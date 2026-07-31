@@ -1,0 +1,13 @@
+{
+  "_comment": "cindy 仓 UI 路径 registry — 迁移自 submit-pr v1 的 UI_PATHS_RE（apps/desktop/src/renderer|apps/mobile|DESIGN.md|packages/*login），计划依据: §1.1b ⑫。",
+  "schema_version": "v1",
+  "repo": "makecindy/cindy",
+  "ui_globs": [
+    "apps/desktop/src/renderer/**",
+    "apps/mobile/**",
+    "DESIGN.md",
+    "packages/**/login/**",
+    "packages/**/*login*/**"
+  ],
+  "non_ui_exceptions": []
+}

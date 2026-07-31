@@ -1,0 +1,6 @@
+node_modules/
+.DS_Store
+*.log
+# runtime 台账/状态数据绝不入库（部署机上位于 ~/pr-autopilot-runtime）
+runtime/
+*.jsonl.head

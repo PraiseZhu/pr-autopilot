@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- pr-autopilot 独立健康告警 launchd 模板 — 计划依据: W-7
+     安装: 替换 __AUTOPILOT_DIR__ / __HEALTH_CONFIG__ 后
+           cp 到 ~/Library/LaunchAgents/ && launchctl load
+     回滚: launchctl unload ~/Library/LaunchAgents/com.praise.pr-autopilot-health.plist && rm 之
+     凭证: FEISHU_* 环境变量按 deploy/README.md 注入（不写死在本文件提交版里） -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.praise.pr-autopilot-health</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>__AUTOPILOT_DIR__/scripts/health/lease-check.mjs</string>
+    <string>--config</string>
+    <string>__HEALTH_CONFIG__</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>9</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/tmp/pr-autopilot-health.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/pr-autopilot-health.err</string>
+</dict>
+</plist>

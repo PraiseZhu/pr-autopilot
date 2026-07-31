@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pr-autopilot/review-verdict/v1",
+  "title": "三审 reviewer 机器 verdict（计划 §1.1b ⑨）",
+  "type": "object",
+  "required": [
+    "schema_version", "reviewer", "run_status", "round",
+    "base_sha", "candidate_sha", "review_input_hash",
+    "faces", "findings", "gate_checks", "verdict", "closed_finding_ids"
+  ],
+  "properties": {
+    "schema_version": { "const": "v1" },
+    "reviewer": { "enum": ["claude-adversarial", "codex-adversarial", "upstream-preview"] },
+    "run_status": { "enum": ["ok", "degraded"] },
+    "round": { "type": "integer", "minimum": 1 },
+    "base_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+    "candidate_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+    "review_input_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "faces": {
+      "type": "array",
+      "minItems": 1,
+      "$comment": "角色级覆盖约束（对抗席恰好七面、第三席必填 faces/gates、fail 与 APPROVED 互斥等跨字段规则）由 verdict-validate.mjs 强制——JSON Schema 表达不了，以 validator 为准（审②-F1）",
+      "items": {
+        "type": "object",
+        "required": ["face", "result", "evidence"],
+        "properties": {
+          "face": { "enum": ["A", "B", "C", "D", "E", "F", "G"] },
+          "result": { "enum": ["pass", "fail", "n_a"] },
+          "evidence": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "primary_face", "severity", "anchor", "evidence", "status"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "primary_face": { "enum": ["A", "B", "C", "D", "E", "F", "G", "taxonomy_gap"] },
+          "related_faces": { "type": "array", "items": { "enum": ["A", "B", "C", "D", "E", "F", "G"] } },
+          "severity": { "enum": ["blocker", "major", "suggestion"] },
+          "anchor": { "type": "string", "minLength": 1 },
+          "evidence": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["open", "closed"] }
+        }
+      }
+    },
+    "gate_checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["gate_id", "result", "evidence"],
+        "properties": {
+          "gate_id": { "type": "string", "minLength": 1 },
+          "result": { "enum": ["pass", "fail", "n_a"] },
+          "evidence": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "verdict": { "enum": ["APPROVED", "REQUIRES_CHANGES"] },
+    "closed_finding_ids": { "type": "array", "items": { "type": "string" } },
+    "arbitration_reason": { "type": "string" }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "_comment": "宪法层路径表 — 计划依据: §1.3b R3/R4/R5/R7。黑名单: 自进化 PR 的 diff 不得落在这些路径（改宪法层只能 owner 亲自动手）；白名单: 自进化提案 PR 的 changed files 必须全部落在这些路径内，否则门禁 fail（R7）。glob 语义: * 匹配单段, ** 匹配任意深度。",
+  "schema_version": "v1",
+  "blacklist": [
+    "scripts/push-guard.mjs",
+    "scripts/consensus-gate.mjs",
+    "scripts/verdict-validate.mjs",
+    "scripts/review-input-hash.mjs",
+    "scripts/ci-readiness.mjs",
+    "scripts/evolution/secret-lint.mjs",
+    "scripts/evolution/constitution-paths.json",
+    "scripts/evolution/cluster.mjs",
+    "scripts/evolution/ledger-append.mjs",
+    "schemas/**",
+    "scripts/pr-watch/gate.mjs",
+    "scripts/health/**",
+    "config/budget*",
+    "config/routing*",
+    "config/notify*",
+    ".github/workflows/**"
+  ],
+  "whitelist": [
+    "skills/submit-pr/references/faces.md",
+    "skills/submit-pr/references/finding-attribution.md",
+    "skills/submit-pr/references/lens-assignment.md",
+    "skills/submit-pr/references/sc-examples.md",
+    "scripts/ui-paths/registry.*.json",
+    "docs/evolution-proposals/**",
+    "fixtures/**"
+  ],
+  "_whitelist_note": "fixtures/** 在白名单是 R10 的必然推论（自动落地必附误报回归 fixture）；fixture 只能新增断言，方向 diff 检查同样适用于它",
+  "proposal_ledger_path": "/Users/praise/pr-autopilot-runtime/ledger/proposal-ledger.jsonl",
+  "escape_ledger_path": "/Users/praise/pr-autopilot-runtime/ledger/escape.jsonl",
+  "fast_ledger_path": "/Users/praise/pr-autopilot-runtime/ledger/fast-bypass.jsonl",
+  "_fast_ledger_note": "审⑤-I2: fast attestation 的 ledger_file 必须等于此路径；push-guard 对缺失该字段 fail-closed（不再静默跳过固定校验）",
+  "confirm_rule_allowlist": [],
+  "_confirm_rule_note": "审⑤-F6: E1 pending → confirm 的确定性规则 allowlist（rule_id）。初始为空 = 只有 owner HMAC（PR_AUTOPILOT_CONFIRM_KEY 签名）能转正；新增规则由 owner 亲手提交（本文件在宪法黑名单内）",
+  "_escape_ledger_note": "e2e-pushguard 洞B: R10 的 ledger_ids 真实性必须绑定受信台账源——manifest 自带 ledger_file 伪造条目被拦",
+  "_proposal_ledger_note": "R8 固定路径（审③-F11-R: 提案会话不得自带空账本绕限流）；mini 部署时若 runtime 目录不同，改这里并走 owner 亲手提交（本文件在宪法黑名单内）",
+  "ci_paths": [
+    ".github/workflows/**",
+    ".github/actions/**",
+    ".gitlab-ci.yml",
+    "Jenkinsfile"
+  ]
+}

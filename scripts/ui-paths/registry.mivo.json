@@ -1,0 +1,19 @@
+{
+  "_comment": "mivo-canvas UI 路径 registry — 计划依据: §1.1b ⑫（审④-F4 实锤: 旧 UI_PATHS_RE 完全不含 mivo 路径）。B 面仅当 match.mjs 判 touches_ui=false 才允许 n_a。",
+  "schema_version": "v1",
+  "repo": "xindong/mivo-canvas",
+  "ui_globs": [
+    "src/app/**",
+    "src/canvas/**",
+    "src/render/**",
+    "src/agent/**/*.tsx",
+    "src/**/*.css",
+    "index.html",
+    "public/**",
+    "DESIGN.md"
+  ],
+  "non_ui_exceptions": [
+    "**/*.test.ts",
+    "**/*.test.tsx"
+  ]
+}
