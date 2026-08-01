@@ -71,8 +71,26 @@ engine-mivo.json（完整必填示例；两仓 schedule **共享同一 budget.le
     「origin=fork / upstream=上游」布局，则注册时传 `--push-remote origin` 即可——remote
     名以**注册时显式声明**为准，不是约定死的。
 
-（wrappers 的 CINDY_DISPATCH_CMD 传输层在 P0-⑦ 验证后填写；gh-snapshot/cindy-dispatch 本体
-已交付并被契约 fixture 覆盖。）
+### P0-⑦ 定案：CINDY_DISPATCH_CMD = 队列握手（班车形态）
+
+```
+CINDY_DISPATCH_CMD="node /Users/praise/pr-autopilot/deploy/wrappers/queue-transport.mjs"
+```
+
+链路：盯梢班车 = mini Cindy scheduler 的 **agent 模式** schedule（`claude-code + Cindy AI +
+z-ai/glm-5.2 + max`，workingDir = 对应仓 checkout，intervalMs 建议 900000=15min，静默运行）。
+班车会话职责（写进 schedule prompt）：
+1. `source ~/pr-autopilot-runtime/env.sh` 后**后台**跑 engine（对应 engine-*.json）；
+2. 轮询 `~/pr-autopilot-runtime/dispatch-queue/*.task.txt`：每个任务调 `cindy_helper`
+   的 `send_to_session`（**不传 target id = create 模式**，message=任务全文）——新会话
+   克隆班车自身 agent/model/effort，四元组由此保证；拿回 target_session_id 后写
+   `<id>.receipt.json`（`{session_id, agentKind, provider, model, effort}`，model/effort
+   照抄本 schedule 配置）；
+3. engine 退出后汇报其 JSON 输出（dispatched/stuck/paused 非空才提醒）。
+queue-transport 落任务文件→轮询回执（默认 240s，env 硬边界 [5s,300s]）→回执原样交
+cindy-dispatch.mjs 做 session_id+四元组校验；超时 = 投递失败，引擎 at-least-once 重试。
+
+（gh-snapshot/cindy-dispatch/queue-transport 均有契约 fixture 覆盖。）
 
 ## 3. 每日卡片调度（§3）
 

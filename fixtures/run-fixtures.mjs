@@ -2167,6 +2167,63 @@ t('[审⑪P1] closed→cleanup-pending→reopen 与销单→重注册两条路�
   ok(!ackDispatch({ stateDir: stDir, owner: 'o', repo: 'mivo-canvas', prNumber: 71, dispatchId: idPre }).ok, '旧 receipt 的 id 不得收口新 pending');
 });
 
+// ========== 15. P0-⑦ 队列握手 transport 契约 ==========
+console.log('\n[15] P0-⑦: queue-transport 班车握手契约');
+
+t('[P0-⑦] queue-transport: 落任务→收回执→清理；超时拒；坏标头拒；坏 env 拒', () => {
+  const dQ = mkdtempSync(join(tmpdir(), 'qt-'));
+  const qDir = join(dQ, 'queue');
+  const QT = join(W, 'queue-transport.mjs');
+  const dispatchText = (id) => `【pr-autopilot 修复任务 ${id}】o/r#1 有新反馈: comment\n\n硬规则...\nOWNER_STANDING_AUTH: PR_PUSH_AND_REPLY`;
+  const goodReceipt = { session_id: 's-9', agentKind: 'claude-code', provider: 'Cindy AI', model: 'z-ai/glm-5.2', effort: 'max' };
+  // ① 正常握手: 后台起 transport → 模拟班车写 receipt → transport 输出回执并清理
+  const idA = 'a'.repeat(16);
+  const pA = new Promise((res, rej) => {
+    const p = spawn(process.execPath, [QT], { env: { ...process.env, PR_AUTOPILOT_QUEUE_DIR: qDir, PR_AUTOPILOT_QUEUE_TIMEOUT_MS: '10000' }, stdio: ['pipe', 'pipe', 'inherit'] });
+    let out = '';
+    p.stdout.on('data', (d) => { out += d; });
+    p.on('exit', (c) => c === 0 ? res(out) : rej(new Error(`transport exit ${c}`)));
+    p.stdin.end(dispatchText(idA));
+    const poll = setInterval(() => {
+      if (existsSync(join(qDir, `${idA}.task.txt`))) {
+        clearInterval(poll);
+        ok(readFileSync(join(qDir, `${idA}.task.txt`), 'utf8').includes('OWNER_STANDING_AUTH'), '任务文本必须完整落盘');
+        writeFileSync(join(qDir, `${idA}.receipt.json`), JSON.stringify(goodReceipt));
+      }
+    }, 100);
+  }).then((out) => {
+    const r = JSON.parse(out.trim());
+    eq(r.session_id, 's-9');
+    eq(r.model, 'z-ai/glm-5.2', '回执四元组原样转交（校验在 cindy-dispatch）');
+    ok(!existsSync(join(qDir, `${idA}.task.txt`)) && !existsSync(join(qDir, `${idA}.receipt.json`)), '握手完成必须清理队列');
+  });
+  // ② 超时: 无班车 → 非零退出且任务文件被清（防晚到班车重复投递）
+  const idB = 'b'.repeat(16);
+  const pB = new Promise((res, rej) => {
+    const p = spawn(process.execPath, [QT], { env: { ...process.env, PR_AUTOPILOT_QUEUE_DIR: qDir, PR_AUTOPILOT_QUEUE_TIMEOUT_MS: '5000' }, stdio: ['pipe', 'ignore', 'ignore'] });
+    p.on('exit', (c) => {
+      try {
+        ok(c !== 0, '无回执必须非零');
+        ok(!existsSync(join(qDir, `${idB}.task.txt`)), '超时必须清任务文件');
+        res();
+      } catch (e) { rej(e); }
+    });
+    p.stdin.end(dispatchText(idB));
+  });
+  // ③ 坏标头 / 坏 env: 立即拒
+  for (const [badIn, badEnv, why] of [
+    ['没有标头的文本', {}, '缺 dispatch_id 标头'],
+    [dispatchText('c'.repeat(16)), { PR_AUTOPILOT_QUEUE_TIMEOUT_MS: '0' }, 'timeout=0'],
+    [dispatchText('d'.repeat(16)), { PR_AUTOPILOT_QUEUE_TIMEOUT_MS: '999999999' }, 'timeout 超大']
+  ]) {
+    let failedQ = false;
+    try { execFileSync(process.execPath, [QT], { input: badIn, env: { ...process.env, PR_AUTOPILOT_QUEUE_DIR: qDir, ...badEnv }, stdio: ['pipe', 'pipe', 'pipe'] }); }
+    catch { failedQ = true; }
+    ok(failedQ, `必须拒: ${why}`);
+  }
+  return Promise.all([pA, pB]);
+});
+
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
 console.log(`\n========== fixtures: ${pass} passed, ${failCount} failed ==========`);
