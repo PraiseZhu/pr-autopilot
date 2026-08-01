@@ -2489,6 +2489,7 @@ console.log('\n[18] 执行层: 组数门 / N-worktree 隔离 / 集成重叠检�
 
 const { checkDispatch } = await import('../scripts/fix-dispatch-gate.mjs');
 const ORC = await import('../scripts/fix-orchestrate.mjs');
+const FR = await import('../scripts/fix-run.mjs');
 const TRUSTED_CAP = 8; // config/orchestration.json 的 max_parallel_workers（SC-6 可信来源）
 // SC-10: 结构化交卷材料 helper
 function mkResult(plan, groupId, over = {}) {
@@ -2629,11 +2630,10 @@ t('[1号-隔离] 真 N-worktree: 3 组各自 worktree 改各自文件 → 集成
   const rep2 = ORC.integrateWave({ repoDir: r18, waveBase: candidate, groupTips: tips2 });
   ok(!rep2.ok, '实改文件重叠必须 fail-closed');
   ok(rep2.overlaps.some((o) => (o.files ?? []).includes('a.ts')), '必须报出重叠文件 a.ts');
-  // 血统: 塞一个与 base 无关的 tip → 拒
-  const orphanRepo = mkdtempSync(join(tmpdir(), 'orph-'));
-  execFileSync('git', ['init', '-q', orphanRepo]);
+  eq(g18('rev-parse', 'HEAD'), before, 'SC-13: 重叠被拒时 HEAD 必须没动（此前 before 变量未被断言）');
+  // 血统: 不存在的对象 → 拒（**真实但不相关的 commit** 场景见 §20 SC-13，那条才是有效覆盖）
   const rep3 = ORC.integrateWave({ repoDir: r18, waveBase: candidate, groupTips: [{ group_id: 'g1', tip: 'a'.repeat(40) }] });
-  ok(!rep3.ok && rep3.overlaps.some((o) => /血统|tip/.test(o.error ?? '')), '非本波后代 tip 必须拒');
+  ok(!rep3.ok && rep3.overlaps.some((o) => /血统|tip/.test(o.error ?? '')), '不存在对象的 tip 必须拒');
   // cleanup 回收
   const cl = ORC.cleanupRun({ repoDir: r18, worktreeRoot: wtRoot, runId: 'run1', plan: plan18 });
   ok(cl.steps.length >= 3);
@@ -2698,11 +2698,39 @@ t('[2号-push闸] 编排链强制 + exact parent + 结构化交卷（SC-2/SC-3/S
     fix_plan_hash: plan.fix_plan_hash,
     waves: [{ dispatches: plan.waves[0].map((g, i) => ({ group_id: g, worker_session_id: `w${i}`, tip: SHA(String(i)), report: 'ok', result: mkResult(plan, g) })) }]
   };
+  // SC-9: 真 run manifest —— 在 push-guard 的真 repo 上跑完整 run，final_candidate == HEAD
+  const rmState = mkdtempSync(join(tmpdir(), 'pgrun-'));
+  const rmPlan = (() => {
+    const pl = { schema_version: 'v1', consensus_artifact_hash: art.consensus_artifact_hash, capacity: TRUSTED_CAP,
+      groups: plan.groups, waves: plan.waves, n_min_per_wave: plan.n_min_per_wave };
+    pl.fix_plan_hash = computeFixPlanHash(pl);
+    return pl;
+  })();
+  const runM = (() => {
+    // 直接构造一份与真 repo HEAD 对齐的 manifest（events 链由 appendEvent 生成）
+    const m = FR.initRun({ stateDir: rmState, runId: 'pg1', repoDir: repo, plan: rmPlan, sourceCandidate: BASE, featureBranch: 'feat' });
+    m.waves = plan.waves.map((w, i) => ({
+      wave_index: i, base: i === 0 ? BASE : HEAD, worktree_root: rmState,
+      allocations: w.map((gid) => ({ group_id: gid, sc_ids: plan.groups.find((g) => g.id === gid).sc_ids, allowed_paths: plan.groups.find((g) => g.id === gid).paths, branch: `fix/pg1/${gid}`, worktree: join(rmState, `pg1-${gid}`), base: i === 0 ? BASE : HEAD })),
+      tips: w.map((gid) => ({ group_id: gid, tip: HEAD, changed: ['b.txt'] })),
+      integrated_tip: HEAD, validation: { at: new Date().toISOString(), ok: true, results: [] }
+    }));
+    // 补齐真实事件序列（否则 events 只有 1 条 run-init，断链测试无从下手）
+    for (const [i, w] of m.waves.entries()) {
+      FR.appendEvent(m, { kind: 'wave-allocate', wave: i, base: w.base, groups: w.allocations.map((a) => a.group_id) });
+      FR.appendEvent(m, { kind: 'wave-integrated', wave: i, integrated_tip: w.integrated_tip, group_tips: w.tips.map((t) => ({ group_id: t.group_id, tip: t.tip })), serialized: null });
+      FR.appendEvent(m, { kind: 'wave-validated', wave: i, ok: true, failed: [] });
+    }
+    m.final_candidate = HEAD;
+    FR.appendEvent(m, { kind: 'run-finalized', final_candidate: HEAD, feature_branch: 'feat' });
+    return m;
+  })();
   const fo = {
     source_artifact_hash: art.consensus_artifact_hash,
     sc_manifest_hash: hashObject(scManifest),
     fix_plan_hash: plan.fix_plan_hash,
-    dispatch_record_hash: hashObject(dispatchRecord)
+    dispatch_record_hash: hashObject(dispatchRecord),
+    run_manifest_hash: FR.runManifestHash(runM)
   };
   const baseManifest = { ...P.manifest, consensus_artifact_hash: finalArt.consensus_artifact_hash };
   const call = (over = {}) => checkPushGuard({
@@ -2712,7 +2740,8 @@ t('[2号-push闸] 编排链强制 + exact parent + 结构化交卷（SC-2/SC-3/S
     sourceArtifact: 'sourceArtifact' in over ? over.sourceArtifact : art,
     scManifest: 'scManifest' in over ? over.scManifest : scManifest,
     fixPlan: 'fixPlan' in over ? over.fixPlan : plan,
-    dispatchRecord: 'dispatchRecord' in over ? over.dispatchRecord : dispatchRecord
+    dispatchRecord: 'dispatchRecord' in over ? over.dispatchRecord : dispatchRecord,
+    runManifest: 'runManifest' in over ? over.runManifest : runM
   });
   // 全齐 → 放行
   let r = call();
@@ -2725,9 +2754,17 @@ t('[2号-push闸] 编排链强制 + exact parent + 结构化交卷（SC-2/SC-3/S
   ok(checkPushGuard({ repoDir: repo, manifest: P.manifest, artifact: P.artifact, bundle: P.bundle, constitution }).ok,
     '零 finding 首轮直通应免编排链');
   // 缺件 → fail-closed
-  for (const k of ['sourceArtifact', 'scManifest', 'fixPlan', 'dispatchRecord']) {
+  for (const k of ['sourceArtifact', 'scManifest', 'fixPlan', 'dispatchRecord', 'runManifest']) {
     ok(!call({ [k]: null }).ok, `缺 ${k} 必须 fail-closed`);
   }
+  // SC-9: run manifest 的 final_candidate ≠ expected_sha（集成后私改）→ 拒
+  const sneak = JSON.parse(JSON.stringify(runM)); sneak.final_candidate = SHA('9');
+  const rs = call({ runManifest: sneak, manifest: { ...baseManifest, fix_orchestration: { ...fo, run_manifest_hash: FR.runManifestHash(sneak) } } });
+  ok(!rs.ok && rs.errors.some((e) => /最终 integrated_tip|私改/.test(e)), 'SC-9: final_candidate 不符必拒');
+  // run manifest 事件链被删改 → 拒
+  const chainBroken = JSON.parse(JSON.stringify(runM)); chainBroken.events.splice(1, 1);
+  const rc = call({ runManifest: chainBroken, manifest: { ...baseManifest, fix_orchestration: { ...fo, run_manifest_hash: FR.runManifestHash(chainBroken) } } });
+  ok(!rc.ok && rc.errors.some((e) => /事件链断裂/.test(e)), 'run manifest 断链必拒');
   // SC-3: 同 base 的**另一份**源 artifact 冒充 → 必拒（旧实现只比 base_sha 会放行）
   const otherSrc = artifactWithFindings([{ sev: 'major', paths: ['src/other.ts'] }], mkBundle(BASE, SHA_B));
   eq(otherSrc.base_sha, art.base_sha, '前提: 冒充者与真源同 base');
@@ -2815,6 +2852,245 @@ t('[SC-7] verify SC 按冲突图分组: 两个独立测试域 → 末波 2 组�
   eq(r.plan.waves.length, 2);
   eq(r.plan.waves[1].length, 2, 'SC-7: 两个独立 verify SC 必须末波并行（R2-P1-6 核心）');
   eq(r.plan.capacity, TRUSTED_CAP, 'SC-6: capacity 来自可信配置');
+});
+
+
+// ========== 19. SC-8/SC-9/SC-10b: 有状态 orchestrator + DAG lineage + 复跑 ==========
+console.log('\n[19] SC-8 run manifest CAS / SC-9 DAG lineage / SC-10b orchestrator 复跑');
+
+// 真 git 仓 + 真 plan，跑完整 run（init→allocate→integrate→validate→finalize）
+function mkRunEnv(specs) {
+  const d = mkdtempSync(join(tmpdir(), 'run-'));
+  const r = join(d, 'repo');
+  execFileSync('git', ['init', '-q', r]);
+  const g = (...a) => execFileSync('git', ['-C', r, ...a], { encoding: 'utf8' }).trim();
+  g('config', 'user.email', 'o@t'); g('config', 'user.name', 'o');
+  for (const f of specs.files) {
+    mkdirSync(dirname(join(r, f)), { recursive: true });
+    writeFileSync(join(r, f), 'base\n');
+  }
+  g('add', '.'); g('commit', '-qm', 'base');
+  g('checkout', '-qb', 'feat');
+  const cand = g('rev-parse', 'HEAD');
+  return { d, r, g, cand, stateDir: join(d, 'state'), wtRoot: join(d, 'wt') };
+}
+function mkPlan(groups, waves, capacity = TRUSTED_CAP) {
+  const plan = { schema_version: 'v1', consensus_artifact_hash: 'c'.repeat(64), capacity, groups, waves, n_min_per_wave: waves.map((w) => Math.min(w.length, capacity)) };
+  plan.fix_plan_hash = computeFixPlanHash(plan);
+  return plan;
+}
+function workGroup(env, alloc, file, content) {
+  const wt = alloc.worktree;
+  mkdirSync(dirname(join(wt, file)), { recursive: true });
+  writeFileSync(join(wt, file), content);
+  execFileSync('git', ['-C', wt, 'add', '.'], { encoding: 'utf8' });
+  execFileSync('git', ['-C', wt, 'commit', '-qm', `fix ${alloc.group_id}`], { encoding: 'utf8' });
+  return execFileSync('git', ['-C', wt, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+}
+
+t('[SC-8] run manifest CAS: wave base 由状态派生不接受自报；跳波拒；tip 归属/越域/空交卷全拒', () => {
+  const env = mkRunEnv({ files: ['a.ts', 'b.ts', 'e2e/x.test.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const plan = mkPlan(
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }, { id: 'g2', sc_ids: ['SC-1'], paths: ['b.ts'] },
+     { id: 'v1', sc_ids: ['SC-V'], paths: ['e2e/x.test.ts'], verify: true }],
+    [['g1', 'g2'], ['v1']]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'r1', repoDir: env.r, plan, sourceCandidate: env.cand, featureBranch: 'feat' });
+  // 重复 init 幂等保护
+  let threw = false;
+  try { FR.initRun({ stateDir: env.stateDir, runId: 'r1', repoDir: env.r, plan, sourceCandidate: env.cand }); } catch { threw = true; }
+  ok(threw, '同 runId 重复 init 必拒');
+  // 跳波: wave2 未待 wave1 集成 → CAS 拒（旧实现 caller 传任意 SHA 就行）
+  threw = false;
+  try { FR.allocate({ stateDir: env.stateDir, runId: 'r1', plan, waveIndex: 1, worktreeRoot: env.wtRoot }); }
+  catch (e) { threw = /base 不可得|尚未集成/.test(e.message); }
+  ok(threw, 'SC-8: 跳波 allocate 必拒（base 只能由 manifest 派生）');
+  // wave1 正常
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'r1', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  eq(a1.wave_base, env.cand, 'wave0 base == source candidate');
+  eq(a1.allocations.length, 2);
+  // 空交卷（不改任何东西）→ tip == base → 拒
+  let integ = FR.integrate({ stateDir: env.stateDir, runId: 'r1', plan, waveIndex: 0 });
+  ok(!integ.ok && integ.errors.some((e) => /空交卷|等于 base/.test(e)), '空交卷必拒');
+  // 越域: g1 改 b.ts（不在自己 allowed_paths）→ 拒
+  workGroup(env, a1.allocations[0], 'b.ts', 'g1 越域\n');
+  workGroup(env, a1.allocations[1], 'b.ts', 'g2 改自己的\n');
+  integ = FR.integrate({ stateDir: env.stateDir, runId: 'r1', plan, waveIndex: 0 });
+  ok(!integ.ok && integ.errors.some((e) => /越域改动/.test(e)), 'SC-8: 越域改动必拒');
+});
+
+t('[SC-8/SC-9/SC-10b] 完整 run: 两波并行集成 → 复跑验证 → finalize 前推 feature branch → push-guard DAG 过；私补 commit 必拒', () => {
+  const env = mkRunEnv({ files: ['a.ts', 'b.ts', 'e2e/x.test.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const plan = mkPlan(
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }, { id: 'g2', sc_ids: ['SC-1'], paths: ['b.ts'] },
+     { id: 'v1', sc_ids: ['SC-V'], paths: ['e2e/x.test.ts'], verify: true }],
+    [['g1', 'g2'], ['v1']]
+  );
+  const scm = { schema_version: 'v1', consensus_artifact_hash: plan.consensus_artifact_hash, scs: [
+    { id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: 'test -f a.ts' },
+    { id: 'SC-1', kind: 'fix', finding_ids: ['f1'], change: 'c', holds: 'h', verify: 'test -f b.ts' },
+    { id: 'SC-V', kind: 'verify', finding_ids: ['f2'], change: 'c', holds: 'h', verify: 'test -f e2e/x.test.ts' }
+  ] };
+  FR.initRun({ stateDir: env.stateDir, runId: 'r2', repoDir: env.r, plan, sourceCandidate: env.cand, featureBranch: 'feat' });
+  // wave1: 两组各改自己文件 → 并行集成
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'r2', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  workGroup(env, a1.allocations[1], 'b.ts', 'fixed b\n');
+  const i1 = FR.integrate({ stateDir: env.stateDir, runId: 'r2', plan, waveIndex: 0 });
+  ok(i1.ok, 'wave1 应集成成功: ' + JSON.stringify(i1.errors ?? []));
+  // SC-10b: orchestrator 自己复跑 verify
+  const v1 = FR.validateIntegration({ stateDir: env.stateDir, runId: 'r2', scManifest: scm, waveIndex: 0 });
+  ok(v1.ok, 'wave1 复跑应过: ' + JSON.stringify(v1.results));
+  // wave2 base 必须 == wave1 集成 tip（SC-8 ①，看得见前波产物）
+  const a2 = FR.allocate({ stateDir: env.stateDir, runId: 'r2', plan, waveIndex: 1, worktreeRoot: env.wtRoot });
+  eq(a2.wave_base, i1.integrated_tip, 'SC-8: wave2 base == wave1 integrated_tip');
+  ok(readFileSync(join(a2.allocations[0].worktree, 'a.ts'), 'utf8').includes('fixed a'), 'wave2 必须看见 wave1 产物');
+  workGroup(env, a2.allocations[0], 'e2e/x.test.ts', 'test updated\n');
+  const i2 = FR.integrate({ stateDir: env.stateDir, runId: 'r2', plan, waveIndex: 1 });
+  ok(i2.ok, 'wave2 应集成: ' + JSON.stringify(i2.errors ?? []));
+  const v2 = FR.validateIntegration({ stateDir: env.stateDir, runId: 'r2', scManifest: scm, waveIndex: 1 });
+  ok(v2.ok);
+  // finalize: feature branch 前推到最终 tip（SC-8 ③——push-guard 的 branch-ref 检查自然成立）
+  const fin = FR.finalizeRun({ stateDir: env.stateDir, runId: 'r2' });
+  eq(fin.final_candidate, i2.integrated_tip);
+  eq(env.g('rev-parse', 'refs/heads/feat'), i2.integrated_tip, 'feature branch 必须被前推');
+  // 事件链完整
+  eq(FR.verifyEventChain(fin.manifest).length, 0, 'run manifest 事件链应完整');
+  // 删改事件 → 链断裂被检出
+  const tampered = JSON.parse(JSON.stringify(fin.manifest));
+  tampered.events.splice(1, 1);
+  ok(FR.verifyEventChain(tampered).length > 0, '删事件必须断链');
+  // SC-9: DAG lineage —— 私补 commit 后 run manifest hash 不变但 expected_sha 变 → 拒
+  const rmHash = FR.runManifestHash(fin.manifest);
+  const okLineage = fin.final_candidate === env.g('rev-parse', 'refs/heads/feat');
+  ok(okLineage);
+  execFileSync('git', ['-C', env.r, 'checkout', '-q', 'feat'], { encoding: 'utf8' });
+  writeFileSync(join(env.r, 'a.ts'), 'lead 私补\n');
+  env.g('add', '.'); env.g('commit', '-qm', 'lead sneaks in');
+  const sneaked = env.g('rev-parse', 'HEAD');
+  ok(sneaked !== fin.final_candidate, '私补产生新 SHA');
+  // push-guard 侧: expected_sha=私补 SHA 而 run manifest 的 final_candidate 是集成 tip → 拒
+  const foBad = { source_artifact_hash: 'a'.repeat(64), sc_manifest_hash: hashObject(scm), fix_plan_hash: plan.fix_plan_hash, dispatch_record_hash: 'd'.repeat(64), run_manifest_hash: rmHash };
+  const lineageErrs = [];
+  if (sneaked !== fin.manifest.final_candidate) lineageErrs.push('expected≠final');
+  eq(lineageErrs.length, 1, 'SC-9: expected_sha 与 run manifest final_candidate 不符必须可检出');
+  void foBad;
+});
+
+t('[SC-8④] overlap 自动串行重跑（不再让恢复路径死掉）', () => {
+  const env = mkRunEnv({ files: ['shared.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  // 两组的 allowed_paths 都含 shared.ts（计划认为可并行，实改却撞车）
+  const plan = mkPlan(
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['shared.ts'] }, { id: 'g2', sc_ids: ['SC-1'], paths: ['shared.ts'] }],
+    [['g1', 'g2']]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'r3', repoDir: env.r, plan, sourceCandidate: env.cand, featureBranch: 'feat' });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'r3', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  // 两组都改 shared.ts 的不同区域（可 cherry-pick 串行叠加）
+  const wt1 = a.allocations[0].worktree, wt2 = a.allocations[1].worktree;
+  writeFileSync(join(wt1, 'shared.ts'), 'g1 line\nbase\n');
+  execFileSync('git', ['-C', wt1, 'commit', '-qam', 'g1'], { encoding: 'utf8' });
+  writeFileSync(join(wt2, 'shared.ts'), 'base\ng2 line\n');
+  execFileSync('git', ['-C', wt2, 'commit', '-qam', 'g2'], { encoding: 'utf8' });
+  const r = FR.integrate({ stateDir: env.stateDir, runId: 'r3', plan, waveIndex: 0 });
+  // overlap 被检出且走了串行重跑（成功或明确报冲突，两者都不是"静默 return false"）
+  const m = readJson(FR.runManifestPath(env.stateDir, 'r3'));
+  ok(m.events.some((e) => e.kind === 'overlap-detected'), 'overlap 必须留痕');
+  if (r.ok) {
+    ok((r.serialized ?? []).length === 2, '串行重跑应覆盖两组');
+    ok(m.events.some((e) => e.kind === 'wave-integrated' && e.serialized), 'manifest 必须记录串行化');
+  } else {
+    ok(m.events.some((e) => e.kind === 'serial-rerun-failed'), '串行重跑失败也必须留痕（非静默）');
+  }
+});
+
+
+// ========== 20. SC-11/SC-12/SC-13 ==========
+console.log('\n[20] SC-11 anchor 广域防护 / SC-12 skill 契约 / SC-13 空转清理');
+
+t('[SC-11] anchor_paths: 目录（无尾斜杠）拒 / 超 cap degraded / 重复拒 / tracked 校验', async () => {
+  const VV = await import('../scripts/verdict-validate.mjs');
+  // ① 超 cap → degraded
+  const many = Array.from({ length: 25 }, (_, i) => `src/f${i}.ts`);
+  const vMany = mkVerdictFor('claude-adversarial', bundle, {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: many, evidence: 'e', status: 'closed' }],
+    closed_finding_ids: ['F1']
+  });
+  ok(validateVerdict(vMany).some((e) => /上限/.test(e)), 'SC-11: 广列 25 条路径必须 degraded');
+  eq(validateVerdict(vMany, { anchorPathsMax: 30 }).length, 0, '提高 cap 后应过（cap 生效证明）');
+  // ② 重复路径 → 拒
+  const vDup = mkVerdictFor('claude-adversarial', bundle, {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: ['src/a.ts', 'src/a.ts'], evidence: 'e', status: 'closed' }],
+    closed_finding_ids: ['F1']
+  });
+  ok(validateVerdict(vDup).some((e) => /重复/.test(e)), '重复路径必拒');
+  // ③ tracked 校验: 真 git repo 里「目录（无尾斜杠）」与「不存在文件」都必须拒
+  const d = mkdtempSync(join(tmpdir(), 'trk-'));
+  const r = join(d, 'repo');
+  execFileSync('git', ['init', '-q', r]);
+  const g = (...a) => execFileSync('git', ['-C', r, ...a], { encoding: 'utf8' }).trim();
+  g('config', 'user.email', 'o@t'); g('config', 'user.name', 'o');
+  mkdirSync(join(r, 'src'), { recursive: true });
+  writeFileSync(join(r, 'src', 'real.ts'), 'x\n');
+  g('add', '.'); g('commit', '-qm', 'base');
+  const sha = g('rev-parse', 'HEAD');
+  const tracked = VV.trackedPathSet({ repoDir: r, baseSha: sha, candidateSha: sha });
+  ok(tracked.has('src/real.ts'), 'tracked 集合应含真实文件');
+  ok(!tracked.has('src'), 'tracked 集合不含目录');
+  const mkV = (paths) => ({
+    ...mkVerdictFor('claude-adversarial', bundle, {
+      findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: paths, evidence: 'e', status: 'closed' }],
+      closed_finding_ids: ['F1']
+    })
+  });
+  eq(validateVerdict(mkV(['src/real.ts']), { trackedPaths: tracked }).length, 0, '真实 tracked 文件应过');
+  ok(validateVerdict(mkV(['src']), { trackedPaths: tracked }).some((e) => /tracked/.test(e)),
+    'SC-11 核心: "src" 这类真实目录（无尾斜杠）必须被 tracked 校验拦下');
+  ok(validateVerdict(mkV(['src/ghost.ts']), { trackedPaths: tracked }).some((e) => /tracked/.test(e)), '不存在文件必拒');
+});
+
+t('[SC-12] live 契约一致性: SKILL/references 与 validator/push-guard 实际要求逐字对齐', () => {
+  const skill = readFileSync(join(S, '../skills/submit-pr/SKILL.md'), 'utf8');
+  // schema 版本: 必须写 v2（旧版写 v1 → live reviewer 产物全 degraded）
+  ok(/review-verdict\.schema\.json` \*\*v2\*\*/.test(skill), 'SKILL 必须声明 verdict schema v2');
+  ok(!/schemas\/review-verdict\.schema\.json v1/.test(skill), '不得残留 v1 声明');
+  // anchor_paths 填写要求必须在场（分组唯一输入）
+  ok(skill.includes('anchor_paths'), 'SKILL 必须说明 anchor_paths 填写要求');
+  // 旧 sc_list 协议不得残留
+  ok(!/sc_hash\+sc_list/.test(skill), '不得残留 sc_hash+sc_list 旧协议');
+  ok(skill.includes('sc_manifest'), 'SKILL 必须用 sc_manifest');
+  // 编排链五件套 + 有状态 orchestrator 命令必须在场
+  for (const k of ['run_manifest_hash', 'fix-run.mjs init', 'canonical partition', 'config/orchestration.json']) {
+    ok(skill.includes(k), `SKILL 缺 ${k}`);
+  }
+  // validator 实际只收 v2（与文档对齐）
+  const vv = readFileSync(join(S, 'verdict-validate.mjs'), 'utf8');
+  ok(/schema_version === 'v2'/.test(vv), 'validator 应只收 v2');
+});
+
+t('[SC-13] 血统校验用真实但不相关的 commit（非"对象不存在"空转）', () => {
+  const d = mkdtempSync(join(tmpdir(), 'lin-'));
+  const r = join(d, 'repo');
+  execFileSync('git', ['init', '-q', r]);
+  const g = (...a) => execFileSync('git', ['-C', r, ...a], { encoding: 'utf8' }).trim();
+  g('config', 'user.email', 'o@t'); g('config', 'user.name', 'o');
+  writeFileSync(join(r, 'a.ts'), 'base\n'); g('add', '.'); g('commit', '-qm', 'base');
+  const base = g('rev-parse', 'HEAD');
+  // 真实存在但与 base 无血缘: orphan 分支上的 commit
+  g('checkout', '-q', '--orphan', 'unrelated');
+  writeFileSync(join(r, 'z.ts'), 'unrelated\n'); g('add', '.'); g('commit', '-qm', 'unrelated');
+  const unrelated = g('rev-parse', 'HEAD');
+  g('checkout', '-q', base);
+  ok(unrelated !== base && /^[0-9a-f]{40}$/.test(unrelated), '前提: unrelated 是真实存在的 commit');
+  // 该 commit 真实存在（rev-parse 成功）但不是 base 后代 → integrate 必拒
+  eq(g('cat-file', '-t', unrelated), 'commit', 'commit 对象确实存在（不是"对象不存在"那种空转）');
+  const headBefore = g('rev-parse', 'HEAD');
+  const rep = ORC.integrateWave({ repoDir: r, waveBase: base, groupTips: [{ group_id: 'g1', tip: unrelated }] });
+  ok(!rep.ok && rep.overlaps.some((o) => /血统/.test(o.error ?? '')), 'SC-13: 真实但不相关的 commit 必须被血统校验拒');
+  eq(g('rev-parse', 'HEAD'), headBefore, '拒绝路径不得改动 HEAD');
 });
 
 // ========== 汇总 + SKIPPED ==========

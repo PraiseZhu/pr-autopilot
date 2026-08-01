@@ -25,6 +25,7 @@ import { validateRemoteBranch } from './lib/git-checks.mjs';
 import { checkScCoverage } from './sc-coverage-gate.mjs';
 import { buildFixPlan } from './fix-plan.mjs';
 import { checkDispatch } from './fix-dispatch-gate.mjs';
+import { verifyEventChain, runManifestHash } from './fix-run.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PURPOSES = ['feature', 'evolution', 'fast'];
@@ -64,7 +65,7 @@ export function validateManifest(manifest) {
     // lead 省略即完全旁路）。判据从 artifact 派生，见 checkPushGuard 的 needsOrchestration。
     if (manifest.fix_orchestration) {
       const fo = manifest.fix_orchestration;
-      for (const k of ['source_artifact_hash', 'sc_manifest_hash', 'fix_plan_hash', 'dispatch_record_hash']) {
+      for (const k of ['source_artifact_hash', 'sc_manifest_hash', 'fix_plan_hash', 'dispatch_record_hash', 'run_manifest_hash']) {
         if (!fo[k]) errs.push(`fix_orchestration 缺 ${k}`);
       }
     }
@@ -154,7 +155,7 @@ export function verifyFastAttestation(manifest, key, nowMs = Date.now()) {
   return null;
 }
 
-export function checkPushGuard({ repoDir, manifest, artifact, bundle, constitution, sourceArtifact = null, scManifest = null, fixPlan = null, dispatchRecord = null, nowMs = Date.now(), fastKey = process.env.PR_AUTOPILOT_FAST_KEY }) {
+export function checkPushGuard({ repoDir, manifest, artifact, bundle, constitution, sourceArtifact = null, scManifest = null, fixPlan = null, dispatchRecord = null, runManifest = null, nowMs = Date.now(), fastKey = process.env.PR_AUTOPILOT_FAST_KEY }) {
   const errors = [];
 
   const schemaErrs = validateManifest(manifest);
@@ -260,6 +261,56 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
         const dErrs = checkDispatch({ plan: fixPlan, record: dispatchRecord });
         for (const e of dErrs) errors.push(`派发门: ${e}`);
         if (hashObject(dispatchRecord) !== fo.dispatch_record_hash) errors.push('fix_orchestration.dispatch_record_hash ≠ dispatch record 重算值');
+        // ⑤ SC-9: 最终 DAG lineage——final candidate 必须 == run manifest 的最终 integrated_tip，
+        // 且 tip 的祖先集合只能由「已登记 group tips + 规定 merge/cherry-pick」构成:
+        // lead 在集成分支私补 commit → 拒（R2 判为本轮必修）。
+        if (!runManifest) {
+          errors.push('fix_orchestration 在场但缺 run manifest（SC-9: 无法验证最终 DAG lineage，fail-closed）');
+        } else {
+          const rmErrs = verifyEventChain(runManifest);
+          for (const e of rmErrs) errors.push(`run manifest: ${e}`);
+          if (runManifest.fix_plan_hash !== fixPlan.fix_plan_hash) errors.push('run manifest 绑定的 plan hash ≠ 本 plan');
+          if (runManifestHash(runManifest) !== fo.run_manifest_hash) errors.push('fix_orchestration.run_manifest_hash ≠ run manifest 重算值');
+          const finalTip = runManifest.final_candidate ?? null;
+          if (!finalTip) errors.push('run manifest 未 finalize（无 final_candidate）');
+          else if (finalTip !== manifest.expected_sha) {
+            errors.push(`expected_sha ≠ run manifest 的最终 integrated_tip（expected=${String(manifest.expected_sha).slice(0, 12)} run=${finalTip.slice(0, 12)}）——集成后私改/换 commit 被拦（SC-9）`);
+          } else {
+            // 祖先集合校验: final tip 到 source candidate 之间的 commit，必须都能归属到某个已登记
+            // group tip 的祖先链（或是集成自身产生的 merge commit）。私补的孤立 commit 落不进去。
+            const registered = new Set();
+            for (const w of runManifest.waves ?? []) for (const t of w.tips ?? []) registered.add(t.tip);
+            try {
+              const revs = gitT(repoDir, 'rev-list', `${runManifest.source_candidate}..${finalTip}`).split('\n').filter(Boolean);
+              for (const rev of revs) {
+                const isMerge = gitT(repoDir, 'rev-list', '--no-walk', '--merges', rev).trim() !== '';
+                if (isMerge) continue; // 集成 merge commit
+                const owned = [...registered].some((tip) => {
+                  try { execFileSync('git', ['-C', repoDir, 'merge-base', '--is-ancestor', rev, tip], { encoding: 'utf8' }); return true; }
+                  catch { return false; }
+                });
+                // cherry-pick 串行重跑会产生新 SHA，用 patch-id 归属
+                let patchOwned = false;
+                if (!owned) {
+                  try {
+                    const pid = gitT(repoDir, 'patch-id', '--stable') || '';
+                    void pid; // patch-id 需 stdin，改用 diff 比对（下方）
+                  } catch { /* noop */ }
+                  for (const tip of registered) {
+                    try {
+                      const a = gitT(repoDir, 'show', '--format=', '--no-color', rev);
+                      const b = gitT(repoDir, 'log', '-p', '--format=', '--no-color', `${runManifest.source_candidate}..${tip}`);
+                      if (a && b.includes(a.split('\n').slice(0, 6).join('\n'))) { patchOwned = true; break; }
+                    } catch { /* noop */ }
+                  }
+                }
+                if (!owned && !patchOwned) {
+                  errors.push(`最终 DAG 含未登记 commit ${rev.slice(0, 12)}（不属于任何已登记 group tip——集成后私补代码被拦，SC-9）`);
+                }
+              }
+            } catch (e) { errors.push(`DAG lineage 校验失败（fail-closed）: ${e.message}`); }
+          }
+        }
       }
     }
   } else if (manifest.purpose === 'fast') {
@@ -383,7 +434,7 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
 if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
   if (!args.manifest || !args['repo-dir']) {
-    fail('用法: push-guard.mjs --repo-dir <dir> --manifest <m.json> [--artifact <a.json>] [--bundle <b.json>]\n      [--source-artifact <src.json> --sc-manifest <sc.json> --fix-plan <plan.json> --dispatch-record <rec.json>]\n      [--execute]\n（编排四件套在 manifest.fix_orchestration 在场时必填；宪法路径表固定随仓，不接受 override——审④-F3）');
+    fail('用法: push-guard.mjs --repo-dir <dir> --manifest <m.json> [--artifact <a.json>] [--bundle <b.json>]\n      [--source-artifact <src.json> --sc-manifest <sc.json> --fix-plan <plan.json> --dispatch-record <rec.json> --run-manifest <run.json>]\n      [--execute]\n（编排四件套在 manifest.fix_orchestration 在场时必填；宪法路径表固定随仓，不接受 override——审④-F3）');
   }
   const res = checkPushGuard({
     repoDir: args['repo-dir'],
@@ -395,6 +446,7 @@ if (isMain(import.meta.url)) {
     scManifest: args['sc-manifest'] ? readJson(args['sc-manifest']) : null,
     fixPlan: args['fix-plan'] ? readJson(args['fix-plan']) : null,
     dispatchRecord: args['dispatch-record'] ? readJson(args['dispatch-record']) : null,
+    runManifest: args['run-manifest'] ? readJson(args['run-manifest']) : null,
     constitution: readJson(join(HERE, 'evolution/constitution-paths.json')) // 固定路径，CLI 无 override（审④-F3）
   });
   if (!res.ok) {

@@ -6,7 +6,29 @@
 //   - 任何 face.result=fail → verdict 必须 REQUIRES_CHANGES（不许 fail+APPROVED）
 //   - 存在 primary_face=taxonomy_gap 的 finding → run_status 必须 degraded（⑪ 停轮）
 //   - bundle.touches_ui=true 时对抗席 B 面禁 n_a（⑫ 脚本判定为唯一源）
+import { execFileSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs, readJson, fail, isMain, normalizeRepoPath } from './lib/common.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+// SC-11: anchor_paths 数量上限来自可信配置（与 capacity 同源，owner 亲手改）
+export const DEFAULT_ANCHOR_PATHS_MAX = (() => {
+  try { return readJson(join(HERE, '../config/orchestration.json')).anchor_paths_max_per_finding ?? 20; }
+  catch { return 20; }
+})();
+
+// SC-11: base∪candidate 的 tracked 文件集（唯一可信「这是真文件」判据）
+export function trackedPathSet({ repoDir, baseSha, candidateSha }) {
+  const set = new Set();
+  for (const ref of [baseSha, candidateSha].filter(Boolean)) {
+    try {
+      const out = execFileSync('git', ['-C', repoDir, 'ls-tree', '-r', '--name-only', ref], { encoding: 'utf8', timeout: 60_000 });
+      for (const line of out.split('\n')) if (line.trim()) set.add(line.trim());
+    } catch { /* ref 不可得 → 该 ref 不贡献 */ }
+  }
+  return set;
+}
 
 const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
 const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];
@@ -93,9 +115,30 @@ export function validateVerdict(v, opts = {}) {
     if (!Array.isArray(fd.anchor_paths) || fd.anchor_paths.length === 0) {
       need(false, `finding ${fd.id} 缺 anchor_paths（v2 机器字段必填，分组据此，degraded）`);
     } else {
+      // SC-11（R2-P1-5）: 语法校验之外再加三道——
+      //   ① 去重（uniqueItems）；② 数量上限（可信配置，防把「影响范围」当「证据锚点」广列
+      //   进而制造假冲突把并行工作串行化）；③ 有 repoDir 时逐条验证是**真实 tracked blob**
+      //   （"src" 这类无尾斜杠的真实目录在纯语法层会通过）
+      const seenPaths = new Set();
       for (const p of fd.anchor_paths) {
         const r = normalizeRepoPath(p);
         need(r.ok, `finding ${fd.id} anchor_paths「${p}」非法: ${r.reason ?? ''}`);
+        if (r.ok) {
+          need(!seenPaths.has(r.path), `finding ${fd.id} anchor_paths 重复: ${r.path}`);
+          seenPaths.add(r.path);
+        }
+      }
+      const cap = opts.anchorPathsMax ?? DEFAULT_ANCHOR_PATHS_MAX;
+      need(fd.anchor_paths.length <= cap,
+        `finding ${fd.id} 的 anchor_paths 有 ${fd.anchor_paths.length} 条 > 上限 ${cap}（SC-11: 广列路径会制造假冲突把可并行工作串行化；请由 origin 席拆分成多条 finding）`);
+      if (opts.trackedPaths) {
+        for (const p of fd.anchor_paths) {
+          const r = normalizeRepoPath(p);
+          if (r.ok) {
+            need(opts.trackedPaths.has(r.path),
+              `finding ${fd.id} 的 anchor_paths「${r.path}」不是 base∪candidate 里的 tracked 文件（目录/不存在路径不收——SC-11）`);
+          }
+        }
       }
     }
     need(typeof fd.evidence === 'string' && fd.evidence.length > 0, `finding ${fd.id} 缺 evidence`);
@@ -121,7 +164,14 @@ export function validateVerdict(v, opts = {}) {
 if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
   if (!args.verdict) fail('用法: verdict-validate.mjs --verdict <verdict.json> [--bundle <bundle.json>]');
-  const errs = validateVerdict(readJson(args.verdict), { bundle: args.bundle ? readJson(args.bundle) : null });
+  // SC-11: 传 --repo-dir 时启用 tracked 校验（plan 承诺但 R2 指出未实现）
+  const v0 = readJson(args.verdict);
+  let trackedPaths = null;
+  if (args['repo-dir']) {
+    trackedPaths = trackedPathSet({ repoDir: args['repo-dir'], baseSha: v0.base_sha, candidateSha: v0.candidate_sha });
+  }
+  const errs = validateVerdict(v0, {
+    trackedPaths, bundle: args.bundle ? readJson(args.bundle) : null });
   if (errs.length) {
     for (const e of errs) process.stderr.write(`[SCHEMA-FAIL] ${e}\n`);
     process.stderr.write('[VERDICT] degraded（schema 校验失败一律 degraded，⑨）\n');
