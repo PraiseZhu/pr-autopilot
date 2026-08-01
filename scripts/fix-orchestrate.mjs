@@ -152,16 +152,38 @@ export function branchCheckedOut({ repoDir, branch, exec = null }) {
   return String(out).split('\n').includes(`branch refs/heads/${branch}`);
 }
 
-// R7/R8-P1: 分支 CAS 删除的**补偿事务**（group / serial / integration 共用同一实现，
-// 避免两条路径漂移）。不变量: destructive step（update-ref -d）之后的任何异常都不得在
-// 补偿尝试前逃逸——包括复查命令自身失败（R8 实证: worktree list 普通 IO 失败即可让
-// 删除落地却既不回滚也不留 br-restore-fail，racer worktree 被打成 unborn）。
+// R7/R8/R9: 分支 CAS 删除的**补偿事务**（group / serial / integration 共用同一实现，
+// 避免路径漂移）。不变量: 一旦发起 destructive step（update-ref -d），后续任何异常都不得
+// 在补偿尝试前逃逸——**包括删除命令自身抛错**（R9 实证: git 可能已原子落盘而父进程回执
+// 丢失/被杀，把它当"删除未发生"就会留下已损坏的 racer worktree）与复查命令抛错
+// （R8 实证: worktree list 一次 IO 失败即可让删除落地却不回滚不留痕）。
 //   ① 预检查检出（含检查失败）→ fail-closed 不删
 //   ② CAS 删除（old = 记录 tip；不匹配 git 自己拒）
-//   ③ 删除后复查: 抛错 = **按不安全处理**（与"确实被检出"同路径）
-//   ④ 需补偿 → 创建式 CAS（old = 全零）按记录 tip 精确恢复；成功记 br-restored，
-//      失败记 br-restore-fail 并带完整 expected tip + 两个错误
+//   ③ 删除**抛错** = 结果不确定 → 读 ref 实际状态后 reconcile（R9）:
+//        ref 仍 == 记录 tip → 删除确实没发生，安全记 br-refused
+//        ref 已消失 / 读不出来 → 尝试创建式 CAS 恢复
+//        ref 变成第三方 tip → 绝不覆盖，记 br-restore-fail
+//   ④ 删除成功后复查: 抛错 = 按不安全处理（与"确实被检出"同路径）
+//   ⑤ 需补偿 → 创建式 CAS（old = 全零，不覆盖第三方同名新 ref）按记录 tip 精确恢复；
+//      成功记 br-restored（消息带触发原因），失败记 br-restore-fail + 完整 expected tip + 各错误
 function casDeleteBranch({ repoDir, branch, expectedTip, label, exec, g, steps, errors }) {
+  const ref = `refs/heads/${branch}`;
+  const readRef = () => {
+    try { return exec ? exec(['git', '-C', repoDir, 'rev-parse', ref]).trim() : git(repoDir, 'rev-parse', ref); }
+    catch { return null; } // ref 不存在 或 读取失败——两者都归入「不可证明仍在原位」
+  };
+  // 恢复: 仅当 ref 不存在时创建（old = 全零），因此永不覆盖第三方同名新 ref
+  const restore = (why, extra = '') => {
+    try {
+      g('update-ref', ref, expectedTip, '0'.repeat(40));
+      errors.push(`分支 ${branch} ${why}——已按记录 tip ${expectedTip} 恢复${extra}`);
+      steps.push(`br-restored:${label}`);
+    } catch (e) {
+      errors.push(`分支 ${branch} ${why}且恢复失败，请人工恢复到 ${expectedTip}: 恢复错误=${e.message}${extra}`);
+      steps.push(`br-restore-fail:${label}`);
+    }
+  };
+
   let checkedOut = null;
   try { checkedOut = branchCheckedOut({ repoDir, branch, exec }); }
   catch (e) {
@@ -175,27 +197,35 @@ function casDeleteBranch({ repoDir, branch, expectedTip, label, exec, g, steps, 
     steps.push(`br-refused:${label}`);
     return;
   }
-  try { g('update-ref', '-d', `refs/heads/${branch}`, expectedTip); }
-  catch (e) {
-    errors.push(`分支 CAS 删除失败 ${branch}: ${e.message}`);
-    steps.push(`br-refused:${label}`);
+
+  let delErr = null;
+  try { g('update-ref', '-d', ref, expectedTip); }
+  catch (e) { delErr = e; }
+
+  if (delErr) {
+    // R9-MUST-FIX: 删除报错 ≠ 删除未发生。按「结果不确定」reconcile，不得直接 return。
+    const cur = readRef();
+    if (cur === expectedTip) {
+      errors.push(`分支 CAS 删除失败 ${branch}（ref 仍在记录 tip 原位，未产生破坏）: ${delErr.message}`);
+      steps.push(`br-refused:${label}`);
+    } else if (cur !== null) {
+      errors.push(`分支 ${branch} 删除结果不确定，且 ref 现为 ${cur.slice(0, 12)} ≠ 记录 ${expectedTip}（第三方已抢占，绝不覆盖）: 删除错误=${delErr.message}`);
+      steps.push(`br-restore-fail:${label}`);
+    } else {
+      restore(`删除命令报错但 ref 已不可证明在原位（结果不确定，R9）`, ` / 删除错误=${delErr.message}`);
+    }
     return;
   }
-  // —— 以下已是「删除已落地」，必须走完补偿状态机 ——
+
+  // —— 以下已是「删除确认落地」，必须走完补偿状态机 ——
   let raced = false, recheckErr = null;
   try { raced = branchCheckedOut({ repoDir, branch, exec }); }
   catch (e) { raced = true; recheckErr = e; } // 复查失败 → 不可证明安全 → 按不安全处理（R8-P1）
   if (!raced) { steps.push(`br-deleted:${label}`); return; }
-  try {
-    g('update-ref', `refs/heads/${branch}`, expectedTip, '0'.repeat(40)); // 仅当 ref 不存在时恢复（不覆盖第三方同名新 ref）
-    errors.push(recheckErr
-      ? `分支 ${branch} 删除后复查失败（${recheckErr.message}）——按不安全处理，已按记录 tip ${expectedTip} 恢复（R8-P1）`
-      : `分支 ${branch} 删除时被检出竞态——已按记录 tip 原样恢复（R7-P1 补偿回滚）`);
-    steps.push(`br-restored:${label}`);
-  } catch (e2) {
-    errors.push(`分支 ${branch} 补偿恢复失败，请人工恢复到 ${expectedTip}: ${e2.message}${recheckErr ? ` / 复查错误: ${recheckErr.message}` : ''}`);
-    steps.push(`br-restore-fail:${label}`);
-  }
+  restore(
+    recheckErr ? `删除后复查失败（${recheckErr.message}）——按不安全处理（R8-P1）` : '删除时被检出竞态（R7-P1 补偿回滚）',
+    recheckErr ? ` / 复查错误=${recheckErr.message}` : ''
+  );
 }
 
 // git 已登记的 worktree 路径集合（SC-1 归属校验的唯一可信来源）

@@ -105,14 +105,14 @@ mini 盯梢修复: glm-5.2/max（send_to_session 克隆班车四元组）；卡�
 
 ## 残余风险登记（R3〜R8 对抗审查后归档，如实声明不冒充）
 
-修复编排链经六轮对抗复审（gpt-5.6-sol/xhigh）收敛。以下是**明知存在、判定为可接受**的面，
+修复编排链经**九轮**对抗复审（gpt-5.6-sol/xhigh；共收敛 5×P0 + 26×P1 + 4×P2）收敛。以下是**明知存在、判定为可接受**的面，
 不是遗漏——写在这里是为了不让任何人以为这套东西比它实际的更强。
 
 | 残余面 | 性质 | 为什么可接受 |
 |---|---|---|
 | **T1 是设计上限** | 全链保证等级 = 防疏忽/防漂移（honest-but-fallible lead），**不防恶意伪造** | 脚本与 lead 同 UID，恶意 lead 可直接改 push-guard 自身。真 T2 需宿主级签名回执，本仓做不到。任何读起来像"防恶意"的文案都是 bug，请提 issue |
-| verify 写 `sh -c` / `node -e` | 显式作恶，非疏忽 | `cmd` 是裸程序名白名单式约束，但 `sh`/`bash`/`node` 本身合法，args 可带 `-c`/`-e`。黑名单不完备（python/perl/env 都能解释器化）且制造假安全感。升 T2 的正解是签名 verifier registry，不是枚举黑名单 |
+| verify 可显式调用解释器（如 `sh -c` / `node -e`） | T1 信任边界内的显式作恶面 | `cmd` 仅做"裸程序名"语法约束，不是程序白名单；`args` 也不限制解释器开关。因此同 UID 的恶意 lead 可选择 PATH 中任意程序执行命令。若要把这一面纳入 T2，必须由宿主在隔离信任域中提供并签发 verifier registry/执行回执；在本仓枚举解释器黑名单不能形成安全边界 |
 | anchor hub 2+2 配对 | 合法冲突图结果 | hub 门是「≥3 条 SC 且 >50% 占比」。4 条 SC 用两个 hub 两两配对 → 4 组并 2 组，未触发门；但若 hub 是真实 changed evidence，这**就是**正确的冲突分组。hub 未实改的情形由共识入口的 changed-set 门拦住 |
 | 手工伪造 owner 印记 | T2 面 | 归属判据是 worktree admin git-dir 里的 `pr-autopilot-owner`（run_id + 随机 nonce）。手工复制 admin dir / nonce 属显式伪造。已验证正常生命周期无继承误判（remove/prune/同 basename 重建都不残留） |
-| cleanup 补偿恢复失败 | 显式报错，非静默 | 分支 CAS 删除后若复查发现竞态检出、而创建式 CAS 恢复又失败（如第三方已抢占同名 ref），记 `br-restore-fail` + 完整 expected tip + 两个错误交人工。不覆盖第三方 ref |
-| 外部 raw git 并发 | 有补偿事务兜底 | cleanup 的破坏性步骤后一律复查 + 按记录 tip 精确回滚；复查命令自身失败也按不安全处理走补偿（R8）。窗口后到达的 `worktree add` 因分支已删自行失败 |
+| cleanup 补偿恢复失败 | 显式报错，非静默 | 恢复用创建式 CAS（old = 全零），因此**永不覆盖**第三方同名新 ref；一旦恢复失败（如第三方已抢占该 ref）记 `br-restore-fail` + 完整 expected tip + 各错误交人工。不静默 |
+| 外部 raw git 并发 | 有补偿事务兜底 | 一旦发起破坏性步骤（`update-ref -d`），此后任何异常都不得在补偿尝试前逃逸：删除命令抛错按**结果不确定**处理（读 ref 后 reconcile：仍在原位→安全拒 / 已消失或读不出→恢复 / 第三方 tip→不覆盖，R9）；复查命令抛错按**不安全**处理走补偿（R8）；预检查抛错在破坏前 fail-closed。窗口后到达的 `worktree add` 因分支已删自行失败 |

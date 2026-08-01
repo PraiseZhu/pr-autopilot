@@ -3724,6 +3724,73 @@ t('[R8-P1] 删除后复查命令失败 → 按不安全处理: group 与 integra
   eq(C.g('rev-parse', 'refs/heads/fix/r8/g1'), C.T, '预检查失败时分支不得被删');
 });
 
+t('[R9] 删除命令抛错 = 结果不确定: 已落地→恢复 / 仍在原位→安全拒 / 第三方抢占→不覆盖', () => {
+  const mk = (branch) => {
+    const d = mkdtempSync(join(tmpdir(), 'r9-'));
+    const r = join(d, 'repo');
+    execFileSync('git', ['init', '-q', r]);
+    const g = (...a) => execFileSync('git', ['-C', r, ...a], { encoding: 'utf8' }).trim();
+    g('config', 'user.email', 'o@t'); g('config', 'user.name', 'o');
+    writeFileSync(join(r, 'f.ts'), 'x\n'); g('add', '.'); g('commit', '-qm', 'base');
+    const cand = g('rev-parse', 'HEAD');
+    writeFileSync(join(r, 'f.ts'), 'w\n'); g('add', '.'); g('commit', '-qm', 'w');
+    const T = g('rev-parse', 'HEAD');
+    g('checkout', '-q', cand);
+    g('branch', branch, T);
+    const wtRoot = join(d, 'wt'); mkdirSync(wtRoot);
+    const manifest = { repo_dir: r, run_id: 'r9', source_candidate: cand, integration_branch: null,
+      waves: [{ worktree_root: wtRoot, base: cand, tips: [{ group_id: 'g1', tip: T }],
+        allocations: [{ group_id: 'g1', worktree: join(wtRoot, 'r9-g1'), branch, base: cand, owner_nonce: 'x'.repeat(32) }] }] };
+    return { d, r, g, cand, T, manifest };
+  };
+  const real = (argv) => execFileSync(argv[0], argv.slice(1), { encoding: 'utf8' });
+
+  // ① R9 反例: 真实删除已落地（且 racer 已检出），但执行器在回执前抛错
+  //    → 旧实现记 br-refused 走人，ref 已消失、racer 被打成 unborn
+  const A = mk('fix/r9/a');
+  const racerA = join(A.d, 'racerA');
+  const execA = (argv) => {
+    if (argv.includes('update-ref') && argv.includes('-d')) {
+      real(['git', '-C', A.r, 'worktree', 'add', '-q', racerA, 'fix/r9/a']);
+      real(argv);                                    // 删除真实落地
+      throw new Error('update-ref 回执丢失（模拟进程被杀 / wrapper exit 42）');
+    }
+    return real(argv);
+  };
+  const rA = ORC.cleanupRun({ manifest: A.manifest, exec: execA });
+  ok(rA.steps.includes('br-restored:g1'), 'R9 核心: 删除已落地却报错 → 必须恢复而非记 br-refused: ' + JSON.stringify(rA.steps));
+  ok(rA.errors.some((e) => /结果不确定/.test(e) && e.includes(A.T)), '错误须说明结果不确定 + 完整 expected tip: ' + JSON.stringify(rA.errors));
+  eq(A.g('rev-parse', 'refs/heads/fix/r9/a'), A.T, '分支必须精确恢复');
+  eq(execFileSync('git', ['-C', racerA, 'status', '--porcelain'], { encoding: 'utf8' }).trim(), '', 'racer 基线无损');
+
+  // ② 删除真的没发生（ref 仍在记录 tip 原位）→ 安全记 br-refused，不误报恢复
+  const B = mk('fix/r9/b');
+  const execB = (argv) => {
+    if (argv.includes('update-ref') && argv.includes('-d')) throw new Error('删除被拒（old 不匹配 / 权限）');
+    return real(argv);
+  };
+  const rB = ORC.cleanupRun({ manifest: B.manifest, exec: execB });
+  ok(rB.steps.includes('br-refused:g1'), 'ref 仍在原位应记 br-refused: ' + JSON.stringify(rB.steps));
+  ok(!rB.steps.some((s) => s.startsWith('br-restored')), '不得误报恢复');
+  ok(rB.errors.some((e) => /仍在记录 tip 原位/.test(e)), JSON.stringify(rB.errors));
+  eq(B.g('rev-parse', 'refs/heads/fix/r9/b'), B.T, '分支未动');
+
+  // ③ 删除落地后第三方抢占同名 ref（不同 tip）→ 绝不覆盖，记 br-restore-fail
+  const C = mk('fix/r9/c');
+  const execC = (argv) => {
+    if (argv.includes('update-ref') && argv.includes('-d')) {
+      real(argv);                                                     // 删除落地
+      real(['git', '-C', C.r, 'update-ref', 'refs/heads/fix/r9/c', C.cand]); // 第三方抢占（tip = cand ≠ T）
+      throw new Error('回执丢失');
+    }
+    return real(argv);
+  };
+  const rC = ORC.cleanupRun({ manifest: C.manifest, exec: execC });
+  ok(rC.steps.includes('br-restore-fail:g1'), '第三方抢占应记 br-restore-fail: ' + JSON.stringify(rC.steps));
+  ok(rC.errors.some((e) => /第三方已抢占，绝不覆盖/.test(e)), JSON.stringify(rC.errors));
+  eq(C.g('rev-parse', 'refs/heads/fix/r9/c'), C.cand, '第三方 ref 必须原封不动');
+});
+
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
 console.log(`\n========== fixtures: ${pass} passed, ${failCount} failed ==========`);
