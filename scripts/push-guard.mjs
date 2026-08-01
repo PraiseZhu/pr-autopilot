@@ -60,7 +60,8 @@ export function validateManifest(manifest) {
     }
     // v2 编排链（审 R1-P1-3 时序修正）: 修复编排产物必须与**源共识**（修复前那份）绑定，
     // 而 manifest.consensus_artifact_hash 指向 delta 复核后的**终版共识**——两份不同，必须分开带。
-    // fix_orchestration 缺失 = 未走编排链（单 SC 或 fast 场景由下方条件豁免）。
+    // SC-2（R2-P1-1）: **是否必须走编排链不由 manifest 自报决定**（旧实现"声明了才验"=
+    // lead 省略即完全旁路）。判据从 artifact 派生，见 checkPushGuard 的 needsOrchestration。
     if (manifest.fix_orchestration) {
       const fo = manifest.fix_orchestration;
       for (const k of ['source_artifact_hash', 'sc_manifest_hash', 'fix_plan_hash', 'dispatch_record_hash']) {
@@ -205,8 +206,18 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
       errors.push('SC 清单 hash 与 sc_hash 不一致');
     }
     // ---- v2 修复编排链核验（审 R1-P1-3: 重算等价，非自报字符串比对） ----
-    // 需要在场: sourceArtifact（修复前源共识）+ scManifest + fixPlan + dispatchRecord。
-    // 缺任一 → 该项无法核验 → fail-closed（有 fix_orchestration 声明就必须能验）。
+    // SC-2（R2-P1-1）: 必走判据**从 artifact 派生**，不看 manifest 自报——
+    // 终版 artifact 有 parent（= 经过 delta 轮，说明修过）或 canonical_findings 非空
+    // （= 本次评审确认过问题，必然产生 SC 与修复）→ 强制编排链；lead 省略声明 = 拒。
+    // 仅「首轮零 finding 且无 parent」的直通 PR 允许无编排链。
+    if (artifact && !errors.length) {
+      const hasFindings = (artifact.canonical_findings ?? []).length > 0;
+      const hasParent = !!artifact.parent_artifact_hash;
+      const needsOrchestration = hasFindings || hasParent;
+      if (needsOrchestration && !manifest.fix_orchestration) {
+        errors.push(`本次评审有 ${hasFindings ? `${artifact.canonical_findings.length} 条 canonical finding` : 'delta 谱系(parent)'} → 必须走修复编排链并携带 fix_orchestration 四件套（SC-2: 省略声明不再是旁路，fail-closed）`);
+      }
+    }
     if (manifest.fix_orchestration && !errors.length) {
       const fo = manifest.fix_orchestration;
       const missing = [];
@@ -221,9 +232,14 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
         const srcReal = recomputeArtifactHash(sourceArtifact);
         if (srcReal !== sourceArtifact.consensus_artifact_hash) errors.push('源 consensus artifact hash 与内容重算不符');
         if (fo.source_artifact_hash !== srcReal) errors.push('fix_orchestration.source_artifact_hash ≠ 源 artifact 重算值');
-        // 源 artifact 必须是同一次评审（同 review_input_hash 谱系）且 candidate 是修复前的
-        if (sourceArtifact.review_input_hash && artifact.review_input_hash &&
-            sourceArtifact.base_sha !== artifact.base_sha) {
+        // SC-3（R2-P1-1）: **exact parent 绑定**——旧实现只比 base_sha，同 base 的任意
+        // 另一份源 artifact 都能冒充（SC/plan 于是绑在错误的 findings 上）。
+        if (!artifact.parent_artifact_hash) {
+          errors.push('终版 artifact 缺 parent_artifact_hash——delta 轮必须由 consensus-gate --parent 生成谱系（SC-3 fail-closed）');
+        } else if (artifact.parent_artifact_hash !== srcReal) {
+          errors.push(`源 artifact 不是终版 artifact 的 exact parent（parent=${artifact.parent_artifact_hash.slice(0, 12)} 源=${srcReal.slice(0, 12)}）——同 base 的另一份 artifact 冒充被拦（SC-3）`);
+        }
+        if (sourceArtifact.base_sha !== artifact.base_sha) {
           errors.push('源 artifact 与终版 artifact 的 base_sha 不同（跨评审拼接）');
         }
         // ② SC 覆盖门（绑源 artifact）——修 R1 既有洞: SC 必须真绑回 finding 且全覆盖

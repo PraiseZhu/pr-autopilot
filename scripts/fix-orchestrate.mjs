@@ -8,7 +8,7 @@
 // 隔离即安全: 每组在自己 worktree 里改，并发写危险从构造上消失（不是事后检查）。
 // git merge conflict 与 实改文件交集 是**真实**碰撞检测器，不是预测。
 import { execFileSync } from 'node:child_process';
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { readJson, writeJsonAtomic, parseArgs, fail, isMain, nowIso, normalizeRepoPath } from './lib/common.mjs';
 
@@ -115,20 +115,50 @@ export function integrateWave({ repoDir, waveBase, groupTips, exec = null }) {
   return report;
 }
 
+// git 已登记的 worktree 路径集合（SC-1 归属校验的唯一可信来源）
+export function registeredWorktrees({ repoDir, exec = null }) {
+  const out = exec ? exec(['git', '-C', repoDir, 'worktree', 'list', '--porcelain']) : git(repoDir, 'worktree', 'list', '--porcelain');
+  const paths = [];
+  for (const line of String(out).split('\n')) {
+    const m = line.match(/^worktree (.+)$/);
+    if (m) { try { paths.push(realpathSync(m[1])); } catch { paths.push(m[1]); } }
+  }
+  return paths;
+}
+
 // 清理本 run 的全部 worktree/分支（终态或 replan 时调用）
+// SC-1（R2-P1-7）: **删除 raw rmSync 兜底**。只回收「本 run 命名规则登记 且 出现在
+// git worktree list 里」的路径——归属不符一律 fail-closed 不删（防 worktreeRoot 传错
+// 时把无关目录递归删掉）。git worktree remove 失败 → 记 wt-fail 交人工，绝不自己动手删。
 export function cleanupRun({ repoDir, worktreeRoot, runId, plan, exec = null }) {
   const g = exec ? (...a) => exec(['git', '-C', repoDir, ...a]) : (...a) => git(repoDir, ...a);
   const steps = [];
+  const errors = [];
+  let registered = [];
+  try { registered = registeredWorktrees({ repoDir, exec }); }
+  catch (e) { return { steps, errors: [`无法读取 git worktree 列表（fail-closed 不删任何目录）: ${e.message}`] }; }
+
   for (const group of plan.groups ?? []) {
     const wtPath = groupWorktreePath(worktreeRoot, runId, group.id);
     if (existsSync(wtPath)) {
+      let real = wtPath;
+      try { real = realpathSync(wtPath); } catch { /* 保持原值 */ }
+      if (!registered.includes(real)) {
+        errors.push(`拒绝回收 ${wtPath}: 不在本仓 git worktree 登记列表内（归属不符，fail-closed——不删未登记目录）`);
+        steps.push(`wt-refused:${group.id}`);
+        continue;
+      }
       try { g('worktree', 'remove', '--force', wtPath); steps.push(`wt-removed:${group.id}`); }
-      catch { try { rmSync(wtPath, { recursive: true, force: true }); steps.push(`wt-rm:${group.id}`); } catch { steps.push(`wt-fail:${group.id}`); } }
+      catch (e) {
+        // 不再 rmSync 兜底: 交人工，避免误删
+        errors.push(`git worktree remove 失败（不做强删兜底，请人工检查 ${wtPath}）: ${e.message}`);
+        steps.push(`wt-fail:${group.id}`);
+      }
     }
     try { g('branch', '-D', groupBranch(runId, group.id)); steps.push(`br-deleted:${group.id}`); } catch { steps.push(`br-absent:${group.id}`); }
   }
   try { g('worktree', 'prune'); } catch { /* best-effort */ }
-  return { steps };
+  return { steps, errors };
 }
 
 if (isMain(import.meta.url)) {

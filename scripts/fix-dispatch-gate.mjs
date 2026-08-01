@@ -15,9 +15,9 @@
 //   ⑤ 每组必须有交卷材料（tip SHA + 交卷摘要）——空壳记录不算派发
 //   ⑥ 批次: 组数 > capacity 时必须分批且每批 size <= capacity，各批组不重复
 import { readJson, parseArgs, fail, isMain } from './lib/common.mjs';
-import { computeFixPlanHash } from './fix-plan.mjs';
+import { computeFixPlanHash, trustedCapacity } from './fix-plan.mjs';
 
-export function checkDispatch({ plan, record }) {
+export function checkDispatch({ plan, record, capacity: capacityOverride = null, configPath = undefined }) {
   const errs = [];
   const need = (c, m) => { if (!c) errs.push(m); };
 
@@ -31,7 +31,14 @@ export function checkDispatch({ plan, record }) {
   need(record.fix_plan_hash === real,
     `dispatch record 的 fix_plan_hash 与 plan 重算值不符（record=${String(record.fix_plan_hash).slice(0, 12)} 实=${real.slice(0, 12)}）——记录未绑定本 plan`);
 
-  const capacity = Number(plan.capacity ?? 8);
+  // SC-6: capacity 独立从可信配置读并与 plan 声明比对——不信 plan/record 自报
+  let capacity = capacityOverride;
+  if (capacity === null) {
+    try { capacity = trustedCapacity(configPath ? { configPath } : {}); }
+    catch (e) { errs.push(`capacity 不可得（fail-closed）: ${e.message}`); return errs; }
+  }
+  need(plan.capacity === capacity,
+    `plan.capacity=${plan.capacity} 与可信配置 ${capacity} 不符（SC-6: capacity 不得由 lead 自报，改并行上限只能 owner 改 config/orchestration.json）`);
   const waves = Array.isArray(record.waves) ? record.waves : [];
   need(waves.length === plan.waves.length, `record 波数 ${waves.length} ≠ plan 波数 ${plan.waves.length}`);
 
@@ -64,23 +71,55 @@ export function checkDispatch({ plan, record }) {
         seenWorkers.add(wid);
       }
       need(/^[0-9a-f]{40}$/.test(String(d.tip ?? '')), `wave${wi + 1}: 组 ${d.group_id} 缺合法 tip SHA（交卷材料，空壳记录不算派发）`);
-      need(typeof d.report === 'string' && d.report.trim().length > 0, `wave${wi + 1}: 组 ${d.group_id} 缺交卷摘要 report`);
+      // SC-10（R2-P1-6）: 交卷必须**结构化 PASS**——旧实现只要非空字符串，report='FAIL' 也过
+      const res = d.result;
+      need(res && typeof res === 'object', `wave${wi + 1}: 组 ${d.group_id} 缺结构化 result{status, sc_results[]}`);
+      if (res && typeof res === 'object') {
+        need(res.status === 'PASS', `wave${wi + 1}: 组 ${d.group_id} result.status=${res.status} ≠ PASS（失败交卷不算完工）`);
+        const srs = Array.isArray(res.sc_results) ? res.sc_results : null;
+        need(srs && srs.length > 0, `wave${wi + 1}: 组 ${d.group_id} 缺 sc_results[]`);
+        if (srs) {
+          const group = (plan.groups ?? []).find((x) => x.id === d.group_id);
+          const wantScs = new Set(group?.sc_ids ?? []);
+          const gotScs = new Set(srs.map((x) => x.sc_id));
+          for (const sc of wantScs) need(gotScs.has(sc), `wave${wi + 1}: 组 ${d.group_id} 的 sc_results 缺 ${sc}`);
+          for (const sr of srs) {
+            need(sr.status === 'PASS', `wave${wi + 1}: 组 ${d.group_id} 的 ${sr.sc_id} status=${sr.status} ≠ PASS`);
+            need(typeof sr.evidence === 'string' && sr.evidence.trim().length > 0, `wave${wi + 1}: ${sr.sc_id} 缺 evidence`);
+          }
+        }
+      }
     }
 
-    // ⑥ 批次
+    // ⑥ SC-6（R2-P1-3）: 批次必须是**确定性 canonical partition**——
+    // 旧实现只查「每批 ≤ capacity」，singleton batches（capacity=1 或 [[g1],[g2],[g3]]）
+    // 与幽灵 id 都能过 = 合法全串行。现要求: 集合 exact 相等、批数 exact、除末批外满载。
     const batches = Array.isArray(rec.batches) ? rec.batches : null;
+    const expectBatches = Math.ceil(planned.length / capacity);
     if (planned.length > capacity) {
-      need(batches && batches.length >= Math.ceil(planned.length / capacity),
-        `wave${wi + 1}: ${planned.length} 组 > capacity ${capacity}，必须分批记录（batches）`);
-      if (batches) {
-        const flat = batches.flat();
-        need(flat.length === planned.length, `wave${wi + 1}: batches 覆盖 ${flat.length} 组 ≠ 计划 ${planned.length} 组`);
-        need(new Set(flat).size === flat.length, `wave${wi + 1}: batches 有重复组`);
-        for (const b of batches) need(b.length <= capacity, `wave${wi + 1}: 某批 ${b.length} 组超 capacity ${capacity}`);
-      }
-    } else if (batches) {
+      need(batches, `wave${wi + 1}: ${planned.length} 组 > capacity ${capacity}，必须分批记录（batches）`);
+    }
+    if (batches) {
       const flat = batches.flat();
+      need(flat.length === planned.length, `wave${wi + 1}: batches 覆盖 ${flat.length} 组 ≠ 计划 ${planned.length} 组`);
       need(new Set(flat).size === flat.length, `wave${wi + 1}: batches 有重复组`);
+      for (const g of flat) need(plannedSet.has(g), `wave${wi + 1}: batches 含幽灵组 ${g}`);
+      for (const g of planned) need(flat.includes(g), `wave${wi + 1}: batches 缺计划组 ${g}`);
+      need(batches.length === expectBatches,
+        `wave${wi + 1}: 批数 ${batches.length} ≠ ceil(${planned.length}/${capacity})=${expectBatches}（canonical partition：不得把可并行的组拆成更多批串行化）`);
+      batches.forEach((b, bi) => {
+        if (bi < batches.length - 1) {
+          need(b.length === capacity, `wave${wi + 1} 第 ${bi + 1} 批 size=${b.length} ≠ capacity ${capacity}（非末批必须满载，否则等于降并行）`);
+        } else {
+          need(b.length >= 1 && b.length <= capacity, `wave${wi + 1} 末批 size=${b.length} 非法`);
+        }
+      });
+    }
+    // n_min_per_wave 消费（R2: 此前从未使用）——实际并行组数不得低于计划下界
+    const nMin = Array.isArray(plan.n_min_per_wave) ? plan.n_min_per_wave[wi] : null;
+    if (Number.isInteger(nMin)) {
+      const firstBatch = batches ? batches[0].length : dispatches.length;
+      need(firstBatch >= nMin, `wave${wi + 1}: 首批并行 ${firstBatch} 组 < 计划下界 n_min ${nMin}（该并行没并行）`);
     }
   }
   return errs;

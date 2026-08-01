@@ -1,0 +1,8 @@
+{
+  "_comment": "修复编排可信运行时配置（SC-6: capacity 不得由 lead 自报——planner 与 push-guard 各自独立从本文件读取并校验）。本文件是宪法层配置，改动只能 owner 亲手提交。",
+  "schema_version": "v1",
+  "max_parallel_workers": 8,
+  "_max_parallel_workers_note": "Orca 单 workflow 硬上限（当前 8）。owner 2026-08-01: 该并行必须并行、拉满 8 也可以。改这个数字 = 改并行上限，必须 owner 亲手。",
+  "anchor_paths_max_per_finding": 20,
+  "_anchor_paths_note": "SC-11: 单条 finding 的 anchor_paths 数量上限。超出 → degraded，要求 origin 席拆分补发（防把「影响范围」当「证据锚点」广列，进而制造假冲突把并行工作串行化）。"
+}

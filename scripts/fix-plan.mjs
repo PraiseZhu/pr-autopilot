@@ -11,11 +11,51 @@
 //   5. 任何 fix/verify SC 引用的 finding 缺 anchor_paths → degraded，不产出可派工 plan
 //
 // 单调性: 冲突边由脚本连成，lead 不可拆（拆=切冲突边=并发改同文件）也不可合并独立组。
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { readJson, parseArgs, fail, isMain, hashObject, canonicalJson } from './lib/common.mjs';
 
+const HERE = dirname(fileURLToPath(import.meta.url));
 const TEST_PATH_RE = /(^|\/)(e2e|fixtures)\/|\.(test|spec)\.[a-z]+$/i;
 
-export function buildFixPlan({ artifact, manifest, capacity = 8 }) {
+// SC-6（R2-P1-3）: capacity 的**唯一可信来源**是宪法层配置文件，planner 与 push-guard
+// 各自独立读取——旧实现 `Number(args.capacity ?? 8)` 是 lead 自报，填 1 就能合法全串行。
+export function trustedCapacity({ configPath = join(HERE, '../config/orchestration.json') } = {}) {
+  const cfg = readJson(configPath);
+  const n = cfg.max_parallel_workers;
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`config/orchestration.json 的 max_parallel_workers 非法（${n}）——必须是 ≥1 整数（fail-closed）`);
+  }
+  return n;
+}
+
+// 文件域相交 → union-find 同组。确定性: 组内 sc_ids 字典序、组按最小 sc_id 排序。
+export function groupByConflict(items) {
+  const parent = new Map(items.map((s) => [s.sc_id, s.sc_id]));
+  const find = (x) => { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; };
+  const unite = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent.set(ra, rb); };
+  for (let i = 0; i < items.length; i++) {
+    for (let j = i + 1; j < items.length; j++) {
+      const A = new Set(items[i].paths);
+      if (items[j].paths.some((p) => A.has(p))) unite(items[i].sc_id, items[j].sc_id);
+    }
+  }
+  const byRoot = new Map();
+  for (const s of items) {
+    const r = find(s.sc_id);
+    if (!byRoot.has(r)) byRoot.set(r, { sc_ids: [], paths: new Set() });
+    const g = byRoot.get(r);
+    g.sc_ids.push(s.sc_id);
+    for (const p of s.paths) g.paths.add(p);
+  }
+  return [...byRoot.values()]
+    .map((g) => ({ sc_ids: g.sc_ids.sort(), paths: [...g.paths].sort() }))
+    .sort((a, b) => a.sc_ids[0].localeCompare(b.sc_ids[0]));
+}
+
+export function buildFixPlan({ artifact, manifest, capacity = null, configPath = undefined }) {
+  // capacity 参数只允许 fixture 注入；生产路径一律从可信配置读
+  const cap = capacity ?? trustedCapacity(configPath ? { configPath } : {});
   const findingById = new Map((artifact.canonical_findings ?? []).map((f) => [f.id, f]));
   const scs = manifest.scs ?? [];
   const degraded = [];
@@ -48,48 +88,27 @@ export function buildFixPlan({ artifact, manifest, capacity = 8 }) {
 
   if (degraded.length) return { degraded: true, reasons: degraded };
 
-  // 冲突图 union-find（仅 fix-SC；文件域相交 → 同组）
-  const parent = new Map(fixScs.map((s) => [s.sc_id, s.sc_id]));
-  const find = (x) => { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; };
-  const unite = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parent.set(ra, rb); };
-  for (let i = 0; i < fixScs.length; i++) {
-    for (let j = i + 1; j < fixScs.length; j++) {
-      const A = new Set(fixScs[i].paths);
-      if (fixScs[j].paths.some((p) => A.has(p))) unite(fixScs[i].sc_id, fixScs[j].sc_id);
-    }
-  }
-  // 收组
-  const byRoot = new Map();
-  for (const s of fixScs) {
-    const r = find(s.sc_id);
-    if (!byRoot.has(r)) byRoot.set(r, { sc_ids: [], paths: new Set() });
-    const g = byRoot.get(r);
-    g.sc_ids.push(s.sc_id);
-    for (const p of s.paths) g.paths.add(p);
-  }
-  // 确定性: 组内 sc_ids 字典序，组按最小 sc_id 排序，赋 g1..gN
-  const fixGroups = [...byRoot.values()]
-    .map((g) => ({ sc_ids: g.sc_ids.sort(), paths: [...g.paths].sort() }))
-    .sort((a, b) => a.sc_ids[0].localeCompare(b.sc_ids[0]))
-    .map((g, i) => ({ id: `g${i + 1}`, ...g }));
+  // 冲突图分组（fix 与 verify 共用同一确定性算法——SC-7）
+  const fixGroups = groupByConflict(fixScs).map((g, i) => ({ id: `g${i + 1}`, ...g }));
 
-  // verify 组: 全部 verify-SC 合成一组进最后一波（它们跑测试，天然可共存于集成 tip）
+  // SC-7（R2-P1-6）: verify SC **也按冲突图分组**，末波内保持多组并行——
+  // 旧实现把所有互不相交的 verify SC 合成一个 worker，直接违反 owner「该并行必须并行」。
   const groups = [...fixGroups];
   const waves = [];
   if (fixGroups.length) waves.push(fixGroups.map((g) => g.id));
   if (verifyScs.length) {
-    const vg = { id: `v${fixGroups.length + 1}`, sc_ids: verifyScs.map((s) => s.sc_id).sort(), paths: [...new Set(verifyScs.flatMap((s) => s.paths))].sort(), verify: true };
-    groups.push(vg);
-    waves.push([vg.id]);
+    const vGroups = groupByConflict(verifyScs).map((g, i) => ({ id: `v${i + 1}`, ...g, verify: true }));
+    groups.push(...vGroups);
+    waves.push(vGroups.map((g) => g.id));
   }
 
   const plan = {
     schema_version: 'v1',
     consensus_artifact_hash: artifact.consensus_artifact_hash,
-    capacity,
+    capacity: cap,
     groups,
     waves,
-    n_min_per_wave: waves.map((w) => Math.min(w.length, capacity))
+    n_min_per_wave: waves.map((w) => Math.min(w.length, cap))
   };
   plan.fix_plan_hash = computeFixPlanHash(plan);
   return { degraded: false, plan };
@@ -109,11 +128,10 @@ export function computeFixPlanHash(plan) {
 if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
   if (!args.artifact || !args.manifest) {
-    fail('用法: fix-plan.mjs --artifact <consensus.json> --manifest <sc-manifest.json> [--capacity 8] [--out plan.json]');
+    fail('用法: fix-plan.mjs --artifact <consensus.json> --manifest <sc-manifest.json> [--out plan.json]\n（capacity 来自 config/orchestration.json，SC-6: 不接受 CLI 自报）');
   }
   const r = buildFixPlan({
-    artifact: readJson(args.artifact), manifest: readJson(args.manifest),
-    capacity: Number(args.capacity ?? 8)
+    artifact: readJson(args.artifact), manifest: readJson(args.manifest)
   });
   if (r.degraded) {
     for (const m of r.reasons) process.stderr.write(`[FIX-PLAN-DEGRADED] ${m}\n`);

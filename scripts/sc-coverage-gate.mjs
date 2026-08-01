@@ -31,31 +31,51 @@ export function checkScCoverage({ manifest, artifact }) {
   const scs = Array.isArray(manifest.scs) ? manifest.scs : [];
   need(scs.length > 0, 'sc manifest 无 SC');
 
-  // ③④ 逐 SC 结构
-  const covered = new Set();
+  // ③④ 逐 SC 结构 + SC-4 一对一双射
+  // SC-4（R2-P1-2）: 非 global SC 必须**恰好引用 1 条** finding，且每条 blocker/major finding
+  // **恰好被 1 条** SC 引用。旧实现允许一条 SC 引用任意多 finding → lead 可写 mega-SC
+  // 把多个不相交 finding 塞成一条，使 fix-plan 的冲突图合法退化为单组 = 合法全串行。
+  // 多步骤修复写在 change/holds 文本里，不得借 finding_ids 合组。
+  const coverCount = new Map();
   let globalCount = 0;
   const seenScIds = new Set();
+  const SC_ID_RE = /^SC-[A-Za-z0-9._-]+$/;
   for (const sc of scs) {
+    // schema 约束在此真正执行（R2: schema 此前未被任何代码校验）
+    need(typeof sc.id === 'string' && SC_ID_RE.test(sc.id), `SC id 格式非法: ${JSON.stringify(sc.id)}（须 ^SC-[A-Za-z0-9._-]+$）`);
     need(!seenScIds.has(sc.id), `SC id 重复: ${sc.id}`);
     seenScIds.add(sc.id);
+    for (const f of ['change', 'holds', 'verify']) {
+      need(typeof sc[f] === 'string' && sc[f].trim().length > 0, `SC ${sc.id} 缺必填字段 ${f}`);
+    }
     const fids = Array.isArray(sc.finding_ids) ? sc.finding_ids : [];
     if (sc.kind === 'global') {
       globalCount++;
       need(fids.length === 0, `global SC ${sc.id} 不得引用 finding（它是中央验证步）`);
     } else {
       need(['fix', 'verify'].includes(sc.kind), `SC ${sc.id} kind 非法: ${sc.kind}`);
-      need(fids.length >= 1, `SC ${sc.id}（${sc.kind}）必须引用 ≥1 finding`);
+      need(fids.length === 1,
+        `SC ${sc.id}（${sc.kind}）必须**恰好引用 1 条** finding，实际 ${fids.length}（SC-4: 禁 mega-SC——多个 finding 塞一条会让分组合法退化为串行；多步骤写在 change/holds 文本里）`);
       for (const fid of fids) {
         need(canonicalIds.has(fid), `SC ${sc.id} 引用悬空 finding_id: ${fid}（不在 consensus artifact 中）`);
-        covered.add(fid);
+        coverCount.set(fid, (coverCount.get(fid) ?? 0) + 1);
       }
     }
   }
   need(globalCount <= 1, `global SC 至多 1 条，得到 ${globalCount}`);
 
-  // ② blocker/major 全覆盖
+  // ② blocker/major 恰好被 1 条 SC 覆盖（漏项 & 重复覆盖都拒）
   for (const f of mustCover) {
-    need(covered.has(f.id), `canonical finding ${f.id}（${f.severity}/${f.primary_face}）未被任何 SC 覆盖——三审确认的问题不得在修复阶段静默丢弃`);
+    const n = coverCount.get(f.id) ?? 0;
+    if (n === 0) {
+      need(false, `canonical finding ${f.id}（${f.severity}/${f.primary_face}）未被任何 SC 覆盖——三审确认的问题不得在修复阶段静默丢弃`);
+    } else {
+      need(n === 1, `canonical finding ${f.id} 被 ${n} 条 SC 重复引用（SC-4: 必须一对一，重复覆盖会污染分组）`);
+    }
+  }
+  // suggestion 级被引用也须唯一（防用 suggestion 当合组载体）
+  for (const [fid, n] of coverCount) {
+    if (!mustCover.some((f) => f.id === fid)) need(n === 1, `finding ${fid} 被 ${n} 条 SC 引用（须唯一）`);
   }
   return errs;
 }

@@ -18,6 +18,7 @@ import { validateVerdict } from './verdict-validate.mjs';
 import { computeReviewInputHash } from './review-input-hash.mjs';
 
 const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
+const SEVERITY_RANK = { suggestion: 1, major: 2, blocker: 3 }; // SC-5: canonical 取最高
 
 // 聚类 key（仅用于去重展示，不参与放行判定）:
 // face + 去行号规整 anchor + 语义指纹。同 key 的多席条目并入一簇，
@@ -36,6 +37,9 @@ export function canonicalFindingKey(finding) {
 
 export function runConsensusGate(verdicts, opts = {}) {
   const bundle = opts.bundle ?? null;
+  // SC-3（R2-P1-1）: delta 轮必须 exact 绑定上一轮 artifact——只比 base_sha 挡不住
+  // 「同 base 的另一份源 artifact 冒充」。首轮为 null。
+  const parentArtifactHash = opts.parentArtifactHash ?? null;
   const failReasons = [];
 
   if (!bundle) failReasons.push('缺 review bundle（共识脚本必须重算 input hash，不信 opaque 值）');
@@ -119,6 +123,10 @@ export function runConsensusGate(verdicts, opts = {}) {
       const c = union.get(key);
       c.origins.push({ reviewer: v.reviewer, finding_id: fd.id });
       for (const p of fd.anchor_paths ?? []) if (!c.anchor_paths.includes(p)) c.anchor_paths.push(p);
+      // SC-5（R2-P1-2 附带洞）: canonical severity 取同簇**最高**——旧实现取首个 origin，
+      // 一席 suggestion 一席 major 时输入顺序能把 canonical 降为 suggestion，
+      // 从而绕过 coverage gate 的强制覆盖。
+      if (SEVERITY_RANK[fd.severity] > SEVERITY_RANK[c.severity]) c.severity = fd.severity;
     }
   }
 
@@ -130,12 +138,15 @@ export function runConsensusGate(verdicts, opts = {}) {
   const base_sha = verdicts[0].base_sha;
   const candidate_sha = verdicts[0].candidate_sha;
   // 审③-F4-R: base/candidate 必须入锅——只改 artifact 声明的 SHA 即 hash 失效
+  // SC-3: parent_artifact_hash 一并入锅——谱系被换即 hash 失效
   const consensus_artifact_hash = sha256(
-    base_sha + candidate_sha + review_input_hash + canonicalJson(canonical_findings) + canonicalJson(verdict_hashes)
+    base_sha + candidate_sha + review_input_hash + canonicalJson(canonical_findings) + canonicalJson(verdict_hashes) +
+    canonicalJson({ parent: parentArtifactHash })
   );
   return {
-    schema_version: 'v1',
+    schema_version: 'v2',
     review_input_hash,
+    parent_artifact_hash: parentArtifactHash,
     base_sha,
     candidate_sha,
     canonical_findings,
@@ -151,17 +162,19 @@ export function runConsensusGate(verdicts, opts = {}) {
 export function recomputeArtifactHash(artifact) {
   return sha256(
     artifact.base_sha + artifact.candidate_sha + artifact.review_input_hash +
-    canonicalJson(artifact.canonical_findings) + canonicalJson(artifact.verdict_hashes)
+    canonicalJson(artifact.canonical_findings) + canonicalJson(artifact.verdict_hashes) +
+    canonicalJson({ parent: artifact.parent_artifact_hash ?? null })
   );
 }
 
 if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
   if (args._.length < 3 || !args.bundle) {
-    fail('用法: consensus-gate.mjs <v1.json> <v2.json> <v3.json> --bundle <bundle.json> [--out artifact.json]');
+    fail('用法: consensus-gate.mjs <v1.json> <v2.json> <v3.json> --bundle <bundle.json> [--parent <prev-artifact.json>] [--out artifact.json]\n（delta 轮必须传 --parent 上一轮 artifact——SC-3 exact 谱系绑定）');
   }
   const verdicts = args._.slice(0, 3).map(readJson);
-  const result = runConsensusGate(verdicts, { bundle: readJson(args.bundle) });
+  const parentArtifactHash = args.parent ? readJson(args.parent).consensus_artifact_hash : null;
+  const result = runConsensusGate(verdicts, { bundle: readJson(args.bundle), parentArtifactHash });
   if (result.gate_result === 'pass') {
     if (args.out) writeJsonAtomic(args.out, result);
     process.stdout.write(`PASS consensus_artifact_hash=${result.consensus_artifact_hash}\n`);
