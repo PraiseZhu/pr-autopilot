@@ -2262,6 +2262,94 @@ t('[P0-⑦] probe 探针: 无活 SKIP / 新信号·租约过期·canceling·终�
   eq(P9().work, false, '杂质文件不得放行班车');
 });
 
+// ========== 16. merged 远端分支清理（owner 2026-08-01 点单） ==========
+console.log('\n[16] branch-cleanup: merged 远端分支清理硬门');
+
+t('[branch-cleanup] 保护分支/野 remote/无锚点/头漂移全拒；already-gone 幂等；正例 argv 钉死', async () => {
+  const { cleanupRemoteBranch } = await import('../scripts/pr-watch/branch-cleanup.mjs');
+  const SHA = 'a'.repeat(40);
+  const calls = [];
+  const mkExec = (lsOut) => (argv) => {
+    calls.push(argv.join(' '));
+    if (argv.includes('ls-remote')) return lsOut;
+    return '';
+  };
+  const base9 = { repoDir: repo, remote: 'origin', branch: 'feat', repoFullName: 'o/r', expectedHeadSha: SHA };
+  // ① 保护分支硬名单（任何配置不可放开）
+  for (const b of ['main', 'master', 'develop', 'release/1.0', 'deploy/green']) {
+    const r = cleanupRemoteBranch({ ...base9, branch: b, exec: mkExec('') });
+    ok(!r.deleted && r.skipped && /保护分支/.test(r.reason), `保护分支必须拒: ${b}`);
+  }
+  // ② 野 remote（evilhost 在 repo 里配置的 URL 非 github/o/r）→ validate 拦
+  let r = cleanupRemoteBranch({ ...base9, remote: 'evilhost', exec: mkExec('') });
+  ok(r.skipped && /校验未过/.test(r.reason), '野 remote 必须拒');
+  // ③ 无 PR head 锚点 → 拒
+  r = cleanupRemoteBranch({ ...base9, expectedHeadSha: 'HEAD', exec: mkExec('') });
+  ok(r.skipped && /锚点/.test(r.reason));
+  // ④ 远端头 ≠ 被合并 PR head（merge 后有人推了新提交）→ 拒且绝不执行 push
+  calls.length = 0;
+  r = cleanupRemoteBranch({ ...base9, exec: mkExec(`${'b'.repeat(40)}\trefs/heads/feat\n`) });
+  ok(r.skipped && /新提交/.test(r.reason), '头漂移必须拒');
+  ok(!calls.some((c) => c.includes('--delete')), '拒删路径绝不执行 push');
+  // ⑤ already-gone（GitHub auto-delete 已删）→ 幂等跳过
+  r = cleanupRemoteBranch({ ...base9, exec: mkExec('') });
+  ok(r.skipped && r.alreadyGone === true);
+  // ⑥ 正例: ls-remote 头等于 PR head → 删除，argv 固定普通 delete refspec
+  calls.length = 0;
+  r = cleanupRemoteBranch({ ...base9, exec: mkExec(`${SHA}\trefs/heads/feat\n`) });
+  ok(r.deleted === true, r.reason);
+  eq(r.argv, ['git', '-C', repo, 'push', 'origin', '--delete', 'feat'], '删除 argv 必须钉死');
+  // ⑦ push 失败 → 异常上抛（由引擎 journal，不静默）
+  let threw9 = false;
+  try {
+    cleanupRemoteBranch({ ...base9, exec: (argv) => { if (argv.includes('--delete')) throw new Error('remote rejected'); return `${SHA}\trefs/heads/feat\n`; } });
+  } catch (e) { threw9 = /remote rejected/.test(e.message); }
+  ok(threw9);
+});
+
+t('[branch-cleanup] 引擎接线: 默认关闭零行为；开启后 merged 才触发、失败留痕不阻塞销单', () => {
+  const dD = mkdtempSync(join(tmpdir(), 'bc16-'));
+  const stDir = join(dD, 'state'); mkdirSync(stDir);
+  const snapJson = join(dD, 'snap.json');
+  writeFileSync(join(dD, 'snap.sh'), `#!/bin/sh\ncat "${snapJson}"\n`);
+  writeFileSync(join(dD, 'nul.sh'), '#!/bin/sh\ncat > /dev/null\n');
+  for (const f of ['snap.sh', 'nul.sh']) execFileSync('chmod', ['+x', join(dD, f)]);
+  const bizD = mkdtempSync(join(tmpdir(), 'bizD-'));
+  {
+    const g = (...a) => execFileSync('git', ['-C', bizD, ...a], { encoding: 'utf8' });
+    g('init', '-q', '-b', 'main'); g('config', 'user.email', 'x@t'); g('config', 'user.name', 'x');
+    writeFileSync(join(bizD, 'f.txt'), '1'); g('add', '.'); g('commit', '-qm', 'i');
+    g('remote', 'add', 'origin', join(dD, 'not-github.git')); // 本地路径 URL → validate 必拦（fail-closed 展示面）
+  }
+  const jf = join(dD, 'journal.jsonl');
+  const ENGD = (over = {}) => ({
+    stateDir: stDir, leaseFile: join(dD, 'lease.json'),
+    snapshotCmd: join(dD, 'snap.sh') + ' {owner} {repo} {pr}', dispatchCmd: join(dD, 'nul.sh'),
+    journalFile: jf, hmacKey: HMAC_KEY,
+    budget: { ledger: join(dD, 'b.jsonl'), cap: 100, estimate: 1 },
+    repoDirs: { 'o/mivo-canvas': bizD }, ...over
+  });
+  // 默认关闭: merged 销单，无 branch-cleanup 痕迹
+  registerPr({ stateDir: stDir, owner: 'o', repo: 'mivo-canvas', prNumber: 81, branch: 'f81', pushRemote: 'origin' });
+  writeFileSync(snapJson, JSON.stringify({ ...snapBase, state: 'merged' }));
+  runEngine(ENGD());
+  ok(!existsSync(join(stDir, stateFileName('o', 'mivo-canvas', 81))), '销单正常');
+  ok(!readFileSync(jf, 'utf8').includes('branch-cleanup'), '默认 off 零行为');
+  // 开启: merged → 尝试清理（本例被 URL 校验拦下 = skipped 留痕），销单不受阻
+  registerPr({ stateDir: stDir, owner: 'o', repo: 'mivo-canvas', prNumber: 82, branch: 'f82', pushRemote: 'origin' });
+  runEngine(ENGD({ deleteRemoteBranchOnMerge: true }));
+  ok(!existsSync(join(stDir, stateFileName('o', 'mivo-canvas', 82))), '清理被拦不得阻塞销单');
+  const jTxt = readFileSync(jf, 'utf8');
+  ok(jTxt.includes('"kind":"branch-cleanup"') && /校验未过/.test(jTxt), '开启后必须留痕（本例 fail-closed 拦下）');
+  // closed（未合并）: 开启也绝不触发清理
+  registerPr({ stateDir: stDir, owner: 'o', repo: 'mivo-canvas', prNumber: 83, branch: 'f83', pushRemote: 'origin' });
+  writeFileSync(snapJson, JSON.stringify({ ...snapBase, state: 'closed' }));
+  runEngine(ENGD({ deleteRemoteBranchOnMerge: true }));
+  ok(!existsSync(join(stDir, stateFileName('o', 'mivo-canvas', 83))));
+  const after83 = readFileSync(jf, 'utf8').split('\n').filter((l) => l.includes('#83'));
+  ok(!after83.some((l) => l.includes('branch-cleanup')), 'closed 未合并绝不碰分支');
+});
+
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
 console.log(`\n========== fixtures: ${pass} passed, ${failCount} failed ==========`);

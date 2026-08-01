@@ -16,6 +16,7 @@ import { withLock } from '../lib/state-lock.mjs';
 import { evaluate, emptyCursors } from './gate.mjs';
 import { unregisterPr, stateFileName } from './register.mjs';
 import { reserveBudget, releaseReserve } from './budget.mjs';
+import { cleanupRemoteBranch } from './branch-cleanup.mjs';
 import { send as routeNotify } from './notify-router.mjs';
 import { classifyEscapes } from '../evolution/escape-classify.mjs';
 
@@ -67,6 +68,7 @@ export function runEngine(cfg) {
     triReviewLedgerDir = null, escapeLedger = null,
     feishuCmd = null, slackCmd = null,
     leaseTtlMinutes = 40, stuckThreshold = 3, lockTimeoutMs = 10_000,
+    deleteRemoteBranchOnMerge = false, // 审⑬/owner 点单: 显式 opt-in 才启用远端分支清理
     hmacKey = process.env.PR_AUTOPILOT_HMAC_KEY ?? null,
     nowMs = Date.now()
   } = cfg;
@@ -152,6 +154,21 @@ export function runEngine(cfg) {
         if (!clean.ok) {
           writeJsonAtomic(path, { ...settled, status: 'cleanup-pending', last_scan: nowIso() });
           return;
+        }
+        // owner 点单（2026-08-01）: merged 后顺手清远端 feature 分支。
+        // 只在 merged（closed 未合并的分支绝不删）+ 显式 opt-in；全部硬门在 branch-cleanup.mjs。
+        // best-effort: 失败/跳过 journal 留痕但不阻塞销单（分支清理不值得让状态机卡死）。
+        if (deleteRemoteBranchOnMerge && snapshot.state === 'merged' && repoDir) {
+          try {
+            const bc = cleanupRemoteBranch({
+              repoDir, remote: settled.push_remote, branch: settled.branch,
+              repoFullName: settled.push_repo ?? `${settled.owner}/${settled.repo}`,
+              expectedHeadSha: snapshot.head_sha
+            });
+            journal(journalFile, { kind: 'branch-cleanup', pr: prKey, ...bc });
+          } catch (e) {
+            journal(journalFile, { kind: 'branch-cleanup-failed', pr: prKey, branch: settled.branch, error: e.message });
+          }
         }
         unregisterPr({ stateDir, owner: settled.owner, repo: settled.repo, prNumber: settled.pr_number, reason: snapshot.state, journalFile, skipLock: true });
         out.terminal.push(f);
