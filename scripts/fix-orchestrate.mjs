@@ -152,6 +152,52 @@ export function branchCheckedOut({ repoDir, branch, exec = null }) {
   return String(out).split('\n').includes(`branch refs/heads/${branch}`);
 }
 
+// R7/R8-P1: 分支 CAS 删除的**补偿事务**（group / serial / integration 共用同一实现，
+// 避免两条路径漂移）。不变量: destructive step（update-ref -d）之后的任何异常都不得在
+// 补偿尝试前逃逸——包括复查命令自身失败（R8 实证: worktree list 普通 IO 失败即可让
+// 删除落地却既不回滚也不留 br-restore-fail，racer worktree 被打成 unborn）。
+//   ① 预检查检出（含检查失败）→ fail-closed 不删
+//   ② CAS 删除（old = 记录 tip；不匹配 git 自己拒）
+//   ③ 删除后复查: 抛错 = **按不安全处理**（与"确实被检出"同路径）
+//   ④ 需补偿 → 创建式 CAS（old = 全零）按记录 tip 精确恢复；成功记 br-restored，
+//      失败记 br-restore-fail 并带完整 expected tip + 两个错误
+function casDeleteBranch({ repoDir, branch, expectedTip, label, exec, g, steps, errors }) {
+  let checkedOut = null;
+  try { checkedOut = branchCheckedOut({ repoDir, branch, exec }); }
+  catch (e) {
+    errors.push(`拒绝删除分支 ${branch}: 无法确认检出状态（${e.message}）——fail-closed 不做破坏性操作`);
+    steps.push(`br-refused:${label}`);
+    return;
+  }
+  if (checkedOut) {
+    // R6-P1: update-ref -d 会绕过 git 的 checked-out 保护，把检出方打成「No commits yet」
+    errors.push(`拒绝删除分支 ${branch}: 正被某个 worktree 检出（update-ref 会绕过 git 检出保护破坏其基线，fail-closed——R6-P1）`);
+    steps.push(`br-refused:${label}`);
+    return;
+  }
+  try { g('update-ref', '-d', `refs/heads/${branch}`, expectedTip); }
+  catch (e) {
+    errors.push(`分支 CAS 删除失败 ${branch}: ${e.message}`);
+    steps.push(`br-refused:${label}`);
+    return;
+  }
+  // —— 以下已是「删除已落地」，必须走完补偿状态机 ——
+  let raced = false, recheckErr = null;
+  try { raced = branchCheckedOut({ repoDir, branch, exec }); }
+  catch (e) { raced = true; recheckErr = e; } // 复查失败 → 不可证明安全 → 按不安全处理（R8-P1）
+  if (!raced) { steps.push(`br-deleted:${label}`); return; }
+  try {
+    g('update-ref', `refs/heads/${branch}`, expectedTip, '0'.repeat(40)); // 仅当 ref 不存在时恢复（不覆盖第三方同名新 ref）
+    errors.push(recheckErr
+      ? `分支 ${branch} 删除后复查失败（${recheckErr.message}）——按不安全处理，已按记录 tip ${expectedTip} 恢复（R8-P1）`
+      : `分支 ${branch} 删除时被检出竞态——已按记录 tip 原样恢复（R7-P1 补偿回滚）`);
+    steps.push(`br-restored:${label}`);
+  } catch (e2) {
+    errors.push(`分支 ${branch} 补偿恢复失败，请人工恢复到 ${expectedTip}: ${e2.message}${recheckErr ? ` / 复查错误: ${recheckErr.message}` : ''}`);
+    steps.push(`br-restore-fail:${label}`);
+  }
+}
+
 // git 已登记的 worktree 路径集合（SC-1 归属校验的唯一可信来源）
 export function registeredWorktrees({ repoDir, exec = null }) {
   const out = exec ? exec(['git', '-C', repoDir, 'worktree', 'list', '--porcelain']) : git(repoDir, 'worktree', 'list', '--porcelain');
@@ -276,30 +322,9 @@ export function cleanupRun({ manifest, exec = null }) {
         } else if (brTip !== t.expectedTip) {
           errors.push(`拒绝删除分支 ${t.branch}: tip ${brTip.slice(0, 12)} ≠ 记录 ${t.expectedTip.slice(0, 12)}（同名他人分支/被移动，fail-closed）`);
           steps.push(`br-refused:${t.label}`);
-        } else if (branchCheckedOut({ repoDir, branch: t.branch, exec })) {
-          // R6-P1: update-ref -d 会绕过 checked-out 保护，把检出该分支的 worktree 打成
-          // 「No commits yet」——先查后动
-          errors.push(`拒绝删除分支 ${t.branch}: 正被某个 worktree 检出（update-ref 会绕过 git 检出保护破坏其基线，fail-closed——R6-P1）`);
-          steps.push(`br-refused:${t.label}`);
         } else {
-          // CAS 删除只保护 ref 的 old 值；「未被检出」是外部条件，预检查与删除之间存在
-          // 竞态窗口（R7-P1 实证）。处置 = 删除后**复查 + 补偿回滚**: 若删除瞬间有 worktree
-          // 抢先检出了该分支，按记录 tip 原样恢复（update-ref 创建式 CAS，恢复值精确）。
-          // 窗口后到达的 worktree add 会因分支已删而自行失败，不产生静默基线破坏。
-          try { g('update-ref', '-d', `refs/heads/${t.branch}`, t.expectedTip); }
-          catch (e) { errors.push(`分支 CAS 删除失败 ${t.branch}: ${e.message}`); steps.push(`br-refused:${t.label}`); continue; }
-          if (branchCheckedOut({ repoDir, branch: t.branch, exec })) {
-            try {
-              g('update-ref', `refs/heads/${t.branch}`, t.expectedTip, '0'.repeat(40)); // 仅当 ref 不存在时恢复
-              errors.push(`分支 ${t.branch} 删除时检出竞态被检出——已按记录 tip 原样恢复（R7-P1 补偿回滚）`);
-              steps.push(`br-restored:${t.label}`);
-            } catch (e2) {
-              errors.push(`分支 ${t.branch} 竞态回滚失败（人工恢复到 ${t.expectedTip.slice(0, 12)}）: ${e2.message}`);
-              steps.push(`br-restore-fail:${t.label}`);
-            }
-          } else {
-            steps.push(`br-deleted:${t.label}`);
-          }
+          // 「未被检出」是外部条件，CAS 只保护 ref 的 old 值——统一走补偿事务 helper
+          casDeleteBranch({ repoDir, branch: t.branch, expectedTip: t.expectedTip, label: t.label, exec, g, steps, errors });
         }
       }
       // owned=false 且 worktree 仍在（归属不符）→ 分支一个字都不碰
@@ -314,28 +339,9 @@ export function cleanupRun({ manifest, exec = null }) {
       if (!lastIntegrationTip || ibTip !== lastIntegrationTip) {
         errors.push(`拒绝删除分支 ${manifest.integration_branch}: tip ${ibTip.slice(0, 12)} ≠ 记录的 integrated_tip ${lastIntegrationTip ? lastIntegrationTip.slice(0, 12) : '(无)'}（同名他人分支/无记录，fail-closed）`);
         steps.push('br-refused:integration');
-      } else if (branchCheckedOut({ repoDir, branch: manifest.integration_branch, exec })) {
-        errors.push(`拒绝删除分支 ${manifest.integration_branch}: 正被某个 worktree 检出（R6-P1 fail-closed）`);
-        steps.push('br-refused:integration');
       } else {
-        // R7-P1: 同 group 分支——删除后复查 + 补偿回滚
-        let deleted = false;
-        try { g('update-ref', '-d', `refs/heads/${manifest.integration_branch}`, lastIntegrationTip); deleted = true; }
-        catch (e) { errors.push(`integration 分支 CAS 删除失败: ${e.message}`); steps.push('br-refused:integration'); }
-        if (deleted) {
-          if (branchCheckedOut({ repoDir, branch: manifest.integration_branch, exec })) {
-            try {
-              g('update-ref', `refs/heads/${manifest.integration_branch}`, lastIntegrationTip, '0'.repeat(40));
-              errors.push(`分支 ${manifest.integration_branch} 删除时检出竞态被检出——已恢复（R7-P1）`);
-              steps.push('br-restored:integration');
-            } catch (e2) {
-              errors.push(`integration 分支竞态回滚失败（人工恢复到 ${lastIntegrationTip.slice(0, 12)}）: ${e2.message}`);
-              steps.push('br-restore-fail:integration');
-            }
-          } else {
-            steps.push('br-deleted:integration');
-          }
-        }
+        // 与 group/serial 同一补偿事务实现（R8-P1: 消除两条路径漂移）
+        casDeleteBranch({ repoDir, branch: manifest.integration_branch, expectedTip: lastIntegrationTip, label: 'integration', exec, g, steps, errors });
       }
     }
   }

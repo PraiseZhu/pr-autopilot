@@ -3650,6 +3650,80 @@ t('[R7-P1] 删除竞态: 预检查后、删除前被抢先检出 → 复查检�
   eq(execFileSync('git', ['-C', racerWt, 'status', '--porcelain'], { encoding: 'utf8' }).trim(), '', 'racer worktree 基线无损（不再是 No commits yet）');
 });
 
+t('[R8-P1] 删除后复查命令失败 → 按不安全处理: group 与 integration 两条路径都必须补偿恢复', () => {
+  const mk = () => {
+    const d = mkdtempSync(join(tmpdir(), 'r8p1-'));
+    const r = join(d, 'repo');
+    execFileSync('git', ['init', '-q', r]);
+    const g = (...a) => execFileSync('git', ['-C', r, ...a], { encoding: 'utf8' }).trim();
+    g('config', 'user.email', 'o@t'); g('config', 'user.name', 'o');
+    writeFileSync(join(r, 'f.ts'), 'x\n'); g('add', '.'); g('commit', '-qm', 'base');
+    const cand = g('rev-parse', 'HEAD');
+    writeFileSync(join(r, 'f.ts'), 'w\n'); g('add', '.'); g('commit', '-qm', 'w');
+    const T = g('rev-parse', 'HEAD');
+    g('checkout', '-q', cand);
+    return { d, r, g, cand, T };
+  };
+  // exec 包装: 预检查放行；racer 在删除前抢先检出；**删除后的复查命令失败**（R8 反例）
+  const wrap = (r, branch, racerWt) => {
+    const real = (argv) => execFileSync(argv[0], argv.slice(1), { encoding: 'utf8' });
+    let listCalls = 0, deleted = false;
+    return (argv) => {
+      const isList = argv.includes('worktree') && argv.includes('list');
+      if (isList) {
+        listCalls++;
+        if (deleted) throw new Error('worktree list 失败（模拟 IO 错误，exit 42）');
+        return real(argv);
+      }
+      if (argv.includes('update-ref') && argv.includes('-d')) {
+        real(['git', '-C', r, 'worktree', 'add', '-q', racerWt, branch]); // 竞态检出
+        const out = real(argv);
+        deleted = true;
+        return out;
+      }
+      return real(argv);
+    };
+  };
+  // ① group 分支路径
+  const A = mk();
+  A.g('branch', 'fix/r8/g1', A.T);
+  const racerA = join(A.d, 'racerA');
+  const wtRootA = join(A.d, 'wt'); mkdirSync(wtRootA);
+  const mA = { repo_dir: A.r, run_id: 'r8', source_candidate: A.cand, integration_branch: null,
+    waves: [{ worktree_root: wtRootA, base: A.cand, tips: [{ group_id: 'g1', tip: A.T }],
+      allocations: [{ group_id: 'g1', worktree: join(wtRootA, 'r8-g1'), branch: 'fix/r8/g1', base: A.cand, owner_nonce: 'x'.repeat(32) }] }] };
+  const rA = ORC.cleanupRun({ manifest: mA, exec: wrap(A.r, 'fix/r8/g1', racerA) });
+  ok(rA.steps.includes('br-restored:g1'), 'R8-P1 核心(group): 复查失败必须按不安全处理并恢复: ' + JSON.stringify(rA.steps));
+  ok(rA.errors.some((e) => /删除后复查失败/.test(e) && e.includes(A.T)), '错误必须说明复查失败 + 完整 expected tip: ' + JSON.stringify(rA.errors));
+  eq(A.g('rev-parse', 'refs/heads/fix/r8/g1'), A.T, '分支必须精确恢复');
+  eq(execFileSync('git', ['-C', racerA, 'status', '--porcelain'], { encoding: 'utf8' }).trim(), '', 'racer worktree 基线无损');
+  // ② integration 分支路径（同一 helper，不得漂移）
+  const B = mk();
+  B.g('branch', 'fix/r8/integration', B.T);
+  const racerB = join(B.d, 'racerB');
+  const wtRootB = join(B.d, 'wt'); mkdirSync(wtRootB);
+  const mB = { repo_dir: B.r, run_id: 'r8', source_candidate: B.cand, integration_branch: 'fix/r8/integration',
+    waves: [{ worktree_root: wtRootB, base: B.cand, tips: [], allocations: [], integrated_tip: B.T }] };
+  const rB = ORC.cleanupRun({ manifest: mB, exec: wrap(B.r, 'fix/r8/integration', racerB) });
+  ok(rB.steps.includes('br-restored:integration'), 'R8-P1 核心(integration): 同样必须恢复: ' + JSON.stringify(rB.steps));
+  eq(B.g('rev-parse', 'refs/heads/fix/r8/integration'), B.T, 'integration 分支必须精确恢复');
+  eq(execFileSync('git', ['-C', racerB, 'status', '--porcelain'], { encoding: 'utf8' }).trim(), '', 'racer worktree 基线无损');
+  // ③ 预检查阶段复查失败 → fail-closed 不删（destructive step 前的异常也不得逃逸）
+  const C = mk();
+  C.g('branch', 'fix/r8/g1', C.T);
+  const wtRootC = join(C.d, 'wt'); mkdirSync(wtRootC);
+  const mC = { repo_dir: C.r, run_id: 'r8', source_candidate: C.cand, integration_branch: null,
+    waves: [{ worktree_root: wtRootC, base: C.cand, tips: [{ group_id: 'g1', tip: C.T }],
+      allocations: [{ group_id: 'g1', worktree: join(wtRootC, 'r8-g1'), branch: 'fix/r8/g1', base: C.cand, owner_nonce: 'x'.repeat(32) }] }] };
+  const execC = (argv) => {
+    if (argv.includes('worktree') && argv.includes('list')) throw new Error('worktree list 全程失败');
+    return execFileSync(argv[0], argv.slice(1), { encoding: 'utf8' });
+  };
+  const rC = ORC.cleanupRun({ manifest: mC, exec: execC });
+  ok(rC.errors.some((e) => /无法读取 git worktree 列表|无法确认检出状态/.test(e)), '预检查失败必须 fail-closed: ' + JSON.stringify(rC.errors));
+  eq(C.g('rev-parse', 'refs/heads/fix/r8/g1'), C.T, '预检查失败时分支不得被删');
+});
+
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
 console.log(`\n========== fixtures: ${pass} passed, ${failCount} failed ==========`);

@@ -86,7 +86,7 @@ scripts/
   evolution/                     自进化: 台账 append(hash 链)/聚类达阈/secret-lint/周会/宪法路径表
   health/                        独立健康告警（launchd + lease-check + 飞书→slack 降级链）
 skills/submit-pr/                「提交 PR」skill v2（三审收口版）+ references
-fixtures/                        90 条回归 fixture（run-all.sh 一键跑；末尾附诚实 SKIPPED 清单）
+fixtures/                        126 条回归 fixture（run-all.sh 一键跑；末尾附诚实 SKIPPED 清单）
 deploy/README.md                 mini 部署手册（含 P0-⑦ 班车握手定案）
 deploy/wrappers/                 真机适配: gh-snapshot / cindy-dispatch / queue-transport / probe
 ```
@@ -94,7 +94,7 @@ deploy/wrappers/                 真机适配: gh-snapshot / cindy-dispatch / qu
 ## 快速验证
 
 ```bash
-bash fixtures/run-all.sh   # 90 passed 才算数；SKIPPED 清单如实列出仓内验不了的真机项
+bash fixtures/run-all.sh   # 126 passed 才算数；SKIPPED 清单如实列出仓内验不了的真机项
 ```
 
 ## 模型点名（owner 第 0 优先，压过 routing 表）
@@ -102,3 +102,17 @@ bash fixtures/run-all.sh   # 90 passed 才算数；SKIPPED 清单如实列出仓
 三审: opus-5/xhigh + gpt-5.6-sol/xhigh + opus-5/high（上游预演）；修复+push: glm-5.2/max（goal --until-sc）；
 mini 盯梢修复: glm-5.2/max（send_to_session 克隆班车四元组）；卡片: deepseek-v4-pro/max（唯一允许降级 xhigh，留审计）；
 周会: glm-5.2/max。
+
+## 残余风险登记（R3〜R8 对抗审查后归档，如实声明不冒充）
+
+修复编排链经六轮对抗复审（gpt-5.6-sol/xhigh）收敛。以下是**明知存在、判定为可接受**的面，
+不是遗漏——写在这里是为了不让任何人以为这套东西比它实际的更强。
+
+| 残余面 | 性质 | 为什么可接受 |
+|---|---|---|
+| **T1 是设计上限** | 全链保证等级 = 防疏忽/防漂移（honest-but-fallible lead），**不防恶意伪造** | 脚本与 lead 同 UID，恶意 lead 可直接改 push-guard 自身。真 T2 需宿主级签名回执，本仓做不到。任何读起来像"防恶意"的文案都是 bug，请提 issue |
+| verify 写 `sh -c` / `node -e` | 显式作恶，非疏忽 | `cmd` 是裸程序名白名单式约束，但 `sh`/`bash`/`node` 本身合法，args 可带 `-c`/`-e`。黑名单不完备（python/perl/env 都能解释器化）且制造假安全感。升 T2 的正解是签名 verifier registry，不是枚举黑名单 |
+| anchor hub 2+2 配对 | 合法冲突图结果 | hub 门是「≥3 条 SC 且 >50% 占比」。4 条 SC 用两个 hub 两两配对 → 4 组并 2 组，未触发门；但若 hub 是真实 changed evidence，这**就是**正确的冲突分组。hub 未实改的情形由共识入口的 changed-set 门拦住 |
+| 手工伪造 owner 印记 | T2 面 | 归属判据是 worktree admin git-dir 里的 `pr-autopilot-owner`（run_id + 随机 nonce）。手工复制 admin dir / nonce 属显式伪造。已验证正常生命周期无继承误判（remove/prune/同 basename 重建都不残留） |
+| cleanup 补偿恢复失败 | 显式报错，非静默 | 分支 CAS 删除后若复查发现竞态检出、而创建式 CAS 恢复又失败（如第三方已抢占同名 ref），记 `br-restore-fail` + 完整 expected tip + 两个错误交人工。不覆盖第三方 ref |
+| 外部 raw git 并发 | 有补偿事务兜底 | cleanup 的破坏性步骤后一律复查 + 按记录 tip 精确回滚；复查命令自身失败也按不安全处理走补偿（R8）。窗口后到达的 `worktree add` 因分支已删自行失败 |
