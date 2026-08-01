@@ -2224,6 +2224,44 @@ t('[P0-⑦] queue-transport: 落任务→收回执→清理；超时拒；坏标
   return Promise.all([pA, pB]);
 });
 
+t('[P0-⑦] probe 探针: 无活 SKIP / 新信号·租约过期·canceling·终态·滞留队列 RUN；文法过滤同引擎', async () => {
+  const { probe } = await import('../deploy/wrappers/probe.mjs');
+  const dP = mkdtempSync(join(tmpdir(), 'pb-'));
+  const stDir = join(dP, 'state'); mkdirSync(stDir);
+  const qDir = join(dP, 'queue'); mkdirSync(qDir);
+  const snapJson = join(dP, 'snap.json');
+  writeFileSync(join(dP, 'snap.sh'), `#!/bin/sh\ncat "${snapJson}"\n`);
+  execFileSync('chmod', ['+x', join(dP, 'snap.sh')]);
+  const snapCmd = join(dP, 'snap.sh') + ' {owner} {repo} {pr}';
+  const P9 = (over = {}) => probe({ stateDir: stDir, queueDir: qDir, snapshotCmd: snapCmd, hmacKey: HMAC_KEY, ...over });
+  eq(P9().work, false, '无在册 PR → SKIP');
+  registerPr({ stateDir: stDir, owner: 'o', repo: 'mivo-canvas', prNumber: 5, branch: 'f', pushRemote: 'origin' });
+  writeFileSync(snapJson, JSON.stringify(snapBase));
+  eq(P9().work, false, '在册但无信号 → SKIP（零 token 轮）');
+  writeFileSync(snapJson, JSON.stringify({ ...snapBase, comments: [{ id: 'p1', body: '修' }] }));
+  ok(P9().work, '新评论信号 → RUN');
+  // pending 未过期 → 无动作；过期 → RUN；canceling → RUN
+  const stF = join(stDir, stateFileName('o', 'mivo-canvas', 5));
+  const base = readJson(stF);
+  writeFileSync(stF, JSON.stringify({ ...base, pending_dispatch: { dispatch_id: 'd', dispatched_at: new Date().toISOString(), manifest: {} } }));
+  eq(P9().work, false, '在途未过期 → SKIP');
+  writeFileSync(stF, JSON.stringify({ ...base, pending_dispatch: { dispatch_id: 'd', dispatched_at: new Date(Date.now() - 60 * 60000).toISOString(), manifest: {} } }));
+  ok(P9().work, '租约过期 → RUN');
+  writeFileSync(stF, JSON.stringify({ ...base, pending_dispatch: { dispatch_id: 'd', dispatched_at: new Date().toISOString(), manifest: {}, canceling: true } }));
+  ok(P9().work, 'canceling → RUN（待引擎收敛）');
+  writeFileSync(stF, JSON.stringify(base));
+  writeFileSync(snapJson, JSON.stringify({ ...snapBase, state: 'merged' }));
+  ok(P9().work, '终态 → RUN（结算/清理）');
+  // 队列滞留任务 → RUN（与 PR 状态无关）
+  writeFileSync(snapJson, JSON.stringify(snapBase));
+  writeFileSync(join(qDir, 'x.task.txt'), 'x');
+  ok(P9().work, '队列滞留 → RUN');
+  execFileSync('rm', [join(qDir, 'x.task.txt')]);
+  // 杂质文件不触发
+  writeFileSync(join(stDir, 'garbage__5.json'), '{}');
+  eq(P9().work, false, '杂质文件不得放行班车');
+});
+
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
 console.log(`\n========== fixtures: ${pass} passed, ${failCount} failed ==========`);
