@@ -74,12 +74,25 @@ SC 例句库见 `skills/submit-pr/references/sc-examples.md`（E3 自进化的�
 
 ## Phase 2c — 修复 + delta 复核
 
-派 **glm-5.2/max** worker 持 manifest：goal skill `--until-sc` 修到每条 SC 有 PASS 证据 → 新 commit 新 SHA → **三审 delta 复核**：
+**修复编排由 lead 判断串并行（owner 2026-08-01 拍板：并行 worker 数量不设上限）**：
+
+1. lead 把 SC 清单按**改动文件域**分组：两组触碰的文件互不相交 → 可并行；有依赖关系
+   （B 组要在 A 组产物上改）或撞同一文件 → 并入同组串行。禁止两个 worker 碰同一文件。
+2. 每组派一个 **glm-5.2** worker（点名 max，模型不支持该档时取其可用上限并留痕），
+   一次 create_workers 并行开出；派发包写明：本组 SC 子集 + **允许触碰的文件域清单**
+   （越域即失败）+ goal `--until-sc` 修到每条 SC 有 PASS 证据。
+3. 并行 worker **只改文件不 commit**（防并发 git 操作互踩）；全量验证不用每个 worker
+   各跑一遍——各 worker 只跑自己文件域的定向验证，**全量 tsc/lint/test 由 lead 在全部
+   worker 交卷后统一收口跑一次**，过了再按逻辑分组 commit → 新 candidate SHA。
+4. 只有一组或 SC 强耦合时退化为单 worker 串行——判断权在 lead，但「10 条 SC 一个
+   worker 串行吃完」这种默认必须先给出不可并行的理由。
+
+新 commit 新 SHA 后 → **三审 delta 复核**：
 - 两对抗席只对账 findings 修没修 + delta 有无新问题，禁重审未改代码；
 - 第三席对每个新 candidate 做只读 gate replay 出新 verdict（**不计对抗轮次**）；
 - 重跑 consensus-gate 绑定三份新 verdict。
 
-## Phase 3 — push + 注册（同一 glm-5.2/max worker）
+## Phase 3 — push + 注册（lead 指定一个修复 worker 执行；并行场景选其一即可）
 
 worker 收**自包含 push manifest**（repo/remote/branch/**expected_sha**/`purpose=feature`/标题正文/已有 PR 号/注册 key/consensus_artifact_hash/sc_hash+sc_list）。base 不在 manifest 里——由共识 artifact 派生，manifest 无权自定（审②-F4）：
 
