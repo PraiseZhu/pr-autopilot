@@ -3356,6 +3356,132 @@ t('[SC-R3-11] 单入口: fix-orchestrate 独立 CLI 已删（直跑非零退出�
   ok(/单入口|fix-run/.test(out), '错误信息应指向 fix-run 单入口: ' + out.slice(0, 120));
 });
 
+// ========== 22. R4 修正专项 ==========
+console.log('\n[22] R4: cleanup integration 归属 / consensus changed-set / replan 不可逆 / finalize CAS');
+
+t('[R4-P0] cleanup 预测路径撞上他人 detached worktree / 同名他人分支 → 全拒', () => {
+  const d = mkdtempSync(join(tmpdir(), 'r4p0-'));
+  const r = join(d, 'repo');
+  execFileSync('git', ['init', '-q', r]);
+  const g = (...a) => execFileSync('git', ['-C', r, ...a], { encoding: 'utf8' }).trim();
+  g('config', 'user.email', 'o@t'); g('config', 'user.name', 'o');
+  writeFileSync(join(r, 'f.ts'), 'x\n'); g('add', '.'); g('commit', '-qm', 'base');
+  const cand = g('rev-parse', 'HEAD');
+  // 他人的合法 commit（与本 run 记录无交集）
+  writeFileSync(join(r, 'f.ts'), 'other\n'); g('add', '.'); g('commit', '-qm', 'other');
+  const otherTip = g('rev-parse', 'HEAD');
+  g('checkout', '-q', cand);
+  const wtRoot = join(d, 'wt'); mkdirSync(wtRoot);
+  // ① R4 反例: 在预测的 integration 路径注册一个**他人的 detached worktree** + 未提交 sentinel
+  const predicted = join(wtRoot, 'runX-integration');
+  g('worktree', 'add', '-q', '--detach', predicted, otherTip);
+  const sentinel = join(predicted, 'UNSAVED.txt');
+  writeFileSync(sentinel, '他人未提交数据\n');
+  const manifest = { repo_dir: r, run_id: 'runX', source_candidate: cand, integration_branch: 'fix/runX/integration',
+    waves: [{ worktree_root: wtRoot, base: cand, allocations: [], tips: null, integrated_tip: null }] };
+  // ② 同名他人分支: integration_branch 名字被占、tip 与本 run 无关
+  g('branch', 'fix/runX/integration', otherTip);
+  const res = ORC.cleanupRun({ manifest });
+  ok(existsSync(sentinel), 'R4-P0 核心: 他人 detached worktree（registered+common-dir 都过）必须存活');
+  ok(res.errors.some((e) => /HEAD.*不是本 run/.test(e)), '必须报 HEAD 归属不符: ' + JSON.stringify(res.errors));
+  ok(res.steps.includes('wt-refused:integration'));
+  eq(g('rev-parse', '--verify', 'refs/heads/fix/runX/integration').length, 40, '同名他人 integration 分支必须原封不动');
+  ok(res.errors.some((e) => /拒绝删除分支/.test(e)), '必须报分支归属不符');
+  // ③ worktree 已不存在时，同名他人组分支同样拒删
+  g('branch', 'fix/runX/g1', otherTip);
+  const manifest2 = { repo_dir: r, run_id: 'runX', source_candidate: cand, integration_branch: null,
+    waves: [{ worktree_root: wtRoot, base: cand, allocations: [{ group_id: 'g1', worktree: join(wtRoot, 'runX-g1'), branch: 'fix/runX/g1', base: cand }] }] };
+  // 让他人分支 tip 与 allocation base 无血缘: otherTip 是 cand 后代……改用 orphan
+  g('checkout', '-q', '--orphan', 'foreign');
+  execFileSync('git', ['-C', r, 'commit', '-qam', 'foreign'], { encoding: 'utf8' });
+  const foreignTip = g('rev-parse', 'HEAD');
+  g('checkout', '-q', cand);
+  g('branch', '-D', 'foreign');
+  g('branch', '-f', 'fix/runX/g1', foreignTip);
+  const res2 = ORC.cleanupRun({ manifest: manifest2 });
+  ok(res2.errors.some((e) => /无血缘/.test(e)), 'worktree 缺席时同名无血缘分支必须拒删: ' + JSON.stringify(res2.errors));
+  eq(g('rev-parse', 'refs/heads/fix/runX/g1'), foreignTip, '他人分支原封不动');
+});
+
+t('[R4-P1] consensus 入口自算 changed-set: tracked-but-unchanged hub 在 runConsensusGate 就被拦', () => {
+  // 真 git 仓: candidate 只改 u1.ts；finding 锚 u1.ts + 未实改的 hub.ts
+  const d = mkdtempSync(join(tmpdir(), 'r4cs-'));
+  const r = join(d, 'repo');
+  execFileSync('git', ['init', '-q', r]);
+  const g = (...a) => execFileSync('git', ['-C', r, ...a], { encoding: 'utf8' }).trim();
+  g('config', 'user.email', 'o@t'); g('config', 'user.name', 'o');
+  writeFileSync(join(r, 'u1.ts'), 'base\n'); writeFileSync(join(r, 'hub.ts'), 'base\n');
+  g('add', '.'); g('commit', '-qm', 'base');
+  const b0 = g('rev-parse', 'HEAD');
+  writeFileSync(join(r, 'u1.ts'), 'changed\n'); g('add', '.'); g('commit', '-qm', 'change u1');
+  const c0 = g('rev-parse', 'HEAD');
+  const bnd = mkBundle(b0, c0);
+  const mkVs = (paths) => [
+    mkVerdictFor('claude-adversarial', bnd, { findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: paths, evidence: 'e1', status: 'closed' }], closed_finding_ids: ['F1'] }),
+    mkVerdictFor('codex-adversarial', bnd, { findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: paths, evidence: 'e1', status: 'closed' }], closed_finding_ids: ['F1'] }),
+    mkVerdictFor('upstream-preview', bnd)
+  ];
+  // 带未实改 hub → 入口 fail（R4 反例: 旧实现 consensusFor 不传 changedPaths 照过）
+  const bad = runConsensusGate(mkVs(['u1.ts', 'hub.ts']), { bundle: bnd, repoDir: r });
+  ok(bad.gate_result === 'fail' && bad.fail_reasons.some((e) => /实改文件集/.test(e)),
+    'R4-P1 核心: live 共识入口必须拦 tracked-but-unchanged 锚点: ' + JSON.stringify(bad.fail_reasons));
+  // 只锚实改文件 → pass
+  const good = runConsensusGate(mkVs(['u1.ts']), { bundle: bnd, repoDir: r });
+  eq(good.gate_result, 'pass', JSON.stringify(good.fail_reasons ?? []));
+});
+
+t('[R4-P1] replan 状态不可被 allocate 重放清除（串行重派不可逆）', () => {
+  const env = mkRunEnv({ files: ['shared.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['shared.ts'] }, { id: 'g2', sc_ids: ['SC-1'], paths: ['shared.ts'] }],
+    [['g1', 'g2']],
+    [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF() },
+     { id: 'SC-1', kind: 'fix', finding_ids: ['f1'], change: 'c', holds: 'h', verify: VF() }]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'rp', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rp', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  for (const al of a.allocations) {
+    writeFileSync(join(al.worktree, 'shared.ts'), `${al.group_id}\n`);
+    execFileSync('git', ['-C', al.worktree, 'commit', '-qam', al.group_id], { encoding: 'utf8' });
+  }
+  const r = FR.integrate({ stateDir: env.stateDir, runId: 'rp', plan, waveIndex: 0 });
+  ok(!r.ok && r.replan_required, '前提: 已进入 replan');
+  // R4 反例: 再 allocate 同 wave → v1 会静默重建 wave 清掉 replan → 现在必须拒
+  let threw = false;
+  try { FR.allocate({ stateDir: env.stateDir, runId: 'rp', plan, waveIndex: 0, worktreeRoot: env.wtRoot }); }
+  catch (e) { threw = /串行重派状态，禁止重新 allocate/.test(e.message); }
+  ok(threw, 'R4-P1 核心: replan 后 allocate 重放必拒');
+  const m = readJson(FR.runManifestPath(env.stateDir, 'rp'));
+  ok(m.waves[0].replan && m.waves[0].replan.order.length === 2, 'replan 状态与证据必须保留');
+});
+
+t('[R4-P1] finalize 未检出路径 CAS: feature branch 被并发推进 → 拒（不再 branch -f 覆盖）', () => {
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }], [['g1']],
+    [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }]);
+  FR.initRun({ stateDir: env.stateDir, runId: 'rc', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rc', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  workGroup(env, a.allocations[0], 'a.ts', 'fix\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'rc', plan, waveIndex: 0 }).ok);
+  ok(FR.validateIntegration({ stateDir: env.stateDir, runId: 'rc', scManifest: scm, waveIndex: 0 }).ok);
+  // 并发场景: feat 被别的进程推进一个合法 commit C；主 checkout 切去别的分支（走 branch -f 路径）
+  env.g('checkout', '-qb', 'elsewhere');
+  const concurrent = env.g('commit-tree', `${env.cand}^{tree}`, '-p', env.cand, '-m', 'concurrent C');
+  env.g('update-ref', 'refs/heads/feat', concurrent);
+  let threw = false;
+  try { FR.finalizeRun({ stateDir: env.stateDir, runId: 'rc' }); }
+  catch (e) { threw = /CAS 失败|已不在 run 起点/.test(e.message); }
+  ok(threw, 'R4-P1 核心: 并发推进的 feat 不得被 branch -f 静默覆盖');
+  eq(env.g('rev-parse', 'refs/heads/feat'), concurrent, '并发 commit C 必须还在');
+  // 恢复到起点 → CAS 前推成功
+  env.g('update-ref', 'refs/heads/feat', env.cand);
+  const fin = FR.finalizeRun({ stateDir: env.stateDir, runId: 'rc' });
+  eq(env.g('rev-parse', 'refs/heads/feat'), fin.final_candidate, '起点未动时 CAS 前推成功');
+});
+
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
 console.log(`\n========== fixtures: ${pass} passed, ${failCount} failed ==========`);

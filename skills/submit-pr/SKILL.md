@@ -66,8 +66,10 @@ Round 2+ 只对账修复情况 + 审 delta（含 SC/标题/正文/验证声称�
 
 **共识 = 脚本判**：
 ```
-node scripts/consensus-gate.mjs v1.json v2.json v3.json --out consensus.json
+node scripts/consensus-gate.mjs v1.json v2.json v3.json --bundle bundle.json --repo-dir . --out consensus.json
 ```
+`--repo-dir` 必填（R4-P1）：共识入口自算 `base..candidate` 实改集并校验每条 finding 的
+`anchor_paths` ⊆ 实改集——tracked-but-unchanged 的 hub 路径在入口就被拦，不依赖调用方自觉。
 四 conjunct 缺一不可（同 input hash / union 每条被 origin close / 三 verdict APPROVED / 全部 gate_checks∈{pass,n_a}）。任何席 degraded 或 schema 不合 → fail-closed。
 
 ## Phase 2b — SC 提炼 + 覆盖门（共识后，自动衔接）

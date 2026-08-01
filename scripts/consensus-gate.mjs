@@ -14,7 +14,7 @@
 //   ③ 三 verdict 均 APPROVED
 //   ④ 全部 gate_checks ∈ {pass, n_a}（脚本断言，不信模型总 verdict）
 import { hashObject, sha256, canonicalJson, readJson, writeJsonAtomic, parseArgs, fail, nowIso, isMain} from './lib/common.mjs';
-import { validateVerdict } from './verdict-validate.mjs';
+import { validateVerdict, changedPathSet } from './verdict-validate.mjs';
 import { computeReviewInputHash } from './review-input-hash.mjs';
 
 const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
@@ -40,13 +40,21 @@ export function runConsensusGate(verdicts, opts = {}) {
   // SC-3（R2-P1-1）: delta 轮必须 exact 绑定上一轮 artifact——只比 base_sha 挡不住
   // 「同 base 的另一份源 artifact 冒充」。首轮为 null。
   const parentArtifactHash = opts.parentArtifactHash ?? null;
+  // R4-P1: changed-set 校验必须在**共识入口**生效，不能只活在 validator CLI——
+  // 否则 tracked-but-unchanged 的 hub 路径能穿过 live 路径污染冲突图。
+  // repoDir 在场时脚本自算实改集；调用方也可直接注入 changedPaths（fixture 用）。
+  let changedPaths = opts.changedPaths ?? null;
   const failReasons = [];
+  if (!changedPaths && opts.repoDir && bundle) {
+    try { changedPaths = changedPathSet({ repoDir: opts.repoDir, baseSha: bundle.base_sha, candidateSha: bundle.candidate_sha }); }
+    catch (e) { failReasons.push(`无法计算 base..candidate 实改集（fail-closed）: ${e.message}`); }
+  }
 
   if (!bundle) failReasons.push('缺 review bundle（共识脚本必须重算 input hash，不信 opaque 值）');
   if (verdicts.length !== 3) failReasons.push(`需要恰好 3 份 verdict，得到 ${verdicts.length}`);
 
   for (const v of verdicts) {
-    const errs = validateVerdict(v, { bundle, requirements: opts.requirements });
+    const errs = validateVerdict(v, { bundle, changedPaths, requirements: opts.requirements });
     if (errs.length) failReasons.push(`verdict(${v?.reviewer ?? '?'}) schema/跨字段校验失败 → degraded: ${errs[0]}`);
     else if (v.run_status !== 'ok') failReasons.push(`verdict(${v.reviewer}) run_status=degraded ≠ APPROVED（⑦ fail-closed）`);
   }
@@ -169,12 +177,13 @@ export function recomputeArtifactHash(artifact) {
 
 if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
-  if (args._.length < 3 || !args.bundle) {
-    fail('用法: consensus-gate.mjs <v1.json> <v2.json> <v3.json> --bundle <bundle.json> [--parent <prev-artifact.json>] [--out artifact.json]\n（delta 轮必须传 --parent 上一轮 artifact——SC-3 exact 谱系绑定）');
+  // R4-P1: live 入口必须带 --repo-dir——changed-set 校验缺席 = anchor 污染门形同虚设
+  if (args._.length < 3 || !args.bundle || !args['repo-dir']) {
+    fail('用法: consensus-gate.mjs <v1.json> <v2.json> <v3.json> --bundle <bundle.json> --repo-dir <dir> [--parent <prev-artifact.json>] [--out artifact.json]\n（--repo-dir 必填: 共识入口自算 base..candidate 实改集校验 anchor_paths——R4-P1；delta 轮必须传 --parent——SC-3）');
   }
   const verdicts = args._.slice(0, 3).map(readJson);
   const parentArtifactHash = args.parent ? readJson(args.parent).consensus_artifact_hash : null;
-  const result = runConsensusGate(verdicts, { bundle: readJson(args.bundle), parentArtifactHash });
+  const result = runConsensusGate(verdicts, { bundle: readJson(args.bundle), parentArtifactHash, repoDir: args['repo-dir'] });
   if (result.gate_result === 'pass') {
     if (args.out) writeJsonAtomic(args.out, result);
     process.stdout.write(`PASS consensus_artifact_hash=${result.consensus_artifact_hash}\n`);

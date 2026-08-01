@@ -103,6 +103,11 @@ export function nextWaveBase(manifest, waveIndex) {
 export function allocate({ stateDir, runId, plan, waveIndex, worktreeRoot }) {
   const { path, m } = loadRun(stateDir, runId, plan);
   if (m.waves[waveIndex]?.integrated_tip) throw new Error(`wave${waveIndex + 1} 已集成，不可重复 allocate`);
+  // R4-P1: replan 状态不可被 allocate 重放清除——否则串行重派可被绕回并行集成（fail-open）。
+  // 该状态只能被 serialAllocate/serialIntegrate 消费。
+  if (m.waves[waveIndex]?.replan) {
+    throw new Error(`wave${waveIndex + 1} 已进入 overlap 串行重派状态，禁止重新 allocate（只能 serial-allocate 消费，R4-P1）`);
+  }
   const waveBase = nextWaveBase(m, waveIndex); // ← 权威来源
   const alloc = allocateWave({ repoDir: m.repo_dir, worktreeRoot, runId, plan, waveIndex, waveBase });
   m.waves[waveIndex] = { wave_index: waveIndex, base: waveBase, worktree_root: worktreeRoot, allocations: alloc.allocations, tips: null, integrated_tip: null, replan: null, validation: null };
@@ -364,9 +369,15 @@ export function finalizeRun({ stateDir, runId }) {
       if (git(m.repo_dir, 'status', '--porcelain') !== '') {
         throw new Error('feature branch 检出处工作区不 clean，拒绝前推（fail-closed）');
       }
-      git(m.repo_dir, 'merge', '--ff-only', last.integrated_tip);
+      git(m.repo_dir, 'merge', '--ff-only', last.integrated_tip); // 分叉即失败，天然 CAS
     } else {
-      git(m.repo_dir, 'branch', '-f', m.feature_branch, last.integrated_tip);
+      // R4-P1: branch -f 会静默覆盖并发提交——改 update-ref CAS，旧值必须仍是 run 起点
+      // （run 期间 feature branch 被外部推进 = 出现未审内容，fail-closed 交人工 replan）
+      try {
+        git(m.repo_dir, 'update-ref', `refs/heads/${m.feature_branch}`, last.integrated_tip, m.source_candidate);
+      } catch (e) {
+        throw new Error(`feature branch 前推 CAS 失败: refs/heads/${m.feature_branch} 已不在 run 起点 ${m.source_candidate.slice(0, 12)}（并发提交会被 branch -f 静默覆盖，拒绝——R4-P1）: ${e.message}`);
+      }
     }
   }
   m.final_candidate = last.integrated_tip;
