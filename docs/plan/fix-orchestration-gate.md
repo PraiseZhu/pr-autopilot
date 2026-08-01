@@ -121,6 +121,49 @@ N 个 max 档 glm-5.2 worker 并发 ≠ 免费。10 条 SC 拆 5 组 = 5 个 max
 7. **与既有机制的相互作用**: fix_plan_hash 进 push manifest 后，`--fast` 通道（跳三审）是否也要求这两段 hash？fast 场景没有 SC 清单，如何处理（豁免？还是 fast 本就不该有并行修复）？
 8. **单调性红线的实现**: 「lead 可拆细不可合并」如何机器校验？给定脚本 groups 与 lead 实际分组，拆细 = lead 分组是脚本分组的细化（refinement）——这个偏序关系脚本可判；但 lead 若同时拆一组又并另一组，能否被单一 refinement 检查捕获？
 
+## 5b. 审查结论 R1（gpt-5.6-sol/xhigh，2026-08-01）
+
+**verdict = REQUIRES_CHANGES**。方向（机器裁决而非散文）认可，但「不能实施并宣称满足 owner 验收」。
+§5 八题 reviewer 判定: 挡不住 ×5（1/2/4/5/6）、部分挡住 ×2（3/7）、算法可判但方向错 ×1（8）。
+
+### 已承认的本方案硬错误（非威胁模型分歧，纯逻辑/事实错）
+
+- **E1（对应 P1-4）自相矛盾**: M1 的组由冲突边连成，而 §0 允许「lead 可拆细不需理由」——拆组 = 切冲突边
+  = 允许两 worker 并发改同一文件。「可拆细不可合并」这条单调性红线**必须删除**，换成: 冲突边永不可拆、
+  独立组不可由 lead 合并或加边（例外只能上游修正证据后重算）。
+- **E2（对应 P1-5）wave base 错**: 方案说所有 worktree 从 candidate SHA 切 → Wave 2 的 consumer 看不见
+  Wave 1 新增的 API，依赖边形同虚设。正确: 每波集成后以 integration tip 作为后继波 base，`wave_base_sha` 入执行 artifact。
+- **E3（对应 P1-5）夸大既有基建**: 「复用仓内既有 worktree 基建」不属实。仓内只有「prompt 要求单个修复
+  会话自建 fix-<pr> worktree」+ 单一固定 worktree 的终态清理，**没有** N-worktree allocator / 波次基线 /
+  merge coordinator / lineage verifier / crash recovery。Git 原语可做，但是新工程量。
+- **E4 §1 例证不准**: `migration.mjs:109/121/130` 的无目录多行写法出现在 markdown 叙述，当前机器 anchor
+  实际是 `scripts/e2e/scenarios/migration.mjs:109`。总判断（anchor 不可靠解析）仍成立——反例应改用 upstream 席的
+  `docs/decisions/api-surface.md:202-210 (对应 server/routes/assets.ts:321)`（两路径+散文塞进一个 anchor）。
+- **E5 capacity 不该硬编码 8**: 应从 orchestrator 运行时读取（reviewer 环境实测公开值与 8 不一致）。
+
+### 意外收获: 既有链的真实漏洞（本方案之外，已复核确认）
+
+`push-guard.mjs:192` 对 SC 只检查 `hashObject(manifest.sc_list) === manifest.sc_hash`（自洽性），
+**从未把 sc_list 绑定到 consensus artifact 的 findings**，也不读修复 manifest（`grep fix_manifest` = 无）。
+
+后果: **lead 可以保持同一个合法 consensus_artifact_hash，同时提交一份完全自编的 sc_list（只要自洽）而 push 照过。**
+即「共识确认的每条 finding 都被提炼成 SC」这个 Phase 2b 承诺目前**零机器保证**——SC 可漏项、可掺假、可 mega-SC 合并。
+这架空的是三审整条价值链，优先级**高于**本并行门。修法: SC coverage gate——从 source artifact 校验所有
+actionable canonical finding 被 exact 覆盖，无额外/重复/悬空引用，并把 sc_manifest_hash 纳入 push-guard 重算。
+
+### 待 owner 决策的分水岭（reviewer 明确指出，无法由 agent 代定）
+
+P1-1 的核心: `dispatch_record` 由 lead 自报 → hash 只能证明「这份自报数据前后一致」，不能证明
+「真实并发派过这些 worker」。reviewer 结论: **若宿主不提供可鉴权的 batch/session event，不存在任何
+仅靠仓内 Node 脚本 + 同权限 JSON 就能达到「防绕过」强度的机制**；此时只能诚实标为「lead 可伪造的审计提示」。
+
+因此必须先定 threat model:
+- **T1 = 防疏忽/防漂移**（honest-but-fallible lead）: lead 不撒谎但会因惯性/上下文压力做错（首跑实际就是这类）。
+  此模型下 lead 自报 + 数量门是**有效**的——诚实 lead 会如实填，门发现数量不足即 fail-closed 强制回补。
+- **T2 = 防恶意伪造**: 需要宿主级可鉴权 receipt。且注意——T2 下既有 verdict/consensus 链**同样不成立**
+  （verdict JSON 无签名，恶意 lead 可伪造三席产物；lead 与 owner 同 UID，甚至能直接改 push-guard 本身）。
+  即 T2 是全系统性问题，不是本方案的局部缺口。
+
 ## 6. 不做什么
 
 - 不实现「最优并行划分」——脚本只算保守下界，最优是判断题
