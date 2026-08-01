@@ -18,7 +18,7 @@ export const DEFAULT_ANCHOR_PATHS_MAX = (() => {
   catch { return 20; }
 })();
 
-// SC-11: base∪candidate 的 tracked 文件集（唯一可信「这是真文件」判据）
+// SC-11: base∪candidate 的 tracked 文件集（「这是真文件」判据）
 export function trackedPathSet({ repoDir, baseSha, candidateSha }) {
   const set = new Set();
   for (const ref of [baseSha, candidateSha].filter(Boolean)) {
@@ -28,6 +28,14 @@ export function trackedPathSet({ repoDir, baseSha, candidateSha }) {
     } catch { /* ref 不可得 → 该 ref 不贡献 */ }
   }
   return set;
+}
+
+// SC-R3-5①: 被审 diff 的实改文件集——anchor_paths 必须落在其中。
+// R3 实证: 仅 tracked 校验时，一个共享 tracked 文件（如 .gitignore）能把 8 条独立 finding
+// 合成 1 组。评审锚点指向的是**被审的 diff**；diff 之外的影响面写 scope_note（不进冲突图）。
+export function changedPathSet({ repoDir, baseSha, candidateSha }) {
+  const out = execFileSync('git', ['-C', repoDir, 'diff', '-z', '--name-only', `${baseSha}...${candidateSha}`], { encoding: 'utf8', timeout: 60_000 });
+  return new Set(String(out).split('\0').filter(Boolean));
 }
 
 const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
@@ -140,6 +148,17 @@ export function validateVerdict(v, opts = {}) {
           }
         }
       }
+      // SC-R3-5①: anchor_paths ⊆ 被审 diff 实改集——tracked-but-unchanged 的共享 hub
+      // （R3 的 .gitignore 攻击）在此被拦；diff 外影响面请写 scope_note
+      if (opts.changedPaths) {
+        for (const p of fd.anchor_paths) {
+          const r = normalizeRepoPath(p);
+          if (r.ok) {
+            need(opts.changedPaths.has(r.path),
+              `finding ${fd.id} 的 anchor_paths「${r.path}」不在 base..candidate 实改文件集内（评审锚点必须落在被审 diff 上；影响面写 scope_note——SC-R3-5）`);
+          }
+        }
+      }
     }
     need(typeof fd.evidence === 'string' && fd.evidence.length > 0, `finding ${fd.id} 缺 evidence`);
     need(['open', 'closed'].includes(fd.status), `finding ${fd.id} status 非法`);
@@ -164,14 +183,15 @@ export function validateVerdict(v, opts = {}) {
 if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
   if (!args.verdict) fail('用法: verdict-validate.mjs --verdict <verdict.json> [--bundle <bundle.json>]');
-  // SC-11: 传 --repo-dir 时启用 tracked 校验（plan 承诺但 R2 指出未实现）
+  // SC-11 + SC-R3-5: 传 --repo-dir 时启用 tracked + changed-set 双校验
   const v0 = readJson(args.verdict);
-  let trackedPaths = null;
+  let trackedPaths = null, changedPaths = null;
   if (args['repo-dir']) {
     trackedPaths = trackedPathSet({ repoDir: args['repo-dir'], baseSha: v0.base_sha, candidateSha: v0.candidate_sha });
+    changedPaths = changedPathSet({ repoDir: args['repo-dir'], baseSha: v0.base_sha, candidateSha: v0.candidate_sha });
   }
   const errs = validateVerdict(v0, {
-    trackedPaths, bundle: args.bundle ? readJson(args.bundle) : null });
+    trackedPaths, changedPaths, bundle: args.bundle ? readJson(args.bundle) : null });
   if (errs.length) {
     for (const e of errs) process.stderr.write(`[SCHEMA-FAIL] ${e}\n`);
     process.stderr.write('[VERDICT] degraded（schema 校验失败一律 degraded，⑨）\n');

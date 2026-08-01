@@ -4,5 +4,7 @@
   "max_parallel_workers": 8,
   "_max_parallel_workers_note": "Orca 单 workflow 硬上限（当前 8）。owner 2026-08-01: 该并行必须并行、拉满 8 也可以。改这个数字 = 改并行上限，必须 owner 亲手。",
   "anchor_paths_max_per_finding": 20,
-  "_anchor_paths_note": "SC-11: 单条 finding 的 anchor_paths 数量上限。超出 → degraded，要求 origin 席拆分补发（防把「影响范围」当「证据锚点」广列，进而制造假冲突把并行工作串行化）。"
+  "_anchor_paths_note": "SC-11: 单条 finding 的 anchor_paths 数量上限。超出 → degraded，要求 origin 席拆分补发（防把「影响范围」当「证据锚点」广列，进而制造假冲突把并行工作串行化）。",
+  "hub_path_max_share": 0.5,
+  "_hub_path_max_share_note": "SC-R3-5: 单一路径最多出现在多大比例的 SC 文件域中（且绝对数 ≥3 才触发，保住合法两两冲突）。超出 → fix-plan degraded，要求 origin 席拆分 finding 或把「影响范围」移 scope_note——防共享 hub 文件把 N 个独立修复合成 1 组（R3 实证的串行化攻击）。"
 }

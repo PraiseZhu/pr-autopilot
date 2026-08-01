@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "pr-autopilot/sc-manifest/v1",
+  "$id": "pr-autopilot/sc-manifest/v2",
   "title": "SC 修复清单（Phase 2b 产物；coverage-gate 绑回 consensus findings）",
   "type": "object",
   "required": ["schema_version", "consensus_artifact_hash", "scs"],
   "properties": {
-    "schema_version": { "const": "v1" },
+    "schema_version": { "const": "v2" },
     "consensus_artifact_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "scs": {
       "type": "array",
@@ -26,7 +26,21 @@
           },
           "change": { "type": "string", "minLength": 1 },
           "holds": { "type": "string", "minLength": 1 },
-          "verify": { "type": "string", "minLength": 1 }
+          "verify": {
+            "type": "object",
+            "required": ["cmd", "args"],
+            "properties": {
+              "cmd": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^/\\\\-][^/\\\\]*$",
+                "description": "裸程序名（禁路径分隔符/前导 -）；经 PATH 解析，execFile(shell:false) 执行"
+              },
+              "args": { "type": "array", "items": { "type": "string" } }
+            },
+            "additionalProperties": false,
+            "description": "SC-R3-4（D2）: 结构化 argv 配方——不走 shell（自由文本 = 命令注入面）；复合验证拆成多条 SC 或写进测试文件；执行结果只记 exit code + stdout sha256（凭证不落库）"
+          }
         }
       }
     }

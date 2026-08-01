@@ -9,8 +9,8 @@
 // git merge conflict 与 实改文件交集 是**真实**碰撞检测器，不是预测。
 import { execFileSync } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
-import { join } from 'node:path';
-import { readJson, writeJsonAtomic, parseArgs, fail, isMain, nowIso, normalizeRepoPath } from './lib/common.mjs';
+import { join, resolve } from 'node:path';
+import { fail, isMain, nowIso, normalizeRepoPath } from './lib/common.mjs';
 
 const BRANCH_RE = /^[A-Za-z0-9._\/-]+$/;
 
@@ -127,61 +127,101 @@ export function registeredWorktrees({ repoDir, exec = null }) {
 }
 
 // 清理本 run 的全部 worktree/分支（终态或 replan 时调用）
-// SC-1（R2-P1-7）: **删除 raw rmSync 兜底**。只回收「本 run 命名规则登记 且 出现在
-// git worktree list 里」的路径——归属不符一律 fail-closed 不删（防 worktreeRoot 传错
-// 时把无关目录递归删掉）。git worktree remove 失败 → 记 wt-fail 交人工，绝不自己动手删。
-export function cleanupRun({ repoDir, worktreeRoot, runId, plan, exec = null }) {
+// SC-R3-1（R3-P0，替换 R2 的 SC-1 半成品）: 回收对象**只从 run manifest 枚举**——
+// caller 不再传 worktreeRoot/plan（v1 用 caller 输入预测路径 = 同仓无关 worktree 恰好同名
+// 即被 remove --force，R3 实证的 P0）。每个目标做**双重归属校验**:
+//   ① 路径出现在 git worktree list（realpath 比对）
+//   ② 该 worktree 的 git common-dir 归属本仓，且（组/串行 worktree）检出分支 == 记录分支
+// 任一不符 → 拒删且**连分支都不删**。git worktree remove 失败 → 记 wt-fail 交人工，
+// 绝不 rmSync 兜底。
+export function cleanupRun({ manifest, exec = null }) {
+  const repoDir = manifest.repo_dir;
+  const runId = manifest.run_id;
   const g = exec ? (...a) => exec(['git', '-C', repoDir, ...a]) : (...a) => git(repoDir, ...a);
   const steps = [];
   const errors = [];
   let registered = [];
   try { registered = registeredWorktrees({ repoDir, exec }); }
   catch (e) { return { steps, errors: [`无法读取 git worktree 列表（fail-closed 不删任何目录）: ${e.message}`] }; }
+  let repoCommon = null;
+  try {
+    const out = exec ? exec(['git', '-C', repoDir, 'rev-parse', '--git-common-dir']).trim() : git(repoDir, 'rev-parse', '--git-common-dir');
+    repoCommon = realpathSync(resolve(repoDir, out));
+  } catch (e) { return { steps, errors: [`无法解析本仓 git common-dir（fail-closed）: ${e.message}`] }; }
 
-  for (const group of plan.groups ?? []) {
-    const wtPath = groupWorktreePath(worktreeRoot, runId, group.id);
-    if (existsSync(wtPath)) {
-      let real = wtPath;
-      try { real = realpathSync(wtPath); } catch { /* 保持原值 */ }
+  // 回收目标全部来自 manifest 记录（allocation / 串行轮 / integration worktree + 各自分支）
+  const targets = [];
+  for (const w of manifest.waves ?? []) {
+    for (const a of w.allocations ?? []) targets.push({ label: a.group_id, worktree: a.worktree, branch: a.branch });
+    for (const r of w.replan?.rounds ?? []) targets.push({ label: `${r.group_id}-r${r.round}`, worktree: r.worktree, branch: r.branch });
+    if (w.worktree_root) targets.push({ label: 'integration', worktree: join(w.worktree_root, `${runId}-integration`), branch: null, detachedOk: true });
+  }
+
+  const seen = new Set();
+  for (const t of targets) {
+    if (seen.has(t.worktree)) continue;
+    seen.add(t.worktree);
+    let owned = true;
+    if (existsSync(t.worktree)) {
+      let real = t.worktree;
+      try { real = realpathSync(t.worktree); } catch { /* 保持原值 */ }
       if (!registered.includes(real)) {
-        errors.push(`拒绝回收 ${wtPath}: 不在本仓 git worktree 登记列表内（归属不符，fail-closed——不删未登记目录）`);
-        steps.push(`wt-refused:${group.id}`);
-        continue;
+        errors.push(`拒绝回收 ${t.worktree}: 不在本仓 git worktree 登记列表内（归属不符，fail-closed）`);
+        steps.push(`wt-refused:${t.label}`);
+        owned = false;
       }
-      try { g('worktree', 'remove', '--force', wtPath); steps.push(`wt-removed:${group.id}`); }
-      catch (e) {
-        // 不再 rmSync 兜底: 交人工，避免误删
-        errors.push(`git worktree remove 失败（不做强删兜底，请人工检查 ${wtPath}）: ${e.message}`);
-        steps.push(`wt-fail:${group.id}`);
+      if (owned) {
+        // 归属校验 ②: common-dir 必须是本仓
+        try {
+          const out = exec ? exec(['git', '-C', t.worktree, 'rev-parse', '--git-common-dir']).trim() : git(t.worktree, 'rev-parse', '--git-common-dir');
+          const wtCommon = realpathSync(resolve(t.worktree, out));
+          if (wtCommon !== repoCommon) {
+            errors.push(`拒绝回收 ${t.worktree}: 归属其他仓（common-dir 不符，fail-closed）`);
+            steps.push(`wt-refused:${t.label}`);
+            owned = false;
+          }
+        } catch (e) {
+          errors.push(`拒绝回收 ${t.worktree}: 无法确认归属（${e.message}）`);
+          steps.push(`wt-refused:${t.label}`);
+          owned = false;
+        }
       }
+      if (owned && t.branch) {
+        // 归属校验 ②b: 检出分支必须就是 allocation 记录的分支
+        let headRef = null;
+        try { headRef = exec ? exec(['git', '-C', t.worktree, 'symbolic-ref', '--short', 'HEAD']).trim() : git(t.worktree, 'symbolic-ref', '--short', 'HEAD'); }
+        catch { /* detached */ }
+        if (headRef !== t.branch) {
+          errors.push(`拒绝回收 ${t.worktree}: 检出分支 ${headRef ?? '(detached)'} ≠ allocation 记录 ${t.branch}（归属不符，fail-closed）`);
+          steps.push(`wt-refused:${t.label}`);
+          owned = false;
+        }
+      }
+      if (owned) {
+        try { g('worktree', 'remove', '--force', t.worktree); steps.push(`wt-removed:${t.label}`); }
+        catch (e) {
+          errors.push(`git worktree remove 失败（不做强删兜底，请人工检查 ${t.worktree}）: ${e.message}`);
+          steps.push(`wt-fail:${t.label}`);
+          owned = false;
+        }
+      }
+    } else {
+      steps.push(`wt-absent:${t.label}`);
     }
-    try { g('branch', '-D', groupBranch(runId, group.id)); steps.push(`br-deleted:${group.id}`); } catch { steps.push(`br-absent:${group.id}`); }
+    // 分支只在 worktree 归属确认（或已不存在）时删——归属不符连分支都不动
+    if (t.branch && (owned || !existsSync(t.worktree))) {
+      try { g('branch', '-D', t.branch); steps.push(`br-deleted:${t.label}`); } catch { steps.push(`br-absent:${t.label}`); }
+    }
+  }
+  if (manifest.integration_branch) {
+    try { g('branch', '-D', manifest.integration_branch); steps.push('br-deleted:integration'); } catch { steps.push('br-absent:integration'); }
   }
   try { g('worktree', 'prune'); } catch { /* best-effort */ }
   return { steps, errors };
 }
 
+// SC-R3-11: 独立 CLI 入口已删除——fix-run.mjs 是唯一编排入口（本文件只做库函数）。
+// 直接执行本文件 = 用法错误，指向状态机入口。
 if (isMain(import.meta.url)) {
-  const args = parseArgs(process.argv.slice(2));
-  const mode = args._[0];
-  if (!['allocate', 'integrate', 'cleanup'].includes(mode) || !args['repo-dir'] || !args.plan) {
-    fail('用法:\n  fix-orchestrate.mjs allocate --repo-dir <d> --plan <plan.json> --run-id <id> --wave <n> --wave-base <sha> --worktree-root <d> [--out alloc.json]\n  fix-orchestrate.mjs integrate --repo-dir <d> --plan <plan.json> --wave-base <sha> --tips <tips.json> [--out report.json]\n  fix-orchestrate.mjs cleanup --repo-dir <d> --plan <plan.json> --run-id <id> --worktree-root <d>');
-  }
-  const plan = readJson(args.plan);
-  if (mode === 'allocate') {
-    const r = allocateWave({
-      repoDir: args['repo-dir'], worktreeRoot: args['worktree-root'], runId: args['run-id'],
-      plan, waveIndex: Number(args.wave), waveBase: args['wave-base']
-    });
-    if (args.out) writeJsonAtomic(args.out, r);
-    process.stdout.write(JSON.stringify(r, null, 2) + '\n');
-  } else if (mode === 'integrate') {
-    const r = integrateWave({ repoDir: args['repo-dir'], waveBase: args['wave-base'], groupTips: readJson(args.tips) });
-    if (args.out) writeJsonAtomic(args.out, r);
-    process.stdout.write(JSON.stringify(r, null, 2) + '\n');
-    process.exit(r.ok ? 0 : 1);
-  } else {
-    const r = cleanupRun({ repoDir: args['repo-dir'], worktreeRoot: args['worktree-root'], runId: args['run-id'], plan });
-    process.stdout.write(JSON.stringify(r) + '\n');
-  }
+  fail('fix-orchestrate.mjs 不再提供 CLI（SC-R3-11: 单入口防绕过状态机）。请使用 scripts/fix-run.mjs <init|allocate|integrate|serial-allocate|serial-integrate|validate|finalize|cleanup>');
 }

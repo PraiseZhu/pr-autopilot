@@ -29,6 +29,31 @@ export function trustedCapacity({ configPath = join(HERE, '../config/orchestrati
   return n;
 }
 
+// SC-R3-5②: hub 路径占比上限（同为宪法层配置）。R3 实证: 8 条 finding 各带一个共享
+// tracked 文件（如 .gitignore）即可把 8 个独立 SC 合成 1 组 = 合法全串行。
+export function trustedHubShare({ configPath = join(HERE, '../config/orchestration.json') } = {}) {
+  const cfg = readJson(configPath);
+  const s = cfg.hub_path_max_share;
+  if (typeof s !== 'number' || !(s > 0 && s <= 1)) {
+    throw new Error(`config/orchestration.json 的 hub_path_max_share 非法（${s}）——必须是 (0,1] 数值（fail-closed）`);
+  }
+  return s;
+}
+
+// hub 门: 某路径出现在 ≥3 条 且 > share 比例的 SC 域中 → degraded（要求 origin 席拆分
+// finding 或把「影响范围」移 scope_note）。≥3 的下限保住合法的两两冲突不被误杀。
+export function hubViolations(items, share, label) {
+  const freq = new Map();
+  for (const s of items) for (const p of new Set(s.paths)) freq.set(p, (freq.get(p) ?? 0) + 1);
+  const out = [];
+  for (const [p, n] of freq) {
+    if (n >= 3 && n > items.length * share) {
+      out.push(`${label} hub 路径 ${p} 出现在 ${n}/${items.length} 条 SC 域中（> hub_path_max_share=${share}）——广域锚点会把可并行修复串行化，请 origin 席拆分 finding 或移 scope_note（SC-R3-5）`);
+    }
+  }
+  return out.sort();
+}
+
 // 文件域相交 → union-find 同组。确定性: 组内 sc_ids 字典序、组按最小 sc_id 排序。
 export function groupByConflict(items) {
   const parent = new Map(items.map((s) => [s.sc_id, s.sc_id]));
@@ -53,9 +78,10 @@ export function groupByConflict(items) {
     .sort((a, b) => a.sc_ids[0].localeCompare(b.sc_ids[0]));
 }
 
-export function buildFixPlan({ artifact, manifest, capacity = null, configPath = undefined }) {
-  // capacity 参数只允许 fixture 注入；生产路径一律从可信配置读
+export function buildFixPlan({ artifact, manifest, capacity = null, hubShare = null, configPath = undefined }) {
+  // capacity/hubShare 参数只允许 fixture 注入；生产路径一律从可信配置读
   const cap = capacity ?? trustedCapacity(configPath ? { configPath } : {});
+  const hub = hubShare ?? trustedHubShare(configPath ? { configPath } : {});
   const findingById = new Map((artifact.canonical_findings ?? []).map((f) => [f.id, f]));
   const scs = manifest.scs ?? [];
   const degraded = [];
@@ -85,6 +111,10 @@ export function buildFixPlan({ artifact, manifest, capacity = null, configPath =
       fixScs.push(rec);
     }
   }
+
+  // SC-R3-5②: hub 门（fix 与 verify 两池各自查）
+  degraded.push(...hubViolations(fixScs, hub, 'fix'));
+  degraded.push(...hubViolations(verifyScs, hub, 'verify'));
 
   if (degraded.length) return { degraded: true, reasons: degraded };
 

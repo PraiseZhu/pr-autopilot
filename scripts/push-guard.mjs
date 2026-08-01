@@ -25,7 +25,7 @@ import { validateRemoteBranch } from './lib/git-checks.mjs';
 import { checkScCoverage } from './sc-coverage-gate.mjs';
 import { buildFixPlan } from './fix-plan.mjs';
 import { checkDispatch } from './fix-dispatch-gate.mjs';
-import { verifyEventChain, runManifestHash } from './fix-run.mjs';
+import { verifyEventChain, runManifestHash, recordedSquashes } from './fix-run.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PURPOSES = ['feature', 'evolution', 'fast'];
@@ -56,9 +56,8 @@ export function validateManifest(manifest) {
   }
   if (manifest.purpose === 'feature' || manifest.purpose === 'evolution') {
     if (!manifest.consensus_artifact_hash) errs.push(`purpose=${manifest.purpose} 必须携带 consensus_artifact_hash（F4）`);
-    if (!manifest.sc_hash || !Array.isArray(manifest.sc_list) || manifest.sc_list.length === 0) {
-      errs.push(`purpose=${manifest.purpose} 必须携带 sc_hash + 非空 sc_list`);
-    }
+    // SC-R3-6: legacy sc_hash/sc_list 已删除——SC 载体统一为 sc manifest（编排链五件套里的
+    // sc_manifest_hash）。旧字段强制导致「按 SKILL.md 生成的 manifest 必被拒」的文档断契约。
     // v2 编排链（审 R1-P1-3 时序修正）: 修复编排产物必须与**源共识**（修复前那份）绑定，
     // 而 manifest.consensus_artifact_hash 指向 delta 复核后的**终版共识**——两份不同，必须分开带。
     // SC-2（R2-P1-1）: **是否必须走编排链不由 manifest 自报决定**（旧实现"声明了才验"=
@@ -203,9 +202,6 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
         baseSha = artifact.base_sha;
       }
     }
-    if (manifest.sc_hash && manifest.sc_list && hashObject(manifest.sc_list) !== manifest.sc_hash) {
-      errors.push('SC 清单 hash 与 sc_hash 不一致');
-    }
     // ---- v2 修复编排链核验（审 R1-P1-3: 重算等价，非自报字符串比对） ----
     // SC-2（R2-P1-1）: 必走判据**从 artifact 派生**，不看 manifest 自报——
     // 终版 artifact 有 parent（= 经过 delta 轮，说明修过）或 canonical_findings 非空
@@ -261,52 +257,59 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
         const dErrs = checkDispatch({ plan: fixPlan, record: dispatchRecord });
         for (const e of dErrs) errors.push(`派发门: ${e}`);
         if (hashObject(dispatchRecord) !== fo.dispatch_record_hash) errors.push('fix_orchestration.dispatch_record_hash ≠ dispatch record 重算值');
-        // ⑤ SC-9: 最终 DAG lineage——final candidate 必须 == run manifest 的最终 integrated_tip，
-        // 且 tip 的祖先集合只能由「已登记 group tips + 规定 merge/cherry-pick」构成:
-        // lead 在集成分支私补 commit → 拒（R2 判为本轮必修）。
+        // ⑤ SC-9 + SC-R3-8/10: 最终 DAG lineage——**精确集合判定**（squash 集成后 group tips
+        // 永不进最终祖先，六行子串启发式已删除——R3 实证其 false positive）:
+        //   · run 起点必须 == 源 artifact 的 candidate_sha（起点漂移把 A..B 的私货移出检查窗被拦）
+        //   · run 绑定的 sc_manifest/source_artifact hash 必须与五件套一致（事后换件被拦）
+        //   · 每波 tips 组集合必须与重算 plan 的该波 exact 相等（tampered plan 漏组被拦，SC-R3-2）
+        //   · source..final 的每个 commit 必须非 merge 且 ∈ run manifest 记录的 squash 集，
+        //     双向相等——私补 commit 必然落在集合外（SC-R3-8）
         if (!runManifest) {
           errors.push('fix_orchestration 在场但缺 run manifest（SC-9: 无法验证最终 DAG lineage，fail-closed）');
         } else {
           const rmErrs = verifyEventChain(runManifest);
           for (const e of rmErrs) errors.push(`run manifest: ${e}`);
           if (runManifest.fix_plan_hash !== fixPlan.fix_plan_hash) errors.push('run manifest 绑定的 plan hash ≠ 本 plan');
+          if (runManifest.sc_manifest_hash !== fo.sc_manifest_hash) errors.push('run manifest 绑定的 sc_manifest_hash ≠ 五件套声明值（SC-R3-3: 换 sc manifest 造 vacuous PASS 被拦）');
+          if (runManifest.source_artifact_hash !== srcReal) errors.push('run manifest 绑定的 source_artifact_hash ≠ 源 artifact 重算值（SC-R3-10）');
+          if (runManifest.source_candidate !== sourceArtifact.candidate_sha) {
+            errors.push(`run 起点 ${String(runManifest.source_candidate).slice(0, 12)} ≠ 源 artifact candidate ${String(sourceArtifact.candidate_sha).slice(0, 12)}（起点漂移被拦，SC-R3-10）`);
+          }
           if (runManifestHash(runManifest) !== fo.run_manifest_hash) errors.push('fix_orchestration.run_manifest_hash ≠ run manifest 重算值');
+          // 每波组集合重放（SC-R3-2: subset/ghost/duplicate 全拒）
+          if (!rebuilt.degraded) {
+            const planWaves = rebuilt.plan.waves;
+            const runWaves = runManifest.waves ?? [];
+            if (runWaves.length !== planWaves.length) {
+              errors.push(`run manifest 波数 ${runWaves.length} ≠ plan 波数 ${planWaves.length}（SC-R3-2）`);
+            } else {
+              for (let k = 0; k < planWaves.length; k++) {
+                const want = [...planWaves[k]].sort();
+                const got = (runWaves[k]?.tips ?? []).map((t) => t.group_id).sort();
+                if (JSON.stringify(want) !== JSON.stringify(got)) {
+                  errors.push(`wave${k + 1} 集成组集合 [${got}] ≠ plan 该波 [${want}]（漏组/幽灵组/重复被拦，SC-R3-2）`);
+                }
+                if (k === 0 && runWaves[0] && runWaves[0].base !== runManifest.source_candidate) {
+                  errors.push('wave1 base ≠ run source_candidate（波次基线被改，SC-R3-10）');
+                }
+              }
+            }
+          }
           const finalTip = runManifest.final_candidate ?? null;
           if (!finalTip) errors.push('run manifest 未 finalize（无 final_candidate）');
           else if (finalTip !== manifest.expected_sha) {
             errors.push(`expected_sha ≠ run manifest 的最终 integrated_tip（expected=${String(manifest.expected_sha).slice(0, 12)} run=${finalTip.slice(0, 12)}）——集成后私改/换 commit 被拦（SC-9）`);
           } else {
-            // 祖先集合校验: final tip 到 source candidate 之间的 commit，必须都能归属到某个已登记
-            // group tip 的祖先链（或是集成自身产生的 merge commit）。私补的孤立 commit 落不进去。
-            const registered = new Set();
-            for (const w of runManifest.waves ?? []) for (const t of w.tips ?? []) registered.add(t.tip);
             try {
+              const merges = gitT(repoDir, 'rev-list', '--merges', `${runManifest.source_candidate}..${finalTip}`).split('\n').filter(Boolean);
+              if (merges.length) errors.push(`最终 DAG 含 merge commit ${merges[0].slice(0, 12)}（squash 集成下最终历史只应有 squash 线性链，SC-R3-8）`);
               const revs = gitT(repoDir, 'rev-list', `${runManifest.source_candidate}..${finalTip}`).split('\n').filter(Boolean);
+              const recorded = recordedSquashes(runManifest);
               for (const rev of revs) {
-                const isMerge = gitT(repoDir, 'rev-list', '--no-walk', '--merges', rev).trim() !== '';
-                if (isMerge) continue; // 集成 merge commit
-                const owned = [...registered].some((tip) => {
-                  try { execFileSync('git', ['-C', repoDir, 'merge-base', '--is-ancestor', rev, tip], { encoding: 'utf8' }); return true; }
-                  catch { return false; }
-                });
-                // cherry-pick 串行重跑会产生新 SHA，用 patch-id 归属
-                let patchOwned = false;
-                if (!owned) {
-                  try {
-                    const pid = gitT(repoDir, 'patch-id', '--stable') || '';
-                    void pid; // patch-id 需 stdin，改用 diff 比对（下方）
-                  } catch { /* noop */ }
-                  for (const tip of registered) {
-                    try {
-                      const a = gitT(repoDir, 'show', '--format=', '--no-color', rev);
-                      const b = gitT(repoDir, 'log', '-p', '--format=', '--no-color', `${runManifest.source_candidate}..${tip}`);
-                      if (a && b.includes(a.split('\n').slice(0, 6).join('\n'))) { patchOwned = true; break; }
-                    } catch { /* noop */ }
-                  }
-                }
-                if (!owned && !patchOwned) {
-                  errors.push(`最终 DAG 含未登记 commit ${rev.slice(0, 12)}（不属于任何已登记 group tip——集成后私补代码被拦，SC-9）`);
-                }
+                if (!recorded.has(rev)) errors.push(`最终 DAG 含未登记 commit ${rev.slice(0, 12)}（不在 run manifest 的 squash 集内——集成后私补代码被拦，SC-9/SC-R3-8）`);
+              }
+              for (const s of recorded) {
+                if (!revs.includes(s)) errors.push(`run manifest 登记的 squash ${s.slice(0, 12)} 不在最终链上（记录与历史不符，fail-closed）`);
               }
             } catch (e) { errors.push(`DAG lineage 校验失败（fail-closed）: ${e.message}`); }
           }

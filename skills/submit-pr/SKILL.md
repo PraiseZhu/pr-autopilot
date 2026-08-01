@@ -73,9 +73,16 @@ node scripts/consensus-gate.mjs v1.json v2.json v3.json --out consensus.json
 ## Phase 2b — SC 提炼 + 覆盖门（共识后，自动衔接）
 
 **owner 定案：共识 → 修复不需要 owner 授权。**
-lead 对共识确认的每条 finding 提炼可验证 SC，产出 **SC manifest**（`schemas/sc-manifest.schema.json`）：
+lead 对共识确认的每条 finding 提炼可验证 SC，产出 **SC manifest**（`schemas/sc-manifest.schema.json` **v2**）：
 每条 SC 带 `id / kind(fix|verify|global) / finding_ids[] / change / holds / verify`，manifest 头部绑
 **源共识** `consensus_artifact_hash`。SC 例句库见 `references/sc-examples.md`。
+**verify 是结构化 argv 配方，不是命令行文本**（SC-R3-4，owner 决策 D2）：
+```json
+"verify": { "cmd": "npm", "args": ["test", "--", "-t", "archiveCanvas"] }
+```
+`cmd` 必须是裸程序名（禁路径/前导 `-`），执行走 `execFile(shell:false)` + 最小环境变量——
+`a && b`、管道、重定向一律不可用；复合验证**拆成多条 SC** 或写进测试文件。
+执行结果只记 exit code + stdout sha256（凭证不落库红线，原始输出不进任何档案）。
 
 **覆盖门（脚本判，修补了「SC 可漏项/掺假」的旧洞）**：
 ```
@@ -99,19 +106,30 @@ node scripts/fix-plan.mjs --artifact consensus.json --manifest sc-manifest.json 
 
 **逐波执行（有状态 orchestrator，SC-8：base 由 run manifest CAS 派生，不接受自报）**：
 ```
-# 0) 绑定 plan 与 source candidate（此后所有波次 base 都由状态机派生）
+# 0) 绑定 plan + sc manifest + 源共识（起点 = 源 artifact 的 candidate_sha，由 artifact 派生
+#    而非 CLI 自报——SC-R3-10；此后所有波次 base 都由状态机派生）
 node scripts/fix-run.mjs init --state-dir <st> --run-id <run> --repo-dir . \
-  --plan fix-plan.json --source-candidate <candidate-sha> --feature-branch <branch>
+  --plan fix-plan.json --sc-manifest sc-manifest.json --source-artifact consensus.json \
+  --feature-branch <branch>
 # 1) 本波分配隔离 worktree（每组一个；base 自动取 wave0=source / waveK=上一波集成 tip）
 node scripts/fix-run.mjs allocate --state-dir <st> --run-id <run> --plan fix-plan.json \
   --wave <k> --worktree-root ../.fix-wt
 # 2) 按输出的 allocations 一次 create_workers 并行开出（组数即 worker 数，拉满 capacity）
 #    每包: 本组 SC 子集 + 自己的 worktree 路径 + allowed_paths + goal --until-sc
-#    worker 在自己 worktree 内 commit；越域改动会在集成时被拒
-# 3) 集成: 校验 tip 归属（=分支 HEAD、非空、实改 ⊆ allowed_paths、verify 组只改测试）
-#    → 实改交集检测 → 无重叠则 merge；有重叠**自动串行重跑**（cherry-pick 逐组叠加）
+#    worker 在自己 worktree 内 commit；**所有组** changed ⊆ allowed_paths（verify 组叠加
+#    只改测试路径），越域在集成时被拒（SC-R3-7）
+# 3) 集成 = **squash**（owner 决策 D1）: 校验 tip 归属 → 实改交集检测 → 无重叠则 merge 出
+#    最终树后用 commit-tree 打成**单个 squash commit**（group tips 永不进最终祖先——
+#    中间 commit 藏东西再恢复的「净 diff 洗历史」从构造上无处容身，SC-R3-8）
 node scripts/fix-run.mjs integrate --state-dir <st> --run-id <run> --plan fix-plan.json --wave <k>
-# 4) orchestrator **自己复跑** 本波各 SC 的 verify（SC-10：不信 worker 自报）
+# 3b) 有重叠 → fail-closed 转**串行重派**（并行产物废弃；不是 cherry-pick 搬旧产物，
+#     是 worker 在递进的新 base 上**真实重跑**——SC-R3-9）:
+#     循环 { serial-allocate 输出下一组的新 worktree → 重派该组 worker → serial-integrate }
+node scripts/fix-run.mjs serial-allocate  --state-dir <st> --run-id <run> --plan fix-plan.json --wave <k>
+node scripts/fix-run.mjs serial-integrate --state-dir <st> --run-id <run> --plan fix-plan.json --wave <k>
+# 4) orchestrator **自己复跑** 本波各 SC 的 verify（SC-10：不信 worker 自报）——
+#    sc manifest 必须与 init 绑定的 hash 一致、本波 SC 集 exact 全覆盖（SC-R3-3），
+#    verify 按结构化 argv 走 execFile(shell:false)，只记 exit + stdout sha256
 node scripts/fix-run.mjs validate --state-dir <st> --run-id <run> --sc-manifest sc-manifest.json --wave <k>
 # 5) 全波跑完收口: 校验每波都通过复跑 → feature branch 前推到最终 integration tip
 node scripts/fix-run.mjs finalize --state-dir <st> --run-id <run>   # 输出 run_manifest_hash
@@ -127,8 +145,9 @@ node scripts/fix-run.mjs finalize --state-dir <st> --run-id <run>   # 输出 run
   保证等级 **T1（防疏忽/漂移）**——如实声明：dispatch record 由 lead 提交，恶意伪造需宿主级
   签名回执，本仓做不到；实测失败模式（lead 老实但按惯性只派一个）本门 100% 拦下。
 - 全波集成完 → lead 中央跑一次全量 tsc/lint/test → 新 candidate SHA（== finalize 输出的 final_candidate）
-- 收尾 `fix-run.mjs cleanup` 回收本 run 全部 worktree/分支（只回收 git 登记且本 run 命名的，
-  归属不符 fail-closed 不删）
+- 收尾 `fix-run.mjs cleanup --state-dir <st> --run-id <run>` 回收本 run 全部 worktree/分支——
+  回收对象**只从 run manifest 的 allocation 记录枚举**（caller 不传路径/plan），每项做
+  git 登记 + common-dir 归属 + 检出分支三重校验，归属不符连分支都不删（SC-R3-1）
 
 新 candidate SHA 后 → **三审 delta 复核**：
 - 两对抗席只对账 findings 修没修 + delta 有无新问题，禁重审未改代码；
@@ -149,9 +168,13 @@ node scripts/push-guard.mjs --repo-dir . --manifest push-manifest.json \
 **编排链绑定（SC-2：不是"声明了才验"，而是"有 finding/有 parent 就必须带"）**：
 push manifest 的 `fix_orchestration` 五件套 = `{source_artifact_hash, sc_manifest_hash,
 fix_plan_hash, dispatch_record_hash, run_manifest_hash}`。守卫**自己重跑** coverage gate +
-fix-plan（纯函数重算等价）+ 组数门 + **最终 DAG lineage**（SC-9：expected_sha 必须 == run
-manifest 的 final_candidate，且祖先集合只能由已登记 group tips + 集成 merge 构成——集成后
-私补 commit 被拦）。lead 手改分组/漏 SC/派发不足/私补代码 → **push 被拒**。
+fix-plan（纯函数重算等价）+ 组数门 + **最终 DAG lineage**（SC-9/SC-R3-8：expected_sha 必须
+== run manifest 的 final_candidate；squash 集成下最终历史是线性 squash 链，`source..final`
+的每个 commit 必须**精确等于** run manifest 登记的 squash 集合——集成后私补 commit 落在
+集合外必拒）。
+保证等级如实声明为 **T1（防疏忽/防漂移）**：以上各门拦的是「分组被手改、SC 漏项、派发
+不足、集成后私补代码」这类真实发生过的漂移与惯性失误；编排产物由 lead 会话提交，恶意
+伪造需宿主级签名回执，本仓做不到、也不冒称做到（与派发门同一口径）。
 两份 artifact 不同：`--artifact` 是 delta 复核后的终版（candidate == expected_sha），
 `--source-artifact` 是修复**前**的源共识（编排从它算）；两者必须是 **exact parent 关系**
 （SC-3：终版 artifact 的 `parent_artifact_hash` == 源 artifact hash，同 base 的另一份冒充被拦）。

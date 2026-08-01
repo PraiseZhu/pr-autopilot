@@ -9,6 +9,7 @@
 // 任一违 → fail-closed。suggestion 级 finding 不强制覆盖（进 residual，与共识白名单口径一致）。
 import { readJson, parseArgs, fail, isMain } from './lib/common.mjs';
 import { recomputeArtifactHash } from './consensus-gate.mjs';
+import { validateVerifyRecipe } from './fix-run.mjs';
 
 export function checkScCoverage({ manifest, artifact }) {
   const errs = [];
@@ -45,9 +46,12 @@ export function checkScCoverage({ manifest, artifact }) {
     need(typeof sc.id === 'string' && SC_ID_RE.test(sc.id), `SC id 格式非法: ${JSON.stringify(sc.id)}（须 ^SC-[A-Za-z0-9._-]+$）`);
     need(!seenScIds.has(sc.id), `SC id 重复: ${sc.id}`);
     seenScIds.add(sc.id);
-    for (const f of ['change', 'holds', 'verify']) {
+    for (const f of ['change', 'holds']) {
       need(typeof sc[f] === 'string' && sc[f].trim().length > 0, `SC ${sc.id} 缺必填字段 ${f}`);
     }
+    // SC-R3-4（D2）: verify 必须是结构化 argv 配方——自由文本会被 shell 解释（命令注入面）
+    const recipeErr = validateVerifyRecipe(sc.verify);
+    need(!recipeErr, `SC ${sc.id}: ${recipeErr}`);
     const fids = Array.isArray(sc.finding_ids) ? sc.finding_ids : [];
     if (sc.kind === 'global') {
       globalCount++;
