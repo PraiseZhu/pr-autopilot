@@ -282,9 +282,24 @@ export function cleanupRun({ manifest, exec = null }) {
           errors.push(`拒绝删除分支 ${t.branch}: 正被某个 worktree 检出（update-ref 会绕过 git 检出保护破坏其基线，fail-closed——R6-P1）`);
           steps.push(`br-refused:${t.label}`);
         } else {
-          // CAS 删除: old 值不匹配时 git 自己拒绝（TOCTOU 也兜住）
-          try { g('update-ref', '-d', `refs/heads/${t.branch}`, t.expectedTip); steps.push(`br-deleted:${t.label}`); }
-          catch (e) { errors.push(`分支 CAS 删除失败 ${t.branch}: ${e.message}`); steps.push(`br-refused:${t.label}`); }
+          // CAS 删除只保护 ref 的 old 值；「未被检出」是外部条件，预检查与删除之间存在
+          // 竞态窗口（R7-P1 实证）。处置 = 删除后**复查 + 补偿回滚**: 若删除瞬间有 worktree
+          // 抢先检出了该分支，按记录 tip 原样恢复（update-ref 创建式 CAS，恢复值精确）。
+          // 窗口后到达的 worktree add 会因分支已删而自行失败，不产生静默基线破坏。
+          try { g('update-ref', '-d', `refs/heads/${t.branch}`, t.expectedTip); }
+          catch (e) { errors.push(`分支 CAS 删除失败 ${t.branch}: ${e.message}`); steps.push(`br-refused:${t.label}`); continue; }
+          if (branchCheckedOut({ repoDir, branch: t.branch, exec })) {
+            try {
+              g('update-ref', `refs/heads/${t.branch}`, t.expectedTip, '0'.repeat(40)); // 仅当 ref 不存在时恢复
+              errors.push(`分支 ${t.branch} 删除时检出竞态被检出——已按记录 tip 原样恢复（R7-P1 补偿回滚）`);
+              steps.push(`br-restored:${t.label}`);
+            } catch (e2) {
+              errors.push(`分支 ${t.branch} 竞态回滚失败（人工恢复到 ${t.expectedTip.slice(0, 12)}）: ${e2.message}`);
+              steps.push(`br-restore-fail:${t.label}`);
+            }
+          } else {
+            steps.push(`br-deleted:${t.label}`);
+          }
         }
       }
       // owned=false 且 worktree 仍在（归属不符）→ 分支一个字都不碰
@@ -303,8 +318,24 @@ export function cleanupRun({ manifest, exec = null }) {
         errors.push(`拒绝删除分支 ${manifest.integration_branch}: 正被某个 worktree 检出（R6-P1 fail-closed）`);
         steps.push('br-refused:integration');
       } else {
-        try { g('update-ref', '-d', `refs/heads/${manifest.integration_branch}`, lastIntegrationTip); steps.push('br-deleted:integration'); }
+        // R7-P1: 同 group 分支——删除后复查 + 补偿回滚
+        let deleted = false;
+        try { g('update-ref', '-d', `refs/heads/${manifest.integration_branch}`, lastIntegrationTip); deleted = true; }
         catch (e) { errors.push(`integration 分支 CAS 删除失败: ${e.message}`); steps.push('br-refused:integration'); }
+        if (deleted) {
+          if (branchCheckedOut({ repoDir, branch: manifest.integration_branch, exec })) {
+            try {
+              g('update-ref', `refs/heads/${manifest.integration_branch}`, lastIntegrationTip, '0'.repeat(40));
+              errors.push(`分支 ${manifest.integration_branch} 删除时检出竞态被检出——已恢复（R7-P1）`);
+              steps.push('br-restored:integration');
+            } catch (e2) {
+              errors.push(`integration 分支竞态回滚失败（人工恢复到 ${lastIntegrationTip.slice(0, 12)}）: ${e2.message}`);
+              steps.push('br-restore-fail:integration');
+            }
+          } else {
+            steps.push('br-deleted:integration');
+          }
+        }
       }
     }
   }

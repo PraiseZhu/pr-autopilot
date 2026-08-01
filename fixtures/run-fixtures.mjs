@@ -3614,6 +3614,42 @@ t('[R6-P2] integration 记录路径为唯一权威: 后续波换 worktree_root �
   ok(!existsSync(join(env.wtRoot, 'rf-integration')) && !existsSync(a1.allocations[0].worktree) && !existsSync(a2.allocations[0].worktree), '全部回收，无泄漏');
 });
 
+t('[R7-P1] 删除竞态: 预检查后、删除前被抢先检出 → 复查检出并按记录 tip 补偿回滚', () => {
+  const d = mkdtempSync(join(tmpdir(), 'r7p1-'));
+  const r = join(d, 'repo');
+  execFileSync('git', ['init', '-q', r]);
+  const g = (...a) => execFileSync('git', ['-C', r, ...a], { encoding: 'utf8' }).trim();
+  g('config', 'user.email', 'o@t'); g('config', 'user.name', 'o');
+  writeFileSync(join(r, 'f.ts'), 'x\n'); g('add', '.'); g('commit', '-qm', 'base');
+  const cand = g('rev-parse', 'HEAD');
+  writeFileSync(join(r, 'f.ts'), 'w\n'); g('add', '.'); g('commit', '-qm', 'w');
+  const T = g('rev-parse', 'HEAD');
+  g('checkout', '-q', cand);
+  g('branch', 'fix/rt/g1', T);
+  const wtRoot = join(d, 'wt'); mkdirSync(wtRoot);
+  const racerWt = join(d, 'racer');
+  // exec 注入: 在 update-ref -d 落地前一刻，racer 抢先 worktree add 检出该分支
+  // （复刻 R7 的 PATH-wrapper probe: 预检查已过、删除未落地的窗口）
+  const realExec = (argv) => execFileSync(argv[0], argv.slice(1), { encoding: 'utf8' });
+  let raced = false;
+  const exec = (argv) => {
+    if (!raced && argv.includes('update-ref') && argv.includes('-d')) {
+      raced = true;
+      realExec(['git', '-C', r, 'worktree', 'add', '-q', racerWt, 'fix/rt/g1']);
+    }
+    return realExec(argv);
+  };
+  const manifest = { repo_dir: r, run_id: 'rt', source_candidate: cand, integration_branch: null,
+    waves: [{ worktree_root: wtRoot, base: cand, tips: [{ group_id: 'g1', tip: T }],
+      allocations: [{ group_id: 'g1', worktree: join(wtRoot, 'rt-g1'), branch: 'fix/rt/g1', base: cand, owner_nonce: 'x'.repeat(32) }] }] };
+  const res = ORC.cleanupRun({ manifest, exec });
+  ok(raced, '前提: 竞态确已发生在预检查之后');
+  ok(res.steps.includes('br-restored:g1'), 'R7-P1 核心: 删除后复查必须检出竞态并回滚: ' + JSON.stringify(res.steps));
+  ok(res.errors.some((e) => /竞态.*恢复|补偿回滚/.test(e)), '必须显式报告竞态: ' + JSON.stringify(res.errors));
+  eq(g('rev-parse', 'refs/heads/fix/rt/g1'), T, '分支必须被精确恢复到记录 tip');
+  eq(execFileSync('git', ['-C', racerWt, 'status', '--porcelain'], { encoding: 'utf8' }).trim(), '', 'racer worktree 基线无损（不再是 No commits yet）');
+});
+
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
 console.log(`\n========== fixtures: ${pass} passed, ${failCount} failed ==========`);
