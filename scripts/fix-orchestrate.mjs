@@ -8,9 +8,31 @@
 // 隔离即安全: 每组在自己 worktree 里改，并发写危险从构造上消失（不是事后检查）。
 // git merge conflict 与 实改文件交集 是**真实**碰撞检测器，不是预测。
 import { execFileSync } from 'node:child_process';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, realpathSync, writeFileSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { fail, isMain, nowIso, normalizeRepoPath } from './lib/common.mjs';
+
+// R5-P0: 「内容相等 ≠ 创建归属」——HEAD/base 血缘都可能与他人 worktree 撞值。
+// 唯一可靠的归属判据是**创建时印记**: worktree 的 admin git-dir 里写 owner 文件
+// （run_id + 随机 nonce），manifest 记录 nonce；cleanup 时两边比对。
+const OWNER_FILE = 'pr-autopilot-owner';
+export function stampOwner({ worktreeDir, payload, exec = null }) {
+  const gitdir = exec
+    ? exec(['git', '-C', worktreeDir, 'rev-parse', '--absolute-git-dir']).trim()
+    : git(worktreeDir, 'rev-parse', '--absolute-git-dir');
+  writeFileSync(join(gitdir, OWNER_FILE), JSON.stringify(payload) + '\n');
+  return payload;
+}
+export function readOwner({ worktreeDir, exec = null }) {
+  try {
+    const gitdir = exec
+      ? exec(['git', '-C', worktreeDir, 'rev-parse', '--absolute-git-dir']).trim()
+      : git(worktreeDir, 'rev-parse', '--absolute-git-dir');
+    return JSON.parse(readFileSync(join(gitdir, OWNER_FILE), 'utf8'));
+  } catch { return null; }
+}
+export function newNonce() { return randomBytes(16).toString('hex'); }
 
 const BRANCH_RE = /^[A-Za-z0-9._\/-]+$/;
 
@@ -38,16 +60,24 @@ export function allocateWave({ repoDir, worktreeRoot, runId, plan, waveIndex, wa
     const branch = groupBranch(runId, groupId);
     if (!BRANCH_RE.test(branch)) throw new Error(`分支名非法: ${branch}`);
     const wtPath = groupWorktreePath(worktreeRoot, runId, groupId);
+    let nonce = null;
     if (existsSync(wtPath)) {
-      // 幂等复用: 该 worktree 的分支必须已在 waveBase 之上（防拿旧波残骸当本波用）
+      // 幂等复用: 必须是本 run 本组创建的（owner 印记，R5-P0），且分支已在 waveBase 之上
+      const owner = readOwner({ worktreeDir: wtPath, exec });
+      if (!owner || owner.run_id !== runId || owner.group_id !== groupId) {
+        throw new Error(`worktree ${wtPath} 无本 run 本组的 owner 印记（他人/残骸占位，fail-closed 人工清理）`);
+      }
+      nonce = owner.nonce;
       let head = null;
       try { head = exec ? exec(['git', '-C', wtPath, 'rev-parse', 'HEAD']).trim() : git(wtPath, 'rev-parse', 'HEAD'); } catch { /* 损坏 */ }
       const ok = head && (head === waveBase || isAncestor({ repoDir, ancestor: waveBase, descendant: head, exec }));
       if (!ok) throw new Error(`worktree 残骸 ${wtPath} 不在本波 base 之上（fail-closed，人工清理后重跑）`);
     } else {
       g('worktree', 'add', '-q', '-b', branch, wtPath, waveBase);
+      nonce = newNonce();
+      stampOwner({ worktreeDir: wtPath, payload: { run_id: runId, group_id: groupId, nonce }, exec });
     }
-    allocations.push({ group_id: groupId, sc_ids: group.sc_ids, allowed_paths: group.paths, branch, worktree: wtPath, base: waveBase });
+    allocations.push({ group_id: groupId, sc_ids: group.sc_ids, allowed_paths: group.paths, branch, worktree: wtPath, base: waveBase, owner_nonce: nonce });
   }
   return { run_id: runId, wave_index: waveIndex, wave_base: waveBase, allocations, allocated_at: nowIso() };
 }
@@ -127,13 +157,14 @@ export function registeredWorktrees({ repoDir, exec = null }) {
 }
 
 // 清理本 run 的全部 worktree/分支（终态或 replan 时调用）
-// SC-R3-1（R3-P0，替换 R2 的 SC-1 半成品）: 回收对象**只从 run manifest 枚举**——
-// caller 不再传 worktreeRoot/plan（v1 用 caller 输入预测路径 = 同仓无关 worktree 恰好同名
-// 即被 remove --force，R3 实证的 P0）。每个目标做**双重归属校验**:
-//   ① 路径出现在 git worktree list（realpath 比对）
-//   ② 该 worktree 的 git common-dir 归属本仓，且（组/串行 worktree）检出分支 == 记录分支
-// 任一不符 → 拒删且**连分支都不删**。git worktree remove 失败 → 记 wt-fail 交人工，
-// 绝不 rmSync 兜底。
+// 归属模型（R5-P0 定版——「内容相等 ≠ 创建归属」，HEAD/血缘集合可被撞值）:
+//   worktree: ① git 登记（realpath）② common-dir 归属本仓 ③ **owner 印记**——创建时写进
+//   admin git-dir 的 {run_id, nonce} 必须与 manifest 记录完全一致（组/串行/integration 一律）；
+//   分支目标叠加 ④ 检出分支 == 记录分支。integration 目标**只来自 manifest 的
+//   integration_worktree 记录**（没有记录 = 本 run 从未创建 = 一个字都不碰，路径不做预测）。
+//   分支删除: worktree 归属已证 → branch -D；否则必须有记录 tip，用
+//   `git update-ref -d <ref> <expected>` 做 CAS 删除——无记录/不匹配一律拒。
+// 任一不符 → 拒删且**连分支都不删**；remove 失败 → wt-fail 交人工，绝不 rmSync 兜底。
 export function cleanupRun({ manifest, exec = null }) {
   const repoDir = manifest.repo_dir;
   const runId = manifest.run_id;
@@ -149,29 +180,17 @@ export function cleanupRun({ manifest, exec = null }) {
     repoCommon = realpathSync(resolve(repoDir, out));
   } catch (e) { return { steps, errors: [`无法解析本仓 git common-dir（fail-closed）: ${e.message}`] }; }
 
-  // 本 run 记录过的合法 commit 集（R4-P0 修正: integration/detached 目标与分支删除的
-  // 归属判据——HEAD/tip 必须落在本 run 已知点上，预测路径撞上别人的 detached worktree 时拦下）
-  const knownHeads = new Set();
-  if (manifest.source_candidate) knownHeads.add(manifest.source_candidate);
-  for (const w of manifest.waves ?? []) {
-    if (w.base) knownHeads.add(w.base);
-    if (w.integrated_tip) knownHeads.add(w.integrated_tip);
-    for (const s of w.squash_commits ?? []) knownHeads.add(s);
-    for (const t of w.tips ?? []) if (t.tip) knownHeads.add(t.tip);
-    for (const r of w.replan?.rounds ?? []) { if (r.tip) knownHeads.add(r.tip); if (r.squash) knownHeads.add(r.squash); }
-  }
-  const headOf = (dir) => {
-    try { return exec ? exec(['git', '-C', dir, 'rev-parse', 'HEAD']).trim() : git(dir, 'rev-parse', 'HEAD'); }
-    catch { return null; }
-  };
-  const isAnc = (a2, b2) => isAncestor({ repoDir, ancestor: a2, descendant: b2, exec });
-
-  // 回收目标全部来自 manifest 记录（allocation / 串行轮 / integration worktree + 各自分支）
+  // 回收目标全部来自 manifest 记录。integration 只认创建记录（R5-P0: 不做路径预测）。
   const targets = [];
+  let lastIntegrationTip = null;
+  if (manifest.integration_worktree) {
+    targets.push({ label: 'integration', worktree: manifest.integration_worktree.path, branch: null, nonce: manifest.integration_worktree.nonce ?? null });
+  }
   for (const w of manifest.waves ?? []) {
-    for (const a of w.allocations ?? []) targets.push({ label: a.group_id, worktree: a.worktree, branch: a.branch, base: a.base });
-    for (const r of w.replan?.rounds ?? []) targets.push({ label: `${r.group_id}-r${r.round}`, worktree: r.worktree, branch: r.branch, base: r.base });
-    if (w.worktree_root) targets.push({ label: 'integration', worktree: join(w.worktree_root, `${runId}-integration`), branch: null, detachedOk: true });
+    const tipOf = (gid) => (w.tips ?? []).find((x) => x.group_id === gid)?.tip ?? null;
+    for (const a of w.allocations ?? []) targets.push({ label: a.group_id, worktree: a.worktree, branch: a.branch, nonce: a.owner_nonce ?? null, expectedTip: tipOf(a.group_id) });
+    for (const r of w.replan?.rounds ?? []) targets.push({ label: `${r.group_id}-r${r.round}`, worktree: r.worktree, branch: r.branch, nonce: r.owner_nonce ?? null, expectedTip: r.tip ?? null });
+    if (w.integrated_tip) lastIntegrationTip = w.integrated_tip;
   }
 
   const seen = new Set();
@@ -203,24 +222,23 @@ export function cleanupRun({ manifest, exec = null }) {
           owned = false;
         }
       }
+      if (owned) {
+        // 归属校验 ③（R5-P0 核心）: owner 印记必须与 manifest 记录一致——
+        // 内容点（HEAD==base/squash）可撞值，创建 nonce 撞不了
+        const o = readOwner({ worktreeDir: t.worktree, exec });
+        if (!t.nonce || !o || o.run_id !== runId || o.nonce !== t.nonce) {
+          errors.push(`拒绝回收 ${t.worktree}: owner 印记缺失/不匹配（记录=${t.nonce ? t.nonce.slice(0, 8) : '无'} 实际=${o?.nonce ? o.nonce.slice(0, 8) : '无'}——归属不符，fail-closed）`);
+          steps.push(`wt-refused:${t.label}`);
+          owned = false;
+        }
+      }
       if (owned && t.branch) {
-        // 归属校验 ②b: 检出分支必须就是 allocation 记录的分支
+        // 归属校验 ④: 检出分支必须就是 allocation 记录的分支
         let headRef = null;
         try { headRef = exec ? exec(['git', '-C', t.worktree, 'symbolic-ref', '--short', 'HEAD']).trim() : git(t.worktree, 'symbolic-ref', '--short', 'HEAD'); }
         catch { /* detached */ }
         if (headRef !== t.branch) {
           errors.push(`拒绝回收 ${t.worktree}: 检出分支 ${headRef ?? '(detached)'} ≠ allocation 记录 ${t.branch}（归属不符，fail-closed）`);
-          steps.push(`wt-refused:${t.label}`);
-          owned = false;
-        }
-      }
-      if (owned && !t.branch) {
-        // 归属校验 ②c（R4-P0）: detached integration 目标的 HEAD 必须是本 run 已知点——
-        // 路径是从 worktree_root 预测的，别人的 detached worktree 恰好占位时 registered +
-        // common-dir 都会过，只有 HEAD 归属能分辨
-        const h = headOf(t.worktree);
-        if (!h || !knownHeads.has(h)) {
-          errors.push(`拒绝回收 ${t.worktree}: HEAD ${h ? h.slice(0, 12) : '(不可得)'} 不是本 run 记录的任何 base/squash/tip（预测路径撞上他人 worktree，fail-closed）`);
           steps.push(`wt-refused:${t.label}`);
           owned = false;
         }
@@ -235,36 +253,43 @@ export function cleanupRun({ manifest, exec = null }) {
       }
     } else {
       steps.push(`wt-absent:${t.label}`);
-      owned = false; // worktree 缺席 = 归属未证明，分支删除必须走血缘判据（R4-P0）
+      owned = false; // worktree 缺席 = 归属未证明，分支删除必须走 CAS
     }
-    // 分支只在 worktree 归属确认（或已不存在）时删——归属不符连分支都不动。
-    // R4-P0 补: worktree 已不存在时，分支删除也要过归属——tip 必须是本 run 已知点、
-    // 或该 allocation base 的后代（worker 在本 run 分支上多 commit 的正常情形）；
-    // 同名的他人分支（tip 与本 run 无血缘）拒删
-    if (t.branch && (owned || !existsSync(t.worktree))) {
+    // 分支删除: 归属已证（owned）→ branch -D；否则只接受「记录 tip 完全一致」的 CAS 删除
+    if (t.branch) {
       let brTip = null;
       try { brTip = exec ? exec(['git', '-C', repoDir, 'rev-parse', `refs/heads/${t.branch}`]).trim() : git(repoDir, 'rev-parse', `refs/heads/${t.branch}`); }
       catch { steps.push(`br-absent:${t.label}`); continue; }
-      const brOwned = owned || knownHeads.has(brTip) || (t.base && isAnc(t.base, brTip));
-      if (!brOwned) {
-        errors.push(`拒绝删除分支 ${t.branch}: tip ${brTip.slice(0, 12)} 与本 run 无血缘（同名他人分支，fail-closed）`);
-        steps.push(`br-refused:${t.label}`);
-        continue;
+      if (owned) {
+        try { g('branch', '-D', t.branch); steps.push(`br-deleted:${t.label}`); } catch { steps.push(`br-absent:${t.label}`); }
+      } else if (!existsSync(t.worktree)) {
+        if (!t.expectedTip) {
+          errors.push(`拒绝删除分支 ${t.branch}: 本 run 无记录 tip、worktree 又已缺席，归属无法确认（fail-closed 交人工）`);
+          steps.push(`br-refused:${t.label}`);
+        } else if (brTip !== t.expectedTip) {
+          errors.push(`拒绝删除分支 ${t.branch}: tip ${brTip.slice(0, 12)} ≠ 记录 ${t.expectedTip.slice(0, 12)}（同名他人分支/被移动，fail-closed）`);
+          steps.push(`br-refused:${t.label}`);
+        } else {
+          // CAS 删除: old 值不匹配时 git 自己拒绝（TOCTOU 也兜住）
+          try { g('update-ref', '-d', `refs/heads/${t.branch}`, t.expectedTip); steps.push(`br-deleted:${t.label}`); }
+          catch (e) { errors.push(`分支 CAS 删除失败 ${t.branch}: ${e.message}`); steps.push(`br-refused:${t.label}`); }
+        }
       }
-      try { g('branch', '-D', t.branch); steps.push(`br-deleted:${t.label}`); } catch { steps.push(`br-absent:${t.label}`); }
+      // owned=false 且 worktree 仍在（归属不符）→ 分支一个字都不碰
     }
   }
   if (manifest.integration_branch) {
-    // R4-P0 补: integration 分支删除同样过归属——tip 必须是本 run 已知点
+    // integration 分支同样走 CAS: expected = 最后记录的 integrated_tip；无记录 → 拒
     let ibTip = null;
     try { ibTip = exec ? exec(['git', '-C', repoDir, 'rev-parse', `refs/heads/${manifest.integration_branch}`]).trim() : git(repoDir, 'rev-parse', `refs/heads/${manifest.integration_branch}`); }
     catch { steps.push('br-absent:integration'); ibTip = null; }
     if (ibTip !== null) {
-      if (!knownHeads.has(ibTip)) {
-        errors.push(`拒绝删除分支 ${manifest.integration_branch}: tip ${ibTip.slice(0, 12)} 不是本 run 记录的任何点（同名他人分支，fail-closed）`);
+      if (!lastIntegrationTip || ibTip !== lastIntegrationTip) {
+        errors.push(`拒绝删除分支 ${manifest.integration_branch}: tip ${ibTip.slice(0, 12)} ≠ 记录的 integrated_tip ${lastIntegrationTip ? lastIntegrationTip.slice(0, 12) : '(无)'}（同名他人分支/无记录，fail-closed）`);
         steps.push('br-refused:integration');
       } else {
-        try { g('branch', '-D', manifest.integration_branch); steps.push('br-deleted:integration'); } catch { steps.push('br-absent:integration'); }
+        try { g('update-ref', '-d', `refs/heads/${manifest.integration_branch}`, lastIntegrationTip); steps.push('br-deleted:integration'); }
+        catch (e) { errors.push(`integration 分支 CAS 删除失败: ${e.message}`); steps.push('br-refused:integration'); }
       }
     }
   }

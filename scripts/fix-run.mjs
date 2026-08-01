@@ -19,7 +19,7 @@ import { join, dirname } from 'node:path';
 import { readJson, parseArgs, fail, isMain, nowIso, sha256, canonicalJson, normalizeRepoPath, hashObject } from './lib/common.mjs';
 import { computeFixPlanHash } from './fix-plan.mjs';
 import { recomputeArtifactHash } from './consensus-gate.mjs';
-import { allocateWave, changedFiles, isAncestor, cleanupRun } from './fix-orchestrate.mjs';
+import { allocateWave, changedFiles, isAncestor, cleanupRun, stampOwner, readOwner, newNonce } from './fix-orchestrate.mjs';
 
 const TEST_PATH_RE = /(^|\/)(e2e|fixtures)\//;
 const TEST_FILE_RE = /\.(test|spec)\.[A-Za-z0-9]+$/;
@@ -162,6 +162,32 @@ function squashCommit({ repoDir, treeOf, parent, message }) {
   return git(repoDir, 'commit-tree', tree, '-p', parent, '-m', message);
 }
 
+// R5-P0/P2: integration worktree 的创建与复用统一走此处——
+// 创建即写 owner 印记（run_id + nonce）并**立刻落盘** manifest（crash 窗口内 cleanup 也能凭
+// 印记回收）；路径已被占用但无本 run 记录/印记不符 → fail-closed，绝不 checkout 进他人 worktree。
+function ensureIntegrationWorktree({ manifestPath, m, ws, runId, checkoutRef }) {
+  const wt = integrationWorktree(ws.worktree_root, runId);
+  const g = (...a) => git(m.repo_dir, ...a);
+  const rec = m.integration_worktree ?? null; // run 级记录: integration worktree 跨波共享
+  if (existsSync(wt)) {
+    const o = readOwner({ worktreeDir: wt });
+    if (!rec || !o || o.run_id !== runId || o.nonce !== rec.nonce) {
+      throw new Error(`integration worktree 路径被占用且 owner 印记不符（记录=${rec?.nonce ? rec.nonce.slice(0, 8) : '无'} 实际=${o?.nonce ? o.nonce.slice(0, 8) : '无'}）——不 checkout 进他人 worktree，fail-closed 人工处理: ${wt}`);
+    }
+    execFileSync('git', ['-C', wt, 'checkout', '-q', '--detach', checkoutRef], { encoding: 'utf8' });
+    return wt;
+  }
+  g('worktree', 'add', '-q', '--detach', wt, checkoutRef);
+  const nonce = rec?.nonce ?? newNonce();
+  stampOwner({ worktreeDir: wt, payload: { run_id: runId, kind: 'integration', nonce } });
+  if (!rec) {
+    m.integration_worktree = { path: wt, nonce };
+    appendEvent(m, { kind: 'integration-worktree-created', wave: ws.wave_index, path: wt });
+    saveManifest(manifestPath, m); // 创建身份即刻落盘（R5-P2 crash 窗口）
+  }
+  return wt;
+}
+
 // ---- 集成（squash；overlap = fail-closed + 串行重派标记 SC-R3-8/9） ----
 export function integrate({ stateDir, runId, plan, waveIndex }) {
   const { path, m } = loadRun(stateDir, runId, plan);
@@ -200,10 +226,8 @@ export function integrate({ stateDir, runId, plan, waveIndex }) {
   ws.tips = tips;
 
   const g = (...a) => git(m.repo_dir, ...a);
-  const wt = integrationWorktree(ws.worktree_root, runId);
+  const wt = ensureIntegrationWorktree({ manifestPath: path, m, ws, runId, checkoutRef: ws.base });
   try {
-    if (!existsSync(wt)) g('worktree', 'add', '-q', '--detach', wt, ws.base);
-    else execFileSync('git', ['-C', wt, 'checkout', '-q', '--detach', ws.base], { encoding: 'utf8' });
     const gi = (...a) => execFileSync('git', ['-C', wt, ...a], { encoding: 'utf8', timeout: 120_000 }).trim();
     for (const t of tips) {
       try { gi('merge', '--no-edit', '-q', t.tip); }
@@ -245,7 +269,9 @@ export function serialAllocate({ stateDir, runId, plan, waveIndex }) {
   const wtPath = join(ws.worktree_root, `${runId}-${groupId}-r${roundIdx}`);
   if (existsSync(wtPath)) throw new Error(`串行重派 worktree 已存在: ${wtPath}（fail-closed，人工清理）`);
   git(m.repo_dir, 'worktree', 'add', '-q', '-b', branch, wtPath, base);
-  const round = { round: roundIdx, group_id: groupId, base, branch, worktree: wtPath, allowed_paths: group.paths, sc_ids: group.sc_ids, tip: null, squash: null };
+  const ownerNonce = newNonce();
+  stampOwner({ worktreeDir: wtPath, payload: { run_id: runId, group_id: groupId, round: roundIdx, nonce: ownerNonce } });
+  const round = { round: roundIdx, group_id: groupId, base, branch, worktree: wtPath, allowed_paths: group.paths, sc_ids: group.sc_ids, owner_nonce: ownerNonce, tip: null, squash: null };
   rounds.push(round);
   appendEvent(m, { kind: 'serial-allocate', wave: waveIndex, round: roundIdx, group: groupId, base });
   saveManifest(path, m);
@@ -317,11 +343,8 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
   const missing = scIds.filter((id) => !byId.has(id));
   if (missing.length) throw new Error(`sc manifest 缺本波 SC: ${missing.join(',')}（SC-R3-3: 本波 SC 集必须 exact 全覆盖）`);
 
-  // 验证在 integration worktree 的 integrated_tip 上跑
-  const wt = integrationWorktree(ws.worktree_root, runId);
-  const g = (...a) => git(m.repo_dir, ...a);
-  if (!existsSync(wt)) g('worktree', 'add', '-q', '--detach', wt, ws.integrated_tip);
-  else execFileSync('git', ['-C', wt, 'checkout', '-q', '--detach', ws.integrated_tip], { encoding: 'utf8' });
+  // 验证在 integration worktree 的 integrated_tip 上跑（owner 印记校验同 integrate）
+  const wt = ensureIntegrationWorktree({ manifestPath: path, m, ws, runId, checkoutRef: ws.integrated_tip });
 
   const results = [];
   for (const id of scIds) {
@@ -371,6 +394,12 @@ export function finalizeRun({ stateDir, runId }) {
       }
       git(m.repo_dir, 'merge', '--ff-only', last.integrated_tip); // 分叉即失败，天然 CAS
     } else {
+      // R5-P1: update-ref 会绕过 git 的「检出中分支不可强推」保护——feature branch 若在
+      // 任何其他 worktree 检出，移动 ref 会把那个 worktree 的基线静默污染。先查后动。
+      const wtList = git(m.repo_dir, 'worktree', 'list', '--porcelain');
+      if (wtList.split('\n').includes(`branch refs/heads/${m.feature_branch}`)) {
+        throw new Error(`feature branch ${m.feature_branch} 正被某个 worktree 检出——update-ref 会绕过 git 检出保护污染其工作区，拒绝前推（到该 worktree 里用 merge --ff-only，或先取消检出——R5-P1）`);
+      }
       // R4-P1: branch -f 会静默覆盖并发提交——改 update-ref CAS，旧值必须仍是 run 起点
       // （run 期间 feature branch 被外部推进 = 出现未审内容，fail-closed 交人工 replan）
       try {

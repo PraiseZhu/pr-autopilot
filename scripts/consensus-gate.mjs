@@ -49,6 +49,11 @@ export function runConsensusGate(verdicts, opts = {}) {
     try { changedPaths = changedPathSet({ repoDir: opts.repoDir, baseSha: bundle.base_sha, candidateSha: bundle.candidate_sha }); }
     catch (e) { failReasons.push(`无法计算 base..candidate 实改集（fail-closed）: ${e.message}`); }
   }
+  // R5-P1: 函数契约本身 fail-closed——changedPaths 与 repoDir 双缺 = 调用方漏传（T1 要拦的
+  // 正是这种疏忽），不允许产出 pass artifact。不设旁路 flag。
+  if (!changedPaths) {
+    failReasons.push('缺 base..candidate 实改集（changedPaths / repoDir 二者必居其一）——anchor 污染门不允许 fail-open（R5-P1）');
+  }
 
   if (!bundle) failReasons.push('缺 review bundle（共识脚本必须重算 input hash，不信 opaque 值）');
   if (verdicts.length !== 3) failReasons.push(`需要恰好 3 份 verdict，得到 ${verdicts.length}`);

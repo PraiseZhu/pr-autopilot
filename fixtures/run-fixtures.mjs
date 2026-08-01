@@ -118,7 +118,15 @@ function consensusFor(bundleObj, overrides = [{}, {}, {}], gateOpts = {}) {
     mkVerdictFor('codex-adversarial', bundleObj, overrides[1]),
     mkVerdictFor('upstream-preview', bundleObj, overrides[2])
   ];
-  return { verdicts: vs, artifact: runConsensusGate(vs, { bundle: bundleObj, ...gateOpts }) };
+  // R5-P1: 共识门 fail-closed 要求实改集在场。fixture 的 bundle 多为合成 SHA，
+  // 默认把 verdict 锚点并集当作实改集（模拟「finding 都锚在被审 diff 上」的合法态）；
+  // 需要测污染场景的用例显式传 gateOpts.changedPaths / repoDir 覆盖。
+  let changedPaths = gateOpts.changedPaths;
+  if (!changedPaths && !gateOpts.repoDir) {
+    changedPaths = new Set();
+    for (const v of vs) for (const fd of v.findings ?? []) for (const p of fd.anchor_paths ?? []) changedPaths.add(p);
+  }
+  return { verdicts: vs, artifact: runConsensusGate(vs, { bundle: bundleObj, changedPaths, ...gateOpts }) };
 }
 
 const bundle = mkBundle(SHA_A, SHA_B);
@@ -3359,7 +3367,7 @@ t('[SC-R3-11] 单入口: fix-orchestrate 独立 CLI 已删（直跑非零退出�
 // ========== 22. R4 修正专项 ==========
 console.log('\n[22] R4: cleanup integration 归属 / consensus changed-set / replan 不可逆 / finalize CAS');
 
-t('[R4-P0] cleanup 预测路径撞上他人 detached worktree / 同名他人分支 → 全拒', () => {
+t('[R4-P0/R5-P0] cleanup 归属 = 创建印记而非内容相等: 撞值 HEAD/同名分支/伪造记录全拒', () => {
   const d = mkdtempSync(join(tmpdir(), 'r4p0-'));
   const r = join(d, 'repo');
   execFileSync('git', ['init', '-q', r]);
@@ -3367,40 +3375,106 @@ t('[R4-P0] cleanup 预测路径撞上他人 detached worktree / 同名他人分�
   g('config', 'user.email', 'o@t'); g('config', 'user.name', 'o');
   writeFileSync(join(r, 'f.ts'), 'x\n'); g('add', '.'); g('commit', '-qm', 'base');
   const cand = g('rev-parse', 'HEAD');
-  // 他人的合法 commit（与本 run 记录无交集）
-  writeFileSync(join(r, 'f.ts'), 'other\n'); g('add', '.'); g('commit', '-qm', 'other');
-  const otherTip = g('rev-parse', 'HEAD');
-  g('checkout', '-q', cand);
   const wtRoot = join(d, 'wt'); mkdirSync(wtRoot);
-  // ① R4 反例: 在预测的 integration 路径注册一个**他人的 detached worktree** + 未提交 sentinel
+  // R5-P0 反例: 他人 detached worktree 在预测路径上，HEAD **恰好 == source_candidate**
+  // （内容相等撞值——R4 版的 knownHeads 会放行并删掉）
   const predicted = join(wtRoot, 'runX-integration');
-  g('worktree', 'add', '-q', '--detach', predicted, otherTip);
+  g('worktree', 'add', '-q', '--detach', predicted, cand);
   const sentinel = join(predicted, 'UNSAVED.txt');
   writeFileSync(sentinel, '他人未提交数据\n');
+  // 同名他人分支，tip 也 == source_candidate（同样撞值）
+  g('branch', 'fix/runX/integration', cand);
+  // ① manifest 无 integration_worktree 记录 → 本 run 从未创建 → 一个字都不碰
   const manifest = { repo_dir: r, run_id: 'runX', source_candidate: cand, integration_branch: 'fix/runX/integration',
     waves: [{ worktree_root: wtRoot, base: cand, allocations: [], tips: null, integrated_tip: null }] };
-  // ② 同名他人分支: integration_branch 名字被占、tip 与本 run 无关
-  g('branch', 'fix/runX/integration', otherTip);
   const res = ORC.cleanupRun({ manifest });
-  ok(existsSync(sentinel), 'R4-P0 核心: 他人 detached worktree（registered+common-dir 都过）必须存活');
-  ok(res.errors.some((e) => /HEAD.*不是本 run/.test(e)), '必须报 HEAD 归属不符: ' + JSON.stringify(res.errors));
-  ok(res.steps.includes('wt-refused:integration'));
-  eq(g('rev-parse', '--verify', 'refs/heads/fix/runX/integration').length, 40, '同名他人 integration 分支必须原封不动');
-  ok(res.errors.some((e) => /拒绝删除分支/.test(e)), '必须报分支归属不符');
-  // ③ worktree 已不存在时，同名他人组分支同样拒删
-  g('branch', 'fix/runX/g1', otherTip);
+  ok(existsSync(sentinel), 'R5-P0 核心①: 无创建记录 = 不碰预测路径（HEAD 撞值也无关）');
+  ok(!res.steps.some((s) => s.startsWith('wt-removed')), '不得移除任何 worktree: ' + JSON.stringify(res.steps));
+  eq(g('rev-parse', 'refs/heads/fix/runX/integration'), cand, '同名他人分支必须原封不动');
+  ok(res.errors.some((e) => /拒绝删除分支.*integration|≠ 记录的 integrated_tip|无记录/.test(e)) || res.steps.includes('br-refused:integration'),
+    'integration 分支无记录 tip 必须拒删: ' + JSON.stringify(res));
+  // ② 伪造 integration_worktree 记录（nonce 对不上他人 worktree 的 owner 印记）→ 拒
+  const manifest1b = { ...manifest, integration_worktree: { path: predicted, nonce: 'deadbeef'.repeat(4) } };
+  const res1b = ORC.cleanupRun({ manifest: manifest1b });
+  ok(existsSync(sentinel), 'R5-P0 核心②: 伪造记录 nonce 印记不符必拒');
+  ok(res1b.errors.some((e) => /owner 印记缺失\/不匹配/.test(e)), JSON.stringify(res1b.errors));
+  // ③ worktree 缺席 + 同名他人分支 tip 撞值 == 记录之外的任意点 → 无记录 tip 拒删
+  g('branch', 'fix/runX/g1', cand); // 撞值: tip == 本 run 的 base/source_candidate
   const manifest2 = { repo_dir: r, run_id: 'runX', source_candidate: cand, integration_branch: null,
-    waves: [{ worktree_root: wtRoot, base: cand, allocations: [{ group_id: 'g1', worktree: join(wtRoot, 'runX-g1'), branch: 'fix/runX/g1', base: cand }] }] };
-  // 让他人分支 tip 与 allocation base 无血缘: otherTip 是 cand 后代……改用 orphan
-  g('checkout', '-q', '--orphan', 'foreign');
-  execFileSync('git', ['-C', r, 'commit', '-qam', 'foreign'], { encoding: 'utf8' });
-  const foreignTip = g('rev-parse', 'HEAD');
-  g('checkout', '-q', cand);
-  g('branch', '-D', 'foreign');
-  g('branch', '-f', 'fix/runX/g1', foreignTip);
+    waves: [{ worktree_root: wtRoot, base: cand, tips: null, allocations: [{ group_id: 'g1', worktree: join(wtRoot, 'runX-g1'), branch: 'fix/runX/g1', base: cand, owner_nonce: 'x'.repeat(32) }] }] };
   const res2 = ORC.cleanupRun({ manifest: manifest2 });
-  ok(res2.errors.some((e) => /无血缘/.test(e)), 'worktree 缺席时同名无血缘分支必须拒删: ' + JSON.stringify(res2.errors));
-  eq(g('rev-parse', 'refs/heads/fix/runX/g1'), foreignTip, '他人分支原封不动');
+  ok(res2.errors.some((e) => /无记录 tip|归属无法确认/.test(e)), 'worktree 缺席且无记录 tip 必拒删（撞值 tip 不放行）: ' + JSON.stringify(res2.errors));
+  eq(g('rev-parse', 'refs/heads/fix/runX/g1'), cand, '他人分支原封不动');
+  // ④ 有记录 tip 但分支被移动 → CAS 拒；tip 完全一致 → CAS 删除成功
+  writeFileSync(join(r, 'f.ts'), 'w\n'); g('add', '.'); g('commit', '-qm', 'w');
+  const recTip = g('rev-parse', 'HEAD');
+  g('checkout', '-q', cand);
+  g('branch', '-f', 'fix/runX/g1', recTip);
+  const manifest3 = { ...manifest2, waves: [{ ...manifest2.waves[0], tips: [{ group_id: 'g1', tip: cand }] }] }; // 记录 ≠ 实际
+  const res3 = ORC.cleanupRun({ manifest: manifest3 });
+  ok(res3.errors.some((e) => /≠ 记录/.test(e)), '记录 tip 不匹配必拒: ' + JSON.stringify(res3.errors));
+  const manifest4 = { ...manifest2, waves: [{ ...manifest2.waves[0], tips: [{ group_id: 'g1', tip: recTip }] }] };
+  const res4 = ORC.cleanupRun({ manifest: manifest4 });
+  ok(res4.steps.includes('br-deleted:g1'), 'tip 一致时 CAS 删除成功: ' + JSON.stringify(res4));
+});
+
+t('[R5-P1] runConsensusGate 缺实改集 fail-closed；[R5-P2] crash 窗口凭创建印记仍可回收', () => {
+  // R5-P1a: 核心 API 缺 changedPaths/repoDir → 不产 pass artifact（调用方漏传 = T1 该拦的疏忽）
+  const vs0 = [
+    mkVerdictFor('claude-adversarial', bundle),
+    mkVerdictFor('codex-adversarial', bundle),
+    mkVerdictFor('upstream-preview', bundle)
+  ];
+  const r0 = runConsensusGate(vs0, { bundle });
+  ok(r0.gate_result === 'fail' && r0.fail_reasons.some((e) => /实改集/.test(e)),
+    'R5-P1: 缺实改集必须 fail-closed: ' + JSON.stringify(r0.fail_reasons ?? []));
+  // R5-P2: integrate 完成但 tips/integrated_tip 未落盘（crash 窗口）→ cleanup 凭 owner 印记仍可回收
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }], [['g1']],
+    [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }]);
+  FR.initRun({ stateDir: env.stateDir, runId: 'rz', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rz', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  workGroup(env, a.allocations[0], 'a.ts', 'fix\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'rz', plan, waveIndex: 0 }).ok);
+  // 模拟 crash: 抹掉 tips/integrated_tip（但 integration_worktree 创建记录在 ensure 时已先落盘）
+  const mPath = FR.runManifestPath(env.stateDir, 'rz');
+  const crashed = readJson(mPath);
+  ok(crashed.integration_worktree?.nonce, '前提: 创建记录已在 integrate 早期落盘');
+  crashed.waves[0].tips = null;
+  crashed.waves[0].integrated_tip = null;
+  crashed.waves[0].squash_commits = null;
+  const res = ORC.cleanupRun({ manifest: crashed });
+  ok(res.steps.includes('wt-removed:integration'), 'R5-P2: crash 窗口的 integration worktree 凭印记回收: ' + JSON.stringify(res.steps));
+  ok(res.steps.includes('wt-removed:g1'), '组 worktree 同样凭印记回收（tips 未落盘不影响）');
+  ok(!existsSync(a.allocations[0].worktree), '组 worktree 已删');
+});
+
+t('[R5-P1] finalize: feature branch 在其他 worktree 检出 → 拒（update-ref 不得绕过检出保护）', () => {
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }], [['g1']],
+    [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }]);
+  FR.initRun({ stateDir: env.stateDir, runId: 'rw', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rw', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  workGroup(env, a.allocations[0], 'a.ts', 'fix\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'rw', plan, waveIndex: 0 }).ok);
+  ok(FR.validateIntegration({ stateDir: env.stateDir, runId: 'rw', scManifest: scm, waveIndex: 0 }).ok);
+  // 主 checkout 切走（走 update-ref 路径），feat 检出在另一个 worktree（clean、基线 = 起点）
+  env.g('checkout', '-qb', 'elsewhere');
+  const otherWt = join(env.d, 'other-wt');
+  env.g('worktree', 'add', '-q', otherWt, 'feat');
+  let threw = false;
+  try { FR.finalizeRun({ stateDir: env.stateDir, runId: 'rw' }); }
+  catch (e) { threw = /worktree 检出.*拒绝前推|检出保护/.test(e.message); }
+  ok(threw, 'R5-P1 核心: feat 在他处检出时 update-ref 必拒');
+  eq(execFileSync('git', ['-C', otherWt, 'status', '--porcelain'], { encoding: 'utf8' }).trim(), '', '他处 worktree 基线不得被污染');
+  // 取消检出后 → CAS 前推成功
+  env.g('worktree', 'remove', '--force', otherWt);
+  const fin = FR.finalizeRun({ stateDir: env.stateDir, runId: 'rw' });
+  eq(env.g('rev-parse', 'refs/heads/feat'), fin.final_candidate);
 });
 
 t('[R4-P1] consensus 入口自算 changed-set: tracked-but-unchanged hub 在 runConsensusGate 就被拦', () => {
