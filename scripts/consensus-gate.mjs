@@ -107,18 +107,23 @@ export function runConsensusGate(verdicts, opts = {}) {
       if (!union.has(key)) {
         union.set(key, {
           canonical_key: key,
+          id: sha256(key).slice(0, 12), // v2: 稳定 canonical finding id，供 SC manifest 引用
           origins: [],
           primary_face: fd.primary_face,
           severity: fd.severity,
           anchor: fd.anchor,
+          anchor_paths: [], // v2: 各 origin 并集，随 artifact hash——下游换路径即断裂
           status: 'closed' // 走到这里必然全 closed（conjunct② 已断言）
         });
       }
-      union.get(key).origins.push({ reviewer: v.reviewer, finding_id: fd.id });
+      const c = union.get(key);
+      c.origins.push({ reviewer: v.reviewer, finding_id: fd.id });
+      for (const p of fd.anchor_paths ?? []) if (!c.anchor_paths.includes(p)) c.anchor_paths.push(p);
     }
   }
 
   const review_input_hash = verdicts[0].review_input_hash;
+  for (const c of union.values()) c.anchor_paths.sort(); // 确定性: 并集顺序不依赖 origin 到达序
   const canonical_findings = [...union.values()].sort((a, b) => a.canonical_key.localeCompare(b.canonical_key));
   const verdict_hashes = {};
   for (const v of verdicts) verdict_hashes[v.reviewer] = hashObject(v);

@@ -35,6 +35,9 @@ import { validateRender, fallbackRender, lintSentence } from '../scripts/inbox-d
 import { runDigest } from '../scripts/inbox-digest/runner.mjs';
 import { appendLedger } from '../scripts/evolution/ledger-append.mjs';
 import { clusterLedger, signConfirm } from '../scripts/evolution/cluster.mjs';
+import { checkScCoverage } from '../scripts/sc-coverage-gate.mjs';
+import { buildFixPlan, computeFixPlanHash } from '../scripts/fix-plan.mjs';
+import { normalizeRepoPath } from '../scripts/lib/common.mjs';
 import { recoverFromReceipt } from '../scripts/pr-watch/finalize.mjs';
 import { foldDispatchStates } from '../scripts/pr-watch/budget.mjs';
 import { secretLint } from '../scripts/evolution/secret-lint.mjs';
@@ -85,15 +88,27 @@ function mkBundle(baseSha, candidateSha, over = {}) {
     ui_registry_config_hash: 'c'.repeat(64), pr_context_digest: 'd'.repeat(64), ...over
   };
 }
+// v2: 每条 finding 需 anchor_paths（机器分组字段）。测试 finding 未显式给时，
+// 从 anchor 派生（去 :行号 后取路径部分；不像路径则回退占位），减少逐条改动。
+function withAnchorPaths(findings) {
+  return (findings ?? []).map((fd) => {
+    if (Array.isArray(fd.anchor_paths)) return fd;
+    const stripped = String(fd.anchor ?? '').replace(/:\d+(-\d+)?$/, '').trim();
+    const looksPath = stripped && !/\s/.test(stripped) && !stripped.startsWith('/') && !stripped.includes('..');
+    return { ...fd, anchor_paths: [looksPath ? stripped : 'src/_fixture.ts'] };
+  });
+}
 function mkVerdictFor(reviewer, bundleObj, over = {}) {
-  return {
-    schema_version: 'v1', reviewer, run_status: 'ok', round: 1,
+  const base = {
+    schema_version: 'v2', reviewer, run_status: 'ok', round: 1,
     base_sha: bundleObj.base_sha, candidate_sha: bundleObj.candidate_sha,
     review_input_hash: computeReviewInputHash(bundleObj),
     faces: reviewer === 'upstream-preview' ? THIRD_FACES : FULL_FACES,
     findings: [], gate_checks: reviewer === 'upstream-preview' ? THIRD_GATES : [],
     verdict: 'APPROVED', closed_finding_ids: [], ...over
   };
+  base.findings = withAnchorPaths(base.findings);
+  return base;
 }
 function consensusFor(bundleObj, overrides = [{}, {}, {}]) {
   const vs = [
@@ -2348,6 +2363,125 @@ t('[branch-cleanup] 引擎接线: 默认关闭零行为；开启后 merged 才�
   ok(!existsSync(join(stDir, stateFileName('o', 'mivo-canvas', 83))));
   const after83 = readFileSync(jf, 'utf8').split('\n').filter((l) => l.includes('#83'));
   ok(!after83.some((l) => l.includes('branch-cleanup')), 'closed 未合并绝不碰分支');
+});
+
+// ========== 17. 修复编排门禁 v2（并行/串行机器裁决） ==========
+console.log('\n[17] 修复编排 v2: anchor_paths 校验 / SC coverage / fix-plan 分组波次');
+
+t('[v2-anchor] normalizeRepoPath: 精确文件收，绝对/../反斜杠/尾斜杠/空/NUL 拒', () => {
+  ok(normalizeRepoPath('src/store/documentSlice.ts').ok);
+  ok(normalizeRepoPath('a').ok, '单段文件名合法');
+  for (const bad of ['/abs/x', './x', '../x', 'a/../b', 'a\\b', 'dir/', '', 'a/\0/b', 'a//b']) {
+    ok(!normalizeRepoPath(bad).ok, `必须拒: ${JSON.stringify(bad)}`);
+  }
+});
+
+t('[v2-anchor] verdict-validate: anchor_paths 缺失/含目录/绝对 → degraded', () => {
+  const bad1 = mkVerdictFor('claude-adversarial', bundle, { findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: [], evidence: 'e', status: 'closed' }], closed_finding_ids: ['F1'] });
+  ok(validateVerdict(bad1).some((e) => /anchor_paths/.test(e)), '空 anchor_paths 必 degraded');
+  const bad2 = mkVerdictFor('claude-adversarial', bundle, { findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: ['src/x/'], evidence: 'e', status: 'closed' }], closed_finding_ids: ['F1'] });
+  ok(validateVerdict(bad2).some((e) => /anchor_paths/.test(e)), '目录路径必 degraded');
+  const good = mkVerdictFor('claude-adversarial', bundle, { findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: ['src/x.ts'], evidence: 'e', status: 'closed' }], closed_finding_ids: ['F1'] });
+  eq(validateVerdict(good).length, 0, '精确路径应过');
+});
+
+// 造一个带 N 条 canonical finding 的真共识 artifact（各 finding 指定 anchor_paths）
+function artifactWithFindings(specs) {
+  // specs: [{fid_face, sev, paths}] —— 三席都 close 同一批以达共识。
+  // 每条 anchor + evidence 唯一（防 canonical dedup 合并），便于按 anchor 反查 canonical id。
+  const findings = specs.map((s, i) => ({ id: `f${i}`, primary_face: s.face ?? 'A', severity: s.sev, anchor: `${s.paths.join('|')}#${i}`, anchor_paths: s.paths, evidence: `ev-${i}-${s.paths.join(',')}`, status: 'closed' }));
+  const ids = findings.map((f) => f.id);
+  const art = consensusFor(bundle, [
+    { findings, closed_finding_ids: ids },
+    { findings, closed_finding_ids: ids },
+    { findings: [], closed_finding_ids: [] } // 第三席无独立 finding
+  ]).artifact;
+  ok(art.gate_result === 'pass', 'artifact 应达共识: ' + JSON.stringify(art.fail_reasons ?? []));
+  return art;
+}
+
+t('[v2-coverage] SC 必须覆盖每条 blocker/major finding，绑定 artifact hash，拒悬空/漏项', () => {
+  const art = artifactWithFindings([
+    { sev: 'blocker', paths: ['server/lib/assetStore.ts'] },
+    { sev: 'major', paths: ['src/store/documentSlice.ts'] },
+    { sev: 'suggestion', paths: ['docs/x.md'] }
+  ]);
+  const ids = art.canonical_findings.map((f) => f.id);
+  const blockerMajor = art.canonical_findings.filter((f) => f.severity !== 'suggestion').map((f) => f.id);
+  const mk = (scs) => ({ schema_version: 'v1', consensus_artifact_hash: art.consensus_artifact_hash, scs });
+  // 全覆盖 → ok
+  const full = mk(blockerMajor.map((fid, i) => ({ id: `SC-${i}`, kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: 'v' })));
+  eq(checkScCoverage({ manifest: full, artifact: art }).length, 0, '全覆盖应过');
+  // 漏一条 major → fail
+  const miss = mk([{ id: 'SC-0', kind: 'fix', finding_ids: [blockerMajor[0]], change: 'c', holds: 'h', verify: 'v' }]);
+  ok(checkScCoverage({ manifest: miss, artifact: art }).some((e) => /未被任何 SC 覆盖/.test(e)), '漏 major 必拒');
+  // 悬空引用 → fail
+  const dangling = mk([...full.scs, { id: 'SC-x', kind: 'fix', finding_ids: ['nonexistent'], change: 'c', holds: 'h', verify: 'v' }]);
+  ok(checkScCoverage({ manifest: dangling, artifact: art }).some((e) => /悬空/.test(e)), '悬空 finding_id 必拒');
+  // 换 artifact hash（假绑定）→ fail
+  const forged = mk(full.scs); forged.consensus_artifact_hash = 'f'.repeat(64);
+  ok(checkScCoverage({ manifest: forged, artifact: art }).some((e) => /未绑定|不符/.test(e)), 'SC 未绑定本次共识必拒');
+  // suggestion 不强制覆盖: 仅覆盖 blocker/major 仍过
+  eq(checkScCoverage({ manifest: full, artifact: art }).length, 0);
+});
+
+t('[v2-plan] fix-plan: 冲突域相交同组、独立域并行、verify 进末波、缺 anchor_paths degraded、hash 可重算', () => {
+  const art = artifactWithFindings([
+    { sev: 'blocker', paths: ['server/lib/assetStore.ts'] },       // f0 独立
+    { sev: 'major', paths: ['src/store/documentSlice.ts'] },        // f1 与 f2 撞
+    { sev: 'major', paths: ['src/store/documentSlice.ts', 'src/store/x.ts'] }, // f2
+    { sev: 'major', paths: ['src/lib/persistBoot.ts'] }             // f3 独立
+  ]);
+  const id = (i) => art.canonical_findings.find((f) => f.anchor.endsWith(`#${i}`)).id;
+  const manifest = {
+    schema_version: 'v1', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: [
+      { id: 'SC-0', kind: 'fix', finding_ids: [id(0)], change: 'c', holds: 'h', verify: 'v' },
+      { id: 'SC-1', kind: 'fix', finding_ids: [id(1)], change: 'c', holds: 'h', verify: 'v' },
+      { id: 'SC-2', kind: 'fix', finding_ids: [id(2)], change: 'c', holds: 'h', verify: 'v' }, // 与 SC-1 撞 documentSlice.ts
+      { id: 'SC-3', kind: 'fix', finding_ids: [id(3)], change: 'c', holds: 'h', verify: 'v' },
+      { id: 'SC-V', kind: 'verify', finding_ids: [id(1)], change: 'c', holds: 'h', verify: 'npm test', anchor: 't' }
+    ]
+  };
+  // SC-V 的 finding 是 f1（非测试路径）——verify SC 自身路径须像测试，这里 finding 路径不像 → 应 degraded
+  let r = buildFixPlan({ artifact: art, manifest });
+  ok(r.degraded && r.reasons.some((x) => /verify.*不像测试/.test(x)), 'verify SC 路径不像测试必 degraded');
+  // 改: verify SC 引用一个测试路径 finding
+  const artT = artifactWithFindings([
+    { sev: 'blocker', paths: ['server/lib/assetStore.ts'] },
+    { sev: 'major', paths: ['src/store/documentSlice.ts'] },
+    { sev: 'major', paths: ['src/store/documentSlice.ts', 'src/store/x.ts'] },
+    { sev: 'major', paths: ['src/lib/persistBoot.ts'] },
+    { sev: 'major', paths: ['e2e/flow.test.ts'] }  // 测试路径 finding
+  ]);
+  const idT = (i) => artT.canonical_findings.find((f) => f.anchor.endsWith(`#${i}`)).id;
+  const m2 = {
+    schema_version: 'v1', consensus_artifact_hash: artT.consensus_artifact_hash,
+    scs: [
+      { id: 'SC-0', kind: 'fix', finding_ids: [idT(0)], change: 'c', holds: 'h', verify: 'v' },
+      { id: 'SC-1', kind: 'fix', finding_ids: [idT(1)], change: 'c', holds: 'h', verify: 'v' },
+      { id: 'SC-2', kind: 'fix', finding_ids: [idT(2)], change: 'c', holds: 'h', verify: 'v' },
+      { id: 'SC-3', kind: 'fix', finding_ids: [idT(3)], change: 'c', holds: 'h', verify: 'v' },
+      { id: 'SC-V', kind: 'verify', finding_ids: [idT(4)], change: 'c', holds: 'h', verify: 'npm test' }
+    ]
+  };
+  r = buildFixPlan({ artifact: artT, manifest: m2 });
+  ok(!r.degraded, '合法 plan 不应 degraded: ' + JSON.stringify(r.reasons ?? []));
+  // SC-1 + SC-2 撞 documentSlice.ts → 同组；SC-0 / SC-3 各独立组 → 三组并行在 wave1
+  const fixWave = r.plan.waves[0];
+  eq(fixWave.length, 3, 'wave1 三组并行（SC-0 / {SC-1,SC-2} / SC-3）');
+  const merged = r.plan.groups.find((g) => g.sc_ids.length === 2);
+  eq(merged.sc_ids, ['SC-1', 'SC-2'], '撞同文件的两 SC 必同组串行');
+  // verify 进最后一波
+  eq(r.plan.waves.length, 2, 'verify 单独末波');
+  eq(r.plan.waves[1].length, 1);
+  // hash 可重算（纯函数）
+  eq(computeFixPlanHash(r.plan), r.plan.fix_plan_hash, 'fix_plan_hash 必须重算等价');
+  // 缺 anchor_paths → degraded
+  const artBad = JSON.parse(JSON.stringify(artT));
+  artBad.canonical_findings[0].anchor_paths = [];
+  const rb = buildFixPlan({ artifact: artBad, manifest: m2 });
+  ok(rb.degraded, '缺 anchor_paths 必 degraded 不产 plan');
 });
 
 // ========== 汇总 + SKIPPED ==========

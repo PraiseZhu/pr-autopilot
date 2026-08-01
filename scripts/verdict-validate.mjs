@@ -6,7 +6,7 @@
 //   - 任何 face.result=fail → verdict 必须 REQUIRES_CHANGES（不许 fail+APPROVED）
 //   - 存在 primary_face=taxonomy_gap 的 finding → run_status 必须 degraded（⑪ 停轮）
 //   - bundle.touches_ui=true 时对抗席 B 面禁 n_a（⑫ 脚本判定为唯一源）
-import { parseArgs, readJson, fail, isMain} from './lib/common.mjs';
+import { parseArgs, readJson, fail, isMain, normalizeRepoPath } from './lib/common.mjs';
 
 const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
 const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];
@@ -29,7 +29,7 @@ export function validateVerdict(v, opts = {}) {
 
   need(v && typeof v === 'object', 'verdict 不是对象');
   if (errs.length) return errs;
-  need(v.schema_version === 'v1', `schema_version 必须为 v1，得到 ${v.schema_version}`);
+  need(v.schema_version === 'v2', `schema_version 必须为 v2，得到 ${v.schema_version}`);
   need(REVIEWERS.includes(v.reviewer), `reviewer 非法: ${v.reviewer}`);
   need(['ok', 'degraded'].includes(v.run_status), `run_status 非法: ${v.run_status}`);
   need(Number.isInteger(v.round) && v.round >= 1, `round 非法: ${v.round}`);
@@ -89,6 +89,15 @@ export function validateVerdict(v, opts = {}) {
     if (fd.primary_face === 'taxonomy_gap') hasTaxonomyGap = true;
     need(SEVERITIES.includes(fd.severity), `finding ${fd.id} severity 非法`);
     need(typeof fd.anchor === 'string' && fd.anchor.length > 0, `finding ${fd.id} 缺 anchor`);
+    // v2: anchor_paths 机器字段——分组唯一输入源，逐条 POSIX 精确文件校验（污染面从严）
+    if (!Array.isArray(fd.anchor_paths) || fd.anchor_paths.length === 0) {
+      need(false, `finding ${fd.id} 缺 anchor_paths（v2 机器字段必填，分组据此，degraded）`);
+    } else {
+      for (const p of fd.anchor_paths) {
+        const r = normalizeRepoPath(p);
+        need(r.ok, `finding ${fd.id} anchor_paths「${p}」非法: ${r.reason ?? ''}`);
+      }
+    }
     need(typeof fd.evidence === 'string' && fd.evidence.length > 0, `finding ${fd.id} 缺 evidence`);
     need(['open', 'closed'].includes(fd.status), `finding ${fd.id} status 非法`);
   }
