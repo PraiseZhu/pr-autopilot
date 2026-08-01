@@ -22,6 +22,9 @@ import { readJson, parseArgs, fail, hashObject, nowIso, isMain, canonicalJson } 
 import { recomputeArtifactHash } from './consensus-gate.mjs';
 import { computeReviewInputHash } from './review-input-hash.mjs';
 import { validateRemoteBranch } from './lib/git-checks.mjs';
+import { checkScCoverage } from './sc-coverage-gate.mjs';
+import { buildFixPlan } from './fix-plan.mjs';
+import { checkDispatch } from './fix-dispatch-gate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PURPOSES = ['feature', 'evolution', 'fast'];
@@ -54,6 +57,15 @@ export function validateManifest(manifest) {
     if (!manifest.consensus_artifact_hash) errs.push(`purpose=${manifest.purpose} 必须携带 consensus_artifact_hash（F4）`);
     if (!manifest.sc_hash || !Array.isArray(manifest.sc_list) || manifest.sc_list.length === 0) {
       errs.push(`purpose=${manifest.purpose} 必须携带 sc_hash + 非空 sc_list`);
+    }
+    // v2 编排链（审 R1-P1-3 时序修正）: 修复编排产物必须与**源共识**（修复前那份）绑定，
+    // 而 manifest.consensus_artifact_hash 指向 delta 复核后的**终版共识**——两份不同，必须分开带。
+    // fix_orchestration 缺失 = 未走编排链（单 SC 或 fast 场景由下方条件豁免）。
+    if (manifest.fix_orchestration) {
+      const fo = manifest.fix_orchestration;
+      for (const k of ['source_artifact_hash', 'sc_manifest_hash', 'fix_plan_hash', 'dispatch_record_hash']) {
+        if (!fo[k]) errs.push(`fix_orchestration 缺 ${k}`);
+      }
     }
   }
   if (manifest.purpose === 'evolution') {
@@ -141,7 +153,7 @@ export function verifyFastAttestation(manifest, key, nowMs = Date.now()) {
   return null;
 }
 
-export function checkPushGuard({ repoDir, manifest, artifact, bundle, constitution, nowMs = Date.now(), fastKey = process.env.PR_AUTOPILOT_FAST_KEY }) {
+export function checkPushGuard({ repoDir, manifest, artifact, bundle, constitution, sourceArtifact = null, scManifest = null, fixPlan = null, dispatchRecord = null, nowMs = Date.now(), fastKey = process.env.PR_AUTOPILOT_FAST_KEY }) {
   const errors = [];
 
   const schemaErrs = validateManifest(manifest);
@@ -191,6 +203,48 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
     }
     if (manifest.sc_hash && manifest.sc_list && hashObject(manifest.sc_list) !== manifest.sc_hash) {
       errors.push('SC 清单 hash 与 sc_hash 不一致');
+    }
+    // ---- v2 修复编排链核验（审 R1-P1-3: 重算等价，非自报字符串比对） ----
+    // 需要在场: sourceArtifact（修复前源共识）+ scManifest + fixPlan + dispatchRecord。
+    // 缺任一 → 该项无法核验 → fail-closed（有 fix_orchestration 声明就必须能验）。
+    if (manifest.fix_orchestration && !errors.length) {
+      const fo = manifest.fix_orchestration;
+      const missing = [];
+      if (!sourceArtifact) missing.push('source consensus artifact');
+      if (!scManifest) missing.push('sc manifest');
+      if (!fixPlan) missing.push('fix plan');
+      if (!dispatchRecord) missing.push('dispatch record');
+      if (missing.length) {
+        errors.push(`fix_orchestration 在场但缺件无法核验: ${missing.join(' / ')}（fail-closed）`);
+      } else {
+        // ① 源 artifact 自洽 + 与声明一致
+        const srcReal = recomputeArtifactHash(sourceArtifact);
+        if (srcReal !== sourceArtifact.consensus_artifact_hash) errors.push('源 consensus artifact hash 与内容重算不符');
+        if (fo.source_artifact_hash !== srcReal) errors.push('fix_orchestration.source_artifact_hash ≠ 源 artifact 重算值');
+        // 源 artifact 必须是同一次评审（同 review_input_hash 谱系）且 candidate 是修复前的
+        if (sourceArtifact.review_input_hash && artifact.review_input_hash &&
+            sourceArtifact.base_sha !== artifact.base_sha) {
+          errors.push('源 artifact 与终版 artifact 的 base_sha 不同（跨评审拼接）');
+        }
+        // ② SC 覆盖门（绑源 artifact）——修 R1 既有洞: SC 必须真绑回 finding 且全覆盖
+        const covErrs = checkScCoverage({ manifest: scManifest, artifact: sourceArtifact });
+        for (const e of covErrs) errors.push(`SC 覆盖门: ${e}`);
+        if (hashObject(scManifest) !== fo.sc_manifest_hash) errors.push('fix_orchestration.sc_manifest_hash ≠ sc manifest 重算值');
+        // ③ fix plan 重算等价（纯函数——lead 改分组即 hash 对不上）
+        const rebuilt = buildFixPlan({ artifact: sourceArtifact, manifest: scManifest, capacity: fixPlan.capacity ?? 8 });
+        if (rebuilt.degraded) {
+          errors.push(`fix plan 从源 artifact 重算为 degraded（不该产出可派工 plan）: ${rebuilt.reasons[0]}`);
+        } else {
+          if (rebuilt.plan.fix_plan_hash !== fixPlan.fix_plan_hash) {
+            errors.push('fix plan 与源 artifact+SC 重算结果不一致（分组被 lead 改动，fail-closed）');
+          }
+          if (fo.fix_plan_hash !== rebuilt.plan.fix_plan_hash) errors.push('fix_orchestration.fix_plan_hash ≠ 重算 plan hash');
+        }
+        // ④ 派发门（T1）: 计划要求的并行组必须都有独立 worker 派发记录
+        const dErrs = checkDispatch({ plan: fixPlan, record: dispatchRecord });
+        for (const e of dErrs) errors.push(`派发门: ${e}`);
+        if (hashObject(dispatchRecord) !== fo.dispatch_record_hash) errors.push('fix_orchestration.dispatch_record_hash ≠ dispatch record 重算值');
+      }
     }
   } else if (manifest.purpose === 'fast') {
     // F4-R: base 由守卫自算 merge-base，manifest 无权自报
@@ -313,13 +367,18 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
 if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
   if (!args.manifest || !args['repo-dir']) {
-    fail('用法: push-guard.mjs --repo-dir <dir> --manifest <m.json> [--artifact <a.json>] [--bundle <b.json>] [--execute]（宪法路径表固定随仓，不接受 override——审④-F3）');
+    fail('用法: push-guard.mjs --repo-dir <dir> --manifest <m.json> [--artifact <a.json>] [--bundle <b.json>]\n      [--source-artifact <src.json> --sc-manifest <sc.json> --fix-plan <plan.json> --dispatch-record <rec.json>]\n      [--execute]\n（编排四件套在 manifest.fix_orchestration 在场时必填；宪法路径表固定随仓，不接受 override——审④-F3）');
   }
   const res = checkPushGuard({
     repoDir: args['repo-dir'],
     manifest: readJson(args.manifest),
     artifact: args.artifact ? readJson(args.artifact) : null,
     bundle: args.bundle ? readJson(args.bundle) : null,
+    // v2 编排链四件套（缺件时 checkPushGuard 对声明了 fix_orchestration 的 manifest fail-closed）
+    sourceArtifact: args['source-artifact'] ? readJson(args['source-artifact']) : null,
+    scManifest: args['sc-manifest'] ? readJson(args['sc-manifest']) : null,
+    fixPlan: args['fix-plan'] ? readJson(args['fix-plan']) : null,
+    dispatchRecord: args['dispatch-record'] ? readJson(args['dispatch-record']) : null,
     constitution: readJson(join(HERE, 'evolution/constitution-paths.json')) // 固定路径，CLI 无 override（审④-F3）
   });
   if (!res.ok) {

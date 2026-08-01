@@ -66,28 +66,57 @@ node scripts/consensus-gate.mjs v1.json v2.json v3.json --out consensus.json
 ```
 四 conjunct 缺一不可（同 input hash / union 每条被 origin close / 三 verdict APPROVED / 全部 gate_checks∈{pass,n_a}）。任何席 degraded 或 schema 不合 → fail-closed。
 
-## Phase 2b — SC 提炼（共识后，自动衔接）
+## Phase 2b — SC 提炼 + 覆盖门（共识后，自动衔接）
 
 **owner 定案：共识 → 修复不需要 owner 授权。**
-lead 对共识确认的**每个修改项**提炼一条可验证 SC（改什么 / 什么该成立 / 怎么验证），连同 finding 清单 + bundle 打成修复 manifest，绑定 `consensus_artifact_hash + SC 清单 hash`。
-SC 例句库见 `skills/submit-pr/references/sc-examples.md`（E3 自进化的迭代对象）。
+lead 对共识确认的每条 finding 提炼可验证 SC，产出 **SC manifest**（`schemas/sc-manifest.schema.json`）：
+每条 SC 带 `id / kind(fix|verify|global) / finding_ids[] / change / holds / verify`，manifest 头部绑
+**源共识** `consensus_artifact_hash`。SC 例句库见 `references/sc-examples.md`。
 
-## Phase 2c — 修复 + delta 复核
+**覆盖门（脚本判，修补了「SC 可漏项/掺假」的旧洞）**：
+```
+node scripts/sc-coverage-gate.mjs --manifest sc-manifest.json --artifact consensus.json
+```
+每条 blocker/major canonical finding 必须被 ≥1 条 SC 覆盖；悬空 finding_id、漏项、
+假绑定（manifest 的 artifact hash ≠ 实际重算值）全部 fail-closed。**lead 不得口头声称已覆盖。**
 
-**修复编排由 lead 判断串并行（owner 2026-08-01 拍板：并行 worker 数量不设上限）**：
+## Phase 2c — 修复编排（脚本裁决并行/串行）+ delta 复核
 
-1. lead 把 SC 清单按**改动文件域**分组：两组触碰的文件互不相交 → 可并行；有依赖关系
-   （B 组要在 A 组产物上改）或撞同一文件 → 并入同组串行。禁止两个 worker 碰同一文件。
-2. 每组派一个 **glm-5.2** worker（点名 max，模型不支持该档时取其可用上限并留痕），
-   一次 create_workers 并行开出；派发包写明：本组 SC 子集 + **允许触碰的文件域清单**
-   （越域即失败）+ goal `--until-sc` 修到每条 SC 有 PASS 证据。
-3. 并行 worker **只改文件不 commit**（防并发 git 操作互踩）；全量验证不用每个 worker
-   各跑一遍——各 worker 只跑自己文件域的定向验证，**全量 tsc/lint/test 由 lead 在全部
-   worker 交卷后统一收口跑一次**，过了再按逻辑分组 commit → 新 candidate SHA。
-4. 只有一组或 SC 强耦合时退化为单 worker 串行——判断权在 lead，但「10 条 SC 一个
-   worker 串行吃完」这种默认必须先给出不可并行的理由。
+**分组不由 lead 判断——由脚本从 finding 的 `anchor_paths` 机器派生**（owner 2026-08-01：
+该并行必须并行、拉满 8 个也行；该串行必须串行）：
 
-新 commit 新 SHA 后 → **三审 delta 复核**：
+```
+node scripts/fix-plan.mjs --artifact consensus.json --manifest sc-manifest.json --out fix-plan.json
+```
+- 文件域相交的 SC → **强制同组**（组内串行，单 worker 承担）；互不相交 → **强制拆开并行**
+- `kind=verify` 的 SC 自动进**最后一波**（base = 前波集成 tip，故能看见前波产物）
+- 缺 `anchor_paths` → plan degraded，**不产出可派工计划**；恢复唯一路径 = 原 origin 席补发
+  verdict 重跑 validator→consensus→coverage→plan。**lead 不得代填 anchor_paths、不得拆组也不得合组。**
+
+**逐波执行**（wave1 base = candidate；wave k+1 base = wave k 集成 tip）：
+```
+# ① 本波分配隔离 worktree（每组一个，构造上排除并发写）
+node scripts/fix-orchestrate.mjs allocate --repo-dir . --plan fix-plan.json \
+  --run-id <run> --wave <k> --wave-base <sha> --worktree-root ../.fix-wt --out alloc.json
+# ② 按 alloc.json 一次 create_workers 并行开出（组数即 worker 数，拉满 capacity）
+#    每个派发包: 本组 SC 子集 + 自己的 worktree 路径 + goal --until-sc 修到每条 SC 有 PASS 证据
+#    worker 在自己 worktree 内 commit（隔离，不互踩）；只跑本组定向验证
+# ③ 收全部 tip 后集成: merge 前比实改文件集，有交集 → fail-closed 弃组重排串行
+node scripts/fix-orchestrate.mjs integrate --repo-dir . --plan fix-plan.json \
+  --wave-base <sha> --tips tips.json --out integ.json
+```
+- **组数门**（lead 派少了直接拦）：
+  ```
+  node scripts/fix-dispatch-gate.mjs --plan fix-plan.json --record dispatch-record.json
+  ```
+  每组恰好一条派发记录、worker 标识互异（同会话不得兼两组冒充并行）、每组必须有
+  tip SHA + 交卷摘要（空壳记录不算派发）、组数 > capacity 必须分批且每批 ≤ capacity。
+  保证等级 **T1（防疏忽/漂移）**——如实声明：dispatch record 由 lead 提交，恶意伪造需宿主级
+  签名回执，本仓做不到；实测失败模式（lead 老实但按惯性只派一个）本门 100% 拦下。
+- 全波集成完 → **lead 中央跑一次**全量 tsc/lint/test + 各 SC 的 verify 命令 → 新 candidate SHA
+- 收尾 `fix-orchestrate.mjs cleanup` 回收本 run 全部 worktree/分支
+
+新 candidate SHA 后 → **三审 delta 复核**：
 - 两对抗席只对账 findings 修没修 + delta 有无新问题，禁重审未改代码；
 - 第三席对每个新 candidate 做只读 gate replay 出新 verdict（**不计对抗轮次**）；
 - 重跑 consensus-gate 绑定三份新 verdict。
@@ -97,8 +126,17 @@ SC 例句库见 `skills/submit-pr/references/sc-examples.md`（E3 自进化的�
 worker 收**自包含 push manifest**（repo/remote/branch/**expected_sha**/`purpose=feature`/标题正文/已有 PR 号/注册 key/consensus_artifact_hash/sc_hash+sc_list）。base 不在 manifest 里——由共识 artifact 派生，manifest 无权自定（审②-F4）：
 
 ```
-node scripts/push-guard.mjs --repo-dir . --manifest push-manifest.json --artifact consensus.json --bundle review-bundle.json --execute
+node scripts/push-guard.mjs --repo-dir . --manifest push-manifest.json \
+  --artifact consensus-final.json --bundle review-bundle.json \
+  --source-artifact consensus.json --sc-manifest sc-manifest.json \
+  --fix-plan fix-plan.json --dispatch-record dispatch-record.json --execute
 ```
+**编排链绑定**（走了 Phase 2c 编排就必须带全四件套）：push manifest 增 `fix_orchestration
+{source_artifact_hash, sc_manifest_hash, fix_plan_hash, dispatch_record_hash}`。守卫**自己重跑**
+coverage gate + fix-plan（纯函数重算等价）+ 组数门——lead 手改分组/漏 SC/派发不足，
+hash 对不上或门不过 → **push 被拒**。注意两份 artifact 不同：`--artifact` 是 delta 复核后的
+终版（candidate == expected_sha），`--source-artifact` 是修复**前**的源共识（编排就是从它算的），
+两者 base_sha 必须一致（防跨评审拼接）。
 （审③-F4-R：bundle 必到场——守卫重算 review_input_hash 并绑定 bundle↔artifact↔manifest 三方 SHA。）
 守卫过 → **守卫自己以固定 argv 执行普通 refspec push**（漂移即停，绝不产出待 shell 解释的命令串）→ `gh pr create/edit` → ssh mini：
 ```
