@@ -166,9 +166,11 @@ function squashCommit({ repoDir, treeOf, parent, message }) {
 // 创建即写 owner 印记（run_id + nonce）并**立刻落盘** manifest（crash 窗口内 cleanup 也能凭
 // 印记回收）；路径已被占用但无本 run 记录/印记不符 → fail-closed，绝不 checkout 进他人 worktree。
 function ensureIntegrationWorktree({ manifestPath, m, ws, runId, checkoutRef }) {
-  const wt = integrationWorktree(ws.worktree_root, runId);
-  const g = (...a) => git(m.repo_dir, ...a);
   const rec = m.integration_worktree ?? null; // run 级记录: integration worktree 跨波共享
+  // R6-P2: 记录一旦存在，其路径就是唯一权威——后续波换 worktree_root 不得在新路径
+  // 分叉出第二个同 nonce worktree（会产生 manifest 记不到、cleanup 收不走的泄漏）
+  const wt = rec?.path ?? integrationWorktree(ws.worktree_root, runId);
+  const g = (...a) => git(m.repo_dir, ...a);
   if (existsSync(wt)) {
     const o = readOwner({ worktreeDir: wt });
     if (!rec || !o || o.run_id !== runId || o.nonce !== rec.nonce) {

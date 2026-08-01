@@ -145,6 +145,13 @@ export function integrateWave({ repoDir, waveBase, groupTips, exec = null }) {
   return report;
 }
 
+// R6-P1: 分支是否正被任一 worktree 检出——update-ref 系操作会绕过 git 的检出保护，
+// 删除/移动前必须显式查（branch -D 会拒，update-ref 不会）
+export function branchCheckedOut({ repoDir, branch, exec = null }) {
+  const out = exec ? exec(['git', '-C', repoDir, 'worktree', 'list', '--porcelain']) : git(repoDir, 'worktree', 'list', '--porcelain');
+  return String(out).split('\n').includes(`branch refs/heads/${branch}`);
+}
+
 // git 已登记的 worktree 路径集合（SC-1 归属校验的唯一可信来源）
 export function registeredWorktrees({ repoDir, exec = null }) {
   const out = exec ? exec(['git', '-C', repoDir, 'worktree', 'list', '--porcelain']) : git(repoDir, 'worktree', 'list', '--porcelain');
@@ -269,6 +276,11 @@ export function cleanupRun({ manifest, exec = null }) {
         } else if (brTip !== t.expectedTip) {
           errors.push(`拒绝删除分支 ${t.branch}: tip ${brTip.slice(0, 12)} ≠ 记录 ${t.expectedTip.slice(0, 12)}（同名他人分支/被移动，fail-closed）`);
           steps.push(`br-refused:${t.label}`);
+        } else if (branchCheckedOut({ repoDir, branch: t.branch, exec })) {
+          // R6-P1: update-ref -d 会绕过 checked-out 保护，把检出该分支的 worktree 打成
+          // 「No commits yet」——先查后动
+          errors.push(`拒绝删除分支 ${t.branch}: 正被某个 worktree 检出（update-ref 会绕过 git 检出保护破坏其基线，fail-closed——R6-P1）`);
+          steps.push(`br-refused:${t.label}`);
         } else {
           // CAS 删除: old 值不匹配时 git 自己拒绝（TOCTOU 也兜住）
           try { g('update-ref', '-d', `refs/heads/${t.branch}`, t.expectedTip); steps.push(`br-deleted:${t.label}`); }
@@ -286,6 +298,9 @@ export function cleanupRun({ manifest, exec = null }) {
     if (ibTip !== null) {
       if (!lastIntegrationTip || ibTip !== lastIntegrationTip) {
         errors.push(`拒绝删除分支 ${manifest.integration_branch}: tip ${ibTip.slice(0, 12)} ≠ 记录的 integrated_tip ${lastIntegrationTip ? lastIntegrationTip.slice(0, 12) : '(无)'}（同名他人分支/无记录，fail-closed）`);
+        steps.push('br-refused:integration');
+      } else if (branchCheckedOut({ repoDir, branch: manifest.integration_branch, exec })) {
+        errors.push(`拒绝删除分支 ${manifest.integration_branch}: 正被某个 worktree 检出（R6-P1 fail-closed）`);
         steps.push('br-refused:integration');
       } else {
         try { g('update-ref', '-d', `refs/heads/${manifest.integration_branch}`, lastIntegrationTip); steps.push('br-deleted:integration'); }

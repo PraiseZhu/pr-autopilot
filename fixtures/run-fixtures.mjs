@@ -3556,6 +3556,64 @@ t('[R4-P1] finalize 未检出路径 CAS: feature branch 被并发推进 → 拒�
   eq(env.g('rev-parse', 'refs/heads/feat'), fin.final_candidate, '起点未动时 CAS 前推成功');
 });
 
+t('[R6-P1] CAS 删除不得绕过检出保护: 记录 tip 一致但分支正被 worktree 检出 → 拒', () => {
+  const d = mkdtempSync(join(tmpdir(), 'r6p1-'));
+  const r = join(d, 'repo');
+  execFileSync('git', ['init', '-q', r]);
+  const g = (...a) => execFileSync('git', ['-C', r, ...a], { encoding: 'utf8' }).trim();
+  g('config', 'user.email', 'o@t'); g('config', 'user.name', 'o');
+  writeFileSync(join(r, 'f.ts'), 'x\n'); g('add', '.'); g('commit', '-qm', 'base');
+  const cand = g('rev-parse', 'HEAD');
+  writeFileSync(join(r, 'f.ts'), 'w\n'); g('add', '.'); g('commit', '-qm', 'w');
+  const T = g('rev-parse', 'HEAD');
+  g('checkout', '-q', cand);
+  // 分支在另一 worktree 检出（clean），allocation worktree 缺席，记录 tip == 实际 tip
+  g('branch', 'fix/rq/g1', T);
+  const otherWt = join(d, 'other');
+  g('worktree', 'add', '-q', otherWt, 'fix/rq/g1');
+  const wtRoot = join(d, 'wt'); mkdirSync(wtRoot);
+  const manifest = { repo_dir: r, run_id: 'rq', source_candidate: cand, integration_branch: null,
+    waves: [{ worktree_root: wtRoot, base: cand, tips: [{ group_id: 'g1', tip: T }],
+      allocations: [{ group_id: 'g1', worktree: join(wtRoot, 'rq-g1'), branch: 'fix/rq/g1', base: cand, owner_nonce: 'x'.repeat(32) }] }] };
+  const res = ORC.cleanupRun({ manifest });
+  ok(res.errors.some((e) => /正被某个 worktree 检出/.test(e)), 'R6-P1 核心: CAS 删除前必须查检出: ' + JSON.stringify(res.errors));
+  ok(res.steps.includes('br-refused:g1'));
+  eq(g('rev-parse', 'refs/heads/fix/rq/g1'), T, '分支必须原封不动');
+  eq(execFileSync('git', ['-C', otherWt, 'status', '--porcelain'], { encoding: 'utf8' }).trim(), '', '检出该分支的 worktree 基线不得被破坏');
+  // 取消检出后 → CAS 删除放行
+  g('worktree', 'remove', '--force', otherWt);
+  const res2 = ORC.cleanupRun({ manifest });
+  ok(res2.steps.includes('br-deleted:g1'), '无人检出时 CAS 删除成功: ' + JSON.stringify(res2));
+});
+
+t('[R6-P2] integration 记录路径为唯一权威: 后续波换 worktree_root 不分叉第二个 worktree', () => {
+  const env = mkRunEnv({ files: ['a.ts', 'e2e/x.test.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }, { id: 'v1', sc_ids: ['SC-V'], paths: ['e2e/x.test.ts'], verify: true }],
+    [['g1'], ['v1']],
+    [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) },
+     { id: 'SC-V', kind: 'verify', finding_ids: ['f1'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'e2e/x.test.ts']) }]);
+  FR.initRun({ stateDir: env.stateDir, runId: 'rf', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'rf', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fix\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'rf', plan, waveIndex: 0 }).ok);
+  ok(FR.validateIntegration({ stateDir: env.stateDir, runId: 'rf', scManifest: scm, waveIndex: 0 }).ok);
+  // wave2 换一个 worktree_root（R6 反例: v1 实现会在 root2 分叉出第二个 integration worktree）
+  const root2 = join(env.d, 'wt2'); mkdirSync(root2);
+  const a2 = FR.allocate({ stateDir: env.stateDir, runId: 'rf', plan, waveIndex: 1, worktreeRoot: root2 });
+  workGroup(env, a2.allocations[0], 'e2e/x.test.ts', 'test\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'rf', plan, waveIndex: 1 }).ok);
+  const m = readJson(FR.runManifestPath(env.stateDir, 'rf'));
+  ok(!existsSync(join(root2, 'rf-integration')), 'R6-P2 核心: 不得在新 root 分叉第二个 integration worktree');
+  eq(m.integration_worktree.path, join(env.wtRoot, 'rf-integration'), '记录路径保持唯一权威');
+  ok(FR.validateIntegration({ stateDir: env.stateDir, runId: 'rf', scManifest: scm, waveIndex: 1 }).ok);
+  // cleanup 后无泄漏: 本 run 的 worktree 全部回收
+  const res = ORC.cleanupRun({ manifest: readJson(FR.runManifestPath(env.stateDir, 'rf')) });
+  eq((res.errors ?? []).length, 0, JSON.stringify(res.errors));
+  ok(!existsSync(join(env.wtRoot, 'rf-integration')) && !existsSync(a1.allocations[0].worktree) && !existsSync(a2.allocations[0].worktree), '全部回收，无泄漏');
+});
+
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
 console.log(`\n========== fixtures: ${pass} passed, ${failCount} failed ==========`);
