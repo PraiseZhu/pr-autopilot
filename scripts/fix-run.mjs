@@ -100,7 +100,11 @@ export function nextWaveBase(manifest, waveIndex) {
   return prev.integrated_tip;
 }
 
-export function allocate({ stateDir, runId, plan, waveIndex, worktreeRoot }) {
+// SC-B1: artifact/scManifest 是**可选**的派工上下文输入（供 family_context 派生，见
+// fix-orchestrate.mjs 的 familyContext）——不传即为 v1 行为，完全向后兼容。传了就必须与本
+// run init 时绑定的 hash 一致（fail-closed，防有人拿不相干的 artifact/manifest 冒充上下文），
+// 不一致直接抛错，不静默降级为「没有 family_context」（那会把「输入错」伪装成「无 family」）。
+export function allocate({ stateDir, runId, plan, waveIndex, worktreeRoot, artifact = null, scManifest = null }) {
   const { path, m } = loadRun(stateDir, runId, plan);
   if (m.waves[waveIndex]?.integrated_tip) throw new Error(`wave${waveIndex + 1} 已集成，不可重复 allocate`);
   // R4-P1: replan 状态不可被 allocate 重放清除——否则串行重派可被绕回并行集成（fail-open）。
@@ -108,8 +112,14 @@ export function allocate({ stateDir, runId, plan, waveIndex, worktreeRoot }) {
   if (m.waves[waveIndex]?.replan) {
     throw new Error(`wave${waveIndex + 1} 已进入 overlap 串行重派状态，禁止重新 allocate（只能 serial-allocate 消费，R4-P1）`);
   }
+  if (artifact && recomputeArtifactHash(artifact) !== m.source_artifact_hash) {
+    throw new Error('allocate 传入的 artifact 与本 run 绑定的 source_artifact_hash 不符（family_context 输入必须是同一份源共识，fail-closed）');
+  }
+  if (scManifest && hashObject(scManifest) !== m.sc_manifest_hash) {
+    throw new Error('allocate 传入的 scManifest 与本 run 绑定的 sc_manifest_hash 不符（family_context 输入必须是同一份 sc manifest，fail-closed）');
+  }
   const waveBase = nextWaveBase(m, waveIndex); // ← 权威来源
-  const alloc = allocateWave({ repoDir: m.repo_dir, worktreeRoot, runId, plan, waveIndex, waveBase });
+  const alloc = allocateWave({ repoDir: m.repo_dir, worktreeRoot, runId, plan, waveIndex, waveBase, artifact, scManifest });
   m.waves[waveIndex] = { wave_index: waveIndex, base: waveBase, worktree_root: worktreeRoot, allocations: alloc.allocations, tips: null, integrated_tip: null, replan: null, validation: null };
   appendEvent(m, { kind: 'wave-allocate', wave: waveIndex, base: waveBase, groups: alloc.allocations.map((a) => a.group_id) });
   saveManifest(path, m);
@@ -473,7 +483,14 @@ if (isMain(import.meta.url)) {
       process.stdout.write(JSON.stringify({ ok: true, run_id: m.run_id, source_candidate: m.source_candidate }) + '\n');
     } else if (mode === 'allocate') {
       need(['state-dir', 'run-id', 'plan', 'wave', 'worktree-root']);
-      const r = allocate({ stateDir: args['state-dir'], runId: args['run-id'], plan: readJson(args.plan), waveIndex: Number(args.wave), worktreeRoot: args['worktree-root'] });
+      // SC-B1: --artifact/--sc-manifest 可选——传了才产出 family_context（须与 init 绑定的
+      // hash 一致，见 allocate() 的 fail-closed 校验），不传即 v1 行为。
+      const r = allocate({
+        stateDir: args['state-dir'], runId: args['run-id'], plan: readJson(args.plan),
+        waveIndex: Number(args.wave), worktreeRoot: args['worktree-root'],
+        artifact: args.artifact ? readJson(args.artifact) : null,
+        scManifest: args['sc-manifest'] ? readJson(args['sc-manifest']) : null
+      });
       process.stdout.write(JSON.stringify({ ok: true, wave_base: r.wave_base, allocations: r.allocations }, null, 2) + '\n');
     } else if (mode === 'integrate') {
       need(['state-dir', 'run-id', 'plan', 'wave']);

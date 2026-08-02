@@ -37,6 +37,7 @@ import { appendLedger } from '../scripts/evolution/ledger-append.mjs';
 import { clusterLedger, signConfirm } from '../scripts/evolution/cluster.mjs';
 import { checkScCoverage } from '../scripts/sc-coverage-gate.mjs';
 import { buildFixPlan, computeFixPlanHash, hubViolations } from '../scripts/fix-plan.mjs';
+import { buildInvariantsSection, upsertInvariantsSection, SECTION_START, SECTION_END } from '../scripts/pr-body.mjs';
 import { normalizeRepoPath } from '../scripts/lib/common.mjs';
 import { recoverFromReceipt } from '../scripts/pr-watch/finalize.mjs';
 import { foldDispatchStates } from '../scripts/pr-watch/budget.mjs';
@@ -44,6 +45,7 @@ import { secretLint } from '../scripts/evolution/secret-lint.mjs';
 import { classifyEscapes } from '../scripts/evolution/escape-classify.mjs';
 import { checkLeases, alertWithFallback } from '../scripts/health/lease-check.mjs';
 import { readJson, hashObject, canonicalJson } from '../scripts/lib/common.mjs';
+import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from '../scripts/lib/hardening-registry.mjs';
 
 let pass = 0, failCount = 0;
 const failures = [];
@@ -82,8 +84,10 @@ console.log('\n[1] ⑨⑩ + 审②F1/F2 + 审③F4-R: hash·verdict·共识门')
 const FULL_FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'].map((f) => ({ face: f, result: f === 'B' ? 'n_a' : 'pass', evidence: `${f} 面走查完成` }));
 const THIRD_FACES = ['D', 'E', 'F', 'G'].map((f) => ({ face: f, result: 'pass', evidence: `${f} 面走查完成` }));
 const THIRD_GATES = ['format-gate', 'rule-compliance', 'security-privacy-gate', 'product-arch-gate'].map((g) => ({ gate_id: g, result: 'pass', evidence: `${g} 走查完成` }));
-// R10-A3: 加固清单九类默认全 covered——两对抗席 R1 verdict 的默认 hardening_coverage
-const FULL_HARDENING = Array.from({ length: 9 }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `第${i + 1}类走查完成` }));
+// R10-A3/SC-B4: 加固清单十类默认全 covered——两对抗席 R1 verdict 的默认 hardening_coverage
+// （长度从 HARDENING_CLASS_COUNT 派生，不手抄数字——第 7 类「文档/校验/schema/fixture 不得
+// 四处手抄数字」的要求延伸到 fixture 自身）。
+const FULL_HARDENING = Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `第${i + 1}类走查完成` }));
 
 function mkBundle(baseSha, candidateSha, over = {}) {
   return {
@@ -94,12 +98,22 @@ function mkBundle(baseSha, candidateSha, over = {}) {
 }
 // v2: 每条 finding 需 anchor_paths（机器分组字段）。测试 finding 未显式给时，
 // 从 anchor 派生（去 :行号 后取路径部分；不像路径则回退占位），减少逐条改动。
+// SC-B1: actionable（blocker/major）finding 还需 invariant/family_id——测试未显式给时，
+// 默认补一个「自成一族」的值（用 id/下标当 family key，各不相同，等价于「本轮只有一处
+// 表现」的合法态）；显式提供了就不覆盖，用于测试「共享 family」「篡改归因」等场景。
 function withAnchorPaths(findings) {
-  return (findings ?? []).map((fd) => {
-    if (Array.isArray(fd.anchor_paths)) return fd;
-    const stripped = String(fd.anchor ?? '').replace(/:\d+(-\d+)?$/, '').trim();
-    const looksPath = stripped && !/\s/.test(stripped) && !stripped.startsWith('/') && !stripped.includes('..');
-    return { ...fd, anchor_paths: [looksPath ? stripped : 'src/_fixture.ts'] };
+  return (findings ?? []).map((fd, i) => {
+    let out = fd;
+    if (!Array.isArray(out.anchor_paths)) {
+      const stripped = String(out.anchor ?? '').replace(/:\d+(-\d+)?$/, '').trim();
+      const looksPath = stripped && !/\s/.test(stripped) && !stripped.startsWith('/') && !stripped.includes('..');
+      out = { ...out, anchor_paths: [looksPath ? stripped : 'src/_fixture.ts'] };
+    }
+    if (['blocker', 'major'].includes(out.severity)) {
+      if (out.invariant === undefined) out = { ...out, invariant: `fixture-invariant-${out.id ?? i}` };
+      if (out.family_id === undefined) out = { ...out, family_id: `fixture-family-${out.id ?? i}` };
+    }
+    return out;
   });
 }
 function mkVerdictFor(reviewer, bundleObj, over = {}) {
@@ -112,7 +126,9 @@ function mkVerdictFor(reviewer, bundleObj, over = {}) {
     verdict: 'APPROVED', closed_finding_ids: [],
     // R10-A3: 默认给两对抗席一份齐全的 hardening_coverage——不关心该字段的既有 fixture
     // 不必逐条改；专门测该字段的用例通过 over.hardening_coverage 覆盖/摘除。
-    ...(reviewer === 'upstream-preview' ? {} : { hardening_coverage: FULL_HARDENING }),
+    // SC-B4: 同理默认给两对抗席当前 checklist_version——专门测版本迁移的用例通过
+    // over.checklist_version 覆盖/摘除（如摘除模拟「旧 9 项 verdict 没有这个字段」）。
+    ...(reviewer === 'upstream-preview' ? {} : { hardening_coverage: FULL_HARDENING, checklist_version: HARDENING_CHECKLIST_VERSION }),
     ...over
   };
   base.findings = withAnchorPaths(base.findings);
@@ -167,7 +183,7 @@ t('[⑫] touches_ui=true 而对抗席 B=n_a → 拒', () => {
   const uiBundle = mkBundle(SHA_A, SHA_B, { touches_ui: true, matched_paths: ['src/app/x.tsx'] });
   ok(validateVerdict(mkVerdictFor('claude-adversarial', uiBundle), { bundle: uiBundle }).length > 0);
 });
-t('[R10-A3] R1 两对抗席 hardening_coverage 机器强制: 缺失/缺项/重复 class_id → fail；9 项齐全 → pass；round2/第三席不强制', () => {
+t('[R10-A3] R1 两对抗席 hardening_coverage 机器强制: 缺失/缺项/重复 class_id → fail；10 项齐全 → pass；round2/第三席不强制', () => {
   // ① 完全不带 hardening_coverage（复现 MUST-FIX-2 报告场景）→ 必须 fail-closed
   const missingCov = (over = {}) => mkVerdictFor('claude-adversarial', bundle, { hardening_coverage: undefined, ...over });
   ok(validateVerdict(missingCov()).some((e) => /hardening_coverage/.test(e)), 'R1 对抗席缺 hardening_coverage 必须报错');
@@ -175,24 +191,50 @@ t('[R10-A3] R1 两对抗席 hardening_coverage 机器强制: 缺失/缺项/重�
   eq(runConsensusGate(missingAll, { bundle }).gate_result, 'fail',
     '端到端: 三份 round:1 verdict 完全不带 hardening_coverage 必须 fail（此前 gate_result 会误判 pass，MUST-FIX-2 核心）');
 
-  // ② 缺 3 项（只给 6/9）→ fail
-  const short = mkVerdictFor('claude-adversarial', bundle, { hardening_coverage: FULL_HARDENING.slice(0, 6) });
+  // ② 缺 3 项（只给 7/10）→ fail
+  const short = mkVerdictFor('claude-adversarial', bundle, { hardening_coverage: FULL_HARDENING.slice(0, 7) });
   ok(validateVerdict(short).some((e) => /hardening_coverage/.test(e)), '缺项必须报 hardening_coverage 错误');
 
-  // ③ class_id 重复（9 项但漏 9、重复 1）→ fail
-  const dupCov = [...FULL_HARDENING.slice(0, 8), { class_id: 1, result: 'covered', evidence: '重复项' }];
+  // ③ class_id 重复（10 项但漏 10、重复 1）→ fail
+  const dupCov = [...FULL_HARDENING.slice(0, 9), { class_id: 1, result: 'covered', evidence: '重复项' }];
   const dup = mkVerdictFor('claude-adversarial', bundle, { hardening_coverage: dupCov });
   ok(validateVerdict(dup).some((e) => /重复/.test(e)), 'class_id 重复必须报错');
 
-  // ④ 9 项齐全 → pass（默认值本身即是这一形状，显式再断言一次）
-  eq(validateVerdict(mkVerdictFor('claude-adversarial', bundle)).length, 0, '9 项齐全的 R1 对抗席应过');
+  // ④ 10 项齐全 → pass（默认值本身即是这一形状，显式再断言一次）
+  eq(validateVerdict(mkVerdictFor('claude-adversarial', bundle)).length, 0, '10 项齐全的 R1 对抗席应过');
 
   // ⑤ round>=2 不强制（即便完全不带）
-  eq(validateVerdict(mkVerdictFor('claude-adversarial', bundle, { round: 2, hardening_coverage: undefined })).length, 0,
-    'round>=2 不强制 hardening_coverage（复核轮不重扫穷举面）');
+  eq(validateVerdict(mkVerdictFor('claude-adversarial', bundle, { round: 2, hardening_coverage: undefined, checklist_version: undefined })).length, 0,
+    'round>=2 不强制 hardening_coverage/checklist_version（复核轮不重扫穷举面）');
 
   // ⑥ 第三席不强制（即便完全不带）
-  eq(validateVerdict(mkVerdictFor('upstream-preview', bundle)).length, 0, '第三席不强制 hardening_coverage');
+  eq(validateVerdict(mkVerdictFor('upstream-preview', bundle)).length, 0, '第三席不强制 hardening_coverage/checklist_version');
+});
+
+t('[SC-B4/D5] checklist_version 9→10 迁移: 旧 9 项 verdict 必须报「清单版本过期需重审」而非缺项；新 10 项完整 verdict 必须过', () => {
+  // 旧形态复刻：checklist_version 缺失（旧协议没有这个字段）+ hardening_coverage 恰好 9 项
+  // （class_id 1〜9，每项本身合法——旧清单的「完整」形态）。D5 要求：这必须被识别成「版本不符
+  // 需重审」，不能被静默当成「凑巧缺了 1 项」的普通计数错误。
+  const OLD_NINE = Array.from({ length: 9 }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `旧第${i + 1}类核对完成` }));
+  const oldStyle = mkVerdictFor('claude-adversarial', bundle, { checklist_version: undefined, hardening_coverage: OLD_NINE });
+  const oldErrs = validateVerdict(oldStyle);
+  ok(oldErrs.some((e) => /清单版本过期需重审/.test(e)), '旧 9 项 verdict 必须显式报「清单版本过期需重审」: ' + JSON.stringify(oldErrs));
+  ok(oldErrs.some((e) => /checklist_version/.test(e)), '错误信息必须点名 checklist_version 字段本身');
+
+  // 显式携带旧版本号（而不是缺失该字段）同样必须被拒——版本号本身不等于当前值就是不符
+  const explicitOld = mkVerdictFor('claude-adversarial', bundle, { checklist_version: HARDENING_CHECKLIST_VERSION - 1, hardening_coverage: OLD_NINE });
+  ok(validateVerdict(explicitOld).some((e) => /清单版本过期需重审/.test(e)), '显式旧版本号同样必须报版本不符');
+
+  // 端到端: 三份都是旧 9 项 verdict → consensus-gate 必须 fail（不得被 gate_result:pass 放过）
+  const oldAll = [oldStyle, mkVerdictFor('codex-adversarial', bundle, { checklist_version: undefined, hardening_coverage: OLD_NINE }), mkVerdictFor('upstream-preview', bundle)];
+  eq(runConsensusGate(oldAll, { bundle }).gate_result, 'fail', '三份旧 9 项 verdict 必须端到端 fail（9→10 是 exact 集合变更，D5）');
+
+  // 新 10 项完整（默认值本身就是当前版本 + 10 项）→ 必须过，且不得混入版本错误
+  const newStyle = mkVerdictFor('claude-adversarial', bundle);
+  eq(newStyle.checklist_version, HARDENING_CHECKLIST_VERSION);
+  eq(newStyle.hardening_coverage.length, HARDENING_CLASS_COUNT);
+  const newErrs = validateVerdict(newStyle);
+  eq(newErrs.length, 0, '新 10 项 + 当前 checklist_version 的 verdict 必须零错误: ' + JSON.stringify(newErrs));
 });
 t('[⑥/审③F4-R] 全绿 → pass；artifact hash 含 base/candidate（只改 SHA 即失效）', () => {
   const { artifact } = consensusFor(bundle);
@@ -2436,9 +2478,14 @@ t('[anchor_paths 拆分/D2] verdict 的 finding 携带 write_paths/allowed_paths
 
 // 造一个带 N 条 canonical finding 的真共识 artifact（各 finding 指定 anchor_paths）
 function artifactWithFindings(specs, bundleObj = bundle, gateOpts = {}) {
-  // specs: [{fid_face, sev, paths}] —— 三席都 close 同一批以达共识。
+  // specs: [{fid_face, sev, paths, invariant?, family_id?, evidence?}] —— 三席都 close 同一批以达共识。
   // 每条 anchor + evidence 唯一（防 canonical dedup 合并），便于按 anchor 反查 canonical id。
-  const findings = specs.map((s, i) => ({ id: `f${i}`, primary_face: s.face ?? 'A', severity: s.sev, anchor: `${s.paths.join('|')}#${i}`, anchor_paths: s.paths, evidence: `ev-${i}-${s.paths.join(',')}`, status: 'closed' }));
+  // SC-B1: actionable（blocker/major）finding 默认各自「自成一族」（invariant/family_id 按
+  // 下标各不相同）；测试跨 finding 共享 family 时通过 spec.family_id/spec.invariant 显式指定。
+  const findings = specs.map((s, i) => ({
+    id: `f${i}`, primary_face: s.face ?? 'A', severity: s.sev, anchor: `${s.paths.join('|')}#${i}`, anchor_paths: s.paths, evidence: s.evidence ?? `ev-${i}-${s.paths.join(',')}`, status: 'closed',
+    ...(['blocker', 'major'].includes(s.sev) ? { invariant: s.invariant ?? `inv-f${i}`, family_id: s.family_id ?? `fam-f${i}` } : {})
+  }));
   const ids = findings.map((f) => f.id);
   const art = consensusFor(bundleObj, [
     { findings, closed_finding_ids: ids },
@@ -2449,6 +2496,23 @@ function artifactWithFindings(specs, bundleObj = bundle, gateOpts = {}) {
   return art;
 }
 
+// SC-B1: 测试懒惰路径——对 fix/verify/archive SC 自动补 invariant/family_id（从其引用的
+// canonical finding 逐字复制，只在引用 finding 存在且 actionable 时补）。显式已提供该字段的
+// SC 不覆盖（用于测试「篡改归因」「缺归因」等场景）。global SC / 多 finding_ids 的 SC 不处理
+// （SC-4 会先拒多引用，不需要本函数介入）。
+function withScAttribution(scs, artifact) {
+  const byId = new Map((artifact.canonical_findings ?? []).map((f) => [f.id, f]));
+  return scs.map((sc) => {
+    if (sc.kind === 'global') return sc;
+    const fids = Array.isArray(sc.finding_ids) ? sc.finding_ids : [];
+    if (fids.length !== 1) return sc;
+    const cf = byId.get(fids[0]);
+    if (!cf || (cf.severity !== 'blocker' && cf.severity !== 'major')) return sc;
+    if ('invariant' in sc || 'family_id' in sc) return sc;
+    return { ...sc, invariant: cf.invariant, family_id: cf.family_id };
+  });
+}
+
 t('[v2-coverage] SC 必须覆盖每条 blocker/major finding，绑定 artifact hash，拒悬空/漏项', () => {
   const art = artifactWithFindings([
     { sev: 'blocker', paths: ['server/lib/assetStore.ts'] },
@@ -2457,7 +2521,7 @@ t('[v2-coverage] SC 必须覆盖每条 blocker/major finding，绑定 artifact h
   ]);
   const ids = art.canonical_findings.map((f) => f.id);
   const blockerMajor = art.canonical_findings.filter((f) => f.severity !== 'suggestion').map((f) => f.id);
-  const mk = (scs) => ({ schema_version: 'v1', consensus_artifact_hash: art.consensus_artifact_hash, scs });
+  const mk = (scs) => ({ schema_version: 'v1', consensus_artifact_hash: art.consensus_artifact_hash, scs: withScAttribution(scs, art) });
   // 全覆盖 → ok
   const full = mk(blockerMajor.map((fid, i) => ({ id: `SC-${i}`, kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF() })));
   eq(checkScCoverage({ manifest: full, artifact: art }).length, 0, '全覆盖应过');
@@ -2760,12 +2824,12 @@ t('[2号-push闸/SC-R3-6] 端到端契约: 真实状态机 run + SKILL 字段 ma
     { sev: 'major', paths: ['src/c.ts'] }
   ], srcBundle);
   const fid = (i) => art.canonical_findings.find((f) => f.anchor.endsWith(`#${i}`)).id;
-  const scManifest = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash, scs: [
+  const scManifest = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash, scs: withScAttribution([
     { id: 'SC-0', kind: 'fix', finding_ids: [fid(0)], change: 'c', holds: 'h', verify: VF('test', ['-f', 'server/a.ts']) },
     { id: 'SC-1', kind: 'fix', finding_ids: [fid(1)], change: 'c', holds: 'h', verify: VF('test', ['-f', 'src/b.ts']) },
     { id: 'SC-2', kind: 'fix', finding_ids: [fid(2)], change: 'c', holds: 'h', verify: VF('test', ['-f', 'src/b2.ts']) },
     { id: 'SC-3', kind: 'fix', finding_ids: [fid(3)], change: 'c', holds: 'h', verify: VF('test', ['-f', 'src/c.ts']) }
-  ] };
+  ], art) };
   const pr2 = buildFixPlan({ artifact: art, manifest: scManifest });
   ok(!pr2.degraded, 'plan 不该 degraded: ' + JSON.stringify(pr2.reasons ?? []));
   const plan = pr2.plan;
@@ -3214,11 +3278,11 @@ t('[R10-A1] archive kind 端到端可用: coverage-gate 过 → buildFixPlan 定
   const RESIDUAL_PHRASE = 'ARCHIVE-R10-A1-RESIDUAL';
   const scManifest = {
     schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
-    scs: [
+    scs: withScAttribution([
       { id: 'SC-0', kind: 'fix', finding_ids: [id(0)], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) },
       { id: 'SC-V', kind: 'verify', finding_ids: [id(1)], change: 'c', holds: 'h', verify: VF('test', ['-f', 'e2e/x.test.ts']) },
       { id: 'SC-ARCH', kind: 'archive', finding_ids: [id(2)], change: '把残余风险文案写进 README.md', holds: 'README.md 含约定文案', verify: VF('grep', ['-q', RESIDUAL_PHRASE, 'README.md']) }
-    ]
+    ], art)
   };
 
   // ① coverage-gate: archive SC 与 fix/verify 同等过闸
@@ -3330,10 +3394,10 @@ t('[R10-A2] hub 门（D1 通用可移除性判据）: 4 条 archive SC 全指向
   const id = (i) => art.canonical_findings.find((f) => f.anchor.endsWith(`#${i}`)).id;
   const scManifest = {
     schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
-    scs: [0, 1, 2, 3].map((i) => ({
+    scs: withScAttribution([0, 1, 2, 3].map((i) => ({
       id: `SC-ARCH-${i}`, kind: 'archive', finding_ids: [id(i)], change: 'c', holds: 'h',
       verify: VF('grep', ['-q', `RESIDUAL-${i}`, 'README.md'])
-    }))
+    })), art)
   };
   eq(checkScCoverage({ manifest: scManifest, artifact: art }).length, 0, '4 条 archive SC 应各恰好引用 1 条 finding 并过覆盖门');
   const r2 = buildFixPlan({ artifact: art, manifest: scManifest });
@@ -3472,17 +3536,29 @@ t('[R10-A4] SKILL.md 契约与实现逐字同步: 按文档描述构造的 manif
   ok(/"cmd":\s*"grep"/.test(skill) && skill.includes('README.md'), 'SKILL 必须给出 grep 验证配方示例');
   ok(skill.includes('hub 路径门对 archive 池豁免'), 'SKILL 必须说明 hub 门对 archive 池豁免');
   ok(skill.includes('round===1') && skill.includes('两对抗席'), 'SKILL 必须说明覆盖率契约的机器强制范围');
+  // SC-B4: 文档必须点名 checklist_version 机制与 9→10 迁移语义
+  ok(skill.includes('checklist_version'), 'SKILL 必须点名机器字段 checklist_version');
+  ok(skill.includes('十类'), 'SKILL 必须说明加固清单已是十类（9→10 迁移）');
+  ok(skill.includes('清单版本过期需重审'), 'SKILL 必须点名版本不符的报错措辞（与缺项错误区分，D5）');
+  // SC-B1: 文档必须点名 invariant/family_id 归因字段与「lead 只能复制不得自填」的约束
+  ok(skill.includes('invariant') && skill.includes('family_id'), 'SKILL 必须点名机器字段 invariant/family_id');
+  ok(skill.includes('逐字复制') || skill.includes('逐字相等'), 'SKILL 必须说明 lead/SC 层只能逐字复制归因字段，不得自填');
+  ok(skill.includes('family_context'), 'SKILL 必须点名派工包的 family_context 机制');
+  // SC-B2: 文档必须点名 pr-body.mjs 机制与时序约束（先生成锚点段，delta review 才能开始）
+  ok(skill.includes('pr-body.mjs'), 'SKILL 必须点名 pr-body.mjs 脚本');
+  ok(skill.includes('review_input_hash') && skill.includes('pr_body'), 'SKILL 必须说明 pr_body 纳入 review_input_hash 的时序约束');
+  ok(skill.includes('已登记接受'), 'SKILL 必须点名 ARCHIVE 措辞「已登记接受」（与「已修复」区分）');
 
   // ② 严格按 SKILL.md 描述的形状构造真实输入，跑真守卫——不是只 grep 文档字符串（R3 踩过的坑）
   const art = artifactWithFindings([{ sev: 'major', paths: ['src/skill-doc-check.ts'] }]);
   const fid = art.canonical_findings[0].id;
   const scManifest = {
     schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
-    scs: [{
+    scs: withScAttribution([{
       id: 'SC-ARCH-1', kind: 'archive', finding_ids: [fid],
       change: '把残余风险文案写进 README.md', holds: 'README.md 含约定文案',
       verify: { cmd: 'grep', args: ['-q', '<残余风险关键文案>', 'README.md'] }
-    }]
+    }], art)
   };
   eq(checkScCoverage({ manifest: scManifest, artifact: art }).length, 0, '按 SKILL.md 例句构造的 archive SC 必须真过 coverage-gate');
   const r = buildFixPlan({ artifact: art, manifest: scManifest });
@@ -3491,7 +3567,7 @@ t('[R10-A4] SKILL.md 契约与实现逐字同步: 按文档描述构造的 manif
 
   // ③ 按 SKILL.md 描述的 hardening_coverage 形状构造 verdict，跑真 validator
   const docVerdict = mkVerdictFor('claude-adversarial', bundle, {
-    hardening_coverage: Array.from({ length: 9 }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `第${i + 1}类核对完成` }))
+    hardening_coverage: Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `第${i + 1}类核对完成` }))
   });
   eq(validateVerdict(docVerdict).length, 0, '按 SKILL.md 例句构造的 hardening_coverage 必须真过 validator');
 });
@@ -4081,6 +4157,208 @@ t('[R9] 删除命令抛错 = 结果不确定: 已落地→恢复 / 仍在原位�
   ok(rC.steps.includes('br-restore-fail:g1'), '第三方抢占应记 br-restore-fail: ' + JSON.stringify(rC.steps));
   ok(rC.errors.some((e) => /第三方已抢占，绝不覆盖/.test(e)), JSON.stringify(rC.errors));
   eq(C.g('rev-parse', 'refs/heads/fix/r9/c'), C.cand, '第三方 ref 必须原封不动');
+});
+
+// ========== 23. SC-B1: family 归因数据契约 + SC-B4: 加固清单十类文档一致性 ==========
+console.log('\n[23] SC-B1 family 归因（invariant/family_id 冻结+逐字相等） / SC-B4 hardening-checklist.md 十类文档一致性');
+
+t('[SC-B1] actionable finding 缺 invariant/family_id → degraded；suggestion 不强制', () => {
+  // withAnchorPaths 的 fixture 便利默认值只在字段**完全未出现**（undefined）时补——这里显式传
+  // null 表示「测试故意不给」，绕开默认值以测出 validator 真实的必填校验（而不是被 fixture 便利
+  // 逻辑掩盖）。
+  const noInv = mkVerdictFor('claude-adversarial', bundle, {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'src/x.ts', anchor_paths: ['src/x.ts'], invariant: null, family_id: 'FAM-1', evidence: 'e', status: 'closed' }],
+    closed_finding_ids: ['F1']
+  });
+  ok(validateVerdict(noInv).some((e) => /F1.*缺 invariant/.test(e)), 'actionable finding 缺 invariant 必须报错');
+  const noFam = mkVerdictFor('claude-adversarial', bundle, {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'blocker', anchor: 'src/x.ts', anchor_paths: ['src/x.ts'], invariant: 'inv', family_id: null, evidence: 'e', status: 'closed' }],
+    closed_finding_ids: ['F1']
+  });
+  ok(validateVerdict(noFam).some((e) => /F1.*缺 family_id/.test(e)), 'actionable finding 缺 family_id 必须报错');
+  // suggestion 级不强制——两个字段都不给也应过（其余字段齐全）
+  const sugg = mkVerdictFor('claude-adversarial', bundle, {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'suggestion', anchor: 'src/x.ts', anchor_paths: ['src/x.ts'], evidence: 'e', status: 'closed' }],
+    closed_finding_ids: ['F1']
+  });
+  eq(validateVerdict(sugg).length, 0, 'suggestion 级 finding 不强制 invariant/family_id');
+});
+
+t('[SC-B1/D1] family_id 引用合法性: 同 family 的 invariant 必须逐字一致（同 verdict 内自洽）', () => {
+  const mkTwo = (inv1, inv2) => mkVerdictFor('claude-adversarial', bundle, {
+    findings: [
+      { id: 'F1', primary_face: 'A', severity: 'major', anchor: 'src/x.ts', anchor_paths: ['src/x.ts'], invariant: inv1, family_id: 'FAM-SHARED', evidence: 'e1', status: 'closed' },
+      { id: 'F2', primary_face: 'A', severity: 'major', anchor: 'src/y.ts', anchor_paths: ['src/y.ts'], invariant: inv2, family_id: 'FAM-SHARED', evidence: 'e2', status: 'closed' }
+    ],
+    closed_finding_ids: ['F1', 'F2']
+  });
+  ok(validateVerdict(mkTwo('同一个不变量', '另一个不变量')).some((e) => /family_id=FAM-SHARED.*不一致/.test(e)), '同 family_id 但 invariant 不同必须报错');
+  eq(validateVerdict(mkTwo('同一个不变量', '同一个不变量')).length, 0, '同 family_id 且 invariant 逐字一致应过');
+});
+
+t('[SC-B1] consensus-gate 冻结 invariant/family_id 到 canonical finding（取首个 origin 的值，与 anchor/primary_face 同一处理方式）', () => {
+  const srcBundle2 = mkBundle(SHA_A, SHA_B);
+  const fdA = { id: 'FA', primary_face: 'A', severity: 'major', anchor: 'src/shared.ts#0', anchor_paths: ['src/shared.ts'], invariant: 'first-invariant', family_id: 'FAM-X', evidence: 'ev-shared', status: 'closed' };
+  // 第二席同一条 finding（同 canonicalFindingKey：face+anchor+evidence 指纹一致）携带不同的
+  // invariant/family_id 文本——冻结逻辑只取首个 origin 的值，不做跨 origin 语义裁决/合并。
+  const fdB = { ...fdA, id: 'FB', invariant: 'second-invariant-should-not-win', family_id: 'FAM-Y-should-not-win' };
+  const v1x = mkVerdictFor('claude-adversarial', srcBundle2, { findings: [fdA], closed_finding_ids: ['FA'] });
+  const v2x = mkVerdictFor('codex-adversarial', srcBundle2, { findings: [fdB], closed_finding_ids: ['FB'] });
+  const v3x = mkVerdictFor('upstream-preview', srcBundle2, { findings: [], closed_finding_ids: [] });
+  const changedPaths = new Set(['src/shared.ts']);
+  const artifact = runConsensusGate([v1x, v2x, v3x], { bundle: srcBundle2, changedPaths });
+  eq(artifact.gate_result, 'pass', JSON.stringify(artifact.fail_reasons ?? []));
+  eq(artifact.canonical_findings.length, 1, '两席同一条 finding 应聚为 1 条 canonical');
+  const cf = artifact.canonical_findings[0];
+  eq(cf.invariant, 'first-invariant', 'canonical 必须冻结首个 origin（claude-adversarial）的 invariant');
+  eq(cf.family_id, 'FAM-X', 'canonical 必须冻结首个 origin 的 family_id');
+  eq(cf.origins.length, 2, '两席的 origin 都必须保留（审②-F2 全量保留不变）');
+});
+
+t('[SC-B1/D1] sc-coverage-gate: SC 的 invariant/family_id 必须逐字等于共识产物冻结值——缺失/篡改一律 fail-closed', () => {
+  const art = artifactWithFindings([{ sev: 'major', paths: ['src/attr.ts'], invariant: '真实不变量', family_id: 'FAM-ATTR' }]);
+  const fid = art.canonical_findings[0].id;
+  eq(art.canonical_findings[0].invariant, '真实不变量');
+  eq(art.canonical_findings[0].family_id, 'FAM-ATTR');
+  const mkOne = (over = {}) => ({ schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: [{ id: 'SC-0', kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF(), invariant: '真实不变量', family_id: 'FAM-ATTR', ...over }] });
+  // 正确逐字复制 → 过
+  eq(checkScCoverage({ manifest: mkOne(), artifact: art }).length, 0, '逐字复制归因字段应过覆盖门');
+  // 缺 invariant → 拒
+  const missingInv = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: [{ id: 'SC-0', kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF(), family_id: 'FAM-ATTR' }] };
+  ok(checkScCoverage({ manifest: missingInv, artifact: art }).some((e) => /必须携带 invariant/.test(e)), '缺 invariant 必须拒');
+  // 缺 family_id → 拒
+  const missingFam = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: [{ id: 'SC-0', kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF(), invariant: '真实不变量' }] };
+  ok(checkScCoverage({ manifest: missingFam, artifact: art }).some((e) => /必须携带 family_id/.test(e)), '缺 family_id 必须拒');
+  // 篡改 invariant（lead 改写文本）→ 拒
+  ok(checkScCoverage({ manifest: mkOne({ invariant: '被篡改的不变量' }), artifact: art }).some((e) => /不逐字相等.*invariant|invariant.*不逐字相等/.test(e) || /lead 不得篡改归因/.test(e)),
+    '篡改 invariant 必须拒');
+  // 篡改 family_id → 拒
+  ok(checkScCoverage({ manifest: mkOne({ family_id: 'FAM-FORGED' }), artifact: art }).some((e) => /lead 不得篡改归因/.test(e)), '篡改 family_id 必须拒');
+});
+
+t('[SC-B1] fix-orchestrate.familyContext: 同 family 的其它 manifestation 跨组可见，且各自带 sc_id 引用；未归族 finding 得 null', () => {
+  const art = artifactWithFindings([
+    { sev: 'major', paths: ['src/fam-a.ts'], invariant: '共享不变量', family_id: 'FAM-SHARE' },
+    { sev: 'major', paths: ['src/fam-b.ts'], invariant: '共享不变量', family_id: 'FAM-SHARE' }, // 与上条同 family，不同路径 → 分到不同冲突组
+    { sev: 'suggestion', paths: ['docs/note.md'] } // 不归族
+  ]);
+  const idOf = (i) => art.canonical_findings.find((f) => f.anchor.endsWith(`#${i}`)).id;
+  const scManifest = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: withScAttribution([
+      { id: 'SC-A', kind: 'fix', finding_ids: [idOf(0)], change: 'c', holds: 'h', verify: VF() },
+      { id: 'SC-B', kind: 'fix', finding_ids: [idOf(1)], change: 'c', holds: 'h', verify: VF() },
+      { id: 'SC-C', kind: 'fix', finding_ids: [idOf(2)], change: 'c', holds: 'h', verify: VF() }
+    ], art) };
+  const plan = buildFixPlan({ artifact: art, manifest: scManifest });
+  ok(!plan.degraded, JSON.stringify(plan.reasons ?? []));
+  eq(plan.plan.groups.length, 3, '三条 SC 路径互不相交，各自独立组（family 关系不影响分组——分组逻辑不改）');
+  const ctxA = ORC.familyContext({ artifact: art, manifest: scManifest, scIds: ['SC-A'] });
+  ok(ctxA['SC-A'], 'SC-A 应有 family_context');
+  eq(ctxA['SC-A'].family_id, 'FAM-SHARE');
+  eq(ctxA['SC-A'].manifestations.length, 1, 'SC-A 应看到同 family 的另一条 manifestation（跨组可见）');
+  eq(ctxA['SC-A'].manifestations[0].finding_id, idOf(1));
+  eq(ctxA['SC-A'].manifestations[0].sc_id, 'SC-B', 'manifestation 必须带上已分到的 sc_id 引用（同 family 前序 finding 引用）');
+  ok(ctxA['SC-A'].audit_instruction.includes('未点名处'), '审计指令文本必须要求排查未点名路径');
+  const ctxC = ORC.familyContext({ artifact: art, manifest: scManifest, scIds: ['SC-C'] });
+  eq(ctxC['SC-C'], null, '未归族（suggestion）finding 的 SC 应得 null family_context');
+  // allocateWave 接线: 传 artifact+scManifest 才附 family_context，不传则为 null（向后兼容）
+  const d23 = mkdtempSync(join(tmpdir(), 'famctx-'));
+  const r23 = join(d23, 'repo');
+  execFileSync('git', ['init', '-q', r23]);
+  const g23 = (...a) => execFileSync('git', ['-C', r23, ...a], { encoding: 'utf8' }).trim();
+  g23('config', 'user.email', 'o@t'); g23('config', 'user.name', 'o');
+  mkdirSync(join(r23, 'src'), { recursive: true });
+  writeFileSync(join(r23, 'src', 'fam-a.ts'), 'base\n');
+  g23('add', '.'); g23('commit', '-qm', 'base');
+  const cand23 = g23('rev-parse', 'HEAD');
+  const wtRoot23 = join(d23, 'wt'); mkdirSync(wtRoot23);
+  const planShape = { schema_version: 'v1', capacity: 8, groups: [{ id: 'g1', sc_ids: ['SC-A'], paths: ['src/fam-a.ts'] }], waves: [['g1']] };
+  const withCtx = ORC.allocateWave({ repoDir: r23, worktreeRoot: wtRoot23, runId: 'famctx1', plan: planShape, waveIndex: 0, waveBase: cand23, artifact: art, scManifest });
+  ok(withCtx.allocations[0].family_context, '传 artifact+scManifest 时 allocation 应带 family_context');
+  eq(withCtx.allocations[0].family_context['SC-A'].family_id, 'FAM-SHARE');
+  const withoutCtx = ORC.allocateWave({ repoDir: r23, worktreeRoot: wtRoot23, runId: 'famctx2', plan: planShape, waveIndex: 0, waveBase: cand23 });
+  eq(withoutCtx.allocations[0].family_context, null, '不传 artifact/scManifest 时应为 null（向后兼容 v1 行为）');
+});
+
+t('[SC-B4] hardening-checklist.md 文档一致性: 十类齐全 + 第 10 类判据所有权/跨门兼容展开 + hub⊥coverage 实证案例', () => {
+  const doc = readFileSync(join(S, '../skills/submit-pr/references/hardening-checklist.md'), 'utf8');
+  ok(doc.includes('| 10 |') && doc.includes('判据所有权与跨门兼容'), '文档必须有第 10 类表格行');
+  ok(doc.includes('第 10 类展开'), '文档必须有第 10 类的展开小节');
+  ok(doc.includes('形态①') && doc.includes('形态②'), '文档必须区分两种形态');
+  ok(doc.includes('hub 门') && doc.includes('coverage 门') && doc.includes('单文件 PR'), '文档必须给出 hub⊥coverage 死锁的实证案例');
+  ok(doc.includes('可移除性'), '文档必须点出 D1 的可移除性判据作为真正解法');
+  ok(doc.includes('十类'), '文档标题/正文必须已更新为十类（不留九类残留表述于用法边界段）');
+  // 单一来源提醒必须在场，防止未来又四处手抄数字
+  ok(doc.includes('hardening-registry.mjs'), '文档必须点名单一来源常量文件');
+});
+
+t('[SC-B2] pr-body.mjs: MUST-FIX 按 family 去重 + ARCHIVE 措辞「已登记接受」+ 不外泄证据原文', () => {
+  // secretEvidence 是每条 finding 的 evidence 原文（模拟三审 verdict 里可能带内部路径/上下文
+  // 的证据长文本）——canonical finding 结构上从不携带 evidence（consensus-gate.mjs 只用它算
+  // 语义指纹，不落进 canonical 记录），本测试直接断言：即便 evidence 里塞了独特的敏感标记，
+  // 生成的 PR body 段里也不会出现该标记（真正验证「不外泄」，不是靠 canonical 记录本就没有
+  // 这个字段来空转过关）。
+  const secretEvidence = (tag) => `内部路径 /etc/very-secret/${tag}.txt 与凭证片段 SECRET-MARKER-${tag} 不得外泄`;
+  const art = artifactWithFindings([
+    { sev: 'major', paths: ['src/fam-1.ts'], invariant: '共享的不变量文本', family_id: 'FAM-SHARE', evidence: secretEvidence('A') },
+    { sev: 'major', paths: ['src/fam-2.ts'], invariant: '共享的不变量文本', family_id: 'FAM-SHARE', evidence: secretEvidence('B') },
+    { sev: 'blocker', paths: ['src/solo.ts'], invariant: '独立的不变量', family_id: 'FAM-SOLO', evidence: secretEvidence('C') },
+    { sev: 'major', paths: ['src/arch.ts'], invariant: '残余风险不变量', family_id: 'FAM-ARCH', evidence: secretEvidence('D') }
+  ]);
+  const idOf = (i) => art.canonical_findings.find((f) => f.anchor.endsWith(`#${i}`)).id;
+  const manifest = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash, scs: withScAttribution([
+    { id: 'SC-1', kind: 'fix', finding_ids: [idOf(0)], change: 'c', holds: 'h', verify: VF() },
+    { id: 'SC-2', kind: 'fix', finding_ids: [idOf(1)], change: 'c', holds: 'h', verify: VF() },
+    { id: 'SC-3', kind: 'fix', finding_ids: [idOf(2)], change: 'c', holds: 'h', verify: VF() },
+    { id: 'SC-ARCH', kind: 'archive', finding_ids: [idOf(3)], change: 'c', holds: 'README.md 含约定文案', verify: VF('grep', ['-q', 'x', 'README.md']) }
+  ], art) };
+  const section = buildInvariantsSection({ artifact: art, manifest });
+  ok(section.startsWith(SECTION_START) && section.endsWith(SECTION_END), '生成段必须被 marker 完整包围');
+  // MUST-FIX 按 family 去重: FAM-SHARE 只出现一次 invariant 文本，但两条 manifestation 都列出
+  const shareCount = (section.match(/共享的不变量文本/g) ?? []).length;
+  eq(shareCount, 1, '同 family 的 invariant 文本只应出现一次（去重）');
+  ok(section.includes('SC-1') && section.includes('SC-2'), '同 family 的两条 manifestation（各自 sc_id）都必须列出');
+  ok(section.includes('独立的不变量') && section.includes('SC-3'), 'FAM-SOLO 也必须列出');
+  // ARCHIVE 措辞: 必须是「已登记接受」，不得出现「已修复」
+  ok(section.includes('已登记接受'), 'ARCHIVE 项措辞必须是「已登记接受」');
+  ok(!section.includes('已修复'), 'ARCHIVE 段不得出现「已修复」措辞（D2: 不是修复，是文档化接受）');
+  // 不外泄敏感证据原文——四条 finding 的 evidence 里各自唯一的 SECRET-MARKER-{A,B,C,D} 一个都
+  // 不得出现在生成的段落里（真正的反证：先证明这些字符串确实在输入里，再证明它们不在输出里）
+  for (const tag of ['A', 'B', 'C', 'D']) {
+    ok(secretEvidence(tag).length > 0); // 前提健全性
+    ok(!section.includes(`SECRET-MARKER-${tag}`), `finding evidence 里的敏感标记 SECRET-MARKER-${tag} 不得出现在 PR body 锚点段`);
+  }
+});
+
+t('[SC-B2] pr-body.mjs: 幂等 upsert——marker 存在则整段替换保留 owner 手写正文；不存在则追加', () => {
+  const artA = artifactWithFindings([{ sev: 'major', paths: ['src/v1.ts'], invariant: '版本一不变量', family_id: 'FAM-V1' }]);
+  const manifestA = { schema_version: 'v2', consensus_artifact_hash: artA.consensus_artifact_hash,
+    scs: withScAttribution([{ id: 'SC-1', kind: 'fix', finding_ids: [artA.canonical_findings[0].id], change: 'c', holds: 'h', verify: VF() }], artA) };
+  const sectionA = buildInvariantsSection({ artifact: artA, manifest: manifestA });
+
+  // 首次生成: owner 手写正文保留在前，marker 段追加在后
+  const ownerBody = '## 这是 owner 手写的正文\n\n一些说明文字。';
+  const firstBody = upsertInvariantsSection(ownerBody, sectionA);
+  ok(firstBody.startsWith(ownerBody), '首次生成必须保留 owner 手写正文在前');
+  ok(firstBody.includes(SECTION_START) && firstBody.includes('版本一不变量'), '首次生成必须包含锚点段内容');
+
+  // 第二轮（换了新 artifact/manifest）: 只替换 marker 段，owner 手写正文原样不变
+  const artB = artifactWithFindings([{ sev: 'major', paths: ['src/v2.ts'], invariant: '版本二不变量', family_id: 'FAM-V2' }]);
+  const manifestB = { schema_version: 'v2', consensus_artifact_hash: artB.consensus_artifact_hash,
+    scs: withScAttribution([{ id: 'SC-2', kind: 'fix', finding_ids: [artB.canonical_findings[0].id], change: 'c', holds: 'h', verify: VF() }], artB) };
+  const sectionB = buildInvariantsSection({ artifact: artB, manifest: manifestB });
+  const secondBody = upsertInvariantsSection(firstBody, sectionB);
+  ok(secondBody.startsWith(ownerBody), '二次 upsert 必须保留 owner 手写正文不变');
+  ok(secondBody.includes('版本二不变量'), '二次 upsert 必须换成新内容');
+  ok(!secondBody.includes('版本一不变量'), '二次 upsert 不得残留旧版本内容（整段替换，不是追加）');
+  eq((secondBody.match(new RegExp(SECTION_START.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) ?? []).length, 1, 'marker 不得重复叠加');
+
+  // 幂等: 用同一份 section 再 upsert 一次，结果必须字节级不变
+  const thirdBody = upsertInvariantsSection(secondBody, sectionB);
+  eq(thirdBody, secondBody, '同内容重复 upsert 必须幂等（字节级不变）');
 });
 
 // ========== 汇总 + SKIPPED ==========

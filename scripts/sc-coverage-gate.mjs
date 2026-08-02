@@ -27,6 +27,7 @@ export function checkScCoverage({ manifest, artifact }) {
 
   const canonical = artifact.canonical_findings ?? [];
   const canonicalIds = new Set(canonical.map((f) => f.id));
+  const canonicalById = new Map(canonical.map((f) => [f.id, f]));
   const mustCover = canonical.filter((f) => f.severity === 'blocker' || f.severity === 'major');
 
   const scs = Array.isArray(manifest.scs) ? manifest.scs : [];
@@ -68,6 +69,28 @@ export function checkScCoverage({ manifest, artifact }) {
       for (const fid of fids) {
         need(canonicalIds.has(fid), `SC ${sc.id} 引用悬空 finding_id: ${fid}（不在 consensus artifact 中）`);
         coverCount.set(fid, (coverCount.get(fid) ?? 0) + 1);
+      }
+      // SC-B1（D1）: lead 提炼 SC 时只能**逐字复制**引用 finding 在共识产物里冻结的
+      // invariant/family_id，不得自填/改写——归因判断权始终在审查席，SC 层没有自由裁量。
+      // 仅当 fids 恰好 1 条（上面已断言，否则下面按 undefined 处理不产生误报）且引用的
+      // canonical finding 确实存在、且是 actionable（blocker/major）时才强制：suggestion
+      // 级 finding 在 verdict-validate 层本就不强制携带这两个字段，SC 层同等不强制。
+      if (fids.length === 1) {
+        const cf = canonicalById.get(fids[0]);
+        if (cf && (cf.severity === 'blocker' || cf.severity === 'major')) {
+          need(typeof sc.invariant === 'string' && sc.invariant.length > 0,
+            `SC ${sc.id} 引用的 finding ${fids[0]} 是 ${cf.severity}（actionable），SC 必须携带 invariant（逐字复制自共识产物，D1：lead 不得自填）`);
+          need(typeof sc.family_id === 'string' && sc.family_id.length > 0,
+            `SC ${sc.id} 引用的 finding ${fids[0]} 是 ${cf.severity}（actionable），SC 必须携带 family_id（逐字复制自共识产物，D1）`);
+          if (typeof sc.invariant === 'string' && sc.invariant) {
+            need(sc.invariant === cf.invariant,
+              `SC ${sc.id} 的 invariant 与其引用 finding ${fids[0]} 在共识产物中冻结的值不逐字相等（SC="${sc.invariant}" 共识="${cf.invariant}"）——lead 不得篡改归因（D1 fail-closed）`);
+          }
+          if (typeof sc.family_id === 'string' && sc.family_id) {
+            need(sc.family_id === cf.family_id,
+              `SC ${sc.id} 的 family_id 与其引用 finding ${fids[0]} 在共识产物中冻结的值不逐字相等（SC="${sc.family_id}" 共识="${cf.family_id}"）——lead 不得篡改归因（D1 fail-closed）`);
+          }
+        }
       }
     }
   }
