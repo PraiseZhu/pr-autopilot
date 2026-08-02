@@ -138,6 +138,12 @@ node scripts/fix-plan.mjs --artifact consensus.json --manifest sc-manifest.json 
 被审出来再补第二个」。这是砍掉 B 类 finding（修复引入的新洞）的主手段——R6→R9 四轮全是「删分支」
 这一个不可逆操作被拆成四次补丁，若 R6 一次套上「事务 reconciliation」形状，R7/R8/R9 三轮不存在。
 
+**接线：命中原子收敛检查点触发条件时的前置动作**——若本 SC 的修复命中
+`references/convergence-checkpoint.md` 的任一触发条件（漏了对称的另一半 / 同一判据第 3 处 /
+repair-mode watermark 达标，见下方「收敛判据与收口」），worker 必须先完成该文档的原子六件套
+并把产出贴进 PR body 的 checkpoint marker 段，之后才继续上面「动手前先判代码种类、上来就套
+形状」的流程——六件套不豁免套形状，是套形状在触发条件命中时的前置步骤。
+
 **逐波执行（有状态 orchestrator，SC-8：base 由 run manifest CAS 派生，不接受自报）**：
 ```
 # 0) 绑定 plan + sc manifest + 源共识（起点 = 源 artifact 的 candidate_sha，由 artifact 派生
@@ -231,20 +237,76 @@ node scripts/fix-run.mjs finalize --state-dir <st> --run-id <run>   # 输出 run
    README 已含约定文案 + verify 通过，据此把该 finding `status=closed`（已由文档化接受解决）
    → consensus-gate 正常 PASS → push。**闸没绕，循环终止**（因为文档化不产生新代码 = 不长新 finding）。
 3. **`[MUST-FIX]` 仍须改代码**：回 Phase 2c 头部，**按类套形状重做**（不是打补丁）。
-4. **补丁螺旋探测（替代数字轮次上限）**——触发要求**同一问题谱系**，不是「凑够 2 轮窄面」：
-   连续 2 轮的窄面 `[MUST-FIX]` 必须指向**同一模块 + 同一操作 + 同一失败形状**（对账依据：上一轮
-   finding id + `prev..current` 的行级 provenance；两个互不相关的窄面**不算**螺旋）→ 强制回
+4. **补丁螺旋探测（谱系判据，不是水位线——数字只切换修复模式，谱系探测仍可比水位线更早
+   触发）**——触发要求**同一问题谱系**，不是「凑够 2 轮窄面」：连续 2 轮的窄面 `[MUST-FIX]`
+   必须指向**同一模块 + 同一操作 + 同一失败形状**（对账依据：上一轮 finding id +
+   `prev..current` 的行级 provenance；两个互不相关的窄面**不算**螺旋）→ 先完成
+   `references/convergence-checkpoint.md` 的原子六件套（若本谱系尚未做过），产出后强制回
    「修复方设计约束」把该模块**所有异常出口一次性重写**（不是再加一个 guard）。
    **重写后仍复现同类窄面 → 不自动降级**：必须**重新逐项评估第 1 条的四项资格**，任一不满足
-   （尤其③：数据损失/泄密/安全绕过/active-path 失败/T2 冒充）→ **继续 `[MUST-FIX]`**；
-   同一谱系累计 3 次整块重写仍无进展 → 走第 5 条报 owner，**不许自动 ARCHIVE 掉**。
-5. **真·卡死兜底**：`[MUST-FIX]` 的 **blocker/major** 连续 2 轮不减（不是窄面）→ 停，报 owner。
+   （尤其③：数据损失/泄密/安全绕过/active-path 失败/T2 冒充）→ **继续 `[MUST-FIX]`**。
+5. **检查点后同族复发 → 升级阶梯，不再打补丁**（触发 = 完成第 4 条的六件套之后，**同一
+   family** 再次复发——说明模型仍是猜的，继续加条件分支没有意义）。四选项按「要不要 owner」
+   分两档，**不是**无差别的「lead 自主」——同一句话不能既说自主又说要 owner：
 
-区分：4 治「越修越窄的补丁螺旋」（收敛中，用整块重写了结）；5 治「真修不动」（不收敛，交人）。
-**绝不**混为「跑够 N 轮就停」的数字闸——数字闸要么切早漏真问题，要么切晚继续螺旋。
+   - **纯技术档（lead 自主，不上抛 owner）**：① 抽出显式状态机/transition reducer（命中
+     一般 async 形状套 `hardening-checklist.md` 第 4 类展开）；② 把该职责移到更合适的上层
+     协调者；③ 缩减实现机制、**保留产品语义**（降级设计）。这三条按 `convergence-checkpoint.md`
+     D3 属于「纯技术升级路径」，不改变用户可见行为与功能范围，所以自主执行。**「保留产品语义」
+     是判据，不是自称**：③做完之后若用户可见行为/功能范围实际发生了变化，即使 worker 声称
+     「保留了语义」，该改动也不再属于本档，必须落 D3 走 owner 确认——不能靠自我声明豁免。
+   - **需 owner 档**：④ **划定范围**（在 PR body 写明本 PR 不处理哪些场景，范围外 finding
+     答复说明后 close）。划定范围**本身就是**用户可见的功能范围变更，落 D3——动手前须先获
+     owner 确认，不属于「纯技术判断」，不能因为它出现在四选项列表里就默认跟①②③一样自主。
+
+   **硬约束（即使 owner 已同意划定范围，这条线也不许越）**：划定范围**不得**把仍在 active
+   path 上的安全问题改名成 residual——范围只能划在真正的产品边界外，不能拿它当 `[ARCHIVE]`
+   的后门。
+
+   拆 PR **不是标准动作**：仅当以上四选项都不可行时才考虑，同样落 D3（拆 PR / 净新增基础
+   设施 / 用户可见行为/功能范围/发布策略变更），动手前须先获 owner 确认。**「升级阶梯本身
+   不需要 owner」只在纯技术档内成立**——在①②③之间选哪条路径不需要 owner；一旦落到④划定
+   范围或拆 PR，就必须走 owner，不能把这句话读成对四选项的全称句。升级路径若需**新增**
+   并发/锁/缓存/持久化/重试类基础设施，先过 `hardening-checklist.md`「新增机制确认门」。
+
+   同一谱系累计 3 次整块重写（含本条升级）仍无进展 → 走第 6 条报 owner，**不许自动
+   ARCHIVE 掉**。
+6. **真·卡死兜底**：`[MUST-FIX]` 的 **blocker/major** 连续 2 轮不减（不是窄面）→ 停，报 owner。
+
+区分：4 治「同一问题谱系反复打补丁」（先做检查点、再整块重写了结）；5 治「做完检查点后同族
+再犯」（升级路径——抽状态机/挪职责/降级/划范围，不再加 guard）；6 治「真修不动」（不收敛，
+交人）。**绝不**混为「跑够 N 轮就停」的数字闸——数字闸要么切早漏真问题，要么切晚继续螺旋；
+下面的 repair-mode watermark 是另一件事，只切换修复模式，不替代这三条判据。
+
+**repair-mode watermark（补丁计数的唯一合法用途，`convergence-checkpoint.md` D2）**：计数
+权威 = 本次 submit-pr run 的 run artifacts 中「完成过 delta 审查的不同 candidate SHA」数
+（排除同 head 重跑、工具重试、纯 reviewer 重放）。第 5 个 candidate 仍出现**新 family**
+（对照共识产物 `canonical_findings` 的 family_id）→ 下一次修复 commit 前强制完成
+`references/convergence-checkpoint.md` 六件套；第 10 个 → 禁止继续同形状打补丁，lead 按第
+5 条升级阶梯自主选路径执行 + **红色通报 owner**（轮数/失败族清单/选定路径）。
+这条数字线**只**做一件事——切换「这次修复要不要先做六件套 / 要不要禁止继续同形状打补丁」，
+**绝不**决定 consensus 是否 PASS、finding 的 severity、能否 `[ARCHIVE]`、能否 push——这四件
+事仍分别由 consensus-gate / 审查席 / SC 覆盖门 / push-guard 独立裁决，水位线到第几个
+candidate 不改变它们的判据（与本节「反猫捉老鼠」立场一致：数字从不替代形状判断，只是在形状
+判断之外加一层「至少做过一次结构化止损」的兜底）。
+
+> **临时条款（脚手架，带显式解除条件，不是永久措辞）**：本节写下时 `family_id` 尚未落地到
+> `schemas/consensus-artifact.schema.json` 的 `canonical_findings`——在此之前，「对照 family_id
+> 判断是否新 family」这件事**暂不可判**，按 fail-closed 处理：**视为「暂不可判」而不是「无新
+> family」**，即第 5/10 个 candidate 的强制动作仍按上面文字生效，不因字段缺失而失效。
+> **解除条件（谁落地 `family_id` 谁必须做，不是可选项）**：`canonical_findings` 落地
+> `family_id` 字段后，本条临时条款**立即失效并必须从本文件删除**，同时必须在
+> `fixtures/run-fixtures.mjs` 补一条与 `[R10-A4]` 同款方法的新 fixture（自定 test id，不要
+> 复用已被占用的 `[R10-A4]`）：按本节描述构造带不同 `family_id` 的 verdict/consensus
+> manifest，真跑相关判定逻辑，验证「第 5/10 个 candidate 触发对应强制动作」这一行为本身能
+> 通过，不能只 grep 本节文字。**在没有这条 fixture 之前，删掉本临时条款本身也不允许**——
+> 否则水位线判据会从「暂不可判」这个显式脚手架状态，静默退化成「永远无新 family」的隐性
+> fail-open，watermark 从此再也不会触发，而文档读起来却像已经生效——这正是本条款要杜绝的
+> 情形。
 
 > **与 plan.md 的数字上限冲突已裁决（owner 2026-08-02）**：`docs/plan.md` SP-2 及其流程图写的
-> 「≤3 轮未收敛停给 owner」（plan.md:37 / 69 / 95 / 131）**本节取代之**——按形状判据收敛，不按轮数硬停。
+> 「≤3 轮未收敛停给 owner」（plan.md:37 / 69 / 95 / 131）**本节取代之**——按形状判据收敛，不按轮数硬停；
+> repair-mode watermark 的第 5/10 个 candidate 同样不是该数字上限的复活，只切换修复模式（见上）。
 > plan.md 的该数字保留为历史记录，不再作为执行契约。
 > 另需区分：`SKILL.md` Phase 2「lead 争议质询 ≤3 轮」是**仲裁**轮次上限（lead 与审查席就某条 finding
 > 是否成立的往复），**不计**修复轮/delta 复核轮——两者互不换算。
