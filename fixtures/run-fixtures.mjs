@@ -3253,10 +3253,10 @@ t('[R10-A1] archive kind 端到端可用: coverage-gate 过 → buildFixPlan 定
   const vAlloc = a1.allocations.find((x) => x.group_id === verifyGroup.id);
   const arAlloc = a1.allocations.find((x) => x.group_id === archGroup.id);
   ok(vAlloc && arAlloc, '两组分配都应存在');
-  eq(arAlloc.allowed_paths, ['README.md'], 'archive 组分配的 allowed_paths 必须固定为 README.md');
+  eq(arAlloc.write_paths, { mode: 'fixed-list', paths: ['README.md'] }, 'archive 组分配的 write_paths 必须是脚本给定的固定清单（mode=fixed-list），不是 isolated（SC-M1/M2）');
   workGroup(env, vAlloc, 'e2e/x.test.ts', 'test ok\n');
   // worker 在 archive worktree 里把残余风险文案写进 README——这正是 MUST-FIX-1 要打通的路径；
-  // 改的是 allowed_paths 内的 README.md，不应被 fix-run 判越域
+  // 改的是 write_paths.paths 内的 README.md，不应被 fix-run 判越域
   workGroup(env, arAlloc, 'README.md', `# Project\n\n## 残余风险\n${RESIDUAL_PHRASE}: 已知限制，登记存档\n`);
   const i1 = FR.integrate({ stateDir: env.stateDir, runId: 'archA1', plan, waveIndex: 1 });
   ok(i1.ok, 'wave1（verify+archive 并行）应集成，改 README 不得被判越域: ' + JSON.stringify(i1.errors ?? []));
@@ -3302,6 +3302,22 @@ t('[R10-A1] archive kind 端到端可用: coverage-gate 过 → buildFixPlan 定
     sourceArtifact: art, scManifest, fixPlan: plan, dispatchRecord: dispatchRecordA1, runManifest: runManifestA1
   });
   ok(pgResult.ok, 'push-guard 全链应放行: ' + pgResult.errors.join(';'));
+});
+
+t('[SC-M3] archive 组越域: 改了非 README.md 的文件 → 必须被拒（write_paths.mode=fixed-list 强制 exact）', () => {
+  // 行为断言，不只是形状断言（lead 判据：形状对了不代表约束在咬）——archive 组的 write_paths
+  // 是脚本给定常量 ['README.md']，changed 集合必须是它的子集，多一个文件就是越域。
+  const env = mkRunEnv({ files: ['README.md', 'other.md'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'a1', sc_ids: ['SC-ARCH'], paths: ['README.md'], archive: true }], [['a1']],
+    [{ id: 'SC-ARCH', kind: 'archive', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'README.md']) }]);
+  FR.initRun({ stateDir: env.stateDir, runId: 'archM3', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'archM3', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  eq(a.allocations[0].write_paths, { mode: 'fixed-list', paths: ['README.md'] }, 'archive 组分配的 write_paths 必须是脚本给定的固定清单');
+  workGroup(env, a.allocations[0], 'other.md', '越域改动\n');
+  const integ = FR.integrate({ stateDir: env.stateDir, runId: 'archM3', plan, waveIndex: 0 });
+  ok(!integ.ok && integ.errors.some((e) => /越域改动/.test(e)), 'archive 组改非 README.md 必须被拒（write_paths.mode=fixed-list 强制）: ' + JSON.stringify(integ.errors ?? []));
 });
 
 t('[R10-A2] hub 门（D1 通用可移除性判据）: 4 条 archive SC 全指向 README.md 合成 1 组，不触发 hub degraded', () => {

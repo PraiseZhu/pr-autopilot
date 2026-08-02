@@ -157,6 +157,9 @@ node scripts/fix-run.mjs allocate --state-dir <st> --run-id <run> --plan fix-pla
 #        不会再因「改动不在 anchor_paths 内」被拒——anchor 是证据不是写集（2026-08-02 拆分）。
 #      verify 类 write_paths.mode='anchor-test-path' —— 仍要求 changed ⊆ write_paths.paths
 #        且全为测试路径（SC-R3-7 加固不变），越域在集成时被拒。
+#      archive 类 write_paths.mode='fixed-list' —— changed ⊆ write_paths.paths，值固定为
+#        ARCHIVE_PATH（README.md，fix-plan.mjs 脚本给定常量，不从 anchor_paths 派生，
+#        全链唯一诚实拥有正向写入清单的场景），改了非 README.md 的文件同样越域被拒（SC-M2）。
 # 3) 集成 = **squash**（owner 决策 D1）: 校验 tip 归属 → 实改交集检测 → 无重叠则 merge 出
 #    最终树后用 commit-tree 打成**单个 squash commit**（group tips 永不进最终祖先——
 #    中间 commit 藏东西再恢复的「净 diff 洗历史」从构造上无处容身，SC-R3-8）
