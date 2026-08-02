@@ -16,8 +16,8 @@
         "properties": {
           "id": { "type": "string", "pattern": "^SC-[A-Za-z0-9._-]+$" },
           "kind": {
-            "enum": ["fix", "verify", "global"],
-            "description": "fix=改代码; verify=纯测试（进最后一波）; global=lead 中央验证步（不派 worker，全 plan ≤1）"
+            "enum": ["fix", "verify", "global", "archive"],
+            "description": "fix=改代码; verify=纯测试（进最后一波）; global=lead 中央验证步（不派 worker，全 plan ≤1）; archive=残余风险登记（文件域由 fix-plan.mjs 固定给 README.md，不从 anchor_paths 派生；进末波与 verify 并行；恰好引用 1 条 finding，hub 门豁免）"
           },
           "finding_ids": {
             "type": "array",

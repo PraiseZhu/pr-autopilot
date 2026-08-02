@@ -9,6 +9,9 @@
 //      verify 的 anchor_paths 必须全命中测试路径模式，否则 fail-closed（防用 verify 位藏实改）
 //   4. global SC 不进波次（lead 中央验证步）
 //   5. 任何 fix/verify SC 引用的 finding 缺 anchor_paths → degraded，不产出可派工 plan
+//   6. archive-wave（R10-A1/A2）: kind=archive 的 SC 文件域固定为 ARCHIVE_PATH（README.md，
+//      不从 anchor_paths 派生），与 verify SC 同进最后一波（互不相交，并行）；
+//      hub 门对 archive 池豁免（多条 archive SC 天然全落在同一路径，设计如此非污染）
 //
 // 单调性: 冲突边由脚本连成，lead 不可拆（拆=切冲突边=并发改同文件）也不可合并独立组。
 import { dirname, join } from 'node:path';
@@ -17,6 +20,9 @@ import { readJson, parseArgs, fail, isMain, hashObject, canonicalJson } from './
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TEST_PATH_RE = /(^|\/)(e2e|fixtures)\/|\.(test|spec)\.[a-z]+$/i;
+// R10-A1: archive SC 的文件域固定值——不从 anchor_paths 派生（那是 finding 本体的锚点，
+// 不是本次要改的文件）。SKILL.md「ARCHIVE 类的收口」机器契约的唯一落点。
+const ARCHIVE_PATH = 'README.md';
 
 // SC-6（R2-P1-3）: capacity 的**唯一可信来源**是宪法层配置文件，planner 与 push-guard
 // 各自独立读取——旧实现 `Number(args.capacity ?? 8)` 是 lead 自报，填 1 就能合法全串行。
@@ -89,6 +95,7 @@ export function buildFixPlan({ artifact, manifest, capacity = null, hubShare = n
   // SC → 文件域（机器派生）
   const fixScs = [];
   const verifyScs = [];
+  const archiveScs = [];
   for (const sc of scs) {
     if (sc.kind === 'global') continue;
     const paths = new Set();
@@ -102,6 +109,12 @@ export function buildFixPlan({ artifact, manifest, capacity = null, hubShare = n
       for (const p of f.anchor_paths) paths.add(p);
     }
     if (paths.size === 0) degraded.push(`SC ${sc.id} 无有效文件域（无法分组）`);
+    if (sc.kind === 'archive') {
+      // R10-A1: finding/anchor_paths 存在性校验（上面）照跑不豁免，但产出的文件域
+      // 固定改写为 ARCHIVE_PATH——archive SC 改的是残余风险登记文档，不是 finding 本体锚点。
+      archiveScs.push({ sc_id: sc.id, paths: [ARCHIVE_PATH] });
+      continue;
+    }
     const rec = { sc_id: sc.id, paths: [...paths].sort() };
     if (sc.kind === 'verify') {
       const bad = rec.paths.filter((p) => !TEST_PATH_RE.test(p));
@@ -112,7 +125,9 @@ export function buildFixPlan({ artifact, manifest, capacity = null, hubShare = n
     }
   }
 
-  // SC-R3-5②: hub 门（fix 与 verify 两池各自查）
+  // SC-R3-5②: hub 门（fix 与 verify 两池各自查）。archive 池豁免（R10-A2）：多条 archive SC
+  // 天然全落在 ARCHIVE_PATH，这是设计如此——不是「广域锚点把并行串行化」的污染信号，
+  // 2 号「拆 finding」的建议在这里不适用。
   degraded.push(...hubViolations(fixScs, hub, 'fix'));
   degraded.push(...hubViolations(verifyScs, hub, 'verify'));
 
@@ -126,11 +141,13 @@ export function buildFixPlan({ artifact, manifest, capacity = null, hubShare = n
   const groups = [...fixGroups];
   const waves = [];
   if (fixGroups.length) waves.push(fixGroups.map((g) => g.id));
-  if (verifyScs.length) {
-    const vGroups = groupByConflict(verifyScs).map((g, i) => ({ id: `v${i + 1}`, ...g, verify: true }));
-    groups.push(...vGroups);
-    waves.push(vGroups.map((g) => g.id));
-  }
+  // R10-A1: archive 组进末波，与 verify 组并行（两者都只需看见前波产物，域互不相交，
+  // 该并行必须并行）——同一个末波数组里既有 v* 也有 a*。
+  const vGroups = verifyScs.length ? groupByConflict(verifyScs).map((g, i) => ({ id: `v${i + 1}`, ...g, verify: true })) : [];
+  const aGroups = archiveScs.length ? groupByConflict(archiveScs).map((g, i) => ({ id: `a${i + 1}`, ...g, archive: true })) : [];
+  groups.push(...vGroups, ...aGroups);
+  const finalWave = [...vGroups, ...aGroups].map((g) => g.id);
+  if (finalWave.length) waves.push(finalWave);
 
   const plan = {
     schema_version: 'v1',
