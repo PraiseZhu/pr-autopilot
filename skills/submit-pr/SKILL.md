@@ -63,14 +63,20 @@ bundle = base_sha + candidate_sha + PR 标题/正文 + touches_ui + matched_path
 修复串行化，填成目录/不存在路径直接 degraded。影响范围说明写 `scope_note`（不进冲突图）。
 - 两对抗席：七面（A 正确性/B UI+无障碍/C 测试/D 文档/E 安全/F 范围/G 声称核实）逐面 `pass/fail/n_a`+证据；B 面仅当脚本判非 UI 才许 n_a。
 - 第三席：只填相关 faces（F/G/E/D 为主）+ `gate_checks[]`（产品/架构过程门专用通道，不得用无类型 finding 绕过归属规则）。
-- 首轮穷举（④）+ **加固清单覆盖率契约**：R1 两对抗席**必须逐条扫** `references/hardening-checklist.md`
-  的九类核对点（不是「看到什么报什么」），并在 verdict 里对每一类标 `covered/n_a`——目的是把
+- 首轮穷举（④）+ **加固清单覆盖率契约（机器强制，不是纸面约定）**：R1 两对抗席
+  （`claude-adversarial`/`codex-adversarial`）**必须逐条扫** `references/hardening-checklist.md`
+  的九类核对点（不是「看到什么报什么」），并在 verdict 里用机器字段
+  `hardening_coverage: [{class_id:1..9, result:covered|n_a, evidence}]` 逐类标注——目的是把
   「既有代码的洞」在**一轮**里挖净，而不是分轮细水长流（R3 的 11 条本可更多提前到 R1）。
-  后续轮冒出"首轮就能看到但没报"的 → 该席本轮 `degraded`。
+  `verdict-validate.mjs` 对 `round===1` 的这两席强制该字段**恰好 9 项、class_id 1〜9 各恰好
+  一次、`evidence` 非空**——缺项/漏项/重复 class_id 一律 schema/跨字段校验失败 →
+  `runConsensusGate` fail-closed（R10-A3：此前只在文档里写"必须标"，没有任何字段/校验落地，
+  三份完全不带该字段的 verdict 照样能拿到 `gate_result: pass`）。第三席与 `round>=2` 不强制
+  （复核轮不必重扫穷举面）。后续轮冒出"首轮就能看到但没报"的 → 该席本轮 `degraded`。
 - finding 归属（⑪）：恰好一个 `primary_face`；白名单内映射不进任何面 → `taxonomy_gap` + degraded 停轮，禁止丢弃。
 - Blocker 白名单（③）：仅 active path 失败 / SC 未达成 / 状态污染 / 安全风险 / 核心验证缺失 / 范围违规可阻塞；风格偏好等只进 Residual Risk 附录，不计入共识。
 
-**lead 职责**：只做争议仲裁（质询 ≤3 轮），**不改代码、不代关 finding、不宣布共识**。
+**lead 职责**：只做争议仲裁（质询 ≤3 轮——这是**仲裁**轮上限，**不计**修复轮/delta 复核轮），**不改代码、不代关 finding、不宣布共识**。
 Round 2+ 只对账修复情况 + 审 delta（含 SC/标题/正文/验证声称的元数据 diff，G 面不豁免）；禁止重审未改代码。**收口/螺旋/卡死的判据统一见 Phase 2c 收尾「收敛判据与收口」**（收口仍走 consensus PASS，靠 ARCHIVE 类文档化接受终止循环）。
 
 **共识 = 脚本判**：
@@ -81,12 +87,19 @@ node scripts/consensus-gate.mjs v1.json v2.json v3.json --bundle bundle.json --r
 `anchor_paths` ⊆ 实改集——tracked-but-unchanged 的 hub 路径在入口就被拦，不依赖调用方自觉。
 四 conjunct 缺一不可（同 input hash / union 每条被 origin close / 三 verdict APPROVED / 全部 gate_checks∈{pass,n_a}）。任何席 degraded 或 schema 不合 → fail-closed。
 
+> **`closed` 的语义（易误读，显式定义）**：conjunct② 的 `status=closed` 意思是「该 finding 已被其
+> origin 席**裁决为真实、且同意进入 SC 修复台账**」，**不是「代码已经修好」**。所以修复**前**的源共识
+> artifact 在构造上是存在的（Phase 2b/2c 正是拿它当输入）。误读成「已修好」会推出「源共识不可能存在」
+> 的假结论——另一会话 2026-08-02 就这么栽过一次。「共识确认的每条 finding 提炼 SC」这句话本身也蕴含
+> 该语义：若 closed = 已修好，这句话就没有对象。
+
 ## Phase 2b — SC 提炼 + 覆盖门（共识后，自动衔接）
 
 **owner 定案：共识 → 修复不需要 owner 授权。**
 lead 对共识确认的每条 finding 提炼可验证 SC，产出 **SC manifest**（`schemas/sc-manifest.schema.json` **v2**）：
-每条 SC 带 `id / kind(fix|verify|global) / finding_ids[] / change / holds / verify`，manifest 头部绑
-**源共识** `consensus_artifact_hash`。SC 例句库见 `references/sc-examples.md`。
+每条 SC 带 `id / kind(fix|verify|global|archive) / finding_ids[] / change / holds / verify`，manifest 头部绑
+**源共识** `consensus_artifact_hash`。SC 例句库见 `references/sc-examples.md`。`archive` 的机器契约见
+Phase 2c 收尾「ARCHIVE 类的收口」。
 **verify 是结构化 argv 配方，不是命令行文本**（SC-R3-4，owner 决策 D2）：
 ```json
 "verify": { "cmd": "npm", "args": ["test", "--", "-t", "archiveCanvas"] }
@@ -178,24 +191,51 @@ node scripts/fix-run.mjs finalize --state-dir <st> --run-id <run>   # 输出 run
 > 直接发车的路径**，写「不等 APPROVED 就 push」= 文档骗自己（正是加固清单第 7 条的坑）。
 >
 > 真正的解法不是绕闸，是**让审查席有正当理由 close**：把 finding 分两类处置，`[ARCHIVE]` 类的
-> **修复动作本身就是"写进 README 残余登记"**（文档化接受即解决，R9 已实证此路径）。
+> **修复动作本身就是"写进 README 残余登记"**，且这条"修复"跟 `[MUST-FIX]` 走**同一条 fix-run
+> 编排链**（文档化接受即解决，R9 已实证此路径；R10 把它接成机器可执行的 `kind=archive` SC，
+> 不再是「文档说了但脚本走不通」的纸面约定）。
 
 每轮 delta 复核，审查席对每条存活 finding 标 `[MUST-FIX]` 或 `[ARCHIVE-eligible]`：
 
 1. **`[ARCHIVE-eligible]` 判据**（四条全中）：① 窄面（不改主要控制/数据流，只是并发窗口/异常路径的窄角）；
    ② 限于**本修复周期新写的代码**（git 可查，不是既有面）；③ 非数据损失、非泄密、非安全绕过、
    非 active-path 失败、非 T2 冒充；④ 审查席给出了**它自己建议的残余登记文案**。
-2. **ARCHIVE 类的收口**：把该文案**逐字写进 `README.md` 残余风险登记**（这一步 = 该 finding 的修复，
-   不需 owner 授权，同 Phase 2b）→ 下一轮 delta 审查席据此把它 `status=closed`（已由文档化接受解决）
+2. **ARCHIVE 类的收口（机器契约，不是自由发挥）**：lead 为该 finding 提炼一条 `kind=archive` 的 SC
+   （`schemas/sc-manifest.schema.json` v2），把审查席给的文案原样填进该 SC 的 `change`/`holds`，
+   `verify` 用结构化 argv 校验文案已落地，例：
+   ```json
+   { "id": "SC-ARCH-1", "kind": "archive", "finding_ids": ["<fid>"],
+     "change": "把残余风险文案写进 README.md", "holds": "README.md 含约定文案",
+     "verify": { "cmd": "grep", "args": ["-q", "<残余风险关键文案>", "README.md"] } }
+   ```
+   `fix-plan.mjs` 对 `archive` SC 的文件域**固定给 `README.md`**（不从 `anchor_paths` 派生——那是
+   finding 本体的锚点，不是本次要改的文件），该组进**末波**、与 `verify` 组并行（两者都只需看见
+   前波产物、域互不相交，该并行必须并行）；多条 archive SC 天然都落在 `README.md`，
+   **hub 路径门对 archive 池豁免**（不是污染，是设计如此——2 号「拆 finding」的建议在这里不适用）。
+   coverage-gate 对 `archive` SC 与 `fix`/`verify` 同等要求：恰好引用 1 条 finding。
+   worker 走**与 `[MUST-FIX]` 完全相同的 fix-run 编排**：`allocate` 分到自己的 worktree
+   （`allowed_paths` 只有 `README.md`）→ 把文案写进 `README.md` → commit → `integrate` →
+   orchestrator 复跑 `grep` 验证通过。不需 owner 授权（同 Phase 2b）→ 下一轮 delta 审查席看到
+   README 已含约定文案 + verify 通过，据此把该 finding `status=closed`（已由文档化接受解决）
    → consensus-gate 正常 PASS → push。**闸没绕，循环终止**（因为文档化不产生新代码 = 不长新 finding）。
 3. **`[MUST-FIX]` 仍须改代码**：回 Phase 2c 头部，**按类套形状重做**（不是打补丁）。
-4. **补丁螺旋探测（替代数字轮次上限）**：连续 **2 轮** delta 都「只有窄面 `[MUST-FIX]` 且全打在
-   **上一轮新写的代码**上」= 补丁螺旋 → **强制**回「修复方设计约束」把该模块**所有异常出口一次性重写**
-   （不是再加 guard）；若本轮已按类重写过仍复现同类窄面 → 该条**降级为 `[ARCHIVE-eligible]`** 走第 2 条。
+4. **补丁螺旋探测（替代数字轮次上限）**——触发要求**同一问题谱系**，不是「凑够 2 轮窄面」：
+   连续 2 轮的窄面 `[MUST-FIX]` 必须指向**同一模块 + 同一操作 + 同一失败形状**（对账依据：上一轮
+   finding id + `prev..current` 的行级 provenance；两个互不相关的窄面**不算**螺旋）→ 强制回
+   「修复方设计约束」把该模块**所有异常出口一次性重写**（不是再加一个 guard）。
+   **重写后仍复现同类窄面 → 不自动降级**：必须**重新逐项评估第 1 条的四项资格**，任一不满足
+   （尤其③：数据损失/泄密/安全绕过/active-path 失败/T2 冒充）→ **继续 `[MUST-FIX]`**；
+   同一谱系累计 3 次整块重写仍无进展 → 走第 5 条报 owner，**不许自动 ARCHIVE 掉**。
 5. **真·卡死兜底**：`[MUST-FIX]` 的 **blocker/major** 连续 2 轮不减（不是窄面）→ 停，报 owner。
 
-区分：4 治「越修越窄的补丁螺旋」（收敛中，用重写或转 ARCHIVE 了结）；5 治「真修不动」（不收敛，交人）。
+区分：4 治「越修越窄的补丁螺旋」（收敛中，用整块重写了结）；5 治「真修不动」（不收敛，交人）。
 **绝不**混为「跑够 N 轮就停」的数字闸——数字闸要么切早漏真问题，要么切晚继续螺旋。
+
+> **与 plan.md 的数字上限冲突已裁决（owner 2026-08-02）**：`docs/plan.md` SP-2 及其流程图写的
+> 「≤3 轮未收敛停给 owner」（plan.md:37 / 69 / 95 / 131）**本节取代之**——按形状判据收敛，不按轮数硬停。
+> plan.md 的该数字保留为历史记录，不再作为执行契约。
+> 另需区分：`SKILL.md` Phase 2「lead 争议质询 ≤3 轮」是**仲裁**轮次上限（lead 与审查席就某条 finding
+> 是否成立的往复），**不计**修复轮/delta 复核轮——两者互不换算。
 
 ## Phase 3 — push + 注册（lead 指定一个修复 worker 执行；并行场景选其一即可）
 
