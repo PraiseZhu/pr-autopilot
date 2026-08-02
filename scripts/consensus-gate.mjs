@@ -130,6 +130,13 @@ export function runConsensusGate(verdicts, opts = {}) {
           severity: fd.severity,
           anchor: fd.anchor,
           anchor_paths: [], // v2: 各 origin 并集，随 artifact hash——下游换路径即断裂
+          // SC-B1（D1）: invariant/family_id 冻结自**首个**（按 verdicts 到达顺序）提供该字段的
+          // origin——与 anchor/primary_face 同一处理方式（只有 severity 特殊取最高，见下方）。
+          // 归属本就发生在 origin 席自己的 verdict 里（同 verdict 内 family_id 已由
+          // verdict-validate 强制自洽），这里只做「冻结第一手」，不做跨 origin 的语义合并/裁决。
+          // suggestion 级 finding 不强制该字段——不带就不带，不写 null（schema 类型是 string）。
+          ...(typeof fd.invariant === 'string' && fd.invariant ? { invariant: fd.invariant } : {}),
+          ...(typeof fd.family_id === 'string' && fd.family_id ? { family_id: fd.family_id } : {}),
           status: 'closed' // 走到这里必然全 closed（conjunct② 已断言）
         });
       }

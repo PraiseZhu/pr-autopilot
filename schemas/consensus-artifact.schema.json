@@ -34,6 +34,8 @@
           "primary_face": { "type": "string" },
           "severity": { "type": "string" },
           "anchor": { "type": "string" },
+          "invariant": { "type": "string", "minLength": 1, "maxLength": 120, "description": "SC-B1: 冻结自首个 origin 提供的值（consensus-gate.mjs），suggestion 级 finding 可不带。" },
+          "family_id": { "type": "string", "minLength": 1, "description": "SC-B1: 冻结自首个 origin 提供的值（consensus-gate.mjs），suggestion 级 finding 可不带。" },
           "status": { "enum": ["open", "closed"] }
         }
       }

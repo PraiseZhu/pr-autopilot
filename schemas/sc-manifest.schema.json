@@ -28,6 +28,14 @@
           },
           "change": { "type": "string", "minLength": 1 },
           "holds": { "type": "string", "minLength": 1 },
+          "invariant": {
+            "type": "string", "minLength": 1, "maxLength": 120,
+            "description": "SC-B1（D1）: 必须逐字等于其引用 finding 在共识产物（consensus artifact）里冻结的 invariant——lead 只能复制，不得自填/改写。仅当引用的 canonical finding 是 actionable（blocker/major）时强制必填并校验相等；suggestion 级不强制（sc-coverage-gate.mjs 为准，JSON Schema 无法表达跨对象引用校验）。"
+          },
+          "family_id": {
+            "type": "string", "minLength": 1,
+            "description": "SC-B1（D1）: 必须逐字等于其引用 finding 在共识产物里冻结的 family_id，同 invariant 同等强制条件与校验位置（sc-coverage-gate.mjs）。"
+          },
           "verify": {
             "type": "object",
             "required": ["cmd", "args"],
