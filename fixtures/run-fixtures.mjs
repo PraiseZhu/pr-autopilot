@@ -36,7 +36,7 @@ import { runDigest } from '../scripts/inbox-digest/runner.mjs';
 import { appendLedger } from '../scripts/evolution/ledger-append.mjs';
 import { clusterLedger, signConfirm } from '../scripts/evolution/cluster.mjs';
 import { checkScCoverage } from '../scripts/sc-coverage-gate.mjs';
-import { buildFixPlan, computeFixPlanHash } from '../scripts/fix-plan.mjs';
+import { buildFixPlan, computeFixPlanHash, hubViolations } from '../scripts/fix-plan.mjs';
 import { normalizeRepoPath } from '../scripts/lib/common.mjs';
 import { recoverFromReceipt } from '../scripts/pr-watch/finalize.mjs';
 import { foldDispatchStates } from '../scripts/pr-watch/budget.mjs';
@@ -3284,7 +3284,7 @@ t('[R10-A1] archive kind 端到端可用: coverage-gate 过 → buildFixPlan 定
   ok(pgResult.ok, 'push-guard 全链应放行: ' + pgResult.errors.join(';'));
 });
 
-t('[R10-A2] hub 门对 archive 池豁免: 4 条 archive SC 全指向 README.md 合成 1 组，不触发 hub degraded', () => {
+t('[R10-A2] hub 门（D1 通用可移除性判据）: 4 条 archive SC 全指向 README.md 合成 1 组，不触发 hub degraded', () => {
   const art = artifactWithFindings([
     { sev: 'major', paths: ['src/m0.ts'] },
     { sev: 'major', paths: ['src/m1.ts'] },
@@ -3307,6 +3307,51 @@ t('[R10-A2] hub 门对 archive 池豁免: 4 条 archive SC 全指向 README.md �
   eq(r2.plan.groups[0].paths, ['README.md']);
   eq(r2.plan.waves.length, 1, '无 fix/verify SC 时只有 archive 末波');
   eq(r2.plan.waves[0], [r2.plan.groups[0].id]);
+});
+
+// R10-A2'（owner 2026-08-02，复核 mivo-canvas #419 死锁后拍板换判据）: hubViolations 从
+// 「路径占比」换成「可移除性」——6 个场景各自独立成一条 fixture（不合并进一个 t()），
+// 使每条判据分支的红/绿在回归输出里能被逐条精确定位，不被同一 t() 内先失败的断言掩盖。
+const HUB_SHARE_D1 = 0.5; // 与 config/orchestration.json 的 hub_path_max_share 一致，判据变了配置语义不变
+
+t("[R10-A2'-1] hubViolations 场景1 R3 真 hub 污染: 8 条 fix SC 各带共享 .gitignore → 必须 degraded（原有保护不能被删）", () => {
+  const s1 = Array.from({ length: 8 }, (_, i) => ({ sc_id: `s1-${i}`, paths: [`src/u${i}.ts`, '.gitignore'] }));
+  const r1 = hubViolations(s1, HUB_SHARE_D1, 'fix');
+  ok(r1.length > 0 && r1.some((x) => x.includes('.gitignore')), '场景1 R3 真 hub 污染必须 degraded（原有保护）: ' + JSON.stringify(r1));
+});
+
+t("[R10-A2'-2] hubViolations 场景2 单文件 PR 死锁: 3 条 fix SC 全锚同 1 文件 → 必须放行（D1 核心，mivo-canvas #419 实测）", () => {
+  const s2 = Array.from({ length: 3 }, (_, i) => ({ sc_id: `s2-${i}`, paths: ['src/foo.ts'] }));
+  const r2h = hubViolations(s2, HUB_SHARE_D1, 'fix');
+  eq(r2h.length, 0, '场景2 单文件 PR 死锁必须放行（唯一锚点=真耦合，不是广域误报）: ' + JSON.stringify(r2h));
+});
+
+t("[R10-A2'-3] hubViolations 场景3 archive 池: 4 条 archive SC 全锚 README.md → 必须放行（D2: 通用判据自然覆盖）", () => {
+  const s3 = Array.from({ length: 4 }, (_, i) => ({ sc_id: `s3-${i}`, paths: ['README.md'] }));
+  const r3 = hubViolations(s3, HUB_SHARE_D1, 'archive');
+  eq(r3.length, 0, '场景3 archive 池必须放行（不需要专门豁免分支）: ' + JSON.stringify(r3));
+});
+
+t("[R10-A2'-4] hubViolations 场景4 混合真耦合: 两条 [foo.ts,shared.ts] + 一条 [shared.ts] → 必须放行（第三条唯一锚点即 shared.ts）", () => {
+  const s4 = [
+    { sc_id: 's4-0', paths: ['foo.ts', 'shared.ts'] },
+    { sc_id: 's4-1', paths: ['foo.ts', 'shared.ts'] },
+    { sc_id: 's4-2', paths: ['shared.ts'] }
+  ];
+  const r4 = hubViolations(s4, HUB_SHARE_D1, 'fix');
+  eq(r4.length, 0, '场景4 混合真耦合必须放行（s4-2 唯一锚点就是 shared.ts）: ' + JSON.stringify(r4));
+});
+
+t("[R10-A2'-5] hubViolations 场景5 混合假 hub: 4 条 SC 各带 [各自文件, shared.ts] → 必须 degraded（每条都能脱离 shared.ts 独立存在）", () => {
+  const s5 = Array.from({ length: 4 }, (_, i) => ({ sc_id: `s5-${i}`, paths: [`m${i}.ts`, 'shared.ts'] }));
+  const r5 = hubViolations(s5, HUB_SHARE_D1, 'fix');
+  ok(r5.length > 0 && r5.some((x) => x.includes('shared.ts')), '场景5 混合假 hub 必须 degraded: ' + JSON.stringify(r5));
+});
+
+t("[R10-A2'-6] hubViolations 场景6 不到 ≥3 下限: 2 条 SC 共享同一路径 → 必须放行（原有下限保护）", () => {
+  const s6 = [{ sc_id: 's6-0', paths: ['shared6.ts'] }, { sc_id: 's6-1', paths: ['shared6.ts'] }];
+  const r6 = hubViolations(s6, HUB_SHARE_D1, 'fix');
+  eq(r6.length, 0, '场景6 低于 ≥3 下限必须放行（原有下限保护）: ' + JSON.stringify(r6));
 });
 
 
