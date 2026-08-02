@@ -4283,6 +4283,57 @@ t('[SC-B1] fix-orchestrate.familyContext: 同 family 的其它 manifestation 跨
   eq(withoutCtx.allocations[0].family_context, null, '不传 artifact/scManifest 时应为 null（向后兼容 v1 行为）');
 });
 
+// family_id 集合（去重）——SKILL.md repair-mode watermark 描述的判据本体：
+// 「对照共识产物 canonical_findings 的 family_id」判断相邻两个 candidate 之间是否出现新 family。
+// watermark 本身没有代码实现（是 SKILL.md 里 lead 遵循的过程规则，没有脚本在数 candidate），
+// 这里验证的是它的**机器前提**：给定两份 consensus artifact，能否机器化判定「是否出现新 family」。
+function familyIdSet(artifact) {
+  return new Set((artifact.canonical_findings ?? []).map((f) => f.family_id).filter(Boolean));
+}
+function newFamilies(prevArtifact, nextArtifact) {
+  const prev = familyIdSet(prevArtifact);
+  return [...familyIdSet(nextArtifact)].filter((fid) => !prev.has(fid));
+}
+
+t('[SC-B1-WM] repair-mode watermark 的机器前提: family_id 已可从 canonical_findings 取得，「是否出现新 family」可机器判定（原 SKILL.md 脚手架条款的解除对象）', () => {
+  // candidate-N: 两个既有 family（FAM-X / FAM-Z）
+  const artN = artifactWithFindings([
+    { sev: 'major', paths: ['src/x.ts'], invariant: 'inv-x', family_id: 'FAM-X' },
+    { sev: 'major', paths: ['src/z.ts'], invariant: 'inv-z', family_id: 'FAM-Z' }
+  ]);
+  // candidate-N+1（出现新 family）: 沿用 FAM-X/FAM-Z，新增 FAM-Y
+  const artNextNew = artifactWithFindings([
+    { sev: 'major', paths: ['src/x.ts'], invariant: 'inv-x', family_id: 'FAM-X' },
+    { sev: 'major', paths: ['src/z.ts'], invariant: 'inv-z', family_id: 'FAM-Z' },
+    { sev: 'blocker', paths: ['src/y.ts'], invariant: 'inv-y', family_id: 'FAM-Y' }
+  ]);
+  // candidate-N+1'（无新 family）: family 集合是 N 的真子集（只剩 FAM-X）
+  const artNextSubset = artifactWithFindings([
+    { sev: 'major', paths: ['src/x.ts'], invariant: 'inv-x', family_id: 'FAM-X' }
+  ]);
+
+  // ① 三份都真走了 validator + consensus-gate（不是手搭的假 artifact），且都真达成共识
+  for (const [label, art] of [['N', artN], ['N+1(new)', artNextNew], ["N+1'(subset)", artNextSubset]]) {
+    eq(art.gate_result, 'pass', `candidate-${label} 应真实达成共识: ` + JSON.stringify(art.fail_reasons ?? []));
+  }
+
+  // ② canonical_findings 确实携带 family_id——不是被可选跳过（脚手架条款要解除的核心前提）
+  for (const [label, art] of [['N', artN], ['N+1(new)', artNextNew], ["N+1'(subset)", artNextSubset]]) {
+    ok(art.canonical_findings.length > 0, `candidate-${label} 应至少有一条 canonical finding`);
+    for (const f of art.canonical_findings) {
+      ok(typeof f.family_id === 'string' && f.family_id.length > 0, `candidate-${label} 的 canonical finding ${f.id} 必须真携带 family_id（不是「暂不可判」的字段缺失态）`);
+    }
+  }
+
+  // ③ 由 N 与 N+1 可判出「出现了新 family Y」——水位线所需输入确实可得
+  const detectedNew = newFamilies(artN, artNextNew);
+  eq(detectedNew, ['FAM-Y'], '对照 canonical_findings 的 family_id 必须能判出新 family FAM-Y（水位线机器前提成立）');
+
+  // ④ 反向: N+1' 的 family 集合是 N 的子集 → 判出「无新 family」
+  const detectedNone = newFamilies(artN, artNextSubset);
+  eq(detectedNone, [], 'family 集合是子集时必须判出「无新 family」（不得把子集误判成新 family）');
+});
+
 t('[SC-B4] hardening-checklist.md 文档一致性: 十类齐全 + 第 10 类判据所有权/跨门兼容展开 + hub⊥coverage 实证案例', () => {
   const doc = readFileSync(join(S, '../skills/submit-pr/references/hardening-checklist.md'), 'utf8');
   ok(doc.includes('| 10 |') && doc.includes('判据所有权与跨门兼容'), '文档必须有第 10 类表格行');

@@ -330,20 +330,6 @@ marker 段 `<!-- pr-autopilot:invariants:start/end -->` 内是脚本生成的 MU
 candidate 不改变它们的判据（与本节「反猫捉老鼠」立场一致：数字从不替代形状判断，只是在形状
 判断之外加一层「至少做过一次结构化止损」的兜底）。
 
-> **临时条款（脚手架，带显式解除条件，不是永久措辞）**：本节写下时 `family_id` 尚未落地到
-> `schemas/consensus-artifact.schema.json` 的 `canonical_findings`——在此之前，「对照 family_id
-> 判断是否新 family」这件事**暂不可判**，按 fail-closed 处理：**视为「暂不可判」而不是「无新
-> family」**，即第 5/10 个 candidate 的强制动作仍按上面文字生效，不因字段缺失而失效。
-> **解除条件（谁落地 `family_id` 谁必须做，不是可选项）**：`canonical_findings` 落地
-> `family_id` 字段后，本条临时条款**立即失效并必须从本文件删除**，同时必须在
-> `fixtures/run-fixtures.mjs` 补一条与 `[R10-A4]` 同款方法的新 fixture（自定 test id，不要
-> 复用已被占用的 `[R10-A4]`）：按本节描述构造带不同 `family_id` 的 verdict/consensus
-> manifest，真跑相关判定逻辑，验证「第 5/10 个 candidate 触发对应强制动作」这一行为本身能
-> 通过，不能只 grep 本节文字。**在没有这条 fixture 之前，删掉本临时条款本身也不允许**——
-> 否则水位线判据会从「暂不可判」这个显式脚手架状态，静默退化成「永远无新 family」的隐性
-> fail-open，watermark 从此再也不会触发，而文档读起来却像已经生效——这正是本条款要杜绝的
-> 情形。
-
 > **与 plan.md 的数字上限冲突已裁决（owner 2026-08-02）**：`docs/plan.md` SP-2 及其流程图写的
 > 「≤3 轮未收敛停给 owner」（plan.md:37 / 69 / 95 / 131）**本节取代之**——按形状判据收敛，不按轮数硬停；
 > repair-mode watermark 的第 5/10 个 candidate 同样不是该数字上限的复活，只切换修复模式（见上）。
