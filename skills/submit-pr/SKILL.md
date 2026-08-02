@@ -65,18 +65,30 @@ bundle = base_sha + candidate_sha + PR 标题/正文 + touches_ui + matched_path
 mivo-canvas PR #419 实战反馈）：证据可能落在只读症状文件，真正要改的文件可能根本不在证据里——
 写入许可另见 Phase 2c 的 `write_paths`（脚本按 SC kind 推导，reviewer/lead 不得填写，
 verdict-validate/sc-coverage-gate 对该字段一律拒收）。
+**actionable finding 必须携带 `invariant`+`family_id`**（SC-B1，owner 2026-08-02 D1）：blocker/major
+级 finding 除 `anchor_paths` 外，还必须给 `invariant`（≤120 字，一句话「被破坏的不变量」）与
+`family_id`（同 verdict 内归族标识，即便只有一处表现也要归——「自成一族」）。**归属发生在 finding
+生成时（审查席），不是修复计划时（lead）**：lead 在 Phase 2b 提炼 SC 时只能**逐字复制**这两个
+字段，不得自填/改写（sc-coverage-gate.mjs 强制逐字相等，fail-closed）。suggestion 级不强制。
+同一 family_id 下的 invariant 必须逐字一致（同 verdict 内自洽，`verdict-validate.mjs` 强制）——
+机器只做「格式/引用合法、逐字相等」，「这几处是不是真的同族」永远是审查席的语义判断，机器不裁决、
+也不据此合并 SC（D2：family 关系通过字段流转，不通过合并 SC，SC↔finding 双射不变）。
 - 两对抗席：七面（A 正确性/B UI+无障碍/C 测试/D 文档/E 安全/F 范围/G 声称核实）逐面 `pass/fail/n_a`+证据；B 面仅当脚本判非 UI 才许 n_a。
 - 第三席：只填相关 faces（F/G/E/D 为主）+ `gate_checks[]`（产品/架构过程门专用通道，不得用无类型 finding 绕过归属规则）。
 - 首轮穷举（④）+ **加固清单覆盖率契约（机器强制，不是纸面约定）**：R1 两对抗席
   （`claude-adversarial`/`codex-adversarial`）**必须逐条扫** `references/hardening-checklist.md`
-  的九类核对点（不是「看到什么报什么」），并在 verdict 里用机器字段
-  `hardening_coverage: [{class_id:1..9, result:covered|n_a, evidence}]` 逐类标注——目的是把
+  的十类核对点（不是「看到什么报什么」），并在 verdict 里用机器字段
+  `checklist_version`（须等于 `scripts/lib/hardening-registry.mjs` 的当前版本）+
+  `hardening_coverage: [{class_id:1..10, result:covered|n_a, evidence}]` 逐类标注——目的是把
   「既有代码的洞」在**一轮**里挖净，而不是分轮细水长流（R3 的 11 条本可更多提前到 R1）。
-  `verdict-validate.mjs` 对 `round===1` 的这两席强制该字段**恰好 9 项、class_id 1〜9 各恰好
-  一次、`evidence` 非空**——缺项/漏项/重复 class_id 一律 schema/跨字段校验失败 →
-  `runConsensusGate` fail-closed（R10-A3：此前只在文档里写"必须标"，没有任何字段/校验落地，
-  三份完全不带该字段的 verdict 照样能拿到 `gate_result: pass`）。第三席与 `round>=2` 不强制
-  （复核轮不必重扫穷举面）。后续轮冒出"首轮就能看到但没报"的 → 该席本轮 `degraded`。
+  `verdict-validate.mjs` 对 `round===1` 的这两席强制 `checklist_version` 等于当前值 +
+  `hardening_coverage` **恰好 10 项、class_id 1〜10 各恰好一次、`evidence` 非空**——版本不符
+  单独报「清单版本过期需重审」（不与「缺 N 项」的普通计数错误混淆，D5：9→10 是 exact 集合变更，
+  2026-08-02 SC-B4 迁移，旧的 9 项 verdict 一律拒收要求重审，不静默放行）；缺项/漏项/重复
+  class_id 同样一律 schema/跨字段校验失败 → `runConsensusGate` fail-closed（R10-A3：此前只在
+  文档里写"必须标"，没有任何字段/校验落地，三份完全不带该字段的 verdict 照样能拿到
+  `gate_result: pass`）。第三席与 `round>=2` 不强制（复核轮不必重扫穷举面）。后续轮冒出"首轮
+  就能看到但没报"的 → 该席本轮 `degraded`。
 - finding 归属（⑪）：恰好一个 `primary_face`；白名单内映射不进任何面 → `taxonomy_gap` + degraded 停轮，禁止丢弃。
 - Blocker 白名单（③）：仅 active path 失败 / SC 未达成 / 状态污染 / 安全风险 / 核心验证缺失 / 范围违规可阻塞；风格偏好等只进 Residual Risk 附录，不计入共识。
 
@@ -104,6 +116,11 @@ lead 对共识确认的每条 finding 提炼可验证 SC，产出 **SC manifest*
 每条 SC 带 `id / kind(fix|verify|global|archive) / finding_ids[] / change / holds / verify`，manifest 头部绑
 **源共识** `consensus_artifact_hash`。SC 例句库见 `references/sc-examples.md`。`archive` 的机器契约见
 Phase 2c 收尾「ARCHIVE 类的收口」。
+**先归因，再写 SC**（SC-B1）：finding 是 actionable（blocker/major）时，提炼 SC 前先看它的
+`invariant`/`family_id`——**即便这条 finding 在本轮只有一处表现（family 里只有它自己），也要把这
+两个字段逐字复制进对应 SC**，不是「只有多处表现才需要归因」。lead 不得改写这两个字段的文本，
+也不得借「合并同 family 的多条 finding」把它们塞进一条 SC（SC↔finding 双射不变，D2）——
+`sc-coverage-gate.mjs` 会拿 SC 的值与共识产物里冻结的值逐字比对，任何篡改/遗漏 fail-closed。
 **verify 是结构化 argv 配方，不是命令行文本**（SC-R3-4，owner 决策 D2）：
 ```json
 "verify": { "cmd": "npm", "args": ["test", "--", "-t", "archiveCanvas"] }
@@ -146,11 +163,16 @@ node scripts/fix-run.mjs init --state-dir <st> --run-id <run> --repo-dir . \
   --plan fix-plan.json --sc-manifest sc-manifest.json --source-artifact consensus.json \
   --feature-branch <branch>
 # 1) 本波分配隔离 worktree（每组一个；base 自动取 wave0=source / waveK=上一波集成 tip）
+#    --artifact/--sc-manifest 可选（须与 init 绑定的 hash 一致，否则 fail-closed）：传了才
+#    产出 family_context（SC-B1），不传即 v1 行为，分组本身不受影响。
 node scripts/fix-run.mjs allocate --state-dir <st> --run-id <run> --plan fix-plan.json \
-  --wave <k> --worktree-root ../.fix-wt
+  --wave <k> --worktree-root ../.fix-wt [--artifact consensus.json --sc-manifest sc-manifest.json]
 # 2) 按输出的 allocations 一次 create_workers 并行开出（组数即 worker 数，拉满 capacity）
 #    每包: 本组 SC 子集 + 自己的 worktree 路径 + anchor_paths（证据/分组输入，仅供参考，
-#    不是写入许可）+ write_paths（脚本按 kind 推导的写入约束）+ goal --until-sc
+#    不是写入许可）+ write_paths（脚本按 kind 推导的写入约束）+ family_context（SC-B1，
+#    allocate 传了 --artifact/--sc-manifest 才会有：本 SC 所属 family 的全部已知 manifestation
+#    ——含各自 finding_id/已分到的 sc_id/anchor_paths + 一段审计指令文本，要求 worker 除已点名
+#    路径外还要审计该不变量的未点名处，不得只按分给自己的窄路径打补丁）+ goal --until-sc
 #    worker 在自己 worktree 内 commit：
 #      fix 类 write_paths.mode='isolated' —— 不设清单，写入边界只靠独立 worktree +
 #        集成期真实 diff 重叠检测兜底（overlap → fail-closed 转串行重派，SC-R3-9）；
@@ -190,6 +212,24 @@ node scripts/fix-run.mjs finalize --state-dir <st> --run-id <run>   # 输出 run
 - 收尾 `fix-run.mjs cleanup --state-dir <st> --run-id <run>` 回收本 run 全部 worktree/分支——
   回收对象**只从 run manifest 的 allocation 记录枚举**（caller 不传路径/plan），每项做
   git 登记 + common-dir 归属 + 检出分支三重校验，归属不符连分支都不删（SC-R3-1）
+
+**PR body 不变量锚点先生成，delta review 才能开始**（SC-B2，时序硬约束）：
+`scripts/review-input-hash.mjs` 早就把 `pr_body` 纳入了 `review_input_hash`——这意味着三审审的不
+只是代码 diff，也审 PR body 本身。所以在算 delta 轮的新 `bundle`/`review_input_hash` **之前**，
+lead 必须先跑：
+```
+node scripts/pr-body.mjs --artifact consensus.json --sc-manifest sc-manifest.json \
+  [--existing-body <当前 PR body 文件>] > new-body.txt
+```
+把输出写回 PR body（已存在 PR 时用 `gh pr edit --body-file`——`pr-body.mjs` 只做**幂等替换**:
+marker 段 `<!-- pr-autopilot:invariants:start/end -->` 内是脚本生成的 MUST-FIX/ARCHIVE 清单
+（按 family_id 去重列 invariant + 全部 manifestation；ARCHIVE 措辞是「已登记接受」，不是
+「已修复」；不外泄 anchor_paths 之外的证据原文），marker 外的 owner 手写正文原样保留）。
+**新 body 定稿后才能把它填进 delta 轮的 `bundle.pr_body` 去算新 `review_input_hash`**——
+三席审的必须是含锚点段的这份 body，不是审完之后才补生成。Phase 3 `gh pr create/edit` 只能提交
+**这份已审、hash 对得上的 body**；如果审完之后 body 又被改了（哪怕只改了 marker 外的 owner 手写
+部分），`review_input_hash` 就变了，视为输入漂移，必须重审——不得「反正锚点段是自动生成的，随时
+能重刷」。
 
 新 candidate SHA 后 → **三审 delta 复核**：
 - 两对抗席只对账 findings 修没修 + delta 有无新问题，禁重审未改代码；
