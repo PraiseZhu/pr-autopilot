@@ -14,8 +14,8 @@
 // push-guard 的 lineage 校验退化为精确集合判定（SC-R3-8）。
 // 主 checkout 零接触: 全程不在主 repoDir checkout/detach（SC-R3-11）。
 import { execFileSync } from 'node:child_process';
-import { existsSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { existsSync, writeFileSync, renameSync, mkdirSync, symlinkSync } from 'node:fs';
+import { join, dirname, basename } from 'node:path';
 import { readJson, parseArgs, fail, isMain, nowIso, sha256, canonicalJson, normalizeRepoPath, hashObject } from './lib/common.mjs';
 import { computeFixPlanHash } from './fix-plan.mjs';
 import { recomputeArtifactHash } from './consensus-gate.mjs';
@@ -362,6 +362,42 @@ export function validateVerifyRecipe(v) {
 }
 export function verifyDigest(v) { return sha256(canonicalJson({ cmd: v.cmd, args: v.args })); }
 
+// ---- D7: 依赖准备 + fail-closed 分支 ----
+// 根因（另一会话实测，2026-08-02）: ensureIntegrationWorktree 只做 `git worktree add --detach`，
+// 裸 checkout 没有 node_modules——依赖项目依赖的 verify recipe（如 `npx vitest`）会立刻
+// exit!=0 且 stdout 为空，SC-10「orchestrator 不信 worker 自报」这道门因此在任何带依赖的
+// 项目上全数假阳，训练调用方忽略它（比没有门更糟）。
+// 主仓存在 node_modules 且 worktree 内没有 → 软链（成本近零，依赖不是被审代码，不违背
+// 隔离初衷）。**fail-closed 分支（必须有，否则产出静默错误结果）**: 软链主仓依赖等于
+// 用主仓依赖集跑候选代码——若候选累计 diff 改了依赖清单，链过来的 node_modules 与候选
+// 不一致，测试可能通过但通过的是错的依赖状态，比响亮失败更危险。此时不建软链，直接把
+// 整波（同一 worktree/环境）判 UNRUNNABLE，原因点名具体哪个清单文件。
+// 不实现 npm ci（新增机制确认门）：本轮目标是让门可用，自动安装要处理网络/超时策略，
+// 留给下一轮；本轮 fail-closed 报出来即可，不静默、不硬撑。
+// 坑④: 主仓本就没有 node_modules 不是错误——自包含 verify recipe（纯 node/bash，不依赖
+// 项目依赖）合法存在，此时 no-op，不报错、不阻断。
+// 「recipe 依赖 node 工具链」的确定性判据：cmd 是 npx/npm/yarn/pnpm 之一（这几个命令的存在
+// 意义就是解析/调用项目依赖里的东西，不可能在没有 node_modules 时正常工作）——这不是启发式，
+// 是对这四个命令语义的确定性事实。裸 `node` 不算（可能是自包含的 `node -e "..."`）。
+const DEP_MANIFEST_BASENAMES = new Set(['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock']);
+export const DEP_TOOLCHAIN_CMDS = new Set(['npx', 'npm', 'yarn', 'pnpm']);
+export function prepareDependencies({ repoDir, wt, sourceCandidate, integratedTip }) {
+  const wtModules = join(wt, 'node_modules');
+  if (existsSync(wtModules)) return { unrunnable: false, linked: false }; // worktree 已有，无需准备
+  const repoModules = join(repoDir, 'node_modules');
+  if (!existsSync(repoModules)) return { unrunnable: false, linked: false }; // 坑④: 主仓也没有 = 合法态
+  const changed = changedFiles({ repoDir, base: sourceCandidate, tip: integratedTip });
+  const touched = changed.find((f) => DEP_MANIFEST_BASENAMES.has(basename(f)));
+  if (touched) {
+    return {
+      unrunnable: true, linked: false,
+      reason: `候选改动了依赖清单 ${touched}，链入主仓的 node_modules 与候选不一致（fail-closed，未尝试软链）——需真实安装依赖后重跑，本轮不自动 npm ci（新增机制确认门，留给下一轮）`
+    };
+  }
+  symlinkSync(repoModules, wtModules, 'dir');
+  return { unrunnable: false, linked: true };
+}
+
 // ---- SC-10b + SC-R3-3: orchestrator 复跑 SC verify，绑定 sc manifest，空跑不算过 ----
 export function validateIntegration({ stateDir, runId, scManifest, waveIndex, runner = null }) {
   const { path, m } = loadRun(stateDir, runId);
@@ -379,11 +415,29 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
   // 验证在 integration worktree 的 integrated_tip 上跑（owner 印记校验同 integrate）
   const wt = ensureIntegrationWorktree({ manifestPath: path, m, ws, runId, checkoutRef: ws.integrated_tip });
 
+  // D7: 依赖准备——整波共用同一个 worktree/环境，判定一次即可
+  const depPrep = prepareDependencies({ repoDir: m.repo_dir, wt, sourceCandidate: m.source_candidate, integratedTip: ws.integrated_tip });
+  const wtHasModules = existsSync(join(wt, 'node_modules'));
+
   const results = [];
   for (const id of scIds) {
     const sc = byId.get(id);
     const recipeErr = validateVerifyRecipe(sc.verify);
     if (recipeErr) throw new Error(`SC ${id}: ${recipeErr}`);
+    if (depPrep.unrunnable) {
+      // D7 确定性分类①: 已知我们主动跳过了依赖准备（候选改了依赖清单），不是猜的。
+      // UNRUNNABLE 与 FAIL 分开报但同等阻断（下方 ok 判定对两者一视同仁，不得把
+      // UNRUNNABLE 排除在 every(PASS) 之外）。
+      results.push({ sc_id: id, status: 'UNRUNNABLE', exit_code: null, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(''), stdout_bytes: 0, note: depPrep.reason });
+      continue;
+    }
+    if (DEP_TOOLCHAIN_CMDS.has(sc.verify.cmd) && !wtHasModules) {
+      // D7 确定性分类②: recipe 明确要用 npx/npm/yarn/pnpm，但 worktree 里确实没有
+      // node_modules（无论是主仓也没有、还是软链已尝试但仍不存在）——这是对命令语义的
+      // 确定性判断，不是「exit!=0 且 stdout 空」那种启发式猜测。
+      results.push({ sc_id: id, status: 'UNRUNNABLE', exit_code: null, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(''), stdout_bytes: 0, note: `verify.cmd="${sc.verify.cmd}" 依赖 node 工具链，但 worktree 无 node_modules（主仓亦无可链入的依赖）——未尝试执行，避免落一个无意义的原生报错` });
+      continue;
+    }
     let exitCode = 0, stdout = '';
     try {
       stdout = runner
@@ -397,7 +451,14 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
       stdout = String(e.stdout ?? '');
     }
     // 凭证不落库红线: 只存 exit + 摘要 hash，不存原始输出
-    results.push({ sc_id: id, status: exitCode === 0 ? 'PASS' : 'FAIL', exit_code: exitCode, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(String(stdout)), stdout_bytes: Buffer.byteLength(String(stdout)) });
+    const status = exitCode === 0 ? 'PASS' : 'FAIL';
+    const entry = { sc_id: id, status, exit_code: exitCode, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(String(stdout)), stdout_bytes: Buffer.byteLength(String(stdout)) };
+    // D7: exit≠0 且 stdout 为空只是**提示**，不是判据——真实测试失败也可能 stdout 为空
+    // （有些 runner 只写 stderr），不得据此改判 UNRUNNABLE，只在 note 里给排查方向。
+    if (status === 'FAIL' && entry.stdout_bytes === 0) {
+      entry.note = '退出非零且 stdout 为空——疑似环境问题（如 worktree 缺 node_modules、命令找不到），也可能是真实测试失败但输出全落在 stderr；请先查 worktree 运行环境再确认是否为真实失败';
+    }
+    results.push(entry);
   }
   const ok = results.every((r) => r.status === 'PASS');
   ws.validation = { at: nowIso(), ok, results };

@@ -3640,6 +3640,87 @@ t('[SC-R3-4] verify 结构化 argv: 注入串按字面传参、最小环境、�
   ok(v.results[0].stdout === undefined && typeof v.results[0].stdout_sha256 === 'string', '只存摘要 hash 不存原文');
 });
 
+// ========== D7: validate 依赖准备 + fail-closed 分类（另一会话实测的阻断洞） ==========
+console.log('\n[D7] fix-run validate: 裸 worktree 软链依赖 + 候选改依赖清单 fail-closed + UNRUNNABLE 同等阻断');
+
+t('[D7-①] 裸 worktree + 需依赖的 recipe（npx/npm 等）→ UNRUNNABLE 且阻断（确定性判据：命令语义，不猜 exit/stdout）', () => {
+  const env = mkRunEnv({ files: ['a.ts'] }); // 主仓无 node_modules（坑④场景叠加①）
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }], [['g1']],
+    [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('npm', ['test']) }]);
+  FR.initRun({ stateDir: env.stateDir, runId: 'd7a', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'd7a', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a.allocations[0], 'a.ts', 'fix\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd7a', plan, waveIndex: 0 }).ok, '集成应过');
+  const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd7a', scManifest: scm, waveIndex: 0 });
+  eq(v.ok, false, 'D7 核心断言: UNRUNNABLE 必须使 ok=false（同等阻断，不是软提醒）——这是本次最该守住的一条');
+  eq(v.results[0].status, 'UNRUNNABLE', 'verify.cmd=npm 且无 node_modules 时必须确定性判 UNRUNNABLE，不得真跑产出无意义的原生报错');
+  ok(v.results[0].note.includes('node 工具链'), 'note 必须说明是 node 工具链缺依赖，不是猜的启发式');
+  eq(v.results[0].exit_code, null, 'UNRUNNABLE 不应有 exit_code（从未真正执行）');
+});
+
+t('[D7-②] 候选改了 package.json → 不建软链（避免用主仓依赖跑候选代码产出静默错误结果）+ UNRUNNABLE 且原因点名依赖清单文件', () => {
+  const env = mkRunEnv({ files: ['a.ts', 'package.json'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  // 主仓有 node_modules（本该可以软链，若不是候选改了依赖清单）
+  mkdirSync(join(env.r, 'node_modules'), { recursive: true });
+  writeFileSync(join(env.r, 'node_modules', '.marker'), 'present\n');
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['package.json'] }], [['g1']],
+    [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'package.json']) }]);
+  FR.initRun({ stateDir: env.stateDir, runId: 'd7b', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'd7b', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a.allocations[0], 'package.json', '{"name":"changed-by-candidate"}\n'); // 候选改了依赖清单
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd7b', plan, waveIndex: 0 }).ok, '集成应过');
+  const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd7b', scManifest: scm, waveIndex: 0 });
+  eq(v.ok, false, 'D7 核心断言: 候选改依赖清单时必须阻断（UNRUNNABLE 同等阻断）');
+  eq(v.results[0].status, 'UNRUNNABLE');
+  ok(v.results[0].note.includes('package.json'), '原因必须点名具体是哪个依赖清单文件');
+  ok(v.results[0].note.includes('fail-closed'), '原因必须说明是主动跳过（fail-closed），不是环境本身坏了');
+  // 不得建软链——否则就是用主仓依赖集跑了候选代码，产出的是静默错误结果
+  const runM = readJson(FR.runManifestPath(env.stateDir, 'd7b'));
+  const integWt = runM.integration_worktree.path;
+  ok(!existsSync(join(integWt, 'node_modules')), 'D7 fail-closed 核心: 候选改了依赖清单时绝不能建软链');
+});
+
+t('[D7-③] 自包含 recipe（不依赖 node 工具链）在主仓无 node_modules 时 → 正常 PASS（守住坑④：主仓无依赖不是错误）', () => {
+  const env = mkRunEnv({ files: ['a.ts'] }); // 主仓无 node_modules
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }], [['g1']],
+    [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }]); // 自包含：纯 shell test，不需要项目依赖
+  FR.initRun({ stateDir: env.stateDir, runId: 'd7c', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'd7c', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a.allocations[0], 'a.ts', 'fix\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd7c', plan, waveIndex: 0 }).ok, '集成应过');
+  const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd7c', scManifest: scm, waveIndex: 0 });
+  ok(v.ok, 'D7 坑④核心: 主仓没有 node_modules 本身不是错误，自包含 recipe 必须正常 PASS: ' + JSON.stringify(v.results));
+  eq(v.results[0].status, 'PASS');
+  ok(!v.results[0].note, '正常 PASS 不应带诊断 note');
+});
+
+t('[D7-④] 主仓有 node_modules、候选未改依赖清单 → 真软链，需依赖的 recipe 借软链真正跑通（不只是安全网，是修复本身）', () => {
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  mkdirSync(join(env.r, 'node_modules'), { recursive: true });
+  writeFileSync(join(env.r, 'node_modules', '.marker'), 'present\n');
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }], [['g1']],
+    // recipe 本身不在 DEP_TOOLCHAIN_CMDS 里（用 test 而不是 npm，避免撞上①的确定性分类），
+    // 但真实依赖 node_modules 是否存在——只有软链生效这条才能过。
+    [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-e', 'node_modules/.marker']) }]);
+  FR.initRun({ stateDir: env.stateDir, runId: 'd7d', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'd7d', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a.allocations[0], 'a.ts', 'fix\n'); // 未触碰依赖清单
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd7d', plan, waveIndex: 0 }).ok, '集成应过');
+  const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd7d', scManifest: scm, waveIndex: 0 });
+  ok(v.ok, 'D7 修复本身核心: 软链生效后，需要 node_modules 的 recipe 必须真正跑通: ' + JSON.stringify(v.results));
+  eq(v.results[0].status, 'PASS');
+  const runM = readJson(FR.runManifestPath(env.stateDir, 'd7d'));
+  ok(existsSync(join(runM.integration_worktree.path, 'node_modules', '.marker')), '软链必须真的生效（穿透可见主仓 node_modules 内容）');
+});
+
 t('[SC-R3-5] anchor hub 污染: 共享 hub 把 8 组并成 1 组 → hub 门 degraded；changed-set 拦 tracked-but-unchanged', () => {
   // hub 门（R3 反例复刻: 8 条 finding 各带共享 .gitignore + 独立文件）
   const specs = Array.from({ length: 8 }, (_, i) => ({ sev: 'major', paths: ['.gitignore', `src/u${i}.ts`] }));
