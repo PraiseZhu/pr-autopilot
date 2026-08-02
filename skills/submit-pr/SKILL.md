@@ -113,11 +113,37 @@ node scripts/consensus-gate.mjs v1.json v2.json v3.json --bundle bundle.json --r
 `anchor_paths` ⊆ 实改集——tracked-but-unchanged 的 hub 路径在入口就被拦，不依赖调用方自觉。
 四 conjunct 缺一不可（同 input hash / union 每条被 origin close / 三 verdict APPROVED / 全部 gate_checks∈{pass,n_a}）。任何席 degraded 或 schema 不合 → fail-closed。
 
+**不检查**（写出来是因为「局部背书」最容易被当成「完整背书」，同 push-guard 如实声明 T1 上限的做法）：
+① **不检查代码是否真的修好** —— conjunct② 的 `closed` 只表示「origin 席裁决该 finding 为真实、
+同意进 SC 台账」（见上方 `closed` 语义定义），共识 PASS 不代表任何代码已改；
+② **不校验下游产物** —— SC manifest 与共识产物的逐字一致由 `sc-coverage-gate` 管、分组与 hub
+判定由 `fix-plan` 管、终版 artifact 的 parent 链与 CI 路径由 `push-guard` 管。共识 PASS 只说明
+这三份 verdict 之间自洽，**不预示下游任一道门会过**。
+
 > **`closed` 的语义（易误读，显式定义）**：conjunct② 的 `status=closed` 意思是「该 finding 已被其
 > origin 席**裁决为真实、且同意进入 SC 修复台账**」，**不是「代码已经修好」**。所以修复**前**的源共识
 > artifact 在构造上是存在的（Phase 2b/2c 正是拿它当输入）。误读成「已修好」会推出「源共识不可能存在」
 > 的假结论——另一会话 2026-08-02 就这么栽过一次。「共识确认的每条 finding 提炼 SC」这句话本身也蕴含
 > 该语义：若 closed = 已修好，这句话就没有对象。
+>
+> **关 finding 是双条件，改 `status` 一个字段不够**（`consensus-gate.mjs:115`）：
+> ```js
+> const closed = fd.status === 'closed' && v.closed_finding_ids.includes(fd.id);
+> ```
+> 该 finding 的 **`status` 必须是 `'closed'`**，**且**它的 `id` 必须出现在**同一份 verdict** 的
+> **`closed_finding_ids` 数组**里。缺任一条，conjunct② 即拒——每条漏的 finding 各拒一次。
+>
+> **`verdict-validate` 不检查这个双向一致**：它只在 `:78` 校验 `closed_finding_ids` **是个数组**
+> （类型），既不检查「`status='closed'` 的 finding 是否在数组里」，也不检查「数组里的 id 是否
+> 真实存在」。所以一份只改了 `status` 的 verdict 能拿到 `exit=0 ok`，却在共识处必被拒。
+> 顺带：`verdict-validate` 也**不重算** `review_input_hash`（`:76` 只验它是 64 位 hex），重算是
+> `consensus-gate` 的 conjunct①（`:90-101`，源码注释原话「共识脚本必须重算 input hash，不信
+> opaque 值」）。**它是单份 verdict 的形状校验器，不做跨席一致性。**
+>
+> 实测代价（2026-08-03，另一会话）：审查席按指令把 4 条 finding 的 `status` 改成 `closed`、
+> 自跑 `verdict-validate` 得 `exit=0 ok`、据此如实报告成功——那份 verdict 跑共识时在 conjunct②
+> 上被拒 4 次，白跑一次往返。**审查席没做错任何事**：错在派工清单漏写 `closed_finding_ids`，
+> 而自检工具的口径覆盖不到它。所以派工给审查席时，这个双条件必须逐字写进收口清单。
 
 ## Phase 2b — SC 提炼 + 覆盖门（共识后，自动衔接）
 
