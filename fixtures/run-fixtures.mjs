@@ -3880,8 +3880,9 @@ t('[R4-P0/R5-P0] cleanup 归属 = 创建印记而非内容相等: 撞值 HEAD/�
 
 t('[D8-3] delta 轮漏传 parent 必拒；首轮无 parent 必须仍放行', () => {
   const D2 = [{ round: 2 }, { round: 2 }, { round: 2 }];
-  // ① round>=2 且完全不传 parent → 必拒。SC-3 原本只校验「传了但传错源」（:2938 同 base 冒充），
-  // **漏传**却静默出 pass artifact（parent_artifact_hash: null），谱系门对最省事的绕法失效。
+  // ① round>=2 且完全不传 parent → 必拒。SC-3 原本只校验「传了但传错源」（见 fixture
+  // 「SC-3: 同 base 错源必拒」；此处不写行号——行号会随插行漂移，D8-3 已让上一版漂过一次），
+  // **漏传**却静默出 pass artifact（parent_artifact_hash: null），谱系门对最常见的漏参路径失效。
   const delta = consensusFor(bundle, D2).artifact;
   ok(delta.gate_result === 'fail' && delta.fail_reasons.some((e) => /delta 轮|parent/.test(e)),
     'D8-3: delta 轮漏传 parent 必须 fail-closed: ' + JSON.stringify(delta.fail_reasons ?? []));

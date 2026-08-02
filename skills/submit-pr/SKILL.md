@@ -140,18 +140,20 @@ CLI 用法串写了这条要求但无人执行）。三席 `round` 不一致时�
 > 的假结论——另一会话 2026-08-02 就这么栽过一次。「共识确认的每条 finding 提炼 SC」这句话本身也蕴含
 > 该语义：若 closed = 已修好，这句话就没有对象。
 >
-> **关 finding 是双条件，改 `status` 一个字段不够**（`consensus-gate.mjs:115`）：
+> **关 finding 是双条件，改 `status` 一个字段不够**（`consensus-gate.mjs` → `runConsensusGate` 的
+> **conjunct②** 那一段；此处一律用符号锚点不写行号——D8-3 插了 12 行后，初版写的 `:115`
+> 当场漂成 `:127`，被 gpt 复审逮到，正是本文档反复在讲的「坐标失真」）：
 > ```js
 > const closed = fd.status === 'closed' && v.closed_finding_ids.includes(fd.id);
 > ```
 > 该 finding 的 **`status` 必须是 `'closed'`**，**且**它的 `id` 必须出现在**同一份 verdict** 的
 > **`closed_finding_ids` 数组**里。缺任一条，conjunct② 即拒——每条漏的 finding 各拒一次。
 >
-> **`verdict-validate` 不检查这个双向一致**：它只在 `:78` 校验 `closed_finding_ids` **是个数组**
+> **`verdict-validate` 不检查这个双向一致**：它的 `closed_finding_ids` 那行只校验它**是个数组**
 > （类型），既不检查「`status='closed'` 的 finding 是否在数组里」，也不检查「数组里的 id 是否
 > 真实存在」。所以一份只改了 `status` 的 verdict 能拿到 `exit=0 ok`，却在共识处必被拒。
-> 顺带：`verdict-validate` 也**不重算** `review_input_hash`（`:76` 只验它是 64 位 hex），重算是
-> `consensus-gate` 的 conjunct①（`:90-101`，源码注释原话「共识脚本必须重算 input hash，不信
+> 顺带：`verdict-validate` 也**不重算** `review_input_hash`（它那行只验是 64 位 hex），重算是
+> `consensus-gate` 的 **conjunct①**（源码注释原话「共识脚本必须重算 input hash，不信
 > opaque 值」）。**它是单份 verdict 的形状校验器，不做跨席一致性。**
 >
 > 实测代价（2026-08-03，另一会话）：审查席按指令把 4 条 finding 的 `status` 改成 `closed`、
@@ -386,12 +388,21 @@ reviewer 席内的本地标签，两个不同 reviewer 完全可能各自合法�
 → 下一次修复 commit 前强制完成 `references/convergence-checkpoint.md` 六件套；第 10 个 → 禁止
 继续同形状打补丁，lead 按第 5 条升级阶梯自主选路径执行 + **红色通报 owner**（轮数/失败族清单/
 选定路径）。
+
+> ⚠ **这里的「强制」「禁止」没有任何守卫在拦**——它们约束的是 lead 的行为，不是脚本的行为。
+> 没有计数器会在第 5 个 candidate 时报错，没有门会在第 10 个 candidate 时拒绝 push；漏做**只能**
+> 靠 review 发现。这是 owner 2026-08-02（D2）的明确选择，理由见下方「机器锁定范围」。
+> 之所以把这句话单独拎出来：段落里的「强制/禁止」字面强度高，略读的人会以为它是机器门
+> （2026-08-02 gpt 复审正是据此开了一条 P1——原标题写「验收条件」，读起来像这条动作本身
+> 已被验收）。**它不是。** 把它当成写在流程里的自律条款，不是安全网。
 这条数字线**只**做一件事——切换「这次修复要不要先做六件套 / 要不要禁止继续同形状打补丁」，
 **绝不**决定 consensus 是否 PASS、finding 的 severity、能否 `[ARCHIVE]`、能否 push——这四件
 事仍分别由 consensus-gate / 审查席 / SC 覆盖门 / push-guard 独立裁决，水位线到第几个
 candidate 不改变它们的判据（与本节「反猫捉老鼠」立场一致：数字从不替代形状判断，只是在形状
 判断之外加一层「至少做过一次结构化止损」的兜底）。
-**验收条件（owner 2026-08-02 fable 拍板，D2）**：
+**机器锁定范围 / 未强制部分（owner 2026-08-02 fable 拍板，D2；标题原为「验收条件」，
+2026-08-02 gpt 复审 P1 指出那个标题读起来像「第 5/10 个动作本身已被验收」，故改名——
+下面两条一条讲「没锁什么、为什么不锁」，一条讲「锁住了什么」）**：
 - 第 5/10 个 candidate 的触发是**纯 T1 过程规则**——由 lead 对照本次 run 的 run artifacts
   与各轮 consensus 产物**手动执行**，本仓**有意不建**任何生产态计数器脚本/字段。按
   `hardening-checklist.md`「新增机制确认门」的检验标准：删掉这个计数器，本节其余判据
@@ -407,6 +418,12 @@ candidate 不改变它们的判据（与本节「反猫捉老鼠」立场一致�
   ①两个 reviewer 都合法使用同一个 `family_id` 标签但描述不同 invariant → `family_key` 不同
   → 不得合并；②同一个 invariant 被标了不同的 `family_id` 标签 → `family_key` 相同 → 必须
   正确合并）。
+  **这条锁的边界要看清**：三份 artifact 是真走 validator + consensus-gate 产出的（断言里逐份
+  核了 `gate_result === 'pass'`），被锁住的是**真实代码产出的 artifact 形状**——`family_key`
+  确实随每条 canonical finding 落账、且集合差可判。而做集合差的那两个小函数
+  （`familyKeySet` / `newFamilies`）是**测试文件内的本地辅助，生产路径没有对应实现**，
+  别当成有一个生产态的「新 family 检测器」。这正是上一条不建计数器的同一立场：
+  被测对象是 artifact，不是辅助函数。
 
 > **与 plan.md 的数字上限冲突已裁决（owner 2026-08-02）**：`docs/plan.md` SP-2 及其流程图写的
 > 「≤3 轮未收敛停给 owner」（plan.md:37 / 69 / 95 / 131）**本节取代之**——按形状判据收敛，不按轮数硬停；

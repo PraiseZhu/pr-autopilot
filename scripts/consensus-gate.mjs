@@ -88,10 +88,12 @@ export function runConsensusGate(verdicts, opts = {}) {
   if (failReasons.length) return { gate_result: 'fail', fail_reasons: failReasons };
 
   // D8-3: delta 轮缺 parent 必须拒。此前 SC-3 只在「调用方传了 parent」时才校验来源正确
-  // （:2938 的「同 base 错源冒充」），**漏传**却是静默放行——parent_artifact_hash 记成 null
-  // 照样出 pass artifact，谱系门对最省事的绕法（干脆不传）完全 fail-open。
-  // 位置必须在上面那道 schema 早返回**之后**: round 到此已确认是合法整数，
-  // 否则 Math.max 拿到 undefined 得 NaN，`NaN >= 2` 为 false → 又是 fail-open。
+  // （fixture「SC-3: 同 base 错源必拒」那条），**漏传**却是静默放行——parent_artifact_hash
+  // 记成 null 照样出 pass artifact，谱系门对最常见的漏参路径完全 fail-open。
+  // 位置放在上面那道 schema 早返回**之后**，理由是**类型边界**: 到此 round 已过
+  // validateVerdict 的 `Number.isInteger(v.round) && v.round >= 1`，可以按整数直接算 max。
+  // 不是「放前面会 fail-open」——放前面也不会漏，非法 round 早被 validateVerdict 记成错误、
+  // 由那道早返回拦下。初版注释把理由写成「否则 NaN >= 2 为 false 就放行」，gpt 复审证伪，此处纠正。
   // 取 max 而非要求三席 round 一致: 三席 round 若不一致，按最大的那个要求 parent
   // （fail-closed 方向）。「三席 round 必须一致」是另一条不变量，本轮不在范围内。
   const maxRound = Math.max(...verdicts.map((v) => v.round));
