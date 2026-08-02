@@ -87,6 +87,18 @@ export function runConsensusGate(verdicts, opts = {}) {
   }
   if (failReasons.length) return { gate_result: 'fail', fail_reasons: failReasons };
 
+  // D8-3: delta 轮缺 parent 必须拒。此前 SC-3 只在「调用方传了 parent」时才校验来源正确
+  // （:2938 的「同 base 错源冒充」），**漏传**却是静默放行——parent_artifact_hash 记成 null
+  // 照样出 pass artifact，谱系门对最省事的绕法（干脆不传）完全 fail-open。
+  // 位置必须在上面那道 schema 早返回**之后**: round 到此已确认是合法整数，
+  // 否则 Math.max 拿到 undefined 得 NaN，`NaN >= 2` 为 false → 又是 fail-open。
+  // 取 max 而非要求三席 round 一致: 三席 round 若不一致，按最大的那个要求 parent
+  // （fail-closed 方向）。「三席 round 必须一致」是另一条不变量，本轮不在范围内。
+  const maxRound = Math.max(...verdicts.map((v) => v.round));
+  if (maxRound >= 2 && !parentArtifactHash) {
+    failReasons.push(`delta 轮（round=${maxRound}）未绑定上一轮 artifact：缺 --parent / parentArtifactHash——SC-3 谱系门不允许 fail-open（D8-3）`);
+  }
+
   // conjunct ①: 同 hash 且等于 bundle 重算值
   let recomputed = null;
   try {

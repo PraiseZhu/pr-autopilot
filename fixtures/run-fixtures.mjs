@@ -100,7 +100,9 @@ function mkBundle(baseSha, candidateSha, over = {}) {
 // 从 anchor 派生（去 :行号 后取路径部分；不像路径则回退占位），减少逐条改动。
 // SC-B1: actionable（blocker/major）finding 还需 invariant/family_id——测试未显式给时，
 // 默认补一个「自成一族」的值（用 id/下标当 family key，各不相同，等价于「本轮只有一处
-// 表现」的合法态）；显式提供了就不覆盖，用于测试「共享 family」「篡改归因」等场景。
+// 表现」的合法态）；显式提供了就不覆盖，用于测试「共享 family」「归因错配」等场景。
+// D8-4: 原文写「篡改归因」——本仓保证等级只到 T1（防疏忽/防漂移），归因写错是**填错**
+// 不是伪造；「篡改」读起来像在防恶意，属超卖。真防伪造要宿主级签名回执，本仓做不到。
 function withAnchorPaths(findings) {
   return (findings ?? []).map((fd, i) => {
     let out = fd;
@@ -3874,6 +3876,33 @@ t('[R4-P0/R5-P0] cleanup 归属 = 创建印记而非内容相等: 撞值 HEAD/�
   const manifest4 = { ...manifest2, waves: [{ ...manifest2.waves[0], tips: [{ group_id: 'g1', tip: recTip }] }] };
   const res4 = ORC.cleanupRun({ manifest: manifest4 });
   ok(res4.steps.includes('br-deleted:g1'), 'tip 一致时 CAS 删除成功: ' + JSON.stringify(res4));
+});
+
+t('[D8-3] delta 轮漏传 parent 必拒；首轮无 parent 必须仍放行', () => {
+  const D2 = [{ round: 2 }, { round: 2 }, { round: 2 }];
+  // ① round>=2 且完全不传 parent → 必拒。SC-3 原本只校验「传了但传错源」（:2938 同 base 冒充），
+  // **漏传**却静默出 pass artifact（parent_artifact_hash: null），谱系门对最省事的绕法失效。
+  const delta = consensusFor(bundle, D2).artifact;
+  ok(delta.gate_result === 'fail' && delta.fail_reasons.some((e) => /delta 轮|parent/.test(e)),
+    'D8-3: delta 轮漏传 parent 必须 fail-closed: ' + JSON.stringify(delta.fail_reasons ?? []));
+  // ② 首轮无 parent 必须放行——守住「别把新门开成误拦首轮」这个坑（首轮本就没有上一轮）。
+  const first = consensusFor(bundle).artifact;
+  eq(first.gate_result, 'pass', '首轮无 parent 必须放行: ' + JSON.stringify(first.fail_reasons ?? []));
+  eq(first.parent_artifact_hash, null, '首轮 parent_artifact_hash 记 null');
+  // ③ delta 轮带上 parent → 放行，且 exact 谱系落进 artifact
+  const bound = consensusFor(bundle, D2, { parentArtifactHash: first.consensus_artifact_hash }).artifact;
+  eq(bound.gate_result, 'pass', 'delta 轮带 parent 必须放行: ' + JSON.stringify(bound.fail_reasons ?? []));
+  eq(bound.parent_artifact_hash, first.consensus_artifact_hash, 'delta 轮必须记录 exact parent');
+});
+
+// 独立成块（不并进上面）: 上面钉的是「delta 轮要 parent」，这里钉的是「用 max 而非首席 round」。
+// 两条判定合在一个 t() 里，删整道门和把 max 换成 verdicts[0].round 会红同一个块——
+// 变异红集无法分辨是哪条判定在起作用（第 8 类）。拆开后前者红 2 块、后者红 1 块。
+t('[D8-3] 三席 round 不一致时按最大值要求 parent（不得因不一致而 fail-open）', () => {
+  // 「三席 round 必须一致」是另一条不变量，本轮不在范围内；此处只钉住不一致时的方向。
+  const mixed = consensusFor(bundle, [{ round: 1 }, { round: 2 }, { round: 1 }]).artifact;
+  ok(mixed.gate_result === 'fail' && mixed.fail_reasons.some((e) => /delta 轮/.test(e)),
+    'D8-3: 混合 round 取最大值 → 仍要求 parent: ' + JSON.stringify(mixed.fail_reasons ?? []));
 });
 
 t('[R5-P1] runConsensusGate 缺实改集 fail-closed；[R5-P2] crash 窗口凭创建印记仍可回收', () => {
