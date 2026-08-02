@@ -113,6 +113,20 @@ node scripts/consensus-gate.mjs v1.json v2.json v3.json --bundle bundle.json --r
 `anchor_paths` ⊆ 实改集——tracked-but-unchanged 的 hub 路径在入口就被拦，不依赖调用方自觉。
 四 conjunct 缺一不可（同 input hash / union 每条被 origin close / 三 verdict APPROVED / 全部 gate_checks∈{pass,n_a}）。任何席 degraded 或 schema 不合 → fail-closed。
 
+**delta 轮（verdict `round>=2`）必须加 `--parent <上一轮 consensus.json>`**（SC-3/D8-3）：
+```
+node scripts/consensus-gate.mjs v1.json v2.json v3.json --bundle bundle.json --repo-dir . --parent prev-consensus.json --out consensus.json
+```
+漏传即 fail（不是静默记 `parent_artifact_hash: null` 放行——D8-3 之前正是如此，
+CLI 用法串写了这条要求但无人执行）。三席 `round` 不一致时按最大值判（fail-closed 方向）。
+真首轮（round 1）不传 `--parent` 正常放行，这是刻意保留的——首轮没有上一轮可绑。
+
+> **这道门只覆盖一个方向**：`round>=2` 缺 parent 必拒；反方向「round 1 **带** parent」
+> **不拦**。按 Phase 2b/2c 的流程，终版共识的 verdict 本应是 `round>=2`（它审的是 delta），
+> 但 `fixtures/run-fixtures.mjs` 里的终版用例用的是默认 `round: 1` 并带 parent。
+> 那属于**当时无人校验故未指定**，不是「round 1 带 parent」被认可为合法——真要收紧得先把
+> 终版 verdict 的 round 语义定死，属另一条不变量，本轮不扩。同理「三席 round 必须一致」也未实现。
+
 **不检查**（写出来是因为「局部背书」最容易被当成「完整背书」，同 push-guard 如实声明 T1 上限的做法）：
 ① **不检查代码是否真的修好** —— conjunct② 的 `closed` 只表示「origin 席裁决该 finding 为真实、
 同意进 SC 台账」（见上方 `closed` 语义定义），共识 PASS 不代表任何代码已改；
