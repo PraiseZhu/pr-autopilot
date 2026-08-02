@@ -61,6 +61,10 @@ bundle = base_sha + candidate_sha + PR 标题/正文 + touches_ui + matched_path
 仓库相对**精确文件路径**（POSIX，非目录，去重，≤ config/orchestration.json 的
 `anchor_paths_max_per_finding`）。这是修复分组的**唯一机器输入**：填宽了会制造假冲突把本可并行的
 修复串行化，填成目录/不存在路径直接 degraded。影响范围说明写 `scope_note`（不进冲突图）。
+**`anchor_paths` 只是证据锚点，绝不是写入许可**（2026-08-02 anchor_paths 三用途拆分，源:
+mivo-canvas PR #419 实战反馈）：证据可能落在只读症状文件，真正要改的文件可能根本不在证据里——
+写入许可另见 Phase 2c 的 `write_paths`（脚本按 SC kind 推导，reviewer/lead 不得填写，
+verdict-validate/sc-coverage-gate 对该字段一律拒收）。
 - 两对抗席：七面（A 正确性/B UI+无障碍/C 测试/D 文档/E 安全/F 范围/G 声称核实）逐面 `pass/fail/n_a`+证据；B 面仅当脚本判非 UI 才许 n_a。
 - 第三席：只填相关 faces（F/G/E/D 为主）+ `gate_checks[]`（产品/架构过程门专用通道，不得用无类型 finding 绕过归属规则）。
 - 首轮穷举（④）+ **加固清单覆盖率契约（机器强制，不是纸面约定）**：R1 两对抗席
@@ -145,9 +149,14 @@ node scripts/fix-run.mjs init --state-dir <st> --run-id <run> --repo-dir . \
 node scripts/fix-run.mjs allocate --state-dir <st> --run-id <run> --plan fix-plan.json \
   --wave <k> --worktree-root ../.fix-wt
 # 2) 按输出的 allocations 一次 create_workers 并行开出（组数即 worker 数，拉满 capacity）
-#    每包: 本组 SC 子集 + 自己的 worktree 路径 + allowed_paths + goal --until-sc
-#    worker 在自己 worktree 内 commit；**所有组** changed ⊆ allowed_paths（verify 组叠加
-#    只改测试路径），越域在集成时被拒（SC-R3-7）
+#    每包: 本组 SC 子集 + 自己的 worktree 路径 + anchor_paths（证据/分组输入，仅供参考，
+#    不是写入许可）+ write_paths（脚本按 kind 推导的写入约束）+ goal --until-sc
+#    worker 在自己 worktree 内 commit：
+#      fix 类 write_paths.mode='isolated' —— 不设清单，写入边界只靠独立 worktree +
+#        集成期真实 diff 重叠检测兜底（overlap → fail-closed 转串行重派，SC-R3-9）；
+#        不会再因「改动不在 anchor_paths 内」被拒——anchor 是证据不是写集（2026-08-02 拆分）。
+#      verify 类 write_paths.mode='anchor-test-path' —— 仍要求 changed ⊆ write_paths.paths
+#        且全为测试路径（SC-R3-7 加固不变），越域在集成时被拒。
 # 3) 集成 = **squash**（owner 决策 D1）: 校验 tip 归属 → 实改交集检测 → 无重叠则 merge 出
 #    最终树后用 commit-tree 打成**单个 squash commit**（group tips 永不进最终祖先——
 #    中间 commit 藏东西再恢复的「净 diff 洗历史」从构造上无处容身，SC-R3-8）

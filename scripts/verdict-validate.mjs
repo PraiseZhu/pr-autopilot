@@ -153,6 +153,12 @@ export function validateVerdict(v, opts = {}) {
     if (fd.primary_face === 'taxonomy_gap') hasTaxonomyGap = true;
     need(SEVERITIES.includes(fd.severity), `finding ${fd.id} severity 非法`);
     need(typeof fd.anchor === 'string' && fd.anchor.length > 0, `finding ${fd.id} 缺 anchor`);
+    // D2（anchor_paths 三用途拆分，2026-08-02）: 写入许可字段不受理外部输入——两个入口
+    // 同等 fail-closed（本函数是唯一校验实现，CLI 只是薄封装，天然满足）。这里拒的是「字段
+    // 出现即拒」，不是「出现被忽略」：schema 文档同步加 additionalProperties:false。
+    for (const forbidden of ['write_paths', 'allowed_paths']) {
+      need(!(forbidden in fd), `finding ${fd.id} 不得提供 ${forbidden}（D2: 写入许可只能由脚本从 SC kind 推导，不受理 lead/AI 自报——见 anchor_paths 三用途拆分设计）`);
+    }
     // v2: anchor_paths 机器字段——分组唯一输入源，逐条 POSIX 精确文件校验（污染面从严）
     if (!Array.isArray(fd.anchor_paths) || fd.anchor_paths.length === 0) {
       need(false, `finding ${fd.id} 缺 anchor_paths（v2 机器字段必填，分组据此，degraded）`);

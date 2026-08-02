@@ -52,6 +52,11 @@ export function checkScCoverage({ manifest, artifact }) {
     // SC-R3-4（D2）: verify 必须是结构化 argv 配方——自由文本会被 shell 解释（命令注入面）
     const recipeErr = validateVerifyRecipe(sc.verify);
     need(!recipeErr, `SC ${sc.id}: ${recipeErr}`);
+    // D2（anchor_paths 三用途拆分，2026-08-02）: write_paths 由 fix-orchestrate.mjs 按 SC kind
+    // 脚本推导，sc manifest（lead 产物）不得携带该字段——同等 fail-closed 于 verdict-validate。
+    for (const forbidden of ['write_paths', 'allowed_paths']) {
+      need(!(forbidden in sc), `SC ${sc.id} 不得提供 ${forbidden}（D2: 写入许可只能由脚本推导，不受理 lead 自报）`);
+    }
     const fids = Array.isArray(sc.finding_ids) ? sc.finding_ids : [];
     if (sc.kind === 'global') {
       globalCount++;

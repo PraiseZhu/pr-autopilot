@@ -2427,6 +2427,13 @@ t('[v2-anchor] verdict-validate: anchor_paths 缺失/含目录/绝对 → degrad
   eq(validateVerdict(good).length, 0, '精确路径应过');
 });
 
+t('[anchor_paths 拆分/D2] verdict 的 finding 携带 write_paths/allowed_paths → 必拒（写入许可不受理外部输入）', () => {
+  const withWrite = mkVerdictFor('claude-adversarial', bundle, { findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: ['src/x.ts'], write_paths: ['src/x.ts'], evidence: 'e', status: 'closed' }], closed_finding_ids: ['F1'] });
+  ok(validateVerdict(withWrite).some((e) => /write_paths/.test(e)), 'finding 带 write_paths 必须被拒（D2）');
+  const withAllowed = mkVerdictFor('claude-adversarial', bundle, { findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: ['src/x.ts'], allowed_paths: ['src/x.ts'], evidence: 'e', status: 'closed' }], closed_finding_ids: ['F1'] });
+  ok(validateVerdict(withAllowed).some((e) => /allowed_paths/.test(e)), 'finding 带 allowed_paths 必须被拒（D2）');
+});
+
 // 造一个带 N 条 canonical finding 的真共识 artifact（各 finding 指定 anchor_paths）
 function artifactWithFindings(specs, bundleObj = bundle, gateOpts = {}) {
   // specs: [{fid_face, sev, paths}] —— 三席都 close 同一批以达共识。
@@ -2465,6 +2472,17 @@ t('[v2-coverage] SC 必须覆盖每条 blocker/major finding，绑定 artifact h
   ok(checkScCoverage({ manifest: forged, artifact: art }).some((e) => /未绑定|不符/.test(e)), 'SC 未绑定本次共识必拒');
   // suggestion 不强制覆盖: 仅覆盖 blocker/major 仍过
   eq(checkScCoverage({ manifest: full, artifact: art }).length, 0);
+});
+
+t('[anchor_paths 拆分/D2] sc-manifest 的 SC 携带 write_paths/allowed_paths → 必拒', () => {
+  const art = artifactWithFindings([{ sev: 'major', paths: ['src/y.ts'] }]);
+  const fid = art.canonical_findings[0].id;
+  const withWrite = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: [{ id: 'SC-0', kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF(), write_paths: ['src/y.ts'] }] };
+  ok(checkScCoverage({ manifest: withWrite, artifact: art }).some((e) => /write_paths/.test(e)), 'SC 带 write_paths 必须被拒（D2）');
+  const withAllowed = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: [{ id: 'SC-0', kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF(), allowed_paths: ['src/y.ts'] }] };
+  ok(checkScCoverage({ manifest: withAllowed, artifact: art }).some((e) => /allowed_paths/.test(e)), 'SC 带 allowed_paths 必须被拒（D2）');
 });
 
 t('[v2-plan] fix-plan: 冲突域相交同组、独立域并行、verify 进末波、缺 anchor_paths degraded、hash 可重算', () => {
@@ -2761,7 +2779,7 @@ t('[2号-push闸/SC-R3-6] 端到端契约: 真实状态机 run + SKILL 字段 ma
   const al = FR.allocate({ stateDir: st, runId: 'pg1', plan, waveIndex: 0, worktreeRoot: wtR });
   eq(al.wave_base, HEAD, 'wave0 base == 源 artifact candidate（SC-R3-10）');
   for (const a of al.allocations) {
-    for (const f of a.allowed_paths) {
+    for (const f of a.anchor_paths) {
       mkdirSync(dirname(join(a.worktree, f)), { recursive: true });
       writeFileSync(join(a.worktree, f), `fixed ${a.group_id}\n`);
     }
@@ -3034,11 +3052,13 @@ t('[SC-8] run manifest CAS: wave base 由状态派生不接受自报；跳波拒
   // 空交卷（不改任何东西）→ tip == base → 拒
   let integ = FR.integrate({ stateDir: env.stateDir, runId: 'r1', plan, waveIndex: 0 });
   ok(!integ.ok && integ.errors.some((e) => /空交卷|等于 base/.test(e)), '空交卷必拒');
-  // 越域: g1 改 b.ts（不在自己 allowed_paths）→ 拒
-  workGroup(env, a1.allocations[0], 'b.ts', 'g1 越域\n');
+  // [anchor_paths 拆分] fix 类 write_paths.mode='isolated'：g1（anchor=a.ts）改一个未被任何组
+  // 认领、也未与其他组撞车的新文件 c.ts——旧设计会把它误判「越域改动」拒绝（anchor 是证据不是
+  // 写集，2026-08-02 拆分修的正是这个问题），新设计应放行。
+  workGroup(env, a1.allocations[0], 'c.ts', 'g1 合法但未被证据覆盖的改动\n');
   workGroup(env, a1.allocations[1], 'b.ts', 'g2 改自己的\n');
   integ = FR.integrate({ stateDir: env.stateDir, runId: 'r1', plan, waveIndex: 0 });
-  ok(!integ.ok && integ.errors.some((e) => /越域改动/.test(e)), 'SC-8: 越域改动必拒');
+  ok(integ.ok, 'fix 类 write_paths.mode=isolated: 改未被证据覆盖但未撞车的文件应放行: ' + JSON.stringify(integ.errors ?? []));
 });
 
 t('[SC-8/SC-9/SC-10b] 完整 run: 两波 squash 集成 → 复跑验证 → finalize 前推 → 链为精确 squash 集合；主 checkout 零接触', () => {
