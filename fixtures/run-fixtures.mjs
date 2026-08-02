@@ -15,7 +15,7 @@ const W = join(HERE, '..', 'deploy', 'wrappers');
 
 import { computeReviewInputHash } from '../scripts/review-input-hash.mjs';
 import { validateVerdict } from '../scripts/verdict-validate.mjs';
-import { runConsensusGate, recomputeArtifactHash } from '../scripts/consensus-gate.mjs';
+import { runConsensusGate, recomputeArtifactHash, familyKeyOf } from '../scripts/consensus-gate.mjs';
 import { checkPushGuard, matchAny, directionCheck, jsonSubset, fastSignaturePayload } from '../scripts/push-guard.mjs';
 import { ciReadiness } from '../scripts/ci-readiness.mjs';
 import { matchUiPaths } from '../scripts/ui-paths/match.mjs';
@@ -37,7 +37,7 @@ import { appendLedger } from '../scripts/evolution/ledger-append.mjs';
 import { clusterLedger, signConfirm } from '../scripts/evolution/cluster.mjs';
 import { checkScCoverage } from '../scripts/sc-coverage-gate.mjs';
 import { buildFixPlan, computeFixPlanHash, hubViolations } from '../scripts/fix-plan.mjs';
-import { buildInvariantsSection, upsertInvariantsSection, SECTION_START, SECTION_END } from '../scripts/pr-body.mjs';
+import { buildInvariantsSection, upsertInvariantsSection, SECTION_START, SECTION_END, buildCheckpointSection, upsertCheckpointSection, CHECKPOINT_SECTION_START, CHECKPOINT_SECTION_END } from '../scripts/pr-body.mjs';
 import { normalizeRepoPath } from '../scripts/lib/common.mjs';
 import { recoverFromReceipt } from '../scripts/pr-watch/finalize.mjs';
 import { foldDispatchStates } from '../scripts/pr-watch/budget.mjs';
@@ -2482,6 +2482,9 @@ function artifactWithFindings(specs, bundleObj = bundle, gateOpts = {}) {
   // 每条 anchor + evidence 唯一（防 canonical dedup 合并），便于按 anchor 反查 canonical id。
   // SC-B1: actionable（blocker/major）finding 默认各自「自成一族」（invariant/family_id 按
   // 下标各不相同）；测试跨 finding 共享 family 时通过 spec.family_id/spec.invariant 显式指定。
+  // D1: family_id 只是这里模拟的 verdict 层本地标签（保持不变）——真正的跨 finding 分组身份
+  // 是 consensus-gate 从 invariant 派生的 family_key；两条 spec 若给了相同 invariant，即便
+  // family_id 标签不同，下游也会被正确判定为同一 family（这正是本次数据契约要保证的性质）。
   const findings = specs.map((s, i) => ({
     id: `f${i}`, primary_face: s.face ?? 'A', severity: s.sev, anchor: `${s.paths.join('|')}#${i}`, anchor_paths: s.paths, evidence: s.evidence ?? `ev-${i}-${s.paths.join(',')}`, status: 'closed',
     ...(['blocker', 'major'].includes(s.sev) ? { invariant: s.invariant ?? `inv-f${i}`, family_id: s.family_id ?? `fam-f${i}` } : {})
@@ -2496,10 +2499,11 @@ function artifactWithFindings(specs, bundleObj = bundle, gateOpts = {}) {
   return art;
 }
 
-// SC-B1: 测试懒惰路径——对 fix/verify/archive SC 自动补 invariant/family_id（从其引用的
-// canonical finding 逐字复制，只在引用 finding 存在且 actionable 时补）。显式已提供该字段的
-// SC 不覆盖（用于测试「篡改归因」「缺归因」等场景）。global SC / 多 finding_ids 的 SC 不处理
-// （SC-4 会先拒多引用，不需要本函数介入）。
+// SC-B1/D1: 测试懒惰路径——对 fix/verify/archive SC 自动补 invariant/family_key（从其引用的
+// canonical finding 逐字复制，只在引用 finding 存在且 actionable 时补）。绑定字段是
+// family_key（内容派生），不是 family_id（reviewer 席内本地标签）。显式已提供该字段的
+// SC 不覆盖（用于测试「字段错配/归因漂移」「缺归因」等场景）。global SC / 多 finding_ids 的
+// SC 不处理（SC-4 会先拒多引用，不需要本函数介入）。
 function withScAttribution(scs, artifact) {
   const byId = new Map((artifact.canonical_findings ?? []).map((f) => [f.id, f]));
   return scs.map((sc) => {
@@ -2508,8 +2512,8 @@ function withScAttribution(scs, artifact) {
     if (fids.length !== 1) return sc;
     const cf = byId.get(fids[0]);
     if (!cf || (cf.severity !== 'blocker' && cf.severity !== 'major')) return sc;
-    if ('invariant' in sc || 'family_id' in sc) return sc;
-    return { ...sc, invariant: cf.invariant, family_id: cf.family_id };
+    if ('invariant' in sc || 'family_key' in sc) return sc;
+    return { ...sc, invariant: cf.invariant, family_key: cf.family_key };
   });
 }
 
@@ -2719,7 +2723,7 @@ t('[1号-隔离] 真 N-worktree: 3 组各自 worktree 改各自文件 → 集成
     waves: [['g1', 'g2', 'g3']]
   };
   // allocate: 三个独立 worktree，base 同为 candidate
-  const alloc = ORC.allocateWave({ repoDir: r18, worktreeRoot: wtRoot, runId: 'run1', plan: plan18, waveIndex: 0, waveBase: candidate });
+  const alloc = ORC.allocateWave({ repoDir: r18, worktreeRoot: wtRoot, runId: 'run1', plan: plan18, waveIndex: 0, waveBase: candidate, artifact: { canonical_findings: [] }, scManifest: { scs: [] } });
   eq(alloc.allocations.length, 3);
   for (const a of alloc.allocations) ok(existsSync(a.worktree), `worktree 应建成: ${a.group_id}`);
   ok(new Set(alloc.allocations.map((a) => a.worktree)).size === 3, '三个 worktree 路径互异（并发写危险构造上消失）');
@@ -2742,7 +2746,7 @@ t('[1号-隔离] 真 N-worktree: 3 组各自 worktree 改各自文件 → 集成
   // 重叠场景: 两组都改 a.ts → 集成前检测出交集，fail-closed 不 merge
   const d2 = mkdtempSync(join(tmpdir(), 'orc2-'));
   const wtRoot2 = join(d2, 'wt'); mkdirSync(wtRoot2, { recursive: true });
-  const alloc2 = ORC.allocateWave({ repoDir: r18, worktreeRoot: wtRoot2, runId: 'run2', plan: plan18, waveIndex: 0, waveBase: candidate });
+  const alloc2 = ORC.allocateWave({ repoDir: r18, worktreeRoot: wtRoot2, runId: 'run2', plan: plan18, waveIndex: 0, waveBase: candidate, artifact: { canonical_findings: [] }, scManifest: { scs: [] } });
   const tips2 = [];
   for (const a of alloc2.allocations.slice(0, 2)) {
     writeFileSync(join(a.worktree, 'a.ts'), `both touch ${a.group_id}\n`); // 计划外重叠（实改写集漂移）
@@ -2780,7 +2784,7 @@ t('[1号-波次基线] wave2 base = wave1 集成 tip（依赖波能看见前波�
     waves: [['g1'], ['v2']]
   };
   // wave1: 新增 API
-  const a1 = ORC.allocateWave({ repoDir: r19, worktreeRoot: wtRoot, runId: 'r', plan: plan19, waveIndex: 0, waveBase: cand });
+  const a1 = ORC.allocateWave({ repoDir: r19, worktreeRoot: wtRoot, runId: 'r', plan: plan19, waveIndex: 0, waveBase: cand, artifact: { canonical_findings: [] }, scManifest: { scs: [] } });
   const wt1 = a1.allocations[0].worktree;
   writeFileSync(join(wt1, 'api.ts'), 'export const old = 1;\nexport const NEW_API = 2;\n');
   execFileSync('git', ['-C', wt1, 'add', '.'], { encoding: 'utf8' });
@@ -2789,7 +2793,7 @@ t('[1号-波次基线] wave2 base = wave1 集成 tip（依赖波能看见前波�
   const int1 = ORC.integrateWave({ repoDir: r19, waveBase: cand, groupTips: [{ group_id: 'g1', tip: tip1 }] });
   ok(int1.ok);
   // wave2 base = wave1 集成 tip → verify 组能看见 NEW_API（审 R1-P1-5 核心）
-  const a2 = ORC.allocateWave({ repoDir: r19, worktreeRoot: wtRoot, runId: 'r', plan: plan19, waveIndex: 1, waveBase: int1.integrated_tip });
+  const a2 = ORC.allocateWave({ repoDir: r19, worktreeRoot: wtRoot, runId: 'r', plan: plan19, waveIndex: 1, waveBase: int1.integrated_tip, artifact: { canonical_findings: [] }, scManifest: { scs: [] } });
   const wt2 = a2.allocations[0].worktree;
   ok(readFileSync(join(wt2, 'api.ts'), 'utf8').includes('NEW_API'), 'wave2 worktree 必须看见 wave1 的产物（否则依赖波形同虚设）');
   // 残骸: 把 g1 的 worktree 挪到与 base 无血缘的 orphan commit → 再 allocate 必须 fail-closed
@@ -2798,13 +2802,13 @@ t('[1号-波次基线] wave2 base = wave1 集成 tip（依赖波能看见前波�
   execFileSync('git', ['-C', wt1, 'add', '.'], { encoding: 'utf8' });
   execFileSync('git', ['-C', wt1, 'commit', '-qm', 'orphan'], { encoding: 'utf8' });
   let threw19 = false;
-  try { ORC.allocateWave({ repoDir: r19, worktreeRoot: wtRoot, runId: 'r', plan: plan19, waveIndex: 0, waveBase: cand }); }
+  try { ORC.allocateWave({ repoDir: r19, worktreeRoot: wtRoot, runId: 'r', plan: plan19, waveIndex: 0, waveBase: cand, artifact: { canonical_findings: [] }, scManifest: { scs: [] } }); }
   catch (e) { threw19 = /残骸/.test(e.message); }
   ok(threw19, '与 base 无血缘的 worktree 残骸必须 fail-closed（不得拿它当本波用）');
   // 非法输入
   for (const bad of [{ waveBase: 'HEAD' }, { runId: 'a b' }]) {
     let t19 = false;
-    try { ORC.allocateWave({ repoDir: r19, worktreeRoot: wtRoot, runId: bad.runId ?? 'r2', plan: plan19, waveIndex: 0, waveBase: bad.waveBase ?? cand }); }
+    try { ORC.allocateWave({ repoDir: r19, worktreeRoot: wtRoot, runId: bad.runId ?? 'r2', plan: plan19, waveIndex: 0, waveBase: bad.waveBase ?? cand, artifact: { canonical_findings: [] }, scManifest: { scs: [] } }); }
     catch { t19 = true; }
     ok(t19, `非法输入应拒: ${JSON.stringify(bad)}`);
   }
@@ -2840,7 +2844,7 @@ t('[2号-push闸/SC-R3-6] 端到端契约: 真实状态机 run + SKILL 字段 ma
   const wtR = join(st, 'wt'); mkdirSync(wtR);
   const symbolicBefore = git('symbolic-ref', '--short', 'HEAD');
   FR.initRun({ stateDir: st, runId: 'pg1', repoDir: repo, plan, scManifest, sourceArtifact: art, featureBranch: 'feat' });
-  const al = FR.allocate({ stateDir: st, runId: 'pg1', plan, waveIndex: 0, worktreeRoot: wtR });
+  const al = FR.allocate({ stateDir: st, runId: 'pg1', plan, waveIndex: 0, worktreeRoot: wtR, artifact: art, scManifest });
   eq(al.wave_base, HEAD, 'wave0 base == 源 artifact candidate（SC-R3-10）');
   for (const a of al.allocations) {
     for (const f of a.anchor_paths) {
@@ -3011,7 +3015,7 @@ t('[SC-1/SC-R3-1] cleanup 归属校验: 未登记拒删 + registered-not-owned �
   ok(!(bad2.steps ?? []).some((s) => s.startsWith('br-deleted')), '归属不符连分支都不删');
   // ③ 正常 run → 照常回收（目标来自真实 allocation 记录）
   const wtRoot = join(d1, 'wt'); mkdirSync(wtRoot);
-  const al = ORC.allocateWave({ repoDir: r1, worktreeRoot: wtRoot, runId: 'ok1', plan: planC, waveIndex: 0, waveBase: cand });
+  const al = ORC.allocateWave({ repoDir: r1, worktreeRoot: wtRoot, runId: 'ok1', plan: planC, waveIndex: 0, waveBase: cand, artifact: { canonical_findings: [] }, scManifest: { scs: [] } });
   ok(existsSync(al.allocations[0].worktree));
   const good = ORC.cleanupRun({ manifest: { repo_dir: r1, run_id: 'ok1', integration_branch: null, waves: [{ worktree_root: wtRoot, allocations: al.allocations }] } });
   ok(!existsSync(al.allocations[0].worktree), '已登记 worktree 应被回收');
@@ -3098,11 +3102,11 @@ t('[SC-8] run manifest CAS: wave base 由状态派生不接受自报；跳波拒
   ok(threw, 'SC-R3-10: plan 与源 artifact 不绑定必拒');
   // 跳波: wave2 未待 wave1 集成 → CAS 拒（旧实现 caller 传任意 SHA 就行）
   threw = false;
-  try { FR.allocate({ stateDir: env.stateDir, runId: 'r1', plan, waveIndex: 1, worktreeRoot: env.wtRoot }); }
+  try { FR.allocate({ stateDir: env.stateDir, runId: 'r1', plan, waveIndex: 1, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm }); }
   catch (e) { threw = /base 不可得|尚未集成/.test(e.message); }
   ok(threw, 'SC-8: 跳波 allocate 必拒（base 只能由 manifest 派生）');
   // wave1 正常
-  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'r1', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'r1', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   eq(a1.wave_base, env.cand, 'wave0 base == source candidate');
   eq(a1.allocations.length, 2);
   // SC-R3-2（R3 反例复刻）: tampered plan（漏 g2 且 hash 自洽）调 integrate → 必拒
@@ -3139,7 +3143,7 @@ t('[SC-8/SC-9/SC-10b] 完整 run: 两波 squash 集成 → 复跑验证 → fina
   FR.initRun({ stateDir: env.stateDir, runId: 'r2', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
   const symbolicBefore = env.g('symbolic-ref', '--short', 'HEAD');
   // wave1: 两组各改自己文件 → 并行集成（squash）
-  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'r2', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'r2', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   const t1a = workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
   const t1b = workGroup(env, a1.allocations[1], 'b.ts', 'fixed b\n');
   const i1 = FR.integrate({ stateDir: env.stateDir, runId: 'r2', plan, waveIndex: 0 });
@@ -3158,7 +3162,7 @@ t('[SC-8/SC-9/SC-10b] 完整 run: 两波 squash 集成 → 复跑验证 → fina
   const v1 = FR.validateIntegration({ stateDir: env.stateDir, runId: 'r2', scManifest: scm, waveIndex: 0 });
   ok(v1.ok, 'wave1 复跑应过: ' + JSON.stringify(v1.results));
   // wave2 base 必须 == wave1 集成 tip（SC-8 ①，看得见前波产物）
-  const a2 = FR.allocate({ stateDir: env.stateDir, runId: 'r2', plan, waveIndex: 1, worktreeRoot: env.wtRoot });
+  const a2 = FR.allocate({ stateDir: env.stateDir, runId: 'r2', plan, waveIndex: 1, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   eq(a2.wave_base, i1.integrated_tip, 'SC-8: wave2 base == wave1 integrated_tip');
   ok(readFileSync(join(a2.allocations[0].worktree, 'a.ts'), 'utf8').includes('fixed a'), 'wave2 必须看见 wave1 产物');
   workGroup(env, a2.allocations[0], 'e2e/x.test.ts', 'test updated\n');
@@ -3200,7 +3204,7 @@ t('[SC-8④/SC-R3-9] overlap = fail-closed + 串行重派（真重跑: 后组看
      { id: 'SC-1', kind: 'fix', finding_ids: ['f1'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'shared.ts']) }]
   );
   FR.initRun({ stateDir: env.stateDir, runId: 'r3', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
-  const a = FR.allocate({ stateDir: env.stateDir, runId: 'r3', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'r3', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   // 两组并行都改 shared.ts → 撞车
   const wt1 = a.allocations[0].worktree, wt2 = a.allocations[1].worktree;
   writeFileSync(join(wt1, 'shared.ts'), 'g1 line\nbase\n');
@@ -3305,14 +3309,14 @@ t('[R10-A1] archive kind 端到端可用: coverage-gate 过 → buildFixPlan 定
   // ③ 真跑 fix-run: init → allocate wave0 → 改 a.ts → integrate → validate
   mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
   FR.initRun({ stateDir: env.stateDir, runId: 'archA1', repoDir: env.r, plan, scManifest, sourceArtifact: art, featureBranch: 'feat' });
-  const a0 = FR.allocate({ stateDir: env.stateDir, runId: 'archA1', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a0 = FR.allocate({ stateDir: env.stateDir, runId: 'archA1', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest });
   workGroup(env, a0.allocations[0], 'a.ts', 'fixed\n');
   const i0 = FR.integrate({ stateDir: env.stateDir, runId: 'archA1', plan, waveIndex: 0 });
   ok(i0.ok, 'wave0 应集成: ' + JSON.stringify(i0.errors ?? []));
   ok(FR.validateIntegration({ stateDir: env.stateDir, runId: 'archA1', scManifest, waveIndex: 0 }).ok, 'wave0 复跑验证应过');
 
   // wave1: verify 组改 e2e/x.test.ts；archive 组把残余风险文案写进 README.md（各自独立 worktree，域互不相交）
-  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'archA1', plan, waveIndex: 1, worktreeRoot: env.wtRoot });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'archA1', plan, waveIndex: 1, worktreeRoot: env.wtRoot, artifact: art, scManifest });
   eq(a1.allocations.length, 2, 'wave1 应分配 2 个独立 worktree（verify + archive 并行）');
   const vAlloc = a1.allocations.find((x) => x.group_id === verifyGroup.id);
   const arAlloc = a1.allocations.find((x) => x.group_id === archGroup.id);
@@ -3377,7 +3381,7 @@ t('[SC-M3] archive 组越域: 改了非 README.md 的文件 → 必须被拒（w
     [{ id: 'a1', sc_ids: ['SC-ARCH'], paths: ['README.md'], archive: true }], [['a1']],
     [{ id: 'SC-ARCH', kind: 'archive', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'README.md']) }]);
   FR.initRun({ stateDir: env.stateDir, runId: 'archM3', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
-  const a = FR.allocate({ stateDir: env.stateDir, runId: 'archM3', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'archM3', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   eq(a.allocations[0].write_paths, { mode: 'fixed-list', paths: ['README.md'] }, 'archive 组分配的 write_paths 必须是脚本给定的固定清单');
   workGroup(env, a.allocations[0], 'other.md', '越域改动\n');
   const integ = FR.integrate({ stateDir: env.stateDir, runId: 'archM3', plan, waveIndex: 0 });
@@ -3542,6 +3546,11 @@ t('[R10-A4] SKILL.md 契约与实现逐字同步: 按文档描述构造的 manif
   ok(skill.includes('清单版本过期需重审'), 'SKILL 必须点名版本不符的报错措辞（与缺项错误区分，D5）');
   // SC-B1: 文档必须点名 invariant/family_id 归因字段与「lead 只能复制不得自填」的约束
   ok(skill.includes('invariant') && skill.includes('family_id'), 'SKILL 必须点名机器字段 invariant/family_id');
+  // D1: 文档必须区分 family_id（verdict 层本地标签）与 family_key（跨 reviewer/跨 candidate
+  // 的内容派生身份）——这条界线本身是 gpt 终审阻断修复的直接原因，不能只字面提过 family_id
+  // 就算数，必须同时点名 family_key 且说明两者不是一回事。
+  ok(skill.includes('family_key'), 'SKILL 必须点名机器字段 family_key');
+  ok(skill.includes('本地归组标签') || skill.includes('本地标签'), 'SKILL 必须说明 family_id 只是 reviewer 席内的本地标签（与 family_key 的区分）');
   ok(skill.includes('逐字复制') || skill.includes('逐字相等'), 'SKILL 必须说明 lead/SC 层只能逐字复制归因字段，不得自填');
   ok(skill.includes('family_context'), 'SKILL 必须点名派工包的 family_context 机制');
   // SC-B2: 文档必须点名 pr-body.mjs 机制与时序约束（先生成锚点段，delta review 才能开始）
@@ -3618,7 +3627,7 @@ t('[SC-R3-4] verify 结构化 argv: 注入串按字面传参、最小环境、�
     [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('echo', [`x; touch ${injTarget}`, secret]) },
      { id: 'SC-1', kind: 'fix', finding_ids: ['f1'], change: 'c', holds: 'h', verify: VF('node', ['-e', 'process.exit(process.env.PG_FIXTURE_SECRET ? 3 : 0)']) }]);
   FR.initRun({ stateDir: env.stateDir, runId: 'rv', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
-  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rv', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rv', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   workGroup(env, a.allocations[0], 'a.ts', 'fix\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'rv', plan, waveIndex: 0 }).ok, '集成应过');
   process.env.PG_FIXTURE_SECRET = secret;
@@ -3663,7 +3672,7 @@ t('[SC-R3-7] allowed_paths 对 verify 组同样强制（else-if 旁路已修）'
     [{ id: 'v1', sc_ids: ['SC-V'], paths: ['e2e/x.test.ts'], verify: true }], [['v1']],
     [{ id: 'SC-V', kind: 'verify', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'e2e/x.test.ts']) }]);
   FR.initRun({ stateDir: env.stateDir, runId: 'rV7', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
-  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rV7', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rV7', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   // verify worker 改 allowed 之外的测试文件（旧 else-if 只查"像测试路径"→ 放行 = R3 输入 A）
   workGroup(env, a.allocations[0], 'sneaky.spec.ts', 'not allowed\n');
   const r = FR.integrate({ stateDir: env.stateDir, runId: 'rV7', plan, waveIndex: 0 });
@@ -3677,7 +3686,7 @@ t('[SC-R3-8] 洗历史: 中间 commit 藏密钥再恢复（net diff 干净）→
     [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }], [['g1']],
     [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }]);
   FR.initRun({ stateDir: env.stateDir, runId: 'rL', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
-  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rL', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rL', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   const wt = a.allocations[0].worktree;
   const laundered = ['LAUNDERED_', 'SECRET_TOKEN'].join('');
   // commit1: 越域写入密钥文件; commit2: 删掉它 + 改 allowed 文件 → net diff 只剩 a.ts（R3 输入 B）
@@ -3703,7 +3712,7 @@ t('[SC-R3-3] 复跑绑定: 空/换/漏项 sc-manifest 不得造 vacuous PASS', (
     [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }], [['g1']],
     [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }]);
   FR.initRun({ stateDir: env.stateDir, runId: 'rM', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
-  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rM', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rM', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   workGroup(env, a.allocations[0], 'a.ts', 'fix\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'rM', plan, waveIndex: 0 }).ok);
   // 空 manifest（R3 反例: 循环零次 every=true）→ 必 throw
@@ -3715,7 +3724,7 @@ t('[SC-R3-3] 复跑绑定: 空/换/漏项 sc-manifest 不得造 vacuous PASS', (
   const scmMiss = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
     scs: [{ id: 'SC-OTHER', kind: 'fix', finding_ids: ['fx'], change: 'c', holds: 'h', verify: VF() }] };
   FR.initRun({ stateDir: env.stateDir, runId: 'rM2', repoDir: env.r, plan, scManifest: scmMiss, sourceArtifact: art, featureBranch: null });
-  const a2 = FR.allocate({ stateDir: env.stateDir, runId: 'rM2', plan, waveIndex: 0, worktreeRoot: join(env.d, 'wt2') });
+  const a2 = FR.allocate({ stateDir: env.stateDir, runId: 'rM2', plan, waveIndex: 0, worktreeRoot: join(env.d, 'wt2'), artifact: art, scManifest: scmMiss });
   workGroup(env, a2.allocations[0], 'a.ts', 'fix2\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'rM2', plan, waveIndex: 0 }).ok);
   threw = false;
@@ -3803,7 +3812,7 @@ t('[R5-P1] runConsensusGate 缺实改集 fail-closed；[R5-P2] crash 窗口凭�
     [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }], [['g1']],
     [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }]);
   FR.initRun({ stateDir: env.stateDir, runId: 'rz', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
-  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rz', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rz', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   workGroup(env, a.allocations[0], 'a.ts', 'fix\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'rz', plan, waveIndex: 0 }).ok);
   // 模拟 crash: 抹掉 tips/integrated_tip（但 integration_worktree 创建记录在 ensure 时已先落盘）
@@ -3826,7 +3835,7 @@ t('[R5-P1] finalize: feature branch 在其他 worktree 检出 → 拒（update-r
     [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }], [['g1']],
     [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }]);
   FR.initRun({ stateDir: env.stateDir, runId: 'rw', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
-  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rw', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rw', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   workGroup(env, a.allocations[0], 'a.ts', 'fix\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'rw', plan, waveIndex: 0 }).ok);
   ok(FR.validateIntegration({ stateDir: env.stateDir, runId: 'rw', scManifest: scm, waveIndex: 0 }).ok);
@@ -3882,7 +3891,7 @@ t('[R4-P1] replan 状态不可被 allocate 重放清除（串行重派不可逆�
      { id: 'SC-1', kind: 'fix', finding_ids: ['f1'], change: 'c', holds: 'h', verify: VF() }]
   );
   FR.initRun({ stateDir: env.stateDir, runId: 'rp', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
-  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rp', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rp', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   for (const al of a.allocations) {
     writeFileSync(join(al.worktree, 'shared.ts'), `${al.group_id}\n`);
     execFileSync('git', ['-C', al.worktree, 'commit', '-qam', al.group_id], { encoding: 'utf8' });
@@ -3891,7 +3900,7 @@ t('[R4-P1] replan 状态不可被 allocate 重放清除（串行重派不可逆�
   ok(!r.ok && r.replan_required, '前提: 已进入 replan');
   // R4 反例: 再 allocate 同 wave → v1 会静默重建 wave 清掉 replan → 现在必须拒
   let threw = false;
-  try { FR.allocate({ stateDir: env.stateDir, runId: 'rp', plan, waveIndex: 0, worktreeRoot: env.wtRoot }); }
+  try { FR.allocate({ stateDir: env.stateDir, runId: 'rp', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm }); }
   catch (e) { threw = /串行重派状态，禁止重新 allocate/.test(e.message); }
   ok(threw, 'R4-P1 核心: replan 后 allocate 重放必拒');
   const m = readJson(FR.runManifestPath(env.stateDir, 'rp'));
@@ -3905,7 +3914,7 @@ t('[R4-P1] finalize 未检出路径 CAS: feature branch 被并发推进 → 拒�
     [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }], [['g1']],
     [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }]);
   FR.initRun({ stateDir: env.stateDir, runId: 'rc', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
-  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rc', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'rc', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   workGroup(env, a.allocations[0], 'a.ts', 'fix\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'rc', plan, waveIndex: 0 }).ok);
   ok(FR.validateIntegration({ stateDir: env.stateDir, runId: 'rc', scManifest: scm, waveIndex: 0 }).ok);
@@ -3963,13 +3972,13 @@ t('[R6-P2] integration 记录路径为唯一权威: 后续波换 worktree_root �
     [{ id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) },
      { id: 'SC-V', kind: 'verify', finding_ids: ['f1'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'e2e/x.test.ts']) }]);
   FR.initRun({ stateDir: env.stateDir, runId: 'rf', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
-  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'rf', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'rf', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   workGroup(env, a1.allocations[0], 'a.ts', 'fix\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'rf', plan, waveIndex: 0 }).ok);
   ok(FR.validateIntegration({ stateDir: env.stateDir, runId: 'rf', scManifest: scm, waveIndex: 0 }).ok);
   // wave2 换一个 worktree_root（R6 反例: v1 实现会在 root2 分叉出第二个 integration worktree）
   const root2 = join(env.d, 'wt2'); mkdirSync(root2);
-  const a2 = FR.allocate({ stateDir: env.stateDir, runId: 'rf', plan, waveIndex: 1, worktreeRoot: root2 });
+  const a2 = FR.allocate({ stateDir: env.stateDir, runId: 'rf', plan, waveIndex: 1, worktreeRoot: root2, artifact: art, scManifest: scm });
   workGroup(env, a2.allocations[0], 'e2e/x.test.ts', 'test\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'rf', plan, waveIndex: 1 }).ok);
   const m = readJson(FR.runManifestPath(env.stateDir, 'rf'));
@@ -4196,11 +4205,12 @@ t('[SC-B1/D1] family_id 引用合法性: 同 family 的 invariant 必须逐字�
   eq(validateVerdict(mkTwo('同一个不变量', '同一个不变量')).length, 0, '同 family_id 且 invariant 逐字一致应过');
 });
 
-t('[SC-B1] consensus-gate 冻结 invariant/family_id 到 canonical finding（取首个 origin 的值，与 anchor/primary_face 同一处理方式）', () => {
+t('[SC-B1/D1] consensus-gate 冻结 invariant + 派生 family_key（内容身份，不是 family_id 标签）到 canonical finding', () => {
   const srcBundle2 = mkBundle(SHA_A, SHA_B);
   const fdA = { id: 'FA', primary_face: 'A', severity: 'major', anchor: 'src/shared.ts#0', anchor_paths: ['src/shared.ts'], invariant: 'first-invariant', family_id: 'FAM-X', evidence: 'ev-shared', status: 'closed' };
   // 第二席同一条 finding（同 canonicalFindingKey：face+anchor+evidence 指纹一致）携带不同的
-  // invariant/family_id 文本——冻结逻辑只取首个 origin 的值，不做跨 origin 语义裁决/合并。
+  // invariant/family_id 文本——冻结逻辑只取首个 origin 的 invariant，不做跨 origin 语义裁决/
+  // 合并；family_key 则从「冻结后的 invariant」派生，与 origin 到达顺序无关。
   const fdB = { ...fdA, id: 'FB', invariant: 'second-invariant-should-not-win', family_id: 'FAM-Y-should-not-win' };
   const v1x = mkVerdictFor('claude-adversarial', srcBundle2, { findings: [fdA], closed_finding_ids: ['FA'] });
   const v2x = mkVerdictFor('codex-adversarial', srcBundle2, { findings: [fdB], closed_finding_ids: ['FB'] });
@@ -4211,38 +4221,43 @@ t('[SC-B1] consensus-gate 冻结 invariant/family_id 到 canonical finding（取
   eq(artifact.canonical_findings.length, 1, '两席同一条 finding 应聚为 1 条 canonical');
   const cf = artifact.canonical_findings[0];
   eq(cf.invariant, 'first-invariant', 'canonical 必须冻结首个 origin（claude-adversarial）的 invariant');
-  eq(cf.family_id, 'FAM-X', 'canonical 必须冻结首个 origin 的 family_id');
+  eq(cf.family_key, familyKeyOf('first-invariant'), 'canonical 的 family_key 必须从冻结后的 invariant 派生（与 familyKeyOf 重算值一致）');
+  ok(cf.family_key !== familyKeyOf('second-invariant-should-not-win'), 'family_key 不得跟着第二席的 invariant 走');
   eq(cf.origins.length, 2, '两席的 origin 都必须保留（审②-F2 全量保留不变）');
+  // D1: origin_family_ids 保留每个 origin 自己的本地标签，供人工回溯，但不参与机器分组
+  ok(cf.origin_family_ids.some((o) => o.reviewer === 'claude-adversarial' && o.family_id === 'FAM-X'), 'origin_family_ids 必须留痕首席标签');
+  ok(cf.origin_family_ids.some((o) => o.reviewer === 'codex-adversarial' && o.family_id === 'FAM-Y-should-not-win'), 'origin_family_ids 必须留痕次席标签');
 });
 
-t('[SC-B1/D1] sc-coverage-gate: SC 的 invariant/family_id 必须逐字等于共识产物冻结值——缺失/篡改一律 fail-closed', () => {
+t('[SC-B1/D1] sc-coverage-gate: SC 的 invariant/family_key 必须逐字等于共识产物冻结值——缺失/错配一律 fail-closed', () => {
   const art = artifactWithFindings([{ sev: 'major', paths: ['src/attr.ts'], invariant: '真实不变量', family_id: 'FAM-ATTR' }]);
   const fid = art.canonical_findings[0].id;
   eq(art.canonical_findings[0].invariant, '真实不变量');
-  eq(art.canonical_findings[0].family_id, 'FAM-ATTR');
+  eq(art.canonical_findings[0].family_key, familyKeyOf('真实不变量'));
+  const realKey = art.canonical_findings[0].family_key;
   const mkOne = (over = {}) => ({ schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
-    scs: [{ id: 'SC-0', kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF(), invariant: '真实不变量', family_id: 'FAM-ATTR', ...over }] });
+    scs: [{ id: 'SC-0', kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF(), invariant: '真实不变量', family_key: realKey, ...over }] });
   // 正确逐字复制 → 过
   eq(checkScCoverage({ manifest: mkOne(), artifact: art }).length, 0, '逐字复制归因字段应过覆盖门');
   // 缺 invariant → 拒
   const missingInv = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
-    scs: [{ id: 'SC-0', kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF(), family_id: 'FAM-ATTR' }] };
+    scs: [{ id: 'SC-0', kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF(), family_key: realKey }] };
   ok(checkScCoverage({ manifest: missingInv, artifact: art }).some((e) => /必须携带 invariant/.test(e)), '缺 invariant 必须拒');
-  // 缺 family_id → 拒
+  // 缺 family_key → 拒
   const missingFam = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
     scs: [{ id: 'SC-0', kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF(), invariant: '真实不变量' }] };
-  ok(checkScCoverage({ manifest: missingFam, artifact: art }).some((e) => /必须携带 family_id/.test(e)), '缺 family_id 必须拒');
-  // 篡改 invariant（lead 改写文本）→ 拒
-  ok(checkScCoverage({ manifest: mkOne({ invariant: '被篡改的不变量' }), artifact: art }).some((e) => /不逐字相等.*invariant|invariant.*不逐字相等/.test(e) || /lead 不得篡改归因/.test(e)),
-    '篡改 invariant 必须拒');
-  // 篡改 family_id → 拒
-  ok(checkScCoverage({ manifest: mkOne({ family_id: 'FAM-FORGED' }), artifact: art }).some((e) => /lead 不得篡改归因/.test(e)), '篡改 family_id 必须拒');
+  ok(checkScCoverage({ manifest: missingFam, artifact: art }).some((e) => /必须携带 family_key/.test(e)), '缺 family_key 必须拒');
+  // invariant 与共识产物不逐字相等（字段错配/归因漂移）→ 拒
+  ok(checkScCoverage({ manifest: mkOne({ invariant: '被改写的不变量' }), artifact: art }).some((e) => /不逐字相等.*invariant|invariant.*不逐字相等/.test(e) || /字段错配\/归因漂移/.test(e)),
+    'invariant 与冻结值不一致必须拒');
+  // family_key 与共识产物不逐字相等（不是从 familyKeyOf 重算得到的值，比如手误改了几位）→ 拒
+  ok(checkScCoverage({ manifest: mkOne({ family_key: 'fk1-' + '0'.repeat(64) }), artifact: art }).some((e) => /字段错配\/归因漂移/.test(e)), 'family_key 与冻结值不一致必须拒');
 });
 
-t('[SC-B1] fix-orchestrate.familyContext: 同 family 的其它 manifestation 跨组可见，且各自带 sc_id 引用；未归族 finding 得 null', () => {
+t('[SC-B1] fix-orchestrate.familyContext: 同 family 的其它 manifestation 跨组可见，且各自带 sc_id 引用；未归族 finding 得 null；缺 artifact/scManifest 必须 fail-closed（D3）', () => {
   const art = artifactWithFindings([
     { sev: 'major', paths: ['src/fam-a.ts'], invariant: '共享不变量', family_id: 'FAM-SHARE' },
-    { sev: 'major', paths: ['src/fam-b.ts'], invariant: '共享不变量', family_id: 'FAM-SHARE' }, // 与上条同 family，不同路径 → 分到不同冲突组
+    { sev: 'major', paths: ['src/fam-b.ts'], invariant: '共享不变量', family_id: 'FAM-SHARE' }, // 与上条同 invariant → 同 family_key，不同路径 → 分到不同冲突组
     { sev: 'suggestion', paths: ['docs/note.md'] } // 不归族
   ]);
   const idOf = (i) => art.canonical_findings.find((f) => f.anchor.endsWith(`#${i}`)).id;
@@ -4257,14 +4272,16 @@ t('[SC-B1] fix-orchestrate.familyContext: 同 family 的其它 manifestation 跨
   eq(plan.plan.groups.length, 3, '三条 SC 路径互不相交，各自独立组（family 关系不影响分组——分组逻辑不改）');
   const ctxA = ORC.familyContext({ artifact: art, manifest: scManifest, scIds: ['SC-A'] });
   ok(ctxA['SC-A'], 'SC-A 应有 family_context');
-  eq(ctxA['SC-A'].family_id, 'FAM-SHARE');
+  eq(ctxA['SC-A'].family_key, familyKeyOf('共享不变量'));
   eq(ctxA['SC-A'].manifestations.length, 1, 'SC-A 应看到同 family 的另一条 manifestation（跨组可见）');
   eq(ctxA['SC-A'].manifestations[0].finding_id, idOf(1));
   eq(ctxA['SC-A'].manifestations[0].sc_id, 'SC-B', 'manifestation 必须带上已分到的 sc_id 引用（同 family 前序 finding 引用）');
   ok(ctxA['SC-A'].audit_instruction.includes('未点名处'), '审计指令文本必须要求排查未点名路径');
   const ctxC = ORC.familyContext({ artifact: art, manifest: scManifest, scIds: ['SC-C'] });
   eq(ctxC['SC-C'], null, '未归族（suggestion）finding 的 SC 应得 null family_context');
-  // allocateWave 接线: 传 artifact+scManifest 才附 family_context，不传则为 null（向后兼容）
+
+  // D3（gpt 终审阻断修复）: allocateWave 的 artifact/scManifest 现在必填——不传必须 fail-closed
+  // 抛错，不再静默产出 family_context=null（那会让"强制覆盖全部路径"悄悄退化成部分覆盖）。
   const d23 = mkdtempSync(join(tmpdir(), 'famctx-'));
   const r23 = join(d23, 'repo');
   execFileSync('git', ['init', '-q', r23]);
@@ -4278,36 +4295,56 @@ t('[SC-B1] fix-orchestrate.familyContext: 同 family 的其它 manifestation 跨
   const planShape = { schema_version: 'v1', capacity: 8, groups: [{ id: 'g1', sc_ids: ['SC-A'], paths: ['src/fam-a.ts'] }], waves: [['g1']] };
   const withCtx = ORC.allocateWave({ repoDir: r23, worktreeRoot: wtRoot23, runId: 'famctx1', plan: planShape, waveIndex: 0, waveBase: cand23, artifact: art, scManifest });
   ok(withCtx.allocations[0].family_context, '传 artifact+scManifest 时 allocation 应带 family_context');
-  eq(withCtx.allocations[0].family_context['SC-A'].family_id, 'FAM-SHARE');
-  const withoutCtx = ORC.allocateWave({ repoDir: r23, worktreeRoot: wtRoot23, runId: 'famctx2', plan: planShape, waveIndex: 0, waveBase: cand23 });
-  eq(withoutCtx.allocations[0].family_context, null, '不传 artifact/scManifest 时应为 null（向后兼容 v1 行为）');
+  eq(withCtx.allocations[0].family_context['SC-A'].family_key, familyKeyOf('共享不变量'));
+  let threwNoArtifact = false;
+  try { ORC.allocateWave({ repoDir: r23, worktreeRoot: wtRoot23, runId: 'famctx2', plan: planShape, waveIndex: 0, waveBase: cand23, scManifest }); }
+  catch (e) { threwNoArtifact = /缺 artifact/.test(e.message); }
+  ok(threwNoArtifact, 'D3: 缺 artifact 必须 fail-closed 抛错，不得静默产出 family_context=null');
+  let threwNoManifest = false;
+  try { ORC.allocateWave({ repoDir: r23, worktreeRoot: wtRoot23, runId: 'famctx3', plan: planShape, waveIndex: 0, waveBase: cand23, artifact: art }); }
+  catch (e) { threwNoManifest = /缺 scManifest/.test(e.message); }
+  ok(threwNoManifest, 'D3: 缺 scManifest 必须 fail-closed 抛错');
+  // 真旧版 artifact（actionable finding 缺 family_key）同样不做静默兼容——找到一条真正
+  // actionable（major/blocker）的 canonical finding 摘掉 family_key（不能盲摘 index 0，
+  // 排序后 index 0 可能恰好是 suggestion 级、本就没有该字段的那条，摘了等于没摘）
+  const oldArt = JSON.parse(JSON.stringify(art));
+  const actionableIdx = oldArt.canonical_findings.findIndex((f) => f.severity === 'blocker' || f.severity === 'major');
+  ok(actionableIdx !== -1, '前提: 必须存在至少一条 actionable canonical finding');
+  delete oldArt.canonical_findings[actionableIdx].family_key;
+  let threwOldFormat = false;
+  try { ORC.allocateWave({ repoDir: r23, worktreeRoot: wtRoot23, runId: 'famctx4', plan: planShape, waveIndex: 0, waveBase: cand23, artifact: oldArt, scManifest }); }
+  catch (e) { threwOldFormat = /疑似旧版 consensus artifact/.test(e.message); }
+  ok(threwOldFormat, 'D3: actionable finding 缺 family_key（真旧版 artifact）必须 fail-closed，不静默产出不完整的 family_context');
 });
 
-// family_id 集合（去重）——SKILL.md repair-mode watermark 描述的判据本体：
-// 「对照共识产物 canonical_findings 的 family_id」判断相邻两个 candidate 之间是否出现新 family。
-// watermark 本身没有代码实现（是 SKILL.md 里 lead 遵循的过程规则，没有脚本在数 candidate），
-// 这里验证的是它的**机器前提**：给定两份 consensus artifact，能否机器化判定「是否出现新 family」。
-function familyIdSet(artifact) {
-  return new Set((artifact.canonical_findings ?? []).map((f) => f.family_id).filter(Boolean));
+// family_key 集合（去重）——SKILL.md repair-mode watermark 描述的判据本体：
+// 「对照共识产物 canonical_findings 的 family_key」判断相邻两个 candidate 之间是否出现新 family。
+// D1: 绑定 family_key（内容派生），不是 family_id（reviewer 席内本地标签，两个不同 reviewer
+// 可能各自合法地把同一标签用来指不同的不变量，按标签比较毫无意义——见下方两条反例 fixture）。
+// watermark 本身没有代码实现（是 SKILL.md 里 lead 遵循的过程规则，D2 owner 拍板：有意不建
+// 生产计数器），这里验证的是它的**机器前提**：给定两份 consensus artifact，能否机器化判定
+// 「是否出现新 family」。
+function familyKeySet(artifact) {
+  return new Set((artifact.canonical_findings ?? []).map((f) => f.family_key).filter(Boolean));
 }
 function newFamilies(prevArtifact, nextArtifact) {
-  const prev = familyIdSet(prevArtifact);
-  return [...familyIdSet(nextArtifact)].filter((fid) => !prev.has(fid));
+  const prev = familyKeySet(prevArtifact);
+  return [...familyKeySet(nextArtifact)].filter((k) => !prev.has(k));
 }
 
-t('[SC-B1-WM] repair-mode watermark 的机器前提: family_id 已可从 canonical_findings 取得，「是否出现新 family」可机器判定（原 SKILL.md 脚手架条款的解除对象）', () => {
-  // candidate-N: 两个既有 family（FAM-X / FAM-Z）
+t('[SC-B1-WM] repair-mode watermark 的机器前提: family_key 已可从 canonical_findings 取得，「是否出现新 family」可机器判定（原 SKILL.md 脚手架条款的解除对象，D2 重锚 family_key）', () => {
+  // candidate-N: 两个既有 family（inv-x / inv-z）
   const artN = artifactWithFindings([
     { sev: 'major', paths: ['src/x.ts'], invariant: 'inv-x', family_id: 'FAM-X' },
     { sev: 'major', paths: ['src/z.ts'], invariant: 'inv-z', family_id: 'FAM-Z' }
   ]);
-  // candidate-N+1（出现新 family）: 沿用 FAM-X/FAM-Z，新增 FAM-Y
+  // candidate-N+1（出现新 family）: 沿用 inv-x/inv-z，新增 inv-y
   const artNextNew = artifactWithFindings([
     { sev: 'major', paths: ['src/x.ts'], invariant: 'inv-x', family_id: 'FAM-X' },
     { sev: 'major', paths: ['src/z.ts'], invariant: 'inv-z', family_id: 'FAM-Z' },
     { sev: 'blocker', paths: ['src/y.ts'], invariant: 'inv-y', family_id: 'FAM-Y' }
   ]);
-  // candidate-N+1'（无新 family）: family 集合是 N 的真子集（只剩 FAM-X）
+  // candidate-N+1'（无新 family）: family 集合是 N 的真子集（只剩 inv-x）
   const artNextSubset = artifactWithFindings([
     { sev: 'major', paths: ['src/x.ts'], invariant: 'inv-x', family_id: 'FAM-X' }
   ]);
@@ -4317,21 +4354,76 @@ t('[SC-B1-WM] repair-mode watermark 的机器前提: family_id 已可从 canonic
     eq(art.gate_result, 'pass', `candidate-${label} 应真实达成共识: ` + JSON.stringify(art.fail_reasons ?? []));
   }
 
-  // ② canonical_findings 确实携带 family_id——不是被可选跳过（脚手架条款要解除的核心前提）
+  // ② canonical_findings 确实携带 family_key——不是被可选跳过（脚手架条款要解除的核心前提）
   for (const [label, art] of [['N', artN], ['N+1(new)', artNextNew], ["N+1'(subset)", artNextSubset]]) {
     ok(art.canonical_findings.length > 0, `candidate-${label} 应至少有一条 canonical finding`);
     for (const f of art.canonical_findings) {
-      ok(typeof f.family_id === 'string' && f.family_id.length > 0, `candidate-${label} 的 canonical finding ${f.id} 必须真携带 family_id（不是「暂不可判」的字段缺失态）`);
+      ok(typeof f.family_key === 'string' && f.family_key.length > 0, `candidate-${label} 的 canonical finding ${f.id} 必须真携带 family_key（不是「暂不可判」的字段缺失态）`);
     }
   }
 
-  // ③ 由 N 与 N+1 可判出「出现了新 family Y」——水位线所需输入确实可得
+  // ③ 由 N 与 N+1 可判出「出现了新 family（inv-y）」——水位线所需输入确实可得
   const detectedNew = newFamilies(artN, artNextNew);
-  eq(detectedNew, ['FAM-Y'], '对照 canonical_findings 的 family_id 必须能判出新 family FAM-Y（水位线机器前提成立）');
+  eq(detectedNew, [familyKeyOf('inv-y')], '对照 canonical_findings 的 family_key 必须能判出新 family（水位线机器前提成立）');
 
   // ④ 反向: N+1' 的 family 集合是 N 的子集 → 判出「无新 family」
   const detectedNone = newFamilies(artN, artNextSubset);
   eq(detectedNone, [], 'family 集合是子集时必须判出「无新 family」（不得把子集误判成新 family）');
+});
+
+t('[SC-B1-WM/D1-反例①] 两席合法共用同一 family_id 标签但描述不同 invariant → family_key 不同 → 不得合并（gpt 终审实测复现的阻断项）', () => {
+  // reviewer A 与 reviewer B 各自在自己的 verdict 里都合法地用了 "F1" 这个本地标签——
+  // 但 A 的 F1 说的是"状态单一 writer"，B 的 F1 说的是"删除须 reconciliation"，两者语义
+  // 无关。两条 finding 锚在不同文件/不同 evidence，canonicalFindingKey 不会把它们去重合并，
+  // 因此产出两条独立的 canonical finding；本例断言：即便两者的 origin family_id 标签字符串
+  // 相同（都是 "F1"），下游 family_key 分组也绝不会把它们当同一 family。
+  const srcBundle3 = mkBundle(SHA_A, SHA_B);
+  const fdWriter = { id: 'FW', primary_face: 'A', severity: 'major', anchor: 'src/writer.ts#0', anchor_paths: ['src/writer.ts'], invariant: '状态字段必须只有一个写入 owner', family_id: 'F1', evidence: 'ev-writer', status: 'closed' };
+  const fdDelete = { id: 'FD', primary_face: 'A', severity: 'major', anchor: 'src/deleter.ts#0', anchor_paths: ['src/deleter.ts'], invariant: '删除操作必须走事务性 reconciliation', family_id: 'F1', evidence: 'ev-deleter', status: 'closed' };
+  const vA = mkVerdictFor('claude-adversarial', srcBundle3, { findings: [fdWriter], closed_finding_ids: ['FW'] });
+  const vB = mkVerdictFor('codex-adversarial', srcBundle3, { findings: [fdDelete], closed_finding_ids: ['FD'] });
+  const vC = mkVerdictFor('upstream-preview', srcBundle3, { findings: [], closed_finding_ids: [] });
+  const changedPaths = new Set(['src/writer.ts', 'src/deleter.ts']);
+  const artifact = runConsensusGate([vA, vB, vC], { bundle: srcBundle3, changedPaths });
+  eq(artifact.gate_result, 'pass', JSON.stringify(artifact.fail_reasons ?? []));
+  eq(artifact.canonical_findings.length, 2, '两条不相关 finding 必须保持独立的 canonical 记录（锚点/证据都不同，不因同标签合并）');
+  const cfWriter = artifact.canonical_findings.find((f) => f.anchor === fdWriter.anchor);
+  const cfDelete = artifact.canonical_findings.find((f) => f.anchor === fdDelete.anchor);
+  ok(cfWriter && cfDelete, '两条 canonical finding 都必须存在');
+  ok(cfWriter.family_key !== cfDelete.family_key, 'D1 核心: 同 family_id 标签（都是 F1）但不同 invariant 的两条 finding，family_key 必须不同（不得被旧实现按标签字符串误合并）');
+  // 派工包层面同样验证不会被错误合并
+  const scManifest = { schema_version: 'v2', consensus_artifact_hash: artifact.consensus_artifact_hash,
+    scs: withScAttribution([
+      { id: 'SC-W', kind: 'fix', finding_ids: [cfWriter.id], change: 'c', holds: 'h', verify: VF() },
+      { id: 'SC-D', kind: 'fix', finding_ids: [cfDelete.id], change: 'c', holds: 'h', verify: VF() }
+    ], artifact) };
+  const ctx = ORC.familyContext({ artifact, manifest: scManifest, scIds: ['SC-W', 'SC-D'] });
+  eq(ctx['SC-W'].manifestations.length, 0, 'SC-W 不得把 SC-D 当成同 family 的 manifestation（两者 family_key 不同）');
+  eq(ctx['SC-D'].manifestations.length, 0, 'SC-D 同理不得把 SC-W 当成同 family 的 manifestation');
+});
+
+t('[SC-B1-WM/D1-反例②] 同一 invariant 被标了不同的 family_id 标签 → family_key 相同 → 必须正确合并', () => {
+  // 同一份 verdict 里，reviewer 疏忽把同一个不变量的两处表现标成了不同的本地标签
+  // （family_id 分别是 "LABEL-A" 与 "LABEL-B"），但 invariant 文本逐字相同——这在
+  // verdict-validate 层是合法的（自洽校验只检查"同标签下 invariant 必须一致"，不禁止
+  // "同 invariant 用不同标签"）。family_key 从 invariant 派生，必须能看穿标签差异，
+  // 正确判定这两条属于同一 family。
+  const art = artifactWithFindings([
+    { sev: 'major', paths: ['src/p1.ts'], invariant: '缓存失效必须与写路径同一事务', family_id: 'LABEL-A' },
+    { sev: 'major', paths: ['src/p2.ts'], invariant: '缓存失效必须与写路径同一事务', family_id: 'LABEL-B' }
+  ]);
+  const idOf = (i) => art.canonical_findings.find((f) => f.anchor.endsWith(`#${i}`)).id;
+  eq(art.canonical_findings[0].family_key, art.canonical_findings[1].family_key,
+    'D1 核心: 同 invariant 但不同 family_id 标签，两条 canonical finding 的 family_key 必须相同');
+  const scManifest = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: withScAttribution([
+      { id: 'SC-P1', kind: 'fix', finding_ids: [idOf(0)], change: 'c', holds: 'h', verify: VF() },
+      { id: 'SC-P2', kind: 'fix', finding_ids: [idOf(1)], change: 'c', holds: 'h', verify: VF() }
+    ], art) };
+  const ctx = ORC.familyContext({ artifact: art, manifest: scManifest, scIds: ['SC-P1', 'SC-P2'] });
+  eq(ctx['SC-P1'].manifestations.length, 1, 'SC-P1 必须看到 SC-P2 是同 family 的另一处 manifestation（正确合并，不因标签不同而漏检）');
+  eq(ctx['SC-P1'].manifestations[0].sc_id, 'SC-P2');
+  eq(ctx['SC-P2'].manifestations.length, 1, 'SC-P2 同理必须看到 SC-P1');
 });
 
 t('[SC-B4] hardening-checklist.md 文档一致性: 十类齐全 + 第 10 类判据所有权/跨门兼容展开 + hub⊥coverage 实证案例', () => {
@@ -4344,6 +4436,14 @@ t('[SC-B4] hardening-checklist.md 文档一致性: 十类齐全 + 第 10 类判�
   ok(doc.includes('十类'), '文档标题/正文必须已更新为十类（不留九类残留表述于用法边界段）');
   // 单一来源提醒必须在场，防止未来又四处手抄数字
   ok(doc.includes('hardening-registry.mjs'), '文档必须点名单一来源常量文件');
+});
+
+t('[D6] schemas/review-verdict.schema.json 的 class_id maximum 必须与 hardening-registry.mjs 的 HARDENING_CLASS_COUNT 一致（不能只靠注释提醒，机器断言）', () => {
+  const schema = JSON.parse(readFileSync(join(S, '..', 'schemas', 'review-verdict.schema.json'), 'utf8'));
+  const classIdSchema = schema.properties?.hardening_coverage?.items?.properties?.class_id;
+  ok(classIdSchema, 'schema 必须有 hardening_coverage.items.properties.class_id 节点');
+  eq(classIdSchema.maximum, HARDENING_CLASS_COUNT, `schema 的 class_id maximum（${classIdSchema.maximum}）必须等于 HARDENING_CLASS_COUNT（${HARDENING_CLASS_COUNT}）——两处手抄数字漂移必须被机器抓到，不能只靠代码注释里的"务必同步"提醒`);
+  eq(classIdSchema.minimum, 1, 'class_id minimum 应恒为 1');
 });
 
 t('[SC-B2] pr-body.mjs: MUST-FIX 按 family 去重 + ARCHIVE 措辞「已登记接受」+ 不外泄证据原文', () => {
@@ -4410,6 +4510,83 @@ t('[SC-B2] pr-body.mjs: 幂等 upsert——marker 存在则整段替换保留 ow
   // 幂等: 用同一份 section 再 upsert 一次，结果必须字节级不变
   const thirdBody = upsertInvariantsSection(secondBody, sectionB);
   eq(thirdBody, secondBody, '同内容重复 upsert 必须幂等（字节级不变）');
+});
+
+t('[SC-B4-D4] pr-body.mjs: checkpoint 六件套用独立第二对 marker，不与 MUST-FIX/ARCHIVE 锚点段互相覆盖', () => {
+  const art = artifactWithFindings([{ sev: 'major', paths: ['src/ckpt.ts'], invariant: '取消后任何迟到的 start 都不得重新激活', family_id: 'FAM-CKPT' }]);
+  const manifest = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: withScAttribution([{ id: 'SC-1', kind: 'fix', finding_ids: [art.canonical_findings[0].id], change: 'c', holds: 'h', verify: VF() }], art) };
+  const invariantsSection = buildInvariantsSection({ artifact: art, manifest });
+  const checkpoint = {
+    trigger: '触发条件①: 上一轮修复漏了对称的另一半',
+    invariants: [{ family: 'cancel-race', statement: '取消后任何迟到的 start 都不得重新激活' }],
+    state_owners: [{ field: 'session.status', owner: 'SessionManager.transition()', lifecycle: 'created→active→cancelled|completed' }],
+    event_state_matrix: [{ event: 'late-start', state: 'cancelled', action: '拒绝', reason: '终态后到达的 start 必须被拒绝，不得重新激活' }],
+    symmetry_audit: [{ path: 'cancel', status: 'covered', note: '已加 guard' }, { path: '迟到', status: 'covered' }],
+    normalization: [{ semantic: '终态判定', consolidated_to: 'isTerminal(status)' }],
+    tests: [{ name: 'late-start-after-cancel.test.ts', distinguishes: '旧补丁只挡了同步路径，本测试对异步迟到路径同样断言拒绝，对旧补丁应该红' }]
+  };
+  const checkpointSection = buildCheckpointSection(checkpoint);
+  ok(checkpointSection.startsWith(CHECKPOINT_SECTION_START) && checkpointSection.endsWith(CHECKPOINT_SECTION_END), 'checkpoint 段必须被自己的 marker 完整包围');
+  ok(checkpointSection.includes('取消后任何迟到的 start 都不得重新激活'), '六件套第 1 项内容必须渲染进去');
+  ok(checkpointSection.includes('late-start-after-cancel.test.ts'), '六件套第 6 项内容必须渲染进去');
+
+  // 两段各自独立 upsert：先写不变量段，再写 checkpoint 段——互不覆盖
+  let body = upsertInvariantsSection('', invariantsSection);
+  body = upsertCheckpointSection(body, checkpointSection);
+  ok(body.includes(SECTION_START) && body.includes(CHECKPOINT_SECTION_START), '两对 marker 必须同时存在');
+  ok(body.includes('src/ckpt.ts') || body.includes('FAM-CKPT') || body.includes(art.canonical_findings[0].family_key), '不变量段内容必须还在');
+  ok(body.includes('late-start-after-cancel.test.ts'), 'checkpoint 段内容必须还在');
+
+  // 重新生成不变量段（比如 SC 变了）→ 只替换自己的 marker 段，checkpoint 段原样不动
+  const art2 = artifactWithFindings([{ sev: 'major', paths: ['src/ckpt2.ts'], invariant: '另一条不变量', family_id: 'FAM-CKPT2' }]);
+  const manifest2 = { schema_version: 'v2', consensus_artifact_hash: art2.consensus_artifact_hash,
+    scs: withScAttribution([{ id: 'SC-2', kind: 'fix', finding_ids: [art2.canonical_findings[0].id], change: 'c', holds: 'h', verify: VF() }], art2) };
+  const body2 = upsertInvariantsSection(body, buildInvariantsSection({ artifact: art2, manifest: manifest2 }));
+  ok(body2.includes('另一条不变量'), '不变量段必须换成新内容');
+  ok(body2.includes('late-start-after-cancel.test.ts'), 'D4 核心: 重新生成不变量段不得吃掉 checkpoint 段（旧契约的矛盾就在这里）');
+
+  // 反过来: 重新生成 checkpoint 段，不变量段原样不动
+  const checkpoint2 = { ...checkpoint, tests: [{ name: 'other-test.test.ts', distinguishes: '换一批测试' }] };
+  const body3 = upsertCheckpointSection(body2, buildCheckpointSection(checkpoint2));
+  ok(body3.includes('other-test.test.ts') && !body3.includes('late-start-after-cancel.test.ts'), 'checkpoint 段必须换成新内容（整段替换）');
+  ok(body3.includes('另一条不变量'), 'D4 核心: 重新生成 checkpoint 段不得吃掉不变量段');
+});
+
+t('[SC-B4-D4] pr-body.mjs: 半残/重复 marker → fail loud 拒绝写入，不得静默追加第二段', () => {
+  const section = buildInvariantsSection({ artifact: artifactWithFindings([{ sev: 'major', paths: ['src/x.ts'], invariant: 'x', family_id: 'FX' }]), manifest: { schema_version: 'v2', scs: [] } });
+  // 只有 start，没有 end（上一次写入过程中被截断/被人手改坏）
+  const halfStart = `owner 正文\n${SECTION_START}\n一些残留内容但没有 end`;
+  let threw1 = false;
+  try { upsertInvariantsSection(halfStart, section); } catch (e) { threw1 = /残缺\/重复/.test(e.message); }
+  ok(threw1, '只有 start 没有 end 必须 fail loud');
+  // 只有 end，没有 start
+  const halfEnd = `owner 正文\n一些残留内容\n${SECTION_END}`;
+  let threw2 = false;
+  try { upsertInvariantsSection(halfEnd, section); } catch (e) { threw2 = /残缺\/重复/.test(e.message); }
+  ok(threw2, '只有 end 没有 start 必须 fail loud');
+  // start 重复两次
+  const dupStart = `${SECTION_START}\nA\n${SECTION_START}\nB\n${SECTION_END}`;
+  let threw3 = false;
+  try { upsertInvariantsSection(dupStart, section); } catch (e) { threw3 = /残缺\/重复/.test(e.message); }
+  ok(threw3, 'start 重复两次必须 fail loud');
+  // end 出现在 start 之前（顺序损坏）
+  const reversed = `${SECTION_END}\n中间\n${SECTION_START}`;
+  let threw4 = false;
+  try { upsertInvariantsSection(reversed, section); } catch (e) { threw4 = /顺序损坏/.test(e.message); }
+  ok(threw4, 'end 在 start 之前必须 fail loud（顺序损坏）');
+  // 合法的一对 marker 仍应正常工作（对照组：不是所有输入都拒）
+  const healthy = `owner 正文\n${SECTION_START}\n旧内容\n${SECTION_END}`;
+  const result = upsertInvariantsSection(healthy, section);
+  ok(result.includes('owner 正文') && !result.includes('旧内容'), '合法 marker 对照组必须正常替换，不受上面异常路径影响');
+  // 两对独立 marker（invariants + checkpoint）各自的半残检测互不干扰——只坏了 checkpoint 段的
+  // marker 时，upsertInvariantsSection 不应受影响（各自扫描自己的 marker，不会扫到对方的）
+  const onlyCheckpointBroken = `${SECTION_START}\nok\n${SECTION_END}\n${CHECKPOINT_SECTION_START}\n半残 checkpoint，没有 end`;
+  const okResult = upsertInvariantsSection(onlyCheckpointBroken, section);
+  ok(!okResult.includes('半残') || okResult.includes(CHECKPOINT_SECTION_START), '不变量段自己的 marker 完好时，checkpoint 段损坏不应影响 upsertInvariantsSection 本身');
+  let threwCkpt = false;
+  try { upsertCheckpointSection(onlyCheckpointBroken, buildCheckpointSection({})); } catch (e) { threwCkpt = /残缺\/重复/.test(e.message); }
+  ok(threwCkpt, 'checkpoint 段自己的 marker 半残时，upsertCheckpointSection 必须 fail loud');
 });
 
 // ========== 汇总 + SKIPPED ==========
