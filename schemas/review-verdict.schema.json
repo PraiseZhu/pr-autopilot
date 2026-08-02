@@ -64,6 +64,20 @@
         }
       }
     },
+    "hardening_coverage": {
+      "type": "array",
+      "$comment": "加固清单九类核对点（references/hardening-checklist.md）机器覆盖字段。是否强制由 round/reviewer 决定——verdict-validate.mjs 对 round===1 的两个对抗席（claude-adversarial/codex-adversarial）强制恰好 9 项、class_id 1〜9 各恰好一次；第三席与 round>=2 不强制，JSON Schema 表达不了角色/轮次条件，以 validator 为准（同 faces 的角色级约束）。",
+      "items": {
+        "type": "object",
+        "required": ["class_id", "result", "evidence"],
+        "properties": {
+          "class_id": { "type": "integer", "minimum": 1, "maximum": 9 },
+          "result": { "enum": ["covered", "n_a"] },
+          "evidence": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
     "verdict": { "enum": ["APPROVED", "REQUIRES_CHANGES"] },
     "closed_finding_ids": { "type": "array", "items": { "type": "string" } },
     "arbitration_reason": { "type": "string" }

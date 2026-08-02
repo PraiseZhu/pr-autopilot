@@ -6,6 +6,9 @@
 //   - 任何 face.result=fail → verdict 必须 REQUIRES_CHANGES（不许 fail+APPROVED）
 //   - 存在 primary_face=taxonomy_gap 的 finding → run_status 必须 degraded（⑪ 停轮）
 //   - bundle.touches_ui=true 时对抗席 B 面禁 n_a（⑫ 脚本判定为唯一源）
+// R10-A3 修复: 加固清单覆盖率契约由纯文档承诺变机器强制——round===1 的两个对抗席必须携带
+//   hardening_coverage[9]（class_id 1〜9 各恰好一次，result∈{covered,n_a}，evidence 非空）；
+//   第三席与 round>=2 不强制（复核轮不重扫穷举面）
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -45,6 +48,9 @@ const RESULTS = ['pass', 'fail', 'n_a'];
 const SEVERITIES = ['blocker', 'major', 'suggestion'];
 const SHA_RE = /^[0-9a-f]{7,40}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
+// R10-A3: 加固清单九类（references/hardening-checklist.md）机器覆盖字段。
+const HARDENING_CLASS_COUNT = 9;
+const HARDENING_RESULTS = ['covered', 'n_a'];
 
 export const DEFAULT_REQUIREMENTS = {
   third_seat_required_faces: ['D', 'E', 'F', 'G'],
@@ -94,6 +100,34 @@ export function validateVerdict(v, opts = {}) {
     const gateIds = new Set((v.gate_checks ?? []).map((g) => g.gate_id));
     for (const gid of req.third_seat_required_gates) {
       need(gateIds.has(gid), `第三席缺必填过程门 ${gid}（gate 缺席 = fail-open，禁止）`);
+    }
+  }
+
+  // R10-A3: 加固清单覆盖率机器强制——仅 round===1 的两个对抗席（第三席/round>=2 不复核穷举面）。
+  // MUST-FIX-2 反例: 旧实现只在 SKILL.md 里写"必须标 covered/n_a"，没有任何字段/schema/校验落地，
+  // 三份完全不带 hardening_coverage 的 round:1 verdict 照样能让 runConsensusGate 返回 pass。
+  if (ADVERSARIAL.includes(v.reviewer) && v.round === 1) {
+    const items = v.hardening_coverage;
+    if (!Array.isArray(items)) {
+      need(false, `对抗席 ${v.reviewer} R1 缺 hardening_coverage（九类加固清单机器覆盖字段必填，R10-A3）`);
+    } else {
+      need(items.length === HARDENING_CLASS_COUNT,
+        `对抗席 ${v.reviewer} R1 的 hardening_coverage 必须恰好 ${HARDENING_CLASS_COUNT} 项，得到 ${items.length}`);
+      const seenClassIds = new Set();
+      for (const item of items) {
+        const cid = item?.class_id;
+        const validId = Number.isInteger(cid) && cid >= 1 && cid <= HARDENING_CLASS_COUNT;
+        need(validId, `hardening_coverage.class_id 非法: ${JSON.stringify(cid)}`);
+        if (validId) {
+          need(!seenClassIds.has(cid), `hardening_coverage.class_id 重复: ${cid}`);
+          seenClassIds.add(cid);
+        }
+        need(HARDENING_RESULTS.includes(item?.result), `hardening_coverage[class_id=${cid}].result 非法: ${item?.result}`);
+        need(typeof item?.evidence === 'string' && item.evidence.length > 0, `hardening_coverage[class_id=${cid}] 缺 evidence`);
+      }
+      for (let cid = 1; cid <= HARDENING_CLASS_COUNT; cid++) {
+        need(seenClassIds.has(cid), `对抗席 ${v.reviewer} R1 的 hardening_coverage 缺 class_id=${cid}（九类必须逐一覆盖，不许分轮细水长流）`);
+      }
     }
   }
 
