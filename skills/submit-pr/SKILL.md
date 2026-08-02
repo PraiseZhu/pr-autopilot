@@ -13,11 +13,17 @@ description: 提交 PR v2 — push 前三审收口（对抗双审 + 上游预演
 
 ```
 Phase 1  预检 + typecheck-merged + 版本 bump（确定性脚本，继承 v1）
-Phase 2  三审（push 之前，SHA 绑定 + 盲审）
+Phase 2  三审（push 之前，SHA 绑定 + 盲审；R1 走加固清单穷举）
 Phase 2b 共识 → SC 提炼（自动，无需 owner 授权）
-Phase 2c glm-5.2/max worker 修复（goal --until-sc）→ 三审 delta 复核
+Phase 2c glm-5.2/max worker 修复（按类套形状，goal --until-sc）→ delta 复核 → 收敛即收口
 Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini 注册盯梢（回执四要素）
 ```
+
+> **退出判据（2026-08-01 反猫捉老鼠修正）**：对抗审查席结构上**不会**主动给 APPROVED——它的职责
+> 就是挑毛病，新代码总有窄面可挑（九轮零 APPROVED 是本质）。收口**仍走** consensus PASS（硬约束，
+> 脚本不给旁路），但把 finding 分 `[MUST-FIX]`（改代码）/ `[ARCHIVE]`（写进 README 残余登记即解决）
+> 两类——ARCHIVE 类靠**文档化接受**让审查席正当 close，循环因此终止（文档不产生新代码 = 不长新
+> finding）。判据见 Phase 2c 收尾。「等一个不会来的批准」的破法是给审查席正当的 close 理由，不是绕闸。
 
 ## Phase 1 — 预检（保留 v1 确定性部分）
 
@@ -57,12 +63,15 @@ bundle = base_sha + candidate_sha + PR 标题/正文 + touches_ui + matched_path
 修复串行化，填成目录/不存在路径直接 degraded。影响范围说明写 `scope_note`（不进冲突图）。
 - 两对抗席：七面（A 正确性/B UI+无障碍/C 测试/D 文档/E 安全/F 范围/G 声称核实）逐面 `pass/fail/n_a`+证据；B 面仅当脚本判非 UI 才许 n_a。
 - 第三席：只填相关 faces（F/G/E/D 为主）+ `gate_checks[]`（产品/架构过程门专用通道，不得用无类型 finding 绕过归属规则）。
-- 首轮穷举（④）：后续轮冒出"首轮就能看到但没报"的 → 该席本轮 `degraded`。
+- 首轮穷举（④）+ **加固清单覆盖率契约**：R1 两对抗席**必须逐条扫** `references/hardening-checklist.md`
+  的九类核对点（不是「看到什么报什么」），并在 verdict 里对每一类标 `covered/n_a`——目的是把
+  「既有代码的洞」在**一轮**里挖净，而不是分轮细水长流（R3 的 11 条本可更多提前到 R1）。
+  后续轮冒出"首轮就能看到但没报"的 → 该席本轮 `degraded`。
 - finding 归属（⑪）：恰好一个 `primary_face`；白名单内映射不进任何面 → `taxonomy_gap` + degraded 停轮，禁止丢弃。
 - Blocker 白名单（③）：仅 active path 失败 / SC 未达成 / 状态污染 / 安全风险 / 核心验证缺失 / 范围违规可阻塞；风格偏好等只进 Residual Risk 附录，不计入共识。
 
 **lead 职责**：只做争议仲裁（质询 ≤3 轮），**不改代码、不代关 finding、不宣布共识**。
-Round 2+ 只对账修复情况 + 审 delta（含 SC/标题/正文/验证声称的元数据 diff，G 面不豁免）；禁止重审未改代码。unresolved 连续 2 轮不减 → 停给 owner。
+Round 2+ 只对账修复情况 + 审 delta（含 SC/标题/正文/验证声称的元数据 diff，G 面不豁免）；禁止重审未改代码。**收口/螺旋/卡死的判据统一见 Phase 2c 收尾「收敛判据与收口」**（收口仍走 consensus PASS，靠 ARCHIVE 类文档化接受终止循环）。
 
 **共识 = 脚本判**：
 ```
@@ -105,6 +114,12 @@ node scripts/fix-plan.mjs --artifact consensus.json --manifest sc-manifest.json 
 - `kind=verify` 的 SC 自动进**最后一波**（base = 前波集成 tip，故能看见前波产物）
 - 缺 `anchor_paths` → plan degraded，**不产出可派工计划**；恢复唯一路径 = 原 origin 席补发
   verdict 重跑 validator→consensus→coverage→plan。**lead 不得代填 anchor_paths、不得拆组也不得合组。**
+
+**修复方设计约束（写代码之前，按类套形状——反补丁螺旋的主闸）**：
+派工包必须带上 `references/hardening-checklist.md`，并要求 worker：**动手前先判本 SC 触碰的
+代码种类**，命中清单左列任一类 → **上来就套右列的已知正确形状、一次写完**，禁止「先加一个 guard、
+被审出来再补第二个」。这是砍掉 B 类 finding（修复引入的新洞）的主手段——R6→R9 四轮全是「删分支」
+这一个不可逆操作被拆成四次补丁，若 R6 一次套上「事务 reconciliation」形状，R7/R8/R9 三轮不存在。
 
 **逐波执行（有状态 orchestrator，SC-8：base 由 run manifest CAS 派生，不接受自报）**：
 ```
@@ -155,6 +170,32 @@ node scripts/fix-run.mjs finalize --state-dir <st> --run-id <run>   # 输出 run
 - 两对抗席只对账 findings 修没修 + delta 有无新问题，禁重审未改代码；
 - 第三席对每个新 candidate 做只读 gate replay 出新 verdict（**不计对抗轮次**）；
 - 重跑 consensus-gate 绑定三份新 verdict。
+
+**收敛判据与收口（反猫捉老鼠核心）**：
+> 前提认清：对抗审查席**结构上不会主动给 APPROVED**——它的职责是挑毛病，新代码总有窄面可挑。
+> 但收口**仍必须走** consensus-gate PASS（全 APPROVED + 全 finding closed）+ push-guard——这是硬约束，
+> 脚本不给旁路（`consensus-gate` conjunct②③ + push-guard `gate_result==pass`）。**不存在 lead 越过审查席
+> 直接发车的路径**，写「不等 APPROVED 就 push」= 文档骗自己（正是加固清单第 7 条的坑）。
+>
+> 真正的解法不是绕闸，是**让审查席有正当理由 close**：把 finding 分两类处置，`[ARCHIVE]` 类的
+> **修复动作本身就是"写进 README 残余登记"**（文档化接受即解决，R9 已实证此路径）。
+
+每轮 delta 复核，审查席对每条存活 finding 标 `[MUST-FIX]` 或 `[ARCHIVE-eligible]`：
+
+1. **`[ARCHIVE-eligible]` 判据**（四条全中）：① 窄面（不改主要控制/数据流，只是并发窗口/异常路径的窄角）；
+   ② 限于**本修复周期新写的代码**（git 可查，不是既有面）；③ 非数据损失、非泄密、非安全绕过、
+   非 active-path 失败、非 T2 冒充；④ 审查席给出了**它自己建议的残余登记文案**。
+2. **ARCHIVE 类的收口**：把该文案**逐字写进 `README.md` 残余风险登记**（这一步 = 该 finding 的修复，
+   不需 owner 授权，同 Phase 2b）→ 下一轮 delta 审查席据此把它 `status=closed`（已由文档化接受解决）
+   → consensus-gate 正常 PASS → push。**闸没绕，循环终止**（因为文档化不产生新代码 = 不长新 finding）。
+3. **`[MUST-FIX]` 仍须改代码**：回 Phase 2c 头部，**按类套形状重做**（不是打补丁）。
+4. **补丁螺旋探测（替代数字轮次上限）**：连续 **2 轮** delta 都「只有窄面 `[MUST-FIX]` 且全打在
+   **上一轮新写的代码**上」= 补丁螺旋 → **强制**回「修复方设计约束」把该模块**所有异常出口一次性重写**
+   （不是再加 guard）；若本轮已按类重写过仍复现同类窄面 → 该条**降级为 `[ARCHIVE-eligible]`** 走第 2 条。
+5. **真·卡死兜底**：`[MUST-FIX]` 的 **blocker/major** 连续 2 轮不减（不是窄面）→ 停，报 owner。
+
+区分：4 治「越修越窄的补丁螺旋」（收敛中，用重写或转 ARCHIVE 了结）；5 治「真修不动」（不收敛，交人）。
+**绝不**混为「跑够 N 轮就停」的数字闸——数字闸要么切早漏真问题，要么切晚继续螺旋。
 
 ## Phase 3 — push + 注册（lead 指定一个修复 worker 执行；并行场景选其一即可）
 
