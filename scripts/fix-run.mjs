@@ -100,11 +100,14 @@ export function nextWaveBase(manifest, waveIndex) {
   return prev.integrated_tip;
 }
 
-// SC-B1: artifact/scManifest 是**可选**的派工上下文输入（供 family_context 派生，见
-// fix-orchestrate.mjs 的 familyContext）——不传即为 v1 行为，完全向后兼容。传了就必须与本
-// run init 时绑定的 hash 一致（fail-closed，防有人拿不相干的 artifact/manifest 冒充上下文），
-// 不一致直接抛错，不静默降级为「没有 family_context」（那会把「输入错」伪装成「无 family」）。
-export function allocate({ stateDir, runId, plan, waveIndex, worktreeRoot, artifact = null, scManifest = null }) {
+// D3（gpt 终审阻断修复）: artifact/scManifest 改**必填**——旧版允许不传、静默产出
+// family_context=null，「强制覆盖全部路径」这件事因此可以静默退化成部分覆盖，且对真旧版
+// manifest（未升级到 family_key 数据契约）不做静默兼容，两个入口（本函数 + fix-orchestrate.mjs
+// 的 allocateWave/familyContext）同等 fail-closed，不留 legacy 通道（hardening-checklist 第
+// 5 类）。传入后必须与本 run init 时绑定的 hash 一致（fail-closed，防误传不相关的
+// artifact/manifest——字段错配，不是恶意场景的专用措辞，D5），不一致直接抛错，不静默降级
+// 为「没有 family_context」（那会把「输入错」伪装成「无 family」）。
+export function allocate({ stateDir, runId, plan, waveIndex, worktreeRoot, artifact, scManifest }) {
   const { path, m } = loadRun(stateDir, runId, plan);
   if (m.waves[waveIndex]?.integrated_tip) throw new Error(`wave${waveIndex + 1} 已集成，不可重复 allocate`);
   // R4-P1: replan 状态不可被 allocate 重放清除——否则串行重派可被绕回并行集成（fail-open）。
@@ -112,11 +115,13 @@ export function allocate({ stateDir, runId, plan, waveIndex, worktreeRoot, artif
   if (m.waves[waveIndex]?.replan) {
     throw new Error(`wave${waveIndex + 1} 已进入 overlap 串行重派状态，禁止重新 allocate（只能 serial-allocate 消费，R4-P1）`);
   }
-  if (artifact && recomputeArtifactHash(artifact) !== m.source_artifact_hash) {
-    throw new Error('allocate 传入的 artifact 与本 run 绑定的 source_artifact_hash 不符（family_context 输入必须是同一份源共识，fail-closed）');
+  if (!artifact) throw new Error('allocate 缺 artifact（D3 必填：family_context 强制覆盖全部路径，不传会静默退化，两个入口同等 fail-closed）');
+  if (!scManifest) throw new Error('allocate 缺 scManifest（D3 必填，同上）');
+  if (recomputeArtifactHash(artifact) !== m.source_artifact_hash) {
+    throw new Error('allocate 传入的 artifact 与本 run 绑定的 source_artifact_hash 不符（字段错配：family_context 输入必须是同一份源共识，fail-closed）');
   }
-  if (scManifest && hashObject(scManifest) !== m.sc_manifest_hash) {
-    throw new Error('allocate 传入的 scManifest 与本 run 绑定的 sc_manifest_hash 不符（family_context 输入必须是同一份 sc manifest，fail-closed）');
+  if (hashObject(scManifest) !== m.sc_manifest_hash) {
+    throw new Error('allocate 传入的 scManifest 与本 run 绑定的 sc_manifest_hash 不符（字段错配：family_context 输入必须是同一份 sc manifest，fail-closed）');
   }
   const waveBase = nextWaveBase(m, waveIndex); // ← 权威来源
   const alloc = allocateWave({ repoDir: m.repo_dir, worktreeRoot, runId, plan, waveIndex, waveBase, artifact, scManifest });
@@ -482,14 +487,13 @@ if (isMain(import.meta.url)) {
       const m = initRun({ stateDir: args['state-dir'], runId: args['run-id'], repoDir: args['repo-dir'], plan: readJson(args.plan), scManifest: readJson(args['sc-manifest']), sourceArtifact: readJson(args['source-artifact']), featureBranch: args['feature-branch'] });
       process.stdout.write(JSON.stringify({ ok: true, run_id: m.run_id, source_candidate: m.source_candidate }) + '\n');
     } else if (mode === 'allocate') {
-      need(['state-dir', 'run-id', 'plan', 'wave', 'worktree-root']);
-      // SC-B1: --artifact/--sc-manifest 可选——传了才产出 family_context（须与 init 绑定的
-      // hash 一致，见 allocate() 的 fail-closed 校验），不传即 v1 行为。
+      // D3: --artifact/--sc-manifest 改必填——两个入口同等 fail-closed，不留 legacy 通道。
+      need(['state-dir', 'run-id', 'plan', 'wave', 'worktree-root', 'artifact', 'sc-manifest']);
       const r = allocate({
         stateDir: args['state-dir'], runId: args['run-id'], plan: readJson(args.plan),
         waveIndex: Number(args.wave), worktreeRoot: args['worktree-root'],
-        artifact: args.artifact ? readJson(args.artifact) : null,
-        scManifest: args['sc-manifest'] ? readJson(args['sc-manifest']) : null
+        artifact: readJson(args.artifact),
+        scManifest: readJson(args['sc-manifest'])
       });
       process.stdout.write(JSON.stringify({ ok: true, wave_base: r.wave_base, allocations: r.allocations }, null, 2) + '\n');
     } else if (mode === 'integrate') {
