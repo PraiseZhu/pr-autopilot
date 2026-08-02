@@ -100,8 +100,21 @@ worker 先 commit 部分产出。
 
 ## 六件套产出去向
 
-产出贴进 PR body 的 checkpoint marker 段（与 conv-contract 分支引入的 pr-body 锚点机制
-衔接——marker 段的脚本化写入/校验归该分支负责，本文档只定义写什么、何时写，不新增脚本）。
+产出贴进 PR body 的**独立** checkpoint marker 段（`<!-- pr-autopilot:checkpoint:start/end -->`，
+D4，与 MUST-FIX/ARCHIVE 的不变量锚点段用**不同**的 marker，互相独立 upsert、互不覆盖——
+两者共用同一对 marker 曾是本文档与 `SKILL.md` 之间的一处矛盾：任何一方重新生成都会把另一方
+整段吃掉，2026-08-02 gpt 终审阻断项）。写法：
+```
+node scripts/pr-body.mjs --artifact consensus.json --sc-manifest sc-manifest.json \
+  --checkpoint-json checkpoint.json [--existing-body <当前 PR body 文件>]
+```
+`checkpoint.json` 结构对应六件套：`{ trigger, invariants:[{family,statement}],
+state_owners:[{field,owner,lifecycle}], event_state_matrix:[{event,state,action,reason}],
+symmetry_audit:[{path,status,note}], normalization:[{semantic,consolidated_to}],
+tests:[{name,distinguishes}] }`——`scripts/pr-body.mjs` 的 `buildCheckpointSection` 只负责
+渲染，不判断六件套是否齐全（那仍是 lead 派工/收口时的过程纪律，见上方 D1 原子性）。
+半残/重复 marker（只有 start、只有 end、重复 start）→ 脚本 fail loud 拒绝写入，不会静默
+在文档里堆出第二段。
 产出同时服务三个读者：自己下一步修复时的模型、lead 判断是否收敛的依据、审查席复核 delta
 时的判据来源——`review-convergence.md` §2 原文称之为「reviewer 有了明确不变量后反馈会明显
 更聚焦，不再每轮换个入口挑一条」。
