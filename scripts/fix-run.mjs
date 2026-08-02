@@ -382,18 +382,41 @@ export function verifyDigest(v) { return sha256(canonicalJson({ cmd: v.cmd, args
 const DEP_MANIFEST_BASENAMES = new Set(['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock']);
 export const DEP_TOOLCHAIN_CMDS = new Set(['npx', 'npm', 'yarn', 'pnpm']);
 export function prepareDependencies({ repoDir, wt, sourceCandidate, integratedTip }) {
-  const wtModules = join(wt, 'node_modules');
-  if (existsSync(wtModules)) return { unrunnable: false, linked: false }; // worktree 已有，无需准备
   const repoModules = join(repoDir, 'node_modules');
   if (!existsSync(repoModules)) return { unrunnable: false, linked: false }; // 坑④: 主仓也没有 = 合法态
-  const changed = changedFiles({ repoDir, base: sourceCandidate, tip: integratedTip });
-  const touched = changed.find((f) => DEP_MANIFEST_BASENAMES.has(basename(f)));
-  if (touched) {
+  // R2-F2（gpt 复审 finding 2，P1）: 依赖清单 diff 必须**先于**「worktree 已有 node_modules」
+  // 的早返回。旧顺序是先看 wtModules 存在就直接返回 runnable，而 integration worktree 是
+  // **run 级跨波复用**（见 ensureIntegrationWorktree，注释原话「run 级记录: integration
+  // worktree 跨波共享」），波间只做 `git checkout --detach`——**不清 untracked**，所以 wave 1
+  // 建的软链原地活到 wave 2。于是 wave 2 即便改了 package.json 也撞第一行早返回，永远走不到
+  // 下面的清单检查，被归成 runnable，然后在**旧依赖**下跑出 PASS。
+  // 阻断谓词本身是对的（validate 用 every(status==='PASS')，UNRUNNABLE 令 ok=false；
+  // finalizeRun 拒 validation.ok !== true）——出问题的是它的**分类前提**被短路了。
+  // gpt 实测探针（已有软链 + source..tip 改 package.json）拿到 {unrunnable:false,linked:false}。
+  let changed;
+  try {
+    changed = changedFiles({ repoDir, base: sourceCandidate, tip: integratedTip });
+  } catch (e) {
+    // 算不出实改集就不敢判「依赖没变」——抛错归 UNRUNNABLE，不是归 runnable（fail-closed）
     return {
       unrunnable: true, linked: false,
-      reason: `候选改动了依赖清单 ${touched}，链入主仓的 node_modules 与候选不一致（fail-closed，未尝试软链）——需真实安装依赖后重跑，本轮不自动 npm ci（新增机制确认门，留给下一轮）`
+      reason: `无法计算 ${sourceCandidate?.slice?.(0, 8) ?? '?'}..${integratedTip?.slice?.(0, 8) ?? '?'} 的实改集，无法判断依赖清单是否变化（fail-closed）: ${e.message}`
     };
   }
+  const touched = changed.find((f) => DEP_MANIFEST_BASENAMES.has(basename(f)));
+  const wtModules = join(wt, 'node_modules');
+  if (touched) {
+    // 注意 changedFiles 取的是 source_candidate..本波 tip = **累计** diff：某一波改过清单后，
+    // 后续每一波的 diff 里都还带着它，所以整个 run 会持续判 UNRUNNABLE，不会下一波又放行。
+    // 也因此**不删**任何已有的 node_modules：既然已经阻断，删了不多买一分安全，
+    // 而误删一份真实安装的依赖是不可逆的。只把「有残留软链」如实写进 reason。
+    const stale = existsSync(wtModules) ? '（integration worktree 内已有前一波留下的 node_modules 残留，未删除）' : '';
+    return {
+      unrunnable: true, linked: false,
+      reason: `候选改动了依赖清单 ${touched}，链入主仓的 node_modules 与候选不一致（fail-closed，未尝试软链）${stale}——需真实安装依赖后重跑，本轮不自动 npm ci（新增机制确认门，留给下一轮）`
+    };
+  }
+  if (existsSync(wtModules)) return { unrunnable: false, linked: false }; // 依赖清单未变，前一波的软链仍然有效
   symlinkSync(repoModules, wtModules, 'dir');
   return { unrunnable: false, linked: true };
 }

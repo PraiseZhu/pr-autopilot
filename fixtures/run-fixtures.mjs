@@ -2,7 +2,7 @@
 // pr-autopilot 回归 fixtures v3 — 审③后更新（对账用例全部固化）
 // 每条用例前缀 [计划条款/审次编号]；末尾 SKIPPED 清单如实列出仓内验不了的项。
 // 模拟密钥一律运行时拼接（静态文件不含完整 token/赋值形态）。
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, utimesSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, utimesSync, rmSync, lstatSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawn } from 'node:child_process';
@@ -3721,6 +3721,62 @@ t('[D7-④] 主仓有 node_modules、候选未改依赖清单 → 真软链，�
   eq(v.results[0].status, 'PASS');
   const runM = readJson(FR.runManifestPath(env.stateDir, 'd7d'));
   ok(existsSync(join(runM.integration_worktree.path, 'node_modules', '.marker')), '软链必须真的生效（穿透可见主仓 node_modules 内容）');
+});
+
+t('[R2-F2] 跨波: wave1 建的软链不得让 wave2「改了依赖清单」被归成 runnable（gpt 复审 finding 2，P1）', () => {
+  // integration worktree 是 run 级跨波复用，波间只 `git checkout --detach`——不清 untracked，
+  // 所以 wave1 建的 node_modules 软链原地活到 wave2。旧实现把「wtModules 已存在」的早返回
+  // 放在依赖清单 diff **之前**，于是 wave2 即便改了 package.json 也走不到清单检查，
+  // 被归成 runnable，然后在**旧依赖**下跑出 PASS。阻断谓词没错，是分类前提被短路。
+  const env = mkRunEnv({ files: ['a.ts', 'package.json'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  mkdirSync(join(env.r, 'node_modules'), { recursive: true });
+  writeFileSync(join(env.r, 'node_modules', '.marker'), 'present\n');
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-0'], paths: ['a.ts'] }, { id: 'g2', sc_ids: ['SC-1'], paths: ['package.json'] }],
+    [['g1'], ['g2']],
+    [
+      { id: 'SC-0', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) },
+      { id: 'SC-1', kind: 'fix', finding_ids: ['f1'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'package.json']) }
+    ]);
+  FR.initRun({ stateDir: env.stateDir, runId: 'r2f2', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+
+  // ---- wave 1: 不碰依赖清单 → 应建软链并 PASS ----
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'r2f2', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'r2f2', plan, waveIndex: 0 }).ok, 'wave1 集成应过');
+  const v1 = FR.validateIntegration({ stateDir: env.stateDir, runId: 'r2f2', scManifest: scm, waveIndex: 0 });
+  ok(v1.ok, 'wave1 应 PASS: ' + JSON.stringify(v1.results));
+  const integWt = readJson(FR.runManifestPath(env.stateDir, 'r2f2')).integration_worktree.path;
+  const wtModules = join(integWt, 'node_modules');
+  ok(lstatSync(wtModules).isSymbolicLink(), '前提: wave1 确实建了软链（这条软链就是 wave2 的旁路来源）');
+
+  // ---- wave 2: 改依赖清单，而 wave1 的软链还在 ----
+  const a2 = FR.allocate({ stateDir: env.stateDir, runId: 'r2f2', plan, waveIndex: 1, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a2.allocations[0], 'package.json', '{"name":"changed-by-wave2"}\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'r2f2', plan, waveIndex: 1 }).ok, 'wave2 集成应过');
+  ok(lstatSync(wtModules).isSymbolicLink(), '前提: 波间 checkout --detach 不清 untracked，软链仍在（旁路成立的必要条件）');
+  const v2 = FR.validateIntegration({ stateDir: env.stateDir, runId: 'r2f2', scManifest: scm, waveIndex: 1 });
+  eq(v2.ok, false, 'R2-F2 核心断言: 已有软链不得让「候选改了依赖清单」被放行（旧实现此处 ok=true）');
+  eq(v2.results[0].status, 'UNRUNNABLE', '必须归 UNRUNNABLE，不是 PASS/FAIL——依赖与候选不一致，结果无意义');
+  ok(v2.results[0].note.includes('package.json'), 'reason 必须点名具体哪个依赖清单文件');
+  ok(v2.results[0].note.includes('残留'), 'reason 必须说明有前一波留下的 node_modules 残留（区别于裸 worktree 那条路径）');
+  ok(lstatSync(wtModules).isSymbolicLink(), '不得删除已有 node_modules——已阻断，删了不多买一分安全，误删真实依赖不可逆');
+  // 阻断必须一路传到 finalize，不能只停在 validate（finalizeRun 的契约是**抛错**，不是返回 ok:false）
+  let finThrew = null;
+  try { FR.finalizeRun({ stateDir: env.stateDir, runId: 'r2f2' }); } catch (e) { finThrew = e.message; }
+  ok(finThrew && /未通过 orchestrator 复跑验证/.test(finThrew), 'finalizeRun 必须拒绝（validation.ok !== true → 抛错）: ' + finThrew);
+});
+
+t('[R2-F2] changedFiles 抛错时归 UNRUNNABLE，不归 runnable（算不出实改集就不敢判「依赖没变」）', () => {
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(join(env.r, 'node_modules'), { recursive: true });
+  const wt = join(env.d, 'bare-wt');
+  mkdirSync(wt, { recursive: true });
+  const r = FR.prepareDependencies({ repoDir: env.r, wt, sourceCandidate: 'd'.repeat(40), integratedTip: env.cand });
+  eq(r.unrunnable, true, '实改集算不出来必须 fail-closed 判 UNRUNNABLE');
+  ok(/实改集|fail-closed/.test(r.reason ?? ''), 'reason 必须说明是算不出实改集，不是依赖清单变了');
+  ok(!existsSync(join(wt, 'node_modules')), '算不出来时不得建软链');
 });
 
 t('[SC-R3-5] anchor hub 污染: 共享 hub 把 8 组并成 1 组 → hub 门 degraded；changed-set 拦 tracked-but-unchanged', () => {
