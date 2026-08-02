@@ -246,17 +246,29 @@ node scripts/fix-run.mjs finalize --state-dir <st> --run-id <run>   # 输出 run
    **重写后仍复现同类窄面 → 不自动降级**：必须**重新逐项评估第 1 条的四项资格**，任一不满足
    （尤其③：数据损失/泄密/安全绕过/active-path 失败/T2 冒充）→ **继续 `[MUST-FIX]`**。
 5. **检查点后同族复发 → 升级阶梯，不再打补丁**（触发 = 完成第 4 条的六件套之后，**同一
-   family** 再次复发——说明模型仍是猜的，继续加条件分支没有意义）。四选项，lead 按纯技术
-   判断自主执行（不上抛 owner）：抽出显式状态机/transition reducer（命中一般 async 形状套
-   `hardening-checklist.md` 第 4 类展开）；把该职责移到更合适的上层协调者；缩减实现机制、
-   保留产品语义（降级设计）；划定范围（在 PR body 写明本 PR 不处理哪些场景，范围外 finding
-   答复说明后 close）。
-   **硬约束**：划定范围**不得**把仍在 active path 上的安全问题改名成 residual——范围只能划
-   在真正的产品边界外，不能拿它当 `[ARCHIVE]` 的后门。拆 PR **不是标准动作**：仅当以上四选项
-   都不可行时才考虑，且按 `convergence-checkpoint.md` D3 属于 owner 决策范围（拆 PR / 净新增
-   基础设施 / 用户可见行为/功能范围/发布策略变更），动手前须先获 owner 确认；升级阶梯本身
-   （选哪条技术路径）不需要 owner。升级路径若需**新增**并发/锁/缓存/持久化/重试类基础设施，
-   先过 `hardening-checklist.md`「新增机制确认门」。
+   family** 再次复发——说明模型仍是猜的，继续加条件分支没有意义）。四选项按「要不要 owner」
+   分两档，**不是**无差别的「lead 自主」——同一句话不能既说自主又说要 owner：
+
+   - **纯技术档（lead 自主，不上抛 owner）**：① 抽出显式状态机/transition reducer（命中
+     一般 async 形状套 `hardening-checklist.md` 第 4 类展开）；② 把该职责移到更合适的上层
+     协调者；③ 缩减实现机制、**保留产品语义**（降级设计）。这三条按 `convergence-checkpoint.md`
+     D3 属于「纯技术升级路径」，不改变用户可见行为与功能范围，所以自主执行。**「保留产品语义」
+     是判据，不是自称**：③做完之后若用户可见行为/功能范围实际发生了变化，即使 worker 声称
+     「保留了语义」，该改动也不再属于本档，必须落 D3 走 owner 确认——不能靠自我声明豁免。
+   - **需 owner 档**：④ **划定范围**（在 PR body 写明本 PR 不处理哪些场景，范围外 finding
+     答复说明后 close）。划定范围**本身就是**用户可见的功能范围变更，落 D3——动手前须先获
+     owner 确认，不属于「纯技术判断」，不能因为它出现在四选项列表里就默认跟①②③一样自主。
+
+   **硬约束（即使 owner 已同意划定范围，这条线也不许越）**：划定范围**不得**把仍在 active
+   path 上的安全问题改名成 residual——范围只能划在真正的产品边界外，不能拿它当 `[ARCHIVE]`
+   的后门。
+
+   拆 PR **不是标准动作**：仅当以上四选项都不可行时才考虑，同样落 D3（拆 PR / 净新增基础
+   设施 / 用户可见行为/功能范围/发布策略变更），动手前须先获 owner 确认。**「升级阶梯本身
+   不需要 owner」只在纯技术档内成立**——在①②③之间选哪条路径不需要 owner；一旦落到④划定
+   范围或拆 PR，就必须走 owner，不能把这句话读成对四选项的全称句。升级路径若需**新增**
+   并发/锁/缓存/持久化/重试类基础设施，先过 `hardening-checklist.md`「新增机制确认门」。
+
    同一谱系累计 3 次整块重写（含本条升级）仍无进展 → 走第 6 条报 owner，**不许自动
    ARCHIVE 掉**。
 6. **真·卡死兜底**：`[MUST-FIX]` 的 **blocker/major** 连续 2 轮不减（不是窄面）→ 停，报 owner。
@@ -269,8 +281,7 @@ node scripts/fix-run.mjs finalize --state-dir <st> --run-id <run>   # 输出 run
 **repair-mode watermark（补丁计数的唯一合法用途，`convergence-checkpoint.md` D2）**：计数
 权威 = 本次 submit-pr run 的 run artifacts 中「完成过 delta 审查的不同 candidate SHA」数
 （排除同 head 重跑、工具重试、纯 reviewer 重放）。第 5 个 candidate 仍出现**新 family**
-（对照共识产物 `canonical_findings` 的 family_id——该字段随第 10 类/9→10 迁移引入 consensus
-artifact，若尚未落地视为「暂不可判」而不是「无新 family」）→ 下一次修复 commit 前强制完成
+（对照共识产物 `canonical_findings` 的 family_id）→ 下一次修复 commit 前强制完成
 `references/convergence-checkpoint.md` 六件套；第 10 个 → 禁止继续同形状打补丁，lead 按第
 5 条升级阶梯自主选路径执行 + **红色通报 owner**（轮数/失败族清单/选定路径）。
 这条数字线**只**做一件事——切换「这次修复要不要先做六件套 / 要不要禁止继续同形状打补丁」，
@@ -278,6 +289,20 @@ artifact，若尚未落地视为「暂不可判」而不是「无新 family」�
 事仍分别由 consensus-gate / 审查席 / SC 覆盖门 / push-guard 独立裁决，水位线到第几个
 candidate 不改变它们的判据（与本节「反猫捉老鼠」立场一致：数字从不替代形状判断，只是在形状
 判断之外加一层「至少做过一次结构化止损」的兜底）。
+
+> **临时条款（脚手架，带显式解除条件，不是永久措辞）**：本节写下时 `family_id` 尚未落地到
+> `schemas/consensus-artifact.schema.json` 的 `canonical_findings`——在此之前，「对照 family_id
+> 判断是否新 family」这件事**暂不可判**，按 fail-closed 处理：**视为「暂不可判」而不是「无新
+> family」**，即第 5/10 个 candidate 的强制动作仍按上面文字生效，不因字段缺失而失效。
+> **解除条件（谁落地 `family_id` 谁必须做，不是可选项）**：`canonical_findings` 落地
+> `family_id` 字段后，本条临时条款**立即失效并必须从本文件删除**，同时必须在
+> `fixtures/run-fixtures.mjs` 补一条与 `[R10-A4]` 同款方法的新 fixture（自定 test id，不要
+> 复用已被占用的 `[R10-A4]`）：按本节描述构造带不同 `family_id` 的 verdict/consensus
+> manifest，真跑相关判定逻辑，验证「第 5/10 个 candidate 触发对应强制动作」这一行为本身能
+> 通过，不能只 grep 本节文字。**在没有这条 fixture 之前，删掉本临时条款本身也不允许**——
+> 否则水位线判据会从「暂不可判」这个显式脚手架状态，静默退化成「永远无新 family」的隐性
+> fail-open，watermark 从此再也不会触发，而文档读起来却像已经生效——这正是本条款要杜绝的
+> 情形。
 
 > **与 plan.md 的数字上限冲突已裁决（owner 2026-08-02）**：`docs/plan.md` SP-2 及其流程图写的
 > 「≤3 轮未收敛停给 owner」（plan.md:37 / 69 / 95 / 131）**本节取代之**——按形状判据收敛，不按轮数硬停；
