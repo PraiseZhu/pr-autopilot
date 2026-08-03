@@ -406,10 +406,19 @@ export function prepareDependencies({ repoDir, wt, sourceCandidate, integratedTi
   const touched = changed.find((f) => DEP_MANIFEST_BASENAMES.has(basename(f)));
   const wtModules = join(wt, 'node_modules');
   if (touched) {
-    // 注意 changedFiles 取的是 source_candidate..本波 tip = **累计** diff：某一波改过清单后，
-    // 后续每一波的 diff 里都还带着它，所以整个 run 会持续判 UNRUNNABLE，不会下一波又放行。
-    // 也因此**不删**任何已有的 node_modules：既然已经阻断，删了不多买一分安全，
-    // 而误删一份真实安装的依赖是不可逆的。只把「有残留软链」如实写进 reason。
+    // changedFiles 取的是 source_candidate..本波 tip 的**树差**（不是逐波增量）：只要依赖清单
+    // 相对 source 的差异**仍然存在**，后续每一波都还会看到它，持续判 UNRUNNABLE。
+    //
+    // 这里**不删**任何已有的 node_modules。初版注释把理由写成「某波改过清单后后续每波都还
+    // 带着它，所以永远不会放行」——那是**全称句，不成立**：gpt 终审构造了「后续波把
+    // package.json 内容恢复到与 source 相同」的对照组，实测 beforeRevert=["other.txt",
+    // "package.json"]、afterRevert=["other.txt"]，清单差异确实会消失。
+    // 但**决定仍然正确，安全性由另一条机制兜住**：恢复后候选依赖重新等于 source，那条旧软链
+    // 已经不 stale（用它跑是对的）；而先前那一波留下的 `validation.ok=false` 不会被后续波抹掉，
+    // `finalizeRun` 逐波检查、任一波不过即拒。所以「阻断」不是靠 diff 一直带着清单来维持的，
+    // 是靠**已落盘的逐波验证结果**维持的。
+    // 至于为什么不删：既然已阻断，删了不多买一分安全，而误删一份真实安装的依赖不可逆。
+    // 只把「有残留软链」如实写进 reason。
     const stale = existsSync(wtModules) ? '（integration worktree 内已有前一波留下的 node_modules 残留，未删除）' : '';
     return {
       unrunnable: true, linked: false,
