@@ -37,6 +37,7 @@ import { appendLedger } from '../scripts/evolution/ledger-append.mjs';
 import { clusterLedger, signConfirm } from '../scripts/evolution/cluster.mjs';
 import { checkScCoverage } from '../scripts/sc-coverage-gate.mjs';
 import { buildFixPlan, computeFixPlanHash, hubViolations } from '../scripts/fix-plan.mjs';
+import * as FP from '../scripts/fix-plan.mjs';
 import { buildInvariantsSection, upsertInvariantsSection, SECTION_START, SECTION_END, buildCheckpointSection, upsertCheckpointSection, CHECKPOINT_SECTION_START, CHECKPOINT_SECTION_END } from '../scripts/pr-body.mjs';
 import { normalizeRepoPath } from '../scripts/lib/common.mjs';
 import { recoverFromReceipt } from '../scripts/pr-watch/finalize.mjs';
@@ -3801,15 +3802,25 @@ t('[R2-F2] changedFiles 抛错时归 UNRUNNABLE，不归 runnable（算不出实
   ok(!existsSync(join(wt, 'node_modules')), '算不出来时不得建软链');
 });
 
-t('[SC-R3-5] anchor hub 污染: 共享 hub 把 8 组并成 1 组 → hub 门 degraded；changed-set 拦 tracked-but-unchanged', () => {
-  // hub 门（R3 反例复刻: 8 条 finding 各带共享 .gitignore + 独立文件）
+t('[SC-R3-5/D2] anchor hub: 共享 hub 把 8 组并成 1 组 → 产出 plan 但如实记录 7 组并行度损失（不再阻断）；changed-set 拦 tracked-but-unchanged', () => {
+  // hub 检测（R3 反例复刻: 8 条 finding 各带共享 .gitignore + 独立文件）
   const specs = Array.from({ length: 8 }, (_, i) => ({ sev: 'major', paths: ['.gitignore', `src/u${i}.ts`] }));
   const art = artifactWithFindings(specs);
   const fid = (i) => art.canonical_findings.find((f) => f.anchor.endsWith(`#${i}`)).id;
   const scm = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
     scs: specs.map((_, i) => ({ id: `SC-${i}`, kind: 'fix', finding_ids: [fid(i)], change: 'c', holds: 'h', verify: VF() })) };
   const r = buildFixPlan({ artifact: art, manifest: scm });
-  ok(r.degraded && r.reasons.some((x) => /hub 路径/.test(x)), 'SC-R3-5: 共享 hub 必须 degraded: ' + JSON.stringify(r.reasons ?? r.plan?.waves));
+  // D2（2026-08-02 重定）: 并行度不是正确性属性——hub 命中不再阻断产出 plan。
+  // 旧断言是 `r.degraded === true`，那把「跑得不够并行」当成了「计划有缺陷」，
+  // 在 mivo-canvas 上两次把正当交付整个卡死（13 条缺陷真在同一模块里，三条出路全是伪造）。
+  eq(r.degraded, false, 'D2: hub 命中不得阻断产出 plan: ' + JSON.stringify(r.reasons ?? []));
+  ok(Array.isArray(r.plan.parallelism_notes) && r.plan.parallelism_notes.length > 0, 'D2: hub 事实必须落进 plan.parallelism_notes');
+  ok(r.plan.parallelism_notes.some((x) => /hub 路径 \.gitignore/.test(x)), 'note 必须点名具体 hub 路径');
+  // 关键: note 必须给出**联合**度量的真实损失(1 → 8 = 7 组)，不是只报占比。
+  // 占比只是代理指标，分组数才是它宣称的那个量。
+  ok(r.plan.parallelism_notes.some((x) => /分组数会从 1 增到 8（并行度损失 7 组）/.test(x)), 'note 必须如实给出联合度量的损失量: ' + JSON.stringify(r.plan.parallelism_notes));
+  ok(r.plan.parallelism_notes.some((x) => /记录，不阻断/.test(x)), 'note 必须自陈是记录而非阻断，不许读起来像错误');
+
   // 对照: 去掉 hub → 8 组全并行
   const specs2 = Array.from({ length: 8 }, (_, i) => ({ sev: 'major', paths: [`src/u${i}.ts`] }));
   const art2 = artifactWithFindings(specs2);
@@ -3819,11 +3830,53 @@ t('[SC-R3-5] anchor hub 污染: 共享 hub 把 8 组并成 1 组 → hub 门 deg
   const r2 = buildFixPlan({ artifact: art2, manifest: scm2 });
   ok(!r2.degraded, JSON.stringify(r2.reasons ?? []));
   eq(r2.plan.waves[0].length, 8, '无 hub → 8 组全并行（owner 目标: 拉满也可以）');
+  eq(r2.plan.parallelism_notes, [], '无 hub 命中时 notes 必须是空数组（形状稳定，hash 才确定）');
   // changed-set 层: anchor 指向 tracked-but-unchanged 文件 → 拒（validator）
   const chg = new Set(['src/changed.ts']);
   const mkV2 = (paths) => mkVerdictFor('claude-adversarial', bundle, { findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: paths, evidence: 'e', status: 'closed' }], closed_finding_ids: ['F1'] });
   eq(validateVerdict(mkV2(['src/changed.ts']), { changedPaths: chg }).length, 0, '实改文件应过');
   ok(validateVerdict(mkV2(['.gitignore']), { changedPaths: chg }).some((e) => /实改文件集/.test(e)), 'SC-R3-5: 锚点不在被审 diff 上必拒');
+});
+
+t('[D2-冗余连接对] 逐路径「移除后是否增加分组数」在 source+test 成对时恒为 0 → 那个判据会 fail-open；联合度量看得见 4× 损失', () => {
+  // 这条钉住的是**为什么不采纳**跨会话提案方的判据（逐路径 after > before）。
+  // 4 条 SC 各含 [a.mjs, a.test.mjs, xN.mjs]：真实可并行度 4，被这对冗余连接压成 1 组。
+  const items = Array.from({ length: 4 }, (_, i) => ({ sc_id: `SC-${i}`, paths: ['a.mjs', 'a.test.mjs', `x${i}.mjs`] }));
+  eq(FP.groupByConflict(items).length, 1, '前提: 冗余连接对把 4 组压成 1 组');
+  // 逐路径探测: 移除任一条，另一条仍连着全部 → 分组数不变 → 「不是串行化成因」→ 放行
+  for (const p of ['a.mjs', 'a.test.mjs']) {
+    eq(FP.groupCountIgnoring(items, new Set([p])), 1, `逐路径判据在 ${p} 上看不到损失（这正是它 fail-open 的原因）`);
+  }
+  // 联合度量: 两条一起移除 → 4 组。损失真实存在，只是不由任何**单条**路径引起。
+  eq(FP.groupCountIgnoring(items, new Set(['a.mjs', 'a.test.mjs'])), 4, '联合度量必须看见 4× 损失');
+  // 报文必须用**联合**度量: 这个形状下逐路径度量恒为「不是成因」，联合度量才报出损失。
+  // 少了这条断言，把报文的度量改回逐路径会红 0——门读起来在度量损失，实际度量的是别的东西。
+  const notes = hubViolations(items, 0.5, 'fix');
+  eq(notes.length, 2, '两条 hub 路径都应被记录');
+  ok(notes.every((x) => /分组数会从 1 增到 4（并行度损失 3 组）/.test(x)), '报文必须给出联合度量的损失，不得逐路径算成「不是成因」: ' + JSON.stringify(notes));
+});
+
+t('[D2] groupCountIgnoring: 余集为空的 SC 各算独立一组,不得丢弃', () => {
+  // 独立成块: 「联合度量」与「空余集计数」是两条判定。合在一块时「度量改回逐路径」和
+  // 「丢弃空余集」会红同一个块,分辨不出是哪条在起作用。
+  // 丢弃空余集会低估分组数,把并行度损失算小——门于是少报损失,读起来像"没那么严重"。
+  const allShared = [{ sc_id: 'S1', paths: ['h.mjs'] }, { sc_id: 'S2', paths: ['h.mjs'] }, { sc_id: 'S3', paths: ['h.mjs'] }];
+  eq(FP.groupCountIgnoring(allShared, new Set(['h.mjs'])), 3, '余集为空的 SC 各算独立一组（不再与任何人冲突 = 可自由并行）');
+  eq(FP.groupByConflict(allShared).length, 1, '对照: 未忽略时它们本是 1 组');
+});
+
+t('[D2] parallelism_notes 必须进 fix_plan_hash——否则 lead 可把 hub 事实静默摘除', () => {
+  // 独立成块（不并进 SC-R3-5/D2）: 「不阻断」与「notes 入 hash」是两条判定，
+  // 合在一块时「改回阻断」和「把 notes 移出 hash」会红同一个块，分辨不出是哪条在起作用。
+  const specs = Array.from({ length: 8 }, (_, i) => ({ sev: 'major', paths: ['.gitignore', `src/u${i}.ts`] }));
+  const art = artifactWithFindings(specs);
+  const fid = (i) => art.canonical_findings.find((f) => f.anchor.endsWith(`#${i}`)).id;
+  const scm = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: specs.map((_, i) => ({ id: `SC-${i}`, kind: 'fix', finding_ids: [fid(i)], change: 'c', holds: 'h', verify: VF() })) };
+  const r = buildFixPlan({ artifact: art, manifest: scm });
+  ok(!r.degraded && r.plan.parallelism_notes.length > 0, '前提: 本场景应产出带 notes 的 plan');
+  const stripped = { ...r.plan, parallelism_notes: [] };
+  ok(computeFixPlanHash(stripped) !== r.plan.fix_plan_hash, 'D2: 摘掉 notes 必须让 fix_plan_hash 变化（push-guard 重算即对不上）');
 });
 
 t('[SC-R3-7] write_paths 对 verify 组同样强制（else-if 旁路已修）', () => {

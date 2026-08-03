@@ -47,8 +47,33 @@ export function trustedHubShare({ configPath = join(HERE, '../config/orchestrati
   return s;
 }
 
-// hub 门: 某路径出现在 ≥3 条 且 > share 比例的 SC 域中 → degraded（要求 origin 席拆分
-// finding 或把「影响范围」移 scope_note）。≥3 的下限保住合法的两两冲突不被误杀。
+// hub 检测: 某路径出现在 ≥3 条 且 > share 比例的 SC 域中。≥3 的下限保住合法的两两冲突。
+//
+// D2（2026-08-02，跨会话第二次死锁实测后重定，**取代 D1 的"阻断"后果，保留其检测**）:
+// 本函数的产出**不再进 degraded**（不再阻断产出 plan），改为落进 plan 的
+// `parallelism_notes`。根本理由是一句话:**并行度不是正确性属性。**
+// hub 条件度量的是"这批修复能不能并行"，而"不能并行"是关于工作本身的事实，不是计划的缺陷。
+// 13 条缺陷真的都长在同一个模块里时，正确的计划就是「一组、串行」，不是「没有计划」。
+// 拿性能指标做 fail-closed 阻断是范畴错误——代价是完全交付不了，收益只是"跑得快一点"。
+//
+// 更硬的一条: 机器**分辨不出**「合法同模块耦合」与「锚点污染」——两者产出的 path 集合
+// 完全一样，区别只在语义（这 10 条缺陷是不是真的在 gate.mjs 里）。既然分辨不出，
+// 就不该由机器下阻断判决；它该做的是把事实**记下来并且删不掉**（notes 进 plan hash，
+// push-guard 重算时对不上就断），由人看一眼。这与本仓 ARCHIVE 类「文档化接受」终止
+// 循环是同一个立场: fail loud, 不是 fail stuck。
+//
+// D1（owner 2026-08-02，复核 mivo-canvas #419 死锁）曾把判据从纯占比换成「可移除性」，
+// 但那仍是代理指标: 「某条 SC 除该路径外还有别的路径」不等于「该路径对它是多余的」。
+// mivo-canvas 第二次死锁就撞在这里——10 条缺陷真在 gate.mjs 里，每条同时也真的碰
+// gate.test.mjs，`allRemovable` 因此为真而被判成污染。D1 治了「单文件」，没治「单模块多文件」。
+//
+// 另: 提案方建议把判据改成逐路径的「移除后分组数是否增加」(after > before)。**不采纳**——
+// 它在**冗余连接对**上 fail-open，而 source+test 成对出现正是最常见的形状（也正是提案方
+// 自己那个案例）。实测反例: 4 条 SC 各含 [a.mjs, a.test.mjs, xN.mjs]，真实可并行度 4;
+// 逐路径探测「移除 a.mjs → 1 组不变」「移除 a.test.mjs → 1 组不变」两条都放行，门完全静默，
+// 而两条同时移除得 4 组——4× 的并行度损失被判成"不存在"。见 fixtures 的 [D2-冗余连接对] 一条。
+// 但提案方"度量你宣称的那个量"的方法论是对的，已采纳进**报文**: notes 里给出**联合**度量
+// （把所有命中路径一起移除，分组数从 X 变 Y），比占比更接近真实损失。
 //
 // D1（owner 2026-08-02，复核 mivo-canvas #419 死锁实测）: 判据换成「可移除性」——
 // 占比高不等于污染，真正的特征是那条共享路径**冗余**：把它从各 SC 域里删掉，各 SC
@@ -59,15 +84,33 @@ export function trustedHubShare({ configPath = join(HERE, '../config/orchestrati
 export function hubViolations(items, share, label) {
   const freq = new Map();
   for (const s of items) for (const p of new Set(s.paths)) freq.set(p, (freq.get(p) ?? 0) + 1);
-  const out = [];
+  const hits = [];
   for (const [p, n] of freq) {
     if (!(n >= 3 && n > items.length * share)) continue;
     const holders = items.filter((s) => s.paths.includes(p));
     const allRemovable = holders.every((s) => s.paths.filter((x) => x !== p).length > 0);
     if (!allRemovable) continue;          // 真耦合放行，不是 hub 污染
-    out.push(`${label} hub 路径 ${p} 出现在 ${n}/${items.length} 条 SC 域中（> hub_path_max_share=${share}）——广域锚点会把可并行修复串行化，请 origin 席拆分 finding 或移 scope_note（SC-R3-5）`);
+    hits.push(p);
   }
-  return out.sort();
+  if (!hits.length) return [];
+  // 联合度量: 把**所有**命中路径一起移除后分组数会变成多少——这才是「串行化损失」本身。
+  // 逐路径度量在冗余连接对上恒为 0（见上方 D2 说明），联合度量才看得见真实损失。
+  const before = groupByConflict(items).length;
+  const after = groupCountIgnoring(items, new Set(hits));
+  const loss = after > before ? `若这些路径不在各 SC 域中，分组数会从 ${before} 增到 ${after}（并行度损失 ${after - before} 组）` : `即便这些路径都不在各 SC 域中，分组数仍为 ${before}——这些路径不是分组数的成因`;
+  return hits.sort().map((p) => {
+    const n = freq.get(p);
+    return `${label} hub 路径 ${p} 出现在 ${n}/${items.length} 条 SC 域中（> hub_path_max_share=${share}）。${loss}。这是**记录，不阻断**（D2: 并行度不是正确性属性；机器分辨不出合法同模块耦合与锚点污染）——若确属锚点写宽了，请 origin 席拆分 finding 或移 scope_note（SC-R3-5）`;
+  });
+}
+
+// D2 联合度量用: 忽略给定路径集后的分组数。余集为空的 SC 各算独立一组（它不再与任何人
+// 冲突 = 可自由并行），**不能丢弃**——丢弃会低估分组数，把损失算小。
+export function groupCountIgnoring(items, ignore) {
+  const reduced = items.map((s) => ({ ...s, paths: s.paths.filter((x) => !ignore.has(x)) }));
+  const nonEmpty = reduced.filter((s) => s.paths.length > 0);
+  const emptyCount = reduced.length - nonEmpty.length;
+  return (nonEmpty.length ? groupByConflict(nonEmpty).length : 0) + emptyCount;
 }
 
 // 文件域相交 → union-find 同组。确定性: 组内 sc_ids 字典序、组按最小 sc_id 排序。
@@ -140,9 +183,12 @@ export function buildFixPlan({ artifact, manifest, capacity = null, hubShare = n
   // ARCHIVE_PATH、移除该路径后各自余集为空，D1 判据本身就会把它判为真同文件耦合而放行；
   // 特例豁免分支会掩盖测试信号（通用判据被改回旧版时，被豁免的池子测不出来——加固清单
   // 第 8 类「特例短路掩盖断言」），删掉后 archive 池由通用判据保护，才有真信号。
-  degraded.push(...hubViolations(fixScs, hub, 'fix'));
-  degraded.push(...hubViolations(verifyScs, hub, 'verify'));
-  degraded.push(...hubViolations(archiveScs, hub, 'archive'));
+  // D2: hub 命中不再阻断，落进 plan 的 parallelism_notes（进 plan hash，删不掉）
+  const hubNotes = [
+    ...hubViolations(fixScs, hub, 'fix'),
+    ...hubViolations(verifyScs, hub, 'verify'),
+    ...hubViolations(archiveScs, hub, 'archive'),
+  ].sort();
 
   if (degraded.length) return { degraded: true, reasons: degraded };
 
@@ -168,20 +214,32 @@ export function buildFixPlan({ artifact, manifest, capacity = null, hubShare = n
     capacity: cap,
     groups,
     waves,
-    n_min_per_wave: waves.map((w) => Math.min(w.length, cap))
+    n_min_per_wave: waves.map((w) => Math.min(w.length, cap)),
+    // D2: hub 事实随 plan 落账并进 fix_plan_hash——lead 不能把它删掉当没看见
+    // （push-guard 从源 artifact 重算 plan 并比 hash，删了就对不上，SC-R3-2）。
+    // 无命中时是空数组，不是 undefined——形状稳定，hash 才确定。
+    parallelism_notes: hubNotes
   };
   plan.fix_plan_hash = computeFixPlanHash(plan);
   return { degraded: false, plan };
 }
 
 // 重算等价（审 R1-P1-3: plan 是纯函数，push-guard 自己重跑比对，非自报）
+// D2: `v` 从 v1 升到 v2,因为 hash 覆盖面变了(新增 parallelism_notes)。按本仓既有约定
+// (对齐 `ik1-`/`fk1-` 前缀的做法): 算法改动就换版本号,让新旧 hash 在数据里可区分,
+// 绝不静默改变同名函数的输出——否则两份形状不同的 plan 会被误认成同一个。
+// 代价如实说: 升版后**旧 run manifest 绑定的 fix_plan_hash 全部失效**,进行中的 run 需重开。
+// 本仓尚无生产数据,这个代价现在付最便宜;不升版才是把「不兼容」伪装成「兼容」。
+// parallelism_notes 必须入 hash: 否则 lead 可以把 hub 事实从 plan 里删掉当没看见,
+// 而 push-guard 正是靠「从源 artifact 重算 plan 并比 hash」来发现这种摘除(SC-R3-2)。
 export function computeFixPlanHash(plan) {
   return hashObject({
-    v: 'fix-plan/v1',
+    v: 'fix-plan/v2',
     consensus_artifact_hash: plan.consensus_artifact_hash,
     capacity: plan.capacity,
     groups: plan.groups,
-    waves: plan.waves
+    waves: plan.waves,
+    parallelism_notes: plan.parallelism_notes ?? []
   });
 }
 
