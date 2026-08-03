@@ -65,21 +65,6 @@ export function hubViolations(items, share, label) {
     const holders = items.filter((s) => s.paths.includes(p));
     const allRemovable = holders.every((s) => s.paths.filter((x) => x !== p).length > 0);
     if (!allRemovable) continue;          // 真耦合放行，不是 hub 污染
-    // D3（owner 2026-08-03 授权，复核 bug-doctor 批次 1 的 13-SC 死锁实测）: 占比只是代理
-    // 指标，本门自己宣称的损失是「把可并行修复串行化」——而那个损失可以直接测量：把该路径
-    // 从各 SC 域里抽掉，若冲突图的组数**不增加**，它就没有串行化任何东西，报它即误报。
-    // D1 的「可移除性」是必要条件而非充分条件：单模块多文件 PR 里每个持有者都还有别的路径
-    // （allRemovable 为真），但抽掉该路径后各 SC 仍因共享其余文件而同组——实测 13 条 SC
-    // 抽掉 gate.mjs / gate.test.mjs 各自仍是 1 组。旧判据在此判 degraded，而 coverage-gate
-    // 的双射禁止合并 SC、锚点又不能伪造收窄 → 与 D1 修掉的 #419 同类死锁，只是从「单文件」
-    // 升级成「单模块多文件」。
-    // 本门原本要拦的攻击仍拦得住：8 条独立 finding 各挂一个共享 .gitignore 时，抽掉它组数
-    // 1→8（真的把可并行工作串行化了），判据成立、照样报。
-    const groupsBefore = groupByConflict(items).length;
-    const groupsAfter = groupByConflict(
-      items.map((s) => ({ ...s, paths: s.paths.filter((x) => x !== p) })).filter((s) => s.paths.length > 0)
-    ).length;
-    if (groupsAfter <= groupsBefore) continue; // 抽掉也拆不开 ⇒ 该路径非串行化成因，放行
     out.push(`${label} hub 路径 ${p} 出现在 ${n}/${items.length} 条 SC 域中（> hub_path_max_share=${share}）——广域锚点会把可并行修复串行化，请 origin 席拆分 finding 或移 scope_note（SC-R3-5）`);
   }
   return out.sort();
