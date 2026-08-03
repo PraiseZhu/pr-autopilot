@@ -3198,7 +3198,7 @@ t('[SC-8/SC-9/SC-10b] 完整 run: 两波 squash 集成 → 复跑验证 → fina
 t('[SC-8④/SC-R3-9] overlap = fail-closed + 串行重派（真重跑: 后组看得见前组产物，不搬旧产物）', () => {
   const env = mkRunEnv({ files: ['shared.ts'] });
   mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
-  // 两组的 allowed_paths 都含 shared.ts（计划认为可并行，实改却撞车）
+  // 两组的 write_paths 域都含 shared.ts（计划认为可并行，实改却撞车）
   const { art, plan, scm } = mkRunSetup(env,
     [{ id: 'g1', sc_ids: ['SC-0'], paths: ['shared.ts'] }, { id: 'g2', sc_ids: ['SC-1'], paths: ['shared.ts'] }],
     [['g1', 'g2']],
@@ -3826,7 +3826,7 @@ t('[SC-R3-5] anchor hub 污染: 共享 hub 把 8 组并成 1 组 → hub 门 deg
   ok(validateVerdict(mkV2(['.gitignore']), { changedPaths: chg }).some((e) => /实改文件集/.test(e)), 'SC-R3-5: 锚点不在被审 diff 上必拒');
 });
 
-t('[SC-R3-7] allowed_paths 对 verify 组同样强制（else-if 旁路已修）', () => {
+t('[SC-R3-7] write_paths 对 verify 组同样强制（else-if 旁路已修）', () => {
   const env = mkRunEnv({ files: ['e2e/x.test.ts'] });
   mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
   const { art, plan, scm } = mkRunSetup(env,
@@ -3834,10 +3834,10 @@ t('[SC-R3-7] allowed_paths 对 verify 组同样强制（else-if 旁路已修）'
     [{ id: 'SC-V', kind: 'verify', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'e2e/x.test.ts']) }]);
   FR.initRun({ stateDir: env.stateDir, runId: 'rV7', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
   const a = FR.allocate({ stateDir: env.stateDir, runId: 'rV7', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
-  // verify worker 改 allowed 之外的测试文件（旧 else-if 只查"像测试路径"→ 放行 = R3 输入 A）
+  // verify worker 改 write_paths 之外的测试文件（旧 else-if 只查"像测试路径"→ 放行 = R3 输入 A）
   workGroup(env, a.allocations[0], 'sneaky.spec.ts', 'not allowed\n');
   const r = FR.integrate({ stateDir: env.stateDir, runId: 'rV7', plan, waveIndex: 0 });
-  ok(!r.ok && r.errors.some((e) => /越域改动/.test(e)), 'SC-R3-7: verify 组越 allowed 改测试文件必拒');
+  ok(!r.ok && r.errors.some((e) => /越域改动/.test(e)), 'SC-R3-7: verify 组越 write_paths 改测试文件必拒');
 });
 
 t('[SC-R3-8] 洗历史: 中间 commit 藏密钥再恢复（net diff 干净）→ squash 后最终历史无处容身', () => {

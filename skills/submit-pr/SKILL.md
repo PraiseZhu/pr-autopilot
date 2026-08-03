@@ -344,7 +344,10 @@ marker 段 `<!-- pr-autopilot:invariants:start/end -->` 内是脚本生成的 MU
    > `hubViolations` 对任何 label 行为一致，见 fixture `[R10-A4]`。别把它写成可验证契约。
    coverage-gate 对 `archive` SC 与 `fix`/`verify` 同等要求：恰好引用 1 条 finding。
    worker 走**与 `[MUST-FIX]` 完全相同的 fix-run 编排**：`allocate` 分到自己的 worktree
-   （`allowed_paths` 只有 `README.md`）→ 把文案写进 `README.md` → commit → `integrate` →
+   （`write_paths = {mode:'fixed-list', paths:['README.md']}`——2026-08-03 终审 P2: 这里原写
+   `allowed_paths`,那是**已废弃**的字段名,schema 对 SC/finding 自带 `allowed_paths` 是**结构性拒绝**;
+   照旧文档派工会让 worker 去找一个不存在且被 validator 拒收的字段）→ 把文案写进 `README.md`
+   → commit → `integrate` →
    orchestrator 复跑 `grep` 验证通过。不需 owner 授权（同 Phase 2b）→ 下一轮 delta 审查席看到
    README 已含约定文案 + verify 通过，据此把该 finding `status=closed`（已由文档化接受解决）
    → consensus-gate 正常 PASS → push。**闸没绕，循环终止**（因为文档化不产生新代码 = 不长新 finding）。
