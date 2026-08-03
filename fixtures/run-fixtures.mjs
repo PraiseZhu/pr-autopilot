@@ -3550,7 +3550,13 @@ t('[R10-A4] SKILL.md 契约与实现逐字同步: 按文档描述构造的 manif
   ok(skill.includes('hub 路径门对 archive 池没有特例豁免'), 'SKILL 必须说明 hub 门三池同查、archive 无特例豁免（当前契约）');
   // D2 复核 P2: 机器把阻断降级为「由人读记录」时,主流程必须写明谁读/何时读/读后动作——
   // 否则 notes 只是随 JSON 存在,T1 流程可以整体无视它,「记录」名存实亡。
-  ok(skill.includes('parallelism_notes') && skill.includes('非空时 lead 必须读'), 'SKILL Phase 2c 必须定义 parallelism_notes 的消费动作（非空必读+确认,不阻断）');
+  ok(skill.includes('parallelism_notes') && skill.includes('非空时 lead 必须读'), 'SKILL Phase 2c 必须定义 parallelism_notes 的消费动作（非空必读）');
+  // 复核控制变异实证(2026-08-03): 只锁"非空必读"时,把后半句反写成"停止派工/进 degraded/
+  // 阻断"仍全绿——契约的后半(确认后继续,不得把记录当阻断用)同样要钉,否则 fixture 全绿下
+  // 流程可以改回 D2 之前的死锁。三段锚点均取 Phase 2c 消费条款内的原文。
+  ok(skill.includes('在编排记录（派工说明/PR 正文任一）里写一句确认'), 'Phase 2c 必须要求读后在编排记录写确认');
+  ok(skill.includes('后照常派工'), 'Phase 2c 必须写明确认后照常派工（不是停下）');
+  ok(skill.includes('不改分组、不进 degraded、不阻断'), 'Phase 2c 必须写明 notes 不改分组/不进 degraded/不阻断——把记录改回阻断即违反 D2');
   ok(!skill.includes('hub 路径门对 archive 池豁免'), '不得再出现旧契约原句——哪怕作为历史引文，也会让 substring 断言失去鉴别力');
   // 「三池同查」这条**无法从 buildFixPlan 的输出观测**: archive SC 的文件域固定为单一
   // README.md，移除后余集为空，D1 判据必然放行——"查了但放行"与"豁免所以没查"输出完全相同。

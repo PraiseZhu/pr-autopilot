@@ -233,8 +233,9 @@ export function buildFixPlan({ artifact, manifest, capacity = null, hubShare = n
 // 绝不静默改变同名函数的输出——否则两份形状不同的 plan 会被误认成同一个。
 // 代价如实说: 升版后**旧 run manifest 绑定的 fix_plan_hash 全部失效**,进行中的 run 需重开。
 // 本仓尚无生产数据,这个代价现在付最便宜;不升版才是把「不兼容」伪装成「兼容」。
-// parallelism_notes 必须入 hash: 否则 lead 可以把 hub 事实从 plan 里删掉当没看见,
-// 而 push-guard 正是靠「从源 artifact 重算 plan 并比 hash」来发现这种摘除(SC-R3-2)。
+// parallelism_notes 必须入 hash: 正常、未改脚本的链路下,plan 里的 notes 被删改会导致
+// push-guard「从源 artifact 重算 plan 并比 hash」时不一致而被检出(SC-R3-2,T1 防疏忽/
+// 防漂移);不防同 UID 修改脚本/guard 本身(T2,本仓做不到)。
 export function computeFixPlanHash(plan) {
   return hashObject({
     v: 'fix-plan/v2',
