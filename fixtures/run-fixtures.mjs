@@ -3548,6 +3548,9 @@ t('[R10-A4] SKILL.md 契约与实现逐字同步: 按文档描述构造的 manif
   // 这是第 8 类的 0-红 形态,由「断言锁的是旧契约 + 历史引文满足它」双因造成。
   // 改法: ①断当前**正向**契约; ②SKILL 历史块已改写为不含旧句(消除陷阱本身)。
   ok(skill.includes('hub 路径门对 archive 池没有特例豁免'), 'SKILL 必须说明 hub 门三池同查、archive 无特例豁免（当前契约）');
+  // D2 复核 P2: 机器把阻断降级为「由人读记录」时,主流程必须写明谁读/何时读/读后动作——
+  // 否则 notes 只是随 JSON 存在,T1 流程可以整体无视它,「记录」名存实亡。
+  ok(skill.includes('parallelism_notes') && skill.includes('非空时 lead 必须读'), 'SKILL Phase 2c 必须定义 parallelism_notes 的消费动作（非空必读+确认,不阻断）');
   ok(!skill.includes('hub 路径门对 archive 池豁免'), '不得再出现旧契约原句——哪怕作为历史引文，也会让 substring 断言失去鉴别力');
   // 「三池同查」这条**无法从 buildFixPlan 的输出观测**: archive SC 的文件域固定为单一
   // README.md，移除后余集为空，D1 判据必然放行——"查了但放行"与"豁免所以没查"输出完全相同。
@@ -3865,7 +3868,7 @@ t('[D2] groupCountIgnoring: 余集为空的 SC 各算独立一组,不得丢弃',
   eq(FP.groupByConflict(allShared).length, 1, '对照: 未忽略时它们本是 1 组');
 });
 
-t('[D2] parallelism_notes 必须进 fix_plan_hash——否则 lead 可把 hub 事实静默摘除', () => {
+t('[D2] parallelism_notes 必须参与 fix_plan_hash（正常链路下删改 notes 会被重算检出；不防同 UID 改脚本）', () => {
   // 独立成块（不并进 SC-R3-5/D2）: 「不阻断」与「notes 入 hash」是两条判定，
   // 合在一块时「改回阻断」和「把 notes 移出 hash」会红同一个块，分辨不出是哪条在起作用。
   const specs = Array.from({ length: 8 }, (_, i) => ({ sev: 'major', paths: ['.gitignore', `src/u${i}.ts`] }));

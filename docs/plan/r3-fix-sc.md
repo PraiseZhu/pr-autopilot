@@ -46,6 +46,13 @@
   manifest 里断言无 stdout 原文字段；旧 string 形态 verify → coverage gate 拒。
 
 ### SC-R3-5 [P1] anchor 反 hub 污染：changed-set 收紧 + hub 频率门
+
+> ⚠ **本条的 hub 门部分已被取代（历史记录，非现行契约）**：「→ degraded」的阻断后果
+> 先被 D1（2026-08-02，可移除性判据）收窄，再被 D2（fable 裁决 2026-08-03）取消——
+> 现行为「检测面不变，命中落 plan.parallelism_notes（联合度量）+ 进 fix_plan_hash，
+> 不 degraded 不阻断」。下方「验」里的「8 SC 共享单 hub → buildFixPlan degraded」
+> 对应的 fixture 已改写为断言「产出 plan + notes 如实记录 7 组损失」。
+> changed-set 收紧（①）不受影响，仍是现行契约。
 - **改**: ① verdict-validate 有 repoDir 时，anchor_paths 必须 ⊆ `git diff --name-only
   base..candidate` 的实改集（评审锚点必须落在被审 diff 上；影响面写 scope_note）；
   ② fix-plan 增 hub 门：fix SC 数 ≥4 时，任一路径出现在 > `hub_path_max_share`（config，0.5）

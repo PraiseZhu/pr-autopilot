@@ -204,6 +204,14 @@ node scripts/fix-plan.mjs --artifact consensus.json --manifest sc-manifest.json 
 - `kind=verify` 的 SC 自动进**最后一波**（base = 前波集成 tip，故能看见前波产物）
 - 缺 `anchor_paths` → plan degraded，**不产出可派工计划**；恢复唯一路径 = 原 origin 席补发
   verdict 重跑 validator→consensus→coverage→plan。**lead 不得代填 anchor_paths、不得拆组也不得合组。**
+- **`parallelism_notes` 非空时 lead 必须读**（D2，fable 裁决 2026-08-03）：hub 命中不再
+  degraded（并行度不是正确性属性；机器分辨不出合法同模块耦合与锚点污染），改落
+  `plan.parallelism_notes`——每条含联合度量的真实并行度损失（所有命中路径一起移除后分组数
+  X→Y）。**动作**：非空 → lead 逐条读，在编排记录（派工说明/PR 正文任一）里写一句确认
+  「已读 N 条 parallelism_notes，判定为 <真同模块耦合 / 锚点写宽了需 origin 席拆 finding>」
+  后照常派工。它**不改分组、不进 degraded、不阻断**——把它当阻断绕，或当不存在跳过，
+  都是错读：前者回到 D2 之前的死锁，后者让「由人看一眼」变成没人看（机器降级为记录的
+  前提正是有人读记录）。notes 参与 `fix_plan_hash`：正常链路下删改会被重算检出（T1）。
 
 **修复方设计约束（写代码之前，按类套形状——反补丁螺旋的主闸）**：
 派工包必须带上 `references/hardening-checklist.md`，并要求 worker：**动手前先判本 SC 触碰的

@@ -58,7 +58,9 @@ export function trustedHubShare({ configPath = join(HERE, '../config/orchestrati
 //
 // 更硬的一条: 机器**分辨不出**「合法同模块耦合」与「锚点污染」——两者产出的 path 集合
 // 完全一样，区别只在语义（这 10 条缺陷是不是真的在 gate.mjs 里）。既然分辨不出，
-// 就不该由机器下阻断判决；它该做的是把事实**记下来并且删不掉**（notes 进 plan hash，
+// 就不该由机器下阻断判决；它该做的是把事实**如实记下来**（notes 进 plan hash：正常、未改
+// 脚本的链路下，删改 notes 会让 hash 重算不一致而被既有 gate 检出——T1 防疏忽/防漂移；
+// **不防**同 UID 修改脚本/guard 本身，
 // push-guard 重算时对不上就断），由人看一眼。这与本仓 ARCHIVE 类「文档化接受」终止
 // 循环是同一个立场: fail loud, 不是 fail stuck。
 //
@@ -183,7 +185,7 @@ export function buildFixPlan({ artifact, manifest, capacity = null, hubShare = n
   // ARCHIVE_PATH、移除该路径后各自余集为空，D1 判据本身就会把它判为真同文件耦合而放行；
   // 特例豁免分支会掩盖测试信号（通用判据被改回旧版时，被豁免的池子测不出来——加固清单
   // 第 8 类「特例短路掩盖断言」），删掉后 archive 池由通用判据保护，才有真信号。
-  // D2: hub 命中不再阻断，落进 plan 的 parallelism_notes（进 plan hash，删不掉）
+  // D2: hub 命中不再阻断，落进 plan 的 parallelism_notes（进 plan hash——正常链路下删改可被重算检出，T1）
   const hubNotes = [
     ...hubViolations(fixScs, hub, 'fix'),
     ...hubViolations(verifyScs, hub, 'verify'),
@@ -215,7 +217,8 @@ export function buildFixPlan({ artifact, manifest, capacity = null, hubShare = n
     groups,
     waves,
     n_min_per_wave: waves.map((w) => Math.min(w.length, cap)),
-    // D2: hub 事实随 plan 落账并进 fix_plan_hash——lead 不能把它删掉当没看见
+    // D2: hub 事实随 plan 落账并进 fix_plan_hash——正常、未改脚本的链路下，删改 notes 会被
+    // push-guard 的重算比对检出（防疏忽/漂移；不防同 UID 改脚本，那是 T2，本仓做不到）
     // （push-guard 从源 artifact 重算 plan 并比 hash，删了就对不上，SC-R3-2）。
     // 无命中时是空数组，不是 undefined——形状稳定，hash 才确定。
     parallelism_notes: hubNotes
