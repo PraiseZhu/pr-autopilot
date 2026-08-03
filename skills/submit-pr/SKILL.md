@@ -329,8 +329,13 @@ marker 段 `<!-- pr-autopilot:invariants:start/end -->` 内是脚本生成的 MU
    ```
    `fix-plan.mjs` 对 `archive` SC 的文件域**固定给 `README.md`**（不从 `anchor_paths` 派生——那是
    finding 本体的锚点，不是本次要改的文件），该组进**末波**、与 `verify` 组并行（两者都只需看见
-   前波产物、域互不相交，该并行必须并行）；多条 archive SC 天然都落在 `README.md`，
-   **hub 路径门对 archive 池豁免**（不是污染，是设计如此——2 号「拆 finding」的建议在这里不适用）。
+   前波产物、域互不相交，该并行必须并行）；多条 archive SC 天然都落在 `README.md`。
+   **hub 路径门对 archive 池没有特例豁免**（三池同查）——多条 archive SC 移除 `README.md`
+   后余集为空，D1「可移除性」判据本身就会判它为真同文件耦合而放行，不需要豁免分支。
+   > ⚠ 这行原文写的是「**hub 路径门对 archive 池豁免**」，而 D2（owner 2026-08-02）已把那个
+   > 特例分支**删掉**了（理由：特例短路会掩盖测试信号——通用判据被改回旧版时，被豁免的池子
+   > 测不出来，加固清单第 8 类）。文档没跟着改，2026-08-03 由跨会话作者顺带点出「文档与实现
+   > 不同步」的风险时查到。这是我自己那次改动留下的第 7 类漂移，不是别人的。
    coverage-gate 对 `archive` SC 与 `fix`/`verify` 同等要求：恰好引用 1 条 finding。
    worker 走**与 `[MUST-FIX]` 完全相同的 fix-run 编排**：`allocate` 分到自己的 worktree
    （`allowed_paths` 只有 `README.md`）→ 把文案写进 `README.md` → commit → `integrate` →
