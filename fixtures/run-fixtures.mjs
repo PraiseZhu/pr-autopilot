@@ -3462,6 +3462,121 @@ t("[R10-A2'-6] hubViolations 场景6 不到 ≥3 下限: 2 条 SC 共享同一�
 });
 
 
+// ========== 19b. D8 选中数闸门（owner 2026-08-03 授权）==========
+console.log('\n[19b] D8 选中数闸门: vitest `-t` 无匹配 exit 0 不得记 PASS');
+
+// 历史反例（bug-doctor 批次1，四轮实测）: SC-BD1-R2-N05 的 verify 写成
+// `state.test.mjs -t 时间戳归一化`，过滤词对、**文件错**（用例实际在 gate.test.mjs）。
+// vitest 对 -t 无匹配 = skip 全部 + **exit 0**，于是它在 orchestrator 里记 PASS、
+// digest 唯一、stdout 非空，却对交付物零约束。本闸门专治这一类。
+t('[D8] 纯函数: vitest recipe 识别 + 选中数解析', () => {
+  eq(FR.vitestSelectionApplies(VF('npx', ['vitest', 'run', 'x', '-t', 'Y'])), { applies: true, blocked: false }, 'vitest recipe 应适用');
+  eq(FR.vitestSelectionApplies(VF('test', ['-f', 'a.ts'])).applies, false, '自包含 test recipe 不适用（坑④: 它们合法存在）');
+  eq(FR.vitestSelectionApplies(VF('node', ['-e', '1'])).applies, false, '裸 node -e 不适用');
+  eq(FR.vitestSelectionApplies(VF('npx', ['eslint', '.'])).applies, false, 'npx 但非 vitest 不适用');
+  for (const flag of ['--reporter=dot', '--outputFile=/tmp/z', '--reporter', '--outputFile.json=/tmp/z']) {
+    const r = FR.vitestSelectionApplies(VF('npx', ['vitest', 'run', 'x', flag]));
+    ok(r.applies && r.blocked === true, `自带 ${flag} 必须 fail-closed（不许用自定义 reporter 关掉闸门）`);
+  }
+  // 选中数 = passed + failed；被 -t 过滤掉的落 pending，不算跑过
+  eq(FR.readVitestSelection(JSON.stringify({ numPassedTests: 4, numFailedTests: 0, numPendingTests: 124 })), 4);
+  eq(FR.readVitestSelection(JSON.stringify({ numPassedTests: 2, numFailedTests: 1, numPendingTests: 0 })), 3);
+  eq(FR.readVitestSelection(JSON.stringify({ numPassedTests: 0, numFailedTests: 0, numPendingTests: 17 })), 0, '无匹配: 全 pending ⇒ 选中 0');
+  eq(FR.readVitestSelection('not json'), null, '坏 json ⇒ null（调用方 fail-closed）');
+  eq(FR.readVitestSelection(JSON.stringify({ numTotalTests: 5 })), null, '缺计数字段 ⇒ null');
+});
+
+t('[D8] validate 闸门: 选中 0 记 VACUOUS 阻断；测不出 fail-closed；非 vitest recipe 不误伤', () => {
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  // D7 前置: npx 类 recipe 需要主仓有 node_modules 可链入，否则先被 D7 判 UNRUNNABLE，
+  // 根本走不到 D8。这里造一个空目录即可（D8 用 selectionProbe 注入，不真跑 vitest）。
+  mkdirSync(join(env.r, 'node_modules'), { recursive: true });
+  const V = (id) => VF('npx', ['vitest', 'run', 'a.ts', '-t', id]);
+  const ids = ['D8-OK', 'D8-ZERO', 'D8-NULL', 'D8-PLAIN', 'D8-REPORTER'];
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ids, paths: ['a.ts'] }],
+    [['g1']],
+    [
+      { id: 'D8-OK', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: V('D8-OK') },
+      { id: 'D8-ZERO', kind: 'fix', finding_ids: ['f1'], change: 'c', holds: 'h', verify: V('D8-ZERO') },
+      { id: 'D8-NULL', kind: 'fix', finding_ids: ['f2'], change: 'c', holds: 'h', verify: V('D8-NULL') },
+      { id: 'D8-PLAIN', kind: 'fix', finding_ids: ['f3'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) },
+      { id: 'D8-REPORTER', kind: 'fix', finding_ids: ['f4'], change: 'c', holds: 'h', verify: VF('npx', ['vitest', 'run', 'a.ts', '--reporter=dot']) }
+    ]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'd8', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8', plan, waveIndex: 0 }).ok, 'd8 wave1 应集成');
+
+  // runner 注入让主记录一律 PASS（把「主记录成败」与「选中数闸门」两件事解耦，
+  // 单独考闸门）；selectionProbe 注入模拟四种选中数形态。
+  const probed = [];
+  const v = FR.validateIntegration({
+    stateDir: env.stateDir, runId: 'd8', scManifest: scm, waveIndex: 0,
+    runner: () => 'stub stdout',
+    selectionProbe: (verify) => {
+      const id = verify.args[verify.args.length - 1];
+      probed.push(id);
+      if (id === 'D8-ZERO') return 0;
+      if (id === 'D8-NULL') return null;
+      return 3;
+    }
+  });
+  const by = Object.fromEntries(v.results.map((r) => [r.sc_id, r]));
+
+  eq(by['D8-OK'].status, 'PASS', '选中 3 ⇒ 照常 PASS');
+  eq(by['D8-OK'].selection_gate, 'pass');
+  eq(by['D8-OK'].selected_tests, 3, '选中数必须落进记录（可审计）');
+
+  eq(by['D8-ZERO'].status, 'VACUOUS', '选中 0 ⇒ VACUOUS（历史缺陷 N05 的形状）');
+  eq(by['D8-ZERO'].selection_gate, 'fail');
+  ok(/零约束|选中 0/.test(by['D8-ZERO'].note ?? ''), 'VACUOUS 必须写清原因');
+
+  eq(by['D8-NULL'].status, 'UNRUNNABLE', '测不出选中数 ⇒ fail-closed，不得记 PASS');
+  eq(by['D8-NULL'].selection_gate, 'unmeasurable');
+
+  eq(by['D8-PLAIN'].status, 'PASS', '非 vitest 的自包含 recipe 不得被误伤');
+  eq(by['D8-PLAIN'].selection_gate, 'unmeasured');
+  eq(by['D8-PLAIN'].selected_tests, null);
+  ok(/T1/.test(by['D8-PLAIN'].selection_reason ?? ''), '未覆盖必须如实声明为 T1，不冒称覆盖全部');
+  eq(by['D8-PLAIN'].note, undefined, 'D7-③ 契约: 正常 PASS 不得带诊断 note（覆盖边界声明走 selection_reason）');
+
+  eq(by['D8-REPORTER'].status, 'UNRUNNABLE', '自带 --reporter ⇒ 阻断');
+  eq(by['D8-REPORTER'].selection_gate, 'blocked');
+  ok(!probed.includes('a.ts'), '被 blocked 的 recipe 不应再去跑探针');
+  eq(probed.sort(), ['D8-NULL', 'D8-OK', 'D8-ZERO'], '只对适用且未 blocked 的 recipe 探针');
+
+  eq(v.ok, false, '本波含 VACUOUS/UNRUNNABLE ⇒ 整波不过（与 FAIL 同等阻断）');
+  // 注意: 本波不能用来证明「闸门不是恒拦」——D8-REPORTER 的 --reporter 冲突是
+  // recipe 形状问题，改选中数也解不开，它永远 blocked。放行方向另起一条 fixture 验。
+});
+
+t('[D8] 反向: 选中数全 > 0 且无 reporter 冲突时闸门放行（证明不是恒拦）', () => {
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  mkdirSync(join(env.r, 'node_modules'), { recursive: true }); // 同上: D7 前置
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['D8-A', 'D8-B'], paths: ['a.ts'] }],
+    [['g1']],
+    [{ id: 'D8-A', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('npx', ['vitest', 'run', 'a.ts', '-t', 'D8-A']) },
+     { id: 'D8-B', kind: 'fix', finding_ids: ['f1'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'd8b', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8b', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8b', plan, waveIndex: 0 }).ok);
+  const v = FR.validateIntegration({
+    stateDir: env.stateDir, runId: 'd8b', scManifest: scm, waveIndex: 0,
+    runner: () => 'stub', selectionProbe: () => 5
+  });
+  eq(v.ok, true, '选中数 > 0 + 无冲突 ⇒ 放行: ' + JSON.stringify(v.results));
+  eq(v.results.find((r) => r.sc_id === 'D8-A').selection_gate, 'pass');
+  eq(v.results.find((r) => r.sc_id === 'D8-B').selection_gate, 'unmeasured');
+  eq(v.results.find((r) => r.sc_id === 'D8-B').note, undefined, 'D7-③ 契约: 正常 PASS 不带 note');
+});
+
 // ========== 20. SC-11/SC-12/SC-13 ==========
 console.log('\n[20] SC-11 anchor 广域防护 / SC-12 skill 契约 / SC-13 空转清理');
 

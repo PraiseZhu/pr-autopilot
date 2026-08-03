@@ -14,8 +14,9 @@
 // push-guard 的 lineage 校验退化为精确集合判定（SC-R3-8）。
 // 主 checkout 零接触: 全程不在主 repoDir checkout/detach（SC-R3-11）。
 import { execFileSync } from 'node:child_process';
-import { existsSync, writeFileSync, renameSync, mkdirSync, symlinkSync } from 'node:fs';
+import { existsSync, writeFileSync, renameSync, mkdirSync, symlinkSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
+import { tmpdir } from 'node:os';
 import { readJson, parseArgs, fail, isMain, nowIso, sha256, canonicalJson, normalizeRepoPath, hashObject } from './lib/common.mjs';
 import { computeFixPlanHash } from './fix-plan.mjs';
 import { recomputeArtifactHash } from './consensus-gate.mjs';
@@ -362,6 +363,52 @@ export function validateVerifyRecipe(v) {
 }
 export function verifyDigest(v) { return sha256(canonicalJson({ cmd: v.cmd, args: v.args })); }
 
+// ---- D8（owner 2026-08-03 授权）: 选中数闸门——「PASS」必须建立在真的跑了用例之上 ----
+// 根因: vitest 对 `-t <无匹配>` 的处理是 **skip 全部用例并 exit 0**（`--passWithNoTests` 只
+// 管文件级无匹配，不管 `-t` 级）。于是一条选不中任何用例的 verify 在本函数里记 PASS、
+// 有唯一 verify_digest、stdout 非空，看起来样样齐全，却对该 SC 的交付物零约束。
+// 这一族在 bug-doctor 批次1 上连吃四轮，每轮的判据都被下一轮推翻:
+//   R2→R3  「digest 互不相同 ⇒ 无假覆盖」 → 反例: 6 条 SC 共用一条 verify 之外，还有
+//            digest 唯一但选中 0 的（SC-BD1-R2-N05 把文件写成 state.test.mjs，用例实际在
+//            gate.test.mjs）。**唯一 ≠ 非空**
+//   R3→R4  「选中数 > 0」（人工逐条实测） → 反例: SC-BD1-R4-N10 的 `-t 已知局限` 选中 2 条，
+//            但那 2 条是上一轮 D01 的锚点断言。**非空 ≠ 相关**
+//   R4→R5  「本轮 SC id 各自在场」（硬编码快照） → 该断言本身 fail-open（未登记的 SC 不被守）
+// 本闸门只关掉**可机器判定**的那一半（非空）；「相关」由 manifest 侧的约定保证
+// （过滤词 = 该 SC 自己的 id + 测试 describe 标题带该 id），二者合起来才等于「verify 选中的
+// 是因该 SC 的实现而存在的用例」。
+//
+// **为什么不做「verify 在 base 上必红」**（初版设想，实测不可行）: 它与上面那条 id 约定互斥——
+// 过滤词是本 SC 自己的 id 时，base 上该 describe 还不存在 → 选中 0 → exit 0 → base 是绿的，
+// 于是每条新增测试类 SC 都会被误判。base-red 只在「测试先于实现存在」（TDD 型）或整文件 verify
+// 下成立，不能作为通用闸门。**撤实现必红仍是真属性，但它留在交卷义务里，不在本闸门内。**
+//
+// 覆盖边界（如实声明，T1 级——防疏忽/漂移，不防刻意规避）:
+//   · 只覆盖**已识别的 vitest recipe**（cmd ∈ node 工具链且 args 出现 'vitest'）。
+//   · 其他 runner（含 `node -e "..."`、`test -f x` 这类自包含 recipe，坑④ 明确它们合法）
+//     无通用的「选中数」概念，记 selection_gate='unmeasured' + note，**不阻断**。
+//     换 runner 即可绕过本闸门——这是已知且如实登记的洞，不冒称覆盖全部。
+//   · recipe 自带 --reporter/--outputFile 时无法叠加 json reporter 取数 → **阻断**
+//     （不允许用自定义 reporter 把闸门关掉）。
+const VITEST_REPORTER_FLAG_RE = /^--(reporter|outputFile)/;
+export function vitestSelectionApplies(v) {
+  if (!DEP_TOOLCHAIN_CMDS.has(v.cmd)) return { applies: false, reason: `cmd="${v.cmd}" 不是已识别的 node 工具链` };
+  if (!v.args.includes('vitest')) return { applies: false, reason: "args 未出现 'vitest'" };
+  const conflict = v.args.find((a) => VITEST_REPORTER_FLAG_RE.test(String(a)));
+  if (conflict) return { applies: true, blocked: true, reason: `recipe 自带 ${conflict}，无法叠加 json reporter 取选中数（fail-closed: 不允许用自定义 reporter 绕过选中数闸门）` };
+  return { applies: true, blocked: false };
+}
+// 选中数 = passed + failed。vitest 的 json reporter 把「被 -t 过滤掉的」记为 pending，
+// 所以 pending 不计入选中——`it.skip` 同样落 pending，也确实不该算「跑过了」。
+// 返回 null = 测不出来（json 文件没产出/解析不了/字段缺失），调用方按 fail-closed 处理。
+export function readVitestSelection(jsonText) {
+  let r;
+  try { r = JSON.parse(jsonText); } catch { return null; }
+  const p = r?.numPassedTests, f = r?.numFailedTests;
+  if (!Number.isInteger(p) || !Number.isInteger(f)) return null;
+  return p + f;
+}
+
 // ---- D7: 依赖准备 + fail-closed 分支 ----
 // 根因（另一会话实测，2026-08-02）: ensureIntegrationWorktree 只做 `git worktree add --detach`，
 // 裸 checkout 没有 node_modules——依赖项目依赖的 verify recipe（如 `npx vitest`）会立刻
@@ -431,7 +478,29 @@ export function prepareDependencies({ repoDir, wt, sourceCandidate, integratedTi
 }
 
 // ---- SC-10b + SC-R3-3: orchestrator 复跑 SC verify，绑定 sc manifest，空跑不算过 ----
-export function validateIntegration({ stateDir, runId, scManifest, waveIndex, runner = null }) {
+// D8: 选中数探针——单独跑一次同 recipe + json reporter，只取计数。
+// 刻意与主记录**分离两次运行**：主记录的 exit/stdout_sha256/stdout_bytes 语义因此逐字不变，
+// 不因引入本闸门而改写既有证据形状（json reporter 会让 stdout 变成 JSON，若合并成一次跑
+// 会把 stdout_bytes 的含义悄悄换掉）。代价是带过滤词的 verify 多跑一次（收集期为主，秒级）。
+export function probeVitestSelection({ verify, wt }) {
+  const dir = mkdtempSync(join(tmpdir(), 'sel-'));
+  const out = join(dir, 'sel.json');
+  try {
+    const args = [...verify.args, '--reporter=json', `--outputFile=${out}`];
+    try {
+      execFileSync(verify.cmd, args, {
+        cwd: wt, encoding: 'utf8', timeout: 600_000, shell: false,
+        env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '' }
+      });
+    } catch { /* 探针本身的退出码不作判据: 主记录已经判过成败，这里只要那份 json */ }
+    if (!existsSync(out)) return null;
+    return readVitestSelection(readFileSync(out, 'utf8'));
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* 清理失败不影响判定 */ }
+  }
+}
+
+export function validateIntegration({ stateDir, runId, scManifest, waveIndex, runner = null, selectionProbe = null }) {
   const { path, m } = loadRun(stateDir, runId);
   if (hashObject(scManifest) !== m.sc_manifest_hash) {
     throw new Error('sc manifest 与 run 绑定的 sc_manifest_hash 不符（SC-R3-3: 换/改 manifest 造 vacuous PASS 被拦）');
@@ -489,6 +558,37 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
     // （有些 runner 只写 stderr），不得据此改判 UNRUNNABLE，只在 note 里给排查方向。
     if (status === 'FAIL' && entry.stdout_bytes === 0) {
       entry.note = '退出非零且 stdout 为空——疑似环境问题（如 worktree 缺 node_modules、命令找不到），也可能是真实测试失败但输出全落在 stderr；请先查 worktree 运行环境再确认是否为真实失败';
+    }
+    // D8 选中数闸门: 只在「主记录判 PASS」时才有意义——FAIL/UNRUNNABLE 已经阻断了，
+    // 再测选中数不改变结论、白花一次运行。
+    if (entry.status === 'PASS') {
+      const sel = vitestSelectionApplies(sc.verify);
+      if (!sel.applies) {
+        entry.selected_tests = null;
+        entry.selection_gate = 'unmeasured';
+        // 刻意**不**写进 note: D7-③ 的既有契约是「正常 PASS 不带诊断 note」，note 专供
+        // 需要人去排查的异常。本条是闸门自身的覆盖边界声明，属常态，走独立字段。
+        entry.selection_reason = `${sel.reason}。如实声明: 本闸门只覆盖已识别的 vitest recipe，其他 runner 的空验证不被检测（T1，换 runner 即可绕过）`;
+      } else if (sel.blocked) {
+        entry.status = 'UNRUNNABLE';
+        entry.selected_tests = null;
+        entry.selection_gate = 'blocked';
+        entry.note = [entry.note, `D8 选中数闸门 fail-closed: ${sel.reason}`].filter(Boolean).join(' | ');
+      } else {
+        const selected = selectionProbe ? selectionProbe(sc.verify, wt) : probeVitestSelection({ verify: sc.verify, wt });
+        entry.selected_tests = selected;
+        if (selected === null) {
+          entry.status = 'UNRUNNABLE';
+          entry.selection_gate = 'unmeasurable';
+          entry.note = [entry.note, 'D8 选中数闸门 fail-closed: 探针未能产出/解析 vitest json 报告，无法确认本条 verify 真的跑了用例——不允许在测不出选中数时记 PASS'].filter(Boolean).join(' | ');
+        } else if (selected === 0) {
+          entry.status = 'VACUOUS';
+          entry.selection_gate = 'fail';
+          entry.note = [entry.note, 'D8 选中数闸门: 本条 verify 选中 0 个用例却 exit 0（vitest 对 -t 无匹配即 skip 全部并 exit 0）——它对该 SC 的交付物零约束，不得记 PASS。请把过滤词改成能选中本 SC 自己用例的值（约定: 过滤词 = 该 SC 的 id，且测试 describe 标题带该 id）'].filter(Boolean).join(' | ');
+        } else {
+          entry.selection_gate = 'pass';
+        }
+      }
     }
     results.push(entry);
   }
