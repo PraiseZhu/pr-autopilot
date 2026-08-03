@@ -19,7 +19,7 @@ import { join, dirname } from 'node:path';
 import { readJson, parseArgs, fail, isMain, nowIso, sha256, canonicalJson, normalizeRepoPath, hashObject } from './lib/common.mjs';
 import { computeFixPlanHash } from './fix-plan.mjs';
 import { recomputeArtifactHash } from './consensus-gate.mjs';
-import { allocateWave, changedFiles, isAncestor, cleanupRun, stampOwner, readOwner, newNonce } from './fix-orchestrate.mjs';
+import { allocateWave, changedFiles, isAncestor, cleanupRun, stampOwner, readOwner, newNonce, writePathsFor } from './fix-orchestrate.mjs';
 
 const TEST_PATH_RE = /(^|\/)(e2e|fixtures)\//;
 const TEST_FILE_RE = /\.(test|spec)\.[A-Za-z0-9]+$/;
@@ -140,17 +140,33 @@ export function validateTips({ repoDir, plan, waveIndex, waveState }) {
   return { errs, tips };
 }
 
-// SC-R3-7: **所有组**先过 changed ⊆ allowed_paths，verify 组在此之上叠加全测试路径要求
-// （v1 的 else-if 让 verify 组完全跳过 allowed 集——R3 实证的旁路）。
+// anchor_paths 拆分（2026-08-02）: 写入许可读 alloc.write_paths（脚本按 SC kind 推导，
+// 不再是 anchor 并集本身——见 fix-orchestrate.mjs 的 writePathsFor 注释）。
+//   mode='anchor-test-path'（verify 类，SC-R3-7 加固不变）: changed ⊆ write_paths.paths，
+//     且叠加全测试路径要求（v1 的 else-if 让 verify 组完全跳过 allowed 集——R3 实证的旁路）。
+//   mode='fixed-list'（archive 类，SC-M2）: changed ⊆ write_paths.paths（脚本给定常量
+//     ARCHIVE_PATH，全链唯一诚实拥有正向写入清单的场景）——不叠加测试路径要求，archive
+//     改的是残余风险登记文档，不是测试文件。
+//   mode='isolated'（fix 类）: 不设清单——不得因「改动不在证据锚点内」被拒（anchor 是证据
+//     不是写集）；写入边界只靠独立 worktree + 集成期真实 diff 重叠检测兜底（本函数之外，
+//     integrate() 无条件执行）。
+// write_paths 缺失/mode 非法 = 内部编排 bug（本函数从不接受外部输入），throw 而非静默兜底，
+// 避免 fail-closed 默认值掩盖故障（见加固清单「fail-closed 默认值降低可观测性」）。
+// 加固清单第 5/6 类: 白名单放行 mode ≠ 约束生效——下方 allowed 判定必须覆盖每个新 mode，
+// 光加进 includes() 而不接进约束分支等于放开了口子（本次 SC-M 系列专门补的洞）。
 function checkGroupChanges({ repoDir, base, tip, alloc, group, label }) {
   const errs = [];
   const changed = changedFiles({ repoDir, base, tip });
   if (changed.length === 0) { errs.push(`${label} 实改为空（空交卷）`); return { errs, changed }; }
-  const allowed = new Set(alloc.allowed_paths ?? []);
+  const wp = alloc.write_paths;
+  if (!wp || !['isolated', 'anchor-test-path', 'fixed-list'].includes(wp.mode)) {
+    throw new Error(`${label} 的 allocation 缺 write_paths 或 mode 非法（${JSON.stringify(wp)}）——内部编排 bug，fail-closed`);
+  }
+  const allowed = wp.mode === 'isolated' ? null : new Set(wp.paths ?? []);
   for (const f of changed) {
     const r = normalizeRepoPath(f);
     if (!r.ok) { errs.push(`${label} 改了非法路径 ${f}`); continue; }
-    if (!allowed.has(f)) errs.push(`${label} 越域改动 ${f}（不在 allowed_paths: ${[...allowed].join(',')}——SC-R3-7 对所有组强制）`);
+    if (allowed && !allowed.has(f)) errs.push(`${label} 越域改动 ${f}（不在 write_paths: ${[...allowed].join(',')}——mode=${wp.mode} 强制）`);
     if (group?.verify && !isTestPath(f)) errs.push(`verify ${label} 改了非测试文件 ${f}（verify 位不得藏生产改动）`);
   }
   return { errs, changed };
@@ -273,7 +289,7 @@ export function serialAllocate({ stateDir, runId, plan, waveIndex }) {
   git(m.repo_dir, 'worktree', 'add', '-q', '-b', branch, wtPath, base);
   const ownerNonce = newNonce();
   stampOwner({ worktreeDir: wtPath, payload: { run_id: runId, group_id: groupId, round: roundIdx, nonce: ownerNonce } });
-  const round = { round: roundIdx, group_id: groupId, base, branch, worktree: wtPath, allowed_paths: group.paths, sc_ids: group.sc_ids, owner_nonce: ownerNonce, tip: null, squash: null };
+  const round = { round: roundIdx, group_id: groupId, base, branch, worktree: wtPath, anchor_paths: group.paths, write_paths: writePathsFor(group), sc_ids: group.sc_ids, owner_nonce: ownerNonce, tip: null, squash: null };
   rounds.push(round);
   appendEvent(m, { kind: 'serial-allocate', wave: waveIndex, round: roundIdx, group: groupId, base });
   saveManifest(path, m);

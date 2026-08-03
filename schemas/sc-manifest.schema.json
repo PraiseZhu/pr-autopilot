@@ -13,11 +13,13 @@
       "items": {
         "type": "object",
         "required": ["id", "kind", "finding_ids", "change", "holds", "verify"],
+        "additionalProperties": false,
+        "$comment": "D2（anchor_paths 三用途拆分，2026-08-02）: write_paths/allowed_paths 禁止出现在 SC 上——写入许可只能由 fix-orchestrate.mjs 按 kind 脚本推导（fix=isolated 无清单；verify=anchor 并集∩测试路径），lead 不得自报。additionalProperties:false 结构性拒绝 + sc-coverage-gate.mjs 显式校验双重把关。",
         "properties": {
           "id": { "type": "string", "pattern": "^SC-[A-Za-z0-9._-]+$" },
           "kind": {
-            "enum": ["fix", "verify", "global"],
-            "description": "fix=改代码; verify=纯测试（进最后一波）; global=lead 中央验证步（不派 worker，全 plan ≤1）"
+            "enum": ["fix", "verify", "global", "archive"],
+            "description": "fix=改代码; verify=纯测试（进最后一波）; global=lead 中央验证步（不派 worker，全 plan ≤1）; archive=残余风险登记（文件域由 fix-plan.mjs 固定给 README.md，不从 anchor_paths 派生；进末波与 verify 并行；恰好引用 1 条 finding，hub 门豁免）"
           },
           "finding_ids": {
             "type": "array",

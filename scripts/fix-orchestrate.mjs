@@ -41,6 +41,29 @@ function git(repoDir, ...a) { return execFileSync('git', ['-C', repoDir, ...a], 
 export function groupBranch(runId, groupId) { return `fix/${runId}/${groupId}`; }
 export function groupWorktreePath(worktreeRoot, runId, groupId) { return join(worktreeRoot, `${runId}-${groupId}`); }
 
+// anchor_paths 三用途拆分（2026-08-02，源: mivo-canvas PR #419 submit-pr 实战反馈）:
+//   finding.anchor_paths 是证据锚点；fix-plan 的 group.paths（= 覆盖 findings 的 anchor_paths
+//   并集）是分组/hub 判定输入——这两用途不变，仍读 anchor_paths。
+//   写入许可（第三用途）不再等于 anchor 并集：evidence 可能落在只读症状文件，真正要改的文件
+//   可能根本不在证据里，拿 anchor 当写入域会把合法修复误判「越域改动」拒绝。
+// write_paths 由 SC 的 kind 决定（脚本推导，lead/AI 不可自由填写——D2）：
+//   kind=verify：SC-R3-7 加固不变——仍要求 changed ⊆ anchor 并集，且叠加全测试路径形状
+//     （verify SC 的意图本就是「在指定测试文件里补断言」，证据=目标不构成本次要修的错配）。
+//   kind=archive（SC-M1，合并另一分支后补齐）：fix-plan.mjs 把 group.paths 固定改写为
+//     ARCHIVE_PATH（README.md，脚本给定常量，不从 anchor_paths 派生）——这是全链**唯一**
+//     诚实拥有正向写入清单数据源的场景，专开一档 mode，不与 verify 共用
+//     'anchor-test-path'：archive 的路径既不是 anchor 也不是 test path，混用会让下一个人
+//     误以为它经过测试路径校验。
+//   kind=fix：没有 kind 内在目标文件（修复内容各异，无法脚本推导出比 anchor 更准的清单，
+//     而清单又不能由 lead/AI 自报）——不设清单，写入边界只靠结构隔离（各组独立 worktree，
+//     并发写从构造上不可能）+ 集成期真实 diff 重叠检测（integrate() 无条件执行，不依赖
+//     任何声明域，SC-R3-9）兜底。
+export function writePathsFor(group) {
+  if (group?.verify) return { mode: 'anchor-test-path', paths: group.paths ?? [] };
+  if (group?.archive) return { mode: 'fixed-list', paths: group.paths ?? [] };
+  return { mode: 'isolated' };
+}
+
 // 为一个波次分配 worktree（幂等: 已存在同名 worktree 视为复用，base 必须一致否则 fail-closed）
 export function allocateWave({ repoDir, worktreeRoot, runId, plan, waveIndex, waveBase, exec = null }) {
   const g = exec ? (...a) => exec(['git', '-C', repoDir, ...a]) : (...a) => git(repoDir, ...a);
@@ -77,7 +100,7 @@ export function allocateWave({ repoDir, worktreeRoot, runId, plan, waveIndex, wa
       nonce = newNonce();
       stampOwner({ worktreeDir: wtPath, payload: { run_id: runId, group_id: groupId, nonce }, exec });
     }
-    allocations.push({ group_id: groupId, sc_ids: group.sc_ids, allowed_paths: group.paths, branch, worktree: wtPath, base: waveBase, owner_nonce: nonce });
+    allocations.push({ group_id: groupId, sc_ids: group.sc_ids, anchor_paths: group.paths, write_paths: writePathsFor(group), branch, worktree: wtPath, base: waveBase, owner_nonce: nonce });
   }
   return { run_id: runId, wave_index: waveIndex, wave_base: waveBase, allocations, allocated_at: nowIso() };
 }

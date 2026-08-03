@@ -5,7 +5,7 @@
 //   ① manifest.consensus_artifact_hash 必须等于 artifact 实际重算值（不信自报）
 //   ② 每条 severity∈{blocker,major} 的 canonical finding 必须被 ≥1 条 SC 覆盖（exact，无遗漏）
 //   ③ SC 引用的 finding_ids 无悬空（必须是 artifact 里真实存在的 canonical id）
-//   ④ fix/verify SC 必须引用 ≥1 finding；global SC ≤1 条且不引用 finding
+//   ④ fix/verify/archive SC 必须引用 ≥1 finding；global SC ≤1 条且不引用 finding
 // 任一违 → fail-closed。suggestion 级 finding 不强制覆盖（进 residual，与共识白名单口径一致）。
 import { readJson, parseArgs, fail, isMain } from './lib/common.mjs';
 import { recomputeArtifactHash } from './consensus-gate.mjs';
@@ -52,12 +52,17 @@ export function checkScCoverage({ manifest, artifact }) {
     // SC-R3-4（D2）: verify 必须是结构化 argv 配方——自由文本会被 shell 解释（命令注入面）
     const recipeErr = validateVerifyRecipe(sc.verify);
     need(!recipeErr, `SC ${sc.id}: ${recipeErr}`);
+    // D2（anchor_paths 三用途拆分，2026-08-02）: write_paths 由 fix-orchestrate.mjs 按 SC kind
+    // 脚本推导，sc manifest（lead 产物）不得携带该字段——同等 fail-closed 于 verdict-validate。
+    for (const forbidden of ['write_paths', 'allowed_paths']) {
+      need(!(forbidden in sc), `SC ${sc.id} 不得提供 ${forbidden}（D2: 写入许可只能由脚本推导，不受理 lead 自报）`);
+    }
     const fids = Array.isArray(sc.finding_ids) ? sc.finding_ids : [];
     if (sc.kind === 'global') {
       globalCount++;
       need(fids.length === 0, `global SC ${sc.id} 不得引用 finding（它是中央验证步）`);
     } else {
-      need(['fix', 'verify'].includes(sc.kind), `SC ${sc.id} kind 非法: ${sc.kind}`);
+      need(['fix', 'verify', 'archive'].includes(sc.kind), `SC ${sc.id} kind 非法: ${sc.kind}`);
       need(fids.length === 1,
         `SC ${sc.id}（${sc.kind}）必须**恰好引用 1 条** finding，实际 ${fids.length}（SC-4: 禁 mega-SC——多个 finding 塞一条会让分组合法退化为串行；多步骤写在 change/holds 文本里）`);
       for (const fid of fids) {

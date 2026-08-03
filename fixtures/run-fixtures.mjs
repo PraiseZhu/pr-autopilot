@@ -36,7 +36,7 @@ import { runDigest } from '../scripts/inbox-digest/runner.mjs';
 import { appendLedger } from '../scripts/evolution/ledger-append.mjs';
 import { clusterLedger, signConfirm } from '../scripts/evolution/cluster.mjs';
 import { checkScCoverage } from '../scripts/sc-coverage-gate.mjs';
-import { buildFixPlan, computeFixPlanHash } from '../scripts/fix-plan.mjs';
+import { buildFixPlan, computeFixPlanHash, hubViolations } from '../scripts/fix-plan.mjs';
 import { normalizeRepoPath } from '../scripts/lib/common.mjs';
 import { recoverFromReceipt } from '../scripts/pr-watch/finalize.mjs';
 import { foldDispatchStates } from '../scripts/pr-watch/budget.mjs';
@@ -82,6 +82,8 @@ console.log('\n[1] ⑨⑩ + 审②F1/F2 + 审③F4-R: hash·verdict·共识门')
 const FULL_FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'].map((f) => ({ face: f, result: f === 'B' ? 'n_a' : 'pass', evidence: `${f} 面走查完成` }));
 const THIRD_FACES = ['D', 'E', 'F', 'G'].map((f) => ({ face: f, result: 'pass', evidence: `${f} 面走查完成` }));
 const THIRD_GATES = ['format-gate', 'rule-compliance', 'security-privacy-gate', 'product-arch-gate'].map((g) => ({ gate_id: g, result: 'pass', evidence: `${g} 走查完成` }));
+// R10-A3: 加固清单九类默认全 covered——两对抗席 R1 verdict 的默认 hardening_coverage
+const FULL_HARDENING = Array.from({ length: 9 }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `第${i + 1}类走查完成` }));
 
 function mkBundle(baseSha, candidateSha, over = {}) {
   return {
@@ -107,7 +109,11 @@ function mkVerdictFor(reviewer, bundleObj, over = {}) {
     review_input_hash: computeReviewInputHash(bundleObj),
     faces: reviewer === 'upstream-preview' ? THIRD_FACES : FULL_FACES,
     findings: [], gate_checks: reviewer === 'upstream-preview' ? THIRD_GATES : [],
-    verdict: 'APPROVED', closed_finding_ids: [], ...over
+    verdict: 'APPROVED', closed_finding_ids: [],
+    // R10-A3: 默认给两对抗席一份齐全的 hardening_coverage——不关心该字段的既有 fixture
+    // 不必逐条改；专门测该字段的用例通过 over.hardening_coverage 覆盖/摘除。
+    ...(reviewer === 'upstream-preview' ? {} : { hardening_coverage: FULL_HARDENING }),
+    ...over
   };
   base.findings = withAnchorPaths(base.findings);
   return base;
@@ -160,6 +166,33 @@ t('[e2e-consensus 缺口] 重复 finding id → degraded（一次 close 不得�
 t('[⑫] touches_ui=true 而对抗席 B=n_a → 拒', () => {
   const uiBundle = mkBundle(SHA_A, SHA_B, { touches_ui: true, matched_paths: ['src/app/x.tsx'] });
   ok(validateVerdict(mkVerdictFor('claude-adversarial', uiBundle), { bundle: uiBundle }).length > 0);
+});
+t('[R10-A3] R1 两对抗席 hardening_coverage 机器强制: 缺失/缺项/重复 class_id → fail；9 项齐全 → pass；round2/第三席不强制', () => {
+  // ① 完全不带 hardening_coverage（复现 MUST-FIX-2 报告场景）→ 必须 fail-closed
+  const missingCov = (over = {}) => mkVerdictFor('claude-adversarial', bundle, { hardening_coverage: undefined, ...over });
+  ok(validateVerdict(missingCov()).some((e) => /hardening_coverage/.test(e)), 'R1 对抗席缺 hardening_coverage 必须报错');
+  const missingAll = [missingCov(), mkVerdictFor('codex-adversarial', bundle, { hardening_coverage: undefined }), mkVerdictFor('upstream-preview', bundle)];
+  eq(runConsensusGate(missingAll, { bundle }).gate_result, 'fail',
+    '端到端: 三份 round:1 verdict 完全不带 hardening_coverage 必须 fail（此前 gate_result 会误判 pass，MUST-FIX-2 核心）');
+
+  // ② 缺 3 项（只给 6/9）→ fail
+  const short = mkVerdictFor('claude-adversarial', bundle, { hardening_coverage: FULL_HARDENING.slice(0, 6) });
+  ok(validateVerdict(short).some((e) => /hardening_coverage/.test(e)), '缺项必须报 hardening_coverage 错误');
+
+  // ③ class_id 重复（9 项但漏 9、重复 1）→ fail
+  const dupCov = [...FULL_HARDENING.slice(0, 8), { class_id: 1, result: 'covered', evidence: '重复项' }];
+  const dup = mkVerdictFor('claude-adversarial', bundle, { hardening_coverage: dupCov });
+  ok(validateVerdict(dup).some((e) => /重复/.test(e)), 'class_id 重复必须报错');
+
+  // ④ 9 项齐全 → pass（默认值本身即是这一形状，显式再断言一次）
+  eq(validateVerdict(mkVerdictFor('claude-adversarial', bundle)).length, 0, '9 项齐全的 R1 对抗席应过');
+
+  // ⑤ round>=2 不强制（即便完全不带）
+  eq(validateVerdict(mkVerdictFor('claude-adversarial', bundle, { round: 2, hardening_coverage: undefined })).length, 0,
+    'round>=2 不强制 hardening_coverage（复核轮不重扫穷举面）');
+
+  // ⑥ 第三席不强制（即便完全不带）
+  eq(validateVerdict(mkVerdictFor('upstream-preview', bundle)).length, 0, '第三席不强制 hardening_coverage');
 });
 t('[⑥/审③F4-R] 全绿 → pass；artifact hash 含 base/candidate（只改 SHA 即失效）', () => {
   const { artifact } = consensusFor(bundle);
@@ -2394,6 +2427,13 @@ t('[v2-anchor] verdict-validate: anchor_paths 缺失/含目录/绝对 → degrad
   eq(validateVerdict(good).length, 0, '精确路径应过');
 });
 
+t('[anchor_paths 拆分/D2] verdict 的 finding 携带 write_paths/allowed_paths → 必拒（写入许可不受理外部输入）', () => {
+  const withWrite = mkVerdictFor('claude-adversarial', bundle, { findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: ['src/x.ts'], write_paths: ['src/x.ts'], evidence: 'e', status: 'closed' }], closed_finding_ids: ['F1'] });
+  ok(validateVerdict(withWrite).some((e) => /write_paths/.test(e)), 'finding 带 write_paths 必须被拒（D2）');
+  const withAllowed = mkVerdictFor('claude-adversarial', bundle, { findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: ['src/x.ts'], allowed_paths: ['src/x.ts'], evidence: 'e', status: 'closed' }], closed_finding_ids: ['F1'] });
+  ok(validateVerdict(withAllowed).some((e) => /allowed_paths/.test(e)), 'finding 带 allowed_paths 必须被拒（D2）');
+});
+
 // 造一个带 N 条 canonical finding 的真共识 artifact（各 finding 指定 anchor_paths）
 function artifactWithFindings(specs, bundleObj = bundle, gateOpts = {}) {
   // specs: [{fid_face, sev, paths}] —— 三席都 close 同一批以达共识。
@@ -2432,6 +2472,17 @@ t('[v2-coverage] SC 必须覆盖每条 blocker/major finding，绑定 artifact h
   ok(checkScCoverage({ manifest: forged, artifact: art }).some((e) => /未绑定|不符/.test(e)), 'SC 未绑定本次共识必拒');
   // suggestion 不强制覆盖: 仅覆盖 blocker/major 仍过
   eq(checkScCoverage({ manifest: full, artifact: art }).length, 0);
+});
+
+t('[anchor_paths 拆分/D2] sc-manifest 的 SC 携带 write_paths/allowed_paths → 必拒', () => {
+  const art = artifactWithFindings([{ sev: 'major', paths: ['src/y.ts'] }]);
+  const fid = art.canonical_findings[0].id;
+  const withWrite = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: [{ id: 'SC-0', kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF(), write_paths: ['src/y.ts'] }] };
+  ok(checkScCoverage({ manifest: withWrite, artifact: art }).some((e) => /write_paths/.test(e)), 'SC 带 write_paths 必须被拒（D2）');
+  const withAllowed = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: [{ id: 'SC-0', kind: 'fix', finding_ids: [fid], change: 'c', holds: 'h', verify: VF(), allowed_paths: ['src/y.ts'] }] };
+  ok(checkScCoverage({ manifest: withAllowed, artifact: art }).some((e) => /allowed_paths/.test(e)), 'SC 带 allowed_paths 必须被拒（D2）');
 });
 
 t('[v2-plan] fix-plan: 冲突域相交同组、独立域并行、verify 进末波、缺 anchor_paths degraded、hash 可重算', () => {
@@ -2728,7 +2779,7 @@ t('[2号-push闸/SC-R3-6] 端到端契约: 真实状态机 run + SKILL 字段 ma
   const al = FR.allocate({ stateDir: st, runId: 'pg1', plan, waveIndex: 0, worktreeRoot: wtR });
   eq(al.wave_base, HEAD, 'wave0 base == 源 artifact candidate（SC-R3-10）');
   for (const a of al.allocations) {
-    for (const f of a.allowed_paths) {
+    for (const f of a.anchor_paths) {
       mkdirSync(dirname(join(a.worktree, f)), { recursive: true });
       writeFileSync(join(a.worktree, f), `fixed ${a.group_id}\n`);
     }
@@ -3001,11 +3052,13 @@ t('[SC-8] run manifest CAS: wave base 由状态派生不接受自报；跳波拒
   // 空交卷（不改任何东西）→ tip == base → 拒
   let integ = FR.integrate({ stateDir: env.stateDir, runId: 'r1', plan, waveIndex: 0 });
   ok(!integ.ok && integ.errors.some((e) => /空交卷|等于 base/.test(e)), '空交卷必拒');
-  // 越域: g1 改 b.ts（不在自己 allowed_paths）→ 拒
-  workGroup(env, a1.allocations[0], 'b.ts', 'g1 越域\n');
+  // [anchor_paths 拆分] fix 类 write_paths.mode='isolated'：g1（anchor=a.ts）改一个未被任何组
+  // 认领、也未与其他组撞车的新文件 c.ts——旧设计会把它误判「越域改动」拒绝（anchor 是证据不是
+  // 写集，2026-08-02 拆分修的正是这个问题），新设计应放行。
+  workGroup(env, a1.allocations[0], 'c.ts', 'g1 合法但未被证据覆盖的改动\n');
   workGroup(env, a1.allocations[1], 'b.ts', 'g2 改自己的\n');
   integ = FR.integrate({ stateDir: env.stateDir, runId: 'r1', plan, waveIndex: 0 });
-  ok(!integ.ok && integ.errors.some((e) => /越域改动/.test(e)), 'SC-8: 越域改动必拒');
+  ok(integ.ok, 'fix 类 write_paths.mode=isolated: 改未被证据覆盖但未撞车的文件应放行: ' + JSON.stringify(integ.errors ?? []));
 });
 
 t('[SC-8/SC-9/SC-10b] 完整 run: 两波 squash 集成 → 复跑验证 → finalize 前推 → 链为精确 squash 集合；主 checkout 零接触', () => {
@@ -3131,6 +3184,212 @@ t('[SC-8④/SC-R3-9] overlap = fail-closed + 串行重派（真重跑: 后组看
   ok(threw, '重派完成后不得再开轮');
 });
 
+t('[R10-A1] archive kind 端到端可用: coverage-gate 过 → buildFixPlan 定域末波 → 真跑 fix-run 改 README → push-guard 全链绿', () => {
+  // 独立仓: 真实 base 祖先（非合成 SHA）——push-guard 的 diff/CI 路径检查需要 base_sha 真实存在
+  const d = mkdtempSync(join(tmpdir(), 'archA1-'));
+  const r = join(d, 'repo');
+  execFileSync('git', ['init', '-q', '-b', 'main', r]);
+  const g = (...a) => execFileSync('git', ['-C', r, ...a], { encoding: 'utf8' }).trim();
+  g('config', 'user.email', 'o@t'); g('config', 'user.name', 'o');
+  writeFileSync(join(r, 'seed.txt'), 'seed\n');
+  g('add', '.'); g('commit', '-qm', 'base');
+  const baseSha = g('rev-parse', 'HEAD');
+  g('remote', 'add', 'origin', 'https://github.com/o/r.git');
+  g('checkout', '-qb', 'feat');
+  for (const f of ['a.ts', 'e2e/x.test.ts', 'README.md']) {
+    mkdirSync(dirname(join(r, f)), { recursive: true });
+    writeFileSync(join(r, f), 'base\n');
+  }
+  g('add', '.'); g('commit', '-qm', 'feat seed');
+  const cand = g('rev-parse', 'HEAD');
+  const env = { d, r, g, cand, stateDir: join(d, 'state'), wtRoot: join(d, 'wt') };
+
+  const bundleA1 = mkBundle(baseSha, cand);
+  const art = artifactWithFindings([
+    { sev: 'major', paths: ['a.ts'] },              // f0 → kind=fix
+    { sev: 'major', paths: ['e2e/x.test.ts'] },     // f1 → kind=verify
+    { sev: 'major', paths: ['server/bar.ts'] }      // f2 → kind=archive（残余风险登记，域不从此派生）
+  ], bundleA1);
+  const id = (i) => art.canonical_findings.find((f) => f.anchor.endsWith(`#${i}`)).id;
+  const RESIDUAL_PHRASE = 'ARCHIVE-R10-A1-RESIDUAL';
+  const scManifest = {
+    schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: [
+      { id: 'SC-0', kind: 'fix', finding_ids: [id(0)], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) },
+      { id: 'SC-V', kind: 'verify', finding_ids: [id(1)], change: 'c', holds: 'h', verify: VF('test', ['-f', 'e2e/x.test.ts']) },
+      { id: 'SC-ARCH', kind: 'archive', finding_ids: [id(2)], change: '把残余风险文案写进 README.md', holds: 'README.md 含约定文案', verify: VF('grep', ['-q', RESIDUAL_PHRASE, 'README.md']) }
+    ]
+  };
+
+  // ① coverage-gate: archive SC 与 fix/verify 同等过闸
+  eq(checkScCoverage({ manifest: scManifest, artifact: art }).length, 0, 'archive SC 应与 fix/verify 同等过 coverage-gate（SKILL.md「ARCHIVE 类的收口」机器契约）');
+
+  // ② buildFixPlan: 域固定 README.md + 末波与 verify 并行
+  const r1 = buildFixPlan({ artifact: art, manifest: scManifest });
+  ok(!r1.degraded, 'archive kind 不应致 degraded: ' + JSON.stringify(r1.reasons ?? []));
+  const plan = r1.plan;
+  eq(plan.waves.length, 2, 'fix 一波 + (verify+archive) 末波');
+  eq(plan.waves[0].length, 1, 'wave0 仅 fix 组');
+  eq(plan.waves[1].length, 2, 'wave1 verify 组与 archive 组并行（Decision 3）');
+  const archGroup = plan.groups.find((gr) => gr.sc_ids.includes('SC-ARCH'));
+  ok(archGroup, '必须存在 archive 组');
+  eq(archGroup.paths, ['README.md'], 'archive SC 的文件域必须固定为 README.md（不从 anchor_paths 派生）');
+  ok(plan.waves[1].includes(archGroup.id), 'archive 组必须在末波');
+  const verifyGroup = plan.groups.find((gr) => gr.verify);
+  ok(verifyGroup && plan.waves[1].includes(verifyGroup.id), 'verify 组也必须在同一末波');
+
+  // ③ 真跑 fix-run: init → allocate wave0 → 改 a.ts → integrate → validate
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  FR.initRun({ stateDir: env.stateDir, runId: 'archA1', repoDir: env.r, plan, scManifest, sourceArtifact: art, featureBranch: 'feat' });
+  const a0 = FR.allocate({ stateDir: env.stateDir, runId: 'archA1', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  workGroup(env, a0.allocations[0], 'a.ts', 'fixed\n');
+  const i0 = FR.integrate({ stateDir: env.stateDir, runId: 'archA1', plan, waveIndex: 0 });
+  ok(i0.ok, 'wave0 应集成: ' + JSON.stringify(i0.errors ?? []));
+  ok(FR.validateIntegration({ stateDir: env.stateDir, runId: 'archA1', scManifest, waveIndex: 0 }).ok, 'wave0 复跑验证应过');
+
+  // wave1: verify 组改 e2e/x.test.ts；archive 组把残余风险文案写进 README.md（各自独立 worktree，域互不相交）
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'archA1', plan, waveIndex: 1, worktreeRoot: env.wtRoot });
+  eq(a1.allocations.length, 2, 'wave1 应分配 2 个独立 worktree（verify + archive 并行）');
+  const vAlloc = a1.allocations.find((x) => x.group_id === verifyGroup.id);
+  const arAlloc = a1.allocations.find((x) => x.group_id === archGroup.id);
+  ok(vAlloc && arAlloc, '两组分配都应存在');
+  eq(arAlloc.write_paths, { mode: 'fixed-list', paths: ['README.md'] }, 'archive 组分配的 write_paths 必须是脚本给定的固定清单（mode=fixed-list），不是 isolated（SC-M1/M2）');
+  workGroup(env, vAlloc, 'e2e/x.test.ts', 'test ok\n');
+  // worker 在 archive worktree 里把残余风险文案写进 README——这正是 MUST-FIX-1 要打通的路径；
+  // 改的是 write_paths.paths 内的 README.md，不应被 fix-run 判越域
+  workGroup(env, arAlloc, 'README.md', `# Project\n\n## 残余风险\n${RESIDUAL_PHRASE}: 已知限制，登记存档\n`);
+  const i1 = FR.integrate({ stateDir: env.stateDir, runId: 'archA1', plan, waveIndex: 1 });
+  ok(i1.ok, 'wave1（verify+archive 并行）应集成，改 README 不得被判越域: ' + JSON.stringify(i1.errors ?? []));
+  const v1 = FR.validateIntegration({ stateDir: env.stateDir, runId: 'archA1', scManifest, waveIndex: 1 });
+  ok(v1.ok, 'wave1 复跑验证应过（archive 的 grep 验证也在内): ' + JSON.stringify(v1.results));
+  ok(v1.results.some((x) => x.sc_id === 'SC-ARCH' && x.status === 'PASS'), 'SC-ARCH 的 grep 验证必须真通过');
+
+  const fin = FR.finalizeRun({ stateDir: env.stateDir, runId: 'archA1' });
+  ok(/^[0-9a-f]{40}$/.test(fin.final_candidate));
+  eq(env.g('status', '--porcelain'), '', 'finalize 后工作区应 clean');
+
+  // ④ push-guard 全链: 终版共识 + SKILL 字段 manifest → 应放行
+  const finalBundleA1 = mkBundle(bundleA1.base_sha, fin.final_candidate);
+  const finalArtA1 = consensusFor(finalBundleA1, [{}, {}, {}], { parentArtifactHash: art.consensus_artifact_hash }).artifact;
+  ok(finalArtA1.gate_result === 'pass', '终版共识应达成: ' + JSON.stringify(finalArtA1.fail_reasons ?? []));
+  const runManifestA1 = readJson(FR.runManifestPath(env.stateDir, 'archA1'));
+  const tipFor = (groupId) => {
+    for (const w of runManifestA1.waves) {
+      const found = (w.tips ?? []).find((x) => x.group_id === groupId);
+      if (found) return found.tip;
+    }
+    throw new Error(`no tip recorded for group ${groupId}`);
+  };
+  const dispatchRecordA1 = {
+    fix_plan_hash: plan.fix_plan_hash,
+    waves: plan.waves.map((waveGroupIds, wi) => ({
+      dispatches: waveGroupIds.map((gid, i) => ({
+        group_id: gid, worker_session_id: `w${wi}-${i}`, tip: tipFor(gid), report: 'ok', result: mkResult(plan, gid)
+      }))
+    }))
+  };
+  const foA1 = {
+    source_artifact_hash: art.consensus_artifact_hash,
+    sc_manifest_hash: hashObject(scManifest),
+    fix_plan_hash: plan.fix_plan_hash,
+    dispatch_record_hash: hashObject(dispatchRecordA1),
+    run_manifest_hash: FR.runManifestHash(runManifestA1)
+  };
+  const pgResult = checkPushGuard({
+    repoDir: env.r,
+    manifest: { repo: 'o/r', remote: 'origin', branch: 'feat', expected_sha: fin.final_candidate, purpose: 'feature', consensus_artifact_hash: finalArtA1.consensus_artifact_hash, fix_orchestration: foA1 },
+    artifact: finalArtA1, bundle: finalBundleA1, constitution,
+    sourceArtifact: art, scManifest, fixPlan: plan, dispatchRecord: dispatchRecordA1, runManifest: runManifestA1
+  });
+  ok(pgResult.ok, 'push-guard 全链应放行: ' + pgResult.errors.join(';'));
+});
+
+t('[SC-M3] archive 组越域: 改了非 README.md 的文件 → 必须被拒（write_paths.mode=fixed-list 强制 exact）', () => {
+  // 行为断言，不只是形状断言（lead 判据：形状对了不代表约束在咬）——archive 组的 write_paths
+  // 是脚本给定常量 ['README.md']，changed 集合必须是它的子集，多一个文件就是越域。
+  const env = mkRunEnv({ files: ['README.md', 'other.md'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'a1', sc_ids: ['SC-ARCH'], paths: ['README.md'], archive: true }], [['a1']],
+    [{ id: 'SC-ARCH', kind: 'archive', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'README.md']) }]);
+  FR.initRun({ stateDir: env.stateDir, runId: 'archM3', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a = FR.allocate({ stateDir: env.stateDir, runId: 'archM3', plan, waveIndex: 0, worktreeRoot: env.wtRoot });
+  eq(a.allocations[0].write_paths, { mode: 'fixed-list', paths: ['README.md'] }, 'archive 组分配的 write_paths 必须是脚本给定的固定清单');
+  workGroup(env, a.allocations[0], 'other.md', '越域改动\n');
+  const integ = FR.integrate({ stateDir: env.stateDir, runId: 'archM3', plan, waveIndex: 0 });
+  ok(!integ.ok && integ.errors.some((e) => /越域改动/.test(e)), 'archive 组改非 README.md 必须被拒（write_paths.mode=fixed-list 强制）: ' + JSON.stringify(integ.errors ?? []));
+});
+
+t('[R10-A2] hub 门（D1 通用可移除性判据）: 4 条 archive SC 全指向 README.md 合成 1 组，不触发 hub degraded', () => {
+  const art = artifactWithFindings([
+    { sev: 'major', paths: ['src/m0.ts'] },
+    { sev: 'major', paths: ['src/m1.ts'] },
+    { sev: 'major', paths: ['src/m2.ts'] },
+    { sev: 'major', paths: ['src/m3.ts'] }
+  ]);
+  const id = (i) => art.canonical_findings.find((f) => f.anchor.endsWith(`#${i}`)).id;
+  const scManifest = {
+    schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: [0, 1, 2, 3].map((i) => ({
+      id: `SC-ARCH-${i}`, kind: 'archive', finding_ids: [id(i)], change: 'c', holds: 'h',
+      verify: VF('grep', ['-q', `RESIDUAL-${i}`, 'README.md'])
+    }))
+  };
+  eq(checkScCoverage({ manifest: scManifest, artifact: art }).length, 0, '4 条 archive SC 应各恰好引用 1 条 finding 并过覆盖门');
+  const r2 = buildFixPlan({ artifact: art, manifest: scManifest });
+  ok(!r2.degraded, '4 条 archive SC 全指向 README.md 不应触发 hub degraded（R10-A2 核心）: ' + JSON.stringify(r2.reasons ?? []));
+  eq(r2.plan.groups.length, 1, '4 条 archive SC 应合成 1 组（同域必然同组串行）');
+  eq(r2.plan.groups[0].sc_ids, ['SC-ARCH-0', 'SC-ARCH-1', 'SC-ARCH-2', 'SC-ARCH-3'], '该组必须含全部 4 条 archive SC');
+  eq(r2.plan.groups[0].paths, ['README.md']);
+  eq(r2.plan.waves.length, 1, '无 fix/verify SC 时只有 archive 末波');
+  eq(r2.plan.waves[0], [r2.plan.groups[0].id]);
+});
+
+// R10-A2'（owner 2026-08-02，复核 mivo-canvas #419 死锁后拍板换判据）: hubViolations 从
+// 「路径占比」换成「可移除性」——6 个场景各自独立成一条 fixture（不合并进一个 t()），
+// 使每条判据分支的红/绿在回归输出里能被逐条精确定位，不被同一 t() 内先失败的断言掩盖。
+const HUB_SHARE_D1 = 0.5; // 与 config/orchestration.json 的 hub_path_max_share 一致，判据变了配置语义不变
+
+t("[R10-A2'-1] hubViolations 场景1 R3 真 hub 污染: 8 条 fix SC 各带共享 .gitignore → 必须 degraded（原有保护不能被删）", () => {
+  const s1 = Array.from({ length: 8 }, (_, i) => ({ sc_id: `s1-${i}`, paths: [`src/u${i}.ts`, '.gitignore'] }));
+  const r1 = hubViolations(s1, HUB_SHARE_D1, 'fix');
+  ok(r1.length > 0 && r1.some((x) => x.includes('.gitignore')), '场景1 R3 真 hub 污染必须 degraded（原有保护）: ' + JSON.stringify(r1));
+});
+
+t("[R10-A2'-2] hubViolations 场景2 单文件 PR 死锁: 3 条 fix SC 全锚同 1 文件 → 必须放行（D1 核心，mivo-canvas #419 实测）", () => {
+  const s2 = Array.from({ length: 3 }, (_, i) => ({ sc_id: `s2-${i}`, paths: ['src/foo.ts'] }));
+  const r2h = hubViolations(s2, HUB_SHARE_D1, 'fix');
+  eq(r2h.length, 0, '场景2 单文件 PR 死锁必须放行（唯一锚点=真耦合，不是广域误报）: ' + JSON.stringify(r2h));
+});
+
+t("[R10-A2'-3] hubViolations 场景3 archive 池: 4 条 archive SC 全锚 README.md → 必须放行（D2: 通用判据自然覆盖）", () => {
+  const s3 = Array.from({ length: 4 }, (_, i) => ({ sc_id: `s3-${i}`, paths: ['README.md'] }));
+  const r3 = hubViolations(s3, HUB_SHARE_D1, 'archive');
+  eq(r3.length, 0, '场景3 archive 池必须放行（不需要专门豁免分支）: ' + JSON.stringify(r3));
+});
+
+t("[R10-A2'-4] hubViolations 场景4 混合真耦合: 两条 [foo.ts,shared.ts] + 一条 [shared.ts] → 必须放行（第三条唯一锚点即 shared.ts）", () => {
+  const s4 = [
+    { sc_id: 's4-0', paths: ['foo.ts', 'shared.ts'] },
+    { sc_id: 's4-1', paths: ['foo.ts', 'shared.ts'] },
+    { sc_id: 's4-2', paths: ['shared.ts'] }
+  ];
+  const r4 = hubViolations(s4, HUB_SHARE_D1, 'fix');
+  eq(r4.length, 0, '场景4 混合真耦合必须放行（s4-2 唯一锚点就是 shared.ts）: ' + JSON.stringify(r4));
+});
+
+t("[R10-A2'-5] hubViolations 场景5 混合假 hub: 4 条 SC 各带 [各自文件, shared.ts] → 必须 degraded（每条都能脱离 shared.ts 独立存在）", () => {
+  const s5 = Array.from({ length: 4 }, (_, i) => ({ sc_id: `s5-${i}`, paths: [`m${i}.ts`, 'shared.ts'] }));
+  const r5 = hubViolations(s5, HUB_SHARE_D1, 'fix');
+  ok(r5.length > 0 && r5.some((x) => x.includes('shared.ts')), '场景5 混合假 hub 必须 degraded: ' + JSON.stringify(r5));
+});
+
+t("[R10-A2'-6] hubViolations 场景6 不到 ≥3 下限: 2 条 SC 共享同一路径 → 必须放行（原有下限保护）", () => {
+  const s6 = [{ sc_id: 's6-0', paths: ['shared6.ts'] }, { sc_id: 's6-1', paths: ['shared6.ts'] }];
+  const r6 = hubViolations(s6, HUB_SHARE_D1, 'fix');
+  eq(r6.length, 0, '场景6 低于 ≥3 下限必须放行（原有下限保护）: ' + JSON.stringify(r6));
+});
+
 
 // ========== 20. SC-11/SC-12/SC-13 ==========
 console.log('\n[20] SC-11 anchor 广域防护 / SC-12 skill 契约 / SC-13 空转清理');
@@ -3202,6 +3461,39 @@ t('[SC-12] live 契约一致性: SKILL/references 与 validator/push-guard 实�
   // SC-R3-6: push-guard 不得再强制 legacy sc_hash/sc_list（文档≡实现）
   const pg = readFileSync(join(S, 'push-guard.mjs'), 'utf8');
   ok(!pg.includes('必须携带 sc_hash'), 'push-guard 不得再强制 legacy sc_hash/sc_list');
+});
+
+t('[R10-A4] SKILL.md 契约与实现逐字同步: 按文档描述构造的 manifest/verdict 真能过闸（不止 grep 文档）', () => {
+  const skill = readFileSync(join(S, '../skills/submit-pr/SKILL.md'), 'utf8');
+  // ① 文档必须点名真实机制的机器字段/kind/范围（不是只写"文档化接受"这种空话）
+  ok(skill.includes('kind=archive'), 'SKILL 必须点名 kind=archive 机制');
+  ok(skill.includes('hardening_coverage'), 'SKILL 必须点名机器字段 hardening_coverage');
+  ok(skill.includes('README.md'), 'SKILL 必须说明 archive 的文件域是 README.md');
+  ok(/"cmd":\s*"grep"/.test(skill) && skill.includes('README.md'), 'SKILL 必须给出 grep 验证配方示例');
+  ok(skill.includes('hub 路径门对 archive 池豁免'), 'SKILL 必须说明 hub 门对 archive 池豁免');
+  ok(skill.includes('round===1') && skill.includes('两对抗席'), 'SKILL 必须说明覆盖率契约的机器强制范围');
+
+  // ② 严格按 SKILL.md 描述的形状构造真实输入，跑真守卫——不是只 grep 文档字符串（R3 踩过的坑）
+  const art = artifactWithFindings([{ sev: 'major', paths: ['src/skill-doc-check.ts'] }]);
+  const fid = art.canonical_findings[0].id;
+  const scManifest = {
+    schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: [{
+      id: 'SC-ARCH-1', kind: 'archive', finding_ids: [fid],
+      change: '把残余风险文案写进 README.md', holds: 'README.md 含约定文案',
+      verify: { cmd: 'grep', args: ['-q', '<残余风险关键文案>', 'README.md'] }
+    }]
+  };
+  eq(checkScCoverage({ manifest: scManifest, artifact: art }).length, 0, '按 SKILL.md 例句构造的 archive SC 必须真过 coverage-gate');
+  const r = buildFixPlan({ artifact: art, manifest: scManifest });
+  ok(!r.degraded, '按 SKILL.md 例句构造的 archive SC 必须真产出可派工 plan: ' + JSON.stringify(r.reasons ?? []));
+  eq(r.plan.groups[0].paths, ['README.md'], 'SKILL.md 声明的文件域必须与实现一致');
+
+  // ③ 按 SKILL.md 描述的 hardening_coverage 形状构造 verdict，跑真 validator
+  const docVerdict = mkVerdictFor('claude-adversarial', bundle, {
+    hardening_coverage: Array.from({ length: 9 }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `第${i + 1}类核对完成` }))
+  });
+  eq(validateVerdict(docVerdict).length, 0, '按 SKILL.md 例句构造的 hardening_coverage 必须真过 validator');
 });
 
 t('[SC-13] 血统校验用真实但不相关的 commit（非"对象不存在"空转）', () => {

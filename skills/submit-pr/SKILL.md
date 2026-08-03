@@ -13,11 +13,17 @@ description: 提交 PR v2 — push 前三审收口（对抗双审 + 上游预演
 
 ```
 Phase 1  预检 + typecheck-merged + 版本 bump（确定性脚本，继承 v1）
-Phase 2  三审（push 之前，SHA 绑定 + 盲审）
+Phase 2  三审（push 之前，SHA 绑定 + 盲审；R1 走加固清单穷举）
 Phase 2b 共识 → SC 提炼（自动，无需 owner 授权）
-Phase 2c glm-5.2/max worker 修复（goal --until-sc）→ 三审 delta 复核
+Phase 2c glm-5.2/max worker 修复（按类套形状，goal --until-sc）→ delta 复核 → 收敛即收口
 Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini 注册盯梢（回执四要素）
 ```
+
+> **退出判据（2026-08-01 反猫捉老鼠修正）**：对抗审查席结构上**不会**主动给 APPROVED——它的职责
+> 就是挑毛病，新代码总有窄面可挑（九轮零 APPROVED 是本质）。收口**仍走** consensus PASS（硬约束，
+> 脚本不给旁路），但把 finding 分 `[MUST-FIX]`（改代码）/ `[ARCHIVE]`（写进 README 残余登记即解决）
+> 两类——ARCHIVE 类靠**文档化接受**让审查席正当 close，循环因此终止（文档不产生新代码 = 不长新
+> finding）。判据见 Phase 2c 收尾。「等一个不会来的批准」的破法是给审查席正当的 close 理由，不是绕闸。
 
 ## Phase 1 — 预检（保留 v1 确定性部分）
 
@@ -55,14 +61,27 @@ bundle = base_sha + candidate_sha + PR 标题/正文 + touches_ui + matched_path
 仓库相对**精确文件路径**（POSIX，非目录，去重，≤ config/orchestration.json 的
 `anchor_paths_max_per_finding`）。这是修复分组的**唯一机器输入**：填宽了会制造假冲突把本可并行的
 修复串行化，填成目录/不存在路径直接 degraded。影响范围说明写 `scope_note`（不进冲突图）。
+**`anchor_paths` 只是证据锚点，绝不是写入许可**（2026-08-02 anchor_paths 三用途拆分，源:
+mivo-canvas PR #419 实战反馈）：证据可能落在只读症状文件，真正要改的文件可能根本不在证据里——
+写入许可另见 Phase 2c 的 `write_paths`（脚本按 SC kind 推导，reviewer/lead 不得填写，
+verdict-validate/sc-coverage-gate 对该字段一律拒收）。
 - 两对抗席：七面（A 正确性/B UI+无障碍/C 测试/D 文档/E 安全/F 范围/G 声称核实）逐面 `pass/fail/n_a`+证据；B 面仅当脚本判非 UI 才许 n_a。
 - 第三席：只填相关 faces（F/G/E/D 为主）+ `gate_checks[]`（产品/架构过程门专用通道，不得用无类型 finding 绕过归属规则）。
-- 首轮穷举（④）：后续轮冒出"首轮就能看到但没报"的 → 该席本轮 `degraded`。
+- 首轮穷举（④）+ **加固清单覆盖率契约（机器强制，不是纸面约定）**：R1 两对抗席
+  （`claude-adversarial`/`codex-adversarial`）**必须逐条扫** `references/hardening-checklist.md`
+  的九类核对点（不是「看到什么报什么」），并在 verdict 里用机器字段
+  `hardening_coverage: [{class_id:1..9, result:covered|n_a, evidence}]` 逐类标注——目的是把
+  「既有代码的洞」在**一轮**里挖净，而不是分轮细水长流（R3 的 11 条本可更多提前到 R1）。
+  `verdict-validate.mjs` 对 `round===1` 的这两席强制该字段**恰好 9 项、class_id 1〜9 各恰好
+  一次、`evidence` 非空**——缺项/漏项/重复 class_id 一律 schema/跨字段校验失败 →
+  `runConsensusGate` fail-closed（R10-A3：此前只在文档里写"必须标"，没有任何字段/校验落地，
+  三份完全不带该字段的 verdict 照样能拿到 `gate_result: pass`）。第三席与 `round>=2` 不强制
+  （复核轮不必重扫穷举面）。后续轮冒出"首轮就能看到但没报"的 → 该席本轮 `degraded`。
 - finding 归属（⑪）：恰好一个 `primary_face`；白名单内映射不进任何面 → `taxonomy_gap` + degraded 停轮，禁止丢弃。
 - Blocker 白名单（③）：仅 active path 失败 / SC 未达成 / 状态污染 / 安全风险 / 核心验证缺失 / 范围违规可阻塞；风格偏好等只进 Residual Risk 附录，不计入共识。
 
-**lead 职责**：只做争议仲裁（质询 ≤3 轮），**不改代码、不代关 finding、不宣布共识**。
-Round 2+ 只对账修复情况 + 审 delta（含 SC/标题/正文/验证声称的元数据 diff，G 面不豁免）；禁止重审未改代码。unresolved 连续 2 轮不减 → 停给 owner。
+**lead 职责**：只做争议仲裁（质询 ≤3 轮——这是**仲裁**轮上限，**不计**修复轮/delta 复核轮），**不改代码、不代关 finding、不宣布共识**。
+Round 2+ 只对账修复情况 + 审 delta（含 SC/标题/正文/验证声称的元数据 diff，G 面不豁免）；禁止重审未改代码。**收口/螺旋/卡死的判据统一见 Phase 2c 收尾「收敛判据与收口」**（收口仍走 consensus PASS，靠 ARCHIVE 类文档化接受终止循环）。
 
 **共识 = 脚本判**：
 ```
@@ -72,12 +91,19 @@ node scripts/consensus-gate.mjs v1.json v2.json v3.json --bundle bundle.json --r
 `anchor_paths` ⊆ 实改集——tracked-but-unchanged 的 hub 路径在入口就被拦，不依赖调用方自觉。
 四 conjunct 缺一不可（同 input hash / union 每条被 origin close / 三 verdict APPROVED / 全部 gate_checks∈{pass,n_a}）。任何席 degraded 或 schema 不合 → fail-closed。
 
+> **`closed` 的语义（易误读，显式定义）**：conjunct② 的 `status=closed` 意思是「该 finding 已被其
+> origin 席**裁决为真实、且同意进入 SC 修复台账**」，**不是「代码已经修好」**。所以修复**前**的源共识
+> artifact 在构造上是存在的（Phase 2b/2c 正是拿它当输入）。误读成「已修好」会推出「源共识不可能存在」
+> 的假结论——另一会话 2026-08-02 就这么栽过一次。「共识确认的每条 finding 提炼 SC」这句话本身也蕴含
+> 该语义：若 closed = 已修好，这句话就没有对象。
+
 ## Phase 2b — SC 提炼 + 覆盖门（共识后，自动衔接）
 
 **owner 定案：共识 → 修复不需要 owner 授权。**
 lead 对共识确认的每条 finding 提炼可验证 SC，产出 **SC manifest**（`schemas/sc-manifest.schema.json` **v2**）：
-每条 SC 带 `id / kind(fix|verify|global) / finding_ids[] / change / holds / verify`，manifest 头部绑
-**源共识** `consensus_artifact_hash`。SC 例句库见 `references/sc-examples.md`。
+每条 SC 带 `id / kind(fix|verify|global|archive) / finding_ids[] / change / holds / verify`，manifest 头部绑
+**源共识** `consensus_artifact_hash`。SC 例句库见 `references/sc-examples.md`。`archive` 的机器契约见
+Phase 2c 收尾「ARCHIVE 类的收口」。
 **verify 是结构化 argv 配方，不是命令行文本**（SC-R3-4，owner 决策 D2）：
 ```json
 "verify": { "cmd": "npm", "args": ["test", "--", "-t", "archiveCanvas"] }
@@ -106,6 +132,12 @@ node scripts/fix-plan.mjs --artifact consensus.json --manifest sc-manifest.json 
 - 缺 `anchor_paths` → plan degraded，**不产出可派工计划**；恢复唯一路径 = 原 origin 席补发
   verdict 重跑 validator→consensus→coverage→plan。**lead 不得代填 anchor_paths、不得拆组也不得合组。**
 
+**修复方设计约束（写代码之前，按类套形状——反补丁螺旋的主闸）**：
+派工包必须带上 `references/hardening-checklist.md`，并要求 worker：**动手前先判本 SC 触碰的
+代码种类**，命中清单左列任一类 → **上来就套右列的已知正确形状、一次写完**，禁止「先加一个 guard、
+被审出来再补第二个」。这是砍掉 B 类 finding（修复引入的新洞）的主手段——R6→R9 四轮全是「删分支」
+这一个不可逆操作被拆成四次补丁，若 R6 一次套上「事务 reconciliation」形状，R7/R8/R9 三轮不存在。
+
 **逐波执行（有状态 orchestrator，SC-8：base 由 run manifest CAS 派生，不接受自报）**：
 ```
 # 0) 绑定 plan + sc manifest + 源共识（起点 = 源 artifact 的 candidate_sha，由 artifact 派生
@@ -117,9 +149,17 @@ node scripts/fix-run.mjs init --state-dir <st> --run-id <run> --repo-dir . \
 node scripts/fix-run.mjs allocate --state-dir <st> --run-id <run> --plan fix-plan.json \
   --wave <k> --worktree-root ../.fix-wt
 # 2) 按输出的 allocations 一次 create_workers 并行开出（组数即 worker 数，拉满 capacity）
-#    每包: 本组 SC 子集 + 自己的 worktree 路径 + allowed_paths + goal --until-sc
-#    worker 在自己 worktree 内 commit；**所有组** changed ⊆ allowed_paths（verify 组叠加
-#    只改测试路径），越域在集成时被拒（SC-R3-7）
+#    每包: 本组 SC 子集 + 自己的 worktree 路径 + anchor_paths（证据/分组输入，仅供参考，
+#    不是写入许可）+ write_paths（脚本按 kind 推导的写入约束）+ goal --until-sc
+#    worker 在自己 worktree 内 commit：
+#      fix 类 write_paths.mode='isolated' —— 不设清单，写入边界只靠独立 worktree +
+#        集成期真实 diff 重叠检测兜底（overlap → fail-closed 转串行重派，SC-R3-9）；
+#        不会再因「改动不在 anchor_paths 内」被拒——anchor 是证据不是写集（2026-08-02 拆分）。
+#      verify 类 write_paths.mode='anchor-test-path' —— 仍要求 changed ⊆ write_paths.paths
+#        且全为测试路径（SC-R3-7 加固不变），越域在集成时被拒。
+#      archive 类 write_paths.mode='fixed-list' —— changed ⊆ write_paths.paths，值固定为
+#        ARCHIVE_PATH（README.md，fix-plan.mjs 脚本给定常量，不从 anchor_paths 派生，
+#        全链唯一诚实拥有正向写入清单的场景），改了非 README.md 的文件同样越域被拒（SC-M2）。
 # 3) 集成 = **squash**（owner 决策 D1）: 校验 tip 归属 → 实改交集检测 → 无重叠则 merge 出
 #    最终树后用 commit-tree 打成**单个 squash commit**（group tips 永不进最终祖先——
 #    中间 commit 藏东西再恢复的「净 diff 洗历史」从构造上无处容身，SC-R3-8）
@@ -155,6 +195,59 @@ node scripts/fix-run.mjs finalize --state-dir <st> --run-id <run>   # 输出 run
 - 两对抗席只对账 findings 修没修 + delta 有无新问题，禁重审未改代码；
 - 第三席对每个新 candidate 做只读 gate replay 出新 verdict（**不计对抗轮次**）；
 - 重跑 consensus-gate 绑定三份新 verdict。
+
+**收敛判据与收口（反猫捉老鼠核心）**：
+> 前提认清：对抗审查席**结构上不会主动给 APPROVED**——它的职责是挑毛病，新代码总有窄面可挑。
+> 但收口**仍必须走** consensus-gate PASS（全 APPROVED + 全 finding closed）+ push-guard——这是硬约束，
+> 脚本不给旁路（`consensus-gate` conjunct②③ + push-guard `gate_result==pass`）。**不存在 lead 越过审查席
+> 直接发车的路径**，写「不等 APPROVED 就 push」= 文档骗自己（正是加固清单第 7 条的坑）。
+>
+> 真正的解法不是绕闸，是**让审查席有正当理由 close**：把 finding 分两类处置，`[ARCHIVE]` 类的
+> **修复动作本身就是"写进 README 残余登记"**，且这条"修复"跟 `[MUST-FIX]` 走**同一条 fix-run
+> 编排链**（文档化接受即解决，R9 已实证此路径；R10 把它接成机器可执行的 `kind=archive` SC，
+> 不再是「文档说了但脚本走不通」的纸面约定）。
+
+每轮 delta 复核，审查席对每条存活 finding 标 `[MUST-FIX]` 或 `[ARCHIVE-eligible]`：
+
+1. **`[ARCHIVE-eligible]` 判据**（四条全中）：① 窄面（不改主要控制/数据流，只是并发窗口/异常路径的窄角）；
+   ② 限于**本修复周期新写的代码**（git 可查，不是既有面）；③ 非数据损失、非泄密、非安全绕过、
+   非 active-path 失败、非 T2 冒充；④ 审查席给出了**它自己建议的残余登记文案**。
+2. **ARCHIVE 类的收口（机器契约，不是自由发挥）**：lead 为该 finding 提炼一条 `kind=archive` 的 SC
+   （`schemas/sc-manifest.schema.json` v2），把审查席给的文案原样填进该 SC 的 `change`/`holds`，
+   `verify` 用结构化 argv 校验文案已落地，例：
+   ```json
+   { "id": "SC-ARCH-1", "kind": "archive", "finding_ids": ["<fid>"],
+     "change": "把残余风险文案写进 README.md", "holds": "README.md 含约定文案",
+     "verify": { "cmd": "grep", "args": ["-q", "<残余风险关键文案>", "README.md"] } }
+   ```
+   `fix-plan.mjs` 对 `archive` SC 的文件域**固定给 `README.md`**（不从 `anchor_paths` 派生——那是
+   finding 本体的锚点，不是本次要改的文件），该组进**末波**、与 `verify` 组并行（两者都只需看见
+   前波产物、域互不相交，该并行必须并行）；多条 archive SC 天然都落在 `README.md`，
+   **hub 路径门对 archive 池豁免**（不是污染，是设计如此——2 号「拆 finding」的建议在这里不适用）。
+   coverage-gate 对 `archive` SC 与 `fix`/`verify` 同等要求：恰好引用 1 条 finding。
+   worker 走**与 `[MUST-FIX]` 完全相同的 fix-run 编排**：`allocate` 分到自己的 worktree
+   （`allowed_paths` 只有 `README.md`）→ 把文案写进 `README.md` → commit → `integrate` →
+   orchestrator 复跑 `grep` 验证通过。不需 owner 授权（同 Phase 2b）→ 下一轮 delta 审查席看到
+   README 已含约定文案 + verify 通过，据此把该 finding `status=closed`（已由文档化接受解决）
+   → consensus-gate 正常 PASS → push。**闸没绕，循环终止**（因为文档化不产生新代码 = 不长新 finding）。
+3. **`[MUST-FIX]` 仍须改代码**：回 Phase 2c 头部，**按类套形状重做**（不是打补丁）。
+4. **补丁螺旋探测（替代数字轮次上限）**——触发要求**同一问题谱系**，不是「凑够 2 轮窄面」：
+   连续 2 轮的窄面 `[MUST-FIX]` 必须指向**同一模块 + 同一操作 + 同一失败形状**（对账依据：上一轮
+   finding id + `prev..current` 的行级 provenance；两个互不相关的窄面**不算**螺旋）→ 强制回
+   「修复方设计约束」把该模块**所有异常出口一次性重写**（不是再加一个 guard）。
+   **重写后仍复现同类窄面 → 不自动降级**：必须**重新逐项评估第 1 条的四项资格**，任一不满足
+   （尤其③：数据损失/泄密/安全绕过/active-path 失败/T2 冒充）→ **继续 `[MUST-FIX]`**；
+   同一谱系累计 3 次整块重写仍无进展 → 走第 5 条报 owner，**不许自动 ARCHIVE 掉**。
+5. **真·卡死兜底**：`[MUST-FIX]` 的 **blocker/major** 连续 2 轮不减（不是窄面）→ 停，报 owner。
+
+区分：4 治「越修越窄的补丁螺旋」（收敛中，用整块重写了结）；5 治「真修不动」（不收敛，交人）。
+**绝不**混为「跑够 N 轮就停」的数字闸——数字闸要么切早漏真问题，要么切晚继续螺旋。
+
+> **与 plan.md 的数字上限冲突已裁决（owner 2026-08-02）**：`docs/plan.md` SP-2 及其流程图写的
+> 「≤3 轮未收敛停给 owner」（plan.md:37 / 69 / 95 / 131）**本节取代之**——按形状判据收敛，不按轮数硬停。
+> plan.md 的该数字保留为历史记录，不再作为执行契约。
+> 另需区分：`SKILL.md` Phase 2「lead 争议质询 ≤3 轮」是**仲裁**轮次上限（lead 与审查席就某条 finding
+> 是否成立的往复），**不计**修复轮/delta 复核轮——两者互不换算。
 
 ## Phase 3 — push + 注册（lead 指定一个修复 worker 执行；并行场景选其一即可）
 
