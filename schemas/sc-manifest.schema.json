@@ -19,7 +19,7 @@
           "id": { "type": "string", "pattern": "^SC-[A-Za-z0-9._-]+$" },
           "kind": {
             "enum": ["fix", "verify", "global", "archive"],
-            "description": "fix=改代码; verify=纯测试（进最后一波）; global=lead 中央验证步（不派 worker，全 plan ≤1）; archive=残余风险登记（文件域由 fix-plan.mjs 固定给 README.md，不从 anchor_paths 派生；进末波与 verify 并行；恰好引用 1 条 finding，hub 门豁免）"
+            "description": "fix=改代码; verify=纯测试（进最后一波）; global=lead 中央验证步（不派 worker，全 plan ≤1）; archive=残余风险登记（文件域由 fix-plan.mjs 固定给 README.md，不从 anchor_paths 派生；进末波与 verify 并行；恰好引用 1 条 finding；hub 门**三池同查、无 archive 特例豁免**——archive SC 的文件域是单一 README.md，移除后余集为空，D1「可移除性」判据必然放行，不需要豁免分支）"
           },
           "finding_ids": {
             "type": "array",

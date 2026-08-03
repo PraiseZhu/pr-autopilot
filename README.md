@@ -112,7 +112,7 @@ mini 盯梢修复: glm-5.2/max（send_to_session 克隆班车四元组）；卡�
 |---|---|---|
 | **T1 是设计上限** | 全链保证等级 = 防疏忽/防漂移（honest-but-fallible lead），**不防恶意伪造** | 脚本与 lead 同 UID，恶意 lead 可直接改 push-guard 自身。真 T2 需宿主级签名回执，本仓做不到。任何读起来像"防恶意"的文案都是 bug，请提 issue |
 | verify 可显式调用解释器（如 `sh -c` / `node -e`） | T1 信任边界内的显式作恶面 | `cmd` 仅做"裸程序名"语法约束，不是程序白名单；`args` 也不限制解释器开关。因此同 UID 的恶意 lead 可选择 PATH 中任意程序执行命令。若要把这一面纳入 T2，必须由宿主在隔离信任域中提供并签发 verifier registry/执行回执；在本仓枚举解释器黑名单不能形成安全边界 |
-| anchor hub 2+2 配对 | 合法冲突图结果 | hub 门是「≥3 条 SC 且 >50% 占比」。4 条 SC 用两个 hub 两两配对 → 4 组并 2 组，未触发门；但若 hub 是真实 changed evidence，这**就是**正确的冲突分组。hub 未实改的情形由共识入口的 changed-set 门拦住 |
+| anchor hub 2+2 配对 | 合法冲突图结果 | hub 门是「≥3 条 SC **且** >50% 占比 **且** 该共享路径对每个持有者都可移除（移除后各自余集非空）」——最后这个 `allRemovable` 条件是 D1（owner 2026-08-02）加的决定性条件，此前本行只写了前两条，把已被替换的纯占比规则当成了充分条件（2026-08-03 终审 P2 查出）。单文件真耦合即使超过阈值也必须放行。4 条 SC 用两个 hub 两两配对 → 4 组并 2 组，未触发门；但若 hub 是真实 changed evidence，这**就是**正确的冲突分组。hub 未实改的情形由共识入口的 changed-set 门拦住 |
 | 手工伪造 owner 印记 | T2 面 | 归属判据是 worktree admin git-dir 里的 `pr-autopilot-owner`（run_id + 随机 nonce）。手工复制 admin dir / nonce 属显式伪造。已验证正常生命周期无继承误判（remove/prune/同 basename 重建都不残留） |
 | cleanup 补偿恢复失败 | 显式报错，非静默 | 恢复用创建式 CAS（old = 全零），因此**永不覆盖**第三方同名新 ref；一旦恢复失败（如第三方已抢占该 ref）记 `br-restore-fail` + 完整 expected tip + 各错误交人工。不静默 |
 | 外部 raw git 并发 | 有补偿事务兜底 | 一旦发起破坏性步骤（`update-ref -d`），此后任何异常都不得在补偿尝试前逃逸：删除命令抛错按**结果不确定**处理（读 ref 后 reconcile：仍在原位→安全拒 / 已消失或读不出→恢复 / 第三方 tip→不覆盖，R9）；复查命令抛错按**不安全**处理走补偿（R8）；预检查抛错在破坏前 fail-closed。窗口后到达的 `worktree add` 因分支已删自行失败 |

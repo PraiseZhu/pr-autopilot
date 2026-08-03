@@ -3540,7 +3540,29 @@ t('[R10-A4] SKILL.md 契约与实现逐字同步: 按文档描述构造的 manif
   ok(skill.includes('hardening_coverage'), 'SKILL 必须点名机器字段 hardening_coverage');
   ok(skill.includes('README.md'), 'SKILL 必须说明 archive 的文件域是 README.md');
   ok(/"cmd":\s*"grep"/.test(skill) && skill.includes('README.md'), 'SKILL 必须给出 grep 验证配方示例');
-  ok(skill.includes('hub 路径门对 archive 池豁免'), 'SKILL 必须说明 hub 门对 archive 池豁免');
+  // 2026-08-03 终审 P1: 这行原本断言的是**旧契约**（'hub 路径门对 archive 池豁免'），
+  // 而该特例分支早已被 SC-A2'/D2 删掉。更糟的是: 我修 SKILL 主句时在历史警示块里**逐字引用**
+  // 了那句旧文案,于是这条 substring 断言继续为真——**我的漂移修正把这条本该抓漂移的
+  // fixture 骗绿了**。终审实测: 预测「把主句反向改回豁免 → 本块必红」,实际红集 = ∅。
+  // 这是第 8 类的 0-红 形态,由「断言锁的是旧契约 + 历史引文满足它」双因造成。
+  // 改法: ①断当前**正向**契约; ②SKILL 历史块已改写为不含旧句(消除陷阱本身)。
+  ok(skill.includes('hub 路径门对 archive 池没有特例豁免'), 'SKILL 必须说明 hub 门三池同查、archive 无特例豁免（当前契约）');
+  ok(!skill.includes('hub 路径门对 archive 池豁免'), '不得再出现旧契约原句——哪怕作为历史引文，也会让 substring 断言失去鉴别力');
+  // 「三池同查」这条**无法从 buildFixPlan 的输出观测**: archive SC 的文件域固定为单一
+  // README.md，移除后余集为空，D1 判据必然放行——"查了但放行"与"豁免所以没查"输出完全相同。
+  // 所以这里只锁机器真能验的那一条: hubViolations 对任何 label 行为一致（不给 archive 开后门）。
+  {
+    const items = [
+      { sc_id: 'A-0', paths: ['README.md', 'src/a.ts'] },
+      { sc_id: 'A-1', paths: ['README.md', 'src/b.ts'] },
+      { sc_id: 'A-2', paths: ['README.md', 'src/c.ts'] }
+    ];
+    eq(hubViolations(items, 0.5, 'archive').length, 1, 'archive label 不得被特例放行');
+    eq(hubViolations(items, 0.5, 'fix').length, 1, '对照: 同一组输入在 fix label 下结果相同');
+    // 真 archive 形状（只有 README.md）→ 余集为空 → D1 判据放行，两个 label 同样放行
+    const solo = ['A-0', 'A-1', 'A-2'].map((sc_id) => ({ sc_id, paths: ['README.md'] }));
+    eq(hubViolations(solo, 0.5, 'archive').length, 0, '真 archive 形状: 余集为空 → D1 放行（不是豁免，是判据本身）');
+  }
   ok(skill.includes('round===1') && skill.includes('两对抗席'), 'SKILL 必须说明覆盖率契约的机器强制范围');
   // SC-B4: 文档必须点名 checklist_version 机制与 9→10 迁移语义
   ok(skill.includes('checklist_version'), 'SKILL 必须点名机器字段 checklist_version');
