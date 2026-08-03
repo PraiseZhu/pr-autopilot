@@ -14,8 +14,8 @@
 // push-guard 的 lineage 校验退化为精确集合判定（SC-R3-8）。
 // 主 checkout 零接触: 全程不在主 repoDir checkout/detach（SC-R3-11）。
 import { execFileSync } from 'node:child_process';
-import { existsSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { existsSync, writeFileSync, renameSync, mkdirSync, symlinkSync } from 'node:fs';
+import { join, dirname, basename } from 'node:path';
 import { readJson, parseArgs, fail, isMain, nowIso, sha256, canonicalJson, normalizeRepoPath, hashObject } from './lib/common.mjs';
 import { computeFixPlanHash } from './fix-plan.mjs';
 import { recomputeArtifactHash } from './consensus-gate.mjs';
@@ -100,7 +100,14 @@ export function nextWaveBase(manifest, waveIndex) {
   return prev.integrated_tip;
 }
 
-export function allocate({ stateDir, runId, plan, waveIndex, worktreeRoot }) {
+// D3（gpt 终审阻断修复）: artifact/scManifest 改**必填**——旧版允许不传、静默产出
+// family_context=null，「强制覆盖全部路径」这件事因此可以静默退化成部分覆盖，且对真旧版
+// manifest（未升级到 family_key 数据契约）不做静默兼容，两个入口（本函数 + fix-orchestrate.mjs
+// 的 allocateWave/familyContext）同等 fail-closed，不留 legacy 通道（hardening-checklist 第
+// 5 类）。传入后必须与本 run init 时绑定的 hash 一致（fail-closed，防误传不相关的
+// artifact/manifest——字段错配，不是恶意场景的专用措辞，D5），不一致直接抛错，不静默降级
+// 为「没有 family_context」（那会把「输入错」伪装成「无 family」）。
+export function allocate({ stateDir, runId, plan, waveIndex, worktreeRoot, artifact, scManifest }) {
   const { path, m } = loadRun(stateDir, runId, plan);
   if (m.waves[waveIndex]?.integrated_tip) throw new Error(`wave${waveIndex + 1} 已集成，不可重复 allocate`);
   // R4-P1: replan 状态不可被 allocate 重放清除——否则串行重派可被绕回并行集成（fail-open）。
@@ -108,8 +115,16 @@ export function allocate({ stateDir, runId, plan, waveIndex, worktreeRoot }) {
   if (m.waves[waveIndex]?.replan) {
     throw new Error(`wave${waveIndex + 1} 已进入 overlap 串行重派状态，禁止重新 allocate（只能 serial-allocate 消费，R4-P1）`);
   }
+  if (!artifact) throw new Error('allocate 缺 artifact（D3 必填：family_context 强制覆盖全部路径，不传会静默退化，两个入口同等 fail-closed）');
+  if (!scManifest) throw new Error('allocate 缺 scManifest（D3 必填，同上）');
+  if (recomputeArtifactHash(artifact) !== m.source_artifact_hash) {
+    throw new Error('allocate 传入的 artifact 与本 run 绑定的 source_artifact_hash 不符（字段错配：family_context 输入必须是同一份源共识，fail-closed）');
+  }
+  if (hashObject(scManifest) !== m.sc_manifest_hash) {
+    throw new Error('allocate 传入的 scManifest 与本 run 绑定的 sc_manifest_hash 不符（字段错配：family_context 输入必须是同一份 sc manifest，fail-closed）');
+  }
   const waveBase = nextWaveBase(m, waveIndex); // ← 权威来源
-  const alloc = allocateWave({ repoDir: m.repo_dir, worktreeRoot, runId, plan, waveIndex, waveBase });
+  const alloc = allocateWave({ repoDir: m.repo_dir, worktreeRoot, runId, plan, waveIndex, waveBase, artifact, scManifest });
   m.waves[waveIndex] = { wave_index: waveIndex, base: waveBase, worktree_root: worktreeRoot, allocations: alloc.allocations, tips: null, integrated_tip: null, replan: null, validation: null };
   appendEvent(m, { kind: 'wave-allocate', wave: waveIndex, base: waveBase, groups: alloc.allocations.map((a) => a.group_id) });
   saveManifest(path, m);
@@ -347,6 +362,74 @@ export function validateVerifyRecipe(v) {
 }
 export function verifyDigest(v) { return sha256(canonicalJson({ cmd: v.cmd, args: v.args })); }
 
+// ---- D7: 依赖准备 + fail-closed 分支 ----
+// 根因（另一会话实测，2026-08-02）: ensureIntegrationWorktree 只做 `git worktree add --detach`，
+// 裸 checkout 没有 node_modules——依赖项目依赖的 verify recipe（如 `npx vitest`）会立刻
+// exit!=0 且 stdout 为空，SC-10「orchestrator 不信 worker 自报」这道门因此在任何带依赖的
+// 项目上全数假阳，训练调用方忽略它（比没有门更糟）。
+// 主仓存在 node_modules 且 worktree 内没有 → 软链（成本近零，依赖不是被审代码，不违背
+// 隔离初衷）。**fail-closed 分支（必须有，否则产出静默错误结果）**: 软链主仓依赖等于
+// 用主仓依赖集跑候选代码——若候选累计 diff 改了依赖清单，链过来的 node_modules 与候选
+// 不一致，测试可能通过但通过的是错的依赖状态，比响亮失败更危险。此时不建软链，直接把
+// 整波（同一 worktree/环境）判 UNRUNNABLE，原因点名具体哪个清单文件。
+// 不实现 npm ci（新增机制确认门）：本轮目标是让门可用，自动安装要处理网络/超时策略，
+// 留给下一轮；本轮 fail-closed 报出来即可，不静默、不硬撑。
+// 坑④: 主仓本就没有 node_modules 不是错误——自包含 verify recipe（纯 node/bash，不依赖
+// 项目依赖）合法存在，此时 no-op，不报错、不阻断。
+// 「recipe 依赖 node 工具链」的确定性判据：cmd 是 npx/npm/yarn/pnpm 之一（这几个命令的存在
+// 意义就是解析/调用项目依赖里的东西，不可能在没有 node_modules 时正常工作）——这不是启发式，
+// 是对这四个命令语义的确定性事实。裸 `node` 不算（可能是自包含的 `node -e "..."`）。
+const DEP_MANIFEST_BASENAMES = new Set(['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock']);
+export const DEP_TOOLCHAIN_CMDS = new Set(['npx', 'npm', 'yarn', 'pnpm']);
+export function prepareDependencies({ repoDir, wt, sourceCandidate, integratedTip }) {
+  const repoModules = join(repoDir, 'node_modules');
+  if (!existsSync(repoModules)) return { unrunnable: false, linked: false }; // 坑④: 主仓也没有 = 合法态
+  // R2-F2（gpt 复审 finding 2，P1）: 依赖清单 diff 必须**先于**「worktree 已有 node_modules」
+  // 的早返回。旧顺序是先看 wtModules 存在就直接返回 runnable，而 integration worktree 是
+  // **run 级跨波复用**（见 ensureIntegrationWorktree，注释原话「run 级记录: integration
+  // worktree 跨波共享」），波间只做 `git checkout --detach`——**不清 untracked**，所以 wave 1
+  // 建的软链原地活到 wave 2。于是 wave 2 即便改了 package.json 也撞第一行早返回，永远走不到
+  // 下面的清单检查，被归成 runnable，然后在**旧依赖**下跑出 PASS。
+  // 阻断谓词本身是对的（validate 用 every(status==='PASS')，UNRUNNABLE 令 ok=false；
+  // finalizeRun 拒 validation.ok !== true）——出问题的是它的**分类前提**被短路了。
+  // gpt 实测探针（已有软链 + source..tip 改 package.json）拿到 {unrunnable:false,linked:false}。
+  let changed;
+  try {
+    changed = changedFiles({ repoDir, base: sourceCandidate, tip: integratedTip });
+  } catch (e) {
+    // 算不出实改集就不敢判「依赖没变」——抛错归 UNRUNNABLE，不是归 runnable（fail-closed）
+    return {
+      unrunnable: true, linked: false,
+      reason: `无法计算 ${sourceCandidate?.slice?.(0, 8) ?? '?'}..${integratedTip?.slice?.(0, 8) ?? '?'} 的实改集，无法判断依赖清单是否变化（fail-closed）: ${e.message}`
+    };
+  }
+  const touched = changed.find((f) => DEP_MANIFEST_BASENAMES.has(basename(f)));
+  const wtModules = join(wt, 'node_modules');
+  if (touched) {
+    // changedFiles 取的是 source_candidate..本波 tip 的**树差**（不是逐波增量）：只要依赖清单
+    // 相对 source 的差异**仍然存在**，后续每一波都还会看到它，持续判 UNRUNNABLE。
+    //
+    // 这里**不删**任何已有的 node_modules。初版注释把理由写成「某波改过清单后后续每波都还
+    // 带着它，所以永远不会放行」——那是**全称句，不成立**：gpt 终审构造了「后续波把
+    // package.json 内容恢复到与 source 相同」的对照组，实测 beforeRevert=["other.txt",
+    // "package.json"]、afterRevert=["other.txt"]，清单差异确实会消失。
+    // 但**决定仍然正确，安全性由另一条机制兜住**：恢复后候选依赖重新等于 source，那条旧软链
+    // 已经不 stale（用它跑是对的）；而先前那一波留下的 `validation.ok=false` 不会被后续波抹掉，
+    // `finalizeRun` 逐波检查、任一波不过即拒。所以「阻断」不是靠 diff 一直带着清单来维持的，
+    // 是靠**已落盘的逐波验证结果**维持的。
+    // 至于为什么不删：既然已阻断，删了不多买一分安全，而误删一份真实安装的依赖不可逆。
+    // 只把「有残留软链」如实写进 reason。
+    const stale = existsSync(wtModules) ? '（integration worktree 内已有前一波留下的 node_modules 残留，未删除）' : '';
+    return {
+      unrunnable: true, linked: false,
+      reason: `候选改动了依赖清单 ${touched}，链入主仓的 node_modules 与候选不一致（fail-closed，未尝试软链）${stale}——需真实安装依赖后重跑，本轮不自动 npm ci（新增机制确认门，留给下一轮）`
+    };
+  }
+  if (existsSync(wtModules)) return { unrunnable: false, linked: false }; // 依赖清单未变，前一波的软链仍然有效
+  symlinkSync(repoModules, wtModules, 'dir');
+  return { unrunnable: false, linked: true };
+}
+
 // ---- SC-10b + SC-R3-3: orchestrator 复跑 SC verify，绑定 sc manifest，空跑不算过 ----
 export function validateIntegration({ stateDir, runId, scManifest, waveIndex, runner = null }) {
   const { path, m } = loadRun(stateDir, runId);
@@ -364,11 +447,29 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
   // 验证在 integration worktree 的 integrated_tip 上跑（owner 印记校验同 integrate）
   const wt = ensureIntegrationWorktree({ manifestPath: path, m, ws, runId, checkoutRef: ws.integrated_tip });
 
+  // D7: 依赖准备——整波共用同一个 worktree/环境，判定一次即可
+  const depPrep = prepareDependencies({ repoDir: m.repo_dir, wt, sourceCandidate: m.source_candidate, integratedTip: ws.integrated_tip });
+  const wtHasModules = existsSync(join(wt, 'node_modules'));
+
   const results = [];
   for (const id of scIds) {
     const sc = byId.get(id);
     const recipeErr = validateVerifyRecipe(sc.verify);
     if (recipeErr) throw new Error(`SC ${id}: ${recipeErr}`);
+    if (depPrep.unrunnable) {
+      // D7 确定性分类①: 已知我们主动跳过了依赖准备（候选改了依赖清单），不是猜的。
+      // UNRUNNABLE 与 FAIL 分开报但同等阻断（下方 ok 判定对两者一视同仁，不得把
+      // UNRUNNABLE 排除在 every(PASS) 之外）。
+      results.push({ sc_id: id, status: 'UNRUNNABLE', exit_code: null, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(''), stdout_bytes: 0, note: depPrep.reason });
+      continue;
+    }
+    if (DEP_TOOLCHAIN_CMDS.has(sc.verify.cmd) && !wtHasModules) {
+      // D7 确定性分类②: recipe 明确要用 npx/npm/yarn/pnpm，但 worktree 里确实没有
+      // node_modules（无论是主仓也没有、还是软链已尝试但仍不存在）——这是对命令语义的
+      // 确定性判断，不是「exit!=0 且 stdout 空」那种启发式猜测。
+      results.push({ sc_id: id, status: 'UNRUNNABLE', exit_code: null, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(''), stdout_bytes: 0, note: `verify.cmd="${sc.verify.cmd}" 依赖 node 工具链，但 worktree 无 node_modules（主仓亦无可链入的依赖）——未尝试执行，避免落一个无意义的原生报错` });
+      continue;
+    }
     let exitCode = 0, stdout = '';
     try {
       stdout = runner
@@ -382,7 +483,14 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
       stdout = String(e.stdout ?? '');
     }
     // 凭证不落库红线: 只存 exit + 摘要 hash，不存原始输出
-    results.push({ sc_id: id, status: exitCode === 0 ? 'PASS' : 'FAIL', exit_code: exitCode, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(String(stdout)), stdout_bytes: Buffer.byteLength(String(stdout)) });
+    const status = exitCode === 0 ? 'PASS' : 'FAIL';
+    const entry = { sc_id: id, status, exit_code: exitCode, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(String(stdout)), stdout_bytes: Buffer.byteLength(String(stdout)) };
+    // D7: exit≠0 且 stdout 为空只是**提示**，不是判据——真实测试失败也可能 stdout 为空
+    // （有些 runner 只写 stderr），不得据此改判 UNRUNNABLE，只在 note 里给排查方向。
+    if (status === 'FAIL' && entry.stdout_bytes === 0) {
+      entry.note = '退出非零且 stdout 为空——疑似环境问题（如 worktree 缺 node_modules、命令找不到），也可能是真实测试失败但输出全落在 stderr；请先查 worktree 运行环境再确认是否为真实失败';
+    }
+    results.push(entry);
   }
   const ok = results.every((r) => r.status === 'PASS');
   ws.validation = { at: nowIso(), ok, results };
@@ -472,8 +580,14 @@ if (isMain(import.meta.url)) {
       const m = initRun({ stateDir: args['state-dir'], runId: args['run-id'], repoDir: args['repo-dir'], plan: readJson(args.plan), scManifest: readJson(args['sc-manifest']), sourceArtifact: readJson(args['source-artifact']), featureBranch: args['feature-branch'] });
       process.stdout.write(JSON.stringify({ ok: true, run_id: m.run_id, source_candidate: m.source_candidate }) + '\n');
     } else if (mode === 'allocate') {
-      need(['state-dir', 'run-id', 'plan', 'wave', 'worktree-root']);
-      const r = allocate({ stateDir: args['state-dir'], runId: args['run-id'], plan: readJson(args.plan), waveIndex: Number(args.wave), worktreeRoot: args['worktree-root'] });
+      // D3: --artifact/--sc-manifest 改必填——两个入口同等 fail-closed，不留 legacy 通道。
+      need(['state-dir', 'run-id', 'plan', 'wave', 'worktree-root', 'artifact', 'sc-manifest']);
+      const r = allocate({
+        stateDir: args['state-dir'], runId: args['run-id'], plan: readJson(args.plan),
+        waveIndex: Number(args.wave), worktreeRoot: args['worktree-root'],
+        artifact: readJson(args.artifact),
+        scManifest: readJson(args['sc-manifest'])
+      });
       process.stdout.write(JSON.stringify({ ok: true, wave_base: r.wave_base, allocations: r.allocations }, null, 2) + '\n');
     } else if (mode === 'integrate') {
       need(['state-dir', 'run-id', 'plan', 'wave']);

@@ -20,6 +20,23 @@ import { computeReviewInputHash } from './review-input-hash.mjs';
 const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
 const SEVERITY_RANK = { suggestion: 1, major: 2, blocker: 3 }; // SC-5: canonical 取最高
 
+// D1（owner 2026-08-02 fable 拍板，gpt 终审阻断修复）: family_key 是跨 reviewer/跨 candidate 的
+// 内容派生身份——`family_id` 只是「同 verdict 内」的本地归组标签（SKILL.md 正式定义），两个不同
+// reviewer 完全可能各自合法地把同一个标签（如 "F1"）用来指不同的不变量；下游若直接按 family_id
+// 字符串分组，会把互不相关的 finding 错误合并（gpt 实测复现: SC-A「状态单一 writer」与 SC-B
+// 「删除须 reconciliation」因两席各自的 F1 恰好撞了标签字符串，被合成一族，PR body 只显示了
+// 第一个 invariant）。family_key 从 invariant 文本本身派生：同（归一化后）文本 → 同 key，
+// 不同文本 → （密码学意义上）不同 key，天然免疫「标签撞车」，也天然支持反过来的「同一 invariant
+// 用了不同 family_id 标签」被正确合并。'fk1-' 是算法版本前缀——未来若换归一化规则，旧 key 与新
+// key 不再相等，不会被误认成兼容（对齐 hardening-checklist 第 7 类「改契约要同步改」的教训）。
+export function normalizeInvariantForKey(invariant) {
+  return String(invariant).trim().toLowerCase().replace(/\s+/g, '');
+}
+export function familyKeyOf(invariant) {
+  if (typeof invariant !== 'string' || !invariant) return null;
+  return `fk1-${sha256(normalizeInvariantForKey(invariant))}`;
+}
+
 // 聚类 key（仅用于去重展示，不参与放行判定）:
 // face + 去行号规整 anchor + 语义指纹。同 key 的多席条目并入一簇，
 // 全部 origins 保留（审②-F2: 不做先到先得）。
@@ -69,6 +86,20 @@ export function runConsensusGate(verdicts, opts = {}) {
     if (!seen.has(r)) failReasons.push(`缺少三席之一: ${r}`);
   }
   if (failReasons.length) return { gate_result: 'fail', fail_reasons: failReasons };
+
+  // D8-3: delta 轮缺 parent 必须拒。此前 SC-3 只在「调用方传了 parent」时才校验来源正确
+  // （fixture「SC-3: 同 base 错源必拒」那条），**漏传**却是静默放行——parent_artifact_hash
+  // 记成 null 照样出 pass artifact，谱系门对最常见的漏参路径完全 fail-open。
+  // 位置放在上面那道 schema 早返回**之后**，理由是**类型边界**: 到此 round 已过
+  // validateVerdict 的 `Number.isInteger(v.round) && v.round >= 1`，可以按整数直接算 max。
+  // 不是「放前面会 fail-open」——放前面也不会漏，非法 round 早被 validateVerdict 记成错误、
+  // 由那道早返回拦下。初版注释把理由写成「否则 NaN >= 2 为 false 就放行」，gpt 复审证伪，此处纠正。
+  // 取 max 而非要求三席 round 一致: 三席 round 若不一致，按最大的那个要求 parent
+  // （fail-closed 方向）。「三席 round 必须一致」是另一条不变量，本轮不在范围内。
+  const maxRound = Math.max(...verdicts.map((v) => v.round));
+  if (maxRound >= 2 && !parentArtifactHash) {
+    failReasons.push(`delta 轮（round=${maxRound}）未绑定上一轮 artifact：缺 --parent / parentArtifactHash——SC-3 谱系门不允许 fail-open（D8-3）`);
+  }
 
   // conjunct ①: 同 hash 且等于 bundle 重算值
   let recomputed = null;
@@ -130,11 +161,25 @@ export function runConsensusGate(verdicts, opts = {}) {
           severity: fd.severity,
           anchor: fd.anchor,
           anchor_paths: [], // v2: 各 origin 并集，随 artifact hash——下游换路径即断裂
+          // SC-B1（D1）: invariant 冻结自**首个**（按 verdicts 到达顺序）提供该字段的
+          // origin——与 anchor/primary_face 同一处理方式（只有 severity 特殊取最高，见下方）。
+          // 归属本就发生在 origin 席自己的 verdict 里（同 verdict 内 family_id 已由
+          // verdict-validate 强制自洽），这里只做「冻结第一手」，不做跨 origin 的语义合并/裁决。
+          // suggestion 级 finding 不强制该字段——不带就不带，不写 null（schema 类型是 string）。
+          // D1: family_key 从冻结后的 invariant 派生——跨 reviewer/跨 candidate 的真实身份，
+          // 下游分组/校验全部改绑这个字段，不再信任 family_id 字符串本身（见上方 familyKeyOf）。
+          ...(typeof fd.invariant === 'string' && fd.invariant ? { invariant: fd.invariant, family_key: familyKeyOf(fd.invariant) } : {}),
+          // D1: origin_family_ids 保留每个 origin 自己的本地标签，供人工回溯「这条记录是哪个
+          // reviewer 用哪个标签指过」——不参与任何机器分组判定，纯审计用途。
+          origin_family_ids: [],
           status: 'closed' // 走到这里必然全 closed（conjunct② 已断言）
         });
       }
       const c = union.get(key);
       c.origins.push({ reviewer: v.reviewer, finding_id: fd.id });
+      if (typeof fd.family_id === 'string' && fd.family_id) {
+        c.origin_family_ids.push({ reviewer: v.reviewer, family_id: fd.family_id });
+      }
       for (const p of fd.anchor_paths ?? []) if (!c.anchor_paths.includes(p)) c.anchor_paths.push(p);
       // SC-5（R2-P1-2 附带洞）: canonical severity 取同簇**最高**——旧实现取首个 origin，
       // 一席 suggestion 一席 major 时输入顺序能把 canonical 降为 suggestion，

@@ -34,6 +34,23 @@
           "primary_face": { "type": "string" },
           "severity": { "type": "string" },
           "anchor": { "type": "string" },
+          "invariant": { "type": "string", "minLength": 1, "maxLength": 120, "description": "SC-B1: 冻结自首个 origin 提供的值（consensus-gate.mjs），suggestion 级 finding 可不带。" },
+          "family_key": {
+            "type": "string", "pattern": "^fk1-[0-9a-f]{64}$",
+            "description": "D1: 跨 reviewer/跨 candidate 的内容派生身份，从冻结后的 invariant 归一化文本 sha256 派生（consensus-gate.mjs 的 familyKeyOf）——下游分组/校验的唯一合法依据，不是 family_id。suggestion 级 finding（无 invariant）可不带。"
+          },
+          "origin_family_ids": {
+            "type": "array",
+            "description": "D1: 各 origin 自己的本地归组标签（供人工回溯，不参与任何机器分组判定）。",
+            "items": {
+              "type": "object",
+              "required": ["reviewer", "family_id"],
+              "properties": {
+                "reviewer": { "enum": ["claude-adversarial", "codex-adversarial", "upstream-preview"] },
+                "family_id": { "type": "string", "minLength": 1 }
+              }
+            }
+          },
           "status": { "enum": ["open", "closed"] }
         }
       }

@@ -64,8 +64,76 @@ export function writePathsFor(group) {
   return { mode: 'isolated' };
 }
 
+// SC-B1: 派工包的 family 上下文——纯只读派生，不改变写入范围（write_paths 仍按 kind 走
+// writePathsFor 不变）。分组逻辑（union-find 按路径冲突）完全不改；本函数只是在已分好的组
+// 之上，为组内每条 SC 附上「同 family 的其它已知 manifestation」，让 worker 一次看到本不变量
+// 的全部已知表现——不这样做的话，worker 只看到自己组分到的窄路径，容易重演 hardening-checklist
+// 第 1 类踩过的坑（分四次补丁而不是一次套对形状），只是这次的窄面来自「family 的其它成员在
+// 别的组/别的波，我看不见」而不是「一个函数里少写一支」。
+// D1: 分组键是 family_key（内容派生），不是 family_id——family_id 只是 reviewer 席内的本地
+// 标签，两个不同 reviewer 完全可能各自合法地把同一标签用来指不同的不变量；按标签分组会把
+// 互不相关的 finding 错误合并（gpt 终审实测复现的阻断项）。family 关系跨组/跨波（同 family_key
+// 的两条 finding 完全可能分到不同的路径冲突组，甚至一个进 fix 波一个进 verify 波）——因此必须
+// 扫**全量** canonical_findings，不能只看本组的 SC。
+// D3（gpt 终审阻断修复）: artifact/manifest 必填——不传/传旧版（actionable finding 缺
+// family_key）不再静默退化成「没有 family_context」，两个入口（本函数 + fix-run.mjs 的
+// allocate）同等 fail-closed（hardening-checklist 第 5 类）。
+export function familyContext({ artifact, manifest, scIds }) {
+  if (!artifact) throw new Error('familyContext 缺 artifact（D3 必填：family_context 要强制覆盖全部路径，不传不再静默产出 null，两个入口同等 fail-closed）');
+  if (!manifest) throw new Error('familyContext 缺 manifest（D3 必填，同上）');
+  const canonical = artifact.canonical_findings ?? [];
+  // D3: 真旧版 artifact（actionable finding 缺 family_key，即未升级到本次数据契约）不做
+  // 静默兼容——一次性扫全量 canonical_findings，任何 actionable finding 缺 family_key 立即
+  // fail-closed，而不是让「强制覆盖全部路径」这件事在下游按 scId 逐个悄悄退化成部分覆盖。
+  for (const f of canonical) {
+    if ((f.severity === 'blocker' || f.severity === 'major') && !f.family_key) {
+      throw new Error(`familyContext: actionable finding ${f.id}（${f.severity}）缺 family_key——疑似旧版 consensus artifact（未升级到 family_key 数据契约），请用当前版本重新生成，不得静默产出不完整的 family_context（D3 fail-closed）`);
+    }
+  }
+  const findingById = new Map(canonical.map((f) => [f.id, f]));
+  const scByFindingId = new Map();
+  for (const sc of manifest.scs ?? []) {
+    if (sc.kind === 'global') continue;
+    for (const fid of sc.finding_ids ?? []) scByFindingId.set(fid, sc.id);
+  }
+  // family_key -> 该 family 全部 manifestation（finding_id/sc_id/anchor_paths），全量、不分组不分波
+  const byFamily = new Map();
+  for (const f of canonical) {
+    if (!f.family_key) continue; // 未归族（suggestion 或缺归因）: 不参与 family 聚合
+    if (!byFamily.has(f.family_key)) byFamily.set(f.family_key, []);
+    byFamily.get(f.family_key).push({
+      finding_id: f.id, sc_id: scByFindingId.get(f.id) ?? null,
+      anchor_paths: f.anchor_paths ?? [], invariant: f.invariant ?? null
+    });
+  }
+  const out = {};
+  for (const scId of scIds ?? []) {
+    const sc = (manifest.scs ?? []).find((s) => s.id === scId);
+    const fid = sc?.finding_ids?.[0];
+    const f = fid ? findingById.get(fid) : null;
+    if (!f || !f.family_key) { out[scId] = null; continue; } // 不存在或本就未归族（suggestion）: 合法态
+    // 同 family 前序 finding 引用（D1 归因链）: 排除自己，其余全部 manifestation 原样列出——
+    // 包括它们各自的 finding_id（引用本体）与已分到的 sc_id（若尚未分到任何 SC 则为 null）。
+    const manifestations = (byFamily.get(f.family_key) ?? []).filter((m) => m.finding_id !== f.id);
+    out[scId] = {
+      family_key: f.family_key,
+      invariant: f.invariant,
+      manifestations,
+      audit_instruction: manifestations.length
+        ? `本 SC 修复的不变量「${f.invariant}」在本轮共识中还有 ${manifestations.length} 处已知表现（family_key=${f.family_key}）：${manifestations.map((m) => `${m.finding_id}${m.sc_id ? `(${m.sc_id})` : ''}@${m.anchor_paths.join(',')}`).join('; ')}。除上述已点名路径外，请审计所有可能违反该不变量的代码路径（含未点名处），一次性修复到位——不要只按分给自己的这几处打窄补丁。`
+        : `本 SC 修复的不变量「${f.invariant}」在本轮共识中暂无其它已知表现，但请审计所有可能违反该不变量的代码路径（含未点名处），不要只按 anchor_paths 打窄补丁。`
+    };
+  }
+  return out;
+}
+
 // 为一个波次分配 worktree（幂等: 已存在同名 worktree 视为复用，base 必须一致否则 fail-closed）
-export function allocateWave({ repoDir, worktreeRoot, runId, plan, waveIndex, waveBase, exec = null }) {
+// D3（gpt 终审阻断修复）: artifact/scManifest 改必填——旧版允许不传、静默产出 family_context
+// =null，「强制覆盖全部路径」这件事因此可以静默退化成「有的路径覆盖、有的路径没覆盖」。
+// 两个入口（本函数 + fix-run.mjs 的 allocate）同等 fail-closed，不留 legacy 静默通道。
+export function allocateWave({ repoDir, worktreeRoot, runId, plan, waveIndex, waveBase, exec = null, artifact, scManifest }) {
+  if (!artifact) throw new Error('allocateWave 缺 artifact（D3 必填：family_context 强制覆盖全部路径，不传会静默退化，两个入口同等 fail-closed）');
+  if (!scManifest) throw new Error('allocateWave 缺 scManifest（D3 必填，同上）');
   const g = exec ? (...a) => exec(['git', '-C', repoDir, ...a]) : (...a) => git(repoDir, ...a);
   if (!/^[A-Za-z0-9._-]+$/.test(String(runId))) throw new Error(`runId 非法: ${runId}`);
   if (!/^[0-9a-f]{40}$/.test(String(waveBase))) throw new Error(`waveBase 必须是完整 SHA: ${waveBase}`);
@@ -100,7 +168,10 @@ export function allocateWave({ repoDir, worktreeRoot, runId, plan, waveIndex, wa
       nonce = newNonce();
       stampOwner({ worktreeDir: wtPath, payload: { run_id: runId, group_id: groupId, nonce }, exec });
     }
-    allocations.push({ group_id: groupId, sc_ids: group.sc_ids, anchor_paths: group.paths, write_paths: writePathsFor(group), branch, worktree: wtPath, base: waveBase, owner_nonce: nonce });
+    // D3: artifact/scManifest 已在函数入口强制校验非空，family_context 现在恰好覆盖全部路径
+    // （不再有「没传就是 null」的静默退化通道）。分组结果本身不受影响（分组逻辑完全不改）。
+    const family_context = familyContext({ artifact, manifest: scManifest, scIds: group.sc_ids });
+    allocations.push({ group_id: groupId, sc_ids: group.sc_ids, anchor_paths: group.paths, write_paths: writePathsFor(group), branch, worktree: wtPath, base: waveBase, owner_nonce: nonce, family_context });
   }
   return { run_id: runId, wave_index: waveIndex, wave_base: waveBase, allocations, allocated_at: nowIso() };
 }

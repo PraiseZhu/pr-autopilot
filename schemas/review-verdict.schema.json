@@ -1,8 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "pr-autopilot/review-verdict/v2",
-  "title": "三审 reviewer 机器 verdict（计划 §1.1b ⑨；v2 增 anchor_paths 机器字段）",
+  "title": "三审 reviewer 机器 verdict（计划 §1.1b ⑨；v2 增 anchor_paths/invariant/family_id/checklist_version 机器字段）",
   "type": "object",
+  "$comment": "checklist_version 的必填/取值校验是角色/轮次条件（同 hardening_coverage）——JSON Schema 表达不了，verdict-validate.mjs 为准。计数与版本单一来源: scripts/lib/hardening-registry.mjs。",
   "required": [
     "schema_version", "reviewer", "run_status", "round",
     "base_sha", "candidate_sha", "review_input_hash",
@@ -47,12 +48,20 @@
             "items": { "type": "string", "minLength": 1 },
             "description": "机器字段: 该 finding 涉及的仓库相对精确文件路径（POSIX，非目录）。纯证据锚点——用于分组/hub 判定输入，**绝不是写入许可**（2026-08-02 anchor_paths 三用途拆分: 证据可能落在只读症状文件，真正要改的文件可能根本不在证据里）。formal 校验在 verdict-validate（拒绝绝对/./../反斜杠/尾斜杠/NUL）"
           },
+          "invariant": {
+            "type": "string", "minLength": 1, "maxLength": 120,
+            "description": "SC-B1（D1）: 一句话「被破坏的不变量」。归属发生在 finding 生成时（审查席），不是修复计划时（lead）——verdict-validate.mjs 对 round===1 两对抗席的 actionable（blocker/major）finding 强制必填，suggestion 级不强制。lead/SC 层只能逐字复制该值，不得自填（sc-coverage-gate.mjs 强制逐字相等）。"
+          },
+          "family_id": {
+            "type": "string", "minLength": 1,
+            "description": "SC-B1（D1）: 同 verdict 内归族标识——同一 origin 席在自己这份 verdict 里，把该不变量的多处 manifestation 标同一个 family_id。机器只强制：actionable finding 必填、同 family_id 的 invariant 文本必须逐字一致（同 verdict 内自洽，verdict-validate.mjs）。语义上「这几处是不是真的同族」永远是审查席的判断，机器不判断、不合并 SC（D2：family 关系通过字段流转，不通过合并 SC）。"
+          },
           "scope_note": { "type": "string", "description": "跨面/宽范围说明（自由文本，不进冲突图）" },
           "evidence": { "type": "string", "minLength": 1 },
           "status": { "enum": ["open", "closed"] }
         }
       },
-      "$comment": "D2: write_paths/allowed_paths 禁止出现在 finding 上（additionalProperties:false 结构性拒绝 + verdict-validate.mjs 显式校验双重把关）——写入许可只能由脚本从 SC kind 推导，lead/AI 不得自报。"
+      "$comment": "D2: write_paths/allowed_paths 禁止出现在 finding 上（additionalProperties:false 结构性拒绝 + verdict-validate.mjs 显式校验双重把关）——写入许可只能由脚本从 SC kind 推导，lead/AI 不得自报。invariant/family_id 仅对 actionable（blocker/major）finding 强制必填——JSON Schema 表达不了「severity 条件必填」，verdict-validate.mjs 为准（同 hardening_coverage 的角色/轮次条件同一处理方式）。"
     },
     "gate_checks": {
       "type": "array",
@@ -68,17 +77,21 @@
     },
     "hardening_coverage": {
       "type": "array",
-      "$comment": "加固清单九类核对点（references/hardening-checklist.md）机器覆盖字段。是否强制由 round/reviewer 决定——verdict-validate.mjs 对 round===1 的两个对抗席（claude-adversarial/codex-adversarial）强制恰好 9 项、class_id 1〜9 各恰好一次；第三席与 round>=2 不强制，JSON Schema 表达不了角色/轮次条件，以 validator 为准（同 faces 的角色级约束）。",
+      "$comment": "加固清单十类核对点（references/hardening-checklist.md）机器覆盖字段。是否强制由 round/reviewer 决定——verdict-validate.mjs 对 round===1 的两个对抗席（claude-adversarial/codex-adversarial）强制恰好 10 项、class_id 1〜10 各恰好一次；第三席与 round>=2 不强制，JSON Schema 表达不了角色/轮次条件，以 validator 为准（同 faces 的角色级约束）。class_id 上界 10 与 scripts/lib/hardening-registry.mjs 的 HARDENING_CLASS_COUNT 手动保持一致（SC-B4: 9→10 迁移，schema 是静态数据无法 import，改动务必同步）。",
       "items": {
         "type": "object",
         "required": ["class_id", "result", "evidence"],
         "properties": {
-          "class_id": { "type": "integer", "minimum": 1, "maximum": 9 },
+          "class_id": { "type": "integer", "minimum": 1, "maximum": 10 },
           "result": { "enum": ["covered", "n_a"] },
           "evidence": { "type": "string", "minLength": 1 }
         },
         "additionalProperties": false
       }
+    },
+    "checklist_version": {
+      "type": "integer", "minimum": 1,
+      "description": "SC-B4（D5）: 加固清单版本号，取值须等于 scripts/lib/hardening-registry.mjs 的 HARDENING_CHECKLIST_VERSION。round===1 两对抗席必填（同 hardening_coverage 的角色/轮次条件，validator 为准）；版本不符 → degraded，错误信息明确「清单版本过期需重审」，不与 hardening_coverage 缺项的普通计数错误混淆（9→10 是 exact 集合变更，不是少填一项）。"
     },
     "verdict": { "enum": ["APPROVED", "REQUIRES_CHANGES"] },
     "closed_finding_ids": { "type": "array", "items": { "type": "string" } },

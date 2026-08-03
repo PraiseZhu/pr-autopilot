@@ -27,6 +27,7 @@ export function checkScCoverage({ manifest, artifact }) {
 
   const canonical = artifact.canonical_findings ?? [];
   const canonicalIds = new Set(canonical.map((f) => f.id));
+  const canonicalById = new Map(canonical.map((f) => [f.id, f]));
   const mustCover = canonical.filter((f) => f.severity === 'blocker' || f.severity === 'major');
 
   const scs = Array.isArray(manifest.scs) ? manifest.scs : [];
@@ -68,6 +69,34 @@ export function checkScCoverage({ manifest, artifact }) {
       for (const fid of fids) {
         need(canonicalIds.has(fid), `SC ${sc.id} 引用悬空 finding_id: ${fid}（不在 consensus artifact 中）`);
         coverCount.set(fid, (coverCount.get(fid) ?? 0) + 1);
+      }
+      // SC-B1（D1）: lead 提炼 SC 时只能**逐字复制**引用 finding 在共识产物里冻结的
+      // invariant/family_key，不得自填/改写——归因判断权始终在审查席，SC 层没有自由裁量。
+      // 仅当 fids 恰好 1 条（上面已断言，否则下面按 undefined 处理不产生误报）且引用的
+      // canonical finding 确实存在、且是 actionable（blocker/major）时才强制：suggestion
+      // 级 finding 在 verdict-validate 层本就不强制携带这两个字段，SC 层同等不强制。
+      // D1: 绑定字段是 family_key（内容派生身份），不是 family_id（reviewer 席内本地标签，
+      // 两个不同 reviewer 可能各自合法地把同一标签用来指不同不变量，按标签绑定会把不相关
+      // finding 错误合并——gpt 终审实测复现的阻断项）。
+      // D5（T1 措辞清扫）: 机器只验字段是否存在、是否与共识产物逐字相等——这是检测「字段
+      // 错配/归因漂移」（复制时手误、引用错 finding、脚本 bug 等疏忽），不声称能区分不同
+      // 意图的输入来源；同 UID 的 lead 本就可以直接改这个校验脚本本身，机器层面对此无能力。
+      if (fids.length === 1) {
+        const cf = canonicalById.get(fids[0]);
+        if (cf && (cf.severity === 'blocker' || cf.severity === 'major')) {
+          need(typeof sc.invariant === 'string' && sc.invariant.length > 0,
+            `SC ${sc.id} 引用的 finding ${fids[0]} 是 ${cf.severity}（actionable），SC 必须携带 invariant（逐字复制自共识产物，D1）`);
+          need(typeof sc.family_key === 'string' && sc.family_key.length > 0,
+            `SC ${sc.id} 引用的 finding ${fids[0]} 是 ${cf.severity}（actionable），SC 必须携带 family_key（逐字复制自共识产物，D1；不是 family_id）`);
+          if (typeof sc.invariant === 'string' && sc.invariant) {
+            need(sc.invariant === cf.invariant,
+              `SC ${sc.id} 的 invariant 与其引用 finding ${fids[0]} 在共识产物中冻结的值不逐字相等（SC="${sc.invariant}" 共识="${cf.invariant}"）——字段错配/归因漂移，不得作为不相关输入提交（D1 fail-closed）`);
+          }
+          if (typeof sc.family_key === 'string' && sc.family_key) {
+            need(sc.family_key === cf.family_key,
+              `SC ${sc.id} 的 family_key 与其引用 finding ${fids[0]} 在共识产物中冻结的值不逐字相等（SC="${sc.family_key}" 共识="${cf.family_key}"）——字段错配/归因漂移，不得作为不相关输入提交（D1 fail-closed）`);
+          }
+        }
       }
     }
   }
