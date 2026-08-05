@@ -69,7 +69,7 @@ bundle = base_sha + candidate_sha + PR 标题/正文 + touches_ui + matched_path
 
 - **seat② 降级链**：骨折路由报 `BUDGET_MODEL_REQUIRES_API_MODE` → 降 `gpt-5.5 / xhigh`（标准价），派发说明必须标注降级原因，不静默。
 - **降档观察窗（2026-08-05 起，连续 5 个走三审的 PR）**：lead 在台账逐席记 **unique-major**（只有该席抓到的 major/blocker 数）。seat① 换 sonnet 后 unique 率塌方（历史基线场均 2+ → 场均 0）→ 该席单席回滚 `claude-opus-5 / xhigh`，其他席不动。回滚对照基线（08-02~05，38 份裁决）：① opus/xhigh 27 major+1 blocker；② sol/xhigh 15+1（独抓率最高）；③ opus/high 12+1。
-- **争议仲裁席（L3，按需出场，不常驻）**：仅当 ①同一 finding 两轮 open/维持拉锯、②P0/P1 定性分歧、③对抗反驳终裁 三者之一发生时，lead 加派 codex / `gpt-5.6-sol`（标准价），默认 effort=max，仲裁结论本身被推翻重来才升 ultra。**纪律**：仲裁席只产证据与分析内部报告供 origin reviewer 与 lead 参考，finding 仍由 origin reviewer close，报告不进共识判据、不改共识四 conjunct。
+- **争议仲裁席（L3，按需出场，不常驻）**：仅当 ①同一 finding 两轮 open/维持拉锯、②P0/P1 定性分歧、③对抗反驳终裁 三者之一发生时，lead 加派 codex / `codex/gpt-5.6-sol`（骨折），默认 effort=max，仲裁结论本身被推翻重来才升 ultra；骨折路由报 `BUDGET_MODEL_REQUIRES_API_MODE` → 降标准 `gpt-5.6-sol` 同 effort，标注不静默。**纪律**：仲裁席只产证据与分析内部报告供 origin reviewer 与 lead 参考，finding 仍由 origin reviewer close，报告不进共识判据、不改共识四 conjunct。
 
 三席各产两份输出：人读 markdown + **机器 JSON**（`schemas/review-verdict.schema.json` **v2**）。
 **v2 必填 `anchor_paths`**：每条 finding 除人读 `anchor` 外，必须给 `anchor_paths: string[]`——
