@@ -14,6 +14,7 @@ const S = join(HERE, '..', 'scripts');
 const W = join(HERE, '..', 'deploy', 'wrappers');
 
 import { computeReviewInputHash } from '../scripts/review-input-hash.mjs';
+import { evaluateIntent, buildMarkerBlock, extractIntentMarker, fallbackIntentFromBody } from '../scripts/intent-check.mjs';
 import { validateVerdict } from '../scripts/verdict-validate.mjs';
 import { runConsensusGate, recomputeArtifactHash, familyKeyOf } from '../scripts/consensus-gate.mjs';
 import { checkPushGuard, matchAny, directionCheck, jsonSubset, fastSignaturePayload } from '../scripts/push-guard.mjs';
@@ -4953,6 +4954,52 @@ t('[SC-B4-D4] pr-body.mjs: 半残/重复 marker → fail loud 拒绝写入，不
   let threwCkpt = false;
   try { upsertCheckpointSection(onlyCheckpointBroken, buildCheckpointSection({})); } catch (e) { threwCkpt = /残缺\/重复/.test(e.message); }
   ok(threwCkpt, 'checkpoint 段自己的 marker 半残时，upsertCheckpointSection 必须 fail loud');
+});
+
+// ========== PR-B1 意图契约（SC-4/5/18，2026-08-06） ==========
+
+t('[B1-SC4] intent marker 经 pr_body 参与 review_input_hash：改 marker 必换 hash', () => {
+  const intentA = '目标: 修 X\n非目标: 不动 Y\n验收: 测试 Z 绿';
+  const intentB = '目标: 修 X 并顺手改 Y\n非目标: (无)\n验收: 测试 Z 绿';
+  const bodyA = `正文开头\n\n${buildMarkerBlock(intentA)}\n\n正文结尾`;
+  const bodyB = `正文开头\n\n${buildMarkerBlock(intentB)}\n\n正文结尾`;
+  ok(computeReviewInputHash({ ...bundle, pr_body: bodyA }) !== computeReviewInputHash({ ...bundle, pr_body: bodyB }),
+    '仅 marker 区块不同的两个 body 必须产生不同 review_input_hash');
+  eq(extractIntentMarker(bodyA).trim(), intentA);
+});
+
+t('[B1-SC18] 文件与 marker digest 不一致 → MISMATCH exit 1', () => {
+  const intent = '目标: A\n非目标: B\n验收: C';
+  const res = evaluateIntent({ fileContent: '目标: A（本机偷偷改过）', prBody: buildMarkerBlock(intent) });
+  eq(res.status, 'MISMATCH');
+  eq(res.exit, 1);
+  // 一致（含行尾空白/CRLF 归一化差异）→ OK
+  const same = evaluateIntent({ fileContent: `${intent.replace(/\n/g, '\r\n')}  \n`, prBody: buildMarkerBlock(intent) });
+  eq(same.status, 'OK');
+  eq(same.exit, 0);
+});
+
+t('[B1-SC5] 双缺 fallback：生成 [auto-generated] marker，落 body 后才 OK 且 fallback 结果入锅', () => {
+  const bareBody = '这个 PR 修复了 X 的空指针问题。\n\n细节略。';
+  const res = evaluateIntent({ fileContent: null, prBody: bareBody });
+  eq(res.status, 'FALLBACK');
+  eq(res.exit, 2);
+  ok(res.marker_block.includes('[auto-generated]'), 'fallback 意图必须显式标注 auto-generated');
+  // 模拟 lead 把 marker 写回 body 后重跑 → REBUILT(缺文件)/OK，且新 body 的 hash 与裸 body 不同（入锅证据）
+  const bodyWithMarker = `${bareBody}\n\n${res.marker_block}`;
+  const rerun = evaluateIntent({ fileContent: null, prBody: bodyWithMarker });
+  eq(rerun.status, 'REBUILT');
+  eq(rerun.exit, 0);
+  ok(computeReviewInputHash({ ...bundle, pr_body: bodyWithMarker }) !== computeReviewInputHash({ ...bundle, pr_body: bareBody }),
+    'fallback 生成的 marker 必须改变 review_input_hash（入锅）');
+  // 半残 marker（只有 start 没有 end）按缺失处理
+  eq(extractIntentMarker(`${bareBody}\n<!-- pr-intent:start -->\n目标: 半残`), null);
+  // 文件在、marker 缺 → MARKER_MISSING exit 2，输出的区块内容与文件一致
+  const mm = evaluateIntent({ fileContent: '目标: 只有文件', prBody: bareBody });
+  eq(mm.status, 'MARKER_MISSING');
+  eq(mm.exit, 2);
+  ok(mm.marker_block.includes('目标: 只有文件'));
+  ok(fallbackIntentFromBody('').includes('目标句待 owner 补写'));
 });
 
 // ========== 汇总 + SKIPPED ==========
