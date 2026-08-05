@@ -84,11 +84,13 @@ if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
   const filePath = args['intent-file'] ?? '.pr-intent.md';
   const bodyPath = args['pr-body'];
-  if (!bodyPath) fail('用法: intent-check.mjs --pr-body <body文件> [--intent-file .pr-intent.md] [--write]');
+  if (!bodyPath) fail('用法: intent-check.mjs --pr-body <body文件> [--intent-file .pr-intent.md]');
   const prBody = readFileSync(bodyPath, 'utf8');
   const fileContent = existsSync(filePath) ? readFileSync(filePath, 'utf8') : null;
   const res = evaluateIntent({ fileContent, prBody });
-  if (res.status === 'REBUILT' && 'write' in args) {
+  if (res.status === 'REBUILT') {
+    // REBUILT 的语义就是「工作副本已重建」——无条件落盘，不设开关（审①B1-F1：
+    // 可选 --write 留下过「exit 0 但文件没重建」的文档性成功路径）。
     writeFileSync(filePath, `${res.intent}\n`);
   }
   process.stdout.write(`${JSON.stringify(res, null, 2)}\n`);

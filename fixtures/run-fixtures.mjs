@@ -5002,6 +5002,22 @@ t('[B1-SC5] 双缺 fallback：生成 [auto-generated] marker，落 body 后才 O
   ok(fallbackIntentFromBody('').includes('目标句待 owner 补写'));
 });
 
+t('[B1-F1] CLI 级 REBUILT 无条件落盘：exit 0 时 .pr-intent.md 必然存在', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'b1f1-'));
+  const bodyPath = join(dir, 'body.md');
+  const intentPath = join(dir, '.pr-intent.md');
+  const intent = '目标: CLI 重建\n非目标: 无\n验收: 文件落盘';
+  writeFileSync(bodyPath, `正文\n\n${buildMarkerBlock(intent)}\n`);
+  const out = execFileSync(process.execPath, [join(S, 'intent-check.mjs'), '--pr-body', bodyPath, '--intent-file', intentPath], { encoding: 'utf8' });
+  eq(JSON.parse(out).status, 'REBUILT');
+  ok(existsSync(intentPath), 'REBUILT exit 0 后工作副本必须已落盘（审①B1-F1：不设 --write 开关）');
+  eq(readFileSync(intentPath, 'utf8').trim(), intent);
+  // 重跑同参数 → 两副本一致 OK
+  const out2 = execFileSync(process.execPath, [join(S, 'intent-check.mjs'), '--pr-body', bodyPath, '--intent-file', intentPath], { encoding: 'utf8' });
+  eq(JSON.parse(out2).status, 'OK');
+  rmSync(dir, { recursive: true, force: true });
+});
+
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
 console.log(`\n========== fixtures: ${pass} passed, ${failCount} failed ==========`);

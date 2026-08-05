@@ -40,11 +40,11 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    `touches_ui=true` → demo 证据预检必须过；`--skip-demo-gate` 需 owner 显式理由 + ledger 留痕，用后不得声称"证据完整"。
 4. **意图契约校验**（PR-B1，2026-08-06）:
    ```
-   node scripts/intent-check.mjs --pr-body <body文件> [--intent-file .pr-intent.md] [--write]
+   node scripts/intent-check.mjs --pr-body <body文件> [--intent-file .pr-intent.md]
    ```
    双载体：worktree 根 `.pr-intent.md`（工作副本）+ PR body 的 `<!-- pr-intent:start/end -->` marker
    区块（**权威副本**——经 `bundle.pr_body` 自动参与 `review_input_hash`，改意图必然换 hash 重审）。
-   - exit 0（OK/REBUILT）→ 继续；REBUILT = 本机缺文件已从 marker 重建（换机场景）。
+   - exit 0（OK/REBUILT）→ 继续；REBUILT = 本机缺文件，CLI 已**无条件**从 marker 重建落盘（换机场景，无开关）。
    - exit 1（MISMATCH）→ **Phase 1 FAIL**：两副本 digest 不一致，先对齐（改哪边由 owner 意图为准）再重跑。
    - exit 2（MARKER_MISSING/FALLBACK）→ 权威副本未就位：把 stdout 的 marker 区块写进 PR body
      （已有 draft PR 用 `gh pr edit --body-file`；未建 PR 写进 body 草稿文件），然后重跑至 exit 0。
