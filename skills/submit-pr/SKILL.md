@@ -13,6 +13,7 @@ description: 提交 PR v2 — push 前三审收口（对抗双审 + 上游预演
 
 ```
 Phase 1  预检 + typecheck-merged + 版本 bump（确定性脚本，继承 v1）
+Phase 1.5 预扫自清洗（haiku diff-scanner 只报可疑点 → lead 核实修机械类 → 有改动则重跑 Phase 1）
 Phase 2  三审（push 之前，SHA 绑定 + 盲审；R1 走加固清单穷举）
 Phase 2b 共识 → SC 提炼（自动，无需 owner 授权）
 Phase 2c glm-5.2/max worker 修复（按类套形状，goal --until-sc）→ delta 复核 → 收敛即收口
@@ -43,7 +44,8 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
 目的：把机械类问题拦在三审之前，砍掉整轮「三席全量重读」（2026-08-05 实证：多轮 REQUIRES_CHANGES 相当比例是陈旧注释/漏改引用/测试 import 类，haiku 档即可捕获）。
 
 1. **派扫描员**：`git diff --name-only origin/main...HEAD` 取改动文件，按文件并行派 `diff-scanner` 原生子代理（`~/.claude/agents/diff-scanner.md`，model 钉死 haiku，职责「只报可疑点不做判断」）。每个扫描员输入 = 该文件的完整 diff hunk；输出 = 可疑点 JSON 数组（`{file, line, category, note}`），**禁止 verdict/严重度字段**。
-2. **lead 核实并自清洗**：只处理机械类类别（陈旧注释、漏改引用、术语残留、测试 import 缺失、文档声明与实现不符、明显笔误）——lead 逐条核实为真后当场修掉，落**独立 commit**（message 前缀 `chore(prescan):`），然后才进入 Phase 2 定格 candidate SHA。非机械类可疑点只留 lead 台账，**不投喂任何审查席**（v1 边界：预扫清单不进 bundle、不进 review_input_hash、不改派工包结构——座位输入与无预扫时同构）。
+2. **lead 核实并自清洗**：只处理机械类类别（陈旧注释、漏改引用、术语残留、测试 import 缺失、文档声明与实现不符、明显笔误）——lead 逐条核实为真后当场修掉，落**独立 commit**（message 前缀 `chore(prescan):`）。非机械类可疑点只留 lead 台账，**不投喂任何审查席**（v1 边界：预扫清单不进 bundle、不进 review_input_hash、不改派工包结构——座位输入与无预扫时同构）。
+2b. **自清洗改了树 → Phase 1 确定性预检必须对新树重跑**：只要 Phase 1.5 产生了任何 commit，进入 Phase 2 之前必须重跑 Phase 1 的 typecheck-merged 与 UI 判定脚本（touches_ui/matched_paths/config_hash 取重跑结果进 bundle）——candidate SHA 携带的预检证据必须绑定最终树，禁止拿自清洗前旧 SHA 的预检结果进三审。预扫零改动（无 commit）则无需重跑。重跑失败按 Phase 1 失败语义处理（修复后从 Phase 1 重新走），不得带病进 Phase 2。
 3. **fail-open**：扫描员超时/报错/输出不合形 → 记台账 `prescan: skipped(<原因>)`，直接进 Phase 2 三审。预扫是增强不是门，任何情况下不阻塞、不构成放行条件。
 4. **覆盖义务不缩水**：预扫存在与否不改变三席的 coverage 契约（首轮穷举 + 加固清单十类照旧），扫描员漏报不构成任何席位少看的理由。
 
