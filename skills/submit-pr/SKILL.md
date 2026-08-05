@@ -50,6 +50,19 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
      （已有 draft PR 用 `gh pr edit --body-file`；未建 PR 写进 body 草稿文件），然后重跑至 exit 0。
      FALLBACK 生成的意图带 `[auto-generated]` 标注（存量 worktree 兼容）——**同样必须先落 body
      再算 bundle**，fallback 结果一样入锅，不存在「无意图也能进三审」的路径。
+5. **规模入口闸**（PR-B2，2026-08-06）:
+   ```
+   node scripts/size-gate.mjs --repo-dir . --base origin/main [--exemption <豁免json>]
+   ```
+   统计对 merge-base 的非测试 diff 行数（add+delete；内置排除 ∪ 目标仓 pr-rules.json
+   `sizeGate.excludePaths`；配置缺失默认 800/0.75，**存在但 malformed 则 fail-closed**）。
+   - `PASS`（<75% 预算）→ 继续。
+   - `WARN`（≥75%）→ 继续，但 lead 必须当场给出拆分规划或写明「为何不拆」进台账——这是 75% 即规划拆分纪律的机器化。
+   - `STOP`（≥100%，exit 1）→ **不得进入 Phase 2**：先拆分（拆分列车 playbook），或取得 owner
+     **当次**显式豁免——豁免为结构化记录 `{repo, branch, base_sha, head_sha, lineCount, at, reason}`
+     落盘并记入 PR body，**绑定 head_sha，改一行即失效**；push-guard 终闸同口径复验（膨胀绕不过）。
+   实测依据：规模与 review 轮数是断崖关系（54 行一轮合并 / 292 行 4 轮 / 450 行振荡 8 轮报废；
+   本仓 #297 P1a 5662 行事后拆 13 节）。
 
 ## Phase 1.5 — 预扫自清洗（haiku，定格 candidate 之前）
 
@@ -512,8 +525,11 @@ node scripts/push-guard.mjs --repo-dir . --manifest push-manifest.json \
   --artifact consensus-final.json --bundle review-bundle.json \
   --source-artifact consensus.json --sc-manifest sc-manifest.json \
   --fix-plan fix-plan.json --dispatch-record dispatch-record.json \
-  --run-manifest <st>/run-<run>.json --execute
+  --run-manifest <st>/run-<run>.json [--size-exemption <豁免json>] --execute
 ```
+**size 终闸**（PR-B2）：守卫对终版（expected_sha vs artifact.base_sha）重算规模——入口闸
+PASS 过的 PR 在修复轮膨胀到 STOP 一样拒 push；豁免与 Phase 1 第 5 步同口径同文件（绑定
+head_sha，修复轮产生新 SHA 后旧豁免自动失效）。size 结果 + 配置 hash 打进 PASS 回执行。
 **编排链绑定（SC-2：不是"声明了才验"，而是"有 finding/有 parent 就必须带"）**：
 push manifest 的 `fix_orchestration` 五件套 = `{source_artifact_hash, sc_manifest_hash,
 fix_plan_hash, dispatch_record_hash, run_manifest_hash}`。守卫**自己重跑** coverage gate +

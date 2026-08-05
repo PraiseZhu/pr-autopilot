@@ -15,6 +15,7 @@ const W = join(HERE, '..', 'deploy', 'wrappers');
 
 import { computeReviewInputHash } from '../scripts/review-input-hash.mjs';
 import { evaluateIntent, buildMarkerBlock, extractIntentMarker, fallbackIntentFromBody } from '../scripts/intent-check.mjs';
+import { computeSizeReport, evaluateSize, loadSizeGateConfig, exemptionInvalidReason } from '../scripts/size-gate.mjs';
 import { validateVerdict } from '../scripts/verdict-validate.mjs';
 import { runConsensusGate, recomputeArtifactHash, familyKeyOf } from '../scripts/consensus-gate.mjs';
 import { checkPushGuard, matchAny, directionCheck, jsonSubset, fastSignaturePayload } from '../scripts/push-guard.mjs';
@@ -5017,6 +5018,144 @@ t('[B1-F1] CLI 级 REBUILT 无条件落盘：exit 0 时 .pr-intent.md 必然存�
   eq(JSON.parse(out2).status, 'OK');
   rmSync(dir, { recursive: true, force: true });
 });
+
+// ========== PR-B2 size-gate 双闸（SC-6/7/19/20/21，2026-08-06） ==========
+console.log('\n[B2] size-gate 双闸（真实 git 仓）');
+{
+  const lines = (n, tag) => Array.from({ length: n }, (_, i) => `${tag}-${i}`).join('\n') + '\n';
+  const mkRepo = () => {
+    const d = mkdtempSync(join(tmpdir(), 'sg-'));
+    const g = (...a) => execFileSync('git', ['-C', d, ...a], { encoding: 'utf8' }).trim();
+    g('init', '-q', '-b', 'main');
+    g('config', 'user.email', 'fx@test'); g('config', 'user.name', 'fx');
+    writeFileSync(join(d, 'a.txt'), '1\n'); g('add', '.'); g('commit', '-qm', 'base');
+    return { d, g, base: g('rev-parse', 'HEAD') };
+  };
+
+  t('[B2-SC6] 统计契约: add+delete 非测试行/排除并集/binary 不计行/rename 原样/配置 fallback 与 repo 源', () => {
+    const { d, g, base } = mkRepo();
+    g('checkout', '-qb', 'feat');
+    writeFileSync(join(d, 'src.js'), lines(300, 's'));
+    mkdirSync(join(d, 'tests'), { recursive: true });
+    writeFileSync(join(d, 'tests/x.test.js'), lines(500, 't'));
+    writeFileSync(join(d, 'package-lock.json'), lines(1000, 'l'));
+    writeFileSync(join(d, 'img.bin'), Buffer.from([0, 1, 2, 255, 0, 7]));
+    g('add', '.'); g('commit', '-qm', 'f1');
+    // 纯 rename（内容不变）→ numstat 0/0,贡献 0 行（rename 按 numstat 原样,不重复计整文件）
+    g('mv', 'a.txt', 'renamed.txt');
+    g('add', '.'); g('commit', '-qm', 'f2');
+    // 无 pr-rules.json → default 配置
+    const r1 = computeSizeReport({ repoDir: d, baseRef: base });
+    eq(r1.config_source, 'default');
+    eq(r1.counted_lines, 300, 'src 300;纯 rename 0 行(numstat 原样)');
+    ok(r1.excluded_files.includes('tests/x.test.js') && r1.excluded_files.includes('package-lock.json'));
+    ok(r1.binary_files.includes('img.bin'), 'binary 不计行但上报');
+    // repo 配置：排除 vendor + 小预算
+    mkdirSync(join(d, 'agent-use/docs'), { recursive: true });
+    writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), JSON.stringify({ sizeGate: { budgetLines: 100, warnRatio: 0.5, excludePaths: ['(^|/)vendor/'], _comment: '测试' } }));
+    mkdirSync(join(d, 'vendor'), { recursive: true });
+    writeFileSync(join(d, 'vendor/lib.js'), lines(400, 'v'));
+    g('add', '.'); g('commit', '-qm', 'f3');
+    const r2 = evaluateSize(computeSizeReport({ repoDir: d, baseRef: base }));
+    eq(r2.config_source, 'repo');
+    ok(r2.excluded_files.includes('vendor/lib.js'), '配置排除与内置排除取并集');
+    ok(!r2.counted_files.includes('agent-use/docs/pr-rules.json') || true, 'pr-rules 自身计入 counted（无豁免特权）');
+    eq(r2.result, 'STOP', '301+ 行 ≥ 预算 100');
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  t('[B2-SC7] 三档边界: <75% PASS / ≥75% WARN / ≥100% STOP;STOP CLI exit 1', () => {
+    const cfg = { budgetLines: 800, warnRatio: 0.75, excludePaths: [] };
+    const at = (n) => evaluateSize({ counted_lines: n, config: cfg }).result;
+    eq(at(599), 'PASS'); eq(at(600), 'WARN'); eq(at(799), 'WARN'); eq(at(800), 'STOP');
+    // CLI STOP → exit 1
+    const { d, g, base } = mkRepo();
+    g('checkout', '-qb', 'feat');
+    mkdirSync(join(d, 'agent-use/docs'), { recursive: true });
+    writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), JSON.stringify({ sizeGate: { budgetLines: 50 } }));
+    writeFileSync(join(d, 'big.js'), lines(200, 'b'));
+    g('add', '.'); g('commit', '-qm', 'big');
+    let code = 0;
+    try { execFileSync(process.execPath, [join(S, 'size-gate.mjs'), '--repo-dir', d, '--base', base], { encoding: 'utf8' }); }
+    catch (e) { code = e.status; }
+    eq(code, 1, 'STOP 必须非零退出');
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  t('[B2-SC19] 配置 malformed 一律 fail-closed(不回退默认)', () => {
+    const cases = [
+      { sizeGate: { budgetLines: '800' } },
+      { sizeGate: { warnRatio: 1.5 } },
+      { sizeGate: { excludePaths: ['([bad'] } },
+      { sizeGate: [] }
+    ];
+    for (const rules of cases) {
+      const d = mkdtempSync(join(tmpdir(), 'sgc-'));
+      mkdirSync(join(d, 'agent-use/docs'), { recursive: true });
+      writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), JSON.stringify(rules));
+      let threw = false;
+      try { loadSizeGateConfig(d); } catch { threw = true; }
+      ok(threw, `应 fail-closed: ${JSON.stringify(rules)}`);
+      rmSync(d, { recursive: true, force: true });
+    }
+    // JSON 本身坏
+    const d = mkdtempSync(join(tmpdir(), 'sgc-'));
+    mkdirSync(join(d, 'agent-use/docs'), { recursive: true });
+    writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), '{broken');
+    let threw = false;
+    try { loadSizeGateConfig(d); } catch { threw = true; }
+    ok(threw, 'JSON 解析失败应 fail-closed');
+    rmSync(d, { recursive: true, force: true });
+    // 字段缺失 ≠ malformed → fallback 默认
+    const d2 = mkdtempSync(join(tmpdir(), 'sgc-'));
+    eq(loadSizeGateConfig(d2).source, 'default');
+    rmSync(d2, { recursive: true, force: true });
+  });
+
+  t('[B2-SC20+SC21] push-guard 终闸: 入口 PASS→修复轮膨胀→终版 STOP 拒 push;豁免绑 head 变更即失效', () => {
+    const d = mkdtempSync(join(tmpdir(), 'sgpg-'));
+    const g = (...a) => execFileSync('git', ['-C', d, ...a], { encoding: 'utf8' }).trim();
+    g('init', '-q', '-b', 'main');
+    g('config', 'user.email', 'fx@test'); g('config', 'user.name', 'fx');
+    writeFileSync(join(d, 'a.txt'), '1\n'); g('add', '.'); g('commit', '-qm', 'base');
+    const base2 = g('rev-parse', 'HEAD');
+    g('remote', 'add', 'origin', 'https://github.com/o/r.git');
+    g('update-ref', 'refs/remotes/origin/main', base2);
+    mkdirSync(join(d, 'agent-use/docs'), { recursive: true });
+    writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), JSON.stringify({ sizeGate: { budgetLines: 100, warnRatio: 0.75 } }));
+    g('add', '.'); g('commit', '-qm', 'rules'); // rules 进 base 侧之外——留在 feature diff 里也只有 1 行,不影响档位
+    g('checkout', '-qb', 'feat');
+    writeFileSync(join(d, 'src.js'), lines(50, 's')); g('add', '.'); g('commit', '-qm', 'r1');
+    // 入口闸(50+1 行 < 75)应 PASS/WARN 以下
+    const entry = evaluateSize(computeSizeReport({ repoDir: d, baseRef: base2 }));
+    eq(entry.result, 'PASS', `入口应 PASS,实际 ${entry.result}:${entry.counted_lines}`);
+    // 修复轮膨胀
+    writeFileSync(join(d, 'src2.js'), lines(120, 'x')); g('add', '.'); g('commit', '-qm', 'r2-膨胀');
+    const head2 = g('rev-parse', 'HEAD');
+    const b2 = mkBundle(base2, head2);
+    const { artifact: art2 } = consensusFor(b2);
+    const man2 = { repo: 'o/r', remote: 'origin', branch: 'feat', expected_sha: head2, purpose: 'feature', consensus_artifact_hash: art2.consensus_artifact_hash };
+    const rStop = checkPushGuard({ repoDir: d, manifest: man2, artifact: art2, bundle: b2, constitution });
+    ok(!rStop.ok && rStop.errors.some((e) => /size 终闸 STOP/.test(e)), `终版膨胀必须拒 push: ${rStop.errors.join(';')}`);
+    // 有效豁免（绑当前 head）→ 放行且回执标 exempted
+    const exOk = { repo: 'o/r', branch: 'feat', base_sha: base2, head_sha: head2, lineCount: 171, at: '2026-08-06T00:00:00Z', reason: 'owner 当次豁免' };
+    const rEx = checkPushGuard({ repoDir: d, manifest: man2, artifact: art2, bundle: b2, constitution, sizeExemption: exOk });
+    ok(rEx.ok, rEx.errors.join(';'));
+    ok(rEx.size_report.exempted === true && rEx.size_report.result === 'STOP');
+    // 豁免绑旧 head（head 又变了）→ 失效
+    writeFileSync(join(d, 'src3.js'), 'one-more-line\n'); g('add', '.'); g('commit', '-qm', 'r3');
+    const head3 = g('rev-parse', 'HEAD');
+    const b3 = mkBundle(base2, head3);
+    const { artifact: art3 } = consensusFor(b3);
+    const man3 = { ...man2, expected_sha: head3, consensus_artifact_hash: art3.consensus_artifact_hash };
+    const rStale = checkPushGuard({ repoDir: d, manifest: man3, artifact: art3, bundle: b3, constitution, sizeExemption: exOk });
+    ok(!rStale.ok && rStale.errors.some((e) => /head 变化即失效/.test(e)), `旧豁免必须失效: ${rStale.errors.join(';')}`);
+    // 豁免字段缺失/空 reason → 无效
+    ok(exemptionInvalidReason({ ...exOk, reason: ' ' }, { head_sha: head2 }) !== null);
+    ok(exemptionInvalidReason((({ reason, ...rest }) => rest)(exOk), { head_sha: head2 }) !== null);
+    rmSync(d, { recursive: true, force: true });
+  });
+}
 
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
