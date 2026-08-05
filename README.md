@@ -27,9 +27,9 @@ pr-autopilot 把这四件事全部接走。你只保留两个动作：**说一�
  │
  ├─ Phase 1  确定性预检（typecheck-merged / lint / 版本 bump / UI 判定脚本说了算）
  ├─ Phase 2  三审收口 —— push 之前，三个互相不通气的 AI 审查员同时上：
- │            ① opus-5/xhigh   盲审: 正确性/回归/影响面
- │            ② gpt-5.6-sol/xhigh 盲审: 安全/边界/规范
- │            ③ opus-5/high    只读预演上游 review-pr 的口径（提前踩雷）
+ │            ① sonnet-5/xhigh 盲审: 正确性/回归/影响面
+ │            ② 骨折 terra/xhigh 盲审: 安全/边界/规范（核心路径 PR 升 ultra）
+ │            ③ sonnet-5/xhigh 只读预演上游 review-pr 的口径（提前踩雷）
  │            共识不由任何 AI 宣布——由脚本判四个硬条件（consensus-gate）
  ├─ Phase 2b/2c  共识确认的问题 → 提炼成可验证 SC → glm-5.2/max 修到每条有证据
  ├─ Phase 3  push-guard 守卫放行才 push（SHA 钉死/禁 force/禁碰 CI/hash 链三方绑定）
@@ -99,7 +99,8 @@ bash fixtures/run-all.sh   # 126 passed 才算数；SKIPPED 清单如实列出�
 
 ## 模型点名（owner 第 0 优先，压过 routing 表）
 
-三审: opus-5/xhigh + gpt-5.6-sol/xhigh + opus-5/high（上游预演）；修复+push: glm-5.2/max（goal --until-sc）；
+三审（唯一权威 = `skills/submit-pr/SKILL.md` Phase 2 席位表，本行仅摘要）: sonnet-5/xhigh + 骨折 `codex/gpt-5.6-terra`/xhigh（核心路径升 ultra，降级链 gpt-5.5）+ sonnet-5/xhigh（上游预演）；
+争议仲裁（按需）: 骨折 `codex/gpt-5.6-sol`/max（极端 ultra）；修复+push: glm-5.2/max（goal --until-sc）；
 mini 盯梢修复: glm-5.2/max（send_to_session 克隆班车四元组）；卡片: deepseek-v4-pro/max（唯一允许降级 xhigh，留审计）；
 周会: glm-5.2/max。
 
