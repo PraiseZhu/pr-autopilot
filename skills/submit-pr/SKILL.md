@@ -38,6 +38,18 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    ```
    产出 `{touches_ui, matched_paths, config_hash}` 写入 review bundle。**B 面 n_a 权在脚本不在 reviewer**。
    `touches_ui=true` → demo 证据预检必须过；`--skip-demo-gate` 需 owner 显式理由 + ledger 留痕，用后不得声称"证据完整"。
+4. **意图契约校验**（PR-B1，2026-08-06）:
+   ```
+   node scripts/intent-check.mjs --pr-body <body文件> [--intent-file .pr-intent.md]
+   ```
+   双载体：worktree 根 `.pr-intent.md`（工作副本）+ PR body 的 `<!-- pr-intent:start/end -->` marker
+   区块（**权威副本**——经 `bundle.pr_body` 自动参与 `review_input_hash`，改意图必然换 hash 重审）。
+   - exit 0（OK/REBUILT）→ 继续；REBUILT = 本机缺文件，CLI 已**无条件**从 marker 重建落盘（换机场景，无开关）。
+   - exit 1（MISMATCH）→ **Phase 1 FAIL**：两副本 digest 不一致，先对齐（改哪边由 owner 意图为准）再重跑。
+   - exit 2（MARKER_MISSING/FALLBACK）→ 权威副本未就位：把 stdout 的 marker 区块写进 PR body
+     （已有 draft PR 用 `gh pr edit --body-file`；未建 PR 写进 body 草稿文件），然后重跑至 exit 0。
+     FALLBACK 生成的意图带 `[auto-generated]` 标注（存量 worktree 兼容）——**同样必须先落 body
+     再算 bundle**，fallback 结果一样入锅，不存在「无意图也能进三审」的路径。
 
 ## Phase 1.5 — 预扫自清洗（haiku，定格 candidate 之前）
 
@@ -60,6 +72,10 @@ node scripts/review-input-hash.mjs --input bundle.json   # ⑩ 第一段
 bundle = base_sha + candidate_sha + PR 标题/正文 + touches_ui + matched_paths + ui_registry_config_hash + pr_context_digest（第三席读过的 draft PR 上下文快照；无 draft PR 时为空串的 sha256）。
 
 **一次 create_workers 开三席**（模型为 owner 点名，第 0 优先；派发说明带 `(model/effort)`，SP-5）。
+**三席派工包首段必须原文携带 intent marker 区块**（Phase 1 第 4 步产物；PR-B1）：审查席对每条
+候选 finding 先答「它解决的是不是意图目标句里的问题」，范围判断锚定意图——这也是 Phase 2c
+意见三分法（修/答/推）的判据源。marker 内容已经由 `bundle.pr_body` 绑进 `review_input_hash`，
+派工包里的置顶只是可读性冗余，两者不一致以 bundle 为准。
 
 > ⛔ **派工前强制现读本表（2026-08-05 两次事故后加）**：`create_workers` 调用**之前**必须用工具重新读取
 > 本文件的席位表三行，把读到的字面值填进参数，并在派发说明里逐席复读 `(model/effort)`。
