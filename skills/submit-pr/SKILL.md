@@ -59,7 +59,13 @@ node scripts/review-input-hash.mjs --input bundle.json   # ⑩ 第一段
 ```
 bundle = base_sha + candidate_sha + PR 标题/正文 + touches_ui + matched_paths + ui_registry_config_hash + pr_context_digest（第三席读过的 draft PR 上下文快照；无 draft PR 时为空串的 sha256）。
 
-**一次 create_workers 开三席**（模型为 owner 点名，第 0 优先；派发说明带 `(model/effort)`，SP-5）：
+**一次 create_workers 开三席**（模型为 owner 点名，第 0 优先；派发说明带 `(model/effort)`，SP-5）。
+
+> ⛔ **派工前强制现读本表（2026-08-05 两次事故后加）**：`create_workers` 调用**之前**必须用工具重新读取
+> 本文件的席位表三行，把读到的字面值填进参数，并在派发说明里逐席复读 `(model/effort)`。
+> **禁止凭记忆或历史习惯填模型**——`claude-opus-5` 已于 2026-08-05 从三席全部移除（现仅作 seat①
+> 质量塌方时的回滚候选，见观察窗条款），但两个会话仍按旧记忆派了 opus-5。若你读到的表与本段
+> 描述不一致，以**表为准**并停下向 owner 报告版本异常。
 
 | 席 | 模型/档位 | lens | 边界 |
 |---|---|---|---|
