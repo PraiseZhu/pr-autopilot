@@ -343,6 +343,18 @@ marker 段 `<!-- pr-autopilot:invariants:start/end -->` 内是脚本生成的 MU
 > 编排链**（文档化接受即解决，R9 已实证此路径；R10 把它接成机器可执行的 `kind=archive` SC，
 > 不再是「文档说了但脚本走不通」的纸面约定）。
 
+**意见三分法（finding 处置前置定性，2026-08-06 引入；蒸馏自 cindy-git-workflow-skill，经 GPT 审核席共识）**：
+
+每轮收到审查席 findings 后、提炼 SC 之前，lead 对每条 finding 先答一个问题：「它解决的是不是本 PR 意图目标句里的问题？」（意图目标句 = PR body 中的目标描述；intent marker 机制落地后指向 `<!-- pr-intent -->` 区块。）据此三分：
+
+- **修**：同时满足「服务于意图目标句」+「必须留在本 PR」→ 进 `[MUST-FIX]` 链（提炼 `kind=fix` SC，走 fix-run 编排，下述机器契约不变）。
+- **答**：误读 / 过时 / 与实现不符 → **不改代码**。lead 以证据（代码/测试/规范原文引用）回复请 origin 席复核，成立则该席把 finding `status=closed`。答类处置必须留下可回链的证据锚点（回复文本进 PR 评论或本轮对账记录），禁止无证据口头驳回。
+- **推**：真问题，但属于加固、邻域补全、通用能力——不服务于目标句，或不必留在本 PR → **默认外推**：开独立 issue，PR body 记录 issue 链接，origin 席据此 `closed`（out-of-scope-tracked）。**即使是真问题也默认外推**——「每条意见单看都合理」正是 PR 在返修轮膨胀的路径；范围判断锚定意图，不锚定意见本身的对错（临场逐条判必输）。
+
+与 `[ARCHIVE-eligible]` 的关系（并列不冲突、判据不同）：ARCHIVE 是「**本修复周期新写代码**的窄面残余」的文档化接受（登记进 README，`kind=archive` SC 走同一编排链，四条判据见下）；推是「**范围外真问题**」的外推跟踪（登记进 issue）。一条 finding 若两者都够格，优先 ARCHIVE（本 PR 内闭环、成本更低）。
+
+处置报告要求（人读验收，不改 verdict schema）：每轮 delta 对账记录中，每条 finding 必须标注 修/答/推/ARCHIVE 之一并附对应产物锚点——修：SC id；答：证据回复位置；推：issue 链接；ARCHIVE：README 登记文案。缺任一即视为该轮对账不完整，不得进入收口。
+
 每轮 delta 复核，审查席对每条存活 finding 标 `[MUST-FIX]` 或 `[ARCHIVE-eligible]`：
 
 1. **`[ARCHIVE-eligible]` 判据**（四条全中）：① 窄面（不改主要控制/数据流，只是并发窗口/异常路径的窄角）；
