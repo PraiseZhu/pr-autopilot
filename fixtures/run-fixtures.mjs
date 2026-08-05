@@ -5050,29 +5050,45 @@ console.log('\n[B2] size-gate 双闸（真实 git 仓）');
     eq(r1.counted_lines, 300, 'src 300;纯 rename 0 行(numstat 原样)');
     ok(r1.excluded_files.includes('tests/x.test.js') && r1.excluded_files.includes('package-lock.json'));
     ok(r1.binary_files.includes('img.bin'), 'binary 不计行但上报');
-    // repo 配置：排除 vendor + 小预算
-    mkdirSync(join(d, 'agent-use/docs'), { recursive: true });
-    writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), JSON.stringify({ sizeGate: { budgetLines: 100, warnRatio: 0.5, excludePaths: ['(^|/)vendor/'], _comment: '测试' } }));
-    mkdirSync(join(d, 'vendor'), { recursive: true });
-    writeFileSync(join(d, 'vendor/lib.js'), lines(400, 'v'));
-    g('add', '.'); g('commit', '-qm', 'f3');
-    const r2 = evaluateSize(computeSizeReport({ repoDir: d, baseRef: base }));
-    eq(r2.config_source, 'repo');
-    ok(r2.excluded_files.includes('vendor/lib.js'), '配置排除与内置排除取并集');
-    ok(!r2.counted_files.includes('agent-use/docs/pr-rules.json') || true, 'pr-rules 自身计入 counted（无豁免特权）');
-    eq(r2.result, 'STOP', '301+ 行 ≥ 预算 100');
     rmSync(d, { recursive: true, force: true });
+    // 第二仓：配置在 base(main) 树上 → source='base'，排除并集生效
+    const R2 = mkRepo();
+    mkdirSync(join(R2.d, 'agent-use/docs'), { recursive: true });
+    writeFileSync(join(R2.d, 'agent-use/docs/pr-rules.json'), JSON.stringify({ sizeGate: { budgetLines: 100, warnRatio: 0.5, excludePaths: ['(^|/)vendor/'], _comment: '测试' } }));
+    R2.g('add', '.'); R2.g('commit', '-qm', 'rules');
+    const base2 = R2.g('rev-parse', 'HEAD');
+    R2.g('checkout', '-qb', 'feat');
+    writeFileSync(join(R2.d, 'src.js'), lines(300, 's'));
+    mkdirSync(join(R2.d, 'vendor'), { recursive: true });
+    writeFileSync(join(R2.d, 'vendor/lib.js'), lines(400, 'v'));
+    R2.g('add', '.'); R2.g('commit', '-qm', 'f1');
+    const r2 = evaluateSize(computeSizeReport({ repoDir: R2.d, baseRef: base2 }));
+    eq(r2.config_source, 'base');
+    ok(r2.excluded_files.includes('vendor/lib.js'), '配置排除与内置排除取并集');
+    eq(r2.result, 'STOP', '300 行 ≥ 预算 100');
+    // 审 B2-F1 复现已死：被测 PR 自带宽配置（天价预算+排除自己）→ 配置仍取 base 树，照样 STOP
+    writeFileSync(join(R2.d, 'agent-use/docs/pr-rules.json'), JSON.stringify({ sizeGate: { budgetLines: 999999, excludePaths: ['^src\\.js$', '^huge\\.js$'] } }));
+    writeFileSync(join(R2.d, 'huge.js'), lines(5000, 'h'));
+    R2.g('add', '.'); R2.g('commit', '-qm', '自改闸门尝试');
+    const r3 = evaluateSize(computeSizeReport({ repoDir: R2.d, baseRef: base2 }));
+    eq(r3.config_source, 'base', '候选树的配置修改不得生效');
+    eq(r3.config.budgetLines, 100);
+    ok(r3.counted_files.includes('huge.js') && r3.counted_files.includes('src.js'), '候选自写的排除不得生效');
+    eq(r3.result, 'STOP');
+    rmSync(R2.d, { recursive: true, force: true });
   });
 
   t('[B2-SC7] 三档边界: <75% PASS / ≥75% WARN / ≥100% STOP;STOP CLI exit 1', () => {
     const cfg = { budgetLines: 800, warnRatio: 0.75, excludePaths: [] };
     const at = (n) => evaluateSize({ counted_lines: n, config: cfg }).result;
     eq(at(599), 'PASS'); eq(at(600), 'WARN'); eq(at(799), 'WARN'); eq(at(800), 'STOP');
-    // CLI STOP → exit 1
-    const { d, g, base } = mkRepo();
-    g('checkout', '-qb', 'feat');
+    // CLI STOP → exit 1（配置提交在 base 树上）
+    const { d, g } = mkRepo();
     mkdirSync(join(d, 'agent-use/docs'), { recursive: true });
     writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), JSON.stringify({ sizeGate: { budgetLines: 50 } }));
+    g('add', '.'); g('commit', '-qm', 'rules');
+    const base = g('rev-parse', 'HEAD');
+    g('checkout', '-qb', 'feat');
     writeFileSync(join(d, 'big.js'), lines(200, 'b'));
     g('add', '.'); g('commit', '-qm', 'big');
     let code = 0;
@@ -5082,33 +5098,35 @@ console.log('\n[B2] size-gate 双闸（真实 git 仓）');
     rmSync(d, { recursive: true, force: true });
   });
 
-  t('[B2-SC19] 配置 malformed 一律 fail-closed(不回退默认)', () => {
-    const cases = [
-      { sizeGate: { budgetLines: '800' } },
-      { sizeGate: { warnRatio: 1.5 } },
-      { sizeGate: { excludePaths: ['([bad'] } },
-      { sizeGate: [] }
-    ];
-    for (const rules of cases) {
-      const d = mkdtempSync(join(tmpdir(), 'sgc-'));
+  t('[B2-SC19] base 树配置 malformed 一律 fail-closed(不回退默认);缺失才 fallback', () => {
+    const commitRules = (content) => {
+      const { d, g } = mkRepo();
       mkdirSync(join(d, 'agent-use/docs'), { recursive: true });
-      writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), JSON.stringify(rules));
+      writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), content);
+      g('add', '.'); g('commit', '-qm', 'rules');
+      return { d, ref: g('rev-parse', 'HEAD') };
+    };
+    const cases = [
+      JSON.stringify({ sizeGate: { budgetLines: '800' } }),
+      JSON.stringify({ sizeGate: { warnRatio: 1.5 } }),
+      JSON.stringify({ sizeGate: { excludePaths: ['([bad'] } }),
+      JSON.stringify({ sizeGate: [] }),
+      '{broken'
+    ];
+    for (const content of cases) {
+      const { d, ref } = commitRules(content);
       let threw = false;
-      try { loadSizeGateConfig(d); } catch { threw = true; }
-      ok(threw, `应 fail-closed: ${JSON.stringify(rules)}`);
+      try { loadSizeGateConfig(d, ref); } catch { threw = true; }
+      ok(threw, `应 fail-closed: ${content.slice(0, 60)}`);
       rmSync(d, { recursive: true, force: true });
     }
-    // JSON 本身坏
-    const d = mkdtempSync(join(tmpdir(), 'sgc-'));
-    mkdirSync(join(d, 'agent-use/docs'), { recursive: true });
-    writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), '{broken');
-    let threw = false;
-    try { loadSizeGateConfig(d); } catch { threw = true; }
-    ok(threw, 'JSON 解析失败应 fail-closed');
-    rmSync(d, { recursive: true, force: true });
-    // 字段缺失 ≠ malformed → fallback 默认
-    const d2 = mkdtempSync(join(tmpdir(), 'sgc-'));
-    eq(loadSizeGateConfig(d2).source, 'default');
+    // base 树无该文件 / 无 sizeGate 字段 → fallback 默认
+    const { d: d2, g: g2, base: b2 } = mkRepo();
+    eq(loadSizeGateConfig(d2, b2).source, 'default');
+    mkdirSync(join(d2, 'agent-use/docs'), { recursive: true });
+    writeFileSync(join(d2, 'agent-use/docs/pr-rules.json'), JSON.stringify({ titleTypes: [] }));
+    g2('add', '.'); g2('commit', '-qm', 'no-sizegate');
+    eq(loadSizeGateConfig(d2, g2('rev-parse', 'HEAD')).source, 'default');
     rmSync(d2, { recursive: true, force: true });
   });
 
@@ -5118,12 +5136,12 @@ console.log('\n[B2] size-gate 双闸（真实 git 仓）');
     g('init', '-q', '-b', 'main');
     g('config', 'user.email', 'fx@test'); g('config', 'user.name', 'fx');
     writeFileSync(join(d, 'a.txt'), '1\n'); g('add', '.'); g('commit', '-qm', 'base');
+    mkdirSync(join(d, 'agent-use/docs'), { recursive: true });
+    writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), JSON.stringify({ sizeGate: { budgetLines: 100, warnRatio: 0.75 } }));
+    g('add', '.'); g('commit', '-qm', 'rules'); // 配置必须在 base 树上（审 B2-F1 后语义）
     const base2 = g('rev-parse', 'HEAD');
     g('remote', 'add', 'origin', 'https://github.com/o/r.git');
     g('update-ref', 'refs/remotes/origin/main', base2);
-    mkdirSync(join(d, 'agent-use/docs'), { recursive: true });
-    writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), JSON.stringify({ sizeGate: { budgetLines: 100, warnRatio: 0.75 } }));
-    g('add', '.'); g('commit', '-qm', 'rules'); // rules 进 base 侧之外——留在 feature diff 里也只有 1 行,不影响档位
     g('checkout', '-qb', 'feat');
     writeFileSync(join(d, 'src.js'), lines(50, 's')); g('add', '.'); g('commit', '-qm', 'r1');
     // 入口闸(50+1 行 < 75)应 PASS/WARN 以下

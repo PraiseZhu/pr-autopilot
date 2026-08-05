@@ -5,16 +5,16 @@
 // - 统计口径：git diff --numstat -z <merge-base(base,head)> <head> 的 added+deleted 行数，
 //   二进制文件（numstat 报 "-"）不计行数但计入 binary_files 上报；rename 按 numstat 原样（计新路径）。
 // - 排除：内置 regex（测试/spec/fixtures/lockfile/生成物）∪ 目标仓 sizeGate.excludePaths（regex 并集）。
-// - 配置源：<repoDir>/agent-use/docs/pr-rules.json 的 sizeGate 字段。
+// - 配置源：**merge-base 树**的 agent-use/docs/pr-rules.json 的 sizeGate 字段（git show 读取，
+//   绝不读候选工作树——否则被测 PR 自带一份宽配置就能绕过双闸，审 B2-F1 实测复现过）。
 //   文件或字段缺失 → fallback 默认 {budgetLines:800, warnRatio:0.75}（fail-safe，配置 PR 可后置）；
 //   字段存在但 malformed（类型错/regex 编不过/JSON 坏）→ **fail-closed 抛错**，不是回退默认。
+//   候选侧对配置的修改只在合并进 base 后对未来 PR 生效。
 // - 三档：PASS(<warnRatio×budget) / WARN(≥warnRatio×budget) / STOP(≥budget)。CLI: STOP exit 1，其余 0。
 // - 豁免：结构化记录 {repo, branch, base_sha, head_sha, lineCount, at, reason}，owner 当次签发；
 //   head_sha 与当前 head 不一致即失效（改一行就要重新豁免）。Phase 1 与 push-guard 同口径消费。
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { sha256, canonicalJson, parseArgs, fail, isMain, readJson } from './lib/common.mjs';
 
 export const DEFAULT_SIZE_CONFIG = Object.freeze({ budgetLines: 800, warnRatio: 0.75, excludePaths: [] });
@@ -29,13 +29,18 @@ export const BUILTIN_EXCLUDES = [
   '\\.snap$'
 ];
 
-// 返回 {config, source: 'default'|'repo'}；malformed 一律 throw（fail-closed，SC-19）
-export function loadSizeGateConfig(repoDir) {
-  const p = join(repoDir, 'agent-use', 'docs', 'pr-rules.json');
-  if (!existsSync(p)) return { config: { ...DEFAULT_SIZE_CONFIG }, source: 'default' };
+// 返回 {config, source: 'default'|'base'}；malformed 一律 throw（fail-closed，SC-19）。
+// ref = merge-base SHA：配置从 base 树读（审 B2-F1：读候选树 = 被测 PR 可自改闸门）。
+export function loadSizeGateConfig(repoDir, ref) {
+  let text;
+  try {
+    text = execFileSync('git', ['-C', repoDir, 'show', `${ref}:agent-use/docs/pr-rules.json`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch {
+    return { config: { ...DEFAULT_SIZE_CONFIG }, source: 'default' }; // base 树无此文件 → 默认
+  }
   let rules;
-  try { rules = JSON.parse(readFileSync(p, 'utf8')); } catch (e) {
-    throw new Error(`size-gate: pr-rules.json 解析失败（fail-closed，不回退默认）: ${e.message}`);
+  try { rules = JSON.parse(text); } catch (e) {
+    throw new Error(`size-gate: base 树 pr-rules.json 解析失败（fail-closed，不回退默认）: ${e.message}`);
   }
   const sg = rules.sizeGate;
   if (sg === undefined || sg === null) return { config: { ...DEFAULT_SIZE_CONFIG }, source: 'default' };
@@ -58,7 +63,7 @@ export function loadSizeGateConfig(repoDir) {
     }
     cfg.excludePaths = [...sg.excludePaths];
   }
-  return { config: cfg, source: 'repo' };
+  return { config: cfg, source: 'base' };
 }
 
 export function sizeConfigHash(config) {
@@ -93,7 +98,7 @@ export function computeSizeReport({ repoDir, baseRef, headRef = 'HEAD' }) {
   const mergeBase = git('merge-base', baseRef, headRef).trim();
   const headSha = git('rev-parse', headRef).trim();
   const raw = git('diff', '--numstat', '-z', mergeBase, headRef);
-  const { config, source } = loadSizeGateConfig(repoDir);
+  const { config, source } = loadSizeGateConfig(repoDir, mergeBase);
   let counted = 0, excludedLines = 0;
   const binaryFiles = [], countedFiles = [], excludedFiles = [];
   for (const e of parseNumstatZ(raw)) {

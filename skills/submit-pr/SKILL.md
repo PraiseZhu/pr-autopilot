@@ -54,8 +54,9 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    ```
    node scripts/size-gate.mjs --repo-dir . --base origin/main [--exemption <豁免json>]
    ```
-   统计对 merge-base 的非测试 diff 行数（add+delete；内置排除 ∪ 目标仓 pr-rules.json
-   `sizeGate.excludePaths`；配置缺失默认 800/0.75，**存在但 malformed 则 fail-closed**）。
+   统计对 merge-base 的非测试 diff 行数（add+delete；内置排除 ∪ 目标仓 `sizeGate.excludePaths`；
+   配置从 **merge-base 树**读取——读候选树会让被测 PR 自带宽配置绕闸（审 B2-F1 实测复现），
+   候选侧配置修改合并后才生效；配置缺失默认 800/0.75，**存在但 malformed 则 fail-closed**）。
    - `PASS`（<75% 预算）→ 继续。
    - `WARN`（≥75%）→ 继续，但 lead 必须当场给出拆分规划或写明「为何不拆」进台账——这是 75% 即规划拆分纪律的机器化。
    - `STOP`（≥100%，exit 1）→ **不得进入 Phase 2**：先拆分（拆分列车 playbook），或取得 owner
