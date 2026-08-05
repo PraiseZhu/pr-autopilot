@@ -6,3 +6,6 @@ runtime/
 *.jsonl.head
 # mini 宿主 preRunHook 落盘目录（schedule_set_pre_run_hook 生成，随机器不随仓）
 scripts/schedule-checks/
+
+# syncthing 同步临时文件
+.syncthing.*.tmp
