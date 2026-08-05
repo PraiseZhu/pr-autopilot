@@ -9,7 +9,7 @@
 //
 // 状态机（exit code 语义）：
 //   OK               exit 0  两副本 digest 一致
-//   REBUILT          exit 0  文件缺、marker 在 → --write 时重建 .pr-intent.md
+//   REBUILT          exit 0  文件缺、marker 在 → CLI 无条件重建 .pr-intent.md（无开关）
 //   MISMATCH         exit 1  两副本都在但 digest 不一致（SC-18：Phase 1 硬 FAIL）
 //   MARKER_MISSING   exit 2  文件在、marker 缺 → 输出待写入 body 的 marker 区块；
 //                            权威副本必须先落 PR body 再算 bundle（动作后重跑）
