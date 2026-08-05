@@ -38,6 +38,15 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    产出 `{touches_ui, matched_paths, config_hash}` 写入 review bundle。**B 面 n_a 权在脚本不在 reviewer**。
    `touches_ui=true` → demo 证据预检必须过；`--skip-demo-gate` 需 owner 显式理由 + ledger 留痕，用后不得声称"证据完整"。
 
+## Phase 1.5 — 预扫自清洗（haiku，定格 candidate 之前）
+
+目的：把机械类问题拦在三审之前，砍掉整轮「三席全量重读」（2026-08-05 实证：多轮 REQUIRES_CHANGES 相当比例是陈旧注释/漏改引用/测试 import 类，haiku 档即可捕获）。
+
+1. **派扫描员**：`git diff --name-only origin/main...HEAD` 取改动文件，按文件并行派 `diff-scanner` 原生子代理（`~/.claude/agents/diff-scanner.md`，model 钉死 haiku，职责「只报可疑点不做判断」）。每个扫描员输入 = 该文件的完整 diff hunk；输出 = 可疑点 JSON 数组（`{file, line, category, note}`），**禁止 verdict/严重度字段**。
+2. **lead 核实并自清洗**：只处理机械类类别（陈旧注释、漏改引用、术语残留、测试 import 缺失、文档声明与实现不符、明显笔误）——lead 逐条核实为真后当场修掉，落**独立 commit**（message 前缀 `chore(prescan):`），然后才进入 Phase 2 定格 candidate SHA。非机械类可疑点只留 lead 台账，**不投喂任何审查席**（v1 边界：预扫清单不进 bundle、不进 review_input_hash、不改派工包结构——座位输入与无预扫时同构）。
+3. **fail-open**：扫描员超时/报错/输出不合形 → 记台账 `prescan: skipped(<原因>)`，直接进 Phase 2 三审。预扫是增强不是门，任何情况下不阻塞、不构成放行条件。
+4. **覆盖义务不缩水**：预扫存在与否不改变三席的 coverage 契约（首轮穷举 + 加固清单十类照旧），扫描员漏报不构成任何席位少看的理由。
+
 ## Phase 2 — 三审（push 之前）
 
 **定格 candidate**：本地 commit → 工作区 clean → 记 `candidate SHA`。任何后续修改都产生新 SHA 新一轮。
@@ -52,9 +61,13 @@ bundle = base_sha + candidate_sha + PR 标题/正文 + touches_ui + matched_path
 
 | 席 | 模型/档位 | lens | 边界 |
 |---|---|---|---|
-| ① claude-adversarial | claude-opus-5 / xhigh | 正确性 / 回归 / 影响面 | 盲审：不见其他席 finding |
-| ② codex-adversarial | gpt-5.6-sol / xhigh | 安全 / 边界 / 规范 | 盲审：同上 |
-| ③ upstream-preview | claude-opus-5 / high | review-pr skill 口径预演（规则遵从/安全隐私门/格式门/产品·架构门语义预判） | **严格只读**：禁止发 GitHub review/评论/合并/标签等一切对外写动作，只产内部报告 |
+| ① claude-adversarial | claude-sonnet-5 / xhigh | 正确性 / 回归 / 影响面 | 盲审：不见其他席 finding |
+| ② codex-adversarial | codex/gpt-5.6-terra（骨折）/ xhigh；**条件升档**：本次 diff 路径命中目标仓 pr-rules.json `archGate.corePaths` → 该席 effort=ultra，派发说明标注原因 | 安全 / 边界 / 规范 | 盲审：同上 |
+| ③ upstream-preview | claude-sonnet-5 / xhigh | review-pr skill 口径预演（规则遵从/安全隐私门/格式门/产品·架构门语义预判） | **严格只读**：禁止发 GitHub review/评论/合并/标签等一切对外写动作，只产内部报告 |
+
+- **seat② 降级链**：骨折路由报 `BUDGET_MODEL_REQUIRES_API_MODE` → 降 `gpt-5.5 / xhigh`（标准价），派发说明必须标注降级原因，不静默。
+- **降档观察窗（2026-08-05 起，连续 5 个走三审的 PR）**：lead 在台账逐席记 **unique-major**（只有该席抓到的 major/blocker 数）。seat① 换 sonnet 后 unique 率塌方（历史基线场均 2+ → 场均 0）→ 该席单席回滚 `claude-opus-5 / xhigh`，其他席不动。回滚对照基线（08-02~05，38 份裁决）：① opus/xhigh 27 major+1 blocker；② sol/xhigh 15+1（独抓率最高）；③ opus/high 12+1。
+- **争议仲裁席（L3，按需出场，不常驻）**：仅当 ①同一 finding 两轮 open/维持拉锯、②P0/P1 定性分歧、③对抗反驳终裁 三者之一发生时，lead 加派 codex / `gpt-5.6-sol`（标准价），默认 effort=max，仲裁结论本身被推翻重来才升 ultra。**纪律**：仲裁席只产证据与分析内部报告供 origin reviewer 与 lead 参考，finding 仍由 origin reviewer close，报告不进共识判据、不改共识四 conjunct。
 
 三席各产两份输出：人读 markdown + **机器 JSON**（`schemas/review-verdict.schema.json` **v2**）。
 **v2 必填 `anchor_paths`**：每条 finding 除人读 `anchor` 外，必须给 `anchor_paths: string[]`——
