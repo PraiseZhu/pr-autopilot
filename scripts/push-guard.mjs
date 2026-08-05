@@ -26,6 +26,7 @@ import { checkScCoverage } from './sc-coverage-gate.mjs';
 import { buildFixPlan } from './fix-plan.mjs';
 import { checkDispatch } from './fix-dispatch-gate.mjs';
 import { verifyEventChain, runManifestHash, recordedSquashes } from './fix-run.mjs';
+import { computeSizeReport, evaluateSize, exemptionInvalidReason } from './size-gate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PURPOSES = ['feature', 'evolution', 'fast'];
@@ -154,7 +155,7 @@ export function verifyFastAttestation(manifest, key, nowMs = Date.now()) {
   return null;
 }
 
-export function checkPushGuard({ repoDir, manifest, artifact, bundle, constitution, sourceArtifact = null, scManifest = null, fixPlan = null, dispatchRecord = null, runManifest = null, nowMs = Date.now(), fastKey = process.env.PR_AUTOPILOT_FAST_KEY }) {
+export function checkPushGuard({ repoDir, manifest, artifact, bundle, constitution, sourceArtifact = null, scManifest = null, fixPlan = null, dispatchRecord = null, runManifest = null, sizeExemption = null, nowMs = Date.now(), fastKey = process.env.PR_AUTOPILOT_FAST_KEY }) {
   const errors = [];
 
   const schemaErrs = validateManifest(manifest);
@@ -427,11 +428,32 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
     }
   }
 
+  // ---- size 终闸（PR-B2 SC-20，2026-08-06）----
+  // 入口闸（Phase 1）拦开局贪大；本闸拦修复轮渐进膨胀——对将要 push 的终版
+  // （expected_sha vs artifact.base_sha）重算规模，STOP 且无当次有效豁免即拒 push。
+  // 豁免绑定 head_sha（同 size-gate.mjs 口径），改一行即失效。
+  let sizeReport = null;
+  if (baseSha && (manifest.purpose === 'feature' || manifest.purpose === 'evolution')) {
+    try {
+      sizeReport = evaluateSize(computeSizeReport({ repoDir, baseRef: baseSha, headRef: manifest.expected_sha }));
+      if (sizeReport.result === 'STOP') {
+        const invalid = exemptionInvalidReason(sizeExemption, sizeReport);
+        if (invalid === null) {
+          sizeReport.exempted = true;
+        } else {
+          errors.push(`size 终闸 STOP: 非测试 diff ${sizeReport.counted_lines} 行 ≥ 预算 ${sizeReport.budget_lines}（${invalid}）——修复轮膨胀不得绕闸，拆分或取 owner 当次豁免`);
+        }
+      }
+    } catch (e) {
+      errors.push(`size 终闸计算失败（fail-closed）: ${e.message}`);
+    }
+  }
+
   // 审④-F1: refspec 源 = 被批准的 expected_sha 对象本身（不是易变的 branch ref）
   const pushArgv = errors.length === 0
     ? ['git', '-C', repoDir, 'push', manifest.remote, `${manifest.expected_sha}:refs/heads/${manifest.branch}`]
     : null;
-  return { ok: errors.length === 0, errors, changed, head, pushArgv };
+  return { ok: errors.length === 0, errors, changed, head, pushArgv, size_report: sizeReport };
 }
 
 if (isMain(import.meta.url)) {
@@ -450,12 +472,14 @@ if (isMain(import.meta.url)) {
     fixPlan: args['fix-plan'] ? readJson(args['fix-plan']) : null,
     dispatchRecord: args['dispatch-record'] ? readJson(args['dispatch-record']) : null,
     runManifest: args['run-manifest'] ? readJson(args['run-manifest']) : null,
+    sizeExemption: args['size-exemption'] ? readJson(args['size-exemption']) : null,
     constitution: readJson(join(HERE, 'evolution/constitution-paths.json')) // 固定路径，CLI 无 override（审④-F3）
   });
   if (!res.ok) {
     for (const e of res.errors) process.stderr.write(`[PUSH-GUARD] ${e}\n`);
     process.exit(1);
   }
-  process.stdout.write(`PASS head=${res.head.slice(0, 12)} files=${res.changed.length}\n`);
+  const sz = res.size_report ? ` size=${res.size_report.result}${res.size_report.exempted ? '(exempted)' : ''}:${res.size_report.counted_lines}/${res.size_report.budget_lines} cfg=${res.size_report.config_hash.slice(0, 12)}` : '';
+  process.stdout.write(`PASS head=${res.head.slice(0, 12)} files=${res.changed.length}${sz}\n`);
   if (args.execute) execFileSync(res.pushArgv[0], res.pushArgv.slice(1), { stdio: 'inherit' });
 }
