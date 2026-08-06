@@ -64,6 +64,28 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
      落盘并记入 PR body，**绑定 head_sha，改一行即失效**；push-guard 终闸同口径复验（膨胀绕不过）。
    实测依据：规模与 review 轮数是断崖关系（54 行一轮合并 / 292 行 4 轮 / 450 行振荡 8 轮报废；
    本仓 #297 P1a 5662 行事后拆 13 节）。
+6. **PR 标题/正文模板合规闸**（D2，2026-08-06）:
+   ```
+   node scripts/pr-format-gate.mjs --repo-dir . --base origin/main \
+     --title "<PR 标题>" --body-file <PR 正文文件>
+   ```
+   - `PASS` → 继续。`FAIL`（exit 1）→ **Phase 1 FAIL**：按输出的 `missing_sections` / 标题原因
+     改正文或标题，重跑至 PASS。`SKIP`（exit 0）→ 目标仓 merge-base 树未声明格式契约，本门
+     **无判据**；台账如实记 `format-gate: skipped(无配置)`，**不得**记成"格式检查通过"。
+   - 配置源与失败语义同第 5 步（merge-base 树读 `agent-use/docs/pr-rules.json`；缺失 → SKIP；
+     存在但 malformed → fail-closed exit 3）。口径刻意对齐 review-pr 的 `context.mjs`
+     （第三席的职责就是预演 review-pr 的裁决，口径一致才是正确性判据）。
+   > **为什么这道门在 Phase 1，不在审查席**（D2 死锁修复，2026-08-06 实测代价一整轮三席）：
+   > 「正文缺一个必填段落」此前只能由第三席判 `format-gate=fail` → conjunct④ 要求全部
+   > gate_checks ∈ {pass,n_a} → 共识永不 PASS → **不写 artifact**（实测：fail 时 CLI 根本不
+   > 落盘）→ Phase 2b 的 `sc-coverage-gate --artifact` 与 2c 的 `fix-run init --source-artifact`
+   > 是硬依赖，参数层就跑不起来 → 唯一出路是改正文 → `pr_body` 在 `review-input-hash` 的必填
+   > 字段里 → hash 变 → 三份 verdict 全作废 → 三席穷举重审。**Phase 2「Round 2+ 只审 delta」
+   > 在这条路径上够不着**。它是纯字符串匹配、机读真相源已存在、Phase 1 本就有查正文的步骤
+   > （第 4 步 marker），放这里代价是零轮审查。**本门不动 conjunct④、不动 `format-gate` 这个
+   > gate_id**：第三席照旧填报它，只是"缺必填段落"这个成因在 Phase 1 之后已不可能存在，
+   > 该 gate 回到它该管的语义判断上。任何「给 gate fail 开补救口」的方案都要削弱 fail-closed，
+   > 本仓禁止。
 
 ## Phase 1.5 — 预扫自清洗（haiku，定格 candidate 之前）
 
@@ -90,6 +112,30 @@ bundle = base_sha + candidate_sha + PR 标题/正文 + touches_ui + matched_path
 候选 finding 先答「它解决的是不是意图目标句里的问题」，范围判断锚定意图——这也是 Phase 2c
 意见三分法（修/答/推）的判据源。marker 内容已经由 `bundle.pr_body` 绑进 `review_input_hash`，
 派工包里的置顶只是可读性冗余，两者不一致以 bundle 为准。
+
+**派工包机器契约段：脚本生成 + 前置门校验，禁止手抄**（D1，2026-08-06）：
+```
+# 1) 为每一席生成机器契约段，原文粘进该席派工包（不要手打、不要凭记忆写字段名）
+node scripts/dispatch-contract.mjs --emit <reviewer> --round <n> >> pkg-<seat>.md
+# 2) 派工包组好后，create_workers **之前**逐席过前置门（缺任一必需字面值即 exit 1）
+node scripts/dispatch-contract.mjs --check pkg-<seat>.md --seat <reviewer> --round <n>
+```
+三席全部 `DISPATCH-CONTRACT-OK` 才允许 `create_workers`。契约内容（必填 faces、第三席的
+canonical `gate_checks[].gate_id` 全集、加固清单穷举的强制条件与版本、`anchor_paths` 约束、
+actionable 必填字段、finding 禁用字段、**关 finding 的双条件**、域外通道字段名）**全部从
+`verdict-validate.mjs` / `lib/hardening-registry.mjs` 的常量派生**——本文档刻意不复述任何一个
+字面值，改常量时 emit/check 自动跟上。emit 输出携带 `contract_digest`（契约 spec 的内容 hash），
+`--check` 要求它逐字在场且等于当前重算值：**粘贴陈旧契约段会被当场拦下**。
+
+> **为什么这里换成机制、不再加一段提醒**（D1 修法理由）：这类失误已连续发生两次——2026-08-03
+> 派工清单漏写 `closed_finding_ids`（代价一次往返，本文档 Phase 2 末尾已为此专门写过一段警告），
+> 2026-08-06 第三席拿不到四个 canonical `gate_id` 而自创，`verdict-validate` 判 degraded、
+> `consensus-gate` 连跑都跑不起来，**整轮三席作废**。第二次事故本身就是「在文档里写提醒」这个
+> 修法的证伪：提醒与 validator 常量是两份数据，任何一侧漂移即复发，而漂移只在收卷时才暴露。
+> 换成生成器 + 前置门后，字面值**只有一份**（validator 常量），且检查点从"收卷时"提前到
+> "派工前"——两次事故的共同形态（lead 手里没有权威字面值可抄）在构造上消失。
+> 保证等级如实声明 **T1（防疏忽/防漂移）**：它不保证审查席真的按契约填报（那仍由
+> `verdict-validate` 在收卷时拦），也不防恶意伪造派工包文本。
 
 > ⛔ **派工前强制现读本表（2026-08-05 两次事故后加）**：`create_workers` 调用**之前**必须用工具重新读取
 > 本文件的席位表三行，把读到的字面值填进参数，并在派发说明里逐席复读 `(model/effort)`。
@@ -381,9 +427,21 @@ marker 段 `<!-- pr-autopilot:invariants:start/end -->` 内是脚本生成的 MU
 - **答**：误读 / 过时 / 与实现不符 → **不改代码**。lead 以证据（代码/测试/规范原文引用）回复请 origin 席复核；成立则该席在**新一份 verdict 里同时**把该 finding `status=closed` **并**将其 id 列入本席 `closed_finding_ids`（共识门双条件，缺一即 fail，见下方收口契约与 consensus-gate 实现——只翻 status 不列 id 是已知失败模式）。证据锚点单独留档（回复文本进 PR 评论或本轮对账记录），禁止无证据口头驳回。
 - **推**：真问题，但属于加固、邻域补全、通用能力——不服务于目标句，或不必留在本 PR → **默认外推**：开独立 issue，PR body 记录 issue 链接；origin 席据此在**同一份 verdict 里** `status=closed` **且**列入 `closed_finding_ids`（双条件同上），close 理由记 out-of-scope-tracked、issue 链接作为锚点单独留档。**即使是真问题也默认外推**——「每条意见单看都合理」正是 PR 在返修轮膨胀的路径；范围判断锚定意图，不锚定意见本身的对错（临场逐条判必输）。
 
+  > **主证据落在 diff 之外的真问题（仓库既有问题等）走 `out_of_scope_notes[]`，不要写成 finding**
+  > （D3，2026-08-06）：finding 的 `anchor_paths` 必须 ⊆ `base..candidate` 实改集（SC-R3-5，拦
+  > 「锚点填宽制造假冲突」，**一个字不放宽**），所以这类问题**无法**合法表达成 finding——塞
+  > `gate_checks` 会撞 conjunct④ 且进不了台账，丢弃则永久丢信息。审查席改填 verdict 的
+  > `out_of_scope_notes[]`（字段形状见 `schemas/review-verdict.schema.json`，派工契约段已自动带上
+  > 字段名与必填项）：`ref_paths` 只要求是 tracked 文件、**允许在实改集之外**，这正是该通道存在
+  > 的理由。它参与 `verdict_hashes`（改了就换 hash，不可事后追加），但**不进** conjunct②③④、
+  > **不进** `canonical_findings`、**不进** SC 台账与冲突图——因此不影响任何放行判定。
+  > **lead 的义务**：每条 note 按本节「推」的流程开 issue（用 note 的 `suggested_issue_title`）
+  > 并把链接记进 PR body 与本轮对账记录。保证等级 **T1**：机器只锁形状（字段齐全、与 finding
+  > 双向不可互相伪装、id 命名空间互斥），**不校验 issue 真的开了**——漏开只能靠对账发现。
+
 与 `[ARCHIVE-eligible]` 的关系（并列不冲突、判据不同）：ARCHIVE 是「**本修复周期新写代码**的窄面残余」的文档化接受（登记进 README，`kind=archive` SC 走同一编排链，四条判据见下）；推是「**范围外真问题**」的外推跟踪（登记进 issue）。一条 finding 若两者都够格，优先 ARCHIVE（本 PR 内闭环、成本更低）。
 
-处置报告要求（人读验收，不改 verdict schema）：每轮 delta 对账记录中，每条 finding 必须标注 修/答/推/ARCHIVE 之一并附对应产物锚点——修：SC id；答：证据回复位置；推：issue 链接；ARCHIVE：README 登记文案。缺任一即视为该轮对账不完整，不得进入收口。
+处置报告要求（人读验收）：每轮 delta 对账记录中，每条 finding 必须标注 修/答/推/ARCHIVE 之一并附对应产物锚点——修：SC id；答：证据回复位置；推：issue 链接；ARCHIVE：README 登记文案。**三席 verdict 里的每条 `out_of_scope_notes` 同样各占一行**（视同「推」，附 issue 链接）。缺任一即视为该轮对账不完整，不得进入收口。
 
 每轮 delta 复核，审查席对每条存活 finding 标 `[MUST-FIX]` 或 `[ARCHIVE-eligible]`：
 
