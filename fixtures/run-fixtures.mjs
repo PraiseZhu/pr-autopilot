@@ -5378,24 +5378,131 @@ t('[D2-FG-ALIGN] self-review 勾选率: 段落存在且 <80% → FAIL；段落�
   eq(evaluateFormat({ title: 'chore: x', body: withList(0, 3), config: FG_CFG }).result, 'PASS');
 });
 
-t('[D2-FG-ALIGN] 跨仓对齐探针: 与 review-pr 源码里的两条 regex 逐条比对裁决（缺席则如实 skip）', () => {
+// 从源码文本里**严格**抽出两条 regex，不执行任何跨仓文本（去 eval，2026-08-06 第五轮）。
+// 初版用贪婪 `(\/.+\/[a-z]*);` + eval：实测把
+//   `const TITLE_VAGUE_RE = /foo/; globalThis.__x = 1; /bar/;`
+// 整段捕获并执行（sentinel 真被赋值）。review-pr 是本机受信源码、且只在 fixture 期运行，
+// 但**没有必要**执行跨仓文本——改为 body/flags 分组 + new RegExp(body, flags)。
+export function extractRegexLiterals(src) {
+  const type = src.match(/^const TITLE_TYPE_RE\s*=\s*new RegExp\(`([^`\n]+)`\);\s*$/m);
+  // body 只吃「非转义斜杠、非换行」的字符，因此吃不进 `; globalThis...` 那种尾巴
+  const vague = src.match(/^const TITLE_VAGUE_RE[ \t]*=[ \t]*\n?[ \t]*\/((?:[^/\\\n]|\\.)+)\/([a-z]*);[ \t]*$/m);
+  return { typeTemplate: type?.[1] ?? null, vagueBody: vague?.[1] ?? null, vagueFlags: vague?.[2] ?? null };
+}
+// 上游源码的 **exact** 期望值。任何一个字变了 → 探针 loud fail → 强制人工重审对齐
+// （而不是"16 条 case 恰好还全过"就放行——实测删掉 `^` 后 16 条全绿但正则已变宽，静默漂移）。
+const RP_EXPECT_TYPE = '^(${prRules.titleTypes.join(\'|\')})(\\\\([^)]+\\\\))?!?: .+';
+const RP_EXPECT_VAGUE_BODY = ':\\s*(bug|update|improve|fix issue|优化|调整|更新|misc|若干|一些)\\s*$';
+const RP_EXPECT_VAGUE_FLAGS = 'i';
+
+t('[D2-FG-ALIGN] 跨仓对齐探针: 严格抽取（不 eval）+ 上游源码 exact 断言 + 裁决逐条比对（缺席则如实 skip）', () => {
   const RP = join(process.env.HOME ?? '', '.claude/skills/review-pr/scripts/context.mjs');
   if (!existsSync(RP)) { console.log('       ↳ SKIP: 本机未安装 review-pr，跨仓对齐无法实测（如实记录，不当通过）'); return; }
-  const src = readFileSync(RP, 'utf8');
-  const typeSrc = src.match(/const TITLE_TYPE_RE\s*=\s*new RegExp\(`([^`]+)`\)/);
-  const vagueSrc = src.match(/const TITLE_VAGUE_RE\s*=\s*(\/.+\/[a-z]*);/);
-  ok(typeSrc && vagueSrc, 'review-pr 源码形态变了，探针需重写（这本身就是要人看的信号）');
+  const { typeTemplate, vagueBody, vagueFlags } = extractRegexLiterals(readFileSync(RP, 'utf8'));
+  ok(typeTemplate && vagueBody !== null, 'review-pr 源码形态变了，探针需重写（这本身就是要人看的信号）');
+  // exact 断言: 上游改任何一个字（含只删一个 ^ 这种"case 全过但语义已变宽"的漂移）都必须 loud fail
+  eq(typeTemplate, RP_EXPECT_TYPE, 'review-pr 的 TITLE_TYPE_RE 源码变了 —— 必须人工重新对齐 titleTypeRe 后同步本期望值');
+  eq(vagueBody, RP_EXPECT_VAGUE_BODY, 'review-pr 的 TITLE_VAGUE_RE 变了 —— 必须人工重新对齐后同步本期望值');
+  eq(vagueFlags, RP_EXPECT_VAGUE_FLAGS, 'review-pr 的 TITLE_VAGUE_RE flags 变了 —— 同上');
   const types = FG_CFG.titleTypes;
-  // 用 review-pr 的模板字符串原文编译出「他们的」正则（不执行他们的模块，避免副作用）
-  const theirType = new RegExp(typeSrc[1].replace('${prRules.titleTypes.join(\'|\')}', types.join('|')).replace(/\\\\/g, '\\'));
-  const theirVague = eval(vagueSrc[1]); // eslint-disable-line no-eval -- 只对本机 review-pr 源码里的字面量正则求值
+  const theirType = new RegExp(typeTemplate.replace('${prRules.titleTypes.join(\'|\')}', types.join('|')).replace(/\\\\/g, '\\'));
+  const theirVague = new RegExp(vagueBody, vagueFlags); // 不 eval
   const mineType = titleTypeReRef(types);
   const cases = ['feat(scope): x', 'feat: x', 'feat(): x', 'feat(scope):x', 'feat:x', 'feat!: x', 'feat(a)!: x',
-    'wat: x', 'feat: ', 'feat:', 'feat: 优化', 'feat: 优化渲染', 'fix: 调整', 'feat: update', 'feat: 一些', 'FEAT: X'];
+    'wat: x', 'feat: ', 'feat:', 'feat:  x', 'prefix feat: x', 'feat: 优化', 'feat: 优化渲染',
+    'fix: 调整', 'feat: update', 'feat: 一些', 'FEAT: X'];
   for (const c of cases) {
     eq(mineType.test(c), theirType.test(c), `title type 裁决必须与 review-pr 一致: 「${c}」`);
     eq(TITLE_VAGUE_RE_REF.test(c), theirVague.test(c), `含糊词裁决必须与 review-pr 一致: 「${c}」`);
   }
+  // `prefix feat: x` 是锚点漂移的反例哨兵: 上游删掉 `^` 后它会变 true，本仓仍 false → 立刻不一致
+  eq(mineType.test('prefix feat: x'), false, '锚点必须在行首（本例是 ^ 漂移的哨兵）');
+});
+
+t('[D2-FG-ALIGN] 严格抽取器: 不执行跨仓文本，且吃不进注入的尾巴（去 eval 的反证）', () => {
+  // 初版贪婪 + eval 会把整段吞下并执行；严格 body 只吃非转义斜杠/非换行字符
+  globalThis.__fixtureProbeSentinel = undefined;
+  const injected = 'const TITLE_VAGUE_RE = /foo/; globalThis.__fixtureProbeSentinel = 1; /bar/;\n';
+  const r = extractRegexLiterals(injected);
+  eq(globalThis.__fixtureProbeSentinel, undefined, '抽取器绝不得执行源码文本（初版 eval 会把 sentinel 置 1）');
+  // 注意断言方向: 带尾巴的整行**整条拒收**（返回 null）比"抽出 foo 忽略尾巴"更 fail-closed——
+  // 形态异常就该让调用侧 loud fail 去叫人看。初稿在这里断言 expected='foo'，跑基线时红了，
+  // 是断言写错不是实现错（实现要求 `;` 后必须直接行尾）。
+  eq(r.vagueBody, null, '带尾巴的异常行必须整条拒收（返回 null → 调用侧 loud fail）');
+  // 反证「初版 eval 确实会执行」: 就地重演初版的贪婪+eval 逻辑，sentinel 必被置 1。
+  // 这条替代了「改生产代码跑整套变异」——本属性在 fixture 内部，变异注入反而验不到（见交卷说明）。
+  globalThis.__fixtureProbeSentinel = undefined;
+  const greedy = injected.match(/const TITLE_VAGUE_RE\s*=\s*\/(.+)\/([a-z]*);/);
+  ok(greedy, '前提: 初版的贪婪 regex 确实能匹配这行');
+  eq(greedy[1], 'foo/; globalThis.__fixtureProbeSentinel = 1; /bar', '初版贪婪捕获会把整段尾巴吞进来');
+  // eslint-disable-next-line no-eval -- 刻意重演初版行为以证明它会执行；只在本用例内、输入是本文件字面量
+  try { eval(`/${greedy[1]}/${greedy[2]}`); } catch { /* 语法错也算没执行成功 */ }
+  eq(globalThis.__fixtureProbeSentinel, 1, '初版 eval 路径确实会执行注入代码——这就是去 eval 的理由');
+  globalThis.__fixtureProbeSentinel = undefined;
+  // 形态异常一律返回 null → 调用侧 loud fail，不静默放行
+  for (const bad of ['const TITLE_VAGUE_RE = someFn();\n', 'let TITLE_VAGUE_RE = /x/i;\n',
+    '// const TITLE_VAGUE_RE = /x/i;\n',
+    'const TITLE_VAGUE_RE =\n\n  /x/i;\n',                    // 跨空行 = 可能抓到无关 literal，必须拒
+    'const TITLE_VAGUE_RE =\n  someFn();\n  /x/i;\n']) {      // 声明与 literal 之间夹了别的语句
+    eq(extractRegexLiterals(bad).vagueBody, null, `形态异常必须抽不出（返回 null 让调用侧 loud fail）: ${JSON.stringify(bad)}`);
+  }
+  // 合法的换行排版**应当**抽得出（只允许一个换行 + 缩进；初稿断言它必须为 null，跑基线时红了，
+  // 是断言过严不是实现错——同一批里我写错两条断言，都是靠真跑基线而不是假定全绿才发现的）
+  eq(extractRegexLiterals('const TITLE_VAGUE_RE =\n  /x/i;\n').vagueBody, 'x', '一个换行的合法排版应抽得出');
+  eq(extractRegexLiterals('const TITLE_TYPE_RE = someOther(`x`);\n').typeTemplate, null, 'type 侧同理');
+  // 正向: 正常形态抽得出且 flags 正确
+  const good = extractRegexLiterals('const TITLE_VAGUE_RE = /:\\s*(a|b)\\s*$/i;\n');
+  eq(good.vagueBody, ':\\s*(a|b)\\s*$');
+  eq(good.vagueFlags, 'i');
+});
+
+t('[D2-FG-ALIGN] exact 源码断言的必要性: 只比 case 会放过静默漂移，exact 断言才拦得住（内存态）', () => {
+  // 本属性朝**上游**（review-pr 源码变了要 loud fail），无法靠改本仓代码做变异验证——
+  // 改 review-pr 仓是硬边界禁止的。改为内存态构造：拿真实期望串做一处「删掉 ^」的语义漂移，
+  // 分别看「只比 18 条 case」与「exact 断言」两种口径的表现。
+  const types = FG_CFG.titleTypes;
+  const compile = (tpl) => new RegExp(tpl.replace('${prRules.titleTypes.join(\'|\')}', types.join('|')).replace(/\\\\/g, '\\'));
+  const drifted = RP_EXPECT_TYPE.replace(/^\^/, ''); // 上游删掉行首锚点 = 悄悄变宽
+  ok(drifted !== RP_EXPECT_TYPE, '前提: 漂移串确实与期望不同');
+  const theirsDrifted = compile(drifted);
+  const mine = titleTypeReRef(types);
+  // ① 只比 case 的口径: 原有 18 条 case 里没有一条能发现这次漂移
+  const CASES = ['feat(scope): x', 'feat: x', 'feat(): x', 'feat(scope):x', 'feat:x', 'feat!: x', 'feat(a)!: x',
+    'wat: x', 'feat: ', 'feat:', 'feat:  x', 'feat: 优化', 'feat: 优化渲染', 'fix: 调整', 'feat: update', 'feat: 一些', 'FEAT: X'];
+  eq(CASES.filter((c) => mine.test(c) !== theirsDrifted.test(c)), [], '前提: 这批 case 对该漂移完全无感（这正是"全绿≠已覆盖"）');
+  // ② exact 断言的口径: 立刻不等 → 调用侧 loud fail
+  ok(drifted !== RP_EXPECT_TYPE, 'exact 断言必然发现该漂移');
+  // ③ 哨兵 case: 加了 `prefix feat: x` 之后，连"只比 case"也能抓到这一种漂移
+  eq(mine.test('prefix feat: x'), false);
+  eq(theirsDrifted.test('prefix feat: x'), true, '哨兵 case 对锚点漂移有感——两道口径互为兜底');
+});
+
+t('[D2-FG-ALIGN] titleTypes 是 regex fragment: 不得 escRe（初版 escRe 造成双向分叉）', () => {
+  const types = ['feat|fix'];
+  const theirs = new RegExp(`^(${types.join('|')})(\\([^)]+\\))?!?: .+`); // review-pr 口径
+  const mine = titleTypeReRef(types);
+  eq(mine.source, theirs.source, 'titleTypeRe 的 pattern 必须与 review-pr 逐字相同（不得 escRe）');
+  // 三个实测分叉用例（初版：前两个假 FAIL、第三个假 PASS）
+  for (const c of ['fix: x', 'feat: x', 'feat|fix: x']) {
+    eq(mine.test(c), theirs.test(c), `「${c}」两侧必须同判（初版 escRe 在此双向分叉）`);
+  }
+  eq(mine.test('fix: x'), true, 'fragment 里的 fix 必须能匹配（初版判 false = 假 FAIL）');
+  eq(mine.test('feat|fix: x'), false, '字面量 feat|fix 不得匹配（初版判 true = 假 PASS → D2 死锁）');
+  // 普通 token 回归: 与旧行为完全一致
+  eq(titleTypeReRef(['feat', 'fix']).source, '^(feat|fix)(\\([^)]+\\))?!?: .+');
+  // 不可解析的 fragment → 抛错（fail-closed；CLI 侧转 exit 3），不静默降级。
+  // 注意选例: `[` **能**编译（被 pattern 后面 `[^)]` 里的 `]` 闭合成字符类），拿它当"非法"
+  // 会写出一条假成立的断言——初稿正是如此，自测时才发现。真非法的是 `(` / `*` / `+` / `a)`。
+  for (const bad of ['(', '*', '+', 'a)']) {
+    let threw = false;
+    try { titleTypeReRef([bad]); } catch { threw = true; }
+    ok(threw, `不可解析的 titleTypes fragment「${bad}」必须抛错，不得静默放行`);
+    let threw2 = false;
+    try { evaluateFormat({ title: 'feat: x', body: FG_BODY_FULL, config: { ...FG_CFG, titleTypes: [bad] } }); } catch { threw2 = true; }
+    ok(threw2, `evaluateFormat 遇「${bad}」同样抛错（CLI 转 exit 3）`);
+  }
+  // 对照: `[` 能编译，因此它**不该**被期望抛错（锁住上面的选例理由，防有人"修正"回去）
+  ok(titleTypeReRef(['[']) instanceof RegExp, '`[` 在本 pattern 里可编译——不得把它当非法用例');
 });
 
 t('[D2-FG] 配置未声明 → SKIP（显式"无判据"，不是 PASS；不硬编码任一目标仓的段落名）', () => {

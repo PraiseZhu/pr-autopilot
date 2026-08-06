@@ -147,11 +147,19 @@ export function hasSection(body, heading) {
 //   new RegExp(`^(${prRules.titleTypes.join('|')})(\\([^)]+\\))?!?: .+`)
 // 两个差异点必须原样保持，初版各写错一个就制造了新死锁（见文件头「初版事故」）：
 //   ① scope 内容**非空** `[^)]+`（不是 `*`）——`feat(): x` 必须判不合规；
-//   ② 冒号后**恰好一个字面空格**再接 `.+`（不是 `\s*\S`）——`feat(scope):x` / `feat:x` 必须判不合规。
-// 本侧额外对 type 做了 escRe（review-pr 未做）：titleTypes 实际都是纯单词，编译结果等价；
-// 万一将来配置里出现正则元字符，本侧是从严方向，不会比 review-pr 宽。
+//   ② 冒号后必须有**至少一个字面空格**再接 `.+`（`: .+` 而非 `\s*\S`；两侧都允许多个空格）——`feat(scope):x` / `feat:x` 必须判不合规。
+// `titleTypes` 按 review-pr 的设计**就是 regex fragment**（它直接 `join('|')` 拼进 pattern），
+// 所以本侧也必须原样 join，**不得 escRe**。初版对 token 做了 escRe 并在注释里断言「是从严方向，
+// 不会比 review-pr 宽」——那句话是错的，实测是**双向**分叉（2026-08-06 裁决席第五轮）：
+//   titleTypes=['feat|fix'] 时 → `fix: x` 我拒它放（假 FAIL，白跑一轮三席）
+//                              → `feat|fix: x` 我放它拒（假 PASS，第三席 format-gate fail
+//                                 → conjunct④ → 回到 D2 无 artifact 死锁）
+//   （`feat: x` 同为假 FAIL——分叉是 3 例不是 2 例。）
+// 配置里写了不可解析的 fragment（如 `(` / `*` / `+`；注意 `[` 反而能编译，被后续 `[^)]` 的 `]` 闭合）
+// 时 new RegExp 抛错，CLI 侧 fail-closed 成 exit 3，
+// 与 review-pr 在模块加载期抛错同向，不静默放行。
 export function titleTypeRe(titleTypes) {
-  return new RegExp(`^(${titleTypes.map(escRe).join('|')})(\\([^)]+\\))?!?: .+`);
+  return new RegExp(`^(${titleTypes.join('|')})(\\([^)]+\\))?!?: .+`);
 }
 
 // 含糊词黑名单。逐字对齐 review-pr context.mjs 的 TITLE_VAGUE_RE。
