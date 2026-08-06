@@ -5760,6 +5760,145 @@ t('[D3-OOS-WIRE] 接线层: runConsensusGate 只给 repoDir（不注入任何集
   rmSync(d, { recursive: true, force: true });
 });
 
+// ========== 25. T1 validator CLI 必填 repo-dir / D2-B 格式门双读交集（2026-08-06 第二批） ==========
+console.log('\n[25] T1 verdict-validate CLI 口径完整 · D2-B pr-format-gate 双读交集');
+
+// 共用: 真 git 仓（base 一个提交 + candidate 一个提交），供两组 CLI 用例
+function mkTwoCommitRepo() {
+  const d = mkdtempSync(join(tmpdir(), 't1d2b-'));
+  const g = (...a) => execFileSync('git', ['-C', d, ...a], { encoding: 'utf8' }).trim();
+  g('init', '-q', '-b', 'main'); g('config', 'user.email', 'a@b.c'); g('config', 'user.name', 'x');
+  mkdirSync(join(d, 'src'), { recursive: true });
+  writeFileSync(join(d, 'src/legacy.ts'), 'legacy\n');
+  writeFileSync(join(d, 'src/changed.ts'), 'v1\n');
+  g('add', '.'); g('commit', '-qm', 'base');
+  const baseSha = g('rev-parse', 'HEAD');
+  writeFileSync(join(d, 'src/changed.ts'), 'v2\n');
+  g('add', '.'); g('commit', '-qm', 'cand');
+  return { d, g, baseSha, candSha: g('rev-parse', 'HEAD') };
+}
+
+t('[T1-CLI] verdict-validate CLI: 省 --repo-dir 必拒（旧行为对非法 anchor 报 ok = 自检假绿，事故家族本体）', () => {
+  const { d, baseSha, candSha } = mkTwoCommitRepo();
+  const mkV = (anchorPath) => {
+    const f = join(d, 'v.json');
+    writeFileSync(f, JSON.stringify(mkVerdictFor('claude-adversarial', mkBundle(baseSha, candSha), {
+      findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: [anchorPath], evidence: 'e', status: 'closed' }],
+      closed_finding_ids: ['F1']
+    })));
+    return f;
+  };
+  const cli = (args) => {
+    try { return { out: execFileSync(process.execPath, [join(S, 'verdict-validate.mjs'), ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }), code: 0 }; }
+    catch (e) { return { out: `${e.stdout ?? ''}${e.stderr ?? ''}`, code: e.status }; }
+  };
+  const badV = mkV('src/legacy.ts'); // tracked 但不在实改集——非法 anchor
+  // 事故本体: 初版省 --repo-dir 时这份非法 verdict 得 exit=0 ok
+  const r1 = cli(['--verdict', badV]);
+  ok(r1.code !== 0, 'T1: 省 --repo-dir 必须拒（初版 exit=0 输出 ok = 自检假绿）');
+  ok(/repo-dir/.test(r1.out) && /口径|必填/.test(r1.out), `拒绝文案必须点名 --repo-dir 与口径问题: ${r1.out.slice(0, 120)}`);
+  // 带 --repo-dir: 非法 anchor 照旧被实改集校验拦（原有行为不丢）
+  const r2 = cli(['--verdict', badV, '--repo-dir', d]);
+  ok(r2.code === 1 && /实改文件集/.test(r2.out), `带 repo-dir 时非法 anchor 仍拦: ${r2.out.slice(0, 120)}`);
+  // 正向: 合法 anchor + --repo-dir → ok（收紧不误伤）
+  const r3 = cli(['--verdict', mkV('src/changed.ts'), '--repo-dir', d]);
+  eq(r3.code, 0, `合法 verdict 必须放行: ${r3.out.slice(0, 120)}`);
+  ok(/^ok/m.test(r3.out), '输出 ok');
+  // fail-closed: repo-dir 指向非 git 目录 → 拒且文案是"算不出集合"，不是静默跳过校验
+  const notRepo = mkdtempSync(join(tmpdir(), 'nr-'));
+  const r4 = cli(['--verdict', mkV('src/changed.ts'), '--repo-dir', notRepo]);
+  ok(r4.code !== 0 && /实改集|fail-closed/.test(r4.out), `非 git 仓必须 fail-closed: ${r4.out.slice(0, 120)}`);
+  rmSync(d, { recursive: true, force: true }); rmSync(notRepo, { recursive: true, force: true });
+});
+
+// D2-B: pr-format-gate CLI 双读交集（修复逻辑在 CLI 层，必须 spawn 真进程）
+function fgCli(repoDir, title, bodyText) {
+  const bf = join(repoDir, '.body-under-test.md');
+  writeFileSync(bf, bodyText);
+  try {
+    const out = execFileSync(process.execPath, [join(S, 'pr-format-gate.mjs'), '--repo-dir', repoDir, '--base', 'main', '--title', title, '--body-file', bf], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return { code: 0, json: JSON.parse(out) };
+  } catch (e) {
+    let json = null; try { json = JSON.parse(e.stdout ?? ''); } catch { /* exit3 时无 JSON */ }
+    return { code: e.status, json, err: String(e.stderr ?? '') };
+  }
+}
+const RULES_REL = 'agent-use/docs/pr-rules.json';
+function mkRulesRepo(baseRules) {
+  const d = mkdtempSync(join(tmpdir(), 'd2b-'));
+  const g = (...a) => execFileSync('git', ['-C', d, ...a], { encoding: 'utf8' }).trim();
+  g('init', '-q', '-b', 'main'); g('config', 'user.email', 'a@b.c'); g('config', 'user.name', 'x');
+  mkdirSync(join(d, 'agent-use/docs'), { recursive: true });
+  if (baseRules !== null) writeFileSync(join(d, RULES_REL), JSON.stringify(baseRules));
+  writeFileSync(join(d, 'x.txt'), 'x');
+  g('add', '.'); g('commit', '-qm', 'base');
+  // 开 feature 分支再回 main 指针：CLI 用 --base main 与 HEAD 求 merge-base
+  g('checkout', '-qb', 'feat');
+  return { d, g };
+}
+const B_RULES = { featureSections: ['变更说明', '备注'], titleTypes: ['feat', 'fix'] };
+const BODY_BASE_OK = '## 变更说明\nx\n\n## 备注\n无\n';
+
+t('[D2B-DUAL] 事故本体: 候选收紧规则（新增必填段）→ 必须 FAIL 且点名 [candidate]（初版只读 base 会放行）', () => {
+  const { d, g } = mkRulesRepo(B_RULES);
+  writeFileSync(join(d, RULES_REL), JSON.stringify({ ...B_RULES, featureSections: ['变更说明', '备注', '风险'] }));
+  g('add', '.'); g('commit', '-qm', 'tighten');
+  const r = fgCli(d, 'feat: x', BODY_BASE_OK); // body 只满足 base 的两段，缺候选新增的「风险」
+  eq(r.code, 1, 'D2-B: 候选收紧必须在 Phase 1 就 FAIL（否则第三席按候选规则 fail → 死锁复活）');
+  eq(r.json.result, 'FAIL');
+  ok(r.json.reasons.some((x) => x.startsWith('[candidate]') && x.includes('风险')), `原因必须点名候选侧新段: ${JSON.stringify(r.json.reasons)}`);
+  eq(r.json.base.result, 'PASS', '对照: base 侧单看确实 PASS——这正是初版只读 base 会放行的证据');
+  rmSync(d, { recursive: true, force: true });
+});
+
+t('[D2B-DUAL] B2-F1 方向仍守住: 候选放宽（删段/加 type）不生效，按 base 拦', () => {
+  const { d, g } = mkRulesRepo(B_RULES);
+  writeFileSync(join(d, RULES_REL), JSON.stringify({ featureSections: ['备注'], titleTypes: ['feat', 'fix', 'wat'] }));
+  g('add', '.'); g('commit', '-qm', 'widen');
+  // 候选放宽后 body 只写「备注」、title 用候选新加的 wat → base 侧必须双拦
+  const r = fgCli(d, 'wat: x', '## 备注\n无\n');
+  eq(r.code, 1);
+  ok(r.json.reasons.some((x) => x.startsWith('[base]') && x.includes('变更说明')), `base 侧段落要求仍生效: ${JSON.stringify(r.json.reasons)}`);
+  ok(r.json.reasons.some((x) => x.startsWith('[base]') && /type/.test(x)), 'base 侧 titleTypes 仍生效（候选自加的 wat 不算数）');
+  eq(r.json.candidate.result, 'PASS', '对照: 候选侧单看 PASS——只读候选就会被绕，双读把它拦回来');
+  rmSync(d, { recursive: true, force: true });
+});
+
+t('[D2B-DUAL] 正向与边界: 同规则 PASS / 两侧皆无 SKIP / 单侧有判据以该侧为准 / 候选 malformed exit 3', () => {
+  // 同规则 → PASS（交集不误伤）
+  const a = mkRulesRepo(B_RULES);
+  writeFileSync(join(a.d, 'y.txt'), 'y'); a.g('add', '.'); a.g('commit', '-qm', 'c');
+  const rA = fgCli(a.d, 'feat: x', BODY_BASE_OK);
+  eq(rA.code, 0); eq(rA.json.result, 'PASS');
+  ok(rA.json.base.config_source === 'base' && rA.json.candidate.config_source === 'base', '两侧都读到配置');
+  rmSync(a.d, { recursive: true, force: true });
+  // 两侧都无配置 → SKIP（不是 PASS）
+  const b = mkRulesRepo(null);
+  writeFileSync(join(b.d, 'y.txt'), 'y'); b.g('add', '.'); b.g('commit', '-qm', 'c');
+  const rB = fgCli(b.d, '随便', '空');
+  eq(rB.code, 0); eq(rB.json.result, 'SKIP');
+  ok(rB.json.skip_reason.includes('两侧'), 'SKIP 文案说明是两侧均无判据');
+  rmSync(b.d, { recursive: true, force: true });
+  // base 无、候选新增配置 → 以候选为准（新仓第一次引入规则的 PR 自身就受约束）
+  const c = mkRulesRepo(null);
+  mkdirSync(join(c.d, 'agent-use/docs'), { recursive: true });
+  writeFileSync(join(c.d, RULES_REL), JSON.stringify(B_RULES));
+  c.g('add', '.'); c.g('commit', '-qm', 'introduce');
+  const rC = fgCli(c.d, 'feat: x', '没有段落');
+  eq(rC.code, 1, '候选引入的规则对本 PR 生效');
+  ok(rC.json.reasons.every((x) => x.startsWith('[candidate]')), '原因全部来自候选侧');
+  const rC2 = fgCli(c.d, 'feat: x', BODY_BASE_OK);
+  eq(rC2.code, 0); eq(rC2.json.result, 'PASS', '满足候选规则即放行（base 侧 SKIP 不否决）');
+  rmSync(c.d, { recursive: true, force: true });
+  // 候选侧 malformed → exit 3（fail-closed，不因 base 侧健康而放行）
+  const e = mkRulesRepo(B_RULES);
+  writeFileSync(join(e.d, RULES_REL), '{ 坏 json');
+  e.g('add', '.'); e.g('commit', '-qm', 'break');
+  const rE = fgCli(e.d, 'feat: x', BODY_BASE_OK);
+  eq(rE.code, 3, `候选侧配置坏必须 exit 3: ${rE.err?.slice(0, 100)}`);
+  rmSync(e.d, { recursive: true, force: true });
+});
+
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
 console.log(`\n========== fixtures: ${pass} passed, ${failCount} failed ==========`);
