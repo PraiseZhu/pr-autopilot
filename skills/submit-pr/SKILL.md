@@ -149,9 +149,18 @@ actionable 必填字段、finding 禁用字段、**关 finding 的双条件**、
 | ② codex-adversarial | codex/gpt-5.6-terra（骨折）/ xhigh；**条件升档**：本次 diff 路径命中目标仓 pr-rules.json `archGate.corePaths` → 该席 effort=ultra，派发说明标注原因 | 安全 / 边界 / 规范 | 盲审：同上 |
 | ③ upstream-preview | claude-sonnet-5 / xhigh | review-pr skill 口径预演（规则遵从/安全隐私门/格式门/产品·架构门语义预判） | **严格只读**：禁止发 GitHub review/评论/合并/标签等一切对外写动作，只产内部报告 |
 
-- **seat② 降级链**：骨折路由报 `BUDGET_MODEL_REQUIRES_API_MODE` → 降 `gpt-5.5 / xhigh`（标准价），派发说明必须标注降级原因，不静默。
+- **GPT 通路纪律（owner 2026-08-06 定案，三条通路择一）**：本机对 GPT 有**三条**互不相同的通路，
+  从 model ID 前缀区分——`codex/gpt-*` = **骨折**（立省 85%）；裸 `gpt-*` = **Cindy AI 通路**
+  （立省 40%）；`chatgpt/gpt-*` = **官方订阅**。规则：**默认一律选骨折**；骨折不可用时
+  **降级走 Cindy AI 通路（裸 `gpt-*`）**；**禁用 `chatgpt/` 官方订阅**（本仓任何执行契约都不得
+  出现该前缀，现状已核实为零引用）。
+  > ⚠ **`model-route models` 只给骨折打标**，裸 `gpt-*` 与 `chatgpt/gpt-*` 在它的输出里都不带
+  > 标记、看起来一样。所以「不许用官方订阅」这条**没有机器门在拦**，只能靠本条纪律 + 派工前
+  > 现读本表。填模型时请直接看前缀，不要凭 model-route 输出里"没标骨折"就以为是 Cindy AI。
+- **seat② 降级链**：骨折路由报 `BUDGET_MODEL_REQUIRES_API_MODE`（Codex 不在 API key 模式）→ 降
+  裸 `gpt-5.5 / xhigh`（**Cindy AI 通路**，不是官方订阅），派发说明必须标注降级原因，不静默。
 - **降档观察窗（2026-08-05 起，连续 5 个走三审的 PR）**：lead 在台账逐席记 **unique-major**（只有该席抓到的 major/blocker 数）。seat① 换 sonnet 后 unique 率塌方（历史基线场均 2+ → 场均 0）→ 该席单席回滚 `claude-opus-5 / xhigh`，其他席不动。回滚对照基线（08-02~05，38 份裁决）：① opus/xhigh 27 major+1 blocker；② sol/xhigh 15+1（独抓率最高）；③ opus/high 12+1。
-- **争议仲裁席（L3，按需出场，不常驻）**：仅当 ①同一 finding 两轮 open/维持拉锯、②P0/P1 定性分歧、③对抗反驳终裁 三者之一发生时，lead 加派 codex / `codex/gpt-5.6-sol`（骨折），默认 effort=max，仲裁结论本身被推翻重来才升 ultra；骨折路由报 `BUDGET_MODEL_REQUIRES_API_MODE` → 降标准 `gpt-5.6-sol` 同 effort，标注不静默。**纪律**：仲裁席只产证据与分析内部报告供 origin reviewer 与 lead 参考，finding 仍由 origin reviewer close，报告不进共识判据、不改共识四 conjunct。
+- **争议仲裁席（L3，按需出场，不常驻）**：仅当 ①同一 finding 两轮 open/维持拉锯、②P0/P1 定性分歧、③对抗反驳终裁 三者之一发生时，lead 加派 codex / `codex/gpt-5.6-sol`（骨折），默认 effort=max，仲裁结论本身被推翻重来才升 ultra；骨折路由报 `BUDGET_MODEL_REQUIRES_API_MODE` → 降裸 `gpt-5.6-sol` 同 effort（**Cindy AI 通路**，不是官方订阅），标注不静默。**纪律**：仲裁席只产证据与分析内部报告供 origin reviewer 与 lead 参考，finding 仍由 origin reviewer close，报告不进共识判据、不改共识四 conjunct。
 
 三席各产两份输出：人读 markdown + **机器 JSON**（`schemas/review-verdict.schema.json` **v2**）。
 **v2 必填 `anchor_paths`**：每条 finding 除人读 `anchor` 外，必须给 `anchor_paths: string[]`——

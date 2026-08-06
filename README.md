@@ -101,7 +101,7 @@ bash fixtures/run-all.sh   # 判据是 0 failed（刻意不写死条数——写
 
 ## 模型点名（owner 第 0 优先，压过 routing 表）
 
-三审（唯一权威 = `skills/submit-pr/SKILL.md` Phase 2 席位表，本行仅摘要）: sonnet-5/xhigh + 骨折 `codex/gpt-5.6-terra`/xhigh（核心路径升 ultra，降级链 gpt-5.5）+ sonnet-5/xhigh（上游预演）；
+三审（唯一权威 = `skills/submit-pr/SKILL.md` Phase 2 席位表，本行仅摘要）: sonnet-5/xhigh + 骨折 `codex/gpt-5.6-terra`/xhigh（核心路径升 ultra；降级链走 Cindy AI 通路裸 `gpt-5.5`，禁用 `chatgpt/` 官方订阅）+ sonnet-5/xhigh（上游预演）；
 争议仲裁（按需）: 骨折 `codex/gpt-5.6-sol`/max（极端 ultra）；修复+push: 见 `skills/submit-pr/SKILL.md` Phase 2c **修复席表**（该表指向 orca-fanout routing.json 的 execute 档，本行不复述值）；
 mini 盯梢修复: glm-5.2/max（send_to_session 克隆班车四元组）；卡片: deepseek-v4-pro/max（唯一允许降级 xhigh，留审计）；
 周会: glm-5.2/max。
