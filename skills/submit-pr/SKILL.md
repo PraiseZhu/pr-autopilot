@@ -16,7 +16,7 @@ Phase 1  预检 + typecheck-merged + 版本 bump（确定性脚本，继承 v1�
 Phase 1.5 预扫自清洗（haiku diff-scanner 只报可疑点 → lead 核实修机械类 → 有改动则重跑 Phase 1）
 Phase 2  三审（push 之前，SHA 绑定 + 盲审；R1 走加固清单穷举）
 Phase 2b 共识 → SC 提炼（自动，无需 owner 授权）
-Phase 2c glm-5.2/max worker 修复（按类套形状，goal --until-sc）→ delta 复核 → 收敛即收口
+Phase 2c 修复 worker（模型见 Phase 2c 修复席表；按类套形状，goal --until-sc）→ delta 复核 → 收敛即收口
 Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini 注册盯梢（回执四要素）
 ```
 
@@ -309,6 +309,17 @@ node scripts/fix-plan.mjs --artifact consensus.json --manifest sc-manifest.json 
   后照常派工。它**不改分组、不进 degraded、不阻断**——把它当阻断绕，或当不存在跳过，
   都是错读：前者回到 D2 之前的死锁，后者让「由人看一眼」变成没人看（机器降级为记录的
   前提正是有人读记录）。notes 参与 `fix_plan_hash`：正常链路下删改会被重算检出（T1）。
+
+**修复席表（owner 2026-08-06 定案；派工前强制现读本表，同 Phase 2 席位表纪律）**：
+
+| 席 | 模型/档位 | 边界 |
+|---|---|---|
+| 修复 worker（Phase 2c 全部并行组 + Phase 2c/3 由 lead 指定其一执行 push） | **取 `orca-fanout/routing.json` 的 `execute` 档三元组**（agent 必须是 `claude-code`——`goal --until-sc` 在 `~/.claude/skills`，换 agent 家族就没有这个 skill） | 只在自己的 worktree 内改动；写入边界见 `write_paths`；不得代关 finding、不得改共识/SC 产物 |
+
+- **本表刻意不写具体模型值**——`routing.json` 是唯一真相源，`node -e` 或 Read 现读即得。复述模型值已出过事故：commit `c57ea43` 专门清掉 `plan.md` 的具体模型值，就是因为「文档复述 + 席位表改了不同步 → 照旧值填错模型」（2026-08-05 两个会话都派了已被移除的模型）。
+- **与 Orca 路由表的优先关系（显式写明，防下一个会话判错）**：`~/.claude/rules/agent-dispatch.md` 的权威顺序是「skill 内明确编排 > 任务类型首选规则」。本表**不覆盖** `execute` 档的值，而是**指向**它——所以两者天然不冲突，无需裁决。若将来 owner 要让修复席脱离 `execute` 档，必须在本表写明并说明理由，不得靠某处复述的旧值默认生效。
+- 换值的唯一合法路径是 `model-route set 执行 <模型> [effort]`（脚本校验模型存在性/可路由性/枚举，写入前自动备份）；**禁止手改 `routing.json`**。
+- 与 mini 盯梢链的修复会话**是两回事**：那条走引擎 schedule 的四元组继承（见 `deploy/README.md`），本表不管它，改本表不改它。
 
 **修复方设计约束（写代码之前，按类套形状——反补丁螺旋的主闸）**：
 派工包必须带上 `references/hardening-checklist.md`，并要求 worker：**动手前先判本 SC 触碰的

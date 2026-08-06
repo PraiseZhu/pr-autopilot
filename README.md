@@ -31,7 +31,7 @@ pr-autopilot 把这四件事全部接走。你只保留两个动作：**说一�
  │            ② 骨折 terra/xhigh 盲审: 安全/边界/规范（核心路径 PR 升 ultra）
  │            ③ sonnet-5/xhigh 只读预演上游 review-pr 的口径（提前踩雷）
  │            共识不由任何 AI 宣布——由脚本判四个硬条件（consensus-gate）
- ├─ Phase 2b/2c  共识确认的问题 → 提炼成可验证 SC → glm-5.2/max 修到每条有证据
+ ├─ Phase 2b/2c  共识确认的问题 → 提炼成可验证 SC → 修复 worker 修到每条有证据
  ├─ Phase 3  push-guard 守卫放行才 push（SHA 钉死/禁 force/禁碰 CI/hash 链三方绑定）
  │            → gh pr create → ssh 到 mini 把这个 PR 登记进盯梢名单（回执四要素）
  │
@@ -102,7 +102,7 @@ bash fixtures/run-all.sh   # 判据是 0 failed（刻意不写死条数——写
 ## 模型点名（owner 第 0 优先，压过 routing 表）
 
 三审（唯一权威 = `skills/submit-pr/SKILL.md` Phase 2 席位表，本行仅摘要）: sonnet-5/xhigh + 骨折 `codex/gpt-5.6-terra`/xhigh（核心路径升 ultra，降级链 gpt-5.5）+ sonnet-5/xhigh（上游预演）；
-争议仲裁（按需）: 骨折 `codex/gpt-5.6-sol`/max（极端 ultra）；修复+push: glm-5.2/max（goal --until-sc）；
+争议仲裁（按需）: 骨折 `codex/gpt-5.6-sol`/max（极端 ultra）；修复+push: 见 `skills/submit-pr/SKILL.md` Phase 2c **修复席表**（该表指向 orca-fanout routing.json 的 execute 档，本行不复述值）；
 mini 盯梢修复: glm-5.2/max（send_to_session 克隆班车四元组）；卡片: deepseek-v4-pro/max（唯一允许降级 xhigh，留审计）；
 周会: glm-5.2/max。
 
