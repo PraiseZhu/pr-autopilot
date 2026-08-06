@@ -47,11 +47,14 @@
 // 配置源与失败语义（与 size-gate.mjs 同一模式，勿各自发明）：
 //   - 从 **merge-base 树** `git show <merge-base>:agent-use/docs/pr-rules.json` 读，绝不读候选
 //     工作树——否则被测 PR 自带一份宽配置就能绕闸（size-gate 审 B2-F1 已实测复现过该绕法）。
-//   - 文件缺失，或三个键（featureSections/bugfixSections/titleTypes）全缺 → **SKIP**（exit 0）
-//     并显式打印原因。这里刻意**不**回退到硬编码段落名：本仓服务多个目标仓，硬编码某一仓的
-//     段落名会在其他仓产生假 FAIL（比误放行更糟——它会让人学会忽略这道门）。SKIP 是如实声明
-//     「本仓未声明格式契约，本门无判据」，不是"检查过了没问题"。
+//   - **真·缺文件**（ref 可解析、ls-tree 确认该路径不存在），或三个键
+//     （featureSections/bugfixSections/titleTypes）全缺 → **SKIP**（exit 0）并显式打印原因。
+//     这里刻意**不**回退到硬编码段落名：本仓服务多个目标仓，硬编码某一仓的段落名会在其他仓
+//     产生假 FAIL（比误放行更糟——它会让人学会忽略这道门）。SKIP 是如实声明「本仓未声明格式
+//     契约，本门无判据」，不是"检查过了没问题"。
 //   - 键存在但 malformed（类型错/空数组/JSON 坏）→ **fail-closed 抛错**（exit 3），不回退默认。
+//   - **任何 git 侧失败**（ref 不可解析 / 非 git 仓 / 路径在但读不出）→ 同样 **fail-closed 抛错**，
+//     绝不与"真·缺文件"合流成 SKIP——否则就是把一个错误伪装成"该仓没声明契约"（假 SKIP）。
 
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -75,13 +78,42 @@ function readStringArray(rules, key, { allowEmpty }) {
   return [...v];
 }
 
-// 返回 {config, source: 'base'|'default'}；malformed 一律 throw（fail-closed）。
+// 返回 {config, source: 'base'|'default'}；malformed 与**任何 git 侧失败**一律 throw（fail-closed）。
+//
+// 「真·缺文件」与「git 失败」必须分开（2026-08-06 裁决席第三条，实测：初版对
+// `git show` 无条件 catch → 坏 ref / 空 ref / 非 git 仓全部静默返回 source=default，
+// 即"本门无判据"。CLI 路径当时被前置的 `git merge-base` 挡住了坏 ref，但导出函数直接
+// 被调用时无保护，且「merge-base 成功但 show 因权限/坏对象失败」这条路径两边都没挡。
+// 后果不是放宽四 conjunct，而是**假 SKIP**：一个本该 fail-closed 的错误被伪装成
+// "该仓没声明格式契约"，与本文件自己声明的「SKIP 不是检查通过」直接矛盾）。
+// 三步判别，每步的失败语义都不同：
+//   ① ref 必须可解析成 tree（rev-parse --verify）——exit 1 = ref 不存在，其他 = 仓库/git 不可用；
+//   ② ls-tree 列该路径——exit 0 且**输出为空** = 真·缺文件（唯一允许 SKIP 的情形）；非 0 = 错误；
+//   ③ 到这步路径已确认存在，`git show` 再失败就是真错误，不得回退默认。
 export function loadFormatConfig(repoDir, ref) {
+  const git = (args) => execFileSync('git', ['-C', repoDir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    git(['rev-parse', '--verify', '--quiet', `${ref}^{tree}`]);
+  } catch (e) {
+    const code = e?.status;
+    throw new Error(code === 1
+      ? `pr-format-gate: ref「${ref}」无法解析成 tree（base 传错了？fail-closed，不当作"无配置"）`
+      : `pr-format-gate: git 不可用或「${repoDir}」不是 git 仓库（fail-closed，不当作"无配置"）: ${String(e?.stderr ?? e.message).trim().slice(0, 200)}`);
+  }
+  let listed;
+  try {
+    listed = git(['ls-tree', '--name-only', ref, '--', CONFIG_PATH]);
+  } catch (e) {
+    throw new Error(`pr-format-gate: 无法列出 ${ref}:${CONFIG_PATH}（fail-closed，不当作"无配置"）: ${String(e?.stderr ?? e.message).trim().slice(0, 200)}`);
+  }
+  if (!listed.trim()) {
+    return { config: { ...EMPTY_FORMAT_CONFIG }, source: 'default' }; // 真·缺文件 → 无判据
+  }
   let text;
   try {
-    text = execFileSync('git', ['-C', repoDir, 'show', `${ref}:${CONFIG_PATH}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-  } catch {
-    return { config: { ...EMPTY_FORMAT_CONFIG }, source: 'default' }; // base 树无此文件 → 无判据
+    text = git(['show', `${ref}:${CONFIG_PATH}`]);
+  } catch (e) {
+    throw new Error(`pr-format-gate: ${CONFIG_PATH} 在 ${ref} 里存在却读不出（fail-closed）: ${String(e?.stderr ?? e.message).trim().slice(0, 200)}`);
   }
   let rules;
   try { rules = JSON.parse(text); } catch (e) {

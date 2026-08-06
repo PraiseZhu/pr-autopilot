@@ -5442,6 +5442,36 @@ t('[D2-FG] malformed 配置 fail-closed 抛错，绝不回退默认（同 size-g
   rmSync(d, { recursive: true, force: true }); rmSync(d2, { recursive: true, force: true });
 });
 
+t('[D2-FG-FC] 「真·缺文件」与「git 失败」必须分开: 前者 SKIP，后者 fail-closed 抛错（防假 SKIP）', () => {
+  const d = mkdtempSync(join(tmpdir(), 'fgfc-'));
+  const g = (...a) => execFileSync('git', ['-C', d, ...a], { encoding: 'utf8' }).trim();
+  g('init', '-q', '-b', 'main'); g('config', 'user.email', 'a@b.c'); g('config', 'user.name', 'x');
+  writeFileSync(join(d, 'x.txt'), 'x'); g('add', '.'); g('commit', '-qm', 'r');
+  const head = g('rev-parse', 'HEAD');
+  // 正向（唯一允许 SKIP 的情形）: ref 可解析、ls-tree 确认路径不存在
+  eq(loadFormatConfig(d, head).source, 'default', '真·缺文件才允许 SKIP');
+  eq(loadFormatConfig(d, 'main').source, 'default', '分支名同样可解析');
+  // 反向: 坏 ref / 空 ref / 非 git 仓 —— 初版这三种全部静默返回 source=default（假 SKIP）
+  const expectThrow = (dir, ref, re, label) => {
+    let msg = null;
+    try { loadFormatConfig(dir, ref); } catch (e) { msg = e.message; }
+    ok(msg !== null, `${label} 必须抛错，不得静默 SKIP（初版正是静默）`);
+    ok(re.test(msg), `${label} 的错误文案应命中 ${re}，得到: ${msg}`);
+  };
+  expectThrow(d, 'definitely-no-such-ref', /无法解析成 tree/, '坏 ref');
+  expectThrow(d, '', /无法解析成 tree|不是 git 仓库/, '空 ref');
+  const notRepo = mkdtempSync(join(tmpdir(), 'fgnr-'));
+  expectThrow(notRepo, 'main', /不是 git 仓库|git 不可用/, '非 git 仓');
+  // 对照: 路径存在时照常读出（三步判别没有把正常路径拦掉）
+  mkdirSync(join(d, 'agent-use', 'docs'), { recursive: true });
+  writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), JSON.stringify({ titleTypes: ['feat'] }));
+  g('add', '.'); g('commit', '-qm', 'cfg');
+  const r2 = loadFormatConfig(d, g('rev-parse', 'HEAD'));
+  eq(r2.source, 'base');
+  eq(r2.config.titleTypes, ['feat']);
+  rmSync(d, { recursive: true, force: true }); rmSync(notRepo, { recursive: true, force: true });
+});
+
 t('[D2-FG] 配置从 merge-base 树读: 候选侧自带宽配置绕不过闸（复刻 size-gate 审 B2-F1 防线）', () => {
   const d = mkdtempSync(join(tmpdir(), 'fgb-'));
   const g = (...a) => execFileSync('git', ['-C', d, ...a], { encoding: 'utf8' }).trim();
