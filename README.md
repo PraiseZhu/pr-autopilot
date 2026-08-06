@@ -3,7 +3,7 @@
 **把「提一个 PR」之后的所有等待、盯梢、返工，从人的日程表里拿掉。**
 
 > 权威计划: `docs/plan.md`（九轮对抗审查定稿）；实现经 12 轮 gpt-5.6-sol/xhigh 对抗复审 APPROVED，
-> 5 路并行 e2e 全绿，fixtures 202/202。运行时台账数据**不入本仓**（台本与数据分离）。
+> 5 路并行 e2e 全绿，fixtures 203/203。运行时台账数据**不入本仓**（台本与数据分离）。
 
 ---
 
@@ -88,7 +88,7 @@ scripts/
   evolution/                     自进化: 台账 append(hash 链)/聚类达阈/secret-lint/周会/宪法路径表
   health/                        独立健康告警（launchd + lease-check + 飞书→slack 降级链）
 skills/submit-pr/                「提交 PR」skill v2（三审收口版）+ references
-fixtures/                        202 条回归 fixture（run-all.sh 一键跑；末尾附诚实 SKIPPED 清单）
+fixtures/                        203 条回归 fixture（run-all.sh 一键跑；末尾附诚实 SKIPPED 清单）
 deploy/README.md                 mini 部署手册（含 P0-⑦ 班车握手定案）
 deploy/wrappers/                 真机适配: gh-snapshot / cindy-dispatch / queue-transport / probe
 ```
@@ -96,7 +96,7 @@ deploy/wrappers/                 真机适配: gh-snapshot / cindy-dispatch / qu
 ## 快速验证
 
 ```bash
-bash fixtures/run-all.sh   # 202 passed 才算数；SKIPPED 清单如实列出仓内验不了的真机项
+bash fixtures/run-all.sh   # 203 passed 才算数；SKIPPED 清单如实列出仓内验不了的真机项
 ```
 
 ## 模型点名（owner 第 0 优先，压过 routing 表）

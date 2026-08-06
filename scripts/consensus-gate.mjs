@@ -14,7 +14,7 @@
 //   ③ 三 verdict 均 APPROVED
 //   ④ 全部 gate_checks ∈ {pass, n_a}（脚本断言，不信模型总 verdict）
 import { hashObject, sha256, canonicalJson, readJson, writeJsonAtomic, parseArgs, fail, nowIso, isMain} from './lib/common.mjs';
-import { validateVerdict, changedPathSet } from './verdict-validate.mjs';
+import { validateVerdict, changedPathSet, trackedPathSet } from './verdict-validate.mjs';
 import { computeReviewInputHash } from './review-input-hash.mjs';
 
 const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
@@ -61,10 +61,21 @@ export function runConsensusGate(verdicts, opts = {}) {
   // 否则 tracked-but-unchanged 的 hub 路径能穿过 live 路径污染冲突图。
   // repoDir 在场时脚本自算实改集；调用方也可直接注入 changedPaths（fixture 用）。
   let changedPaths = opts.changedPaths ?? null;
+  // D3 接线修复（2026-08-06）: tracked 集此前**只在 verdict-validate 的 CLI** 里被构造，
+  // `runConsensusGate` 从不传——即 live 共识路径没有 tracked 门。`anchor_paths` 侥幸无恙
+  // （实改集检查天然吞掉 tracked：实改文件必在 base∪candidate 的 tracked 集内），但 D3 新增的
+  // `out_of_scope_notes[].ref_paths` **只有** tracked 这一道检查，于是在 live 路径上一道都没有。
+  // fixture 靠注入 trackedPaths 断言通过 = 单元层锁住了、接线层没接上（本仓台账里的既有教训形态）。
+  // 现与 changedPaths 对称构造，同样 fail-closed。
+  let trackedPaths = opts.trackedPaths ?? null;
   const failReasons = [];
   if (!changedPaths && opts.repoDir && bundle) {
     try { changedPaths = changedPathSet({ repoDir: opts.repoDir, baseSha: bundle.base_sha, candidateSha: bundle.candidate_sha }); }
     catch (e) { failReasons.push(`无法计算 base..candidate 实改集（fail-closed）: ${e.message}`); }
+  }
+  if (!trackedPaths && opts.repoDir && bundle) {
+    try { trackedPaths = trackedPathSet({ repoDir: opts.repoDir, baseSha: bundle.base_sha, candidateSha: bundle.candidate_sha }); }
+    catch (e) { failReasons.push(`无法计算 base∪candidate 的 tracked 集（fail-closed）: ${e.message}`); }
   }
   // R5-P1: 函数契约本身 fail-closed——changedPaths 与 repoDir 双缺 = 调用方漏传（T1 要拦的
   // 正是这种疏忽），不允许产出 pass artifact。不设旁路 flag。
@@ -76,7 +87,7 @@ export function runConsensusGate(verdicts, opts = {}) {
   if (verdicts.length !== 3) failReasons.push(`需要恰好 3 份 verdict，得到 ${verdicts.length}`);
 
   for (const v of verdicts) {
-    const errs = validateVerdict(v, { bundle, changedPaths, requirements: opts.requirements });
+    const errs = validateVerdict(v, { bundle, changedPaths, trackedPaths, requirements: opts.requirements });
     if (errs.length) failReasons.push(`verdict(${v?.reviewer ?? '?'}) schema/跨字段校验失败 → degraded: ${errs[0]}`);
     else if (v.run_status !== 'ok') failReasons.push(`verdict(${v.reviewer}) run_status=degraded ≠ APPROVED（⑦ fail-closed）`);
   }

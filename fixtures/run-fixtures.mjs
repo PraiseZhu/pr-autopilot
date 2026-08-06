@@ -5582,6 +5582,53 @@ t('[D3-OOS] 共识不受影响: 三席带 notes 仍 PASS，且 note 不进 canon
   eq(bad.artifact.gate_result, 'fail', 'conjunct③④ 未被 notes 削弱');
 });
 
+t('[D3-OOS-WIRE] 接线层: runConsensusGate 只给 repoDir（不注入任何集合）时必须自算 tracked 集并校验 ref_paths', () => {
+  // 为什么单独一条: 上面的 [D3-OOS] 用例都**注入** trackedPaths/changedPaths，锁的是 validator 的
+  // 判定逻辑；而 live 路径（consensus-gate CLI）只给 repoDir。初版 runConsensusGate 只构造
+  // changedPaths、从不构造 trackedPaths —— anchor_paths 侥幸被实改集检查吞掉，但 ref_paths 的
+  // tracked 检查在 live 路径上一道都没有。「单元层锁住了、接线层没接上」，本条专测接线层。
+  const d = mkdtempSync(join(tmpdir(), 'oosw-'));
+  const g = (...a) => execFileSync('git', ['-C', d, ...a], { encoding: 'utf8' }).trim();
+  g('init', '-q', '-b', 'main'); g('config', 'user.email', 'a@b.c'); g('config', 'user.name', 'x');
+  mkdirSync(join(d, 'src'), { recursive: true });
+  writeFileSync(join(d, 'src/legacy.ts'), 'legacy\n');      // tracked 但本 PR 未改
+  writeFileSync(join(d, 'src/changed.ts'), 'v1\n');
+  g('add', '.'); g('commit', '-qm', 'base');
+  const baseSha = g('rev-parse', 'HEAD');
+  writeFileSync(join(d, 'src/changed.ts'), 'v2\n');         // 实改
+  g('add', '.'); g('commit', '-qm', 'cand');
+  const candSha = g('rev-parse', 'HEAD');
+
+  const b = mkBundle(baseSha, candSha);
+  const mk = (refPaths) => ({
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: ['src/changed.ts'], evidence: 'e', status: 'closed' }],
+    closed_finding_ids: ['F1'],
+    out_of_scope_notes: [{ id: 'N1', note: 'n', evidence: 'e', suggested_issue_title: 't', ...(refPaths ? { ref_paths: refPaths } : {}) }]
+  });
+  const run = (refPaths) => {
+    const o = mk(refPaths);
+    const vs = [mkVerdictFor('claude-adversarial', b, o), mkVerdictFor('codex-adversarial', b, o),
+      mkVerdictFor('upstream-preview', b, { ...o, gate_checks: THIRD_GATES })];
+    return runConsensusGate(vs, { bundle: b, repoDir: d }); // 只给 repoDir——live 路径的形态
+  };
+  // 正向: tracked-but-unchanged 的 ref_paths 必须放行（这是 D3 通道存在的理由，不得被误伤）
+  eq(run(['src/legacy.ts']).gate_result, 'pass', 'diff 外的 tracked 路径必须放行: ' + JSON.stringify(run(['src/legacy.ts']).fail_reasons));
+  eq(run(undefined).gate_result, 'pass', 'ref_paths 省略仍放行');
+  // 反向（初版在 live 路径上放行了这条）: 编造一个不存在的路径 → 必须被 tracked 门拦下
+  const bogus = run(['src/does-not-exist.ts']);
+  eq(bogus.gate_result, 'fail', '不存在的 ref_paths 必须被 live 路径拦下（初版这里 fail-open）');
+  ok(bogus.fail_reasons.some((r) => /tracked/.test(r)), `失败原因应点名 tracked: ${JSON.stringify(bogus.fail_reasons)}`);
+  // 对照: anchor_paths 的实改集门在同一条 live 路径上仍然生效（未被本次接线改动影响）
+  const o2 = mk(['src/legacy.ts']);
+  o2.findings[0].anchor_paths = ['src/legacy.ts']; // tracked 但未改
+  const vs2 = [mkVerdictFor('claude-adversarial', b, o2), mkVerdictFor('codex-adversarial', b, o2),
+    mkVerdictFor('upstream-preview', b, { ...o2, gate_checks: THIRD_GATES })];
+  const r2 = runConsensusGate(vs2, { bundle: b, repoDir: d });
+  eq(r2.gate_result, 'fail');
+  ok(r2.fail_reasons.some((x) => /实改文件集/.test(x)), 'SC-R3-5 在 live 路径上仍生效');
+  rmSync(d, { recursive: true, force: true });
+});
+
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
 console.log(`\n========== fixtures: ${pass} passed, ${failCount} failed ==========`);
