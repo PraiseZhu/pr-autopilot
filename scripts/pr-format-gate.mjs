@@ -44,9 +44,11 @@
 //   注释声称"对齐"而无任何东西验证对齐，正是假覆盖。现改为：正则从单一函数派生 + fixture 锁死
 //   三个分叉用例 + 一条条件式跨仓对齐探针（review-pr 在场时逐条比对两侧裁决，缺席则如实记 skip）。
 //
-// 配置源与失败语义（与 size-gate.mjs 同一模式，勿各自发明）：
-//   - 从 **merge-base 树** `git show <merge-base>:agent-use/docs/pr-rules.json` 读，绝不读候选
-//     工作树——否则被测 PR 自带一份宽配置就能绕闸（size-gate 审 B2-F1 已实测复现过该绕法）。
+// 配置源与失败语义：
+//   - **双读取严格交集**（D2-B，2026-08-06）：merge-base 树 + 候选树（HEAD）各读一份、各判一次，
+//     任一侧 FAIL 即 FAIL。只读 base 会在「PR 自身收紧规则」时与 review-pr（读候选树）裁决相反，
+//     复活 D2 死锁；只读候选会回到 B2-F1 的「自带宽配置绕闸」。交集把两个方向都堵上。
+//     两侧都只读 **commit 树**（git show <ref>:path），绝不读工作树。
 //   - **真·缺文件**（ref 可解析、ls-tree 确认该路径不存在），或三个键
 //     （featureSections/bugfixSections/titleTypes）全缺 → **SKIP**（exit 0）并显式打印原因。
 //     这里刻意**不**回退到硬编码段落名：本仓服务多个目标仓，硬编码某一仓的段落名会在其他仓
@@ -235,14 +237,39 @@ if (isMain(import.meta.url)) {
   if (!baseRef || !bodyFile || title === undefined) {
     fail('用法: pr-format-gate.mjs --repo-dir <dir> --base <ref>（如 origin/main）--title <PR 标题>|--title-file <文件> --body-file <PR 正文文件>');
   }
+  // D2-B（2026-08-06，裁决席终稿第 2 条）: **双读取严格交集**——merge-base 树与候选树（HEAD）
+  // 各读一份配置、各判一次，两侧都不 FAIL 才放行。
+  //   只读 base（初版）: 防「候选自带宽配置绕闸」（审 B2-F1 的方向），但 PR 自身**收紧**规则时
+  //     本门按旧规则 PASS，而 review-pr 的 loadRulesWithSource() 读的是 checkout 后的**候选树**
+  //     → 按新规则 FAIL → Phase 1 放行、第三席 format-gate fail → D2 死锁原地复活。
+  //   只读候选: 直接回到 B2-F1 的绕闸。
+  //   双读交集: 放宽方向被 base 侧拦（候选加的宽松不生效），收紧方向被 candidate 侧拦
+  //     （新增的要求当场生效）——两个方向都不会产生「本门与 review-pr 裁决相反」。
+  // SKIP 语义: 只有两侧都无判据才 SKIP；任一侧有判据即以有判据侧为准。malformed 任一侧 exit 3。
   let out;
   try {
     const mergeBase = execFileSync('git', ['-C', repoDir, 'merge-base', baseRef, 'HEAD'], { encoding: 'utf8' }).trim();
-    const { config, source } = loadFormatConfig(repoDir, mergeBase);
-    out = { merge_base: mergeBase, config_source: source, config, ...evaluateFormat({ title, body: readFileSync(bodyFile, 'utf8'), config }) };
+    const body = readFileSync(bodyFile, 'utf8');
+    const sides = {};
+    for (const [key, ref] of [['base', mergeBase], ['candidate', 'HEAD']]) {
+      const { config, source } = loadFormatConfig(repoDir, ref);
+      sides[key] = { ref, config_source: source, ...evaluateFormat({ title, body, config }) };
+    }
+    const results = [sides.base.result, sides.candidate.result];
+    const combined = results.includes('FAIL') ? 'FAIL' : results.includes('PASS') ? 'PASS' : 'SKIP';
+    out = {
+      merge_base: mergeBase,
+      result: combined,
+      reasons: [
+        ...sides.base.reasons.map((r) => `[base] ${r}`),
+        ...sides.candidate.reasons.map((r) => `[candidate] ${r}`)
+      ],
+      base: sides.base,
+      candidate: sides.candidate
+    };
   } catch (e) { fail(e.message, 3); }
   if (out.result === 'SKIP') {
-    out.skip_reason = `base 树 ${CONFIG_PATH} 未声明 featureSections/bugfixSections/titleTypes（本门无判据；这不是"检查通过"）`;
+    out.skip_reason = `base 与候选两侧 ${CONFIG_PATH} 均未声明 featureSections/bugfixSections/titleTypes（本门无判据；这不是"检查通过"）`;
   }
   process.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
   process.exit(out.result === 'FAIL' ? 1 : 0);

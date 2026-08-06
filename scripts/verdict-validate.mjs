@@ -313,13 +313,22 @@ export function validateVerdict(v, opts = {}) {
 
 if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
-  if (!args.verdict) fail('用法: verdict-validate.mjs --verdict <verdict.json> [--bundle <bundle.json>]');
-  // SC-11 + SC-R3-5: 传 --repo-dir 时启用 tracked + changed-set 双校验
+  // T1（2026-08-06）: --repo-dir 从可选改**必填**。此前不传时 tracked/changed 双校验整段被
+  // 静默跳过，一份 anchor_paths 非法的 verdict 能拿到 `exit=0 ok`——审查席按此自检得绿、
+  // 到 consensus-gate 才被拒，白跑一次往返（2026-08-03 事故家族的机制本体：自检工具的口径
+  // 覆盖不到收卷时的门）。与 consensus-gate CLI 的 R4-P1 同一收紧方向：自检口径必须与
+  // 收卷口径一致，「省参数」不能成为「少校验」的静默开关。
+  if (!args.verdict || !args['repo-dir']) {
+    fail('用法: verdict-validate.mjs --verdict <verdict.json> --repo-dir <dir> [--bundle <bundle.json>]\n（--repo-dir 必填——T1: 不带实改集校验的自检是不完整口径，会产出「自检绿、共识拒」的假信号）');
+  }
   const v0 = readJson(args.verdict);
   let trackedPaths = null, changedPaths = null;
-  if (args['repo-dir']) {
+  try {
     trackedPaths = trackedPathSet({ repoDir: args['repo-dir'], baseSha: v0.base_sha, candidateSha: v0.candidate_sha });
     changedPaths = changedPathSet({ repoDir: args['repo-dir'], baseSha: v0.base_sha, candidateSha: v0.candidate_sha });
+  } catch (e) {
+    // ref 不可得 / 非 git 仓 → fail-closed：算不出实改集就不敢说「anchor 合法」
+    fail(`无法计算 base..candidate 实改集/tracked 集（fail-closed，不降级为跳过校验）: ${String(e.message).slice(0, 200)}`);
   }
   const errs = validateVerdict(v0, {
     trackedPaths, changedPaths, bundle: args.bundle ? readJson(args.bundle) : null });

@@ -72,9 +72,11 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    - `PASS` → 继续。`FAIL`（exit 1）→ **Phase 1 FAIL**：按输出的 `missing_sections` / 标题原因
      改正文或标题，重跑至 PASS。`SKIP`（exit 0）→ 目标仓 merge-base 树未声明格式契约，本门
      **无判据**；台账如实记 `format-gate: skipped(无配置)`，**不得**记成"格式检查通过"。
-   - 配置源与失败语义同第 5 步（merge-base 树读 `agent-use/docs/pr-rules.json`；缺失 → SKIP；
-     存在但 malformed → fail-closed exit 3）。口径刻意对齐 review-pr 的 `context.mjs`
-     （第三席的职责就是预演 review-pr 的裁决，口径一致才是正确性判据）。
+   - 配置源 = **双读取严格交集**（D2-B，2026-08-06）：merge-base 树 + 候选树（HEAD）各读一份
+     `agent-use/docs/pr-rules.json`、各判一次，任一侧 FAIL 即 FAIL——只读 base 会在「PR 自身
+     收紧规则」时与 review-pr（读候选 checkout）裁决相反，复活 D2 死锁；只读候选回到 B2-F1
+     绕闸。两侧均无判据才 SKIP；任一侧 malformed → fail-closed exit 3。口径刻意对齐 review-pr
+     的 `context.mjs`（第三席的职责就是预演 review-pr 的裁决，口径一致才是正确性判据）。
    > **为什么这道门在 Phase 1，不在审查席**（D2 死锁修复，2026-08-06 实测代价一整轮三席）：
    > 「正文缺一个必填段落」此前只能由第三席判 `format-gate=fail` → conjunct④ 要求全部
    > gate_checks ∈ {pass,n_a} → 共识永不 PASS → **不写 artifact**（实测：fail 时 CLI 根本不
