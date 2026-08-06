@@ -19,7 +19,7 @@
 | **F2** | **goal skill 与本场景硬冲突**：场景 B 轮次=SC×3 上限 30 "到顶即停"；且全程遵守 autonomous-execution 硬停清单，**"对外发消息"硬停会挡 PR 回帖** | **实锤**（goal/SKILL.md Step 4 原文） | 改 goal skill（owner 自有）：新增 `--until-sc` 模式（无轮次/时长上限，仅 hard_stop 与预算告警可停）+ 本场景投递指令携带 owner 常设授权声明（PR 分支 push 与 PR 内回帖为已授权动作，不触发外发硬停）；$30/天语义维持 owner 原话"暂停等确认后继续"，与"修到 SC"不矛盾——是暂停不是放弃，文档加显式优先级说明 |
 | **F3** | 原生 notifier 无条件追加 `agentKind · 模型名 · cwd` 元信息行，"零代码标识符"每张卡必失败 | 成立（我早前读 `notifier.ts:138-147` 时已见该段） | 发送通道改层级：**首选**卡片 agent 会话直接调 `cindy_feishu_bot` MCP 自发（P0 验证调度会话是否报 NO_CHAT_CONTEXT）→ 不通则向 Cindy 上游提 PR 加 `contentOnly` 通知模式 → 都不通才回退原生 notifier 并**如实告知 owner 卡尾会有一行技术元信息**（不静默违约） |
 | **F4** | v5 写"保留合并后清理逻辑"，未显式删除 submit-pr 的 `--merge`/Phase 4a 合并确认/Phase 4c `gh pr merge` | 成立（我早前读 SKILL.md 结构时确认 Phase 4c 存在） | SP-1 改为**逐项枚举删除**：`--merge` 参数、Phase 4a 合并状态机、Phase 4c 全部 merge/ready 路径；只保留"观察到远端已 merged 后"的只读判定 + 本地清理，清理函数自身无 merge 能力 |
-| **F5** | 双审共识未绑定到最终 push 的不可变工件（审的是 `main..HEAD`，lead 未 commit 的工作区改动逃逸复审；批准的 A 与 push 的 B 可能不同） | 成立（机制推理无可辩驳） | **SHA 绑定协议**：每轮=修改→验证→本地 commit→工作区 clean→记 candidate SHA→两 reviewer 独立审同一 `merge-base...SHA`；两份 APPROVED 必须携带同一 SHA；共识判定=**确定性脚本比对两份 verdict+SHA**（不由 lead 宣布）；GLM worker 收自包含 manifest（repo/remote/base/branch/**expected SHA**/标题正文/PR 号/注册 key），仅 `HEAD==expectedSHA && clean` 时普通 push，漂移即停 |
+| **F5** | 双审共识未绑定到最终 push 的不可变工件（审的是 `main..HEAD`，lead 未 commit 的工作区改动逃逸复审；批准的 A 与 push 的 B 可能不同） | 成立（机制推理无可辩驳） | **SHA 绑定协议**：每轮=修改→验证→本地 commit→工作区 clean→记 candidate SHA→两 reviewer 独立审同一 `merge-base...SHA`；两份 APPROVED 必须携带同一 SHA；共识判定=**确定性脚本比对两份 verdict+SHA**（不由 lead 宣布）；修复 worker 收自包含 manifest（repo/remote/base/branch/**expected SHA**/标题正文/PR 号/注册 key），仅 `HEAD==expectedSHA && clean` 时普通 push，漂移即停 |
 | **F6** | 注册成功 ≠ 引擎活着：写入 watchlist 但 schedule 不存在/paused/Cindy 没起，PR 永远无人盯，且是**假成功** | 成立 | 注册回执四要素：持久化成功 + 引擎 schedule active + 引擎 last-success lease 未过期 + 本 PR 首扫 ack；任一缺失=注册失败显式报 owner。另加**独立于 Cindy 调度器**的健康告警：mini launchd 每日脚本查 lease，超时经 bug-doctor 现成 notify.mjs Slack 通道告警（复用既有基础设施，零新依赖） |
 | **F7** | 飞书回复不会天然路由回卡片会话（notifier 只发文本不带 session 绑定；入站走显式 binding 否则进默认 IM 会话），而"退直链"违反 owner 硬需求 | 成立（reviewer 引 `turnRunner.ts:452-502`，与 F3 通道改造联动） | **续聊分拣升为 P1 阻断出口**（不可降级上线）：验证"卡片会话 = owner 飞书默认会话绑定"或发卡时原子建立 binding，真实回复实测 sessionId/上下文/条目映射一致；不通过则 P1 不通过 |
 | I1 | watchlist 单 JSON 的 flock 协议在 mini 上不成立（**mini 无 flock 命令**，且锁跟 inode 走、rename 后失效） | 成立（reviewer 实测 command -v flock 为空） | 改**每 PR 一个状态文件**（`pr-watch/state/<owner>__<repo>__<N>.json`），key 天然隔离，无共享锁；P2 fixture：并发 100 次注册/销单不丢 key |
@@ -39,10 +39,10 @@
 | 项 | 定案 |
 |---|---|
 | **触发架构** | submit-pr 收尾时把 PR **注册**进 mini 的盯梢清单；盯梢生命周期 = PR 生命周期（合并/关闭即销单）；**没有在飞 PR 时零 GitHub 请求、零 LLM、零 token（本地目录心跳仍在，见 §0.3-I6）**。物理边界如实声明：GitHub 无法推送到内网 mini、cindy 上游无权配 webhook，"发现新反馈"仍需向 GitHub 提问——但从"常开全局轮询"变为"**仅对在飞 PR 的定点盯梢**"（**每 15 分钟一查，owner 定案**；gh + ETag 条件请求，零 token） |
-| **submit-pr 重构** | ① **删除 10 维度自审**（被三层取代：对抗双审 / 云端 CI 审查 / 盯梢修复）；② push **之前**做 **Orca worker 三审**：Claude=`<见 SKILL.md 席位表>` + Codex=`gpt-5.6-sol/xhigh` 并行盲审，**外加 `<见 SKILL.md 席位表>` worker 对当前 PR 按 review-pr skill 口径预演上游审查（严格只读）**；lead 汇总三方 → **共识 = 脚本对三方 finding 做 canonical union（保留 origin），放行门 = 三 verdict 同 input hash ∧ union 每条已被 origin close ∧ 三 verdict 均 APPROVED ∧ 全部 gate_checks∈{pass,n_a}**（≤3 轮，分歧停 owner）；③ **共识后自动进入修复，无需 owner 授权**（owner 2026-07-31 定案）：对共识确认的**全部修改项逐项提炼 SC** → 派 **`z-ai/glm-5.2/max` worker** 用 **goal skill** 修到每条 SC 有证据 → 新 SHA 由**三审** delta 复核（只对账，禁重审；第三席对每个新 candidate 做只读 gate replay 并出新 verdict，**不计对抗轮次**）→ 全清后同一 worker 执行 push + 创建/更新 PR + ssh 注册盯梢 |
+| **submit-pr 重构** | ① **删除 10 维度自审**（被三层取代：对抗双审 / 云端 CI 审查 / 盯梢修复）；② push **之前**做 **Orca worker 三审**：Claude=`<见 SKILL.md 席位表>` + Codex=`gpt-5.6-sol/xhigh` 并行盲审，**外加 `<见 SKILL.md 席位表>` worker 对当前 PR 按 review-pr skill 口径预演上游审查（严格只读）**；lead 汇总三方 → **共识 = 脚本对三方 finding 做 canonical union（保留 origin），放行门 = 三 verdict 同 input hash ∧ union 每条已被 origin close ∧ 三 verdict 均 APPROVED ∧ 全部 gate_checks∈{pass,n_a}**（≤3 轮，分歧停 owner）；③ **共识后自动进入修复，无需 owner 授权**（owner 2026-07-31 定案）：对共识确认的**全部修改项逐项提炼 SC** → 派 **修复 worker**（模型 `<见 SKILL.md 修复席表>`）用 **goal skill** 修到每条 SC 有证据 → 新 SHA 由**三审** delta 复核（只对账，禁重审；第三席对每个新 candidate 做只读 gate replay 并出新 verdict，**不计对抗轮次**）→ 全清后同一 worker 执行 push + 创建/更新 PR + ssh 注册盯梢 |
 | **修复会话** | GLM-5.2/**最高**（继承自引擎 schedule 配置——宿主 broker 禁止 per-dispatch 指定，F1 实锤）；隔离=**会话第一步自建 git worktree**（宿主级 worktree 不可用，见 §0.3-F1）；从反馈提炼 **SC 清单**，**goal skill `--until-sc` 模式**（需先改 goal，见 §0.3-F2）驱动修到每条 SC 有证据；不限轮次不限时长 |
 | **每日待办卡片** | 保持每日 10:00 一次的 Cindy 调度，但从"纯脚本"升级为 **agent 模式：`deepseek/deepseek-v4-pro`，effort=max（待验证，不支持则降 xhigh 并告知 owner）**。职责：采集与**排序均由脚本确定性完成**，DeepSeek **仅做逐项人话改写**（source_id 守恒校验，见 §3.1；风格契约见 §3.3）。<br>**卡片 schedule 期望四元组（审④-I3，session meta 验收的 expected value）**：`agentKind=claude-code` + `provider=Cindy AI` + `model=deepseek/deepseek-v4-pro` + `effort=max`；**唯一允许降级** `max→xhigh`（须在 ledger 留审计记录并在首张卡片脚注告知 owner），其余任何字段漂移=验收失败。飞书已连 Cindy：owner 可直接**回复机器人继续分拣**（会话须可续聊，见 §3.4） |
-| **模型点名（第 0 优先，压过 routing 表）** | 三审（owner 2026-07-31 增补第三席）：对抗双审 `<见 SKILL.md 席位表>`，**再加一个上游预演 worker 对当前 PR 执行 review-pr skill 口径的预演审查**；lead 汇总三方反馈出共识；**共识后修复+push：glm-5.2/max（同一 worker，goal skill）**；mini 盯梢修复会话：glm-5.2/最高；卡片：deepseek-v4-pro/max(降级 xhigh) |
+| **模型点名（第 0 优先，压过 routing 表）** | 三审（owner 2026-07-31 增补第三席）：对抗双审 `<见 SKILL.md 席位表>`，**再加一个上游预演 worker 对当前 PR 执行 review-pr skill 口径的预演审查**；lead 汇总三方反馈出共识；**共识后修复+push：`<见 SKILL.md 修复席表>`（同一 worker，goal skill）**；mini 盯梢修复会话：glm-5.2/最高；卡片：deepseek-v4-pro/max(降级 xhigh) |
 
 ---
 
@@ -67,10 +67,10 @@ flowchart TD
         end
 
         DR -->|"共识 finding 清单定稿"| SCX["SC 提炼(逐修改项)<br/>★无需 owner 授权"]
-        SCX --> FIXW["GLM-5.2/max worker · goal --until-sc<br/>修到每条 SC 有证据"]
+        SCX --> FIXW["修复 worker（见 SKILL.md 修复席表）· goal --until-sc<br/>修到每条 SC 有证据"]
         FIXW --> DELTA["三审 delta 复核<br/>对抗席只对账,禁重审<br/>第三席只读 gate replay(不计轮次)"]
         W3 -.->|"每个新 candidate 重放"| DELTA
-        DELTA -->|"全清"| PUSHW["同一 GLM-5.2/max worker<br/>push + 创建/更新 PR + ssh 注册盯梢"]
+        DELTA -->|"全清"| PUSHW["同一修复 worker（见 SKILL.md 修复席表）<br/>push + 创建/更新 PR + ssh 注册盯梢"]
         DR -->|"3 轮仍分歧"| HALT["停,owner 裁决"]
         PUSHW --> DONE["本地收工,报告 PR 链接"]
     end
@@ -99,8 +99,8 @@ flowchart TD
 | SP-1 | **删除**（逐项枚举，§0.3-F4）：Phase 3 十维度审查全部内容、**`--merge` 参数、Phase 4a 合并确认状态机、Phase 4c 全部 `gh pr merge`/`ready` 路径**。**保留**：Phase 1/1.5/1.6（预检/typecheck-merged/版本 bump）、"观察到远端已 merged 后"的只读判定 + 本地清理（清理函数自身无 merge 能力）、评论"（自动生成）"标记约定给 provenance 复用 |
 | SP-2 | 新 Phase 2 **三审**（**SHA 绑定 + 盲审**；owner 2026-07-31 两次修订后定案）：commit 定格 **candidate SHA**（工作区 clean）→ `create_workers` 一次开**三个 worker**：<br>① Claude reviewer `<见 SKILL.md 席位表>`——盲审，lens=正确性/回归/影响面；<br>② Codex reviewer `gpt-5.6-sol/xhigh`——盲审，lens=安全/边界/规范；<br>③ **上游预演 reviewer `<见 SKILL.md 席位表>`——对当前 PR 按 review-pr skill 口径执行审查**（规则文件遵从/安全隐私门/格式门/产品·架构门语义预判），**严格只读**：禁止发 GitHub review/评论/合并/标签等一切对外写动作，只产内部报告（提前消化 push 后才会吃的上游打回；有 draft PR 时可读其上下文，但审的对象是本地 candidate SHA）；<br>三方均输出机器 JSON（⑨，`reviewer` 字段区分三席）；lead 汇总三方、只做**争议仲裁**（finding 由原 reviewer close/维持，lead 不得代关、不改代码）。<br>**共识定义（审⑦修正：不要求三份原始清单相同——lens 不同清单本就不同）**：脚本对三方 finding 做 **canonical union + 去重，逐条保留 `origin_reviewer`**；**放行门 = 三份 verdict 携带同一 `review_input_hash` ∧ union 内每条 finding 已被其 origin reviewer close ∧ 三份 verdict 均 APPROVED ∧ 共识脚本直接断言全部 `gate_checks ∈ {pass, n_a}`（审⑨补齐，四个 conjunct 缺一不可）**。③ 的阻断 finding **同样受 ⑪ 唯一 `primary_face` 约束**（格式→F、规则遵从→F、证据→G、隐私→E、文档→D）；产品/架构**过程门**不属七面，走 schema 内独立 `gate_checks[]` 通道（⑨），不得用无类型 finding 绕过 ⑪；其确定性门类项直接进修改清单不占对抗轮次。**③ 读过的 draft PR 上下文必须先快照为 `pr_context_digest` 并纳入 `review_input_hash`**（否则同 hash ≠ 同完整输入）。≤3 轮未收敛停给 owner，全程入 ledger |
 | SP-2b | **共识 → 修复自动衔接（owner 定案：不需要 owner 授权）**：lead 对共识确认的**每个修改项提炼一条可验证 SC**（改什么/什么该成立/怎么验证），连同 finding 清单 + bundle 打成**修复 manifest** |
-| SP-2c | 派 **glm-5.2/max** worker 持 manifest 修复：**goal skill（--until-sc）** 驱动到每条 SC 有 PASS 证据 → 新 commit 新 SHA → **三审 delta 复核**（两对抗席只对账 findings 修没修 + delta 有无新问题，禁重审未改代码；**第三席对新 candidate 做只读 gate replay 出新 verdict，不计对抗轮次**；最终 hash 绑定**三份**当前 candidate 的 verdict；unresolved 连续 2 轮不减 → 停给 owner） |
-| SP-3 | 新 Phase 3：delta 复核全清后，**同一 glm-5.2/max worker** 收**自包含 push manifest**（repo/remote/base/branch/**expected SHA**/标题正文/已有 PR 号/注册 key）；仅 `HEAD==expectedSHA && clean` 时普通 refspec push（漂移即停）→ `gh pr create/edit` → ssh mini 注册；**注册回执四要素**（§0.3-F6）：状态文件落盘 + 引擎 schedule active + 心跳 lease 未过期 + 本 PR 首扫 ack，任一缺失=注册失败显式报 owner（兜底靠每日补扫，但不静默） |
+| SP-2c | 派 **修复 worker**（模型 `<见 SKILL.md 修复席表>`）持 manifest 修复：**goal skill（--until-sc）** 驱动到每条 SC 有 PASS 证据 → 新 commit 新 SHA → **三审 delta 复核**（两对抗席只对账 findings 修没修 + delta 有无新问题，禁重审未改代码；**第三席对新 candidate 做只读 gate replay 出新 verdict，不计对抗轮次**；最终 hash 绑定**三份**当前 candidate 的 verdict；unresolved 连续 2 轮不减 → 停给 owner） |
+| SP-3 | 新 Phase 3：delta 复核全清后，**同一修复 worker**（模型 `<见 SKILL.md 修复席表>`）收**自包含 push manifest**（repo/remote/base/branch/**expected SHA**/标题正文/已有 PR 号/注册 key）；仅 `HEAD==expectedSHA && clean` 时普通 refspec push（漂移即停）→ `gh pr create/edit` → ssh mini 注册；**注册回执四要素**（§0.3-F6）：状态文件落盘 + 引擎 schedule active + 心跳 lease 未过期 + 本 PR 首扫 ack，任一缺失=注册失败显式报 owner（兜底靠每日补扫，但不静默） |
 | SP-4 | 新增 `--fast` 参数：**只跳双审**（SHA/clean/禁 merge/禁 CI/禁 force 守卫不跳）；仅限 owner 交互输入，自动会话禁用；走 ledger 留痕（§0.3-I7） |
 | SP-5 | worker 台账：派发说明带 `(model/effort)` 标注（对齐 orca 派工规则；模型为 owner 点名，第 0 优先） |
 | SP-6 | **双审自迭代机制（owner 2026-07-31 要求，参照 review-pr 的 EVOLUTION.md 与 idea-outline 口味台账设计）**：<br>**漏检台账（escape ledger）**：mini 盯梢引擎本来就在消费远端反馈——每当远端（云端 CI 审查/Copilot/Codex/Greptile/人类）对一个**通过了本地三审**的 PR 打出 finding，自动比对该 PR 的**完整三审 ledger（含 `origin_reviewer`，审⑦：第三席已捕获的上游门类项不算漏检）**，比不上的 = **漏检**，自动记账：`{PR、远端 finding、本应命中的检查面、why-class}`。why-class 四选一定迭代方向：`face-gap`(检查面缺口/归属表漏项) / `lens-blind`(某 reviewer 的 lens 盲区) / `evidence-skip`(有面但没查证据,如 UI registry 漏路径) / `judgment`(判了但判错)。<br>**升级规则（阈值制,抄 idea-outline）**：同 why-class + 同模式 **≥2 次** → 生成 skill 修改提案（改检查面定义/归属表/lens 分工/registry）。**收紧类**（加检查项、补路径、扩 E 面 checklist）可自动落地走 PR；**扩权类**（放宽守卫、降低门槛、跳过检查）**永不自动落地**（抄 review-pr 铁律），只能提案等 owner。<br>**防误报加固（审⑥）**：① 幂等键 = remote node id，跨 bot/顶层/thread 的同一问题按 `repo+PR+headSHA(commitOid)+规整路径/symbol+语义指纹` **聚类合并**（多 bot 回声算一条）；② **只计在同一 head 上被确认 actionable 的**（实际被修复、或被明确接受）——stale/outdated/dismissed/纯建议/错误 finding 不计；③ 行号随修复漂移 → 比对用规整路径+symbol 不用裸行号；④ **"≥2 次"必须来自不同 PR（或不同独立 head）**，单 PR 内重复回声不触发；⑤ why-class 先记 `pending`，经规则或人工确认后才转正。<br>**自动落地纪律**：收紧类提案只允许在**专用 worktree** 开分支提 PR（不碰共享 checkout，与 W-2 临界区规则一致），必须带误报回归 fixture + 正常过审过 CI，**禁止自动合并**。<br>**复盘节奏**：漏检发生即记账（不等收尾）；每 10 条或每周由每日卡片附一行"双审漏检 N 条待复盘"提醒 owner。台账入 mivo 仓 `agent-use/docs/dual-review-evolution.md`（团队可见） |
@@ -109,7 +109,7 @@ flowchart TD
 
 **① 锚点先行（GD 最大教训："没有锚点就没有反发散"；SC 时机为 owner 2026-07-31 纠正后定案）**
 **审查阶段的锚点 = 下方七个固定检查面**：每条 finding 必须锚到检查面（`primary_face`），无锚点的 finding 按 ⑪ 规则处理。
-**SC 提炼发生在双审达成共识之后**：lead 对共识确认的**每一个具体修改项**提炼一条可验证 SC（改什么 → 什么该成立 → 怎么验证），SC 清单交给修复 worker（glm-5.2/max + goal skill）作为执行目标；**共识 → 修复自动衔接，不需要 owner 授权**。（v6 曾写"派审前提 SC 作审查锚点"，owner 纠正：SC 是修复的验收合约，不是审查的输入。）
+**SC 提炼发生在双审达成共识之后**：lead 对共识确认的**每一个具体修改项**提炼一条可验证 SC（改什么 → 什么该成立 → 怎么验证），SC 清单交给修复 worker（模型 `<见 SKILL.md 修复席表>` + goal skill）作为执行目标；**共识 → 修复自动衔接，不需要 owner 授权**。（v6 曾写"派审前提 SC 作审查锚点"，owner 纠正：SC 是修复的验收合约，不是审查的输入。）
 
 **② 固定检查面（审⑧明确适用范围：**两对抗席**必须逐七面填 `pass/fail/n_a` + 证据，两份表的差异即仲裁点；**第三席**只填与其口径相关的 faces（F/G/E/D 为主）+ `gate_checks[]`，不强制七面全填）**
 **gate_checks 确定性判定（审⑧）**：任何 `gate_checks.result=fail` → 第三席 verdict **必为 REQUIRES_CHANGES** 且该项直接进修改清单；修复后由第三席在 replay 中改判 pass；共识脚本**直接断言全部 gate_checks ∈ {pass, n_a}**，不以模型自报的总 verdict 为准。
@@ -289,5 +289,5 @@ reviewer 超时/跑挂/输出不合 schema → `degraded` ≠ APPROVED，绝不�
 ## 6. 审查③结论（已收敛，v6 即共识版）
 
 审查③判定 REQUIRES_CHANGES（7 致命 + 7 重要），全部 14 条已采纳进 §0.3 并同步正文；其中 F1（broker 禁 per-dispatch worktree/model）与 F2（goal 轮次硬顶 + 外发硬停）经本会话读源码独立实锤。原 §6 六个疑点的最终答案：
-① 收敛性 → SHA 绑定协议解决（SP-2）；② GLM worker 指令自包含 → manifest 解决（SP-3）；③ script dispatch 能力面 → **继承成立、per-dispatch 否**，故每仓一条引擎 schedule（W-2）；④ 注册失败路径 → 回执四要素（SP-3）+ 独立 launchd 健康告警（**W-7**，审④-F5 后落为正文任务）；⑤ DeepSeek 幻觉 → source_id 守恒 validator（§3.1）；⑥ 飞书续聊 → 升为 P1 阻断出口（§3.4）。
+① 收敛性 → SHA 绑定协议解决（SP-2）；② 修复 worker 指令自包含 → manifest 解决（SP-3）；③ script dispatch 能力面 → **继承成立、per-dispatch 否**，故每仓一条引擎 schedule（W-2）；④ 注册失败路径 → 回执四要素（SP-3）+ 独立 launchd 健康告警（**W-7**，审④-F5 后落为正文任务）；⑤ DeepSeek 幻觉 → source_id 守恒 validator（§3.1）；⑥ 飞书续聊 → 升为 P1 阻断出口（§3.4）。
 审查③明确认可并要求保留的 v5 方向：定点盯梢取代全局轮询、审查前置到 push 前、双模型硬 AND、三轮不收敛交 owner、v4 全部安全判据。

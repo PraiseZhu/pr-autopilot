@@ -241,6 +241,63 @@ export function validateVerdict(v, opts = {}) {
     need(v.run_status === 'degraded', 'taxonomy_gap 存在但 run_status≠degraded（⑪: 必须停轮，禁止丢弃）');
   }
 
+  // D3（2026-08-06）: 域外真问题的合法载体 out_of_scope_notes ——**不是** finding。
+  // 背景: SC-R3-5 要求 anchor_paths ⊆ base..candidate 实改集（那条校验拦的是「锚点填宽制造
+  // 假冲突」，有实测价值，一个字都不放宽）。副作用是「仓库既有问题」这类主证据落在 diff 之外
+  // 的真问题**无处安放**：塞 gate_checks 会进不了 SC 台账且撞 conjunct④，丢弃则永久丢信息。
+  // 修法是给它一条**旁路载体**而非放宽 anchor：本字段
+  //   - 参与 hashObject(v) → verdict_hashes（改了就换 hash，不可事后追加）；
+  //   - **不**进 conjunct②③④（consensus-gate 只遍历 findings / gate_checks），故不影响放行判定；
+  //   - **不**进 canonical_findings，因此不进 SC 台账、不进冲突图、不影响分组；
+  //   - ref_paths 只要求是 tracked 文件，**刻意不要求 ⊆ 实改集**——这正是本通道存在的理由。
+  // 跟踪义务在 Phase 2c 意见三分法的「推」通道（开 issue + PR body 记链接），保证等级 T1：
+  // 机器只锁形状（字段齐全、不与 finding 互相伪装），**不**校验 issue 真的开了。如实声明。
+  if (v.out_of_scope_notes !== undefined) {
+    need(Array.isArray(v.out_of_scope_notes), 'out_of_scope_notes 必须是数组（D3）');
+    if (Array.isArray(v.out_of_scope_notes)) {
+      const seenNoteIds = new Set();
+      const cap = opts.anchorPathsMax ?? DEFAULT_ANCHOR_PATHS_MAX;
+      for (const n of v.out_of_scope_notes) {
+        need(n && typeof n === 'object' && !Array.isArray(n), 'out_of_scope_notes 元素必须是对象');
+        if (!n || typeof n !== 'object' || Array.isArray(n)) continue;
+        need(typeof n.id === 'string' && n.id.length > 0, 'out_of_scope_note 缺 id');
+        if (typeof n.id === 'string' && n.id) {
+          need(!seenNoteIds.has(n.id), `out_of_scope_note id 重复: ${n.id}`);
+          seenNoteIds.add(n.id);
+          // 与 finding id 撞号会让人（和台账）分不清「这条进没进 SC」——两个命名空间必须互斥
+          need(!seenFindingIds.has(n.id), `out_of_scope_note id「${n.id}」与 finding id 撞号（两者是不同命名空间，一条进 SC 台账一条不进，撞号会让对账无法分辨）`);
+        }
+        need(typeof n.note === 'string' && n.note.length > 0, `out_of_scope_note ${n.id} 缺 note`);
+        need(typeof n.evidence === 'string' && n.evidence.length > 0, `out_of_scope_note ${n.id} 缺 evidence`);
+        need(typeof n.suggested_issue_title === 'string' && n.suggested_issue_title.length > 0,
+          `out_of_scope_note ${n.id} 缺 suggested_issue_title（「推」通道必须给出可直接开 issue 的标题，否则跟踪义务落不了地）`);
+        // 双向防伪装: note 不得携带 finding 的机器字段（否则等于绕开实改集校验造一条 finding）
+        for (const forbidden of ['anchor_paths', 'severity', 'primary_face', 'family_id', 'invariant', 'status', 'write_paths', 'allowed_paths']) {
+          need(!(forbidden in n), `out_of_scope_note ${n.id} 不得携带 ${forbidden}（D3: 它不是 finding——带上这些字段等于用旁路通道伪造一条绕过 SC-R3-5 实改集校验的 finding）`);
+        }
+        if (n.ref_paths !== undefined) {
+          need(Array.isArray(n.ref_paths), `out_of_scope_note ${n.id} 的 ref_paths 必须是数组`);
+          if (Array.isArray(n.ref_paths)) {
+            need(n.ref_paths.length <= cap, `out_of_scope_note ${n.id} 的 ref_paths 有 ${n.ref_paths.length} 条 > 上限 ${cap}`);
+            const seenRefs = new Set();
+            for (const p of n.ref_paths) {
+              const r = normalizeRepoPath(p);
+              need(r.ok, `out_of_scope_note ${n.id} ref_paths「${p}」非法: ${r.reason ?? ''}`);
+              if (!r.ok) continue;
+              need(!seenRefs.has(r.path), `out_of_scope_note ${n.id} ref_paths 重复: ${r.path}`);
+              seenRefs.add(r.path);
+              // tracked 要求保留（"这是真文件"），实改集要求**故意不加**——见上方说明
+              if (opts.trackedPaths) {
+                need(opts.trackedPaths.has(r.path),
+                  `out_of_scope_note ${n.id} ref_paths「${r.path}」不是 base∪candidate 里的 tracked 文件（目录/不存在路径不收）`);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   // gate_checks
   need(Array.isArray(v.gate_checks), 'gate_checks 必须是数组');
   for (const g of v.gate_checks ?? []) {

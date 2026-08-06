@@ -93,6 +93,26 @@
       "type": "integer", "minimum": 1,
       "description": "SC-B4（D5）: 加固清单版本号，取值须等于 scripts/lib/hardening-registry.mjs 的 HARDENING_CHECKLIST_VERSION。round===1 两对抗席必填（同 hardening_coverage 的角色/轮次条件，validator 为准）；版本不符 → degraded，错误信息明确「清单版本过期需重审」，不与 hardening_coverage 缺项的普通计数错误混淆（9→10 是 exact 集合变更，不是少填一项）。"
     },
+    "out_of_scope_notes": {
+      "type": "array",
+      "$comment": "D3（2026-08-06）: 域外真问题的合法载体——**不是 finding**。SC-R3-5 要求 finding 的 anchor_paths ⊆ base..candidate 实改集（拦「锚点填宽制造假冲突」，不放宽），副作用是主证据在 diff 之外的真问题（仓库既有问题等）无处安放。本字段是旁路载体：参与 hashObject(v)→verdict_hashes（不可事后追加），但不进 conjunct②③④（consensus-gate 只遍历 findings/gate_checks）、不进 canonical_findings、不进 SC 台账、不进冲突图。ref_paths 只要求 tracked，**刻意不要求 ⊆ 实改集**——那正是本通道存在的理由。跟踪义务在 Phase 2c 意见三分法的「推」通道（开 issue + PR body 记链接），保证等级 T1：机器只锁形状，不校验 issue 真的开了。禁止携带 finding 的机器字段（anchor_paths/severity/primary_face/family_id/invariant/status/write_paths/allowed_paths），否则等于用旁路通道伪造一条绕过实改集校验的 finding——verdict-validate.mjs 显式拒收 + 本处 additionalProperties:false 双重把关。id 与 finding id 必须互斥（validator 强制）。",
+      "items": {
+        "type": "object",
+        "required": ["id", "note", "evidence", "suggested_issue_title"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "note": { "type": "string", "minLength": 1, "description": "问题本体（人读）" },
+          "evidence": { "type": "string", "minLength": 1 },
+          "suggested_issue_title": { "type": "string", "minLength": 1, "description": "可直接开 issue 的标题——缺它跟踪义务落不了地" },
+          "ref_paths": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "description": "参考路径（tracked 即可，允许在 base..candidate 实改集之外；数量上限同 anchor_paths_max_per_finding）"
+          }
+        }
+      }
+    },
     "verdict": { "enum": ["APPROVED", "REQUIRES_CHANGES"] },
     "closed_finding_ids": { "type": "array", "items": { "type": "string" } },
     "arbitration_reason": { "type": "string" }

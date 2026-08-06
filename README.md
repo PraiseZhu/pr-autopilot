@@ -3,7 +3,7 @@
 **把「提一个 PR」之后的所有等待、盯梢、返工，从人的日程表里拿掉。**
 
 > 权威计划: `docs/plan.md`（九轮对抗审查定稿）；实现经 12 轮 gpt-5.6-sol/xhigh 对抗复审 APPROVED，
-> 5 路并行 e2e 全绿，fixtures 90/90。运行时台账数据**不入本仓**（台本与数据分离）。
+> 5 路并行 e2e 全绿，fixtures 全绿（条数以 `bash fixtures/run-all.sh` 实跑为准，不在文档写死）。运行时台账数据**不入本仓**（台本与数据分离）。
 
 ---
 
@@ -31,7 +31,7 @@ pr-autopilot 把这四件事全部接走。你只保留两个动作：**说一�
  │            ② 骨折 terra/xhigh 盲审: 安全/边界/规范（核心路径 PR 升 ultra）
  │            ③ sonnet-5/xhigh 只读预演上游 review-pr 的口径（提前踩雷）
  │            共识不由任何 AI 宣布——由脚本判四个硬条件（consensus-gate）
- ├─ Phase 2b/2c  共识确认的问题 → 提炼成可验证 SC → glm-5.2/max 修到每条有证据
+ ├─ Phase 2b/2c  共识确认的问题 → 提炼成可验证 SC → 修复 worker 修到每条有证据
  ├─ Phase 3  push-guard 守卫放行才 push（SHA 钉死/禁 force/禁碰 CI/hash 链三方绑定）
  │            → gh pr create → ssh 到 mini 把这个 PR 登记进盯梢名单（回执四要素）
  │
@@ -76,7 +76,9 @@ schemas/                         review-verdict v1 / consensus-artifact v1
 scripts/
   lib/                           canonical JSON / sha256 / 原子写 / per-key 锁 / git 校验
   review-input-hash.mjs          派审前可算的输入 hash（两段链第一段）
-  verdict-validate.mjs           审查产出机器契约（schema 失败一律 degraded）
+  verdict-validate.mjs           审查产出机器契约（schema 失败一律 degraded）；含域外通道 out_of_scope_notes 形状门（D3）
+  dispatch-contract.mjs          派工包机器契约段生成器 + 派工前置门（D1；字面值从 validator 常量派生，digest 防陈旧粘贴）
+  pr-format-gate.mjs             PR 标题/正文模板合规确定性预检（D2；配置读 merge-base 树，缺配置 SKIP、malformed fail-closed）
   consensus-gate.mjs             四 conjunct 共识门（谁也不能口头宣布共识）
   push-guard.mjs                 push 放行守卫: SHA 绑定/禁 force/CI 路径/宪法黑白名单/fast HMAC
   ci-readiness.mjs               CI 判绿契约（required contexts，fail-closed）
@@ -86,7 +88,7 @@ scripts/
   evolution/                     自进化: 台账 append(hash 链)/聚类达阈/secret-lint/周会/宪法路径表
   health/                        独立健康告警（launchd + lease-check + 飞书→slack 降级链）
 skills/submit-pr/                「提交 PR」skill v2（三审收口版）+ references
-fixtures/                        126 条回归 fixture（run-all.sh 一键跑；末尾附诚实 SKIPPED 清单）
+fixtures/                        回归 fixture（run-all.sh 一键跑；末尾附诚实 SKIPPED 清单）
 deploy/README.md                 mini 部署手册（含 P0-⑦ 班车握手定案）
 deploy/wrappers/                 真机适配: gh-snapshot / cindy-dispatch / queue-transport / probe
 ```
@@ -94,13 +96,13 @@ deploy/wrappers/                 真机适配: gh-snapshot / cindy-dispatch / qu
 ## 快速验证
 
 ```bash
-bash fixtures/run-all.sh   # 126 passed 才算数；SKIPPED 清单如实列出仓内验不了的真机项
+bash fixtures/run-all.sh   # 判据是 0 failed（刻意不写死条数——写死过四次，四次都陈旧）；SKIPPED 清单如实列出仓内验不了的真机项
 ```
 
 ## 模型点名（owner 第 0 优先，压过 routing 表）
 
-三审（唯一权威 = `skills/submit-pr/SKILL.md` Phase 2 席位表，本行仅摘要）: sonnet-5/xhigh + 骨折 `codex/gpt-5.6-terra`/xhigh（核心路径升 ultra，降级链 gpt-5.5）+ sonnet-5/xhigh（上游预演）；
-争议仲裁（按需）: 骨折 `codex/gpt-5.6-sol`/max（极端 ultra）；修复+push: glm-5.2/max（goal --until-sc）；
+三审（唯一权威 = `skills/submit-pr/SKILL.md` Phase 2 席位表，本行仅摘要）: sonnet-5/xhigh + 骨折 `codex/gpt-5.6-terra`/xhigh（核心路径升 ultra；降级链走 Cindy AI 通路裸 `gpt-5.6-terra`（同代换通路），禁用 `chatgpt/` 官方订阅）+ sonnet-5/xhigh（上游预演）；
+争议仲裁（按需）: 骨折 `codex/gpt-5.6-sol`/max（极端 ultra）；修复+push: 见 `skills/submit-pr/SKILL.md` Phase 2c **修复席表**（该表指向 orca-fanout routing.json 的 execute 档，本行不复述值）；
 mini 盯梢修复: glm-5.2/max（send_to_session 克隆班车四元组）；卡片: deepseek-v4-pro/max（唯一允许降级 xhigh，留审计）；
 周会: glm-5.2/max。
 

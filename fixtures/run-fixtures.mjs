@@ -49,6 +49,10 @@ import { classifyEscapes } from '../scripts/evolution/escape-classify.mjs';
 import { checkLeases, alertWithFallback } from '../scripts/health/lease-check.mjs';
 import { readJson, hashObject, canonicalJson } from '../scripts/lib/common.mjs';
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from '../scripts/lib/hardening-registry.mjs';
+import { contractSpec, contractDigest, emitContract, requiredLiterals, checkDispatchPackage, SEATS, ALL_FACES } from '../scripts/dispatch-contract.mjs';
+import { loadFormatConfig, evaluateFormat, formatConfigHash, hasSection, EMPTY_FORMAT_CONFIG,
+  titleTypeRe as titleTypeReRef, TITLE_VAGUE_RE as TITLE_VAGUE_RE_REF } from '../scripts/pr-format-gate.mjs';
+import { DEFAULT_REQUIREMENTS } from '../scripts/verdict-validate.mjs';
 
 let pass = 0, failCount = 0;
 const failures = [];
@@ -980,24 +984,48 @@ t('[审③F8-R] dispatch wrapper 四元组: 只回 session_id 拒 / 缺任一字
     state_dir: '/tmp/state', snapshot_cmd: 'snap {owner} {repo} {pr}', manifest_path: '/tmp/m.json',
     finalize_cmd: 'node finalize.mjs ...', complete_cmd: 'node complete.mjs ...', branch: 'fix-1', remote: 'origin'
   });
-  const runW = (transport) => {
+  // 期望值只能来自 env（wrapper 已去掉硬编码默认值——单一来源，见该文件头注释）
+  const EXPECT_ENV = { EXPECT_AGENT_KIND: 'claude-code', EXPECT_PROVIDER: 'Cindy AI', EXPECT_MODEL: 'claude-sonnet-5', EXPECT_EFFORT: 'xhigh' };
+  // unset: 要**真正删掉**的 env key 列表——不能用空串代替。初版代码是 `process.env.X ?? '默认值'`，
+  // `??` 只拦 null/undefined，空串会原样成为 EXPECT='' 照样判漂移拒绝；用空串写的"缺 env 应拒"
+  // 断言在装回硬编码默认值后**依然通过** = 假覆盖（本轮自查发现，改为真 unset 才有牙齿）。
+  const runW = (transport, { over = {}, unset = [] } = {}) => {
+    const env = { ...process.env, CINDY_DISPATCH_CMD: transport, ...EXPECT_ENV, ...over };
+    for (const k of unset) delete env[k];
     try {
-      execFileSync(process.execPath, [join(W, 'cindy-dispatch.mjs')], {
-        encoding: 'utf8', input: manifest,
-        env: { ...process.env, CINDY_DISPATCH_CMD: transport }
-      });
+      execFileSync(process.execPath, [join(W, 'cindy-dispatch.mjs')], { encoding: 'utf8', input: manifest, env });
       return true;
     } catch { return false; }
   };
-  const full = { session_id: 's1', agentKind: 'claude-code', provider: 'Cindy AI', model: 'z-ai/glm-5.2', effort: 'max' };
+  const full = { session_id: 's1', agentKind: 'claude-code', provider: 'Cindy AI', model: 'claude-sonnet-5', effort: 'xhigh' };
   ok(runW(mkTransport(JSON.stringify(full))), '四元组全齐应过');
   ok(!runW(mkTransport(JSON.stringify({ session_id: 's1' }))), '只回 session_id 应拒');
   for (const missing of ['agentKind', 'provider', 'model', 'effort']) {
     const { [missing]: _, ...part } = full;
     ok(!runW(mkTransport(JSON.stringify(part))), `缺 ${missing} 应拒`);
   }
-  ok(!runW(mkTransport(JSON.stringify({ ...full, model: 'glm-5.2' }))), 'model 漂移应拒');
+  ok(!runW(mkTransport(JSON.stringify({ ...full, model: 'z-ai/glm-5.2' }))), 'model 漂移应拒');
   ok(!runW(''), '无传输层配置应拒');
+  // 单一来源 fail-closed: 四个 EXPECT_* 真 unset 任一 → 拒（不得回落到硬编码默认值静默用旧期望）。
+  //
+  // 这条断言的构造试错了两轮，写清楚免得后人又写成假的：
+  //   ✗ 第一版用空串占位——`?? '默认值'` 只拦 null/undefined，空串会原样成为 EXPECT='' 照样判漂移，
+  //     装回默认值后断言依然通过 = 假覆盖。
+  //   ✗ 第二版真 unset 了，但回执把 model 与 effort **两个**都填旧值，而每次只 unset 一个变量 →
+  //     另一个字段必然与 env 的新值不符 → 仍被拒 → 装回默认值后断言依然通过 = 还是假覆盖。
+  //   ✓ 本版：只让**被 unset 的那一个字段**用旧默认值，其余三个字段用新值。这样装回默认值后，
+  //     期望会静默回落成旧值、恰好与回执相符、其余字段也相符 → 整体放行 → 断言变红。
+  const LEGACY_DEFAULT = { EXPECT_AGENT_KIND: 'claude-code', EXPECT_PROVIDER: 'Cindy AI', EXPECT_MODEL: 'z-ai/glm-5.2', EXPECT_EFFORT: 'max' };
+  const RECEIPT_FIELD = { EXPECT_AGENT_KIND: 'agentKind', EXPECT_PROVIDER: 'provider', EXPECT_MODEL: 'model', EXPECT_EFFORT: 'effort' };
+  for (const envVar of Object.keys(EXPECT_ENV)) {
+    const receipt = JSON.stringify({ ...full, [RECEIPT_FIELD[envVar]]: LEGACY_DEFAULT[envVar] });
+    ok(!runW(mkTransport(receipt), { unset: [envVar] }),
+      `${envVar} 真 unset 时必须拒（期望值只能来自 env.sh；回落旧默认值会让"旧回执 + 旧期望"这一对静默通过）`);
+  }
+  // 正向对照: 换一套期望值 + 相符的回执照样过（证明不是钉死某个具体模型，而是钉死"env 与回执一致"）
+  ok(runW(mkTransport(JSON.stringify({ ...full, model: 'z-ai/glm-5.2', effort: 'max' })),
+    { over: { EXPECT_MODEL: 'z-ai/glm-5.2', EXPECT_EFFORT: 'max' } }),
+  '换一套期望值且回执相符应过');
 });
 
 // ========== 7. inbox-digest ==========
@@ -5174,6 +5202,563 @@ console.log('\n[B2] size-gate 双闸（真实 git 仓）');
     rmSync(d, { recursive: true, force: true });
   });
 }
+
+// ========== 24. D1 派工契约 / D2 格式预检 / D3 域外通道（2026-08-06 三缺陷修复） ==========
+console.log('\n[24] D1 dispatch-contract · D2 pr-format-gate · D3 out_of_scope_notes');
+
+// ── D1: 派工包机器契约段 ──
+t('[D1-DC] emit→check 闭环: 三席 × round 1/2 的 emit 输出必过自身 check（正向）', () => {
+  for (const seat of SEATS) {
+    for (const round of [1, 2]) {
+      const text = emitContract({ seat, round });
+      const r = checkDispatchPackage(text, { seat, round });
+      ok(r.ok, `emit 输出必过 check: seat=${seat} round=${round} missing=${JSON.stringify(r.missing)}`);
+      // 契约段被粘进更大的派工包文本里也必须过（check 是 substring 匹配，不是整体等值）
+      ok(checkDispatchPackage(`前言\n${text}\n后记`, { seat, round }).ok, '嵌入更大文本仍应过');
+    }
+  }
+});
+
+t('[D1-DC] 反向: 逐个删掉任一必需字面值 → check 必拦且点名该项（含四个 canonical gate_id）', () => {
+  const seat = 'upstream-preview', round = 1;
+  const text = emitContract({ seat, round });
+  const lits = requiredLiterals({ seat, round });
+  ok(lits.length >= 10, `必需字面值数量异常: ${lits.length}`);
+  for (const lit of lits) {
+    // 用不可能出现在契约里的替换串抹掉该字面值的全部出现
+    const broken = text.split(lit).join('§ABSENT§');
+    const r = checkDispatchPackage(broken, { seat, round });
+    ok(!r.ok, `抹掉「${lit}」后 check 必须拦`);
+    ok(r.missing.includes(lit), `missing 必须点名「${lit}」，得到 ${JSON.stringify(r.missing)}`);
+  }
+  // D1 事故本体: 第三席派工包缺 gate_id 就是这条路径
+  for (const g of DEFAULT_REQUIREMENTS.third_seat_required_gates) {
+    ok(lits.includes(g), `第三席必需字面值必须含 canonical gate_id「${g}」`);
+    ok(!checkDispatchPackage(text.split(g).join('x'), { seat, round }).ok, `缺 ${g} 必拦`);
+  }
+});
+
+t('[D1-DC] 单一真相源: gate 集合从 requirements 派生——新增第 5 个 gate，emit 与 requiredLiterals 同时自动跟上', () => {
+  const seat = 'upstream-preview', round = 1;
+  const requirements = { third_seat_required_gates: [...DEFAULT_REQUIREMENTS.third_seat_required_gates, 'brand-new-gate'] };
+  const text = emitContract({ seat, round, requirements });
+  ok(text.includes('brand-new-gate'), 'emit 必须自动包含新增 gate_id（否则就是手写清单，回到 D1 的漂移）');
+  ok(requiredLiterals({ seat, round, requirements }).includes('brand-new-gate'), 'requiredLiterals 同样必须自动跟上');
+  // 反向: 默认契约的 emit 文本里不该出现它（证明上一条不是常量硬编码巧合）
+  ok(!emitContract({ seat, round }).includes('brand-new-gate'), '默认契约不应含该 gate');
+});
+
+t('[D1-DC] digest 反漂移: 粘贴陈旧契约段必被拦（旧 digest 与当前重算值失配）', () => {
+  const seat = 'upstream-preview', round = 1;
+  const requirements = { third_seat_required_gates: [...DEFAULT_REQUIREMENTS.third_seat_required_gates, 'brand-new-gate'] };
+  const oldText = emitContract({ seat, round });               // 契约变更**前**生成的段落
+  const rStale = checkDispatchPackage(oldText, { seat, round, requirements }); // 用变更**后**的契约校验
+  ok(!rStale.ok, '陈旧契约段必须被拦');
+  ok(rStale.missing.some((m) => m.startsWith('contract_digest=')), `失配必须体现在 digest 上: ${JSON.stringify(rStale.missing)}`);
+  ok(rStale.missing.includes('brand-new-gate'), '同时必须点名缺失的新 gate');
+  // 只改 digest 一个字符（其余字面值都在）→ 仍必须拦
+  const d = contractDigest(contractSpec({ seat, round }));
+  const tampered = emitContract({ seat, round }).replace(d, d.slice(0, -1) + (d.endsWith('0') ? '1' : '0'));
+  const rT = checkDispatchPackage(tampered, { seat, round });
+  ok(!rT.ok && rT.missing.length === 1 && rT.missing[0] === `contract_digest=${d}`, `改一字必拦且只报 digest: ${JSON.stringify(rT.missing)}`);
+  // 正向对照: 未改动的 emit 文本在同一契约下必过（确认上面不是全都在拦）
+  ok(checkDispatchPackage(emitContract({ seat, round }), { seat, round }).ok, '未改动必过');
+});
+
+t('[D1-DC] 两侧同源（D1 核心不变量）: 契约段声明的 gate 集合 == validator 强制的集合', () => {
+  const spec = contractSpec({ seat: 'upstream-preview', round: 1 });
+  // 正向: 恰好按契约声明的 gate 集合构造 verdict → validator 必过
+  const gates = spec.required_gate_ids.map((g) => ({ gate_id: g, result: 'pass', evidence: `${g} ok` }));
+  const vOk = mkVerdictFor('upstream-preview', bundle, { gate_checks: gates });
+  eq(validateVerdict(vOk).length, 0, '按契约构造的 verdict 必过 validator');
+  // 反向: 逐个摘掉一个 gate → validator 必拒（证明契约不是多写的装饰）
+  for (const g of spec.required_gate_ids) {
+    const vBad = mkVerdictFor('upstream-preview', bundle, { gate_checks: gates.filter((x) => x.gate_id !== g) });
+    ok(validateVerdict(vBad).some((e) => e.includes(g)), `摘掉 ${g} 后 validator 必须点名它`);
+  }
+  // 反向: 自创 gate_id（2026-08-06 实测事故形态）→ validator 拒
+  const vSelf = mkVerdictFor('upstream-preview', bundle, { gate_checks: [{ gate_id: '格式检查', result: 'pass', evidence: 'e' }] });
+  ok(validateVerdict(vSelf).length >= spec.required_gate_ids.length, '自创 gate_id 必须每个必填门各报一次');
+  // 对抗席契约不含 gate 要求，但必须要求恰好七面
+  const advSpec = contractSpec({ seat: 'claude-adversarial', round: 1 });
+  eq(advSpec.required_gate_ids, [], '对抗席不承担 gate_checks 必填');
+  eq(advSpec.required_faces, ALL_FACES, '对抗席必须七面');
+  eq(advSpec.faces_exact, true);
+  eq(advSpec.hardening, { required: true, checklist_version: HARDENING_CHECKLIST_VERSION, class_count: HARDENING_CLASS_COUNT });
+  eq(contractSpec({ seat: 'claude-adversarial', round: 2 }).hardening, { required: false }, 'round>=2 不强制穷举（与 validator 同条件）');
+  eq(contractSpec({ seat: 'upstream-preview', round: 1 }).hardening, { required: false }, '第三席不强制穷举');
+});
+
+t('[D1-DC] 非法输入 fail-closed: seat/round 非法一律 throw，不产出半成品契约', () => {
+  for (const bad of [{ seat: 'nope', round: 1 }, { seat: 'claude-adversarial', round: 0 },
+    { seat: 'claude-adversarial', round: 1.5 }, { seat: 'claude-adversarial', round: NaN },
+    { seat: undefined, round: 1 }, { seat: 'claude-adversarial', round: undefined }]) {
+    let threw = false;
+    try { emitContract(bad); } catch { threw = true; }
+    ok(threw, `非法输入必须 throw: ${JSON.stringify(bad)}`);
+  }
+});
+
+// ── D2: PR 格式确定性预检 ──
+const FG_CFG = { featureSections: ['变更说明', '提交前自检', '备注'], bugfixSections: ['变更说明', '怎么修的', '备注'], titleTypes: ['feat', 'fix', 'chore', 'docs'], lightTypes: ['chore', 'docs'] };
+const FG_BODY_FULL = '## 变更说明\n做了 X\n\n## 提交前自检\n- [x] ok\n\n## 备注\n无\n';
+
+t('[D2-FG] 正向: 三段齐全 + 合法 title type → PASS（不该拦的没拦）', () => {
+  const r = evaluateFormat({ title: 'feat(canvas): 加 X', body: FG_BODY_FULL, config: FG_CFG });
+  eq(r.result, 'PASS', JSON.stringify(r.reasons));
+  eq(r.template, 'feature');
+  eq(r.missing_sections, []);
+  eq(r.title_type_ok, true);
+  eq(r.sections_checked, true);
+  // 无 scope、带 ! 的破坏性标记都合法
+  eq(evaluateFormat({ title: 'feat: 加 X', body: FG_BODY_FULL, config: FG_CFG }).result, 'PASS');
+  eq(evaluateFormat({ title: 'feat(a)!: 加 X', body: FG_BODY_FULL, config: FG_CFG }).result, 'PASS');
+});
+
+t('[D2-FG] 反向（D2 事故本体）: 缺一个必填段落 → FAIL 且恰好点名该段落', () => {
+  const body = '## 变更说明\n做了 X\n\n## 提交前自检\n- [x] ok\n'; // 缺「备注」
+  const r = evaluateFormat({ title: 'feat: 加 X', body, config: FG_CFG });
+  eq(r.result, 'FAIL');
+  eq(r.missing_sections, ['备注'], '必须恰好点名缺的那一段');
+  eq(r.present_sections, ['变更说明', '提交前自检']);
+  ok(r.reasons.some((x) => x.includes('## 备注')), '错误文案必须给出可直接照抄的标题');
+  // 三段全缺
+  eq(evaluateFormat({ title: 'feat: 加 X', body: '随便写点什么', config: FG_CFG }).missing_sections, FG_CFG.featureSections);
+});
+
+t('[D2-FG] 段落存在性用标题锚定，不做全文 substring（口径对齐 review-pr）', () => {
+  // 正文里出现同名词句但没有标题 → 必须仍判 FAIL（否则硬判层失去拦截力）
+  const sneaky = '## 变更说明\nX\n\n## 提交前自检\n- [x] ok\n\n备注：无\n';
+  eq(evaluateFormat({ title: 'feat: X', body: sneaky, config: FG_CFG }).missing_sections, ['备注']);
+  ok(!hasSection('备注：无', '备注'), '裸文本不算段落');
+  ok(hasSection('### 备注', '备注'), 'h3 算');
+  ok(hasSection('## 3. 备注（可选）', '备注'), '标题行内含关键词算');
+  ok(!hasSection('#备注', '备注'), '缺空格不算标题');
+});
+
+t('[D2-FG] 模板选择: fix→bugfixSections；lightTypes→免段落检查（不该拦的没拦）', () => {
+  const bugfixBody = '## 变更说明\nX\n\n## 怎么修的\nY\n\n## 备注\n无\n';
+  const rFix = evaluateFormat({ title: 'fix: 修 Y', body: bugfixBody, config: FG_CFG });
+  eq(rFix.template, 'bugfix');
+  eq(rFix.result, 'PASS', JSON.stringify(rFix.reasons));
+  // 拿 feature 的段落集喂 fix → 缺 bugfix 特有段落
+  eq(evaluateFormat({ title: 'fix: 修 Y', body: FG_BODY_FULL, config: FG_CFG }).missing_sections, ['怎么修的']);
+  // light 类不查段落，但 title type 仍查
+  const rChore = evaluateFormat({ title: 'chore: 杂活', body: '啥也没有', config: FG_CFG });
+  eq(rChore.template, 'light');
+  eq(rChore.result, 'PASS');
+  eq(rChore.sections_checked, false);
+  eq(evaluateFormat({ title: 'chore 杂活', body: '啥也没有', config: FG_CFG }).result, 'FAIL', 'light 类的 title 形态仍要查');
+});
+
+t('[D2-FG] 反向: title type 不在白名单 / 形态不合 → FAIL', () => {
+  for (const bad of ['wat: 啥', 'feat 缺冒号', 'feat:', 'feat: ', '加个功能', 'FEAT: 大写', 'feat(a: 括号不闭合']) {
+    const r = evaluateFormat({ title: bad, body: FG_BODY_FULL, config: FG_CFG });
+    eq(r.result, 'FAIL', `title「${bad}」应判 FAIL: ${JSON.stringify(r)}`);
+    eq(r.title_type_ok, false);
+  }
+});
+
+t('[D2-FG-ALIGN] 初版分叉三例必拦（本门比 review-pr 宽 = Phase 1 放行、第三席仍 fail = D2 死锁复活）', () => {
+  // 初版正则 `(\([^)]*\))?!?:\s*\S` 放行了这三个，review-pr 的 `(\([^)]+\))?!?: .+` 判 fail
+  for (const bad of ['feat(): x', 'feat(scope):x', 'feat:x']) {
+    const r = evaluateFormat({ title: bad, body: FG_BODY_FULL, config: FG_CFG });
+    eq(r.title_type_ok, false, `「${bad}」必须判不合规（初版分叉用例）`);
+    eq(r.result, 'FAIL');
+  }
+  // 正向对照: 合法形态照旧放行（收紧不得误伤）
+  for (const good of ['feat(scope): x', 'feat: x', 'feat!: x', 'feat(a)!: x', 'feat:  两个空格也合法']) {
+    eq(evaluateFormat({ title: good, body: FG_BODY_FULL, config: FG_CFG }).title_type_ok, true, `「${good}」不得被误伤`);
+  }
+});
+
+t('[D2-FG-ALIGN] 含糊词黑名单（review-pr formatIssues 同层判据，漏掉即换一扇门复活死锁）', () => {
+  for (const bad of ['feat: 优化', 'fix: 调整', 'feat: 更新 ', 'feat: bug', 'feat: update', 'feat: 若干', 'feat: 一些', 'feat: MISC']) {
+    const r = evaluateFormat({ title: bad, body: FG_BODY_FULL, config: FG_CFG });
+    eq(r.title_vague, true, `「${bad}」应命中含糊词: ${JSON.stringify(r.reasons)}`);
+    eq(r.result, 'FAIL');
+  }
+  // 正向: 含糊词只在**结尾**才算（词出现在描述中间不拦）
+  for (const good of ['feat: 优化渲染路径', 'fix: 调整了阈值到 32px', 'feat: update 之后再收敛']) {
+    eq(evaluateFormat({ title: good, body: FG_BODY_FULL, config: FG_CFG }).title_vague, false, `「${good}」不得误判含糊`);
+  }
+  eq(evaluateFormat({ title: '随便', body: FG_BODY_FULL, config: { ...EMPTY_FORMAT_CONFIG } }).title_vague, null, '未声明 titleTypes 时该项为 null（SKIP），不是 false');
+});
+
+t('[D2-FG-ALIGN] self-review 勾选率: 段落存在且 <80% → FAIL；段落不存在不强制', () => {
+  const withList = (done, total) => `${FG_BODY_FULL}\n## Self-review\n${Array.from({ length: total }, (_, i) => `- [${i < done ? 'x' : ' '}] 第${i + 1}项`).join('\n')}\n`;
+  eq(evaluateFormat({ title: 'feat: x', body: withList(1, 3), config: FG_CFG }).result, 'FAIL', '1/3 应拦');
+  eq(evaluateFormat({ title: 'feat: x', body: withList(3, 3), config: FG_CFG }).result, 'PASS', '3/3 应放行');
+  eq(evaluateFormat({ title: 'feat: x', body: withList(4, 5), config: FG_CFG }).result, 'PASS', '4/5=80% 恰好放行（不是 <=）');
+  const noSec = evaluateFormat({ title: 'feat: x', body: FG_BODY_FULL, config: FG_CFG });
+  eq(noSec.checklist.has_section, false);
+  eq(noSec.result, 'PASS', '没写 self-review 段落时不强制（作者自发写了才校验）');
+  // 只统计该段落到下一个标题之间的复选框——别处的 TODO 不进分母
+  const other = `${FG_BODY_FULL}\n## Self-review\n- [x] 做完了\n\n## 后续 TODO\n- [ ] 另开 issue\n- [ ] 再一条\n`;
+  const r = evaluateFormat({ title: 'feat: x', body: other, config: FG_CFG });
+  eq(r.checklist, { has_section: true, total: 1, done: 1, ratio: 1 }, '下一个标题之后的复选框不得计入分母');
+  eq(r.result, 'PASS');
+  // light 类不算勾选率（与段落检查同层豁免）
+  eq(evaluateFormat({ title: 'chore: x', body: withList(0, 3), config: FG_CFG }).result, 'PASS');
+});
+
+// 从源码文本里**严格**抽出两条 regex，不执行任何跨仓文本（去 eval，2026-08-06 第五轮）。
+// 初版用贪婪 `(\/.+\/[a-z]*);` + eval：实测把
+//   `const TITLE_VAGUE_RE = /foo/; globalThis.__x = 1; /bar/;`
+// 整段捕获并执行（sentinel 真被赋值）。review-pr 是本机受信源码、且只在 fixture 期运行，
+// 但**没有必要**执行跨仓文本——改为 body/flags 分组 + new RegExp(body, flags)。
+export function extractRegexLiterals(src) {
+  const type = src.match(/^const TITLE_TYPE_RE\s*=\s*new RegExp\(`([^`\n]+)`\);\s*$/m);
+  // body 只吃「非转义斜杠、非换行」的字符，因此吃不进 `; globalThis...` 那种尾巴
+  const vague = src.match(/^const TITLE_VAGUE_RE[ \t]*=[ \t]*\n?[ \t]*\/((?:[^/\\\n]|\\.)+)\/([a-z]*);[ \t]*$/m);
+  return { typeTemplate: type?.[1] ?? null, vagueBody: vague?.[1] ?? null, vagueFlags: vague?.[2] ?? null };
+}
+// 上游源码的 **exact** 期望值。任何一个字变了 → 探针 loud fail → 强制人工重审对齐
+// （而不是"16 条 case 恰好还全过"就放行——实测删掉 `^` 后 16 条全绿但正则已变宽，静默漂移）。
+const RP_EXPECT_TYPE = '^(${prRules.titleTypes.join(\'|\')})(\\\\([^)]+\\\\))?!?: .+';
+const RP_EXPECT_VAGUE_BODY = ':\\s*(bug|update|improve|fix issue|优化|调整|更新|misc|若干|一些)\\s*$';
+const RP_EXPECT_VAGUE_FLAGS = 'i';
+
+t('[D2-FG-ALIGN] 跨仓对齐探针: 严格抽取（不 eval）+ 上游源码 exact 断言 + 裁决逐条比对（缺席则如实 skip）', () => {
+  const RP = join(process.env.HOME ?? '', '.claude/skills/review-pr/scripts/context.mjs');
+  if (!existsSync(RP)) { console.log('       ↳ SKIP: 本机未安装 review-pr，跨仓对齐无法实测（如实记录，不当通过）'); return; }
+  const { typeTemplate, vagueBody, vagueFlags } = extractRegexLiterals(readFileSync(RP, 'utf8'));
+  ok(typeTemplate && vagueBody !== null, 'review-pr 源码形态变了，探针需重写（这本身就是要人看的信号）');
+  // exact 断言: 上游改任何一个字（含只删一个 ^ 这种"case 全过但语义已变宽"的漂移）都必须 loud fail
+  eq(typeTemplate, RP_EXPECT_TYPE, 'review-pr 的 TITLE_TYPE_RE 源码变了 —— 必须人工重新对齐 titleTypeRe 后同步本期望值');
+  eq(vagueBody, RP_EXPECT_VAGUE_BODY, 'review-pr 的 TITLE_VAGUE_RE 变了 —— 必须人工重新对齐后同步本期望值');
+  eq(vagueFlags, RP_EXPECT_VAGUE_FLAGS, 'review-pr 的 TITLE_VAGUE_RE flags 变了 —— 同上');
+  const types = FG_CFG.titleTypes;
+  const theirType = new RegExp(typeTemplate.replace('${prRules.titleTypes.join(\'|\')}', types.join('|')).replace(/\\\\/g, '\\'));
+  const theirVague = new RegExp(vagueBody, vagueFlags); // 不 eval
+  const mineType = titleTypeReRef(types);
+  const cases = ['feat(scope): x', 'feat: x', 'feat(): x', 'feat(scope):x', 'feat:x', 'feat!: x', 'feat(a)!: x',
+    'wat: x', 'feat: ', 'feat:', 'feat:  x', 'prefix feat: x', 'feat: 优化', 'feat: 优化渲染',
+    'fix: 调整', 'feat: update', 'feat: 一些', 'FEAT: X'];
+  for (const c of cases) {
+    eq(mineType.test(c), theirType.test(c), `title type 裁决必须与 review-pr 一致: 「${c}」`);
+    eq(TITLE_VAGUE_RE_REF.test(c), theirVague.test(c), `含糊词裁决必须与 review-pr 一致: 「${c}」`);
+  }
+  // `prefix feat: x` 是锚点漂移的反例哨兵: 上游删掉 `^` 后它会变 true，本仓仍 false → 立刻不一致
+  eq(mineType.test('prefix feat: x'), false, '锚点必须在行首（本例是 ^ 漂移的哨兵）');
+});
+
+t('[D2-FG-ALIGN] 严格抽取器: 不执行跨仓文本，且吃不进注入的尾巴（去 eval 的反证）', () => {
+  // 初版贪婪 + eval 会把整段吞下并执行；严格 body 只吃非转义斜杠/非换行字符
+  globalThis.__fixtureProbeSentinel = undefined;
+  const injected = 'const TITLE_VAGUE_RE = /foo/; globalThis.__fixtureProbeSentinel = 1; /bar/;\n';
+  const r = extractRegexLiterals(injected);
+  eq(globalThis.__fixtureProbeSentinel, undefined, '抽取器绝不得执行源码文本（初版 eval 会把 sentinel 置 1）');
+  // 注意断言方向: 带尾巴的整行**整条拒收**（返回 null）比"抽出 foo 忽略尾巴"更 fail-closed——
+  // 形态异常就该让调用侧 loud fail 去叫人看。初稿在这里断言 expected='foo'，跑基线时红了，
+  // 是断言写错不是实现错（实现要求 `;` 后必须直接行尾）。
+  eq(r.vagueBody, null, '带尾巴的异常行必须整条拒收（返回 null → 调用侧 loud fail）');
+  // 反证「初版 eval 确实会执行」: 就地重演初版的贪婪+eval 逻辑，sentinel 必被置 1。
+  // 这条替代了「改生产代码跑整套变异」——本属性在 fixture 内部，变异注入反而验不到（见交卷说明）。
+  globalThis.__fixtureProbeSentinel = undefined;
+  const greedy = injected.match(/const TITLE_VAGUE_RE\s*=\s*\/(.+)\/([a-z]*);/);
+  ok(greedy, '前提: 初版的贪婪 regex 确实能匹配这行');
+  eq(greedy[1], 'foo/; globalThis.__fixtureProbeSentinel = 1; /bar', '初版贪婪捕获会把整段尾巴吞进来');
+  // eslint-disable-next-line no-eval -- 刻意重演初版行为以证明它会执行；只在本用例内、输入是本文件字面量
+  try { eval(`/${greedy[1]}/${greedy[2]}`); } catch { /* 语法错也算没执行成功 */ }
+  eq(globalThis.__fixtureProbeSentinel, 1, '初版 eval 路径确实会执行注入代码——这就是去 eval 的理由');
+  globalThis.__fixtureProbeSentinel = undefined;
+  // 形态异常一律返回 null → 调用侧 loud fail，不静默放行
+  for (const bad of ['const TITLE_VAGUE_RE = someFn();\n', 'let TITLE_VAGUE_RE = /x/i;\n',
+    '// const TITLE_VAGUE_RE = /x/i;\n',
+    'const TITLE_VAGUE_RE =\n\n  /x/i;\n',                    // 跨空行 = 可能抓到无关 literal，必须拒
+    'const TITLE_VAGUE_RE =\n  someFn();\n  /x/i;\n']) {      // 声明与 literal 之间夹了别的语句
+    eq(extractRegexLiterals(bad).vagueBody, null, `形态异常必须抽不出（返回 null 让调用侧 loud fail）: ${JSON.stringify(bad)}`);
+  }
+  // 合法的换行排版**应当**抽得出（只允许一个换行 + 缩进；初稿断言它必须为 null，跑基线时红了，
+  // 是断言过严不是实现错——同一批里我写错两条断言，都是靠真跑基线而不是假定全绿才发现的）
+  eq(extractRegexLiterals('const TITLE_VAGUE_RE =\n  /x/i;\n').vagueBody, 'x', '一个换行的合法排版应抽得出');
+  eq(extractRegexLiterals('const TITLE_TYPE_RE = someOther(`x`);\n').typeTemplate, null, 'type 侧同理');
+  // 正向: 正常形态抽得出且 flags 正确
+  const good = extractRegexLiterals('const TITLE_VAGUE_RE = /:\\s*(a|b)\\s*$/i;\n');
+  eq(good.vagueBody, ':\\s*(a|b)\\s*$');
+  eq(good.vagueFlags, 'i');
+});
+
+t('[D2-FG-ALIGN] exact 源码断言的必要性: 只比 case 会放过静默漂移，exact 断言才拦得住（内存态）', () => {
+  // 本属性朝**上游**（review-pr 源码变了要 loud fail），无法靠改本仓代码做变异验证——
+  // 改 review-pr 仓是硬边界禁止的。改为内存态构造：拿真实期望串做一处「删掉 ^」的语义漂移，
+  // 分别看「只比 18 条 case」与「exact 断言」两种口径的表现。
+  const types = FG_CFG.titleTypes;
+  const compile = (tpl) => new RegExp(tpl.replace('${prRules.titleTypes.join(\'|\')}', types.join('|')).replace(/\\\\/g, '\\'));
+  const drifted = RP_EXPECT_TYPE.replace(/^\^/, ''); // 上游删掉行首锚点 = 悄悄变宽
+  ok(drifted !== RP_EXPECT_TYPE, '前提: 漂移串确实与期望不同');
+  const theirsDrifted = compile(drifted);
+  const mine = titleTypeReRef(types);
+  // ① 只比 case 的口径: 原有 18 条 case 里没有一条能发现这次漂移
+  const CASES = ['feat(scope): x', 'feat: x', 'feat(): x', 'feat(scope):x', 'feat:x', 'feat!: x', 'feat(a)!: x',
+    'wat: x', 'feat: ', 'feat:', 'feat:  x', 'feat: 优化', 'feat: 优化渲染', 'fix: 调整', 'feat: update', 'feat: 一些', 'FEAT: X'];
+  eq(CASES.filter((c) => mine.test(c) !== theirsDrifted.test(c)), [], '前提: 这批 case 对该漂移完全无感（这正是"全绿≠已覆盖"）');
+  // ② exact 断言的口径: 立刻不等 → 调用侧 loud fail
+  ok(drifted !== RP_EXPECT_TYPE, 'exact 断言必然发现该漂移');
+  // ③ 哨兵 case: 加了 `prefix feat: x` 之后，连"只比 case"也能抓到这一种漂移
+  eq(mine.test('prefix feat: x'), false);
+  eq(theirsDrifted.test('prefix feat: x'), true, '哨兵 case 对锚点漂移有感——两道口径互为兜底');
+});
+
+t('[D2-FG-ALIGN] titleTypes 是 regex fragment: 不得 escRe（初版 escRe 造成双向分叉）', () => {
+  const types = ['feat|fix'];
+  const theirs = new RegExp(`^(${types.join('|')})(\\([^)]+\\))?!?: .+`); // review-pr 口径
+  const mine = titleTypeReRef(types);
+  eq(mine.source, theirs.source, 'titleTypeRe 的 pattern 必须与 review-pr 逐字相同（不得 escRe）');
+  // 三个实测分叉用例（初版：前两个假 FAIL、第三个假 PASS）
+  for (const c of ['fix: x', 'feat: x', 'feat|fix: x']) {
+    eq(mine.test(c), theirs.test(c), `「${c}」两侧必须同判（初版 escRe 在此双向分叉）`);
+  }
+  eq(mine.test('fix: x'), true, 'fragment 里的 fix 必须能匹配（初版判 false = 假 FAIL）');
+  eq(mine.test('feat|fix: x'), false, '字面量 feat|fix 不得匹配（初版判 true = 假 PASS → D2 死锁）');
+  // 普通 token 回归: 与旧行为完全一致
+  eq(titleTypeReRef(['feat', 'fix']).source, '^(feat|fix)(\\([^)]+\\))?!?: .+');
+  // 不可解析的 fragment → 抛错（fail-closed；CLI 侧转 exit 3），不静默降级。
+  // 注意选例: `[` **能**编译（被 pattern 后面 `[^)]` 里的 `]` 闭合成字符类），拿它当"非法"
+  // 会写出一条假成立的断言——初稿正是如此，自测时才发现。真非法的是 `(` / `*` / `+` / `a)`。
+  for (const bad of ['(', '*', '+', 'a)']) {
+    let threw = false;
+    try { titleTypeReRef([bad]); } catch { threw = true; }
+    ok(threw, `不可解析的 titleTypes fragment「${bad}」必须抛错，不得静默放行`);
+    let threw2 = false;
+    try { evaluateFormat({ title: 'feat: x', body: FG_BODY_FULL, config: { ...FG_CFG, titleTypes: [bad] } }); } catch { threw2 = true; }
+    ok(threw2, `evaluateFormat 遇「${bad}」同样抛错（CLI 转 exit 3）`);
+  }
+  // 对照: `[` 能编译，因此它**不该**被期望抛错（锁住上面的选例理由，防有人"修正"回去）
+  ok(titleTypeReRef(['[']) instanceof RegExp, '`[` 在本 pattern 里可编译——不得把它当非法用例');
+});
+
+t('[D2-FG] 配置未声明 → SKIP（显式"无判据"，不是 PASS；不硬编码任一目标仓的段落名）', () => {
+  const r = evaluateFormat({ title: '随便', body: '空的', config: { ...EMPTY_FORMAT_CONFIG } });
+  eq(r.result, 'SKIP', 'result 必须是 SKIP 而不是 PASS——否则"没判据"会被读成"检查通过"');
+  eq(r.title_type_ok, null);
+  eq(r.sections_checked, false);
+  // 只声明 titleTypes → 只查标题，段落 SKIP 但整体不再 SKIP
+  const partial = evaluateFormat({ title: 'feat: X', body: '空的', config: { ...EMPTY_FORMAT_CONFIG, titleTypes: ['feat'] } });
+  eq(partial.result, 'PASS');
+  eq(partial.sections_checked, false);
+  eq(evaluateFormat({ title: 'wat: X', body: '空的', config: { ...EMPTY_FORMAT_CONFIG, titleTypes: ['feat'] } }).result, 'FAIL');
+});
+
+t('[D2-FG] malformed 配置 fail-closed 抛错，绝不回退默认（同 size-gate 口径）', () => {
+  const d = mkdtempSync(join(tmpdir(), 'fg-'));
+  const g = (...a) => execFileSync('git', ['-C', d, ...a], { encoding: 'utf8' }).trim();
+  g('init', '-q', '-b', 'main'); g('config', 'user.email', 'a@b.c'); g('config', 'user.name', 'x');
+  mkdirSync(join(d, 'agent-use', 'docs'), { recursive: true });
+  const writeRules = (obj, raw) => {
+    writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), raw ?? JSON.stringify(obj));
+    g('add', '.'); g('commit', '-qm', 'r');
+    return g('rev-parse', 'HEAD');
+  };
+  const expectThrow = (ref, re) => {
+    let msg = null;
+    try { loadFormatConfig(d, ref); } catch (e) { msg = e.message; }
+    ok(msg && re.test(msg), `应 fail-closed 抛错并命中 ${re}，得到: ${msg}`);
+  };
+  expectThrow(writeRules({ featureSections: '变更说明' }), /featureSections 必须是非空字符串数组/);
+  expectThrow(writeRules({ bugfixSections: [] }), /bugfixSections 声明了却是空数组/);
+  expectThrow(writeRules({ titleTypes: ['feat', ''] }), /titleTypes 必须是非空字符串数组/);
+  expectThrow(writeRules({ featureSections: ['a', 3] }), /featureSections 必须是非空字符串数组/);
+  expectThrow(writeRules(null, '{ 坏 json'), /解析失败/);
+  expectThrow(writeRules(null, '[1,2]'), /顶层必须是对象/);
+  // 文件整个不存在 → default（无判据），不抛错
+  const d2 = mkdtempSync(join(tmpdir(), 'fg2-'));
+  const g2 = (...a) => execFileSync('git', ['-C', d2, ...a], { encoding: 'utf8' }).trim();
+  g2('init', '-q', '-b', 'main'); g2('config', 'user.email', 'a@b.c'); g2('config', 'user.name', 'x');
+  writeFileSync(join(d2, 'x.txt'), 'x'); g2('add', '.'); g2('commit', '-qm', 'r');
+  const r = loadFormatConfig(d2, g2('rev-parse', 'HEAD'));
+  eq(r.source, 'default');
+  eq(r.config.featureSections, null);
+  rmSync(d, { recursive: true, force: true }); rmSync(d2, { recursive: true, force: true });
+});
+
+t('[D2-FG-FC] 「真·缺文件」与「git 失败」必须分开: 前者 SKIP，后者 fail-closed 抛错（防假 SKIP）', () => {
+  const d = mkdtempSync(join(tmpdir(), 'fgfc-'));
+  const g = (...a) => execFileSync('git', ['-C', d, ...a], { encoding: 'utf8' }).trim();
+  g('init', '-q', '-b', 'main'); g('config', 'user.email', 'a@b.c'); g('config', 'user.name', 'x');
+  writeFileSync(join(d, 'x.txt'), 'x'); g('add', '.'); g('commit', '-qm', 'r');
+  const head = g('rev-parse', 'HEAD');
+  // 正向（唯一允许 SKIP 的情形）: ref 可解析、ls-tree 确认路径不存在
+  eq(loadFormatConfig(d, head).source, 'default', '真·缺文件才允许 SKIP');
+  eq(loadFormatConfig(d, 'main').source, 'default', '分支名同样可解析');
+  // 反向: 坏 ref / 空 ref / 非 git 仓 —— 初版这三种全部静默返回 source=default（假 SKIP）
+  const expectThrow = (dir, ref, re, label) => {
+    let msg = null;
+    try { loadFormatConfig(dir, ref); } catch (e) { msg = e.message; }
+    ok(msg !== null, `${label} 必须抛错，不得静默 SKIP（初版正是静默）`);
+    ok(re.test(msg), `${label} 的错误文案应命中 ${re}，得到: ${msg}`);
+  };
+  expectThrow(d, 'definitely-no-such-ref', /无法解析成 tree/, '坏 ref');
+  expectThrow(d, '', /无法解析成 tree|不是 git 仓库/, '空 ref');
+  const notRepo = mkdtempSync(join(tmpdir(), 'fgnr-'));
+  expectThrow(notRepo, 'main', /不是 git 仓库|git 不可用/, '非 git 仓');
+  // 对照: 路径存在时照常读出（三步判别没有把正常路径拦掉）
+  mkdirSync(join(d, 'agent-use', 'docs'), { recursive: true });
+  writeFileSync(join(d, 'agent-use/docs/pr-rules.json'), JSON.stringify({ titleTypes: ['feat'] }));
+  g('add', '.'); g('commit', '-qm', 'cfg');
+  const r2 = loadFormatConfig(d, g('rev-parse', 'HEAD'));
+  eq(r2.source, 'base');
+  eq(r2.config.titleTypes, ['feat']);
+  rmSync(d, { recursive: true, force: true }); rmSync(notRepo, { recursive: true, force: true });
+});
+
+t('[D2-FG] 配置从 merge-base 树读: 候选侧自带宽配置绕不过闸（复刻 size-gate 审 B2-F1 防线）', () => {
+  const d = mkdtempSync(join(tmpdir(), 'fgb-'));
+  const g = (...a) => execFileSync('git', ['-C', d, ...a], { encoding: 'utf8' }).trim();
+  g('init', '-q', '-b', 'main'); g('config', 'user.email', 'a@b.c'); g('config', 'user.name', 'x');
+  mkdirSync(join(d, 'agent-use', 'docs'), { recursive: true });
+  const rulesPath = join(d, 'agent-use/docs/pr-rules.json');
+  writeFileSync(rulesPath, JSON.stringify({ featureSections: ['变更说明', '备注'], titleTypes: ['feat'] }));
+  g('add', '.'); g('commit', '-qm', 'base');
+  const baseSha = g('rev-parse', 'HEAD');
+  // 候选侧把段落要求改空（"我这个 PR 不需要段落"）
+  g('checkout', '-qb', 'feat');
+  writeFileSync(rulesPath, JSON.stringify({ featureSections: ['备注'], titleTypes: ['feat', 'wat'] }));
+  g('add', '.'); g('commit', '-qm', 'widen');
+  const mergeBase = g('merge-base', 'main', 'HEAD');
+  eq(mergeBase, baseSha, '前提: merge-base 应是 base 提交');
+  const fromBase = loadFormatConfig(d, mergeBase).config;
+  eq(fromBase.featureSections, ['变更说明', '备注'], '必须读 merge-base 树的配置');
+  eq(fromBase.titleTypes, ['feat'], '候选侧新增的 titleTypes 不得生效');
+  // 对照: 若错误地读候选树，宽配置就会生效（本条锁的正是"没读候选树"）
+  const fromHead = loadFormatConfig(d, g('rev-parse', 'HEAD')).config;
+  eq(fromHead.featureSections, ['备注'], '前提对照: 候选树确实是宽配置');
+  ok(evaluateFormat({ title: 'wat: X', body: '## 备注\n无\n', config: fromBase }).result === 'FAIL',
+    '按 base 配置判: 候选侧自加的 type 与放宽的段落都不生效');
+  ok(evaluateFormat({ title: 'wat: X', body: '## 备注\n无\n', config: fromHead }).result === 'PASS',
+    '前提对照: 按候选配置判就会被绕过——这正是必须读 merge-base 的理由');
+  rmSync(d, { recursive: true, force: true });
+});
+
+t('[D2-FG] config_hash 随配置变化（配置被换掉时可被上报/对账检出）', () => {
+  const h = formatConfigHash(FG_CFG);
+  eq(h, formatConfigHash({ ...FG_CFG, lightTypes: [...FG_CFG.lightTypes].reverse() }), 'lightTypes 顺序不影响 hash（内部排序）');
+  ok(h !== formatConfigHash({ ...FG_CFG, featureSections: ['变更说明'] }), '段落集变化必须换 hash');
+  ok(h !== formatConfigHash({ ...FG_CFG, titleTypes: ['feat'] }), 'titleTypes 变化必须换 hash');
+  ok(h !== formatConfigHash({ ...FG_CFG, lightTypes: ['chore'] }), 'lightTypes 集合变化必须换 hash');
+});
+
+// ── D3: 域外真问题通道 out_of_scope_notes ──
+const OOS_CHANGED = new Set(['src/changed.ts']);
+const OOS_TRACKED = new Set(['src/changed.ts', 'src/legacy.ts', 'README.md']);
+const mkNote = (over = {}) => ({ id: 'N1', note: '既有实现里 X 未加锁', evidence: 'src/legacy.ts:12 读改写无互斥', suggested_issue_title: 'legacy 路径缺锁', ...over });
+const mkVoos = (over = {}) => mkVerdictFor('claude-adversarial', bundle, {
+  findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: ['src/changed.ts'], evidence: 'e', status: 'closed' }],
+  closed_finding_ids: ['F1'], ...over
+});
+const voosErrs = (over) => validateVerdict(mkVoos(over), { changedPaths: OOS_CHANGED, trackedPaths: OOS_TRACKED });
+
+t('[D3-OOS] 正向（本通道存在的理由）: note 的 ref_paths 可以在实改集之外，只要是 tracked 文件', () => {
+  eq(voosErrs({ out_of_scope_notes: [mkNote({ ref_paths: ['src/legacy.ts'] })] }), [], 'diff 外的 tracked 路径必须被接受');
+  eq(voosErrs({ out_of_scope_notes: [mkNote()] }), [], 'ref_paths 可省略');
+  eq(voosErrs({ out_of_scope_notes: [] }), [], '空数组合法');
+  eq(voosErrs({}), [], '不带该字段仍合法（存量 verdict 向后兼容，不破）');
+});
+
+t('[D3-OOS] 对照（SC-R3-5 一个字没放宽）: 同一 diff 外路径放进 finding.anchor_paths 仍必拒', () => {
+  const errs = validateVerdict(mkVerdictFor('claude-adversarial', bundle, {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: ['src/legacy.ts'], evidence: 'e', status: 'closed' }],
+    closed_finding_ids: ['F1']
+  }), { changedPaths: OOS_CHANGED, trackedPaths: OOS_TRACKED });
+  ok(errs.some((e) => /实改文件集/.test(e)), `anchor_paths 的实改集校验必须仍然生效: ${JSON.stringify(errs)}`);
+});
+
+t('[D3-OOS] 反向: note 携带 finding 的机器字段 → 拒（防用旁路通道伪造绕过实改集校验的 finding）', () => {
+  for (const k of ['anchor_paths', 'severity', 'primary_face', 'family_id', 'invariant', 'status', 'write_paths', 'allowed_paths']) {
+    const errs = voosErrs({ out_of_scope_notes: [mkNote({ [k]: k === 'anchor_paths' ? ['src/legacy.ts'] : 'x' })] });
+    ok(errs.some((e) => e.includes(`不得携带 ${k}`)), `note 携带 ${k} 必须被拒: ${JSON.stringify(errs)}`);
+  }
+});
+
+t('[D3-OOS] 反向: 必填字段缺失 / id 撞号 / ref_paths 非法 → 逐条拒', () => {
+  for (const k of ['id', 'note', 'evidence', 'suggested_issue_title']) {
+    const n = mkNote(); delete n[k];
+    ok(voosErrs({ out_of_scope_notes: [n] }).some((e) => e.includes(k === 'id' ? '缺 id' : `缺 ${k}`)), `缺 ${k} 必拒`);
+    ok(voosErrs({ out_of_scope_notes: [mkNote({ [k]: '' })] }).length > 0, `${k} 为空串必拒`);
+  }
+  ok(voosErrs({ out_of_scope_notes: [mkNote(), mkNote()] }).some((e) => /id 重复/.test(e)), 'note id 重复必拒');
+  ok(voosErrs({ out_of_scope_notes: [mkNote({ id: 'F1' })] }).some((e) => /撞号/.test(e)), 'note id 与 finding id 撞号必拒');
+  ok(voosErrs({ out_of_scope_notes: [mkNote({ ref_paths: ['src/nope.ts'] })] }).some((e) => /tracked/.test(e)), '非 tracked 路径必拒');
+  ok(voosErrs({ out_of_scope_notes: [mkNote({ ref_paths: ['src/'] })] }).length > 0, '目录必拒');
+  ok(voosErrs({ out_of_scope_notes: [mkNote({ ref_paths: ['/abs/x.ts'] })] }).length > 0, '绝对路径必拒');
+  ok(voosErrs({ out_of_scope_notes: [mkNote({ ref_paths: ['src/legacy.ts', 'src/legacy.ts'] })] }).some((e) => /ref_paths 重复/.test(e)), '重复必拒');
+  ok(voosErrs({ out_of_scope_notes: [mkNote({ ref_paths: Array.from({ length: 21 }, (_, i) => `src/f${i}.ts`) })] }).some((e) => /上限/.test(e)), '超上限必拒');
+  ok(voosErrs({ out_of_scope_notes: [mkNote({ ref_paths: 'src/legacy.ts' })] }).some((e) => /必须是数组/.test(e)), 'ref_paths 非数组必拒');
+  ok(voosErrs({ out_of_scope_notes: 'x' }).some((e) => /必须是数组/.test(e)), 'notes 非数组必拒');
+  ok(voosErrs({ out_of_scope_notes: ['x'] }).some((e) => /必须是对象/.test(e)), 'note 元素非对象必拒');
+});
+
+t('[D3-OOS] 共识不受影响: 三席带 notes 仍 PASS，且 note 不进 canonical_findings / 不进 SC 台账', () => {
+  const notes = [mkNote({ id: 'N1' })];
+  const withNotes = { findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: ['src/changed.ts'], evidence: 'e', status: 'closed' }], closed_finding_ids: ['F1'], out_of_scope_notes: notes };
+  const plain = { findings: withNotes.findings, closed_finding_ids: ['F1'] };
+  const withN = consensusFor(bundle, [withNotes, withNotes, { ...withNotes, gate_checks: THIRD_GATES }]);
+  eq(withN.artifact.gate_result, 'pass', JSON.stringify(withN.artifact.fail_reasons));
+  const without = consensusFor(bundle, [plain, plain, { ...plain, gate_checks: THIRD_GATES }]);
+  eq(without.artifact.gate_result, 'pass');
+  // canonical_findings 数量与内容不因 notes 变化；note id 不出现在里面
+  eq(withN.artifact.canonical_findings.length, without.artifact.canonical_findings.length, 'notes 不得新增 canonical finding');
+  ok(!JSON.stringify(withN.artifact.canonical_findings).includes('N1'), 'note 不得泄进 canonical_findings');
+  ok(!JSON.stringify(withN.artifact.canonical_findings).includes('legacy'), 'note 的证据不得进冲突图输入');
+  // notes 入 verdict hash → artifact hash 变（不可事后追加/删改）
+  ok(withN.artifact.consensus_artifact_hash !== without.artifact.consensus_artifact_hash, 'notes 必须参与 verdict_hashes → artifact hash（改了就换 hash）');
+  const mutated = { ...withNotes, out_of_scope_notes: [mkNote({ id: 'N1', note: '改了一个字' })] };
+  const withM = consensusFor(bundle, [mutated, mutated, { ...mutated, gate_checks: THIRD_GATES }]);
+  eq(withM.artifact.gate_result, 'pass');
+  ok(withM.artifact.consensus_artifact_hash !== withN.artifact.consensus_artifact_hash, '改 note 文本必须换 artifact hash');
+  // note 不影响 conjunct④: 带 notes 的第三席 gate 全 pass 时照常放行；gate fail 仍拒（未被削弱）
+  const gateFail = { ...withNotes, gate_checks: THIRD_GATES.map((g, i) => i === 0 ? { ...g, result: 'fail' } : g), verdict: 'REQUIRES_CHANGES' };
+  const bad = consensusFor(bundle, [withNotes, withNotes, gateFail]);
+  eq(bad.artifact.gate_result, 'fail', 'conjunct③④ 未被 notes 削弱');
+});
+
+t('[D3-OOS-WIRE] 接线层: runConsensusGate 只给 repoDir（不注入任何集合）时必须自算 tracked 集并校验 ref_paths', () => {
+  // 为什么单独一条: 上面的 [D3-OOS] 用例都**注入** trackedPaths/changedPaths，锁的是 validator 的
+  // 判定逻辑；而 live 路径（consensus-gate CLI）只给 repoDir。初版 runConsensusGate 只构造
+  // changedPaths、从不构造 trackedPaths —— anchor_paths 侥幸被实改集检查吞掉，但 ref_paths 的
+  // tracked 检查在 live 路径上一道都没有。「单元层锁住了、接线层没接上」，本条专测接线层。
+  const d = mkdtempSync(join(tmpdir(), 'oosw-'));
+  const g = (...a) => execFileSync('git', ['-C', d, ...a], { encoding: 'utf8' }).trim();
+  g('init', '-q', '-b', 'main'); g('config', 'user.email', 'a@b.c'); g('config', 'user.name', 'x');
+  mkdirSync(join(d, 'src'), { recursive: true });
+  writeFileSync(join(d, 'src/legacy.ts'), 'legacy\n');      // tracked 但本 PR 未改
+  writeFileSync(join(d, 'src/changed.ts'), 'v1\n');
+  g('add', '.'); g('commit', '-qm', 'base');
+  const baseSha = g('rev-parse', 'HEAD');
+  writeFileSync(join(d, 'src/changed.ts'), 'v2\n');         // 实改
+  g('add', '.'); g('commit', '-qm', 'cand');
+  const candSha = g('rev-parse', 'HEAD');
+
+  const b = mkBundle(baseSha, candSha);
+  const mk = (refPaths) => ({
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'x', anchor_paths: ['src/changed.ts'], evidence: 'e', status: 'closed' }],
+    closed_finding_ids: ['F1'],
+    out_of_scope_notes: [{ id: 'N1', note: 'n', evidence: 'e', suggested_issue_title: 't', ...(refPaths ? { ref_paths: refPaths } : {}) }]
+  });
+  const run = (refPaths) => {
+    const o = mk(refPaths);
+    const vs = [mkVerdictFor('claude-adversarial', b, o), mkVerdictFor('codex-adversarial', b, o),
+      mkVerdictFor('upstream-preview', b, { ...o, gate_checks: THIRD_GATES })];
+    return runConsensusGate(vs, { bundle: b, repoDir: d }); // 只给 repoDir——live 路径的形态
+  };
+  // 正向: tracked-but-unchanged 的 ref_paths 必须放行（这是 D3 通道存在的理由，不得被误伤）
+  eq(run(['src/legacy.ts']).gate_result, 'pass', 'diff 外的 tracked 路径必须放行: ' + JSON.stringify(run(['src/legacy.ts']).fail_reasons));
+  eq(run(undefined).gate_result, 'pass', 'ref_paths 省略仍放行');
+  // 反向（初版在 live 路径上放行了这条）: 编造一个不存在的路径 → 必须被 tracked 门拦下
+  const bogus = run(['src/does-not-exist.ts']);
+  eq(bogus.gate_result, 'fail', '不存在的 ref_paths 必须被 live 路径拦下（初版这里 fail-open）');
+  ok(bogus.fail_reasons.some((r) => /tracked/.test(r)), `失败原因应点名 tracked: ${JSON.stringify(bogus.fail_reasons)}`);
+  // 对照: anchor_paths 的实改集门在同一条 live 路径上仍然生效（未被本次接线改动影响）
+  const o2 = mk(['src/legacy.ts']);
+  o2.findings[0].anchor_paths = ['src/legacy.ts']; // tracked 但未改
+  const vs2 = [mkVerdictFor('claude-adversarial', b, o2), mkVerdictFor('codex-adversarial', b, o2),
+    mkVerdictFor('upstream-preview', b, { ...o2, gate_checks: THIRD_GATES })];
+  const r2 = runConsensusGate(vs2, { bundle: b, repoDir: d });
+  eq(r2.gate_result, 'fail');
+  ok(r2.fail_reasons.some((x) => /实改文件集/.test(x)), 'SC-R3-5 在 live 路径上仍生效');
+  rmSync(d, { recursive: true, force: true });
+});
 
 // ========== 汇总 + SKIPPED ==========
 await Promise.all(pending);
