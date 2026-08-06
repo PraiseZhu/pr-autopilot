@@ -50,7 +50,8 @@ import { checkLeases, alertWithFallback } from '../scripts/health/lease-check.mj
 import { readJson, hashObject, canonicalJson } from '../scripts/lib/common.mjs';
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from '../scripts/lib/hardening-registry.mjs';
 import { contractSpec, contractDigest, emitContract, requiredLiterals, checkDispatchPackage, SEATS, ALL_FACES } from '../scripts/dispatch-contract.mjs';
-import { loadFormatConfig, evaluateFormat, formatConfigHash, hasSection, EMPTY_FORMAT_CONFIG } from '../scripts/pr-format-gate.mjs';
+import { loadFormatConfig, evaluateFormat, formatConfigHash, hasSection, EMPTY_FORMAT_CONFIG,
+  titleTypeRe as titleTypeReRef, TITLE_VAGUE_RE as TITLE_VAGUE_RE_REF } from '../scripts/pr-format-gate.mjs';
 import { DEFAULT_REQUIREMENTS } from '../scripts/verdict-validate.mjs';
 
 let pass = 0, failCount = 0;
@@ -5331,6 +5332,69 @@ t('[D2-FG] 反向: title type 不在白名单 / 形态不合 → FAIL', () => {
     const r = evaluateFormat({ title: bad, body: FG_BODY_FULL, config: FG_CFG });
     eq(r.result, 'FAIL', `title「${bad}」应判 FAIL: ${JSON.stringify(r)}`);
     eq(r.title_type_ok, false);
+  }
+});
+
+t('[D2-FG-ALIGN] 初版分叉三例必拦（本门比 review-pr 宽 = Phase 1 放行、第三席仍 fail = D2 死锁复活）', () => {
+  // 初版正则 `(\([^)]*\))?!?:\s*\S` 放行了这三个，review-pr 的 `(\([^)]+\))?!?: .+` 判 fail
+  for (const bad of ['feat(): x', 'feat(scope):x', 'feat:x']) {
+    const r = evaluateFormat({ title: bad, body: FG_BODY_FULL, config: FG_CFG });
+    eq(r.title_type_ok, false, `「${bad}」必须判不合规（初版分叉用例）`);
+    eq(r.result, 'FAIL');
+  }
+  // 正向对照: 合法形态照旧放行（收紧不得误伤）
+  for (const good of ['feat(scope): x', 'feat: x', 'feat!: x', 'feat(a)!: x', 'feat:  两个空格也合法']) {
+    eq(evaluateFormat({ title: good, body: FG_BODY_FULL, config: FG_CFG }).title_type_ok, true, `「${good}」不得被误伤`);
+  }
+});
+
+t('[D2-FG-ALIGN] 含糊词黑名单（review-pr formatIssues 同层判据，漏掉即换一扇门复活死锁）', () => {
+  for (const bad of ['feat: 优化', 'fix: 调整', 'feat: 更新 ', 'feat: bug', 'feat: update', 'feat: 若干', 'feat: 一些', 'feat: MISC']) {
+    const r = evaluateFormat({ title: bad, body: FG_BODY_FULL, config: FG_CFG });
+    eq(r.title_vague, true, `「${bad}」应命中含糊词: ${JSON.stringify(r.reasons)}`);
+    eq(r.result, 'FAIL');
+  }
+  // 正向: 含糊词只在**结尾**才算（词出现在描述中间不拦）
+  for (const good of ['feat: 优化渲染路径', 'fix: 调整了阈值到 32px', 'feat: update 之后再收敛']) {
+    eq(evaluateFormat({ title: good, body: FG_BODY_FULL, config: FG_CFG }).title_vague, false, `「${good}」不得误判含糊`);
+  }
+  eq(evaluateFormat({ title: '随便', body: FG_BODY_FULL, config: { ...EMPTY_FORMAT_CONFIG } }).title_vague, null, '未声明 titleTypes 时该项为 null（SKIP），不是 false');
+});
+
+t('[D2-FG-ALIGN] self-review 勾选率: 段落存在且 <80% → FAIL；段落不存在不强制', () => {
+  const withList = (done, total) => `${FG_BODY_FULL}\n## Self-review\n${Array.from({ length: total }, (_, i) => `- [${i < done ? 'x' : ' '}] 第${i + 1}项`).join('\n')}\n`;
+  eq(evaluateFormat({ title: 'feat: x', body: withList(1, 3), config: FG_CFG }).result, 'FAIL', '1/3 应拦');
+  eq(evaluateFormat({ title: 'feat: x', body: withList(3, 3), config: FG_CFG }).result, 'PASS', '3/3 应放行');
+  eq(evaluateFormat({ title: 'feat: x', body: withList(4, 5), config: FG_CFG }).result, 'PASS', '4/5=80% 恰好放行（不是 <=）');
+  const noSec = evaluateFormat({ title: 'feat: x', body: FG_BODY_FULL, config: FG_CFG });
+  eq(noSec.checklist.has_section, false);
+  eq(noSec.result, 'PASS', '没写 self-review 段落时不强制（作者自发写了才校验）');
+  // 只统计该段落到下一个标题之间的复选框——别处的 TODO 不进分母
+  const other = `${FG_BODY_FULL}\n## Self-review\n- [x] 做完了\n\n## 后续 TODO\n- [ ] 另开 issue\n- [ ] 再一条\n`;
+  const r = evaluateFormat({ title: 'feat: x', body: other, config: FG_CFG });
+  eq(r.checklist, { has_section: true, total: 1, done: 1, ratio: 1 }, '下一个标题之后的复选框不得计入分母');
+  eq(r.result, 'PASS');
+  // light 类不算勾选率（与段落检查同层豁免）
+  eq(evaluateFormat({ title: 'chore: x', body: withList(0, 3), config: FG_CFG }).result, 'PASS');
+});
+
+t('[D2-FG-ALIGN] 跨仓对齐探针: 与 review-pr 源码里的两条 regex 逐条比对裁决（缺席则如实 skip）', () => {
+  const RP = join(process.env.HOME ?? '', '.claude/skills/review-pr/scripts/context.mjs');
+  if (!existsSync(RP)) { console.log('       ↳ SKIP: 本机未安装 review-pr，跨仓对齐无法实测（如实记录，不当通过）'); return; }
+  const src = readFileSync(RP, 'utf8');
+  const typeSrc = src.match(/const TITLE_TYPE_RE\s*=\s*new RegExp\(`([^`]+)`\)/);
+  const vagueSrc = src.match(/const TITLE_VAGUE_RE\s*=\s*(\/.+\/[a-z]*);/);
+  ok(typeSrc && vagueSrc, 'review-pr 源码形态变了，探针需重写（这本身就是要人看的信号）');
+  const types = FG_CFG.titleTypes;
+  // 用 review-pr 的模板字符串原文编译出「他们的」正则（不执行他们的模块，避免副作用）
+  const theirType = new RegExp(typeSrc[1].replace('${prRules.titleTypes.join(\'|\')}', types.join('|')).replace(/\\\\/g, '\\'));
+  const theirVague = eval(vagueSrc[1]); // eslint-disable-line no-eval -- 只对本机 review-pr 源码里的字面量正则求值
+  const mineType = titleTypeReRef(types);
+  const cases = ['feat(scope): x', 'feat: x', 'feat(): x', 'feat(scope):x', 'feat:x', 'feat!: x', 'feat(a)!: x',
+    'wat: x', 'feat: ', 'feat:', 'feat: 优化', 'feat: 优化渲染', 'fix: 调整', 'feat: update', 'feat: 一些', 'FEAT: X'];
+  for (const c of cases) {
+    eq(mineType.test(c), theirType.test(c), `title type 裁决必须与 review-pr 一致: 「${c}」`);
+    eq(TITLE_VAGUE_RE_REF.test(c), theirVague.test(c), `含糊词裁决必须与 review-pr 一致: 「${c}」`);
   }
 });
 
