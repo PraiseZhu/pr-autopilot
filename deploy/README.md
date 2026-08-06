@@ -10,7 +10,7 @@
 2. mini clone cindy（fork 流程，push 目标 = PraiseZhu/cindy-fork）与 mivo 各一份 checkout。
 3. 飞书: owner 先私聊一次 Mivo bot；W-7 三前提实测（launchd 环境凭证可读 / bot API 可达 / 真实试发成功，凭证不落库不打日志）。
 4. `sessions.dispatch` 端到端: 从 script 调度起 GLM 会话，session meta 落盘核对四元组
-   `agentKind=claude-code + provider + z-ai/glm-5.2 + 最高`（不是只看 dispatch 成功）。
+   `agentKind=claude-code + provider + claude-sonnet-5 + xhigh`（不是只看 dispatch 成功）。
 5. goal skill 在 mini 可用，且已含 `--until-sc` 模式。
 6. deepseek effort=max 可用性（不支持 → 降 xhigh + 首张卡片脚注告知 + ledger 审计）。
 7. preRunHook 失败语义 / missed-fire 补跑语义实测；调度会话调 cindy_feishu_bot 是否 NO_CHAT_CONTEXT。
@@ -29,7 +29,7 @@ runtime 目录（state/lease/ledger/journal）一律在仓外 `~/pr-autopilot-ru
 
 - cron: `*/15 * * * *`；execution_mode=script；零 LLM。
 - schedule A（mivo）: workingDir=mivo checkout；schedule B（cindy）: workingDir=cindy checkout。
-- 两条 schedule 自身设 `agentKind=claude-code + z-ai/glm-5.2 + 最高`（修复会话经继承获得）。
+- 两条 schedule 自身设 `agentKind=claude-code + claude-sonnet-5 + xhigh`（修复会话经继承获得）。
 - 入口命令（`--config` **必填**——缺 budget 配置引擎直接拒绝启动，审③-F13-R fail-closed）:
 
 ```bash
@@ -78,7 +78,7 @@ CINDY_DISPATCH_CMD="node /Users/praise/pr-autopilot/deploy/wrappers/queue-transp
 ```
 
 链路：盯梢班车 = mini Cindy scheduler 的 **agent 模式** schedule（`claude-code + Cindy AI +
-z-ai/glm-5.2 + max`，workingDir = 对应仓 checkout，intervalMs 建议 900000=15min，静默运行）。
+claude-sonnet-5 + xhigh`，workingDir = 对应仓 checkout，intervalMs 建议 900000=15min，静默运行）。
 班车会话职责（写进 schedule prompt）：
 1. `source ~/pr-autopilot-runtime/env.sh` 后**后台**跑 engine（对应 engine-*.json）；
 2. 轮询 `~/pr-autopilot-runtime/dispatch-queue/*.task.txt`：每个任务调 `cindy_helper`
@@ -90,6 +90,34 @@ z-ai/glm-5.2 + max`，workingDir = 对应仓 checkout，intervalMs 建议 900000
 queue-transport 落任务文件→轮询回执（默认 240s，env 硬边界 [5s,300s]）→回执原样交
 cindy-dispatch.mjs 做 session_id+四元组校验；超时 = 投递失败，引擎 at-least-once 重试。
 
+### ⚠ 换模型必须同时改三处（owner 2026-08-06）
+
+同一个模型/档位值在这条链上出现三次，**必须逐字一致**，否则四元组校验判投递失败：
+
+| # | 位置 | 改法 |
+|---|---|---|
+| ① | Cindy schedule 的 `model` / `effort` 字段 | mini 的 Cindy 界面上改（决定**实际**用什么模型） |
+| ② | 同一 schedule 的 **prompt 正文**里那段 receipt 模板 | 同一界面改（决定回执**写**什么） |
+| ③ | `~/pr-autopilot-runtime/env.sh` 的 `EXPECT_*` 四个变量 | ssh 改（决定校验**期望**什么） |
+
+`cindy-dispatch.mjs` **已去掉硬编码默认值**：四个 `EXPECT_AGENT_KIND` / `EXPECT_PROVIDER` /
+`EXPECT_MODEL` / `EXPECT_EFFORT` 缺任一即 fail-closed 退出，不再回落到旧默认值。理由：初版把
+期望值写死在 wrapper 里，换模型时只改 ①②、③ 静默继续用旧期望 → 本门拿旧期望比新回执 →
+投递被判失败；反过来只改 ③ 则回执与实际不符却能过。现在 ③ 只能来自 env.sh，没有可被抄旧的默认值。
+
+env.sh 需含（值随 schedule 同步改）：
+```bash
+export EXPECT_AGENT_KIND='claude-code'
+export EXPECT_PROVIDER='Cindy AI'
+export EXPECT_MODEL='claude-sonnet-5'
+export EXPECT_EFFORT='xhigh'
+```
+
+**如实声明这道门的强度**：它校验的是「回执四元组 == env 期望」，而回执是班车会话按 prompt 模板
+写出来的**字面量**，不是从运行时实测到的真实模型。所以 ①② 不一致时（如 schedule 用 sonnet
+但 prompt 模板仍写 glm）本门只能发现"回执与期望不符"，**发现不了"回执与实际不符"**——真做到
+后者需要宿主回报 session meta 实测值。这是 T1，别读成"模型用错了机器一定拦得住"。
+
 （gh-snapshot/cindy-dispatch/queue-transport 均有契约 fixture 覆盖。）
 
 ## 3. 每日卡片调度（§3）
@@ -100,7 +128,7 @@ cindy-dispatch.mjs 做 session_id+四元组校验；超时 = 投递失败，引�
 
 ## 4. 自进化周会调度（§1.3a）
 
-- cron: `0 0 * * 1`；四元组 `claude-code + Cindy AI + z-ai/glm-5.2 + max`。
+- cron: `0 0 * * 1`；四元组 `claude-code + Cindy AI + claude-sonnet-5 + xhigh`。
 - 投递内容 = `scripts/evolution/weekly-evolve.md` 全文 + ledger 路径参数。
 
 ## 5. 独立健康告警（W-7，不依赖 Cindy）

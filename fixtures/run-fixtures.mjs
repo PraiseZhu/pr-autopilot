@@ -984,24 +984,48 @@ t('[审③F8-R] dispatch wrapper 四元组: 只回 session_id 拒 / 缺任一字
     state_dir: '/tmp/state', snapshot_cmd: 'snap {owner} {repo} {pr}', manifest_path: '/tmp/m.json',
     finalize_cmd: 'node finalize.mjs ...', complete_cmd: 'node complete.mjs ...', branch: 'fix-1', remote: 'origin'
   });
-  const runW = (transport) => {
+  // 期望值只能来自 env（wrapper 已去掉硬编码默认值——单一来源，见该文件头注释）
+  const EXPECT_ENV = { EXPECT_AGENT_KIND: 'claude-code', EXPECT_PROVIDER: 'Cindy AI', EXPECT_MODEL: 'claude-sonnet-5', EXPECT_EFFORT: 'xhigh' };
+  // unset: 要**真正删掉**的 env key 列表——不能用空串代替。初版代码是 `process.env.X ?? '默认值'`，
+  // `??` 只拦 null/undefined，空串会原样成为 EXPECT='' 照样判漂移拒绝；用空串写的"缺 env 应拒"
+  // 断言在装回硬编码默认值后**依然通过** = 假覆盖（本轮自查发现，改为真 unset 才有牙齿）。
+  const runW = (transport, { over = {}, unset = [] } = {}) => {
+    const env = { ...process.env, CINDY_DISPATCH_CMD: transport, ...EXPECT_ENV, ...over };
+    for (const k of unset) delete env[k];
     try {
-      execFileSync(process.execPath, [join(W, 'cindy-dispatch.mjs')], {
-        encoding: 'utf8', input: manifest,
-        env: { ...process.env, CINDY_DISPATCH_CMD: transport }
-      });
+      execFileSync(process.execPath, [join(W, 'cindy-dispatch.mjs')], { encoding: 'utf8', input: manifest, env });
       return true;
     } catch { return false; }
   };
-  const full = { session_id: 's1', agentKind: 'claude-code', provider: 'Cindy AI', model: 'z-ai/glm-5.2', effort: 'max' };
+  const full = { session_id: 's1', agentKind: 'claude-code', provider: 'Cindy AI', model: 'claude-sonnet-5', effort: 'xhigh' };
   ok(runW(mkTransport(JSON.stringify(full))), '四元组全齐应过');
   ok(!runW(mkTransport(JSON.stringify({ session_id: 's1' }))), '只回 session_id 应拒');
   for (const missing of ['agentKind', 'provider', 'model', 'effort']) {
     const { [missing]: _, ...part } = full;
     ok(!runW(mkTransport(JSON.stringify(part))), `缺 ${missing} 应拒`);
   }
-  ok(!runW(mkTransport(JSON.stringify({ ...full, model: 'glm-5.2' }))), 'model 漂移应拒');
+  ok(!runW(mkTransport(JSON.stringify({ ...full, model: 'z-ai/glm-5.2' }))), 'model 漂移应拒');
   ok(!runW(''), '无传输层配置应拒');
+  // 单一来源 fail-closed: 四个 EXPECT_* 真 unset 任一 → 拒（不得回落到硬编码默认值静默用旧期望）。
+  //
+  // 这条断言的构造试错了两轮，写清楚免得后人又写成假的：
+  //   ✗ 第一版用空串占位——`?? '默认值'` 只拦 null/undefined，空串会原样成为 EXPECT='' 照样判漂移，
+  //     装回默认值后断言依然通过 = 假覆盖。
+  //   ✗ 第二版真 unset 了，但回执把 model 与 effort **两个**都填旧值，而每次只 unset 一个变量 →
+  //     另一个字段必然与 env 的新值不符 → 仍被拒 → 装回默认值后断言依然通过 = 还是假覆盖。
+  //   ✓ 本版：只让**被 unset 的那一个字段**用旧默认值，其余三个字段用新值。这样装回默认值后，
+  //     期望会静默回落成旧值、恰好与回执相符、其余字段也相符 → 整体放行 → 断言变红。
+  const LEGACY_DEFAULT = { EXPECT_AGENT_KIND: 'claude-code', EXPECT_PROVIDER: 'Cindy AI', EXPECT_MODEL: 'z-ai/glm-5.2', EXPECT_EFFORT: 'max' };
+  const RECEIPT_FIELD = { EXPECT_AGENT_KIND: 'agentKind', EXPECT_PROVIDER: 'provider', EXPECT_MODEL: 'model', EXPECT_EFFORT: 'effort' };
+  for (const envVar of Object.keys(EXPECT_ENV)) {
+    const receipt = JSON.stringify({ ...full, [RECEIPT_FIELD[envVar]]: LEGACY_DEFAULT[envVar] });
+    ok(!runW(mkTransport(receipt), { unset: [envVar] }),
+      `${envVar} 真 unset 时必须拒（期望值只能来自 env.sh；回落旧默认值会让"旧回执 + 旧期望"这一对静默通过）`);
+  }
+  // 正向对照: 换一套期望值 + 相符的回执照样过（证明不是钉死某个具体模型，而是钉死"env 与回执一致"）
+  ok(runW(mkTransport(JSON.stringify({ ...full, model: 'z-ai/glm-5.2', effort: 'max' })),
+    { over: { EXPECT_MODEL: 'z-ai/glm-5.2', EXPECT_EFFORT: 'max' } }),
+  '换一套期望值且回执相符应过');
 });
 
 // ========== 7. inbox-digest ==========

@@ -10,12 +10,30 @@ import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
 // 审③-F8-R: 四元组全量必填 exact match（provider 在内），回执缺任一字段 = 派发失败
-const EXPECT = {
-  agentKind: process.env.EXPECT_AGENT_KIND ?? 'claude-code',
-  provider: process.env.EXPECT_PROVIDER ?? 'Cindy AI',
-  model: process.env.EXPECT_MODEL ?? 'z-ai/glm-5.2',
-  effort: process.env.EXPECT_EFFORT ?? 'max'
+//
+// 期望值**只有一个来源** = `env.sh` 的 EXPECT_* 四个变量（owner 2026-08-06）。
+// 初版这里写了硬编码默认值（`z-ai/glm-5.2` / `max`），于是同一个模型值散在三处：
+//   ① Cindy schedule 的 model/effort 列（决定实际用什么模型）
+//   ② schedule prompt 里那段 receipt 模板（决定回执写什么）
+//   ③ 本文件的默认值（决定校验期望什么）
+// 三处必须逐字一致，而 ③ 的默认值会在 ①② 换模型后静默继续用旧值 —— 换模型时只改 ①②，
+// 本门会拿旧期望去比新回执，投递被判失败；反过来只改 ③ 则回执与实际不符却能过。
+// 改为**缺 env 即 fail-closed**：期望值必须显式来自 env.sh，没有可被抄旧的默认值。
+const EXPECT_ENV = {
+  agentKind: 'EXPECT_AGENT_KIND',
+  provider: 'EXPECT_PROVIDER',
+  model: 'EXPECT_MODEL',
+  effort: 'EXPECT_EFFORT'
 };
+const EXPECT = {};
+for (const [field, envVar] of Object.entries(EXPECT_ENV)) {
+  const v = process.env[envVar];
+  if (!v) {
+    process.stderr.write(`[DISPATCH] ${envVar} 未设置（四元组期望值只能来自 env.sh，不设默认值以免换模型后静默用旧期望）——fail-closed\n`);
+    process.exit(1);
+  }
+  EXPECT[field] = v;
+}
 
 const manifest = JSON.parse(readFileSync(0, 'utf8'));
 // 审④-F5: 修复会话必须能直接执行 finalize/complete——缺任一接线字段 = 派发失败
