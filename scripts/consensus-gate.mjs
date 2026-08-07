@@ -154,15 +154,22 @@ export function runConsensusGate(verdicts, opts = {}) {
       if (parentShapeErrs.length) {
         for (const e of parentShapeErrs) failReasons.push(e);
       } else {
-        const parentReal = recomputeArtifactHash(parentArtifact);
-        if (parentArtifact.consensus_artifact_hash !== parentReal) {
-          failReasons.push('parent artifact 自身 hash 与内容重算不符（parent 被伪造/篡改，SC-B fail-closed）');
-        } else if (parentArtifact.gate_result !== 'pass') {
-          failReasons.push(`parent artifact gate_result=${parentArtifact.gate_result} ≠ pass（只有 PASS 共识才能作 parent，SC-B）`);
-        } else if (parentArtifact.round !== round - 1) {
-          failReasons.push(`parent artifact round=${parentArtifact.round} ≠ 当前 round-1=${round - 1}（父 round 跳号被拦，SC-B）`);
-        } else {
-          parentArtifactHash = parentArtifact.consensus_artifact_hash;
+        // 防御性 try/catch（与三消费入口同款理由）: recomputeArtifactHash 现在对结构非法
+        // 输入会 throw；正常路径下已被上面的 assertArtifactShape 挡住，但若那道短路本身
+        // 被破坏（回归/反向变异），不加这层会让 runConsensusGate 整个崩溃而不是优雅 fail。
+        let parentReal = null;
+        try { parentReal = recomputeArtifactHash(parentArtifact); }
+        catch (e) { failReasons.push(`parent artifact hash 重算失败（结构非法，fail-closed）: ${e.message}`); }
+        if (parentReal !== null) {
+          if (parentArtifact.consensus_artifact_hash !== parentReal) {
+            failReasons.push('parent artifact 自身 hash 与内容重算不符（parent 被伪造/篡改，SC-B fail-closed）');
+          } else if (parentArtifact.gate_result !== 'pass') {
+            failReasons.push(`parent artifact gate_result=${parentArtifact.gate_result} ≠ pass（只有 PASS 共识才能作 parent，SC-B）`);
+          } else if (parentArtifact.round !== round - 1) {
+            failReasons.push(`parent artifact round=${parentArtifact.round} ≠ 当前 round-1=${round - 1}（父 round 跳号被拦，SC-B）`);
+          } else {
+            parentArtifactHash = parentArtifact.consensus_artifact_hash;
+          }
         }
       }
     }
