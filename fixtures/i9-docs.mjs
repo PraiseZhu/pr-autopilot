@@ -408,6 +408,37 @@ try {
   }
 });
 
+// R2-P1 补漏（lead 复核发现：required_faces 那行早已如实标注"schema 可派生但未做"，是 lead
+// 读表时漏看，不是刻意划界）：ALL_FACES/FACES 与 SEATS/REVIEWERS、ADVERSARIAL 是完全同一形状
+// 的残留（verdict-validate.mjs 本地 FACES 未导出，dispatch-contract.mjs 独立手拄一份同值数组），
+// 同一个病治一半比多花一轮更糟，按已验证过的镜像模式一并根治。
+t('[SC-R2-C10] 真相源变化(verdict-validate.mjs 的 FACES 数组)→ dispatch-contract 的 ALL_FACES 与对抗席 required_faces 跟着变（不再各自手拄）', () => {
+  const vvPath = fileURLToPath(new URL('../scripts/verdict-validate.mjs', import.meta.url));
+  const original = readFileSync(vvPath, 'utf8');
+  try {
+    const facesLine = "export const FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];";
+    ok(original.includes(facesLine), '前置条件: 源码须含预期的 FACES 声明（探针按此字符串定位变异点，源码格式变了要同步改这里）');
+    const mutated = original.split(facesLine).join("export const FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'X-r2c10-sentinel'];");
+    writeFileSync(vvPath, mutated);
+    const probe = `
+import { ALL_FACES, contractSpec } from '${DC_URL}';
+import { FACES } from '${VV_URL}';
+try {
+  const spec = contractSpec({ seat: 'claude-adversarial', round: 1 });
+  console.log(JSON.stringify({ ALL_FACES, FACES, requiredFaces: spec.required_faces }));
+} catch (e) {
+  console.log(JSON.stringify({ __probe_error__: String((e && e.stack) || e) }));
+}
+`;
+    const { ALL_FACES: allFacesOut, FACES: facesOut, requiredFaces } = runProbe(probe);
+    eq(facesOut, ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'X-r2c10-sentinel'], '前置条件: verdict-validate.mjs 的 FACES 确实已变异');
+    eq(allFacesOut, facesOut, 'dispatch-contract 的 ALL_FACES 必须等于 verdict-validate.mjs 变异后的 FACES（不是自己另存一份）');
+    ok(requiredFaces.includes('X-r2c10-sentinel'), '对抗席的 required_faces 必须包含变异后新增的哨兵面（contractSpec 用的是活的 ALL_FACES，不是编译期定值的拷贝）');
+  } finally {
+    writeFileSync(vvPath, original);
+  }
+});
+
 t('[SC-R2-C5] SKILL.md 已同步声明 verdict schema **v3**（不再声明 v2）', () => {
   const skill = readFileSync(new URL('../skills/submit-pr/SKILL.md', import.meta.url), 'utf8');
   ok(skill.includes('review-verdict.schema.json` **v3**'), 'SKILL 必须声明 verdict schema **v3**');

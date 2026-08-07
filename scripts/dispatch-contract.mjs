@@ -30,21 +30,23 @@ import {
   ATTEMPT_MIN,
   HARDENING_NA_EVIDENCE_MIN_LENGTH,
   REVIEWERS,
-  ADVERSARIAL
+  ADVERSARIAL,
+  FACES
 } from './verdict-validate.mjs';
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from './lib/hardening-registry.mjs';
 
 // R2-P1（lead 实测发现的复发风险）: verdict_schema_version / attempt 下限 / hardening_coverage
-// [n_a].evidence 最小长度、合法 seat 名单（=REVIEWERS）、对抗席分类（ADVERSARIAL）——全部改为
-// 从 verdict-validate.mjs import，不再各自读 schema 或手拄第二份数组。verdict-validate.mjs 是
-// 这些值唯一的物理派生/声明点（前三者它自己从 schemas/review-verdict.schema.json 派生并
-// export；后两者是纯业务分类，schema 表达不了，只能靠代码常量单一来源，同样由它 export）。
-// 本文件此前独立读 schema 派生前三者、又各自手拄 SEATS/ADVERSARIAL 两个数组——「一处派生 +
-// 一处手拄」在真相源变化时会自动产生新的不一致，比原来的「两处手拄」更危险（emit 侧跟着真相源
-// 变了，check/validator 侧不跟，审查席按新契约交卷反而在收卷时被拒）。改成单一物理读取/声明
-// 点后，这类复发在构造上不可能再发生。
+// [n_a].evidence 最小长度、合法 seat 名单（=REVIEWERS）、对抗席分类（ADVERSARIAL）、七面枚举
+// （=FACES）——全部改为从 verdict-validate.mjs import，不再各自读 schema 或手拄第二份数组。
+// verdict-validate.mjs 是这些值唯一的物理派生/声明点（前三者它自己从
+// schemas/review-verdict.schema.json 派生并 export；后两者是业务分类/枚举，同样由它 export，
+// 不再区分"能不能从 schema 派生"——治同一个病就治干净，不留同形状残留）。本文件此前独立读
+// schema 派生前三者、又各自手拄 SEATS/ADVERSARIAL/ALL_FACES 三个数组——「一处派生 + 一处手拄」
+// 在真相源变化时会自动产生新的不一致，比原来的「两处手拄」更危险（emit 侧跟着真相源变了，
+// check/validator 侧不跟，审查席按新契约交卷反而在收卷时被拒）。改成单一物理读取/声明点后，
+// 这类复发在构造上不可能再发生。
 export const SEATS = REVIEWERS;
-export const ALL_FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+export const ALL_FACES = FACES;
 
 // issue #9 SC-C（状态模型矛盾修复）：「答」「推」两种处置不再走 status=closed + closed_finding_ids
 // 双条件——那双条件专属仍留在 findings[] 里的「修」「ARCHIVE」两种载体。这两条字面值直接进

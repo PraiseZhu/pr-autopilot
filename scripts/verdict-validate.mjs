@@ -70,13 +70,16 @@ export function changedPathSet({ repoDir, baseSha, candidateSha }) {
   return new Set(String(out).split('\0').filter(Boolean));
 }
 
-// R2-P1 SC-9: 导出席位名单，dispatch-contract.mjs 的 SEATS/ADVERSARIAL 改从这里 import，
-// 不再各自手拄第二份——本文件是这两份分类（哪些是合法 reviewer、哪些算对抗席）的唯一权威，
-// 这个分类不是 schema 能表达的概念（schema 只有 reviewer 的枚举值，没有"哪些是对抗席"这层
-// 业务语义），只能靠代码常量单一来源。
+// R2-P1 SC-9/SC-10: 导出席位名单与检查面枚举，dispatch-contract.mjs 的 SEATS/ADVERSARIAL/
+// ALL_FACES 改从这里 import，不再各自手拄第二份——本文件是这三份分类（哪些是合法 reviewer、
+// 哪些算对抗席、七面都是谁）的唯一权威。REVIEWERS/ADVERSARIAL 不是 schema 能表达的概念
+// （schema 只有 reviewer 的枚举值，没有"哪些是对抗席"这层业务语义），FACES 虽然值同构于
+// schema.properties.faces.items.properties.face.enum，但同一个病治一半比多花一轮更糟——
+// 三者用同一种手法（export 本地常量，下游 import）处理，不再区分"能不能从 schema 派生"，
+// 反正本文件本来就是它们的唯一权威声明点。
 export const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
 export const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];
-const FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+export const FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
 const RESULTS = ['pass', 'fail', 'n_a'];
 const SEVERITIES = ['blocker', 'major', 'suggestion'];
 const ACTIONABLE_SEVERITIES = ['blocker', 'major'];
