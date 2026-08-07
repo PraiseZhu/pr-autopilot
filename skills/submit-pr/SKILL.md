@@ -20,11 +20,25 @@ Phase 2c 修复 worker（模型见 Phase 2c 修复席表；按类套形状，goa
 Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini 注册盯梢（回执四要素）
 ```
 
-> **退出判据（2026-08-01 反猫捉老鼠修正）**：对抗审查席结构上**不会**主动给 APPROVED——它的职责
-> 就是挑毛病，新代码总有窄面可挑（九轮零 APPROVED 是本质）。收口**仍走** consensus PASS（硬约束，
-> 脚本不给旁路），但把 finding 分 `[MUST-FIX]`（改代码）/ `[ARCHIVE]`（写进 README 残余登记即解决）
-> 两类——ARCHIVE 类靠**文档化接受**让审查席正当 close，循环因此终止（文档不产生新代码 = 不长新
-> finding）。判据见 Phase 2c 收尾。「等一个不会来的批准」的破法是给审查席正当的 close 理由，不是绕闸。
+> **`face=pass` 与 `APPROVED` 的权威定义（issue #9 F4 修复；全文仅此一处定义，其余提及处与本段
+> 一致，不重新定义）**：
+> - **`face=pass`**（含 `gate_checks[].result=pass`）：该面 / 该 gate 的审查工作**已完成**，是
+>   审查席对七面（A-G）或第三席 `gate_checks[]` 逐项填报的**分项**结果。一个面 `pass`**可以**
+>   同时携带该面下的非零 finding——`pass` 说的是「这面审完了」，不是「这面零问题」。
+> - **`APPROVED`**（`v.verdict === 'APPROVED'`）：verdict **顶层**字段，是 conjunct③ 的判据，
+>   意思是「该 reviewer 同意本轮 `findings[]` 里**留存**的每一条都已按 Phase 2c 意见三分法妥善
+>   处置（修/答/推/ARCHIVE 之一，见下方处置载体表），可以**准入 SC 修复台账**」。**不等于**
+>   PR 可以合并——能否合并由 `push-guard.mjs` 的 `gate_result==pass` 独立判定，本 skill 本身
+>   没有合并能力（见文末「明确禁止」）。
+> - 两者关系：`APPROVED` 要求 `findings[]` 里留存的每条都满足 conjunct② 的关 finding 双条件
+>   （`status=closed` 且 id 入 `closed_finding_ids`，见下方「关 finding 是双条件」一节），
+>   **不要求** `findings[]` 为空。审查席**会**在完成一轮审查、把该轮 findings 妥善处置之后给出
+>   `APPROVED`——「新代码总有窄面可挑」说的是**逐面穷举永远挑得出新东西**，不代表 `APPROVED`
+>   结构上给不出来。把 finding 分 `[MUST-FIX]`（改代码）/ `[ARCHIVE]`（写进 README 残余登记即
+>   解决）两类，正是让审查席能在挑出问题的同时仍正当给出 `APPROVED` 的机制——ARCHIVE 类靠
+>   **文档化接受**让审查席正当 close，循环因此终止（文档不产生新代码 = 不长新 finding）。判据见
+>   Phase 2c 收尾。收口**仍走** consensus PASS（硬约束，脚本不给旁路），「等一个不会来的批准」
+>   的破法是给审查席正当的 close 理由，不是绕闸。
 
 ## Phase 1 — 预检（保留 v1 确定性部分）
 
@@ -196,24 +210,35 @@ finding）上出现，不是 reviewer 填写的字段。**verdict 层填 `family
 invariant，被旧实现按标签字符串合并成一族，PR body 只显示了先到的那个 invariant）。
 - 两对抗席：七面（A 正确性/B UI+无障碍/C 测试/D 文档/E 安全/F 范围/G 声称核实）逐面 `pass/fail/n_a`+证据；B 面仅当脚本判非 UI 才许 n_a。
 - 第三席：只填相关 faces（F/G/E/D 为主）+ `gate_checks[]`（产品/架构过程门专用通道，不得用无类型 finding 绕过归属规则）。
-- 首轮穷举（④）+ **加固清单覆盖率契约（机器强制，不是纸面约定）**：R1 两对抗席
-  （`claude-adversarial`/`codex-adversarial`）**必须逐条扫** `references/hardening-checklist.md`
-  的十类核对点（不是「看到什么报什么」），并在 verdict 里用机器字段
-  `checklist_version`（须等于 `scripts/lib/hardening-registry.mjs` 的当前版本）+
-  `hardening_coverage: [{class_id:1..10, result:covered|n_a, evidence}]` 逐类标注——目的是把
-  「既有代码的洞」在**一轮**里挖净，而不是分轮细水长流（R3 的 11 条本可更多提前到 R1）。
-  `verdict-validate.mjs` 对 `round===1` 的这两席强制 `checklist_version` 等于当前值 +
-  `hardening_coverage` **恰好 10 项、class_id 1〜10 各恰好一次、`evidence` 非空**——版本不符
-  单独报「清单版本过期需重审」（不与「缺 N 项」的普通计数错误混淆，D5：9→10 是 exact 集合变更，
-  2026-08-02 SC-B4 迁移，旧的 9 项 verdict 一律拒收要求重审，不静默放行）；缺项/漏项/重复
-  class_id 同样一律 schema/跨字段校验失败 → `runConsensusGate` fail-closed（R10-A3：此前只在
-  文档里写"必须标"，没有任何字段/校验落地，三份完全不带该字段的 verdict 照样能拿到
-  `gate_result: pass`）。第三席与 `round>=2` 不强制（复核轮不必重扫穷举面）。后续轮冒出"首轮
-  就能看到但没报"的 → 该席本轮 `degraded`。
+- 加固清单穷举（④）+ **加固清单覆盖率契约（机器强制，不是纸面约定）**：适用范围为**对抗席全
+  round**（`claude-adversarial`/`codex-adversarial` 任一 round 都强制，不再假设晚轮天然不需要
+  重扫穷举面；第三席任一 round 都不强制——其 faces/`gate_checks[]` 职责不同）**必须逐条扫**
+  `references/hardening-checklist.md` 的十类核对点（不是「看到什么报什么」），并在 verdict 里用
+  机器字段 `checklist_version`（须等于 `scripts/lib/hardening-registry.mjs` 的当前版本）+
+  `hardening_coverage[]`（每类一条 `{class_id, result, evidence}`，class_id 覆盖全部已定义
+  分类各一次）逐类标注——目的是把「既有代码的洞」尽早挖净，而不是分轮细水长流（R3 的 11 条本可
+  更多提前到 R1）。`checklist_version` 不符单独报「清单版本过期需重审」（不与「缺 N 项」的普通
+  计数错误混淆，D5：分类集合发生过 exact 变更时旧版本 verdict 一律拒收要求重审，不静默放行）；
+  缺项/漏项/重复 class_id 同样一律 schema/跨字段校验失败 → `runConsensusGate` fail-closed
+  （R10-A3：此前只在文档里写"必须标"，没有任何字段/校验落地，三份完全不带该字段的 verdict 照样
+  能拿到 `gate_result: pass`）。恰好覆盖哪些 `class_id`、版本号具体取值，一律从
+  `verdict-validate.mjs` / `lib/hardening-registry.mjs` 的常量派生并由其校验，契约段落见
+  `dispatch-contract.mjs` 的 `--emit` 输出，本文档不复述具体数值。
+  **`evidence` 按 `result` 分两种形态，不是同一句话**（i9-verdict 加固：`evidence` 现有格式
+  校验）：`result: 'covered'`（声称本次改动里该类被覆盖）→ `evidence` **必须**含「路径:行号」
+  形态的引用，例如 `"server/lib/foo.ts:42 破坏性 step 后的 catch 已接入统一 reconcile"`——声称
+  覆盖就要指出在哪覆盖的，不许空话；`result: 'n_a'`（本次改动不涉及该类）→ `evidence` **不含**
+  file:line 是正常的，写清楚为什么不适用即可，例如
+  `"本 PR 无并发/异步改动，该类无适用面"`——不适用的类本来就没有代码位置，强制它反而逼审查席
+  编造假锚点。
+  **首次尝试（`attempt===1`）就能看到、却拖到后续 `attempt` 才报**的 → 该席本轮 `degraded`
+  （判据按 `attempt` 计，不按 `round`——见下方「`round` 与 `attempt` 的权威定义」：一个 `round`
+  内可能经过多次 `attempt`，「首轮」在新语义下不再等价于「第一次尝试」）。
 - finding 归属（⑪）：恰好一个 `primary_face`；白名单内映射不进任何面 → `taxonomy_gap` + degraded 停轮，禁止丢弃。
 - Blocker 白名单（③）：仅 active path 失败 / SC 未达成 / 状态污染 / 安全风险 / 核心验证缺失 / 范围违规可阻塞；风格偏好等只进 Residual Risk 附录，不计入共识。
 
-**lead 职责**：只做争议仲裁（质询 ≤3 轮——这是**仲裁**轮上限，**不计**修复轮/delta 复核轮），**不改代码、不代关 finding、不宣布共识**。
+**lead 职责**：只做争议仲裁（质询 ≤3 次 `attempt`——这是**仲裁**上限，按 `attempt` 计数，**不计**
+`round`、不计修复轮/delta 复核轮），**不改代码、不代关 finding、不宣布共识**。
 Round 2+ 只对账修复情况 + 审 delta（含 SC/标题/正文/验证声称的元数据 diff，G 面不豁免）；禁止重审未改代码。**收口/螺旋/卡死的判据统一见 Phase 2c 收尾「收敛判据与收口」**（收口仍走 consensus PASS，靠 ARCHIVE 类文档化接受终止循环）。
 
 **共识 = 脚本判**：
@@ -224,6 +249,21 @@ node scripts/consensus-gate.mjs v1.json v2.json v3.json --bundle bundle.json --r
 `anchor_paths` ⊆ 实改集——tracked-but-unchanged 的 hub 路径在入口就被拦，不依赖调用方自觉。
 四 conjunct 缺一不可（同 input hash / union 每条被 origin close / 三 verdict APPROVED / 全部 gate_checks∈{pass,n_a}）。任何席 degraded 或 schema 不合 → fail-closed。
 
+**`round` 与 `attempt` 的权威定义（issue #9 SC-B 修复，全文仅此一处定义，其余提及处与本段一致）**：
+- **`round`** = 连续修复链中**已 PASS 共识产物（consensus artifact）的序号**，不是「审查尝试
+  次数」。失败 / degraded / 整体拒收（`consensus-gate` 判 `fail`）**不消耗** `round`——纠正后
+  仍重跑**当前** `round`，不递增。⇒ **首个可 PASS 的共识永远是 R1、`parent=null`**；
+  `round>=2` 的 PASS 产物必须携带上一个 PASS 产物作 `parent`。
+- **`attempt`** = 当前 `round` 内「第几次审查尝试」（含判 fail/degraded 的尝试），与 `round`
+  正交——`round` 数「第几个 PASS 产物」，`attempt` 数「为凑出这个 PASS 产物试了几次」。`round`
+  收紧为「PASS 序号」后，「这是第几次审查尝试」这个信息从 verdict 里消失了，而它仍在被两处
+  既有判据使用：上方加固清单覆盖率契约的 degraded 判据（「首次尝试就能看到却没报」）、以及
+  下方 `lead` 职责的仲裁上限 `≤3`。**`attempt` 是 verdict 的机读字段**（`schemas/review-verdict.
+  schema.json` 的必填项，`verdict-validate.mjs` 校验其形状、`consensus-gate.mjs` 校验三席一致——
+  具体校验条件不在此复述）：机器字段而非 lead 人工计数是刻意选择——纯人工记录没有任何守卫拦
+  单席填错，字段方案至少能让三席一致性校验逮到分歧。这两处判据据此都读该字段，不再靠 lead 对照
+  记录人工执行。
+
 **delta 轮（verdict `round>=2`）必须加 `--parent <上一轮 consensus.json>`**（SC-3/D8-3）：
 ```
 node scripts/consensus-gate.mjs v1.json v2.json v3.json --bundle bundle.json --repo-dir . --parent prev-consensus.json --out consensus.json
@@ -232,11 +272,11 @@ node scripts/consensus-gate.mjs v1.json v2.json v3.json --bundle bundle.json --r
 CLI 用法串写了这条要求但无人执行）。三席 `round` 不一致时按最大值判（fail-closed 方向）。
 真首轮（round 1）不传 `--parent` 正常放行，这是刻意保留的——首轮没有上一轮可绑。
 
-> **这道门只覆盖一个方向**：`round>=2` 缺 parent 必拒；反方向「round 1 **带** parent」
-> **不拦**。按 Phase 2b/2c 的流程，终版共识的 verdict 本应是 `round>=2`（它审的是 delta），
-> 但 `fixtures/run-fixtures.mjs` 里的终版用例用的是默认 `round: 1` 并带 parent。
-> 那属于**当时无人校验故未指定**，不是「round 1 带 parent」被认可为合法——真要收紧得先把
-> 终版 verdict 的 round 语义定死，属另一条不变量，本轮不扩。同理「三席 round 必须一致」也未实现。
+> **语义已按上方定义收紧，机器强制仍有两处缺口（本次文档变更不实现，留给机器侧同批跟进）**：
+> `round>=2` 缺 parent 必拒这一方向机器已强制；**反方向**「round 1 **带** parent」当前**仍
+> 不拦**——`fixtures/run-fixtures.mjs` 里的终版用例仍用默认 `round: 1` 并带 parent。按上方权威
+> 定义，R1 应当 `parent=null`；这条 fixture 与「三席 `round` 必须一致」尚未按新定义收紧校验
+> 逻辑，是两个具体的机器侧待办（见交卷报告「需要机器侧配合」一节，不在本次文档变更范围内实现）。
 
 **不检查**（写出来是因为「局部背书」最容易被当成「完整背书」，同 push-guard 如实声明 T1 上限的做法）：
 ① **不检查代码是否真的修好** —— conjunct② 的 `closed` 只表示「origin 席裁决该 finding 为真实、
@@ -434,28 +474,56 @@ marker 段 `<!-- pr-autopilot:invariants:start/end -->` 内是脚本生成的 MU
 - 重跑 consensus-gate 绑定三份新 verdict。
 
 **收敛判据与收口（反猫捉老鼠核心）**：
-> 前提认清：对抗审查席**结构上不会主动给 APPROVED**——它的职责是挑毛病，新代码总有窄面可挑。
-> 但收口**仍必须走** consensus-gate PASS（全 APPROVED + 全 finding closed）+ push-guard——这是硬约束，
-> 脚本不给旁路（`consensus-gate` conjunct②③ + push-guard `gate_result==pass`）。**不存在 lead 越过审查席
-> 直接发车的路径**，写「不等 APPROVED 就 push」= 文档骗自己（正是加固清单第 7 条的坑）。
+> 前提认清（`face=pass` / `APPROVED` 的权威定义见 Phase 2 开头「退出判据」一节，此处只用不重
+> 复定义）：「新代码总有窄面可挑」说的是审查席逐面穷举永远挑得出新东西，**不是**「`APPROVED`
+> 结构上给不出来」——审查席把本轮 findings 妥善处置（修/答/推/ARCHIVE）之后会给出 `APPROVED`。
+> 收口**仍必须走** consensus-gate PASS（全 APPROVED + 全留存 finding closed）+ push-guard——这是
+> 硬约束，脚本不给旁路（`consensus-gate` conjunct②③ + push-guard `gate_result==pass`）。**不存在
+> lead 越过审查席直接发车的路径**，写「不等 APPROVED 就 push」= 文档骗自己（正是加固清单第 7
+> 条的坑）。
 >
 > 真正的解法不是绕闸，是**让审查席有正当理由 close**：把 finding 分两类处置，`[ARCHIVE]` 类的
 > **修复动作本身就是"写进 README 残余登记"**，且这条"修复"跟 `[MUST-FIX]` 走**同一条 fix-run
 > 编排链**（文档化接受即解决，R9 已实证此路径；R10 把它接成机器可执行的 `kind=archive` SC，
-> 不再是「文档说了但脚本走不通」的纸面约定）。
+> 不再是「文档说了但脚本走不通」的纸面约定）。「答」与「推」不进 `[MUST-FIX]`/`[ARCHIVE]` 二分——
+> 它们的载体归属见下方 Phase 2c 意见三分法一节的处置载体表，同样不构成收口障碍。
 
 **意见三分法（finding 处置前置定性，2026-08-06 引入；蒸馏自 cindy-git-workflow-skill，经 GPT 审核席共识）**：
 
 每轮收到审查席 findings 后、提炼 SC 之前，lead 对每条 finding 先答一个问题：「它解决的是不是本 PR 意图目标句里的问题？」（意图目标句 = PR body 中的目标描述；intent marker 机制落地后指向 `<!-- pr-intent -->` 区块。）据此三分：
 
 - **修**：同时满足「服务于意图目标句」+「必须留在本 PR」→ 进 `[MUST-FIX]` 链（提炼 `kind=fix` SC，走 fix-run 编排，下述机器契约不变）。
-- **答**：误读 / 过时 / 与实现不符 → **不改代码**。lead 以证据（代码/测试/规范原文引用）回复请 origin 席复核；成立则该席在**新一份 verdict 里同时**把该 finding `status=closed` **并**将其 id 列入本席 `closed_finding_ids`（共识门双条件，缺一即 fail，见下方收口契约与 consensus-gate 实现——只翻 status 不列 id 是已知失败模式）。证据锚点单独留档（回复文本进 PR 评论或本轮对账记录），禁止无证据口头驳回。
-- **推**：真问题，但属于加固、邻域补全、通用能力——不服务于目标句，或不必留在本 PR → **默认外推**：开独立 issue，PR body 记录 issue 链接；origin 席据此在**同一份 verdict 里** `status=closed` **且**列入 `closed_finding_ids`（双条件同上），close 理由记 out-of-scope-tracked、issue 链接作为锚点单独留档。**即使是真问题也默认外推**——「每条意见单看都合理」正是 PR 在返修轮膨胀的路径；范围判断锚定意图，不锚定意见本身的对错（临场逐条判必输）。
+- **答**：误读 / 过时 / 与实现不符 → **不改代码**。lead 以证据（代码/测试/规范原文引用）回复请 origin 席复核；成立则该席在**下一份 verdict 里把该 finding 从 `findings[]` 中整条撤回**（不再出现，不是留在数组里只翻 `status`）——`consensus-gate` 的 conjunct② 只遍历该轮 `v.findings` 里现存的条目，撤回后的 finding 不再受关 finding 双条件约束，也不会进入 `canonical_findings`；**不走** `status=closed`/`closed_finding_ids`（那双条件是「修」与「ARCHIVE」两种仍留在 `findings[]` 里的载体专用，「答」用它会让本该消失的 finding 又进 canonical、需要一条本不该存在的 SC 才能收口）。证据锚点单独留档（回复文本进 PR 评论或本轮对账记录），禁止无证据口头驳回。
+- **推**：真问题，但属于加固、邻域补全、通用能力——不服务于目标句，或不必留在本 PR → **默认外推**：**不进** `findings[]`，改走 `out_of_scope_notes[]`（`schemas/review-verdict.schema.json` 定义的独立字段，与 `findings[]` 互斥——一条问题只能落在其中一处，不得两处都写；不论主证据落在 diff 之内还是之外，都走这一条通道，不再按「diff 内/外」分成两套机制）。origin 席填 `{id, note, evidence, suggested_issue_title, ref_paths?}`；lead 按 `suggested_issue_title` 开独立 issue，PR body 与本轮对账记录里落 issue 链接（tracking locator）。该字段天然**不进** conjunct②③④ 判定、**不进** `canonical_findings`、**不进** SC 台账。**即使是真问题也默认外推**——「每条意见单看都合理」正是 PR 在返修轮膨胀的路径；范围判断锚定意图，不锚定意见本身的对错（临场逐条判必输）。
 
-  > **主证据落在 diff 之外的真问题（仓库既有问题等）走 `out_of_scope_notes[]`，不要写成 finding**
-  > （D3，2026-08-06）：finding 的 `anchor_paths` 必须 ⊆ `base..candidate` 实改集（SC-R3-5，拦
-  > 「锚点填宽制造假冲突」，**一个字不放宽**），所以这类问题**无法**合法表达成 finding——塞
-  > `gate_checks` 会撞 conjunct④ 且进不了台账，丢弃则永久丢信息。审查席改填 verdict 的
+**四种处置的载体与互斥关系**（一条 finding 最终只能落在其中一处，不得同时出现在两处——这是本节
+要消除的状态模型矛盾：此前「答」「推」都被要求 `status=closed`+`closed_finding_ids`，于是都进了
+`canonical_findings`，而 `sc-coverage-gate.mjs` 要求每条 blocker/major canonical finding 恰好被
+1 条 SC 覆盖——答与推都没有 SC，收不了口）：
+
+| 处置 | 载体 | 关 finding 双条件 | 进 `canonical_findings` / SC 台账 |
+|---|---|---|---|
+| 修 | 留在 `findings[]` | 需要（`status=closed` + `closed_finding_ids`） | 进，`sc-coverage-gate` 强制 1:1 覆盖（`kind=fix`） |
+| ARCHIVE | 留在 `findings[]` | 需要（同上） | 进，`sc-coverage-gate` 强制 1:1 覆盖（`kind=archive`，见下方「ARCHIVE 类的收口」） |
+| 答 | 从 `findings[]` 撤回 | 不适用（已不在数组里） | 不进——证据回复留在 PR 评论/对账记录 |
+| 推 | `out_of_scope_notes[]` | 不适用（不是 finding） | 不进——issue 链接留在 PR body/对账记录 |
+
+> **残余风险如实声明：撤回与静默删除，机器不可区分**（issue #9 修复的已知代价，本轮不堵）：
+> 「答」类撤回在机器层与「审查席图省事，直接把不想处理的 finding 从下一轮 verdict 里删掉」
+> **完全同构**——`consensus-gate` 的 conjunct② 只遍历该轮 `v.findings` 里现存的条目，消失的
+> 条目它看不见，两种情况在 artifact 里留下的痕迹一样。唯一能堵的办法是比对 parent 的
+> `canonical_findings` 与本轮 `findings[]`，要求消失的条目必须有显式交代——但那需要新增一个
+> 撤回记录载体字段，且会强制「parent 里的 major 必须仍在本轮数组里」，与「答」类本就要撤回
+> 的诉求直接互斥（等于把死锁焊回去）。**所以本轮不堵**：仲裁记录（回复文本进 PR 评论/本轮
+> 对账记录）的存在与真实性**没有任何守卫**——不要把这句话读反：不是「由仲裁记录保证撤回正当」，
+> 是「撤回正当与否只能靠仲裁记录，而仲裁记录本身无人验证」。保证等级 T1（防疏忽不防伪造，同本仓
+> 其余"如实声明"条款一致），依赖 lead 在对账时人工核对每条撤回是否真有证据支撑。
+
+  > **补一条更硬的理由（覆盖「推」里主证据落在 diff 之外的子情形，D3，2026-08-06）**：这类问题
+  > 不仅是「按三分法判定该走 out_of_scope_notes」，而是**物理上无法**合法表达成 finding——
+  > finding 的 `anchor_paths` 必须 ⊆ `base..candidate` 实改集（SC-R3-5，拦「锚点填宽制造假
+  > 冲突」，**一个字不放宽**）——塞 `gate_checks` 会撞 conjunct④ 且进不了台账，丢弃则永久丢信息。
+  > 审查席改填 verdict 的
   > `out_of_scope_notes[]`（字段形状见 `schemas/review-verdict.schema.json`，派工契约段已自动带上
   > 字段名与必填项）：`ref_paths` 只要求是 tracked 文件、**允许在实改集之外**，这正是该通道存在
   > 的理由。它参与 `verdict_hashes`（改了就换 hash，不可事后追加），但**不进** conjunct②③④、
