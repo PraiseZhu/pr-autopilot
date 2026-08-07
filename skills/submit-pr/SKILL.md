@@ -165,7 +165,7 @@ node scripts/dispatch-contract.mjs --check pkg-<seat>.md --seat <reviewer> --rou
 |---|---|---|---|
 | ① claude-adversarial | claude-sonnet-5 / xhigh | 正确性 / 回归 / 影响面 | 盲审：不见其他席 finding |
 | ② codex-adversarial | codex/gpt-5.6-terra（骨折）/ xhigh；**条件升档**：本次 diff 路径命中目标仓 pr-rules.json `archGate.corePaths` → 该席 effort=ultra，派发说明标注原因 | 安全 / 边界 / 规范 | 盲审：同上 |
-| ③ upstream-preview | claude-sonnet-5 / xhigh | review-pr skill 口径预演（规则遵从/安全隐私门/格式门/产品·架构门语义预判） | **严格只读**：禁止发 GitHub review/评论/合并/标签等一切对外写动作，只产内部报告 |
+| ③ upstream-preview | deepseek/deepseek-v4-flash / max（owner 2026-08-08 替换 claude-sonnet-5/xhigh） | review-pr skill 口径预演（规则遵从/安全隐私门/格式门/产品·架构门语义预判） | **严格只读**：禁止发 GitHub review/评论/合并/标签等一切对外写动作，只产内部报告 |
 
 - **GPT 通路纪律（owner 2026-08-06 定案，三条通路择一）**：本机对 GPT 有**三条**互不相同的通路，
   从 model ID 前缀区分——`codex/gpt-*` = **骨折**（立省 85%）；裸 `gpt-*` = **Cindy AI 通路**
