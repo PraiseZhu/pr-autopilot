@@ -49,7 +49,7 @@ const SHA_A = 'a'.repeat(40), SHA_B = 'b'.repeat(40), SHA_C = 'c'.repeat(40);
 const FULL_FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'].map((f) => ({ face: f, result: f === 'B' ? 'n_a' : 'pass', evidence: `${f} 面走查完成` }));
 const THIRD_FACES = ['D', 'E', 'F', 'G'].map((f) => ({ face: f, result: 'pass', evidence: `${f} 面走查完成` }));
 const THIRD_GATES = ['format-gate', 'rule-compliance', 'security-privacy-gate', 'product-arch-gate'].map((g) => ({ gate_id: g, result: 'pass', evidence: `${g} 走查完成` }));
-const FULL_HARDENING = Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `第${i + 1}类走查完成` }));
+const FULL_HARDENING = Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `scripts/verdict-validate.mjs:${100 + i} 第${i + 1}类走查完成` }));
 
 function mkBundle(baseSha, candidateSha, over = {}) {
   return {
@@ -75,7 +75,7 @@ function withAnchorPaths(findings) {
 }
 function mkVerdictFor(reviewer, bundleObj, over = {}) {
   const base = {
-    schema_version: 'v2', reviewer, run_status: 'ok', round: 1, attempt: 1,
+    schema_version: 'v3', reviewer, run_status: 'ok', round: 1, attempt: 1,
     base_sha: bundleObj.base_sha, candidate_sha: bundleObj.candidate_sha,
     review_input_hash: computeReviewInputHash(bundleObj),
     faces: reviewer === 'upstream-preview' ? THIRD_FACES : FULL_FACES,

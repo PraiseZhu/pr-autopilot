@@ -94,7 +94,7 @@ const THIRD_GATES = ['format-gate', 'rule-compliance', 'security-privacy-gate', 
 // R10-A3/SC-B4: 加固清单十类默认全 covered——两对抗席 R1 verdict 的默认 hardening_coverage
 // （长度从 HARDENING_CLASS_COUNT 派生，不手抄数字——第 7 类「文档/校验/schema/fixture 不得
 // 四处手抄数字」的要求延伸到 fixture 自身）。
-const FULL_HARDENING = Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `第${i + 1}类走查完成` }));
+const FULL_HARDENING = Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `scripts/verdict-validate.mjs:${100 + i} 第${i + 1}类走查完成` }));
 
 function mkBundle(baseSha, candidateSha, over = {}) {
   return {
@@ -127,7 +127,7 @@ function withAnchorPaths(findings) {
 }
 function mkVerdictFor(reviewer, bundleObj, over = {}) {
   const base = {
-    schema_version: 'v2', reviewer, run_status: 'ok', round: 1,
+    schema_version: 'v3', reviewer, run_status: 'ok', round: 1, attempt: 1,
     base_sha: bundleObj.base_sha, candidate_sha: bundleObj.candidate_sha,
     review_input_hash: computeReviewInputHash(bundleObj),
     faces: reviewer === 'upstream-preview' ? THIRD_FACES : FULL_FACES,
@@ -212,9 +212,9 @@ t('[R10-A3] R1 两对抗席 hardening_coverage 机器强制: 缺失/缺项/重�
   // ④ 10 项齐全 → pass（默认值本身即是这一形状，显式再断言一次）
   eq(validateVerdict(mkVerdictFor('claude-adversarial', bundle)).length, 0, '10 项齐全的 R1 对抗席应过');
 
-  // ⑤ round>=2 不强制（即便完全不带）
-  eq(validateVerdict(mkVerdictFor('claude-adversarial', bundle, { round: 2, hardening_coverage: undefined, checklist_version: undefined })).length, 0,
-    'round>=2 不强制 hardening_coverage/checklist_version（复核轮不重扫穷举面）');
+  // ⑤ round>=2 同样强制（issue #9 SC-B: 对抗席全 round——修复代码曾是全流程唯一没被十类清单扫过的代码）
+  ok(validateVerdict(mkVerdictFor('claude-adversarial', bundle, { round: 2, hardening_coverage: undefined, checklist_version: undefined })).length > 0,
+    'round>=2 的对抗席同样强制 hardening_coverage/checklist_version（issue #9 SC-B: 修复代码也要被十类扫净，不许分轮细水长流）');
 
   // ⑥ 第三席不强制（即便完全不带）
   eq(validateVerdict(mkVerdictFor('upstream-preview', bundle)).length, 0, '第三席不强制 hardening_coverage/checklist_version');
@@ -2908,7 +2908,7 @@ t('[2号-push闸/SC-R3-6] 端到端契约: 真实状态机 run + SKILL 字段 ma
 
   // ---- 终版共识（delta 轮 parent 谱系）+ **SKILL.md 字段清单** manifest（无 sc_hash/sc_list）----
   const finalBundle = mkBundle(BASE, S1);
-  const finalArt = consensusFor(finalBundle, [{}, {}, {}], { parentArtifactHash: art.consensus_artifact_hash }).artifact;
+  const finalArt = consensusFor(finalBundle, [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: art }).artifact; eq(finalArt.round, 2, '终版必须是 round=2（i9-SC-B）');
   ok(finalArt.gate_result === 'pass', '终版共识应达成');
   eq(finalArt.parent_artifact_hash, art.consensus_artifact_hash, '终版必须记录 exact parent');
   const dispatchRecord = { fix_plan_hash: plan.fix_plan_hash,
@@ -2951,7 +2951,7 @@ t('[2号-push闸/SC-R3-6] 端到端契约: 真实状态机 run + SKILL 字段 ma
   const sneakTip = git('commit-tree', `${S1}^{tree}`, '-p', S1, '-m', 'lead sneaks in');
   git('merge', '--ff-only', sneakTip); // 模拟 lead 私补后 feat/HEAD 都在私补 SHA 上
   const sneakBundle = mkBundle(BASE, sneakTip);
-  const sneakArt = consensusFor(sneakBundle, [{}, {}, {}], { parentArtifactHash: art.consensus_artifact_hash }).artifact;
+  const sneakArt = consensusFor(sneakBundle, [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: art }).artifact;
   const rSneak = call({ artifact: sneakArt, bundle: sneakBundle, manifest: { ...baseManifest, expected_sha: sneakTip, consensus_artifact_hash: sneakArt.consensus_artifact_hash, fix_orchestration: fo } });
   ok(!rSneak.ok && rSneak.errors.some((e) => /最终 integrated_tip|私改|未登记 commit/.test(e)), 'SC-R3-8: 集成后私补 commit 必拒: ' + rSneak.errors.join(';'));
   git('reset', '--hard', '-q', S1); // 还原临时 fixture 仓到集成 tip
@@ -3371,7 +3371,7 @@ t('[R10-A1] archive kind 端到端可用: coverage-gate 过 → buildFixPlan 定
 
   // ④ push-guard 全链: 终版共识 + SKILL 字段 manifest → 应放行
   const finalBundleA1 = mkBundle(bundleA1.base_sha, fin.final_candidate);
-  const finalArtA1 = consensusFor(finalBundleA1, [{}, {}, {}], { parentArtifactHash: art.consensus_artifact_hash }).artifact;
+  const finalArtA1 = consensusFor(finalBundleA1, [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: art }).artifact; eq(finalArtA1.round, 2, '终版必须是 round=2（i9-SC-B）');
   ok(finalArtA1.gate_result === 'pass', '终版共识应达成: ' + JSON.stringify(finalArtA1.fail_reasons ?? []));
   const runManifestA1 = readJson(FR.runManifestPath(env.stateDir, 'archA1'));
   const tipFor = (groupId) => {
@@ -3673,7 +3673,7 @@ t('[SC-12] live 契约一致性: SKILL/references 与 validator/push-guard 实�
   ok(!/cherry-pick 逐组叠加/.test(skill), '不得残留 cherry-pick 冒充串行重跑的旧文案（SC-R3-9）');
   // validator 实际只收 v2（与文档对齐）
   const vv = readFileSync(join(S, 'verdict-validate.mjs'), 'utf8');
-  ok(/schema_version === 'v2'/.test(vv), 'validator 应只收 v2');
+  ok(/schema_version === 'v3'/.test(vv), 'validator 应只收 v3');
   // SC-R3-6: push-guard 不得再强制 legacy sc_hash/sc_list（文档≡实现）
   const pg = readFileSync(join(S, 'push-guard.mjs'), 'utf8');
   ok(!pg.includes('必须携带 sc_hash'), 'push-guard 不得再强制 legacy sc_hash/sc_list');
@@ -3718,7 +3718,7 @@ t('[R10-A4] SKILL.md 契约与实现逐字同步: 按文档描述构造的 manif
     const solo = ['A-0', 'A-1', 'A-2'].map((sc_id) => ({ sc_id, paths: ['README.md'] }));
     eq(hubViolations(solo, 0.5, 'archive').length, 0, '真 archive 形状: 余集为空 → D1 放行（不是豁免，是判据本身）');
   }
-  ok(skill.includes('round===1') && skill.includes('两对抗席'), 'SKILL 必须说明覆盖率契约的机器强制范围');
+  ok(skill.includes('两对抗席') && skill.includes('第三席'), 'SKILL 必须说明覆盖率契约的机器强制范围（哪些席/哪些轮），但不复述机器字面值');
   // SC-B4: 文档必须点名 checklist_version 机制与 9→10 迁移语义
   ok(skill.includes('checklist_version'), 'SKILL 必须点名机器字段 checklist_version');
   ok(skill.includes('十类'), 'SKILL 必须说明加固清单已是十类（9→10 迁移）');
@@ -3753,9 +3753,13 @@ t('[R10-A4] SKILL.md 契约与实现逐字同步: 按文档描述构造的 manif
   ok(!r.degraded, '按 SKILL.md 例句构造的 archive SC 必须真产出可派工 plan: ' + JSON.stringify(r.reasons ?? []));
   eq(r.plan.groups[0].paths, ['README.md'], 'SKILL.md 声明的文件域必须与实现一致');
 
-  // ③ 按 SKILL.md 描述的 hardening_coverage 形状构造 verdict，跑真 validator
+  // ③ 按 SKILL.md 描述的 hardening_coverage 形状构造 verdict，跑真 validator——
+  //    两种 result 形态各覆盖一项（i9-SC-5b: covered 必须带「路径:行号」证据锚点；n_a 没有
+  //    对应代码位置，只需说明为何不适用——强制它给 file:line 只会逼审查席造假锚点）。
   const docVerdict = mkVerdictFor('claude-adversarial', bundle, {
-    hardening_coverage: Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `第${i + 1}类核对完成` }))
+    hardening_coverage: Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => (i === 3
+      ? { class_id: i + 1, result: 'n_a', evidence: '本 PR 无并发/异步改动，该类无适用面' }
+      : { class_id: i + 1, result: 'covered', evidence: `server/lib/foo.ts:${42 + i} 第${i + 1}类核对完成` }))
   });
   eq(validateVerdict(docVerdict).length, 0, '按 SKILL.md 例句构造的 hardening_coverage 必须真过 validator');
 });
@@ -4176,19 +4180,20 @@ t('[D8-3] delta 轮漏传 parent 必拒；首轮无 parent 必须仍放行', () 
   eq(first.gate_result, 'pass', '首轮无 parent 必须放行: ' + JSON.stringify(first.fail_reasons ?? []));
   eq(first.parent_artifact_hash, null, '首轮 parent_artifact_hash 记 null');
   // ③ delta 轮带上 parent → 放行，且 exact 谱系落进 artifact
-  const bound = consensusFor(bundle, D2, { parentArtifactHash: first.consensus_artifact_hash }).artifact;
+  const bound = consensusFor(bundle, D2, { parentArtifact: first }).artifact;
   eq(bound.gate_result, 'pass', 'delta 轮带 parent 必须放行: ' + JSON.stringify(bound.fail_reasons ?? []));
   eq(bound.parent_artifact_hash, first.consensus_artifact_hash, 'delta 轮必须记录 exact parent');
 });
 
-// 独立成块（不并进上面）: 上面钉的是「delta 轮要 parent」，这里钉的是「用 max 而非首席 round」。
-// 两条判定合在一个 t() 里，删整道门和把 max 换成 verdicts[0].round 会红同一个块——
-// 变异红集无法分辨是哪条判定在起作用（第 8 类）。拆开后前者红 2 块、后者红 1 块。
-t('[D8-3] 三席 round 不一致时按最大值要求 parent（不得因不一致而 fail-open）', () => {
-  // 「三席 round 必须一致」是另一条不变量，本轮不在范围内；此处只钉住不一致时的方向。
+// 独立成块（不并进上面）: 上面钉的是「delta 轮要 parent」，这里钉的是「三席 round 必须一致」。
+// 两条判定合在一个 t() 里，变异红集无法分辨是哪条在起作用（第 8 类）；拆开后各自可辨。
+t('[D8-3/i9-SC-B] 三席 round 不一致 → 直接 fail（不再静默取最大值）', () => {
+  // issue #9 SC-B 改判: 旧行为是「取 max 后按最严的那个要求 parent」——那是在静默纠正调用方的
+  // 输入错误。新语义下 round 是 PASS 共识产物的序号，三席不一致本身就是应当被拒的输入错误，
+  // 不该被悄悄抹平成「按最严的走」。原断言（钉 max 方向）的前提已不存在，故改钉新不变量。
   const mixed = consensusFor(bundle, [{ round: 1 }, { round: 2 }, { round: 1 }]).artifact;
-  ok(mixed.gate_result === 'fail' && mixed.fail_reasons.some((e) => /delta 轮/.test(e)),
-    'D8-3: 混合 round 取最大值 → 仍要求 parent: ' + JSON.stringify(mixed.fail_reasons ?? []));
+  ok(mixed.gate_result === 'fail' && mixed.fail_reasons.some((e) => /三席 round 不一致/.test(e)),
+    'i9-SC-B: 三席 round 不一致必须直接 fail 且点名该原因: ' + JSON.stringify(mixed.fail_reasons ?? []));
 });
 
 t('[R5-P1] runConsensusGate 缺实改集 fail-closed；[R5-P2] crash 窗口凭创建印记仍可回收', () => {
@@ -5285,7 +5290,7 @@ t('[D1-DC] 两侧同源（D1 核心不变量）: 契约段声明的 gate 集合 
   eq(advSpec.required_faces, ALL_FACES, '对抗席必须七面');
   eq(advSpec.faces_exact, true);
   eq(advSpec.hardening, { required: true, checklist_version: HARDENING_CHECKLIST_VERSION, class_count: HARDENING_CLASS_COUNT });
-  eq(contractSpec({ seat: 'claude-adversarial', round: 2 }).hardening, { required: false }, 'round>=2 不强制穷举（与 validator 同条件）');
+  eq(contractSpec({ seat: 'claude-adversarial', round: 2 }).hardening, { required: true, checklist_version: HARDENING_CHECKLIST_VERSION, class_count: HARDENING_CLASS_COUNT }, 'round>=2 对抗席同样强制穷举（与 validator 同条件，issue #9 SC-B）');
   eq(contractSpec({ seat: 'upstream-preview', round: 1 }).hardening, { required: false }, '第三席不强制穷举');
 });
 

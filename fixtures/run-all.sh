@@ -3,3 +3,6 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 node run-fixtures.mjs
+node i9-core.mjs
+node i9-verdict.mjs
+node i9-docs.mjs
