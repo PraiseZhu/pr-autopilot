@@ -63,14 +63,22 @@ engine-mivo.json（完整必填示例；两仓 schedule **共享同一 budget.le
   dispatch 路径调用它预留，当前约 `engine.mjs:293`——以符号为准，行号会漂移），不是注释）——
   mivo 示例取 `3`：外部部署实测单样本 $1.41，保守取整为 3。
 - **完工结算（机械，人工只作兜底）**：`complete.mjs` 成功路径在 **ack 之前**把该 dispatch 的
-  reserve 机械结算为 actual（`settleDispatchBudget()`，`scripts/pr-watch/complete.mjs`）：
+  reserve 机械结算为 actual（`settleDispatchBudget()`，`scripts/pr-watch/budget.mjs`）：
   - 调用方可传 `--actual <usd>` 用**真实成本**结算（settlement=`actual`）；
-  - 调用链拿不到真实成本时，缺省以 `manifest.budget.estimate` 结算（settlement=`estimate`，
-    显式标记**估算结算**，后续同 id 真实成本入账可覆盖该值，见 `foldDispatchStates`）；
+  - 调用链拿不到真实成本时，缺省以 **state 固化的 `pending_dispatch.budget.estimate`** 结算
+    （settlement=`estimate`，显式标记**估算结算**，后续同 id 真实成本入账可覆盖该值，
+    见 `foldDispatchStates`）——**权威账本与估算值只认 pending，不信任 manifest.budget**
+    （manifest 是投递给修复会话的可变文件，会话可把 ledger 指向坏账本、把 estimate 改成 0
+    洗账，信任它等于把结算权交给被修复方；旧版本派发的 manifest 无 budget 字段时同样从
+    pending 自动收口，2026-08-08 GPT R2）；
+  - **结算与 ack 同一 state-lock 临界区**（`settleAndAckDispatch()`，
+    `scripts/pr-watch/ack.mjs`）：结算落账与 pending 清空之间无窗口——结算抛错即整个收口
+    失败，pending 原样保留，不产生「已结算但 pending 未清」的半状态；
   - **结算失败 fail-closed**：不 ack、不清 pending、游标不动——引擎按 at-least-once 重派，
-    重跑 complete 幂等（同 id 已结算则跳过，不追加台账行）；
+    重跑 complete 幂等（同 id 已结算则跳过，不追加台账行；`isDispatchSettled` 扫**全账本**
+    按 dispatch_id 折叠，跨日重试不会重复结算；`spentToday` 仍只聚合当日）；
   - 成功 ack 后**绝不保留 reserve**；人工 `budget.mjs --record --dispatch-id <id> --cost <实际>`
-    只是**纠偏兜底**（真实成本补记 / 旧版 manifest 迁移期人工核账），不是常规结算路径。
+    只是**纠偏兜底**（真实成本补记 / 非引擎标准派发的遗留 pending 人工核账），不是常规结算路径。
 - **敞口算式**：cap 30 ÷ estimate 3 = 单日最多 **10 个**并发未结算 reserve（若沿用旧值 9.2 则仅
   3 个）。风险：并发未结算 reserve 上限 3 → 10，最坏坏账放大约 **3.3 倍**；收益：正常日不再因
   3 个在途 reserve 顶闸停派。完工即结算后，**陈旧 reserve 只存在于「派发到 complete 收口」的
@@ -165,11 +173,11 @@ export EXPECT_EFFORT='xhigh'
 export PR_AUTOPILOT_HMAC_KEY=$(openssl rand -hex 32)   # 每台机器独立生成，禁止拷贝别人的
 ```
 
-- **生成与形状**：`openssl rand -hex 32` 即可（HMAC key 无格式约束，任意字符串都行；64 位十六进制只是惯例）。**谁读 env**：`deploy/wrappers/probe.mjs:57` 读 `process.env.PR_AUTOPILOT_HMAC_KEY` 后传给 `gate.evaluate`；`scripts/pr-watch/engine.mjs:73` 默认读 env，但 main() 的 `runEngine({ ...extra })` 配置合并处（`engine.mjs:378-384`，`...extra` 展开在 `:383`）可被 `engine-*.json` 里的 `hmacKey` 字段**覆盖**（`engine.mjs:73` 只是 env 默认值，覆盖发生在 `:378-384`）；`scripts/pr-watch/complete.mjs:80` 读 env 传给 `checkCompletion`；`scripts/pr-watch/provenance.mjs` 本身**不读 env**，只接收调用方传入的 key 参数。**不落盘、不打日志**。
+- **生成与形状**：`openssl rand -hex 32` 即可（HMAC key 无格式约束，任意字符串都行；64 位十六进制只是惯例）。**谁读 env**：`deploy/wrappers/probe.mjs:57` 读 `process.env.PR_AUTOPILOT_HMAC_KEY` 后传给 `gate.evaluate`；`scripts/pr-watch/engine.mjs:73` 默认读 env，但 main() 的 `runEngine({ ...extra })` 配置合并处（`engine.mjs:378-384`，`...extra` 展开在 `:383`）可被 `engine-*.json` 里的 `hmacKey` 字段**覆盖**（`engine.mjs:73` 只是 env 默认值，覆盖发生在 `:378-384`）；`scripts/pr-watch/complete.mjs:54` 读 env 传给 `checkCompletion`；`scripts/pr-watch/provenance.mjs` 本身**不读 env**，只接收调用方传入的 key 参数。**不落盘、不打日志**。
 - **每台机器必须独立生成**：它是「这条评论是不是我自己发的」的识别凭证，不是共享口令。拷别人的 key = 两台机器互认对方回帖为自家，签名校验的意义归零。
 - **没配会怎样（三层，别混）**：
   - **gate 侧先说明白（login 早退）**：`gh-snapshot:117` 尝试拿 `selfLogin`（拿不到 → 宁多唤醒，`author_is_self` 为 false），`gate:54` 先跳过 `author_is_self === true` 再对剩余评论用 HMAC。所以 **login 可得时，无 key 不会因 HMAC 导致自家评论被当成新反馈**；HMAC 只在 login 不可得（拿不到 `ghGet('user')`）时才是识别自家回帖的那一层。
-  - **已验证机制（前提：worker 已提交一条待核验的回帖）**：**在 worker 已提交待核验回帖的前提下**，无 key 会让 `complete.mjs:80` 取到空 key → `provenance.mjs:17`（实现：`if (!key) return false`，「无法验证 → 不声称是自家的 → 宁多唤醒」；`complete.mjs:62` 只是调用点）→ `:64` 判「回帖未落地」→ `:81-84` exit 1（checkCompletion 失败分支——副作用缺失即拒；预算结算失败是另一条独立失败分支 `:95-97`），**ack 不发生**（`ackDispatch` 只在 checkCompletion 通过**且**结算成功后的 `:99-102` 发生）→ `pending_dispatch` 保持在途 → 引擎 `engine.mjs:236-260` 只按 lease 超时（`:236`）重派**同一个 dispatch_id**（`budget.mjs:94` reserve 对同 id 幂等，`already-reserved` 直接放行不重复占额，幂等放行在 `:107`）→ 重派 ≥ `stuckThreshold` 次 → `engine.mjs:238-240` 记 `stuck` + `:241-246` routeNotify 发通知。**这是可能路径，不是无条件后果**——真实表现（在该前提下）= 卡在 pending、最终触发 stuck 通知（有告警，不是静默；通知为 best-effort——发送失败只记 `notify-error` journal `engine.mjs:246`，不重试不补发，见 §2.1 ③）。
+  - **已验证机制（前提：worker 已提交一条待核验的回帖）**：**在 worker 已提交待核验回帖的前提下**，无 key 会让 `complete.mjs:54` 取到空 key → `provenance.mjs:17`（实现：`if (!key) return false`，「无法验证 → 不声称是自家的 → 宁多唤醒」；`complete.mjs:36` 只是调用点）→ `:38` 判「回帖未落地」→ `:57` exit 1（checkCompletion 失败分支——副作用缺失即拒；预算结算失败是另一条独立失败分支 `:83`），**ack 不发生**（`settleAndAckDispatch` 只在 checkCompletion 通过**且**结算成功后的 `:66` 发生——结算与 ack 同一 state-lock 临界区，见 §2 estimate 段）→ `pending_dispatch` 保持在途 → 引擎 `engine.mjs:236-260` 只按 lease 超时（`:236`）重派**同一个 dispatch_id**（`budget.mjs:145` reserve 对同 id 幂等，`already-reserved` 直接放行不重复占额，幂等放行在 `:157`）→ 重派 ≥ `stuckThreshold` 次 → `engine.mjs:238-240` 记 `stuck` + `:241-246` routeNotify 发通知。**这是可能路径，不是无条件后果**——真实表现（在该前提下）= 卡在 pending、最终触发 stuck 通知（有告警，不是静默；通知为 best-effort——发送失败只记 `notify-error` journal `engine.mjs:246`，不重试不补发，见 §2.1 ③）。
   - **已验证的间接预算影响（代码支持的可能路径，未在真实事件中证实）**：`complete` 未 ack → `pending_dispatch` 连同**原 dispatch 的 reserve 一起长留**（`engine.mjs:344-351` pending_dispatch 固化含 `budget: {ledger, estimate}`，以符号 `pending_dispatch.budget` 为准）→ 该额度不释放，与后续真实 dispatch 竞争同一个 cap；而重派路径**不调用 reserve**（reserve 只在无 pending 且判 actionable 的新 dispatch 路径，`engine.mjs:293`，以符号 `reserveBudget` 为准）。**这条是代码支持的可能机制，不是已证实因果**——不要当成新的因果断言。成功路径的 reserve 由 `complete` 在 ack 前机械结算（见 §2 estimate 段），不依赖人工 `--record`。
   - **不可归因**：外部部署方那次「$30/天 cap 撞顶」**成因未定**——本 checkout 没有「缺 key → 每轮新 dispatch_id → 每轮 reserve」的路径（重派复用同 id + reserve 幂等），且该事件无运行时台账/序列证据。**不要归因到 HMAC key，也不猜替代解释**。
 - **强度如实声明（T1，无机器门在拦）**：引擎启动时不校验 key 是否存在（`engine.mjs:73` `?? null`，没有 fail-closed 启动门）；这道门防的是「自家评论误唤醒自己」的**疏忽**，不防**伪造**——知道 key 的人可以伪造签名评论。配不配 key 全靠部署时自觉，机器不拦。

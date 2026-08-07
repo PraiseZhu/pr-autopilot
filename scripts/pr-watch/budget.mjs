@@ -21,6 +21,14 @@ function readEntries(ledgerFile, nowMs) {
     .filter((r) => Date.parse(r.at) >= cutoff);
 }
 
+// 审(2026-08-08 GPT R2): 结算判定必须扫**全账本**——跨日重试时昨天的 actual 行
+// 不能被当日 cutoff 过滤掉（否则昨天结算过的 dispatch 今天又被重复结算、追加 actual）。
+// 只读全量、不做任何过滤；spentToday 的当日口径不在此处（见 readEntries）。
+function readAllEntries(ledgerFile) {
+  if (!ledgerFile || !existsSync(ledgerFile)) return [];
+  return readFileSync(ledgerFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
 function validCost(v) { return typeof v === 'number' && Number.isFinite(v) && v >= 0; }
 
 // 审⑤-F2: 每 dispatch 按台账行序折叠**最新状态**（reserve→release→reserve→actual 状态机），
@@ -66,11 +74,25 @@ export function foldDispatchStates(entries) {
 }
 
 // 2026-08-08: 该 dispatch 是否已结算（存在 actual 即已结算）——complete 估算结算幂等跳过依据
-export function isDispatchSettled(ledgerFile, dispatchId, nowMs = Date.now()) {
+// 审(2026-08-08 GPT R2): 必须扫**全账本**按 dispatch_id 折叠——跨日重试时昨天的
+// actual 行仍是结算证据（当日 cutoff 是 spentToday 的口径，不是结算幂等的口径）。
+// 跨日语义: 昨天已结算 → 今天 isDispatchSettled 仍 true → 重跑 complete 幂等跳过、不追加。
+export function isDispatchSettled(ledgerFile, dispatchId) {
   if (!ledgerFile || !existsSync(ledgerFile) || !dispatchId) return false;
-  const { byId } = foldDispatchStates(readEntries(ledgerFile, nowMs));
+  const { byId } = foldDispatchStates(readAllEntries(ledgerFile));
   const s = byId.get(dispatchId);
   return s !== undefined && s.actual !== null;
+}
+
+// 审(2026-08-08 GPT R2): 结算状态细节（是否已结算 + 结算来源）。isDispatchSettled 的
+// 布尔版只够估算幂等；真实成本入账需要区分「已按 estimate 结算（可覆盖）」与
+// 「已按 actual 结算（幂等跳过，不追加）」。折叠状态携带 settlement 标记（fold 内维护）。
+function settledState(ledgerFile, dispatchId) {
+  if (!ledgerFile || !existsSync(ledgerFile) || !dispatchId) return { settled: false, settlement: null };
+  const { byId } = foldDispatchStates(readAllEntries(ledgerFile));
+  const s = byId.get(dispatchId);
+  if (s === undefined || s.actual === null) return { settled: false, settlement: null };
+  return { settled: true, settlement: s.settlement ?? 'actual' };
 }
 
 export function spentToday(ledgerFile, nowMs = Date.now()) {
@@ -78,6 +100,35 @@ export function spentToday(ledgerFile, nowMs = Date.now()) {
   let sum = noIdSum;
   for (const s of byId.values()) sum += s.actual ?? s.reserved ?? 0;
   return sum;
+}
+
+// 审(2026-08-08 GPT R2): 完工机械结算原语——从 complete.mjs 移入（预算逻辑归预算层，
+// 供 ack.mjs 的锁内复合原语调用；避免 ack↔complete 循环 import）。
+// 幂等规则（SC-B4 跨日）:
+//   - 真实成本（actualUsd）: 同 id **已按真实成本结算** → 幂等跳过（次日重试不追加行）；
+//     同 id 仅按 estimate 结算 → 真实成本覆盖（estimate 是估算，可被实值取代，fold 内维护）；
+//     未结算 → 追加。
+//   - 估算结算（无 actualUsd）: isDispatchSettled（全账本）→ 幂等跳过；否则 estimate 必须
+//     是有穷 ≥0 数字（缺失/非法 fail-closed——不结算就不允许 ack，调用方在锁内抛错保 pending）。
+// 本原语本身**不带锁**——由调用方（ack 锁内 / fixtures）决定临界区，避免嵌套同锁死锁。
+export function settleDispatchBudget({ ledgerFile, dispatchId, actualUsd = null, estimateUsd = null }) {
+  if (!ledgerFile || !dispatchId) {
+    throw new Error(`结算缺 ledger/dispatch_id（无法结算的 reserve，fail-closed——不允许 ack 后留 reserve）`);
+  }
+  if (actualUsd !== null) {
+    // 真实成本: 已按实值结算 → 幂等跳过；estimate 结算可被实值覆盖；未结算则直接入账
+    const st = settledState(ledgerFile, dispatchId);
+    if (st.settled && st.settlement === 'actual') return { settled: true, skipped: true };
+    recordCost(ledgerFile, { cost_usd: actualUsd, kind: 'actual', dispatch_id: dispatchId, settlement: 'actual', note: 'settled-by-complete (actual)' });
+    return { settled: true };
+  }
+  // 估算结算: 同 id 已结算（含昨日，全账本）→ 幂等跳过（重复 complete/跨日重试不追加噪音行）
+  if (isDispatchSettled(ledgerFile, dispatchId)) return { settled: true, skipped: true };
+  if (!(typeof estimateUsd === 'number' && Number.isFinite(estimateUsd) && estimateUsd >= 0)) {
+    throw new Error(`结算缺实际成本且 estimate 不可得（${estimateUsd}，fail-closed——无法结算的 reserve 不许 ack）`);
+  }
+  recordCost(ledgerFile, { cost_usd: estimateUsd, kind: 'actual', dispatch_id: dispatchId, settlement: 'estimate', note: 'settled-by-complete (estimate, 可同 id 真实成本覆盖)' });
+  return { settled: true };
 }
 
 export function recordCost(ledgerFile, { cost_usd, session, note, kind = 'actual', dispatch_id = null, settlement = null }) {
