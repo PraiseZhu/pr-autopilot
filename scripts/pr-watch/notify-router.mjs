@@ -21,7 +21,9 @@ const ROUTES = {
 };
 
 export function route(eventType, { repo } = {}) {
-  if (eventType === 'stuck') {
+  // T3/SC-3a: pending-stuck 与 stuck 同通道（cindy=silent / mivo=feishu）——不落 ROUTES，
+  // 否则 null 值会撞下方「未知事件类型」fail-closed
+  if (eventType === 'stuck' || eventType === 'pending-stuck') {
     if (/cindy/i.test(repo ?? '')) return 'silent'; // W-6: cindy PR 卡死不打扰
     return 'feishu'; // mivo PR 卡死飞书点名
   }

@@ -13,7 +13,7 @@
    `agentKind=claude-code + provider + claude-sonnet-5 + xhigh`（不是只看 dispatch 成功）。
 5. goal skill 在 mini 可用，且已含 `--until-sc` 模式。
 6. deepseek effort=max 可用性（不支持 → 降 xhigh + 首张卡片脚注告知 + ledger 审计）。
-7. preRunHook 失败语义 / missed-fire 补跑语义实测；调度会话调 cindy_feishu_bot 是否 NO_CHAT_CONTEXT。
+7. ~~preRunHook 失败语义实测~~（2026-08-08 已确认：Cindy host preRunHook 为 **fail-open**，部署必须用仓内 `deploy/wrappers/probe.mjs` 包装为 fail-closed，见 §2.1 ③；不再作为实测项）/ missed-fire 补跑语义实测；调度会话调 cindy_feishu_bot 是否 NO_CHAT_CONTEXT。
 
 ## 1. 落盘
 
@@ -128,7 +128,7 @@ export EXPECT_EFFORT='xhigh'
 > - `docs/plan.md:163-164` W-2 首扫空目录立即退出；W-3 按类游标、exact-head、评论 node-id、CI 状态跃迁、at-least-once/副作用幂等；
 > - `docs/plan.md:31,42,83-84` 空清单零 GitHub 请求 / 零 LLM / 零 token；引擎每仓一条 schedule、空 state 目录秒退；
 > - `scripts/pr-watch/gate.mjs:3-10,16,61-74` 按类游标、同 head 的 `ci_red_sha` 去重、ack 后推进；
-> - `scripts/pr-watch/engine.mjs:181-225,250-269` pending 单飞、租约到期同 id 重派、reserve 仅新 actionable dispatch；
+> - `scripts/pr-watch/engine.mjs:182-257` pending 单飞、租约到期同 id 重派（重派失败持久化 `redispatch_count` 且计入 stuck 判据，`:247-253`）、每轮记 `waiting` 事件（`:210-215`，`waiting_for` 仅 `'ack'`）、超 `pendingStuckHours`（默认 **6h**，`:71`，可经 config 覆盖）记 `pending-stuck` 告警（`:219-228`，年龄基准 = `first_dispatched_at`——首派写入 `:338`、旧 state 缺字段先原子回填 `:185-190`）；reserve 仅新 actionable dispatch（`:287`）；首派失败记 `dispatch-failed`（`:350`）；
 > - `deploy/wrappers/probe.mjs:2-6` preRunHook 的 exit 2 / 不启动会话协议。
 
 | 变量/项 | 作用 | 已验证的直接后果（逐跳） |
@@ -136,7 +136,7 @@ export EXPECT_EFFORT='xhigh'
 | `PR_AUTOPILOT_HMAC_KEY` | 自家评论识别密钥（complete 校验回帖落地、gate 过滤自家评论） | 无 key → 修复完工回执校验失败 → 卡 pending → 最终 stuck 通知（①） |
 | `REQUIRED_CONTEXTS_FILE` | CI 判绿的 required contexts 清单（JSON 文件路径） | 无配置 → 每 head 首扫判 CI 红 → 该 head 首次唤醒；**投递失败则下轮重试（at-least-once），不保证跨轮静默**（②） |
 | `SNAPSHOT_CACHE_DIR` | gh-snapshot 响应缓存/ETag（条件请求） | 不配 → 每轮探针都是**普通 API 请求**，配额被静默低估（②b） |
-| preRunHook | 班车调度跳过空转轮 | 若宿主 schedule 每周期启动 agent 且未接 probe，则**可能**每周期启动会话（宿主行为需在 mini 实测）；接 probe 注意退出码边界（③） |
+| preRunHook | 班车调度跳过空转轮 | 宿主 preRunHook 已确认 **fail-open**（探针失败/异常也放行会话启动）——不接 probe 则每周期必起 agent 会话，空转轮也烧 token；必须接 `deploy/wrappers/probe.mjs` 用 exit 2 协议把「无活」变成真正的跳过（包装为 fail-closed），并注意退出码边界（③） |
 
 **① `PR_AUTOPILOT_HMAC_KEY` —— 没配会卡在 pending 并最终触发 stuck 通知（有告警，不是静默）**
 
@@ -144,14 +144,14 @@ export EXPECT_EFFORT='xhigh'
 export PR_AUTOPILOT_HMAC_KEY=$(openssl rand -hex 32)   # 每台机器独立生成，禁止拷贝别人的
 ```
 
-- **生成与形状**：`openssl rand -hex 32` 即可（HMAC key 无格式约束，任意字符串都行；64 位十六进制只是惯例）。**谁读 env**：`deploy/wrappers/probe.mjs:57` 读 `process.env.PR_AUTOPILOT_HMAC_KEY` 后传给 `gate.evaluate`；`scripts/pr-watch/engine.mjs:72` 默认读 env，但 `engine.mjs:332-338` 的 CLI `...extra` 展开处可被 `engine-*.json` 里的 `hmacKey` 字段**覆盖**（`engine.mjs:72` 只是 env 默认值，覆盖发生在 `:332-338`）；`scripts/pr-watch/complete.mjs:53` 读 env 传给 `checkCompletion`；`scripts/pr-watch/provenance.mjs` 本身**不读 env**，只接收调用方传入的 key 参数。**不落盘、不打日志**。
+- **生成与形状**：`openssl rand -hex 32` 即可（HMAC key 无格式约束，任意字符串都行；64 位十六进制只是惯例）。**谁读 env**：`deploy/wrappers/probe.mjs:57` 读 `process.env.PR_AUTOPILOT_HMAC_KEY` 后传给 `gate.evaluate`；`scripts/pr-watch/engine.mjs:73` 默认读 env，但 `engine.mjs:369-374` 的 CLI `...extra` 展开处可被 `engine-*.json` 里的 `hmacKey` 字段**覆盖**（`engine.mjs:73` 只是 env 默认值，覆盖发生在 `:369-374`）；`scripts/pr-watch/complete.mjs:53` 读 env 传给 `checkCompletion`；`scripts/pr-watch/provenance.mjs` 本身**不读 env**，只接收调用方传入的 key 参数。**不落盘、不打日志**。
 - **每台机器必须独立生成**：它是「这条评论是不是我自己发的」的识别凭证，不是共享口令。拷别人的 key = 两台机器互认对方回帖为自家，签名校验的意义归零。
 - **没配会怎样（三层，别混）**：
   - **gate 侧先说明白（login 早退）**：`gh-snapshot:117` 尝试拿 `selfLogin`（拿不到 → 宁多唤醒，`author_is_self` 为 false），`gate:54` 先跳过 `author_is_self === true` 再对剩余评论用 HMAC。所以 **login 可得时，无 key 不会因 HMAC 导致自家评论被当成新反馈**；HMAC 只在 login 不可得（拿不到 `ghGet('user')`）时才是识别自家回帖的那一层。
-  - **已验证机制（前提：worker 已提交一条待核验的回帖）**：**在 worker 已提交待核验回帖的前提下**，无 key 会让 `complete.mjs:53` 取到空 key → `provenance.mjs:17`（实现：`if (!key) return false`，「无法验证 → 不声称是自家的 → 宁多唤醒」；`complete.mjs:35` 只是调用点）→ `:37` 判「回帖未落地」→ `:56` exit 1，**ack 不发生**（`:58-63` 只在 checkCompletion 通过后才 ackDispatch）→ `pending_dispatch` 保持在途 → 引擎 `engine.mjs:182-224` 只按 lease 超时（`:202`）重派**同一个 dispatch_id**（`budget.mjs:89` reserve 对同 id 幂等，`already-reserved` 直接放行不重复占额）→ 重派 ≥ `stuckThreshold` 次 → `engine.mjs:204-205` 记 `stuck` + `:208` routeNotify 发通知。**这是可能路径，不是无条件后果**——真实表现（在该前提下）= 卡在 pending、最终触发 stuck 通知（有告警，不是静默）。
-  - **已验证的间接预算影响（代码支持的可能路径，未在真实事件中证实）**：`complete` 未 ack → `pending_dispatch` 连同**原 dispatch 的 reserve 一起长留**（`engine.mjs:303-308` pending_dispatch 固化含 `budget: {ledger, estimate}`）→ 该额度不释放，与后续真实 dispatch 竞争同一个 cap；而重派路径**不调用 reserve**（reserve 只在无 pending 且判 actionable 的新 dispatch 路径，`engine.mjs:250-255`）。**这条是代码支持的可能机制，不是已证实因果**——不要当成新的因果断言。
+  - **已验证机制（前提：worker 已提交一条待核验的回帖）**：**在 worker 已提交待核验回帖的前提下**，无 key 会让 `complete.mjs:53` 取到空 key → `provenance.mjs:17`（实现：`if (!key) return false`，「无法验证 → 不声称是自家的 → 宁多唤醒」；`complete.mjs:35` 只是调用点）→ `:37` 判「回帖未落地」→ `:56` exit 1，**ack 不发生**（`:58-63` 只在 checkCompletion 通过后才 ackDispatch）→ `pending_dispatch` 保持在途 → 引擎 `engine.mjs:229-254` 只按 lease 超时（`:230`）重派**同一个 dispatch_id**（`budget.mjs:89` reserve 对同 id 幂等，`already-reserved` 直接放行不重复占额）→ 重派 ≥ `stuckThreshold` 次 → `engine.mjs:232-234` 记 `stuck` + `:235-240` routeNotify 发通知。**这是可能路径，不是无条件后果**——真实表现（在该前提下）= 卡在 pending、最终触发 stuck 通知（有告警，不是静默；通知为 best-effort——发送失败只记 `notify-error` journal `engine.mjs:240`，不重试不补发，见 §2.1 ③）。
+  - **已验证的间接预算影响（代码支持的可能路径，未在真实事件中证实）**：`complete` 未 ack → `pending_dispatch` 连同**原 dispatch 的 reserve 一起长留**（`engine.mjs:335-342` pending_dispatch 固化含 `budget: {ledger, estimate}`）→ 该额度不释放，与后续真实 dispatch 竞争同一个 cap；而重派路径**不调用 reserve**（reserve 只在无 pending 且判 actionable 的新 dispatch 路径，`engine.mjs:287`）。**这条是代码支持的可能机制，不是已证实因果**——不要当成新的因果断言。
   - **不可归因**：外部部署方那次「$30/天 cap 撞顶」**成因未定**——本 checkout 没有「缺 key → 每轮新 dispatch_id → 每轮 reserve」的路径（重派复用同 id + reserve 幂等），且该事件无运行时台账/序列证据。**不要归因到 HMAC key，也不猜替代解释**。
-- **强度如实声明（T1，无机器门在拦）**：引擎启动时不校验 key 是否存在（`engine.mjs:72` `?? null`，没有 fail-closed 启动门）；这道门防的是「自家评论误唤醒自己」的**疏忽**，不防**伪造**——知道 key 的人可以伪造签名评论。配不配 key 全靠部署时自觉，机器不拦。
+- **强度如实声明（T1，无机器门在拦）**：引擎启动时不校验 key 是否存在（`engine.mjs:73` `?? null`，没有 fail-closed 启动门）；这道门防的是「自家评论误唤醒自己」的**疏忽**，不防**伪造**——知道 key 的人可以伪造签名评论。配不配 key 全靠部署时自觉，机器不拦。
 
 **② `REQUIRED_CONTEXTS_FILE` —— CI 判绿的权威来源**
 
@@ -181,7 +181,7 @@ export REQUIRED_CONTEXTS_FILE=/path/to/required-contexts.json
 - **两类 check 绝对不能进这份清单（同一类陷阱的两个变种）**：
   - **`SKIPPED` 不算绿**：gh-snapshot 归一化 check-run 时只有 `conclusion == success` 才映射为绿，`skipped`/`neutral`/`cancelled` 一律非绿（`gh-snapshot.mjs:135`；`scripts/ci-readiness.mjs:33` `entry.state !== 'success'` → fail-closed 非绿）。按路径过滤的 job（改动不命中就 SKIPPED）一旦进清单，该 PR 永远判不绿。
   - **只在 `pull_request` 事件上跑的 job 同样不能列**：它在 main push 上根本不产生 check，列进去 = 永远等一个不会来的绿。真实案例：mivo 仓（`xindong/mivo-canvas`）`.github/workflows/deploy-green-ref.yml` 的 `REQUIRED_ON_MAIN` 数组上方注释（本机踩过并写死在注释里的教训，措辞以该文件当前内容为准）——e2e 系列 job 是 pull_request-only，main push 上不存在，不能列（列了 ref 永远不动）；bench / deps audit / semgrep baseline / coverage report 是设计上的非阻断，不纳入。**设计上非阻断的 job（bench / audit / baseline / coverage 类）也不进清单**。
-- **没配/文件缺失 = fail-closed 非绿，同一 head 的 ci-red 在本轮之内判一次并去重**：gh-snapshot 对未配置的 required 返回 `green: false` + `['required contexts 未配置（fail-closed）']`（`gh-snapshot.mjs:147`）→ gate 对**同一 head** 的 ci-red 用 `cursors.ci_red_sha !== head` 去重（`gate.mjs:61-62`）——**前提是状态真的落盘了（投递成功、pending/ack 已持久化）**；若投递失败，`engine.mjs:311-315` 释放预留且**游标不推进**（「下轮重试 = at-least-once」），`engine.mjs:316` 落盘的状态里没有 pending/cursor 推进，下一轮 gate 仍见 `ci_red_sha != head` → 仍 actionable → **可能每轮重新启动 agent**（`fixtures/run-fixtures.mjs:779-790` 已覆盖连续 dispatch 失败重试）。**不保证低唤醒/低 token**——别据此估预算。（早期版本写「CI 永远红 → 每轮都唤醒」不成立，已更正；本段也不构成跨轮静默保证。）
+- **没配/文件缺失 = fail-closed 非绿，同一 head 的 ci-red 在本轮之内判一次并去重**：gh-snapshot 对未配置的 required 返回 `green: false` + `['required contexts 未配置（fail-closed）']`（`gh-snapshot.mjs:147`）→ gate 对**同一 head** 的 ci-red 用 `cursors.ci_red_sha !== head` 去重（`gate.mjs:61-62`）——**前提是状态真的落盘了（投递成功、pending/ack 已持久化）**；若投递失败，`engine.mjs:345-352` 释放预留（`:347`）且**游标不推进**（「下轮重试 = at-least-once」，失败记 `dispatch-failed` journal 事件 `:350`），`engine.mjs:353` 落盘的状态里没有 pending/cursor 推进，下一轮 gate 仍见 `ci_red_sha != head` → 仍 actionable → **可能每轮重新启动 agent**（`fixtures/run-fixtures.mjs:1089-1141` 已覆盖首派/重派连续失败重试；重派失败同样持久化 `redispatch_count` 并计入 stuck 判据，`engine.mjs:247-253`）。**不保证低唤醒/低 token**——别据此估预算。（早期版本写「CI 永远红 → 每轮都唤醒」不成立，已更正；本段也不构成跨轮静默保证。）
 
 **②b `SNAPSHOT_CACHE_DIR` —— 不配 = 每轮探针都是普通 API 请求，配额被静默低估**
 
@@ -191,7 +191,7 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
 
 - gh-snapshot 只在 `SNAPSHOT_CACHE_DIR` 非空时启用响应缓存 + ETag 条件请求（`gh-snapshot.mjs:16` `CACHE_DIR = process.env.SNAPSHOT_CACHE_DIR ?? null`；判非空分支 `:27-31`、写缓存 `:62`，均在 `CACHE_DIR` 非空分支内）。
 - **不配的后果**：每轮探针/引擎的 gh API 请求都是普通请求，不发 `If-None-Match`、拿不到 304——**没有报错，唯一信号是 GitHub API 配额被静默低估**（探针每班车周期一次 × 在册 PR 数 × 多接口，长期累积可观）。
-- **配置了也有运维前提（不是无副作用）**：正常可读写时**不改变判定协议**——ETag 命中（304）只省 API 调用，非绿判据不变（`gh-snapshot.mjs:27-31` 判非空、`:62` `mkdirSync(CACHE_DIR,{recursive:true}) + writeFileSync(cacheFile,…)` 真实文件系统写入）。但**缓存目录不可写或既有缓存内容损坏会抛错**（`:28` 解析既有 cache、`:62` 写 cache）→ wrapper 自身 `:178-180` **exit 1**。注意 **exit 1 不等于「CI 判非绿」**——快照没产出，走不到绿/非绿判定：`engine.mjs:110-112` 捕获快照失败后只写 stderr（「保持状态，下轮重试」）并 `continue`，**跳过该 PR 本轮、不进 gate**；`probe.mjs:59-61` 对运行期异常是 **exit 0 = fail-open**（注释原文「放行班车，让引擎/通知链暴露问题」），班车照常起。所以缓存故障的真实表现是**本轮静默跳过 + 班车仍被放行**（可能反复耗 token），**不是 fail-closed 拦停**——必须修好缓存目录/文件才会恢复正常判定。这是一条运维前提（目录权限 / 磁盘可写 / 缓存文件可解析），不能当成「无副作用」。
+- **配置了也有运维前提（不是无副作用）**：正常可读写时**不改变判定协议**——ETag 命中（304）只省 API 调用，非绿判据不变（`gh-snapshot.mjs:27-31` 判非空、`:62` `mkdirSync(CACHE_DIR,{recursive:true}) + writeFileSync(cacheFile,…)` 真实文件系统写入）。但**缓存目录不可写或既有缓存内容损坏会抛错**（`:28` 解析既有 cache、`:62` 写 cache）→ wrapper 自身 `:178-180` **exit 1**。注意 **exit 1 不等于「CI 判非绿」**——快照没产出，走不到绿/非绿判定：`engine.mjs:111-113` 捕获快照失败后只写 stderr（「保持状态，下轮重试」）并 `continue`，**跳过该 PR 本轮、不进 gate**；`probe.mjs:59-61` 对运行期异常是 **exit 0 = fail-open**（注释原文「放行班车，让引擎/通知链暴露问题」），班车照常起。所以缓存故障的真实表现是**本轮静默跳过 + 班车仍被放行**（可能反复耗 token），**不是 fail-closed 拦停**——必须修好缓存目录/文件才会恢复正常判定。这是一条运维前提（目录权限 / 磁盘可写 / 缓存文件可解析），不能当成「无副作用」。
 - 这条是**配置项**，不是可选优化——部署时必须显式配，配了才算用了 ETag；并确保缓存目录可写、缓存可解析。
 
 **③ preRunHook 必须用 `deploy/wrappers/probe.mjs`，别自己造一个**
@@ -201,7 +201,10 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
 - **三条退出路径（都要接对）**：
   - `exit 0` = 有活 → 放行班车 agent 会话（引擎 + 队列投递）；**或运行期异常放行**（`probe.mjs:59-61` catch → exit 0，可用性优先：让完整引擎 + 通知链去暴露问题，而不是让探针静默扼杀所有轮次）；
   - `exit 2` = 无活 → 跳过本轮，**零 token**，只花几次带 ETag 的 gh API 读（`probe.mjs:64`）；
-  - `exit 1` = **参数/初始化错误**（`probe.mjs:47-50` 在 try 外 `fail(...,1)`，模块导入/初始化异常也不在 catch 内），**不受 fail-open 保护，且本仓未定义调度侧如何处理 exit 1**——这是调用姿势错了，不是「探针异常」。（本仓只有 exit 0/2 协议；preRunHook 失败语义本身也是 P0 真机实测项，`deploy/README.md:16`。）
+  - `exit 1` = **参数/初始化错误**（`probe.mjs:47-50` 在 try 外 `fail(...,1)`，模块导入/初始化异常也不在 catch 内），**不受 fail-open 保护，且本仓未定义调度侧如何处理 exit 1**——这是调用姿势错了，不是「探针异常」。（本仓只有 exit 0/2 协议。）
+- **宿主 preRunHook 失败语义 2026-08-08 已确认：fail-open**——preRunHook 失败/异常不会拦停班车会话，宿主照常启动；所以「不接 probe 会怎样」从「可能每周期启动会话（需实测）」升级为**确定的**「每周期必起会话、空转轮也烧 token」。fail-closed 的唯一来源是把 probe.mjs 的 `exit 2` 接进宿主 preRunHook（无活 → 真正跳过）；本仓源码自身没有「preRunHook 失败 → 拦停」的 fail-closed 路径（曾写「源码 fail-closed / 待实测」的旧说法已随 T4 更正，P0 项 ⑦ 见 `deploy/README.md:16`）。
+- **通知链是 best-effort，别依赖「收到」当验收**：`pending-stuck`（`engine.mjs:225`）与 `stuck`（`engine.mjs:240`）、`budget-pause`（`engine.mjs:297`）的发送失败都只记 `notify-error` journal 事件，**不重试、不补发**；`pending_stuck_notified` 去重标记在**尝试发送后即置位（含发送失败）**——取舍是宁丢一次不刷屏（`engine.mjs:216-218` 注释原文）。判断「告警是否被发出」以 journal 的 `notify-error` 有无为准，不能假设必达。
+- **`stuck` / `pending-stuck` 的路由（T3 定案，`notify-router.mjs:26-29`）**：按 repo 名细分——**cindy 仓（repo 名含 `cindy`）→ `silent`（不产生任何通知，只记 journal）**；**其他仓（如 mivo）→ `feishu` 通道**。pending-stuck 与 stuck 同通道、不落 ROUTES 表（否则 null 值会撞「未知事件类型」fail-closed）。「卡死无人知」在 cindy 仓是设计行为（W-6: cindy PR 卡死不打扰），不是漏配。
 - **部署动作**：接进 schedule 前**先手动跑一次**确认拿到 0 或 2；拿到 1 说明参数/调用姿势错了，fail-open 不会救你。
 - 它的判定**复用引擎同源模块**（`gate.evaluate` / `stateFileName` 文法），信号逻辑与引擎是**同一套**——自己另写一个探针等于造第二套判定，两套迟早不一致（探针说有活、引擎说没活，或反过来），凭空多一个故障面。
 
@@ -285,6 +288,8 @@ health.json（`slack_cmd` **必填**——不配则飞书凭证不可得时双�
   "feishu_cmd": "node /Users/<mini-user>/pr-autopilot/scripts/health/feishu-alert.mjs",
   "slack_cmd": "node /Users/<mini-user>/mivo-ops/mivo-canvas/agent-use/loops/bug-doctor/notify.mjs" }
 ```
+
+> **lease 语义（T4 澄清，勿把 lease 当进展信号）**：lease 文件只表示「引擎轮次仍活」——引擎每轮启动时刷新 `{last_success, pid}`（`engine.mjs:86`），健康检查据此判引擎是否在跑（ttl_minutes 过期 → 告警）。**lease 新鲜 ≠ PR 有进展**：引擎活着但某个 PR 的修复会话卡死/重派失败时，lease 照常刷新，健康检查不会因此告警。判断单个 PR 是否有进展要看 journal 事件：`waiting`（每轮对在途 pending 记一条，`engine.mjs:210-215`）、`pending-stuck`（超 `pendingStuckHours` 未 ack）、`dispatch-failed` / `redispatch-failed`（派发失败）；健康告警只管引擎进程本身，管不了 PR 级卡死——后者靠盯梢告警链（`stuck`/`pending-stuck` 通知）。
 
 FEISHU_* 凭证经 launchctl setenv 或 plist EnvironmentVariables 注入（不提交、不打日志）。
 
