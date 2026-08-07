@@ -3706,7 +3706,7 @@ t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生，不�
   ok(/schema_version: SCHEMA_VERSION, reviewer/.test(own), '本文件 verdict 构造必须用 SCHEMA_VERSION 派生常量');
   // 反向: 不得残留 verdict 版字面量（'v[0-9]', reviewer 形态）。正则用拼接构造，避免自引用误报。
   const lit = "schema_version: 'v" + "[0-9]', reviewer";
-  ok(!own.includes(lit), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
+  ok(!new RegExp(lit).test(own), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
 });
 
 t('[R10-A4] SKILL.md 契约与实现逐字同步: 按文档描述构造的 manifest/verdict 真能过闸（不止 grep 文档）', () => {
