@@ -97,9 +97,13 @@ export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, 
   // blocker/major）。`status=closed` ≠ 不进 canonical——closed 是「裁决为真且已处置」，进不进
   // canonical 是另一回事。因此判据④必须给 ARCHIVE 留出口，否则合法 ARCHIVE 永远收不了口。
   // 出口判据 =「该 family 有一条**已验证的 archive SC**」（结果导向，不是自报「已处置」标志
-  // 位——后者是记账式满足，正是 lead 一开始否决的形态）: archive SC 必须真实存在于 sc
-  // manifest 且其 finding_ids 引用的 canonical finding 的 family_key 就是本族，且本批 SC
-  // manifest 里存在该 archive SC（含 kind=archive）。
+  // 位——后者是记账式满足，正是 lead 一开始否决的形态）。完整判据三段（SC-T3T4 一致化，
+  // 2026-08-08）：
+  //   ① finding_ids 指向本族 canonical：每个 id 引用一条 canonical finding（源或终版均可），
+  //      且其 family_key === 该 SC 的 family_key（防「随便填个 family_key 的 archive SC 冒充出口」）；
+  //   ② 该 SC 真实出现在某个 wave 的 allocations 里；
+  //   ③ 该 wave 的 validation.results 中存在 sc_id === 该 SC 且 status === 'PASS' 的逐项证据
+  //      （不依赖 validation.ok 自报摘要——空 results 上 every 恒 true）。
   // **verify 由哪层保证（lead 2026-08-07 一行证据）**：`fix-run.mjs:551` validateIntegration
   // 对 wave 内全部 SC（含 archive）执行 verify 并强制全 PASS——:572-574 逐 SC 跑 verify recipe、
   // :643 `results.every((r) => r.status === 'PASS')`、:645 非 PASS 记 failed 阻断。因此
@@ -138,7 +142,8 @@ export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, 
     //    此前只验 validation.ok（自报汇总布尔值）——空 results 上 fix-run:643 的
     //    results.every((r) => r.status === 'PASS') 恒为 true，`{ok:true, results:[]}` 就能
     //    伪造通过出口而该 SC 的 verify 从未执行（汇总布尔值 = 「台账≠修复」标准形态）。
-    //    逐项查到即说明 results 非空且该 SC 真跑过；不再依赖 validation.ok（可真而 results 空）。
+    //    逐项查到即说明 results 非空且有该 SC 的 PASS 记录；正常路径下由 validateIntegration
+    //    执行产生（台账记录，非执行证明——与 :27-31 T1 免责一致，SC-T3T4 降级表述）。
     const waves = Array.isArray(runManifest.waves) ? runManifest.waves : [];
     const executedOk = waves.some((w) => {
       const allocs = Array.isArray(w.allocations) ? w.allocations : [];

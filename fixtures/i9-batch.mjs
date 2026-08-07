@@ -609,8 +609,9 @@ t('[i9-batch-13d] 裁决 2 行为钉住：pr_number 不入 review_input_hash（n
 console.log('\n[i9-batch-14] 判据④ ARCHIVE 出口：带 archive SC 放行 / 无出口仍拒');
 // 背景：ARCHIVE 的 finding 留在 findings[] 且进终版 canonical（SKILL.md:507），status=closed
 // ≠ 不进 canonical。判据④原会拒 → 合法 ARCHIVE 收不了口（洞，R4 实测定论）。修复：④给
-// ARCHIVE 留出口，判据 =「该 family 有一条 archive SC（kind=archive 且 family_key 匹配）」——
-// 结果导向，不是自报「已处置」标志位。
+// ARCHIVE 留出口，判据三段（SC-T3T4 一致化，2026-08-08）：① finding_ids 指向本族 canonical
+// （family_key 匹配，源或终版均可）② SC 在某 wave allocations ③ 该 wave validation.results 含
+// {sc_id, status:'PASS'} 逐项证据——结果导向，不是自报「已处置」标志位。
 // 构造：终版含 FK1（复发）+ 一个带 FK1 的 archive SC → ④应放行；无该 archive SC → 拒。
 const termRecurArch = mkTerminal(L2, [[f1Recur], [f1Recur], [f1Recur]]); // 终版仍含 FK1
 if (termRecurArch.gate_result !== 'pass') throw new Error('[i9-batch-14] 前提失败: 复发轮未 PASS: ' + JSON.stringify(termRecurArch.fail_reasons ?? []));
@@ -619,9 +620,10 @@ const scManifestWithArchFK1 = {
   scs: [...scManifest.scs, { id: 'SC-ARCH-FK1', kind: 'archive', finding_ids: [cF1.id], invariant: I1, family_key: FK1, change: '登记 FK1 残余', holds: 'README 含 FK1 文案', verify: { cmd: 'grep', args: ['-q', 'FK1', 'README.md'] } }]
 };
 t('[i9-batch-14a] 冻结 family 被 ARCHIVE 处置（终版有该族 + 带 archive SC 且该 SC 真实执行过）→ 判据④放行（出口生效）', () => {
-  // 2026-08-07 收紧（集成审查）：出口判据按注释声明补「该 archive SC 必须真实出现在某 wave
-  // allocations 且该 wave validation.ok === true」（补委派链断点——有 archive SC ≠ 执行过）。
-  // 构造：recurRunManifest 的 wave0 加 SC-ARCH-FK1 的 allocation + validation.ok=true。
+  // 2026-08-07 收紧（集成审查）+ 2026-08-08 一致化（SC-T3T4）：出口判据三段——该 archive SC
+  // 的 finding_ids 指向本族 canonical + 真实出现在某 wave allocations + 该 wave validation.results
+  // 含 {sc_id, status:'PASS'} 逐项证据（不依赖 validation.ok 自报摘要；空 results 上 every 恒 true）。
+  // 构造：recurRunManifest 的 wave0 加 SC-ARCH-FK1 的 allocation + results 逐项 PASS。
   const executedRunManifest = {
     ...recurRunManifest,
     waves: (recurRunManifest.waves ?? []).map((w, i) => (i === 0
