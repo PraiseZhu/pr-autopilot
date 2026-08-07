@@ -13,7 +13,9 @@
 //                push-guard「恰好一个后继」拒（squash 记录齐全，只红批次判据，失败模式隔离）
 //   [i9-batch-10] 缺 invariant 无法归族（判据⑥）：源共识/终版共识的 blocker/major 无
 //                family_key → 拒（先归因再进批次）
-// 反向变异：每条用例对应一个「挖空点」，变异后只有该用例红、其余保持绿（消息文本互斥支撑隔离）。
+// 反向变异：每条用例对应一个「挖空点」。各挖空点的实测红行记录在开发期 lead 报告中，
+// 本树只有 [i9-batch-6c] 内的一条常驻反向测试（严格后代——该检查曾被误删，故单独钉住）。
+// 其余挖空点未在树内固化，改动相关实现时请手工重做变异。
 // 本文件独立可跑：`node fixtures/i9-batch.mjs`，不并入 run-fixtures.mjs / run-all.sh
 // （lead 边界：run-fixtures.mjs / run-all.sh 由 lead 亲自接线，禁改）。
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
@@ -814,7 +816,8 @@ t('[i9-batch-6e] run manifest 版本比较：schema_version 不符 → 拒（旧
   // 2026-08-07 修正（失败模式隔离）：staleRm 必须**无 batch 段**——若带 batch，checkBatchClosure
   // 的 :61-62 也有 RUN_MANIFEST_SCHEMA_VERSION 比较，会把 v2 拦下、掩盖 push-guard 版本比较
   // 被挖空的变异（6e 断言的是 push-guard 的 :327，不是闭合门的）。去掉 batch 段后，只有
-  // push-guard 版本比较能拦，变异 C（挖空 :327）会让 6e 变红。
+  // push-guard 版本比较能拦，变异 C（挖空 :327）实测使 6e 变红（开发期手工验证，记录见 lead 报告）；
+  // 本树无该条的常驻反向测试。
   const staleRm = { ...twoStepRunManifest, schema_version: 'v2', batch: undefined }; // 旧版 run manifest（hash 自洽，无 batch）
   const foStale = {
     source_artifact_hash: recomputeArtifactHash(srcArtifact),
