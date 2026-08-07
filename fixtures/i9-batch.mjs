@@ -27,6 +27,8 @@ import { runConsensusGate, recomputeArtifactHash, familyKeyOf } from '../scripts
 import { checkPushGuard, isStrictDescendant } from '../scripts/push-guard.mjs';
 import { checkScCoverage } from '../scripts/sc-coverage-gate.mjs';
 import { checkDispatch } from '../scripts/fix-dispatch-gate.mjs';
+import { validateVerdict, OUT_OF_SCOPE_NOTES_FIELD } from '../scripts/verdict-validate.mjs';
+import { contractSpec } from '../scripts/dispatch-contract.mjs';
 import { buildFixPlan } from '../scripts/fix-plan.mjs';
 import { runManifestHash, initRun } from '../scripts/fix-run.mjs';
 import { computeFixPlanHash } from '../scripts/fix-plan.mjs';
@@ -418,6 +420,40 @@ t('[i9-batch-11b] 非祖先 parent 仍拒（与同 SHA 失败模式不重合）'
   ok(r2Sibling.gate_result === 'fail', '[i9-batch-11b] 非祖先 parent 必须 fail: ' + JSON.stringify(r2Sibling.fail_reasons ?? []));
   ok((r2Sibling.fail_reasons ?? []).some((e) => /不是当前 candidate_sha.*的祖先/.test(e)),
     '非祖先必须报「不是祖先」而非「同 SHA」: ' + JSON.stringify(r2Sibling.fail_reasons ?? []));
+});
+
+// ========== [i9-batch-12] out_of_scope_notes 单一读取点旁路（R4 修复③，行为级钉住） ==========
+console.log('\n[i9-batch-12] out_of_scope_notes 消费接线：产物字段名真正送进 validateVerdict，内容校验必须执行');
+// 用 dispatch-contract 的产物字段名（out_of_scope_channel = OUT_OF_SCOPE_NOTES_FIELD）构造
+// verdict——「把产物真正送进 validator」，不是只检查 contractSpec() 的返回值。
+// 背景（审查席实测）：validator 的 D3 内容校验此前硬读 `v.out_of_scope_notes` 字面量，
+// 字段名一旦在 schema 改名，TOP_LEVEL_KEYS（schema 派生）接受新名、本段读旧名读 undefined
+// → 内容校验整段静默跳过（可选通道改名 = 静默丢数据，SC-R3-F2 判据要治的那类）。
+const SPEC_CHANNEL = contractSpec({ seat: 'claude-adversarial', round: 1 }).out_of_scope_channel;
+ok(SPEC_CHANNEL === OUT_OF_SCOPE_NOTES_FIELD, '[i9-batch-12] 前提: 产物通道名 == validator 常量');
+function verdictWithNotes(notes, over = {}) {
+  const fd = { id: 'f1', primary_face: 'A', severity: 'major', anchor: FIX1_ANCHOR, anchor_paths: ['src/fix1.ts'], evidence: 'x', invariant: I1, family_id: 'fam-1', status: 'closed' };
+  const v = mkVerdictFor('claude-adversarial', mkBundle(L0, L1), [fd], over);
+  if (notes !== null) v[SPEC_CHANNEL] = notes; // 用产物字段名（动态，跟常量走）
+  return v;
+}
+t('[i9-batch-12a] 合法 out_of_scope_notes（产物字段名）→ validateVerdict 零 D3 错误', () => {
+  const v = verdictWithNotes([{ id: 'n1', note: '范围外真问题', evidence: '证据', suggested_issue_title: '标题' }]);
+  const errs = validateVerdict(v);
+  ok(!errs.some((e) => /out_of_scope|D3/.test(e)), '合法 note 不应报 D3 错误: ' + JSON.stringify(errs));
+});
+t('[i9-batch-12b] 内容校验真实执行：note id 与 finding id 撞号 → validateVerdict 必须拦（走常量读取点）', () => {
+  const v = verdictWithNotes([{ id: 'f1', note: '撞号', evidence: '证据', suggested_issue_title: '标题' }]); // id='f1' 撞 finding id
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /out_of_scope_note id「f1」与 finding id 撞号/.test(e)),
+    '撞号必须被 D3 内容校验拦下（若读取点被旁路，本段读 undefined 静默跳过 = 洞）: ' + JSON.stringify(errs));
+});
+t('[i9-batch-12c] 可选通道改名不能静默：typo 字段名（out_of_scope_note 单数）→ 未知顶层字段被拦', () => {
+  const v = verdictWithNotes(null);
+  v['out_of_scope_note'] = [{ id: 'n1', note: 'x', evidence: 'y', suggested_issue_title: 'z' }];
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /verdict 存在未知顶层字段: out_of_scope_note/.test(e)),
+    'typo 字段名必须被 TOP_LEVEL_KEYS 拦（fail loud，不得静默放走内容）: ' + JSON.stringify(errs));
 });
 
 // ========== [i9-batch-6] 批次严格后代语义（lead 撤回「直接后继」后） ==========

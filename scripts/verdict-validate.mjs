@@ -103,8 +103,10 @@ export function changedPathSet({ repoDir, baseSha, candidateSha }) {
 export const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
 export const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];
 export const FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
-// SC-R3-F5: 域外真问题的唯一合法载体字段名——本文件下方 validateVerdict() 里的
-// `v.out_of_scope_notes` 是这个字段名唯一的物理读取点，dispatch-contract.mjs 的
+// SC-R3-F5: 域外真问题的唯一合法载体字段名——本文件下方 validateVerdict() 里的 D3 内容
+// 校验通过本常量动态读取（`v[OUT_OF_SCOPE_NOTES_FIELD]`，R4 修复前是 `v.out_of_scope_notes`
+// 硬字面量，字段名在 schema 改名时 TOP_LEVEL_KEYS 接受新名、本段读旧名读 undefined → 内容
+// 校验静默跳过，属 SC-R3-F2 要治的可选通道静默丢数据一类）。dispatch-contract.mjs 的
 // out_of_scope_channel 此前在那之外又手拄了一份同一字符串（与 SEATS/ADVERSARIAL/ALL_FACES 曾经
 // 的漂移是同一形状）。改为 import 本常量，不再自己手写字面值。
 export const OUT_OF_SCOPE_NOTES_FIELD = 'out_of_scope_notes';
@@ -363,12 +365,18 @@ export function validateVerdict(v, opts = {}) {
   //   - ref_paths 只要求是 tracked 文件，**刻意不要求 ⊆ 实改集**——这正是本通道存在的理由。
   // 跟踪义务在 Phase 2c 意见三分法的「推」通道（开 issue + PR body 记链接），保证等级 T1：
   // 机器只锁形状（字段齐全、不与 finding 互相伪装），**不**校验 issue 真的开了。如实声明。
-  if (v.out_of_scope_notes !== undefined) {
-    need(Array.isArray(v.out_of_scope_notes), 'out_of_scope_notes 必须是数组（D3）');
-    if (Array.isArray(v.out_of_scope_notes)) {
+  // R4（审查席 major，2026-08-07）: 此前的读取是 `v.out_of_scope_notes` 硬字面量——字段名
+  // 一旦在真相源/schema 改名，TOP_LEVEL_KEYS（schema 派生）接受新名，但本段继续读旧名读到
+  // undefined → 整段内容校验静默跳过（可选通道改名 = 静默丢数据，正是 SC-R3-F2 要治的那类）。
+  // 改为经 OUT_OF_SCOPE_NOTES_FIELD 常量动态读取（本文件 :110 定义的唯一物理读取点，与
+  // dispatch-contract.mjs 的 out_of_scope_channel 同源），字段名改名时本段自动跟上。
+  const notes = v[OUT_OF_SCOPE_NOTES_FIELD];
+  if (notes !== undefined) {
+    need(Array.isArray(notes), `${OUT_OF_SCOPE_NOTES_FIELD} 必须是数组（D3）`);
+    if (Array.isArray(notes)) {
       const seenNoteIds = new Set();
       const cap = opts.anchorPathsMax ?? DEFAULT_ANCHOR_PATHS_MAX;
-      for (const n of v.out_of_scope_notes) {
+      for (const n of notes) {
         need(n && typeof n === 'object' && !Array.isArray(n), 'out_of_scope_notes 元素必须是对象');
         if (!n || typeof n !== 'object' || Array.isArray(n)) continue;
         need(typeof n.id === 'string' && n.id.length > 0, 'out_of_scope_note 缺 id');
