@@ -1136,6 +1136,171 @@ t('[SC-T2-2] 持久化篡改：validation 改为 {ok:true, results:[]} → final
   ok(finErr.includes('finalizeRun 读到该形状时拒绝'), 'finalizeRun 必须拒绝 {ok:true, results:[]} 并点名该形状: ' + finErr);
 });
 
+// ========== [SC-T8] 批次强制 + 冻结族精确全覆盖（2026-08-08 派工，lead 转授 SC-T8 契约） ==========
+console.log('\n[SC-T8] 修复编排路径 batch 强制（SC-1）+ frozen_families 精确全覆盖（SC-2）');
+// 测试所需分支/HEAD 状态：push-guard 的 SHA 绑定要求 HEAD == expected_sha 且 branch ref 也是，
+// 文件尾部 HEAD 已不在 feat 上（[SC-T2-2] 停在自建分支），每个用例自建指向目标 sha 的分支。
+const mkBranch = (name, sha) => { execFileSync('git', ['-C', repo, 'checkout', '-q', '-b', name, sha]); };
+const noBatchRunManifest = mkRunManifest({ batch: undefined }); // 无 batch 段（批次强制负例载体）
+const BATCH_REQUIRED_RE = /批次协议/;
+
+t('[SC-T8-1] 修复编排 + 源 artifact 含 actionable findings + run manifest 无 batch → push-guard 拒（批次强制，本门自己的消息）', () => {
+  mkBranch('sc-t8-1', L2);
+  const r = pgCallWith(noBatchRunManifest, L2, termEmpty, 'sc-t8-1');
+  ok(r.errors.some((e) => BATCH_REQUIRED_RE.test(e) && /缺 batch 段/.test(e)),
+    '必须报本门自己的批次强制错误（点名批次协议 + 缺 batch 段）: ' + JSON.stringify(r.errors));
+  ok(!r.errors.some((e) => /批次闭合门/.test(e)),
+    '无 batch 时闭合门不得误报（无 batch 段 = 闭合门整体跳过，只有批次强制这一道门在拦）: ' + JSON.stringify(r.errors));
+});
+
+t('[SC-T8-2] 部分冻结（缺 FK2，少冻结）→ 闭合门判据③拒「缺源共识族」+ push-guard 传导', () => {
+  const partialRun = mkRunManifest({ batch: { batch_id: 'b1', frozen_at_sha: L1, frozen_families: [FK1], successor_sha: L2, status: 'closed' } });
+  const errs = checkBatchClosure({ runManifest: partialRun, sourceArtifact: srcArtifact, finalArtifact: termEmpty, scManifest });
+  ok(errs.some((e) => /缺源共识族/.test(e)),
+    '少冻结必须报「缺源共识族」（点名漏冻结的族）: ' + JSON.stringify(errs));
+  ok(!errs.some((e) => /不在源共识中的 family_key/.test(e)),
+    '部分冻结不得误报外族（FK1 在源共识内）: ' + JSON.stringify(errs));
+  mkBranch('sc-t8-2', L2);
+  const r = pgCallWith(partialRun, L2, termEmpty, 'sc-t8-2');
+  ok(r.errors.some((e) => /批次闭合门/.test(e) && /缺源共识族/.test(e)),
+    'push-guard 必须传导闭合门的缺族错误: ' + JSON.stringify(r.errors));
+});
+
+t('[SC-T8-3] 额外外族（frozen 含 FK3，多冻结）→ 闭合门判据③拒「不在源共识」+ push-guard 传导', () => {
+  const extraRun = mkRunManifest({ batch: { batch_id: 'b1', frozen_at_sha: L1, frozen_families: [FK1, FK2, FK3], successor_sha: L2, status: 'closed' } });
+  const errs = checkBatchClosure({ runManifest: extraRun, sourceArtifact: srcArtifact, finalArtifact: termEmpty, scManifest });
+  ok(errs.some((e) => /不在源共识中的 family_key/.test(e)),
+    '外族必须被拒（点名外族 family_key）: ' + JSON.stringify(errs));
+  ok(!errs.some((e) => /缺源共识族/.test(e)),
+    '外族场景不得误报缺族（FK1/FK2 都在冻结集内）: ' + JSON.stringify(errs));
+  mkBranch('sc-t8-3', L2);
+  const r = pgCallWith(extraRun, L2, termEmpty, 'sc-t8-3');
+  ok(r.errors.some((e) => /批次闭合门/.test(e) && /不在源共识中的 family_key/.test(e)),
+    'push-guard 必须传导闭合门的外族错误: ' + JSON.stringify(r.errors));
+});
+
+t('[SC-T8-4] 精确覆盖正向全链：CLI init --batch（frozen = 源 artifact 全部唯一 family_key）→ push-guard 整体通过', () => {
+  const { runManifest, finalCandidate, featBranch } = cliFullChain(JSON.stringify({ batch_id: 't8-4', frozen_families: [FK1, FK2].sort() }));
+  // 终版 artifact：delta 轮对 finalCandidate（candidate=finalCandidate、parent=srcArtifact、无 findings）
+  const forgedTerm = { ...termEmpty, candidate_sha: finalCandidate, review_input_hash: computeReviewInputHash(mkBundle(L0, finalCandidate)), parent_artifact_hash: recomputeArtifactHash(srcArtifact) };
+  forgedTerm.consensus_artifact_hash = recomputeArtifactHash(forgedTerm);
+  // HEAD 已在 featBranch（cliFullChain 内部创建并停留，finalize 后 tip == finalCandidate）
+  const r = pgCallWith(runManifest, finalCandidate, forgedTerm, featBranch);
+  eq(r.errors, [], '精确覆盖应整体零错误（正例必须验整体通过，不能只查「无批次类报错」）: ' + JSON.stringify(r.errors));
+});
+
+t('[SC-T8-5] 普通旧路径不变：首轮零 finding 无 parent 无编排 → push-guard 整体通过（不强制批次）', () => {
+  const r1Clean = consensusFor(mkBundle(L0, L1), [[], [], []], { repoDir: repo });
+  ok(r1Clean.gate_result === 'pass', '[SC-T8-5] 前提失败: 首轮零 finding 未 PASS: ' + JSON.stringify(r1Clean.fail_reasons ?? []));
+  mkBranch('sc-t8-5', L1);
+  const r = checkPushGuard({
+    repoDir: repo,
+    manifest: { repo: 'o/r', remote: 'origin', branch: 'sc-t8-5', expected_sha: L1, purpose: 'feature', consensus_artifact_hash: r1Clean.consensus_artifact_hash },
+    artifact: r1Clean, bundle: mkBundle(L0, L1), constitution
+  });
+  eq(r.errors, [], '零 finding 无编排直通 PR 应整体通过（批次协议不约束普通路径）: ' + JSON.stringify(r.errors));
+});
+
+t('[SC-T8-6] 单 SC actionable 强制：源 artifact 仅 1 条 actionable finding → 无 batch 仍拒（判定看 actionable findings，不按 SC 数量）', () => {
+  // 单 finding 源共识（f1 一条 major）+ 单 SC manifest + 单组 plan + 无 batch run manifest
+  const singleSrc = consensusFor(mkBundle(L0, L1), [[f1], [f1], [f1]], { repoDir: repo });
+  ok(singleSrc.gate_result === 'pass', '[SC-T8-6] 前提失败: 单 finding 源共识未 PASS: ' + JSON.stringify(singleSrc.fail_reasons ?? []));
+  const cS1 = singleSrc.canonical_findings.find((c) => c.family_key === FK1);
+  ok(cS1, '[SC-T8-6] 前提失败: 单 finding 源共识须含 FK1 canonical');
+  const singleScManifest = { schema_version: 'v2', consensus_artifact_hash: singleSrc.consensus_artifact_hash, scs: [{ id: 'SC-1', kind: 'fix', finding_ids: [cS1.id], invariant: I1, family_key: FK1, change: '给 fix1 加取消保护', holds: 'fix1 取消后迟到 start 不激活', verify: { cmd: 'grep', args: ['-q', 'cancel', 'src/fix1.ts'] } }] };
+  const sCov = checkScCoverage({ manifest: singleScManifest, artifact: singleSrc });
+  eq(sCov, [], '[SC-T8-6] 前提失败: SC 覆盖门: ' + JSON.stringify(sCov));
+  const sBuilt = buildFixPlan({ artifact: singleSrc, manifest: singleScManifest, capacity: 8 });
+  ok(!sBuilt.degraded, '[SC-T8-6] 前提失败: plan degraded: ' + JSON.stringify(sBuilt.reasons));
+  const singlePlan = sBuilt.plan;
+  eq(JSON.stringify(singlePlan.waves), JSON.stringify([['g1']]), '[SC-T8-6] 前提失败: 单 SC plan 应为单 fix 波');
+  const singleDispatch = { fix_plan_hash: singlePlan.fix_plan_hash, waves: [{ dispatches: [{ group_id: 'g1', worker_session_id: 'w1', tip: L2, result: { status: 'PASS', sc_results: [{ sc_id: 'SC-1', status: 'PASS', evidence: 'fix1 修好' }] } }] }] };
+  const sDisp = checkDispatch({ plan: singlePlan, record: singleDispatch });
+  eq(sDisp, [], '[SC-T8-6] 前提失败: 派发门: ' + JSON.stringify(sDisp));
+  const singleTerm = consensusFor(mkBundle(L0, L2), [[], [], []], { round: 2, attempt: 1, repoDir: repo, gateOpts: { parentArtifact: singleSrc, repoDir: repo } });
+  ok(singleTerm.gate_result === 'pass', '[SC-T8-6] 前提失败: 单 finding 终版未 PASS: ' + JSON.stringify(singleTerm.fail_reasons ?? []));
+  const singleRun = {
+    schema_version: RUN_MANIFEST_SCHEMA_VERSION, run_id: 'sc-t8-single', repo_dir: repo,
+    fix_plan_hash: singlePlan.fix_plan_hash, sc_manifest_hash: hashObject(singleScManifest),
+    source_artifact_hash: recomputeArtifactHash(singleSrc), source_candidate: L1,
+    feature_branch: 'feat', integration_branch: 'x',
+    waves: [{ wave_index: 0, base: L1, worktree_root: '/x', allocations: [], tips: [{ group_id: 'g1', tip: L2 }], integrated_tip: L2, replan: null, validation: { at: 't', ok: true, results: [] }, squash_commits: [L2] }],
+    final_candidate: L2, events: []
+  };
+  const foSingle = {
+    source_artifact_hash: recomputeArtifactHash(singleSrc),
+    sc_manifest_hash: hashObject(singleScManifest),
+    fix_plan_hash: singlePlan.fix_plan_hash,
+    dispatch_record_hash: hashObject(singleDispatch),
+    run_manifest_hash: runManifestHash(singleRun)
+  };
+  mkBranch('sc-t8-6', L2);
+  const r = checkPushGuard({
+    repoDir: repo,
+    manifest: { repo: 'o/r', remote: 'origin', branch: 'sc-t8-6', expected_sha: L2, purpose: 'feature', consensus_artifact_hash: singleTerm.consensus_artifact_hash, fix_orchestration: foSingle },
+    artifact: singleTerm, bundle: mkBundle(L0, L2), constitution,
+    sourceArtifact: singleSrc, scManifest: singleScManifest, fixPlan: singlePlan, dispatchRecord: singleDispatch, runManifest: singleRun
+  });
+  ok(r.errors.some((e) => BATCH_REQUIRED_RE.test(e) && /缺 batch 段/.test(e)),
+    '单 SC actionable 无 batch 必须被批次强制拒（不按 SC 数量判断，判定只看源 artifact 的 actionable findings）: ' + JSON.stringify(r.errors));
+  ok(!r.errors.some((e) => /批次闭合门/.test(e)), '无 batch 时闭合门不得误报: ' + JSON.stringify(r.errors));
+});
+
+t('[SC-T8-7] 常驻反向变异：挖掉 push-guard batch-required 接线 → 无 batch 负例不再报本门消息（控制组未变异必报；不用笼统 errors.length）', async () => {
+  // 与 [i9-batch-6c] 同一模式：临时拷贝 push-guard.mjs 到 scripts/（保留相对 import）、
+  // 挖空变异点、动态 import；变异组证明检测器有效（接线一旦消失负例即放行），控制组
+  // 证明未变异时必须拦（防止「变异组放行是因为别的原因」的误读）。
+  const { readFileSync: rf, writeFileSync: wf, rmSync: rm } = await import('node:fs');
+  const pgSrc = rf(join(S, 'push-guard.mjs'), 'utf8');
+  const probe = 'if (srcActionable.length > 0 && !runManifest.batch) {';
+  ok(pgSrc.includes(probe), '前置: push-guard 源码须含 batch-required 接线（探针按此定位变异点）');
+  const patched = pgSrc.replace(probe, 'if (false && srcActionable.length > 0 && !runManifest.batch) { // MUTATION: batch-required 接线挖空（SC-T8-7 常驻反向变异）');
+  const uid = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const pgCopy = join(S, `.i9-batch-pg-t8-${uid}.mjs`);
+  wf(pgCopy, patched);
+  try {
+    const fo = {
+      source_artifact_hash: recomputeArtifactHash(srcArtifact),
+      sc_manifest_hash: hashObject(scManifest),
+      fix_plan_hash: plan.fix_plan_hash,
+      dispatch_record_hash: hashObject(dispatchRecord),
+      run_manifest_hash: runManifestHash(noBatchRunManifest)
+    };
+    // HEAD 竞态防护（实测踩坑，2026-08-08）：本文件多个 async 测试（[i9-batch-6c] 等）在
+    // 恢复阶段会操作共享 repo 的 HEAD。变异组注册时的 mkBranch 在 await import 之前执行，
+    // 恢复后 HEAD 可能已被其他 async 测试改走 → checkPushGuard 先报 SHA 漂移、测不到本门。
+    // 修复：checkout 与 checkPushGuard 放进同一个原子同步块（await 之后、调用之前重新
+    // checkout；同步块之间不交错，谁先恢复谁后恢复都自洽）。
+    const ensureHead = (branch) => { execFileSync('git', ['-C', repo, 'checkout', '-q', branch]); };
+    mkBranch('sc-t8-7a', L2); // 注册阶段先建分支（分支创建与 HEAD 绑定不在恢复段）
+    mkBranch('sc-t8-7b', L2);
+    const copy = await import('file://' + pgCopy + '?t=' + Date.now());
+    // 变异组：临时副本 → 无 batch 负例 errors 不得含本门「批次协议」消息（且整体放行——
+    // 若 errors 非空是别的门在拦，说明变异没测到本门，变异无效）
+    ensureHead('sc-t8-7a');
+    const rMut = copy.checkPushGuard({
+      repoDir: repo,
+      manifest: { repo: 'o/r', remote: 'origin', branch: 'sc-t8-7a', expected_sha: L2, purpose: 'feature', consensus_artifact_hash: termEmpty.consensus_artifact_hash, fix_orchestration: fo },
+      artifact: termEmpty, bundle: mkBundle(L0, L2), constitution,
+      sourceArtifact: srcArtifact, scManifest, fixPlan: plan, dispatchRecord, runManifest: noBatchRunManifest
+    });
+    ok(!rMut.errors.some((e) => BATCH_REQUIRED_RE.test(e)) && rMut.errors.length === 0,
+      '变异组：挖掉接线后无 batch 负例必须放行（不得再报本门「批次协议」消息；errors 非空 = 别的门在拦 = 变异无效）: ' + JSON.stringify(rMut.errors));
+    // 控制组：未变异原模块 → 必报本门消息（同一原子同步块内，HEAD 不受其他 async 测试影响）
+    ensureHead('sc-t8-7b');
+    const rCtl = checkPushGuard({
+      repoDir: repo,
+      manifest: { repo: 'o/r', remote: 'origin', branch: 'sc-t8-7b', expected_sha: L2, purpose: 'feature', consensus_artifact_hash: termEmpty.consensus_artifact_hash, fix_orchestration: fo },
+      artifact: termEmpty, bundle: mkBundle(L0, L2), constitution,
+      sourceArtifact: srcArtifact, scManifest, fixPlan: plan, dispatchRecord, runManifest: noBatchRunManifest
+    });
+    ok(rCtl.errors.some((e) => BATCH_REQUIRED_RE.test(e)),
+      '控制组（未变异）：必须报本门「批次协议」消息（变异生效的对照）: ' + JSON.stringify(rCtl.errors));
+  } finally {
+    rm(pgCopy, { force: true });
+  }
+});
+
 // 等所有 async 测试完成后再出汇总（t 的 async 支持：主流程不等 Promise 会提前打印）
 await Promise.allSettled(pendingTests);
 console.log(`\n==== i9-batch.mjs: ${pass} passed, ${failCount} failed ====`);
