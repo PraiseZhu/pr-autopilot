@@ -465,52 +465,75 @@ t('[i9-batch-12c] 可选通道改名不能静默：typo 字段名（out_of_scope
   ok(errs.some((e) => /verdict 存在未知顶层字段: out_of_scope_note/.test(e)),
     'typo 字段名必须被 TOP_LEVEL_KEYS 拦（fail loud，不得静默放走内容）: ' + JSON.stringify(errs));
 });
-// B 类钉住测试（lead 2026-08-07）：钉「validator 必须跟着常量走」（改名后不脱节）——
-// A 类（[12b]+变异M）钉的是「内容校验真的执行」，B 类钉的是「内容校验的读取点真的跟常量」。
-// 做法（不动生产文件）：拷 verdict-validate.mjs 到临时文件，拷贝里把 OUT_OF_SCOPE_NOTES_FIELD
-// 值改成新名 oos_notes_v2，动态 import 该拷贝，构造用新字段名的 verdict 送进拷贝的
-// validateVerdict → 若消费点硬读旧名则读 undefined 内容校验整段跳过（撞号静默通过=断言失败）；
-// 走常量则跟着新名走（撞号报错=断言通过）。
-t('[i9-batch-12d] B 类：validator 跟着常量走——改名后内容校验不脱节（临时拷贝动态 import）', async () => {
-  const { readFileSync, writeFileSync, mkdtempSync } = await import('node:fs');
+// B 类钉住 harness（lead 2026-08-07）：钉「validator 必须跟着常量走」（常量变则行为跟着变，
+// 防未来漂移）。两个不变量共用同一套「拷贝 + 改常量 + 动态 import」：
+//   · 12d：改 OUT_OF_SCOPE_NOTES_FIELD 值 → 新字段名承载 note 送进拷贝 validateVerdict
+//          → 硬读旧名则读 undefined 内容校验整段跳过（撞号静默通过=断言失败）；走常量跟新名（报错=通过）
+//   · 12e：改 FACES 为 8 面 → 送 8 面对抗席 verdict → 硬抄 7 则拒（断言失败）；走 FACES.length 跟着变（通过）
+// 通用 harness：拷 verdict-validate.mjs + review-verdict.schema.json 到 scripts/ 临时文件
+// （保留相对 import——/tmp 下相对路径 import 实测失败；schema 也拷贝因为 TOP_LEVEL_KEYS 从
+// schema 派生），applySrcPatch / applySchemaPatch 各自应用，动态 import，跑完 finally 清理。
+async function withPatchedValidator({ srcPatch, schemaPatch, run }) {
+  const { readFileSync, writeFileSync, rmSync } = await import('node:fs');
   const { join } = await import('node:path');
-  const { tmpdir } = await import('node:os');
   const src = readFileSync(join(S, 'verdict-validate.mjs'), 'utf8');
-  const NEW_NAME = 'oos_notes_v2';
-  // 真实改名的完整场景 = 常量 + schema 同步改（TOP_LEVEL_KEYS 从 schema 派生）。拷贝只改
-  // 常量不改 schema 会先撞「未知顶层字段」（schema 不认新名），测不到 B——所以 schema 也
-  // 做临时拷贝并让 verdict-validate 拷贝指向它。
-  const patchedSrc = src.replace(
-    "export const OUT_OF_SCOPE_NOTES_FIELD = 'out_of_scope_notes';",
-    `export const OUT_OF_SCOPE_NOTES_FIELD = '${NEW_NAME}';`
-  ).replace(
-    "'out_of_scope_notes'", `'${NEW_NAME}'` // schema 读取路径不变，但 TOP_LEVEL_KEYS 由 schema 派生——改 schema 拷贝
-  );
-  // schema 拷贝：改 review-verdict.schema.json 里的 out_of_scope_notes 字段名为新名
+  let patchedSrc = srcPatch(src);
+  // 唯一文件后缀（每次调用独立，避免 12d/12e 并发共享同名文件竞态——t 的 async 支持让它们并行）
+  const uid = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const schemaCopyPath = join(S, `.i9-batch-vv-schema-${uid}.json`);
   const schemaSrc = readFileSync(join(S, '..', 'schemas', 'review-verdict.schema.json'), 'utf8');
-  const schemaCopyPath = join(S, '.i9-batch-vv-schema-copy.json');
-  writeFileSync(schemaCopyPath, schemaSrc.replace(/"out_of_scope_notes"/g, `"${NEW_NAME}"`));
-  // verdict-validate 拷贝：让它读 schema 拷贝（改 REVIEW_VERDICT_SCHEMA 读取路径）
-  const copyPath = join(S, '.i9-batch-vv-copy.mjs');
-  const patchedWithSchema = patchedSrc.replace(
+  writeFileSync(schemaCopyPath, schemaPatch(schemaSrc));
+  const copyPath = join(S, `.i9-batch-vv-copy-${uid}.mjs`);
+  patchedSrc = patchedSrc.replace(
     "join(HERE, '../schemas/review-verdict.schema.json')",
-    "join(HERE, '.i9-batch-vv-schema-copy.json')"
+    `join(HERE, '.i9-batch-vv-schema-${uid}.json')`
   );
-  writeFileSync(copyPath, patchedWithSchema);
+  writeFileSync(copyPath, patchedSrc);
   try {
-    const copy = await import('file://' + copyPath + '?t=' + Date.now()); // 动态 import 拷贝
-    ok(copy.OUT_OF_SCOPE_NOTES_FIELD === NEW_NAME, '拷贝的常量值应为新名');
-    // 构造用新字段名的 verdict（新名承载 note，撞 finding id f1）→ 拷贝的 validateVerdict 必须拦
-    const v = verdictWithNotes(null);
-    v[NEW_NAME] = [{ id: 'f1', note: '撞号', evidence: '证据', suggested_issue_title: '标题' }];
-    const errs = copy.validateVerdict(v);
-    ok(errs.some((e) => /与 finding id 撞号/.test(e)),
-      '走常量则跟新名 → 撞号必须被拦（若硬读旧名则读 undefined 静默跳过 = B 洞）: ' + JSON.stringify(errs));
+    const copy = await import('file://' + copyPath + '?t=' + Date.now());
+    await run(copy);
   } finally {
-    const fs = await import('node:fs');
-    fs.rmSync(copyPath, { force: true });
-    fs.rmSync(schemaCopyPath, { force: true });
+    rmSync(copyPath, { force: true });
+    rmSync(schemaCopyPath, { force: true });
   }
+}
+t('[i9-batch-12d] B 类：validator 跟着常量走——改名后内容校验不脱节（临时拷贝动态 import）', async () => {
+  const NEW_NAME = 'oos_notes_v2';
+  await withPatchedValidator({
+    srcPatch: (src) => src.replace(
+      "export const OUT_OF_SCOPE_NOTES_FIELD = 'out_of_scope_notes';",
+      `export const OUT_OF_SCOPE_NOTES_FIELD = '${NEW_NAME}';`
+    ),
+    schemaPatch: (sch) => sch.replace(/"out_of_scope_notes"/g, `"${NEW_NAME}"`),
+    run: async (copy) => {
+      ok(copy.OUT_OF_SCOPE_NOTES_FIELD === NEW_NAME, '拷贝的常量值应为新名');
+      // 构造用新字段名的 verdict（新名承载 note，撞 finding id f1）→ 拷贝的 validateVerdict 必须拦
+      const v = verdictWithNotes(null);
+      v[NEW_NAME] = [{ id: 'f1', note: '撞号', evidence: '证据', suggested_issue_title: '标题' }];
+      const errs = copy.validateVerdict(v);
+      ok(errs.some((e) => /与 finding id 撞号/.test(e)),
+        '走常量则跟新名 → 撞号必须被拦（若硬读旧名则读 undefined 静默跳过 = B 洞）: ' + JSON.stringify(errs));
+    }
+  });
+});
+t('[i9-batch-12e] B 类：validator 跟着常量走——FACES 改 8 面后 8 面 verdict 不被拒（防 FACES.length 漂移）', async () => {
+  await withPatchedValidator({
+    srcPatch: (src) => src.replace(
+      "export const FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];",
+      "export const FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];"
+    ),
+    schemaPatch: (sch) => sch, // FACES 不在 schema 里（verdict-validate 硬编码数组），schema 不用改
+    run: async (copy) => {
+      ok(copy.FACES.length === 8, '拷贝的 FACES 应为 8 面');
+      // 送 8 面的对抗席 verdict → 若 validator 硬抄 7 则拒（面数≠7 断言失败）；走 FACES.length 跟着变（通过）
+      const faces8 = ['A','B','C','D','E','F','G','H'].map((f) => ({ face: f, result: f === 'B' ? 'n_a' : 'pass', evidence: f + '面' }));
+      const fd = { id: 'f1', primary_face: 'A', severity: 'major', anchor: FIX1_ANCHOR, anchor_paths: ['src/fix1.ts'], evidence: 'x', invariant: I1, family_id: 'fam-1', status: 'closed' };
+      const v = mkVerdictFor('claude-adversarial', mkBundle(L0, L1), [fd], { faces: faces8 });
+      const errs = copy.validateVerdict(v);
+      ok(!errs.some((e) => /faces 数量/.test(e)),
+        'FACES.length 跟着 8 面走 → 不得因「面数≠7」拒（若硬抄 7 则拒 = 漂移）: ' + JSON.stringify(errs));
+    }
+  });
 });
 
 // ========== [i9-batch-13] pr_number PR 身份绑定（R4 修复①，审查席精确形状） ==========
