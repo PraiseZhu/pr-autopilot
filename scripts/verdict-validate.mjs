@@ -109,6 +109,12 @@ export const FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
 // 校验静默跳过，属 SC-R3-F2 要治的可选通道静默丢数据一类）。dispatch-contract.mjs 的
 // out_of_scope_channel 此前在那之外又手拄了一份同一字符串（与 SEATS/ADVERSARIAL/ALL_FACES 曾经
 // 的漂移是同一形状）。改为 import 本常量，不再自己手写字面值。
+// 已全量扫过（lead 2026-08-07 补输入复核）：validator 内部「有导出常量却硬读字面量」共两处——
+// 本处（out_of_scope_notes）+ 对抗席 faces 数量 `length === 7`（FACES.length，见 :189 已改）。
+// 其余导出常量（SCHEMA_VERSION/ATTEMPT_MIN/HARDENING_NA_EVIDENCE_MIN_LENGTH/TOP_LEVEL_KEYS/
+// FINDING_KEYS/REVIEWERS/ADVERSARIAL/DEFAULT_ANCHOR_PATHS_MAX）在 validator 内部均走常量引用，
+// 无第三处旁路。:254 的 `face === 'B'` 无对应命名常量（FACES 是数组、无 B_FACE 导出），
+// 不命中「本该走导出常量」判据，如实声明不扩。
 export const OUT_OF_SCOPE_NOTES_FIELD = 'out_of_scope_notes';
 const RESULTS = ['pass', 'fail', 'n_a'];
 const SEVERITIES = ['blocker', 'major', 'suggestion'];
@@ -186,7 +192,10 @@ export function validateVerdict(v, opts = {}) {
     for (const face of FACES) {
       need(seenFaces.has(face), `对抗席 ${v.reviewer} 缺检查面 ${face}（必须恰好七面全填，② 审⑧）`);
     }
-    need((v.faces ?? []).length === 7, `对抗席 faces 数量必须为 7，得到 ${(v.faces ?? []).length}`);
+    // R4 复核（lead 2026-08-07 补输入，独立复核发现第二处硬读）: 原 `length === 7` 硬编码
+    // FACES 数组长度——FACES 是导出常量（:105），若未来加面（8 面），此断言拒绝合法输入 =
+    // 同类「有导出常量却硬读字面量」漂移（与 out_of_scope_notes 同一判据）。改 FACES.length。
+    need((v.faces ?? []).length === FACES.length, `对抗席 faces 数量必须为 ${FACES.length}，得到 ${(v.faces ?? []).length}`);
   } else if (v.reviewer === 'upstream-preview') {
     for (const face of req.third_seat_required_faces) {
       need(seenFaces.has(face), `第三席缺必填检查面 ${face}（② 审⑧: F/G/E/D 为主）`);
