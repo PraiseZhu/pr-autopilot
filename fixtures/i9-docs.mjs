@@ -446,9 +446,10 @@ try {
   }
 });
 
-t('[SC-R2-C5] SKILL.md 已同步声明 verdict schema **v3**（不再声明 v2）', () => {
+t('[SC-R2-C5] SKILL.md 已同步声明 verdict schema **v4**（不再声明 v2/v3）', () => {
   const skill = readFileSync(new URL('../skills/submit-pr/SKILL.md', import.meta.url), 'utf8');
-  ok(skill.includes('review-verdict.schema.json` **v3**'), 'SKILL 必须声明 verdict schema **v3**');
+  ok(skill.includes('review-verdict.schema.json` **v4**'), 'SKILL 必须声明 verdict schema **v4**');
+  ok(!skill.includes('review-verdict.schema.json` **v3**'), 'SKILL 不得残留 verdict schema **v3** 的声明');
   ok(!skill.includes('review-verdict.schema.json` **v2**'), 'SKILL 不得残留 verdict schema **v2** 的声明');
 });
 
