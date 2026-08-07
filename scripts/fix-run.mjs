@@ -711,8 +711,9 @@ export function recordedSquashes(m) {
 // SC-R3-3: validation 明细（sc_id/exit/verify digest）入锅，事后换 sc manifest/结果即失效
 // i9-batch: batch 段（batch_id/frozen_at_sha/frozen_families/successor_sha/status）入锅——
 // 照 gate_result 入 recomputeArtifactHash 的同一做法：末尾追加 canonicalJson，不重排既有字段；
-// v tag 升 'fix-run/v3'，旧 manifest（v2）重算 hash 不再等于声明值，push-guard 的
-// fix_orchestration.run_manifest_hash 比对即 fail-closed。
+// v tag 升 'fix-run/v3'：**存储的 hash 是在旧 tag 下算出来的**那种旧 manifest，重算值 ≠ 声明值
+// → push-guard 的 fix_orchestration.run_manifest_hash 比对 fail-closed。
+// **注意这**不覆盖**「字段写 v2 但 hash 用当前公式重算过」的 manifest**（见下）。
 // **注意（2026-08-07，lead 补充派工）**：`v:` 是**常量 tag**（`fix-run/${RUN_MANIFEST_SCHEMA_VERSION}`），
 // **不绑定 manifest 自身的 `schema_version` 字段**——`m.schema_version` 从不入 hash，任何 run
 // manifest 用当前代码重算 `runManifestHash` 都必然自洽，该字段写 v2/写错/缺失都一样过。所以
