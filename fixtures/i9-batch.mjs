@@ -919,6 +919,129 @@ t('[SC-T1a-3] 非 batch 对照组：不传 --batch → manifest 无 batch 字段
   ok(!m.events.some((e) => e.kind === 'run-init' && e.batch), 'run-init 事件必须无 batch 字段');
 });
 
+// ========== [SC-T1b] 真实 CLI 全链负例（2026-08-08 派工） ==========
+console.log('\n[SC-T1b] 真实 CLI 全链：init --batch → allocate → integrate → validate → finalize → push-guard');
+function cliRun(...a) {
+  try { return execFileSync('node', [join(S, 'fix-run.mjs'), ...a], { encoding: 'utf8' }); }
+  catch (e) { throw new Error(`fix-run CLI 失败 (${a[0]}): stderr=${JSON.stringify(String(e.stderr ?? ''))} stdout=${JSON.stringify(String(e.stdout ?? ''))}`); }
+}
+function cliPg(...a) {
+  try { return execFileSync('node', [join(S, 'push-guard.mjs'), ...a], { encoding: 'utf8' }); }
+  catch (e) { throw new Error(`push-guard CLI 失败: ${String(e.stderr ?? e.message).slice(0, 400)}`); }
+}
+// CLI 全链 helper：init --batch → allocate wave0 → integrate → validate → finalize
+// 返回 { stateDir, runManifest, finalCandidate }；worktree 写文件由调用方提供 fn(wt)
+function cliFullChain(batchJson, { wtWrite, expectInitOk = true } = {}) {
+  const dTb = mkdtempSync(join(tmpdir(), 't1b-'));
+  const stateDir = join(dTb, 'state'); mkdirSync(stateDir, { recursive: true });
+  const wtRoot = join(dTb, 'wt'); mkdirSync(wtRoot, { recursive: true });
+  // runId 唯一（共享 repo：allocateWave 的 worktree 分支名 fix/<runId>/<group> 撞名会 fail-closed）
+  const runId = `t1b-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const writeJson = (name, obj) => { const p = join(dTb, name); writeFileSync(p, JSON.stringify(obj)); return p; };
+  const planP = writeJson('plan.json', plan);
+  const scmP = writeJson('scm.json', scManifest);
+  const srcP = writeJson('src.json', srcArtifact);
+  // feature-branch 唯一（finalize 对 feature branch ff-only 前推——共享 repo 的 feat 已被
+  // 既有测试推进到 L3，用共享名会因分叉 ff-only 失败）
+  const featBranch = `feat-${runId}`;
+  execFileSync('git', ['-C', repo, 'checkout', '-q', '-b', featBranch, L1]);
+  const initArgv = ['init', '--state-dir', stateDir, '--run-id', runId, '--repo-dir', repo, '--plan', planP, '--sc-manifest', scmP, '--source-artifact', srcP, '--feature-branch', featBranch];
+  if (batchJson !== undefined) initArgv.push('--batch', batchJson);
+  cliRun(...initArgv);
+  // allocate wave0
+  const allocOut = JSON.parse(cliRun('allocate', '--state-dir', stateDir, '--run-id', runId, '--plan', planP, '--wave', '0', '--worktree-root', wtRoot, '--artifact', srcP, '--sc-manifest', scmP));
+  for (const a of allocOut.allocations) {
+    for (const f of a.anchor_paths ?? []) {
+      mkdirSync(dirname(join(a.worktree, f)), { recursive: true });
+      if (wtWrite) wtWrite(join(a.worktree, f), a);
+      else writeFileSync(join(a.worktree, f), f.includes('fix1') ? 'cancel 保护已加\n' : (f.includes('README') ? '残余 风险已登记\n' : 'fixed\n'));
+    }
+    execFileSync('git', ['-C', a.worktree, 'add', '.']);
+    execFileSync('git', ['-C', a.worktree, 'commit', '-qm', `fix ${a.group_id}`]);
+  }
+  const intOut = JSON.parse(cliRun('integrate', '--state-dir', stateDir, '--run-id', runId, '--plan', planP, '--wave', '0'));
+  if (!intOut.ok) throw new Error('integrate 失败: ' + JSON.stringify(intOut.errors));
+  const valOut = JSON.parse(cliRun('validate', '--state-dir', stateDir, '--run-id', runId, '--sc-manifest', scmP, '--wave', '0'));
+  if (!valOut.ok) throw new Error('validate 失败: ' + JSON.stringify(valOut.results));
+  const finOut = JSON.parse(cliRun('finalize', '--state-dir', stateDir, '--run-id', runId));
+  const runManifest = readJson(join(stateDir, `run-${runId}.json`));
+  return { stateDir, runManifest, finalCandidate: finOut.final_candidate, wtRoot, dTb, featBranch, runId };
+}
+t('[SC-T1b-closure] 真实 CLI 全链（init --batch → allocate → integrate → validate → finalize → push-guard）：同族复发负例 → push-guard 错误文本含「批次闭合门」', () => {
+  // 冻结 FK1/FK2；终版 consensus 用 termRecur（含 FK1 复发）→ 闭合门判据④拒 → push-guard 必须报「批次闭合门」
+  const { runManifest, finalCandidate, dTb, featBranch } = cliFullChain(JSON.stringify({ batch_id: 't1b-b', frozen_families: [FK1, FK2].sort() }));
+  const writeJson = (name, obj) => { const p = join(dTb, name); writeFileSync(p, JSON.stringify(obj)); return p; };
+  // 终版 consensus 用 termRecur（含 FK1 复发）改造为匹配 finalCandidate：
+  // candidate_sha/review_input_hash/parent 都对 finalCandidate——canonical_findings 仍含 FK1（复发）
+  const forgedRecur = { ...termRecur, candidate_sha: finalCandidate, review_input_hash: computeReviewInputHash(mkBundle(L0, finalCandidate)), parent_artifact_hash: recomputeArtifactHash(srcArtifact) };
+  forgedRecur.consensus_artifact_hash = recomputeArtifactHash(forgedRecur);
+  const termRecurJson = writeJson('term-recur.json', forgedRecur);
+  const bundleJson = writeJson('bundle.json', mkBundle(L0, finalCandidate));
+  const srcJson = writeJson('src.json', srcArtifact);
+  const scmJson = writeJson('scm.json', scManifest);
+  const planJson = writeJson('plan.json', plan);
+  const recJson = writeJson('rec.json', dispatchRecord);
+  const rmJson = writeJson('rm.json', runManifest);
+  const fo = {
+    source_artifact_hash: recomputeArtifactHash(srcArtifact),
+    sc_manifest_hash: hashObject(scManifest),
+    fix_plan_hash: plan.fix_plan_hash,
+    dispatch_record_hash: hashObject(dispatchRecord),
+    run_manifest_hash: runManifestHash(runManifest)
+  };
+  const mJson = writeJson('m.json', { repo: 'o/r', remote: 'origin', branch: featBranch, expected_sha: finalCandidate, purpose: 'feature', consensus_artifact_hash: forgedRecur.consensus_artifact_hash, fix_orchestration: fo });
+  let pgOut = '';
+  let pgCode = 0;
+  try { pgOut = cliPg('--repo-dir', repo, '--manifest', mJson, '--artifact', termRecurJson, '--bundle', bundleJson, '--source-artifact', srcJson, '--sc-manifest', scmJson, '--fix-plan', planJson, '--dispatch-record', recJson, '--run-manifest', rmJson); }
+  catch (e) { pgCode = e.status ?? 1; pgOut = String(e.stderr ?? e.message); }
+  ok(pgCode !== 0, 'push-guard 必须非零退出（同族复发被拒）');
+  ok(pgOut.includes('批次闭合门'), '错误文本必须含「批次闭合门」（绑定到该门自己的消息）: ' + pgOut.slice(0, 300));
+});
+t('[SC-T1b-ancestry] 隔离副本 sibling 提交场景（manifest 由真实 CLI init 产出后在隔离路径改造）→ 严格后代门自己的错误消息', () => {
+  // CLI init 产出 run manifest（带 batch——严格后代检查在 push-guard 的 batch 段内，无 batch 不触发）；
+  // 隔离路径：T 从 L0 分叉（兄弟），run manifest 的 source_candidate 保持 L1（=srcArtifact.candidate），
+  // final_candidate 改为 T——sibling 不能经正常 integrate 链到达（fix-run 血统检查先拒），
+  // 故在隔离路径改造 manifest 后直调 push-guard。
+  const { runManifest, dTb } = cliFullChain(JSON.stringify({ batch_id: 't1b-anc', frozen_families: [FK1, FK2].sort() }));
+  const branchName = 'sibling-t1b';
+  execFileSync('git', ['-C', repo, 'checkout', '-q', '-b', branchName, L0]);
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  writeFileSync(join(repo, 'src/sib.ts'), 'sib\n');
+  execFileSync('git', ['-C', repo, 'add', '.']);
+  execFileSync('git', ['-C', repo, 'commit', '-qm', 'T sibling']);
+  const T = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  // 隔离改造：run manifest 的 final_candidate → T，waves 相应改（T 登记为 squash），
+  // 源 artifact candidate 保持 L1（兄弟提交 rev-list L1..T={T} 非空但 L1 非 T 祖先）
+  const forgedRm = { ...runManifest, final_candidate: T, waves: [{ wave_index: 0, base: L1, worktree_root: '/x', allocations: [], tips: [{ group_id: 'g1', tip: T }], integrated_tip: T, replan: null, validation: { at: 't', ok: true, results: [{ sc_id: 'SC-1', status: 'PASS' }] }, squash_commits: [T] }, { wave_index: 1, base: T, worktree_root: '/x', allocations: [], tips: [{ group_id: 'a1', tip: T }], integrated_tip: T, replan: null, validation: { at: 't', ok: true, results: [{ sc_id: 'SC-2', status: 'PASS' }] }, squash_commits: [T] }] };
+  // 伪造自洽终版 artifact（candidate=T、parent=srcArtifact hash、review_input_hash 对应 T）
+  const forgedTerminal = { ...termEmpty, candidate_sha: T, review_input_hash: computeReviewInputHash(mkBundle(L0, T)), parent_artifact_hash: recomputeArtifactHash(srcArtifact) };
+  forgedTerminal.consensus_artifact_hash = recomputeArtifactHash(forgedTerminal);
+  const writeJson = (name, obj) => { const p = join(dTb, name); writeFileSync(p, JSON.stringify(obj)); return p; };
+  const rmJson = writeJson('rm-sib.json', forgedRm);
+  const termJson = writeJson('term-sib.json', forgedTerminal);
+  const bundleJson = writeJson('bundle-sib.json', mkBundle(L0, T));
+  const srcJson = writeJson('src-sib.json', srcArtifact);
+  const scmJson = writeJson('scm-sib.json', scManifest);
+  const planJson = writeJson('plan-sib.json', plan);
+  const recJson = writeJson('rec-sib.json', dispatchRecord);
+  const fo = {
+    source_artifact_hash: recomputeArtifactHash(srcArtifact),
+    sc_manifest_hash: hashObject(scManifest),
+    fix_plan_hash: plan.fix_plan_hash,
+    dispatch_record_hash: hashObject(dispatchRecord),
+    run_manifest_hash: runManifestHash(forgedRm)
+  };
+  const mJson = writeJson('m-sib.json', { repo: 'o/r', remote: 'origin', branch: branchName, expected_sha: T, purpose: 'feature', consensus_artifact_hash: forgedTerminal.consensus_artifact_hash, fix_orchestration: fo });
+  let pgOut = '';
+  let pgCode = 0;
+  try { pgOut = cliPg('--repo-dir', repo, '--manifest', mJson, '--artifact', termJson, '--bundle', bundleJson, '--source-artifact', srcJson, '--sc-manifest', scmJson, '--fix-plan', planJson, '--dispatch-record', recJson, '--run-manifest', rmJson); }
+  catch (e) { pgCode = e.status ?? 1; pgOut = String(e.stderr ?? e.message); }
+  ok(pgCode !== 0, 'push-guard 必须非零退出（兄弟提交被拒）');
+  ok(pgOut.includes('严格后代') || pgOut.includes('祖先后代'), '必须报严格后代门自己的错误消息: ' + pgOut.slice(0, 300));
+  execFileSync('git', ['-C', repo, 'checkout', '-q', 'feat']);
+  execFileSync('git', ['-C', repo, 'reset', '--hard', '-q', L3]);
+});
+
 // 等所有 async 测试完成后再出汇总（t 的 async 支持：主流程不等 Promise 会提前打印）
 await Promise.allSettled(pendingTests);
 console.log(`\n==== i9-batch.mjs: ${pass} passed, ${failCount} failed ====`);
