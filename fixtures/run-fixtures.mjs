@@ -181,16 +181,25 @@ t('[审②F1] 空 faces/缺面/重复面/fail+APPROVED/第三席缺 gate/taxonom
   const v = mkVerdictFor('claude-adversarial', bundle, {
     findings: [{ id: 'X', primary_face: 'taxonomy_gap', severity: 'blocker', anchor: 'a', evidence: 'e', status: 'open' }]
   });
-  ok(validateVerdict(v).length > 0);
+  // 变异定性（2026-08-07）: 本输入只违反 taxonomy_gap→run_status 一条规则（open blocker 不触发
+  // 其他检查，probe 实测仅此一条错误）；挖空该检查后本条断言变红（红在目标断言，更早断言全绿）——
+  // 断言有效。仍升级为点名式，显式绑定被验字段（防未来给输入加第二个违规字段时悄悄变弱）。
+  ok(validateVerdict(v).some((e) => /taxonomy_gap/.test(e)), 'taxonomy_gap finding 必须点名 taxonomy_gap 报错（⑪ 停轮）');
 });
 t('[e2e-consensus 缺口] 重复 finding id → degraded（一次 close 不得覆盖多条）', () => {
   const dup = { id: 'DUP-1', primary_face: 'A', severity: 'major', anchor: 'a', evidence: 'e', status: 'closed' };
   const v = mkVerdictFor('claude-adversarial', bundle, { findings: [dup, { ...dup, anchor: 'b' }], closed_finding_ids: ['DUP-1'] });
-  ok(validateVerdict(v).length > 0, '重复 id 应拒');
+  // 变异定性（2026-08-07）: 本输入只违反重复 id 一条规则（probe 实测仅此一条错误）；挖空
+  // 重复 id 检查后本条断言以自身 message「重复 id 应拒」变红（红在目标断言，无崩溃）——断言有效。
+  // 升级为点名式，显式绑定被验字段。
+  ok(validateVerdict(v).some((e) => /id 重复/.test(e)), '重复 id 必须点名报错（一次 close 不得覆盖多条）');
 });
 t('[⑫] touches_ui=true 而对抗席 B=n_a → 拒', () => {
   const uiBundle = mkBundle(SHA_A, SHA_B, { touches_ui: true, matched_paths: ['src/app/x.tsx'] });
-  ok(validateVerdict(mkVerdictFor('claude-adversarial', uiBundle), { bundle: uiBundle }).length > 0);
+  // 变异定性（2026-08-07）: 本输入只违反 touches_ui→B 面一条规则（probe 实测仅此一条错误）；
+  // 挖空该检查后本条断言变红（红在目标测试 [⑫]，无崩溃）——断言有效。升级为点名式。
+  ok(validateVerdict(mkVerdictFor('claude-adversarial', uiBundle), { bundle: uiBundle }).some((e) => /B 面为 n_a/.test(e)),
+    'touches_ui=true 时对抗席 B 面 n_a 必须点名报错（⑫）');
 });
 t('[R10-A3] R1 两对抗席 hardening_coverage 机器强制: 缺失/缺项/重复 class_id → fail；10 项齐全 → pass；round2/第三席不强制', () => {
   // ① 完全不带 hardening_coverage（复现 MUST-FIX-2 报告场景）→ 必须 fail-closed
@@ -4208,6 +4217,149 @@ t('[D8-3/i9-SC-B] 三席 round 不一致 → 直接 fail（不再静默取最大
   const mixed = consensusFor(bundle, [{ round: 1 }, { round: 2 }, { round: 1 }]).artifact;
   ok(mixed.gate_result === 'fail' && mixed.fail_reasons.some((e) => /三席 round 不一致/.test(e)),
     'i9-SC-B: 三席 round 不一致必须直接 fail 且点名该原因: ' + JSON.stringify(mixed.fail_reasons ?? []));
+});
+
+// SC-D（2026-08-07 新建）: 谱系此前只有单跳证据（R1→R2）与共识层三连正例（i9-core [SC-R3-4]，
+// 无 findings/修复 run/push 维度）。这里补完整三层滚动链的「R2 是 F2 的 source」语义：push 的
+// source artifact 必须是 R2（R2 修 F1 时发现了 F2），不能继续用 R1。SKILL.md 只有 one-hop 措辞
+// （终版 parent == 源 hash），本测试把该语义固化为可执行断言。
+t('[SC-D] 三层滚动链: R1(发现F1,根)→R2(修F1时发现F2,parent=R1)→R3(空,parent=R2)；push 的源必须是 R2（R2 是 F2 的 source，不能继续用 R1）', () => {
+  // 自建隔离仓（不动共享 repo，避免测试顺序耦合）；祖先校验需要真 commit 链，字面量 SHA 不满足。
+  const dD = mkdtempSync(join(tmpdir(), 'scd-'));
+  const rD = join(dD, 'repo');
+  execFileSync('git', ['init', '-q', '-b', 'main', rD]);
+  const gD = (...a) => execFileSync('git', ['-C', rD, ...a], { encoding: 'utf8' }).trim();
+  gD('config', 'user.email', 'o@t'); gD('config', 'user.name', 'o');
+  gD('remote', 'add', 'origin', 'https://github.com/o/r.git'); // validateRemoteBranch 要求已配置 remote
+  writeFileSync(join(rD, 'app.ts'), 'export const app = 1;\n');
+  gD('add', '.'); gD('commit', '-qm', 'base');
+  const bD = gD('rev-parse', 'HEAD');
+  gD('checkout', '-qb', 'feat');
+  writeFileSync(join(rD, 'app.ts'), 'export const app = 1;\nexport const v2 = 2;\n');
+  gD('add', '.'); gD('commit', '-qm', 'feat v2');
+  const c1 = gD('rev-parse', 'HEAD'); // R1 candidate（引入 F1 的代码）
+
+  // ---- R1: 谱系根，发现 F1（blocker，锚 app.ts ⊆ base..c1 实改集）----
+  const a1 = artifactWithFindings([{ sev: 'blocker', paths: ['app.ts'] }], mkBundle(bD, c1), { repoDir: rD });
+  eq(a1.round, 1, 'R1 必须是 round=1');
+  eq(a1.parent_artifact_hash, null, 'R1 是谱系根，parent=null');
+  ok(a1.canonical_findings.length >= 1, 'R1 必须发现 F1');
+
+  // ---- hop 1: 修 F1（直接 git commit——本跳的 run 产物不进最终 push 的五件套，R2 共识的
+  //    candidate 真祖先校验会验证这条链真实存在；修复 run 状态机本身由 [2号-push闸] 等测试覆盖）----
+  writeFileSync(join(rD, 'app.ts'), 'export const app = 1;\nexport const v2 = 2; // F1 fixed\n');
+  gD('add', '.'); gD('commit', '-qm', 'fix F1');
+  const c2 = gD('rev-parse', 'HEAD');
+
+  // ---- R2: 修 F1 时发现 F2（delta 轮，parent=R1，锚仍落在 base..c2 实改集内的 app.ts）----
+  const f2 = { id: 'F2', primary_face: 'A', severity: 'major', anchor: 'app.ts#2', anchor_paths: ['app.ts'], evidence: 'ev-2', status: 'closed', invariant: 'inv-F2', family_id: 'fam-F2' };
+  const a2 = consensusFor(mkBundle(bD, c2), [
+    { round: 2, findings: [f2], closed_finding_ids: ['F2'] },
+    { round: 2, findings: [f2], closed_finding_ids: ['F2'] },
+    { round: 2, findings: [], closed_finding_ids: [] }
+  ], { parentArtifact: a1, repoDir: rD }).artifact;
+  eq(a2.round, 2, 'R2 必须是 round=2');
+  eq(a2.parent_artifact_hash, a1.consensus_artifact_hash, 'R2 必须记录 exact parent R1');
+  const f2id = a2.canonical_findings.find((f) => f.anchor.endsWith('#2')).id;
+
+  // ---- hop 2: 修 F2——**源必须是 R2**。R2 是 F2 的 source（R2 在修 F1 时发现了 F2）；
+  //    继续用 R1 = 拿发现 F1 的共识当 F2 的源，SC-3 exact parent 必拒（见下方 N1）----
+  const sc2 = { schema_version: 'v2', consensus_artifact_hash: a2.consensus_artifact_hash,
+    scs: withScAttribution([{ id: 'SC-F2', kind: 'fix', finding_ids: [f2id], change: 'c', holds: 'h', verify: VF('test', ['-f', 'app.ts']) }], a2) };
+  const pl2 = buildFixPlan({ artifact: a2, manifest: sc2 });
+  ok(!pl2.degraded, 'hop2 plan 不该 degraded: ' + JSON.stringify(pl2.reasons ?? []));
+  const stD = mkdtempSync(join(tmpdir(), 'scdrun-'));
+  const wtD = join(stD, 'wt'); mkdirSync(wtD);
+  FR.initRun({ stateDir: stD, runId: 'scd2', repoDir: rD, plan: pl2.plan, scManifest: sc2, sourceArtifact: a2, featureBranch: 'feat' });
+  const al2 = FR.allocate({ stateDir: stD, runId: 'scd2', plan: pl2.plan, waveIndex: 0, worktreeRoot: wtD, artifact: a2, scManifest: sc2 });
+  eq(al2.wave_base, c2, 'hop2 run 起点 == R2 candidate（SC-R3-10: 起点由源 artifact 派生）');
+  for (const alloc of al2.allocations) {
+    for (const f of alloc.anchor_paths) {
+      mkdirSync(dirname(join(alloc.worktree, f)), { recursive: true });
+      writeFileSync(join(alloc.worktree, f), `fixed F2 ${alloc.group_id}\n`);
+    }
+    execFileSync('git', ['-C', alloc.worktree, 'add', '.']);
+    execFileSync('git', ['-C', alloc.worktree, 'commit', '-qm', `fix F2 ${alloc.group_id}`]);
+  }
+  const int2 = FR.integrate({ stateDir: stD, runId: 'scd2', plan: pl2.plan, waveIndex: 0 });
+  ok(int2.ok, 'hop2 应集成: ' + JSON.stringify(int2.errors ?? []));
+  const val2 = FR.validateIntegration({ stateDir: stD, runId: 'scd2', scManifest: sc2, waveIndex: 0 });
+  ok(val2.ok, 'hop2 复跑应过: ' + JSON.stringify(val2.results));
+  const fin2 = FR.finalizeRun({ stateDir: stD, runId: 'scd2' });
+  const c3 = fin2.final_candidate;
+  eq(gD('rev-parse', 'HEAD'), c3, 'finalize 应 ff-only 前推 feat 到 F2 修复 tip');
+  const runM2 = fin2.manifest;
+
+  // ---- R3: 空（parent=R2）----
+  const b3 = mkBundle(bD, c3);
+  const a3 = consensusFor(b3, [{ round: 3 }, { round: 3 }, { round: 3 }], { parentArtifact: a2, repoDir: rD }).artifact;
+  eq(a3.round, 3, 'R3 必须是 round=3');
+  eq(a3.parent_artifact_hash, a2.consensus_artifact_hash, 'R3 必须记录 exact parent R2');
+  eq(a3.canonical_findings.length, 0, 'R3 无 finding');
+
+  // ---- push: artifact=R3，source 必须是 R2（F2 的 source）→ 放行 ----
+  const dispatch2 = { fix_plan_hash: pl2.plan.fix_plan_hash,
+    waves: [{ dispatches: runM2.waves[0].tips.map((t3, i) => ({ group_id: t3.group_id, worker_session_id: `w${i}`, tip: t3.tip, report: 'ok', result: mkResult(pl2.plan, t3.group_id) })) }] };
+  const fo2 = { source_artifact_hash: a2.consensus_artifact_hash, sc_manifest_hash: hashObject(sc2), fix_plan_hash: pl2.plan.fix_plan_hash, dispatch_record_hash: hashObject(dispatch2), run_manifest_hash: FR.runManifestHash(runM2) };
+  const mD = { repo: 'o/r', remote: 'origin', branch: 'feat', expected_sha: c3, purpose: 'feature', consensus_artifact_hash: a3.consensus_artifact_hash, fix_orchestration: fo2 };
+  const callD = (over = {}) => checkPushGuard({ repoDir: rD, manifest: over.manifest ?? mD, artifact: over.artifact ?? a3, bundle: 'bundle' in over ? over.bundle : b3, constitution, sourceArtifact: 'sourceArtifact' in over ? over.sourceArtifact : a2, scManifest: 'scManifest' in over ? over.scManifest : sc2, fixPlan: 'fixPlan' in over ? over.fixPlan : pl2.plan, dispatchRecord: 'dispatchRecord' in over ? over.dispatchRecord : dispatch2, runManifest: 'runManifest' in over ? over.runManifest : runM2 });
+  const rPos = callD();
+  ok(rPos.ok, 'SC-D 正向: 三层链 + 源=R2 应放行: ' + rPos.errors.join(';'));
+
+  // N1: push 用 R1 当 hop2 的源（R1 是 F1 的 source，不是 F2 的 source）→ 必拒（SC-3 exact parent）
+  const rN1 = callD({ sourceArtifact: a1, manifest: { ...mD, fix_orchestration: { ...fo2, source_artifact_hash: a1.consensus_artifact_hash } } });
+  ok(!rN1.ok && rN1.errors.some((e) => /exact parent/.test(e)),
+    'N1: 用 R1 当 hop2 源必须拒（R2 才是 F2 的 source）: ' + rN1.errors.join(';'));
+
+  // N2: R3 声明 root（round=3 不带 parent）→ 共识必拒（delta 轮未绑定上一轮 artifact）
+  const n2 = consensusFor(b3, [{ round: 3 }, { round: 3 }, { round: 3 }], { repoDir: rD }).artifact;
+  eq(n2.gate_result, 'fail', 'N2: round=3 声明 root 必须 fail');
+  ok(n2.fail_reasons.some((e) => /未绑定上一轮 artifact/.test(e)),
+    'N2 必须点名缺 parent: ' + n2.fail_reasons.join(';'));
+
+  // N3: R3 挂 R1 当 parent（跳过 R2，round 跳号）→ 共识必拒（父 round 跳号）
+  const n3 = consensusFor(b3, [{ round: 3 }, { round: 3 }, { round: 3 }], { parentArtifact: a1, repoDir: rD }).artifact;
+  eq(n3.gate_result, 'fail', 'N3: R3 挂 R1 当 parent（跳号）必须 fail');
+  ok(n3.fail_reasons.some((e) => /跳号/.test(e)),
+    'N3 必须点名父 round 跳号: ' + n3.fail_reasons.join(';'));
+
+  // ---- R1 清单版本过期 → 纠正后仍是 R1（不得靠 R2 或声明 root 绕开十类穷举）----
+  // 过期形态: 三席 round=1 verdict 全部 checklist_version=旧版 + 只给 9 项 → 共识必拒，
+  // 且报错必须点名「清单版本过期需重审」（不是普通缺项计数）。
+  const b1 = mkBundle(bD, c1);
+  const OLD_NINE = Array.from({ length: HARDENING_CLASS_COUNT - 1 }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: `scripts/x.mjs:${i + 1}` }));
+  const staleV = (reviewer) => mkVerdictFor(reviewer, b1, { checklist_version: HARDENING_CHECKLIST_VERSION - 1, hardening_coverage: OLD_NINE });
+  const staleGate = runConsensusGate([staleV('claude-adversarial'), staleV('codex-adversarial'), mkVerdictFor('upstream-preview', b1)], { bundle: b1, repoDir: rD });
+  eq(staleGate.gate_result, 'fail', 'R1 过期清单必须 fail');
+  ok(staleGate.fail_reasons.some((e) => /清单版本过期/.test(e)), '必须点名版本过期: ' + staleGate.fail_reasons.join(';'));
+
+  // 纠正（版本 + 十类补齐，attempt=2）→ **仍是 R1**（round 不因版本纠正而推进），谱系根不带 parent
+  const corrGate = runConsensusGate([
+    mkVerdictFor('claude-adversarial', b1, { round: 1, attempt: 2 }),
+    mkVerdictFor('codex-adversarial', b1, { round: 1, attempt: 2 }),
+    mkVerdictFor('upstream-preview', b1, { round: 1, attempt: 2 })
+  ], { bundle: b1, repoDir: rD });
+  eq(corrGate.gate_result, 'pass', '纠正后应达成共识: ' + JSON.stringify(corrGate.fail_reasons ?? []));
+  eq(corrGate.round, 1, '纠正后仍是 R1，不升 round');
+  eq(corrGate.parent_artifact_hash, null, '纠正后的 R1 仍是谱系根');
+
+  // 靠 R2 绕开十类穷举: 声明 round=2（哪怕带合法 parent）但缺 hardening_coverage → 必拒（I9 全 round 强制）
+  const r2Sneak = runConsensusGate([
+    mkVerdictFor('claude-adversarial', mkBundle(bD, c2), { round: 2, hardening_coverage: undefined }),
+    mkVerdictFor('codex-adversarial', mkBundle(bD, c2), { round: 2, hardening_coverage: undefined }),
+    mkVerdictFor('upstream-preview', mkBundle(bD, c2), { round: 2 })
+  ], { bundle: mkBundle(bD, c2), parentArtifact: a1, repoDir: rD });
+  eq(r2Sneak.gate_result, 'fail', 'round=2 缺十类必须 fail（不得靠升 round 绕开穷举）');
+  ok(r2Sneak.fail_reasons.some((e) => /hardening_coverage/.test(e)), '必须点名 hardening_coverage: ' + r2Sneak.fail_reasons.join(';'));
+
+  // 声明 root 绕开: round=1 携带 parent → 必拒（谱系根不得绑 parent，SC-B）
+  const rootSneak = runConsensusGate([
+    mkVerdictFor('claude-adversarial', b1, { round: 1 }),
+    mkVerdictFor('codex-adversarial', b1, { round: 1 }),
+    mkVerdictFor('upstream-preview', b1, { round: 1 })
+  ], { bundle: b1, parentArtifact: a2, repoDir: rD });
+  eq(rootSneak.gate_result, 'fail', 'round=1 携带 parent 必须 fail（声明 root 绕不开十类）');
+  ok(rootSneak.fail_reasons.some((e) => /round=1 不得携带 parent/.test(e)), '必须点名 root 违例: ' + rootSneak.fail_reasons.join(';'));
 });
 
 t('[R5-P1] runConsensusGate 缺实改集 fail-closed；[R5-P2] crash 窗口凭创建印记仍可回收', () => {

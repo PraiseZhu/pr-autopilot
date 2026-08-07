@@ -42,7 +42,11 @@ function mkVerdict(reviewer, over = {}) {
 t('[SC-1] 对抗席 round=2 缺 hardening_coverage → 拒，且报错可分辨"缺十类覆盖"', () => {
   const v = mkVerdict('claude-adversarial', { round: 2, hardening_coverage: undefined, checklist_version: undefined });
   const errs = validateVerdict(v);
-  ok(errs.length > 0, 'round=2 缺 hardening_coverage 必须报错: ' + JSON.stringify(errs));
+  // 变异定性（2026-08-07）: 本输入**同时摘掉两个字段**（hardening_coverage + checklist_version），
+  // 原 `.length > 0` 会被 checklist_version 的错误掩盖——实测挖空「缺 hardening_coverage」检查后
+  // 本条（.length>0）保持绿（错误数组只剩 checklist_version 一条），下一行点名式断言变红。本条
+  // 未绑定它声称验证的字段，是真 finding；升级为点名式，与下一行共同钉住同一字段。
+  ok(errs.some((e) => /缺 hardening_coverage/.test(e)), 'round=2 缺 hardening_coverage 必须点名报错: ' + JSON.stringify(errs));
   ok(errs.some((e) => /缺 hardening_coverage/.test(e)), '必须有明确指向"缺 hardening_coverage"的错误: ' + JSON.stringify(errs));
 });
 
