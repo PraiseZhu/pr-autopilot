@@ -136,12 +136,14 @@ node scripts/dispatch-contract.mjs --emit <reviewer> --round <n> >> pkg-<seat>.m
 # 2) 派工包组好后，create_workers **之前**逐席过前置门（缺任一必需字面值即 exit 1）
 node scripts/dispatch-contract.mjs --check pkg-<seat>.md --seat <reviewer> --round <n>
 ```
-三席全部 `DISPATCH-CONTRACT-OK` 才允许 `create_workers`。契约内容（必填 faces、第三席的
-canonical `gate_checks[].gate_id` 全集、加固清单穷举的强制条件与版本、`anchor_paths` 约束、
-actionable 必填字段、finding 禁用字段、**关 finding 的双条件**、域外通道字段名）**全部从
-`verdict-validate.mjs` / `lib/hardening-registry.mjs` 的常量派生**——本文档刻意不复述任何一个
-字面值，改常量时 emit/check 自动跟上。emit 输出携带 `contract_digest`（契约 spec 的内容 hash），
-`--check` 要求它逐字在场且等于当前重算值：**粘贴陈旧契约段会被当场拦下**。
+三席全部 `DISPATCH-CONTRACT-OK` 才允许 `create_workers`。契约内容（verdict `schema_version`、
+顶层 `attempt` 必填、必填 faces、第三席的 canonical `gate_checks[].gate_id` 全集、加固清单穷举的
+强制条件与版本、`hardening_coverage[].evidence` 按 `result` 分支的格式约束（covered/n_a 各自
+要求）、`anchor_paths` 约束、actionable 必填字段、finding 禁用字段、**关 finding 的双条件**、
+域外通道字段名）**全部从 `schemas/review-verdict.schema.json` / `verdict-validate.mjs` /
+`lib/hardening-registry.mjs` 的常量派生**——本文档刻意不复述任何一个字面值，改常量时 emit/check
+自动跟上。emit 输出携带 `contract_digest`（契约 spec 的内容 hash），`--check` 要求它逐字在场且
+等于当前重算值：**粘贴陈旧契约段会被当场拦下**。
 
 > **为什么这里换成机制、不再加一段提醒**（D1 修法理由）：这类失误已连续发生两次——2026-08-03
 > 派工清单漏写 `closed_finding_ids`（代价一次往返，本文档 Phase 2 末尾已为此专门写过一段警告），
@@ -181,7 +183,7 @@ actionable 必填字段、finding 禁用字段、**关 finding 的双条件**、
 - **降档观察窗（2026-08-05 起，连续 5 个走三审的 PR）**：lead 在台账逐席记 **unique-major**（只有该席抓到的 major/blocker 数）。seat① 换 sonnet 后 unique 率塌方（历史基线场均 2+ → 场均 0）→ 该席单席回滚 `claude-opus-5 / xhigh`，其他席不动。回滚对照基线（08-02~05，38 份裁决）：① opus/xhigh 27 major+1 blocker；② sol/xhigh 15+1（独抓率最高）；③ opus/high 12+1。
 - **争议仲裁席（L3，按需出场，不常驻）**：仅当 ①同一 finding 两轮 open/维持拉锯、②P0/P1 定性分歧、③对抗反驳终裁 三者之一发生时，lead 加派 codex / `codex/gpt-5.6-sol`（骨折），默认 effort=max，仲裁结论本身被推翻重来才升 ultra；骨折路由报 `BUDGET_MODEL_REQUIRES_API_MODE` → 降裸 `gpt-5.6-sol` 同 effort（**Cindy AI 通路**，不是官方订阅），标注不静默。**纪律**：仲裁席只产证据与分析内部报告供 origin reviewer 与 lead 参考，finding 仍由 origin reviewer close，报告不进共识判据、不改共识四 conjunct。
 
-三席各产两份输出：人读 markdown + **机器 JSON**（`schemas/review-verdict.schema.json` **v2**）。
+三席各产两份输出：人读 markdown + **机器 JSON**（`schemas/review-verdict.schema.json` **v3**）。
 **v2 必填 `anchor_paths`**：每条 finding 除人读 `anchor` 外，必须给 `anchor_paths: string[]`——
 仓库相对**精确文件路径**（POSIX，非目录，去重，≤ config/orchestration.json 的
 `anchor_paths_max_per_finding`）。这是修复分组的**唯一机器输入**：填宽了会制造假冲突把本可并行的
@@ -269,14 +271,12 @@ node scripts/consensus-gate.mjs v1.json v2.json v3.json --bundle bundle.json --r
 node scripts/consensus-gate.mjs v1.json v2.json v3.json --bundle bundle.json --repo-dir . --parent prev-consensus.json --out consensus.json
 ```
 漏传即 fail（不是静默记 `parent_artifact_hash: null` 放行——D8-3 之前正是如此，
-CLI 用法串写了这条要求但无人执行）。三席 `round` 不一致时按最大值判（fail-closed 方向）。
-真首轮（round 1）不传 `--parent` 正常放行，这是刻意保留的——首轮没有上一轮可绑。
-
-> **语义已按上方定义收紧，机器强制仍有两处缺口（本次文档变更不实现，留给机器侧同批跟进）**：
-> `round>=2` 缺 parent 必拒这一方向机器已强制；**反方向**「round 1 **带** parent」当前**仍
-> 不拦**——`fixtures/run-fixtures.mjs` 里的终版用例仍用默认 `round: 1` 并带 parent。按上方权威
-> 定义，R1 应当 `parent=null`；这条 fixture 与「三席 `round` 必须一致」尚未按新定义收紧校验
-> 逻辑，是两个具体的机器侧待办（见交卷报告「需要机器侧配合」一节，不在本次文档变更范围内实现）。
+CLI 用法串写了这条要求但无人执行）。三席 `round` 不一致直接 fail-closed（issue #9 SC-B：不再
+静默取最大值——取最大值等于替调用方的输入错误做静默纠正，新语义下三席不一致本身就是应当被
+拒的输入错误，不该被悄悄抹平成「按最严的那个走」）。
+真首轮（round 1）不传 `--parent` 正常放行，这是刻意保留的——首轮没有上一轮可绑；round 1 若
+携带 parent 同样 fail-closed（首个可 PASS 的共识必须是无谱系的根，同一 SC-B 收紧的另一方向，
+不再是「带了也不拦」的旧行为）。
 
 **不检查**（写出来是因为「局部背书」最容易被当成「完整背书」，同 push-guard 如实声明 T1 上限的做法）：
 ① **不检查代码是否真的修好** —— conjunct② 的 `closed` 只表示「origin 席裁决该 finding 为真实、

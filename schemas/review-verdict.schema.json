@@ -51,7 +51,7 @@
           },
           "invariant": {
             "type": "string", "minLength": 1, "maxLength": 120,
-            "description": "SC-B1（D1）: 一句话「被破坏的不变量」。归属发生在 finding 生成时（审查席），不是修复计划时（lead）——verdict-validate.mjs 对 round===1 两对抗席的 actionable（blocker/major）finding 强制必填，suggestion 级不强制。lead/SC 层只能逐字复制该值，不得自填（sc-coverage-gate.mjs 强制逐字相等）。"
+            "description": "SC-B1（D1）: 一句话「被破坏的不变量」。归属发生在 finding 生成时（审查席），不是修复计划时（lead）——verdict-validate.mjs 只按 severity 判断：任意 reviewer 在任意 round 提交的 actionable（blocker/major）finding 都必填，suggestion 级不强制。lead/SC 层只能逐字复制该值，不得自填（sc-coverage-gate.mjs 强制逐字相等）。"
           },
           "family_id": {
             "type": "string", "minLength": 1,

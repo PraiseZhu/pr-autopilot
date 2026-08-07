@@ -23,12 +23,30 @@
 //   恶意伪造派工包文本。如实声明，不冒称。
 
 import { parseArgs, fail, isMain, sha256, canonicalJson } from './lib/common.mjs';
-import { DEFAULT_REQUIREMENTS, DEFAULT_ANCHOR_PATHS_MAX } from './verdict-validate.mjs';
+import {
+  DEFAULT_REQUIREMENTS,
+  DEFAULT_ANCHOR_PATHS_MAX,
+  SCHEMA_VERSION,
+  ATTEMPT_MIN,
+  HARDENING_NA_EVIDENCE_MIN_LENGTH,
+  REVIEWERS,
+  ADVERSARIAL,
+  FACES
+} from './verdict-validate.mjs';
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from './lib/hardening-registry.mjs';
 
-export const SEATS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
-const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];
-export const ALL_FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+// R2-P1（lead 实测发现的复发风险）: verdict_schema_version / attempt 下限 / hardening_coverage
+// [n_a].evidence 最小长度、合法 seat 名单（=REVIEWERS）、对抗席分类（ADVERSARIAL）、七面枚举
+// （=FACES）——全部改为从 verdict-validate.mjs import，不再各自读 schema 或手拄第二份数组。
+// verdict-validate.mjs 是这些值唯一的物理派生/声明点（前三者它自己从
+// schemas/review-verdict.schema.json 派生并 export；后两者是业务分类/枚举，同样由它 export，
+// 不再区分"能不能从 schema 派生"——治同一个病就治干净，不留同形状残留）。本文件此前独立读
+// schema 派生前三者、又各自手拄 SEATS/ADVERSARIAL/ALL_FACES 三个数组——「一处派生 + 一处手拄」
+// 在真相源变化时会自动产生新的不一致，比原来的「两处手拄」更危险（emit 侧跟着真相源变了，
+// check/validator 侧不跟，审查席按新契约交卷反而在收卷时被拒）。改成单一物理读取/声明点后，
+// 这类复发在构造上不可能再发生。
+export const SEATS = REVIEWERS;
+export const ALL_FACES = FACES;
 
 // issue #9 SC-C（状态模型矛盾修复）：「答」「推」两种处置不再走 status=closed + closed_finding_ids
 // 双条件——那双条件专属仍留在 findings[] 里的「修」「ARCHIVE」两种载体。这两条字面值直接进
@@ -51,12 +69,18 @@ export function contractSpec({ seat, round, requirements } = {}) {
     contract_version: 'dc1',
     seat,
     round,
-    verdict_schema_version: 'v2',
+    verdict_schema_version: SCHEMA_VERSION,
+    attempt_min: ATTEMPT_MIN,
     required_faces: isAdversarial ? [...ALL_FACES] : [...req.third_seat_required_faces],
     faces_exact: isAdversarial, // 对抗席必须恰好七面，第三席只要求覆盖必填面
     required_gate_ids: isAdversarial ? [] : [...req.third_seat_required_gates],
     hardening: hardeningRequired
-      ? { required: true, checklist_version: HARDENING_CHECKLIST_VERSION, class_count: HARDENING_CLASS_COUNT }
+      ? {
+          required: true,
+          checklist_version: HARDENING_CHECKLIST_VERSION,
+          class_count: HARDENING_CLASS_COUNT,
+          na_evidence_min_length: HARDENING_NA_EVIDENCE_MIN_LENGTH
+        }
       : { required: false },
     close_dual_condition: ['status', 'closed_finding_ids'],
     forbidden_finding_fields: ['write_paths', 'allowed_paths'],
@@ -77,6 +101,7 @@ export function requiredLiterals({ seat, round, requirements } = {}) {
   const lits = [
     spec.seat,
     `schema_version: "${spec.verdict_schema_version}"`,
+    'attempt',
     'anchor_paths',
     ...spec.close_dual_condition,
     ...spec.actionable_required_fields,
@@ -91,7 +116,13 @@ export function requiredLiterals({ seat, round, requirements } = {}) {
   if (!spec.required_gate_ids.length) lits.push('faces');
   else lits.push('gate_checks');
   if (spec.hardening.required) {
-    lits.push('hardening_coverage', `checklist_version: ${spec.hardening.checklist_version}`, `恰好 ${spec.hardening.class_count} 项`);
+    lits.push(
+      'hardening_coverage',
+      `checklist_version: ${spec.hardening.checklist_version}`,
+      `恰好 ${spec.hardening.class_count} 项`,
+      '路径:行号',
+      `${spec.hardening.na_evidence_min_length} 字符`
+    );
   }
   return [...new Set(lits)];
 }
@@ -104,6 +135,7 @@ export function emitContract({ seat, round, requirements } = {}) {
   L.push(`### 机器契约段（脚本生成，勿手改；改一个字 digest 即失配被前置门拦下）`);
   L.push('');
   L.push(`- reviewer: \`${spec.seat}\`；round: \`${spec.round}\`；verdict \`schema_version: "${spec.verdict_schema_version}"\`（schemas/review-verdict.schema.json）。`);
+  L.push(`- verdict 顶层必填 \`attempt\`（整数 ≥ ${spec.attempt_min}；当前 round 内第几次审查尝试，三席须一致——一致性由 consensus-gate 核对，本契约只锁「必须填」）。`);
   if (spec.faces_exact) {
     L.push(`- faces：必须**恰好七面全填** \`${spec.required_faces.join('/')}\`，每面 result ∈ pass|fail|n_a 且 evidence 非空（空结果 ≠ pass）。`);
   } else {
@@ -116,6 +148,7 @@ export function emitContract({ seat, round, requirements } = {}) {
   }
   if (spec.hardening.required) {
     L.push(`- 加固清单穷举（本席本轮强制）：\`checklist_version: ${spec.hardening.checklist_version}\` + \`hardening_coverage\` **恰好 ${spec.hardening.class_count} 项**，class_id 1〜${spec.hardening.class_count} 各恰好一次，result ∈ covered|n_a，evidence 非空。逐条扫 references/hardening-checklist.md，不是"看到什么报什么"。`);
+    L.push(`  \`evidence\` 按 \`result\` 分支，不是同一句话：\`covered\`（声称已覆盖）必须给出「路径:行号」形态引用（如 \`scripts/foo.mjs:42\`），声称覆盖就要指出在哪覆盖的，不许空话；\`n_a\`（声称不适用）不要求路径:行号——不适用的类没有对应代码位置，强制会逼你编造假锚点——但 evidence 长度须 ≥ ${spec.hardening.na_evidence_min_length} 字符（防"无"/"n/a"这类敷衍）。`);
   }
   L.push(`- 每条 finding 必填 \`anchor_paths\`：仓库相对精确文件路径（POSIX、非目录、去重、≤ ${spec.anchor_paths_max_per_finding} 条），且**必须落在 base..candidate 实改文件集内**。它是证据锚点，**不是写入许可**。`);
   L.push(`- actionable（blocker/major）finding 另必填 \`${spec.actionable_required_fields.join('` + `')}\`；同一 family_id 下 invariant 必须逐字一致。`);
