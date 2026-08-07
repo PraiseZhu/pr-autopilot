@@ -187,6 +187,7 @@ export function emitContract({ seat, round, requirements, parentArtifact } = {})
       L.push(`  - \`${kf.family_key}\` — ${kf.invariant}`);
     }
     L.push(`  机器只证明这些 family_key 在本谱系存在（reuse 引用它们才合法），**不判语义**——「这个 reuse 判断对不对」是审查席的判断，机器不裁决。`);
+    L.push(`  只覆盖同一 artifact 谱系（parent 链），不冒充跨 PR 全局历史（SC-4）——known families 从 parent 现场派生，无历史注册表。`);
   } else {
     L.push(`- **每条 actionable finding 必填 \`family_claim\`**（SC-T7b）：二选一——\`{kind:'reuse', target_family_key:'fk1-...'}\`（复用**上一轮真实问题族**）或 \`{kind:'new', reason:'非空'}\`（新问题，reason 不得为空串）。suggestion 不要求。inner exact keys——reuse 不得带 reason、new 不得带 target_family_key、未知键一律拒（verdict-validate fail-closed）。**本轮是 round=1（谱系根，无 parent）——known families 为空，\`kind:'reuse'\` 必拒**；只能声明 \`kind:'new'\`。`);
   }
