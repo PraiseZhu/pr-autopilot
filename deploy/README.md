@@ -147,7 +147,8 @@ export PR_AUTOPILOT_HMAC_KEY=$(openssl rand -hex 32)   # 每台机器独立生�
 - **生成与形状**：`openssl rand -hex 32` 即可（HMAC key 无格式约束，任意字符串都行；64 位十六进制只是惯例）。**谁读 env**：`deploy/wrappers/probe.mjs:57` 读 `process.env.PR_AUTOPILOT_HMAC_KEY` 后传给 `gate.evaluate`；`scripts/pr-watch/engine.mjs:72` 默认读 env，但 CLI 的 `...extra` 可被 `engine-*.json` 里的 `hmacKey` 字段**覆盖**；`scripts/pr-watch/complete.mjs:53` 读 env 传给 `checkCompletion`；`scripts/pr-watch/provenance.mjs` 本身**不读 env**，只接收调用方传入的 key 参数。**不落盘、不打日志**。
 - **每台机器必须独立生成**：它是「这条评论是不是我自己发的」的识别凭证，不是共享口令。拷别人的 key = 两台机器互认对方回帖为自家，签名校验的意义归零。
 - **没配会怎样（三层，别混）**：
-  - **已验证机制**：修复会话完工后 `complete.mjs:53` 取到空 key → `:35` `verifyMarker(c.body, 空)` 返回 false → `:37` 判「回帖未落地」→ `:56` exit 1，**ack 不发生**（`:58-63` 只在 checkCompletion 通过后才 ackDispatch）→ `pending_dispatch` 保持在途 → 引擎 `engine.mjs:182-224` 只按 lease 超时（`:202`）重派**同一个 dispatch_id**（`budget.mjs:89` reserve 对同 id 幂等，`already-reserved` 直接放行不重复占额）→ 重派 ≥ `stuckThreshold` 次 → `engine.mjs:204-205` 记 `stuck` + `:208` routeNotify 发通知。**真实表现 = 卡在 pending、最终触发 stuck 通知**——这是**有告警的故障**，不是静默故障。
+  - **gate 侧先说明白（login 早退）**：`gh-snapshot:117` 尝试拿 `selfLogin`（拿不到 → 宁多唤醒，`author_is_self` 为 false），`gate:54` 先跳过 `author_is_self === true` 再对剩余评论用 HMAC。所以 **login 可得时，无 key 不会因 HMAC 导致自家评论被当成新反馈**；HMAC 只在 login 不可得（拿不到 `ghGet('user')`）时才是识别自家回帖的那一层。
+  - **已验证机制（前提：worker 已提交一条待核验的回帖）**：**在 worker 已提交待核验回帖的前提下**，无 key 会让 `complete.mjs:53` 取到空 key → `:35` `verifyMarker(c.body, 空)` 返回 false → `:37` 判「回帖未落地」→ `:56` exit 1，**ack 不发生**（`:58-63` 只在 checkCompletion 通过后才 ackDispatch）→ `pending_dispatch` 保持在途 → 引擎 `engine.mjs:182-224` 只按 lease 超时（`:202`）重派**同一个 dispatch_id**（`budget.mjs:89` reserve 对同 id 幂等，`already-reserved` 直接放行不重复占额）→ 重派 ≥ `stuckThreshold` 次 → `engine.mjs:204-205` 记 `stuck` + `:208` routeNotify 发通知。**这是可能路径，不是无条件后果**——真实表现（在该前提下）= 卡在 pending、最终触发 stuck 通知（有告警，不是静默）。
   - **已验证的间接预算影响（代码支持的可能路径，未在真实事件中证实）**：`complete` 未 ack → `pending_dispatch` 连同**原 dispatch 的 reserve 一起长留**（`engine.mjs:303-308` pending_dispatch 固化含 `budget: {ledger, estimate}`）→ 该额度不释放，与后续真实 dispatch 竞争同一个 cap；而重派路径**不调用 reserve**（reserve 只在无 pending 且判 actionable 的新 dispatch 路径，`engine.mjs:250-255`）。**这条是代码支持的可能机制，不是已证实因果**——不要当成新的因果断言。
   - **不可归因**：外部部署方那次「$30/天 cap 撞顶」**成因未定**——本 checkout 没有「缺 key → 每轮新 dispatch_id → 每轮 reserve」的路径（重派复用同 id + reserve 幂等），且该事件无运行时台账/序列证据。**不要归因到 HMAC key，也不猜替代解释**。
 - **强度如实声明（T1，无机器门在拦）**：引擎启动时不校验 key 是否存在（`engine.mjs:72` `?? null`，没有 fail-closed 启动门）；这道门防的是「自家评论误唤醒自己」的**疏忽**，不防**伪造**——知道 key 的人可以伪造签名评论。配不配 key 全靠部署时自觉，机器不拦。
@@ -199,7 +200,7 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
 - **三条退出路径（都要接对）**：
   - `exit 0` = 有活 → 放行班车 agent 会话（引擎 + 队列投递）；**或运行期异常放行**（`probe.mjs:59-61` catch → exit 0，可用性优先：让完整引擎 + 通知链去暴露问题，而不是让探针静默扼杀所有轮次）；
   - `exit 2` = 无活 → 跳过本轮，**零 token**，只花几次带 ETag 的 gh API 读（`probe.mjs:64`）；
-  - `exit 1` = **参数/初始化错误**（`probe.mjs:48-49` `fail()`），**不在 fail-open 保护范围内**——这是调用姿势错了，不是「探针异常」。
+  - `exit 1` = **参数/初始化错误**（`probe.mjs:47-50` 在 try 外 `fail(...,1)`，模块导入/初始化异常也不在 catch 内），**不受 fail-open 保护，且本仓未定义调度侧如何处理 exit 1**——这是调用姿势错了，不是「探针异常」。（本仓只有 exit 0/2 协议；preRunHook 失败语义本身也是 P0 真机实测项，`deploy/README.md:16`。）
 - **部署动作**：接进 schedule 前**先手动跑一次**确认拿到 0 或 2；拿到 1 说明参数/调用姿势错了，fail-open 不会救你。
 - 它的判定**复用引擎同源模块**（`gate.evaluate` / `stateFileName` 文法），信号逻辑与引擎是**同一套**——自己另写一个探针等于造第二套判定，两套迟早不一致（探针说有活、引擎说没活，或反过来），凭空多一个故障面。
 
