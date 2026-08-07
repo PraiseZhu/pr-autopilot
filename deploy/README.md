@@ -48,7 +48,7 @@ engine-mivo.json（完整必填示例；两仓 schedule **共享同一 budget.le
   "budget": {
     "ledger": "/Users/<mini-user>/pr-autopilot-runtime/ledger/cost.jsonl",
     "cap": 30,
-    "estimate": 9.2
+    "estimate": 3
   },
   "repoDirs": {
     "xindong/mivo-canvas": "/Users/<mini-user>/mivo-ops/mivo-canvas"
@@ -59,8 +59,14 @@ engine-mivo.json（完整必填示例；两仓 schedule **共享同一 budget.le
   "slackCmd": "node /Users/<mini-user>/mivo-ops/mivo-canvas/agent-use/loops/bug-doctor/notify.mjs"
 }
 ```
-- `estimate` 取 review-pr 历史 exact 均价 ~$9.2/会话；修复会话完工时用
+- `estimate` 是**行为参数**（engine.mjs:250-255 预留时按它 reserve，不是注释）——mivo 示例取
+  `3`：外部部署实测单样本 $1.41，保守取整为 3；修复会话完工时用
   `budget.mjs --record --dispatch-id <id> --cost <实际>` reconcile（reserve 被同 id actual 取代）。
+- **敞口算式**：cap 30 ÷ estimate 3 = 单日最多 **10 个**并发未结算 reserve（若沿用旧值 9.2 则仅
+  3 个）。风险：并发未结算 reserve 上限 3 → 10，最坏坏账放大约 **3.3 倍**；收益：正常日不再因
+  3 个在途 reserve 顶闸停派。
+- **cindy 引擎各有 config**（engine-cindy.json 等），estimate 取值由部署者按同口径自行判断调整，
+  本示例只校准 mivo 侧，不代改其他引擎的 config。
 - `repoDirs` 缺某仓时该仓终态清理 fail-closed（cleanup-pending 不销单，审③-I2-R）——两仓都必须配。
 - 注册命令（审⑤-F4: `--branch` 与 `--push-remote` **必填**，引擎不猜 remote 名）:
   - mivo: `node scripts/pr-watch/register.mjs --state-dir … --owner xindong --repo mivo-canvas --pr <N> --branch <feature> --push-remote origin`
