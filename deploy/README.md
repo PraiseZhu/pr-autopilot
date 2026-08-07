@@ -191,7 +191,7 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
 
 - gh-snapshot 只在 `SNAPSHOT_CACHE_DIR` 非空时启用响应缓存 + ETag 条件请求（`gh-snapshot.mjs:16` `CACHE_DIR = process.env.SNAPSHOT_CACHE_DIR ?? null`；判非空分支 `:27-31`、写缓存 `:62`，均在 `CACHE_DIR` 非空分支内）。
 - **不配的后果**：每轮探针/引擎的 gh API 请求都是普通请求，不发 `If-None-Match`、拿不到 304——**没有报错，唯一信号是 GitHub API 配额被静默低估**（探针每班车周期一次 × 在册 PR 数 × 多接口，长期累积可观）。
-- **配置了也有运维前提（不是无副作用）**：正常可读写时**不改变判定协议**——ETag 命中（304）只省 API 调用，非绿判据不变（`gh-snapshot.mjs:27-31` 判非空、`:62` `mkdirSync(CACHE_DIR,{recursive:true}) + writeFileSync(cacheFile,…)` 真实文件系统写入）。但**缓存目录不可写或缓存内容损坏会抛错 → `gh-snapshot.mjs:178-180` exit 1（fail-closed，非绿而非静默降级）**——这是一条运维前提（目录权限 / 磁盘可写 / 缓存文件可解析），必须写出来，不能当成「无副作用」。
+- **配置了也有运维前提（不是无副作用）**：正常可读写时**不改变判定协议**——ETag 命中（304）只省 API 调用，非绿判据不变（`gh-snapshot.mjs:27-31` 判非空、`:62` `mkdirSync(CACHE_DIR,{recursive:true}) + writeFileSync(cacheFile,…)` 真实文件系统写入）。但**缓存目录不可写或既有缓存内容损坏会抛错**（`:28` 解析既有 cache、`:62` 写 cache）→ wrapper 自身 `:178-180` **exit 1**。注意 **exit 1 不等于「CI 判非绿」**——快照没产出，走不到绿/非绿判定：`engine.mjs:110-112` 捕获快照失败后只写 stderr（「保持状态，下轮重试」）并 `continue`，**跳过该 PR 本轮、不进 gate**；`probe.mjs:59-61` 对运行期异常是 **exit 0 = fail-open**（注释原文「放行班车，让引擎/通知链暴露问题」），班车照常起。所以缓存故障的真实表现是**本轮静默跳过 + 班车仍被放行**（可能反复耗 token），**不是 fail-closed 拦停**——必须修好缓存目录/文件才会恢复正常判定。这是一条运维前提（目录权限 / 磁盘可写 / 缓存文件可解析），不能当成「无副作用」。
 - 这条是**配置项**，不是可选优化——部署时必须显式配，配了才算用了 ETag；并确保缓存目录可写、缓存可解析。
 
 **③ preRunHook 必须用 `deploy/wrappers/probe.mjs`，别自己造一个**
