@@ -195,7 +195,13 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
       if (!errors.length) errors.push(...assertArtifactShape(artifact, 'consensus artifact'));
       if (!errors.length) {
         if (artifact.gate_result !== 'pass') errors.push('consensus artifact gate_result ≠ pass');
-        if (recomputeArtifactHash(artifact) !== artifact.consensus_artifact_hash) errors.push('consensus artifact hash 与内容重算值不符（含 base/candidate，伪造/改 SHA 均失效）');
+        // 防御性 try/catch（同 sourceArtifact 路径的理由）: recomputeArtifactHash 现在对结构
+        // 非法输入会 throw；这里的 hash 重算在正常路径下已被上面的 assertArtifactShape 挡住，
+        // 但若那道短路本身被破坏（回归/反向变异），不加这层会让本函数崩溃而不是优雅拒绝。
+        let selfReal = null;
+        try { selfReal = recomputeArtifactHash(artifact); }
+        catch (e) { errors.push(`consensus artifact hash 重算失败（结构非法，fail-closed）: ${e.message}`); }
+        if (selfReal !== null && selfReal !== artifact.consensus_artifact_hash) errors.push('consensus artifact hash 与内容重算值不符（含 base/candidate，伪造/改 SHA 均失效）');
         if (manifest.consensus_artifact_hash !== artifact.consensus_artifact_hash) errors.push('manifest 与 artifact 的 consensus_artifact_hash 不一致');
         // bundle 三方绑定
         let rih = null;
