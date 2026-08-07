@@ -3815,6 +3815,25 @@ t('[SC-13] 血统校验用真实但不相关的 commit（非"对象不存在"空
   ok(!rep.ok && rep.overlaps.some((o) => /血统/.test(o.error ?? '')), 'SC-13: 真实但不相关的 commit 必须被血统校验拒');
   eq(g('rev-parse', 'HEAD'), headBefore, '拒绝路径不得改动 HEAD');
 });
+// [R10-A4 扩展] ARCHIVE 出口判据 doc↔impl 逐字同步（2026-08-07，审查席第六件 6-2）：
+// 该判据今天漂移两次（实现改了、两处文档留在旧版），三处描述改一次要动三处、漏一处几乎
+// 必然——不是谁不小心，是结构问题。钉住：SKILL.md 的 ARCHIVE 出口段必须逐字含当前判据的
+// 关键谓词（validation.results + status === 'PASS'），且不得把 validation.ok 当出口判据表述。
+// 反向断言用拼接构造 + 编译正则（照 :3708-3709 写法），收窄到「出口判据」语境——
+// SKILL.md 可能有解释「为何不用 validation.ok」的正当文字，全文扫一个词会误判（今天两次
+// 因拿全文命中当结论而误判）。
+t('[R10-A4-arch] SKILL.md ARCHIVE 出口判据与实现逐字同步（不得残留 validation.ok 当出口判据）', () => {
+  const skill2 = readFileSync(join(S, '../skills/submit-pr/SKILL.md'), 'utf8');
+  const archIdx = skill2.indexOf('ARCHIVE 出口');
+  ok(archIdx !== -1, 'SKILL 必须含 ARCHIVE 出口段');
+  const archSeg = skill2.slice(archIdx, archIdx + 600);
+  ok(archSeg.includes('validation.results'), 'ARCHIVE 出口段必须点名 validation.results（当前实现判据）');
+  ok(archSeg.includes('status') && archSeg.includes("'PASS'"), 'ARCHIVE 出口段必须点名 status === PASS 逐项证据');
+  // 反向: 出口判据语境不得把 validation.ok 当放行条件（拼接构造防自引用；「不依赖 validation.ok」
+  // 的正当说明文字会命中——这里只查「validation.ok** 则放行」这个把 ok 当判据的旧形态）
+  const okLit = 'validation.ok** 则放行';
+  ok(!archSeg.includes(okLit), 'ARCHIVE 出口段不得残留「validation.ok** 则放行」旧判据形态: ' + archSeg.slice(0, 200));
+});
 
 // ========== 21. R3 修正专项 ==========
 console.log('\n[21] SC-R3: verify argv 沙箱 / anchor hub 门 / allowed 全组 / squash 防洗历史 / 复跑绑定 / 单入口');
