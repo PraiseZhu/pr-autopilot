@@ -14,7 +14,7 @@ import { execFileSync } from 'node:child_process';
 import { readJson, writeJsonAtomic, parseArgs, fail, nowIso, sha256, canonicalJson, isMain} from '../lib/common.mjs';
 import { withLock } from '../lib/state-lock.mjs';
 import { evaluate, emptyCursors } from './gate.mjs';
-import { unregisterPr, stateFileName } from './register.mjs';
+import { unregisterPr, stateFileName, migrateAllLegacyStateFiles, STATE_FILE_NAME_RE } from './register.mjs';
 import { reserveBudget, releaseReserve } from './budget.mjs';
 import { cleanupRemoteBranch } from './branch-cleanup.mjs';
 import { send as routeNotify } from './notify-router.mjs';
@@ -68,6 +68,7 @@ export function runEngine(cfg) {
     triReviewLedgerDir = null, escapeLedger = null,
     feishuCmd = null, slackCmd = null,
     leaseTtlMinutes = 40, stuckThreshold = 3, lockTimeoutMs = 10_000,
+    pendingStuckHours = 6, // T3/SC-3a: pending 等待 ack 超时告警阈值（默认 6 小时，可经 config 覆盖）
     deleteRemoteBranchOnMerge = false, // 审⑬/owner 点单: 显式 opt-in 才启用远端分支清理
     hmacKey = process.env.PR_AUTOPILOT_HMAC_KEY ?? null,
     nowMs = Date.now()
@@ -81,17 +82,25 @@ export function runEngine(cfg) {
   if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 100 || lockTimeoutMs > 10_000) {
     throw new Error(`引擎启动拒绝: lockTimeoutMs 非法（${lockTimeoutMs}）——必须是 [100, 10000] 毫秒整数（审⑩-P2-2 fail-closed）`);
   }
+  // 审(2026-08-08): pendingStuckHours 仅接受有穷 number 且 > 0。字符串/NaN/Infinity/负数/0
+  // 会静默失效（"6"*60 的隐式转换、NaN 比较恒假、0 令任何年龄都超时），超时告警随之消失——
+  // 非法配置在扫描/通知前直接拒启动（fail-closed）。不支持用 0 禁用（禁用=告警永远不触发）。
+  if (typeof pendingStuckHours !== 'number' || !Number.isFinite(pendingStuckHours) || pendingStuckHours <= 0) {
+    throw new Error(`引擎启动拒绝: pendingStuckHours 非法（${pendingStuckHours}）——必须是有穷 number 且 > 0（字符串/NaN/Infinity/负数/0 均 fail-closed，不支持禁用）`);
+  }
 
   writeJsonAtomic(leaseFile, { last_success: nowIso(), pid: process.pid });
 
   if (!existsSync(stateDir)) mkdirSync(stateDir, { recursive: true });
-  // 审⑤-I3: 只认与 stateFileName 严格同文法的文件（三段、字符集受限、无前缀杂质），
-  // 读取后再反查 stateFileName(owner,repo,pr)===文件名——garbage__5.json 之类不进扫描
+  // R3 修复: 扫描前先做旧命名迁移（SC-S3）——含折叠字符的 v2 注册（mame/_、mame/- 等）
+  // 先原子迁移到 v3 单射编码名；名实不符/冲突拒绝留痕（journal），绝不静默漏扫。
+  // 迁移后再按 v3 文法过滤——garbage__5.json 之类（两段/杂质）不进扫描。
+  const migSummary = migrateAllLegacyStateFiles(stateDir, journalFile);
   const files = readdirSync(stateDir).filter((f) =>
-    /^[A-Za-z0-9.-]+__[A-Za-z0-9.-]+__\d+\.json$/.test(f) && !f.startsWith('manifest-') && !f.startsWith('receipt-'));
-  if (files.length === 0) return { scanned: 0, dispatched: [], redispatched: [], terminal: [], stuck: [], paused: false, quiet: true };
+    STATE_FILE_NAME_RE.test(f) && !f.startsWith('manifest-') && !f.startsWith('receipt-'));
+  if (files.length === 0) return { scanned: 0, migrated: migSummary.migrated, rejected: migSummary.rejected, dispatched: [], redispatched: [], terminal: [], stuck: [], paused: false, quiet: true };
 
-  const out = { scanned: files.length, dispatched: [], redispatched: [], terminal: [], stuck: [], paused: false, quiet: false };
+  const out = { scanned: files.length, migrated: migSummary.migrated, rejected: migSummary.rejected, dispatched: [], redispatched: [], terminal: [], stuck: [], paused: false, quiet: false };
 
   for (const f of files) {
     const path = join(stateDir, f);
@@ -180,7 +189,13 @@ export function runEngine(cfg) {
 
       // F6: pending → 单飞；lease 到期重派同 id；≥N 次 → stuck 路由
       if (state.pending_dispatch) {
-        const pd = state.pending_dispatch;
+        const pd0 = state.pending_dispatch;
+        // T3/SC-3a: 旧 state 缺 first_dispatched_at → 先原子回填（取当时 dispatched_at）再做任何
+        // 重派更新——回填随本轮 writeJsonAtomic(path, next) 一并落盘，年龄基准不因迁移后移
+        let pd = (pd0.first_dispatched_at === undefined && pd0.dispatched_at)
+          ? { ...pd0, first_dispatched_at: pd0.dispatched_at }
+          : pd0;
+        if (pd !== pd0) next.pending_dispatch = pd;
         // 审⑨-P2-1R: canceling 状态机恢复——cancel 在 release/清态之间崩溃时由引擎收敛，
         // 绝不把 canceling pending 当普通 pending 重派（重派 session 无预留 = 预算低计）
         if (pd.canceling) {
@@ -198,6 +213,27 @@ export function runEngine(cfg) {
           writeJsonAtomic(path, next);
           return;
         }
+        // T3/SC-3b: 每轮对每个持有 pending 的 PR 记 waiting——waiting_for 枚举只有 'ack'；
+        // canceling 分支已提前 return，天然不记 waiting（正在收尾的取消会话不制造等待噪音）
+        const pendingAgeMin = (nowMs - Date.parse(pd.first_dispatched_at ?? pd.dispatched_at)) / 60000;
+        journal(journalFile, {
+          kind: 'waiting', pr: prKey, dispatch_id: pd.dispatch_id,
+          waiting_for: 'ack', age_minutes: Math.round(pendingAgeMin),
+          attempt: (pd.redispatch_count ?? 0) + 1
+        });
+        // T3/SC-3a: pending 超时告警——年龄基准 = first_dispatched_at（重派不更新）；
+        // 去重标记持久化在 pending_dispatch 内：尝试发送后即置 true（含发送失败），
+        // 宁丢一次不刷屏——取舍与下方 stuck 通知的 try/catch 同口径
+        if (pd.pending_stuck_notified !== true && pendingAgeMin > pendingStuckHours * 60) {
+          try {
+            routeNotify({
+              eventType: 'pending-stuck', repo: `${state.owner}/${state.repo}`, feishuCmd, slackCmd,
+              message: `【盯梢器】${prKey} 修复会话 ${pd.dispatch_id} 等待 ack 已超 ${Math.floor(pendingAgeMin / 60)} 小时，请检查修复会话是否还活着。`
+            });
+          } catch (e) { journal(journalFile, { kind: 'notify-error', pr: prKey, error: e.message }); }
+          pd = { ...pd, pending_stuck_notified: true };
+          next.pending_dispatch = pd;
+        }
         const ageMin = (nowMs - Date.parse(pd.dispatched_at)) / 60000;
         if (ageMin > leaseTtlMinutes) {
           const count = (pd.redispatch_count ?? 0) + 1;
@@ -206,7 +242,7 @@ export function runEngine(cfg) {
             journal(journalFile, { kind: 'stuck', pr: prKey, dispatch_id: pd.dispatch_id, redispatch_count: count });
             try {
               routeNotify({
-                eventType: 'stuck', repo: state.repo, feishuCmd, slackCmd,
+                eventType: 'stuck', repo: `${state.owner}/${state.repo}`, feishuCmd, slackCmd,
                 message: `【盯梢器】${prKey} 修复会话疑似挂死：dispatch ${pd.dispatch_id} 已重派 ${count} 次仍无完工回执。`
               });
             } catch (e) { journal(journalFile, { kind: 'notify-error', pr: prKey, error: e.message }); }
@@ -217,6 +253,10 @@ export function runEngine(cfg) {
             out.redispatched.push(prKey);
             journal(journalFile, { kind: 'redispatch', pr: prKey, dispatch_id: pd.dispatch_id, count });
           } catch (e) {
+            // SC-2a: 重派失败同样持久化 redispatch_count——否则连续失败永远到不了 stuck 判据。
+            // 判活语义变更（如实声明）：stuck 的「已重派 N 次」计数现在包含失败尝试。
+            next.pending_dispatch = { ...pd, redispatch_count: count };
+            journal(journalFile, { kind: 'redispatch-failed', pr: prKey, dispatch_id: pd.dispatch_id, attempt: count, error: e.message });
             process.stderr.write(`[ENGINE] 重派失败 ${f}: ${e.message}（下轮再试）\n`);
           }
         }
@@ -259,7 +299,7 @@ export function runEngine(cfg) {
         if (state.budget_notified_on !== today) {
           try {
             routeNotify({
-              eventType: 'budget-pause', repo: state.repo, feishuCmd, slackCmd,
+              eventType: 'budget-pause', repo: `${state.owner}/${state.repo}`, feishuCmd, slackCmd,
               message: `【预算闸】${b.reason}。${prKey} 有新反馈但暂停派活，等你确认后继续。`
             });
           } catch (e) { journal(journalFile, { kind: 'notify-error', pr: prKey, error: e.message }); }
@@ -285,6 +325,9 @@ export function runEngine(cfg) {
         finalize_cmd: `node ${scriptsDir}finalize.mjs --repo-dir <修复worktree路径> --manifest ${manifestPath} --snapshot-cmd "${snapshotCmd}" --state-dir ${stateDir}`,
         complete_cmd: `node ${scriptsDir}complete.mjs --manifest ${manifestPath} --snapshot-cmd "${snapshotCmd}" --state-dir ${stateDir}`,
         signals: res.signals, new_items: res.newItems,
+        // 审(2026-08-08): 预算结算字段随 manifest 自包含投递——complete 在 ack 前凭
+        // manifest.budget.{ledger,estimate} 机械结算 reserve（缺省 estimate 结算，--actual 可给实值）
+        budget: { ledger: budget.ledger, estimate: budget.estimate },
         worktree_name: `fix-${state.pr_number}`,
         rules: [
           '第一步必须 git worktree add ../fix-<pr> 并切入（宿主无 per-dispatch worktree，S2）',
@@ -302,7 +345,9 @@ export function runEngine(cfg) {
         next.status = 'fixing';
         next.pending_dispatch = {
           dispatch_id: dispatchId, manifest, cursors_next: res.cursors,
-          dispatched_at: nowIso(), redispatch_count: 0,
+          dispatched_at: nowIso(),
+          first_dispatched_at: nowIso(), // T3/SC-3a: 首派时刻（重派不更新）——pending 超时年龄基准
+          redispatch_count: 0,
           // 审⑨-P2-1R: 权威预算账本随派发固化——cancel 只认这里，不接受调用者任意自报
           budget: { ledger: budget.ledger, estimate: budget.estimate }
         };
@@ -311,6 +356,9 @@ export function runEngine(cfg) {
       } catch (e) {
         // 审④-F7: 投递失败释放预留，预算不漂
         try { releaseReserve({ ledgerFile: budget.ledger, dispatchId }); } catch { /* 记账失败下轮 reserve 幂等兜底 */ }
+        // SC-2a: 首派失败记结构化事件——attempt 恒 1（首派失败无 pending、无跨轮状态，
+        // 游标不推进、下轮重试 = at-least-once，不存在「重派第几次」的概念）
+        journal(journalFile, { kind: 'dispatch-failed', pr: prKey, dispatch_id: dispatchId, attempt: 1, error: e.message });
         process.stderr.write(`[ENGINE] 投递失败 ${f}: ${e.message}（游标不推进 + 预留已释放，下轮重试 = at-least-once）\n`);
       }
       writeJsonAtomic(path, next);

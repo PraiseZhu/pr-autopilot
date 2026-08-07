@@ -6,12 +6,12 @@
 //   ③ original_head..HEAD 的 diff 不碰 CI 路径（git diff -z）
 //   ④ remote 必须已配置、branch 合法、固定普通 refspec（复用 push-guard F3 规则）
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { readJson, writeJsonAtomic, parseArgs, fail, isMain } from '../lib/common.mjs';
 import { join as joinPath } from 'node:path';
-import { stateFileName } from './register.mjs';
+import { stateFileName, legacyStateFileName, resolveStateFile } from './register.mjs';
 import { matchAny } from '../push-guard.mjs';
 import { validateRemoteBranch } from '../lib/git-checks.mjs';
 import { withLock } from '../lib/state-lock.mjs';
@@ -64,8 +64,56 @@ export function checkFinalize({ repoDir, manifest, snapshot, constitution }) {
 }
 
 // 审④-F4: push 成功后原子写不可变 receipt——complete 只认 receipt，candidate 不再自报
+// R3 修复: receipt 路径与 stateFileName 同源（SC-S2: ack/finalize/complete/receipt 全链一致）。
+// R4 修复 (2026-08-08 GPT R4 finding): 旧实现把「检查 canonical → rename 迁移」拆在锁外两步，
+// 窗口期另一进程写入 canonical 后 renameSync 会静默覆盖新 receipt（TOCTOU）。修复:
+//   - 迁移并入 per-state 锁内串行（锁内重新检查 canonical 目标，绝不 rename 覆盖已存在 receipt）；
+//   - 分层: receiptPathLocked = 锁内 helper（调用方必须已持 state 锁，本函数不加锁）；
+//           receiptPath = 锁外公共 API（自行解析并持同一把 per-state 锁后调 helper）。
+//     所有锁内调用点（finalize main / ack cancelDispatch）用 Locked；锁外调用点（complete）用公共 API。
+// canonical 已存在（锁内复核）→ 优先保留 canonical:
+//   同 dispatch → 幂等视为已迁移（返回 canonical；legacy 保留不删——显式策略，双保险不丢数据）；
+//   不同 dispatch 且 legacy 待迁移（legacy.dispatch == manifest.dispatch）→ 显式冲突抛错:
+//     两文件保留、调用方 fail-closed（不 push/不结算不 ack，人工核对后处理）；
+//   不同 dispatch 且无 legacy 待迁移 → 返回 canonical（调用方自有 dispatch 校验 fail-closed）。
+// 只读核对（调用方无 dispatch_id，ack.mjs cancel）→ 不做任何迁移/抛错，按 canonical 优先返回。
+export function receiptPathLocked(stateDir, manifest) {
+  const newPath = joinPath(stateDir, `receipt-${stateFileName(manifest.owner, manifest.repo, manifest.pr_number)}`);
+  const legacyPath = joinPath(stateDir, `receipt-${legacyStateFileName(manifest.owner, manifest.repo, manifest.pr_number)}`);
+  if (existsSync(newPath)) {
+    // 锁内复核: canonical 已存在 → 绝不 rename 覆盖
+    if (!manifest.dispatch_id) return newPath; // 只读核对（ack cancel）: canonical 优先
+    let canonical = null;
+    try { canonical = readJson(newPath); } catch { canonical = null; }
+    if (canonical && canonical.dispatch_id === manifest.dispatch_id) return newPath; // 同 dispatch 幂等（已迁移）
+    if (existsSync(legacyPath)) {
+      let legacy = null;
+      try { legacy = readJson(legacyPath); } catch { legacy = null; }
+      if (legacy && legacy.dispatch_id === manifest.dispatch_id) {
+        // 迁移在途被抢占: canonical 属其他 dispatch → 显式冲突，两文件保留，调用方 fail-closed
+        throw new Error(
+          `receipt 迁移冲突: canonical 已被 dispatch=${String(canonical?.dispatch_id).slice(0, 12) ?? '?'} 占用，` +
+          `legacy dispatch=${String(legacy.dispatch_id).slice(0, 12)}，manifest.dispatch_id=${String(manifest.dispatch_id).slice(0, 12)}` +
+          `——两文件保留不覆盖（fail-closed），人工核对 canonical 归属后处理`
+        );
+      }
+    }
+    return newPath; // 无 legacy 待迁移 → canonical 属其他 dispatch，调用方自有校验 fail-closed
+  }
+  if (!existsSync(legacyPath)) return newPath;
+  if (!manifest.dispatch_id) return legacyPath; // 只读核对场景（ack.mjs cancel）
+  let rec = null;
+  try { rec = readJson(legacyPath); } catch { rec = null; }
+  if (!rec || rec.dispatch_id !== manifest.dispatch_id) return newPath; // 损坏/不匹配 → 不迁移
+  renameSync(legacyPath, newPath); // 锁内: canonical 已复核不存在 → 同目录原子迁移，无覆盖风险
+  return newPath;
+}
+
+// R4: 锁外公共 API——自行解析 state 文件并持同一把 per-state 锁（与 finalize/ack/complete
+// 同一把 ${stateFile}.lock），迁移与复核在锁内串行完成，释放后路径已稳定。
 export function receiptPath(stateDir, manifest) {
-  return joinPath(stateDir, `receipt-${stateFileName(manifest.owner, manifest.repo, manifest.pr_number)}`);
+  const stateFile = joinPath(stateDir, stateFileName(manifest.owner, manifest.repo, manifest.pr_number));
+  return withLock(`${stateFile}.lock`, () => receiptPathLocked(stateDir, manifest));
 }
 
 // 审⑤-F1: 两段 receipt 协议——push 前原子写 intent（记 candidate），push 后升 committed。
@@ -109,9 +157,20 @@ if (isMain(import.meta.url)) {
   // （与 engine/ack/cancel/complete 同一把）——cancel 与 finalize 真并发只有一个合法结果:
   //   cancel 先 → pending 被清 → 本处 push 前核对失败，旧 manifest 到不了远端；
   //   finalize 先 → intent receipt 已落盘 → cancel 见 receipt fail-closed。
-  const rp = receiptPath(args['state-dir'], manifest);
-  const stateFile = joinPath(args['state-dir'], stateFileName(manifest.owner, manifest.repo, manifest.pr_number));
+  // R3 修复: 状态文件同源解析——旧命名文件先迁移，pending 核对才能在升级后命中旧注册
+  const { file: resolvedStateFile } = resolveStateFile({
+    stateDir: args['state-dir'], owner: manifest.owner, repo: manifest.repo,
+    prNumber: manifest.pr_number, journalFile: args.journal ?? null
+  });
+  const stateFile = joinPath(args['state-dir'], resolvedStateFile);
   const outcome = withLock(`${stateFile}.lock`, () => {
+    // R4 修复: receipt 解析/迁移移入锁内（receiptPathLocked 不加锁，避免嵌套死锁）——
+    // 锁内复核 canonical 目标后才迁移，receipt 路径在临界区内稳定，pending 核对与
+    // intent/committed 写入使用同一路径（TOCTOU 覆盖窗口关闭）。迁移冲突（canonical
+    // 被其他 dispatch 占用）在此捕获为 errors 走统一 fail-closed 出口，不裸堆栈。
+    let rp;
+    try { rp = receiptPathLocked(args['state-dir'], manifest); }
+    catch (e) { return { code: 1, errors: [e.message] }; }
     // 审⑤-F1: 恢复分支优先——上次 push 成功但 committed 升级前崩溃时，
     // intent receipt + 远端 head==candidate 即可幂等补升，不再被 CAS 永拒。
     const prevReceipt = (() => { try { return readJson(rp); } catch { return null; } })();
@@ -152,6 +211,8 @@ if (isMain(import.meta.url)) {
     }
     return { code: 0, msg: 'FINALIZE-OK push 已落地；回帖后运行 complete.mjs 收口\n' };
   }, { timeoutMs: 120_000 }); // push 在锁内，给足网络时间
+  // R4: receipt 迁移冲突（canonical 被其他 dispatch 占用）显式 fail-closed——锁在 finally
+  // 已释放，此处只做干净报错，不 push 不写盘
   if (outcome.code !== 0) {
     for (const e of outcome.errors) process.stderr.write(`[FINALIZE] ${e}\n`);
     process.exit(1);

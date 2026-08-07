@@ -4,7 +4,7 @@
 // 回执四要素: ① 状态文件落盘 ② 引擎 schedule active ③ 心跳 lease 未过期 ④ 本 PR 首扫 ack
 //   本脚本保证①并检查②③（可注入）；④由引擎首扫回写 first_scan_ack，--verify 复查。
 //   任一缺失 = 注册失败显式报错（绝不假成功，§0.3-F6）。
-import { existsSync, readFileSync, unlinkSync, appendFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, unlinkSync, appendFileSync, mkdirSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -12,9 +12,131 @@ import { readJson, writeJsonAtomic, parseArgs, fail, nowIso, isMain} from '../li
 import { withLock } from '../lib/state-lock.mjs';
 // 状态文件新增字段（审② F6/F7）: cursors（按类游标）/ pending_dispatch（两阶段状态机）
 
+// ===== 状态文件名编码 v3（2026-08-08 GPT R3: v2 clean 折叠非单射，mame/_ 与 mame/- 同路径碰撞）=====
+// 段内容 = encodeURIComponent(lower(段))，再补转义 `_` → `%5F`。
+//   - 单射: encodeURIComponent 单射；`_` 补转义后段内字符集 {A-Za-z0-9.%!~*'()-} 不含裸 `_`，
+//     `__` 分隔符无歧义；owner/repo 任意已允许标点（/ # _ . - 等）两两不碰撞
+//   - 可逆: parseStateFileName（decodeURIComponent + %5F 还原），内容反查 round-trip 自洽
+//   - 大小写归一: GitHub owner/repo 大小写不敏感（MAME/mame 同一身份）；macOS APFS 默认
+//     大小写不敏感，不归一化会让 Mame/Repo#7 与 mame/repo#7 写两个名、实落同一 inode 互相覆盖
+//   - 兼容: 无折叠字符的 ASCII 名（o/mivo-canvas 等）编码恒等 → 与 v2 文件名逐字一致，
+//     存量普通状态文件零迁移；只有含折叠字符（_ / # 等）的旧注册才走迁移（migrateLegacyStateFile）
+export const STATE_FILE_NAME_RE = /^([A-Za-z0-9.%!~*'()-]+)__([A-Za-z0-9.%!~*'()-]+)__(\d+)\.json$/;
+
 export function stateFileName(owner, repo, prNumber) {
+  const enc = (s) => encodeURIComponent(String(s).toLowerCase()).replace(/_/g, '%5F');
+  return `${enc(owner)}__${enc(repo)}__${Number(prNumber)}.json`;
+}
+
+// v3 反向解析（小写解码值）: 解析失败返回 null（调用方按非法文件处理）
+export function parseStateFileName(file) {
+  const m = STATE_FILE_NAME_RE.exec(file);
+  if (!m) return null;
+  try {
+    return {
+      owner: decodeURIComponent(m[1].replace(/%5F/g, '_')),
+      repo: decodeURIComponent(m[2].replace(/%5F/g, '_')),
+      prNumber: Number(m[3])
+    };
+  } catch { return null; }
+}
+
+// v1/v2 旧编码（保留: 迁移识别用）。clean 非单射——`_`/`/`/`#` 等一律折叠成 `-`，
+// 这正是 R3 碰撞根因；只有旧命名文件才需要按本函数做 round-trip 判定。
+export function legacyStateFileName(owner, repo, prNumber) {
   const clean = (s) => String(s).replace(/[^A-Za-z0-9.-]/g, '-');
   return `${clean(owner)}__${clean(repo)}__${Number(prNumber)}.json`;
+}
+
+// 旧命名 → 新命名原子迁移（SC-S3，fail-closed）。判据:
+//   1. 内容 identity 的 legacy round-trip 必须等于文件名——否则是名实不符垃圾，拒绝
+//   2. 新名不存在 → 持旧名锁原子 rename（同目录，内容原样保留）
+//   3. 新名已存在 → 归一化身份（lower owner/repo + pr）相同 = 同一身份重复（大小写/迁移前
+//      残留）→ 以新名文件为准删旧合并；不同 = 真实冲突 → 拒绝并给人工恢复提示
+// 拒绝/合并都 journal 留痕；绝不静默漏扫（engine/probe 对拒绝文件跳过、但留痕可查）。
+export function migrateLegacyStateFile({ stateDir, file, state, journalFile = null }) {
+  const j = (rec) => {
+    if (!journalFile) return;
+    mkdirSync(dirname(journalFile), { recursive: true });
+    appendFileSync(journalFile, JSON.stringify({ at: nowIso(), ...rec }) + '\n');
+  };
+  if (typeof state?.owner !== 'string' || typeof state?.repo !== 'string'
+      || !Number.isInteger(Number(state?.pr_number))) {
+    j({ kind: 'state-file-rejected', file, error: '内容缺 owner/repo/pr_number，无法反查身份（不迁移，人工核对）' });
+    return { ok: false, file, action: 'rejected', reason: 'missing-identity' };
+  }
+  if (legacyStateFileName(state.owner, state.repo, state.pr_number) !== file) {
+    j({ kind: 'state-file-rejected', file, error: '文件名与内容身份的旧编码 round-trip 不符（名实不符垃圾，不迁移）' });
+    return { ok: false, file, action: 'rejected', reason: 'name-mismatch' };
+  }
+  const newFile = stateFileName(state.owner, state.repo, state.pr_number);
+  if (newFile === file) return { ok: true, file, action: 'none' }; // 理论不可达（round-trip 通过即新名相同）
+  const oldPath = join(stateDir, file);
+  const newPath = join(stateDir, newFile);
+  return withLock(`${oldPath}.lock`, () => {
+    if (!existsSync(oldPath)) { // 并发下已被迁移
+      if (existsSync(newPath)) return { ok: true, file: newFile, action: 'none' };
+      j({ kind: 'state-file-rejected', file, error: '迁移源消失且目标不存在（异常，不迁移）' });
+      return { ok: false, file, action: 'rejected', reason: 'source-lost' };
+    }
+    if (existsSync(newPath)) {
+      let other = null;
+      try { other = readJson(newPath); } catch { other = null; }
+      const sameId = other && String(other.owner ?? '').toLowerCase() === String(state.owner).toLowerCase()
+        && String(other.repo ?? '').toLowerCase() === String(state.repo).toLowerCase()
+        && Number(other.pr_number) === Number(state.pr_number);
+      if (sameId) {
+        unlinkSync(oldPath); // 同一身份重复 → 新名文件为准，删旧合并
+        j({ kind: 'state-file-merged', from: file, into: newFile, pr: `${state.owner}/${state.repo}#${state.pr_number}` });
+        return { ok: true, file: newFile, action: 'merged' };
+      }
+      j({ kind: 'state-file-rejected', file, error: `迁移冲突: 目标 ${newFile} 已被不同身份占用（identity 不符）——保留旧文件未动，请人工核对后处理（fail-closed）` });
+      return { ok: false, file, action: 'rejected', reason: 'conflict' };
+    }
+    renameSync(oldPath, newPath); // 同目录原子 rename，内容原样保留
+    j({ kind: 'state-file-migrated', from: file, to: newFile, pr: `${state.owner}/${state.repo}#${state.pr_number}` });
+    return { ok: true, file: newFile, action: 'renamed' };
+  });
+}
+
+// 按身份解析状态文件路径（register/ack/finalize/unregister 共用）:
+//   新名存在 → 直接用；否则旧名存在 → 尝试迁移（可安全识别单一身份则原子 rename）。
+//   迁移失败（垃圾/冲突/损坏）→ 不迁移，按新名路径返回（调用方 existsSync 自然判不存在；
+//   engine/probe 侧的目录扫描会对残留文件继续 journal 拒绝，留痕不静默）。
+export function resolveStateFile({ stateDir, owner, repo, prNumber, journalFile = null }) {
+  const newFile = stateFileName(owner, repo, prNumber);
+  if (existsSync(join(stateDir, newFile))) return { file: newFile, migrated: false };
+  const legacyFile = legacyStateFileName(owner, repo, prNumber);
+  if (!existsSync(join(stateDir, legacyFile))) return { file: newFile, migrated: false };
+  let state = null;
+  try { state = readJson(join(stateDir, legacyFile)); } catch { state = null; }
+  if (!state) return { file: newFile, migrated: false }; // 损坏旧文件无法反查 → 不迁移
+  const mig = migrateLegacyStateFile({ stateDir, file: legacyFile, state, journalFile });
+  if (!mig.ok) return { file: newFile, migrated: false };
+  return { file: mig.file, migrated: mig.action !== 'none' };
+}
+
+// 目录级迁移（engine/probe 扫描前调用）: 把仍为旧命名的状态文件逐个迁移到新编码名。
+// 只处理新/旧格式段字符集内的文件；内容反查 round-trip 已通过的（= 新命名或无需改名）
+// 跳过；名实不符/冲突由 migrateLegacyStateFile 拒绝并 journal 留痕（fail-closed，
+// 绝不静默漏扫——engine/probe 对拒绝文件跳过，但 journal 可查、下轮仍会重试判定）。
+export function migrateAllLegacyStateFiles(stateDir, journalFile = null) {
+  if (!existsSync(stateDir)) return { scanned: 0, migrated: 0, rejected: 0 };
+  const out = { scanned: 0, migrated: 0, rejected: 0 };
+  for (const f of readdirSync(stateDir)) {
+    if (f.startsWith('manifest-') || f.startsWith('receipt-')) continue;
+    if (!STATE_FILE_NAME_RE.test(f)) continue; // 段字符集之外（garbage 等）不处理
+    let state = null;
+    try { state = readJson(join(stateDir, f)); } catch { continue; }
+    out.scanned++;
+    if (typeof state?.owner !== 'string' || typeof state?.repo !== 'string'
+        || !Number.isInteger(Number(state?.pr_number))) continue; // 内容缺身份 → migrate 侧会拒绝
+    if (stateFileName(state.owner, state.repo, state.pr_number) === f) continue; // 已新命名
+    const mig = migrateLegacyStateFile({ stateDir, file: f, state, journalFile });
+    if (mig.ok && mig.action === 'renamed') out.migrated++;
+    if (!mig.ok) out.rejected++;
+  }
+  return out;
 }
 
 export function registerPr({ stateDir, owner, repo, prNumber, branch, registeredBy, pushRepo, pushRemote }) {
@@ -22,7 +144,10 @@ export function registerPr({ stateDir, owner, repo, prNumber, branch, registered
   // 正常文档路径不允许生成注定失败的注册；remote 名不许引擎事后猜。
   if (!branch) throw new Error('注册缺 branch（fail-closed: 无 branch 的状态文件会让 finalize 必然失败）');
   if (!pushRemote) throw new Error('注册缺 push_remote（fail-closed: 修复 push 的 remote 名必须显式指定，引擎不猜）');
-  const file = join(stateDir, stateFileName(owner, repo, prNumber));
+  // R3 修复: 按身份解析先于加锁——旧命名文件（含折叠字符的 v2 注册）先原子迁移到新编码名，
+  // 新名已存在则直接复用（同一身份幂等 already；不同身份必然不同名，不 already 不覆盖）。
+  const { file: resolvedFile } = resolveStateFile({ stateDir, owner, repo, prNumber });
+  const file = join(stateDir, resolvedFile);
   // 审⑥-F1: 读改写持与 engine/ack 同一把 per-key 锁；既有状态做显式 v1→v2 迁移——
   // 只补/纠正接线字段（branch/push_repo/push_remote），cursors/pending_dispatch/first_scan_ack
   // 原样保留（迁移不得重置游标造成重复派发）。旧注册不再永久停派、错误注册可重注册纠正。
@@ -74,7 +199,9 @@ export function registerPr({ stateDir, owner, repo, prNumber, branch, registered
 
 export function checkReceipt({ stateDir, owner, repo, prNumber, leaseFile, leaseTtlMinutes = 45, scheduleCheckCmd }) {
   const missing = [];
-  const file = join(stateDir, stateFileName(owner, repo, prNumber));
+  // R3 修复: 与 register/ack/unregister 同源解析（旧命名文件先迁移，四要素检查才能命中旧注册）
+  const { file: resolvedFile } = resolveStateFile({ stateDir, owner, repo, prNumber });
+  const file = join(stateDir, resolvedFile);
 
   // ① 落盘
   if (!existsSync(file)) missing.push('要素①: 状态文件未落盘');
@@ -108,7 +235,9 @@ export function checkReceipt({ stateDir, owner, repo, prNumber, leaseFile, lease
 }
 
 export function unregisterPr({ stateDir, owner, repo, prNumber, reason, journalFile, skipLock = false }) {
-  const file = join(stateDir, stateFileName(owner, repo, prNumber));
+  // R3 修复: 同源解析——旧命名文件先迁移再销单，engine 终态路径（skipLock）与 CLI 一致
+  const { file: resolvedFile } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  const file = join(stateDir, resolvedFile);
   const doIt = () => {
     if (!existsSync(file)) return { removed: false };
     const state = readFileSync(file, 'utf8');
