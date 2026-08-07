@@ -164,17 +164,16 @@ tests:[{name,distinguishes}] }`——`scripts/pr-body.mjs` 的 `buildCheckpointS
 时的判据来源——`review-convergence.md` §2 原文称之为「reviewer 有了明确不变量后反馈会明显
 更聚焦，不再每轮换个入口挑一条」。
 
-## 批次严格后代不变量（lead 2026-08-07 定案，防后人误加回重复检查）
+## 批次严格后代不变量（lead 2026-08-07 定案；2026-08-08 更新为与 SKILL.md:675 一致）
 
 批次的 successor 必是 `source_candidate` 的**严格后代**（任意距离，不得等于起点）——批次是
 「一批 finding → 一个已解决状态」的事务，多 commit 分步修复合法，不要求直接子 commit。
 
-该不变量由 push-guard 的 `expected_sha` 绑定 + SC-3（终版 artifact 的 parent 祖先绑定）
-**by construction 共同保证**；实测确认「非后代/零推进」在完整链上**无法独立构造触发**
-（会被前置检查先拦）。
-
-**因此批次门不再重复校验 —— 这不是疏漏，是刻意不加**：一道不可达的检查会让人误以为是它
-在拦，而真正的强制点在别处（比没有这道门更危险——它正是「声明看着在验、实际没验」这个
-本项目反复咬人的缺陷形状）。后人若要在此处加「严格后代」守卫，须先证明 `expected_sha` +
-SC-3 存在可独立构造的失效路径（带实证，不是「未来可能变松」的推测），否则按「新增机制确认
-门」不建。
+**守卫已在 `push-guard` 内实现**（`is-ancestor` + 不等；`isAncestorCommit` 从 consensus-gate.mjs
+import 复用，单一真相源）。此前该不变量曾被声明为 `expected_sha` 绑定 + SC-3 parent 祖先绑定
+**by construction 共同保证、刻意不设检查**——**2026-08-07 被集成审查席构造出兄弟提交反例推翻**
+（共同 base B、source S=B+X、兄弟 T=B+Y：`rev-list S..T` 非空 ≠ S 是 T 的祖先，伪造自洽终版
++ run manifest 可全过集合一致性检查），故恢复守卫（前向门「须先证明存在可独立构造的失效路径」
+已被满足）。常驻反向变异测试钉住该检查（挖空 `isAncestorCommit` 后兄弟提交放行 = 有效检测器）。
+**生效前提（opt-in）**：`fix-run init` 未传 `--batch` 时 run manifest 无 batch 段，push-guard 的
+批次段校验（含严格后代检查）整体跳过——非批次 run 不受此约束。
