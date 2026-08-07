@@ -213,8 +213,18 @@ t('[R10-A3] R1 两对抗席 hardening_coverage 机器强制: 缺失/缺项/重�
   eq(validateVerdict(mkVerdictFor('claude-adversarial', bundle)).length, 0, '10 项齐全的 R1 对抗席应过');
 
   // ⑤ round>=2 同样强制（issue #9 SC-B: 对抗席全 round——修复代码曾是全流程唯一没被十类清单扫过的代码）
-  ok(validateVerdict(mkVerdictFor('claude-adversarial', bundle, { round: 2, hardening_coverage: undefined, checklist_version: undefined })).length > 0,
-    'round>=2 的对抗席同样强制 hardening_coverage/checklist_version（issue #9 SC-B: 修复代码也要被十类扫净，不许分轮细水长流）');
+  //    两个字段必须**各自独立**断言，且断言必须**点名该字段**（照 ① 的写法）。
+  //    此前本条是 `{ round:2, hardening_coverage: undefined, checklist_version: undefined }` + `.length > 0`——
+  //    同时摘两个字段又只看"有没有报错"，于是把 hardening 全-round 检查整段挖空后，
+  //    checklist_version 的错误仍让 `.length > 0` 成立，本条照绿：断言压根没绑住它声称验证的对象
+  //    （R3 审查席反向变异实测发现）。判据：`.length > 0` 仅在输入**只违反一条规则**时才安全；
+  //    一次摘多个字段就必须逐字段 `.some(/字段名/)`，否则失败模式互相掩盖。
+  const r2NoCov = mkVerdictFor('claude-adversarial', bundle, { round: 2, hardening_coverage: undefined });
+  ok(validateVerdict(r2NoCov).some((e) => /hardening_coverage/.test(e)),
+    'round>=2 的对抗席缺 hardening_coverage 必须点名该字段报错（issue #9 SC-B: 修复代码也要被十类扫净，不许分轮细水长流）');
+  const r2NoVer = mkVerdictFor('claude-adversarial', bundle, { round: 2, checklist_version: undefined });
+  ok(validateVerdict(r2NoVer).some((e) => /checklist_version/.test(e)),
+    'round>=2 的对抗席缺 checklist_version 必须点名该字段报错（版本校验独立于缺项计数，见 verdict-validate.mjs 的 SC-B4/D5 分支）');
 
   // ⑥ 第三席不强制（即便完全不带）
   eq(validateVerdict(mkVerdictFor('upstream-preview', bundle)).length, 0, '第三席不强制 hardening_coverage/checklist_version');
