@@ -140,8 +140,10 @@ export PR_AUTOPILOT_HMAC_KEY=$(openssl rand -hex 32)   # 每台机器独立生�
 
 - **生成与形状**：`openssl rand -hex 32` 即可（HMAC key 无格式约束，任意字符串都行；64 位十六进制只是惯例）。**谁读 env**：`deploy/wrappers/probe.mjs:57` 读 `process.env.PR_AUTOPILOT_HMAC_KEY` 后传给 `gate.evaluate`；`scripts/pr-watch/engine.mjs:72` 默认读 env，但 CLI 的 `...extra` 可被 `engine-*.json` 里的 `hmacKey` 字段**覆盖**；`scripts/pr-watch/complete.mjs:53` 读 env 传给 `checkCompletion`；`scripts/pr-watch/provenance.mjs` 本身**不读 env**，只接收调用方传入的 key 参数。**不落盘、不打日志**。
 - **每台机器必须独立生成**：它是「这条评论是不是我自己发的」的识别凭证，不是共享口令。拷别人的 key = 两台机器互认对方回帖为自家，签名校验的意义归零。
-- **没配会怎样（已验证因果链，逐跳）**：修复会话完工后 `complete.mjs:53` 取到空 key → `:35` `verifyMarker(c.body, 空)` 返回 false → `:37` 判「回帖未落地: 无带 provenance 签名且含 dispatch 的评论」→ `:56` exit 1，**ack 不发生**（`:58-63`）→ `pending_dispatch` 保持在途 → 引擎 `engine.mjs:182-224` 只按 lease 超时（`:202`）重派**同一个 dispatch_id**（`budget.mjs:89` reserve 对同 id 幂等，`already-reserved` 直接放行不重复占额）→ 重派 ≥ `stuckThreshold` 次 → `engine.mjs:204-205` 记 `stuck` + `:208` routeNotify 发通知。**真实表现 = 卡在 pending、最终触发 stuck 通知**——这是**有告警的故障**，不是静默故障。
-- **budget cap 撞顶的成因未定**：不要把「$30/天 cap 撞顶」归因到 HMAC key——该现象成因**未定**，本文档不归因、也不猜替代解释。缺 key 的已验证后果就是上面那条 stuck 链。
+- **没配会怎样（三层，别混）**：
+  - **已验证机制**：修复会话完工后 `complete.mjs:53` 取到空 key → `:35` `verifyMarker(c.body, 空)` 返回 false → `:37` 判「回帖未落地」→ `:56` exit 1，**ack 不发生**（`:58-63` 只在 checkCompletion 通过后才 ackDispatch）→ `pending_dispatch` 保持在途 → 引擎 `engine.mjs:182-224` 只按 lease 超时（`:202`）重派**同一个 dispatch_id**（`budget.mjs:89` reserve 对同 id 幂等，`already-reserved` 直接放行不重复占额）→ 重派 ≥ `stuckThreshold` 次 → `engine.mjs:204-205` 记 `stuck` + `:208` routeNotify 发通知。**真实表现 = 卡在 pending、最终触发 stuck 通知**——这是**有告警的故障**，不是静默故障。
+  - **已验证的间接预算影响（代码支持的可能路径，未在真实事件中证实）**：`complete` 未 ack → `pending_dispatch` 连同**原 dispatch 的 reserve 一起长留**（`engine.mjs:303-308` pending_dispatch 固化含 `budget: {ledger, estimate}`）→ 该额度不释放，与后续真实 dispatch 竞争同一个 cap；而重派路径**不调用 reserve**（reserve 只在无 pending 且判 actionable 的新 dispatch 路径，`engine.mjs:250-255`）。**这条是代码支持的可能机制，不是已证实因果**——不要当成新的因果断言。
+  - **不可归因**：外部部署方那次「$30/天 cap 撞顶」**成因未定**——本 checkout 没有「缺 key → 每轮新 dispatch_id → 每轮 reserve」的路径（重派复用同 id + reserve 幂等），且该事件无运行时台账/序列证据。**不要归因到 HMAC key，也不猜替代解释**。
 - **强度如实声明（T1，无机器门在拦）**：引擎启动时不校验 key 是否存在（`engine.mjs:72` `?? null`，没有 fail-closed 启动门）；这道门防的是「自家评论误唤醒自己」的**疏忽**，不防**伪造**——知道 key 的人可以伪造签名评论。配不配 key 全靠部署时自觉，机器不拦。
 
 **② `REQUIRED_CONTEXTS_FILE` —— CI 判绿的权威来源**
@@ -162,7 +164,11 @@ export REQUIRED_CONTEXTS_FILE=/path/to/required-contexts.json
     node <引擎入口> …
   ```
   本机在跑的部署就是这么做（Cindy schedule 的 prompt 里写死这条命令；外部实证，本地不可复验）。
-- **env.sh 是否生效是有条件的**：`source env.sh` 与启动引擎发生在**同一个 shell** 时，export 会随子进程继承——本仓命令就是「班车会话 source env.sh 后**后台**跑 engine」（见上文 §2 班车职责 1），`gh-snapshot` 作为 engine 子进程读 `process.env`（`gh-snapshot.mjs:143-144`），代码里**没有任何「env.sh 特殊隔离」机制**；**只有 source 发生在另一个调度会话里、与启动引擎不在同一 shell** 时，才需要像上面那样在启动命令上并列 export。**顺带：非交互 shell 的 PATH 里没有 `node`**（本机踩过，mini 的 node 在 `/opt/homebrew/bin`），部署时不显式加 PATH 会静默失败——上面命令行里的 `export PATH=…` 就是干这个的。
+- **env.sh 是否生效（精确条件）**：
+  - **生效（本仓可证）**：同一 shell / 同一调度会话里 `source env.sh` 后再启动 engine（前台、后台、或该 shell 直接 exec 子进程）→ 变量进 `process.env`，并由 engine 的 `execFileSync` 子进程继承（`deploy/README.md:83`「班车会话 source env.sh 后**后台**跑 engine」+ `engine.mjs:23-27` execFileSync 启动子命令 + `gh-snapshot.mjs:143-144` 从 `process.env` 读）。
+  - **失效（两种）**：① 只在某个会话 source 了 env.sh，engine 却由**另一个已存在或独立启动的 scheduler / launchd 会话**拉起——后者不继承前者环境；② source 的那个 shell 随后退出，再由独立 scheduler 拉起 engine——同样失效。此时才需要像上面那样在启动命令上并列 export。
+  - **边界（必须知道）**：本 checkout 只能证明普通 Unix 子进程继承与本仓命令链，**不能证明 Mac mini 上 Cindy scheduler 的真实会话边界**（`env.sh`、schedule 启动命令、launchd runtime 都不在 checkout 里）。所以「别人这么塞没生效」**不能写成本仓事实**，是外部实证/本地不可验。
+  - **顺带：非交互 shell 的 PATH 里没有 `node`**（本机踩过，mini 的 node 在 `/opt/homebrew/bin`），部署时不显式加 PATH 会静默失败——上面命令行里的 `export PATH=…` 就是干这个的。
 - 备选（**未实测**）：launchctl setenv 或 plist EnvironmentVariables 注入调度进程环境，理论同效。
 - **取值权威来源 = 分支保护 API 的实际值，不是人手抄 workflow 名**：`gh api repos/{owner}/{repo}/branches/main/protection --jq '.required_status_checks.contexts'`（或仓库 Settings → Branches → 保护规则 → Require status checks 里看到的清单）。手抄名字会漂移——分支保护里改名/增删后，清单不跟着变，CI 判绿就失真。
 - **两类 check 绝对不能进这份清单（同一类陷阱的两个变种）**：
