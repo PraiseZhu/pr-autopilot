@@ -16,7 +16,7 @@ const W = join(HERE, '..', 'deploy', 'wrappers');
 import { computeReviewInputHash } from '../scripts/review-input-hash.mjs';
 import { evaluateIntent, buildMarkerBlock, extractIntentMarker, fallbackIntentFromBody } from '../scripts/intent-check.mjs';
 import { computeSizeReport, evaluateSize, loadSizeGateConfig, exemptionInvalidReason } from '../scripts/size-gate.mjs';
-import { validateVerdict } from '../scripts/verdict-validate.mjs';
+import { validateVerdict, SCHEMA_VERSION } from '../scripts/verdict-validate.mjs';
 import { runConsensusGate, recomputeArtifactHash, familyKeyOf } from '../scripts/consensus-gate.mjs';
 import { checkPushGuard, matchAny, directionCheck, jsonSubset, fastSignaturePayload } from '../scripts/push-guard.mjs';
 import { ciReadiness } from '../scripts/ci-readiness.mjs';
@@ -127,7 +127,7 @@ function withAnchorPaths(findings) {
 }
 function mkVerdictFor(reviewer, bundleObj, over = {}) {
   const base = {
-    schema_version: 'v3', reviewer, run_status: 'ok', round: 1, attempt: 1,
+    schema_version: SCHEMA_VERSION, reviewer, run_status: 'ok', round: 1, attempt: 1,
     base_sha: bundleObj.base_sha, candidate_sha: bundleObj.candidate_sha,
     review_input_hash: computeReviewInputHash(bundleObj),
     faces: reviewer === 'upstream-preview' ? THIRD_FACES : FULL_FACES,
@@ -3696,6 +3696,17 @@ t('[SC-12] live 契约一致性: SKILL/references 与 validator/push-guard 实�
   // SC-R3-6: push-guard 不得再强制 legacy sc_hash/sc_list（文档≡实现）
   const pg = readFileSync(join(S, 'push-guard.mjs'), 'utf8');
   ok(!pg.includes('必须携带 sc_hash'), 'push-guard 不得再强制 legacy sc_hash/sc_list');
+});
+
+t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生，不得残留 verdict schema_version 字面量（照 [SC-12] 写法）', () => {
+  // 2026-08-07: 硬编码判据（纯值必须单一真相源）——verdict schema 版本改从 verdict-validate.mjs
+  // 导出的 SCHEMA_VERSION 派生。artifact schema 版本（B 类）等 batch-txn 的 ARTIFACT_SCHEMA_VERSION；
+  // sc_manifest/fix_plan/pr-watch state 的 schema_version 是另一套协议，不在此列。
+  const own = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  ok(/schema_version: SCHEMA_VERSION, reviewer/.test(own), '本文件 verdict 构造必须用 SCHEMA_VERSION 派生常量');
+  // 反向: 不得残留 verdict 版字面量（'v[0-9]', reviewer 形态）。正则用拼接构造，避免自引用误报。
+  const lit = "schema_version: 'v" + "[0-9]', reviewer";
+  ok(!own.includes(lit), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
 });
 
 t('[R10-A4] SKILL.md 契约与实现逐字同步: 按文档描述构造的 manifest/verdict 真能过闸（不止 grep 文档）', () => {

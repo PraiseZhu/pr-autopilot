@@ -2,7 +2,9 @@
 // I9: 十类穷举契约扩展至对抗席全 round + attempt 字段 — 独立回归
 // 自包含：不依赖 fixtures/run-fixtures.mjs（418K，派工边界禁止改动），自建最小 verdict 工厂。
 // 覆盖 SC-1〜SC-6（见派工包）。运行: node fixtures/i9-verdict.mjs（全过 exit 0，有失败 exit 1）。
-import { validateVerdict } from '../scripts/verdict-validate.mjs';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { validateVerdict, SCHEMA_VERSION } from '../scripts/verdict-validate.mjs';
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from '../scripts/lib/hardening-registry.mjs';
 
 let pass = 0, failCount = 0;
@@ -28,7 +30,7 @@ const FULL_HARDENING = Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => (
 
 function mkVerdict(reviewer, over = {}) {
   return {
-    schema_version: 'v3', reviewer, run_status: 'ok', round: 1, attempt: 1,
+    schema_version: SCHEMA_VERSION, reviewer, run_status: 'ok', round: 1, attempt: 1,
     base_sha: SHA_A, candidate_sha: SHA_B, review_input_hash: RIH,
     faces: reviewer === 'upstream-preview' ? THIRD_FACES : FULL_FACES,
     findings: [], gate_checks: reviewer === 'upstream-preview' ? THIRD_GATES : [],
@@ -236,6 +238,14 @@ t('[SC-R3-F6-c2] actionable_required_fields: family_id typo(family_ids) → fail
   });
   const errs = validateVerdict(v);
   ok(errs.some((e) => /缺 family_id/.test(e)), 'family_id 必填值校验必须 fail loud: ' + JSON.stringify(errs));
+});
+
+// ========== 版本字面量自检（2026-08-07）==========
+t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生，不得残留 verdict schema_version 字面量（照 [SC-12] 写法）', () => {
+  const own = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  ok(/schema_version: SCHEMA_VERSION, reviewer/.test(own), '本文件 verdict 构造必须用 SCHEMA_VERSION 派生常量');
+  const lit = "schema_version: 'v" + "[0-9]', reviewer";
+  ok(!own.includes(lit), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
 });
 
 // ========== 汇总 ==========

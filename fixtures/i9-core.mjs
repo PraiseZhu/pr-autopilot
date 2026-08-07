@@ -29,7 +29,7 @@ import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from '../scripts/l
 // SC-R3-6（只读引用，不修改该文件）: REVIEWERS 是 verdict-validate.mjs 的唯一权威声明——
 // consensus-gate.mjs 已改为直接 import 它（MAJOR1 修复）。这里同样只读引用，用于行为级验证
 // 「改席位名单 → consensus-gate 的席位门跟着变」，测试内会 push/pop 还原，不留污染。
-import { REVIEWERS } from '../scripts/verdict-validate.mjs';
+import { REVIEWERS, SCHEMA_VERSION } from '../scripts/verdict-validate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const S = join(HERE, '..', 'scripts');
@@ -79,7 +79,7 @@ function withAnchorPaths(findings) {
 }
 function mkVerdictFor(reviewer, bundleObj, over = {}) {
   const base = {
-    schema_version: 'v3', reviewer, run_status: 'ok', round: 1, attempt: 1,
+    schema_version: SCHEMA_VERSION, reviewer, run_status: 'ok', round: 1, attempt: 1,
     base_sha: bundleObj.base_sha, candidate_sha: bundleObj.candidate_sha,
     review_input_hash: computeReviewInputHash(bundleObj),
     faces: reviewer === 'upstream-preview' ? THIRD_FACES : FULL_FACES,
@@ -540,6 +540,7 @@ t('[SC-R3-7] 改 schemas/consensus-artifact.schema.json 的 schema_version 版�
 
     const probeSrc = `
 import { runConsensusGate, assertArtifactShape, ARTIFACT_SCHEMA_VERSION } from ${JSON.stringify(join(S, 'consensus-gate.mjs'))};
+import { SCHEMA_VERSION } from ${JSON.stringify(join(S, 'verdict-validate.mjs'))};
 import { computeReviewInputHash } from ${JSON.stringify(join(S, 'review-input-hash.mjs'))};
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from ${JSON.stringify(join(S, 'lib', 'hardening-registry.mjs'))};
 const FULL_FACES = ['A','B','C','D','E','F','G'].map((f) => ({ face: f, result: f === 'B' ? 'n_a' : 'pass', evidence: f + ' 面走查完成' }));
@@ -549,7 +550,7 @@ const FULL_HARDENING = Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => (
 const bundle = { base_sha: 'a'.repeat(40), candidate_sha: 'b'.repeat(40), pr_title: 't', pr_body: 'b', touches_ui: false, matched_paths: [], ui_registry_config_hash: 'c'.repeat(64), pr_context_digest: 'd'.repeat(64) };
 function mkV(reviewer) {
   return {
-    schema_version: 'v3', reviewer, run_status: 'ok', round: 1, attempt: 1,
+    schema_version: SCHEMA_VERSION, reviewer, run_status: 'ok', round: 1, attempt: 1,
     base_sha: bundle.base_sha, candidate_sha: bundle.candidate_sha,
     review_input_hash: computeReviewInputHash(bundle),
     faces: reviewer === 'upstream-preview' ? THIRD_FACES : FULL_FACES,
@@ -576,6 +577,16 @@ process.stdout.write(JSON.stringify({ ARTIFACT_SCHEMA_VERSION, gate_result: arti
   }
   const restoredCheck = JSON.parse(readFileSync(schemaPath, 'utf8'));
   eq(restoredCheck.properties?.schema_version?.const, 'v3', 'SC-R3-7: schema 文件必须已还原为 v3（防止测试污染仓库文件）');
+});
+
+t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生，不得残留 verdict schema_version 字面量（照 [SC-12] 写法）', () => {
+  // 2026-08-07: verdict schema 版本改从 verdict-validate.mjs 导出的 SCHEMA_VERSION 派生。
+  // artifact schema 版本（SC-R2-1/2-3/2-6/3-2/3-7 的 B 类字面量）等 batch-txn 的
+  // ARTIFACT_SCHEMA_VERSION 落地再改；sc_manifest/fix_plan 的 schema_version 是另一套协议，不在此列。
+  const own = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  ok(/schema_version: SCHEMA_VERSION, reviewer/.test(own), '本文件 verdict 构造必须用 SCHEMA_VERSION 派生常量');
+  const lit = "schema_version: 'v" + "[0-9]', reviewer";
+  ok(!own.includes(lit), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
 });
 
 console.log(`\n========== i9-core fixtures: ${pass} passed, ${failCount} failed ==========`);

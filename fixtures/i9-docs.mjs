@@ -23,7 +23,7 @@ import {
   SEATS,
 } from '../scripts/dispatch-contract.mjs';
 import { HARDENING_CHECKLIST_VERSION, HARDENING_CLASS_COUNT } from '../scripts/lib/hardening-registry.mjs';
-import { validateVerdict } from '../scripts/verdict-validate.mjs';
+import { validateVerdict, SCHEMA_VERSION } from '../scripts/verdict-validate.mjs';
 
 // R2-P1 真相源变化测试的通用探针：本进程已经 import 过 dispatch-contract.mjs/verdict-validate.mjs，
 // 它们模块顶层派生的常量（SCHEMA_VERSION 等）是「导入时那一刻」的快照，进程内再改磁盘文件不会让
@@ -183,11 +183,15 @@ const LIVE_SCHEMA = JSON.parse(readFileSync(new URL('../schemas/review-verdict.s
 
 t('[SC-R2-C1] verdict_schema_version 从 schema 常量派生，不是手拄字面值（v2→v3 漂移的直接复现）', () => {
   const expected = LIVE_SCHEMA.properties.schema_version.const;
-  eq(expected, 'v3', '当前 schema 的 schema_version.const 应为 v3（回归锚点）');
+  // 有意锚定历史版本（例外，非漏改）: 这条钉的是「v2→v3 迁移已完成」——如果将来 verdict
+  // schema 再 bump（如 v4），本行必须由人显式更新（这是迁移事件的有意断点，不是可派生的值；
+  // expected 本就来自同一 schema，派生会变成同义反复）。不要顺手改成 expected 或 SCHEMA_VERSION。
+  eq(expected, 'v3', '当前 schema 的 schema_version.const 应为 v3（回归锚点，bump 时必须显式更新）');
   eq(contractSpec({ seat: SEAT, round: ROUND }).verdict_schema_version, expected,
     'contractSpec.verdict_schema_version 必须等于 review-verdict.schema.json 的 schema_version.const');
   const text = emitContract({ seat: SEAT, round: ROUND });
-  ok(text.includes('schema_version: "v3"'), 'emit 输出必须逐字含 schema_version: "v3"');
+  // emit 输出的版本号从 expected（= schema const）派生，不手拄字面量——schema bump 时自动跟随
+  ok(text.includes('schema_version: "' + expected + '"'), `emit 输出必须逐字含 schema_version: "${expected}"（从 schema const 派生）`);
   ok(!text.includes('schema_version: "v2"'), 'emit 输出不得残留 schema_version: "v2"');
 });
 
@@ -288,13 +292,15 @@ t('[SC-R2-C4] emit→validator 端到端(反向变异): 把 schema_version 改�
 t('[SC-R2-C7] 真相源变化(schema.properties.schema_version.const)→ dispatch-contract 与 verdict-validate 双侧同步跟着变', () => {
   const schemaPath = fileURLToPath(new URL('../schemas/review-verdict.schema.json', import.meta.url));
   const original = readFileSync(schemaPath, 'utf8');
+  // 变异前的当前版本（模块级 LIVE_SCHEMA 在变异前读取）——「旧值」从真相源派生，不手拄字面量
+  const originalVersion = LIVE_SCHEMA.properties.schema_version.const;
   try {
     const mutatedSchema = JSON.parse(original);
     mutatedSchema.properties.schema_version.const = 'v9-MUTATION-TEST';
     writeFileSync(schemaPath, JSON.stringify(mutatedSchema, null, 2) + '\n');
     const probe = `
 import { contractSpec } from '${DC_URL}';
-import { validateVerdict } from '${VV_URL}';
+import { validateVerdict, SCHEMA_VERSION } from '${VV_URL}';
 try {
   const spec = contractSpec({ seat: 'claude-adversarial', round: 1 });
   const base = { reviewer: 'claude-adversarial', run_status: 'ok', round: 1, attempt: 1,
@@ -305,7 +311,7 @@ try {
     hardening_coverage: Array.from({ length: ${HARDENING_CLASS_COUNT} }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: 'scripts/x.mjs:' + (i + 1) }))
   };
   const vFollowing = { ...base, schema_version: spec.verdict_schema_version };
-  const vStale = { ...base, schema_version: 'v3' };
+  const vStale = { ...base, schema_version: '${originalVersion}' };
   console.log(JSON.stringify({
     specVersion: spec.verdict_schema_version,
     followingErrs: validateVerdict(vFollowing),
@@ -335,7 +341,7 @@ t('[SC-R2-C8] 真相源变化(attempt.minimum / hardening n_a evidence.minLength
     writeFileSync(schemaPath, JSON.stringify(mutatedSchema, null, 2) + '\n');
     const probe = `
 import { contractSpec } from '${DC_URL}';
-import { validateVerdict } from '${VV_URL}';
+import { validateVerdict, SCHEMA_VERSION } from '${VV_URL}';
 try {
   const spec = contractSpec({ seat: 'claude-adversarial', round: 1 });
   const faces = ['A','B','C','D','E','F','G'].map((face) => ({ face, result: 'pass', evidence: 'e' }));
@@ -531,14 +537,14 @@ t('[SC-R3-F2-reverse] 反向变异: 去掉顶层未知字段检查循环 → out
     ok(original.includes(loopBlock), '前置条件: 源码须含预期的顶层未知字段检查循环（探针按此字符串定位变异点）');
     writeFileSync(vvPath, original.split(loopBlock).join(''));
     const probe = `
-import { validateVerdict } from '${VV_URL}';
+import { validateVerdict, SCHEMA_VERSION } from '${VV_URL}';
 try {
   const HARDENING_CLASS_COUNT = ${HARDENING_CLASS_COUNT};
   const HARDENING_CHECKLIST_VERSION = ${HARDENING_CHECKLIST_VERSION};
   const FULL_FACES = ['A','B','C','D','E','F','G'].map((f) => ({ face: f, result: f === 'B' ? 'n_a' : 'pass', evidence: f + ' 面走查完成' }));
   const FULL_HARDENING = Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: 'x.mjs:' + (i + 1) + ' 第' + (i + 1) + '类核对完成' }));
   const v = {
-    schema_version: 'v3', reviewer: 'claude-adversarial', run_status: 'ok', round: 1, attempt: 1,
+    schema_version: SCHEMA_VERSION, reviewer: 'claude-adversarial', run_status: 'ok', round: 1, attempt: 1,
     base_sha: 'a'.repeat(40), candidate_sha: 'b'.repeat(40), review_input_hash: 'e'.repeat(64),
     faces: FULL_FACES, findings: [], gate_checks: [], verdict: 'APPROVED', closed_finding_ids: [],
     hardening_coverage: FULL_HARDENING, checklist_version: HARDENING_CHECKLIST_VERSION,
@@ -564,14 +570,14 @@ t('[SC-R3-F6-reverse] 反向变异: 去掉 finding 级未知字段检查循环 �
     ok(original.includes(loopBlock), '前置条件: 源码须含预期的 finding 级未知字段检查循环（探针按此字符串定位变异点）');
     writeFileSync(vvPath, original.split(loopBlock).join(''));
     const probe = `
-import { validateVerdict } from '${VV_URL}';
+import { validateVerdict, SCHEMA_VERSION } from '${VV_URL}';
 try {
   const HARDENING_CLASS_COUNT = ${HARDENING_CLASS_COUNT};
   const HARDENING_CHECKLIST_VERSION = ${HARDENING_CHECKLIST_VERSION};
   const FULL_FACES = ['A','B','C','D','E','F','G'].map((f) => ({ face: f, result: f === 'B' ? 'n_a' : 'pass', evidence: f + ' 面走查完成' }));
   const FULL_HARDENING = Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: 'x.mjs:' + (i + 1) + ' 第' + (i + 1) + '类核对完成' }));
   const v = {
-    schema_version: 'v3', reviewer: 'claude-adversarial', run_status: 'ok', round: 1, attempt: 1,
+    schema_version: SCHEMA_VERSION, reviewer: 'claude-adversarial', run_status: 'ok', round: 1, attempt: 1,
     base_sha: 'a'.repeat(40), candidate_sha: 'b'.repeat(40), review_input_hash: 'e'.repeat(64),
     faces: FULL_FACES, gate_checks: [], verdict: 'APPROVED', closed_finding_ids: [],
     hardening_coverage: FULL_HARDENING, checklist_version: HARDENING_CHECKLIST_VERSION,
@@ -587,6 +593,17 @@ try {
   } finally {
     writeFileSync(vvPath, original);
   }
+});
+
+t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生，不得残留 verdict schema_version 字面量（照 [SC-12] 写法）', () => {
+  // 2026-08-07: verdict schema 版本改从 verdict-validate.mjs 导出的 SCHEMA_VERSION 派生。
+  // artifact schema 版本（B 类）等 batch-txn 的 ARTIFACT_SCHEMA_VERSION 落地再改；sc_manifest/
+  // fix_plan 的 schema_version 是另一套协议，不在此列。例外: [SC-R2-C1] 的回归锚点 eq(expected,'v3')
+  // 是有意锚定历史版本（迁移断点），已加注释，不在本自检范围。
+  const own = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  ok(/schema_version: SCHEMA_VERSION, reviewer/.test(own), '本文件 verdict 构造必须用 SCHEMA_VERSION 派生常量');
+  const lit = "schema_version: 'v" + "[0-9]', reviewer";
+  ok(!own.includes(lit), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
 });
 
 console.log(`\n========== i9-docs fixtures: ${pass} passed, ${failCount} failed ==========`);
