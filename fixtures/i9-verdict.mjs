@@ -103,6 +103,30 @@ t('[SC-5] hardening_coverage.evidence 不含"路径:行号" → 拒；含则过'
   eq(validateVerdict(good).length, 0, '合法 evidence 格式应零错误: ' + JSON.stringify(validateVerdict(good)));
 });
 
+// ========== SC-5b：n_a 不强制路径:行号（否则逼审查席造假锚点），covered 仍强制 ==========
+function withResult(index, result, evidence) {
+  return FULL_HARDENING.map((it, i) => (i === index ? { class_id: it.class_id, result, evidence } : it));
+}
+
+t('[SC-5b-1] result=n_a + 合法说明文本（无路径:行号）→ 过', () => {
+  const v = mkVerdict('claude-adversarial', {
+    hardening_coverage: withResult(3, 'n_a', '本 PR 无并发/异步改动，该类无适用面')
+  });
+  eq(validateVerdict(v).length, 0, 'n_a + 合法说明应零错误: ' + JSON.stringify(validateVerdict(v)));
+});
+
+t('[SC-5b-2] result=n_a + 敷衍短文本 → 拒', () => {
+  const v = mkVerdict('claude-adversarial', { hardening_coverage: withResult(3, 'n_a', '无') });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /（n_a）的 evidence 过短/.test(e)), '必须报 n_a evidence 过短: ' + JSON.stringify(errs));
+});
+
+t('[SC-5b-3] result=covered + 无路径:行号 → 仍拒（SC-5 原意保留，不因分支拆分而漏判）', () => {
+  const v = mkVerdict('claude-adversarial', { hardening_coverage: withResult(3, 'covered', '已仔细核对完成，没有问题') });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /（covered）的 evidence 缺「路径:行号」形态引用/.test(e)), '必须报 covered evidence 格式错误: ' + JSON.stringify(errs));
+});
+
 // ========== SC-6：attempt 字段 ==========
 t('[SC-6-a] attempt 缺失 → 拒', () => {
   ok(validateVerdict(mkVerdict('claude-adversarial', { attempt: undefined })).some((e) => /attempt 非法/.test(e)), 'attempt 缺失必须报错');

@@ -55,11 +55,19 @@ const SEVERITIES = ['blocker', 'major', 'suggestion'];
 const ACTIONABLE_SEVERITIES = ['blocker', 'major'];
 const SHA_RE = /^[0-9a-f]{7,40}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
-// I9-SC-5: hardening_coverage[].evidence 格式校验——须含「路径:行号」形态的引用（如
-// "scripts/verdict-validate.mjs:111"），拒绝纯散文本（如"第1类走查完成"）。只做形状校验，
-// 不做内容核实（本仓拿不到 repoDir，无法验证该路径:行号是否真落在本轮 diff 上——那属于
-// consensus-gate 层，不在此实现）。
+// I9-SC-5: hardening_coverage[].evidence 格式校验，按 result 分支（SC-5b 修复）——
+//   - result==='covered'：声称"已覆盖"，必须给出「路径:行号」形态的引用（如
+//     "scripts/verdict-validate.mjs:111"），拒绝纯散文本（如"第1类走查完成"）。只做形状
+//     校验，不做内容核实（本仓拿不到 repoDir，无法验证该路径:行号是否真落在本轮 diff 上——
+//     那属于 consensus-gate 层，不在此实现）。
+//   - result==='n_a'：声称"本 PR 不涉及该类"，没有对应代码位置——强制假 file:line 只会逼
+//     审查席随便贴一行凑格式，把一句诚实的"不适用"说明变成看似有据的**假锚点**，比不校验
+//     更糟（references/hardening-checklist.md 关于"覆盖 N 类不等于只有 N 类"的同一病灾的
+//     加强版：连"构造了"都变假）。故 n_a 只做最小长度约束（防"无"/"n/a"/"-"这类敷衍），
+//     不强制路径:行号。n_a 的实质性（是否真的不适用）是语义判断，机器判不了，如实交给
+//     审查席负责，不假装堵住"十类全填 n_a 逃避穷举"这个洞。
 const EVIDENCE_LOCATOR_RE = /[\w-]+(?:[./][\w-]+)+:\d+(-\d+)?/;
+const HARDENING_NA_EVIDENCE_MIN_LENGTH = 10;
 // R10-A3/SC-B4: 加固清单类别数与版本单一来源——scripts/lib/hardening-registry.mjs
 // （9→10 迁移见 D5：exact 集合变更，不是新增一条 append，因此同步 bump checklist_version）。
 const HARDENING_RESULTS = ['covered', 'n_a'];
@@ -148,11 +156,17 @@ export function validateVerdict(v, opts = {}) {
         }
         need(HARDENING_RESULTS.includes(item?.result), `hardening_coverage[class_id=${cid}].result 非法: ${item?.result}`);
         need(typeof item?.evidence === 'string' && item.evidence.length > 0, `hardening_coverage[class_id=${cid}] 缺 evidence`);
-        // I9-SC-5: evidence 格式校验——须含「路径:行号」形态引用，纯散文本一律拒（不做内容
-        // 核实，只判形状；见 EVIDENCE_LOCATOR_RE 定义处注释）。
+        // I9-SC-5b: 格式校验按 result 分支（见本文件顶部 EVIDENCE_LOCATOR_RE 定义处注释）——
+        // covered 必须给出「路径:行号」；n_a 没有对应代码位置，不强制路径:行号（否则逼审查席
+        // 造假锚点），只做最小长度防敷衍。result 非 covered/n_a（已在上面报错）时不做此项校验。
         if (typeof item?.evidence === 'string' && item.evidence.length > 0) {
-          need(EVIDENCE_LOCATOR_RE.test(item.evidence),
-            `hardening_coverage[class_id=${cid}] 的 evidence 缺「路径:行号」形态引用（如 "scripts/foo.mjs:42"），得到: ${JSON.stringify(item.evidence)}`);
+          if (item.result === 'covered') {
+            need(EVIDENCE_LOCATOR_RE.test(item.evidence),
+              `hardening_coverage[class_id=${cid}]（covered）的 evidence 缺「路径:行号」形态引用（如 "scripts/foo.mjs:42"），得到: ${JSON.stringify(item.evidence)}`);
+          } else if (item.result === 'n_a') {
+            need(item.evidence.length >= HARDENING_NA_EVIDENCE_MIN_LENGTH,
+              `hardening_coverage[class_id=${cid}]（n_a）的 evidence 过短（<${HARDENING_NA_EVIDENCE_MIN_LENGTH} 字符，疑似敷衍如"无"/"n/a"），得到: ${JSON.stringify(item.evidence)}`);
+          }
         }
       }
       for (let cid = 1; cid <= HARDENING_CLASS_COUNT; cid++) {
