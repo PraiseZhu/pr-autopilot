@@ -867,6 +867,58 @@ t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生、run 
   ok(!new RegExp(rmLit).test(own), '本文件不得残留 run manifest schema_version 字面量（须用 RUN_MANIFEST_SCHEMA_VERSION 派生）');
 });
 
+// ========== [SC-T1a] init CLI --batch opt-in（2026-08-08 派工） ==========
+console.log('\n[SC-T1a] init CLI --batch opt-in：显式传才生效 / 坏输入 fail-closed / 非 batch 对照组');
+function cliInit(batchJson, { expectFail = false } = {}) {
+  // 真实 CLI：写 plan/sc-manifest/source-artifact 临时 JSON，execFileSync node fix-run.mjs init
+  const dT1 = mkdtempSync(join(tmpdir(), 't1a-'));
+  const stateDir = join(dT1, 'state'); mkdirSync(stateDir, { recursive: true });
+  const writeJson = (name, obj) => { const p = join(dT1, name); writeFileSync(p, JSON.stringify(obj)); return p; };
+  const planP = writeJson('plan.json', plan);
+  const scmP = writeJson('scm.json', scManifest);
+  const srcP = writeJson('src.json', srcArtifact);
+  const argv = ['--state-dir', stateDir, '--run-id', 't1a-run', '--repo-dir', repo, '--plan', planP, '--sc-manifest', scmP, '--source-artifact', srcP];
+  if (batchJson !== undefined) argv.push('--batch', batchJson);
+  try {
+    const out = execFileSync('node', [join(S, 'fix-run.mjs'), 'init', ...argv], { encoding: 'utf8' });
+    return { ok: true, out, stateDir };
+  } catch (e) {
+    if (!expectFail) throw e;
+    return { ok: false, err: String(e.stderr ?? e.message) };
+  }
+}
+t('[SC-T1a-1] CLI init --batch 正常：manifest 带 batch 字段 + run-init 事件带 batch + stdout schema 不变', () => {
+  const r = cliInit(JSON.stringify({ batch_id: 't1a-b', frozen_families: [FK1, FK2].sort() }));
+  ok(r.ok, 'CLI init 应成功');
+  const parsed = JSON.parse(r.out);
+  eq(JSON.stringify(Object.keys(parsed).sort()), JSON.stringify(['ok', 'run_id', 'source_candidate'].sort()), 'stdout schema 必须不变（ok/run_id/source_candidate）');
+  const m = readJson(join(r.stateDir, 'run-t1a-run.json'));
+  ok(m.batch && m.batch.batch_id === 't1a-b' && m.batch.status === 'open', 'manifest 必须带 batch 字段（status=open 未收口）');
+  ok(m.events.some((e) => e.kind === 'run-init' && e.batch_id === 't1a-b' && e.frozen_families === 2), 'run-init 事件必须带 batch 字段（扁平 batch_id + frozen_families 数）');
+});
+t('[SC-T1a-2] CLI init --batch 坏输入逐项 fail-closed：JSON 解析失败 / 非对象 / frozen_families 缺失 / 空 / 未知键', () => {
+  const badInputs = [
+    { json: '{bad json', why: 'JSON 解析失败' },
+    { json: JSON.stringify([]), why: '非对象（数组）' },
+    { json: JSON.stringify({ batch_id: 'b' }), why: 'frozen_families 缺失' },
+    { json: JSON.stringify({ batch_id: 'b', frozen_families: [] }), why: 'frozen_families 空' },
+    { json: JSON.stringify({ batch_id: 'b', frozen_families: [FK1], unknown_key: 1 }), why: '未知键' }
+  ];
+  for (const bi of badInputs) {
+    const r = cliInit(bi.json, { expectFail: true });
+    ok(!r.ok, `${bi.why} 必须 fail-closed: ${bi.json}`);
+  }
+});
+t('[SC-T1a-3] 非 batch 对照组：不传 --batch → manifest 无 batch 字段、run-init 事件无 batch、stdout 不变', () => {
+  const r = cliInit(undefined);
+  ok(r.ok, '不传 --batch 应成功');
+  const parsed = JSON.parse(r.out);
+  eq(JSON.stringify(Object.keys(parsed).sort()), JSON.stringify(['ok', 'run_id', 'source_candidate'].sort()), 'stdout schema 不变');
+  const m = readJson(join(r.stateDir, 'run-t1a-run.json'));
+  ok(!('batch' in m), 'manifest 必须无 batch 字段（opt-in 未传 = 两道门整体跳过）');
+  ok(!m.events.some((e) => e.kind === 'run-init' && e.batch), 'run-init 事件必须无 batch 字段');
+});
+
 // 等所有 async 测试完成后再出汇总（t 的 async 支持：主流程不等 Promise 会提前打印）
 await Promise.allSettled(pendingTests);
 console.log(`\n==== i9-batch.mjs: ${pass} passed, ${failCount} failed ====`);

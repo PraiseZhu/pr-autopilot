@@ -81,6 +81,13 @@ export function initRun({ stateDir, runId, repoDir, plan, scManifest, sourceArti
   if (!/^[A-Za-z0-9._-]+$/.test(String(runId))) throw new Error(`runId 非法: ${runId}`);
   if (batch !== undefined) {
     if (!batch || typeof batch !== 'object') throw new Error('batch 参数非法: 必须为对象 { batch_id, frozen_families }（fail-closed）');
+    // SC-T1a: 未知键 fail-closed——批次段是受控协议，新键必须先登记（进 schema/hash/消费端），
+    // 静默忽略未知键会让「拼错键名」变成「批次选项没生效」的静默降级（SC-T1c 变异 A 要拦的形状）。
+    for (const k of Object.keys(batch)) {
+      if (!['batch_id', 'frozen_families'].includes(k)) {
+        throw new Error(`batch 参数含未知键: ${k}（批次段是受控协议，仅 batch_id/frozen_families 合法，fail-closed）`);
+      }
+    }
     if (!/^[A-Za-z0-9._-]+$/.test(String(batch.batch_id ?? ''))) throw new Error(`batch_id 非法: ${batch.batch_id}`);
     if (!Array.isArray(batch.frozen_families) || batch.frozen_families.length === 0) {
       throw new Error('batch.frozen_families 必须是非空数组（批次冻结集为空 = 没有待处置义务，语义不成立，fail-closed）');
@@ -750,7 +757,15 @@ if (isMain(import.meta.url)) {
   try {
     if (mode === 'init') {
       need(['state-dir', 'run-id', 'repo-dir', 'plan', 'sc-manifest', 'source-artifact']);
-      const m = initRun({ stateDir: args['state-dir'], runId: args['run-id'], repoDir: args['repo-dir'], plan: readJson(args.plan), scManifest: readJson(args['sc-manifest']), sourceArtifact: readJson(args['source-artifact']), featureBranch: args['feature-branch'] });
+      // SC-T1a: --batch <json> opt-in——批次事务协议默认关闭，显式传才生效（两道门
+      // batch-closure/push-guard 批次段整体跳过当未传）。坏输入 fail-closed：JSON 解析失败
+      // /非对象在 initRun 的 batch 校验里拒（含未知键），此处只负责把字符串解析成对象。
+      let batchArg = undefined;
+      if (args.batch !== undefined) {
+        try { batchArg = JSON.parse(args.batch); }
+        catch (e) { fail(`--batch 不是合法 JSON: ${e.message}`); }
+      }
+      const m = initRun({ stateDir: args['state-dir'], runId: args['run-id'], repoDir: args['repo-dir'], plan: readJson(args.plan), scManifest: readJson(args['sc-manifest']), sourceArtifact: readJson(args['source-artifact']), featureBranch: args['feature-branch'], batch: batchArg });
       process.stdout.write(JSON.stringify({ ok: true, run_id: m.run_id, source_candidate: m.source_candidate }) + '\n');
     } else if (mode === 'allocate') {
       // D3: --artifact/--sc-manifest 改必填——两个入口同等 fail-closed，不留 legacy 通道。
