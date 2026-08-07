@@ -458,6 +458,137 @@ t('[SC-R2-C6] review-verdict.schema.json 的 invariant description 已同步 val
   ok(!/两对抗席/.test(desc), 'invariant description 不得残留仅两对抗席强制的过期限定（validator 对全部 reviewer 按 severity 强制）');
 });
 
+// ========== [R3-field] out_of_scope_channel 单一真相源 + additionalProperties:false 反向变异 ==========
+// SC-R3-F5: 真相源变化(verdict-validate.mjs 的 OUT_OF_SCOPE_NOTES_FIELD)→ dispatch-contract 的
+// out_of_scope_channel 跟着变（不再各自手拄）。手法同 [SC-R2-C9]/[SC-R2-C10]：物理改磁盘上的
+// verdict-validate.mjs，全新子进程 import 观察，finally 里还原。
+t('[SC-R3-F5] 真相源变化(verdict-validate.mjs 的 OUT_OF_SCOPE_NOTES_FIELD)→ dispatch-contract 的 out_of_scope_channel 跟着变（不再各自手拄）', () => {
+  const vvPath = fileURLToPath(new URL('../scripts/verdict-validate.mjs', import.meta.url));
+  const original = readFileSync(vvPath, 'utf8');
+  try {
+    const fieldLine = "export const OUT_OF_SCOPE_NOTES_FIELD = 'out_of_scope_notes';";
+    ok(original.includes(fieldLine), '前置条件: 源码须含预期的 OUT_OF_SCOPE_NOTES_FIELD 声明（探针按此字符串定位变异点，源码格式变了要同步改这里）');
+    const mutated = original.split(fieldLine).join("export const OUT_OF_SCOPE_NOTES_FIELD = 'r3f5_mutated_channel';");
+    writeFileSync(vvPath, mutated);
+    const probe = `
+import { contractSpec } from '${DC_URL}';
+import { OUT_OF_SCOPE_NOTES_FIELD } from '${VV_URL}';
+try {
+  const spec = contractSpec({ seat: 'claude-adversarial', round: 1 });
+  console.log(JSON.stringify({ OUT_OF_SCOPE_NOTES_FIELD, outOfScopeChannel: spec.out_of_scope_channel }));
+} catch (e) {
+  console.log(JSON.stringify({ __probe_error__: String((e && e.stack) || e) }));
+}
+`;
+    const { OUT_OF_SCOPE_NOTES_FIELD: fieldOut, outOfScopeChannel } = runProbe(probe);
+    eq(fieldOut, 'r3f5_mutated_channel', '前置条件: verdict-validate.mjs 的 OUT_OF_SCOPE_NOTES_FIELD 确实已变异');
+    eq(outOfScopeChannel, 'r3f5_mutated_channel', 'dispatch-contract 的 out_of_scope_channel 必须等于变异后的 OUT_OF_SCOPE_NOTES_FIELD（不是自己另存一份手拄字面值）');
+  } finally {
+    writeFileSync(vvPath, original);
+  }
+});
+
+t('[SC-R3-F5-reverse] 反向变异: dispatch-contract.mjs 的 out_of_scope_channel 改回手拄字面值 → 与真相源变化不再同步', () => {
+  const dcPath = fileURLToPath(new URL('../scripts/dispatch-contract.mjs', import.meta.url));
+  const vvPath = fileURLToPath(new URL('../scripts/verdict-validate.mjs', import.meta.url));
+  const dcOriginal = readFileSync(dcPath, 'utf8');
+  const vvOriginal = readFileSync(vvPath, 'utf8');
+  try {
+    const dcLine = 'out_of_scope_channel: OUT_OF_SCOPE_NOTES_FIELD';
+    ok(dcOriginal.includes(dcLine), '前置条件: dispatch-contract.mjs 须仍从 import 的常量读取（探针按此字符串定位变异点）');
+    const dcMutated = dcOriginal.split(dcLine).join("out_of_scope_channel: 'out_of_scope_notes'");
+    writeFileSync(dcPath, dcMutated);
+    const fieldLine = "export const OUT_OF_SCOPE_NOTES_FIELD = 'out_of_scope_notes';";
+    const vvMutated = vvOriginal.split(fieldLine).join("export const OUT_OF_SCOPE_NOTES_FIELD = 'r3f5rev_mutated_channel';");
+    writeFileSync(vvPath, vvMutated);
+    const probe = `
+import { contractSpec } from '${DC_URL}';
+import { OUT_OF_SCOPE_NOTES_FIELD } from '${VV_URL}';
+try {
+  const spec = contractSpec({ seat: 'claude-adversarial', round: 1 });
+  console.log(JSON.stringify({ OUT_OF_SCOPE_NOTES_FIELD, outOfScopeChannel: spec.out_of_scope_channel }));
+} catch (e) {
+  console.log(JSON.stringify({ __probe_error__: String((e && e.stack) || e) }));
+}
+`;
+    const { OUT_OF_SCOPE_NOTES_FIELD: fieldOut, outOfScopeChannel } = runProbe(probe);
+    eq(fieldOut, 'r3f5rev_mutated_channel', '前置条件: verdict-validate.mjs 的真相源确实已变异');
+    ok(outOfScopeChannel !== fieldOut, '手拄字面值的 dispatch-contract 不会跟着真相源变化——证明 SC-R3-F5 的同步性确实来自 import，不是巧合');
+    eq(outOfScopeChannel, 'out_of_scope_notes', '手拄版本停留在旧字面值');
+  } finally {
+    writeFileSync(dcPath, dcOriginal);
+    writeFileSync(vvPath, vvOriginal);
+  }
+});
+
+// SC-R3-F2/F6 反向变异: 去掉 verdict-validate.mjs 里新增的未知字段拒绝循环 → typo verdict 变回
+// 静默通过（0 errors）——证明 SC-R3-F1/F2/F6-b 的通过真的挂在这段新代码上，不是别处偶然生效。
+t('[SC-R3-F2-reverse] 反向变异: 去掉顶层未知字段检查循环 → out_of_scope_note(typo) 变回 0 errors 静默通过', () => {
+  const vvPath = fileURLToPath(new URL('../scripts/verdict-validate.mjs', import.meta.url));
+  const original = readFileSync(vvPath, 'utf8');
+  try {
+    const loopBlock = "  for (const k of Object.keys(v)) {\n    need(TOP_LEVEL_KEYS.has(k), `verdict 存在未知顶层字段: ${k}（additionalProperties:false，见 schemas/review-verdict.schema.json）`);\n  }\n";
+    ok(original.includes(loopBlock), '前置条件: 源码须含预期的顶层未知字段检查循环（探针按此字符串定位变异点）');
+    writeFileSync(vvPath, original.split(loopBlock).join(''));
+    const probe = `
+import { validateVerdict } from '${VV_URL}';
+try {
+  const HARDENING_CLASS_COUNT = ${HARDENING_CLASS_COUNT};
+  const HARDENING_CHECKLIST_VERSION = ${HARDENING_CHECKLIST_VERSION};
+  const FULL_FACES = ['A','B','C','D','E','F','G'].map((f) => ({ face: f, result: f === 'B' ? 'n_a' : 'pass', evidence: f + ' 面走查完成' }));
+  const FULL_HARDENING = Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: 'x.mjs:' + (i + 1) + ' 第' + (i + 1) + '类核对完成' }));
+  const v = {
+    schema_version: 'v3', reviewer: 'claude-adversarial', run_status: 'ok', round: 1, attempt: 1,
+    base_sha: 'a'.repeat(40), candidate_sha: 'b'.repeat(40), review_input_hash: 'e'.repeat(64),
+    faces: FULL_FACES, findings: [], gate_checks: [], verdict: 'APPROVED', closed_finding_ids: [],
+    hardening_coverage: FULL_HARDENING, checklist_version: HARDENING_CHECKLIST_VERSION,
+    out_of_scope_note: [{ id: 'N1', note: 'x', evidence: 'e', suggested_issue_title: 't' }]
+  };
+  console.log(JSON.stringify({ errCount: validateVerdict(v).length }));
+} catch (e) {
+  console.log(JSON.stringify({ __probe_error__: String((e && e.stack) || e) }));
+}
+`;
+    const { errCount } = runProbe(probe);
+    eq(errCount, 0, '去掉检查循环后，typo 字段必须变回 0 errors（证明 SC-R3-F1/F2 的拒绝真的来自这段代码，不是巧合命中别的检查）');
+  } finally {
+    writeFileSync(vvPath, original);
+  }
+});
+
+t('[SC-R3-F6-reverse] 反向变异: 去掉 finding 级未知字段检查循环 → write_path(typo) 变回 0 errors 静默通过', () => {
+  const vvPath = fileURLToPath(new URL('../scripts/verdict-validate.mjs', import.meta.url));
+  const original = readFileSync(vvPath, 'utf8');
+  try {
+    const loopBlock = "    for (const k of Object.keys(fd)) {\n      need(FINDING_KEYS.has(k), `finding ${fd.id ?? '?'} 存在未知字段: ${k}（findings additionalProperties:false，见 schemas/review-verdict.schema.json）`);\n    }\n";
+    ok(original.includes(loopBlock), '前置条件: 源码须含预期的 finding 级未知字段检查循环（探针按此字符串定位变异点）');
+    writeFileSync(vvPath, original.split(loopBlock).join(''));
+    const probe = `
+import { validateVerdict } from '${VV_URL}';
+try {
+  const HARDENING_CLASS_COUNT = ${HARDENING_CLASS_COUNT};
+  const HARDENING_CHECKLIST_VERSION = ${HARDENING_CHECKLIST_VERSION};
+  const FULL_FACES = ['A','B','C','D','E','F','G'].map((f) => ({ face: f, result: f === 'B' ? 'n_a' : 'pass', evidence: f + ' 面走查完成' }));
+  const FULL_HARDENING = Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: 'x.mjs:' + (i + 1) + ' 第' + (i + 1) + '类核对完成' }));
+  const v = {
+    schema_version: 'v3', reviewer: 'claude-adversarial', run_status: 'ok', round: 1, attempt: 1,
+    base_sha: 'a'.repeat(40), candidate_sha: 'b'.repeat(40), review_input_hash: 'e'.repeat(64),
+    faces: FULL_FACES, gate_checks: [], verdict: 'APPROVED', closed_finding_ids: [],
+    hardening_coverage: FULL_HARDENING, checklist_version: HARDENING_CHECKLIST_VERSION,
+    findings: [{ id: 'F2', primary_face: 'A', severity: 'suggestion', anchor: 'a', anchor_paths: ['x'], evidence: 'e', status: 'open', write_path: ['src/x.ts'] }]
+  };
+  console.log(JSON.stringify({ errCount: validateVerdict(v).length }));
+} catch (e) {
+  console.log(JSON.stringify({ __probe_error__: String((e && e.stack) || e) }));
+}
+`;
+    const { errCount } = runProbe(probe);
+    eq(errCount, 0, '去掉检查循环后，write_path（typo）必须变回 0 errors（证明 SC-R3-F6-b 的拒绝真的来自这段新代码，不是 D2 专项检查碰巧顶上）');
+  } finally {
+    writeFileSync(vvPath, original);
+  }
+});
+
 console.log(`\n========== i9-docs fixtures: ${pass} passed, ${failCount} failed ==========`);
 if (failCount) {
   console.log('failed: ' + failures.join(' | '));

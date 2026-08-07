@@ -1,9 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "pr-autopilot/review-verdict/v3",
-  "title": "三审 reviewer 机器 verdict（计划 §1.1b ⑨；v2 增 anchor_paths/invariant/family_id/checklist_version 机器字段；v3(I9) 增 attempt 字段 + hardening_coverage 覆盖率强制扩展至对抗席全 round + hardening_coverage[].evidence 格式校验）",
+  "title": "三审 reviewer 机器 verdict（计划 §1.1b ⑨；v2 增 anchor_paths/invariant/family_id/checklist_version 机器字段；v3(I9) 增 attempt 字段 + hardening_coverage 覆盖率强制扩展至对抗席全 round + hardening_coverage[].evidence 格式校验；v3(R3-field) 顶层与 findings[] 补 additionalProperties:false）",
   "type": "object",
-  "$comment": "checklist_version 的必填/取值校验是角色条件（同 hardening_coverage，I9 起两者均对对抗席全 round 强制，不再限 round===1）——JSON Schema 表达不了，verdict-validate.mjs 为准。计数与版本单一来源: scripts/lib/hardening-registry.mjs。",
+  "additionalProperties": false,
+  "$comment": "checklist_version 的必填/取值校验是角色条件（同 hardening_coverage，I9 起两者均对对抗席全 round 强制，不再限 round===1）——JSON Schema 表达不了，verdict-validate.mjs 为准。计数与版本单一来源: scripts/lib/hardening-registry.mjs。顶层 additionalProperties:false（R3-field，2026-08-07）: 此前本文件从未声明，且 verdict-validate.mjs 也没有任何拒绝未知顶层字段的机制——实测确认 out_of_scope_notes（复数）typo 成 out_of_scope_note（单数）后 validateVerdict 返回 0 errors，域外真问题静默消失。本声明与 verdict-validate.mjs 新增的 TOP_LEVEL_KEYS 检查（从 properties 派生，同一份 key 集合）配套，不是本文件独立生效——本仓没有 ajv 等 JSON Schema 执行引擎，schema.json 本身只被当数据读取，结构性校验全部由 verdict-validate.mjs 的手写逻辑承担，这份声明是文档真相源，不是可独立运行的校验器。",
   "required": [
     "schema_version", "reviewer", "run_status", "round", "attempt",
     "base_sha", "candidate_sha", "review_input_hash",
@@ -62,7 +63,7 @@
           "status": { "enum": ["open", "closed"] }
         }
       },
-      "$comment": "D2: write_paths/allowed_paths 禁止出现在 finding 上（additionalProperties:false 结构性拒绝 + verdict-validate.mjs 显式校验双重把关）——写入许可只能由脚本从 SC kind 推导，lead/AI 不得自报。invariant/family_id 仅对 actionable（blocker/major）finding 强制必填——JSON Schema 表达不了「severity 条件必填」，verdict-validate.mjs 为准（同 hardening_coverage 的角色/轮次条件同一处理方式）。"
+      "$comment": "D2: write_paths/allowed_paths 禁止出现在 finding 上（additionalProperties:false 结构性拒绝 + verdict-validate.mjs 显式校验双重把关）——写入许可只能由脚本从 SC kind 推导，lead/AI 不得自报。invariant/family_id 仅对 actionable（blocker/major）finding 强制必填——JSON Schema 表达不了「severity 条件必填」，verdict-validate.mjs 为准（同 hardening_coverage 的角色/轮次条件同一处理方式）。R3-field 实测更正: 本行长期声称的「additionalProperties:false 结构性拒绝」此前只是文档承诺——本仓无 ajv，这份声明从未被任何代码执行；把 write_paths 打成 write_path（单数）实测 0 errors 静默放过。verdict-validate.mjs 现已新增 FINDING_KEYS 检查（从本 items.properties 派生）把这份声明变成真实生效的校验，不再只是双重把关里名不副实的一重。"
     },
     "gate_checks": {
       "type": "array",

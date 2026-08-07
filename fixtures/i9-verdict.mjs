@@ -144,6 +144,96 @@ t('[SC-6-d] attempt 合法（≥1 整数）→ 过', () => {
   eq(validateVerdict(mkVerdict('claude-adversarial', { attempt: 7 })).length, 0, 'attempt=7 应过');
 });
 
+// ========== SC-R3-F1/F2/F3: 顶层 additionalProperties:false（out_of_scope_notes 静默丢失事故）==========
+// 修前实测基线（lead 派工包 SC-R3-F1）: 把 out_of_scope_notes（复数）typo 成 out_of_scope_note
+// （单数）后 validateVerdict 返回 0 errors——域外真问题静默消失，且因为该字段本就是可选字段，
+// 缺失/typo 在结构上无法区分，不会在别处触发任何天然警报。下方三条锁住修复后的行为。
+t('[SC-R3-F1] 顶层 out_of_scope_notes typo 成 out_of_scope_note（单数）→ 拒（此前 0 errors 静默丢失）', () => {
+  const v = mkVerdict('claude-adversarial', {
+    out_of_scope_note: [{ id: 'N1', note: '仓库既有问题', evidence: 'e', suggested_issue_title: 't' }]
+  });
+  const errs = validateVerdict(v);
+  ok(errs.length > 0, 'typo 后必须报错（此前静默通过）: ' + JSON.stringify(errs));
+  ok(errs.some((e) => /未知顶层字段: out_of_scope_note（/.test(e)), '必须点名未知字段 out_of_scope_note: ' + JSON.stringify(errs));
+});
+
+t('[SC-R3-F2] 顶层任意未知字段（与 out_of_scope_notes 无关的普通 typo）→ 同样拒（证明是通用机制，不是专门为一个字段名打的补丁）', () => {
+  const v = mkVerdict('claude-adversarial', { r3f2_bogus_field: 'x' });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /未知顶层字段: r3f2_bogus_field（/.test(e)), '必须点名未知字段 r3f2_bogus_field: ' + JSON.stringify(errs));
+});
+
+t('[SC-R3-F3] 合法 verdict（含正确的 out_of_scope_notes 复数 / 或完全不带该可选字段）→ 仍过（新增拒绝不误伤正常路径）', () => {
+  const withNotes = mkVerdict('claude-adversarial', {
+    out_of_scope_notes: [{ id: 'N1', note: '仓库既有问题', evidence: 'e', suggested_issue_title: 't' }]
+  });
+  eq(validateVerdict(withNotes).length, 0, '正确的 out_of_scope_notes（复数）应零错误: ' + JSON.stringify(validateVerdict(withNotes)));
+  const withoutNotes = mkVerdict('claude-adversarial');
+  eq(validateVerdict(withoutNotes).length, 0, '完全不带该可选字段应零错误: ' + JSON.stringify(validateVerdict(withoutNotes)));
+});
+
+// ========== SC-R3-F6: 另三个字段名类项的逐个实测（不凭推理分类）==========
+// close_dual_condition（status/closed_finding_ids）: 均为必填值校验字段——typo 后该字段读到
+// undefined，天然落不进任何合法枚举/类型，实测: fail loud（下方两条锁住证据，登记为可容忍残留，
+// 不需要根治）。
+t('[SC-R3-F6-a1] close_dual_condition: finding.status typo(statuss) → fail loud（可容忍残留，非静默）', () => {
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'suggestion', anchor: 'a', anchor_paths: ['x'], evidence: 'e', statuss: 'closed' }]
+  });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /status 非法/.test(e)), 'status 必填值校验必须 fail loud: ' + JSON.stringify(errs));
+});
+t('[SC-R3-F6-a2] close_dual_condition: 顶层 closed_finding_ids typo(closed_finding_id 单数) → fail loud（可容忍残留，非静默）', () => {
+  const v = mkVerdict('claude-adversarial', { closed_finding_id: ['X'] });
+  delete v.closed_finding_ids;
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /closed_finding_ids 必须是数组/.test(e)), 'closed_finding_ids 必填值校验必须 fail loud: ' + JSON.stringify(errs));
+});
+
+// forbidden_finding_fields（write_paths/allowed_paths）: 精确字符串匹配的禁入检查，typo 后实测
+// 曾是 0 errors 静默放过（D2 写入许可边界失守）——已按 SC-R3-F2 同一机制根治（FINDING_KEYS），
+// 下方锁住修复后的行为，同时保留"仍是同一根因、非各自独立打了补丁"的证据。
+t('[SC-R3-F6-b1] forbidden_finding_fields: write_paths typo(write_path 单数) → 已根治，现在 fail loud（此前静默）', () => {
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F2', primary_face: 'A', severity: 'suggestion', anchor: 'a', anchor_paths: ['x'], evidence: 'e', status: 'open', write_path: ['src/x.ts'] }]
+  });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /未知字段: write_path（/.test(e)), 'write_path（typo）必须被 FINDING_KEYS 拒绝: ' + JSON.stringify(errs));
+});
+t('[SC-R3-F6-b2] forbidden_finding_fields: allowed_paths typo(allowed_path 单数) → 已根治，现在 fail loud（此前静默）', () => {
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F3', primary_face: 'A', severity: 'suggestion', anchor: 'a', anchor_paths: ['x'], evidence: 'e', status: 'open', allowed_path: ['src/x.ts'] }]
+  });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /未知字段: allowed_path（/.test(e)), 'allowed_path（typo）必须被 FINDING_KEYS 拒绝: ' + JSON.stringify(errs));
+});
+t('[SC-R3-F6-b3] forbidden_finding_fields sanity: 正确拼写 write_paths/allowed_paths 仍被 D2 专项检查 + FINDING_KEYS 双重拒绝（新机制不替代旧检查）', () => {
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F2b', primary_face: 'A', severity: 'suggestion', anchor: 'a', anchor_paths: ['x'], evidence: 'e', status: 'open', write_paths: ['src/x.ts'] }]
+  });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /不得提供 write_paths（D2/.test(e)), 'D2 专项检查必须仍在: ' + JSON.stringify(errs));
+  ok(errs.some((e) => /未知字段: write_paths（/.test(e)), 'FINDING_KEYS 检查也命中同一 key（双重把关，无害）: ' + JSON.stringify(errs));
+});
+
+// actionable_required_fields（invariant/family_id）: 均为必填值校验字段（仅 actionable severity
+// 强制），typo 后同样落到 undefined，实测: fail loud（登记为可容忍残留，不需要根治；FINDING_KEYS
+// 新机制额外覆盖，但原有必填值校验本身已经足够）。
+t('[SC-R3-F6-c1] actionable_required_fields: invariant typo(invariants) → fail loud（可容忍残留，非静默）', () => {
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F4', primary_face: 'A', severity: 'blocker', anchor: 'a', anchor_paths: ['x'], evidence: 'e', status: 'open', invariants: 'xxx', family_id: 'fam1' }]
+  });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /缺 invariant 或超长/.test(e)), 'invariant 必填值校验必须 fail loud: ' + JSON.stringify(errs));
+});
+t('[SC-R3-F6-c2] actionable_required_fields: family_id typo(family_ids) → fail loud（可容忍残留，非静默）', () => {
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F5', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['x'], evidence: 'e', status: 'open', invariant: 'inv1', family_ids: 'fam1' }]
+  });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /缺 family_id/.test(e)), 'family_id 必填值校验必须 fail loud: ' + JSON.stringify(errs));
+});
+
 // ========== 汇总 ==========
 console.log(`\n========== i9-verdict fixtures: ${pass} passed, ${failCount} failed ==========`);
 if (failCount) { console.log('failed: ' + failures.join(' | ')); process.exit(1); }

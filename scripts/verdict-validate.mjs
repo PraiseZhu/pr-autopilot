@@ -50,6 +50,29 @@ if (!Number.isInteger(HARDENING_NA_EVIDENCE_MIN_LENGTH)) {
   throw new Error('verdict-validate: 无法从 review-verdict.schema.json 读出 hardening_coverage[n_a].evidence 的 minLength（schema 结构已变，需人工核对派生路径）');
 }
 
+// R3-field-SC-R3-F2（实测事故复现）: 此前 schema.json 顶层未声明 additionalProperties，
+// validateVerdict 也没有任何「拒绝未知顶层字段」的机制——把 out_of_scope_notes（复数）typo 成
+// out_of_scope_note（单数）后 validateVerdict 返回 0 errors，域外真问题静默消失，且因为该字段
+// 本就是可选字段，缺失/typo 在结构上无法区分，不会在别处触发任何天然警报。已知顶层字段集合从
+// schema.properties 派生（单一真相源——新增合法顶层字段只需要出现在 schema.properties 里，
+// 这里自动跟上，不需要另外手改一份清单）。
+export const TOP_LEVEL_KEYS = new Set(Object.keys(REVIEW_VERDICT_SCHEMA.properties ?? {}));
+if (TOP_LEVEL_KEYS.size === 0) {
+  throw new Error('verdict-validate: 无法从 review-verdict.schema.json 读出 properties（schema 结构已变，需人工核对派生路径）');
+}
+
+// R3-field-SC-R3-F6（同一病灶的第二个实测实例）: forbidden_finding_fields（write_paths/
+// allowed_paths）的禁入检查此前是纯精确字符串匹配（见下方 forbidden 循环），把 write_paths 打成
+// write_path（单数）实测同样 0 errors 静默放过——close_dual_condition（status/closed_finding_ids）
+// 与 actionable_required_fields（invariant/family_id）经实测均为必填值校验，typo 必然 fail loud，
+// 不受本次改动影响（证据见 fixtures/i9-verdict.mjs 的 [SC-R3-F6-*] 系列）。已知 finding 字段集合
+// 同样从 schema 派生，拒绝任何不在其中的字段——不再要求精确命中 forbidden 数组里的字面值才报错。
+const FINDING_SCHEMA_PROPS = REVIEW_VERDICT_SCHEMA.properties?.findings?.items?.properties;
+export const FINDING_KEYS = new Set(Object.keys(FINDING_SCHEMA_PROPS ?? {}));
+if (FINDING_KEYS.size === 0) {
+  throw new Error('verdict-validate: 无法从 review-verdict.schema.json 读出 findings.items.properties（schema 结构已变，需人工核对派生路径）');
+}
+
 // SC-11: base∪candidate 的 tracked 文件集（「这是真文件」判据）
 export function trackedPathSet({ repoDir, baseSha, candidateSha }) {
   const set = new Set();
@@ -80,6 +103,11 @@ export function changedPathSet({ repoDir, baseSha, candidateSha }) {
 export const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
 export const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];
 export const FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+// SC-R3-F5: 域外真问题的唯一合法载体字段名——本文件下方 validateVerdict() 里的
+// `v.out_of_scope_notes` 是这个字段名唯一的物理读取点，dispatch-contract.mjs 的
+// out_of_scope_channel 此前在那之外又手拄了一份同一字符串（与 SEATS/ADVERSARIAL/ALL_FACES 曾经
+// 的漂移是同一形状）。改为 import 本常量，不再自己手写字面值。
+export const OUT_OF_SCOPE_NOTES_FIELD = 'out_of_scope_notes';
 const RESULTS = ['pass', 'fail', 'n_a'];
 const SEVERITIES = ['blocker', 'major', 'suggestion'];
 const ACTIONABLE_SEVERITIES = ['blocker', 'major'];
@@ -120,6 +148,11 @@ export function validateVerdict(v, opts = {}) {
 
   need(v && typeof v === 'object', 'verdict 不是对象');
   if (errs.length) return errs;
+  // SC-R3-F2: 顶层未知字段拒绝——见文件顶部 TOP_LEVEL_KEYS 派生说明。不早退（不影响后续检查，
+  // 累积报告即可，同本文件其余 need() 的一贯风格）。
+  for (const k of Object.keys(v)) {
+    need(TOP_LEVEL_KEYS.has(k), `verdict 存在未知顶层字段: ${k}（additionalProperties:false，见 schemas/review-verdict.schema.json）`);
+  }
   need(v.schema_version === SCHEMA_VERSION, `schema_version 必须为 ${SCHEMA_VERSION}，得到 ${v.schema_version}`);
   need(REVIEWERS.includes(v.reviewer), `reviewer 非法: ${v.reviewer}`);
   need(['ok', 'degraded'].includes(v.run_status), `run_status 非法: ${v.run_status}`);
@@ -225,6 +258,13 @@ export function validateVerdict(v, opts = {}) {
   let hasTaxonomyGap = false;
   const seenFindingIds = new Set(); // e2e-consensus 实测缺口: 重复 id 会让一次 close 覆盖多条 finding
   for (const fd of v.findings ?? []) {
+    // SC-R3-F6: finding 未知字段拒绝——把 forbidden_finding_fields 的精确字符串匹配检查（下方
+    // write_paths/allowed_paths 专项循环）升级为「只认 schema 声明的合法字段集合」，两者的
+    // typo/变体（如 write_path 单数）现在都会在这里先被拦住。保留下方专项循环是因为它给出的
+    // 错误信息更精确（点名 D2 的写入许可语义），两者可能同时命中同一 key 报两条错，无害。
+    for (const k of Object.keys(fd)) {
+      need(FINDING_KEYS.has(k), `finding ${fd.id ?? '?'} 存在未知字段: ${k}（findings additionalProperties:false，见 schemas/review-verdict.schema.json）`);
+    }
     need(typeof fd.id === 'string' && fd.id.length > 0, 'finding 缺 id');
     need(!seenFindingIds.has(fd.id), `finding id 重复: ${fd.id}（一次 close 不得覆盖多条）`);
     seenFindingIds.add(fd.id);

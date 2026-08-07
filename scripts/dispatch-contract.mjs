@@ -31,7 +31,8 @@ import {
   HARDENING_NA_EVIDENCE_MIN_LENGTH,
   REVIEWERS,
   ADVERSARIAL,
-  FACES
+  FACES,
+  OUT_OF_SCOPE_NOTES_FIELD
 } from './verdict-validate.mjs';
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from './lib/hardening-registry.mjs';
 
@@ -47,6 +48,11 @@ import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from './lib/harden
 // 这类复发在构造上不可能再发生。
 export const SEATS = REVIEWERS;
 export const ALL_FACES = FACES;
+
+// SC-R3-F5（R3-field，2026-08-07）: out_of_scope_channel 此前在本文件独立手拄字面值
+// 'out_of_scope_notes'，与 verdict-validate.mjs 里 `v.out_of_scope_notes` 的实际读取点是两份
+// 独立数据——同一形状的「一处派生 + 一处手拄」复发风险（同上方 SEATS/ALL_FACES 的治法）。改为
+// import verdict-validate.mjs 导出的 OUT_OF_SCOPE_NOTES_FIELD，不再自己手写。
 
 // issue #9 SC-C（状态模型矛盾修复）：「答」「推」两种处置不再走 status=closed + closed_finding_ids
 // 双条件——那双条件专属仍留在 findings[] 里的「修」「ARCHIVE」两种载体。这两条字面值直接进
@@ -86,7 +92,7 @@ export function contractSpec({ seat, round, requirements } = {}) {
     forbidden_finding_fields: ['write_paths', 'allowed_paths'],
     actionable_required_fields: ['invariant', 'family_id'],
     anchor_paths_max_per_finding: DEFAULT_ANCHOR_PATHS_MAX,
-    out_of_scope_channel: 'out_of_scope_notes'
+    out_of_scope_channel: OUT_OF_SCOPE_NOTES_FIELD
   };
 }
 
