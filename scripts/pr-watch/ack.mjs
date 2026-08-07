@@ -5,13 +5,15 @@ import { existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, dirname, resolve as resolvePath } from 'node:path';
 import { readJson, writeJsonAtomic, parseArgs, fail, nowIso, isMain} from '../lib/common.mjs';
 import { withLock } from '../lib/state-lock.mjs';
-import { stateFileName } from './register.mjs';
+import { resolveStateFile } from './register.mjs';
 import { releaseReserve, settleDispatchBudget } from './budget.mjs';
 import { receiptPath } from './finalize.mjs';
 
 // 审③-F14: 读改写全程持 per-key 锁（与 engine 同一把），防并发丢更新/复活 pending
 export function ackDispatch({ stateDir, owner, repo, prNumber, dispatchId, journalFile }) {
-  const file = join(stateDir, stateFileName(owner, repo, prNumber));
+  // R3 修复: 按身份解析（旧命名文件先迁移）再持新名锁——与 engine/register/finalize 同源
+  const { file: resolvedFile } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  const file = join(stateDir, resolvedFile);
   return withLock(`${file}.lock`, () => {
     if (!existsSync(file)) return { ok: false, reason: '状态文件不存在（可能已销单）' };
     const state = readJson(file);
@@ -50,7 +52,9 @@ export function ackDispatch({ stateDir, owner, repo, prNumber, dispatchId, journ
 // 只读全账本折叠），在 state 锁内调用不产生同锁/异锁嵌套；结算抛错 → state 未被改写、
 // pending 原样保留 → 引擎 at-least-once 重派重跑，幂等收敛（已结算跳过，无半状态）。
 export function settleAndAckDispatch({ stateDir, owner, repo, prNumber, dispatchId, actualUsd = null, journalFile }) {
-  const file = join(stateDir, stateFileName(owner, repo, prNumber));
+  // R3 修复: 同源解析（旧命名文件先迁移），收口路径与 ack/cancel/finalize 一致
+  const { file: resolvedFile } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  const file = join(stateDir, resolvedFile);
   return withLock(`${file}.lock`, () => {
     if (!existsSync(file)) return { ok: false, reason: '状态文件不存在（可能已销单）' };
     const state = readJson(file);
@@ -104,7 +108,9 @@ export function settleAndAckDispatch({ stateDir, owner, repo, prNumber, dispatch
 //   Phase C: 清 pending + 升 generation
 //   任一崩溃点重启后由 engine 的 canceling 恢复分支收敛。
 export function cancelDispatch({ stateDir, owner, repo, prNumber, dispatchId, budgetLedger = null, journalFile }) {
-  const file = join(stateDir, stateFileName(owner, repo, prNumber));
+  // R3 修复: 同源解析（旧命名文件先迁移），取消路径与 ack/complete/finalize 一致
+  const { file: resolvedFile } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  const file = join(stateDir, resolvedFile);
   return withLock(`${file}.lock`, () => {
     if (!existsSync(file)) return { ok: false, reason: '状态文件不存在（可能已销单）' };
     const state = readJson(file);

@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { parseArgs, fail, isMain } from '../../scripts/lib/common.mjs';
 import { evaluate, emptyCursors } from '../../scripts/pr-watch/gate.mjs';
-import { stateFileName } from '../../scripts/pr-watch/register.mjs';
+import { stateFileName, migrateAllLegacyStateFiles, STATE_FILE_NAME_RE } from '../../scripts/pr-watch/register.mjs';
 
 export function probe({ stateDir, queueDir, snapshotCmd, leaseTtlMinutes = 40, hmacKey = null, nowMs = Date.now() }) {
   // 队列有未消费任务（上一班车没送完/晚到回执）→ 有活
@@ -19,8 +19,11 @@ export function probe({ stateDir, queueDir, snapshotCmd, leaseTtlMinutes = 40, h
     return { work: true, why: 'dispatch-queue 有滞留任务' };
   }
   if (!existsSync(stateDir)) return { work: false, why: 'state 目录不存在' };
+  // R3 修复: 与引擎同源——扫描前先迁移旧命名状态文件（mame/_ 等折叠碰撞旧名），
+  // 拒绝（垃圾/冲突）跳过不算有活（引擎会 journal 留痕，不重复触发班车空转）
+  migrateAllLegacyStateFiles(stateDir, null);
   const files = readdirSync(stateDir).filter((f) =>
-    /^[A-Za-z0-9.-]+__[A-Za-z0-9.-]+__\d+\.json$/.test(f) && !f.startsWith('manifest-') && !f.startsWith('receipt-'));
+    STATE_FILE_NAME_RE.test(f) && !f.startsWith('manifest-') && !f.startsWith('receipt-'));
   if (files.length === 0) return { work: false, why: '无在册 PR' };
   for (const f of files) {
     let state;

@@ -21,7 +21,7 @@ import { runConsensusGate, recomputeArtifactHash, familyKeyOf } from '../scripts
 import { checkPushGuard, matchAny, directionCheck, jsonSubset, fastSignaturePayload } from '../scripts/push-guard.mjs';
 import { ciReadiness } from '../scripts/ci-readiness.mjs';
 import { matchUiPaths } from '../scripts/ui-paths/match.mjs';
-import { registerPr, unregisterPr, checkReceipt, stateFileName } from '../scripts/pr-watch/register.mjs';
+import { registerPr, unregisterPr, checkReceipt, stateFileName, legacyStateFileName, parseStateFileName, migrateAllLegacyStateFiles, STATE_FILE_NAME_RE } from '../scripts/pr-watch/register.mjs';
 import { evaluate, emptyCursors } from '../scripts/pr-watch/gate.mjs';
 import { runEngine } from '../scripts/pr-watch/engine.mjs';
 import { ackDispatch, cancelDispatch } from '../scripts/pr-watch/ack.mjs';
@@ -6846,6 +6846,182 @@ t('[SC-T7b-INT-3] 变异还原后回归: consensus-gate 恢复原状后，reuse 
   ], { parentArtifact: r1, repoDir: rD }).artifact;
   eq(r2bad.gate_result, 'fail', '还原后 reuse 自造 key 必须恢复 fail: ' + JSON.stringify(r2bad.fail_reasons ?? []));
   rmSync(dD, { recursive: true, force: true });
+});
+
+// ========== R3: state 文件名单射编码 + 旧命名迁移（2026-08-08 GPT R3） ==========
+console.log('\n[R3] stateFileName 单射（mame/_ vs mame/- 碰撞）+ 旧命名迁移 fail-closed（SC-S1/S2/S3/S4）');
+const r3Dir = mkdtempSync(join(tmpdir(), 'r3-'));
+const r3State = join(r3Dir, 'state');
+const r3Snap = join(r3Dir, 'snap.json');
+mkdirSync(r3State, { recursive: true });
+writeFileSync(join(r3Dir, 'snap.sh'), `#!/bin/sh\ncat "${r3Snap}"\n`);
+writeFileSync(join(r3Dir, 'dispatch-ok.sh'), `#!/bin/sh\ncat >> "${join(r3Dir, 'dispatch.log')}"\necho "" >> "${join(r3Dir, 'dispatch.log')}"\n`);
+execFileSync('chmod', ['+x', join(r3Dir, 'snap.sh')]);
+execFileSync('chmod', ['+x', join(r3Dir, 'dispatch-ok.sh')]);
+const R3 = (over = {}) => ({
+  stateDir: r3State, leaseFile: join(r3Dir, 'lease.json'),
+  snapshotCmd: join(r3Dir, 'snap.sh') + ' {owner} {repo} {pr}',
+  dispatchCmd: join(r3Dir, 'dispatch-ok.sh'),
+  journalFile: join(r3Dir, 'journal.jsonl'),
+  hmacKey: HMAC_KEY,
+  budget: { ledger: join(r3Dir, `budget-${Math.random().toString(36).slice(2)}.jsonl`), cap: 10000, estimate: 1 },
+  repoDirs: { 'mame/_': bizRepo, 'mame/-': bizRepo, 'mame/Repo': bizRepo },
+  ...over
+});
+const r3V2 = (o, r, n, branch = 'fb') => ({
+  schema_version: 'v2', owner: o, repo: r, pr_number: n,
+  branch, push_repo: null, push_remote: 'origin',
+  cursors: null, pending_dispatch: null, first_scan_ack: null, status: 'watching'
+});
+const r3Ack = (o, r, n) => {
+  const st = readJson(join(r3State, stateFileName(o, r, n)));
+  if (st.pending_dispatch) ackDispatch({ stateDir: r3State, owner: o, repo: r, prNumber: n, dispatchId: st.pending_dispatch.dispatch_id });
+};
+
+t('[R3-SC-S1] stateFileName 单射: mame/_ 与 mame/- 不同名；已允许标点两两不碰撞；round-trip 可逆；大小写归一', () => {
+  const fUnd = stateFileName('mame', '_', 7);
+  const fDash = stateFileName('mame', '-', 7);
+  ok(fUnd !== fDash, `mame/_ 与 mame/- 必须不同文件名（v2 clean 折叠碰撞修复）: ${fUnd} vs ${fDash}`);
+  const punct = ['_', '-', '.', '#', '/', 'x.y', 'a-b', 'a_b'];
+  const keys = new Set();
+  for (const p of punct) keys.add(stateFileName('mame', p, 7));
+  eq(keys.size, punct.length, `已允许标点两两不碰撞（${punct.length} 个互异）`);
+  // 可逆 round-trip（含 % 字符、大小写、点段）
+  for (const [o, r, n] of [['mame', '_', 7], ['MAME', '-', 7], ['a%b', 'c#d', 9], ['makecindy', '.github', 3], ['a_b', 'c', 1]]) {
+    const parsed = parseStateFileName(stateFileName(o, r, n));
+    eq([parsed.owner, parsed.repo, parsed.prNumber], [o.toLowerCase(), r.toLowerCase(), n], `round-trip 可逆: ${o}/${r}#${n}`);
+  }
+  // 大小写归一: Mame/Repo#7 与 mame/repo#7 同一身份同一文件（macOS case-insensitive 不互相覆盖）
+  eq(stateFileName('Mame', 'Repo', 7), stateFileName('mame', 'repo', 7), '大小写归一同一文件（GitHub identity 大小写不敏感）');
+  // 无折叠 ASCII 名与 v2 逐字一致（存量普通注册零迁移）
+  eq(stateFileName('o', 'mivo-canvas', 5), 'o__mivo-canvas__5.json', '普通 ASCII 名编码恒等（v2 兼容）');
+  // 段内无裸 `_`（__ 分隔符无歧义）
+  ok(!stateFileName('a_b', 'c', 1).split('__').slice(0, 2).some((s) => s.includes('_')), '段内不含裸 _，__ 分隔无歧义');
+});
+
+t('[R3-SC-S2] register 双仓同 PR 并存: mame/_#301 与 mame/-#301 各自注册不 already 不覆盖；engine 一轮双扫描双派发；内容回验 fail-closed', () => {
+  writeFileSync(r3Snap, JSON.stringify(snapBase));
+  const ra = registerPr({ stateDir: r3State, owner: 'mame', repo: '_', prNumber: 301, branch: 'fa', pushRemote: 'origin' });
+  const rb = registerPr({ stateDir: r3State, owner: 'mame', repo: '-', prNumber: 301, branch: 'fb', pushRemote: 'origin' });
+  ok(!ra.already && !rb.already, '两仓同 PR 必须各自新建（不得 already）');
+  ok(ra.file !== rb.file, '两仓状态文件必须不同路径');
+  ok(existsSync(ra.file) && existsSync(rb.file), '两文件同时存在（不得互相覆盖）');
+  eq(readJson(ra.file).repo, '_', 'mame/_ 状态文件内容 repo=_');
+  eq(readJson(rb.file).repo, '-', 'mame/- 状态文件内容 repo=-');
+  // engine 一轮同时扫描两文件并各自按内容回验
+  writeFileSync(r3Snap, JSON.stringify({ ...snapBase, comments: [{ id: 'q1', body: '请修' }] }));
+  const r = runEngine(R3());
+  eq(r.scanned, 2, 'engine 一轮扫描两文件');
+  eq(r.dispatched.length, 2, '双仓同 PR 各自派发');
+  eq(r.dispatched.map((x) => x.pr).sort(), ['mame/-#301', 'mame/_#301'], '派发身份各自正确');
+  // 内容回验 fail-closed: 把 mame/_ 文件内容换成 mame/- 身份 → 反查不符 → 拒绝不派发
+  const aFile = join(r3State, stateFileName('mame', '_', 301));
+  writeFileSync(aFile, JSON.stringify({ ...readJson(aFile), repo: '-' }));
+  const r2 = runEngine(R3());
+  eq(r2.dispatched.filter((x) => x.pr === 'mame/_#301').length, 0, '内容 identity 不符 → 不派发（回验 fail-closed）');
+  ok(readFileSync(join(r3Dir, 'journal.jsonl'), 'utf8').includes('state-file-rejected'), '内容不符拒绝留痕');
+  writeFileSync(aFile, JSON.stringify({ ...readJson(aFile), repo: '_' }));
+  r3Ack('mame', '_', 301); r3Ack('mame', '-', 301); // 清 pending 防污染后续用例
+});
+
+t('[R3-SC-S2] 大小写归一 register 幂等: Mame/_#307 与 mame/_#307 同一文件 already；mame/-#307 独立', () => {
+  const r1 = registerPr({ stateDir: r3State, owner: 'Mame', repo: '_', prNumber: 307, branch: 'fa', pushRemote: 'origin' });
+  ok(!r1.already, '首注册新建');
+  const r2 = registerPr({ stateDir: r3State, owner: 'mame', repo: '_', prNumber: 307, branch: 'fa', pushRemote: 'origin' });
+  ok(r2.already, '大小写变体同一 GitHub 身份 → already 幂等');
+  eq(r1.file, r2.file, '同一文件（大小写归一）');
+  const r3 = registerPr({ stateDir: r3State, owner: 'mame', repo: '-', prNumber: 307, branch: 'fc', pushRemote: 'origin' });
+  ok(!r3.already && r3.file !== r2.file, 'mame/-#307 与 mame/_#307 不同身份独立文件');
+});
+
+t('[R3-SC-S3] 旧命名迁移: 含折叠字符的 v2 注册被 engine 扫描前原子迁移 + 内容保留 + 正常派发', () => {
+  const legacyName = 'mame__-__302.json'; // v2 clean: mame/_#302
+  writeFileSync(join(r3State, legacyName), JSON.stringify(r3V2('mame', '_', 302)));
+  writeFileSync(r3Snap, JSON.stringify({ ...snapBase, comments: [{ id: 'q2', body: '请修' }] }));
+  const r = runEngine(R3());
+  ok(!existsSync(join(r3State, legacyName)), '旧命名文件已迁移（旧名不再存在）');
+  const newName = stateFileName('mame', '_', 302);
+  eq(newName, 'mame__%5F__302.json', 'mame/_ 的 v3 文件名');
+  ok(existsSync(join(r3State, newName)), `迁移后新命名文件存在: ${newName}`);
+  const migrated = readJson(join(r3State, newName));
+  eq([migrated.owner, migrated.repo, migrated.pr_number], ['mame', '_', 302], '迁移内容保留原始身份（repo 未折叠）');
+  eq(r.dispatched.some((x) => x.pr === 'mame/_#302'), true, '迁移后该 PR 正常派发（不静默漏扫）');
+  ok(readFileSync(join(r3Dir, 'journal.jsonl'), 'utf8').includes('state-file-migrated'), 'journal 留痕 state-file-migrated');
+  r3Ack('mame', '_', 302);
+});
+
+t('[R3-SC-S3] 迁移拒绝 fail-closed: 名实不符垃圾不迁移；迁移目标被不同身份占用 → 冲突拒绝 + 人工恢复提示', () => {
+  // 名实不符垃圾: 旧名 mame__-__303.json 内容身份 repo=x（legacy round-trip 是 mame-x，≠ 文件名）
+  const badName = 'mame__-__303.json';
+  writeFileSync(join(r3State, badName), JSON.stringify(r3V2('mame', 'x', 303)));
+  const r = runEngine(R3());
+  ok(existsSync(join(r3State, badName)), '名实不符垃圾不迁移（原样保留待人工核对）');
+  eq(r.dispatched.some((x) => x.pr === 'mame/x#303'), false, '名实不符不得按内容派发');
+  ok(readFileSync(join(r3Dir, 'journal.jsonl'), 'utf8').includes('state-file-rejected'), '拒绝留痕 state-file-rejected');
+  // 真冲突: 旧名 mame__-__304.json（内容 mame/_#304）迁移目标 mame__%5F__304.json 已被不同身份（mame/-）占用
+  writeFileSync(join(r3State, stateFileName('mame', '_', 304)), JSON.stringify(r3V2('mame', '-', 304, 'fc')));
+  writeFileSync(join(r3State, 'mame__-__304.json'), JSON.stringify(r3V2('mame', '_', 304)));
+  const r2 = runEngine(R3());
+  ok(existsSync(join(r3State, 'mame__-__304.json')), '冲突旧文件保留未动（不静默覆盖）');
+  ok(existsSync(join(r3State, stateFileName('mame', '_', 304))), '占用方文件保留未动');
+  const j2 = readFileSync(join(r3Dir, 'journal.jsonl'), 'utf8');
+  ok(j2.includes('迁移冲突'), '冲突拒绝留痕（含人工恢复提示）');
+  for (const f of [badName, 'mame__-__304.json']) execFileSync('rm', ['-f', join(r3State, f)]);
+});
+
+t('[R3-SC-S3] 迁移合并: 旧名文件与新名文件同一身份（大小写差异残留）→ 删旧合并 + journal 留痕', () => {
+  writeFileSync(join(r3State, stateFileName('mame', '_', 305)), JSON.stringify(r3V2('mame', '_', 305)));
+  const oldUp = 'Mame__-__305.json'; // 大写 owner 的旧命名（legacy clean 保留大小写）
+  writeFileSync(join(r3State, oldUp), JSON.stringify(r3V2('Mame', '_', 305)));
+  const r = runEngine(R3());
+  ok(!existsSync(join(r3State, oldUp)), '同一身份重复 → 旧文件已合并删除');
+  ok(existsSync(join(r3State, stateFileName('mame', '_', 305))), '新名文件保留');
+  ok(readFileSync(join(r3Dir, 'journal.jsonl'), 'utf8').includes('state-file-merged'), '合并留痕 state-file-merged');
+});
+
+t('[R3-SC-S3] register 触发迁移: 旧命名文件被 registerPr 解析迁移 + already 幂等；不同身份独立注册', () => {
+  const legacyName = 'mame__-__306.json';
+  writeFileSync(join(r3State, legacyName), JSON.stringify(r3V2('mame', '_', 306)));
+  const r = registerPr({ stateDir: r3State, owner: 'mame', repo: '_', prNumber: 306, branch: 'fb', pushRemote: 'origin' });
+  ok(r.already, '旧文件迁移后 register 幂等 already（同一身份）');
+  ok(!existsSync(join(r3State, legacyName)), 'register 路径旧名已迁移');
+  ok(existsSync(join(r3State, stateFileName('mame', '_', 306))), 'register 路径新名存在');
+  const r2 = registerPr({ stateDir: r3State, owner: 'mame', repo: '-', prNumber: 306, branch: 'fc', pushRemote: 'origin' });
+  ok(!r2.already && r2.file !== r.file, 'mame/-#306 与 mame/_#306 独立（不得 already/覆盖）');
+  eq(r2.file, join(r3State, 'mame__-__306.json'), 'mame/- 的新名文件');
+});
+
+t('[R3-SC-S2] receipt 路径同源: 旧命名 receipt 随 manifest dispatch_id 原子迁移；dispatch 不符不迁移', () => {
+  const manifest = { owner: 'mame', repo: '_', pr_number: 308, dispatch_id: 'rec-abc-123', branch: 'fb', remote: 'origin', original_head: SHA_A };
+  const legacyReceipt = `receipt-${legacyStateFileName('mame', '_', 308)}`;
+  writeFileSync(join(r3State, legacyReceipt), JSON.stringify({
+    phase: 'committed', dispatch_id: 'rec-abc-123', original_head: SHA_A,
+    candidate: SHA_B, remote: 'origin', branch: 'fb', at: new Date().toISOString()
+  }));
+  const rp = receiptPath(r3State, manifest);
+  eq(rp, join(r3State, `receipt-${stateFileName('mame', '_', 308)}`), 'receipt 迁移到新命名路径');
+  ok(!existsSync(join(r3State, legacyReceipt)), '旧 receipt 已迁移');
+  eq(readJson(rp).dispatch_id, 'rec-abc-123', 'receipt 内容保留（recoverFromReceipt 全字段绑定不变）');
+  // dispatch 不符 → 不迁移（fail-closed: 不猜身份）
+  const legacyReceipt2 = `receipt-${legacyStateFileName('mame', '_', 309)}`;
+  writeFileSync(join(r3State, legacyReceipt2), JSON.stringify({
+    phase: 'intent', dispatch_id: 'rec-other', original_head: SHA_A,
+    candidate: SHA_B, remote: 'origin', branch: 'fb', at: new Date().toISOString()
+  }));
+  const rp2 = receiptPath(r3State, { ...manifest, pr_number: 309, dispatch_id: 'rec-x' });
+  ok(existsSync(join(r3State, legacyReceipt2)), 'dispatch 不符 → 旧 receipt 不迁移');
+  eq(rp2, join(r3State, `receipt-${stateFileName('mame', '_', 309)}`), '返回新名（complete 自然失败留痕）');
+  for (const f of [legacyReceipt2]) execFileSync('rm', ['-f', join(r3State, f)]);
+});
+
+t('[R3-SC-S4] 目录级迁移汇总: migrateAllLegacyStateFiles 统计 migrated/rejected', () => {
+  writeFileSync(join(r3State, 'mame__-__401.json'), JSON.stringify(r3V2('mame', '_', 401)));
+  writeFileSync(join(r3State, 'mame__-__402.json'), JSON.stringify(r3V2('mame', 'x', 402)));
+  const m = migrateAllLegacyStateFiles(r3State, join(r3Dir, 'journal.jsonl'));
+  ok(m.migrated >= 1, `迁移统计 migrated>=1（got ${m.migrated}）`);
+  ok(m.rejected >= 1, `拒绝统计 rejected>=1（got ${m.rejected}）`);
+  ok(existsSync(join(r3State, 'mame__%5F__401.json')), 'mame/_#401 已迁移到新名');
+  for (const f of ['mame__-__401.json', 'mame__-__402.json']) execFileSync('rm', ['-f', join(r3State, f)]);
 });
 
 // ========== 汇总 + SKIPPED ==========

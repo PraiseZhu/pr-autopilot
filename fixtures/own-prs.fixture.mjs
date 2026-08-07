@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { writeJsonAtomic } from '../scripts/lib/common.mjs';
-import { stateFileName } from '../scripts/pr-watch/register.mjs';
+import { stateFileName, STATE_FILE_NAME_RE } from '../scripts/pr-watch/register.mjs';
 import { parseRepo } from '../deploy/wrappers/own-prs.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
@@ -284,17 +284,21 @@ eq(r11.status, 0, 'S11 mame/_ reconcile exit 0');
 eq(o11.registered, ['mame/_#301', 'mame/_#302'], 'S11 mame/_ 两条 registered（302 fork 绑定 PrinceRpz23/-）');
 eq(o11.dropped, [], 'S11 mame/_ 无 dropped');
 
-// SC-R2: state filename 可扫描——文件名由 stateFileName 生成（`_`/`-` 段 clean 到 `-`），
-// 必须匹配 engine.mjs runEngine 的扫描 grammar（同款 regex）且内容反查 round-trip 一致，
-// 否则 engine scan 会跳过该 state（不可扫描状态）。
-const ENGINE_STATE_SCAN_RE = /^[A-Za-z0-9.-]+__[A-Za-z0-9.-]+__\d+\.json$/; // 与 engine.mjs runEngine 同款
+// SC-R2: state filename 可扫描——文件名由 stateFileName 生成（v3 单射编码:
+// encodeURIComponent + `_`→`%5F` 补转义，段内字符集 {A-Za-z0-9.%!~*'()-} 无裸 `_`），
+// 必须匹配 engine.mjs runEngine 的扫描 grammar（同源常量 STATE_FILE_NAME_RE）且内容
+// 反查 round-trip 一致，否则 engine scan 会跳过该 state（不可扫描状态）。
+// R3 修复: v2 clean 折叠把 mame/_ 与 mame/- 都编成 mame__-__301.json（碰撞覆盖）；
+// v3 下两者不同名、`-` 段保留原样、`_` 段编码 %5F，各自独立可扫描。
 const f301 = stateFileName('mame', '_', 301);
-ok(ENGINE_STATE_SCAN_RE.test(f301), `S11 state 文件名匹配 engine 扫描 grammar: ${f301}`);
-eq(f301, 'mame__-__301.json', 'S11 `_` repo 段在 state 文件名 clean 成 `-`（可扫描字符集内）');
+ok(STATE_FILE_NAME_RE.test(f301), `S11 state 文件名匹配 engine 扫描 grammar: ${f301}`);
+eq(f301, 'mame__%5F__301.json', 'S11 `_` repo 段编码为 %5F（段内无裸 `_`，__ 分隔无歧义）');
+ok(stateFileName('mame', '-', 301) !== f301, 'S11 mame/_ 与 mame/- 编码后文件名不同（v3 单射，碰撞修复）');
+eq(stateFileName('mame', '-', 301), 'mame__-__301.json', 'S11 `-` 段保留原样（encodeURIComponent safe set，可扫描字符集内）');
 const s301 = JSON.parse(readFileSync(join(gd, 'state-punct', f301), 'utf8'));
 eq(stateFileName(s301.owner, s301.repo, s301.pr_number), f301, 'S11 内容反查 stateFileName 一致（engine 接受该文件）');
 const f401 = stateFileName('PrinceRpz23', '-', 401);
-ok(ENGINE_STATE_SCAN_RE.test(f401), `S11 dash repo state 文件名匹配 engine 扫描 grammar: ${f401}`);
+ok(STATE_FILE_NAME_RE.test(f401), `S11 dash repo state 文件名匹配 engine 扫描 grammar: ${f401}`);
 const r11b = reconcile(PRINCE_PUNCT, join(gd, 'state-prince'), mapPunct);
 const o11b = JSON.parse(r11b.out.split('\n').filter((l) => l.startsWith('{'))[0] ?? '{}');
 eq(r11b.status, 0, 'S11 PrinceRpz23/- reconcile exit 0');

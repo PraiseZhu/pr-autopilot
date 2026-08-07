@@ -14,7 +14,7 @@ import { execFileSync } from 'node:child_process';
 import { readJson, writeJsonAtomic, parseArgs, fail, nowIso, sha256, canonicalJson, isMain} from '../lib/common.mjs';
 import { withLock } from '../lib/state-lock.mjs';
 import { evaluate, emptyCursors } from './gate.mjs';
-import { unregisterPr, stateFileName } from './register.mjs';
+import { unregisterPr, stateFileName, migrateAllLegacyStateFiles, STATE_FILE_NAME_RE } from './register.mjs';
 import { reserveBudget, releaseReserve } from './budget.mjs';
 import { cleanupRemoteBranch } from './branch-cleanup.mjs';
 import { send as routeNotify } from './notify-router.mjs';
@@ -92,13 +92,15 @@ export function runEngine(cfg) {
   writeJsonAtomic(leaseFile, { last_success: nowIso(), pid: process.pid });
 
   if (!existsSync(stateDir)) mkdirSync(stateDir, { recursive: true });
-  // 审⑤-I3: 只认与 stateFileName 严格同文法的文件（三段、字符集受限、无前缀杂质），
-  // 读取后再反查 stateFileName(owner,repo,pr)===文件名——garbage__5.json 之类不进扫描
+  // R3 修复: 扫描前先做旧命名迁移（SC-S3）——含折叠字符的 v2 注册（mame/_、mame/- 等）
+  // 先原子迁移到 v3 单射编码名；名实不符/冲突拒绝留痕（journal），绝不静默漏扫。
+  // 迁移后再按 v3 文法过滤——garbage__5.json 之类（两段/杂质）不进扫描。
+  const migSummary = migrateAllLegacyStateFiles(stateDir, journalFile);
   const files = readdirSync(stateDir).filter((f) =>
-    /^[A-Za-z0-9.-]+__[A-Za-z0-9.-]+__\d+\.json$/.test(f) && !f.startsWith('manifest-') && !f.startsWith('receipt-'));
-  if (files.length === 0) return { scanned: 0, dispatched: [], redispatched: [], terminal: [], stuck: [], paused: false, quiet: true };
+    STATE_FILE_NAME_RE.test(f) && !f.startsWith('manifest-') && !f.startsWith('receipt-'));
+  if (files.length === 0) return { scanned: 0, migrated: migSummary.migrated, rejected: migSummary.rejected, dispatched: [], redispatched: [], terminal: [], stuck: [], paused: false, quiet: true };
 
-  const out = { scanned: files.length, dispatched: [], redispatched: [], terminal: [], stuck: [], paused: false, quiet: false };
+  const out = { scanned: files.length, migrated: migSummary.migrated, rejected: migSummary.rejected, dispatched: [], redispatched: [], terminal: [], stuck: [], paused: false, quiet: false };
 
   for (const f of files) {
     const path = join(stateDir, f);

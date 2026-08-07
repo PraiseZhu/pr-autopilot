@@ -247,6 +247,7 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
 - **`stuck` / `pending-stuck` 的路由（T3 定案，`notify-router.mjs` 的 `route()`/`isCindyRepo()`）**：以 **canonical owner/repo 判 cindy**（2026-08-08 GPT 审查修复，不再用裸 repo 名子串猜身份）——**cindy 仓（引擎传 `${owner}/${repo}` 全名，判据 = `makecindy/cindy`）→ `silent`（不产生任何通知，只记 journal）**；**其他仓（如 `xindong/mivo-canvas`、`PraiseZhu/pr-autopilot`）→ `feishu` 通道**。兼容旧调用：只传裸 repo 名（如 `cindy`）时判据为字面 `cindy`。pending-stuck 与 stuck 同通道、不落 ROUTES 表（否则 null 值会撞「未知事件类型」fail-closed）。「卡死无人知」在 cindy 仓是设计行为（W-6: cindy PR 卡死不打扰），不是漏配。
 - **部署动作**：接进 schedule 前**先手动跑一次**确认拿到 0 或 2；拿到 1 说明参数/调用姿势错了，fail-open 不会救你。
 - 它的判定**复用引擎同源模块**（`gate.evaluate` / `stateFileName` 文法），信号逻辑与引擎是**同一套**——自己另写一个探针等于造第二套判定，两套迟早不一致（探针说有活、引擎说没活，或反过来），凭空多一个故障面。
+- **状态文件名 = v3 单射编码（2026-08-08 GPT R3 修复）**：`stateFileName(owner, repo, pr)` 段内容 = `encodeURIComponent(lower(段))` 再补转义 `_`→`%5F`——段内字符集 `{A-Za-z0-9.%!~*'()-}` 无裸 `_`，`__` 分隔无歧义，`mame/_` 与 `mame/-` 等任意已允许标点不碰撞；大小写归一（GitHub identity 大小写不敏感 + macOS APFS 大小写不敏感双保险）。**升级兼容**：无折叠字符的 ASCII 名（`o/mivo-canvas`）文件名与 v2 逐字一致、零迁移；含折叠字符的旧注册（`mame__-__7.json` 之类）由 engine/probe 扫描前与 register/ack/finalize 按身份解析时**自动原子迁移**（`migrateLegacyStateFile`）——旧命名文件迁移后照常派发，名实不符垃圾/迁移目标身份冲突则 journal 拒绝并留人工恢复提示，绝不静默漏扫或覆盖。旧 receipt 同理随 `manifest.dispatch_id` 二次校验迁移（`receiptPath`）。
 
 **④ 多实例部署（2026-08-07 从外部部署者真实踩坑回填）**
 

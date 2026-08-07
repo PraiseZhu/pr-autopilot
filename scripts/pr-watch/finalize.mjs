@@ -6,12 +6,12 @@
 //   ③ original_head..HEAD 的 diff 不碰 CI 路径（git diff -z）
 //   ④ remote 必须已配置、branch 合法、固定普通 refspec（复用 push-guard F3 规则）
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { readJson, writeJsonAtomic, parseArgs, fail, isMain } from '../lib/common.mjs';
 import { join as joinPath } from 'node:path';
-import { stateFileName } from './register.mjs';
+import { stateFileName, legacyStateFileName, resolveStateFile } from './register.mjs';
 import { matchAny } from '../push-guard.mjs';
 import { validateRemoteBranch } from '../lib/git-checks.mjs';
 import { withLock } from '../lib/state-lock.mjs';
@@ -64,8 +64,26 @@ export function checkFinalize({ repoDir, manifest, snapshot, constitution }) {
 }
 
 // 审④-F4: push 成功后原子写不可变 receipt——complete 只认 receipt，candidate 不再自报
+// R3 修复: receipt 路径与 stateFileName 同源（SC-S2: ack/finalize/complete/receipt 全链一致）。
+// 新名存在 → 直接用；否则旧名存在 → dispatch_id 二次校验（receipt 无 owner/repo 字段，
+// 身份由 manifest 携带、dispatch_id 是唯一绑定键，与 recoverFromReceipt 同判据）——
+//   相同 → 原子迁移（旧命名 receipt 跟随身份升级，complete 收口路径不因升级断链）；
+//   不同/损坏 → 不迁移（complete 自然失败留痕，fail-closed 不猜）。
+// 调用方无 dispatch_id（cancel 只读核对）→ 返回存在的旧 receipt 路径供 existsSync 检查。
 export function receiptPath(stateDir, manifest) {
-  return joinPath(stateDir, `receipt-${stateFileName(manifest.owner, manifest.repo, manifest.pr_number)}`);
+  const newPath = joinPath(stateDir, `receipt-${stateFileName(manifest.owner, manifest.repo, manifest.pr_number)}`);
+  if (existsSync(newPath)) return newPath;
+  const legacyPath = joinPath(stateDir, `receipt-${legacyStateFileName(manifest.owner, manifest.repo, manifest.pr_number)}`);
+  if (!existsSync(legacyPath)) return newPath;
+  if (!manifest.dispatch_id) return legacyPath; // 只读核对场景（ack.mjs cancel）
+  try {
+    const rec = readJson(legacyPath);
+    if (rec.dispatch_id === manifest.dispatch_id) {
+      renameSync(legacyPath, newPath); // 同目录原子迁移，recoverFromReceipt 全字段绑定不变
+      return newPath;
+    }
+  } catch { /* 损坏 → 不迁移 */ }
+  return newPath;
 }
 
 // 审⑤-F1: 两段 receipt 协议——push 前原子写 intent（记 candidate），push 后升 committed。
@@ -110,7 +128,12 @@ if (isMain(import.meta.url)) {
   //   cancel 先 → pending 被清 → 本处 push 前核对失败，旧 manifest 到不了远端；
   //   finalize 先 → intent receipt 已落盘 → cancel 见 receipt fail-closed。
   const rp = receiptPath(args['state-dir'], manifest);
-  const stateFile = joinPath(args['state-dir'], stateFileName(manifest.owner, manifest.repo, manifest.pr_number));
+  // R3 修复: 状态文件同源解析——旧命名文件先迁移，pending 核对才能在升级后命中旧注册
+  const { file: resolvedStateFile } = resolveStateFile({
+    stateDir: args['state-dir'], owner: manifest.owner, repo: manifest.repo,
+    prNumber: manifest.pr_number, journalFile: args.journal ?? null
+  });
+  const stateFile = joinPath(args['state-dir'], resolvedStateFile);
   const outcome = withLock(`${stateFile}.lock`, () => {
     // 审⑤-F1: 恢复分支优先——上次 push 成功但 committed 升级前崩溃时，
     // intent receipt + 远端 head==candidate 即可幂等补升，不再被 CAS 永拒。
