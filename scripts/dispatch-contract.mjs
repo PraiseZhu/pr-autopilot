@@ -22,40 +22,28 @@
 //   疏忽；它**不**保证审查席真的按契约填报（那由 verdict-validate 在收卷时拦），也**不**防
 //   恶意伪造派工包文本。如实声明，不冒称。
 
-import { parseArgs, fail, isMain, sha256, canonicalJson, readJson } from './lib/common.mjs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { DEFAULT_REQUIREMENTS, DEFAULT_ANCHOR_PATHS_MAX } from './verdict-validate.mjs';
+import { parseArgs, fail, isMain, sha256, canonicalJson } from './lib/common.mjs';
+import {
+  DEFAULT_REQUIREMENTS,
+  DEFAULT_ANCHOR_PATHS_MAX,
+  SCHEMA_VERSION,
+  ATTEMPT_MIN,
+  HARDENING_NA_EVIDENCE_MIN_LENGTH,
+  REVIEWERS,
+  ADVERSARIAL
+} from './verdict-validate.mjs';
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from './lib/hardening-registry.mjs';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-
-// verdict_schema_version / attempt 下限 / hardening_coverage[result=n_a].evidence 最小长度——
-// 三者的单一真相源是 schemas/review-verdict.schema.json 本身。verdict-validate.mjs 把
-// schema_version 判等写成字面量比较（`v.schema_version === 'v3'`）、把 attempt 下限与 n_a 最小
-// 长度写成本地未导出常量，本文件不越权改 verdict-validate.mjs（不在本次改动范围），改从两者
-// 共同的输入——schema 文件——派生，避免手拄第三份。R2-P1 blocker 实测教训：本文件此前手拄
-// 'v2'，validator 早已只收 'v3'，两份数据各自漂移、直到收卷才炸；这条派生关系就是修复本体。
-const REVIEW_VERDICT_SCHEMA = readJson(join(HERE, '../schemas/review-verdict.schema.json'));
-// 导出这三个派生常量（不只留局部变量）：下游 fixture/文档需要断言「hardening/attempt 相关值
-// 等于当前真相源」时，import 这里的常量而不是各自重算或手拄——否则又制造第三份字面值。
-export const SCHEMA_VERSION = REVIEW_VERDICT_SCHEMA.properties?.schema_version?.const;
-export const ATTEMPT_MIN = REVIEW_VERDICT_SCHEMA.properties?.attempt?.minimum;
-export const HARDENING_NA_EVIDENCE_MIN_LENGTH = REVIEW_VERDICT_SCHEMA.properties?.hardening_coverage?.items?.allOf
-  ?.find((clause) => clause?.if?.properties?.result?.const === 'n_a')
-  ?.then?.properties?.evidence?.minLength;
-if (typeof SCHEMA_VERSION !== 'string' || !SCHEMA_VERSION) {
-  throw new Error('dispatch-contract: 无法从 review-verdict.schema.json 读出 schema_version.const（schema 结构已变，需人工核对派生路径）');
-}
-if (!Number.isInteger(ATTEMPT_MIN)) {
-  throw new Error('dispatch-contract: 无法从 review-verdict.schema.json 读出 attempt.minimum（schema 结构已变，需人工核对派生路径）');
-}
-if (!Number.isInteger(HARDENING_NA_EVIDENCE_MIN_LENGTH)) {
-  throw new Error('dispatch-contract: 无法从 review-verdict.schema.json 读出 hardening_coverage[n_a].evidence 的 minLength（schema 结构已变，需人工核对派生路径）');
-}
-
-export const SEATS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
-const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];
+// R2-P1（lead 实测发现的复发风险）: verdict_schema_version / attempt 下限 / hardening_coverage
+// [n_a].evidence 最小长度、合法 seat 名单（=REVIEWERS）、对抗席分类（ADVERSARIAL）——全部改为
+// 从 verdict-validate.mjs import，不再各自读 schema 或手拄第二份数组。verdict-validate.mjs 是
+// 这些值唯一的物理派生/声明点（前三者它自己从 schemas/review-verdict.schema.json 派生并
+// export；后两者是纯业务分类，schema 表达不了，只能靠代码常量单一来源，同样由它 export）。
+// 本文件此前独立读 schema 派生前三者、又各自手拄 SEATS/ADVERSARIAL 两个数组——「一处派生 +
+// 一处手拄」在真相源变化时会自动产生新的不一致，比原来的「两处手拄」更危险（emit 侧跟着真相源
+// 变了，check/validator 侧不跟，审查席按新契约交卷反而在收卷时被拒）。改成单一物理读取/声明
+// 点后，这类复发在构造上不可能再发生。
+export const SEATS = REVIEWERS;
 export const ALL_FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
 
 // issue #9 SC-C（状态模型矛盾修复）：「答」「推」两种处置不再走 status=closed + closed_finding_ids

@@ -27,6 +27,29 @@ export const DEFAULT_ANCHOR_PATHS_MAX = (() => {
   catch { return 20; }
 })();
 
+// R2-P1（lead 实测发现的复发风险）: schema_version / attempt 下限 / hardening_coverage[n_a]
+// 的 evidence 最小长度，此前在本文件里各自手拄一份字面量（'v3' / >=1 / 10），与
+// schemas/review-verdict.schema.json 的对应字段是两份独立数据。dispatch-contract.mjs 已改
+// 从 schema 派生这三个值，若本文件继续手拄，就会出现「一处派生 + 一处手拄」——schema 真相源
+// 一变，dispatch-contract 跟着变、本文件不动，两者立刻不一致，形状与刚修的 blocker 完全相同，
+// 且更隐蔽（会被误以为"已经改成派生了"）。现改为本文件读 schema 派生并 export，
+// dispatch-contract.mjs 改为从本文件 import（不再各自重复读 schema），全链单一物理读取点。
+const REVIEW_VERDICT_SCHEMA = readJson(join(HERE, '../schemas/review-verdict.schema.json'));
+export const SCHEMA_VERSION = REVIEW_VERDICT_SCHEMA.properties?.schema_version?.const;
+export const ATTEMPT_MIN = REVIEW_VERDICT_SCHEMA.properties?.attempt?.minimum;
+export const HARDENING_NA_EVIDENCE_MIN_LENGTH = REVIEW_VERDICT_SCHEMA.properties?.hardening_coverage?.items?.allOf
+  ?.find((clause) => clause?.if?.properties?.result?.const === 'n_a')
+  ?.then?.properties?.evidence?.minLength;
+if (typeof SCHEMA_VERSION !== 'string' || !SCHEMA_VERSION) {
+  throw new Error('verdict-validate: 无法从 review-verdict.schema.json 读出 schema_version.const（schema 结构已变，需人工核对派生路径）');
+}
+if (!Number.isInteger(ATTEMPT_MIN)) {
+  throw new Error('verdict-validate: 无法从 review-verdict.schema.json 读出 attempt.minimum（schema 结构已变，需人工核对派生路径）');
+}
+if (!Number.isInteger(HARDENING_NA_EVIDENCE_MIN_LENGTH)) {
+  throw new Error('verdict-validate: 无法从 review-verdict.schema.json 读出 hardening_coverage[n_a].evidence 的 minLength（schema 结构已变，需人工核对派生路径）');
+}
+
 // SC-11: base∪candidate 的 tracked 文件集（「这是真文件」判据）
 export function trackedPathSet({ repoDir, baseSha, candidateSha }) {
   const set = new Set();
@@ -47,8 +70,12 @@ export function changedPathSet({ repoDir, baseSha, candidateSha }) {
   return new Set(String(out).split('\0').filter(Boolean));
 }
 
-const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
-const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];
+// R2-P1 SC-9: 导出席位名单，dispatch-contract.mjs 的 SEATS/ADVERSARIAL 改从这里 import，
+// 不再各自手拄第二份——本文件是这两份分类（哪些是合法 reviewer、哪些算对抗席）的唯一权威，
+// 这个分类不是 schema 能表达的概念（schema 只有 reviewer 的枚举值，没有"哪些是对抗席"这层
+// 业务语义），只能靠代码常量单一来源。
+export const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
+export const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];
 const FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
 const RESULTS = ['pass', 'fail', 'n_a'];
 const SEVERITIES = ['blocker', 'major', 'suggestion'];
@@ -72,7 +99,7 @@ const EVIDENCE_LOCATOR_RE = /[\w-]+(?:[./][\w-]+)+:\d+(-\d+)?/;
 // （"无异步改动"=5、"本PR不涉及并发"=8 都会被拒，而它们是合法的简短说明），副作用是逼人凑
 // 字数、制造无信息填充文本——那跟造假锚点是同一类病的轻症版。改成任何具体数值都同样任意，
 // 所以不追求"调准"，只求拦掉最低限度的敷衍；真实性判断仍在审查席与 lead 手里。
-const HARDENING_NA_EVIDENCE_MIN_LENGTH = 10;
+// 数值本身已改从 schema 派生（见文件顶部 HARDENING_NA_EVIDENCE_MIN_LENGTH），此处不再手拄。
 // R10-A3/SC-B4: 加固清单类别数与版本单一来源——scripts/lib/hardening-registry.mjs
 // （9→10 迁移见 D5：exact 集合变更，不是新增一条 append，因此同步 bump checklist_version）。
 const HARDENING_RESULTS = ['covered', 'n_a'];
@@ -90,14 +117,14 @@ export function validateVerdict(v, opts = {}) {
 
   need(v && typeof v === 'object', 'verdict 不是对象');
   if (errs.length) return errs;
-  need(v.schema_version === 'v3', `schema_version 必须为 v3，得到 ${v.schema_version}`);
+  need(v.schema_version === SCHEMA_VERSION, `schema_version 必须为 ${SCHEMA_VERSION}，得到 ${v.schema_version}`);
   need(REVIEWERS.includes(v.reviewer), `reviewer 非法: ${v.reviewer}`);
   need(['ok', 'degraded'].includes(v.run_status), `run_status 非法: ${v.run_status}`);
   need(Number.isInteger(v.round) && v.round >= 1, `round 非法: ${v.round}`);
   // I9-SC-6: attempt = 当前 round 的第几次审查尝试。round 语义变更为「PASS 共识序号」后，
   // 尝试次数信息从 round 里丢失，由本字段承载（单份 verdict 的形状校验；「三席 attempt 必须
   // 一致」的跨席校验属 consensus-gate 层，不在此实现）。
-  need(Number.isInteger(v.attempt) && v.attempt >= 1, `attempt 非法: ${JSON.stringify(v.attempt)}`);
+  need(Number.isInteger(v.attempt) && v.attempt >= ATTEMPT_MIN, `attempt 非法: ${JSON.stringify(v.attempt)}（须为 >= ${ATTEMPT_MIN} 的整数）`);
   need(SHA_RE.test(v.base_sha ?? ''), `base_sha 非法: ${v.base_sha}`);
   need(SHA_RE.test(v.candidate_sha ?? ''), `candidate_sha 非法: ${v.candidate_sha}`);
   need(HASH_RE.test(v.review_input_hash ?? ''), 'review_input_hash 必须是 64 位 hex');

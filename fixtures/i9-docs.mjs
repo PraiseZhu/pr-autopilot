@@ -9,7 +9,9 @@
 // 而 sc-coverage-gate.mjs 的 mustCover 要求每条 blocker/major 恰好被 1 条 SC 覆盖——
 // 答/推都没有 SC，收不了口。本次修法：答从 findings[] 撤回、推统一走
 // out_of_scope_notes[]，两者都不再进 canonical_findings，因此不需要 SC 覆盖。
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import {
   contractSpec,
   contractDigest,
@@ -22,6 +24,26 @@ import {
 } from '../scripts/dispatch-contract.mjs';
 import { HARDENING_CHECKLIST_VERSION, HARDENING_CLASS_COUNT } from '../scripts/lib/hardening-registry.mjs';
 import { validateVerdict } from '../scripts/verdict-validate.mjs';
+
+// R2-P1 真相源变化测试的通用探针：本进程已经 import 过 dispatch-contract.mjs/verdict-validate.mjs，
+// 它们模块顶层派生的常量（SCHEMA_VERSION 等）是「导入时那一刻」的快照，进程内再改磁盘文件不会让
+// 已导入的绑定重新求值——所以"改真相源→两侧是否跟着变"这个问题，必须在**全新进程**里验证
+// （新进程从磁盘重新读取，天然没有缓存问题），不能靠本进程内的 dynamic import 缓存规避。
+// 探针脚本用绝对 file:// URL import 两个待测模块，避免脚本落盘位置影响相对路径解析。
+const DC_URL = new URL('../scripts/dispatch-contract.mjs', import.meta.url).href;
+const VV_URL = new URL('../scripts/verdict-validate.mjs', import.meta.url).href;
+// script 必须是「顶层 import 语句 + try{...console.log(JSON.stringify(...))...}catch{...}」形态——
+// import 语句语法上不能包在 try 里，只能放外面；子进程内部真报错（包括 mutation 导致 import 时
+// 的派生 guard throw）都会被 catch 成 __probe_error__ 打成 JSON，而不是让 execFileSync 因非零
+// 退出码抛出难辨认的异常。
+function runProbe(script) {
+  const out = execFileSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' }).trim();
+  const parsed = JSON.parse(out.split('\n').filter(Boolean).pop());
+  if (parsed && parsed.__probe_error__) {
+    throw new Error(`探针子进程内部报错: ${parsed.__probe_error__}`);
+  }
+  return parsed;
+}
 
 let pass = 0, failCount = 0;
 const failures = [];
@@ -254,6 +276,136 @@ t('[SC-R2-C4] emit→validator 端到端(反向变异): 把 schema_version 改�
   const errs = validateVerdict(mutated);
   ok(errs.length > 0, '变异后 validateVerdict 必须报错');
   ok(errs.some((e) => /schema_version/.test(e)), `报错必须点名 schema_version，实际: ${JSON.stringify(errs)}`);
+});
+
+// R2-P1（lead 实测发现的复发风险）: 上面 SC-R2-C1〜C4 只证明了"当前取值一致"，没证明"真相源
+// 一变、两侧真的会一起变"——lead 实测把 schema.properties.schema_version.const 改成 v9，
+// dispatch-contract 的派生值跟着变了，但 verdict-validate.mjs 的判等仍手拄 'v3' 没跟。这比修复前
+// 的"两处手拄"更危险：两处手拄时真相源一变两边都不动，仍然彼此一致（虽然过期）；一处派生一处
+// 手拄时真相源一变，一边动一边不动，自动产生新的不一致——形状与刚修的 blocker 完全相同。
+// 以下三条测试真的去改磁盘上的真相源文件（schema.json / verdict-validate.mjs 源码），在全新子
+// 进程里验证 dispatch-contract 与 verdict-validate 是否**都**跟着变，改完必还原（try/finally）。
+t('[SC-R2-C7] 真相源变化(schema.properties.schema_version.const)→ dispatch-contract 与 verdict-validate 双侧同步跟着变', () => {
+  const schemaPath = fileURLToPath(new URL('../schemas/review-verdict.schema.json', import.meta.url));
+  const original = readFileSync(schemaPath, 'utf8');
+  try {
+    const mutatedSchema = JSON.parse(original);
+    mutatedSchema.properties.schema_version.const = 'v9-MUTATION-TEST';
+    writeFileSync(schemaPath, JSON.stringify(mutatedSchema, null, 2) + '\n');
+    const probe = `
+import { contractSpec } from '${DC_URL}';
+import { validateVerdict } from '${VV_URL}';
+try {
+  const spec = contractSpec({ seat: 'claude-adversarial', round: 1 });
+  const base = { reviewer: 'claude-adversarial', run_status: 'ok', round: 1, attempt: 1,
+    base_sha: '0'.repeat(40), candidate_sha: '1'.repeat(40), review_input_hash: 'a'.repeat(64),
+    verdict: 'APPROVED', closed_finding_ids: [], findings: [], gate_checks: [],
+    faces: ['A','B','C','D','E','F','G'].map((face) => ({ face, result: 'pass', evidence: 'e' })),
+    checklist_version: ${HARDENING_CHECKLIST_VERSION},
+    hardening_coverage: Array.from({ length: ${HARDENING_CLASS_COUNT} }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: 'scripts/x.mjs:' + (i + 1) }))
+  };
+  const vFollowing = { ...base, schema_version: spec.verdict_schema_version };
+  const vStale = { ...base, schema_version: 'v3' };
+  console.log(JSON.stringify({
+    specVersion: spec.verdict_schema_version,
+    followingErrs: validateVerdict(vFollowing),
+    staleErrs: validateVerdict(vStale)
+  }));
+} catch (e) {
+  console.log(JSON.stringify({ __probe_error__: String((e && e.stack) || e) }));
+}
+`;
+    const { specVersion, followingErrs, staleErrs } = runProbe(probe);
+    eq(specVersion, 'v9-MUTATION-TEST', 'dispatch-contract 的派生值必须跟着真相源变化（emit 侧）');
+    eq(followingErrs, [], `按当前真相源构造的 verdict 必须零错误通过 validateVerdict（validator 侧必须同步跟着变）: ${JSON.stringify(followingErrs)}`);
+    ok(staleErrs.some((e) => /schema_version/.test(e)), `仍用旧值 v3 的 verdict 必须被 validator 拒（证明判等真的跟着真相源走，不是巧合一致）: ${JSON.stringify(staleErrs)}`);
+  } finally {
+    writeFileSync(schemaPath, original);
+  }
+});
+
+t('[SC-R2-C8] 真相源变化(attempt.minimum / hardening n_a evidence.minLength)→ dispatch-contract 与 verdict-validate 双侧同步跟着变', () => {
+  const schemaPath = fileURLToPath(new URL('../schemas/review-verdict.schema.json', import.meta.url));
+  const original = readFileSync(schemaPath, 'utf8');
+  try {
+    const mutatedSchema = JSON.parse(original);
+    mutatedSchema.properties.attempt.minimum = 5;
+    const naClause = mutatedSchema.properties.hardening_coverage.items.allOf.find((c) => c?.if?.properties?.result?.const === 'n_a');
+    naClause.then.properties.evidence.minLength = 20;
+    writeFileSync(schemaPath, JSON.stringify(mutatedSchema, null, 2) + '\n');
+    const probe = `
+import { contractSpec } from '${DC_URL}';
+import { validateVerdict } from '${VV_URL}';
+try {
+  const spec = contractSpec({ seat: 'claude-adversarial', round: 1 });
+  const faces = ['A','B','C','D','E','F','G'].map((face) => ({ face, result: 'pass', evidence: 'e' }));
+  const mkHardening = (naEvidence) => Array.from({ length: ${HARDENING_CLASS_COUNT} }, (_, i) => i === 0
+    ? { class_id: 1, result: 'n_a', evidence: naEvidence }
+    : { class_id: i + 1, result: 'covered', evidence: 'scripts/x.mjs:' + (i + 1) });
+  const naLen = spec.hardening.na_evidence_min_length;
+  const base = { schema_version: spec.verdict_schema_version, reviewer: 'claude-adversarial', run_status: 'ok', round: 1,
+    base_sha: '0'.repeat(40), candidate_sha: '1'.repeat(40), review_input_hash: 'a'.repeat(64),
+    verdict: 'APPROVED', closed_finding_ids: [], findings: [], gate_checks: [], faces,
+    checklist_version: ${HARDENING_CHECKLIST_VERSION}
+  };
+  const vAttemptFollowing = { ...base, attempt: spec.attempt_min, hardening_coverage: mkHardening('y'.repeat(naLen)) };
+  const vAttemptBelowMin = { ...base, attempt: spec.attempt_min - 1, hardening_coverage: mkHardening('y'.repeat(naLen)) };
+  const vNaFollowing = { ...base, attempt: spec.attempt_min, hardening_coverage: mkHardening('y'.repeat(naLen)) };
+  const vNaBelowMin = { ...base, attempt: spec.attempt_min, hardening_coverage: mkHardening('y'.repeat(naLen - 1)) };
+  console.log(JSON.stringify({
+    attemptMin: spec.attempt_min,
+    naMinLen: naLen,
+    attemptFollowingErrs: validateVerdict(vAttemptFollowing),
+    attemptBelowMinErrs: validateVerdict(vAttemptBelowMin),
+    naFollowingErrs: validateVerdict(vNaFollowing),
+    naBelowMinErrs: validateVerdict(vNaBelowMin)
+  }));
+} catch (e) {
+  console.log(JSON.stringify({ __probe_error__: String((e && e.stack) || e) }));
+}
+`;
+    const { attemptMin, naMinLen, attemptFollowingErrs, attemptBelowMinErrs, naFollowingErrs, naBelowMinErrs } = runProbe(probe);
+    eq(attemptMin, 5, 'dispatch-contract 的 attempt_min 必须跟着真相源变化');
+    eq(naMinLen, 20, 'dispatch-contract 的 na_evidence_min_length 必须跟着真相源变化');
+    eq(attemptFollowingErrs, [], `attempt=新下限 的 verdict 必须零错误通过: ${JSON.stringify(attemptFollowingErrs)}`);
+    ok(attemptBelowMinErrs.some((e) => /attempt 非法/.test(e)), `attempt=新下限-1 必须被拒（证明 validator 真的用了新下限，不是仍卡在旧值 1）: ${JSON.stringify(attemptBelowMinErrs)}`);
+    eq(naFollowingErrs, [], `n_a evidence 长度=新最小长度 的 verdict 必须零错误通过: ${JSON.stringify(naFollowingErrs)}`);
+    ok(naBelowMinErrs.some((e) => /过短/.test(e)), `n_a evidence 长度=新最小长度-1 必须被拒（证明 validator 真的用了新长度，不是仍卡在旧值 10）: ${JSON.stringify(naBelowMinErrs)}`);
+  } finally {
+    writeFileSync(schemaPath, original);
+  }
+});
+
+t('[SC-R2-C9] 真相源变化(verdict-validate.mjs 的 REVIEWERS/ADVERSARIAL 名单)→ dispatch-contract 的 SEATS 与对抗席判断跟着变（不再各自手拄）', () => {
+  const vvPath = fileURLToPath(new URL('../scripts/verdict-validate.mjs', import.meta.url));
+  const original = readFileSync(vvPath, 'utf8');
+  try {
+    const reviewersLine = "export const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];";
+    const adversarialLine = "export const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];";
+    ok(original.includes(reviewersLine), '前置条件: 源码须含预期的 REVIEWERS 声明（探针按此字符串定位变异点，源码格式变了要同步改这里）');
+    ok(original.includes(adversarialLine), '前置条件: 源码须含预期的 ADVERSARIAL 声明');
+    const mutated = original
+      .split(reviewersLine).join("export const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview', 'r2c9-extra-seat'];")
+      .split(adversarialLine).join("export const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial', 'r2c9-extra-seat'];");
+    writeFileSync(vvPath, mutated);
+    const probe = `
+import { SEATS, contractSpec } from '${DC_URL}';
+import { REVIEWERS, ADVERSARIAL } from '${VV_URL}';
+try {
+  const spec = contractSpec({ seat: 'r2c9-extra-seat', round: 1 });
+  console.log(JSON.stringify({ SEATS, REVIEWERS, ADVERSARIAL, extraSeatHardeningRequired: spec.hardening.required }));
+} catch (e) {
+  console.log(JSON.stringify({ __probe_error__: String((e && e.stack) || e) }));
+}
+`;
+    const { SEATS: seatsOut, REVIEWERS: reviewersOut, ADVERSARIAL: adversarialOut, extraSeatHardeningRequired } = runProbe(probe);
+    eq(reviewersOut, ['claude-adversarial', 'codex-adversarial', 'upstream-preview', 'r2c9-extra-seat'], '前置条件: verdict-validate.mjs 的 REVIEWERS 确实已变异');
+    eq(adversarialOut, ['claude-adversarial', 'codex-adversarial', 'r2c9-extra-seat'], '前置条件: verdict-validate.mjs 的 ADVERSARIAL 确实已变异');
+    eq(seatsOut, reviewersOut, 'dispatch-contract 的 SEATS 必须等于 verdict-validate.mjs 变异后的 REVIEWERS（不是自己另存一份，contractSpec 才能接受新席位而不 throw "seat 非法"）');
+    eq(extraSeatHardeningRequired, true, 'dispatch-contract 的对抗席判断必须用 verdict-validate.mjs 变异后的 ADVERSARIAL——新席位被加入对抗席分类后，contractSpec 对它也要求 hardening_coverage，不是自己另存一份旧名单');
+  } finally {
+    writeFileSync(vvPath, original);
+  }
 });
 
 t('[SC-R2-C5] SKILL.md 已同步声明 verdict schema **v3**（不再声明 v2）', () => {
