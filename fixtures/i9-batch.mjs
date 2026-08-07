@@ -383,6 +383,43 @@ t('[i9-batch-9] batch.frozen_at_sha ≠ run 起点 → 闭合门②拒（起点 
     'frozen_at_sha 漂移必须被拦: ' + JSON.stringify(errs));
 });
 
+// ========== [i9-batch-11] parent 同 SHA 铸造轮号被拒（issue #9 R4 修复②） ==========
+console.log('\n[i9-batch-11] parent 同 SHA：`git merge-base --is-ancestor A A` 退出 0，同 SHA 的 R2 此前能通过 → 现在拒');
+t('[i9-batch-11] R1(candidate=L2) 当 round=2 同 candidate 的 parent → 拒（同 SHA 无合法用途）', () => {
+  const r1L2 = consensusFor(mkBundle(L0, L2), [[], [], []], { repoDir: repo }); // round 1 PASS，candidate=L2
+  ok(r1L2.gate_result === 'pass', '[i9-batch-11] 前提失败: R1(L2) 未 PASS: ' + JSON.stringify(r1L2.fail_reasons ?? []));
+  const r2SameSha = consensusFor(mkBundle(L0, L2), [[], [], []], {
+    round: 2, attempt: 1, repoDir: repo,
+    gateOpts: { parentArtifact: r1L2, repoDir: repo }
+  });
+  ok(r2SameSha.gate_result === 'fail', '[i9-batch-11] 同 SHA 的 R2 必须 fail: ' + JSON.stringify(r2SameSha.fail_reasons ?? []));
+  ok((r2SameSha.fail_reasons ?? []).some((e) => /同 SHA 的 R2 无合法用途/.test(e)),
+    '必须精确报出同 SHA 错误: ' + JSON.stringify(r2SameSha.fail_reasons ?? []));
+});
+t('[i9-batch-11b] 非祖先 parent 仍拒（与同 SHA 失败模式不重合）', () => {
+  // 从 L0 分叉的 sibling LX（与 L2 平行）——真祖先链上不存在，is-ancestor=1
+  const lRepo2 = mkdtempSync(join(tmpdir(), 'i9-batch-sibling-'));
+  const g2 = (...a) => execFileSync('git', ['-C', lRepo2, ...a], { encoding: 'utf8' }).trim();
+  g2('init', '-q', '-b', 'main');
+  g2('config', 'user.email', 'fx@test'); g2('config', 'user.name', 'fx');
+  writeFileSync(join(lRepo2, 'f0.txt'), '0\n'); g2('add', '.'); g2('commit', '-qm', 'L0');
+  const Z0 = g2('rev-parse', 'HEAD');
+  writeFileSync(join(lRepo2, 'f1.txt'), '1\n'); g2('add', '.'); g2('commit', '-qm', 'L1');
+  const Z1 = g2('rev-parse', 'HEAD');
+  g2('checkout', '-qb', 'sibling', Z0);
+  writeFileSync(join(lRepo2, 'fx.txt'), 'x\n'); g2('add', '.'); g2('commit', '-qm', 'LX');
+  const ZX = g2('rev-parse', 'HEAD');
+  const r1Z1 = consensusFor(mkBundle(Z0, Z1), [[], [], []], { repoDir: lRepo2 }); // R1: candidate=Z1
+  ok(r1Z1.gate_result === 'pass', '[i9-batch-11b] 前提失败: R1(Z1) 未 PASS: ' + JSON.stringify(r1Z1.fail_reasons ?? []));
+  const r2Sibling = consensusFor(mkBundle(Z0, ZX), [[], [], []], {
+    round: 2, attempt: 1, repoDir: lRepo2,
+    gateOpts: { parentArtifact: r1Z1, repoDir: lRepo2 }
+  });
+  ok(r2Sibling.gate_result === 'fail', '[i9-batch-11b] 非祖先 parent 必须 fail: ' + JSON.stringify(r2Sibling.fail_reasons ?? []));
+  ok((r2Sibling.fail_reasons ?? []).some((e) => /不是当前 candidate_sha.*的祖先/.test(e)),
+    '非祖先必须报「不是祖先」而非「同 SHA」: ' + JSON.stringify(r2Sibling.fail_reasons ?? []));
+});
+
 // ========== [i9-batch-6] successor 不是直接后继被拒 ==========
 console.log('\n[i9-batch-6] successor 非直接后继：frozen_at_sha..successor 恰 2 个 commit → push-guard 拒');
 // 再产出一个 commit L3（L1→L2→L3），把 L3 当 final candidate

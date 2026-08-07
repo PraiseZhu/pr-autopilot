@@ -214,9 +214,20 @@ export function runConsensusGate(verdicts, opts = {}) {
             // 接受自报字符串）。这一步拦的是「同 base、伪造/无关 candidate」的 parent（例如
             // 平行分支的另一次评审、或手工拼的 candidate_sha）。无 repoDir 时无法验证，
             // fail-closed（不设旁路，与 R5-P1 的 changedPaths 契约同一原则）。
+            // issue #9 R4（审查席 major）: `git merge-base --is-ancestor A A` 退出 0——一个
+            // commit 是自己的祖先，所以同 SHA 的 parent 此前能通过。收紧为**严格祖先**：
+            // isAncestor(...) && parent.candidate_sha !== bundle.candidate_sha（任意距离，但
+            // 不得相等）。理由（SC-B 定案）：R2 之所以存在是因为 R1 的 PASS artifact 带了进
+            // SC 台账的 finding；修复必然产出 commit；所以合法的 R2 一定有不同的 candidate_sha，
+            // 同 SHA 的 R2 没有合法用途——允许它等于零代码推进就能铸造一个新 PASS 轮号，
+            // 正好把整件事要治的轮次膨胀重新打开。注意与批次门语义对齐：consensus-gate 用
+            // 严格祖先（任意距离），批次门用严格后代（任意距离），两者都不要求直接子 commit，
+            // 同一条链上不会出现两个门严格度打架。
             let isAncestor = false;
             let ancestorErr = null;
-            if (!opts.repoDir) {
+            if (parentArtifact.candidate_sha === bundle.candidate_sha) {
+              ancestorErr = `parent artifact candidate_sha 与当前 candidate_sha 相同（${String(bundle.candidate_sha).slice(0, 12)}）——同 SHA 的 R2 无合法用途（R1 的 PASS artifact 带进 SC 台账的 finding 必然产出修复 commit，合法 R2 一定有不同的 candidate_sha；允许同 SHA 等于零代码推进铸造新 PASS 轮号，issue #9 R4）`;
+            } else if (!opts.repoDir) {
               ancestorErr = 'parent 谱系门缺 repoDir，无法验证 parent.candidate_sha 是否为当前 candidate_sha 的祖先（不允许 fail-open，issue #9 R3 blocker）';
             } else {
               try {
@@ -238,14 +249,15 @@ export function runConsensusGate(verdicts, opts = {}) {
     }
   }
   // T1 上限声明（issue #9 R3 blocker 修复的已知边界，如实声明，不得读作"谱系已可信"）:
-  // 以上两道新增校验（base_sha 相同 + candidate_sha 真祖先）堵住的是「疏忽/误拼」与
-  // 「跨 PR/跨谱系张冠李戴」两类输入错误——但 parent artifact 终究是调用方本地磁盘上的一份
-  // JSON 文件，lead 对它有写权限。一份 base_sha 与当前完全相同、candidate_sha 确实是当前
-  // candidate 的真实历史祖先（比如 lead 手工在真仓库里造出这段祖先链）、hash 自洽、
-  // gate_result=pass 的"完全自洽的伪 R2"依然能通过本门——因为这些都是本地可构造满足的
-  // 条件，不涉及任何签名或第三方存证。要防这一类需要引入可信 ledger/签名（本轮已否决，
-  // 见派工包 Decisions②：新增机制需过确认门，删掉它其余判据照样成立）。本修复只防疏忽/
-  // 误用/跨谱系张冠李戴，T1：不防伪造。
+  // 以上新增校验（base_sha 相同 + candidate_sha 真祖先 + 严格不等，issue #9 R4 补上同 SHA
+  // 铸造轮号的缺口——`git merge-base --is-ancestor A A` 退出 0，同 SHA 此前能通过）堵住的是
+  // 「疏忽/误拼」「跨 PR/跨谱系张冠李戴」与「零推进铸造轮号」三类输入错误——但 parent
+  // artifact 终究是调用方本地磁盘上的一份 JSON 文件，lead 对它有写权限。一份 base_sha 与当前
+  // 完全相同、candidate_sha 确实是当前 candidate 的**真**历史祖先（比如 lead 手工在真仓库里
+  // 造出这段祖先链）、hash 自洽、gate_result=pass 的"完全自洽的伪 R2"依然能通过本门——因为
+  // 这些都是本地可构造满足的条件，不涉及任何签名或第三方存证。要防这一类需要引入可信
+  // ledger/签名（本轮已否决，见派工包 Decisions②：新增机制需过确认门，删掉它其余判据照样
+  // 成立）。本修复只防疏忽/误用/跨谱系张冠李戴/零推进，T1：不防伪造。
 
   // conjunct ①: 同 hash 且等于 bundle 重算值
   let recomputed = null;
