@@ -126,7 +126,7 @@ export EXPECT_EFFORT='xhigh'
 |---|---|---|
 | `PR_AUTOPILOT_HMAC_KEY` | 自家评论识别密钥（gate 过滤自家回帖不当作新反馈） | **budget cap 撞顶**（见 ①） |
 | `REQUIRED_CONTEXTS_FILE` | CI 判绿的 required contexts 清单（JSON 文件路径） | **CI 永远红 → 每轮都唤醒**（见 ②） |
-| preRunHook | 班车调度跳过空转轮 | 不用 probe.mjs 会**每 15 分钟白起一个 agent 会话**（见 ③） |
+| preRunHook | 班车调度跳过空转轮 | 不用 probe.mjs 会**每个班车周期白起一个 agent 会话**（本机当前周期见 schedule 配置；见 ③） |
 
 **① `PR_AUTOPILOT_HMAC_KEY` —— 没配的症状是 budget cap 撞顶**
 
@@ -150,7 +150,15 @@ export REQUIRED_CONTEXTS_FILE=/path/to/required-contexts.json
 ```
 
 - **格式**：`{"owner/repo": ["ctx 名"]}`（`deploy/wrappers/gh-snapshot.mjs` 读 JSON 后按 `[owner/repo] ?? []` 取值）。
-- **接线位置是 `deploy/wrappers/gh-snapshot.mjs` 的运行时 env 读取，不是 `env.sh`**：gh-snapshot 是引擎的**子进程**，读的是调度/launchd 注入的进程环境；`env.sh` 是班车会话自己 source 的文件，往里面塞这个变量，引擎子进程根本看不到——别人就是这么塞的，塞了没生效。要注入到跑引擎的那层环境（与 FEISHU_* 同法：launchctl setenv 或 plist EnvironmentVariables）。
+- **注入位置 = 启动引擎的那条命令本身**（本机在跑的部署实测生效）——与 `source env.sh` 并列 export，例如：
+  ```bash
+  source ~/pr-autopilot-runtime/env.sh && \
+    export PATH=/opt/homebrew/bin:$PATH REQUIRED_CONTEXTS_FILE=/path/to/required-contexts.json && \
+    node <引擎入口> …
+  ```
+  本机在跑的部署就是这么做（Cindy schedule 的 prompt 里写死这条命令）。
+- **为什么不能只塞进 `env.sh`**：gh-snapshot 是引擎的**子进程**，读的是启动命令注入的进程环境；`env.sh` 是班车会话自己 source 的文件，往里面塞这个变量，引擎子进程根本看不到——别人就是这么塞的，塞了没生效。**顺带：非交互 shell 的 PATH 里没有 `node`**（本机踩过，mini 的 node 在 `/opt/homebrew/bin`），部署时不显式加 PATH 会静默失败——上面命令行里的 `export PATH=…` 就是干这个的。
+- 备选（**未实测**）：launchctl setenv 或 plist EnvironmentVariables 注入调度进程环境，理论同效。
 - **取值权威来源 = 分支保护 API 的实际值，不是人手抄 workflow 名**：`gh api repos/{owner}/{repo}/branches/main/protection --jq '.required_status_checks.contexts'`（或仓库 Settings → Branches → 保护规则 → Require status checks 里看到的清单）。手抄名字会漂移——分支保护里改名/增删后，清单不跟着变，CI 判绿就失真。
 - **两类 check 绝对不能进这份清单（同一类陷阱的两个变种）**：
   - **`SKIPPED` 不算绿**：gh-snapshot 归一化 check-run 时只有 `conclusion == success` 才映射为绿，`skipped`/`neutral`/`cancelled` 一律非绿（`scripts/ci-readiness.mjs`：`entry.state !== 'success'` → fail-closed 非绿）。按路径过滤的 job（改动不命中就 SKIPPED）一旦进清单，该 PR 永远判不绿。
