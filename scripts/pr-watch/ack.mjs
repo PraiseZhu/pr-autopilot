@@ -7,7 +7,7 @@ import { readJson, writeJsonAtomic, parseArgs, fail, nowIso, isMain} from '../li
 import { withLock } from '../lib/state-lock.mjs';
 import { resolveStateFile } from './register.mjs';
 import { releaseReserve, settleDispatchBudget } from './budget.mjs';
-import { receiptPath } from './finalize.mjs';
+import { receiptPathLocked } from './finalize.mjs';
 
 // 审③-F14: 读改写全程持 per-key 锁（与 engine 同一把），防并发丢更新/复活 pending
 export function ackDispatch({ stateDir, owner, repo, prNumber, dispatchId, journalFile }) {
@@ -120,8 +120,11 @@ export function cancelDispatch({ stateDir, owner, repo, prNumber, dispatchId, bu
       return { ok: false, reason: `dispatch_id 不匹配（pending=${pending.dispatch_id} cancel=${dispatchId}）——只允许显式点名取消` };
     }
     // 审⑧-P1-2: 已有 intent/committed receipt = 该 dispatch 已表达/完成 push 意图，
-    // 取消无法撤回已发生或在途的远端写——fail-closed，只能走 complete 收口
-    const rp = receiptPath(stateDir, { owner, repo, pr_number: prNumber });
+    // 取消无法撤回已发生或在途的远端写——fail-closed，只能走 complete 收口。
+    // R4: 本函数已持 state 锁（含 resolveStateFile 的锁），只读核对必须用锁内 helper
+    // receiptPathLocked——公共 API 会再拿同一把锁 → 自锁死锁（mkdir 锁不可重入）。
+    // 只读模式（无 dispatch_id）不迁移、不抛冲突，canonical 优先返回。
+    const rp = receiptPathLocked(stateDir, { owner, repo, pr_number: prNumber });
     if (existsSync(rp)) {
       const rec = readJson(rp);
       if (rec.dispatch_id === dispatchId && (rec.phase === 'intent' || rec.phase === 'committed')) {

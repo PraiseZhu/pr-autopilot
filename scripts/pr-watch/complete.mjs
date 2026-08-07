@@ -49,7 +49,12 @@ if (isMain(import.meta.url)) {
   const tpl = args['snapshot-cmd'].split(' ').map((p) =>
     p.replace('{owner}', manifest.owner).replace('{repo}', manifest.repo).replace('{pr}', String(manifest.pr_number)));
   const snapshot = JSON.parse(execFileSync(tpl[0], tpl.slice(1), { encoding: 'utf8' }));
-  const rp = receiptPath(args['state-dir'], manifest);
+  // R4: receipt 查找用锁外公共 API（自行持 per-state 锁，迁移在锁内串行）——本处不在任何
+  // 锁内，不会嵌套；迁移冲突（canonical 被其他 dispatch 占用）显式抛出 → 干净 fail-closed
+  // 退出（不结算不 ack，两文件保留），不裸堆栈。
+  let rp;
+  try { rp = receiptPath(args['state-dir'], manifest); }
+  catch (e) { process.stderr.write(`[COMPLETE] ${e.message}\n`); process.exit(1); }
   const receipt = existsSync(rp) ? readJson(rp) : null;
   const res = checkCompletion({ manifest, snapshot, receipt, hmacKey: process.env.PR_AUTOPILOT_HMAC_KEY });
   if (!res.ok) {

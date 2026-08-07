@@ -25,7 +25,7 @@ import { registerPr, unregisterPr, checkReceipt, stateFileName, legacyStateFileN
 import { evaluate, emptyCursors } from '../scripts/pr-watch/gate.mjs';
 import { runEngine } from '../scripts/pr-watch/engine.mjs';
 import { ackDispatch, cancelDispatch } from '../scripts/pr-watch/ack.mjs';
-import { checkFinalize, receiptPath } from '../scripts/pr-watch/finalize.mjs';
+import { checkFinalize, receiptPath, receiptPathLocked } from '../scripts/pr-watch/finalize.mjs';
 import { checkCompletion } from '../scripts/pr-watch/complete.mjs';
 import { reserveBudget, releaseReserve, recordCost, spentToday, budgetCheck, settleDispatchBudget, isDispatchSettled } from '../scripts/pr-watch/budget.mjs';
 import { route } from '../scripts/pr-watch/notify-router.mjs';
@@ -7022,6 +7022,151 @@ t('[R3-SC-S4] 目录级迁移汇总: migrateAllLegacyStateFiles 统计 migrated/
   ok(m.rejected >= 1, `拒绝统计 rejected>=1（got ${m.rejected}）`);
   ok(existsSync(join(r3State, 'mame__%5F__401.json')), 'mame/_#401 已迁移到新名');
   for (const f of ['mame__-__401.json', 'mame__-__402.json']) execFileSync('rm', ['-f', join(r3State, f)]);
+});
+
+// ========== R4: receipt 迁移 TOCTOU 修复（2026-08-08 GPT R4 finding） ==========
+// GPT R4 唯一 finding: legacy receipt 迁移的「检查 canonical → rename」在锁外两步执行，
+// 窗口期另一进程写入 canonical 后 renameSync 静默覆盖新 receipt。修复 = 迁移并入
+// per-state 锁内（receiptPathLocked 锁内 helper + receiptPath 锁外公共 API 分层），
+// 锁内复核 canonical 目标：同 dispatch 幂等、mismatch 显式冲突两文件保留、调用方 fail-closed。
+// SC-RC1/RC2/RC3 由下面三条 t 覆盖；反向变异（无条件 rename）时 SC-RC1 第一条断言必须红。
+console.log('\n[R4] legacy receipt 迁移 TOCTOU: 锁内复核 canonical + 显式冲突 fail-closed（SC-RC1/RC2/RC3）');
+
+t('[R4-SC-RC1] TOCTOU 交错: A 读 legacy D1 后 B 写 canonical D2 → A 迁移不得覆盖 D2（显式冲突、两文件保留）；complete D2 能读 canonical D2', () => {
+  const idA = 'rc-a-111', idB = 'rc-b-222';
+  const candB = 'c'.repeat(40);
+  const mD1 = { owner: 'mame', repo: '_', pr_number: 501, dispatch_id: idA, branch: 'f1', remote: 'origin', original_head: SHA_A };
+  const mD2 = { owner: 'mame', repo: '_', pr_number: 501, dispatch_id: idB, branch: 'f2', remote: 'origin', original_head: SHA_B };
+  const legR = `receipt-${legacyStateFileName('mame', '_', 501)}`;
+  const canR = `receipt-${stateFileName('mame', '_', 501)}`;
+  // A 的迁移前状态: legacy D1 已落盘且 dispatch 校验通过（A 已读过它）
+  writeFileSync(join(r3State, legR), JSON.stringify({
+    phase: 'committed', dispatch_id: idA, original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  // B 在 A 检查之后、A rename 之前写入 canonical D2（窗口期交错——模拟并发写者已落盘新 receipt）
+  writeFileSync(join(r3State, canR), JSON.stringify({
+    phase: 'committed', dispatch_id: idB, original_head: SHA_B, candidate: candB,
+    remote: 'origin', branch: 'f2', at: new Date().toISOString()
+  }));
+  // A 迁移: 锁内复核 canonical 已存在且属其他 dispatch → 显式冲突，绝不 rename 覆盖
+  let conflict = '';
+  try { receiptPath(r3State, mD1); } catch (e) { conflict = e.message; }
+  ok(conflict.includes('receipt 迁移冲突'), `A 迁移必须显式冲突而非覆盖（got: ${conflict.slice(0, 140)}）`);
+  eq(readJson(join(r3State, canR)).dispatch_id, idB, 'canonical D2 未被覆盖（内容原样）');
+  ok(existsSync(join(r3State, legR)), 'legacy D1 保留（两文件并存）');
+  // complete D2 能读 canonical D2 且收口检查通过（同 dispatch 幂等命中 canonical）
+  const rpD2 = receiptPath(r3State, mD2);
+  eq(rpD2, join(r3State, canR), 'D2 解析命中 canonical');
+  const snapD2 = { state: 'open', head_sha: candB, comments: [{ id: 'rc-c1', body: signMarker(`done dispatch:${idB}`, HMAC_KEY) }] };
+  const resD2 = checkCompletion({ manifest: mD2, snapshot: snapD2, receipt: readJson(rpD2), hmacKey: HMAC_KEY });
+  ok(resD2.ok, `complete D2 收口检查必须通过: ${(resD2.missing ?? []).join('; ')}`);
+  for (const f of [legR, canR]) execFileSync('rm', ['-f', join(r3State, f)]);
+});
+
+t('[R4-SC-RC2] 正常迁移成功 + canonical 同 D1 已存在幂等（legacy 保留不删——显式策略）', () => {
+  // ① 正常 legacy D1 → canonical 迁移仍成功
+  const m502 = { owner: 'mame', repo: '_', pr_number: 502, dispatch_id: 'rc-502', branch: 'f1', remote: 'origin', original_head: SHA_A };
+  const leg502 = `receipt-${legacyStateFileName('mame', '_', 502)}`;
+  writeFileSync(join(r3State, leg502), JSON.stringify({
+    phase: 'committed', dispatch_id: 'rc-502', original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  const rp502 = receiptPath(r3State, m502);
+  eq(rp502, join(r3State, `receipt-${stateFileName('mame', '_', 502)}`), '正常迁移到 canonical 路径');
+  ok(!existsSync(join(r3State, leg502)), '旧名已迁移消失');
+  eq(readJson(rp502).dispatch_id, 'rc-502', '迁移内容保留（recoverFromReceipt 全字段绑定不变）');
+  // ② canonical 同 D1 已存在 → 幂等: 不迁移、不抛错、canonical 保留（legacy 保留不删）
+  const m503 = { owner: 'mame', repo: '_', pr_number: 503, dispatch_id: 'rc-503', branch: 'f1', remote: 'origin', original_head: SHA_A };
+  const can503 = join(r3State, `receipt-${stateFileName('mame', '_', 503)}`);
+  const leg503 = join(r3State, `receipt-${legacyStateFileName('mame', '_', 503)}`);
+  writeFileSync(can503, JSON.stringify({
+    phase: 'committed', dispatch_id: 'rc-503', original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  writeFileSync(leg503, JSON.stringify({
+    phase: 'committed', dispatch_id: 'rc-503', original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  const rp503 = receiptPath(r3State, m503); // 不得抛
+  eq(rp503, can503, '同 dispatch → 命中 canonical（幂等视为已迁移）');
+  eq(readJson(can503).dispatch_id, 'rc-503', 'canonical 内容保留');
+  ok(existsSync(leg503), 'legacy 保留不删（显式策略: 双保险不丢数据）');
+  for (const f of [leg503, can503]) execFileSync('rm', ['-f', f]);
+});
+
+t('[R4-SC-RC2] canonical mismatch 显式冲突 fail-closed: complete CLI 非零退出、不结算不 ack、两文件保留', () => {
+  const idA = 'rc-a-601', idB = 'rc-b-602';
+  const candB = 'c'.repeat(40);
+  const m601 = { owner: 'mame', repo: '_', pr_number: 601, dispatch_id: idA, branch: 'f1', remote: 'origin', original_head: SHA_A };
+  const legR = `receipt-${legacyStateFileName('mame', '_', 601)}`;
+  const canR = `receipt-${stateFileName('mame', '_', 601)}`;
+  writeFileSync(join(r3State, legR), JSON.stringify({
+    phase: 'committed', dispatch_id: idA, original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  writeFileSync(join(r3State, canR), JSON.stringify({
+    phase: 'committed', dispatch_id: idB, original_head: SHA_B, candidate: candB,
+    remote: 'origin', branch: 'f2', at: new Date().toISOString()
+  }));
+  const mf = join(r3Dir, 'rc-m601.json'); writeFileSync(mf, JSON.stringify(m601));
+  const snapF = join(r3Dir, 'rc-snap601.sh');
+  writeFileSync(snapF, `#!/bin/sh\necho '{"state":"open","head_sha":"${SHA_B}","comments":[]}'\n`);
+  execFileSync('chmod', ['+x', snapF]);
+  let out = '', failed = false;
+  try { out = execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', mf, '--snapshot-cmd', snapF, '--state-dir', r3State], { encoding: 'utf8', stdio: 'pipe' }); }
+  catch (e) { failed = true; out = `${e.stdout ?? ''}${e.stderr ?? ''}`; }
+  ok(failed, '冲突状态下 complete 必须非零退出（fail-closed）');
+  ok(out.includes('receipt 迁移冲突'), `complete 必须显式报冲突: ${out.slice(0, 160)}`);
+  eq(readJson(join(r3State, canR)).dispatch_id, idB, 'canonical 保留未动');
+  ok(existsSync(join(r3State, legR)), 'legacy 保留未动');
+  for (const f of [legR, canR, mf, snapF]) execFileSync('rm', ['-f', f]);
+});
+
+t('[R4-SC-RC3] 锁内 helper 分层: withLock(state 锁) 内调 receiptPathLocked 迁移无嵌套死锁（公共 API 会自锁）', () => {
+  const m504 = { owner: 'mame', repo: '_', pr_number: 504, dispatch_id: 'rc-504', branch: 'f1', remote: 'origin', original_head: SHA_A };
+  const leg504 = `receipt-${legacyStateFileName('mame', '_', 504)}`;
+  writeFileSync(join(r3State, leg504), JSON.stringify({
+    phase: 'committed', dispatch_id: 'rc-504', original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  // 模拟 finalize main: 持同一把 per-state 锁后调 Locked helper（若错用公共 API 会嵌套自锁）
+  const lockPath = join(r3State, `${stateFileName('mame', '_', 504)}.lock`);
+  let rpInLock = null;
+  withLock(lockPath, () => { rpInLock = receiptPathLocked(r3State, m504); }, { timeoutMs: 5000 });
+  eq(rpInLock, join(r3State, `receipt-${stateFileName('mame', '_', 504)}`), '锁内迁移成功（无死锁）');
+  ok(!existsSync(join(r3State, leg504)), '锁内迁移后旧名消失');
+  eq(readJson(rpInLock).dispatch_id, 'rc-504', '内容保留');
+});
+
+t('[R4-SC-RC3] cancel 锁内只读核对 legacy receipt 无死锁: 意图 receipt 拦取消；错 dispatch 正常取消', () => {
+  const st701 = join(r3State, stateFileName('mame', '_', 701));
+  const led701 = join(r3Dir, 'rc-ledger-701.jsonl');
+  writeFileSync(led701, '');
+  const mkState = (id) => ({
+    schema_version: 'v2', owner: 'mame', repo: '_', pr_number: 701, branch: 'f1',
+    push_repo: null, push_remote: 'origin', cursors: null, first_scan_ack: null, status: 'fixing',
+    pending_dispatch: { dispatch_id: id, canceling: false, cursors_next: null, dispatched_at: new Date().toISOString(), budget: { ledger: led701, cap: 100, estimate: 1 } }
+  });
+  writeFileSync(st701, JSON.stringify(mkState('rc-c-701')));
+  // legacy intent receipt（旧命名会话遗留）: canonical 缺失 → 锁内只读核对必须命中 legacy 并拒取消
+  const leg701 = `receipt-${legacyStateFileName('mame', '_', 701)}`;
+  writeFileSync(join(r3State, leg701), JSON.stringify({
+    phase: 'intent', dispatch_id: 'rc-c-701', original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  const rcRefuse = cancelDispatch({ stateDir: r3State, owner: 'mame', repo: '_', prNumber: 701, dispatchId: 'rc-c-701', budgetLedger: led701 });
+  ok(!rcRefuse.ok && /intent receipt/.test(rcRefuse.reason), `legacy intent receipt 必须拦下取消（锁内只读命中 legacy）: ${rcRefuse.reason}`);
+  ok(readJson(st701).pending_dispatch, '拒取消时 pending 原样');
+  // 错 dispatch 的 legacy receipt → 只读核对不命中 → 正常取消（release + 清 pending + 升 generation）
+  writeFileSync(join(r3State, leg701), JSON.stringify({
+    phase: 'intent', dispatch_id: 'rc-other', original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  const rcOk = cancelDispatch({ stateDir: r3State, owner: 'mame', repo: '_', prNumber: 701, dispatchId: 'rc-c-701', budgetLedger: led701 });
+  ok(rcOk.ok, `错 dispatch receipt 不拦取消（正常取消）: ${rcOk.reason}`);
+  ok(!readJson(st701).pending_dispatch, '取消完成清 pending');
+  for (const f of [leg701, st701]) execFileSync('rm', ['-f', f]);
 });
 
 // ========== 汇总 + SKIPPED ==========
