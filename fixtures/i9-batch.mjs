@@ -503,6 +503,28 @@ t('[i9-batch-13d] 裁决 2 行为钉住：pr_number 不入 review_input_hash（n
     'pr_number 必须入 consensus_artifact_hash（null 与 301 的 artifact hash 必须不同）');
 });
 
+// ========== [i9-batch-14] 判据④ ARCHIVE 出口（R4 查证+实测定论） ==========
+console.log('\n[i9-batch-14] 判据④ ARCHIVE 出口：带 archive SC 放行 / 无出口仍拒');
+// 背景：ARCHIVE 的 finding 留在 findings[] 且进终版 canonical（SKILL.md:507），status=closed
+// ≠ 不进 canonical。判据④原会拒 → 合法 ARCHIVE 收不了口（洞，R4 实测定论）。修复：④给
+// ARCHIVE 留出口，判据 =「该 family 有一条 archive SC（kind=archive 且 family_key 匹配）」——
+// 结果导向，不是自报「已处置」标志位。
+// 构造：终版含 FK1（复发）+ 一个带 FK1 的 archive SC → ④应放行；无该 archive SC → 拒。
+const termRecurArch = mkTerminal(L2, [[f1Recur], [f1Recur], [f1Recur]]); // 终版仍含 FK1
+if (termRecurArch.gate_result !== 'pass') throw new Error('[i9-batch-14] 前提失败: 复发轮未 PASS: ' + JSON.stringify(termRecurArch.fail_reasons ?? []));
+const scManifestWithArchFK1 = {
+  ...scManifest,
+  scs: [...scManifest.scs, { id: 'SC-ARCH-FK1', kind: 'archive', finding_ids: [cF1.id], invariant: I1, family_key: FK1, change: '登记 FK1 残余', holds: 'README 含 FK1 文案', verify: { cmd: 'grep', args: ['-q', 'FK1', 'README.md'] } }]
+};
+t('[i9-batch-14a] 冻结 family 被 ARCHIVE 处置（终版有该族 + 带 archive SC）→ 判据④放行（出口生效）', () => {
+  const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest: scManifestWithArchFK1 });
+  ok(!errs.some((e) => /同族复发/.test(e)), '带 FK1 的 archive SC → FK1 复发应被出口放行: ' + JSON.stringify(errs));
+});
+t('[i9-batch-14b] 无该族 archive SC（终版有该族）→ 判据④仍拒（出口判据=该族有 archive SC）', () => {
+  const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest });
+  ok(errs.some((e) => /同族复发/.test(e)), 'FK1 复发但无 FK1 的 archive SC → 必须仍拒: ' + JSON.stringify(errs));
+});
+
 // ========== [i9-batch-6] 批次严格后代语义（lead 撤回「直接后继」后） ==========
 console.log('\n[i9-batch-6] 批次严格后代：多 commit 合法 / 非后代拒 / 零推进拒');
 // 再产出一个 commit L3（L1→L2→L3），把 L3 当 final candidate
