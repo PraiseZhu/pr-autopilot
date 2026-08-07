@@ -209,14 +209,35 @@ export function runConsensusGate(verdicts, opts = {}) {
             // （同一 PR 的同一 base）——先拦掉跮 PR / 无关 base 的 parent。
             failReasons.push(`parent artifact base_sha 与当前 bundle.base_sha 不一致（parent=${String(parentArtifact.base_sha).slice(0, 12)} 当前=${String(bundle.base_sha).slice(0, 12)}）——parent 不属于同一 PR/同一 base，谱系绑定必须验内容而非只验这一跳自洽（issue #9 R3 blocker）`);
           } else {
+            // issue #9 R4 修复①（lead 裁决 2026-08-07，有条件强制）: parent 有 PR 号时必须与
+            // 当前 bundle 相同——堵审查席实测形状（PR-A 的 R1 当 PR-B 的 R2，pass 且 fail_reasons=[]，
+            // 堆叠 PR/兄弟 run 目录抓错 artifact 文件的真实疏忽路径）。parent.pr_number===null 时
+            // 不限（「先无 PR 审 R1、后有 PR 审 R2」是合法演进，不误伤——SKILL.md 明文支持无 PR
+            // 直跑三审）。
+            // 残余洞（如实写进 T1 声明，不冒充"已堵跨 PR"）：R1 无 PR（null）、R2 用另一个 PR 的
+            // bundle——机器无法区分「R2 建了自己的 PR」与「张冠李戴」，仍在 T1 上限内。
+            if (parentArtifact.pr_number !== null && parentArtifact.pr_number !== bundle.pr_number) {
+              failReasons.push(`parent artifact pr_number=${String(parentArtifact.pr_number)} ≠ 当前 bundle.pr_number=${String(bundle.pr_number)}——parent 属于另一个 PR（张冠李戴：堆叠 PR/兄弟 run 目录抓错 artifact 文件），谱系绑定必须同 PR（issue #9 R4 修复①）`);
+            } else {
             // issue #9 R3 blocker: base 相同后仍需验 candidate 谱系是否真实推进——parent.
             // candidate_sha 必须是当前 candidate_sha 的**真实 git 祖先**（原生 ancestry，不
             // 接受自报字符串）。这一步拦的是「同 base、伪造/无关 candidate」的 parent（例如
             // 平行分支的另一次评审、或手工拼的 candidate_sha）。无 repoDir 时无法验证，
             // fail-closed（不设旁路，与 R5-P1 的 changedPaths 契约同一原则）。
+            // issue #9 R4（审查席 major）: `git merge-base --is-ancestor A A` 退出 0——一个
+            // commit 是自己的祖先，所以同 SHA 的 parent 此前能通过。收紧为**严格祖先**：
+            // isAncestor(...) && parent.candidate_sha !== bundle.candidate_sha（任意距离，但
+            // 不得相等）。理由（SC-B 定案）：R2 之所以存在是因为 R1 的 PASS artifact 带了进
+            // SC 台账的 finding；修复必然产出 commit；所以合法的 R2 一定有不同的 candidate_sha，
+            // 同 SHA 的 R2 没有合法用途——允许它等于零代码推进就能铸造一个新 PASS 轮号，
+            // 正好把整件事要治的轮次膨胀重新打开。注意与批次门语义对齐：consensus-gate 用
+            // 严格祖先（任意距离），批次门用严格后代（任意距离），两者都不要求直接子 commit，
+            // 同一条链上不会出现两个门严格度打架。
             let isAncestor = false;
             let ancestorErr = null;
-            if (!opts.repoDir) {
+            if (parentArtifact.candidate_sha === bundle.candidate_sha) {
+              ancestorErr = `parent artifact candidate_sha 与当前 candidate_sha 相同（${String(bundle.candidate_sha).slice(0, 12)}）——同 SHA 的 R2 无合法用途（R1 的 PASS artifact 带进 SC 台账的 finding 必然产出修复 commit，合法 R2 一定有不同的 candidate_sha；允许同 SHA 等于零代码推进铸造新 PASS 轮号，issue #9 R4）`;
+            } else if (!opts.repoDir) {
               ancestorErr = 'parent 谱系门缺 repoDir，无法验证 parent.candidate_sha 是否为当前 candidate_sha 的祖先（不允许 fail-open，issue #9 R3 blocker）';
             } else {
               try {
@@ -232,20 +253,28 @@ export function runConsensusGate(verdicts, opts = {}) {
             } else {
               parentArtifactHash = parentArtifact.consensus_artifact_hash;
             }
+            } // 闭合 pr_number 有条件强制的 else（issue #9 R4 修复①）
           }
         }
       }
     }
   }
   // T1 上限声明（issue #9 R3 blocker 修复的已知边界，如实声明，不得读作"谱系已可信"）:
-  // 以上两道新增校验（base_sha 相同 + candidate_sha 真祖先）堵住的是「疏忽/误拼」与
-  // 「跨 PR/跨谱系张冠李戴」两类输入错误——但 parent artifact 终究是调用方本地磁盘上的一份
-  // JSON 文件，lead 对它有写权限。一份 base_sha 与当前完全相同、candidate_sha 确实是当前
-  // candidate 的真实历史祖先（比如 lead 手工在真仓库里造出这段祖先链）、hash 自洽、
-  // gate_result=pass 的"完全自洽的伪 R2"依然能通过本门——因为这些都是本地可构造满足的
-  // 条件，不涉及任何签名或第三方存证。要防这一类需要引入可信 ledger/签名（本轮已否决，
-  // 见派工包 Decisions②：新增机制需过确认门，删掉它其余判据照样成立）。本修复只防疏忽/
-  // 误用/跨谱系张冠李戴，T1：不防伪造。
+  // 以上新增校验（base_sha 相同 + candidate_sha 真祖先 + 严格不等 + pr_number 有条件强制，
+  // issue #9 R4 补上同 SHA 铸造轮号与跨 PR 张冠李戴的缺口——`git merge-base --is-ancestor
+  // A A` 退出 0，同 SHA 此前能通过；parent 有 PR 号时与 bundle 不符此前也能过）堵住的是
+  // 「疏忽/误拼」「跨 PR/跨谱系张冠李戴」与「零推进铸造轮号」三类输入错误——但 parent
+  // artifact 终究是调用方本地磁盘上的一份 JSON 文件，lead 对它有写权限。一份 base_sha 与当前
+  // 完全相同、candidate_sha 确实是当前 candidate 的**真**历史祖先（比如 lead 手工在真仓库里
+  // 造出这段祖先链）、hash 自洽、gate_result=pass 的"完全自洽的伪 R2"依然能通过本门——因为
+  // 这些都是本地可构造满足的条件，不涉及任何签名或第三方存证。要防这一类需要引入可信
+  // ledger/签名（本轮已否决，见派工包 Decisions②：新增机制需过确认门，删掉它其余判据照样
+  // 成立）。本修复只防疏忽/误用/跨谱系张冠李戴/零推进，T1：不防伪造。
+  // 残余洞（lead 裁决 4 要求如实写，不冒充"已堵跨 PR"）：R1 无 PR（pr_number=null）、R2 用
+  // 另一个 PR 的 bundle——机器无法区分「R2 建了自己的 PR」与「张冠李戴」，仍在 T1 上限内
+  // （防疏忽不防伪造）。合法出口：PR 号变了 → 重开 R1（SC-B 语义 R1 本就可重跑，代价是两个
+  // 对抗席重扫十类加固清单——这本就是设计意图），不加 override 阀门（会回到 SC-2 被自我
+  // 否决的「漏传 parent 填 reason 即过」形态，lead 2026-08-07 裁决 3）。
 
   // conjunct ①: 同 hash 且等于 bundle 重算值
   let recomputed = null;
@@ -360,7 +389,11 @@ export function runConsensusGate(verdicts, opts = {}) {
     verdict_hashes,
     created_at: nowIso(),
     gate_result: 'pass',
-    fail_reasons: []
+    fail_reasons: [],
+    // issue #9 R4 修复①（lead 裁决）: pr_number 进 artifact（烙进 consensus_artifact_hash），
+    // 不进 review_input_hash——进了会因「Phase 3 建 PR」动作让同一 candidate 的 input hash 变
+    // → 三份 verdict 全失效 → 整轮重跑，正是轮次膨胀根因之一（与 pr_body 在 input hash 里同病灶）。
+    pr_number: bundle.pr_number ?? null
   };
   return { ...draft, consensus_artifact_hash: recomputeArtifactHash(draft) };
 }
@@ -384,7 +417,8 @@ export function recomputeArtifactHash(artifact) {
     canonicalJson(artifact.canonical_findings) + canonicalJson(artifact.verdict_hashes) +
     canonicalJson({ parent: artifact.parent_artifact_hash ?? null }) +
     canonicalJson({ gate_result: artifact.gate_result, round: artifact.round }) +
-    canonicalJson({ schema_version: artifact.schema_version ?? null })
+    canonicalJson({ schema_version: artifact.schema_version ?? null }) +
+    canonicalJson({ pr_number: artifact.pr_number ?? null }) // R4: pr_number 烙入 artifact hash（照 gate_result 末尾追加）
   );
 }
 
@@ -424,6 +458,12 @@ export function assertArtifactShape(artifact, label = 'consensus artifact') {
     }
   } else if (typeof artifact.parent_artifact_hash !== 'string' || !/^[0-9a-f]{64}$/.test(artifact.parent_artifact_hash)) {
     errs.push(`${label}.round=${artifact.round} 但 parent_artifact_hash=${JSON.stringify(artifact.parent_artifact_hash)} 非合法 64-hex（round>=2 必须携带谱系）`);
+  }
+  // issue #9 R4 修复①: pr_number 结构门（integer 或 null）——缺字段/被删不再静默兜底为 null
+  // （照 round/gate_result 的同一原则：结构非法必须显式点名，不能靠 recomputeArtifactHash 的
+  // `?? null` 兜底出一个"看起来合法"的值）。它已入 consensus_artifact_hash，结构上理应同批校验。
+  if (artifact.pr_number !== null && !Number.isInteger(artifact.pr_number)) {
+    errs.push(`${label}.pr_number=${JSON.stringify(artifact.pr_number)} 非法（须为 integer 或 null，issue #9 R4 修复①）`);
   }
   return errs;
 }

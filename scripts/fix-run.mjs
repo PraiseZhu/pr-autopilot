@@ -28,6 +28,14 @@ const isTestPath = (p) => TEST_PATH_RE.test(p) || TEST_FILE_RE.test(p);
 
 function git(repoDir, ...a) { return execFileSync('git', ['-C', repoDir, ...a], { encoding: 'utf8', timeout: 120_000 }).trim(); }
 
+// R4 归一（lead 2026-08-07）：run manifest 的 schema 版本此前是散字面量（构造 'v3' +
+// runManifestHash 的 'fix-run/v3' tag + batch-closure-gate 校验 'v3'）——同类「纯值散字面量」
+// 漂移点（与 artifact schema 版本号散在实现里同一形状）。改为单一导出常量，各处引用。
+// 注意：这是 **run manifest 自己的 schema 版本**，与 consensus-artifact.schema.json 的
+// schema_version（ARTIFACT_SCHEMA_VERSION）是两套独立版本线——前者无独立 schema 文件，
+// 后者从 schema 派生。此处导出让实现内不再手写字面量。
+export const RUN_MANIFEST_SCHEMA_VERSION = 'v3';
+
 export function runManifestPath(stateDir, runId) { return join(stateDir, `run-${runId}.json`); }
 export function integrationBranch(runId) { return `fix/${runId}/integration`; }
 export function integrationWorktree(worktreeRoot, runId) { return join(worktreeRoot, `${runId}-integration`); }
@@ -65,8 +73,30 @@ function loadRun(stateDir, runId, plan = null) {
 }
 
 // ---- init: 绑定 plan + sc manifest + 源共识（起点由 artifact 派生，不接受 CLI 自报 SC-R3-10） ----
-export function initRun({ stateDir, runId, repoDir, plan, scManifest, sourceArtifact, featureBranch }) {
+// i9-batch: 可选 batch 参数 { batch_id, frozen_families }——批次事务协议（issue #9 SC 延伸）。
+// 批次开始即冻结待处置 family 集：frozen_at_sha 强制 = source_candidate（CAS 派生，不接受自报，
+// 与 SC-R3-10 同一原则）；frozen_families 每项必须匹配 fk1- 派生 key 且**必须存在于源共识的
+// canonical_findings**（冻结集只能来自这份审查产物，编造/照抄他批 family 即拒，fail-closed）。
+export function initRun({ stateDir, runId, repoDir, plan, scManifest, sourceArtifact, featureBranch, batch }) {
   if (!/^[A-Za-z0-9._-]+$/.test(String(runId))) throw new Error(`runId 非法: ${runId}`);
+  if (batch !== undefined) {
+    if (!batch || typeof batch !== 'object') throw new Error('batch 参数非法: 必须为对象 { batch_id, frozen_families }（fail-closed）');
+    if (!/^[A-Za-z0-9._-]+$/.test(String(batch.batch_id ?? ''))) throw new Error(`batch_id 非法: ${batch.batch_id}`);
+    if (!Array.isArray(batch.frozen_families) || batch.frozen_families.length === 0) {
+      throw new Error('batch.frozen_families 必须是非空数组（批次冻结集为空 = 没有待处置义务，语义不成立，fail-closed）');
+    }
+    for (const fk of batch.frozen_families) {
+      if (typeof fk !== 'string' || !/^fk1-[0-9a-f]{64}$/.test(fk)) {
+        throw new Error(`batch.frozen_families 含非法 family_key: ${JSON.stringify(fk)}（必须是 fk1- 派生的 64-hex key，i9-batch）`);
+      }
+    }
+    const canonKeys = new Set((sourceArtifact?.canonical_findings ?? []).map((c) => c.family_key).filter(Boolean));
+    for (const fk of batch.frozen_families) {
+      if (!canonKeys.has(fk)) {
+        throw new Error(`batch.frozen_families 含不在源共识 canonical_findings 中的 family_key: ${fk.slice(0, 12)}…（冻结集只能从源共识派生，fail-closed，i9-batch）`);
+      }
+    }
+  }
   const real = computeFixPlanHash(plan);
   if (plan.fix_plan_hash !== real) throw new Error('plan 自身 hash 与内容重算不符（plan 被改）');
   // issue #9 R2 blocker: 结构门先于 hash 自洽——sourceArtifact 的 schema_version/round 非法
@@ -85,7 +115,7 @@ export function initRun({ stateDir, runId, repoDir, plan, scManifest, sourceArti
   const path = runManifestPath(stateDir, runId);
   if (existsSync(path)) throw new Error(`run ${runId} 已存在（幂等保护，换 runId 或先 cleanup）`);
   const m = {
-    schema_version: 'v2', run_id: runId, repo_dir: repoDir,
+    schema_version: RUN_MANIFEST_SCHEMA_VERSION, run_id: runId, repo_dir: repoDir,
     fix_plan_hash: plan.fix_plan_hash,
     sc_manifest_hash: hashObject(scManifest),
     source_artifact_hash: srcHash,
@@ -94,7 +124,17 @@ export function initRun({ stateDir, runId, repoDir, plan, scManifest, sourceArti
     integration_branch: integrationBranch(runId),
     waves: [], events: []
   };
-  appendEvent(m, { kind: 'run-init', source_candidate: sourceCandidate, source_artifact_hash: srcHash, plan_hash: plan.fix_plan_hash, sc_manifest_hash: m.sc_manifest_hash, waves: plan.waves.length });
+  // i9-batch: 批次段——frozen_at_sha 派生不自报；successor_sha/status 在 finalizeRun 收口时写入。
+  if (batch !== undefined) {
+    m.batch = {
+      batch_id: batch.batch_id,
+      frozen_at_sha: sourceCandidate,
+      frozen_families: [...new Set(batch.frozen_families)].sort(), // 确定性: 去重 + 排序，hash 稳定
+      successor_sha: null,
+      status: 'open'
+    };
+  }
+  appendEvent(m, { kind: 'run-init', source_candidate: sourceCandidate, source_artifact_hash: srcHash, plan_hash: plan.fix_plan_hash, sc_manifest_hash: m.sc_manifest_hash, waves: plan.waves.length, ...(m.batch ? { batch_id: m.batch.batch_id, frozen_families: m.batch.frozen_families.length } : {}) });
   saveManifest(path, m);
   return m;
 }
@@ -644,7 +684,14 @@ export function finalizeRun({ stateDir, runId }) {
     }
   }
   m.final_candidate = last.integrated_tip;
-  appendEvent(m, { kind: 'run-finalized', final_candidate: last.integrated_tip, feature_branch: m.feature_branch ?? null });
+  // i9-batch: 批次收口——successor_sha 由 final_candidate 派生（CAS 派生，不自报），
+  // status 置 closed。push-guard 侧验证「恰好一个后继」：successor_sha 必须是 frozen_at_sha
+  // 的直接后继（见 push-guard.mjs 的批次校验段）。
+  if (m.batch) {
+    m.batch.successor_sha = last.integrated_tip;
+    m.batch.status = 'closed';
+  }
+  appendEvent(m, { kind: 'run-finalized', final_candidate: last.integrated_tip, feature_branch: m.feature_branch ?? null, ...(m.batch ? { batch_id: m.batch.batch_id, successor_sha: m.batch.successor_sha, batch_status: m.batch.status } : {}) });
   saveManifest(path, m);
   return { final_candidate: last.integrated_tip, manifest: m };
 }
@@ -662,9 +709,13 @@ export function recordedSquashes(m) {
 
 // SC-9 用: run manifest 的权威 hash（纳入 fix_orchestration）——
 // SC-R3-3: validation 明细（sc_id/exit/verify digest）入锅，事后换 sc manifest/结果即失效
+// i9-batch: batch 段（batch_id/frozen_at_sha/frozen_families/successor_sha/status）入锅——
+// 照 gate_result 入 recomputeArtifactHash 的同一做法：末尾追加 canonicalJson，不重排既有字段；
+// v tag 升 'fix-run/v3'，旧 manifest（v2）重算 hash 不再等于声明值，push-guard 的
+// fix_orchestration.run_manifest_hash 比对即 fail-closed。
 export function runManifestHash(m) {
   return sha256(canonicalJson({
-    v: 'fix-run/v2', run_id: m.run_id, fix_plan_hash: m.fix_plan_hash,
+    v: `fix-run/${RUN_MANIFEST_SCHEMA_VERSION}`, run_id: m.run_id, fix_plan_hash: m.fix_plan_hash,
     sc_manifest_hash: m.sc_manifest_hash, source_artifact_hash: m.source_artifact_hash,
     source_candidate: m.source_candidate, final_candidate: m.final_candidate ?? null,
     waves: (m.waves ?? []).map((w) => ({
@@ -674,7 +725,14 @@ export function runManifestHash(m) {
       squashes: w.squash_commits ?? [],
       rounds: (w.replan?.rounds ?? []).map((r) => ({ g: r.group_id, base: r.base, tip: r.tip, squash: r.squash })),
       validation: w.validation ? { ok: !!w.validation.ok, results: (w.validation.results ?? []).map((r) => ({ sc_id: r.sc_id, status: r.status, exit_code: r.exit_code, verify_digest: r.verify_digest })) } : null
-    }))
+    })),
+    batch: m.batch ? {
+      batch_id: m.batch.batch_id,
+      frozen_at_sha: m.batch.frozen_at_sha,
+      frozen_families: m.batch.frozen_families ?? [],
+      successor_sha: m.batch.successor_sha ?? null,
+      status: m.batch.status ?? null
+    } : null
   }));
 }
 

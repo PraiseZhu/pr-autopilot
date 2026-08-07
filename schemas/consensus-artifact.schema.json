@@ -1,15 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "pr-autopilot/consensus-artifact/v3",
-  "title": "共识 artifact v3（计划 §1.1b ⑩ 第二段 hash；issue #9 R2 blocker 升版：schema_version/round/parent_artifact_hash 结构不再只靠 hash 自洽把关，见 consensus-gate.mjs 的 assertArtifactShape）",
+  "$id": "pr-autopilot/consensus-artifact/v4",
+  "title": "共识 artifact v4（issue #9 R4 修复①：pr_number PR 身份绑定，入 consensus_artifact_hash 照 gate_result/round 做法；不进 review_input_hash——lead 2026-08-07 裁决，防「建 PR」成整轮失效触发器）",
   "type": "object",
   "required": [
     "schema_version", "review_input_hash", "base_sha", "candidate_sha",
     "canonical_findings", "verdict_hashes", "consensus_artifact_hash",
-    "created_at", "gate_result", "round", "parent_artifact_hash"
+    "created_at", "gate_result", "round", "parent_artifact_hash", "pr_number"
   ],
   "properties": {
-    "schema_version": { "const": "v3" },
+    "schema_version": { "const": "v4" },
+    "pr_number": {
+      "type": ["integer", "null"],
+      "description": "issue #9 R4 修复①：PR 身份绑定。PR 号（有 draft PR 时）或 null（无 PR 直跑三审，SKILL.md 明文支持）。入 consensus_artifact_hash（recomputeArtifactHash），不进 review_input_hash（lead 裁决：进了会因「建 PR」动作让同一个 candidate 的 hash 变 → 三份 verdict 全失效 → 整轮重跑，正是轮次膨胀根因之一）。"
+    },
     "review_input_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "round": {
       "type": "integer", "minimum": 1,

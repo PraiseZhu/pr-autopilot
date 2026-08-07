@@ -343,6 +343,38 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
               for (const s of recorded) {
                 if (!revs.includes(s)) errors.push(`run manifest 登记的 squash ${s.slice(0, 12)} 不在最终链上（记录与历史不符，fail-closed）`);
               }
+              // i9-batch: 批次「严格后代」校验——批次是事务：一批 finding → 一个已解决状态
+              // （一个 successor artifact / 一个收口状态）。successor_sha 必须是 frozen_at_sha
+              // 的**严格后代**（is-ancestor + 不等，任意距离），不是要求恰好一个 commit——多
+              // commit 分步修复合法；run 起点（source_candidate）之外的批次起点被拦（批次起点
+              // 必须由 run 起点派生，batch-closure-gate ② 同判据，此处独立重验）。
+              const batch = runManifest.batch ?? null;
+              if (batch) {
+                if (batch.status !== 'closed') {
+                  errors.push(`run manifest 批次 ${batch.batch_id} status=${JSON.stringify(batch.status)} ≠ closed（批次未收口，不得 push）`);
+                } else {
+                  if (batch.frozen_at_sha !== runManifest.source_candidate) {
+                    errors.push(`批次 frozen_at_sha（${String(batch.frozen_at_sha).slice(0, 12)}）≠ run 起点 source_candidate（${String(runManifest.source_candidate).slice(0, 12)}）——批次起点必须由 run 起点派生，不接受自报（i9-batch）`);
+                  }
+                  if (batch.successor_sha !== finalTip) {
+                    errors.push(`批次 successor_sha（${String(batch.successor_sha).slice(0, 12)}）≠ 最终 integrated_tip（${finalTip.slice(0, 12)}）——批次后继必须等于 run 的最终候选（i9-batch）`);
+                  }
+                  // i9-batch 语义（lead 2026-08-07 撤回「直接后继」后定案）: 批次是一次「一批
+                  // finding → 一个已解决状态」的事务，不要求单 commit——多 commit 分步修复
+                  // 合法（分步修、边修边测）。successor_sha 必是 frozen_at_sha 的**严格后代**
+                  // （任意距离，不得等于起点）。
+                  // **此处刻意不设检查**（lead 2026-08-07 裁定，确认门：删掉它其他判断还成立
+                  // = 成立就不建）：该不变量由本守卫的 expected_sha 绑定 + SC-3 终版 artifact
+                  // 的 parent 祖先绑定 **by construction 共同保证**；实测确认「非后代/零推进」
+                  // 在完整链上无法独立构造触发（会被前置检查先拦）。一道不可达的检查会让人
+                  // 误以为是它在拦，而真正的强制点在别处——比没有这道门更危险。
+                  // 完整不变量声明见 convergence-checkpoint.md 批次段。
+                  if (batch.successor_sha === finalTip && batch.frozen_at_sha === runManifest.source_candidate) {
+                    // 语义契约：successor 必为 frozen 的严格后代（由 expected_sha + SC-3 保证，
+                    // 此处只保留 successor==finalTip 与起点派生的一致性断言）
+                  }
+                }
+              }
             } catch (e) { errors.push(`DAG lineage 校验失败（fail-closed）: ${e.message}`); }
           }
         }

@@ -17,6 +17,11 @@ export function computeReviewInputHash(input) {
   if (typeof input.touches_ui !== 'boolean') throw new Error('touches_ui 必须是 boolean');
   if (!Array.isArray(input.matched_paths)) throw new Error('matched_paths 必须是数组');
   // 只取契约字段参与 hash，多余字段不入锅（防止携带易变字段导致 hash 漂移）
+  // 注意（lead 2026-08-07 裁决 2）：pr_number **刻意不入** review_input_hash——
+  // 进了会因「Phase 3 建 draft PR」动作（null→N）让同一 candidate 的 input hash 变 →
+  // 三份 verdict 全失效 → 整轮重跑，正是轮次膨胀根因之一（与 pr_body 在 input hash 里同病灶）。
+  // pr_number 只进 artifact + consensus_artifact_hash（consensus-gate.mjs 处理），
+  // 对 review_input_hash 是多余字段，被这里忽略。
   const canonical = {
     base_sha: input.base_sha,
     candidate_sha: input.candidate_sha,

@@ -8,7 +8,7 @@
 
 ## 触发条件（命中即停手，下一个修复 commit 前必须先产出六件套）
 
-三条命中任一即触发：
+四条命中任一即触发（并列关系，不是替代；任一条命中即停手）：
 
 1. 上一轮修复被指出（或自查发现）漏了对称的另一半——例如 resolve 分支修了、reject 分支
    没修；同步路径修了、迟到/乱序路径没修。
@@ -16,6 +16,20 @@
    没有归一，继续加第 3 处只是把同一个洞打三个补丁。
 3. repair-mode watermark（`SKILL.md`「收敛判据与收口」）计数到第 5 个 candidate 仍出现
    新 family。
+4. **某个 `family_key` 在一个批次的 `frozen_families` 中被处置后，又出现在后续批次的
+   `frozen_families` 里**（批次事务协议，issue #9 SC 延伸；i9-batch）。这条是批次协议对
+   既有机制的**真实增量**：既有 1〜3 全是人判形状（"漏了对称一半"/"第 3 处判据"/"水位线到
+   第 5 个"），本条**机器可判且更早**——`family_key` 逐字内容派生（`consensus-gate.mjs` 的
+   `familyKeyOf`），跨批次出现即可比对；比等 5 个 candidate 或 2 轮窄面更早暴露「SC 一路绿、
+   bug 一路复发」的捉老鼠成因。命中本条时，下一个修复 commit 前必须产出下方「复发归因段
+   （recurrence）」——它是既有六件套的**补充载体**（回看上一次 SC 为什么失效，既有六件套
+   从头到尾没有这一问），不是替代六件套；命名纪律：**「六件套」保持既有那套的唯一称谓**，
+   本段不叫六件套。
+   > **T1 边界（如实声明，lead 2026-08-07 措辞）**：批次协议拦的是**逐字复发**，拦不住
+   > **语义复发**——`family_key` 由 `invariant` 的字面文本派生（仅 trim/小写/去空白），
+   > 同一根因换个说法会算出不同 key、机器视为新族。语义级同族复发的判断权在 lead，机器
+   > 无能力。上面「机器可判且更早」说的是优点；本条边界说的是它**治不了什么**——反捉老鼠
+   > 的痛点本体就是语义复发，本机制只拦逐字复发，不冒充已解决语义复发。
 
 ## 原子性（D1，硬约束）
 
@@ -113,8 +127,51 @@ state_owners:[{field,owner,lifecycle}], event_state_matrix:[{event,state,action,
 symmetry_audit:[{path,status,note}], normalization:[{semantic,consolidated_to}],
 tests:[{name,distinguishes}] }`——`scripts/pr-body.mjs` 的 `buildCheckpointSection` 只负责
 渲染，不判断六件套是否齐全（那仍是 lead 派工/收口时的过程纪律，见上方 D1 原子性）。
+
+**复发归因段（recurrence，可选字段，仅触发条件④命中时必填）**：`checkpoint.json` 的
+顶层可选字段，不占六件套名额、不叫六件套。结构：
+
+```json
+{
+  "recurrence": {
+    "family_key": "fk1-…",                  // 复发的族（必须 ∈ 本批 frozen_families）
+    "prior_batch_id": "…",                  // 上次在哪个批次被处置
+    "prior_candidate_sha": "…",             // 上次的修复 commit
+    "prior_sc_id": "SC-…",                  // 上次声称拦住它的 SC（必须 ∈ sc manifest）
+    "prior_sc_missed_because": "…",         // 自由文本：那条 SC 为什么没拦住（T1 只验非空）
+    "verdict": "fix_was_wrong" | "family_was_misgrouped" | "fix_was_symptom",
+    "root_cause_locator": "路径:行号"        // 仅当 verdict="fix_was_symptom" 时必填
+  }
+}
+```
+
+对照 lead 原六问的压缩：①②③ 收成 `prior_sc_id` + `prior_sc_missed_because`；④「修错还是
+族归错」是 `verdict` 二选一；⑤⑥「根因还是症状」是 `verdict` 第三值 + 症状时强制
+`root_cause_locator`。结构化枚举比六段自由文本更可判。
+
+**齐全性检查在批次闭合门（`scripts/batch-closure-gate.mjs`），不在 `pr-body.mjs`**——
+`buildCheckpointSection` 只渲染、不判断齐全的职责边界不扩。闭合门验：recurrence 字段齐全 +
+`verdict` enum 合法 + symptom 时 `root_cause_locator` 非空（形如 `路径:行号`）+ `family_key`
+∈ 本批 `frozen_families` + `prior_sc_id` ∈ sc manifest。保证等级 **T1（防疏忽不防伪造，
+如实声明）**：`prior_sc_missed_because` 填一句废话也能过，机器只锁形状与自洽；「这次是不是
+真的同族复发」的判断权在 lead（机器无跨批次账本，无法独立判定），申报后由机器验形状。
 半残/重复 marker（只有 start、只有 end、重复 start）→ 脚本 fail loud 拒绝写入，不会静默
 在文档里堆出第二段。
 产出同时服务三个读者：自己下一步修复时的模型、lead 判断是否收敛的依据、审查席复核 delta
 时的判据来源——`review-convergence.md` §2 原文称之为「reviewer 有了明确不变量后反馈会明显
 更聚焦，不再每轮换个入口挑一条」。
+
+## 批次严格后代不变量（lead 2026-08-07 定案，防后人误加回重复检查）
+
+批次的 successor 必是 `source_candidate` 的**严格后代**（任意距离，不得等于起点）——批次是
+「一批 finding → 一个已解决状态」的事务，多 commit 分步修复合法，不要求直接子 commit。
+
+该不变量由 push-guard 的 `expected_sha` 绑定 + SC-3（终版 artifact 的 parent 祖先绑定）
+**by construction 共同保证**；实测确认「非后代/零推进」在完整链上**无法独立构造触发**
+（会被前置检查先拦）。
+
+**因此批次门不再重复校验 —— 这不是疏漏，是刻意不加**：一道不可达的检查会让人误以为是它
+在拦，而真正的强制点在别处（比没有这道门更危险——它正是「声明看着在验、实际没验」这个
+本项目反复咬人的缺陷形状）。后人若要在此处加「严格后代」守卫，须先证明 `expected_sha` +
+SC-3 存在可独立构造的失效路径（带实证，不是「未来可能变松」的推测），否则按「新增机制确认
+门」不建。

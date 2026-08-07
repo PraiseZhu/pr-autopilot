@@ -668,6 +668,14 @@ candidate 不改变它们的判据（与本节「反猫捉老鼠」立场一致�
 > 另需区分：`SKILL.md` Phase 2「lead 争议质询 ≤3 轮」是**仲裁**轮次上限（lead 与审查席就某条 finding
 > 是否成立的往复），**不计**修复轮/delta 复核轮——两者互不换算。
 
+**批次事务协议（issue #9 SC 延伸，i9-batch；2026-08-07 落地）**：把「一批 finding」变成一个事务——批次开始时冻结待处置集合（`frozen_families` = family_key 集合，不是 finding id），一次修完产出**恰好一个后继 commit**（一个 successor artifact / 一个收口状态），批次期间新冒出的 finding 进下一批而不是打断当前批。
+
+- **run manifest 批次段**：`batch: { batch_id, frozen_at_sha, frozen_families, successor_sha, status }`——`frozen_at_sha` 由 source_candidate 派生（不自报），`successor_sha`/`status=closed` 在 finalizeRun 收口写入；batch 段入 runManifestHash（照 gate_result 入 artifact hash 的同一做法）。schema_version 升 v3（`RUN_MANIFEST_SCHEMA_VERSION`）。
+- **批次闭合门**（`scripts/batch-closure-gate.mjs`）判据：①批次已收口 ②frozen_at_sha == run 起点 ③冻结集 ⊆ 源共识 family_keys ④**冻结集 family 在终版 delta 审查中再次出现 = 同族复发 = 未处置 → 拒收口**（ARCHIVE 出口：该 family 有一条 archive SC 则放行——ARCHIVE 的 finding 留在 findings[] 且进终版 canonical，见 SKILL.md 处置载体表，`status=closed` ≠ 不进 canonical；出口判据 =「该族有 archive SC」结果导向，verify 由 fix-run.mjs:551/:643 wave validation 层保证）⑤本批 SC 不得处置冻结集外 family（新 family 进下一批）⑥blocker/major 必须带 family_key（缺 invariant 无法归族 = 没归因就打补丁，先归因再进批次）⑦recurrence 段形状校验。
+- **严格后代不变量**（lead 2026-08-07 撤回「直接后继」）：批次的 successor 必是 source_candidate 的**严格后代**（任意距离，不得等于起点）——多 commit 分步修复合法。该不变量由 push-guard 的 `expected_sha` 绑定 + SC-3（终版 artifact 的 parent 祖先绑定）**by construction 共同保证**；实测确认「非后代/零推进」在完整链上无法独立构造触发（会被前置检查先拦）。**因此批次门不再重复校验——不是疏漏，是刻意不加**（一道不可达的检查会让人误以为是它在拦，比没有更危险）。后人若要加守卫须先证明存在可独立构造的失效路径（带实证，不是推测），否则按「新增机制确认门」不建。
+- **pr_number PR 身份绑定**（R4 修复①）：bundle + artifact 各带 `pr_number`（integer|null，派审时无 PR 可为 null——SKILL.md 明文支持无 PR 直跑三审）。parent 校验有条件强制：`parent.pr_number !== null` 时 `bundle.pr_number === parent.pr_number` 必须成立（堵跨 PR 张冠李戴），null 时不限（「先无 PR 审 R1、后有 PR 审 R2」合法演进）。pr_number **入 consensus_artifact_hash**（烙进 artifact，伪造不了自洽）、**不入 review_input_hash**（进了会因「Phase 3 建 PR」动作 null→N 让同一 candidate 的 input hash 变 → 三份 verdict 全失效 → 整轮重跑，正是轮次膨胀根因之一）。**PR 号变了 → 重开 R1**（SC-B 语义 R1 本就可重跑，代价是两个对抗席重扫十类加固清单——这本就是设计意图），不加 override 阀门（会回到 SC-2 被自我否决的「漏传 parent 填 reason 即过」形态）。残余洞如实写进 T1：R1 无 PR（null）、R2 用另一个 PR 的 bundle——机器无法区分「R2 建了自己的 PR」与「张冠李戴」，**不冒充已堵跨 PR**。
+- **语义复发边界（T1 上限，如实声明）**：批次协议拦的是**逐字复发**，拦不住**语义复发**——`family_key` 由 `invariant` 的字面文本派生（`familyKeyOf`，仅 trim/小写/去空白），同一根因换个说法会算出不同 key、机器视为新族。语义级同族复发的判断权在 lead，机器无能力。**反捉老鼠的痛点本体就是语义复发，本机制只拦逐字复发，不冒充已解决**——语义级归族的机器化（要求每条 finding 显式声明「复用现有 family_key X」或「新族，与已列出的都不同因为…」，机器验动作存在性）已登记为下一轮独立议题（需改 dispatch-contract + verdict schema）。
+
 ## Phase 3 — push + 注册（lead 指定一个修复 worker 执行；并行场景选其一即可）
 
 worker 收**自包含 push manifest**（repo/remote/branch/**expected_sha**/`purpose=feature`/标题正文/已有 PR 号/注册 key/consensus_artifact_hash/`sc_manifest`+`sc_manifest_hash`/`fix_orchestration` 五件套）。base 不在 manifest 里——由共识 artifact 派生，manifest 无权自定（审②-F4）：
