@@ -654,8 +654,8 @@ t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生、run 
   // 反向: 两种签名都不得残留字面量（正则拼接构造防自引用）
   const vLit = "schema_version: 'v" + "[0-9]', reviewer";
   const rmLit = "schema_version: 'v" + "[0-9]', run_id";
-  ok(!own.includes(vLit), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
-  ok(!own.includes(rmLit), '本文件不得残留 run manifest schema_version 字面量（须用 RUN_MANIFEST_SCHEMA_VERSION 派生）');
+  ok(!new RegExp(vLit).test(own), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
+  ok(!new RegExp(rmLit).test(own), '本文件不得残留 run manifest schema_version 字面量（须用 RUN_MANIFEST_SCHEMA_VERSION 派生）');
 });
 
 // 等所有 async 测试完成后再出汇总（t 的 async 支持：主流程不等 Promise 会提前打印）

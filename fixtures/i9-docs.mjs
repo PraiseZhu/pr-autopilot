@@ -603,7 +603,7 @@ t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生，不�
   const own = readFileSync(fileURLToPath(import.meta.url), 'utf8');
   ok(/schema_version: SCHEMA_VERSION, reviewer/.test(own), '本文件 verdict 构造必须用 SCHEMA_VERSION 派生常量');
   const lit = "schema_version: 'v" + "[0-9]', reviewer";
-  ok(!own.includes(lit), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
+  ok(!new RegExp(lit).test(own), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
 });
 
 console.log(`\n========== i9-docs fixtures: ${pass} passed, ${failCount} failed ==========`);

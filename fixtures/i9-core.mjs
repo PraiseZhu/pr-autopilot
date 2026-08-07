@@ -603,13 +603,13 @@ t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生，不�
   const own = readFileSync(fileURLToPath(import.meta.url), 'utf8');
   ok(/schema_version: SCHEMA_VERSION, reviewer/.test(own), '本文件 verdict 构造必须用 SCHEMA_VERSION 派生常量');
   const lit = "schema_version: 'v" + "[0-9]', reviewer";
-  ok(!own.includes(lit), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
+  ok(!new RegExp(lit).test(own), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
   // B 类（2026-08-07）: artifact schema 版本也不得残留字面量（须用 ARTIFACT_SCHEMA_VERSION 派生）。
   // 反向正则收窄为「, review_input_hash 尾随」形态——artifact 对象的 schema_version 后必跟
   // review_input_hash；sc_manifest（'v2', consensus_artifact_hash 尾随）与 fix_plan（'v1'）是
   // 另一套协议，不在本自检范围。forgeArtifact 的 'v1' 是赋值形态（=号），也不在此列。
   const artLit = "schema_version: 'v" + "[0-9]', review_input_hash";
-  ok(!own.includes(artLit), '本文件不得残留 artifact schema_version 字面量（须用 ARTIFACT_SCHEMA_VERSION 派生）');
+  ok(!new RegExp(artLit).test(own), '本文件不得残留 artifact schema_version 字面量（须用 ARTIFACT_SCHEMA_VERSION 派生）');
 });
 
 console.log(`\n========== i9-core fixtures: ${pass} passed, ${failCount} failed ==========`);
