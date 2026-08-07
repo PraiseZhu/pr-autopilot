@@ -124,13 +124,19 @@ export EXPECT_EFFORT='xhigh'
 
 > 每条「后果」都逐跳落到 `文件:行号`（已核实）；落不到行号的写「成因未定」——空白比推测有用。
 > 症状名（如「budget cap 撞顶」）可能误导你对根因的判断，务必读因果链本身。
+> **本节表格三行全部是「被证伪」或「未验证」**（不是局部不准——「每个变量映射一个症状」的组织方式没有经验证的引擎反应模型支撑，故按后果导向重构）。判断依据可直接引：
+> - `docs/plan.md:163-164` W-2 首扫空目录立即退出；W-3 按类游标、exact-head、评论 node-id、CI 状态跃迁、at-least-once/副作用幂等；
+> - `docs/plan.md:31,42,83-84` 空清单零 GitHub 请求 / 零 LLM / 零 token；引擎每仓一条 schedule、空 state 目录秒退；
+> - `scripts/pr-watch/gate.mjs:3-10,16,61-74` 按类游标、同 head 的 `ci_red_sha` 去重、ack 后推进；
+> - `scripts/pr-watch/engine.mjs:181-225,250-269` pending 单飞、租约到期同 id 重派、reserve 仅新 actionable dispatch；
+> - `deploy/wrappers/probe.mjs:2-6` preRunHook 的 exit 2 / 不启动会话协议。
 
 | 变量/项 | 作用 | 已验证的直接后果（逐跳） |
 |---|---|---|
 | `PR_AUTOPILOT_HMAC_KEY` | 自家评论识别密钥（complete 校验回帖落地、gate 过滤自家评论） | 无 key → 修复完工回执校验失败 → 卡 pending → 最终 stuck 通知（①） |
 | `REQUIRED_CONTEXTS_FILE` | CI 判绿的 required contexts 清单（JSON 文件路径） | 无配置 → 每 head 首扫判 CI 红 → **该 head 首次唤醒**（不是持续每轮）（②） |
 | `SNAPSHOT_CACHE_DIR` | gh-snapshot 响应缓存/ETag（条件请求） | 不配 → 每轮探针都是**普通 API 请求**，配额被静默低估（②b） |
-| preRunHook | 班车调度跳过空转轮 | 不接 → **每个班车周期白起一个 agent 会话**（本机当前周期见 schedule 配置）；接 probe 注意退出码边界（③） |
+| preRunHook | 班车调度跳过空转轮 | 若宿主 schedule 每周期启动 agent 且未接 probe，则**可能**每周期启动会话（宿主行为需在 mini 实测）；接 probe 注意退出码边界（③） |
 
 **① `PR_AUTOPILOT_HMAC_KEY` —— 没配会卡在 pending 并最终触发 stuck 通知（有告警，不是静默）**
 
