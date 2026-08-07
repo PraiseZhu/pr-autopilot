@@ -165,7 +165,7 @@ node scripts/dispatch-contract.mjs --check pkg-<seat>.md --seat <reviewer> --rou
 |---|---|---|---|
 | ① claude-adversarial | anthropic-claude/claude-sonnet-5 / xhigh（Cindy AI 网关供应商，owner 2026-08-08 拍板替换裸 claude-sonnet-5） | 正确性 / 回归 / 影响面 | 盲审：不见其他席 finding |
 | ② codex-adversarial | codex/gpt-5.6-terra（骨折）/ xhigh；**条件升档**：本次 diff 路径命中目标仓 pr-rules.json `archGate.corePaths` → 该席 effort=ultra，派发说明标注原因 | 安全 / 边界 / 规范 | 盲审：同上 |
-| ③ upstream-preview | deepseek/deepseek-v4-flash / max（owner 2026-08-08 替换 claude-sonnet-5/xhigh） | review-pr skill 口径预演（规则遵从/安全隐私门/格式门/产品·架构门语义预判） | **严格只读**：禁止发 GitHub review/评论/合并/标签等一切对外写动作，只产内部报告 |
+| ③ upstream-preview | deepseek/deepseek-v4-flash / max（owner 2026-08-08 替换 claude-sonnet-5/xhigh） | **直接运行 review-pr 受限构建版**（preview-dist，见下方「席③执行契约」）：阶段一四门 + 阶段二独立审查真实执行，产内部 verdict | 对外写**白名单仅产品/架构 hold 三类**（开讨论 issue / PR hold 说明评论 / 转 draft 及 release/close 收尾）；其余 GitHub review/评论/合并/标签一律禁止（合并/批准/修代码/普通通知能力已在构建层物理剥离） |
 
 - **GPT 通路纪律（owner 2026-08-06 定案，三条通路择一）**：本机对 GPT 有**三条**互不相同的通路，
   从 model ID 前缀区分——`codex/gpt-*` = **骨折**（立省 85%）；裸 `gpt-*` = **Cindy AI 通路**
@@ -182,6 +182,12 @@ node scripts/dispatch-contract.mjs --check pkg-<seat>.md --seat <reviewer> --rou
   备选2 才降到裸 `gpt-5.5`）。
 - **降档观察窗（2026-08-05 起，连续 5 个走三审的 PR）**：lead 在台账逐席记 **unique-major**（只有该席抓到的 major/blocker 数）。seat① 换 sonnet 后 unique 率塌方（历史基线场均 2+ → 场均 0）→ 该席单席回滚 `claude-opus-5 / xhigh`，其他席不动。回滚对照基线（08-02~05，38 份裁决）：① opus/xhigh 27 major+1 blocker；② sol/xhigh 15+1（独抓率最高）；③ opus/high 12+1。
 - **争议仲裁席（L3，按需出场，不常驻）**：仅当 ①同一 finding 两轮 open/维持拉锯、②P0/P1 定性分歧、③对抗反驳终裁 三者之一发生时，lead 加派 codex / `codex/gpt-5.6-sol`（骨折），默认 effort=max，仲裁结论本身被推翻重来才升 ultra；骨折路由报 `BUDGET_MODEL_REQUIRES_API_MODE` → 降裸 `gpt-5.6-sol` 同 effort（**Cindy AI 通路**，不是官方订阅），标注不静默。**纪律**：仲裁席只产证据与分析内部报告供 origin reviewer 与 lead 参考，finding 仍由 origin reviewer close，报告不进共识判据、不改共识四 conjunct。
+- **席③执行契约（preview-dist 直跑，owner 2026-08-08 拍板替换「口径预演」）**：
+  - SKILL_ROOT = `/Users/praise/AI-Agent/Claude/capabilities/source/cindy-lizi-skills/preview-dist`（Review-PR 仓受限构建产物，能力剥离在构建层完成：无 merge/approve/REQUEST_CHANGES/fix-handoff/普通通知，保留完整审查链 + 自进化账本 + 5.3 分流 + 产品/架构 hold；见其 README）。
+  - 输入 = 本次 create-pr 预建的 **draft PR 号**；无 draft PR 时降级为旧口径预演（读 bundle diff 按四门语义预判），派发说明标注降级。
+  - 派工包必须要求 worker：`export REVIEW_PR_STATE_DIR=$(mktemp -d)`（一次性隔离目录，防污染 mini 正式巡审的收敛/复发/去重账本）；禁 `--auto`；执行到阶段二结束即产内部 verdict，四门结论映射 `gate_checks[]`（format-gate/rule-compliance/security-privacy-gate/product-arch-gate）。
+  - 对外写白名单同席位表边界列；自进化仅记账/提案（构建层已剥离回推主仓能力）。
+  - 同族复发维度如实声明：隔离空账本跑不出正式巡审的历史记忆效应，该维度结论仅供参考。
 
 三席各产两份输出：人读 markdown + **机器 JSON**（`schemas/review-verdict.schema.json` **v4**）。
 **v2 必填 `anchor_paths`**：每条 finding 除人读 `anchor` 外，必须给 `anchor_paths: string[]`——
