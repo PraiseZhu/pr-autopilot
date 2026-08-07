@@ -53,10 +53,23 @@ export function canonicalFindingKey(finding) {
 }
 
 export function runConsensusGate(verdicts, opts = {}) {
+  // issue #9 SC-B5: opts.parentArtifactHash 是已废弃参数，不再被任何代码读取。调用方若仍
+  // 传它（哪怕值是 undefined——用 hasOwnProperty 而非真值判断，防漏报），说明调用方代码
+  // 没跟上新契约，这是**编程错误**，不是 verdict 数据不合规——不得混进 failReasons（那会让
+  // 调用方误以为是 verdict 有问题去排错，而迁移期恰恰需要它响得刺耳），必须直接 throw。
+  // 根因（sc-final.md 审查发现）: 若只静默忽略废弃键，round=1 却想绑定 parent 的调用会被
+  // 误判成「无谱系的根」而 PASS——round=1 分支只看 `parentArtifact` 是否为真，不认识旧键。
+  if (Object.prototype.hasOwnProperty.call(opts, 'parentArtifactHash')) {
+    throw new Error(
+      'runConsensusGate: opts.parentArtifactHash 已废弃且不再被识别（issue #9 SC-B）——' +
+      '请改传 opts.parentArtifact，值必须是完整的 parent consensus artifact 对象本身' +
+      '（不是 consensus_artifact_hash 的 hash 字符串）。静默忽略旧键会让「round=1 却带 ' +
+      'parent」这类应被拒的输入错误地被当作「无谱系的根」放行（SC-B5）。'
+    );
+  }
   const bundle = opts.bundle ?? null;
-  // SC-3（R2-P1-1）: delta 轮必须 exact 绑定上一轮 artifact——只比 base_sha 挡不住
-  // 「同 base 的另一份源 artifact 冒充」。首轮为 null。
-  const parentArtifactHash = opts.parentArtifactHash ?? null;
+  // issue #9 SC-B: parent 绑定改为读取**完整 parent artifact 对象**（opts.parentArtifact），
+  // 不再接受 opaque 的 parentArtifactHash 字符串——校验逻辑见下方 round/parent 处理块。
   // R4-P1: changed-set 校验必须在**共识入口**生效，不能只活在 validator CLI——
   // 否则 tracked-but-unchanged 的 hub 路径能穿过 live 路径污染冲突图。
   // repoDir 在场时脚本自算实改集；调用方也可直接注入 changedPaths（fixture 用）。
@@ -98,18 +111,53 @@ export function runConsensusGate(verdicts, opts = {}) {
   }
   if (failReasons.length) return { gate_result: 'fail', fail_reasons: failReasons };
 
-  // D8-3: delta 轮缺 parent 必须拒。此前 SC-3 只在「调用方传了 parent」时才校验来源正确
-  // （fixture「SC-3: 同 base 错源必拒」那条），**漏传**却是静默放行——parent_artifact_hash
-  // 记成 null 照样出 pass artifact，谱系门对最常见的漏参路径完全 fail-open。
-  // 位置放在上面那道 schema 早返回**之后**，理由是**类型边界**: 到此 round 已过
-  // validateVerdict 的 `Number.isInteger(v.round) && v.round >= 1`，可以按整数直接算 max。
-  // 不是「放前面会 fail-open」——放前面也不会漏，非法 round 早被 validateVerdict 记成错误、
-  // 由那道早返回拦下。初版注释把理由写成「否则 NaN >= 2 为 false 就放行」，gpt 复审证伪，此处纠正。
-  // 取 max 而非要求三席 round 一致: 三席 round 若不一致，按最大的那个要求 parent
-  // （fail-closed 方向）。「三席 round 必须一致」是另一条不变量，本轮不在范围内。
-  const maxRound = Math.max(...verdicts.map((v) => v.round));
-  if (maxRound >= 2 && !parentArtifactHash) {
-    failReasons.push(`delta 轮（round=${maxRound}）未绑定上一轮 artifact：缺 --parent / parentArtifactHash——SC-3 谱系门不允许 fail-open（D8-3）`);
+  // issue #9 SC-B: round 重定义为「PASS consensus artifact 的序号」，不是审查尝试次数。
+  // 三席 round 必须完全一致——替代此前 D8-3「三席不一致时按最大值要求 parent」的静默取 max：
+  // 不一致本身就是应当被拒的输入错误，不该被悄悄纠正成「按最严的那个走」。
+  // 位置放在上面那道 schema 早返回**之后**：到此每份 verdict 已过 validateVerdict 的
+  // `Number.isInteger(v.round) && v.round >= 1`，可以直接按整数比较。
+  const roundSet = new Set(verdicts.map((v) => v.round));
+  let round = null;
+  if (roundSet.size !== 1) {
+    failReasons.push(`三席 round 不一致: ${[...roundSet].sort((a, b) => a - b).join('/')}（SC-B: round 必须完全一致，不再静默取最大值）`);
+  } else {
+    round = [...roundSet][0];
+  }
+
+  // SC-B4（lead 补充方案）: round 收成「PASS 序号」后，「这是第几次审查尝试」这条信息从
+  // round 里消失了，改由新字段 attempt 承载——三席必须一致（跨席才校验得到；单份 verdict 的
+  // 形状校验属 verdict-validate.mjs 的职责，不在本函数内做）。
+  const attemptSet = new Set(verdicts.map((v) => v.attempt));
+  if (attemptSet.size !== 1) {
+    failReasons.push(`三席 attempt 不一致: ${[...attemptSet].map((a) => JSON.stringify(a)).join('/')}（SC-B4: attempt 必须完全一致）`);
+  }
+
+  // SC-B: round=1 必须无 parent（首个可 PASS 的共识永远是谱系根，收紧 F9 的反方向缺口：
+  // 此前「round 1 带 parent」不拦）；round>=2 必须携带**完整可信**的 parent——不再只信任
+  // opaque 的 consensus_artifact_hash 字符串（此前 CLI 只取该字符串一个字段，parent 的
+  // gate_result / round 全无验证，伪造或过期的 parent 一样能绑进谱系）。
+  let parentArtifactHash = null;
+  const parentArtifact = opts.parentArtifact ?? null;
+  if (round === 1) {
+    if (parentArtifact) {
+      failReasons.push('round=1 不得携带 parent（首个可 PASS 的共识必须是无谱系的根，SC-B）');
+    }
+  } else if (round !== null) {
+    // roundSet.size===1 且 round!==1 时，round 必然 >=2（validateVerdict 已保证 >=1）。
+    if (!parentArtifact) {
+      failReasons.push(`delta 轮（round=${round}）未绑定上一轮 artifact：缺 --parent / parentArtifact——SC-B 谱系门不允许 fail-open`);
+    } else {
+      const parentReal = recomputeArtifactHash(parentArtifact);
+      if (parentArtifact.consensus_artifact_hash !== parentReal) {
+        failReasons.push('parent artifact 自身 hash 与内容重算不符（parent 被伪造/篡改，SC-B fail-closed）');
+      } else if (parentArtifact.gate_result !== 'pass') {
+        failReasons.push(`parent artifact gate_result=${parentArtifact.gate_result} ≠ pass（只有 PASS 共识才能作 parent，SC-B）`);
+      } else if (parentArtifact.round !== round - 1) {
+        failReasons.push(`parent artifact round=${parentArtifact.round} ≠ 当前 round-1=${round - 1}（父 round 跳号被拦，SC-B）`);
+      } else {
+        parentArtifactHash = parentArtifact.consensus_artifact_hash;
+      }
+    }
   }
 
   // conjunct ①: 同 hash 且等于 bundle 重算值
@@ -208,14 +256,18 @@ export function runConsensusGate(verdicts, opts = {}) {
   const candidate_sha = verdicts[0].candidate_sha;
   // 审③-F4-R: base/candidate 必须入锅——只改 artifact 声明的 SHA 即 hash 失效
   // SC-3: parent_artifact_hash 一并入锅——谱系被换即 hash 失效
+  // issue #9 SC-A1: gate_result 与 round 追加在末尾入锅（不重排既有字段顺序）——此前
+  // gate_result 未入 hash，PASS↔fail 互改而 hash 不变，手工拼一份 fail artifact 能冒充源共识。
   const consensus_artifact_hash = sha256(
     base_sha + candidate_sha + review_input_hash + canonicalJson(canonical_findings) + canonicalJson(verdict_hashes) +
-    canonicalJson({ parent: parentArtifactHash })
+    canonicalJson({ parent: parentArtifactHash }) +
+    canonicalJson({ gate_result: 'pass', round })
   );
   return {
-    schema_version: 'v2',
+    schema_version: 'v3',
     review_input_hash,
     parent_artifact_hash: parentArtifactHash,
+    round,
     base_sha,
     candidate_sha,
     canonical_findings,
@@ -228,11 +280,13 @@ export function runConsensusGate(verdicts, opts = {}) {
 }
 
 // push-guard 复用: 从 artifact 内容重算 hash（F4: 不信自报字符串；F4-R: 含 base/candidate）
+// issue #9 SC-A1: gate_result/round 追加入锅——任一字段翻转即 hash 失效（末尾追加，不重排既有字段）。
 export function recomputeArtifactHash(artifact) {
   return sha256(
     artifact.base_sha + artifact.candidate_sha + artifact.review_input_hash +
     canonicalJson(artifact.canonical_findings) + canonicalJson(artifact.verdict_hashes) +
-    canonicalJson({ parent: artifact.parent_artifact_hash ?? null })
+    canonicalJson({ parent: artifact.parent_artifact_hash ?? null }) +
+    canonicalJson({ gate_result: artifact.gate_result ?? null, round: artifact.round ?? null })
   );
 }
 
@@ -240,11 +294,21 @@ if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
   // R4-P1: live 入口必须带 --repo-dir——changed-set 校验缺席 = anchor 污染门形同虚设
   if (args._.length < 3 || !args.bundle || !args['repo-dir']) {
-    fail('用法: consensus-gate.mjs <v1.json> <v2.json> <v3.json> --bundle <bundle.json> --repo-dir <dir> [--parent <prev-artifact.json>] [--out artifact.json]\n（--repo-dir 必填: 共识入口自算 base..candidate 实改集校验 anchor_paths——R4-P1；delta 轮必须传 --parent——SC-3）');
+    fail('用法: consensus-gate.mjs <v1.json> <v2.json> <v3.json> --bundle <bundle.json> --repo-dir <dir> [--parent <prev-artifact.json>] [--out artifact.json]\n（--repo-dir 必填: 共识入口自算 base..candidate 实改集校验 anchor_paths——R4-P1；delta 轮（round>=2）必须传 --parent——issue #9 SC-B）');
   }
   const verdicts = args._.slice(0, 3).map(readJson);
-  const parentArtifactHash = args.parent ? readJson(args.parent).consensus_artifact_hash : null;
-  const result = runConsensusGate(verdicts, { bundle: readJson(args.bundle), parentArtifactHash, repoDir: args['repo-dir'] });
+  // issue #9 SC-B: 读**完整** parent 文件，不再只取 consensus_artifact_hash 字符串——
+  // gate_result/round/自身 hash 自洽全部要在 runConsensusGate 内部校验，opaque 字符串绑定不再可信。
+  const parentArtifact = args.parent ? readJson(args.parent) : null;
+  // issue #9 SC-B5: runConsensusGate 现在对「废弃参数名」这类编程错误会 throw（不再是
+  // fail_reasons 里的一条数据错误）——CLI 侧兜住，输出干净的单行消息，不让用户看到裸
+  // stack trace（本 CLI 自身从不传 parentArtifactHash，这里防的是未来误用/其他调用路径）。
+  let result;
+  try {
+    result = runConsensusGate(verdicts, { bundle: readJson(args.bundle), parentArtifact, repoDir: args['repo-dir'] });
+  } catch (e) {
+    fail(e.message);
+  }
   if (result.gate_result === 'pass') {
     if (args.out) writeJsonAtomic(args.out, result);
     process.stdout.write(`PASS consensus_artifact_hash=${result.consensus_artifact_hash}\n`);

@@ -71,6 +71,9 @@ export function initRun({ stateDir, runId, repoDir, plan, scManifest, sourceArti
   if (plan.fix_plan_hash !== real) throw new Error('plan 自身 hash 与内容重算不符（plan 被改）');
   const srcHash = recomputeArtifactHash(sourceArtifact);
   if (sourceArtifact.consensus_artifact_hash !== srcHash) throw new Error('源 consensus artifact hash 与内容重算不符（SC-R3-10）');
+  // issue #9 SC-A2: 源 artifact 必须是 PASS 共识——此前只验 hash 自洽，一份手工拼的
+  // fail artifact（hash 自洽但 gate_result=fail）能原样启动一次修复 run。
+  if (sourceArtifact.gate_result !== 'pass') throw new Error(`源 consensus artifact gate_result=${sourceArtifact.gate_result} ≠ pass（issue #9 SC-A: initRun 只接受 PASS 共识作源）`);
   if (plan.consensus_artifact_hash !== srcHash) throw new Error('plan 绑定的 artifact hash ≠ 源 artifact 重算值（plan 不是从这份共识算出来的）');
   const sourceCandidate = sourceArtifact.candidate_sha;
   if (!/^[0-9a-f]{40}$/.test(String(sourceCandidate))) throw new Error('源 artifact 的 candidate_sha 非法（起点由 artifact 派生，SC-R3-10）');

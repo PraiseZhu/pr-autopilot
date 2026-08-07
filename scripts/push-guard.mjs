@@ -230,6 +230,9 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
         const srcReal = recomputeArtifactHash(sourceArtifact);
         if (srcReal !== sourceArtifact.consensus_artifact_hash) errors.push('源 consensus artifact hash 与内容重算不符');
         if (fo.source_artifact_hash !== srcReal) errors.push('fix_orchestration.source_artifact_hash ≠ 源 artifact 重算值');
+        // issue #9 SC-A2: 源 artifact 必须是 PASS 共识——此前只验 hash 自洽，一份手工拼的
+        // fail artifact（hash 自洽但 gate_result=fail）能原样当源共识过完整编排链。
+        if (sourceArtifact.gate_result !== 'pass') errors.push(`源 consensus artifact gate_result=${sourceArtifact.gate_result} ≠ pass（issue #9 SC-A: fail 共识不得作为修复编排的源）`);
         // SC-3（R2-P1-1）: **exact parent 绑定**——旧实现只比 base_sha，同 base 的任意
         // 另一份源 artifact 都能冒充（SC/plan 于是绑在错误的 findings 上）。
         if (!artifact.parent_artifact_hash) {

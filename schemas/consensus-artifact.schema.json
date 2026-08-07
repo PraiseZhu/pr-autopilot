@@ -6,11 +6,15 @@
   "required": [
     "schema_version", "review_input_hash", "base_sha", "candidate_sha",
     "canonical_findings", "verdict_hashes", "consensus_artifact_hash",
-    "created_at", "gate_result"
+    "created_at", "gate_result", "round"
   ],
   "properties": {
-    "schema_version": { "const": "v1" },
+    "schema_version": { "const": "v3" },
     "review_input_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "round": {
+      "type": "integer", "minimum": 1,
+      "description": "issue #9 SC-B: PASS consensus artifact 的序号（不是审查尝试次数）。首个可 PASS 的共识永远是 1、parent_artifact_hash=null；round>=2 必须携带 round-1 的完整可信 parent。入 consensus_artifact_hash（consensus-gate.mjs 的 recomputeArtifactHash）。"
+    },
     "canonical_findings": {
       "type": "array",
       "items": {
