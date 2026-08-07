@@ -595,9 +595,22 @@ const scManifestWithArchFK1 = {
   ...scManifest,
   scs: [...scManifest.scs, { id: 'SC-ARCH-FK1', kind: 'archive', finding_ids: [cF1.id], invariant: I1, family_key: FK1, change: '登记 FK1 残余', holds: 'README 含 FK1 文案', verify: { cmd: 'grep', args: ['-q', 'FK1', 'README.md'] } }]
 };
-t('[i9-batch-14a] 冻结 family 被 ARCHIVE 处置（终版有该族 + 带 archive SC）→ 判据④放行（出口生效）', () => {
-  const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest: scManifestWithArchFK1 });
-  ok(!errs.some((e) => /同族复发/.test(e)), '带 FK1 的 archive SC → FK1 复发应被出口放行: ' + JSON.stringify(errs));
+t('[i9-batch-14a] 冻结 family 被 ARCHIVE 处置（终版有该族 + 带 archive SC 且该 SC 真实执行过）→ 判据④放行（出口生效）', () => {
+  // 2026-08-07 收紧（集成审查）：出口判据按注释声明补「该 archive SC 必须真实出现在某 wave
+  // allocations 且该 wave validation.ok === true」（补委派链断点——有 archive SC ≠ 执行过）。
+  // 构造：recurRunManifest 的 wave0 加 SC-ARCH-FK1 的 allocation + validation.ok=true。
+  const executedRunManifest = {
+    ...recurRunManifest,
+    waves: (recurRunManifest.waves ?? []).map((w, i) => (i === 0
+      ? { ...w, allocations: [{ group_id: 'arch', sc_ids: ['SC-ARCH-FK1'], worktree: '/x', anchor_paths: ['README.md'] }], validation: { at: 't', ok: true, results: [{ sc_id: 'SC-ARCH-FK1', status: 'PASS' }] } }
+      : w))
+  };
+  const errs = checkBatchClosure({ runManifest: executedRunManifest, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest: scManifestWithArchFK1 });
+  ok(!errs.some((e) => /同族复发/.test(e)), '带 FK1 的 archive SC 且真实执行过 → FK1 复发应被出口放行: ' + JSON.stringify(errs));
+  // 反向：archive SC 存在但未出现在任何 wave allocations（委派链断）→ 出口不成立，仍拒
+  const notExecuted = { ...recurRunManifest, waves: (recurRunManifest.waves ?? []).map((w) => ({ ...w, allocations: [], validation: { at: 't', ok: true, results: [] } })) };
+  const errsNotExec = checkBatchClosure({ runManifest: notExecuted, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest: scManifestWithArchFK1 });
+  ok(errsNotExec.some((e) => /同族复发/.test(e)), 'archive SC 未真实执行（allocations 空）→ 出口不成立，仍拒: ' + JSON.stringify(errsNotExec));
 });
 t('[i9-batch-14b] 无该族 archive SC（终版有该族）→ 判据④仍拒（出口判据=该族有 archive SC）', () => {
   const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest });

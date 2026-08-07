@@ -42,7 +42,7 @@ export const ARTIFACT_SCHEMA_VERSION = (() => {
 // 必须是当前 candidate_sha 的真实 git 祖先（原生 ancestry，不接受自报字符串）。
 // `git merge-base --is-ancestor` 退出码 0=是祖先、1=不是祖先（合法的否定结果，不是错误）、
 // 其它非零退出（revision 不可得等）视为无法判定——三态互不吞并，故不用简单的 try/catch true/false。
-function isAncestorCommit({ repoDir, ancestorSha, descendantSha }) {
+export function isAncestorCommit({ repoDir, ancestorSha, descendantSha }) {
   try {
     execFileSync('git', ['-C', repoDir, 'merge-base', '--is-ancestor', ancestorSha, descendantSha], { encoding: 'utf8', timeout: 60_000 });
     return true;

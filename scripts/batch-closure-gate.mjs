@@ -106,12 +106,43 @@ export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, 
   // 「archive SC 过 verify」由 fix-run 的 wave validation 层保证，闭合门不扩（按确认门：删掉
   // 它其他判断仍成立——verify 记录已随 run manifest validation 入 hash，push-guard 校验之）。
   const finKeys = new Set((finalArtifact.canonical_findings ?? []).map((c) => c.family_key).filter(Boolean));
-  // 本批已处置族的 archive SC 集合：kind=archive 且 family_key ∈ frozen 的 SC（结果导向出口）
-  const archiveScFamilies = new Set(
-    (Array.isArray(scManifest.scs) ? scManifest.scs : [])
-      .filter((sc) => sc.kind === 'archive' && typeof sc.family_key === 'string' && sc.family_key)
-      .map((sc) => sc.family_key)
-  );
+  // 本批已处置族的 archive SC 集合（结果导向出口，2026-08-07 按注释声明收紧）——
+  // 注释 :100-102 声称「finding_ids 引用的 canonical finding 的 family_key 就是本族」，
+  // 但实现此前只过滤 kind==='archive' && family_key，finding_ids 零次出现、allocations/
+  // validation/sc_manifest_hash 同样零次——注释描述了一道没实现的检查（读的人会以为它在拦）。
+  // 收紧为：① 该 archive SC 的 finding_ids 必须指向本族（每个 id 引用一条 canonical finding，
+  //    且该 finding 的 family_key 必须等于该 SC 的 family_key——防「随便填个 family_key 的
+  //    archive SC 冒充出口」）；② 该 archive SC 必须真实出现在某个 wave 的 allocations 里
+  //    且该 wave 的 validation.ok === true（补上委派链断点：verify 由 fix-run wave validation
+  //    层保证，闭合门要求该 wave 真实执行过且通过——「有 archive SC」≠「执行过」）。
+  // 注意：canonical finding 的 family_key 从 invariant 派生（consensus-gate 的 familyKeyOf），
+  // SC manifest 里的 family_key 是引用同一派生的字符串，可直接比对。finding_ids 引用的
+  // canonical 可能是源共识的（archive SC 处置源共识发现的 finding，scManifest 的 finding_ids
+  // 通常指向源共识——见 i9-batch 的 SC-2）也可能是终版的（终版复现的那条），两个命名空间
+  // 都要查：只要引用任一 canonical 的 family_key == 该 SC 的 family_key 即「指向本族」。
+  const finalById = new Map([...(finalArtifact.canonical_findings ?? []), ...(sourceArtifact.canonical_findings ?? [])].map((c) => [c.id, c]));
+  const archiveScByFamily = new Map();
+  for (const sc of Array.isArray(scManifest.scs) ? scManifest.scs : []) {
+    if (sc.kind !== 'archive' || typeof sc.family_key !== 'string' || !sc.family_key) continue;
+    // ① finding_ids 指向本族
+    const fids = Array.isArray(sc.finding_ids) ? sc.finding_ids : [];
+    if (!fids.length) continue; // 无 finding_ids 的 archive SC 不构成出口（无引用 = 无法指向本族）
+    const allInFamily = fids.every((fid) => {
+      const cf = finalById.get(fid);
+      return cf && cf.family_key === sc.family_key;
+    });
+    if (!allInFamily) continue;
+    // ② 该 SC 真实出现在某 wave 的 allocations 且该 wave validation.ok
+    const waves = Array.isArray(runManifest.waves) ? runManifest.waves : [];
+    const executedOk = waves.some((w) => {
+      if (!(w && w.validation && w.validation.ok === true)) return false;
+      const allocs = Array.isArray(w.allocations) ? w.allocations : [];
+      return allocs.some((a) => (a.sc_ids ?? []).includes(sc.id));
+    });
+    if (!executedOk) continue;
+    archiveScByFamily.set(sc.family_key, sc.id);
+  }
+  const archiveScFamilies = new Set(archiveScByFamily.keys());
   const recurred = frozen.filter((fk) => finKeys.has(fk) && !archiveScFamilies.has(fk));
   if (recurred.length) {
     for (const fk of recurred) {
