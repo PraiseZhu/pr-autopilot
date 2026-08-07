@@ -16,7 +16,7 @@
 // 反向变异：每条用例对应一个「挖空点」，变异后只有该用例红、其余保持绿（消息文本互斥支撑隔离）。
 // 本文件独立可跑：`node fixtures/i9-batch.mjs`，不并入 run-fixtures.mjs / run-all.sh
 // （lead 边界：run-fixtures.mjs / run-all.sh 由 lead 亲自接线，禁改）。
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -27,10 +27,10 @@ import { runConsensusGate, recomputeArtifactHash, familyKeyOf } from '../scripts
 import { checkPushGuard } from '../scripts/push-guard.mjs';
 import { checkScCoverage } from '../scripts/sc-coverage-gate.mjs';
 import { checkDispatch } from '../scripts/fix-dispatch-gate.mjs';
-import { validateVerdict, OUT_OF_SCOPE_NOTES_FIELD } from '../scripts/verdict-validate.mjs';
+import { validateVerdict, OUT_OF_SCOPE_NOTES_FIELD, SCHEMA_VERSION } from '../scripts/verdict-validate.mjs';
 import { contractSpec } from '../scripts/dispatch-contract.mjs';
 import { buildFixPlan } from '../scripts/fix-plan.mjs';
-import { runManifestHash, initRun } from '../scripts/fix-run.mjs';
+import { runManifestHash, initRun, RUN_MANIFEST_SCHEMA_VERSION } from '../scripts/fix-run.mjs';
 import { computeFixPlanHash } from '../scripts/fix-plan.mjs';
 import { checkBatchClosure } from '../scripts/batch-closure-gate.mjs';
 import { readJson, hashObject } from '../scripts/lib/common.mjs';
@@ -90,7 +90,7 @@ function withAnchorPaths(findings) {
 function mkVerdictFor(reviewer, bundleObj, findings, over = {}) {
   const closedIds = (findings ?? []).map((f) => f.id);
   return {
-    schema_version: 'v3', reviewer, run_status: 'ok', round: over.round ?? 1, attempt: over.attempt ?? 1,
+    schema_version: SCHEMA_VERSION, reviewer, run_status: 'ok', round: over.round ?? 1, attempt: over.attempt ?? 1,
     base_sha: bundleObj.base_sha, candidate_sha: bundleObj.candidate_sha,
     review_input_hash: computeReviewInputHash(bundleObj),
     faces: reviewer === 'upstream-preview' ? THIRD_FACES : FULL_FACES,
@@ -178,10 +178,12 @@ const dispatchRecord = {
 const dErrs = checkDispatch({ plan, record: dispatchRecord });
 if (dErrs.length) throw new Error('fixture 前提失败: 派发门: ' + JSON.stringify(dErrs));
 
-// ---- run manifest 构造 helper（手工构造 v3 + batch 段；调用方覆盖 waves/final_candidate/batch）----
+// ---- run manifest 构造 helper（手工构造 + batch 段；调用方覆盖 waves/final_candidate/batch）----
+// 2026-08-07: schema_version 改从 RUN_MANIFEST_SCHEMA_VERSION 派生（fix-run.mjs 导出）——
+// 此前硬编码 'v3'，run manifest 版本线 bump 后会静默构造出生产端不再产生的形态。
 function mkRunManifest(over = {}) {
   return {
-    schema_version: 'v3', run_id: 'i9-batch-ok', repo_dir: repo,
+    schema_version: RUN_MANIFEST_SCHEMA_VERSION, run_id: 'i9-batch-ok', repo_dir: repo,
     fix_plan_hash: plan.fix_plan_hash, sc_manifest_hash: hashObject(scManifest),
     source_artifact_hash: recomputeArtifactHash(srcArtifact), source_candidate: L1,
     feature_branch: 'feat', integration_branch: 'fix/i9-batch/integration',
@@ -642,6 +644,18 @@ function pgCallWith(runManifest, expectedSha, terminal, branch = 'feat') {
 t('[i9-batch-6a] L1..L3 两个 commit（多 commit 分步修复）→ 批次校验通过（严格后代，任意距离）', () => {
   const r = pgCallWith(twoStepRunManifest, L3, termTwoStep);
   ok(!r.errors.some((e) => /批次|严格后代|零推进/i.test(e)), '多 commit 不应报任何批次错误: ' + JSON.stringify(r.errors));
+});
+
+// ===== 版本字面量自检（2026-08-07）=====
+t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生、run manifest 构造须用 RUN_MANIFEST_SCHEMA_VERSION 派生，不得残留两条线字面量（照 [SC-12] 写法）', () => {
+  const own = readFileSync(fileURLToPath(import.meta.url), 'utf8');
+  ok(/schema_version: SCHEMA_VERSION, reviewer/.test(own), '本文件 verdict 构造必须用 SCHEMA_VERSION 派生常量');
+  ok(/schema_version: RUN_MANIFEST_SCHEMA_VERSION, run_id/.test(own), '本文件 run manifest 构造必须用 RUN_MANIFEST_SCHEMA_VERSION 派生常量');
+  // 反向: 两种签名都不得残留字面量（正则拼接构造防自引用）
+  const vLit = "schema_version: 'v" + "[0-9]', reviewer";
+  const rmLit = "schema_version: 'v" + "[0-9]', run_id";
+  ok(!own.includes(vLit), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
+  ok(!own.includes(rmLit), '本文件不得残留 run manifest schema_version 字面量（须用 RUN_MANIFEST_SCHEMA_VERSION 派生）');
 });
 
 // 等所有 async 测试完成后再出汇总（t 的 async 支持：主流程不等 Promise 会提前打印）
