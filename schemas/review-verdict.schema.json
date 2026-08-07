@@ -1,19 +1,20 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "pr-autopilot/review-verdict/v2",
-  "title": "三审 reviewer 机器 verdict（计划 §1.1b ⑨；v2 增 anchor_paths/invariant/family_id/checklist_version 机器字段）",
+  "$id": "pr-autopilot/review-verdict/v3",
+  "title": "三审 reviewer 机器 verdict（计划 §1.1b ⑨；v2 增 anchor_paths/invariant/family_id/checklist_version 机器字段；v3(I9) 增 attempt 字段 + hardening_coverage 覆盖率强制扩展至对抗席全 round + hardening_coverage[].evidence 格式校验）",
   "type": "object",
-  "$comment": "checklist_version 的必填/取值校验是角色/轮次条件（同 hardening_coverage）——JSON Schema 表达不了，verdict-validate.mjs 为准。计数与版本单一来源: scripts/lib/hardening-registry.mjs。",
+  "$comment": "checklist_version 的必填/取值校验是角色条件（同 hardening_coverage，I9 起两者均对对抗席全 round 强制，不再限 round===1）——JSON Schema 表达不了，verdict-validate.mjs 为准。计数与版本单一来源: scripts/lib/hardening-registry.mjs。",
   "required": [
-    "schema_version", "reviewer", "run_status", "round",
+    "schema_version", "reviewer", "run_status", "round", "attempt",
     "base_sha", "candidate_sha", "review_input_hash",
     "faces", "findings", "gate_checks", "verdict", "closed_finding_ids"
   ],
   "properties": {
-    "schema_version": { "const": "v2" },
+    "schema_version": { "const": "v3" },
     "reviewer": { "enum": ["claude-adversarial", "codex-adversarial", "upstream-preview"] },
     "run_status": { "enum": ["ok", "degraded"] },
-    "round": { "type": "integer", "minimum": 1 },
+    "round": { "type": "integer", "minimum": 1, "description": "I9: round 语义 = PASS 共识 artifact 的序号（不是审查尝试次数）——见 attempt。" },
+    "attempt": { "type": "integer", "minimum": 1, "description": "I9（SC-6）: 当前 round 的第几次审查尝试。round 语义变更为「PASS 共识序号」后，尝试次数信息从 round 里丢失，改由本字段承载。单份 verdict 的形状校验只锁「是合法正整数」；三席 attempt 是否一致属 consensus-gate 层跨席校验，不在此实现。" },
     "base_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
     "candidate_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
     "review_input_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
@@ -77,21 +78,34 @@
     },
     "hardening_coverage": {
       "type": "array",
-      "$comment": "加固清单十类核对点（references/hardening-checklist.md）机器覆盖字段。是否强制由 round/reviewer 决定——verdict-validate.mjs 对 round===1 的两个对抗席（claude-adversarial/codex-adversarial）强制恰好 10 项、class_id 1〜10 各恰好一次；第三席与 round>=2 不强制，JSON Schema 表达不了角色/轮次条件，以 validator 为准（同 faces 的角色级约束）。class_id 上界 10 与 scripts/lib/hardening-registry.mjs 的 HARDENING_CLASS_COUNT 手动保持一致（SC-B4: 9→10 迁移，schema 是静态数据无法 import，改动务必同步）。",
+      "$comment": "加固清单十类核对点（references/hardening-checklist.md）机器覆盖字段。是否强制由 reviewer 决定——verdict-validate.mjs 对两个对抗席（claude-adversarial/codex-adversarial）的**全部 round**强制恰好 10 项、class_id 1〜10 各恰好一次（I9: 此前仅 round===1 强制，已扩展至全 round——round>=2 是修复后的新代码，此前反而是唯一没有可机读穷举契约的代码）；第三席不强制，JSON Schema 表达不了角色条件，以 validator 为准（同 faces 的角色级约束）。class_id 上界 10 与 scripts/lib/hardening-registry.mjs 的 HARDENING_CLASS_COUNT 手动保持一致（SC-B4: 9→10 迁移，schema 是静态数据无法 import，改动务必同步）。",
       "items": {
         "type": "object",
         "required": ["class_id", "result", "evidence"],
         "properties": {
           "class_id": { "type": "integer", "minimum": 1, "maximum": 10 },
           "result": { "enum": ["covered", "n_a"] },
-          "evidence": { "type": "string", "minLength": 1 }
+          "evidence": {
+            "type": "string", "minLength": 1,
+            "description": "I9（SC-5/SC-5b）: 格式要求按 result 分支——covered 声称「已覆盖」，必须给出「路径:行号」形态的引用（如 \"scripts/foo.mjs:42\"，只判形状不核实内容）；n_a 声称「不适用」，没有对应代码位置，不强制路径:行号（强制会逼审查席伪造假锚点，比不校验更糟），改为最小长度约束防敷衍（如「无」/「n/a」）。n_a 的实质性（是否真的不适用）是语义判断，机器判不了，如实交给审查席负责。分支细节见下方 allOf/if-then，长度阈值与 verdict-validate.mjs 的 EVIDENCE_LOCATOR_RE / HARDENING_NA_EVIDENCE_MIN_LENGTH 同源，以 validator 为准。"
+          }
         },
-        "additionalProperties": false
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": { "properties": { "result": { "const": "covered" } } },
+            "then": { "properties": { "evidence": { "pattern": "[\\w-]+([./][\\w-]+)+:\\d+(-\\d+)?" } } }
+          },
+          {
+            "if": { "properties": { "result": { "const": "n_a" } } },
+            "then": { "properties": { "evidence": { "minLength": 10 } } }
+          }
+        ]
       }
     },
     "checklist_version": {
       "type": "integer", "minimum": 1,
-      "description": "SC-B4（D5）: 加固清单版本号，取值须等于 scripts/lib/hardening-registry.mjs 的 HARDENING_CHECKLIST_VERSION。round===1 两对抗席必填（同 hardening_coverage 的角色/轮次条件，validator 为准）；版本不符 → degraded，错误信息明确「清单版本过期需重审」，不与 hardening_coverage 缺项的普通计数错误混淆（9→10 是 exact 集合变更，不是少填一项）。"
+      "description": "SC-B4（D5）: 加固清单版本号，取值须等于 scripts/lib/hardening-registry.mjs 的 HARDENING_CHECKLIST_VERSION。两对抗席**全部 round**必填（I9: 同 hardening_coverage 的角色条件扩展，不再限 round===1，validator 为准）；版本不符 → degraded，错误信息明确「清单版本过期需重审」，不与 hardening_coverage 缺项的普通计数错误混淆（9→10 是 exact 集合变更，不是少填一项）。"
     },
     "out_of_scope_notes": {
       "type": "array",
