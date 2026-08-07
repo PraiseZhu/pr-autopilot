@@ -1145,6 +1145,34 @@ t('[2026-08-08 GPT R2 SC-B4] 跨日幂等: isDispatchSettled 扫全账本按 dis
   settleDispatchBudget({ ledgerFile: ld, dispatchId: 'x4', estimateUsd: 3 });
   eq(spentToday(ld), 3, 'SC-B4: 跨日收口 actual 计入今日（昨日 reserve 不占今日额、今日 actual 占额 3）');
 });
+t('[2026-08-08 GPT R3 SC-D1/D2] reserveBudget 跨日幂等: 昨日已结算 dispatch 今日同 id 返回 already-settled 不追加不占今日；昨日在途 reserve 今日同 id 返回 already-reserved 不追加、spent 为当日口径不计昨日、今日 cap 按日重置', () => {
+  const yesterday = new Date(Date.now() - 86400000).toISOString();
+  const mk = (at, rec) => JSON.stringify({ at, ...rec }) + '\n';
+  // D1: 昨日 reserve+actual（真实成本结算）→ 今日同 id reserveBudget → already-settled，不追加行、不占今日
+  const l1 = join(engDir, 'r3-d1-settled.jsonl');
+  appendFileSync(l1, mk(yesterday, { kind: 'reserve', dispatch_id: 'd1', cost_usd: 9 }));
+  appendFileSync(l1, mk(yesterday, { kind: 'actual', dispatch_id: 'd1', cost_usd: 9, settlement: 'actual' }));
+  const b1 = reserveBudget({ ledgerFile: l1, capUsd: 30, estimateUsd: 9, dispatchId: 'd1' });
+  ok(b1.allowed && b1.reason.includes('already-settled'), 'SC-D1: 昨日已结算 dispatch 今日同 id 必须 already-settled（不得跨日重新 reserve）');
+  eq(readFileSync(l1, 'utf8').trim().split('\n').length, 2, 'SC-D1: already-settled 不追加台账行（2 行不变）');
+  eq(b1.spent, 0, 'SC-D1: 返回 spent 为当日口径——昨日 actual 不占今日额度');
+  // 昨日结算不占今日 cap → 今日新 dispatch 仍按今日 cap 正常放行
+  ok(reserveBudget({ ledgerFile: l1, capUsd: 30, estimateUsd: 20, dispatchId: 'd1-new' }).allowed, 'SC-D1: 昨日结算不占今日 cap——新 dispatch 今日正常放行');
+  eq(spentToday(l1), 20, 'SC-D1: spentToday 只计今日（新 reserve 20，昨日 9 不计）');
+  // D2: 昨日未结算 reserve（在途）→ 今日同 id → already-reserved，不追加行；spent 当日口径不含昨日在途
+  const l2 = join(engDir, 'r3-d2-open.jsonl');
+  appendFileSync(l2, mk(yesterday, { kind: 'reserve', dispatch_id: 'd2', cost_usd: 9 }));
+  const b2 = reserveBudget({ ledgerFile: l2, capUsd: 30, estimateUsd: 9, dispatchId: 'd2' });
+  ok(b2.allowed && b2.reason.includes('already-reserved'), 'SC-D2: 昨日在途 reserve 今日同 id 必须 already-reserved（幂等不重复占额，不得悄然重新 reserve）');
+  eq(readFileSync(l2, 'utf8').trim().split('\n').length, 1, 'SC-D2: already-reserved 不追加台账行（1 行不变）');
+  eq(b2.spent, 0, 'SC-D2: 返回 spent 为当日口径——昨日在途 reserve 不计今日 spent');
+  // 今日 cap 语义: 昨日在途不占今日 cap（cap 按日重置），但今日 cap 仍生效
+  ok(reserveBudget({ ledgerFile: l2, capUsd: 30, estimateUsd: 20, dispatchId: 'd2-new' }).allowed, 'SC-D2: 昨日在途不占今日 cap——新 dispatch 今日正常放行');
+  ok(!reserveBudget({ ledgerFile: l2, capUsd: 30, estimateUsd: 20, dispatchId: 'd2-new2' }).allowed, 'SC-D2: 今日 cap 仍生效——20+20>30 必拦');
+  // 在途 reserve 未悄然释放: 今日收口结算 → actual 计入今日（20+9=29）
+  settleDispatchBudget({ ledgerFile: l2, dispatchId: 'd2', estimateUsd: 9 });
+  eq(spentToday(l2), 29, 'SC-D2: 昨日在途 reserve 收口时 actual 计入今日——未被悄然释放');
+});
 t('[审④F5] dispatch manifest 自包含: finalize/complete 命令与 state/snapshot 接线齐备且无 undefined', () => {
   writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 'k5', body: '再来反馈' }] }));
   const r = runEngine(ENG({ budget: sharedBudget }));

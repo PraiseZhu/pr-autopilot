@@ -79,6 +79,17 @@ engine-mivo.json（完整必填示例；两仓 schedule **共享同一 budget.le
     按 dispatch_id 折叠，跨日重试不会重复结算；`spentToday` 仍只聚合当日）；
   - 成功 ack 后**绝不保留 reserve**；人工 `budget.mjs --record --dispatch-id <id> --cost <实际>`
     只是**纠偏兜底**（真实成本补记 / 非引擎标准派发的遗留 pending 人工核账），不是常规结算路径。
+- **reserve 幂等判定扫全账本（2026-08-08 GPT R3）**：`reserveBudget()` 的 already 判定（
+  `budget.mjs:145`）用**全历史 fold** 按 dispatch_id 折叠，**当日 cutoff 只属于 cap 计算**
+  （`spentToday` 内部按当日 fold）。跨日语义：
+  - 昨日已结算（reserve+actual）→ 今日同 id `reserveBudget` 返回 `already-settled`，
+    不追加行、不占今日额度——避免昨日结算过的 dispatch 今日被重复 reserve 重复占额；
+  - 昨日未结算在途 reserve → 今日同 id 返回 `already-reserved`，不追加行；返回的 `spent`
+    为**当日口径**，昨日在途不计入今日 spent；今日 cap 按日重置，昨日占额不滚入今日
+    （cap 30/天的「天」是自然日，不是滚动窗口）；
+  - **在途 reserve 不会悄然释放**：昨日在途今日同 id 仍被认作占额幂等放行；其收口结算
+    （`settleDispatchBudget`）时以 actual 计入**结算当天**的 spent，与 SC-B4 语义一致。
+  - 反向变异（改回当日 fold）恰好红 SC-D1/D2 断言（`fixtures/run-fixtures.mjs`），锁定该口径。
 - **敞口算式**：cap 30 ÷ estimate 3 = 单日最多 **10 个**并发未结算 reserve（若沿用旧值 9.2 则仅
   3 个）。风险：并发未结算 reserve 上限 3 → 10，最坏坏账放大约 **3.3 倍**；收益：正常日不再因
   3 个在途 reserve 顶闸停派。完工即结算后，**陈旧 reserve 只存在于「派发到 complete 收口」的

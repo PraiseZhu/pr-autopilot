@@ -150,12 +150,18 @@ export function reserveBudget({ ledgerFile, capUsd, estimateUsd, dispatchId, now
   if (!dispatchId) return { allowed: false, spent: null, reason: '缺 dispatch_id（reserve 必须可幂等/可结算）' };
   return withLock(`${ledgerFile}.lock`, () => {
     // 审⑤-F2: already 判断同样基于折叠后的最新状态（release 之后的 reserve 是新预留，不是重复）
-    const { byId } = foldDispatchStates(readEntries(ledgerFile, nowMs));
+    // 审⑤-F2: already 判断同样基于折叠后的最新状态（release 之后的 reserve 是新预留，不是重复）
+    // 审(2026-08-08 GPT R3): 幂等判定必须扫**全账本**——跨日重试时昨天的 reserve/actual
+    // 行不能被当日 cutoff 过滤掉（否则昨日已结算/已预留的 dispatch 今天又被重新 reserve、
+    // 重复占额）。当日口径只属于 cap 计算：spentToday 内部按当日 fold，昨日占额不滚入今日
+    // cap（cap 按日重置）；昨日已结算 → already-settled、昨日在途 → already-reserved，
+    // 均不追加、不占今日额度；在途 reserve 在收口结算时以 actual 计入**结算当天**。
+    const { byId } = foldDispatchStates(readAllEntries(ledgerFile));
     const cur = byId.get(dispatchId) ?? { actual: null, reserved: null };
     const already = cur.actual === null && cur.reserved !== null;
     const spent = spentToday(ledgerFile, nowMs);
-    if (cur.actual !== null) return { allowed: true, spent, reason: 'already-settled（该 dispatch 已有实花入账，不再追加 reserve）' };
-    if (already) return { allowed: true, spent, reason: 'already-reserved（幂等重试不重复占额）' };
+    if (cur.actual !== null) return { allowed: true, spent, reason: 'already-settled（该 dispatch 已有实花入账——含昨日，不再追加 reserve）' };
+    if (already) return { allowed: true, spent, reason: 'already-reserved（幂等重试不重复占额——含昨日在途 reserve，不占今日 cap）' };
     if (spent + estimateUsd > capUsd) {
       return { allowed: false, spent, reason: `今日已花/预留 $${spent.toFixed(2)} + 估算 $${estimateUsd} > cap $${capUsd}（暂停等 owner 确认，不是放弃）` };
     }
