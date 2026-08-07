@@ -473,7 +473,7 @@ function verdictWithNotes(notes, over = {}) {
 t('[i9-batch-12a] 合法 out_of_scope_notes（产物字段名）→ validateVerdict 零 D3 错误', () => {
   const v = verdictWithNotes([{ id: 'n1', note: '范围外真问题', evidence: '证据', suggested_issue_title: '标题' }]);
   const errs = validateVerdict(v);
-  ok(!errs.some((e) => /out_of_scope|D3/.test(e)), '合法 note 不应报 D3 错误: ' + JSON.stringify(errs));
+  eq(errs, [], '合法 note 应整体零错误（正例必须验整体通过，不能只查「无 D3 报错」——别的错误照绿 = 弱断言）: ' + JSON.stringify(errs));
 });
 t('[i9-batch-12b] 内容校验真实执行：note id 与 finding id 撞号 → validateVerdict 必须拦（走常量读取点）', () => {
   const v = verdictWithNotes([{ id: 'f1', note: '撞号', evidence: '证据', suggested_issue_title: '标题' }]); // id='f1' 撞 finding id
@@ -689,7 +689,7 @@ function pgCallWith(runManifest, expectedSha, terminal, branch = 'feat') {
 // 负例在此处独立构造。
 t('[i9-batch-6a] L1..L3 两个 commit（多 commit 分步修复）→ 批次校验通过（严格后代，任意距离）', () => {
   const r = pgCallWith(twoStepRunManifest, L3, termTwoStep);
-  ok(!r.errors.some((e) => /批次|严格后代|零推进/i.test(e)), '多 commit 不应报任何批次错误: ' + JSON.stringify(r.errors));
+  eq(r.errors, [], '多 commit（L1..L3）应整体放行（正例必须验整体通过，不能只查「无批次类报错」——别的门失败照绿 = 弱断言）: ' + JSON.stringify(r.errors));
 });
 t('[i9-batch-6c] 兄弟提交（共同 base B、source S=B+X、兄弟 T=B+Y）→ 严格后代拒（rev-list 非空 ≠ 祖先，集合一致性双向通过也拦不住）', async () => {
   // 审查席构造的失效路径：共同 base B、source S=B+X、兄弟 T=B+Y——rev-list S..T 返回 {Y} 非空、
@@ -806,7 +806,7 @@ t('[i9-batch-6d] pr_number 绑定：bundle.pr_number ≠ artifact.pr_number → 
     artifact: artNull, bundle: bNull, constitution,
     sourceArtifact: srcArtifact, scManifest, fixPlan: plan, dispatchRecord, runManifest: twoStepRunManifest
   });
-  ok(!rNull.errors.some((e) => /pr_number/.test(e)), '两边 null（无 PR 直跑）应放行: ' + JSON.stringify(rNull.errors));
+  eq(rNull.errors, [], '两边 null（无 PR 直跑）应整体放行（正例必须验整体通过，不能只查「无 pr_number 报错」——别的门失败照绿 = 弱断言）: ' + JSON.stringify(rNull.errors));
 });
 t('[i9-batch-6e] run manifest 版本比较：schema_version 不符 → 拒（旧 v2 按当前公式重算 hash 仍过）', () => {
   // 2026-08-07 修正（失败模式隔离）：staleRm 必须**无 batch 段**——若带 batch，checkBatchClosure
