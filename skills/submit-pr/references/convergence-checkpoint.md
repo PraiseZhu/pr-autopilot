@@ -19,13 +19,15 @@
 4. **某个 `family_key` 在一个批次的 `frozen_families` 中被处置后，又出现在后续批次的
    `frozen_families` 里**（批次事务协议，issue #9 SC 延伸；i9-batch）。这条是批次协议对
    既有机制的**真实增量**：既有 1〜3 全是人判形状（"漏了对称一半"/"第 3 处判据"/"水位线到
-   第 5 个"），本条新增的是**申报义务 + 申报形状被机器校验**——命中时 lead 必须申报
-   `recurrence` 段，机器校验其形状/自洽（`batch-closure-gate.mjs:148-179`）。**注意：本条
-   仍是人判 + lead 申报，机器不会自己发现复发**——`batch-closure-gate.mjs:35` 自陈「机器无
-   跨批次账本，无法独立判定」（跨批比较的唯一实现在 `fixtures/run-fixtures.mjs:4905-4910`
-   的测试 helper，不在生产路径）。**不要把「申报被机器校验」说成「机器自动检测」**——那
-   正是对用户核心痛点（SC 一路绿、bug 一路复发）给假保证，会让读者停止人工盯防。命中本条
-   时，下一个修复 commit 前必须产出下方「复发归因段（recurrence）」——它是既有六件套的
+   第 5 个"），本条新增的是**人的申报义务 + 一条可选形状校验能力**——命中时 lead 必须申报
+   `recurrence` 段；机器只在该调用**显式传了 `checkpoint`** 时校验其形状/自洽
+   （`batch-closure-gate.mjs:148-179`），**非生产强制**：push-guard 调 checkBatchClosure
+   不传 checkpoint，`checkpoint?.recurrence ?? null` 在缺省时静默放行（SC-T6 降级，2026-08-08）。
+   **本条仍是人判 + lead 申报，机器不会自己发现复发**——`batch-closure-gate.mjs:35` 自陈
+   「机器无跨批次账本，无法独立判定」（跨批比较的唯一实现在 `fixtures/run-fixtures.mjs:
+   4905-4910` 的测试 helper，不在生产路径）。**不要把「可选形状校验」说成「机器自动检测」**
+   ——那正是对用户核心痛点（SC 一路绿、bug 一路复发）给假保证，会让读者停止人工盯防。命中
+   本条时，下一个修复 commit 前必须产出下方「复发归因段（recurrence）」——它是既有六件套的
    **补充载体**（回看上一次 SC 为什么失效，既有六件套从头到尾没有这一问），不是替代六件套；
    命名纪律：**「六件套」保持既有那套的唯一称谓**，本段不叫六件套。
    > **T1 边界（如实声明，lead 2026-08-07 措辞）**：批次协议拦的是**逐字复发**，拦不住
@@ -153,11 +155,13 @@ tests:[{name,distinguishes}] }`——`scripts/pr-body.mjs` 的 `buildCheckpointS
 `root_cause_locator`。结构化枚举比六段自由文本更可判。
 
 **齐全性检查在批次闭合门（`scripts/batch-closure-gate.mjs`），不在 `pr-body.mjs`**——
-`buildCheckpointSection` 只渲染、不判断齐全的职责边界不扩。闭合门验：recurrence 字段齐全 +
-`verdict` enum 合法 + symptom 时 `root_cause_locator` 非空（形如 `路径:行号`）+ `family_key`
-∈ 本批 `frozen_families` + `prior_sc_id` ∈ sc manifest。保证等级 **T1（防疏忽不防伪造，
-如实声明）**：`prior_sc_missed_because` 填一句废话也能过，机器只锁形状与自洽；「这次是不是
-真的同族复发」的判断权在 lead（机器无跨批次账本，无法独立判定），申报后由机器验形状。
+`buildCheckpointSection` 只渲染、不判断齐全的职责边界不扩。闭合门验（**仅显式传 `checkpoint`
+的调用方生效——如 fixture/手工 CLI；push-guard 调 checkBatchClosure 不传，缺省静默放行，
+非生产强制，SC-T6 降级 2026-08-08**）：recurrence 字段齐全 + `verdict` enum 合法 + symptom 时
+`root_cause_locator` 非空（形如 `路径:行号`）+ `family_key` ∈ 本批 `frozen_families` +
+`prior_sc_id` ∈ sc manifest。保证等级 **T1（防疏忽不防伪造，如实声明）**：
+`prior_sc_missed_because` 填一句废话也能过，机器只锁形状与自洽；「这次是不是真的同族复发」
+的判断权在 lead（机器无跨批次账本，无法独立判定），申报后由机器验形状（仅显式传时）。
 半残/重复 marker（只有 start、只有 end、重复 start）→ 脚本 fail loud 拒绝写入，不会静默
 在文档里堆出第二段。
 产出同时服务三个读者：自己下一步修复时的模型、lead 判断是否收敛的依据、审查席复核 delta
