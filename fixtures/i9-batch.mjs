@@ -772,7 +772,9 @@ t('[i9-batch-6c] 兄弟提交（共同 base B、source S=B+X、兄弟 T=B+Y）�
       rm(pgCopy, { force: true });
     }
   }
-  // 反向变异已由实现侧覆盖（push-guard 的 is-ancestor 检查），此处钉正向拒绝。
+  // 反向变异见上方常驻测试（2026-08-07，审查席验证覆盖空白）：挖空 push-guard 的
+  // isAncestorCommit（临时副本）后兄弟提交会放行，证明本用例是有效检测器——树内有执行证据，
+  // 不是「开发期手工做过一次」的聊天记录声明。
 });
 t('[i9-batch-6d] pr_number 绑定：bundle.pr_number ≠ artifact.pr_number → 拒（同 candidate 自洽拼接被拦）', () => {
   // 同 candidate 的 artifact(pr=101) 与 bundle(pr=202) 可自洽拼接（不经 runConsensusGate 产出）
