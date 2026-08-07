@@ -491,6 +491,17 @@ t('[i9-batch-13c] 合法演进：R1 无 PR（null）→ R2 有 PR（201）→ �
   });
   ok(r2WithPr.gate_result === 'pass', '无 PR R1 → 有 PR R2 是合法演进，应 PASS: ' + JSON.stringify(r2WithPr.fail_reasons ?? []));
 });
+t('[i9-batch-13d] 裁决 2 行为钉住：pr_number 不入 review_input_hash（null→N 不改 hash = 建 PR 不成整轮失效触发器）', () => {
+  const bNull = mkBundle(L0, L1);                       // pr_number=null（无 PR 直跑）
+  const bN = mkBundle(L0, L1, { pr_number: 301 });      // 建了 draft PR 后同 candidate
+  eq(computeReviewInputHash(bNull), computeReviewInputHash(bN),
+    'pr_number 必须不进 review_input_hash——否则「建 PR」动作让同一 candidate 的 hash 变、三份 verdict 全失效、整轮重跑（裁决 2 防的正是这个）');
+  // 但 pr_number 必须烙进 artifact hash（裁决 1：被抓 parent 的 pr_number 改不动、伪造不了自洽）
+  const aNull = consensusFor(bNull, [[], [], []], { repoDir: repo });
+  const aN = consensusFor(bN, [[], [], []], { repoDir: repo });
+  ok(aNull.consensus_artifact_hash !== aN.consensus_artifact_hash,
+    'pr_number 必须入 consensus_artifact_hash（null 与 301 的 artifact hash 必须不同）');
+});
 
 // ========== [i9-batch-6] 批次严格后代语义（lead 撤回「直接后继」后） ==========
 console.log('\n[i9-batch-6] 批次严格后代：多 commit 合法 / 非后代拒 / 零推进拒');
