@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 
 import { computeReviewInputHash } from '../scripts/review-input-hash.mjs';
 import { runConsensusGate, recomputeArtifactHash, familyKeyOf } from '../scripts/consensus-gate.mjs';
-import { checkPushGuard } from '../scripts/push-guard.mjs';
+import { checkPushGuard, isStrictDescendant } from '../scripts/push-guard.mjs';
 import { checkScCoverage } from '../scripts/sc-coverage-gate.mjs';
 import { checkDispatch } from '../scripts/fix-dispatch-gate.mjs';
 import { buildFixPlan } from '../scripts/fix-plan.mjs';
@@ -420,11 +420,11 @@ t('[i9-batch-11b] 非祖先 parent 仍拒（与同 SHA 失败模式不重合）'
     '非祖先必须报「不是祖先」而非「同 SHA」: ' + JSON.stringify(r2Sibling.fail_reasons ?? []));
 });
 
-// ========== [i9-batch-6] successor 不是直接后继被拒 ==========
-console.log('\n[i9-batch-6] successor 非直接后继：frozen_at_sha..successor 恰 2 个 commit → push-guard 拒');
+// ========== [i9-batch-6] 批次严格后代语义（lead 撤回「直接后继」后） ==========
+console.log('\n[i9-batch-6] 批次严格后代：多 commit 合法 / 非后代拒 / 零推进拒');
 // 再产出一个 commit L3（L1→L2→L3），把 L3 当 final candidate
 writeFileSync(join(repo, 'src/fix2.ts'), 'export const fix2 = 2;\n');
-g('add', '.'); g('commit', '-qm', 'L3 额外 commit（非直接后继场景）');
+g('add', '.'); g('commit', '-qm', 'L3 额外 commit（多 commit 分步修复场景）');
 const L3 = g('rev-parse', 'HEAD');
 const termTwoStep = mkTerminal(L3, [[], [], []]);
 if (termTwoStep.gate_result !== 'pass') throw new Error('[i9-batch-6] 前提失败: L3 轮未 PASS: ' + JSON.stringify(termTwoStep.fail_reasons ?? []));
@@ -436,23 +436,41 @@ const twoStepRunManifest = mkRunManifest({
   final_candidate: L3,
   batch: { batch_id: 'b1', frozen_at_sha: L1, frozen_families: [FK1, FK2].sort(), successor_sha: L3, status: 'closed' }
 });
-t('[i9-batch-6] L1..L3 两个 commit → push-guard「恰好一个后继」拒（squash 记录齐全，只红批次判据）', () => {
+function pgCallWith(runManifest, expectedSha, terminal, branch = 'feat') {
   const fo = {
     source_artifact_hash: recomputeArtifactHash(srcArtifact),
     sc_manifest_hash: hashObject(scManifest),
     fix_plan_hash: plan.fix_plan_hash,
     dispatch_record_hash: hashObject(dispatchRecord),
-    run_manifest_hash: runManifestHash(twoStepRunManifest)
+    run_manifest_hash: runManifestHash(runManifest)
   };
-  const r = checkPushGuard({
+  return checkPushGuard({
     repoDir: repo,
-    manifest: { repo: 'o/r', remote: 'origin', branch: 'feat', expected_sha: L3, purpose: 'feature', consensus_artifact_hash: termTwoStep.consensus_artifact_hash, fix_orchestration: fo },
-    artifact: termTwoStep, bundle: mkBundle(L0, L3), constitution,
-    sourceArtifact: srcArtifact, scManifest, fixPlan: plan, dispatchRecord, runManifest: twoStepRunManifest
+    manifest: { repo: 'o/r', remote: 'origin', branch, expected_sha: expectedSha, purpose: 'feature', consensus_artifact_hash: terminal.consensus_artifact_hash, fix_orchestration: fo },
+    artifact: terminal, bundle: mkBundle(L0, expectedSha), constitution,
+    sourceArtifact: srcArtifact, scManifest, fixPlan: plan, dispatchRecord, runManifest
   });
-  ok(r.errors.some((e) => /「恰好一个后继」失败: frozen_at_sha\.\.successor_sha 有 2 个 commit/.test(e)),
-    '必须精确报出「恰好一个后继」错误: ' + JSON.stringify(r.errors));
-  ok(!r.errors.some((e) => /未登记 commit/.test(e)), 'squash 记录齐全，不得先被 SC-R3-8 拦（失败模式隔离）: ' + JSON.stringify(r.errors));
+}
+t('[i9-batch-6a] L1..L3 两个 commit（多 commit 分步修复）→ 批次校验通过（严格后代，任意距离）', () => {
+  const r = pgCallWith(twoStepRunManifest, L3, termTwoStep);
+  ok(!r.errors.some((e) => /批次|严格后代|零推进/i.test(e)), '多 commit 不应报任何批次错误: ' + JSON.stringify(r.errors));
+});
+// 6b/6c 诚实说明（如实声明）：完整 checkPushGuard 链上，「expected_sha 绑定」+「SC-3 终版
+// artifact 的 parent 祖先绑定」已前置保证终版 candidate 必是 source_candidate 的后代——
+// 「非后代/零推进」在完整链上必然被前置检查先拦，无法独立构造触发。因此这两个失败模式
+// 直接单测 push-guard 导出的 isStrictDescendant 纯函数（push-guard 批次段调用它，6a 的
+// 完整链通过即验证接线未断）。
+t('[i9-batch-6b] isStrictDescendant：非后代（L1 之前的 L0）→ false（push-guard 批次段据此拒）', () => {
+  ok(isStrictDescendant({ repoDir: repo, ancestorSha: L1, descendantSha: L0 }) === false,
+    'L0 不是 L1 的后代必须判 false');
+});
+t('[i9-batch-6c] isStrictDescendant：相等（零推进）→ false（push-guard 批次段据此报「批次零推进」）', () => {
+  ok(isStrictDescendant({ repoDir: repo, ancestorSha: L1, descendantSha: L1 }) === false,
+    '同 SHA 必须判 false（严格不等，git merge-base --is-ancestor A A 会退出 0，必须显式排除）');
+});
+t('[i9-batch-6d] isStrictDescendant：严格后代（任意距离 L1→L3）→ true（多 commit 分步修复合法）', () => {
+  ok(isStrictDescendant({ repoDir: repo, ancestorSha: L1, descendantSha: L3 }) === true,
+    'L3 是 L1 的严格后代（隔 2 个 commit）必须判 true——任意距离，不要求直接子 commit');
 });
 
 console.log(`\n==== i9-batch.mjs: ${pass} passed, ${failCount} failed ====`);
