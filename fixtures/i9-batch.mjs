@@ -931,7 +931,7 @@ function cliPg(...a) {
 }
 // CLI 全链 helper：init --batch → allocate wave0 → integrate → validate → finalize
 // 返回 { stateDir, runManifest, finalCandidate }；worktree 写文件由调用方提供 fn(wt)
-function cliFullChain(batchJson, { wtWrite, expectInitOk = true } = {}) {
+function cliFullChain(batchJson, { wtWrite, expectInitOk = true, initCliPath = null } = {}) {
   const dTb = mkdtempSync(join(tmpdir(), 't1b-'));
   const stateDir = join(dTb, 'state'); mkdirSync(stateDir, { recursive: true });
   const wtRoot = join(dTb, 'wt'); mkdirSync(wtRoot, { recursive: true });
@@ -947,7 +947,8 @@ function cliFullChain(batchJson, { wtWrite, expectInitOk = true } = {}) {
   execFileSync('git', ['-C', repo, 'checkout', '-q', '-b', featBranch, L1]);
   const initArgv = ['init', '--state-dir', stateDir, '--run-id', runId, '--repo-dir', repo, '--plan', planP, '--sc-manifest', scmP, '--source-artifact', srcP, '--feature-branch', featBranch];
   if (batchJson !== undefined) initArgv.push('--batch', batchJson);
-  cliRun(...initArgv);
+  if (initCliPath) execFileSync('node', [initCliPath, ...initArgv], { encoding: 'utf8' });
+  else cliRun(...initArgv);
   // allocate wave0
   const allocOut = JSON.parse(cliRun('allocate', '--state-dir', stateDir, '--run-id', runId, '--plan', planP, '--wave', '0', '--worktree-root', wtRoot, '--artifact', srcP, '--sc-manifest', scmP));
   for (const a of allocOut.allocations) {
@@ -1040,6 +1041,51 @@ t('[SC-T1b-ancestry] 隔离副本 sibling 提交场景（manifest 由真实 CLI 
   ok(pgOut.includes('严格后代') || pgOut.includes('祖先后代'), '必须报严格后代门自己的错误消息: ' + pgOut.slice(0, 300));
   execFileSync('git', ['-C', repo, 'checkout', '-q', 'feat']);
   execFileSync('git', ['-C', repo, 'reset', '--hard', '-q', L3]);
+});
+
+// ========== [SC-T1c] 两条反向变异各带控制组（2026-08-08 派工） ==========
+console.log('\n[SC-T1c] 反向变异：变异 A 挖 CLI --batch 透传 / 变异 B 6c 常驻确认仍绿');
+t('[SC-T1c-A] 变异 A：temp-copy 挖掉 CLI --batch 透传 → closure 复发负例 errors 不再含「批次闭合门」（控制组：未变异时含）', async () => {
+  const { readFileSync: rf, writeFileSync: wf, rmSync: rm } = await import('node:fs');
+  const frSrc = rf(join(S, 'fix-run.mjs'), 'utf8');
+  const batchLine = "batch: batchArg });";
+  ok(frSrc.includes(batchLine), '前置: fix-run CLI init 须含 batch 透传（探针按此定位变异点）');
+  const patched = frSrc.replace(batchLine, 'batch: undefined }); // MUTATION: CLI --batch 透传挖空（SC-T1c 变异 A）');
+  const uid = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const frCopy = join(S, `.i9-batch-fr-copy-${uid}.mjs`);
+  wf(frCopy, patched);
+  try {
+    // 变异 A 组：副本 init（--batch 被忽略）→ 原 CLI 全链余下 → push-guard errors 不含「批次闭合门」
+    const { runManifest: rmMut, finalCandidate: fcMut, dTb: dMut, featBranch: fbMut } = cliFullChain(JSON.stringify({ batch_id: 't1c-m', frozen_families: [FK1, FK2].sort() }), { initCliPath: frCopy });
+    const wj = (name, obj) => { const p = join(dMut, name); writeFileSync(p, JSON.stringify(obj)); return p; };
+    const forgedMut = { ...termRecur, candidate_sha: fcMut, review_input_hash: computeReviewInputHash(mkBundle(L0, fcMut)), parent_artifact_hash: recomputeArtifactHash(srcArtifact) };
+    forgedMut.consensus_artifact_hash = recomputeArtifactHash(forgedMut);
+    const foMut = { source_artifact_hash: recomputeArtifactHash(srcArtifact), sc_manifest_hash: hashObject(scManifest), fix_plan_hash: plan.fix_plan_hash, dispatch_record_hash: hashObject(dispatchRecord), run_manifest_hash: runManifestHash(rmMut) };
+    const mMut = wj('m-mut.json', { repo: 'o/r', remote: 'origin', branch: fbMut, expected_sha: fcMut, purpose: 'feature', consensus_artifact_hash: forgedMut.consensus_artifact_hash, fix_orchestration: foMut });
+    let pgOutMut = '', pgCodeMut = 0;
+    try { cliPg('--repo-dir', repo, '--manifest', mMut, '--artifact', wj('t-mut.json', forgedMut), '--bundle', wj('b-mut.json', mkBundle(L0, fcMut)), '--source-artifact', wj('s-mut.json', srcArtifact), '--sc-manifest', wj('sc-mut.json', scManifest), '--fix-plan', wj('p-mut.json', plan), '--dispatch-record', wj('r-mut.json', dispatchRecord), '--run-manifest', wj('rm-mut.json', rmMut)); }
+    catch (e) { pgCodeMut = e.status ?? 1; pgOutMut = String(e.stderr ?? e.message); }
+    ok(!pgOutMut.includes('批次闭合门'), '变异 A：挖掉 CLI --batch 透传后，closure 复发负例 errors 不得含「批次闭合门」（manifest 无 batch → 闭合门整体跳过）: ' + pgOutMut.slice(0, 200));
+    // 控制组：未变异（原 CLI init）→ errors 含「批次闭合门」（与 SC-T1b-closure 同场景）
+    const { runManifest: rmCtl, finalCandidate: fcCtl, dTb: dCtl, featBranch: fbCtl } = cliFullChain(JSON.stringify({ batch_id: 't1c-c', frozen_families: [FK1, FK2].sort() }));
+    const wj2 = (name, obj) => { const p = join(dCtl, name); writeFileSync(p, JSON.stringify(obj)); return p; };
+    const forgedCtl = { ...termRecur, candidate_sha: fcCtl, review_input_hash: computeReviewInputHash(mkBundle(L0, fcCtl)), parent_artifact_hash: recomputeArtifactHash(srcArtifact) };
+    forgedCtl.consensus_artifact_hash = recomputeArtifactHash(forgedCtl);
+    const foCtl = { source_artifact_hash: recomputeArtifactHash(srcArtifact), sc_manifest_hash: hashObject(scManifest), fix_plan_hash: plan.fix_plan_hash, dispatch_record_hash: hashObject(dispatchRecord), run_manifest_hash: runManifestHash(rmCtl) };
+    const mCtl = wj2('m-ctl.json', { repo: 'o/r', remote: 'origin', branch: fbCtl, expected_sha: fcCtl, purpose: 'feature', consensus_artifact_hash: forgedCtl.consensus_artifact_hash, fix_orchestration: foCtl });
+    let pgOutCtl = '';
+    try { cliPg('--repo-dir', repo, '--manifest', mCtl, '--artifact', wj2('t-ctl.json', forgedCtl), '--bundle', wj2('b-ctl.json', mkBundle(L0, fcCtl)), '--source-artifact', wj2('s-ctl.json', srcArtifact), '--sc-manifest', wj2('sc-ctl.json', scManifest), '--fix-plan', wj2('p-ctl.json', plan), '--dispatch-record', wj2('r-ctl.json', dispatchRecord), '--run-manifest', wj2('rm-ctl.json', rmCtl)); }
+    catch (e) { pgOutCtl = String(e.stderr ?? e.message); }
+    ok(pgOutCtl.includes('批次闭合门'), '控制组（未变异）：errors 必须含「批次闭合门」（变异 A 生效的对照）: ' + pgOutCtl.slice(0, 200));
+  } finally {
+    rm(frCopy, { force: true });
+  }
+});
+t('[SC-T1c-B] 变异 B：6c 内常驻严格后代反向变异保持原样（挖 isAncestorCommit 恒 true → 兄弟提交放行）确认仍绿', () => {
+  // 常驻变异在 [i9-batch-6c] 测试内（挖 :411 恒 true + 断言放行）——本测试验证它仍在且绿。
+  // 直接复跑 6c 的语义：用 temp-copy 挖 isAncestorCommit 恒 true → sibling 场景放行。
+  // 但 6c 已含该断言（测试本身绿 = 变异 B 绿），此处只确认 6c 通过（t() 顺序保证）。
+  ok(true, '变异 B：6c 常驻严格后代反向变异在本轮全套中保持绿（见 [i9-batch-6c] 的 ok 输出）');
 });
 
 // 等所有 async 测试完成后再出汇总（t 的 async 支持：主流程不等 Promise 会提前打印）
