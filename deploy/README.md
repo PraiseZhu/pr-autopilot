@@ -124,7 +124,7 @@ export EXPECT_EFFORT='xhigh'
 
 > 每条「后果」都逐跳落到 `文件:行号`（已核实）；落不到行号的写「成因未定」——空白比推测有用。
 > 症状名（如「budget cap 撞顶」）可能误导你对根因的判断，务必读因果链本身。
-> **重构依据**：原先「每个变量映射一个症状」的组织方式，没有经验证的引擎反应模型支撑——旧写法行行被证伪。故整节按后果导向重写；**下表是重写后的结果，每条后果都逐跳落到已核实的 `文件:行号`**（行数刻意不写，防表格增删漂移）。判断依据可直接引：
+> **本节按后果导向重写过**：原先「每个变量映射一个症状」的组织方式没有经验证的引擎反应模型支撑，那三条症状映射已被证伪或无法验证，故整节重构。**下表是重写后的结果——每条后果都逐跳落到已核实的 `文件:行号`**；落不到行号的在正文里明写「成因未定」或「需 mini 实测」。判断依据可直接引：
 > - `docs/plan.md:163-164` W-2 首扫空目录立即退出；W-3 按类游标、exact-head、评论 node-id、CI 状态跃迁、at-least-once/副作用幂等；
 > - `docs/plan.md:31,42,83-84` 空清单零 GitHub 请求 / 零 LLM / 零 token；引擎每仓一条 schedule、空 state 目录秒退；
 > - `scripts/pr-watch/gate.mjs:3-10,16,61-74` 按类游标、同 head 的 `ci_red_sha` 去重、ack 后推进；
@@ -134,7 +134,7 @@ export EXPECT_EFFORT='xhigh'
 | 变量/项 | 作用 | 已验证的直接后果（逐跳） |
 |---|---|---|
 | `PR_AUTOPILOT_HMAC_KEY` | 自家评论识别密钥（complete 校验回帖落地、gate 过滤自家评论） | 无 key → 修复完工回执校验失败 → 卡 pending → 最终 stuck 通知（①） |
-| `REQUIRED_CONTEXTS_FILE` | CI 判绿的 required contexts 清单（JSON 文件路径） | 无配置 → 每 head 首扫判 CI 红 → **该 head 首次唤醒**（不是持续每轮）（②） |
+| `REQUIRED_CONTEXTS_FILE` | CI 判绿的 required contexts 清单（JSON 文件路径） | 无配置 → 每 head 首扫判 CI 红 → 该 head 首次唤醒；**投递失败则下轮重试（at-least-once），不保证跨轮静默**（②） |
 | `SNAPSHOT_CACHE_DIR` | gh-snapshot 响应缓存/ETag（条件请求） | 不配 → 每轮探针都是**普通 API 请求**，配额被静默低估（②b） |
 | preRunHook | 班车调度跳过空转轮 | 若宿主 schedule 每周期启动 agent 且未接 probe，则**可能**每周期启动会话（宿主行为需在 mini 实测）；接 probe 注意退出码边界（③） |
 
