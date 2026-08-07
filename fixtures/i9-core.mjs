@@ -19,7 +19,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { computeReviewInputHash } from '../scripts/review-input-hash.mjs';
-import { runConsensusGate, recomputeArtifactHash } from '../scripts/consensus-gate.mjs';
+import { runConsensusGate, recomputeArtifactHash, ARTIFACT_SCHEMA_VERSION } from '../scripts/consensus-gate.mjs';
 import { checkPushGuard } from '../scripts/push-guard.mjs';
 import { checkScCoverage } from '../scripts/sc-coverage-gate.mjs';
 import { initRun } from '../scripts/fix-run.mjs';
@@ -33,6 +33,10 @@ import { REVIEWERS, SCHEMA_VERSION } from '../scripts/verdict-validate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const S = join(HERE, '..', 'scripts');
+// B 类（2026-08-07）: artifact schema 版本从 consensus-gate.mjs 导出的 ARTIFACT_SCHEMA_VERSION
+// 派生（它从 schemas/consensus-artifact.schema.json 的 schema_version.const 读取）。8 处
+// 'v3' 字面量全部改用它；反向自检在下方「版本字面量」测试里统一断言不残留 'v[0-9]'。
+const A = ARTIFACT_SCHEMA_VERSION; // 简称：artifact schema 版本（报错断言里插值用）
 
 let pass = 0, failCount = 0;
 const failures = [];
@@ -336,7 +340,7 @@ t('[SC-R2-1-pre] schema_version v3→v1 后按当前公式重算 hash 仍自洽�
 t('[SC-R2-1-a] sc-coverage-gate.checkScCoverage 拒 schema_version≠v3 的源 artifact，报错点名 schema 版本而非 hash', () => {
   const manifest = { schema_version: 'v2', consensus_artifact_hash: r2SchemaForged.consensus_artifact_hash, scs: [] };
   const errs = checkScCoverage({ manifest, artifact: r2SchemaForged });
-  ok(errs.some((e) => /schema_version/.test(e) && /v3/.test(e)), '必须点名 schema_version 问题: ' + JSON.stringify(errs));
+  ok(errs.some((e) => /schema_version/.test(e) && e.includes(A)), '必须点名 schema_version 问题: ' + JSON.stringify(errs));
   ok(!errs.some((e) => /hash 与内容重算不符/.test(e)), '不应报 hash 不符（hash 本就自洽，问题是结构）: ' + JSON.stringify(errs));
 });
 t('[SC-R2-1-b] fix-run.initRun throw 拒 schema_version≠v3 的源 artifact，消息点名 schema 版本', () => {
@@ -344,11 +348,11 @@ t('[SC-R2-1-b] fix-run.initRun throw 拒 schema_version≠v3 的源 artifact，�
   let threw = null;
   try { initRun({ stateDir, runId: 'i9-r2-schema', repoDir: '/nonexistent', plan: mkPlanFor(r2SchemaForged), scManifest: {}, sourceArtifact: r2SchemaForged }); }
   catch (e) { threw = e; }
-  ok(threw && /schema_version/.test(threw.message) && /v3/.test(threw.message), '必须 throw 且点名 schema_version: ' + (threw ? threw.message : '(未抛错，疑似静默通过)'));
+  ok(threw && /schema_version/.test(threw.message) && threw.message.includes(A), '必须 throw 且点名 schema_version: ' + (threw ? threw.message : '(未抛错，疑似静默通过)'));
 });
 t('[SC-R2-1-c] push-guard.checkPushGuard 的 fix_orchestration.sourceArtifact 拒 schema_version≠v3，报错点名 schema 版本', () => {
   const r = callPushGuardWithSource(r2SchemaForged);
-  ok(r.errors.some((e) => /schema_version/.test(e) && /v3/.test(e)), '必须点名 schema_version: ' + JSON.stringify(r.errors));
+  ok(r.errors.some((e) => /schema_version/.test(e) && e.includes(A)), '必须点名 schema_version: ' + JSON.stringify(r.errors));
 });
 // 额外一处（不在 blocker 原文三入口之列，防御性加固）: push-guard 顶层 artifact 字段
 // （purpose=feature，无 fix_orchestration 时的直通路径）同样必须过结构门。
@@ -359,7 +363,7 @@ t('[SC-R2-1-d(bonus)] push-guard.checkPushGuard 顶层 artifact 字段（purpose
     manifest: { ...pgManifestBase, consensus_artifact_hash: forgedTerminal.consensus_artifact_hash },
     artifact: forgedTerminal, bundle: pgBundle, constitution
   });
-  ok(r.errors.some((e) => /schema_version/.test(e) && /v3/.test(e)), '必须点名 schema_version: ' + JSON.stringify(r.errors));
+  ok(r.errors.some((e) => /schema_version/.test(e) && e.includes(A)), '必须点名 schema_version: ' + JSON.stringify(r.errors));
 });
 
 // ---- SC-R2-2: 删除 round ----
@@ -402,7 +406,7 @@ const r2ParentSchemaForged = forgeArtifact(r2Pass, (a) => { a.schema_version = '
 t('[SC-R2-3] round>=2 的 parent 结构门——parent.schema_version 被改成 v1（hash 重算自洽）→ 必拒，报错点名 schema 而非 hash', () => {
   const { artifact } = consensusFor(mkBundle(SHA_B, SHA_C), [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: r2ParentSchemaForged });
   ok(artifact.gate_result === 'fail', 'round=2 携带 schema 非法的 parent 必须 fail: ' + JSON.stringify(artifact));
-  ok(artifact.fail_reasons.some((e) => /schema_version/.test(e) && /v3/.test(e)), '必须点名 parent 的 schema_version 问题: ' + JSON.stringify(artifact.fail_reasons));
+  ok(artifact.fail_reasons.some((e) => /schema_version/.test(e) && e.includes(A)), '必须点名 parent 的 schema_version 问题: ' + JSON.stringify(artifact.fail_reasons));
   ok(!artifact.fail_reasons.some((e) => /hash 与内容重算不符/.test(e)), '不应报 parent hash 不符（parent hash 本就自洽，问题是结构）: ' + JSON.stringify(artifact.fail_reasons));
 });
 t('[SC-R2-3-round] round>=2 的 parent 删除 round → 必拒，报错点名 round', () => {
@@ -416,7 +420,9 @@ t('[SC-R2-3-round] round>=2 的 parent 删除 round → 必拒，报错点名 ro
 // ---- SC-R2-4: schema_version 已入 hash ----
 t('[SC-R2-4] schema_version 已入 hash——仅翻转它（不重算）hash 必变', () => {
   const before = recomputeArtifactHash(r2Pass);
-  const flipped = { ...r2Pass, schema_version: 'v1' };
+  // B 类: 翻转值 = 当前版本 bump 一位（'v4'→'v5'），从常量派生不写死字面量（本测试只验
+  // 「翻转后 hash 必变」，值是什么不重要，只要 ≠ 当前版本）
+  const flipped = { ...r2Pass, schema_version: 'v' + (Number(ARTIFACT_SCHEMA_VERSION.slice(1)) + 1) };
   const after = recomputeArtifactHash(flipped);
   ok(after !== before, 'schema_version 翻转后 hash 必须变化（SC-R2-4）');
 });
@@ -437,10 +443,12 @@ t('[SC-R2-5b] round 缺失时 recomputeArtifactHash 必须 throw，不得静默�
 });
 
 // ---- SC-R2-6: schema 文件 $id/title 升 v3 + parent_artifact_hash 已声明 ----
-t('[SC-R2-6] schemas/consensus-artifact.schema.json 已升级为 v3 且声明 parent_artifact_hash（nullable 64-hex）', () => {
+t('[SC-R2-6] schemas/consensus-artifact.schema.json 已升级（版本从 $id 派生）且声明 parent_artifact_hash（nullable 64-hex）', () => {
   const schema = readJson(join(S, '..', 'schemas', 'consensus-artifact.schema.json'));
-  ok(/v3/.test(schema.$id), '$id 必须标注 v3: ' + schema.$id);
-  ok(/v3/.test(schema.title), 'title 必须标注 v3: ' + schema.title);
+  // B 类: 版本断言从 $id 版本段派生（v4 起），不写死字面量——schema bump 时自动跟随
+  const idVersion = schema.$id.split('/').pop();
+  ok(idVersion === ARTIFACT_SCHEMA_VERSION, `$id 版本段必须等于 schema_version.const（${ARTIFACT_SCHEMA_VERSION}）: $id=${schema.$id}`);
+  ok(schema.title.includes(ARTIFACT_SCHEMA_VERSION), `title 必须标注当前版本 ${ARTIFACT_SCHEMA_VERSION}: ` + schema.title);
   ok(schema.properties && schema.properties.parent_artifact_hash, 'properties 必须声明 parent_artifact_hash: ' + JSON.stringify(Object.keys(schema.properties ?? {})));
   const pah = schema.properties.parent_artifact_hash;
   const types = Array.isArray(pah.type) ? pah.type : [pah.type];
@@ -458,7 +466,10 @@ console.log('\n[SC-R3] parent 谱系绑定新增内容校验：base_sha 相同 +
 t('[SC-R3-2] 跮 PR 的伪 parent（base/candidate 与当前评审完全不同，自身完全自洽）→ 必拒，报错点名 base 不匹配', () => {
   const CROSS_BASE = 'e'.repeat(40), CROSS_CANDIDATE = 'f'.repeat(40);
   const forgedDraft = {
-    schema_version: 'v3', review_input_hash: 'a'.repeat(64), parent_artifact_hash: 'f'.repeat(64),
+    // B 类: schema_version 从 ARTIFACT_SCHEMA_VERSION 派生；pr_number 是 v4 新增 required
+    // 字段（补 null 使伪 parent 形状自洽——本反例要测的是「base 不匹配」，不能让缺 pr_number
+    // 多报一条把失败模式污染掉）
+    schema_version: ARTIFACT_SCHEMA_VERSION, pr_number: null, review_input_hash: 'a'.repeat(64), parent_artifact_hash: 'f'.repeat(64),
     round: 2, base_sha: CROSS_BASE, candidate_sha: CROSS_CANDIDATE, canonical_findings: [],
     verdict_hashes: { 'claude-adversarial': '1'.repeat(64), 'codex-adversarial': '2'.repeat(64), 'upstream-preview': '3'.repeat(64) },
     created_at: new Date(0).toISOString(), gate_result: 'pass', fail_reasons: []
@@ -532,9 +543,13 @@ t('[SC-R3-7] 改 schemas/consensus-artifact.schema.json 的 schema_version 版�
   const schemaPath = join(S, '..', 'schemas', 'consensus-artifact.schema.json');
   const original = readFileSync(schemaPath, 'utf8');
   const PROBE_VERSION = 'v3-sc-r3-7-probe';
+  // B 类: 变异前的当前版本——声明在 try 外（try 块内 const 在 try 后的还原检查不可见，
+  // 块作用域）。前提断言与还原检查都用它，不写死任何版本字面量——schema bump 时自动跟随。
+  const originalVersion = JSON.parse(original).properties?.schema_version?.const;
   try {
     const schemaObj = JSON.parse(original);
-    ok(schemaObj.properties?.schema_version?.const === 'v3', '前提: 改动前版本应为 v3，得到: ' + JSON.stringify(schemaObj.properties?.schema_version?.const));
+    ok(typeof originalVersion === 'string' && originalVersion, '前提: schema 必须声明 schema_version.const，得到: ' + JSON.stringify(originalVersion));
+    ok(originalVersion === ARTIFACT_SCHEMA_VERSION, `前提: schema 版本必须等于导出常量（${ARTIFACT_SCHEMA_VERSION}），得到 ${originalVersion}——说明派生源与生产判定不同步，先查 batch-txn`);
     schemaObj.properties.schema_version.const = PROBE_VERSION;
     writeFileSync(schemaPath, JSON.stringify(schemaObj, null, 2) + '\n');
 
@@ -561,7 +576,9 @@ function mkV(reviewer) {
 }
 const vs = ['claude-adversarial','codex-adversarial','upstream-preview'].map(mkV);
 const artifact = runConsensusGate(vs, { bundle, changedPaths: new Set() });
-const shapeErrsOld = assertArtifactShape({ ...artifact, schema_version: 'v3' });
+// B 类: '旧值'用变异前的 originalVersion（非 probe 版本即可），不写死字面量
+// JSON.stringify 生成带引号的字符串字面量（直接插值会变裸标识符导致 probe 语法错误）
+const shapeErrsOld = assertArtifactShape({ ...artifact, schema_version: ${JSON.stringify(originalVersion)} });
 const shapeErrsNew = assertArtifactShape(artifact);
 process.stdout.write(JSON.stringify({ ARTIFACT_SCHEMA_VERSION, gate_result: artifact.gate_result, fail_reasons: artifact.fail_reasons, draft_schema_version: artifact.schema_version, shapeErrsOld, shapeErrsNew }));
 `;
@@ -576,7 +593,7 @@ process.stdout.write(JSON.stringify({ ARTIFACT_SCHEMA_VERSION, gate_result: arti
     writeFileSync(schemaPath, original);
   }
   const restoredCheck = JSON.parse(readFileSync(schemaPath, 'utf8'));
-  eq(restoredCheck.properties?.schema_version?.const, 'v3', 'SC-R3-7: schema 文件必须已还原为 v3（防止测试污染仓库文件）');
+  eq(restoredCheck.properties?.schema_version?.const, originalVersion, 'SC-R3-7: schema 文件必须已还原为变异前的原版本（防止测试污染仓库文件）');
 });
 
 t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生，不得残留 verdict schema_version 字面量（照 [SC-12] 写法）', () => {
@@ -587,6 +604,12 @@ t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生，不�
   ok(/schema_version: SCHEMA_VERSION, reviewer/.test(own), '本文件 verdict 构造必须用 SCHEMA_VERSION 派生常量');
   const lit = "schema_version: 'v" + "[0-9]', reviewer";
   ok(!own.includes(lit), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
+  // B 类（2026-08-07）: artifact schema 版本也不得残留字面量（须用 ARTIFACT_SCHEMA_VERSION 派生）。
+  // 反向正则收窄为「, review_input_hash 尾随」形态——artifact 对象的 schema_version 后必跟
+  // review_input_hash；sc_manifest（'v2', consensus_artifact_hash 尾随）与 fix_plan（'v1'）是
+  // 另一套协议，不在本自检范围。forgeArtifact 的 'v1' 是赋值形态（=号），也不在此列。
+  const artLit = "schema_version: 'v" + "[0-9]', review_input_hash";
+  ok(!own.includes(artLit), '本文件不得残留 artifact schema_version 字面量（须用 ARTIFACT_SCHEMA_VERSION 派生）');
 });
 
 console.log(`\n========== i9-core fixtures: ${pass} passed, ${failCount} failed ==========`);
