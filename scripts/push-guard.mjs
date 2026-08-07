@@ -265,7 +265,14 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
           errors.push('源 artifact 与终版 artifact 的 base_sha 不同（跨评审拼接）');
         }
         // ② SC 覆盖门（绑源 artifact）——修 R1 既有洞: SC 必须真绑回 finding 且全覆盖
-        const covErrs = checkScCoverage({ manifest: scManifest, artifact: sourceArtifact });
+        // 防御性 try/catch: checkScCoverage 的契约是"返回错误数组、不 throw"，但它内部同样
+        // 依赖 assertArtifactShape 先行短路才能保证不 throw——若那道短路本身被破坏（回归/
+        // 反向变异），不加这层会让本函数已经在 errors 里攒好的结构错误（见上方我们自己的
+        // assertArtifactShape 调用）因未捕获异常而丢失、连 { ok:false, errors } 都返回不了
+        // （fail-closed 应体现为多一条错误，不是把调用方也拖崩，保证四个调用点互相隔离）。
+        let covErrs = [];
+        try { covErrs = checkScCoverage({ manifest: scManifest, artifact: sourceArtifact }); }
+        catch (e) { errors.push(`SC 覆盖门内部异常（fail-closed，不让调用方崩溃）: ${e.message}`); }
         for (const e of covErrs) errors.push(`SC 覆盖门: ${e}`);
         if (hashObject(scManifest) !== fo.sc_manifest_hash) errors.push('fix_orchestration.sc_manifest_hash ≠ sc manifest 重算值');
         // ③ fix plan 重算等价（纯函数——lead 改分组即 hash 对不上）
