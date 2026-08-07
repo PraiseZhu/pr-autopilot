@@ -210,6 +210,51 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
 - **双机同时巡审：目前没有内建的按作者分片手段**。实测核实：review-pr 的 `--auto` 批量扫**所有**可审查的 open、非 draft PR，无作者过滤参数；pr-autopilot 引擎按 state 目录扫全部在册 PR，注册（`register.mjs`）也不含 author 维度。两台机器各自跑巡审会**抢同一批 PR**：同一 PR 被两家重复审查、重复评论（selfFixAuthors 触发还会交叉改同一 PR）。**这是 T1 之外的真实空缺**，不是设计限制——分片能力尚未建，别以为有什么参数能解决。现状下的缓解只有人工约定：错开时间窗、或让每台机器只管自己注册进盯梢的 PR（pr-autopilot 的盯梢按注册隔离，谁注册谁盯；但注册与巡审是两条独立链路，巡审侧的抢单不受注册隔离保护）。
 - **`engine-mivo.json` 不能直接拷** —— ⚠️ 里面的 `feishuCmd` / `slackCmd` 是指向**本机 owner** 的告警脚本路径（bug-doctor notify.mjs 的 Slack 通道、feishu-alert.mjs 的飞书通道）：原样拷过去 = 对方机器上的巡审结果、预算告警、健康告警**发进我们的群里**，等于把我们机器的通知目标装到了别人机器上。部署者必须**本地化通知配置**（把这两个字段改成自己的告警通道）。这条没有机器门在拦——字段只是路径字符串，机器无法验证它指向谁的通知——纯靠部署时自觉，写在这里就是要让这份拷贝刺眼。
 
+### 2.2 补注册接线（reconcile 班车，T1）
+
+自己名下没走注册流程的旁路 PR，由 `deploy/wrappers/reconcile-own-prs.mjs` 补注册进盯梢。
+**生产入口 = 每仓一条 15 分钟 schedule**（`*/15 * * * *`，execution_mode=script，零 LLM）——
+mivo → state-mivo、cindy → state-cindy，与盯梢引擎、每日卡片（§3）解耦独立调度：
+
+```bash
+# mivo 仓
+node ~/pr-autopilot/deploy/wrappers/reconcile-own-prs.mjs \
+  --repo xindong/mivo-canvas \
+  --state-dir ~/pr-autopilot-runtime/state-mivo \
+  --remote-map-file ~/pr-autopilot-runtime/remote-map.json
+# cindy 仓
+node ~/pr-autopilot/deploy/wrappers/reconcile-own-prs.mjs \
+  --repo PraiseZhu/pr-autopilot \
+  --state-dir ~/pr-autopilot-runtime/state-cindy \
+  --remote-map-file ~/pr-autopilot-runtime/remote-map.json
+```
+
+remote-map.json（base 仓全名 → 该仓 checkout 里修复 push 用的 remote 名；注册时必须显式声明，
+引擎不猜，同 §2 注册命令的 `--push-remote` 语义）:
+
+```json
+{ "xindong/mivo-canvas": "origin", "PraiseZhu/pr-autopilot": "fork" }
+```
+
+- **fail-closed 分层**：启动前校验 remote-map（不可读 / JSON 非对象 / 缺当前 `--repo` key /
+  alias 非法或空串）即非零退出；gh 失败非零；API 脏字段（缺 headRefName、
+  `headRepository.nameWithOwner` 缺失或非字符串）该条 dropped + stderr 继续（合法 dropped 不判
+  非零）；registerPr 异常（含在途 dispatch 接线变化，`register.mjs:39-42`）记 errors 且该轮非零。
+  输出 JSON 四明细 `{registered, already, dropped, errors}`；退出码：配置错 / gh 失败 / errors
+  非空 → 非零，其余 → 0。
+- **`--author @me` 只作用于补注册 wrapper 这一层**：reconcile 的 `gh pr list --author @me`
+  只筛自己名下的 open PR 做补注册，是**注册侧的按作者收窄**。这与 §2 ④（:208-211）里
+  「review-pr 的 `--auto` 无作者过滤参数、双机巡审会抢同一批 PR」的声明是**两条独立事实，
+  互不混淆**——巡审侧（审查）至今没有按作者分片，补注册侧（盯梢注册）用 `--author @me`
+  收窄，两者不互相取消。
+- **每日卡片的 ownPrsCmd 是可选辅路**（`scripts/inbox-digest/runner.mjs` 的补注册段）：配了会在
+  每日卡片时顺带补注册，不配则跳过。**本期只交付 reconcile 班车这条生产入口，不声称双仓补注册
+  已由每日卡片完成**——每日卡片 10:00 一次，旁路 PR 的 24h SLO 由 15 分钟班车兜底。
+- **registerPr 幂等**（同 wiring 重跑返回 already、不重置游标/在途 dispatch），15 分钟高频重跑
+  安全，不会重复派发或污染在途任务。
+- 契约 fixture: `fixtures/own-prs.fixture.mjs`（真实三层接线 wrapper→reconcile→registerPr，
+  只 stub gh 二进制）。
+
 ## 3. 每日卡片调度（§3）
 
 - cron: `0 10 * * *`；agent 模式；四元组 `claude-code + Cindy AI + deepseek/deepseek-v4-pro + max`。
