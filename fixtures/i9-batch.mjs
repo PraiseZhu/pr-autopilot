@@ -241,6 +241,27 @@ const f1Recur = { id: 'f1r', primary_face: 'C', severity: 'major', anchor: FIX1_
 const termRecur = mkTerminal(L2, [[f1Recur], [f1Recur], [f1Recur]]);
 if (termRecur.gate_result !== 'pass') throw new Error('[i9-batch-2] 前提失败: 复发轮未 PASS: ' + JSON.stringify(termRecur.fail_reasons ?? []));
 const recurRunManifest = mkRunManifest();
+t('[i9-batch-1c] push-guard 闭合门接线：run manifest 含 batch 段且闭合门 errs 非空（复发）→ 拒 push（接线负例）', () => {
+  // 2026-08-07（集成审查④）: batch-closure-gate 此前全仓只有 fixture 与它自己 CLI 调，
+  // push 边界从不执行它——批次语义不变量在生产链静默缺席。接线后：run manifest 含 batch 段
+  // 时 push-guard 调 checkBatchClosure，errs 非空即拒。用 recurRunManifest（冻结 FK1 复发）+
+  // termRecur（终版含 FK1）构造：闭合门判据④必拒 → push-guard 必须报「批次闭合门」错误。
+  const foRecur = {
+    source_artifact_hash: recomputeArtifactHash(srcArtifact),
+    sc_manifest_hash: hashObject(scManifest),
+    fix_plan_hash: plan.fix_plan_hash,
+    dispatch_record_hash: hashObject(dispatchRecord),
+    run_manifest_hash: runManifestHash(recurRunManifest)
+  };
+  const rRecur = checkPushGuard({
+    repoDir: repo,
+    manifest: { repo: 'o/r', remote: 'origin', branch: 'feat', expected_sha: L2, purpose: 'feature', consensus_artifact_hash: termRecur.consensus_artifact_hash, fix_orchestration: foRecur },
+    artifact: termRecur, bundle: mkBundle(L0, L2), constitution,
+    sourceArtifact: srcArtifact, scManifest, fixPlan: plan, dispatchRecord, runManifest: recurRunManifest
+  });
+  ok(rRecur.errors.some((e) => /批次闭合门/.test(e)),
+    '复发 run manifest（闭合门 errs 非空）必须被 push-guard 拒并点名批次闭合门: ' + JSON.stringify(rRecur.errors));
+});
 t('[i9-batch-2] 冻结集 family 在终版再次出现 → 闭合门④拒收口（消息点名复发 family）', () => {
   const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termRecur, scManifest });
   ok(errs.some((e) => /冻结集 family_key .*再次出现（同族复发/.test(e)),
@@ -733,7 +754,11 @@ t('[i9-batch-6d] pr_number 绑定：bundle.pr_number ≠ artifact.pr_number → 
   ok(!rNull.errors.some((e) => /pr_number/.test(e)), '两边 null（无 PR 直跑）应放行: ' + JSON.stringify(rNull.errors));
 });
 t('[i9-batch-6e] run manifest 版本比较：schema_version 不符 → 拒（旧 v2 按当前公式重算 hash 仍过）', () => {
-  const staleRm = { ...twoStepRunManifest, schema_version: 'v2' }; // 旧版 run manifest（hash 自洽）
+  // 2026-08-07 修正（失败模式隔离）：staleRm 必须**无 batch 段**——若带 batch，checkBatchClosure
+  // 的 :61-62 也有 RUN_MANIFEST_SCHEMA_VERSION 比较，会把 v2 拦下、掩盖 push-guard 版本比较
+  // 被挖空的变异（6e 断言的是 push-guard 的 :327，不是闭合门的）。去掉 batch 段后，只有
+  // push-guard 版本比较能拦，变异 C（挖空 :327）会让 6e 变红。
+  const staleRm = { ...twoStepRunManifest, schema_version: 'v2', batch: undefined }; // 旧版 run manifest（hash 自洽，无 batch）
   const foStale = {
     source_artifact_hash: recomputeArtifactHash(srcArtifact),
     sc_manifest_hash: hashObject(scManifest),
