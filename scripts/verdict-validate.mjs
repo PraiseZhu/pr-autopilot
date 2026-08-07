@@ -6,9 +6,14 @@
 //   - 任何 face.result=fail → verdict 必须 REQUIRES_CHANGES（不许 fail+APPROVED）
 //   - 存在 primary_face=taxonomy_gap 的 finding → run_status 必须 degraded（⑪ 停轮）
 //   - bundle.touches_ui=true 时对抗席 B 面禁 n_a（⑫ 脚本判定为唯一源）
-// R10-A3 修复: 加固清单覆盖率契约由纯文档承诺变机器强制——round===1 的两个对抗席必须携带
+// R10-A3 修复: 加固清单覆盖率契约由纯文档承诺变机器强制——两个对抗席必须携带
 //   hardening_coverage[9]（class_id 1〜9 各恰好一次，result∈{covered,n_a}，evidence 非空）；
-//   第三席与 round>=2 不强制（复核轮不重扫穷举面）
+//   第三席不强制（第三席不复核穷举面）
+// I9 修复: 十类穷举契约从「仅 round===1」扩展到「对抗席全 round」——每批修复产生的新代码
+//   此前是全流程唯一没有可机读穷举契约的代码，洞会漏到下一轮才被挖出，是审查轮次无限增殖的
+//   机制成因之一。第三席仍不强制（与 round 无关）。同时新增 hardening_coverage[].evidence 的
+//   格式校验（须含「路径:行号」形态引用），以及 verdict 顶层必填 attempt 字段（当前 round 的
+//   第几次审查尝试——round 语义变更为"PASS 共识序号"后，尝试次数信息改由本字段承载）。
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,6 +26,52 @@ export const DEFAULT_ANCHOR_PATHS_MAX = (() => {
   try { return readJson(join(HERE, '../config/orchestration.json')).anchor_paths_max_per_finding ?? 20; }
   catch { return 20; }
 })();
+
+// R2-P1（lead 实测发现的复发风险）: schema_version / attempt 下限 / hardening_coverage[n_a]
+// 的 evidence 最小长度，此前在本文件里各自手拄一份字面量（'v3' / >=1 / 10），与
+// schemas/review-verdict.schema.json 的对应字段是两份独立数据。dispatch-contract.mjs 已改
+// 从 schema 派生这三个值，若本文件继续手拄，就会出现「一处派生 + 一处手拄」——schema 真相源
+// 一变，dispatch-contract 跟着变、本文件不动，两者立刻不一致，形状与刚修的 blocker 完全相同，
+// 且更隐蔽（会被误以为"已经改成派生了"）。现改为本文件读 schema 派生并 export，
+// dispatch-contract.mjs 改为从本文件 import（不再各自重复读 schema），全链单一物理读取点。
+const REVIEW_VERDICT_SCHEMA = readJson(join(HERE, '../schemas/review-verdict.schema.json'));
+export const SCHEMA_VERSION = REVIEW_VERDICT_SCHEMA.properties?.schema_version?.const;
+export const ATTEMPT_MIN = REVIEW_VERDICT_SCHEMA.properties?.attempt?.minimum;
+export const HARDENING_NA_EVIDENCE_MIN_LENGTH = REVIEW_VERDICT_SCHEMA.properties?.hardening_coverage?.items?.allOf
+  ?.find((clause) => clause?.if?.properties?.result?.const === 'n_a')
+  ?.then?.properties?.evidence?.minLength;
+if (typeof SCHEMA_VERSION !== 'string' || !SCHEMA_VERSION) {
+  throw new Error('verdict-validate: 无法从 review-verdict.schema.json 读出 schema_version.const（schema 结构已变，需人工核对派生路径）');
+}
+if (!Number.isInteger(ATTEMPT_MIN)) {
+  throw new Error('verdict-validate: 无法从 review-verdict.schema.json 读出 attempt.minimum（schema 结构已变，需人工核对派生路径）');
+}
+if (!Number.isInteger(HARDENING_NA_EVIDENCE_MIN_LENGTH)) {
+  throw new Error('verdict-validate: 无法从 review-verdict.schema.json 读出 hardening_coverage[n_a].evidence 的 minLength（schema 结构已变，需人工核对派生路径）');
+}
+
+// R3-field-SC-R3-F2（实测事故复现）: 此前 schema.json 顶层未声明 additionalProperties，
+// validateVerdict 也没有任何「拒绝未知顶层字段」的机制——把 out_of_scope_notes（复数）typo 成
+// out_of_scope_note（单数）后 validateVerdict 返回 0 errors，域外真问题静默消失，且因为该字段
+// 本就是可选字段，缺失/typo 在结构上无法区分，不会在别处触发任何天然警报。已知顶层字段集合从
+// schema.properties 派生（单一真相源——新增合法顶层字段只需要出现在 schema.properties 里，
+// 这里自动跟上，不需要另外手改一份清单）。
+export const TOP_LEVEL_KEYS = new Set(Object.keys(REVIEW_VERDICT_SCHEMA.properties ?? {}));
+if (TOP_LEVEL_KEYS.size === 0) {
+  throw new Error('verdict-validate: 无法从 review-verdict.schema.json 读出 properties（schema 结构已变，需人工核对派生路径）');
+}
+
+// R3-field-SC-R3-F6（同一病灶的第二个实测实例）: forbidden_finding_fields（write_paths/
+// allowed_paths）的禁入检查此前是纯精确字符串匹配（见下方 forbidden 循环），把 write_paths 打成
+// write_path（单数）实测同样 0 errors 静默放过——close_dual_condition（status/closed_finding_ids）
+// 与 actionable_required_fields（invariant/family_id）经实测均为必填值校验，typo 必然 fail loud，
+// 不受本次改动影响（证据见 fixtures/i9-verdict.mjs 的 [SC-R3-F6-*] 系列）。已知 finding 字段集合
+// 同样从 schema 派生，拒绝任何不在其中的字段——不再要求精确命中 forbidden 数组里的字面值才报错。
+const FINDING_SCHEMA_PROPS = REVIEW_VERDICT_SCHEMA.properties?.findings?.items?.properties;
+export const FINDING_KEYS = new Set(Object.keys(FINDING_SCHEMA_PROPS ?? {}));
+if (FINDING_KEYS.size === 0) {
+  throw new Error('verdict-validate: 无法从 review-verdict.schema.json 读出 findings.items.properties（schema 结构已变，需人工核对派生路径）');
+}
 
 // SC-11: base∪candidate 的 tracked 文件集（「这是真文件」判据）
 export function trackedPathSet({ repoDir, baseSha, candidateSha }) {
@@ -42,14 +93,52 @@ export function changedPathSet({ repoDir, baseSha, candidateSha }) {
   return new Set(String(out).split('\0').filter(Boolean));
 }
 
-const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
-const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];
-const FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+// R2-P1 SC-9/SC-10: 导出席位名单与检查面枚举，dispatch-contract.mjs 的 SEATS/ADVERSARIAL/
+// ALL_FACES 改从这里 import，不再各自手拄第二份——本文件是这三份分类（哪些是合法 reviewer、
+// 哪些算对抗席、七面都是谁）的唯一权威。REVIEWERS/ADVERSARIAL 不是 schema 能表达的概念
+// （schema 只有 reviewer 的枚举值，没有"哪些是对抗席"这层业务语义），FACES 虽然值同构于
+// schema.properties.faces.items.properties.face.enum，但同一个病治一半比多花一轮更糟——
+// 三者用同一种手法（export 本地常量，下游 import）处理，不再区分"能不能从 schema 派生"，
+// 反正本文件本来就是它们的唯一权威声明点。
+export const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
+export const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];
+export const FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+// SC-R3-F5: 域外真问题的唯一合法载体字段名——本文件下方 validateVerdict() 里的 D3 内容
+// 校验通过本常量动态读取（`v[OUT_OF_SCOPE_NOTES_FIELD]`，R4 修复前是 `v.out_of_scope_notes`
+// 硬字面量，字段名在 schema 改名时 TOP_LEVEL_KEYS 接受新名、本段读旧名读 undefined → 内容
+// 校验静默跳过，属 SC-R3-F2 要治的可选通道静默丢数据一类）。dispatch-contract.mjs 的
+// out_of_scope_channel 此前在那之外又手拄了一份同一字符串（与 SEATS/ADVERSARIAL/ALL_FACES 曾经
+// 的漂移是同一形状）。改为 import 本常量，不再自己手写字面值。
+// 已全量扫过（lead 2026-08-07 补输入复核）：validator 内部「有导出常量却硬读字面量」共两处——
+// 本处（out_of_scope_notes）+ 对抗席 faces 数量 `length === 7`（FACES.length，见 :189 已改）。
+// 其余导出常量（SCHEMA_VERSION/ATTEMPT_MIN/HARDENING_NA_EVIDENCE_MIN_LENGTH/TOP_LEVEL_KEYS/
+// FINDING_KEYS/REVIEWERS/ADVERSARIAL/DEFAULT_ANCHOR_PATHS_MAX）在 validator 内部均走常量引用，
+// 无第三处旁路。:254 的 `face === 'B'` 无对应命名常量（FACES 是数组、无 B_FACE 导出），
+// 不命中「本该走导出常量」判据，如实声明不扩。
+export const OUT_OF_SCOPE_NOTES_FIELD = 'out_of_scope_notes';
 const RESULTS = ['pass', 'fail', 'n_a'];
 const SEVERITIES = ['blocker', 'major', 'suggestion'];
 const ACTIONABLE_SEVERITIES = ['blocker', 'major'];
 const SHA_RE = /^[0-9a-f]{7,40}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
+// I9-SC-5: hardening_coverage[].evidence 格式校验，按 result 分支（SC-5b 修复）——
+//   - result==='covered'：声称"已覆盖"，必须给出「路径:行号」形态的引用（如
+//     "scripts/verdict-validate.mjs:111"），拒绝纯散文本（如"第1类走查完成"）。只做形状
+//     校验，不做内容核实（本仓拿不到 repoDir，无法验证该路径:行号是否真落在本轮 diff 上——
+//     那属于 consensus-gate 层，不在此实现）。
+//   - result==='n_a'：声称"本 PR 不涉及该类"，没有对应代码位置——强制假 file:line 只会逼
+//     审查席随便贴一行凑格式，把一句诚实的"不适用"说明变成看似有据的**假锚点**，比不校验
+//     更糟（references/hardening-checklist.md 关于"覆盖 N 类不等于只有 N 类"的同一病灾的
+//     加强版：连"构造了"都变假）。故 n_a 只做最小长度约束（防"无"/"n/a"/"-"这类敷衍），
+//     不强制路径:行号。n_a 的实质性（是否真的不适用）是语义判断，机器判不了，如实交给
+//     审查席负责，不假装堵住"十类全填 n_a 逃避穷举"这个洞。
+const EVIDENCE_LOCATOR_RE = /[\w-]+(?:[./][\w-]+)+:\d+(-\d+)?/;
+// n_a 的最小长度阈值——**如实声明这是个弱代理指标**，不是"有实质内容"的证明：①它只能拦住
+// "无"/"n/a"/"-" 这类一眼敷衍，拦不住凑字数的空话；②按 JS .length 计数，对中文说明**偏严**
+// （"无异步改动"=5、"本PR不涉及并发"=8 都会被拒，而它们是合法的简短说明），副作用是逼人凑
+// 字数、制造无信息填充文本——那跟造假锚点是同一类病的轻症版。改成任何具体数值都同样任意，
+// 所以不追求"调准"，只求拦掉最低限度的敷衍；真实性判断仍在审查席与 lead 手里。
+// 数值本身已改从 schema 派生（见文件顶部 HARDENING_NA_EVIDENCE_MIN_LENGTH），此处不再手拄。
 // R10-A3/SC-B4: 加固清单类别数与版本单一来源——scripts/lib/hardening-registry.mjs
 // （9→10 迁移见 D5：exact 集合变更，不是新增一条 append，因此同步 bump checklist_version）。
 const HARDENING_RESULTS = ['covered', 'n_a'];
@@ -67,10 +156,19 @@ export function validateVerdict(v, opts = {}) {
 
   need(v && typeof v === 'object', 'verdict 不是对象');
   if (errs.length) return errs;
-  need(v.schema_version === 'v2', `schema_version 必须为 v2，得到 ${v.schema_version}`);
+  // SC-R3-F2: 顶层未知字段拒绝——见文件顶部 TOP_LEVEL_KEYS 派生说明。不早退（不影响后续检查，
+  // 累积报告即可，同本文件其余 need() 的一贯风格）。
+  for (const k of Object.keys(v)) {
+    need(TOP_LEVEL_KEYS.has(k), `verdict 存在未知顶层字段: ${k}（additionalProperties:false，见 schemas/review-verdict.schema.json）`);
+  }
+  need(v.schema_version === SCHEMA_VERSION, `schema_version 必须为 ${SCHEMA_VERSION}，得到 ${v.schema_version}`);
   need(REVIEWERS.includes(v.reviewer), `reviewer 非法: ${v.reviewer}`);
   need(['ok', 'degraded'].includes(v.run_status), `run_status 非法: ${v.run_status}`);
   need(Number.isInteger(v.round) && v.round >= 1, `round 非法: ${v.round}`);
+  // I9-SC-6: attempt = 当前 round 的第几次审查尝试。round 语义变更为「PASS 共识序号」后，
+  // 尝试次数信息从 round 里丢失，由本字段承载（单份 verdict 的形状校验；「三席 attempt 必须
+  // 一致」的跨席校验属 consensus-gate 层，不在此实现）。
+  need(Number.isInteger(v.attempt) && v.attempt >= ATTEMPT_MIN, `attempt 非法: ${JSON.stringify(v.attempt)}（须为 >= ${ATTEMPT_MIN} 的整数）`);
   need(SHA_RE.test(v.base_sha ?? ''), `base_sha 非法: ${v.base_sha}`);
   need(SHA_RE.test(v.candidate_sha ?? ''), `candidate_sha 非法: ${v.candidate_sha}`);
   need(HASH_RE.test(v.review_input_hash ?? ''), 'review_input_hash 必须是 64 位 hex');
@@ -94,7 +192,10 @@ export function validateVerdict(v, opts = {}) {
     for (const face of FACES) {
       need(seenFaces.has(face), `对抗席 ${v.reviewer} 缺检查面 ${face}（必须恰好七面全填，② 审⑧）`);
     }
-    need((v.faces ?? []).length === 7, `对抗席 faces 数量必须为 7，得到 ${(v.faces ?? []).length}`);
+    // R4 复核（lead 2026-08-07 补输入，独立复核发现第二处硬读）: 原 `length === 7` 硬编码
+    // FACES 数组长度——FACES 是导出常量（:105），若未来加面（8 面），此断言拒绝合法输入 =
+    // 同类「有导出常量却硬读字面量」漂移（与 out_of_scope_notes 同一判据）。改 FACES.length。
+    need((v.faces ?? []).length === FACES.length, `对抗席 faces 数量必须为 ${FACES.length}，得到 ${(v.faces ?? []).length}`);
   } else if (v.reviewer === 'upstream-preview') {
     for (const face of req.third_seat_required_faces) {
       need(seenFaces.has(face), `第三席缺必填检查面 ${face}（② 审⑧: F/G/E/D 为主）`);
@@ -105,22 +206,24 @@ export function validateVerdict(v, opts = {}) {
     }
   }
 
-  // R10-A3: 加固清单覆盖率机器强制——仅 round===1 的两个对抗席（第三席/round>=2 不复核穷举面）。
+  // R10-A3/I9: 加固清单覆盖率机器强制——两个对抗席的**全部 round**（第三席永不强制）。
   // MUST-FIX-2 反例: 旧实现只在 SKILL.md 里写"必须标 covered/n_a"，没有任何字段/schema/校验落地，
   // 三份完全不带 hardening_coverage 的 round:1 verdict 照样能让 runConsensusGate 返回 pass。
-  if (ADVERSARIAL.includes(v.reviewer) && v.round === 1) {
+  // I9-SC-1/SC-2: 此前仅 round===1 强制，round>=2（修复后的复核轮）反而是唯一没有可机读穷举
+  // 契约的代码——洞会漏到下一轮才被挖出，是审查轮次无限增殖的机制成因之一。故去掉 round 限制。
+  if (ADVERSARIAL.includes(v.reviewer)) {
     // SC-B4（D5）: checklist_version 是独立于「缺项计数」的校验——9→10 是 exact 集合变更，
     // 旧的 9 项 verdict（即便碰巧凑到 9 个合法 class_id）必须显式报「清单版本过期需重审」，
     // 不能被淹没进「缺项/漏项」的普通计数错误里（下面的 length/class_id 检查仍会照常触发，
     // 两条错误可以同时出现，但版本错误必须独立可辨认）。
     need(v.checklist_version === HARDENING_CHECKLIST_VERSION,
-      `对抗席 ${v.reviewer} R1 的 checklist_version=${JSON.stringify(v.checklist_version)} 与当前加固清单版本 ${HARDENING_CHECKLIST_VERSION} 不符（清单版本过期需重审，不是缺项——D5: hardening-checklist.md 类别集合发生了 exact 变更）`);
+      `对抗席 ${v.reviewer} 的 checklist_version=${JSON.stringify(v.checklist_version)} 与当前加固清单版本 ${HARDENING_CHECKLIST_VERSION} 不符（清单版本过期需重审，不是缺项——D5: hardening-checklist.md 类别集合发生了 exact 变更）`);
     const items = v.hardening_coverage;
     if (!Array.isArray(items)) {
-      need(false, `对抗席 ${v.reviewer} R1 缺 hardening_coverage（十类加固清单机器覆盖字段必填，R10-A3）`);
+      need(false, `对抗席 ${v.reviewer} 缺 hardening_coverage（十类加固清单机器覆盖字段必填，R10-A3/I9: 对抗席全 round 强制）`);
     } else {
       need(items.length === HARDENING_CLASS_COUNT,
-        `对抗席 ${v.reviewer} R1 的 hardening_coverage 必须恰好 ${HARDENING_CLASS_COUNT} 项，得到 ${items.length}`);
+        `对抗席 ${v.reviewer} 的 hardening_coverage 必须恰好 ${HARDENING_CLASS_COUNT} 项，得到 ${items.length}`);
       const seenClassIds = new Set();
       for (const item of items) {
         const cid = item?.class_id;
@@ -132,9 +235,21 @@ export function validateVerdict(v, opts = {}) {
         }
         need(HARDENING_RESULTS.includes(item?.result), `hardening_coverage[class_id=${cid}].result 非法: ${item?.result}`);
         need(typeof item?.evidence === 'string' && item.evidence.length > 0, `hardening_coverage[class_id=${cid}] 缺 evidence`);
+        // I9-SC-5b: 格式校验按 result 分支（见本文件顶部 EVIDENCE_LOCATOR_RE 定义处注释）——
+        // covered 必须给出「路径:行号」；n_a 没有对应代码位置，不强制路径:行号（否则逼审查席
+        // 造假锚点），只做最小长度防敷衍。result 非 covered/n_a（已在上面报错）时不做此项校验。
+        if (typeof item?.evidence === 'string' && item.evidence.length > 0) {
+          if (item.result === 'covered') {
+            need(EVIDENCE_LOCATOR_RE.test(item.evidence),
+              `hardening_coverage[class_id=${cid}]（covered）的 evidence 缺「路径:行号」形态引用（如 "scripts/foo.mjs:42"），得到: ${JSON.stringify(item.evidence)}`);
+          } else if (item.result === 'n_a') {
+            need(item.evidence.length >= HARDENING_NA_EVIDENCE_MIN_LENGTH,
+              `hardening_coverage[class_id=${cid}]（n_a）的 evidence 过短（<${HARDENING_NA_EVIDENCE_MIN_LENGTH} 字符，疑似敷衍如"无"/"n/a"），得到: ${JSON.stringify(item.evidence)}`);
+          }
+        }
       }
       for (let cid = 1; cid <= HARDENING_CLASS_COUNT; cid++) {
-        need(seenClassIds.has(cid), `对抗席 ${v.reviewer} R1 的 hardening_coverage 缺 class_id=${cid}（十类必须逐一覆盖，不许分轮细水长流）`);
+        need(seenClassIds.has(cid), `对抗席 ${v.reviewer} 的 hardening_coverage 缺 class_id=${cid}（十类必须逐一覆盖，不许分轮细水长流）`);
       }
     }
   }
@@ -154,6 +269,13 @@ export function validateVerdict(v, opts = {}) {
   let hasTaxonomyGap = false;
   const seenFindingIds = new Set(); // e2e-consensus 实测缺口: 重复 id 会让一次 close 覆盖多条 finding
   for (const fd of v.findings ?? []) {
+    // SC-R3-F6: finding 未知字段拒绝——把 forbidden_finding_fields 的精确字符串匹配检查（下方
+    // write_paths/allowed_paths 专项循环）升级为「只认 schema 声明的合法字段集合」，两者的
+    // typo/变体（如 write_path 单数）现在都会在这里先被拦住。保留下方专项循环是因为它给出的
+    // 错误信息更精确（点名 D2 的写入许可语义），两者可能同时命中同一 key 报两条错，无害。
+    for (const k of Object.keys(fd)) {
+      need(FINDING_KEYS.has(k), `finding ${fd.id ?? '?'} 存在未知字段: ${k}（findings additionalProperties:false，见 schemas/review-verdict.schema.json）`);
+    }
     need(typeof fd.id === 'string' && fd.id.length > 0, 'finding 缺 id');
     need(!seenFindingIds.has(fd.id), `finding id 重复: ${fd.id}（一次 close 不得覆盖多条）`);
     seenFindingIds.add(fd.id);
@@ -252,12 +374,18 @@ export function validateVerdict(v, opts = {}) {
   //   - ref_paths 只要求是 tracked 文件，**刻意不要求 ⊆ 实改集**——这正是本通道存在的理由。
   // 跟踪义务在 Phase 2c 意见三分法的「推」通道（开 issue + PR body 记链接），保证等级 T1：
   // 机器只锁形状（字段齐全、不与 finding 互相伪装），**不**校验 issue 真的开了。如实声明。
-  if (v.out_of_scope_notes !== undefined) {
-    need(Array.isArray(v.out_of_scope_notes), 'out_of_scope_notes 必须是数组（D3）');
-    if (Array.isArray(v.out_of_scope_notes)) {
+  // R4（审查席 major，2026-08-07）: 此前的读取是 `v.out_of_scope_notes` 硬字面量——字段名
+  // 一旦在真相源/schema 改名，TOP_LEVEL_KEYS（schema 派生）接受新名，但本段继续读旧名读到
+  // undefined → 整段内容校验静默跳过（可选通道改名 = 静默丢数据，正是 SC-R3-F2 要治的那类）。
+  // 改为经 OUT_OF_SCOPE_NOTES_FIELD 常量动态读取（本文件 :110 定义的唯一物理读取点，与
+  // dispatch-contract.mjs 的 out_of_scope_channel 同源），字段名改名时本段自动跟上。
+  const notes = v[OUT_OF_SCOPE_NOTES_FIELD];
+  if (notes !== undefined) {
+    need(Array.isArray(notes), `${OUT_OF_SCOPE_NOTES_FIELD} 必须是数组（D3）`);
+    if (Array.isArray(notes)) {
       const seenNoteIds = new Set();
       const cap = opts.anchorPathsMax ?? DEFAULT_ANCHOR_PATHS_MAX;
-      for (const n of v.out_of_scope_notes) {
+      for (const n of notes) {
         need(n && typeof n === 'object' && !Array.isArray(n), 'out_of_scope_notes 元素必须是对象');
         if (!n || typeof n !== 'object' || Array.isArray(n)) continue;
         need(typeof n.id === 'string' && n.id.length > 0, 'out_of_scope_note 缺 id');

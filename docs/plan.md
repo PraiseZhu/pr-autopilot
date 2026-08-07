@@ -2,6 +2,7 @@
 
 > v1 → 审①(RC) → v2 → owner 定案 → v3 → 审②(RC) → v4 → owner 架构改向 → v5 → 审③(RC) → v6 → 审④⑤⑥⑦⑧⑨ 增量收敛 + owner 六次修订（SC 后置/glm-max/15min/通知分层/三审/六项自进化）→ **审⑨ 最终 APPROVED（2026-07-31）**
 > 部署红线：**盯梢器与修复会话必须在 macmini（Praise-Mini）**；submit-pr 在 owner 交互机执行
+> 多实例部署注意事项（双机抢单现状 + engine-mivo.json 通知目标不可直拷）见 `deploy/README.md` §2.1 ④。
 > 状态：**定稿，实施基线。** 九轮对抗审查（gpt-5.6-sol/xhigh）全部意见采纳并逐条闭环核对；下一步 = §5 P0（首件事：修 mini gh token）。
 >
 > ⚠️ **模型配置已过时（2026-08-05）**：本文件是历史定稿存档，其中所有三审/仲裁的模型与档位（opus-5、gpt-5.6-sol 等）

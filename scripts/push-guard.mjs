@@ -19,13 +19,14 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHmac } from 'node:crypto';
 import { readJson, parseArgs, fail, hashObject, nowIso, isMain, canonicalJson } from './lib/common.mjs';
-import { recomputeArtifactHash } from './consensus-gate.mjs';
+import { recomputeArtifactHash, assertArtifactShape, isAncestorCommit } from './consensus-gate.mjs';
 import { computeReviewInputHash } from './review-input-hash.mjs';
 import { validateRemoteBranch } from './lib/git-checks.mjs';
 import { checkScCoverage } from './sc-coverage-gate.mjs';
 import { buildFixPlan } from './fix-plan.mjs';
 import { checkDispatch } from './fix-dispatch-gate.mjs';
-import { verifyEventChain, runManifestHash, recordedSquashes } from './fix-run.mjs';
+import { checkBatchClosure } from './batch-closure-gate.mjs';
+import { verifyEventChain, runManifestHash, recordedSquashes, RUN_MANIFEST_SCHEMA_VERSION } from './fix-run.mjs';
 import { computeSizeReport, evaluateSize, exemptionInvalidReason } from './size-gate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -189,9 +190,19 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
       for (const k of ['review_input_hash', 'base_sha', 'candidate_sha', 'canonical_findings', 'verdict_hashes', 'consensus_artifact_hash', 'gate_result']) {
         if (!(k in artifact)) errors.push(`consensus artifact 缺字段 ${k}`);
       }
+      // issue #9 R2 blocker: 结构门与字段存在性检查同批——schema_version/round 非法时必须
+      // 点名结构问题本身，不能被"hash 恰好被攻击者重算到自洽"掩盖（真正拦截面独立于 hash，
+      // 见 consensus-gate.mjs 的 assertArtifactShape 注释）。
+      if (!errors.length) errors.push(...assertArtifactShape(artifact, 'consensus artifact'));
       if (!errors.length) {
         if (artifact.gate_result !== 'pass') errors.push('consensus artifact gate_result ≠ pass');
-        if (recomputeArtifactHash(artifact) !== artifact.consensus_artifact_hash) errors.push('consensus artifact hash 与内容重算值不符（含 base/candidate，伪造/改 SHA 均失效）');
+        // 防御性 try/catch（同 sourceArtifact 路径的理由）: recomputeArtifactHash 现在对结构
+        // 非法输入会 throw；这里的 hash 重算在正常路径下已被上面的 assertArtifactShape 挡住，
+        // 但若那道短路本身被破坏（回归/反向变异），不加这层会让本函数崩溃而不是优雅拒绝。
+        let selfReal = null;
+        try { selfReal = recomputeArtifactHash(artifact); }
+        catch (e) { errors.push(`consensus artifact hash 重算失败（结构非法，fail-closed）: ${e.message}`); }
+        if (selfReal !== null && selfReal !== artifact.consensus_artifact_hash) errors.push('consensus artifact hash 与内容重算值不符（含 base/candidate，伪造/改 SHA 均失效）');
         if (manifest.consensus_artifact_hash !== artifact.consensus_artifact_hash) errors.push('manifest 与 artifact 的 consensus_artifact_hash 不一致');
         // bundle 三方绑定
         let rih = null;
@@ -199,6 +210,18 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
         if (rih && rih !== artifact.review_input_hash) errors.push('bundle 重算的 review_input_hash ≠ artifact 记录值（bundle 被换）');
         if (bundle.base_sha !== artifact.base_sha) errors.push('bundle.base_sha ≠ artifact.base_sha');
         if (bundle.candidate_sha !== artifact.candidate_sha) errors.push('bundle.candidate_sha ≠ artifact.candidate_sha');
+        // issue #9 R4 修复①（lead 2026-08-07）: pr_number PR 身份绑定——artifact 烙了
+        // pr_number（进 consensus_artifact_hash），但 push 边界的三方绑定此前只比
+        // review_input_hash/base/candidate，不比 bundle.pr_number === artifact.pr_number——
+        // 同一 candidate 的 artifact(pr=101) 与 bundle(pr=202) 可自洽拼接通过（只要不经
+        // runConsensusGate 产出）。语义：**两边都为 null 放行**（无 PR 直跑三审是明文支持的
+        // 形态——派审时无 PR、artifact 烙 null，bundle 也 null，一致）；**一边 null 一边非 null
+        // 视为不匹配拒收**（一个 PR 绑定态 vs 非绑定态拼一起 = 张冠李戴；「先无 PR 审 R1、
+        // 后有 PR 审 R2」的合法演进由 parent 谱系覆盖——R2 的 bundle 与 R2 的 artifact 都非
+        // null、一致，R1 的 parent 校验在 consensus-gate 侧有条件强制）。
+        if ((bundle.pr_number ?? null) !== (artifact.pr_number ?? null)) {
+          errors.push(`bundle.pr_number=${String(bundle.pr_number ?? null)} ≠ artifact.pr_number=${String(artifact.pr_number ?? null)}（PR 身份绑定不一致：两边都为 null 才放行，一边 null 一边非 null 视为不匹配，issue #9 R4 修复①）`);
+        }
         if (artifact.candidate_sha !== manifest.expected_sha) errors.push('artifact.candidate_sha ≠ manifest.expected_sha（共识批的不是这个 commit）');
         baseSha = artifact.base_sha;
       }
@@ -226,22 +249,43 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
       if (missing.length) {
         errors.push(`fix_orchestration 在场但缺件无法核验: ${missing.join(' / ')}（fail-closed）`);
       } else {
+        // issue #9 R2 blocker: 结构门先于/独立于 hash 自洽——sourceArtifact 的
+        // schema_version/round 必须显式校验，不能只信"重算后自洽"（攻击者重算 hash 后
+        // 一样自洽，hash 自洽挡不住确定性重算攻击，真正拦截面在 assertArtifactShape）。
+        for (const e of assertArtifactShape(sourceArtifact, '源 consensus artifact')) errors.push(e);
         // ① 源 artifact 自洽 + 与声明一致
-        const srcReal = recomputeArtifactHash(sourceArtifact);
-        if (srcReal !== sourceArtifact.consensus_artifact_hash) errors.push('源 consensus artifact hash 与内容重算不符');
-        if (fo.source_artifact_hash !== srcReal) errors.push('fix_orchestration.source_artifact_hash ≠ 源 artifact 重算值');
+        // srcReal 在结构非法时保持 null——recomputeArtifactHash 现在对缺 round/gate_result
+        // 会 throw，此处不再无条件调用它，避免结构非法输入把整个 push-guard 调用崩掉
+        // （fail-closed 应体现为错误列表里多一条，不是抛出未捕获异常）。
+        let srcReal = null;
+        try { srcReal = recomputeArtifactHash(sourceArtifact); }
+        catch (e) { errors.push(`源 consensus artifact hash 重算失败（结构非法，fail-closed）: ${e.message}`); }
+        if (srcReal !== null) {
+          if (srcReal !== sourceArtifact.consensus_artifact_hash) errors.push('源 consensus artifact hash 与内容重算不符');
+          if (fo.source_artifact_hash !== srcReal) errors.push('fix_orchestration.source_artifact_hash ≠ 源 artifact 重算值');
+        }
+        // issue #9 SC-A2: 源 artifact 必须是 PASS 共识——此前只验 hash 自洽，一份手工拼的
+        // fail artifact（hash 自洽但 gate_result=fail）能原样当源共识过完整编排链。
+        if (sourceArtifact.gate_result !== 'pass') errors.push(`源 consensus artifact gate_result=${sourceArtifact.gate_result} ≠ pass（issue #9 SC-A: fail 共识不得作为修复编排的源）`);
         // SC-3（R2-P1-1）: **exact parent 绑定**——旧实现只比 base_sha，同 base 的任意
         // 另一份源 artifact 都能冒充（SC/plan 于是绑在错误的 findings 上）。
         if (!artifact.parent_artifact_hash) {
           errors.push('终版 artifact 缺 parent_artifact_hash——delta 轮必须由 consensus-gate --parent 生成谱系（SC-3 fail-closed）');
         } else if (artifact.parent_artifact_hash !== srcReal) {
-          errors.push(`源 artifact 不是终版 artifact 的 exact parent（parent=${artifact.parent_artifact_hash.slice(0, 12)} 源=${srcReal.slice(0, 12)}）——同 base 的另一份 artifact 冒充被拦（SC-3）`);
+          errors.push(`源 artifact 不是终版 artifact 的 exact parent（parent=${artifact.parent_artifact_hash.slice(0, 12)} 源=${String(srcReal).slice(0, 12)}）——同 base 的另一份 artifact 冒充被拦（SC-3）`);
         }
         if (sourceArtifact.base_sha !== artifact.base_sha) {
           errors.push('源 artifact 与终版 artifact 的 base_sha 不同（跨评审拼接）');
         }
         // ② SC 覆盖门（绑源 artifact）——修 R1 既有洞: SC 必须真绑回 finding 且全覆盖
-        const covErrs = checkScCoverage({ manifest: scManifest, artifact: sourceArtifact });
+        // 防御性 try/catch: checkScCoverage 的契约是"返回错误数组、不 throw"，但它内部同样
+        // 依赖 assertArtifactShape 先行短路才能保证不 throw——若那道短路本身被破坏（回归/
+        // 反向变异），不加这层会让本函数已经在 errors 里攒好的结构错误（见上方我们自己的
+        // assertArtifactShape 调用）因未捕获异常而丢失、连 { ok:false, errors } 都返回不了
+        // （fail-closed 应体现为多一条错误，不是把调用方也拖崩，保证四个调用点互相隔离）。
+        let covErrs = [];
+        try { covErrs = checkScCoverage({ manifest: scManifest, artifact: sourceArtifact }); }
+        catch (e) { errors.push(`SC 覆盖门内部异常（fail-closed，不让调用方崩溃）: ${e.message}`); }
         for (const e of covErrs) errors.push(`SC 覆盖门: ${e}`);
         if (hashObject(scManifest) !== fo.sc_manifest_hash) errors.push('fix_orchestration.sc_manifest_hash ≠ sc manifest 重算值');
         // ③ fix plan 重算等价（纯函数——lead 改分组即 hash 对不上）
@@ -277,6 +321,22 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
             errors.push(`run 起点 ${String(runManifest.source_candidate).slice(0, 12)} ≠ 源 artifact candidate ${String(sourceArtifact.candidate_sha).slice(0, 12)}（起点漂移被拦，SC-R3-10）`);
           }
           if (runManifestHash(runManifest) !== fo.run_manifest_hash) errors.push('fix_orchestration.run_manifest_hash ≠ run manifest 重算值');
+          // issue #9 R4（lead 2026-08-07）: run manifest 版本比较——旧 v2/缺字段只要按当前
+          // runManifestHash 公式重算仍可能过 hash 比对（hash 自洽挡不住「篡改后照公式重算」）。
+          // 从 fix-run.mjs import RUN_MANIFEST_SCHEMA_VERSION（单一真相源，不手抄）。
+          if (runManifest.schema_version !== RUN_MANIFEST_SCHEMA_VERSION) {
+            errors.push(`run manifest schema_version=${JSON.stringify(runManifest.schema_version)} ≠ ${RUN_MANIFEST_SCHEMA_VERSION}（run manifest 版本不符，R4）`);
+          }
+          // issue #9 R4（lead 2026-08-07）: 批次闭合门接线——run manifest 含 batch 段时，
+          // push-guard 必须调用 checkBatchClosure（七判据现成，不新造门），errs 非空即拒 push。
+          // 此前 batch-closure-gate 全仓只有 fixture 与它自己 CLI 调，push 边界从不执行它——
+          // 批次协议的语义不变量在生产链上静默缺席（落在「疏忽」射程内）。
+          if (runManifest.batch) {
+            let closureErrs = [];
+            try { closureErrs = checkBatchClosure({ runManifest, sourceArtifact, finalArtifact: artifact, scManifest }); }
+            catch (e) { errors.push(`批次闭合门内部异常（fail-closed，不让调用方崩溃）: ${e.message}`); }
+            for (const e of closureErrs) errors.push(`批次闭合门: ${e}`);
+          }
           // 每波组集合重放（SC-R3-2: subset/ghost/duplicate 全拒）
           if (!rebuilt.degraded) {
             const planWaves = rebuilt.plan.waves;
@@ -311,6 +371,52 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
               }
               for (const s of recorded) {
                 if (!revs.includes(s)) errors.push(`run manifest 登记的 squash ${s.slice(0, 12)} 不在最终链上（记录与历史不符，fail-closed）`);
+              }
+              // i9-batch: 批次「严格后代」校验——批次是事务：一批 finding → 一个已解决状态
+              // （一个 successor artifact / 一个收口状态）。successor_sha 必须是 frozen_at_sha
+              // 的**严格后代**（is-ancestor + 不等，任意距离），不是要求恰好一个 commit——多
+              // commit 分步修复合法；run 起点（source_candidate）之外的批次起点被拦（批次起点
+              // 必须由 run 起点派生，batch-closure-gate ② 同判据，此处独立重验）。
+              const batch = runManifest.batch ?? null;
+              if (batch) {
+                if (batch.status !== 'closed') {
+                  errors.push(`run manifest 批次 ${batch.batch_id} status=${JSON.stringify(batch.status)} ≠ closed（批次未收口，不得 push）`);
+                } else {
+                  if (batch.frozen_at_sha !== runManifest.source_candidate) {
+                    errors.push(`批次 frozen_at_sha（${String(batch.frozen_at_sha).slice(0, 12)}）≠ run 起点 source_candidate（${String(runManifest.source_candidate).slice(0, 12)}）——批次起点必须由 run 起点派生，不接受自报（i9-batch）`);
+                  }
+                  if (batch.successor_sha !== finalTip) {
+                    errors.push(`批次 successor_sha（${String(batch.successor_sha).slice(0, 12)}）≠ 最终 integrated_tip（${finalTip.slice(0, 12)}）——批次后继必须等于 run 的最终候选（i9-batch）`);
+                  }
+                  // i9-batch 语义（lead 2026-08-07 撤回「直接后继」后定案）: 批次是一次「一批
+                  // finding → 一个已解决状态」的事务，不要求单 commit——多 commit 分步修复
+                  // 合法（分步修、边修边测）。successor_sha 必是 frozen_at_sha 的**严格后代**
+                  // （任意距离，不得等于起点）。
+                  // **严格后代检查（2026-08-07 恢复，实证依据）**：此前该不变量被声明为
+                  // expected_sha 绑定 + SC-3 parent 祖先绑定 by construction 共同保证、刻意不设
+                  // 检查（确认门前向门：「后人若要加守卫须先证明存在可独立构造的失效路径」）。
+                  // 集成审查席构造出了反例：共同 base B、source S=B+X、兄弟 T=B+Y，伪造自洽终版
+                  // artifact（candidate=T、parent=source hash）+ run manifest（source=S、final=T、
+                  // T 登记为 squash）+ expected_sha=T——push-guard 全部通过。关键技术点：
+                  // `git rev-list A..B` 非空 ≠ A 是 B 的祖先（兄弟提交 rev-list S..T 返回 {Y} 非空，
+                  // 且 Y 已登记时 :340-345 的双向集合一致检查两个方向都通过——集合一致性不是
+                  // 祖先检查）。故加 `merge-base --is-ancestor(source_candidate, final_candidate)`
+                  // 且不相等。isAncestorCommit 从 consensus-gate.mjs import（单一真相源，不复制）；
+                  // 其「不是祖先」返回 false 是合法否定、其他错误抛异常——三态语义保留。
+                  if (runManifest.source_candidate === finalTip) {
+                    errors.push(`run 起点 == 最终 integrated_tip（零推进：successor 必须严格推进，不得等于起点，i9-batch）`);
+                  } else {
+                    let isStrict = null;
+                    try {
+                      isStrict = isAncestorCommit({ repoDir, ancestorSha: runManifest.source_candidate, descendantSha: finalTip });
+                    } catch (e) {
+                      errors.push(`严格后代判定失败（fail-closed）: ${e.message}`);
+                    }
+                    if (isStrict === false) {
+                      errors.push(`最终 integrated_tip（${finalTip.slice(0, 12)}）不是 run 起点 source_candidate（${runManifest.source_candidate.slice(0, 12)}）的祖先后代——successor 必须严格推进（is-ancestor + 不等），兄弟提交绕过被拦（i9-batch）`);
+                    }
+                  }
+                }
               }
             } catch (e) { errors.push(`DAG lineage 校验失败（fail-closed）: ${e.message}`); }
           }

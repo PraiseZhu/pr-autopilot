@@ -19,7 +19,7 @@ import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { readJson, parseArgs, fail, isMain, nowIso, sha256, canonicalJson, normalizeRepoPath, hashObject } from './lib/common.mjs';
 import { computeFixPlanHash } from './fix-plan.mjs';
-import { recomputeArtifactHash } from './consensus-gate.mjs';
+import { recomputeArtifactHash, assertArtifactShape } from './consensus-gate.mjs';
 import { allocateWave, changedFiles, isAncestor, cleanupRun, stampOwner, readOwner, newNonce, writePathsFor } from './fix-orchestrate.mjs';
 
 const TEST_PATH_RE = /(^|\/)(e2e|fixtures)\//;
@@ -27,6 +27,14 @@ const TEST_FILE_RE = /\.(test|spec)\.[A-Za-z0-9]+$/;
 const isTestPath = (p) => TEST_PATH_RE.test(p) || TEST_FILE_RE.test(p);
 
 function git(repoDir, ...a) { return execFileSync('git', ['-C', repoDir, ...a], { encoding: 'utf8', timeout: 120_000 }).trim(); }
+
+// R4 归一（lead 2026-08-07）：run manifest 的 schema 版本此前是散字面量（构造 'v3' +
+// runManifestHash 的 'fix-run/v3' tag + batch-closure-gate 校验 'v3'）——同类「纯值散字面量」
+// 漂移点（与 artifact schema 版本号散在实现里同一形状）。改为单一导出常量，各处引用。
+// 注意：这是 **run manifest 自己的 schema 版本**，与 consensus-artifact.schema.json 的
+// schema_version（ARTIFACT_SCHEMA_VERSION）是两套独立版本线——前者无独立 schema 文件，
+// 后者从 schema 派生。此处导出让实现内不再手写字面量。
+export const RUN_MANIFEST_SCHEMA_VERSION = 'v3';
 
 export function runManifestPath(stateDir, runId) { return join(stateDir, `run-${runId}.json`); }
 export function integrationBranch(runId) { return `fix/${runId}/integration`; }
@@ -65,19 +73,56 @@ function loadRun(stateDir, runId, plan = null) {
 }
 
 // ---- init: 绑定 plan + sc manifest + 源共识（起点由 artifact 派生，不接受 CLI 自报 SC-R3-10） ----
-export function initRun({ stateDir, runId, repoDir, plan, scManifest, sourceArtifact, featureBranch }) {
+// i9-batch: 可选 batch 参数 { batch_id, frozen_families }——批次事务协议（issue #9 SC 延伸）。
+// 批次开始即冻结待处置 family 集：frozen_at_sha 强制 = source_candidate（CAS 派生，不接受自报，
+// 与 SC-R3-10 同一原则）；frozen_families 每项必须匹配 fk1- 派生 key 且**必须存在于源共识的
+// canonical_findings**（冻结集只能来自这份审查产物，编造/照抄他批 family 即拒，fail-closed）。
+export function initRun({ stateDir, runId, repoDir, plan, scManifest, sourceArtifact, featureBranch, batch }) {
   if (!/^[A-Za-z0-9._-]+$/.test(String(runId))) throw new Error(`runId 非法: ${runId}`);
+  if (batch !== undefined) {
+    if (!batch || typeof batch !== 'object') throw new Error('batch 参数非法: 必须为对象 { batch_id, frozen_families }（fail-closed）');
+    // SC-T1a: 未知键 fail-closed——批次段是受控协议，新键必须先登记（进 schema/hash/消费端），
+    // 静默忽略未知键会让「拼错键名」变成「批次选项没生效」的静默降级（SC-T1c 变异 A 要拦的形状）。
+    for (const k of Object.keys(batch)) {
+      if (!['batch_id', 'frozen_families'].includes(k)) {
+        throw new Error(`batch 参数含未知键: ${k}（批次段是受控协议，仅 batch_id/frozen_families 合法，fail-closed）`);
+      }
+    }
+    if (!/^[A-Za-z0-9._-]+$/.test(String(batch.batch_id ?? ''))) throw new Error(`batch_id 非法: ${batch.batch_id}`);
+    if (!Array.isArray(batch.frozen_families) || batch.frozen_families.length === 0) {
+      throw new Error('batch.frozen_families 必须是非空数组（批次冻结集为空 = 没有待处置义务，语义不成立，fail-closed）');
+    }
+    for (const fk of batch.frozen_families) {
+      if (typeof fk !== 'string' || !/^fk1-[0-9a-f]{64}$/.test(fk)) {
+        throw new Error(`batch.frozen_families 含非法 family_key: ${JSON.stringify(fk)}（必须是 fk1- 派生的 64-hex key，i9-batch）`);
+      }
+    }
+    const canonKeys = new Set((sourceArtifact?.canonical_findings ?? []).map((c) => c.family_key).filter(Boolean));
+    for (const fk of batch.frozen_families) {
+      if (!canonKeys.has(fk)) {
+        throw new Error(`batch.frozen_families 含不在源共识 canonical_findings 中的 family_key: ${fk.slice(0, 12)}…（冻结集只能从源共识派生，fail-closed，i9-batch）`);
+      }
+    }
+  }
   const real = computeFixPlanHash(plan);
   if (plan.fix_plan_hash !== real) throw new Error('plan 自身 hash 与内容重算不符（plan 被改）');
+  // issue #9 R2 blocker: 结构门先于 hash 自洽——sourceArtifact 的 schema_version/round 非法
+  // 时必须 throw 出结构问题本身，不能被"hash 恰好被攻击者重算到自洽"掩盖（hash 自洽挡不住
+  // 确定性重算攻击，见 consensus-gate.mjs 的 assertArtifactShape 注释）。
+  const shapeErrs = assertArtifactShape(sourceArtifact, '源 consensus artifact');
+  if (shapeErrs.length) throw new Error(shapeErrs[0]);
   const srcHash = recomputeArtifactHash(sourceArtifact);
   if (sourceArtifact.consensus_artifact_hash !== srcHash) throw new Error('源 consensus artifact hash 与内容重算不符（SC-R3-10）');
+  // issue #9 SC-A2: 源 artifact 必须是 PASS 共识——此前只验 hash 自洽，一份手工拼的
+  // fail artifact（hash 自洽但 gate_result=fail）能原样启动一次修复 run。
+  if (sourceArtifact.gate_result !== 'pass') throw new Error(`源 consensus artifact gate_result=${sourceArtifact.gate_result} ≠ pass（issue #9 SC-A: initRun 只接受 PASS 共识作源）`);
   if (plan.consensus_artifact_hash !== srcHash) throw new Error('plan 绑定的 artifact hash ≠ 源 artifact 重算值（plan 不是从这份共识算出来的）');
   const sourceCandidate = sourceArtifact.candidate_sha;
   if (!/^[0-9a-f]{40}$/.test(String(sourceCandidate))) throw new Error('源 artifact 的 candidate_sha 非法（起点由 artifact 派生，SC-R3-10）');
   const path = runManifestPath(stateDir, runId);
   if (existsSync(path)) throw new Error(`run ${runId} 已存在（幂等保护，换 runId 或先 cleanup）`);
   const m = {
-    schema_version: 'v2', run_id: runId, repo_dir: repoDir,
+    schema_version: RUN_MANIFEST_SCHEMA_VERSION, run_id: runId, repo_dir: repoDir,
     fix_plan_hash: plan.fix_plan_hash,
     sc_manifest_hash: hashObject(scManifest),
     source_artifact_hash: srcHash,
@@ -86,7 +131,17 @@ export function initRun({ stateDir, runId, repoDir, plan, scManifest, sourceArti
     integration_branch: integrationBranch(runId),
     waves: [], events: []
   };
-  appendEvent(m, { kind: 'run-init', source_candidate: sourceCandidate, source_artifact_hash: srcHash, plan_hash: plan.fix_plan_hash, sc_manifest_hash: m.sc_manifest_hash, waves: plan.waves.length });
+  // i9-batch: 批次段——frozen_at_sha 派生不自报；successor_sha/status 在 finalizeRun 收口时写入。
+  if (batch !== undefined) {
+    m.batch = {
+      batch_id: batch.batch_id,
+      frozen_at_sha: sourceCandidate,
+      frozen_families: [...new Set(batch.frozen_families)].sort(), // 确定性: 去重 + 排序，hash 稳定
+      successor_sha: null,
+      status: 'open'
+    };
+  }
+  appendEvent(m, { kind: 'run-init', source_candidate: sourceCandidate, source_artifact_hash: srcHash, plan_hash: plan.fix_plan_hash, sc_manifest_hash: m.sc_manifest_hash, waves: plan.waves.length, ...(m.batch ? { batch_id: m.batch.batch_id, frozen_families: m.batch.frozen_families.length } : {}) });
   saveManifest(path, m);
   return m;
 }
@@ -610,6 +665,13 @@ export function finalizeRun({ stateDir, runId }) {
   if (!last?.integrated_tip) throw new Error('最后一波尚未集成，不能 finalize');
   for (const [i, w] of m.waves.entries()) {
     if (!w.validation?.ok) throw new Error(`wave${i + 1} 未通过 orchestrator 复跑验证（fail-closed）`);
+    // SC-T2（2026-08-08，GPT 席执行注记）：reader 侧硬化——finalizeRun 读到持久化 manifest 中
+    // {ok:true, results:[]} 该形状时拒绝（空 results 上 results.every 恒 true，ok:true 是自报
+    // 摘要，不是逐项证据；文案限定「finalizeRun 读到该形状时拒绝」，不泛化为防所有手改 manifest）。
+    // 正常路径下 validateIntegration 写 results 非空（逐 SC 记录），空 results 只可能是篡改或异常。
+    if (w.validation.ok === true && Array.isArray(w.validation.results) && w.validation.results.length === 0) {
+      throw new Error(`wave${i + 1} validation {ok:true, results:[]}——finalizeRun 读到该形状时拒绝（空 results = 无逐项 PASS 证据，ok:true 是自报摘要，SC-T2）`);
+    }
   }
   if (m.feature_branch) {
     let currentBranch = null;
@@ -636,7 +698,14 @@ export function finalizeRun({ stateDir, runId }) {
     }
   }
   m.final_candidate = last.integrated_tip;
-  appendEvent(m, { kind: 'run-finalized', final_candidate: last.integrated_tip, feature_branch: m.feature_branch ?? null });
+  // i9-batch: 批次收口——successor_sha 由 final_candidate 派生（CAS 派生，不自报），
+  // status 置 closed。push-guard 侧验证「恰好一个后继」：successor_sha 必须是 frozen_at_sha
+  // 的直接后继（见 push-guard.mjs 的批次校验段）。
+  if (m.batch) {
+    m.batch.successor_sha = last.integrated_tip;
+    m.batch.status = 'closed';
+  }
+  appendEvent(m, { kind: 'run-finalized', final_candidate: last.integrated_tip, feature_branch: m.feature_branch ?? null, ...(m.batch ? { batch_id: m.batch.batch_id, successor_sha: m.batch.successor_sha, batch_status: m.batch.status } : {}) });
   saveManifest(path, m);
   return { final_candidate: last.integrated_tip, manifest: m };
 }
@@ -654,9 +723,20 @@ export function recordedSquashes(m) {
 
 // SC-9 用: run manifest 的权威 hash（纳入 fix_orchestration）——
 // SC-R3-3: validation 明细（sc_id/exit/verify digest）入锅，事后换 sc manifest/结果即失效
+// i9-batch: batch 段（batch_id/frozen_at_sha/frozen_families/successor_sha/status）入锅——
+// 照 gate_result 入 recomputeArtifactHash 的同一做法：末尾追加 canonicalJson，不重排既有字段；
+// v tag 升 'fix-run/v3'：**存储的 hash 是在旧 tag 下算出来的**那种旧 manifest，重算值 ≠ 声明值
+// → push-guard 的 fix_orchestration.run_manifest_hash 比对 fail-closed。
+// 注意这**不覆盖**「字段写 v2 但 hash 用当前公式重算过」的 manifest（见下）。
+// **注意（2026-08-07，lead 补充派工）**：`v:` 是**常量 tag**（`fix-run/${RUN_MANIFEST_SCHEMA_VERSION}`），
+// **不绑定 manifest 自身的 `schema_version` 字段**——`m.schema_version` 从不入 hash，任何 run
+// manifest 用当前代码重算 `runManifestHash` 都必然自洽，该字段写 v2/写错/缺失都一样过。所以
+// **版本一致性由 push-guard 的显式比较负责**（`runManifest.schema_version === RUN_MANIFEST_SCHEMA_VERSION`），
+// 不要以为 hash 覆盖了它。刻意不加进 hash：改 hash 公式 = 迁移事件（在途 run 全部失效且失败
+// 信息是「hash 不符」不可诊断），显式比较给出「期望 v3、实到 v2」可诊断。
 export function runManifestHash(m) {
   return sha256(canonicalJson({
-    v: 'fix-run/v2', run_id: m.run_id, fix_plan_hash: m.fix_plan_hash,
+    v: `fix-run/${RUN_MANIFEST_SCHEMA_VERSION}`, run_id: m.run_id, fix_plan_hash: m.fix_plan_hash,
     sc_manifest_hash: m.sc_manifest_hash, source_artifact_hash: m.source_artifact_hash,
     source_candidate: m.source_candidate, final_candidate: m.final_candidate ?? null,
     waves: (m.waves ?? []).map((w) => ({
@@ -666,7 +746,14 @@ export function runManifestHash(m) {
       squashes: w.squash_commits ?? [],
       rounds: (w.replan?.rounds ?? []).map((r) => ({ g: r.group_id, base: r.base, tip: r.tip, squash: r.squash })),
       validation: w.validation ? { ok: !!w.validation.ok, results: (w.validation.results ?? []).map((r) => ({ sc_id: r.sc_id, status: r.status, exit_code: r.exit_code, verify_digest: r.verify_digest })) } : null
-    }))
+    })),
+    batch: m.batch ? {
+      batch_id: m.batch.batch_id,
+      frozen_at_sha: m.batch.frozen_at_sha,
+      frozen_families: m.batch.frozen_families ?? [],
+      successor_sha: m.batch.successor_sha ?? null,
+      status: m.batch.status ?? null
+    } : null
   }));
 }
 
@@ -677,7 +764,15 @@ if (isMain(import.meta.url)) {
   try {
     if (mode === 'init') {
       need(['state-dir', 'run-id', 'repo-dir', 'plan', 'sc-manifest', 'source-artifact']);
-      const m = initRun({ stateDir: args['state-dir'], runId: args['run-id'], repoDir: args['repo-dir'], plan: readJson(args.plan), scManifest: readJson(args['sc-manifest']), sourceArtifact: readJson(args['source-artifact']), featureBranch: args['feature-branch'] });
+      // SC-T1a: --batch <json> opt-in——批次事务协议默认关闭，显式传才生效（两道门
+      // batch-closure/push-guard 批次段整体跳过当未传）。坏输入 fail-closed：JSON 解析失败
+      // /非对象在 initRun 的 batch 校验里拒（含未知键），此处只负责把字符串解析成对象。
+      let batchArg = undefined;
+      if (args.batch !== undefined) {
+        try { batchArg = JSON.parse(args.batch); }
+        catch (e) { fail(`--batch 不是合法 JSON: ${e.message}`); }
+      }
+      const m = initRun({ stateDir: args['state-dir'], runId: args['run-id'], repoDir: args['repo-dir'], plan: readJson(args.plan), scManifest: readJson(args['sc-manifest']), sourceArtifact: readJson(args['source-artifact']), featureBranch: args['feature-branch'], batch: batchArg });
       process.stdout.write(JSON.stringify({ ok: true, run_id: m.run_id, source_candidate: m.source_candidate }) + '\n');
     } else if (mode === 'allocate') {
       // D3: --artifact/--sc-manifest 改必填——两个入口同等 fail-closed，不留 legacy 通道。

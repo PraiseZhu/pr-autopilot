@@ -8,7 +8,7 @@
 
 ## 触发条件（命中即停手，下一个修复 commit 前必须先产出六件套）
 
-三条命中任一即触发：
+四条命中任一即触发（并列关系，不是替代；任一条命中即停手）：
 
 1. 上一轮修复被指出（或自查发现）漏了对称的另一半——例如 resolve 分支修了、reject 分支
    没修；同步路径修了、迟到/乱序路径没修。
@@ -16,6 +16,28 @@
    没有归一，继续加第 3 处只是把同一个洞打三个补丁。
 3. repair-mode watermark（`SKILL.md`「收敛判据与收口」）计数到第 5 个 candidate 仍出现
    新 family。
+4. **某个 `family_key` 在一个批次的 `frozen_families` 中被处置后，又出现在后续批次的
+   `frozen_families` 里**（批次事务协议，issue #9 SC 延伸；i9-batch）。这条是批次协议对
+   既有机制的**真实增量**：既有 1〜3 全是人判形状（"漏了对称一半"/"第 3 处判据"/"水位线到
+   第 5 个"），本条新增的是**人的申报义务 + 一条可选形状校验能力**——命中时 lead 必须申报
+   `recurrence` 段；机器只在该调用**显式传了 `checkpoint`** 时校验其形状/自洽
+   （`batch-closure-gate.mjs:192-222` 的⑦段，`checkpoint?.recurrence ?? null` 从 :193 起），
+   **非生产强制**：push-guard 调 checkBatchClosure 不传 checkpoint，`checkpoint?.recurrence ??
+   null` 在缺省时静默放行（SC-T6 降级，2026-08-08）。**本条仍是人判 + lead 申报，机器不会
+   自己发现复发**——`batch-closure-gate.mjs:35` 自陈「机器无跨批次账本，无法独立判定」
+   （跨批复发的申报形状校验测试在 `fixtures/i9-batch.mjs:293-330` 的 [i9-batch-4] 系列，
+   是 fixture 测试、**不是生产机制**；生产路径没有任何跨批次比较）。**不要把「可选形状校验」
+   说成「机器自动检测」**——那正是对用户核心痛点（SC 一路绿、bug 一路复发）给假保证，会让
+   读者停止人工盯防。命中
+   本条时，下一个修复 commit 前必须产出下方「复发归因段（recurrence）」——它是既有六件套的
+   **补充载体**（回看上一次 SC 为什么失效，既有六件套从头到尾没有这一问），不是替代六件套；
+   命名纪律：**「六件套」保持既有那套的唯一称谓**，本段不叫六件套。
+   > **T1 边界（如实声明，lead 2026-08-07 措辞）**：批次协议拦的是**逐字复发**，拦不住
+   > **语义复发**——`family_key` 由 `invariant` 的字面文本派生（仅 trim/小写/去空白），
+   > 同一根因换个说法会算出不同 key、机器视为新族。语义级同族复发的判断权在 lead，机器
+   > 无能力。上面「申报义务 + 可选形状校验（仅显式传 checkpoint 生效）」说的是真实增量；本条
+   > 边界说的是它**治不了什么**——反捉老鼠的痛点本体就是语义复发，本机制只拦逐字复发，不冒充
+   > 已解决语义复发。
 
 ## 原子性（D1，硬约束）
 
@@ -113,8 +135,52 @@ state_owners:[{field,owner,lifecycle}], event_state_matrix:[{event,state,action,
 symmetry_audit:[{path,status,note}], normalization:[{semantic,consolidated_to}],
 tests:[{name,distinguishes}] }`——`scripts/pr-body.mjs` 的 `buildCheckpointSection` 只负责
 渲染，不判断六件套是否齐全（那仍是 lead 派工/收口时的过程纪律，见上方 D1 原子性）。
+
+**复发归因段（recurrence，可选字段，仅触发条件④命中时必填）**：`checkpoint.json` 的
+顶层可选字段，不占六件套名额、不叫六件套。结构：
+
+```json
+{
+  "recurrence": {
+    "family_key": "fk1-…",                  // 复发的族（必须 ∈ 本批 frozen_families）
+    "prior_batch_id": "…",                  // 上次在哪个批次被处置
+    "prior_candidate_sha": "…",             // 上次的修复 commit
+    "prior_sc_id": "SC-…",                  // 上次声称拦住它的 SC（必须 ∈ sc manifest）
+    "prior_sc_missed_because": "…",         // 自由文本：那条 SC 为什么没拦住（T1 只验非空）
+    "verdict": "fix_was_wrong" | "family_was_misgrouped" | "fix_was_symptom",
+    "root_cause_locator": "路径:行号"        // 仅当 verdict="fix_was_symptom" 时必填
+  }
+}
+```
+
+对照 lead 原六问的压缩：①②③ 收成 `prior_sc_id` + `prior_sc_missed_because`；④「修错还是
+族归错」是 `verdict` 二选一；⑤⑥「根因还是症状」是 `verdict` 第三值 + 症状时强制
+`root_cause_locator`。结构化枚举比六段自由文本更可判。
+
+**齐全性检查在批次闭合门（`scripts/batch-closure-gate.mjs`），不在 `pr-body.mjs`**——
+`buildCheckpointSection` 只渲染、不判断齐全的职责边界不扩。闭合门验（**仅显式传 `checkpoint`
+的调用方生效——如 fixture/手工 CLI；push-guard 调 checkBatchClosure 不传，缺省静默放行，
+非生产强制，SC-T6 降级 2026-08-08**）：recurrence 字段齐全 + `verdict` enum 合法 + symptom 时
+`root_cause_locator` 非空（形如 `路径:行号`）+ `family_key` ∈ 本批 `frozen_families` +
+`prior_sc_id` ∈ sc manifest。保证等级 **T1（防疏忽不防伪造，如实声明）**：
+`prior_sc_missed_because` 填一句废话也能过，机器只锁形状与自洽；「这次是不是真的同族复发」
+的判断权在 lead（机器无跨批次账本，无法独立判定），申报后由机器验形状（仅显式传时）。
 半残/重复 marker（只有 start、只有 end、重复 start）→ 脚本 fail loud 拒绝写入，不会静默
 在文档里堆出第二段。
 产出同时服务三个读者：自己下一步修复时的模型、lead 判断是否收敛的依据、审查席复核 delta
 时的判据来源——`review-convergence.md` §2 原文称之为「reviewer 有了明确不变量后反馈会明显
 更聚焦，不再每轮换个入口挑一条」。
+
+## 批次严格后代不变量（lead 2026-08-07 定案；2026-08-08 更新为与 SKILL.md:675 一致）
+
+批次的 successor 必是 `source_candidate` 的**严格后代**（任意距离，不得等于起点）——批次是
+「一批 finding → 一个已解决状态」的事务，多 commit 分步修复合法，不要求直接子 commit。
+
+**守卫已在 `push-guard` 内实现**（`is-ancestor` + 不等；`isAncestorCommit` 从 consensus-gate.mjs
+import 复用，单一真相源）。此前该不变量曾被声明为 `expected_sha` 绑定 + SC-3 parent 祖先绑定
+**by construction 共同保证、刻意不设检查**——**2026-08-07 被集成审查席构造出兄弟提交反例推翻**
+（共同 base B、source S=B+X、兄弟 T=B+Y：`rev-list S..T` 非空 ≠ S 是 T 的祖先，伪造自洽终版
++ run manifest 可全过集合一致性检查），故恢复守卫（前向门「须先证明存在可独立构造的失效路径」
+已被满足）。常驻反向变异测试钉住该检查（挖空 `isAncestorCommit` 后兄弟提交放行 = 有效检测器）。
+**生效前提（opt-in）**：`fix-run init` 未传 `--batch` 时 run manifest 无 batch 段，push-guard 的
+批次段校验（含严格后代检查）整体跳过——非批次 run 不受此约束。

@@ -1,16 +1,30 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "pr-autopilot/consensus-artifact/v1",
-  "title": "共识 artifact（计划 §1.1b ⑩ 第二段 hash）",
+  "$id": "pr-autopilot/consensus-artifact/v4",
+  "title": "共识 artifact v4（issue #9 R4 修复①：pr_number PR 身份绑定，入 consensus_artifact_hash 照 gate_result/round 做法；不进 review_input_hash——lead 2026-08-07 裁决，防「建 PR」成整轮失效触发器）",
   "type": "object",
   "required": [
     "schema_version", "review_input_hash", "base_sha", "candidate_sha",
     "canonical_findings", "verdict_hashes", "consensus_artifact_hash",
-    "created_at", "gate_result"
+    "created_at", "gate_result", "round", "parent_artifact_hash", "pr_number"
   ],
   "properties": {
-    "schema_version": { "const": "v1" },
+    "schema_version": { "const": "v4" },
+    "pr_number": {
+      "type": ["integer", "null"],
+      "description": "issue #9 R4 修复①：PR 身份绑定。PR 号（有 draft PR 时）或 null（无 PR 直跑三审，SKILL.md 明文支持）。入 consensus_artifact_hash（recomputeArtifactHash），不进 review_input_hash（lead 裁决：进了会因「建 PR」动作让同一个 candidate 的 hash 变 → 三份 verdict 全失效 → 整轮重跑，正是轮次膨胀根因之一）。"
+    },
     "review_input_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "round": {
+      "type": "integer", "minimum": 1,
+      "description": "issue #9 SC-B: PASS consensus artifact 的序号（不是审查尝试次数）。首个可 PASS 的共识永远是 1、parent_artifact_hash=null；round>=2 必须携带 round-1 的完整可信 parent。入 consensus_artifact_hash（consensus-gate.mjs 的 recomputeArtifactHash）。"
+    },
+    "parent_artifact_hash": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$",
+      "$comment": "round=1 时必须恰为 null（首个可 PASS 的共识永远是无谱系的根）；round>=2 时必须是 round-1 那份 PASS artifact 的 consensus_artifact_hash（合法 64-hex）。JSON Schema 的 `type` union 允许 string 或 null 两种形状，但两者中具体选哪个由 round 值决定——这条 round↔parent 的条件约束无法用 JSON Schema 表达，运行时必须由 consensus-gate.mjs 的 assertArtifactShape 显式跳字段校验（issue #9 SC-R2-3/6）。",
+      "description": "issue #9 SC-3/SC-B: 谱系指针，round=1 为 null，round>=2 为上一轮 PASS artifact 的 hash。追加入 consensus_artifact_hash（recomputeArtifactHash）。"
+    },
     "canonical_findings": {
       "type": "array",
       "items": {

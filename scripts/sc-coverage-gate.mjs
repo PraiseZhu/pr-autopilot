@@ -8,7 +8,7 @@
 //   ④ fix/verify/archive SC 必须引用 ≥1 finding；global SC ≤1 条且不引用 finding
 // 任一违 → fail-closed。suggestion 级 finding 不强制覆盖（进 residual，与共识白名单口径一致）。
 import { readJson, parseArgs, fail, isMain } from './lib/common.mjs';
-import { recomputeArtifactHash } from './consensus-gate.mjs';
+import { recomputeArtifactHash, assertArtifactShape } from './consensus-gate.mjs';
 import { validateVerifyRecipe } from './fix-run.mjs';
 
 export function checkScCoverage({ manifest, artifact }) {
@@ -19,11 +19,21 @@ export function checkScCoverage({ manifest, artifact }) {
   need(artifact && typeof artifact === 'object', 'consensus artifact 不是对象');
   if (errs.length) return errs;
 
+  // issue #9 R2 blocker: 结构门先于 hash 自洽——schema_version/round 非法时必须点名结构
+  // 问题本身，不能被"hash 恰好被攻击者重算到自洽"掩盖（hash 自洽挡不住确定性重算攻击，
+  // 见 consensus-gate.mjs 的 assertArtifactShape 注释）。结构非法时直接返回，不再往下走
+  // hash/覆盖检查——那些检查全部假设结构合法。
+  const shapeErrs = assertArtifactShape(artifact, 'consensus artifact');
+  if (shapeErrs.length) return errs.concat(shapeErrs);
+
   // ① artifact hash 绑定（重算，不信自报）
   const real = recomputeArtifactHash(artifact);
   need(artifact.consensus_artifact_hash === real, 'artifact 自身 hash 与内容重算不符（artifact 被改）');
   need(manifest.consensus_artifact_hash === real,
     `sc manifest 的 consensus_artifact_hash 与 artifact 重算值不符（manifest=${String(manifest.consensus_artifact_hash).slice(0, 12)} 实=${real.slice(0, 12)}）——SC 未绑定到本次共识`);
+  // issue #9 SC-A2: 源 artifact 必须是 PASS 共识——本门此前全程不验 gate_result，
+  // 一份 hash 自洽但 gate_result=fail 的 artifact 能原样当源共识提炼 SC。
+  need(artifact.gate_result === 'pass', `consensus artifact gate_result=${artifact.gate_result} ≠ pass（issue #9 SC-A: SC 覆盖门只接受 PASS 共识）`);
 
   const canonical = artifact.canonical_findings ?? [];
   const canonicalIds = new Set(canonical.map((f) => f.id));

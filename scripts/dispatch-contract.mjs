@@ -23,12 +23,42 @@
 //   恶意伪造派工包文本。如实声明，不冒称。
 
 import { parseArgs, fail, isMain, sha256, canonicalJson } from './lib/common.mjs';
-import { DEFAULT_REQUIREMENTS, DEFAULT_ANCHOR_PATHS_MAX } from './verdict-validate.mjs';
+import {
+  DEFAULT_REQUIREMENTS,
+  DEFAULT_ANCHOR_PATHS_MAX,
+  SCHEMA_VERSION,
+  ATTEMPT_MIN,
+  HARDENING_NA_EVIDENCE_MIN_LENGTH,
+  REVIEWERS,
+  ADVERSARIAL,
+  FACES,
+  OUT_OF_SCOPE_NOTES_FIELD
+} from './verdict-validate.mjs';
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from './lib/hardening-registry.mjs';
 
-export const SEATS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
-const ADVERSARIAL = ['claude-adversarial', 'codex-adversarial'];
-export const ALL_FACES = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
+// R2-P1（lead 实测发现的复发风险）: verdict_schema_version / attempt 下限 / hardening_coverage
+// [n_a].evidence 最小长度、合法 seat 名单（=REVIEWERS）、对抗席分类（ADVERSARIAL）、七面枚举
+// （=FACES）——全部改为从 verdict-validate.mjs import，不再各自读 schema 或手拄第二份数组。
+// verdict-validate.mjs 是这些值唯一的物理派生/声明点（前三者它自己从
+// schemas/review-verdict.schema.json 派生并 export；后两者是业务分类/枚举，同样由它 export，
+// 不再区分"能不能从 schema 派生"——治同一个病就治干净，不留同形状残留）。本文件此前独立读
+// schema 派生前三者、又各自手拄 SEATS/ADVERSARIAL/ALL_FACES 三个数组——「一处派生 + 一处手拄」
+// 在真相源变化时会自动产生新的不一致，比原来的「两处手拄」更危险（emit 侧跟着真相源变了，
+// check/validator 侧不跟，审查席按新契约交卷反而在收卷时被拒）。改成单一物理读取/声明点后，
+// 这类复发在构造上不可能再发生。
+export const SEATS = REVIEWERS;
+export const ALL_FACES = FACES;
+
+// SC-R3-F5（R3-field，2026-08-07）: out_of_scope_channel 此前在本文件独立手拄字面值
+// 'out_of_scope_notes'，与 verdict-validate.mjs 里 `v.out_of_scope_notes` 的实际读取点是两份
+// 独立数据——同一形状的「一处派生 + 一处手拄」复发风险（同上方 SEATS/ALL_FACES 的治法）。改为
+// import verdict-validate.mjs 导出的 OUT_OF_SCOPE_NOTES_FIELD，不再自己手写。
+
+// issue #9 SC-C（状态模型矛盾修复）：「答」「推」两种处置不再走 status=closed + closed_finding_ids
+// 双条件——那双条件专属仍留在 findings[] 里的「修」「ARCHIVE」两种载体。这两条字面值直接进
+// requiredLiterals，反漂移方式与其余字面值一致：改这两个常量，emit/check 自动跟上。
+export const ANSWERED_WITHDRAW_LITERAL = '「答」disposition 须整条撤出 findings，不得只翻 status';
+export const DEFERRED_UNIFIED_LITERAL = '「推」disposition 不分 diff 内外统一进 out_of_scope_notes';
 
 // 契约 spec —— 纯数据，从 validator/registry 常量派生。digest 对它取内容 hash。
 export function contractSpec({ seat, round, requirements } = {}) {
@@ -36,24 +66,33 @@ export function contractSpec({ seat, round, requirements } = {}) {
   if (!Number.isInteger(round) || round < 1) throw new Error(`round 非法: ${round}（必须是 >=1 的整数）`);
   const req = { ...DEFAULT_REQUIREMENTS, ...(requirements ?? {}) };
   const isAdversarial = ADVERSARIAL.includes(seat);
-  // 加固清单穷举只对 round===1 的两个对抗席强制——与 verdict-validate 同一条件，勿各自判断
-  const hardeningRequired = isAdversarial && round === 1;
+  // issue #9: 加固清单穷举适用范围已扩大到「对抗席全 round」（i9-verdict 移除了
+  // verdict-validate.mjs 里的 `&& v.round === 1` 限制）——本行必须与之同条件，勿各自判断。
+  // 不改会造成 R2+ 派工契约不要求填 hardening_coverage，审查席老实交卷却被 validator 拒收，
+  // 整轮三席作废（同 D1 头部注释描述的 gate_id 事故是同一类形状：契约与 validator 各念各的经）。
+  const hardeningRequired = isAdversarial;
   return {
     contract_version: 'dc1',
     seat,
     round,
-    verdict_schema_version: 'v2',
+    verdict_schema_version: SCHEMA_VERSION,
+    attempt_min: ATTEMPT_MIN,
     required_faces: isAdversarial ? [...ALL_FACES] : [...req.third_seat_required_faces],
     faces_exact: isAdversarial, // 对抗席必须恰好七面，第三席只要求覆盖必填面
     required_gate_ids: isAdversarial ? [] : [...req.third_seat_required_gates],
     hardening: hardeningRequired
-      ? { required: true, checklist_version: HARDENING_CHECKLIST_VERSION, class_count: HARDENING_CLASS_COUNT }
+      ? {
+          required: true,
+          checklist_version: HARDENING_CHECKLIST_VERSION,
+          class_count: HARDENING_CLASS_COUNT,
+          na_evidence_min_length: HARDENING_NA_EVIDENCE_MIN_LENGTH
+        }
       : { required: false },
     close_dual_condition: ['status', 'closed_finding_ids'],
     forbidden_finding_fields: ['write_paths', 'allowed_paths'],
     actionable_required_fields: ['invariant', 'family_id'],
     anchor_paths_max_per_finding: DEFAULT_ANCHOR_PATHS_MAX,
-    out_of_scope_channel: 'out_of_scope_notes'
+    out_of_scope_channel: OUT_OF_SCOPE_NOTES_FIELD
   };
 }
 
@@ -68,6 +107,7 @@ export function requiredLiterals({ seat, round, requirements } = {}) {
   const lits = [
     spec.seat,
     `schema_version: "${spec.verdict_schema_version}"`,
+    'attempt',
     'anchor_paths',
     ...spec.close_dual_condition,
     ...spec.actionable_required_fields,
@@ -75,12 +115,20 @@ export function requiredLiterals({ seat, round, requirements } = {}) {
     spec.out_of_scope_channel,
     spec.required_faces.join('/'),
     ...spec.required_gate_ids,
+    ANSWERED_WITHDRAW_LITERAL,
+    DEFERRED_UNIFIED_LITERAL,
     `contract_digest=${contractDigest(spec)}`
   ];
   if (!spec.required_gate_ids.length) lits.push('faces');
   else lits.push('gate_checks');
   if (spec.hardening.required) {
-    lits.push('hardening_coverage', `checklist_version: ${spec.hardening.checklist_version}`, `恰好 ${spec.hardening.class_count} 项`);
+    lits.push(
+      'hardening_coverage',
+      `checklist_version: ${spec.hardening.checklist_version}`,
+      `恰好 ${spec.hardening.class_count} 项`,
+      '路径:行号',
+      `${spec.hardening.na_evidence_min_length} 字符`
+    );
   }
   return [...new Set(lits)];
 }
@@ -93,6 +141,7 @@ export function emitContract({ seat, round, requirements } = {}) {
   L.push(`### 机器契约段（脚本生成，勿手改；改一个字 digest 即失配被前置门拦下）`);
   L.push('');
   L.push(`- reviewer: \`${spec.seat}\`；round: \`${spec.round}\`；verdict \`schema_version: "${spec.verdict_schema_version}"\`（schemas/review-verdict.schema.json）。`);
+  L.push(`- verdict 顶层必填 \`attempt\`（整数 ≥ ${spec.attempt_min}；当前 round 内第几次审查尝试，三席须一致——一致性由 consensus-gate 核对，本契约只锁「必须填」）。`);
   if (spec.faces_exact) {
     L.push(`- faces：必须**恰好七面全填** \`${spec.required_faces.join('/')}\`，每面 result ∈ pass|fail|n_a 且 evidence 非空（空结果 ≠ pass）。`);
   } else {
@@ -105,12 +154,14 @@ export function emitContract({ seat, round, requirements } = {}) {
   }
   if (spec.hardening.required) {
     L.push(`- 加固清单穷举（本席本轮强制）：\`checklist_version: ${spec.hardening.checklist_version}\` + \`hardening_coverage\` **恰好 ${spec.hardening.class_count} 项**，class_id 1〜${spec.hardening.class_count} 各恰好一次，result ∈ covered|n_a，evidence 非空。逐条扫 references/hardening-checklist.md，不是"看到什么报什么"。`);
+    L.push(`  \`evidence\` 按 \`result\` 分支，不是同一句话：\`covered\`（声称已覆盖）必须给出「路径:行号」形态引用（如 \`scripts/foo.mjs:42\`），声称覆盖就要指出在哪覆盖的，不许空话；\`n_a\`（声称不适用）不要求路径:行号——不适用的类没有对应代码位置，强制会逼你编造假锚点——但 evidence 长度须 ≥ ${spec.hardening.na_evidence_min_length} 字符（防"无"/"n/a"这类敷衍）。`);
   }
   L.push(`- 每条 finding 必填 \`anchor_paths\`：仓库相对精确文件路径（POSIX、非目录、去重、≤ ${spec.anchor_paths_max_per_finding} 条），且**必须落在 base..candidate 实改文件集内**。它是证据锚点，**不是写入许可**。`);
   L.push(`- actionable（blocker/major）finding 另必填 \`${spec.actionable_required_fields.join('` + `')}\`；同一 family_id 下 invariant 必须逐字一致。`);
   L.push(`- finding 上**禁止**出现 \`${spec.forbidden_finding_fields.join('\` / \`')}\`（出现即结构性拒收）。`);
-  L.push(`- **关 finding 是双条件**：该 finding 的 \`status\` 置为 \`closed\` **且**它的 id 必须出现在同一份 verdict 的 \`closed_finding_ids\` 数组里。只翻 status 不列 id → verdict-validate 给 exit 0，但 consensus-gate conjunct② 必拒（2026-08-03 实测，白跑一次往返）。`);
-  L.push(`- diff 之外的真问题（仓库既有问题等）**不要塞进 finding 的 anchor_paths**（会被实改集校验拒），写进 \`${spec.out_of_scope_channel}[]\`：每条 \`{id, note, evidence, suggested_issue_title, ref_paths?}\`，走 Phase 2c 意见三分法的「推」通道（开 issue 跟踪）。该字段不进共识判定、不进 SC 台账。`);
+  L.push(`- **关 finding 是双条件**（仅适用于「修」「ARCHIVE」两类仍留在 findings[] 里的处置）：该 finding 的 \`status\` 置为 \`closed\` **且**它的 id 必须出现在同一份 verdict 的 \`closed_finding_ids\` 数组里。只翻 status 不列 id → verdict-validate 给 exit 0，但 consensus-gate conjunct② 必拒（2026-08-03 实测，白跑一次往返）。`);
+  L.push(`- ${ANSWERED_WITHDRAW_LITERAL}——本席若认可 lead 的证据回复（Phase 2c 意见三分法「答」），在下一份 verdict 里**不要**把该 finding 留在 \`findings[]\` 里改 \`status\`：直接删掉该条目。留着改 status 会撞上一条的双条件，把本不该进 canonical 的 finding 又送进 \`canonical_findings\`。`);
+  L.push(`- ${DEFERRED_UNIFIED_LITERAL}：Phase 2c 意见三分法判定为「推」（范围外真问题，默认外推）的 finding——不论主证据落在 diff 内还是 diff 外——都**不要塞进** \`findings[]\` 的 \`anchor_paths\`（diff 外的会被实改集校验直接拒收），改写进 \`${spec.out_of_scope_channel}[]\`：每条 \`{id, note, evidence, suggested_issue_title, ref_paths?}\`，走开 issue 跟踪。该字段不进共识判定、不进 SC 台账。`);
   L.push('');
   return `${L.join('\n')}\n`;
 }
