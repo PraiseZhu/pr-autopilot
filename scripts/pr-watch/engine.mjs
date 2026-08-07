@@ -225,7 +225,7 @@ export function runEngine(cfg) {
         if (pd.pending_stuck_notified !== true && pendingAgeMin > pendingStuckHours * 60) {
           try {
             routeNotify({
-              eventType: 'pending-stuck', repo: state.repo, feishuCmd, slackCmd,
+              eventType: 'pending-stuck', repo: `${state.owner}/${state.repo}`, feishuCmd, slackCmd,
               message: `【盯梢器】${prKey} 修复会话 ${pd.dispatch_id} 等待 ack 已超 ${Math.floor(pendingAgeMin / 60)} 小时，请检查修复会话是否还活着。`
             });
           } catch (e) { journal(journalFile, { kind: 'notify-error', pr: prKey, error: e.message }); }
@@ -240,7 +240,7 @@ export function runEngine(cfg) {
             journal(journalFile, { kind: 'stuck', pr: prKey, dispatch_id: pd.dispatch_id, redispatch_count: count });
             try {
               routeNotify({
-                eventType: 'stuck', repo: state.repo, feishuCmd, slackCmd,
+                eventType: 'stuck', repo: `${state.owner}/${state.repo}`, feishuCmd, slackCmd,
                 message: `【盯梢器】${prKey} 修复会话疑似挂死：dispatch ${pd.dispatch_id} 已重派 ${count} 次仍无完工回执。`
               });
             } catch (e) { journal(journalFile, { kind: 'notify-error', pr: prKey, error: e.message }); }
@@ -297,7 +297,7 @@ export function runEngine(cfg) {
         if (state.budget_notified_on !== today) {
           try {
             routeNotify({
-              eventType: 'budget-pause', repo: state.repo, feishuCmd, slackCmd,
+              eventType: 'budget-pause', repo: `${state.owner}/${state.repo}`, feishuCmd, slackCmd,
               message: `【预算闸】${b.reason}。${prKey} 有新反馈但暂停派活，等你确认后继续。`
             });
           } catch (e) { journal(journalFile, { kind: 'notify-error', pr: prKey, error: e.message }); }

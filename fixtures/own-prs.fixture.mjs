@@ -2,11 +2,13 @@
 // 补注册接线契约 fixture — 共识计划 T1 (SC-1b)。
 // 真实三层接线（own-prs.mjs 的 listOwnPrs → reconcile-own-prs.mjs → register.mjs 的 registerPr），
 // 只 stub gh 二进制（GH_BIN 注入，模式同 run-fixtures.mjs 的 gh-snapshot 契约 fixture）。
-// 覆盖: 正常映射 / fork 三态（含 finalize.mjs:46-50→git-checks.mjs:24-27 消费口径）/
+// 覆盖: 正常映射 / fork 三态（含 finalize.mjs 的 validateRemoteBranch 调用处 repoFullName
+//       = push_repo ?? owner/repo 消费口径，git-checks 实现见 scripts/lib/git-checks.mjs）/
 //       缺 headRefName 或 nameWithOwner 非字符串 → dropped 且 exit 0 / gh 失败非零 /
-//       空列表 [] / 双仓互不污染 / 幂等 already / 缺 map key 非零 / registerPr throw 非零。
+//       空列表 [] / 双仓互不污染 / 幂等 already / 缺 map key 非零 / registerPr throw 非零 /
+//       fake gh 精确 argv 断言 + 反向变异（SC-F3）/ 非数组负例 / 真实 JSON 形状兼容。
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -21,18 +23,27 @@ const eq = (a, b, label) => { if (JSON.stringify(a) !== JSON.stringify(b)) { fai
 const ok = (cond, label) => { if (!cond) { failed++; console.error(`FAIL ${label}`); } };
 
 const MIVO = 'xindong/mivo-canvas';
-const CINDY = 'PraiseZhu/pr-autopilot';
+const CINDY = 'makecindy/cindy'; // canonical cindy base 仓（2026-08-08 GPT 审查修复，SC-F1）
 const FORK = 'PraiseZhu/cindy-fork';
 const MAP = { [MIVO]: 'origin', [CINDY]: 'fork' };
 
-// ---- stub gh: 按 --repo 与 OWN_PRS_FIXTURE_MODE 输出确定性响应 ----
+// ---- stub gh: 精确断言完整 argv（SC-F3），再按 --repo 与 OWN_PRS_FIXTURE_MODE 输出确定性响应 ----
+// 期望序列与 own-prs.mjs 的 execFileSync argv 逐元素一致:
+//   pr list --repo <repo> --author @me --state open --json number,headRefName,headRepository
+// 补删 --author / 改 --state closed / 改 --json 字段 / 重排 → argv mismatch → exit 1（有牙齿）——
+// 产品代码 argv 一旦退化，fixture 立即红。
 const FAKE_GH_SRC = `
 const argv = process.argv.slice(2);
 if (process.env.OWN_PRS_FIXTURE_MODE === 'fail') { process.stderr.write('gh: boom\\n'); process.exit(1); }
 if (argv[0] !== 'pr' || argv[1] !== 'list') { process.stderr.write('unknown endpoint: ' + argv.join(' ')); process.exit(1); }
 const repo = argv[argv.indexOf('--repo') + 1];
+const EXPECTED = ['pr', 'list', '--repo', repo, '--author', '@me', '--state', 'open', '--json', 'number,headRefName,headRepository'];
+if (argv.length !== EXPECTED.length || argv.some((a, i) => a !== EXPECTED[i])) {
+  process.stderr.write('argv mismatch: ' + argv.join(' ') + ' != ' + EXPECTED.join(' ')); process.exit(1);
+}
 if (process.env.OWN_PRS_FIXTURE_MODE === 'empty') { process.stdout.write('[]'); process.exit(0); }
-const MIVO = 'xindong/mivo-canvas', CINDY = 'PraiseZhu/pr-autopilot', FORK = 'PraiseZhu/cindy-fork';
+if (process.env.OWN_PRS_FIXTURE_MODE === 'object') { process.stdout.write('{"items":[]}'); process.exit(0); } // 非数组负例
+const MIVO = 'xindong/mivo-canvas', CINDY = 'makecindy/cindy', FORK = 'PraiseZhu/cindy-fork';
 const byRepo = {
   [MIVO]: [
     { number: 101, headRefName: 'feat/mivo-base', headRepository: { nameWithOwner: MIVO } },
@@ -45,6 +56,16 @@ const byRepo = {
     { number: 202, headRefName: 'feat/cindy-base', headRepository: { nameWithOwner: CINDY } }
   ]
 };
+if (process.env.OWN_PRS_FIXTURE_MODE === 'real') {
+  // 真实 gh pr list --json 形状: 额外字段（baseRefName/url/isDraft/headRepositoryOwner/mergeable…）
+  // 不影响解析——own-prs 只消费 number/headRefName/headRepository.nameWithOwner
+  process.stdout.write(JSON.stringify([
+    { number: 301, headRefName: 'feat/real', headRepository: { nameWithOwner: MIVO, id: 'R_1', isPrivate: false },
+      baseRefName: 'main', url: 'https://github.com/' + MIVO + '/pull/301', isDraft: false,
+      headRepositoryOwner: { login: 'xindong' }, mergeable: 'MERGEABLE' }
+  ]));
+  process.exit(0);
+}
 if (!byRepo[repo]) { process.stderr.write('unknown repo: ' + repo); process.exit(1); }
 process.stdout.write(JSON.stringify(byRepo[repo]));
 `;
@@ -88,7 +109,12 @@ eq(wprs.map((p) => [p.owner, p.repo, p.number, p.branch, p.push_repo, p.push_rem
   ['xindong', 'mivo-canvas', 102, 'feat/mivo-fork', 'PraiseZhu/cindy-fork', 'origin']
 ], 'S1 契约五字段 + push_repo 三态（同仓 null / fork 字符串）');
 
-// state 文件落盘 + 三态 typeof 断言 + finalize:46-50→git-checks:24-27 消费口径
+// state 文件落盘 + 三态 typeof 断言 + 消费口径（稳定符号，2026-08-08 行号刷新）
+//   engine.mjs manifest 构造的 push_repo 行（`push_repo: state.push_repo ?? null`）;
+//   finalize.mjs validateRemoteBranch 调用处（`repoFullName: manifest.push_repo ?? owner/repo`）;
+//   engine.mjs 终态 branch-cleanup 调用处（`repoFullName: settled.push_repo ?? owner/repo`）;
+//   scripts/lib/git-checks.mjs 的 validateRemoteBranch: repoFullName 与 push URL path 精确匹配——
+//   fork 场景 remote push URL 的 path 必须 === nameWithOwner 才过。
 const s101 = JSON.parse(readFileSync(stateFile(stateMivo, 'xindong', 'mivo-canvas', 101), 'utf8'));
 const s102 = JSON.parse(readFileSync(stateFile(stateMivo, 'xindong', 'mivo-canvas', 102), 'utf8'));
 const pushRepoTriState = (v) => v === null || typeof v === 'string'; // 三态: 字符串或 null
@@ -100,17 +126,13 @@ eq(s101.push_remote, 'origin', 'S1 state#101 push_remote=映射值 origin');
 eq(s102.push_remote, 'origin', 'S1 state#102 push_remote=映射值 origin');
 eq(s101.branch, 'feat/mivo-base', 'S1 state#101 branch=headRefName');
 eq(s101.registered_by, 'reconcile-shuttle', 'S1 registered_by 标注班车来源');
-// engine.mjs:281 manifest 口径: push_repo: state.push_repo ?? null；
-// finalize.mjs:50 / engine.mjs:165 消费口径: repoFullName = manifest.push_repo ?? `${owner}/${repo}`
-// git-checks.mjs:24-27: validateRemoteBranch 用 repoFullName 与 push URL path 精确匹配——
-// fork 场景 remote push URL 的 path 必须 === nameWithOwner 才过。
 for (const [s, nw, expectRepoFullName] of [
   [s101, MIVO, 'xindong/mivo-canvas'],
   [s102, FORK, 'PraiseZhu/cindy-fork']
 ]) {
-  const manifestPushRepo = s.push_repo ?? null; // engine.mjs:281
+  const manifestPushRepo = s.push_repo ?? null; // engine.mjs manifest 构造（push_repo: state.push_repo ?? null）
   ok(pushRepoTriState(manifestPushRepo), 'S1 manifest push_repo 字符串或 null');
-  const repoFullName = manifestPushRepo ?? `${s.owner}/${s.repo}`; // finalize.mjs:50 口径
+  const repoFullName = manifestPushRepo ?? `${s.owner}/${s.repo}`; // finalize.mjs validateRemoteBranch 调用处口径
   eq(repoFullName, nw, `S1 消费口径 repoFullName===nameWithOwner（${nw}，fork 绑定不被上游冒充）`);
 }
 
@@ -122,15 +144,15 @@ eq(o2.registered, [], 'S2 重跑无新注册');
 eq(o2.already, ['xindong/mivo-canvas#101', 'xindong/mivo-canvas#102'], 'S2 重跑 already 两条（registerPr 幂等）');
 eq(o2.dropped.length, 2, 'S2 重跑 dropped 依旧两条');
 
-// ---- S3: 双仓互不污染（cindy 跑自己的 stateDir） ----
+// ---- S3: 双仓互不污染（canonical cindy 跑自己的 stateDir） ----
 const r3 = reconcile(CINDY, stateCindy);
 const o3 = JSON.parse(r3.out.split('\n').filter((l) => l.startsWith('{'))[0] ?? '{}');
 eq(r3.status, 0, 'S3 cindy 跑 exit 0');
-eq(o3.registered, ['PraiseZhu/pr-autopilot#201', 'PraiseZhu/pr-autopilot#202'], 'S3 cindy 两条 registered');
-ok(existsSync(stateFile(stateCindy, 'PraiseZhu', 'pr-autopilot', 201)), 'S3 cindy state#201 落盘');
+eq(o3.registered, ['makecindy/cindy#201', 'makecindy/cindy#202'], 'S3 cindy 两条 registered');
+ok(existsSync(stateFile(stateCindy, 'makecindy', 'cindy', 201)), 'S3 cindy state#201 落盘');
 ok(!existsSync(stateFile(stateCindy, 'xindong', 'mivo-canvas', 101)), 'S3 cindy stateDir 无 mivo PR（互不污染）');
-ok(!existsSync(stateFile(stateMivo, 'PraiseZhu', 'pr-autopilot', 201)), 'S3 mivo stateDir 无 cindy PR（互不污染）');
-const s201 = JSON.parse(readFileSync(stateFile(stateCindy, 'PraiseZhu', 'pr-autopilot', 201), 'utf8'));
+ok(!existsSync(stateFile(stateMivo, 'makecindy', 'cindy', 201)), 'S3 mivo stateDir 无 cindy PR（互不污染）');
+const s201 = JSON.parse(readFileSync(stateFile(stateCindy, 'makecindy', 'cindy', 201), 'utf8'));
 eq(s201.push_repo, 'PraiseZhu/cindy-fork', 'S3 cindy fork PR push_repo 正确');
 eq(s201.push_remote, 'fork', 'S3 cindy 映射值 push_remote=fork');
 
@@ -152,7 +174,8 @@ const r6 = reconcile(CINDY, stateCindy, mapNokey);
 ok(r6.status !== 0, 'S6 缺 map key exit 非零');
 ok(r6.out.includes('缺当前 --repo'), 'S6 报错含缺当前 --repo 的 key');
 
-// ---- S7: registerPr throw（在途 dispatch 接线变化，register.mjs:39-42）→ 非零 + errors 明细 ----
+// ---- S7: registerPr throw（在途 dispatch 接线变化——registerPr 的 wiringChanged && pending_dispatch
+//          迁移拒绝分支）→ 非零 + errors 明细 ----
 // 预置 state#101 为「旧 branch + 在途 dispatch」——API 返回 feat/mivo-base ≠ 旧 branch → wiringChanged
 // 且 pending_dispatch 非空 → registerPr 必须 throw（迁移拒绝），该条记 errors，其余条照常注册。
 writeJsonAtomic(stateFile(stateMivo, 'xindong', 'mivo-canvas', 101), {
@@ -169,6 +192,59 @@ ok(o7.errors.some((e) => e.pr === 'xindong/mivo-canvas#101' && e.reason.includes
 ok(!o7.registered.includes('xindong/mivo-canvas#101'), 'S7 101 不进 registered');
 ok(!o7.errors.some((e) => e.pr === 'xindong/mivo-canvas#102'), 'S7 102 不进 errors（逐 PR 隔离）');
 ok([...o7.registered, ...o7.already].includes('xindong/mivo-canvas#102'), 'S7 102 不受 101 影响照常处理（已注册走 already）');
+
+// ---- S8: fake gh 精确 argv 断言的反向变异（SC-F3）——断言必须有牙齿 ----
+// 对期望 argv 的每一处变异（补删 --author / 改 --state closed / 改 --json 字段 / 重排），
+// fake gh 必须拒绝（exit 1 + argv mismatch）——产品代码 argv 一旦退化，fixture 立即红；
+// 完整 argv 必须接受（正向闭环）。
+const FULL_ARGV = (repo) => ['pr', 'list', '--repo', repo, '--author', '@me', '--state', 'open', '--json', 'number,headRefName,headRepository'];
+const ARGV_MUTATIONS = [
+  { name: 'drop-author', argv: (r) => ['pr', 'list', '--repo', r, '--state', 'open', '--json', 'number,headRefName,headRepository'] },
+  { name: 'state-closed', argv: (r) => ['pr', 'list', '--repo', r, '--author', '@me', '--state', 'closed', '--json', 'number,headRefName,headRepository'] },
+  { name: 'drop-json-field', argv: (r) => ['pr', 'list', '--repo', r, '--author', '@me', '--state', 'open', '--json', 'number,headRefName'] },
+  { name: 'reorder-flags', argv: (r) => ['pr', 'list', '--repo', r, '--state', 'open', '--author', '@me', '--json', 'number,headRefName,headRepository'] }
+];
+for (const m of ARGV_MUTATIONS) {
+  const rm = spawnSync(ghWrap, m.argv(MIVO), { encoding: 'utf8', env });
+  ok(rm.status !== 0, `S8 变异 argv 必须被 fake gh 拒绝（${m.name}）`);
+  ok((rm.stderr ?? '').includes('argv mismatch'), `S8 拒绝信息含 argv mismatch（${m.name}）`);
+}
+const r8ok = spawnSync(ghWrap, FULL_ARGV(MIVO), { encoding: 'utf8', env });
+eq(r8ok.status, 0, 'S8 完整 argv 被 fake gh 接受（正向闭环）');
+// 全链路反向变异: 变异 fake gh 的期望序列（等价临时副本，逐个替换 FAKE_GH_SRC 中的唯一子串），
+// 产品传完整 argv → 期望不匹配 → 拒绝 → reconcile 非零——证明 fixture 对 argv 变化敏感
+const MUT_SUBST = [
+  { name: 'drop-author', from: `'--author', '@me', `, to: `` },
+  { name: 'state-closed', from: `'--state', 'open'`, to: `'--state', 'closed'` },
+  { name: 'drop-json-field', from: `'number,headRefName,headRepository'`, to: `'number,headRefName'` },
+  { name: 'reorder-flags', from: `'--author', '@me', '--state', 'open'`, to: `'--state', 'open', '--author', '@me'` }
+];
+const mutMap = join(gd, 'map-argvmut.json');
+writeFileSync(mutMap, JSON.stringify({ [MIVO]: 'origin' }));
+for (const m of MUT_SUBST) {
+  const mutGh = join(gd, `fake-gh-${m.name}.mjs`);
+  writeFileSync(mutGh, FAKE_GH_SRC.replace(m.from, m.to));
+  const mutWrap = join(gd, `gh-${m.name}`);
+  writeFileSync(mutWrap, `#!/bin/sh\nexec "${process.execPath}" "${mutGh}" "$@"\n`);
+  execFileSync('chmod', ['+x', mutWrap]);
+  const rm2 = reconcile(MIVO, join(gd, `state-argvmut-${m.name}`), mutMap, { GH_BIN: mutWrap });
+  ok(rm2.status !== 0, `S8 全链路: 变异 fake gh（${m.name}）下 reconcile 必须非零`);
+  ok(rm2.out.includes('argv mismatch') || rm2.out.includes('gh pr list 失败'), `S8 全链路失败信息可见（${m.name}）`);
+}
+
+// ---- S9: 非数组响应负例 → fail-closed 非零，无 state 落盘 ----
+const r9 = reconcile(MIVO, join(gd, 'state-object'), join(gd, 'map.json'), { OWN_PRS_FIXTURE_MODE: 'object' });
+ok(r9.status !== 0, 'S9 gh 返回非数组 exit 非零');
+ok(r9.out.includes('非数组'), 'S9 报错含非数组（fail-closed）');
+const stateDirObj = join(gd, 'state-object');
+ok(existsSync(stateDirObj) && readdirSync(stateDirObj).filter((f) => f.endsWith('.json')).length === 0, 'S9 非数组失败无 state 文件落盘');
+
+// ---- S10: 真实 gh JSON 形状（额外字段）→ 正常解析注册 ----
+const r10 = reconcile(MIVO, join(gd, 'state-real'), join(gd, 'map.json'), { OWN_PRS_FIXTURE_MODE: 'real' });
+const o10 = JSON.parse(r10.out.split('\n').filter((l) => l.startsWith('{'))[0] ?? '{}');
+eq(r10.status, 0, 'S10 真实 JSON 形状 exit 0');
+eq(o10.registered, ['xindong/mivo-canvas#301'], 'S10 真实形状 PR 正常注册');
+eq(o10.dropped, [], 'S10 真实形状无 dropped');
 
 console.log(`own-prs.fixture: ${failed === 0 ? 'all pass' : failed + ' failed'}`);
 process.exit(failed === 0 ? 0 : 1);

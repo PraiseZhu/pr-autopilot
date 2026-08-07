@@ -7,7 +7,7 @@
 ## 0. 前置（P0，不做完不许开调度）
 
 1. mini `gh auth status` 有效（token 失效是当前第一阻塞）。
-2. mini clone cindy（fork 流程，push 目标 = PraiseZhu/cindy-fork）与 mivo 各一份 checkout。
+2. mini clone cindy（base = `makecindy/cindy`；fork 流程 push 目标 = `PraiseZhu/cindy-fork`）与 mivo 各一份 checkout。
 3. 飞书: owner 先私聊一次 Mivo bot；W-7 三前提实测（launchd 环境凭证可读 / bot API 可达 / 真实试发成功，凭证不落库不打日志）。
 4. `sessions.dispatch` 端到端: 从 script 调度起 GLM 会话，session meta 落盘核对四元组
    `agentKind=claude-code + provider + claude-sonnet-5 + xhigh`（不是只看 dispatch 成功）。
@@ -86,7 +86,8 @@ engine-mivo.json（完整必填示例；两仓 schedule **共享同一 budget.le
   - mivo: `node scripts/pr-watch/register.mjs --state-dir … --owner xindong --repo mivo-canvas --pr <N> --branch <feature> --push-remote origin`
   - cindy: 同上，另加 `--push-remote fork --push-repo PraiseZhu/cindy-fork`
     （finalize 会把该 remote 的 push URL 与 push-repo 仓名绑定，upstream 冒充被拦）。
-    **前置**: cindy checkout 里必须存在名为 `fork` 的 remote 指向 PraiseZhu/cindy-fork
+    **前置**: cindy checkout 的 origin/base = `makecindy/cindy`（canonical），checkout 里必须存在
+    名为 `fork` 的 remote 指向 PraiseZhu/cindy-fork
     （`git remote add fork git@github.com:PraiseZhu/cindy-fork.git`）；若你的 checkout 是
     「origin=fork / upstream=上游」布局，则注册时传 `--push-remote origin` 即可——remote
     名以**注册时显式声明**为准，不是约定死的。
@@ -224,7 +225,7 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
   - `exit 1` = **参数/初始化错误**（`probe.mjs:47-50` 在 try 外 `fail(...,1)`，模块导入/初始化异常也不在 catch 内），**不受 fail-open 保护，且本仓未定义调度侧如何处理 exit 1**——这是调用姿势错了，不是「探针异常」。（本仓只有 exit 0/2 协议。）
 - **宿主 preRunHook 失败语义 2026-08-08 已确认：fail-open**——preRunHook 失败/异常不会拦停班车会话，宿主照常启动；所以「不接 probe 会怎样」从「可能每周期启动会话（需实测）」升级为**确定的**「每周期必起会话、空转轮也烧 token」。fail-closed 的唯一来源是把 probe.mjs 的 `exit 2` 接进宿主 preRunHook（无活 → 真正跳过）；本仓源码自身没有「preRunHook 失败 → 拦停」的 fail-closed 路径（曾写「源码 fail-closed / 待实测」的旧说法已随 T4 更正，P0 项 ⑦ 见 `deploy/README.md:16`）。
 - **通知链是 best-effort，别依赖「收到」当验收**：`pending-stuck`（`engine.mjs:225`）与 `stuck`（`engine.mjs:240`）、`budget-pause`（`engine.mjs:297`）的发送失败都只记 `notify-error` journal 事件，**不重试、不补发**；`pending_stuck_notified` 去重标记在**尝试发送后即置位（含发送失败）**——取舍是宁丢一次不刷屏（`engine.mjs:216-218` 注释原文）。判断「告警是否被发出」以 journal 的 `notify-error` 有无为准，不能假设必达。
-- **`stuck` / `pending-stuck` 的路由（T3 定案，`notify-router.mjs:26-29`）**：按 repo 名细分——**cindy 仓（repo 名含 `cindy`）→ `silent`（不产生任何通知，只记 journal）**；**其他仓（如 mivo）→ `feishu` 通道**。pending-stuck 与 stuck 同通道、不落 ROUTES 表（否则 null 值会撞「未知事件类型」fail-closed）。「卡死无人知」在 cindy 仓是设计行为（W-6: cindy PR 卡死不打扰），不是漏配。
+- **`stuck` / `pending-stuck` 的路由（T3 定案，`notify-router.mjs` 的 `route()`/`isCindyRepo()`）**：以 **canonical owner/repo 判 cindy**（2026-08-08 GPT 审查修复，不再用裸 repo 名子串猜身份）——**cindy 仓（引擎传 `${owner}/${repo}` 全名，判据 = `makecindy/cindy`）→ `silent`（不产生任何通知，只记 journal）**；**其他仓（如 `xindong/mivo-canvas`、`PraiseZhu/pr-autopilot`）→ `feishu` 通道**。兼容旧调用：只传裸 repo 名（如 `cindy`）时判据为字面 `cindy`。pending-stuck 与 stuck 同通道、不落 ROUTES 表（否则 null 值会撞「未知事件类型」fail-closed）。「卡死无人知」在 cindy 仓是设计行为（W-6: cindy PR 卡死不打扰），不是漏配。
 - **部署动作**：接进 schedule 前**先手动跑一次**确认拿到 0 或 2；拿到 1 说明参数/调用姿势错了，fail-open 不会救你。
 - 它的判定**复用引擎同源模块**（`gate.evaluate` / `stateFileName` 文法），信号逻辑与引擎是**同一套**——自己另写一个探针等于造第二套判定，两套迟早不一致（探针说有活、引擎说没活，或反过来），凭空多一个故障面。
 
@@ -245,28 +246,30 @@ node ~/pr-autopilot/deploy/wrappers/reconcile-own-prs.mjs \
   --repo xindong/mivo-canvas \
   --state-dir ~/pr-autopilot-runtime/state-mivo \
   --remote-map-file ~/pr-autopilot-runtime/remote-map.json
-# cindy 仓
+# cindy 仓（canonical base = makecindy/cindy；fork 身份 = PraiseZhu/cindy-fork）
 node ~/pr-autopilot/deploy/wrappers/reconcile-own-prs.mjs \
-  --repo PraiseZhu/pr-autopilot \
+  --repo makecindy/cindy \
   --state-dir ~/pr-autopilot-runtime/state-cindy \
   --remote-map-file ~/pr-autopilot-runtime/remote-map.json
 ```
 
 remote-map.json（base 仓全名 → 该仓 checkout 里修复 push 用的 remote 名；注册时必须显式声明，
-引擎不猜，同 §2 注册命令的 `--push-remote` 语义）:
+引擎不猜，同 §2 注册命令的 `--push-remote` 语义。key 一律要求严格 owner/repo 形状——
+`/foo`、`foo/`、多斜杠、非法字符的 key 会在启动前被拒）:
 
 ```json
-{ "xindong/mivo-canvas": "origin", "PraiseZhu/pr-autopilot": "fork" }
+{ "xindong/mivo-canvas": "origin", "makecindy/cindy": "fork" }
 ```
 
 - **fail-closed 分层**：启动前校验 remote-map（不可读 / JSON 非对象 / 缺当前 `--repo` key /
   alias 非法或空串）即非零退出；gh 失败非零；API 脏字段（缺 headRefName、
   `headRepository.nameWithOwner` 缺失或非字符串）该条 dropped + stderr 继续（合法 dropped 不判
-  非零）；registerPr 异常（含在途 dispatch 接线变化，`register.mjs:39-42`）记 errors 且该轮非零。
+  非零）；registerPr 异常（含在途 dispatch 接线变化——`registerPr` 的 wiringChanged 且有
+  pending_dispatch 时抛「迁移拒绝」，`scripts/pr-watch/register.mjs` 该分支）记 errors 且该轮非零。
   输出 JSON 四明细 `{registered, already, dropped, errors}`；退出码：配置错 / gh 失败 / errors
   非空 → 非零，其余 → 0。
 - **`--author @me` 只作用于补注册 wrapper 这一层**：reconcile 的 `gh pr list --author @me`
-  只筛自己名下的 open PR 做补注册，是**注册侧的按作者收窄**。这与 §2 ④（:208-211）里
+  只筛自己名下的 open PR 做补注册，是**注册侧的按作者收窄**。这与 §2.1 ④「多实例部署」里
   「review-pr 的 `--auto` 无作者过滤参数、双机巡审会抢同一批 PR」的声明是**两条独立事实，
   互不混淆**——巡审侧（审查）至今没有按作者分片，补注册侧（盯梢注册）用 `--author @me`
   收窄，两者不互相取消。

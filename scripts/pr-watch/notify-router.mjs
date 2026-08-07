@@ -20,12 +20,24 @@ const ROUTES = {
   'stuck': null // 按 repo 细分，见 route()
 };
 
+// canonical cindy 判定（2026-08-08 GPT 审查修复，W-6 收窄）:
+//   裸 repo 名（旧调用/部署只传 repo 段）→ 只认字面 'cindy'，不再用 /cindy/i 子串猜身份——
+//   'my-cindy-app' 之类含 cindy 子串的 repo 不再被误静音；
+//   owner/repo 全名（engine 现传 `${owner}/${repo}`）→ 只认 canonical makecindy/cindy，
+//   PraiseZhu/pr-autopilot、evilorg/cindy 等一律不判 cindy。
+export const CINDY_CANONICAL_REPO = 'makecindy/cindy';
+
+export function isCindyRepo(repo) {
+  if (typeof repo !== 'string' || repo.length === 0) return false;
+  return repo.includes('/') ? repo === CINDY_CANONICAL_REPO : repo === 'cindy';
+}
+
 export function route(eventType, { repo } = {}) {
   // T3/SC-3a: pending-stuck 与 stuck 同通道（cindy=silent / mivo=feishu）——不落 ROUTES，
   // 否则 null 值会撞下方「未知事件类型」fail-closed
   if (eventType === 'stuck' || eventType === 'pending-stuck') {
-    if (/cindy/i.test(repo ?? '')) return 'silent'; // W-6: cindy PR 卡死不打扰
-    return 'feishu'; // mivo PR 卡死飞书点名
+    if (isCindyRepo(repo)) return 'silent'; // W-6: canonical cindy PR 卡死不打扰
+    return 'feishu'; // 其余仓 PR 卡死飞书点名
   }
   const ch = ROUTES[eventType];
   if (!ch) throw new Error(`未知通知事件类型: ${eventType}（fail-closed，不猜通道）`);

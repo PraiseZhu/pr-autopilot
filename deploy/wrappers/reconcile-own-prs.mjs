@@ -7,17 +7,20 @@
 // fail-closed 分层:
 //   ① 启动前非零 —— remote-map 文件不可读 / JSON 非对象 / 缺当前 --repo key / alias 非法或空串
 //   ② 逐 PR 可容忍 —— API 脏字段 → dropped + warning（stderr）继续；合法 dropped 不判非零
-//   ③ registerPr 异常（含 register.mjs:39-42 在途 dispatch 接线变化 throw）→ errors 记明细且该轮非零
+//   ③ registerPr 异常（含在途 dispatch 接线变化——registerPr 的 wiringChanged && pending_dispatch
+//      迁移拒绝 throw）→ errors 记明细且该轮非零
 // 退出码: 配置错 / gh 失败 / errors 非空 → 非零；其余（含合法 dropped）→ 0
 // 输出 JSON 四明细: {registered:[prKey...], already:[prKey...], dropped:[{pr,reason}...], errors:[{pr,reason}...]}
 import { mkdirSync, readFileSync } from 'node:fs';
 import { isMain, parseArgs, fail } from '../../scripts/lib/common.mjs';
 import { registerPr } from '../../scripts/pr-watch/register.mjs';
-import { listOwnPrs } from './own-prs.mjs';
+import { listOwnPrs, parseRepo } from './own-prs.mjs';
 
 // ①层启动校验: 读 map 并整体校验（结构 + 全部 alias 非空字符串 + 缺当前 --repo key 即报错）。
-// 所有 key 也要求 owner/repo 形态——散乱的 key 说明文件放错了仓。
+// 所有 key 也要求严格 owner/repo 形状（parseRepo grammar 复用，own-prs.mjs 导出）——
+// /foo、foo/、多斜杠、非法字符的 key 一律启动前拒绝（fail-closed，无 state 落盘）。
 export function loadRemoteMap(file, repo) {
+  parseRepo(repo, '--repo'); // CLI 入口 fail-closed: 非法 repo 在任何 state 落盘之前拒绝
   let raw;
   try { raw = readFileSync(file, 'utf8'); }
   catch (e) { throw new Error(`remote-map 文件不可读: ${e.message}`); }
@@ -28,9 +31,8 @@ export function loadRemoteMap(file, repo) {
     throw new Error('remote-map 须为 JSON 对象 {"owner/repo":"alias"}');
   }
   for (const [k, v] of Object.entries(map)) {
-    if (typeof k !== 'string' || !k.includes('/') || k.split('/').length !== 2) {
-      throw new Error(`remote-map key 非法（须 owner/repo）: ${JSON.stringify(k)}`);
-    }
+    try { parseRepo(k, `remote-map key`); }
+    catch (e) { throw new Error(`remote-map ${e.message}`); }
     if (typeof v !== 'string' || v.length === 0) {
       throw new Error(`remote-map alias 非法或空串: ${k}=${JSON.stringify(v)}`);
     }

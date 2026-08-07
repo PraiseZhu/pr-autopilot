@@ -17,13 +17,37 @@ import { isMain, parseArgs, fail } from '../../scripts/lib/common.mjs';
 
 const GH = process.env.GH_BIN ?? 'gh';
 
+// 严格 owner/repo grammar（2026-08-08 GPT 审查修复，SC-F2 提炼复用）:
+//   恰一个斜杠、两段非空、GitHub 合法形状（owner: 字母数字开头结尾、中间可连字符；
+//   repo: 字母数字开头结尾、中间可连字符/下划线/点）。
+//   拒: /foo、foo/、a/b/c、foo//bar、a//、空串、非字符串。
+//   返回 { owner, repo }；非法即 throw（fail-closed，调用方决定落盘与否）。
+export function parseRepo(repo, label = 'repo') {
+  if (typeof repo !== 'string') {
+    throw new Error(`${label} 非法（须 owner/repo 字符串）: ${JSON.stringify(repo)}`);
+  }
+  const parts = repo.split('/');
+  if (parts.length !== 2) {
+    throw new Error(`${label} 非法（须恰一个斜杠的 owner/repo）: ${JSON.stringify(repo)}`);
+  }
+  const [owner, repoName] = parts;
+  if (!owner || !repoName) {
+    throw new Error(`${label} 非法（owner/repo 两段均不能为空）: ${JSON.stringify(repo)}`);
+  }
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(owner)) {
+    throw new Error(`${label} 非法（owner 不是 GitHub 合法用户名形状）: ${JSON.stringify(repo)}`);
+  }
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(repoName)) {
+    throw new Error(`${label} 非法（repo 不是 GitHub 合法仓库名形状）: ${JSON.stringify(repo)}`);
+  }
+  return { owner, repo: repoName };
+}
+
 // 纯函数: 列本人 open PR → 补注册契约字段。返回 { prs, dropped }。
 //   prs:    [{owner,repo,number,branch,push_repo,push_remote}]（契约输出；push_repo 三态: 同仓 null / fork 字符串）
 //   dropped: [{pr,reason}]（API 脏字段，调用方决定继续与否；stderr 已在此处如实标注）
 export function listOwnPrs({ repo, remoteMap }) {
-  if (typeof repo !== 'string' || !repo.includes('/') || repo.split('/').length !== 2) {
-    throw new Error(`repo 非法（须 owner/repo）: ${JSON.stringify(repo)}`);
-  }
+  const { owner, repo: repoName } = parseRepo(repo);
   if (!remoteMap || typeof remoteMap !== 'object' || Array.isArray(remoteMap)) {
     throw new Error('remoteMap 须为对象');
   }
@@ -31,7 +55,6 @@ export function listOwnPrs({ repo, remoteMap }) {
   if (typeof alias !== 'string' || alias.length === 0) {
     throw new Error(`remoteMap 缺当前 --repo 的映射（${repo}）或 alias 非字符串/空串`);
   }
-  const [owner, repoName] = repo.split('/');
 
   let rows;
   try {
