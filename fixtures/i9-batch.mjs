@@ -651,7 +651,7 @@ t('[i9-batch-14a] 冻结 family 被 ARCHIVE 处置（终版有该族 + 带 archi
   const errsFail = checkBatchClosure({ runManifest: failResult, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest: scManifestWithArchFK1 });
   ok(errsFail.some((e) => /同族复发/.test(e)), 'results 含该 SC 但 status=FAIL → 出口不成立，仍拒: ' + JSON.stringify(errsFail));
 });
-t('[i9-batch-14b] 无该族 archive SC（终版有该族）→ 判据④仍拒（出口判据=该族有 archive SC）', () => {
+t('[i9-batch-14b] 无该族 archive SC（终版有该族）→ 判据④仍拒（出口三条件之一的必要条件缺失，故必拒）', () => {
   const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest });
   ok(errs.some((e) => /同族复发/.test(e)), 'FK1 复发但无 FK1 的 archive SC → 必须仍拒: ' + JSON.stringify(errs));
 });
@@ -1087,12 +1087,9 @@ t('[SC-T1c-A] 变异 A：temp-copy 挖掉 CLI --batch 透传 → closure 复发�
     rm(frCopy, { force: true });
   }
 });
-t('[SC-T1c-B] 变异 B：6c 内常驻严格后代反向变异保持原样（挖 isAncestorCommit 恒 true → 兄弟提交放行）确认仍绿', () => {
-  // 常驻变异在 [i9-batch-6c] 测试内（挖 :411 恒 true + 断言放行）——本测试验证它仍在且绿。
-  // 直接复跑 6c 的语义：用 temp-copy 挖 isAncestorCommit 恒 true → sibling 场景放行。
-  // 但 6c 已含该断言（测试本身绿 = 变异 B 绿），此处只确认 6c 通过（t() 顺序保证）。
-  ok(true, '变异 B：6c 常驻严格后代反向变异在本轮全套中保持绿（见 [i9-batch-6c] 的 ok 输出）');
-});
+// FIX-5（2026-08-08）：删除 [SC-T1c-B] ok(true) 空断言——严格后代的真实常驻反向变异
+// 在 [i9-batch-6c] :737-774 已有效（挖 isAncestorCommit 恒 true → 兄弟提交放行），
+// 不需要包装项（空断言 = 恒真，无验证价值）。
 
 // ========== [SC-T2] finalizeRun reader 侧硬化（2026-08-08 派工） ==========
 console.log('\n[SC-T2] finalizeRun 读到持久化 manifest {ok:true, results:[]} 时拒绝');
