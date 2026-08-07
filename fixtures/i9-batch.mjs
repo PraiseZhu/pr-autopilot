@@ -6,11 +6,13 @@
 //   [i9-batch-2] 冻结集未闭合被拒：冻结 family 在终版 delta 审查中再次出现（同族复发）→
 //                闭合门判据④拒收口
 //   [i9-batch-3] 批次期间新 family 混入被拒：本批 SC 处置冻结集之外的 family → 闭合门判据⑤拒
-//   [i9-batch-4] 同族二次触发六件套：闭合门④检出复发（触发）→ lead 产出归因六件套 →
-//                convergence-attribution-gate 通过（六项齐全 = 触发已兑现）
-//   [i9-batch-5] 六件套缺项被拒：attribution 缺任一项 → convergence-attribution-gate 拒
+//   [i9-batch-4] 跨批复发申报 recurrence 段（触发条件④命中时的补充载体）：齐全通过；
+//                缺 prior_sc_missed_because / verdict enum 非法 / symptom 缺 locator /
+//                family_key 不在本批 frozen / prior_sc_id 不在 sc manifest → 各拒（自洽）
 //   [i9-batch-6] successor 不是直接后继被拒：frozen_at_sha..successor 恰 2 个 commit →
 //                push-guard「恰好一个后继」拒（squash 记录齐全，只红批次判据，失败模式隔离）
+//   [i9-batch-10] 缺 invariant 无法归族（判据⑥）：源共识/终版共识的 blocker/major 无
+//                family_key → 拒（先归因再进批次）
 // 反向变异：每条用例对应一个「挖空点」，变异后只有该用例红、其余保持绿（消息文本互斥支撑隔离）。
 // 本文件独立可跑：`node fixtures/i9-batch.mjs`，不并入 run-fixtures.mjs / run-all.sh
 // （lead 边界：run-fixtures.mjs / run-all.sh 由 lead 亲自接线，禁改）。
@@ -29,7 +31,6 @@ import { buildFixPlan } from '../scripts/fix-plan.mjs';
 import { runManifestHash, initRun } from '../scripts/fix-run.mjs';
 import { computeFixPlanHash } from '../scripts/fix-plan.mjs';
 import { checkBatchClosure } from '../scripts/batch-closure-gate.mjs';
-import { checkAttribution } from '../scripts/convergence-attribution-gate.mjs';
 import { readJson, hashObject } from '../scripts/lib/common.mjs';
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from '../scripts/lib/hardening-registry.mjs';
 
@@ -253,57 +254,81 @@ t('[i9-batch-3] 本批 SC 处置冻结集外 family → 闭合门⑤拒（新 fa
   ok(!errs.some((e) => /再次出现（同族复发/.test(e)), '判据④不得误报（FK1/FK2 未在终版出现）: ' + JSON.stringify(errs));
 });
 
-// ========== [i9-batch-4] 同族二次触发六件套（触发 + 产出闭环） ==========
-console.log('\n[i9-batch-4] 同族二次触发六件套：闭合门④检出复发（触发）→ 归因六件套齐全 → 通过');
-t('[i9-batch-4a] 触发：闭合门④必须拒（同 [i9-batch-2]，触发点即此交集）', () => {
+// ========== [i9-batch-4] 跨批复发 → recurrence 段（触发条件④命中的补充载体） ==========
+console.log('\n[i9-batch-4] 跨批复发申报 recurrence 段：齐全通过 / 残缺被拒（字段+enum+locator+自洽）');
+// 场景：本批 frozen 含 FK1（上批处置过、又冒出来），本批修完终版无 FK1（这次修住了）→ 判据④通过；
+// lead 申报 recurrence 段（触发条件④命中）→ 闭合门验形状与自洽（T1）。
+t('[i9-batch-4a] 本批内同族复发（判据④：frozen family 在终版再次出现 = 没修住）→ 拒收口（与跨批触发区分）', () => {
   const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termRecur, scManifest });
-  ok(errs.some((e) => /同族复发/.test(e)), '触发点必须是闭合门④的同族复发判定: ' + JSON.stringify(errs));
+  ok(errs.some((e) => /同族复发/.test(e)), '判据④必须拒「本批没修住」: ' + JSON.stringify(errs));
 });
-t('[i9-batch-4b] 兑现：lead 产出归因六件套（六项全非空 + 归属正确）→ convergence-attribution-gate 通过', () => {
-  const attribution = {
-    family_key: FK1, batch_id: 'b1',
-    items: {
-      prev_fix: '上次修的是给 fix1 加取消保护（SC-1）',
-      why_recurred: '取消路径修了，但迟到事件在 cancel 后仍走旧回调入口',
-      why_sc_missed: 'SC-1 的 holds 只覆盖了同步取消路径，没写迟到事件的断言',
-      fix_or_family_misclassified: '族归得对（同一不变量），是修错了（只修了一半）',
-      root_or_symptom: '这次改的是症状（补入口判空），根因是状态机没有终态守卫',
-      root_cause_and_issue: '根因在状态机终态守卫缺失，已开 issue #9999 跟踪'
-    }
-  };
-  const errs = checkAttribution({ attribution, runManifest: recurRunManifest, familyKey: FK1 });
-  eq(errs, [], '六项齐全的归因六件套应通过: ' + JSON.stringify(errs));
+const goodRecurrence = {
+  family_key: FK1, prior_batch_id: 'b0', prior_candidate_sha: L2,
+  prior_sc_id: 'SC-1',
+  prior_sc_missed_because: 'SC-1 的 holds 只覆盖同步取消路径，没写迟到事件的断言',
+  verdict: 'fix_was_wrong'
+  // root_cause_locator: verdict ≠ symptom，不带
+};
+t('[i9-batch-4b] recurrence 齐全（跨批复发申报）→ 闭合门通过', () => {
+  const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termEmpty, scManifest, checkpoint: { recurrence: goodRecurrence } });
+  eq(errs, [], '齐全 recurrence 应通过: ' + JSON.stringify(errs));
+});
+t('[i9-batch-4c] recurrence 缺 prior_sc_missed_because → 拒', () => {
+  const bad = { ...goodRecurrence, prior_sc_missed_because: '' };
+  const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termEmpty, scManifest, checkpoint: { recurrence: bad } });
+  ok(errs.some((e) => /prior_sc_missed_because 缺失或为空/.test(e)), '必须点名缺 prior_sc_missed_because: ' + JSON.stringify(errs));
+});
+t('[i9-batch-4d] recurrence.verdict 非法 enum → 拒', () => {
+  const bad = { ...goodRecurrence, verdict: 'not_a_verdict' };
+  const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termEmpty, scManifest, checkpoint: { recurrence: bad } });
+  ok(errs.some((e) => /recurrence\.verdict 非法/.test(e)), 'verdict enum 必须被拦: ' + JSON.stringify(errs));
+});
+t('[i9-batch-4e] verdict=fix_was_symptom 缺 root_cause_locator → 拒', () => {
+  const bad = { ...goodRecurrence, verdict: 'fix_was_symptom', root_cause_locator: undefined };
+  const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termEmpty, scManifest, checkpoint: { recurrence: bad } });
+  ok(errs.some((e) => /fix_was_symptom 必须携带 root_cause_locator/.test(e)), 'symptom 缺 locator 必须被拦: ' + JSON.stringify(errs));
+});
+t('[i9-batch-4f] recurrence.family_key 不在本批 frozen → 拒（自洽）', () => {
+  const bad = { ...goodRecurrence, family_key: FK3 };
+  const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termEmpty, scManifest, checkpoint: { recurrence: bad } });
+  ok(errs.some((e) => /不在本批 frozen_families 中/.test(e)), 'family_key 自洽必须被拦: ' + JSON.stringify(errs));
+});
+t('[i9-batch-4g] recurrence.prior_sc_id 不在 sc manifest → 拒（自洽）', () => {
+  const bad = { ...goodRecurrence, prior_sc_id: 'SC-NOPE' };
+  const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termEmpty, scManifest, checkpoint: { recurrence: bad } });
+  ok(errs.some((e) => /不在 sc manifest 中/.test(e)), 'prior_sc_id 自洽必须被拦: ' + JSON.stringify(errs));
 });
 
-// ========== [i9-batch-5] 六件套缺项被拒 ==========
-console.log('\n[i9-batch-5] 六件套缺项：任一项缺失 → convergence-attribution-gate 拒');
-t('[i9-batch-5] 缺 ⑥ root_cause_and_issue → 拒（消息点名缺项标签）', () => {
-  const incomplete = {
-    family_key: FK1, batch_id: 'b1',
-    items: {
-      prev_fix: '上次修的是给 fix1 加取消保护',
-      why_recurred: '迟到事件仍走旧入口',
-      why_sc_missed: 'SC-1 没写迟到断言',
-      fix_or_family_misclassified: '修错了',
-      root_or_symptom: '症状',
-      // root_cause_and_issue 缺失
-    }
+// ========== [i9-batch-10] 缺 invariant 无法归族（判据⑥：blocker/major 必须带 family_key） ==========
+console.log('\n[i9-batch-10] 缺 invariant 无法归族：blocker/major 无 family_key → 闭合门⑥拒');
+// verdict 层已强制 actionable 带 invariant（verdict-validate SC-B1），但 consensus-gate 的
+// family_key 注入是条件式——artifact 层独立检查防「verdict 校验被绕过/版本漂移」后缺口复活
+// （T1 防漂移纵深）。此处手工构造缺族 artifact（合法结构 + hash 自洽），测闭合门判据⑥本身。
+function mkNoFamilyArtifact(baseSha, candidateSha, over = {}) {
+  const draft = {
+    schema_version: 'v3', review_input_hash: computeReviewInputHash(mkBundle(baseSha, candidateSha)),
+    parent_artifact_hash: null, round: 1, base_sha: baseSha, candidate_sha: candidateSha,
+    canonical_findings: [{
+      canonical_key: 'A|src/fix1.ts|x', id: 'hand1',
+      origins: [{ reviewer: 'claude-adversarial', finding_id: 'f1' }],
+      primary_face: 'A', severity: 'blocker', anchor: 'src/fix1.ts:1', anchor_paths: ['src/fix1.ts'],
+      status: 'closed', origin_family_ids: []
+      // 无 invariant → 无 family_key（缺归族）
+    }],
+    verdict_hashes: { 'claude-adversarial': 'x'.repeat(64), 'codex-adversarial': 'x'.repeat(64), 'upstream-preview': 'x'.repeat(64) },
+    created_at: 't', gate_result: 'pass', fail_reasons: [], ...over
   };
-  const errs = checkAttribution({ attribution: incomplete, runManifest: recurRunManifest, familyKey: FK1 });
-  ok(errs.some((e) => /⑥若仍是症状，明确指出根因在哪并开 issue/.test(e)),
-    '必须点名缺失的 ⑥ 项: ' + JSON.stringify(errs));
+  return { ...draft, consensus_artifact_hash: recomputeArtifactHash(draft) };
+}
+const srcNoFam = mkNoFamilyArtifact(L0, L1); // 源共识：blocker 无 family_key
+const finNoFam = mkNoFamilyArtifact(L0, L2); // 终版：blocker 无 family_key
+t('[i9-batch-10a] 源共识 blocker 缺 invariant（无 family_key）→ 拒（先归因再进批次）', () => {
+  const errs = checkBatchClosure({ runManifest: okRunManifest, sourceArtifact: srcNoFam, finalArtifact: termEmpty, scManifest });
+  ok(errs.some((e) => /缺 invariant 无法归族/.test(e)), '源共识缺族必须被拦: ' + JSON.stringify(errs));
 });
-t('[i9-batch-5b] family_key 归属错（不是触发复发的族）→ 拒', () => {
-  const wrongFamily = {
-    family_key: FK2, batch_id: 'b1',
-    items: {
-      prev_fix: 'x', why_recurred: 'x', why_sc_missed: 'x',
-      fix_or_family_misclassified: 'x', root_or_symptom: 'x', root_cause_and_issue: 'x'
-    }
-  };
-  const errs = checkAttribution({ attribution: wrongFamily, runManifest: recurRunManifest, familyKey: FK1 });
-  ok(errs.some((e) => /六件套必须针对复发的那一族/.test(e)),
-    'family_key 错配必须被拦: ' + JSON.stringify(errs));
+t('[i9-batch-10b] 终版共识 blocker 缺 invariant → 拒（下一批无法冻结它）', () => {
+  const errs = checkBatchClosure({ runManifest: okRunManifest, sourceArtifact: srcArtifact, finalArtifact: finNoFam, scManifest });
+  ok(errs.some((e) => /缺 invariant 无法归族/.test(e)), '终版缺族必须被拦: ' + JSON.stringify(errs));
 });
 
 // ========== [i9-batch-7] 批次未收口（status=open）被拒 ==========

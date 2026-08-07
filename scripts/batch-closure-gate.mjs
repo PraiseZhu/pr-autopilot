@@ -13,10 +13,17 @@
 //     （冻结集只能来自源共识——initRun 已验，此处独立重验，防 init 后篡改）
 //   ④ batch.frozen_families ∩ 终版共识 canonical_findings 的 family_key 集必须为空
 //     （处置语义：冻结集内的 family 在本批 delta 审查中**不再出现** = 上次修住 = 处置完成；
-//      再次出现 = 同族复发 = 上次没修住 = 未处置 → 拒收口，并按 Task 4 触发归因六件套——
-//      机器检测点即此交集，语义对齐「同一个 family_key 二次出现」）
+//      再次出现 = 同族复发 = 上次没修住 = 未处置 → 拒收口。注意与触发条件④（convergence-
+//      checkpoint.md）的区分：判据④是本批内「没修住」的拒收口；触发条件④是「上一批处置过、
+//      又进本批 frozen」的跨批复发，命中时 lead 须在 checkpoint.json 里带 recurrence 段）
 //   ⑤ 本批 SC（非 global）携带的 family_key 必须 ∈ batch.frozen_families
 //     （本批 SC 只处置冻结集内的族；处置冻结集之外的 family = 把下一批的义务混进本批 → 拒）
+//   ⑥ 源共识与终版共识的 blocker/major canonical finding 必须全部带 family_key
+//     （lead 裁决：批次只冻结有 family_key 的 finding；没有 invariant 的 blocker/major 无法
+//      归族 = 无法进 frozen_families = 「没归因就打补丁」本身——先归因再进批次，拒收口）
+//   ⑦ recurrence 段校验（可选 checkpoint 参数；lead 申报跨批复发时必带）：
+//      字段齐全 + verdict enum 合法 + symptom 时 root_cause_locator 非空（形如 路径:行号）
+//      + family_key ∈ 本批 frozen_families + prior_sc_id ∈ sc manifest
 // 保证等级 T1（如实声明）：
 //   · family_key 是逐字内容派生（consensus-gate.mjs 的 familyKeyOf，归一化仅 trim/小写/去空白）——
 //     「同一根因换个说法」会算出不同 key，机器视为新族（进下一批，不触发本门）；语义级同族
@@ -24,11 +31,15 @@
 //     （同本仓其余 T1 条款：本地可构造满足全部条件的 run manifest 同样能通过，无签名/存证）。
 //   · suggestion 级 canonical finding 不带 family_key（共识 schema 不强制），其 SC 无 family_key
 //     可判定归属 → 放行（不在冻结集模型内）；机器能锁住的 actionable 混入全部锁住。
+//   · recurrence 段：机器只验形状与自洽；「这次是不是真的同族复发」的判断权在 lead（机器无
+//     跨批次账本，无法独立判定），prior_sc_missed_because 填一句废话也能过（防疏忽不防伪造）。
 import { readJson, parseArgs, fail, isMain } from './lib/common.mjs';
 import { recomputeArtifactHash, assertArtifactShape } from './consensus-gate.mjs';
 import { runManifestHash, verifyEventChain } from './fix-run.mjs';
 
-export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, scManifest }) {
+const RECURRENCE_VERDICTS = ['fix_was_wrong', 'family_was_misgrouped', 'fix_was_symptom'];
+
+export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, scManifest, checkpoint = null }) {
   const errs = [];
   const need = (c, m) => { if (!c) errs.push(m); };
 
@@ -101,19 +112,66 @@ export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, 
     // 不在冻结集模型内，放行（T1 上限如实声明见文件头）。
   }
 
+  // ⑥ 缺 invariant 无法归族强制（lead 裁决）：blocker/major 必须全部带 family_key——
+  // 批次只冻结有 family_key 的 finding；没有 invariant 的 actionable 无法进 frozen_families，
+  // 恰恰是「没归因就打补丁」本身（convergence-checkpoint.md D5: 先归因到不变量再修全部路径）。
+  const actionables = (artifact) => (artifact.canonical_findings ?? []).filter((c) => c.severity === 'blocker' || c.severity === 'major');
+  for (const [label, artifact] of [['源共识', sourceArtifact], ['终版共识', finalArtifact]]) {
+    for (const c of actionables(artifact)) {
+      if (typeof c.family_key !== 'string' || !c.family_key) {
+        errs.push(`${label} canonical finding ${c.id}（${c.severity}/${c.primary_face}）缺 invariant 无法归族（无 family_key）——先归因到不变量再进批次，拒收口（i9-batch）`);
+      }
+    }
+  }
+
+  // ⑦ recurrence 段校验（触发条件④命中时 lead 在 checkpoint.json 申报；机器验形状与自洽）
+  const rec = checkpoint?.recurrence ?? null;
+  if (rec !== null) {
+    if (!rec || typeof rec !== 'object') {
+      errs.push('checkpoint.recurrence 不是对象');
+    } else {
+      need(/^fk1-[0-9a-f]{64}$/.test(String(rec.family_key ?? '')),
+        `recurrence.family_key 非法: ${JSON.stringify(rec.family_key)}（必须是 fk1- 派生的 64-hex key）`);
+      need(/^[A-Za-z0-9._-]+$/.test(String(rec.prior_batch_id ?? '')),
+        `recurrence.prior_batch_id 非法: ${JSON.stringify(rec.prior_batch_id)}`);
+      need(/^[0-9a-f]{40}$/.test(String(rec.prior_candidate_sha ?? '')),
+        `recurrence.prior_candidate_sha 非法: ${JSON.stringify(rec.prior_candidate_sha)}（必须是 40-hex commit SHA）`);
+      need(/^SC-[A-Za-z0-9._-]+$/.test(String(rec.prior_sc_id ?? '')),
+        `recurrence.prior_sc_id 非法: ${JSON.stringify(rec.prior_sc_id)}（须 ^SC-[A-Za-z0-9._-]+$）`);
+      need(typeof rec.prior_sc_missed_because === 'string' && rec.prior_sc_missed_because.trim().length > 0,
+        'recurrence.prior_sc_missed_because 缺失或为空（自由文本，T1 只验非空）');
+      need(RECURRENCE_VERDICTS.includes(rec.verdict),
+        `recurrence.verdict 非法: ${JSON.stringify(rec.verdict)}（必须 ∈ ${RECURRENCE_VERDICTS.join('/')}）`);
+      if (rec.verdict === 'fix_was_symptom') {
+        need(typeof rec.root_cause_locator === 'string' && /^[^:\s]+:\d+$/.test(rec.root_cause_locator.trim()),
+          `recurrence.verdict=fix_was_symptom 必须携带 root_cause_locator（形如 路径:行号）: ${JSON.stringify(rec.root_cause_locator)}`);
+      } else {
+        need(rec.root_cause_locator === undefined || rec.root_cause_locator === null,
+          'recurrence.verdict ≠ fix_was_symptom 时不得携带 root_cause_locator');
+      }
+      // 自洽：复发的族必须确实是本批要处置的族；上次的 SC 必须确实存在于 sc manifest
+      need(frozenSet.has(rec.family_key),
+        `recurrence.family_key（${String(rec.family_key).slice(0, 12)}…）不在本批 frozen_families 中——复发归因必须针对本批要处置的族（i9-batch）`);
+      const scIds = new Set(scs.map((s) => s.id));
+      need(scIds.has(rec.prior_sc_id),
+        `recurrence.prior_sc_id（${rec.prior_sc_id}）不在 sc manifest 中——上次声称拦住它的 SC 必须真实存在（i9-batch）`);
+    }
+  }
+
   return errs;
 }
 
 if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
   if (!args['run-manifest'] || !args['source-artifact'] || !args['final-artifact'] || !args['sc-manifest']) {
-    fail('用法: batch-closure-gate.mjs --run-manifest <run.json> --source-artifact <consensus.json> --final-artifact <consensus.json> --sc-manifest <sc-manifest.json>');
+    fail('用法: batch-closure-gate.mjs --run-manifest <run.json> --source-artifact <consensus.json> --final-artifact <consensus.json> --sc-manifest <sc-manifest.json> [--checkpoint <checkpoint.json>]');
   }
   const errs = checkBatchClosure({
     runManifest: readJson(args['run-manifest']),
     sourceArtifact: readJson(args['source-artifact']),
     finalArtifact: readJson(args['final-artifact']),
-    scManifest: readJson(args['sc-manifest'])
+    scManifest: readJson(args['sc-manifest']),
+    checkpoint: args.checkpoint ? readJson(args.checkpoint) : null
   });
   if (errs.length) {
     for (const e of errs) process.stderr.write(`[BATCH-CLOSURE-FAIL] ${e}\n`);
