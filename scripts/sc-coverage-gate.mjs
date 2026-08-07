@@ -24,6 +24,9 @@ export function checkScCoverage({ manifest, artifact }) {
   need(artifact.consensus_artifact_hash === real, 'artifact 自身 hash 与内容重算不符（artifact 被改）');
   need(manifest.consensus_artifact_hash === real,
     `sc manifest 的 consensus_artifact_hash 与 artifact 重算值不符（manifest=${String(manifest.consensus_artifact_hash).slice(0, 12)} 实=${real.slice(0, 12)}）——SC 未绑定到本次共识`);
+  // issue #9 SC-A2: 源 artifact 必须是 PASS 共识——本门此前全程不验 gate_result，
+  // 一份 hash 自洽但 gate_result=fail 的 artifact 能原样当源共识提炼 SC。
+  need(artifact.gate_result === 'pass', `consensus artifact gate_result=${artifact.gate_result} ≠ pass（issue #9 SC-A: SC 覆盖门只接受 PASS 共识）`);
 
   const canonical = artifact.canonical_findings ?? [];
   const canonicalIds = new Set(canonical.map((f) => f.id));
