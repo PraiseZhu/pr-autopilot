@@ -315,6 +315,17 @@ t('[SC-R2-1-c] push-guard.checkPushGuard 的 fix_orchestration.sourceArtifact �
   const r = callPushGuardWithSource(r2SchemaForged);
   ok(r.errors.some((e) => /schema_version/.test(e) && /v3/.test(e)), '必须点名 schema_version: ' + JSON.stringify(r.errors));
 });
+// 额外一处（不在 blocker 原文三入口之列，防御性加固）: push-guard 顶层 artifact 字段
+// （purpose=feature，无 fix_orchestration 时的直通路径）同样必须过结构门。
+t('[SC-R2-1-d(bonus)] push-guard.checkPushGuard 顶层 artifact 字段（purpose=feature 直通路径）拒 schema_version≠v3', () => {
+  const forgedTerminal = forgeArtifact(pgTerminal, (a) => { a.schema_version = 'v1'; return a; });
+  const r = checkPushGuard({
+    repoDir: pgRepo,
+    manifest: { ...pgManifestBase, consensus_artifact_hash: forgedTerminal.consensus_artifact_hash },
+    artifact: forgedTerminal, bundle: pgBundle, constitution
+  });
+  ok(r.errors.some((e) => /schema_version/.test(e) && /v3/.test(e)), '必须点名 schema_version: ' + JSON.stringify(r.errors));
+});
 
 // ---- SC-R2-2: 删除 round ----
 const r2RoundDeleted = { ...r2Pass };
@@ -338,6 +349,16 @@ t('[SC-R2-2-b] fix-run.initRun throw 拒删除 round 的源 artifact', () => {
 });
 t('[SC-R2-2-c] push-guard.checkPushGuard 的 fix_orchestration.sourceArtifact 拒删除 round 的源 artifact', () => {
   const r = callPushGuardWithSource(r2RoundDeleted);
+  ok(r.errors.some((e) => /round/.test(e)), '必须点名 round: ' + JSON.stringify(r.errors));
+});
+t('[SC-R2-2-d(bonus)] push-guard.checkPushGuard 顶层 artifact 字段（purpose=feature 直通路径）拒删除 round', () => {
+  const forgedTerminal = { ...pgTerminal };
+  delete forgedTerminal.round;
+  const r = checkPushGuard({
+    repoDir: pgRepo,
+    manifest: { ...pgManifestBase },
+    artifact: forgedTerminal, bundle: pgBundle, constitution
+  });
   ok(r.errors.some((e) => /round/.test(e)), '必须点名 round: ' + JSON.stringify(r.errors));
 });
 
