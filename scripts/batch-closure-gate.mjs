@@ -84,10 +84,20 @@ export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, 
   const frozen = batch.frozen_families ?? [];
   need(Array.isArray(frozen) && frozen.length > 0, 'batch.frozen_families 缺失或为空（冻结集为空 = 没有待处置义务，语义不成立）');
 
-  // ③ 冻结集真实（⊆ 源共识 family_keys）
+  // ③ 冻结集真实且**精确全覆盖**（SC-T8，2026-08-08）：此前只验 ⊆（冻结集只能来自源共识），
+  // lead 少冻结（部分问题族漏冻结）时闭合门静默放行——batch 义务漏保护。精确相等 = 不多不少：
+  // 缺族（少冻结）与外族（多冻结）两个方向都拒、消息互斥（支持反向变异隔离）；恰好全覆盖
+  // 继续走判据④⑤⑥⑦与 push-guard 的 closure/lineage 门。frozen 非数组时按空集处理（need
+  // 已报「缺失或为空」，后续集合运算不 throw——畸形输入优雅 fail-closed 而非崩溃）。
   const srcKeys = new Set((sourceArtifact.canonical_findings ?? []).map((c) => c.family_key).filter(Boolean));
-  for (const fk of frozen) {
-    if (!srcKeys.has(fk)) errs.push(`batch.frozen_families 含不在源共识中的 family_key: ${fk.slice(0, 12)}…（冻结集只能从源共识派生，fail-closed）`);
+  const frozenKeys = new Set((Array.isArray(frozen) ? frozen : []).map((fk) => String(fk)));
+  const missing = [...srcKeys].filter((k) => !frozenKeys.has(k));
+  const extra = [...frozenKeys].filter((k) => !srcKeys.has(k));
+  for (const fk of missing) {
+    errs.push(`batch.frozen_families 缺源共识族: ${String(fk).slice(0, 12)}…（少冻结 = 部分问题族未冻结；冻结族必须与源 artifact 全部唯一 family_key 精确相等，SC-T8）`);
+  }
+  for (const fk of extra) {
+    errs.push(`batch.frozen_families 含不在源共识中的 family_key: ${String(fk).slice(0, 12)}…（冻结集只能从源共识派生，fail-closed）`);
   }
 
   // ④ 全处置（冻结集 ∩ 终版 family_keys 必须为空——终版再次出现 = 同族复发 = 未处置）
