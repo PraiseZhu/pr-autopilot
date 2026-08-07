@@ -260,6 +260,22 @@ t('[SC-B4] attempt 不一致 → fail；一致 → 不因此失败', () => {
   eq(goodArt.gate_result, 'pass', 'SC-B4 正例应整体 PASS: ' + JSON.stringify(goodArt.fail_reasons ?? []));
 });
 
+// ========== SC-B5: 废弃参数名 opts.parentArtifactHash 必须 throw，不得静默降级 ==========
+console.log('\n[SC-B5] opts.parentArtifactHash 已废弃 → 必须 throw（round=1/round>=2 两种形状都不得静默降级）');
+t('[SC-B5] 误传旧参数名 parentArtifactHash → throw；round=1 不得静默降级为「无谱系的根」PASS，round>=2 不得退化成方向错误的「缺 parent」fail', () => {
+  let threwR1 = null;
+  try { consensusFor(mkBundle(SHA_A, SHA_B), [{}, {}, {}], { parentArtifactHash: 'f'.repeat(64) }); }
+  catch (e) { threwR1 = e; }
+  ok(threwR1 && /parentArtifactHash 已废弃/.test(threwR1.message),
+    'round=1 传废弃参数必须 throw 且消息点名废弃参数: ' + (threwR1 ? threwR1.message : '(未抛错，疑似静默降级为 PASS)'));
+
+  let threwR2 = null;
+  try { consensusFor(mkBundle(SHA_A, SHA_B), [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifactHash: 'f'.repeat(64) }); }
+  catch (e) { threwR2 = e; }
+  ok(threwR2 && /parentArtifactHash 已废弃/.test(threwR2.message),
+    'round>=2 传废弃参数必须同样 throw（不是退化成「未绑定上一轮 artifact」）: ' + (threwR2 ? threwR2.message : '(未抛错)'));
+});
+
 console.log(`\n========== i9-core fixtures: ${pass} passed, ${failCount} failed ==========`);
 if (failCount > 0) {
   console.log('\nFAILED:');

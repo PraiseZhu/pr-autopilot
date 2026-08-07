@@ -53,6 +53,20 @@ export function canonicalFindingKey(finding) {
 }
 
 export function runConsensusGate(verdicts, opts = {}) {
+  // issue #9 SC-B5: opts.parentArtifactHash 是已废弃参数，不再被任何代码读取。调用方若仍
+  // 传它（哪怕值是 undefined——用 hasOwnProperty 而非真值判断，防漏报），说明调用方代码
+  // 没跟上新契约，这是**编程错误**，不是 verdict 数据不合规——不得混进 failReasons（那会让
+  // 调用方误以为是 verdict 有问题去排错，而迁移期恰恰需要它响得刺耳），必须直接 throw。
+  // 根因（sc-final.md 审查发现）: 若只静默忽略废弃键，round=1 却想绑定 parent 的调用会被
+  // 误判成「无谱系的根」而 PASS——round=1 分支只看 `parentArtifact` 是否为真，不认识旧键。
+  if (Object.prototype.hasOwnProperty.call(opts, 'parentArtifactHash')) {
+    throw new Error(
+      'runConsensusGate: opts.parentArtifactHash 已废弃且不再被识别（issue #9 SC-B）——' +
+      '请改传 opts.parentArtifact，值必须是完整的 parent consensus artifact 对象本身' +
+      '（不是 consensus_artifact_hash 的 hash 字符串）。静默忽略旧键会让「round=1 却带 ' +
+      'parent」这类应被拒的输入错误地被当作「无谱系的根」放行（SC-B5）。'
+    );
+  }
   const bundle = opts.bundle ?? null;
   // issue #9 SC-B: parent 绑定改为读取**完整 parent artifact 对象**（opts.parentArtifact），
   // 不再接受 opaque 的 parentArtifactHash 字符串——校验逻辑见下方 round/parent 处理块。
@@ -286,7 +300,15 @@ if (isMain(import.meta.url)) {
   // issue #9 SC-B: 读**完整** parent 文件，不再只取 consensus_artifact_hash 字符串——
   // gate_result/round/自身 hash 自洽全部要在 runConsensusGate 内部校验，opaque 字符串绑定不再可信。
   const parentArtifact = args.parent ? readJson(args.parent) : null;
-  const result = runConsensusGate(verdicts, { bundle: readJson(args.bundle), parentArtifact, repoDir: args['repo-dir'] });
+  // issue #9 SC-B5: runConsensusGate 现在对「废弃参数名」这类编程错误会 throw（不再是
+  // fail_reasons 里的一条数据错误）——CLI 侧兜住，输出干净的单行消息，不让用户看到裸
+  // stack trace（本 CLI 自身从不传 parentArtifactHash，这里防的是未来误用/其他调用路径）。
+  let result;
+  try {
+    result = runConsensusGate(verdicts, { bundle: readJson(args.bundle), parentArtifact, repoDir: args['repo-dir'] });
+  } catch (e) {
+    fail(e.message);
+  }
   if (result.gate_result === 'pass') {
     if (args.out) writeJsonAtomic(args.out, result);
     process.stdout.write(`PASS consensus_artifact_hash=${result.consensus_artifact_hash}\n`);
