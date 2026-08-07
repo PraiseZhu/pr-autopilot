@@ -691,7 +691,7 @@ t('[i9-batch-6a] L1..L3 两个 commit（多 commit 分步修复）→ 批次校�
   const r = pgCallWith(twoStepRunManifest, L3, termTwoStep);
   ok(!r.errors.some((e) => /批次|严格后代|零推进/i.test(e)), '多 commit 不应报任何批次错误: ' + JSON.stringify(r.errors));
 });
-t('[i9-batch-6c] 兄弟提交（共同 base B、source S=B+X、兄弟 T=B+Y）→ 严格后代拒（rev-list 非空 ≠ 祖先，集合一致性双向通过也拦不住）', () => {
+t('[i9-batch-6c] 兄弟提交（共同 base B、source S=B+X、兄弟 T=B+Y）→ 严格后代拒（rev-list 非空 ≠ 祖先，集合一致性双向通过也拦不住）', async () => {
   // 审查席构造的失效路径：共同 base B、source S=B+X、兄弟 T=B+Y——rev-list S..T 返回 {Y} 非空、
   // Y 已登记时集合一致检查双向通过，但 S 不是 T 的祖先。构造：T 从 L1 分叉（sibling 分支）加 Y，
   // 伪造自洽终版 artifact（candidate=T、parent=srcArtifact hash）+ run manifest（source=L1、
@@ -730,6 +730,48 @@ t('[i9-batch-6c] 兄弟提交（共同 base B、source S=B+X、兄弟 T=B+Y）�
     '兄弟提交必须被严格后代检查拒（rev-list S..T 非空 ≠ 祖先，集合一致性拦不住）: ' + JSON.stringify(r.errors));
   execFileSync('git', ['-C', repo, 'checkout', '-q', 'feat']); // 切回 feat（后续测试依赖 L3 为 HEAD）
   execFileSync('git', ['-C', repo, 'reset', '--hard', '-q', L3]); // 保险：确保 HEAD=L3（防 sibling 分支 checkout 污染）
+  // 常驻反向变异（审查席验证覆盖空白，2026-08-07）：把 push-guard 的 :411 isAncestorCommit 调用
+  // 挖掉后，同一兄弟提交场景必须**放行**——证明 6c 是有效检测器（该检查一旦消失，兄弟提交就
+  // 通过）。临时副本在 scripts/ 下（保留相对 import），用完 finally 清理；push-guard.mjs 本体不动。
+  {
+    const { readFileSync: rf, writeFileSync: wf, rmSync: rm } = await import('node:fs');
+    const pgSrc = rf(join(S, 'push-guard.mjs'), 'utf8');
+    const ancestryCall = 'isStrict = isAncestorCommit({ repoDir, ancestorSha: runManifest.source_candidate, descendantSha: finalTip });';
+    ok(pgSrc.includes(ancestryCall), '前置: push-guard 源码须含 isAncestorCommit 调用（探针按此定位变异点）');
+    // 挖空 = 让 isStrict 恒 true（「是祖先」→ 不报错 → 放行）——证明检查一旦消失兄弟提交即通过。
+    // 若恒 false 则检查恒报「不是祖先」= 还在拦，测不到「消失后放行」。
+    const patched = pgSrc.replace(ancestryCall, 'isStrict = true; // MUTATION: ancestry 检查挖空（常驻反向变异，证明 6c 有效）');
+    const uid = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const pgCopy = join(S, `.i9-batch-pg-copy-${uid}.mjs`);
+    wf(pgCopy, patched);
+    try {
+      const copy = await import('file://' + pgCopy + '?t=' + Date.now());
+      const foNoAnc = {
+        source_artifact_hash: recomputeArtifactHash(srcArtifact),
+        sc_manifest_hash: hashObject(scManifest),
+        fix_plan_hash: plan.fix_plan_hash,
+        dispatch_record_hash: hashObject(dispatchRecord),
+        run_manifest_hash: runManifestHash(siblingRunManifest)
+      };
+      execFileSync('git', ['-C', repo, 'checkout', '-q', branchName]); // 切到 sibling 分支（HEAD=T，SHA 绑定要求 HEAD == expected_sha）
+      let rNoAnc;
+      try {
+        rNoAnc = copy.checkPushGuard({
+          repoDir: repo,
+          manifest: { repo: 'o/r', remote: 'origin', branch: branchName, expected_sha: T, purpose: 'feature', consensus_artifact_hash: forgedTerminal.consensus_artifact_hash, fix_orchestration: foNoAnc },
+          artifact: forgedTerminal, bundle: mkBundle(L0, T), constitution,
+          sourceArtifact: srcArtifact, scManifest, fixPlan: plan, dispatchRecord, runManifest: siblingRunManifest
+        });
+      } finally {
+        execFileSync('git', ['-C', repo, 'checkout', '-q', 'feat']); // 切回 feat（后续测试依赖）
+        execFileSync('git', ['-C', repo, 'reset', '--hard', '-q', L3]);
+      }
+      ok(rNoAnc.errors.length === 0,
+        '常驻反向变异: isAncestorCommit 被挖空后兄弟提交必须放行（证明 [i9-batch-6c] 是有效检测器——该检查一旦消失，兄弟提交即通过）: ' + JSON.stringify(rNoAnc.errors));
+    } finally {
+      rm(pgCopy, { force: true });
+    }
+  }
   // 反向变异已由实现侧覆盖（push-guard 的 is-ancestor 检查），此处钉正向拒绝。
 });
 t('[i9-batch-6d] pr_number 绑定：bundle.pr_number ≠ artifact.pr_number → 拒（同 candidate 自洽拼接被拦）', () => {
