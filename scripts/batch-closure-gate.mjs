@@ -113,8 +113,9 @@ export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, 
   // 收紧为：① 该 archive SC 的 finding_ids 必须指向本族（每个 id 引用一条 canonical finding，
   //    且该 finding 的 family_key 必须等于该 SC 的 family_key——防「随便填个 family_key 的
   //    archive SC 冒充出口」）；② 该 archive SC 必须真实出现在某个 wave 的 allocations 里
-  //    且该 wave 的 validation.ok === true（补上委派链断点：verify 由 fix-run wave validation
-  //    层保证，闭合门要求该 wave 真实执行过且通过——「有 archive SC」≠「执行过」）。
+  //    且该 wave 的 validation.results 中有 sc_id === 该 SC 且 status === 'PASS' 的逐项证据
+  //    （补上委派链断点：「有 archive SC」≠「执行过」；不再看 validation.ok——见下方
+  //    :137-140 的变更理由）。
   // 注意：canonical finding 的 family_key 从 invariant 派生（consensus-gate 的 familyKeyOf），
   // SC manifest 里的 family_key 是引用同一派生的字符串，可直接比对。finding_ids 引用的
   // canonical 可能是源共识的（archive SC 处置源共识发现的 finding，scManifest 的 finding_ids
