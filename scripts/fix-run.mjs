@@ -713,6 +713,12 @@ export function recordedSquashes(m) {
 // 照 gate_result 入 recomputeArtifactHash 的同一做法：末尾追加 canonicalJson，不重排既有字段；
 // v tag 升 'fix-run/v3'，旧 manifest（v2）重算 hash 不再等于声明值，push-guard 的
 // fix_orchestration.run_manifest_hash 比对即 fail-closed。
+// **注意（2026-08-07，lead 补充派工）**：`v:` 是**常量 tag**（`fix-run/${RUN_MANIFEST_SCHEMA_VERSION}`），
+// **不绑定 manifest 自身的 `schema_version` 字段**——`m.schema_version` 从不入 hash，任何 run
+// manifest 用当前代码重算 `runManifestHash` 都必然自洽，该字段写 v2/写错/缺失都一样过。所以
+// **版本一致性由 push-guard 的显式比较负责**（`runManifest.schema_version === RUN_MANIFEST_SCHEMA_VERSION`），
+// 不要以为 hash 覆盖了它。刻意不加进 hash：改 hash 公式 = 迁移事件（在途 run 全部失效且失败
+// 信息是「hash 不符」不可诊断），显式比较给出「期望 v3、实到 v2」可诊断。
 export function runManifestHash(m) {
   return sha256(canonicalJson({
     v: `fix-run/${RUN_MANIFEST_SCHEMA_VERSION}`, run_id: m.run_id, fix_plan_hash: m.fix_plan_hash,

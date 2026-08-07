@@ -774,6 +774,25 @@ t('[i9-batch-6e] run manifest 版本比较：schema_version 不符 → 拒（旧
   });
   ok(r.errors.some((e) => /schema_version/.test(e) && /run manifest/.test(e)),
     '旧 v2 run manifest 必须被版本比较拒（hash 自洽挡不住）: ' + JSON.stringify(r.errors));
+  // 2026-08-07（lead 补充派工）：缺该字段同样必须拒——`v:` 是常量 tag 不绑 m.schema_version，
+  // 缺字段重算 hash 仍自洽，只有显式比较能拦。构造缺 schema_version 的 run manifest（无 batch）。
+  const missingVer = { ...twoStepRunManifest, batch: undefined };
+  delete missingVer.schema_version;
+  const foMissing = {
+    source_artifact_hash: recomputeArtifactHash(srcArtifact),
+    sc_manifest_hash: hashObject(scManifest),
+    fix_plan_hash: plan.fix_plan_hash,
+    dispatch_record_hash: hashObject(dispatchRecord),
+    run_manifest_hash: runManifestHash(missingVer)
+  };
+  const rMissing = checkPushGuard({
+    repoDir: repo,
+    manifest: { repo: 'o/r', remote: 'origin', branch: 'feat', expected_sha: L3, purpose: 'feature', consensus_artifact_hash: termTwoStep.consensus_artifact_hash, fix_orchestration: foMissing },
+    artifact: termTwoStep, bundle: mkBundle(L0, L3), constitution,
+    sourceArtifact: srcArtifact, scManifest, fixPlan: plan, dispatchRecord, runManifest: missingVer
+  });
+  ok(rMissing.errors.some((e) => /schema_version/.test(e) && /run manifest/.test(e)),
+    '缺 schema_version 字段的 run manifest 必须被版本比较拒（hash 自洽挡不住）: ' + JSON.stringify(rMissing.errors));
 });
 
 // ===== 版本字面量自检（2026-08-07）=====
