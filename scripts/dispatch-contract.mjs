@@ -22,7 +22,7 @@
 //   疏忽；它**不**保证审查席真的按契约填报（那由 verdict-validate 在收卷时拦），也**不**防
 //   恶意伪造派工包文本。如实声明，不冒称。
 
-import { parseArgs, fail, isMain, sha256, canonicalJson } from './lib/common.mjs';
+import { parseArgs, fail, isMain, sha256, canonicalJson, readJson } from './lib/common.mjs';
 import {
   DEFAULT_REQUIREMENTS,
   DEFAULT_ANCHOR_PATHS_MAX,
@@ -32,7 +32,8 @@ import {
   REVIEWERS,
   ADVERSARIAL,
   FACES,
-  OUT_OF_SCOPE_NOTES_FIELD
+  OUT_OF_SCOPE_NOTES_FIELD,
+  deriveKnownFamilies
 } from './verdict-validate.mjs';
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from './lib/hardening-registry.mjs';
 
@@ -61,11 +62,16 @@ export const ANSWERED_WITHDRAW_LITERAL = '「答」disposition 须整条撤出 f
 export const DEFERRED_UNIFIED_LITERAL = '「推」disposition 不分 diff 内外统一进 out_of_scope_notes';
 
 // 契约 spec —— 纯数据，从 validator/registry 常量派生。digest 对它取内容 hash。
-export function contractSpec({ seat, round, requirements } = {}) {
+export function contractSpec({ seat, round, requirements, parentArtifact } = {}) {
   if (!SEATS.includes(seat)) throw new Error(`seat 非法: ${seat}（合法值: ${SEATS.join(' / ')}）`);
   if (!Number.isInteger(round) || round < 1) throw new Error(`round 非法: ${round}（必须是 >=1 的整数）`);
   const req = { ...DEFAULT_REQUIREMENTS, ...(requirements ?? {}) };
   const isAdversarial = ADVERSARIAL.includes(seat);
+  // SC-T7b（SC-2）: known families 权威只来自同一谱系 parentArtifact.canonical_findings
+  // （deriveKnownFamilies，verdict-validate.mjs 唯一实现）——round=1（无 parent）→ null
+  // （空集合语义，reuse 必拒）；round>=2 传 parent 时从 parent 现场派生排序去重。不创建
+  // state-dir 历史注册表（SC-2 明确禁止）——永远现场派生，无持久化、无跨 PR 全局历史（SC-4）。
+  const knownFamilies = parentArtifact ? deriveKnownFamilies(parentArtifact) : null;
   // issue #9: 加固清单穷举适用范围已扩大到「对抗席全 round」（i9-verdict 移除了
   // verdict-validate.mjs 里的 `&& v.round === 1` 限制）——本行必须与之同条件，勿各自判断。
   // 不改会造成 R2+ 派工契约不要求填 hardening_coverage，审查席老实交卷却被 validator 拒收，
@@ -92,7 +98,15 @@ export function contractSpec({ seat, round, requirements } = {}) {
     forbidden_finding_fields: ['write_paths', 'allowed_paths'],
     actionable_required_fields: ['invariant', 'family_id'],
     anchor_paths_max_per_finding: DEFAULT_ANCHOR_PATHS_MAX,
-    out_of_scope_channel: OUT_OF_SCOPE_NOTES_FIELD
+    out_of_scope_channel: OUT_OF_SCOPE_NOTES_FIELD,
+    // SC-T7b（SC-2）: known_families 进 spec → 进 contract_digest——parent 的 family 集合一变，
+    // 旧契约段 digest 立刻失配，被 --check 前置门当场拦下（反漂移牙齿，与其余 spec 字段同一机制）。
+    // known_families_digest 是对家族集合（排序去重后的 {family_key, invariant} 列表）内容 hash，
+    // 供正文校验用；round=1（null）时两者都为 null，契约声明「无 known families，reuse 必拒」。
+    known_families: knownFamilies,
+    known_families_digest: knownFamilies
+      ? sha256(canonicalJson(knownFamilies))
+      : null
   };
 }
 
@@ -102,8 +116,8 @@ export function contractDigest(spec) {
 
 // 必须逐字出现在派工包文本里的字面值。**由 spec 派生，不手写清单**——
 // validator 常量新增一个 gate_id，本函数与 emit 同时自动跟上（fixture [D1-DC] 锁住这条）。
-export function requiredLiterals({ seat, round, requirements } = {}) {
-  const spec = contractSpec({ seat, round, requirements });
+export function requiredLiterals({ seat, round, requirements, parentArtifact } = {}) {
+  const spec = contractSpec({ seat, round, requirements, parentArtifact });
   const lits = [
     spec.seat,
     `schema_version: "${spec.verdict_schema_version}"`,
@@ -130,11 +144,16 @@ export function requiredLiterals({ seat, round, requirements } = {}) {
       `${spec.hardening.na_evidence_min_length} 字符`
     );
   }
+  // SC-T7b: family_claim 契约字面值——kind/target_family_key/reason 三键 + digest 绑定。
+  // known_families_digest 逐字出现 → 契约段携带的家族集合与当前 parent 现场派生结果一致；
+  // parent 一变 → digest 失配 → --check 拦下旧契约段（同 contract_digest 的机制）。
+  lits.push('family_claim', 'kind', 'target_family_key', 'reason', 'fk1-');
+  if (spec.known_families_digest) lits.push(`known_families_digest=${spec.known_families_digest}`);
   return [...new Set(lits)];
 }
 
-export function emitContract({ seat, round, requirements } = {}) {
-  const spec = contractSpec({ seat, round, requirements });
+export function emitContract({ seat, round, requirements, parentArtifact } = {}) {
+  const spec = contractSpec({ seat, round, requirements, parentArtifact });
   const digest = contractDigest(spec);
   const L = [];
   L.push(`<!-- pr-autopilot:dispatch-contract seat=${spec.seat} round=${spec.round} contract_digest=${digest} -->`);
@@ -158,6 +177,20 @@ export function emitContract({ seat, round, requirements } = {}) {
   }
   L.push(`- 每条 finding 必填 \`anchor_paths\`：仓库相对精确文件路径（POSIX、非目录、去重、≤ ${spec.anchor_paths_max_per_finding} 条），且**必须落在 base..candidate 实改文件集内**。它是证据锚点，**不是写入许可**。`);
   L.push(`- actionable（blocker/major）finding 另必填 \`${spec.actionable_required_fields.join('` + `')}\`；同一 family_id 下 invariant 必须逐字一致。`);
+  // SC-T7b（SC-2/SC-4）: family_claim 契约段——正文列 family_key+invariant 与 digest。
+  // 机器只证明「引用本谱系存在族」，不判「这个 reuse 判断对不对」的语义（SC-4）——那是审查席
+  // 的判断；只覆盖同一 artifact 谱系（parent 链），不冒充跨 PR 全局历史（SC-4）。
+  if (spec.known_families) {
+    L.push(`- **每条 actionable finding 必填 \`family_claim\`**（SC-T7b）：二选一——\`{kind:'reuse', target_family_key:'fk1-...'}\`（复用**上一轮真实问题族**，key 必须在本契约下方 known families 清单内）或 \`{kind:'new', reason:'非空'}\`（新问题，reason 不得为空串）。suggestion 不要求。inner exact keys——reuse 不得带 reason、new 不得带 target_family_key、未知键一律拒（verdict-validate fail-closed）。`);
+    L.push(`  上一轮 known families（权威 = parentArtifact.canonical_findings 现场派生，排序去重；\`known_families_digest=${spec.known_families_digest}\`）：`);
+    for (const kf of spec.known_families) {
+      L.push(`  - \`${kf.family_key}\` — ${kf.invariant}`);
+    }
+    L.push(`  机器只证明这些 family_key 在本谱系存在（reuse 引用它们才合法），**不判语义**——「这个 reuse 判断对不对」是审查席的判断，机器不裁决。`);
+    L.push(`  只覆盖同一 artifact 谱系（parent 链），不冒充跨 PR 全局历史（SC-4）——known families 从 parent 现场派生，无历史注册表。`);
+  } else {
+    L.push(`- **每条 actionable finding 必填 \`family_claim\`**（SC-T7b）：二选一——\`{kind:'reuse', target_family_key:'fk1-...'}\`（复用**上一轮真实问题族**）或 \`{kind:'new', reason:'非空'}\`（新问题，reason 不得为空串）。suggestion 不要求。inner exact keys——reuse 不得带 reason、new 不得带 target_family_key、未知键一律拒（verdict-validate fail-closed）。**本轮是 round=1（谱系根，无 parent）——known families 为空，\`kind:'reuse'\` 必拒**；只能声明 \`kind:'new'\`。`);
+  }
   L.push(`- finding 上**禁止**出现 \`${spec.forbidden_finding_fields.join('\` / \`')}\`（出现即结构性拒收）。`);
   L.push(`- **关 finding 是双条件**（仅适用于「修」「ARCHIVE」两类仍留在 findings[] 里的处置）：该 finding 的 \`status\` 置为 \`closed\` **且**它的 id 必须出现在同一份 verdict 的 \`closed_finding_ids\` 数组里。只翻 status 不列 id → verdict-validate 给 exit 0，但 consensus-gate conjunct② 必拒（2026-08-03 实测，白跑一次往返）。`);
   L.push(`- ${ANSWERED_WITHDRAW_LITERAL}——本席若认可 lead 的证据回复（Phase 2c 意见三分法「答」），在下一份 verdict 里**不要**把该 finding 留在 \`findings[]\` 里改 \`status\`：直接删掉该条目。留着改 status 会撞上一条的双条件，把本不该进 canonical 的 finding 又送进 \`canonical_findings\`。`);
@@ -167,25 +200,26 @@ export function emitContract({ seat, round, requirements } = {}) {
 }
 
 // 返回 {ok, missing[]}。substring 逐字匹配——派工包是自由文本，不做结构解析。
-export function checkDispatchPackage(text, { seat, round, requirements } = {}) {
+export function checkDispatchPackage(text, { seat, round, requirements, parentArtifact } = {}) {
   const body = String(text ?? '');
-  const missing = requiredLiterals({ seat, round, requirements }).filter((lit) => !body.includes(lit));
+  const missing = requiredLiterals({ seat, round, requirements, parentArtifact }).filter((lit) => !body.includes(lit));
   return { ok: missing.length === 0, missing };
 }
 
 if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
   const USAGE = ' 用法:\n'
-    + '  dispatch-contract.mjs --emit <seat> --round <n>\n'
-    + '  dispatch-contract.mjs --check <派工包文本文件> --seat <seat> --round <n>\n'
-    + `  seat ∈ ${SEATS.join(' | ')}`;
+    + '  dispatch-contract.mjs --emit <seat> --round <n> [--parent <parent-artifact.json>]\n'
+    + '  dispatch-contract.mjs --check <派工包文本文件> --seat <seat> --round <n> [--parent <parent-artifact.json>]\n'
+    + `  seat ∈ ${SEATS.join(' | ')}\n`
+    + '  --parent 可选（SC-T7b）: round>=2 时传上一轮 consensus artifact，known families 现场派生进契约段（含 digest）；round=1 不传（谱系根，reuse 必拒）。';
   const round = args.round === undefined ? NaN : Number(args.round);
   try {
     if (args.emit) {
-      process.stdout.write(emitContract({ seat: args.emit, round }));
+      process.stdout.write(emitContract({ seat: args.emit, round, parentArtifact: args.parent ? readJson(args.parent) : null }));
     } else if (args.check) {
       const { readFileSync } = await import('node:fs');
-      const r = checkDispatchPackage(readFileSync(args.check, 'utf8'), { seat: args.seat, round });
+      const r = checkDispatchPackage(readFileSync(args.check, 'utf8'), { seat: args.seat, round, parentArtifact: args.parent ? readJson(args.parent) : null });
       if (!r.ok) {
         for (const m of r.missing) process.stderr.write(`[DISPATCH-CONTRACT-FAIL] 派工包缺必需字面值: ${m}\n`);
         process.stderr.write(`[DISPATCH-CONTRACT] 共缺 ${r.missing.length} 项——用 --emit ${args.seat} --round ${round} 生成契约段原文粘贴，勿手抄\n`);

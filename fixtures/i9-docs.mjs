@@ -181,12 +181,13 @@ console.log('\n[R2-P1] 契约漂移修复回归（SC-R2-C1〜C6）');
 
 const LIVE_SCHEMA = JSON.parse(readFileSync(new URL('../schemas/review-verdict.schema.json', import.meta.url), 'utf8'));
 
-t('[SC-R2-C1] verdict_schema_version 从 schema 常量派生，不是手拄字面值（v2→v3 漂移的直接复现）', () => {
+t('[SC-R2-C1] verdict_schema_version 从 schema 常量派生，不是手拄字面值（v2→v3→v4 漂移的直接复现）', () => {
   const expected = LIVE_SCHEMA.properties.schema_version.const;
-  // 有意锚定历史版本（例外，非漏改）: 这条钉的是「v2→v3 迁移已完成」——如果将来 verdict
-  // schema 再 bump（如 v4），本行必须由人显式更新（这是迁移事件的有意断点，不是可派生的值；
-  // expected 本就来自同一 schema，派生会变成同义反复）。不要顺手改成 expected 或 SCHEMA_VERSION。
-  eq(expected, 'v3', '当前 schema 的 schema_version.const 应为 v3（回归锚点，bump 时必须显式更新）');
+  // 有意锚定历史版本（例外，非漏改）: 这条钉的是「v2→v3 迁移已完成、v3→v4（T7b family_claim）
+  // 已同步迁移」——如果将来 verdict schema 再 bump（如 v5），本行必须由人显式更新（这是迁移
+  // 事件的有意断点，不是可派生的值；expected 本就来自同一 schema，派生会变成同义反复）。
+  // 不要顺手改成 expected 或 SCHEMA_VERSION。
+  eq(expected, 'v4', '当前 schema 的 schema_version.const 应为 v4（回归锚点，bump 时必须显式更新）');
   eq(contractSpec({ seat: SEAT, round: ROUND }).verdict_schema_version, expected,
     'contractSpec.verdict_schema_version 必须等于 review-verdict.schema.json 的 schema_version.const');
   const text = emitContract({ seat: SEAT, round: ROUND });
@@ -445,9 +446,10 @@ try {
   }
 });
 
-t('[SC-R2-C5] SKILL.md 已同步声明 verdict schema **v3**（不再声明 v2）', () => {
+t('[SC-R2-C5] SKILL.md 已同步声明 verdict schema **v4**（不再声明 v2/v3）', () => {
   const skill = readFileSync(new URL('../skills/submit-pr/SKILL.md', import.meta.url), 'utf8');
-  ok(skill.includes('review-verdict.schema.json` **v3**'), 'SKILL 必须声明 verdict schema **v3**');
+  ok(skill.includes('review-verdict.schema.json` **v4**'), 'SKILL 必须声明 verdict schema **v4**');
+  ok(!skill.includes('review-verdict.schema.json` **v3**'), 'SKILL 不得残留 verdict schema **v3** 的声明');
   ok(!skill.includes('review-verdict.schema.json` **v2**'), 'SKILL 不得残留 verdict schema **v2** 的声明');
 });
 
@@ -604,6 +606,93 @@ t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生，不�
   ok(/schema_version: SCHEMA_VERSION, reviewer/.test(own), '本文件 verdict 构造必须用 SCHEMA_VERSION 派生常量');
   const lit = "schema_version: 'v" + "[0-9]', reviewer";
   ok(!new RegExp(lit).test(own), '本文件不得残留 verdict schema_version 字面量（须用 SCHEMA_VERSION 派生）');
+});
+
+// ========== SC-T7b: dispatch-contract --parent（SC-2: emit/check/CLI 支持 + 正文列家族表 + digest 反漂移）==========
+// 背景（owner 批准的 pr-autopilot 剩余 SC-T7b，2026-08-08）: 派工契约必须把「上一轮真实问题族」
+// （known families）带进派工包正文（family_key + invariant 与 digest），审查席才能声明
+// family_claim.kind='reuse' 引用合法 key。known families 权威只来自同一谱系
+// parentArtifact.canonical_findings（deriveKnownFamilies，round=1→null）；不创建 state-dir
+// 历史注册表（永远现场派生）。digest 进 contract_digest——parent 一变旧契约段失配被前置门拦。
+console.log('\n[SC-T7b-DC] dispatch-contract --parent 独立回归');
+import { deriveKnownFamilies, familyKeyOf } from '../scripts/verdict-validate.mjs';
+const DC_INV1 = '状态字段必须只有一个写入 owner';
+const DC_K1 = familyKeyOf(DC_INV1);
+const DC_PARENT = { canonical_findings: [
+  { family_key: DC_K1, invariant: DC_INV1 },
+  { family_key: familyKeyOf('删除必须走事务性 reconciliation'), invariant: '删除必须走事务性 reconciliation' }
+] };
+
+t('[SC-T7b-DC-1] emit --parent: 正文列 family_claim 要求 + known families 表（family_key+invariant）+ known_families_digest', () => {
+  const text = emitContract({ seat: SEAT, round: ROUND, parentArtifact: DC_PARENT });
+  ok(text.includes('family_claim'), 'emit 输出必须含 family_claim 契约要求');
+  ok(text.includes('kind'), 'emit 输出必须含 kind');
+  ok(text.includes('target_family_key'), 'emit 输出必须含 target_family_key');
+  ok(text.includes('reason'), 'emit 输出必须含 reason');
+  ok(text.includes('fk1-'), 'emit 输出必须含 fk1- 前缀示例');
+  ok(text.includes(DC_K1), 'emit 输出必须逐字列出上一轮真实 family_key: ' + DC_K1);
+  ok(text.includes(DC_INV1), 'emit 输出必须逐字列出对应 invariant: ' + DC_INV1);
+  const spec = contractSpec({ seat: SEAT, round: ROUND, parentArtifact: DC_PARENT });
+  ok(text.includes(`known_families_digest=${spec.known_families_digest}`), 'emit 输出必须含 known_families_digest');
+  ok(text.includes('机器只证明这些 family_key 在本谱系存在'), 'emit 必须声明机器只证明存在性、不判语义（SC-4）');
+  ok(text.includes('不冒充跨 PR 全局历史') || text.includes('同一谱系'), 'emit 必须声明只覆盖同一谱系（SC-4）');
+});
+
+t('[SC-T7b-DC-2] round=1 emit（无 parent）: 声明「known families 为空，reuse 必拒，只能声明 kind:new」', () => {
+  const text = emitContract({ seat: SEAT, round: 1 }); // 不传 parentArtifact
+  ok(text.includes("kind:'reuse'"), 'round=1 emit 必须仍说明 reuse 形态');
+  ok(/known families 为空.*reuse.*必拒/.test(text), 'round=1 emit 必须声明 reuse 必拒: ' + text.slice(0, 200));
+  ok(text.includes("kind:'new'"), 'round=1 emit 必须说明只能声明 kind:new');
+  const spec = contractSpec({ seat: SEAT, round: 1 });
+  eq(spec.known_families, null, 'round=1 known_families 必须为 null（空集合语义）');
+  eq(spec.known_families_digest, null, 'round=1 known_families_digest 必须为 null');
+});
+
+t('[SC-T7b-DC-3] requiredLiterals 收录 family_claim 系列 + known_families_digest；emit→check 闭环过', () => {
+  const lits = requiredLiterals({ seat: SEAT, round: ROUND, parentArtifact: DC_PARENT });
+  for (const lit of ['family_claim', 'kind', 'target_family_key', 'reason', 'fk1-']) {
+    ok(lits.includes(lit), `requiredLiterals 必须收录 ${lit}`);
+  }
+  const spec = contractSpec({ seat: SEAT, round: ROUND, parentArtifact: DC_PARENT });
+  ok(lits.includes(`known_families_digest=${spec.known_families_digest}`), 'requiredLiterals 必须收录 known_families_digest');
+  const text = emitContract({ seat: SEAT, round: ROUND, parentArtifact: DC_PARENT });
+  const r = checkDispatchPackage(text, { seat: SEAT, round: ROUND, parentArtifact: DC_PARENT });
+  ok(r.ok, `emit 自身应过 check，缺: ${r.missing.join(', ')}`);
+});
+
+t('[SC-T7b-DC-4] 反向变异: parent 家族集合一变 → 旧契约段 digest 失配被 check 拦（反漂移牙齿）', () => {
+  const oldText = emitContract({ seat: SEAT, round: ROUND, parentArtifact: DC_PARENT });
+  const newParent = { canonical_findings: [
+    { family_key: DC_K1, invariant: DC_INV1 },
+    { family_key: familyKeyOf('第三个全新不变量'), invariant: '第三个全新不变量' }
+  ] };
+  const r = checkDispatchPackage(oldText, { seat: SEAT, round: ROUND, parentArtifact: newParent });
+  ok(!r.ok, 'parent 家族集合变化后旧契约段必须失配被拦');
+  ok(r.missing.includes(`known_families_digest=${contractSpec({ seat: SEAT, round: ROUND, parentArtifact: newParent }).known_families_digest}`),
+    '缺项清单必须点名新 digest（lead 看错误信息就知道要重新 --emit）: ' + JSON.stringify(r.missing));
+});
+
+t('[SC-T7b-DC-5] digest 进 contract_digest: 同一 parent 的两份 spec digest 相同；parent 不同 digest 不同', () => {
+  const specA = contractSpec({ seat: SEAT, round: ROUND, parentArtifact: DC_PARENT });
+  const specA2 = contractSpec({ seat: SEAT, round: ROUND, parentArtifact: DC_PARENT });
+  eq(contractDigest(specA), contractDigest(specA2), '同 parent 的 spec digest 必须相同（确定性）');
+  const specNoParent = contractSpec({ seat: SEAT, round: ROUND });
+  ok(contractDigest(specA) !== contractDigest(specNoParent), '有/无 parent 的 spec digest 必须不同（known_families 进 digest）');
+});
+
+t('[SC-T7b-DC-6] deriveKnownFamilies 排序去重: 只提取 family_key+invariant，重复 key 去重，按 key 字典序', () => {
+  const k3 = familyKeyOf('第三个全新不变量');
+  const parent = { canonical_findings: [
+    { family_key: k3, invariant: '第三个全新不变量' },
+    { family_key: DC_K1, invariant: DC_INV1 },
+    { family_key: DC_K1, invariant: DC_INV1 } // 重复 key → 去重
+  ] };
+  const known = deriveKnownFamilies(parent);
+  eq(known.length, 2, '去重后应只有 2 个 family: ' + JSON.stringify(known));
+  eq(known[0].family_key, [DC_K1, k3].sort((a, b) => a.localeCompare(b))[0], '按 family_key 字典序');
+  eq(known[0].invariant, known[0].family_key === DC_K1 ? DC_INV1 : '第三个全新不变量', 'invariant 取首个遇到的值');
+  eq(Object.keys(known[0]).sort().join(','), 'family_key,invariant', '只带 family_key+invariant 两字段');
+  eq(deriveKnownFamilies(null), null, '无 parent → null');
 });
 
 console.log(`\n========== i9-docs fixtures: ${pass} passed, ${failCount} failed ==========`);

@@ -17,7 +17,7 @@
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseArgs, readJson, fail, isMain, normalizeRepoPath } from './lib/common.mjs';
+import { parseArgs, readJson, fail, isMain, normalizeRepoPath, sha256 } from './lib/common.mjs';
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from './lib/hardening-registry.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -71,6 +71,43 @@ const FINDING_SCHEMA_PROPS = REVIEW_VERDICT_SCHEMA.properties?.findings?.items?.
 export const FINDING_KEYS = new Set(Object.keys(FINDING_SCHEMA_PROPS ?? {}));
 if (FINDING_KEYS.size === 0) {
   throw new Error('verdict-validate: 无法从 review-verdict.schema.json 读出 findings.items.properties（schema 结构已变，需人工核对派生路径）');
+}
+
+// SC-T7b（D1 延续）: family_key 是跨 reviewer/跨 candidate 的内容派生身份——从 invariant 文本
+// 本身派生：同（归一化后）文本 → 同 key，不同文本 → 不同 key。'fk1-' 是算法版本前缀。本实现
+// 从 consensus-gate.mjs 上移至此（consensus-gate imports 本文件，反向 import 会循环）——它是
+// fk1 派生的**唯一**实现点；consensus-gate.mjs 改为 re-export（见该文件），既有 import 方
+// （run-fixtures / i9-batch 的 `import { familyKeyOf } from consensus-gate.mjs`）签名不变。
+// SC-T7b（SC-4）: family_claim **不参与**本派生——canonical family_key 仍只由 invariant 文本
+// 派生，claim 只是审查席的显式声明，改变不了 key 的数学派生。语义边界（SC-4）: 机器只证明
+// 「target_family_key 引用本谱系（parentArtifact.canonical_findings）存在族」，不判「这个 reuse
+// 判断对不对」——语义归族永远是审查席的判断。
+export function normalizeInvariantForKey(invariant) {
+  return String(invariant).trim().toLowerCase().replace(/\s+/g, '');
+}
+export function familyKeyOf(invariant) {
+  if (typeof invariant !== 'string' || !invariant) return null;
+  return `fk1-${sha256(normalizeInvariantForKey(invariant))}`;
+}
+
+// SC-T7b（SC-2）: 权威 known families 只来自**同一谱系**的 parentArtifact.canonical_findings。
+//   - round=1（parentArtifact 缺省/null）→ 返回 null（「集合为空」语义：reuse 必拒，SC-5 测试锁）。
+//   - round>=2 → 从 parent.canonical_findings 提取 {family_key, invariant}，排序去重（确定性，
+//     顺序不依赖 artifact 内容排列）。只提取 family_key 与 invariant 两个字段——下游（CLI 正文
+//     列示 / reuse 存在性校验）只消费这两个字段，不把 parent 的其它内容带进派工契约。
+//   - 不创建 state-dir 历史注册表（SC-2 明确禁止）——known families 永远从 parent 现场派生，
+//     无持久化、无跨 PR 全局历史（SC-4: 只覆盖同一 artifact 谱系，不冒充跨 PR 全局历史）。
+export function deriveKnownFamilies(parentArtifact) {
+  if (!parentArtifact || typeof parentArtifact !== 'object') return null;
+  const seen = new Map(); // family_key -> invariant（首个遇到的，后续同 key 去重）
+  for (const c of parentArtifact.canonical_findings ?? []) {
+    if (typeof c?.family_key !== 'string' || !c.family_key) continue;
+    if (typeof c?.invariant !== 'string' || !c.invariant) continue;
+    if (!seen.has(c.family_key)) seen.set(c.family_key, c.invariant);
+  }
+  return [...seen.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([family_key, invariant]) => ({ family_key, invariant }));
 }
 
 // SC-11: base∪candidate 的 tracked 文件集（「这是真文件」判据）
@@ -339,6 +376,51 @@ export function validateVerdict(v, opts = {}) {
         `finding ${fd.id}（${fd.severity}）缺 invariant 或超长（SC-B1: actionable finding 必须给出 ≤120 字的「被破坏的不变量」）`);
       need(typeof fd.family_id === 'string' && fd.family_id.length > 0,
         `finding ${fd.id}（${fd.severity}）缺 family_id（SC-B1: actionable finding 必须归族，即便是「自成一族」）`);
+      // SC-T7b: 每条 actionable finding 必须显式声明「复用上一轮真实问题族」还是「新问题」。
+      // suggestion 不要求（未来即便被某条 SC 引用也不要求，同 invariant/family_id 的处理）。
+      // inner exact keys: {kind:'reuse',target_family_key:'fk1-...'} / {kind:'new',reason:'非空'}。
+      // 空串/多余键/kind 非法一律 fail-closed——本仓无 ajv，JSON Schema 的 additionalProperties
+      // 只是文档真相源，结构性校验以本段为准（同 hardening_coverage 分支约束的处理方式）。
+      // reuse 的 target_family_key 存在性对照 opts.parentArtifact 派生出的 known families
+      // （SC-3: 同一 --parent，与 CLI 同源）；无 parent（round=1 谱系根）时 reuse 必拒。
+      need(fd.family_claim && typeof fd.family_claim === 'object' && !Array.isArray(fd.family_claim),
+        `finding ${fd.id}（${fd.severity}）缺 family_claim（SC-T7b: actionable finding 必须显式声明「复用上一轮真实问题族」或「新问题」——{kind:'reuse',target_family_key:'fk1-...'} 或 {kind:'new',reason:'非空'}）`);
+      if (fd.family_claim && typeof fd.family_claim === 'object' && !Array.isArray(fd.family_claim)) {
+        const fc = fd.family_claim;
+        // inner exact keys: 只认 kind/target_family_key/reason 三个键，其它一律拒
+        for (const k of Object.keys(fc)) {
+          need(['kind', 'target_family_key', 'reason'].includes(k),
+            `finding ${fd.id} 的 family_claim 存在未知字段: ${k}（inner exact keys，SC-T7b）`);
+        }
+        need(['reuse', 'new'].includes(fc.kind),
+          `finding ${fd.id} 的 family_claim.kind 非法: ${JSON.stringify(fc.kind)}（须为 'reuse' 或 'new'，SC-T7b）`);
+        if (fc.kind === 'reuse') {
+          // 分支专属 exact key: reuse 只能带 kind + target_family_key，带 reason = 多余键
+          need(typeof fc.target_family_key === 'string' && fc.target_family_key.length > 0,
+            `finding ${fd.id} 的 family_claim（reuse）缺 target_family_key 或为空串（SC-T7b）`);
+          if (typeof fc.target_family_key === 'string' && fc.target_family_key) {
+            need(fc.target_family_key.startsWith('fk1-'),
+              `finding ${fd.id} 的 family_claim.target_family_key 非法: ${JSON.stringify(fc.target_family_key)}（须为 fk1- 前缀的 family_key，SC-T7b）`);
+          }
+          need(!('reason' in fc),
+            `finding ${fd.id} 的 family_claim（reuse）不得携带 reason（inner exact keys: reuse 只能带 kind+target_family_key，SC-T7b）`);
+          // 存在性对照同一谱系 known families——机器只证明「引用本谱系存在族」，不判语义（SC-4）
+          const known = deriveKnownFamilies(opts.parentArtifact ?? null);
+          if (known === null) {
+            need(false,
+              `finding ${fd.id} 声明 family_claim.kind='reuse' 但无 parent（round=1 谱系根，known families 为空——reuse 必须指向上一轮真实问题族，SC-T7b）`);
+          } else {
+            need(known.some((k) => k.family_key === fc.target_family_key),
+              `finding ${fd.id} 的 family_claim.target_family_key=${JSON.stringify(fc.target_family_key)} 不在上一轮 known families 中（机器只证明引用本谱系存在族，不判语义；同一谱系见 parentArtifact.canonical_findings，SC-T7b）`);
+          }
+        } else if (fc.kind === 'new') {
+          // 分支专属 exact key: new 只能带 kind + reason，带 target_family_key = 多余键
+          need(typeof fc.reason === 'string' && fc.reason.length > 0,
+            `finding ${fd.id} 的 family_claim（new）缺 reason 或为空串（非空，SC-T7b）`);
+          need(!('target_family_key' in fc),
+            `finding ${fd.id} 的 family_claim（new）不得携带 target_family_key（inner exact keys: new 只能带 kind+reason，SC-T7b）`);
+        }
+      }
     }
   }
   // SC-B1（D1）: family_id 引用合法性——同一 verdict 内，同一个 family_id 下的全部 finding
@@ -447,7 +529,7 @@ if (isMain(import.meta.url)) {
   // 覆盖不到收卷时的门）。与 consensus-gate CLI 的 R4-P1 同一收紧方向：自检口径必须与
   // 收卷口径一致，「省参数」不能成为「少校验」的静默开关。
   if (!args.verdict || !args['repo-dir']) {
-    fail('用法: verdict-validate.mjs --verdict <verdict.json> --repo-dir <dir> [--bundle <bundle.json>]\n（--repo-dir 必填——T1: 不带实改集校验的自检是不完整口径，会产出「自检绿、共识拒」的假信号）');
+    fail('用法: verdict-validate.mjs --verdict <verdict.json> --repo-dir <dir> [--bundle <bundle.json>] [--parent <parent-artifact.json>]\n（--repo-dir 必填——T1: 不带实改集校验的自检是不完整口径，会产出「自检绿、共识拒」的假信号；--parent 可选——SC-T7b: round>=2 校验 family_claim.kind=\'reuse\' 的 target_family_key 存在性时必须传，与 consensus-gate 的 --parent 同源）');
   }
   const v0 = readJson(args.verdict);
   let trackedPaths = null, changedPaths = null;
@@ -459,7 +541,8 @@ if (isMain(import.meta.url)) {
     fail(`无法计算 base..candidate 实改集/tracked 集（fail-closed，不降级为跳过校验）: ${String(e.message).slice(0, 200)}`);
   }
   const errs = validateVerdict(v0, {
-    trackedPaths, changedPaths, bundle: args.bundle ? readJson(args.bundle) : null });
+    trackedPaths, changedPaths, bundle: args.bundle ? readJson(args.bundle) : null,
+    parentArtifact: args.parent ? readJson(args.parent) : null });
   if (errs.length) {
     for (const e of errs) process.stderr.write(`[SCHEMA-FAIL] ${e}\n`);
     process.stderr.write('[VERDICT] degraded（schema 校验失败一律 degraded，⑨）\n');

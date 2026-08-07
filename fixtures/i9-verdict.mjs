@@ -240,6 +240,186 @@ t('[SC-R3-F6-c2] actionable_required_fields: family_id typo(family_ids) → fail
   ok(errs.some((e) => /缺 family_id/.test(e)), 'family_id 必填值校验必须 fail loud: ' + JSON.stringify(errs));
 });
 
+// ========== SC-T7b: family_claim（validator 单元层）==========
+// 背景（owner 批准的 pr-autopilot 剩余 SC-T7b，2026-08-08）: 每条 actionable finding 必须显式
+// 声明「复用上一轮真实问题族」或「新问题」；known families 权威只来自同一谱系
+// parentArtifact.canonical_findings（deriveKnownFamilies，round=1→null）；机器只证明「引用本
+// 谱系存在族」，不判语义（SC-4）。以下测试覆盖 SC-1/SC-2/SC-3 的 validator 层验收点。
+import { deriveKnownFamilies, familyKeyOf as vvFamilyKeyOf } from '../scripts/verdict-validate.mjs';
+import { familyKeyOf as cgFamilyKeyOf } from '../scripts/consensus-gate.mjs';
+
+// 最小 parent artifact 构造（deriveKnownFamilies 只消费 canonical_findings；validator 层的
+// reuse 存在性校验不需要完整 artifact——完整谱系校验属 consensus-gate 层，run-fixtures 覆盖）
+function mkParent(canonicalFindings) {
+  return { canonical_findings: canonicalFindings };
+}
+const INV1 = 'X 必须唯一写者';
+const K1 = vvFamilyKeyOf(INV1); // 真实 fk1- key（与 consensus-gate 同源派生）
+const K2 = vvFamilyKeyOf('删除必须走事务性 reconciliation');
+
+t('[SC-T7b-1] round=1 + kind:new（非空 reason）→ 过；suggestion 不要求 family_claim', () => {
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'blocker', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'new', reason: '本轮新发现的问题族' } }],
+    closed_finding_ids: ['F1']
+  });
+  eq(validateVerdict(v, { parentArtifact: null }).length, 0, 'round=1 + new 应零错误: ' + JSON.stringify(validateVerdict(v, { parentArtifact: null })));
+  // suggestion 不要求 claim（即便带 actionable 字段的 suggestion 也过）
+  const sv = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'S1', primary_face: 'A', severity: 'suggestion', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'open', invariant: 'inv-s', family_id: 'fam-s' }]
+  });
+  eq(validateVerdict(sv).length, 0, 'suggestion 无 claim 应过: ' + JSON.stringify(validateVerdict(sv)));
+});
+
+t('[SC-T7b-2] round=1 + kind:reuse → 拒（谱系根无 parent，known families 为空）且点名「无 parent」', () => {
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'reuse', target_family_key: K1 } }],
+    closed_finding_ids: ['F1']
+  });
+  const errs = validateVerdict(v, { parentArtifact: null });
+  ok(errs.some((e) => /无 parent/.test(e)), 'round=1 reuse 必须点名无 parent: ' + JSON.stringify(errs));
+});
+
+t('[SC-T7b-3] round>=2 + reuse 引用 parent 真实 key → 过（reuse 合法，机器只验存在性）', () => {
+  const parent = mkParent([{ family_key: K1, invariant: INV1 }]);
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'reuse', target_family_key: K1 } }],
+    closed_finding_ids: ['F1']
+  });
+  eq(validateVerdict(v, { parentArtifact: parent }).length, 0, 'reuse 引用 parent 真实 key 应零错误: ' + JSON.stringify(validateVerdict(v, { parentArtifact: parent })));
+});
+
+t('[SC-T7b-4] round>=2 + reuse 引用自造 key（fk1- 前缀合法但不在 parent）→ 拒且点名「不在上一轮 known families」', () => {
+  const parent = mkParent([{ family_key: K1, invariant: INV1 }]);
+  const forgedKey = 'fk1-' + 'a'.repeat(64); // 格式合法但绝不可能是真实派生 key
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'reuse', target_family_key: forgedKey } }],
+    closed_finding_ids: ['F1']
+  });
+  const errs = validateVerdict(v, { parentArtifact: parent });
+  ok(errs.some((e) => /不在上一轮 known families/.test(e)), '自造 key 必须点名不在 known families: ' + JSON.stringify(errs));
+});
+
+t('[SC-T7b-5] round>=2 + reuse 引用错 parent（传了 parent 但其 canonical 无此 key）→ 拒（同 4 的消息形态）', () => {
+  // 错 parent = 引用 K1 但传的 parent 只含 K2——K1 在该谱系不存在
+  const wrongParent = mkParent([{ family_key: K2, invariant: '删除必须走事务性 reconciliation' }]);
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'reuse', target_family_key: K1 } }],
+    closed_finding_ids: ['F1']
+  });
+  const errs = validateVerdict(v, { parentArtifact: wrongParent });
+  ok(errs.some((e) => /不在上一轮 known families/.test(e)), '错 parent 必须拒（K1 不在该谱系）: ' + JSON.stringify(errs));
+});
+
+t('[SC-T7b-6] round>=2 + reuse 但缺 parent 传参 → 拒且点名「无 parent」（known families 无法派生）', () => {
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'reuse', target_family_key: K1 } }],
+    closed_finding_ids: ['F1']
+  });
+  const errs = validateVerdict(v); // 不传 parentArtifact
+  ok(errs.some((e) => /无 parent/.test(e)), 'reuse 缺 parent 必须点名无 parent: ' + JSON.stringify(errs));
+});
+
+t('[SC-T7b-7] actionable 缺 family_claim → 拒且点名「缺 family_claim」', () => {
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'blocker', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1' }],
+    closed_finding_ids: ['F1']
+  });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /缺 family_claim/.test(e)), '缺 claim 必须点名缺 family_claim: ' + JSON.stringify(errs));
+});
+
+t('[SC-T7b-8] inner 多余键各自独立拒绝: reuse 带 reason / new 带 target_family_key / 未知键', () => {
+  const parent = mkParent([{ family_key: K1, invariant: INV1 }]);
+  const reuseWithReason = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'reuse', target_family_key: K1, reason: '多余' } }],
+    closed_finding_ids: ['F1']
+  });
+  const e1 = validateVerdict(reuseWithReason, { parentArtifact: parent });
+  ok(e1.some((e) => /不得携带 reason/.test(e)), 'reuse 带 reason 必须拒且点名: ' + JSON.stringify(e1));
+
+  const newWithTarget = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'new', reason: 'x', target_family_key: K1 } }],
+    closed_finding_ids: ['F1']
+  });
+  const e2 = validateVerdict(newWithTarget);
+  ok(e2.some((e) => /不得携带 target_family_key/.test(e)), 'new 带 target_family_key 必须拒且点名: ' + JSON.stringify(e2));
+
+  const withUnknown = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'new', reason: 'x', bogus: 'y' } }],
+    closed_finding_ids: ['F1']
+  });
+  const e3 = validateVerdict(withUnknown);
+  ok(e3.some((e) => /family_claim 存在未知字段: bogus/.test(e)), '未知键必须拒且点名: ' + JSON.stringify(e3));
+});
+
+t('[SC-T7b-9] new reason 空串 → 拒且点名「缺 reason 或为空串」', () => {
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'new', reason: '' } }],
+    closed_finding_ids: ['F1']
+  });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /缺 reason 或为空串/.test(e)), 'new reason 空串必须拒且点名: ' + JSON.stringify(errs));
+});
+
+t('[SC-T7b-10] kind 非法 → 拒且点名「kind 非法」', () => {
+  const v = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'maybe', reason: 'x' } }],
+    closed_finding_ids: ['F1']
+  });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /kind 非法/.test(e)), 'kind 非法必须拒且点名: ' + JSON.stringify(errs));
+});
+
+t('[SC-T7b-11] reuse target_family_key 空串 / 非 fk1- 前缀 → 各自独立拒', () => {
+  const vEmpty = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'reuse', target_family_key: '' } }],
+    closed_finding_ids: ['F1']
+  });
+  const e1 = validateVerdict(vEmpty);
+  ok(e1.some((e) => /缺 target_family_key 或为空串/.test(e)), '空串必须点名: ' + JSON.stringify(e1));
+
+  const vBad = mkVerdict('claude-adversarial', {
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['src/a.ts'], evidence: 'e', status: 'closed', invariant: INV1, family_id: 'fam1', family_claim: { kind: 'reuse', target_family_key: 'fk2-abc' } }],
+    closed_finding_ids: ['F1']
+  });
+  const e2 = validateVerdict(vBad);
+  ok(e2.some((e) => /须为 fk1- 前缀/.test(e)), '非 fk1- 前缀必须点名: ' + JSON.stringify(e2));
+});
+
+t('[SC-T7b-12] 旧 schema（v3）→ fail-loud 点名 schema_version（bump 后旧 verdict 必须拒）', () => {
+  const v = mkVerdict('claude-adversarial', { schema_version: 'v3' });
+  const errs = validateVerdict(v);
+  ok(errs.some((e) => /schema_version 必须为/.test(e)), 'v3 verdict 必须 fail-loud 点名 schema_version: ' + JSON.stringify(errs));
+});
+
+t('[SC-T7b-13] deriveKnownFamilies: round=1（无 parent）→ null；round>=2 排序去重只留 family_key+invariant', () => {
+  eq(deriveKnownFamilies(null), null, '无 parent 必须返回 null（空集合语义）');
+  eq(deriveKnownFamilies(undefined), null, 'undefined parent 必须返回 null');
+  const k1 = vvFamilyKeyOf('同一不变量的文本');
+  const k2 = vvFamilyKeyOf('另一个不变量');
+  const parent = mkParent([
+    { family_key: k2, invariant: '另一个不变量', extra_field: '不该带出来' },
+    { family_key: k1, invariant: '同一不变量的文本' },
+    { family_key: k1, invariant: '同一不变量的文本（重复 key）' } // 去重：重复 key 只留首个
+  ]);
+  const known = deriveKnownFamilies(parent);
+  eq(known.length, 2, '去重后应只有 2 个 family: ' + JSON.stringify(known));
+  // 排序按 family_key 字符串字典序（localeCompare），不是按 invariant 或插入序
+  const sortedKeys = [k1, k2].sort((a, b) => a.localeCompare(b));
+  eq(known[0].family_key, sortedKeys[0], '按 family_key 字典序排序，首个应为较小的 key: ' + JSON.stringify(known));
+  eq(known[1].family_key, sortedKeys[1], '次个应为较大的 key: ' + JSON.stringify(known));
+  eq(Object.keys(known[0]).sort().join(','), 'family_key,invariant', '只带 family_key+invariant 两字段: ' + JSON.stringify(known[0]));
+  eq(known[0].invariant, known[0].family_key === k1 ? '同一不变量的文本' : '另一个不变量', 'invariant 取首个遇到的值');
+  eq(deriveKnownFamilies(mkParent([])), [], 'parent 无 canonical_findings → 空数组（不是 null，谱系存在但无族）');
+});
+
+t('[SC-T7b-14] familyKeyOf 派生单一实现: verdict-validate 与 consensus-gate re-export 逐字一致（SC-4 派生不被 claim 改变）', () => {
+  eq(vvFamilyKeyOf(INV1), cgFamilyKeyOf(INV1), '两处 familyKeyOf 必须同值（re-export 单一实现）');
+  ok(String(vvFamilyKeyOf(INV1)).startsWith('fk1-'), 'key 必须带 fk1- 前缀');
+  // SC-4: claim 不改变派生——同一 invariant 无论带什么 claim，key 都一样
+  eq(vvFamilyKeyOf('  同一  不变量 '), vvFamilyKeyOf('同一不变量'), '归一化（去空白）后同文本 → 同 key');
+});
+
 // ========== 版本字面量自检（2026-08-07）==========
 t('[版本字面量] 本文件 verdict 构造须用 SCHEMA_VERSION 派生，不得残留 verdict schema_version 字面量（照 [SC-12] 写法）', () => {
   const own = readFileSync(fileURLToPath(import.meta.url), 'utf8');

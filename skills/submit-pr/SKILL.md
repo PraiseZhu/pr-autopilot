@@ -183,7 +183,7 @@ node scripts/dispatch-contract.mjs --check pkg-<seat>.md --seat <reviewer> --rou
 - **降档观察窗（2026-08-05 起，连续 5 个走三审的 PR）**：lead 在台账逐席记 **unique-major**（只有该席抓到的 major/blocker 数）。seat① 换 sonnet 后 unique 率塌方（历史基线场均 2+ → 场均 0）→ 该席单席回滚 `claude-opus-5 / xhigh`，其他席不动。回滚对照基线（08-02~05，38 份裁决）：① opus/xhigh 27 major+1 blocker；② sol/xhigh 15+1（独抓率最高）；③ opus/high 12+1。
 - **争议仲裁席（L3，按需出场，不常驻）**：仅当 ①同一 finding 两轮 open/维持拉锯、②P0/P1 定性分歧、③对抗反驳终裁 三者之一发生时，lead 加派 codex / `codex/gpt-5.6-sol`（骨折），默认 effort=max，仲裁结论本身被推翻重来才升 ultra；骨折路由报 `BUDGET_MODEL_REQUIRES_API_MODE` → 降裸 `gpt-5.6-sol` 同 effort（**Cindy AI 通路**，不是官方订阅），标注不静默。**纪律**：仲裁席只产证据与分析内部报告供 origin reviewer 与 lead 参考，finding 仍由 origin reviewer close，报告不进共识判据、不改共识四 conjunct。
 
-三席各产两份输出：人读 markdown + **机器 JSON**（`schemas/review-verdict.schema.json` **v3**）。
+三席各产两份输出：人读 markdown + **机器 JSON**（`schemas/review-verdict.schema.json` **v4**）。
 **v2 必填 `anchor_paths`**：每条 finding 除人读 `anchor` 外，必须给 `anchor_paths: string[]`——
 仓库相对**精确文件路径**（POSIX，非目录，去重，≤ config/orchestration.json 的
 `anchor_paths_max_per_finding`）。这是修复分组的**唯一机器输入**：填宽了会制造假冲突把本可并行的
@@ -210,6 +210,21 @@ finding）上出现，不是 reviewer 填写的字段。**verdict 层填 `family
 `family_key`、`fix-orchestrate.familyContext`、`pr-body.mjs`、repair-mode watermark）一律读/绑
 `family_key`**——这条界线是本轮阻断修复的直接原因（gpt 实测复现: 两席各自合法用 F1 描述不同
 invariant，被旧实现按标签字符串合并成一族，PR body 只显示了先到的那个 invariant）。
+**每条 actionable finding 必须显式声明 `family_claim`**（SC-T7b，owner 2026-08-08 批准）：blocker/major
+必填二选一——`{kind:'reuse', target_family_key:'fk1-...'}`（复用**上一轮真实问题族**）或
+`{kind:'new', reason:'非空'}`（新问题）；suggestion 不要求。inner exact keys：reuse 不得带
+`reason`、new 不得带 `target_family_key`、未知键一律拒（`verdict-validate.mjs` fail-closed，空串/
+多余键/kind 非法同样拒）。**`family_claim` 不参与 canonical `family_key` 派生**（SC-4）：canonical
+的 `family_key` 仍只由冻结后的 `invariant` 文本派生（`familyKeyOf`，`verdict-validate.mjs` 唯一
+实现），claim 只是审查席的显式声明，改变不了 key 的数学派生。
+**机器只证明「引用本谱系存在族」，不判语义**（SC-4）：`target_family_key` 的「该族真的存在」由
+`verdict-validate.mjs` 对照**同一谱系** `parentArtifact.canonical_findings` 现场派生出的 known
+families 校验（权威来源只此一处；round=1 谱系根无 parent → known families 为空 → `kind:'reuse'`
+必拒，只能声明 `kind:'new'`）；「这个 reuse 判断对不对」「是不是真的同一族」永远是审查席的判断，
+机器不裁决、不据此合并 SC（同 D2）。**只覆盖同一 artifact 谱系（parent 链）**（SC-4）：known
+families 从 parent 现场派生、无 state-dir 历史注册表、不冒充跨 PR 全局历史。`dispatch-contract
+--parent <artifact.json>` 在派工契约正文列出上一轮 known families（family_key + invariant）与
+`known_families_digest`（进 contract_digest，parent 一变旧契约段失配被前置门拦）。
 - 两对抗席：七面（A 正确性/B UI+无障碍/C 测试/D 文档/E 安全/F 范围/G 声称核实）逐面 `pass/fail/n_a`+证据；B 面仅当脚本判非 UI 才许 n_a。
 - 第三席：只填相关 faces（F/G/E/D 为主）+ `gate_checks[]`（产品/架构过程门专用通道，不得用无类型 finding 绕过归属规则）。
 - 加固清单穷举（④）+ **加固清单覆盖率契约（机器强制，不是纸面约定）**：适用范围为**对抗席全
@@ -683,7 +698,7 @@ candidate 不改变它们的判据（与本节「反猫捉老鼠」立场一致�
   2. **parent 侧**：R2 用另一个 PR 的 bundle 且 R2 的 bundle 与 artifact 都自洽地非 null 且相等（例如把 R2 的 bundle.pr_number 与 artifact 一起改成同值）时，机器无法区分「R2 建了自己的 PR」与「张冠李戴」；
   3. **push-guard 无目标 PR 号输入**（T1，机器不拦）：push manifest 没有 pr_number 字段（SKILL.md:681 的「已有 PR 号」是 worker 收 manifest 的上下文，push-guard 不读它），故 pr_number 比较（bundle↔artifact 两份输入）只保证**两份输入互相自洽**，不保证与实际推送目标一致——两份都写 101 而实际要推另一个 PR 时照样过。**这一条是 T1，不冒充已堵跨 PR**。
   — **不冒充已堵跨 PR**。
-- **语义复发边界（T1 上限，如实声明）**：批次协议拦的是**逐字复发**，拦不住**语义复发**——`family_key` 由 `invariant` 的字面文本派生（`familyKeyOf`，仅 trim/小写/去空白），同一根因换个说法会算出不同 key、机器视为新族。语义级同族复发的判断权在 lead，机器无能力。**反捉老鼠的痛点本体就是语义复发，本机制只拦逐字复发，不冒充已解决**——语义级归族的机器化（要求每条 finding 显式声明「复用现有 family_key X」或「新族，与已列出的都不同因为…」，机器验动作存在性）已登记为下一轮独立议题（需改 dispatch-contract + verdict schema）。
+- **语义复发边界（T1 上限，如实声明）**：批次协议拦的是**逐字复发**，拦不住**语义复发**——`family_key` 由 `invariant` 的字面文本派生（`familyKeyOf`，仅 trim/小写/去空白），同一根因换个说法会算出不同 key、机器视为新族。语义级同族复发的判断权在 lead，机器无能力。**反捉老鼠的痛点本体就是语义复发，本机制只拦逐字复发，不冒充已解决**——语义级归族的机器化（要求每条 finding 显式声明「复用现有 family_key X」或「新族，与已列出的都不同因为…」，机器验动作存在性）**已由 SC-T7b 落地**（2026-08-08）：`family_claim` 字段 + `verdict-validate.mjs` 校验（reuse 引用本谱系 known families 才合法 / new 必须给非空 reason / 缺 claim 拒）+ `dispatch-contract --parent` 契约正文列 known families 与 digest + consensus-gate live 接线。机器验的是「**声明动作存在且引用合法**」（reuse 的 target 在本谱系 known families 内、new 的 reason 非空），**仍不判语义**（「这个 reuse 判断对不对」是审查席的判断，见 Phase 1 的 family_claim 段）。
 
 ## Phase 3 — push + 注册（lead 指定一个修复 worker 执行；并行场景选其一即可）
 

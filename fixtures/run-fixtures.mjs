@@ -121,6 +121,11 @@ function withAnchorPaths(findings) {
     if (['blocker', 'major'].includes(out.severity)) {
       if (out.invariant === undefined) out = { ...out, invariant: `fixture-invariant-${out.id ?? i}` };
       if (out.family_id === undefined) out = { ...out, family_id: `fixture-family-${out.id ?? i}` };
+      // SC-T7b（兼容性迁移，lead 2026-08-08 补包授权）: actionable finding 默认补一条
+      // family_claim（{kind:'new',reason:'fixture 默认构造'}）——与 invariant/family_id 的既有
+      // 默认补全同一模式；显式提供了就不覆盖（测试「共享 family」「reuse 引用」等场景时显式传）。
+      // 默认声明 new（无 parent 的 round=1 语境下 reuse 必拒，new 是唯一合法声明）。
+      if (out.family_claim === undefined) out = { ...out, family_claim: { kind: 'new', reason: 'fixture 默认构造' } };
     }
     return out;
   });
@@ -3670,8 +3675,9 @@ t('[SC-11] anchor_paths: 目录（无尾斜杠）拒 / 超 cap degraded / 重复
 
 t('[SC-12] live 契约一致性: SKILL/references 与 validator/push-guard 实际要求逐字对齐', () => {
   const skill = readFileSync(join(S, '../skills/submit-pr/SKILL.md'), 'utf8');
-  // schema 版本: 必须写 v3（v2→v3 迁移已完成；残留旧版 → live reviewer 产物全 degraded）
-  ok(/review-verdict\.schema\.json` \*\*v3\*\*/.test(skill), 'SKILL 必须声明 verdict schema v3');
+  // schema 版本: 必须写 v4（v2→v3→v4 迁移已完成，v4=T7b family_claim；残留旧版 → live reviewer 产物全 degraded）
+  ok(/review-verdict\.schema\.json` \*\*v4\*\*/.test(skill), 'SKILL 必须声明 verdict schema v4');
+  ok(!/review-verdict\.schema\.json` \*\*v3\*\*/.test(skill), '不得残留 v3 声明（v3→v4 迁移已完成）');
   ok(!/review-verdict\.schema\.json` \*\*v2\*\*/.test(skill), '不得残留 v2 声明（v2→v3 迁移已完成）');
   ok(!/schemas\/review-verdict\.schema\.json v1/.test(skill), '不得残留 v1 声明');
   // anchor_paths 填写要求必须在场（分组唯一输入）
@@ -6110,6 +6116,236 @@ t('[D2B-DUAL] 正向与边界: 同规则 PASS / 两侧皆无 SKIP / 单侧有判
   const rE = fgCli(e.d, 'feat: x', BODY_BASE_OK);
   eq(rE.code, 3, `候选侧配置坏必须 exit 3: ${rE.err?.slice(0, 100)}`);
   rmSync(e.d, { recursive: true, force: true });
+});
+
+// ========== SC-T7b: family_claim 集成层（SC-5: runConsensusGate 覆盖 + 反向变异挖 live parent 传参）==========
+// 背景（owner 批准的 pr-autopilot 剩余 SC-T7b，2026-08-08）: validator 单元层在 i9-verdict.mjs
+// 覆盖；本族覆盖 runConsensusGate 集成层——reuse 校验必须经 live 传参生效（SC-3: 不能只有 CLI
+// 绿），并以反向变异证明：挖掉 consensus-gate.mjs 的 live `parentArtifact` 传参后，reuse 自造
+// key 的集成负例必须失效（变 pass），控制组（缺 claim 负例）必须仍 fail（证明挖的是传参不是
+// validator 的必填校验本体）。
+console.log('\n[SC-T7b] family_claim 集成层回归');
+
+t('[SC-T7b-INT-1] 集成正向: R1(new)→R2(reuse 引用上一轮真实 family_key) 全链 pass；reuse 自造 key / 错谱系 → fail 点名', () => {
+  const dD = mkdtempSync(join(tmpdir(), 't7bint-'));
+  const rD = join(dD, 'repo');
+  execFileSync('git', ['init', '-q', '-b', 'main', rD]);
+  const gD = (...a) => execFileSync('git', ['-C', rD, ...a], { encoding: 'utf8' }).trim();
+  gD('config', 'user.email', 'o@t'); gD('config', 'user.name', 'o');
+  writeFileSync(join(rD, 'app.ts'), 'v1\n'); gD('add', '.'); gD('commit', '-qm', 'base');
+  const L0 = gD('rev-parse', 'HEAD');
+  writeFileSync(join(rD, 'app.ts'), 'v2\n'); gD('add', '.'); gD('commit', '-qm', 'feat v2');
+  const L1 = gD('rev-parse', 'HEAD');
+  // R1: round=1 发现 F1（withAnchorPaths 默认补 family_claim {kind:new}，round=1 语境合法）
+  const INV1 = '状态字段必须只有一个写入 owner';
+  const F1 = { id: 'F1', primary_face: 'A', severity: 'major', anchor: 'app.ts#1', anchor_paths: ['app.ts'], evidence: 'ev-1', status: 'closed', invariant: INV1, family_id: 'fam-1' };
+  const r1 = consensusFor(mkBundle(L0, L1), [
+    { findings: [F1], closed_finding_ids: ['F1'] },
+    { findings: [F1], closed_finding_ids: ['F1'] },
+    {}
+  ], { repoDir: rD }).artifact;
+  eq(r1.gate_result, 'pass', 'R1 应 PASS: ' + JSON.stringify(r1.fail_reasons ?? []));
+  const K1 = r1.canonical_findings[0].family_key;
+  ok(String(K1).startsWith('fk1-'), 'R1 canonical 必须带 fk1- family_key: ' + String(K1));
+  // L2: 修 F1 后的候选（R2 的 candidate 必须是 L1 真后代——严格祖先门）
+  writeFileSync(join(rD, 'app.ts'), 'v3 // F1 fixed\n'); gD('add', '.'); gD('commit', '-qm', 'fix F1');
+  const L2 = gD('rev-parse', 'HEAD');
+  // R2 正向: 三席显式 reuse 上一轮真实 family_key → pass（集成层 live 传参生效，不是只 CLI 绿）
+  const F1r = { id: 'F1r', primary_face: 'A', severity: 'major', anchor: 'app.ts#2', anchor_paths: ['app.ts'], evidence: 'ev-2', status: 'closed', invariant: INV1, family_id: 'fam-1', family_claim: { kind: 'reuse', target_family_key: K1 } };
+  const r2 = consensusFor(mkBundle(L0, L2), [
+    { round: 2, findings: [F1r], closed_finding_ids: ['F1r'] },
+    { round: 2, findings: [F1r], closed_finding_ids: ['F1r'] },
+    { round: 2 }
+  ], { parentArtifact: r1, repoDir: rD }).artifact;
+  eq(r2.gate_result, 'pass', 'R2 reuse 上一轮真实 key 应 PASS（live 接线生效）: ' + JSON.stringify(r2.fail_reasons ?? []));
+  eq(r2.round, 2, 'R2 应为 round=2');
+  eq(r2.parent_artifact_hash, r1.consensus_artifact_hash, 'R2 必须记录 exact parent R1');
+  // R2 负例: reuse 自造 key（格式合法但不在上一轮 known families）→ fail 且点名
+  const forgedKey = 'fk1-' + 'b'.repeat(64);
+  const F1forged = { ...F1r, id: 'F1g', family_claim: { kind: 'reuse', target_family_key: forgedKey } };
+  const r2bad = consensusFor(mkBundle(L0, L2), [
+    { round: 2, findings: [F1forged], closed_finding_ids: ['F1g'] },
+    { round: 2 },
+    { round: 2 }
+  ], { parentArtifact: r1, repoDir: rD }).artifact;
+  eq(r2bad.gate_result, 'fail', 'R2 reuse 自造 key 必须 fail: ' + JSON.stringify(r2bad.fail_reasons ?? []));
+  ok(r2bad.fail_reasons.some((e) => /不在上一轮 known families/.test(e)),
+    'R2 自造 key 必须点名「不在上一轮 known families」: ' + r2bad.fail_reasons.join(';'));
+  // R2 负例: reuse 引用错谱系（parent 里没这条 family——用另一个 R1' 当 parent）→ fail
+  const dD2 = mkdtempSync(join(tmpdir(), 't7bint2-'));
+  const rD2 = join(dD2, 'repo');
+  execFileSync('git', ['init', '-q', '-b', 'main', rD2]);
+  const g2 = (...a) => execFileSync('git', ['-C', rD2, ...a], { encoding: 'utf8' }).trim();
+  g2('config', 'user.email', 'o@t'); g2('config', 'user.name', 'o');
+  writeFileSync(join(rD2, 'app.ts'), 'v1\n'); g2('add', '.'); g2('commit', '-qm', 'base');
+  const Z0 = g2('rev-parse', 'HEAD');
+  writeFileSync(join(rD2, 'app.ts'), 'v2\n'); g2('add', '.'); g2('commit', '-qm', 'feat');
+  const Z1 = g2('rev-parse', 'HEAD');
+  // 另一条谱系（不同 base）的 R1——base 不同，runConsensusGate 的 base_sha 门会先拒
+  const r1Other = consensusFor(mkBundle(Z0, Z1), [[], [], []], { repoDir: rD2 }).artifact;
+  eq(r1Other.gate_result, 'pass', '前置: 另一条谱系的 R1 应先 PASS');
+  const r2wrong = consensusFor(mkBundle(L0, L2), [
+    { round: 2, findings: [F1r], closed_finding_ids: ['F1r'] },
+    { round: 2, findings: [F1r], closed_finding_ids: ['F1r'] },
+    { round: 2 }
+  ], { parentArtifact: r1Other, repoDir: rD }).artifact;
+  eq(r2wrong.gate_result, 'fail', '错谱系 parent 必须 fail: ' + JSON.stringify(r2wrong.fail_reasons ?? []));
+  // 拒绝路径: validateVerdict（带 parentArtifact）先于 runConsensusGate 的 base 门执行——K1
+  // 不在 r1Other 谱系的 known families（空），reuse 存在性校验先命中「不在上一轮 known families」。
+  // base_sha 门是第二道防线（runConsensusGate 后段），不先到。断言接受两种可辨认消息之一。
+  ok(r2wrong.fail_reasons.some((e) => /不在上一轮 known families/.test(e)) ||
+     r2wrong.fail_reasons.some((e) => /base_sha 与当前 bundle.base_sha 不一致/.test(e)),
+    '错谱系必须点名「不在 known families」或「base 不一致」: ' + r2wrong.fail_reasons.join(';'));
+  rmSync(dD, { recursive: true, force: true });
+  rmSync(dD2, { recursive: true, force: true });
+});
+
+t('[SC-T7b-INT-2] 反向变异: 挖掉 consensus-gate live 的 parentArtifact 传参 → reuse 存在性校验路径断（正向失效、自造 key 负例断言失效）；控制组（缺 claim）仍 fail', () => {
+  const cgPath = join(S, 'consensus-gate.mjs');
+  const original = readFileSync(cgPath, 'utf8');
+  const wired = 'parentArtifact: opts.parentArtifact ?? null';
+  ok(original.includes(wired), '前置条件: consensus-gate 须含 live 传参（探针按此字符串定位变异点，源码格式变了要同步改这里）');
+  const mutated = original.split(wired).join('parentArtifact: null /* MUTATION: live 传参被挖掉 */');
+  try {
+    writeFileSync(cgPath, mutated);
+    const probe = `
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { runConsensusGate } from ${JSON.stringify('file://' + join(S, 'consensus-gate.mjs'))};
+import { SCHEMA_VERSION } from ${JSON.stringify('file://' + join(S, 'verdict-validate.mjs'))};
+import { computeReviewInputHash } from ${JSON.stringify('file://' + join(S, 'review-input-hash.mjs'))};
+import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from ${JSON.stringify('file://' + join(S, 'lib/hardening-registry.mjs'))};
+try {
+  const dD = mkdtempSync(join(tmpdir(), 't7bmut-'));
+  const rD = join(dD, 'repo');
+  execFileSync('git', ['init', '-q', '-b', 'main', rD]);
+  const gD = (...a) => execFileSync('git', ['-C', rD, ...a], { encoding: 'utf8' }).trim();
+  gD('config', 'user.email', 'o@t'); gD('config', 'user.name', 'o');
+  writeFileSync(join(rD, 'app.ts'), 'v1\\n'); gD('add', '.'); gD('commit', '-qm', 'base');
+  const L0 = gD('rev-parse', 'HEAD');
+  writeFileSync(join(rD, 'app.ts'), 'v2\\n'); gD('add', '.'); gD('commit', '-qm', 'feat');
+  const L1 = gD('rev-parse', 'HEAD');
+  writeFileSync(join(rD, 'app.ts'), 'v3\\n'); gD('add', '.'); gD('commit', '-qm', 'fix');
+  const L2 = gD('rev-parse', 'HEAD');
+  const bundle = (b, c) => ({ base_sha: b, candidate_sha: c, pr_title: 't', pr_body: 'b', touches_ui: false, matched_paths: [], ui_registry_config_hash: 'c'.repeat(64), pr_context_digest: 'd'.repeat(64) });
+  const FULL_FACES = ['A','B','C','D','E','F','G'].map((f) => ({ face: f, result: f === 'B' ? 'n_a' : 'pass', evidence: f + ' 面走查完成' }));
+  const THIRD_FACES = ['D','E','F','G'].map((f) => ({ face: f, result: 'pass', evidence: f + ' 面走查完成' }));
+  const THIRD_GATES = ['format-gate','rule-compliance','security-privacy-gate','product-arch-gate'].map((g) => ({ gate_id: g, result: 'pass', evidence: g + ' 走查完成' }));
+  const FULL_HARDENING = Array.from({ length: HARDENING_CLASS_COUNT }, (_, i) => ({ class_id: i + 1, result: 'covered', evidence: 'scripts/x.mjs:' + (i + 1) }));
+  const mkV = (reviewer, bnd, findings, closedIds, over = {}) => ({
+    schema_version: SCHEMA_VERSION, reviewer, run_status: 'ok', round: over.round ?? 2, attempt: 1,
+    base_sha: bnd.base_sha, candidate_sha: bnd.candidate_sha, review_input_hash: computeReviewInputHash(bnd),
+    faces: reviewer === 'upstream-preview' ? THIRD_FACES : FULL_FACES,
+    findings, gate_checks: reviewer === 'upstream-preview' ? THIRD_GATES : [],
+    verdict: 'APPROVED', closed_finding_ids: closedIds,
+    ...(reviewer === 'upstream-preview' ? {} : { hardening_coverage: FULL_HARDENING, checklist_version: HARDENING_CHECKLIST_VERSION }),
+    ...over
+  });
+  const INV1 = '状态字段必须只有一个写入 owner';
+  const b1 = bundle(L0, L1);
+  const F1 = { id: 'F1', primary_face: 'A', severity: 'major', anchor: 'app.ts#1', anchor_paths: ['app.ts'], evidence: 'ev-1', status: 'closed', invariant: INV1, family_id: 'fam-1', family_claim: { kind: 'new', reason: 'R1 新发现' } };
+  const r1 = runConsensusGate([
+    mkV('claude-adversarial', b1, [F1], ['F1'], { round: 1 }),
+    mkV('codex-adversarial', b1, [F1], ['F1'], { round: 1 }),
+    mkV('upstream-preview', b1, [], [], { round: 1 })
+  ], { bundle: b1, repoDir: rD });
+  if (r1.gate_result !== 'pass') throw new Error('探针前置失败: R1 未 PASS: ' + JSON.stringify(r1.fail_reasons));
+  const K1 = r1.canonical_findings[0].family_key;
+  const b2 = bundle(L0, L2);
+  // case A（目标·正向）: reuse 引用上一轮真实 key —— 变异前 pass；变异（挖掉传参）后 validator
+  // 收不到 parent → deriveKnownFamilies(null) → reuse 无 parent 必拒 → 合法 R2 失效（变 fail）。
+  // 证明 live 传参是 reuse 合法路径的必要条件（没接线 = 整个 reuse 机制在 live 层不可用）。
+  const F1ok = { id: 'F1k', primary_face: 'A', severity: 'major', anchor: 'app.ts#2', anchor_paths: ['app.ts'], evidence: 'ev-2', status: 'closed', invariant: INV1, family_id: 'fam-1', family_claim: { kind: 'reuse', target_family_key: K1 } };
+  const okGate = runConsensusGate([
+    mkV('claude-adversarial', b2, [F1ok], ['F1k']),
+    mkV('codex-adversarial', b2, [], []),
+    mkV('upstream-preview', b2, [], [])
+  ], { bundle: b2, repoDir: rD, parentArtifact: r1 });
+  // case B（目标·负例）: reuse 自造 key —— 变异前 fail 且点名「不在上一轮 known families」；
+  // 变异后存在性校验路径断：仍 fail（fallback 到「无 parent」）但**消息不再是「不在 known
+  // families」**——目标负例的断言失效（它测的校验被挖掉了），证明原负例挂在 live 传参上。
+  const F1forged = { id: 'F1g', primary_face: 'A', severity: 'major', anchor: 'app.ts#3', anchor_paths: ['app.ts'], evidence: 'ev-3', status: 'closed', invariant: INV1, family_id: 'fam-1', family_claim: { kind: 'reuse', target_family_key: 'fk1-' + 'b'.repeat(64) } };
+  const forgedGate = runConsensusGate([
+    mkV('claude-adversarial', b2, [F1forged], ['F1g']),
+    mkV('codex-adversarial', b2, [], []),
+    mkV('upstream-preview', b2, [], [])
+  ], { bundle: b2, repoDir: rD, parentArtifact: r1 });
+  // case C（控制组）: 缺 claim —— 变异前后都必须 fail 且点名「缺 family_claim」（必填校验
+  // 不依赖 parent 传参——证明挖的是传参，不是 validator 的 claim 必填本体）
+  const F1raw = { id: 'F1r', primary_face: 'A', severity: 'major', anchor: 'app.ts#4', anchor_paths: ['app.ts'], evidence: 'ev-4', status: 'closed', invariant: INV1, family_id: 'fam-1' };
+  const missingClaimGate = runConsensusGate([
+    mkV('claude-adversarial', b2, [F1raw], ['F1r']),
+    mkV('codex-adversarial', b2, [], []),
+    mkV('upstream-preview', b2, [], [])
+  ], { bundle: b2, repoDir: rD, parentArtifact: r1 });
+  rmSync(dD, { recursive: true, force: true });
+  console.log(JSON.stringify({
+    okGate: okGate.gate_result,
+    okGateReasons: okGate.fail_reasons ?? [],
+    forgedGate: forgedGate.gate_result,
+    forgedReasons: forgedGate.fail_reasons ?? [],
+    missingClaimGate: missingClaimGate.gate_result,
+    missingClaimReasons: missingClaimGate.fail_reasons ?? []
+  }));
+} catch (e) {
+  console.log(JSON.stringify({ __probe_error__: String((e && e.stack) || e) }));
+}
+`;
+    const out = execFileSync(process.execPath, ['--input-type=module', '-e', probe], { encoding: 'utf8' });
+    const parsed = JSON.parse(out.trim().split('\n').filter(Boolean).pop());
+    if (parsed && parsed.__probe_error__) throw new Error('探针子进程内部报错: ' + parsed.__probe_error__);
+    // 目标·正向失效: 变异后 validator 收不到 parent（deriveKnownFamilies(null)）→ reuse 无
+    // parent 必拒 → 合法 R2（reuse 上一轮真实 key）变 fail。证明 live 传参是 reuse 合法路径的
+    // 必要条件——没接线的 consensus-gate 会让整个 reuse 机制在 live 层不可用。
+    eq(parsed.okGate, 'fail', '挖掉 live 传参后 reuse 真实 key 正向用例必须失效（变 fail）——证明该正向用例挂在 consensus-gate 的 live 传参上');
+    ok(parsed.okGateReasons.some((e) => /无 parent/.test(e)),
+      '正向失效的拒绝理由必须是「无 parent」（validator 收不到谱系）: ' + JSON.stringify(parsed.okGateReasons));
+    // 目标·负例断言失效: 变异后仍 fail（fallback 无 parent 拒）但**不再点名「不在上一轮 known
+    // families」**——存在性校验路径被挖断，原负例的断言（fail + 点名该消息）失效。
+    eq(parsed.forgedGate, 'fail', '变异后自造 key 仍被拒（fail-closed fallback 到「无 parent」，不放开）');
+    ok(!parsed.forgedReasons.some((e) => /不在上一轮 known families/.test(e)),
+      '变异后自造 key 负例的「不在 known families」断言必须失效（存在性校验路径断了）: ' + JSON.stringify(parsed.forgedReasons));
+    ok(parsed.forgedReasons.some((e) => /无 parent/.test(e)),
+      '变异后自造 key 的拒绝理由是 fallback 的「无 parent」: ' + JSON.stringify(parsed.forgedReasons));
+    // 控制组: 缺 claim 必填校验不依赖 parent 传参——变异后仍 fail 且消息不变
+    eq(parsed.missingClaimGate, 'fail', '控制组: 挖掉传参后缺 claim 负例必须仍 fail（必填校验不依赖 parent 传参——证明挖的是传参，不是 validator 的 claim 必填本体）');
+    ok(parsed.missingClaimReasons.some((e) => /缺 family_claim/.test(e)),
+      '控制组 fail_reasons 必须点名缺 family_claim: ' + JSON.stringify(parsed.missingClaimReasons));
+  } finally {
+    writeFileSync(cgPath, original);
+  }
+});
+
+t('[SC-T7b-INT-3] 变异还原后回归: consensus-gate 恢复原状后，reuse 自造 key 集成负例必须恢复 fail（反向变异探针不留污染）', () => {
+  const dD = mkdtempSync(join(tmpdir(), 't7bint3-'));
+  const rD = join(dD, 'repo');
+  execFileSync('git', ['init', '-q', '-b', 'main', rD]);
+  const gD = (...a) => execFileSync('git', ['-C', rD, ...a], { encoding: 'utf8' }).trim();
+  gD('config', 'user.email', 'o@t'); gD('config', 'user.name', 'o');
+  writeFileSync(join(rD, 'app.ts'), 'v1\n'); gD('add', '.'); gD('commit', '-qm', 'base');
+  const L0 = gD('rev-parse', 'HEAD');
+  writeFileSync(join(rD, 'app.ts'), 'v2\n'); gD('add', '.'); gD('commit', '-qm', 'feat');
+  const L1 = gD('rev-parse', 'HEAD');
+  const INV1 = '状态字段必须只有一个写入 owner';
+  const F1 = { id: 'F1', primary_face: 'A', severity: 'major', anchor: 'app.ts#1', anchor_paths: ['app.ts'], evidence: 'ev-1', status: 'closed', invariant: INV1, family_id: 'fam-1' };
+  const r1 = consensusFor(mkBundle(L0, L1), [
+    { findings: [F1], closed_finding_ids: ['F1'] },
+    { findings: [F1], closed_finding_ids: ['F1'] },
+    {}
+  ], { repoDir: rD }).artifact;
+  const K1 = r1.canonical_findings[0].family_key;
+  writeFileSync(join(rD, 'app.ts'), 'v3 // fixed\n'); gD('add', '.'); gD('commit', '-qm', 'fix');
+  const L2 = gD('rev-parse', 'HEAD');
+  const F1forged = { ...F1, id: 'F1g', family_claim: { kind: 'reuse', target_family_key: 'fk1-' + 'b'.repeat(64) } };
+  const r2bad = consensusFor(mkBundle(L0, L2), [
+    { round: 2, findings: [F1forged], closed_finding_ids: ['F1g'] },
+    { round: 2 },
+    { round: 2 }
+  ], { parentArtifact: r1, repoDir: rD }).artifact;
+  eq(r2bad.gate_result, 'fail', '还原后 reuse 自造 key 必须恢复 fail: ' + JSON.stringify(r2bad.fail_reasons ?? []));
+  rmSync(dD, { recursive: true, force: true });
 });
 
 // ========== 汇总 + SKIPPED ==========
