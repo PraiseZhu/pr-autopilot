@@ -96,19 +96,20 @@ export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, 
   // sc-coverage-gate 强制 kind=archive SC 1:1 覆盖」；sc-coverage-gate.mjs:41 mustCover 含
   // blocker/major）。`status=closed` ≠ 不进 canonical——closed 是「裁决为真且已处置」，进不进
   // canonical 是另一回事。因此判据④必须给 ARCHIVE 留出口，否则合法 ARCHIVE 永远收不了口。
-  // 出口判据 =「该 family 有一条**已验证的 archive SC**」（结果导向，不是自报「已处置」标志
-  // 位——后者是记账式满足，正是 lead 一开始否决的形态）。完整判据三段（SC-T3T4 一致化，
-  // 2026-08-08）：
+  // 出口判据 =「该 family 有一条 archive SC 的**台账 PASS 逐项记录**」（结果导向，不是自报
+  // 「已处置」标志位——后者是记账式满足，正是 lead 一开始否决的形态）。完整判据三段
+  // （SC-T3T4 一致化，2026-08-08；FIX-2 措辞降级 2026-08-08——本门只认 manifest validation
+  // 台账记录，**不把记录当执行证明**）：
   //   ① finding_ids 指向本族 canonical：每个 id 引用一条 canonical finding（源或终版均可），
   //      且其 family_key === 该 SC 的 family_key（防「随便填个 family_key 的 archive SC 冒充出口」）；
-  //   ② 该 SC 真实出现在某个 wave 的 allocations 里；
-  //   ③ 该 wave 的 validation.results 中存在 sc_id === 该 SC 且 status === 'PASS' 的逐项证据
+  //   ② 该 SC 出现在某个 wave 的 allocations 里（台账有该 SC 的分配记录）；
+  //   ③ 该 wave 的 validation.results 中存在 sc_id === 该 SC 且 status === 'PASS' 的逐项记录
   //      （不依赖 validation.ok 自报摘要——空 results 上 every 恒 true）。
-  // **verify 由哪层保证（lead 2026-08-07 一行证据）**：`fix-run.mjs:551` validateIntegration
-  // 对 wave 内全部 SC（含 archive）执行 verify 并强制全 PASS——:572-574 逐 SC 跑 verify recipe、
-  // :643 `results.every((r) => r.status === 'PASS')`、:645 非 PASS 记 failed 阻断。因此
-  // 「archive SC 过 verify」由 fix-run 的 wave validation 层保证，闭合门不扩（按确认门：删掉
-  // 它其他判断仍成立——verify 记录已随 run manifest validation 入 hash，push-guard 校验之）。
+  // **记录由哪层产生（T1 如实声明）**：正常 fix-run 路径下 `fix-run.mjs:551` validateIntegration
+  // 对 wave 内全部 SC（含 archive）执行 verify 并写 results——:572-574 逐 SC 跑 verify recipe、
+  // :643 `results.every((r) => r.status === 'PASS')`、:645 非 PASS 记 failed 阻断。本门校验的是
+  // **台账记录本身**（该 SC 有 PASS 逐项记录），**不是执行证明**——记录可被手改（无签名/存证），
+  // 与 :27-31 T1 免责一致。
   const finKeys = new Set((finalArtifact.canonical_findings ?? []).map((c) => c.family_key).filter(Boolean));
   // 本批已处置族的 archive SC 集合（结果导向出口，2026-08-07 按注释声明收紧）——
   // 注释 :100-102 声称「finding_ids 引用的 canonical finding 的 family_key 就是本族」，
@@ -116,10 +117,10 @@ export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, 
   // validation/sc_manifest_hash 同样零次——注释描述了一道没实现的检查（读的人会以为它在拦）。
   // 收紧为：① 该 archive SC 的 finding_ids 必须指向本族（每个 id 引用一条 canonical finding，
   //    且该 finding 的 family_key 必须等于该 SC 的 family_key——防「随便填个 family_key 的
-  //    archive SC 冒充出口」）；② 该 archive SC 必须真实出现在某个 wave 的 allocations 里
-  //    且该 wave 的 validation.results 中有 sc_id === 该 SC 且 status === 'PASS' 的逐项证据
-  //    （补上委派链断点：「有 archive SC」≠「执行过」；不再看 validation.ok——见下方
-  //    :137-140 的变更理由）。
+  //    archive SC 冒充出口」）；② 该 archive SC 出现在某个 wave 的 allocations 里
+  //    且该 wave 的 validation.results 中有 sc_id === 该 SC 且 status === 'PASS' 的逐项记录
+  //    （补上委派链断点：「有 archive SC」≠「有 PASS 记录」；不再看 validation.ok——见下方
+  //    :137-140 的变更理由。FIX-2：台账记录非执行证明，与 :27-31 T1 免责一致）。
   // 注意：canonical finding 的 family_key 从 invariant 派生（consensus-gate 的 familyKeyOf），
   // SC manifest 里的 family_key 是引用同一派生的字符串，可直接比对。finding_ids 引用的
   // canonical 可能是源共识的（archive SC 处置源共识发现的 finding，scManifest 的 finding_ids

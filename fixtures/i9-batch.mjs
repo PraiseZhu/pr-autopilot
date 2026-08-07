@@ -619,10 +619,11 @@ const scManifestWithArchFK1 = {
   ...scManifest,
   scs: [...scManifest.scs, { id: 'SC-ARCH-FK1', kind: 'archive', finding_ids: [cF1.id], invariant: I1, family_key: FK1, change: '登记 FK1 残余', holds: 'README 含 FK1 文案', verify: { cmd: 'grep', args: ['-q', 'FK1', 'README.md'] } }]
 };
-t('[i9-batch-14a] 冻结 family 被 ARCHIVE 处置（终版有该族 + 带 archive SC 且该 SC 真实执行过）→ 判据④放行（出口生效）', () => {
-  // 2026-08-07 收紧（集成审查）+ 2026-08-08 一致化（SC-T3T4）：出口判据三段——该 archive SC
-  // 的 finding_ids 指向本族 canonical + 真实出现在某 wave allocations + 该 wave validation.results
-  // 含 {sc_id, status:'PASS'} 逐项证据（不依赖 validation.ok 自报摘要；空 results 上 every 恒 true）。
+t('[i9-batch-14a] 冻结 family 被 ARCHIVE 处置（终版有该族 + 带 archive SC 且有 PASS 台账记录）→ 判据④放行（出口生效）', () => {
+  // 2026-08-07 收紧（集成审查）+ 2026-08-08 一致化（SC-T3T4）+ FIX-2 措辞降级：出口判据三段——
+  // 该 archive SC 的 finding_ids 指向本族 canonical + 出现在某 wave allocations + 该 wave
+  // validation.results 含 {sc_id, status:'PASS'} 逐项记录（台账记录非执行证明，不依赖
+  // validation.ok 自报摘要；空 results 上 every 恒 true）。
   // 构造：recurRunManifest 的 wave0 加 SC-ARCH-FK1 的 allocation + results 逐项 PASS。
   const executedRunManifest = {
     ...recurRunManifest,
@@ -631,13 +632,13 @@ t('[i9-batch-14a] 冻结 family 被 ARCHIVE 处置（终版有该族 + 带 archi
       : w))
   };
   const errs = checkBatchClosure({ runManifest: executedRunManifest, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest: scManifestWithArchFK1 });
-  ok(!errs.some((e) => /同族复发/.test(e)), '带 FK1 的 archive SC 且真实执行过 → FK1 复发应被出口放行: ' + JSON.stringify(errs));
-  // 反向：archive SC 存在但未出现在任何 wave allocations（委派链断）→ 出口不成立，仍拒
+  ok(!errs.some((e) => /同族复发/.test(e)), '带 FK1 的 archive SC 且有 PASS 台账记录 → FK1 复发应被出口放行: ' + JSON.stringify(errs));
+  // 反向：archive SC 存在但未出现在任何 wave allocations（无分配台账）→ 出口不成立，仍拒
   const notExecuted = { ...recurRunManifest, waves: (recurRunManifest.waves ?? []).map((w) => ({ ...w, allocations: [], validation: { at: 't', ok: true, results: [] } })) };
   const errsNotExec = checkBatchClosure({ runManifest: notExecuted, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest: scManifestWithArchFK1 });
-  ok(errsNotExec.some((e) => /同族复发/.test(e)), 'archive SC 未真实执行（allocations 空）→ 出口不成立，仍拒: ' + JSON.stringify(errsNotExec));
+  ok(errsNotExec.some((e) => /同族复发/.test(e)), 'archive SC 无 PASS 台账记录（allocations 空）→ 出口不成立，仍拒: ' + JSON.stringify(errsNotExec));
   // 2026-08-07 复核 major 负例①：validation {ok:true, results:[]}（空 results——fix-run:643 的
-  // results.every 空数组恒 true，ok:true 是自报摘要）→ 该 archive SC 的 verify 从未执行 → 出口不成立
+  // results.every 空数组恒 true，ok:true 是自报摘要）→ 该 archive SC 无 PASS 台账记录 → 出口不成立
   const emptyResults = { ...recurRunManifest, waves: (recurRunManifest.waves ?? []).map((w, i) => (i === 0
     ? { ...w, allocations: [{ group_id: 'arch', sc_ids: ['SC-ARCH-FK1'], worktree: '/x', anchor_paths: ['README.md'] }], validation: { at: 't', ok: true, results: [] } }
     : w)) };
