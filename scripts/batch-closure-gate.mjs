@@ -90,8 +90,23 @@ export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, 
   }
 
   // ④ 全处置（冻结集 ∩ 终版 family_keys 必须为空——终版再次出现 = 同族复发 = 未处置）
+  // R4 实测（lead 2026-08-07 查证 + 实测定论）: 一个被 ARCHIVE 的 family **会带着 archive SC
+  // 留在终版 canonical_findings 里**（SKILL.md:507「ARCHIVE | 留在 findings[] | 进 canonical，
+  // sc-coverage-gate 强制 kind=archive SC 1:1 覆盖」；sc-coverage-gate.mjs:41 mustCover 含
+  // blocker/major）。`status=closed` ≠ 不进 canonical——closed 是「裁决为真且已处置」，进不进
+  // canonical 是另一回事。因此判据④必须给 ARCHIVE 留出口，否则合法 ARCHIVE 永远收不了口。
+  // 出口判据 =「该 family 有一条**已验证的 archive SC**」（结果导向，不是自报「已处置」标志
+  // 位——后者是记账式满足，正是 lead 一开始否决的形态）: archive SC 必须真实存在于 sc
+  // manifest 且其 finding_ids 引用的 canonical finding 的 family_key 就是本族，且本批 SC
+  // manifest 里存在该 archive SC（含 kind=archive）。
   const finKeys = new Set((finalArtifact.canonical_findings ?? []).map((c) => c.family_key).filter(Boolean));
-  const recurred = frozen.filter((fk) => finKeys.has(fk));
+  // 本批已处置族的 archive SC 集合：kind=archive 且 family_key ∈ frozen 的 SC（结果导向出口）
+  const archiveScFamilies = new Set(
+    (Array.isArray(scManifest.scs) ? scManifest.scs : [])
+      .filter((sc) => sc.kind === 'archive' && typeof sc.family_key === 'string' && sc.family_key)
+      .map((sc) => sc.family_key)
+  );
+  const recurred = frozen.filter((fk) => finKeys.has(fk) && !archiveScFamilies.has(fk));
   if (recurred.length) {
     for (const fk of recurred) {
       errs.push(`冻结集 family_key ${fk.slice(0, 12)}… 在终版共识中再次出现（同族复发：上次未修住或未 ARCHIVE，不得作为处置兑现，拒收口；按 i9-batch Task 4 须先产出归因六件套）`);
