@@ -343,6 +343,29 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
               for (const s of recorded) {
                 if (!revs.includes(s)) errors.push(`run manifest 登记的 squash ${s.slice(0, 12)} 不在最终链上（记录与历史不符，fail-closed）`);
               }
+              // i9-batch: 批次「恰好一个后继」校验——批次是事务：冻结集一次修完产出**恰好一个**
+              // 后继 commit。successor_sha 必须是 frozen_at_sha 的**直接后继**（rev-list 恰好 1
+              // 个 commit），不是任意祖先关系；run 起点（source_candidate）之外的批次起点被拦
+              // （批次起点必须由 run 起点派生，batch-closure-gate ② 同判据，此处独立重验）。
+              const batch = runManifest.batch ?? null;
+              if (batch) {
+                if (batch.status !== 'closed') {
+                  errors.push(`run manifest 批次 ${batch.batch_id} status=${JSON.stringify(batch.status)} ≠ closed（批次未收口，不得 push）`);
+                } else {
+                  if (batch.frozen_at_sha !== runManifest.source_candidate) {
+                    errors.push(`批次 frozen_at_sha（${String(batch.frozen_at_sha).slice(0, 12)}）≠ run 起点 source_candidate（${String(runManifest.source_candidate).slice(0, 12)}）——批次起点必须由 run 起点派生，不接受自报（i9-batch）`);
+                  }
+                  if (batch.successor_sha !== finalTip) {
+                    errors.push(`批次 successor_sha（${String(batch.successor_sha).slice(0, 12)}）≠ 最终 integrated_tip（${finalTip.slice(0, 12)}）——批次后继必须等于 run 的最终候选（i9-batch）`);
+                  }
+                  if (batch.successor_sha === finalTip && batch.frozen_at_sha === runManifest.source_candidate) {
+                    const count = gitT(repoDir, 'rev-list', '--count', `${batch.frozen_at_sha}..${batch.successor_sha}`);
+                    if (count !== '1') {
+                      errors.push(`批次「恰好一个后继」失败: frozen_at_sha..successor_sha 有 ${count} 个 commit（须恰好 1——批次是一次修完的事务，产出多个 commit = 批次被拆散，i9-batch）`);
+                    }
+                  }
+                }
+              }
             } catch (e) { errors.push(`DAG lineage 校验失败（fail-closed）: ${e.message}`); }
           }
         }
