@@ -100,6 +100,11 @@ export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, 
   // 位——后者是记账式满足，正是 lead 一开始否决的形态）: archive SC 必须真实存在于 sc
   // manifest 且其 finding_ids 引用的 canonical finding 的 family_key 就是本族，且本批 SC
   // manifest 里存在该 archive SC（含 kind=archive）。
+  // **verify 由哪层保证（lead 2026-08-07 一行证据）**：`fix-run.mjs:551` validateIntegration
+  // 对 wave 内全部 SC（含 archive）执行 verify 并强制全 PASS——:572-574 逐 SC 跑 verify recipe、
+  // :643 `results.every((r) => r.status === 'PASS')`、:645 非 PASS 记 failed 阻断。因此
+  // 「archive SC 过 verify」由 fix-run 的 wave validation 层保证，闭合门不扩（按确认门：删掉
+  // 它其他判断仍成立——verify 记录已随 run manifest validation 入 hash，push-guard 校验之）。
   const finKeys = new Set((finalArtifact.canonical_findings ?? []).map((c) => c.family_key).filter(Boolean));
   // 本批已处置族的 archive SC 集合：kind=archive 且 family_key ∈ frozen 的 SC（结果导向出口）
   const archiveScFamilies = new Set(
