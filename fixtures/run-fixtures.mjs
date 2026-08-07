@@ -52,7 +52,7 @@ import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from '../scripts/l
 import { contractSpec, contractDigest, emitContract, requiredLiterals, checkDispatchPackage, SEATS, ALL_FACES } from '../scripts/dispatch-contract.mjs';
 import { loadFormatConfig, evaluateFormat, formatConfigHash, hasSection, EMPTY_FORMAT_CONFIG,
   titleTypeRe as titleTypeReRef, TITLE_VAGUE_RE as TITLE_VAGUE_RE_REF } from '../scripts/pr-format-gate.mjs';
-import { DEFAULT_REQUIREMENTS } from '../scripts/verdict-validate.mjs';
+import { DEFAULT_REQUIREMENTS, HARDENING_NA_EVIDENCE_MIN_LENGTH } from '../scripts/verdict-validate.mjs';
 
 let pass = 0, failCount = 0;
 const failures = [];
@@ -3653,8 +3653,9 @@ t('[SC-11] anchor_paths: 目录（无尾斜杠）拒 / 超 cap degraded / 重复
 
 t('[SC-12] live 契约一致性: SKILL/references 与 validator/push-guard 实际要求逐字对齐', () => {
   const skill = readFileSync(join(S, '../skills/submit-pr/SKILL.md'), 'utf8');
-  // schema 版本: 必须写 v2（旧版写 v1 → live reviewer 产物全 degraded）
-  ok(/review-verdict\.schema\.json` \*\*v2\*\*/.test(skill), 'SKILL 必须声明 verdict schema v2');
+  // schema 版本: 必须写 v3（v2→v3 迁移已完成；残留旧版 → live reviewer 产物全 degraded）
+  ok(/review-verdict\.schema\.json` \*\*v3\*\*/.test(skill), 'SKILL 必须声明 verdict schema v3');
+  ok(!/review-verdict\.schema\.json` \*\*v2\*\*/.test(skill), '不得残留 v2 声明（v2→v3 迁移已完成）');
   ok(!/schemas\/review-verdict\.schema\.json v1/.test(skill), '不得残留 v1 声明');
   // anchor_paths 填写要求必须在场（分组唯一输入）
   ok(skill.includes('anchor_paths'), 'SKILL 必须说明 anchor_paths 填写要求');
@@ -3671,9 +3672,10 @@ t('[SC-12] live 契约一致性: SKILL/references 与 validator/push-guard 实�
   }
   ok(!skill.includes('--source-candidate'), '不得残留 CLI 自报起点参数（SC-R3-10: 起点由 artifact 派生）');
   ok(!/cherry-pick 逐组叠加/.test(skill), '不得残留 cherry-pick 冒充串行重跑的旧文案（SC-R3-9）');
-  // validator 实际只收 v2（与文档对齐）
   const vv = readFileSync(join(S, 'verdict-validate.mjs'), 'utf8');
-  ok(/schema_version === 'v3'/.test(vv), 'validator 应只收 v3');
+  // validator 的 schema_version 判等必须用从 schema 派生的常量，不得手拄字面量
+  ok(/schema_version === SCHEMA_VERSION/.test(vv), 'validator 的 schema_version 判等必须用派生常量，不得手拄字面量');
+  ok(!/schema_version === 'v[0-9]/.test(vv), 'validator 不得残留 schema_version 硬编码字面量比较');
   // SC-R3-6: push-guard 不得再强制 legacy sc_hash/sc_list（文档≡实现）
   const pg = readFileSync(join(S, 'push-guard.mjs'), 'utf8');
   ok(!pg.includes('必须携带 sc_hash'), 'push-guard 不得再强制 legacy sc_hash/sc_list');
@@ -5289,8 +5291,8 @@ t('[D1-DC] 两侧同源（D1 核心不变量）: 契约段声明的 gate 集合 
   eq(advSpec.required_gate_ids, [], '对抗席不承担 gate_checks 必填');
   eq(advSpec.required_faces, ALL_FACES, '对抗席必须七面');
   eq(advSpec.faces_exact, true);
-  eq(advSpec.hardening, { required: true, checklist_version: HARDENING_CHECKLIST_VERSION, class_count: HARDENING_CLASS_COUNT });
-  eq(contractSpec({ seat: 'claude-adversarial', round: 2 }).hardening, { required: true, checklist_version: HARDENING_CHECKLIST_VERSION, class_count: HARDENING_CLASS_COUNT }, 'round>=2 对抗席同样强制穷举（与 validator 同条件，issue #9 SC-B）');
+  eq(advSpec.hardening, { required: true, checklist_version: HARDENING_CHECKLIST_VERSION, class_count: HARDENING_CLASS_COUNT, na_evidence_min_length: HARDENING_NA_EVIDENCE_MIN_LENGTH });
+  eq(contractSpec({ seat: 'claude-adversarial', round: 2 }).hardening, { required: true, checklist_version: HARDENING_CHECKLIST_VERSION, class_count: HARDENING_CLASS_COUNT, na_evidence_min_length: HARDENING_NA_EVIDENCE_MIN_LENGTH }, 'round>=2 对抗席同样强制穷举（与 validator 同条件，issue #9 SC-B）');
   eq(contractSpec({ seat: 'upstream-preview', round: 1 }).hardening, { required: false }, '第三席不强制穷举');
 });
 
