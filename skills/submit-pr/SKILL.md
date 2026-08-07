@@ -163,7 +163,7 @@ node scripts/dispatch-contract.mjs --check pkg-<seat>.md --seat <reviewer> --rou
 
 | 席 | 模型/档位 | lens | 边界 |
 |---|---|---|---|
-| ① claude-adversarial | claude-sonnet-5 / xhigh | 正确性 / 回归 / 影响面 | 盲审：不见其他席 finding |
+| ① claude-adversarial | anthropic-claude/claude-sonnet-5 / xhigh（Cindy AI 网关供应商，owner 2026-08-08 拍板替换裸 claude-sonnet-5） | 正确性 / 回归 / 影响面 | 盲审：不见其他席 finding |
 | ② codex-adversarial | codex/gpt-5.6-terra（骨折）/ xhigh；**条件升档**：本次 diff 路径命中目标仓 pr-rules.json `archGate.corePaths` → 该席 effort=ultra，派发说明标注原因 | 安全 / 边界 / 规范 | 盲审：同上 |
 | ③ upstream-preview | deepseek/deepseek-v4-flash / max（owner 2026-08-08 替换 claude-sonnet-5/xhigh） | review-pr skill 口径预演（规则遵从/安全隐私门/格式门/产品·架构门语义预判） | **严格只读**：禁止发 GitHub review/评论/合并/标签等一切对外写动作，只产内部报告 |
 
