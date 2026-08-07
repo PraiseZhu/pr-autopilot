@@ -146,13 +146,15 @@ export REQUIRED_CONTEXTS_FILE=/path/to/required-contexts.json
 ```
 
 ```json
-{ "xindong/mivo-canvas": ["ci/mivo-canvas", "ci/e2e-smoke"] }
+{ "<owner>/<repo>": ["<用下面 gh api 命令取到的实际 context 名>"] }
 ```
 
 - **格式**：`{"owner/repo": ["ctx 名"]}`（`deploy/wrappers/gh-snapshot.mjs` 读 JSON 后按 `[owner/repo] ?? []` 取值）。
 - **接线位置是 `deploy/wrappers/gh-snapshot.mjs` 的运行时 env 读取，不是 `env.sh`**：gh-snapshot 是引擎的**子进程**，读的是调度/launchd 注入的进程环境；`env.sh` 是班车会话自己 source 的文件，往里面塞这个变量，引擎子进程根本看不到——别人就是这么塞的，塞了没生效。要注入到跑引擎的那层环境（与 FEISHU_* 同法：launchctl setenv 或 plist EnvironmentVariables）。
 - **取值权威来源 = 分支保护 API 的实际值，不是人手抄 workflow 名**：`gh api repos/{owner}/{repo}/branches/main/protection --jq '.required_status_checks.contexts'`（或仓库 Settings → Branches → 保护规则 → Require status checks 里看到的清单）。手抄名字会漂移——分支保护里改名/增删后，清单不跟着变，CI 判绿就失真。
-- **`SKIPPED` 不算绿，会 SKIPPED 的 check 绝对不能进这份清单**：gh-snapshot 归一化 check-run 时只有 `conclusion == success` 才映射为绿，`skipped`/`neutral`/`cancelled` 一律非绿（`scripts/ci-readiness.mjs`：`entry.state !== 'success'` → fail-closed 非绿）。按路径过滤的 job（改动不命中就 SKIPPED）一旦进清单，该 PR 永远判不绿。
+- **两类 check 绝对不能进这份清单（同一类陷阱的两个变种）**：
+  - **`SKIPPED` 不算绿**：gh-snapshot 归一化 check-run 时只有 `conclusion == success` 才映射为绿，`skipped`/`neutral`/`cancelled` 一律非绿（`scripts/ci-readiness.mjs`：`entry.state !== 'success'` → fail-closed 非绿）。按路径过滤的 job（改动不命中就 SKIPPED）一旦进清单，该 PR 永远判不绿。
+  - **只在 `pull_request` 事件上跑的 job 同样不能列**：它在 main push 上根本不产生 check，列进去 = 永远等一个不会来的绿。真实案例（mivo 仓 `.github/workflows/deploy-green-ref.yml` 注释原文，本机踩过并写死在注释里的教训）：「e2e 系列 job 都是 pull_request-only，main push 上不存在，不能列（列了 ref 永远不动）；bench / deps audit / semgrep baseline / coverage report 是设计上的非阻断，不纳入」——**设计上非阻断的 job（bench / audit / baseline / coverage 类）也不进清单**。
 - **没配/文件缺失 = fail-closed 非绿**：gh-snapshot 对未配置的 required 返回 `green: false` + `['required contexts 未配置（fail-closed）']` → 引擎每轮都以为 CI 红 → 反复唤醒。这又是一个「看起来像别的问题」的症状，实际只是清单没配。
 
 **③ preRunHook 必须用 `deploy/wrappers/probe.mjs`，别自己造一个**
@@ -162,6 +164,11 @@ export REQUIRED_CONTEXTS_FILE=/path/to/required-contexts.json
 - 协议：exit 0 = 有活 → 放行班车 agent 会话（引擎 + 队列投递）；exit 2 = 无活 → 跳过本轮，**零 token**，只花几次带 ETag 的 gh API 读。
 - 它的判定**复用引擎同源模块**（`gate.evaluate` / `stateFileName` 文法），信号逻辑与引擎是**同一套**——自己另写一个探针等于造第二套判定，两套迟早不一致（探针说有活、引擎说没活，或反过来），凭空多一个故障面。
 - 探针自身异常 → exit 0 放行（可用性优先：让完整引擎 + 通知链去暴露问题，而不是让探针静默扼杀所有轮次）。
+
+**④ 多实例部署（2026-08-07 从外部部署者真实踩坑回填）**
+
+- **双机同时巡审：目前没有内建的按作者分片手段**。实测核实：review-pr 的 `--auto` 批量扫**所有**可审查的 open、非 draft PR，无作者过滤参数；pr-autopilot 引擎按 state 目录扫全部在册 PR，注册（`register.mjs`）也不含 author 维度。两台机器各自跑巡审会**抢同一批 PR**：同一 PR 被两家重复审查、重复评论（selfFixAuthors 触发还会交叉改同一 PR）。**这是 T1 之外的真实空缺**，不是设计限制——分片能力尚未建，别以为有什么参数能解决。现状下的缓解只有人工约定：错开时间窗、或让每台机器只管自己注册进盯梢的 PR（pr-autopilot 的盯梢按注册隔离，谁注册谁盯；但注册与巡审是两条独立链路，巡审侧的抢单不受注册隔离保护）。
+- **`engine-mivo.json` 不能直接拷** —— ⚠️ 里面的 `feishuCmd` / `slackCmd` 是指向**本机 owner** 的告警脚本路径（bug-doctor notify.mjs 的 Slack 通道、feishu-alert.mjs 的飞书通道）：原样拷过去 = 对方机器上的巡审结果、预算告警、健康告警**发进我们的群里**，等于把我们机器的通知目标装到了别人机器上。部署者必须**本地化通知配置**（把这两个字段改成自己的告警通道）。这条没有机器门在拦——字段只是路径字符串，机器无法验证它指向谁的通知——纯靠部署时自觉，写在这里就是要让这份拷贝刺眼。
 
 ## 3. 每日卡片调度（§3）
 
