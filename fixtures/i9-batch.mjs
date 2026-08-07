@@ -61,7 +61,9 @@ function mkBundle(baseSha, candidateSha, over = {}) {
   return {
     base_sha: baseSha, candidate_sha: candidateSha, pr_title: 't', pr_body: 'b',
     touches_ui: false, matched_paths: [],
-    ui_registry_config_hash: 'c'.repeat(64), pr_context_digest: 'd'.repeat(64), ...over
+    ui_registry_config_hash: 'c'.repeat(64), pr_context_digest: 'd'.repeat(64),
+    pr_number: over.pr_number !== undefined ? over.pr_number : null, // R4: 默认 null（无 PR 直跑三审合法），可覆盖
+    ...over
   };
 }
 function withAnchorPaths(findings) {
@@ -308,7 +310,8 @@ console.log('\n[i9-batch-10] 缺 invariant 无法归族：blocker/major 无 fami
 // （T1 防漂移纵深）。此处手工构造缺族 artifact（合法结构 + hash 自洽），测闭合门判据⑥本身。
 function mkNoFamilyArtifact(baseSha, candidateSha, over = {}) {
   const draft = {
-    schema_version: 'v3', review_input_hash: computeReviewInputHash(mkBundle(baseSha, candidateSha)),
+    schema_version: readJson(join(S, '..', 'schemas', 'consensus-artifact.schema.json')).properties.schema_version.const,
+    review_input_hash: computeReviewInputHash(mkBundle(baseSha, candidateSha)),
     parent_artifact_hash: null, round: 1, base_sha: baseSha, candidate_sha: candidateSha,
     canonical_findings: [{
       canonical_key: 'A|src/fix1.ts|x', id: 'hand1',
@@ -318,7 +321,7 @@ function mkNoFamilyArtifact(baseSha, candidateSha, over = {}) {
       // 无 invariant → 无 family_key（缺归族）
     }],
     verdict_hashes: { 'claude-adversarial': 'x'.repeat(64), 'codex-adversarial': 'x'.repeat(64), 'upstream-preview': 'x'.repeat(64) },
-    created_at: 't', gate_result: 'pass', fail_reasons: [], ...over
+    created_at: 't', gate_result: 'pass', fail_reasons: [], pr_number: null, ...over
   };
   return { ...draft, consensus_artifact_hash: recomputeArtifactHash(draft) };
 }
@@ -454,6 +457,39 @@ t('[i9-batch-12c] 可选通道改名不能静默：typo 字段名（out_of_scope
   const errs = validateVerdict(v);
   ok(errs.some((e) => /verdict 存在未知顶层字段: out_of_scope_note/.test(e)),
     'typo 字段名必须被 TOP_LEVEL_KEYS 拦（fail loud，不得静默放走内容）: ' + JSON.stringify(errs));
+});
+
+// ========== [i9-batch-13] pr_number PR 身份绑定（R4 修复①，审查席精确形状） ==========
+console.log('\n[i9-batch-13] pr_number 跨 PR 张冠李戴被拦（parent 有 PR 号时 ≠ bundle 即拒）');
+// 审查席实测形状：bundle A（PR-A, candidate=L1）生成 R1；bundle B（PR-B, candidate=L2，L1 是 L2 祖先、base 相同）
+// 拿 A 当 B 的 R2 parent——此前 pass 且 fail_reasons=[]。现在 parent.pr_number=PR-A ≠ bundle.pr_number=PR-B → 拒。
+const prASrc = consensusFor(mkBundle(L0, L1, { pr_number: 101 }), [[f1, f2], [f1, f2], [f1, f2]], { repoDir: repo });
+ok(prASrc.gate_result === 'pass', '[i9-batch-13] 前提失败: PR-A R1 未 PASS: ' + JSON.stringify(prASrc.fail_reasons ?? []));
+t('[i9-batch-13a] 反例：base 相同 + candidate 真祖先 + pr_number 不同 → 拒（张冠李戴）', () => {
+  const r2Cross = consensusFor(mkBundle(L0, L2, { pr_number: 202 }), [[], [], []], {
+    round: 2, attempt: 1, repoDir: repo,
+    gateOpts: { parentArtifact: prASrc, repoDir: repo }
+  });
+  ok(r2Cross.gate_result === 'fail', '[i9-batch-13a] 跨 PR 的 R2 必须 fail: ' + JSON.stringify(r2Cross.fail_reasons ?? []));
+  ok((r2Cross.fail_reasons ?? []).some((e) => /parent artifact pr_number=101 ≠ 当前 bundle\.pr_number=202/.test(e)),
+    '必须精确报出 pr_number 不符: ' + JSON.stringify(r2Cross.fail_reasons ?? []));
+});
+t('[i9-batch-13b] 正例：同 PR（R1=PR-A 101 → R2=PR-A 101）→ 通过', () => {
+  const r2Same = consensusFor(mkBundle(L0, L2, { pr_number: 101 }), [[], [], []], {
+    round: 2, attempt: 1, repoDir: repo,
+    gateOpts: { parentArtifact: prASrc, repoDir: repo }
+  });
+  ok(r2Same.gate_result === 'pass', '同 PR 的 R2 应 PASS: ' + JSON.stringify(r2Same.fail_reasons ?? []));
+});
+t('[i9-batch-13c] 合法演进：R1 无 PR（null）→ R2 有 PR（201）→ 通过（不误伤）', () => {
+  const r1NoPr = consensusFor(mkBundle(L0, L1), [[f1, f2], [f1, f2], [f1, f2]], { repoDir: repo }); // pr_number=null
+  ok(r1NoPr.gate_result === 'pass', '[i9-batch-13c] 前提失败: 无 PR R1 未 PASS: ' + JSON.stringify(r1NoPr.fail_reasons ?? []));
+  ok(r1NoPr.pr_number === null, 'R1 无 PR 时 artifact.pr_number 应为 null');
+  const r2WithPr = consensusFor(mkBundle(L0, L2, { pr_number: 201 }), [[], [], []], {
+    round: 2, attempt: 1, repoDir: repo,
+    gateOpts: { parentArtifact: r1NoPr, repoDir: repo }
+  });
+  ok(r2WithPr.gate_result === 'pass', '无 PR R1 → 有 PR R2 是合法演进，应 PASS: ' + JSON.stringify(r2WithPr.fail_reasons ?? []));
 });
 
 // ========== [i9-batch-6] 批次严格后代语义（lead 撤回「直接后继」后） ==========
