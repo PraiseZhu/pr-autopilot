@@ -147,15 +147,23 @@ export function runConsensusGate(verdicts, opts = {}) {
     if (!parentArtifact) {
       failReasons.push(`delta 轮（round=${round}）未绑定上一轮 artifact：缺 --parent / parentArtifact——SC-B 谱系门不允许 fail-open`);
     } else {
-      const parentReal = recomputeArtifactHash(parentArtifact);
-      if (parentArtifact.consensus_artifact_hash !== parentReal) {
-        failReasons.push('parent artifact 自身 hash 与内容重算不符（parent 被伪造/篡改，SC-B fail-closed）');
-      } else if (parentArtifact.gate_result !== 'pass') {
-        failReasons.push(`parent artifact gate_result=${parentArtifact.gate_result} ≠ pass（只有 PASS 共识才能作 parent，SC-B）`);
-      } else if (parentArtifact.round !== round - 1) {
-        failReasons.push(`parent artifact round=${parentArtifact.round} ≠ 当前 round-1=${round - 1}（父 round 跳号被拦，SC-B）`);
+      // issue #9 R2 blocker: parent 结构门先于 hash 自洽——parent.schema_version 被改成 v1
+      // 后一样能按当前公式重算出自洽 hash（hash 自洽挡不住"篡改后照公式重算"这类确定性
+      // 攻击），唯一能拦的是独立于 hash 结果的显式结构校验（SC-R2-3）。
+      const parentShapeErrs = assertArtifactShape(parentArtifact, 'parent artifact');
+      if (parentShapeErrs.length) {
+        for (const e of parentShapeErrs) failReasons.push(e);
       } else {
-        parentArtifactHash = parentArtifact.consensus_artifact_hash;
+        const parentReal = recomputeArtifactHash(parentArtifact);
+        if (parentArtifact.consensus_artifact_hash !== parentReal) {
+          failReasons.push('parent artifact 自身 hash 与内容重算不符（parent 被伪造/篡改，SC-B fail-closed）');
+        } else if (parentArtifact.gate_result !== 'pass') {
+          failReasons.push(`parent artifact gate_result=${parentArtifact.gate_result} ≠ pass（只有 PASS 共识才能作 parent，SC-B）`);
+        } else if (parentArtifact.round !== round - 1) {
+          failReasons.push(`parent artifact round=${parentArtifact.round} ≠ 当前 round-1=${round - 1}（父 round 跳号被拦，SC-B）`);
+        } else {
+          parentArtifactHash = parentArtifact.consensus_artifact_hash;
+        }
       }
     }
   }
@@ -256,14 +264,13 @@ export function runConsensusGate(verdicts, opts = {}) {
   const candidate_sha = verdicts[0].candidate_sha;
   // 审③-F4-R: base/candidate 必须入锅——只改 artifact 声明的 SHA 即 hash 失效
   // SC-3: parent_artifact_hash 一并入锅——谱系被换即 hash 失效
-  // issue #9 SC-A1: gate_result 与 round 追加在末尾入锅（不重排既有字段顺序）——此前
-  // gate_result 未入 hash，PASS↔fail 互改而 hash 不变，手工拼一份 fail artifact 能冒充源共识。
-  const consensus_artifact_hash = sha256(
-    base_sha + candidate_sha + review_input_hash + canonicalJson(canonical_findings) + canonicalJson(verdict_hashes) +
-    canonicalJson({ parent: parentArtifactHash }) +
-    canonicalJson({ gate_result: 'pass', round })
-  );
-  return {
+  // issue #9 SC-A1: gate_result 与 round 入锅——PASS↔fail 互改而 hash 不变，手工拼一份
+  // fail artifact 能冒充源共识。
+  // issue #9 R2 blocker: hash 不再在此处手抄第二份公式——直接调 recomputeArtifactHash 对
+  // 草稿对象计算，公式改动（如追加 schema_version）只有一处，不会出现"改了消费端却忘了
+  // 同步构造端"这种本仓 hardening 台账反复出现的第 7 类教训（SC-A1 曾经的教训，schema_version
+  // 追加时差点再踩一次）。
+  const draft = {
     schema_version: 'v3',
     review_input_hash,
     parent_artifact_hash: parentArtifactHash,
@@ -272,22 +279,64 @@ export function runConsensusGate(verdicts, opts = {}) {
     candidate_sha,
     canonical_findings,
     verdict_hashes,
-    consensus_artifact_hash,
     created_at: nowIso(),
     gate_result: 'pass',
     fail_reasons: []
   };
+  return { ...draft, consensus_artifact_hash: recomputeArtifactHash(draft) };
 }
 
 // push-guard 复用: 从 artifact 内容重算 hash（F4: 不信自报字符串；F4-R: 含 base/candidate）
 // issue #9 SC-A1: gate_result/round 追加入锅——任一字段翻转即 hash 失效（末尾追加，不重排既有字段）。
+// issue #9 R2 blocker: round/gate_result 去掉 `?? null` 静默兜底——缺字段是结构错误，必须
+// 直接拒绝计算，不得悄悄哈希出一个"看起来合法"的值（SC-R2-2/5）。schema_version 追加入锅
+// （SC-R2-4）：这只挡住"改字段却忘记/懒得重算 hash"的自洽性检查，挡不住"篡改后照同一公式
+// 重算"这类确定性攻击——后者只能靠 assertArtifactShape 独立于 hash 结果的显式结构校验来拒绝
+// （SC-R2-1/2/3，见该函数注释）。
 export function recomputeArtifactHash(artifact) {
+  if (!Number.isInteger(artifact.round)) {
+    throw new Error(`recomputeArtifactHash: artifact.round 非整数（缺字段不再静默兜底为 null，issue #9 R2 blocker）: ${JSON.stringify(artifact.round)}`);
+  }
+  if (artifact.gate_result !== 'pass' && artifact.gate_result !== 'fail') {
+    throw new Error(`recomputeArtifactHash: artifact.gate_result 非法（缺字段不再静默兜底为 null，issue #9 R2 blocker）: ${JSON.stringify(artifact.gate_result)}`);
+  }
   return sha256(
     artifact.base_sha + artifact.candidate_sha + artifact.review_input_hash +
     canonicalJson(artifact.canonical_findings) + canonicalJson(artifact.verdict_hashes) +
     canonicalJson({ parent: artifact.parent_artifact_hash ?? null }) +
-    canonicalJson({ gate_result: artifact.gate_result ?? null, round: artifact.round ?? null })
+    canonicalJson({ gate_result: artifact.gate_result, round: artifact.round }) +
+    canonicalJson({ schema_version: artifact.schema_version ?? null })
   );
+}
+
+// issue #9 R2 blocker（单审席 blocker，2026-08-07）: 三消费入口（sc-coverage-gate.
+// checkScCoverage / fix-run.initRun / push-guard 的 artifact 与 sourceArtifact）与
+// consensus-gate 自身的 parent 路径此前只验 hash 自洽与 gate_result，从不检查
+// schema_version/round——克隆一份合法 PASS artifact，把 schema_version 改成 v1 或删掉
+// round，按 recomputeArtifactHash 当前公式重算 hash 即可自洽通过，结构门被完全架空。
+// hash 自洽在数学上不可能挡住"篡改后照同一公式重算"这类确定性攻击（攻击者与校验方用的
+// 是同一个函数）——唯一能挡的是独立于 hash 结果的显式结构校验，因此单独抽出本函数，四处
+// （三入口 + parent 路径）统一调用，禁止各自手抄一份（本仓 hardening 台账第 7 类教训：
+// 同一字面值/同一校验四处手抄，改一处漏三处）。
+export function assertArtifactShape(artifact, label = 'consensus artifact') {
+  const errs = [];
+  if (!artifact || typeof artifact !== 'object') {
+    errs.push(`${label}: 不是对象（结构非法，fail-closed）`);
+    return errs;
+  }
+  if (artifact.schema_version !== 'v3') {
+    errs.push(`${label}.schema_version=${JSON.stringify(artifact.schema_version)} ≠ 'v3'（结构门拒绝非当前 schema 版本——这是 schema 版本问题，不是 hash 问题，issue #9 R2 blocker）`);
+  }
+  if (!Number.isInteger(artifact.round) || artifact.round < 1) {
+    errs.push(`${label}.round=${JSON.stringify(artifact.round)} 非法（须为 >=1 的整数，缺字段/被删不再静默兜底为 null，issue #9 R2 blocker）`);
+  } else if (artifact.round === 1) {
+    if (artifact.parent_artifact_hash !== null) {
+      errs.push(`${label}.round=1 但 parent_artifact_hash=${JSON.stringify(artifact.parent_artifact_hash)}（round=1 必须是无谱系的根，parent 必须为 null）`);
+    }
+  } else if (typeof artifact.parent_artifact_hash !== 'string' || !/^[0-9a-f]{64}$/.test(artifact.parent_artifact_hash)) {
+    errs.push(`${label}.round=${artifact.round} 但 parent_artifact_hash=${JSON.stringify(artifact.parent_artifact_hash)} 非合法 64-hex（round>=2 必须携带谱系）`);
+  }
+  return errs;
 }
 
 if (isMain(import.meta.url)) {

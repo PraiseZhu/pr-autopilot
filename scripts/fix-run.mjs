@@ -19,7 +19,7 @@ import { join, dirname, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import { readJson, parseArgs, fail, isMain, nowIso, sha256, canonicalJson, normalizeRepoPath, hashObject } from './lib/common.mjs';
 import { computeFixPlanHash } from './fix-plan.mjs';
-import { recomputeArtifactHash } from './consensus-gate.mjs';
+import { recomputeArtifactHash, assertArtifactShape } from './consensus-gate.mjs';
 import { allocateWave, changedFiles, isAncestor, cleanupRun, stampOwner, readOwner, newNonce, writePathsFor } from './fix-orchestrate.mjs';
 
 const TEST_PATH_RE = /(^|\/)(e2e|fixtures)\//;
@@ -69,6 +69,11 @@ export function initRun({ stateDir, runId, repoDir, plan, scManifest, sourceArti
   if (!/^[A-Za-z0-9._-]+$/.test(String(runId))) throw new Error(`runId 非法: ${runId}`);
   const real = computeFixPlanHash(plan);
   if (plan.fix_plan_hash !== real) throw new Error('plan 自身 hash 与内容重算不符（plan 被改）');
+  // issue #9 R2 blocker: 结构门先于 hash 自洽——sourceArtifact 的 schema_version/round 非法
+  // 时必须 throw 出结构问题本身，不能被"hash 恰好被攻击者重算到自洽"掩盖（hash 自洽挡不住
+  // 确定性重算攻击，见 consensus-gate.mjs 的 assertArtifactShape 注释）。
+  const shapeErrs = assertArtifactShape(sourceArtifact, '源 consensus artifact');
+  if (shapeErrs.length) throw new Error(shapeErrs[0]);
   const srcHash = recomputeArtifactHash(sourceArtifact);
   if (sourceArtifact.consensus_artifact_hash !== srcHash) throw new Error('源 consensus artifact hash 与内容重算不符（SC-R3-10）');
   // issue #9 SC-A2: 源 artifact 必须是 PASS 共识——此前只验 hash 自洽，一份手工拼的
