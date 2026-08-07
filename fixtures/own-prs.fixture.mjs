@@ -13,6 +13,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { writeJsonAtomic } from '../scripts/lib/common.mjs';
+import { stateFileName } from '../scripts/pr-watch/register.mjs';
+import { parseRepo } from '../deploy/wrappers/own-prs.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const RECONCILE = fileURLToPath(new URL('../deploy/wrappers/reconcile-own-prs.mjs', import.meta.url));
@@ -26,6 +28,8 @@ const MIVO = 'xindong/mivo-canvas';
 const CINDY = 'makecindy/cindy'; // canonical cindy base 仓（2026-08-08 GPT 审查修复，SC-F1）
 const FORK = 'PraiseZhu/cindy-fork';
 const MAP = { [MIVO]: 'origin', [CINDY]: 'fork' };
+// SC-R1/R2 正例: gh API 实测存在的合法标点仓名（2026-08-08 R2 确认，mame/_ 与 PrinceRpz23/- 均真实公开）
+const MAME_PUNCT = 'mame/_', PRINCE_PUNCT = 'PrinceRpz23/-';
 
 // ---- stub gh: 精确断言完整 argv（SC-F3），再按 --repo 与 OWN_PRS_FIXTURE_MODE 输出确定性响应 ----
 // 期望序列与 own-prs.mjs 的 execFileSync argv 逐元素一致:
@@ -44,6 +48,8 @@ if (argv.length !== EXPECTED.length || argv.some((a, i) => a !== EXPECTED[i])) {
 if (process.env.OWN_PRS_FIXTURE_MODE === 'empty') { process.stdout.write('[]'); process.exit(0); }
 if (process.env.OWN_PRS_FIXTURE_MODE === 'object') { process.stdout.write('{"items":[]}'); process.exit(0); } // 非数组负例
 const MIVO = 'xindong/mivo-canvas', CINDY = 'makecindy/cindy', FORK = 'PraiseZhu/cindy-fork';
+// SC-R1/R2 正例: gh API 实测存在的合法标点仓名（2026-08-08 R2 确认，mame/_ 与 PrinceRpz23/- 均真实公开）
+const MAME_PUNCT = 'mame/_', PRINCE_PUNCT = 'PrinceRpz23/-';
 const byRepo = {
   [MIVO]: [
     { number: 101, headRefName: 'feat/mivo-base', headRepository: { nameWithOwner: MIVO } },
@@ -54,6 +60,13 @@ const byRepo = {
   [CINDY]: [
     { number: 201, headRefName: 'feat/cindy-fork', headRepository: { nameWithOwner: FORK } },
     { number: 202, headRefName: 'feat/cindy-base', headRepository: { nameWithOwner: CINDY } }
+  ],
+  [MAME_PUNCT]: [
+    { number: 301, headRefName: 'feat/underscore-repo', headRepository: { nameWithOwner: MAME_PUNCT } },
+    { number: 302, headRefName: 'feat/underscore-fork', headRepository: { nameWithOwner: PRINCE_PUNCT } }
+  ],
+  [PRINCE_PUNCT]: [
+    { number: 401, headRefName: 'feat/dash-repo', headRepository: { nameWithOwner: PRINCE_PUNCT } }
   ]
 };
 if (process.env.OWN_PRS_FIXTURE_MODE === 'real') {
@@ -245,6 +258,62 @@ const o10 = JSON.parse(r10.out.split('\n').filter((l) => l.startsWith('{'))[0] ?
 eq(r10.status, 0, 'S10 真实 JSON 形状 exit 0');
 eq(o10.registered, ['xindong/mivo-canvas#301'], 'S10 真实形状 PR 正常注册');
 eq(o10.dropped, [], 'S10 真实形状无 dropped');
+
+// ---- S11: SC-R1/R2 合法标点 repo 正例 + 必要负例 + state filename 可扫描 ----
+// 正例依据 gh API 实测（2026-08-08 R2）: mame/_、PrinceRpz23/- 真实存在且公开；
+// makecindy/.github 同样真实存在，故 repo 段 `.` 开头不拒。
+const POS_REPOS = ['mame/_', 'PrinceRpz23/-', 'xindong/mivo-canvas', 'makecindy/cindy', 'makecindy/.github', 'a-b/c-d', 'a-b/c.d_'];
+const NEG_REPOS = ['/foo', 'foo/', 'a/b/c', 'foo//bar', 'a//', '', 'a/..', 'a/foo.git', 'a/foo.', 'a/foo bar', 'a/foo\tbar', 'a/foo\nbar', ' ', './x'];
+for (const r of POS_REPOS) {
+  let accepted = false;
+  try { parseRepo(r); accepted = true; } catch { /* 期望接受 */ }
+  ok(accepted, `S11 parseRepo 接受合法标点正例 ${JSON.stringify(r)}`);
+}
+for (const r of NEG_REPOS) {
+  let rejected = false;
+  try { parseRepo(r); } catch { rejected = true; }
+  ok(rejected, `S11 parseRepo 拒绝非法 ${JSON.stringify(r)}`);
+}
+
+// 全链路: reconcile mame/_（fake gh 已加 MAME_PUNCT/PRINCE_PUNCT 数据）→ 注册成功
+const mapPunct = join(gd, 'map-punct.json');
+writeFileSync(mapPunct, JSON.stringify({ [MIVO]: 'origin', [CINDY]: 'fork', [MAME_PUNCT]: 'origin', [PRINCE_PUNCT]: 'origin' }));
+const r11 = reconcile(MAME_PUNCT, join(gd, 'state-punct'), mapPunct);
+const o11 = JSON.parse(r11.out.split('\n').filter((l) => l.startsWith('{'))[0] ?? '{}');
+eq(r11.status, 0, 'S11 mame/_ reconcile exit 0');
+eq(o11.registered, ['mame/_#301', 'mame/_#302'], 'S11 mame/_ 两条 registered（302 fork 绑定 PrinceRpz23/-）');
+eq(o11.dropped, [], 'S11 mame/_ 无 dropped');
+
+// SC-R2: state filename 可扫描——文件名由 stateFileName 生成（`_`/`-` 段 clean 到 `-`），
+// 必须匹配 engine.mjs runEngine 的扫描 grammar（同款 regex）且内容反查 round-trip 一致，
+// 否则 engine scan 会跳过该 state（不可扫描状态）。
+const ENGINE_STATE_SCAN_RE = /^[A-Za-z0-9.-]+__[A-Za-z0-9.-]+__\d+\.json$/; // 与 engine.mjs runEngine 同款
+const f301 = stateFileName('mame', '_', 301);
+ok(ENGINE_STATE_SCAN_RE.test(f301), `S11 state 文件名匹配 engine 扫描 grammar: ${f301}`);
+eq(f301, 'mame__-__301.json', 'S11 `_` repo 段在 state 文件名 clean 成 `-`（可扫描字符集内）');
+const s301 = JSON.parse(readFileSync(join(gd, 'state-punct', f301), 'utf8'));
+eq(stateFileName(s301.owner, s301.repo, s301.pr_number), f301, 'S11 内容反查 stateFileName 一致（engine 接受该文件）');
+const f401 = stateFileName('PrinceRpz23', '-', 401);
+ok(ENGINE_STATE_SCAN_RE.test(f401), `S11 dash repo state 文件名匹配 engine 扫描 grammar: ${f401}`);
+const r11b = reconcile(PRINCE_PUNCT, join(gd, 'state-prince'), mapPunct);
+const o11b = JSON.parse(r11b.out.split('\n').filter((l) => l.startsWith('{'))[0] ?? '{}');
+eq(r11b.status, 0, 'S11 PrinceRpz23/- reconcile exit 0');
+eq(o11b.registered, ['PrinceRpz23/-#401'], 'S11 PrinceRpz23/- 一条 registered');
+
+// SC-R1 全入口一致: remote-map key 也过 parseRepo——含非法 key 的 map 启动前拒绝（fail-closed）
+const mapBad = join(gd, 'map-bad.json');
+writeFileSync(mapBad, JSON.stringify({ [MIVO]: 'origin', '/foo': 'origin' }));
+const r11bad = reconcile(MIVO, join(gd, 'state-bad'), mapBad);
+ok(r11bad.status !== 0, 'S11 remote-map 含非法 key（/foo）启动前非零');
+ok(r11bad.out.includes('remote-map'), 'S11 报错指向 remote-map key');
+
+// CLI 入口一致: own-prs CLI 直接传标点 repo 也能跑（parseRepo 全入口复用）
+const w11 = run(process.execPath, [OWN_PRS, '--repo', MAME_PUNCT, '--remote-map-file', mapPunct]);
+eq(w11.status, 0, 'S11 own-prs CLI --repo mame/_ exit 0');
+const w11prs = JSON.parse(w11.out.split('\n').filter((l) => l.startsWith('['))[0] ?? '[]');
+eq(w11prs.map((p) => [p.owner, p.repo, p.push_repo]), [
+  ['mame', '_', null], ['mame', '_', PRINCE_PUNCT]
+], 'S11 CLI 契约字段 owner/repo 正确 + push_repo 三态（同仓 null / 标点 fork 字符串）');
 
 console.log(`own-prs.fixture: ${failed === 0 ? 'all pass' : failed + ' failed'}`);
 process.exit(failed === 0 ? 0 : 1);

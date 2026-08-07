@@ -17,9 +17,16 @@ import { isMain, parseArgs, fail } from '../../scripts/lib/common.mjs';
 
 const GH = process.env.GH_BIN ?? 'gh';
 
-// 严格 owner/repo grammar（2026-08-08 GPT 审查修复，SC-F2 提炼复用）:
-//   恰一个斜杠、两段非空、GitHub 合法形状（owner: 字母数字开头结尾、中间可连字符；
-//   repo: 字母数字开头结尾、中间可连字符/下划线/点）。
+// 严格 owner/repo grammar（2026-08-08 GPT 审查 R2 修复，SC-F2 提炼复用）:
+//   恰一个斜杠、两段非空、GitHub 合法形状。
+//   owner: 字母数字开头结尾、中间可连字符（GitHub 用户名规则，保留原检查）。
+//   repo: 按 GitHub 实际允许的字符集放宽——字母/数字/`.`/`_`/`-` 均允许，
+//     末尾允许 `_`/`-`（gh API 实测实例: mame/_、PrinceRpz23/- 均真实存在且公开；
+//     makecindy/.github 同样真实存在，故 `.` 开头不拒）。
+//     仍拒（本地必要安全边界 + GitHub 官方禁止）:
+//       `..`（GitHub 明确禁止 + 路径语义）、`.git` 结尾（git 保留名）、
+//       `.` 结尾（macOS 文件系统折叠尾部点，会与无点仓库的 state 文件名冲突）、
+//       空白/控制字符（字符集白名单天然排除）。
 //   拒: /foo、foo/、a/b/c、foo//bar、a//、空串、非字符串。
 //   返回 { owner, repo }；非法即 throw（fail-closed，调用方决定落盘与否）。
 export function parseRepo(repo, label = 'repo') {
@@ -37,7 +44,7 @@ export function parseRepo(repo, label = 'repo') {
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(owner)) {
     throw new Error(`${label} 非法（owner 不是 GitHub 合法用户名形状）: ${JSON.stringify(repo)}`);
   }
-  if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(repoName)) {
+  if (!/^[A-Za-z0-9._-]+$/.test(repoName) || repoName.includes('..') || repoName.endsWith('.git') || repoName.endsWith('.')) {
     throw new Error(`${label} 非法（repo 不是 GitHub 合法仓库名形状）: ${JSON.stringify(repo)}`);
   }
   return { owner, repo: repoName };

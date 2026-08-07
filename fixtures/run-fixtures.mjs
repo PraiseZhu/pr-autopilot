@@ -773,6 +773,20 @@ t('[W-8] 路由: cindy stuck 静默/mivo 飞书/budget 飞书/broadcast slack/�
   let threw = false; try { route('mystery', {}); } catch { threw = true; }
   ok(threw);
 });
+t('[SC-R3] canonical route 直接矩阵: 仅 makecindy/cindy→silent，其余含 cindy 名一律 feishu（2026-08-08 R2 固化）', () => {
+  // 全名（engine 现传 `${owner}/${repo}`）: 只认 canonical makecindy/cindy
+  eq(route('stuck', { repo: 'makecindy/cindy' }), 'silent');
+  eq(route('stuck', { repo: 'PraiseZhu/pr-autopilot' }), 'feishu');
+  eq(route('stuck', { repo: 'evilorg/cindy' }), 'feishu');
+  eq(route('stuck', { repo: 'xindong/mivo-canvas' }), 'feishu');
+  // 裸 repo 名（旧调用/部署只传 repo 段）: 只认字面 cindy，含 cindy 子串不判
+  eq(route('stuck', { repo: 'cindy' }), 'silent');
+  eq(route('stuck', { repo: 'my-cindy-app' }), 'feishu');
+  // pending-stuck 同通道规则
+  eq(route('pending-stuck', { repo: 'makecindy/cindy' }), 'silent');
+  eq(route('pending-stuck', { repo: 'evilorg/cindy' }), 'feishu');
+  eq(route('pending-stuck', { repo: 'my-cindy-app' }), 'feishu');
+});
 t('[审④F7] 预算 v3: 29+9 拦 / 同 id 重复 reserve 幂等 / release 归零 / 负数与 NaN actual 拒 / 双 actual 只认第一条', () => {
   const bl = join(engDir, 'b29.jsonl');
   recordCost(bl, { cost_usd: 29, note: 'today' });
