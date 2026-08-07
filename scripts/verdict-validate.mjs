@@ -6,9 +6,14 @@
 //   - 任何 face.result=fail → verdict 必须 REQUIRES_CHANGES（不许 fail+APPROVED）
 //   - 存在 primary_face=taxonomy_gap 的 finding → run_status 必须 degraded（⑪ 停轮）
 //   - bundle.touches_ui=true 时对抗席 B 面禁 n_a（⑫ 脚本判定为唯一源）
-// R10-A3 修复: 加固清单覆盖率契约由纯文档承诺变机器强制——round===1 的两个对抗席必须携带
+// R10-A3 修复: 加固清单覆盖率契约由纯文档承诺变机器强制——两个对抗席必须携带
 //   hardening_coverage[9]（class_id 1〜9 各恰好一次，result∈{covered,n_a}，evidence 非空）；
-//   第三席与 round>=2 不强制（复核轮不重扫穷举面）
+//   第三席不强制（第三席不复核穷举面）
+// I9 修复: 十类穷举契约从「仅 round===1」扩展到「对抗席全 round」——每批修复产生的新代码
+//   此前是全流程唯一没有可机读穷举契约的代码，洞会漏到下一轮才被挖出，是审查轮次无限增殖的
+//   机制成因之一。第三席仍不强制（与 round 无关）。同时新增 hardening_coverage[].evidence 的
+//   格式校验（须含「路径:行号」形态引用），以及 verdict 顶层必填 attempt 字段（当前 round 的
+//   第几次审查尝试——round 语义变更为"PASS 共识序号"后，尝试次数信息改由本字段承载）。
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -50,6 +55,11 @@ const SEVERITIES = ['blocker', 'major', 'suggestion'];
 const ACTIONABLE_SEVERITIES = ['blocker', 'major'];
 const SHA_RE = /^[0-9a-f]{7,40}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
+// I9-SC-5: hardening_coverage[].evidence 格式校验——须含「路径:行号」形态的引用（如
+// "scripts/verdict-validate.mjs:111"），拒绝纯散文本（如"第1类走查完成"）。只做形状校验，
+// 不做内容核实（本仓拿不到 repoDir，无法验证该路径:行号是否真落在本轮 diff 上——那属于
+// consensus-gate 层，不在此实现）。
+const EVIDENCE_LOCATOR_RE = /[\w-]+(?:[./][\w-]+)+:\d+(-\d+)?/;
 // R10-A3/SC-B4: 加固清单类别数与版本单一来源——scripts/lib/hardening-registry.mjs
 // （9→10 迁移见 D5：exact 集合变更，不是新增一条 append，因此同步 bump checklist_version）。
 const HARDENING_RESULTS = ['covered', 'n_a'];
@@ -67,10 +77,14 @@ export function validateVerdict(v, opts = {}) {
 
   need(v && typeof v === 'object', 'verdict 不是对象');
   if (errs.length) return errs;
-  need(v.schema_version === 'v2', `schema_version 必须为 v2，得到 ${v.schema_version}`);
+  need(v.schema_version === 'v3', `schema_version 必须为 v3，得到 ${v.schema_version}`);
   need(REVIEWERS.includes(v.reviewer), `reviewer 非法: ${v.reviewer}`);
   need(['ok', 'degraded'].includes(v.run_status), `run_status 非法: ${v.run_status}`);
   need(Number.isInteger(v.round) && v.round >= 1, `round 非法: ${v.round}`);
+  // I9-SC-6: attempt = 当前 round 的第几次审查尝试。round 语义变更为「PASS 共识序号」后，
+  // 尝试次数信息从 round 里丢失，由本字段承载（单份 verdict 的形状校验；「三席 attempt 必须
+  // 一致」的跨席校验属 consensus-gate 层，不在此实现）。
+  need(Number.isInteger(v.attempt) && v.attempt >= 1, `attempt 非法: ${JSON.stringify(v.attempt)}`);
   need(SHA_RE.test(v.base_sha ?? ''), `base_sha 非法: ${v.base_sha}`);
   need(SHA_RE.test(v.candidate_sha ?? ''), `candidate_sha 非法: ${v.candidate_sha}`);
   need(HASH_RE.test(v.review_input_hash ?? ''), 'review_input_hash 必须是 64 位 hex');
@@ -105,22 +119,24 @@ export function validateVerdict(v, opts = {}) {
     }
   }
 
-  // R10-A3: 加固清单覆盖率机器强制——仅 round===1 的两个对抗席（第三席/round>=2 不复核穷举面）。
+  // R10-A3/I9: 加固清单覆盖率机器强制——两个对抗席的**全部 round**（第三席永不强制）。
   // MUST-FIX-2 反例: 旧实现只在 SKILL.md 里写"必须标 covered/n_a"，没有任何字段/schema/校验落地，
   // 三份完全不带 hardening_coverage 的 round:1 verdict 照样能让 runConsensusGate 返回 pass。
-  if (ADVERSARIAL.includes(v.reviewer) && v.round === 1) {
+  // I9-SC-1/SC-2: 此前仅 round===1 强制，round>=2（修复后的复核轮）反而是唯一没有可机读穷举
+  // 契约的代码——洞会漏到下一轮才被挖出，是审查轮次无限增殖的机制成因之一。故去掉 round 限制。
+  if (ADVERSARIAL.includes(v.reviewer)) {
     // SC-B4（D5）: checklist_version 是独立于「缺项计数」的校验——9→10 是 exact 集合变更，
     // 旧的 9 项 verdict（即便碰巧凑到 9 个合法 class_id）必须显式报「清单版本过期需重审」，
     // 不能被淹没进「缺项/漏项」的普通计数错误里（下面的 length/class_id 检查仍会照常触发，
     // 两条错误可以同时出现，但版本错误必须独立可辨认）。
     need(v.checklist_version === HARDENING_CHECKLIST_VERSION,
-      `对抗席 ${v.reviewer} R1 的 checklist_version=${JSON.stringify(v.checklist_version)} 与当前加固清单版本 ${HARDENING_CHECKLIST_VERSION} 不符（清单版本过期需重审，不是缺项——D5: hardening-checklist.md 类别集合发生了 exact 变更）`);
+      `对抗席 ${v.reviewer} 的 checklist_version=${JSON.stringify(v.checklist_version)} 与当前加固清单版本 ${HARDENING_CHECKLIST_VERSION} 不符（清单版本过期需重审，不是缺项——D5: hardening-checklist.md 类别集合发生了 exact 变更）`);
     const items = v.hardening_coverage;
     if (!Array.isArray(items)) {
-      need(false, `对抗席 ${v.reviewer} R1 缺 hardening_coverage（十类加固清单机器覆盖字段必填，R10-A3）`);
+      need(false, `对抗席 ${v.reviewer} 缺 hardening_coverage（十类加固清单机器覆盖字段必填，R10-A3/I9: 对抗席全 round 强制）`);
     } else {
       need(items.length === HARDENING_CLASS_COUNT,
-        `对抗席 ${v.reviewer} R1 的 hardening_coverage 必须恰好 ${HARDENING_CLASS_COUNT} 项，得到 ${items.length}`);
+        `对抗席 ${v.reviewer} 的 hardening_coverage 必须恰好 ${HARDENING_CLASS_COUNT} 项，得到 ${items.length}`);
       const seenClassIds = new Set();
       for (const item of items) {
         const cid = item?.class_id;
@@ -132,9 +148,15 @@ export function validateVerdict(v, opts = {}) {
         }
         need(HARDENING_RESULTS.includes(item?.result), `hardening_coverage[class_id=${cid}].result 非法: ${item?.result}`);
         need(typeof item?.evidence === 'string' && item.evidence.length > 0, `hardening_coverage[class_id=${cid}] 缺 evidence`);
+        // I9-SC-5: evidence 格式校验——须含「路径:行号」形态引用，纯散文本一律拒（不做内容
+        // 核实，只判形状；见 EVIDENCE_LOCATOR_RE 定义处注释）。
+        if (typeof item?.evidence === 'string' && item.evidence.length > 0) {
+          need(EVIDENCE_LOCATOR_RE.test(item.evidence),
+            `hardening_coverage[class_id=${cid}] 的 evidence 缺「路径:行号」形态引用（如 "scripts/foo.mjs:42"），得到: ${JSON.stringify(item.evidence)}`);
+        }
       }
       for (let cid = 1; cid <= HARDENING_CLASS_COUNT; cid++) {
-        need(seenClassIds.has(cid), `对抗席 ${v.reviewer} R1 的 hardening_coverage 缺 class_id=${cid}（十类必须逐一覆盖，不许分轮细水长流）`);
+        need(seenClassIds.has(cid), `对抗席 ${v.reviewer} 的 hardening_coverage 缺 class_id=${cid}（十类必须逐一覆盖，不许分轮细水长流）`);
       }
     }
   }
