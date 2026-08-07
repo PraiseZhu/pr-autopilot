@@ -586,8 +586,8 @@ process.stdout.write(JSON.stringify({ ARTIFACT_SCHEMA_VERSION, gate_result: arti
     const result = JSON.parse(out);
     eq(result.ARTIFACT_SCHEMA_VERSION, PROBE_VERSION, '产出端派生常量: 必须跟着 schema 文件变化，不是编译期定死的字面量');
     ok(result.gate_result === 'pass', 'probe 版本下的共识应仍 PASS: ' + JSON.stringify(result.fail_reasons));
-    eq(result.draft_schema_version, PROBE_VERSION, '产出端: draft.schema_version 必须是新派生的版本，不是硬编码的 v3');
-    ok(result.shapeErrsOld.some((e) => /schema_version/.test(e)), '结构门: 改版后旧版本号字面量 v3 必须被拒: ' + JSON.stringify(result.shapeErrsOld));
+    eq(result.draft_schema_version, PROBE_VERSION, '产出端: draft.schema_version 必须是新派生的版本，不是硬编码的旧版本号');
+    ok(result.shapeErrsOld.some((e) => /schema_version/.test(e)), '结构门: 改版后旧版本号字面量必须被拒: ' + JSON.stringify(result.shapeErrsOld));
     ok(!result.shapeErrsNew.some((e) => /schema_version/.test(e)), '结构门: 改版后的新版本号必须放行: ' + JSON.stringify(result.shapeErrsNew));
   } finally {
     writeFileSync(schemaPath, original);
