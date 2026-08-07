@@ -650,13 +650,105 @@ function pgCallWith(runManifest, expectedSha, terminal, branch = 'feat') {
 }
 // 本条只验合法多 commit 放行（lead 2026-08-07 撤回「直接后继」后的正确语义）。
 // 非后代的负例不在此处：完整链上「expected_sha 绑定」+「SC-3 终版 artifact 的 parent 祖先
-// 绑定」已 by construction 保证终版 candidate 是 source_candidate 的严格后代，「非后代/
-// 零推进」无法独立构造触发（会被前置检查先拦）。真实强制点在 expected_sha + SC-3，批次门
-// 刻意不设重复检查（lead 裁定：不可达的检查会让人误以为是它在拦——比没有更危险）。
-// 完整不变量声明见 convergence-checkpoint.md 批次段。
+// 绑定」曾声明 by construction 保证终版 candidate 是 source_candidate 的严格后代——但
+// 2026-08-07 集成审查席构造出兄弟提交反例推翻该声明（见下方 [i9-batch-6c]），守卫已恢复，
+// 负例在此处独立构造。
 t('[i9-batch-6a] L1..L3 两个 commit（多 commit 分步修复）→ 批次校验通过（严格后代，任意距离）', () => {
   const r = pgCallWith(twoStepRunManifest, L3, termTwoStep);
   ok(!r.errors.some((e) => /批次|严格后代|零推进/i.test(e)), '多 commit 不应报任何批次错误: ' + JSON.stringify(r.errors));
+});
+t('[i9-batch-6c] 兄弟提交（共同 base B、source S=B+X、兄弟 T=B+Y）→ 严格后代拒（rev-list 非空 ≠ 祖先，集合一致性双向通过也拦不住）', () => {
+  // 审查席构造的失效路径：共同 base B、source S=B+X、兄弟 T=B+Y——rev-list S..T 返回 {Y} 非空、
+  // Y 已登记时集合一致检查双向通过，但 S 不是 T 的祖先。构造：T 从 L1 分叉（sibling 分支）加 Y，
+  // 伪造自洽终版 artifact（candidate=T、parent=srcArtifact hash）+ run manifest（source=L1、
+  // final=T、T 登记为 squash）+ expected_sha=T → 只有严格后代检查（is-ancestor + 不等）能拦。
+  // 审查席场景：source S=B+X、兄弟 T=B+Y（互不为祖先）。本仓 L0 是 base B，L1=S=B+X（已含，
+  // 是 srcArtifact.candidate），T 从 L0 分叉加 Y——L1 与 T 是兄弟（共同 base L0，互不为祖先）。
+  // rev-list L1..T = {T} 非空且 T 已登记 → 集合一致性双向通过；只有严格后代检查
+  // （is-ancestor(L1,T)=false）能拦。source_candidate=L1 与 srcArtifact.candidate_sha 一致，
+  // 不触发起点漂移。
+  const branchName = 'sibling-scd';
+  execFileSync('git', ['-C', repo, 'checkout', '-q', '-b', branchName, L0]); // T 从 L0（base）分叉
+  mkdirSync(join(repo, 'src'), { recursive: true }); // L0 分支没有 src/（src 是 L1 建的）
+  writeFileSync(join(repo, 'src/sibling.ts'), 'export const sibling = 1;\n');
+  execFileSync('git', ['-C', repo, 'add', '.']);
+  execFileSync('git', ['-C', repo, 'commit', '-qm', 'T 兄弟提交（B+Y，与 S=B+X 互不为祖先）']);
+  const T = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  // 留在 sibling 分支（HEAD=T）：push-guard 的 SHA 绑定要求 HEAD == expected_sha，若切回 feat
+  // HEAD=L3 ≠ expected=T 会先报 SHA 漂移、测不到严格后代检查。分支名传 sibling-scd。
+  // 伪造自洽终版 artifact（candidate=T、parent=srcArtifact hash——SC-3 会过因为 parent hash 对；
+  // review_input_hash 也要改成 T 对应的值，否则 bundle 重算的 review_input_hash ≠ artifact 记录值
+  // 会先报、测不到严格后代检查）
+  const forgedTerminal = { ...termEmpty, candidate_sha: T, review_input_hash: computeReviewInputHash(mkBundle(L0, T)), parent_artifact_hash: recomputeArtifactHash(srcArtifact) };
+  forgedTerminal.consensus_artifact_hash = recomputeArtifactHash(forgedTerminal);
+  // 2 波（与 plan 波数一致，避免「波数 ≠ plan」先拦、测不到严格后代）：
+  // wave0 base=L1 集成 T（兄弟提交），wave1 base=T 空波（无新修复）
+  const siblingRunManifest = mkRunManifest({
+    waves: [
+      { wave_index: 0, base: L1, worktree_root: '/x', allocations: [], tips: [{ group_id: 'g1', tip: T }], integrated_tip: T, replan: null, validation: { at: 't', ok: true, results: [] }, squash_commits: [T] },
+      { wave_index: 1, base: T, worktree_root: '/x', allocations: [], tips: [{ group_id: 'a1', tip: T }], integrated_tip: T, replan: null, validation: { at: 't', ok: true, results: [] }, squash_commits: [T] }
+    ],
+    final_candidate: T,
+    batch: { batch_id: 'b1', frozen_at_sha: L1, frozen_families: [FK1, FK2].sort(), successor_sha: T, status: 'closed' }
+  });
+  const r = pgCallWith(siblingRunManifest, T, forgedTerminal, branchName);
+  ok(r.errors.some((e) => /严格后代|祖先后代/.test(e)),
+    '兄弟提交必须被严格后代检查拒（rev-list S..T 非空 ≠ 祖先，集合一致性拦不住）: ' + JSON.stringify(r.errors));
+  execFileSync('git', ['-C', repo, 'checkout', '-q', 'feat']); // 切回 feat（后续测试依赖 L3 为 HEAD）
+  execFileSync('git', ['-C', repo, 'reset', '--hard', '-q', L3]); // 保险：确保 HEAD=L3（防 sibling 分支 checkout 污染）
+  // 反向变异已由实现侧覆盖（push-guard 的 is-ancestor 检查），此处钉正向拒绝。
+});
+t('[i9-batch-6d] pr_number 绑定：bundle.pr_number ≠ artifact.pr_number → 拒（同 candidate 自洽拼接被拦）', () => {
+  // 同 candidate 的 artifact(pr=101) 与 bundle(pr=202) 可自洽拼接（不经 runConsensusGate 产出）
+  // ——push-guard 三方绑定此前只比 review_input_hash/base/candidate，不比 pr_number。
+  const art101 = { ...termTwoStep, pr_number: 101 };
+  art101.consensus_artifact_hash = recomputeArtifactHash(art101);
+  const b202 = mkBundle(L0, L3, { pr_number: 202 });
+  const fo202 = {
+    source_artifact_hash: recomputeArtifactHash(srcArtifact),
+    sc_manifest_hash: hashObject(scManifest),
+    fix_plan_hash: plan.fix_plan_hash,
+    dispatch_record_hash: hashObject(dispatchRecord),
+    run_manifest_hash: runManifestHash(twoStepRunManifest)
+  };
+  const r = checkPushGuard({
+    repoDir: repo,
+    manifest: { repo: 'o/r', remote: 'origin', branch: 'feat', expected_sha: L3, purpose: 'feature', consensus_artifact_hash: art101.consensus_artifact_hash, fix_orchestration: fo202 },
+    artifact: art101, bundle: b202, constitution,
+    sourceArtifact: srcArtifact, scManifest, fixPlan: plan, dispatchRecord, runManifest: twoStepRunManifest
+  });
+  ok(r.errors.some((e) => /pr_number/.test(e) && /101.*202|202.*101/.test(e)),
+    'pr_number 不匹配必须拒（artifact=101 bundle=202）: ' + JSON.stringify(r.errors));
+  // 反向：两边都 null（无 PR 直跑三审）→ 放行
+  const artNull = { ...termTwoStep, pr_number: null };
+  artNull.consensus_artifact_hash = recomputeArtifactHash(artNull);
+  const bNull = mkBundle(L0, L3, { pr_number: null });
+  const foNull = { ...fo202, run_manifest_hash: runManifestHash(twoStepRunManifest) };
+  const rNull = checkPushGuard({
+    repoDir: repo,
+    manifest: { repo: 'o/r', remote: 'origin', branch: 'feat', expected_sha: L3, purpose: 'feature', consensus_artifact_hash: artNull.consensus_artifact_hash, fix_orchestration: foNull },
+    artifact: artNull, bundle: bNull, constitution,
+    sourceArtifact: srcArtifact, scManifest, fixPlan: plan, dispatchRecord, runManifest: twoStepRunManifest
+  });
+  ok(!rNull.errors.some((e) => /pr_number/.test(e)), '两边 null（无 PR 直跑）应放行: ' + JSON.stringify(rNull.errors));
+});
+t('[i9-batch-6e] run manifest 版本比较：schema_version 不符 → 拒（旧 v2 按当前公式重算 hash 仍过）', () => {
+  const staleRm = { ...twoStepRunManifest, schema_version: 'v2' }; // 旧版 run manifest（hash 自洽）
+  const foStale = {
+    source_artifact_hash: recomputeArtifactHash(srcArtifact),
+    sc_manifest_hash: hashObject(scManifest),
+    fix_plan_hash: plan.fix_plan_hash,
+    dispatch_record_hash: hashObject(dispatchRecord),
+    run_manifest_hash: runManifestHash(staleRm)
+  };
+  const r = checkPushGuard({
+    repoDir: repo,
+    manifest: { repo: 'o/r', remote: 'origin', branch: 'feat', expected_sha: L3, purpose: 'feature', consensus_artifact_hash: termTwoStep.consensus_artifact_hash, fix_orchestration: foStale },
+    artifact: termTwoStep, bundle: mkBundle(L0, L3), constitution,
+    sourceArtifact: srcArtifact, scManifest, fixPlan: plan, dispatchRecord, runManifest: staleRm
+  });
+  ok(r.errors.some((e) => /schema_version/.test(e) && /run manifest/.test(e)),
+    '旧 v2 run manifest 必须被版本比较拒（hash 自洽挡不住）: ' + JSON.stringify(r.errors));
 });
 
 // ===== 版本字面量自检（2026-08-07）=====
