@@ -210,8 +210,9 @@ finding）上出现，不是 reviewer 填写的字段。**verdict 层填 `family
 invariant，被旧实现按标签字符串合并成一族，PR body 只显示了先到的那个 invariant）。
 - 两对抗席：七面（A 正确性/B UI+无障碍/C 测试/D 文档/E 安全/F 范围/G 声称核实）逐面 `pass/fail/n_a`+证据；B 面仅当脚本判非 UI 才许 n_a。
 - 第三席：只填相关 faces（F/G/E/D 为主）+ `gate_checks[]`（产品/架构过程门专用通道，不得用无类型 finding 绕过归属规则）。
-- 加固清单穷举（④）+ **加固清单覆盖率契约（机器强制，不是纸面约定）**：`verdict-validate.mjs`
-  对 `round===1` 的两对抗席（`claude-adversarial`/`codex-adversarial`）强制**必须逐条扫**
+- 加固清单穷举（④）+ **加固清单覆盖率契约（机器强制，不是纸面约定）**：适用范围为**对抗席全
+  round**（`claude-adversarial`/`codex-adversarial` 任一 round 都强制，不再假设晚轮天然不需要
+  重扫穷举面；第三席任一 round 都不强制——其 faces/`gate_checks[]` 职责不同）**必须逐条扫**
   `references/hardening-checklist.md` 的十类核对点（不是「看到什么报什么」），并在 verdict 里用
   机器字段 `checklist_version`（须等于 `scripts/lib/hardening-registry.mjs` 的当前版本）+
   `hardening_coverage[]`（每类一条 `{class_id, result, evidence}`，class_id 覆盖全部已定义
@@ -222,16 +223,17 @@ invariant，被旧实现按标签字符串合并成一族，PR body 只显示了
   （R10-A3：此前只在文档里写"必须标"，没有任何字段/校验落地，三份完全不带该字段的 verdict 照样
   能拿到 `gate_result: pass`）。恰好覆盖哪些 `class_id`、版本号具体取值，一律从
   `verdict-validate.mjs` / `lib/hardening-registry.mjs` 的常量派生并由其校验，契约段落见
-  `dispatch-contract.mjs` 的 `--emit` 输出，本文档不复述具体数值。第三席与 `round>=2` 不强制
-  （复核轮不必重扫穷举面）。
+  `dispatch-contract.mjs` 的 `--emit` 输出，本文档不复述具体数值。
+  **`evidence` 按 `result` 分两种形态，不是同一句话**（i9-verdict 加固：`evidence` 现有格式
+  校验）：`result: 'covered'`（声称本次改动里该类被覆盖）→ `evidence` **必须**含「路径:行号」
+  形态的引用，例如 `"server/lib/foo.ts:42 破坏性 step 后的 catch 已接入统一 reconcile"`——声称
+  覆盖就要指出在哪覆盖的，不许空话；`result: 'n_a'`（本次改动不涉及该类）→ `evidence` **不含**
+  file:line 是正常的，写清楚为什么不适用即可，例如
+  `"本 PR 无并发/异步改动，该类无适用面"`——不适用的类本来就没有代码位置，强制它反而逼审查席
+  编造假锚点。
   **首次尝试（`attempt===1`）就能看到、却拖到后续 `attempt` 才报**的 → 该席本轮 `degraded`
   （判据按 `attempt` 计，不按 `round`——见下方「`round` 与 `attempt` 的权威定义」：一个 `round`
   内可能经过多次 `attempt`，「首轮」在新语义下不再等价于「第一次尝试」）。
-  > **待跟进（不在本次文档变更范围内实现，见交卷报告「需要机器侧配合」）**：适用范围拟从
-  > 「仅 `round===1`」扩大到「对抗席全 round」（不再假设晚轮天然不需要重扫穷举面）——这需要
-  > `verdict-validate.mjs` 的门槛条件、`dispatch-contract.mjs` 的 `hardeningRequired` 计算、
-  > 以及本仓 fixture 里断言当前范围的用例三者**同批**改，否则文档与实现立刻漂移（本条尚未做，
-  > 上文仍如实描述**当前**机器强制的范围）。
 - finding 归属（⑪）：恰好一个 `primary_face`；白名单内映射不进任何面 → `taxonomy_gap` + degraded 停轮，禁止丢弃。
 - Blocker 白名单（③）：仅 active path 失败 / SC 未达成 / 状态污染 / 安全风险 / 核心验证缺失 / 范围违规可阻塞；风格偏好等只进 Residual Risk 附录，不计入共识。
 
