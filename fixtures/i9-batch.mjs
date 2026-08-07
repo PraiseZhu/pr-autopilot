@@ -42,8 +42,13 @@ const S = join(HERE, '..', 'scripts');
 let pass = 0, failCount = 0;
 const failures = [];
 function t(name, fn) {
-  try { fn(); pass++; console.log(`  ok  ${name}`); }
-  catch (e) { failCount++; failures.push(name); console.log(`FAIL  ${name}: ${e.message}`); }
+  const r = fn(); // 支持 async（返回 Promise 则 await）
+  const done = (err) => {
+    if (err) { failCount++; failures.push(name); console.log(`FAIL  ${name}: ${err.message}`); }
+    else { pass++; console.log(`  ok  ${name}`); }
+  };
+  if (r && typeof r.then === 'function') r.then(() => done(null), done);
+  else { try { done(null); } catch (e) { done(e); } }
 }
 function ok(cond, msg) { if (!cond) throw new Error(msg); }
 function eq(a, b, msg = '') {
@@ -457,6 +462,53 @@ t('[i9-batch-12c] 可选通道改名不能静默：typo 字段名（out_of_scope
   const errs = validateVerdict(v);
   ok(errs.some((e) => /verdict 存在未知顶层字段: out_of_scope_note/.test(e)),
     'typo 字段名必须被 TOP_LEVEL_KEYS 拦（fail loud，不得静默放走内容）: ' + JSON.stringify(errs));
+});
+// B 类钉住测试（lead 2026-08-07）：钉「validator 必须跟着常量走」（改名后不脱节）——
+// A 类（[12b]+变异M）钉的是「内容校验真的执行」，B 类钉的是「内容校验的读取点真的跟常量」。
+// 做法（不动生产文件）：拷 verdict-validate.mjs 到临时文件，拷贝里把 OUT_OF_SCOPE_NOTES_FIELD
+// 值改成新名 oos_notes_v2，动态 import 该拷贝，构造用新字段名的 verdict 送进拷贝的
+// validateVerdict → 若消费点硬读旧名则读 undefined 内容校验整段跳过（撞号静默通过=断言失败）；
+// 走常量则跟着新名走（撞号报错=断言通过）。
+t('[i9-batch-12d] B 类：validator 跟着常量走——改名后内容校验不脱节（临时拷贝动态 import）', async () => {
+  const { readFileSync, writeFileSync, mkdtempSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const src = readFileSync(join(S, 'verdict-validate.mjs'), 'utf8');
+  const NEW_NAME = 'oos_notes_v2';
+  // 真实改名的完整场景 = 常量 + schema 同步改（TOP_LEVEL_KEYS 从 schema 派生）。拷贝只改
+  // 常量不改 schema 会先撞「未知顶层字段」（schema 不认新名），测不到 B——所以 schema 也
+  // 做临时拷贝并让 verdict-validate 拷贝指向它。
+  const patchedSrc = src.replace(
+    "export const OUT_OF_SCOPE_NOTES_FIELD = 'out_of_scope_notes';",
+    `export const OUT_OF_SCOPE_NOTES_FIELD = '${NEW_NAME}';`
+  ).replace(
+    "'out_of_scope_notes'", `'${NEW_NAME}'` // schema 读取路径不变，但 TOP_LEVEL_KEYS 由 schema 派生——改 schema 拷贝
+  );
+  // schema 拷贝：改 review-verdict.schema.json 里的 out_of_scope_notes 字段名为新名
+  const schemaSrc = readFileSync(join(S, '..', 'schemas', 'review-verdict.schema.json'), 'utf8');
+  const schemaCopyPath = join(S, '.i9-batch-vv-schema-copy.json');
+  writeFileSync(schemaCopyPath, schemaSrc.replace(/"out_of_scope_notes"/g, `"${NEW_NAME}"`));
+  // verdict-validate 拷贝：让它读 schema 拷贝（改 REVIEW_VERDICT_SCHEMA 读取路径）
+  const copyPath = join(S, '.i9-batch-vv-copy.mjs');
+  const patchedWithSchema = patchedSrc.replace(
+    "join(HERE, '../schemas/review-verdict.schema.json')",
+    "join(HERE, '.i9-batch-vv-schema-copy.json')"
+  );
+  writeFileSync(copyPath, patchedWithSchema);
+  try {
+    const copy = await import('file://' + copyPath + '?t=' + Date.now()); // 动态 import 拷贝
+    ok(copy.OUT_OF_SCOPE_NOTES_FIELD === NEW_NAME, '拷贝的常量值应为新名');
+    // 构造用新字段名的 verdict（新名承载 note，撞 finding id f1）→ 拷贝的 validateVerdict 必须拦
+    const v = verdictWithNotes(null);
+    v[NEW_NAME] = [{ id: 'f1', note: '撞号', evidence: '证据', suggested_issue_title: '标题' }];
+    const errs = copy.validateVerdict(v);
+    ok(errs.some((e) => /与 finding id 撞号/.test(e)),
+      '走常量则跟新名 → 撞号必须被拦（若硬读旧名则读 undefined 静默跳过 = B 洞）: ' + JSON.stringify(errs));
+  } finally {
+    const fs = await import('node:fs');
+    fs.rmSync(copyPath, { force: true });
+    fs.rmSync(schemaCopyPath, { force: true });
+  }
 });
 
 // ========== [i9-batch-13] pr_number PR 身份绑定（R4 修复①，审查席精确形状） ==========
