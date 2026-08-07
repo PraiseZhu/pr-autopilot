@@ -2908,7 +2908,7 @@ t('[2号-push闸/SC-R3-6] 端到端契约: 真实状态机 run + SKILL 字段 ma
 
   // ---- 终版共识（delta 轮 parent 谱系）+ **SKILL.md 字段清单** manifest（无 sc_hash/sc_list）----
   const finalBundle = mkBundle(BASE, S1);
-  const finalArt = consensusFor(finalBundle, [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: art }).artifact; eq(finalArt.round, 2, '终版必须是 round=2（i9-SC-B）');
+  const finalArt = consensusFor(finalBundle, [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: art, repoDir: repo }).artifact; eq(finalArt.round, 2, '终版必须是 round=2（i9-SC-B）');
   ok(finalArt.gate_result === 'pass', '终版共识应达成');
   eq(finalArt.parent_artifact_hash, art.consensus_artifact_hash, '终版必须记录 exact parent');
   const dispatchRecord = { fix_plan_hash: plan.fix_plan_hash,
@@ -2951,7 +2951,7 @@ t('[2号-push闸/SC-R3-6] 端到端契约: 真实状态机 run + SKILL 字段 ma
   const sneakTip = git('commit-tree', `${S1}^{tree}`, '-p', S1, '-m', 'lead sneaks in');
   git('merge', '--ff-only', sneakTip); // 模拟 lead 私补后 feat/HEAD 都在私补 SHA 上
   const sneakBundle = mkBundle(BASE, sneakTip);
-  const sneakArt = consensusFor(sneakBundle, [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: art }).artifact;
+  const sneakArt = consensusFor(sneakBundle, [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: art, repoDir: repo }).artifact;
   const rSneak = call({ artifact: sneakArt, bundle: sneakBundle, manifest: { ...baseManifest, expected_sha: sneakTip, consensus_artifact_hash: sneakArt.consensus_artifact_hash, fix_orchestration: fo } });
   ok(!rSneak.ok && rSneak.errors.some((e) => /最终 integrated_tip|私改|未登记 commit/.test(e)), 'SC-R3-8: 集成后私补 commit 必拒: ' + rSneak.errors.join(';'));
   git('reset', '--hard', '-q', S1); // 还原临时 fixture 仓到集成 tip
@@ -3073,7 +3073,6 @@ t('[SC-7] verify SC 按冲突图分组: 两个独立测试域 → 末波 2 组�
   eq(r.plan.waves[1].length, 2, 'SC-7: 两个独立 verify SC 必须末波并行（R2-P1-6 核心）');
   eq(r.plan.capacity, TRUSTED_CAP, 'SC-6: capacity 来自可信配置');
 });
-
 
 // ========== 19. SC-8/SC-9/SC-10b: 有状态 orchestrator + DAG lineage + 复跑 ==========
 console.log('\n[19] SC-8 run manifest CAS / SC-9 DAG lineage / SC-10b orchestrator 复跑');
@@ -3371,7 +3370,7 @@ t('[R10-A1] archive kind 端到端可用: coverage-gate 过 → buildFixPlan 定
 
   // ④ push-guard 全链: 终版共识 + SKILL 字段 manifest → 应放行
   const finalBundleA1 = mkBundle(bundleA1.base_sha, fin.final_candidate);
-  const finalArtA1 = consensusFor(finalBundleA1, [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: art }).artifact; eq(finalArtA1.round, 2, '终版必须是 round=2（i9-SC-B）');
+  const finalArtA1 = consensusFor(finalBundleA1, [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: art, repoDir: env.r }).artifact; eq(finalArtA1.round, 2, '终版必须是 round=2（i9-SC-B）');
   ok(finalArtA1.gate_result === 'pass', '终版共识应达成: ' + JSON.stringify(finalArtA1.fail_reasons ?? []));
   const runManifestA1 = readJson(FR.runManifestPath(env.stateDir, 'archA1'));
   const tipFor = (groupId) => {
@@ -3490,7 +3489,6 @@ t("[R10-A2'-6] hubViolations 场景6 不到 ≥3 下限: 2 条 SC 共享同一�
   const r6 = hubViolations(s6, HUB_SHARE_D1, 'fix');
   eq(r6.length, 0, '场景6 低于 ≥3 下限必须放行（原有下限保护）: ' + JSON.stringify(r6));
 });
-
 
 // ========== 19b. D8 选中数闸门（owner 2026-08-03 授权）==========
 console.log('\n[19b] D8 选中数闸门: vitest `-t` 无匹配 exit 0 不得记 PASS');
@@ -4181,10 +4179,14 @@ t('[D8-3] delta 轮漏传 parent 必拒；首轮无 parent 必须仍放行', () 
   const first = consensusFor(bundle).artifact;
   eq(first.gate_result, 'pass', '首轮无 parent 必须放行: ' + JSON.stringify(first.fail_reasons ?? []));
   eq(first.parent_artifact_hash, null, '首轮 parent_artifact_hash 记 null');
-  // ③ delta 轮带上 parent → 放行，且 exact 谱系落进 artifact
-  const bound = consensusFor(bundle, D2, { parentArtifact: first }).artifact;
-  eq(bound.gate_result, 'pass', 'delta 轮带 parent 必须放行: ' + JSON.stringify(bound.fail_reasons ?? []));
-  eq(bound.parent_artifact_hash, first.consensus_artifact_hash, 'delta 轮必须记录 exact parent');
+  // ③ 「delta 轮带 parent → 放行 + exact 谱系落账」的正向覆盖**不在此处**：issue #9 R3 给
+  //   parent 加了内容绑定（parent.base_sha 必须等于当前 bundle.base_sha，且 parent.candidate_sha
+  //   必须是当前 candidate 的真实 git 祖先）。本 t() 的 bundle 是纯字面量 SHA（见 mkBundle(SHA_A,
+  //   SHA_B)），没有对应的真实 git 仓，祖先关系在数学上无法成立——这不是漏传参数，是测试前提与
+  //   新契约结构性不兼容。正向路径由 fixtures/i9-core.mjs 的 [SC-R3-4] 用真实线性提交链覆盖，
+  //   且比这里更严（真祖先关系 vs 仅「传了个 parent」）。此处只保留①②两条不依赖真实仓的判定，
+  //   不留一个「改成能过但覆盖更弱」的替身。
+
 });
 
 // 独立成块（不并进上面）: 上面钉的是「delta 轮要 parent」，这里钉的是「三席 round 必须一致」。
