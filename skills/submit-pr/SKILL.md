@@ -723,6 +723,13 @@ node scripts/pr-watch/register.mjs --state-dir <mini-state> --owner <o> --repo <
 - `--fast`：**只跳三审**；SHA/clean/禁 merge/禁 CI/禁 force 守卫不跳。机器化约束（审④-F2 版）：push manifest `purpose=fast` + `base_branch` + `fast_attestation{reason, ledger_file, expires_at, signature}`；signature = HMAC-SHA256(PR_AUTOPILOT_FAST_KEY, canonicalJson({v:2,purpose,repo,remote,base_branch,branch,expected_sha,reason,ledger_file,expires_at}))——任一受保护字段被改写即失效；expires_at 必须是未来时刻（守卫强制时效）；ledger_file 必须等于 constitution 固定路径；base 由守卫自算 merge-base，manifest 无权自报；留痕由 push-guard 自己写。自动会话拿不到 FAST_KEY 即签不出合法 attestation。
 - `--skip-demo-gate`：需 owner 显式理由 + ledger 留痕（⑫）。
 
+**provenance 标记（SC-T9 核实，2026-08-08）**：`scripts/pr-watch/provenance.mjs` 的 `signMarker(body, key)`
+在 `key` 缺失（undefined/空串）时**立即 throw**（`缺 HMAC key（PR_AUTOPILOT_HMAC_KEY）`）——fail-loud，
+不产出无签名的假标记。完整调用链核实：该函数在 `scripts/` 生产路径**当前零调用**（仅 fixtures
+显式传 key 调用）；若未来接线机器人回帖打标，调用方必须从环境变量 `PR_AUTOPILOT_HMAC_KEY`
+取 key（不落盘不打日志），无 key 时 throw 会沿调用链向上传播——调用方应 fail-closed（不回复）
+而非捕获后降级为无标记回帖。`verifyMarker` 无 key 时返回 false（宁多唤醒不假认自家）。
+
 ## 自进化挂钩（SP-6 / §1.3）
 
 - 远端对通过了本地三审的 PR 打出 finding → E1 漏检台账自动记账（`ledger-append.mjs`，why-class 先 pending）。
