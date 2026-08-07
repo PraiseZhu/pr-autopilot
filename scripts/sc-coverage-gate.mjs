@@ -8,7 +8,7 @@
 //   ④ fix/verify/archive SC 必须引用 ≥1 finding；global SC ≤1 条且不引用 finding
 // 任一违 → fail-closed。suggestion 级 finding 不强制覆盖（进 residual，与共识白名单口径一致）。
 import { readJson, parseArgs, fail, isMain } from './lib/common.mjs';
-import { recomputeArtifactHash } from './consensus-gate.mjs';
+import { recomputeArtifactHash, assertArtifactShape } from './consensus-gate.mjs';
 import { validateVerifyRecipe } from './fix-run.mjs';
 
 export function checkScCoverage({ manifest, artifact }) {
@@ -18,6 +18,13 @@ export function checkScCoverage({ manifest, artifact }) {
   need(manifest && typeof manifest === 'object', 'sc manifest 不是对象');
   need(artifact && typeof artifact === 'object', 'consensus artifact 不是对象');
   if (errs.length) return errs;
+
+  // issue #9 R2 blocker: 结构门先于 hash 自洽——schema_version/round 非法时必须点名结构
+  // 问题本身，不能被"hash 恰好被攻击者重算到自洽"掩盖（hash 自洽挡不住确定性重算攻击，
+  // 见 consensus-gate.mjs 的 assertArtifactShape 注释）。结构非法时直接返回，不再往下走
+  // hash/覆盖检查——那些检查全部假设结构合法。
+  const shapeErrs = assertArtifactShape(artifact, 'consensus artifact');
+  if (shapeErrs.length) return errs.concat(shapeErrs);
 
   // ① artifact hash 绑定（重算，不信自报）
   const real = recomputeArtifactHash(artifact);

@@ -19,7 +19,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHmac } from 'node:crypto';
 import { readJson, parseArgs, fail, hashObject, nowIso, isMain, canonicalJson } from './lib/common.mjs';
-import { recomputeArtifactHash } from './consensus-gate.mjs';
+import { recomputeArtifactHash, assertArtifactShape } from './consensus-gate.mjs';
 import { computeReviewInputHash } from './review-input-hash.mjs';
 import { validateRemoteBranch } from './lib/git-checks.mjs';
 import { checkScCoverage } from './sc-coverage-gate.mjs';
@@ -189,9 +189,19 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
       for (const k of ['review_input_hash', 'base_sha', 'candidate_sha', 'canonical_findings', 'verdict_hashes', 'consensus_artifact_hash', 'gate_result']) {
         if (!(k in artifact)) errors.push(`consensus artifact 缺字段 ${k}`);
       }
+      // issue #9 R2 blocker: 结构门与字段存在性检查同批——schema_version/round 非法时必须
+      // 点名结构问题本身，不能被"hash 恰好被攻击者重算到自洽"掩盖（真正拦截面独立于 hash，
+      // 见 consensus-gate.mjs 的 assertArtifactShape 注释）。
+      if (!errors.length) errors.push(...assertArtifactShape(artifact, 'consensus artifact'));
       if (!errors.length) {
         if (artifact.gate_result !== 'pass') errors.push('consensus artifact gate_result ≠ pass');
-        if (recomputeArtifactHash(artifact) !== artifact.consensus_artifact_hash) errors.push('consensus artifact hash 与内容重算值不符（含 base/candidate，伪造/改 SHA 均失效）');
+        // 防御性 try/catch（同 sourceArtifact 路径的理由）: recomputeArtifactHash 现在对结构
+        // 非法输入会 throw；这里的 hash 重算在正常路径下已被上面的 assertArtifactShape 挡住，
+        // 但若那道短路本身被破坏（回归/反向变异），不加这层会让本函数崩溃而不是优雅拒绝。
+        let selfReal = null;
+        try { selfReal = recomputeArtifactHash(artifact); }
+        catch (e) { errors.push(`consensus artifact hash 重算失败（结构非法，fail-closed）: ${e.message}`); }
+        if (selfReal !== null && selfReal !== artifact.consensus_artifact_hash) errors.push('consensus artifact hash 与内容重算值不符（含 base/candidate，伪造/改 SHA 均失效）');
         if (manifest.consensus_artifact_hash !== artifact.consensus_artifact_hash) errors.push('manifest 与 artifact 的 consensus_artifact_hash 不一致');
         // bundle 三方绑定
         let rih = null;
@@ -226,10 +236,21 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
       if (missing.length) {
         errors.push(`fix_orchestration 在场但缺件无法核验: ${missing.join(' / ')}（fail-closed）`);
       } else {
+        // issue #9 R2 blocker: 结构门先于/独立于 hash 自洽——sourceArtifact 的
+        // schema_version/round 必须显式校验，不能只信"重算后自洽"（攻击者重算 hash 后
+        // 一样自洽，hash 自洽挡不住确定性重算攻击，真正拦截面在 assertArtifactShape）。
+        for (const e of assertArtifactShape(sourceArtifact, '源 consensus artifact')) errors.push(e);
         // ① 源 artifact 自洽 + 与声明一致
-        const srcReal = recomputeArtifactHash(sourceArtifact);
-        if (srcReal !== sourceArtifact.consensus_artifact_hash) errors.push('源 consensus artifact hash 与内容重算不符');
-        if (fo.source_artifact_hash !== srcReal) errors.push('fix_orchestration.source_artifact_hash ≠ 源 artifact 重算值');
+        // srcReal 在结构非法时保持 null——recomputeArtifactHash 现在对缺 round/gate_result
+        // 会 throw，此处不再无条件调用它，避免结构非法输入把整个 push-guard 调用崩掉
+        // （fail-closed 应体现为错误列表里多一条，不是抛出未捕获异常）。
+        let srcReal = null;
+        try { srcReal = recomputeArtifactHash(sourceArtifact); }
+        catch (e) { errors.push(`源 consensus artifact hash 重算失败（结构非法，fail-closed）: ${e.message}`); }
+        if (srcReal !== null) {
+          if (srcReal !== sourceArtifact.consensus_artifact_hash) errors.push('源 consensus artifact hash 与内容重算不符');
+          if (fo.source_artifact_hash !== srcReal) errors.push('fix_orchestration.source_artifact_hash ≠ 源 artifact 重算值');
+        }
         // issue #9 SC-A2: 源 artifact 必须是 PASS 共识——此前只验 hash 自洽，一份手工拼的
         // fail artifact（hash 自洽但 gate_result=fail）能原样当源共识过完整编排链。
         if (sourceArtifact.gate_result !== 'pass') errors.push(`源 consensus artifact gate_result=${sourceArtifact.gate_result} ≠ pass（issue #9 SC-A: fail 共识不得作为修复编排的源）`);
@@ -238,13 +259,20 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
         if (!artifact.parent_artifact_hash) {
           errors.push('终版 artifact 缺 parent_artifact_hash——delta 轮必须由 consensus-gate --parent 生成谱系（SC-3 fail-closed）');
         } else if (artifact.parent_artifact_hash !== srcReal) {
-          errors.push(`源 artifact 不是终版 artifact 的 exact parent（parent=${artifact.parent_artifact_hash.slice(0, 12)} 源=${srcReal.slice(0, 12)}）——同 base 的另一份 artifact 冒充被拦（SC-3）`);
+          errors.push(`源 artifact 不是终版 artifact 的 exact parent（parent=${artifact.parent_artifact_hash.slice(0, 12)} 源=${String(srcReal).slice(0, 12)}）——同 base 的另一份 artifact 冒充被拦（SC-3）`);
         }
         if (sourceArtifact.base_sha !== artifact.base_sha) {
           errors.push('源 artifact 与终版 artifact 的 base_sha 不同（跨评审拼接）');
         }
         // ② SC 覆盖门（绑源 artifact）——修 R1 既有洞: SC 必须真绑回 finding 且全覆盖
-        const covErrs = checkScCoverage({ manifest: scManifest, artifact: sourceArtifact });
+        // 防御性 try/catch: checkScCoverage 的契约是"返回错误数组、不 throw"，但它内部同样
+        // 依赖 assertArtifactShape 先行短路才能保证不 throw——若那道短路本身被破坏（回归/
+        // 反向变异），不加这层会让本函数已经在 errors 里攒好的结构错误（见上方我们自己的
+        // assertArtifactShape 调用）因未捕获异常而丢失、连 { ok:false, errors } 都返回不了
+        // （fail-closed 应体现为多一条错误，不是把调用方也拖崩，保证四个调用点互相隔离）。
+        let covErrs = [];
+        try { covErrs = checkScCoverage({ manifest: scManifest, artifact: sourceArtifact }); }
+        catch (e) { errors.push(`SC 覆盖门内部异常（fail-closed，不让调用方崩溃）: ${e.message}`); }
         for (const e of covErrs) errors.push(`SC 覆盖门: ${e}`);
         if (hashObject(scManifest) !== fo.sc_manifest_hash) errors.push('fix_orchestration.sc_manifest_hash ≠ sc manifest 重算值');
         // ③ fix plan 重算等价（纯函数——lead 改分组即 hash 对不上）

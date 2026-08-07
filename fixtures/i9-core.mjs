@@ -276,6 +276,143 @@ t('[SC-B5] 误传旧参数名 parentArtifactHash → throw；round=1 不得静�
     'round>=2 传废弃参数必须同样 throw（不是退化成「未绑定上一轮 artifact」）: ' + (threwR2 ? threwR2.message : '(未抛错)'));
 });
 
+// ========== SC-R2: 结构门（schema_version/round）独立于 hash 自洽 ==========
+// issue #9 R2 blocker（单审席，pr#563 review）: 三消费入口 + parent 路径此前只验 hash 自洽
+// 与 gate_result，从不检查 schema_version/round——克隆合法 PASS artifact 后改 schema_version
+// (v3→v1) 或删 round，按 recomputeArtifactHash 当前公式重算 hash 即可自洽通过。真正的拒绝
+// 只能来自独立于 hash 结果的显式结构校验（assertArtifactShape），下面逐一验证四处调用点。
+console.log('\n[SC-R2] 结构门（schema_version/round）先于/独立于 hash 自洽——hash 自洽挡不住确定性重算攻击');
+
+function forgeArtifact(base, mutate) {
+  const forged = mutate({ ...base });
+  forged.consensus_artifact_hash = recomputeArtifactHash(forged);
+  return forged;
+}
+
+const r2Bundle = mkBundle(SHA_A, SHA_B);
+const { artifact: r2Pass } = consensusFor(r2Bundle);
+if (r2Pass.gate_result !== 'pass') throw new Error('SC-R2 前提失败: r2Pass 未 PASS: ' + JSON.stringify(r2Pass.fail_reasons ?? []));
+
+// ---- SC-R2-1: schema_version v3→v1，按当前公式重算后仍自洽 ----
+const r2SchemaForged = forgeArtifact(r2Pass, (a) => { a.schema_version = 'v1'; return a; });
+t('[SC-R2-1-pre] schema_version v3→v1 后按当前公式重算 hash 仍自洽（证明 hash 自洽挡不住这类攻击，唯有独立结构门能拦）', () => {
+  eq(recomputeArtifactHash(r2SchemaForged), r2SchemaForged.consensus_artifact_hash, 'schema_version 伪造后 hash 应仍自洽——这正是需要 assertArtifactShape 的原因');
+});
+t('[SC-R2-1-a] sc-coverage-gate.checkScCoverage 拒 schema_version≠v3 的源 artifact，报错点名 schema 版本而非 hash', () => {
+  const manifest = { schema_version: 'v2', consensus_artifact_hash: r2SchemaForged.consensus_artifact_hash, scs: [] };
+  const errs = checkScCoverage({ manifest, artifact: r2SchemaForged });
+  ok(errs.some((e) => /schema_version/.test(e) && /v3/.test(e)), '必须点名 schema_version 问题: ' + JSON.stringify(errs));
+  ok(!errs.some((e) => /hash 与内容重算不符/.test(e)), '不应报 hash 不符（hash 本就自洽，问题是结构）: ' + JSON.stringify(errs));
+});
+t('[SC-R2-1-b] fix-run.initRun throw 拒 schema_version≠v3 的源 artifact，消息点名 schema 版本', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'i9-run-r2schema-'));
+  let threw = null;
+  try { initRun({ stateDir, runId: 'i9-r2-schema', repoDir: '/nonexistent', plan: mkPlanFor(r2SchemaForged), scManifest: {}, sourceArtifact: r2SchemaForged }); }
+  catch (e) { threw = e; }
+  ok(threw && /schema_version/.test(threw.message) && /v3/.test(threw.message), '必须 throw 且点名 schema_version: ' + (threw ? threw.message : '(未抛错，疑似静默通过)'));
+});
+t('[SC-R2-1-c] push-guard.checkPushGuard 的 fix_orchestration.sourceArtifact 拒 schema_version≠v3，报错点名 schema 版本', () => {
+  const r = callPushGuardWithSource(r2SchemaForged);
+  ok(r.errors.some((e) => /schema_version/.test(e) && /v3/.test(e)), '必须点名 schema_version: ' + JSON.stringify(r.errors));
+});
+// 额外一处（不在 blocker 原文三入口之列，防御性加固）: push-guard 顶层 artifact 字段
+// （purpose=feature，无 fix_orchestration 时的直通路径）同样必须过结构门。
+t('[SC-R2-1-d(bonus)] push-guard.checkPushGuard 顶层 artifact 字段（purpose=feature 直通路径）拒 schema_version≠v3', () => {
+  const forgedTerminal = forgeArtifact(pgTerminal, (a) => { a.schema_version = 'v1'; return a; });
+  const r = checkPushGuard({
+    repoDir: pgRepo,
+    manifest: { ...pgManifestBase, consensus_artifact_hash: forgedTerminal.consensus_artifact_hash },
+    artifact: forgedTerminal, bundle: pgBundle, constitution
+  });
+  ok(r.errors.some((e) => /schema_version/.test(e) && /v3/.test(e)), '必须点名 schema_version: ' + JSON.stringify(r.errors));
+});
+
+// ---- SC-R2-2: 删除 round ----
+const r2RoundDeleted = { ...r2Pass };
+delete r2RoundDeleted.round;
+t('[SC-R2-2-pre] 删除 round 后 recomputeArtifactHash 直接 throw（不再静默产出"看起来合法"的 hash）', () => {
+  let threw = null;
+  try { recomputeArtifactHash(r2RoundDeleted); } catch (e) { threw = e; }
+  ok(threw && /round/.test(threw.message), 'recomputeArtifactHash 必须 throw 且点名 round: ' + (threw ? threw.message : '(未抛错——静默产出了看似合法的 hash，正是 R2 blocker 的核心风险)'));
+});
+t('[SC-R2-2-a] sc-coverage-gate.checkScCoverage 拒删除 round 的源 artifact（不静默当 round:null 通过）', () => {
+  const manifest = { schema_version: 'v2', consensus_artifact_hash: r2Pass.consensus_artifact_hash, scs: [] };
+  const errs = checkScCoverage({ manifest, artifact: r2RoundDeleted });
+  ok(errs.some((e) => /round/.test(e)), '必须点名 round 问题: ' + JSON.stringify(errs));
+});
+t('[SC-R2-2-b] fix-run.initRun throw 拒删除 round 的源 artifact', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'i9-run-r2round-'));
+  let threw = null;
+  try { initRun({ stateDir, runId: 'i9-r2-round', repoDir: '/nonexistent', plan: mkPlanFor(r2Pass), scManifest: {}, sourceArtifact: r2RoundDeleted }); }
+  catch (e) { threw = e; }
+  ok(threw && /round/.test(threw.message), '必须 throw 且点名 round: ' + (threw ? threw.message : '(未抛错)'));
+});
+t('[SC-R2-2-c] push-guard.checkPushGuard 的 fix_orchestration.sourceArtifact 拒删除 round 的源 artifact', () => {
+  const r = callPushGuardWithSource(r2RoundDeleted);
+  ok(r.errors.some((e) => /round/.test(e)), '必须点名 round: ' + JSON.stringify(r.errors));
+});
+t('[SC-R2-2-d(bonus)] push-guard.checkPushGuard 顶层 artifact 字段（purpose=feature 直通路径）拒删除 round', () => {
+  const forgedTerminal = { ...pgTerminal };
+  delete forgedTerminal.round;
+  const r = checkPushGuard({
+    repoDir: pgRepo,
+    manifest: { ...pgManifestBase },
+    artifact: forgedTerminal, bundle: pgBundle, constitution
+  });
+  ok(r.errors.some((e) => /round/.test(e)), '必须点名 round: ' + JSON.stringify(r.errors));
+});
+
+// ---- SC-R2-3: round>=2 的 parent 同样过结构门 ----
+const r2ParentSchemaForged = forgeArtifact(r2Pass, (a) => { a.schema_version = 'v1'; return a; });
+t('[SC-R2-3] round>=2 的 parent 结构门——parent.schema_version 被改成 v1（hash 重算自洽）→ 必拒，报错点名 schema 而非 hash', () => {
+  const { artifact } = consensusFor(mkBundle(SHA_B, SHA_C), [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: r2ParentSchemaForged });
+  ok(artifact.gate_result === 'fail', 'round=2 携带 schema 非法的 parent 必须 fail: ' + JSON.stringify(artifact));
+  ok(artifact.fail_reasons.some((e) => /schema_version/.test(e) && /v3/.test(e)), '必须点名 parent 的 schema_version 问题: ' + JSON.stringify(artifact.fail_reasons));
+  ok(!artifact.fail_reasons.some((e) => /hash 与内容重算不符/.test(e)), '不应报 parent hash 不符（parent hash 本就自洽，问题是结构）: ' + JSON.stringify(artifact.fail_reasons));
+});
+t('[SC-R2-3-round] round>=2 的 parent 删除 round → 必拒，报错点名 round', () => {
+  const parentRoundDeleted = { ...r2Pass };
+  delete parentRoundDeleted.round;
+  const { artifact } = consensusFor(mkBundle(SHA_B, SHA_C), [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: parentRoundDeleted });
+  ok(artifact.gate_result === 'fail' && artifact.fail_reasons.some((e) => /round/.test(e)),
+    'parent 删除 round 必须 fail 且点名 round: ' + JSON.stringify(artifact.fail_reasons ?? []));
+});
+
+// ---- SC-R2-4: schema_version 已入 hash ----
+t('[SC-R2-4] schema_version 已入 hash——仅翻转它（不重算）hash 必变', () => {
+  const before = recomputeArtifactHash(r2Pass);
+  const flipped = { ...r2Pass, schema_version: 'v1' };
+  const after = recomputeArtifactHash(flipped);
+  ok(after !== before, 'schema_version 翻转后 hash 必须变化（SC-R2-4）');
+});
+
+// ---- SC-R2-5: round 翻转变 hash；round 缺失不得静默产出"合法" hash ----
+t('[SC-R2-5a] round 翻转（1→2）hash 必变', () => {
+  const before = recomputeArtifactHash(r2Pass);
+  const flipped = { ...r2Pass, round: 2 };
+  const after = recomputeArtifactHash(flipped);
+  ok(after !== before, 'round 翻转后 hash 必须变化（SC-R2-5）');
+});
+t('[SC-R2-5b] round 缺失时 recomputeArtifactHash 必须 throw，不得静默产出"合法" hash', () => {
+  const missing = { ...r2Pass };
+  delete missing.round;
+  let threw = null;
+  try { recomputeArtifactHash(missing); } catch (e) { threw = e; }
+  ok(threw && /round/.test(threw.message), 'round 缺失必须 throw 且点名 round: ' + (threw ? threw.message : '(未抛错——静默产出了看似合法的 hash)'));
+});
+
+// ---- SC-R2-6: schema 文件 $id/title 升 v3 + parent_artifact_hash 已声明 ----
+t('[SC-R2-6] schemas/consensus-artifact.schema.json 已升级为 v3 且声明 parent_artifact_hash（nullable 64-hex）', () => {
+  const schema = readJson(join(S, '..', 'schemas', 'consensus-artifact.schema.json'));
+  ok(/v3/.test(schema.$id), '$id 必须标注 v3: ' + schema.$id);
+  ok(/v3/.test(schema.title), 'title 必须标注 v3: ' + schema.title);
+  ok(schema.properties && schema.properties.parent_artifact_hash, 'properties 必须声明 parent_artifact_hash: ' + JSON.stringify(Object.keys(schema.properties ?? {})));
+  const pah = schema.properties.parent_artifact_hash;
+  const types = Array.isArray(pah.type) ? pah.type : [pah.type];
+  ok(types.includes('string') && types.includes('null'), 'parent_artifact_hash 必须允许 string 或 null（nullable）: ' + JSON.stringify(pah.type));
+  ok(typeof pah.pattern === 'string' && /64/.test(pah.pattern), 'parent_artifact_hash 必须声明 64-hex pattern: ' + JSON.stringify(pah.pattern));
+});
+
 console.log(`\n========== i9-core fixtures: ${pass} passed, ${failCount} failed ==========`);
 if (failCount > 0) {
   console.log('\nFAILED:');
