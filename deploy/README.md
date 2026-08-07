@@ -120,6 +120,49 @@ export EXPECT_EFFORT='xhigh'
 
 （gh-snapshot/cindy-dispatch/queue-transport 均有契约 fixture 覆盖。）
 
+### 2.1 环境变量三条（不配齐会以**误导性症状**失败，不是直接报错）
+
+| 变量/项 | 作用 | 缺了/做错会看到什么 |
+|---|---|---|
+| `PR_AUTOPILOT_HMAC_KEY` | 自家评论识别密钥（gate 过滤自家回帖不当作新反馈） | **budget cap 撞顶**（见 ①） |
+| `REQUIRED_CONTEXTS_FILE` | CI 判绿的 required contexts 清单（JSON 文件路径） | **CI 永远红 → 每轮都唤醒**（见 ②） |
+| preRunHook | 班车调度跳过空转轮 | 不用 probe.mjs 会**每 15 分钟白起一个 agent 会话**（见 ③） |
+
+**① `PR_AUTOPILOT_HMAC_KEY` —— 没配的症状是 budget cap 撞顶**
+
+```bash
+export PR_AUTOPILOT_HMAC_KEY=$(openssl rand -hex 32)   # 每台机器独立生成，禁止拷贝别人的
+```
+
+- **生成与形状**：`openssl rand -hex 32` 即可（HMAC key 无格式约束，任意字符串都行；64 位十六进制只是惯例）。由 `scripts/pr-watch/provenance.mjs` / `gate.mjs` / `engine.mjs` / `complete.mjs` / `probe.mjs` 全链从环境变量读取，**不落盘、不打日志**（provenance.mjs 注释原文）。
+- **每台机器必须独立生成**：它是「这条评论是不是我自己发的」的识别凭证，不是共享口令。拷别人的 key = 两台机器互认对方回帖为自家，签名校验的意义归零。
+- **没配会怎样（因果链，别被症状骗了）**：`verifyMarker` 在无 key 时返回 false（「无法验证 → 不声称是自家的 → 宁多唤醒」，provenance.mjs 原文语义）。于是 **gate 把机器人自己发的回帖当成新评论 → 每轮引擎都判「有反馈」→ 反复 dispatch 修复会话 → 每轮 dispatch 都 reserve 预算 → 撞 $30/天 cap → 引擎暂停等你确认**。别人部署时实际看到的「budget cap 撞顶」就是这个链条的末端——**根因是 key 没生成**，调预算参数（cap/estimate）治标不治本，症状会继续咬。这是本项最想让你记住的：budget 报错 ≠ budget 的问题。
+- **强度如实声明（T1，无机器门在拦）**：引擎启动时不校验 key 是否存在（`process.env.PR_AUTOPILOT_HMAC_KEY ?? null`，没有 fail-closed 启动门）；这道门防的是「自家评论误唤醒自己」的**疏忽**，不防**伪造**——知道 key 的人可以伪造签名评论。配不配 key 全靠部署时自觉，机器不拦。
+
+**② `REQUIRED_CONTEXTS_FILE` —— CI 判绿的权威来源**
+
+```bash
+export REQUIRED_CONTEXTS_FILE=/path/to/required-contexts.json
+```
+
+```json
+{ "xindong/mivo-canvas": ["ci/mivo-canvas", "ci/e2e-smoke"] }
+```
+
+- **格式**：`{"owner/repo": ["ctx 名"]}`（`deploy/wrappers/gh-snapshot.mjs` 读 JSON 后按 `[owner/repo] ?? []` 取值）。
+- **接线位置是 `deploy/wrappers/gh-snapshot.mjs` 的运行时 env 读取，不是 `env.sh`**：gh-snapshot 是引擎的**子进程**，读的是调度/launchd 注入的进程环境；`env.sh` 是班车会话自己 source 的文件，往里面塞这个变量，引擎子进程根本看不到——别人就是这么塞的，塞了没生效。要注入到跑引擎的那层环境（与 FEISHU_* 同法：launchctl setenv 或 plist EnvironmentVariables）。
+- **取值权威来源 = 分支保护 API 的实际值，不是人手抄 workflow 名**：`gh api repos/{owner}/{repo}/branches/main/protection --jq '.required_status_checks.contexts'`（或仓库 Settings → Branches → 保护规则 → Require status checks 里看到的清单）。手抄名字会漂移——分支保护里改名/增删后，清单不跟着变，CI 判绿就失真。
+- **`SKIPPED` 不算绿，会 SKIPPED 的 check 绝对不能进这份清单**：gh-snapshot 归一化 check-run 时只有 `conclusion == success` 才映射为绿，`skipped`/`neutral`/`cancelled` 一律非绿（`scripts/ci-readiness.mjs`：`entry.state !== 'success'` → fail-closed 非绿）。按路径过滤的 job（改动不命中就 SKIPPED）一旦进清单，该 PR 永远判不绿。
+- **没配/文件缺失 = fail-closed 非绿**：gh-snapshot 对未配置的 required 返回 `green: false` + `['required contexts 未配置（fail-closed）']` → 引擎每轮都以为 CI 红 → 反复唤醒。这又是一个「看起来像别的问题」的症状，实际只是清单没配。
+
+**③ preRunHook 必须用 `deploy/wrappers/probe.mjs`，别自己造一个**
+
+班车 schedule 的 preRunHook 直接用本仓现成的 `deploy/wrappers/probe.mjs`，不要另写：
+
+- 协议：exit 0 = 有活 → 放行班车 agent 会话（引擎 + 队列投递）；exit 2 = 无活 → 跳过本轮，**零 token**，只花几次带 ETag 的 gh API 读。
+- 它的判定**复用引擎同源模块**（`gate.evaluate` / `stateFileName` 文法），信号逻辑与引擎是**同一套**——自己另写一个探针等于造第二套判定，两套迟早不一致（探针说有活、引擎说没活，或反过来），凭空多一个故障面。
+- 探针自身异常 → exit 0 放行（可用性优先：让完整引擎 + 通知链去暴露问题，而不是让探针静默扼杀所有轮次）。
+
 ## 3. 每日卡片调度（§3）
 
 - cron: `0 10 * * *`；agent 模式；四元组 `claude-code + Cindy AI + deepseek/deepseek-v4-pro + max`。
