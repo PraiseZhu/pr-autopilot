@@ -42,8 +42,11 @@ export function contractSpec({ seat, round, requirements } = {}) {
   if (!Number.isInteger(round) || round < 1) throw new Error(`round 非法: ${round}（必须是 >=1 的整数）`);
   const req = { ...DEFAULT_REQUIREMENTS, ...(requirements ?? {}) };
   const isAdversarial = ADVERSARIAL.includes(seat);
-  // 加固清单穷举只对 round===1 的两个对抗席强制——与 verdict-validate 同一条件，勿各自判断
-  const hardeningRequired = isAdversarial && round === 1;
+  // issue #9: 加固清单穷举适用范围已扩大到「对抗席全 round」（i9-verdict 移除了
+  // verdict-validate.mjs 里的 `&& v.round === 1` 限制）——本行必须与之同条件，勿各自判断。
+  // 不改会造成 R2+ 派工契约不要求填 hardening_coverage，审查席老实交卷却被 validator 拒收，
+  // 整轮三席作废（同 D1 头部注释描述的 gate_id 事故是同一类形状：契约与 validator 各念各的经）。
+  const hardeningRequired = isAdversarial;
   return {
     contract_version: 'dc1',
     seat,

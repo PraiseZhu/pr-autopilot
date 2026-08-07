@@ -258,11 +258,11 @@ node scripts/consensus-gate.mjs v1.json v2.json v3.json --bundle bundle.json --r
   正交——`round` 数「第几个 PASS 产物」，`attempt` 数「为凑出这个 PASS 产物试了几次」。`round`
   收紧为「PASS 序号」后，「这是第几次审查尝试」这个信息从 verdict 里消失了，而它仍在被两处
   既有判据使用：上方加固清单覆盖率契约的 degraded 判据（「首次尝试就能看到却没报」）、以及
-  下方 `lead` 职责的仲裁上限 `≤3`。**`attempt` 是 lead 在本轮对账记录里维护的计数，不是 verdict
-  的机读字段**（issue #9 修复方案给出的两个候选载体之一：给 verdict 加字段，或记进对账记录——
-  本次选后者，避免额外改 schema/`verdict-validate.mjs`）；这两处判据靠 lead 对照对账记录人工执行，
-  机器不校验 `attempt` 本身，如实声明为纯过程纪律（同下方 repair-mode watermark 一节「没有守卫
-  在拦」的声明方式一致，不冒称机器强制）。
+  下方 `lead` 职责的仲裁上限 `≤3`。**`attempt` 是 verdict 的机读字段**（`schemas/review-verdict.
+  schema.json` 的必填项，`verdict-validate.mjs` 校验其形状、`consensus-gate.mjs` 校验三席一致——
+  具体校验条件不在此复述）：机器字段而非 lead 人工计数是刻意选择——纯人工记录没有任何守卫拦
+  单席填错，字段方案至少能让三席一致性校验逮到分歧。这两处判据据此都读该字段，不再靠 lead 对照
+  记录人工执行。
 
 **delta 轮（verdict `round>=2`）必须加 `--parent <上一轮 consensus.json>`**（SC-3/D8-3）：
 ```
@@ -507,6 +507,17 @@ marker 段 `<!-- pr-autopilot:invariants:start/end -->` 内是脚本生成的 MU
 | ARCHIVE | 留在 `findings[]` | 需要（同上） | 进，`sc-coverage-gate` 强制 1:1 覆盖（`kind=archive`，见下方「ARCHIVE 类的收口」） |
 | 答 | 从 `findings[]` 撤回 | 不适用（已不在数组里） | 不进——证据回复留在 PR 评论/对账记录 |
 | 推 | `out_of_scope_notes[]` | 不适用（不是 finding） | 不进——issue 链接留在 PR body/对账记录 |
+
+> **残余风险如实声明：撤回与静默删除，机器不可区分**（issue #9 修复的已知代价，本轮不堵）：
+> 「答」类撤回在机器层与「审查席图省事，直接把不想处理的 finding 从下一轮 verdict 里删掉」
+> **完全同构**——`consensus-gate` 的 conjunct② 只遍历该轮 `v.findings` 里现存的条目，消失的
+> 条目它看不见，两种情况在 artifact 里留下的痕迹一样。唯一能堵的办法是比对 parent 的
+> `canonical_findings` 与本轮 `findings[]`，要求消失的条目必须有显式交代——但那需要新增一个
+> 撤回记录载体字段，且会强制「parent 里的 major 必须仍在本轮数组里」，与「答」类本就要撤回
+> 的诉求直接互斥（等于把死锁焊回去）。**所以本轮不堵**：仲裁记录（回复文本进 PR 评论/本轮
+> 对账记录）的存在与真实性**没有任何守卫**——不要把这句话读反：不是「由仲裁记录保证撤回正当」，
+> 是「撤回正当与否只能靠仲裁记录，而仲裁记录本身无人验证」。保证等级 T1（防疏忽不防伪造，同本仓
+> 其余"如实声明"条款一致），依赖 lead 在对账时人工核对每条撤回是否真有证据支撑。
 
   > **补一条更硬的理由（覆盖「推」里主证据落在 diff 之外的子情形，D3，2026-08-06）**：这类问题
   > 不仅是「按三分法判定该走 out_of_scope_notes」，而是**物理上无法**合法表达成 finding——

@@ -19,6 +19,7 @@ import {
   DEFERRED_UNIFIED_LITERAL,
   SEATS,
 } from '../scripts/dispatch-contract.mjs';
+import { HARDENING_CHECKLIST_VERSION, HARDENING_CLASS_COUNT } from '../scripts/lib/hardening-registry.mjs';
 
 let pass = 0, failCount = 0;
 const failures = [];
@@ -39,8 +40,9 @@ function eq(a, b, msg = '') {
   if (ja !== jb) throw new Error(`${msg} expected=${jb} got=${ja}`);
 }
 
-// round=2（非首轮）：两条新字面值与 hardening 穷举门槛（round===1）正交，
-// 用 round=2 避免测试与那条不在本次改动范围内的既有逻辑纠缠。
+// round=2（非首轮）：验证两条新字面值在 round>=2 下同样生效——issue #9 落地后加固清单穷举
+// 已扩大到「对抗席全 round」（hardeningRequired 不再判 round===1），round=2 现在也会带
+// hardening_coverage 要求，用它做默认场景正好覆盖这条，不必额外切到 round=1。
 const SEAT = 'claude-adversarial';
 const ROUND = 2;
 
@@ -108,6 +110,29 @@ t('[I9-DOC-07] 三席 × round 1/2 全覆盖: emit→check 闭环不因新增字
       ok(text.includes(DEFERRED_UNIFIED_LITERAL), `seat=${seat} round=${round} 应含推统一通道字面值`);
     }
   }
+});
+
+t('[I9-DOC-08a] 加固清单穷举适用范围=对抗席全 round: contractSpec 对两对抗席任一 round 都要求 hardening，第三席任一 round 都不要求', () => {
+  for (const round of [1, 2, 3]) {
+    eq(contractSpec({ seat: 'claude-adversarial', round }).hardening.required, true, `claude-adversarial round=${round} 应要求 hardening`);
+    eq(contractSpec({ seat: 'codex-adversarial', round }).hardening.required, true, `codex-adversarial round=${round} 应要求 hardening`);
+    eq(contractSpec({ seat: 'upstream-preview', round }).hardening.required, false, `upstream-preview round=${round} 不应要求 hardening`);
+  }
+});
+
+t('[I9-DOC-08b] round>=2 的 emit/requiredLiterals 同步带上 hardening_coverage 要求（不再是 round===1 独有）', () => {
+  const text = emitContract({ seat: SEAT, round: ROUND }); // ROUND=2
+  ok(text.includes('hardening_coverage'), 'round=2 的 emit 输出必须含 hardening_coverage（对抗席全 round 强制）');
+  ok(text.includes(`checklist_version: ${HARDENING_CHECKLIST_VERSION}`), 'round=2 的 emit 输出必须含当前 checklist_version');
+  const lits = requiredLiterals({ seat: SEAT, round: ROUND });
+  ok(lits.includes('hardening_coverage'), 'round=2 的 requiredLiterals 必须含 hardening_coverage');
+  // 反向变异: 陈旧派工包（改动前生成，缺 hardening_coverage）在 round=2 下必被拦——
+  // 这正是 lead 指出的「R2 契约不要求填十类 → 审查席老实交卷未带 → validator 拒收 → 整轮作废」
+  // 那条死锁链的机器验证：check 层必须先行拦下，不能等 validator 收卷才发现。
+  const staleR2 = text.split('hardening_coverage').join('');
+  const r = checkDispatchPackage(staleR2, { seat: SEAT, round: ROUND });
+  ok(!r.ok, '缺 hardening_coverage 的 round=2 派工包必须被 check 拦下');
+  ok(r.missing.includes('hardening_coverage'), '缺项清单必须点名 hardening_coverage');
 });
 
 t('[I9-DOC-08] digest 反漂移未被新字面值破坏：spec 改动仍会让旧 digest 失配', () => {
