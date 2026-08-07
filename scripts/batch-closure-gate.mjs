@@ -35,7 +35,7 @@
 //     跨批次账本，无法独立判定），prior_sc_missed_because 填一句废话也能过（防疏忽不防伪造）。
 import { readJson, parseArgs, fail, isMain } from './lib/common.mjs';
 import { recomputeArtifactHash, assertArtifactShape } from './consensus-gate.mjs';
-import { runManifestHash, verifyEventChain } from './fix-run.mjs';
+import { runManifestHash, verifyEventChain, RUN_MANIFEST_SCHEMA_VERSION } from './fix-run.mjs';
 
 const RECURRENCE_VERDICTS = ['fix_was_wrong', 'family_was_misgrouped', 'fix_was_symptom'];
 
@@ -58,7 +58,8 @@ export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, 
 
   // 事件链完整（防删改历史，与 fix-run.loadRun 同判据）
   for (const e of verifyEventChain(runManifest)) errs.push(`run manifest: ${e}`);
-  need(runManifest.schema_version === 'v3', `run manifest schema_version=${JSON.stringify(runManifest.schema_version)} ≠ v3（批次段是 v3 schema 的字段，i9-batch）`);
+  need(runManifest.schema_version === RUN_MANIFEST_SCHEMA_VERSION,
+    `run manifest schema_version=${JSON.stringify(runManifest.schema_version)} ≠ ${RUN_MANIFEST_SCHEMA_VERSION}（批次段是 ${RUN_MANIFEST_SCHEMA_VERSION} schema 的字段，i9-batch）`);
 
   // ② 起点派生不自报
   need(batch.frozen_at_sha === runManifest.source_candidate,

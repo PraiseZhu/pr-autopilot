@@ -28,6 +28,14 @@ const isTestPath = (p) => TEST_PATH_RE.test(p) || TEST_FILE_RE.test(p);
 
 function git(repoDir, ...a) { return execFileSync('git', ['-C', repoDir, ...a], { encoding: 'utf8', timeout: 120_000 }).trim(); }
 
+// R4 归一（lead 2026-08-07）：run manifest 的 schema 版本此前是散字面量（构造 'v3' +
+// runManifestHash 的 'fix-run/v3' tag + batch-closure-gate 校验 'v3'）——同类「纯值散字面量」
+// 漂移点（与 artifact schema 版本号散在实现里同一形状）。改为单一导出常量，各处引用。
+// 注意：这是 **run manifest 自己的 schema 版本**，与 consensus-artifact.schema.json 的
+// schema_version（ARTIFACT_SCHEMA_VERSION）是两套独立版本线——前者无独立 schema 文件，
+// 后者从 schema 派生。此处导出让实现内不再手写字面量。
+export const RUN_MANIFEST_SCHEMA_VERSION = 'v3';
+
 export function runManifestPath(stateDir, runId) { return join(stateDir, `run-${runId}.json`); }
 export function integrationBranch(runId) { return `fix/${runId}/integration`; }
 export function integrationWorktree(worktreeRoot, runId) { return join(worktreeRoot, `${runId}-integration`); }
@@ -107,7 +115,7 @@ export function initRun({ stateDir, runId, repoDir, plan, scManifest, sourceArti
   const path = runManifestPath(stateDir, runId);
   if (existsSync(path)) throw new Error(`run ${runId} 已存在（幂等保护，换 runId 或先 cleanup）`);
   const m = {
-    schema_version: 'v3', run_id: runId, repo_dir: repoDir,
+    schema_version: RUN_MANIFEST_SCHEMA_VERSION, run_id: runId, repo_dir: repoDir,
     fix_plan_hash: plan.fix_plan_hash,
     sc_manifest_hash: hashObject(scManifest),
     source_artifact_hash: srcHash,
@@ -707,7 +715,7 @@ export function recordedSquashes(m) {
 // fix_orchestration.run_manifest_hash 比对即 fail-closed。
 export function runManifestHash(m) {
   return sha256(canonicalJson({
-    v: 'fix-run/v3', run_id: m.run_id, fix_plan_hash: m.fix_plan_hash,
+    v: `fix-run/${RUN_MANIFEST_SCHEMA_VERSION}`, run_id: m.run_id, fix_plan_hash: m.fix_plan_hash,
     sc_manifest_hash: m.sc_manifest_hash, source_artifact_hash: m.source_artifact_hash,
     source_candidate: m.source_candidate, final_candidate: m.final_candidate ?? null,
     waves: (m.waves ?? []).map((w) => ({

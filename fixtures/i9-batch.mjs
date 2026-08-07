@@ -41,14 +41,16 @@ const S = join(HERE, '..', 'scripts');
 
 let pass = 0, failCount = 0;
 const failures = [];
+const pendingTests = [];
 function t(name, fn) {
-  const r = fn(); // 支持 async（返回 Promise 则 await）
   const done = (err) => {
     if (err) { failCount++; failures.push(name); console.log(`FAIL  ${name}: ${err.message}`); }
     else { pass++; console.log(`  ok  ${name}`); }
   };
-  if (r && typeof r.then === 'function') r.then(() => done(null), done);
-  else { try { done(null); } catch (e) { done(e); } }
+  let r;
+  try { r = fn(); } catch (e) { done(e); return; }
+  if (r && typeof r.then === 'function') pendingTests.push(Promise.resolve(r).then(() => done(null), done));
+  else done(null);
 }
 function ok(cond, msg) { if (!cond) throw new Error(msg); }
 function eq(a, b, msg = '') {
@@ -619,6 +621,8 @@ t('[i9-batch-6a] L1..L3 两个 commit（多 commit 分步修复）→ 批次校�
   ok(!r.errors.some((e) => /批次|严格后代|零推进/i.test(e)), '多 commit 不应报任何批次错误: ' + JSON.stringify(r.errors));
 });
 
+// 等所有 async 测试完成后再出汇总（t 的 async 支持：主流程不等 Promise 会提前打印）
+await Promise.allSettled(pendingTests);
 console.log(`\n==== i9-batch.mjs: ${pass} passed, ${failCount} failed ====`);
 if (failCount) {
   console.log('失败用例:', failures.join(', '));
