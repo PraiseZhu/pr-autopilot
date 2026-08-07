@@ -26,7 +26,8 @@ import { checkPushGuard } from '../scripts/push-guard.mjs';
 import { checkScCoverage } from '../scripts/sc-coverage-gate.mjs';
 import { checkDispatch } from '../scripts/fix-dispatch-gate.mjs';
 import { buildFixPlan } from '../scripts/fix-plan.mjs';
-import { runManifestHash } from '../scripts/fix-run.mjs';
+import { runManifestHash, initRun } from '../scripts/fix-run.mjs';
+import { computeFixPlanHash } from '../scripts/fix-plan.mjs';
 import { checkBatchClosure } from '../scripts/batch-closure-gate.mjs';
 import { checkAttribution } from '../scripts/convergence-attribution-gate.mjs';
 import { readJson, hashObject } from '../scripts/lib/common.mjs';
@@ -303,6 +304,58 @@ t('[i9-batch-5b] family_key 归属错（不是触发复发的族）→ 拒', () 
   const errs = checkAttribution({ attribution: wrongFamily, runManifest: recurRunManifest, familyKey: FK1 });
   ok(errs.some((e) => /六件套必须针对复发的那一族/.test(e)),
     'family_key 错配必须被拦: ' + JSON.stringify(errs));
+});
+
+// ========== [i9-batch-7] 批次未收口（status=open）被拒 ==========
+console.log('\n[i9-batch-7] 批次未收口：batch.status=open → push-guard 拒 push');
+const openRunManifest = mkRunManifest({
+  batch: { batch_id: 'b1', frozen_at_sha: L1, frozen_families: [FK1, FK2].sort(), successor_sha: null, status: 'open' }
+});
+t('[i9-batch-7] batch.status=open → push-guard 报「批次未收口」', () => {
+  const fo = {
+    source_artifact_hash: recomputeArtifactHash(srcArtifact),
+    sc_manifest_hash: hashObject(scManifest),
+    fix_plan_hash: plan.fix_plan_hash,
+    dispatch_record_hash: hashObject(dispatchRecord),
+    run_manifest_hash: runManifestHash(openRunManifest)
+  };
+  const r = checkPushGuard({
+    repoDir: repo,
+    manifest: { repo: 'o/r', remote: 'origin', branch: 'feat', expected_sha: L2, purpose: 'feature', consensus_artifact_hash: termEmpty.consensus_artifact_hash, fix_orchestration: fo },
+    artifact: termEmpty, bundle: mkBundle(L0, L2), constitution,
+    sourceArtifact: srcArtifact, scManifest, fixPlan: plan, dispatchRecord, runManifest: openRunManifest
+  });
+  ok(r.errors.some((e) => /批次 .* status="open" ≠ closed（批次未收口，不得 push）/.test(e)),
+    '必须精确报出「批次未收口」错误: ' + JSON.stringify(r.errors));
+  ok(!r.errors.some((e) => /恰好一个后继/.test(e)), '未收口批次不得先撞「恰好一个后继」（失败模式隔离，successor 还没写）: ' + JSON.stringify(r.errors));
+});
+
+// ========== [i9-batch-8] 冻结集必须 ⊆ 源共识（initRun 与闭合门③同判据） ==========
+console.log('\n[i9-batch-8] 冻结集真实：frozen_families 含源共识之外的 family → initRun throw / 闭合门③拒');
+t('[i9-batch-8a] initRun 冻结集含外族 family_key → throw（fail-closed）', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'i9-batch-run-'));
+  const p = { schema_version: 'v1', consensus_artifact_hash: srcArtifact.consensus_artifact_hash, capacity: 8, groups: [], waves: [], n_min_per_wave: [], parallelism_notes: [] };
+  p.fix_plan_hash = computeFixPlanHash(p);
+  let threw = null;
+  try { initRun({ stateDir, runId: 'i9-batch-bad', repoDir: repo, plan: p, scManifest: {}, sourceArtifact: srcArtifact, batch: { batch_id: 'b-bad', frozen_families: [FK1, FK3] } }); }
+  catch (e) { threw = e; }
+  ok(threw && /不在源共识 canonical_findings 中的 family_key/.test(threw.message),
+    'initRun 必须精确 throw 外族冻结集错误: ' + (threw ? threw.message : '(未抛错)'));
+});
+t('[i9-batch-8b] 闭合门③同判据：frozen_families 含外族 → 拒（独立于 initRun 重验）', () => {
+  const forgedRun = mkRunManifest({ batch: { batch_id: 'b1', frozen_at_sha: L1, frozen_families: [FK1, FK3].sort(), successor_sha: L2, status: 'closed' } });
+  const errs = checkBatchClosure({ runManifest: forgedRun, sourceArtifact: srcArtifact, finalArtifact: termEmpty, scManifest });
+  ok(errs.some((e) => /不在源共识中的 family_key/.test(e)),
+    '闭合门必须独立重验冻结集真实性: ' + JSON.stringify(errs));
+});
+
+// ========== [i9-batch-9] 批次起点必须由 run 起点派生 ==========
+console.log('\n[i9-batch-9] frozen_at_sha 不自报：≠ source_candidate → 闭合门②拒');
+t('[i9-batch-9] batch.frozen_at_sha ≠ run 起点 → 闭合门②拒（起点 CAS 派生，不接受自报）', () => {
+  const driftedRun = mkRunManifest({ batch: { batch_id: 'b1', frozen_at_sha: L0, frozen_families: [FK1, FK2].sort(), successor_sha: L2, status: 'closed' } });
+  const errs = checkBatchClosure({ runManifest: driftedRun, sourceArtifact: srcArtifact, finalArtifact: termEmpty, scManifest });
+  ok(errs.some((e) => /batch\.frozen_at_sha.*≠ run manifest source_candidate/.test(e)),
+    'frozen_at_sha 漂移必须被拦: ' + JSON.stringify(errs));
 });
 
 // ========== [i9-batch-6] successor 不是直接后继被拒 ==========
