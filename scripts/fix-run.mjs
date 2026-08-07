@@ -665,6 +665,13 @@ export function finalizeRun({ stateDir, runId }) {
   if (!last?.integrated_tip) throw new Error('最后一波尚未集成，不能 finalize');
   for (const [i, w] of m.waves.entries()) {
     if (!w.validation?.ok) throw new Error(`wave${i + 1} 未通过 orchestrator 复跑验证（fail-closed）`);
+    // SC-T2（2026-08-08，GPT 席执行注记）：reader 侧硬化——finalizeRun 读到持久化 manifest 中
+    // {ok:true, results:[]} 该形状时拒绝（空 results 上 results.every 恒 true，ok:true 是自报
+    // 摘要，不是逐项证据；文案限定「finalizeRun 读到该形状时拒绝」，不泛化为防所有手改 manifest）。
+    // 正常路径下 validateIntegration 写 results 非空（逐 SC 记录），空 results 只可能是篡改或异常。
+    if (w.validation.ok === true && Array.isArray(w.validation.results) && w.validation.results.length === 0) {
+      throw new Error(`wave${i + 1} validation {ok:true, results:[]}——finalizeRun 读到该形状时拒绝（空 results = 无逐项 PASS 证据，ok:true 是自报摘要，SC-T2）`);
+    }
   }
   if (m.feature_branch) {
     let currentBranch = null;

@@ -1088,6 +1088,51 @@ t('[SC-T1c-B] 变异 B：6c 内常驻严格后代反向变异保持原样（挖 
   ok(true, '变异 B：6c 常驻严格后代反向变异在本轮全套中保持绿（见 [i9-batch-6c] 的 ok 输出）');
 });
 
+// ========== [SC-T2] finalizeRun reader 侧硬化（2026-08-08 派工） ==========
+console.log('\n[SC-T2] finalizeRun 读到持久化 manifest {ok:true, results:[]} 时拒绝');
+t('[SC-T2-1] CLI 全链正常 finalize 通过（对照组：results 非空逐项证据）', () => {
+  const { runManifest } = cliFullChain(undefined);
+  ok(runManifest.waves.every((w) => w.validation && w.validation.ok === true && (w.validation.results ?? []).length > 0),
+    '正常路径 waves validation 必须 ok:true 且 results 非空（逐 SC 记录）');
+});
+t('[SC-T2-2] 持久化篡改：validation 改为 {ok:true, results:[]} → finalizeRun 拒绝（文案限定该形状）', () => {
+  // CLI 全链跑到 validate 后（validation 已写入 results 非空），持久化篡改 manifest：
+  // 把 wave0 的 validation.results 清空（ok 保持 true——自报摘要形态）→ finalizeRun 必须拒
+  const dT2 = mkdtempSync(join(tmpdir(), 't2-'));
+  const stateDir = join(dT2, 'state'); mkdirSync(stateDir, { recursive: true });
+  const wtRoot = join(dT2, 'wt'); mkdirSync(wtRoot, { recursive: true });
+  const runId = `t2-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const writeJson = (name, obj) => { const p = join(dT2, name); writeFileSync(p, JSON.stringify(obj)); return p; };
+  const planP = writeJson('plan.json', plan);
+  const scmP = writeJson('scm.json', scManifest);
+  const srcP = writeJson('src.json', srcArtifact);
+  const featBranch = `feat-${runId}`;
+  execFileSync('git', ['-C', repo, 'checkout', '-q', '-b', featBranch, L1]);
+  cliRun('init', '--state-dir', stateDir, '--run-id', runId, '--repo-dir', repo, '--plan', planP, '--sc-manifest', scmP, '--source-artifact', srcP, '--feature-branch', featBranch);
+  const allocOut = JSON.parse(cliRun('allocate', '--state-dir', stateDir, '--run-id', runId, '--plan', planP, '--wave', '0', '--worktree-root', wtRoot, '--artifact', srcP, '--sc-manifest', scmP));
+  for (const a of allocOut.allocations) {
+    for (const f of a.anchor_paths ?? []) {
+      mkdirSync(dirname(join(a.worktree, f)), { recursive: true });
+      writeFileSync(join(a.worktree, f), f.includes('fix1') ? 'cancel 保护已加\n' : (f.includes('README') ? '残余 风险已登记\n' : 'fixed\n'));
+    }
+    execFileSync('git', ['-C', a.worktree, 'add', '.']);
+    execFileSync('git', ['-C', a.worktree, 'commit', '-qm', `fix ${a.group_id}`]);
+  }
+  const intOut = JSON.parse(cliRun('integrate', '--state-dir', stateDir, '--run-id', runId, '--plan', planP, '--wave', '0'));
+  if (!intOut.ok) throw new Error('integrate 失败: ' + JSON.stringify(intOut.errors));
+  const valOut = JSON.parse(cliRun('validate', '--state-dir', stateDir, '--run-id', runId, '--sc-manifest', scmP, '--wave', '0'));
+  if (!valOut.ok) throw new Error('validate 失败: ' + JSON.stringify(valOut.results));
+  // 持久化篡改：wave0 validation.results 清空（ok 保持 true）
+  const mPath = join(stateDir, `run-${runId}.json`);
+  const m = readJson(mPath);
+  m.waves[0].validation.results = [];
+  writeFileSync(mPath, JSON.stringify(m));
+  let finErr = '';
+  try { cliRun('finalize', '--state-dir', stateDir, '--run-id', runId); }
+  catch (e) { finErr = String(e.message); }
+  ok(finErr.includes('finalizeRun 读到该形状时拒绝'), 'finalizeRun 必须拒绝 {ok:true, results:[]} 并点名该形状: ' + finErr);
+});
+
 // 等所有 async 测试完成后再出汇总（t 的 async 支持：主流程不等 Promise 会提前打印）
 await Promise.allSettled(pendingTests);
 console.log(`\n==== i9-batch.mjs: ${pass} passed, ${failCount} failed ====`);
