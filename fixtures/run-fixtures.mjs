@@ -1052,6 +1052,225 @@ t('[审③F8-R] dispatch wrapper 四元组: 只回 session_id 拒 / 缺任一字
   '换一套期望值且回执相符应过');
 });
 
+// ---- T2/T3: 引擎失败可观测 + pending 超时告警（SC-2a/b · SC-3a/b/c）----
+// 每个测试用独立 tmp 目录（不与上面共享 engState 的用例互踩）；
+// 顺序 runEngine 调用模拟独立引擎进程共享同一 stateDir（runEngine 无进程内状态，
+// 每轮都是完整引擎循环，去重持久化证据 = state 文件内的标记）。
+const readJournal = (f) => existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+const markerCount = (f, m) => existsSync(f) ? (readFileSync(f, 'utf8').match(new RegExp(m, 'g')) ?? []).length : 0;
+function mkT23Eng() {
+  const dir = mkdtempSync(join(tmpdir(), 't23-'));
+  const stateDir = join(dir, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  const snapFile = join(dir, 'snap.json');
+  const journalFile = join(dir, 'journal.jsonl');
+  const notifyLog = join(dir, 'notify.log');
+  writeFileSync(snapFile, JSON.stringify(snapBase));
+  writeFileSync(join(dir, 'snap.sh'), `#!/bin/sh\ncat "${snapFile}"\n`);
+  writeFileSync(join(dir, 'dispatch-ok.sh'), `#!/bin/sh\ncat >> "${join(dir, 'dispatch.log')}"\necho "" >> "${join(dir, 'dispatch.log')}"\n`);
+  writeFileSync(join(dir, 'dispatch-fail.sh'), '#!/bin/sh\nexit 1\n');
+  writeFileSync(join(dir, 'notify.sh'), `#!/bin/sh\ncat >> "${notifyLog}"\necho "" >> "${notifyLog}"\n`);
+  writeFileSync(join(dir, 'notify-fail.sh'), '#!/bin/sh\nexit 1\n');
+  for (const f of ['snap.sh', 'dispatch-ok.sh', 'dispatch-fail.sh', 'notify.sh', 'notify-fail.sh']) execFileSync('chmod', ['+x', join(dir, f)]);
+  const eng = (over = {}) => ({
+    stateDir, leaseFile: join(dir, 'lease.json'),
+    snapshotCmd: join(dir, 'snap.sh') + ' {owner} {repo} {pr}',
+    dispatchCmd: join(dir, 'dispatch-ok.sh'),
+    journalFile,
+    feishuCmd: join(dir, 'notify.sh'), slackCmd: join(dir, 'notify.sh'),
+    hmacKey: HMAC_KEY,
+    budget: { ledger: join(dir, 'budget.jsonl'), cap: 10000, estimate: 1 },
+    repoDirs: { 'o/mivo-canvas': bizRepo },
+    ...over
+  });
+  return { dir, eng, snapFile, journalFile, notifyLog };
+}
+
+t('[T2/SC-2b] 首派连续失败: 每轮一条 dispatch-failed + attempt 恒 1 + 游标不推进 + 不留 pending', () => {
+  const d = mkT23Eng();
+  const { eng, snapFile, journalFile } = d;
+  registerPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 301, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't2a1', body: '请修' }] }));
+  const stFile = join(eng().stateDir, stateFileName('o', 'mivo-canvas', 301));
+  const failEng = eng({ dispatchCmd: join(d.dir, 'dispatch-fail.sh') });
+  for (let i = 0; i < 3; i++) runEngine(failEng);
+  const df = readJournal(journalFile).filter((r) => r.kind === 'dispatch-failed');
+  eq(df.length, 3, '连续 3 轮失败必须每轮记一条 dispatch-failed');
+  for (const r of df) {
+    eq(r.attempt, 1, '首派失败 attempt 必须恒 1（无 pending 无跨轮状态）');
+    ok(r.dispatch_id && r.error, 'dispatch-failed 必须带 dispatch_id 与 error');
+    eq(r.pr, 'o/mivo-canvas#301');
+  }
+  // 失败不消费信号 → 游标不推进（下轮仍重试 at-least-once）；首派失败不留 pending
+  ok(!(readJson(stFile).cursors?.comment_ids ?? []).includes('t2a1'), '失败轮不得推进游标');
+  ok(!readJson(stFile).pending_dispatch, '首派失败不得留下 pending_dispatch');
+  unregisterPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 301 });
+});
+
+t('[T2/SC-2b] 重派连续失败: redispatch_count 跨轮递增持久化 + 最终 stuck + redispatch-failed 绑定同 id', () => {
+  const d = mkT23Eng();
+  const { eng, snapFile, journalFile, notifyLog } = d;
+  registerPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 302, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't2b1', body: '请修' }] }));
+  const stFile = join(eng().stateDir, stateFileName('o', 'mivo-canvas', 302));
+  let r = runEngine(eng());
+  eq(r.dispatched.length, 1, '首派必须成功');
+  const origId = readJson(stFile).pending_dispatch.dispatch_id;
+  const expire = () => {
+    const st = readJson(stFile);
+    st.pending_dispatch.dispatched_at = new Date(Date.now() - 60 * 60000).toISOString();
+    writeFileSync(stFile, JSON.stringify(st));
+  };
+  const failEng = eng({ dispatchCmd: join(d.dir, 'dispatch-fail.sh') });
+  const counts = [];
+  for (let i = 0; i < 3; i++) {
+    expire();
+    r = runEngine(failEng);
+    counts.push(readJson(stFile).pending_dispatch.redispatch_count);
+  }
+  eq(counts, [1, 2, 3], 'redispatch_count 必须跨轮递增持久化（连续失败也能到达 stuck 判据）');
+  eq(r.stuck.length, 1, '连续失败必须最终触发 stuck');
+  ok(readFileSync(notifyLog, 'utf8').includes('挂死'), 'stuck 通知必须发出');
+  const rf = readJournal(journalFile).filter((x) => x.kind === 'redispatch-failed');
+  eq(rf.length, 3, '每轮失败必须记一条 redispatch-failed');
+  eq(rf.map((x) => x.attempt), [1, 2, 3], 'redispatch-failed attempt = redispatch_count+1');
+  eq(rf.map((x) => x.dispatch_id).every((id) => id === origId), true, '重派失败事件必须绑定同一 dispatch_id');
+  eq(readJson(stFile).pending_dispatch.dispatch_id, origId, '失败重派不改 id（仍待 ack）');
+  ackDispatch({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 302, dispatchId: origId });
+  unregisterPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 302 });
+});
+
+t('[T3/SC-3c] pending 超时: 首轮告警 + 第二次独立引擎运行去重不重发 + ack 后新 id 可再告 + waiting 形状', () => {
+  const d = mkT23Eng();
+  const { eng, snapFile, journalFile, notifyLog } = d;
+  const T0 = Date.now();
+  registerPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 303, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't3c1', body: '请修' }] }));
+  const stFile = join(eng().stateDir, stateFileName('o', 'mivo-canvas', 303));
+  let r = runEngine(eng({ nowMs: T0 }));
+  eq(r.dispatched.length, 1, '首派必须成功');
+  let st = readJson(stFile);
+  eq(st.pending_dispatch.first_dispatched_at, st.pending_dispatch.dispatched_at, '首派必须写入 first_dispatched_at');
+  const id1 = st.pending_dispatch.dispatch_id;
+  // 超 6 小时（默认 pendingStuckHours=6）
+  st.pending_dispatch.first_dispatched_at = new Date(T0 - 7 * 3600 * 1000).toISOString();
+  writeFileSync(stFile, JSON.stringify(st));
+  r = runEngine(eng({ nowMs: T0 }));
+  eq(markerCount(notifyLog, '等待 ack 已超'), 1, '超时必须告警一次');
+  st = readJson(stFile);
+  eq(st.pending_dispatch.pending_stuck_notified, true, '尝试发送后标记必须置位');
+  // waiting 形状
+  const w = readJournal(journalFile).filter((x) => x.kind === 'waiting' && x.dispatch_id === id1).pop();
+  ok(w, '必须记 waiting');
+  eq(w.pr, 'o/mivo-canvas#303');
+  eq(w.waiting_for, 'ack', 'waiting_for 枚举只有 ack');
+  eq(w.age_minutes, 420, 'age_minutes = now - first_dispatched_at（7h = 420min）');
+  eq(w.attempt, 1, 'attempt = redispatch_count+1（无重派 = 1）');
+  // 第二次独立引擎运行（顺序调用模拟独立进程共享 stateDir）→ 去重不重发
+  r = runEngine(eng({ nowMs: T0 }));
+  eq(markerCount(notifyLog, '等待 ack 已超'), 1, '去重持久化: 第二轮不得重发');
+  // ack 清 pending → 新反馈 → 新 dispatch id（标记在 pending_dispatch 内，天然清掉）→ 可再告
+  ok(ackDispatch({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 303, dispatchId: id1 }).ok);
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't3c1', body: '请修' }, { id: 't3c2', body: '又来了' }] }));
+  r = runEngine(eng({ nowMs: T0 }));
+  eq(r.dispatched.length, 1, 'ack 后新反馈必须重新派发');
+  st = readJson(stFile);
+  const id2 = st.pending_dispatch.dispatch_id;
+  ok(id2 !== id1, 'ack 后必须新 dispatch_id');
+  ok(!st.pending_dispatch.pending_stuck_notified, '新 pending_dispatch 必须不带旧标记');
+  st.pending_dispatch.first_dispatched_at = new Date(T0 - 7 * 3600 * 1000).toISOString();
+  writeFileSync(stFile, JSON.stringify(st));
+  r = runEngine(eng({ nowMs: T0 }));
+  eq(markerCount(notifyLog, '等待 ack 已超'), 2, '新 dispatch_id 必须可再告');
+  ackDispatch({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 303, dispatchId: id2 });
+  unregisterPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 303 });
+});
+
+t('[T3/SC-3c] 未超时（< 6h）不告警且不置标记', () => {
+  const d = mkT23Eng();
+  const { eng, snapFile, notifyLog } = d;
+  const T0 = Date.now();
+  registerPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 305, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't3e1', body: '请修' }] }));
+  const stFile = join(eng().stateDir, stateFileName('o', 'mivo-canvas', 305));
+  runEngine(eng({ nowMs: T0 }));
+  const st = readJson(stFile);
+  st.pending_dispatch.first_dispatched_at = new Date(T0 - 5 * 3600 * 1000).toISOString(); // 5h < 默认 6h
+  writeFileSync(stFile, JSON.stringify(st));
+  runEngine(eng({ nowMs: T0 }));
+  eq(markerCount(notifyLog, '等待 ack 已超'), 0, '未超时不得告警');
+  ok(readJson(stFile).pending_dispatch.pending_stuck_notified === undefined, '未超时不得置标记');
+  ackDispatch({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 305, dispatchId: readJson(stFile).pending_dispatch.dispatch_id });
+  unregisterPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 305 });
+});
+
+t('[T3/SC-3c] 旧 state 缺 first_dispatched_at: 回填后成功重派 + 年龄仍按原 dispatched_at', () => {
+  const d = mkT23Eng();
+  const { eng, snapFile, journalFile } = d;
+  const T0 = Date.now();
+  registerPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 304, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't3d1', body: '请修' }] }));
+  runEngine(eng({ nowMs: T0 })); // 首派
+  const stFile = join(eng().stateDir, stateFileName('o', 'mivo-canvas', 304));
+  const st = readJson(stFile);
+  const origDispatched = new Date(T0 - 2 * 3600 * 1000).toISOString();
+  delete st.pending_dispatch.first_dispatched_at; // 模拟旧协议 state（无该字段）
+  st.pending_dispatch.dispatched_at = origDispatched; // lease 已过期（2h > 40min）
+  writeFileSync(stFile, JSON.stringify(st));
+  const r = runEngine(eng({ nowMs: T0 })); // 重派成功
+  eq(r.redispatched.length, 1, '旧 state 缺字段也必须能正常重派');
+  const st2 = readJson(stFile);
+  eq(st2.pending_dispatch.first_dispatched_at, origDispatched, '回填必须取当时的 dispatched_at');
+  ok(st2.pending_dispatch.dispatched_at !== origDispatched, '重派必须更新 dispatched_at（first_dispatched_at 不更新）');
+  const w = readJournal(journalFile).filter((x) => x.kind === 'waiting' && x.dispatch_id === st2.pending_dispatch.dispatch_id).pop();
+  ok(w, '重派轮必须记 waiting');
+  eq(w.age_minutes, 120, '年龄必须按回填的 first_dispatched_at 计算（2h = 120min）');
+  ackDispatch({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 304, dispatchId: st2.pending_dispatch.dispatch_id });
+  unregisterPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 304 });
+});
+
+t('[T3/SC-3c] 通知命令失败: notify-error 事件在 + 标记仍置位 + 换好命令不重发（宁丢一次）', () => {
+  const d = mkT23Eng();
+  const { eng, snapFile, journalFile, notifyLog } = d;
+  const T0 = Date.now();
+  registerPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 306, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't3f1', body: '请修' }] }));
+  const stFile = join(eng().stateDir, stateFileName('o', 'mivo-canvas', 306));
+  runEngine(eng({ nowMs: T0 }));
+  const st = readJson(stFile);
+  st.pending_dispatch.first_dispatched_at = new Date(T0 - 7 * 3600 * 1000).toISOString();
+  writeFileSync(stFile, JSON.stringify(st));
+  runEngine(eng({ nowMs: T0, feishuCmd: join(d.dir, 'notify-fail.sh') })); // mivo → feishu 通道，命令失败
+  const ne = readJournal(journalFile).filter((x) => x.kind === 'notify-error');
+  ok(ne.length >= 1, '通知命令失败必须记 notify-error');
+  eq(readJson(stFile).pending_dispatch.pending_stuck_notified, true, '通知失败标记仍必须置位');
+  runEngine(eng({ nowMs: T0 })); // 换回正常通知脚本再跑一轮
+  eq(markerCount(notifyLog, '等待 ack 已超'), 0, '失败轮不重发（去重不受通知失败影响，宁丢一次不刷屏）');
+  ackDispatch({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 306, dispatchId: readJson(stFile).pending_dispatch.dispatch_id });
+  unregisterPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 306 });
+});
+
+t('[T3/SC-3c] pending-stuck 路由: cindy=silent / mivo=feishu（route 单元 + 引擎路径 silent 不碰通知）', () => {
+  eq(route('pending-stuck', { repo: 'cindy' }), 'silent');
+  eq(route('pending-stuck', { repo: 'mivo-canvas' }), 'feishu');
+  // 引擎路径: cindy PR 超时 → silent → 不产生任何通知，但标记仍置位（去重）
+  const d = mkT23Eng();
+  const { eng, snapFile, notifyLog } = d;
+  const T0 = Date.now();
+  registerPr({ stateDir: eng().stateDir, owner: 'makecindy', repo: 'cindy', prNumber: 307, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't3g1', body: '请修' }] }));
+  const stFile = join(eng().stateDir, stateFileName('makecindy', 'cindy', 307));
+  runEngine(eng({ nowMs: T0 }));
+  const st = readJson(stFile);
+  st.pending_dispatch.first_dispatched_at = new Date(T0 - 7 * 3600 * 1000).toISOString();
+  writeFileSync(stFile, JSON.stringify(st));
+  runEngine(eng({ nowMs: T0 }));
+  eq(markerCount(notifyLog, '等待 ack 已超'), 0, 'cindy PR 必须 silent（不产生任何通知）');
+  eq(readJson(stFile).pending_dispatch.pending_stuck_notified, true, 'silent 分支也必须置标记（去重）');
+  ackDispatch({ stateDir: eng().stateDir, owner: 'makecindy', repo: 'cindy', prNumber: 307, dispatchId: readJson(stFile).pending_dispatch.dispatch_id });
+  unregisterPr({ stateDir: eng().stateDir, owner: 'makecindy', repo: 'cindy', prNumber: 307 });
+});
+
 // ========== 7. inbox-digest ==========
 console.log('\n[7] §3 + 审③F9-R: 卡片全链闭环');
 const notifications = [
