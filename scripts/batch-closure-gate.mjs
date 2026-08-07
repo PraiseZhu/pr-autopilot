@@ -132,12 +132,18 @@ export function checkBatchClosure({ runManifest, sourceArtifact, finalArtifact, 
       return cf && cf.family_key === sc.family_key;
     });
     if (!allInFamily) continue;
-    // ② 该 SC 真实出现在某 wave 的 allocations 且该 wave validation.ok
+    // ② 该 SC 真实出现在某 wave 的 allocations **且该 wave 的 validation.results 中存在
+    //    sc_id === sc.id 且 status === 'PASS' 的逐项证据**（2026-08-07 复核 major 修复）。
+    //    此前只验 validation.ok（自报汇总布尔值）——空 results 上 fix-run:643 的
+    //    results.every((r) => r.status === 'PASS') 恒为 true，`{ok:true, results:[]}` 就能
+    //    伪造通过出口而该 SC 的 verify 从未执行（汇总布尔值 = 「台账≠修复」标准形态）。
+    //    逐项查到即说明 results 非空且该 SC 真跑过；不再依赖 validation.ok（可真而 results 空）。
     const waves = Array.isArray(runManifest.waves) ? runManifest.waves : [];
     const executedOk = waves.some((w) => {
-      if (!(w && w.validation && w.validation.ok === true)) return false;
       const allocs = Array.isArray(w.allocations) ? w.allocations : [];
-      return allocs.some((a) => (a.sc_ids ?? []).includes(sc.id));
+      if (!allocs.some((a) => (a.sc_ids ?? []).includes(sc.id))) return false;
+      const results = w && w.validation ? (Array.isArray(w.validation.results) ? w.validation.results : []) : [];
+      return results.some((r) => r.sc_id === sc.id && r.status === 'PASS');
     });
     if (!executedOk) continue;
     archiveScByFamily.set(sc.family_key, sc.id);

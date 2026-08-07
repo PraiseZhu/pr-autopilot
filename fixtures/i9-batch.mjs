@@ -632,6 +632,19 @@ t('[i9-batch-14a] 冻结 family 被 ARCHIVE 处置（终版有该族 + 带 archi
   const notExecuted = { ...recurRunManifest, waves: (recurRunManifest.waves ?? []).map((w) => ({ ...w, allocations: [], validation: { at: 't', ok: true, results: [] } })) };
   const errsNotExec = checkBatchClosure({ runManifest: notExecuted, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest: scManifestWithArchFK1 });
   ok(errsNotExec.some((e) => /同族复发/.test(e)), 'archive SC 未真实执行（allocations 空）→ 出口不成立，仍拒: ' + JSON.stringify(errsNotExec));
+  // 2026-08-07 复核 major 负例①：validation {ok:true, results:[]}（空 results——fix-run:643 的
+  // results.every 空数组恒 true，ok:true 是自报摘要）→ 该 archive SC 的 verify 从未执行 → 出口不成立
+  const emptyResults = { ...recurRunManifest, waves: (recurRunManifest.waves ?? []).map((w, i) => (i === 0
+    ? { ...w, allocations: [{ group_id: 'arch', sc_ids: ['SC-ARCH-FK1'], worktree: '/x', anchor_paths: ['README.md'] }], validation: { at: 't', ok: true, results: [] } }
+    : w)) };
+  const errsEmpty = checkBatchClosure({ runManifest: emptyResults, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest: scManifestWithArchFK1 });
+  ok(errsEmpty.some((e) => /同族复发/.test(e)), 'validation {ok:true, results:[]}（空 results 无逐项证据）→ 出口不成立，仍拒: ' + JSON.stringify(errsEmpty));
+  // 负例②：results 含该 SC 但 status=FAIL → 逐项证据不通过 → 出口不成立
+  const failResult = { ...recurRunManifest, waves: (recurRunManifest.waves ?? []).map((w, i) => (i === 0
+    ? { ...w, allocations: [{ group_id: 'arch', sc_ids: ['SC-ARCH-FK1'], worktree: '/x', anchor_paths: ['README.md'] }], validation: { at: 't', ok: true, results: [{ sc_id: 'SC-ARCH-FK1', status: 'FAIL' }] } }
+    : w)) };
+  const errsFail = checkBatchClosure({ runManifest: failResult, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest: scManifestWithArchFK1 });
+  ok(errsFail.some((e) => /同族复发/.test(e)), 'results 含该 SC 但 status=FAIL → 出口不成立，仍拒: ' + JSON.stringify(errsFail));
 });
 t('[i9-batch-14b] 无该族 archive SC（终版有该族）→ 判据④仍拒（出口判据=该族有 archive SC）', () => {
   const errs = checkBatchClosure({ runManifest: recurRunManifest, sourceArtifact: srcArtifact, finalArtifact: termRecurArch, scManifest });
