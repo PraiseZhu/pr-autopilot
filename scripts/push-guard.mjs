@@ -47,24 +47,6 @@ function git(repoDir, ...args) {
 }
 const gitT = (repoDir, ...args) => git(repoDir, ...args).trim();
 
-// i9-batch: 严格后代判定（is-ancestor + 不等，任意距离）——批次 successor_sha 必须是
-// frozen_at_sha 的严格后代（一批 finding → 一个已解决状态，不要求单 commit；多 commit 分步
-// 修复合法）。与 consensus-gate 的 parent 校验（严格祖先，任意距离）严格度对齐。
-// 三态：true=严格后代 / false=非后代或相等 / throw=无法判定（fail-closed）。
-// 注意（如实声明）：在 push-guard 完整链上，SC-3（终版 artifact 的 parent 祖先绑定）+
-// expected_sha 绑定已前置保证终版 candidate 是 source_candidate 的后代，本函数是**显式
-// 语义 + 纵深**（防前置检查被改坏/未来变松），正常流不可独立触发。
-export function isStrictDescendant({ repoDir, ancestorSha, descendantSha }) {
-  if (ancestorSha === descendantSha) return false;
-  try {
-    execFileSync('git', ['-C', repoDir, 'merge-base', '--is-ancestor', ancestorSha, descendantSha], { encoding: 'utf8', timeout: 60_000 });
-    return true;
-  } catch (e) {
-    if (e.status === 1) return false;
-    throw new Error(`git merge-base --is-ancestor 判定失败（非「不是祖先」的正常否定，可能是 revision 不可得/非 git 仓）: ${e.message}`);
-  }
-}
-
 export function validateManifest(manifest) {
   const errs = [];
   for (const k of ['repo', 'remote', 'branch', 'expected_sha', 'purpose']) {
@@ -377,23 +359,19 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
                   if (batch.successor_sha !== finalTip) {
                     errors.push(`批次 successor_sha（${String(batch.successor_sha).slice(0, 12)}）≠ 最终 integrated_tip（${finalTip.slice(0, 12)}）——批次后继必须等于 run 的最终候选（i9-batch）`);
                   }
-                  // i9-batch 语义纠正（lead 2026-08-07 撤回「直接后继」）: 批次是一次「一批
+                  // i9-batch 语义（lead 2026-08-07 撤回「直接后继」后定案）: 批次是一次「一批
                   // finding → 一个已解决状态」的事务，不要求单 commit——多 commit 分步修复
-                  // 合法（分步修、边修边测）。校验为**严格后代**（is-ancestor + 不等，任意
-                  // 距离）：successor_sha 必须是 frozen_at_sha 的后代且不得相等。与
-                  // consensus-gate 的 parent 校验（严格祖先，任意距离）严格度对齐——同一
-                  // 条链上不会出现一个门允许多 commit、另一个门只许直接子 commit 的打架。
+                  // 合法（分步修、边修边测）。successor_sha 必是 frozen_at_sha 的**严格后代**
+                  // （任意距离，不得等于起点）。
+                  // **此处刻意不设检查**（lead 2026-08-07 裁定，确认门：删掉它其他判断还成立
+                  // = 成立就不建）：该不变量由本守卫的 expected_sha 绑定 + SC-3 终版 artifact
+                  // 的 parent 祖先绑定 **by construction 共同保证**；实测确认「非后代/零推进」
+                  // 在完整链上无法独立构造触发（会被前置检查先拦）。一道不可达的检查会让人
+                  // 误以为是它在拦，而真正的强制点在别处——比没有这道门更危险。
+                  // 完整不变量声明见 convergence-checkpoint.md 批次段。
                   if (batch.successor_sha === finalTip && batch.frozen_at_sha === runManifest.source_candidate) {
-                    let isDesc = null, descErr = null;
-                    try { isDesc = isStrictDescendant({ repoDir, ancestorSha: batch.frozen_at_sha, descendantSha: batch.successor_sha }); }
-                    catch (e) { descErr = e.message; }
-                    if (descErr) {
-                      errors.push(`批次后代关系判定失败（fail-closed）: ${descErr}`);
-                    } else if (!isDesc) {
-                      errors.push(batch.successor_sha === batch.frozen_at_sha
-                        ? `批次零推进: successor_sha 等于 frozen_at_sha（${String(batch.frozen_at_sha).slice(0, 12)}）——批次必须推进到起点之后的某个 commit（i9-batch）`
-                        : `批次 successor_sha（${String(batch.successor_sha).slice(0, 12)}）不是 frozen_at_sha（${String(batch.frozen_at_sha).slice(0, 12)}）的严格后代——批次必须推进到起点之后的 commit（任意距离，不要求直接子 commit，i9-batch）`);
-                    }
+                    // 语义契约：successor 必为 frozen 的严格后代（由 expected_sha + SC-3 保证，
+                    // 此处只保留 successor==finalTip 与起点派生的一致性断言）
                   }
                 }
               }
