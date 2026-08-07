@@ -14,10 +14,44 @@
 //   ③ 三 verdict 均 APPROVED
 //   ④ 全部 gate_checks ∈ {pass, n_a}（脚本断言，不信模型总 verdict）
 import { hashObject, sha256, canonicalJson, readJson, writeJsonAtomic, parseArgs, fail, nowIso, isMain} from './lib/common.mjs';
-import { validateVerdict, changedPathSet, trackedPathSet } from './verdict-validate.mjs';
+// issue #9 R3 MAJOR1: REVIEWERS 此前在本文件独立手拄第三份（第一份 schemas/review-verdict.
+// schema.json 的 enum，第二份 verdict-validate.mjs:80 的 export）。verdict-validate.mjs 已是
+// 席位名单的唯一权威声明点（见该文件 R2-P1 SC-9/SC-10 注释），本文件改为直接 import，不再
+// 各自手拄——roster 增删时 dispatch/validator 与本门的席位门不再可能因为漏改一处而永久死锁。
+import { validateVerdict, changedPathSet, trackedPathSet, REVIEWERS } from './verdict-validate.mjs';
 import { computeReviewInputHash } from './review-input-hash.mjs';
+import { execFileSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const REVIEWERS = ['claude-adversarial', 'codex-adversarial', 'upstream-preview'];
+const HERE = dirname(fileURLToPath(import.meta.url));
+// issue #9 R3 MAJOR3: schema_version 的 'v3' 字面量此前在本文件独立手拄两处（draft 构造 +
+// assertArtifactShape 校验），与 schemas/consensus-artifact.schema.json 的对应字段是两份
+// 独立数据——只升级 JSON 里的版本会使本文件继续产 v3/拒 v4。改为本文件读 schema 派生
+// （与 verdict-validate.mjs 对 review-verdict schema 的既有做法一致），派生失败显式 throw。
+export const ARTIFACT_SCHEMA_VERSION = (() => {
+  const schema = readJson(join(HERE, '../schemas/consensus-artifact.schema.json'));
+  const v = schema.properties?.schema_version?.const;
+  if (typeof v !== 'string' || !v) {
+    throw new Error('consensus-gate: 无法从 consensus-artifact.schema.json 读出 schema_version.const（schema 结构已变，需人工核对派生路径）');
+  }
+  return v;
+})();
+
+// issue #9 R3 blocker: parent 谱系绑定需要独立于 hash/round 的第三层校验——parent.candidate_sha
+// 必须是当前 candidate_sha 的真实 git 祖先（原生 ancestry，不接受自报字符串）。
+// `git merge-base --is-ancestor` 退出码 0=是祖先、1=不是祖先（合法的否定结果，不是错误）、
+// 其它非零退出（revision 不可得等）视为无法判定——三态互不吞并，故不用简单的 try/catch true/false。
+function isAncestorCommit({ repoDir, ancestorSha, descendantSha }) {
+  try {
+    execFileSync('git', ['-C', repoDir, 'merge-base', '--is-ancestor', ancestorSha, descendantSha], { encoding: 'utf8', timeout: 60_000 });
+    return true;
+  } catch (e) {
+    if (e.status === 1) return false;
+    throw new Error(`git merge-base --is-ancestor 判定失败（非「不是祖先」的正常否定，可能是 revision 不可得/非 git 仓）: ${e.message}`);
+  }
+}
+
 const SEVERITY_RANK = { suggestion: 1, major: 2, blocker: 3 }; // SC-5: canonical 取最高
 
 // D1（owner 2026-08-02 fable 拍板，gpt 终审阻断修复）: family_key 是跨 reviewer/跨 candidate 的
@@ -167,13 +201,51 @@ export function runConsensusGate(verdicts, opts = {}) {
             failReasons.push(`parent artifact gate_result=${parentArtifact.gate_result} ≠ pass（只有 PASS 共识才能作 parent，SC-B）`);
           } else if (parentArtifact.round !== round - 1) {
             failReasons.push(`parent artifact round=${parentArtifact.round} ≠ 当前 round-1=${round - 1}（父 round 跳号被拦，SC-B）`);
+          } else if (parentArtifact.base_sha !== bundle.base_sha) {
+            // issue #9 R3 blocker: 此前谱系只验「这一跳」自身结构/hash 自洽/round 连续，从不验
+            // parent 的内容是否与**当前这次评审**同源——一份自身完全自洽、gate_result=pass、
+            // round=当前round-1 的 parent，只要它是伪造的或者干脆来自另一个 PR（base/candidate
+            // 与当前评审毫无关系），一样能绑定成谱系。base_sha 必须与当前 bundle 完全一致
+            // （同一 PR 的同一 base）——先拦掉跮 PR / 无关 base 的 parent。
+            failReasons.push(`parent artifact base_sha 与当前 bundle.base_sha 不一致（parent=${String(parentArtifact.base_sha).slice(0, 12)} 当前=${String(bundle.base_sha).slice(0, 12)}）——parent 不属于同一 PR/同一 base，谱系绑定必须验内容而非只验这一跳自洽（issue #9 R3 blocker）`);
           } else {
-            parentArtifactHash = parentArtifact.consensus_artifact_hash;
+            // issue #9 R3 blocker: base 相同后仍需验 candidate 谱系是否真实推进——parent.
+            // candidate_sha 必须是当前 candidate_sha 的**真实 git 祖先**（原生 ancestry，不
+            // 接受自报字符串）。这一步拦的是「同 base、伪造/无关 candidate」的 parent（例如
+            // 平行分支的另一次评审、或手工拼的 candidate_sha）。无 repoDir 时无法验证，
+            // fail-closed（不设旁路，与 R5-P1 的 changedPaths 契约同一原则）。
+            let isAncestor = false;
+            let ancestorErr = null;
+            if (!opts.repoDir) {
+              ancestorErr = 'parent 谱系门缺 repoDir，无法验证 parent.candidate_sha 是否为当前 candidate_sha 的祖先（不允许 fail-open，issue #9 R3 blocker）';
+            } else {
+              try {
+                isAncestor = isAncestorCommit({ repoDir: opts.repoDir, ancestorSha: parentArtifact.candidate_sha, descendantSha: bundle.candidate_sha });
+              } catch (e) {
+                ancestorErr = `parent.candidate_sha 祖先关系判定失败（fail-closed）: ${e.message}`;
+              }
+            }
+            if (ancestorErr) {
+              failReasons.push(ancestorErr);
+            } else if (!isAncestor) {
+              failReasons.push(`parent artifact candidate_sha（${String(parentArtifact.candidate_sha).slice(0, 12)}）不是当前 candidate_sha（${String(bundle.candidate_sha).slice(0, 12)}）的祖先——parent 与当前评审的代码谱系无关，即便 base_sha 相同（issue #9 R3 blocker）`);
+            } else {
+              parentArtifactHash = parentArtifact.consensus_artifact_hash;
+            }
           }
         }
       }
     }
   }
+  // T1 上限声明（issue #9 R3 blocker 修复的已知边界，如实声明，不得读作"谱系已可信"）:
+  // 以上两道新增校验（base_sha 相同 + candidate_sha 真祖先）堵住的是「疏忽/误拼」与
+  // 「跨 PR/跨谱系张冠李戴」两类输入错误——但 parent artifact 终究是调用方本地磁盘上的一份
+  // JSON 文件，lead 对它有写权限。一份 base_sha 与当前完全相同、candidate_sha 确实是当前
+  // candidate 的真实历史祖先（比如 lead 手工在真仓库里造出这段祖先链）、hash 自洽、
+  // gate_result=pass 的"完全自洽的伪 R2"依然能通过本门——因为这些都是本地可构造满足的
+  // 条件，不涉及任何签名或第三方存证。要防这一类需要引入可信 ledger/签名（本轮已否决，
+  // 见派工包 Decisions②：新增机制需过确认门，删掉它其余判据照样成立）。本修复只防疏忽/
+  // 误用/跨谱系张冠李戴，T1：不防伪造。
 
   // conjunct ①: 同 hash 且等于 bundle 重算值
   let recomputed = null;
@@ -278,7 +350,7 @@ export function runConsensusGate(verdicts, opts = {}) {
   // 同步构造端"这种本仓 hardening 台账反复出现的第 7 类教训（SC-A1 曾经的教训，schema_version
   // 追加时差点再踩一次）。
   const draft = {
-    schema_version: 'v3',
+    schema_version: ARTIFACT_SCHEMA_VERSION,
     review_input_hash,
     parent_artifact_hash: parentArtifactHash,
     round,
@@ -331,8 +403,18 @@ export function assertArtifactShape(artifact, label = 'consensus artifact') {
     errs.push(`${label}: 不是对象（结构非法，fail-closed）`);
     return errs;
   }
-  if (artifact.schema_version !== 'v3') {
-    errs.push(`${label}.schema_version=${JSON.stringify(artifact.schema_version)} ≠ 'v3'（结构门拒绝非当前 schema 版本——这是 schema 版本问题，不是 hash 问题，issue #9 R2 blocker）`);
+  if (artifact.schema_version !== ARTIFACT_SCHEMA_VERSION) {
+    errs.push(`${label}.schema_version=${JSON.stringify(artifact.schema_version)} ≠ ${JSON.stringify(ARTIFACT_SCHEMA_VERSION)}（结构门拒绝非当前 schema 版本——这是 schema 版本问题，不是 hash 问题，issue #9 R2 blocker；版本值改从 schemas/consensus-artifact.schema.json 派生，issue #9 R3 MAJOR3）`);
+  }
+  // issue #9 R3 MAJOR2: gate_result 的结构校验此前完全不在本函数内——recomputeArtifactHash
+  // 会对非法 gate_result 直接 throw（见该函数），但本函数（三消费入口的共同前置短路）此前
+  // 只查 schema_version/round/parent，漏了 gate_result 这一项。缺 gate_result 的输入能通过
+  // 本函数的 shape 检查，随后在调用方（如 sc-coverage-gate.checkScCoverage）里撞上
+  // recomputeArtifactHash 的未捕获 throw——而那些调用方的契约是"返回错误数组，不抛异常"。
+  // gate_result 本就已经入 hash（recomputeArtifactHash 的必填字段），结构上理应与
+  // schema_version/round 同一批被本函数校验，而不是分散在四个消费点各自 try/catch 兜底。
+  if (artifact.gate_result !== 'pass' && artifact.gate_result !== 'fail') {
+    errs.push(`${label}.gate_result=${JSON.stringify(artifact.gate_result)} 非法（须为 'pass' 或 'fail'，缺字段/被删不再静默兜底为 null，issue #9 R3 MAJOR2: 结构门必须先于 hash 重算拦住，不能让 recomputeArtifactHash 的 throw 逃逸出「契约是返回错误数组」的消费入口）`);
   }
   if (!Number.isInteger(artifact.round) || artifact.round < 1) {
     errs.push(`${label}.round=${JSON.stringify(artifact.round)} 非法（须为 >=1 的整数，缺字段/被删不再静默兜底为 null，issue #9 R2 blocker）`);
