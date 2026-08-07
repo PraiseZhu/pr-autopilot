@@ -85,6 +85,9 @@ function withAnchorPaths(findings) {
     if (['blocker', 'major'].includes(out.severity)) {
       if (out.invariant === undefined) out = { ...out, invariant: `fixture-invariant-${out.id ?? 'x'}` };
       if (out.family_id === undefined) out = { ...out, family_id: `fixture-family-${out.id ?? 'x'}` };
+      // SC-T7b（兼容性迁移，lead 2026-08-08 补包授权）: 同 run-fixtures/i9-core 的
+      // withAnchorPaths——actionable finding 默认补 family_claim {kind:'new'}，显式提供不覆盖。
+      if (out.family_claim === undefined) out = { ...out, family_claim: { kind: 'new', reason: 'fixture 默认构造' } };
     }
     return out;
   });

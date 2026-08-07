@@ -181,12 +181,13 @@ console.log('\n[R2-P1] 契约漂移修复回归（SC-R2-C1〜C6）');
 
 const LIVE_SCHEMA = JSON.parse(readFileSync(new URL('../schemas/review-verdict.schema.json', import.meta.url), 'utf8'));
 
-t('[SC-R2-C1] verdict_schema_version 从 schema 常量派生，不是手拄字面值（v2→v3 漂移的直接复现）', () => {
+t('[SC-R2-C1] verdict_schema_version 从 schema 常量派生，不是手拄字面值（v2→v3→v4 漂移的直接复现）', () => {
   const expected = LIVE_SCHEMA.properties.schema_version.const;
-  // 有意锚定历史版本（例外，非漏改）: 这条钉的是「v2→v3 迁移已完成」——如果将来 verdict
-  // schema 再 bump（如 v4），本行必须由人显式更新（这是迁移事件的有意断点，不是可派生的值；
-  // expected 本就来自同一 schema，派生会变成同义反复）。不要顺手改成 expected 或 SCHEMA_VERSION。
-  eq(expected, 'v3', '当前 schema 的 schema_version.const 应为 v3（回归锚点，bump 时必须显式更新）');
+  // 有意锚定历史版本（例外，非漏改）: 这条钉的是「v2→v3 迁移已完成、v3→v4（T7b family_claim）
+  // 已同步迁移」——如果将来 verdict schema 再 bump（如 v5），本行必须由人显式更新（这是迁移
+  // 事件的有意断点，不是可派生的值；expected 本就来自同一 schema，派生会变成同义反复）。
+  // 不要顺手改成 expected 或 SCHEMA_VERSION。
+  eq(expected, 'v4', '当前 schema 的 schema_version.const 应为 v4（回归锚点，bump 时必须显式更新）');
   eq(contractSpec({ seat: SEAT, round: ROUND }).verdict_schema_version, expected,
     'contractSpec.verdict_schema_version 必须等于 review-verdict.schema.json 的 schema_version.const');
   const text = emitContract({ seat: SEAT, round: ROUND });

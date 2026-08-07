@@ -18,7 +18,13 @@ import { hashObject, sha256, canonicalJson, readJson, writeJsonAtomic, parseArgs
 // schema.json 的 enum，第二份 verdict-validate.mjs:80 的 export）。verdict-validate.mjs 已是
 // 席位名单的唯一权威声明点（见该文件 R2-P1 SC-9/SC-10 注释），本文件改为直接 import，不再
 // 各自手拄——roster 增删时 dispatch/validator 与本门的席位门不再可能因为漏改一处而永久死锁。
-import { validateVerdict, changedPathSet, trackedPathSet, REVIEWERS } from './verdict-validate.mjs';
+import { validateVerdict, changedPathSet, trackedPathSet, REVIEWERS, normalizeInvariantForKey, familyKeyOf } from './verdict-validate.mjs';
+// SC-T7b: normalizeInvariantForKey/familyKeyOf 的实现已上移至 verdict-validate.mjs（本文件
+// import 它，反向 import 会循环）。这里 re-export 保住既有 import 方（run-fixtures / i9-batch
+// 的 `import { familyKeyOf } from '../scripts/consensus-gate.mjs'`）签名不变。fk1 派生唯一实现
+// 点在 verdict-validate.mjs；SC-4: family_claim 不参与该派生，canonical family_key 仍只由
+// invariant 文本派生。
+export { normalizeInvariantForKey, familyKeyOf } from './verdict-validate.mjs';
 import { computeReviewInputHash } from './review-input-hash.mjs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
@@ -63,13 +69,7 @@ const SEVERITY_RANK = { suggestion: 1, major: 2, blocker: 3 }; // SC-5: canonica
 // 不同文本 → （密码学意义上）不同 key，天然免疫「标签撞车」，也天然支持反过来的「同一 invariant
 // 用了不同 family_id 标签」被正确合并。'fk1-' 是算法版本前缀——未来若换归一化规则，旧 key 与新
 // key 不再相等，不会被误认成兼容（对齐 hardening-checklist 第 7 类「改契约要同步改」的教训）。
-export function normalizeInvariantForKey(invariant) {
-  return String(invariant).trim().toLowerCase().replace(/\s+/g, '');
-}
-export function familyKeyOf(invariant) {
-  if (typeof invariant !== 'string' || !invariant) return null;
-  return `fk1-${sha256(normalizeInvariantForKey(invariant))}`;
-}
+// SC-T7b: 实现已上移至 verdict-validate.mjs（上方 import + re-export），本段注释保留为设计说明。
 
 // 聚类 key（仅用于去重展示，不参与放行判定）:
 // face + 去行号规整 anchor + 语义指纹。同 key 的多席条目并入一簇，
@@ -134,7 +134,12 @@ export function runConsensusGate(verdicts, opts = {}) {
   if (verdicts.length !== 3) failReasons.push(`需要恰好 3 份 verdict，得到 ${verdicts.length}`);
 
   for (const v of verdicts) {
-    const errs = validateVerdict(v, { bundle, changedPaths, trackedPaths, requirements: opts.requirements });
+    // SC-T7b（SC-3）: live 收卷路径必须与 CLI 同一口径——把 opts.parentArtifact 传给
+    // validateVerdict，family_claim.kind='reuse' 的 target_family_key 存在性校验才能在真实
+    // consensus 收卷时生效（不能只有 CLI 绿、live 放行——R4-P1「自检口径必须与收卷口径一致」
+    // 的同一收紧方向）。parentArtifact 变量在下方 round/parent 处理块定义（`opts.parentArtifact
+    // ?? null`），此处直接引用同一对象，同一谱系唯一来源。
+    const errs = validateVerdict(v, { bundle, changedPaths, trackedPaths, requirements: opts.requirements, parentArtifact: opts.parentArtifact ?? null });
     if (errs.length) failReasons.push(`verdict(${v?.reviewer ?? '?'}) schema/跨字段校验失败 → degraded: ${errs[0]}`);
     else if (v.run_status !== 'ok') failReasons.push(`verdict(${v.reviewer}) run_status=degraded ≠ APPROVED（⑦ fail-closed）`);
   }

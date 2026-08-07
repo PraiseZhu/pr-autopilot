@@ -121,6 +121,11 @@ function withAnchorPaths(findings) {
     if (['blocker', 'major'].includes(out.severity)) {
       if (out.invariant === undefined) out = { ...out, invariant: `fixture-invariant-${out.id ?? i}` };
       if (out.family_id === undefined) out = { ...out, family_id: `fixture-family-${out.id ?? i}` };
+      // SC-T7b（兼容性迁移，lead 2026-08-08 补包授权）: actionable finding 默认补一条
+      // family_claim（{kind:'new',reason:'fixture 默认构造'}）——与 invariant/family_id 的既有
+      // 默认补全同一模式；显式提供了就不覆盖（测试「共享 family」「reuse 引用」等场景时显式传）。
+      // 默认声明 new（无 parent 的 round=1 语境下 reuse 必拒，new 是唯一合法声明）。
+      if (out.family_claim === undefined) out = { ...out, family_claim: { kind: 'new', reason: 'fixture 默认构造' } };
     }
     return out;
   });

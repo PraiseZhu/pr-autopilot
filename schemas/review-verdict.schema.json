@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "pr-autopilot/review-verdict/v3",
-  "title": "三审 reviewer 机器 verdict（计划 §1.1b ⑨；v2 增 anchor_paths/invariant/family_id/checklist_version 机器字段；v3(I9) 增 attempt 字段 + hardening_coverage 覆盖率强制扩展至对抗席全 round + hardening_coverage[].evidence 格式校验；v3(R3-field) 顶层与 findings[] 补 additionalProperties:false）",
+  "$id": "pr-autopilot/review-verdict/v4",
+  "title": "三审 reviewer 机器 verdict（计划 §1.1b ⑨；v2 增 anchor_paths/invariant/family_id/checklist_version 机器字段；v3(I9) 增 attempt 字段 + hardening_coverage 覆盖率强制扩展至对抗席全 round + hardening_coverage[].evidence 格式校验；v3(R3-field) 顶层与 findings[] 补 additionalProperties:false；v4(T7b) 增 family_claim 字段——actionable finding 必须显式声明「复用上一轮真实问题族」或「新问题」，inner exact keys，语义边界见 verdict-validate.mjs 与 skills/submit-pr/SKILL.md）",
   "type": "object",
   "additionalProperties": false,
   "$comment": "checklist_version 的必填/取值校验是角色条件（同 hardening_coverage，I9 起两者均对对抗席全 round 强制，不再限 round===1）——JSON Schema 表达不了，verdict-validate.mjs 为准。计数与版本单一来源: scripts/lib/hardening-registry.mjs。顶层 additionalProperties:false（R3-field，2026-08-07）: 此前本文件从未声明，且 verdict-validate.mjs 也没有任何拒绝未知顶层字段的机制——实测确认 out_of_scope_notes（复数）typo 成 out_of_scope_note（单数）后 validateVerdict 返回 0 errors，域外真问题静默消失。本声明与 verdict-validate.mjs 新增的 TOP_LEVEL_KEYS 检查（从 properties 派生，同一份 key 集合）配套，不是本文件独立生效——本仓没有 ajv 等 JSON Schema 执行引擎，schema.json 本身只被当数据读取，结构性校验全部由 verdict-validate.mjs 的手写逻辑承担，这份声明是文档真相源，不是可独立运行的校验器。",
@@ -11,7 +11,7 @@
     "faces", "findings", "gate_checks", "verdict", "closed_finding_ids"
   ],
   "properties": {
-    "schema_version": { "const": "v3" },
+    "schema_version": { "const": "v4" },
     "reviewer": { "enum": ["claude-adversarial", "codex-adversarial", "upstream-preview"] },
     "run_status": { "enum": ["ok", "degraded"] },
     "round": { "type": "integer", "minimum": 1, "description": "I9: round 语义 = PASS 共识 artifact 的序号（不是审查尝试次数）——见 attempt。" },
@@ -57,6 +57,11 @@
           "family_id": {
             "type": "string", "minLength": 1,
             "description": "SC-B1（D1）: 同 verdict 内归族标识——同一 origin 席在自己这份 verdict 里，把该不变量的多处 manifestation 标同一个 family_id。机器只强制：actionable finding 必填、同 family_id 的 invariant 文本必须逐字一致（同 verdict 内自洽，verdict-validate.mjs）。语义上「这几处是不是真的同族」永远是审查席的判断，机器不判断、不合并 SC（D2：family 关系通过字段流转，不通过合并 SC）。"
+          },
+          "family_claim": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "SC-T7b: 每条 actionable（blocker/major）finding 必须显式声明「复用上一轮真实问题族」还是「新问题」——blocker/major 必填二选一；suggestion 不要求。inner exact keys：{kind:'reuse',target_family_key:'fk1-...'} / {kind:'new',reason:'非空'}；空串/多余键/kind 非法由 verdict-validate.mjs fail-closed（本仓无 ajv，JSON Schema 只是文档真相源，结构性校验以 verdict-validate.mjs 为准，同 hardening_coverage 分支约束的处理方式）。语义边界（机器不判语义）：target_family_key 的「该族真的存在」由 validator 对照同一谱系 parentArtifact.canonical_findings 派生出的 known families 校验；「这个 reuse 判断本身对不对」永远是审查席的判断，机器不裁决——文档见 skills/submit-pr/SKILL.md。只覆盖同一 artifact 谱系（parent 链），不冒充跨 PR 全局历史。"
           },
           "scope_note": { "type": "string", "description": "跨面/宽范围说明（自由文本，不进冲突图）" },
           "evidence": { "type": "string", "minLength": 1 },
