@@ -68,6 +68,7 @@ export function runEngine(cfg) {
     triReviewLedgerDir = null, escapeLedger = null,
     feishuCmd = null, slackCmd = null,
     leaseTtlMinutes = 40, stuckThreshold = 3, lockTimeoutMs = 10_000,
+    pendingStuckHours = 6, // T3/SC-3a: pending 等待 ack 超时告警阈值（默认 6 小时，可经 config 覆盖）
     deleteRemoteBranchOnMerge = false, // 审⑬/owner 点单: 显式 opt-in 才启用远端分支清理
     hmacKey = process.env.PR_AUTOPILOT_HMAC_KEY ?? null,
     nowMs = Date.now()
@@ -180,7 +181,13 @@ export function runEngine(cfg) {
 
       // F6: pending → 单飞；lease 到期重派同 id；≥N 次 → stuck 路由
       if (state.pending_dispatch) {
-        const pd = state.pending_dispatch;
+        const pd0 = state.pending_dispatch;
+        // T3/SC-3a: 旧 state 缺 first_dispatched_at → 先原子回填（取当时 dispatched_at）再做任何
+        // 重派更新——回填随本轮 writeJsonAtomic(path, next) 一并落盘，年龄基准不因迁移后移
+        let pd = (pd0.first_dispatched_at === undefined && pd0.dispatched_at)
+          ? { ...pd0, first_dispatched_at: pd0.dispatched_at }
+          : pd0;
+        if (pd !== pd0) next.pending_dispatch = pd;
         // 审⑨-P2-1R: canceling 状态机恢复——cancel 在 release/清态之间崩溃时由引擎收敛，
         // 绝不把 canceling pending 当普通 pending 重派（重派 session 无预留 = 预算低计）
         if (pd.canceling) {
@@ -197,6 +204,27 @@ export function runEngine(cfg) {
           journal(journalFile, { kind: 'cancel-resumed', pr: prKey, dispatch_id: pd.dispatch_id, generation: next.dispatch_generation });
           writeJsonAtomic(path, next);
           return;
+        }
+        // T3/SC-3b: 每轮对每个持有 pending 的 PR 记 waiting——waiting_for 枚举只有 'ack'；
+        // canceling 分支已提前 return，天然不记 waiting（正在收尾的取消会话不制造等待噪音）
+        const pendingAgeMin = (nowMs - Date.parse(pd.first_dispatched_at ?? pd.dispatched_at)) / 60000;
+        journal(journalFile, {
+          kind: 'waiting', pr: prKey, dispatch_id: pd.dispatch_id,
+          waiting_for: 'ack', age_minutes: Math.round(pendingAgeMin),
+          attempt: (pd.redispatch_count ?? 0) + 1
+        });
+        // T3/SC-3a: pending 超时告警——年龄基准 = first_dispatched_at（重派不更新）；
+        // 去重标记持久化在 pending_dispatch 内：尝试发送后即置 true（含发送失败），
+        // 宁丢一次不刷屏——取舍与下方 stuck 通知的 try/catch 同口径
+        if (pd.pending_stuck_notified !== true && pendingAgeMin > pendingStuckHours * 60) {
+          try {
+            routeNotify({
+              eventType: 'pending-stuck', repo: state.repo, feishuCmd, slackCmd,
+              message: `【盯梢器】${prKey} 修复会话 ${pd.dispatch_id} 等待 ack 已超 ${Math.floor(pendingAgeMin / 60)} 小时，请检查修复会话是否还活着。`
+            });
+          } catch (e) { journal(journalFile, { kind: 'notify-error', pr: prKey, error: e.message }); }
+          pd = { ...pd, pending_stuck_notified: true };
+          next.pending_dispatch = pd;
         }
         const ageMin = (nowMs - Date.parse(pd.dispatched_at)) / 60000;
         if (ageMin > leaseTtlMinutes) {
@@ -217,6 +245,10 @@ export function runEngine(cfg) {
             out.redispatched.push(prKey);
             journal(journalFile, { kind: 'redispatch', pr: prKey, dispatch_id: pd.dispatch_id, count });
           } catch (e) {
+            // SC-2a: 重派失败同样持久化 redispatch_count——否则连续失败永远到不了 stuck 判据。
+            // 判活语义变更（如实声明）：stuck 的「已重派 N 次」计数现在包含失败尝试。
+            next.pending_dispatch = { ...pd, redispatch_count: count };
+            journal(journalFile, { kind: 'redispatch-failed', pr: prKey, dispatch_id: pd.dispatch_id, attempt: count, error: e.message });
             process.stderr.write(`[ENGINE] 重派失败 ${f}: ${e.message}（下轮再试）\n`);
           }
         }
@@ -302,7 +334,9 @@ export function runEngine(cfg) {
         next.status = 'fixing';
         next.pending_dispatch = {
           dispatch_id: dispatchId, manifest, cursors_next: res.cursors,
-          dispatched_at: nowIso(), redispatch_count: 0,
+          dispatched_at: nowIso(),
+          first_dispatched_at: nowIso(), // T3/SC-3a: 首派时刻（重派不更新）——pending 超时年龄基准
+          redispatch_count: 0,
           // 审⑨-P2-1R: 权威预算账本随派发固化——cancel 只认这里，不接受调用者任意自报
           budget: { ledger: budget.ledger, estimate: budget.estimate }
         };
@@ -311,6 +345,9 @@ export function runEngine(cfg) {
       } catch (e) {
         // 审④-F7: 投递失败释放预留，预算不漂
         try { releaseReserve({ ledgerFile: budget.ledger, dispatchId }); } catch { /* 记账失败下轮 reserve 幂等兜底 */ }
+        // SC-2a: 首派失败记结构化事件——attempt 恒 1（首派失败无 pending、无跨轮状态，
+        // 游标不推进、下轮重试 = at-least-once，不存在「重派第几次」的概念）
+        journal(journalFile, { kind: 'dispatch-failed', pr: prKey, dispatch_id: dispatchId, attempt: 1, error: e.message });
         process.stderr.write(`[ENGINE] 投递失败 ${f}: ${e.message}（游标不推进 + 预留已释放，下轮重试 = at-least-once）\n`);
       }
       writeJsonAtomic(path, next);
