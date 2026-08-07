@@ -312,6 +312,16 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
         if (!runManifest) {
           errors.push('fix_orchestration 在场但缺 run manifest（SC-9: 无法验证最终 DAG lineage，fail-closed）');
         } else {
+          // SC-T8-1（2026-08-08）: 批次强制接线——修复编排路径下批次协议是**必须**不是 opt-in。
+          // 源 artifact 含 actionable canonical findings（blocker/major，与 batch-closure-gate
+          // 判据⑥同口径）时，run manifest 必须带 batch 段：每个 actionable finding 族都在冻结
+          // 义务内。此前 batch 是 opt-in（init 不传 --batch 即整体跳过），lead 省略 = 批次语义
+          // 不变量在生产链静默缺席（与闭合门接线的同一洞的另一个面）。不按 SC 数量判断——判定
+          // 只看源 artifact 的 actionable findings，单 SC actionable 同样强制。
+          const srcActionable = (sourceArtifact.canonical_findings ?? []).filter((c) => c.severity === 'blocker' || c.severity === 'major');
+          if (srcActionable.length > 0 && !runManifest.batch) {
+            errors.push(`源 consensus artifact 含 ${srcActionable.length} 条 actionable canonical findings → 修复编排路径必须启用批次协议：run manifest 缺 batch 段（batch.frozen_families 必须精确覆盖全部问题族；不按 SC 数量判断，单 SC actionable 也强制，SC-T8）`);
+          }
           const rmErrs = verifyEventChain(runManifest);
           for (const e of rmErrs) errors.push(`run manifest: ${e}`);
           if (runManifest.fix_plan_hash !== fixPlan.fix_plan_hash) errors.push('run manifest 绑定的 plan hash ≠ 本 plan');

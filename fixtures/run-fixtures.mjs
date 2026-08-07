@@ -2895,7 +2895,7 @@ t('[2号-push闸/SC-R3-6] 端到端契约: 真实状态机 run + SKILL 字段 ma
   const st = mkdtempSync(join(tmpdir(), 'pgrun-'));
   const wtR = join(st, 'wt'); mkdirSync(wtR);
   const symbolicBefore = git('symbolic-ref', '--short', 'HEAD');
-  FR.initRun({ stateDir: st, runId: 'pg1', repoDir: repo, plan, scManifest, sourceArtifact: art, featureBranch: 'feat' });
+  FR.initRun({ stateDir: st, runId: 'pg1', repoDir: repo, plan, scManifest, sourceArtifact: art, featureBranch: 'feat', batch: { batch_id: 'pg1', frozen_families: [...new Set((art.canonical_findings ?? []).map((c) => c.family_key).filter(Boolean))] } });
   const al = FR.allocate({ stateDir: st, runId: 'pg1', plan, waveIndex: 0, worktreeRoot: wtR, artifact: art, scManifest });
   eq(al.wave_base, HEAD, 'wave0 base == 源 artifact candidate（SC-R3-10）');
   for (const a of al.allocations) {
@@ -3359,7 +3359,7 @@ t('[R10-A1] archive kind 端到端可用: coverage-gate 过 → buildFixPlan 定
 
   // ③ 真跑 fix-run: init → allocate wave0 → 改 a.ts → integrate → validate
   mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
-  FR.initRun({ stateDir: env.stateDir, runId: 'archA1', repoDir: env.r, plan, scManifest, sourceArtifact: art, featureBranch: 'feat' });
+  FR.initRun({ stateDir: env.stateDir, runId: 'archA1', repoDir: env.r, plan, scManifest, sourceArtifact: art, featureBranch: 'feat', batch: { batch_id: 'archA1', frozen_families: [...new Set((art.canonical_findings ?? []).map((c) => c.family_key).filter(Boolean))] } });
   const a0 = FR.allocate({ stateDir: env.stateDir, runId: 'archA1', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest });
   workGroup(env, a0.allocations[0], 'a.ts', 'fixed\n');
   const i0 = FR.integrate({ stateDir: env.stateDir, runId: 'archA1', plan, waveIndex: 0 });
@@ -4312,7 +4312,7 @@ t('[SC-D] 三层滚动链: R1(发现F1,根)→R2(修F1时发现F2,parent=R1)→R
   ok(!pl2.degraded, 'hop2 plan 不该 degraded: ' + JSON.stringify(pl2.reasons ?? []));
   const stD = mkdtempSync(join(tmpdir(), 'scdrun-'));
   const wtD = join(stD, 'wt'); mkdirSync(wtD);
-  FR.initRun({ stateDir: stD, runId: 'scd2', repoDir: rD, plan: pl2.plan, scManifest: sc2, sourceArtifact: a2, featureBranch: 'feat' });
+  FR.initRun({ stateDir: stD, runId: 'scd2', repoDir: rD, plan: pl2.plan, scManifest: sc2, sourceArtifact: a2, featureBranch: 'feat', batch: { batch_id: 'scd2', frozen_families: [...new Set((a2.canonical_findings ?? []).map((c) => c.family_key).filter(Boolean))] } });
   const al2 = FR.allocate({ stateDir: stD, runId: 'scd2', plan: pl2.plan, waveIndex: 0, worktreeRoot: wtD, artifact: a2, scManifest: sc2 });
   eq(al2.wave_base, c2, 'hop2 run 起点 == R2 candidate（SC-R3-10: 起点由源 artifact 派生）');
   for (const alloc of al2.allocations) {
