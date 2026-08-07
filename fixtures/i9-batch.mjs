@@ -931,7 +931,7 @@ function cliPg(...a) {
   try { return execFileSync('node', [join(S, 'push-guard.mjs'), ...a], { encoding: 'utf8' }); }
   catch (e) { throw new Error(`push-guard CLI 失败: ${String(e.stderr ?? e.message).slice(0, 400)}`); }
 }
-// CLI 全链 helper：init --batch → allocate wave0 → integrate → validate → finalize
+// CLI 全链 helper：init --batch → 遍历 plan.waves 逐波 allocate→integrate→validate → 最后一波完成后 finalize
 // 返回 { stateDir, runManifest, finalCandidate }；worktree 写文件由调用方提供 fn(wt)
 function cliFullChain(batchJson, { wtWrite, expectInitOk = true, initCliPath = null } = {}) {
   const dTb = mkdtempSync(join(tmpdir(), 't1b-'));
@@ -951,21 +951,24 @@ function cliFullChain(batchJson, { wtWrite, expectInitOk = true, initCliPath = n
   if (batchJson !== undefined) initArgv.push('--batch', batchJson);
   if (initCliPath) execFileSync('node', [initCliPath, ...initArgv], { encoding: 'utf8' });
   else cliRun(...initArgv);
-  // allocate wave0
-  const allocOut = JSON.parse(cliRun('allocate', '--state-dir', stateDir, '--run-id', runId, '--plan', planP, '--wave', '0', '--worktree-root', wtRoot, '--artifact', srcP, '--sc-manifest', scmP));
-  for (const a of allocOut.allocations) {
-    for (const f of a.anchor_paths ?? []) {
-      mkdirSync(dirname(join(a.worktree, f)), { recursive: true });
-      if (wtWrite) wtWrite(join(a.worktree, f), a);
-      else writeFileSync(join(a.worktree, f), f.includes('fix1') ? 'cancel 保护已加\n' : (f.includes('README') ? '残余 风险已登记\n' : 'fixed\n'));
+  // FIX-1（2026-08-08）：遍历 plan.waves 逐波 allocate→integrate→validate（此前只跑 wave 0，
+  // 导致 push-guard 报「run manifest 波数 1 ≠ plan 波数 2」混入非目标错误）。最后一波完成后才 finalize。
+  for (let wi = 0; wi < plan.waves.length; wi++) {
+    const allocOut = JSON.parse(cliRun('allocate', '--state-dir', stateDir, '--run-id', runId, '--plan', planP, '--wave', String(wi), '--worktree-root', wtRoot, '--artifact', srcP, '--sc-manifest', scmP));
+    for (const a of allocOut.allocations) {
+      for (const f of a.anchor_paths ?? []) {
+        mkdirSync(dirname(join(a.worktree, f)), { recursive: true });
+        if (wtWrite) wtWrite(join(a.worktree, f), a);
+        else writeFileSync(join(a.worktree, f), f.includes('fix1') ? 'cancel 保护已加\n' : (f.includes('README') ? '残余 风险已登记\n' : 'fixed\n'));
+      }
+      execFileSync('git', ['-C', a.worktree, 'add', '.']);
+      execFileSync('git', ['-C', a.worktree, 'commit', '-qm', `fix ${a.group_id}`]);
     }
-    execFileSync('git', ['-C', a.worktree, 'add', '.']);
-    execFileSync('git', ['-C', a.worktree, 'commit', '-qm', `fix ${a.group_id}`]);
+    const intOut = JSON.parse(cliRun('integrate', '--state-dir', stateDir, '--run-id', runId, '--plan', planP, '--wave', String(wi)));
+    if (!intOut.ok) throw new Error(`integrate wave${wi} 失败: ` + JSON.stringify(intOut.errors));
+    const valOut = JSON.parse(cliRun('validate', '--state-dir', stateDir, '--run-id', runId, '--sc-manifest', scmP, '--wave', String(wi)));
+    if (!valOut.ok) throw new Error(`validate wave${wi} 失败: ` + JSON.stringify(valOut.results));
   }
-  const intOut = JSON.parse(cliRun('integrate', '--state-dir', stateDir, '--run-id', runId, '--plan', planP, '--wave', '0'));
-  if (!intOut.ok) throw new Error('integrate 失败: ' + JSON.stringify(intOut.errors));
-  const valOut = JSON.parse(cliRun('validate', '--state-dir', stateDir, '--run-id', runId, '--sc-manifest', scmP, '--wave', '0'));
-  if (!valOut.ok) throw new Error('validate 失败: ' + JSON.stringify(valOut.results));
   const finOut = JSON.parse(cliRun('finalize', '--state-dir', stateDir, '--run-id', runId));
   const runManifest = readJson(join(stateDir, `run-${runId}.json`));
   return { stateDir, runManifest, finalCandidate: finOut.final_candidate, wtRoot, dTb, featBranch, runId };
