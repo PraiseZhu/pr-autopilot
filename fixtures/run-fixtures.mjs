@@ -26,7 +26,7 @@ import { evaluate, emptyCursors } from '../scripts/pr-watch/gate.mjs';
 import { runEngine } from '../scripts/pr-watch/engine.mjs';
 import { ackDispatch, cancelDispatch } from '../scripts/pr-watch/ack.mjs';
 import { checkFinalize, receiptPath } from '../scripts/pr-watch/finalize.mjs';
-import { checkCompletion } from '../scripts/pr-watch/complete.mjs';
+import { checkCompletion, settleDispatchBudget } from '../scripts/pr-watch/complete.mjs';
 import { reserveBudget, releaseReserve, recordCost, spentToday, budgetCheck } from '../scripts/pr-watch/budget.mjs';
 import { route } from '../scripts/pr-watch/notify-router.mjs';
 import { signMarker, verifyMarker } from '../scripts/pr-watch/provenance.mjs';
@@ -912,15 +912,120 @@ t('[审④F4] complete 只认 receipt: 无 receipt 拒 / 跨任务 receipt 拒 /
   ok(c.ok, c.missing?.join(';'));
   ok(ackDispatch({ stateDir: engState, owner: 'o', repo: 'mivo-canvas', prNumber: 5, dispatchId: manifest.dispatch_id }).ok);
 });
+t('[2026-08-08 F5] complete 机械结算全链: reserve→actual/settled + manifest 携带结算字段 + 重复 complete 幂等 + 结算失败 fail-closed 不 ack', () => {
+  const d = mkdtempSync(join(tmpdir(), 'cset-'));
+  const stateDir = join(d, 'state'); mkdirSync(stateDir);
+  const led = join(d, 'cost.jsonl');
+  // 每 PR 独立快照文件（共享快照会让一个 PR 的反馈被另一个 PR 读到，重复派发）
+  const snapSh = join(d, 'snap.sh');
+  writeFileSync(snapSh, `#!/bin/sh\ncat "${d}/snap-\${3}.json"\n`);
+  execFileSync('chmod', ['+x', snapSh]);
+  const cand = 'e'.repeat(40);
+  const eng = {
+    stateDir, leaseFile: join(d, 'lease.json'),
+    snapshotCmd: snapSh + ' {owner} {repo} {pr}',
+    dispatchCmd: join(engDir, 'dispatch-ok.sh'),
+    journalFile: join(d, 'journal.jsonl'),
+    hmacKey: HMAC_KEY,
+    budget: { ledger: led, cap: 30, estimate: 3 },
+    repoDirs: {}
+  };
+  registerPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 91, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(join(d, 'snap-91.json'), JSON.stringify({ ...snapBase, comments: [{ id: 'cs1', body: '请修' }] }));
+  runEngine(eng);
+  const stFile = join(stateDir, stateFileName('o', 'mivo-canvas', 91));
+  const manifest = readJson(stFile).pending_dispatch.manifest;
+  ok(manifest.budget?.ledger === led && manifest.budget?.estimate === 3, 'manifest 必须携带预算结算字段（自包含投递）');
+  eq(spentToday(led), 3, 'reserve(3) 占额');
+  // 完工: receipt(committed) + 远端 head==candidate + HMAC 回帖
+  writeFileSync(receiptPath(stateDir, manifest), JSON.stringify({
+    dispatch_id: manifest.dispatch_id, original_head: SHA_A, candidate: cand,
+    remote: 'origin', branch: 'feat', phase: 'committed', at: new Date().toISOString()
+  }));
+  writeFileSync(join(d, 'snap-91.json'), JSON.stringify({ ...snapBase, head_sha: cand, comments: [{ id: 'z', body: signMarker(`fixed dispatch:${manifest.dispatch_id}`, HMAC_KEY) }] }));
+  // CLI 第一跑: 结算 + ack（--actual 缺省 → 按 estimate 结算并标记）
+  let out = execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', manifest.manifest_path, '--snapshot-cmd', snapSh + ' {owner} {repo} {pr}', '--state-dir', stateDir], { encoding: 'utf8', env: { ...process.env, PR_AUTOPILOT_HMAC_KEY: HMAC_KEY } });
+  ok(JSON.parse(out.trim()).ok, 'complete 正例必须 ack 成功');
+  const acts = readFileSync(led, 'utf8').trim().split('\n').map(JSON.parse).filter((l) => l.kind === 'actual' && l.dispatch_id === manifest.dispatch_id);
+  eq(acts.length, 1, '结算只落一条 actual');
+  eq(acts[0].settlement, 'estimate', '无 --actual 时按 estimate 结算并显式标记估算结算');
+  eq(spentToday(led), 3, 'reserve(3)→actual(3): 占额不漂且已结算');
+  ok(readJson(stFile).pending_dispatch === null, 'ack 后 pending 清空');
+  // 重复 complete: 幂等 exit 0，不重复计账、不改状态
+  out = execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', manifest.manifest_path, '--snapshot-cmd', snapSh + ' {owner} {repo} {pr}', '--state-dir', stateDir], { encoding: 'utf8', env: { ...process.env, PR_AUTOPILOT_HMAC_KEY: HMAC_KEY } });
+  ok(JSON.parse(out.trim()).idempotent === true, '重复 complete 必须幂等成功（exit 0）');
+  eq(readFileSync(led, 'utf8').trim().split('\n').length, 2, '重复 complete 不追加台账行（reserve+actual 两行）');
+  eq(spentToday(led), 3, '重复 complete 不重复计账');
+  // 结算失败 fail-closed（checkCompletion 通过、结算环节失败）: 改 manifest 的 budget.estimate
+  // 为非法值 → complete 非零、不 ack、pending 保留、游标不动、台账不动
+  const st92File = join(stateDir, stateFileName('o', 'mivo-canvas', 92));
+  registerPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 92, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(join(d, 'snap-92.json'), JSON.stringify({ ...snapBase, comments: [{ id: 'cs2', body: '再修' }] }));
+  runEngine(eng);
+  const m92 = readJson(st92File).pending_dispatch.manifest;
+  // 完工快照 + receipt 先就位（checkCompletion 必须通过，才能打到结算环节）
+  writeFileSync(receiptPath(stateDir, m92), JSON.stringify({
+    dispatch_id: m92.dispatch_id, original_head: SHA_A, candidate: cand,
+    remote: 'origin', branch: 'feat', phase: 'committed', at: new Date().toISOString()
+  }));
+  writeFileSync(join(d, 'snap-92.json'), JSON.stringify({ ...snapBase, head_sha: cand, comments: [{ id: 'z92', body: signMarker(`fixed dispatch:${m92.dispatch_id}`, HMAC_KEY) }] }));
+  const bad92 = { ...m92, budget: { ledger: led, estimate: -5 } };
+  writeFileSync(join(d, 'bad92.json'), JSON.stringify(bad92));
+  let cliFailed = false, cliErr = '';
+  try {
+    execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', join(d, 'bad92.json'), '--snapshot-cmd', snapSh + ' {owner} {repo} {pr}', '--state-dir', stateDir], { encoding: 'utf8', env: { ...process.env, PR_AUTOPILOT_HMAC_KEY: HMAC_KEY } });
+  } catch (e) { cliFailed = true; cliErr = `${e.stderr ?? ''}`; }
+  ok(cliFailed, '结算失败必须非零退出');
+  ok(/预算结算失败/.test(cliErr), `结算失败必须报预算结算失败（不 ack）: ${cliErr.slice(0, 160)}`);
+  const st92b = readJson(st92File);
+  ok(st92b.pending_dispatch?.dispatch_id === m92.dispatch_id, '结算失败必须保留 pending（不清 pending，引擎可重派）');
+  ok(!(st92b.cursors?.comment_ids ?? []).includes('cs2'), '结算失败不得推进游标');
+  eq(spentToday(led), 6, '结算失败不得改变台账（91 已结算 3 + 92 reserve 3 原样，无 actual92 追加）');
+  eq(readFileSync(led, 'utf8').trim().split('\n').length, 3, '结算失败不得追加台账行（reserve91/actual91/reserve92 三行）');
+  unregisterPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 91 });
+  unregisterPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 92 });
+});
+t('[2026-08-08 F5] 连续 12 次完工结算（cap=30, estimate=3, 实值 1.41）不因陈旧 reserve 顶闸；对照: 11 个未结算 reserve 必顶闸', () => {
+  const led = join(engDir, 'settle11.jsonl');
+  for (let i = 0; i < 12; i++) {
+    const b = reserveBudget({ ledgerFile: led, capUsd: 30, estimateUsd: 3, dispatchId: `s${i}` });
+    ok(b.allowed, `第 ${i + 1} 次 reserve 必须放行（陈旧 reserve 不得顶闸）: ${b.reason}`);
+    settleDispatchBudget({ ledgerFile: led, dispatchId: `s${i}`, actualUsd: 1.41 }); // 真实成本结算
+  }
+  ok(Math.abs(spentToday(led) - 12 * 1.41) < 1e-9, '台账只计 12 笔实值 actual');
+  ok(budgetCheck({ ledgerFile: led, capUsd: 30, estimateUsd: 3 }).allowed, '12 次完工后预算仍在闸内（无陈旧 reserve）');
+  // 对照（旧行为）: 10 个未结算 reserve = 30 已触顶，第 11 次 dispatch 被陈旧 reserve 顶闸
+  const led2 = join(engDir, 'stale11.jsonl');
+  for (let i = 0; i < 10; i++) {
+    const b = reserveBudget({ ledgerFile: led2, capUsd: 30, estimateUsd: 3, dispatchId: `x${i}` });
+    ok(b.allowed, `对照第 ${i + 1} 次 reserve 应放行`);
+  }
+  eq(spentToday(led2), 30, '未结算 reserve 全占额');
+  ok(!reserveBudget({ ledgerFile: led2, capUsd: 30, estimateUsd: 3, dispatchId: 'x10' }).allowed, '对照: 第 11 次 dispatch 因陈旧 reserve 必顶闸');
+  ok(!budgetCheck({ ledgerFile: led2, capUsd: 30, estimateUsd: 3 }).allowed, '对照: 预算检查必不过');
+});
+t('[2026-08-08 F5] 估算结算可被同 id 真实成本覆盖；已结算 dispatch 不再 reserve（already-settled 幂等）', () => {
+  const led = join(engDir, 'settle-overwrite.jsonl');
+  settleDispatchBudget({ ledgerFile: led, dispatchId: 'ow1', estimateUsd: 3 });
+  eq(spentToday(led), 3, '估算结算占额 3');
+  recordCost(led, { cost_usd: 1.5, kind: 'actual', dispatch_id: 'ow1', settlement: 'actual', note: 'real cost' });
+  eq(spentToday(led), 1.5, '真实成本必须同 id 覆盖估算结算');
+  // 估算结算幂等跳过: 再调 settle（estimate）不追加行
+  settleDispatchBudget({ ledgerFile: led, dispatchId: 'ow1', estimateUsd: 3 });
+  eq(readFileSync(led, 'utf8').trim().split('\n').length, 2, '重复估算结算不追加行');
+  const b = reserveBudget({ ledgerFile: led, capUsd: 30, estimateUsd: 3, dispatchId: 'ow1' });
+  ok(b.allowed && b.reason.includes('already-settled'), '已结算 dispatch 再 reserve 必须 already-settled 幂等');
+});
 t('[审④F5] dispatch manifest 自包含: finalize/complete 命令与 state/snapshot 接线齐备且无 undefined', () => {
   writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 'k5', body: '再来反馈' }] }));
   const r = runEngine(ENG({ budget: sharedBudget }));
   eq(r.dispatched.length, 1);
   const stFile = join(engState, stateFileName('o', 'mivo-canvas', 5));
   const m = readJson(stFile).pending_dispatch.manifest;
-  for (const k of ['state_dir', 'snapshot_cmd', 'manifest_path', 'finalize_cmd', 'complete_cmd', 'original_head']) {
+  for (const k of ['state_dir', 'snapshot_cmd', 'manifest_path', 'finalize_cmd', 'complete_cmd', 'original_head', 'budget']) {
     ok(m[k], `manifest 缺 ${k}`);
   }
+  ok(m.budget?.ledger && m.budget?.estimate > 0, 'manifest.budget 必须含 ledger 与 estimate（complete 结算依据）');
   ok(!JSON.stringify(m).includes('undefined'), 'manifest 不得含 undefined');
   ok(existsSync(m.manifest_path), 'manifest 必须已落盘供会话读取');
   ackDispatch({ stateDir: engState, owner: 'o', repo: 'mivo-canvas', prNumber: 5, dispatchId: m.dispatch_id });
@@ -2463,6 +2568,25 @@ t('[审⑩P2-2] timeout 硬边界: push env 0/空/NaN/负/超大全拒且零副�
   // 合法边界值照常工作
   const rOk = runEngine(ENG({ budget: BUDGET(), lockTimeoutMs: 100 }));
   ok(rOk.scanned >= 0);
+});
+
+t('[2026-08-08 F6] pendingStuckHours 非法配置拒启动（字符串/NaN/Infinity/负数/0 全 fail-closed，扫描与写 lease 之前）', () => {
+  const leaseP = lease;
+  for (const bad of ['6', 'abc', NaN, Infinity, -1, 0, -0.5]) {
+    let threw = false;
+    try { runEngine(ENG({ budget: BUDGET(), pendingStuckHours: bad })); }
+    catch (e) { threw = /pendingStuckHours 非法/.test(e.message); }
+    ok(threw, `pendingStuckHours=${String(bad)} 必须拒启动`);
+  }
+  // 非法配置在写 lease / 扫描之前即抛（零副作用）: 删掉 lease 后跑非法值，lease 不得被重建
+  rmSync(leaseP, { force: true });
+  let threw0 = false;
+  try { runEngine(ENG({ budget: BUDGET(), pendingStuckHours: 0 })); } catch (e) { threw0 = /pendingStuckHours 非法/.test(e.message); }
+  ok(threw0, 'pendingStuckHours=0 必须拒启动（不支持禁用）');
+  ok(!existsSync(leaseP), '非法配置不得写 lease（在扫描/通知之前抛）');
+  // 合法值照常工作（含小数与默认 6 不被破坏）
+  ok(runEngine(ENG({ budget: BUDGET(), pendingStuckHours: 6.5 })).scanned >= 0, '合法小数必须放行');
+  ok(runEngine(ENG({ budget: BUDGET(), pendingStuckHours: 8 })).scanned >= 0, '合法整数必须放行');
 });
 
 // ========== 14. 审⑪ delta 验收 ==========

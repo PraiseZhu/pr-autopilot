@@ -59,12 +59,26 @@ engine-mivo.json（完整必填示例；两仓 schedule **共享同一 budget.le
   "slackCmd": "node /Users/<mini-user>/mivo-ops/mivo-canvas/agent-use/loops/bug-doctor/notify.mjs"
 }
 ```
-- `estimate` 是**行为参数**（engine.mjs:250-255 预留时按它 reserve，不是注释）——mivo 示例取
-  `3`：外部部署实测单样本 $1.41，保守取整为 3；修复会话完工时用
-  `budget.mjs --record --dispatch-id <id> --cost <实际>` reconcile（reserve 被同 id actual 取代）。
+- `estimate` 是**行为参数**（`reserveBudget()`（`scripts/pr-watch/budget.mjs` 导出，engine 的
+  dispatch 路径调用它预留，当前约 `engine.mjs:293`——以符号为准，行号会漂移），不是注释）——
+  mivo 示例取 `3`：外部部署实测单样本 $1.41，保守取整为 3。
+- **完工结算（机械，人工只作兜底）**：`complete.mjs` 成功路径在 **ack 之前**把该 dispatch 的
+  reserve 机械结算为 actual（`settleDispatchBudget()`，`scripts/pr-watch/complete.mjs`）：
+  - 调用方可传 `--actual <usd>` 用**真实成本**结算（settlement=`actual`）；
+  - 调用链拿不到真实成本时，缺省以 `manifest.budget.estimate` 结算（settlement=`estimate`，
+    显式标记**估算结算**，后续同 id 真实成本入账可覆盖该值，见 `foldDispatchStates`）；
+  - **结算失败 fail-closed**：不 ack、不清 pending、游标不动——引擎按 at-least-once 重派，
+    重跑 complete 幂等（同 id 已结算则跳过，不追加台账行）；
+  - 成功 ack 后**绝不保留 reserve**；人工 `budget.mjs --record --dispatch-id <id> --cost <实际>`
+    只是**纠偏兜底**（真实成本补记 / 旧版 manifest 迁移期人工核账），不是常规结算路径。
 - **敞口算式**：cap 30 ÷ estimate 3 = 单日最多 **10 个**并发未结算 reserve（若沿用旧值 9.2 则仅
   3 个）。风险：并发未结算 reserve 上限 3 → 10，最坏坏账放大约 **3.3 倍**；收益：正常日不再因
-  3 个在途 reserve 顶闸停派。
+  3 个在途 reserve 顶闸停派。完工即结算后，**陈旧 reserve 只存在于「派发到 complete 收口」的
+  在途窗口**——连续完工不会因未结算残留顶闸（fixture: cap=30/estimate=3 下 12 次完工不暂停）。
+- **`pendingStuckHours`（超时告警阈值，默认 6 小时）**：引擎启动时仅接受**有穷 number 且 > 0**；
+  字符串 / `NaN` / `Infinity` / 负数 / `0` 一律**启动即拒（fail-closed）**，在扫描与通知之前抛错，
+  零副作用——本任务明确**不支持用 0 禁用**告警。年龄基准 = `first_dispatched_at`（重派不更新），
+  去重标记持久化在 `pending_dispatch.pending_stuck_notified`（通知失败也置位，宁丢一次不刷屏）。
 - **cindy 引擎各有 config**（engine-cindy.json 等），estimate 取值由部署者按同口径自行判断调整，
   本示例只校准 mivo 侧，不代改其他引擎的 config。
 - `repoDirs` 缺某仓时该仓终态清理 fail-closed（cleanup-pending 不销单，审③-I2-R）——两仓都必须配。
@@ -155,7 +169,7 @@ export PR_AUTOPILOT_HMAC_KEY=$(openssl rand -hex 32)   # 每台机器独立生�
 - **没配会怎样（三层，别混）**：
   - **gate 侧先说明白（login 早退）**：`gh-snapshot:117` 尝试拿 `selfLogin`（拿不到 → 宁多唤醒，`author_is_self` 为 false），`gate:54` 先跳过 `author_is_self === true` 再对剩余评论用 HMAC。所以 **login 可得时，无 key 不会因 HMAC 导致自家评论被当成新反馈**；HMAC 只在 login 不可得（拿不到 `ghGet('user')`）时才是识别自家回帖的那一层。
   - **已验证机制（前提：worker 已提交一条待核验的回帖）**：**在 worker 已提交待核验回帖的前提下**，无 key 会让 `complete.mjs:53` 取到空 key → `provenance.mjs:17`（实现：`if (!key) return false`，「无法验证 → 不声称是自家的 → 宁多唤醒」；`complete.mjs:35` 只是调用点）→ `:37` 判「回帖未落地」→ `:56` exit 1，**ack 不发生**（`:58-63` 只在 checkCompletion 通过后才 ackDispatch）→ `pending_dispatch` 保持在途 → 引擎 `engine.mjs:229-254` 只按 lease 超时（`:230`）重派**同一个 dispatch_id**（`budget.mjs:89` reserve 对同 id 幂等，`already-reserved` 直接放行不重复占额）→ 重派 ≥ `stuckThreshold` 次 → `engine.mjs:232-234` 记 `stuck` + `:235-240` routeNotify 发通知。**这是可能路径，不是无条件后果**——真实表现（在该前提下）= 卡在 pending、最终触发 stuck 通知（有告警，不是静默；通知为 best-effort——发送失败只记 `notify-error` journal `engine.mjs:240`，不重试不补发，见 §2.1 ③）。
-  - **已验证的间接预算影响（代码支持的可能路径，未在真实事件中证实）**：`complete` 未 ack → `pending_dispatch` 连同**原 dispatch 的 reserve 一起长留**（`engine.mjs:335-342` pending_dispatch 固化含 `budget: {ledger, estimate}`）→ 该额度不释放，与后续真实 dispatch 竞争同一个 cap；而重派路径**不调用 reserve**（reserve 只在无 pending 且判 actionable 的新 dispatch 路径，`engine.mjs:287`）。**这条是代码支持的可能机制，不是已证实因果**——不要当成新的因果断言。
+  - **已验证的间接预算影响（代码支持的可能路径，未在真实事件中证实）**：`complete` 未 ack → `pending_dispatch` 连同**原 dispatch 的 reserve 一起长留**（`engine.mjs:344-351` pending_dispatch 固化含 `budget: {ledger, estimate}`，以符号 `pending_dispatch.budget` 为准）→ 该额度不释放，与后续真实 dispatch 竞争同一个 cap；而重派路径**不调用 reserve**（reserve 只在无 pending 且判 actionable 的新 dispatch 路径，`engine.mjs:293`，以符号 `reserveBudget` 为准）。**这条是代码支持的可能机制，不是已证实因果**——不要当成新的因果断言。成功路径的 reserve 由 `complete` 在 ack 前机械结算（见 §2 estimate 段），不依赖人工 `--record`。
   - **不可归因**：外部部署方那次「$30/天 cap 撞顶」**成因未定**——本 checkout 没有「缺 key → 每轮新 dispatch_id → 每轮 reserve」的路径（重派复用同 id + reserve 幂等），且该事件无运行时台账/序列证据。**不要归因到 HMAC key，也不猜替代解释**。
 - **强度如实声明（T1，无机器门在拦）**：引擎启动时不校验 key 是否存在（`engine.mjs:73` `?? null`，没有 fail-closed 启动门）；这道门防的是「自家评论误唤醒自己」的**疏忽**，不防**伪造**——知道 key 的人可以伪造签名评论。配不配 key 全靠部署时自觉，机器不拦。
 
@@ -187,7 +201,7 @@ export REQUIRED_CONTEXTS_FILE=/path/to/required-contexts.json
 - **两类 check 绝对不能进这份清单（同一类陷阱的两个变种）**：
   - **`SKIPPED` 不算绿**：gh-snapshot 归一化 check-run 时只有 `conclusion == success` 才映射为绿，`skipped`/`neutral`/`cancelled` 一律非绿（`gh-snapshot.mjs:135`；`scripts/ci-readiness.mjs:33` `entry.state !== 'success'` → fail-closed 非绿）。按路径过滤的 job（改动不命中就 SKIPPED）一旦进清单，该 PR 永远判不绿。
   - **只在 `pull_request` 事件上跑的 job 同样不能列**：它在 main push 上根本不产生 check，列进去 = 永远等一个不会来的绿。真实案例：mivo 仓（`xindong/mivo-canvas`）`.github/workflows/deploy-green-ref.yml` 的 `REQUIRED_ON_MAIN` 数组上方注释（本机踩过并写死在注释里的教训，措辞以该文件当前内容为准）——e2e 系列 job 是 pull_request-only，main push 上不存在，不能列（列了 ref 永远不动）；bench / deps audit / semgrep baseline / coverage report 是设计上的非阻断，不纳入。**设计上非阻断的 job（bench / audit / baseline / coverage 类）也不进清单**。
-- **没配/文件缺失 = fail-closed 非绿，同一 head 的 ci-red 在本轮之内判一次并去重**：gh-snapshot 对未配置的 required 返回 `green: false` + `['required contexts 未配置（fail-closed）']`（`gh-snapshot.mjs:147`）→ gate 对**同一 head** 的 ci-red 用 `cursors.ci_red_sha !== head` 去重（`gate.mjs:61-62`）——**前提是状态真的落盘了（投递成功、pending/ack 已持久化）**；若投递失败，`engine.mjs:345-352` 释放预留（`:347`）且**游标不推进**（「下轮重试 = at-least-once」，失败记 `dispatch-failed` journal 事件 `:350`），`engine.mjs:353` 落盘的状态里没有 pending/cursor 推进，下一轮 gate 仍见 `ci_red_sha != head` → 仍 actionable → **可能每轮重新启动 agent**（`fixtures/run-fixtures.mjs:1089-1141` 已覆盖首派/重派连续失败重试；重派失败同样持久化 `redispatch_count` 并计入 stuck 判据，`engine.mjs:247-253`）。**不保证低唤醒/低 token**——别据此估预算。（早期版本写「CI 永远红 → 每轮都唤醒」不成立，已更正；本段也不构成跨轮静默保证。）
+- **没配/文件缺失 = fail-closed 非绿，同一 head 的 ci-red 在本轮之内判一次并去重**：gh-snapshot 对未配置的 required 返回 `green: false` + `['required contexts 未配置（fail-closed）']`（`gh-snapshot.mjs:147`）→ gate 对**同一 head** 的 ci-red 用 `cursors.ci_red_sha !== head` 去重（`gate.mjs:61-62`）——**前提是状态真的落盘了（投递成功、pending/ack 已持久化）**；若投递失败，`engine.mjs:354-361` 释放预留（`:356`）且**游标不推进**（「下轮重试 = at-least-once」，失败记 `dispatch-failed` journal 事件 `:350`），`engine.mjs:353` 落盘的状态里没有 pending/cursor 推进，下一轮 gate 仍见 `ci_red_sha != head` → 仍 actionable → **可能每轮重新启动 agent**（`fixtures/run-fixtures.mjs:1089-1141` 已覆盖首派/重派连续失败重试；重派失败同样持久化 `redispatch_count` 并计入 stuck 判据，`engine.mjs:247-253`）。**不保证低唤醒/低 token**——别据此估预算。（早期版本写「CI 永远红 → 每轮都唤醒」不成立，已更正；本段也不构成跨轮静默保证。）
 
 **②b `SNAPSHOT_CACHE_DIR` —— 不配 = 每轮探针都是普通 API 请求，配额被静默低估**
 

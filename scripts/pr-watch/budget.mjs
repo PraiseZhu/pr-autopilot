@@ -46,7 +46,15 @@ export function foldDispatchStates(entries) {
       if (!validCost(r.cost_usd)) throw new Error(`台账含非法实花金额 ${r.cost_usd}（负数/NaN 洗账被拦，fail-closed）`);
       if (r.dispatch_id) {
         const s = byId.get(r.dispatch_id) ?? { actual: null, reserved: null };
-        if (s.actual === null) { s.actual = r.cost_usd; s.reserved = null; } // 同 id 只认第一条 actual
+        if (s.actual === null) {
+          s.actual = r.cost_usd; s.reserved = null;
+          // 2026-08-08: 结算来源标记——complete 无 --actual 时以 estimate 结算（settlement='estimate'，
+          // 估算结算可被同 id 的真实成本覆盖）；显式实值/人工 record 一律按真实成本（settlement='actual'）
+          s.settlement = r.settlement === 'estimate' ? 'estimate' : 'actual';
+        } else if (s.settlement === 'estimate' && r.settlement !== 'estimate') {
+          // 真实成本同 id 覆盖估算结算（后续实值入账取代估算值）
+          s.actual = r.cost_usd; s.settlement = 'actual';
+        }
         byId.set(r.dispatch_id, s);
       } else noIdSum += r.cost_usd;
     } else {
@@ -57,6 +65,14 @@ export function foldDispatchStates(entries) {
   return { byId, noIdSum };
 }
 
+// 2026-08-08: 该 dispatch 是否已结算（存在 actual 即已结算）——complete 估算结算幂等跳过依据
+export function isDispatchSettled(ledgerFile, dispatchId, nowMs = Date.now()) {
+  if (!ledgerFile || !existsSync(ledgerFile) || !dispatchId) return false;
+  const { byId } = foldDispatchStates(readEntries(ledgerFile, nowMs));
+  const s = byId.get(dispatchId);
+  return s !== undefined && s.actual !== null;
+}
+
 export function spentToday(ledgerFile, nowMs = Date.now()) {
   const { byId, noIdSum } = foldDispatchStates(readEntries(ledgerFile, nowMs));
   let sum = noIdSum;
@@ -64,12 +80,14 @@ export function spentToday(ledgerFile, nowMs = Date.now()) {
   return sum;
 }
 
-export function recordCost(ledgerFile, { cost_usd, session, note, kind = 'actual', dispatch_id = null }) {
+export function recordCost(ledgerFile, { cost_usd, session, note, kind = 'actual', dispatch_id = null, settlement = null }) {
   if (kind !== 'release' && !validCost(cost_usd)) {
     throw new Error(`拒绝入账: cost_usd 必须是 ≥0 的有限数，得到 ${cost_usd}（审④-F7）`);
   }
   mkdirSync(dirname(ledgerFile), { recursive: true });
-  appendFileSync(ledgerFile, JSON.stringify({ at: nowIso(), kind, dispatch_id, cost_usd: kind === 'release' ? 0 : cost_usd, session: session ?? null, note: note ?? null }) + '\n');
+  const rec = { at: nowIso(), kind, dispatch_id, cost_usd: kind === 'release' ? 0 : cost_usd, session: session ?? null, note: note ?? null };
+  if (settlement) rec.settlement = settlement; // 仅显式传入时落盘（旧行格式不变）
+  appendFileSync(ledgerFile, JSON.stringify(rec) + '\n');
 }
 
 // dispatch 前原子预留（幂等: 同 dispatch_id 已有未结算 reserve → 直接放行不重复占额）

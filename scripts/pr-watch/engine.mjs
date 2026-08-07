@@ -82,6 +82,12 @@ export function runEngine(cfg) {
   if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 100 || lockTimeoutMs > 10_000) {
     throw new Error(`引擎启动拒绝: lockTimeoutMs 非法（${lockTimeoutMs}）——必须是 [100, 10000] 毫秒整数（审⑩-P2-2 fail-closed）`);
   }
+  // 审(2026-08-08): pendingStuckHours 仅接受有穷 number 且 > 0。字符串/NaN/Infinity/负数/0
+  // 会静默失效（"6"*60 的隐式转换、NaN 比较恒假、0 令任何年龄都超时），超时告警随之消失——
+  // 非法配置在扫描/通知前直接拒启动（fail-closed）。不支持用 0 禁用（禁用=告警永远不触发）。
+  if (typeof pendingStuckHours !== 'number' || !Number.isFinite(pendingStuckHours) || pendingStuckHours <= 0) {
+    throw new Error(`引擎启动拒绝: pendingStuckHours 非法（${pendingStuckHours}）——必须是有穷 number 且 > 0（字符串/NaN/Infinity/负数/0 均 fail-closed，不支持禁用）`);
+  }
 
   writeJsonAtomic(leaseFile, { last_success: nowIso(), pid: process.pid });
 
@@ -317,6 +323,9 @@ export function runEngine(cfg) {
         finalize_cmd: `node ${scriptsDir}finalize.mjs --repo-dir <修复worktree路径> --manifest ${manifestPath} --snapshot-cmd "${snapshotCmd}" --state-dir ${stateDir}`,
         complete_cmd: `node ${scriptsDir}complete.mjs --manifest ${manifestPath} --snapshot-cmd "${snapshotCmd}" --state-dir ${stateDir}`,
         signals: res.signals, new_items: res.newItems,
+        // 审(2026-08-08): 预算结算字段随 manifest 自包含投递——complete 在 ack 前凭
+        // manifest.budget.{ledger,estimate} 机械结算 reserve（缺省 estimate 结算，--actual 可给实值）
+        budget: { ledger: budget.ledger, estimate: budget.estimate },
         worktree_name: `fix-${state.pr_number}`,
         rules: [
           '第一步必须 git worktree add ../fix-<pr> 并切入（宿主无 per-dispatch worktree，S2）',

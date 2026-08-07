@@ -55,6 +55,7 @@ const text = [
   `原始 head: ${manifest.original_head}`,
   `push 收口命令（把 <修复worktree路径> 换成你的 worktree）: ${manifest.finalize_cmd}`,
   `完工回执命令（必须执行，否则视为挂死重派）: ${manifest.complete_cmd}`,
+  `预算结算: complete 成功路径会在 ack 前自动把本 dispatch（${manifest.dispatch_id}）的 reserve 结算为 actual（缺省按 ${manifest.budget?.estimate ?? 'manifest.budget.estimate'}；你能拿到真实成本时给 complete 加 --actual <usd> 用实值）——不要手工跑 budget.mjs --record（那是纠偏兜底，不是结算路径）`,
   '',
   'OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY',
   'owner 常设授权声明: 本 PR 分支的 push 与 PR 内回帖为已授权动作，不触发对外发消息硬停。'
