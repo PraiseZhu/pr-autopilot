@@ -4283,6 +4283,97 @@ t('[D8-node⑤] 未登记入口 node 脚本打印同形 summary（0 passed, 0 fa
   eq(v.ok, true, '整波放行');
 });
 
+t('[D8-node⑥] 白名单路径出现在非执行位（other.mjs 在前）→ unmeasured，不得测量其 stdout（POS-1）', () => {
+  // 三席共识 POS-1（finding 798f68f140a9）: 白名单路径仅作为附加参数出现 ≠ node 实际
+  // 执行了它。`node other.mjs fixtures/run-fixtures.mjs` 执行的是 other.mjs，run-fixtures
+  // 只是 argv——若按其 stdout 测量，攻击者可在任意脚本的 argv 里带一个白名单路径就让
+  // 伪造 summary 被采信（实测旧实现可拿 selected_tests=999）。
+  const v = mkNodeGateEnv('D8-N6', ['other.mjs', 'fixtures/run-fixtures.mjs'], '========== fixtures: 3 passed, 1 failed ==========\n');
+  const r = v.results.find((x) => x.sc_id === 'D8-N6');
+  eq(r.status, 'PASS', '不测量 ⇒ 维持 PASS 不阻断');
+  eq(r.selection_gate, 'unmeasured', 'gate=unmeasured（非执行位的伪造 summary 不得被采信）');
+  eq(r.selected_tests, null, '不取任何计数');
+  eq(FR.nodeSelectionApplies({ cmd: 'node', args: ['other.mjs', 'fixtures/run-fixtures.mjs'] }).applies, false, '直接断言 applies=false');
+  eq(v.ok, true, '整波放行');
+});
+
+t('[D8-node⑦] -e 注入模式: eval 旗标下白名单路径只是 -e 代码的 argv → unmeasured（POS-1）', () => {
+  // 实测事实（三席复核）: `node -e '<伪造 summary>' fixtures/run-fixtures.mjs` 的 stdout
+  // 只有伪造行——文件操作数在 -e 模式下**不执行**（只是代码的 argv），不得据其 stdout 测量。
+  const code = 'console.log("========== fixtures: 3 passed, 1 failed ==========")';
+  const v = mkNodeGateEnv('D8-N7', ['-e', code, 'fixtures/run-fixtures.mjs'], '========== fixtures: 3 passed, 1 failed ==========\n');
+  const r = v.results.find((x) => x.sc_id === 'D8-N7');
+  eq(r.status, 'PASS', '不测量 ⇒ 维持 PASS 不阻断');
+  eq(r.selection_gate, 'unmeasured', 'gate=unmeasured（-e 注入的伪造 summary 不得被采信）');
+  eq(r.selected_tests, null, '不取任何计数');
+  eq(FR.nodeSelectionApplies({ cmd: 'node', args: ['-e', code, 'fixtures/run-fixtures.mjs'] }).applies, false, '直接断言 applies=false');
+  // 直接绑定 eval 规则: 白名单路径本身作为 -e 代码内容——去掉 eval 检测时，位置判定会把它
+  // 误当操作数（首非 option 参数）而错误测量；有 eval 检测则按 eval 处理。
+  const v2 = mkNodeGateEnv('D8-N7b', ['-e', 'fixtures/run-fixtures.mjs'], '========== fixtures: 3 passed, 1 failed ==========\n');
+  const r2 = v2.results.find((x) => x.sc_id === 'D8-N7b');
+  eq(r2.selection_gate, 'unmeasured', '-e 代码内容恰为白名单路径也按 eval 处理（gate=unmeasured）');
+  eq(r2.status, 'PASS', '维持 PASS');
+  eq(r2.selected_tests, null, '不取计数');
+  eq(FR.nodeSelectionApplies({ cmd: 'node', args: ['-e', 'fixtures/run-fixtures.mjs'] }).applies, false, '直接断言 applies=false');
+});
+
+t('[D8-node⑧] 路径规范化: 同一真实文件的不同拼写判定一致（POS-3）', () => {
+  // 三席共识 POS-3（finding 248c74756449）: `./fixtures/run-fixtures.mjs` 与
+  // `fixtures/../fixtures/run-fixtures.mjs` 与规范拼写指向同一真实文件，applies 判定必须
+  // 一致（均 true）——旧实现按原字符串查白名单，两种合法拼写都被拒成 unmeasured（漏测）。
+  const trueSpellings = [
+    ['fixtures/run-fixtures.mjs', '规范拼写'],
+    ['./fixtures/run-fixtures.mjs', './ 前缀'],
+    ['fixtures/../fixtures/run-fixtures.mjs', '../ 中段'],
+    ['fixtures/./run-fixtures.mjs', './ 中段']
+  ];
+  for (const [arg, label] of trueSpellings) {
+    eq(FR.nodeSelectionApplies({ cmd: 'node', args: [arg] }).applies, true, `applies=true（${label}: ${arg}）`);
+  }
+  // 集成路径: ./ 拼写走完整 validateIntegration 应正常测量
+  const v = mkNodeGateEnv('D8-N8', ['./fixtures/run-fixtures.mjs'], '========== fixtures: 3 passed, 1 failed ==========\n');
+  const r = v.results.find((x) => x.sc_id === 'D8-N8');
+  eq(r.selection_gate, 'pass', '集成路径: ./ 拼写正常测量（gate=pass）');
+  eq(r.selected_tests, 4, 'selected = passed + failed = 3 + 1');
+  // 反向边界: 仓外拼写仍 applies=false（绝对路径 basename 撞白名单、越出仓根的 ..、非白名单文件）
+  const falseSpellings = [
+    ['/abs/path/fixtures/run-fixtures.mjs', '绝对路径'],
+    ['../fixtures/run-fixtures.mjs', '越出仓根'],
+    ['scripts/other.js', '非白名单文件']
+  ];
+  for (const [arg, label] of falseSpellings) {
+    eq(FR.nodeSelectionApplies({ cmd: 'node', args: [arg] }).applies, false, `applies=false（${label}: ${arg}）`);
+  }
+});
+
+t('[D8-node⑨] ReDoS 回归: 20 万连续 `=` 字符输入匹配耗时 < 1000ms（20 倍余量）', () => {
+  // sc-ReDoS（finding f41a44812474）: 旧 NODE_SUMMARY_RE 的 `.*?`/`.*` 与 `=+` 争夺同一批
+  // `=` 字符造成 O(n²) 回溯——三席实测 10k=48ms / 50k=1205ms / 100k=4826ms / 200k=19335ms
+  // （输入×2 耗时×4）。修复（通配段改排除 `=` 与换行的字符类）后 200k 应在 1ms 量级；
+  // 断言 <1000ms 保留 20 倍余量防 flake（issue #15 的学费）。输入不产生 summary 行 ⇒
+  // gate=unmeasured 不阻断。走真实消费点（validateIntegration 内 matchAll + 尾部扫描界限）。
+  const big = '='.repeat(200000);
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['D8-N9'], paths: ['a.ts'] }],
+    [['g1']],
+    [{ id: 'D8-N9', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('node', ['fixtures/run-fixtures.mjs']) }]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'd8n-redos', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-redos', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-redos', plan, waveIndex: 0 }).ok, 'wave 应集成');
+  const t0 = Date.now();
+  const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd8n-redos', scManifest: scm, waveIndex: 0, runner: () => big });
+  const elapsed = Date.now() - t0;
+  const r = v.results.find((x) => x.sc_id === 'D8-N9');
+  eq(r.status, 'PASS', '无 summary ⇒ PASS 不阻断');
+  eq(r.selection_gate, 'unmeasured', '200k `=` 无 summary 行 ⇒ unmeasured');
+  eq(r.selected_tests, null, '不取计数');
+  ok(elapsed < 1000, `匹配耗时 < 1000ms（实测 ${elapsed}ms，20 倍余量防 flake）`);
+});
+
 t('[D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且凭证零落库（sc-1g）', () => {
   // sc-1g（2026-08-09，issue #15）: 闭合 GPT-R4/R5「只有文字承诺、没有可执行断言」缺口——
   // **必须走真实子进程、禁止 runner 注入**（注入会绕过 fix-run.mjs 主跑 execFileSync，绑不住
