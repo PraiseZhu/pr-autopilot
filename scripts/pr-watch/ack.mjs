@@ -162,7 +162,7 @@ export function cancelDispatch({ stateDir, owner, repo, prNumber, dispatchId, bu
 
 // 审⑧-P1-1: 本 CLI **只有 --cancel 一种模式**。裸 ack（不验 receipt/push/回帖直接推游标）
 // 没有任何合法使用场景——推进游标的唯一入口是 complete.mjs 的副作用核验路径
-// （ackDispatch 仅作为内部函数被 complete 调用）。误跑裸 ack 吞反馈的通道从 CLI 层拆除。
+// （settleAndAckDispatch 仅作为内部函数被 complete 调用）。误跑裸 ack 吞反馈的通道从 CLI 层拆除。
 if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
   const need = ['state-dir', 'owner', 'repo', 'pr', 'dispatch-id'];
