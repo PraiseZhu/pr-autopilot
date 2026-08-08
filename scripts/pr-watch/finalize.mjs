@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { readJson, writeJsonAtomic, parseArgs, fail, isMain } from '../lib/common.mjs';
 import { join as joinPath } from 'node:path';
-import { stateFileName, legacyStateFileName, resolveStateFile } from './register.mjs';
+import { stateFileName, legacyStateFileName, resolveStateFile, identityMatches } from './register.mjs';
 import { matchAny } from '../push-guard.mjs';
 import { validateRemoteBranch } from '../lib/git-checks.mjs';
 import { withLock } from '../lib/state-lock.mjs';
@@ -161,10 +161,16 @@ if (isMain(import.meta.url)) {
   //   cancel 先 → pending 被清 → 本处 push 前核对失败，旧 manifest 到不了远端；
   //   finalize 先 → intent receipt 已落盘 → cancel 见 receipt fail-closed。
   // R3 修复: 状态文件同源解析——旧命名文件先迁移，pending 核对才能在升级后命中旧注册
-  const { file: resolvedStateFile } = resolveStateFile({
+  // SC-FIX-2 (2026-08-08): 解析路径被他身份文件占据（旧命名碰撞落点）→ 使用前 fail-closed
+  // 拒绝——仅按 pending.dispatch_id 放行会命中他身份文件并对其 push（冲突接线，SC-2）。
+  const { file: resolvedStateFile, identityConflict } = resolveStateFile({
     stateDir: args['state-dir'], owner: manifest.owner, repo: manifest.repo,
     prNumber: manifest.pr_number, journalFile: args.journal ?? null
   });
+  if (identityConflict) {
+    process.stderr.write(`[FINALIZE] 状态文件路径被其他身份占用（identityConflict: ${manifest.owner}/${manifest.repo}#${manifest.pr_number}）——不按 dispatch_id 放行他身份状态（fail-closed）\n`);
+    process.exit(1);
+  }
   const stateFile = joinPath(args['state-dir'], resolvedStateFile);
   const outcome = withLock(`${stateFile}.lock`, () => {
     // R4 修复: receipt 解析/迁移移入锁内（receiptPathLocked 不加锁，避免嵌套死锁）——
@@ -184,6 +190,12 @@ if (isMain(import.meta.url)) {
       return { code: 0, msg: 'FINALIZE-OK push 已在远端（receipt 恢复分支，幂等）；回帖后运行 complete.mjs 收口\n' };
     }
     const st = existsSync(stateFile) ? readJson(stateFile) : null;
+    // SC-FIX-2: 锁内身份复核（与 register/ack 同源，identityMatches 大小写不敏感）——
+    // 解析与持锁之间文件可被并发替换（TOCTOU），pending 放行前确认内容身份与 manifest
+    // 一致，绝不 push 他身份状态。
+    if (st && !identityMatches(st, manifest.owner, manifest.repo, manifest.pr_number)) {
+      return { code: 1, errors: [`state 内容身份与 manifest 不符（state=${st.owner}/${st.repo}#${st.pr_number} manifest=${manifest.owner}/${manifest.repo}#${manifest.pr_number}）——不 push 他身份状态（fail-closed）`] };
+    }
     const pendingId = st?.pending_dispatch?.dispatch_id ?? null;
     if (pendingId !== manifest.dispatch_id) {
       return { code: 1, errors: [`该 dispatch 已被取消/替换/收口（state.pending=${pendingId} ≠ manifest=${manifest.dispatch_id}）——旧会话禁止按旧 manifest push（审⑧-P1-2）`] };

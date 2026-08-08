@@ -374,7 +374,13 @@ const badArgCases = [
   { prNumber: 0, label: 'PR 号 0' },
   { prNumber: -5, label: 'PR 号 -5' },
   { prNumber: 1.5, label: 'PR 号 1.5' },
-  { prNumber: 'abc', label: 'PR 号非数字串' }
+  { prNumber: 'abc', label: 'PR 号非数字串' },
+  // SC-FIX-4 (2026-08-08): Number 强转会归一放行的异形输入——'1e2'→100 生成 o__r__100.json、
+  // '01'→1 生成 o__r__1.json、true→1、[1]→1，全部必须拒绝（不生成与传入表示不一致的绕过文件）
+  { prNumber: '1e2', label: 'PR 号科学计数法 1e2' },
+  { prNumber: '01', label: 'PR 号前导零 01' },
+  { prNumber: true, label: 'PR 号 boolean' },
+  { prNumber: [1], label: 'PR 号数组 [1]' }
 ];
 for (const c of badArgCases) {
   let threw = false;
@@ -385,7 +391,13 @@ for (const c of badArgCases) {
 const badWiringCases = [
   { branch: 'bad branch', label: 'branch 含空格' },
   { pushRemote: 'bad remote', label: 'push_remote 含空格' },
-  { branch: '-x', label: 'branch 前导 -' }
+  { branch: '-x', label: 'branch 前导 -' },
+  // SC-FIX-5 (2026-08-08): 非字符串 wiring——git-checks 语法守卫内部 String() 归一
+  // （123→'123'、true→'true'、自定义 toString 对象→任意串）会隐式强转放行，落盘前
+  // 必须先拒绝非字符串（守卫不依赖隐式强转）
+  { branch: 123, label: 'branch 数字 123' },
+  { pushRemote: true, label: 'push_remote boolean' },
+  { branch: { toString: () => 'feat/x' }, label: 'branch 自定义 toString 对象' }
 ];
 for (const c of badWiringCases) {
   let threw = false;
@@ -397,6 +409,12 @@ let pushRepoThrew = false;
 try { registerPr({ stateDir: s14Dir, owner: 'xindong', repo: 'mivo-canvas', prNumber: 502, branch: 'feat/x', pushRemote: 'origin', pushRepo: 'not-a-repo' }); }
 catch { pushRepoThrew = true; }
 ok(pushRepoThrew, 'S14 registerPr 拒绝非法 push_repo（not-a-repo）');
+let pushRepoNumThrew = false;
+// 自定义 toString 对象：String() 隐式强转得合法全名 'xindong/mivo-canvas'——语法守卫拦不住，
+// 必须由类型守卫在落盘前拒绝（若用数字 42，语法守卫的无斜杠检查也会拦，无法区分类型守卫在咬）
+try { registerPr({ stateDir: s14Dir, owner: 'xindong', repo: 'mivo-canvas', prNumber: 504, branch: 'feat/x', pushRemote: 'origin', pushRepo: { toString: () => 'xindong/mivo-canvas' } }); }
+catch { pushRepoNumThrew = true; }
+ok(pushRepoNumThrew, 'S14 registerPr 拒绝非字符串 push_repo（自定义 toString 对象，不依赖 String 隐式强转）');
 const goodReg = registerPr({ stateDir: s14Dir, owner: 'xindong', repo: 'mivo-canvas', prNumber: 503, branch: 'feat/x', pushRemote: 'origin', pushRepo: null });
 ok(goodReg.already === false && existsSync(goodReg.file), 'S14 registerPr 合法注册（pushRepo=null 同仓三态）正常');
 eq(readdirSync(s14Dir).filter((f) => f.endsWith('.json')).length, 1, 'S14 非法请求零落盘，仅 503 一个合法状态文件');

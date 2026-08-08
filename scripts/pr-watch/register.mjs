@@ -174,14 +174,34 @@ export function migrateAllLegacyStateFiles(stateDir, journalFile = null) {
 export function registerPr({ stateDir, owner, repo, prNumber, branch, registeredBy, pushRepo, pushRemote }) {
   // SC-FIX-2 (2026-08-08): PR 号必须是正整数——0/负数/非整数生成的状态文件名不满足
   // STATE_FILE_NAME_RE（PR 段 \d+），引擎扫描永不命中 = 可注册不可扫的空转，注册即拒绝。
-  const prNum = Number(prNumber);
+  // SC-FIX-4 (2026-08-08): 规范类型与表示守卫——Number 强转会放行异形输入
+  // （"1e2"→100 生成 o__r__100.json、"01"→1 生成 o__r__1.json、true→1、[1]→1），
+  // 生成与调用方传入表示不一致的状态文件名（归一化绕过）。只接受:
+  //   number 型正整数，或无前导零十进制字符串（/^[1-9]\d*$/）。
+  let prNum;
+  if (typeof prNumber === 'number') {
+    prNum = prNumber;
+  } else if (typeof prNumber === 'string' && /^[1-9]\d*$/.test(prNumber)) {
+    prNum = Number(prNumber);
+  } else {
+    throw new Error(`prNumber 非法（须正整数: number 型或 /^[1-9]\\d*$/ 无前导零十进制字符串，got ${JSON.stringify(prNumber)}）——拒绝注册（fail-closed: 生成的状态文件名不满足引擎扫描文法 STATE_FILE_NAME_RE 或与传入表示不一致）`);
+  }
   if (!Number.isInteger(prNum) || prNum <= 0) {
     throw new Error(`prNumber 非法（须正整数）: ${JSON.stringify(prNumber)}——拒绝注册（fail-closed: 生成的状态文件名不满足引擎扫描文法 STATE_FILE_NAME_RE）`);
   }
   // 审⑤-F4: branch 与 push remote 名注册时必填——state.branch=null 会让 finalize 必然拒绝，
   // 正常文档路径不允许生成注定失败的注册；remote 名不许引擎事后猜。
-  if (!branch) throw new Error('注册缺 branch（fail-closed: 无 branch 的状态文件会让 finalize 必然失败）');
-  if (!pushRemote) throw new Error('注册缺 push_remote（fail-closed: 修复 push 的 remote 名必须显式指定，引擎不猜）');
+  // SC-FIX-5 (2026-08-08): wiring 字段类型契约——branch/push_remote 必须为非空字符串、
+  // push_repo 必须为 null 或字符串。git-checks 的语法守卫内部用 String() 归一
+  // （123→'123'、true→'true'、自定义 toString 对象→任意串），对非字符串输入会隐式
+  // 强转放行；registerPr 是全部注册入口（CLI/reconcile/其他调用方）的共同写盘点，
+  // 落盘前在此先拒绝非字符串（守卫不依赖 String 隐式强转）。
+  if (typeof branch !== 'string' || branch.length === 0) {
+    throw new Error(`注册缺 branch 或非字符串（fail-closed: 无合法 branch 的状态文件会让 finalize 必然失败）: ${JSON.stringify(branch)}`);
+  }
+  if (typeof pushRemote !== 'string' || pushRemote.length === 0) {
+    throw new Error(`注册缺 push_remote 或非字符串（fail-closed: 修复 push 的 remote 名必须显式指定，引擎不猜）: ${JSON.stringify(pushRemote)}`);
+  }
   // SC-FIX-3 (2026-08-08): 落盘前对 branch/push_remote/push_repo 应用与 finalize.mjs
   // validateRemoteBranch 同源的绑定守卫（语法级，判据单一 owner 在 git-checks.mjs）。
   // registerPr 是全部注册入口（CLI/reconcile/其他调用方）的共同写盘点——可注册可派发
@@ -191,6 +211,9 @@ export function registerPr({ stateDir, owner, repo, prNumber, branch, registered
   const remoteErrs = validateRemoteName(pushRemote);
   if (remoteErrs.length) throw new Error(`注册拒绝: push_remote 未过绑定守卫——${remoteErrs.join('; ')}`);
   if (pushRepo !== undefined && pushRepo !== null) {
+    if (typeof pushRepo !== 'string') {
+      throw new Error(`注册拒绝: push_repo 必须为 null 或字符串（got ${typeof pushRepo}）——不依赖 String 隐式强转（fail-closed）: ${JSON.stringify(pushRepo)}`);
+    }
     const repoErrs = validateRepoFullName(pushRepo, 'push_repo');
     if (repoErrs.length) throw new Error(`注册拒绝: push_repo 未过绑定守卫——${repoErrs.join('; ')}`);
   }
@@ -242,7 +265,7 @@ export function registerPr({ stateDir, owner, repo, prNumber, branch, registered
     }
     const state = {
       schema_version: 'v2',
-      owner, repo, pr_number: Number(prNumber),
+      owner, repo, pr_number: prNum, // SC-FIX-4: 规范表示（无 Number 强转异形放行）
       registration_epoch: randomBytes(8).toString('hex'), // 审⑪-P1: 每次全新注册 = 新 dispatch id 空间
       branch,
       push_repo: pushRepo ?? null, // cindy 场景: 修复 push 目标 fork 全名（finalize 绑 remote URL 用）
@@ -269,7 +292,10 @@ export function checkReceipt({ stateDir, owner, repo, prNumber, leaseFile, lease
   // SC-FIX-1: 解析路径被他身份文件占据（旧命名碰撞落点）→ 本身份无合法状态文件，要素①不满足
   if (identityConflict) missing.push('要素①: 状态文件未落盘（该路径被其他身份占用，本身份无合法注册）');
   else if (!existsSync(file)) missing.push('要素①: 状态文件未落盘');
-  const state = existsSync(file) ? readJson(file) : null;
+  // SC-FIX-6 (2026-08-08): identityConflict 时该路径文件必然存在但内容属于他身份——
+  // 不得读取/返回他身份注册详情（branch/push_repo/push_remote/registered_by 不外泄），
+  // 要素④也不得用他身份文件的 first_scan_ack 判定本 PR（冲突时 state=null 天然跳过）。
+  const state = (identityConflict || !existsSync(file)) ? null : readJson(file);
 
   // ② 引擎 schedule active（可注入命令，产出 "active"/其他）
   if (scheduleCheckCmd) {
