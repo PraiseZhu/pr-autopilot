@@ -14,39 +14,22 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { isMain, parseArgs, fail } from '../../scripts/lib/common.mjs';
+import { validateBranchName, validateRemoteName, validateRepoFullName } from '../../scripts/lib/git-checks.mjs';
 
 const GH = process.env.GH_BIN ?? 'gh';
 
 // 严格 owner/repo grammar（2026-08-08 GPT 审查 R2 修复，SC-F2 提炼复用）:
-//   恰一个斜杠、两段非空、GitHub 合法形状。
-//   owner: 字母数字开头结尾、中间可连字符（GitHub 用户名规则，保留原检查）。
-//   repo: 按 GitHub 实际允许的字符集放宽——字母/数字/`.`/`_`/`-` 均允许，
-//     末尾允许 `_`/`-`（gh API 实测实例: mame/_、PrinceRpz23/- 均真实存在且公开；
-//     makecindy/.github 同样真实存在，故 `.` 开头不拒）。
-//     仍拒（本地必要安全边界 + GitHub 官方禁止）:
-//       `..`（GitHub 明确禁止 + 路径语义）、`.git` 结尾（git 保留名）、
-//       `.` 结尾（macOS 文件系统折叠尾部点，会与无点仓库的 state 文件名冲突）、
-//       空白/控制字符（字符集白名单天然排除）。
-//   拒: /foo、foo/、a/b/c、foo//bar、a//、空串、非字符串。
-//   返回 { owner, repo }；非法即 throw（fail-closed，调用方决定落盘与否）。
+//   判据权威在 scripts/lib/git-checks.mjs 的 validateRepoFullName（单一 owner，第 10 类
+//   形态①——register.mjs 的 push_repo 校验共用同一份，禁止两处各自手拄判据）。
+//   恰一个斜杠、两段非空、GitHub 合法形状（owner 用户名规则 + repo 白名单字符集，
+//   拒 .. / .git 结尾 / 尾部点 / 空白控制字符）。非法即 throw（fail-closed，调用方决定落盘与否）。
 export function parseRepo(repo, label = 'repo') {
   if (typeof repo !== 'string') {
     throw new Error(`${label} 非法（须 owner/repo 字符串）: ${JSON.stringify(repo)}`);
   }
-  const parts = repo.split('/');
-  if (parts.length !== 2) {
-    throw new Error(`${label} 非法（须恰一个斜杠的 owner/repo）: ${JSON.stringify(repo)}`);
-  }
-  const [owner, repoName] = parts;
-  if (!owner || !repoName) {
-    throw new Error(`${label} 非法（owner/repo 两段均不能为空）: ${JSON.stringify(repo)}`);
-  }
-  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(owner)) {
-    throw new Error(`${label} 非法（owner 不是 GitHub 合法用户名形状）: ${JSON.stringify(repo)}`);
-  }
-  if (!/^[A-Za-z0-9._-]+$/.test(repoName) || repoName.includes('..') || repoName.endsWith('.git') || repoName.endsWith('.')) {
-    throw new Error(`${label} 非法（repo 不是 GitHub 合法仓库名形状）: ${JSON.stringify(repo)}`);
-  }
+  const errs = validateRepoFullName(repo, label);
+  if (errs.length) throw new Error(errs[0]);
+  const [owner, repoName] = repo.split('/');
   return { owner, repo: repoName };
 }
 
@@ -82,8 +65,10 @@ export function listOwnPrs({ repo, remoteMap }) {
   for (const row of rows) {
     const number = row.number;
     const prRef = `${repo}#${typeof number === 'number' ? number : '?'}`;
-    if (typeof number !== 'number' || !Number.isInteger(number)) {
-      dropped.push({ pr: prRef, reason: 'number 缺失或非整数' });
+    // SC-FIX-2 (2026-08-08): PR 号必须是正整数——0/负数/非整数生成的注册不满足引擎
+    // 扫描 grammar（STATE_FILE_NAME_RE 的 PR 段 \d+），可注册不可扫 = 空转，直接 dropped。
+    if (typeof number !== 'number' || !Number.isInteger(number) || number <= 0) {
+      dropped.push({ pr: prRef, reason: 'number 非正整数（PR 号须 >0 的整数）' });
       continue;
     }
     const branch = row.headRefName;
@@ -91,14 +76,35 @@ export function listOwnPrs({ repo, remoteMap }) {
       dropped.push({ pr: prRef, reason: '缺 headRefName' });
       continue;
     }
+    // SC-FIX-3 (2026-08-08): 落盘前对 branch/push_remote/push_repo 应用与 finalize.mjs
+    // validateRemoteBranch 同源的绑定守卫（语法级，判据单一 owner 在 git-checks.mjs）——
+    // 可注册可派发但必然无法收口（finalize 必拒绝）的空转状态不允许从数据生产侧产生。
+    const branchErrs = validateBranchName(branch);
+    if (branchErrs.length) {
+      dropped.push({ pr: prRef, reason: `branch 未过绑定守卫: ${branchErrs.join('; ')}` });
+      continue;
+    }
+    const remoteErrs = validateRemoteName(alias);
+    if (remoteErrs.length) {
+      dropped.push({ pr: prRef, reason: `push_remote 未过绑定守卫: ${remoteErrs.join('; ')}` });
+      continue;
+    }
     const nameWithOwner = row.headRepository?.nameWithOwner;
     if (typeof nameWithOwner !== 'string' || !nameWithOwner) {
       dropped.push({ pr: prRef, reason: 'headRepository.nameWithOwner 缺失或非字符串' });
       continue;
     }
+    const pushRepo = nameWithOwner === repo ? null : nameWithOwner; // 三态: 同仓→null / fork→nameWithOwner
+    if (pushRepo !== null) {
+      const repoErrs = validateRepoFullName(pushRepo, 'push_repo');
+      if (repoErrs.length) {
+        dropped.push({ pr: prRef, reason: `push_repo 未过绑定守卫: ${repoErrs.join('; ')}` });
+        continue;
+      }
+    }
     prs.push({
       owner, repo: repoName, number, branch,
-      push_repo: nameWithOwner === repo ? null : nameWithOwner, // 三态: 同仓→null / fork→nameWithOwner
+      push_repo: pushRepo,
       push_remote: alias
     });
   }
