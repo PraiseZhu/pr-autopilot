@@ -31,6 +31,13 @@ import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from '../scripts/l
 // 「改席位名单 → consensus-gate 的席位门跟着变」，测试内会 push/pop 还原，不留污染。
 import { REVIEWERS, SCHEMA_VERSION } from '../scripts/verdict-validate.mjs';
 
+// fixture 回归必须 hermetic：临时仓 commit 一律不签名。用 GIT_CONFIG_* 而非逐处 -c——
+// 生产侧 git helper（fix-run.mjs:29 function git / :320 const gi）不传 env: 故继承 process.env，
+// 进程级设置能一并覆盖生产代码发起的 merge；逐处补 fixture 覆盖不到那些调用。
+process.env.GIT_CONFIG_COUNT = '1';
+process.env.GIT_CONFIG_KEY_0 = 'commit.gpgsign';
+process.env.GIT_CONFIG_VALUE_0 = 'false';
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const S = join(HERE, '..', 'scripts');
 // B 类（2026-08-07）: artifact schema 版本从 consensus-gate.mjs 导出的 ARTIFACT_SCHEMA_VERSION
