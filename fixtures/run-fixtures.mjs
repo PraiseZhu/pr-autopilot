@@ -6924,6 +6924,63 @@ t('[R3-SC-S2] register 双仓同 PR 并存: mame/_#301 与 mame/-#301 各自注�
   r3Ack('mame', '_', 301); r3Ack('mame', '-', 301); // 清 pending 防污染后续用例
 });
 
+t('[R3-SC-S2] SC-FIX-1 身份校验: 一身份 legacy 预存、另一身份 registerPr/unregisterPr 不得污染/删除其记录', () => {
+  // 每场景独立 stateDir（r3State 已被本段前面测试写过 mame/_#301 等文件；场景之间也互不干扰——
+  // B1 的前提是「调用方身份无自身文件」，与场景 A 的新建文件序列互斥）
+  const fixDir = () => { const d = mkdtempSync(join(tmpdir(), 'r3-fix1-')); mkdirSync(d, { recursive: true }); return d; };
+  // 场景 A: 预置 legacy 文件（身份 mame/-#301，旧命名 mame__-__301.json）——v2 clean 折叠下
+  // 它恰是 mame/_#301 的旧名（碰撞落点）。对 mame/_#301 registerPr:
+  //   round-trip 判据只证明内容==文件名、不证明内容==调用方身份；修复前会把 mame/-#301 的
+  //   文件当 mame/_#301 的已有注册（already+migrated 且覆写接线），修复后必须识别为
+  //   「他身份文件」→ 不 already、不覆写、本身份另建新名文件。
+  const dirA = fixDir();
+  const legacyA = 'mame__-__301.json';
+  writeFileSync(join(dirA, legacyA), JSON.stringify(r3V2('mame', '-', 301)));
+  const ra = registerPr({ stateDir: dirA, owner: 'mame', repo: '_', prNumber: 301, branch: 'fa', pushRemote: 'origin' });
+  ok(ra.already === false, 'SC-FIX-1A 他身份 legacy 预存 → registerPr 不得 already（修复前误报 already:true）');
+  ok(ra.migrated === false, 'SC-FIX-1A 不得声称 migrated');
+  const legacyAState = readJson(join(dirA, legacyA));
+  eq([legacyAState.owner, legacyAState.repo, legacyAState.pr_number], ['mame', '-', 301], 'SC-FIX-1A legacy 内容未被覆写（仍属 mame/-#301）');
+  const newA = stateFileName('mame', '_', 301);
+  ok(existsSync(join(dirA, newA)), `SC-FIX-1A 本身份新建有主新命名文件: ${newA}`);
+  eq([readJson(join(dirA, newA)).owner, readJson(join(dirA, newA)).repo], ['mame', '_'], 'SC-FIX-1A 新文件内容身份=mame/_（有主，非名实不符无主文件）');
+  rmSync(dirA, { recursive: true, force: true });
+
+  // 场景 B: unregisterPr 不得删除他身份合法注册记录
+  //   B1: 独立目录只预置 mame/-#301 的 legacy → mame/_#301 unregister → 不删他身份文件
+  //   （调用方身份无自身文件，解析走 legacy 身份不符 → 不迁移 → 无文件可删）
+  const dirB = fixDir();
+  writeFileSync(join(dirB, legacyA), JSON.stringify(r3V2('mame', '-', 301)));
+  const rb1 = unregisterPr({ stateDir: dirB, owner: 'mame', repo: '_', prNumber: 301, reason: 'fixture' });
+  eq(rb1.removed, false, 'SC-FIX-1B1 他身份 legacy 预存 → unregisterPr removed:false（修复前直接 unlink 他身份文件）');
+  ok(existsSync(join(dirB, legacyA)), 'SC-FIX-1B1 legacy 记录保留（mame/-#301 未被误删）');
+  //   B2: 新名路径被 mame/_#301 内容占据（旧命名即 mame/-#301 的新名）→ mame/-#301 unregister
+  //   走 identityConflict 拒绝不删
+  writeFileSync(join(dirB, legacyA), JSON.stringify(r3V2('mame', '_', 301)));
+  const rb2 = unregisterPr({ stateDir: dirB, owner: 'mame', repo: '-', prNumber: 301, reason: 'fixture' });
+  eq(rb2.removed, false, 'SC-FIX-1B2 新名路径被 mame/_#301 内容占据 → mame/-#301 unregister 拒绝（identityConflict）');
+  ok(existsSync(join(dirB, legacyA)), 'SC-FIX-1B2 mame/_#301 的合法注册记录保留（未被他身份 unregister 删除）');
+
+  // 场景 C: 冲突拒绝报错身份与实际请求一致（不得指向他身份的在途 dispatch 误导）
+  let cMsg = null;
+  try { registerPr({ stateDir: dirB, owner: 'mame', repo: '-', prNumber: 301, branch: 'fb', pushRemote: 'origin' }); }
+  catch (e) { cMsg = e.message; }
+  ok(cMsg !== null, 'SC-FIX-1C 他身份占据本身份新名 → registerPr 抛错（fail-closed）');
+  ok(cMsg !== null && cMsg.includes('注册冲突') && cMsg.includes('mame/-#301'), 'SC-FIX-1C 报错含调用方真实身份 mame/-#301');
+  ok(cMsg !== null && !cMsg.includes('在途 dispatch'), 'SC-FIX-1C 报错不指向他身份的在途 dispatch（不误导）');
+  ok(existsSync(join(dirB, legacyA)), 'SC-FIX-1C 冲突后他身份文件原样保留（不覆写不删除）');
+  rmSync(dirB, { recursive: true, force: true });
+
+  // 场景 D（对照）: 本身份 legacy 预存 → 本身份 registerPr 正常迁移 + already（守卫不误伤）
+  const dirD = fixDir();
+  const legacyD = 'mame__-__310.json';
+  writeFileSync(join(dirD, legacyD), JSON.stringify(r3V2('mame', '_', 310)));
+  const rd = registerPr({ stateDir: dirD, owner: 'mame', repo: '_', prNumber: 310, branch: 'fa', pushRemote: 'origin' });
+  ok(rd.already, 'SC-FIX-1D 本身份 legacy 预存 → registerPr already（迁移+幂等不误伤）');
+  ok(!existsSync(join(dirD, legacyD)), 'SC-FIX-1D 本身份 legacy 已迁移（旧名不再存在）');
+  rmSync(dirD, { recursive: true, force: true });
+});
+
 t('[R3-SC-S2] 大小写归一 register 幂等: Mame/_#307 与 mame/_#307 同一文件 already；mame/-#307 独立', () => {
   const r1 = registerPr({ stateDir: r3State, owner: 'Mame', repo: '_', prNumber: 307, branch: 'fa', pushRemote: 'origin' });
   ok(!r1.already, '首注册新建');

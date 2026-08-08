@@ -75,7 +75,10 @@ export function checkFinalize({ repoDir, manifest, snapshot, constitution }) {
 //   同 dispatch → 幂等视为已迁移（返回 canonical；legacy 保留不删——显式策略，双保险不丢数据）；
 //   不同 dispatch 且 legacy 待迁移（legacy.dispatch == manifest.dispatch）→ 显式冲突抛错:
 //     两文件保留、调用方 fail-closed（不 push/不结算不 ack，人工核对后处理）；
-//   不同 dispatch 且无 legacy 待迁移 → 返回 canonical（调用方自有 dispatch 校验 fail-closed）。
+//   不同 dispatch 且无 legacy 待迁移 → 返回 canonical（调用方以 recoverFromReceipt 判定恢复分支，
+//     不同 dispatch receipt 由 pending 核对与后续 complete 身份核对兜底——SC-FIX-4: 本函数只做
+//     receipt 路径解析，不越权判定归属；恢复分支的字段绑定与 complete 的锁内身份核对
+//     承担调用方侧校验，此处不替调用方断言）。
 // 只读核对（调用方无 dispatch_id，ack.mjs cancel）→ 不做任何迁移/抛错，按 canonical 优先返回。
 export function receiptPathLocked(stateDir, manifest) {
   const newPath = joinPath(stateDir, `receipt-${stateFileName(manifest.owner, manifest.repo, manifest.pr_number)}`);
@@ -98,7 +101,7 @@ export function receiptPathLocked(stateDir, manifest) {
         );
       }
     }
-    return newPath; // 无 legacy 待迁移 → canonical 属其他 dispatch，调用方自有校验 fail-closed
+    return newPath; // 无 legacy 待迁移 → canonical 属其他 dispatch，调用方按 pending 核对兜底（SC-FIX-4）
   }
   if (!existsSync(legacyPath)) return newPath;
   if (!manifest.dispatch_id) return legacyPath; // 只读核对场景（ack.mjs cancel）
