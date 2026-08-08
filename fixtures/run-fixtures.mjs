@@ -2,10 +2,10 @@
 // pr-autopilot 回归 fixtures v3 — 审③后更新（对账用例全部固化）
 // 每条用例前缀 [计划条款/审次编号]；末尾 SKIPPED 清单如实列出仓内验不了的项。
 // 模拟密钥一律运行时拼接（静态文件不含完整 token/赋值形态）。
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, utimesSync, rmSync, lstatSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, utimesSync, rmSync, lstatSync, appendFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHmac } from 'node:crypto';
 
@@ -21,13 +21,13 @@ import { runConsensusGate, recomputeArtifactHash, familyKeyOf } from '../scripts
 import { checkPushGuard, matchAny, directionCheck, jsonSubset, fastSignaturePayload } from '../scripts/push-guard.mjs';
 import { ciReadiness } from '../scripts/ci-readiness.mjs';
 import { matchUiPaths } from '../scripts/ui-paths/match.mjs';
-import { registerPr, unregisterPr, checkReceipt, stateFileName } from '../scripts/pr-watch/register.mjs';
+import { registerPr, unregisterPr, checkReceipt, stateFileName, legacyStateFileName, parseStateFileName, migrateAllLegacyStateFiles, STATE_FILE_NAME_RE } from '../scripts/pr-watch/register.mjs';
 import { evaluate, emptyCursors } from '../scripts/pr-watch/gate.mjs';
 import { runEngine } from '../scripts/pr-watch/engine.mjs';
-import { ackDispatch, cancelDispatch } from '../scripts/pr-watch/ack.mjs';
-import { checkFinalize, receiptPath } from '../scripts/pr-watch/finalize.mjs';
+import { ackDispatch, cancelDispatch, settleAndAckDispatch } from '../scripts/pr-watch/ack.mjs';
+import { checkFinalize, receiptPath, receiptPathLocked } from '../scripts/pr-watch/finalize.mjs';
 import { checkCompletion } from '../scripts/pr-watch/complete.mjs';
-import { reserveBudget, releaseReserve, recordCost, spentToday, budgetCheck } from '../scripts/pr-watch/budget.mjs';
+import { reserveBudget, releaseReserve, recordCost, spentToday, budgetCheck, settleDispatchBudget, isDispatchSettled } from '../scripts/pr-watch/budget.mjs';
 import { route } from '../scripts/pr-watch/notify-router.mjs';
 import { signMarker, verifyMarker } from '../scripts/pr-watch/provenance.mjs';
 import { withLock, acquireLock } from '../scripts/lib/state-lock.mjs';
@@ -828,6 +828,20 @@ t('[W-8] 路由: cindy stuck 静默/mivo 飞书/budget 飞书/broadcast slack/�
   let threw = false; try { route('mystery', {}); } catch { threw = true; }
   ok(threw);
 });
+t('[SC-R3] canonical route 直接矩阵: 仅 makecindy/cindy→silent，其余含 cindy 名一律 feishu（2026-08-08 R2 固化）', () => {
+  // 全名（engine 现传 `${owner}/${repo}`）: 只认 canonical makecindy/cindy
+  eq(route('stuck', { repo: 'makecindy/cindy' }), 'silent');
+  eq(route('stuck', { repo: 'PraiseZhu/pr-autopilot' }), 'feishu');
+  eq(route('stuck', { repo: 'evilorg/cindy' }), 'feishu');
+  eq(route('stuck', { repo: 'xindong/mivo-canvas' }), 'feishu');
+  // 裸 repo 名（旧调用/部署只传 repo 段）: 只认字面 cindy，含 cindy 子串不判
+  eq(route('stuck', { repo: 'cindy' }), 'silent');
+  eq(route('stuck', { repo: 'my-cindy-app' }), 'feishu');
+  // pending-stuck 同通道规则
+  eq(route('pending-stuck', { repo: 'makecindy/cindy' }), 'silent');
+  eq(route('pending-stuck', { repo: 'evilorg/cindy' }), 'feishu');
+  eq(route('pending-stuck', { repo: 'my-cindy-app' }), 'feishu');
+});
 t('[审④F7] 预算 v3: 29+9 拦 / 同 id 重复 reserve 幂等 / release 归零 / 负数与 NaN actual 拒 / 双 actual 只认第一条', () => {
   const bl = join(engDir, 'b29.jsonl');
   recordCost(bl, { cost_usd: 29, note: 'today' });
@@ -967,15 +981,267 @@ t('[审④F4] complete 只认 receipt: 无 receipt 拒 / 跨任务 receipt 拒 /
   ok(c.ok, c.missing?.join(';'));
   ok(ackDispatch({ stateDir: engState, owner: 'o', repo: 'mivo-canvas', prNumber: 5, dispatchId: manifest.dispatch_id }).ok);
 });
+t('[2026-08-08 F5] complete 机械结算全链: reserve→actual/settled + manifest 携带结算字段 + 重复 complete 幂等 + 结算失败 fail-closed 不 ack', () => {
+  const d = mkdtempSync(join(tmpdir(), 'cset-'));
+  const stateDir = join(d, 'state'); mkdirSync(stateDir);
+  const led = join(d, 'cost.jsonl');
+  // 每 PR 独立快照文件（共享快照会让一个 PR 的反馈被另一个 PR 读到，重复派发）
+  const snapSh = join(d, 'snap.sh');
+  writeFileSync(snapSh, `#!/bin/sh\ncat "${d}/snap-\${3}.json"\n`);
+  execFileSync('chmod', ['+x', snapSh]);
+  const cand = 'e'.repeat(40);
+  const eng = {
+    stateDir, leaseFile: join(d, 'lease.json'),
+    snapshotCmd: snapSh + ' {owner} {repo} {pr}',
+    dispatchCmd: join(engDir, 'dispatch-ok.sh'),
+    journalFile: join(d, 'journal.jsonl'),
+    hmacKey: HMAC_KEY,
+    budget: { ledger: led, cap: 30, estimate: 3 },
+    repoDirs: {}
+  };
+  registerPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 91, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(join(d, 'snap-91.json'), JSON.stringify({ ...snapBase, comments: [{ id: 'cs1', body: '请修' }] }));
+  runEngine(eng);
+  const stFile = join(stateDir, stateFileName('o', 'mivo-canvas', 91));
+  const manifest = readJson(stFile).pending_dispatch.manifest;
+  ok(manifest.budget?.ledger === led && manifest.budget?.estimate === 3, 'manifest 必须携带预算结算字段（自包含投递）');
+  eq(spentToday(led), 3, 'reserve(3) 占额');
+  // 完工: receipt(committed) + 远端 head==candidate + HMAC 回帖
+  writeFileSync(receiptPath(stateDir, manifest), JSON.stringify({
+    dispatch_id: manifest.dispatch_id, original_head: SHA_A, candidate: cand,
+    remote: 'origin', branch: 'feat', phase: 'committed', at: new Date().toISOString()
+  }));
+  writeFileSync(join(d, 'snap-91.json'), JSON.stringify({ ...snapBase, head_sha: cand, comments: [{ id: 'z', body: signMarker(`fixed dispatch:${manifest.dispatch_id}`, HMAC_KEY) }] }));
+  // CLI 第一跑: 结算 + ack（--actual 缺省 → 按 estimate 结算并标记）
+  let out = execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', manifest.manifest_path, '--snapshot-cmd', snapSh + ' {owner} {repo} {pr}', '--state-dir', stateDir], { encoding: 'utf8', env: { ...process.env, PR_AUTOPILOT_HMAC_KEY: HMAC_KEY } });
+  ok(JSON.parse(out.trim()).ok, 'complete 正例必须 ack 成功');
+  const acts = readFileSync(led, 'utf8').trim().split('\n').map(JSON.parse).filter((l) => l.kind === 'actual' && l.dispatch_id === manifest.dispatch_id);
+  eq(acts.length, 1, '结算只落一条 actual');
+  eq(acts[0].settlement, 'estimate', '无 --actual 时按 estimate 结算并显式标记估算结算');
+  eq(spentToday(led), 3, 'reserve(3)→actual(3): 占额不漂且已结算');
+  ok(readJson(stFile).pending_dispatch === null, 'ack 后 pending 清空');
+  // 重复 complete: 幂等 exit 0，不重复计账、不改状态
+  out = execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', manifest.manifest_path, '--snapshot-cmd', snapSh + ' {owner} {repo} {pr}', '--state-dir', stateDir], { encoding: 'utf8', env: { ...process.env, PR_AUTOPILOT_HMAC_KEY: HMAC_KEY } });
+  ok(JSON.parse(out.trim()).idempotent === true, '重复 complete 必须幂等成功（exit 0）');
+  eq(readFileSync(led, 'utf8').trim().split('\n').length, 2, '重复 complete 不追加台账行（reserve+actual 两行）');
+  eq(spentToday(led), 3, '重复 complete 不重复计账');
+  // 审(2026-08-08 GPT R2) SC-B1 对抗: 改 manifest.budget 指向坏账本/estimate=0 → complete
+  // 必须仍成功——结算来源只认 state 固化的 pending_dispatch.budget（manifest 可变不信任），
+  // 坏账本零写入、真账本按 pending 权威 estimate 结算 + ack 成功
+  const st92File = join(stateDir, stateFileName('o', 'mivo-canvas', 92));
+  registerPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 92, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(join(d, 'snap-92.json'), JSON.stringify({ ...snapBase, comments: [{ id: 'cs2', body: '再修' }] }));
+  runEngine(eng);
+  const m92 = readJson(st92File).pending_dispatch.manifest;
+  // 完工快照 + receipt 先就位（checkCompletion 必须通过，才能打到结算环节）
+  writeFileSync(receiptPath(stateDir, m92), JSON.stringify({
+    dispatch_id: m92.dispatch_id, original_head: SHA_A, candidate: cand,
+    remote: 'origin', branch: 'feat', phase: 'committed', at: new Date().toISOString()
+  }));
+  writeFileSync(join(d, 'snap-92.json'), JSON.stringify({ ...snapBase, head_sha: cand, comments: [{ id: 'z92', body: signMarker(`fixed dispatch:${m92.dispatch_id}`, HMAC_KEY) }] }));
+  const badLedger = join(d, 'bad-ledger.jsonl');
+  const bad92 = { ...m92, budget: { ledger: badLedger, estimate: 0 } }; // 篡改: 坏账本 + 0 洗账
+  writeFileSync(join(d, 'bad92.json'), JSON.stringify(bad92));
+  let out92 = execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', join(d, 'bad92.json'), '--snapshot-cmd', snapSh + ' {owner} {repo} {pr}', '--state-dir', stateDir], { encoding: 'utf8', env: { ...process.env, PR_AUTOPILOT_HMAC_KEY: HMAC_KEY } });
+  ok(JSON.parse(out92.trim()).ok, 'SC-B1: 篡改 manifest.budget（坏账本/estimate=0）不得影响收口——complete 必须成功 ack');
+  ok(!existsSync(badLedger), 'SC-B1: 篡改指向的坏账本必须零写入（结算绝不落 manifest 自报账本）');
+  const acts92 = readFileSync(led, 'utf8').trim().split('\n').map(JSON.parse).filter((l) => l.kind === 'actual' && l.dispatch_id === m92.dispatch_id);
+  eq(acts92.length, 1, 'SC-B1: 真账本只落一条 actual（pending 权威 estimate=3）');
+  eq(acts92[0].cost_usd, 3, 'SC-B1: 结算金额来自 pending.budget.estimate（3），不是 manifest 篡改值 0');
+  eq(spentToday(led), 6, 'SC-B1: 真账本 reserve(3)+actual(3) 占额 6，无洗账');
+  ok(readJson(st92File).pending_dispatch === null, 'SC-B1: 篡改 manifest.budget 后 ack 仍正常清空 pending');
+  // SC-B3 恢复路径: 已 ack 后重跑 complete（带 --actual）→ 幂等成功、不追加行、不改状态
+  let out92b = execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', join(d, 'bad92.json'), '--snapshot-cmd', snapSh + ' {owner} {repo} {pr}', '--state-dir', stateDir, '--actual', '5'], { encoding: 'utf8', env: { ...process.env, PR_AUTOPILOT_HMAC_KEY: HMAC_KEY } });
+  ok(JSON.parse(out92b.trim()).idempotent === true, 'SC-B3: 已 ack 后重跑 complete 必须幂等成功（exit 0）');
+  eq(readFileSync(led, 'utf8').trim().split('\n').length, 4, 'SC-B3: 幂等重跑不追加台账行（reserve91/actual91/reserve92/actual92 四行）');
+  // SC-B1 identity fail-closed: 篡改 manifest.owner（state 内容核对）→ 非零退出、不结算、不 ack、pending 保留
+  const st93File = join(stateDir, stateFileName('o', 'mivo-canvas', 93));
+  registerPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 93, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(join(d, 'snap-93.json'), JSON.stringify({ ...snapBase, comments: [{ id: 'cs3', body: '改身份' }] }));
+  runEngine(eng);
+  const m93 = readJson(st93File).pending_dispatch.manifest;
+  writeFileSync(receiptPath(stateDir, m93), JSON.stringify({
+    dispatch_id: m93.dispatch_id, original_head: SHA_A, candidate: cand,
+    remote: 'origin', branch: 'feat', phase: 'committed', at: new Date().toISOString()
+  }));
+  writeFileSync(join(d, 'snap-93.json'), JSON.stringify({ ...snapBase, head_sha: cand, comments: [{ id: 'z93', body: signMarker(`fixed dispatch:${m93.dispatch_id}`, HMAC_KEY) }] }));
+  // SC-B1 identity fail-closed: manifest 按文件名定位到**内容与文件名错位**的 state（数据损坏/
+  // 被换）→ 锁内 identity 核对必须拦下，不结算不 ack、pending 保留。
+  // 构造: 复制 PR93 的 state 内容到 PR96 文件名（内容仍 pr_number=93），manifest 自报 pr_number=96
+  const st96File = join(stateDir, stateFileName('o', 'mivo-canvas', 96));
+  writeFileSync(st96File, readFileSync(st93File));
+  const bad96 = { ...m93, pr_number: 96 };
+  writeFileSync(receiptPath(stateDir, bad96), JSON.stringify({
+    dispatch_id: m93.dispatch_id, original_head: SHA_A, candidate: cand,
+    remote: 'origin', branch: 'feat', phase: 'committed', at: new Date().toISOString()
+  }));
+  writeFileSync(join(d, 'snap-96.json'), JSON.stringify({ ...snapBase, head_sha: cand, comments: [{ id: 'z96', body: signMarker(`fixed dispatch:${m93.dispatch_id}`, HMAC_KEY) }] }));
+  writeFileSync(join(d, 'bad96.json'), JSON.stringify(bad96));
+  let cliFailed = false, cliErr = '';
+  try {
+    execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', join(d, 'bad96.json'), '--snapshot-cmd', snapSh + ' {owner} {repo} {pr}', '--state-dir', stateDir], { encoding: 'utf8', env: { ...process.env, PR_AUTOPILOT_HMAC_KEY: HMAC_KEY } });
+  } catch (e) { cliFailed = true; cliErr = `${e.stderr ?? ''}`; }
+  ok(cliFailed, 'SC-B1: state 内容与文件名错位必须非零退出');
+  // SC-FIX-2 (2026-08-08): settleAndAckDispatch 在 resolve 层显式拒绝 identityConflict（SC-2 冲突
+  // 接线——在使用前 fail-closed），该场景（内容身份错位）由 resolve 层先拦、不再进入锁内复核，
+  // 报错文案为 identityConflict；锁内 identityMatches 复核保留兜底 TOCTOU。行为断言（非零退出/
+  // pending 保留/台账不动）不变，文案断言兼容两种表达。
+  ok(/identity 与 state 不匹配|identityConflict/.test(cliErr), `SC-B1: 必须报 identity 不匹配或 identityConflict（不结算不 ack）: ${cliErr.slice(0, 160)}`);
+  const st93b = readJson(st93File);
+  ok(st93b.pending_dispatch?.dispatch_id === m93.dispatch_id, 'SC-B1: identity 不匹配必须保留 pending（不清 pending，引擎可重派）');
+  // 台账基线: 91(reserve+actual) + 92(reserve+actual) + 93(reserve) = 5 行；identity 失败不得追加
+  eq(readFileSync(led, 'utf8').trim().split('\n').length, 5, 'SC-B1: identity 不匹配不得追加台账行（结算未发生——锁内先校验后结算）');
+  eq(spentToday(led), 9, 'SC-B1: identity 不匹配不得改变台账（3+3+3，93 的 reserve 原样占额）');
+  // SC-B1 dispatch_id 篡改 fail-closed: 旧会话拿错 dispatch_id 的 complete → 不结算不 ack
+  const st94File = join(stateDir, stateFileName('o', 'mivo-canvas', 94));
+  registerPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 94, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(join(d, 'snap-94.json'), JSON.stringify({ ...snapBase, comments: [{ id: 'cs4', body: '换 id' }] }));
+  runEngine(eng);
+  const m94 = readJson(st94File).pending_dispatch.manifest;
+  writeFileSync(receiptPath(stateDir, m94), JSON.stringify({
+    dispatch_id: m94.dispatch_id, original_head: SHA_A, candidate: cand,
+    remote: 'origin', branch: 'feat', phase: 'committed', at: new Date().toISOString()
+  }));
+  writeFileSync(join(d, 'snap-94.json'), JSON.stringify({ ...snapBase, head_sha: cand, comments: [{ id: 'z94', body: signMarker(`fixed dispatch:${m94.dispatch_id}`, HMAC_KEY) }] }));
+  const bad94 = { ...m94, dispatch_id: 'deadbeefdeadbeef' };
+  writeFileSync(join(d, 'bad94.json'), JSON.stringify(bad94));
+  let cli94Failed = false;
+  try {
+    execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', join(d, 'bad94.json'), '--snapshot-cmd', snapSh + ' {owner} {repo} {pr}', '--state-dir', stateDir], { encoding: 'utf8', env: { ...process.env, PR_AUTOPILOT_HMAC_KEY: HMAC_KEY } });
+  } catch (e) { cli94Failed = true; }
+  ok(cli94Failed, 'SC-B1: dispatch_id 篡改必须非零退出（不结算不 ack）');
+  ok(readJson(st94File).pending_dispatch?.dispatch_id === m94.dispatch_id, 'SC-B1: dispatch_id 篡改必须保留 pending');
+  // 台账基线: 5 行（含 93 reserve）+ 94 reserve = 6 行；dispatch_id 失败不得追加
+  eq(readFileSync(led, 'utf8').trim().split('\n').length, 6, 'SC-B1: dispatch_id 篡改不得追加台账行（结算未发生）');
+  // SC-B2 旧 manifest 迁移: 旧版本派发的 manifest 无 budget 字段 → complete 从 pending 权威收口
+  const st95File = join(stateDir, stateFileName('o', 'mivo-canvas', 95));
+  registerPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 95, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(join(d, 'snap-95.json'), JSON.stringify({ ...snapBase, comments: [{ id: 'cs5', body: '旧 manifest' }] }));
+  runEngine(eng);
+  const m95 = readJson(st95File).pending_dispatch.manifest;
+  writeFileSync(receiptPath(stateDir, m95), JSON.stringify({
+    dispatch_id: m95.dispatch_id, original_head: SHA_A, candidate: cand,
+    remote: 'origin', branch: 'feat', phase: 'committed', at: new Date().toISOString()
+  }));
+  writeFileSync(join(d, 'snap-95.json'), JSON.stringify({ ...snapBase, head_sha: cand, comments: [{ id: 'z95', body: signMarker(`fixed dispatch:${m95.dispatch_id}`, HMAC_KEY) }] }));
+  // 旧形状 = 显式删除 budget 字段（0bf3c4e 之前的派发产物无此字段，基线引擎已在 manifest 携带）
+  const old95 = { ...m95 }; delete old95.budget;
+  writeFileSync(join(d, 'old95.json'), JSON.stringify(old95));
+  ok(!('budget' in readJson(join(d, 'old95.json'))), 'SC-B2: fixture 必须是明确旧形状（无 budget 字段）');
+  const out95 = execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', join(d, 'old95.json'), '--snapshot-cmd', snapSh + ' {owner} {repo} {pr}', '--state-dir', stateDir], { encoding: 'utf8', env: { ...process.env, PR_AUTOPILOT_HMAC_KEY: HMAC_KEY } });
+  ok(JSON.parse(out95.trim()).ok, 'SC-B2: 旧 manifest（无 budget）+ pending budget 必须能成功结算并 ack');
+  const acts95 = readFileSync(led, 'utf8').trim().split('\n').map(JSON.parse).filter((l) => l.kind === 'actual' && l.dispatch_id === m95.dispatch_id);
+  eq(acts95.length, 1, 'SC-B2: 账本 reserve→actual 恰好一条');
+  eq(acts95[0].cost_usd, 3, 'SC-B2: 收口金额 = pending 权威 estimate（3）');
+  ok(readJson(st95File).pending_dispatch === null, 'SC-B2: 旧 manifest 收口后 pending 清空');
+  unregisterPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 91 });
+  unregisterPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 92 });
+  unregisterPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 93 });
+  unregisterPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 94 });
+  unregisterPr({ stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 95 });
+});
+t('[2026-08-08 F5] 连续 12 次完工结算（cap=30, estimate=3, 实值 1.41）不因陈旧 reserve 顶闸；对照: 11 个未结算 reserve 必顶闸', () => {
+  const led = join(engDir, 'settle11.jsonl');
+  for (let i = 0; i < 12; i++) {
+    const b = reserveBudget({ ledgerFile: led, capUsd: 30, estimateUsd: 3, dispatchId: `s${i}` });
+    ok(b.allowed, `第 ${i + 1} 次 reserve 必须放行（陈旧 reserve 不得顶闸）: ${b.reason}`);
+    settleDispatchBudget({ ledgerFile: led, dispatchId: `s${i}`, actualUsd: 1.41 }); // 真实成本结算
+  }
+  ok(Math.abs(spentToday(led) - 12 * 1.41) < 1e-9, '台账只计 12 笔实值 actual');
+  ok(budgetCheck({ ledgerFile: led, capUsd: 30, estimateUsd: 3 }).allowed, '12 次完工后预算仍在闸内（无陈旧 reserve）');
+  // 对照（旧行为）: 10 个未结算 reserve = 30 已触顶，第 11 次 dispatch 被陈旧 reserve 顶闸
+  const led2 = join(engDir, 'stale11.jsonl');
+  for (let i = 0; i < 10; i++) {
+    const b = reserveBudget({ ledgerFile: led2, capUsd: 30, estimateUsd: 3, dispatchId: `x${i}` });
+    ok(b.allowed, `对照第 ${i + 1} 次 reserve 应放行`);
+  }
+  eq(spentToday(led2), 30, '未结算 reserve 全占额');
+  ok(!reserveBudget({ ledgerFile: led2, capUsd: 30, estimateUsd: 3, dispatchId: 'x10' }).allowed, '对照: 第 11 次 dispatch 因陈旧 reserve 必顶闸');
+  ok(!budgetCheck({ ledgerFile: led2, capUsd: 30, estimateUsd: 3 }).allowed, '对照: 预算检查必不过');
+});
+t('[2026-08-08 F5] 估算结算可被同 id 真实成本覆盖；已结算 dispatch 不再 reserve（already-settled 幂等）', () => {
+  const led = join(engDir, 'settle-overwrite.jsonl');
+  settleDispatchBudget({ ledgerFile: led, dispatchId: 'ow1', estimateUsd: 3 });
+  eq(spentToday(led), 3, '估算结算占额 3');
+  recordCost(led, { cost_usd: 1.5, kind: 'actual', dispatch_id: 'ow1', settlement: 'actual', note: 'real cost' });
+  eq(spentToday(led), 1.5, '真实成本必须同 id 覆盖估算结算');
+  // 估算结算幂等跳过: 再调 settle（estimate）不追加行
+  settleDispatchBudget({ ledgerFile: led, dispatchId: 'ow1', estimateUsd: 3 });
+  eq(readFileSync(led, 'utf8').trim().split('\n').length, 2, '重复估算结算不追加行');
+  const b = reserveBudget({ ledgerFile: led, capUsd: 30, estimateUsd: 3, dispatchId: 'ow1' });
+  ok(b.allowed && b.reason.includes('already-settled'), '已结算 dispatch 再 reserve 必须 already-settled 幂等');
+});
+t('[2026-08-08 GPT R2 SC-B4] 跨日幂等: isDispatchSettled 扫全账本按 dispatch_id 折叠，昨日结算今日重试不追加；spentToday 只聚合当日；真实成本可覆盖跨日 estimate', () => {
+  const yesterday = new Date(Date.now() - 86400000).toISOString();
+  const mk = (at, rec) => JSON.stringify({ at, ...rec }) + '\n';
+  // A: 昨日 estimate 结算 → 今日重试估算结算幂等跳过（不追加行）；昨日 actual 不占今日额度
+  const la = join(engDir, 'dayroll-estimate.jsonl');
+  appendFileSync(la, mk(yesterday, { kind: 'reserve', dispatch_id: 'x1', cost_usd: 3 }));
+  appendFileSync(la, mk(yesterday, { kind: 'actual', dispatch_id: 'x1', cost_usd: 3, settlement: 'estimate' }));
+  ok(isDispatchSettled(la, 'x1') === true, 'SC-B4: 昨日已结算 dispatch 今日 isDispatchSettled 必须仍 true（全账本折叠）');
+  const rA = settleDispatchBudget({ ledgerFile: la, dispatchId: 'x1', estimateUsd: 3 });
+  ok(rA.skipped === true, 'SC-B4: 跨日重试估算结算必须幂等跳过（不追加 actual）');
+  eq(readFileSync(la, 'utf8').trim().split('\n').length, 2, 'SC-B4: 跨日重试不追加台账行');
+  eq(spentToday(la), 0, 'SC-B4: spentToday 只聚合当日——昨日 actual 不占今日额度');
+  // B: 昨日 estimate 结算 → 今日真实成本覆盖（追加今日行，占额按实值）
+  const lb = join(engDir, 'dayroll-overwrite.jsonl');
+  appendFileSync(lb, mk(yesterday, { kind: 'reserve', dispatch_id: 'x2', cost_usd: 3 }));
+  appendFileSync(lb, mk(yesterday, { kind: 'actual', dispatch_id: 'x2', cost_usd: 3, settlement: 'estimate' }));
+  settleDispatchBudget({ ledgerFile: lb, dispatchId: 'x2', actualUsd: 1.5 });
+  eq(spentToday(lb), 1.5, 'SC-B4: 真实成本必须覆盖跨日 estimate 结算（今日实值 1.5 占额）');
+  eq(readFileSync(lb, 'utf8').trim().split('\n').length, 3, 'SC-B4: 真实成本覆盖追加今日行');
+  // C: 昨日真实成本已结算 → 今日重试 --actual 幂等跳过（次日重试不追加 actual）
+  const lc = join(engDir, 'dayroll-actual.jsonl');
+  appendFileSync(lc, mk(yesterday, { kind: 'reserve', dispatch_id: 'x3', cost_usd: 5 }));
+  appendFileSync(lc, mk(yesterday, { kind: 'actual', dispatch_id: 'x3', cost_usd: 5, settlement: 'actual' }));
+  const rC = settleDispatchBudget({ ledgerFile: lc, dispatchId: 'x3', actualUsd: 5 });
+  ok(rC.skipped === true, 'SC-B4: 次日重试 --actual 必须幂等跳过（已按真实成本结算，不追加）');
+  eq(readFileSync(lc, 'utf8').trim().split('\n').length, 2, 'SC-B4: 次日重试不追加 actual 行');
+  // D: 昨日 reserve 未结算 → 今日收口追加今日 actual（reserve 不占今日额 + 今日 actual 计入）
+  const ld = join(engDir, 'dayroll-open.jsonl');
+  appendFileSync(ld, mk(yesterday, { kind: 'reserve', dispatch_id: 'x4', cost_usd: 3 }));
+  ok(isDispatchSettled(ld, 'x4') === false, 'SC-B4: 仅昨日 reserve 未结算 → 今日仍判未结算');
+  settleDispatchBudget({ ledgerFile: ld, dispatchId: 'x4', estimateUsd: 3 });
+  eq(spentToday(ld), 3, 'SC-B4: 跨日收口 actual 计入今日（昨日 reserve 不占今日额、今日 actual 占额 3）');
+});
+t('[2026-08-08 GPT R3 SC-D1/D2] reserveBudget 跨日幂等: 昨日已结算 dispatch 今日同 id 返回 already-settled 不追加不占今日；昨日在途 reserve 今日同 id 返回 already-reserved 不追加、spent 为当日口径不计昨日、今日 cap 按日重置', () => {
+  const yesterday = new Date(Date.now() - 86400000).toISOString();
+  const mk = (at, rec) => JSON.stringify({ at, ...rec }) + '\n';
+  // D1: 昨日 reserve+actual（真实成本结算）→ 今日同 id reserveBudget → already-settled，不追加行、不占今日
+  const l1 = join(engDir, 'r3-d1-settled.jsonl');
+  appendFileSync(l1, mk(yesterday, { kind: 'reserve', dispatch_id: 'd1', cost_usd: 9 }));
+  appendFileSync(l1, mk(yesterday, { kind: 'actual', dispatch_id: 'd1', cost_usd: 9, settlement: 'actual' }));
+  const b1 = reserveBudget({ ledgerFile: l1, capUsd: 30, estimateUsd: 9, dispatchId: 'd1' });
+  ok(b1.allowed && b1.reason.includes('already-settled'), 'SC-D1: 昨日已结算 dispatch 今日同 id 必须 already-settled（不得跨日重新 reserve）');
+  eq(readFileSync(l1, 'utf8').trim().split('\n').length, 2, 'SC-D1: already-settled 不追加台账行（2 行不变）');
+  eq(b1.spent, 0, 'SC-D1: 返回 spent 为当日口径——昨日 actual 不占今日额度');
+  // 昨日结算不占今日 cap → 今日新 dispatch 仍按今日 cap 正常放行
+  ok(reserveBudget({ ledgerFile: l1, capUsd: 30, estimateUsd: 20, dispatchId: 'd1-new' }).allowed, 'SC-D1: 昨日结算不占今日 cap——新 dispatch 今日正常放行');
+  eq(spentToday(l1), 20, 'SC-D1: spentToday 只计今日（新 reserve 20，昨日 9 不计）');
+  // D2: 昨日未结算 reserve（在途）→ 今日同 id → already-reserved，不追加行；spent 当日口径不含昨日在途
+  const l2 = join(engDir, 'r3-d2-open.jsonl');
+  appendFileSync(l2, mk(yesterday, { kind: 'reserve', dispatch_id: 'd2', cost_usd: 9 }));
+  const b2 = reserveBudget({ ledgerFile: l2, capUsd: 30, estimateUsd: 9, dispatchId: 'd2' });
+  ok(b2.allowed && b2.reason.includes('already-reserved'), 'SC-D2: 昨日在途 reserve 今日同 id 必须 already-reserved（幂等不重复占额，不得悄然重新 reserve）');
+  eq(readFileSync(l2, 'utf8').trim().split('\n').length, 1, 'SC-D2: already-reserved 不追加台账行（1 行不变）');
+  eq(b2.spent, 0, 'SC-D2: 返回 spent 为当日口径——昨日在途 reserve 不计今日 spent');
+  // 今日 cap 语义: 昨日在途不占今日 cap（cap 按日重置），但今日 cap 仍生效
+  ok(reserveBudget({ ledgerFile: l2, capUsd: 30, estimateUsd: 20, dispatchId: 'd2-new' }).allowed, 'SC-D2: 昨日在途不占今日 cap——新 dispatch 今日正常放行');
+  ok(!reserveBudget({ ledgerFile: l2, capUsd: 30, estimateUsd: 20, dispatchId: 'd2-new2' }).allowed, 'SC-D2: 今日 cap 仍生效——20+20>30 必拦');
+  // 在途 reserve 未悄然释放: 今日收口结算 → actual 计入今日（20+9=29）
+  settleDispatchBudget({ ledgerFile: l2, dispatchId: 'd2', estimateUsd: 9 });
+  eq(spentToday(l2), 29, 'SC-D2: 昨日在途 reserve 收口时 actual 计入今日——未被悄然释放');
+});
 t('[审④F5] dispatch manifest 自包含: finalize/complete 命令与 state/snapshot 接线齐备且无 undefined', () => {
   writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 'k5', body: '再来反馈' }] }));
   const r = runEngine(ENG({ budget: sharedBudget }));
   eq(r.dispatched.length, 1);
   const stFile = join(engState, stateFileName('o', 'mivo-canvas', 5));
   const m = readJson(stFile).pending_dispatch.manifest;
-  for (const k of ['state_dir', 'snapshot_cmd', 'manifest_path', 'finalize_cmd', 'complete_cmd', 'original_head']) {
+  for (const k of ['state_dir', 'snapshot_cmd', 'manifest_path', 'finalize_cmd', 'complete_cmd', 'original_head', 'budget']) {
     ok(m[k], `manifest 缺 ${k}`);
   }
+  ok(m.budget?.ledger && m.budget?.estimate > 0, 'manifest.budget 必须含 ledger 与 estimate（complete 结算依据）');
   ok(!JSON.stringify(m).includes('undefined'), 'manifest 不得含 undefined');
   ok(existsSync(m.manifest_path), 'manifest 必须已落盘供会话读取');
   ackDispatch({ stateDir: engState, owner: 'o', repo: 'mivo-canvas', prNumber: 5, dispatchId: m.dispatch_id });
@@ -1105,6 +1371,225 @@ t('[审③F8-R] dispatch wrapper 四元组: 只回 session_id 拒 / 缺任一字
   ok(runW(mkTransport(JSON.stringify({ ...full, model: 'z-ai/glm-5.2', effort: 'max' })),
     { over: { EXPECT_MODEL: 'z-ai/glm-5.2', EXPECT_EFFORT: 'max' } }),
   '换一套期望值且回执相符应过');
+});
+
+// ---- T2/T3: 引擎失败可观测 + pending 超时告警（SC-2a/b · SC-3a/b/c）----
+// 每个测试用独立 tmp 目录（不与上面共享 engState 的用例互踩）；
+// 顺序 runEngine 调用模拟独立引擎进程共享同一 stateDir（runEngine 无进程内状态，
+// 每轮都是完整引擎循环，去重持久化证据 = state 文件内的标记）。
+const readJournal = (f) => existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+const markerCount = (f, m) => existsSync(f) ? (readFileSync(f, 'utf8').match(new RegExp(m, 'g')) ?? []).length : 0;
+function mkT23Eng() {
+  const dir = mkdtempSync(join(tmpdir(), 't23-'));
+  const stateDir = join(dir, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  const snapFile = join(dir, 'snap.json');
+  const journalFile = join(dir, 'journal.jsonl');
+  const notifyLog = join(dir, 'notify.log');
+  writeFileSync(snapFile, JSON.stringify(snapBase));
+  writeFileSync(join(dir, 'snap.sh'), `#!/bin/sh\ncat "${snapFile}"\n`);
+  writeFileSync(join(dir, 'dispatch-ok.sh'), `#!/bin/sh\ncat >> "${join(dir, 'dispatch.log')}"\necho "" >> "${join(dir, 'dispatch.log')}"\n`);
+  writeFileSync(join(dir, 'dispatch-fail.sh'), '#!/bin/sh\nexit 1\n');
+  writeFileSync(join(dir, 'notify.sh'), `#!/bin/sh\ncat >> "${notifyLog}"\necho "" >> "${notifyLog}"\n`);
+  writeFileSync(join(dir, 'notify-fail.sh'), '#!/bin/sh\nexit 1\n');
+  for (const f of ['snap.sh', 'dispatch-ok.sh', 'dispatch-fail.sh', 'notify.sh', 'notify-fail.sh']) execFileSync('chmod', ['+x', join(dir, f)]);
+  const eng = (over = {}) => ({
+    stateDir, leaseFile: join(dir, 'lease.json'),
+    snapshotCmd: join(dir, 'snap.sh') + ' {owner} {repo} {pr}',
+    dispatchCmd: join(dir, 'dispatch-ok.sh'),
+    journalFile,
+    feishuCmd: join(dir, 'notify.sh'), slackCmd: join(dir, 'notify.sh'),
+    hmacKey: HMAC_KEY,
+    budget: { ledger: join(dir, 'budget.jsonl'), cap: 10000, estimate: 1 },
+    repoDirs: { 'o/mivo-canvas': bizRepo },
+    ...over
+  });
+  return { dir, eng, snapFile, journalFile, notifyLog };
+}
+
+t('[T2/SC-2b] 首派连续失败: 每轮一条 dispatch-failed + attempt 恒 1 + 游标不推进 + 不留 pending', () => {
+  const d = mkT23Eng();
+  const { eng, snapFile, journalFile } = d;
+  registerPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 301, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't2a1', body: '请修' }] }));
+  const stFile = join(eng().stateDir, stateFileName('o', 'mivo-canvas', 301));
+  const failEng = eng({ dispatchCmd: join(d.dir, 'dispatch-fail.sh') });
+  for (let i = 0; i < 3; i++) runEngine(failEng);
+  const df = readJournal(journalFile).filter((r) => r.kind === 'dispatch-failed');
+  eq(df.length, 3, '连续 3 轮失败必须每轮记一条 dispatch-failed');
+  for (const r of df) {
+    eq(r.attempt, 1, '首派失败 attempt 必须恒 1（无 pending 无跨轮状态）');
+    ok(r.dispatch_id && r.error, 'dispatch-failed 必须带 dispatch_id 与 error');
+    eq(r.pr, 'o/mivo-canvas#301');
+  }
+  // 失败不消费信号 → 游标不推进（下轮仍重试 at-least-once）；首派失败不留 pending
+  ok(!(readJson(stFile).cursors?.comment_ids ?? []).includes('t2a1'), '失败轮不得推进游标');
+  ok(!readJson(stFile).pending_dispatch, '首派失败不得留下 pending_dispatch');
+  unregisterPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 301 });
+});
+
+t('[T2/SC-2b] 重派连续失败: redispatch_count 跨轮递增持久化 + 最终 stuck + redispatch-failed 绑定同 id', () => {
+  const d = mkT23Eng();
+  const { eng, snapFile, journalFile, notifyLog } = d;
+  registerPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 302, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't2b1', body: '请修' }] }));
+  const stFile = join(eng().stateDir, stateFileName('o', 'mivo-canvas', 302));
+  let r = runEngine(eng());
+  eq(r.dispatched.length, 1, '首派必须成功');
+  const origId = readJson(stFile).pending_dispatch.dispatch_id;
+  const expire = () => {
+    const st = readJson(stFile);
+    st.pending_dispatch.dispatched_at = new Date(Date.now() - 60 * 60000).toISOString();
+    writeFileSync(stFile, JSON.stringify(st));
+  };
+  const failEng = eng({ dispatchCmd: join(d.dir, 'dispatch-fail.sh') });
+  const counts = [];
+  for (let i = 0; i < 3; i++) {
+    expire();
+    r = runEngine(failEng);
+    counts.push(readJson(stFile).pending_dispatch.redispatch_count);
+  }
+  eq(counts, [1, 2, 3], 'redispatch_count 必须跨轮递增持久化（连续失败也能到达 stuck 判据）');
+  eq(r.stuck.length, 1, '连续失败必须最终触发 stuck');
+  ok(readFileSync(notifyLog, 'utf8').includes('挂死'), 'stuck 通知必须发出');
+  const rf = readJournal(journalFile).filter((x) => x.kind === 'redispatch-failed');
+  eq(rf.length, 3, '每轮失败必须记一条 redispatch-failed');
+  eq(rf.map((x) => x.attempt), [1, 2, 3], 'redispatch-failed attempt = redispatch_count+1');
+  eq(rf.map((x) => x.dispatch_id).every((id) => id === origId), true, '重派失败事件必须绑定同一 dispatch_id');
+  eq(readJson(stFile).pending_dispatch.dispatch_id, origId, '失败重派不改 id（仍待 ack）');
+  ackDispatch({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 302, dispatchId: origId });
+  unregisterPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 302 });
+});
+
+t('[T3/SC-3c] pending 超时: 首轮告警 + 第二次独立引擎运行去重不重发 + ack 后新 id 可再告 + waiting 形状', () => {
+  const d = mkT23Eng();
+  const { eng, snapFile, journalFile, notifyLog } = d;
+  const T0 = Date.now();
+  registerPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 303, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't3c1', body: '请修' }] }));
+  const stFile = join(eng().stateDir, stateFileName('o', 'mivo-canvas', 303));
+  let r = runEngine(eng({ nowMs: T0 }));
+  eq(r.dispatched.length, 1, '首派必须成功');
+  let st = readJson(stFile);
+  eq(st.pending_dispatch.first_dispatched_at, st.pending_dispatch.dispatched_at, '首派必须写入 first_dispatched_at');
+  const id1 = st.pending_dispatch.dispatch_id;
+  // 超 6 小时（默认 pendingStuckHours=6）
+  st.pending_dispatch.first_dispatched_at = new Date(T0 - 7 * 3600 * 1000).toISOString();
+  writeFileSync(stFile, JSON.stringify(st));
+  r = runEngine(eng({ nowMs: T0 }));
+  eq(markerCount(notifyLog, '等待 ack 已超'), 1, '超时必须告警一次');
+  st = readJson(stFile);
+  eq(st.pending_dispatch.pending_stuck_notified, true, '尝试发送后标记必须置位');
+  // waiting 形状
+  const w = readJournal(journalFile).filter((x) => x.kind === 'waiting' && x.dispatch_id === id1).pop();
+  ok(w, '必须记 waiting');
+  eq(w.pr, 'o/mivo-canvas#303');
+  eq(w.waiting_for, 'ack', 'waiting_for 枚举只有 ack');
+  eq(w.age_minutes, 420, 'age_minutes = now - first_dispatched_at（7h = 420min）');
+  eq(w.attempt, 1, 'attempt = redispatch_count+1（无重派 = 1）');
+  // 第二次独立引擎运行（顺序调用模拟独立进程共享 stateDir）→ 去重不重发
+  r = runEngine(eng({ nowMs: T0 }));
+  eq(markerCount(notifyLog, '等待 ack 已超'), 1, '去重持久化: 第二轮不得重发');
+  // ack 清 pending → 新反馈 → 新 dispatch id（标记在 pending_dispatch 内，天然清掉）→ 可再告
+  ok(ackDispatch({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 303, dispatchId: id1 }).ok);
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't3c1', body: '请修' }, { id: 't3c2', body: '又来了' }] }));
+  r = runEngine(eng({ nowMs: T0 }));
+  eq(r.dispatched.length, 1, 'ack 后新反馈必须重新派发');
+  st = readJson(stFile);
+  const id2 = st.pending_dispatch.dispatch_id;
+  ok(id2 !== id1, 'ack 后必须新 dispatch_id');
+  ok(!st.pending_dispatch.pending_stuck_notified, '新 pending_dispatch 必须不带旧标记');
+  st.pending_dispatch.first_dispatched_at = new Date(T0 - 7 * 3600 * 1000).toISOString();
+  writeFileSync(stFile, JSON.stringify(st));
+  r = runEngine(eng({ nowMs: T0 }));
+  eq(markerCount(notifyLog, '等待 ack 已超'), 2, '新 dispatch_id 必须可再告');
+  ackDispatch({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 303, dispatchId: id2 });
+  unregisterPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 303 });
+});
+
+t('[T3/SC-3c] 未超时（< 6h）不告警且不置标记', () => {
+  const d = mkT23Eng();
+  const { eng, snapFile, notifyLog } = d;
+  const T0 = Date.now();
+  registerPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 305, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't3e1', body: '请修' }] }));
+  const stFile = join(eng().stateDir, stateFileName('o', 'mivo-canvas', 305));
+  runEngine(eng({ nowMs: T0 }));
+  const st = readJson(stFile);
+  st.pending_dispatch.first_dispatched_at = new Date(T0 - 5 * 3600 * 1000).toISOString(); // 5h < 默认 6h
+  writeFileSync(stFile, JSON.stringify(st));
+  runEngine(eng({ nowMs: T0 }));
+  eq(markerCount(notifyLog, '等待 ack 已超'), 0, '未超时不得告警');
+  ok(readJson(stFile).pending_dispatch.pending_stuck_notified === undefined, '未超时不得置标记');
+  ackDispatch({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 305, dispatchId: readJson(stFile).pending_dispatch.dispatch_id });
+  unregisterPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 305 });
+});
+
+t('[T3/SC-3c] 旧 state 缺 first_dispatched_at: 回填后成功重派 + 年龄仍按原 dispatched_at', () => {
+  const d = mkT23Eng();
+  const { eng, snapFile, journalFile } = d;
+  const T0 = Date.now();
+  registerPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 304, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't3d1', body: '请修' }] }));
+  runEngine(eng({ nowMs: T0 })); // 首派
+  const stFile = join(eng().stateDir, stateFileName('o', 'mivo-canvas', 304));
+  const st = readJson(stFile);
+  const origDispatched = new Date(T0 - 2 * 3600 * 1000).toISOString();
+  delete st.pending_dispatch.first_dispatched_at; // 模拟旧协议 state（无该字段）
+  st.pending_dispatch.dispatched_at = origDispatched; // lease 已过期（2h > 40min）
+  writeFileSync(stFile, JSON.stringify(st));
+  const r = runEngine(eng({ nowMs: T0 })); // 重派成功
+  eq(r.redispatched.length, 1, '旧 state 缺字段也必须能正常重派');
+  const st2 = readJson(stFile);
+  eq(st2.pending_dispatch.first_dispatched_at, origDispatched, '回填必须取当时的 dispatched_at');
+  ok(st2.pending_dispatch.dispatched_at !== origDispatched, '重派必须更新 dispatched_at（first_dispatched_at 不更新）');
+  const w = readJournal(journalFile).filter((x) => x.kind === 'waiting' && x.dispatch_id === st2.pending_dispatch.dispatch_id).pop();
+  ok(w, '重派轮必须记 waiting');
+  eq(w.age_minutes, 120, '年龄必须按回填的 first_dispatched_at 计算（2h = 120min）');
+  ackDispatch({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 304, dispatchId: st2.pending_dispatch.dispatch_id });
+  unregisterPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 304 });
+});
+
+t('[T3/SC-3c] 通知命令失败: notify-error 事件在 + 标记仍置位 + 换好命令不重发（宁丢一次）', () => {
+  const d = mkT23Eng();
+  const { eng, snapFile, journalFile, notifyLog } = d;
+  const T0 = Date.now();
+  registerPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 306, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't3f1', body: '请修' }] }));
+  const stFile = join(eng().stateDir, stateFileName('o', 'mivo-canvas', 306));
+  runEngine(eng({ nowMs: T0 }));
+  const st = readJson(stFile);
+  st.pending_dispatch.first_dispatched_at = new Date(T0 - 7 * 3600 * 1000).toISOString();
+  writeFileSync(stFile, JSON.stringify(st));
+  runEngine(eng({ nowMs: T0, feishuCmd: join(d.dir, 'notify-fail.sh') })); // mivo → feishu 通道，命令失败
+  const ne = readJournal(journalFile).filter((x) => x.kind === 'notify-error');
+  ok(ne.length >= 1, '通知命令失败必须记 notify-error');
+  eq(readJson(stFile).pending_dispatch.pending_stuck_notified, true, '通知失败标记仍必须置位');
+  runEngine(eng({ nowMs: T0 })); // 换回正常通知脚本再跑一轮
+  eq(markerCount(notifyLog, '等待 ack 已超'), 0, '失败轮不重发（去重不受通知失败影响，宁丢一次不刷屏）');
+  ackDispatch({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 306, dispatchId: readJson(stFile).pending_dispatch.dispatch_id });
+  unregisterPr({ stateDir: eng().stateDir, owner: 'o', repo: 'mivo-canvas', prNumber: 306 });
+});
+
+t('[T3/SC-3c] pending-stuck 路由: cindy=silent / mivo=feishu（route 单元 + 引擎路径 silent 不碰通知）', () => {
+  eq(route('pending-stuck', { repo: 'cindy' }), 'silent');
+  eq(route('pending-stuck', { repo: 'mivo-canvas' }), 'feishu');
+  // 引擎路径: cindy PR 超时 → silent → 不产生任何通知，但标记仍置位（去重）
+  const d = mkT23Eng();
+  const { eng, snapFile, notifyLog } = d;
+  const T0 = Date.now();
+  registerPr({ stateDir: eng().stateDir, owner: 'makecindy', repo: 'cindy', prNumber: 307, branch: 'feat', pushRemote: 'origin' });
+  writeFileSync(snapFile, JSON.stringify({ ...snapBase, comments: [{ id: 't3g1', body: '请修' }] }));
+  const stFile = join(eng().stateDir, stateFileName('makecindy', 'cindy', 307));
+  runEngine(eng({ nowMs: T0 }));
+  const st = readJson(stFile);
+  st.pending_dispatch.first_dispatched_at = new Date(T0 - 7 * 3600 * 1000).toISOString();
+  writeFileSync(stFile, JSON.stringify(st));
+  runEngine(eng({ nowMs: T0 }));
+  eq(markerCount(notifyLog, '等待 ack 已超'), 0, 'cindy PR 必须 silent（不产生任何通知）');
+  eq(readJson(stFile).pending_dispatch.pending_stuck_notified, true, 'silent 分支也必须置标记（去重）');
+  ackDispatch({ stateDir: eng().stateDir, owner: 'makecindy', repo: 'cindy', prNumber: 307, dispatchId: readJson(stFile).pending_dispatch.dispatch_id });
+  unregisterPr({ stateDir: eng().stateDir, owner: 'makecindy', repo: 'cindy', prNumber: 307 });
 });
 
 // ========== 7. inbox-digest ==========
@@ -2299,6 +2784,25 @@ t('[审⑩P2-2] timeout 硬边界: push env 0/空/NaN/负/超大全拒且零副�
   // 合法边界值照常工作
   const rOk = runEngine(ENG({ budget: BUDGET(), lockTimeoutMs: 100 }));
   ok(rOk.scanned >= 0);
+});
+
+t('[2026-08-08 F6] pendingStuckHours 非法配置拒启动（字符串/NaN/Infinity/负数/0 全 fail-closed，扫描与写 lease 之前）', () => {
+  const leaseP = lease;
+  for (const bad of ['6', 'abc', NaN, Infinity, -1, 0, -0.5]) {
+    let threw = false;
+    try { runEngine(ENG({ budget: BUDGET(), pendingStuckHours: bad })); }
+    catch (e) { threw = /pendingStuckHours 非法/.test(e.message); }
+    ok(threw, `pendingStuckHours=${String(bad)} 必须拒启动`);
+  }
+  // 非法配置在写 lease / 扫描之前即抛（零副作用）: 删掉 lease 后跑非法值，lease 不得被重建
+  rmSync(leaseP, { force: true });
+  let threw0 = false;
+  try { runEngine(ENG({ budget: BUDGET(), pendingStuckHours: 0 })); } catch (e) { threw0 = /pendingStuckHours 非法/.test(e.message); }
+  ok(threw0, 'pendingStuckHours=0 必须拒启动（不支持禁用）');
+  ok(!existsSync(leaseP), '非法配置不得写 lease（在扫描/通知之前抛）');
+  // 合法值照常工作（含小数与默认 6 不被破坏）
+  ok(runEngine(ENG({ budget: BUDGET(), pendingStuckHours: 6.5 })).scanned >= 0, '合法小数必须放行');
+  ok(runEngine(ENG({ budget: BUDGET(), pendingStuckHours: 8 })).scanned >= 0, '合法整数必须放行');
 });
 
 // ========== 14. 审⑪ delta 验收 ==========
@@ -6401,6 +6905,513 @@ t('[SC-T7b-INT-3] 变异还原后回归: consensus-gate 恢复原状后，reuse 
   ], { parentArtifact: r1, repoDir: rD }).artifact;
   eq(r2bad.gate_result, 'fail', '还原后 reuse 自造 key 必须恢复 fail: ' + JSON.stringify(r2bad.fail_reasons ?? []));
   rmSync(dD, { recursive: true, force: true });
+});
+
+// ========== R3: state 文件名单射编码 + 旧命名迁移（2026-08-08 GPT R3） ==========
+console.log('\n[R3] stateFileName 单射（mame/_ vs mame/- 碰撞）+ 旧命名迁移 fail-closed（SC-S1/S2/S3/S4）');
+const r3Dir = mkdtempSync(join(tmpdir(), 'r3-'));
+const r3State = join(r3Dir, 'state');
+const r3Snap = join(r3Dir, 'snap.json');
+mkdirSync(r3State, { recursive: true });
+writeFileSync(join(r3Dir, 'snap.sh'), `#!/bin/sh\ncat "${r3Snap}"\n`);
+writeFileSync(join(r3Dir, 'dispatch-ok.sh'), `#!/bin/sh\ncat >> "${join(r3Dir, 'dispatch.log')}"\necho "" >> "${join(r3Dir, 'dispatch.log')}"\n`);
+execFileSync('chmod', ['+x', join(r3Dir, 'snap.sh')]);
+execFileSync('chmod', ['+x', join(r3Dir, 'dispatch-ok.sh')]);
+const R3 = (over = {}) => ({
+  stateDir: r3State, leaseFile: join(r3Dir, 'lease.json'),
+  snapshotCmd: join(r3Dir, 'snap.sh') + ' {owner} {repo} {pr}',
+  dispatchCmd: join(r3Dir, 'dispatch-ok.sh'),
+  journalFile: join(r3Dir, 'journal.jsonl'),
+  hmacKey: HMAC_KEY,
+  budget: { ledger: join(r3Dir, `budget-${Math.random().toString(36).slice(2)}.jsonl`), cap: 10000, estimate: 1 },
+  repoDirs: { 'mame/_': bizRepo, 'mame/-': bizRepo, 'mame/Repo': bizRepo },
+  ...over
+});
+const r3V2 = (o, r, n, branch = 'fb') => ({
+  schema_version: 'v2', owner: o, repo: r, pr_number: n,
+  branch, push_repo: null, push_remote: 'origin',
+  cursors: null, pending_dispatch: null, first_scan_ack: null, status: 'watching'
+});
+const r3Ack = (o, r, n) => {
+  const st = readJson(join(r3State, stateFileName(o, r, n)));
+  if (st.pending_dispatch) ackDispatch({ stateDir: r3State, owner: o, repo: r, prNumber: n, dispatchId: st.pending_dispatch.dispatch_id });
+};
+
+t('[R3-SC-S1] stateFileName 单射: mame/_ 与 mame/- 不同名；已允许标点两两不碰撞；round-trip 可逆；大小写归一', () => {
+  const fUnd = stateFileName('mame', '_', 7);
+  const fDash = stateFileName('mame', '-', 7);
+  ok(fUnd !== fDash, `mame/_ 与 mame/- 必须不同文件名（v2 clean 折叠碰撞修复）: ${fUnd} vs ${fDash}`);
+  const punct = ['_', '-', '.', '#', '/', 'x.y', 'a-b', 'a_b'];
+  const keys = new Set();
+  for (const p of punct) keys.add(stateFileName('mame', p, 7));
+  eq(keys.size, punct.length, `已允许标点两两不碰撞（${punct.length} 个互异）`);
+  // 可逆 round-trip（含 % 字符、大小写、点段）
+  for (const [o, r, n] of [['mame', '_', 7], ['MAME', '-', 7], ['a%b', 'c#d', 9], ['makecindy', '.github', 3], ['a_b', 'c', 1]]) {
+    const parsed = parseStateFileName(stateFileName(o, r, n));
+    eq([parsed.owner, parsed.repo, parsed.prNumber], [o.toLowerCase(), r.toLowerCase(), n], `round-trip 可逆: ${o}/${r}#${n}`);
+  }
+  // 大小写归一: Mame/Repo#7 与 mame/repo#7 同一身份同一文件（macOS case-insensitive 不互相覆盖）
+  eq(stateFileName('Mame', 'Repo', 7), stateFileName('mame', 'repo', 7), '大小写归一同一文件（GitHub identity 大小写不敏感）');
+  // 无折叠 ASCII 名与 v2 逐字一致（存量普通注册零迁移）
+  eq(stateFileName('o', 'mivo-canvas', 5), 'o__mivo-canvas__5.json', '普通 ASCII 名编码恒等（v2 兼容）');
+  // 段内无裸 `_`（__ 分隔符无歧义）
+  ok(!stateFileName('a_b', 'c', 1).split('__').slice(0, 2).some((s) => s.includes('_')), '段内不含裸 _，__ 分隔无歧义');
+});
+
+t('[R3-SC-S2] register 双仓同 PR 并存: mame/_#301 与 mame/-#301 各自注册不 already 不覆盖；engine 一轮双扫描双派发；内容回验 fail-closed', () => {
+  writeFileSync(r3Snap, JSON.stringify(snapBase));
+  const ra = registerPr({ stateDir: r3State, owner: 'mame', repo: '_', prNumber: 301, branch: 'fa', pushRemote: 'origin' });
+  const rb = registerPr({ stateDir: r3State, owner: 'mame', repo: '-', prNumber: 301, branch: 'fb', pushRemote: 'origin' });
+  ok(!ra.already && !rb.already, '两仓同 PR 必须各自新建（不得 already）');
+  ok(ra.file !== rb.file, '两仓状态文件必须不同路径');
+  ok(existsSync(ra.file) && existsSync(rb.file), '两文件同时存在（不得互相覆盖）');
+  eq(readJson(ra.file).repo, '_', 'mame/_ 状态文件内容 repo=_');
+  eq(readJson(rb.file).repo, '-', 'mame/- 状态文件内容 repo=-');
+  // engine 一轮同时扫描两文件并各自按内容回验
+  writeFileSync(r3Snap, JSON.stringify({ ...snapBase, comments: [{ id: 'q1', body: '请修' }] }));
+  const r = runEngine(R3());
+  eq(r.scanned, 2, 'engine 一轮扫描两文件');
+  eq(r.dispatched.length, 2, '双仓同 PR 各自派发');
+  eq(r.dispatched.map((x) => x.pr).sort(), ['mame/-#301', 'mame/_#301'], '派发身份各自正确');
+  // 内容回验 fail-closed: 把 mame/_ 文件内容换成 mame/- 身份 → 反查不符 → 拒绝不派发
+  const aFile = join(r3State, stateFileName('mame', '_', 301));
+  writeFileSync(aFile, JSON.stringify({ ...readJson(aFile), repo: '-' }));
+  const r2 = runEngine(R3());
+  eq(r2.dispatched.filter((x) => x.pr === 'mame/_#301').length, 0, '内容 identity 不符 → 不派发（回验 fail-closed）');
+  ok(readFileSync(join(r3Dir, 'journal.jsonl'), 'utf8').includes('state-file-rejected'), '内容不符拒绝留痕');
+  writeFileSync(aFile, JSON.stringify({ ...readJson(aFile), repo: '_' }));
+  r3Ack('mame', '_', 301); r3Ack('mame', '-', 301); // 清 pending 防污染后续用例
+});
+
+t('[R3-SC-S2] SC-FIX-1 身份校验: 一身份 legacy 预存、另一身份 registerPr/unregisterPr 不得污染/删除其记录', () => {
+  // 每场景独立 stateDir（r3State 已被本段前面测试写过 mame/_#301 等文件；场景之间也互不干扰——
+  // B1 的前提是「调用方身份无自身文件」，与场景 A 的新建文件序列互斥）
+  const fixDir = () => { const d = mkdtempSync(join(tmpdir(), 'r3-fix1-')); mkdirSync(d, { recursive: true }); return d; };
+  // 场景 A: 预置 legacy 文件（身份 mame/-#301，旧命名 mame__-__301.json）——v2 clean 折叠下
+  // 它恰是 mame/_#301 的旧名（碰撞落点）。对 mame/_#301 registerPr:
+  //   round-trip 判据只证明内容==文件名、不证明内容==调用方身份；修复前会把 mame/-#301 的
+  //   文件当 mame/_#301 的已有注册（already+migrated 且覆写接线），修复后必须识别为
+  //   「他身份文件」→ 不 already、不覆写、本身份另建新名文件。
+  const dirA = fixDir();
+  const legacyA = 'mame__-__301.json';
+  writeFileSync(join(dirA, legacyA), JSON.stringify(r3V2('mame', '-', 301)));
+  const ra = registerPr({ stateDir: dirA, owner: 'mame', repo: '_', prNumber: 301, branch: 'fa', pushRemote: 'origin' });
+  ok(ra.already === false, 'SC-FIX-1A 他身份 legacy 预存 → registerPr 不得 already（修复前误报 already:true）');
+  ok(ra.migrated === false, 'SC-FIX-1A 不得声称 migrated');
+  const legacyAState = readJson(join(dirA, legacyA));
+  eq([legacyAState.owner, legacyAState.repo, legacyAState.pr_number], ['mame', '-', 301], 'SC-FIX-1A legacy 内容未被覆写（仍属 mame/-#301）');
+  const newA = stateFileName('mame', '_', 301);
+  ok(existsSync(join(dirA, newA)), `SC-FIX-1A 本身份新建有主新命名文件: ${newA}`);
+  eq([readJson(join(dirA, newA)).owner, readJson(join(dirA, newA)).repo], ['mame', '_'], 'SC-FIX-1A 新文件内容身份=mame/_（有主，非名实不符无主文件）');
+  rmSync(dirA, { recursive: true, force: true });
+
+  // 场景 B: unregisterPr 不得删除他身份合法注册记录
+  //   B1: 独立目录只预置 mame/-#301 的 legacy → mame/_#301 unregister → 不删他身份文件
+  //   （调用方身份无自身文件，解析走 legacy 身份不符 → 不迁移 → 无文件可删）
+  const dirB = fixDir();
+  writeFileSync(join(dirB, legacyA), JSON.stringify(r3V2('mame', '-', 301)));
+  const rb1 = unregisterPr({ stateDir: dirB, owner: 'mame', repo: '_', prNumber: 301, reason: 'fixture' });
+  eq(rb1.removed, false, 'SC-FIX-1B1 他身份 legacy 预存 → unregisterPr removed:false（修复前直接 unlink 他身份文件）');
+  ok(existsSync(join(dirB, legacyA)), 'SC-FIX-1B1 legacy 记录保留（mame/-#301 未被误删）');
+  //   B2: 新名路径被 mame/_#301 内容占据（旧命名即 mame/-#301 的新名）→ mame/-#301 unregister
+  //   走 identityConflict 拒绝不删
+  writeFileSync(join(dirB, legacyA), JSON.stringify(r3V2('mame', '_', 301)));
+  const rb2 = unregisterPr({ stateDir: dirB, owner: 'mame', repo: '-', prNumber: 301, reason: 'fixture' });
+  eq(rb2.removed, false, 'SC-FIX-1B2 新名路径被 mame/_#301 内容占据 → mame/-#301 unregister 拒绝（identityConflict）');
+  ok(existsSync(join(dirB, legacyA)), 'SC-FIX-1B2 mame/_#301 的合法注册记录保留（未被他身份 unregister 删除）');
+
+  // 场景 C: 冲突拒绝报错身份与实际请求一致（不得指向他身份的在途 dispatch 误导）
+  let cMsg = null;
+  try { registerPr({ stateDir: dirB, owner: 'mame', repo: '-', prNumber: 301, branch: 'fb', pushRemote: 'origin' }); }
+  catch (e) { cMsg = e.message; }
+  ok(cMsg !== null, 'SC-FIX-1C 他身份占据本身份新名 → registerPr 抛错（fail-closed）');
+  ok(cMsg !== null && cMsg.includes('注册冲突') && cMsg.includes('mame/-#301'), 'SC-FIX-1C 报错含调用方真实身份 mame/-#301');
+  ok(cMsg !== null && !cMsg.includes('在途 dispatch'), 'SC-FIX-1C 报错不指向他身份的在途 dispatch（不误导）');
+  ok(existsSync(join(dirB, legacyA)), 'SC-FIX-1C 冲突后他身份文件原样保留（不覆写不删除）');
+  rmSync(dirB, { recursive: true, force: true });
+
+  // 场景 D（对照）: 本身份 legacy 预存 → 本身份 registerPr 正常迁移 + already（守卫不误伤）
+  const dirD = fixDir();
+  const legacyD = 'mame__-__310.json';
+  writeFileSync(join(dirD, legacyD), JSON.stringify(r3V2('mame', '_', 310)));
+  const rd = registerPr({ stateDir: dirD, owner: 'mame', repo: '_', prNumber: 310, branch: 'fa', pushRemote: 'origin' });
+  ok(rd.already, 'SC-FIX-1D 本身份 legacy 预存 → registerPr already（迁移+幂等不误伤）');
+  ok(!existsSync(join(dirD, legacyD)), 'SC-FIX-1D 本身份 legacy 已迁移（旧名不再存在）');
+  rmSync(dirD, { recursive: true, force: true });
+});
+
+t('[R3-SC-S2] SC-FIX-1F unregisterPr 锁内身份复核: resolve→lock 窗口换入他身份文件（含在途 pending_dispatch）→ 拒绝且他身份文件原样保留', () => {
+  // 隔离复现（SC-2 实测）: unregisterPr 在 resolveStateFile 之后、withLock 内的 doIt() 在
+  // unlinkSync 前没有 identityMatches 复核，是四个共用调用方（register/ack/finalize/unregister）
+  // 中唯一缺锁内复核的变更入口。主进程先 acquireLock 持锁 → 子进程 unregisterPr resolve
+  // 通过（读到本身份 mame/_#301）→ 阻塞在 acquireLock → 主进程在锁外窗口把文件内容换成
+  // 他身份 mame/-#301（含在途 pending_dispatch）→ 释放锁 → 子进程 doIt 直接 unlinkSync。
+  // 修复前: 返回 {removed:true} 且他身份文件（含 pending）被物理删除；
+  // 修复后: 锁内 identityMatches 复核失败 → {removed:false}，文件/pending 原样保留。
+  const dir = mkdtempSync(join(tmpdir(), 'r3-toc-'));
+  const selfFile = join(dir, stateFileName('mame', '_', 301));
+  writeFileSync(selfFile, JSON.stringify(r3V2('mame', '_', 301)));
+  const lockPath = `${selfFile}.lock`;
+  const release = acquireLock(lockPath); // 主进程先持锁（模拟 unregisterPr 正在执行的锁窗口）
+  const sig = join(dir, 'resolved.sig');
+  const out = join(dir, 'out.json');
+  const childSrc = `
+    const fs = require('fs');
+    const { unregisterPr, resolveStateFile } = require(${JSON.stringify(join(S, 'pr-watch/register.mjs'))});
+    const r = resolveStateFile({ stateDir: process.env.SD, owner: 'mame', repo: '_', prNumber: 301 });
+    fs.writeFileSync(process.env.SIG, JSON.stringify({ file: r.file, identityConflict: r.identityConflict }));
+    const res = unregisterPr({ stateDir: process.env.SD, owner: 'mame', repo: '_', prNumber: 301, reason: 'fixture' });
+    fs.writeFileSync(process.env.OUT, JSON.stringify(res));
+  `;
+  const child = spawn(process.execPath, ['-e', childSrc], {
+    env: { ...process.env, SD: dir, SIG: sig, OUT: out },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  // 等子进程完成 resolve（信号文件出现 = resolve 已通过、正阻塞在 acquireLock）
+  const waitFor = (p, ms) => { const d = Date.now() + ms; while (!existsSync(p) && Date.now() < d) execFileSync('sleep', ['0.02']); return existsSync(p); };
+  const sigSeen = waitFor(sig, 5000);
+  ok(sigSeen, 'SC-FIX-1F 子进程 resolve 信号出现（已阻塞在锁）');
+  if (sigSeen) {
+    const sigInfo = JSON.parse(readFileSync(sig, 'utf8'));
+    ok(sigInfo.identityConflict !== true, 'SC-FIX-1F resolve 阶段读到本身份（非 conflict，窗口成立）');
+    // 锁外窗口换入他身份文件（含在途 pending_dispatch）
+    writeFileSync(selfFile, JSON.stringify({
+      ...r3V2('mame', '-', 301, 'fb'),
+      pending_dispatch: { dispatch_id: 'd1', budget: { ledger: join(dir, 'b.jsonl'), estimate: 1 }, cursors_next: null }
+    }));
+  }
+  release(); // 释放锁 → 子进程 doIt
+  const outSeen = waitFor(out, 5000);
+  ok(outSeen, 'SC-FIX-1F 子进程完成输出');
+  if (outSeen) {
+    const res = JSON.parse(readFileSync(out, 'utf8'));
+    eq(res.removed, false, 'SC-FIX-1F 锁内复核失败 → removed:false（修复前 removed:true 物理删除他身份文件）');
+  }
+  const heFile = selfFile;
+  ok(existsSync(heFile), 'SC-FIX-1F 他身份文件未被物理删除（原样保留）');
+  if (existsSync(heFile)) {
+    const he = readJson(heFile);
+    eq([he.owner, he.repo, he.pr_number], ['mame', '-', 301], 'SC-FIX-1F 文件内容身份仍是他身份 mame/-#301');
+    ok(he.pending_dispatch !== null, 'SC-FIX-1F 他身份在途 pending_dispatch 原样保留（未被清空）');
+  }
+  try { child.kill(); } catch { /* 已退出 */ }
+  rmSync(dir, { recursive: true, force: true });
+});
+
+t('[R3-SC-S2] SC-FIX-1C checkReceipt identityConflict: state=null 不携带他身份注册详情、无误导性要素④', () => {
+  // 预置 mame/-#301 请求路径被 mame/_#301 内容占据（v2 clean 折叠碰撞落点:
+  // mame/_ 的旧名恰是 mame/- 的新名）。修复前 checkReceipt 读取该他身份文件并返回其
+  // branch/push_repo/push_remote/registered_by（state leak），要素④还用他身份文件的
+  // first_scan_ack 判定本 PR（误判）。
+  const dir = mkdtempSync(join(tmpdir(), 'r3-rec-'));
+  const heFile = join(dir, stateFileName('mame', '-', 301));
+  writeFileSync(heFile, JSON.stringify(r3V2('mame', '_', 301, 'fb')));
+  const lease = join(dir, 'lease.json');
+  writeFileSync(lease, JSON.stringify({ last_success: new Date().toISOString() }));
+  const rc = checkReceipt({ stateDir: dir, owner: 'mame', repo: '-', prNumber: 301, leaseFile: lease, scheduleCheckCmd: ['echo', 'active'] });
+  ok(!rc.ok, '冲突路径 receipt ok=false（fail-closed）');
+  ok(rc.missing.some((m) => m.includes('要素①')), '冲突路径缺要素①（本身份无合法注册）');
+  ok(!rc.missing.some((m) => m.includes('要素④')), '冲突路径不产生基于他身份 first_scan_ack 的要素④消息');
+  eq(rc.state, null, '冲突路径返回 state=null（不携带他身份注册详情）');
+  // 对照: 他身份文件 first_scan_ack 已回写 → 仍不得读取/判定（state 恒 null、无要素④）
+  writeFileSync(heFile, JSON.stringify({ ...r3V2('mame', '_', 301, 'fb'), first_scan_ack: new Date().toISOString() }));
+  const rc2 = checkReceipt({ stateDir: dir, owner: 'mame', repo: '-', prNumber: 301, leaseFile: lease, scheduleCheckCmd: ['echo', 'active'] });
+  eq(rc2.state, null, '他身份 first_scan_ack 已回写 → 仍不读他身份文件（state=null）');
+  ok(!rc2.missing.some((m) => m.includes('要素④')), '他身份 first_scan_ack 已回写 → 无要素④消息');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+t('[R3-SC-S2] SC-FIX-1D 消费方 identityConflict 拒绝: ack/cancel/settle 不清空他身份 pending', () => {
+  // 隔离复现（SC-2）: legacy 路径 mame__-__301.json 内容身份为 mame/_#301，调用
+  // ackDispatch(owner=mame, repo=-, pr=301, dispatchId=d1) 修复前按 dispatch_id 命中
+  // 他身份 pending → 返回 {ok:true} 并清空他身份 pending_dispatch。修复后必须全部拒绝。
+  const dir = mkdtempSync(join(tmpdir(), 'r3-cons-'));
+  const heFile = join(dir, stateFileName('mame', '-', 301));
+  const heState = {
+    ...r3V2('mame', '_', 301, 'fb'),
+    pending_dispatch: { dispatch_id: 'd1', budget: { ledger: join(dir, 'b.jsonl'), estimate: 1 }, cursors_next: null }
+  };
+  writeFileSync(heFile, JSON.stringify(heState));
+  const a1 = ackDispatch({ stateDir: dir, owner: 'mame', repo: '-', prNumber: 301, dispatchId: 'd1' });
+  ok(a1.ok === false, 'ackDispatch identityConflict → 拒绝（不按 dispatch_id 放行他身份状态）');
+  ok(a1.reason.includes('identityConflict'), 'ackDispatch 拒绝 reason 指向 identityConflict（resolved 层显式拒绝，反向变异可鉴别）');
+  ok(readJson(heFile).pending_dispatch !== null, 'ackDispatch 拒绝后他身份 pending 原样保留（未清空）');
+  const c1 = cancelDispatch({ stateDir: dir, owner: 'mame', repo: '-', prNumber: 301, dispatchId: 'd1' });
+  ok(c1.ok === false, 'cancelDispatch identityConflict → 拒绝');
+  ok(c1.reason.includes('identityConflict'), 'cancelDispatch 拒绝 reason 指向 identityConflict');
+  ok(readJson(heFile).pending_dispatch !== null, 'cancelDispatch 拒绝后他身份 pending 原样保留');
+  const s1 = settleAndAckDispatch({ stateDir: dir, owner: 'mame', repo: '-', prNumber: 301, dispatchId: 'd1' });
+  ok(s1.ok === false, 'settleAndAckDispatch identityConflict → 拒绝（不结算不 ack）');
+  ok(s1.reason.includes('identityConflict'), 'settleAndAckDispatch 拒绝 reason 指向 identityConflict');
+  ok(readJson(heFile).pending_dispatch !== null, 'settleAndAckDispatch 拒绝后他身份 pending 原样保留');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+t('[R3-SC-S2] SC-FIX-1E finalize 消费方 identityConflict 拒绝: 不按 dispatch_id 放行他身份状态', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'r3-fin-'));
+  const heFile = join(dir, stateFileName('mame', '-', 301));
+  writeFileSync(heFile, JSON.stringify({
+    ...r3V2('mame', '_', 301, 'fb'),
+    pending_dispatch: { dispatch_id: 'd1', budget: { ledger: join(dir, 'b.jsonl'), estimate: 1 }, cursors_next: null }
+  }));
+  const mf = join(dir, 'manifest.json');
+  writeFileSync(mf, JSON.stringify({
+    owner: 'mame', repo: '-', pr_number: 301, branch: 'fb',
+    original_head: HEAD, dispatch_id: 'd1', remote: 'origin'
+  }));
+  const snapSh = join(dir, 'snap.sh');
+  writeFileSync(snapSh, `#!/bin/sh\necho '{"state":"open","head_sha":"${HEAD}"}'\n`);
+  execFileSync('chmod', ['+x', snapSh]);
+  const r = spawnSync(process.execPath, [join(S, 'pr-watch/finalize.mjs'), '--repo-dir', repo, '--manifest', mf, '--snapshot-cmd', snapSh, '--state-dir', dir], { encoding: 'utf8' });
+  ok(r.status === 1, 'finalize identityConflict → exit 1（fail-closed，不 push）');
+  ok(r.stderr.includes('identityConflict'), 'finalize stderr 指向 identityConflict 占用');
+  ok(readJson(heFile).pending_dispatch !== null, 'finalize 拒绝后他身份 pending 原样保留');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+t('[R3-SC-S2] 大小写归一 register 幂等: Mame/_#307 与 mame/_#307 同一文件 already；mame/-#307 独立', () => {
+  const r1 = registerPr({ stateDir: r3State, owner: 'Mame', repo: '_', prNumber: 307, branch: 'fa', pushRemote: 'origin' });
+  ok(!r1.already, '首注册新建');
+  const r2 = registerPr({ stateDir: r3State, owner: 'mame', repo: '_', prNumber: 307, branch: 'fa', pushRemote: 'origin' });
+  ok(r2.already, '大小写变体同一 GitHub 身份 → already 幂等');
+  eq(r1.file, r2.file, '同一文件（大小写归一）');
+  const r3 = registerPr({ stateDir: r3State, owner: 'mame', repo: '-', prNumber: 307, branch: 'fc', pushRemote: 'origin' });
+  ok(!r3.already && r3.file !== r2.file, 'mame/-#307 与 mame/_#307 不同身份独立文件');
+});
+
+t('[R3-SC-S3] 旧命名迁移: 含折叠字符的 v2 注册被 engine 扫描前原子迁移 + 内容保留 + 正常派发', () => {
+  const legacyName = 'mame__-__302.json'; // v2 clean: mame/_#302
+  writeFileSync(join(r3State, legacyName), JSON.stringify(r3V2('mame', '_', 302)));
+  writeFileSync(r3Snap, JSON.stringify({ ...snapBase, comments: [{ id: 'q2', body: '请修' }] }));
+  const r = runEngine(R3());
+  ok(!existsSync(join(r3State, legacyName)), '旧命名文件已迁移（旧名不再存在）');
+  const newName = stateFileName('mame', '_', 302);
+  eq(newName, 'mame__%5F__302.json', 'mame/_ 的 v3 文件名');
+  ok(existsSync(join(r3State, newName)), `迁移后新命名文件存在: ${newName}`);
+  const migrated = readJson(join(r3State, newName));
+  eq([migrated.owner, migrated.repo, migrated.pr_number], ['mame', '_', 302], '迁移内容保留原始身份（repo 未折叠）');
+  eq(r.dispatched.some((x) => x.pr === 'mame/_#302'), true, '迁移后该 PR 正常派发（不静默漏扫）');
+  ok(readFileSync(join(r3Dir, 'journal.jsonl'), 'utf8').includes('state-file-migrated'), 'journal 留痕 state-file-migrated');
+  r3Ack('mame', '_', 302);
+});
+
+t('[R3-SC-S3] 迁移拒绝 fail-closed: 名实不符垃圾不迁移；迁移目标被不同身份占用 → 冲突拒绝 + 人工恢复提示', () => {
+  // 名实不符垃圾: 旧名 mame__-__303.json 内容身份 repo=x（legacy round-trip 是 mame-x，≠ 文件名）
+  const badName = 'mame__-__303.json';
+  writeFileSync(join(r3State, badName), JSON.stringify(r3V2('mame', 'x', 303)));
+  const r = runEngine(R3());
+  ok(existsSync(join(r3State, badName)), '名实不符垃圾不迁移（原样保留待人工核对）');
+  eq(r.dispatched.some((x) => x.pr === 'mame/x#303'), false, '名实不符不得按内容派发');
+  ok(readFileSync(join(r3Dir, 'journal.jsonl'), 'utf8').includes('state-file-rejected'), '拒绝留痕 state-file-rejected');
+  // 真冲突: 旧名 mame__-__304.json（内容 mame/_#304）迁移目标 mame__%5F__304.json 已被不同身份（mame/-）占用
+  writeFileSync(join(r3State, stateFileName('mame', '_', 304)), JSON.stringify(r3V2('mame', '-', 304, 'fc')));
+  writeFileSync(join(r3State, 'mame__-__304.json'), JSON.stringify(r3V2('mame', '_', 304)));
+  const r2 = runEngine(R3());
+  ok(existsSync(join(r3State, 'mame__-__304.json')), '冲突旧文件保留未动（不静默覆盖）');
+  ok(existsSync(join(r3State, stateFileName('mame', '_', 304))), '占用方文件保留未动');
+  const j2 = readFileSync(join(r3Dir, 'journal.jsonl'), 'utf8');
+  ok(j2.includes('迁移冲突'), '冲突拒绝留痕（含人工恢复提示）');
+  for (const f of [badName, 'mame__-__304.json']) execFileSync('rm', ['-f', join(r3State, f)]);
+});
+
+t('[R3-SC-S3] 迁移合并: 旧名文件与新名文件同一身份（大小写差异残留）→ 删旧合并 + journal 留痕', () => {
+  writeFileSync(join(r3State, stateFileName('mame', '_', 305)), JSON.stringify(r3V2('mame', '_', 305)));
+  const oldUp = 'Mame__-__305.json'; // 大写 owner 的旧命名（legacy clean 保留大小写）
+  writeFileSync(join(r3State, oldUp), JSON.stringify(r3V2('Mame', '_', 305)));
+  const r = runEngine(R3());
+  ok(!existsSync(join(r3State, oldUp)), '同一身份重复 → 旧文件已合并删除');
+  ok(existsSync(join(r3State, stateFileName('mame', '_', 305))), '新名文件保留');
+  ok(readFileSync(join(r3Dir, 'journal.jsonl'), 'utf8').includes('state-file-merged'), '合并留痕 state-file-merged');
+});
+
+t('[R3-SC-S3] register 触发迁移: 旧命名文件被 registerPr 解析迁移 + already 幂等；不同身份独立注册', () => {
+  const legacyName = 'mame__-__306.json';
+  writeFileSync(join(r3State, legacyName), JSON.stringify(r3V2('mame', '_', 306)));
+  const r = registerPr({ stateDir: r3State, owner: 'mame', repo: '_', prNumber: 306, branch: 'fb', pushRemote: 'origin' });
+  ok(r.already, '旧文件迁移后 register 幂等 already（同一身份）');
+  ok(!existsSync(join(r3State, legacyName)), 'register 路径旧名已迁移');
+  ok(existsSync(join(r3State, stateFileName('mame', '_', 306))), 'register 路径新名存在');
+  const r2 = registerPr({ stateDir: r3State, owner: 'mame', repo: '-', prNumber: 306, branch: 'fc', pushRemote: 'origin' });
+  ok(!r2.already && r2.file !== r.file, 'mame/-#306 与 mame/_#306 独立（不得 already/覆盖）');
+  eq(r2.file, join(r3State, 'mame__-__306.json'), 'mame/- 的新名文件');
+});
+
+t('[R3-SC-S2] receipt 路径同源: 旧命名 receipt 随 manifest dispatch_id 原子迁移；dispatch 不符不迁移', () => {
+  const manifest = { owner: 'mame', repo: '_', pr_number: 308, dispatch_id: 'rec-abc-123', branch: 'fb', remote: 'origin', original_head: SHA_A };
+  const legacyReceipt = `receipt-${legacyStateFileName('mame', '_', 308)}`;
+  writeFileSync(join(r3State, legacyReceipt), JSON.stringify({
+    phase: 'committed', dispatch_id: 'rec-abc-123', original_head: SHA_A,
+    candidate: SHA_B, remote: 'origin', branch: 'fb', at: new Date().toISOString()
+  }));
+  const rp = receiptPath(r3State, manifest);
+  eq(rp, join(r3State, `receipt-${stateFileName('mame', '_', 308)}`), 'receipt 迁移到新命名路径');
+  ok(!existsSync(join(r3State, legacyReceipt)), '旧 receipt 已迁移');
+  eq(readJson(rp).dispatch_id, 'rec-abc-123', 'receipt 内容保留（recoverFromReceipt 全字段绑定不变）');
+  // dispatch 不符 → 不迁移（fail-closed: 不猜身份）
+  const legacyReceipt2 = `receipt-${legacyStateFileName('mame', '_', 309)}`;
+  writeFileSync(join(r3State, legacyReceipt2), JSON.stringify({
+    phase: 'intent', dispatch_id: 'rec-other', original_head: SHA_A,
+    candidate: SHA_B, remote: 'origin', branch: 'fb', at: new Date().toISOString()
+  }));
+  const rp2 = receiptPath(r3State, { ...manifest, pr_number: 309, dispatch_id: 'rec-x' });
+  ok(existsSync(join(r3State, legacyReceipt2)), 'dispatch 不符 → 旧 receipt 不迁移');
+  eq(rp2, join(r3State, `receipt-${stateFileName('mame', '_', 309)}`), '返回新名（complete 自然失败留痕）');
+  for (const f of [legacyReceipt2]) execFileSync('rm', ['-f', join(r3State, f)]);
+});
+
+t('[R3-SC-S4] 目录级迁移汇总: migrateAllLegacyStateFiles 统计 migrated/rejected', () => {
+  writeFileSync(join(r3State, 'mame__-__401.json'), JSON.stringify(r3V2('mame', '_', 401)));
+  writeFileSync(join(r3State, 'mame__-__402.json'), JSON.stringify(r3V2('mame', 'x', 402)));
+  const m = migrateAllLegacyStateFiles(r3State, join(r3Dir, 'journal.jsonl'));
+  ok(m.migrated >= 1, `迁移统计 migrated>=1（got ${m.migrated}）`);
+  ok(m.rejected >= 1, `拒绝统计 rejected>=1（got ${m.rejected}）`);
+  ok(existsSync(join(r3State, 'mame__%5F__401.json')), 'mame/_#401 已迁移到新名');
+  for (const f of ['mame__-__401.json', 'mame__-__402.json']) execFileSync('rm', ['-f', join(r3State, f)]);
+});
+
+// ========== R4: receipt 迁移 TOCTOU 修复（2026-08-08 GPT R4 finding） ==========
+// GPT R4 唯一 finding: legacy receipt 迁移的「检查 canonical → rename」在锁外两步执行，
+// 窗口期另一进程写入 canonical 后 renameSync 静默覆盖新 receipt。修复 = 迁移并入
+// per-state 锁内（receiptPathLocked 锁内 helper + receiptPath 锁外公共 API 分层），
+// 锁内复核 canonical 目标：同 dispatch 幂等、mismatch 显式冲突两文件保留、调用方 fail-closed。
+// SC-RC1/RC2/RC3 由下面三条 t 覆盖；反向变异（无条件 rename）时 SC-RC1 第一条断言必须红。
+console.log('\n[R4] legacy receipt 迁移 TOCTOU: 锁内复核 canonical + 显式冲突 fail-closed（SC-RC1/RC2/RC3）');
+
+t('[R4-SC-RC1] TOCTOU 交错: A 读 legacy D1 后 B 写 canonical D2 → A 迁移不得覆盖 D2（显式冲突、两文件保留）；complete D2 能读 canonical D2', () => {
+  const idA = 'rc-a-111', idB = 'rc-b-222';
+  const candB = 'c'.repeat(40);
+  const mD1 = { owner: 'mame', repo: '_', pr_number: 501, dispatch_id: idA, branch: 'f1', remote: 'origin', original_head: SHA_A };
+  const mD2 = { owner: 'mame', repo: '_', pr_number: 501, dispatch_id: idB, branch: 'f2', remote: 'origin', original_head: SHA_B };
+  const legR = `receipt-${legacyStateFileName('mame', '_', 501)}`;
+  const canR = `receipt-${stateFileName('mame', '_', 501)}`;
+  // A 的迁移前状态: legacy D1 已落盘且 dispatch 校验通过（A 已读过它）
+  writeFileSync(join(r3State, legR), JSON.stringify({
+    phase: 'committed', dispatch_id: idA, original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  // B 在 A 检查之后、A rename 之前写入 canonical D2（窗口期交错——模拟并发写者已落盘新 receipt）
+  writeFileSync(join(r3State, canR), JSON.stringify({
+    phase: 'committed', dispatch_id: idB, original_head: SHA_B, candidate: candB,
+    remote: 'origin', branch: 'f2', at: new Date().toISOString()
+  }));
+  // A 迁移: 锁内复核 canonical 已存在且属其他 dispatch → 显式冲突，绝不 rename 覆盖
+  let conflict = '';
+  try { receiptPath(r3State, mD1); } catch (e) { conflict = e.message; }
+  ok(conflict.includes('receipt 迁移冲突'), `A 迁移必须显式冲突而非覆盖（got: ${conflict.slice(0, 140)}）`);
+  eq(readJson(join(r3State, canR)).dispatch_id, idB, 'canonical D2 未被覆盖（内容原样）');
+  ok(existsSync(join(r3State, legR)), 'legacy D1 保留（两文件并存）');
+  // complete D2 能读 canonical D2 且收口检查通过（同 dispatch 幂等命中 canonical）
+  const rpD2 = receiptPath(r3State, mD2);
+  eq(rpD2, join(r3State, canR), 'D2 解析命中 canonical');
+  const snapD2 = { state: 'open', head_sha: candB, comments: [{ id: 'rc-c1', body: signMarker(`done dispatch:${idB}`, HMAC_KEY) }] };
+  const resD2 = checkCompletion({ manifest: mD2, snapshot: snapD2, receipt: readJson(rpD2), hmacKey: HMAC_KEY });
+  ok(resD2.ok, `complete D2 收口检查必须通过: ${(resD2.missing ?? []).join('; ')}`);
+  for (const f of [legR, canR]) execFileSync('rm', ['-f', join(r3State, f)]);
+});
+
+t('[R4-SC-RC2] 正常迁移成功 + canonical 同 D1 已存在幂等（legacy 保留不删——显式策略）', () => {
+  // ① 正常 legacy D1 → canonical 迁移仍成功
+  const m502 = { owner: 'mame', repo: '_', pr_number: 502, dispatch_id: 'rc-502', branch: 'f1', remote: 'origin', original_head: SHA_A };
+  const leg502 = `receipt-${legacyStateFileName('mame', '_', 502)}`;
+  writeFileSync(join(r3State, leg502), JSON.stringify({
+    phase: 'committed', dispatch_id: 'rc-502', original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  const rp502 = receiptPath(r3State, m502);
+  eq(rp502, join(r3State, `receipt-${stateFileName('mame', '_', 502)}`), '正常迁移到 canonical 路径');
+  ok(!existsSync(join(r3State, leg502)), '旧名已迁移消失');
+  eq(readJson(rp502).dispatch_id, 'rc-502', '迁移内容保留（recoverFromReceipt 全字段绑定不变）');
+  // ② canonical 同 D1 已存在 → 幂等: 不迁移、不抛错、canonical 保留（legacy 保留不删）
+  const m503 = { owner: 'mame', repo: '_', pr_number: 503, dispatch_id: 'rc-503', branch: 'f1', remote: 'origin', original_head: SHA_A };
+  const can503 = join(r3State, `receipt-${stateFileName('mame', '_', 503)}`);
+  const leg503 = join(r3State, `receipt-${legacyStateFileName('mame', '_', 503)}`);
+  writeFileSync(can503, JSON.stringify({
+    phase: 'committed', dispatch_id: 'rc-503', original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  writeFileSync(leg503, JSON.stringify({
+    phase: 'committed', dispatch_id: 'rc-503', original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  const rp503 = receiptPath(r3State, m503); // 不得抛
+  eq(rp503, can503, '同 dispatch → 命中 canonical（幂等视为已迁移）');
+  eq(readJson(can503).dispatch_id, 'rc-503', 'canonical 内容保留');
+  ok(existsSync(leg503), 'legacy 保留不删（显式策略: 双保险不丢数据）');
+  for (const f of [leg503, can503]) execFileSync('rm', ['-f', f]);
+});
+
+t('[R4-SC-RC2] canonical mismatch 显式冲突 fail-closed: complete CLI 非零退出、不结算不 ack、两文件保留', () => {
+  const idA = 'rc-a-601', idB = 'rc-b-602';
+  const candB = 'c'.repeat(40);
+  const m601 = { owner: 'mame', repo: '_', pr_number: 601, dispatch_id: idA, branch: 'f1', remote: 'origin', original_head: SHA_A };
+  const legR = `receipt-${legacyStateFileName('mame', '_', 601)}`;
+  const canR = `receipt-${stateFileName('mame', '_', 601)}`;
+  writeFileSync(join(r3State, legR), JSON.stringify({
+    phase: 'committed', dispatch_id: idA, original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  writeFileSync(join(r3State, canR), JSON.stringify({
+    phase: 'committed', dispatch_id: idB, original_head: SHA_B, candidate: candB,
+    remote: 'origin', branch: 'f2', at: new Date().toISOString()
+  }));
+  const mf = join(r3Dir, 'rc-m601.json'); writeFileSync(mf, JSON.stringify(m601));
+  const snapF = join(r3Dir, 'rc-snap601.sh');
+  writeFileSync(snapF, `#!/bin/sh\necho '{"state":"open","head_sha":"${SHA_B}","comments":[]}'\n`);
+  execFileSync('chmod', ['+x', snapF]);
+  let out = '', failed = false;
+  try { out = execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', mf, '--snapshot-cmd', snapF, '--state-dir', r3State], { encoding: 'utf8', stdio: 'pipe' }); }
+  catch (e) { failed = true; out = `${e.stdout ?? ''}${e.stderr ?? ''}`; }
+  ok(failed, '冲突状态下 complete 必须非零退出（fail-closed）');
+  ok(out.includes('receipt 迁移冲突'), `complete 必须显式报冲突: ${out.slice(0, 160)}`);
+  eq(readJson(join(r3State, canR)).dispatch_id, idB, 'canonical 保留未动');
+  ok(existsSync(join(r3State, legR)), 'legacy 保留未动');
+  for (const f of [legR, canR, mf, snapF]) execFileSync('rm', ['-f', f]);
+});
+
+t('[R4-SC-RC3] 锁内 helper 分层: withLock(state 锁) 内调 receiptPathLocked 迁移无嵌套死锁（公共 API 会自锁）', () => {
+  const m504 = { owner: 'mame', repo: '_', pr_number: 504, dispatch_id: 'rc-504', branch: 'f1', remote: 'origin', original_head: SHA_A };
+  const leg504 = `receipt-${legacyStateFileName('mame', '_', 504)}`;
+  writeFileSync(join(r3State, leg504), JSON.stringify({
+    phase: 'committed', dispatch_id: 'rc-504', original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  // 模拟 finalize main: 持同一把 per-state 锁后调 Locked helper（若错用公共 API 会嵌套自锁）
+  const lockPath = join(r3State, `${stateFileName('mame', '_', 504)}.lock`);
+  let rpInLock = null;
+  withLock(lockPath, () => { rpInLock = receiptPathLocked(r3State, m504); }, { timeoutMs: 5000 });
+  eq(rpInLock, join(r3State, `receipt-${stateFileName('mame', '_', 504)}`), '锁内迁移成功（无死锁）');
+  ok(!existsSync(join(r3State, leg504)), '锁内迁移后旧名消失');
+  eq(readJson(rpInLock).dispatch_id, 'rc-504', '内容保留');
+});
+
+t('[R4-SC-RC3] cancel 锁内只读核对 legacy receipt 无死锁: 意图 receipt 拦取消；错 dispatch 正常取消', () => {
+  const st701 = join(r3State, stateFileName('mame', '_', 701));
+  const led701 = join(r3Dir, 'rc-ledger-701.jsonl');
+  writeFileSync(led701, '');
+  const mkState = (id) => ({
+    schema_version: 'v2', owner: 'mame', repo: '_', pr_number: 701, branch: 'f1',
+    push_repo: null, push_remote: 'origin', cursors: null, first_scan_ack: null, status: 'fixing',
+    pending_dispatch: { dispatch_id: id, canceling: false, cursors_next: null, dispatched_at: new Date().toISOString(), budget: { ledger: led701, cap: 100, estimate: 1 } }
+  });
+  writeFileSync(st701, JSON.stringify(mkState('rc-c-701')));
+  // legacy intent receipt（旧命名会话遗留）: canonical 缺失 → 锁内只读核对必须命中 legacy 并拒取消
+  const leg701 = `receipt-${legacyStateFileName('mame', '_', 701)}`;
+  writeFileSync(join(r3State, leg701), JSON.stringify({
+    phase: 'intent', dispatch_id: 'rc-c-701', original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  const rcRefuse = cancelDispatch({ stateDir: r3State, owner: 'mame', repo: '_', prNumber: 701, dispatchId: 'rc-c-701', budgetLedger: led701 });
+  ok(!rcRefuse.ok && /intent receipt/.test(rcRefuse.reason), `legacy intent receipt 必须拦下取消（锁内只读命中 legacy）: ${rcRefuse.reason}`);
+  ok(readJson(st701).pending_dispatch, '拒取消时 pending 原样');
+  // 错 dispatch 的 legacy receipt → 只读核对不命中 → 正常取消（release + 清 pending + 升 generation）
+  writeFileSync(join(r3State, leg701), JSON.stringify({
+    phase: 'intent', dispatch_id: 'rc-other', original_head: SHA_A, candidate: SHA_B,
+    remote: 'origin', branch: 'f1', at: new Date().toISOString()
+  }));
+  const rcOk = cancelDispatch({ stateDir: r3State, owner: 'mame', repo: '_', prNumber: 701, dispatchId: 'rc-c-701', budgetLedger: led701 });
+  ok(rcOk.ok, `错 dispatch receipt 不拦取消（正常取消）: ${rcOk.reason}`);
+  ok(!readJson(st701).pending_dispatch, '取消完成清 pending');
+  for (const f of [leg701, st701]) execFileSync('rm', ['-f', f]);
 });
 
 // ========== 汇总 + SKIPPED ==========

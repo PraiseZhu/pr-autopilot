@@ -5,16 +5,29 @@ import { existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, dirname, resolve as resolvePath } from 'node:path';
 import { readJson, writeJsonAtomic, parseArgs, fail, nowIso, isMain} from '../lib/common.mjs';
 import { withLock } from '../lib/state-lock.mjs';
-import { stateFileName } from './register.mjs';
-import { releaseReserve } from './budget.mjs';
-import { receiptPath } from './finalize.mjs';
+import { resolveStateFile, identityMatches } from './register.mjs';
+import { releaseReserve, settleDispatchBudget } from './budget.mjs';
+import { receiptPathLocked } from './finalize.mjs';
 
 // 审③-F14: 读改写全程持 per-key 锁（与 engine 同一把），防并发丢更新/复活 pending
 export function ackDispatch({ stateDir, owner, repo, prNumber, dispatchId, journalFile }) {
-  const file = join(stateDir, stateFileName(owner, repo, prNumber));
+  // R3 修复: 按身份解析（旧命名文件先迁移）再持新名锁——与 engine/register/finalize 同源
+  // SC-FIX-2 (2026-08-08): 解析路径被他身份文件占据（旧命名碰撞落点）→ 使用前 fail-closed
+  // 拒绝——绝不按 dispatch_id 放行他身份状态（冲突接线，SC-2）。
+  const { file: resolvedFile, identityConflict } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  if (identityConflict) {
+    return { ok: false, reason: `状态文件路径被其他身份占用（identityConflict: ${owner}/${repo}#${prNumber}）——不按 dispatch_id 放行他身份状态（fail-closed）` };
+  }
+  const file = join(stateDir, resolvedFile);
   return withLock(`${file}.lock`, () => {
     if (!existsSync(file)) return { ok: false, reason: '状态文件不存在（可能已销单）' };
     const state = readJson(file);
+    // SC-FIX-2: 锁内身份复核（与 registerPr/settleAndAckDispatch 同源，identityMatches
+    // 大小写不敏感）——解析与持锁之间文件可被并发替换（TOCTOU），锁内重读内容身份
+    // 必须等于调用方身份才放行。
+    if (!identityMatches(state, owner, repo, prNumber)) {
+      return { ok: false, reason: `state 内容身份与调用方不符（state=${state.owner}/${state.repo}#${state.pr_number} 调用=${owner}/${repo}#${prNumber}）——不 ack 他身份状态（fail-closed）` };
+    }
     const pending = state.pending_dispatch;
     if (!pending) return { ok: false, reason: '无 pending dispatch（重复 ack 幂等忽略）' };
     if (pending.dispatch_id !== dispatchId) {
@@ -23,6 +36,68 @@ export function ackDispatch({ stateDir, owner, repo, prNumber, dispatchId, journ
     if (pending.canceling) {
       return { ok: false, reason: '该 dispatch 正在取消（canceling）——等引擎收敛取消状态机，不接受收口 ack（审⑨-P2-1R）' };
     }
+    const next = {
+      ...state,
+      cursors: pending.cursors_next, // 游标只在此刻推进（F6 核心）
+      pending_dispatch: null,
+      status: 'watching',
+      last_ack: nowIso()
+    };
+    writeJsonAtomic(file, next);
+    if (journalFile) {
+      mkdirSync(dirname(journalFile), { recursive: true });
+      appendFileSync(journalFile, JSON.stringify({ at: nowIso(), kind: 'ack', pr: `${owner}/${repo}#${prNumber}`, dispatch_id: dispatchId }) + '\n');
+    }
+    return { ok: true };
+  });
+}
+
+// 审(2026-08-08 GPT R2): 结算+ack 同锁复合原语——complete 收口的唯一入口。
+// 与 ackDispatch 的区别: 本函数在**同一 state-lock 临界区**内完成「机械结算 reserve →
+// actual」与「推进游标/清 pending」，两个动作之间不存在可被观察或插入的窗口（SC-B3）。
+// 权威来源（SC-B1/SC-B2）: 结算账本与估算值**只认 state 固化的 pending_dispatch.budget**，
+// 不看 manifest.budget——manifest 是投递给修复会话的可变文件，会话可把 ledger 指向坏账本
+// 或把 estimate 改成 0 洗账，信任它等于把结算权交给被修复方。旧版本派发的 manifest 无
+// budget 字段时，同样从这里自动收口（引擎 0bf3c4e 起固化 pending.budget）。
+// 锁纪律: settleDispatchBudget 内部不取锁（recordCost 为单条原子追加、isDispatchSettled
+// 只读全账本折叠），在 state 锁内调用不产生同锁/异锁嵌套；结算抛错 → state 未被改写、
+// pending 原样保留 → 引擎 at-least-once 重派重跑，幂等收敛（已结算跳过，无半状态）。
+export function settleAndAckDispatch({ stateDir, owner, repo, prNumber, dispatchId, actualUsd = null, journalFile }) {
+  // R3 修复: 同源解析（旧命名文件先迁移），收口路径与 ack/cancel/finalize 一致
+  // SC-FIX-2 (2026-08-08): 解析路径被他身份文件占据（旧命名碰撞落点）→ 使用前 fail-closed
+  // 拒绝——不结算不 ack（冲突接线，SC-2）。
+  const { file: resolvedFile, identityConflict } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  if (identityConflict) {
+    return { ok: false, reason: `状态文件路径被其他身份占用（identityConflict: ${owner}/${repo}#${prNumber}）——不结算不 ack（fail-closed）` };
+  }
+  const file = join(stateDir, resolvedFile);
+  return withLock(`${file}.lock`, () => {
+    if (!existsSync(file)) return { ok: false, reason: '状态文件不存在（可能已销单）' };
+    const state = readJson(file);
+    // SC-B1: manifest 自报 identity 必须与 state 内容一致（文件路径按 owner/repo/pr 定位，
+    // 但内容可能错放/被换——锁内核对，任一不符 fail-closed：不结算不 ack）
+    // SC-FIX-2: 复核判据与 registerPr 同源统一为 identityMatches（大小写不敏感——
+    // GitHub 身份大小写不敏感，Mame/Repo 与 mame/repo 同一身份；区分大小写比较会误伤
+    // 幂等收口路径）。
+    if (!identityMatches(state, owner, repo, prNumber)) {
+      return { ok: false, reason: `manifest identity 与 state 不匹配（state=${state.owner}/${state.repo}#${state.pr_number} manifest=${owner}/${repo}#${prNumber}）——不结算不 ack（fail-closed）` };
+    }
+    const pending = state.pending_dispatch;
+    if (!pending) return { ok: false, reason: '无 pending dispatch（重复 complete 幂等忽略）' };
+    if (pending.dispatch_id !== dispatchId) {
+      return { ok: false, reason: `dispatch_id 不匹配（pending=${pending.dispatch_id} complete=${dispatchId}）——旧会话的迟到 complete 被拒，不结算不 ack` };
+    }
+    if (pending.canceling) {
+      return { ok: false, reason: '该 dispatch 正在取消（canceling）——等引擎收敛取消状态机，不接受收口 ack（审⑨-P2-1R）' };
+    }
+    // SC-B2: 权威 budget 只认 pending 固化的账本——manifest 可变不信任；旧 manifest 无 budget
+    // 时这里同样能收口（无 authority 则 fail-closed，人工 record 纠偏后重试）
+    const authority = pending.budget ?? null;
+    if (!authority || !authority.ledger) {
+      return { ok: false, reason: 'pending 缺权威 budget 账本（非引擎标准派发遗留）——人工 record 纠偏后重试，不结算不 ack（fail-closed）' };
+    }
+    // SC-B3: 结算与 ack 同一临界区——结算抛错即整个收口失败，state 未动，pending 保留
+    settleDispatchBudget({ ledgerFile: authority.ledger, dispatchId, actualUsd, estimateUsd: authority.estimate ?? null });
     const next = {
       ...state,
       cursors: pending.cursors_next, // 游标只在此刻推进（F6 核心）
@@ -52,18 +127,32 @@ export function ackDispatch({ stateDir, owner, repo, prNumber, dispatchId, journ
 //   Phase C: 清 pending + 升 generation
 //   任一崩溃点重启后由 engine 的 canceling 恢复分支收敛。
 export function cancelDispatch({ stateDir, owner, repo, prNumber, dispatchId, budgetLedger = null, journalFile }) {
-  const file = join(stateDir, stateFileName(owner, repo, prNumber));
+  // R3 修复: 同源解析（旧命名文件先迁移），取消路径与 ack/complete/finalize 一致
+  // SC-FIX-2 (2026-08-08): 解析路径被他身份文件占据（旧命名碰撞落点）→ 使用前 fail-closed
+  // 拒绝——绝不清他身份 pending（冲突接线，SC-2）。
+  const { file: resolvedFile, identityConflict } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  if (identityConflict) {
+    return { ok: false, reason: `状态文件路径被其他身份占用（identityConflict: ${owner}/${repo}#${prNumber}）——不清他身份 pending（fail-closed）` };
+  }
+  const file = join(stateDir, resolvedFile);
   return withLock(`${file}.lock`, () => {
     if (!existsSync(file)) return { ok: false, reason: '状态文件不存在（可能已销单）' };
     const state = readJson(file);
+    // SC-FIX-2: 锁内身份复核（与 ackDispatch 同源）——解析与持锁之间的 TOCTOU 窗口兜底
+    if (!identityMatches(state, owner, repo, prNumber)) {
+      return { ok: false, reason: `state 内容身份与调用方不符（state=${state.owner}/${state.repo}#${state.pr_number} 调用=${owner}/${repo}#${prNumber}）——不清他身份 pending（fail-closed）` };
+    }
     const pending = state.pending_dispatch;
     if (!pending) return { ok: false, reason: '无 pending dispatch（无可取消）' };
     if (pending.dispatch_id !== dispatchId) {
       return { ok: false, reason: `dispatch_id 不匹配（pending=${pending.dispatch_id} cancel=${dispatchId}）——只允许显式点名取消` };
     }
     // 审⑧-P1-2: 已有 intent/committed receipt = 该 dispatch 已表达/完成 push 意图，
-    // 取消无法撤回已发生或在途的远端写——fail-closed，只能走 complete 收口
-    const rp = receiptPath(stateDir, { owner, repo, pr_number: prNumber });
+    // 取消无法撤回已发生或在途的远端写——fail-closed，只能走 complete 收口。
+    // R4: 本函数已持 state 锁（含 resolveStateFile 的锁），只读核对必须用锁内 helper
+    // receiptPathLocked——公共 API 会再拿同一把锁 → 自锁死锁（mkdir 锁不可重入）。
+    // 只读模式（无 dispatch_id）不迁移、不抛冲突，canonical 优先返回。
+    const rp = receiptPathLocked(stateDir, { owner, repo, pr_number: prNumber });
     if (existsSync(rp)) {
       const rec = readJson(rp);
       if (rec.dispatch_id === dispatchId && (rec.phase === 'intent' || rec.phase === 'committed')) {
@@ -101,7 +190,7 @@ export function cancelDispatch({ stateDir, owner, repo, prNumber, dispatchId, bu
 
 // 审⑧-P1-1: 本 CLI **只有 --cancel 一种模式**。裸 ack（不验 receipt/push/回帖直接推游标）
 // 没有任何合法使用场景——推进游标的唯一入口是 complete.mjs 的副作用核验路径
-// （ackDispatch 仅作为内部函数被 complete 调用）。误跑裸 ack 吞反馈的通道从 CLI 层拆除。
+// （settleAndAckDispatch 仅作为内部函数被 complete 调用）。误跑裸 ack 吞反馈的通道从 CLI 层拆除。
 if (isMain(import.meta.url)) {
   const args = parseArgs(process.argv.slice(2));
   const need = ['state-dir', 'owner', 'repo', 'pr', 'dispatch-id'];
