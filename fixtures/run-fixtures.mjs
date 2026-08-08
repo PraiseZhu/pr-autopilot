@@ -6985,6 +6985,64 @@ t('[R3-SC-S2] SC-FIX-1 身份校验: 一身份 legacy 预存、另一身份 regi
   rmSync(dirD, { recursive: true, force: true });
 });
 
+t('[R3-SC-S2] SC-FIX-1F unregisterPr 锁内身份复核: resolve→lock 窗口换入他身份文件（含在途 pending_dispatch）→ 拒绝且他身份文件原样保留', () => {
+  // 隔离复现（SC-2 实测）: unregisterPr 在 resolveStateFile 之后、withLock 内的 doIt() 在
+  // unlinkSync 前没有 identityMatches 复核，是四个共用调用方（register/ack/finalize/unregister）
+  // 中唯一缺锁内复核的变更入口。主进程先 acquireLock 持锁 → 子进程 unregisterPr resolve
+  // 通过（读到本身份 mame/_#301）→ 阻塞在 acquireLock → 主进程在锁外窗口把文件内容换成
+  // 他身份 mame/-#301（含在途 pending_dispatch）→ 释放锁 → 子进程 doIt 直接 unlinkSync。
+  // 修复前: 返回 {removed:true} 且他身份文件（含 pending）被物理删除；
+  // 修复后: 锁内 identityMatches 复核失败 → {removed:false}，文件/pending 原样保留。
+  const dir = mkdtempSync(join(tmpdir(), 'r3-toc-'));
+  const selfFile = join(dir, stateFileName('mame', '_', 301));
+  writeFileSync(selfFile, JSON.stringify(r3V2('mame', '_', 301)));
+  const lockPath = `${selfFile}.lock`;
+  const release = acquireLock(lockPath); // 主进程先持锁（模拟 unregisterPr 正在执行的锁窗口）
+  const sig = join(dir, 'resolved.sig');
+  const out = join(dir, 'out.json');
+  const childSrc = `
+    const fs = require('fs');
+    const { unregisterPr, resolveStateFile } = require(${JSON.stringify(join(S, 'pr-watch/register.mjs'))});
+    const r = resolveStateFile({ stateDir: process.env.SD, owner: 'mame', repo: '_', prNumber: 301 });
+    fs.writeFileSync(process.env.SIG, JSON.stringify({ file: r.file, identityConflict: r.identityConflict }));
+    const res = unregisterPr({ stateDir: process.env.SD, owner: 'mame', repo: '_', prNumber: 301, reason: 'fixture' });
+    fs.writeFileSync(process.env.OUT, JSON.stringify(res));
+  `;
+  const child = spawn(process.execPath, ['-e', childSrc], {
+    env: { ...process.env, SD: dir, SIG: sig, OUT: out },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  // 等子进程完成 resolve（信号文件出现 = resolve 已通过、正阻塞在 acquireLock）
+  const waitFor = (p, ms) => { const d = Date.now() + ms; while (!existsSync(p) && Date.now() < d) execFileSync('sleep', ['0.02']); return existsSync(p); };
+  const sigSeen = waitFor(sig, 5000);
+  ok(sigSeen, 'SC-FIX-1F 子进程 resolve 信号出现（已阻塞在锁）');
+  if (sigSeen) {
+    const sigInfo = JSON.parse(readFileSync(sig, 'utf8'));
+    ok(sigInfo.identityConflict !== true, 'SC-FIX-1F resolve 阶段读到本身份（非 conflict，窗口成立）');
+    // 锁外窗口换入他身份文件（含在途 pending_dispatch）
+    writeFileSync(selfFile, JSON.stringify({
+      ...r3V2('mame', '-', 301, 'fb'),
+      pending_dispatch: { dispatch_id: 'd1', budget: { ledger: join(dir, 'b.jsonl'), estimate: 1 }, cursors_next: null }
+    }));
+  }
+  release(); // 释放锁 → 子进程 doIt
+  const outSeen = waitFor(out, 5000);
+  ok(outSeen, 'SC-FIX-1F 子进程完成输出');
+  if (outSeen) {
+    const res = JSON.parse(readFileSync(out, 'utf8'));
+    eq(res.removed, false, 'SC-FIX-1F 锁内复核失败 → removed:false（修复前 removed:true 物理删除他身份文件）');
+  }
+  const heFile = selfFile;
+  ok(existsSync(heFile), 'SC-FIX-1F 他身份文件未被物理删除（原样保留）');
+  if (existsSync(heFile)) {
+    const he = readJson(heFile);
+    eq([he.owner, he.repo, he.pr_number], ['mame', '-', 301], 'SC-FIX-1F 文件内容身份仍是他身份 mame/-#301');
+    ok(he.pending_dispatch !== null, 'SC-FIX-1F 他身份在途 pending_dispatch 原样保留（未被清空）');
+  }
+  try { child.kill(); } catch { /* 已退出 */ }
+  rmSync(dir, { recursive: true, force: true });
+});
+
 t('[R3-SC-S2] SC-FIX-1C checkReceipt identityConflict: state=null 不携带他身份注册详情、无误导性要素④', () => {
   // 预置 mame/-#301 请求路径被 mame/_#301 内容占据（v2 clean 折叠碰撞落点:
   // mame/_ 的旧名恰是 mame/- 的新名）。修复前 checkReceipt 读取该他身份文件并返回其

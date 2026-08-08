@@ -178,6 +178,11 @@ export function registerPr({ stateDir, owner, repo, prNumber, branch, registered
   // （"1e2"→100 生成 o__r__100.json、"01"→1 生成 o__r__1.json、true→1、[1]→1），
   // 生成与调用方传入表示不一致的状态文件名（归一化绕过）。只接受:
   //   number 型正整数，或无前导零十进制字符串（/^[1-9]\d*$/）。
+  // SC-FIX-4B (2026-08-08 R2): 数值保真复核——/^[1-9]\d*$/ 只验十进制形状不验数值保真，
+  // 超过 Number.MAX_SAFE_INTEGER 的十进制字符串经 Number() 双精度损失后仍被接受
+  // （'9007199254740993'→9007199254740992），两个不同 PR 号归一化到同一 state 文件
+  // （collision）；number 型分支亦无 isSafeInteger 检查。转换结果必须过
+  // Number.isSafeInteger（保真判据）——超界即拒绝，不生成精度损失的状态文件名。
   let prNum;
   if (typeof prNumber === 'number') {
     prNum = prNumber;
@@ -186,8 +191,8 @@ export function registerPr({ stateDir, owner, repo, prNumber, branch, registered
   } else {
     throw new Error(`prNumber 非法（须正整数: number 型或 /^[1-9]\\d*$/ 无前导零十进制字符串，got ${JSON.stringify(prNumber)}）——拒绝注册（fail-closed: 生成的状态文件名不满足引擎扫描文法 STATE_FILE_NAME_RE 或与传入表示不一致）`);
   }
-  if (!Number.isInteger(prNum) || prNum <= 0) {
-    throw new Error(`prNumber 非法（须正整数）: ${JSON.stringify(prNumber)}——拒绝注册（fail-closed: 生成的状态文件名不满足引擎扫描文法 STATE_FILE_NAME_RE）`);
+  if (!Number.isInteger(prNum) || prNum <= 0 || !Number.isSafeInteger(prNum)) {
+    throw new Error(`prNumber 非法（须 Number.MAX_SAFE_INTEGER 内的正整数）: ${JSON.stringify(prNumber)}——拒绝注册（fail-closed: 超过 MAX_SAFE_INTEGER 的 PR 号经 Number() 双精度损失后可与另一 PR 号归一化到同一状态文件）`);
   }
   // 审⑤-F4: branch 与 push remote 名注册时必填——state.branch=null 会让 finalize 必然拒绝，
   // 正常文档路径不允许生成注定失败的注册；remote 名不许引擎事后猜。
@@ -241,6 +246,18 @@ export function registerPr({ stateDir, owner, repo, prNumber, branch, registered
       }
       // 审⑥-F1-⑥: push_repo 三态——undefined=保留旧值 / null=显式清空（CLI --clear-push-repo）/ 字符串=设置
       const wantPushRepo = pushRepo === undefined ? (prev.push_repo ?? null) : pushRepo;
+      // SC-FIX-5B (2026-08-08 R2): 继承路径类型守卫——上方 SC-FIX-5 只覆盖「本次显式传参」
+      // 分支（pushRepo !== undefined），wantPushRepo 从 prev.push_repo 继承时（仅改 branch
+      // 重注册）不校验类型：预置畸形 push_repo（对象/数字/boolean）后原样落盘 migrated:true，
+      // 后续被 git-checks.mjs 的 String() 隐式强转消费。落盘前对最终值统一应用类型契约
+      // （null 或字符串，且字符串过绑定守卫）——与显式分支同判据，不依赖 String 隐式强转。
+      if (typeof wantPushRepo !== 'string' && wantPushRepo !== null) {
+        throw new Error(`注册拒绝: 继承的 push_repo 必须为 null 或字符串（got ${typeof wantPushRepo}）——不依赖 String 隐式强转（fail-closed）: ${JSON.stringify(wantPushRepo)}`);
+      }
+      if (typeof wantPushRepo === 'string') {
+        const repoErrs = validateRepoFullName(wantPushRepo, 'push_repo');
+        if (repoErrs.length) throw new Error(`注册拒绝: 继承的 push_repo 未过绑定守卫——${repoErrs.join('; ')}`);
+      }
       const wiringChanged = prev.branch !== branch || prev.push_remote !== pushRemote
         || (prev.push_repo ?? null) !== wantPushRepo;
       // 审⑥-F1-⑥: 在途 dispatch 的 manifest 冻结着旧接线，engine 重派走 pending 不看 state——
@@ -332,10 +349,26 @@ export function unregisterPr({ stateDir, owner, repo, prNumber, reason, journalF
   const file = join(stateDir, resolvedFile);
   const doIt = () => {
     if (!existsSync(file)) return { removed: false };
-    const state = readFileSync(file, 'utf8');
+    const raw = readFileSync(file, 'utf8');
+    let state = null;
+    try { state = JSON.parse(raw); } catch { /* 损坏内容：身份不可核验，fail-closed 拒绝删除 */ }
+    // SC-FIX-1G (2026-08-08 R2): 锁内身份复核——resolveStateFile 与加锁之间（TOCTOU 窗口）
+    // 文件内容可能已被并发替换为他身份（含在途 pending_dispatch）。registerPr/ack/finalize
+    // 的锁内复核在此前的修复已覆盖，unregisterPr 是四个共用调用方中唯一缺失的：修复前
+    // doIt() 在 unlinkSync 前不做 identityMatches 复核，锁外解析通过后即使锁内文件已换成
+    // 他身份内容仍返回 {removed:true} 且物理删除他人注册（含在途 dispatch）。与
+    // registerPr 锁内复核同源（同一 identityMatches 判据）——身份不符或不可核验（损坏）
+    // 均 fail-closed 拒绝，绝不 unlink 身份不明文件。
+    if (!identityMatches(state, owner, repo, prNumber)) {
+      if (journalFile) {
+        mkdirSync(dirname(journalFile), { recursive: true });
+        appendFileSync(journalFile, JSON.stringify({ at: nowIso(), kind: 'unregister-identity-rejected', file, reason: reason ?? 'terminal', owner, repo, prNumber, stateOwner: state?.owner ?? null, stateRepo: state?.repo ?? null, statePr: state?.pr_number ?? null }) + '\n');
+      }
+      return { removed: false };
+    }
     if (journalFile) {
       mkdirSync(dirname(journalFile), { recursive: true });
-      appendFileSync(journalFile, JSON.stringify({ at: nowIso(), reason: reason ?? 'terminal', state: JSON.parse(state) }) + '\n');
+      appendFileSync(journalFile, JSON.stringify({ at: nowIso(), reason: reason ?? 'terminal', state }) + '\n');
     }
     unlinkSync(file);
     return { removed: true };

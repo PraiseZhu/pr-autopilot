@@ -380,7 +380,13 @@ const badArgCases = [
   { prNumber: '1e2', label: 'PR 号科学计数法 1e2' },
   { prNumber: '01', label: 'PR 号前导零 01' },
   { prNumber: true, label: 'PR 号 boolean' },
-  { prNumber: [1], label: 'PR 号数组 [1]' }
+  { prNumber: [1], label: 'PR 号数组 [1]' },
+  // SC-FIX-4 精度缺口 (2026-08-08 R2): /^[1-9]\d*$/ 只验十进制形状不验数值保真——超过
+  // Number.MAX_SAFE_INTEGER 的十进制字符串经 Number() 双精度损失后仍被接受
+  // （'9007199254740993'→9007199254740992），两个不同 PR 号归一化到同一 state 文件；
+  // number 型分支亦无 isSafeInteger 检查。必须拒绝（修复前该用例红）。
+  { prNumber: '9007199254740993', label: 'PR 号超 MAX_SAFE_INTEGER 十进制串' },
+  { prNumber: 9007199254740993, label: 'PR 号超 MAX_SAFE_INTEGER number' }
 ];
 for (const c of badArgCases) {
   let threw = false;
@@ -419,6 +425,30 @@ const goodReg = registerPr({ stateDir: s14Dir, owner: 'xindong', repo: 'mivo-can
 ok(goodReg.already === false && existsSync(goodReg.file), 'S14 registerPr 合法注册（pushRepo=null 同仓三态）正常');
 eq(readdirSync(s14Dir).filter((f) => f.endsWith('.json')).length, 1, 'S14 非法请求零落盘，仅 503 一个合法状态文件');
 ok(STATE_FILE_NAME_RE.test(goodReg.file.split('/').pop()), 'S14 合法注册文件名满足 STATE_FILE_NAME_RE（引擎可扫描）');
+
+// ---- S15 (SC-FIX-5 继承路径, 2026-08-08 R2): 迁移/继承分支的 prev.push_repo 值不经类型/绑定守卫
+//      直接落盘——类型守卫仅覆盖「本次显式传参」分支（register.mjs:213-218），继承 prev.push_repo
+//      时不校验。预置畸形 push_repo:{} 后仅改 branch 重注册 → 修复前 migrated:true 且畸形对象
+//      原样落盘（后续被 git-checks.mjs 的 String() 隐式强转消费）；修复后必须拒绝（fail-closed）----
+const s15Dir = join(gd, 'state-s15');
+mkdirSync(s15Dir, { recursive: true });
+writeJsonAtomic(stateFile(s15Dir, 'xindong', 'mivo-canvas', 601), {
+  schema_version: 'v2', owner: 'xindong', repo: 'mivo-canvas', pr_number: 601,
+  branch: 'feat/OLD', push_repo: {}, push_remote: 'origin', // 畸形 push_repo（对象）
+  registered_at: '2026-08-08T00:00:00.000Z', registered_by: 'fixture',
+  cursors: null, pending_dispatch: null, first_scan_ack: null, status: 'watching'
+});
+// 仅改 branch 重注册（不传 pushRepo → 继承 prev.push_repo）
+let s15Threw = false;
+let s15Result = null;
+try {
+  s15Result = registerPr({ stateDir: s15Dir, owner: 'xindong', repo: 'mivo-canvas', prNumber: 601, branch: 'feat/NEW', pushRemote: 'origin' });
+} catch { s15Threw = true; }
+ok(s15Threw, 'S15 继承畸形 prev.push_repo → registerPr 拒绝（修复前 migrated:true 且畸形对象落盘）');
+if (!s15Threw && s15Result) ok(s15Result.migrated !== true, 'S15 不得声称 migrated（畸形 push_repo 继承路径）');
+const s15State = JSON.parse(readFileSync(stateFile(s15Dir, 'xindong', 'mivo-canvas', 601), 'utf8'));
+eq(s15State.branch, 'feat/OLD', 'S15 拒绝后文件未被本次注册覆写（branch 仍为预置旧值）');
+eq(s15State.registered_by, 'fixture', 'S15 拒绝后文件未被本次注册覆写（registered_by 仍为预置值）');
 
 console.log(`own-prs.fixture: ${failed === 0 ? 'all pass' : failed + ' failed'}`);
 process.exit(failed === 0 ? 0 : 1);
