@@ -90,7 +90,7 @@ flowchart TD
         ENG -->|"PR merged/closed"| CLEAN["销单 + 回收 worktree/分支"]
     end
 
-    DIGEST["每日 10:00 卡片顺带扫<br/>open 但未被盯的 PR → 补注册<br/>当前推荐 mini 侧补注册<br/>(own-prs reconcile 班车 + 15min schedule,<br/>见 deploy/README 补注册段)<br/>#814 原生通道未验证维持 open ·<br/>ssh 仅 submit-pr Phase 3 强收口场景"] -.-> WL
+    DIGEST["每日 10:00 卡片顺带扫<br/>open 但未被盯的 PR → 补注册<br/>当前推荐 mini 侧补注册<br/>(own-prs reconcile 班车 + 15min schedule,<br/>见 deploy/README 补注册段)<br/>#814 原生通道未验证维持 open；<br/>ssh 仅 submit-pr Phase 3 强收口场景"] -.-> WL
 ```
 
 ### 1.1 submit-pr 改造清单

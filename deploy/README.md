@@ -60,7 +60,7 @@ engine-mivo.json（完整必填示例；两仓 schedule **共享同一 budget.le
 }
 ```
 - `estimate` 是**行为参数**（`reserveBudget()`（`scripts/pr-watch/budget.mjs` 导出，engine 的
-  dispatch 路径调用它预留，当前约 `engine.mjs:293`——以符号为准，行号会漂移），不是注释）——
+  dispatch 路径调用它预留，当前约 `engine.mjs:295`——以符号为准，行号会漂移），不是注释）——
   mivo 示例取 `3`：外部部署实测单样本 $1.41，保守取整为 3。
 - **完工结算（机械，人工只作兜底）**：`complete.mjs` 成功路径在 **ack 之前**把该 dispatch 的
   reserve 机械结算为 actual（`settleDispatchBudget()`，`scripts/pr-watch/budget.mjs`）：
@@ -168,7 +168,7 @@ export EXPECT_EFFORT='xhigh'
 > - `docs/plan.md:163-164` W-2 首扫空目录立即退出；W-3 按类游标、exact-head、评论 node-id、CI 状态跃迁、at-least-once/副作用幂等；
 > - `docs/plan.md:31,42,83-84` 空清单零 GitHub 请求 / 零 LLM / 零 token；引擎每仓一条 schedule、空 state 目录秒退；
 > - `scripts/pr-watch/gate.mjs:3-10,16,61-75` 按类游标、同 head 的 `ci_red_sha` 去重（`:61`）、ack 后推进（nextCursors 在 `:70-75`）；
-> - `scripts/pr-watch/engine.mjs:188-262` pending 单飞、租约到期同 id 重派（`:236-260`；重派失败持久化 `redispatch_count` 在 `:256` 且计入 stuck 判据 `:238`）、每轮记 `waiting` 事件（`:217-221`，`waiting_for` 仅 `'ack'`）、超 `pendingStuckHours`（默认 **6h**，`:71`，可经 config 覆盖）记 `pending-stuck` 告警（`:225-234`，年龄基准 = `first_dispatched_at`——首派写入 `:347`、旧 state 缺字段先原子回填 `:191-196`）；reserve 仅新 actionable dispatch（`:293`）；首派失败记 `dispatch-failed`（`:359`）；
+> - `scripts/pr-watch/engine.mjs:188-262` pending 单飞、租约到期同 id 重派（`:238-262`；重派失败持久化 `redispatch_count` 在 `:256` 且计入 stuck 判据 `:240`）、每轮记 `waiting` 事件（`:217-221`，`waiting_for` 仅 `'ack'`）、超 `pendingStuckHours`（默认 **6h**，`:71`，可经 config 覆盖）记 `pending-stuck` 告警（`:225-234`，年龄基准 = `first_dispatched_at`——首派写入 `:349`、旧 state 缺字段先原子回填 `:191-196`）；reserve 仅新 actionable dispatch（`:295`）；首派失败记 `dispatch-failed`（`:361`）；
 > - `deploy/wrappers/probe.mjs:2-6` preRunHook 的 exit 2 / 不启动会话协议。
 
 | 变量/项 | 作用 | 已验证的直接后果（逐跳） |
@@ -184,12 +184,12 @@ export EXPECT_EFFORT='xhigh'
 export PR_AUTOPILOT_HMAC_KEY=$(openssl rand -hex 32)   # 每台机器独立生成，禁止拷贝别人的
 ```
 
-- **生成与形状**：`openssl rand -hex 32` 即可（HMAC key 无格式约束，任意字符串都行；64 位十六进制只是惯例）。**谁读 env**：`deploy/wrappers/probe.mjs:57` 读 `process.env.PR_AUTOPILOT_HMAC_KEY` 后传给 `gate.evaluate`；`scripts/pr-watch/engine.mjs:73` 默认读 env，但 main() 的 `runEngine({ ...extra })` 配置合并处（`engine.mjs:378-384`，`...extra` 展开在 `:383`）可被 `engine-*.json` 里的 `hmacKey` 字段**覆盖**（`engine.mjs:73` 只是 env 默认值，覆盖发生在 `:378-384`）；`scripts/pr-watch/complete.mjs:54` 读 env 传给 `checkCompletion`；`scripts/pr-watch/provenance.mjs` 本身**不读 env**，只接收调用方传入的 key 参数。**不落盘、不打日志**。
+- **生成与形状**：`openssl rand -hex 32` 即可（HMAC key 无格式约束，任意字符串都行；64 位十六进制只是惯例）。**谁读 env**：`deploy/wrappers/probe.mjs:60` 读 `process.env.PR_AUTOPILOT_HMAC_KEY` 后传给 `gate.evaluate`；`scripts/pr-watch/engine.mjs:73` 默认读 env，但 main() 的 `runEngine({ ...extra })` 配置合并处（`engine.mjs:380-386`，`...extra` 展开在 `:385`）可被 `engine-*.json` 里的 `hmacKey` 字段**覆盖**（`engine.mjs:73` 只是 env 默认值，覆盖发生在 `:380-386`）；`scripts/pr-watch/complete.mjs:59` 读 env 传给 `checkCompletion`；`scripts/pr-watch/provenance.mjs` 本身**不读 env**，只接收调用方传入的 key 参数。**不落盘、不打日志**。
 - **每台机器必须独立生成**：它是「这条评论是不是我自己发的」的识别凭证，不是共享口令。拷别人的 key = 两台机器互认对方回帖为自家，签名校验的意义归零。
 - **没配会怎样（三层，别混）**：
   - **gate 侧先说明白（login 早退）**：`gh-snapshot:117` 尝试拿 `selfLogin`（拿不到 → 宁多唤醒，`author_is_self` 为 false），`gate:54` 先跳过 `author_is_self === true` 再对剩余评论用 HMAC。所以 **login 可得时，无 key 不会因 HMAC 导致自家评论被当成新反馈**；HMAC 只在 login 不可得（拿不到 `ghGet('user')`）时才是识别自家回帖的那一层。
-  - **已验证机制（前提：worker 已提交一条待核验的回帖）**：**在 worker 已提交待核验回帖的前提下**，无 key 会让 `complete.mjs:54` 取到空 key → `provenance.mjs:17`（实现：`if (!key) return false`，「无法验证 → 不声称是自家的 → 宁多唤醒」；`complete.mjs:36` 只是调用点）→ `:38` 判「回帖未落地」→ `:57` exit 1（checkCompletion 失败分支——副作用缺失即拒；预算结算失败是另一条独立失败分支 `:83`），**ack 不发生**（`settleAndAckDispatch` 只在 checkCompletion 通过**且**结算成功后的 `:66` 发生——结算与 ack 同一 state-lock 临界区，见 §2 estimate 段）→ `pending_dispatch` 保持在途 → 引擎 `engine.mjs:236-260` 只按 lease 超时（`:236`）重派**同一个 dispatch_id**（`budget.mjs:145` reserve 对同 id 幂等，`already-reserved` 直接放行不重复占额，幂等放行在 `:157`）→ 重派 ≥ `stuckThreshold` 次 → `engine.mjs:238-240` 记 `stuck` + `:241-246` routeNotify 发通知。**这是可能路径，不是无条件后果**——真实表现（在该前提下）= 卡在 pending、最终触发 stuck 通知（有告警，不是静默；通知为 best-effort——发送失败只记 `notify-error` journal `engine.mjs:246`，不重试不补发，见 §2.1 ③）。
-  - **已验证的间接预算影响（代码支持的可能路径，未在真实事件中证实）**：`complete` 未 ack → `pending_dispatch` 连同**原 dispatch 的 reserve 一起长留**（`engine.mjs:344-351` pending_dispatch 固化含 `budget: {ledger, estimate}`，以符号 `pending_dispatch.budget` 为准）→ 该额度不释放，与后续真实 dispatch 竞争同一个 cap；而重派路径**不调用 reserve**（reserve 只在无 pending 且判 actionable 的新 dispatch 路径，`engine.mjs:293`，以符号 `reserveBudget` 为准）。**这条是代码支持的可能机制，不是已证实因果**——不要当成新的因果断言。成功路径的 reserve 由 `complete` 在 ack 前机械结算（见 §2 estimate 段），不依赖人工 `--record`。
+  - **已验证机制（前提：worker 已提交一条待核验的回帖）**：**在 worker 已提交待核验回帖的前提下**，无 key 会让 `complete.mjs:59` 取到空 key → `provenance.mjs:17`（实现：`if (!key) return false`，「无法验证 → 不声称是自家的 → 宁多唤醒」；`complete.mjs:36` 只是调用点）→ `:38` 判「回帖未落地」→ `:62` exit 1（checkCompletion 失败分支——副作用缺失即拒；预算结算失败是另一条独立失败分支 `:88`），**ack 不发生**（`settleAndAckDispatch` 只在 checkCompletion 通过**且**结算成功后的 `:71` 发生——结算与 ack 同一 state-lock 临界区，见 §2 estimate 段）→ `pending_dispatch` 保持在途 → 引擎 `engine.mjs:238-262` 只按 lease 超时（`:238`）重派**同一个 dispatch_id**（`budget.mjs:145` reserve 对同 id 幂等，`already-reserved` 直接放行不重复占额，幂等放行在 `:157`）→ 重派 ≥ `stuckThreshold` 次 → `engine.mjs:239-242` 记 `stuck` + `:243-248` routeNotify 发通知。**这是可能路径，不是无条件后果**——真实表现（在该前提下）= 卡在 pending、最终触发 stuck 通知（有告警，不是静默；通知为 best-effort——发送失败只记 `notify-error` journal `engine.mjs:248`，不重试不补发，见 §2.1 ③）。
+  - **已验证的间接预算影响（代码支持的可能路径，未在真实事件中证实）**：`complete` 未 ack → `pending_dispatch` 连同**原 dispatch 的 reserve 一起长留**（`engine.mjs:346-352` pending_dispatch 固化含 `budget: {ledger, estimate}`，以符号 `pending_dispatch.budget` 为准）→ 该额度不释放，与后续真实 dispatch 竞争同一个 cap；而重派路径**不调用 reserve**（reserve 只在无 pending 且判 actionable 的新 dispatch 路径，`engine.mjs:295`，以符号 `reserveBudget` 为准）。**这条是代码支持的可能机制，不是已证实因果**——不要当成新的因果断言。成功路径的 reserve 由 `complete` 在 ack 前机械结算（见 §2 estimate 段），不依赖人工 `--record`。
   - **不可归因**：外部部署方那次「$30/天 cap 撞顶」**成因未定**——本 checkout 没有「缺 key → 每轮新 dispatch_id → 每轮 reserve」的路径（重派复用同 id + reserve 幂等），且该事件无运行时台账/序列证据。**不要归因到 HMAC key，也不猜替代解释**。
 - **强度如实声明（T1，无机器门在拦）**：引擎启动时不校验 key 是否存在（`engine.mjs:73` `?? null`，没有 fail-closed 启动门）；这道门防的是「自家评论误唤醒自己」的**疏忽**，不防**伪造**——知道 key 的人可以伪造签名评论。配不配 key 全靠部署时自觉，机器不拦。
 
@@ -212,7 +212,7 @@ export REQUIRED_CONTEXTS_FILE=/path/to/required-contexts.json
   ```
   本机在跑的部署就是这么做（Cindy schedule 的 prompt 里写死这条命令；外部实证，本地不可复验）。
 - **env.sh 是否生效（精确条件）**：
-  - **生效（本仓可证）**：同一 shell / 同一调度会话里 `source env.sh` 后再启动 engine（前台、后台、或该 shell 直接 exec 子进程）→ 变量进 `process.env`，并由 engine 的 `execFileSync` 子进程继承（`deploy/README.md:104`「班车会话 source env.sh 后**后台**跑 engine」+ `engine.mjs:23-28` execFileSync 启动子命令，调用在 `:27` + `gh-snapshot.mjs:143-144` 从 `process.env` 读）。
+  - **生效（本仓可证）**：同一 shell / 同一调度会话里 `source env.sh` 后再启动 engine（前台、后台、或该 shell 直接 exec 子进程）→ 变量进 `process.env`，并由 engine 的 `execFileSync` 子进程继承（`deploy/README.md:123`「班车会话 source env.sh 后**后台**跑 engine」+ `engine.mjs:23-28` execFileSync 启动子命令，调用在 `:27` + `gh-snapshot.mjs:143-144` 从 `process.env` 读）。
   - **失效（两种）**：① 只在某个会话 source 了 env.sh，engine 却由**另一个已存在或独立启动的 scheduler / launchd 会话**拉起——后者不继承前者环境；② source 的那个 shell 随后退出，再由独立 scheduler 拉起 engine——同样失效。此时才需要像上面那样在启动命令上并列 export。
   - **边界（必须知道）**：本 checkout 只能证明普通 Unix 子进程继承与本仓命令链，**不能证明 Mac mini 上 Cindy scheduler 的真实会话边界**（`env.sh`、schedule 启动命令、launchd runtime 都不在 checkout 里）。所以「别人这么塞没生效」**不能写成本仓事实**，是外部实证/本地不可验。
   - **顺带：非交互 shell 的 PATH 里没有 `node`**（本机踩过，mini 的 node 在 `/opt/homebrew/bin`），部署时不显式加 PATH 会静默失败——上面命令行里的 `export PATH=…` 就是干这个的。
@@ -221,7 +221,7 @@ export REQUIRED_CONTEXTS_FILE=/path/to/required-contexts.json
 - **两类 check 绝对不能进这份清单（同一类陷阱的两个变种）**：
   - **`SKIPPED` 不算绿**：gh-snapshot 归一化 check-run 时只有 `conclusion == success` 才映射为绿，`skipped`/`neutral`/`cancelled` 一律非绿（`gh-snapshot.mjs:135`；`scripts/ci-readiness.mjs:33` `entry.state !== 'success'` → fail-closed 非绿）。按路径过滤的 job（改动不命中就 SKIPPED）一旦进清单，该 PR 永远判不绿。
   - **只在 `pull_request` 事件上跑的 job 同样不能列**：它在 main push 上根本不产生 check，列进去 = 永远等一个不会来的绿。真实案例：mivo 仓（`xindong/mivo-canvas`）`.github/workflows/deploy-green-ref.yml` 的 `REQUIRED_ON_MAIN` 数组上方注释（本机踩过并写死在注释里的教训，措辞以该文件当前内容为准）——e2e 系列 job 是 pull_request-only，main push 上不存在，不能列（列了 ref 永远不动）；bench / deps audit / semgrep baseline / coverage report 是设计上的非阻断，不纳入。**设计上非阻断的 job（bench / audit / baseline / coverage 类）也不进清单**。
-- **没配/文件缺失 = fail-closed 非绿，同一 head 的 ci-red 在本轮之内判一次并去重**：gh-snapshot 对未配置的 required 返回 `green: false` + `['required contexts 未配置（fail-closed）']`（`gh-snapshot.mjs:147`）→ gate 对**同一 head** 的 ci-red 用 `cursors.ci_red_sha !== head` 去重（`gate.mjs:61-62`）——**前提是状态真的落盘了（投递成功、pending/ack 已持久化）**；若投递失败，`engine.mjs:354-361` 释放预留（`:356`）且**游标不推进**（「下轮重试 = at-least-once」，失败记 `dispatch-failed` journal 事件 `:359`），`engine.mjs:362` 落盘的状态里没有 pending/cursor 推进，下一轮 gate 仍见 `ci_red_sha != head` → 仍 actionable → **可能每轮重新启动 agent**（`fixtures/run-fixtures.mjs:1194-1246` 已覆盖首派/重派连续失败重试；重派失败同样持久化 `redispatch_count`（`engine.mjs:256`）并计入 stuck 判据（`engine.mjs:238`））。**不保证低唤醒/低 token**——别据此估预算。（早期版本写「CI 永远红 → 每轮都唤醒」不成立，已更正；本段也不构成跨轮静默保证。）
+- **没配/文件缺失 = fail-closed 非绿，同一 head 的 ci-red 在本轮之内判一次并去重**：gh-snapshot 对未配置的 required 返回 `green: false` + `['required contexts 未配置（fail-closed）']`（`gh-snapshot.mjs:147`）→ gate 对**同一 head** 的 ci-red 用 `cursors.ci_red_sha !== head` 去重（`gate.mjs:61-62`）——**前提是状态真的落盘了（投递成功、pending/ack 已持久化）**；若投递失败，`engine.mjs:356-363` 释放预留（`:358`）且**游标不推进**（「下轮重试 = at-least-once」，失败记 `dispatch-failed` journal 事件 `:361`），`engine.mjs:364` 落盘的状态里没有 pending/cursor 推进，下一轮 gate 仍见 `ci_red_sha != head` → 仍 actionable → **可能每轮重新启动 agent**（`fixtures/run-fixtures.mjs:1194-1246` 已覆盖首派/重派连续失败重试；重派失败同样持久化 `redispatch_count`（`engine.mjs:256`）并计入 stuck 判据（`engine.mjs:240`））。**不保证低唤醒/低 token**——别据此估预算。（早期版本写「CI 永远红 → 每轮都唤醒」不成立，已更正；本段也不构成跨轮静默保证。）
 
 **②b `SNAPSHOT_CACHE_DIR` —— 不配 = 每轮探针都是普通 API 请求，配额被静默低估**
 
