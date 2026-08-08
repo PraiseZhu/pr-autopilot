@@ -5,7 +5,7 @@
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, utimesSync, rmSync, lstatSync, appendFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHmac } from 'node:crypto';
 
@@ -24,7 +24,7 @@ import { matchUiPaths } from '../scripts/ui-paths/match.mjs';
 import { registerPr, unregisterPr, checkReceipt, stateFileName, legacyStateFileName, parseStateFileName, migrateAllLegacyStateFiles, STATE_FILE_NAME_RE } from '../scripts/pr-watch/register.mjs';
 import { evaluate, emptyCursors } from '../scripts/pr-watch/gate.mjs';
 import { runEngine } from '../scripts/pr-watch/engine.mjs';
-import { ackDispatch, cancelDispatch } from '../scripts/pr-watch/ack.mjs';
+import { ackDispatch, cancelDispatch, settleAndAckDispatch } from '../scripts/pr-watch/ack.mjs';
 import { checkFinalize, receiptPath, receiptPathLocked } from '../scripts/pr-watch/finalize.mjs';
 import { checkCompletion } from '../scripts/pr-watch/complete.mjs';
 import { reserveBudget, releaseReserve, recordCost, spentToday, budgetCheck, settleDispatchBudget, isDispatchSettled } from '../scripts/pr-watch/budget.mjs';
@@ -1027,7 +1027,11 @@ t('[2026-08-08 F5] complete 机械结算全链: reserve→actual/settled + manif
     execFileSync(process.execPath, [join(S, 'pr-watch/complete.mjs'), '--manifest', join(d, 'bad96.json'), '--snapshot-cmd', snapSh + ' {owner} {repo} {pr}', '--state-dir', stateDir], { encoding: 'utf8', env: { ...process.env, PR_AUTOPILOT_HMAC_KEY: HMAC_KEY } });
   } catch (e) { cliFailed = true; cliErr = `${e.stderr ?? ''}`; }
   ok(cliFailed, 'SC-B1: state 内容与文件名错位必须非零退出');
-  ok(/identity 与 state 不匹配/.test(cliErr), `SC-B1: 必须报 identity 不匹配（不结算不 ack）: ${cliErr.slice(0, 160)}`);
+  // SC-FIX-2 (2026-08-08): settleAndAckDispatch 在 resolve 层显式拒绝 identityConflict（SC-2 冲突
+  // 接线——在使用前 fail-closed），该场景（内容身份错位）由 resolve 层先拦、不再进入锁内复核，
+  // 报错文案为 identityConflict；锁内 identityMatches 复核保留兜底 TOCTOU。行为断言（非零退出/
+  // pending 保留/台账不动）不变，文案断言兼容两种表达。
+  ok(/identity 与 state 不匹配|identityConflict/.test(cliErr), `SC-B1: 必须报 identity 不匹配或 identityConflict（不结算不 ack）: ${cliErr.slice(0, 160)}`);
   const st93b = readJson(st93File);
   ok(st93b.pending_dispatch?.dispatch_id === m93.dispatch_id, 'SC-B1: identity 不匹配必须保留 pending（不清 pending，引擎可重派）');
   // 台账基线: 91(reserve+actual) + 92(reserve+actual) + 93(reserve) = 5 行；identity 失败不得追加
@@ -6922,6 +6926,192 @@ t('[R3-SC-S2] register 双仓同 PR 并存: mame/_#301 与 mame/-#301 各自注�
   ok(readFileSync(join(r3Dir, 'journal.jsonl'), 'utf8').includes('state-file-rejected'), '内容不符拒绝留痕');
   writeFileSync(aFile, JSON.stringify({ ...readJson(aFile), repo: '_' }));
   r3Ack('mame', '_', 301); r3Ack('mame', '-', 301); // 清 pending 防污染后续用例
+});
+
+t('[R3-SC-S2] SC-FIX-1 身份校验: 一身份 legacy 预存、另一身份 registerPr/unregisterPr 不得污染/删除其记录', () => {
+  // 每场景独立 stateDir（r3State 已被本段前面测试写过 mame/_#301 等文件；场景之间也互不干扰——
+  // B1 的前提是「调用方身份无自身文件」，与场景 A 的新建文件序列互斥）
+  const fixDir = () => { const d = mkdtempSync(join(tmpdir(), 'r3-fix1-')); mkdirSync(d, { recursive: true }); return d; };
+  // 场景 A: 预置 legacy 文件（身份 mame/-#301，旧命名 mame__-__301.json）——v2 clean 折叠下
+  // 它恰是 mame/_#301 的旧名（碰撞落点）。对 mame/_#301 registerPr:
+  //   round-trip 判据只证明内容==文件名、不证明内容==调用方身份；修复前会把 mame/-#301 的
+  //   文件当 mame/_#301 的已有注册（already+migrated 且覆写接线），修复后必须识别为
+  //   「他身份文件」→ 不 already、不覆写、本身份另建新名文件。
+  const dirA = fixDir();
+  const legacyA = 'mame__-__301.json';
+  writeFileSync(join(dirA, legacyA), JSON.stringify(r3V2('mame', '-', 301)));
+  const ra = registerPr({ stateDir: dirA, owner: 'mame', repo: '_', prNumber: 301, branch: 'fa', pushRemote: 'origin' });
+  ok(ra.already === false, 'SC-FIX-1A 他身份 legacy 预存 → registerPr 不得 already（修复前误报 already:true）');
+  ok(ra.migrated === false, 'SC-FIX-1A 不得声称 migrated');
+  const legacyAState = readJson(join(dirA, legacyA));
+  eq([legacyAState.owner, legacyAState.repo, legacyAState.pr_number], ['mame', '-', 301], 'SC-FIX-1A legacy 内容未被覆写（仍属 mame/-#301）');
+  const newA = stateFileName('mame', '_', 301);
+  ok(existsSync(join(dirA, newA)), `SC-FIX-1A 本身份新建有主新命名文件: ${newA}`);
+  eq([readJson(join(dirA, newA)).owner, readJson(join(dirA, newA)).repo], ['mame', '_'], 'SC-FIX-1A 新文件内容身份=mame/_（有主，非名实不符无主文件）');
+  rmSync(dirA, { recursive: true, force: true });
+
+  // 场景 B: unregisterPr 不得删除他身份合法注册记录
+  //   B1: 独立目录只预置 mame/-#301 的 legacy → mame/_#301 unregister → 不删他身份文件
+  //   （调用方身份无自身文件，解析走 legacy 身份不符 → 不迁移 → 无文件可删）
+  const dirB = fixDir();
+  writeFileSync(join(dirB, legacyA), JSON.stringify(r3V2('mame', '-', 301)));
+  const rb1 = unregisterPr({ stateDir: dirB, owner: 'mame', repo: '_', prNumber: 301, reason: 'fixture' });
+  eq(rb1.removed, false, 'SC-FIX-1B1 他身份 legacy 预存 → unregisterPr removed:false（修复前直接 unlink 他身份文件）');
+  ok(existsSync(join(dirB, legacyA)), 'SC-FIX-1B1 legacy 记录保留（mame/-#301 未被误删）');
+  //   B2: 新名路径被 mame/_#301 内容占据（旧命名即 mame/-#301 的新名）→ mame/-#301 unregister
+  //   走 identityConflict 拒绝不删
+  writeFileSync(join(dirB, legacyA), JSON.stringify(r3V2('mame', '_', 301)));
+  const rb2 = unregisterPr({ stateDir: dirB, owner: 'mame', repo: '-', prNumber: 301, reason: 'fixture' });
+  eq(rb2.removed, false, 'SC-FIX-1B2 新名路径被 mame/_#301 内容占据 → mame/-#301 unregister 拒绝（identityConflict）');
+  ok(existsSync(join(dirB, legacyA)), 'SC-FIX-1B2 mame/_#301 的合法注册记录保留（未被他身份 unregister 删除）');
+
+  // 场景 C: 冲突拒绝报错身份与实际请求一致（不得指向他身份的在途 dispatch 误导）
+  let cMsg = null;
+  try { registerPr({ stateDir: dirB, owner: 'mame', repo: '-', prNumber: 301, branch: 'fb', pushRemote: 'origin' }); }
+  catch (e) { cMsg = e.message; }
+  ok(cMsg !== null, 'SC-FIX-1C 他身份占据本身份新名 → registerPr 抛错（fail-closed）');
+  ok(cMsg !== null && cMsg.includes('注册冲突') && cMsg.includes('mame/-#301'), 'SC-FIX-1C 报错含调用方真实身份 mame/-#301');
+  ok(cMsg !== null && !cMsg.includes('在途 dispatch'), 'SC-FIX-1C 报错不指向他身份的在途 dispatch（不误导）');
+  ok(existsSync(join(dirB, legacyA)), 'SC-FIX-1C 冲突后他身份文件原样保留（不覆写不删除）');
+  rmSync(dirB, { recursive: true, force: true });
+
+  // 场景 D（对照）: 本身份 legacy 预存 → 本身份 registerPr 正常迁移 + already（守卫不误伤）
+  const dirD = fixDir();
+  const legacyD = 'mame__-__310.json';
+  writeFileSync(join(dirD, legacyD), JSON.stringify(r3V2('mame', '_', 310)));
+  const rd = registerPr({ stateDir: dirD, owner: 'mame', repo: '_', prNumber: 310, branch: 'fa', pushRemote: 'origin' });
+  ok(rd.already, 'SC-FIX-1D 本身份 legacy 预存 → registerPr already（迁移+幂等不误伤）');
+  ok(!existsSync(join(dirD, legacyD)), 'SC-FIX-1D 本身份 legacy 已迁移（旧名不再存在）');
+  rmSync(dirD, { recursive: true, force: true });
+});
+
+t('[R3-SC-S2] SC-FIX-1F unregisterPr 锁内身份复核: resolve→lock 窗口换入他身份文件（含在途 pending_dispatch）→ 拒绝且他身份文件原样保留', () => {
+  // 隔离复现（SC-2 实测）: unregisterPr 在 resolveStateFile 之后、withLock 内的 doIt() 在
+  // unlinkSync 前没有 identityMatches 复核，是四个共用调用方（register/ack/finalize/unregister）
+  // 中唯一缺锁内复核的变更入口。主进程先 acquireLock 持锁 → 子进程 unregisterPr resolve
+  // 通过（读到本身份 mame/_#301）→ 阻塞在 acquireLock → 主进程在锁外窗口把文件内容换成
+  // 他身份 mame/-#301（含在途 pending_dispatch）→ 释放锁 → 子进程 doIt 直接 unlinkSync。
+  // 修复前: 返回 {removed:true} 且他身份文件（含 pending）被物理删除；
+  // 修复后: 锁内 identityMatches 复核失败 → {removed:false}，文件/pending 原样保留。
+  const dir = mkdtempSync(join(tmpdir(), 'r3-toc-'));
+  const selfFile = join(dir, stateFileName('mame', '_', 301));
+  writeFileSync(selfFile, JSON.stringify(r3V2('mame', '_', 301)));
+  const lockPath = `${selfFile}.lock`;
+  const release = acquireLock(lockPath); // 主进程先持锁（模拟 unregisterPr 正在执行的锁窗口）
+  const sig = join(dir, 'resolved.sig');
+  const out = join(dir, 'out.json');
+  const childSrc = `
+    const fs = require('fs');
+    const { unregisterPr, resolveStateFile } = require(${JSON.stringify(join(S, 'pr-watch/register.mjs'))});
+    const r = resolveStateFile({ stateDir: process.env.SD, owner: 'mame', repo: '_', prNumber: 301 });
+    fs.writeFileSync(process.env.SIG, JSON.stringify({ file: r.file, identityConflict: r.identityConflict }));
+    const res = unregisterPr({ stateDir: process.env.SD, owner: 'mame', repo: '_', prNumber: 301, reason: 'fixture' });
+    fs.writeFileSync(process.env.OUT, JSON.stringify(res));
+  `;
+  const child = spawn(process.execPath, ['-e', childSrc], {
+    env: { ...process.env, SD: dir, SIG: sig, OUT: out },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  // 等子进程完成 resolve（信号文件出现 = resolve 已通过、正阻塞在 acquireLock）
+  const waitFor = (p, ms) => { const d = Date.now() + ms; while (!existsSync(p) && Date.now() < d) execFileSync('sleep', ['0.02']); return existsSync(p); };
+  const sigSeen = waitFor(sig, 5000);
+  ok(sigSeen, 'SC-FIX-1F 子进程 resolve 信号出现（已阻塞在锁）');
+  if (sigSeen) {
+    const sigInfo = JSON.parse(readFileSync(sig, 'utf8'));
+    ok(sigInfo.identityConflict !== true, 'SC-FIX-1F resolve 阶段读到本身份（非 conflict，窗口成立）');
+    // 锁外窗口换入他身份文件（含在途 pending_dispatch）
+    writeFileSync(selfFile, JSON.stringify({
+      ...r3V2('mame', '-', 301, 'fb'),
+      pending_dispatch: { dispatch_id: 'd1', budget: { ledger: join(dir, 'b.jsonl'), estimate: 1 }, cursors_next: null }
+    }));
+  }
+  release(); // 释放锁 → 子进程 doIt
+  const outSeen = waitFor(out, 5000);
+  ok(outSeen, 'SC-FIX-1F 子进程完成输出');
+  if (outSeen) {
+    const res = JSON.parse(readFileSync(out, 'utf8'));
+    eq(res.removed, false, 'SC-FIX-1F 锁内复核失败 → removed:false（修复前 removed:true 物理删除他身份文件）');
+  }
+  const heFile = selfFile;
+  ok(existsSync(heFile), 'SC-FIX-1F 他身份文件未被物理删除（原样保留）');
+  if (existsSync(heFile)) {
+    const he = readJson(heFile);
+    eq([he.owner, he.repo, he.pr_number], ['mame', '-', 301], 'SC-FIX-1F 文件内容身份仍是他身份 mame/-#301');
+    ok(he.pending_dispatch !== null, 'SC-FIX-1F 他身份在途 pending_dispatch 原样保留（未被清空）');
+  }
+  try { child.kill(); } catch { /* 已退出 */ }
+  rmSync(dir, { recursive: true, force: true });
+});
+
+t('[R3-SC-S2] SC-FIX-1C checkReceipt identityConflict: state=null 不携带他身份注册详情、无误导性要素④', () => {
+  // 预置 mame/-#301 请求路径被 mame/_#301 内容占据（v2 clean 折叠碰撞落点:
+  // mame/_ 的旧名恰是 mame/- 的新名）。修复前 checkReceipt 读取该他身份文件并返回其
+  // branch/push_repo/push_remote/registered_by（state leak），要素④还用他身份文件的
+  // first_scan_ack 判定本 PR（误判）。
+  const dir = mkdtempSync(join(tmpdir(), 'r3-rec-'));
+  const heFile = join(dir, stateFileName('mame', '-', 301));
+  writeFileSync(heFile, JSON.stringify(r3V2('mame', '_', 301, 'fb')));
+  const lease = join(dir, 'lease.json');
+  writeFileSync(lease, JSON.stringify({ last_success: new Date().toISOString() }));
+  const rc = checkReceipt({ stateDir: dir, owner: 'mame', repo: '-', prNumber: 301, leaseFile: lease, scheduleCheckCmd: ['echo', 'active'] });
+  ok(!rc.ok, '冲突路径 receipt ok=false（fail-closed）');
+  ok(rc.missing.some((m) => m.includes('要素①')), '冲突路径缺要素①（本身份无合法注册）');
+  ok(!rc.missing.some((m) => m.includes('要素④')), '冲突路径不产生基于他身份 first_scan_ack 的要素④消息');
+  eq(rc.state, null, '冲突路径返回 state=null（不携带他身份注册详情）');
+  // 对照: 他身份文件 first_scan_ack 已回写 → 仍不得读取/判定（state 恒 null、无要素④）
+  writeFileSync(heFile, JSON.stringify({ ...r3V2('mame', '_', 301, 'fb'), first_scan_ack: new Date().toISOString() }));
+  const rc2 = checkReceipt({ stateDir: dir, owner: 'mame', repo: '-', prNumber: 301, leaseFile: lease, scheduleCheckCmd: ['echo', 'active'] });
+  eq(rc2.state, null, '他身份 first_scan_ack 已回写 → 仍不读他身份文件（state=null）');
+  ok(!rc2.missing.some((m) => m.includes('要素④')), '他身份 first_scan_ack 已回写 → 无要素④消息');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+t('[R3-SC-S2] SC-FIX-1D 消费方 identityConflict 拒绝: ack/cancel/settle 不清空他身份 pending', () => {
+  // 隔离复现（SC-2）: legacy 路径 mame__-__301.json 内容身份为 mame/_#301，调用
+  // ackDispatch(owner=mame, repo=-, pr=301, dispatchId=d1) 修复前按 dispatch_id 命中
+  // 他身份 pending → 返回 {ok:true} 并清空他身份 pending_dispatch。修复后必须全部拒绝。
+  const dir = mkdtempSync(join(tmpdir(), 'r3-cons-'));
+  const heFile = join(dir, stateFileName('mame', '-', 301));
+  const heState = {
+    ...r3V2('mame', '_', 301, 'fb'),
+    pending_dispatch: { dispatch_id: 'd1', budget: { ledger: join(dir, 'b.jsonl'), estimate: 1 }, cursors_next: null }
+  };
+  writeFileSync(heFile, JSON.stringify(heState));
+  const a1 = ackDispatch({ stateDir: dir, owner: 'mame', repo: '-', prNumber: 301, dispatchId: 'd1' });
+  ok(a1.ok === false, 'ackDispatch identityConflict → 拒绝（不按 dispatch_id 放行他身份状态）');
+  ok(a1.reason.includes('identityConflict'), 'ackDispatch 拒绝 reason 指向 identityConflict（resolved 层显式拒绝，反向变异可鉴别）');
+  ok(readJson(heFile).pending_dispatch !== null, 'ackDispatch 拒绝后他身份 pending 原样保留（未清空）');
+  const c1 = cancelDispatch({ stateDir: dir, owner: 'mame', repo: '-', prNumber: 301, dispatchId: 'd1' });
+  ok(c1.ok === false, 'cancelDispatch identityConflict → 拒绝');
+  ok(c1.reason.includes('identityConflict'), 'cancelDispatch 拒绝 reason 指向 identityConflict');
+  ok(readJson(heFile).pending_dispatch !== null, 'cancelDispatch 拒绝后他身份 pending 原样保留');
+  const s1 = settleAndAckDispatch({ stateDir: dir, owner: 'mame', repo: '-', prNumber: 301, dispatchId: 'd1' });
+  ok(s1.ok === false, 'settleAndAckDispatch identityConflict → 拒绝（不结算不 ack）');
+  ok(s1.reason.includes('identityConflict'), 'settleAndAckDispatch 拒绝 reason 指向 identityConflict');
+  ok(readJson(heFile).pending_dispatch !== null, 'settleAndAckDispatch 拒绝后他身份 pending 原样保留');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+t('[R3-SC-S2] SC-FIX-1E finalize 消费方 identityConflict 拒绝: 不按 dispatch_id 放行他身份状态', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'r3-fin-'));
+  const heFile = join(dir, stateFileName('mame', '-', 301));
+  writeFileSync(heFile, JSON.stringify({
+    ...r3V2('mame', '_', 301, 'fb'),
+    pending_dispatch: { dispatch_id: 'd1', budget: { ledger: join(dir, 'b.jsonl'), estimate: 1 }, cursors_next: null }
+  }));
+  const mf = join(dir, 'manifest.json');
+  writeFileSync(mf, JSON.stringify({
+    owner: 'mame', repo: '-', pr_number: 301, branch: 'fb',
+    original_head: HEAD, dispatch_id: 'd1', remote: 'origin'
+  }));
+  const snapSh = join(dir, 'snap.sh');
+  writeFileSync(snapSh, `#!/bin/sh\necho '{"state":"open","head_sha":"${HEAD}"}'\n`);
+  execFileSync('chmod', ['+x', snapSh]);
+  const r = spawnSync(process.execPath, [join(S, 'pr-watch/finalize.mjs'), '--repo-dir', repo, '--manifest', mf, '--snapshot-cmd', snapSh, '--state-dir', dir], { encoding: 'utf8' });
+  ok(r.status === 1, 'finalize identityConflict → exit 1（fail-closed，不 push）');
+  ok(r.stderr.includes('identityConflict'), 'finalize stderr 指向 identityConflict 占用');
+  ok(readJson(heFile).pending_dispatch !== null, 'finalize 拒绝后他身份 pending 原样保留');
+  rmSync(dir, { recursive: true, force: true });
 });
 
 t('[R3-SC-S2] 大小写归一 register 幂等: Mame/_#307 与 mame/_#307 同一文件 already；mame/-#307 独立', () => {

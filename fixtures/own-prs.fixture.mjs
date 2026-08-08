@@ -8,12 +8,12 @@
 //       空列表 [] / 双仓互不污染 / 幂等 already / 缺 map key 非零 / registerPr throw 非零 /
 //       fake gh 精确 argv 断言 + 反向变异（SC-F3）/ 非数组负例 / 真实 JSON 形状兼容。
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { writeJsonAtomic } from '../scripts/lib/common.mjs';
-import { stateFileName, STATE_FILE_NAME_RE } from '../scripts/pr-watch/register.mjs';
+import { stateFileName, STATE_FILE_NAME_RE, registerPr } from '../scripts/pr-watch/register.mjs';
 import { parseRepo } from '../deploy/wrappers/own-prs.mjs';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url));
@@ -76,6 +76,26 @@ if (process.env.OWN_PRS_FIXTURE_MODE === 'real') {
     { number: 301, headRefName: 'feat/real', headRepository: { nameWithOwner: MIVO, id: 'R_1', isPrivate: false },
       baseRefName: 'main', url: 'https://github.com/' + MIVO + '/pull/301', isDraft: false,
       headRepositoryOwner: { login: 'xindong' }, mergeable: 'MERGEABLE' }
+  ]));
+  process.exit(0);
+}
+// SC-FIX-2: 非法 PR 号（0/负数/非整数）必须 dropped——PR 段 \d+ 之外的状态文件名引擎永不扫描
+if (process.env.OWN_PRS_FIXTURE_MODE === 'badnums') {
+  process.stdout.write(JSON.stringify([
+    { number: 0, headRefName: 'feat/zero', headRepository: { nameWithOwner: MIVO } },
+    { number: -5, headRefName: 'feat/neg', headRepository: { nameWithOwner: MIVO } },
+    { number: 1.5, headRefName: 'feat/frac', headRepository: { nameWithOwner: MIVO } },
+    { number: 301, headRefName: 'feat/good', headRepository: { nameWithOwner: MIVO } }
+  ]));
+  process.exit(0);
+}
+// SC-FIX-3: 非法 wiring（branch 含空格/前导 -、push_remote 含空格、push_repo 非合法 full name 等）必须 dropped——
+// 可注册可派发但 finalize 必拒（无法收口）的空转不允许从数据生产侧产生
+if (process.env.OWN_PRS_FIXTURE_MODE === 'badwiring') {
+  process.stdout.write(JSON.stringify([
+    { number: 401, headRefName: 'bad branch', headRepository: { nameWithOwner: MIVO } },
+    { number: 402, headRefName: 'feat/ok', headRepository: { nameWithOwner: 'not-a-repo' } },
+    { number: 403, headRefName: 'feat/ok2', headRepository: { nameWithOwner: MIVO } }
   ]));
   process.exit(0);
 }
@@ -318,6 +338,117 @@ const w11prs = JSON.parse(w11.out.split('\n').filter((l) => l.startsWith('['))[0
 eq(w11prs.map((p) => [p.owner, p.repo, p.push_repo]), [
   ['mame', '_', null], ['mame', '_', PRINCE_PUNCT]
 ], 'S11 CLI 契约字段 owner/repo 正确 + push_repo 三态（同仓 null / 标点 fork 字符串）');
+
+// ---- S12 (SC-FIX-2): 非法 PR 号（0/负数/非整数）→ dropped，合法行照常注册 ----
+const r12 = reconcile(MIVO, join(gd, 'state-badnums'), join(gd, 'map.json'), { OWN_PRS_FIXTURE_MODE: 'badnums' });
+const o12 = JSON.parse(r12.out.split('\n').filter((l) => l.startsWith('{'))[0] ?? '{}');
+eq(r12.status, 0, 'S12 非法 PR 号 reconcile exit 0（合法 dropped 不判非零）');
+eq(o12.dropped.map((d) => d.pr).sort(), ['xindong/mivo-canvas#-5', 'xindong/mivo-canvas#0', 'xindong/mivo-canvas#1.5'], 'S12 三条非法 PR 号 dropped');
+ok(o12.dropped.every((d) => d.reason.includes('非正整数')), 'S12 dropped reason 指向 PR 号非正整数');
+eq(o12.registered, ['xindong/mivo-canvas#301'], 'S12 合法 PR 号 301 照常注册');
+const dirBadNums = join(gd, 'state-badnums');
+eq(readdirSync(dirBadNums).filter((f) => f.endsWith('.json')).length, 1, 'S12 只落盘一个状态文件（非法 PR 号零落盘）');
+
+// ---- S13 (SC-FIX-3): 非法 wiring → dropped；非法 alias → 启动前非零 ----
+const r13 = reconcile(MIVO, join(gd, 'state-badwiring'), join(gd, 'map.json'), { OWN_PRS_FIXTURE_MODE: 'badwiring' });
+const o13 = JSON.parse(r13.out.split('\n').filter((l) => l.startsWith('{'))[0] ?? '{}');
+eq(r13.status, 0, 'S13 非法 wiring reconcile exit 0（合法 dropped 不判非零）');
+eq(o13.dropped.map((d) => d.pr).sort(), ['xindong/mivo-canvas#401', 'xindong/mivo-canvas#402'], 'S13 非法 branch/push_repo 两条 dropped');
+ok(o13.dropped.some((d) => d.pr === 'xindong/mivo-canvas#401' && d.reason.includes('绑定守卫') && d.reason.includes('branch')), 'S13 dropped#401 reason 指向 branch 绑定守卫');
+ok(o13.dropped.some((d) => d.pr === 'xindong/mivo-canvas#402' && d.reason.includes('绑定守卫') && d.reason.includes('push_repo')), 'S13 dropped#402 reason 指向 push_repo 绑定守卫');
+eq(o13.registered, ['xindong/mivo-canvas#403'], 'S13 合法 wiring 行 403 照常注册');
+const dirBadWiring = join(gd, 'state-badwiring');
+eq(readdirSync(dirBadWiring).filter((f) => f.endsWith('.json')).length, 1, 'S13 只落盘一个状态文件（非法 wiring 零落盘）');
+// 非法 alias（push_remote='bad remote'）→ loadRemoteMap 启动前 fail-closed（非逐 PR dropped，无任何落盘）
+const mapBadAlias = join(gd, 'map-badalias.json');
+writeFileSync(mapBadAlias, JSON.stringify({ [MIVO]: 'bad remote' }));
+const r13b = reconcile(MIVO, join(gd, 'state-badalias'), mapBadAlias, { OWN_PRS_FIXTURE_MODE: 'empty' });
+ok(r13b.status !== 0, 'S13 非法 alias（bad remote）→ reconcile 启动前非零');
+ok(r13b.out.includes('绑定守卫'), 'S13 报错指向 alias 绑定守卫（fail-closed，无 state 落盘）');
+ok(!existsSync(join(gd, 'state-badalias')) || readdirSync(join(gd, 'state-badalias')).filter((f) => f.endsWith('.json')).length === 0, 'S13 非法 alias 无状态文件落盘');
+
+// ---- S14 (SC-FIX-2/3): registerPr 共同落盘点 fail-closed（CLI/任意调用方入口同等拦截） ----
+const s14Dir = join(gd, 'state-s14');
+mkdirSync(s14Dir, { recursive: true });
+const badArgCases = [
+  { prNumber: 0, label: 'PR 号 0' },
+  { prNumber: -5, label: 'PR 号 -5' },
+  { prNumber: 1.5, label: 'PR 号 1.5' },
+  { prNumber: 'abc', label: 'PR 号非数字串' },
+  // SC-FIX-4 (2026-08-08): Number 强转会归一放行的异形输入——'1e2'→100 生成 o__r__100.json、
+  // '01'→1 生成 o__r__1.json、true→1、[1]→1，全部必须拒绝（不生成与传入表示不一致的绕过文件）
+  { prNumber: '1e2', label: 'PR 号科学计数法 1e2' },
+  { prNumber: '01', label: 'PR 号前导零 01' },
+  { prNumber: true, label: 'PR 号 boolean' },
+  { prNumber: [1], label: 'PR 号数组 [1]' },
+  // SC-FIX-4 精度缺口 (2026-08-08 R2): /^[1-9]\d*$/ 只验十进制形状不验数值保真——超过
+  // Number.MAX_SAFE_INTEGER 的十进制字符串经 Number() 双精度损失后仍被接受
+  // （'9007199254740993'→9007199254740992），两个不同 PR 号归一化到同一 state 文件；
+  // number 型分支亦无 isSafeInteger 检查。必须拒绝（修复前该用例红）。
+  { prNumber: '9007199254740993', label: 'PR 号超 MAX_SAFE_INTEGER 十进制串' },
+  { prNumber: 9007199254740993, label: 'PR 号超 MAX_SAFE_INTEGER number' }
+];
+for (const c of badArgCases) {
+  let threw = false;
+  try { registerPr({ stateDir: s14Dir, owner: 'xindong', repo: 'mivo-canvas', prNumber: c.prNumber, branch: 'feat/x', pushRemote: 'origin' }); }
+  catch { threw = true; }
+  ok(threw, `S14 registerPr 拒绝非法 ${c.label}（fail-closed）`);
+}
+const badWiringCases = [
+  { branch: 'bad branch', label: 'branch 含空格' },
+  { pushRemote: 'bad remote', label: 'push_remote 含空格' },
+  { branch: '-x', label: 'branch 前导 -' },
+  // SC-FIX-5 (2026-08-08): 非字符串 wiring——git-checks 语法守卫内部 String() 归一
+  // （123→'123'、true→'true'、自定义 toString 对象→任意串）会隐式强转放行，落盘前
+  // 必须先拒绝非字符串（守卫不依赖隐式强转）
+  { branch: 123, label: 'branch 数字 123' },
+  { pushRemote: true, label: 'push_remote boolean' },
+  { branch: { toString: () => 'feat/x' }, label: 'branch 自定义 toString 对象' }
+];
+for (const c of badWiringCases) {
+  let threw = false;
+  try { registerPr({ stateDir: s14Dir, owner: 'xindong', repo: 'mivo-canvas', prNumber: 501, branch: c.branch ?? 'feat/x', pushRemote: c.pushRemote ?? 'origin', pushRepo: c.pushRepo }); }
+  catch { threw = true; }
+  ok(threw, `S14 registerPr 拒绝非法 wiring（${c.label}）`);
+}
+let pushRepoThrew = false;
+try { registerPr({ stateDir: s14Dir, owner: 'xindong', repo: 'mivo-canvas', prNumber: 502, branch: 'feat/x', pushRemote: 'origin', pushRepo: 'not-a-repo' }); }
+catch { pushRepoThrew = true; }
+ok(pushRepoThrew, 'S14 registerPr 拒绝非法 push_repo（not-a-repo）');
+let pushRepoNumThrew = false;
+// 自定义 toString 对象：String() 隐式强转得合法全名 'xindong/mivo-canvas'——语法守卫拦不住，
+// 必须由类型守卫在落盘前拒绝（若用数字 42，语法守卫的无斜杠检查也会拦，无法区分类型守卫在咬）
+try { registerPr({ stateDir: s14Dir, owner: 'xindong', repo: 'mivo-canvas', prNumber: 504, branch: 'feat/x', pushRemote: 'origin', pushRepo: { toString: () => 'xindong/mivo-canvas' } }); }
+catch { pushRepoNumThrew = true; }
+ok(pushRepoNumThrew, 'S14 registerPr 拒绝非字符串 push_repo（自定义 toString 对象，不依赖 String 隐式强转）');
+const goodReg = registerPr({ stateDir: s14Dir, owner: 'xindong', repo: 'mivo-canvas', prNumber: 503, branch: 'feat/x', pushRemote: 'origin', pushRepo: null });
+ok(goodReg.already === false && existsSync(goodReg.file), 'S14 registerPr 合法注册（pushRepo=null 同仓三态）正常');
+eq(readdirSync(s14Dir).filter((f) => f.endsWith('.json')).length, 1, 'S14 非法请求零落盘，仅 503 一个合法状态文件');
+ok(STATE_FILE_NAME_RE.test(goodReg.file.split('/').pop()), 'S14 合法注册文件名满足 STATE_FILE_NAME_RE（引擎可扫描）');
+
+// ---- S15 (SC-FIX-5 继承路径, 2026-08-08 R2): 迁移/继承分支的 prev.push_repo 值不经类型/绑定守卫
+//      直接落盘——类型守卫仅覆盖「本次显式传参」分支（register.mjs:213-218），继承 prev.push_repo
+//      时不校验。预置畸形 push_repo:{} 后仅改 branch 重注册 → 修复前 migrated:true 且畸形对象
+//      原样落盘（后续被 git-checks.mjs 的 String() 隐式强转消费）；修复后必须拒绝（fail-closed）----
+const s15Dir = join(gd, 'state-s15');
+mkdirSync(s15Dir, { recursive: true });
+writeJsonAtomic(stateFile(s15Dir, 'xindong', 'mivo-canvas', 601), {
+  schema_version: 'v2', owner: 'xindong', repo: 'mivo-canvas', pr_number: 601,
+  branch: 'feat/OLD', push_repo: {}, push_remote: 'origin', // 畸形 push_repo（对象）
+  registered_at: '2026-08-08T00:00:00.000Z', registered_by: 'fixture',
+  cursors: null, pending_dispatch: null, first_scan_ack: null, status: 'watching'
+});
+// 仅改 branch 重注册（不传 pushRepo → 继承 prev.push_repo）
+let s15Threw = false;
+let s15Result = null;
+try {
+  s15Result = registerPr({ stateDir: s15Dir, owner: 'xindong', repo: 'mivo-canvas', prNumber: 601, branch: 'feat/NEW', pushRemote: 'origin' });
+} catch { s15Threw = true; }
+ok(s15Threw, 'S15 继承畸形 prev.push_repo → registerPr 拒绝（修复前 migrated:true 且畸形对象落盘）');
+if (!s15Threw && s15Result) ok(s15Result.migrated !== true, 'S15 不得声称 migrated（畸形 push_repo 继承路径）');
+const s15State = JSON.parse(readFileSync(stateFile(s15Dir, 'xindong', 'mivo-canvas', 601), 'utf8'));
+eq(s15State.branch, 'feat/OLD', 'S15 拒绝后文件未被本次注册覆写（branch 仍为预置旧值）');
+eq(s15State.registered_by, 'fixture', 'S15 拒绝后文件未被本次注册覆写（registered_by 仍为预置值）');
 
 console.log(`own-prs.fixture: ${failed === 0 ? 'all pass' : failed + ' failed'}`);
 process.exit(failed === 0 ? 0 : 1);

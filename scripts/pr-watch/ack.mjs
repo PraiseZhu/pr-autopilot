@@ -5,18 +5,29 @@ import { existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import { join, dirname, resolve as resolvePath } from 'node:path';
 import { readJson, writeJsonAtomic, parseArgs, fail, nowIso, isMain} from '../lib/common.mjs';
 import { withLock } from '../lib/state-lock.mjs';
-import { resolveStateFile } from './register.mjs';
+import { resolveStateFile, identityMatches } from './register.mjs';
 import { releaseReserve, settleDispatchBudget } from './budget.mjs';
 import { receiptPathLocked } from './finalize.mjs';
 
 // 审③-F14: 读改写全程持 per-key 锁（与 engine 同一把），防并发丢更新/复活 pending
 export function ackDispatch({ stateDir, owner, repo, prNumber, dispatchId, journalFile }) {
   // R3 修复: 按身份解析（旧命名文件先迁移）再持新名锁——与 engine/register/finalize 同源
-  const { file: resolvedFile } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  // SC-FIX-2 (2026-08-08): 解析路径被他身份文件占据（旧命名碰撞落点）→ 使用前 fail-closed
+  // 拒绝——绝不按 dispatch_id 放行他身份状态（冲突接线，SC-2）。
+  const { file: resolvedFile, identityConflict } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  if (identityConflict) {
+    return { ok: false, reason: `状态文件路径被其他身份占用（identityConflict: ${owner}/${repo}#${prNumber}）——不按 dispatch_id 放行他身份状态（fail-closed）` };
+  }
   const file = join(stateDir, resolvedFile);
   return withLock(`${file}.lock`, () => {
     if (!existsSync(file)) return { ok: false, reason: '状态文件不存在（可能已销单）' };
     const state = readJson(file);
+    // SC-FIX-2: 锁内身份复核（与 registerPr/settleAndAckDispatch 同源，identityMatches
+    // 大小写不敏感）——解析与持锁之间文件可被并发替换（TOCTOU），锁内重读内容身份
+    // 必须等于调用方身份才放行。
+    if (!identityMatches(state, owner, repo, prNumber)) {
+      return { ok: false, reason: `state 内容身份与调用方不符（state=${state.owner}/${state.repo}#${state.pr_number} 调用=${owner}/${repo}#${prNumber}）——不 ack 他身份状态（fail-closed）` };
+    }
     const pending = state.pending_dispatch;
     if (!pending) return { ok: false, reason: '无 pending dispatch（重复 ack 幂等忽略）' };
     if (pending.dispatch_id !== dispatchId) {
@@ -53,14 +64,22 @@ export function ackDispatch({ stateDir, owner, repo, prNumber, dispatchId, journ
 // pending 原样保留 → 引擎 at-least-once 重派重跑，幂等收敛（已结算跳过，无半状态）。
 export function settleAndAckDispatch({ stateDir, owner, repo, prNumber, dispatchId, actualUsd = null, journalFile }) {
   // R3 修复: 同源解析（旧命名文件先迁移），收口路径与 ack/cancel/finalize 一致
-  const { file: resolvedFile } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  // SC-FIX-2 (2026-08-08): 解析路径被他身份文件占据（旧命名碰撞落点）→ 使用前 fail-closed
+  // 拒绝——不结算不 ack（冲突接线，SC-2）。
+  const { file: resolvedFile, identityConflict } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  if (identityConflict) {
+    return { ok: false, reason: `状态文件路径被其他身份占用（identityConflict: ${owner}/${repo}#${prNumber}）——不结算不 ack（fail-closed）` };
+  }
   const file = join(stateDir, resolvedFile);
   return withLock(`${file}.lock`, () => {
     if (!existsSync(file)) return { ok: false, reason: '状态文件不存在（可能已销单）' };
     const state = readJson(file);
     // SC-B1: manifest 自报 identity 必须与 state 内容一致（文件路径按 owner/repo/pr 定位，
     // 但内容可能错放/被换——锁内核对，任一不符 fail-closed：不结算不 ack）
-    if (state.owner !== owner || state.repo !== repo || state.pr_number !== Number(prNumber)) {
+    // SC-FIX-2: 复核判据与 registerPr 同源统一为 identityMatches（大小写不敏感——
+    // GitHub 身份大小写不敏感，Mame/Repo 与 mame/repo 同一身份；区分大小写比较会误伤
+    // 幂等收口路径）。
+    if (!identityMatches(state, owner, repo, prNumber)) {
       return { ok: false, reason: `manifest identity 与 state 不匹配（state=${state.owner}/${state.repo}#${state.pr_number} manifest=${owner}/${repo}#${prNumber}）——不结算不 ack（fail-closed）` };
     }
     const pending = state.pending_dispatch;
@@ -109,11 +128,20 @@ export function settleAndAckDispatch({ stateDir, owner, repo, prNumber, dispatch
 //   任一崩溃点重启后由 engine 的 canceling 恢复分支收敛。
 export function cancelDispatch({ stateDir, owner, repo, prNumber, dispatchId, budgetLedger = null, journalFile }) {
   // R3 修复: 同源解析（旧命名文件先迁移），取消路径与 ack/complete/finalize 一致
-  const { file: resolvedFile } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  // SC-FIX-2 (2026-08-08): 解析路径被他身份文件占据（旧命名碰撞落点）→ 使用前 fail-closed
+  // 拒绝——绝不清他身份 pending（冲突接线，SC-2）。
+  const { file: resolvedFile, identityConflict } = resolveStateFile({ stateDir, owner, repo, prNumber, journalFile });
+  if (identityConflict) {
+    return { ok: false, reason: `状态文件路径被其他身份占用（identityConflict: ${owner}/${repo}#${prNumber}）——不清他身份 pending（fail-closed）` };
+  }
   const file = join(stateDir, resolvedFile);
   return withLock(`${file}.lock`, () => {
     if (!existsSync(file)) return { ok: false, reason: '状态文件不存在（可能已销单）' };
     const state = readJson(file);
+    // SC-FIX-2: 锁内身份复核（与 ackDispatch 同源）——解析与持锁之间的 TOCTOU 窗口兜底
+    if (!identityMatches(state, owner, repo, prNumber)) {
+      return { ok: false, reason: `state 内容身份与调用方不符（state=${state.owner}/${state.repo}#${state.pr_number} 调用=${owner}/${repo}#${prNumber}）——不清他身份 pending（fail-closed）` };
+    }
     const pending = state.pending_dispatch;
     if (!pending) return { ok: false, reason: '无 pending dispatch（无可取消）' };
     if (pending.dispatch_id !== dispatchId) {
