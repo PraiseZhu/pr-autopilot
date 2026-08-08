@@ -221,7 +221,7 @@ export REQUIRED_CONTEXTS_FILE=/path/to/required-contexts.json
 - **两类 check 绝对不能进这份清单（同一类陷阱的两个变种）**：
   - **`SKIPPED` 不算绿**：gh-snapshot 归一化 check-run 时只有 `conclusion == success` 才映射为绿，`skipped`/`neutral`/`cancelled` 一律非绿（`gh-snapshot.mjs:135`；`scripts/ci-readiness.mjs:33` `entry.state !== 'success'` → fail-closed 非绿）。按路径过滤的 job（改动不命中就 SKIPPED）一旦进清单，该 PR 永远判不绿。
   - **只在 `pull_request` 事件上跑的 job 同样不能列**：它在 main push 上根本不产生 check，列进去 = 永远等一个不会来的绿。真实案例：mivo 仓（`xindong/mivo-canvas`）`.github/workflows/deploy-green-ref.yml` 的 `REQUIRED_ON_MAIN` 数组上方注释（本机踩过并写死在注释里的教训，措辞以该文件当前内容为准）——e2e 系列 job 是 pull_request-only，main push 上不存在，不能列（列了 ref 永远不动）；bench / deps audit / semgrep baseline / coverage report 是设计上的非阻断，不纳入。**设计上非阻断的 job（bench / audit / baseline / coverage 类）也不进清单**。
-- **没配/文件缺失 = fail-closed 非绿，同一 head 的 ci-red 在本轮之内判一次并去重**：gh-snapshot 对未配置的 required 返回 `green: false` + `['required contexts 未配置（fail-closed）']`（`gh-snapshot.mjs:147`）→ gate 对**同一 head** 的 ci-red 用 `cursors.ci_red_sha !== head` 去重（`gate.mjs:61-62`）——**前提是状态真的落盘了（投递成功、pending/ack 已持久化）**；若投递失败，`engine.mjs:356-363` 释放预留（`:358`）且**游标不推进**（「下轮重试 = at-least-once」，失败记 `dispatch-failed` journal 事件 `:361`），`engine.mjs:364` 落盘的状态里没有 pending/cursor 推进，下一轮 gate 仍见 `ci_red_sha != head` → 仍 actionable → **可能每轮重新启动 agent**（`fixtures/run-fixtures.mjs:1194-1246` 已覆盖首派/重派连续失败重试；重派失败同样持久化 `redispatch_count`（`engine.mjs:256`）并计入 stuck 判据（`engine.mjs:240`））。**不保证低唤醒/低 token**——别据此估预算。（早期版本写「CI 永远红 → 每轮都唤醒」不成立，已更正；本段也不构成跨轮静默保证。）
+- **没配/文件缺失 = fail-closed 非绿，同一 head 的 ci-red 在本轮之内判一次并去重**：gh-snapshot 对未配置的 required 返回 `green: false` + `['required contexts 未配置（fail-closed）']`（`gh-snapshot.mjs:147`）→ gate 对**同一 head** 的 ci-red 用 `cursors.ci_red_sha !== head` 去重（`gate.mjs:61-62`）——**前提是状态真的落盘了（投递成功、pending/ack 已持久化）**；若投递失败，`engine.mjs:356-363` 释放预留（`:358`）且**游标不推进**（「下轮重试 = at-least-once」，失败记 `dispatch-failed` journal 事件 `:361`），`engine.mjs:364` 落盘的状态里没有 pending/cursor 推进，下一轮 gate 仍见 `ci_red_sha != head` → 仍 actionable → **可能每轮重新启动 agent**（`fixtures/run-fixtures.mjs:1351-1403` 已覆盖首派/重派连续失败重试；重派失败同样持久化 `redispatch_count`（`engine.mjs:256`）并计入 stuck 判据（`engine.mjs:240`））。**不保证低唤醒/低 token**——别据此估预算。（早期版本写「CI 永远红 → 每轮都唤醒」不成立，已更正；本段也不构成跨轮静默保证。）
 
 **②b `SNAPSHOT_CACHE_DIR` —— 不配 = 每轮探针都是普通 API 请求，配额被静默低估**
 
@@ -231,7 +231,7 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
 
 - gh-snapshot 只在 `SNAPSHOT_CACHE_DIR` 非空时启用响应缓存 + ETag 条件请求（`gh-snapshot.mjs:16` `CACHE_DIR = process.env.SNAPSHOT_CACHE_DIR ?? null`；判非空分支 `:27-31`、写缓存 `:62`，均在 `CACHE_DIR` 非空分支内）。
 - **不配的后果**：每轮探针/引擎的 gh API 请求都是普通请求，不发 `If-None-Match`、拿不到 304——**没有报错，唯一信号是 GitHub API 配额被静默低估**（探针每班车周期一次 × 在册 PR 数 × 多接口，长期累积可观）。
-- **配置了也有运维前提（不是无副作用）**：正常可读写时**不改变判定协议**——ETag 命中（304）只省 API 调用，非绿判据不变（`gh-snapshot.mjs:27-31` 判非空、`:62` `mkdirSync(CACHE_DIR,{recursive:true}) + writeFileSync(cacheFile,…)` 真实文件系统写入）。但**缓存目录不可写或既有缓存内容损坏会抛错**（`:28` 解析既有 cache、`:62` 写 cache）→ wrapper 自身 `:178-180` **exit 1**。注意 **exit 1 不等于「CI 判非绿」**——快照没产出，走不到绿/非绿判定：`engine.mjs:115-119` 捕获快照失败后只写 stderr（「保持状态，下轮重试」）并 `continue`，**跳过该 PR 本轮、不进 gate**；`probe.mjs:59-61` 对运行期异常是 **exit 0 = fail-open**（注释原文「放行班车，让引擎/通知链暴露问题」），班车照常起。所以缓存故障的真实表现是**本轮静默跳过 + 班车仍被放行**（可能反复耗 token），**不是 fail-closed 拦停**——必须修好缓存目录/文件才会恢复正常判定。这是一条运维前提（目录权限 / 磁盘可写 / 缓存文件可解析），不能当成「无副作用」。
+- **配置了也有运维前提（不是无副作用）**：正常可读写时**不改变判定协议**——ETag 命中（304）只省 API 调用，非绿判据不变（`gh-snapshot.mjs:27-31` 判非空、`:62` `mkdirSync(CACHE_DIR,{recursive:true}) + writeFileSync(cacheFile,…)` 真实文件系统写入）。但**缓存目录不可写或既有缓存内容损坏会抛错**（`:28` 解析既有 cache、`:62` 写 cache）→ wrapper 自身 `:178-180` **exit 1**。注意 **exit 1 不等于「CI 判非绿」**——快照没产出，走不到绿/非绿判定：`engine.mjs:115-119` 捕获快照失败后只写 stderr（「保持状态，下轮重试」）并 `continue`，**跳过该 PR 本轮、不进 gate**；`probe.mjs:62-64` 对运行期异常是 **exit 0 = fail-open**（注释原文「放行班车，让引擎/通知链暴露问题」），班车照常起。所以缓存故障的真实表现是**本轮静默跳过 + 班车仍被放行**（可能反复耗 token），**不是 fail-closed 拦停**——必须修好缓存目录/文件才会恢复正常判定。这是一条运维前提（目录权限 / 磁盘可写 / 缓存文件可解析），不能当成「无副作用」。
 - 这条是**配置项**，不是可选优化——部署时必须显式配，配了才算用了 ETag；并确保缓存目录可写、缓存可解析。
 
 **③ preRunHook 必须用 `deploy/wrappers/probe.mjs`，别自己造一个**
@@ -239,9 +239,9 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
 班车 schedule 的 preRunHook 直接用本仓现成的 `deploy/wrappers/probe.mjs`，不要另写：
 
 - **三条退出路径（都要接对）**：
-  - `exit 0` = 有活 → 放行班车 agent 会话（引擎 + 队列投递）；**或运行期异常放行**（`probe.mjs:59-61` catch → exit 0，可用性优先：让完整引擎 + 通知链去暴露问题，而不是让探针静默扼杀所有轮次）；
-  - `exit 2` = 无活 → 跳过本轮，**零 token**，只花几次带 ETag 的 gh API 读（`probe.mjs:64`）；
-  - `exit 1` = **参数/初始化错误**（`probe.mjs:47-50` 在 try 外 `fail(...,1)`，模块导入/初始化异常也不在 catch 内），**不受 fail-open 保护，且本仓未定义调度侧如何处理 exit 1**——这是调用姿势错了，不是「探针异常」。（本仓只有 exit 0/2 协议。）
+  - `exit 0` = 有活 → 放行班车 agent 会话（引擎 + 队列投递）；**或运行期异常放行**（`probe.mjs:62-64` catch → exit 0，可用性优先：让完整引擎 + 通知链去暴露问题，而不是让探针静默扼杀所有轮次）；
+  - `exit 2` = 无活 → 跳过本轮，**零 token**，只花几次带 ETag 的 gh API 读（`probe.mjs:67`）；
+  - `exit 1` = **参数/初始化错误**（`probe.mjs:52` 在 try 外 `fail(...,1)`，模块导入/初始化异常也不在 catch 内），**不受 fail-open 保护，且本仓未定义调度侧如何处理 exit 1**——这是调用姿势错了，不是「探针异常」。（本仓只有 exit 0/2 协议。）
 - **宿主 preRunHook 失败语义 2026-08-08 已确认：fail-open**——preRunHook 失败/异常不会拦停班车会话，宿主照常启动；所以「不接 probe 会怎样」从「可能每周期启动会话（需实测）」升级为**确定的**「每周期必起会话、空转轮也烧 token」。fail-closed 的唯一来源是把 probe.mjs 的 `exit 2` 接进宿主 preRunHook（无活 → 真正跳过）；本仓源码自身没有「preRunHook 失败 → 拦停」的 fail-closed 路径（曾写「源码 fail-closed / 待实测」的旧说法已随 T4 更正，P0 项 ⑦ 见 `deploy/README.md:16`）。
 - **通知链是 best-effort，别依赖「收到」当验收**：`pending-stuck`（`engine.mjs:225`）与 `stuck`（`engine.mjs:240`）、`budget-pause`（`engine.mjs:297`）的发送失败都只记 `notify-error` journal 事件，**不重试、不补发**；`pending_stuck_notified` 去重标记在**尝试发送后即置位（含发送失败）**——取舍是宁丢一次不刷屏（`engine.mjs:222-224` 注释原文）。判断「告警是否被发出」以 journal 的 `notify-error` 有无为准，不能假设必达。
 - **`stuck` / `pending-stuck` 的路由（T3 定案，`notify-router.mjs` 的 `route()`/`isCindyRepo()`）**：以 **canonical owner/repo 判 cindy**（2026-08-08 GPT 审查修复，不再用裸 repo 名子串猜身份）——**cindy 仓（引擎传 `${owner}/${repo}` 全名，判据 = `makecindy/cindy`）→ `silent`（不产生任何通知，只记 journal）**；**其他仓（如 `xindong/mivo-canvas`、`PraiseZhu/pr-autopilot`）→ `feishu` 通道**。兼容旧调用：只传裸 repo 名（如 `cindy`）时判据为字面 `cindy`。pending-stuck 与 stuck 同通道、不落 ROUTES 表（否则 null 值会撞「未知事件类型」fail-closed）。「卡死无人知」在 cindy 仓是设计行为（W-6: cindy PR 卡死不打扰），不是漏配。
