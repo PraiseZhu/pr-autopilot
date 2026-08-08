@@ -10,7 +10,6 @@ import { existsSync } from 'node:fs';
 import { readJson, parseArgs, fail, isMain } from '../lib/common.mjs';
 import { verifyMarker } from './provenance.mjs';
 import { settleAndAckDispatch } from './ack.mjs';
-import { settleDispatchBudget } from './budget.mjs';
 import { receiptPath } from './finalize.mjs';
 
 // 审④-F4: candidate 不再由调用者自报——只认 finalize 落盘的 receipt

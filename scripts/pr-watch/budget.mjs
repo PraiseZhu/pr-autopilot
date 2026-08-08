@@ -150,7 +150,6 @@ export function reserveBudget({ ledgerFile, capUsd, estimateUsd, dispatchId, now
   if (!dispatchId) return { allowed: false, spent: null, reason: '缺 dispatch_id（reserve 必须可幂等/可结算）' };
   return withLock(`${ledgerFile}.lock`, () => {
     // 审⑤-F2: already 判断同样基于折叠后的最新状态（release 之后的 reserve 是新预留，不是重复）
-    // 审⑤-F2: already 判断同样基于折叠后的最新状态（release 之后的 reserve 是新预留，不是重复）
     // 审(2026-08-08 GPT R3): 幂等判定必须扫**全账本**——跨日重试时昨天的 reserve/actual
     // 行不能被当日 cutoff 过滤掉（否则昨日已结算/已预留的 dispatch 今天又被重新 reserve、
     // 重复占额）。当日口径只属于 cap 计算：spentToday 内部按当日 fold，昨日占额不滚入今日
