@@ -7047,61 +7047,141 @@ t('[R3-SC-S2] SC-FIX-1 身份校验: 一身份 legacy 预存、另一身份 regi
   rmSync(dirD, { recursive: true, force: true });
 });
 
-t('[R3-SC-S2] SC-FIX-1F unregisterPr 锁内身份复核: resolve→lock 窗口换入他身份文件（含在途 pending_dispatch）→ 拒绝且他身份文件原样保留', () => {
-  // 隔离复现（SC-2 实测）: unregisterPr 在 resolveStateFile 之后、withLock 内的 doIt() 在
-  // unlinkSync 前没有 identityMatches 复核，是四个共用调用方（register/ack/finalize/unregister）
-  // 中唯一缺锁内复核的变更入口。主进程先 acquireLock 持锁 → 子进程 unregisterPr resolve
-  // 通过（读到本身份 mame/_#301）→ 阻塞在 acquireLock → 主进程在锁外窗口把文件内容换成
-  // 他身份 mame/-#301（含在途 pending_dispatch）→ 释放锁 → 子进程 doIt 直接 unlinkSync。
-  // 修复前: 返回 {removed:true} 且他身份文件（含 pending）被物理删除；
-  // 修复后: 锁内 identityMatches 复核失败 → {removed:false}，文件/pending 原样保留。
+t('[R3-SC-S2] SC-FIX-1F unregisterPr 锁内身份复核: resolve→lock 窗口换入他身份文件（含在途 pending_dispatch）→ 拒绝且他身份文件原样保留', async () => {
+  // 同步改造（sc-0a，2026-08-09）: 原 waitFor 的固定 sleep 子进程忙等（每 20ms 起一个
+  // 进程，负载敏感）换成事件驱动握手（child stdout 'RESOLVED'/'DONE' 标记 + child exit 事件，
+  // 复用 :2665-2683 先例）；Promise.race 超时上界 + finally 清理（child.kill + tmpdir rm +
+  // release 幂等），任一断言抛出/超时也执行。**不声称**本改造建立了 happens-before（F-LOCK-1）。
+  // 判据（sc-0b，F-LOCK-1 处置）: 不要求命中锁内路径——RESOLVED 标记来自子进程第一次独立
+  // resolveStateFile，unregisterPr 内部在 register.mjs:347 还有第二次 resolve，两者无
+  // happens-before；child 发标记后若被挂起，parent 走完改写+release，child 恢复后第二次
+  // resolve 读到他身份 → :348 早退（锁外 conflict 路径），永不触及 :362。两条路径下都必然
+  // 成立的四个不变式: removed:false ∧ 他身份文件仍存在 ∧ 文件内容身份仍是他身份 ∧
+  // pending_dispatch 原样保留。本轮实际走了哪条路径（journal 有无 kind=unregister-identity-
+  // rejected）只作信息性记录（成功不输出、失败取证带出），绝不作为通过条件——要求它必然
+  // 命中等于要求一个调度保证。锁内路径的覆盖由 SC-FIX-1G-DET（确定性用例）承担。
+  // 边界（sc-0f）: ① 偶发红根因**未证实**——静态推演（lead 与审核席独立一致）认为现代码
+  // 不可产生 removed:true；本改造消除已识别的真空绿路径（原轮询下主进程改写落在子进程第
+  // 二次 resolve 之前时走锁外 conflict 早退、锁内复核根本没被测到仍报绿）、把守卫绑定挪到
+  // 确定性用例、并加失败取证，复发时可诊断——**不声称已修复偶发红**。② 守卫属
+  // defense-in-depth: 按 v3 文件名单射（stateFileName 把 mame/_ 与 mame/- 分离，已有
+  // [R3-SC-S1] 用例断言），合法生产 writer 不会把另一身份内容写进同一 canonical 文件——
+  // 竞态场景里那次裸 writeFileSync 是 fixture 自己造的、违反生产写入纪律的动作；SC-FIX-1G
+  // 守的是当前生产路径不可达的场景，不是真实可达的生产缺陷。
   const dir = mkdtempSync(join(tmpdir(), 'r3-toc-'));
   const selfFile = join(dir, stateFileName('mame', '_', 301));
   writeFileSync(selfFile, JSON.stringify(r3V2('mame', '_', 301)));
   const lockPath = `${selfFile}.lock`;
   const release = acquireLock(lockPath); // 主进程先持锁（模拟 unregisterPr 正在执行的锁窗口）
-  const sig = join(dir, 'resolved.sig');
-  const out = join(dir, 'out.json');
+  const journal = join(dir, 'journal.jsonl');
   const childSrc = `
-    const fs = require('fs');
     const { unregisterPr, resolveStateFile } = require(${JSON.stringify(join(S, 'pr-watch/register.mjs'))});
     const r = resolveStateFile({ stateDir: process.env.SD, owner: 'mame', repo: '_', prNumber: 301 });
-    fs.writeFileSync(process.env.SIG, JSON.stringify({ file: r.file, identityConflict: r.identityConflict }));
-    const res = unregisterPr({ stateDir: process.env.SD, owner: 'mame', repo: '_', prNumber: 301, reason: 'fixture' });
-    fs.writeFileSync(process.env.OUT, JSON.stringify(res));
+    process.stdout.write('RESOLVED ' + JSON.stringify({ file: r.file, identityConflict: r.identityConflict }) + '\\n');
+    const res = unregisterPr({ stateDir: process.env.SD, owner: 'mame', repo: '_', prNumber: 301, reason: 'fixture', journalFile: process.env.JRNL });
+    process.stdout.write('DONE ' + JSON.stringify(res) + '\\n');
   `;
   const child = spawn(process.execPath, ['-e', childSrc], {
-    env: { ...process.env, SD: dir, SIG: sig, OUT: out },
+    env: { ...process.env, SD: dir, JRNL: journal },
     stdio: ['ignore', 'pipe', 'pipe']
   });
-  // 等子进程完成 resolve（信号文件出现 = resolve 已通过、正阻塞在 acquireLock）
-  const waitFor = (p, ms) => { const d = Date.now() + ms; while (!existsSync(p) && Date.now() < d) execFileSync('sleep', ['0.02']); return existsSync(p); };
-  const sigSeen = waitFor(sig, 5000);
-  ok(sigSeen, 'SC-FIX-1F 子进程 resolve 信号出现（已阻塞在锁）');
-  if (sigSeen) {
-    const sigInfo = JSON.parse(readFileSync(sig, 'utf8'));
-    ok(sigInfo.identityConflict !== true, 'SC-FIX-1F resolve 阶段读到本身份（非 conflict，窗口成立）');
-    // 锁外窗口换入他身份文件（含在途 pending_dispatch）
-    writeFileSync(selfFile, JSON.stringify({
-      ...r3V2('mame', '-', 301, 'fb'),
-      pending_dispatch: { dispatch_id: 'd1', budget: { ledger: join(dir, 'b.jsonl'), estimate: 1 }, cursors_next: null }
-    }));
-  }
-  release(); // 释放锁 → 子进程 doIt
-  const outSeen = waitFor(out, 5000);
-  ok(outSeen, 'SC-FIX-1F 子进程完成输出');
-  if (outSeen) {
-    const res = JSON.parse(readFileSync(out, 'utf8'));
-    eq(res.removed, false, 'SC-FIX-1F 锁内复核失败 → removed:false（修复前 removed:true 物理删除他身份文件）');
-  }
-  const heFile = selfFile;
-  ok(existsSync(heFile), 'SC-FIX-1F 他身份文件未被物理删除（原样保留）');
-  if (existsSync(heFile)) {
-    const he = readJson(heFile);
-    eq([he.owner, he.repo, he.pr_number], ['mame', '-', 301], 'SC-FIX-1F 文件内容身份仍是他身份 mame/-#301');
-    ok(he.pending_dispatch !== null, 'SC-FIX-1F 他身份在途 pending_dispatch 原样保留（未被清空）');
-  }
-  try { child.kill(); } catch { /* 已退出 */ }
+  // 失败取证（sc-0c）: 四项现场证据并入 Error message，使未来偶发红可区分
+  // 「doIt 读到旧内容 / 走了 conflict 早退 / 子进程异常退出」三类。
+  const forensics = (msg, ctx) => new Error(
+    `${msg}\n[取证] 尝试#1 @ ${new Date().toISOString()}` +
+    `\n[取证] child stdout: ${ctx.out || '(空)'}` +
+    `\n[取证] child stderr: ${ctx.err || '(空)'}` +
+    `\n[取证] selfFile 实际内容: ${existsSync(ctx.selfFile) ? readFileSync(ctx.selfFile, 'utf8') : '(文件不存在)'}` +
+    `\n[取证] journal 全文: ${existsSync(ctx.journal) ? readFileSync(ctx.journal, 'utf8') : '(journal 不存在)'}`
+  );
+  return await new Promise((resolve, reject) => {
+    let out = '', errOut = '', released = false, settled = false;
+    const ctx = { selfFile, journal, get out() { return out; }, get err() { return errOut; } };
+    // finally 清理: 任一断言抛出/超时/成功路径都执行（child.kill + tmpdir rm + release 幂等）
+    const cleanup = () => {
+      try { child.kill(); } catch { /* 已退出 */ }
+      try { release(); } catch { /* 幂等 */ }
+      rmSync(dir, { recursive: true, force: true });
+    };
+    const finish = (fn) => { if (!settled) { settled = true; try { fn(); } catch (e) { reject(e); } } };
+    const timer = setTimeout(() => { cleanup(); finish(() => { throw forensics('SC-FIX-1F 用例超时（Promise.race 上界 15s）', ctx); }); }, 15_000);
+    child.stdout.on('data', (chunk) => {
+      try {
+        out += chunk.toString();
+        if (!released && out.includes('RESOLVED')) {
+          released = true;
+          const m = /RESOLVED (\{.*\})/.exec(out);
+          const sigInfo = JSON.parse(m[1]);
+          if (sigInfo.identityConflict === true) {
+            finish(() => { throw forensics('SC-FIX-1F resolve 阶段读到 conflict（锁外窗口未成立）', ctx); });
+            return;
+          }
+          // 锁外窗口换入他身份文件（含在途 pending_dispatch）
+          writeFileSync(selfFile, JSON.stringify({
+            ...r3V2('mame', '-', 301, 'fb'),
+            pending_dispatch: { dispatch_id: 'd1', budget: { ledger: join(dir, 'b.jsonl'), estimate: 1 }, cursors_next: null }
+          }));
+          release(); // 释放锁 → 子进程 doIt
+        }
+        if (out.includes('DONE')) {
+          const m = /DONE (\{.*\})/.exec(out);
+          const res = JSON.parse(m[1]);
+          finish(() => {
+            try {
+              // 四个不变式（sc-0b）: 锁外 identityConflict 早退 / 锁内 identityMatches 拒绝两条路径下都必然成立
+              eq(res.removed, false, 'SC-FIX-1F 不变式1: removed:false（任何路径都不得删除他身份注册）');
+              ok(existsSync(selfFile), 'SC-FIX-1F 不变式2: 他身份文件未被物理删除（原样保留）');
+              if (existsSync(selfFile)) {
+                const he = readJson(selfFile);
+                eq([he.owner, he.repo, he.pr_number], ['mame', '-', 301], 'SC-FIX-1F 不变式3: 文件内容身份仍是他身份 mame/-#301');
+                ok(he.pending_dispatch !== null, 'SC-FIX-1F 不变式4: 他身份在途 pending_dispatch 原样保留（未被清空）');
+              }
+              clearTimeout(timer);
+              cleanup();
+              resolve();
+            } catch (e) {
+              // sc-0c: 断言失败也带四项取证字段（child stdout/stderr、selfFile 现内容、journal 全文、尝试序号/时间戳）
+              cleanup();
+              throw forensics('SC-FIX-1F 断言失败: ' + e.message, ctx);
+            }
+          });
+        }
+      } catch (e) {
+        finish(() => { throw forensics('SC-FIX-1F 握手处理异常: ' + e.message, ctx); });
+      }
+    });
+    child.stderr.on('data', (chunk) => { errOut += chunk.toString(); });
+    child.on('exit', () => {
+      // DONE 标记已到 → exit 只是正常收尾；DONE 未到就退出 = 子进程异常 → 取证
+      if (out.includes('DONE')) return;
+      finish(() => { throw forensics('SC-FIX-1F 子进程异常退出（未产出 DONE 标记）', ctx); });
+    });
+  });
+});
+
+t('[R3-SC-S2] SC-FIX-1G-DET unregisterPr 锁内身份复核（确定性守卫绑定）: 静态非法 JSON 状态文件 → 零并发确定性拒绝 → 文件保留 + journal 留痕', () => {
+  // 确定性守卫绑定（F-LOCK-1 处置，sc-0i）: 把 register.mjs:362 锁内 identityMatches 复核的
+  // 绑定从竞态用例里拿出来——本用例零并发/零子进程/零锁/零重试，永不 flaky。机理（lead
+  // 实测）: resolveStateFile 对 readJson 抛错的文件置 st=null（:133 判据 if (st && !identityMatches)
+  // 中 null 不算 conflict）→ 外层确定性放行；进 doIt 后 :354 再次 parse 失败 → state=null →
+  // :362 identityMatches(null, ...) 为 false → 确定性拒绝并写 journal（:365）。
+  const dir = mkdtempSync(join(tmpdir(), 'r3-det-'));
+  const selfFile = join(dir, stateFileName('mame', '_', 301));
+  writeFileSync(selfFile, 'not-json-{{{'); // 静态非法 JSON（readJson 必抛错，零并发零时序依赖）
+  const journal = join(dir, 'journal.jsonl');
+  const res = unregisterPr({ stateDir: dir, owner: 'mame', repo: '_', prNumber: 301, reason: 'fixture', journalFile: journal });
+  eq(res.removed, false, 'SC-FIX-1G-DET 不可核验内容 fail-closed → removed:false');
+  ok(existsSync(selfFile), 'SC-FIX-1G-DET 文件未被物理删除（身份不明内容不得被 unlink）');
+  const entries = readFileSync(journal, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const rejected = entries.find((e) => e.kind === 'unregister-identity-rejected');
+  ok(!!rejected, 'SC-FIX-1G-DET journal 出现 kind=unregister-identity-rejected');
+  eq([rejected.stateOwner, rejected.stateRepo, rejected.statePr], [null, null, null],
+    'SC-FIX-1G-DET 拒绝来自身份复核分支 :362-367（state=null 不可核验），而非 :351 !existsSync 早退');
+  // 源码级结构断言: doIt 体内确有对 identityMatches 的调用——抓「把 :362 换成只特判 state===null」
+  // 这类半修法（半修法下本用例仍会绿，结构断言保证复核调用不被移除）。
+  const src = readFileSync(join(S, 'pr-watch/register.mjs'), 'utf8');
+  const doItBody = src.slice(src.indexOf('const doIt'), src.indexOf('return skipLock'));
+  ok(doItBody.includes('identityMatches'), 'SC-FIX-1G-DET 结构断言: doIt 体内保留 identityMatches 复核调用');
   rmSync(dir, { recursive: true, force: true });
 });
 
