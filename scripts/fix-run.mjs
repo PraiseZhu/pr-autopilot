@@ -464,6 +464,27 @@ export function readVitestSelection(jsonText) {
   return p + f;
 }
 
+// ---- D8-node（sc-1a，issue #15 P1）: node 入口 stdout-summary 行级测量分支 ----
+// 判据由**入口白名单**把关（GPT-N1 裁决）: 纯文本形状不是可证明的测试协议——不设白名单
+// 时，任何普通 node 脚本恰好打印一条同形日志（尤其 0 passed, 0 failed）都会从今天的
+// PASS+unmeasured 变成 VACUOUS 阻断（新造的误拦路径）。白名单收窄后，**未登记的 node
+// recipe 行为与今天逐字一致**（仍 PASS+unmeasured），只有已登记入口进入测量。
+// 白名单 = 本仓五个 fixture 入口（own-prs.fixture.mjs 只打印 'all pass'、无数字 summary，
+// 故不列入；run-all.sh 自身 cmd=bash 不进本分支）。
+export const NODE_ENTRYPOINTS = new Set([
+  'fixtures/run-fixtures.mjs', 'fixtures/i9-core.mjs', 'fixtures/i9-verdict.mjs',
+  'fixtures/i9-docs.mjs', 'fixtures/i9-batch.mjs'
+]);
+// 行级锚定: 行首 =+ 前缀、行尾 =+ 后缀，中间含 "N passed, M failed"（与五个入口的
+// summary 行格式一致，i9-*.mjs 与 run-fixtures.mjs:7419 同形）。
+const NODE_SUMMARY_RE = /^=+.*?(\d+) passed, (\d+) failed.*=+$/gm;
+export function nodeSelectionApplies(v) {
+  if (v.cmd !== 'node') return { applies: false, reason: `cmd="${v.cmd}" 不是 node` };
+  const hit = (v.args ?? []).find((a) => NODE_ENTRYPOINTS.has(String(a)));
+  if (!hit) return { applies: false, reason: `args 未命中已登记 fixture 入口白名单（${[...NODE_ENTRYPOINTS].join(', ')}）——未登记入口不进入测量` };
+  return { applies: true, blocked: false };
+}
+
 // ---- D7: 依赖准备 + fail-closed 分支 ----
 // 根因（另一会话实测，2026-08-02）: ensureIntegrationWorktree 只做 `git worktree add --detach`，
 // 裸 checkout 没有 node_modules——依赖项目依赖的 verify recipe（如 `npx vitest`）会立刻
@@ -481,6 +502,21 @@ export function readVitestSelection(jsonText) {
 // 「recipe 依赖 node 工具链」的确定性判据：cmd 是 npx/npm/yarn/pnpm 之一（这几个命令的存在
 // 意义就是解析/调用项目依赖里的东西，不可能在没有 node_modules 时正常工作）——这不是启发式，
 // 是对这四个命令语义的确定性事实。裸 `node` 不算（可能是自包含的 `node -e "..."`）。
+// sc-1e（2026-08-09，issue #15）覆盖边界收窄声明：D8-node 分支只覆盖**已登记 fixture 入口**
+// （fixtures/run-fixtures.mjs, fixtures/i9-core.mjs, fixtures/i9-verdict.mjs, fixtures/i9-docs.mjs,
+// fixtures/i9-batch.mjs）的**单行 summary 可解析**情形。已知三项洞（如实记录，不以「已加固」
+// 措辞掩盖）:
+// ① 未登记 node 入口、多行 summary、own-prs.fixture.mjs（只打印 'all pass' 无数字 summary）、
+//    以及其他 runner 仍为 T1 洞（换 runner / 换入口 / 抑制 summary 即绕过）；
+// ② validateIntegration 对 run manifest 的无锁读-改-写（loadRun → 赋值 → saveManifest，
+//    tmp+rename 只保单次写原子）为既有问题，本改动不扩大该面；
+// ③ 包装式全量 runner（node wrapper 调 run-all 会产出五条 summary，解析歧义）仍退回
+//    unmeasured——本交付范围窄于 issue 标题的「node runner」字面范围。
+// maxBuffer 说明（sc-1a，2026-08-09）: 主跑执行点已设 maxBuffer=16MiB（见 validateIntegration
+// 主跑 execFileSync）。这不是修一个已发生的截断（实测本仓输出 32305 B / 64429 B 远低于 1MB，
+// 当前没有截断），而是**承重项**——本分支的测量直接消费主跑 stdout：一旦截断，尾部 summary
+// 丢失会让测量从应有的 pass 静默退化成 unmeasured，或 ENOBUFS 被 catch 归一成 exitCode=1
+// 误判 FAIL。绑定由 sc-1g（D8-node-REAL 真实子进程用例）承担。
 const DEP_MANIFEST_BASENAMES = new Set(['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock']);
 export const DEP_TOOLCHAIN_CMDS = new Set(['npx', 'npm', 'yarn', 'pnpm']);
 export function prepareDependencies({ repoDir, wt, sourceCandidate, integratedTip }) {
@@ -599,7 +635,12 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
       stdout = runner
         ? runner(sc.verify, wt)
         : execFileSync(sc.verify.cmd, sc.verify.args, {
-            cwd: wt, encoding: 'utf8', timeout: 600_000, shell: false,
+            // 主跑执行点 maxBuffer 承重（sc-1a）: 本分支直接消费主跑 stdout 做 summary 行级测量，
+            // 默认 1MB 上限若截断会把尾部 summary 弄丢 → 测量从 pass 静默退化成 unmeasured，
+            // 或 ENOBUFS 被归一成 exitCode=1 误判 FAIL。16MiB ≥ 本仓实测输出上限（32305 B /
+            // 64429 B）两个数量级。**禁止**设到 probeVitestSelection（:576-592）——接错位置时
+            // 注入式用例仍会全绿，绑定由 sc-1g 真实子进程用例承担。
+            cwd: wt, encoding: 'utf8', timeout: 600_000, shell: false, maxBuffer: 16 * 1024 * 1024,
             env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '' } // 最小环境: 不透传凭证类变量
           });
     } catch (e) {
@@ -617,31 +658,66 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
     // D8 选中数闸门: 只在「主记录判 PASS」时才有意义——FAIL/UNRUNNABLE 已经阻断了，
     // 再测选中数不改变结论、白花一次运行。
     if (entry.status === 'PASS') {
-      const sel = vitestSelectionApplies(sc.verify);
-      if (!sel.applies) {
-        entry.selected_tests = null;
-        entry.selection_gate = 'unmeasured';
-        // 刻意**不**写进 note: D7-③ 的既有契约是「正常 PASS 不带诊断 note」，note 专供
-        // 需要人去排查的异常。本条是闸门自身的覆盖边界声明，属常态，走独立字段。
-        entry.selection_reason = `${sel.reason}。如实声明: 本闸门只覆盖已识别的 vitest recipe，其他 runner 的空验证不被检测（T1，换 runner 即可绕过）`;
-      } else if (sel.blocked) {
-        entry.status = 'UNRUNNABLE';
-        entry.selected_tests = null;
-        entry.selection_gate = 'blocked';
-        entry.note = [entry.note, `D8 选中数闸门 fail-closed: ${sel.reason}`].filter(Boolean).join(' | ');
-      } else {
-        const selected = selectionProbe ? selectionProbe(sc.verify, wt) : probeVitestSelection({ verify: sc.verify, wt });
-        entry.selected_tests = selected;
-        if (selected === null) {
-          entry.status = 'UNRUNNABLE';
-          entry.selection_gate = 'unmeasurable';
-          entry.note = [entry.note, 'D8 选中数闸门 fail-closed: 探针未能产出/解析 vitest json 报告，无法确认本条 verify 真的跑了用例——不允许在测不出选中数时记 PASS'].filter(Boolean).join(' | ');
-        } else if (selected === 0) {
-          entry.status = 'VACUOUS';
-          entry.selection_gate = 'fail';
-          entry.note = [entry.note, 'D8 选中数闸门: 本条 verify 选中 0 个用例却 exit 0（vitest 对 -t 无匹配即 skip 全部并 exit 0）——它对该 SC 的交付物零约束，不得记 PASS。请把过滤词改成能选中本 SC 自己用例的值（约定: 过滤词 = 该 SC 的 id，且测试 describe 标题带该 id）'].filter(Boolean).join(' | ');
+      const nsel = nodeSelectionApplies(sc.verify);
+      if (nsel.applies) {
+        // D8-node（sc-1a）: 已登记 fixture 入口 → 直接消费主跑已捕获的 stdout（:635-645，
+        // 决策点仍在作用域内），行级锚定解析，**恰好一行**匹配才测量。0 行或多行 →
+        // 维持 unmeasured 不阻断（fail-open 到现状，绝不静默充当 pass）；selected=0 →
+        // VACUOUS 阻断整波（空验证可检测，fix-run validate 的机器层洞）。selection_reason
+        // / note 只写结构化事实（匹配行数、解析出的计数、原因短语），**不回显任何 raw
+        // stdout 片段**（凭证不落库红线，:650 契约）；unmeasured 走 selection_reason
+        // （D7-③ 分工），fail/VACUOUS 走 note（沿用 D8-ZERO 写法）。
+        const matches = [...String(stdout).matchAll(NODE_SUMMARY_RE)];
+        if (matches.length === 1) {
+          const passed = Number(matches[0][1]), failed = Number(matches[0][2]);
+          const selected = passed + failed;
+          entry.selected_tests = selected;
+          if (selected === 0) {
+            entry.status = 'VACUOUS';
+            entry.selection_gate = 'fail';
+            entry.note = [entry.note, 'D8-node 选中数闸门: 已登记 fixture 入口本轮选中 0 个用例却 exit 0（summary 为 0 passed, 0 failed 形态）——它对该 SC 的交付物零约束，不得记 PASS'].filter(Boolean).join(' | ');
+          } else {
+            entry.selection_gate = 'pass';
+            entry.selection_reason = `已登记 fixture 入口 stdout summary 恰好一行，selected=${selected}（passed=${passed}, failed=${failed}）`;
+          }
+        } else if (matches.length === 0) {
+          entry.selected_tests = null;
+          entry.selection_gate = 'unmeasured';
+          entry.selection_reason = '已登记 fixture 入口但主跑 stdout 无 summary 行（0 行匹配），维持 unmeasured 不阻断';
         } else {
-          entry.selection_gate = 'pass';
+          entry.selected_tests = null;
+          entry.selection_gate = 'unmeasured';
+          entry.selection_reason = `已登记 fixture 入口但主跑 stdout 出现 ${matches.length} 行 summary 匹配，解析歧义，维持 unmeasured 不阻断`;
+        }
+      } else {
+        const sel = vitestSelectionApplies(sc.verify);
+        if (!sel.applies) {
+          entry.selected_tests = null;
+          entry.selection_gate = 'unmeasured';
+          // 刻意**不**写进 note: D7-③ 的既有契约是「正常 PASS 不带诊断 note」，note 专供
+          // 需要人去排查的异常。本条是闸门自身的覆盖边界声明，属常态，走独立字段。
+          // sc-1e: 收窄后边界如实声明——node 侧只有已登记 fixture 入口的单行 summary 可解析，
+          // 未登记 node 入口 / 多行 summary / own-prs.fixture.mjs / 其他 runner 仍为 T1 洞。
+          entry.selection_reason = `${sel.reason}。如实声明: 本闸门只覆盖已识别 vitest recipe 与已登记 fixture 入口（fixtures/run-fixtures.mjs, fixtures/i9-core.mjs, fixtures/i9-verdict.mjs, fixtures/i9-docs.mjs, fixtures/i9-batch.mjs）的单行 summary；未登记 node 入口、多行 summary、own-prs.fixture.mjs（只打印 all pass 无数字 summary）、以及其他 runner 仍为 T1 洞（换 runner / 换入口 / 抑制 summary 即绕过）`;
+        } else if (sel.blocked) {
+          entry.status = 'UNRUNNABLE';
+          entry.selected_tests = null;
+          entry.selection_gate = 'blocked';
+          entry.note = [entry.note, `D8 选中数闸门 fail-closed: ${sel.reason}`].filter(Boolean).join(' | ');
+        } else {
+          const selected = selectionProbe ? selectionProbe(sc.verify, wt) : probeVitestSelection({ verify: sc.verify, wt });
+          entry.selected_tests = selected;
+          if (selected === null) {
+            entry.status = 'UNRUNNABLE';
+            entry.selection_gate = 'unmeasurable';
+            entry.note = [entry.note, 'D8 选中数闸门 fail-closed: 探针未能产出/解析 vitest json 报告，无法确认本条 verify 真的跑了用例——不允许在测不出选中数时记 PASS'].filter(Boolean).join(' | ');
+          } else if (selected === 0) {
+            entry.status = 'VACUOUS';
+            entry.selection_gate = 'fail';
+            entry.note = [entry.note, 'D8 选中数闸门: 本条 verify 选中 0 个用例却 exit 0（vitest 对 -t 无匹配即 skip 全部并 exit 0）——它对该 SC 的交付物零约束，不得记 PASS。请把过滤词改成能选中本 SC 自己用例的值（约定: 过滤词 = 该 SC 的 id，且测试 describe 标题带该 id）'].filter(Boolean).join(' | ');
+          } else {
+            entry.selection_gate = 'pass';
+          }
         }
       }
     }

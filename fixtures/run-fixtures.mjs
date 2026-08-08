@@ -4195,6 +4195,136 @@ t('[D8] 反向: 选中数全 > 0 且无 reporter 冲突时闸门放行（证明�
   eq(v.results.find((r) => r.sc_id === 'D8-B').note, undefined, 'D7-③ 契约: 正常 PASS 不带 note');
 });
 
+// ========== 19c. D8-node 选中数闸门（node 入口 stdout-summary 行级测量，sc-1a/sc-1c）==========
+console.log('\n[19c] D8-node: 已登记 fixture 入口的 stdout summary 行级测量（白名单把关）');
+
+// 注入式用例前置: 单 SC 波、runner 注入主跑 stdout（模拟真实 verify run 的输出，走
+// validateIntegration:635-645 的真实消费点，不做额外 probe run——node 分支直接解析 stdout）、
+// 不注入 selectionProbe（vitest 分支用不到）。已登记入口白名单（GPT-N1 裁决）:
+// run-fixtures / i9-core / i9-verdict / i9-docs / i9-batch 五个；own-prs.fixture.mjs 只打印
+// 'all pass' 无数字 summary，不列入。
+function mkNodeGateEnv(id, verifyArgs, runnerOut) {
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: [id], paths: ['a.ts'] }],
+    [['g1']],
+    [{ id, kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('node', verifyArgs) }]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'd8n-' + id, repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-' + id, plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-' + id, plan, waveIndex: 0 }).ok, 'd8n wave 应集成');
+  return FR.validateIntegration({
+    stateDir: env.stateDir, runId: 'd8n-' + id, scManifest: scm, waveIndex: 0,
+    runner: () => runnerOut
+  });
+}
+
+t('[D8-node①] 已登记入口 + summary 恰好一行（3 passed, 1 failed）→ selection_gate=pass 且 status=PASS', () => {
+  const v = mkNodeGateEnv('D8-N1', ['fixtures/run-fixtures.mjs'], '前置日志行\n========== fixtures: 3 passed, 1 failed ==========\n尾部日志行\n');
+  const r = v.results.find((x) => x.sc_id === 'D8-N1');
+  eq(r.status, 'PASS', 'selected>0 ⇒ PASS');
+  eq(r.selection_gate, 'pass', 'gate=pass');
+  eq(r.selected_tests, 4, 'selected = passed + failed = 3 + 1');
+  eq(r.note, undefined, 'D7-③ 契约: 正常 PASS 不带诊断 note');
+  // 本用例锁 selection_reason 里的计数与结构化字段一致（selected/passed/failed 三数都来自
+  // 同一处解析）；D8-node-REAL 的 marker 落库检测（sc-1g (b)）锁 selection_reason 不回显
+  // 原始 stdout。两者是不同属性（计数一致 vs 不回显原文），互补而非替代——reason 报
+  // selected=0 而 selected_tests=4 的漂移只有前者能抓到，回显 summary 原文的泄漏只有后者能抓。
+  ok(/selected=4/.test(r.selection_reason ?? '') && /passed=3/.test(r.selection_reason ?? '') && /failed=1/.test(r.selection_reason ?? ''), 'selection_reason 计数与结构化字段一致（selected=4, passed=3, failed=1）: ' + (r.selection_reason ?? ''));
+});
+
+t('[D8-node②] 已登记入口 + summary 0 passed, 0 failed → selection_gate=fail 且 VACUOUS 阻断整波', () => {
+  const v = mkNodeGateEnv('D8-N2', ['fixtures/run-fixtures.mjs'], '========== fixtures: 0 passed, 0 failed ==========\n');
+  const r = v.results.find((x) => x.sc_id === 'D8-N2');
+  eq(r.status, 'VACUOUS', 'selected=0 ⇒ VACUOUS（空验证可检测，正是 fix-run validate 的机器层洞）');
+  eq(r.selection_gate, 'fail');
+  eq(r.selected_tests, 0);
+  ok(/零约束|选中 0/.test(r.note ?? ''), 'VACUOUS 必须写清原因（沿用 D8-ZERO 的 note 写法）');
+  eq(v.ok, false, '含 VACUOUS ⇒ 整波不过');
+});
+
+t('[D8-node③] 已登记入口 + 无 summary 行 → unmeasured 且 PASS 不阻断', () => {
+  const v = mkNodeGateEnv('D8-N3', ['fixtures/run-fixtures.mjs'], 'all pass\n');
+  const r = v.results.find((x) => x.sc_id === 'D8-N3');
+  eq(r.status, 'PASS', '无 summary ⇒ 维持 PASS 不阻断');
+  eq(r.selection_gate, 'unmeasured');
+  eq(r.selected_tests, null);
+  // 先红绑定: 旧代码 reason（vitest 旧模板）不含「已登记 fixture 入口」→ 旧代码红；
+  // 变异态（vitest 新模板）与最终实现（node 分支）都含 → 变异态绿（sc-1d 预期红集不
+  // 含 ③）、最终实现绿。
+  ok(/已登记 fixture 入口/.test(r.selection_reason ?? ''), 'unmeasured 走 selection_reason 并如实标注收窄后边界（D7-③ 分工）: ' + (r.selection_reason ?? ''));
+  // 与 ④ 区分（lead Delta D）: 0 匹配不得被实现错报成多行歧义。用「解析歧义」而非裸
+  // 「多行|歧义」——「解析歧义」只出现在 node 分支多行情形（④）的 reason，③ 的 reason
+  // （0 行）与变异态 vitest 模板 reason 均不含，故本断言在新/旧/变异三态都成立。
+  ok(!/解析歧义/.test(r.selection_reason ?? ''), '0 匹配不得报成多行歧义（与 ④ 区分）: ' + (r.selection_reason ?? ''));
+  eq(r.note, undefined, 'D7-③ 契约: 正常 PASS 不带 note');
+});
+
+t('[D8-node④] 已登记入口 + 多行 summary → unmeasured（歧义如实声明）', () => {
+  const v = mkNodeGateEnv('D8-N4', ['fixtures/run-fixtures.mjs'], '= A: 1 passed, 0 failed =\n= B: 2 passed, 0 failed =\n');
+  const r = v.results.find((x) => x.sc_id === 'D8-N4');
+  eq(r.status, 'PASS', '多行歧义 ⇒ fail-open 到现状，维持 PASS 不阻断');
+  eq(r.selection_gate, 'unmeasured');
+  eq(r.selected_tests, null);
+  ok(/多行|歧义/.test(r.selection_reason ?? ''), '歧义如实声明: ' + (r.selection_reason ?? ''));
+});
+
+t('[D8-node⑤] 未登记入口 node 脚本打印同形 summary（0 passed, 0 failed）→ 仍 unmeasured + PASS（白名单把关）', () => {
+  // GPT-N1 反例: 纯文本形状不是可证明的测试协议——任何普通 node 脚本恰好打印一条同形
+  // 日志（尤其 0 passed, 0 failed）都不能从今天的 PASS+unmeasured 变成 VACUOUS 阻断。
+  // 本用例绑定白名单把关本身: 在「只按文本形状不查白名单」的中间实现上必红（VACUOUS）。
+  const v = mkNodeGateEnv('D8-N5', ['scripts/other.js'], '========== whatever: 0 passed, 0 failed ==========\n');
+  const r = v.results.find((x) => x.sc_id === 'D8-N5');
+  eq(r.status, 'PASS', '未登记入口不进入测量 ⇒ 维持 PASS 不阻断');
+  eq(r.selection_gate, 'unmeasured');
+  eq(r.selected_tests, null);
+  eq(v.ok, true, '整波放行');
+});
+
+t('[D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且凭证零落库（sc-1g）', () => {
+  // sc-1g（2026-08-09，issue #15）: 闭合 GPT-R4/R5「只有文字承诺、没有可执行断言」缺口——
+  // **必须走真实子进程、禁止 runner 注入**（注入会绕过 fix-run.mjs 主跑 execFileSync，绑不住
+  // maxBuffer 接线与凭证不落库）。构造已登记白名单入口的真实 node verify，stdout: ① 总量
+  // >1MiB 且 <16MiB；② 含唯一 fake marker（FAKE-SECRET-MARKER-<随机>，纯测试串）；③ 末尾
+  // 恰好一条合法 summary 行。
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const marker = 'FAKE-SECRET-MARKER-' + Math.random().toString(36).slice(2);
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['D8-NREAL'], paths: ['a.ts'] }],
+    [['g1']],
+    [{ id: 'D8-NREAL', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('node', ['fixtures/run-fixtures.mjs']) }]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'd8n-real', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-real', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-real', plan, waveIndex: 0 }).ok, 'd8n-real wave 应集成');
+  // 真实子进程: integration worktree 路径 = integrationWorktree(ws.worktree_root, runId)
+  // = join(env.wtRoot, 'd8n-real-integration')（fix-run.mjs:41）。把伪脚本覆盖进它的
+  // fixtures/run-fixtures.mjs（白名单入口路径）——validate 真实跑 `node fixtures/run-fixtures.mjs`，
+  // 走 fix-run.mjs 主跑 execFileSync（带 maxBuffer=16MiB，sc-1a）。stdout: >1MiB 前缀 + 末尾
+  // 恰好一条合法 summary，且 fake marker **放在 summary 行内**——这样任何「selection_reason
+  // 回显 summary 原文」的违规都会把 marker 带进落盘 manifest，被下方 (b) 断言抓到。
+  const wt = join(env.wtRoot, 'd8n-real-integration');
+  mkdirSync(join(wt, 'fixtures'), { recursive: true });
+  writeFileSync(join(wt, 'fixtures', 'run-fixtures.mjs'), `#!/usr/bin/env node\nprocess.stdout.write('x'.repeat(1100000) + '\\n'); process.stdout.write('========== fixtures: 7 passed, 2 failed ${marker} ==========\\n');\n`);
+  // 真实跑（不注入 runner/selectionProbe）
+  const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd8n-real', scManifest: scm, waveIndex: 0 });
+  const r = v.results.find((x) => x.sc_id === 'D8-NREAL');
+  eq(r.status, 'PASS', '(a) 未截断 → PASS');
+  eq(r.selection_gate, 'pass', '(a) gate=pass');
+  eq(r.selected_tests, 9, '(a) selected_tests = 7+2 = 9（证明 stdout 未被截断，maxBuffer 接在主跑点）: got=' + r.selected_tests);
+  // (b) 读落盘后的 run manifest，fake marker 一次都不出现（凭证不落库红线可执行断言）
+  const manifest = readJson(join(env.stateDir, 'run-d8n-real.json'));
+  const manifestText = JSON.stringify(manifest);
+  ok(!manifestText.includes(marker), '(b) 落盘 manifest 不含 fake marker（凭证不落库红线）');
+  // (c) unmeasured 情形只写 selection_reason 不写 note（D7-③）
+  ok(!('note' in r) || r.note === undefined, '(c) 本 PASS 用例不带诊断 note（D7-③ 契约）');
+  eq(v.ok, true, '整波放行');
+});
+
 // ========== 20. SC-11/SC-12/SC-13 ==========
 console.log('\n[20] SC-11 anchor 广域防护 / SC-12 skill 契约 / SC-13 空转清理');
 
