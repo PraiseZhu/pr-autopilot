@@ -20,7 +20,7 @@ import { validateRemoteName } from '../../scripts/lib/git-checks.mjs';
 // ①层启动校验: 读 map 并整体校验（结构 + 全部 alias 非空字符串 + 缺当前 --repo key 即报错）。
 // 所有 key 也要求严格 owner/repo 形状（parseRepo grammar 复用，own-prs.mjs 导出）——
 // /foo、foo/、多斜杠、非法字符的 key 一律启动前拒绝（fail-closed，无 state 落盘）。
-// SC-FIX-3 (2026-08-08): alias（push_remote 来源）过 validateRemoteName 语法守卫（与
+// SC-FIX-3 (2026-08-08): alias（push_remote 来源）过 validateRemoteName 绑定守卫（与
 // finalize.mjs validateRemoteBranch 同源，单一 owner 在 git-checks.mjs）——'bad remote'
 // 这类非法 remote 名在启动前整体拒绝，不逐 PR dropped 也不落任何 state。
 export function loadRemoteMap(file, repo) {

@@ -89,7 +89,7 @@ if (process.env.OWN_PRS_FIXTURE_MODE === 'badnums') {
   ]));
   process.exit(0);
 }
-// SC-FIX-3: 非法 wiring（branch='bad branch' / push_repo='not-a-repo'）必须 dropped——
+// SC-FIX-3: 非法 wiring（branch 含空格/前导 -、push_remote 含空格、push_repo 非合法 full name 等）必须 dropped——
 // 可注册可派发但 finalize 必拒（无法收口）的空转不允许从数据生产侧产生
 if (process.env.OWN_PRS_FIXTURE_MODE === 'badwiring') {
   process.stdout.write(JSON.stringify([

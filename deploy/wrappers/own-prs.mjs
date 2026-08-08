@@ -9,7 +9,8 @@
 //   push_repo    = headRepository.nameWithOwner 字符串；缺失或非字符串 → 该条 dropped+stderr；
 //                  nameWithOwner === --repo 时 push_repo=null（同仓 PR 无需 fork 绑定）
 //   push_remote  = remoteMap[--repo] 映射值（reconcile 启动前已整体校验，此处仅取用）
-// drop 判据（仅此一处）: gh 失败 / 返回非数组 / number 缺失或非整数 / 缺 headRefName / nameWithOwner 缺失或非字符串。
+// drop 判据（仅此一处）: gh 失败 / 返回非数组 / number 非正整数 / 缺 headRefName / branch、push_remote、
+//   push_repo 未过绑定守卫（SC-FIX-3，判据单一 owner 在 git-checks.mjs）/ nameWithOwner 缺失或非字符串。
 //   合法 dropped 不判非零（reconcile 的退出码规则见该文件头注释）。
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
