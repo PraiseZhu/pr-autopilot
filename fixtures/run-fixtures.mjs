@@ -539,6 +539,61 @@ t('[审③F11-R] JSON 单调: 删数组元素/改键值 → 拒；纯追加 → 
   ok(!directionCheck(evoWt, prev, f).ok, '删 glob 应判扩权');
   gitW('reset', '-q', '--hard', prev);
 });
+// F11-R scope 修正（owner 授权 2026-08-08）专用回归：判据从 some(whitelist ∪ blacklist)
+// 改为 some(blacklist) || every(whitelist)。三条用例：
+//   1) 纯 whitelist（fixtures-only）+ feature → 仍拦（allInWhitelist 判定不削弱保护）
+//   2) blacklist 命中（scripts/push-guard.mjs）+ feature → 仍拦（touchesBlacklist 严格）
+//   3) 生产代码 + fixtures 混合 + feature → 放行（本次要修的洞：feature 修复顺带补
+//      fixture 回归不再被误判为降级伪装）
+t('[审③F11-R scope] 纯 whitelist（fixtures-only）+ purpose=feature → 仍拦', () => {
+  const savedHead = gitW('rev-parse', 'HEAD');
+  try {
+    gitW('reset', '-q', '--hard', BASE);
+    mkdirSync(join(evoWt, 'fixtures'), { recursive: true });
+    writeFileSync(join(evoWt, 'fixtures/regress-pure-fix.json'), '{"case":"pure whitelist","expect":true}\n');
+    gitW('add', '.'); gitW('commit', '-qm', 'pure-fix');
+    const h = gitW('rev-parse', 'HEAD');
+    const b = mkBundle(BASE, h);
+    const { artifact } = consensusFor(b);
+    const m = { repo: 'o/r', remote: 'origin', branch: 'evolve-t', expected_sha: h, purpose: 'feature', consensus_artifact_hash: artifact.consensus_artifact_hash };
+    const r = checkPushGuard({ repoDir: evoWt, manifest: m, artifact, bundle: b, constitution });
+    ok(r.changed.every((f) => matchAny(f, constitution.whitelist)), '前置: changed 必须全部落在白名单');
+    ok(!r.ok && r.errors.some((e) => e.includes('降级伪装')), r.errors.join(';'));
+  } finally { gitW('reset', '-q', '--hard', savedHead); }
+});
+t('[审③F11-R scope] blacklist 命中（push-guard.mjs）+ purpose=feature → 仍拦', () => {
+  const savedHead = gitW('rev-parse', 'HEAD');
+  try {
+    mkdirSync(join(evoWt, 'scripts'), { recursive: true });
+    writeFileSync(join(evoWt, 'scripts/push-guard.mjs'), '// fixture: blacklist probe\n');
+    gitW('add', '.'); gitW('commit', '-qm', 'bl-probe');
+    const h = gitW('rev-parse', 'HEAD');
+    const b = mkBundle(BASE, h);
+    const { artifact } = consensusFor(b);
+    const m = { repo: 'o/r', remote: 'origin', branch: 'evolve-t', expected_sha: h, purpose: 'feature', consensus_artifact_hash: artifact.consensus_artifact_hash };
+    const r = checkPushGuard({ repoDir: evoWt, manifest: m, artifact, bundle: b, constitution });
+    ok(r.changed.some((f) => matchAny(f, constitution.blacklist)), '前置: changed 必须命中黑名单');
+    ok(!r.ok && r.errors.some((e) => e.includes('降级伪装')), r.errors.join(';'));
+  } finally { gitW('reset', '-q', '--hard', savedHead); }
+});
+t('[审③F11-R scope] 生产+fixtures 混合 + purpose=feature → 放行（不再误判降级伪装）', () => {
+  const savedHead = gitW('rev-parse', 'HEAD');
+  try {
+    mkdirSync(join(evoWt, 'src/render'), { recursive: true });
+    writeFileSync(join(evoWt, 'src/render/render-patch.ts'), 'export const patch = 1;\n');
+    mkdirSync(join(evoWt, 'fixtures'), { recursive: true });
+    writeFileSync(join(evoWt, 'fixtures/regress-mixed.json'), '{"case":"prod+fixtures","expect":true}\n');
+    gitW('add', '.'); gitW('commit', '-qm', 'mixed-fix');
+    const h = gitW('rev-parse', 'HEAD');
+    const b = mkBundle(BASE, h);
+    const { artifact } = consensusFor(b);
+    const m = { repo: 'o/r', remote: 'origin', branch: 'evolve-t', expected_sha: h, purpose: 'feature', consensus_artifact_hash: artifact.consensus_artifact_hash };
+    const r = checkPushGuard({ repoDir: evoWt, manifest: m, artifact, bundle: b, constitution });
+    ok(r.changed.some((f) => matchAny(f, constitution.whitelist)), '前置: changed 含白名单路径（fixtures 回归）');
+    ok(r.changed.some((f) => !matchAny(f, constitution.whitelist) && !matchAny(f, constitution.blacklist)), '前置: changed 含生产代码路径');
+    ok(r.ok && !r.errors.some((e) => e.includes('降级伪装')), r.errors.join(';'));
+  } finally { gitW('reset', '-q', '--hard', savedHead); }
+});
 t('[R10/R8] 主 checkout 跑 evolution 拒；周 3 提案后第 4 个拒', () => {
   const h = git('rev-parse', 'HEAD');
   const b = mkBundle(BASE, h);

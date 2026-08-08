@@ -462,8 +462,12 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
   }
 
   const fastOwnerSigned = manifest.purpose === 'fast' && !errors.some((e) => e.startsWith('I6:'));
-  // F11-R: 进化规则集由 diff 内容触发，不由自报 purpose 决定
-  const touchesEvolutionDomain = changed.some((f) => matchAny(f, constitution.whitelist) || matchAny(f, constitution.blacklist));
+  // F11-R scope 修正（owner 授权 2026-08-08）：黑名单严格（任一命中即需 owner 放行），
+  // 白名单按「全部落在其中」判定——只有 changed 全部在进化白名单内才是自进化提案；
+  // 「feature 修复顺带补 fixture 回归」这种部分命中属正常 feature，不再误判为降级伪装。
+  const touchesBlacklist = changed.some((f) => matchAny(f, constitution.blacklist));
+  const allInWhitelist = changed.length > 0 && changed.every((f) => matchAny(f, constitution.whitelist));
+  const touchesEvolutionDomain = touchesBlacklist || allInWhitelist;
   const evolutionRules = manifest.purpose === 'evolution' || (touchesEvolutionDomain && !fastOwnerSigned);
   if (touchesEvolutionDomain && manifest.purpose === 'feature') {
     errors.push('diff 落在进化领域（宪法黑名单/进化白名单路径）但 purpose=feature——降级伪装被拦（F11-R）；走 evolution manifest 或 owner fast 签名');
