@@ -14,7 +14,7 @@
 // push-guard 的 lineage 校验退化为精确集合判定（SC-R3-8）。
 // 主 checkout 零接触: 全程不在主 repoDir checkout/detach（SC-R3-11）。
 import { execFileSync } from 'node:child_process';
-import { existsSync, writeFileSync, renameSync, mkdirSync, symlinkSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, writeFileSync, renameSync, mkdirSync, symlinkSync, readFileSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, posix } from 'node:path';
 import { tmpdir } from 'node:os';
 import { readJson, parseArgs, fail, isMain, nowIso, sha256, canonicalJson, normalizeRepoPath, hashObject } from './lib/common.mjs';
@@ -499,8 +499,14 @@ export const SUMMARY_SCAN_TAIL = 1024 * 1024;
 // 测量。多一个参数即不进测量（fail-open 到 unmeasured，与未登记入口行为逐字一致）。
 // 五种已登记入口的真实 recipe 恰好都是单参数，零实际损失。-- 终止符、单独 -（stdin）、
 // 无值 option（如 --experimental-vm-modules）、带独立值 option 全部落入 args.length≠1 →
-// applies=false。NODE_OPTIONS 不构成漏洞（能预加载模块但改不了 node 执行哪个主脚本，
-// 且 -e 在 NODE_OPTIONS 内被 node 禁止）——不加防护，不新增机制。
+// applies=false。NODE_OPTIONS 不构成威胁的真实机制（R4 修正，2026-08-09——旧注释
+// 「能预加载模块但改不了 node 执行哪个主脚本」的理由是反的: 预加载模块在主脚本之前
+// 运行，直接往 stdout 打一行假 summary 就够了，与执行哪个主脚本无关）:
+// ① validateVerifyRecipe（本文件）只接受 {cmd, args[]} 结构化配方，schema 里没有 env
+//    字段——verify 声明无法把 NODE_OPTIONS 带进执行环境；
+// ② 主跑 execFileSync 的 env 被硬编码为 {PATH, HOME}，不转发 NODE_OPTIONS。
+// 警告: 若将来放宽 env 洗白（例如为透传 CI 变量），NODE_OPTIONS 的预加载（-r/--require
+// 等）即可伪造 summary，此处判据必须同步加固。
 // 规范化（POS-3）: 同一真实文件的不同拼写（./fixtures/run-fixtures.mjs、
 // fixtures/../fixtures/run-fixtures.mjs）在查白名单前归一，判定一致；绝对路径与越出
 // 仓根的 `..` 拼写不进白名单（仓外文件）。
@@ -525,6 +531,64 @@ export function nodeSelectionApplies(v) {
     return { applies: false, reason: `脚本操作数 ${JSON.stringify(args[0])}${normNote} 未命中已登记 fixture 入口白名单（${[...NODE_ENTRYPOINTS].join(', ')}）——未登记入口不进入测量` };
   }
   return { applies: true, blocked: false };
+}
+
+// ---- R4-IDENT（SC-R4-IDENT-1，issue #19 round 4，family fk1-0fd60e45…）: 文件身份判据 ----
+// 词法白名单（上方 nodeSelectionApplies）只证明「argv 操作数的**拼写**命中已登记入口」，
+// 证明不了「node 实际执行的那个文件就是白名单入口本体」。路径拼写正确、磁盘上该路径是
+// symlink（指向仓外或仓内另一个文件）时，node 执行的是链接目标——decoy 打印一行合法形态
+// 的 summary 即可被当作白名单入口的测量采信（三席实测构造: fixtures/run-fixtures.mjs →
+// ../decoy.mjs，真实 execFileSync 返回 PASS / selection_gate=pass / selected_tests=5）。
+// 这是同形态的第三次出现（R1「白名单路径在 argv 任意位置就算执行了」、R2「白名单路径在
+// option 值位就算执行了」）——共同点是把词法/句法属性当作「node 到底执行了哪个文件」的
+// 证明。R3 判据归一收掉了 argv 维度，但判据仍是纯字符串的；本判据补上**文件身份**维度。
+//
+// 判据（一条，同时关掉三个维度，不逐维特判）:
+//   real     = realpath(join(wt, norm))
+//   expected = join(realpath(wt), norm)
+//   要求 real === expected
+//   · symlink 指向仓外 → real 落在 worktree 外 ≠ expected
+//   · symlink 指向仓内**另一个**文件 → real 是那个文件的路径 ≠ expected
+//   · **父目录本身是 symlink**（如 fixtures → 别处）→ realpath 解析整条路径，同样 ≠ expected
+// realpath 失败（文件缺失 / 循环链接 / 权限）一律 fail-open 到 unmeasured，**不抛异常**
+// ——与「多参数 / 未登记入口」的处理方向一致（漏测而非假 PASS）。reason 写结构化事实
+// （规范化操作数、real/expected 路径差异、错误码），零 raw stdout 回显（凭证不落库红线）。
+//
+// 天花板（如实声明，不软化）: 本判据只能证明「**那个路径上的文件跑了**」，永远不能证明
+// 「那个文件是**诚实**的」——直接编辑 fixtures/run-fixtures.mjs 的内容让它打印假 summary，
+// 或把目标做成硬链接（硬链接就是该路径上的文件，realpath 等于自身），任何路径级检查都
+// 抓不到。防恶意伪造需宿主级签名回执，本仓保证等级上限 T1。路径身份检查关掉的是
+// 「路径指向的文件本体 == 白名单登记的那一个」这一维；没关掉的是「文件内容真的执行了
+// 本 SC 的用例」这一维（内容维只能由测试自身 + 宿主级签名闭合）。
+export function nodeEntryIdentity({ wt, operand }) {
+  const norm = normalizeNodeOperand(operand);
+  if (norm === null) {
+    return { ok: false, reason: `操作数 ${JSON.stringify(operand)} 无法规范化（仓外拼写）——不进入文件身份判据` };
+  }
+  let real;
+  let expected;
+  try {
+    real = realpathSync(join(wt, norm));
+    expected = join(realpathSync(wt), norm);
+  } catch (e) {
+    return { ok: false, reason: `已登记入口 ${JSON.stringify(norm)} 但文件身份无法解析（realpath 失败: ${e?.code ?? e?.message ?? '未知'}）——fail-open 到 unmeasured，不采信该路径上的 summary` };
+  }
+  if (real !== expected) {
+    return { ok: false, reason: `已登记入口 ${JSON.stringify(norm)} 但文件身份校验失败: realpath=${JSON.stringify(real)} ≠ 期望 ${JSON.stringify(expected)}（symlink 冒充白名单入口）——fail-open 到 unmeasured，不采信该路径上的 summary` };
+  }
+  return { ok: true, real, expected };
+}
+
+// 唯一写入者: 「该 node recipe 是否进入 D8-node summary 测量」的全部授权决定只经本函数
+// 一处（词法子集 nodeSelectionApplies + 文件身份子集 nodeEntryIdentity 在此串联，本文件
+// 没有第二处做这个判断——收敛检查 R4 第 2/4 条）。stage 供调用方区分词法未命中与身份
+// 未命中（身份未命中需要专用 reason，不得落进 vitest fallthrough 的通用文案）。
+export function nodeEntryEligible(v, wt) {
+  const lex = nodeSelectionApplies(v);
+  if (!lex.applies) return { ...lex, stage: 'lexical' };
+  const ident = nodeEntryIdentity({ wt, operand: v.args[0] });
+  if (!ident.ok) return { applies: false, reason: ident.reason, stage: 'identity' };
+  return { applies: true, blocked: false, stage: 'ok' };
 }
 
 // ---- D7: 依赖准备 + fail-closed 分支 ----
@@ -702,7 +766,11 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
     // D8 选中数闸门: 只在「主记录判 PASS」时才有意义——FAIL/UNRUNNABLE 已经阻断了，
     // 再测选中数不改变结论、白花一次运行。
     if (entry.status === 'PASS') {
-      const nsel = nodeSelectionApplies(sc.verify);
+      // R4-IDENT（SC-R4-IDENT-1）: 唯一写入者——是否进入 D8-node summary 测量的授权只经
+      // nodeEntryEligible 一处（词法白名单 + 文件身份两个子判据在其内部串联）。wt 即主跑
+      // execFileSync 实际执行 verify 的 cwd（上方主跑执行点同源），判据用的路径与真正被
+      // 执行的路径是同一个。
+      const nsel = nodeEntryEligible(sc.verify, wt);
       if (nsel.applies) {
         // D8-node（sc-1a）: 已登记 fixture 入口 → 直接消费主跑已捕获的 stdout（主跑执行点
         // 仍在作用域内），行级锚定解析，**恰好一行**匹配才测量。0 行或多行 →
@@ -750,6 +818,15 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
           entry.selection_gate = 'unmeasured';
           entry.selection_reason = `已登记 fixture 入口但主跑 stdout 出现 ${matches.length} 行 summary 匹配，解析歧义，维持 unmeasured 不阻断`;
         }
+      } else if (nsel.stage === 'identity') {
+        // 词法命中已登记入口、但操作数路径上的文件不是白名单入口本体（symlink 冒充 /
+        // 缺失 / realpath 失败）→ 不采信该路径上的 summary，fail-open 到 unmeasured
+        // （漏测而非假 PASS，与「多参数 / 未登记入口」方向一致）。reason 只写结构化事实
+        // （R4-IDENT 天花板: 只能证明「那个路径上的文件跑了」，不能证明「那个文件是
+        // 诚实的」——内容维由测试自身 + 宿主级签名闭合，见 nodeEntryIdentity 注释）。
+        entry.selected_tests = null;
+        entry.selection_gate = 'unmeasured';
+        entry.selection_reason = nsel.reason;
       } else {
         const sel = vitestSelectionApplies(sc.verify);
         if (!sel.applies) {

@@ -2,7 +2,7 @@
 // pr-autopilot 回归 fixtures v3 — 审③后更新（对账用例全部固化）
 // 每条用例前缀 [计划条款/审次编号]；末尾 SKIPPED 清单如实列出仓内验不了的项。
 // 模拟密钥一律运行时拼接（静态文件不含完整 token/赋值形态）。
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, utimesSync, rmSync, lstatSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, utimesSync, rmSync, lstatSync, appendFileSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
@@ -4215,10 +4215,46 @@ function mkNodeGateEnv(id, verifyArgs, runnerOut) {
   const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-' + id, plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-' + id, plan, waveIndex: 0 }).ok, 'd8n wave 应集成');
+  // R4-IDENT（SC-R4-IDENT-1）: 已登记入口要进入 summary 测量，操作数路径上的文件必须以
+  // **正规文件**形态存在于 integration worktree（真实运行中 node 也只有该路径可执行才
+  // 可能 PASS——这正是身份判据的语义）。注入式 runner 场景下文件不会自动存在，这里把
+  // 白名单操作数物化为正规文件，身份判据因此通过，测量路径原样被测试（否则全部
+  // fail-open 成 unmeasured，本组测试静默失去意义）。非白名单操作数（⑤⑥⑦/POS-2/PE）
+  // 词法即拒，无需物化。
+  const wtPath = FR.integrationWorktree(env.wtRoot, 'd8n-' + id);
+  const normOperand = FR.normalizeNodeOperand(verifyArgs[0]);
+  if (normOperand !== null && FR.NODE_ENTRYPOINTS.has(normOperand)) {
+    mkdirSync(dirname(join(wtPath, normOperand)), { recursive: true });
+    writeFileSync(join(wtPath, normOperand), '#!/usr/bin/env node\nconsole.log("identity stub for injected-runner tests")\n');
+  }
   return FR.validateIntegration({
     stateDir: env.stateDir, runId: 'd8n-' + id, scManifest: scm, waveIndex: 0,
     runner: () => runnerOut
   });
+}
+
+// R4-IDENT（SC-R4-IDENT-1）: 与 mkNodeGateEnv 同骨架，但不物化白名单文件——文件形态
+// 由 setupFs(wtPath, env) 在 validate 前自行构造（symlink 指向仓外 / 仓内另一文件 /
+// 父目录 symlink / 缺失等身份负例需要自定义文件形态）。
+function mkNodeGateEnvFs(id, verifyArgs, runnerOut, setupFs) {
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: [id], paths: ['a.ts'] }],
+    [['g1']],
+    [{ id, kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('node', verifyArgs) }]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'd8n-' + id, repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-' + id, plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-' + id, plan, waveIndex: 0 }).ok, 'd8n wave 应集成');
+  const wtPath = FR.integrationWorktree(env.wtRoot, 'd8n-' + id);
+  setupFs(wtPath, env);
+  const v = FR.validateIntegration({
+    stateDir: env.stateDir, runId: 'd8n-' + id, scManifest: scm, waveIndex: 0,
+    runner: () => runnerOut
+  });
+  return { env, wtPath, v };
 }
 
 t('[D8-node①] 已登记入口 + summary 恰好一行（3 passed, 1 failed）→ selection_gate=pass 且 status=PASS', () => {
@@ -4366,6 +4402,11 @@ t('[D8-node⑨] ReDoS 回归: 20 万连续 `=` 字符输入 validateIntegration 
   const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-redos', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-redos', plan, waveIndex: 0 }).ok, 'wave 应集成');
+  // R4-IDENT: 物化白名单入口为正规文件（身份判据通过，matchAll 走真实消费点——否则
+  // 身份判据先 fail-open 成 unmeasured，ReDoS 线性度实际不再被测到）
+  const wtRedos = FR.integrationWorktree(env.wtRoot, 'd8n-redos');
+  mkdirSync(join(wtRedos, 'fixtures'), { recursive: true });
+  writeFileSync(join(wtRedos, 'fixtures', 'run-fixtures.mjs'), '#!/usr/bin/env node\n');
   const t0 = Date.now();
   const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd8n-redos', scManifest: scm, waveIndex: 0, runner: () => big });
   const elapsed = Date.now() - t0;
@@ -4401,6 +4442,10 @@ t('[D8-node-TAIL-1] 尾窗行边界对齐（形状②）: decoy 行切点落前�
   const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-tail1', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-tail1', plan, waveIndex: 0 }).ok, 'wave 应集成');
+  // R4-IDENT: 物化白名单入口为正规文件（身份判据通过，尾窗行边界逻辑走真实消费点）
+  const wtTail1 = FR.integrationWorktree(env.wtRoot, 'd8n-tail1');
+  mkdirSync(join(wtTail1, 'fixtures'), { recursive: true });
+  writeFileSync(join(wtTail1, 'fixtures', 'run-fixtures.mjs'), '#!/usr/bin/env node\n');
   const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd8n-tail1', scManifest: scm, waveIndex: 0, runner: () => decoy });
   const r = v.results.find((x) => x.sc_id === 'D8-TAIL1');
   eq(r.status, 'PASS', '尾窗 0 匹配 ⇒ 维持 PASS 不阻断');
@@ -4434,6 +4479,10 @@ t('[D8-node-TAIL-2] 尾窗行边界对齐（形状①）: 真实 0 passed, 0 fai
   const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-tail2', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
   workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-tail2', plan, waveIndex: 0 }).ok, 'wave 应集成');
+  // R4-IDENT: 物化白名单入口为正规文件（身份判据通过，VACUOUS 阻断语义不被身份判据短路）
+  const wtTail2 = FR.integrationWorktree(env.wtRoot, 'd8n-tail2');
+  mkdirSync(join(wtTail2, 'fixtures'), { recursive: true });
+  writeFileSync(join(wtTail2, 'fixtures', 'run-fixtures.mjs'), '#!/usr/bin/env node\n');
   const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd8n-tail2', scManifest: scm, waveIndex: 0, runner: () => stdout });
   const r = v.results.find((x) => x.sc_id === 'D8-TAIL2');
   eq(r.status, 'VACUOUS', '尾窗恰好 1 匹配（真实 0 passed, 0 failed）⇒ VACUOUS 阻断，不得被伪装成 unmeasured');
@@ -4511,6 +4560,10 @@ t('[D8-node⑩] ReDoS 线性度回归: 10k/50k/100k/200k 四点与输入长度�
       const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-redos10', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
       workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
       ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-redos10', plan, waveIndex: 0 }).ok, 'wave 应集成');
+      // R4-IDENT: 物化白名单入口为正规文件（同 ⑨，保证 matchAll 走真实消费点）
+      const wtRedos10 = FR.integrationWorktree(env.wtRoot, 'd8n-redos10');
+      mkdirSync(join(wtRedos10, 'fixtures'), { recursive: true });
+      writeFileSync(join(wtRedos10, 'fixtures', 'run-fixtures.mjs'), '#!/usr/bin/env node\n');
       const t0 = Date.now();
       const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd8n-redos10', scManifest: scm, waveIndex: 0, runner: () => '='.repeat(n) });
       const el = Date.now() - t0;
@@ -4527,6 +4580,91 @@ t('[D8-node⑩] ReDoS 线性度回归: 10k/50k/100k/200k 四点与输入长度�
     const rt = timings[hi] / timings[lo];
     ok(rt < 3.5, `倍率 ${hi}/${lo} = ${rt.toFixed(2)} < 3.5（输入×2 耗时不得 ×4 级膨胀）`);
   }
+});
+
+t('[D8-node-R4IDENT-1] symlink 指向 worktree 外 decoy（打印合法 summary）→ applies=false 且 selection_gate=unmeasured，不是 pass', () => {
+  // R4-IDENT（SC-R4-IDENT-1，issue #19 round 4）: 判据是纯词法的、从不触碰文件系统时，
+  // 路径拼写正确但磁盘上该文件是 symlink（指向仓外 decoy）→ selection_gate 会给 pass
+  // 并采信伪造 summary（三席实测构造: fixtures/run-fixtures.mjs → ../decoy.mjs，真实
+  // execFileSync 返回 PASS / selection_gate=pass / selected_tests=5）。本用例绑定文件
+  // 身份判据本身: 挖掉身份判据的变异态上词法命中 → 测量 → gate=pass（红）。
+  const { env, wtPath, v } = mkNodeGateEnvFs('R4ID1', ['fixtures/run-fixtures.mjs'], '========== fixtures: 5 passed, 0 failed ==========\n', (wt, env) => {
+    mkdirSync(join(wt, 'fixtures'), { recursive: true });
+    const decoyPath = join(env.d, 'decoy.mjs'); // 仓外（env 临时根，不在 worktree 内）
+    writeFileSync(decoyPath, '#!/usr/bin/env node\nconsole.log("========== fixtures: 5 passed, 0 failed ==========")\n');
+    symlinkSync(decoyPath, join(wt, 'fixtures', 'run-fixtures.mjs')); // 白名单路径 → 指向仓外
+  });
+  const r = v.results.find((x) => x.sc_id === 'R4ID1');
+  eq(FR.nodeEntryEligible({ cmd: 'node', args: ['fixtures/run-fixtures.mjs'] }, wtPath).applies, false, '直接断言 applies=false（词法命中但文件身份不成立）');
+  eq(r.status, 'PASS', 'fail-open: 维持 PASS 不阻断');
+  eq(r.selection_gate, 'unmeasured', 'gate=unmeasured（symlink 冒充白名单入口的伪造 summary 不得被采信）');
+  eq(r.selected_tests, null, '不取伪造计数');
+  eq(v.ok, true, '整波放行');
+});
+
+t('[D8-node-R4IDENT-2] symlink 指向 worktree 内另一个文件 → applies=false 且 selection_gate=unmeasured（仓内换体同样不得冒充白名单入口）', () => {
+  // R4-IDENT 维度②: symlink 目标在 worktree **内**但**不是**白名单登记的那个文件——
+  // realpath 解析到目标文件路径 ≠ 白名单路径，同样拒绝采信（不只防仓外）。
+  const { env, wtPath, v } = mkNodeGateEnvFs('R4ID2', ['fixtures/run-fixtures.mjs'], '========== fixtures: 5 passed, 0 failed ==========\n', (wt) => {
+    mkdirSync(join(wt, 'fixtures'), { recursive: true });
+    const targetPath = join(wt, 'decoy.mjs'); // 仓内另一个文件
+    writeFileSync(targetPath, '#!/usr/bin/env node\nconsole.log("========== fixtures: 5 passed, 0 failed ==========")\n');
+    symlinkSync(targetPath, join(wt, 'fixtures', 'run-fixtures.mjs'));
+  });
+  const r = v.results.find((x) => x.sc_id === 'R4ID2');
+  eq(FR.nodeEntryEligible({ cmd: 'node', args: ['fixtures/run-fixtures.mjs'] }, wtPath).applies, false, '直接断言 applies=false');
+  eq(r.status, 'PASS', 'fail-open: 维持 PASS 不阻断');
+  eq(r.selection_gate, 'unmeasured', 'gate=unmeasured（仓内换体 symlink 同样不得被采信）');
+  eq(r.selected_tests, null, '不取伪造计数');
+  eq(v.ok, true, '整波放行');
+});
+
+t('[D8-node-R4IDENT-3] 父目录本身是 symlink（fixtures → 别处）→ applies=false 且 selection_gate=unmeasured', () => {
+  // R4-IDENT 维度③: 文件本身是正规文件、但**父目录**是 symlink——realpath 解析整条路径，
+  // 同样 ≠ 期望路径（不得只检查最后一节）。
+  const { env, wtPath, v } = mkNodeGateEnvFs('R4ID3', ['fixtures/run-fixtures.mjs'], '========== fixtures: 5 passed, 0 failed ==========\n', (wt) => {
+    const elsewhere = join(wt, 'elsewhere');
+    mkdirSync(elsewhere, { recursive: true });
+    writeFileSync(join(elsewhere, 'run-fixtures.mjs'), '#!/usr/bin/env node\nconsole.log("========== fixtures: 5 passed, 0 failed ==========")\n');
+    symlinkSync(elsewhere, join(wt, 'fixtures')); // fixtures 目录本身是 symlink
+  });
+  const r = v.results.find((x) => x.sc_id === 'R4ID3');
+  eq(FR.nodeEntryEligible({ cmd: 'node', args: ['fixtures/run-fixtures.mjs'] }, wtPath).applies, false, '直接断言 applies=false');
+  eq(r.status, 'PASS', 'fail-open: 维持 PASS 不阻断');
+  eq(r.selection_gate, 'unmeasured', 'gate=unmeasured（父目录 symlink 解析整条路径后同样 ≠ 期望）');
+  eq(r.selected_tests, null, '不取伪造计数');
+  eq(v.ok, true, '整波放行');
+});
+
+t('[D8-node-R4IDENT-4] 正向对照: 普通正规文件（白名单路径本体）→ applies=true 且 selected_tests 为真实数（零回归）', () => {
+  // R4-IDENT 正向对照: 文件以正规文件形态存在于白名单路径 → 身份判据通过，测量行为与
+  // R4-IDENT 之前逐字一致（零回归）。变异态（挖掉身份判据）下本用例同样绿（不红——
+  // 正向行为两态一致，红集只应含 1/2/3）。
+  const { env, wtPath, v } = mkNodeGateEnvFs('R4ID4', ['fixtures/run-fixtures.mjs'], '========== fixtures: 3 passed, 1 failed ==========\n', (wt) => {
+    mkdirSync(join(wt, 'fixtures'), { recursive: true });
+    writeFileSync(join(wt, 'fixtures', 'run-fixtures.mjs'), '#!/usr/bin/env node\nconsole.log("========== fixtures: 3 passed, 1 failed ==========")\n');
+  });
+  const r = v.results.find((x) => x.sc_id === 'R4ID4');
+  eq(FR.nodeEntryEligible({ cmd: 'node', args: ['fixtures/run-fixtures.mjs'] }, wtPath).applies, true, '直接断言 applies=true（正规文件身份成立）');
+  eq(r.status, 'PASS', '维持 PASS');
+  eq(r.selection_gate, 'pass', 'gate=pass（与 R4-IDENT 之前行为一致，零回归）');
+  eq(r.selected_tests, 4, 'selected = passed + failed = 3 + 1（真实数）');
+  eq(v.ok, true, '整波放行');
+});
+
+t('[D8-node-R4IDENT-5] 文件缺失 → 不抛异常，落 unmeasured（fail-open，与多参数/未登记方向一致）', () => {
+  // R4-IDENT fail-open 分支: realpath 失败（文件缺失）必须不抛异常、落 unmeasured，不得
+  // 让 validateIntegration 崩掉，也不得把缺失态当成 pass。变异态（挖掉身份判据）下
+  // 本用例同样绿（runnerOut 无 summary 行 → 0 匹配 → unmeasured，两态一致，不红）。
+  const { env, wtPath, v } = mkNodeGateEnvFs('R4ID5', ['fixtures/run-fixtures.mjs'], 'all pass\n', (wt) => {
+    /* 刻意不创建文件: 操作数路径缺失（真实运行中 node 会 ENOENT → FAIL，不会进本分支；
+       注入式 runner 下显式构造缺失态验证 fail-open 不抛异常） */
+  });
+  const r = v.results.find((x) => x.sc_id === 'R4ID5');
+  eq(r.status, 'PASS', '不抛异常且维持 PASS 不阻断');
+  eq(r.selection_gate, 'unmeasured', 'gate=unmeasured');
+  eq(r.selected_tests, null, '不取计数');
+  eq(v.ok, true, '整波放行');
 });
 
 t('[D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且凭证零落库（sc-1g）', () => {
