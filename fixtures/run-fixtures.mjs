@@ -4346,7 +4346,7 @@ t('[D8-node⑧] 路径规范化: 同一真实文件的不同拼写判定一致�
   }
 });
 
-t('[D8-node⑨] ReDoS 回归: 20 万连续 `=` 字符输入匹配耗时 < 1000ms', () => {
+t('[D8-node⑨] ReDoS 回归: 20 万连续 `=` 字符输入 validateIntegration 全链路耗时 < 1000ms', () => {
   // sc-ReDoS（finding f41a44812474）: 旧 NODE_SUMMARY_RE 的 `.*?`/`.*` 与 `=+` 争夺同一批
   // `=` 字符造成 O(n²) 回溯——三席实测（2026-08-09）10k=48ms / 50k=1205ms / 100k=4826ms /
   // 200k=19335ms（输入×2 耗时×4）。修复（通配段改排除 `=` 与换行的字符类）后 200k 纯正则
@@ -4373,7 +4373,7 @@ t('[D8-node⑨] ReDoS 回归: 20 万连续 `=` 字符输入匹配耗时 < 1000ms
   eq(r.status, 'PASS', '无 summary ⇒ PASS 不阻断');
   eq(r.selection_gate, 'unmeasured', '200k `=` 无 summary 行 ⇒ unmeasured');
   eq(r.selected_tests, null, '不取计数');
-  ok(elapsed < 1000, `匹配耗时 < 1000ms（实测 ${elapsed}ms，含 git worktree 常数，阈值按量级留余量）`);
+  ok(elapsed < 1000, `validateIntegration 全链路耗时 < 1000ms（实测 ${elapsed}ms，含 git worktree 常数，阈值按量级留余量）`);
 });
 
 t('[D8-node-TAIL-1] 尾窗行边界对齐（形状②）: decoy 行切点落前导 = 串内部 → 全量 0 匹配、尾窗仍 0 匹配（字节盲切会伪造出 1 匹配）', () => {
