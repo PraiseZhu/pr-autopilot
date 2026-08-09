@@ -343,10 +343,14 @@ export function runEngine(cfg) {
         writeJsonAtomic(manifestPath, manifest); // 落盘: 修复会话按 manifest_path 拿完整参数（F5）
         runCmd(dispatchCmd, {}, JSON.stringify(manifest));
         next.status = 'fixing';
+        // 首派时刻单一真相：first_dispatched_at 与 dispatched_at 必须同源同值。
+        // 分两次调 nowIso() 会在跨毫秒边界时差 1ms，破坏「首派时二者相等」不变量
+        // （T3/SC-3c 断言），在高负载下偶发红。取一次复用即根除。
+        const firstDispatchedAt = nowIso();
         next.pending_dispatch = {
           dispatch_id: dispatchId, manifest, cursors_next: res.cursors,
-          dispatched_at: nowIso(),
-          first_dispatched_at: nowIso(), // T3/SC-3a: 首派时刻（重派不更新）——pending 超时年龄基准
+          dispatched_at: firstDispatchedAt,
+          first_dispatched_at: firstDispatchedAt, // T3/SC-3a: 首派时刻（重派不更新）——pending 超时年龄基准；与 dispatched_at 同源保证首派时相等
           redispatch_count: 0,
           // 审⑨-P2-1R: 权威预算账本随派发固化——cancel 只认这里，不接受调用者任意自报
           budget: { ledger: budget.ledger, estimate: budget.estimate }
