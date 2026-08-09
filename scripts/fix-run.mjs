@@ -476,43 +476,38 @@ export const NODE_ENTRYPOINTS = new Set([
   'fixtures/i9-docs.mjs', 'fixtures/i9-batch.mjs'
 ]);
 // 行级锚定: 行首 =+ 前缀、行尾 =+ 后缀，中间含 "N passed, M failed"（与五个入口的
-// summary 行格式一致，i9-*.mjs 与 run-fixtures.mjs:7727 同形）。
+// summary 行格式一致——见 fixtures/run-fixtures.mjs 末尾「fixtures: N passed, M failed」
+// 汇总打印行，i9-*.mjs 同形）。
 // sc-ReDoS（2026-08-09）: 通配段必须是排除 `=` 与换行的字符类——旧版 `.*?`/`.*` 与 `=+`
 // 争夺同一批 `=` 字符，O(n²) 回溯（三席实测 10k=48ms / 50k=1205ms / 100k=4826ms /
 // 200k=19335ms，输入×2 耗时×4）。字符类与 `=+` 无重叠，每次回溯 O(1) 失败、整体线性。
 // 五个入口的真实 summary 行中间段不含 `=`（i9-batch 为 `==== ... ====` 同形），排除
 // `=` 不误伤。
-const NODE_SUMMARY_RE = /^=+[^=\n]*?(\d+) passed, (\d+) failed[^=\n]*=+$/gm;
+export const NODE_SUMMARY_RE = /^=+[^=\n]*?(\d+) passed, (\d+) failed[^=\n]*=+$/gm;
 // 尾部扫描界限（sc-ReDoS）: 送进 NODE_SUMMARY_RE 的 stdout 只取尾部 SUMMARY_SCAN_TAIL
 // 字节。summary 恒在输出尾部（行级锚定的前提；D8-node-REAL 的 1.1MB 前缀用例锁此性质）。
 // 与主跑 maxBuffer=16MiB 配套承重: 未来若正则改动重新引入超线性匹配，伤害上界被压回
 // 1MiB 量级（即本 PR 之前 execFileSync 的默认上限），而不是 16MiB。
-const SUMMARY_SCAN_TAIL = 1024 * 1024;
+// 导出供 fixture 构造跨窗口用例与全量对照（fixtures 依赖此值精确对齐截断点）。
+export const SUMMARY_SCAN_TAIL = 1024 * 1024;
 // POS-1/POS-3（issue #15 三席共识）: 测量分支只应在「node 真正执行的脚本恰好是白名单
-// 成员」时生效。位置绑定: 白名单路径出现在 args **任意位置**不构成被执行——node CLI
-// 语义下 eval 模式旗标（-e/--eval/-p/--print，含 =code 连写）没有脚本操作数，其后的
-// 路径只是 -e 代码的 argv；脚本操作数 = 第一个非 option 参数（`--` 终止符之后全部按
-// 操作数处理；单独 `-` = stdin 脚本，也占操作数位——实测 `node - x.mjs` 中 x.mjs 只是
-// argv）。无法确定 → 不进测量（fail-open 到 unmeasured，与未登记入口行为逐字一致）。
+// 成员」时生效。R3-A 判据归一（收敛检查点第 5 条）: **停止解析 node 的 CLI**——node 的
+// 参数语法（吃值 option 清单、组合短旗标、-- 语义、stdin 占位）是外部演进的，追不完；
+// 前两轮补了 eval 旗标（NODE_EVAL_FLAG_RE）就漏了吃值 option（-r/--require/--import/
+// --conditions/--loader 实测均可把白名单路径放进 option 值位，由非白名单脚本执行后伪造
+// summary）。判据收成唯一形式: 只有**恰好一个参数**且该参数规范化后命中白名单时才应用
+// 测量。多一个参数即不进测量（fail-open 到 unmeasured，与未登记入口行为逐字一致）。
+// 五种已登记入口的真实 recipe 恰好都是单参数，零实际损失。-- 终止符、单独 -（stdin）、
+// 无值 option（如 --experimental-vm-modules）、带独立值 option 全部落入 args.length≠1 →
+// applies=false。NODE_OPTIONS 不构成漏洞（能预加载模块但改不了 node 执行哪个主脚本，
+// 且 -e 在 NODE_OPTIONS 内被 node 禁止）——不加防护，不新增机制。
 // 规范化（POS-3）: 同一真实文件的不同拼写（./fixtures/run-fixtures.mjs、
 // fixtures/../fixtures/run-fixtures.mjs）在查白名单前归一，判定一致；绝对路径与越出
 // 仓根的 `..` 拼写不进白名单（仓外文件）。
-// 已知边界（T1 如实声明）: 带独立值的 option（如 `-r module`）未特判，会把 option 的
-// 值当操作数——更常见的后果是真白名单入口被漏测（`node -r helper.mjs
-// fixtures/run-fixtures.mjs` → applies=false，已实测）；反向的「多测一次」需要 option
-// 值本身恰为白名单成员，更罕见。两者都落在 fail-open（unmeasured）侧，均不产生假
-// PASS。防恶意伪造需宿主级签名回执，本仓保证等级上限 T1。
-const NODE_EVAL_FLAG_RE = /^-(e|p)$|^--(eval|print)(=.*)?$/;
-export function nodeScriptOperand(args) {
-  let afterTerminator = false;
-  for (const a of args ?? []) {
-    if (!afterTerminator && a === '--') { afterTerminator = true; continue; }
-    if (!afterTerminator && NODE_EVAL_FLAG_RE.test(a)) return null; // eval 模式: 无脚本操作数
-    if (!afterTerminator && a.startsWith('-') && a !== '-') continue; // option（`-` = stdin 脚本，占操作数位）
-    return a; // 第一个非 option 参数 = 脚本操作数
-  }
-  return null; // 纯 flag / 空 args: 无脚本操作数
-}
+// 已知边界（T1 如实声明）: 合法的多参数形态（如 `node --experimental-vm-modules
+// fixtures/run-fixtures.mjs` 确实执行白名单文件）会漏测成 unmeasured——方向安全
+// （fail-open，missed testing 而非假 PASS）。防恶意伪造需宿主级签名回执，本仓保证
+// 等级上限 T1。
 export function normalizeNodeOperand(operand) {
   const norm = posix.normalize(operand);
   if (posix.isAbsolute(norm) || norm === '..' || norm.startsWith('../')) return null; // 仓外拼写
@@ -520,12 +515,14 @@ export function normalizeNodeOperand(operand) {
 }
 export function nodeSelectionApplies(v) {
   if (v.cmd !== 'node') return { applies: false, reason: `cmd="${v.cmd}" 不是 node` };
-  const operand = nodeScriptOperand(v.args ?? []);
-  if (operand === null) return { applies: false, reason: `args 无脚本操作数（eval 模式旗标 -e/--eval/-p/--print，或纯 flag/空 args）——白名单入口不在执行位，不进测量` };
-  const norm = normalizeNodeOperand(operand);
+  const args = v.args ?? [];
+  if (args.length !== 1) {
+    return { applies: false, reason: `node 参数个数=${args.length} ≠ 1——node CLI 语法外部演进，多参数形态（option 与操作数并存）一律不进测量（fail-open 到 unmeasured）` };
+  }
+  const norm = normalizeNodeOperand(args[0]);
   if (norm === null || !NODE_ENTRYPOINTS.has(norm)) {
-    const normNote = norm !== null && norm !== operand ? `（规范化 ${JSON.stringify(norm)}）` : '';
-    return { applies: false, reason: `脚本操作数 ${JSON.stringify(operand)}${normNote} 未命中已登记 fixture 入口白名单（${[...NODE_ENTRYPOINTS].join(', ')}）——未登记入口不进入测量` };
+    const normNote = norm !== null && norm !== args[0] ? `（规范化 ${JSON.stringify(norm)}）` : '';
+    return { applies: false, reason: `脚本操作数 ${JSON.stringify(args[0])}${normNote} 未命中已登记 fixture 入口白名单（${[...NODE_ENTRYPOINTS].join(', ')}）——未登记入口不进入测量` };
   }
   return { applies: true, blocked: false };
 }
@@ -685,7 +682,7 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
             // 默认 1MB 上限若截断会把尾部 summary 弄丢 → 测量从 pass 静默退化成 unmeasured，
             // 或 ENOBUFS 被归一成 exitCode=1 误判 FAIL。16MiB 比本仓五个入口实测 stdout 量级
             // （10¹–10² KB，2026-08-09 实测最大 run-fixtures.mjs 33241 B；随用例增长漂移，不写
-            // 精确字节数）大两个数量级。**禁止**设到 probeVitestSelection（:621-637）——接错
+            // 精确字节数）大两个数量级。**禁止**设到 probeVitestSelection（见该函数）——接错
             // 位置时注入式用例仍会全绿，绑定由 sc-1g 真实子进程用例承担。
             cwd: wt, encoding: 'utf8', timeout: 600_000, shell: false, maxBuffer: 16 * 1024 * 1024,
             env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '' } // 最小环境: 不透传凭证类变量
@@ -707,15 +704,31 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
     if (entry.status === 'PASS') {
       const nsel = nodeSelectionApplies(sc.verify);
       if (nsel.applies) {
-        // D8-node（sc-1a）: 已登记 fixture 入口 → 直接消费主跑已捕获的 stdout（:682-690，
-        // 决策点仍在作用域内），行级锚定解析，**恰好一行**匹配才测量。0 行或多行 →
+        // D8-node（sc-1a）: 已登记 fixture 入口 → 直接消费主跑已捕获的 stdout（主跑执行点
+        // 仍在作用域内），行级锚定解析，**恰好一行**匹配才测量。0 行或多行 →
         // 维持 unmeasured 不阻断（fail-open 到现状，绝不静默充当 pass）；selected=0 →
         // VACUOUS 阻断整波（空验证可检测，fix-run validate 的机器层洞）。selection_reason
         // / note 只写结构化事实（匹配行数、解析出的计数、原因短语），**不回显任何 raw
-        // stdout 片段**（凭证不落库红线，:696 契约）；unmeasured 走 selection_reason
+        // stdout 片段**（凭证不落库红线，见 validateIntegration 内「只存 exit + 摘要 hash」
+        // 那段）；unmeasured 走 selection_reason
         // （D7-③ 分工），fail/VACUOUS 走 note（沿用 D8-ZERO 写法）。sc-ReDoS: 送入匹配的
-        // 是尾部截断后的扫描窗（SUMMARY_SCAN_TAIL，见 :486-490）——不是全量 stdout。
-        const matches = [...String(stdout).slice(-SUMMARY_SCAN_TAIL).matchAll(NODE_SUMMARY_RE)];
+        // 是尾部截断后的扫描窗（SUMMARY_SCAN_TAIL，见该常量定义处）——不是全量 stdout。
+        // R3-B（sc-TAIL 三席共识）: 尾窗必须从**真实换行边界**开始——字节盲切会把行中间
+        // 字符位置当作 multiline ^ 的合法行首（构造 decoy 行、切点落在其前导 = 串内部即可
+        // 让原本不匹配的行变匹配）。对齐规则: 窗口起点位于行中间（非输出起点、且前一个
+        // 字符不是换行）时，丢弃窗口内首个换行之前的残片，从首个换行之后开始匹配；窗口
+        // 内无换行（整窗是一行残片）→ 丢弃整窗 → 0 匹配 → unmeasured（fail-open）。窗口
+        // 起点恰为输出起点或紧邻换行（真实边界）时**不**丢弃首行——非截断输出的匹配
+        // 语义逐字不变（0 passed, 0 failed 仍 VACUOUS 阻断），截断恰好落在行首时完整行
+        // 仍被保留（匹配条数不被凭空减少，VACUOUS 不被伪装成 unmeasured）。
+        const fullOut = String(stdout);
+        let tailWindow = fullOut.slice(-SUMMARY_SCAN_TAIL);
+        const windowStart = fullOut.length - tailWindow.length;
+        if (windowStart > 0 && fullOut[windowStart - 1] !== '\n') {
+          const firstNl = tailWindow.indexOf('\n');
+          tailWindow = firstNl === -1 ? '' : tailWindow.slice(firstNl + 1);
+        }
+        const matches = [...tailWindow.matchAll(NODE_SUMMARY_RE)];
         if (matches.length === 1) {
           const passed = Number(matches[0][1]), failed = Number(matches[0][2]);
           const selected = passed + failed;

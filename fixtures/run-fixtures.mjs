@@ -4199,7 +4199,7 @@ t('[D8] 反向: 选中数全 > 0 且无 reporter 冲突时闸门放行（证明�
 console.log('\n[19c] D8-node: 已登记 fixture 入口的 stdout summary 行级测量（白名单把关）');
 
 // 注入式用例前置: 单 SC 波、runner 注入主跑 stdout（模拟真实 verify run 的输出，走
-// validateIntegration:635-645 的真实消费点，不做额外 probe run——node 分支直接解析 stdout）、
+// validateIntegration 内 D8-node 分支的真实消费点，不做额外 probe run——node 分支直接解析 stdout）、
 // 不注入 selectionProbe（vitest 分支用不到）。已登记入口白名单（GPT-N1 裁决）:
 // run-fixtures / i9-core / i9-verdict / i9-docs / i9-batch 五个；own-prs.fixture.mjs 只打印
 // 'all pass' 无数字 summary，不列入。
@@ -4346,11 +4346,13 @@ t('[D8-node⑧] 路径规范化: 同一真实文件的不同拼写判定一致�
   }
 });
 
-t('[D8-node⑨] ReDoS 回归: 20 万连续 `=` 字符输入匹配耗时 < 1000ms（20 倍余量）', () => {
+t('[D8-node⑨] ReDoS 回归: 20 万连续 `=` 字符输入匹配耗时 < 1000ms', () => {
   // sc-ReDoS（finding f41a44812474）: 旧 NODE_SUMMARY_RE 的 `.*?`/`.*` 与 `=+` 争夺同一批
-  // `=` 字符造成 O(n²) 回溯——三席实测 10k=48ms / 50k=1205ms / 100k=4826ms / 200k=19335ms
-  // （输入×2 耗时×4）。修复（通配段改排除 `=` 与换行的字符类）后 200k 应在 1ms 量级；
-  // 断言 <1000ms 保留 20 倍余量防 flake（issue #15 的学费）。输入不产生 summary 行 ⇒
+  // `=` 字符造成 O(n²) 回溯——三席实测（2026-08-09）10k=48ms / 50k=1205ms / 100k=4826ms /
+  // 200k=19335ms（输入×2 耗时×4）。修复（通配段改排除 `=` 与换行的字符类）后 200k 纯正则
+  // 实测 ≈1.1ms。本用例 elapsed 走完整 validateIntegration，真实开销主要来自其中的 git
+  // worktree 操作（2026-08-09 实测 32-56ms，随环境漂移）而非纯正则耗时；阈值 1000ms 相对
+  // 该实测量级留足余量防 flake（不写精确倍数，防冒充可复现证据）。输入不产生 summary 行 ⇒
   // gate=unmeasured 不阻断。走真实消费点（validateIntegration 内 matchAll + 尾部扫描界限）。
   const big = '='.repeat(200000);
   const env = mkRunEnv({ files: ['a.ts'] });
@@ -4371,7 +4373,160 @@ t('[D8-node⑨] ReDoS 回归: 20 万连续 `=` 字符输入匹配耗时 < 1000ms
   eq(r.status, 'PASS', '无 summary ⇒ PASS 不阻断');
   eq(r.selection_gate, 'unmeasured', '200k `=` 无 summary 行 ⇒ unmeasured');
   eq(r.selected_tests, null, '不取计数');
-  ok(elapsed < 1000, `匹配耗时 < 1000ms（实测 ${elapsed}ms，20 倍余量防 flake）`);
+  ok(elapsed < 1000, `匹配耗时 < 1000ms（实测 ${elapsed}ms，含 git worktree 常数，阈值按量级留余量）`);
+});
+
+t('[D8-node-TAIL-1] 尾窗行边界对齐（形状②）: decoy 行切点落前导 = 串内部 → 全量 0 匹配、尾窗仍 0 匹配（字节盲切会伪造出 1 匹配）', () => {
+  // sc-TAIL（R3-B 三席共识）: 字节盲切把窗口起点（行中间）当作 multiline ^ 的合法行首——
+  // 构造 decoy 行（行首为非 = 字符、内部含 = 串 + "N passed, M failed" 形状）且切点落在其
+  // 前导 = 串内部时，盲切窗口首行 = "=…decoy: N passed, M failed =…" 恰好匹配
+  // NODE_SUMMARY_RE → 全量 0 匹配却尾窗 1 匹配 → 伪造任意 selected_tests 被采信（假 PASS）。
+  // 行边界对齐后残片被丢弃 → 0 匹配 → unmeasured（fail-open），与全量一致。
+  const tail = FR.SUMMARY_SCAN_TAIL;
+  const decoyHead = ';' + '='.repeat(6000) + 'decoy: 3 passed, 1 failed tail';
+  const decoyEnd = '='.repeat(300) + '\n';
+  // decoy 行总长 = TAIL+5000 → 窗口起点落在前导 = 串内第 5000 个 = 处（行中间）
+  const decoy = decoyHead + 'x'.repeat(tail + 5000 - decoyHead.length - decoyEnd.length) + decoyEnd;
+  eq(decoy.length, tail + 5000, 'decoy 行总长 = TAIL+5000（构造前提: 窗口起点落前导 = 串内 5000 处）');
+  // 构造前提: 全量扫描 0 匹配（decoy 行首为 ; 非 =）
+  eq([...decoy.matchAll(FR.NODE_SUMMARY_RE)].length, 0, '全量 0 匹配（构造前提）');
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['D8-TAIL1'], paths: ['a.ts'] }],
+    [['g1']],
+    [{ id: 'D8-TAIL1', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('node', ['fixtures/run-fixtures.mjs']) }]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'd8n-tail1', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-tail1', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-tail1', plan, waveIndex: 0 }).ok, 'wave 应集成');
+  const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd8n-tail1', scManifest: scm, waveIndex: 0, runner: () => decoy });
+  const r = v.results.find((x) => x.sc_id === 'D8-TAIL1');
+  eq(r.status, 'PASS', '尾窗 0 匹配 ⇒ 维持 PASS 不阻断');
+  eq(r.selection_gate, 'unmeasured', '残片丢弃后 0 匹配 ⇒ unmeasured，不得采信伪造计数');
+  eq(r.selected_tests, null, '不取任何计数');
+  eq(v.ok, true, '整波放行');
+});
+
+t('[D8-node-TAIL-2] 尾窗行边界对齐（形状①）: 真实 0 passed, 0 failed + decoy 切点落前导 = 串内 → 尾窗仍恰好 1 匹配 → VACUOUS 阻断（字节盲切见 2 匹配 → 歧义放行伪装 VACUOUS）', () => {
+  // sc-TAIL（R3-B）: 字节盲切下 decoy 残片 + 真实 summary 共 2 匹配 → 解析歧义 → unmeasured
+  // → VACUOUS 阻断被伪装成放行（VACUOUS 是 fix-run validate 机器层洞的核心阻断）。行边界
+  // 对齐后残片丢弃 → 尾窗恰好 1 匹配 → VACUOUS 保留。
+  const tail = FR.SUMMARY_SCAN_TAIL;
+  const realLine = '========== fixtures: 0 passed, 0 failed ==========\n';
+  const decoyHead = ';' + '='.repeat(6000) + 'decoy: 3 passed, 1 failed tail';
+  const decoyEnd = '='.repeat(300) + '\n';
+  // decoy 行 + real 行总长 = TAIL+5000 → 窗口起点落在 decoy 前导 = 串内 5000 处
+  const decoyLen = tail + 5000 - realLine.length;
+  const decoy = decoyHead + 'x'.repeat(decoyLen - decoyHead.length - decoyEnd.length) + decoyEnd;
+  const stdout = decoy + realLine;
+  // 构造前提: 全量扫描恰好 1 匹配（decoy 行首为 ; 不匹配、真实行匹配）
+  eq([...stdout.matchAll(FR.NODE_SUMMARY_RE)].length, 1, '全量 1 匹配（构造前提）');
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['D8-TAIL2'], paths: ['a.ts'] }],
+    [['g1']],
+    [{ id: 'D8-TAIL2', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('node', ['fixtures/run-fixtures.mjs']) }]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'd8n-tail2', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-tail2', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-tail2', plan, waveIndex: 0 }).ok, 'wave 应集成');
+  const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd8n-tail2', scManifest: scm, waveIndex: 0, runner: () => stdout });
+  const r = v.results.find((x) => x.sc_id === 'D8-TAIL2');
+  eq(r.status, 'VACUOUS', '尾窗恰好 1 匹配（真实 0 passed, 0 failed）⇒ VACUOUS 阻断，不得被伪装成 unmeasured');
+  eq(r.selection_gate, 'fail', 'gate=fail');
+  eq(r.selected_tests, 0, 'selected = 0');
+  eq(v.ok, false, 'VACUOUS ⇒ 整波不过');
+});
+
+t('[D8-node-POS-2] 吃值 option（-r/--require/--import/--conditions/--loader）: option 值位的白名单路径不构成执行位 → applies=false', () => {
+  // round-2 解析式实现的洞: 把 option 的**值**当操作数——`node --conditions
+  // fixtures/run-fixtures.mjs decoy.mjs` 实际执行 decoy.mjs（stdout 只有伪造 summary），
+  // 解析式判 applies=true → 伪造 selected 被采信（三席实测 --conditions/--require/--import
+  // 三个均可复现旧洞）。判据归一（args.length===1）使 option 值在构造上不可能占据唯一
+  // 操作数位——SC-R3-POS-2 的「option 值不得授权测量」由构造保证，不需要第二处判据。
+  const valueOpts = [
+    ['--conditions', '带值 option'],
+    ['-r', '短带值 option'],
+    ['--require', '长带值 option'],
+    ['--import', 'import 带值 option'],
+    ['--loader', 'loader 带值 option']
+  ];
+  for (const [flag, label] of valueOpts) {
+    const args = [flag, 'fixtures/run-fixtures.mjs', 'decoy.mjs'];
+    eq(FR.nodeSelectionApplies({ cmd: 'node', args }).applies, false, `${label} ${flag}: 白名单路径在 option 值位 ⇒ applies=false`);
+  }
+  // 集成路径: --conditions 形态走完整 validateIntegration → unmeasured + PASS（不得采信伪造 999）
+  const v = mkNodeGateEnv('D8-POS2', ['--conditions', 'fixtures/run-fixtures.mjs', 'decoy.mjs'], '========== fixtures: 999 passed, 0 failed ==========\n');
+  const r = v.results.find((x) => x.sc_id === 'D8-POS2');
+  eq(r.status, 'PASS', '不测量 ⇒ 维持 PASS 不阻断');
+  eq(r.selection_gate, 'unmeasured', 'option 值位不构成执行位 ⇒ unmeasured');
+  eq(r.selected_tests, null, '不取伪造计数');
+  eq(v.ok, true, '整波放行');
+});
+
+t('[D8-node-PE] -pe/-ep 组合短旗标: eval 模式漏出检测 → 判据归一后多参数/非白名单单参数一律 applies=false', () => {
+  // round-2 解析式: NODE_EVAL_FLAG_RE 只认 -e/-p/--eval/--print 单旗标，-pe/-ep 组合短旗标
+  // 漏出 → 被当普通 option 跳过，其后的白名单路径被误当操作数（`node -pe
+  // fixtures/run-fixtures.mjs` → applies=true，而 node 实际把该字符串当 -e 代码 eval，
+  // 根本不执行文件——SC-R3-PE）。判据归一后: 组合旗标形态参数数 ≠ 1 → applies=false
+  // （构造上消灭）。
+  eq(FR.nodeSelectionApplies({ cmd: 'node', args: ['-pe', 'console.log("x")', 'fixtures/run-fixtures.mjs'] }).applies, false, '-pe <code> <白名单> ⇒ applies=false');
+  eq(FR.nodeSelectionApplies({ cmd: 'node', args: ['-ep', 'console.log("x")', 'fixtures/run-fixtures.mjs'] }).applies, false, '-ep <code> <白名单> ⇒ applies=false');
+  eq(FR.nodeSelectionApplies({ cmd: 'node', args: ['-pe', 'fixtures/run-fixtures.mjs'] }).applies, false, '-pe 直接吃白名单路径为 -e 代码 ⇒ applies=false（round-2 解析式在此形态 applies=true）');
+  eq(FR.nodeSelectionApplies({ cmd: 'node', args: ['-ep', 'fixtures/run-fixtures.mjs'] }).applies, false, '-ep 直接吃白名单路径为 -e 代码 ⇒ applies=false');
+  eq(FR.nodeSelectionApplies({ cmd: 'node', args: ['-pe'] }).applies, false, '纯 -pe ⇒ applies=false');
+  eq(FR.nodeSelectionApplies({ cmd: 'node', args: ['-pe', 'console.log("x")', 'fixtures/run-fixtures.mjs', 'extra.mjs'] }).applies, false, '-pe <code> <白名单> <extra> ⇒ applies=false');
+  // 集成路径: -pe <code> <白名单> 形态走完整 validateIntegration → unmeasured + PASS
+  const v = mkNodeGateEnv('D8-PE', ['-pe', 'console.log("x")', 'fixtures/run-fixtures.mjs'], '========== fixtures: 3 passed, 1 failed ==========\n');
+  const r = v.results.find((x) => x.sc_id === 'D8-PE');
+  eq(r.status, 'PASS', '不测量 ⇒ PASS');
+  eq(r.selection_gate, 'unmeasured', 'eval 组合旗标形态 ⇒ unmeasured');
+  eq(r.selected_tests, null, '不取计数');
+  eq(v.ok, true, '整波放行');
+});
+
+t('[D8-node⑩] ReDoS 线性度回归: 10k/50k/100k/200k 四点与输入长度近似线性（输入×2 耗时约 ×2，不得 ×4 级膨胀）', () => {
+  // sc-ReDoS 回归加固（R3）: 本轮改动（判据归一删解析器 / 尾窗行边界对齐）恰好重写
+  // NODE_SUMMARY_RE 周边的两处代码——这条把线性度锁住不被改回去。四点经真实消费点
+  // （validateIntegration 的 matchAll + 尾部扫描界限）；每点取 3 次测量最小值压 GC 抖动。
+  // 预测: 修复态各点 <1000ms 且倍率 <3.5；把通配段改回 .*?/.* 的变异在 50k 起已 >1000ms、
+  // 200k/100k 倍率 ≈4.0（三席实测 200k=19335ms / 100k=4826ms）。
+  const sizes = [10000, 50000, 100000, 200000];
+  const timings = {};
+  for (const n of sizes) {
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const env = mkRunEnv({ files: ['a.ts'] });
+      mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+      const { art, plan, scm } = mkRunSetup(env,
+        [{ id: 'g1', sc_ids: ['D8-N10'], paths: ['a.ts'] }],
+        [['g1']],
+        [{ id: 'D8-N10', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('node', ['fixtures/run-fixtures.mjs']) }]
+      );
+      FR.initRun({ stateDir: env.stateDir, runId: 'd8n-redos10', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+      const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-redos10', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+      workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+      ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-redos10', plan, waveIndex: 0 }).ok, 'wave 应集成');
+      const t0 = Date.now();
+      const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd8n-redos10', scManifest: scm, waveIndex: 0, runner: () => '='.repeat(n) });
+      const el = Date.now() - t0;
+      const r = v.results.find((x) => x.sc_id === 'D8-N10');
+      eq(r.status, 'PASS', `无 summary ⇒ PASS（n=${n}）`);
+      eq(r.selection_gate, 'unmeasured', `n=${n} 无 summary ⇒ unmeasured`);
+      if (el < best) best = el;
+    }
+    timings[n] = best;
+  }
+  for (const n of sizes) ok(timings[n] < 1000, `n=${n} 全链路耗时 < 1000ms（实测 ${timings[n]}ms，3 次取最小）`);
+  const pairs = [[10000, 50000], [50000, 100000], [100000, 200000]];
+  for (const [lo, hi] of pairs) {
+    const rt = timings[hi] / timings[lo];
+    ok(rt < 3.5, `倍率 ${hi}/${lo} = ${rt.toFixed(2)} < 3.5（输入×2 耗时不得 ×4 级膨胀）`);
+  }
 });
 
 t('[D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且凭证零落库（sc-1g）', () => {
@@ -4393,7 +4548,7 @@ t('[D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且�
   workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
   ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-real', plan, waveIndex: 0 }).ok, 'd8n-real wave 应集成');
   // 真实子进程: integration worktree 路径 = integrationWorktree(ws.worktree_root, runId)
-  // = join(env.wtRoot, 'd8n-real-integration')（fix-run.mjs:41）。把伪脚本覆盖进它的
+  // = join(env.wtRoot, 'd8n-real-integration')（见 fix-run.mjs 导出的 integrationWorktree）。把伪脚本覆盖进它的
   // fixtures/run-fixtures.mjs（白名单入口路径）——validate 真实跑 `node fixtures/run-fixtures.mjs`，
   // 走 fix-run.mjs 主跑 execFileSync（带 maxBuffer=16MiB，sc-1a）。stdout: >1MiB 前缀 + 末尾
   // 恰好一条合法 summary，且 fake marker **放在 summary 行内**——这样任何「selection_reason
