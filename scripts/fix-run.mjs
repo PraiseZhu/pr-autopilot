@@ -554,12 +554,12 @@ export function nodeSelectionApplies(v) {
 // ——与「多参数 / 未登记入口」的处理方向一致（漏测而非假 PASS）。reason 写结构化事实
 // （规范化操作数、real/expected 路径差异、错误码），零 raw stdout 回显（凭证不落库红线）。
 //
-// 天花板（如实声明，不软化）: 本判据只能证明「**那个路径上的文件跑了**」，永远不能证明
-// 「那个文件是**诚实**的」——直接编辑 fixtures/run-fixtures.mjs 的内容让它打印假 summary，
-// 或把目标做成硬链接（硬链接就是该路径上的文件，realpath 等于自身），任何路径级检查都
-// 抓不到。防恶意伪造需宿主级签名回执，本仓保证等级上限 T1。路径身份检查关掉的是
-// 「路径指向的文件本体 == 白名单登记的那一个」这一维；没关掉的是「文件内容真的执行了
-// 本 SC 的用例」这一维（内容维只能由测试自身 + 宿主级签名闭合）。
+// 天花板（如实声明，不软化，SC-R5-CLAIM-1）: 本判据对稳定、无意的 symlink 配置提供过滤
+// 价值；不构成对抗性候选完整性证明，也不构成实际执行对象身份证明。内容替换 / 硬链接 /
+// symlink / TOCTOU 同属受控候选树 T1——判定先于主跑（SC-R5-TIMING-1）只保证判定时刻与
+// 主跑消费同一文件系统快照，缩小而非消除执行窗口内的换体可能。更紧的绑定（open + fstat
+// 校 inode + 经 /dev/fd/N 执行）在某些平台确能原子绑定，但属**在本门声明的 T1 范围内不
+// 予防御**的权衡选择，不是不可能性声明。内容维由测试自身 + 宿主级签名闭合。
 export function nodeEntryIdentity({ wt, operand }) {
   const norm = normalizeNodeOperand(operand);
   if (norm === null) {
@@ -737,6 +737,18 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
       results.push({ sc_id: id, status: 'UNRUNNABLE', exit_code: null, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(''), stdout_bytes: 0, note: `verify.cmd="${sc.verify.cmd}" 依赖 node 工具链，但 worktree 无 node_modules（主仓亦无可链入的依赖）——未尝试执行，避免落一个无意义的原生报错` });
       continue;
     }
+    // SC-R5-TIMING-1（issue #19 round 5，三席共识 PoC）: 文件身份判据必须在主跑
+    // execFileSync 消费其 stdout **之前**完成——授权决定只能来自 exec 前那次判定，不得
+    // 依赖执行后复核。时序缺陷（判据放主跑之后取值时）: 白名单路径起初是指向 decoy 的
+    // symlink，decoy 打印伪造 summary 后在退出前同步 unlinkSync+writeFileSync 把自己洗成
+    // 正规文件（全在同一个同步子进程内先于 execFileSync 返回完成），事后 realpath 看到的
+    // 是被洗白的文件系统 → 旧实现采信伪造 summary（status=PASS / gate=pass /
+    // selected_tests=999，三席各自复现）。前置后判定与主跑消费同一快照: 判定时刻入口是
+    // symlink 就永不授权测量，洗白发生在判定之后也无济于事。wt 仍是下方主跑 execFileSync
+    // 实际执行 verify 的同一个 cwd 变量（空间同源上一轮已做到，本轮加时间同源）。词法未
+    // 命中的 recipe 本函数纯字符串早退、零文件系统开销；非 PASS 的 SC 该结论不消费，
+    // 「FAIL/UNRUNNABLE 不测量」的既有行为逐字不变。
+    const preIdent = nodeEntryEligible(sc.verify, wt);
     let exitCode = 0, stdout = '';
     try {
       stdout = runner
@@ -766,11 +778,12 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
     // D8 选中数闸门: 只在「主记录判 PASS」时才有意义——FAIL/UNRUNNABLE 已经阻断了，
     // 再测选中数不改变结论、白花一次运行。
     if (entry.status === 'PASS') {
-      // R4-IDENT（SC-R4-IDENT-1）: 唯一写入者——是否进入 D8-node summary 测量的授权只经
-      // nodeEntryEligible 一处（词法白名单 + 文件身份两个子判据在其内部串联）。wt 即主跑
-      // execFileSync 实际执行 verify 的 cwd（上方主跑执行点同源），判据用的路径与真正被
-      // 执行的路径是同一个。
-      const nsel = nodeEntryEligible(sc.verify, wt);
+      // R4-IDENT（SC-R4-IDENT-1）+ SC-R5-TIMING-1: 唯一写入者不变——是否进入 D8-node
+      // summary 测量的授权只经 nodeEntryEligible 一处（词法白名单 + 文件身份两个子判据
+      // 在其内部串联）。**授权决定来自 exec 前那次判定**（上方 preIdent，与主跑消费同一
+      // 文件系统快照），这里只消费结论、不再重新取值——退出后复核会被「退出前洗白自身」
+      // 的 decoy 骗过（事后 realpath 看到的是被洗白的文件系统，见 preIdent 处注释）。
+      const nsel = preIdent;
       if (nsel.applies) {
         // D8-node（sc-1a）: 已登记 fixture 入口 → 直接消费主跑已捕获的 stdout（主跑执行点
         // 仍在作用域内），行级锚定解析，**恰好一行**匹配才测量。0 行或多行 →
@@ -822,8 +835,8 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
         // 词法命中已登记入口、但操作数路径上的文件不是白名单入口本体（symlink 冒充 /
         // 缺失 / realpath 失败）→ 不采信该路径上的 summary，fail-open 到 unmeasured
         // （漏测而非假 PASS，与「多参数 / 未登记入口」方向一致）。reason 只写结构化事实
-        // （R4-IDENT 天花板: 只能证明「那个路径上的文件跑了」，不能证明「那个文件是
-        // 诚实的」——内容维由测试自身 + 宿主级签名闭合，见 nodeEntryIdentity 注释）。
+        // （R4-IDENT 天花板: 对稳定、无意的 symlink 配置提供过滤价值，不构成对抗性候选
+        // 完整性证明——内容维由测试自身 + 宿主级签名闭合，见 nodeEntryIdentity 注释）。
         entry.selected_tests = null;
         entry.selection_gate = 'unmeasured';
         entry.selection_reason = nsel.reason;

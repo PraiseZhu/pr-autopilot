@@ -4709,6 +4709,62 @@ t('[D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且�
   eq(v.ok, true, '整波放行');
 });
 
+t('[D8-node-R4IDENT-6] 运行期洗白 TOCTOU: symlink decoy 真实子进程退出前把自己洗成正规文件 → gate=unmeasured 且 selected_tests=null（SC-R5-TIMING-1）', () => {
+  // SC-R5-TIMING-1（issue #19 round 5，三席各自独立复现的同一 PoC）: 白名单路径起初是
+  // 指向 decoy 的 symlink；decoy 打印伪造 summary 后，在退出前**同步**完成 unlinkSync +
+  // writeFileSync，把自己换成干净的正规文件——全在同一个同步子进程内、先于 execFileSync
+  // 返回完成。于是事后的 realpath 看到的是被洗白的文件系统 → 判据在 exec 后取值的旧实现
+  // 采信伪造 summary（status=PASS / selection_gate=pass / selected_tests=999）。
+  // **必须走真实子进程**（注入式 runner 下文件系统是静态的，事后 realpath 仍然看到
+  // symlink，绑不住时序缺陷——这是 R4IDENT 全族此前只覆盖静态形态、漏掉本组合的根因）。
+  // 断言全部用精确值（禁 .length>0 类笼统判据）；判据移回 exec 后的变异态下本用例必须红。
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['R4ID6'], paths: ['a.ts'] }],
+    [['g1']],
+    [{ id: 'R4ID6', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('node', ['fixtures/run-fixtures.mjs']) }]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'd8n-r4id6', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'd8n-r4id6', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'd8n-r4id6', plan, waveIndex: 0 }).ok, 'd8n-r4id6 wave 应集成');
+  const wt = FR.integrationWorktree(env.wtRoot, 'd8n-r4id6');
+  mkdirSync(join(wt, 'fixtures'), { recursive: true });
+  // decoy 放仓外（env.d），白名单路径 fixtures/run-fixtures.mjs → symlink → decoy。decoy
+  // 打印伪造 summary 后，退出前把白名单入口洗成干净正规文件: 集成 worktree 在
+  // join(env.d, 'wt', 'd8n-r4id6-integration')，decoy 由 __dirname 推导（同 D8-node-REAL
+  // 的集成 worktree 命名约定 integrationWorktree(worktreeRoot, runId)）。
+  // decoy 用 .cjs 后缀: Node 跟随 symlink 后按**目标文件**扩展名决定模块系统（.mjs 强制
+  // ESM，require/__dirname 不可用会 exit 1 → 误 FAIL，且破坏「exit 0 + 伪造 summary +
+  // 退出前洗白」的 PoC 前提）。
+  const decoyPath = join(env.d, 'decoy.cjs');
+  writeFileSync(decoyPath, [
+    "#!/usr/bin/env node",
+    "const fs = require('fs');",
+    "const path = require('path');",
+    "console.log('========== fixtures: 999 passed, 0 failed ==========');",
+    "// 退出前同步洗白: 把白名单入口（当前是指向本文件的 symlink）换成干净正规文件——",
+    "// 全在同一个同步子进程内、先于 execFileSync 返回完成，事后 realpath 看到被洗白的文件系统",
+    "const entry = path.join(__dirname, 'wt', 'd8n-r4id6-integration', 'fixtures', 'run-fixtures.mjs');",
+    "fs.unlinkSync(entry);",
+    "fs.writeFileSync(entry, \"#!/usr/bin/env node\\nconsole.log('========== fixtures: 1 passed, 0 failed ==========');\\n\");",
+    ''
+  ].join('\n'));
+  symlinkSync(decoyPath, join(wt, 'fixtures', 'run-fixtures.mjs'));
+  // 真实跑（不注入 runner/selectionProbe）: validate 真实执行 node fixtures/run-fixtures.mjs
+  const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd8n-r4id6', scManifest: scm, waveIndex: 0 });
+  const r = v.results.find((x) => x.sc_id === 'R4ID6');
+  eq(r.status, 'PASS', 'fail-open: 维持 PASS 不阻断（漏测而非假 PASS）');
+  eq(r.selection_gate, 'unmeasured', 'gate=unmeasured——授权决定来自 exec 前那次判定，symlink 冒充入口的伪造 summary 不得被采信（判据移回 exec 后的变异态下此处为 pass，本用例即红）: got=' + r.selection_gate);
+  eq(r.selected_tests, null, 'selected_tests=null，不取伪造值 999（精确断言，禁笼统判据）: got=' + r.selected_tests);
+  // PoC 前提自证: 洗白后的入口确为正规文件——「事后看文件系统是干净的」正是旧判据被骗的
+  // 机制，而本闸门（exec 前判定）不受其影响。
+  const st = lstatSync(join(wt, 'fixtures', 'run-fixtures.mjs'));
+  ok(st.isFile() && !st.isSymbolicLink(), '运行后入口已是正规文件（洗白 PoC 前提成立: 事后 realpath 看到的是被洗白的文件系统）');
+  eq(v.ok, true, '整波放行');
+});
+
 // ========== 20. SC-11/SC-12/SC-13 ==========
 console.log('\n[20] SC-11 anchor 广域防护 / SC-12 skill 契约 / SC-13 空转清理');
 
