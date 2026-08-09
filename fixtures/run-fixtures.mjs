@@ -4203,6 +4203,28 @@ console.log('\n[19c] D8-node: 已登记 fixture 入口的 stdout summary 行级�
 // 不注入 selectionProbe（vitest 分支用不到）。已登记入口白名单（GPT-N1 裁决）:
 // run-fixtures / i9-core / i9-verdict / i9-docs / i9-batch 五个；own-prs.fixture.mjs 只打印
 // 'all pass' 无数字 summary，不列入。
+//
+// ── 反向变异红集（SC-R5-REDSET-1，2026-08-09 实测，base=3280adaa92a5f3424dd387da4da39a8c11b44ccd
+//    上复算两次逐条一致；本注释的测量基线与 PR 正文验收条款同源，换 base 后必须重测）──
+// 变异形态: scripts/fix-run.mjs 的 nodeEntryEligible 整体禁用（恒返回
+// { applies:false, stage:'lexical' }——node 测量分支永不生效，全部 node recipe 落到
+// vitest fallthrough → unmeasured）。全套实测 268 passed / 6 failed，失败标题逐条如下:
+//   1. [D8-node①] 已登记入口 + summary 恰好一行（3 passed, 1 failed）→ selection_gate=pass 且 status=PASS
+//   2. [D8-node②] 已登记入口 + summary 0 passed, 0 failed → selection_gate=fail 且 VACUOUS 阻断整波
+//   3. [D8-node⑧] 路径规范化: 同一真实文件的不同拼写判定一致（POS-3）
+//   4. [D8-node-TAIL-2] 尾窗行边界对齐（形状①）: 真实 0 passed, 0 failed + decoy 切点落前导
+//      = 串内 → 尾窗仍恰好 1 匹配 → VACUOUS 阻断（字节盲切见 2 匹配 → 歧义放行伪装 VACUOUS）
+//   5. [D8-node-R4IDENT-4] 正向对照: 普通正规文件（白名单路径本体）→ applies=true 且
+//      selected_tests 为真实数（零回归）
+//   6. [D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且凭证零落库（sc-1g）
+// 注（2026-08-09 新 base 实测）: 本 base 新增的 R4IDENT-6（运行期洗白 TOCTOU）在「整体禁用」
+// 变异下**不红**——它断言 fail-open 语义（gate=unmeasured / selected_tests=null），整体禁用
+// 恰好也落 unmeasured，断言通过；它绑定的是「判据移回 exec 后取值」的时序变异方向，不是本
+// 变异形态。红集以实测为准，勿凭「新增即必红」推理补数。
+// 更新义务: 新增会绑定 node 分支的用例时必须就地更新本清单（否则 PR 正文声称的红集
+// 会随用例新增而静默过期——本缺陷历史上已错过两次，2026-08-09 base 推进后按实测重取）。
+// 如实声明: 本清单是**人读锚点**，不被任何机器门验证（validate 只看退出码）；它不构成
+// 对红集的机器护卫，作用只是让下次过期在代码旁边就能被发现，而不是靠审查席去复算。
 function mkNodeGateEnv(id, verifyArgs, runnerOut) {
   const env = mkRunEnv({ files: ['a.ts'] });
   mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
