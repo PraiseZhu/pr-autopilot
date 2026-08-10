@@ -14,8 +14,8 @@
 // push-guard 的 lineage 校验退化为精确集合判定（SC-R3-8）。
 // 主 checkout 零接触: 全程不在主 repoDir checkout/detach（SC-R3-11）。
 import { execFileSync } from 'node:child_process';
-import { existsSync, writeFileSync, renameSync, mkdirSync, symlinkSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
-import { join, dirname, basename } from 'node:path';
+import { existsSync, writeFileSync, renameSync, mkdirSync, symlinkSync, readFileSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
+import { join, dirname, basename, posix } from 'node:path';
 import { tmpdir } from 'node:os';
 import { readJson, parseArgs, fail, isMain, nowIso, sha256, canonicalJson, normalizeRepoPath, hashObject } from './lib/common.mjs';
 import { computeFixPlanHash } from './fix-plan.mjs';
@@ -464,6 +464,133 @@ export function readVitestSelection(jsonText) {
   return p + f;
 }
 
+// ---- D8-node（sc-1a，issue #15 P1）: node 入口 stdout-summary 行级测量分支 ----
+// 判据由**入口白名单**把关（GPT-N1 裁决）: 纯文本形状不是可证明的测试协议——不设白名单
+// 时，任何普通 node 脚本恰好打印一条同形日志（尤其 0 passed, 0 failed）都会从今天的
+// PASS+unmeasured 变成 VACUOUS 阻断（新造的误拦路径）。白名单收窄后，**未登记的 node
+// recipe 行为与今天逐字一致**（仍 PASS+unmeasured），只有已登记入口进入测量。
+// 白名单 = 本仓五个 fixture 入口（own-prs.fixture.mjs 只打印 'all pass'、无数字 summary，
+// 故不列入；run-all.sh 自身 cmd=bash 不进本分支）。
+export const NODE_ENTRYPOINTS = new Set([
+  'fixtures/run-fixtures.mjs', 'fixtures/i9-core.mjs', 'fixtures/i9-verdict.mjs',
+  'fixtures/i9-docs.mjs', 'fixtures/i9-batch.mjs'
+]);
+// 行级锚定: 行首 =+ 前缀、行尾 =+ 后缀，中间含 "N passed, M failed"（与五个入口的
+// summary 行格式一致——见 fixtures/run-fixtures.mjs 末尾「fixtures: N passed, M failed」
+// 汇总打印行，i9-*.mjs 同形）。
+// sc-ReDoS（2026-08-09）: 通配段必须是排除 `=` 与换行的字符类——旧版 `.*?`/`.*` 与 `=+`
+// 争夺同一批 `=` 字符，O(n²) 回溯（三席实测 10k=48ms / 50k=1205ms / 100k=4826ms /
+// 200k=19335ms，输入×2 耗时×4）。字符类与 `=+` 无重叠，每次回溯 O(1) 失败、整体线性。
+// 五个入口的真实 summary 行中间段不含 `=`（i9-batch 为 `==== ... ====` 同形），排除
+// `=` 不误伤。
+export const NODE_SUMMARY_RE = /^=+[^=\n]*?(\d+) passed, (\d+) failed[^=\n]*=+$/gm;
+// 尾部扫描界限（sc-ReDoS）: 送进 NODE_SUMMARY_RE 的 stdout 只取尾部 SUMMARY_SCAN_TAIL
+// 字节。summary 恒在输出尾部（行级锚定的前提；D8-node-REAL 的 1.1MB 前缀用例锁此性质）。
+// 与主跑 maxBuffer=16MiB 配套承重: 未来若正则改动重新引入超线性匹配，伤害上界被压回
+// 1MiB 量级（即本 PR 之前 execFileSync 的默认上限），而不是 16MiB。
+// 导出供 fixture 构造跨窗口用例与全量对照（fixtures 依赖此值精确对齐截断点）。
+export const SUMMARY_SCAN_TAIL = 1024 * 1024;
+// POS-1/POS-3（issue #15 三席共识）: 测量分支只应在「node 真正执行的脚本恰好是白名单
+// 成员」时生效。R3-A 判据归一（收敛检查点第 5 条）: **停止解析 node 的 CLI**——node 的
+// 参数语法（吃值 option 清单、组合短旗标、-- 语义、stdin 占位）是外部演进的，追不完；
+// 前两轮补了 eval 旗标（NODE_EVAL_FLAG_RE）就漏了吃值 option（-r/--require/--import/
+// --conditions/--loader 实测均可把白名单路径放进 option 值位，由非白名单脚本执行后伪造
+// summary）。判据收成唯一形式: 只有**恰好一个参数**且该参数规范化后命中白名单时才应用
+// 测量。多一个参数即不进测量（fail-open 到 unmeasured，与未登记入口行为逐字一致）。
+// 五种已登记入口的真实 recipe 恰好都是单参数，零实际损失。-- 终止符、单独 -（stdin）、
+// 无值 option（如 --experimental-vm-modules）、带独立值 option 全部落入 args.length≠1 →
+// applies=false。NODE_OPTIONS 不构成威胁的真实机制（R4 修正，2026-08-09——旧注释
+// 「能预加载模块但改不了 node 执行哪个主脚本」的理由是反的: 预加载模块在主脚本之前
+// 运行，直接往 stdout 打一行假 summary 就够了，与执行哪个主脚本无关）:
+// ① validateVerifyRecipe（本文件）只接受 {cmd, args[]} 结构化配方，schema 里没有 env
+//    字段——verify 声明无法把 NODE_OPTIONS 带进执行环境；
+// ② 主跑 execFileSync 的 env 被硬编码为 {PATH, HOME}，不转发 NODE_OPTIONS。
+// 警告: 若将来放宽 env 洗白（例如为透传 CI 变量），NODE_OPTIONS 的预加载（-r/--require
+// 等）即可伪造 summary，此处判据必须同步加固。
+// 规范化（POS-3）: 同一真实文件的不同拼写（./fixtures/run-fixtures.mjs、
+// fixtures/../fixtures/run-fixtures.mjs）在查白名单前归一，判定一致；绝对路径与越出
+// 仓根的 `..` 拼写不进白名单（仓外文件）。
+// 已知边界（T1 如实声明）: 合法的多参数形态（如 `node --experimental-vm-modules
+// fixtures/run-fixtures.mjs` 确实执行白名单文件）会漏测成 unmeasured——方向安全
+// （fail-open，missed testing 而非假 PASS）。防恶意伪造需宿主级签名回执，本仓保证
+// 等级上限 T1。
+export function normalizeNodeOperand(operand) {
+  const norm = posix.normalize(operand);
+  if (posix.isAbsolute(norm) || norm === '..' || norm.startsWith('../')) return null; // 仓外拼写
+  return norm;
+}
+export function nodeSelectionApplies(v) {
+  if (v.cmd !== 'node') return { applies: false, reason: `cmd="${v.cmd}" 不是 node` };
+  const args = v.args ?? [];
+  if (args.length !== 1) {
+    return { applies: false, reason: `node 参数个数=${args.length} ≠ 1——node CLI 语法外部演进，多参数形态（option 与操作数并存）一律不进测量（fail-open 到 unmeasured）` };
+  }
+  const norm = normalizeNodeOperand(args[0]);
+  if (norm === null || !NODE_ENTRYPOINTS.has(norm)) {
+    const normNote = norm !== null && norm !== args[0] ? `（规范化 ${JSON.stringify(norm)}）` : '';
+    return { applies: false, reason: `脚本操作数 ${JSON.stringify(args[0])}${normNote} 未命中已登记 fixture 入口白名单（${[...NODE_ENTRYPOINTS].join(', ')}）——未登记入口不进入测量` };
+  }
+  return { applies: true, blocked: false };
+}
+
+// ---- R4-IDENT（SC-R4-IDENT-1，issue #19 round 4，family fk1-0fd60e45…）: 文件身份判据 ----
+// 词法白名单（上方 nodeSelectionApplies）只证明「argv 操作数的**拼写**命中已登记入口」，
+// 证明不了「node 实际执行的那个文件就是白名单入口本体」。路径拼写正确、磁盘上该路径是
+// symlink（指向仓外或仓内另一个文件）时，node 执行的是链接目标——decoy 打印一行合法形态
+// 的 summary 即可被当作白名单入口的测量采信（三席实测构造: fixtures/run-fixtures.mjs →
+// ../decoy.mjs，真实 execFileSync 返回 PASS / selection_gate=pass / selected_tests=5）。
+// 这是同形态的第三次出现（R1「白名单路径在 argv 任意位置就算执行了」、R2「白名单路径在
+// option 值位就算执行了」）——共同点是把词法/句法属性当作「node 到底执行了哪个文件」的
+// 证明。R3 判据归一收掉了 argv 维度，但判据仍是纯字符串的；本判据补上**文件身份**维度。
+//
+// 判据（一条，同时关掉三个维度，不逐维特判）:
+//   real     = realpath(join(wt, norm))
+//   expected = join(realpath(wt), norm)
+//   要求 real === expected
+//   · symlink 指向仓外 → real 落在 worktree 外 ≠ expected
+//   · symlink 指向仓内**另一个**文件 → real 是那个文件的路径 ≠ expected
+//   · **父目录本身是 symlink**（如 fixtures → 别处）→ realpath 解析整条路径，同样 ≠ expected
+// realpath 失败（文件缺失 / 循环链接 / 权限）一律 fail-open 到 unmeasured，**不抛异常**
+// ——与「多参数 / 未登记入口」的处理方向一致（漏测而非假 PASS）。reason 写结构化事实
+// （规范化操作数、real/expected 路径差异、错误码），零 raw stdout 回显（凭证不落库红线）。
+//
+// 天花板（如实声明，不软化，SC-R5-CLAIM-1）: 本判据对稳定、无意的 symlink 配置提供过滤
+// 价值；不构成对抗性候选完整性证明，也不构成实际执行对象身份证明。内容替换 / 硬链接 /
+// symlink / TOCTOU 同属受控候选树 T1——判定先于主跑（SC-R5-TIMING-1）只保证判定时刻与
+// 主跑消费同一文件系统快照，缩小而非消除执行窗口内的换体可能。更紧的绑定（open + fstat
+// 校 inode + 经 /dev/fd/N 执行）在某些平台确能原子绑定，但属**在本门声明的 T1 范围内不
+// 予防御**的权衡选择，不是不可能性声明。内容维由测试自身 + 宿主级签名闭合。
+export function nodeEntryIdentity({ wt, operand }) {
+  const norm = normalizeNodeOperand(operand);
+  if (norm === null) {
+    return { ok: false, reason: `操作数 ${JSON.stringify(operand)} 无法规范化（仓外拼写）——不进入文件身份判据` };
+  }
+  let real;
+  let expected;
+  try {
+    real = realpathSync(join(wt, norm));
+    expected = join(realpathSync(wt), norm);
+  } catch (e) {
+    return { ok: false, reason: `已登记入口 ${JSON.stringify(norm)} 但文件身份无法解析（realpath 失败: ${e?.code ?? e?.message ?? '未知'}）——fail-open 到 unmeasured，不采信该路径上的 summary` };
+  }
+  if (real !== expected) {
+    return { ok: false, reason: `已登记入口 ${JSON.stringify(norm)} 但文件身份校验失败: realpath=${JSON.stringify(real)} ≠ 期望 ${JSON.stringify(expected)}（symlink 冒充白名单入口）——fail-open 到 unmeasured，不采信该路径上的 summary` };
+  }
+  return { ok: true, real, expected };
+}
+
+// 唯一写入者: 「该 node recipe 是否进入 D8-node summary 测量」的全部授权决定只经本函数
+// 一处（词法子集 nodeSelectionApplies + 文件身份子集 nodeEntryIdentity 在此串联，本文件
+// 没有第二处做这个判断——收敛检查 R4 第 2/4 条）。stage 供调用方区分词法未命中与身份
+// 未命中（身份未命中需要专用 reason，不得落进 vitest fallthrough 的通用文案）。
+export function nodeEntryEligible(v, wt) {
+  const lex = nodeSelectionApplies(v);
+  if (!lex.applies) return { ...lex, stage: 'lexical' };
+  const ident = nodeEntryIdentity({ wt, operand: v.args[0] });
+  if (!ident.ok) return { applies: false, reason: ident.reason, stage: 'identity' };
+  return { applies: true, blocked: false, stage: 'ok' };
+}
+
 // ---- D7: 依赖准备 + fail-closed 分支 ----
 // 根因（另一会话实测，2026-08-02）: ensureIntegrationWorktree 只做 `git worktree add --detach`，
 // 裸 checkout 没有 node_modules——依赖项目依赖的 verify recipe（如 `npx vitest`）会立刻
@@ -481,6 +608,22 @@ export function readVitestSelection(jsonText) {
 // 「recipe 依赖 node 工具链」的确定性判据：cmd 是 npx/npm/yarn/pnpm 之一（这几个命令的存在
 // 意义就是解析/调用项目依赖里的东西，不可能在没有 node_modules 时正常工作）——这不是启发式，
 // 是对这四个命令语义的确定性事实。裸 `node` 不算（可能是自包含的 `node -e "..."`）。
+// sc-1e（2026-08-09，issue #15）覆盖边界收窄声明：D8-node 分支只覆盖**已登记 fixture 入口**
+// （fixtures/run-fixtures.mjs, fixtures/i9-core.mjs, fixtures/i9-verdict.mjs, fixtures/i9-docs.mjs,
+// fixtures/i9-batch.mjs）的**单行 summary 可解析**情形。已知三项洞（如实记录，不以「已加固」
+// 措辞掩盖）:
+// ① 未登记 node 入口、多行 summary、own-prs.fixture.mjs（只打印 'all pass' 无数字 summary）、
+//    以及其他 runner 仍为 T1 洞（换 runner / 换入口 / 抑制 summary 即绕过）；
+// ② validateIntegration 对 run manifest 的无锁读-改-写（loadRun → 赋值 → saveManifest，
+//    tmp+rename 只保单次写原子）为既有问题，本改动不扩大该面；
+// ③ 包装式全量 runner（node wrapper 调 run-all 会产出五条 summary，解析歧义）仍退回
+//    unmeasured——本交付范围窄于 issue 标题的「node runner」字面范围。
+// maxBuffer 说明（sc-1a，2026-08-09）: 主跑执行点已设 maxBuffer=16MiB（见 validateIntegration
+// 主跑 execFileSync）。这不是修一个已发生的截断（本仓五个入口实测 stdout 量级 10¹–10² KB
+// （2026-08-09 实测最大为 run-fixtures.mjs 33241 B），远低于 1MB；数值随用例增长漂移，不写
+// 精确字节数），而是**承重项**——本分支的测量直接消费主跑 stdout：一旦截断，尾部 summary
+// 丢失会让测量从应有的 pass 静默退化成 unmeasured，或 ENOBUFS 被 catch 归一成 exitCode=1
+// 误判 FAIL。绑定由 sc-1g（D8-node-REAL 真实子进程用例）承担。
 const DEP_MANIFEST_BASENAMES = new Set(['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock']);
 export const DEP_TOOLCHAIN_CMDS = new Set(['npx', 'npm', 'yarn', 'pnpm']);
 export function prepareDependencies({ repoDir, wt, sourceCandidate, integratedTip }) {
@@ -594,12 +737,30 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
       results.push({ sc_id: id, status: 'UNRUNNABLE', exit_code: null, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(''), stdout_bytes: 0, note: `verify.cmd="${sc.verify.cmd}" 依赖 node 工具链，但 worktree 无 node_modules（主仓亦无可链入的依赖）——未尝试执行，避免落一个无意义的原生报错` });
       continue;
     }
+    // SC-R5-TIMING-1（issue #19 round 5，三席共识 PoC）: 文件身份判据必须在主跑
+    // execFileSync 消费其 stdout **之前**完成——授权决定只能来自 exec 前那次判定，不得
+    // 依赖执行后复核。时序缺陷（判据放主跑之后取值时）: 白名单路径起初是指向 decoy 的
+    // symlink，decoy 打印伪造 summary 后在退出前同步 unlinkSync+writeFileSync 把自己洗成
+    // 正规文件（全在同一个同步子进程内先于 execFileSync 返回完成），事后 realpath 看到的
+    // 是被洗白的文件系统 → 旧实现采信伪造 summary（status=PASS / gate=pass /
+    // selected_tests=999，三席各自复现）。前置后判定与主跑消费同一快照: 判定时刻入口是
+    // symlink 就永不授权测量，洗白发生在判定之后也无济于事。wt 仍是下方主跑 execFileSync
+    // 实际执行 verify 的同一个 cwd 变量（空间同源上一轮已做到，本轮加时间同源）。词法未
+    // 命中的 recipe 本函数纯字符串早退、零文件系统开销；非 PASS 的 SC 该结论不消费，
+    // 「FAIL/UNRUNNABLE 不测量」的既有行为逐字不变。
+    const preIdent = nodeEntryEligible(sc.verify, wt);
     let exitCode = 0, stdout = '';
     try {
       stdout = runner
         ? runner(sc.verify, wt)
         : execFileSync(sc.verify.cmd, sc.verify.args, {
-            cwd: wt, encoding: 'utf8', timeout: 600_000, shell: false,
+            // 主跑执行点 maxBuffer 承重（sc-1a）: 本分支直接消费主跑 stdout 做 summary 行级测量，
+            // 默认 1MB 上限若截断会把尾部 summary 弄丢 → 测量从 pass 静默退化成 unmeasured，
+            // 或 ENOBUFS 被归一成 exitCode=1 误判 FAIL。16MiB 比本仓五个入口实测 stdout 量级
+            // （10¹–10² KB，2026-08-09 实测最大 run-fixtures.mjs 33241 B；随用例增长漂移，不写
+            // 精确字节数）大两个数量级。**禁止**设到 probeVitestSelection（见该函数）——接错
+            // 位置时注入式用例仍会全绿，绑定由 sc-1g 真实子进程用例承担。
+            cwd: wt, encoding: 'utf8', timeout: 600_000, shell: false, maxBuffer: 16 * 1024 * 1024,
             env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '' } // 最小环境: 不透传凭证类变量
           });
     } catch (e) {
@@ -617,31 +778,97 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
     // D8 选中数闸门: 只在「主记录判 PASS」时才有意义——FAIL/UNRUNNABLE 已经阻断了，
     // 再测选中数不改变结论、白花一次运行。
     if (entry.status === 'PASS') {
-      const sel = vitestSelectionApplies(sc.verify);
-      if (!sel.applies) {
+      // R4-IDENT（SC-R4-IDENT-1）+ SC-R5-TIMING-1: 唯一写入者不变——是否进入 D8-node
+      // summary 测量的授权只经 nodeEntryEligible 一处（词法白名单 + 文件身份两个子判据
+      // 在其内部串联）。**授权决定来自 exec 前那次判定**（上方 preIdent，与主跑消费同一
+      // 文件系统快照），这里只消费结论、不再重新取值——退出后复核会被「退出前洗白自身」
+      // 的 decoy 骗过（事后 realpath 看到的是被洗白的文件系统，见 preIdent 处注释）。
+      const nsel = preIdent;
+      if (nsel.applies) {
+        // D8-node（sc-1a）: 已登记 fixture 入口 → 直接消费主跑已捕获的 stdout（主跑执行点
+        // 仍在作用域内），行级锚定解析，**恰好一行**匹配才测量。0 行或多行 →
+        // 维持 unmeasured 不阻断（fail-open 到现状，绝不静默充当 pass）；selected=0 →
+        // VACUOUS 阻断整波（空验证可检测，fix-run validate 的机器层洞）。selection_reason
+        // / note 只写结构化事实（匹配行数、解析出的计数、原因短语），**不回显任何 raw
+        // stdout 片段**（凭证不落库红线，见 validateIntegration 内「只存 exit + 摘要 hash」
+        // 那段）；unmeasured 走 selection_reason
+        // （D7-③ 分工），fail/VACUOUS 走 note（沿用 D8-ZERO 写法）。sc-ReDoS: 送入匹配的
+        // 是尾部截断后的扫描窗（SUMMARY_SCAN_TAIL，见该常量定义处）——不是全量 stdout。
+        // R3-B（sc-TAIL 三席共识）: 尾窗必须从**真实换行边界**开始——字节盲切会把行中间
+        // 字符位置当作 multiline ^ 的合法行首（构造 decoy 行、切点落在其前导 = 串内部即可
+        // 让原本不匹配的行变匹配）。对齐规则: 窗口起点位于行中间（非输出起点、且前一个
+        // 字符不是换行）时，丢弃窗口内首个换行之前的残片，从首个换行之后开始匹配；窗口
+        // 内无换行（整窗是一行残片）→ 丢弃整窗 → 0 匹配 → unmeasured（fail-open）。窗口
+        // 起点恰为输出起点或紧邻换行（真实边界）时**不**丢弃首行——非截断输出的匹配
+        // 语义逐字不变（0 passed, 0 failed 仍 VACUOUS 阻断），截断恰好落在行首时完整行
+        // 仍被保留（匹配条数不被凭空减少，VACUOUS 不被伪装成 unmeasured）。
+        const fullOut = String(stdout);
+        let tailWindow = fullOut.slice(-SUMMARY_SCAN_TAIL);
+        const windowStart = fullOut.length - tailWindow.length;
+        if (windowStart > 0 && fullOut[windowStart - 1] !== '\n') {
+          const firstNl = tailWindow.indexOf('\n');
+          tailWindow = firstNl === -1 ? '' : tailWindow.slice(firstNl + 1);
+        }
+        const matches = [...tailWindow.matchAll(NODE_SUMMARY_RE)];
+        if (matches.length === 1) {
+          const passed = Number(matches[0][1]), failed = Number(matches[0][2]);
+          const selected = passed + failed;
+          entry.selected_tests = selected;
+          if (selected === 0) {
+            entry.status = 'VACUOUS';
+            entry.selection_gate = 'fail';
+            entry.note = [entry.note, 'D8-node 选中数闸门: 已登记 fixture 入口本轮选中 0 个用例却 exit 0（summary 为 0 passed, 0 failed 形态）——它对该 SC 的交付物零约束，不得记 PASS'].filter(Boolean).join(' | ');
+          } else {
+            entry.selection_gate = 'pass';
+            entry.selection_reason = `已登记 fixture 入口 stdout summary 恰好一行，selected=${selected}（passed=${passed}, failed=${failed}）`;
+          }
+        } else if (matches.length === 0) {
+          entry.selected_tests = null;
+          entry.selection_gate = 'unmeasured';
+          entry.selection_reason = '已登记 fixture 入口但主跑 stdout 无 summary 行（0 行匹配），维持 unmeasured 不阻断';
+        } else {
+          entry.selected_tests = null;
+          entry.selection_gate = 'unmeasured';
+          entry.selection_reason = `已登记 fixture 入口但主跑 stdout 出现 ${matches.length} 行 summary 匹配，解析歧义，维持 unmeasured 不阻断`;
+        }
+      } else if (nsel.stage === 'identity') {
+        // 词法命中已登记入口、但操作数路径上的文件不是白名单入口本体（symlink 冒充 /
+        // 缺失 / realpath 失败）→ 不采信该路径上的 summary，fail-open 到 unmeasured
+        // （漏测而非假 PASS，与「多参数 / 未登记入口」方向一致）。reason 只写结构化事实
+        // （R4-IDENT 天花板: 对稳定、无意的 symlink 配置提供过滤价值，不构成对抗性候选
+        // 完整性证明——内容维由测试自身 + 宿主级签名闭合，见 nodeEntryIdentity 注释）。
         entry.selected_tests = null;
         entry.selection_gate = 'unmeasured';
-        // 刻意**不**写进 note: D7-③ 的既有契约是「正常 PASS 不带诊断 note」，note 专供
-        // 需要人去排查的异常。本条是闸门自身的覆盖边界声明，属常态，走独立字段。
-        entry.selection_reason = `${sel.reason}。如实声明: 本闸门只覆盖已识别的 vitest recipe，其他 runner 的空验证不被检测（T1，换 runner 即可绕过）`;
-      } else if (sel.blocked) {
-        entry.status = 'UNRUNNABLE';
-        entry.selected_tests = null;
-        entry.selection_gate = 'blocked';
-        entry.note = [entry.note, `D8 选中数闸门 fail-closed: ${sel.reason}`].filter(Boolean).join(' | ');
+        entry.selection_reason = nsel.reason;
       } else {
-        const selected = selectionProbe ? selectionProbe(sc.verify, wt) : probeVitestSelection({ verify: sc.verify, wt });
-        entry.selected_tests = selected;
-        if (selected === null) {
+        const sel = vitestSelectionApplies(sc.verify);
+        if (!sel.applies) {
+          entry.selected_tests = null;
+          entry.selection_gate = 'unmeasured';
+          // 刻意**不**写进 note: D7-③ 的既有契约是「正常 PASS 不带诊断 note」，note 专供
+          // 需要人去排查的异常。本条是闸门自身的覆盖边界声明，属常态，走独立字段。
+          // sc-1e: 收窄后边界如实声明——node 侧只有已登记 fixture 入口的单行 summary 可解析，
+          // 未登记 node 入口 / 多行 summary / own-prs.fixture.mjs / 其他 runner 仍为 T1 洞。
+          entry.selection_reason = `${sel.reason}。如实声明: 本闸门只覆盖已识别 vitest recipe 与已登记 fixture 入口（fixtures/run-fixtures.mjs, fixtures/i9-core.mjs, fixtures/i9-verdict.mjs, fixtures/i9-docs.mjs, fixtures/i9-batch.mjs）的单行 summary；未登记 node 入口、多行 summary、own-prs.fixture.mjs（只打印 all pass 无数字 summary）、以及其他 runner 仍为 T1 洞（换 runner / 换入口 / 抑制 summary 即绕过）`;
+        } else if (sel.blocked) {
           entry.status = 'UNRUNNABLE';
-          entry.selection_gate = 'unmeasurable';
-          entry.note = [entry.note, 'D8 选中数闸门 fail-closed: 探针未能产出/解析 vitest json 报告，无法确认本条 verify 真的跑了用例——不允许在测不出选中数时记 PASS'].filter(Boolean).join(' | ');
-        } else if (selected === 0) {
-          entry.status = 'VACUOUS';
-          entry.selection_gate = 'fail';
-          entry.note = [entry.note, 'D8 选中数闸门: 本条 verify 选中 0 个用例却 exit 0（vitest 对 -t 无匹配即 skip 全部并 exit 0）——它对该 SC 的交付物零约束，不得记 PASS。请把过滤词改成能选中本 SC 自己用例的值（约定: 过滤词 = 该 SC 的 id，且测试 describe 标题带该 id）'].filter(Boolean).join(' | ');
+          entry.selected_tests = null;
+          entry.selection_gate = 'blocked';
+          entry.note = [entry.note, `D8 选中数闸门 fail-closed: ${sel.reason}`].filter(Boolean).join(' | ');
         } else {
-          entry.selection_gate = 'pass';
+          const selected = selectionProbe ? selectionProbe(sc.verify, wt) : probeVitestSelection({ verify: sc.verify, wt });
+          entry.selected_tests = selected;
+          if (selected === null) {
+            entry.status = 'UNRUNNABLE';
+            entry.selection_gate = 'unmeasurable';
+            entry.note = [entry.note, 'D8 选中数闸门 fail-closed: 探针未能产出/解析 vitest json 报告，无法确认本条 verify 真的跑了用例——不允许在测不出选中数时记 PASS'].filter(Boolean).join(' | ');
+          } else if (selected === 0) {
+            entry.status = 'VACUOUS';
+            entry.selection_gate = 'fail';
+            entry.note = [entry.note, 'D8 选中数闸门: 本条 verify 选中 0 个用例却 exit 0（vitest 对 -t 无匹配即 skip 全部并 exit 0）——它对该 SC 的交付物零约束，不得记 PASS。请把过滤词改成能选中本 SC 自己用例的值（约定: 过滤词 = 该 SC 的 id，且测试 describe 标题带该 id）'].filter(Boolean).join(' | ');
+          } else {
+            entry.selection_gate = 'pass';
+          }
         }
       }
     }
