@@ -4204,25 +4204,97 @@ console.log('\n[19c] D8-node: 已登记 fixture 入口的 stdout summary 行级�
 // run-fixtures / i9-core / i9-verdict / i9-docs / i9-batch 五个；own-prs.fixture.mjs 只打印
 // 'all pass' 无数字 summary，不列入。
 //
-// ── 反向变异红集（SC-R5-REDSET-1，2026-08-09 实测，base=3280adaa92a5f3424dd387da4da39a8c11b44ccd
-//    上复算两次逐条一致；本注释的测量基线与 PR 正文验收条款同源，换 base 后必须重测）──
-// 变异形态: scripts/fix-run.mjs 的 nodeEntryEligible 整体禁用（恒返回
+// ── 反向变异红集（SC-R5-REDSET-1 建立 f1；SC-R6-REDSET-ROOT-1 扩展至 f1-f7）──
+// 测量基线: base=529793ea437800b349eea29be70c05a662715192（round-4 终态，基线全量
+// 274 passed / 0 failed）。测量日期: 2026-08-10；每种形态实测两次逐条一致（f4 因机器负载
+// 出现过一次 [D8-node⑩] 时序红，查实与变异无接线后重测排除，红集以两次一致为准）。
+// 本注释的测量基线是 PR 正文红集声称的唯一同源事实，换 base 后必须全部重测。
+// 可核事实（2026-08-10）: 本 commit 相对基线 529793ea 只改了本注释文本，scripts/fix-run.mjs
+// 与全部用例体逐字未变（可用 `git diff 529793ea HEAD` 自核：非注释行改动 0 条），
+// 故基线上的全部实测数据在本 commit 上仍然有效。
+//
+// 形态 f1: scripts/fix-run.mjs 的 nodeEntryEligible **整体禁用**（恒返回
 // { applies:false, stage:'lexical' }——node 测量分支永不生效，全部 node recipe 落到
-// vitest fallthrough → unmeasured）。全套实测 268 passed / 6 failed，失败标题逐条如下:
+// vitest fallthrough → unmeasured）。实测 268 passed / 6 failed，红集（完整标题）:
 //   1. [D8-node①] 已登记入口 + summary 恰好一行（3 passed, 1 failed）→ selection_gate=pass 且 status=PASS
 //   2. [D8-node②] 已登记入口 + summary 0 passed, 0 failed → selection_gate=fail 且 VACUOUS 阻断整波
 //   3. [D8-node⑧] 路径规范化: 同一真实文件的不同拼写判定一致（POS-3）
-//   4. [D8-node-TAIL-2] 尾窗行边界对齐（形状①）: 真实 0 passed, 0 failed + decoy 切点落前导
-//      = 串内 → 尾窗仍恰好 1 匹配 → VACUOUS 阻断（字节盲切见 2 匹配 → 歧义放行伪装 VACUOUS）
+//   4. [D8-node-TAIL-2] 尾窗行边界对齐（形状①）: 真实 0 passed, 0 failed + decoy 切点落前导 = 串内
+//      → 尾窗仍恰好 1 匹配 → VACUOUS 阻断（字节盲切见 2 匹配 → 歧义放行伪装 VACUOUS）
 //   5. [D8-node-R4IDENT-4] 正向对照: 普通正规文件（白名单路径本体）→ applies=true 且
 //      selected_tests 为真实数（零回归）
 //   6. [D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且凭证零落库（sc-1g）
-// 注（2026-08-09 新 base 实测）: 本 base 新增的 R4IDENT-6（运行期洗白 TOCTOU）在「整体禁用」
-// 变异下**不红**——它断言 fail-open 语义（gate=unmeasured / selected_tests=null），整体禁用
-// 恰好也落 unmeasured，断言通过；它绑定的是「判据移回 exec 后取值」的时序变异方向，不是本
-// 变异形态。红集以实测为准，勿凭「新增即必红」推理补数。
-// 更新义务: 新增会绑定 node 分支的用例时必须就地更新本清单（否则 PR 正文声称的红集
-// 会随用例新增而静默过期——本缺陷历史上已错过两次，2026-08-09 base 推进后按实测重取）。
+// 注: R4IDENT-6（运行期洗白 TOCTOU）在 f1 下**不红**——它断言 fail-open 语义
+// （gate=unmeasured / selected_tests=null），整体禁用恰好也落 unmeasured，断言通过；
+// 它绑定的是 f3 的时序变异方向。红集以实测为准，勿凭「新增即必红」推理补数
+// （该推理曾由 lead 提出，被实测推翻）。
+// 更新义务 f1: 新增会绑定 node 测量分支的用例时必须就地更新本清单——「断言 pass /
+// VACUOUS / gate=pass」方向的用例会扩红集，「断言 unmeasured / fail-open」方向的一般不会；
+// 方向性不可推理，只能实测。
+//
+// 形态 f2: **挖掉身份判据**（nodeEntryEligible 内部只保留词法子判据，不再调用
+// nodeEntryIdentity——回到 R3 纯词法半成品）。实测 270 passed / 4 failed，红集:
+//   1. [D8-node-R4IDENT-1] symlink 指向 worktree 外 decoy（打印合法 summary）→ applies=false 且
+//      selection_gate=unmeasured，不是 pass
+//   2. [D8-node-R4IDENT-2] symlink 指向 worktree 内另一个文件 → applies=false 且
+//      selection_gate=unmeasured（仓内换体同样不得冒充白名单入口）
+//   3. [D8-node-R4IDENT-3] 父目录本身是 symlink（fixtures → 别处）→ applies=false 且
+//      selection_gate=unmeasured
+//   4. [D8-node-R4IDENT-6] 运行期洗白 TOCTOU: symlink decoy 真实子进程退出前把自己洗成正规文件
+//      → gate=unmeasured 且 selected_tests=null（SC-R5-TIMING-1）
+// 注: f2 红集含 R4IDENT-6 是 R4 新增用例后的演变——旧声称 {R4IDENT-1,2,3} 已随 R4IDENT-6
+// 加入而过期（身份缺失时运行期洗白 decoy 的伪造 summary 同样被采信）。本条正是「红集随
+// 用例新增静默过期」的实锤现场（不变量 fk1-b9dea67e 第 4 次复发）。R4IDENT-4/5
+// （正向对照 / 文件缺失 fail-open）两态一致不红。
+// 更新义务 f2: 新增断言 symlink/身份失败语义的用例时，先实测再更新本清单（f2 红集
+// 会随「身份负例 + fail-open 断言」类用例新增而变化）。
+//
+// 形态 f3: **判据移回 exec 之后**（:786 的 `const nsel = preIdent` 改回
+// `nodeEntryEligible(sc.verify, wt)`——PASS 分支消费 exec 后重新取值，TOCTOU 洗白可骗过）。
+// 实测 273 passed / 1 failed，红集:
+//   1. [D8-node-R4IDENT-6] 运行期洗白 TOCTOU: symlink decoy 真实子进程退出前把自己洗成正规文件
+//      → gate=unmeasured 且 selected_tests=null（SC-R5-TIMING-1）
+// 注: 只有 R4IDENT-6 红——它断言 exec 前判定语义（事后 realpath 看到的是被洗白的文件系统）；
+// R4IDENT-1/2/3 的静态 symlink 不洗白，事后 realpath 仍见 symlink → 不红。
+// 更新义务 f3: 新增「运行期换体 / 洗白」类用例会扩本形态红集，新增后必须实测更新。
+//
+// 形态 f4: **移除主跑 execFileSync 的 maxBuffer**（回默认 1MiB，sc-1a 承重失效）。
+// 实测 273 passed / 1 failed，红集:
+//   1. [D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且凭证零落库（sc-1g）
+// 注: 只有 REAL 红（>1MiB stdout ENOBUFS/截断 → FAIL）；注入式用例不经主跑 execFileSync、
+// 与 maxBuffer 无接线，全部不红。已知环境 flake（不属于任何形态红集）: [D8-node⑩] 是
+// 时序断言且走注入 runner，机器负载下偶发红（2026-08-10 f4 复测中出现一次 50k/10k 倍率
+// 4.58），遇红重跑确认后不计入红集。
+// 更新义务 f4: 新增走真实子进程且 stdout >1MiB 的用例会扩本形态红集，新增后必须实测更新。
+//
+// 形态 f5: **selection_reason 回显 summary 原文**（凭证不落库红线击穿）。
+// 实测 272 passed / 2 failed，红集:
+//   1. [D8-node①] 已登记入口 + summary 恰好一行（3 passed, 1 failed）→ selection_gate=pass 且 status=PASS
+//   2. [D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且凭证零落库（sc-1g）
+// 注: ① 的 reason 计数一致断言（selected=4/passed=3/failed=1 结构化）与 REAL 的 marker 落库
+// 断言 (b) 分别从「计数漂移」与「原文泄漏」两个方向锁住不回显。
+// 更新义务 f5: 新增断言 selection_reason 内容/凭证回显的用例会扩本形态红集，新增后必须
+// 实测更新。
+//
+// 形态 f6: **NODE_SUMMARY_RE 通配段回退旧版**（`[^=\n]*?` → `.*?`、`[^=\n]*` → `.*`，
+// ReDoS 回归）。实测 272 passed / 2 failed，红集:
+//   1. [D8-node⑨] ReDoS 回归: 20 万连续 `=` 字符输入 validateIntegration 全链路耗时 < 1000ms
+//   2. [D8-node⑩] ReDoS 线性度回归: 10k/50k/100k/200k 四点与输入长度近似线性
+//      （输入×2 耗时约 ×2，不得 ×4 级膨胀）
+// 注: 旧正则 200k 实测 ≈20s（修复态 ≈1ms），⑨ 的 <1000ms 与 ⑩ 的线性度断言确定性红；
+// 其余用例（含 TAIL-1/2 构造前提）对旧正则仍成立（decoy 行首为 ';' 不触发 ^=+），不红。
+// 更新义务 f6: 新增依赖 NODE_SUMMARY_RE 线性度的用例会扩本形态红集，新增后必须实测更新。
+//
+// 形态 f7: **normalizeNodeOperand 恒等**（不做路径规范化——POS-3 四种合法拼写失去归一）。
+// 实测 273 passed / 1 failed，红集:
+//   1. [D8-node⑧] 路径规范化: 同一真实文件的不同拼写判定一致（POS-3）
+// 注: ⑧ 的 trueSpellings 直接断言与集成路径 gate=pass 全红；falseSpellings（绝对路径 /
+// 越出仓根 / 非白名单文件）本就不在白名单内、恒等规范化下仍 applies=false，不红。
+// 更新义务 f7: 新增依赖路径规范化的用例会扩本形态红集，新增后必须实测更新。
+//
+// 更新义务（总）: 新增会绑定任一形态的用例时必须就地更新该形态清单——否则 PR 正文声称的
+// 红集会随用例新增而静默过期（本缺陷历史上已错过五次，其中四次是 lead 手写正文数字；
+// 2026-08-10 起正文不再复述红集，统一指向本清单）。
 // 如实声明: 本清单是**人读锚点**，不被任何机器门验证（validate 只看退出码）；它不构成
 // 对红集的机器护卫，作用只是让下次过期在代码旁边就能被发现，而不是靠审查席去复算。
 function mkNodeGateEnv(id, verifyArgs, runnerOut) {
