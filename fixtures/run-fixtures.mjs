@@ -6575,6 +6575,27 @@ console.log('\n[B2] size-gate 双闸（真实 git 仓）');
     rmSync(d, { recursive: true, force: true });
   });
 
+  t('[B2-SGX] BUILTIN_EXCLUDES 独立匹配 preview-dist/(PR-B2 修订: (^|/)dist/ 匹配不到完整段名 preview-dist/)', () => {
+    const { d, g, base } = mkRepo();
+    g('checkout', '-qb', 'feat');
+    mkdirSync(join(d, 'src'), { recursive: true });
+    writeFileSync(join(d, 'src/real.js'), lines(10, 'r'));
+    mkdirSync(join(d, 'dist'), { recursive: true });
+    writeFileSync(join(d, 'dist/bundle.js'), lines(300, 'b'));
+    mkdirSync(join(d, 'preview-dist'), { recursive: true });
+    writeFileSync(join(d, 'preview-dist/manifest.json'), lines(200, 'm'));
+    mkdirSync(join(d, 'preview-dist/assets'), { recursive: true });
+    writeFileSync(join(d, 'preview-dist/assets/x.css'), lines(150, 'c'));
+    g('add', '.'); g('commit', '-qm', 'f1');
+    const r = computeSizeReport({ repoDir: d, baseRef: base });
+    ok(!r.counted_files.includes('dist/bundle.js'), 'dist/ 保持排除');
+    ok(!r.counted_files.includes('preview-dist/manifest.json'), 'preview-dist/ 顶层文件不计入');
+    ok(!r.counted_files.includes('preview-dist/assets/x.css'), 'preview-dist/ 子路径不计入');
+    ok(r.excluded_files.includes('dist/bundle.js') && r.excluded_files.includes('preview-dist/manifest.json') && r.excluded_files.includes('preview-dist/assets/x.css'), '三个文件都应在 excluded_files');
+    eq(r.counted_lines, 10, '只计 src/real.js 的 10 行');
+    rmSync(d, { recursive: true, force: true });
+  });
+
   t('[B2-SC19] base 树配置 malformed 一律 fail-closed(不回退默认);缺失才 fallback', () => {
     const commitRules = (content) => {
       const { d, g } = mkRepo();
