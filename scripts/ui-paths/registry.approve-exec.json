@@ -1,0 +1,7 @@
+{
+  "_comment": "approve-exec 仓 UI 路径 registry — 本仓为 lead 编排 skill 工具仓（脚本 + 文档），无任何 UI 面；空 ui_globs 使 match.mjs 对一切输入派生 touches_ui=false（B 面 n_a 由派生值支持，非自报）。approve-exec-skill 规划轮（task-priority 计划期 B 维度 fail-closed 要求）补齐。",
+  "schema_version": "v1",
+  "repo": "PraiseZhu/approve-exec",
+  "ui_globs": [],
+  "non_ui_exceptions": []
+}
