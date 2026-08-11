@@ -1,0 +1,7 @@
+{
+  "_comment": "Review-PR 仓 UI 路径 registry — 本仓为脚本/skill 工具仓，无任何 UI 面；空 ui_globs 使 match.mjs 对一切输入派生 touches_ui=false（B 面 n_a 由派生值支持，非自报）。2026-08-09 task-priority 计划期（review-pr-evo-weekly）B 维度 fail-closed 要求补齐，参照 registry.pr-autopilot.json 先例。",
+  "schema_version": "v1",
+  "repo": "PraiseZhu/Review-PR",
+  "ui_globs": [],
+  "non_ui_exceptions": []
+}
