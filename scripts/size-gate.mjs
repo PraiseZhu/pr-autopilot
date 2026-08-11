@@ -24,6 +24,7 @@ export const BUILTIN_EXCLUDES = [
   '\\.(test|spec)\\.[cm]?[jt]sx?$',
   '(^|/)(package-lock\\.json|yarn\\.lock|pnpm-lock\\.yaml|Cargo\\.lock|poetry\\.lock|Gemfile\\.lock)$',
   '(^|/)dist/',
+  '(^|/)preview-dist/',
   '\\.min\\.(js|css)$',
   '(^|/)(generated|__generated__)/',
   '\\.snap$'
