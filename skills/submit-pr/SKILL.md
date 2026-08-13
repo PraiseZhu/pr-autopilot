@@ -78,19 +78,23 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
      落盘并记入 PR body，**绑定 head_sha，改一行即失效**；push-guard 终闸同口径复验（膨胀绕不过）。
    实测依据：规模与 review 轮数是断崖关系（54 行一轮合并 / 292 行 4 轮 / 450 行振荡 8 轮报废；
    本仓 #297 P1a 5662 行事后拆 13 节）。
-6. **PR 标题/正文模板合规闸**（D2，2026-08-06）:
+6. **PR 标题/正文模板合规闸（格式闸前置——派审前最后一道机检）**（D2，2026-08-06；t3 加固，2026-08-13）:
+
+   ### 6a. 执行命令与结果语义
    ```
    node scripts/pr-format-gate.mjs --repo-dir . --base origin/main \
      --title "<PR 标题>" --body-file <PR 正文文件>
    ```
-   - `PASS` → 继续。`FAIL`（exit 1）→ **Phase 1 FAIL**：按输出的 `missing_sections` / 标题原因
-     改正文或标题，重跑至 PASS。`SKIP`（exit 0）→ 目标仓 merge-base 树未声明格式契约，本门
-     **无判据**；台账如实记 `format-gate: skipped(无配置)`，**不得**记成"格式检查通过"。
+   - `PASS` → 进入步骤 6b 状态机的 `passed` 状态，准入 Phase 2 派审。
+   - `FAIL`（exit 1）→ 进入步骤 6b 状态机的 `failed` 状态，触发自动修复分支。
+   - `SKIP`（exit 0）→ 目标仓 merge-base 树未声明格式契约，本门**无判据**；台账如实记
+     `format-gate: skipped(无配置)`，**不得**记成"格式检查通过"；视同 `passed` 进入 Phase 2。
    - 配置源 = **双读取严格交集**（D2-B，2026-08-06）：merge-base 树 + 候选树（HEAD）各读一份
      `agent-use/docs/pr-rules.json`、各判一次，任一侧 FAIL 即 FAIL——只读 base 会在「PR 自身
      收紧规则」时与 review-pr（读候选 checkout）裁决相反，复活 D2 死锁；只读候选回到 B2-F1
      绕闸。两侧均无判据才 SKIP；任一侧 malformed → fail-closed exit 3。口径刻意对齐 review-pr
      的 `context.mjs`（第三席的职责就是预演 review-pr 的裁决，口径一致才是正确性判据）。
+
    > **为什么这道门在 Phase 1，不在审查席**（D2 死锁修复，2026-08-06 实测代价一整轮三席）：
    > 「正文缺一个必填段落」此前只能由第三席判 `format-gate=fail` → conjunct④ 要求全部
    > gate_checks ∈ {pass,n_a} → 共识永不 PASS → **不写 artifact**（实测：fail 时 CLI 根本不
@@ -102,6 +106,110 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    > gate_id**：第三席照旧填报它，只是"缺必填段落"这个成因在 Phase 1 之后已不可能存在，
    > 该 gate 回到它该管的语义判断上。任何「给 gate fail 开补救口」的方案都要削弱 fail-closed，
    > 本仓禁止。
+
+   ### 6b. 格式闸状态机（t3 加固，2026-08-13）
+
+   格式闸的执行流程为显式状态机。以下状态与转移是**规范性定义**——任何实现（脚本/人工）必须遵循。
+
+   **状态**：
+
+   | 状态 | 标识 | 含义 |
+   |------|------|------|
+   | 待检测 | `pending` | 格式闸尚未对本轮 candidate 执行 |
+   | 检测中 | `checking` | 格式闸正在执行（`pr-format-gate.mjs` 运行中） |
+   | 通过 | `passed` | 格式闸返回 PASS 或 SKIP，准入 Phase 2 派审 |
+   | 未过 | `failed` | 格式闸返回 FAIL，存在缺失段落或标题不合规 |
+   | 修复中 | `fixing` | 正在执行自动修复（补全缺失段落/修正标题格式） |
+   | 阻断 | `blocked` | 自动修复失败或重试耗尽，转人工处理 |
+
+   **转移**：
+
+   | 起点 | 终点 | 触发条件 |
+   |------|------|---------|
+   | `pending` | `checking` | 执行 `pr-format-gate.mjs` |
+   | `checking` | `passed` | exit 0 且 result ∈ {PASS, SKIP} |
+   | `checking` | `failed` | exit 1（result = FAIL） |
+   | `failed` | `fixing` | 重试计数 < `maxRetries`（默认 3），触发自动修复 |
+   | `failed` | `blocked` | 重试计数 ≥ `maxRetries`，转人工 |
+   | `fixing` | `checking` | 自动修复完成，**必须重新执行完整格式闸**（不得因「修过一次」直接放行） |
+   | `fixing` | `blocked` | 自动修复自身失败（无法生成修复补丁/快照还原失败），转人工 |
+
+   **重试上限**：`maxRetries` 默认 3，由目标仓 `agent-use/docs/pr-rules.json` 的
+   `formatGate.maxRetries` 字段配置（缺省 = 3；malformed → fail-closed，拒绝执行）。
+   每次重检前必须重新执行完整 `pr-format-gate.mjs`，**不得**因「已修过一次」跳过检测直接进入
+   `passed`。
+
+   **阻断出口**（到达 `blocked` 状态时）：
+   1. lead 在台账记录阻断原因、已尝试的修复次数、最后一轮 `missing_sections` 输出
+   2. lead 人工修复后从 `pending` 重新开始（重试计数器归零，因为输入已实质性变更）
+   3. **不得绕过格式闸直接进入 Phase 2**——`blocked` 状态下无任何路径通往 `passed`
+
+   ### 6c. 自动修复前快照（t3 加固，2026-08-13）
+
+   自动修复是对文件（PR 正文文件、可能还包括 changelog 等关联文件）的写操作，可能覆盖掉本来正确的写法。
+   修复前**必须**生成可回退快照。
+
+   **快照生成**（进入 `fixing` 状态前执行）：
+   ```bash
+   # 对 PR 正文文件（已跟踪或未跟踪均覆盖）
+   cp -p "<PR正文文件>" "<PR正文文件>.pre-format-fix.bak"
+   ```
+   若自动修复还涉及其他文件（如 changelog），每个被修改文件同口径生成 `.pre-format-fix.bak` 副本。
+
+   **回退命令**（修复后若被打回或发现修复引入新问题）：
+   ```bash
+   # 逐文件还原
+   cp "<文件>.pre-format-fix.bak" "<文件>"
+   ```
+   还原后工作区状态与修复前逐字节一致。快照文件在台账确认修复无误后删除。
+
+   > **「先自动修」与原 evidence 声称的「无破坏性操作」自相矛盾**（加固类 1）：自动修复一旦
+   > 写入文件就不再是纯只读检查。快照机制是这条矛盾的唯一解——它让自动修复变成**可逆**操作，
+   > 修复失败或引入新问题时存在一条命令回到修复前。
+
+   ### 6d. 四闸合取顺序与判定基准（t3 加固，2026-08-13）
+
+   Phase 1 的四道确定性闸门按以下顺序执行，**全部通过**（含 SKIP 视同通过）才准进入 Phase 2 派审：
+
+   | 序号 | 闸 | 脚本 | 失败语义 |
+   |------|----|------|---------|
+   | G1 | 类型检查（typecheck-merged） | Phase 1 步骤 1 | 失败 → Phase 1 FAIL，修复后从 G1 重跑 |
+   | G2 | 意图契约校验 | `intent-check.mjs` | exit 1/2 → Phase 1 FAIL，修复后从 G2 重跑 |
+   | G3 | 规模入口闸 | `size-gate.mjs` | STOP → 不得进入 Phase 2；WARN → 继续但须台账登记拆分规划 |
+   | G4 | 标题/正文模板合规闸 | `pr-format-gate.mjs` | FAIL → 进入格式闸状态机修复分支（§6b） |
+
+   **合取规则**：G1 ∧ G2 ∧ G3 ∧ G4 = true 才进入 Phase 2。任一间 FAIL/STOP 阻断后续闸的执行。
+
+   **判定基准一致性规则**：
+
+   1. **自动修复改动文件后，下游消费者必须使用修复后的最终状态**：
+      - 格式闸自动修复改动 PR 正文或关联文件后，Phase 2 审查席拿到的 `bundle.pr_body` 必须是
+        修复后的定稿版本。不得出现「格式闸判的是修复后 body，但 Phase 2 的 `review_input_hash`
+        算的是修复前 body」的数据不一致。
+      - 若自动修复还改动了其他文件（如 changelog），Phase 1.5 预扫和 Phase 2 三审的 diff 基准
+        必须是修复后的树——不得存在「A 闸判修复前 diff、B 闸判修复后 diff」的混合状态。
+
+   2. **规模闸 STOP 使格式闸结论作废（stale）**：
+      - 规模闸（G3）在格式闸（G4）**之前**执行。若 G3 判 STOP，后续闸不再执行（合取规则已阻断）。
+        若因任何原因（如人工操作顺序错误）导致 G4 在 G3 之前执行并取得 PASS，G3 判 STOP 后
+        该 PASS 结论**标记为 stale**——因为 G3 STOP 要求拆分 PR，拆分后 PR 标题/正文必然变化，
+        原 G4 结论不再有效。
+      - 拆分后各子 PR 必须**各自重跑**完整四闸（G1→G2→G3→G4），不得复用拆分前任一间结论。
+      - 台账记录：`format-gate: stale(上游 size-gate STOP，拆分后重跑)`。
+
+   3. **自动修复改动文件后，G1 和 G2 的判定基准不变**：
+      - G1（typecheck-merged）的输入是 `merge-base..HEAD` 的代码 diff，格式闸自动修复不改源码，
+        因此 G1 不受影响。
+      - G2（intent-check）的输入是 `.pr-intent.md` 与 PR body marker 区块，格式闸自动修复可能
+        改动 PR body 正文但不应改动 marker 区块（marker 内容由 `intent-check.mjs` 管理，格式闸
+        自动修复不触碰 marker）。若格式闸自动修复意外改动了 marker 区块，G2 必须重跑。
+      - 若未来格式闸扩展为可修改源码文件，本条规则须同步更新。
+
+   > **四闸合取顺序的设计理由**：G3（规模）必须在 G4（格式）之前——规模闸判 STOP 时格式闸的
+   > PASS 结论在拆分后立即作废，所以把格式闸放在规模闸之后、作为派审前最后一道闸，避免「格式
+   > 闸 PASS → 规模闸 STOP → 拆分 → 子 PR 忘跑格式闸」的静默漏检路径。G1（类型检查）与 G2
+   > （意图）放在前面是因为它们是其余闸的锚定上下文——类型不对或意图缺失，后续闸的判定缺乏
+   > 语义基础。
 
 ## Phase 1.5 — 预扫自清洗（haiku，定格 candidate 之前）
 
