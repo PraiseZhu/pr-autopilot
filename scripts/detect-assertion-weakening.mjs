@@ -158,7 +158,7 @@ export function detectAssertionWeakening(diff) {
 
       // 5. 注释掉的断言
       for (const line of added) {
-        const t = line.trimStart();
+        const t = line.replace(/^\+/, '').trimStart();
         if ((t.startsWith('//') || t.startsWith('/*')) && isAssertionLine(t.replace(/^\/\/\s*/, '').replace(/^\/\*.*\*\/\s*/, ''))) {
           findings.push({ file: file.file, type: 'commented_assertion', severity: 'high', detail: `注释掉断言: ${t.substring(0, 120)}` });
         }
@@ -166,7 +166,7 @@ export function detectAssertionWeakening(diff) {
 
       // 6. early return 在断言前
       for (const line of added) {
-        if (/^\s*return\s*[;}]/.test(line)) {
+        if (/^\+\s*return\s*[;}]/.test(line)) {
           const idx = hunk.lines.findIndex(l => l.content === line);
           if (idx >= 0) {
             const afterReturn = hunk.lines.slice(idx + 1).filter(l => l.type === 'removed' || l.type === 'added');
