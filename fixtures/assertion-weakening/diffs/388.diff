@@ -1,0 +1,847 @@
+diff --git a/src/__tests__/agentManifest.test.ts b/src/__tests__/agentManifest.test.ts
+new file mode 100644
+index 00000000..dfb20abe
+--- /dev/null
++++ b/src/__tests__/agentManifest.test.ts
+@@ -0,0 +1,87 @@
++/**
++ * 身份卡契约测试 — agent 槽(#297 P2 SC2.8)。
++ *
++ * 独立成文件而不是并进 cardManifest.test.ts:main.js / ghost.json 是本轮多 PR 的
++ * 高竞争面,新增断言另开文件能把 rebase 冲突面收敛到 ghost.json 本身(与
++ * notifyManifest.test.ts / sessionManifest.test.ts 同一惯例)。
++ *
++ * 覆盖 SC2.8「manifest 仅 slots 增 agent(不写 agent:{background:true})」:
++ *   - `agent` 进 slots,且保留之前既有的全部槽;
++ *   - **不声明顶层 `agent` 配置块**(那是 background 模式专属的更重权限,手册
++ *     §4.11 明文:只有清单额外声明 `agent:{background:true}` 时才可不用当次
++ *     点击票据;P2 全程走一次性票据流程,不申请这项权限);
++ *   - 工具数不变(P2 不增工具),守住 ≤16 running total;
++ *   - version 相对 merge-base 严格递增,原有槽一个不少。
++ */
++import { readFileSync } from 'node:fs'
++import { fileURLToPath } from 'node:url'
++import { describe, expect, it } from 'vitest'
++import { readGuardBaseFile } from './mergeBaseGuard'
++
++const MANIFEST_PATH = fileURLToPath(new URL('../../ghost.json', import.meta.url))
++const MANIFEST_REPO_PATH = 'cindyplugin/ghost.json'
++// #297 R11a(subscribe 槽)发布时的槽位集合:agent 之前就存在的全部槽。
++const PRIOR_SLOTS = ['panel', 'fs', 'tool', 'cindy', 'skill', 'card', 'notify', 'subscribe']
++/** §六-1 的工具预算上限(宿主硬约束)。 */
++const TOOL_BUDGET = 16
++// running total:R3/P3-14/R5 三段落地后固定为 8;P2 不加工具。
++const EXPECTED_TOOL_COUNT = 8
++
++type Manifest = {
++  version: string
++  slots: string[]
++  tools: Array<{ name: string }>
++  agent?: unknown
++}
++
++const manifest = (): Manifest => JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')) as Manifest
++
++const parseVersion = (value: string): number[] => {
++  expect(value).toMatch(/^\d+\.\d+\.\d+$/)
++  return value.split('.').map((part) => Number(part))
++}
++
++const compare = (left: number[], right: number[]): number => {
++  for (let i = 0; i < 3; i += 1) {
++    if (left[i] !== right[i]) return left[i] - right[i]
++  }
++  return 0
++}
++
++describe('ghost.json agent 槽契约(#297 P2)', () => {
++  it('保留既有全部槽并新增 agent', () => {
++    const slots = manifest().slots
++    expect(Array.isArray(slots)).toBe(true)
++    for (const slot of PRIOR_SLOTS) expect(slots).toContain(slot)
++    expect(slots).toContain('agent')
++    expect(new Set(slots).size).toBe(slots.length) // 不许重复声明
++  })
++
++  it('不声明顶层 agent 配置块:不申请 background 模式(手册 §4.11)', () => {
++    expect(manifest().agent).toBeUndefined()
++  })
++
++  it('工具数不变,守住 ≤16 running total', () => {
++    const tools = manifest().tools
++    expect(tools).toHaveLength(EXPECTED_TOOL_COUNT)
++    expect(tools.length).toBeLessThanOrEqual(TOOL_BUDGET)
++    expect(new Set(tools.map((tool) => tool.name)).size).toBe(tools.length)
++  })
++
++  // 与 cardManifest.test.ts 共用 mergeBaseGuard 的三档 fail-closed 语义
++  // (CI 判红 / 显式指定基线读不出判红 / 仅本地未指定才跳过)。
++  it('相对 merge-base 版本严格递增、槽位只增不减', (ctx) => {
++    const baseText = readGuardBaseFile(MANIFEST_REPO_PATH, 'agentManifest')
++    if (baseText === null) {
++      ctx.skip() // 只有本地取不到基线才走这里,且 mergeBaseGuard 已打印醒目横幅
++      return
++    }
++    const base = JSON.parse(baseText) as Manifest
++    if (JSON.stringify(base) === JSON.stringify(manifest())) {
++      // manifest 与 merge-base 逐字节一致 = 本分支根本没动它,增量语义无从谈起。
++      return
++    }
++    expect(compare(parseVersion(manifest().version), parseVersion(base.version))).toBeGreaterThan(0)
++    for (const slot of base.slots) expect(manifest().slots).toContain(slot)
++  })
++})
+diff --git a/src/__tests__/brainHarness.ts b/src/__tests__/brainHarness.ts
+index ed8f823c..6c9d92bf 100644
+--- a/src/__tests__/brainHarness.ts
++++ b/src/__tests__/brainHarness.ts
+@@ -200,7 +200,8 @@ export type CardVersion = {
+ }
+ 
+ export type CardView = {
+-  mode?: 'generate' | 'edit'
++  /** #297 P2:'continue' 是「基于这张图继续」的收据卡,不产生新生成。 */
++  mode?: 'generate' | 'edit' | 'continue'
+   phase?: 'working' | 'done' | 'failed'
+   aspectRatio?: string
+   imageUrl?: string
+@@ -214,6 +215,8 @@ export type CardView = {
+   actions?: string[]
+   /** #300:ACK 失败(记录没落盘)→ 按钮藏了并在卡上明说。 */
+   actionsUnavailable?: boolean
++  /** #297 P2:mode:'continue' 且 phase:'done' 时,agent.run 的 disposition 是否为 'queued'。 */
++  queued?: boolean
+ }
+ 
+ /** #300 A0 落盘的动作记录信封(Cindy 私有层;core 是共享层的可移植记录核)。 */
+@@ -250,7 +253,11 @@ export type BrainCardActionHandles = {
+   dir: string
+   records: () => Promise<CardActionRecord[]>
+   doneIds: () => Promise<string[]>
++  /** #297 P2 返修(P1-2):调用 agent.run **前**落盘的一次性调用凭据(与 done 不同集)。 */
++  attemptedIds: () => Promise<string[]>
+   inflightCount: () => number
++  /** #297 P2 返修(R4.3):同根"上一次 continue 结果未知"的守卫数量。 */
++  continueRootPendingCount: () => number
+   plan: (
+     actionId: string,
+     record: CardActionRecord,
+@@ -564,6 +571,15 @@ export type LoadBrainOptions = {
+   writeOutcome?: (request: FsRequest) => 'ok' | 'reject' | 'throw' | 'malformed' | 'hang' | undefined
+   /** throw 档时字节是否仍然落盘(模拟「宿主写成功但回执没回来」)。默认 false。 */
+   landsOnThrow?: boolean
++  /**
++   * 写盘**迟到落地**注入(#297 P2 返修 R5.1:与 writeOutcome 的 'hang' 不同 ——
++   * 'hang' 永不 settle,这里是**真的会 settle,只是晚**)。返回一个正数 ms,该次
++   * 写会在假时钟走过这段延迟后才真正落盘 + resolve `{ok:true}`;这正是
++   * `withDeadline` 放弃等待之后,底层 `cindy.fs` 请求仍在后台跑、迟早会真的落字节
++   * 那个场景的忠实复现 —— 与 'hang' 档「主进程销毁、永远不会有代码再跑」是两种
++   * 不同的宿主故障,协议测试要能分别钉住。返回 undefined = 立即按正常路径落盘。
++   */
++  writeDelayMs?: (request: FsRequest) => number | undefined
+   /**
+    * 读回执的悬挂注入(#297 修正版① SC-1.4-③:read 侧的 'hang' 等价物,仿 writeOutcome
+    * 既有形状)。目前只有 `'hang'` 这一档:**字节位置不变,promise 永不 settle**。
+@@ -586,6 +602,13 @@ export type LoadBrainOptions = {
+    * 「取不到上下文」的回退路径。不传 = 正常返回 locale。
+    */
+   request?: (payload: unknown) => unknown
++  /**
++   * #297 P2:注入 cindy.agent.run(发起 Agent 新回合,手册 §4.11)的应答。
++   * 同步抛错 / 返回被拒绝的 Promise 都原样透传给调用方(main.js 的 await 会
++   * 按各自形态收敛成同一条 catch 路径),用于测 SC2.9 的「同步抛错 / runner
++   * reject」两档。不传 = 默认成功({ok:true, sessionId, mode:'continue', disposition:'resumed'})。
++   */
++  agentRun?: (payload: Record<string, unknown>) => unknown
+   /**
+    * 注入 network 槽代发(`cindy.fetch`)的应答。不传 = 恒回「凭证未配置」类结构化错误,
+    * 即「这台机器没配 Mivo key」——所有既有用例因此保持原有的 cindy-request 行为不变。
+@@ -622,6 +645,8 @@ export type LoadedBrain = {
+   setSendReply: (reply: unknown) => void
+   /** 让 cindy.send / seam.send 抛错。 */
+   setSendThrows: (error: Error | null) => void
++  /** #297 P2:经 cindy.agent.run 发出的每一次调用载荷(顺序即调用顺序)。 */
++  agentRunCalls: Record<string, unknown>[]
+ }
+ 
+ const BRAIN_SOURCE = readFileSync(MAIN_JS_PATH, 'utf8')
+@@ -636,6 +661,7 @@ export function loadBrain(options: LoadBrainOptions = {}): LoadedBrain {
+   const fsRequests: FsRequest[] = []
+   const hostListeners: Array<(msg: unknown) => void> = []
+   const hostRequests: unknown[] = []
++  const agentRunCalls: Record<string, unknown>[] = []
+   const fetchRequests: Array<Record<string, unknown>> = []
+   let sendReply: unknown = { ok: true }
+   let sendThrows: Error | null = null
+@@ -658,6 +684,15 @@ export function loadBrain(options: LoadBrainOptions = {}): LoadedBrain {
+       if (options.request) return options.request(payload)
+       return { ok: true, context: { region: 'cn', locale: options.locale ?? 'en' } }
+     },
++    // #297 P2(手册 §4.11):agent 槷发起新回合。默认成功且不排队,测试按需注入
++    // options.agentRun 覆盖(含同步抛错 / 返回被拒绝的 Promise)。
++    agent: {
++      run: (payload: unknown) => {
++        agentRunCalls.push(payload as Record<string, unknown>)
++        if (options.agentRun) return options.agentRun(payload as Record<string, unknown>)
++        return { ok: true, sessionId: 'sess-test', mode: 'continue', disposition: 'resumed' }
++      },
++    },
+     fs: async (request: FsRequest) => {
+       fsRequests.push(request)
+       if (request.op === 'write') {
+@@ -678,6 +713,17 @@ export function loadBrain(options: LoadBrainOptions = {}): LoadedBrain {
+           return new Promise(() => {})
+         }
+         if (options.writeGuard && !options.writeGuard(request)) return { ok: false, message: 'write refused' }
++        const delayMs = options.writeDelayMs?.(request)
++        if (typeof delayMs === 'number' && delayMs > 0) {
++          // 真的会 settle,只是要等假时钟走过这段延迟——不能用真实 setTimeout(测试
++          // 用假时钟推进,真实定时器永远等不到),必须走同一个 clock seam。
++          return new Promise((resolve) => {
++            clock.setTimeout(() => {
++              files.set(fsKey(request), String(request.content ?? ''))
++              resolve({ ok: true, op: 'write', path: request.path, bytes: String(request.content ?? '').length })
++            }, delayMs)
++          })
++        }
+         files.set(fsKey(request), String(request.content ?? ''))
+         return { ok: true, op: 'write', path: request.path, bytes: String(request.content ?? '').length }
+       }
+@@ -819,6 +865,7 @@ export function loadBrain(options: LoadBrainOptions = {}): LoadedBrain {
+     setSendThrows: (error: Error | null) => {
+       sendThrows = error
+     },
++    agentRunCalls,
+   }
+ }
+ 
+diff --git a/src/__tests__/cardActionContinue.test.ts b/src/__tests__/cardActionContinue.test.ts
+new file mode 100644
+index 00000000..c194665b
+--- /dev/null
++++ b/src/__tests__/cardActionContinue.test.ts
+@@ -0,0 +1,522 @@
++/**
++ * 「基于这张图继续」协议测试(#297 P2)。
++ *
++ * 权威依据:_tmp/297-dispatch/round2-plan-v3.md P2 节 SC2.1-2.9,与手册 §4.11
++ * (发起 Agent 新回合:一次性点击票据、promptTemplate 双占位、mode:'continue')。
++ *
++ * 与 regen/restyle(#300)共用的部分 —— 级①伪事件过滤、级②记录校验(过期/损坏/
++ * 血缘/会话不匹配)、root-inflight 背压、幂等去重 —— 已由 cardActions.test.ts /
++ * cardActionConcurrency.test.ts 覆盖,这里只测 'continue' 分岔之后独有的行为:
++ * 按钮可见性、agent.run 调用契约、失败矩阵、并发、event 白名单与脱敏。
++ */
++import { describe, expect, it } from 'vitest'
++import { flushUntil } from './brainHarness'
++import {
++  boot,
++  clickAction,
++  coreFor,
++  filesOf,
++  generationRequests,
++  HASH,
++  markup,
++  ROOT_CALL_ID,
++  seedRootRecord,
++} from './cardActionHarness'
++import type { Booted } from './cardActionHarness'
++
++const cardsFor = (booted: Booted, callId: string) => booted.cards().filter((card) => card.callId === callId)
++const doneCardsFor = (booted: Booted, callId: string) => cardsFor(booted, callId).filter((card) => card.state === 'done')
++
++// #297 P2 返修:级②共享前置校验(corrupt/TTL/lineage/session/背压)的现场构造,
++// 与 cardActions.test.ts 的 envelope/seededFiles 同一份手搓落盘形状(wire shape),
++// 这里独立一份是因为那个文件的版本是局部常量,未对外导出。
++const CLOCK_START = 1_700_000_000_000
++const TTL_MS = 30 * 24 * 60 * 60 * 1000
++
++const seededFiles = (records: unknown[], done: string[] = [], attempted: string[] = []): Record<string, string> => ({
++  'card-actions/manifest.json': JSON.stringify({ version: 1, current: 'records-a.json', generation: 7 }),
++  'card-actions/records-a.json': JSON.stringify({ version: 1, records, done, attempted }),
++})
++
++const envelope = (overrides: {
++  recordId: string
++  callId?: string
++  core?: unknown
++  sessionId?: string
++  ownedHash?: string
++  rootCallId?: string
++  parentCallId?: string
++}): Record<string, unknown> => ({
++  callId: overrides.recordId,
++  core: coreFor(),
++  ownedHash: HASH,
++  ext: '.png',
++  ...overrides,
++})
++
++describe('P2 continue 按钮可见性(SC2.1/2.2)', () => {
++  it('done 卡且有合法 owned 指纹 → continue 出现在按钮行, allowlist 校验通过', async () => {
++    const booted = boot()
++    await seedRootRecord(booted)
++    const done = doneCardsFor(booted, ROOT_CALL_ID).pop()
++    const html = markup(done?.html)
++    expect(html).toContain('data-ghost-action="continue"')
++    expect(html).toContain('data-ghost-action="regen"')
++    expect(html).toContain('data-ghost-action="restyle"')
++    // continue 与 regen 一样是零输入动作,不带 data-ghost-prompt。
++    const continueBtn = html.slice(
++      html.indexOf('data-ghost-action="continue"'),
++      html.indexOf('</button>', html.indexOf('data-ghost-action="continue"')),
++    )
++    expect(continueBtn).not.toContain('data-ghost-prompt')
++  })
++
++  it('working / failed 卡零 continue 按钮(与 regen/restyle 同一条既有规则)', () => {
++    const handles = boot().brain.handles
++    for (const phase of ['working', 'failed'] as const) {
++      const version = handles.card.render({
++        phase,
++        actionable: true,
++        actions: ['regen', 'restyle', 'continue'],
++        reason: 'x',
++      })
++      expect(version.html).not.toContain('data-ghost-action')
++    }
++  })
++
++  it('无 owned 指纹(withMedia:false)→ 零 continue 按钮,但 regen/restyle 仍在', async () => {
++    const booted = boot({ withMedia: false })
++    await seedRootRecord(booted)
++    const done = doneCardsFor(booted, ROOT_CALL_ID).pop()
++    const html = markup(done?.html)
++    expect(html).not.toContain('data-ghost-action="continue"')
++    expect(html).toContain('data-ghost-action="regen"')
++    expect(html).toContain('data-ghost-action="restyle"')
++  })
++
++  it('actionId allowlist 恰为三值,且逐个匹配宿主字符集正则', () => {
++    const allow = boot().brain.handles.card.actionIds()
++    expect(allow.slice().sort()).toEqual(['continue', 'regen', 'restyle'])
++    for (const id of allow) expect(id).toMatch(/^[A-Za-z0-9_:-]{1,128}$/)
++  })
++})
++
++describe('P2 continue 成功路径:agent.run 调用契约(SC2.3/2.7/2.8)', () => {
++  it('有票立即调用 agent.run;模板恰一次两个占位;event 白名单恰三键;token 原样;无 trigger/sessionId', async () => {
++    const booted = boot()
++    await seedRootRecord(booted)
++    await clickAction(booted, {
++      actionId: 'continue',
++      spawnCallId: 'spawn-continue-ok',
++      userActionToken: 'tok-abc-123',
++    })
++
++    expect(booted.brain.agentRunCalls).toHaveLength(1)
++    const payload = booted.brain.agentRunCalls[0]
++    expect(payload.mode).toBe('continue')
++    expect(payload.userActionToken).toBe('tok-abc-123')
++    expect(payload).not.toHaveProperty('trigger')
++    expect(payload).not.toHaveProperty('sessionId')
++
++    const template = String(payload.promptTemplate)
++    expect(template.split('{{user_message}}')).toHaveLength(2) // 恰一次 = split 出两段
++    expect(template.split('{{event_json}}')).toHaveLength(2)
++
++    const event = payload.event as Record<string, unknown>
++    expect(Object.keys(event).sort()).toEqual(['actionId', 'artifactHash', 'spawnCallId'])
++    expect(event.artifactHash).toBe(HASH)
++    expect(event.spawnCallId).toBe('spawn-continue-ok')
++    expect(event.actionId).toBe('continue')
++
++    // userMessage 是固定产品文案,不拼接任何自由文本。
++    expect(payload.userMessage).toBe(booted.brain.handles.card.text('en', 'continueUserMessage'))
++  })
++
++  it("disposition 非 'queued'(created/resumed/active/forked,宿主冻结五值去掉 queued)→ 画「已发送」,不误画成「已排队」", async () => {
++    for (const disposition of ['created', 'resumed', 'active', 'forked']) {
++      const booted = boot({ agentRun: () => ({ ok: true, sessionId: 's', mode: 'continue', disposition }) })
++      await seedRootRecord(booted)
++      const spawnCallId = `spawn-disp-${disposition}`
++      await clickAction(booted, { actionId: 'continue', spawnCallId, userActionToken: 'tok' })
++      const done = doneCardsFor(booted, spawnCallId).pop()
++      expect(done?.html).toContain(booted.brain.handles.card.text('en', 'continueSent'))
++      expect(done?.html).not.toContain(booted.brain.handles.card.text('en', 'continueQueued'))
++    }
++  })
++
++  it("disposition:'queued' → 如实画「已排队」,不误画成「已完成/已发送」(SC2.5)", async () => {
++    const booted = boot({ agentRun: () => ({ ok: true, sessionId: 's', mode: 'continue', disposition: 'queued' }) })
++    await seedRootRecord(booted)
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-queued', userActionToken: 'tok' })
++    const done = doneCardsFor(booted, 'spawn-queued').pop()
++    expect(done?.html).toContain(booted.brain.handles.card.text('en', 'continueQueued'))
++    expect(done?.html).not.toContain(booted.brain.handles.card.text('en', 'continueSent'))
++  })
++
++  it('extra 未知字段前向兼容忽略,仍画「已发送」', async () => {
++    const booted = boot({
++      agentRun: () => ({ ok: true, sessionId: 's', mode: 'continue', disposition: 'resumed', future: { x: 1 } }),
++    })
++    await seedRootRecord(booted)
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-extra-field', userActionToken: 'tok' })
++    const done = doneCardsFor(booted, 'spawn-extra-field').pop()
++    expect(done?.html).toContain(booted.brain.handles.card.text('en', 'continueSent'))
++  })
++
++  it('成功后恰一次终版卡(working→done,不重复终版)', async () => {
++    const booted = boot()
++    await seedRootRecord(booted)
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-once', userActionToken: 'tok' })
++    expect(doneCardsFor(booted, 'spawn-once')).toHaveLength(1)
++  })
++
++  it('原卡(callId)不被追加渲染:continue 只画在 spawnCallId 自己的卡位上', async () => {
++    const booted = boot()
++    await seedRootRecord(booted)
++    const before = cardsFor(booted, ROOT_CALL_ID).length
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-untouched', userActionToken: 'tok' })
++    expect(cardsFor(booted, ROOT_CALL_ID)).toHaveLength(before)
++  })
++})
++
++describe('P2 continue 无一次性点击票据(SC2.4)', () => {
++  it('缺 userActionToken → 零调用 agent.run,恰一次失败卡带稳定码,原卡不动', async () => {
++    const booted = boot()
++    await seedRootRecord(booted)
++    const before = cardsFor(booted, ROOT_CALL_ID).length
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-no-ticket' })
++    expect(booted.brain.agentRunCalls).toHaveLength(0)
++    const failed = doneCardsFor(booted, 'spawn-no-ticket')
++    expect(failed).toHaveLength(1)
++    expect(failed[0].html).toContain(booted.brain.handles.card.text('en', 'errNoTicket'))
++    expect(cardsFor(booted, ROOT_CALL_ID)).toHaveLength(before)
++  })
++
++  it('空字符串票据同样按无票处理(不是"任意 falsy 之外都算有票"的漏判)', async () => {
++    const booted = boot()
++    await seedRootRecord(booted)
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-empty-ticket', userActionToken: '' })
++    expect(booted.brain.agentRunCalls).toHaveLength(0)
++    expect(doneCardsFor(booted, 'spawn-empty-ticket')).toHaveLength(1)
++  })
++})
++
++describe('P2 continue 失败矩阵(SC2.5/2.9)', () => {
++  it('result.ok:false + TOKEN_EXPIRED → 失败卡,只调了一次(零自动重试)', async () => {
++    const booted = boot({
++      agentRun: () => ({ ok: false, errorCode: 'TOKEN_EXPIRED', message: 'ticket expired' }),
++    })
++    await seedRootRecord(booted)
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-expired', userActionToken: 'tok' })
++    expect(booted.brain.agentRunCalls).toHaveLength(1)
++    const failed = doneCardsFor(booted, 'spawn-expired')
++    expect(failed).toHaveLength(1)
++    expect(failed[0].html).toContain(booted.brain.handles.card.text('en', 'errContinueFailed'))
++  })
++
++  it('agent.run 同步抛错 → 失败卡(不悬挂,不冒泡出 handleCardAction)', async () => {
++    const booted = boot({
++      agentRun: () => {
++        throw new Error('boom sync')
++      },
++    })
++    await seedRootRecord(booted)
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-throw', userActionToken: 'tok' })
++    expect(doneCardsFor(booted, 'spawn-throw')).toHaveLength(1)
++  })
++
++  it('runner reject(返回被拒绝的 Promise)→ 失败卡', async () => {
++    const booted = boot({ agentRun: () => Promise.reject(new Error('boom reject')) })
++    await seedRootRecord(booted)
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-reject', userActionToken: 'tok' })
++    expect(doneCardsFor(booted, 'spawn-reject')).toHaveLength(1)
++  })
++
++  it('回包不是 {ok:boolean}(如 undefined)→ 按失败处理,不当成功', async () => {
++    const booted = boot({ agentRun: () => undefined })
++    await seedRootRecord(booted)
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-malformed', userActionToken: 'tok' })
++    expect(doneCardsFor(booted, 'spawn-malformed')).toHaveLength(1)
++  })
++
++  it('#297 P2 返修(P1-3):回包不按宿主冻结 union 严格校型 → 全部按失败处理,不误画成「已发送/已排队」', async () => {
++    // 宿主冻结 shape(apps/desktop/src/shared/ghost.ts):
++    // {ok:true, sessionId, mode:'continue', disposition:'created'|'resumed'|'active'|'queued'|'forked'}。
++    // 下面每一种都缺字段/错 mode/未知枚举——旧实现只查 result.ok===true 就会把它们全部误判成功。
++    const invalidShapes: Array<[string, unknown]> = [
++      ['missing-all-success-fields', { ok: true }],
++      ['missing-disposition', { ok: true, sessionId: 's', mode: 'continue' }],
++      ['missing-session', { ok: true, mode: 'continue', disposition: 'resumed' }],
++      ['wrong-mode', { ok: true, sessionId: 's', mode: 'fork', disposition: 'forked' }],
++      ['unknown-disposition', { ok: true, sessionId: 's', mode: 'continue', disposition: 'future-value' }],
++      ['empty-session', { ok: true, sessionId: '', mode: 'continue', disposition: 'resumed' }],
++    ]
++    for (const [label, reply] of invalidShapes) {
++      const booted = boot({ agentRun: () => reply })
++      await seedRootRecord(booted)
++      const spawnCallId = `spawn-invalid-${label}`
++      await clickAction(booted, { actionId: 'continue', spawnCallId, userActionToken: 'tok' })
++      const done = doneCardsFor(booted, spawnCallId).pop()
++      expect(booted.brain.agentRunCalls).toHaveLength(1) // 已经调用过,只是回包不合规——不重试
++      expect(done?.html).toContain(booted.brain.handles.card.text('en', 'continueFailed'))
++      expect(done?.html).not.toContain(booted.brain.handles.card.text('en', 'continueSent'))
++      expect(done?.html).not.toContain(booted.brain.handles.card.text('en', 'continueQueued'))
++    }
++  })
++
++  it('失败原因脱敏:agent.run 抛出的原始细节(路径/堆栈)不进卡片,只进日志', async () => {
++    const booted = boot({
++      agentRun: () => {
++        throw new Error('/Users/dev/secret/project/file.ts:42:7 boom')
++      },
++    })
++    await seedRootRecord(booted)
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-leak', userActionToken: 'tok' })
++    const failed = doneCardsFor(booted, 'spawn-leak').pop()
++    expect(failed?.html).not.toContain('/Users/dev/secret')
++    expect(failed?.html).not.toContain('.ts:42')
++  })
++})
++
++describe('P2 continue 并发(SC2.6)', () => {
++  it('同母卡两并发点击恰一次 agent.run,输家悬挂期即收 ACTION_BUSY', async () => {
++    const seeded = boot()
++    await seedRootRecord(seeded)
++    const booted = boot({
++      locale: 'zh-CN',
++      files: filesOf(seeded),
++      agentRun: () => new Promise(() => {}), // 永不 settle:模拟第一次点击悬在等回执
++    })
++    // 第一次不 await(悬挂在途),第二次立刻点同一母卡 —— 与既有 A9 用例
++    // (cardActions.test.ts「每 root 卡在途上限」)同一并发口径。
++    void booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'continue',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'spawn-busy-1',
++      userActionToken: 'tok-1',
++    })
++    await booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'continue',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'spawn-busy-2',
++      userActionToken: 'tok-2',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(1)
++    const rejected = doneCardsFor(booted, 'spawn-busy-2')
++    expect(rejected).toHaveLength(1)
++    expect(rejected[0].html).toContain(booted.brain.handles.card.failureReason('zh-CN', 'actionBusy'))
++    // 输家卡走的是 handleCardAction 里 continue 分岔**之前**的共享背压判定
++    // (level② 的 root-inflight 上限),标题必须仍是 continue 语义 —— 母卡是
++    // mode:'generate',若误用 cardActionFailCard 就会显示「图片生成失败」。
++    expect(rejected[0].html).toContain(booted.brain.handles.card.text('zh-CN', 'continueFailed'))
++    expect(rejected[0].html).not.toContain(booted.brain.handles.card.text('zh-CN', 'genFailed'))
++    expect(rejected[0].html).not.toContain(booted.brain.handles.card.text('zh-CN', 'editFailed'))
++  })
++})
++
++describe('P2 continue 共享级②前置校验的失败卡标题(与 regen/restyle 共用判定,分岔前统一跑)', () => {
++  const genFailed = (b: Booted) => b.brain.handles.card.text('en', 'genFailed')
++  const editFailed = (b: Booted) => b.brain.handles.card.text('en', 'editFailed')
++  const continueFailed = (b: Booted) => b.brain.handles.card.text('en', 'continueFailed')
++
++  it('记录损坏(core 不合规)→ 标题仍是 continue 语义,不是「图片生成失败」', async () => {
++    const booted = boot({
++      files: seededFiles([{ recordId: ROOT_CALL_ID, callId: ROOT_CALL_ID, core: { schemaVersion: 1, mode: 'generate' } }]),
++    })
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-l2-corrupt', userActionToken: 'tok' })
++    const done = doneCardsFor(booted, 'spawn-l2-corrupt').pop()
++    expect(done?.html).toContain(continueFailed(booted))
++    expect(done?.html).not.toContain(genFailed(booted))
++    expect(done?.html).not.toContain(editFailed(booted))
++  })
++
++  it('记录已过 TTL → 标题仍是 continue 语义,不是「图片修改失败」', async () => {
++    const booted = boot({
++      files: seededFiles([
++        envelope({ recordId: ROOT_CALL_ID, core: coreFor({ mode: 'edit', createdAt: CLOCK_START - TTL_MS - 1 }) }),
++      ]),
++    })
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-l2-ttl', userActionToken: 'tok' })
++    const done = doneCardsFor(booted, 'spawn-l2-ttl').pop()
++    expect(done?.html).toContain(continueFailed(booted))
++    expect(done?.html).not.toContain(genFailed(booted))
++    expect(done?.html).not.toContain(editFailed(booted))
++  })
++
++  it('衍生链不自洽(parent 指向不存在的记录)→ 标题仍是 continue 语义', async () => {
++    const orphan = envelope({
++      recordId: ROOT_CALL_ID,
++      core: { ...coreFor(), parentRecordId: 'call-missing', rootRecordId: 'call-missing' },
++    })
++    const booted = boot({ files: seededFiles([orphan]) })
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-l2-lineage', userActionToken: 'tok' })
++    const done = doneCardsFor(booted, 'spawn-l2-lineage').pop()
++    expect(done?.html).toContain(continueFailed(booted))
++    expect(done?.html).not.toContain(genFailed(booted))
++  })
++
++  it('已绑定 sessionId 与事件不匹配 → 标题仍是 continue 语义', async () => {
++    const bound = envelope({ recordId: ROOT_CALL_ID, sessionId: 'session-A' })
++    const booted = boot({ files: seededFiles([bound]) })
++    await clickAction(booted, {
++      actionId: 'continue',
++      spawnCallId: 'spawn-l2-session',
++      sessionId: 'session-B',
++      userActionToken: 'tok',
++    })
++    const done = doneCardsFor(booted, 'spawn-l2-session').pop()
++    expect(done?.html).toContain(continueFailed(booted))
++    expect(done?.html).not.toContain(genFailed(booted))
++  })
++
++  it('电子脑级在途上限(ghostInflightMax)撞满 → 多出的那个不同母卡输家标题仍是 continue 语义', async () => {
++    // 按常数句柄算 root 数量(不手写数字):撞的是「全局」上限而非「per-root」上限,
++    // 所以每个占位 click 必须落在**不同**母卡上,数量 = ghostInflightMax + 1(填满 + 撞满这一个)。
++    const ghostMax = boot().brain.handles.cardAction.ghostInflightMax
++    const roots = Array.from({ length: ghostMax + 1 }, (_unused, index) => `root-busy-${index + 1}`)
++    const booted = boot({
++      files: seededFiles(roots.map((id) => envelope({ recordId: id }))),
++      agentRun: () => new Promise(() => {}), // 永不 settle:占满在途不释放,逼多出的那个撞全局上限而非 root 上限
++    })
++    for (const id of roots.slice(0, ghostMax)) {
++      void booted.brain.handles.handleCardAction({
++        type: 'card-action',
++        actionId: 'continue',
++        callId: id,
++        spawnCallId: `spawn-fill-${id}`,
++        userActionToken: 'tok',
++      })
++    }
++    await booted.settle()
++    await clickAction(booted, {
++      actionId: 'continue',
++      callId: roots[ghostMax],
++      spawnCallId: 'spawn-l2-global-busy',
++      userActionToken: 'tok',
++    })
++    const done = doneCardsFor(booted, 'spawn-l2-global-busy').pop()
++    expect(done?.html).toContain(continueFailed(booted))
++    expect(done?.html).not.toContain(genFailed(booted))
++  })
++})
++
++describe('P2 continue 幂等(SC2.5)', () => {
++  it('同一 spawnCallId 重放:只调一次 agent.run,只发一次终版,不占并发额度', async () => {
++    const booted = boot()
++    await seedRootRecord(booted)
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-replay', userActionToken: 'tok' })
++    await clickAction(booted, { actionId: 'continue', spawnCallId: 'spawn-replay', userActionToken: 'tok' })
++    expect(booted.brain.agentRunCalls).toHaveLength(1)
++    expect(doneCardsFor(booted, 'spawn-replay')).toHaveLength(1)
++    expect(booted.brain.handles.cardAction.inflightCount()).toBe(0)
++  })
++})
++
++describe('P2 continue 衍生卡交错(regen/restyle 生出的子卡上也能 continue,双向背压互斥)', () => {
++  it('regen/restyle 衍生出的子卡各自可独立发起 continue(callId 不是 root 也成立)', async () => {
++    const booted = boot({ agentRun: () => ({ ok: true, sessionId: 's2', mode: 'continue', disposition: 'active' }) })
++    await seedRootRecord(booted)
++    await clickAction(booted, { actionId: 'regen', spawnCallId: 'child-regen' })
++    await clickAction(booted, {
++      actionId: 'continue', callId: 'child-regen', spawnCallId: 'child-continue', userActionToken: 'token-child',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(1)
++    expect(doneCardsFor(booted, 'child-continue').pop()?.html).toContain(
++      booted.brain.handles.card.text('en', 'continueSent'),
++    )
++
++    await clickAction(booted, {
++      actionId: 'restyle', callId: 'child-regen', spawnCallId: 'child-restyle', prompt: 'ink wash',
++    })
++    await clickAction(booted, {
++      actionId: 'continue',
++      callId: 'child-restyle',
++      spawnCallId: 'child-restyle-continue',
++      userActionToken: 'token-restyle-child',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(2)
++    expect(doneCardsFor(booted, 'child-restyle-continue').pop()?.html).toContain(
++      booted.brain.handles.card.text('en', 'continueSent'),
++    )
++  })
++
++  it('regen 在途时 continue 撞同一条 root-inflight 背压;regen 释放后 continue 才能进 agent.run', async () => {
++    const seeded = boot()
++    await seedRootRecord(seeded)
++    const booted = boot({ files: filesOf(seeded), panel: () => 'never' }) // regen 悬在 askPanel 里,永不应答
++    const regen = booted.brain.handles.handleCardAction({
++      type: 'card-action', actionId: 'regen', callId: ROOT_CALL_ID, spawnCallId: 'reverse-regen-1',
++    })
++    await flushUntil(() => generationRequests(booted).length === 1, { label: 'regen entered panel request' })
++    const continueLoser = booted.brain.handles.handleCardAction({
++      type: 'card-action', actionId: 'continue', callId: ROOT_CALL_ID,
++      spawnCallId: 'reverse-continue-busy', userActionToken: 'reverse-token-busy',
++    })
++    await booted.settle()
++    await Promise.all([regen, continueLoser])
++    expect(booted.brain.agentRunCalls).toHaveLength(0) // 背压判定在 continue 分岔之前,从没进过 agent.run
++    expect(doneCardsFor(booted, 'reverse-continue-busy').pop()?.html).toContain(
++      booted.brain.handles.card.failureReason('en', 'actionBusy'),
++    )
++    expect(booted.brain.handles.cardAction.inflightCount()).toBe(0) // regen 那次超出 askPanel 窗口后也已释放
++
++    await clickAction(booted, {
++      actionId: 'continue', spawnCallId: 'reverse-continue-after', userActionToken: 'reverse-token-after',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(1) // 名额释放后,新点击能真正进入 agent.run
++  })
++})
++
++describe('P2 continue 跨动作单飞互斥(与 regen/restyle 互斥,完成后释放,不因引入超时而回归)', () => {
++  it('continue 悬挂在途时,同母卡 regen/restyle 撞 ACTION_BUSY;continue 完成后名额释放,新点击可重新进入', async () => {
++    // 注意:这条用例故意不用 booted.settle()(它会把假时钟推 40 分钟,越过 P1-1
++    // 新引入的 26 分钟超时窗口,把这里正测的"手动 resolve 才算完成"变成"提前被
++    // 超时收敛"——busy 拒绝路径本身零 clock.setTimeout,直接 await 就能落地。
++    const seeded = boot()
++    await seedRootRecord(seeded)
++
++    let finishContinue!: (value: unknown) => void
++    const booted = boot({
++      files: filesOf(seeded),
++      agentRun: () => new Promise((resolve) => { finishContinue = resolve }),
++    })
++    const first = booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'continue',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'cross-continue-1',
++      userActionToken: 'token-1',
++    })
++    await flushUntil(() => booted.brain.agentRunCalls.length === 1, { label: 'continue entered agent.run' })
++
++    await booted.brain.handles.handleCardAction({
++      type: 'card-action', actionId: 'regen', callId: ROOT_CALL_ID, spawnCallId: 'cross-regen-busy',
++    })
++    const regenBusy = doneCardsFor(booted, 'cross-regen-busy').pop()
++    expect(regenBusy?.html).toContain(booted.brain.handles.card.failureReason('en', 'actionBusy'))
++    expect(booted.brain.handles.cardAction.inflightCount()).toBe(1)
++
++    await booted.brain.handles.handleCardAction({
++      type: 'card-action', actionId: 'restyle', callId: ROOT_CALL_ID,
++      spawnCallId: 'cross-restyle-busy', prompt: 'watercolor',
++    })
++    const restyleBusy = doneCardsFor(booted, 'cross-restyle-busy').pop()
++    expect(restyleBusy?.html).toContain(booted.brain.handles.card.failureReason('en', 'actionBusy'))
++    expect(booted.brain.handles.cardAction.inflightCount()).toBe(1)
++
++    // working→done 落在同一 cardId 通道上,中间隔着卡片限速窗口(CARD_MIN_INTERVAL_MS)
++    // 的一次 clock.setTimeout,纯 flushUntil(不推时钟)等不到它 settle——真实回执已经
++    // 在下面 settle() 的首轮微任务冲刷里被 continueAgentRunBounded 接住并清掉了超时计时器
++    // (settled=true 发生在任何 clock.advance 之前),所以这里推时钟不会撞回 26 分钟超时。
++    finishContinue({ ok: true, sessionId: 's1', mode: 'continue', disposition: 'resumed' })
++    await booted.settle()
++    await first
++    expect(booted.brain.handles.cardAction.inflightCount()).toBe(0)
++
++    const before = generationRequests(booted).length
++    await clickAction(booted, { actionId: 'regen', spawnCallId: 'cross-regen-after' })
++    expect(generationRequests(booted).length).toBe(before + 1) // 名额已释放,新点击能真正进入生成
++  })
++})
+diff --git a/src/__tests__/cardActionHarness.ts b/src/__tests__/cardActionHarness.ts
+index 625d1e1b..7495115a 100644
+--- a/src/__tests__/cardActionHarness.ts
++++ b/src/__tests__/cardActionHarness.ts
+@@ -49,6 +49,18 @@ export type BootOptions = {
+   locale?: string
+   files?: Record<string, string>
+   writeGuard?: (request: FsRequest) => boolean
++  /**
++   * #297 P2 返修(R4.1):透传给 loadBrain 的写回执故障注入 —— `writeGuard` 只能
++   * 表达"拒绝"(`{ok:false}`,立即 settle),测不出 cardActionWrite 的有界 deadline;
++   * `writeOutcome` 多出的 `'hang'` 档(promise 永不 settle)才是这里要的悬挂现场。
++   */
++  writeOutcome?: (request: FsRequest) => 'ok' | 'reject' | 'throw' | 'malformed' | 'hang' | undefined
++  /**
++   * #297 P2 返修(R5.1):透传给 loadBrain 的迟到落地注入——写会真的 settle,只是
++   * 晚,复现 withDeadline 放弃等待之后底层 cindy.fs 请求仍在后台跑、迟早落字节
++   * 的场景(与 writeOutcome 的 'hang' 不同,'hang' 永不 settle)。
++   */
++  writeDelayMs?: (request: FsRequest) => number | undefined
+   panel?: PanelScript
+   /** 让宿主在 card-update 上抛错(注入卡片通道故障)。 */
+   hostThrowsOnCard?: boolean
+@@ -58,6 +70,12 @@ export type BootOptions = {
+   withMedia?: boolean
+   /** 宿主对 cindy-request 的回执(默认成功并给出 owned 指纹)。 */
+   genReply?: Record<string, unknown>
++  /**
++   * #297 P2:注入 cindy.agent.run(手册 §4.11,'continue' 动作专用)的应答。
++   * 不要与上面的 `panel`(`mivo-canvas-agent` 频道的动词请求脚本)混淆 —— 两者
++   * 是完全不同的宿主出口。不传 = 默认成功({ok:true, disposition:'resumed'})。
++   */
++  agentRun?: (payload: Record<string, unknown>) => unknown
+ }
+ 
+ export type Booted = {
+@@ -131,6 +149,8 @@ export const boot = (options: BootOptions = {}): Booted => {
+       timeline.push(`fs:${request.path}`)
+       return options.writeGuard ? options.writeGuard(request) : true
+     },
++    writeOutcome: options.writeOutcome,
++    writeDelayMs: options.writeDelayMs,
+     send: (payload) => {
+       const message = payload as HostMessage
+       if (message.type === 'card-update' && options.hostThrowsOnCard) throw new Error('host card bridge exploded')
+@@ -155,6 +175,7 @@ export const boot = (options: BootOptions = {}): Booted => {
+       )
+       return { ok: true }
+     },
++    agentRun: options.agentRun,
+   })
+ 
+   const persist = brain.bus.open('mivo-canvas-persist')
+@@ -260,7 +281,16 @@ export const seedRootRecord = async (
+ /** 触发一次卡上动作点击。 */
+ export const clickAction = async (
+   booted: Booted,
+-  msg: Partial<{ actionId: string; callId: string; spawnCallId: string; sessionId: string; prompt: string; ts: number }>,
++  msg: Partial<{
++    actionId: string
++    callId: string
++    spawnCallId: string
++    sessionId: string
++    prompt: string
++    ts: number
++    /** #297 P2:'continue' 专用一次性点击票据(手册 §4.11)。 */
++    userActionToken: string
++  }>,
+ ): Promise<void> => {
+   await flushMicrotasks(4)
+   const pending = booted.brain.handles.handleCardAction({
+diff --git a/src/__tests__/cardRender.test.ts b/src/__tests__/cardRender.test.ts
+index a6460524..c76f279c 100644
+--- a/src/__tests__/cardRender.test.ts
++++ b/src/__tests__/cardRender.test.ts
+@@ -191,6 +191,26 @@ describe('card 主题与 i18n', () => {
+     expect(ja).toContain('aria-label="画像を生成しています"')
+   })
+ 
++  it("#297 P2 返修(P2-1):mode:'continue' 的呼吸占位 aria-label 不沿用生图文案(不说「图片生成中」)", () => {
++    const api = card()
++    const working = api.render({ mode: 'continue', phase: 'working', locale: 'en' }).html
++    expect(working).toContain('Sending to the agent') // 标题本就正确,未受影响
++    expect(working).toContain('aria-label="Sending to the agent…"')
++    expect(working).not.toContain('aria-label="Image is being generated"')
++
++    const zh = api.render({ mode: 'continue', phase: 'working', locale: 'zh-CN' }).html
++    expect(zh).toContain('aria-label="正在发送给 Agent…"')
++    expect(zh).not.toContain('aria-label="图片生成中"')
++
++    // generate/edit 两种既有 mode 的 aria-label 不受这次分流影响。
++    expect(api.render({ mode: 'generate', phase: 'working', locale: 'en' }).html).toContain(
++      'aria-label="Image is being generated"',
++    )
++    expect(api.render({ mode: 'edit', phase: 'working', locale: 'en' }).html).toContain(
++      'aria-label="Image is being generated"',
++    )
++  })
++
+   it('locale 取自宿主 /app-context,不读 navigator', async () => {
+     const brain = loadBrain({ panelPresent: () => false, locale: 'ko' })
+     await flushMicrotasks()

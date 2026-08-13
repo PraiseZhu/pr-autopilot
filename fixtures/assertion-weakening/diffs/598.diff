@@ -1,0 +1,508 @@
+diff --git a/docs/design-previews/region-edit/assets/product.css b/docs/design-previews/region-edit/assets/product.css
+index 48c7436e..6a71af1c 100644
+--- a/docs/design-previews/region-edit/assets/product.css
++++ b/docs/design-previews/region-edit/assets/product.css
+@@ -4431,7 +4431,7 @@ button:disabled {
+ 
+ .stamp-placement-preview {
+   position: absolute;
+-  z-index: 24;
++  z-index: var(--layer-preview, 30);
+   display: grid;
+   place-items: center;
+   line-height: 1;
+@@ -4439,6 +4439,15 @@ button:disabled {
+   animation: stamp-wiggle 360ms ease-in-out infinite;
+ }
+ 
++.stamp-placement-preview.hover {
++  opacity: 0.42;
++  animation: none;
++}
++
++.stamp-placement-preview.hover img {
++  transform: none !important;
++}
++
+ @keyframes stamp-wiggle {
+   0%,
+   100% {
+@@ -4515,6 +4524,10 @@ button:disabled {
+   cursor: move;
+ }
+ 
++.canvas-shell.stamp-tool .markup-hit-line {
++  cursor: var(--stamp-cursor, copy);
++}
++
+ .markup-visible-line {
+   pointer-events: none;
+ }
+diff --git a/scripts/e2e/renderer-evidence.mjs b/scripts/e2e/renderer-evidence.mjs
+index c78db8d9..4dd53565 100644
+--- a/scripts/e2e/renderer-evidence.mjs
++++ b/scripts/e2e/renderer-evidence.mjs
+@@ -40,7 +40,7 @@ export const waitForCanvasReady = async (page, rendererMode, { timeout = 30000 }
+       const expected = Number(shell?.getAttribute('data-leafer-expected-children') || 0)
+       const children = Number(shell?.getAttribute('data-leafer-children') || 0)
+       return expected > 0 && children === expected && shell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
+-    }, { timeout })
++    }, undefined, { timeout })
+     return
+   }
+   await page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]', { timeout })
+diff --git a/scripts/e2e/scenarios/canvas-interactions.mjs b/scripts/e2e/scenarios/canvas-interactions.mjs
+index b445baf7..d785d7ce 100644
+--- a/scripts/e2e/scenarios/canvas-interactions.mjs
++++ b/scripts/e2e/scenarios/canvas-interactions.mjs
+@@ -1142,7 +1142,29 @@ export const runCanvasInteractionsScenario = async (context) => {
+     throw new Error(`Stamp tool should show the stamp as cursor, got ${stampCursor}`)
+   }
+   const stampPoint = { x: markupShapeTestPoint.x + 40, y: markupShapeTestPoint.y + 320 }
++  await page.mouse.move(stampPoint.x, stampPoint.y)
++  await page.waitForSelector('.stamp-placement-preview.hover')
++  const hoverStamp = await page.evaluate(() => {
++    const el = document.querySelector('.stamp-placement-preview.hover')
++    if (!el) return null
++    const img = el.querySelector('img')
++    const style = getComputedStyle(el)
++    return { opacity: Number(style.opacity), src: img?.getAttribute('src'), animation: style.animationName }
++  })
++  if (!hoverStamp || !(hoverStamp.opacity > 0 && hoverStamp.opacity < 1)) {
++    throw new Error(`Stamp hover preview should be semi-transparent, got ${JSON.stringify(hoverStamp)}`)
++  }
++  if (!hoverStamp.src?.includes('plus-one.svg') || hoverStamp.animation !== 'none') {
++    throw new Error(`Stamp hover preview should show a static plus-one sticker, got ${JSON.stringify(hoverStamp)}`)
++  }
++  const hoverStampCursor = await page.evaluate(
++    () => window.getComputedStyle(document.querySelector('.canvas-shell')).cursor,
++  )
++  if (!hoverStampCursor.includes('stickers/')) {
++    throw new Error(`Stamp hover preview should keep the stamp cursor visible, got ${hoverStampCursor}`)
++  }
+   await page.mouse.click(stampPoint.x, stampPoint.y)
++  await page.waitForSelector('.stamp-placement-preview.hover')
+   await page.waitForFunction(
+     (count) => document.querySelectorAll('.dom-node.markup-node[data-markup-kind="stamp"]').length === count + 1,
+     stampCountBefore,
+diff --git a/scripts/e2e/scenarios/coordinate-probe.mjs b/scripts/e2e/scenarios/coordinate-probe.mjs
+index 0f916fdc..ff2667db 100644
+--- a/scripts/e2e/scenarios/coordinate-probe.mjs
++++ b/scripts/e2e/scenarios/coordinate-probe.mjs
+@@ -429,7 +429,7 @@ export const runCoordinateProbeScenario = async (context) => {
+         const expected = Number(shell?.getAttribute('data-leafer-expected-children') || 0)
+         const children = Number(shell?.getAttribute('data-leafer-children') || 0)
+         return expected > 0 && children === expected && shell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
+-      }, { timeout: 15000 })
++      }, undefined, { timeout: 15000 })
+       // dpr2 是独立 context/page,自己的 store 是一份新实例——交叉验证种子节点
+       // 也要在这份新 page 上单独补种,不能复用 dpr1 page 上已建的那个。
+       const dpr2StoreSpec = () =>
+diff --git a/scripts/e2e/scenarios/mask.mjs b/scripts/e2e/scenarios/mask.mjs
+index d545086c..d3debcab 100644
+--- a/scripts/e2e/scenarios/mask.mjs
++++ b/scripts/e2e/scenarios/mask.mjs
+@@ -611,7 +611,7 @@ export const runMaskScenario = async (context) => {
+     const cards = Array.from(document.querySelectorAll('.chat-message-assistant'))
+     const chatCard = cards.find((card) => card.querySelector('.chat-result-image'))
+     return chatCard !== undefined
+-  }, { timeout: 10000 })
++  }, undefined, { timeout: 10000 })
+ 
+   // mask 卡应展示 error row（canceled）。
+   await page.waitForSelector('.chat-message-assistant .chat-error-row', { timeout: 5000 })
+diff --git a/scripts/e2e/scenarios/stamp-overlap.mjs b/scripts/e2e/scenarios/stamp-overlap.mjs
+index 68692346..775d86ef 100644
+--- a/scripts/e2e/scenarios/stamp-overlap.mjs
++++ b/scripts/e2e/scenarios/stamp-overlap.mjs
+@@ -3,9 +3,9 @@
+  *
+  * 两个断言组:
+  *
+- * 1. D7 wiggle 验伤(placement preview):激活 stamp 工具 → press-and-hold
+- *    (pointerdown 触发 beginStampPlacement → `.stamp-placement-preview` 出现 +
+- *    `animation: stamp-wiggle` 无限动画)。leafer 模式真机确认"仍在动"。坏了修
++ * 1. D7 wiggle 验伤(placement preview):激活 stamp 工具 → 先确认 hover 静态预览，
++ *    再 press-and-hold(pointerdown 触发 beginStampPlacement → `.stamp-placement-preview`
++ *    进入动态放大/摇摆动画)。leafer 模式真机确认"仍在动"。坏了修
+  *    DOM/CSS 侧(不动 MivoCanvas.tsx —— 边界),没坏如实报。
+  * 2. stamp/image 重叠 z-order + hit 一致:在 image 中心 quick-click 放一个 stamp →
+  *    - dom 模式:`.dom-node.stamp-node` 的 z-index(var(--layer-stamp)=25)> image。
+@@ -166,8 +166,8 @@ export const runStampOverlapScenario = async (context) => {
+   const { page, rendererMode, wait } = context
+ 
+   // --- 1. D7 wiggle 验伤 ---------------------------------------------------
+-  // 激活 stamp 工具 → press-and-hold(pointerdown 触发 beginStampPlacement →
+-  // 预览出现 + wiggle 无限动画)。不是 hover,是 pointerdown 期间才显示预览。
++  // 激活 stamp 工具 → 先验证 hover 静态预览，再 press-and-hold(pointerdown 触发
++  // beginStampPlacement → 预览进入 wiggle 无限动画)。
+   await page.locator('.canvas-tool-dock > .canvas-tool-group > button[aria-label="Stamp"]').click()
+   await page.waitForSelector('.stamp-options-bar')
+ 
+@@ -175,9 +175,14 @@ export const runStampOverlapScenario = async (context) => {
+   const hoverX = shellBox.x + shellBox.width / 2
+   const hoverY = shellBox.y + shellBox.height / 2
+   await page.mouse.move(hoverX, hoverY)
++  await page.waitForSelector('.stamp-placement-preview.hover')
+   await page.mouse.down() // press → 预览出现 + wiggle 开始
+   try {
+-    await page.waitForSelector('.stamp-placement-preview', { timeout: 5000 })
++    await page.waitForFunction(
++      () => getComputedStyle(document.querySelector('.stamp-placement-preview')).animationName.includes('stamp-wiggle'),
++      undefined,
++      { timeout: 5000 },
++    )
+ 
+     const wiggle = await page.evaluate(() => {
+       const el = document.querySelector('.stamp-placement-preview')
+diff --git a/src/App.css b/src/App.css
+index 992277b6..6737259d 100644
+--- a/src/App.css
++++ b/src/App.css
+@@ -4385,7 +4385,7 @@ button:disabled {
+ 
+ .stamp-placement-preview {
+   position: absolute;
+-  z-index: 24;
++  z-index: var(--layer-preview, 30);
+   display: grid;
+   place-items: center;
+   line-height: 1;
+@@ -4393,6 +4393,15 @@ button:disabled {
+   animation: stamp-wiggle 360ms ease-in-out infinite;
+ }
+ 
++.stamp-placement-preview.hover {
++  opacity: 0.42;
++  animation: none;
++}
++
++.stamp-placement-preview.hover img {
++  transform: none !important;
++}
++
+ @keyframes stamp-wiggle {
+   0%,
+   100% {
+@@ -4469,6 +4478,10 @@ button:disabled {
+   cursor: move;
+ }
+ 
++.canvas-shell.stamp-tool .markup-hit-line {
++  cursor: var(--stamp-cursor, copy);
++}
++
+ .markup-visible-line {
+   pointer-events: none;
+ }
+diff --git a/src/canvas/MivoCanvas.tsx b/src/canvas/MivoCanvas.tsx
+index 73d01edf..86962e0c 100644
+--- a/src/canvas/MivoCanvas.tsx
++++ b/src/canvas/MivoCanvas.tsx
+@@ -240,6 +240,7 @@ export function MivoCanvas({
+     screenToCanvas,
+     handleCanvasPointerDown,
+     handleCanvasPointerMove,
++    handleCanvasPointerLeave,
+     handleCanvasPointerEnd,
+     handleWheel,
+     fitAll,
+@@ -591,6 +592,7 @@ export function MivoCanvas({
+       onWheel={handleWheel}
+       onPointerDown={handleShellPointerDown}
+       onPointerMove={handleCanvasPointerMove}
++      onPointerLeave={handleCanvasPointerLeave}
+       onPointerUp={handleCanvasPointerEnd}
+       onPointerCancel={handleCanvasPointerEnd}
+       onDragOver={handleCanvasDragOver}
+@@ -713,7 +715,7 @@ export function MivoCanvas({
+         />
+         {stampPlacementPreview ? (
+           <div
+-            className="stamp-placement-preview"
++            className={`stamp-placement-preview${stampPlacementPreview.mode === 'hover' ? ' hover' : ''}`}
+             style={{
+               left: stampPlacementPreview.x - stampGrowthSizes[stampPlacementPreview.stage] / 2,
+               top: stampPlacementPreview.y - stampGrowthSizes[stampPlacementPreview.stage] / 2,
+diff --git a/src/canvas/useBrushStamp.ts b/src/canvas/useBrushStamp.ts
+index a7ae3b78..300fb229 100644
+--- a/src/canvas/useBrushStamp.ts
++++ b/src/canvas/useBrushStamp.ts
+@@ -1,11 +1,12 @@
+-import { useCallback, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
++import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
+ import { useCanvasStore } from '../store/canvasStore'
++import { debugLogger } from '../store/debugLogStore'
+ import { eraserHitStrokeIds, eraserScreenRadius } from '../model/brushGeometry'
+ import { randomStampTilt, stampGrowthIntervalMs, stampGrowthSizes } from './stampDefs'
+ import { isNodeEffectivelyLocked } from './useNodeTransform'
+ import { wrapMutation } from './actions/canvasSyncRuntime'
+ import type { SnapGuide } from './canvasGeometry'
+-import type { Viewport } from './canvasInteraction'
++import { isCanvasUiTarget, type Viewport } from './canvasInteraction'
+ 
+ type UseBrushStampOptions = {
+   screenToCanvas: (clientX: number, clientY: number) => { x: number; y: number }
+@@ -15,10 +16,11 @@ type UseBrushStampOptions = {
+   setEditingTextNodeId: (id: string | undefined) => void
+   setSnapGuides: (guides: SnapGuide[]) => void
+   clearSelection: () => void
++  stampToolActive: boolean
+ }
+ 
+-// Eraser drag + stamp placement. Extracted from useCanvasInteractionController
+-// (F7 brush/stamp gap). Pure extraction; behavior identical to inline logic.
++// Eraser drag + stamp placement/hover preview. Extracted from
++// useCanvasInteractionController (F7 brush/stamp gap).
+ export function useBrushStamp({
+   screenToCanvas,
+   viewportRef,
+@@ -27,6 +29,7 @@ export function useBrushStamp({
+   setEditingTextNodeId,
+   setSnapGuides,
+   clearSelection,
++  stampToolActive,
+ }: UseBrushStampOptions) {
+   const eraserDragRef = useRef<{ pointerId: number; historyCaptured: boolean } | null>(null)
+   const stampPlacementRef = useRef<{ pointerId: number; stage: number; growTimer: number; tilt: number } | null>(null)
+@@ -35,7 +38,47 @@ export function useBrushStamp({
+     y: number
+     stage: number
+     tilt: number
++    mode: 'hover' | 'placement'
+   } | null>(null)
++  const hoverPointerRef = useRef<{ clientX: number; clientY: number } | null>(null)
++  // Debug Log dedup: hover preview show/hide is a discrete transition (logged once),
++  // but viewport pan/zoom re-anchors it continuously — that path logs once per hover
++  // episode instead of once per frame, or panning would flood the log.
++  const hoverVisibleRef = useRef(false)
++  const hoverSyncLoggedRef = useRef(false)
++
++  const markHoverHidden = useCallback(() => {
++    if (!hoverVisibleRef.current) return
++    hoverVisibleRef.current = false
++    hoverSyncLoggedRef.current = false
++    debugLogger.log('Stamp Tool', '隐藏印章悬停预览')
++  }, [])
++
++  const setPreviewIfChanged = useCallback(
++    (next: { x: number; y: number; stage: number; tilt: number; mode: 'hover' | 'placement' }) => {
++      setStampPlacementPreview((current) => {
++        if (
++          current &&
++          current.x === next.x &&
++          current.y === next.y &&
++          current.stage === next.stage &&
++          current.tilt === next.tilt &&
++          current.mode === next.mode
++        ) {
++          return current
++        }
++        return next
++      })
++    },
++    [],
++  )
++
++  const clearHoverPreview = useCallback(() => {
++    if (stampPlacementRef.current) return
++    hoverPointerRef.current = null
++    markHoverHidden()
++    setStampPlacementPreview((current) => (current?.mode === 'hover' ? null : current))
++  }, [markHoverHidden])
+ 
+   const eraseAtClientPoint = useCallback(
+     (clientX: number, clientY: number) => {
+@@ -70,10 +113,13 @@ export function useBrushStamp({
+ 
+   const clearStampPlacement = useCallback(() => {
+     const placement = stampPlacementRef.current
+-    if (!placement) return
+-
+-    window.clearInterval(placement.growTimer)
+-    stampPlacementRef.current = null
++    if (placement) {
++      window.clearInterval(placement.growTimer)
++      stampPlacementRef.current = null
++    }
++    hoverPointerRef.current = null
++    hoverVisibleRef.current = false
++    hoverSyncLoggedRef.current = false
+     setStampPlacementPreview(null)
+   }, [])
+ 
+@@ -99,9 +145,12 @@ export function useBrushStamp({
+       // 倾角在按下时掷定:预览和最终落点用同一角度,松手不会跳变。
+       const tilt = randomStampTilt()
+       stampPlacementRef.current = { pointerId: event.pointerId, stage: 0, growTimer, tilt }
+-      setStampPlacementPreview({ x: point.x, y: point.y, stage: 0, tilt })
++      hoverPointerRef.current = null
++      hoverVisibleRef.current = false
++      hoverSyncLoggedRef.current = false
++      setPreviewIfChanged({ x: point.x, y: point.y, stage: 0, tilt, mode: 'placement' })
+     },
+-    [clearSelection, discardEmptyEditingText, onCloseContextMenu, screenToCanvas, setEditingTextNodeId, setSnapGuides],
++    [clearSelection, discardEmptyEditingText, onCloseContextMenu, screenToCanvas, setEditingTextNodeId, setPreviewIfChanged, setSnapGuides],
+   )
+ 
+   // Dispatcher (handleCanvasPointerMove) branches.
+@@ -117,14 +166,43 @@ export function useBrushStamp({
+   const tryMoveStamp = useCallback(
+     (event: ReactPointerEvent<HTMLElement>): boolean => {
+       const placement = stampPlacementRef.current
+-      if (placement?.pointerId !== event.pointerId) return false
++      if (placement) {
++        if (placement.pointerId !== event.pointerId) return false
++        const point = screenToCanvas(event.clientX, event.clientY)
++        setPreviewIfChanged({ x: point.x, y: point.y, stage: placement.stage, tilt: placement.tilt, mode: 'placement' })
++        return true
++      }
++
++      if (!stampToolActive) return false
++      if (isCanvasUiTarget(event.target)) {
++        clearHoverPreview()
++        return false
++      }
++
++      hoverPointerRef.current = { clientX: event.clientX, clientY: event.clientY }
++      if (!hoverVisibleRef.current) {
++        hoverVisibleRef.current = true
++        hoverSyncLoggedRef.current = false
++        debugLogger.log('Stamp Tool', '显示印章悬停预览')
++      }
+       const point = screenToCanvas(event.clientX, event.clientY)
+-      setStampPlacementPreview({ x: point.x, y: point.y, stage: placement.stage, tilt: placement.tilt })
++      setPreviewIfChanged({ x: point.x, y: point.y, stage: 0, tilt: 0, mode: 'hover' })
+       return true
+     },
+-    [screenToCanvas],
++    [clearHoverPreview, screenToCanvas, setPreviewIfChanged, stampToolActive],
+   )
+ 
++  const refreshStampHover = useCallback(() => {
++    if (!stampToolActive || stampPlacementRef.current || !hoverPointerRef.current) return
++    if (!hoverSyncLoggedRef.current) {
++      hoverSyncLoggedRef.current = true
++      debugLogger.log('Stamp Tool', '视口变化后重新定位悬停预览')
++    }
++    const { clientX, clientY } = hoverPointerRef.current
++    const point = screenToCanvas(clientX, clientY)
++    setPreviewIfChanged({ x: point.x, y: point.y, stage: 0, tilt: 0, mode: 'hover' })
++  }, [screenToCanvas, setPreviewIfChanged, stampToolActive])
++
+   // Dispatcher (handleCanvasPointerEnd) branches.
+   const tryEndEraser = useCallback((event: ReactPointerEvent<HTMLElement>): void => {
+     if (eraserDragRef.current?.pointerId === event.pointerId) {
+@@ -135,6 +213,7 @@ export function useBrushStamp({
+   const tryEndStamp = useCallback(
+     (event: ReactPointerEvent<HTMLElement>): void => {
+       if (stampPlacementRef.current?.pointerId !== event.pointerId) return
++      const placementPoint = { clientX: event.clientX, clientY: event.clientY }
+       if (event.type === 'pointerup') {
+         const placement = stampPlacementRef.current
+         const point = screenToCanvas(event.clientX, event.clientY)
+@@ -150,8 +229,28 @@ export function useBrushStamp({
+       }
+       // Stamp stays active for continuous stamping (FigJam convention); Esc or V exits.
+       clearStampPlacement()
++
++      // Pointer capture ends before the next move event. Restore the static ghost
++      // immediately when the pointer is still inside the canvas so continuous
++      // stamping does not require an extra mouse movement to show it again.
++      if (event.type === 'pointerup' && stampToolActive) {
++        const bounds = event.currentTarget.getBoundingClientRect()
++        const insideCanvas =
++          placementPoint.clientX >= bounds.left &&
++          placementPoint.clientX <= bounds.right &&
++          placementPoint.clientY >= bounds.top &&
++          placementPoint.clientY <= bounds.bottom
++        if (insideCanvas) {
++          hoverPointerRef.current = placementPoint
++          hoverVisibleRef.current = true
++          hoverSyncLoggedRef.current = false
++          debugLogger.log('Stamp Tool', '落章后恢复悬停预览')
++          const hoverPoint = screenToCanvas(placementPoint.clientX, placementPoint.clientY)
++          setPreviewIfChanged({ x: hoverPoint.x, y: hoverPoint.y, stage: 0, tilt: 0, mode: 'hover' })
++        }
++      }
+     },
+-    [clearStampPlacement, screenToCanvas],
++    [clearStampPlacement, screenToCanvas, setPreviewIfChanged, stampToolActive],
+   )
+ 
+   // Scene reset / Escape / window blur.
+@@ -161,15 +260,26 @@ export function useBrushStamp({
+       window.clearInterval(stampPlacementRef.current.growTimer)
+       stampPlacementRef.current = null
+     }
++    hoverPointerRef.current = null
++    hoverVisibleRef.current = false
++    hoverSyncLoggedRef.current = false
+     setStampPlacementPreview(null)
+   }, [])
+ 
++  useEffect(() => {
++    if (stampToolActive) return undefined
++    const timer = window.setTimeout(() => clearStampPlacement(), 0)
++    return () => window.clearTimeout(timer)
++  }, [clearStampPlacement, stampToolActive])
++
+   return {
+     stampPlacementPreview,
+     beginStampPlacement,
+     beginEraserDrag,
+     tryMoveEraser,
+     tryMoveStamp,
++    refreshStampHover,
++    clearHoverPreview,
+     tryEndEraser,
+     tryEndStamp,
+     resetBrushStamp,
+diff --git a/src/canvas/useCanvasInteractionController.ts b/src/canvas/useCanvasInteractionController.ts
+index 2614c0a2..77527503 100644
+--- a/src/canvas/useCanvasInteractionController.ts
++++ b/src/canvas/useCanvasInteractionController.ts
+@@ -116,10 +116,10 @@ export function useCanvasInteractionController({
+ 
+   const {
+     stampPlacementPreview, beginStampPlacement, beginEraserDrag, tryMoveEraser, tryMoveStamp,
+-    tryEndEraser, tryEndStamp, resetBrushStamp,
++    refreshStampHover, clearHoverPreview, tryEndEraser, tryEndStamp, resetBrushStamp,
+   } = useBrushStamp({
+     screenToCanvas, viewportRef, onCloseContextMenu, discardEmptyEditingText, setEditingTextNodeId,
+-    setSnapGuides, clearSelection,
++    setSnapGuides, clearSelection, stampToolActive: interactionMode === 'stamp' && !isPanning,
+   })
+ 
+   const {
+@@ -222,6 +222,10 @@ export function useCanvasInteractionController({
+     tryMoveSelection(event)
+   }, [tryMoveEraser, tryMoveFrameCreation, tryMoveGroupResize, tryMoveMarkupCreation, tryMoveMarkupPointTransform, tryMoveNodeTransform, tryMovePan, tryMoveSelection, tryMoveSpacing, tryMoveStamp, tryMoveTextCreation, tryMoveTextResize, tryMoveZoomGesture])
+ 
++  const handleCanvasPointerLeave = useCallback(() => {
++    clearHoverPreview()
++  }, [clearHoverPreview])
++
+   const handleCanvasPointerEnd = useCallback((event: ReactPointerEvent<HTMLElement>) => {
+     tryEndZoomGesture(event)
+     tryEndGroupResize(event)
+@@ -245,6 +249,10 @@ export function useCanvasInteractionController({
+     resetBrushStamp, resetGroupTransform, resetZoomGesture,
+   })
+ 
++  useEffect(() => {
++    refreshStampHover()
++  }, [refreshStampHover, viewportState])
++
+   // Scene reset: one rAF resets every interaction hook.
+   // Contract: scene-reset.contract.test.ts must list every hook reset below.
+   useEffect(() => {
+@@ -276,7 +284,7 @@ export function useCanvasInteractionController({
+     activeTextCreationRect, activeFrameCreationRect, activeMarkupCreationRect, markupCreationBox,
+     stampPlacementPreview, selectionPreviewSet, beginGroupResize, beginSelectionSpacingDrag,
+     beginNodeResize, editTextNode, beginTextResize, beginMarkupPointMove, updateEditingText,
+-    finishTextEditing, resolveCanvasHit, screenToCanvas, handleCanvasPointerDown, handleCanvasPointerMove,
++    finishTextEditing, resolveCanvasHit, screenToCanvas, handleCanvasPointerDown, handleCanvasPointerMove, handleCanvasPointerLeave,
+     handleCanvasPointerEnd, handleWheel, zoomTo, zoomBy, fitToBounds, fit, fitAll, fitSelection, resetView, resetPan,
+   }
+ }

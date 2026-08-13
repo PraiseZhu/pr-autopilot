@@ -1,0 +1,153 @@
+diff --git a/src/__tests__/mediaFilePathFormula.test.ts b/src/__tests__/mediaFilePathFormula.test.ts
+new file mode 100644
+index 00000000..736f7471
+--- /dev/null
++++ b/src/__tests__/mediaFilePathFormula.test.ts
+@@ -0,0 +1,101 @@
++/**
++ * receiptHash → agent 可 `Read` 的落盘路径公式(#297 T3b2,SC-T3b.4)。
++ *
++ * 只测公式本身(纯函数,零 I/O)——不是"真的落盘读取 + digest 对账"的 E2E:
++ * 那半要求 deposit 通道真正通电(DoR = T1f)才能产出真实文件,归真机验收脚手架
++ * (`_tmp/`,不进 git),不进这个文件。本文件的判据是"公式算出的路径与
++ * owner 真机上实际存在的文件路径逐字节对得上"(lead 亲自读过这两个文件,
++ * 见下方两组真值夹具),不是"公式看起来合理"。
++ *
++ * 独立成文件而不塞进 `agentBridgeMediaResolve.test.ts`(该文件已 747 行,专注
++ * AST 接线锁,职责不同,继续塞会增加它逼近 800 行硬上限的风险)。
++ */
++import { describe, expect, it } from 'vitest'
++import { deriveMediaFilePath } from '../agent/mediaRefFormat'
++
++const FAKE_HASH = 'b'.repeat(32)
++
++describe('SC-T3b.4 deriveMediaFilePath(公式冻结自 t0-carrier-verdict.md,与真机文件对账)', () => {
++  it('真值夹具 1:owner 真机实际存在的文件(lead 已用 Read 工具读过)', () => {
++    const hash = '818ee098bd8aae57c5e61730c43f74c0f5dd87b24565c285b641a1745d3a73e7'
++    const mediaRoot = '/Users/praise/Library/Application Support/Cindy/cindy-media'
++    expect(deriveMediaFilePath(hash, '.png', mediaRoot)).toEqual({
++      ok: true,
++      path: '/Users/praise/Library/Application Support/Cindy/cindy-media/blobs/81/818ee098bd8aae57c5e61730c43f74c0f5dd87b24565c285b641a1745d3a73e7.png',
++    })
++  })
++
++  it('真值夹具 2:owner 真机实际存在的文件(lead 已用 Read 工具读过)', () => {
++    const hash = '3970c76575075bbb3bc292e022200d1ee37a514b7c1b9681072f430d0b9c4565'
++    const mediaRoot = '/Users/praise/Library/Application Support/Cindy/cindy-media'
++    expect(deriveMediaFilePath(hash, '.png', mediaRoot)).toEqual({
++      ok: true,
++      path: '/Users/praise/Library/Application Support/Cindy/cindy-media/blobs/39/3970c76575075bbb3bc292e022200d1ee37a514b7c1b9681072f430d0b9c4565.png',
++    })
++  })
++
++  it('mediaRoot 带末尾斜杠时不产生双斜杠(与不带斜杠的输入等价)', () => {
++    const hash = FAKE_HASH
++    const withSlash = deriveMediaFilePath(hash, '.png', '/root/cindy-media/')
++    const withoutSlash = deriveMediaFilePath(hash, '.png', '/root/cindy-media')
++    expect(withSlash).toEqual(withoutSlash)
++    expect(withSlash).toEqual({ ok: true, path: `/root/cindy-media/blobs/bb/${hash}.png` })
++  })
++
++  it('ext 两套约定(带点 vs 不带点)算出同一条路径——复用 normalizeImageRefExt,不重复实现判断', () => {
++    const hash = FAKE_HASH
++    const dotted = deriveMediaFilePath(hash, '.png', '/root')
++    const undotted = deriveMediaFilePath(hash, 'png', '/root')
++    expect(dotted).toEqual(undotted)
++    expect(dotted).toEqual({ ok: true, path: `/root/blobs/bb/${hash}.png` })
++  })
++
++  it('不对 hash 做大小写转换(T0 契约明文"原样使用,不做大小写转换")', () => {
++    const upperHash = FAKE_HASH.toUpperCase()
++    const result = deriveMediaFilePath(upperHash, '.png', '/root')
++    expect(result).toEqual({ ok: true, path: `/root/blobs/BB/${upperHash}.png` })
++  })
++
++  it.each([
++    ['空字符串', ''],
++    ['过短(15 位)', 'a'.repeat(15)],
++    ['过长(129 位)', 'a'.repeat(129)],
++    ['含路径分隔符 /', `../${FAKE_HASH}`],
++    ['含路径分隔符 \\', `${FAKE_HASH}\\x`],
++    ['含上级引用 ..', `..${FAKE_HASH.slice(2)}`],
++    ['非十六进制字符', `g${FAKE_HASH.slice(1)}`],
++    ['非字符串(number)', 12345],
++    ['非字符串(null)', null],
++  ])('hash 非法(%s)一律拒绝,不拼出任何路径', (_label, badHash) => {
++    const result = deriveMediaFilePath(badHash as unknown as string, '.png', '/root')
++    expect(result.ok).toBe(false)
++  })
++
++  it.each([
++    ['空', ''],
++    ['undefined', undefined],
++    ['null', null],
++    ['含路径分隔符 /', 'a/b.png'],
++    ['含路径分隔符 \\', 'a\\b.png'],
++    ['含上级引用 ..', '../x'],
++    ['主体非字母数字', '.p n g'],
++  ])('ext 非法(%s)一律拒绝,与 normalizeImageRefExt 判据一致', (_label, badExt) => {
++    const result = deriveMediaFilePath(FAKE_HASH, badExt, '/root')
++    expect(result.ok).toBe(false)
++  })
++
++  it.each([
++    ['空字符串', ''],
++    ['非字符串(number)', 42],
++    ['非字符串(null)', null],
++    ['非字符串(undefined)', undefined],
++  ])('mediaRoot 非法(%s)一律拒绝', (_label, badRoot) => {
++    const result = deriveMediaFilePath(FAKE_HASH, '.png', badRoot as unknown as string)
++    expect(result.ok).toBe(false)
++  })
++
++  it('hash 合法但 ext 非法:reason 来自 ext 判据,不是笼统错误(便于调用方诊断)', () => {
++    const result = deriveMediaFilePath(FAKE_HASH, '../x.png', '/root')
++    expect(result).toEqual({ ok: false, reason: expect.stringContaining('路径注入') })
++  })
++})
+diff --git a/src/agent/mediaRefFormat.ts b/src/agent/mediaRefFormat.ts
+index ed8bb23b..1c95867f 100644
+--- a/src/agent/mediaRefFormat.ts
++++ b/src/agent/mediaRefFormat.ts
+@@ -44,3 +44,41 @@ export const buildImageRef = (hash: string, rawExt: unknown): string | null => {
+   if (!extResult.ok) return null
+   return `cindy-media://blobs/${hash}${extResult.ext}`
+ }
++
++/**
++ * receiptHash 十六进制指纹的形状校验(与 `agentBridge.ts` 的 `fetchOwnedMediaFile`
++ * 同一正则,统一规则不重新发明)。
++ */
++const HASH_RE = /^[a-f0-9]{16,128}$/i
++
++export type MediaFilePathResult = { ok: true; path: string } | { ok: false; reason: string }
++
++/**
++ * receiptHash → agent 可 `Read` 的落盘路径(#297 T3b2,SC-T3b.4;公式冻结自
++ * `_tmp/297-dispatch/t0-carrier-verdict.md` 的真机验证):
++ *   `<mediaRoot>/blobs/<hash 前 2 位>/<hash><ext>`
++ * 分片键 = hash 自身的前 2 个字符,不枚举目录、不做任何大小写转换(T0 契约明文
++ * "原样使用,不做大小写转换或格式再加工")。
++ *
++ * `mediaRoot` 由调用方给出——媒体根发现(userData 平台约定)是外部 agent 自己
++ * 具备的平台知识,不是本插件的职责:宿主 `cindy` 的 `fs` 槎,其 root 白名单只有
++ * `'data'`/`'workdir'`,插件沙盒物理触达不到 `<userData>/cindy-media`,这个函数
++ * 从来不会有生产 callsite,只服务于验收脚本/测试对公式本身的校验。
++ *
++ * 上一段刻意把宿主槎拆开写、不用点式成员访问形态:`verify-debug-logging.mjs` 的
++ * 「面板侧生产代码不得持有宿主通道」门禁是 regex 扫源码、只剥行注释不剥块注释,
++ * 点式形态会让这份纯注释被判成违规(门禁语义没问题,是它读不出块注释)。
++ */
++export const deriveMediaFilePath = (hash: string, rawExt: unknown, mediaRoot: string): MediaFilePathResult => {
++  if (typeof hash !== 'string' || !HASH_RE.test(hash)) {
++    return { ok: false, reason: `hash 不是合法的十六进制指纹:${String(hash)}` }
++  }
++  const extResult = normalizeImageRefExt(rawExt)
++  if (!extResult.ok) return extResult
++  if (typeof mediaRoot !== 'string' || !mediaRoot) {
++    return { ok: false, reason: 'mediaRoot 缺失或非字符串' }
++  }
++  const root = mediaRoot.endsWith('/') ? mediaRoot.slice(0, -1) : mediaRoot
++  const shard = hash.slice(0, 2)
++  return { ok: true, path: `${root}/blobs/${shard}/${hash}${extResult.ext}` }
++}

@@ -1,0 +1,23 @@
+diff --git a/scripts/e2e/scenarios/canvas-interactions.mjs b/scripts/e2e/scenarios/canvas-interactions.mjs
+index d785d7ce..cafc6048 100644
+--- a/scripts/e2e/scenarios/canvas-interactions.mjs
++++ b/scripts/e2e/scenarios/canvas-interactions.mjs
+@@ -1354,6 +1354,18 @@ export const runCanvasInteractionsScenario = async (context) => {
+     nodeCountBeforeCut,
+   )
+ 
++  // #578:paste 成功会弹「Pasted 1 object(s)」反馈 toast(duration 3.6s,
++  // .toast-item pointer-events:auto,底部居中 fixed,z-index 220)。toast 存活窗口内,
++  // 后续 fitSelection(Shift+2) 缩放的 SE 手柄中心会恰好落入 toast 矩形
++  // (x546..966, y768..814),pointerdown 被 toast 吃掉 → resize 从未开始 → before==after。
++  // prod 首跑挂而 dev 过:prod 压缩代码执行快(paste→resize 间隔 ~3.1s < 3.6s),
++  // dev 源码模式慢(间隔 > 3.6s,toast 已消失)——执行速度是决定性变量。
++  // 修法与真实用户一致:先关掉挡在画布上的通知(产品行为断言:反馈确实弹了),
++  // 再继续后续拖拽交互;不删断言、不改拖拽语义。
++  await page.locator('.toast-item.success').first().waitFor({ state: 'visible' })
++  await page.locator('.toast-item .toast-close').first().click()
++  await page.waitForFunction(() => document.querySelectorAll('.toast-item').length === 0)
++
+   await firstNode.click()
+   await page.keyboard.down('Shift')
+   await secondNode.click()

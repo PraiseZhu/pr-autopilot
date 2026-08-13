@@ -1,0 +1,223 @@
+diff --git a/scripts/e2e/scenarios/chat-copy.mjs b/scripts/e2e/scenarios/chat-copy.mjs
+index 652dc470..0e60656a 100644
+--- a/scripts/e2e/scenarios/chat-copy.mjs
++++ b/scripts/e2e/scenarios/chat-copy.mjs
+@@ -132,6 +132,108 @@ export const runChatCopyScenario = async (context) => {
+   await page.waitForSelector('.chat-model-popover', { state: 'detached' })
+   await composer.fill('')
+ 
++  // SC1d: popover 关闭后的焦点归属分路径,不能一刀切。
++  //  选中项 / Escape = 用户已结束本次操作 → 焦点回输入框,可以直接接着打字;
++  //  点击外部       = 用户正要去点别处 → 不得把焦点抢回输入框。
++  const composerHoldsFocus = () =>
++    page.waitForFunction(
++      () => document.activeElement === document.querySelector('.chat-composer-textarea'),
++      undefined,
++      { timeout: 5000 },
++    )
++
++  // 1) 选中模型后关闭 → 焦点回输入框
++  await composer.focus()
++  await page.locator('.chat-model-trigger').click()
++  await page.waitForSelector('.chat-model-popover')
++  await page.locator('.chat-model-popover .chat-model-option:not([disabled])').first().click()
++  await page.waitForSelector('.chat-model-popover', { state: 'detached' })
++  await composerHoldsFocus().catch(() => {
++    throw new Error('SC1d: picking a model should return focus to the composer')
++  })
++
++  // 2) Escape 关闭 → 焦点回输入框
++  await page.locator('.chat-model-trigger').click()
++  await page.waitForSelector('.chat-model-popover')
++  await page.keyboard.press('Escape')
++  await page.waitForSelector('.chat-model-popover', { state: 'detached' })
++  await composerHoldsFocus().catch(() => {
++    throw new Error('SC1d: closing the popover with Escape should return focus to the composer')
++  })
++
++  // 3) 点击外部关闭 → 不把焦点抢回输入框。
++  // 必须用合成 pointerdown + 同步读取,不能用真实点击:真实鼠标点击走完后,mousedown 的
++  // focus fixup 会把 activeElement 覆盖成 body,于是「点完再读」永远读不到被抢回的焦点 ——
++  // 断言会变成永真(实测:把外部关闭改成 onClose(true) 制造该 bug,真实点击版仍然绿)。
++  // 同一个 evaluate 内 dispatch 完立刻读,绕开 fixup,才真正测到 onClose 有没有回焦。
++  await composer.focus()
++  await page.locator('.chat-model-trigger').click()
++  await page.waitForSelector('.chat-model-popover')
++  const stoleFocusBackOnOutsideClick = await page.evaluate(() => {
++    const textarea = document.querySelector('.chat-composer-textarea')
++    const outside = document.querySelector('.canvas-shell')
++    if (!(outside instanceof HTMLElement)) throw new Error('SC1d: missing canvas shell')
++    outside.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }))
++    return document.activeElement === textarea
++  })
++  if (stoleFocusBackOnOutsideClick) {
++    throw new Error('SC1d: an outside click must not pull focus back into the composer')
++  }
++  await page.waitForSelector('.chat-model-popover', { state: 'detached' })
++
++  // 4) ratio popover 的 Escape 同样要回焦 —— 两个 popover 共用同一个 closePopover,
++  // 契约要在两侧都钉住,否则只有 model 侧有回归保护。
++  await composer.focus()
++  await page.locator('.chat-ratio-trigger').click()
++  await page.waitForSelector('.chat-ratio-popover')
++  await page.keyboard.press('Escape')
++  await page.waitForSelector('.chat-ratio-popover', { state: 'detached' })
++  await composerHoldsFocus().catch(() => {
++    throw new Error('SC1d: closing the ratio popover with Escape should return focus to the composer')
++  })
++
++  // 5) 生成中(textarea 是 disabled)选模型 → 焦点退给触发按钮,不许掉 body。
++  // 两个 trigger 在 isBusy 时并不禁用,popover 照样能开能选;若不兜底,focus() 静默失败、
++  // 焦点掉到 body,键盘与读屏用户就得从文档头重新 Tab。
++  // 用 harness 已注入的 chatStoreSpec(见 e2e-smoke.mjs),不要自己再拼一份 spec 解析:
++  // 它的匹配串更严,prod 下也由 installE2EStoreBridge 兜住。
++  const chatSpec = await context.chatStoreSpec()
++  const setChatBusy = (busy) =>
++    page.evaluate(
++      async ({ moduleSpec, isBusy }) => {
++        const { useChatStore } = await import(moduleSpec)
++        useChatStore.setState({ isBusy })
++      },
++      { moduleSpec: chatSpec, isBusy: busy },
++    )
++
++  await setChatBusy(true)
++  await page.waitForFunction(
++    () => document.querySelector('.chat-composer-textarea')?.disabled === true,
++    undefined,
++    { timeout: 5000 },
++  )
++  await page.locator('.chat-model-trigger').click()
++  await page.waitForSelector('.chat-model-popover')
++  await page.locator('.chat-model-popover .chat-model-option:not([disabled])').first().click()
++  await page.waitForSelector('.chat-model-popover', { state: 'detached' })
++  const focusWhileComposerDisabled = await page.evaluate(() => {
++    const el = document.activeElement
++    return el ? `${el.tagName}.${el.className || '(no-class)'}` : 'null'
++  })
++  if (!focusWhileComposerDisabled.includes('chat-model-trigger')) {
++    throw new Error(
++      `SC1d: with a disabled composer, picking a model should fall back to the trigger button, got ${focusWhileComposerDisabled}`,
++    )
++  }
++  await setChatBusy(false)
++  await page.waitForFunction(
++    () => document.querySelector('.chat-composer-textarea')?.disabled === false,
++    undefined,
++    { timeout: 5000 },
++  )
++  await composer.fill('')
++
+   // ── SC2: chat 气泡选中文本 cmd+C 复制到系统剪贴板 ──
+   await page.evaluate(() => {
+     const bubble = document.querySelector('.chat-message-user .chat-bubble-user')
+diff --git a/src/app/chat/ChatComposer.tsx b/src/app/chat/ChatComposer.tsx
+index 04898483..338d5e58 100644
+--- a/src/app/chat/ChatComposer.tsx
++++ b/src/app/chat/ChatComposer.tsx
+@@ -69,6 +69,32 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
+       focus: () => textareaRef.current?.focus(),
+     }))
+ 
++    // 关闭工具 popover。
++    // 引用必须稳定:两个 popover 的自动聚焦 effect 依赖 onClose,若每次 render 传新函数,
++    // popover 开着时任何无关重渲染(如 isBusy 变化)都会重跑该 effect、再排一次 rAF 聚焦,
++    // 把键盘用户已移动的焦点拉回选中项。依赖 openPopover 是安全的:它只在 popover 开/关时
++    // 变化,而那时 effect 本就该重跑;无关重渲染不会改它。
++    // refocus 只在「用户已结束这次操作」的路径传 true(选中项 / Escape),让光标回到输入框
++    // 可以接着打字;点击外部关闭时不传,焦点跟着用户去他要点的地方。
++    const closePopover = useCallback(
++      (refocus?: boolean) => {
++        const which = openPopover
++        setOpenPopover(null)
++        if (!refocus) return
++        const textarea = textareaRef.current
++        if (textarea && !textarea.disabled) {
++          textarea.focus()
++          return
++        }
++        // 生成中 / 未登录时 textarea 是 disabled,focus() 会静默失败。两个 trigger 按钮此时
++        // 并不禁用(popover 照样能开、能选),所以退一步把焦点还给触发按钮,别让它掉到 body ——
++        // 掉 body 后键盘和读屏用户要从文档头重新 Tab。
++        const trigger = which === 'ratio' ? ratioButtonRef.current : modelButtonRef.current
++        trigger?.focus()
++      },
++      [openPopover],
++    )
++
+     useEffect(() => {
+       referenceFilesRef.current = referenceFiles
+     }, [referenceFiles])
+@@ -290,7 +316,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
+           <ModelSelectorPopover
+             id="chat-model-selector-popover"
+             anchorRef={modelButtonRef}
+-            onClose={() => setOpenPopover(null)}
++            onClose={closePopover}
+           />
+         )}
+ 
+@@ -298,7 +324,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(
+           <RatioPopover
+             id="chat-ratio-popover"
+             anchorRef={ratioButtonRef}
+-            onClose={() => setOpenPopover(null)}
++            onClose={closePopover}
+           />
+         )}
+ 
+diff --git a/src/app/chat/ModelSelectorPopover.tsx b/src/app/chat/ModelSelectorPopover.tsx
+index 0402a4f9..aa02e17a 100644
+--- a/src/app/chat/ModelSelectorPopover.tsx
++++ b/src/app/chat/ModelSelectorPopover.tsx
+@@ -9,7 +9,8 @@ import { useAnchoredPopoverPosition } from './popoverPosition'
+ type ModelSelectorPopoverProps = {
+   id: string
+   anchorRef: RefObject<HTMLElement | null>
+-  onClose: () => void
++  /** refocus=true 表示用户已结束本次操作(选中项 / Escape),调用方应把焦点还回输入框。 */
++  onClose: (refocus?: boolean) => void
+ }
+ 
+ const popoverWidth = 286
+@@ -30,7 +31,7 @@ export function ModelSelectorPopover({ id, anchorRef, onClose }: ModelSelectorPo
+     const handleKeyDown = (event: KeyboardEvent) => {
+       if (event.key === 'Escape') {
+         event.preventDefault()
+-        onClose()
++        onClose(true)
+       }
+     }
+ 
+@@ -94,7 +95,7 @@ export function ModelSelectorPopover({ id, anchorRef, onClose }: ModelSelectorPo
+               onClick={() => {
+                 if (unavailable) return
+                 setSelectedModel(modelId)
+-                onClose()
++                onClose(true)
+               }}
+               disabled={unavailable}
+               title={unavailable ? '视频端点未接通' : modelDisplayLabel(modelId)}
+diff --git a/src/app/chat/RatioPopover.tsx b/src/app/chat/RatioPopover.tsx
+index 2c5a79be..8667f3f8 100644
+--- a/src/app/chat/RatioPopover.tsx
++++ b/src/app/chat/RatioPopover.tsx
+@@ -8,7 +8,8 @@ import { useAnchoredPopoverPosition } from './popoverPosition'
+ type RatioPopoverProps = {
+   id: string
+   anchorRef: RefObject<HTMLElement | null>
+-  onClose: () => void
++  /** refocus=true 表示用户已结束本次操作(Escape),调用方应把焦点还回输入框。 */
++  onClose: (refocus?: boolean) => void
+ }
+ 
+ const popoverWidth = 264
+@@ -63,7 +64,7 @@ export function RatioPopover({ id, anchorRef, onClose }: RatioPopoverProps) {
+     const handleKeyDown = (event: KeyboardEvent) => {
+       if (event.key === 'Escape') {
+         event.preventDefault()
+-        onClose()
++        onClose(true)
+       }
+     }
+ 

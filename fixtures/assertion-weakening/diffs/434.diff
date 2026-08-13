@@ -1,0 +1,1415 @@
+diff --git a/cindyplugin/ghost.json b/cindyplugin/ghost.json
+index d3541ee4..cfc886b0 100644
+--- a/cindyplugin/ghost.json
++++ b/cindyplugin/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.6",
++  "version": "0.9.7",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/cindyplugin/main.js b/cindyplugin/main.js
+index 0f71945d..7776974f 100644
+--- a/cindyplugin/main.js
++++ b/cindyplugin/main.js
+@@ -482,8 +482,39 @@ async function handleLoadAssets(msg) {
+ // 或体内出现引号、ident 反斜杠转义都会让动画作废甚至整段样式被拒。
+ 
+ const CARD_WIDTH = 458 // 卡内宽(手册给定),高度预报按它算
+-const CARD_TEXT_BLOCK_H = 64 // 固定文字区高度
++const CARD_TEXT_BLOCK_H = 64 // 缺省文字区高度(只有调用方不传 chrome 时用)
++// 失败卡文字区:高度必须**算得出来**,不能凭感觉给个 64 —— 原实现就是这么裁掉失败
++// 原因的(改图失败三行文字实测 72px > 64px,overflow:hidden 把原因底部切了)。
++// 组成(与下面 CSS 逐项对账,改一边必须改另一边,有测试钉住):
++//   padding-top 10 + 标题行 18 + [源图行 6+16] + 原因区 6+32 + padding-bottom 8
++// 源图行用 nowrap+ellipsis 锁死单行,原因区用固定 32px(2 行 × 16)+ overflow:hidden,
++// 所以无论文案多长都不会溢出预留高度 —— 这是「失败必须看得见」的实现前提。
++const CARD_FAIL_PAD_TOP = 10
++const CARD_FAIL_PAD_BOTTOM = 8
++const CARD_FAIL_TITLE_H = 18
++const CARD_FAIL_SUB_GAP = 6
++const CARD_FAIL_SOURCE_H = 16 // 单行
++const CARD_FAIL_REASON_H = 32 // 2 行 × 16
++const CARD_FAIL_META_H =
++  CARD_FAIL_PAD_TOP + CARD_FAIL_TITLE_H + CARD_FAIL_SUB_GAP + CARD_FAIL_REASON_H + CARD_FAIL_PAD_BOTTOM
++const CARD_FAIL_META_WITH_SOURCE_H = CARD_FAIL_META_H + CARD_FAIL_SUB_GAP + CARD_FAIL_SOURCE_H
++// 原因文案上限:2 行约容 74 个 CJK 字(454px / 12px ≈ 37 字/行),留余量取 70。
++const CARD_FAIL_REASON_CHARS = 70
+ const CARD_STAGE_MIN_H = 56 // 极端夹取时给图片区留的最小高度
++
++// ── 卡片只画结果,不画过程,也不复述提示词 ──
++//
++// 一、**不出过程卡**:生成期间聊天里只留宿主自己的插件胶囊(图标 + 名字 + 转圈)。
++//     手册 §4.5「不供片 = 没有过程态」,所以过程态就是「一版都不发」。插件侧因此
++//     没有 working 卡、没有呼吸动画、没有「正在生成…」文案——留着它们就是留一份
++//     生产永不产生的形状,测试还会去断言它。
++// 二、**成功卡只有图**:不放标题(「图片已生成」)、不放提示词。提示词已经在宿主
++//     胶囊的调用参数里,卡内再复述一遍只是把图挤小。
++//     注:胶囊展开体是宿主渲染的 `JSON.stringify(toolInput)`(i18n 键
++//     chat.ghostCall.cardParams),插件递给宿主的只有 html/height/state 三样,
++//     无法把它改成人话——那需要改 Cindy 客户端本身。
++// 三、**失败卡保留文字**:失败必须看得见(标题 + 原因,改图再带源图指代)。
++//     把失败文案一起删掉会让出图失败变成静默无反应,那是 bug 不是干净。
+ const CARD_MIN_H = 120
+ const CARD_MAX_H = 900
+ const CARD_MIN_INTERVAL_MS = 1000 // 宿主限速:两版之间 ≥1s
+@@ -505,16 +536,10 @@ const CARD_MEDIA_URL_RE = /^cindy-media:\/\/blobs\/[a-f0-9]{16,128}\.[a-z0-9]{2,
+ // 其余一律英文兜底(与 dict.ts 的 locale 集一致)。
+ const CARD_I18N = {
+   en: {
+-    genWorking: 'Generating image…',
+-    genDone: 'Image generated',
+     genFailed: 'Image generation failed',
+-    editWorking: 'Updating image…',
+-    editDone: 'Image updated',
+     editFailed: 'Image update failed',
+-    promptLabel: 'Prompt',
+     sourceLabel: 'Source',
+     imageAlt: 'Image placed on the Mivo canvas',
+-    stageAlt: 'Image is being generated',
+     errPanelClosed: 'Open the Mivo Canvas panel and try again',
+     errPanelNotReady: 'The Mivo Canvas panel is still loading. Please retry shortly',
+     errTimeout: 'The task timed out. Please try again',
+@@ -522,16 +547,10 @@ const CARD_I18N = {
+     errUnknown: 'Something went wrong. Please try again later',
+   },
+   'zh-CN': {
+-    genWorking: '正在生成图片…',
+-    genDone: '图片已生成',
+     genFailed: '图片生成失败',
+-    editWorking: '正在修改图片…',
+-    editDone: '图片已更新',
+     editFailed: '图片修改失败',
+-    promptLabel: '提示词',
+     sourceLabel: '源图',
+     imageAlt: '已放到 Mivo 画布上的图片',
+-    stageAlt: '图片生成中',
+     errPanelClosed: '打开 Mivo Canvas 面板后重试',
+     errPanelNotReady: '面板正在载入,请稍候重试',
+     errTimeout: '任务超时,请重试',
+@@ -539,16 +558,10 @@ const CARD_I18N = {
+     errUnknown: '出了点问题,请稍后重试',
+   },
+   ja: {
+-    genWorking: '画像を生成中…',
+-    genDone: '画像を生成しました',
+     genFailed: '画像の生成に失敗しました',
+-    editWorking: '画像を修正中…',
+-    editDone: '画像を更新しました',
+     editFailed: '画像の更新に失敗しました',
+-    promptLabel: 'プロンプト',
+     sourceLabel: '元画像',
+     imageAlt: 'Mivo キャンバスに配置された画像',
+-    stageAlt: '画像を生成しています',
+     errPanelClosed: 'Mivo Canvas パネルを開いてから再試行してください',
+     errPanelNotReady: 'パネルを読み込んでいます。少し待ってから再試行してください',
+     errTimeout: 'タスクがタイムアウトしました。もう一度お試しください',
+@@ -556,16 +569,10 @@ const CARD_I18N = {
+     errUnknown: '問題が発生しました。しばらくしてから再試行してください',
+   },
+   ko: {
+-    genWorking: '이미지 생성 중…',
+-    genDone: '이미지를 생성했습니다',
+     genFailed: '이미지 생성에 실패했습니다',
+-    editWorking: '이미지 수정 중…',
+-    editDone: '이미지를 업데이트했습니다',
+     editFailed: '이미지 업데이트에 실패했습니다',
+-    promptLabel: '프롬프트',
+     sourceLabel: '원본 이미지',
+     imageAlt: 'Mivo 캔버스에 배치된 이미지',
+-    stageAlt: '이미지를 생성하는 중입니다',
+     errPanelClosed: 'Mivo Canvas 패널을 열고 다시 시도하세요',
+     errPanelNotReady: '패널을 불러오는 중입니다. 잠시 후 다시 시도하세요',
+     errTimeout: '작업이 시간 초과되었습니다. 다시 시도하세요',
+@@ -684,102 +691,112 @@ function cardClamp(value, max) {
+ }
+ 
+ /**
+- * 高度预报:固定文字区 64px,总高 clamp(120, round(458 * displayH / displayW) + 64, 900)。
+- * 首帧即最终高度 → working / done 同高,用户看不到收敛跳动。
++ * 高度预报:总高 clamp(120, round(458 * displayH / displayW) + chromeH, 900)。
++ * chromeH = 卡内除图片区以外占用的高度:成功卡传 0(卡里只有图),失败卡传固定文字区
++ * 高度(标题 + 原因)。缺省按文字区算,保持调用方不传时的既有行为。
+  */
+-function cardHeight(displayW, displayH) {
++function cardHeight(displayW, displayH, chromeH) {
+   const w = Number(displayW) > 0 ? Number(displayW) : 1
+   const h = Number(displayH) > 0 ? Number(displayH) : w
+-  const raw = Math.round((CARD_WIDTH * h) / w) + CARD_TEXT_BLOCK_H
++  const chrome = Number(chromeH) >= 0 ? Number(chromeH) : CARD_TEXT_BLOCK_H
++  const raw = Math.round((CARD_WIDTH * h) / w) + chrome
+   return Math.min(CARD_MAX_H, Math.max(CARD_MIN_H, raw))
+ }
+ 
+ /** 请求画幅 → 卡片高度。未传/非法画幅只在卡片布局上按 1:1 预留。 */
+-function cardHeightFor(aspectRatio) {
++function cardHeightFor(aspectRatio, chromeH) {
+   const box = CARD_ASPECTS[aspectRatio] || CARD_ASPECTS['1:1']
+-  return cardHeight(box[0], box[1])
++  return cardHeight(box[0], box[1], chromeH)
+ }
+ 
+-// 样式:颜色全部走宿主主题变量 + 字面回退(light/dark 都可读);动画只动
+-// transform/opacity;不写 !important、keyframes 内不出现引号。
++// 样式:颜色全部走宿主主题变量 + 字面回退(light/dark 都可读)。这里**一条动画都
++// 没有** —— 过程态整卡不发(见文件头「卡片只画结果」),终版本来就该是静止的。
++// 不写 !important(会让宿主整卡动画作废并回退扫光)。
+ const CARD_STYLE = [
+   '.mivo-card{box-sizing:border-box;width:100%}',
++  // 成功卡里只有这一个容器 —— 不描边、不给底色:图片本身就是内容,加边框只会
++  // 在图外围多一圈跟内容无关的框。底色只在没图的失败卡上用得到。
+   '.mivo-card__stage{box-sizing:border-box;width:100%;display:flex;align-items:center;',
+-  'justify-content:center;overflow:hidden;border-radius:10px;background:var(--surface, #f2f2ef)}',
++  'justify-content:center;overflow:hidden;border-radius:10px}',
+   '.mivo-card__img{width:100%;height:100%;object-fit:contain;display:block}',
+   '.mivo-card__void{width:56px;height:56px;border-radius:50%;opacity:.45;',
+   'background:var(--border-default, #d8d8d2)}',
+-  '.mivo-card__pulse{width:56px;height:56px;border-radius:50%;',
+-  'background:var(--border-default, #d8d8d2);animation:mivoCardBreath 1.5s ease-in-out infinite alternate}',
+-  '.mivo-card__meta{box-sizing:border-box;height:' + CARD_TEXT_BLOCK_H + 'px;padding:10px 2px 0;overflow:hidden;',
+-  'color:var(--text-primary, #1a1a1a)}',
+-  '.mivo-card__title{margin:0;font-size:13px;font-weight:700;line-height:18px}',
+-  '.mivo-card__sub{margin:6px 0 0;font-size:12px;line-height:16px;opacity:.72;overflow:hidden}',
+-  '.mivo-card__sub--error{opacity:.9}',
+-  '@keyframes mivoCardBreath{from{opacity:.4;transform:scale(.86)}to{opacity:1;transform:scale(1.04)}}',
++  // 高度由 renderCard 内联给(随有无源图行变化),这里只定 padding 与配色。
++  '.mivo-card__meta{box-sizing:border-box;padding:' + CARD_FAIL_PAD_TOP + 'px 2px ' + CARD_FAIL_PAD_BOTTOM + 'px;',
++  'overflow:hidden;color:var(--text-primary, #1a1a1a)}',
++  '.mivo-card__title{margin:0;font-size:13px;font-weight:700;line-height:' + CARD_FAIL_TITLE_H + 'px}',
++  '.mivo-card__sub{margin:' + CARD_FAIL_SUB_GAP + 'px 0 0;font-size:12px;line-height:16px;opacity:.72;overflow:hidden}',
++  // 源图行锁死单行:再长也只占 16px,不会把下面的失败原因顶出可见区。
++  '.mivo-card__sub--source{height:' + CARD_FAIL_SOURCE_H + 'px;white-space:nowrap;text-overflow:ellipsis}',
++  // 原因区固定 2 行:超长文案被裁的是原因的尾巴,而不是整行消失。
++  '.mivo-card__sub--error{height:' + CARD_FAIL_REASON_H + 'px;opacity:.9}',
+ ].join('')
+ 
+ /**
+- * 渲染一版卡片。view:
++ * 渲染一版卡片。**只有两种终版,没有过程版**(过程态整卡不发,见文件头说明)。view:
+  *   mode        'generate' | 'edit'
+- *   phase       'working' | 'done' | 'failed'(failed 也是终版,宿主 state 记 done)
++ *   phase       'done'(成功) | 'failed'(失败);两者宿主 state 都记 done
+  *   aspectRatio 请求里的显式画幅('1:1'|'3:2'|'2:3'),缺省按 1:1 预留
+- *   imageUrl    done 时的产物地址,必须是本意识名下 cindy-media 地址,否则不渲染 img
+- *   prompt      提示词原文(卡内展示摘要,转义后输出;诊断日志侧永不落原文)
+- *   sourceLabel 图生图的源图标题
++ *   imageUrl    成功时的产物地址,必须是本意识名下 cindy-media 地址,否则不渲染 img
++ *   sourceLabel 图生图的源图标题(只在失败卡上出现,用来指代改的是哪张)
+  *   reason      失败原因(调用方负责脱敏 + 本地化),转义后输出
+  *   locale      宿主 locale;缺省用缓存
+- * 返回 { state, height, html },直接喂 cardSend。
++ *
++ * 成功卡 = 一张图,没有标题、没有提示词、没有副行:提示词已在宿主胶囊的调用参数里,
++ * 卡内复述只会把图挤小。失败卡 = 占位框 + 标题 + 原因(+ 改图的源图指代),失败必须
++ * 看得见 —— 把失败文案一起删掉会让出图失败变成静默无反应。
++ *
++ * 返回 { state, height, html },直接喂 cardSend / cardFinal。
+  */
+ function renderCard(view) {
+   const input = view || {}
+   const locale = cardLocaleKey(input.locale || cardLocaleCache)
+   const mode = input.mode === 'edit' ? 'edit' : 'generate'
+-  const phase = input.phase === 'done' ? 'done' : input.phase === 'failed' ? 'failed' : 'working'
+-  const height = cardHeightFor(input.aspectRatio)
+-  const stageH = Math.max(CARD_STAGE_MIN_H, height - CARD_TEXT_BLOCK_H)
+-  const titleKey = mode === 'edit'
+-    ? (phase === 'working' ? 'editWorking' : phase === 'done' ? 'editDone' : 'editFailed')
+-    : (phase === 'working' ? 'genWorking' : phase === 'done' ? 'genDone' : 'genFailed')
++  const phase = input.phase === 'failed' ? 'failed' : 'done'
++  // 成功卡卡内除图片区外零占用 → chrome 传 0;失败卡按「有没有源图行」取算得出来的高度。
++  const withSource = phase === 'failed' && mode === 'edit' && Boolean(input.sourceLabel)
++  const chromeH = phase === 'failed' ? (withSource ? CARD_FAIL_META_WITH_SOURCE_H : CARD_FAIL_META_H) : 0
++  const height = cardHeightFor(input.aspectRatio, chromeH)
++  const stageH = Math.max(CARD_STAGE_MIN_H, height - chromeH)
+ 
+   const imageUrl = typeof input.imageUrl === 'string' && CARD_MEDIA_URL_RE.test(input.imageUrl) ? input.imageUrl : null
+-  // 只有 working 才挂呼吸动画:done / failed 是终版,残留动画类会让用户以为还在跑。
+-  const stageInner = imageUrl && phase !== 'working'
++  const stageInner = imageUrl
+     ? '<img class="mivo-card__img" src="' + imageUrl + '" alt="' + cardEscape(cardText(locale, 'imageAlt')) + '">'
+-    : phase === 'working'
+-      ? '<div class="mivo-card__pulse" role="img" aria-label="' + cardEscape(cardText(locale, 'stageAlt')) + '"></div>'
+-      : '<div class="mivo-card__void"></div>'
++    : '<div class="mivo-card__void"></div>'
+ 
+-  let sub = ''
++  // 成功态整块 meta 都不渲染(标题/副行一个都没有);失败态才有文字。
++  let meta = ''
+   if (phase === 'failed') {
+-    sub = '<p class="mivo-card__sub mivo-card__sub--error">' + cardEscape(cardClamp(input.reason, 140)) + '</p>'
+-  } else if (mode === 'edit' && input.sourceLabel) {
+-    sub =
+-      '<p class="mivo-card__sub">' +
+-      cardEscape(cardText(locale, 'sourceLabel')) + ': ' + cardEscape(cardClamp(input.sourceLabel, 80)) +
+-      '</p>'
+-  } else if (input.prompt) {
+-    sub =
+-      '<p class="mivo-card__sub">' +
+-      cardEscape(cardText(locale, 'promptLabel')) + ': ' + cardEscape(cardClamp(input.prompt, 120)) +
+-      '</p>'
++    const titleKey = mode === 'edit' ? 'editFailed' : 'genFailed'
++    const source = withSource
++      ? '<p class="mivo-card__sub mivo-card__sub--source">' +
++        cardEscape(cardText(locale, 'sourceLabel')) + ': ' + cardEscape(cardClamp(input.sourceLabel, 80)) +
++        '</p>'
++      : ''
++    meta =
++      '<div class="mivo-card__meta" style="height:' + chromeH + 'px">' +
++      '<p class="mivo-card__title">' + cardEscape(cardText(locale, titleKey)) + '</p>' +
++      source +
++      '<p class="mivo-card__sub mivo-card__sub--error">' +
++      cardEscape(cardClamp(input.reason, CARD_FAIL_REASON_CHARS)) +
++      '</p>' +
++      '</div>'
+   }
+ 
+   const html =
+     '<style>' + CARD_STYLE + '</style>' +
+     '<div class="mivo-card">' +
+     '<div class="mivo-card__stage" style="height:' + stageH + 'px">' + stageInner + '</div>' +
+-    '<div class="mivo-card__meta">' +
+-    '<p class="mivo-card__title">' + cardEscape(cardText(locale, titleKey)) + '</p>' +
+-    sub +
+-    '</div></div>'
++    meta +
++    '</div>'
+ 
+   return {
+-    state: phase === 'working' ? 'working' : 'done',
++    // 只有终版,所以宿主 state 恒为 done(卡位随即关窗,不留跨调用的更新窗口)。
++    state: 'done',
+     height,
+     html,
+     phase,
+-    hasImage: Boolean(imageUrl && phase !== 'working'),
++    hasImage: Boolean(imageUrl),
+   }
+ }
+ 
+@@ -3163,13 +3180,14 @@ async function runCardBackedGeneration(job) {
+   const base = {
+     mode: job.mode,
+     aspectRatio: job.aspectRatio,
+-    prompt: job.prompt,
+     locale,
+   }
+ 
+-  // ① 收到活立刻供过程卡。先出卡再查源图标题 —— 标题查询有 6 秒窗口,不该拖慢首帧。
+-  cardSend(cardId, renderCard(Object.assign({ phase: 'working' }, base)))
+-  // 改图的源图指代在此定住(调用开始时的标题),之后的所有卡版都用这一份。
++  // ① **不发过程卡**:生成期间聊天里只留宿主自己的插件胶囊(图标 + 名字 + 转圈)。
++  // 手册 §4.5「不供片 = 没有过程态」——过程态就是一版都不发,所以这里没有 cardSend。
++  // 卡片只在终态出现一次(成功走 ③ 的 cardFinal,失败走 failWithCard),都在交卷前发出,
++  // 落在宿主交卷后 10 秒宽限之内。
++  // 改图的源图指代在此定住(调用开始时的标题),失败卡用它指代改的是哪张。
+   if (job.sourceLabelNodeId !== undefined) base.sourceLabel = await resolveSourceLabel(job.sourceLabelNodeId)
+ 
+   /**
+@@ -3252,7 +3270,19 @@ async function runCardBackedGeneration(job) {
+   const done = renderCard(Object.assign({ phase: 'done', imageUrl }, base))
+   // ③ 终版先发、发送尝试完成后再收尾;成功终态轻提示紧跟其后(理由同 failWithCard
+   //    内注释:电子脑 on-demand,交卷后随时可能被宿主收走)。
+-  await cardFinal(cardId, done)
++  //
++  // 成功卡零文案 ⇒ **没有图就没有卡**:拿不到本意识名下产物地址时(lastGenByCallId
++  // 上限 16 条 FIFO,并发多轮生成会把在途那条挤掉),发出去的会是一张透明区 + 灰圆点、
++  // 却宣称 state:done 的空白卡 —— 看着像坏了。这种情况一版都不发,交给宿主的默认
++  // 渲染;xdt_images_in_card 本来也只在 hasImage 时才带,两边口径一致。
++  if (done.hasImage) {
++    await cardFinal(cardId, done)
++  } else {
++    diagSkip(
++      DIAG_SOURCE.card,
++      'card 终版未发送: 成功但取不到本意识名下产物地址,改由宿主默认渲染 cardId=' + cardId,
++    )
++  }
+   await notifyGenerationTerminal(job.mode, 'done', locale)
+   return job.onSuccess({ reply: r, gen, imageUrl, done })
+ }
+@@ -3266,7 +3296,7 @@ async function runImageToolWithCard(msg, spec, succeed, fail) {
+     mode: spec.mode,
+     // 画幅只透传显式白名单值;卡片布局在未传时按 1:1 预留,不反向改写模型请求。
+     aspectRatio: spec.mode === 'generate' ? args.aspectRatio : undefined,
+-    prompt: args.prompt,
++    // 卡片不再展示提示词,所以 job 上不留 prompt —— 提示词只经 params 递给面板。
+     sourceLabelNodeId: spec.mode === 'edit' ? args.nodeId : undefined,
+     params: { nodeId: args.nodeId, prompt: args.prompt, aspectRatio: args.aspectRatio, x: args.x, y: args.y },
+     progressCallId: msg.callId,
+@@ -5549,6 +5579,17 @@ if (seam && typeof seam.expose === 'function') {
+       locale: () => cardLocaleCache,
+       width: CARD_WIDTH,
+       textBlockHeight: CARD_TEXT_BLOCK_H,
++      failMetaHeight: CARD_FAIL_META_H,
++      failMetaWithSourceHeight: CARD_FAIL_META_WITH_SOURCE_H,
++      failReasonChars: CARD_FAIL_REASON_CHARS,
++      failParts: {
++        padTop: CARD_FAIL_PAD_TOP,
++        padBottom: CARD_FAIL_PAD_BOTTOM,
++        titleH: CARD_FAIL_TITLE_H,
++        subGap: CARD_FAIL_SUB_GAP,
++        sourceH: CARD_FAIL_SOURCE_H,
++        reasonH: CARD_FAIL_REASON_H,
++      },
+       minIntervalMs: CARD_MIN_INTERVAL_MS,
+       maxBytes: CARD_HTML_MAX_BYTES,
+       minHeight: CARD_MIN_H,
+diff --git a/cindyplugin/src/__tests__/brainHarness.ts b/cindyplugin/src/__tests__/brainHarness.ts
+index 3e6d40d3..60dad18a 100644
+--- a/cindyplugin/src/__tests__/brainHarness.ts
++++ b/cindyplugin/src/__tests__/brainHarness.ts
+@@ -201,7 +201,7 @@ export type CardVersion = {
+ 
+ export type CardView = {
+   mode?: 'generate' | 'edit'
+-  phase?: 'working' | 'done' | 'failed'
++  phase?: 'done' | 'failed'
+   aspectRatio?: string
+   imageUrl?: string
+   prompt?: string
+@@ -251,9 +251,9 @@ export type BrainCardActionHandles = {
+ export type BrainCardHandles = {
+   send: (cardId: string, version: CardVersion) => void
+   final: (cardId: string, version: CardVersion) => Promise<void>
+-  render: (view: CardView) => CardVersion & { phase: string }
+-  height: (displayW: number, displayH: number) => number
+-  heightFor: (aspectRatio?: string) => number
++  render: (view: CardView) => CardVersion & { phase: string; hasImage: boolean }
++  height: (displayW: number, displayH: number, chromeH?: number) => number
++  heightFor: (aspectRatio?: string, chromeH?: number) => number
+   resultTokens: (cardId: string, callId: string) => Record<string, unknown>
+   escape: (value: unknown) => string
+   text: (locale: string, key: string) => string
+@@ -262,6 +262,10 @@ export type BrainCardHandles = {
+   locale: () => string
+   width: number
+   textBlockHeight: number
++  failMetaHeight: number
++  failMetaWithSourceHeight: number
++  failReasonChars: number
++  failParts: { padTop: number; padBottom: number; titleH: number; subGap: number; sourceH: number; reasonH: number }
+   minIntervalMs: number
+   maxBytes: number
+   minHeight: number
+diff --git a/cindyplugin/src/__tests__/cardEditLabel.test.ts b/cindyplugin/src/__tests__/cardEditLabel.test.ts
+index 3255a446..7f61121d 100644
+--- a/cindyplugin/src/__tests__/cardEditLabel.test.ts
++++ b/cindyplugin/src/__tests__/cardEditLabel.test.ts
+@@ -1,9 +1,14 @@
+ /**
+  * 改图源图指代协议测试(#298 T4)。
+  *
+- * SC:done 卡固定展示「源图:<sourceLabel>」;sourceLabel 取**调用开始时**该 nodeId
+- * 对应节点的标题,空标题回退稳定的 nodeId 短标识;并发 edit 不串源图;label 经
+- * HTML escape。断言跑在真实 cindyplugin/main.js 源码上。
++ * SC:**失败卡**展示「源图:<sourceLabel>」——成功卡按本轮改动只放图,零文案,所以
++ * 源图指代只在失败时出现(用来告诉用户「改的是哪张」失败了)。sourceLabel 仍取
++ * **调用开始时**该 nodeId 对应节点的标题(改图期间改名不影响本卡),空标题回退稳定
++ * 的 nodeId 短标识;并发 edit 不串源图;label 经 HTML escape。
++ *
++ * 注:标题解析仍在调用开始时**急性求值**(保住「定住」语义),因此成功路径上这次查询
++ * 的结果用不到 —— 这是为了不让「改图期间改名」影响卡片而付的一次面板往返。
++ * 断言跑在真实 cindyplugin/main.js 源码上。
+  */
+ import { describe, expect, it } from 'vitest'
+ import { attachPanelBridge, flushMicrotasks, loadBrain } from './brainHarness'
+@@ -14,11 +19,16 @@ const IMAGE_URL = `cindy-media://blobs/${HASH}.png`
+ 
+ type HostMessage = { type: string; callId?: string; state?: string; html?: string; ok?: boolean }
+ 
++/** 只看 </style> 之后的真实标记:类名在样式表里必然出现,断言必须落在 markup 上。 */
++const markup = (html: string | undefined): string => (html ?? '').split('</style>')[1] ?? ''
++
+ type PanelScript = {
+   /** nodeId → 标题(缺省即「查不到该节点」)。 */
+   titles?: Record<string, string>
+   /** 让 node-label 动词永不应答(面板未打开)。 */
+   labelSilent?: boolean
++  /** 让 edit 动词回失败 → 出失败卡(源图指代只在失败卡上,断言得走这条路)。 */
++  failEdit?: boolean
+ }
+ 
+ type EditCall = { callId: string; nodeId: string }
+@@ -57,7 +67,10 @@ const runEdits = async (calls: EditCall[], script: PanelScript = {}) => {
+       if (!(nodeId in titles)) return reply({ ok: false, code: 'NODE_NOT_FOUND', message: '找不到节点' })
+       return reply({ ok: true, title: titles[nodeId], nodeType: 'image' })
+     }
+-    if (request.verb === 'edit') return reply({ ok: true, status: 'ready', nodeId: 'result-node' })
++    if (request.verb === 'edit') {
++      if (script.failEdit) return reply({ ok: false, code: 'FAILED', message: '上游拒绝' })
++      return reply({ ok: true, status: 'ready', nodeId: 'result-node' })
++    }
+     return reply({ ok: false, code: 'UNKNOWN_VERB', message: 'x' })
+   }
+ 
+@@ -82,17 +95,26 @@ const runEdits = async (calls: EditCall[], script: PanelScript = {}) => {
+ }
+ 
+ describe('T4 源图指代', () => {
+-  it('done 卡固定展示「源图:<标题>」', async () => {
+-    const run = await runEdits([{ callId: 'c1', nodeId: 'node-aaa111' }], { titles: { 'node-aaa111': '主视觉 v3' } })
+-    const done = run.doneFor('c1')
++  it('失败卡展示「源图:<标题>」,成功卡零文案只放图', async () => {
++    const titles = { 'node-aaa111': '主视觉 v3' }
+ 
+-    expect(done?.html).toContain('源图: 主视觉 v3')
+-    expect(done?.html).toContain('图片已更新')
+-    expect(done?.html).toContain(`src="${IMAGE_URL}"`)
++    const failed = await runEdits([{ callId: 'c1', nodeId: 'node-aaa111' }], { titles, failEdit: true })
++    const failedCard = failed.doneFor('c1')
++    expect(failedCard?.html).toContain('图片修改失败')
++    expect(failedCard?.html).toContain('源图: 主视觉 v3')
++    expect(failedCard?.html).not.toContain('<img') // 失败没有产物 → 静态占位框
++
++    const ok = await runEdits([{ callId: 'c2', nodeId: 'node-aaa111' }], { titles })
++    const okCard = ok.doneFor('c2')
++    expect(okCard?.html).toContain(`src="${IMAGE_URL}"`)
++    // 成功卡不复述任何文字:标题、源图指代都不出现
++    expect(okCard?.html).not.toContain('源图')
++    expect(okCard?.html).not.toContain('主视觉 v3')
++    expect(markup(okCard?.html)).not.toContain('mivo-card__meta')
+   })
+ 
+   it('空标题回退稳定的 nodeId 短标识', async () => {
+-    const blank = await runEdits([{ callId: 'c1', nodeId: 'node-abcdef' }], { titles: { 'node-abcdef': '   ' } })
++    const blank = await runEdits([{ callId: 'c1', nodeId: 'node-abcdef' }], { titles: { 'node-abcdef': '   ' }, failEdit: true })
+     expect(blank.doneFor('c1')?.html).toContain('源图: #abcdef')
+ 
+     // 同一 nodeId 反复解析得到同一短标识(可对账)
+@@ -105,13 +127,17 @@ describe('T4 源图指代', () => {
+   })
+ 
+   it('节点查不到 / 面板不应答都回退短标识并记 warn,不拖垮调用', async () => {
+-    const missing = await runEdits([{ callId: 'c1', nodeId: 'node-ghost1' }], { titles: {} })
++    const missing = await runEdits([{ callId: 'c1', nodeId: 'node-ghost1' }], { titles: {}, failEdit: true })
+     expect(missing.doneFor('c1')?.html).toContain('源图: #ghost1')
+     expect(attachPanelBridge(missing.brain).spy.find('源图标题为空或取不到')[0]?.level).toBe('warn')
+ 
+-    const silent = await runEdits([{ callId: 'c2', nodeId: 'node-quiet' }], { labelSilent: true })
++    const silent = await runEdits([{ callId: 'c2', nodeId: 'node-quiet' }], { labelSilent: true, failEdit: true })
+     expect(silent.doneFor('c2')?.html).toContain('源图: #-quiet')
+-    expect(silent.sent.find((m) => m.type === 'tool-result')?.ok).toBe(true) // 标题拿不到不影响改图本体
++
++    // 「标题拿不到不拖垮改图本体」必须在**成功路径**上验(失败路径的 ok:false 是被
++    // failEdit 造出来的,拿它断言等于什么都没验)。
++    const silentButOk = await runEdits([{ callId: 'c3', nodeId: 'node-quiet' }], { labelSilent: true })
++    expect(silentButOk.sent.find((m) => m.type === 'tool-result')?.ok).toBe(true)
+   })
+ 
+   it('两路并发 edit 各自 label 正确,不串源图', async () => {
+@@ -120,7 +146,7 @@ describe('T4 源图指代', () => {
+         { callId: 'c1', nodeId: 'node-111111' },
+         { callId: 'c2', nodeId: 'node-222222' },
+       ],
+-      { titles: { 'node-111111': '海报 A', 'node-222222': '海报 B' } },
++      { titles: { 'node-111111': '海报 A', 'node-222222': '海报 B' }, failEdit: true },
+     )
+ 
+     expect(run.doneFor('c1')?.html).toContain('源图: 海报 A')
+@@ -131,12 +157,12 @@ describe('T4 源图指代', () => {
+ 
+   it('label 经 HTML escape', async () => {
+     const attack = '<img src=x onerror="alert(1)">'
+-    const run = await runEdits([{ callId: 'c1', nodeId: 'node-xss001' }], { titles: { 'node-xss001': attack } })
++    const run = await runEdits([{ callId: 'c1', nodeId: 'node-xss001' }], { titles: { 'node-xss001': attack }, failEdit: true })
+     const html = run.doneFor('c1')?.html ?? ''
+ 
+     expect(html).not.toContain(attack)
+     expect(html).toContain('&lt;img src=x onerror=&quot;alert(1)&quot;&gt;')
+-    expect((html.match(/<img/g) ?? [])).toHaveLength(1) // 只有那张合法缩略图
++    expect((html.match(/<img/g) ?? [])).toHaveLength(0) // 失败卡没有产物,注入文本也没闭合成 img
+   })
+ 
+   it('标题在调用开始时定住:改图期间改名不影响本卡', async () => {
+@@ -167,7 +193,8 @@ describe('T4 源图指代', () => {
+         titles['node-lock01'] = '改名后的标题' // 改图执行期间用户改了名
+         return
+       }
+-      agent.postMessage({ reqId: request.reqId, reply: true, ok: true, status: 'ready', nodeId: 'r1' })
++      // 源图指代只在失败卡上,所以这里让 edit 回失败(定住语义与成败无关)
++      agent.postMessage({ reqId: request.reqId, reply: true, ok: false, code: 'FAILED', message: '上游拒绝' })
+     }
+     brain.handles.handleGenImage({ reqId: 'g1', kind: 'edit-image', prompt: 'p', hashes: [HASH], callId: 'c1' })
+     await flushMicrotasks()
+@@ -184,7 +211,7 @@ describe('T4 源图指代', () => {
+     expect(done?.html).not.toContain('改名后的标题')
+   })
+ 
+-  it('生图工具不受影响:仍展示提示词而不是源图', async () => {
++  it('生图工具不问 node-label,成功卡只有图', async () => {
+     const sent: HostMessage[] = []
+     const brain = loadBrain({
+       panelPresent: () => false,
+@@ -221,7 +248,10 @@ describe('T4 源图指代', () => {
+     await pending
+ 
+     const done = sent.find((m) => m.type === 'card-update' && m.state === 'done')
+-    expect(done?.html).toContain('提示词: 一只猫')
++    // 生图成功卡:只有图,零文案 —— 提示词不复述、也不问 node-label(上面已断言)
++    expect(done?.html).toContain(`src="${IMAGE_URL}"`)
++    expect(done?.html).not.toContain('一只猫')
+     expect(done?.html).not.toContain('源图')
++    expect(markup(done?.html)).not.toContain('mivo-card__meta')
+   })
+ })
+diff --git a/cindyplugin/src/__tests__/cardRender.test.ts b/cindyplugin/src/__tests__/cardRender.test.ts
+index a6460524..a2f192a5 100644
+--- a/cindyplugin/src/__tests__/cardRender.test.ts
++++ b/cindyplugin/src/__tests__/cardRender.test.ts
+@@ -1,11 +1,15 @@
+ /**
+  * card 展示 / 安全 / i18n / 主题契约测试(#298 T8)+ 高度预报(T2 高度部分)。
+  *
+- * 覆盖:HTML/CSS 零脚本、零事件属性、零危险 URL;动态文本(prompt/source/error)
+- * 全部 HTML escape;img src 只允许本意识 owned cindy-media://blobs/<hash>;
+- * @keyframes 只含 transform/opacity 且无引号、CSS 无 !important;
+- * 文案 zh-CN/en/ja/ko 正确、未知 locale 英文兜底;主题 CSS 变量带字面 fallback;
+- * 缩略图有本地化 alt;高度 clamp(120, round(458*h/w)+64, 900) 且 working/done 同高。
++ * 卡片契约(本轮改后):**只有两种终版,没有过程版**。
++ *   - 成功卡 = 一张图,零文案(没有标题、没有提示词、没有副行);
++ *   - 失败卡 = 占位框 + 标题 + 原因(改图再带源图指代),失败必须看得见;
++ *   - 过程态整卡不发,所以插件侧没有 working 卡、没有呼吸动画、没有「正在生成…」文案。
++ *
++ * 覆盖:HTML/CSS 零脚本、零事件属性、零危险 URL;动态文本(source/error)全部 escape;
++ * img src 只允许本意识 owned cindy-media://blobs/<hash>;CSS 里一条动画都没有、无
++ * !important;文案 zh-CN/en/ja/ko 正确、未知 locale 英文兜底;主题 CSS 变量带字面
++ * fallback;高度 clamp(120, round(458*h/w)+chrome, 900),成功 chrome=0 / 失败 chrome=64。
+  *
+  * 断言跑在真实 cindyplugin/main.js 源码上。
+  */
+@@ -20,56 +24,223 @@ const card = (): BrainCardHandles => loadBrain({ panelPresent: () => false }).ha
+ /** 只看 </style> 之后的真实标记:类名在样式表里必然出现,断言必须落在 markup 上。 */
+ const markup = (html: string): string => html.split('</style>')[1] ?? ''
+ 
+-const keyframesBody = (html: string): string => {
+-  const match = html.match(/@keyframes[^{]*\{([\s\S]*?\}\s*)\}/)
+-  return match ? match[0] : ''
+-}
++/** 只看 <style> 里的样式表。 */
++const styleBlock = (html: string): string => html.split('</style>')[0] ?? ''
+ 
+ describe('card 高度预报', () => {
+-  it('三种显式画幅按公式给高,working / done 同高', () => {
++  it('成功卡 chrome=0:高度就是图片区,三种显式画幅按公式给高', () => {
+     const api = card()
+     const cases: Array<[string, number]> = [
+-      ['1:1', 522], // round(458*1/1) + 64
+-      ['3:2', 369], // round(458*2/3) = 305, +64
+-      ['2:3', 751], // round(458*3/2) = 687, +64
++      ['1:1', 458], // round(458*1/1)
++      ['3:2', 305], // round(458*2/3)
++      ['2:3', 687], // round(458*3/2)
+     ]
+     for (const [aspect, expected] of cases) {
+-      expect(api.heightFor(aspect)).toBe(expected)
+-      const working = api.render({ phase: 'working', aspectRatio: aspect })
++      expect(api.heightFor(aspect, 0)).toBe(expected)
+       const done = api.render({ phase: 'done', aspectRatio: aspect, imageUrl: OWNED_IMAGE })
+-      const failed = api.render({ phase: 'failed', aspectRatio: aspect, reason: 'x' })
+-      expect(working.height).toBe(expected)
+       expect(done.height).toBe(expected)
+-      expect(failed.height).toBe(expected)
++      // 卡内除图片区外零占用 → 图片区高度 == 卡片总高
++      expect(done.html).toContain(`height:${expected}px`)
++    }
++  })
++
++  it('失败卡留出算得出来的文字区:高度 = 图片区 + failMeta', () => {
++    const api = card()
++    for (const [aspect, box] of [
++      ['1:1', 458],
++      ['3:2', 305],
++      ['2:3', 687],
++    ] as Array<[string, number]>) {
++      // 生图失败(无源图行)
++      const gen = api.render({ phase: 'failed', aspectRatio: aspect, reason: 'x' })
++      expect(gen.height).toBe(box + api.failMetaHeight)
++      expect(gen.html).toContain(`mivo-card__stage" style="height:${box}px`)
++
++      // 改图失败(多一行源图指代)→ 多留一行的高度
++      const edit = api.render({ phase: 'failed', mode: 'edit', aspectRatio: aspect, sourceLabel: 's', reason: 'x' })
++      expect(edit.height).toBe(box + api.failMetaWithSourceHeight)
++      expect(edit.height).toBeGreaterThan(gen.height)
+     }
+   })
+ 
+   it('未传画幅只在卡片布局上按 1:1 预留', () => {
+     const api = card()
+-    expect(api.heightFor(undefined)).toBe(522)
+-    expect(api.heightFor('auto')).toBe(522) // 非白名单值同样只影响卡片布局
+-    expect(api.render({ phase: 'working' }).height).toBe(522)
++    expect(api.heightFor(undefined, 0)).toBe(458)
++    expect(api.heightFor('auto', 0)).toBe(458) // 非白名单值同样只影响卡片布局
++    expect(api.render({ phase: 'done', imageUrl: OWNED_IMAGE }).height).toBe(458)
++  })
++
++  it('缺省 chrome 仍按固定文字区算(调用方不传时行为不变)', () => {
++    const api = card()
++    expect(api.heightFor('1:1')).toBe(458 + api.textBlockHeight)
++    expect(api.height(1, 1)).toBe(458 + api.textBlockHeight)
+   })
+ 
+   it('极端尺寸与边界被夹到 [120, 900]', () => {
+     const api = card()
+-    expect(api.height(1, 100)).toBe(api.maxHeight)
+-    expect(api.height(100, 1)).toBe(api.minHeight)
+-    expect(api.height(458, 56)).toBe(120) // 恰好下界
+-    expect(api.height(458, 836)).toBe(900) // 恰好上界
+-    expect(api.height(458, 57)).toBe(121)
+-    expect(api.height(458, 835)).toBe(899)
++    expect(api.height(1, 100, 0)).toBe(api.maxHeight)
++    expect(api.height(100, 1, 0)).toBe(api.minHeight)
++    expect(api.height(458, 120, 0)).toBe(120) // 恰好下界
++    expect(api.height(458, 900, 0)).toBe(900) // 恰好上界
++    expect(api.height(458, 119, 0)).toBe(120) // 低于下界被抬上来
++    expect(api.height(458, 901, 0)).toBe(900)
+     // 非法输入按 1:1 兜底,不抛错、不出界
+-    expect(api.height(0, 0)).toBe(522)
+-    expect(api.height(Number.NaN, Number.NaN)).toBe(522)
+-    expect(api.height(-5, -5)).toBe(522)
++    expect(api.height(0, 0, 0)).toBe(458)
++    expect(api.height(Number.NaN, Number.NaN, 0)).toBe(458)
++    expect(api.height(-5, -5, 0)).toBe(458)
++  })
++})
++
++describe('card 成功卡只有图', () => {
++  it('零文案:没有标题、没有提示词、没有副行、没有 meta 块', () => {
++    const api = card()
++    for (const locale of ['zh-CN', 'en', 'ja', 'ko']) {
++      const m = markup(api.render({ phase: 'done', locale, imageUrl: OWNED_IMAGE, prompt: '一只穿宇航服的柴犬' }).html)
++      expect(m).not.toContain('mivo-card__meta')
++      expect(m).not.toContain('mivo-card__title')
++      expect(m).not.toContain('mivo-card__sub')
++      expect(m).not.toContain('mivo-card__prompt')
++      // 提示词原文一个字都不进卡(它在宿主胶囊的调用参数里)
++      expect(m).not.toContain('柴犬')
++    }
++    // 成功卡没有任何可见文案 → 去掉本地化 alt(无障碍用,不可见)后四语种完全一致
++    const shapes = ['zh-CN', 'en', 'ja', 'ko'].map((locale) =>
++      markup(api.render({ phase: 'done', locale, imageUrl: OWNED_IMAGE }).html).replace(/alt="[^"]*"/g, 'alt=""'),
++    )
++    expect(new Set(shapes).size).toBe(1)
++    // alt 本身仍必须本地化(它是这张卡唯一的文字,给读屏用)
++    const alts = ['zh-CN', 'en', 'ja', 'ko'].map(
++      (locale) => api.render({ phase: 'done', locale, imageUrl: OWNED_IMAGE }).html.match(/alt="([^"]*)"/)?.[1],
++    )
++    expect(new Set(alts).size).toBe(4)
++  })
++
++  it('成功卡里恰好一个 img,且是 owned 地址', () => {
++    const api = card()
++    const done = api.render({ phase: 'done', imageUrl: OWNED_IMAGE })
++    expect((done.html.match(/<img/g) ?? []).length).toBe(1)
++    expect(done.html).toContain(`src="${OWNED_IMAGE}"`)
++    expect(done.hasImage).toBe(true)
++  })
++
++  it('终图用 object-fit:contain,不裁切作品', () => {
++    expect(card().render({ phase: 'done', imageUrl: OWNED_IMAGE }).html).toContain('object-fit:contain')
+   })
+ 
+-  it('图片区高度 = 总高 - 64 文字区', () => {
++  it('图片区不描边不铺底:让「只放图片本身」成立', () => {
+     const api = card()
+-    const done = api.render({ phase: 'done', aspectRatio: '3:2', imageUrl: OWNED_IMAGE })
+-    expect(done.html).toContain(`height:${369 - api.textBlockHeight}px`)
+-    expect(done.html).toContain(`height:${api.textBlockHeight}px`)
++    const css = styleBlock(api.render({ phase: 'done', imageUrl: OWNED_IMAGE }).html)
++    const stage = css.match(/\.mivo-card__stage\{([^}]*)\}/)?.[1] ?? ''
++    expect(stage).not.toContain('border:')
++    expect(stage).not.toContain('background')
++  })
++})
++
++describe('card 失败卡保留文字', () => {
++  it('标题 + 原因都在,并带错误样式', () => {
++    const api = card()
++    const m = markup(api.render({ phase: 'failed', locale: 'zh-CN', reason: '任务超时' }).html)
++    expect(m).toContain('mivo-card__meta')
++    expect(m).toContain('图片生成失败')
++    expect(m).toContain('任务超时')
++    expect(m).toContain('mivo-card__sub--error')
++    expect(m).toContain('mivo-card__void') // 没有产物 → 静态占位框
++  })
++
++  it('改图失败带源图指代,生图失败不带', () => {
++    const api = card()
++    const edit = markup(
++      api.render({ phase: 'failed', mode: 'edit', locale: 'zh-CN', sourceLabel: '梅西', reason: '超时' }).html,
++    )
++    expect(edit).toContain('图片修改失败')
++    expect(edit).toContain('源图: 梅西')
++
++    const gen = markup(api.render({ phase: 'failed', mode: 'generate', locale: 'zh-CN', sourceLabel: '梅西', reason: '超时' }).html)
++    expect(gen).toContain('图片生成失败')
++    expect(gen).not.toContain('源图')
++  })
++
++  it('文字区高度算得出来,且与 CSS 实际盒模型对账', () => {
++    const api = card()
++    const parts = api.failParts
++    // 常量本身必须等于各部分之和(改了某一项忘了改总高,这条就红)
++    expect(api.failMetaHeight).toBe(parts.padTop + parts.titleH + parts.subGap + parts.reasonH + parts.padBottom)
++    expect(api.failMetaWithSourceHeight).toBe(api.failMetaHeight + parts.subGap + parts.sourceH)
++
++    // CSS 侧的数值必须与常量一致(两边脱节只会表现为文字被裁,没有任何报错)
++    const css = styleBlock(api.render({ phase: 'failed', reason: 'r' }).html)
++    const meta = css.match(/\.mivo-card__meta\{([^}]*)\}/)?.[1] ?? ''
++    const title = css.match(/\.mivo-card__title\{([^}]*)\}/)?.[1] ?? ''
++    const sub = css.match(/\.mivo-card__sub\{([^}]*)\}/)?.[1] ?? ''
++    const source = css.match(/\.mivo-card__sub--source\{([^}]*)\}/)?.[1] ?? ''
++    const error = css.match(/\.mivo-card__sub--error\{([^}]*)\}/)?.[1] ?? ''
++    expect(meta).toContain(`padding:${parts.padTop}px 2px ${parts.padBottom}px`)
++    expect(title).toContain(`line-height:${parts.titleH}px`)
++    expect(sub).toContain(`margin:${parts.subGap}px 0 0`)
++    expect(source).toContain(`height:${parts.sourceH}px`)
++    expect(error).toContain(`height:${parts.reasonH}px`)
++  })
++
++  it('失败原因永远落在预留高度之内:源图锁单行、原因锁两行', () => {
++    const api = card()
++    const parts = api.failParts
++    const longSource = '很长的源图标题'.repeat(20)
++    const longReason = '失败原因非常长'.repeat(30)
++
++    // 源图行 nowrap:再长也只占一行,不会把下面的原因顶出可见区
++    const css = styleBlock(api.render({ phase: 'failed', mode: 'edit', sourceLabel: longSource, reason: longReason }).html)
++    expect(css.match(/\.mivo-card__sub--source\{([^}]*)\}/)?.[1] ?? '').toContain('white-space:nowrap')
++
++    // 三行(标题 + 源图 + 原因)所需高度 == 预留的带源图高度,一像素不差
++    const need = parts.padTop + parts.titleH + parts.subGap + parts.sourceH + parts.subGap + parts.reasonH + parts.padBottom
++    expect(need).toBe(api.failMetaWithSourceHeight)
++
++    const edit = api.render({ phase: 'failed', mode: 'edit', sourceLabel: longSource, reason: longReason })
++    expect(edit.html).toContain(`<div class="mivo-card__meta" style="height:${api.failMetaWithSourceHeight}px"`)
++    // 原因文案被截到上限(2 行装得下的量),而不是靠 overflow 把整行吞掉
++    expect(edit.html).toContain('…')
++    const shown = markup(edit.html).match(/mivo-card__sub--error">([^<]*)</)?.[1] ?? ''
++    expect(shown.length).toBeLessThanOrEqual(api.failReasonChars)
++    expect(shown.length).toBeGreaterThan(0)
++
++    // 生图失败没有源图行 → 用不带源图的那档高度,不留多余空白
++    const gen = api.render({ phase: 'failed', mode: 'generate', reason: longReason })
++    expect(gen.html).toContain(`<div class="mivo-card__meta" style="height:${api.failMetaHeight}px"`)
++    expect(api.failMetaHeight).toBeLessThan(api.failMetaWithSourceHeight)
++  })
++
++  it('长文案失败卡的总高仍在 [120, 900] 内', () => {
++    const api = card()
++    for (const aspect of ['1:1', '3:2', '2:3']) {
++      const view = api.render({
++        phase: 'failed',
++        mode: 'edit',
++        aspectRatio: aspect,
++        sourceLabel: 'x'.repeat(200),
++        reason: 'y'.repeat(200),
++      })
++      expect(view.height).toBeGreaterThanOrEqual(api.minHeight)
++      expect(view.height).toBeLessThanOrEqual(api.maxHeight)
++      // 图片区不会被文字区挤成负数
++      const stageH = Number(view.html.match(/mivo-card__stage" style="height:(\d+)px/)?.[1])
++      expect(stageH).toBeGreaterThan(0)
++    }
++  })
++
++  it('失败文案四语种正确,未知 locale 英文兜底', () => {
++    const api = card()
++    const fail = (locale: string, mode: 'generate' | 'edit' = 'generate'): string =>
++      api.render({ phase: 'failed', mode, locale, reason: 'r' }).html
++    expect(fail('zh-CN')).toContain('图片生成失败')
++    expect(fail('en')).toContain('Image generation failed')
++    expect(fail('ja')).toContain('画像の生成に失敗しました')
++    expect(fail('ko')).toContain('이미지 생성에 실패했습니다')
++    expect(fail('zh-CN', 'edit')).toContain('图片修改失败')
++    expect(fail('ko', 'edit')).toContain('이미지 업데이트에 실패했습니다')
++    for (const unknown of ['de', 'zh-TW', 'fr-FR', '', 'not-a-locale']) {
++      expect(api.localeKey(unknown)).toBe('en')
++      expect(fail(unknown)).toContain('Image generation failed')
++    }
+   })
+ })
+ 
+@@ -77,29 +248,29 @@ describe('card 安全契约', () => {
+   it('零脚本、零事件属性、零危险 URL', () => {
+     const api = card()
+     const views = [
+-      api.render({ phase: 'working', prompt: 'p' }),
+-      api.render({ phase: 'done', imageUrl: OWNED_IMAGE, prompt: 'p' }),
+-      api.render({ phase: 'failed', reason: 'r', mode: 'edit' }),
++      api.render({ phase: 'done', imageUrl: OWNED_IMAGE }),
++      api.render({ phase: 'failed', reason: 'r', mode: 'edit', sourceLabel: 's' }),
+     ]
+     for (const view of views) {
+       expect(view.html).not.toMatch(/<script/i)
+-      expect(view.html).not.toMatch(/<iframe|<svg|<object|<embed|<form|<input/i)
++      expect(view.html).not.toMatch(/<iframe|<svg|<object|<embed|<form|<input|<details|<summary|<button/i)
+       expect(view.html).not.toMatch(/\son[a-z]+\s*=/i)
+       expect(view.html).not.toMatch(/javascript:|data:|vbscript:|blob:/i)
+       expect(view.html).not.toMatch(/https?:\/\//i)
+       expect(view.html).not.toMatch(/url\(/i)
++      expect(view.html).not.toContain('data-ghost-action')
+       expect(view.html.length).toBeLessThan(api.maxBytes)
+     }
+   })
+ 
+-  it('动态文本(prompt / source / error)全部 escape', () => {
++  it('动态文本(source / error)全部 escape', () => {
+     const api = card()
+     const attack = '<img src=x onerror="alert(1)"> & "quoted" \'tick\''
+-    const prompt = api.render({ phase: 'done', imageUrl: OWNED_IMAGE, prompt: attack })
+-    const source = api.render({ phase: 'done', mode: 'edit', imageUrl: OWNED_IMAGE, sourceLabel: attack })
+-    const error = api.render({ phase: 'failed', reason: attack })
+-
+-    for (const view of [prompt, source, error]) {
++    const views = [
++      api.render({ phase: 'failed', reason: attack }),
++      api.render({ phase: 'failed', mode: 'edit', sourceLabel: attack, reason: attack }),
++    ]
++    for (const view of views) {
+       expect(view.html).not.toContain(attack) // 原文一个字符都没原样落地
+       expect(view.html).not.toContain('<img src=x')
+       expect(view.html).not.toMatch(/on[a-z]+\s*=\s*["'][^&]/i) // 没有闭合成真事件属性
+@@ -125,70 +296,45 @@ describe('card 安全契约', () => {
+       const view = api.render({ phase: 'done', imageUrl: bad })
+       expect(view.html).not.toContain('<img')
+       expect(markup(view.html)).toContain('mivo-card__void') // 退回静态占位框,卡片仍然出得来
+-      expect(markup(view.html)).not.toContain('mivo-card__pulse')
++      expect(view.hasImage).toBe(false)
+     }
+   })
+ 
+-  it('动画只动 transform / opacity,keyframes 无引号,CSS 无 !important', () => {
++  it('CSS 里一条动画都没有,也没有 !important', () => {
+     const api = card()
+-    const html = api.render({ phase: 'working' }).html
+-    const frames = keyframesBody(html)
+-
+-    expect(frames).toContain('opacity')
+-    expect(frames).toContain('transform')
+-    expect(frames).not.toMatch(/['"]/)
+-    expect(frames).not.toMatch(/\\/)
+-    // keyframes 体内除 opacity/transform 外不许出现其它属性声明
+-    const declarations = frames.match(/[a-z-]+\s*:/g) || []
+-    for (const declaration of declarations) {
+-      expect(['opacity:', 'transform:']).toContain(declaration.replace(/\s+/g, ''))
++    for (const view of [
++      api.render({ phase: 'done', imageUrl: OWNED_IMAGE }),
++      api.render({ phase: 'failed', reason: 'boom' }),
++    ]) {
++      // 过程态整卡不发 → 卡片永远是静止终版。留着动画就是留一份生产永不产生的形状。
++      expect(view.html).not.toMatch(/@[-a-z]*keyframes/i)
++      expect(view.html).not.toMatch(/animation\s*:/i)
++      expect(markup(view.html)).not.toContain('mivo-card__pulse')
++      expect(view.html).not.toContain('!important')
+     }
+-    expect(html).not.toContain('!important')
+   })
+ })
+ 
+-describe('card 主题与 i18n', () => {
+-  it('颜色走宿主主题变量且带字面 fallback', () => {
+-    const html = card().render({ phase: 'done', imageUrl: OWNED_IMAGE }).html
+-    for (const variable of ['--surface', '--text-primary', '--border-default']) {
+-      expect(html).toMatch(new RegExp(`var\\(${variable},\\s*#[0-9a-f]{3,8}\\)`, 'i'))
+-    }
+-  })
+-
+-  it('zh-CN / en / ja / ko 各有正确文案,未知 locale 英文兜底', () => {
++describe('card 主题与 i18n 机制', () => {
++  it('用到的颜色都走宿主主题变量且带字面 fallback', () => {
+     const api = card()
+-    const titles = ['zh-CN', 'en', 'ja', 'ko'].map(
+-      (locale) => api.render({ phase: 'working', locale }).html,
+-    )
+-    expect(titles[0]).toContain('正在生成图片')
+-    expect(titles[1]).toContain('Generating image')
+-    expect(titles[2]).toContain('画像を生成中')
+-    expect(titles[3]).toContain('이미지 생성 중')
+-    expect(new Set(titles).size).toBe(4)
+-
+-    for (const unknown of ['de', 'zh-TW', 'fr-FR', '', 'not-a-locale']) {
+-      expect(api.localeKey(unknown)).toBe('en')
+-      expect(api.render({ phase: 'working', locale: unknown }).html).toContain('Generating image')
++    const html = api.render({ phase: 'failed', reason: 'x' }).html
++    for (const variable of ['--text-primary', '--border-default']) {
++      expect(html).toMatch(new RegExp(`var\\(${variable},\\s*#[0-9a-f]{3,8}\\)`, 'i'))
+     }
++    // 裸色值(非 var 回退位)一律不许出现:主题切换时会瞎
++    const css = styleBlock(html).replace(/var\([^)]*\)/g, '')
++    expect(css).not.toMatch(/#[0-9a-f]{3,8}/i)
+   })
+ 
+-  it('生成 / 修改 / 失败三态文案与 locale 联动', () => {
++  it('缩略图 alt 本地化', () => {
+     const api = card()
+-    expect(api.render({ phase: 'done', mode: 'generate', locale: 'ja', imageUrl: OWNED_IMAGE }).html).toContain(
+-      '画像を生成しました',
++    expect(api.render({ phase: 'done', locale: 'zh-CN', imageUrl: OWNED_IMAGE }).html).toContain(
++      'alt="已放到 Mivo 画布上的图片"',
+     )
+-    expect(api.render({ phase: 'done', mode: 'edit', locale: 'ko', imageUrl: OWNED_IMAGE }).html).toContain(
+-      '이미지를 업데이트했습니다',
++    expect(api.render({ phase: 'done', locale: 'ja', imageUrl: OWNED_IMAGE }).html).toContain(
++      'alt="Mivo キャンバスに配置された画像"',
+     )
+-    expect(api.render({ phase: 'failed', mode: 'edit', locale: 'zh-CN', reason: '超时' }).html).toContain('图片修改失败')
+-  })
+-
+-  it('缩略图 alt 与占位框 aria-label 都本地化', () => {
+-    const api = card()
+-    const zh = api.render({ phase: 'done', locale: 'zh-CN', imageUrl: OWNED_IMAGE }).html
+-    expect(zh).toContain('alt="已放到 Mivo 画布上的图片"')
+-    const ja = api.render({ phase: 'working', locale: 'ja' }).html
+-    expect(ja).toContain('aria-label="画像を生成しています"')
+   })
+ 
+   it('locale 取自宿主 /app-context,不读 navigator', async () => {
+@@ -196,39 +342,31 @@ describe('card 主题与 i18n', () => {
+     await flushMicrotasks()
+     expect(brain.handles.card.locale()).toBe('ko')
+     expect(brain.hostRequests).toEqual([{ kind: 'app-context' }])
+-    // 缺省 locale 时卡片直接用宿主语言
+-    expect(brain.handles.card.render({ phase: 'working' }).html).toContain('이미지 생성 중')
++    // 缺省 locale 时卡片直接用宿主语言(失败卡才有文案可验)
++    expect(brain.handles.card.render({ phase: 'failed', reason: 'r' }).html).toContain('이미지 생성에 실패했습니다')
+ 
+     // 宿主切语言 → 事件里带 context,卡片文案跟着换
+     brain.emitHostMessage({ type: 'host-context-changed', ok: true, context: { region: 'cn', locale: 'zh-CN' } })
+     await flushMicrotasks()
+     expect(brain.handles.card.locale()).toBe('zh-CN')
+-    expect(brain.handles.card.render({ phase: 'working' }).html).toContain('正在生成图片')
+-  })
+-})
+-
+-describe('card 动画只属于过程态', () => {
+-  it('working 用呼吸占位,done / failed 用静态占位,终版无动画类残留', () => {
+-    const api = card()
+-    expect(markup(api.render({ phase: 'working' }).html)).toContain('mivo-card__pulse')
+-    for (const view of [
+-      api.render({ phase: 'done', imageUrl: OWNED_IMAGE }),
+-      api.render({ phase: 'failed', reason: 'boom' }),
+-    ]) {
+-      expect(markup(view.html)).not.toContain('mivo-card__pulse')
+-    }
++    expect(brain.handles.card.render({ phase: 'failed', reason: 'r' }).html).toContain('图片生成失败')
+   })
+ })
+ 
+ describe('card 宿主 state 语义', () => {
+-  it('working → state working;done / failed → state done', () => {
++  it('只有终版:成功与失败的 state 都是 done', () => {
+     const api = card()
+-    expect(api.render({ phase: 'working' }).state).toBe('working')
+     expect(api.render({ phase: 'done', imageUrl: OWNED_IMAGE }).state).toBe('done')
+     expect(api.render({ phase: 'failed', reason: 'x' }).state).toBe('done')
+   })
+ 
+-  it('终图用 object-fit:contain,不裁切作品', () => {
+-    expect(card().render({ phase: 'done', imageUrl: OWNED_IMAGE }).html).toContain('object-fit:contain')
++  it('未知 / 缺省 phase 落到成功态,不会渲染出过程卡', () => {
++    const api = card()
++    for (const phase of [undefined, 'working', 'whatever'] as unknown[]) {
++      const view = api.render({ phase, imageUrl: OWNED_IMAGE } as never)
++      expect(view.state).toBe('done')
++      expect(view.phase).toBe('done')
++      expect(markup(view.html)).not.toContain('mivo-card__meta')
++    }
+   })
+ })
+diff --git a/cindyplugin/src/__tests__/cardWiring.test.ts b/cindyplugin/src/__tests__/cardWiring.test.ts
+index a3dcfa6e..b3728696 100644
+--- a/cindyplugin/src/__tests__/cardWiring.test.ts
++++ b/cindyplugin/src/__tests__/cardWiring.test.ts
+@@ -132,18 +132,18 @@ const runTool = async (scenario: Scenario): Promise<RunResult> => {
+ const markup = (html: string | undefined): string => (html ?? '').split('</style>')[1] ?? ''
+ 
+ describe('T3 canvas_generate_image 接卡', () => {
+-  it('消息序列 = working 卡 → done 卡 → tool-result(ok:true),done 复用同一 cardId', async () => {
++  it('消息序列 = 只发终版卡 → tool-result(ok:true),过程态一版都不发', async () => {
+     const run = await runTool({ tool: 'canvas_generate_image', panelReply: { ok: true, status: 'ready', nodeId: 'n1' }, withMedia: true })
+ 
+     // 心跳与 #299 终态通知都是旁路消息,不属于卡片协议序列(通知本身的"恰一次 +
+     // 顺序"由 notifyWiring.test.ts 断言),这里只看 card-update / tool-result 的顺序。
+     const protocol = run.sent.filter((m) => m.type !== 'tool-progress' && m.type !== 'notify')
++    // 生成期间不出卡(聊天里只留宿主插件胶囊在转圈),所以卡片总共只有一版终版。
+     expect(protocol.map((m) => `${m.type}:${m.state ?? m.ok}`)).toEqual([
+-      'card-update:working',
+       'card-update:done',
+       'tool-result:true',
+     ])
+-    expect(run.cards.map((m) => m.callId)).toEqual(['call-x1', 'call-x1'])
++    expect(run.cards.map((m) => m.callId)).toEqual(['call-x1'])
+   })
+ 
+   it('done 卡含唯一 owned cindy-media 缩略图 + prompt 摘要', async () => {
+@@ -153,29 +153,29 @@ describe('T3 canvas_generate_image 接卡', () => {
+       withMedia: true,
+       locale: 'zh-CN',
+     })
+-    const done = run.cards[1]
++    const done = run.cards[0]
+ 
+     expect((done.html ?? '').match(/<img/g) ?? []).toHaveLength(1)
+     expect(done.html).toContain(`src="${IMAGE_URL}"`)
+-    expect(done.html).toContain('图片已生成')
+-    expect(done.html).toContain('提示词: ')
+-    expect(done.html).toContain('柴犬') // 卡内展示摘要(诊断日志侧才不许出现)
+-    expect(markup(done.html)).not.toContain('mivo-card__pulse')
++    // 成功卡零文案:标题、提示词都不进卡(提示词在宿主胶囊的调用参数里)
++    expect(done.html).not.toContain('图片已生成')
++    expect(done.html).not.toContain('柴犬')
++    expect(markup(done.html)).not.toContain('mivo-card__meta')
+   })
+ 
+-  it('working / done 同高,首帧即最终高度', async () => {
++  it('终版卡高度 = 画幅box(卡内除图片区外零占用)', async () => {
+     const run = await runTool({
+       tool: 'canvas_generate_image',
+       panelReply: { ok: true, status: 'ready', nodeId: 'n1' },
+       withMedia: true,
+       args: { aspectRatio: '3:2' },
+     })
+-    // 数字不写死:从 heightFor(aspect) 取,常量改了测试跟着走。
++    // 数字不写死:从 heightFor(aspect, chrome) 取,常量改了测试跟着走。
+     const api = run.brain.handles.card
+-    const expected = api.heightFor('3:2')
+-    expect(expected).toBe(369)
++    const expected = api.heightFor('3:2', 0)
++    expect(expected).toBe(305) // round(458*2/3),成功卡不留文字区
++    expect(run.cards).toHaveLength(1)
+     expect(run.cards[0].height).toBe(expected)
+-    expect(run.cards[1].height).toBe(expected)
+   })
+ 
+   it('交卷带非空 xdt_image_urls、身份与卡内缩略图一致、xdt_images_in_card:true', async () => {
+@@ -184,7 +184,7 @@ describe('T3 canvas_generate_image 接卡', () => {
+ 
+     expect(result.xdt_image_urls).toEqual([IMAGE_URL])
+     expect(result.xdt_images_in_card).toBe(true)
+-    expect(run.cards[1].html).toContain(String((result.xdt_image_urls as string[])[0]))
++    expect(run.cards[0].html).toContain(String((result.xdt_image_urls as string[])[0]))
+     // 同一调用画卡不需要回锚
+     expect(result.xdt_anchor_card_id).toBeUndefined()
+   })
+@@ -197,6 +197,34 @@ describe('T3 canvas_generate_image 接卡', () => {
+     expect(result.xdt_image_urls).toBeUndefined()
+     expect(run.toolResult?.ok).toBe(true)
+   })
++
++  it('成功但取不到产物地址 → 一版卡都不发,不出「宣称成功的空白卡」', async () => {
++    // 成功卡零文案 ⇒ 没有图就没有卡:否则用户看到的是透明区 + 灰圆点、却 state:done
++    // 的空壳(lastGenByCallId 上限 16 条 FIFO,并发多轮生成真能把在途那条挤掉)。
++    const run = await runTool({ tool: 'canvas_generate_image', panelReply: { ok: true, status: 'ready', nodeId: 'n1' }, withMedia: false })
++
++    expect(run.cards).toHaveLength(0)
++    expect(run.toolResult?.ok).toBe(true) // 图确实进了画布,交卷仍是成功
++    // 不发卡这件事必须留痕,不能静默
++    const spy = attachPanelBridge(run.brain).spy
++    expect(spy.find('card 终版未发送: 成功但取不到本意识名下产物地址')).toHaveLength(1)
++  })
++
++  it('改图路径同样只发一版终版卡,且 state=done', async () => {
++    // 门禁的字符串排除只覆盖 phase:'working' 写法;这条从**行为**上钉住 edit 分支
++    // 的卡片总数与 state,不依赖任何语法形态。
++    const run = await runTool({
++      tool: 'canvas_edit_image',
++      panelReply: { ok: true, status: 'ready', nodeId: 'r1' },
++      withMedia: true,
++      args: { nodeId: 'node-1' },
++    })
++
++    expect(run.cards).toHaveLength(1)
++    expect(run.cards[0].state).toBe('done')
++    expect(run.cards[0].html).toContain(`src="${IMAGE_URL}"`)
++    expect(markup(run.cards[0].html)).not.toContain('mivo-card__meta')
++  })
+ })
+ 
+ describe('T5 失败路径全部收敛为 done 失败卡', () => {
+@@ -261,8 +289,12 @@ describe('T5 失败路径全部收敛为 done 失败卡', () => {
+     it(`${group.name}:一次 done 失败卡 + 交卷 ok:false(${group.errorCode})`, async () => {
+       const run = await runTool(group.scenario)
+ 
+-      const done = run.cards.filter((card) => card.state === 'done')
+-      expect(done).toHaveLength(1)
++      // 卡片**总数**必须是 1。只 filter(state==='done') 会让「失败分支额外直发一张
++      // working 卡」完全漏检:working+done 两张时 done 子集仍是 1,断言照样绿。
++      // 这条覆盖 generate / edit 各 4 档失败,全部经 failWithCard。
++      expect(run.cards).toHaveLength(1)
++      expect(run.cards.map((card) => card.state)).toEqual(['done'])
++      const done = run.cards
+       expect(markup(done[0].html)).not.toContain('mivo-card__pulse') // 无 working 动画类残留
+       expect(done[0].html).not.toContain('<img') // 失败卡不摆图
+       expect(done[0].html).toContain(group.copy)
+@@ -516,7 +548,7 @@ describe('T6 card 三路径日志', () => {
+     const okRun = await runTool({ tool: 'canvas_generate_image', panelReply: { ok: true, status: 'ready', nodeId: 'n1' }, withMedia: true })
+     const okSpy = attachPanelBridge(okRun.brain).spy
+     expect(okSpy.find('card 版本已发出').every((call) => call.level === 'log')).toBe(true)
+-    expect(okSpy.find('card 版本已发出')).toHaveLength(2) // working + done
++    expect(okSpy.find('card 版本已发出')).toHaveLength(1) // 只有终版(过程态不发卡)
+ 
+     // 宿主拒绝
+     const rejected = loadBrain({ panelPresent: () => false, send: () => ({ ok: false, message: 'card rejected' }) })
+diff --git a/cindyplugin/src/__tests__/deferPresence.test.ts b/cindyplugin/src/__tests__/deferPresence.test.ts
+index aa06ce92..efae033c 100644
+--- a/cindyplugin/src/__tests__/deferPresence.test.ts
++++ b/cindyplugin/src/__tests__/deferPresence.test.ts
+@@ -268,6 +268,14 @@ describe('生成类 26 分钟悬挂已修(§2.1 结论 B)', () => {
+     // 心跳一次都没发:回合根本没被吊住
+     const progress = brain.cindySent.filter((item) => (item as { type?: string }).type === 'tool-progress')
+     expect(progress).toEqual([])
++    // 过程态一版都不发:这条 preflight 早退分支同样只许有一张终版失败卡。
++    // 不能只看末位/子集 —— 那样前面塞几张过程卡都观察不到(同形漏口已在
++    // PANEL_NOT_READY 与失败矩阵上各栽过一次)。
++    const cards = brain.cindySent.filter((item) => (item as { type?: string }).type === 'card-update') as Array<{
++      state: string
++    }>
++    expect(cards).toHaveLength(1)
++    expect(cards.map((card) => card.state)).toEqual(['done'])
+   })
+ 
+   it('面板在但没就绪:给 PANEL_NOT_READY,失败卡用「正在载入」文案', async () => {
+@@ -290,7 +298,10 @@ describe('生成类 26 分钟悬挂已修(§2.1 结论 B)', () => {
+       state: string
+       html: string
+     }>
+-    const finalCard = cards.at(-1)!
++    // 不能只看 cards.at(-1):前面再塞几张过程卡也看不见。过程态一版都不发,
++    // 所以这条失败路径的卡片总数必须恰好是 1。
++    expect(cards).toHaveLength(1)
++    const finalCard = cards[0]
+     expect(finalCard.state).toBe('done')
+     expect(finalCard.html).toContain('面板正在载入')
+   })
+diff --git a/cindyplugin/src/__tests__/notifyWiring.test.ts b/cindyplugin/src/__tests__/notifyWiring.test.ts
+index d0ab341f..1a51b004 100644
+--- a/cindyplugin/src/__tests__/notifyWiring.test.ts
++++ b/cindyplugin/src/__tests__/notifyWiring.test.ts
+@@ -46,6 +46,12 @@ type Scenario = {
+   panelPresent?: () => boolean
+   /** 挂一个真面板桥再跑(用于测真实 presence 三态)。 */
+   attachBridgeFirst?: { heartbeat: boolean }
++  /**
++   * 派活**之前**先把假时钟推这么多毫秒 —— 用来显式地把面板心跳推过 presence TTL。
++   * 以前这条 stale 用例是靠「卡片限速器等 1 秒」顺带把心跳拖老的;过程卡取消后那次
++   * 等待没了,前提就不成立。所以把前提写明,不再依赖别处的副作用。
++   */
++  advanceBeforeCall?: number
+   /** 面板回执的那一刻回调(用来在任务执行期间翻转 presence,制造竞态)。 */
+   onPanelReply?: () => void
+   /** 让宿主出口在 notify 上抛错。 */
+@@ -126,6 +132,11 @@ const runTool = async (scenario: Scenario): Promise<RunResult> => {
+     await flushMicrotasks()
+   }
+ 
++  if (scenario.advanceBeforeCall) {
++    brain.clock.advance(scenario.advanceBeforeCall)
++    await flushMicrotasks()
++  }
++
+   const pending = brain.handles.handleToolCall({
+     tool,
+     callId,
+@@ -235,6 +246,8 @@ describe('N2 终态 presence 触发策略', () => {
+ 
+     const stale = await runTool({
+       attachBridgeFirst: { heartbeat: false }, // 面板还在监听,但 presence 心跳停了
++      // 心跳停了还得**过 TTL** 才算 stale:显式推过 30s,不靠任何副作用凑时间
++      advanceBeforeCall: 31_000,
+       panelReply: { ok: true, status: 'ready', nodeId: 'n1' },
+       withMedia: true,
+       locale: 'zh-CN',
+diff --git a/scripts/verify-debug-logging.mjs b/scripts/verify-debug-logging.mjs
+index 3a278789..c07bfa12 100644
+--- a/scripts/verify-debug-logging.mjs
++++ b/scripts/verify-debug-logging.mjs
+@@ -29,6 +29,12 @@ const requireIncludes = (source, needle, label) => {
+   }
+ }
+ 
++const requireExcludes = (source, needle, label) => {
++  if (source.includes(needle)) {
++    throw new Error(`${label} should NOT include ${needle}`)
++  }
++}
++
+ const requireLoggerLevels = (source, label) => {
+   for (const call of ['debugLogger.log', 'debugLogger.warn', 'debugLogger.error']) {
+     requireIncludes(source, call, label)
+@@ -681,8 +687,13 @@ checks.push(async () => {
+   }
+ })
+ 
+-// #298 T3/T5/T6:生图/改图接卡。失败必须收敛成一张 done 失败卡,否则用户只剩一张
+-// 永远呼吸的过程卡 —— 这条和日志一样是「可见反馈」契约,门禁一并钉住。
++// #298 T3/T5/T6:生图/改图接卡。终态必须收敛成一张卡(成功或失败)—— 这条和日志一样
++// 是「可见反馈」契约,门禁一并钉住。
++//
++// 本轮反向:**过程卡整卡不发**。原门禁钉的是「必须有 working 卡」,防的是
++// 「用户只剩一张永远呼吸的过程卡」;现在过程态一版都不发(生成期间由宿主自己的插件
++// 胶囊转圈提供反馈),那个故障模式结构上不存在了,所以这里改成钉「不许出现 working
++// 卡发送点」—— 契约的实质(终态必须出卡、且必须在交卷前 await 发出)一条没松。
+ checks.push(async () => {
+   const brain = await read('cindyplugin/main.js')
+   const brainCompact = compact(brain)
+@@ -691,8 +702,155 @@ checks.push(async () => {
+   for (const tool of ['canvas_generate_image', 'canvas_edit_image']) {
+     requireIncludes(brainCompact, `${tool}:{`, `Plugin brain card spec for ${tool}`)
+   }
+-  // 过程卡 → 失败卡 → 终版卡三条路径的实际调用点
+-  requireIncludes(brainCompact, "cardSend(cardId,renderCard(Object.assign({phase:'working'}", 'Plugin brain working card')
++  // 过程卡:一版都不许发(任何 phase:'working' 的渲染/发送点都算违约)
++  requireExcludes(brainCompact, "phase:'working'", 'Plugin brain must not emit a working card')
++  requireExcludes(brainCompact, 'phase:"working"', 'Plugin brain must not emit a working card')
++  // 上面两条是**语法**排除,绕过方式明显(直接 cardSend(cardId,{state:'working'})、或把
++  // state 放进变量)。这里再钉住唯一的卡片生产者:renderCard 的返回 state 是字面量
++  // 'done',没有任何分支能产出 working。
++  // 注:**不能**简单地 requireExcludes("state:'working'") —— main.js 里有一段描述宿主
++  // 协议的注释原文含这个字面量(compact() 不剥注释),那样加只会立刻假阳性。
++  // 行为侧的兜底(generate / edit 两条路径各自"恰好一版终版卡且 state=done")由
++  // cardWiring.test.ts 断言,不依赖任何语法形态。
++  requireIncludes(brainCompact, "state:'done',height,html,", 'Plugin brain card version state is a hardcoded done')
++  // ── 过程卡的结构性收口(绑真实出口调用图,不是绑字面量拼写)──
++  //
++  // 这里钉五条腿 + 一条如实声明的残留。**上一版只钉了第 1 条,注释却写成「源码层不可能」——那是全称承诺
++  // 大于实际检查**:直接 `hostSend({type:'card-update',state:'working',…})` 或直接
++  // `cardDeliver(cardId,{state:'working'})` 都不增加 cardSend 计数,能整条绕过。
++  // 本轮把出口本身钉上,并把仍未覆盖的残留写在下面(第 5 段),不再放全称话。
++  //
++  const brainAst = parseJs(brain, 'main.js')
++
++  /** callee 是这个名字的真实调用(含 `f?.()` optional call);函数声明不是 CallExpression。 */
++  const callsTo = (name) => {
++    const hits = []
++    walkAst(brainAst, (node) => {
++      if (!ts.isCallExpression(node)) return
++      const callee = unwrapParens(node.expression)
++      if (callee && ts.isIdentifier(callee) && callee.text === name) hits.push(node)
++    })
++    return hits
++  }
++
++  // 1) 没有任何对 cardSend 的直呼。**必须走 AST 而不是 compact 正则**:
++  //    `cardSend?.(…)`(optional call,cardSend 已定义所以会真的执行)与
++  //    `cardSend /* gap */ (…)` 都是合法 JS 的同一个调用,但 compact 后都不含
++  //    `cardSend(` —— 正则版计数仍是 1,整条漏过。AST 把两者都解析为 callee 是
++  //    identifier cardSend 的 CallExpression。
++  const cardSendCalls = callsTo('cardSend')
++  if (cardSendCalls.length !== 0) {
++    const where = cardSendCalls.map((call) => `main.js:${lineOf(brainAst, call)}`).join(', ')
++    throw new Error(
++      `Plugin brain must not call cardSend directly (found ${cardSendCalls.length} at ${where}) — every card has to go out through cardFinal`,
++    )
++  }
++  const deliverFn = functionNode(brainAst, 'cardDeliver', 'Plugin brain card egress')
++  const runPendingFn = functionNode(brainAst, 'cardRunPending', 'Plugin brain card scheduler')
++
++  // 2) 构造 `type:'card-update'` 载荷的地方全仓恰好一处,且必须落在 cardDeliver 内。
++  //    这条直接封掉「在任意失败分支里直接 hostSend 一个 card-update」的回归路径。
++  const cardUpdatePayloads = []
++  walkAst(brainAst, (node) => {
++    if (!ts.isObjectLiteralExpression(node)) return
++    const isCardUpdate = node.properties.some(
++      (member) =>
++        ts.isPropertyAssignment(member) &&
++        staticPropName(member) === 'type' &&
++        staticStringOf(member.initializer) === 'card-update',
++    )
++    if (isCardUpdate) cardUpdatePayloads.push(node)
++  })
++  if (cardUpdatePayloads.length !== 1) {
++    throw new Error(
++      `Plugin brain should build the card-update payload in exactly one place (found ${cardUpdatePayloads.length}) — a second construction site can emit a working card that bypasses cardSend/cardFinal`,
++    )
++  }
++  if (!isWithin(cardUpdatePayloads[0], deliverFn)) {
++    throw new Error(
++      `Plugin brain card-update payload at main.js:${lineOf(brainAst, cardUpdatePayloads[0])} must live inside cardDeliver (the single host egress)`,
++    )
++  }
++
++  // 3) cardDeliver 只许被 cardRunPending 调用,且恰好一处 —— 封掉「绕过限速器与
++  //    finalSent 关窗、直接投递一个自造 version」。
++  const deliverCalls = callsTo('cardDeliver')
++  if (deliverCalls.length !== 1 || !isWithin(deliverCalls[0], runPendingFn)) {
++    const where = deliverCalls.map((call) => `main.js:${lineOf(brainAst, call)}`).join(', ') || 'none'
++    throw new Error(
++      `Plugin brain should call cardDeliver exactly once, from cardRunPending (found ${deliverCalls.length} at ${where})`,
++    )
++  }
++
++  // 4) 宿主出口调用点数量登记:新增任何 hostSend 都必须在这里显式加数,顺带看见
++  //    上面三条。这条挡的是「换写法」——比如动态拼出 'card-' + 'update' 的类型串,
++  //    第 2 条的静态字面量枚举看不见,但它绕不开「多一个出口调用点」。
++  const hostSendCalls = callsTo('hostSend')
++  // 这个数字**依赖基线**:main 上是 7,带 deposit 出口的分支上会多一个。改动数量时要
++  // 顺带确认新出口不是 card-update(第 2 条已单独钉载荷构造点)。
++  const HOST_SEND_CALL_SITES = 7
++  if (hostSendCalls.length !== HOST_SEND_CALL_SITES) {
++    throw new Error(
++      `Plugin brain hostSend call sites changed (expected ${HOST_SEND_CALL_SITES}, found ${hostSendCalls.length}) — register the new host egress here on purpose, then re-check the card-update rules above`,
++    )
++  }
++
++  // 5) cardFinal 的调用点:恰好现有 2 处,都在 runCardBackedGeneration 内、都被 await,
++  //    且第二参数(version)必须来自 renderCard —— 直接 `cardFinal(cardId,{state:'working'})`
++  //    不改变 card-update / cardDeliver / hostSend 任何计数(cardFinal 自己不校验 state,
++  //    cardRunPending 也照样投递),所以前四条腿全看不见它。
++  const genFn = functionNode(brainAst, 'runCardBackedGeneration', 'Plugin brain card generation kernel')
++  const finalCalls = callsTo('cardFinal')
++  const EXPECTED_FINAL_CALLS = 2
++  if (finalCalls.length !== EXPECTED_FINAL_CALLS) {
++    const where = finalCalls.map((call) => `main.js:${lineOf(brainAst, call)}`).join(', ') || 'none'
++    throw new Error(
++      `Plugin brain should call cardFinal exactly ${EXPECTED_FINAL_CALLS} times (found ${finalCalls.length} at ${where}) — a new call site can push a hand-made working version straight to the host`,
++    )
++  }
++  /** version 实参是否可静态判定为 renderCard 的产物(允许两种现有形状)。 */
++  const versionFromRenderCard = (call) => {
++    const arg = unwrapParens(call.arguments[1])
++    if (!arg) return false
++    // 形状一:直接 cardFinal(cardId, renderCard(...))
++    if (ts.isCallExpression(arg)) {
++      const callee = unwrapParens(arg.expression)
++      return Boolean(callee && ts.isIdentifier(callee) && callee.text === 'renderCard')
++    }
++    // 形状二:const done = renderCard(...);  cardFinal(cardId, done)
++    if (!ts.isIdentifier(arg)) return false
++    let ok = false
++    walkAst(genFn, (node) => {
++      if (!ts.isVariableDeclaration(node) || !ts.isIdentifier(node.name)) return
++      if (node.name.text !== arg.text || !node.initializer) return
++      const init = unwrapParens(node.initializer)
++      const callee = init && ts.isCallExpression(init) ? unwrapParens(init.expression) : null
++      if (callee && ts.isIdentifier(callee) && callee.text === 'renderCard') ok = true
++    })
++    return ok
++  }
++  for (const call of finalCalls) {
++    const at = `main.js:${lineOf(brainAst, call)}`
++    if (!isWithin(call, genFn)) {
++      throw new Error(`Plugin brain cardFinal at ${at} must live inside runCardBackedGeneration`)
++    }
++    if (!call.parent || !ts.isAwaitExpression(call.parent)) {
++      throw new Error(
++        `Plugin brain cardFinal at ${at} must be awaited (the host only keeps a 10s grace window after tool-result)`,
++      )
++    }
++    if (!versionFromRenderCard(call)) {
++      throw new Error(
++        `Plugin brain cardFinal at ${at} must pass a version produced by renderCard (its state is the hardcoded done) — a hand-made version object can carry state:'working'`,
++      )
++    }
++  }
++
++  // 6) 仍未被覆盖的残留(如实写出,不当成已保证):在**现有**某个 hostSend 调用点上
++  //    把它原本的载荷类型动态改成 card-update(既不新增调用点、也不留静态字面量),
++  //    第 2/4 条都看不见。这种改动会同时破坏那个出口原本的用途,行为测试会红,
++  //    但门禁本身对它没有静态判据。
++  // 失败卡 → 终版卡两条终态路径的实际调用点
+   requireIncludes(brainCompact, "renderCard(Object.assign({phase:'failed'", 'Plugin brain failure card')
+   requireIncludes(brainCompact, "renderCard(Object.assign({phase:'done'", 'Plugin brain done card')
+   requireIncludes(brain, 'function cardFailureReason(', 'Plugin brain failure copy mapping')

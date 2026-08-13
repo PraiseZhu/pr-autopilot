@@ -1,0 +1,284 @@
+diff --git a/cindyplugin/settings.js b/cindyplugin/settings.js
+index 37858eea..3c3c1b0b 100644
+--- a/cindyplugin/settings.js
++++ b/cindyplugin/settings.js
+@@ -1,7 +1,8 @@
+ // 设置页接线层:把 settingsCard 的 view model 刷到 DOM,把 DOM 事件喂回控制器。
+ //
+-// 这一层**不做任何判断** —— 所有「什么态该显示什么」都在 src/settings/settingsCard.ts 里,
+-// 由单测逐格钉住(SC-C1)。这里只剩搬运,所以没有需要靠截图才能验的分支。
++// 这一层只剩**装配**:状态机在 src/settings/settingsCard.ts、DOM 渲染在
++// src/settings/settingsView.ts,两者都被单测直接跑。本文件不含任何判断逻辑,也因此不需要
++// (也无法)被测试 import —— 它模块顶层就 card.start(),一 import 就发 fetch。
+ //
+ // 红线(手册 §4.7/§4.8,与改动前一致):收单即交 —— 值只经 PUT /secrets/<key> 一次性交给
+ // 宿主保险库,绝不落 /kv、BroadcastChannel、日志或任何自存路径;/secrets 只查回
+@@ -11,54 +12,17 @@
+ // PR-B 已合并的校验 sender —— 校验逻辑只有一份,不在纯 JS 页里重抄一遍。
+ import { createMivoKeyValidateSender } from './src/settings/mivoKeyValidateSender'
+ import { createSettingsCard, SECRET_KEY } from './src/settings/settingsCard'
++import { renderSettingsCard } from './src/settings/settingsView'
+ 
+ const $ = (id) => document.getElementById(id)
+ 
+-const BADGE_CLASS = {
+-  loading: 'is-pending',
+-  validating: 'is-pending',
+-  unconfigured: 'is-unconfigured',
+-  connected: 'is-connected',
+-  failed: 'is-failed',
+-}
+-
+-const render = (view) => {
+-  $('badge').className = 'state-badge ' + BADGE_CLASS[view.state]
+-  $('badge-text').textContent = view.badgeText
+-  $('badge-icon').textContent = view.badgeIcon
+-  $('badge-spinner').hidden = !view.badgeSpinner
+-
+-  $('key-row').hidden = !view.showInput
+-  $('conn-row').hidden = !view.showDisconnect
+-  $('conn-status').textContent = view.statusText
+-
+-  const input = $('key')
+-  input.disabled = view.inputDisabled
+-  input.classList.toggle('is-error', view.inputError)
+-  // 明文永不在页面上留存:非可输入态一律清空(SC-C5 —— validating/connected/failed 三态
+-  // 的输入框都不许还带着真实 key)。
+-  if (!view.showInput || view.inputDisabled) input.value = ''
+-
+-  const primary = $('primary')
+-  primary.hidden = !view.showPrimary
+-  primary.textContent = view.primaryLabel
+-  primary.disabled = view.primaryDisabled
+-
+-  $('disconnect').textContent = view.disconnectLabel
+-
+-  $('error-row').hidden = !view.errorText
+-  $('error-text').textContent = view.errorText
+-
+-  if (view.focusInput) input.focus()
+-}
+-
+ const card = createSettingsCard({
+   readSecrets: async () => (await fetch('/secrets')).json(),
+   putSecret: async (value) =>
+     (await fetch('/secrets/' + SECRET_KEY, { method: 'PUT', body: JSON.stringify({ value: value }) })).status,
+   deleteSecret: async () => (await fetch('/secrets/' + SECRET_KEY, { method: 'DELETE' })).status,
+   sender: createMivoKeyValidateSender(),
+-  render,
++  render: renderSettingsCard,
+ })
+ 
+ $('primary').addEventListener('click', () => {
+diff --git a/cindyplugin/src/__tests__/mivoSettingsCard.test.ts b/cindyplugin/src/__tests__/mivoSettingsCard.test.ts
+index 910bf93d..2999d58b 100644
+--- a/cindyplugin/src/__tests__/mivoSettingsCard.test.ts
++++ b/cindyplugin/src/__tests__/mivoSettingsCard.test.ts
+@@ -304,8 +304,10 @@ describe('SC-C3 零蓝紫:hex/rgb/hsl 三种写法都扫', () => {
+     )
+     const offenders: string[] = []
+     for (const text of sources) {
+-      for (const m of text.matchAll(/#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b/g)) {
+-        const hex = m[1].length === 3 ? m[1].replace(/./g, (c) => c + c) : m[1]
++      // 8 位 hex(带 alpha)也要收:审查方实测 `#417CDDFF` 此前完全绕过本探测器。
++      for (const m of text.matchAll(/#([0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b/g)) {
++        const raw = m[1].length === 8 ? m[1].slice(0, 6) : m[1]
++        const hex = raw.length === 3 ? raw.replace(/./g, (c) => c + c) : raw
+         const [r, g, b] = [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16))
+         const max = Math.max(r, g, b) / 255
+         const min = Math.min(r, g, b) / 255
+@@ -326,6 +328,27 @@ describe('SC-C3 零蓝紫:hex/rgb/hsl 三种写法都扫', () => {
+     expect(offenders).toEqual([])
+   })
+ 
++  it('探测器认不出的颜色写法一律禁用(不留"它读不懂所以放行"的洞)', () => {
++    // 审查方实测的残余盲区:CSS 命名色(rebeccapurple)与现代色彩空间函数
++    // (oklch/lab/lch/color-mix)本探测器解析不了,于是能整支绕过零蓝紫这条约束。
++    // 与其去实现一套完整的颜色解析,不如**禁掉这些写法** —— 本卡片一处都没用到,
++    // 真要用时先把探测器补上再说。
++    const FORBIDDEN = /\b(oklch|oklab|lab|lch|hwb|color-mix|color)\s*\(|\b(rebeccapurple|blueviolet|mediumpurple|mediumslateblue|slateblue|darkslateblue|indigo|purple|violet|blue|royalblue|dodgerblue|cornflowerblue|steelblue|navy|midnightblue)\b/gi
++    const sources = ['../../settings.html', '../../settings.js', '../settings/settingsCard.ts', '../settings/settingsView.ts'].map((rel) =>
++      readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8'),
++    )
++    const hits: string[] = []
++    for (const text of sources) {
++      // 注释里提到禁色名(如本仓注释写"不引入 violet")不算违规,只扫非注释行。
++      const code = text
++        .replace(/<!--[\s\S]*?-->/g, '')
++        .replace(/\/\*[\s\S]*?\*\//g, '')
++        .replace(/^\s*\/\/.*$/gm, '')
++      for (const m of code.matchAll(FORBIDDEN)) hits.push(m[0])
++    }
++    expect(hits).toEqual([])
++  })
++
+   it('自检:探测器认得出 violet 与 Focus Blue(否则上一条是恒真的)', () => {
+     for (const hex of ['#6957e8', '#417CDD']) {
+       const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16))
+diff --git a/cindyplugin/src/__tests__/mivoSettingsCardDom.test.ts b/cindyplugin/src/__tests__/mivoSettingsCardDom.test.ts
+index 66cd5960..fbdc0f4e 100644
+--- a/cindyplugin/src/__tests__/mivoSettingsCardDom.test.ts
++++ b/cindyplugin/src/__tests__/mivoSettingsCardDom.test.ts
+@@ -21,18 +21,25 @@
+ import { beforeEach, describe, expect, it } from 'vitest'
+ import { readFileSync } from 'node:fs'
+ import { join } from 'node:path'
++import { renderSettingsCard } from '../settings/settingsView'
++import type { CardView } from '../settings/settingsCard'
+ 
+ const PLUGIN_DIR = join(process.cwd(), 'cindyplugin')
+ const HTML = readFileSync(join(PLUGIN_DIR, 'settings.html'), 'utf8')
+ 
+ /** 把 settings.html 的 <style> 与 <body> 内容挂进当前 document(可选追加一段覆盖样式做变异)。 */
+ const mount = (extraCss = '') => {
+-  const style = /<style>([\s\S]*?)<\/style>/.exec(HTML)?.[1] ?? ''
++  // ⚠ `matchAll` 抽**全部** <style> 块,不是第一个(第 2 轮审查 P1):上一版用单次 exec,
++  // 于是破坏性规则写进第二个 <style> 块时 R3 已破而 32 条用例照旧全绿 —— 抽取范围本身
++  // 成了规避面。同理 `<style[^>]*>` 而非 `<style>`:带属性(如 media="all")的块也要收。
++  const styles = [...HTML.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/g)].map((m) => m[1]).join('\n')
+   const body = /<body[^>]*>([\s\S]*?)<\/body>/.exec(HTML)?.[1] ?? ''
+-  expect(style.length).toBeGreaterThan(100) // 抽取失败就别静默跑成空断言
++  expect(styles.length).toBeGreaterThan(100) // 抽取失败就别静默跑成空断言
+   expect(body).toContain('id="badge"')
+-  document.head.innerHTML = `<style>${style}${extraCss}</style>`
+-  document.body.innerHTML = body
++  document.head.innerHTML = `<style>${styles}${extraCss}</style>`
++  // 剥掉 <script src>:happy-dom 会为它抛常态 NotSupportedError 噪声,而本文件只量样式与
++  // DOM 行为,不需要真加载模块(生产入口由 vite 重写,形态已在构建产物侧核过)。
++  document.body.innerHTML = body.replace(/<script[\s\S]*?<\/script>/g, '')
+ }
+ 
+ const buttons = () => Array.from(document.querySelectorAll('button')) as HTMLElement[]
+@@ -93,38 +100,57 @@ describe('SC-C2/C13 R3 尺寸不变量:computed-style 断言(四按钮一个尺
+ })
+ 
+ // ── render 层:接线层的凭证卫生(此前零覆盖,审查记为 gap)────────────────────────
++// 跑的是**生产那一份** `renderSettingsCard`(第 2 轮审查:上一版在测试里复刻了这段逻辑,
++// 再用一条「逐字对照生产文件字符串」的断言防漂移 —— 审查方指出那条锁法过紧,生产侧做等价
++// 重写就会误红,而复刻体本身仍可能与生产体分叉。把 render 提成 settingsView.ts 之后,
++// 复刻与逐字断言一起删掉,测的就是真东西)。
+ describe('SC-C5 render 层:非可输入态一律清空输入框(明文不在页面上留)', () => {
+-  /**
+-   * settings.js 是 ESM 且在模块顶层就 `card.start()`,直接 import 会立刻发 fetch。
+-   * 这里只复刻它 render 函数里那条凭证卫生分支的**行为契约**并跑在真实 DOM 上 ——
+-   * 复刻体与生产体逐字对照见 settings.js 的 render();生产侧改了这条而这里没跟,
+-   * 下面「变异」那条用例会红。
+-   */
+-  const renderCredentialHygiene = (view: { showInput: boolean; inputDisabled: boolean }) => {
+-    const input = document.getElementById('key') as HTMLInputElement
+-    input.disabled = view.inputDisabled
+-    if (!view.showInput || view.inputDisabled) input.value = ''
+-  }
++  const viewOf = (patch: Partial<CardView>): CardView => ({
++    state: 'unconfigured',
++    badgeText: '未配置',
++    badgeIcon: '',
++    badgeSpinner: false,
++    showInput: true,
++    inputDisabled: false,
++    inputError: false,
++    primaryLabel: '保存',
++    primaryDisabled: false,
++    showPrimary: true,
++    showDisconnect: false,
++    disconnectLabel: '断开',
++    statusText: '',
++    errorText: '',
++    focusInput: false,
++    ...patch,
++  })
+ 
+   it('showInput=false 或 inputDisabled=true → value 被清空;可输入态保留用户正在打的字', () => {
+     mount()
+     const input = document.getElementById('key') as HTMLInputElement
+ 
+     input.value = 'mivo_secret_plain'
+-    renderCredentialHygiene({ showInput: false, inputDisabled: true }) // connected 态
++    renderSettingsCard(viewOf({ state: 'connected', showInput: false, showDisconnect: true }), document)
+     expect(input.value).toBe('')
+ 
+     input.value = 'mivo_secret_plain'
+-    renderCredentialHygiene({ showInput: true, inputDisabled: true }) // validating 态
++    renderSettingsCard(viewOf({ state: 'validating', inputDisabled: true }), document)
+     expect(input.value).toBe('')
+ 
+     input.value = 'mivo_half_typed'
+-    renderCredentialHygiene({ showInput: true, inputDisabled: false }) // unconfigured/failed 态
++    renderSettingsCard(viewOf({ state: 'unconfigured' }), document)
+     expect(input.value).toBe('mivo_half_typed') // 别把用户打了一半的字擦掉
+   })
+ 
+-  it('生产侧 settings.js 里那条清空分支必须在场(逐字对照,漂移即红)', () => {
+-    const js = readFileSync(join(PLUGIN_DIR, 'settings.js'), 'utf8')
+-    expect(js).toContain("if (!view.showInput || view.inputDisabled) input.value = ''")
++  it('徽标类名随态切换、错误行只在有文案时出现(渲染契约的其余部分也跑生产实现)', () => {
++    mount()
++    renderSettingsCard(viewOf({ state: 'connected', badgeText: '已连接', badgeIcon: '✓', showInput: false, showDisconnect: true, statusText: '已连接(尾号 …a1b2)' }), document)
++    expect((document.getElementById('badge') as HTMLElement).className).toBe('state-badge is-connected')
++    expect((document.getElementById('error-row') as HTMLElement).hidden).toBe(true)
++    expect((document.getElementById('conn-status') as HTMLElement).textContent).toContain('尾号')
++
++    renderSettingsCard(viewOf({ state: 'failed', badgeText: '连接失败', badgeIcon: '✕', inputError: true, primaryLabel: '重试', errorText: 'Key 无效或已过期' }), document)
++    expect((document.getElementById('badge') as HTMLElement).className).toBe('state-badge is-failed')
++    expect((document.getElementById('error-row') as HTMLElement).hidden).toBe(false)
++    expect((document.getElementById('key') as HTMLElement).classList.contains('is-error')).toBe(true)
+   })
+ })
+diff --git a/cindyplugin/src/settings/settingsView.ts b/cindyplugin/src/settings/settingsView.ts
+new file mode 100644
+index 00000000..0eb48eee
+--- /dev/null
++++ b/cindyplugin/src/settings/settingsView.ts
+@@ -0,0 +1,52 @@
++/**
++ * 设置卡的渲染层:把 `settingsCard` 的 view model 刷到真实 DOM。**零判断** ——
++ * 「什么态显示什么」全在 settingsCard.ts,这里只搬运。
++ *
++ * 为什么单独成模块(第 2 轮审查):此前这段住在 `settings.js` 里,而 settings.js 是 ESM 且
++ * 模块顶层就 `card.start()`(一 import 就发 fetch),测试没法直接引它 —— 于是上一版在测试里
++ * **复刻**了这段的凭证卫生分支,再加一条「逐字对照生产文件字符串」的断言防漂移。审查方指出
++ * 那条锁法过紧:生产侧做等价重写(如换成三元表达式)会误红,而复刻体本身仍可能与生产体分叉。
++ * 提成模块后测试直接跑**生产这一份**,两个问题一起消失。
++ */
++import type { CardView } from './settingsCard'
++
++const BADGE_CLASS: Record<CardView['state'], string> = {
++  loading: 'is-pending',
++  validating: 'is-pending',
++  unconfigured: 'is-unconfigured',
++  connected: 'is-connected',
++  failed: 'is-failed',
++}
++
++/** 渲染一次。`doc` 可注入,便于测试挂在自己准备好的 document 上。 */
++export const renderSettingsCard = (view: CardView, doc: Document = document): void => {
++  const $ = (id: string) => doc.getElementById(id) as HTMLElement
++
++  $('badge').className = 'state-badge ' + BADGE_CLASS[view.state]
++  $('badge-text').textContent = view.badgeText
++  $('badge-icon').textContent = view.badgeIcon
++  $('badge-spinner').hidden = !view.badgeSpinner
++
++  $('key-row').hidden = !view.showInput
++  $('conn-row').hidden = !view.showDisconnect
++  $('conn-status').textContent = view.statusText
++
++  const input = $('key') as HTMLInputElement
++  input.disabled = view.inputDisabled
++  input.classList.toggle('is-error', view.inputError)
++  // 明文永不在页面上留存:非可输入态一律清空(SC-C5 —— validating/connected/failed 三态
++  // 的输入框都不许还带着真实 key)。
++  if (!view.showInput || view.inputDisabled) input.value = ''
++
++  const primary = $('primary') as HTMLButtonElement
++  primary.hidden = !view.showPrimary
++  primary.textContent = view.primaryLabel
++  primary.disabled = view.primaryDisabled
++
++  $('disconnect').textContent = view.disconnectLabel
++
++  $('error-row').hidden = !view.errorText
++  $('error-text').textContent = view.errorText
++
++  if (view.focusInput) input.focus()
++}

@@ -1,0 +1,320 @@
+diff --git a/.githooks/pre-push b/.githooks/pre-push
+index e4582c19..1d157988 100755
+--- a/.githooks/pre-push
++++ b/.githooks/pre-push
+@@ -1,5 +1,7 @@
+ #!/usr/bin/env bash
+-# pre-push hook: 推送前强制本地五道验证(tsc / lint / verify:logging / structure-guard / test:unit)
++# pre-push hook: 推送前强制跑 `npm run preflight`(步骤清单以 package.json 的 preflight 为准,
++# 此处不复述数量与步名——2026-08-04 三审:旧注释写「五道验证」而实跑 10 步,漏列的恰是当次
++# 爆掉的 verify:design 与 test:shell,过时自述会盖住真实失败点)
+ # 逃生口:PREFLIGHT_SKIP=1 git push
+ set -u
+ 
+@@ -19,7 +21,23 @@ if [ -n "$untracked_src" ]; then
+ fi
+ 
+ # 推送前跑 preflight(快→慢)
+-echo "[preflight] 开始本地五道验证(tsc -b && lint && verify:logging && structure-guard && test:unit)..."
++# 剥掉全部 repo-local git 环境变量。带着它们,preflight 里任何 git 子进程都会把自己的
++# cwd 当工作树顶层(rev-parse --show-toplevel 误判),或读到外部注入的配置,fixture 类
++# 测试的 git init/branch -M/commit 会直接打到真仓上。
++#
++# 变量清单**必须**取 `git rev-parse --local-env-vars`(git 自己的权威列表,当前 15 项),
++# 不能硬编码猜:2026-08-04 三审实测,初版只 unset GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE
++# 三项时,注入 GIT_CONFIG 仍能让 test-publish-gate.sh 保持 34/34 exit 0,同时**静默**把
++# 被注入仓的 config 写进 user.email/user.name——静默污染,不是响亮失败。
++# 兜底:命令不可用时退回已知三项(总比不剥好),但会打印告警,不静默降级。
++if _local_env_vars=$(git rev-parse --local-env-vars 2>/dev/null) && [ -n "$_local_env_vars" ]; then
++  unset $_local_env_vars
++else
++  printf '\033[33m[preflight] 警告:git rev-parse --local-env-vars 不可用,退回剥离已知三项\033[0m\n'
++  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
++fi
++unset _local_env_vars
++echo "[preflight] 开始本地全套验证(步骤见 package.json 的 preflight)..."
+ if ! npm run preflight; then
+   echo ""
+   echo "------------------------------------------------------------"
+diff --git a/docs/design-previews/region-edit/product-css.mjs b/docs/design-previews/region-edit/product-css.mjs
+index 56b89203..73df55f3 100644
+--- a/docs/design-previews/region-edit/product-css.mjs
++++ b/docs/design-previews/region-edit/product-css.mjs
+@@ -46,10 +46,15 @@ const argOf = (name, fallback) => {
+ 
+ const demoDir = resolve(argOf('--demo', process.cwd()))
+ 
+-/** 仓库根一律走 git(禁止数 ../ 层级 —— demo 换目录就断)。 */
++/** 仓库根一律走 git(禁止数 ../ 层级 —— demo 换目录就断)。
++ * 剔除 GIT_DIR/GIT_WORK_TREE:git hook(如 pre-push 预检)会注入 GIT_DIR,
++ * 此时 rev-parse --show-toplevel 会把子进程 cwd(即 demoDir)当作工作树顶层,
++ * 仓根被误判成 demo 目录自己 → 读 src/index.css 必 ENOENT(2026-08-04 实测)。 */
++const { GIT_DIR: _gd, GIT_WORK_TREE: _gwt, ...gitCleanEnv } = process.env
+ const repoRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+   cwd: demoDir,
+   encoding: 'utf8',
++  env: gitCleanEnv,
+ }).trim()
+ 
+ /**
+diff --git a/docs/loops/bug-doctor-scheduler-prompts.md b/docs/loops/bug-doctor-scheduler-prompts.md
+index aaecdd75..c5c53e24 100644
+--- a/docs/loops/bug-doctor-scheduler-prompts.md
++++ b/docs/loops/bug-doctor-scheduler-prompts.md
+@@ -1,7 +1,7 @@
+ # Mivo(原 bug-doctor)· 主轮/补轮定时会话 Prompt(批次2:接入 Trae/Sentry 第三料源)
+ 
+ > **交付边界(如实)**:本文件合并进 main = prompt 文档交付,**不等于生产已接线**。macmini 上实际驱动主轮/补轮的 mini scheduler 配置不在本仓库(不入 git,与部署主机同理由——见 `docs/loops/bug-doctor.md` 生产安全铁律),需 owner 手工把下方两段 prompt 粘贴进对应的定时会话配置里才会真正跑起来。
+-> **消费日期语义(必读,审查修正)**:主轮 02:30 消费的是**昨日**的 findings 文件(gate 默认取上海昨日)——因为 TRAE 夜巡 **03:30** 才产出当天文件(见 MivoSentry `docs/deploy/trae-nightly-task.md`),02:30 取当天必然扑空,且次日主轮只看次日,当天产物会**永久漏消费**。滞后约一天,对代码审计类 findings 可接受;补历史某天用 `--sentry-date YYYY-MM-DD` 显式指定。
++> **消费日期语义(必读,审查修正)**:主轮 02:30 消费的是**昨日**的 findings 文件(gate 默认取上海昨日)——因为 TRAE 夜巡实测 **02:30–02:32 与主轮同窗**产出当天文件(标称 03:30 已证伪:Trae 2026-08-04 在 mini 上实测 08-02/03/04 三天产出时刻均为 02:30–02:32;上游 MivoSentry `docs/deploy/trae-nightly-task.md` 的标称值若未同步,以实测为准),02:30 取当天要么尚不存在、要么正在写入(同窗竞态),不可靠,且次日主轮只看次日,当天产物会**永久漏消费**。滞后约一天,对代码审计类 findings 可接受;补历史某天用 `--sentry-date YYYY-MM-DD` 显式指定。
+ > **验收标准**:下一次主轮跑完后,`history/loops/bug-doctor/logs.md` 新增一行含 `sentry=consumed`、`sentry=missing` 或 `sentry=degraded` 三者之一(对象是**昨日**文件的实际状态,不是三选一挑好看的);同一天的补轮那一行必须是 `sentry=skipped`(补轮 prompt 不带 `--include-sentry`,详见下方 §2)。
+ > 上游契约:`docs/loops/bug-doctor.md`(loop 总契约,SOP 触发拓扑见其 §触发拓扑)。数据源契约见 `scripts/loops/bug-doctor/sentry-intake.mjs` 文件头注释与 `rules.json` 的 `sentryIntake` 段。
+ 
+@@ -20,7 +20,7 @@ nightly-e2e + 本次新增的 Trae/Sentry findings 第三料源):
+   node scripts/loops/bug-doctor/gate.mjs --include-sentry
+ 
+ - 注意:sentry 消费的是**昨日**的 findings 文件(gate 默认即昨日,不要另传
+-  --sentry-date;TRAE 夜巡 03:30 才产出当天文件,02:30 时它还不存在)。
++  --sentry-date;TRAE 夜巡实测 02:30–02:32 与主轮同窗产出当天文件,02:30 取当天不可靠)。
+ - gate 退出后读 stdout 的一行 JSON 摘要;若 status=locked,说明有其他实例在跑,直接结束
+   本轮(不重试、不排队)。
+ - 打开 history/loops/bug-doctor/workpacket.json,检查 signals.sentry.status:
+diff --git a/package.json b/package.json
+index 9e9bd0c8..78ac9d08 100644
+--- a/package.json
++++ b/package.json
+@@ -17,7 +17,7 @@
+     "test:bench": "vitest run --config vitest.bench.config.ts",
+     "verify:logging": "node scripts/verify-debug-logging.mjs",
+     "verify:design": "node scripts/ci/design-token-mirror.mjs && node docs/design-previews/region-edit/product-css.mjs --demo docs/design-previews/region-edit",
+-    "test:shell": "bash ops/postgres/test-asset-verify.sh && bash ops/postgres/test-restore-drill-matrix.sh && bash scripts/changelog/test-publish-gate.sh",
++    "test:shell": "bash ops/postgres/test-asset-verify.sh && bash ops/postgres/test-restore-drill-matrix.sh && bash scripts/changelog/test-publish-gate.sh && bash scripts/changelog/test-publish-gate-isolation.sh",
+     "test:e2e": "npm run test:e2e:dev",
+     "test:e2e:dev": "node scripts/e2e-runner.mjs --topology=dev",
+     "test:e2e:prod:subset": "VITE_MIVO_PERSIST=local npm run build && node scripts/e2e-runner.mjs --topology=prod --scenario=debug,canvas-interactions,canvas-export,chat-copy,chat-generation,mask,mask-reflow,variations-annotation",
+diff --git a/scripts/changelog/test-publish-gate-isolation.sh b/scripts/changelog/test-publish-gate-isolation.sh
+new file mode 100755
+index 00000000..57402c91
+--- /dev/null
++++ b/scripts/changelog/test-publish-gate-isolation.sh
+@@ -0,0 +1,121 @@
++#!/usr/bin/env bash
++# 鉴别性回归:证明 test-publish-gate.sh 的 repo-local env 剥离**真的在挡污染**。
++#
++# 为什么需要(2026-08-04 三审 C-03,major):原先给的证据是「干净环境 34/34 + 注入
++# GIT_DIR 环境 34/34」——两侧都绿,零鉴别力:把剥离行整段删掉,两侧照样 34/34,因为
++# 那 34 个用例断言的是 publish 门的业务行为,压根不看「污染有没有发生」。
++#
++# 构造(每轮一对):
++#   (a) 真脚本(带剥离)  → victim 仓必须毫发无伤
++#   (b) mutant(剥离行被删)→ victim 仓必须被污染
++# (b) 是**反证**:若 (b) 也毫发无伤,说明注入没生效或 mutant 构造失效,(a) 的绿就毫无
++# 意义 → 判 FAIL,不许静默通过(加固清单第 8 类:新测试必须反证非空转)。
++#
++# 覆盖范围如实声明——只测**已实测复现**的那条穿透路径:
++#   GIT_CONFIG → fixture 的 `git -C "$sandbox" config user.email/user.name` 写进
++#                GIT_CONFIG 所指文件,而非 sandbox 自己的 config。脚本仍 34/34、
++#                退出码 0,污染完全静默(最阴的形态)。
++# **未覆盖** GIT_DIR:git 语义上 GIT_DIR 确实覆盖 `-C`(单命令实测:
++#   `GIT_DIR=<v>/.git git -C <s> branch -M x` 改的是 v),但在本 fixture 的完整序列里
++#   实测**复现不出** victim 被改动 —— 未定位原因,故不写进本测试假装覆盖。
++#   2026-08-04 那次真实事故观察到的 core.bare=true 同样**未能复现**:带路径参数的
++#   `git init` 与 `git init --bare` 在 GIT_DIR 注入下都不改写被注入仓的 core.bare
++#   (实测)。事故症状为真,成因至今未定位,不在此冒称已归因。
++#
++# ⚠ 本环境陷阱(mutant 构造必须避开):这台机器的 `grep` 被包装,`grep -v P f > out`
++# 的 out 会变成一行摘要文本而非过滤结果,导致 mutant 不是脚本副本(exit 127)。
++# 故用 python 造 mutant,并对产物做三重构造自检。
++
++set -u
++
++# 本脚本自己也可能从 git hook 环境被调起——先剥干净,否则「干净基线」不成立
++_lev=$(git rev-parse --local-env-vars 2>/dev/null) && [ -n "$_lev" ] && unset $_lev
++unset _lev
++
++REPO_ROOT=$(git rev-parse --show-toplevel)
++TARGET="$REPO_ROOT/scripts/changelog/test-publish-gate.sh"
++PASS=0
++FAIL=0
++
++pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
++fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
++
++# victim 仓:非 bare、已知 config、1 个 commit
++make_victim() {
++  local dir="$1"
++  git init -q "$dir"
++  git -C "$dir" config core.bare false
++  git -C "$dir" config user.email victim@local
++  git -C "$dir" config user.name victim
++  : > "$dir/seed.txt"
++  git -C "$dir" add seed.txt
++  git -C "$dir" commit -q -m "victim seed"
++}
++
++# mutant = 删掉剥离行的副本。用 python 而非 grep(见文件头的环境陷阱)。
++make_mutant() {
++  local out="$1"
++  python3 - "$TARGET" "$out" <<'PY'
++import sys, pathlib
++src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
++lines = src.read_text().splitlines(keepends=True)
++kept = [l for l in lines if '_local_env_vars' not in l]
++dst.write_text(''.join(kept))
++print(f"{len(lines)} -> {len(kept)}")
++PY
++  chmod +x "$out"
++
++  # 构造自检三重:① 剥离行确实没了 ② 只少了极少几行(不是被整体替换)③ 仍是合法 shell
++  if python3 -c "import sys;sys.exit(0 if '_local_env_vars' not in open(sys.argv[1]).read() else 1)" "$out"; then :; else
++    fail "mutant 构造失败:剥离行仍在副本里"; return 1
++  fi
++  local src_n dst_n
++  src_n=$(wc -l < "$TARGET"); dst_n=$(wc -l < "$out")
++  if [ "$dst_n" -ge "$src_n" ] || [ "$dst_n" -lt $((src_n - 5)) ]; then
++    fail "mutant 构造失败:行数 $src_n -> $dst_n 不在预期区间(应只少 1~5 行)"; return 1
++  fi
++  if ! bash -n "$out" 2>/dev/null; then
++    fail "mutant 构造失败:副本不是合法 shell 脚本"; return 1
++  fi
++  return 0
++}
++
++# GIT_CONFIG 注入:唯一已复现的静默穿透路径
++probe_git_config() {
++  local label="$1" script="$2" expect="$3"   # expect: clean | polluted
++  local work; work=$(mktemp -d)
++  make_victim "$work/victim" > /dev/null 2>&1
++  ( cd "$REPO_ROOT" && GIT_CONFIG="$work/victim/.git/config" bash "$script" ) > /dev/null 2>&1
++  local rc=$?
++  local email name
++  email=$(git config -f "$work/victim/.git/config" --get user.email 2>/dev/null || echo "<gone>")
++  name=$(git config -f "$work/victim/.git/config" --get user.name 2>/dev/null || echo "<gone>")
++  rm -rf "$work"
++
++  if [ "$expect" = "clean" ]; then
++    if [ "$email" = "victim@local" ] && [ "$name" = "victim" ]; then
++      pass "$label: GIT_CONFIG 注入下 victim config 未被改写(email=$email, rc=$rc)"
++    else
++      fail "$label: GIT_CONFIG 注入下 victim config 被改写(email=$email name=$name)"
++    fi
++  else
++    if [ "$email" != "victim@local" ] || [ "$name" != "victim" ]; then
++      pass "$label【反证】: 删掉剥离行后 victim config 确实被改写(email=$email name=$name)—— 注入有效,上一条的绿有鉴别力"
++    else
++      fail "$label【反证失效】: 删掉剥离行后 victim config 仍未被改写 —— 注入没生效或 mutant 失效,本测试对真脚本的绿无鉴别力"
++    fi
++  fi
++}
++
++echo "=== repo-local env 剥离的鉴别性回归(GIT_CONFIG 路径,带反证)==="
++
++MUTANT=$(mktemp)
++if make_mutant "$MUTANT" > /dev/null; then
++  probe_git_config "真脚本" "$TARGET" clean
++  probe_git_config "mutant" "$MUTANT" polluted
++fi
++rm -f "$MUTANT"
++
++echo "----------------"
++echo "PASS=$PASS FAIL=$FAIL"
++[ "$FAIL" -eq 0 ] || exit 1
+diff --git a/scripts/changelog/test-publish-gate.sh b/scripts/changelog/test-publish-gate.sh
+index f02471c9..6d1bd33e 100644
+--- a/scripts/changelog/test-publish-gate.sh
++++ b/scripts/changelog/test-publish-gate.sh
+@@ -1,4 +1,18 @@
+ #!/usr/bin/env bash
++# 自卫:若从 git hook 环境被调起、或调用者 shell 里带着 repo-local git 变量,下方 fixture
++# 的 git 写操作会打到调用者的仓而非沙盒。
++#
++# 已实测复现的穿透路径(鉴别性回归见 test-publish-gate-isolation.sh):注入 GIT_CONFIG 时
++# 本脚本仍 34/34、退出码 0,却会**静默**把 `git -C "$sandbox" config user.email/user.name`
++# 写进 GIT_CONFIG 所指的文件。清单因此取 `git rev-parse --local-env-vars`(git 自己的权威
++# 列表)而非硬编码三项。
++#
++# 未复现、故不冒称已归因:2026-08-04 一次真实事故中观察到主仓 core.bare 被写成 true、
++# 分支被改名成 main、多出一个 fixture commit——症状为真且已人工修复,但三审逐项实测表明
++# 本脚本用的 `git init <path>` / `git init --bare <path>` 形态在 GIT_DIR 注入下都改写不了
++# 被注入仓的 core.bare,GIT_DIR 注入跑完整序列也复现不出 victim 被改动。成因至今未定位。
++_local_env_vars=$(git rev-parse --local-env-vars 2>/dev/null) && [ -n "$_local_env_vars" ] && unset $_local_env_vars
++unset _local_env_vars
+ # scripts/changelog/test-publish-gate.sh — auto-changelog.mjs publish 同日分支域门(分支
+ # 存在性 + 幂等跳过 + 陈旧门)回归测试。真实 git(bare remote + sandbox worktree)+ PATH
+ # 前置假 gh,不碰网络、不碰真实 GitHub。
+diff --git a/scripts/loops/bug-doctor/docs-contract.test.mjs b/scripts/loops/bug-doctor/docs-contract.test.mjs
+index e53c6deb..cded6544 100644
+--- a/scripts/loops/bug-doctor/docs-contract.test.mjs
++++ b/scripts/loops/bug-doctor/docs-contract.test.mjs
+@@ -112,10 +112,14 @@ describe('批次2:Trae/Sentry 第三料源的契约锚点(防止后续编辑把
+     expect(doc).toContain('主轮另带 `--include-sentry` 在同一把 gate 锁内消费 Trae/Sentry findings 第三料源,补轮不带')
+   })
+ 
+-  it('P4-01(blocker 修正)锚点:prompt 文档必须写明消费昨日文件 + TRAE 03:30 产出时刻的因果', () => {
++  it('P4-01(blocker 修正)锚点:prompt 文档必须写明消费昨日文件 + TRAE 与主轮同窗产出的因果(实测 02:30-02:32,标称 03:30 已证伪)', () => {
+     const promptDoc = readFileSync(resolve(__dirname, '..', '..', '..', 'docs', 'loops', 'bug-doctor-scheduler-prompts.md'), 'utf8')
+     expect(promptDoc).toContain('消费的是**昨日**的 findings 文件')
+-    expect(promptDoc).toContain('03:30')
++    // 必须钉住**具体时刻**:只断言「与主轮同窗」时,把口径改回已证伪的 03:30 仍能全绿
++    // （2026-08-04 三审 C-01 实测的变异），而本 commit 存在的唯一理由就是校正这个时刻
++    expect(promptDoc).toContain('02:30–02:32 与主轮同窗')
++    // 并钉住证伪表述:防旧口径以「正面口径」身份复辟（文档刻意保留 03:30 仅作已证伪的对照）
++    expect(promptDoc).toContain('标称 03:30 已证伪')
+     expect(promptDoc).toContain('永久漏消费')
+   })
+ 
+diff --git a/scripts/loops/bug-doctor/gate.mjs b/scripts/loops/bug-doctor/gate.mjs
+index 2dbaa36e..bac59ad2 100644
+--- a/scripts/loops/bug-doctor/gate.mjs
++++ b/scripts/loops/bug-doctor/gate.mjs
+@@ -767,8 +767,9 @@ const main = () => {
+     let sentrySignal = { status: 'skipped' }
+     if (args['include-sentry']) {
+       const sentryNow = typeof args.now === 'string' ? args.now : new Date().toISOString()
+-      // 默认消费**上海昨日**文件(P4-01 审查修正,blocker):TRAE 夜巡 03:30 才产出
+-      // 当天文件,主轮 02:30 取当天必然扑空且次日不回看 → 每天产物永久漏消费。
++      // 默认消费**上海昨日**文件(P4-01 审查修正,blocker):TRAE 夜巡实测 02:30–02:32 与主轮同窗产出
++      // 当天文件,主轮 02:30 取当天要么尚不存在、要么正在写入(同窗竞态)→ 不可靠;
++      // 且次日主轮只看次日 → 每天产物永久漏消费。
+       // 语义与滞后代价见 sentry-intake.mjs 的 shanghaiYesterdayString 注释。
+       const sentryDateStr = typeof args['sentry-date'] === 'string' ? args['sentry-date'] : shanghaiYesterdayString(sentryNow)
+       const findingsDir = resolveFindingsDir({ sentryRules: rules.sentryIntake })
+diff --git a/scripts/loops/bug-doctor/gate.test.mjs b/scripts/loops/bug-doctor/gate.test.mjs
+index 34a402a4..3743e269 100644
+--- a/scripts/loops/bug-doctor/gate.test.mjs
++++ b/scripts/loops/bug-doctor/gate.test.mjs
+@@ -1993,7 +1993,7 @@ describe('SC-B2-1 gate --include-sentry:主轮显式消费,不带 flag 的任何
+     expect(logs).toContain('新簇 1')
+   })
+ 
+-  it('P4-01:不带 --sentry-date 时默认消费上海昨日文件(TRAE 03:30 才产出当天文件,02:30 主轮取当天必然扑空)', () => {
++  it('P4-01:不带 --sentry-date 时默认消费上海昨日文件(TRAE 夜巡与主轮同窗 02:30–02:32 产出当天文件,主轮取当天不可靠)', () => {
+     const findingsDir = join(dir, 'sentry-findings')
+     // now = 2026-08-03T18:30:00Z → 上海 08-04 02:30(主轮时刻),昨日 = 08-03
+     seedFindings(findingsDir, '2026-08-03', [sentryFinding({ fingerprint: '8888888888888888' })])
+diff --git a/scripts/loops/bug-doctor/sentry-intake.mjs b/scripts/loops/bug-doctor/sentry-intake.mjs
+index 2672080f..c145fdd6 100644
+--- a/scripts/loops/bug-doctor/sentry-intake.mjs
++++ b/scripts/loops/bug-doctor/sentry-intake.mjs
+@@ -4,7 +4,7 @@
+ //
+ // findings 路径解析:env MIVO_SENTRY_FINDINGS_DIR > rules.json sentryIntake.findingsDir
+ // (支持 ~ 展开)。日期按 Asia/Shanghai 计算,**默认消费昨日文件**(TRAE 夜巡
+-// 03:30 才产出当天文件,主轮 02:30 取当天必然扑空——见 shanghaiYesterdayString
++// 实测 02:30–02:32 与主轮同窗产出当天文件,主轮取当天不可靠——见 shanghaiYesterdayString
+ // 注释;测试/回填可注入 --date / now 覆盖)。
+ // 文件形态:<findingsDir>/findings-<date>.json,数组,每项 {severity,dim,file,line,
+ // category,evidence,verify,fingerprint}。
+@@ -106,9 +106,10 @@ export const shanghaiDateString = (nowIso) => {
+ }
+ 
+ /**
+- * 消费默认取"上海昨日"(P4-01 审查修正,blocker):TRAE 夜巡 03:30 才产出**当天**
++ * 消费默认取"上海昨日"(P4-01 审查修正,blocker):TRAE 夜巡实测 02:30–02:32 与主轮同窗产出**当天**
+  * 的 findings 文件(见 MivoSentry docs/deploy/trae-nightly-task.md),而主轮 02:30
+- * 运行——若默认取当天,当天文件在主轮时刻必然还不存在,次日主轮又只看次日,
++ * 运行——若默认取当天,当天文件在主轮时刻要么尚不存在、要么正在写入(同窗竞态),
++ * 取到的内容不可靠;次日主轮又只看次日,
+  * 每天的产物会**永久漏消费**。取昨日 = 永远消费最近一份完整产物,滞后约一天,
+  * 对代码审计类 findings 可接受;需要回填/重放时用 --sentry-date / --date 显式指定。
+  */

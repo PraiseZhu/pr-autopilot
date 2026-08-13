@@ -1,0 +1,184 @@
+diff --git a/ghost.json b/ghost.json
+index f4738581..0929c645 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.13",
++  "version": "0.9.14",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+@@ -64,7 +64,7 @@
+   "tools": [
+     {
+       "name": "canvas_snapshot",
+-      "description": "读取画布当前内容的结构化快照:节点(文字/图片/分区/标注)、位置尺寸、连线与衍生关系。默认读整块活跃画布;画布很大时用 region(画布世界坐标矩形)或 sectionId(只读某个分区及其全部子节点)缩小范围,二者互斥。单次返回上限 256KB,超出会只返回第一页并带 nextCursor——把它原样传回 cursor 继续读(翻页期间画布被改动会返回 STALE_CURSOR,那时重新从第一页开始)。返回内容含 selectedImageNodeIds(用户当前选中且在本次结果集内的图片节点 id 列表)与 selectedNodeCount(选中节点总数,不限类型)。用户说「这张」/「选中的图」时,从 selectedImageNodeIds 取 id,显式传给 canvas_edit_image 的 nodeId——canvas_edit_image 不会自动读取当前选中,必须显式传 id。返回 JSON;面板未打开时返回最近一次自动保存的快照并注明来源(离线快照不支持过滤与翻页)。",
++      "description": "读取画布当前内容的结构化快照:节点(文字/图片/分区/标注)、位置尺寸、连线与衍生关系。默认读整块活跃画布;画布很大时用 region(画布世界坐标矩形)或 sectionId(只读某个分区及其全部子节点)缩小范围,二者互斥。单次返回上限 256KB,超出会只返回第一页并带 nextCursor——把它原样传回 cursor 继续读(翻页期间画布被改动会返回 STALE_CURSOR,那时重新从第一页开始)。返回内容含 selectedImageNodeIds(用户当前选中且在本次结果集内的图片节点 id 列表)与 selectedNodeCount(选中节点总数,不限类型)。用户说「这张」/「选中的图」时,从 selectedImageNodeIds 取 id,显式传给 canvas_edit_image 的 nodeId——canvas_edit_image 不会自动读取当前选中,必须显式传 id。返回 JSON;面板未打开时返回最近一次自动保存的快照并注明来源(离线快照不支持过滤与翻页)。默认只读结构,零寄存请求;要看某几张图的像素时用 mediaNodeIds 显式点名(最多 8 个,必须是本次调用返回的这一页里的图片节点 id),返回里会带 mediaStates(逐 id 的 available/imageRef 或 unavailable/reason)与 mediaSummary(requested/available/unavailable 计数)。available 的 imageRef 只是引用(形如 cindy-media://blobs/<hash><ext>),不含像素;要看像素直接用 Read 工具读取推导出的落盘路径:<Cindy 应用 userData 目录>/cindy-media/blobs/<hash 前 2 位小写>/<hash><ext>(macOS 上 userData 目录即 ~/Library/Application Support/Cindy)。一次要看的图超过 8 张时:先分页遍历拿到完整候选清单并固化目标 id,再按页遍历、在包含目标 id 的那一页调用里点名该页目标(每页最多 8 个);维护「已成功读取」与「已知不可读」两个 id 集合,完成条件是两者的并集覆盖固化目标清单全部 id——不要按调用次数累加 requested 计数(会随 STALE_CURSOR 重新遍历而虚高),也不要只看第一批结果就下结论。遇到 STALE_CURSOR 时从第一页重新遍历,固化的目标清单不因此改变。",
+       "parameters": {
+         "type": "object",
+         "properties": {
+@@ -111,6 +111,13 @@
+           "sceneId": {
+             "type": "string",
+             "description": "可选:期望读取的画布 id(快照里的 sceneId);与当前活跃画布不一致会报 SCENE_MISMATCH 而不是读错板。一般不用传。"
++          },
++          "mediaNodeIds": {
++            "type": "array",
++            "items": {
++              "type": "string"
++            },
++            "description": "可选:显式点名要看像素的图片节点 id,最多 8 个、逐项非空且不重复,且必须是本次调用实际返回的这一页结果里的图片节点(不在这一页判 not_in_page,是图片以外的节点类型判 not_image)。不传或传空 = 只读结构,零寄存请求。"
+           }
+         }
+       }
+diff --git a/main.js b/main.js
+index 97311a88..cdf8dd17 100644
+--- a/main.js
++++ b/main.js
+@@ -3704,8 +3704,9 @@ const SNAPSHOT_PANEL_TIMEOUT_MS = 6000
+ const SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS = 64
+ // mediaNodeIds 单次上限(#297 T3a,设计稿 §2.1.1-②/§2.1.2):超出/重复一律整单
+ // INVALID_PARAMS,不做部分降级或静默截断——与「选中观测组」的截断语义不同,
+-// 不要混用同一常量。ghost.json 本段暂不暴露这个参数(暗态),此值只服务于
+-// main.js/agentBridge.ts 两处独立校验的护栏。
++// 不要混用同一常量。ghost.json 自 #297 T3c 起已声明该参数;真正生效仍要等
++// cindy.media 能力键落地(T1f),此值只服务于 main.js/agentBridge.ts 两处独立
++// 校验的护栏,与 ghost 是否已声明无关。
+ const MEDIA_NODE_IDS_MAX = 8
+ 
+ // 面板未打开/离线降级/无事可做属于「可恢复的跳过」,记 warn;其余失败记 error
+diff --git a/src/__tests__/canvasSnapshotMediaDisciplineText.test.ts b/src/__tests__/canvasSnapshotMediaDisciplineText.test.ts
+new file mode 100644
+index 00000000..16d464fb
+--- /dev/null
++++ b/src/__tests__/canvasSnapshotMediaDisciplineText.test.ts
+@@ -0,0 +1,93 @@
++/**
++ * #297 T3c:`canvas_snapshot` 的 ghost 描述文本(mediaNodeIds 纪律 + imageRef 载体
++ * 说明)与生产代码逐条对账,防"说明书假话"(本 dispatch 当晚已三次撞上文本与实现
++ * 不符的事故——ghost 键形状写错、AI 说明书把新能力写成不支持、机制模型判断错误)。
++ *
++ * 只锁"数字/前缀这类可编程比对的锚点",不锁整段散文——散文表述允许改写,但里面
++ * 引用的具体常量值/字符串前缀一旦跟代码脱钩,必须立刻被这个测试文件抓到。
++ *
++ * 范围声明(诚实边界):本文件不校验 selectionObservation/三层递进/批次线索这部分
++ * Agent 纪律——那些字段属于 Task①(选中可见)的产出,在本分支(base
++ * feat/297-t3b1-fix)尚未落地,写了会自我打脸("文本引用不存在的字段")。等
++ * Task① 落地、本段 rebase 之后再补那一段纪律文本与对应断言,不在本次交付范围内
++ * 假装已完成。
++ */
++import { readFileSync } from 'node:fs'
++import { fileURLToPath } from 'node:url'
++import { describe, expect, it } from 'vitest'
++
++const GHOST_PATH = fileURLToPath(new URL('../../ghost.json', import.meta.url))
++const MAIN_JS_PATH = fileURLToPath(new URL('../../main.js', import.meta.url))
++const AGENT_BRIDGE_PATH = fileURLToPath(new URL('../agent/agentBridge.ts', import.meta.url))
++const MEDIA_REF_FORMAT_PATH = fileURLToPath(new URL('../agent/mediaRefFormat.ts', import.meta.url))
++
++type Manifest = {
++  tools: Array<{ name: string; description: string; parameters: { properties: Record<string, unknown> } }>
++}
++
++const manifest = (): Manifest => JSON.parse(readFileSync(GHOST_PATH, 'utf8')) as Manifest
++
++const canvasSnapshotTool = () => {
++  const tool = manifest().tools.find((item) => item.name === 'canvas_snapshot')
++  if (!tool) throw new Error('ghost.json 里找不到 canvas_snapshot 工具声明')
++  return tool
++}
++
++/** 从源码文本里抠出 `MEDIA_NODE_IDS_MAX = <数字>` 的字面量,不 import 运行时模块
++ *  ——main.js 是不过打包的自包含脚本,agentBridge.ts 的常量也没有导出,直接读
++ *  源文本比强行导出一个仅供测试使用的符号更贴近"两份独立代码各自维护"的既有约定
++ *  (mediaRefFormat.ts 顶部注释里已经点名的那个约定)。 */
++const extractMediaNodeIdsMax = (filePath: string): number => {
++  const text = readFileSync(filePath, 'utf8')
++  const match = text.match(/MEDIA_NODE_IDS_MAX\s*=\s*(\d+)/)
++  if (!match) throw new Error(`${filePath} 里找不到 MEDIA_NODE_IDS_MAX 常量`)
++  return Number(match[1])
++}
++
++describe('SC-T3c.1 canvas_snapshot 描述文本与 mediaNodeIds 生产代码对账', () => {
++  it('main.js 与 agentBridge.ts 的 MEDIA_NODE_IDS_MAX 两份独立代码彼此一致', () => {
++    const fromMainJs = extractMediaNodeIdsMax(MAIN_JS_PATH)
++    const fromAgentBridge = extractMediaNodeIdsMax(AGENT_BRIDGE_PATH)
++    expect(fromMainJs).toBe(fromAgentBridge)
++  })
++
++  it('description 与 mediaNodeIds 参数描述里写的上限数字,与代码常量一致', () => {
++    const codeMax = extractMediaNodeIdsMax(AGENT_BRIDGE_PATH)
++    const tool = canvasSnapshotTool()
++    const mediaNodeIdsProp = tool.parameters.properties.mediaNodeIds as
++      | { description?: string; type?: string; items?: { type?: string } }
++      | undefined
++    expect(mediaNodeIdsProp).toBeDefined()
++    expect(mediaNodeIdsProp?.type).toBe('array')
++    expect(mediaNodeIdsProp?.items?.type).toBe('string')
++    // 顶层 description 与参数自身 description 都提到了上限,两处都必须对得上代码值——
++    // 任一处将来单独改了代码常量却没改文本,这条测试立刻变红。
++    expect(tool.description).toContain(`最多 ${codeMax} 个`)
++    expect(mediaNodeIdsProp?.description).toContain(`最多 ${codeMax} 个`)
++  })
++
++  it('description 里的 imageRef 前缀与 mediaRefFormat.ts 实际拼接的前缀一致', () => {
++    const tool = canvasSnapshotTool()
++    const source = readFileSync(MEDIA_REF_FORMAT_PATH, 'utf8')
++    // buildImageRef 的模板字面量固定形如 `cindy-media://blobs/${hash}${ext}`;
++    // 这里只断言字面前缀子串存在,不解析模板——足够抓住"前缀改了但文本没跟着改"
++    // 这一类事故,不需要真的跑一遍拼接逻辑(那是 mediaFilePathFormula.test.ts 的活)。
++    expect(source).toContain('cindy-media://blobs/')
++    expect(tool.description).toContain('cindy-media://blobs/<hash><ext>')
++  })
++
++  it('description 里的落盘路径推导公式与 T0 冻结契约的分片规则(前 2 位)描述一致', () => {
++    const tool = canvasSnapshotTool()
++    // 公式本身的可执行版本在 T3b2 的 deriveMediaFilePath(独立 PR,不在本分支)——
++    // 本条只锁"文本自己内部有没有前后矛盾"这一层:分片键的位数描述与路径模板
++    // 里出现的位数一致,防止散文改写时把"前 2 位"悄悄改成别的数字却漏改模板。
++    expect(tool.description).toContain('前 2 位小写')
++    expect(tool.description).toContain('blobs/<hash 前 2 位小写>/<hash><ext>')
++  })
++
++  it('description 不得只字未提 mediaSummary/mediaStates 输出形状(否则 agent 拿到字段却不知道怎么解读)', () => {
++    const tool = canvasSnapshotTool()
++    expect(tool.description).toContain('mediaStates')
++    expect(tool.description).toContain('mediaSummary')
++  })
++})
+diff --git a/src/__tests__/toolBudget.test.ts b/src/__tests__/toolBudget.test.ts
+index 5ff56bb8..26f0d50d 100644
+--- a/src/__tests__/toolBudget.test.ts
++++ b/src/__tests__/toolBudget.test.ts
+@@ -35,11 +35,12 @@ describe('ghost.json 工具预算', () => {
+     for (const tool of tools) expect(tool.parameters?.type).toBe('object')
+   })
+ 
+-  it('canvas_snapshot 声明 R7a 扩参(region/sectionId/cursor/maxBytes/sceneId)', () => {
++  it('canvas_snapshot 声明 R7a 扩参(region/sectionId/cursor/maxBytes/sceneId)+ #297 T3c 的 mediaNodeIds', () => {
+     const snapshot = manifest().tools.find((tool) => tool.name === 'canvas_snapshot')
+     expect(Object.keys(snapshot?.parameters?.properties ?? {}).sort()).toEqual([
+       'cursor',
+       'maxBytes',
++      'mediaNodeIds',
+       'region',
+       'sceneId',
+       'sectionId',
+diff --git a/src/agent/agentBridge.ts b/src/agent/agentBridge.ts
+index 19881a67..96369bdc 100644
+--- a/src/agent/agentBridge.ts
++++ b/src/agent/agentBridge.ts
+@@ -50,7 +50,9 @@ const WRITE_VERBS = new Set(['add-note', 'place-images', 'generate', 'edit'])
+ const EXT_CANDIDATES = ['.png', '.jpg', '.jpeg', '.webp', '.gif']
+ 
+ // mediaNodeIds 单次上限(#297 T3a,设计稿 §2.1.1-②/§2.1.2):超出/重复一律
+-// 整单 INVALID_PARAMS。ghost.json 本段暂不暴露这个参数(暗态)。
++// 整单 INVALID_PARAMS。ghost.json 自 #297 T3c 起已声明该参数;真正生效(寄存
++// 请求能在宿主侧成功)仍要等 cindy.media 能力键落地(T1f)——本值只服务两处
++// 独立校验的护栏,与 ghost 是否已声明无关。
+ const MEDIA_NODE_IDS_MAX = 8
+ 
+ /**

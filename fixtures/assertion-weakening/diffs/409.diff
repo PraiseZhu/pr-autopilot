@@ -1,0 +1,2234 @@
+diff --git a/docs/context-menu-standard.md b/docs/context-menu-standard.md
+index 851add2e..6393ae46 100644
+--- a/docs/context-menu-standard.md
++++ b/docs/context-menu-standard.md
+@@ -63,7 +63,7 @@
+ | S3 画布多选右键 | 命中节点且选区 ≥2 | ✅ | ✅ | S2 的 multi 分支 |
+ | S4 侧栏项目行右键 | ProjectRow | ✅ | ❌(无侧栏) | 插件无项目/画布管理 UI |
+ | S5 侧栏画布行右键 | CanvasRow | ✅ | ❌(无侧栏) | 同上 |
+-| S6 素材库卡片右键 | LibraryWorkspace | ✅(仅 Eagle 源) | ❌(无素材库) | ⏳ 素材库整体功能未定,本文档暂不规范(见 §7) |
++| S6 素材库卡片右键 | LibraryWorkspace | ✅(仅 Eagle 源;阶段 4 起渲染层复用共享 ContextMenu) | ❌(无素材库) | ⏳ 素材库整体功能未定,本文档暂不规范(见 §7) |
+ 
+ **插件侧通道差异**(功能同名,实现通道不同):
+ 
+@@ -101,7 +101,7 @@
+ ### 2.3 定位
+ 
+ - R8. 视口 clamp 常量全仓唯一来源(边距 12px,溢出翻转/夹取),画布菜单、侧栏菜单、后续新增菜单共用。
+-- R9. 菜单挂载后随视口 resize / visualViewport 变化重新夹取;菜单开着时目标节点固定进虚拟化白名单。
++- R9. 视口突变(resize / visualViewport resize/scroll)时:**共享菜单(sidebar/ContextMenu)直接关闭**(重开成本低于错位);**画布菜单根菜单重新夹取、子菜单收起**(子菜单锚点已随布局失效)。菜单开着时目标节点固定进虚拟化白名单。
+ 
+ ### 2.4 子菜单
+ 
+@@ -139,7 +139,7 @@
+ 
+ - R17. 对外文案统一叫 **Section**(不出现 frame);代码内部类型名不强改,但新增 API/回调命名一律用 section 语汇。
+ - R18. 菜单项 label 是规范名,以本文档 §3–§6 清单为准;改动 label 必须回来改本文档 + characterization 测试。
+-- R19. ✅ 快捷键提示:右键菜单为有快捷键的项(Copy/Paste/Group/Lock/Delete/层级四项)在菜单项右侧展示快捷键文案(2026-07-31 拍板)。
++- R19. ✅ 快捷键提示:右键菜单为有真实快捷键的项展示右侧提示文案(2026-07-31 拍板;阶段 2 实装)。当前全集:Copy ⌘C / Paste ⌘V / Group ⌘G / Ungroup ⇧⌘G / Lock ⇧⌘L / Delete ⌫ / Select all ⌘A / Fit all ⇧1 / Fit selection ⇧2 / 层级四项 ] [ ⇧] ⇧[。提示句句为真:menuShortcuts.ts 与 characterization 钉表是机器镜像。
+ 
+ ---
+ 
+@@ -231,15 +231,15 @@
+ 
+ ---
+ 
+-## 5. markdown / pdf / video 专属菜单(✅ 2026-08-01 拍板,实现排期阶段 4)
++## 5. markdown / pdf / video 专属菜单(✅ 2026-08-01 拍板;阶段 4 已实装)
+ 
+-现状三者只有骨架组,零专属项。标准定为以下清单(2026-08-01 拍板;实现排期阶段 4「功能补齐」批):
++清单如下(阶段 4 已实装:documentActionGroups.ts + useFileNodeActions):
+ 
+ ### 5.1 markdown
+ 
+ | 组 | id | label(EN) | 中文对照 | 说明 |
+ |---|---|---|---|---|
+-| document | `edit-markdown` | Edit document | 编辑文档 | 进入 Markdown 编辑态(作为 `view-details` 的类型化文案) |
++| —(未实装)| ~~`edit-markdown`~~ | ~~Edit document~~ | — | 终审判定:Inspector 尚无 Markdown 正文编辑器,view-details 保持只读详情文案,不做 "Edit" 假承诺;真编辑器立项后回填本行 |
+ | document | `copy-source` | Copy as Markdown | 复制 Markdown 源码 | 源文本进剪贴板 |
+ | document | `replace-file` | Replace file | 替换文件 | 与 image 的 Replace image 同构;⚠️ 若 §2.5a 把 replace-image 退到快捷条而 markdown/pdf/video 无快捷条,则 `replace-file` 留在右键是唯一入口,不矛盾 |
+ 
+@@ -293,7 +293,8 @@
+ - 分发表结构守卫:`scripts/e2e-smoke.mjs` 强制 `contextMenuExtensionsByNodeType` / `quickToolbarExtensionsByNodeType` 存在。
+ - `docs/quickbar-study.md` 与本文档互为姊妹篇:快捷条侧改动记那边,右键侧记这边;§2.5a 落地后需在那边 Core Rules 补一条"样式操作快捷条唯一"。
+ - 已盘出的 16 项实现问题及代码位置见会话盘点记录;修复分批进行,每批 PR 引用本文档对应规则编号。
+-- **已知缺口(2026-08-01 对抗审查发现,待排期)**:① 菜单 Download 对无 assetUrl 的节点(markup/text/section)尚无真实导出——渲染导出管线(`renderCanvasExportBitmap`,agent canvas_export 在用)已存在但菜单未接线,现阶段点击给 toast+日志反馈,不静默。(原缺口②"平移惯性终止"已于阶段 2 补齐。)
++- **已知缺口①(2026-08-01;阶段 4 评估后判定:阻塞于渲染架构,非接线问题)**:菜单 Download 对无 assetUrl 的节点(markup/text/section)尚无真实导出。渲染导出管线(`renderCanvasExportBitmap`)只在 leafer 渲染模式工作(`assertExportableRendererMode`),且 text 节点"永久留 DOM"(Phase 5 判决)、dom 渲染模式没有可合成的 canvas 图层——`computeCanvasExportCoverage` 会把这些节点判为 omission,导出只会得到空白图。现阶段维持 toast+日志的诚实降级;待 Leafer 全量迁移(节点离开 DOM)后再接线。(原缺口②"平移惯性终止"已于阶段 2 补齐。)
++- **菜单面收敛(阶段 4 落地口径)**:三套菜单实现收敛为两套——素材库卡片菜单并入共享 `ContextMenu`(portal/R8 clamp/Escape/outside 关闭全部共享);画布 `NodeActionMenu` **刻意保持独立实现**:它与 R6 分层 Escape、R7 渲染期状态清理、虚拟化 pin、body-portal 子菜单定位深度耦合,强行并入通用面收益小于风险。画布菜单的两处实例自阶段 4 起共用同一份回调全集(消除"17 个可选回调传不同子集"的隐患)。
+ 
+ ## 附:待拍板清单(第 2 版)
+ 
+@@ -303,7 +304,7 @@
+ | §3 | 空白右键三个 markup 创建项退场;Paste 改名 "Paste here" | 同上 | ✅ |
+ | §4.2 | image 右键裁到 generate 3 项 + reset-crop + copy-as-png | 同上 | ✅ |
+ | R3 后半 | 框选/节点拖拽/crop/mask 中右键吞掉 | 同上 | ✅ |
+-| §5 | markdown/pdf/video 菜单项清单 | 拍板通过,实现排期阶段 4 | ✅(实现待排) |
++| §5 | markdown/pdf/video 菜单项清单 | 拍板通过,阶段 4 已实装 | ✅ |
+ | §7 | 素材库右键 | 暂缓 | ⏳(等素材库功能定型) |
+ | §1 | 插件独有项(send-to-cindy-chat 等) | 暂不立项,仅登记候选 | ⏳ |
+ | §0.1/0.2 | 参考产品 F 菜单 👁 项开产品复核截图确认 | §2.5a 已由用户直接拍板,复核降级为可选 | ⏳(可选) |
+diff --git a/docs/quickbar-study.md b/docs/quickbar-study.md
+index 955c505a..6a1ec19e 100644
+--- a/docs/quickbar-study.md
++++ b/docs/quickbar-study.md
+@@ -6,7 +6,7 @@ This note is a product and interaction study for Mivo. It intentionally studies
+ 
+ - Make Mivo quick bars feel closer to Product F: compact, contextual, icon-led, and low-risk.
+ - Treat secondary quick-bar menus as first-class UI, not generic vertical command lists.
+-- Keep complete/rare/destructive actions in right-click menus.
++- Right-click menus keep generic object commands, workflow starters, and rare/destructive actions; **styles live only in quick bars** (context-menu-standard §2.5a, 2026-08-01).
+ - Preserve Mivo's own AI canvas direction: original assets are never overwritten, and every AI operation leaves readable metadata.
+ 
+ ## Source Notes
+@@ -31,6 +31,7 @@ This note is a product and interaction study for Mivo. It intentionally studies
+    - alignment uses an icon grid or compact icon list
+ 5. Details are opened by double-click, not by a quick-bar button.
+ 6. The selected object's primary visible state should be reflected in the quick bar: selected color ring, active stroke style, active lock state, current title visibility, current line endpoint mode.
++7. Style controls are quick-bar exclusive (context-menu-standard §2.5a, 2026-08-01): right-click menus never mirror palette/weight/shape submenus, and Duplicate lives nowhere but Cmd/Ctrl+D (PR #350).
+ 
+ ## Quick Bar Matrix
+ 
+@@ -38,12 +39,12 @@ This note is a product and interaction study for Mivo. It intentionally studies
+ | --- | --- | --- | --- |
+ | Image | Crop, Rotate 90°, Flip H/V, Replace image, AI Edit | AI Edit workflow list | Details, Copy, Delete, Download |
+ | Text | Size, Bold, Align, Color | Color swatches; future font/size menu | Copy, Delete, Details |
+-| Markup shape | Edit text, Fill, Line, Duplicate, Front, Delete | Fill swatches, line palette + style + weight, arrowheads, corner radius | Copy, Download |
+-| Connector / Arrow | Edit text, Fill, Line, Arrowheads, Duplicate, Delete | endpoint/arrowhead choices, line choices | Copy |
++| Markup shape | Edit text, Fill, Line | Fill swatches, line palette + style + weight, arrowheads, corner radius | Copy, Download |
++| Connector / Arrow | Edit text, Fill, Line, Arrowheads | endpoint/arrowhead choices, line choices | Copy |
+ | Section | Fill, Line, Rename, Title visibility, Lock, Focus | Fill palette, line palette + style + weight, lock choices | Copy, Delete with contents |
+-| Multi-select | Shared style controls when the whole selection is one markup family (2026-07-31 P2), then Duplicate, Group/Ungroup, Align, Tidy up (split-button) | Family style menus (note paper palette / shape fill+border / line color+width / brush color+width); Align/distribute grid; explicit row/column/grid behind the Tidy caret | Copy, Delete, Lock, Front |
+-| AI Slot | Generate, Duplicate, Front | future prompt/model choices | Copy, Delete |
+-| AI Annotation | Generate, Edit, Duplicate | future source/result choices | Copy, Delete |
++| Multi-select | Shared style controls when the whole selection is one markup family (2026-07-31 P2), then Group/Ungroup, Align, Tidy up (split-button) | Family style menus (note paper palette / shape fill+border / line color+width / brush color+width); Align/distribute grid; explicit row/column/grid behind the Tidy caret | Copy, Delete, Lock, Front |
++| AI Slot | Generate, Front | future prompt/model choices | Copy, Delete |
++| AI Annotation | Generate, Edit | future source/result choices | Copy, Delete |
+ | Markdown | No quick bar for now | future display-mode toggle | Download, Copy, Delete |
+ | Video | No quick bar for now | future Play/Mute/Trim if needed | Download, Copy, Delete |
+ | PDF | Download original for now | future page picker / open detail | Copy, Delete |
+@@ -104,9 +105,8 @@ Delete section and contents belongs in the right-click menu because it is destru
+ 
+ ### Multi-select
+ 
+-Multi-select is mostly layout (2026-07-30 slim-down, user decision):
++Multi-select is mostly layout (2026-07-30 slim-down, user decision; Duplicate left every surface with PR #350 — Cmd/Ctrl+D only):
+ 
+-- Duplicate
+ - Group/Ungroup
+ - Align (menu; Distribute appears when 3+ objects are selected)
+ - Tidy up as a split-button: the main key runs smart tidy (store resolves
+diff --git a/scripts/verify-debug-logging.mjs b/scripts/verify-debug-logging.mjs
+index b63c3b8b..3a278789 100644
+--- a/scripts/verify-debug-logging.mjs
++++ b/scripts/verify-debug-logging.mjs
+@@ -1938,10 +1938,9 @@ checks.push(async () => {
+   }
+   requireIncludes(handlers, 'Batch import summary', 'Canvas batch import summary log')
+ 
+-  const canvas = await read('src/canvas/MivoCanvas.tsx')
+-  requireIncludes(canvas, 'input.webkitdirectory = true', 'Canvas folder import picker')
+-  // change + 取消双路径接线在 canvasImportHandlers.wireFolderImportInput 里
++  // 目录导入对话框整体在 canvasImportHandlers.openFolderImportDialog
+   // (MivoCanvas.tsx 结构守卫不能再长),锚点跟着挪。
++  requireIncludes(handlers, 'input.webkitdirectory = true', 'Canvas folder import picker')
+   requireIncludes(handlers, 'Folder import skipped: no file selected', 'Canvas folder import empty-selection log')
+   requireIncludes(handlers, 'Folder import skipped: dialog canceled', 'Canvas folder import dialog-cancel log')
+   requireIncludes(compact(handlers), '.then(reportCanvasBatchImport)', 'Canvas folder import report wiring')
+diff --git a/src/App.css b/src/App.css
+index d67256fc..05cfd4c6 100644
+--- a/src/App.css
++++ b/src/App.css
+@@ -2743,35 +2743,7 @@ button:disabled {
+   border-color: var(--ink);
+ }
+ 
+-.asset-card-context-menu {
+-  position: fixed;
+-  z-index: 210;
+-  min-width: 128px;
+-  padding: 6px;
+-  background: rgba(255, 250, 240, 0.98);
+-  border: 1px solid var(--line-strong);
+-  border-radius: 8px;
+-  box-shadow: 0 18px 42px rgba(35, 35, 35, 0.16);
+-}
+-
+-.asset-card-context-menu button {
+-  display: flex;
+-  align-items: center;
+-  width: 100%;
+-  min-height: 30px;
+-  gap: 8px;
+-  padding: 0 9px;
+-  color: var(--ink);
+-  background: transparent;
+-  border-radius: 6px;
+-  font-size: var(--text-sm);
+-  font-weight: 800;
+-  cursor: pointer;
+-}
+-
+-.asset-card-context-menu button:hover {
+-  background: rgba(35, 35, 35, 0.07);
+-}
++/* 素材卡片右键菜单已收敛到共享 ContextMenu(阶段 4),旧 .asset-card-context-menu 样式退役。 */
+ 
+ .asset-lightbox-backdrop {
+   position: fixed;
+diff --git a/src/app/LibraryWorkspace.tsx b/src/app/LibraryWorkspace.tsx
+index a009c98e..1cad4aba 100644
+--- a/src/app/LibraryWorkspace.tsx
++++ b/src/app/LibraryWorkspace.tsx
+@@ -27,8 +27,10 @@ import { importImageUrlToCanvas } from '../lib/canvasAssetImport'
+ import { writeLocalAssetDragPayload } from '../lib/canvasAssetDrag'
+ import { useCanvasStore } from '../store/canvasStore'
+ import { debugLogger } from '../store/debugLogStore'
++import { ContextMenu } from './sidebar/ContextMenu'
+ import { useTranslation } from 'react-i18next'
+ import { t } from '../i18n'
++import { handleOverlayEscape } from '../lib/menuOverlayStack'
+ import {
+   assetMatchesQuery,
+   dimensionsLabel,
+@@ -457,34 +459,19 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }:
+     return () => window.clearTimeout(timer)
+   }, [previewAsset])
+ 
++  // 菜单的 Escape/outside 关闭由共享 ContextMenu 自带(阶段 4 收敛);这里只
++  // 处理 lightbox 预览的 Escape。经 handleOverlayEscape(R6 单一来源):任一
++  // 右键菜单开着(如预览中右键侧栏行)→ 让行给菜单;否则消费事件只关预览,
++  // 不许下层画布全局同帧消费。
+   useEffect(() => {
++    if (!previewAsset) return
+     const handleKeyDown = (event: KeyboardEvent) => {
+-      if (event.key !== 'Escape') return
+-      if (previewAsset) {
+-        event.preventDefault()
+-        setPreviewAsset(undefined)
+-      }
+-      if (assetCardMenu) {
+-        event.preventDefault()
+-        setAssetCardMenu(undefined)
+-      }
++      handleOverlayEscape(event, () => setPreviewAsset(undefined))
+     }
+ 
+-    const handlePointerDown = (event: PointerEvent) => {
+-      const target = event.target instanceof Element ? event.target : null
+-      if (!target?.closest('.asset-card-context-menu')) {
+-        setAssetCardMenu(undefined)
+-      }
+-    }
+-
+-    window.addEventListener('keydown', handleKeyDown)
+-    window.addEventListener('pointerdown', handlePointerDown)
+-
+-    return () => {
+-      window.removeEventListener('keydown', handleKeyDown)
+-      window.removeEventListener('pointerdown', handlePointerDown)
+-    }
+-  }, [assetCardMenu, previewAsset])
++    window.addEventListener('keydown', handleKeyDown, { capture: true })
++    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true })
++  }, [previewAsset])
+ 
+   const addAssetToCanvas = useCallback(
+     async (asset: AssetItem) => {
+@@ -619,6 +606,7 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }:
+       }
+ 
+       setPreviewImageState('loading')
++      setAssetCardMenu(undefined)
+       setPreviewAsset(asset)
+     },
+     [selectAssetRange, toggleAssetSelection],
+@@ -629,6 +617,9 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }:
+       if (event.key !== 'Enter' && event.key !== ' ') return
+       event.preventDefault()
+       setPreviewImageState('loading')
++      // 打开预览的所有路径都显式清右键菜单:菜单与 lightbox 是两个独立条件
++      // 渲染,键盘路径不清会叠层(终审第 1 条)。
++      setAssetCardMenu(undefined)
+       setPreviewAsset(asset)
+     },
+     [],
+@@ -1148,17 +1139,21 @@ export function LibraryWorkspace({ type, variant = 'workspace', onOpenCanvas }:
+         </div>
+       )}
+       {assetCardMenu && contextMenuAsset ? (
+-        <div
+-          className="asset-card-context-menu"
+-          role="menu"
+-          style={{ left: assetCardMenu.x, top: assetCardMenu.y }}
+-          onPointerDown={(event) => event.stopPropagation()}
+-        >
+-          <button type="button" role="menuitem" onClick={() => copyOneAsset(contextMenuAsset)}>
+-            <Copy size={14} />
+-            {t('library.actions.copy')}
+-          </button>
+-        </div>
++        // 阶段 4 收敛:素材卡片右键换用共享 ContextMenu(portal + R8 clamp +
++        // Escape/outside 关闭),不再自带一套内联浮层与全局监听。
++        <ContextMenu
++          position={{ x: assetCardMenu.x, y: assetCardMenu.y }}
++          items={[
++            {
++              kind: 'item',
++              id: 'copy-asset',
++              label: t('library.actions.copy'),
++              icon: Copy,
++              onSelect: () => copyOneAsset(contextMenuAsset),
++            },
++          ]}
++          onClose={() => setAssetCardMenu(undefined)}
++        />
+       ) : null}
+       {previewAsset ? (
+         <div
+diff --git a/src/app/sidebar/ContextMenu.tsx b/src/app/sidebar/ContextMenu.tsx
+index 06c017b2..1e59f706 100644
+--- a/src/app/sidebar/ContextMenu.tsx
++++ b/src/app/sidebar/ContextMenu.tsx
+@@ -10,6 +10,7 @@ import { createPortal } from 'react-dom'
+ import type { LucideIcon } from 'lucide-react'
+ import { ChevronRight } from 'lucide-react'
+ import { clampMenuPosition, menuViewportMargin, submenuHoverDelayMs } from '../../lib/menuOverlayLayout'
++import { handleContextMenuEscape } from '../../lib/menuOverlayStack'
+ 
+ export type ContextMenuItem =
+   | {
+@@ -50,17 +51,27 @@ export function ContextMenu(props: {
+     onCloseRef.current = onClose
+   })
+   useEffect(() => {
++    // R6 分层:菜单是最上层浮层,Escape 只关菜单并消费掉事件(语义收敛在
++    // menuOverlayStack,handler 纯函数可单测)。
+     const onKey = (event: KeyboardEvent) => {
+-      if (event.key === 'Escape') onCloseRef.current()
++      handleContextMenuEscape(event, () => onCloseRef.current())
+     }
+     const onPointer = (event: PointerEvent) => {
+       if (ref.current && !ref.current.contains(event.target as Node)) onCloseRef.current()
+     }
++    // R9:视口突变(resize/visualViewport)下重开成本低于错位——直接关闭。
++    const onViewportChange = () => onCloseRef.current()
+     document.addEventListener('keydown', onKey)
+     document.addEventListener('pointerdown', onPointer)
++    window.addEventListener('resize', onViewportChange)
++    window.visualViewport?.addEventListener('resize', onViewportChange)
++    window.visualViewport?.addEventListener('scroll', onViewportChange)
+     return () => {
+       document.removeEventListener('keydown', onKey)
+       document.removeEventListener('pointerdown', onPointer)
++      window.removeEventListener('resize', onViewportChange)
++      window.visualViewport?.removeEventListener('resize', onViewportChange)
++      window.visualViewport?.removeEventListener('scroll', onViewportChange)
+       window.clearTimeout(hoverTimerRef.current)
+     }
+   }, [])
+diff --git a/src/canvas/ImageCropOverlay.tsx b/src/canvas/ImageCropOverlay.tsx
+index 63068e82..9d105631 100644
+--- a/src/canvas/ImageCropOverlay.tsx
++++ b/src/canvas/ImageCropOverlay.tsx
+@@ -4,6 +4,7 @@ import { toContainer, type Viewport } from '../render/EditOverlayLayer'
+ import { useResolvedAssetUrl } from '../lib/useResolvedAssetUrl'
+ import { useTranslation } from 'react-i18next'
+ import { t } from '../i18n'
++import { isContextMenuOpen } from '../lib/menuOverlayStack'
+ import {
+   applyRatioToCropBox,
+   cropCommitFor as cropCommitForBox,
+@@ -86,6 +87,9 @@ export function ImageCropOverlay({ node, viewport, onCommit, onCancel, onBoxChan
+         event.stopImmediatePropagation()
+         onCommit(cropCommitForBox(original, box, { flipH: node.imageFlipH, flipV: node.imageFlipV }))
+       } else if (event.key === 'Escape') {
++        // R6(menuOverlayStack):任一右键菜单开着(crop 中仍可从常驻侧栏开
++        // 共享菜单)→ 让行给菜单,crop 等下一次 Escape。
++        if (isContextMenuOpen()) return
+         event.preventDefault()
+         event.stopImmediatePropagation()
+         onCancel()
+diff --git a/src/canvas/ImageMaskEditOverlay.tsx b/src/canvas/ImageMaskEditOverlay.tsx
+index e89a3566..23922f23 100644
+--- a/src/canvas/ImageMaskEditOverlay.tsx
++++ b/src/canvas/ImageMaskEditOverlay.tsx
+@@ -49,6 +49,7 @@ import { useMaskAnchorRecognition } from './useMaskAnchorRecognition'
+ import { useTranslation } from 'react-i18next'
+ import { t } from '../i18n'
+ import { LocalizedKeyError } from '../lib/localizedKeyError'
++import { isContextMenuOpen } from '../lib/menuOverlayStack'
+ 
+ type ImageMaskEditOverlayProps = {
+   node: MivoCanvasNode
+@@ -586,6 +587,9 @@ export function ImageMaskEditOverlay({
+   // 焦点在文本框/输入框内时交给浏览器原生撤销,不劫持打字撤销。
+   useEffect(() => {
+     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
++      // R6(menuOverlayStack)菜单优先门:本 handler 今天只管 Cmd/Ctrl+Z,这道门
++      // 钉住未来加 Escape 分支时也不能在菜单开着的同帧清下层状态。
++      if (isContextMenuOpen() && event.key === 'Escape') return
+       if (submitting) return
+       if (event.key.toLowerCase() !== 'z' || !(event.metaKey || event.ctrlKey)) return
+       const target = event.target as HTMLElement | null
+diff --git a/src/canvas/MivoCanvas.tsx b/src/canvas/MivoCanvas.tsx
+index 34736fdf..ac49d6f6 100644
+--- a/src/canvas/MivoCanvas.tsx
++++ b/src/canvas/MivoCanvas.tsx
+@@ -15,7 +15,7 @@ import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvas
+ import { canImportCanvasFile, importCanvasFileBatch, importImageUrlToCanvas } from '../lib/canvasAssetImport'
+ import { useCanvasStore } from '../store/canvasStore'
+ import { wrapMutation } from './actions/canvasSyncRuntime'
+-import { handleImportError, reportCanvasBatchImport, useOpenNodeDetails, wireFolderImportInput } from './canvasImportHandlers'
++import { handleImportError, openFileImportDialog, openFolderImportDialog, reportCanvasBatchImport, useOpenNodeDetails } from './canvasImportHandlers'
+ import { brushCursorCssFor } from './brushCursors'
+ import { CanvasContextMenu } from './CanvasContextMenu'
+ import { MarkupCreationPreview } from './MarkupCreationPreview'
+@@ -38,6 +38,7 @@ import { useRegionEdit } from './useRegionEdit'
+ import { lockedNodeIdSetFor } from './useNodeTransform'
+ import { cullingMode } from '../render/cullingMode'
+ import { registerCanvasExportSurface } from '../lib/canvasExportSurface'
++import { useFileNodeActions } from './useFileNodeActions'
+ import { useCanvasVirtualization } from './useCanvasVirtualization'
+ import { useTranslation } from 'react-i18next'
+ import { t } from '../i18n'
+@@ -319,6 +320,7 @@ export function MivoCanvas({
+   }, [])
+ 
+   const { replaceImageNode, copyImageAsPng, promptRenameNode, promptDialogElement } = useImageEditActions()
++  const { replaceFileNode, openFilePreview } = useFileNodeActions()
+ 
+   const downloadOriginal = useCallback((node?: typeof contextMenuNode) => {
+     if (!node) return
+@@ -356,46 +358,15 @@ export function MivoCanvas({
+   )
+ 
+ 
++  // 单文件/目录导入(#297 P3-15):对话框接线、取消检测与汇报都在
++  // canvasImportHandlers(本文件 structure-guarded,只留稳定回调)。
+   const importAssetAt = useCallback(
+-    (position: { x: number; y: number }) => {
+-      const input = document.createElement('input')
+-      input.type = 'file'
+-      input.accept = 'image/*,.md,.markdown,application/pdf,video/*'
+-      input.multiple = true
+-
+-      input.onchange = async () => {
+-        const files = Array.from(input.files || [])
+-        await importCanvasFileBatch(files, position, addImportedFileNode)
+-          .then(reportCanvasBatchImport)
+-          .catch(handleImportError)
+-      }
+-
+-      input.click()
+-    },
++    (position: { x: number; y: number }) => openFileImportDialog(position, addImportedFileNode),
+     [addImportedFileNode],
+   )
+ 
+-  // 本地素材目录导入(#297 P3-15):用户亲选一个文件夹,整目录批量上板。
+-  //
+-  // 走浏览器原生 webkitdirectory 目录对话框 —— 面板本身就是浏览器上下文,与上面
+-  // 单文件导入同一机制(用户亲手选中即授权),不需要新增宿主槽、不扩权限披露,
+-  // 独立网站形态零改动直接同得。配额与逐文件失败隔离在共享层
+-  // importCanvasFileBatch,这里只负责"开对话框 + 汇报结果"。
+   const importAssetFolderAt = useCallback(
+-    (position: { x: number; y: number }) => {
+-      const input = document.createElement('input')
+-      input.type = 'file'
+-      input.multiple = true
+-      // 目录选择器不吃 accept 过滤(浏览器会把整棵子树交进来),类型过滤与配额
+-      // 一律在共享层做,所以这里不设 accept —— 设了也只是假象。
+-      input.webkitdirectory = true
+-
+-      // change + 取消(#297 P3-15 回归:原生取消对话框未必触发 change)双路径
+-      // 接线在 canvasImportHandlers.wireFolderImportInput,这里不重复。
+-      wireFolderImportInput(input, position, addImportedFileNode)
+-
+-      input.click()
+-    },
++    (position: { x: number; y: number }) => openFolderImportDialog(position, addImportedFileNode),
+     [addImportedFileNode],
+   )
+ 
+@@ -522,6 +493,28 @@ export function MivoCanvas({
+ 
+   // Phase 1b-4: shell-unified contextmenu + doubleclick (per-node root handlers gone;
+   // .dom-node is pointer-events:none so these events reach the shell directly).
++  // 右键菜单回调全集(阶段 4 收敛):此前节点/空白两处实例各传一个不同子集,
++  // 动作可用性隐式依赖调用点(17 个可选回调没有一处传满)。现在两处实例共用
++  // 这一份全集,装配层按选区上下文自行取舍;onOpenDetails 因携带选中语义仍由
++  // 节点实例单独提供。
++  const contextMenuHandlers = {
++    onFitAll: fitAll,
++    onFitSelection: fitSelection,
++    onCreateTextAt: createTextAt,
++    onCreateFrameAt: createFrameAt,
++    onEditText: editTextNode,
++    onRenameNode: promptRenameNode,
++    onImportAssetAt: importAssetAt,
++    onImportAssetFolderAt: importAssetFolderAt,
++    onCropNode: beginCropNode,
++    onStartImageMaskEdit: beginRegionEdit,
++    onDownloadOriginal: downloadOriginal,
++    onReplaceImage: replaceImageNode,
++    onCopyImageAsPng: copyImageAsPng,
++    onReplaceFile: replaceFileNode,
++    onOpenFilePreview: openFilePreview,
++  }
++
+   const handleCanvasContextMenu = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+     // R4:文本编辑器放行浏览器原生菜单;其余 chrome UI 一律吞掉(不弹画布菜单
+     // 也不弹浏览器菜单),gate 与 pointerdown 共用 isCanvasUiTarget 单一来源。
+@@ -832,14 +825,7 @@ export function MivoCanvas({
+               selectNode(contextMenuNode.id)
+               onOpenDetails?.()
+             }}
+-            onFitSelection={fitSelection}
+-            onEditText={editTextNode}
+-            onRenameNode={promptRenameNode}
+-            onCropNode={beginCropNode}
+-            onStartImageMaskEdit={beginRegionEdit}
+-            onDownloadOriginal={downloadOriginal}
+-            onReplaceImage={replaceImageNode}
+-            onCopyImageAsPng={copyImageAsPng}
++            {...contextMenuHandlers}
+           />
+         </CanvasContextMenu>
+       ) : null}
+@@ -849,11 +835,7 @@ export function MivoCanvas({
+             selectedNodes={[]}
+             canvasPosition={contextMenu.canvasPosition}
+             onClose={() => setContextMenu(null)}
+-            onFitAll={fitAll}
+-            onCreateTextAt={createTextAt}
+-            onCreateFrameAt={createFrameAt}
+-            onImportAssetAt={importAssetAt}
+-            onImportAssetFolderAt={importAssetFolderAt}
++            {...contextMenuHandlers}
+           />
+         </CanvasContextMenu>
+       ) : null}
+diff --git a/src/canvas/NodeActionMenu.tsx b/src/canvas/NodeActionMenu.tsx
+index f6c96594..5f851a01 100644
+--- a/src/canvas/NodeActionMenu.tsx
++++ b/src/canvas/NodeActionMenu.tsx
+@@ -6,7 +6,7 @@ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import { contextMenuGroupsFor, type CanvasActionItem } from './actions/canvasActionModel'
+ import { useCanvasActionRuntime } from './actions/useCanvasActionRuntime'
+ import { ActionColorSwatchPicker } from './color/ActionColorSwatchPicker'
+-import { submenuHoverDelayMs } from '../lib/menuOverlayLayout'
++import { menuViewportMargin, submenuHoverDelayMs } from '../lib/menuOverlayLayout'
+ 
+ type NodeActionMenuProps = {
+   node?: MivoCanvasNode
+@@ -22,6 +22,8 @@ type NodeActionMenuProps = {
+   onRenameNode?: (nodeId: string) => void
+   onImportAssetAt?: (position: { x: number; y: number }) => void
+   onImportAssetFolderAt?: (position: { x: number; y: number }) => void
++  onReplaceFile?: (nodeId: string) => void
++  onOpenFilePreview?: (nodeId: string) => void
+   onCropNode?: (nodeId: string) => void
+   onStartImageMaskEdit?: (nodeId: string) => void
+   onDownloadOriginal?: (node?: MivoCanvasNode) => void
+@@ -43,6 +45,8 @@ export function NodeActionMenu({
+   onRenameNode,
+   onImportAssetAt,
+   onImportAssetFolderAt,
++  onReplaceFile,
++  onOpenFilePreview,
+   onCropNode,
+   onStartImageMaskEdit,
+   onDownloadOriginal,
+@@ -64,6 +68,8 @@ export function NodeActionMenu({
+     onRenameNode,
+     onImportAssetAt,
+     onImportAssetFolderAt,
++    onReplaceFile,
++    onOpenFilePreview,
+     onCropNode,
+     onStartImageMaskEdit,
+     onDownloadOriginal,
+@@ -85,8 +91,6 @@ export function NodeActionMenu({
+   }
+ 
+   const renderActionGlyph = ({ icon: Icon, text, swatch, linePreview }: CanvasActionItem) => {
+-    // swatch glyph 是菜单项上的"当前色指示点",不是取色器;选色 UI 统一走 color 模块
+-    // (ActionColorSwatchPicker),这个单色点按 glyph 语义保留(#321 审计结论)。
+     if (swatch) {
+       return (
+         <i
+@@ -123,6 +127,20 @@ export function NodeActionMenu({
+   const cancelHoverOpen = useCallback(() => window.clearTimeout(hoverOpenTimerRef.current), [])
+   useEffect(() => () => window.clearTimeout(hoverOpenTimerRef.current), [])
+ 
++  // R9:子菜单位置在打开瞬间计算;视口突变(resize/visualViewport)下与其错位
++  // 悬挂,不如收起(根菜单由 CanvasContextMenu 自己重夹取)。
++  useEffect(() => {
++    const closeSubmenu = () => setOpenSubmenu({ side: 'right' })
++    window.addEventListener('resize', closeSubmenu)
++    window.visualViewport?.addEventListener('resize', closeSubmenu)
++    window.visualViewport?.addEventListener('scroll', closeSubmenu)
++    return () => {
++      window.removeEventListener('resize', closeSubmenu)
++      window.visualViewport?.removeEventListener('resize', closeSubmenu)
++      window.visualViewport?.removeEventListener('scroll', closeSubmenu)
++    }
++  }, [])
++
+   const openChildMenu = useCallback((actionId: string, button: HTMLButtonElement, submenuWidth = 188) => {
+     const rect = button.getBoundingClientRect()
+     const viewport = window.visualViewport
+@@ -131,7 +149,7 @@ export function NodeActionMenu({
+     const viewportWidth = viewport?.width || window.innerWidth
+     const viewportHeight = viewport?.height || window.innerHeight
+     const gap = 8
+-    const margin = 12
++    const margin = menuViewportMargin
+     const maxHeight = Math.min(360, viewportHeight - margin * 2)
+     const hasRoomRight = rect.right + gap + submenuWidth + margin <= viewportLeft + viewportWidth
+     const side = hasRoomRight ? 'right' : 'left'
+diff --git a/src/canvas/RegionEditOverlay.tsx b/src/canvas/RegionEditOverlay.tsx
+index 5dfe07a9..6dfd971e 100644
+--- a/src/canvas/RegionEditOverlay.tsx
++++ b/src/canvas/RegionEditOverlay.tsx
+@@ -67,6 +67,7 @@ import type { RegionEditTool } from './regionEditTools'
+ import { toContainer, type Viewport } from '../render/EditOverlayLayer'
+ import { LocalizedKeyError } from '../lib/localizedKeyError'
+ import { t } from '../i18n'
++import { isContextMenuOpen } from '../lib/menuOverlayStack'
+ 
+ type RegionEditOverlayProps = {
+   node: MivoCanvasNode
+@@ -737,6 +738,8 @@ export function RegionEditOverlay({
+         return
+       }
+       if (event.key === 'Escape' && selectedIndexRef.current != null) {
++        // R6(menuOverlayStack):右键菜单开着时让行给菜单,选区等下一次 Escape。
++        if (isContextMenuOpen()) return
+         event.preventDefault()
+         event.stopPropagation()
+         setSelectedIndex(undefined)
+@@ -750,6 +753,9 @@ export function RegionEditOverlay({
+   // 原生撤销,不劫持打字撤销(同局部重绘)。
+   useEffect(() => {
+     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
++      // R6(menuOverlayStack)菜单优先门:本 handler 今天只管 Cmd/Ctrl+Z,这道门
++      // 钉住未来加 Escape 分支时也不能在菜单开着的同帧清下层状态。
++      if (isContextMenuOpen() && event.key === 'Escape') return
+       if (submitting) return
+       if (event.key.toLowerCase() !== 'z' || !(event.metaKey || event.ctrlKey)) return
+       const target = event.target as HTMLElement | null
+diff --git a/src/canvas/SelectionQuickToolbar.tsx b/src/canvas/SelectionQuickToolbar.tsx
+index 0c49ee83..4ede2e2b 100644
+--- a/src/canvas/SelectionQuickToolbar.tsx
++++ b/src/canvas/SelectionQuickToolbar.tsx
+@@ -9,6 +9,7 @@ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import { TextFormatToolbar } from './TextFormatToolbar'
+ import { ActionColorSwatchPicker } from './color/ActionColorSwatchPicker'
+ import { isInkDarkColor } from './color/colorSwatchPalette'
++import { handleOverlayEscape } from '../lib/menuOverlayStack'
+ 
+ type SelectionQuickToolbarProps = {
+   selectedNodes: MivoCanvasNode[]
+@@ -109,15 +110,10 @@ export function SelectionQuickToolbar({
+   useEffect(() => {
+     if (!openActionId) return
+ 
++    // R6(context-menu-standard):任一右键菜单(画布/共享)开着时 Escape 让给它,
++    // 让行名单与消费语义收敛在 menuOverlayStack 单一来源。
+     const closeOnEscape = (event: KeyboardEvent) => {
+-      if (event.key !== 'Escape') return
+-      // R6(context-menu-standard):右键菜单是最上层浮层,开着时 Escape 让给它
+-      // (useGlobalCanvasEvents 只关菜单);快捷条子菜单等下一次 Escape。否则这里
+-      // 的 capture+stopImmediatePropagation 会把 bubble 层的全局处理器整个饿死。
+-      if (document.querySelector('.node-context-menu')) return
+-      event.preventDefault()
+-      event.stopImmediatePropagation()
+-      setOpenMenu({ selectionKey })
++      handleOverlayEscape(event, () => setOpenMenu({ selectionKey }))
+     }
+ 
+     window.addEventListener('keydown', closeOnEscape, { capture: true })
+@@ -228,11 +224,9 @@ export function SelectionQuickToolbar({
+   }: CanvasActionItem) => {
+     const hasMenu = Boolean(children?.length) || Boolean(colorPicker)
+     const menuOpen = openActionId === id
+-    // #321:palette 变体(子项自渲 palette-swatch-button)已下线——最后一处 live 场景
+-    // (贴纸纸色)迁入 color 模块(menuVariant 'color-picker' + colorPicker.rows)。
+-    // 子项不再携带 swatch,children 一律按命令项渲染。
+-    const commandActions = children || []
+-    const resolvedMenuVariant = menuVariant || 'list'
++    const swatchActions = children?.filter((child) => child.swatch) || []
++    const commandActions = children?.filter((child) => !child.swatch) || []
++    const resolvedMenuVariant = menuVariant || (swatchActions.length > 0 ? 'palette' : 'list')
+     const toggleMenu = () =>
+       setOpenMenu((current) => ({
+         selectionKey,
+@@ -260,6 +254,36 @@ export function SelectionQuickToolbar({
+             {colorPicker ? <ActionColorSwatchPicker config={colorPicker} /> : null}
+           </>
+         ) : null}
++        {resolvedMenuVariant === 'palette' ? (
++          <>
++            <div className="selection-quick-toolbar-palette" role="none">
++              {swatchActions.map((child) => (
++                <button
++                  key={child.id}
++                  type="button"
++                  role="menuitem"
++                  className={`palette-swatch-button ${child.swatch?.transparent ? 'transparent' : ''} ${child.selected ? 'selected' : ''}`}
++                  style={{ '--swatch-color': child.swatch?.color } as CSSProperties}
++                  aria-label={child.label}
++                  data-tooltip={child.label}
++                  onMouseDown={preventToolButtonFocus}
++                  disabled={child.disabled}
++                  onClick={() => runAction(child)}
++                >
++                  <span className={isInkDarkColor(child.swatch?.color) ? 'swatch-ink-hint' : undefined} aria-hidden="true" />
++                </button>
++              ))}
++            </div>
++            {commandActions.length ? (
++              <>
++                <div className="selection-quick-toolbar-menu-divider" />
++                <div className="selection-quick-toolbar-choice-row" role="none">
++                  {commandActions.map(renderCompactMenuAction)}
++                </div>
++              </>
++            ) : null}
++          </>
++        ) : null}
+         {resolvedMenuVariant === 'segmented' ? (
+           <div className="selection-quick-toolbar-choice-row" role="none">
+             {(children || []).map(renderCompactMenuAction)}
+@@ -270,7 +294,31 @@ export function SelectionQuickToolbar({
+             {(children || []).map(renderCompactMenuAction)}
+           </div>
+         ) : null}
+-        {resolvedMenuVariant === 'list' ? commandActions.map(renderListMenuAction) : null}
++        {resolvedMenuVariant === 'list' ? (
++          <>
++            {swatchActions.length ? (
++              <div className="selection-quick-toolbar-palette" role="none">
++                {swatchActions.map((child) => (
++                  <button
++                    key={child.id}
++                    type="button"
++                    role="menuitem"
++                    className={`palette-swatch-button ${child.swatch?.transparent ? 'transparent' : ''} ${child.selected ? 'selected' : ''}`}
++                    style={{ '--swatch-color': child.swatch?.color } as CSSProperties}
++                    aria-label={child.label}
++                    data-tooltip={child.label}
++                    disabled={child.disabled}
++                    onClick={() => runAction(child)}
++                  >
++                    <span className={isInkDarkColor(child.swatch?.color) ? 'swatch-ink-hint' : undefined} aria-hidden="true" />
++                  </button>
++                ))}
++              </div>
++            ) : null}
++            {swatchActions.length && commandActions.length ? <div className="selection-quick-toolbar-menu-divider" /> : null}
++            {commandActions.map(renderListMenuAction)}
++          </>
++        ) : null}
+       </div>
+     )
+ 
+diff --git a/src/canvas/TextFormatToolbar.tsx b/src/canvas/TextFormatToolbar.tsx
+index c947b245..ff77dddc 100644
+--- a/src/canvas/TextFormatToolbar.tsx
++++ b/src/canvas/TextFormatToolbar.tsx
+@@ -17,6 +17,7 @@ import { toastFeedback } from '../store/toastStore'
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import { ColorSwatchPicker } from './color/ColorSwatchPicker'
+ import { isInkDarkColor } from './color/colorSwatchPalette'
++import { handleOverlayEscape } from '../lib/menuOverlayStack'
+ import { useTranslation } from 'react-i18next'
+ import {
+   defaultTextAlign,
+@@ -94,14 +95,10 @@ export function TextFormatToolbar({ node, scale }: TextFormatToolbarProps) {
+   useEffect(() => {
+     if (!openMenu) return
+ 
++    // R6(context-menu-standard):任一右键菜单开着时 Escape 让给它,见
++    // menuOverlayStack(让行名单单一来源)。
+     const closeOnEscape = (event: KeyboardEvent) => {
+-      if (event.key !== 'Escape') return
+-      // R6(context-menu-standard):右键菜单开着时 Escape 让给它,见
+-      // SelectionQuickToolbar 同款注释。
+-      if (document.querySelector('.node-context-menu')) return
+-      event.preventDefault()
+-      event.stopImmediatePropagation()
+-      setMenuState({ nodeId: node.id })
++      handleOverlayEscape(event, () => setMenuState({ nodeId: node.id }))
+     }
+ 
+     window.addEventListener('keydown', closeOnEscape, { capture: true })
+diff --git a/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts b/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
+index e8d29acb..c6b83842 100644
+--- a/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
++++ b/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
+@@ -742,6 +742,44 @@ describe('canvasActionModel — characterization · part 2 (③ markup/AI-edit 
+       groups.forEach((group) => group.actions.forEach(assertNoShortcut))
+     }
+   })
++
++  // §5(阶段 4 实装):markdown/pdf/video 的 document 专属组 + markdown 的
++  // view-details 类型化文案;三者不得携带任何 AI 生成项。
++  describe('document 扩展(§5,markdown/pdf/video 右键专属组)', () => {
++    it('markdown → document 组恰为 {copy-source, replace-file};view-details 保持只读详情文案', () => {
++      const rt = createRuntime(ctx([markdownNode('d1', { text: '# hi' })]), { onReplaceFile: vi.fn() })
++      const groups = contextMenuGroupsFor(rt)
++      const doc = groups.find((group) => group.id === 'document')
++      expect(doc?.actions.map((action) => action.id)).toEqual(['copy-source', 'replace-file'])
++      // 不做"Edit document"假承诺:Inspector 尚无 Markdown 正文编辑器(终审第 5 条)。
++      expect(findAction(groups, 'view-details')?.label).toBe('View details')
++      fire(groups, 'replace-file')
++      expect(vi.mocked(rt.onReplaceFile)).toHaveBeenCalledWith('d1')
++    })
++
++    it('pdf → 恰为 {open-preview, replace-file};video → 恰为 {replace-file};三类型均无 AI 生成项', () => {
++      const pdfRt = createRuntime(ctx([pdfNode('p1')]), { onOpenFilePreview: vi.fn(), onReplaceFile: vi.fn() })
++      const pdf = contextMenuGroupsFor(pdfRt)
++      expect(pdf.find((group) => group.id === 'document')?.actions.map((action) => action.id)).toEqual(['open-preview', 'replace-file'])
++      fire(pdf, 'open-preview')
++      expect(vi.mocked(pdfRt.onOpenFilePreview)).toHaveBeenCalledWith('p1')
++      const video = contextMenuGroupsFor(createRuntime(ctx([videoNode('v1')]), { onReplaceFile: vi.fn() }))
++      expect(video.find((group) => group.id === 'document')?.actions.map((action) => action.id)).toEqual(['replace-file'])
++      const markdown = contextMenuGroupsFor(createRuntime(ctx([markdownNode('d2', { text: 'x' })])))
++      for (const groups of [pdf, video, markdown]) {
++        for (const id of ['generate-beside', 'variations', 'add-edit-note', 'generate-into-slot']) {
++          expect(findAction(groups, id), id).toBeUndefined()
++        }
++      }
++    })
++
++    it('document 组仅单选出现:多选 [markdown, pdf] 不出任何 document 项', () => {
++      const groups = contextMenuGroupsFor(createRuntime(ctx([markdownNode('d1'), pdfNode('p1')])))
++      for (const id of ['copy-source', 'replace-file', 'open-preview']) {
++        expect(findAction(groups, id), id).toBeUndefined()
++      }
++    })
++  })
+ })
+ 
+ // BASELINE COUNT (part 2): T0.4① 迁移基线 = 153 expect / 96 tests(part 1+2 合计
+diff --git a/src/canvas/actions/canvasActionModel.ts b/src/canvas/actions/canvasActionModel.ts
+index 3abc75ae..2d48e94b 100644
+--- a/src/canvas/actions/canvasActionModel.ts
++++ b/src/canvas/actions/canvasActionModel.ts
+@@ -1,6 +1,5 @@
+ import {
+   ChevronsUp,
+-  Clipboard,
+   Copy,
+   Download,
+   Eye,
+@@ -25,6 +24,7 @@ import {
+ import { t } from '../../i18n'
+ import { objectNameFor } from './objectNames'
+ import { arrangeContextMenuGroup } from './layerActionGroups'
++import { documentContextMenuGroupsFor } from './documentActionGroups'
+ import { menuShortcuts } from './menuShortcuts'
+ import { markupContextMenuGroupsFor, markupQuickToolbarGroupsFor } from './markupStyleActions'
+ import {
+@@ -34,7 +34,6 @@ import {
+   sectionLockToolbarAction,
+ } from './sectionStyleActions'
+ import { debugLogger } from '../../store/debugLogStore'
+-import { toastFeedback } from '../../store/toastStore'
+ import type { CanvasNodeType } from '../../types/mivoCanvas'
+ import { hasAnyCapability, hasCommonCapability } from './canvasSelectionModel'
+ import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
+@@ -68,27 +67,13 @@ import {
+   createAiSlotAtContext,
+   selectAll,
+   copySelectedNodes,
+-  pasteClipboardNodes,
+   groupSelectedNodes,
+   ungroupSelectedNodes,
+   toggleSelectedNodesLocked,
+   hideSelectedNodes,
+   showAllHiddenNodes,
+ } from './canvasActionEmitters'
+-
+-// §3(2026-08-01 拍板):paste 的 label 收敛为 "Paste here"(对齐参考产品语义),
+-// 数量信息挪进粘贴完成的 toast;blank 与选区两处菜单共用本装配。
+-const pasteHereAction = (runtime: CanvasActionRuntime): CanvasActionItem => ({
+-  id: 'paste',
+-  label: t('menu.create.pasteHere'),
+-  icon: Clipboard,
+-  shortcut: menuShortcuts.paste,
+-  onClick: () => {
+-    const count = runtime.clipboardCount
+-    pasteClipboardNodes(runtime)
+-    toastFeedback.success(t('toast.paste.done', { count }))
+-  },
+-})
++import { pasteHereAction } from './clipboardActionItems'
+ 
+ const hasGroupedNodes = (runtime: CanvasActionRuntime) =>
+   runtime.context.nodes.some((node) => Boolean(node.groupId))
+@@ -233,6 +218,10 @@ const contextMenuExtensionsByNodeType: Partial<Record<CanvasNodeType, NodeAction
+   'ai-slot': generationContextMenuGroupsFor,
+   frame: sectionContextMenuGroupsFor,
+   markup: markupContextMenuGroupsFor,
++  // §5(2026-08-01 拍板,阶段 4 实装):文档/媒体三类型的专属组。
++  markdown: documentContextMenuGroupsFor,
++  pdf: documentContextMenuGroupsFor,
++  video: documentContextMenuGroupsFor,
+ }
+ 
+ const nodeContextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasActionGroup[] => {
+diff --git a/src/canvas/actions/canvasActionTypes.ts b/src/canvas/actions/canvasActionTypes.ts
+index 31c50673..a9c8180d 100644
+--- a/src/canvas/actions/canvasActionTypes.ts
++++ b/src/canvas/actions/canvasActionTypes.ts
+@@ -81,6 +81,10 @@ export type CanvasActionRuntime = {
+   onEditText?: (nodeId: string) => void
+   onRenameNode?: (nodeId: string) => void
+   onImportAssetAt?: (position: { x: number; y: number }) => void
++  /** §5:markdown/pdf/video 的 Replace file(文件选择 + 原位替换)。 */
++  onReplaceFile?: (nodeId: string) => void
++  /** §5:pdf 的 Open preview(新窗打开)。 */
++  onOpenFilePreview?: (nodeId: string) => void
+   onImportAssetFolderAt?: (position: { x: number; y: number }) => void
+   onCropNode?: (nodeId: string) => void
+   onStartImageMaskEdit?: (nodeId: string) => void
+@@ -171,6 +175,9 @@ export type CanvasActionRuntime = {
+     options?: CanvasGenerationOptions,
+   ) => Promise<string[]>
+   generateFromAnnotation: (annotationNodeId?: string, options?: CanvasGenerationOptions) => Promise<string[]>
++  /** Duplicate 已全面退出菜单/快捷条(2026-07-31 用户拍板,仅留 ⌘D 快捷键);
++   *  这两个 runtime 方法的唯一消费者是命令通道(canvasCommandExecutor),
++   *  勿在菜单装配里复用。 */
+   duplicateNode: (nodeId: string) => void
+   duplicateSelectedNodes: () => void
+   groupSelectedNodes: () => void
+diff --git a/src/canvas/actions/clipboardActionItems.ts b/src/canvas/actions/clipboardActionItems.ts
+new file mode 100644
+index 00000000..18e08dd3
+--- /dev/null
++++ b/src/canvas/actions/clipboardActionItems.ts
+@@ -0,0 +1,23 @@
++// clipboardActionItems — 剪贴板相关的菜单装配件,从 canvasActionModel.ts 抽出
++// (结构守卫大文件减重,与 layerActionGroups/sectionStyleActions 同款拆分形态)。
++//
++// §3(2026-08-01 拍板):paste 的 label 收敛为 "Paste here"(对齐参考产品语义),
++// 数量信息挪进粘贴完成的 toast;blank 与选区两处菜单共用本装配。
++import { Clipboard } from 'lucide-react'
++import { t } from '../../i18n'
++import { toastFeedback } from '../../store/toastStore'
++import { pasteClipboardNodes } from './canvasActionEmitters'
++import { menuShortcuts } from './menuShortcuts'
++import type { CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
++
++export const pasteHereAction = (runtime: CanvasActionRuntime): CanvasActionItem => ({
++  id: 'paste',
++  label: t('menu.create.pasteHere'),
++  icon: Clipboard,
++  shortcut: menuShortcuts.paste,
++  onClick: () => {
++    const count = runtime.clipboardCount
++    pasteClipboardNodes(runtime)
++    toastFeedback.success(t('toast.paste.done', { count }))
++  },
++})
+diff --git a/src/canvas/actions/documentActionGroups.ts b/src/canvas/actions/documentActionGroups.ts
+new file mode 100644
+index 00000000..1d1951d8
+--- /dev/null
++++ b/src/canvas/actions/documentActionGroups.ts
+@@ -0,0 +1,64 @@
++// documentActionGroups — markdown/pdf/video 的右键菜单专属组(context-menu-standard
++// §5,2026-08-01 拍板,阶段 4 实装)。三类型此前只有骨架组零专属项;按标准:
++//   markdown → Copy as Markdown + Replace file(详情入口沿用骨架 View details,
++//              不做假 Edit;真 Markdown 编辑器立项后再回填,见 §5 决策)
++//   pdf      → Open preview + Replace file
++//   video    → Replace file
++// 共同约束:不加任何 AI 生成项(生成链路不吃文档/视频输入);Download 由骨架
++// export 组覆盖,不重复设项。
++import { ClipboardCopy, ExternalLink, FileUp } from 'lucide-react'
++import { t } from '../../i18n'
++import { debugLogger } from '../../store/debugLogStore'
++import { toastFeedback } from '../../store/toastStore'
++import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
++
++// Copy as Markdown:markdown 节点的正文(node.text,导入时已读入)进系统剪贴板。
++// 空文与剪贴板失败都要有可见反馈(dev-logging 规则)。
++const copyMarkdownSource = async (runtime: CanvasActionRuntime) => {
++  const node = runtime.context.primaryNode
++  const source = node?.text ?? ''
++  if (!source.trim()) {
++    debugLogger.warn('Document', `Copy as Markdown skipped: node ${node?.id ?? '?'} has no source text`)
++    toastFeedback.warn(t('toast.document.copyEmpty'))
++    return
++  }
++  try {
++    await navigator.clipboard.writeText(source)
++    debugLogger.log('Document', `Copied markdown source of ${node?.id} (${source.length} chars)`)
++    toastFeedback.success(t('toast.document.copied'))
++  } catch (error) {
++    debugLogger.error('Document', `Copy as Markdown failed: ${error instanceof Error ? error.message : String(error)}`)
++    toastFeedback.error(t('toast.document.copyFailed'))
++  }
++}
++
++export const documentContextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasActionGroup[] => {
++  const node = runtime.context.primaryNode
++  if (!node) return []
++
++  const actions: CanvasActionItem[] = []
++  if (node.type === 'markdown') {
++    actions.push({
++      id: 'copy-source',
++      label: t('menu.document.copySource'),
++      icon: ClipboardCopy,
++      onClick: () => void copyMarkdownSource(runtime),
++    })
++  }
++  if (node.type === 'pdf') {
++    actions.push({
++      id: 'open-preview',
++      label: t('menu.document.openPreview'),
++      icon: ExternalLink,
++      onClick: () => runtime.onOpenFilePreview?.(node.id),
++    })
++  }
++  actions.push({
++    id: 'replace-file',
++    label: t('menu.document.replaceFile'),
++    icon: FileUp,
++    onClick: () => runtime.onReplaceFile?.(node.id),
++  })
++
++  return [{ id: 'document', actions }]
++}
+diff --git a/src/canvas/actions/useCanvasActionRuntime.ts b/src/canvas/actions/useCanvasActionRuntime.ts
+index f1b4a844..6264a42a 100644
+--- a/src/canvas/actions/useCanvasActionRuntime.ts
++++ b/src/canvas/actions/useCanvasActionRuntime.ts
+@@ -17,6 +17,8 @@ type UseCanvasActionRuntimeOptions = {
+   onEditText?: (nodeId: string) => void
+   onRenameNode?: (nodeId: string) => void
+   onImportAssetAt?: (position: { x: number; y: number }) => void
++  onReplaceFile?: (nodeId: string) => void
++  onOpenFilePreview?: (nodeId: string) => void
+   onImportAssetFolderAt?: (position: { x: number; y: number }) => void
+   onCropNode?: (nodeId: string) => void
+   onStartImageMaskEdit?: (nodeId: string) => void
+@@ -37,6 +39,8 @@ export const useCanvasActionRuntime = ({
+   onEditText,
+   onRenameNode,
+   onImportAssetAt,
++  onReplaceFile,
++  onOpenFilePreview,
+   onImportAssetFolderAt,
+   onCropNode,
+   onStartImageMaskEdit,
+@@ -112,6 +116,8 @@ export const useCanvasActionRuntime = ({
+     onEditText,
+     onRenameNode,
+     onImportAssetAt,
++    onReplaceFile,
++    onOpenFilePreview,
+     onImportAssetFolderAt,
+     onCropNode,
+     onStartImageMaskEdit,
+diff --git a/src/canvas/canvasImportHandlers.ts b/src/canvas/canvasImportHandlers.ts
+index e862d5af..af77265e 100644
+--- a/src/canvas/canvasImportHandlers.ts
++++ b/src/canvas/canvasImportHandlers.ts
+@@ -91,6 +91,44 @@ export const wireFolderImportInput = (
+   })
+ }
+ 
++// 单文件(可多选)导入对话框:开对话框 + 批量导入 + 汇报,一条龙放这里
++// (MivoCanvas.tsx structure-guarded 不能再长)。
++export const openFileImportDialog = (
++  position: { x: number; y: number },
++  addImportedFileNode: AddImportedFileNode,
++): void => {
++  const input = document.createElement('input')
++  input.type = 'file'
++  input.accept = 'image/*,.md,.markdown,application/pdf,video/*'
++  input.multiple = true
++
++  input.onchange = async () => {
++    const files = Array.from(input.files || [])
++    await importCanvasFileBatch(files, position, addImportedFileNode)
++      .then(reportCanvasBatchImport)
++      .catch(handleImportError)
++  }
++
++  input.click()
++}
++
++// 目录导入对话框(#297 P3-15):浏览器原生 webkitdirectory。目录选择器不吃
++// accept 过滤(浏览器会把整棵子树交进来),类型过滤与配额一律在共享层
++// importCanvasFileBatch 做;change + 取消双路径接线在 wireFolderImportInput。
++export const openFolderImportDialog = (
++  position: { x: number; y: number },
++  addImportedFileNode: AddImportedFileNode,
++): void => {
++  const input = document.createElement('input')
++  input.type = 'file'
++  input.multiple = true
++  input.webkitdirectory = true
++
++  wireFolderImportInput(input, position, addImportedFileNode)
++
++  input.click()
++}
++
+ // C02: shared error sink for fire-and-forget asset imports. Without this the
+ // downstream reject becomes an unhandled rejection with zero user feedback.
+ // Extracted to a module so MivoCanvas.tsx (structure-guarded) doesn't grow.
+diff --git a/src/canvas/canvasInteraction.test.ts b/src/canvas/canvasInteraction.test.ts
+index bfa015bf..fecc83ac 100644
+--- a/src/canvas/canvasInteraction.test.ts
++++ b/src/canvas/canvasInteraction.test.ts
+@@ -10,6 +10,7 @@ import {
+   resizeNodeTransform,
+   runtimeToolFor,
+   shouldStartCanvasSurfaceInteraction,
++  isCanvasChromeTarget,
+   isCanvasUiTarget,
+   isDragInterruptedContextMenu,
+   handleLockShortcut,
+@@ -284,6 +285,15 @@ describe('nativeContextMenuAllowed / isCanvasUiTarget(R4 右键 gate)', () => {
+     const bar: FakeElement = new FakeElement((selector) => (selector.includes('.selection-quick-toolbar') ? bar : null))
+     expect(isCanvasUiTarget(bar)).toBe(true)
+   })
++
++  it('isCanvasChromeTarget 委托 isCanvasUiTarget(R4 单一来源,SVG/quickbar 不再漏过)', () => {
++    const bar: FakeElement = new FakeElement((selector) => (selector.includes('.selection-quick-toolbar') ? bar : null))
++    expect(isCanvasChromeTarget(bar)).toBe(isCanvasUiTarget(bar))
++    expect(isCanvasChromeTarget(bar)).toBe(true)
++    const blank = new FakeElement(() => null)
++    expect(isCanvasChromeTarget(blank)).toBe(false)
++    expect(isCanvasChromeTarget(null)).toBe(false)
++  })
+ })
+ 
+ 
+diff --git a/src/canvas/canvasInteraction.ts b/src/canvas/canvasInteraction.ts
+index b477cb87..175c77c3 100644
+--- a/src/canvas/canvasInteraction.ts
++++ b/src/canvas/canvasInteraction.ts
+@@ -268,17 +268,11 @@ export const nativeContextMenuAllowed = (target: EventTarget | null) =>
+   target instanceof Element &&
+   Boolean(target.closest('.dom-text-editor, .dom-markup-text-editor, [data-native-menu="true"]'))
+ 
+-// Shell-level chrome target check (controls/dock/ai-action-bar/menus). Used by
+-// handleCanvasDragOver/Drop/DoubleClick to short-circuit UI clicks. Kept here
+-// alongside isCanvasUiTarget so UI-gate logic lives in one module.
+-// (contextmenu 已按 R4 改走 isCanvasUiTarget,不再用本函数。)
+-export const isCanvasChromeTarget = (target: EventTarget | null) =>
+-  target instanceof HTMLElement &&
+-  Boolean(
+-    target.closest(
+-      '[data-canvas-ui="true"], .canvas-tool-dock, .canvas-ai-action-bar, .node-context-menu, .empty-canvas-note',
+-    ),
+-  )
++// Shell-level chrome target check(dragover/drop/doubleclick 的 UI 短路)。
++// R4 终审收敛:不再维护第二张缩减版白名单,直接委托 isCanvasUiTarget 单一来源
++// ——旧版只收 HTMLElement 且仅 5 个选择器,quickbar/overlay 内的 SVG 会漏过
++// doubleclick/drop gate(终审 MINOR-7)。
++export const isCanvasChromeTarget = (target: EventTarget | null) => isCanvasUiTarget(target)
+ 
+ const contextMenuWidth = 252
+ const contextMenuMaxHeight = 620
+diff --git a/src/canvas/useFileNodeActions.test.ts b/src/canvas/useFileNodeActions.test.ts
+new file mode 100644
+index 00000000..8784f565
+--- /dev/null
++++ b/src/canvas/useFileNodeActions.test.ts
+@@ -0,0 +1,105 @@
++// @vitest-environment happy-dom
++// §5 Replace file / Open preview 的可测内核(终审 MINOR-8):
++// - validateReplacementFile:类型族不符 / 字节签名伪装 → 拒绝(与 canonical 导入
++//   同一份 inspectFileSignature 判定);
++// - navigatePreviewWindow:popup 被拦(null 句柄)→ false 且回收 blob URL;正常
++//   句柄 → 断 opener、replace 导航;危险协议(javascript:/data:/file:)→ 关窗
++//   拒绝;导航抛错 → 关窗 + 立即回收(终审第二轮第 4 条)。
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { isSafePreviewUrl, navigatePreviewWindow, validateReplacementFile } from './useFileNodeActions'
++
++const fileOf = (name: string, bytes: string, type: string) => new File([bytes], name, { type })
++
++afterEach(() => {
++  vi.useRealTimers()
++})
++
++describe('validateReplacementFile(§5 替换准入)', () => {
++  it('类型族不符:给 pdf 节点选 .md 文件 → 拒绝', async () => {
++    const verdict = await validateReplacementFile(fileOf('note.md', '# hi', 'text/markdown'), 'pdf')
++    expect(verdict.ok).toBe(false)
++  })
++
++  it('字节伪装:.pdf 扩展名 + 非 PDF 字节 → 签名闸拒绝', async () => {
++    const verdict = await validateReplacementFile(fileOf('fake.pdf', 'hello world', 'application/pdf'), 'pdf')
++    expect(verdict.ok).toBe(false)
++  })
++
++  it('真 PDF 头 → 通过;markdown 文本 → 通过', async () => {
++    expect((await validateReplacementFile(fileOf('ok.pdf', '%PDF-1.7\n%%EOF', 'application/pdf'), 'pdf')).ok).toBe(true)
++    expect((await validateReplacementFile(fileOf('ok.md', '# title', 'text/markdown'), 'markdown')).ok).toBe(true)
++  })
++})
++
++describe('navigatePreviewWindow(popup blocker 语义)', () => {
++  it('句柄为 null(被拦)→ 返回 false 并立即回收 blob URL', () => {
++    const revoke = vi.fn()
++    expect(navigatePreviewWindow(null, 'blob:x', revoke)).toBe(false)
++    expect(revoke).toHaveBeenCalledTimes(1)
++  })
++
++  it('正常句柄 → 断 opener + location.replace 导航,返回 true', () => {
++    const replace = vi.fn()
++    const win = { opener: {}, location: { replace } } as unknown as Window
++    expect(navigatePreviewWindow(win, 'blob:y')).toBe(true)
++    expect(win.opener).toBeNull()
++    expect(replace).toHaveBeenCalledWith('blob:y')
++  })
++
++  it('危险协议(javascript:/data:/file:)→ 关窗、回收、返回 false,绝不导航', () => {
++    for (const url of ['javascript:alert(1)', 'data:text/html,<script>1</script>', 'file:///etc/passwd']) {
++      const replace = vi.fn()
++      const close = vi.fn()
++      const revoke = vi.fn()
++      const win = { opener: {}, location: { replace }, close } as unknown as Window
++      expect(navigatePreviewWindow(win, url, revoke)).toBe(false)
++      expect(replace).not.toHaveBeenCalled()
++      expect(close).toHaveBeenCalledTimes(1)
++      expect(revoke).toHaveBeenCalledTimes(1)
++    }
++  })
++
++  it('成功导航后 blob URL 与预览窗同寿命:窗口开着不回收,关闭后才回收(Greptile P1)', () => {
++    vi.useFakeTimers()
++    const revoke = vi.fn()
++    const win = { opener: {}, location: { replace: vi.fn() }, closed: false } as unknown as Window & { closed: boolean }
++    expect(navigatePreviewWindow(win, 'blob:alive', revoke)).toBe(true)
++    vi.advanceTimersByTime(120_000)
++    expect(revoke).not.toHaveBeenCalled()
++    win.closed = true
++    vi.advanceTimersByTime(10_000)
++    expect(revoke).toHaveBeenCalledTimes(1)
++    vi.advanceTimersByTime(60_000)
++    expect(revoke).toHaveBeenCalledTimes(1)
++  })
++
++  it('location.replace 抛错 → 关窗 + 立即回收 blob URL,返回 false(不留泄漏)', () => {
++    const close = vi.fn()
++    const revoke = vi.fn()
++    const win = {
++      opener: {},
++      location: {
++        replace: () => {
++          throw new Error('nav refused')
++        },
++      },
++      close,
++    } as unknown as Window
++    expect(navigatePreviewWindow(win, 'blob:z', revoke)).toBe(false)
++    expect(close).toHaveBeenCalledTimes(1)
++    expect(revoke).toHaveBeenCalledTimes(1)
++  })
++})
++
++describe('isSafePreviewUrl(导航协议白名单)', () => {
++  it('http(s)/blob/相对路径放行;javascript/data/file/畸形拒绝', () => {
++    expect(isSafePreviewUrl('https://example.com/a.pdf')).toBe(true)
++    expect(isSafePreviewUrl('http://example.com/a.pdf')).toBe(true)
++    expect(isSafePreviewUrl('blob:http://localhost/uuid')).toBe(true)
++    expect(isSafePreviewUrl('/assets/a.pdf')).toBe(true)
++    expect(isSafePreviewUrl('javascript:alert(1)')).toBe(false)
++    expect(isSafePreviewUrl('data:text/html,x')).toBe(false)
++    expect(isSafePreviewUrl('file:///etc/passwd')).toBe(false)
++    expect(isSafePreviewUrl('JaVaScRiPt:alert(1)')).toBe(false)
++  })
++})
+diff --git a/src/canvas/useFileNodeActions.ts b/src/canvas/useFileNodeActions.ts
+new file mode 100644
+index 00000000..8f13ba69
+--- /dev/null
++++ b/src/canvas/useFileNodeActions.ts
+@@ -0,0 +1,231 @@
++// useFileNodeActions — markdown/pdf/video 的 Replace file 与 pdf Open preview
++// (context-menu-standard §5,阶段 4 实装)。Replace 流程与 useImageEditActions 的
++// replaceImageNode 同款契约:选文件前后双重校验(missing/locked)、异步落地后按
++// store 返回值决定成功/拒绝反馈、拒绝时清理孤儿资产。
++//
++// 终审加固(2026-08-01):
++// - 替换文件先过字节签名闸(inspectFileSignature,与 canonical 导入同一份判定),
++//   accept 只是选择器提示,伪装/错族文件在触碰 assetStorage 前判死;
++// - 资产元数据(assetMimeType/assetOriginalName/assetSizeBytes)随替换原子更新,
++//   Inspector 不再展示旧文件的来源信息;
++// - Open preview 在点击栈内同步预开窗口(保住用户激活),被 popup blocker 拦下
++//   如实 toast,不再记假成功。
++import { useCallback } from 'react'
++import { useCanvasStore } from '../store/canvasStore'
++import { debugLogger } from '../store/debugLogStore'
++import { toastFeedback } from '../store/toastStore'
++import { deleteImportedAsset, isImportedAssetUrl, readImportedAssetFile, saveImportedAsset } from '../lib/assetStorage'
++import { canvasAssetNodeTypeForFile } from '../lib/canvasAssetImport'
++import { inspectFileSignature } from '../lib/fileSignature'
++import { wrapMutation } from './actions/canvasSyncRuntime'
++import { isEffectivelyLocked } from '../store/canvasDocumentModel'
++import { t } from '../i18n'
++
++const REPLACEABLE_FILE_TYPES = ['markdown', 'pdf', 'video'] as const
++export type ReplaceableFileType = (typeof REPLACEABLE_FILE_TYPES)[number]
++
++const acceptByType: Record<ReplaceableFileType, string> = {
++  markdown: '.md,.markdown,text/markdown',
++  pdf: 'application/pdf,.pdf',
++  video: 'video/*',
++}
++
++const isReplaceableFileType = (type: string): type is ReplaceableFileType =>
++  (REPLACEABLE_FILE_TYPES as readonly string[]).includes(type)
++
++/** 替换文件的准入校验(纯函数,单测覆盖):扩展名/类型解析必须与节点类型同族,
++ *  且字节签名过闸(与 prepareCanvasFileImport 同一份 inspectFileSignature)。 */
++export const validateReplacementFile = async (
++  file: File,
++  expectedType: ReplaceableFileType,
++): Promise<{ ok: true } | { ok: false; reason: string }> => {
++  const resolvedType = canvasAssetNodeTypeForFile(file)
++  if (resolvedType !== expectedType) {
++    return { ok: false, reason: `declared ${resolvedType || 'unknown'}, node is ${expectedType}` }
++  }
++  const signature = await inspectFileSignature(file, expectedType)
++  if (!signature.matchesNodeType) {
++    return { ok: false, reason: `content signature mismatch: bytes look like ${signature.container || 'unknown'}` }
++  }
++  return { ok: true }
++}
++
++// 预览导航只放行这三种协议:同步预开的 about:blank 窗口与本站同源,放进
++// javascript:(乃至 data:/file:)就是把 crafted/服务端同步来的 assetUrl 变成可
++// 执行导航(终审第二轮第 4 条)。相对 URL 按当前站点解析,落在 http(s) 内。
++const safePreviewProtocols = new Set(['http:', 'https:', 'blob:'])
++
++export const isSafePreviewUrl = (url: string): boolean => {
++  try {
++    return safePreviewProtocols.has(new URL(url, window.location.href).protocol)
++  } catch {
++    return false
++  }
++}
++
++/** 预览窗导航(可注入 window 句柄单测):协议不过闸或导航抛错时关窗+立即回收
++ *  blob URL 并返回 false;成功时 blob 场景 60s 后回收。 */
++export const navigatePreviewWindow = (win: Window | null, url: string, revoke?: () => void): boolean => {
++  if (!win) {
++    revoke?.()
++    return false
++  }
++  if (!isSafePreviewUrl(url)) {
++    win.close()
++    revoke?.()
++    return false
++  }
++  try {
++    win.opener = null
++    win.location.replace(url)
++  } catch {
++    win.close()
++    revoke?.()
++    return false
++  }
++  if (revoke) {
++    // blob URL 与预览窗同寿命:窗口关闭后才回收。固定 60s 定时会在查看器
++    // reload/后退再前进重新取流时把还在用的 URL 撤销掉(Greptile P1)。
++    const timer = window.setInterval(() => {
++      if (win.closed) {
++        window.clearInterval(timer)
++        revoke()
++      }
++    }, 5_000)
++  }
++  return true
++}
++
++export function useFileNodeActions() {
++  const replaceFileNodeAsset = useCanvasStore((state) => state.replaceFileNodeAsset)
++
++  const replaceFileNode = useCallback(
++    (nodeId: string) => {
++      // 钉住发起时的画布:文件对话框可以无限期开着,期间用户可能切画布——
++      // 复制画布与源画布共享节点 id(nodeFactory.cloneNode 保留 id),不钉
++      // sceneId 会把文件替换到另一块画布的同 id 节点上(Greptile P1)。
++      const { nodes, sceneId } = useCanvasStore.getState()
++      const target = nodes.find((node) => node.id === nodeId && isReplaceableFileType(node.type))
++      if (!target || isEffectivelyLocked(nodes, target)) {
++        debugLogger.warn('Document', `Replace file blocked: node ${nodeId} missing or locked`)
++        toastFeedback.warn(t('toast.fileEdit.replaceBlocked'))
++        return
++      }
++      const fileType = target.type as ReplaceableFileType
++
++      const input = document.createElement('input')
++      input.type = 'file'
++      input.accept = acceptByType[fileType]
++
++      input.onchange = async () => {
++        const file = input.files?.[0]
++        if (!file) return
++        // 文件对话框可以无限期开着:落地前重查画布未切换、节点仍在且未锁。
++        const now = useCanvasStore.getState()
++        const stillThere = now.nodes.find((node) => node.id === nodeId && node.type === fileType)
++        if (now.sceneId !== sceneId || !stillThere || isEffectivelyLocked(now.nodes, stillThere)) {
++          debugLogger.warn('Document', `Replace file aborted before upload: canvas switched or node ${nodeId} missing/locked`)
++          toastFeedback.warn(t('toast.fileEdit.replaceBlocked'))
++          return
++        }
++        try {
++          const verdict = await validateReplacementFile(file, fileType)
++          if (!verdict.ok) {
++            debugLogger.warn('Document', `Replace file rejected for ${nodeId}: ${verdict.reason}`)
++            toastFeedback.warn(t('toast.fileEdit.replaceInvalid'))
++            return
++          }
++          // markdown 的渲染源是 node.text:替换资产的同时同步读入新正文。
++          const text = fileType === 'markdown' ? await file.text() : undefined
++          const asset = await saveImportedAsset(file)
++          // 读正文/落盘资产都是 await:提交前最后一道画布归属闸(同 id 节点
++          // 存在于复制画布时,store 的 missing 检查挡不住,必须看 sceneId)。
++          if (useCanvasStore.getState().sceneId !== sceneId) {
++            const cleaned = await deleteImportedAsset(asset.assetUrl)
++            debugLogger.warn(
++              'Document',
++              `Replace file aborted: canvas switched before commit; orphan asset ${asset.assetUrl} ${cleaned ? 'deleted' : 'left for GC'}`,
++            )
++            toastFeedback.warn(t('toast.fileEdit.replaceBlocked'))
++            return
++          }
++          const replaced = wrapMutation(replaceFileNodeAsset)(nodeId, asset.assetUrl, {
++            text,
++            metadata: {
++              mimeType: asset.type || file.type || undefined,
++              originalName: asset.name,
++              sizeBytes: asset.sizeBytes,
++            },
++          })
++          if (replaced) {
++            toastFeedback.success(t('toast.fileEdit.replaced'))
++          } else {
++            const cleaned = await deleteImportedAsset(asset.assetUrl)
++            debugLogger.warn(
++              'Document',
++              `Replace file refused for ${nodeId}; orphan asset ${asset.assetUrl} ${cleaned ? 'deleted' : 'left for GC'}`,
++            )
++            toastFeedback.warn(t('toast.fileEdit.replaceRefused'))
++          }
++        } catch (error) {
++          debugLogger.error(
++            'Document',
++            `Replace file failed for ${nodeId}: ${error instanceof Error ? error.message : String(error)}`,
++          )
++          toastFeedback.error(t('toast.fileEdit.replaceFailed'))
++        }
++      }
++
++      input.click()
++    },
++    [replaceFileNodeAsset],
++  )
++
++  const openFilePreview = useCallback(async (nodeId: string) => {
++    const node = useCanvasStore.getState().nodes.find((item) => item.id === nodeId)
++    if (!node?.assetUrl) {
++      debugLogger.warn('Document', `Open preview skipped: node ${nodeId} has no assetUrl`)
++      toastFeedback.warn(t('toast.document.previewUnavailable'))
++      return
++    }
++    // 点击栈内同步预开:异步读资产之后再 window.open 会丢用户激活,被
++    // popup blocker 拦下还会记假成功(终审第 4 条)。
++    const previewWindow = window.open('', '_blank')
++    if (!previewWindow) {
++      debugLogger.warn('Document', `Open preview blocked by the browser for ${nodeId}`)
++      toastFeedback.warn(t('toast.document.previewBlocked'))
++      return
++    }
++    try {
++      let navigated: boolean
++      if (isImportedAssetUrl(node.assetUrl)) {
++        const asset = await readImportedAssetFile(node.assetUrl)
++        if (!asset) {
++          previewWindow.close()
++          debugLogger.warn('Document', `Open preview failed: imported asset missing for ${nodeId}`)
++          toastFeedback.warn(t('toast.document.previewUnavailable'))
++          return
++        }
++        const url = URL.createObjectURL(asset.blob)
++        navigated = navigatePreviewWindow(previewWindow, url, () => URL.revokeObjectURL(url))
++      } else {
++        navigated = navigatePreviewWindow(previewWindow, node.assetUrl)
++      }
++      if (!navigated) {
++        debugLogger.warn('Document', `Open preview refused for ${nodeId}: unsupported or failed navigation URL`)
++        toastFeedback.warn(t('toast.document.previewUnavailable'))
++        return
++      }
++      debugLogger.log('Document', `Opened preview for ${nodeId}`)
++    } catch (error) {
++      previewWindow.close()
++      debugLogger.error(
++        'Document',
++        `Open preview failed for ${nodeId}: ${error instanceof Error ? error.message : String(error)}`,
++      )
++      toastFeedback.error(t('toast.document.previewUnavailable'))
++    }
++  }, [])
++
++  return { replaceFileNode, openFilePreview }
++}
+diff --git a/src/canvas/useMaskPointArmed.ts b/src/canvas/useMaskPointArmed.ts
+index e7056d36..3d69a153 100644
+--- a/src/canvas/useMaskPointArmed.ts
++++ b/src/canvas/useMaskPointArmed.ts
+@@ -13,6 +13,7 @@ import { reduceMaskPointPending, shouldCancelPendingMaskEdit, type MaskInitialCl
+ import type { HitTestTarget } from '../render/hitTest'
+ import { t } from '../i18n'
+ import { localizedErrorText } from '../lib/localizedKeyError'
++import { isContextMenuOpen } from '../lib/menuOverlayStack'
+ 
+ export type MaskPointArmedInteractionApi = {
+   /** Shell hit-test peek (screenToCanvas + resolveHitTarget). Armed mode peeks
+@@ -364,6 +365,8 @@ export function useMaskPointArmed({
+   useEffect(() => {
+     const handleEscape = (event: KeyboardEvent) => {
+       if (event.key !== 'Escape' || !maskArmedRef.current) return
++      // R6(menuOverlayStack):右键菜单开着时让行给菜单。
++      if (isContextMenuOpen()) return
+       event.preventDefault()
+       event.stopPropagation()
+       setMaskArmed(false, 'escape')
+diff --git a/src/i18n/locales/en/menu.json b/src/i18n/locales/en/menu.json
+index 37af03b1..c9c72e05 100644
+--- a/src/i18n/locales/en/menu.json
++++ b/src/i18n/locales/en/menu.json
+@@ -271,5 +271,10 @@
+     "describeWithRefs": "Describe the edit — type @ to reference a region or marker",
+     "editing": "Editing…",
+     "imageTooLarge": "Image size {{width}} x {{height}} is too large — import a lower-resolution version before inpainting."
++  },
++  "document": {
++    "copySource": "Copy as Markdown",
++    "replaceFile": "Replace file",
++    "openPreview": "Open preview"
+   }
+ }
+diff --git a/src/i18n/locales/en/toast.json b/src/i18n/locales/en/toast.json
+index 577d0f90..b117db46 100644
+--- a/src/i18n/locales/en/toast.json
++++ b/src/i18n/locales/en/toast.json
+@@ -110,7 +110,12 @@
+     "demoNoArchiveCanvas": "Demo canvases can't be archived",
+     "keepOneActive": "Keep at least one active canvas — create or restore another before archiving",
+     "targetProjectArchivedMove": "Target project is archived — restore it before moving",
+-    "demoNoMoveInto": "Canvases can't be moved into demo projects"
++    "demoNoMoveInto": "Canvases can't be moved into demo projects",
++    "copied": "Markdown source copied.",
++    "copyEmpty": "This document has no source text to copy.",
++    "copyFailed": "Copy failed, please retry.",
++    "previewUnavailable": "Preview unavailable, see Debug Log.",
++    "previewBlocked": "The browser blocked the preview window; allow pop-ups and retry."
+   },
+   "project": {
+     "demoNoDelete": "Demo projects can't be deleted",
+@@ -149,5 +154,12 @@
+   },
+   "paste": {
+     "done": "Pasted {{count}} object(s)."
++  },
++  "fileEdit": {
++    "replaced": "File replaced.",
++    "replaceBlocked": "Object missing or locked; can't replace.",
++    "replaceRefused": "Replace didn't apply (object may be deleted or locked).",
++    "replaceFailed": "File replace failed, see Debug Log.",
++    "replaceInvalid": "Selected file doesn't match this object type; replace rejected."
+   }
+ }
+diff --git a/src/i18n/locales/ja/menu.json b/src/i18n/locales/ja/menu.json
+index 3b1f5d65..ab4cf8e7 100644
+--- a/src/i18n/locales/ja/menu.json
++++ b/src/i18n/locales/ja/menu.json
+@@ -270,5 +270,10 @@
+     "describeWithRefs": "編集内容を入力。@ で領域やマークを参照できます",
+     "editing": "編集中...",
+     "imageTooLarge": "画像サイズ {{width}} x {{height}} が大きすぎます。部分再描画には低解像度版をインポートしてください。"
++  },
++  "document": {
++    "copySource": "Markdown をコピー",
++    "replaceFile": "ファイルを置き換え",
++    "openPreview": "プレビューを開く"
+   }
+ }
+diff --git a/src/i18n/locales/ja/toast.json b/src/i18n/locales/ja/toast.json
+index acd553d4..bc10850c 100644
+--- a/src/i18n/locales/ja/toast.json
++++ b/src/i18n/locales/ja/toast.json
+@@ -110,7 +110,12 @@
+     "demoNoArchiveCanvas": "サンプルキャンバスはアーカイブできません",
+     "keepOneActive": "アクティブなキャンバスは最低1枚必要です。先に別のキャンバスを作成または復元してください",
+     "targetProjectArchivedMove": "対象プロジェクトはアーカイブ済みです。復元してから移動してください",
+-    "demoNoMoveInto": "サンプルプロジェクトへボードは移動できません"
++    "demoNoMoveInto": "サンプルプロジェクトへボードは移動できません",
++    "copied": "Markdown ソースをコピーしました。",
++    "copyEmpty": "コピーできる本文がありません。",
++    "copyFailed": "コピーに失敗しました。",
++    "previewUnavailable": "プレビューを利用できません。Debug Log を確認してください。",
++    "previewBlocked": "ブラウザがプレビューウィンドウをブロックしました。ポップアップを許可して再試行してください。"
+   },
+   "project": {
+     "demoNoDelete": "サンプルプロジェクトは削除できません",
+@@ -145,5 +150,12 @@
+   },
+   "paste": {
+     "done": "{{count}} 個のオブジェクトを貼り付けました。"
++  },
++  "fileEdit": {
++    "replaced": "ファイルを置き換えました。",
++    "replaceBlocked": "対象が存在しないかロックされています。",
++    "replaceRefused": "置き換えは適用されませんでした。",
++    "replaceFailed": "ファイルの置き換えに失敗しました。",
++    "replaceInvalid": "選択したファイルはこのオブジェクトの種類と一致しないため、置き換えを拒否しました。"
+   }
+ }
+diff --git a/src/i18n/locales/ko/menu.json b/src/i18n/locales/ko/menu.json
+index 4a842377..3b2476c6 100644
+--- a/src/i18n/locales/ko/menu.json
++++ b/src/i18n/locales/ko/menu.json
+@@ -270,5 +270,10 @@
+     "describeWithRefs": "수정할 내용을 입력하세요. @로 영역이나 표시를 참조할 수 있습니다",
+     "editing": "편집 중...",
+     "imageTooLarge": "이미지 크기 {{width}} x {{height}}가 너무 큽니다. 부분 다시 그리기 전에 낮은 해상도 버전을 가져오세요."
++  },
++  "document": {
++    "copySource": "Markdown 복사",
++    "replaceFile": "파일 교체",
++    "openPreview": "미리보기 열기"
+   }
+ }
+diff --git a/src/i18n/locales/ko/toast.json b/src/i18n/locales/ko/toast.json
+index 2113d31e..dd539562 100644
+--- a/src/i18n/locales/ko/toast.json
++++ b/src/i18n/locales/ko/toast.json
+@@ -110,7 +110,12 @@
+     "demoNoArchiveCanvas": "예제 캔버스는 보관할 수 없습니다",
+     "keepOneActive": "활성 캔버스를 최소 한 개 남겨야 합니다. 먼저 다른 캔버스를 만들거나 복원하세요",
+     "targetProjectArchivedMove": "대상 프로젝트가 보관됨 상태입니다. 복원 후 이동하세요",
+-    "demoNoMoveInto": "예제 프로젝트로는 보드를 이동할 수 없습니다"
++    "demoNoMoveInto": "예제 프로젝트로는 보드를 이동할 수 없습니다",
++    "copied": "Markdown 소스를 복사했습니다.",
++    "copyEmpty": "복사할 본문이 없습니다.",
++    "copyFailed": "복사에 실패했습니다.",
++    "previewUnavailable": "미리보기를 사용할 수 없습니다. Debug Log를 확인하세요.",
++    "previewBlocked": "브라우저가 미리보기 창을 차단했습니다. 팝업을 허용한 후 다시 시도하세요."
+   },
+   "project": {
+     "demoNoDelete": "예제 프로젝트는 삭제할 수 없습니다",
+@@ -145,5 +150,12 @@
+   },
+   "paste": {
+     "done": "개체 {{count}}개를 붙여넣었습니다."
++  },
++  "fileEdit": {
++    "replaced": "파일을 교체했습니다.",
++    "replaceBlocked": "개체가 없거나 잠겨 있어 교체할 수 없습니다.",
++    "replaceRefused": "교체가 적용되지 않았습니다.",
++    "replaceFailed": "파일 교체에 실패했습니다.",
++    "replaceInvalid": "선택한 파일이 개체 유형과 일치하지 않아 교체를 거부했습니다."
+   }
+ }
+diff --git a/src/i18n/locales/zh-CN/menu.json b/src/i18n/locales/zh-CN/menu.json
+index 6d276256..bb20f569 100644
+--- a/src/i18n/locales/zh-CN/menu.json
++++ b/src/i18n/locales/zh-CN/menu.json
+@@ -270,5 +270,10 @@
+     "describeWithRefs": "描述要改什么,输入 @ 引用区域或标记",
+     "editing": "编辑中...",
+     "imageTooLarge": "图片尺寸 {{width}} x {{height}} 过大，局部重绘请先导入较低分辨率版本。"
++  },
++  "document": {
++    "copySource": "复制 Markdown 源码",
++    "replaceFile": "替换文件",
++    "openPreview": "打开预览"
+   }
+ }
+diff --git a/src/i18n/locales/zh-CN/toast.json b/src/i18n/locales/zh-CN/toast.json
+index 0c3712f2..af9d5fae 100644
+--- a/src/i18n/locales/zh-CN/toast.json
++++ b/src/i18n/locales/zh-CN/toast.json
+@@ -110,7 +110,12 @@
+     "demoNoArchiveCanvas": "示例画布不能归档",
+     "keepOneActive": "至少保留一个活跃画布,请先创建或恢复其他画布再归档",
+     "targetProjectArchivedMove": "目标项目已归档,请先恢复项目再移动",
+-    "demoNoMoveInto": "示例项目不接收画布移入"
++    "demoNoMoveInto": "示例项目不接收画布移入",
++    "copied": "Markdown 源码已复制。",
++    "copyEmpty": "该文档没有可复制的正文。",
++    "copyFailed": "复制失败,请重试。",
++    "previewUnavailable": "预览暂不可用,详见 Debug Log。",
++    "previewBlocked": "浏览器拦截了预览窗口,请允许弹出窗口后重试。"
+   },
+   "project": {
+     "demoNoDelete": "示例项目不能删除",
+@@ -145,5 +150,12 @@
+   },
+   "paste": {
+     "done": "已粘贴 {{count}} 个对象。"
++  },
++  "fileEdit": {
++    "replaced": "文件已替换。",
++    "replaceBlocked": "对象不存在或已锁定,无法替换。",
++    "replaceRefused": "替换未生效(对象可能已被删除或锁定)。",
++    "replaceFailed": "文件替换失败,详见 Debug Log。",
++    "replaceInvalid": "所选文件与该对象类型不符,已拒绝替换。"
+   }
+ }
+diff --git a/src/lib/menuOverlayStack.contract.test.ts b/src/lib/menuOverlayStack.contract.test.ts
+new file mode 100644
+index 00000000..def05d90
+--- /dev/null
++++ b/src/lib/menuOverlayStack.contract.test.ts
+@@ -0,0 +1,194 @@
++// menuOverlayStack 合同守卫(context-menu-standard R6,终审第三/四轮):
++// "右键菜单开着时 Escape 先关菜单"要成立,前提是**所有** capture 层的 keydown
++// 消费者都让行——任何一个不让行的 capture 处理器都会把菜单饿死(事件到不了
++// 菜单所在的 document bubble 层)。
++//
++// 用 TypeScript AST 逐注册分析(第四/五轮升级,不再是正则挑形态):
++// 1. 枚举全部 src 非测试源码里的 addEventListener('keydown', <任意 handler 表达式>,
++//    <options>) 调用,options 为 `true` 或含 capture: true 的对象字面量(可带
++//    once 等其他属性,键可以是标识符或字符串字面量)都算 capture;静态判不了的
++//    一律红灯要求人工改写——包括 options 是标识符/非字面量、对象里有展开、
++//    computed 键、以及 `{ capture }` shorthand / capture 值非布尔字面量(第五轮
++//    封口:这些形态既不许进 capture 也不许静默溜走);
++// 2. 含 capture keydown 注册的文件集合与登记表钉死(新增文件必登记);
++// 3. **逐注册 verdict,无例外必须让行**(第六轮起不按 Escape 文本自动豁免——
++//    `event.key !== ESCAPE_KEY` 之类的常量重构会绕过文本判定;第七轮起连精确
++//    豁免也取消——豁免只能证明"不饿死菜单",证不了"不在同帧清下层状态",
++//    Cmd+Z handler 也统一装了菜单优先门):每个 capture 注册的 handler(内联
++//    箭头/函数表达式直接取,标识符解析到注册点前最近的同名声明)必须在
++//    **顶层函数体**(不进嵌套函数,`const unused = () => isContextMenuOpen()`
++//    冒充不算)存在 callee 为 isContextMenuOpen / handleOverlayEscape 的真实
++//    CallExpression。
++import { readFileSync, readdirSync, statSync } from 'node:fs'
++import { join } from 'node:path'
++import ts from 'typescript'
++import { describe, expect, it } from 'vitest'
++
++const SRC_ROOT = join(__dirname, '..')
++
++// 登记表:允许出现 capture keydown 注册的文件(src 相对路径,排序)。
++const CAPTURE_KEYDOWN_FILES = [
++  'app/LibraryWorkspace.tsx', // lightbox 预览 Escape(handleOverlayEscape)
++  'canvas/ImageCropOverlay.tsx', // crop Enter/Escape(isContextMenuOpen 让行)
++  'canvas/ImageMaskEditOverlay.tsx', // Cmd/Ctrl+Z 撤销重做(装了菜单优先门)
++  'canvas/RegionEditOverlay.tsx', // 选区 Escape(让行)+ Cmd/Ctrl+Z(菜单优先门)
++  'canvas/SelectionQuickToolbar.tsx', // 快捷条子菜单 Escape(handleOverlayEscape)
++  'canvas/TextFormatToolbar.tsx', // 文字条子菜单 Escape(handleOverlayEscape)
++  'canvas/useMaskPointArmed.ts', // mask 待放点 Escape(isContextMenuOpen 让行)
++]
++
++const YIELD_HELPER_NAMES = new Set(['isContextMenuOpen', 'handleOverlayEscape'])
++
++const collectSourceFiles = (dir: string): string[] =>
++  readdirSync(dir).flatMap((name) => {
++    const full = join(dir, name)
++    if (statSync(full).isDirectory()) return collectSourceFiles(full)
++    if (!/\.(ts|tsx)$/.test(name) || /\.test\.tsx?$/.test(name)) return []
++    return [full]
++  })
++
++type Registration = { handler: ts.Expression; line: number }
++
++const scanFile = (filePath: string) => {
++  const content = readFileSync(filePath, 'utf8')
++  if (!content.includes('addEventListener')) {
++    return { sourceFile: undefined, registrations: [] as Registration[], unanalyzable: [] as number[] }
++  }
++  const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true)
++  const registrations: Registration[] = []
++  const unanalyzable: number[] = []
++  const lineOf = (node: ts.Node) => sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1
++
++  const visit = (node: ts.Node) => {
++    if (
++      ts.isCallExpression(node) &&
++      ts.isPropertyAccessExpression(node.expression) &&
++      node.expression.name.text === 'addEventListener'
++    ) {
++      const [eventType, handler, options] = node.arguments
++      if (eventType && ts.isStringLiteralLike(eventType) && eventType.text === 'keydown' && handler && options) {
++        if (options.kind === ts.SyntaxKind.TrueKeyword) {
++          registrations.push({ handler, line: lineOf(node) })
++        } else if (ts.isObjectLiteralExpression(options)) {
++          // 逐属性静态解析:capture: true|false 之外的一切 capture 相关形态
++          // (shorthand { capture }、字符串键之外的 computed 键、展开、非布尔
++          // 字面量值、getter/method)都判 unanalyzable,不许静默溜走。
++          let verdict: 'capture' | 'not-capture' | 'unknown' = 'not-capture'
++          for (const prop of options.properties) {
++            if (ts.isSpreadAssignment(prop)) {
++              verdict = 'unknown'
++              break
++            }
++            if (prop.name && ts.isComputedPropertyName(prop.name)) {
++              verdict = 'unknown'
++              break
++            }
++            const name =
++              prop.name && (ts.isIdentifier(prop.name) || ts.isStringLiteralLike(prop.name))
++                ? prop.name.text
++                : undefined
++            if (name !== 'capture') continue
++            if (ts.isPropertyAssignment(prop) && prop.initializer.kind === ts.SyntaxKind.TrueKeyword) {
++              verdict = 'capture'
++            } else if (ts.isPropertyAssignment(prop) && prop.initializer.kind === ts.SyntaxKind.FalseKeyword) {
++              verdict = 'not-capture'
++            } else {
++              verdict = 'unknown'
++              break
++            }
++          }
++          if (verdict === 'capture') registrations.push({ handler, line: lineOf(node) })
++          else if (verdict === 'unknown') unanalyzable.push(lineOf(node))
++        } else if (options.kind !== ts.SyntaxKind.FalseKeyword) {
++          // options 是标识符/其他表达式 → 静态判不了 capture,同样红灯。
++          unanalyzable.push(lineOf(node))
++        }
++      }
++    }
++    ts.forEachChild(node, visit)
++  }
++  visit(sourceFile)
++  return { sourceFile, registrations, unanalyzable }
++}
++
++/** 解析 handler 函数节点:内联函数直接取;标识符找注册点前最近的同名声明。 */
++const resolveHandlerNode = (handler: ts.Expression, sourceFile: ts.SourceFile): ts.Node | undefined => {
++  if (ts.isArrowFunction(handler) || ts.isFunctionExpression(handler)) return handler
++  if (!ts.isIdentifier(handler)) return undefined
++  let nearest: ts.Node | undefined
++  const visit = (node: ts.Node) => {
++    const isMatch =
++      (ts.isVariableDeclaration(node) &&
++        ts.isIdentifier(node.name) &&
++        node.name.text === handler.text &&
++        node.initializer) ||
++      (ts.isFunctionDeclaration(node) && node.name?.text === handler.text)
++    if (isMatch && node.getStart(sourceFile) < handler.getStart(sourceFile)) {
++      if (!nearest || node.getStart(sourceFile) > nearest.getStart(sourceFile)) {
++        nearest = ts.isVariableDeclaration(node) ? node.initializer : node
++      }
++    }
++    ts.forEachChild(node, visit)
++  }
++  visit(sourceFile)
++  return nearest
++}
++
++/** 让行校验:handler **顶层函数体**内存在 callee 为让行 helper 的真实
++ *  CallExpression。注释/字符串里的同名文本不算(第五轮封口);嵌套函数不进
++ *  (`const unused = () => isContextMenuOpen()` 冒充不算,第六轮封口)——
++ *  helper 作为顶层调用的实参箭头(handleOverlayEscape(event, () => ...))在
++ *  进入嵌套前就已命中,不受影响。 */
++const callsYieldHelperAtTopLevel = (handlerNode: ts.Node): boolean => {
++  let found = false
++  const visit = (node: ts.Node) => {
++    if (found) return
++    if (node !== handlerNode && ts.isFunctionLike(node)) return
++    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && YIELD_HELPER_NAMES.has(node.expression.text)) {
++      found = true
++      return
++    }
++    ts.forEachChild(node, visit)
++  }
++  visit(handlerNode)
++  return found
++}
++
++
++describe('menuOverlayStack 合同:capture keydown 逐 handler 让行', () => {
++  const files = collectSourceFiles(SRC_ROOT)
++  const scanned = files.map((file) => ({ rel: file.slice(SRC_ROOT.length + 1), ...scanFile(file) }))
++
++  it('capture 语义必须静态可判(options 用字面量,不许变量/展开兜圈)', () => {
++    const offenders = scanned
++      .filter((entry) => entry.unanalyzable.length)
++      .map((entry) => `${entry.rel}:${entry.unanalyzable.join(',')}`)
++    expect(offenders, 'keydown options 静态判不了 capture,请改为字面量并登记').toEqual([])
++  })
++
++  it('含 capture keydown 注册的文件集合与登记表钉死(新增未登记 → 红灯)', () => {
++    const captureFiles = scanned
++      .filter((entry) => entry.registrations.length)
++      .map((entry) => entry.rel)
++      .sort()
++    expect(captureFiles).toEqual(CAPTURE_KEYDOWN_FILES)
++  })
++
++  it('每个 capture 注册无例外:handler 顶层函数体必须真调用让行 helper', () => {
++    for (const entry of scanned) {
++      for (const registration of entry.registrations) {
++        const sourceFile = entry.sourceFile as ts.SourceFile
++        const handlerNode = resolveHandlerNode(registration.handler, sourceFile)
++        expect(
++          handlerNode,
++          `${entry.rel}:${registration.line} 的 capture handler 无法静态解析(请用同文件命名函数或内联函数)`,
++        ).toBeDefined()
++        if (!handlerNode) continue
++        expect(
++          callsYieldHelperAtTopLevel(handlerNode),
++          `${entry.rel}:${registration.line} 的 capture handler 顶层函数体内没有 isContextMenuOpen/handleOverlayEscape 的真实调用(R6 菜单优先门,无豁免)`,
++        ).toBe(true)
++      }
++    }
++  })
++})
+diff --git a/src/lib/menuOverlayStack.test.ts b/src/lib/menuOverlayStack.test.ts
+new file mode 100644
+index 00000000..b37c5122
+--- /dev/null
++++ b/src/lib/menuOverlayStack.test.ts
+@@ -0,0 +1,95 @@
++// @vitest-environment happy-dom
++// menuOverlayStack(context-menu-standard R6)——Escape 分层的纯 handler 测试:
++// - capture 层次级浮层(快捷条/文字条子菜单):任一右键菜单(画布 .node-context-menu
++//   或共享 .sidebar-context-menu)开着就让行,否则消费(preventDefault +
++//   stopImmediatePropagation)并关闭;
++// - 右键菜单自身:总是消费(preventDefault + stopPropagation)并关闭。
++// 钉住"共享菜单也在让行名单里"(终审第二轮第 1 条:只让行画布菜单会把共享菜单饿死)。
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { handleContextMenuEscape, handleOverlayEscape, isContextMenuOpen } from './menuOverlayStack'
++
++const mountMenu = (className: string) => {
++  const el = document.createElement('div')
++  el.className = className
++  document.body.appendChild(el)
++  return el
++}
++
++afterEach(() => {
++  document.body.innerHTML = ''
++})
++
++const escapeEvent = () => ({
++  key: 'Escape',
++  preventDefault: vi.fn(),
++  stopPropagation: vi.fn(),
++  stopImmediatePropagation: vi.fn(),
++})
++
++describe('handleOverlayEscape(capture 层次级浮层)', () => {
++  it('画布右键菜单开着 → 让行:不消费事件、不关闭', () => {
++    mountMenu('node-context-menu')
++    const event = escapeEvent()
++    const close = vi.fn()
++    expect(handleOverlayEscape(event, close)).toBe(false)
++    expect(close).not.toHaveBeenCalled()
++    expect(event.preventDefault).not.toHaveBeenCalled()
++    expect(event.stopImmediatePropagation).not.toHaveBeenCalled()
++  })
++
++  it('共享右键菜单(.sidebar-context-menu)开着 → 同样让行(终审第二轮第 1 条)', () => {
++    mountMenu('sidebar-context-menu')
++    const event = escapeEvent()
++    const close = vi.fn()
++    expect(handleOverlayEscape(event, close)).toBe(false)
++    expect(close).not.toHaveBeenCalled()
++    expect(event.stopImmediatePropagation).not.toHaveBeenCalled()
++  })
++
++  it('没有右键菜单 → 消费事件(preventDefault + stopImmediatePropagation)并关闭', () => {
++    const event = escapeEvent()
++    const close = vi.fn()
++    expect(handleOverlayEscape(event, close)).toBe(true)
++    expect(close).toHaveBeenCalledTimes(1)
++    expect(event.preventDefault).toHaveBeenCalledTimes(1)
++    expect(event.stopImmediatePropagation).toHaveBeenCalledTimes(1)
++  })
++
++  it('非 Escape 键 → 完全不介入', () => {
++    const event = { ...escapeEvent(), key: 'Enter' }
++    const close = vi.fn()
++    expect(handleOverlayEscape(event, close)).toBe(false)
++    expect(close).not.toHaveBeenCalled()
++    expect(event.preventDefault).not.toHaveBeenCalled()
++  })
++})
++
++describe('handleContextMenuEscape(右键菜单自身)', () => {
++  it('Escape → 总是消费(preventDefault + stopPropagation)并关闭', () => {
++    const event = escapeEvent()
++    const close = vi.fn()
++    expect(handleContextMenuEscape(event, close)).toBe(true)
++    expect(close).toHaveBeenCalledTimes(1)
++    expect(event.preventDefault).toHaveBeenCalledTimes(1)
++    expect(event.stopPropagation).toHaveBeenCalledTimes(1)
++  })
++
++  it('非 Escape 键 → 不介入', () => {
++    const event = { ...escapeEvent(), key: 'a' }
++    const close = vi.fn()
++    expect(handleContextMenuEscape(event, close)).toBe(false)
++    expect(close).not.toHaveBeenCalled()
++  })
++})
++
++describe('isContextMenuOpen(让行名单)', () => {
++  it('画布菜单或共享菜单任一存在都算开;都不存在为关', () => {
++    expect(isContextMenuOpen()).toBe(false)
++    const canvasMenu = mountMenu('node-context-menu')
++    expect(isContextMenuOpen()).toBe(true)
++    canvasMenu.remove()
++    expect(isContextMenuOpen()).toBe(false)
++    mountMenu('sidebar-context-menu')
++    expect(isContextMenuOpen()).toBe(true)
++  })
++})
+diff --git a/src/lib/menuOverlayStack.ts b/src/lib/menuOverlayStack.ts
+new file mode 100644
+index 00000000..427f2d24
+--- /dev/null
++++ b/src/lib/menuOverlayStack.ts
+@@ -0,0 +1,48 @@
++// menuOverlayStack — Escape 分层(context-menu-standard R6)的单一来源。
++//
++// 分层规则:右键菜单(画布 .node-context-menu / 共享 .sidebar-context-menu)是
++// 最上层浮层。capture 层的次级浮层(快捷条子菜单、文字工具条子菜单等)收到
++// Escape 时必须先查这里的选择器让行——只对 .node-context-menu 让行会把共享菜单
++// 饿死(快捷条 capture+stopImmediatePropagation 先吃掉事件,共享菜单永远收不到,
++// 终审第二轮第 1 条)。新增右键菜单形态时把根节点 class 加进 contextMenuSelector。
++export const contextMenuSelector = '.node-context-menu, .sidebar-context-menu'
++
++type QueryableDocument = Pick<Document, 'querySelector'>
++
++export const isContextMenuOpen = (doc: QueryableDocument = document): boolean =>
++  Boolean(doc.querySelector(contextMenuSelector))
++
++type OverlayEscapeEvent = Pick<KeyboardEvent, 'key' | 'preventDefault' | 'stopImmediatePropagation'>
++
++/**
++ * capture 层次级浮层的 Escape 处理:任一右键菜单开着时让行(返回 false,事件
++ * 原样穿透给菜单);否则消费事件(preventDefault + stopImmediatePropagation,
++ * 防止 bubble 层全局 Escape 同帧继续清选区/工具)并执行 close。
++ */
++export const handleOverlayEscape = (
++  event: OverlayEscapeEvent,
++  close: () => void,
++  doc: QueryableDocument = document,
++): boolean => {
++  if (event.key !== 'Escape') return false
++  if (isContextMenuOpen(doc)) return false
++  event.preventDefault()
++  event.stopImmediatePropagation()
++  close()
++  return true
++}
++
++type MenuEscapeEvent = Pick<KeyboardEvent, 'key' | 'preventDefault' | 'stopPropagation'>
++
++/**
++ * 右键菜单自身的 Escape 处理:菜单是最上层,总是消费事件(preventDefault +
++ * stopPropagation)并关闭——不消费的话,画布 window 层全局 Escape 会同帧继续
++ * 清编辑态/选区/工具(终审第一轮第 1 条)。
++ */
++export const handleContextMenuEscape = (event: MenuEscapeEvent, close: () => void): boolean => {
++  if (event.key !== 'Escape') return false
++  event.preventDefault()
++  event.stopPropagation()
++  close()
++  return true
++}
+diff --git a/src/store/canvasStateTypes.ts b/src/store/canvasStateTypes.ts
+index 8fcd1655..7eedd041 100644
+--- a/src/store/canvasStateTypes.ts
++++ b/src/store/canvasStateTypes.ts
+@@ -262,6 +262,13 @@ export type CanvasState = {
+   flipImageNode: (nodeId: string, axis: 'horizontal' | 'vertical') => void
+   /** Returns false when the node is missing/locked (caller must not report success). */
+   replaceImageNodeAsset: (nodeId: string, assetUrl: string, metadata?: ImportedImageMetadata) => boolean
++  /** §5:markdown/pdf/video 的 Replace file;markdown 需带新正文 text;metadata
++   *  随替换原子更新(Inspector 展示的来源/MIME/大小)。 */
++  replaceFileNodeAsset: (
++    nodeId: string,
++    assetUrl: string,
++    options?: { text?: string; title?: string; metadata?: { mimeType?: string; originalName?: string; sizeBytes?: number } },
++  ) => boolean
+   addFrameNode: (
+     position: { x: number; y: number },
+     size?: { width: number; height: number },
+diff --git a/src/store/nodeMutationSlice.replaceFile.test.ts b/src/store/nodeMutationSlice.replaceFile.test.ts
+new file mode 100644
+index 00000000..7ea1179a
+--- /dev/null
++++ b/src/store/nodeMutationSlice.replaceFile.test.ts
+@@ -0,0 +1,106 @@
++// @vitest-environment happy-dom
++// replaceFileNodeAsset(context-menu-standard §5,阶段 4):markdown/pdf/video 的
++// Replace file——markdown 同步替换正文 text;missing/locked/类型不符时拒绝并
++// 返回 false(调用方按返回值反馈,不误报成功)。真 store 测试。
++//
++// fixture 必须走 normalizeCanvasNodeV2:生产导入节点 normalize 后同时携带
++// canonical(node.asset)与 legacy 镜像(assetUrl/...),canonical 映射与服务端
++// 快照优先读 node.asset——手造纯 legacy fixture 曾放过"只改镜像、canonical 仍指
++// 旧文件"的持久化故障(终审第二轮第 3/8 条)。
++import { beforeEach, describe, expect, it } from 'vitest'
++import { useCanvasStore } from './canvasStore'
++import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++const node = (seed: Partial<MivoCanvasNode> & { id: string }): MivoCanvasNode =>
++  normalizeCanvasNodeV2(
++    {
++      type: 'markdown',
++      title: seed.id,
++      x: 0,
++      y: 0,
++      width: 100,
++      height: 100,
++      status: 'ready',
++      ...seed,
++    } as MivoCanvasNode,
++  )
++
++describe('replaceFileNodeAsset — §5 Replace file', () => {
++  beforeEach(() => {
++    useCanvasStore.setState({
++      nodes: [
++        node({
++          id: 'md',
++          type: 'markdown',
++          text: '# old',
++          assetUrl: 'imported-asset://old-md',
++          assetMimeType: 'text/markdown',
++          assetOriginalName: 'old.md',
++          assetSizeBytes: 5,
++        }),
++        node({ id: 'pdf', type: 'pdf', assetUrl: 'imported-asset://old-pdf' }),
++        node({ id: 'img', type: 'image', assetUrl: 'imported-asset://img' }),
++      ],
++      selectedNodeId: undefined,
++      selectedNodeIds: [],
++    })
++    // 前置自检:normalize 后 fixture 必须已带 canonical asset,否则下面的
++    // canonical 断言全是空转。
++    expect(useCanvasStore.getState().nodes.find((item) => item.id === 'md')?.asset?.url).toBe('imported-asset://old-md')
++  })
++
++  it('markdown:替换资产并同步替换正文 text;canonical 与镜像同步指向新资产', () => {
++    const ok = useCanvasStore.getState().replaceFileNodeAsset('md', 'imported-asset://new-md', { text: '# new' })
++    expect(ok).toBe(true)
++    const md = useCanvasStore.getState().nodes.find((item) => item.id === 'md')
++    expect(md?.assetUrl).toBe('imported-asset://new-md')
++    expect(md?.asset?.url).toBe('imported-asset://new-md')
++    expect(md?.text).toBe('# new')
++    // 再走一遍 normalize(≈ 持久化/快照映射的入口):canonical 仍是新资产,
++    // 不会被残留旧 asset 覆写回去。
++    expect(normalizeCanvasNodeV2(md as MivoCanvasNode).asset?.url).toBe('imported-asset://new-md')
++  })
++
++  it('pdf:只换资产;metadata 原子更新 canonical + Inspector 镜像三字段(终审 MAJOR-3)', () => {
++    const ok = useCanvasStore.getState().replaceFileNodeAsset('pdf', 'imported-asset://new-pdf', {
++      metadata: { mimeType: 'application/pdf', originalName: 'v2.pdf', sizeBytes: 2048 },
++    })
++    expect(ok).toBe(true)
++    const pdf = useCanvasStore.getState().nodes.find((item) => item.id === 'pdf')
++    expect(pdf?.assetUrl).toBe('imported-asset://new-pdf')
++    expect(pdf?.assetMimeType).toBe('application/pdf')
++    expect(pdf?.assetOriginalName).toBe('v2.pdf')
++    expect(pdf?.assetSizeBytes).toBe(2048)
++    expect(pdf?.asset).toMatchObject({
++      url: 'imported-asset://new-pdf',
++      mimeType: 'application/pdf',
++      originalName: 'v2.pdf',
++      sizeBytes: 2048,
++    })
++  })
++
++  it('替换是单个撤销单元:undo 一步回到旧资产(canonical+镜像)与旧正文', () => {
++    useCanvasStore.getState().replaceFileNodeAsset('md', 'imported-asset://new-md', {
++      text: '# new',
++      metadata: { mimeType: 'text/markdown', originalName: 'new.md', sizeBytes: 5 },
++    })
++    useCanvasStore.getState().undo()
++    const md = useCanvasStore.getState().nodes.find((item) => item.id === 'md')
++    expect(md?.assetUrl).toBe('imported-asset://old-md')
++    expect(md?.asset?.url).toBe('imported-asset://old-md')
++    expect(md?.text).toBe('# old')
++  })
++
++  it('拒绝:image 类型 / 不存在 / 已锁定 → 返回 false 且不改状态', () => {
++    expect(useCanvasStore.getState().replaceFileNodeAsset('img', 'imported-asset://x')).toBe(false)
++    expect(useCanvasStore.getState().replaceFileNodeAsset('ghost', 'imported-asset://x')).toBe(false)
++    useCanvasStore.setState({
++      nodes: useCanvasStore.getState().nodes.map((item) => (item.id === 'md' ? { ...item, locked: true } : item)),
++    })
++    expect(useCanvasStore.getState().replaceFileNodeAsset('md', 'imported-asset://y', { text: 'z' })).toBe(false)
++    const md = useCanvasStore.getState().nodes.find((item) => item.id === 'md')
++    expect(md?.text).toBe('# old')
++    expect(md?.asset?.url).toBe('imported-asset://old-md')
++  })
++})
+diff --git a/src/store/nodeMutationSlice.ts b/src/store/nodeMutationSlice.ts
+index 84c07227..16f79571 100644
+--- a/src/store/nodeMutationSlice.ts
++++ b/src/store/nodeMutationSlice.ts
+@@ -1,5 +1,5 @@
+ import type { SliceCreator } from './canvasStateTypes'
+-import { setNodeTransform } from '../model/documentModelV2'
++import { setNodeAsset, setNodeTransform } from '../model/documentModelV2'
+ import { withScaledMarkupPoints } from '../model/markupPointScale'
+ import { resolveArrangePlan } from './agentArrangePlan'
+ import { ArrangePlanError } from '../model/arrangeIntent'
+@@ -414,6 +414,43 @@ export const createNodeMutationSlice: SliceCreator = (set, get) => ({
+     })
+     return true
+   },
++  // §5(context-menu-standard,阶段 4):markdown/pdf/video 的 Replace file——与
++  // replaceImageNodeAsset 同款契约(返回是否真的替换,调用方按返回值反馈);
++  // markdown 同步替换正文 text(渲染源),pdf/video 只换资产。
++  replaceFileNodeAsset: (nodeId, assetUrl, options) => {
++    const before = get()
++    const target = before.nodes.find(
++      (node) => node.id === nodeId && (node.type === 'markdown' || node.type === 'pdf' || node.type === 'video'),
++    )
++    if (!target || isEffectivelyLocked(before.nodes, target)) {
++      warnCanvas(`Replace file skipped: node ${nodeId} missing or locked`)
++      return false
++    }
++
++    set((state) => {
++      const nodes = state.nodes.map((node) => {
++        if (node.id !== nodeId) return node
++        // 资产与元数据经 setNodeAsset 原子双写 canonical(node.asset)+ legacy 镜像
++        // 四字段:normalize 后的生产节点里 canonical 映射优先 node.asset,只改镜像
++        // 会让持久化/服务端快照仍指旧文件(终审第二轮第 3 条)。元数据不带时置空,
++        // Inspector 宁可缺信息也不能声称是旧文件(终审第一轮第 3 条)。
++        const withAsset = setNodeAsset(node, {
++          url: assetUrl,
++          mimeType: options?.metadata?.mimeType,
++          originalName: options?.metadata?.originalName,
++          sizeBytes: options?.metadata?.sizeBytes,
++        })
++        return {
++          ...withAsset,
++          ...(node.type === 'markdown' ? { text: options?.text ?? '' } : {}),
++          ...(options?.title ? { title: options.title } : {}),
++        }
++      })
++      logCanvas(`Replaced ${target.type} source on "${target.title}"`)
++      return patchWithHistory(state, { nodes, selectedNodeId: nodeId, selectedNodeIds: [nodeId] })
++    })
++    return true
++  },
+   moveSelectedNodesBy: (dx, dy) =>
+     set((state) => {
+       const selectedNodeIds = selectedIdsFromState(state)

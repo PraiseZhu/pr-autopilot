@@ -1,0 +1,99 @@
+diff --git a/src/i18n/__tests__/localePreference.test.ts b/src/i18n/__tests__/localePreference.test.ts
+index 63eb2e28..74e570fb 100644
+--- a/src/i18n/__tests__/localePreference.test.ts
++++ b/src/i18n/__tests__/localePreference.test.ts
+@@ -55,6 +55,12 @@ describe('首次加载选语言(initialLocale,隔离 import)', () => {
+     return await import('..')
+   }
+ 
++  it('未设偏好 → 测试环境固定以 en 为文案基准', async () => {
++    window.localStorage.removeItem(LOCALE_STORAGE_KEY)
++    const mod = await freshImport()
++    expect(mod.default.language).toBe('en')
++  })
++
+   it('未设偏好 → 跟随 navigator.language(ko-KR → ko)', async () => {
+     window.localStorage.removeItem(LOCALE_STORAGE_KEY)
+     vi.spyOn(window.navigator, 'language', 'get').mockReturnValue('ko-KR')
+diff --git a/vitest.config.ts b/vitest.config.ts
+index 4421bc1f..1f11cf74 100644
+--- a/vitest.config.ts
++++ b/vitest.config.ts
+@@ -14,6 +14,7 @@ import react from '@vitejs/plugin-react'
+ export default defineConfig({
+   plugins: [react()],
+   test: {
++    setupFiles: ['./vitest.setup.ts'],
+     exclude: [
+       '**/node_modules/**',
+       '**/_tmp/**',
+diff --git a/vitest.setup.test.ts b/vitest.setup.test.ts
+new file mode 100644
+index 00000000..11d77beb
+--- /dev/null
++++ b/vitest.setup.test.ts
+@@ -0,0 +1,33 @@
++/**
++ * @vitest-environment node
++ *
++ * vitest.setup.ts 的直接哨兵(#424)。localePreference.test.ts 里同名回归断言跑
++ * 在 happy-dom 环境下——happy-dom 自带的 navigator.language 本就硬编码
++ * en-US，与本文件是否接线无关（已实测：拔掉 vitest.config.ts 的 setupFiles，
++ * 该断言仍全绿），不构成真正的回归哨兵。
++ *
++ * 这里改用 node 环境（#424 实际失败的 7 个文件所在环境）自行模拟泄漏态——
++ * 而不是依赖跑测机器真实的系统 locale（CI 机器本就是 en，模拟不出中文开发机
++ * 场景）。删除/弱化 setup.ts 里的 defineProperty 时，本用例在任何机器/CI 上
++ * 都会变红。
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++describe('vitest.setup.ts — navigator.language 基准钉死(#424)', () => {
++  beforeEach(() => {
++    vi.resetModules()
++  })
++
++  it('模拟中文开发机泄漏(navigator.language=zh-CN)后应用 setup → 钉回 en-US', async () => {
++    Object.defineProperty(globalThis.navigator, 'language', {
++      configurable: true,
++      enumerable: true,
++      value: 'zh-CN',
++    })
++    expect(globalThis.navigator.language).toBe('zh-CN')
++
++    await import('./vitest.setup.ts')
++
++    expect(globalThis.navigator.language).toBe('en-US')
++  })
++})
+diff --git a/vitest.setup.ts b/vitest.setup.ts
+new file mode 100644
+index 00000000..5f294f7a
+--- /dev/null
++++ b/vitest.setup.ts
+@@ -0,0 +1,25 @@
++/**
++ * Vitest 的文案基准固定为英文。
++ *
++ * 业务测试里有一批模块会在 import 时读取 navigator.language。若沿用
++ * runner/宿主的系统语言，同一组写死英文基准文案的测试会随开发机 locale
++ * 改变而变红。这里只改测试环境的 language getter，不替换 navigator 对象，
++ * 以免破坏 clipboard 等其它浏览器能力；需要验证 locale 跟随的专项测试
++ * 可以用 vi.spyOn(window.navigator, 'language', 'get') 显式覆盖。
++ */
++const globalWithNavigator = globalThis as typeof globalThis & {
++  navigator?: Navigator
++}
++
++if (globalWithNavigator.navigator) {
++  Object.defineProperty(globalWithNavigator.navigator, 'language', {
++    configurable: true,
++    enumerable: true,
++    get: () => 'en-US',
++  })
++} else {
++  Object.defineProperty(globalThis, 'navigator', {
++    configurable: true,
++    value: { language: 'en-US' },
++  })
++}

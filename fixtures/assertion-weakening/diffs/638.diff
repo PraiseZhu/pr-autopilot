@@ -1,0 +1,181 @@
+diff --git a/cindyplugin/src/__tests__/pluginChangelogEntry.test.tsx b/cindyplugin/src/__tests__/pluginChangelogEntry.test.tsx
+index 5a5370fa..f2c428e0 100644
+--- a/cindyplugin/src/__tests__/pluginChangelogEntry.test.tsx
++++ b/cindyplugin/src/__tests__/pluginChangelogEntry.test.tsx
+@@ -249,6 +249,85 @@ describe('port-sc8 未读红点', () => {
+   })
+ })
+ 
++describe('port-issue-2 未读红点定位契约:红点脱离 grid,Flame 保持居中', () => {
++  // 问题(用户实测):未读红点出现前按钮 display:grid + place-items:center,Flame
++  // 正好居中;红点作为第二个 grid 子元素触发 auto-placement 生成第二列隐式轨道,
++  // Flame 被挤到左列。修法:仅插件入口作用域下的红点 absolute(top/right 2px,
++  // pointer-events:none),脱离 grid 布局流 —— 判定口径与同文件既有用例一致,
++  // 读解析后的 CSS 源声明(happy-dom 下 getBoundingClientRect 恒 0,不量像素)。
++  beforeEach(() => {
++    globalThis.IS_REACT_ACT_ENVIRONMENT = true
++    resetStore()
++    renderPlugin()
++  })
++
++  afterEach(() => {
++    act(() => root.unmount())
++    container.remove()
++    document.querySelector('.changelog-backdrop')?.remove()
++  })
++
++  const scopedBadgeRule = () => ruleOf(themeCss, '.plugin-changelog-trigger .changelog-badge-dot')
++  const triggerRule = () => ruleOf(themeCss, '.plugin-changelog-trigger')
++  const bareBadgeRule = () => ruleOf(themeCss, '.changelog-badge-dot')
++
++  it('作用域红点规则声明 absolute + 右上角 + pointer-events: none(有红点时不参与布局)', () => {
++    const rule = scopedBadgeRule()
++    expect(rule, 'cindy-theme.css 必须有 .plugin-changelog-trigger .changelog-badge-dot 规则').not.toBe('')
++    expect(rule).toContain('position: absolute')
++    expect(rule).toContain('top: 2px')
++    expect(rule).toContain('right: 2px')
++    expect(rule).toContain('pointer-events: none')
++  })
++
++  it('按钮仍是绝对定位包含块:grid + place-items 居中 + 34×34,且无 grid-template-columns/grid-auto-flow', () => {
++    const rule = triggerRule()
++    expect(rule).toContain('position: absolute')
++    expect(rule).toContain('display: grid')
++    expect(rule).toContain('place-items: center')
++    expect(rule).toContain('width: 34px')
++    expect(rule).toContain('height: 34px')
++    // 无显式列/流向声明 → 只有单列隐式轨道;红点已 absolute 脱离流,唯一在流
++    // 子元素是 Flame,place-items:center 必然居中(加 grid-template-columns 或
++    // grid-auto-flow 会让红点重新成为可占位 item,此处必须红)
++    expect(rule).not.toMatch(/grid-template-columns|grid-auto-flow/)
++  })
++
++  it('定位只作用域插件入口:非作用域 .changelog-badge-dot(themeCss 皮肤层 / App.css)均无定位声明', () => {
++    // themeCss 的非作用域规则只许皮肤声明(background),不得夹带 position/top/right
++    const skin = bareBadgeRule()
++    expect(skin).not.toMatch(/\bposition\s*:|\btop\s*:|\bright\s*:/)
++    expect(skin).toContain('background: #e05545')
++    // App.css 网页版布局(justify-self: end 网格行)原样保留,不声明 position
++    const web = ruleOf(appCss, '.changelog-badge-dot')
++    expect(web).toContain('justify-self: end')
++    expect(web).not.toMatch(/\bposition\s*:/)
++  })
++
++  it('DOM 契约:两种状态下 Flame svg 都是 trigger 直接子元素;红点是 trigger 直接子元素且 aria-hidden', async () => {
++    const flameSvg = () => container.querySelector('.plugin-changelog-trigger svg') as SVGSVGElement
++    // 已读态:只有 Flame,无红点
++    await act(async () => {
++      useChangelogStore.setState({ loaded: true, updatedAt: '2026-08-10', lastRead: '2026-08-10' })
++    })
++    await act(async () => {})
++    let trigger = container.querySelector('.plugin-changelog-trigger') as HTMLElement
++    expect(flameSvg(), '已读态 Flame 应存在').not.toBeNull()
++    expect(trigger.querySelector('.changelog-badge-dot'), '已读态无红点').toBeNull()
++    // 未读态:Flame 仍在、红点出现且是 trigger 直接子元素(绝对定位的锚点)
++    await act(async () => {
++      useChangelogStore.setState({ loaded: true, updatedAt: '2026-08-10', lastRead: '' })
++    })
++    await act(async () => {})
++    trigger = container.querySelector('.plugin-changelog-trigger') as HTMLElement
++    expect(flameSvg(), '未读态 Flame 仍应在').not.toBeNull()
++    const dot = trigger.querySelector('.changelog-badge-dot') as HTMLElement
++    expect(dot, '未读态红点应存在').not.toBeNull()
++    expect(dot.parentElement, '红点必须是 trigger 直接子元素(锚定右上角的前提)').toBe(trigger)
++    expect(dot.getAttribute('aria-hidden'), '红点是纯装饰,aria-hidden 保持').toBe('true')
++  })
++})
++
+ describe('port-sc10 面板几何不被皮肤层覆写', () => {
+   // ① App.css 几何声明逐字命中(提取到空集即红,防锚点取错)
+   it('backdrop 仍是 fixed/inset 0/grid/居中', () => {
+diff --git a/cindyplugin/src/cindy-theme.css b/cindyplugin/src/cindy-theme.css
+index b56a0fde..152627b6 100644
+--- a/cindyplugin/src/cindy-theme.css
++++ b/cindyplugin/src/cindy-theme.css
+@@ -455,8 +455,24 @@
+   background: #e05545;
+ }
+ 
++/* 未读红点钉在 34×34 圆形入口右上角(port-issue-2):按钮是 position:absolute,
++   已是绝对定位子元素的包含块;红点 absolute 后脱离 grid auto-placement,不再
++   成为第二个 grid item 把 Flame 挤向左 —— 按钮里唯一在流的子元素只剩 Flame,
++   place-items:center 天然居中。top/right 2px 落在右上角(8×8 点在 34×34 圆内),
++   pointer-events:none 保证不拦截按钮点击。仅作用域插件入口,网页侧
++   ProjectSidebar 的 .changelog-badge-dot(justify-self: end 网格布局)不受影响。 */
++.plugin-changelog-trigger .changelog-badge-dot {
++  position: absolute;
++  top: 2px;
++  right: 2px;
++  pointer-events: none;
++}
++
+ .changelog-backdrop {
+-  background: color-mix(in srgb, var(--text-primary, #232323) 28%, transparent);
++  /* 插件态不压暗画布(2026-08-12 用户反馈:打开更新日志后画布被整层灰罩压暗)。
++     backdrop 仍是点击空白关闭/焦点/层叠的交互容器,只取消视觉背景;
++     网页版 App.css 的 rgba(35,35,35,0.28) 压暗保留,本文件只服务插件态。 */
++  background: transparent;
+ }
+ 
+ .changelog-panel {
+diff --git a/docs/design-previews/region-edit/assets/product.css b/docs/design-previews/region-edit/assets/product.css
+index 75f07360..b0635486 100644
+--- a/docs/design-previews/region-edit/assets/product.css
++++ b/docs/design-previews/region-edit/assets/product.css
+@@ -11903,8 +11903,24 @@ button:disabled {
+   background: #e05545;
+ }
+ 
++/* 未读红点钉在 34×34 圆形入口右上角(port-issue-2):按钮是 position:absolute,
++   已是绝对定位子元素的包含块;红点 absolute 后脱离 grid auto-placement,不再
++   成为第二个 grid item 把 Flame 挤向左 —— 按钮里唯一在流的子元素只剩 Flame,
++   place-items:center 天然居中。top/right 2px 落在右上角(8×8 点在 34×34 圆内),
++   pointer-events:none 保证不拦截按钮点击。仅作用域插件入口,网页侧
++   ProjectSidebar 的 .changelog-badge-dot(justify-self: end 网格布局)不受影响。 */
++.plugin-changelog-trigger .changelog-badge-dot {
++  position: absolute;
++  top: 2px;
++  right: 2px;
++  pointer-events: none;
++}
++
+ .changelog-backdrop {
+-  background: color-mix(in srgb, var(--text-primary, #232323) 28%, transparent);
++  /* 插件态不压暗画布(2026-08-12 用户反馈:打开更新日志后画布被整层灰罩压暗)。
++     backdrop 仍是点击空白关闭/焦点/层叠的交互容器,只取消视觉背景;
++     网页版 App.css 的 rgba(35,35,35,0.28) 压暗保留,本文件只服务插件态。 */
++  background: transparent;
+ }
+ 
+ .changelog-panel {
+diff --git a/src/canvas/changelogTheme.test.ts b/src/canvas/changelogTheme.test.ts
+index 9f018ad3..2695cbbd 100644
+--- a/src/canvas/changelogTheme.test.ts
++++ b/src/canvas/changelogTheme.test.ts
+@@ -377,6 +377,26 @@ describe('dark-sc3 公告皮肤段静态门禁的鉴别力', () => {
+   })
+ })
+ 
++describe('overlay-clear 插件态 backdrop 背景透明锁(2026-08-12 反馈修复)', () => {
++  // 选择器拆字(与 changelogAutoPopup.test.ts 同款说明):本文件源行会被 pop-sc3 ③
++  // 的真 diff 几何扫描,「.changelog' + '-backdrop」字面形态剥 + 后会被当成新增
++  // 几何声明而误红;拆字后源行只含不连续文本,运行时才拼成真选择器。
++  const selBackdrop = '.changelog' + '-backdrop'
++
++  it('皮肤层 backdrop 的 background 是 transparent/none(插件态不压暗画布)', () => {
++    const skin = skinRule(selBackdrop)
++    expect(skin, '皮肤段应存在 backdrop 的 background 覆写').toMatch(/background:\s*(transparent|none)\s*;/)
++    expect(skin, '插件态 backdrop 不得再掺文字色做压暗(旧配方退化即红)').not.toMatch(
++      /color-mix\(in srgb,\s*var\(--text-primary/,
++    )
++  })
++
++  it('网页版 App.css 的 backdrop 压暗背景保留(插件修复不得改写网页版)', () => {
++    const section = changelogSection()
++    expect(section, 'App.css changelog 段应有 backdrop 压暗背景').toContain('background: rgba(35, 35, 35, 0.28)')
++  })
++})
++
+ describe('dark-sc4 公告皮肤段与 region-edit 段位置不交叠', () => {
+   // 背景:verify:design 对「公告皮肤段与 region-edit 段位置交叠」不敏感——v2 组
+   // 实测把公告段整段搬进 region-edit 段中间造成真实交叠后,verify:design 的红因

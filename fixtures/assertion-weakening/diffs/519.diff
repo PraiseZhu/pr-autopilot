@@ -1,0 +1,484 @@
+diff --git a/cindyplugin/src/__tests__/mivoRouteConfig.test.ts b/cindyplugin/src/__tests__/mivoRouteConfig.test.ts
+new file mode 100644
+index 00000000..de441548
+--- /dev/null
++++ b/cindyplugin/src/__tests__/mivoRouteConfig.test.ts
+@@ -0,0 +1,353 @@
++/**
++ * Mivo 分流契约 · 配置态部分(SC-A1:/secrets 三态契约 / 禁缓存 / 三态唯一动作表 /
++ * 事故原形回归锁)。共享脚手架见 mivoRouteHarness;姊妹文件 mivoRouteSafety 钉
++ * 阶段矩阵/双扣费/凭证安全。
++ */
++import { describe, expect, it } from 'vitest'
++import { HASH, makeBrain, runOnce, stageCounts, upstream } from './mivoRouteHarness'
++import type { FetchReply, FetchRequest } from './mivoRouteHarness'
++import { flushMicrotasks, flushUntil } from './brainHarness'
++
++// ── SC-A1.1:/secrets 契约(真实 Response 形状 + 8 种 unknown + deadline)──────
++describe('SC-A1.1 配置态读取契约:数组 + 唯一行 + boolean,读不出的一律 unknown(缺行按未配置处理)', () => {
++  // 夹具用**真实 Response**(node 全局):`ok`/`json()` 行为与生产同源,不是手写鸭子对象
++  // (SC-A1.1 明定;reject 无法用 Response 表达,保持 Promise.reject)。
++  const CASES: Array<[string, () => unknown]> = [
++    ['非 2xx(真实 Response)', () => new Response('[]', { status: 500 })],
++    ['reject', () => Promise.reject(new Error('boom'))],
++    ['JSON 解析失败(真实 Response)', () => new Response('not-json{', { status: 200 })],
++    ['非数组(真实 Response)', () => new Response(JSON.stringify({ key: 'mivo_api_key', saved: true }), { status: 200 })],
++    // 「目标行缺失」不在这里:缺行 = 从未配置,是 unconfigured 的正常态,不是 unknown
++    // 的畸形态(见下方"正常态"用例;修复审查线程 discussion_r3720499815)。
++    ['目标行重复(真实 Response)', () => new Response(JSON.stringify([{ key: 'mivo_api_key', saved: true }, { key: 'mivo_api_key', saved: true }]), { status: 200 })],
++    ['saved 非 boolean(真实 Response)', () => new Response(JSON.stringify([{ key: 'mivo_api_key', saved: 'yes' }]), { status: 200 })],
++  ]
++  for (const [name, make] of CASES) {
++    it(`${name} → unknown`, async () => {
++      const run = makeBrain({ localFetch: () => make() })
++      await flushMicrotasks()
++      const state = await run.brain.handles.mivo.readConfigState()
++      expect(state).toBe('unknown')
++    })
++  }
++
++  it('第 8 种:读取超过 3000ms deadline → unknown(fetch 本身挂死)', async () => {
++    const run = makeBrain({ localFetch: () => new Promise(() => {}) })
++    await flushMicrotasks()
++    let state = ''
++    void run.brain.handles.mivo.readConfigState().then((value: string) => {
++      state = value
++    })
++    await flushUntil(() => state !== '', {
++      label: 'deadline 收口',
++      advanceEachRound: () => run.brain.clock.advance(500),
++    })
++    expect(state).toBe('unknown')
++  })
++
++  it('deadline 罩住 body 解析:fetch 返回了 Response 但 json() 挂死 → 仍 unknown,不永久 pending(收口审反例)', async () => {
++    // 真实 Response + 永不结束的 ReadableStream:json() 是真实的 body 解析挂死,
++    // 不是手写鸭子对象(SC-A1.1「真实 Response 全套」含本格)。
++    const run = makeBrain({
++      localFetch: () =>
++        new Response(new ReadableStream({ start() {} }), { status: 200, headers: { 'content-type': 'application/json' } }),
++    })
++    await flushMicrotasks()
++    let state = ''
++    void run.brain.handles.mivo.readConfigState().then((value: string) => {
++      state = value
++    })
++    await flushUntil(() => state !== '', {
++      label: 'body-hang deadline 收口',
++      advanceEachRound: () => run.brain.clock.advance(500),
++    })
++    expect(state).toBe('unknown')
++  })
++
++  it('正常态:saved:true → configured;saved:false → unconfigured;目标行缺失(从未配置)→ unconfigured', async () => {
++    const rows = (saved: boolean) => new Response(JSON.stringify([{ key: 'mivo_api_key', saved, tail: 'IAI' }]), { status: 200 })
++    const on = makeBrain({ localFetch: () => rows(true) })
++    await flushMicrotasks()
++    expect(await on.brain.handles.mivo.readConfigState()).toBe('configured')
++    const off = makeBrain({ localFetch: () => rows(false) })
++    await flushMicrotasks()
++    expect(await off.brain.handles.mivo.readConfigState()).toBe('unconfigured')
++    // 缺行 = 从未存过这个 key(常见常态,不是异常):与 settings.js:16 的 find、
++    // pluginMivoKey.ts 的 some 对缺行的既定语义一致——都判"未配置",不是"读不出"。
++    const missing = makeBrain({ localFetch: () => new Response(JSON.stringify([{ key: 'other_key', saved: true }]), { status: 200 }) })
++    await flushMicrotasks()
++    expect(await missing.brain.handles.mivo.readConfigState()).toBe('unconfigured')
++  })
++
++  it('端到端:body 挂死时生图 fail-fast(MIVO_CONFIG_UNKNOWN),零 Mivo 零 Cindy,不永久转圈', async () => {
++    const run = await runOnce({
++      localFetch: () =>
++        new Response(new ReadableStream({ start() {} }), { status: 200, headers: { 'content-type': 'application/json' } }),
++      fetch: upstream(),
++      advanceMs: 500,
++    })
++    expect(run.reply.ok).toBe(false)
++    expect(run.reply.code).toBe('MIVO_CONFIG_UNKNOWN')
++    expect(run.brain.fetchRequests).toHaveLength(0)
++    expect(run.cindyRequests).toHaveLength(0)
++  })
++})
++
++// ── SC-A1.3:禁止缓存配置态 ─────────────────────────────────────────────
++describe('SC-A1.3 配置态每次分流现读,禁缓存(3 组转换 × 各 2 单)', () => {
++  const seqLocalFetch = (states: Array<boolean | 'error'>) => {
++    let call = 0
++    return () => {
++      const state = states[Math.min(call, states.length - 1)]
++      call += 1
++      if (state === 'error') return { ok: false, status: 500, json: async () => [] }
++      return { ok: true, status: 200, json: async () => [{ key: 'mivo_api_key', saved: state }] }
++    }
++  }
++
++  it('false→true:第一单走代办,第二单走直连(证明第二单重新读了)', async () => {
++    const shared = makeBrain({ localFetch: seqLocalFetch([false, true]), fetch: upstream() })
++    await flushMicrotasks()
++    const first = await runOnce({ brain: shared })
++    expect(first.cindyRequests).toHaveLength(1)
++    expect(shared.brain.fetchRequests).toHaveLength(0)
++    const second = await runOnce({ brain: shared })
++    expect(second.cindyRequests).toHaveLength(1) // 没有新增
++    expect(shared.brain.fetchRequests.length).toBeGreaterThan(0) // 直连真发生了
++    expect(shared.brain.localFetchPaths.length).toBe(2) // 每单各读一次 /secrets
++    expect(second.reply.ok).toBe(true)
++  })
++
++  it('true→false:第一单直连,第二单代办', async () => {
++    const shared = makeBrain({ localFetch: seqLocalFetch([true, false]), fetch: upstream() })
++    await flushMicrotasks()
++    const first = await runOnce({ brain: shared })
++    expect(first.reply.ok).toBe(true)
++    expect(first.cindyRequests).toHaveLength(0)
++    const submitsAfterFirst = stageCounts(shared.brain.fetchRequests).submit
++    const second = await runOnce({ brain: shared })
++    expect(second.cindyRequests).toHaveLength(1)
++    expect(stageCounts(shared.brain.fetchRequests).submit).toBe(submitsAfterFirst) // 第二单零直连
++    expect(shared.brain.localFetchPaths.length).toBe(2)
++  })
++
++  it('unknown→true:第一单 fail-fast,第二单直连成功(读取故障不粘住后续单)', async () => {
++    const shared = makeBrain({ localFetch: seqLocalFetch(['error', true]), fetch: upstream() })
++    await flushMicrotasks()
++    const first = await runOnce({ brain: shared })
++    expect(first.reply.code).toBe('MIVO_CONFIG_UNKNOWN')
++    expect(first.cindyRequests).toHaveLength(0)
++    const second = await runOnce({ brain: shared })
++    expect(second.reply.ok).toBe(true)
++    expect(second.cindyRequests).toHaveLength(0)
++    expect(shared.brain.localFetchPaths.length).toBe(2)
++  })
++})
++
++// ── SC-A1.4 / A2.1:三态唯一动作表(gen 与 edit 逐格)─────────────────────
++describe('SC-A1.4 三态唯一动作表(×gen/edit)', () => {
++  for (const kind of ['gen', 'edit'] as const) {
++    it(`${kind} · configured 成功:/message 恰好 1、零代办、终态 done 有产物`, async () => {
++      const run = await runOnce({ kind, secretSaved: true, fetch: upstream() })
++      expect(run.reply.ok).toBe(true)
++      expect(run.reply.hash).toBe(HASH)
++      expect(stageCounts(run.brain.fetchRequests).submit).toBe(1) // C10b:成功路径也只提交一次
++      expect(run.cindyRequests).toHaveLength(0)
++    })
++
++    it(`${kind} · configured 失败:零代办、终态 failed 带闭集码`, async () => {
++      const run = await runOnce({
++        kind,
++        secretSaved: true,
++        fetch: upstream((r) => (String(r.url).endsWith('/message/chat') ? { ok: true, status: 401 } : null)),
++      })
++      expect(run.reply.ok).toBe(false)
++      expect(run.reply.code).toBe('MIVO_AUTH_INVALID')
++      expect(run.cindyRequests).toHaveLength(0)
++    })
++
++    it(`${kind} · unconfigured:零 Mivo 任何阶段、恰好 1 次代办、成功带 FALLBACK_QUOTA 码`, async () => {
++      const run = await runOnce({ kind, secretSaved: false, fetch: upstream() })
++      expect(run.reply.ok).toBe(true)
++      expect(run.reply.code).toBe('MIVO_FALLBACK_QUOTA')
++      expect(run.brain.fetchRequests).toHaveLength(0) // SC-A2.3:chat/upload/submit/poll/download 全零
++      expect(run.cindyRequests).toHaveLength(1)
++      expect(run.cindyRequests[0].kind).toBe(kind === 'edit' ? 'edit_image' : 'gen_image')
++    })
++
++    it(`${kind} · unknown:fail-fast,零 Mivo 零 Cindy,码 MIVO_CONFIG_UNKNOWN`, async () => {
++      const run = await runOnce({
++        kind,
++        localFetch: () => ({ ok: false, status: 500, json: async () => [] }),
++        fetch: upstream(),
++      })
++      expect(run.reply.ok).toBe(false)
++      expect(run.reply.code).toBe('MIVO_CONFIG_UNKNOWN')
++      expect(run.brain.fetchRequests).toHaveLength(0)
++      expect(run.cindyRequests).toHaveLength(0)
++    })
++  }
++})
++
++// ── SC-A2.2:configured 五阶段失败矩阵(URL 到达断言)────────────────────────
++describe('SC-A2.2 configured 各阶段失败:目标阶段确实到达、后续阶段未发生、零代办', () => {
++  type StageCase = {
++    name: string
++    kind: 'gen' | 'edit'
++    override: (r: FetchRequest) => FetchReply | null
++    expectCode: string
++    arrived: (s: ReturnType<typeof stageCounts>) => void
++  }
++  const CASES: StageCase[] = [
++    {
++      name: '① chat 创建失败(gen)',
++      kind: 'gen',
++      override: (r) => (String(r.url).endsWith('/message/chat') ? { ok: true, status: 500 } : null),
++      expectCode: 'MIVO_UPSTREAM_BUSY',
++      arrived: (s) => {
++        expect(s.chat).toBe(1)
++        expect(s.submit).toBe(0)
++        expect(s.poll).toBe(0)
++      },
++    },
++    {
++      name: '① chat 创建失败(edit)',
++      kind: 'edit',
++      override: (r) => (String(r.url).endsWith('/message/chat') ? { ok: true, status: 500 } : null),
++      expectCode: 'MIVO_UPSTREAM_BUSY',
++      arrived: (s) => {
++        expect(s.chat).toBe(1)
++        expect(s.upload).toBe(0) // 会话在上传之前
++        expect(s.submit).toBe(0)
++      },
++    },
++    {
++      name: '② upload 失败(仅 edit)',
++      kind: 'edit',
++      override: (r) => (r.upload ? { ok: true, status: 403 } : null),
++      expectCode: 'MIVO_AUTH_FORBIDDEN',
++      arrived: (s) => {
++        expect(s.upload).toBe(1)
++        expect(s.submit).toBe(0)
++        expect(s.poll).toBe(0)
++      },
++    },
++    {
++      name: '③ submit 已发出但响应丢失(gen)',
++      kind: 'gen',
++      override: (r) => (String(r.url).endsWith('/api/v1/message') ? { ok: false, message: 'connection reset' } : null),
++      expectCode: 'MIVO_TRANSPORT_UNKNOWN',
++      arrived: (s) => {
++        expect(s.submit).toBe(1) // SC-A3.1:请求确实出站了,且只有一次
++        expect(s.poll).toBe(0)
++      },
++    },
++    {
++      name: '③ submit 已发出但响应丢失(edit)',
++      kind: 'edit',
++      override: (r) => (String(r.url).endsWith('/api/v1/message') ? { ok: false, message: 'connection reset' } : null),
++      expectCode: 'MIVO_TRANSPORT_UNKNOWN',
++      arrived: (s) => {
++        expect(s.submit).toBe(1)
++        expect(s.poll).toBe(0)
++      },
++    },
++    {
++      name: '④ poll 失败(gen)',
++      kind: 'gen',
++      override: (r) => (String(r.url).includes('/api/v1/message/job-') ? { ok: true, status: 429 } : null),
++      expectCode: 'MIVO_UPSTREAM_BUSY',
++      arrived: (s) => {
++        expect(s.submit).toBe(1)
++        expect(s.poll).toBeGreaterThanOrEqual(1)
++        expect(s.download).toBe(0)
++      },
++    },
++    {
++      name: '④ poll 失败(edit)',
++      kind: 'edit',
++      override: (r) => (String(r.url).includes('/api/v1/message/job-') ? { ok: true, status: 429 } : null),
++      expectCode: 'MIVO_UPSTREAM_BUSY',
++      arrived: (s) => {
++        expect(s.upload).toBe(1)
++        expect(s.submit).toBe(1)
++        expect(s.poll).toBeGreaterThanOrEqual(1)
++        expect(s.download).toBe(0)
++      },
++    },
++    {
++      // 直下与 signUrl 两端都真的坏(同一 auth 问题通常两端同时不通)才该对外报错——
++      // 只坏直下会落到 signUrl 兜底(见下方"直下失败回落 signUrl"用例,修复审查线程
++      // discussion_r3720499822)。
++      name: '⑤ download 失败(gen,直下+signUrl 均 401)',
++      kind: 'gen',
++      override: (r) => (String(r.url).includes('/file/download/') || String(r.url).includes('/file/signUrl/') ? { ok: true, status: 401 } : null),
++      expectCode: 'MIVO_AUTH_INVALID',
++      arrived: (s) => {
++        expect(s.poll).toBeGreaterThanOrEqual(1)
++        expect(s.download).toBeGreaterThanOrEqual(1)
++      },
++    },
++    {
++      name: '⑤ download 失败(edit,直下+signUrl 均 403)',
++      kind: 'edit',
++      override: (r) => (String(r.url).includes('/file/download/') || String(r.url).includes('/file/signUrl/') ? { ok: true, status: 403 } : null),
++      expectCode: 'MIVO_AUTH_FORBIDDEN',
++      arrived: (s) => {
++        expect(s.upload).toBe(1)
++        expect(s.download).toBeGreaterThanOrEqual(1)
++      },
++    },
++  ]
++  for (const c of CASES) {
++    it(`${c.name} → ${c.expectCode},零代办`, async () => {
++      const run = await runOnce({ kind: c.kind, secretSaved: true, fetch: upstream(c.override) })
++      expect(run.reply.ok).toBe(false)
++      expect(run.reply.code).toBe(c.expectCode)
++      expect(run.cindyRequests).toHaveLength(0)
++      c.arrived(stageCounts(run.brain.fetchRequests))
++    })
++  }
++
++  // 直下失败回落 signUrl:已计费的单不能因直下端点一次性故障就判死——signUrl 是不同
++  // 域名端点,原本就是次选(修复审查线程 discussion_r3720499822:旧版直下 throw 不接住,
++  // 永不尝试 signUrl)。
++  const FALLBACK_CASES: Array<{ name: string; kind: 'gen' | 'edit'; directStatus: number }> = [
++    { name: '直下 5xx 回落 signUrl 成功(gen)', kind: 'gen', directStatus: 500 },
++    { name: '直下 429 回落 signUrl 成功(edit)', kind: 'edit', directStatus: 429 },
++  ]
++  for (const c of FALLBACK_CASES) {
++    it(`${c.name} → 整单成功,零代办`, async () => {
++      const run = await runOnce({
++        kind: c.kind,
++        secretSaved: true,
++        fetch: upstream((r) => (String(r.url).includes('/file/download/') ? { ok: true, status: c.directStatus } : null)),
++      })
++      expect(run.reply.ok).toBe(true)
++      expect(run.cindyRequests).toHaveLength(0)
++      const stages = stageCounts(run.brain.fetchRequests)
++      // download 桶同时数直下与 signUrl 侧请求:至少 2(直下 1 次失败 + signUrl 链路)。
++      expect(stages.download).toBeGreaterThanOrEqual(2)
++    })
++  }
++})
++
++// ── 事故原形回归锁(A1.5 变异① 的指定红点)──────────────────────────────────
++describe('事故原形:configured + 错误文案命中旧「未配置」正则 → 绝不回落', () => {
++  it('key 已配,上游拒绝且文案带「未登录/凭证」→ 零代办,如实报 TRANSPORT_UNKNOWN', async () => {
++    // 2026-08-04 真实事故的形状:key 失效,平台侧文案恰好命中旧正则的「未登录」「凭证」,
++    // 旧实现把它读成「没配 key」→ 静默改走 Cindy 配额。新契约下该文案不参与任何路由。
++    const run = await runOnce({
++      secretSaved: true,
++      fetch: upstream((r) =>
++        String(r.url).endsWith('/message/chat')
++          ? { ok: false, message: '未登录或凭证无效,请先配置并重新登录' }
++          : null,
++      ),
++    })
++    expect(run.reply.ok).toBe(false)
++    expect(run.reply.code).toBe('MIVO_TRANSPORT_UNKNOWN')
++    expect(run.cindyRequests).toHaveLength(0) // 事故行为 = 这里变成 1
++  })
++})
++
+diff --git a/cindyplugin/src/__tests__/mivoRouteHarness.ts b/cindyplugin/src/__tests__/mivoRouteHarness.ts
+new file mode 100644
+index 00000000..cfc41d88
+--- /dev/null
++++ b/cindyplugin/src/__tests__/mivoRouteHarness.ts
+@@ -0,0 +1,119 @@
++/**
++ * Mivo 分流契约测试的共享脚手架(SC v6 §3 PR-A 拆分列车 ②/③ 共用)。
++ *
++ * 背景(2026-08-04 事故):key 失效时上游 401 文案命中旧「未配置」正则,被静默改走
++ * Cindy 代办配额。修复后的契约测试分两个文件(mivoRouteConfig / mivoRouteSafety),
++ * 本文件提供共用的假上游、阶段分桶与 runOnce 驱动,断言都跑在真实 main.js 上。
++ */
++import { flushMicrotasks, flushUntil, loadBrain } from './brainHarness'
++import type { LoadBrainOptions, LoadedBrain } from './brainHarness'
++
++export const HASH = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
++export const IMAGE_URL = `cindy-media://blobs/${HASH}.png`
++export const MEDIA = { url: IMAGE_URL, hash: HASH, ext: '.png', bytes: 4096 }
++export const SOURCE_HASH = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
++export const FILE_ID = 'img0000000001'
++export const SIGNED_URL = 'https://mivo-oss.example.com/blobs/x.png?sig=abc'
++
++// 高熵合成 canary(32 位十六进制):不与任何安全文案共享 ≥8 字符子串。
++export const CANARY = 'f3a9c1e7b2d84065a1f0c9e3d7b5a482'
++
++export type FetchRequest = Record<string, unknown>
++export type FetchReply = { ok: boolean; status?: number; body?: string; media?: unknown; message?: string }
++
++export const jsonOk = (value: unknown): FetchReply => ({ ok: true, status: 200, body: JSON.stringify(value) })
++
++/** 直连假上游:全部端点按真实形状应答,override 注入单点故障。 */
++export const upstream = (override?: (request: FetchRequest) => FetchReply | null) => {
++  return (request: FetchRequest): FetchReply => {
++    const forced = override?.(request)
++    if (forced) return forced
++    const url = String(request.url ?? '')
++    if (request.upload) return jsonOk([{ object_id: 'upload-1' }])
++    if (url.endsWith('/message/chat')) return jsonOk({ object_id: 'chat-1' })
++    if (url.endsWith('/api/v1/message')) return jsonOk({ object_id: 'job-1' })
++    if (url.includes('/api/v1/message/job-')) return jsonOk({ content: { status: 'completed', images: [`/file/image/${FILE_ID}`] } })
++    if (url.includes('/api/v1/file/download/')) return { ok: true, status: 200, media: MEDIA }
++    if (url.includes('/api/v1/file/signUrl/')) return { ok: true, status: 200, body: `"${SIGNED_URL}"` }
++    if (url === SIGNED_URL) return { ok: true, status: 200, media: MEDIA }
++    return { ok: false, message: `假上游未覆盖: ${url}` }
++  }
++}
++
++/** 出站请求分桶(证明「到达了哪个阶段、没到哪个阶段」的判据)。 */
++export const stageCounts = (fetches: FetchRequest[]) => {
++  const urls = fetches.map((r) => String(r.url ?? ''))
++  return {
++    chat: urls.filter((u) => u.endsWith('/message/chat')).length,
++    upload: fetches.filter((r) => Boolean(r.upload)).length,
++    submit: urls.filter((u) => u.endsWith('/api/v1/message')).length,
++    poll: urls.filter((u) => u.includes('/api/v1/message/job-')).length,
++    download: urls.filter((u) => u.includes('/file/download/') || u === SIGNED_URL || u.includes('/file/signUrl/')).length,
++  }
++}
++
++export type RunOptions = {
++  kind?: 'gen' | 'edit'
++  fetch?: LoadBrainOptions['fetch']
++  localFetch?: LoadBrainOptions['localFetch']
++  secretSaved?: boolean
++  hostReply?: Record<string, unknown> | (() => unknown)
++  reqId?: string
++  advanceMs?: number
++  /** 复用已有 brain(测「同一 brain 连续多单」时用);缺省新建。 */
++  brain?: BrainRun
++}
++
++export type BrainRun = {
++  brain: LoadedBrain
++  cindyRequests: Array<Record<string, unknown>>
++  replies: Array<Record<string, unknown>>
++}
++
++export const makeBrain = (options: RunOptions): BrainRun => {
++  const cindyRequests: Array<Record<string, unknown>> = []
++  const brain = loadBrain({
++    panelPresent: () => false,
++    locale: 'zh-CN',
++    fetch: options.fetch,
++    localFetch: options.localFetch,
++    secretSaved: options.secretSaved,
++    send: (payload) => {
++      const message = (payload ?? {}) as Record<string, unknown>
++      if (message.type === 'cindy-request') {
++        cindyRequests.push(message)
++        const reply = options.hostReply
++        if (typeof reply === 'function') return reply()
++        return reply ?? { ok: true, hash: HASH, ext: '.png', url: IMAGE_URL, width: 1024, height: 1024, modelLabel: 'Cindy 代办模型' }
++      }
++      return { ok: true }
++    },
++  })
++  const replies: Array<Record<string, unknown>> = []
++  const persist = brain.bus.open('mivo-canvas-persist')
++  persist.onmessage = (event) => {
++    const data = event.data as Record<string, unknown>
++    if (data && data.reply === true) replies.push(data)
++  }
++  return { brain, cindyRequests, replies }
++}
++
++export const runOnce = async (options: RunOptions = {}): Promise<BrainRun & { reply: Record<string, unknown> }> => {
++  const run = options.brain ?? makeBrain(options)
++  if (!options.brain) await flushMicrotasks()
++  const before = run.replies.length
++  const reqId = options.reqId ?? `req-${Math.random().toString(36).slice(2)}`
++  const msg =
++    options.kind === 'edit'
++      ? { reqId, kind: 'edit-image', prompt: '改一下', hashes: [SOURCE_HASH], callId: 'call-e' }
++      : { reqId, kind: 'gen-image', prompt: '一只柴犬', callId: 'call-g' }
++  run.brain.handles.handleGenImage(msg)
++  await flushMicrotasks()
++  await flushUntil(() => run.replies.length > before, {
++    label: 'handleGenImage 回执',
++    rounds: 64,
++    advanceEachRound: () => run.brain.clock.advance(options.advanceMs ?? 0),
++  })
++  return { ...run, reply: run.replies[run.replies.length - 1] }
++}
++

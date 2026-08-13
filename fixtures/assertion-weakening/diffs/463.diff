@@ -1,0 +1,668 @@
+diff --git a/src/__tests__/depositFailureClassifiers.test.ts b/src/__tests__/depositFailureClassifiers.test.ts
+index 8149a03c..a2d3ff49 100644
+--- a/src/__tests__/depositFailureClassifiers.test.ts
++++ b/src/__tests__/depositFailureClassifiers.test.ts
+@@ -6,12 +6,12 @@
+  */
+ import { describe, expect, it } from 'vitest'
+ import {
++  DEPOSIT_CAPABILITY_TTL_MS,
+   isKindCapabilityBlocked,
+   isQuotaExceededConsideringThisRequest,
+   nextKindCapabilityMark,
+   type DepositKindCapabilityMark,
+ } from '../agent/depositFailureClassifiers'
+-import { DEPOSIT_CAPABILITY_TTL_MS } from '../agent/depositPort'
+ 
+ describe('isQuotaExceededConsideringThisRequest — SC1b.3 quota 两支', () => {
+   it('支1:已经满了(used >= limit)→ true,不需要 decodedBytes', () => {
+diff --git a/src/__tests__/depositFailureCopy.test.ts b/src/__tests__/depositFailureCopy.test.ts
+index 9437b1ad..875cbca6 100644
+--- a/src/__tests__/depositFailureCopy.test.ts
++++ b/src/__tests__/depositFailureCopy.test.ts
+@@ -58,6 +58,24 @@ describe('describeDepositFailure — 四语覆盖(用户可见路径全部 8 个
+     expect(() => describeDepositFailure('DEPOSIT_FAILED')).not.toThrow()
+     expect(describeDepositFailure('DEPOSIT_FAILED')).toBe(enText)
+   })
++
++  // T1d-wire 必补护栏(lead 追加,防真实陷阱):展示端 AnchorOverlay.tsx 的判别符是
++  // `error.startsWith('chat.')`——生产者侧解析出的成品串一旦以 `chat.` 开头就会被
++  // 二次翻译。全部 8 个失败码 × 全部 4 种语言(含 QUOTA_FULL 的带参/不带参两种插值
++  // 分支)逐一钉住,不只是抽样。
++  it.each(['en', 'zh-CN', 'ja', 'ko'] as const)(
++    '%s:全部 8 个失败码的输出均不以 "chat." 开头(防止被展示端误判为待翻译 key 二次翻译)',
++    async (locale) => {
++      await i18n.changeLanguage(locale)
++      for (const code of ALL_CODES) {
++        const text = describeDepositFailure(code)
++        expect(text.startsWith('chat.'), `${locale}/${code} 文案以 "chat." 开头,会被 AnchorOverlay 误判为待翻译 key:${text}`).toBe(false)
++      }
++      // QUOTA_FULL 带结构化配额两数的插值分支走的是另一个 catalog 词条,单独覆盖。
++      const withUsage = describeDepositFailure('QUOTA_FULL', { usedBytes: 100, limitBytes: 200 })
++      expect(withUsage.startsWith('chat.'), `${locale}/QUOTA_FULL(带用量) 文案以 "chat." 开头:${withUsage}`).toBe(false)
++    },
++  )
+ })
+ 
+ describe('describeDepositFailure — QUOTA_FULL 插值(设计稿 §4.7「用了 X / 共 Y」)', () => {
+diff --git a/src/__tests__/depositFailureMatrixGuards.test.ts b/src/__tests__/depositFailureMatrixGuards.test.ts
+index f76cb48e..9ae3f660 100644
+--- a/src/__tests__/depositFailureMatrixGuards.test.ts
++++ b/src/__tests__/depositFailureMatrixGuards.test.ts
+@@ -51,11 +51,18 @@ describe('SC1b.3 超限——冻结值整(恰好 = 50MB)→ 不拦截,照常发
+     resetDepositPortForTests()
+   })
+ 
+-  it('blob.size === DEPOSIT_MAX_BYTES → depositPort 自己的前置判据不拦截,请求确实发出并成功', async () => {
+-    const exact = blobOfBytes(DEPOSIT_MAX_BYTES)
+-    await expect(depositBlob(exact)).resolves.toMatchObject({ hash: FAKE_HASH })
+-    expect(requests).toHaveLength(1)
+-  })
++  it(
++    'blob.size === DEPOSIT_MAX_BYTES → depositPort 自己的前置判据不拦截,请求确实发出并成功',
++    async () => {
++      // 与 depositPort.test.ts 的同款边界用例(:155-170)同一根因:depositBlob 真实
++      // 把 50MB blob 走一遍 blobToBase64,全仓并跑高并发下偶尔压过默认 5000ms——
++      // 这里补齐那条用例已经采用的超时,不是新引入的容差。
++      const exact = blobOfBytes(DEPOSIT_MAX_BYTES)
++      await expect(depositBlob(exact)).resolves.toMatchObject({ hash: FAKE_HASH })
++      expect(requests).toHaveLength(1)
++    },
++    20_000,
++  )
+ 
+   it('对照:blob.size === DEPOSIT_MAX_BYTES + 1 → 仍是前置拦截,零请求(锁住边界不漂移)', async () => {
+     const oversized = blobOfBytes(DEPOSIT_MAX_BYTES + 1)
+diff --git a/src/__tests__/depositPort.test.ts b/src/__tests__/depositPort.test.ts
+index bfc20dc6..32d27af9 100644
+--- a/src/__tests__/depositPort.test.ts
++++ b/src/__tests__/depositPort.test.ts
+@@ -8,19 +8,21 @@
+  */
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import {
+-  DEPOSIT_CAPABILITY_TTL_MS,
+   DEPOSIT_ENABLED,
+   DEPOSIT_LABEL,
+   DEPOSIT_MAX_BYTES,
+   DEPOSIT_RATE_RETRY_DELAY_MS,
++  DEPOSIT_TIMEOUT_MS,
+   DepositError,
+   classifyDepositFailure,
+   depositBlob,
+   isDepositCapabilityBlocked,
+   resolveDepositEntry,
+   setDepositClockForTests,
++  setDepositMediaTransport,
+   setDepositSleepForTests,
+ } from '../agent/depositPort'
++import { DEPOSIT_CAPABILITY_TTL_MS } from '../agent/depositFailureClassifiers'
+ import { lookupDeposit, peekDepositStoreForTests, recordDeposit } from '../agent/depositStore'
+ import type { PersistReply } from '../persist/bridge'
+ import { blobOfBytes, createDepositHarness, teardownDepositHarness, FAKE_HASH, type DepositHarness } from './depositTestHarness'
+@@ -212,8 +214,11 @@ describe('depositPort — 失败矩阵(绝不写半条映射)', () => {
+ 
+     // 纯文案不判 QUOTA_FULL——唯一判据是结构化两数,不猜文案。
+     expect(classifyDepositFailure(reply({ message: 'quota exceeded' }))).toBe('DEPOSIT_FAILED')
+-    expect(classifyDepositFailure(reply({ quotaUsedBytes: 100, quotaLimitBytes: 100 }))).toBe('QUOTA_FULL')
+-    expect(classifyDepositFailure(reply({ quotaUsedBytes: 50, quotaLimitBytes: 100 }))).toBe('DEPOSIT_FAILED') // 未满不判
++    expect(classifyDepositFailure(reply({ quotaUsedBytes: 100, quotaLimitBytes: 100 }))).toBe('QUOTA_FULL') // 支1:已经满了
++    // SC1b.3 quota 支2(T1d-wire 接线):used<limit 但 used+decodedBytes>limit,即使宿主账面此刻还没满。
++    expect(classifyDepositFailure(reply({ quotaUsedBytes: 50, quotaLimitBytes: 100 }))).toBe('DEPOSIT_FAILED') // 未传本次字节数,不判
++    expect(classifyDepositFailure(reply({ quotaUsedBytes: 50, quotaLimitBytes: 100 }), 40)).toBe('DEPOSIT_FAILED') // 支2:50+40=90<=100,仍不判
++    expect(classifyDepositFailure(reply({ quotaUsedBytes: 50, quotaLimitBytes: 100 }), 60)).toBe('QUOTA_FULL') // 支2:50+60=110>100,判定
+     expect(classifyDepositFailure(reply({ message: 'rate limited' }))).toBe('RATE_LIMITED')
+     expect(classifyDepositFailure(reply({ message: 'unknown kind: deposit_media' }))).toBe('HOST_UNSUPPORTED')
+     expect(classifyDepositFailure(reply({ message: '不支持的类型' }))).toBe('UNSUPPORTED_MIME')
+@@ -248,6 +253,53 @@ describe('depositPort — 频控退避', () => {
+   })
+ })
+ 
++// SC-T1d-wire.5(lead 追加,补起草漏洞):此前 timeout 只有单元级映射断言
++// (下方失败矩阵 describe 里 `classifyDepositFailure(reply({ timeout: true }))`),
++// 只证明"映射对",不证明超时真的会发生并产出那个回执形状。这里换一条自造的
++// 假传输(不经 depositTestHarness 的真 main.js——main.js 从不构造 `timeout:true`,
++// 那是 `persist/bridge.ts` 的 `persistRequest` 自己在客户端 `window.setTimeout`
++// 到期后合成的兜底回执,真 main.js 完全不在这条判定路径上),复刻同一形状:
++// 宿主永不回复,唯一能让请求落定的只有超时兜底。
++//
++// **不用 `vi.useFakeTimers()`**(踩过坑,如实记录):第一版用假时钟
++// `vi.advanceTimersByTimeAsync(DEPOSIT_TIMEOUT_MS)` 推进,单独跑这个文件绿,但
++// 跑全仓 `npm run test:unit` 时会真实拖垮同目录另外两个文件
++// (`depositBrain.test.ts`/`depositFailureMatrixGuards.test.ts` 报
++// `Test timed out in 5000ms`)——`vi.useFakeTimers()`/`useRealTimers()` 影响的是
++// worker 内的全局计时器状态,与本仓 vitest 的文件级隔离粒度不是同一回事,`afterEach`
++// 里还原不能保证下一个文件开始前状态已经干净。`depositBlob`/`resolveDepositEntry`
++// 自己完全不含任何等待/轮询逻辑(那是 `persist/bridge.ts` 的 `persistRequest`
++// 内部行为,已被这里的假传输整体替换),真正需要钉住的只是"消费一条 timeout 回执
++// 的行为对不对",不是"客户端真的等了 60 秒"——那部分留给假传输自己:直接同步
++// resolve 那个回执形状,但断言 `depositBlob` 确实把 `DEPOSIT_TIMEOUT_MS` 当
++// deadline 传给了 transport(证明"配置了 60s 超时"这件事本身没漏),不需要真的
++// 或模拟地等待它流逝。
++describe('depositPort — 超时(SC1b.3 timeout,端到端直测)', () => {
++  it('宿主永不回复(假传输直接合成 timeout 回执)→ 以 timeout 语义失败,恰发出 1 次请求(不重发、不当成 rate-limit 退避)、按 60s 配置 deadline', async () => {
++    let requestCount = 0
++    let observedTimeoutMs: number | undefined
++    setDepositMediaTransport((async (_kind, _payload, options) => {
++      requestCount += 1
++      observedTimeoutMs = options?.timeoutMs
++      // 假宿主真的从不回复——这里直接给出生产 `persistRequest` 在客户端
++      // `window.setTimeout(timeoutMs)` 到期后会合成的**同一回执形状**
++      // (`{ok:false, timeout:true}`),不重放宿主真实通信的时间维度(那部分是
++      // bridge.ts 自己的职责,不是 depositBlob 消费方要重新证明的东西)。
++      return { reqId: 'timeout-probe', reply: true, ok: false, timeout: true } as PersistReply
++    }) as typeof import('../persist/bridge').persistRequest)
++
++    await expect(
++      resolveDepositEntry({ assetUrl: 'mivo-asset:timeout', blob: blobOfBytes(32) }),
++    ).rejects.toMatchObject({ code: 'BRAIN_TIMEOUT' })
++
++    expect(observedTimeoutMs).toBe(DEPOSIT_TIMEOUT_MS) // depositBlob 确实按 60s 配置了 deadline,不是漏配
++    // 超时不重发——与频控退避恰 1 次是不同语义,上面那组用例已经覆盖频控,这里
++    // 专门钉住"别把两者混在一起":timeout 分支没有 sleep+重试这一步。
++    expect(requestCount).toBe(1)
++    expect(peekDepositStoreForTests()?.map['mivo-asset:timeout']).toBeUndefined() // 绝不写半条映射
++  })
++})
++
+ describe('depositPort — 能力探测与负缓存', () => {
+   it('宿主不支持 → 写负缓存;TTL 内后续调用零请求直接降级', async () => {
+     harness.setHostReply(() => ({ ok: false, message: 'unknown kind' }))
+@@ -256,8 +308,10 @@ describe('depositPort — 能力探测与负缓存', () => {
+       code: 'HOST_UNSUPPORTED',
+     })
+     expect(harness.hostRequests).toHaveLength(1)
+-    expect(peekDepositStoreForTests()?.capability).toMatchObject({ supported: false, at: clockNow })
+-    await expect(isDepositCapabilityBlocked()).resolves.toBe(true)
++    // T1d-wire:能力负缓存按 kind 分桶(SC1b.3),resolveDepositEntry 未传 kind 时
++    // 默认 'image'(depositPort.ts DEPOSIT_DEFAULT_KIND),与调用方现状一致。
++    expect(peekDepositStoreForTests()?.capabilityByKind?.image).toMatchObject({ supported: false, at: clockNow })
++    await expect(isDepositCapabilityBlocked('image')).resolves.toBe(true)
+ 
+     await expect(resolveDepositEntry({ assetUrl: 'mivo-asset:2', blob: blobOfBytes(32) })).rejects.toMatchObject({
+       code: 'HOST_UNSUPPORTED',
+@@ -272,14 +326,24 @@ describe('depositPort — 能力探测与负缓存', () => {
+     })
+ 
+     clockNow += DEPOSIT_CAPABILITY_TTL_MS + 1
+-    await expect(isDepositCapabilityBlocked()).resolves.toBe(false)
++    await expect(isDepositCapabilityBlocked('image')).resolves.toBe(false)
+ 
+     harness.setHostReply(() => ({ ok: true, hash: FAKE_HASH, ext: '.png' }))
+     await expect(resolveDepositEntry({ assetUrl: 'mivo-asset:1', blob: blobOfBytes(32) })).resolves.toMatchObject({
+       hash: FAKE_HASH,
+     })
+     expect(harness.hostRequests).toHaveLength(2)
+-    expect(peekDepositStoreForTests()?.capability?.supported).toBe(true)
++    expect(peekDepositStoreForTests()?.capabilityByKind?.image?.supported).toBe(true)
++  })
++
++  it('kind 分桶隔离(SC1b.3):image 负缓存生效不连累未探测过的其它 kind', async () => {
++    harness.setHostReply(() => ({ ok: false, message: 'unknown kind' }))
++    await expect(resolveDepositEntry({ assetUrl: 'mivo-asset:1', blob: blobOfBytes(32) })).rejects.toMatchObject({
++      code: 'HOST_UNSUPPORTED',
++    })
++    await expect(isDepositCapabilityBlocked('image')).resolves.toBe(true)
++    // 分桶前的全局单一布尔实现会让这一句也判 true——把改动前的行为钉成负例。
++    await expect(isDepositCapabilityBlocked('video')).resolves.toBe(false)
+   })
+ 
+   it('探测不发合成探针:全程只有真实寄存请求(不脏配额)', async () => {
+diff --git a/src/agent/depositFailureClassifiers.ts b/src/agent/depositFailureClassifiers.ts
+index 7e8b9e31..a28581f8 100644
+--- a/src/agent/depositFailureClassifiers.ts
++++ b/src/agent/depositFailureClassifiers.ts
+@@ -10,7 +10,19 @@
+  * 为什么不直接改 `depositPort.ts`/`depositStore.ts`:两个文件归属另一条并行泳道
+  * (T1b2/T1b3),本段边界禁止触碰——见派工合同「并行文件所有权」。
+  */
+-import { DEPOSIT_CAPABILITY_TTL_MS } from './depositPort'
++
++/**
++ * 能力负缓存 TTL(设计稿 §5.2):到期重探,宿主升级后自动恢复,不需要用户重装。
++ * 定义搬到这里(而不是留在 `depositPort.ts` 再被本文件 import)是 T1d-wire
++ * 收口的一处修正:它本就是 `isKindCapabilityBlocked` 默认参数值消费的纯常量,
++ * 概念上属这里;留在 `depositPort.ts` 会与本文件已有的
++ * `isKindCapabilityBlocked`/`nextKindCapabilityMark`(被 `depositPort.ts` 导入)
++ * 组成一个值级循环引用——运行期因为只用在默认参数(调用时求值,不在模块初始化期)
++ * 而安全,但 `scripts/ci/cycle-guard.mjs` 扫不到 cindyplugin 独立入口,这个环会
++ * 静默溜过 CI(仓库为此专门做过闸门,#413)。单向依赖后环消失,不需要
++ * `import type` 硬扛,也不需要豁免注释。
++ */
++export const DEPOSIT_CAPABILITY_TTL_MS = 24 * 60 * 60 * 1_000
+ 
+ // ── SC1b.3「quota 两支」──
+ //
+diff --git a/src/agent/depositPort.ts b/src/agent/depositPort.ts
+index 1ec63f03..4fe053b0 100644
+--- a/src/agent/depositPort.ts
++++ b/src/agent/depositPort.ts
+@@ -17,13 +17,36 @@ import {
+   invalidateDeposit,
+   loadDepositStore,
+   lookupDeposit,
+-  recordCapabilityMark,
+   recordDeposit,
++  recordKindCapabilityMark,
+   type DepositEntryDraft,
+ } from './depositStore'
++import {
++  DEPOSIT_CAPABILITY_TTL_MS,
++  isKindCapabilityBlocked,
++  isQuotaExceededConsideringThisRequest,
++  nextKindCapabilityMark,
++} from './depositFailureClassifiers'
++import { describeDepositFailure } from './depositFailureCopy'
++import ghostManifest from '../../ghost.json'
+ 
+ const SOURCE = 'Cindy Deposit'
+ 
++/**
++ * 插件自身版本(T1d-wire 接线指引第 2 点:kind 分桶负缓存的版本判据必须以
++ * ghost.json 为单一真相源)。运行时 JSON import,不是构建期 `define` 注入——
++ * `cindyplugin/vite.config.ts` 现有的 `VITE_MIVO_VERSION` 是应用主站遗留的占位
++ * 常量(硬编码 `'cindy-plugin-dev'`,已知陷阱,不能当真版本用),另开一条 define
++ * 通道只会制造第二份需要手工保持同步的版本来源。`ghost.json` 已被 `build.sh`
++ * 原样拷进 `dist/`,与真正发行的版本号同源;`resolveJsonModule` 已开
++ * (tsconfig.app.json),JSON import 在生产构建与 vitest 下行为一致,不需要
++ * 额外的 mock/注入。
++ */
++const PLUGIN_VERSION: string = ghostManifest.version
++
++/** 当前唯一支持的寄存媒体 kind(video/audio 等待 P3-10)。调用方未来按实际媒体类型传参。 */
++const DEPOSIT_DEFAULT_KIND = 'image'
++
+ /**
+  * 编译期常量,不是运行时开关:运行时开关会产生「一半用户走新路一半走旧路」的
+  * 诊断噩梦,而这条链路的回滚粒度本就是插件版本(设计稿 §6.3)。
+@@ -47,8 +70,9 @@ export const DEPOSIT_TIMEOUT_MS = 60_000
+ export const DEPOSIT_RETRY_MS = 2_000
+ /** 频控退避:宿主令牌桶约 1 张/秒,留余量。 */
+ export const DEPOSIT_RATE_RETRY_DELAY_MS = 1_100
+-/** 能力负缓存 TTL:到期重探,宿主升级后自动恢复,不需要用户重装(设计稿 §5.2)。 */
+-export const DEPOSIT_CAPABILITY_TTL_MS = 24 * 60 * 60 * 1_000
++// 能力负缓存 TTL(DEPOSIT_CAPABILITY_TTL_MS)定义已搬到 depositFailureClassifiers.ts
++// (上面 import 处),打破与该文件的值级循环引用(T1d-wire 收口)——本文件仍从那里
++// 导入使用,不在此处重新导出常量。
+ /** 隐私默认(设计稿 §11-⑦):只带用途标签,不带用户原文件名。 */
+ export const DEPOSIT_LABEL = '画布参考图'
+ 
+@@ -73,23 +97,11 @@ export class DepositError extends Error {
+ }
+ 
+ /**
+- * 用户可见文案。
+- * i18n 现状(交切流段处理,不在本段假装解决):这条链路的错误文案最终落到
+- * `TaskView.error` 由画布 UI 渲染,而插件层 i18n 走的是「英文原文 → 译文」字典
+- * 替换且只作用于 UI 镶边容器白名单(`src/i18n/translator.ts`)——两者不接。
+- * 本段 flag 关,这些文案一条都到不了用户眼前;切流段翻开关前必须先定四语落地
+- * 机制(§六-3),不能靠现有字典想当然覆盖。
++ * 用户可见文案(T1d-wire 已接线):四语落地机制 = `describeDepositFailure`
++ * (`depositFailureCopy.ts`),复用面板侧既有 i18next catalog(`src/i18n`,
++ * `toast.deposit.*`)。本模块不再自持硬编码中文 `Record`——旧版 `FAILURE_MESSAGE`
++ * 已随本次接线删除,所有 `DepositError` 构造点统一调用 `describeDepositFailure`。
+  */
+-const FAILURE_MESSAGE: Record<DepositFailureCode, string> = {
+-  TOO_LARGE: '这张图超过 50MB,暂时不能作为改图源。',
+-  UNSUPPORTED_MIME: '这种格式的图暂时不能作为改图源。',
+-  QUOTA_FULL: '你的媒体库已满,清理后可继续。',
+-  RATE_LIMITED: '寄存请求过于频繁,请稍后再试。',
+-  HOST_UNSUPPORTED: '当前 Cindy 版本还不支持把画布上的图交给改图代办。',
+-  BRAIN_TIMEOUT: '电子脑无响应,请重试。',
+-  BAD_RECEIPT: '寄存回执不完整,请重试。',
+-  DEPOSIT_FAILED: '这张图寄存失败,暂时不能作为改图源。',
+-}
+ 
+ /** 传输 / 计时替身注入点(测试用),形态同 depositStore。 */
+ let transport: typeof persistRequest = persistRequest
+@@ -112,22 +124,24 @@ const HASH_RE = /^[a-f0-9]{16,128}$/i
+ /**
+  * 失败分类。宿主终版已确认**没有稳定 errorCode**(设计稿 §4.1/§11-③ 已解),分类线索
+  * 只有两个,逐级判定:
+- * ① 结构化 `quotaUsedBytes`/`quotaLimitBytes` 两数——QUOTA_FULL 的唯一判据,不靠文案;
++ * ① 结构化 `quotaUsedBytes`/`quotaLimitBytes` 两数(T1d-wire:quota 两支,
++ *    `isQuotaExceededConsideringThisRequest`——支1 `used>=limit` 已经满了,支2
++ *    `used<limit` 但加上这次 `decodedBytes` 会顶穿)——QUOTA_FULL 的唯一判据,
++ *    不靠文案;
+  * ② 回执 `message` 文本——其余分类的唯一线索,**允许匹配失败**并落到 DEPOSIT_FAILED
+  *    兜底(宿主改一句文案不能让插件崩)。
+  * **不猜测宿主的 `reply.code`**:宿主从不为 deposit_media / release_media 提供它,
+  * 按它的值分支等于制造一个从不生效的死分支。**唯一例外**是 `'BAD_RECEIPT'`——那
+  * 不是宿主给的码,是电子脑自己校验 hash/ext 后确定得出的判定(`main.js` 的
+  * `handleDepositMedia`),不是猜,值得信。
++ *
++ * `decodedBytes`(可选):本次请求的解码字节数,只用于支2 的判定;调用方拿不到
++ * 时支2 自动关闭,支1 不受影响(见 `isQuotaExceededConsideringThisRequest`)。
+  */
+-export const classifyDepositFailure = (reply: PersistReply): DepositFailureCode => {
++export const classifyDepositFailure = (reply: PersistReply, decodedBytes?: number): DepositFailureCode => {
+   if (reply.timeout) return 'BRAIN_TIMEOUT'
+   if (reply.code === 'BAD_RECEIPT') return 'BAD_RECEIPT'
+-  if (
+-    typeof reply.quotaUsedBytes === 'number' &&
+-    typeof reply.quotaLimitBytes === 'number' &&
+-    reply.quotaUsedBytes >= reply.quotaLimitBytes
+-  ) {
++  if (isQuotaExceededConsideringThisRequest(reply.quotaUsedBytes, reply.quotaLimitBytes, decodedBytes)) {
+     return 'QUOTA_FULL'
+   }
+   const message = String(reply.message || '').toLowerCase()
+@@ -148,22 +162,25 @@ export const classifyDepositFailure = (reply: PersistReply): DepositFailureCode
+ // (多一次假寄存 = 脏配额)。层 ① 宿主自述与层 ③ 声明式版本门要等 §11-⑤ 回答
+ // (app-context 能否暴露版本/能力清单)才能叠加——未答之前插件侧「最低宿主版本」
+ // 不可判定,不得在文案里声称任何版本要求。
++//
++// T1d-wire 接线指引第 2 点:负缓存按 kind 分桶(`depositStore.ts` 的
++// `capabilityByKind`),不再是单一全局布尔——未来 kind(video/audio)不支持不会
++// 连累 image 一起降级;插件版本变化(`PLUGIN_VERSION`)即视为该 kind 的负缓存
++// 过期,不必等 24h TTL。
+ 
+-/** 负缓存是否仍然生效(TTL 内且判定为不支持)。 */
+-export const isDepositCapabilityBlocked = async (): Promise<boolean> => {
++/** 负缓存是否仍然生效(某 kind:TTL 内 + 插件版本未变 + 判定为不支持)。 */
++export const isDepositCapabilityBlocked = async (kind: string): Promise<boolean> => {
+   const state = await loadDepositStore()
+-  const mark = state.capability
+-  if (!mark || mark.supported) return false
+-  return now() - mark.at <= DEPOSIT_CAPABILITY_TTL_MS
++  return isKindCapabilityBlocked(state.capabilityByKind?.[kind], now(), PLUGIN_VERSION)
+ }
+ 
+-const noteCapability = async (supported: boolean, reason?: string): Promise<void> => {
++const noteCapability = async (kind: string, supported: boolean, reason?: string): Promise<void> => {
+   const state = await loadDepositStore()
+-  const mark = state.capability
+-  if (mark && mark.supported === supported) return // 无变化不写盘
+-  await recordCapabilityMark({ supported, at: now(), reason })
+-  if (supported) debugLogger.log(SOURCE, 'deposit 能力探测:宿主支持,清除负缓存')
+-  else debugLogger.warn(SOURCE, `deposit 能力探测:宿主不支持,写入负缓存(${DEPOSIT_CAPABILITY_TTL_MS / 3_600_000}h TTL)`)
++  const next = nextKindCapabilityMark(state.capabilityByKind?.[kind], supported, now(), PLUGIN_VERSION, reason)
++  if (!next) return // 无变化不写盘(supported 与插件版本均未变)
++  await recordKindCapabilityMark(kind, next)
++  if (supported) debugLogger.log(SOURCE, `deposit 能力探测:宿主支持(kind=${kind}),清除负缓存`)
++  else debugLogger.warn(SOURCE, `deposit 能力探测:宿主不支持(kind=${kind}),写入负缓存(${DEPOSIT_CAPABILITY_TTL_MS / 3_600_000}h TTL)`)
+ }
+ 
+ const blobToBase64 = (blob: Blob): Promise<string> =>
+@@ -181,15 +198,19 @@ export type DepositReceipt = { hash: string; ext: string; bytes?: number; dedupl
+  * 一次寄存(无缓存、无 single-flight 的原语)。失败一律抛 DepositError,
+  * 绝不返回半条结果(设计稿 D-D:失败绝不写半条映射)。
+  */
+-export const depositBlob = async (blob: Blob, label: string = DEPOSIT_LABEL): Promise<DepositReceipt> => {
++export const depositBlob = async (
++  blob: Blob,
++  label: string = DEPOSIT_LABEL,
++  kind: string = DEPOSIT_DEFAULT_KIND,
++): Promise<DepositReceipt> => {
+   if (blob.size > DEPOSIT_MAX_BYTES) {
+     // 前置拦截:不发请求(设计稿 §8.2 超限阈值唯一口径)。
+     debugLogger.warn(SOURCE, `deposit 前置拦截:源图 ${blob.size} 字节超过 ${DEPOSIT_MAX_BYTES} 上限,未发请求`)
+-    throw new DepositError('TOO_LARGE', FAILURE_MESSAGE.TOO_LARGE)
++    throw new DepositError('TOO_LARGE', describeDepositFailure('TOO_LARGE'))
+   }
+-  if (await isDepositCapabilityBlocked()) {
++  if (await isDepositCapabilityBlocked(kind)) {
+     debugLogger.log(SOURCE, 'deposit 跳过:能力负缓存仍在 TTL 内,直接走降级路径')
+-    throw new DepositError('HOST_UNSUPPORTED', FAILURE_MESSAGE.HOST_UNSUPPORTED)
++    throw new DepositError('HOST_UNSUPPORTED', describeDepositFailure('HOST_UNSUPPORTED'))
+   }
+ 
+   const data = await blobToBase64(blob)
+@@ -202,7 +223,7 @@ export const depositBlob = async (blob: Blob, label: string = DEPOSIT_LABEL): Pr
+     )
+ 
+   let reply = await send()
+-  if (!reply.ok && classifyDepositFailure(reply) === 'RATE_LIMITED') {
++  if (!reply.ok && classifyDepositFailure(reply, blob.size) === 'RATE_LIMITED') {
+     // 频控:内部退避重试 1 次;仍失败则如实报,不无限重试。
+     debugLogger.warn(SOURCE, `deposit 撞频控,退避 ${DEPOSIT_RATE_RETRY_DELAY_MS}ms 后重试 1 次`)
+     await sleep(DEPOSIT_RATE_RETRY_DELAY_MS)
+@@ -210,16 +231,16 @@ export const depositBlob = async (blob: Blob, label: string = DEPOSIT_LABEL): Pr
+   }
+ 
+   if (!reply.ok) {
+-    const code = classifyDepositFailure(reply)
+-    if (code === 'HOST_UNSUPPORTED') await noteCapability(false, reply.message)
++    const code = classifyDepositFailure(reply, blob.size)
++    if (code === 'HOST_UNSUPPORTED') await noteCapability(kind, false, reply.message)
+     debugLogger.error(SOURCE, `deposit 失败:code=${code} ${reply.message || '无原因'}`)
+-    throw new DepositError(code, FAILURE_MESSAGE[code])
++    throw new DepositError(code, describeDepositFailure(code, { usedBytes: reply.quotaUsedBytes, limitBytes: reply.quotaLimitBytes }))
+   }
+   if (typeof reply.hash !== 'string' || !HASH_RE.test(reply.hash) || typeof reply.ext !== 'string' || !reply.ext) {
+     debugLogger.error(SOURCE, 'deposit 失败:回执缺少合法 hash/ext,不写映射')
+-    throw new DepositError('BAD_RECEIPT', FAILURE_MESSAGE.BAD_RECEIPT)
++    throw new DepositError('BAD_RECEIPT', describeDepositFailure('BAD_RECEIPT'))
+   }
+-  await noteCapability(true)
++  await noteCapability(kind, true)
+   debugLogger.log(
+     SOURCE,
+     `deposit 完成:hash=${reply.hash.slice(0, 8)} bytes=${reply.bytes ?? blob.size} dedup=${
+@@ -241,6 +262,8 @@ export const resolveDepositEntry = async (input: {
+   assetUrl?: string
+   blob?: Blob
+   label?: string
++  /** 寄存媒体 kind(T1d-wire 分桶负缓存判据);未传默认 image,与现状调用方一致。 */
++  kind?: string
+ }): Promise<DepositEntryDraft> => {
+   const assetUrl = input.assetUrl
+   if (!assetUrl) throw new DepositError('DEPOSIT_FAILED', '缺少源图身份(assetUrl),无法寄存。')
+@@ -257,7 +280,7 @@ export const resolveDepositEntry = async (input: {
+     return existing
+   }
+   const pending = (async () => {
+-    const receipt = await depositBlob(input.blob as Blob, input.label ?? DEPOSIT_LABEL)
++    const receipt = await depositBlob(input.blob as Blob, input.label ?? DEPOSIT_LABEL, input.kind ?? DEPOSIT_DEFAULT_KIND)
+     const entry: DepositEntryDraft = {
+       hash: receipt.hash,
+       ext: receipt.ext,
+diff --git a/src/agent/depositStore.ts b/src/agent/depositStore.ts
+index 37b3efb8..bd8321dc 100644
+--- a/src/agent/depositStore.ts
++++ b/src/agent/depositStore.ts
+@@ -48,6 +48,7 @@ import { canonicalSum } from '../../../src/lib/canonicalHash'
+ import { readOwnProp } from '../../../src/lib/safeArgs'
+ import { debugLogger } from '../../../src/store/debugLogStore'
+ import { persistRequest, type PersistReply } from '../persist/bridge'
++import type { DepositKindCapabilityMark } from './depositFailureClassifiers'
+ 
+ const SOURCE = 'Cindy Deposit'
+ 
+@@ -189,6 +190,29 @@ export type DepositState = {
+   releasedFloor: Record<string, ReleasedFloorEntry>
+   migration?: DepositMigrationMark
+   capability?: DepositCapabilityMark
++  /**
++   * SC1b.3(T1d-wire 接线,与上面 `capability` 并存、不合并):按 kind 分桶的能力
++   * 负缓存——`capability` 是单一全局布尔,未来 kind(video/audio)一旦不支持就会
++   * 连累 image 一起降级(设计稿 §11.2-E 声称"per-kind 骨架已留",实测代码里不
++   * 存在,是文档与代码脱节)。`isDepositCapabilityBlocked`/`noteCapability`
++   * (depositPort.ts)实际读写的是这个字段,不再消费 `capability`。
++   *
++   * 为什么不直接改造 `capability`/`recordCapabilityMark`(而是新增并存):
++   * `depositStore.test.ts`(w-t1b5 领地,T1d-wire 不改动)有一整套按精确字节数
++   * 命中软/硬闸边界的容量测试,把 `capability.reason` 当"唯一带可变长度 string
++   * 载荷的现成字段"用来配平字节数,`recordCapabilityMark` 是其断言覆盖的"五个
++   * 正增长入口"之一——原地改造该字段形状与函数签名,需要重算该文件全部字节边界
++   * 算式,风险与收益不成比例,且已越出本段(T1d-wire)边界。新增字段是加法,不
++   * 触碰任何既有断言。
++   *
++   * 可选(与 `capability`/`migration` 同一口径),不是 `Record` 家族(map/
++   * releasedTombstones/…)的"恒非空对象"套路:从未调用过 `recordKindCapabilityMark`
++   * 的状态里,这个键必须整个不出现在 `JSON.stringify` 输出里——否则任何一份手搓
++   * "远端/预期" JSON 字面量(未跟着改)在字节数上都会与真实序列化结果永久差一个
++   * `"capabilityByKind":{}` 的固定量(已实测踩到:`depositStore.test.ts` SC9.3b
++   * 用手搓 `remoteBase` 字面量核对精确字节数,若这个字段恒存在会导致该断言错位)。
++   */
++  capabilityByKind?: Record<string, DepositKindCapabilityMark>
+   pendingReleases: Record<string, PendingRelease>
+ }
+ 
+@@ -256,6 +280,8 @@ const emptyState = (): DepositState => ({
+   releasedTombstones: emptyRecord(),
+   releasedFloor: emptyRecord(),
+   pendingReleases: emptyRecord(),
++  // capabilityByKind 同 capability/migration:留空(undefined),不预置空 record
++  // ——省一次 recordKindCapabilityMark 之前就出现在序列化输出里的 "恒在" 副作用。
+ })
+ 
+ const DEPOSIT_TEXT_ENCODER = new TextEncoder()
+@@ -340,6 +366,25 @@ const sanitizeReleasedFloorEntry = (value: unknown): ReleasedFloorEntry | null =
+  * 等于替坏数据背书,P1b 的消费者会拿着一个被"洗白"的 hash 去调 release_media,
+  * 违反 §4.4.4「只 release from:'deposit'」)。
+  */
++/**
++ * SC1b.3(T1d-wire):某 kind 的能力负缓存标记——缺 `supported`(非 boolean)或缺
++ * `pluginVersion`(非空字符串)都判非法整条剔除,不补默认值(与其它 sanitizer
++ * 的"缺必填字段→null"口径一致;`pluginVersion` 缺失会让 `isKindCapabilityBlocked`
++ * 的版本比较永远判"已过期",宁可多探测一次也不假装知道版本)。
++ */
++const sanitizeKindCapabilityMark = (value: unknown): DepositKindCapabilityMark | null => {
++  const supported = readOwnProp(value, 'supported')
++  if (typeof supported !== 'boolean') return null
++  const pluginVersion = readString(value, 'pluginVersion')
++  if (!pluginVersion) return null
++  return {
++    supported,
++    at: readFiniteNumber(value, 'at') ?? 0,
++    pluginVersion,
++    reason: readString(value, 'reason'),
++  }
++}
++
+ const sanitizePendingRelease = (value: unknown): PendingRelease | null => {
+   if (!value || typeof value !== 'object') return null
+   const hash = readString(value, 'hash')
+@@ -390,6 +435,14 @@ export const parseDepositState = (raw: unknown): DepositState | null => {
+     releasedFloor: readEntryRecord('releasedFloor', sanitizeReleasedFloorEntry),
+     pendingReleases: readEntryRecord('pendingReleases', sanitizePendingRelease),
+   }
++  // capabilityByKind 同 migration/capability 口径:只在源 JSON 真的带这个键时才
++  // 赋值——键缺失(从未 recordKindCapabilityMark 过,或老数据)时字段整个不出现,
++  // 不当成"总是存在的空 record"(与 map/releasedTombstones 等 Record 家族的既有
++  // 惯例刻意不同,理由见 DepositState.capabilityByKind 声明处)。
++  const rawCapabilityByKind = readOwnProp(value, 'capabilityByKind')
++  if (rawCapabilityByKind && typeof rawCapabilityByKind === 'object') {
++    state.capabilityByKind = readEntryRecord('capabilityByKind', sanitizeKindCapabilityMark)
++  }
+   const migration = readOwnProp(value, 'migration')
+   const migrationVersion = readFiniteNumber(migration, 'version')
+   if (migrationVersion !== undefined) {
+@@ -425,6 +478,8 @@ type DirtySet = {
+   pendingDelete: Set<string>
+   migration: boolean
+   capability: boolean
++  /** SC1b.3(T1d-wire):`capabilityByKind` 的 dirty 键集合,独立于上面的 `capability`。 */
++  capabilityKinds: Set<string>
+ }
+ const emptyDirty = (): DirtySet => ({
+   mapSet: new Set(),
+@@ -434,6 +489,7 @@ const emptyDirty = (): DirtySet => ({
+   pendingDelete: new Set(),
+   migration: false,
+   capability: false,
++  capabilityKinds: new Set(),
+ })
+ 
+ /**
+@@ -453,7 +509,8 @@ const isEmptyDirty = (d: DirtySet): boolean =>
+   d.pendingSet.size === 0 &&
+   d.pendingDelete.size === 0 &&
+   !d.migration &&
+-  !d.capability
++  !d.capability &&
++  d.capabilityKinds.size === 0
+ 
+ /**
+  * 并集,不改动任意一个入参(B2 回归):`commitNow` 在途(CAS 冲突重试期间)到达的
+@@ -472,6 +529,7 @@ const unionDirty = (a: DirtySet, b: DirtySet): DirtySet => ({
+   pendingDelete: new Set([...a.pendingDelete, ...b.pendingDelete]),
+   migration: a.migration || b.migration,
+   capability: a.capability || b.capability,
++  capabilityKinds: new Set([...a.capabilityKinds, ...b.capabilityKinds]),
+ })
+ 
+ // ── 内存权威(层 1)──
+@@ -617,6 +675,23 @@ const applyLocalOverlay = (
+     if (entry) pendingReleases[key] = { ...entry, gen: targetGen, writer }
+   }
+ 
++  // SC1b.3(T1d-wire):`capabilityByKind` 没有 gen/writer 仲裁(与旧 `capability`
++  // 同一口径,不参与 CAS 冲突判定),按 dirty 的 kind 键整键覆盖即可。字段本身可选
++  // (理由见 `DepositState.capabilityByKind` 声明处)——本批没有任何 kind 是 dirty
++  // 时原样传回 `disk.capabilityByKind`(可能是 `undefined`),不凭空实体化一个空
++  // record,否则会让"从未写过 capabilityByKind 的状态"在重放后突然多出这个键。
++  const capabilityByKind =
++    batch.capabilityKinds.size === 0
++      ? disk.capabilityByKind
++      : (() => {
++          const merged: Record<string, DepositKindCapabilityMark> = { ...disk.capabilityByKind }
++          for (const kind of batch.capabilityKinds) {
++            const mark = local.capabilityByKind?.[kind]
++            if (mark) merged[kind] = mark
++          }
++          return merged
++        })()
++
+   return {
+     version: Math.max(disk.version, local.version),
+     generation: disk.generation, // CAS 基线以磁盘为准,下一次提交要拿它去比。
+@@ -632,6 +707,7 @@ const applyLocalOverlay = (
+     releasedFloor: disk.releasedFloor,
+     migration: batch.migration ? local.migration : disk.migration,
+     capability: batch.capability ? local.capability : disk.capability,
++    capabilityByKind,
+     pendingReleases,
+   }
+ }
+@@ -1221,6 +1297,36 @@ export const recordCapabilityMark = (mark: DepositCapabilityMark): Promise<Depos
+   })
+ }
+ 
++/**
++ * SC1b.3(T1d-wire):写某个 kind 的能力负缓存标记,按 kind 键读写 `capabilityByKind`
++ * ——独立于上面的 `recordCapabilityMark`/`capability`(理由见 `DepositState.capabilityByKind`
++ * 声明处的完整说明:那对旧符号留给 `depositStore.test.ts` 的字节边界容量测试当
++ * padding 载体,不再被生产逻辑消费)。SC10.4:同样统一走容量 admission 门。
++ */
++export const recordKindCapabilityMark = (kind: string, mark: DepositKindCapabilityMark): Promise<DepositCommitResult> => {
++  const box: { rejected: ReleaseEvidenceRejection | null } = { rejected: null }
++  return mutateAndCommit((state) => {
++    const gate = evaluateReleaseEvidenceCapacity((draft) => {
++      // 字段可选(理由见 DepositState.capabilityByKind 声明处):首次写入前先
++      // 实体化,`{...undefined}` 合法地产出 `{}`,不需要额外的存在性判断。
++      draft.capabilityByKind = { ...draft.capabilityByKind, [kind]: mark }
++    })
++    if (!gate.allowed) {
++      box.rejected = { currentBytes: gate.currentBytes, projectedBytes: gate.projectedBytes }
++      return
++    }
++    state.capabilityByKind = { ...state.capabilityByKind, [kind]: mark }
++    dirty.capabilityKinds.add(kind)
++  }).then((result) => {
++    if (!box.rejected) return result
++    debugLogger.warn(
++      SOURCE,
++      `deposit 释放证据容量硬闸拒绝(SC10.4):recordKindCapabilityMark kind=${kind} ${describeReleaseEvidenceCapacity(box.rejected.currentBytes, box.rejected.projectedBytes)}——不产生新证据,capabilityByKind 原样保留`,
++    )
++    return { ok: false, code: 'RELEASE_EVIDENCE_CAPACITY', reason: 'capacity', generation: result.generation, attempts: 0 }
++  })
++}
++
+ /**
+  * 存量账本迁移(设计稿 §7):新增一批 `from:'ledger'` 草稿条目并同步写迁移标记,
+  * **同一次提交**(不拆两次写,否则会出现「map 迁了标记没写」的错位态)。
+@@ -1331,9 +1437,10 @@ export const recordDeposit = (assetUrl: string, draft: DepositEntryDraft): Promi
+  * `dirty`——这里传入的是一份供估算用的副本,如果 `mutate` 顺手改了全局 `dirty`,
+  * 即使这次判定为拒绝,`dirty` 里也会残留一条本不该存在的脏键,污染下一次真正的
+  * 提交(调用方必须另外、独立地对真实 `state`/`dirty` 做同样的改动,只有在这里
+- * 判定 `allowed:true` 之后才做——五个调用方 `recordDeposit`/`recordMigration`/
++ * 判定 `allowed:true` 之后才做——调用方 `recordDeposit`/`recordMigration`/
+  * `recordCapabilityMark`/`invalidateDeposit`/`enqueuePendingRelease` 统一用同一个
+- * box 模式,拒绝时真实 `state`/`dirty` 分毫未动,SC10.4 根治 judge-i P1-1)。
++ * box 模式,拒绝时真实 `state`/`dirty` 分毫未动,SC10.4 根治 judge-i P1-1;
++ * `recordKindCapabilityMark`(T1d-wire 新增,SC1b.3)是第六个,同一模式)。
+  */
+ const evaluateReleaseEvidenceCapacity = (
+   mutate: (draft: DepositState) => void,

@@ -1,0 +1,567 @@
+diff --git a/scripts/e2e-runner.mjs b/scripts/e2e-runner.mjs
+index f5adf8b9..0c2a3551 100644
+--- a/scripts/e2e-runner.mjs
++++ b/scripts/e2e-runner.mjs
+@@ -1,6 +1,23 @@
+ import { spawn } from 'node:child_process'
+ import { fileURLToPath } from 'node:url'
+ import { scenarioOrder } from './e2e/scenarios/index.mjs'
++import { appendLedgerRecord, buildLedgerRecord, readAttemptFragments } from './e2e/result-ledger.mjs'
++
++// 台账(report-only):子进程 close 后读它写下的 attempt fragment,合并进单次尝试的
++// 记录。fallbackStatus/fallbackMessage 只在子进程连 fragment 都没写下时兜底(例如
++// dev/bff server 启动失败,scenario 从未真正跑起来)——报告失败但缺细节,好过一条
++// 台账记录都没有。
++const readCellAttemptResult = (scenarioName, attempt, fallbackStatus, fallbackMessage) => {
++  const fragments = readAttemptFragments()
++  const fragment = fragments.find((f) => f.scenario === scenarioName) ?? null
++  return {
++    attempt,
++    status: fragment?.status ?? fallbackStatus,
++    durationMs: fragment?.durationMs ?? 0,
++    message: fragment?.message ?? fallbackMessage ?? null,
++    pageErrors: fragment?.pageErrors ?? [],
++  }
++}
+ 
+ const parseTopology = (argv) => {
+   for (let index = 0; index < argv.length; index += 1) {
+@@ -205,18 +222,25 @@ for (const kernelMode of kernelModes) {
+   for (const rendererMode of rendererModes) {
+     for (const [index, scenarioName] of selectedScenarios.entries()) {
+       let succeeded = false
++      const cellAttempts = []
+ 
+       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+         try {
+           await runScenarioAttempt(scenarioName, index, attempt, rendererMode, kernelMode)
++          cellAttempts.push(readCellAttemptResult(scenarioName, attempt, 'PASS'))
+           succeeded = true
+           break
+         } catch (error) {
+-          if (attempt === maxAttempts) throw error
++          const message = error instanceof Error ? error.message : String(error)
++          cellAttempts.push(readCellAttemptResult(scenarioName, attempt, 'FAIL', message))
++          if (attempt === maxAttempts) {
++            // 台账:重试耗尽,落最终 FAIL 记录后再按原样 rethrow——exit code / 上层
++            // 行为与本次改动之前完全一致,台账只是多记一笔。
++            appendLedgerRecord(buildLedgerRecord({ scenario: scenarioName, renderer: rendererMode, kernel: kernelMode, topology, attempts: cellAttempts }))
++            throw error
++          }
+           console.warn(
+-            `[e2e-runner] retrying scenario=${scenarioName} kernel=${kernelMode} renderer=${rendererMode} after attempt=${attempt} failure: ${
+-              error instanceof Error ? error.message : String(error)
+-            }`,
++            `[e2e-runner] retrying scenario=${scenarioName} kernel=${kernelMode} renderer=${rendererMode} after attempt=${attempt} failure: ${message}`,
+           )
+         }
+       }
+@@ -224,6 +248,9 @@ for (const kernelMode of kernelModes) {
+       if (!succeeded) {
+         throw new Error(`Scenario failed after ${maxAttempts} attempts: ${scenarioName} kernel=${kernelMode} renderer=${rendererMode}`)
+       }
++
++      // 台账:本「格」成功(可能是重试后成功,也可能是 leafer-skip 的 N_A)。
++      appendLedgerRecord(buildLedgerRecord({ scenario: scenarioName, renderer: rendererMode, kernel: kernelMode, topology, attempts: cellAttempts }))
+     }
+   }
+   // 跑到这里 = 该 kernel 下所有 renderer×scenario 全过(失败已 throw)。
+diff --git a/scripts/e2e-smoke.mjs b/scripts/e2e-smoke.mjs
+index 3a0516c3..86239eca 100644
+--- a/scripts/e2e-smoke.mjs
++++ b/scripts/e2e-smoke.mjs
+@@ -14,6 +14,8 @@ import { prepareSmokeFixtures } from './e2e/fixtures.mjs'
+ import { assertPublicModeSecurity } from './e2e/prod-auth-assertions.mjs'
+ import { startUpstreamMockServer } from './e2e/upstream-mock-server.mjs'
+ import { leaferSkippedScenarios, scenarioOrder, scenarioRunners } from './e2e/scenarios/index.mjs'
++import { drainPageErrors, resetPageErrorSink } from './e2e/browser-error-guard.mjs'
++import { recordAttemptFragment, resetAttemptFragments } from './e2e/result-ledger.mjs'
+ import {
+   clearAllStorage,
+   createBaseUrl,
+@@ -182,6 +184,9 @@ let server
+ 
+ try {
+   await prepareSmokeArtifacts()
++  // 台账(report-only):每个 attempt 是一个全新进程,启动时先清空自己的 fragment
++  // 记录——e2e-runner.mjs 在子进程 close 后读它,不会读到上一个 attempt 的残留。
++  resetAttemptFragments()
+   await runCommand('npm', ['run', 'verify:logging'])
+   server = startTopologyServer({
+     activePort: securityPort,
+@@ -525,13 +530,32 @@ try {
+ 
+   // leafer 模式显式 skip(名单+理由见 scenarios/index.mjs leaferSkippedScenarios)。
+   // skip 打印在 stdout,矩阵汇总时可见;dom 模式不受影响。
+-  const selectedScenarios = resolveScenarioSelection(cliArgs).filter((name) => {
++  const requestedScenarioNames = resolveScenarioSelection(cliArgs)
++  const selectedScenarios = requestedScenarioNames.filter((name) => {
+     if (rendererMode === 'leafer' && leaferSkippedScenarios[name]) {
+       console.log(`[e2e-smoke] SKIP scenario=${name} renderer=leafer reason=${leaferSkippedScenarios[name]}`)
+       return false
+     }
+     return true
+   })
++  // 台账(report-only):被 skip 的场景从没真正跑起来,老 e2e-runner.mjs 只按
++  // selectedScenarios.length 计数会把它算成"跑过且 passed"(见 PR 描述③假绿)。这里
++  // 在跑之前就把 N_A 落进 attempt 台账——只有这里知道"跑的是哪个/为什么被跳过";
++  // e2e-runner.mjs 事后只看得到子进程 exit 0,猜不出。不影响任何 pass/fail 语义。
++  for (const name of requestedScenarioNames) {
++    if (!selectedScenarios.includes(name)) {
++      recordAttemptFragment({
++        scenario: name,
++        renderer: rendererMode,
++        kernel: kernelMode,
++        topology,
++        status: 'N_A',
++        durationMs: 0,
++        message: leaferSkippedScenarios[name] ?? null,
++        pageErrors: [],
++      })
++    }
++  }
+   const scenarioContext = {
+     Buffer,
+     assertLibraryLayoutStable,
+@@ -590,7 +614,35 @@ try {
+     }
+     scenarioContext.firstNodeId = undefined
+     await bootstrapBaseCanvas()
+-    await scenarioRunners[scenarioName](scenarioContext)
++    resetPageErrorSink()
++    const scenarioStartedAt = Date.now()
++    try {
++      await scenarioRunners[scenarioName](scenarioContext)
++      recordAttemptFragment({
++        scenario: scenarioName,
++        renderer: rendererMode,
++        kernel: kernelMode,
++        topology,
++        status: 'PASS',
++        durationMs: Date.now() - scenarioStartedAt,
++        message: null,
++        pageErrors: drainPageErrors(),
++      })
++    } catch (error) {
++      // 台账(report-only):只多记一笔,不改变原有失败语义——原样 rethrow,exit
++      // code / e2e-runner.mjs 的重试判定与本次改动之前完全一致。
++      recordAttemptFragment({
++        scenario: scenarioName,
++        renderer: rendererMode,
++        kernel: kernelMode,
++        topology,
++        status: 'FAIL',
++        durationMs: Date.now() - scenarioStartedAt,
++        message: error instanceof Error ? error.message : String(error),
++        pageErrors: drainPageErrors(),
++      })
++      throw error
++    }
+   }
+ 
+ 
+diff --git a/scripts/e2e/browser-error-guard.mjs b/scripts/e2e/browser-error-guard.mjs
+new file mode 100644
+index 00000000..95726e93
+--- /dev/null
++++ b/scripts/e2e/browser-error-guard.mjs
+@@ -0,0 +1,80 @@
++// scripts/e2e/browser-error-guard.mjs
++//
++// 浏览器未捕获异常(page 'pageerror')的 context 级观测底座——report-only,不影响
++// pass/fail(不进 harness.mjs 的 errors[] 数组,不 throw,不阻断任何 scenario)。
++//
++// 挂载模式抄自 ordpool-space/cat21-indexer 的 browser-error-guard.ts
++// (MIT license,github.com/ordpool-space/cat21-indexer):监听挂在 BrowserContext 上
++// (`context.on('page', ...)`)而不是单个 Page,场景自建的 newPage()/newContext() 因此
++// 自动被覆盖——旧版 harness.mjs 的 page.on('pageerror') 只盯自己创建的那一个 page,
++// coordinate-probe.mjs 的 dpr2Context 与 migration.mjs 的 migrationContext 各自
++// browser.newContext()+newPage() 绕过了它,两处的未捕获异常一直没人在看。isOurApp
++// 过滤思路同源(滤掉 chrome-extension:// / about: 等第三方噪音,不算作 app 自身异常)。
++//
++// 去重用 WeakSet(思路借鉴 danmaku-anywhere 的 console-watcher.ts,但该仓 license 是
++// NOASSERTION——只借用"用 WeakSet 防重复挂载"这个思路,不拷贝其代码):
++// `context.on('page')` 的注册时机与对已存在页面的初始枚举(`context.pages()`)之间
++// 存在窗口,同一个 page 理论上可能被两条路径各挂一次监听;WeakSet 让 hookPageForErrors
++// 对同一 page 幂等,不管调用顺序如何。
++import { createHash } from 'node:crypto'
++
++const instrumentedPages = new WeakSet()
++
++// 当前 scenario 的共享 sink。同一 scenario 内可能有多个 context(主 context + 场景
++// 自建的 migrationContext/dpr2Context 等),它们都写进这同一个 sink,调用方不需要在
++// 每个 attachPageErrorObserver 调用点单独传数组。e2e-smoke.mjs 在每个 scenario 开跑前
++// resetPageErrorSink()、跑完(成功或失败)后 drainPageErrors()。
++let pageErrorSink = []
++
++const isOurApp = (page) => {
++  try {
++    const url = page.url()
++    return url.startsWith('http://') || url.startsWith('https://')
++  } catch {
++    return false
++  }
++}
++
++export const fingerprintMessage = (message) =>
++  createHash('sha256').update(String(message)).digest('hex').slice(0, 12)
++
++const hookPageForErrors = (page) => {
++  if (instrumentedPages.has(page)) return
++  instrumentedPages.add(page)
++  page.on('pageerror', (error) => {
++    const message = error?.message || String(error)
++    // 保留原有诊断行为:未捕获异常始终打到 stdout,便于失败时人工排查。
++    console.log(`[browser pageerror] ${message}`)
++    if (!isOurApp(page)) return
++    let url = null
++    try {
++      url = page.url()
++    } catch {
++      url = null
++    }
++    pageErrorSink.push({ message, fingerprint: fingerprintMessage(message), url })
++  })
++}
++
++/**
++ * 在 BrowserContext 上挂未捕获异常观测。调用时机:在该 context 上第一次 newPage()
++ * 之前(harness.mjs createSmokePage / migration.mjs / coordinate-probe.mjs 均在
++ * browser.newContext() 之后、newPage() 之前调用),保证首个 page 也被覆盖;同时
++ * 兜底枚举 context.pages() 覆盖任何已存在的页面,WeakSet 防重复挂载。
++ */
++export const attachPageErrorObserver = (context) => {
++  for (const page of context.pages()) hookPageForErrors(page)
++  context.on('page', (page) => hookPageForErrors(page))
++}
++
++/** e2e-smoke.mjs 在每个 scenario 开跑前调用,清空共享 sink。 */
++export const resetPageErrorSink = () => {
++  pageErrorSink = []
++}
++
++/** e2e-smoke.mjs 在每个 scenario 跑完(成功或失败)后调用,取走本 scenario 期间收集到的 pageerror。 */
++export const drainPageErrors = () => {
++  const drained = pageErrorSink
++  pageErrorSink = []
++  return drained
++}
+diff --git a/scripts/e2e/harness.mjs b/scripts/e2e/harness.mjs
+index 8ca5e577..ae2f6357 100644
+--- a/scripts/e2e/harness.mjs
++++ b/scripts/e2e/harness.mjs
+@@ -3,6 +3,7 @@ import path from 'node:path'
+ import { mkdir, rm } from 'node:fs/promises'
+ import { chromium } from 'playwright'
+ import { attachDefaultMivoApiMocks } from './api-mocks.mjs'
++import { attachPageErrorObserver } from './browser-error-guard.mjs'
+ 
+ export const createBaseUrl = (port) => `http://127.0.0.1:${port}`
+ 
+@@ -613,6 +614,9 @@ export const createSmokePage = async ({
+     deviceScaleFactor: 1,
+     extraHTTPHeaders,
+   })
++  // context 级未捕获异常观测(report-only,见 browser-error-guard.mjs)。必须在
++  // context.newPage() 之前挂,才能覆盖下面这一个初始 page。
++  attachPageErrorObserver(context)
+   // mainfix R3: flip the e2e bridge flag in BOTH topologies so main.tsx populates
+   // `__MIVO_E2E__` (incl. getPersistUserId) everywhere. Previously only
+   // installE2EStoreBridge (prod-only) set it, so dev never had the bridge and
+@@ -663,10 +667,9 @@ export const createSmokePage = async ({
+     if (message.type() === 'error' && !message.text().includes('__MIVO_E2E_EXPECTED_ERROR__')) errors.push(message.text())
+   })
+ 
+-  // 浏览器未捕获异常转 stdout(只诊断,不进 errors 数组不阻断 run),便于 e2e 失败时定位。
+-  page.on('pageerror', (error) => {
+-    console.log(`[browser pageerror] ${error.message}`)
+-  })
++  // 浏览器未捕获异常观测已挪到 context 级(见上方 attachPageErrorObserver 调用 +
++  // browser-error-guard.mjs)——旧版这里只挂在这一个 page 上,场景自建的
++  // newPage()/newContext()(coordinate-probe.mjs/migration.mjs)绕过监听。
+ 
+   return {
+     browser,
+diff --git a/scripts/e2e/result-ledger.mjs b/scripts/e2e/result-ledger.mjs
+new file mode 100644
+index 00000000..634626db
+--- /dev/null
++++ b/scripts/e2e/result-ledger.mjs
+@@ -0,0 +1,153 @@
++// scripts/e2e/result-ledger.mjs
++//
++// 每格测试结果台账——格式照抄 CTRF(Common Test Report Format,
++// github.com/ctrf-io/ctrf,MIT):每条记录带 name/status/duration/flaky/retries/
++// retryAttempts/message,与官方 CTRF 消费方(如 ctrf-io 的各类 reporter)同构。
++// 本仓的扩展:①「格」定位字段 {scenario,renderer,kernel,topology}(唯一定位一次
++// scenario×renderer×kernel×topology 的执行);②终态枚举改为
++// PASS/RETRY_PASS/FAIL/N_A(替换 CTRF 原生的小写 passed/failed/skipped/pending/other——
++// 本台账目前只喂给仓内 e2e-runner.mjs/e2e-smoke.mjs 自己读,不接 CTRF 官方生态工具,
++// 用更贴合本仓语境的枚举更直白;N_A 专用于 leafer-skip 等结构性不执行的格,不与
++// PASS 混淆);③ headSha + diagnostics.pageErrors(browser-error-guard.mjs 采集)。
++//
++// report-only:本模块不抛错、不影响任何 pass/fail 语义,只负责落盘,读写失败均静默
++// 降级(缺一条台账记录好于让台账写坏一次真实的 e2e 判定)。
++//
++// 两层文件:
++//  - ATTEMPT_FRAGMENT_PATH:单次 smoke.mjs 进程(= e2e-runner.mjs 的一次 attempt)的
++//    临时记录。resetAttemptFragments() 在进程刚启动时清空(每个 attempt 是全新进程,
++//    清空即隔离);进程内每跑完一个 scenario(PASS/FAIL)或判定 N_A 就 append 一行。
++//    e2e-runner.mjs 在子进程 close 后读它,合并进最终台账,随后该文件内容即可废弃
++//    (下一个 attempt 的子进程会在自己启动时再次清空)。
++//  - LEDGER_PATH:跨 attempt 累积的最终台账。e2e-runner.mjs 在某个「格」的重试循环
++//    结束后(成功或耗尽重试)写入一条汇总记录。
++
++import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
++import { dirname, resolve } from 'node:path'
++import { execFileSync } from 'node:child_process'
++
++const ARTIFACT_DIR = resolve(process.cwd(), 'test-artifacts')
++export const ATTEMPT_FRAGMENT_PATH = resolve(ARTIFACT_DIR, 'e2e-attempt-fragments.jsonl')
++export const LEDGER_PATH = resolve(ARTIFACT_DIR, 'e2e-result-ledger.jsonl')
++
++const ensureDir = (filePath) => {
++  const dir = dirname(filePath)
++  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
++}
++
++let cachedHeadSha
++export const getHeadSha = () => {
++  if (cachedHeadSha !== undefined) return cachedHeadSha
++  try {
++    cachedHeadSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
++  } catch {
++    cachedHeadSha = null
++  }
++  return cachedHeadSha
++}
++
++/** 供当前 smoke.mjs 进程在最开始清空自己的 attempt 记录(每个 attempt = 一个全新进程)。 */
++export const resetAttemptFragments = () => {
++  ensureDir(ATTEMPT_FRAGMENT_PATH)
++  writeFileSync(ATTEMPT_FRAGMENT_PATH, '')
++}
++
++/** smoke.mjs 每跑完一个 scenario(PASS/FAIL/N_A)调用一次,append 一行 JSON。 */
++export const recordAttemptFragment = (fragment) => {
++  try {
++    ensureDir(ATTEMPT_FRAGMENT_PATH)
++    appendFileSync(ATTEMPT_FRAGMENT_PATH, `${JSON.stringify(fragment)}\n`)
++  } catch (err) {
++    // report-only:台账写失败不阻断真实的 e2e 判定,只打印诊断。
++    console.warn(`[result-ledger] recordAttemptFragment failed: ${err instanceof Error ? err.message : String(err)}`)
++  }
++}
++
++const readJsonlSafe = (path) => {
++  if (!existsSync(path)) return []
++  const raw = readFileSync(path, 'utf8')
++  return raw
++    .split('\n')
++    .map((line) => line.trim())
++    .filter(Boolean)
++    .map((line) => {
++      try {
++        return JSON.parse(line)
++      } catch {
++        return null // 单行坏了不拖垂全体——report-only,宁可丢一行不整体抛错
++      }
++    })
++    .filter(Boolean)
++}
++
++/** e2e-runner.mjs 在子进程 close 后读取本次 attempt 写下的 fragment(s)。 */
++export const readAttemptFragments = () => readJsonlSafe(ATTEMPT_FRAGMENT_PATH)
++
++/** e2e-runner.mjs 在某个「格」的重试循环结束后写入最终汇总记录。 */
++export const appendLedgerRecord = (record) => {
++  try {
++    ensureDir(LEDGER_PATH)
++    appendFileSync(LEDGER_PATH, `${JSON.stringify(record)}\n`)
++  } catch (err) {
++    console.warn(`[result-ledger] appendLedgerRecord failed: ${err instanceof Error ? err.message : String(err)}`)
++  }
++}
++
++/**
++ * 组装单个「格」的最终记录。attempts 是按尝试顺序排列的数组,每项形如
++ * { attempt, status, durationMs, message, pageErrors }(status ∈ PASS/FAIL/N_A,
++ * 单次 attempt 内不会是 RETRY_PASS——RETRY_PASS 只在跨 attempt 汇总时产生)。
++ *
++ * 终态规则:
++ *  - 最后一次 attempt 是 N_A(leafer-skip 等结构性不执行)→ 终态 N_A,不判 flaky。
++ *  - 只有一次 attempt → 终态就是那次的 PASS/FAIL。
++ *  - 多次 attempt 且其中至少一次 PASS → RETRY_PASS(flaky=true)。
++ *  - 多次 attempt 全部 FAIL(重试耗尽)→ FAIL(flaky=false——这是稳定失败,不是抖动)。
++ */
++export const buildLedgerRecord = ({ scenario, renderer, kernel, topology, attempts }) => {
++  const last = attempts[attempts.length - 1]
++  const retries = attempts.length - 1
++  const anyPassed = attempts.some((a) => a.status === 'PASS')
++  let status
++  if (last.status === 'N_A') {
++    status = 'N_A'
++  } else if (attempts.length === 1) {
++    status = last.status
++  } else {
++    status = anyPassed ? 'RETRY_PASS' : 'FAIL'
++  }
++  const flaky = retries > 0 && status === 'RETRY_PASS'
++
++  const pageErrorsByFingerprint = new Map()
++  for (const attempt of attempts) {
++    for (const pageError of attempt.pageErrors || []) {
++      if (!pageErrorsByFingerprint.has(pageError.fingerprint)) {
++        pageErrorsByFingerprint.set(pageError.fingerprint, pageError)
++      }
++    }
++  }
++
++  return {
++    name: `${scenario}::${renderer}::${kernel}::${topology}`,
++    scenario,
++    renderer,
++    kernel,
++    topology,
++    status,
++    durationMs: last.durationMs,
++    flaky,
++    retries,
++    retryAttempts: attempts.map((a) => ({
++      attempt: a.attempt,
++      status: a.status,
++      duration: a.durationMs,
++      message: a.message ?? null,
++    })),
++    message: status === 'FAIL' ? last.message ?? null : null,
++    headSha: getHeadSha(),
++    diagnostics: {
++      pageErrors: [...pageErrorsByFingerprint.values()],
++    },
++    recordedAt: new Date().toISOString(),
++  }
++}
+diff --git a/scripts/e2e/result-ledger.test.mjs b/scripts/e2e/result-ledger.test.mjs
+new file mode 100644
+index 00000000..ef9e92c2
+--- /dev/null
++++ b/scripts/e2e/result-ledger.test.mjs
+@@ -0,0 +1,75 @@
++// scripts/e2e/result-ledger.test.mjs — buildLedgerRecord 终态/flaky 推导单测。
++//
++// 只测纯函数(buildLedgerRecord),不起 Playwright/子进程——这段逻辑是本 PR 里唯一
++// 有判断分支的部分(PASS/RETRY_PASS/FAIL/N_A 四态 + flaky 推导),错了会直接把
++// 「假绿」台账变成「假台账」,值得独立锁定。
++import { describe, it, expect } from 'vitest'
++import { buildLedgerRecord } from './result-ledger.mjs'
++
++const attempt = (overrides) => ({ attempt: 1, status: 'PASS', durationMs: 100, message: null, pageErrors: [], ...overrides })
++
++const cell = (attempts) =>
++  buildLedgerRecord({ scenario: 'debug', renderer: 'dom', kernel: 'legacy', topology: 'prod', attempts })
++
++describe('buildLedgerRecord', () => {
++  it('单次 attempt 且 PASS → 终态 PASS,retries=0,flaky=false', () => {
++    const record = cell([attempt({ status: 'PASS' })])
++    expect(record.status).toBe('PASS')
++    expect(record.retries).toBe(0)
++    expect(record.flaky).toBe(false)
++  })
++
++  it('单次 attempt 且 FAIL → 终态 FAIL,message 透传', () => {
++    const record = cell([attempt({ status: 'FAIL', message: 'boom' })])
++    expect(record.status).toBe('FAIL')
++    expect(record.message).toBe('boom')
++  })
++
++  it('attempt1 FAIL、attempt2 PASS → 终态 RETRY_PASS,retries=1,flaky=true(控制组对照见下一条)', () => {
++    const record = cell([
++      attempt({ attempt: 1, status: 'FAIL', message: 'transient' }),
++      attempt({ attempt: 2, status: 'PASS' }),
++    ])
++    expect(record.status).toBe('RETRY_PASS')
++    expect(record.retries).toBe(1)
++    expect(record.flaky).toBe(true)
++    expect(record.retryAttempts).toHaveLength(2)
++  })
++
++  it('控制组:全部 attempt 都是首次 PASS(单次)→ flaky=false,不与上一条混淆', () => {
++    const record = cell([attempt({ status: 'PASS' })])
++    expect(record.flaky).toBe(false)
++    expect(record.retries).toBe(0)
++  })
++
++  it('多次 attempt 全部 FAIL(重试耗尽)→ 终态 FAIL,不是 RETRY_PASS,flaky=false(稳定失败不是抖动)', () => {
++    const record = cell([
++      attempt({ attempt: 1, status: 'FAIL', message: 'first' }),
++      attempt({ attempt: 2, status: 'FAIL', message: 'second' }),
++    ])
++    expect(record.status).toBe('FAIL')
++    expect(record.flaky).toBe(false)
++    expect(record.retries).toBe(1)
++    expect(record.message).toBe('second')
++  })
++
++  it('最后一次 attempt 是 N_A(leafer-skip)→ 终态 N_A,不判 flaky', () => {
++    const record = cell([attempt({ status: 'N_A', message: 'leafer skip reason' })])
++    expect(record.status).toBe('N_A')
++    expect(record.flaky).toBe(false)
++  })
++
++  it('diagnostics.pageErrors 按 fingerprint 跨 attempt 去重,保留首次出现的条目', () => {
++    const record = cell([
++      attempt({ attempt: 1, status: 'FAIL', pageErrors: [{ message: 'setPointerCapture boom', fingerprint: 'abc123', url: 'http://x' }] }),
++      attempt({ attempt: 2, status: 'PASS', pageErrors: [{ message: 'setPointerCapture boom', fingerprint: 'abc123', url: 'http://x' }] }),
++    ])
++    expect(record.diagnostics.pageErrors).toHaveLength(1)
++    expect(record.diagnostics.pageErrors[0].fingerprint).toBe('abc123')
++  })
++
++  it('name 字段唯一定位一个「格」= scenario::renderer::kernel::topology', () => {
++    const record = cell([attempt({ status: 'PASS' })])
++    expect(record.name).toBe('debug::dom::legacy::prod')
++  })
++})
+diff --git a/scripts/e2e/scenarios/coordinate-probe.mjs b/scripts/e2e/scenarios/coordinate-probe.mjs
+index 0daa7081..c5fda4f4 100644
+--- a/scripts/e2e/scenarios/coordinate-probe.mjs
++++ b/scripts/e2e/scenarios/coordinate-probe.mjs
+@@ -12,6 +12,8 @@
+  * viewport 随同采样记录，后续对照以 actual 为准。
+  */
+ 
++import { attachPageErrorObserver } from '../browser-error-guard.mjs'
++
+ const SAMPLE_NODE_LIMIT = 6
+ const ARTIFACT_PATH = 'test-artifacts/coordinate-probe.json'
+ 
+@@ -150,6 +152,9 @@ export const runCoordinateProbeScenario = async (context) => {
+   let dpr2Error = null
+   try {
+     const dpr2Context = await browser.newContext({ viewport: { width: 1920, height: 1080 }, deviceScaleFactor: 2, colorScheme: 'light' })
++    // 本场景自建 context,harness.mjs 里挂的 context 级 pageerror 观测覆盖不到这里——
++    // 单独补挂(见 browser-error-guard.mjs)。
++    attachPageErrorObserver(dpr2Context)
+     const dpr2Page = await dpr2Context.newPage()
+     await dpr2Page.emulateMedia({ reducedMotion: 'reduce' })
+     await dpr2Page.goto(canvasUrl || baseUrl, { waitUntil: 'networkidle' })
+diff --git a/scripts/e2e/scenarios/migration.mjs b/scripts/e2e/scenarios/migration.mjs
+index 764d75d6..ac7eddc0 100644
+--- a/scripts/e2e/scenarios/migration.mjs
++++ b/scripts/e2e/scenarios/migration.mjs
+@@ -1,4 +1,5 @@
+ import { installE2EStoreBridge, writePersistedKv } from '../harness.mjs'
++import { attachPageErrorObserver } from '../browser-error-guard.mjs'
+ import { waitForCanvasReady } from '../renderer-evidence.mjs'
+ 
+ export const runMigrationScenario = async (context) => {
+@@ -13,6 +14,9 @@ export const runMigrationScenario = async (context) => {
+       deviceScaleFactor: 1,
+       extraHTTPHeaders: prodExtraHTTPHeaders,
+     })
++    // 本场景自建 context(bypasses createSmokePage),harness.mjs 里挂的 context 级
++    // pageerror 观测覆盖不到这里——单独补挂(见 browser-error-guard.mjs)。
++    attachPageErrorObserver(migrationContext)
+     if (isProdTopology) {
+       await installE2EStoreBridge(migrationContext)
+     }

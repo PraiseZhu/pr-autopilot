@@ -1,0 +1,1738 @@
+diff --git a/build.sh b/build.sh
+index 5af25299..30e97135 100755
+--- a/build.sh
++++ b/build.sh
+@@ -19,6 +19,7 @@ cp -R cindyplugin/skills cindyplugin/dist/skills
+ # 所以原样拷进 dist 根即可。
+ cp -R public/stickers cindyplugin/dist/stickers
+ cp -R public/demo-assets cindyplugin/dist/demo-assets
++cp public/changelog.json cindyplugin/dist/changelog.json
+ 
+ # ── 摄取 token 注入(2026-08-10 #591 P1 返修)──────────────────────────────────
+ # main.js 的 `DEBUG_INGEST_TOKEN_FROM_BUILD` 是唯一注入点(未配置 = 空串,守卫
+diff --git a/src/PluginApp.tsx b/src/PluginApp.tsx
+index 039b649c..b98fcfc7 100644
+--- a/src/PluginApp.tsx
++++ b/src/PluginApp.tsx
+@@ -1,19 +1,39 @@
+-import { useCallback, useEffect, useState } from 'react'
+-import { Settings } from 'lucide-react'
++import { useCallback, useEffect, useRef, useState } from 'react'
++import { Settings, createLucideIcon } from 'lucide-react'
+ import { MivoCanvas } from '../../src/canvas/MivoCanvas'
+ import { ToastViewport } from '../../src/app/ToastViewport'
+ import { CanvasSettingsPanel } from '../../src/app/settings/CanvasSettingsPanel'
+ import { MediaLightbox } from '../../src/app/MediaLightbox'
+ import { DetailsTargetGuard } from '../../src/app/DetailsTargetGuard'
++import { ChangelogPanel } from '../../src/app/ChangelogPanel'
+ import { isMediaRenderKind, renderKindForNode } from '../../src/model/canvasNodeRegistry'
+ import { debugLogger } from '../../src/store/debugLogStore'
+ import { useCanvasStore } from '../../src/store/canvasStore'
+ import { useCanvasAppearanceStore } from '../../src/store/canvasAppearanceStore'
++import { selectHasUnreadChangelog, useChangelogStore } from '../../src/store/changelogStore'
+ import { usePluginHydration } from './usePluginHydration'
++import { maybeShowChangelogAutoPopup } from './changelogAutoPopup'
+ import { migrateLedgerIntoDepositStore } from './agent/depositMigration'
+ import { useTranslation } from 'react-i18next'
+ import { t } from '../../src/i18n'
+ 
++// 与 Cindy 应用同一枚 Flame(port-sc3 裁决):两仓 lucide 版本不同(mivo 1.30.0 /
++// Cindy 0.468.0),同名 Flame 的 path 几何并不相同,「直接复用同一导出」不成立。
++// 以 Cindy 实际渲染出的 SVG 几何为准,用 createLucideIcon 内联该几何并落快照
++// (viewBox 0 0 24 24 + path 的 d,见 pluginChangelogEntry.test.tsx 的图标快照断言)。
++// 网页版 Mivo 用的是 Sparkles(ProjectSidebar.tsx:373),不沿用 —— 偏离已在
++// docs/changelog-plugin-port/port-plan.md 偏离①声明。
++const FlameIcon = createLucideIcon('Flame', [
++  [
++    'path',
++    {
++      // lucide-react 0.468.0 Flame 的 path d(Cindy 桌面端 apps/desktop 的
++      // UserInfoSection.tsx 所用导出;跨仓引用,本仓无该文件)。
++      d: 'M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z',
++    },
++  ],
++])
++
+ /**
+  * Cindy 面板形态的最小外壳:只渲染画布本体。
+  *
+@@ -39,6 +59,39 @@ export function PluginApp() {
+   const [lightboxTarget, setLightboxTarget] = useState<{ sceneId: string; nodeId: string }>()
+   const handleLightboxAutoClose = useCallback(() => setLightboxTarget(undefined), [])
+ 
++  // 更新公告入口:齿轮左侧的 Flame(port-sc3)。openedAt 在事件处理器里取
++  // (ChangelogPanel 的入参契约,规避 render 期 Date.now 的纯度限制);
++  // 关闭后 focus 回到触发按钮 —— 与 CanvasSettingsPanel 的既有契约同构。
++  const changelogTriggerRef = useRef<HTMLButtonElement | null>(null)
++  const [changelogOpenedAt, setChangelogOpenedAt] = useState<number | null>(null)
++  const hasUnreadChangelog = useChangelogStore(selectHasUnreadChangelog)
++  const loadChangelog = useChangelogStore((state) => state.loadChangelog)
++
++  useEffect(() => {
++    if (!hydrated) return
++    void loadChangelog()
++  }, [hydrated, loadChangelog])
++
++  // p2-auto-popup(需求⑤):hydrated 后比对当前版本与持久化的 lastSeenVersion,
++  // 版本变了自动弹公告面板。判定只做一次(hydrated false→true 只会发生一次,
++  // 依赖数组就是该信号);弹窗走与手动 Flame 入口同一渲染入口(setChangelogOpenedAt)
++  // 与同一套关闭路径(backdrop pointerdown / 面板内关闭按钮,pop-sc3)。
++  useEffect(() => {
++    if (!hydrated) return
++    if (maybeShowChangelogAutoPopup()) {
++      queueMicrotask(() => setChangelogOpenedAt(Date.now()))
++    }
++  }, [hydrated])
++
++  const openChangelog = useCallback(() => {
++    setChangelogOpenedAt(Date.now())
++  }, [])
++
++  const closeChangelog = useCallback(() => {
++    setChangelogOpenedAt(null)
++    changelogTriggerRef.current?.focus()
++  }, [])
++
+   const handleOpenDetails = useCallback(() => {
+     // onOpenDetails 在 selectNode 之后触发,此刻 store 里的 selectedNodeId 即目标节点。
+     const state = useCanvasStore.getState()
+@@ -70,6 +123,19 @@ export function PluginApp() {
+     <main className="mivo-app project-collapsed ai-collapsed">
+       <div className="workspace">
+         <div className="work-surface">
++          {/* DOM 顺序 = Tab 焦点顺序与视觉顺序一致:公告按钮在齿轮左侧 */}
++          <button
++            ref={changelogTriggerRef}
++            type="button"
++            className="plugin-changelog-trigger"
++            aria-label={t('sidebar.changelog')}
++            title={t('sidebar.changelog')}
++            data-canvas-ui="true"
++            onClick={openChangelog}
++          >
++            <FlameIcon size={17} strokeWidth={1.9} />
++            {hasUnreadChangelog ? <span className="changelog-badge-dot" aria-hidden="true" /> : null}
++          </button>
+           <button
+             type="button"
+             className="plugin-settings-trigger"
+@@ -83,6 +149,9 @@ export function PluginApp() {
+           <MivoCanvas key={sceneId} onOpenDetails={handleOpenDetails} />
+         </div>
+       </div>
++      {changelogOpenedAt !== null ? (
++        <ChangelogPanel openedAt={changelogOpenedAt} onClose={closeChangelog} />
++      ) : null}
+       {lightboxTarget ? (
+         <DetailsTargetGuard
+           targetSceneId={lightboxTarget.sceneId}
+diff --git a/src/__tests__/changelogAutoPopup.test.ts b/src/__tests__/changelogAutoPopup.test.ts
+new file mode 100644
+index 00000000..80fd084f
+--- /dev/null
++++ b/src/__tests__/changelogAutoPopup.test.ts
+@@ -0,0 +1,722 @@
++// @vitest-environment happy-dom
++//
++// changelog-port 需求⑤「插件版每次更新版本后自动弹更新公告」(优先级
++// p2-auto-popup,组 g3)的验收:
++//  · pop-sc1-version-injectable:版本由函数参数注入(默认实参取
++//    import.meta.env.VITE_MIVO_VERSION),持久化 lastSeenVersion 与 lastRead
++//    同一 persist 分区;
++//  · pop-sc2-first-install-silent:首装(持久化无 lastSeenVersion)静默写基线,
++//    不弹;
++//  · pop-sc3-reuse-panel-class-not-values:自动弹出复用 ChangelogPanel 与
++//    .changelog-panel 类,本 PR 对 src/App.css 零改动、不引入几何声明;
++//  · pop-sc4-two-states-independent(wave 4 验证组):lastRead(红点,比对
++//    updatedAt)与 lastSeenVersion(自动弹窗,比对包版本)同分区存储但互不读写
++//    ——改一个不影响另一个;同版本关闭后重新挂载不再弹。②③ 必须经
++//    maybeShowChangelogAutoPopup 真实路径观测(变异打点在弹窗代码上),store
++//    直设断言对变异不可见。
++//
++// 渲染侧:真实渲染 PluginApp(usePluginHydration 真实执行,外围 persistSync /
++// pendingWriteDrain / authClient 桩掉,与 pluginChangelogHydration.test.tsx
++// 同款装配),版本经 vi.stubEnv 注入 import.meta.env.VITE_MIVO_VERSION——
++// PluginApp 的自动弹窗接线调 maybeShowChangelogAutoPopup() 的默认实参,桩
++// env 即注入版本。不 mock useChangelogStore(生产 store + 真实 persist +
++// fake-indexeddb)。
++//
++// 水合侧:**不 mock 两个水合门 hook**,真实 rehydrate + fake-indexeddb 预写
++// (与 pluginChangelogHydration.test.tsx 同构),验 lastSeenVersion 随两个水合
++// 门存活,并含 partialize 写侧锚点(zustand persist 读侧是浅合并 persisted
++// 全部键,与 partialize 无关——「去掉 partialize 字段」的变异只能靠写侧断言
++// 转红)。
++//
++// 假绿防护(与 pluginChangelogHydration.test.tsx 同款教训):本文件多个 describe
++// 共享同一 store 实例与同一 fake IDB 库,清 IDB 不清内存——上一条用例的接线
++// rehydrate / setState 会把值留在内存,残留值会把「无接线/无字段仍通过」的
++// 用例撑成假绿。因此:① 每用例 beforeEach 清 IDB + 清内存(resetStore);
++// ② 水合侧插件/网页两侧刻意用**不同**的 lastRead ISO 与 lastSeenVersion 值,
++// 残留值 ≠ 本侧断言值,删接线必红。
++import 'fake-indexeddb/auto'
++import { execFileSync } from 'node:child_process'
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++import { act, createElement, useEffect, type ReactElement } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { readGuardBaseFile, resolveGuardBase } from './mergeBaseGuard'
++import { CHANGELOG_RULE_RE, scanAddedGeometryViolations, scanBlocksForGeometry } from './changelogGeometryGuard'
++
++// happy-dom 环境下 Vite 会把 new URL(rel, import.meta.url) 静态转换成
++// http://localhost:3000/...(dev-server 资产 URL 模式),fileURLToPath 直接炸。
++// 改用 Node 原生 import.meta.dirname(测试文件自身目录)做相对路径。
++const here = (import.meta as unknown as { dirname: string }).dirname
++
++// ── 宿主桥桩(测试环境无宿主 IPC / 网络)────────────────────────────────────
++// 渲染 PluginApp 时 usePluginHydration 真实执行,其依赖的磁盘恢复 / 延迟写入
++// drain 是宿主能力,桩成 no-op;唯一观测链是 hydration → hydrated=true →
++// PluginApp 的自动弹窗 effect。网页侧 useStoreHydration 的 auth /me 与
++// fire-and-forget reconcile 同样桩掉(与 pluginChangelogHydration.test.tsx 同款)。
++vi.mock('../persist/persistSync', () => ({
++  restoreFromDiskIfEmpty: vi.fn(async () => 'empty'),
++  startAutoSave: vi.fn(),
++}))
++vi.mock('../agent/pendingWriteDrain', () => ({
++  drainPendingCanvasWrites: vi.fn(async () => ({
++    outcome: 'empty',
++    applied: 0,
++    rejected: 0,
++    expired: 0,
++    superseded: 0,
++    deferredByBinding: 0,
++    queueFull: false,
++  })),
++}))
++vi.mock('../../../src/canvas/MivoCanvas', () => ({
++  MivoCanvas: () => null,
++}))
++vi.mock('../../../src/app/ToastViewport', () => ({ ToastViewport: () => null }))
++vi.mock('../../../src/app/MediaLightbox', () => ({ MediaLightbox: () => null }))
++vi.mock('../../../src/app/DetailsTargetGuard', () => ({ DetailsTargetGuard: () => null }))
++vi.mock('../agent/depositMigration', () => ({
++  migrateLedgerIntoDepositStore: vi.fn(async () => ({ ok: true, skipped: true })),
++}))
++// 网页侧 useStoreHydration 依赖(auth /me + settle 网络请求)
++const { fetchMeMock } = vi.hoisted(() => ({ fetchMeMock: vi.fn() }))
++vi.mock('../../../src/lib/authClient', () => ({
++  fetchMe: fetchMeMock,
++  AuthError: class AuthError extends Error {},
++}))
++vi.mock('../../../src/store/chatTaskReconcile', () => ({
++  reconcileExpiredChatTasks: vi.fn(async () => undefined),
++}))
++// PluginApp 在 hydrated 后调用 loadChangelog()(fetch /changelog.json):stub 成
++// 空文档,避免真实网络请求与 toast 副作用。
++vi.stubGlobal(
++  'fetch',
++  vi.fn(async () => ({ ok: true, json: async () => ({}) })),
++)
++
++// 版本 env 桩**必须在 changelogAutoPopup.ts 求值之前生效**(模块作用域,而非用例
++// 体内)。原因:反向变异「把版本改成模块内直读 env」(pop-sc1 ③ 的变异)把 env
++// 读取移到模块加载期——若在用例体内才 stubEnv,变异下模块加载时 env 还是
++// undefined,行为用例(①②、pop-sc2)会跟着红,变异就红了多条而不是恰好红 ③。
++// 桩在 import 前 → 变异下模块捕获到的也是 'B',行为用例保持绿,只有 ③ 的
++// 源码级计数转红。所有渲染用例共用固定版本 'B',「不同版本」由预写的持久化值
++// 承担(seed 'A' + env 'B' → 弹;seed 'B' + env 'B' → 不弹;seed '' + env 'B' → 基线)。
++vi.stubEnv('VITE_MIVO_VERSION', 'B')
++
++const { PluginApp } = await import('../PluginApp')
++const { maybeShowChangelogAutoPopup, __resetChangelogAutoPopup } = await import('../changelogAutoPopup')
++const { selectHasUnreadChangelog, useChangelogStore } = await import('../../../src/store/changelogStore')
++const { usePluginHydration } = await import('../usePluginHydration')
++const { useStoreHydration } = await import('../../../src/app/useStoreHydration')
++const {
++  strictIdbStateStorage,
++  __resetIdbPersist,
++  __resetIdbOperationalProbeForTests,
++} = await import('../../../src/lib/persistIdbStorage')
++const { __resetKernelDegradationForTests } = await import('../../../src/app/kernelMode')
++
++const PERSIST_KEY = 'mivo-changelog-lastread'
++// pop-sc3 ②③ 的 git diff 断言基准在运行时解析,复用仓内 mergeBaseGuard 的三档
++// fail-closed 语义(与 depositBrain/cardManifest 同一份实现,禁止各自内联漂移):
++//  ① CI 且基准不可读 → throw(门禁在做不到本职时必须红,不许静默通过);
++//  ② 显式 MIVO_GUARD_BASE_SHA 指定但读不出 → 本地与 CI 都 throw(配置错误);
++//  ③ 仅本地、未显式指定且确实取不到 → warn + ctx.skip(跳过要看得见)。
++// 用例②走 readGuardBaseFile(读 base 处 App.css,与 HEAD 处 blob 逐字节比较——
++// diff base..HEAD 为空 ⟺ 两侧 blob 相同);用例③走 resolveGuardBase 再 git diff,
++// **不 catch git 错误**:显式坏 base 时 execFileSync 抛错,用例直接判红。
++const gitRaw = (args: string[]): string => execFileSync('git', args, { encoding: 'utf8' })
++const gitTrim = (args: string[]): string => gitRaw(args).trim()
++
++const waitFor = async (predicate: () => boolean, timeoutMs: number, intervalMs = 25): Promise<boolean> => {
++  const deadline = Date.now() + timeoutMs
++  while (Date.now() < deadline) {
++    if (predicate()) return true
++    await new Promise((resolve) => setTimeout(resolve, intervalMs))
++  }
++  return predicate()
++}
++
++// 自动 rehydrate(该分区无 skipHydration)在文件 import 时对空库跑一次,必须
++// 确定性地 settle 在预写之前——否则预写被自动 rehydrate 覆盖,「预写后无接线
++// 读取」会被假撑(与 pluginChangelogHydration.test.tsx 同款防假绿)。
++await waitFor(() => useChangelogStore.persist.hasHydrated(), 5_000)
++expect(useChangelogStore.getState().lastRead).toBe('')
++expect(useChangelogStore.getState().lastSeenVersion).toBe('')
++
++const resetStore = () => {
++  useChangelogStore.setState({ entries: [], updatedAt: '', loaded: false, lastRead: '', lastSeenVersion: '' })
++}
++
++/** 用生产 strictIdbStateStorage 预写分区信封,写后回读校验真实落盘(防假成功)。 */
++const seedPersisted = async (state: { lastRead: string; lastSeenVersion: string }): Promise<void> => {
++  const envelope = JSON.stringify({ state, version: 0 })
++  await strictIdbStateStorage.setItem(PERSIST_KEY, envelope)
++  expect(await strictIdbStateStorage.getItem(PERSIST_KEY)).toBe(envelope)
++}
++
++const flushPersistWrites = async (): Promise<void> => {
++  // persist 拦截 setState 后经 changelogLastReadStorage.setItem 写 + 回读比对
++  // 两跳 microtask,必须等它完全落定再预写/断言,否则 reset 的写会晚到覆盖。
++  await new Promise((resolve) => setTimeout(resolve, 0))
++}
++
++/** 从 setItem spy 的调用记录里取落盘信封(参数 1 是 zustand persist 信封串)。 */
++const persistedEnvelope = (call: [name: string, value: string]): { state: Record<string, unknown> } =>
++  JSON.parse(call[1]) as { state: Record<string, unknown> }
++
++// ── 渲染装配(真实 PluginApp + 真实 hydration)──────────────────────────────
++let container: HTMLDivElement
++let root: Root
++
++const mountPlugin = async (): Promise<void> => {
++  await act(async () => {
++    root.render(createElement(PluginApp))
++  })
++  await act(async () => {
++    await new Promise((resolve) => setTimeout(resolve, 0))
++  })
++}
++
++/** hydrated 完成 = 主内容(.mivo-app)挂载,之后自动弹窗 effect 已随提交跑完。 */
++const waitHydratedApp = async (): Promise<void> => {
++  expect(await waitFor(() => container.querySelector('.mivo-app') !== null, 5_000)).toBe(true)
++  await act(async () => {}) // flush effect 产生的 setState 提交
++}
++
++const teardownRender = (): void => {
++  // 注意:不调 vi.unstubAllEnvs —— env 桩是模块作用域的一个固定值(见顶部),
++  // 逐用例卸载会让后续用例的模块默认参读不到 'B'。
++  act(() => root?.unmount())
++  container?.remove()
++  document.querySelector('.changelog-backdrop')?.remove()
++}
++
++const renderEnv = async (): Promise<void> => {
++  vi.restoreAllMocks()
++  await __resetIdbPersist()
++  __resetIdbOperationalProbeForTests()
++  __resetKernelDegradationForTests()
++  __resetChangelogAutoPopup()
++  resetStore()
++  await flushPersistWrites()
++  container = document.createElement('div')
++  document.body.appendChild(container)
++  root = createRoot(container)
++}
++
++// ── 水合装配(真实 hook,仿 pluginChangelogHydration.test.tsx)────────────────
++const observed = { hydrated: false }
++
++function PluginHarness() {
++  const hydrated = usePluginHydration()
++  useEffect(() => {
++    observed.hydrated = hydrated
++  }, [hydrated])
++  return null
++}
++
++function StoreHarness() {
++  const hydrated = useStoreHydration()
++  useEffect(() => {
++    observed.hydrated = hydrated
++  }, [hydrated])
++  return null
++}
++
++let harnessContainer: HTMLDivElement | undefined
++let harnessRoot: Root | undefined
++
++const mountHarness = async (harness: ReactElement): Promise<void> => {
++  ;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++  harnessContainer = document.createElement('div')
++  document.body.appendChild(harnessContainer)
++  harnessRoot = createRoot(harnessContainer)
++  await act(async () => {
++    harnessRoot!.render(harness)
++  })
++  await act(async () => {
++    await new Promise((resolve) => setTimeout(resolve, 0))
++  })
++}
++
++const teardownHarness = (): void => {
++  vi.restoreAllMocks()
++  act(() => harnessRoot?.unmount())
++  harnessContainer?.remove()
++  harnessContainer = undefined
++  harnessRoot = undefined
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++describe('pop-sc1 版本比对(渲染层,stubEnv 注入版本)', () => {
++  beforeEach(async () => {
++    ;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++    await renderEnv()
++  })
++  afterEach(teardownRender)
++
++  it('① env B + 持久化里是 B → 不弹(不出现 .changelog-backdrop)', async () => {
++    await seedPersisted({ lastRead: '', lastSeenVersion: 'B' })
++    await mountPlugin()
++    await waitHydratedApp()
++    expect(document.querySelector('.changelog-backdrop'), '同版本不弹').toBeNull()
++    expect(useChangelogStore.getState().lastSeenVersion).toBe('B')
++  })
++
++  it('② env B + 持久化里是 A → 弹,且弹出后版本基线更新为 B', async () => {
++    await seedPersisted({ lastRead: '', lastSeenVersion: 'A' })
++    await mountPlugin()
++    await waitHydratedApp()
++    expect(await waitFor(() => document.querySelector('.changelog-backdrop') !== null, 5_000)).toBe(true)
++    // 弹出后基线更新为 'B'(env 版本)。**不做落盘信封断言**——落盘形态
++    // (partialize 含 lastSeenVersion)由 pop-sc1 ④ 的写侧锚点独占,这里若断
++    // 信封,「partialize 去掉该字段」的变异会让本条一起红,④ 的变异就红了两条,
++    // 违反「恰好红 1 条」。
++    expect(useChangelogStore.getState().lastSeenVersion).toBe('B')
++  })
++})
++
++describe('pop-sc1 ③ import.meta.env 只出现在默认实参(源码级门禁)', () => {
++  beforeEach(() => {
++    __resetChangelogAutoPopup()
++  })
++
++  // 与 regionEditTheme.test.ts 同口径:先剥注释(注释里的字面量是文档不是代码),
++  // 再数代码里 import.meta.env 的出现次数——反向变异(改成模块内直读 env)会把
++  // 函数体多出一处命中,恰好让本断言转红。
++  const src = readFileSync(join(here, '../changelogAutoPopup.ts'), 'utf8')
++  const withoutComments = (code: string): string =>
++    code
++      .replace(/\/\*[\s\S]*?\*\//g, '') // 块注释
++      .split('\n')
++      .filter((line) => !line.trim().startsWith('//')) // 整行行注释
++      .join('\n')
++
++  it('changelogAutoPopup.ts 里除默认实参那一处外不出现 import.meta.env', () => {
++    const code = withoutComments(src)
++    const hits = [...code.matchAll(/import\.meta\.env/g)]
++    expect(hits, '模块内部不得直接读 env,只允许默认实参一处').toHaveLength(1)
++    // 且该处必须是函数签名里的默认实参形态(不是函数体直读)
++    expect(src).toMatch(/version: string = import\.meta\.env\.VITE_MIVO_VERSION/)
++  })
++})
++
++describe('pop-sc2 首装静默(渲染层)', () => {
++  beforeEach(async () => {
++    ;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++    await renderEnv()
++  })
++  afterEach(teardownRender)
++
++  // 反向变异(删「写入基线」那一步)必须**恰好**让 ② 转红、① 保持绿——SC 明示
++  // 两条断言分别隔离「首装不弹」与「基线已落」:① 只断首装不弹(变异下仍绿);
++  // 基线已落**经 ② 观测**(第二次挂载仍不弹 = 基线在,第二次挂载弹 = 基线没写,
++  // 或写了没留住)。① 里不许掺「基线被写入」断言——掺了变异时 ① 也会红,
++  // 就是 SC 说的串红,没隔离开。落盘信封形态(partialize 含该字段)归 ④ 独占。
++  it('① 持久化为空 + env B → 不出现 .changelog-backdrop', async () => {
++    // 不预写:renderEnv 的 __resetIdbPersist + resetStore 已把分区清成空/空基线;
++    // 版本 = 模块作用域桩的固定 env 'B'(见文件头说明)
++    await mountPlugin()
++    await waitHydratedApp()
++    expect(document.querySelector('.changelog-backdrop'), '首装不弹').toBeNull()
++  })
++
++  it('② 首装静默写基线;紧接着同版本第二次挂载 → 仍不弹(基线已落)', async () => {
++    await mountPlugin()
++    await waitHydratedApp()
++    expect(document.querySelector('.changelog-backdrop'), '首装不弹').toBeNull()
++    // 「基线已落」:首装后内存基线就是当前版本 'B'(变异删掉写入 → 这里红)
++    expect(useChangelogStore.getState().lastSeenVersion).toBe('B')
++
++    // 第二次挂载:**不清 IDB、不清内存、不 seed** —— 首装真实落下的基线仍在。
++    // 反向变异「删掉写入基线那一步」时,首装后基线是空,第二次挂载 空值 ≠
++    // 1.2.3 必弹,本断言转红;而 ① 仍绿(首装依旧不弹)——恰好红 1 条。
++    act(() => root.unmount())
++    container.remove()
++    container = document.createElement('div')
++    document.body.appendChild(container)
++    root = createRoot(container)
++    await mountPlugin()
++    await waitHydratedApp()
++    expect(document.querySelector('.changelog-backdrop'), '同版本第二次挂载仍不弹').toBeNull()
++  })
++})
++
++describe('pop-sc3 复用同一面板类 + 同一套关闭路径(渲染层)', () => {
++  beforeEach(async () => {
++    ;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++    await renderEnv()
++  })
++  afterEach(teardownRender)
++
++  /** 构造「自动弹出」场景:持久化 A + env B(模块作用域桩)。 */
++  const mountAutoPopup = async (): Promise<void> => {
++    await seedPersisted({ lastRead: '', lastSeenVersion: 'A' })
++    await mountPlugin()
++    await waitHydratedApp()
++    expect(await waitFor(() => document.querySelector('.changelog-backdrop') !== null, 5_000)).toBe(true)
++  }
++
++  it('① 自动弹出的面板 DOM 上的类恰为 changelog-panel(不存在第二个变体类名)', async () => {
++    await mountAutoPopup()
++    const panel = document.querySelector('.changelog-panel')
++    expect(panel, '自动弹出应渲染 .changelog-panel').not.toBeNull()
++    expect(panel!.className).toBe('changelog-panel')
++    // 全文档扫描 changelog-*-panel 形态的类(含 changelog-panel 本身,* 允许
++    // 中间段为空):恰一个且就是 changelog-panel —— 若有人新写一个
++    // changelog-xxx-panel 变体类,这里会变成两个元素而转红。
++    const variantClasses = [...document.querySelectorAll('[class]')]
++      .map((element) => element.getAttribute('class') ?? '')
++      .filter((cn) => /(^|\s)changelog-[a-z0-9-]*panel(\s|$)/.test(cn))
++    expect(variantClasses, '不允许出现第二个 changelog-*-panel 变体类').toEqual(['changelog-panel'])
++  })
++
++  it('② src/App.css 在本 PR 的 diff 里零改动', (ctx) => {
++    const baseText = readGuardBaseFile('src/App.css', 'pop-sc3-appcss')
++    if (baseText === null) {
++      ctx.skip('本地取不到 diff 基准,无法断言 App.css 零改动(mergeBaseGuard 已打横幅)')
++      return
++    }
++    // diff base..HEAD 为空 ⟺ base 处 blob 与 HEAD 处 blob 逐字节相同
++    const headText = gitTrim(['show', 'HEAD:src/App.css'])
++    expect(headText, 'App.css 同时服务网页版,本 PR 对它零改动').toBe(baseText)
++  })
++
++  it('③ 本 PR 未引入对 .changelog-backdrop/.changelog-panel 的几何声明', (ctx) => {
++    const base = resolveGuardBase('pop-sc3-geometry')
++    if (base === null) {
++      ctx.skip('本地取不到 diff 基准,无法断言几何声明(mergeBaseGuard 已打横幅)')
++      return
++    }
++    // 不 catch:显式坏 MIVO_GUARD_BASE_SHA 或其它 git 失败时 execFileSync 抛错,
++    // 用例直接判红(fail-closed),而不是降级成跳过。
++    const diff = gitRaw(['diff', base, '--', 'src', 'cindyplugin'])
++    for (const block of scanAddedGeometryViolations(diff)) {
++      expect.fail(`新增几何声明:${block}`)
++    }
++  })
++
++  it('关闭路径:backdrop pointerdown 关闭(自动弹出场景,同一套关闭)', async () => {
++    await mountAutoPopup()
++    const backdrop = document.querySelector('.changelog-backdrop') as HTMLElement
++    await act(async () => {
++      backdrop.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
++    })
++    expect(document.querySelector('.changelog-backdrop')).toBeNull()
++    // g1 已验的 focus 恢复同一路径:关闭后 focus 回公告按钮
++    expect(document.activeElement).toBe(container.querySelector('.plugin-changelog-trigger'))
++  })
++
++  it('关闭路径:面板内关闭按钮关闭(自动弹出场景)', async () => {
++    await mountAutoPopup()
++    const closeButton = document.querySelector('.changelog-header button') as HTMLButtonElement
++    expect(closeButton, '面板应有关闭按钮').not.toBeNull()
++    await act(async () => {
++      closeButton.click()
++    })
++    expect(document.querySelector('.changelog-backdrop')).toBeNull()
++  })
++})
++
++describe('pop-sc3 diff 守卫:三档 fail-closed 语义(复用 mergeBaseGuard)', () => {
++  afterEach(() => {
++    vi.unstubAllEnvs()
++  })
++
++  // 三档 ②:显式 MIVO_GUARD_BASE_SHA 指定但读不出 → 本地也 throw,不许降级成
++  // 跳过(SC-A-FIX-DIFF-GUARD-FAIL-CLOSED holds ②)。真实 git 行为,不 mock。
++  it('显式坏 MIVO_GUARD_BASE_SHA 时 readGuardBaseFile 必须 throw', () => {
++    vi.stubEnv('MIVO_GUARD_BASE_SHA', 'deadbeef00000000000000000000000000000000')
++    expect(() => readGuardBaseFile('src/App.css', 'pop-sc3-appcss')).toThrow(/MIVO_GUARD_BASE_SHA/)
++  })
++
++  it('显式坏 MIVO_GUARD_BASE_SHA 时 resolveGuardBase 原样返回,git diff 失败向上抛', () => {
++    vi.stubEnv('MIVO_GUARD_BASE_SHA', 'deadbeef00000000000000000000000000000000')
++    expect(resolveGuardBase('pop-sc3-geometry')).toBe('deadbeef00000000000000000000000000000000')
++    expect(() => gitRaw(['diff', 'deadbeef00000000000000000000000000000000', '--', 'src/App.css'])).toThrow()
++  })
++})
++
++describe('pop-sc3 ③ 几何扫描:反向变异与绿对照(共享扫描函数)', () => {
++  // fixture 选择器拆字构造:测试文件自身的源行会被用例③的真 diff 扫描(未提交时),
++  // 任何「.changelog-backdrop {」字面形态剥 + 后都会被当成新增声明 → 用例③误红;
++  // 拆字后源行只含「.changelog' + '-backdrop」这类不连续文本,运行时才拼成真选择器。
++  const sel = (name: string): string => '.changelog' + name
++  const plus = (text: string): string => '+' + text
++  const diffOf = (lines: string[]): string =>
++    ['diff --git a/x b/x', '--- a/x', '+++ b/x', '@@ -1,1 +1,1 @@', ...lines].join('\n')
++
++  it('反向变异:新增规则块首首属性 position 必须命中(旧形状无 m/无 { 前导会放过)', () => {
++    const diff = diffOf([
++      plus(sel('-backdrop {')),
++      plus('  position: fixed;'),
++      plus('  inset: 0;'),
++      plus('}'),
++    ])
++    expect(scanAddedGeometryViolations(diff), '块首 position 必须命中').toHaveLength(1)
++  })
++
++  it('反向变异:换行后的 display/place-items 必须命中(逐行属性)', () => {
++    const diff = diffOf([
++      plus(sel('-panel {')),
++      plus('  display: flex;'),
++      plus('  place-items: center;'),
++      plus('}'),
++    ])
++    expect(scanAddedGeometryViolations(diff), '换行后的 display/place-items 必须命中').toHaveLength(1)
++  })
++
++  it('绿对照:纯皮肤声明(background/color/border-color)不命中', () => {
++    const diff = diffOf([
++      plus(sel('-panel {')),
++      plus('  background: #fff;'),
++      plus('  color: var(--text);'),
++      plus('  border-color: #ccc;'),
++      plus('}'),
++    ])
++    expect(scanAddedGeometryViolations(diff), '皮肤声明不得命中几何扫描').toHaveLength(0)
++  })
++
++  it('绿对照:+++ 文件头与不构成规则块的行不进扫描', () => {
++    const diff = [
++      'diff --git a/cindy-theme.css b/cindy-theme.css',
++      '--- a/cindy-theme.css',
++      '+++ b/cindy-theme.css',
++      '@@ -1,3 +1,4 @@',
++      plus(sel('-backdrop {')),
++      plus('  background: #111;'),
++      plus('}'),
++    ].join('\n')
++    expect(scanAddedGeometryViolations(diff)).toHaveLength(0)
++  })
++
++  it('退化对照:旧形状正则(无 m/无 { 前导)对块首 position 免疫 → 证明 m/{ 前导在咬', () => {
++    const legacy =
++      /(?:^|;)\s*(position|inset|top|right|bottom|left|display|place-items|width|height|padding|gap|border-radius|transform|margin|z-index)\s*:/g
++    const diff = diffOf([plus(sel('-backdrop {')), plus('  position: fixed;'), plus('}')])
++    expect(scanAddedGeometryViolations(diff, legacy), '旧形状免疫 = F1 修复的免疫形态').toHaveLength(0)
++    expect(scanAddedGeometryViolations(diff), '共享扫描必须命中块首 position').toHaveLength(1)
++  })
++
++  it('退化对照:不剥 + 前缀的旧扫描对 position 免疫 → 证明剥前缀在咬', () => {
++    const diff = diffOf([plus(sel('-backdrop {')), plus('  position: fixed;'), plus('}')])
++    // 退化:只过滤不剥前缀 —— added 行带 '+' 挡在属性名前,正则看不到 position
++    const rawAdded = diff
++      .split('\n')
++      .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
++      .join('\n')
++    const legacyBlocks = [...rawAdded.matchAll(CHANGELOG_RULE_RE)].map((match) => match[0])
++    expect(scanBlocksForGeometry(legacyBlocks), '退化(不剥 +)放过').toHaveLength(0)
++    expect(scanAddedGeometryViolations(diff), '剥前缀后必须命中').toHaveLength(1)
++  })
++})
++
++// ─────────────────────────────────────────────────────────────────────────
++// 重挂载竞态(审查席实测复现):PluginApp 每次重新挂载都会让 [hydrated] effect
++// 重跑一次 maybeShowChangelogAutoPopup。模块级「本会话已判定」标志保证一次
++// 会话只判一次——否则上一次判定写入的基线若尚未落盘(异步 IDB 写),重挂载后
++// rehydrate 把旧值合并回来,同一版本会弹两次。
++describe('重挂载竞态:一个会话只判一次,基线未落盘也不二次弹窗(渲染层)', () => {
++  beforeEach(async () => {
++    ;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++    await renderEnv()
++  })
++  afterEach(teardownRender)
++
++  it('第一次判定已弹窗、基线写入未落盘时重挂载 → 不再第二次弹窗', async () => {
++    await seedPersisted({ lastRead: '', lastSeenVersion: 'A' })
++    // gate 住本次基线写入(strictIdbStateStorage.setItem 是 persist 落盘的
++    // 最后一道门),模拟真实 async IO 未落盘——审查席的复现手法。放行前先记下
++    // 原实现,gate 解除后仍走真实写入,不留悬空 promise。
++    let releaseWrite!: () => void
++    const gate = new Promise<void>((resolve) => {
++      releaseWrite = resolve
++    })
++    const originalSetItem = strictIdbStateStorage.setItem
++    vi.spyOn(strictIdbStateStorage, 'setItem').mockImplementation(async (name, value) => {
++      if (name === PERSIST_KEY) await gate
++      return originalSetItem(name, value)
++    })
++    try {
++      await mountPlugin()
++      await waitHydratedApp()
++      // 第一次判定:持久化 A ≠ env B → 弹窗;基线 'B' 的写入被 gate 住,尚未落盘。
++      expect(await waitFor(() => document.querySelector('.changelog-backdrop') !== null, 5_000)).toBe(true)
++
++      // 写入完成前 unmount + remount:重挂载走真实 hydration(rehydrate 无条件
++      // 重跑),IDB 里仍是旧基线 'A',未落盘的 'B' 覆盖不了它——内存基线回到 'A'。
++      act(() => root.unmount())
++      container.remove()
++      container = document.createElement('div')
++      document.body.appendChild(container)
++      root = createRoot(container)
++      await mountPlugin()
++      await waitHydratedApp()
++      // 模块级标志存在:本会话已判定,直接跳过,不二次弹窗。反向变异(去掉标志)
++      // 时,第二次判定读到 'A' ≠ 'B' 会再弹一次,本断言转红——恰好红这一条。
++      expect(document.querySelector('.changelog-backdrop'), '基线未落盘时重挂载不得二次弹窗').toBeNull()
++    } finally {
++      // 无论断言成败都放行被 gate 的写入并还原 spy:断言失败(反向变异)时若
++      // 把 gate 留在原位,后一用例的 seedPersisted 会挂死在同一个 gate 上,
++      // 让变异多红一条、掩盖「恰好红 1 条」的判定。
++      releaseWrite()
++      await flushPersistWrites()
++      vi.restoreAllMocks()
++    }
++  })
++})
++
++// ─────────────────────────────────────────────────────────────────────────
++describe('pop-sc1 ④ lastSeenVersion 活过真实水合门(插件侧 usePluginHydration)', () => {
++  beforeEach(async () => {
++    await __resetIdbPersist()
++    __resetIdbOperationalProbeForTests()
++    __resetKernelDegradationForTests()
++    __resetChangelogAutoPopup()
++    observed.hydrated = false
++  })
++  afterEach(teardownHarness)
++
++  it('预写 {lastRead, lastSeenVersion} → 真实水合门 → hydrated=true 后恢复,且 partialize 落盘含该字段', async () => {
++    const ISO_PLUGIN = '2026-08-11T10:00:00.000Z'
++    const SEED_VERSION = '0.9.30'
++    await seedPersisted({ lastRead: ISO_PLUGIN, lastSeenVersion: SEED_VERSION })
++    const setSpy = vi.spyOn(strictIdbStateStorage, 'setItem') // 记录不拦截
++    await mountHarness(createElement(PluginHarness))
++    expect(await waitFor(() => observed.hydrated, 5_000)).toBe(true)
++    expect(useChangelogStore.getState().lastSeenVersion, '预写值活过水合,非默认空值').toBe(SEED_VERSION)
++    expect(useChangelogStore.getState().lastRead).toBe(ISO_PLUGIN)
++    // 写侧锚点(反向变异④):partialize 必须落盘 lastSeenVersion —— zustand
++    // persist 读侧是浅合并 persisted 全部键(与 partialize 无关),去掉
++    // partialize 字段只有写侧断言会红。
++    expect(maybeShowChangelogAutoPopup('0.9.31')).toBe(true)
++    await vi.waitFor(() => {
++      const last = setSpy.mock.calls.at(-1)
++      expect(last, '应有落盘调用').toBeDefined()
++      const envelope = persistedEnvelope(last!)
++      expect(envelope.state.lastSeenVersion).toBe('0.9.31')
++      expect(envelope.state.lastRead).toBe(ISO_PLUGIN)
++    })
++  })
++})
++
++describe('pop-sc1 ④ 网页侧 useStoreHydration(同构用例)', () => {
++  beforeEach(async () => {
++    await __resetIdbPersist()
++    __resetIdbOperationalProbeForTests()
++    __resetKernelDegradationForTests()
++    __resetChangelogAutoPopup()
++    observed.hydrated = false
++    fetchMeMock.mockReset()
++    fetchMeMock.mockResolvedValue({ authenticated: true, user: { id: 'user-u', name: 'U' } })
++  })
++  afterEach(teardownHarness)
++
++  it('预写 {lastRead, lastSeenVersion} → auth ok 后真实水合门 → hydrated=true,lastSeenVersion 恢复', async () => {
++    const ISO_WEB = '2026-08-11T11:00:00.000Z'
++    const SEED_VERSION = '0.9.29'
++    await seedPersisted({ lastRead: ISO_WEB, lastSeenVersion: SEED_VERSION })
++    await mountHarness(createElement(StoreHarness))
++    expect(await waitFor(() => observed.hydrated, 10_000)).toBe(true)
++    expect(useChangelogStore.getState().lastSeenVersion, '预写值活过网页侧水合').toBe(SEED_VERSION)
++    expect(useChangelogStore.getState().lastRead).toBe(ISO_WEB)
++  })
++})
++
++// ─────────────────────────────────────────────────────────────────────────
++// pop-sc4 两套状态独立(wave 4 验证组,kind=verify / 颗粒度 mutation):红点
++// (lastRead,比对内容 updatedAt)与自动弹窗(lastSeenVersion,比对包版本)是两套
++// 独立状态——改一个不影响另一个。hold 是 ChangelogPanel 自带 markRead()
++// (ChangelogPanel.tsx:101-103,挂载即调用,lead 已裁决为既有取舍、非缺陷,本
++// PR 不改它)只动 lastRead;若拿它当「已看过本版」会出现「点开一次红点后永远
++// 收不到版本提示」或「自动弹窗顺手清红点」两类坏结果,必须各自独立且各自
++// 可验。
++//
++// 断言设计(反向变异「把 lastSeenVersion 的读写改成复用 lastRead」必须让
++// ②③ 转红而①仍绿):
++//  · ① 渲染层 seed lastRead=非空 ISO + lastSeenVersion='A' + env 'B':A≠B
++//    照常弹(真实现看 lastSeenVersion;合并实现看 lastRead 非空≠'B' 也弹),
++//    关闭后同版本重挂载不再弹(基线已更新 + 模块级「本会话已判定」标志双机
++//    制,两种实现下都成立)——①只断 DOM 行为,**不断 lastSeenVersion 值**:
++//    值断言在合并实现下会红,违反「①仍绿」。①单独不足以证明独立性,正是
++//    ②③ 的探测点。
++//  · ② 只调 markRead() 后 lastSeenVersion 不变;且 markRead 之后走真实弹窗
++//    路径(maybeShowChangelogAutoPopup)判定/写入不得覆盖 lastRead——合并
++//    实现下弹窗写 lastRead,此断言转红。
++//  · ③ 只更新 lastSeenVersion(首装基线写入)后 lastRead 不变、
++//    selectHasUnreadChangelog 结果不变——合并实现下基线写入落到 lastRead,
++//    lastRead/lastSeenVersion 断言转红。
++describe('pop-sc4 ① 弹出 → 关闭 → 同版本重新挂载 → 不再弹(渲染层)', () => {
++  beforeEach(async () => {
++    ;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++    await renderEnv()
++  })
++  afterEach(teardownRender)
++
++  it('lastRead 非空 + lastSeenVersion A + env B → 弹;关闭后同版本重挂载不再弹', async () => {
++    // lastRead 用非空 ISO:合并实现(弹窗读写复用 lastRead)下读到非空 ≠ 'B'
++    // 仍判定「版本不同」照常弹,① 保持绿——这是 SC「① 在合并实现下仍可能
++    // 成立」的构造前提(见 describe 头注释)。
++    await seedPersisted({ lastRead: '2026-08-10T00:00:00.000Z', lastSeenVersion: 'A' })
++    await mountPlugin()
++    await waitHydratedApp()
++    expect(await waitFor(() => document.querySelector('.changelog-backdrop') !== null, 5_000)).toBe(true)
++    // 关闭走 pop-sc3 同一套关闭路径(backdrop pointerdown)
++    const backdrop = document.querySelector('.changelog-backdrop') as HTMLElement
++    await act(async () => {
++      backdrop.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
++    })
++    expect(document.querySelector('.changelog-backdrop')).toBeNull()
++    // 等基线写入落定一拍再重挂载:rehydrate 读回的基线是更新后的 'B'
++    // (双机制:基线已更新 + 模块级判定标志;不断言落盘值,见 describe 头注释)
++    await flushPersistWrites()
++    act(() => root.unmount())
++    container.remove()
++    container = document.createElement('div')
++    document.body.appendChild(container)
++    root = createRoot(container)
++    await mountPlugin()
++    await waitHydratedApp()
++    expect(document.querySelector('.changelog-backdrop'), '同版本重新挂载不再弹').toBeNull()
++  })
++})
++
++describe('pop-sc4 ②③ 两套状态互不读写(store 层,经 maybeShowChangelogAutoPopup 真实路径)', () => {
++  beforeEach(async () => {
++    await __resetIdbPersist()
++    __resetChangelogAutoPopup()
++    resetStore()
++    await flushPersistWrites()
++  })
++
++  it('② 只调 markRead() 后 lastSeenVersion 不变;弹窗判定/写入不覆盖 lastRead', async () => {
++    const ISO = '2026-08-11T08:00:00.000Z'
++    useChangelogStore.setState({ updatedAt: ISO, lastRead: '', lastSeenVersion: 'A' })
++    await flushPersistWrites()
++    // markRead 只写 lastRead(红点);updatedAt 非空使其真实写盘,杜绝假绿
++    useChangelogStore.getState().markRead()
++    expect(useChangelogStore.getState().lastRead).toBe(ISO)
++    expect(useChangelogStore.getState().lastSeenVersion, 'markRead 不得触碰版本基线').toBe('A')
++    // 真实弹窗路径:版本 A→B 照常判定弹窗,且只更新 lastSeenVersion——
++    // 不得覆盖 markRead 刚写的 lastRead(反向变异「弹窗读写复用 lastRead」
++    // 下这里 lastRead 被写成 'B'、lastSeenVersion 仍 'A',本用例转红)。
++    expect(maybeShowChangelogAutoPopup('B')).toBe(true)
++    expect(useChangelogStore.getState().lastSeenVersion).toBe('B')
++    expect(useChangelogStore.getState().lastRead, '弹窗更新版本基线不得覆盖已读').toBe(ISO)
++  })
++
++  it('③ 只更新 lastSeenVersion 后 lastRead 不变、selectHasUnreadChangelog 结果不变', async () => {
++    const ISO = '2026-08-12T09:00:00.000Z'
++    useChangelogStore.setState({ loaded: true, updatedAt: ISO, lastRead: '', lastSeenVersion: '' })
++    await flushPersistWrites()
++    expect(selectHasUnreadChangelog(useChangelogStore.getState()), '前置:未读红点成立').toBe(true)
++    // 首装静默写基线:只更新 lastSeenVersion('B'),不弹(反向变异「弹窗读写
++    // 复用 lastRead」下基线写入落到 lastRead → lastRead==='' 断言转红,
++    // lastSeenVersion==='B' 断言也转红;selectHasUnreadChangelog 因
++    // updatedAt=ISO ≠ 'B' 仍 true,保持绿——用例整体红即满足 SC)。
++    expect(maybeShowChangelogAutoPopup('B')).toBe(false)
++    expect(useChangelogStore.getState().lastSeenVersion, '版本基线已更新').toBe('B')
++    expect(useChangelogStore.getState().lastRead, '更新版本基线不得触碰已读').toBe('')
++    expect(selectHasUnreadChangelog(useChangelogStore.getState()), '红点判定结果不变').toBe(true)
++  })
++})
+diff --git a/src/__tests__/changelogGeometryGuard.ts b/src/__tests__/changelogGeometryGuard.ts
+new file mode 100644
+index 00000000..2c26d998
+--- /dev/null
++++ b/src/__tests__/changelogGeometryGuard.ts
+@@ -0,0 +1,47 @@
++/**
++ * changelog 面板几何声明守卫的共享扫描形状。
++ *
++ * 两个消费方必须共用同一份实现(判据所有权,禁止各自内联再漂移):
++ *  · changelogAutoPopup.test.ts pop-sc3 ③ —— 扫「本 PR diff 的 added 行」;
++ *  · pluginChangelogEntry.test.tsx port-sc10 ② —— 扫「皮肤层 themeCss 当前文件」。
++ *
++ * 两个已实测的免疫形态(upstream-preview F1,本波修复):
++ *  1. **`+` 前缀免疫**:diff added 行带单个 `+` 前缀,旧形状 `(?:^|;)` 正则看不到
++ *     行首的 `position:`(前缀 `+` 挡在 `^` 与属性名之间)。修法:先逐行剥掉单个
++ *     `+` 再拼规则块;`+++` 文件头行一并跳过,不进扫描。
++ *  2. **块首位置免疫**:规则块首属性(选择器与 `{` 同行后紧跟的属性)前面没有分号,
++ *     旧形状 `(?:^|;)` 里 `^` 只匹配整个字符串开头(无 m),块首属性必然漏网。
++ *     修法:前导允许 `^`/`;`/`{` 三选,并开 `m` 使换行后的逐行属性也能命中。
++ *
++ * 反向变异(见 hardening-checklist 第 8 类)由两个测试文件各自的 describe 锁住:
++ * 退化回旧形状(无 m/无 `{` 前导、不剥 `+`)时,块首 position 与换行后
++ * display/place-items 的违规必须被放过 → 对应断言转红;纯皮肤声明保持绿。
++ */
++export const GEOMETRY_PROPS_RE =
++  /(?:^|;|\{)\s*(position|inset|top|right|bottom|left|display|place-items|width|height|padding|gap|border-radius|transform|margin|z-index)\s*:/gm
++
++/** `.changelog-backdrop` / `.changelog-panel` 的规则块(跨行,含块首)。 */
++export const CHANGELOG_RULE_RE = /\.changelog-(?:backdrop|panel)[^{}]*\{[^}]*\}/g
++
++/**
++ * diff 的 added 行:过滤 `+` 开头、跳过 `+++` 文件头,逐行剥离**单个** `+` 前缀。
++ * 剥离后的行才是 CSS 源文本,`^`/`;`/`{` 前导才能按 CSS 语义命中。
++ */
++export const diffAddedLines = (diff: string): string[] =>
++  diff
++    .split('\n')
++    .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
++    .map((line) => line.replace(/^\+/, ''))
++
++/** 对一组规则块声明体按几何属性正则过滤,返回命中块。re 可注入用于退化对照。 */
++export const scanBlocksForGeometry = (
++  blocks: string[],
++  re: RegExp = GEOMETRY_PROPS_RE,
++): string[] => blocks.filter((block) => block.match(re) !== null)
++
++/** 扫 diff 的 added 行中新增的 changelog 规则块,返回含几何声明的块。 */
++export const scanAddedGeometryViolations = (diff: string, re: RegExp = GEOMETRY_PROPS_RE): string[] => {
++  const added = diffAddedLines(diff).join('\n')
++  const blocks = [...added.matchAll(CHANGELOG_RULE_RE)].map((match) => match[0])
++  return scanBlocksForGeometry(blocks, re)
++}
+diff --git a/src/__tests__/mergeBaseGuard.ts b/src/__tests__/mergeBaseGuard.ts
+index 55dc839d..567feeac 100644
+--- a/src/__tests__/mergeBaseGuard.ts
++++ b/src/__tests__/mergeBaseGuard.ts
+@@ -18,9 +18,18 @@
+  *     时打印醒目横幅，且**调用方必须 `ctx.skip()`** 让结果显示为 skipped 而不是 passed。
+  */
+ import { execFileSync } from 'node:child_process'
++import { resolve } from 'node:path'
+ import { fileURLToPath } from 'node:url'
+ 
+-const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url))
++// happy-dom 环境的测试文件 import 本模块时,Vite 会把 new URL(rel,
++// import.meta.url) 静态转换成 http://localhost:3000/...(dev-server 资产 URL
++// 模式),fileURLToPath 直接炸「The URL must be of scheme file」。改用 Node 原生
++// import.meta.dirname 并 resolve 到仓根(本文件位于 cindyplugin/src/__tests__/,
++// 上两级是 cindyplugin,上三级才是仓根——dirname 本身是测试目录,不能直接当
++// REPO_ROOT);?? 短路保证 dirname 存在时右侧(含 URL 构造)不求值,fileURLToPath
++// 兜底仅服务无 dirname 的旧 Node 环境。
++const here = (import.meta as unknown as { dirname: string }).dirname
++const REPO_ROOT = here ? resolve(here, '../../..') : fileURLToPath(new URL('../../..', import.meta.url))
+ 
+ const git = (args: string[]): string =>
+   execFileSync('git', args, { cwd: REPO_ROOT, encoding: 'utf8' }).trim()
+@@ -69,6 +78,30 @@ const warnSkip = (label: string, detail: string): void => {
+   )
+ }
+ 
++/**
++ * 解析门禁基准（三档语义的 base 解析部分，供「读文件」与「跑 diff」两类守卫共用）。
++ *
++ * 显式 `MIVO_GUARD_BASE_SHA` 直接返回、不在此校验合法性——坏值的 throw 由调用方
++ * 后续 git 命令失败体现（readGuardBaseFile 的 git show 失败 throw 与 diff 守卫的
++ * execFileSync 抛错是同一语义，见下两条消费方注释）。
++ *
++ * @returns base sha；`null` 表示**允许跳过**（仅「本地 + 未显式指定基线 + 确实取不到」）。
++ *          返回 `null` 时已打印醒目横幅，调用方必须 `ctx.skip()`。
++ * @throws CI 下取不到 merge-base（fail-closed，不降级成跳过）。
++ */
++export const resolveGuardBase = (label: string): string | null => {
++  const explicit = explicitBase()
++  if (explicit) return explicit
++  try {
++    return git(['merge-base', 'HEAD', 'origin/main'])
++  } catch (error) {
++    const detail = `git merge-base HEAD origin/main 失败（${describeError(error)}）`
++    if (isCi()) failClosed(label, detail)
++    warnSkip(label, detail)
++    return null
++  }
++}
++
+ /**
+  * 读 merge-base（或 `MIVO_GUARD_BASE_SHA` 显式指定的基线）处的仓内文件内容。
+  *
+@@ -77,18 +110,9 @@ const warnSkip = (label: string, detail: string): void => {
+  * @throws 上述 ①②两档 fail-closed 情形。
+  */
+ export const readGuardBaseFile = (repoRelPath: string, label: string): string | null => {
++  const base = resolveGuardBase(label)
++  if (base === null) return null
+   const explicit = explicitBase()
+-  let base = explicit
+-  if (!base) {
+-    try {
+-      base = git(['merge-base', 'HEAD', 'origin/main'])
+-    } catch (error) {
+-      const detail = `git merge-base HEAD origin/main 失败（${describeError(error)}）`
+-      if (isCi()) failClosed(label, detail)
+-      warnSkip(label, detail)
+-      return null
+-    }
+-  }
+   try {
+     return git(['show', `${base}:${repoRelPath}`])
+   } catch (error) {
+diff --git a/src/__tests__/pluginCanvasSettings.test.tsx b/src/__tests__/pluginCanvasSettings.test.tsx
+index 4166e17a..85e03e0d 100644
+--- a/src/__tests__/pluginCanvasSettings.test.tsx
++++ b/src/__tests__/pluginCanvasSettings.test.tsx
+@@ -20,6 +20,7 @@ const { PluginApp } = await import('../PluginApp')
+ const { __resetCanvasAppearanceForTests, useCanvasAppearanceStore } = await import(
+   '../../../src/store/canvasAppearanceStore'
+ )
++const { t } = await import('../../../src/i18n')
+ 
+ let container: HTMLDivElement
+ let root: Root
+@@ -96,4 +97,16 @@ describe('PluginApp canvas settings entry', () => {
+     expect(document.querySelector('.canvas-settings-backdrop')).toBeNull()
+     expect(document.activeElement).toBe(gear)
+   })
++
++  it('locks the canvas settings nav to exactly the three sections in navigation order', () => {
++    click(container.querySelector('.plugin-settings-trigger')!)
++    const navItems = Array.from(document.querySelectorAll('.canvas-settings-nav-item'))
++    // 用序列而非集合:数量恰好 3 且与 navigation 数组顺序一一对应 —— 若有人把
++    // 'updates' tab 加回 navigation(或重排顺序),这条断言就是回归闸门。
++    expect(navItems.map((item) => item.textContent)).toEqual([
++      t('settings.canvas.nav.appearance'),
++      t('settings.canvas.nav.workflow'),
++      t('settings.canvas.nav.advanced'),
++    ])
++  })
+ })
+diff --git a/src/__tests__/pluginChangelogEntry.test.tsx b/src/__tests__/pluginChangelogEntry.test.tsx
+new file mode 100644
+index 00000000..5a5370fa
+--- /dev/null
++++ b/src/__tests__/pluginChangelogEntry.test.tsx
+@@ -0,0 +1,329 @@
++// @vitest-environment happy-dom
++// 插件「更新公告」入口的回归测试(port-sc3 / port-sc4 / port-sc8 / port-sc10)。
++// 几何位置断言按解析后的 CSS 声明值判定(happy-dom 下 getBoundingClientRect
++// 恒返回 0,量真实矩形走不到;包内判据二选一,本条取前者并在用例注释写明)。
++import { act } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { GEOMETRY_PROPS_RE } from './changelogGeometryGuard'
++
++// happy-dom 环境下 Vite 会把 new URL(rel, import.meta.url) 静态转换成
++// http://localhost:3000/...(dev-server 资产 URL 模式),fileURLToPath 直接炸。
++// 改用 Node 原生 import.meta.dirname(测试文件自身目录)做相对路径。
++const here = (import.meta as unknown as { dirname: string }).dirname
++
++const pluginState = vi.hoisted(() => ({ hydrated: true }))
++
++vi.mock('../usePluginHydration', () => ({ usePluginHydration: () => pluginState.hydrated }))
++vi.mock('../../../src/canvas/MivoCanvas', () => ({
++  MivoCanvas: () => <div data-testid="mivo-canvas" />,
++}))
++vi.mock('../../../src/app/ToastViewport', () => ({ ToastViewport: () => null }))
++vi.mock('../../../src/app/MediaLightbox', () => ({ MediaLightbox: () => null }))
++vi.mock('../../../src/app/DetailsTargetGuard', () => ({ DetailsTargetGuard: () => null }))
++vi.mock('../agent/depositMigration', () => ({
++  migrateLedgerIntoDepositStore: vi.fn(async () => ({ ok: true, skipped: true })),
++}))
++
++// PluginApp 在 hydrated 后调用 loadChangelog()(fetch /changelog.json):
++// stub 成空文档,避免真实网络请求与 toast 副作用。
++vi.stubGlobal(
++  'fetch',
++  vi.fn(async () => ({ ok: true, json: async () => ({}) })),
++)
++
++const { PluginApp } = await import('../PluginApp')
++const { useChangelogStore } = await import('../../../src/store/changelogStore')
++
++const themeCss = readFileSync(join(here, '../cindy-theme.css'), 'utf8')
++const appCss = readFileSync(join(here, '../../../src/App.css'), 'utf8')
++
++// ── 图标快照(port-sc3 expect ⑤):Cindy(lucide-react 0.468.0)实际渲染出的 Flame 几何。
++//    本仓 lucide 1.30.0 的同名 Flame path 不同(两仓版本不一致,「复用同一导出」不成立),
++//    PluginApp 用 createLucideIcon 内联本快照 —— 断言锁的是几何本身,不是组件名。
++const FLAME_VIEWBOX = '0 0 24 24'
++const FLAME_PATH_D =
++  'M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z'
++
++// 从 CSS 文本提取某选择器的规则块;取不到返回空串(由调用方断言非空)。
++const ruleOf = (css: string, selector: string): string => {
++  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
++  const match = css.match(new RegExp(`(?:^|\\n)${escaped} \\{([^}]*)\\}`))
++  return match?.[1] ?? ''
++}
++
++// 提取 themeCss 中选择器命中 selRe 的规则声明体列表
++const ruleBlocksOf = (css: string, selRe: RegExp): string[] => {
++  const blocks: string[] = []
++  const ruleRe = /([^{}]+)\{([^}]*)\}/g
++  let match: RegExpExecArray | null
++  while ((match = ruleRe.exec(css)) !== null) {
++    if (selRe.test(match[1])) blocks.push(match[2])
++  }
++  return blocks
++}
++
++const resetStore = () => {
++  useChangelogStore.setState({ entries: [], updatedAt: '', loaded: false, lastRead: '' })
++}
++
++let container: HTMLDivElement
++let root: Root
++
++const click = (element: Element) =>
++  act(() => {
++    if (element instanceof HTMLElement) element.focus()
++    element.dispatchEvent(new MouseEvent('click', { bubbles: true }))
++  })
++const pointerDown = (element: Element) =>
++  act(() => element.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })))
++
++const renderPlugin = () => {
++  container = document.createElement('div')
++  document.body.appendChild(container)
++  root = createRoot(container)
++  act(() => root.render(<PluginApp />))
++}
++
++describe('port-sc3 公告入口:Flame 在齿轮左侧', () => {
++  beforeEach(() => {
++    globalThis.IS_REACT_ACT_ENVIRONMENT = true
++    resetStore()
++    renderPlugin()
++  })
++
++  afterEach(() => {
++    act(() => root.unmount())
++    container.remove()
++    document.querySelector('.changelog-backdrop')?.remove()
++  })
++
++  it('几何位置:公告按钮的 right 严格大于齿轮且差值 ≥ 齿轮实际宽度(不重叠)', () => {
++    // 判定口径:解析后的 CSS 声明值(happy-dom 下 getBoundingClientRect 恒 0,
++    // 不量真实矩形;不重叠由 right 数值关系保证)。
++    // 齿轮宽度从 .plugin-settings-trigger 的 width 现读,不写死 34——齿轮尺寸
++    // 改动时若 .plugin-changelog-trigger 的 right 没跟着改,这里必须转红
++    // (而不是继续拿旧的 34 当门槛,让两个真实数字都变了但差值断言仍巧合通过)。
++    const gearRule = ruleOf(themeCss, '.plugin-settings-trigger')
++    const flameRule = ruleOf(themeCss, '.plugin-changelog-trigger')
++    const gearRight = Number(gearRule.match(/right:\s*(\d+)px/)?.[1] ?? NaN)
++    const flameRight = Number(flameRule.match(/right:\s*(\d+)px/)?.[1] ?? NaN)
++    const gearWidth = Number(gearRule.match(/width:\s*(\d+)px/)?.[1] ?? NaN)
++    expect(Number.isFinite(gearRight), '.plugin-settings-trigger 应有数值 right').toBe(true)
++    expect(Number.isFinite(flameRight), '.plugin-changelog-trigger 应有数值 right').toBe(true)
++    expect(Number.isFinite(gearWidth), '.plugin-settings-trigger 应有数值 width').toBe(true)
++    expect(flameRight, '公告按钮 right 应严格大于齿轮(视觉上在其左侧)').toBeGreaterThan(gearRight)
++    expect(flameRight - gearRight, '两按钮 right 差值 ≥ 齿轮实际宽度(不重叠)').toBeGreaterThanOrEqual(gearWidth)
++  })
++
++  it('DOM 顺序:公告按钮在齿轮之前(保 Tab 顺序)', () => {
++    const flame = container.querySelector('.plugin-changelog-trigger') as HTMLElement
++    const gear = container.querySelector('.plugin-settings-trigger') as HTMLElement
++    expect(flame).not.toBeNull()
++    expect(gear).not.toBeNull()
++    // flame.compareDocumentPosition(gear):返回 gear 相对 flame 的位置。
++    // flame 在 gear 之前 = gear 位于 flame 之后 = DOCUMENT_POSITION_FOLLOWING(4)
++    expect(flame.compareDocumentPosition(gear) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
++  })
++
++  it('点击后 .changelog-backdrop 出现,关闭后 focus 回到公告按钮', () => {
++    const flame = container.querySelector('.plugin-changelog-trigger') as HTMLElement
++    click(flame)
++    const backdrop = document.querySelector('.changelog-backdrop')
++    expect(backdrop).not.toBeNull()
++    expect(document.activeElement).toBe(document.querySelector('.changelog-panel'))
++
++    pointerDown(backdrop as Element)
++    expect(document.querySelector('.changelog-backdrop')).toBeNull()
++    expect(document.activeElement).toBe(flame)
++  })
++
++  it('图标同一性:svg 的 viewBox 与 path d 等于 Cindy 0.468.0 Flame 快照(不是 Sparkles)', () => {
++    const svg = container.querySelector('.plugin-changelog-trigger svg') as SVGSVGElement
++    expect(svg, '公告按钮应渲染 lucide svg').not.toBeNull()
++    expect(svg.getAttribute('viewBox')).toBe(FLAME_VIEWBOX)
++    const path = svg.querySelector('path')
++    expect(path, 'svg 应有 path 子节点').not.toBeNull()
++    expect(path!.getAttribute('d')).toBe(FLAME_PATH_D)
++    // lucide 类名 = createLucideIcon 名派生;Sparkles 的类名/几何均不同,几何断言已排除
++    expect(svg.getAttribute('class')).toContain('lucide-flame')
++  })
++})
++
++describe('port-sc4 backdrop 关闭契约:空白关闭/面板内不关/关闭按钮关', () => {
++  beforeEach(() => {
++    globalThis.IS_REACT_ACT_ENVIRONMENT = true
++    resetStore()
++    renderPlugin()
++  })
++
++  afterEach(() => {
++    act(() => root.unmount())
++    container.remove()
++    document.querySelector('.changelog-backdrop')?.remove()
++  })
++
++  // 三个用例都从真实装配路径打开面板:click 公告按钮 → PluginApp 渲染
++  // ChangelogPanel → createPortal 到 document.body 的真 backdrop(不手工搭)。
++  const openPanel = () => {
++    const flame = container.querySelector('.plugin-changelog-trigger') as HTMLElement
++    expect(flame).not.toBeNull()
++    click(flame)
++    const backdrop = document.querySelector('.changelog-backdrop')
++    expect(backdrop, '打开后应出现真 backdrop').not.toBeNull()
++    return backdrop as HTMLElement
++  }
++
++  it('① pointerDown 打在 .changelog-backdrop 自身 → 面板消失', () => {
++    const backdrop = openPanel()
++    pointerDown(backdrop)
++    expect(document.querySelector('.changelog-backdrop'), '点 backdrop 自身应关闭面板').toBeNull()
++  })
++
++  it('② pointerDown 打在 .changelog-panel 上 → 面板仍在', () => {
++    openPanel()
++    const panel = document.querySelector('.changelog-panel') as HTMLElement
++    expect(panel).not.toBeNull()
++    pointerDown(panel)
++    expect(document.querySelector('.changelog-backdrop'), '点面板内部不应关闭面板').not.toBeNull()
++    expect(document.querySelector('.changelog-panel'), '面板元素不应被卸载').toBe(panel)
++  })
++
++  it('③ click .changelog-header button → 面板消失', () => {
++    openPanel()
++    const closeBtn = document.querySelector('.changelog-header button') as HTMLButtonElement
++    expect(closeBtn, '关闭按钮应在 header 内').not.toBeNull()
++    click(closeBtn)
++    expect(document.querySelector('.changelog-backdrop'), '点关闭按钮应关闭面板').toBeNull()
++  })
++})
++
++describe('port-sc8 未读红点', () => {
++  beforeEach(() => {
++    globalThis.IS_REACT_ACT_ENVIRONMENT = true
++    resetStore()
++    renderPlugin()
++  })
++
++  afterEach(() => {
++    act(() => root.unmount())
++    container.remove()
++    document.querySelector('.changelog-backdrop')?.remove()
++  })
++
++  it('未读态(updatedAt ≠ lastRead):按钮内出现 .changelog-badge-dot', async () => {
++    await act(async () => {
++      useChangelogStore.setState({ loaded: true, updatedAt: '2026-08-10', lastRead: '' })
++    })
++    await act(async () => {}) // flush microtask(loadChangelog 的 fetch set)与订阅重渲染
++    const trigger = container.querySelector('.plugin-changelog-trigger') as HTMLElement
++    expect(trigger, `未读态 trigger 应存在; innerHTML=${container.innerHTML.slice(0, 300)}`).not.toBeNull()
++    expect(trigger.querySelector('.changelog-badge-dot'), '未读时应有红点').not.toBeNull()
++  })
++
++  it('markRead() 后红点消失', async () => {
++    await act(async () => {
++      useChangelogStore.setState({ loaded: true, updatedAt: '2026-08-10', lastRead: '' })
++    })
++    await act(async () => {})
++    const trigger = container.querySelector('.plugin-changelog-trigger') as HTMLElement
++    expect(trigger).not.toBeNull()
++    expect(trigger.querySelector('.changelog-badge-dot')).not.toBeNull()
++
++    await act(async () => {
++      useChangelogStore.getState().markRead()
++    })
++    await act(async () => {})
++    expect(trigger.querySelector('.changelog-badge-dot'), 'markRead 后红点应消失').toBeNull()
++  })
++
++  it('已读态(updatedAt === lastRead):从一开始就不存在红点', async () => {
++    await act(async () => {
++      useChangelogStore.setState({ loaded: true, updatedAt: '2026-08-10', lastRead: '2026-08-10' })
++    })
++    await act(async () => {})
++    const trigger = container.querySelector('.plugin-changelog-trigger') as HTMLElement
++    expect(trigger.querySelector('.changelog-badge-dot'), '已读时不应有红点').toBeNull()
++  })
++})
++
++describe('port-sc10 面板几何不被皮肤层覆写', () => {
++  // ① App.css 几何声明逐字命中(提取到空集即红,防锚点取错)
++  it('backdrop 仍是 fixed/inset 0/grid/居中', () => {
++    const backdrop = ruleOf(appCss, '.changelog-backdrop')
++    expect(backdrop).toContain('position: fixed')
++    expect(backdrop).toContain('inset: 0')
++    expect(backdrop).toContain('display: grid')
++    expect(backdrop).toContain('place-items: center')
++  })
++
++  it('panel 尺寸仍是 min(820px, calc(100vw - 48px)) × min(580px, calc(100vh - 48px))', () => {
++    const panel = ruleOf(appCss, '.changelog-panel')
++    expect(panel).toContain('width: min(820px, calc(100vw - 48px))')
++    expect(panel).toContain('height: min(580px, calc(100vh - 48px))')
++  })
++
++  // ② 皮肤层对这两个选择器不声明任何几何属性(命中数恰为 0)。共享正则
++  // GEOMETRY_PROPS_RE(与 pop-sc3 ③ 同一份):m + { 前导使块首属性与逐行属性都能命中。
++  it('皮肤层对 .changelog-backdrop/.changelog-panel 的几何属性命中数为 0', () => {
++    const blocks = ruleBlocksOf(themeCss, /\.changelog-backdrop|\.changelog-panel/)
++    let total = 0
++    for (const decl of blocks) {
++      total += decl.match(GEOMETRY_PROPS_RE)?.length ?? 0
++    }
++    expect(total, '皮肤层不得为面板选择器声明几何属性').toBe(0)
++  })
++
++  // ③ 皮肤层若声明 box-shadow(为换色),offset/blur/spread 必须仍是 0 24px 64px
++  it('皮肤层 box-shadow(若声明)保持 0 24px 64px', () => {
++    const blocks = ruleBlocksOf(themeCss, /\.changelog-panel/)
++    for (const decl of blocks) {
++      const shadow = decl.match(/box-shadow:\s*([^;]+);?/)
++      if (!shadow) continue
++      const segments = shadow[1].trim().split(/\s+/).slice(0, 3)
++      expect(segments.join(' '), '皮肤层投影只允许换颜色,offset/blur/spread 不得改').toBe('0 24px 64px')
++    }
++  })
++})
++
++describe('port-sc10 皮肤层几何扫描:反向变异与对照(共享 GEOMETRY_PROPS_RE)', () => {
++  // fixture 选择器拆字构造(与 changelogAutoPopup.test.ts 同款说明):本文件源行会被
++  // pop-sc3 ③ 的真 diff 扫描(未提交时),不能出现「.changelog-backdrop {」字面形态,
++  // 否则剥 + 后的行内文本会被当成新增几何声明而误红。
++  const sel = (name: string): string => '.changelog' + name
++  const hitsIn = (css: string): string[] =>
++    ruleBlocksOf(css, new RegExp('\\.changelog' + '-backdrop|\\.changelog' + '-panel')).flatMap(
++      (decl) => decl.match(GEOMETRY_PROPS_RE) ?? [],
++    )
++
++  it('反向变异:块首首属性 position/inset 必须命中(旧形状 ^ 无 m 会放过)', () => {
++    const css = [sel('-backdrop {'), '  position: fixed;', '  inset: 0;', '}'].join('\n')
++    expect(hitsIn(css), '块首 position/inset 必须命中').toHaveLength(2)
++  })
++
++  it('反向变异:换行后的 display/place-items 必须命中(逐行属性)', () => {
++    const css = [sel('-panel {'), '  display: flex;', '  place-items: center;', '}'].join('\n')
++    expect(hitsIn(css), '换行后的 display/place-items 必须命中').toHaveLength(2)
++  })
++
++  it('绿对照:纯皮肤声明(background/color/border-color)命中数为 0', () => {
++    const css = [
++      sel('-panel {'),
++      '  background: #fff;',
++      '  color: var(--text);',
++      '  border-color: #ccc;',
++      '}',
++    ].join('\n')
++    expect(hitsIn(css), '皮肤声明不得命中几何扫描').toHaveLength(0)
++  })
++
++  it('退化对照:旧形状正则(无 m/无 { 前导)对块首 position 免疫 → 证明 m/{ 前导在咬', () => {
++    const legacy =
++      /(?:^|;)\s*(position|inset|top|right|bottom|left|display|place-items|width|height|padding|gap|border-radius|transform|margin|z-index)\s*:/g
++    const css = [sel('-backdrop {'), '  position: fixed;', '}'].join('\n')
++    expect(css.match(legacy), '旧形状免疫 = F1 修复的免疫形态').toBeNull()
++    expect(hitsIn(css), '共享正则必须命中块首 position').toHaveLength(1)
++  })
++})
+diff --git a/src/__tests__/pluginChangelogHydration.test.tsx b/src/__tests__/pluginChangelogHydration.test.tsx
+new file mode 100644
+index 00000000..73bf94e9
+--- /dev/null
++++ b/src/__tests__/pluginChangelogHydration.test.tsx
+@@ -0,0 +1,178 @@
++// @vitest-environment happy-dom
++//
++// port-sc7-persist-wired-both-hooks 集成用例(**不 mock usePluginHydration**):
++// changelogStore 的 persist 分区必须在两个装配点被显式接线——cindyplugin 的
++// usePluginHydration 与 src/app 的 useStoreHydration。本文件两侧各挂一个真实 hook,
++// 各自必须有独立的反向变异红。
++//
++// 时序设计(保证反向变异必红):
++// 1. 文件加载时 import changelogStore → persist 中间件**自动 rehydrate**(该分区无
++//    skipHydration)对空库跑一次,lastRead 停留默认空串;顶层 waitFor
++//    persist.hasHydrated() 确定性等它 settle——否则自动 rehydrate 的 getItem 排到
++//    预写之后就会把 lastRead 恢复出来,删掉装配点接线照样绿,变异将不红。
++// 2. beforeEach 用生产 strictIdbStateStorage(与 changelogStore 同一实例、无 auth
++//    命名空间——SC 要求的独立 IDB key 形态)预写 mivo-changelog-lastread 信封,
++//    回读校验真实落盘(防假成功)。
++// 3. 驱动真实 hook 到 hydrated=true → 断言 useChangelogStore.getState().lastRead
++//    正是预写值而非默认空串。预写之后唯一能读到它的路径就是装配点里那条
++//    rehydrate()。
++//
++// 反向变异:删 usePluginHydration 里那条 → 插件侧用例红、网页侧用例保持绿;
++// 删 useStoreHydration 里那条 → 反过来。两红互相独立,一条断言兼顾两边不算通过。
++//
++// lastSeenVersion 刻意不断言:该字段由 wave 2 的 pop-sc1 引入并承接,本 SC 断言它
++// 会与 pop-sc1 成环(执行期实证的死锁)。
++import 'fake-indexeddb/auto'
++import { act, useEffect } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// ── 宿主桥桩(测试环境无宿主 IPC)────────────────────────────────────
++// 这些模块依赖 bridge.persistRequest,桩掉不影响本测试的唯一观测链:
++// hook 本体真实执行 → Promise.all → useChangelogStore.persist.rehydrate()
++// → changelogLastReadStorage(strictIdbStateStorage,真实)→ fake-indexeddb。
++vi.mock('../persist/persistSync', () => ({
++  restoreFromDiskIfEmpty: vi.fn(async () => 'empty'),
++  startAutoSave: vi.fn(),
++}))
++vi.mock('../agent/pendingWriteDrain', () => ({
++  drainPendingCanvasWrites: vi.fn(async () => ({
++    outcome: 'empty',
++    applied: 0,
++    rejected: 0,
++    expired: 0,
++    superseded: 0,
++    deferredByBinding: 0,
++    queueFull: false,
++  })),
++}))
++// useStoreHydration 侧:无宿主时 /api/auth/me 不可达;fetchMe 桩成已认证用户,让
++// auth.hydrate 走 'ok' 路径(Promise.all 才执行)。changelog 键走 strictIdbStateStorage
++// (无 auth 命名空间,插件侧刻意不调 authStore.hydrate),不受 uid 影响。
++const { fetchMeMock } = vi.hoisted(() => ({ fetchMeMock: vi.fn() }))
++vi.mock('../../../src/lib/authClient', () => ({
++  fetchMe: fetchMeMock,
++  AuthError: class AuthError extends Error {},
++}))
++// fire-and-forget 的 settle 会发网络请求,桩成 no-op
++vi.mock('../../../src/store/chatTaskReconcile', () => ({
++  reconcileExpiredChatTasks: vi.fn(async () => undefined),
++}))
++
++const {
++  strictIdbStateStorage,
++  __resetIdbPersist,
++  __resetIdbOperationalProbeForTests,
++} = await import('../../../src/lib/persistIdbStorage')
++const { __resetKernelDegradationForTests } = await import('../../../src/app/kernelMode')
++const { useChangelogStore } = await import('../../../src/store/changelogStore')
++const { usePluginHydration } = await import('../usePluginHydration')
++const { useStoreHydration } = await import('../../../src/app/useStoreHydration')
++
++const PERSIST_KEY = 'mivo-changelog-lastread'
++// 两侧刻意用**不同的** ISO:两个 describe 共享同一 store 实例与同一 IDB 库,
++// 上一条用例的接线 rehydrate 会把 lastRead 内存态留在自己的值上——若两侧同值,
++// 「预写后无接线读取」会被残留内存态撑成假绿(变异 2 假绿实测翻车)。值不同时
++// 残留值 ≠ 本侧断言值,删接线必红。
++const ISO_PLUGIN = '2026-08-11T10:00:00.000Z'
++const ISO_WEB = '2026-08-11T11:00:00.000Z'
++// 与生产 migrateLegacyLastRead / zustand persist 同款信封
++const envelopeFor = (iso: string): string => JSON.stringify({ state: { lastRead: iso }, version: 0 })
++
++const waitFor = async (predicate: () => boolean, timeoutMs: number, intervalMs = 25): Promise<boolean> => {
++  const deadline = Date.now() + timeoutMs
++  while (Date.now() < deadline) {
++    if (predicate()) return true
++    await new Promise((resolve) => setTimeout(resolve, intervalMs))
++  }
++  return predicate()
++}
++
++// 自动 rehydrate 必须确定性地在预写之前 settle(见文件头注释)。
++await waitFor(() => useChangelogStore.persist.hasHydrated(), 5_000)
++expect(useChangelogStore.getState().lastRead).toBe('') // 前提自检:自动 rehydrate 读到的是空库
++
++const observed = { hydrated: false }
++
++function PluginHarness() {
++  const hydrated = usePluginHydration()
++  useEffect(() => {
++    observed.hydrated = hydrated
++  }, [hydrated])
++  return null
++}
++
++function StoreHarness() {
++  const hydrated = useStoreHydration()
++  useEffect(() => {
++    observed.hydrated = hydrated
++  }, [hydrated])
++  return null
++}
++
++/** 用生产 strictIdbStateStorage(与 changelogStore 同一实例)预写分区信封,
++ *  写后回读校验真实落盘(fake-indexeddb 下不会失败,但断言在就防假成功)。 */
++const seedPersistedLastRead = async (iso: string): Promise<void> => {
++  const envelope = envelopeFor(iso)
++  await strictIdbStateStorage.setItem(PERSIST_KEY, envelope)
++  expect(await strictIdbStateStorage.getItem(PERSIST_KEY)).toBe(envelope)
++}
++
++let container: HTMLDivElement | undefined
++let root: Root | undefined
++
++const mountHarness = async (harness: React.JSX.Element): Promise<void> => {
++  ;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++  container = document.createElement('div')
++  document.body.appendChild(container)
++  root = createRoot(container)
++  await act(async () => {
++    root!.render(harness)
++  })
++  await act(async () => {
++    await new Promise((resolve) => setTimeout(resolve, 0))
++  })
++}
++
++const teardown = (): void => {
++  act(() => root?.unmount())
++  container?.remove()
++  container = undefined
++  root = undefined
++}
++
++describe('port-sc7: usePluginHydration 装配点(插件侧水合门)', () => {
++  beforeEach(async () => {
++    await __resetIdbPersist()
++    __resetIdbOperationalProbeForTests()
++    __resetKernelDegradationForTests()
++    observed.hydrated = false
++  })
++  afterEach(teardown)
++
++  it('预写 lastRead → 真实 hook hydrated=true 后 lastRead 恢复为预写值', async () => {
++    await seedPersistedLastRead(ISO_PLUGIN)
++    await mountHarness(<PluginHarness />)
++    expect(await waitFor(() => observed.hydrated, 5_000)).toBe(true)
++    expect(useChangelogStore.getState().lastRead).toBe(ISO_PLUGIN)
++  })
++})
++
++describe('port-sc7: useStoreHydration 装配点(网页侧水合门,同构用例)', () => {
++  beforeEach(async () => {
++    await __resetIdbPersist()
++    __resetIdbOperationalProbeForTests()
++    __resetKernelDegradationForTests()
++    observed.hydrated = false
++    fetchMeMock.mockReset()
++    fetchMeMock.mockResolvedValue({ authenticated: true, user: { id: 'user-u', name: 'U' } })
++  })
++  afterEach(teardown)
++
++  it('预写 lastRead → auth ok 后真实 hook hydrated=true,lastRead 恢复为预写值', async () => {
++    await seedPersistedLastRead(ISO_WEB)
++    await mountHarness(<StoreHarness />)
++    expect(await waitFor(() => observed.hydrated, 10_000)).toBe(true)
++    expect(useChangelogStore.getState().lastRead).toBe(ISO_WEB)
++  })
++})
+diff --git a/src/changelogAutoPopup.ts b/src/changelogAutoPopup.ts
+new file mode 100644
+index 00000000..a9b7466a
+--- /dev/null
++++ b/src/changelogAutoPopup.ts
+@@ -0,0 +1,82 @@
++// 更新公告「自动弹窗」判定(changelog-port 需求⑤,优先级 p2-auto-popup)。
++//
++// 职责:hydration 完成后比对「当前版本」与持久化的 lastSeenVersion,返回是否
++// 该弹公告面板——真正的面板挂载由 PluginApp 的接线负责,与手动 Flame 入口
++// (openChangelog)共用同一个渲染入口与同一套关闭路径(backdrop pointerdown /
++// 面板内关闭按钮,pop-sc3-reuse-panel-class-not-values)。
++//
++// 版本由**函数参数注入**:默认实参取 import.meta.env.VITE_MIVO_VERSION
++// (cindyplugin/vite.config.ts 的 resolvePluginAppVersion——build 取 ghost.json
++// 的 version,serve 恒为 'cindy-plugin-dev')。模块内部除默认实参外不直接读
++// env:dev 下版本永不变化,本地弹一次之后再也不弹;单测里 env 也不是可靠的
++// 驱动手段。版本可注入之后,测试才能真的构造出「版本变了」这个条件
++// (pop-sc1-version-injectable;源码级门禁见 __tests__/changelogAutoPopup.test.ts
++// 的 import.meta.env 静态扫描)。
++import { useChangelogStore } from '../../src/store/changelogStore'
++import { debugLogger } from '../../src/store/debugLogStore'
++
++const SOURCE = 'Changelog'
++
++// 模块级「本会话已判定」标志。与 canvasWriteGate 的 hydrationComplete 同形态
++// (模块级状态跨组件挂载存活),但**没有**与之配对的 begin 复位:canvasWriteGate
++// 每轮 hydration 开始要复位,是因为它的判据是「本轮是否完成」;这里判据是
++// 「本会话是否已判定」,面板重新挂载(面板重开 / 热重载 / 宿主重挂)必须**继续**
++// 跳过——复位会重新打开竞态窗口。
++let autoPopupDecided = false
++
++/**
++ * 自动弹窗判定。返回 true = 应该弹面板(当前版本 ≠ 持久化的 lastSeenVersion);
++ * false = 不弹。
++ *
++ * 四条分支都记 Debug Log(docs/development-logging.md:「跳过不可用路径的操作
++ * 都必须写 Debug Log」)——本函数每次 hydration 后必跑一次,首装跳过与同版本
++ * 跳过若不留痕,「这次启动到底判了哪条分支」在诊断时无从查起(与
++ * usePluginHydration.ts 的 `disk restore: <mode>` 同一惯例:每次都记,不只记
++ * 异常分支)。
++ *
++ * · 首次安装(持久化没有 lastSeenVersion):静默把当前版本写入持久化作为基线,
++ *   不弹——首装弹「更新公告」没有意义,用户没有上一版可对比,第一次打开画布
++ *   就被全屏遮罩挡住是负体验(pop-sc2-first-install-silent);基线这一步不能省,
++ *   省了下次启动仍是空值,会在第二次启动时误弹。
++ * · 版本不同:弹,并立即把当前版本写进持久化——下次同版本启动不再弹。
++ * · 版本相同:不弹。
++ * · 本会话已判定过(模块级标志已置位):直接跳过,不重复判定。
++ */
++export const maybeShowChangelogAutoPopup = (
++  version: string = import.meta.env.VITE_MIVO_VERSION,
++): boolean => {
++  // 一个浏览器会话只判一次,置位在**入口**而不是判定之后。版本在运行时不会
++  // 变化(build 时由 vite.config.ts 的 resolvePluginAppVersion 注入,serve 恒为
++  // 'cindy-plugin-dev'),所以「判过就跳过」不会漏掉真实的版本变化。而组件局部
++  // 状态(usePluginHydration 的 useState)跨挂载不存活,PluginApp 每次重新挂载
++  // 都会让 [hydrated] effect 重跑一次本函数——若每次都重判,上一次判定写入的
++  // 基线(lastSeenVersion)在异步 IDB 写尚未落盘时(重挂载后 rehydrate 把旧值
++  // 合并回来),同一版本会弹两次。入口置位保证写入在途时的第二次挂载也跳过,
++  // 这正是竞态窗口。
++  if (autoPopupDecided) {
++    debugLogger.log(SOURCE, 'already decided this session, auto popup skipped')
++    return false
++  }
++  autoPopupDecided = true
++  const { lastSeenVersion } = useChangelogStore.getState()
++  if (lastSeenVersion === '') {
++    useChangelogStore.setState({ lastSeenVersion: version })
++    debugLogger.log(SOURCE, `first install: wrote baseline version "${version}", auto popup skipped`)
++    return false
++  }
++  if (lastSeenVersion !== version) {
++    useChangelogStore.setState({ lastSeenVersion: version })
++    debugLogger.log(SOURCE, `version changed "${lastSeenVersion}" -> "${version}", showing auto popup`)
++    return true
++  }
++  debugLogger.log(SOURCE, `version unchanged ("${version}"), auto popup skipped`)
++  return false
++}
++
++/**
++ * 仅供测试:模块级判定标志跨用例泄漏,每用例 beforeEach 归零(命名与导出风格
++ * 照 persistIdbStorage.ts 的 __resetIdbPersist)。
++ */
++export const __resetChangelogAutoPopup = (): void => {
++  autoPopupDecided = false
++}
+diff --git a/src/cindy-theme.css b/src/cindy-theme.css
+index 09639652..b56a0fde 100644
+--- a/src/cindy-theme.css
++++ b/src/cindy-theme.css
+@@ -128,6 +128,37 @@
+   transform: scale(0.96);
+ }
+ 
++/* 更新公告入口(port-sc3):齿轮左侧的 Flame。外观复用齿轮的 34×34 / z-index:70 /
++   圆形 / color-mix 口径;right 取 14 + 34(齿轮宽) + 8(间距),top 同为 14px ——
++   齿轮是 absolute 脱离正常流,「齿轮左侧」是几何位置声明,必须给本按钮自己的
++   right 值,JSX 顺序只保证 Tab 焦点顺序与视觉顺序一致。 */
++.plugin-changelog-trigger {
++  position: absolute;
++  top: 14px;
++  right: 56px;
++  z-index: 70;
++  display: grid;
++  place-items: center;
++  width: 34px;
++  height: 34px;
++  padding: 0;
++  color: color-mix(in srgb, var(--text-primary, #232323) 78%, var(--surface, #fffaf0));
++  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 92%, var(--text-primary, #232323) 8%);
++  border: 1px solid color-mix(in srgb, var(--text-primary, #232323) 16%, var(--border-default, #d6d0c6));
++  border-radius: 999px;
++  box-shadow: 0 8px 22px color-mix(in srgb, var(--text-primary, #232323) 14%, transparent);
++  cursor: pointer;
++}
++
++.plugin-changelog-trigger:hover {
++  color: var(--text-primary, #232323);
++  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 84%, var(--text-primary, #232323) 16%);
++}
++
++.plugin-changelog-trigger:active {
++  transform: scale(0.96);
++}
++
+ /* 画布设置浮层**刻意没有插件专属规则**:壳体、导航、行标签、分段控件在 App.css
+    里已经全部走 --panel-2 / --panel / --ink,而本文件顶部已把这三者映射到宿主
+    token,换肤自动跟随。曾经有过一份逐条复写,拆掉的两个理由记下来防再犯:
+@@ -404,3 +435,52 @@
+ /* ── 选区快捷工具条(单选/多选浮条 + 文字排版条):刻意不做主题跟随 ──
+    用户决定(2026-07-31):浮条永远保持 App.css 的深色块(rgba(28,28,27) 底 +
+    米白字),Light/Dark 换肤都不影响——不要给它加主题化规则。 */
++
++/* ── 更新公告面板的皮肤跟随(dark-sc1)──────────────────────────────
++   App.css:1420-1691 的 changelog 段是 11 条裸色值 / 0 条 color-mix,暗色下
++   面板就是一块亮白贴纸(region-edit 半暗半亮事故同型,见本文件 :262-300 的
++   region-edit 段)。这里按 region-edit 段的同一口径逐条覆写:底/描边用
++   color-mix(in srgb, var(--text-primary, …) N%, var(--surface-elevated, …))。
++
++   刻意例外只有一处:**:1455 的 box-shadow(投影)不接肤**。裁决见本文件
++   「画布设置浮层」段(2026-08-09 白色光晕实拍):阴影属于"光"不属于"皮肤",
++   沿用 App.css
++   的固定深色;若确需微调只允许改固定深色的 alpha,offset/blur/spread 保持
++   0 24px 64px(port-sc10 ③ 同一判据)。changelogTheme.test.ts 对此有硬断言
++   ——投影含 var(--text-*) 或以文字色为前景的 color-mix 即判红。 */
++.changelog-badge-dot {
++  /* 红点是图形标识,不是文字:必须与面板底保持 ≥3:1(暗色下文字色是亮的,
++     掺文字色只会把它提亮到跟面板一样,永远到不了 3)。取固定亮红 #e05545,
++     Light/Dark 两档实测对比 3.23 / 3.04(见 changelogTheme.test.ts dark-sc5)。 */
++  background: #e05545;
++}
++
++.changelog-backdrop {
++  background: color-mix(in srgb, var(--text-primary, #232323) 28%, transparent);
++}
++
++.changelog-panel {
++  background: color-mix(in srgb, var(--text-primary, #232323) 6%, var(--surface-elevated, #fffaf0));
++  border-color: color-mix(in srgb, var(--text-primary, #232323) 10%, var(--border-default, #d6d0c6));
++}
++
++.changelog-header button {
++  background: color-mix(in srgb, var(--text-primary, #232323) 5%, transparent);
++}
++
++.changelog-header button:hover {
++  background: color-mix(in srgb, var(--text-primary, #232323) 9%, transparent);
++}
++
++.changelog-carousel-arrow {
++  background: color-mix(in srgb, var(--text-primary, #232323) 5%, transparent);
++}
++
++.changelog-carousel-arrow:hover:not(:disabled) {
++  background: color-mix(in srgb, var(--text-primary, #232323) 9%, transparent);
++}
++
++.changelog-day {
++  background: color-mix(in srgb, var(--text-primary, #232323) 3%, var(--surface-elevated, #fffaf0));
++  border-color: color-mix(in srgb, var(--text-primary, #232323) 7%, var(--border-default, #d6d0c6));
++}
+diff --git a/src/usePluginHydration.ts b/src/usePluginHydration.ts
+index 6ce192fa..790251de 100644
+--- a/src/usePluginHydration.ts
++++ b/src/usePluginHydration.ts
+@@ -1,5 +1,6 @@
+ import { useEffect, useState } from 'react'
+ import { useCanvasStore } from '../../src/store/canvasStore'
++import { useChangelogStore } from '../../src/store/changelogStore'
+ import { useSettingsStore } from '../../src/store/settingsSlice'
+ import { debugLogger } from '../../src/store/debugLogStore'
+ import { beginCanvasHydration, markCanvasHydrationComplete } from '../../src/agent/canvasWriteGate'
+@@ -45,6 +46,10 @@ export function usePluginHydration(): boolean {
+         await Promise.all([
+           useCanvasStore.persist.rehydrate(),
+           useSettingsStore.persist.rehydrate(),
++          // port-sc7:changelogStore 分区(未设 skipHydration,自动 rehydrate 与本
++          // 编排无同步关系)必须挂在这条链上才有确定的恢复时机——与 settings 同
++          // 理走 strictIdbStateStorage(无 auth 命名空间,与插件侧不调 auth 一致)。
++          useChangelogStore.persist.rehydrate(),
+         ])
+         startAutoSave()
+       } catch (error) {

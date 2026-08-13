@@ -1,0 +1,341 @@
+diff --git a/cindyplugin/src/__tests__/mivoRouteSafety.test.ts b/cindyplugin/src/__tests__/mivoRouteSafety.test.ts
+new file mode 100644
+index 00000000..c9199122
+--- /dev/null
++++ b/cindyplugin/src/__tests__/mivoRouteSafety.test.ts
+@@ -0,0 +1,335 @@
++/**
++ * Mivo 分流契约 · 安全边界部分(SC-A2 阶段矩阵与接线 / SC-A3 双扣费边界 /
++ * SC-A5 凭证 canary / SC-A4.6 诊断留痕)。共享脚手架见 mivoRouteHarness。
++ */
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { attachPanelBridge } from './brainHarness'
++import { CANARY, jsonOk, makeBrain, runOnce, SIGNED_URL, stageCounts, upstream } from './mivoRouteHarness'
++import type { BrainRun, FetchReply, FetchRequest } from './mivoRouteHarness'
++import { flushMicrotasks } from './brainHarness'
++
++// ── SC-A2.5:normalizer 5 个响应派生码 ─────────────────────────────────────
++describe('SC-A2.5 normalizeMivoReply:{ok,status} → 5 个响应派生码', () => {
++  it('逐项映射 + 2xx 通行', async () => {
++    const run = makeBrain({})
++    await flushMicrotasks()
++    const normalize = run.brain.handles.mivo.normalizeReply
++    expect(normalize({ ok: true, status: 200 })).toBeNull()
++    expect(normalize({ ok: true, status: 204 })).toBeNull()
++    expect(normalize({ ok: true, status: 401 })).toBe('MIVO_AUTH_INVALID')
++    expect(normalize({ ok: true, status: 403 })).toBe('MIVO_AUTH_FORBIDDEN')
++    expect(normalize({ ok: true, status: 429 })).toBe('MIVO_UPSTREAM_BUSY')
++    expect(normalize({ ok: true, status: 500 })).toBe('MIVO_UPSTREAM_BUSY')
++    expect(normalize({ ok: true, status: 404 })).toBe('MIVO_UPSTREAM_ERROR')
++    expect(normalize({ ok: false, message: 'anything' })).toBe('MIVO_TRANSPORT_UNKNOWN')
++    expect(normalize(null)).toBe('MIVO_TRANSPORT_UNKNOWN')
++  })
++
++  // 三条真实 caller 的接线:同一个 401,text/upload/media 三条路径必须给同一个码。
++  // (修复前 mivoFetchMedia 连 status 都不看——下载 401 会被读成"媒体缺失"。)
++  it('text caller(chat 端点)接线:401 → AUTH_INVALID', async () => {
++    const run = await runOnce({
++      secretSaved: true,
++      fetch: upstream((r) => (String(r.url).endsWith('/message/chat') ? { ok: true, status: 401 } : null)),
++    })
++    expect(run.reply.code).toBe('MIVO_AUTH_INVALID')
++    expect(stageCounts(run.brain.fetchRequests).chat).toBe(1)
++  })
++  it('upload caller 接线(edit):401 → AUTH_INVALID', async () => {
++    const run = await runOnce({
++      kind: 'edit',
++      secretSaved: true,
++      fetch: upstream((r) => (r.upload ? { ok: true, status: 401 } : null)),
++    })
++    expect(run.reply.code).toBe('MIVO_AUTH_INVALID')
++    expect(stageCounts(run.brain.fetchRequests).upload).toBe(1)
++  })
++  it('media caller 接线(签名地址取件):401 → AUTH_INVALID', async () => {
++    // 故障注入面必须**恰好落在 media caller 自己那条腿**上,否则这条用例名不符实:
++    // ① 直下腿(`/file/download/`)的失败被 mivoTakeImage 的 `catch {}` 吞掉后回落
++    //    signUrl,直下的分类码在 reply 层结构上不可观测 —— 注在那里锁不住任何东西;
++    // ② `/file/signUrl/` 是 **text** caller(mivoFetchText),注在那里锁的是 text 腿,
++    //    与本用例声称的 media caller 无关(此前双坏写法就栽在这里:把 mivoFetchMedia
++    //    的归一器整段删掉,用例照样绿)。
++    // 所以:让直下返 2xx 但不带 media(→ 返回 null,合法地走到 signUrl 腿),signUrl
++    // 文本正常,**只让签名地址本身返 401** —— 这时 401 必须由 mivoFetchMedia 的归一器
++    // 分类、经品牌重抛原样传到 reply。删掉那处接线则 401 被读成"媒体缺失"→ INTERNAL,
++    // 用例立刻红。
++    const run = await runOnce({
++      secretSaved: true,
++      fetch: upstream((r) => {
++        const url = String(r.url)
++        if (url.includes('/file/download/')) return { ok: true, status: 200 }
++        if (url === SIGNED_URL) return { ok: true, status: 401 }
++        return null
++      }),
++    })
++    expect(run.reply.code).toBe('MIVO_AUTH_INVALID')
++    expect(run.brain.fetchRequests.map((r) => String(r.url ?? ''))).toContain(SIGNED_URL)
++  })
++})
++
++// ── SC-A2.6:2xx 语义失败与代办自身失败 ─────────────────────────────────────
++describe('SC-A2.6 2xx 后语义失败与代办失败的接线', () => {
++  it('chat 返回 200 但缺会话 id → MIVO_INTERNAL,零 submit', async () => {
++    const run = await runOnce({
++      secretSaved: true,
++      fetch: upstream((r) => (String(r.url).endsWith('/message/chat') ? jsonOk({}) : null)),
++    })
++    expect(run.reply.code).toBe('MIVO_INTERNAL')
++    const stages = stageCounts(run.brain.fetchRequests)
++    expect(stages.chat).toBe(1)
++    expect(stages.submit).toBe(0)
++    expect(run.cindyRequests).toHaveLength(0)
++  })
++
++  it('poll 返回 200 且 status:failed → MIVO_INTERNAL,零代办', async () => {
++    const run = await runOnce({
++      secretSaved: true,
++      fetch: upstream((r) =>
++        String(r.url).includes('/api/v1/message/job-') ? jsonOk({ content: { status: 'failed', images: [] } }) : null,
++      ),
++    })
++    expect(run.reply.code).toBe('MIVO_INTERNAL')
++    expect(run.cindyRequests).toHaveLength(0)
++  })
++
++  it('unconfigured 代办自身失败 → CINDY_FALLBACK_FAILED,宿主 raw 不进回执(canary)', async () => {
++    const run = await runOnce({
++      secretSaved: false,
++      hostReply: { ok: false, message: `host error ${CANARY}` },
++    })
++    expect(run.reply.ok).toBe(false)
++    expect(run.reply.code).toBe('CINDY_FALLBACK_FAILED')
++    expect(JSON.stringify(run.reply)).not.toContain(CANARY)
++    // 诊断也不含 canary 及其 ≥8 字符子串
++    const spy = attachPanelBridge(run.brain).spy
++    const allDiag = spy.calls.map((e) => e.message).join('\n')
++    expect(allDiag).not.toContain(CANARY)
++    expect(allDiag).not.toContain(CANARY.slice(0, 8))
++  })
++})
++
++// ── 签名地址取件:闭集码原样透出(收口审阻断 2 的回归锁)──────────────────
++describe('签名地址取件失败:闭集码不被覆写成 INTERNAL', () => {
++  const signedFail = (status: number) => (r: FetchRequest): FetchReply | null => {
++    const url = String(r.url ?? '')
++    if (url.includes('/file/download/')) return { ok: true, status: 200, body: '{"status":"pending"}' } // 同源直下拿不到媒体
++    if (url.startsWith('https://mivo-oss.example.com/')) return { ok: true, status: status }
++    return null
++  }
++  const CASES: Array<[number, string]> = [
++    [401, 'MIVO_AUTH_INVALID'], //   → 「去设置页查 Key」的动作语义必须保住
++    [403, 'MIVO_AUTH_FORBIDDEN'],
++    [429, 'MIVO_UPSTREAM_BUSY'], //  → 「稍后重试」,不得误导用户去改一个好 Key
++    [500, 'MIVO_UPSTREAM_BUSY'],
++  ]
++  for (const [status, code] of CASES) {
++    it(`signed URL ${status} → ${code}(不是 INTERNAL),零代办`, async () => {
++      const run = await runOnce({ secretSaved: true, fetch: upstream(signedFail(status)) })
++      expect(run.reply.ok).toBe(false)
++      expect(run.reply.code).toBe(code)
++      expect(run.cindyRequests).toHaveLength(0)
++    })
++  }
++  it('签名地址被白名单拦(ok:false)→ TRANSPORT_UNKNOWN(品牌错误原样重抛,零代办)', async () => {
++    const run = await runOnce({
++      secretSaved: true,
++      fetch: upstream((r) => {
++        const url = String(r.url ?? '')
++        if (url.includes('/file/download/')) return { ok: true, status: 200, body: '{}' }
++        if (url.startsWith('https://mivo-oss.example.com/')) return { ok: false, message: '域名不在白名单内' }
++        return null
++      }),
++    })
++    expect(run.reply.ok).toBe(false)
++    expect(run.reply.code).toBe('MIVO_TRANSPORT_UNKNOWN')
++    expect(run.cindyRequests).toHaveLength(0)
++  })
++})
++
++// ── SC-A3:双扣费边界 ─────────────────────────────────────────────────────
++describe('SC-A3 提交边界:/message 恒 ≤1,失败清会话,下一单 fresh 建会话', () => {
++  for (const kind of ['gen', 'edit'] as const) {
++    it(`${kind} · submit 响应丢失:/message === 1(不重试)、零代办、Promise 有界收敛`, async () => {
++      const run = await runOnce({
++        kind,
++        secretSaved: true,
++        fetch: upstream((r) => (String(r.url).endsWith('/api/v1/message') ? { ok: false, message: 'lost' } : null)),
++      })
++      expect(stageCounts(run.brain.fetchRequests).submit).toBe(1)
++      expect(run.cindyRequests).toHaveLength(0)
++      expect(run.reply.code).toBe('MIVO_TRANSPORT_UNKNOWN')
++    })
++  }
++
++  it('SC-A3.2 三组失败形态下 /message 都 === 1:传输丢失 / ok:true 非2xx / 2xx 但回执缺 jobId', async () => {
++    const shapes: Array<[string, FetchReply, string]> = [
++      ['传输丢失', { ok: false, message: 'lost' }, 'MIVO_TRANSPORT_UNKNOWN'],
++      ['ok:true 非2xx', { ok: true, status: 500 }, 'MIVO_UPSTREAM_BUSY'],
++      ['2xx 缺 jobId', jsonOk({}), 'MIVO_INTERNAL'],
++    ]
++    for (const [name, reply, code] of shapes) {
++      const run = await runOnce({
++        secretSaved: true,
++        fetch: upstream((r) => (String(r.url).endsWith('/api/v1/message') ? reply : null)),
++      })
++      expect(stageCounts(run.brain.fetchRequests).submit, name).toBe(1)
++      expect(run.reply.code, name).toBe(code)
++    }
++  })
++
++  it('SC-A3.3 失败清会话:第一单 submit 失败后,第二单 fresh 建会话且自己也只提交一次', async () => {
++    let failFirst = true
++    const shared = makeBrain({
++      secretSaved: true,
++      fetch: upstream((r) => {
++        if (String(r.url).endsWith('/api/v1/message') && failFirst) {
++          failFirst = false
++          return { ok: false, message: 'lost' }
++        }
++        return null
++      }),
++    })
++    await flushMicrotasks()
++    const first = await runOnce({ brain: shared, reqId: 'a3-first' })
++    expect(first.reply.code).toBe('MIVO_TRANSPORT_UNKNOWN')
++    const afterFirst = stageCounts(shared.brain.fetchRequests)
++    expect(afterFirst.chat).toBe(1)
++    expect(afterFirst.submit).toBe(1)
++    const second = await runOnce({ brain: shared, reqId: 'a3-second' })
++    expect(second.reply.ok).toBe(true)
++    const afterSecond = stageCounts(shared.brain.fetchRequests)
++    expect(afterSecond.chat).toBe(2) // fresh 建会话(没有复用坏会话,也没有"一次失效永久坏")
++    expect(afterSecond.submit).toBe(2) // 每单各一次
++  })
++})
++
++// ── SC-A5:凭证安全(canary + 非干扰 + console + 伪造字段)────────────────────
++describe('SC-A5 凭证安全:raw 不进回执/诊断/console,伪造字段不被信任', () => {
++  const CONSOLE_METHODS = ['log', 'info', 'debug', 'warn', 'error', 'trace'] as const
++  let spies: Array<ReturnType<typeof vi.spyOn>> = []
++  beforeEach(() => {
++    spies = CONSOLE_METHODS.map((m) => vi.spyOn(console, m).mockImplementation(() => {}))
++  })
++  afterEach(() => {
++    for (const s of spies) s.mockRestore()
++  })
++
++  // canary 的**全部** 8 字符滑动窗口(25 个)——只查头 8 位会漏中段/尾段的部分泄露。
++  const CANARY_WINDOWS = Array.from({ length: CANARY.length - 7 }, (_, i) => CANARY.slice(i, i + 8))
++  const expectNoCanaryIn = (text: string) => {
++    for (const window of CANARY_WINDOWS) expect(text).not.toContain(window)
++  }
++  // console 实参按真实 Debug Log 捕获的方式序列化(对象走 JSON.stringify)——
++  // 用 String(arg) 的话 console.error({raw: CANARY}) 会变成 [object Object] 假绿,
++  // 而真实 debugLogStore 捕获会把对象序列化后落盘(收口审阻断 3)。
++  // 严格镜像 src/store/debugLogStore.ts 的 normalizeMessage:Error → stack||message,
++  // string 原样,其余 JSON.stringify 兜底 String。上一版对 Error 走 JSON.stringify 会得
++  // '{}',console.error(new Error('…'+CANARY)) 就成了假绿盲区(复验阻断 3)。
++  const serializeConsoleArg = (arg: unknown): string => {
++    if (arg instanceof Error) return arg.stack || arg.message
++    if (typeof arg === 'string') return arg
++    try {
++      return JSON.stringify(arg) ?? String(arg)
++    } catch {
++      return String(arg)
++    }
++  }
++  const assertNoCanaryAnywhere = (run: BrainRun & { reply: Record<string, unknown> }) => {
++    expectNoCanaryIn(JSON.stringify(run.reply))
++    const spy = attachPanelBridge(run.brain).spy
++    expectNoCanaryIn(spy.calls.map((e) => `${e.level}|${e.message}`).join('\n'))
++    for (const s of spies) {
++      for (const call of s.mock.calls) {
++        expectNoCanaryIn(call.map(serializeConsoleArg).join(' '))
++      }
++    }
++  }
++
++  it('组①:ok:true 非 2xx 且 body 含 canary → 回执/诊断/console 全干净', async () => {
++    const run = await runOnce({
++      secretSaved: true,
++      fetch: upstream((r) =>
++        String(r.url).endsWith('/message/chat') ? { ok: true, status: 400, body: `{"error":"${CANARY}"}` } : null,
++      ),
++    })
++    expect(run.reply.code).toBe('MIVO_UPSTREAM_ERROR')
++    assertNoCanaryAnywhere(run)
++  })
++
++  it('组②:ok:false 且 message 含 canary(生产最危险入口)→ 全干净', async () => {
++    const run = await runOnce({
++      secretSaved: true,
++      fetch: upstream((r) => (String(r.url).endsWith('/message/chat') ? { ok: false, message: `denied: ${CANARY}` } : null)),
++    })
++    expect(run.reply.code).toBe('MIVO_TRANSPORT_UNKNOWN')
++    assertNoCanaryAnywhere(run)
++  })
++
++  it('组③:宿主 hostSend 直接 reject(Error 带 canary)→ INTERNAL,全干净(收口审反例 A)', async () => {
++    const run = await runOnce({
++      secretSaved: false,
++      hostReply: () => Promise.reject(new Error(`host blew up ${CANARY}`)),
++    })
++    expect(run.reply.ok).toBe(false)
++    expect(run.reply.code).toBe('MIVO_INTERNAL')
++    assertNoCanaryAnywhere(run)
++  })
++
++  it('组④:外部拒绝对象伪造 genCode/safeMessage → 不被信任,收敛 MIVO_INTERNAL(收口审反例 B)', async () => {
++    const forged = Object.assign(new Error('forged'), { genCode: 'EVIL_CODE', safeMessage: CANARY })
++    const run = await runOnce({ secretSaved: false, hostReply: () => Promise.reject(forged) })
++    expect(run.reply.code).toBe('MIVO_INTERNAL') // 不是 EVIL_CODE
++    assertNoCanaryAnywhere(run)
++  })
++
++  it('SC-A5.2 非干扰:同一 {ok,status} 换两份不同 raw,对外输出与诊断逐字节相同', async () => {
++    const collect = async (raw: string) => {
++      const before = spies.map((s) => s.mock.calls.length)
++      const run = await runOnce({
++        secretSaved: true,
++        reqId: 'same-req', // 同 reqId 让回执可直接比对(两个独立 brain,不撞去重表)
++        fetch: upstream((r) => (String(r.url).endsWith('/message/chat') ? { ok: false, message: raw } : null)),
++      })
++      const spy = attachPanelBridge(run.brain).spy
++      const diag = spy.calls.filter((e) => e.source === 'Brain Gen').map((e) => `${e.level}|${e.message}`)
++      // 本次 run 期间六个 console 方法新增的输出(按真实捕获方式序列化)——换 raw 不得有差异
++      const consoleDump = spies.map((s, i) => s.mock.calls.slice(before[i]).map((call: unknown[]) => call.map(serializeConsoleArg).join(' ')).join('\n'))
++      return { reply: JSON.stringify(run.reply), diag: JSON.stringify(diag), consoleDump: JSON.stringify(consoleDump) }
++    }
++    const a = await collect('凭证已失效,请重新登录 aaaa')
++    const b = await collect(`totally different ${CANARY} raw`)
++    expect(a.reply).toBe(b.reply)
++    expect(a.diag).toBe(b.diag)
++    expect(a.consoleDump).toBe(b.consoleDump)
++  })
++})
++
++// ── SC-A4.6:四类结局的 Debug Log 行为断言 ─────────────────────────────────
++describe('SC-A4.6 四类结局都有诊断留痕', () => {
++  it('configured 成功 → diagOk「完成(Mivo 直连)」', async () => {
++    const run = await runOnce({ secretSaved: true, fetch: upstream() })
++    const spy = attachPanelBridge(run.brain).spy
++    expect(spy.find('完成(Mivo 直连)').length).toBe(1)
++  })
++  it('configured 失败 → diagFail 带闭集码', async () => {
++    const run = await runOnce({
++      secretSaved: true,
++      fetch: upstream((r) => (String(r.url).endsWith('/message/chat') ? { ok: true, status: 401 } : null)),
++    })
++    const spy = attachPanelBridge(run.brain).spy
++    expect(spy.find('code=MIVO_AUTH_INVALID').length).toBeGreaterThanOrEqual(1)
++  })
++  it('unconfigured 回落成功 → diagSkip「回落 Cindy 代办」+ diagOk 完成', async () => {
++    const run = await runOnce({ secretSaved: false })
++    const spy = attachPanelBridge(run.brain).spy
++    expect(spy.find('回落 Cindy 代办').length).toBe(1)
++    expect(spy.find('完成(Cindy 代办)').length).toBe(1)
++  })
++  it('unknown → diagSkip「未出图」', async () => {
++    const run = await runOnce({ localFetch: () => ({ ok: false, status: 500, json: async () => [] }) })
++    const spy = attachPanelBridge(run.brain).spy
++    expect(spy.find('未出图').length).toBe(1)
++  })
++})

@@ -1,0 +1,1157 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 67eb8cbe..593c349a 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -84,6 +84,17 @@ jobs:
+       - name: Verify logging rules
+         run: npm run verify:logging
+ 
++      # 值级循环依赖 fail-closed 守卫(issue #413,不加 madge)。边分类走 TS compiler API
++      # (同 structure-guard.mjs rule ④ 先例,不用手写正则/词法器),环检测复用
++      # codemap.mjs 导出的 findCircles。阻断项:仅堵"新增"值级环——13 条存量值级环
++      # (2026-08-02 基线快照)已进 scripts/ci/cycle-guard.baseline.json(1 条有源码级
++      # 安全论证,12 条按 TECH_DEBT_AUDIT.md A01 存量豁免,未逐条安全审查),命中不致红。
++      # type-only(import type / typeof import() 类型位置惯用法)边编译期擦除,不计入
++      # 值级图,不产生假红。直接 node 调用,对齐 structure-guard/check-internal-literals
++      # 两个兄弟守卫的既有形态。
++      - name: Circular dependency guard (cycle-guard.mjs, value-level only)
++        run: node scripts/ci/cycle-guard.mjs
++
+       # 内网基础设施字面量守卫(2026-08-01 门禁收尾):AGENTS.md「部署机信息不进代码」
+       # 此前零机器执行,实证翻车见 scripts/ci/check-internal-literals.mjs 头注释。
+       # 阻断项:本 job 是 required check,红即挡合并。规则/豁免机制见守卫脚本。
+diff --git a/package.json b/package.json
+index 88bb0111..a514f0f0 100644
+--- a/package.json
++++ b/package.json
+@@ -28,7 +28,8 @@
+     "start:server": "tsx server/index.ts",
+     "contract:diff": "node scripts/contract-diff.mjs",
+     "codemap": "node scripts/codemap.mjs",
+-    "preflight": "npm run check:i18n && tsc -b && npm run lint && npm run verify:logging && node scripts/ci/structure-guard.mjs && node scripts/ci/check-internal-literals.mjs && npm run test:unit && npm run test:shell",
++    "check:cycles": "node scripts/ci/cycle-guard.mjs",
++    "preflight": "npm run check:i18n && tsc -b && npm run lint && npm run verify:logging && npm run check:cycles && node scripts/ci/structure-guard.mjs && node scripts/ci/check-internal-literals.mjs && npm run test:unit && npm run test:shell",
+     "prepare": "git rev-parse --git-dir >/dev/null 2>&1 && git config core.hooksPath .githooks || true",
+     "check:i18n": "node scripts/check-i18n.mjs"
+   },
+diff --git a/scripts/ci/cycle-guard.baseline.json b/scripts/ci/cycle-guard.baseline.json
+new file mode 100644
+index 00000000..023bc2d6
+--- /dev/null
++++ b/scripts/ci/cycle-guard.baseline.json
+@@ -0,0 +1,127 @@
++{
++  "_purpose": "MivoCanvas 值级循环依赖门禁基线(issue #413,2026-08-02 快照)。按 scripts/ci/cycle-guard.mjs 的 TS AST 分类实测——本仓当前全部 13 处值级环(注:早期估计只有 1 处,原型脚本漏检 await/void import() 等动态导入形态,已用逐边 grep 核实校正为 13)。",
++  "_howToUse": "由 scripts/ci/cycle-guard.mjs 读取。entries 按环内文件集合匹配(与起点/方向/rotation 无关):命中不致 exit 1;未命中的新增值级环 → exit 1(fail-closed,只拦新增)。当前检出的值级环若不对应任何 entries → 列入 staleWhitelistEntries 提示可移除(不致 fail,单调收缩)。",
++  "_kindSemantics": "两层标注,不可混淆:kind='accepted' = 源码内有 \"Module cycle note\" 级别的显式安全论证,刻意接受,不属于技术债;kind='baseline' = 2026-08-02 快照时点的存量环,仅豁免\"已存在\",未经逐条安全审查,不代表\"证明安全\"——评审与清理归 TECH_DEBT_AUDIT.md A01(\"循环依赖持续借新债\":canvasStore↔5 slice / chatStore↔chatMaskEditFlow 两族)。",
++  "_updatePolicy": "新增值级环一律不得加进本文件绕过门禁——先判断是否该像 debugLogStore 那样有源码级安全论证(kind=accepted,需在源码写 Module cycle note 级别的论证并在此说明理由),否则应先破环再合并。A01/PR-T2 修掉某条存量环后,跑 `node scripts/ci/cycle-guard.mjs --update-baseline` 会自动裁掉已不存在的 entries(仅裁剪,不会新增)。",
++  "_baselineSnapshot": "2026-08-02,PR #418/R2 返修(issue #413)。",
++  "entries": [
++    {
++      "nodes": ["src/store/debugLogStore.ts", "src/store/remoteDebugReporter.ts"],
++      "kind": "accepted",
++      "reason": "debugLogStore ⇄ remoteDebugReporter：两者互不在模块求值期调用彼方（仅方法体内延迟调用），ESM live binding 保证安全，同 writeRetryQueue 先例。见 src/store/remoteDebugReporter.ts 顶部 \"Module cycle note\"。刻意接受，不纳入 issue #413 破环范围。"
++    },
++    {
++      "nodes": ["src/store/canvasPersistConfig.ts", "src/store/canvasStore.ts"],
++      "kind": "baseline",
++      "reason": "存量基线豁免（2026-08-02 快照）。未经逐条安全审查，不代表「证明安全」，仅防新增回潮；对应 TECH_DEBT_AUDIT.md A01。逐条评审与清理归 A01/PR-T2 后续。"
++    },
++    {
++      "nodes": ["src/store/chatPersistConfig.ts", "src/store/chatStore.ts"],
++      "kind": "baseline",
++      "reason": "存量基线豁免（2026-08-02 快照）。未经逐条安全审查，不代表「证明安全」，仅防新增回潮；对应 TECH_DEBT_AUDIT.md A01。逐条评审与清理归 A01/PR-T2 后续。"
++    },
++    {
++      "nodes": ["src/lib/persistBoot.ts", "src/store/chatPersistSync.ts", "src/store/chatStore.ts"],
++      "kind": "baseline",
++      "reason": "存量基线豁免（2026-08-02 快照）。未经逐条安全审查，不代表「证明安全」，仅防新增回潮；对应 TECH_DEBT_AUDIT.md A01。逐条评审与清理归 A01/PR-T2 后续。"
++    },
++    {
++      "nodes": ["src/lib/persistBoot.ts", "src/store/canvasStore.ts", "src/store/documentSlice.ts"],
++      "kind": "baseline",
++      "reason": "存量基线豁免（2026-08-02 快照）。未经逐条安全审查，不代表「证明安全」，仅防新增回潮；对应 TECH_DEBT_AUDIT.md A01。逐条评审与清理归 A01/PR-T2 后续。"
++    },
++    {
++      "nodes": [
++        "src/lib/assetService.ts",
++        "src/lib/assetStorage.ts",
++        "src/lib/authHeaders.ts",
++        "src/lib/persistIdbStorage.ts",
++        "src/store/settingsSlice.ts"
++      ],
++      "kind": "baseline",
++      "reason": "存量基线豁免（2026-08-02 快照）。未经逐条安全审查，不代表「证明安全」，仅防新增回潮；对应 TECH_DEBT_AUDIT.md A01。逐条评审与清理归 A01/PR-T2 后续。"
++    },
++    {
++      "nodes": [
++        "src/lib/persistBoot.ts",
++        "src/store/canvasGenerationCancel.ts",
++        "src/store/canvasStore.ts",
++        "src/store/chatStore.ts",
++        "src/store/documentSlice.ts"
++      ],
++      "kind": "baseline",
++      "reason": "存量基线豁免（2026-08-02 快照）。未经逐条安全审查，不代表「证明安全」，仅防新增回潮；对应 TECH_DEBT_AUDIT.md A01。逐条评审与清理归 A01/PR-T2 后续。"
++    },
++    {
++      "nodes": [
++        "src/lib/persistBoot.ts",
++        "src/store/canvasStore.ts",
++        "src/store/chatMaskEditFlow.ts",
++        "src/store/chatStore.ts",
++        "src/store/documentSlice.ts"
++      ],
++      "kind": "baseline",
++      "reason": "存量基线豁免（2026-08-02 快照）。未经逐条安全审查，不代表「证明安全」，仅防新增回潮；对应 TECH_DEBT_AUDIT.md A01。逐条评审与清理归 A01/PR-T2 后续。"
++    },
++    {
++      "nodes": [
++        "src/lib/persistBoot.ts",
++        "src/store/canvasStore.ts",
++        "src/store/chatStore.ts",
++        "src/store/documentSlice.ts",
++        "src/store/generationFacade.ts"
++      ],
++      "kind": "baseline",
++      "reason": "存量基线豁免（2026-08-02 快照）。未经逐条安全审查，不代表「证明安全」，仅防新增回潮；对应 TECH_DEBT_AUDIT.md A01。逐条评审与清理归 A01/PR-T2 后续。"
++    },
++    {
++      "nodes": [
++        "src/canvas/maskEditGeneration.ts",
++        "src/lib/persistBoot.ts",
++        "src/store/canvasStore.ts",
++        "src/store/chatMaskEditFlow.ts",
++        "src/store/chatStore.ts",
++        "src/store/documentSlice.ts"
++      ],
++      "kind": "baseline",
++      "reason": "存量基线豁免（2026-08-02 快照）。未经逐条安全审查，不代表「证明安全」，仅防新增回潮；对应 TECH_DEBT_AUDIT.md A01。逐条评审与清理归 A01/PR-T2 后续。"
++    },
++    {
++      "nodes": [
++        "src/canvas/actions/canvasSyncRuntime.ts",
++        "src/canvas/maskEditGeneration.ts",
++        "src/lib/persistBoot.ts",
++        "src/store/canvasStore.ts",
++        "src/store/chatMaskEditFlow.ts",
++        "src/store/chatStore.ts",
++        "src/store/documentSlice.ts"
++      ],
++      "kind": "baseline",
++      "reason": "存量基线豁免（2026-08-02 快照）。未经逐条安全审查，不代表「证明安全」，仅防新增回潮；对应 TECH_DEBT_AUDIT.md A01。逐条评审与清理归 A01/PR-T2 后续。"
++    },
++    {
++      "nodes": [
++        "src/canvas/actions/canvasSyncRuntime.ts",
++        "src/canvas/maskEditGeneration.ts",
++        "src/lib/assetAttachWiring.ts",
++        "src/lib/persistBoot.ts",
++        "src/store/chatMaskEditFlow.ts",
++        "src/store/chatStore.ts"
++      ],
++      "kind": "baseline",
++      "reason": "存量基线豁免（2026-08-02 快照）。未经逐条安全审查，不代表「证明安全」，仅防新增回潮；对应 TECH_DEBT_AUDIT.md A01。逐条评审与清理归 A01/PR-T2 后续。"
++    },
++    {
++      "nodes": [
++        "src/canvas/maskEditGeneration.ts",
++        "src/lib/mivoTaskClient.ts",
++        "src/lib/persistBoot.ts",
++        "src/store/authSlice.ts",
++        "src/store/chatMaskEditFlow.ts",
++        "src/store/chatStore.ts"
++      ],
++      "kind": "baseline",
++      "reason": "存量基线豁免（2026-08-02 快照）。未经逐条安全审查，不代表「证明安全」，仅防新增回潮；对应 TECH_DEBT_AUDIT.md A01。逐条评审与清理归 A01/PR-T2 后续。"
++    }
++  ]
++}
+diff --git a/scripts/ci/cycle-guard.mjs b/scripts/ci/cycle-guard.mjs
+new file mode 100644
+index 00000000..ed598245
+--- /dev/null
++++ b/scripts/ci/cycle-guard.mjs
+@@ -0,0 +1,321 @@
++#!/usr/bin/env node
++// scripts/ci/cycle-guard.mjs — 值级循环依赖门禁(issue #413)。
++//
++// 为什么存在:issue #413 请求恢复夜巡"循环依赖检测"(此前用 madge,因供应链/维护成本
++// 移除)。scripts/codemap.mjs 已有零依赖 DFS 环检测,但边分类原是正则近似——同类问题
++// scripts/ci/structure-guard.mjs rule ④ 第三轮返修时已被 owner 拍板改走 TS AST(该文件
++// 头注释原文:"手写 lexer……是无底洞……AST 天然免疫字符串/模板/正则/注释全部边界")。
++// 本守卫复用同一先例:边分类走 TS compiler API,环检测复用 codemap.mjs 导出的
++// collectFiles/resolveImport/findCircles(不复制文件收集/路径解析/图算法三段逻辑)。
++// codemap.mjs 保留的正则近似只用于 SessionStart hook 展示(不能引入 node_modules 依赖),
++// 不是门禁真相源——门禁真相在本文件。
++//
++// 威胁模型:防的是"新增值级循环依赖"——模块在求值期(top-level)互相依赖对方尚未初始化
++// 完成的绑定,ESM 下表现为 TDZ/undefined 访问。已知存量环(见 cycle-guard.baseline.json)
++// 未逐条证明安全,只是被有意豁免;新增环一律 fail-closed。本守卫不防:刻意用字符串拼接
++// /运行时动态拼装路径绕过静态可分析性——那不是"循环依赖"问题,归 code review 管。
++//
++// 分类规则(TS AST,非正则近似;见 classifyFileSpecs):
++// - ImportDeclaration:importClause.isTypeOnly(整句 `import type ... from`)→ type-only;
++//   否则逐 binding 判定 —— default 绑定 / `* as ns` 命名空间绑定为值,NamedImports 逐
++//   specifier 的 isTypeOnly(TS 4.5+ inline `type` 修饰符),任一非 type → 该边值级;
++//   无 importClause(纯副作用 `import './x'`)→ 值级(模块仍被求值)。
++// - ExportDeclaration:isTypeOnly(整句 `export type ... from`,含 `export type * from`)
++//   → type-only;否则 exportClause 缺失(`export * from`)→ 值级,NamedExports 逐
++//   specifier 判定同 import。
++// - 动态 import():CallExpression(expression.kind===ImportKeyword)恒值级(运行时才发生
++//   的模块求值,如 `await import()` / `void import()`);类型位置(`typeof import('./x')`
++//   / `: import('./x').Foo` / 泛型参数里的 import())被 TS 解析器识别为 ImportTypeNode,
++//   是完全不同的 AST 节点,天然不会落进上面的 CallExpression 分支——按 type-only 计入
++//   全边图(供 allCycleCount 对照),不进值级图。这正是本仓 chatMaskEditFlow.ts /
++//   chatPersistSync.ts 的 `ChatStoreInstance` 类型刻意用来打破值级环的惯用法。
++// AST 天然免疫正则启发式的已知盲区:字符串字面量里出现 "from"/import 关键字文本、反引号
++// 模板字符串内嵌 import 语句等,词法边界由 TS parser 定义,不会被误判。
++//
++// 白名单:scripts/ci/cycle-guard.baseline.json,按环内文件集合匹配(与起点/方向/rotation
++// 无关)。两层标注见该文件 _kindSemantics。已豁免环若被后续重构修掉,常规运行会把对应
++// entry 列入 staleWhitelistEntries 提示可移除(不致 fail,单调收缩);`--update-baseline`
++// 可据此自动裁剪(仅裁剪,拒绝在存在未豁免新增环时执行——不做静默扩大豁免)。
++//
++// 统计口径(不做减法指标):allCycleCount 与 valueCycleCount 是两次独立 DFS 的独立测量值
++// (全边图 vs 值级图),不可比减——去掉 type-only 边后节点间可能仍有别的值级路径互通,
++// "全边环数 - 值级环数"不对应任何真实实体,故不作为字段输出。
++//
++// 退出码:0=当前值级环全部命中白名单(或压根没有新增);1=存在未豁免的新增值级环;
++// 2=运行错误(基线文件缺失/解析失败、扫描过程异常等)。本守卫是独立 CI/preflight 步骤,
++// 不继承 codemap.mjs 给 SessionStart hook 用的 5s 性能门预算。
++//
++// 用法:node scripts/ci/cycle-guard.mjs [--json] [--update-baseline]
++//   默认:人类可读文本到 stdout。
++//   --json:机读单行 JSON(allCycleCount/valueCycleCount/valueCycles/whitelistedCycles/
++//           nonWhitelistedCycles/staleWhitelistEntries)。
++//   --update-baseline:用当前检出重写 baseline entries(仅裁剪 stale 条目,不新增;若存在
++//           未豁免新增环则拒绝执行并 exit 2,提示先手动审查)。
++
++import { readFileSync, writeFileSync } from 'node:fs'
++import { join, dirname, resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import ts from 'typescript'
++import { ROOT, collectFiles, resolveImport, findCircles } from '../codemap.mjs'
++
++const __dirname = dirname(fileURLToPath(import.meta.url))
++const BASELINE_PATH = join(__dirname, 'cycle-guard.baseline.json')
++
++// ── TS AST 边分类:一个文件的源码文本 → { allSpecs, valueSpecs }(相对 import specifier)──
++// 纯函数(不碰文件系统),便于 fixture 测试(issue #413 R2)。
++export function classifyFileSpecs(filePosixPath, content) {
++  const allSpecs = new Set()
++  const valueSpecs = new Set()
++  const isRelative = (s) => s.startsWith('./') || s.startsWith('../')
++  const addSpec = (text, isTypeOnly) => {
++    if (!isRelative(text)) return
++    allSpecs.add(text)
++    if (!isTypeOnly) valueSpecs.add(text)
++  }
++  const addFromStringLiteral = (node, isTypeOnly) => {
++    if (node && ts.isStringLiteral(node)) addSpec(node.text, isTypeOnly)
++  }
++
++  const sf = ts.createSourceFile(filePosixPath || 'scan.ts', content, ts.ScriptTarget.Latest, true)
++
++  function visit(node) {
++    if (ts.isImportDeclaration(node)) {
++      const clause = node.importClause
++      if (!clause) {
++        // 无 importClause = 纯副作用 import(`import './x'`)→ 模块仍被求值,值级。
++        addFromStringLiteral(node.moduleSpecifier, false)
++      } else if (clause.isTypeOnly) {
++        addFromStringLiteral(node.moduleSpecifier, true)
++      } else {
++        let anyValue = Boolean(clause.name) // default 绑定是值
++        const named = clause.namedBindings
++        if (named) {
++          if (ts.isNamespaceImport(named)) {
++            anyValue = true // `* as ns` 命名空间对象在运行时被引用
++          } else if (ts.isNamedImports(named)) {
++            for (const el of named.elements) {
++              if (!el.isTypeOnly) {
++                anyValue = true
++                break
++              }
++            }
++          }
++        }
++        addFromStringLiteral(node.moduleSpecifier, !anyValue)
++      }
++    } else if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
++      if (node.isTypeOnly) {
++        addFromStringLiteral(node.moduleSpecifier, true)
++      } else {
++        const clause = node.exportClause
++        if (!clause) {
++          // `export * from './x'` — 值级重导出(可能带值)。
++          addFromStringLiteral(node.moduleSpecifier, false)
++        } else if (ts.isNamedExports(clause)) {
++          let anyValue = false
++          for (const el of clause.elements) {
++            if (!el.isTypeOnly) {
++              anyValue = true
++              break
++            }
++          }
++          addFromStringLiteral(node.moduleSpecifier, !anyValue)
++        } else {
++          // NamespaceExport(`export * as ns from './x'`)— 值级。
++          addFromStringLiteral(node.moduleSpecifier, false)
++        }
++      }
++    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
++      // 动态 import(...) —— 只有值位置才会解析成 CallExpression;类型位置的
++      // `typeof import()` / `: import()` 被解析器识别为 ImportTypeNode(见下方分支),
++      // 天然不会落进这里,不需要额外的"类型位置回溯判断"。
++      const arg = node.arguments && node.arguments[0]
++      addFromStringLiteral(arg, false)
++    } else if (ts.isImportTypeNode(node)) {
++      // `typeof import('./x')` / `: import('./x').Foo` / `Pick<import('./x').Foo, ...>` 等
++      // 类型位置惯用法(本仓 chatMaskEditFlow.ts/chatPersistSync.ts 的 ChatStoreInstance
++      // 类型故意用它打破值级环)。argument 是 LiteralTypeNode 包一层 StringLiteral。
++      const arg = node.argument
++      if (arg && ts.isLiteralTypeNode(arg) && ts.isStringLiteral(arg.literal)) {
++        addSpec(arg.literal.text, true)
++      }
++    }
++    ts.forEachChild(node, visit)
++  }
++  visit(sf)
++  return { allSpecs, valueSpecs }
++}
++
++// ── 构建全边图 + 值级图,复用 codemap.mjs 的文件收集/路径解析/DFS(不复制)──
++function buildGraphs() {
++  const files = collectFiles()
++  const adj = new Map()
++  const valueAdj = new Map()
++  for (const file of files) {
++    let content = ''
++    try {
++      content = readFileSync(join(ROOT, file), 'utf8')
++    } catch {
++      content = ''
++    }
++    const { allSpecs, valueSpecs } = classifyFileSpecs(file, content)
++    const resolved = new Set()
++    const resolvedValue = new Set()
++    for (const spec of allSpecs) {
++      const target = resolveImport(spec, file)
++      if (!target) continue
++      resolved.add(target)
++      if (valueSpecs.has(spec)) resolvedValue.add(target)
++    }
++    adj.set(file, [...resolved])
++    valueAdj.set(file, [...resolvedValue])
++  }
++  return {
++    allCycles: findCircles(adj),
++    valueCycles: findCircles(valueAdj),
++  }
++}
++
++// ── 白名单:环 → 节点集合 key,与起点/方向/rotation 无关 ──
++function canonicalNodes(ring) {
++  return [...new Set(ring)].sort()
++}
++function ringKey(ring) {
++  return canonicalNodes(ring).join('|')
++}
++
++function loadBaseline() {
++  const raw = readFileSync(BASELINE_PATH, 'utf8')
++  const parsed = JSON.parse(raw)
++  if (!Array.isArray(parsed.entries)) {
++    throw new Error(`${BASELINE_PATH} 缺少 entries 数组`)
++  }
++  for (const entry of parsed.entries) {
++    if (!Array.isArray(entry.nodes) || entry.nodes.length < 2) {
++      throw new Error(`${BASELINE_PATH} 存在 nodes 非法的 entry: ${JSON.stringify(entry)}`)
++    }
++    if (entry.kind !== 'accepted' && entry.kind !== 'baseline') {
++      throw new Error(`${BASELINE_PATH} 存在 kind 非法的 entry(只允许 accepted/baseline): ${JSON.stringify(entry)}`)
++    }
++  }
++  return parsed
++}
++
++// 判断一个值级环是否命中白名单,命中返回该白名单条目({nodes, kind, reason}),否则 null。
++// 导出供 fixture 测试直接验证(issue #413 SC-3)。
++export function matchWhitelist(entries, ring) {
++  const idx = new Map(entries.map((e) => [ringKey(e.nodes), e]))
++  return idx.get(ringKey(ring)) ?? null
++}
++
++// 生成机读/人读共用的判定结果。纯函数,便于 fixture 测试(issue #413)。
++export function evaluateCycles({ allCycles, valueCycles, baselineEntries }) {
++  const whitelistedCycles = []
++  const nonWhitelistedCycles = []
++  const matchedKeys = new Set()
++  for (const ring of valueCycles) {
++    const entry = matchWhitelist(baselineEntries, ring)
++    if (entry) {
++      whitelistedCycles.push({ nodes: canonicalNodes(ring), kind: entry.kind, reason: entry.reason })
++      matchedKeys.add(ringKey(entry.nodes))
++    } else {
++      nonWhitelistedCycles.push(canonicalNodes(ring))
++    }
++  }
++  const staleWhitelistEntries = baselineEntries
++    .filter((entry) => !matchedKeys.has(ringKey(entry.nodes)))
++    .map((entry) => ({ nodes: canonicalNodes(entry.nodes), kind: entry.kind }))
++  return {
++    allCycleCount: allCycles.length,
++    valueCycleCount: valueCycles.length,
++    valueCycles: valueCycles.map(canonicalNodes),
++    whitelistedCycles,
++    nonWhitelistedCycles,
++    staleWhitelistEntries,
++  }
++}
++
++function printHuman(result) {
++  const lines = []
++  lines.push(
++    `cycle-guard: 全边环 ${result.allCycleCount} 处(含 type-only 假环) / 值级环 ${result.valueCycleCount} 处`
++  )
++  lines.push(`  白名单命中: ${result.whitelistedCycles.length}`)
++  for (const c of result.whitelistedCycles) {
++    lines.push(`    - [${c.kind}] ${c.nodes.join(' , ')}`)
++  }
++  if (result.nonWhitelistedCycles.length) {
++    lines.push(`  ❌ 未豁免的新增值级环: ${result.nonWhitelistedCycles.length}`)
++    for (const nodes of result.nonWhitelistedCycles) {
++      lines.push(`    - ${nodes.join(' , ')}`)
++    }
++  } else {
++    lines.push('  ✅ 无未豁免的新增值级环')
++  }
++  if (result.staleWhitelistEntries.length) {
++    lines.push(`  ℹ️  ${result.staleWhitelistEntries.length} 条白名单条目已不对应任何当前值级环(可能已被重构修掉,可从 cycle-guard.baseline.json 移除):`)
++    for (const entry of result.staleWhitelistEntries) {
++      lines.push(`    - [${entry.kind}] ${entry.nodes.join(' , ')}`)
++    }
++  }
++  process.stdout.write(lines.join('\n') + '\n')
++}
++
++function updateBaseline(baseline, result) {
++  if (result.nonWhitelistedCycles.length > 0) {
++    process.stderr.write(
++      `cycle-guard: 存在 ${result.nonWhitelistedCycles.length} 处未豁免的新增值级环,拒绝 --update-baseline` +
++        '(该操作只裁剪已修掉的存量条目,不会静默豁免新问题——请先手动审查新增环)。\n'
++    )
++    return 2
++  }
++  const matchedKeys = new Set(result.whitelistedCycles.map((c) => ringKey(c.nodes)))
++  const kept = baseline.entries.filter((entry) => matchedKeys.has(ringKey(entry.nodes)))
++  const removed = baseline.entries.length - kept.length
++  const next = { ...baseline, entries: kept }
++  writeFileSync(BASELINE_PATH, JSON.stringify(next, null, 2) + '\n', 'utf8')
++  process.stderr.write(`cycle-guard: --update-baseline 完成,裁剪 ${removed} 条已不存在的白名单条目(保留 ${kept.length} 条)。\n`)
++  return 0
++}
++
++function main() {
++  const args = process.argv.slice(2)
++  const asJson = args.includes('--json')
++  const doUpdateBaseline = args.includes('--update-baseline')
++
++  let baseline
++  try {
++    baseline = loadBaseline()
++  } catch (e) {
++    process.stderr.write(`cycle-guard: 基线文件读取/解析失败 — ${e.message}\n`)
++    process.exit(2)
++  }
++
++  let allCycles, valueCycles
++  try {
++    ;({ allCycles, valueCycles } = buildGraphs())
++  } catch (e) {
++    process.stderr.write(`cycle-guard: 扫描过程异常 — ${e.message}\n${e.stack}\n`)
++    process.exit(2)
++  }
++
++  const result = evaluateCycles({ allCycles, valueCycles, baselineEntries: baseline.entries })
++
++  if (doUpdateBaseline) {
++    process.exit(updateBaseline(baseline, result))
++  }
++
++  if (asJson) {
++    process.stdout.write(JSON.stringify(result) + '\n')
++  } else {
++    printHuman(result)
++  }
++
++  process.exit(result.nonWhitelistedCycles.length > 0 ? 1 : 0)
++}
++
++// 仅在直接运行时跑(被 import 做 fixture 测试时不执行,避免污染 stdout / 触发 exit)。
++const __isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])
++if (__isMain) {
++  main()
++}
+diff --git a/scripts/ci/cycle-guard.test.mjs b/scripts/ci/cycle-guard.test.mjs
+new file mode 100644
+index 00000000..d02e5ad3
+--- /dev/null
++++ b/scripts/ci/cycle-guard.test.mjs
+@@ -0,0 +1,298 @@
++// scripts/ci/cycle-guard.test.mjs — 值级循环依赖门禁单测(issue #413 R2)。
++// AST 分类覆盖 structure-guard.mjs rule ④ 当年翻车的那类边界(字符串字面量里出现
++// "from"/import 关键字文本、反引号模板字符串内嵌 import 语句)——这正是本守卫改走
++// TS compiler API 要免疫的盲区,不是随手添的用例。
++import { describe, it, expect, afterEach } from 'vitest'
++import { writeFileSync, rmSync, existsSync } from 'node:fs'
++import { execFileSync } from 'node:child_process'
++import { join } from 'node:path'
++import { findCircles } from '../codemap.mjs'
++import { classifyFileSpecs, matchWhitelist, evaluateCycles } from './cycle-guard.mjs'
++
++const REPO_ROOT = process.cwd()
++const GUARD = join(REPO_ROOT, 'scripts', 'ci', 'cycle-guard.mjs')
++
++describe('cycle-guard classifyFileSpecs(TS AST 边分类)', () => {
++  it('普通值级具名 import → allSpecs 与 valueSpecs 都含该 spec', () => {
++    const { allSpecs, valueSpecs } = classifyFileSpecs('x.ts', "import { real } from './realDep'\n")
++    expect(allSpecs.has('./realDep')).toBe(true)
++    expect(valueSpecs.has('./realDep')).toBe(true)
++  })
++
++  it('整句 import type → 进 allSpecs 但不进 valueSpecs', () => {
++    const { allSpecs, valueSpecs } = classifyFileSpecs('x.ts', "import type { Foo } from './typeOnlyDep'\n")
++    expect(allSpecs.has('./typeOnlyDep')).toBe(true)
++    expect(valueSpecs.has('./typeOnlyDep')).toBe(false)
++  })
++
++  it('specifier 级 type(具名全带 type 前缀)→ 判 type-only', () => {
++    const { allSpecs, valueSpecs } = classifyFileSpecs('x.ts', "import { type A, type B } from './allTypeNamed'\n")
++    expect(allSpecs.has('./allTypeNamed')).toBe(true)
++    expect(valueSpecs.has('./allTypeNamed')).toBe(false)
++  })
++
++  it('混合子句(具名解构含非 type 成员)→ 整条边判值级', () => {
++    const { valueSpecs } = classifyFileSpecs('x.ts', "import { RealValue, type OnlyType } from './mixedNamed'\n")
++    expect(valueSpecs.has('./mixedNamed')).toBe(true)
++  })
++
++  it('default import(无 type 修饰)→ 值级', () => {
++    const { valueSpecs } = classifyFileSpecs('x.ts', "import Default from './defaultDep'\n")
++    expect(valueSpecs.has('./defaultDep')).toBe(true)
++  })
++
++  it('namespace import(`* as ns`)→ 值级', () => {
++    const { valueSpecs } = classifyFileSpecs('x.ts', "import * as ns from './nsDep'\n")
++    expect(valueSpecs.has('./nsDep')).toBe(true)
++  })
++
++  it('副作用 import(无 importClause)→ 值级(模块仍被求值)', () => {
++    const { allSpecs, valueSpecs } = classifyFileSpecs('x.ts', "import './sideEffectDep'\n")
++    expect(allSpecs.has('./sideEffectDep')).toBe(true)
++    expect(valueSpecs.has('./sideEffectDep')).toBe(true)
++  })
++
++  it('export type { ... } from 整句重导出 → type-only', () => {
++    const { allSpecs, valueSpecs } = classifyFileSpecs('x.ts', "export type { Foo } from './typeReexport'\n")
++    expect(allSpecs.has('./typeReexport')).toBe(true)
++    expect(valueSpecs.has('./typeReexport')).toBe(false)
++  })
++
++  it('export { real, type OnlyType } from 混合 → 值级', () => {
++    const { valueSpecs } = classifyFileSpecs('x.ts', "export { real, type OnlyType } from './mixedExport'\n")
++    expect(valueSpecs.has('./mixedExport')).toBe(true)
++  })
++
++  it('export * from(无 exportClause)→ 值级', () => {
++    const { valueSpecs } = classifyFileSpecs('x.ts', "export * from './starExport'\n")
++    expect(valueSpecs.has('./starExport')).toBe(true)
++  })
++
++  it('export type * from → type-only', () => {
++    const { allSpecs, valueSpecs } = classifyFileSpecs('x.ts', "export type * from './starTypeExport'\n")
++    expect(allSpecs.has('./starTypeExport')).toBe(true)
++    expect(valueSpecs.has('./starTypeExport')).toBe(false)
++  })
++
++  it('await import(...) 动态导入 → 恒值级', () => {
++    const { valueSpecs } = classifyFileSpecs(
++      'x.ts',
++      "async function f() { const { x } = await import('./dynamicDep') }\n"
++    )
++    expect(valueSpecs.has('./dynamicDep')).toBe(true)
++  })
++
++  it('void import(...) 动态导入(不 await)→ 恒值级(模块仍被求值)', () => {
++    const { valueSpecs } = classifyFileSpecs('x.ts', "function f() { void import('./voidDep') }\n")
++    expect(valueSpecs.has('./voidDep')).toBe(true)
++  })
++
++  it('typeof import(...) 类型位置惯用法(ImportTypeNode)→ type-only,不落入值级', () => {
++    // 本仓 chatMaskEditFlow.ts / chatPersistSync.ts 的 ChatStoreInstance 类型故意用此手法
++    // 打破值级环——AST 把它解析为 ImportTypeNode,与 CallExpression 动态 import 是不同节点,
++    // 不需要任何"回溯判断"就天然不会误判为值级(对照 R1 版正则启发式需要专门写
++    // isTypePositionDynamicImportAt 回溯——这正是 AST 方案免疫整类问题的地方)。
++    const { allSpecs, valueSpecs } = classifyFileSpecs(
++      'x.ts',
++      "type Instance = typeof import('./chatStoreLike')['useChatStore']\n"
++    )
++    expect(allSpecs.has('./chatStoreLike')).toBe(true)
++    expect(valueSpecs.has('./chatStoreLike')).toBe(false)
++  })
++
++  it('`: import(...)` 变量类型标注位置 → type-only', () => {
++    const { allSpecs, valueSpecs } = classifyFileSpecs('x.ts', "const EMPTY: import('./recordLike').Item[] = []\n")
++    expect(allSpecs.has('./recordLike')).toBe(true)
++    expect(valueSpecs.has('./recordLike')).toBe(false)
++  })
++
++  it('泛型参数里的 import(...)(`Pick<import().Foo, ...>`)→ type-only', () => {
++    const { allSpecs, valueSpecs } = classifyFileSpecs(
++      'x.ts',
++      "type X = Pick<import('./storageLike').StateStorage, 'a'>\n"
++    )
++    expect(allSpecs.has('./storageLike')).toBe(true)
++    expect(valueSpecs.has('./storageLike')).toBe(false)
++  })
++
++  it('函数参数类型标注里的 import(...) → type-only', () => {
++    const { allSpecs, valueSpecs } = classifyFileSpecs('x.ts', "function f(edge: import('./typesLike').Edge) {}\n")
++    expect(allSpecs.has('./typesLike')).toBe(true)
++    expect(valueSpecs.has('./typesLike')).toBe(false)
++  })
++
++  // ── structure-guard.mjs rule ④ 当年翻车的那类边界(正则启发式的已知盲区,AST 天然免疫) ──
++  it('边界:字面量具名绑定叫 "from" 不干扰 import 语句边界(`import { from } from ...`)', () => {
++    const { allSpecs, valueSpecs } = classifyFileSpecs('x.ts', "import { from } from './fromNamedDep'\nimport { real } from './realDep'\n")
++    expect(allSpecs.has('./fromNamedDep')).toBe(true)
++    expect(valueSpecs.has('./fromNamedDep')).toBe(true)
++    expect(allSpecs.has('./realDep')).toBe(true)
++    expect(valueSpecs.has('./realDep')).toBe(true)
++  })
++
++  it('边界:反引号模板字符串内嵌 "import"/"from" 文本不被误判为 import edge', () => {
++    const content = [
++      "const sql = `import { fake } from './notARealImport'`",
++      "import { real } from './realDep'",
++    ].join('\n')
++    const { allSpecs, valueSpecs } = classifyFileSpecs('x.ts', content)
++    expect(allSpecs.has('./notARealImport')).toBe(false)
++    expect(valueSpecs.has('./notARealImport')).toBe(false)
++    expect(valueSpecs.has('./realDep')).toBe(true)
++  })
++
++  it('边界:模板字符串内嵌 ${} 插值表达式(含函数调用)不干扰边界识别', () => {
++    const content = [
++      "const msg = `hello ${doStuff('./notAPath')} from nowhere`",
++      "import { real } from './realDep'",
++    ].join('\n')
++    const { allSpecs, valueSpecs } = classifyFileSpecs('x.ts', content)
++    expect(allSpecs.has('./notAPath')).toBe(false)
++    expect(valueSpecs.has('./realDep')).toBe(true)
++  })
++
++  it('边界:注释里出现 import type ... from 文本不被误判(TS parser 天然跳过注释)', () => {
++    const content = [
++      "// import type { Foo } from './commentedOutDep'",
++      "import { real } from './realDep'",
++    ].join('\n')
++    const { allSpecs, valueSpecs } = classifyFileSpecs('x.ts', content)
++    expect(allSpecs.has('./commentedOutDep')).toBe(false)
++    expect(valueSpecs.has('./realDep')).toBe(true)
++  })
++})
++
++describe('cycle-guard findCircles 组合(复用 codemap.mjs 导出,不重复实现图算法;issue #413 三路径 ①②)', () => {
++  it('① 人造值级环 fixture：互相值导入的两文件在值级图上被检出为环', () => {
++    const fileA = 'src/__fixtureValueA.ts'
++    const fileB = 'src/__fixtureValueB.ts'
++    const { valueSpecs: va } = classifyFileSpecs(fileA, "import { b } from './__fixtureValueB'\nexport const a = 1\n")
++    const { valueSpecs: vb } = classifyFileSpecs(fileB, "import { a } from './__fixtureValueA'\nexport const b = 1\n")
++    expect(va.has('./__fixtureValueB')).toBe(true)
++    expect(vb.has('./__fixtureValueA')).toBe(true)
++    const valueAdj = new Map([
++      [fileA, [fileB]],
++      [fileB, [fileA]],
++    ])
++    expect(findCircles(valueAdj)).toHaveLength(1)
++  })
++
++  it('② 人造 type-only 环 fixture：互相 import type 的两文件不产生值级边，值级图上无环', () => {
++    const fileA = 'src/__fixtureTypeA.ts'
++    const fileB = 'src/__fixtureTypeB.ts'
++    const { allSpecs: aa, valueSpecs: va } = classifyFileSpecs(fileA, "import type { B } from './__fixtureTypeB'\nexport type A = number\n")
++    const { allSpecs: ab, valueSpecs: vb } = classifyFileSpecs(fileB, "import type { A } from './__fixtureTypeA'\nexport type B = number\n")
++    expect(aa.has('./__fixtureTypeB')).toBe(true)
++    expect(ab.has('./__fixtureTypeA')).toBe(true)
++    expect(va.size).toBe(0)
++    expect(vb.size).toBe(0)
++    const valueAdj = new Map([
++      [fileA, []],
++      [fileB, []],
++    ])
++    expect(findCircles(valueAdj)).toHaveLength(0)
++  })
++})
++
++describe('cycle-guard matchWhitelist(issue #413 SC-3：与环表示顺序无关)', () => {
++  const entries = [
++    { nodes: ['a.ts', 'b.ts'], kind: 'accepted', reason: 'r' },
++  ]
++
++  it('白名单命中：不论起点/方向如何表示，同一节点集合都命中', () => {
++    expect(matchWhitelist(entries, ['a.ts', 'b.ts', 'a.ts'])).not.toBeNull()
++    expect(matchWhitelist(entries, ['b.ts', 'a.ts'])).not.toBeNull()
++    expect(matchWhitelist(entries, ['a.ts', 'b.ts', 'a.ts']).kind).toBe('accepted')
++  })
++
++  it('未命中白名单的环返回 null', () => {
++    expect(matchWhitelist(entries, ['c.ts', 'd.ts'])).toBeNull()
++  })
++})
++
++describe('cycle-guard evaluateCycles(issue #413：白名单单调收缩，不致 exit 1)', () => {
++  const entries = [{ nodes: ['a.ts', 'b.ts'], kind: 'accepted', reason: 'r' }]
++
++  it('③ 白名单命中的值环 → 不进 nonWhitelistedCycles(不致 exit 1)', () => {
++    const ring = ['a.ts', 'b.ts', 'a.ts']
++    const result = evaluateCycles({ allCycles: [ring], valueCycles: [ring], baselineEntries: entries })
++    expect(result.nonWhitelistedCycles).toHaveLength(0)
++    expect(result.whitelistedCycles).toHaveLength(1)
++    expect(result.staleWhitelistEntries).toHaveLength(0)
++  })
++
++  it('valueCircular 为空时，白名单条目被判定为 stale，但仍不致 exit 1', () => {
++    const result = evaluateCycles({ allCycles: [], valueCycles: [], baselineEntries: entries })
++    expect(result.nonWhitelistedCycles).toHaveLength(0)
++    expect(result.valueCycles).toHaveLength(0)
++    expect(result.staleWhitelistEntries).toHaveLength(1)
++  })
++
++  it('未命中白名单的环 → 进 nonWhitelistedCycles(会致 exit 1)', () => {
++    const rogue = ['c.ts', 'd.ts']
++    const result = evaluateCycles({ allCycles: [rogue], valueCycles: [rogue], baselineEntries: entries })
++    expect(result.nonWhitelistedCycles).toEqual([['c.ts', 'd.ts']])
++  })
++
++  it('不做减法指标：allCycleCount 与 valueCycleCount 各自独立计数', () => {
++    const ring = ['a.ts', 'b.ts', 'a.ts']
++    const result = evaluateCycles({ allCycles: [ring, ['x.ts', 'y.ts']], valueCycles: [ring], baselineEntries: entries })
++    expect(result.allCycleCount).toBe(2)
++    expect(result.valueCycleCount).toBe(1)
++  })
++})
++
++describe('cycle-guard 端到端(spawn 真实 CLI)', () => {
++  const scratchFiles = []
++  afterEach(() => {
++    for (const f of scratchFiles) {
++      try {
++        if (existsSync(f)) rmSync(f)
++      } catch {
++        // best-effort 清理
++      }
++    }
++    scratchFiles.length = 0
++  })
++
++  function runGuard(extraArgs = []) {
++    try {
++      const out = execFileSync('node', [GUARD, '--json', ...extraArgs], {
++        cwd: REPO_ROOT,
++        encoding: 'utf8',
++        stdio: ['pipe', 'pipe', 'pipe'],
++      })
++      return { exit: 0, out: JSON.parse(out) }
++    } catch (e) {
++      let parsed = null
++      try {
++        parsed = JSON.parse(e.stdout || '')
++      } catch {
++        // --update-baseline 拒绝时 stdout 为空,不解析
++      }
++      return { exit: e.status ?? 1, out: parsed, stderr: e.stderr || '' }
++    }
++  }
++
++  it('当前仓库基线：exit 0，13 处值级环全部命中白名单', () => {
++    const { exit, out } = runGuard()
++    expect(exit).toBe(0)
++    expect(out.valueCycleCount).toBe(13)
++    expect(out.nonWhitelistedCycles).toHaveLength(0)
++    expect(out.staleWhitelistEntries).toHaveLength(0)
++  })
++
++  it('注入新值级环 → exit 1 且环出现在 nonWhitelistedCycles(SC-2)', () => {
++    const fileA = join(REPO_ROOT, 'src', '__scratchCycleGuardA.ts')
++    const fileB = join(REPO_ROOT, 'src', '__scratchCycleGuardB.ts')
++    writeFileSync(fileA, "import { scratchBValue } from './__scratchCycleGuardB'\nexport const scratchAValue = 1\n")
++    writeFileSync(fileB, "import { scratchAValue } from './__scratchCycleGuardA'\nexport const scratchBValue = 1\n")
++    scratchFiles.push(fileA, fileB)
++
++    const { exit, out } = runGuard()
++    expect(exit).toBe(1)
++    expect(out.nonWhitelistedCycles.length).toBeGreaterThan(0)
++    const flat = out.nonWhitelistedCycles.flat()
++    expect(flat.some((p) => p.includes('__scratchCycleGuardA'))).toBe(true)
++  })
++})
+diff --git a/scripts/codemap.mjs b/scripts/codemap.mjs
+index 69466b24..1fa87c62 100644
+--- a/scripts/codemap.mjs
++++ b/scripts/codemap.mjs
+@@ -1,5 +1,6 @@
+ // MivoCanvas codemap — 模块级仓库地图，供 SessionStart hook 注入。
+-// 零第三方依赖：自写 import 扫描（相对路径 + 路径补全）。
++// 零第三方依赖：自写 import 扫描（相对路径 + 路径补全）。hook 路径不能依赖 node_modules
++// (SessionStart 注入必须在 npm ci 之前也能跑),故本文件保持零依赖正则近似。
+ // 设计见 docs/decisions 与 TECH_DEBT_AUDIT.md "Architectural mental model" 段。
+ // 两种模式：--compact（默认，硬上限 3KB）/ --full（完整 markdown 至 stdout）。
+ // 性能门：全流程 <5s，耗时打印至 stderr（不污染 stdout 注入流）。
+@@ -9,13 +10,36 @@
+ // - 启动读 tsconfig，若发现 path alias 则 stderr 显著 warning（防未来失真）
+ // - 相对路径按 .ts/.tsx → /index.ts(x) 序补全；解析不到的不丢弃，尾部报 unresolved 计数
+ // - 循环依赖 DFS 计数
++//
++// issue #413（值级环展示，不加 madge）：
++// 依赖图分两层 —— 全边图（adj，含 type-only 边，保持现状用途：模块级 deps/rdeps 展示、
++// 既有 circ 计数）+ 值级边图（valueAdj，仅保留至少含一个值级引用的边，供 compact/full
++// 展示参考）。分类规则见 isValueImportAt/isClauseTypeOnly/isTypePositionDynamicImportAt：
++// - 整句 `import type ...` / `export type ...`（含 `export type * from`）→ 该边纯 type-only
++// - 具名解构里全员带 `type ` 前缀（如 `import { type A, type B } from`）→ type-only
++// - `typeof import('./x')` / `: import('./x').Foo` 等类型位置动态 import() → type-only
++//   （本仓 chatMaskEditFlow.ts/chatPersistSync.ts 故意用此惯用法打破值级环）
++// - 其余形态（default/namespace import、具名解构混有非 type 成员、真实 await/void
++//   import()）→ 值级
++// ⚠️ 本文件的值级/type-only 分类是**正则近似，仅供 hook 展示参考，不是门禁真相源**。
++// 已知启发式局限（无第三方 parser，零依赖约束下的取舍）：clause 边界靠"最近一个未转义的
++// 引号/分号"回溯定位，若某文件恰好把字面量 "from" 当具名绑定（`import { from } from './x'`）
++// 或在 import 子句内嵌套反引号模板字符串会误判。**门禁真相以 scripts/ci/cycle-guard.mjs
++// 的 TS AST 分类为准**（同 scripts/ci/structure-guard.mjs rule ④ 的既有先例：手写词法
++// 分析器是无底洞，AST 天然免疫字符串/模板/正则/注释边界）——本文件保留近似只是因为 hook
++// 场景不能引入 node_modules 依赖，circ 计数与值级展示因此只是参考数字，新增值级环的
++// fail-closed 阻断由 cycle-guard.mjs（`npm run check:cycles`）负责，不在本文件。
++// collectFiles / resolveImport / findCircles 导出供 cycle-guard.mjs 复用，避免重复实现
++// 文件收集/路径解析/环检测三段图算法。
+ 
+ import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+ import { join, relative, dirname, resolve, sep, posix, extname } from "node:path";
+ import { fileURLToPath } from "node:url";
+ 
+ const COMPACT_CAP_BYTES = 3072; // 3KB 硬上限
+-const ROOT = process.cwd();
++// 导出供 scripts/ci/cycle-guard.mjs 复用(issue #413,与 collectFiles/resolveImport 返回的
++// posix 相对路径配套，用于还原绝对路径读文件)。
++export const ROOT = process.cwd();
+ 
+ // ── 模块职责映射表（手写，参考 TECH_DEBT_AUDIT.md mental model 措辞） ──
+ const RESPONSIBILITY = {
+@@ -92,8 +116,8 @@ function truncateBytes(str, cap) {
+   return buf.slice(0, cut).toString("utf8");
+ }
+ 
+-// 递归收集源文件（posix 相对路径）
+-function collectFiles() {
++// 递归收集源文件（posix 相对路径）。导出供 scripts/ci/cycle-guard.mjs 复用(issue #413)。
++export function collectFiles() {
+   const out = [];
+   function walk(dirAbs, dirPosix) {
+     let entries;
+@@ -131,7 +155,8 @@ function collectFiles() {
+ // 相对路径补全：基于 fromFile 的目录，解析 specifier 到 posix 相对路径。
+ // 按 .ts/.tsx → /index.ts(x) 序；带扩展名直接用。解析不到返回 null。
+ const TRY_EXTS = [".ts", ".tsx", ".js", "/index.ts", "/index.tsx", "/index.js"];
+-function resolveImport(specifier, fromFilePosix) {
++// 导出供 scripts/ci/cycle-guard.mjs 复用(issue #413)。
++export function resolveImport(specifier, fromFilePosix) {
+   const fromAbs = join(ROOT, fromFilePosix);
+   const base = resolve(dirname(fromAbs), specifier); // 绝对路径
+   const baseRel = relative(ROOT, base); // 回到 posix 相对
+@@ -148,31 +173,96 @@ function resolveImport(specifier, fromFilePosix) {
+   return null;
+ }
+ 
++// 判断某条具名解构子句(import/export 关键字之后、from 之前的文本)是否整句 type-only。
++// 覆盖：`type { A, B }`(具名全带 type)/ `type Default` / `type * as ns`。
++// 空 `{}` 或含任一非 type 具名成员 → false(保守判值边，见文件头注释"局限"段)。
++function isClauseTypeOnly(clauseAfterKeyword) {
++  const c = clauseAfterKeyword.trim();
++  if (/^type\b/.test(c)) return true;
++  const brace = c.match(/^\{([\s\S]*)\}$/);
++  if (brace) {
++    const inner = brace[1].trim();
++    if (!inner) return false;
++    return inner.split(",").every((p) => /^type\s+\S/.test(p.trim()));
++  }
++  return false;
++}
++
++// 判断 stripped 文本中位于 fromIndex 的 "from" 关键字，是否属于纯 type-only 的
++// import/export 语句。向前回溯到最近的 ';' 或未转义引号（上一语句的边界/字符串边界），
++// 该窗口内找 import/export 关键字取其后子句分类；找不到关键字则保守判值边。
++function isValueImportAt(stripped, fromIndex) {
++  let i = fromIndex - 1;
++  while (i >= 0) {
++    const ch = stripped[i];
++    if (ch === ";" || ch === '"' || ch === "'") break;
++    i--;
++  }
++  const clause = stripped.slice(i + 1, fromIndex);
++  const kw = clause.match(/\b(?:import|export)\b([\s\S]*)$/);
++  if (!kw) return true;
++  return !isClauseTypeOnly(kw[1]);
++}
++
++// 判断 stripped 文本中位于 matchIndex 的 `import(...)` 是否处于"类型位置"
++// (`typeof import('./x')` / `: import('./x').Foo` / `Pick<import('./x').Foo, ...>` 等
++// TS "typeof import() 取类型"惯用法)。本仓多处刻意用此惯用法打破值级静态环
++// (chatMaskEditFlow.ts / chatPersistSync.ts 的 `ChatStoreInstance` 注释明确写明用途)，
++// 误判为值边会把编译期擦除的类型引用错记成真实运行时环。只看 import( 前一个 token 即可
++// 判定(不像具名解构需要整句)：`:` / `<` 结尾，或前一个词是 `typeof`。
++// 已知局限：`as import(...)`、联合/交叉类型里的 `| import(...)` 未覆盖(本仓当前无此写法)。
++function isTypePositionDynamicImportAt(stripped, matchIndex) {
++  const before = stripped.slice(Math.max(0, matchIndex - 40), matchIndex).replace(/\s+$/, "");
++  if (/[:<]$/.test(before)) return true;
++  if (/\btypeof$/.test(before)) return true;
++  return false;
++}
++
+ // 从源码文本提取相对 import specifier(先剔 // 与 /* */ 注释,防 `from '...'` 出现在
+ // 注释里被误判为 import edge —— A7a-4 假阳性:canvasStore.ts 自环注释 / canvasStateTypes
+ // 注释把 27 报成 29)。纯函数(不碰文件系统),便于 fixture 测试。
+-export function extractSpecs(content) {
++// issue #413:同时分类每条边是否值级(valueSpecs ⊆ allSpecs)。动态 import() 默认值级
++// (运行时才发生的模块求值)，但类型位置的 `typeof import()` 惯用法例外(见上）。
++export function extractSpecsClassified(content) {
+   const stripped = stripJsonComments(content);
+-  const specs = new Set();
++  const allSpecs = new Set();
++  const valueSpecs = new Set();
+   RE_FROM.lastIndex = 0;
+-  RE_DYNAMIC.lastIndex = 0;
+   let m;
+-  while ((m = RE_FROM.exec(stripped)) !== null) specs.add(m[1]);
+-  while ((m = RE_DYNAMIC.exec(stripped)) !== null) specs.add(m[1]);
+-  return specs;
++  while ((m = RE_FROM.exec(stripped)) !== null) {
++    allSpecs.add(m[1]);
++    if (isValueImportAt(stripped, m.index)) valueSpecs.add(m[1]);
++  }
++  RE_DYNAMIC.lastIndex = 0;
++  while ((m = RE_DYNAMIC.exec(stripped)) !== null) {
++    allSpecs.add(m[1]);
++    if (!isTypePositionDynamicImportAt(stripped, m.index)) valueSpecs.add(m[1]);
++  }
++  return { allSpecs, valueSpecs };
++}
++
++// 向后兼容：仅取全边集合（既有 fixture 测试与 buildGraph 全边图消费点）。
++export function extractSpecs(content) {
++  return extractSpecsClassified(content).allSpecs;
+ }
+ 
+-// 扫描单文件的相对 import，返回 { resolved: string[], unresolved: number }
++// 扫描单文件的相对 import，返回 { resolved, resolvedValue, unresolved }。
++// resolved = 全边（含 type-only，保持既有用途）；resolvedValue = 仅值级边子集。
+ export function scanFileImports(filePx, content) {
+-  const specs = extractSpecs(content);
++  const { allSpecs, valueSpecs } = extractSpecsClassified(content);
+   const resolved = new Set();
++  const resolvedValue = new Set();
+   let unresolved = 0;
+-  for (const spec of specs) {
++  for (const spec of allSpecs) {
+     const target = resolveImport(spec, filePx);
+-    if (target) resolved.add(target);
+-    else unresolved++;
++    if (target) {
++      resolved.add(target);
++      if (valueSpecs.has(spec)) resolvedValue.add(target);
++    } else {
++      unresolved++;
++    }
+   }
+-  return { resolved: [...resolved], unresolved };
++  return { resolved: [...resolved], resolvedValue: [...resolvedValue], unresolved };
+ }
+ 
+ // ── path alias 守卫：读 tsconfig，paths 非空则 warning ──
+@@ -247,7 +337,8 @@ export function stripJsonComments(s) {
+ 
+ // ── 图构建 ──
+ function buildGraph(files) {
+-  const adj = new Map(); // file → [resolved files]
++  const adj = new Map(); // file → [resolved files]（全边，含 type-only，保持既有用途）
++  const valueAdj = new Map(); // file → [resolved files]（仅值级边，issue #413）
+   let totalUnresolved = 0;
+   for (const file of files) {
+     const abs = join(ROOT, file);
+@@ -257,16 +348,18 @@ function buildGraph(files) {
+     } catch {
+       content = "";
+     }
+-    const { resolved, unresolved } = scanFileImports(file, content);
++    const { resolved, resolvedValue, unresolved } = scanFileImports(file, content);
+     adj.set(file, resolved);
++    valueAdj.set(file, resolvedValue);
+     totalUnresolved += unresolved;
+   }
+   const circular = findCircles(adj);
+-  return { adj, circular, totalUnresolved };
++  const valueCircular = findCircles(valueAdj);
++  return { adj, valueAdj, circular, valueCircular, totalUnresolved };
+ }
+ 
+-// 循环依赖检测：DFS 维护递归栈
+-function findCircles(adj) {
++// 循环依赖检测：DFS 维护递归栈。导出供 fixture 测试直接构造 Map 验证(issue #413)。
++export function findCircles(adj) {
+   const nodes = [...adj.keys()];
+   const idx = new Map(nodes.map((n, i) => [n, i]));
+   const state = new Uint8Array(nodes.length); // 0=未访 1=栈中 2=完成
+@@ -347,7 +440,7 @@ function collectStats(adj, files) {
+   return { modules, sortedKeys, fileLines };
+ }
+ 
+-function buildFull({ modules, sortedKeys, fileLines, circular, totalUnresolved, elapsedMs }) {
++function buildFull({ modules, sortedKeys, fileLines, circular, valueCircular, totalUnresolved, elapsedMs }) {
+   const out = [];
+   out.push("# MivoCanvas Codemap");
+   out.push(...NAV_LINES);
+@@ -355,7 +448,7 @@ function buildFull({ modules, sortedKeys, fileLines, circular, totalUnresolved,
+   const totalFiles = [...modules.values()].reduce((s, m) => s + m.files, 0);
+   const totalLines = [...modules.values()].reduce((s, m) => s + m.lines, 0);
+   out.push(
+-    `modules: ${sortedKeys.length} | files: ${totalFiles} | lines: ${totalLines} | circ: ${circular.length} | unresolved: ${totalUnresolved} | gen: ${(elapsedMs / 1000).toFixed(2)}s`
++    `modules: ${sortedKeys.length} | files: ${totalFiles} | lines: ${totalLines} | circ: ${circular.length} (value: ${valueCircular.length}) | unresolved: ${totalUnresolved} | gen: ${(elapsedMs / 1000).toFixed(2)}s`
+   );
+   out.push("");
+   out.push("## 模块（文件数 / 行数 / 职责 / 依赖 / 被依赖）");
+@@ -374,21 +467,28 @@ function buildFull({ modules, sortedKeys, fileLines, circular, totalUnresolved,
+   for (const f of top) out.push(`- ${f.path}:${f.lines}`);
+   if (circular.length) {
+     out.push("");
+-    out.push(`## 循环依赖（${circular.length} 处，前 5 处）`);
++    out.push(`## 循环依赖（全边 ${circular.length} 处，前 5 处；含编译期擦除的 import type 假环）`);
+     for (const ring of circular.slice(0, 5)) out.push(`- ${ring.join(" → ")}`);
+   }
++  if (valueCircular.length) {
++    out.push("");
++    out.push(
++      `## 值级循环依赖（近似 ${valueCircular.length} 处，issue #413；门禁真相见 scripts/ci/cycle-guard.mjs）`
++    );
++    for (const ring of valueCircular) out.push(`- ${ring.join(" → ")}`);
++  }
+   out.push("");
+   return out.join("\n");
+ }
+ 
+-function buildCompact({ modules, sortedKeys, fileLines, circular, totalUnresolved, elapsedMs }) {
++function buildCompact({ modules, sortedKeys, fileLines, circular, valueCircular, totalUnresolved, elapsedMs }) {
+   const totalFiles = [...modules.values()].reduce((s, m) => s + m.files, 0);
+   const totalLines = [...modules.values()].reduce((s, m) => s + m.lines, 0);
+   const out = [];
+   out.push("# MivoCanvas Codemap");
+   out.push(...NAV_LINES);
+   out.push(
+-    `modules: ${sortedKeys.length} | files: ${totalFiles} | lines: ${totalLines} | circ: ${circular.length} | unresolved: ${totalUnresolved} | gen: ${(elapsedMs / 1000).toFixed(2)}s`
++    `modules: ${sortedKeys.length} | files: ${totalFiles} | lines: ${totalLines} | circ: ${circular.length} (value: ${valueCircular.length}) | unresolved: ${totalUnresolved} | gen: ${(elapsedMs / 1000).toFixed(2)}s`
+   );
+   out.push("");
+   out.push("## 模块");
+@@ -427,13 +527,13 @@ async function main() {
+ 
+   checkPathAlias();
+   const files = collectFiles();
+-  const { adj, circular, totalUnresolved } = buildGraph(files);
+-  const stats = collectStats(adj, files);
++  const { adj, circular, valueCircular, totalUnresolved } = buildGraph(files);
+ 
+   const t1 = process.hrtime.bigint();
+   const elapsedMs = Number(t1 - t0) / 1e6;
+ 
+-  const payload = { ...stats, circular, totalUnresolved, elapsedMs };
++  const stats = collectStats(adj, files);
++  const payload = { ...stats, circular, valueCircular, totalUnresolved, elapsedMs };
+   let output = full ? buildFull(payload) : buildCompact(payload);
+ 
+   if (!full) {
+diff --git a/scripts/codemap.test.mjs b/scripts/codemap.test.mjs
+index 5b1bd3e0..6e1d0d91 100644
+--- a/scripts/codemap.test.mjs
++++ b/scripts/codemap.test.mjs
+@@ -6,7 +6,7 @@
+ // 本文件为 .mjs:codemap.mjs 是无 .d.ts 的 ESM 脚本,.ts 导入会触发 TS7016;
+ // vitest 默认 include 覆盖 .test.mjs,且 .mjs 不经 tsc -b,避免类型摩擦。
+ import { describe, it, expect } from 'vitest'
+-import { extractSpecs, stripJsonComments } from './codemap.mjs'
++import { extractSpecs, stripJsonComments, extractSpecsClassified } from './codemap.mjs'
+ 
+ describe('codemap extractSpecs (A7a-4: 注释假阳性修复)', () => {
+   it('行注释内的 from 不计为 import edge', () => {
+@@ -76,3 +76,63 @@ describe('codemap stripJsonComments', () => {
+     expect(out).toContain('http://example.com') // 字符串内的 // 不被误剔
+   })
+ })
++
++// ── issue #413:值级 / type-only 边分层展示(不加 madge)。此处只测本文件保留的正则近似
++// 分类逻辑,供 SessionStart hook 展示参考;门禁真相与三路径覆盖(值级环检出 / type-only
++// 环不检出 / 白名单顺序无关匹配 / stale 机制)已迁至 scripts/ci/cycle-guard.test.mjs
++// (AST 分类 + 复用本文件导出的 findCircles,不重复造轮子)。──
++describe('codemap extractSpecsClassified 边分类(issue #413，hook 展示用正则近似)', () => {
++  it('普通具名值级 import → allSpecs 与 valueSpecs 都含该 spec', () => {
++    const content = "import { real } from './realDep'\n"
++    const { allSpecs, valueSpecs } = extractSpecsClassified(content)
++    expect(allSpecs.has('./realDep')).toBe(true)
++    expect(valueSpecs.has('./realDep')).toBe(true)
++  })
++
++  it('整句 import type → 进 allSpecs 但不进 valueSpecs', () => {
++    const content = "import type { Foo } from './typeOnlyDep'\n"
++    const { allSpecs, valueSpecs } = extractSpecsClassified(content)
++    expect(allSpecs.has('./typeOnlyDep')).toBe(true)
++    expect(valueSpecs.has('./typeOnlyDep')).toBe(false)
++  })
++
++  it('具名解构全员带 type 前缀 → 判 type-only', () => {
++    const content = "import { type A, type B } from './allTypeNamed'\n"
++    const { allSpecs, valueSpecs } = extractSpecsClassified(content)
++    expect(allSpecs.has('./allTypeNamed')).toBe(true)
++    expect(valueSpecs.has('./allTypeNamed')).toBe(false)
++  })
++
++  it('具名解构混有非 type 成员 → 整条边判值级(哪怕另有 type 成员)', () => {
++    const content = "import { RealValue, type OnlyType } from './mixedNamed'\n"
++    const { valueSpecs } = extractSpecsClassified(content)
++    expect(valueSpecs.has('./mixedNamed')).toBe(true)
++  })
++
++  it('export type { ... } from 整句重导出 → 判 type-only', () => {
++    const content = "export type { Foo } from './typeReexport'\n"
++    const { allSpecs, valueSpecs } = extractSpecsClassified(content)
++    expect(allSpecs.has('./typeReexport')).toBe(true)
++    expect(valueSpecs.has('./typeReexport')).toBe(false)
++  })
++
++  it('await import(...) 动态导入 → 恒判值级(运行时才发生的模块求值)', () => {
++    const content = "async function f() { const { x } = await import('./dynamicDep') }\n"
++    const { valueSpecs } = extractSpecsClassified(content)
++    expect(valueSpecs.has('./dynamicDep')).toBe(true)
++  })
++
++  it('typeof import(...) 类型位置惯用法 → 判 type-only(本仓 chatMaskEditFlow/chatPersistSync 打破值级环的手法)', () => {
++    const content = "type Instance = typeof import('./chatStoreLike')['useChatStore']\n"
++    const { allSpecs, valueSpecs } = extractSpecsClassified(content)
++    expect(allSpecs.has('./chatStoreLike')).toBe(true)
++    expect(valueSpecs.has('./chatStoreLike')).toBe(false)
++  })
++
++  it('`: import(...)` 变量类型标注位置 → 判 type-only', () => {
++    const content = "const EMPTY: import('./recordLike').Item[] = []\n"
++    const { allSpecs, valueSpecs } = extractSpecsClassified(content)
++    expect(allSpecs.has('./recordLike')).toBe(true)
++    expect(valueSpecs.has('./recordLike')).toBe(false)
++  })
++})

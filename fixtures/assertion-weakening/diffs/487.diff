@@ -1,0 +1,1117 @@
+diff --git a/agent-use/docs/pr-rules.json b/agent-use/docs/pr-rules.json
+index d9888eea..f9d8feed 100644
+--- a/agent-use/docs/pr-rules.json
++++ b/agent-use/docs/pr-rules.json
+@@ -90,20 +90,20 @@
+   "selfFixAuthors": [],
+   "loopPrExclusion": {
+     "titlePrefix": "[bug-doctor] ",
+-    "t1BodyMarkers": [
+-      "^T-level:\\s*T1\\s*$"
+-    ],
++    "t1BodyMarkers": [],
+     "t2BodyMarkers": [
+       "^T-level:\\s*T2\\s*$"
+     ],
+     "stateFile": "history/loops/bug-doctor/state.json",
+-    "defaultWhenAmbiguous": "skip",
++    "defaultWhenAmbiguous": "t2",
+     "mergeAckNotify": {
+       "stateDir": "history/loops/bug-doctor",
+       "dedupFile": "history/loops/review-pr/.merge-notified.json",
+       "notifyModule": "scripts/loops/bug-doctor/notify.mjs",
+       "sender": "cloud"
+-    }
++    },
++    "_t1BodyMarkers_comment": "2026-08-04 缴械:T1 body 标记清空——loop PR 不再存在「自管合并」档,body 写什么都不能把 PR 送进 skip;历史正则见 git 历史",
++    "_defaultWhenAmbiguous_comment": "2026-08-04 缴械:读不出 T-level 也进正常审查(t2),不再保守 skip——skip 语义已随 bug-doctor 合并权移除而废止"
+   },
+   "structuralBypassAllowlist": [
+     "code_scanning",
+@@ -111,7 +111,7 @@
+   ],
+   "securityReviewPaths": [
+     "^scripts/review-pr/",
+-    "^scripts/loops/bug-doctor/",
++    "^scripts/loops/",
+     "^scripts/ci/main-health-logic\\.mjs$",
+     "^agent-use/",
+     "^\\.github/workflows/",
+@@ -122,7 +122,8 @@
+     "package-lock\\.json$",
+     "npm-shrinkwrap\\.json$",
+     "pnpm-lock\\.yaml$",
+-    "\\.npmrc$"
++    "\\.npmrc$",
++    "^docs/loops/"
+   ],
+   "sensitiveContent": {
+     "allowPaths": [],
+diff --git a/docs/loops/bug-doctor-cutover-runbook.md b/docs/loops/bug-doctor-cutover-runbook.md
+new file mode 100644
+index 00000000..83fb8c86
+--- /dev/null
++++ b/docs/loops/bug-doctor-cutover-runbook.md
+@@ -0,0 +1,106 @@
++# bug-doctor 缴械切流操作单(mini 侧,人工执行)
++
++> 配套 owner 2026-08-04 决策「mergeAuthority=review-pr-only」。本文是**跨机人工操作单**:
++> 仓库侧改动(rules.json 缴械 / prompt 镜像 / 守卫)随本 PR 交付,
++> 但 **mini 面板里的生产 prompt 不入库**——旧 prompt 仍含 T1 自动合并指令,不按本单切流
++> 就存在「仓库已缴械、班车还在按旧令合并」的窗口期(三审 GPT 阻断②)。
++>
++> 执行人:owner 或 mini agent。全程约 15 分钟 + 一晚观察。
++
++## 前置事实(执行前逐条确认)
++
++- [ ] 本 PR(缴械 PR)的合并已排期(注意时序:**第 1 步停车在合并之前**;从第 2 步起本 PR 必须已合并进 main,届时记下 merge SHA:`________`)
++- [ ] mini 的 checkout 是 `/Users/praise/mivo-ops/mivo-canvas`,只经 `git pull --ff-only` 更新
++- [ ] mini 面板有两条 bug-doctor 定时会话:主轮(02:30)与补轮(13:00);另有 launchd 的
++      `com.mivo.bug-doctor.patrol`(每小时,不含合并动作,无需动)
++
++## 第 1 步 · 停车(**必须在合并本 PR 之前完成**;若合并后才发现未停车,立即补停并逐条核查窗口期内 mini 侧有无合并动作)
++
++在 mini 面板把主轮(02:30)与补轮(13:00)两条定时会话**暂停**。
++做不到暂停的,先把两段 prompt 顶部插入一行(临时急停,恢复时删掉):
++
++```
++【急停 2026-08-XX】本轮只读不派活:立即输出"cutover 停车中"并结束。
++```
++
++- [ ] 已停车,方式:暂停 / 急停行(圈一个)
++
++## 第 2 步 · 更新 mini 代码到缴械版
++
++```
++export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
++cd /Users/praise/mivo-ops/mivo-canvas
++git pull --ff-only
++git rev-parse HEAD        # 必须 == 第 0 项记下的 merge SHA 或其后代
++node -e "const r=require('./scripts/loops/bug-doctor/rules.json');if(r.mergeAuthority!=='review-pr-only'||r.t1.maxAutoMergePerDay!==0){console.error('缴械字段不对');process.exit(1)};console.log('rules 缴械 OK')"
++```
++
++- [ ] `rules 缴械 OK` 已打印
++
++## 第 3 步 · 改生产 prompt(两条会话都要)
++
++对照仓库镜像 `docs/loops/bug-doctor-scheduler-prompts.md`(缴械版)更新面板 prompt。
++最低要求(逐字,不许意译):
++
++1. 删除一切「T1 自动修复+合并」「merger worker 合并」「达标即合并」表述;
++2. 插入合并纪律硬句:
++   ```
++   合并纪律(2026-08-04 缴械,压过本 prompt 任何其他表述):任何簇、任何 tCap,
++   一律只修复+开 PR,绝不执行 gh pr merge / 任何合并动作 / 任何 /approve-merge 评论。
++   合并统一由 review-pr 巡审承担;PR body 必须含独立一行 `T-level: T2`。
++   ```
++3. 战报状态字改用:`pr-created / review-pending / fix-handoff / merged-by-review-pr / closed-unmerged`。
++
++改完对两段 prompt 各取 hash 留档(粘 prompt 原文进文件再 shasum):
++
++```
++pbpaste > /tmp/prompt-main.txt && shasum -a 256 /tmp/prompt-main.txt
++```
++
++- [ ] 主轮 prompt hash:`________`
++- [ ] 补轮 prompt hash:`________`
++
++## 第 4 步 · 恢复班车(负验先行)
++
++**负验(必须先做)**:若第 2 步 pull 失败/HEAD 不对,或第 3 步 prompt 未改完 —— **不得恢复班车**。
++「仓库新 + prompt 旧」与「仓库旧 + prompt 新」都算失败态,回到对应步骤补齐。
++
++迁移落盘验证(恢复前做):台账若有遗留 tCap=T1,先手动跑一轮轻巡把迁移写盘,
++不给 review-pr 留读到旧 T1 的窗口。**迁移语义(三审 F-487-004c 修订)**:写侧已缴械
++(sentry-intake 只产 T2 + assertDisarmed 机器强制),所以这是**一次性遗留清理**——
++本步跑完、下方 grep 得 0 之后,后续轮次不会再出现新 T1,第 6 步的一次性核验语义成立
++(不是「每轮常态覆盖」):
++
++```
++node scripts/loops/bug-doctor/patrol.mjs --state-dir /Users/praise/mivo-ops/mivo-canvas/history/loops/bug-doctor --no-gh
++grep -c '"tCap": "T1"' /Users/praise/mivo-ops/mivo-canvas/history/loops/bug-doctor/state.json   # 期望 0(无匹配 grep 退出码 1 属正常)
++```
++
++确认以上都到位后:恢复两条定时会话(或删掉急停行)。
++
++- [ ] 已恢复,时间:`________`
++
++## 第 5 步 · fix-handoff canary(通电前提验证,一次性)
++
++review-pr 的跟进闭环(审出问题 → 自动开跟进会话修)依赖 mini 宿主的会话投递能力,
++**从未实弹验证过**。在 `selfFixAuthors` 通电(独立 PR,见台账 B5)之前,用一个一次性
++测试 PR 走一遍:
++
++1. 开一个含明显小问题的 draft PR(如注释错字),转 ready;
++2. 等巡审下一轮打回并投递跟进会话;
++3. 核对:跟进会话在**独立 worktree**、拿到卡点清单、修完 push、`fix-session-state.mjs`
++   有指纹记录、下一轮巡审重审通过并合并、合并后 sweep 回收 worktree;
++4. 任一环节不通 → 把实况回报 owner,B5 保持不通电。
++
++- [ ] canary 结果:通 / 不通(附实况)
++
++## 第 6 步 · 次日观察(一晚)
++
++- [ ] 02:30 主轮战报:只出现 `pr-created`/`review-pending` 类状态字,无任何「已合并」自述
++- [ ] 巡审侧(每小时):loop PR 进入正常审查(logs 无 `skip-loop-managed`)
++- [ ] 若台账有遗留 tCap=T1:logs.md 出现「缴械迁移: tCap T1→T2 共 N 簇」一行
++
++## 回滚
++
++发现异常 → **只做第 1 步(停车)**,然后报 owner。**禁止**把 prompt 回退到旧自动合并版
++——旧版与已缴械的仓库代码组合行为未定义;缴械方向本身由 owner 决策,回滚决策同样归 owner。
+diff --git a/docs/loops/bug-doctor-scheduler-prompts.md b/docs/loops/bug-doctor-scheduler-prompts.md
+index f1445020..00c210ce 100644
+--- a/docs/loops/bug-doctor-scheduler-prompts.md
++++ b/docs/loops/bug-doctor-scheduler-prompts.md
+@@ -25,17 +25,19 @@ nightly-e2e + 本次新增的 Trae/Sentry findings 第三料源):
+   本轮(不重试、不排队)。
+ - 打开 history/loops/bug-doctor/workpacket.json,检查 signals.sentry.status:
+   - "consumed":本轮正常消费了昨日 Trae findings,继续往下看 clusters 里 origin=
+-    "trae-audit" 的项——这些是被 sentry-intake.mjs 预筛过的候选(tCap="T1" 表示结构性
+-    预筛通过,"T2" 表示建了簇但不合 T1 资格,只是可见)。
++    "trae-audit" 的项——这些是被 sentry-intake.mjs 预筛过的候选。**缴械后 tCap 一律为
++    T2(唯一合法持久值);预筛路由看 state.sentryIntake.decisions 的 result 字段
++    (accepted/rejected),不再用 tCap 区分**。台账若再出现 tCap="T1",视为缴械破裂
++    (写侧守卫被绕过),立即记入战报并转人工核查,不得当作正常预筛结果。
+   - "missing":昨日 findings 文件不存在(Trae 夜巡昨天没跑成或路径没配对),
+     不是错误,继续走本轮其余工作,不要因此中断。
+   - "degraded":连续 3 个自然日缺失或文件本身损坏,这是需要人工核查的信号(macmini
+     上 MivoSentry 夜巡是否还在跑、findings 路径是否漂移),记进本轮战报,不要静默略过。
+ - 按【队列纪律】处理完生产/人工的 P0-P1 之后,才轮到 Trae 簇:
+-  - tCap="T1" 且 sLevel 不高于当前处理预算的候选,可以走既有 T1 自动修复+合并流程
+-    (复现→最小修复→验证→审查→合并,禁区/白名单仍以 rules.json t1 段为准,sentry-intake
+-    只是多了一层"这条 finding 结构上像不像 T1"的预筛,不代表跳过既有 T1 全部条件)。
+-  - tCap="T2" 的 Trae 簇按普通 T2 流程处理(修复+PR 留人审),不按合并键。
++  - **合并纪律(2026-08-04 缴械,压过本文件任何旧表述):任何簇、任何 tCap,一律只修复+开 PR,
++    绝不执行 gh pr merge / 任何合并动作 / 任何 /approve-merge 评论**——合并统一由 review-pr
++    巡审承担;PR body 必须含独立一行 `T-level: T2`。
++  - 所有 Trae 簇(无论 tCap)按 T2 流程处理:复现→最小修复→验证→审查→开 PR,到此为止。
+   - workpacket.signals.sentry.manualTicketCount > 0 时,对应的 deps-vuln/secret-pattern
+     发现不建簇、不用本轮 worker 处理——它们只产生了确定性 action id
+     (state.sentryIntake.manualTickets),后续建 GitHub issue 走 T3 既有流程,本轮只需
+diff --git a/docs/loops/bug-doctor.md b/docs/loops/bug-doctor.md
+index c691fe19..26e0d60d 100644
+--- a/docs/loops/bug-doctor.md
++++ b/docs/loops/bug-doctor.md
+@@ -1,6 +1,6 @@
+ # Mivo(原 bug-doctor)— loop 契约
+ 
+-> **Mivo**(原名 bug-doctor,2026-07-19 展示层更名;文件路径/launchd 标签/状态目录/台账内部字段沿用原名,机器判据不动)。每日自动消化生产 debug log + nightly-e2e 结果,修 bug、提 PR、白名单内自动合并(React baseline 与 verify:logging 接入现状见下方信号源表与已知局限,不在"已接"范围内)。
++> **Mivo**(原名 bug-doctor,2026-07-19 展示层更名;文件路径/launchd 标签/状态目录/台账内部字段沿用原名,机器判据不动)。每日自动消化生产 debug log + nightly-e2e 结果,修 bug、提 PR;**合并权已整体移交 review-pr 巡审**(owner 2026-08-04 决策 mergeAuthority=review-pr-only,见「权限」节),bug-doctor 自身不按合并键(React baseline 与 verify:logging 接入现状见下方信号源表与已知局限,不在"已接"范围内)。
+ > 设计来源:2026-07-17 预检定稿(决策记录见 `docs/plan/bug-doctor-unknowns-map.md`)。
+ > 本文件是契约(稳定,改动走 PR);运行时状态与日志在 `history/loops/bug-doctor/`(不入 git,loop 每轮自更新)。
+ 
+@@ -8,7 +8,7 @@
+ 
+ ## Goal
+ 
+-mivo 生产环境的用户可见错误随时间下降(当前由生产 debug log + nightly-e2e 两路常驻信号驱动;批次2 起主轮另消费 Trae/Sentry findings 第三料源,仅显式 `--include-sentry`,见信号源表 #5);React 健康分随时间上升是长期方向,但 gate 尚未对 react-baseline.json 做 diff/打分,这条暂不是本 loop 每轮实际推动的指标。每个工作轮:消化新错误簇 → 修复最高优先级的活 → 带证据交付 PR → 白名单内自动合并。
++mivo 生产环境的用户可见错误随时间下降(当前由生产 debug log + nightly-e2e 两路常驻信号驱动;批次2 起主轮另消费 Trae/Sentry findings 第三料源,仅显式 `--include-sentry`,见信号源表 #5);React 健康分随时间上升是长期方向,但 gate 尚未对 react-baseline.json 做 diff/打分,这条暂不是本 loop 每轮实际推动的指标。每个工作轮:消化新错误簇 → 修复最高优先级的活 → 带证据交付 PR → **等 review-pr 巡审审查合并**(bug-doctor 不自动合并,2026-08-04 起)。
+ 
+ **这是 monitor 型 loop,没有终点线。零新增信号的一轮 = 成功的一轮,不是浪费。永远不要为了显得忙碌而制造改动。**
+ 
+@@ -52,17 +52,15 @@ Gap-check 兜底:会话醒来先看距上次日志条目多久,>26h 说明漏跑
+ 
+ 每日预算:最多 3 并行修复 worker、5 个 PR;单簇 token/轮数硬顶,撞线降级 T3;同簇修 2 次失败强制转 issue,禁止第三次。日累计成本不设顶(Q4),每轮记账,跑满两周由进化轮定价。
+ 
+-## 权限(T 级 = 谁按合并键,Q3 定稿:T1 第一天即开)
++## 权限(T 级 = 分诊风险档;合并键统一由 review-pr 巡审按,owner 2026-08-04 决策)
++
++> **决策记录(2026-08-04,取代 Q3 的「T1 第一天即开」)**:bug-doctor 对任何 PR **SOP 级禁用**自动合并(流程/规则/prompt 层全部裁撤;共享 GitHub 身份在账号能力上仍可合并,机器级隔离(独立本地用户+拆凭证)在缴械台账包 D,择日);review-pr 巡审是唯一自动合并主体;唯一人工例外 = 命中 `securityReviewPaths` 的 PR 由 owner 手合。机器真相源:`rules.json` 顶层 `mergeAuthority` 与 `t1.maxAutoMergePerDay=0`。
+ 
+ ### T0 · 只告警,不动手
+ error 突增(单小时 >50)/ persist·迁移类数据完整性信号 / 鉴权异常簇 / debug 系统自身故障。→ Slack 立即告警,等人。
+ 
+-### T1 · 自动修 + 自动合并(全部条件缺一不可)
+-- 改动类型白名单:hook 依赖数组、memoization、死代码/纯清理 effect、补 debugLogger 调用、纯文案样式;
+-- ≤2 文件,且不碰禁区(见下);
+-- 云端 CI 全绿 + review worker APPROVE + 本地 e2e smoke 过 + 复现测试转绿;
+-- PR 附完整证据(簇统计/before-after);评审线程**先可见回复再 resolve**;
+-- 每日自动合并 ≤3 个;上一个 loop PR 未合不开新的(S0 豁免此条)。
++### T1 · 已废止的「自动合并」档(2026-08-04 缴械)
++T1 原语义「自动修 + 自动合并」已废止,**bug-doctor 侧自动合并流程已全部裁撤(SOP 级禁用;账号能力层的隔离见台账包 D)**。T1 名号仅保留为分诊遥测(「结构上属低风险机械修」的筛选标签),其白名单/≤2 文件/禁区判据仍用于分诊与统计,但**结论一律落 tCap=T2、走 T2 流程**;台账里遗留的 tCap=T1 由 state.mjs loadState 迁移为 T2(迁移留痕见 logs.md 的「缴械迁移」行,不进持久字段)。「上一个 loop PR 未合不开新的(S0 豁免)」的节流保留。
+ 
+ **禁区(命中即 T 级封顶 T2,无例外)**:`src/lib/persist*`、`src/kernel/`、`server/persist/`、`shared/persist-contract.ts`、documentSlice 删除/tombstone 逻辑、迁移、鉴权、计费、asset DAM、任何行为/UX 变化、3+ 文件。
+ 
+@@ -79,9 +77,8 @@ error 突增(单小时 >50)/ persist·迁移类数据完整性信号 / 鉴权异
+ 3. **修复**(执行 worker,隔离 worktree off origin/main,worktree 建在 loop 目录与主 checkout 之外):**先复现**(写失败测试),复现不出降 T3;再最小修复。
+ 4. **验证**:worker 自跑 build/lint/test:unit/verify:logging/test:shell + 复现测试转绿;e2e worker 跑本地双进程 smoke(local persist 模式;server 模式受 PG 限制,如实标注)。
+ 5. **审查**:review worker 独立审 diff;任何 finding → 取消 T1 资格降 T2。
+-6. **交付**:开 PR(证据齐全);T1 达标 → merger worker squash 合并(回复并 resolve 评审线程);否则 Slack 通知留人审。
+-6.5 **合并后兜底**(借鉴 cindy typecheck-merged):T1 自动合并后立即在本地 main 跑 `npm run preflight`,红 → 自动开 revert PR + Slack T0 告警——防两个绿 PR 语义冲突。
+-7. **收尾**:无论成败 `worktree remove --force`;更新 State(游标/台账/PR)、Logs 追加一行(含成本);战报经 `scripts/loops/bug-doctor/broadcast.mjs`(notify.mjs webhook,Mivo 机器人身份)发 `#mivo-canvas`(静默日一行摘要),不再走会话层已连接的 Slack 通道。
++6. **交付**:开 PR(证据齐全,**body 必须含独立一行 `T-level: T2`**——review-pr 按它与台账双重认定托管档,漏写时台账 tCap 兜底,两者都读不出也会按 pr-rules 的 defaultWhenAmbiguous=t2 进审,不会挂死);Slack 通知;**到此为止,不做任何合并动作**——审查与合并由 review-pr 巡审承担,审出问题会经 fix-handoff 派回跟进会话修复。
++7. **收尾**:无论成败 `worktree remove --force`;更新 State(游标/台账/PR)、Logs 追加一行(含成本;PR 相关状态字统一用:`pr-created` / `review-pending` / `fix-handoff` / `merged-by-review-pr` / `closed-unmerged`,不再出现「已自动合并」——合并由 review-pr 巡审执行,战报只转述台账已知状态);战报经 `scripts/loops/bug-doctor/broadcast.mjs`(notify.mjs webhook,Mivo 机器人身份)发 `#mivo-canvas`(静默日一行摘要),不再走会话层已连接的 Slack 通道。
+ 
+ **并发与防失控**(借鉴 cindy review-pr 实测机制):
+ - **文件重叠守卫**:分诊派工前求各簇疑似文件集交集,重叠簇不并行(串行或只派一个),防 3 个修复 worker 互踩;
+@@ -115,7 +112,7 @@ error 突增(单小时 >50)/ persist·迁移类数据完整性信号 / 鉴权异
+ | 修复 worker ×≤3 | z-ai/glm-5.2 · max | 隔离 worktree |
+ | 审查 worker | gpt-5.6-sol · xhigh | 独立审 diff |
+ | e2e worker | gpt-5.4 · high | 本地双进程 smoke |
+-| merger | glm-5.2 · high | 禁改代码,只按键 |
++| ~~merger~~ | ~~glm-5.2 · high~~ | **已裁撤(2026-08-04 缴械)**:合并键归 review-pr 巡审,merger worker 已裁撤(loop 侧不做任何合并动作) |
+ 
+ ## 进化轮
+ 
+@@ -186,7 +183,7 @@ history/loops/bug-doctor/
+ 
+ ## 已知局限(如实)
+ 
+-- 凌晨 T1 自动合并 → 9:00 上生产,无人眼环节(用户 2026-07-17 明确接受;白名单+四层验证对冲,风险不为零)。
++- ~~凌晨 T1 自动合并 → 9:00 上生产~~(2026-08-04 已消除:bug-doctor 不再自动合并;上生产前必经 review-pr 独立审查。新残余=巡审 admin-trust 合并同样无人眼,由回执硬门+deploy/green 绿灯门对冲)。
+ - debug log 无 stack trace/操作序列,复现率有限,初期 T3 占比会偏高。
+ - appVersion 当前为 "0.0.0",回归检测失明,待前置 PR 修复。
+ - **信号接入现状(如实,2026-08-04 更新)**:生产 debug log + nightly-e2e 两路常驻接入 gate 打分;Trae/Sentry findings(#5)批次2 起接入但仅主轮显式 `--include-sentry` 消费,且 Trae 簇不走日志打分公式(score 恒 0,severity 直映 sLevel)。React baseline diff 与 verify:logging 接入均未开始(留接口,均为独立任务),不要按信号源表的"设计意图"描述误判为已经在跑。
+diff --git a/docs/plan/bug-doctor-execution-plan.md b/docs/plan/bug-doctor-execution-plan.md
+index a4a22568..7965e7ee 100644
+--- a/docs/plan/bug-doctor-execution-plan.md
++++ b/docs/plan/bug-doctor-execution-plan.md
+@@ -1,5 +1,8 @@
+ # bug-doctor loop 建设执行计划
+ 
++> ⚠ **2026-08-04 已被「review-pr-only 合并权」决策取代**:本文中一切 T1 自动合并 / merger worker / bug-doctor 按合并键的表述均为历史设计,不再是执行契约;现行契约见 `docs/loops/bug-doctor.md`「权限」节与 `scripts/loops/bug-doctor/rules.json` 的 `mergeAuthority`。
++
++
+ ## Context(为什么做)
+ 
+ mivo 生产 debug log(FX-7 加固过的上报链,现有几十条/天真实错误)只进不出:没人消费、没聚类、没游标,错误安静过完 7 天保留期被删。React 层(70k 行/24 循环依赖)零健康监控。本计划落地一套三层自动化系统(bug-doctor loop):脚本发现 → agent 修复 → 人握否决权,每日自动修 bug、提 PR、白名单内自动合并,附状态看板。
+diff --git a/docs/plan/bug-doctor-phase2-tasks.md b/docs/plan/bug-doctor-phase2-tasks.md
+index 4f7f550b..5dc58a1c 100644
+--- a/docs/plan/bug-doctor-phase2-tasks.md
++++ b/docs/plan/bug-doctor-phase2-tasks.md
+@@ -1,5 +1,8 @@
+ # bug-doctor 二期任务计划(草案,开工前须过预检)
+ 
++> ⚠ **2026-08-04 已被「review-pr-only 合并权」决策取代**:本文中一切 T1 自动合并 / merger worker / bug-doctor 按合并键的表述均为历史设计,不再是执行契约;现行契约见 `docs/loops/bug-doctor.md`「权限」节与 `scripts/loops/bug-doctor/rules.json` 的 `mergeAuthority`。
++
++
+ > 2026-07-18 起草。一期收官状态:loop 已上岗(gate/轻巡/班车/看板/播报降级通道),契约 `docs/loops/bug-doctor.md`。
+ > **二期主题:从"自发现自修"扩展到"人机协作"——团队能报单、能查状态、能在 Slack 里完成审批;同时把修复率的最大瓶颈(无堆栈)补掉。**
+ > 派工规矩沿用:goal skill 执行 + SC 即判据 + lead 独立核证;收尾沿用 sol 统审 → 共识 → merger。
+diff --git a/docs/plan/bug-doctor-tasks.md b/docs/plan/bug-doctor-tasks.md
+index 9278e54c..f24e3f7a 100644
+--- a/docs/plan/bug-doctor-tasks.md
++++ b/docs/plan/bug-doctor-tasks.md
+@@ -1,5 +1,8 @@
+ # bug-doctor loop 建设任务计划
+ 
++> ⚠ **2026-08-04 已被「review-pr-only 合并权」决策取代**:本文中一切 T1 自动合并 / merger worker / bug-doctor 按合并键的表述均为历史设计,不再是执行契约;现行契约见 `docs/loops/bug-doctor.md`「权限」节与 `scripts/loops/bug-doctor/rules.json` 的 `mergeAuthority`。
++
++
+ > 2026-07-17 定稿。契约:`docs/loops/bug-doctor.md`;决策记录:`docs/plan/bug-doctor-unknowns-map.md`。
+ > 依赖链:T2 独立|T1(内含 T1a 状态骨架)→ T4/T5|T3 独立|T6 → T5/T4|T7 需 T1+T6|T8/T9 收尾。
+ > Review 对齐:REVIEW_DOMAIN=automation/tooling;REVIEW_FOCUS=数据管道正确性、幂等性、生产只读安全。
+diff --git a/docs/plan/bug-doctor-unknowns-map.md b/docs/plan/bug-doctor-unknowns-map.md
+index ad3c3cf5..d2964efa 100644
+--- a/docs/plan/bug-doctor-unknowns-map.md
++++ b/docs/plan/bug-doctor-unknowns-map.md
+@@ -1,5 +1,8 @@
+ # bug-doctor loop · 未知数地图(预检产物)
+ 
++> ⚠ **2026-08-04 已被「review-pr-only 合并权」决策取代**:本文中一切 T1 自动合并 / merger worker / bug-doctor 按合并键的表述均为历史设计,不再是执行契约;现行契约见 `docs/loops/bug-doctor.md`「权限」节与 `scripts/loops/bug-doctor/rules.json` 的 `mergeAuthority`。
++
++
+ > 生成:2026-07-17 预检 | 对象:mivo-bug-doctor loop(debug log 自动修复 + React 体检,S/T 双维分级 + 队列)
+ > 状态标记:✅已核实 ⚠️已核实-有问题 ❓待用户回答 🔍待技术验证
+ 
+diff --git a/scripts/loops/bug-doctor/docs-contract.test.mjs b/scripts/loops/bug-doctor/docs-contract.test.mjs
+index cded6544..88b2a99a 100644
+--- a/scripts/loops/bug-doctor/docs-contract.test.mjs
++++ b/scripts/loops/bug-doctor/docs-contract.test.mjs
+@@ -141,3 +141,216 @@ describe('批次2:Trae/Sentry 第三料源的契约锚点(防止后续编辑把
+     expect(promptDoc).toContain('不带 `--include-sentry`')
+   })
+ })
++
++// ── 缴械守卫(owner 2026-08-04 决策 mergeAuthority=review-pr-only;三审 GPT 修订 SC-B7)──
++// ── 检查点(R3 六件套)单一判据实现:主契约子句扫描与 prompt 极性循环共用 ──
++// R3 CX-002 的洞正是两处各自实现:主契约归一了空白、prompt 循环 line.includes 裸匹配,
++// 多空格 gh 命令在 prompt 侧 0 红。豁免语义三类:①历史/否定标记;②否定式直接修饰合并类词
++// (≤8 字窗口,防远距离否定被借用——席① R3 三组借用构造均保持红);③子句含 review-pr
++// 字样:review-pr 是唯一合法合并主体,提及它的合并句是在描述合法路径(席① R3-001:旧版
++// 只认 归/由/给 三连接词,「review-pr 巡审按合并键」这类合法换说法假红;主谓宾解析超出
++// 词法层,裸词豁免是防呆不防敌口径下的正确简化)。
++const normalizeClause = (s) => s.replace(/\s+/g, ' ')
++// R4 席① F487R4-001:review-pr 从裸词豁免表移出(见下 isExemptClause)——裸词把
++// 「loop 冒充 review-pr 直接合并该 PR」这类冒充/借用句整句放行,而 checkpoint 不变量
++// 写的是「子句主体为 review-pr」;纯字符串包含与语义主体不等价。
++const CLAUSE_EXEMPT_RE = /已废止|已裁撤|已消除|已全部裁撤|替代旧|不按合并键|不做任何合并动作|绝不执行|SOP 级禁用|不(执行|再|得|会|做)[^\n]{0,8}(合并|按合并键)/
++// review-pr 豁免的「唯一主体」词法近似:子句里同时出现另一行动主体或冒充/共谋标记时,
++// 豁免失效,交回签名裁决——「合并权移交 review-pr」「review-pr 巡审按合并键」子句里
++// 只有 review-pr 一个主体,豁免;「loop 冒充 review-pr 合并该 PR」「review-pr 与 loop
++// 一起合并」含第二主体/冒充词,不豁免。仍是词法近似(不做句法解析),把豁免条件从
++// 「提及」收紧到「无并存主体的提及」,席① R4 4 组冒充构造全红、合法句保持绿(见鉴别测试)。
++// **能力边界(R5 owner 决策接受,不再打补丁)**:这是「枚举冒充动词 + 枚举其它主体名」两个
++// 封闭列表对「review-pr 是否语义唯一主体」的近似——既不完备(`代替`/`顶替`/`名头`/`假扮`
++// 等近义词、大写 LOOP、`review-pr 核准后自行合并`这类授权前置会漏,F487R5-001/CX-R5-002)
++// 也不精确(`review-pr 巡审调度合并的节奏`等合法契约句会误拦,F487R5-002)。两对抗席 R5
++// 独立判定:枚举列表随近义词/新组件名自然演化持续产漏,词法层不可收敛。此处不再扩列表。
++// **归因(R6/R8 修正)**:真防线是两条独立机制,不是 assertDisarmed 单独——①tCap/rules 字段
++// 被篡改 → assertDisarmed 机器强制;②本守卫防的"文档文本被喂给分诊 LLM 后遵从执行"攻击面
++// 与 tCap 无关,靠 securityReviewPaths 路由转人工 + `/approve-merge` 需人类 admin 主动触发
++// (loop 无法自主触发)。本守卫本身是①②之外的 T1 防无意漂移 lint。详见 PR body 残余登记第 6 条。
++const CLAUSE_IMPERSONATION_RE = /冒充|假冒|伪装|声称|名下|名义|绕过|一起|共同|联合|loop|bug-doctor|merger|worker|机器人|调度|班车/
++
++const CLAUSE_SIG_RE = /(T1[^\n]{0,20}自动合并|merger worker|自动合并\s*≤|达标[^\n]{0,10}合并|gh pr merge|--squash|--merge-when|squash 合并|执行[^\n]{0,12}合并|自行(执行|运行|完成)[^\n]{0,8}合并|自行合并|合并并删|合并(该|本|此)[^\n]{0,4}PR|(发表|发出|发送|加|留)[^\n]{0,16}\/approve-merge|评论[^\n]{0,8}\/approve-merge|\/approve-merge\s+[0-9a-f]{7}|按合并键|合并权移交)/
++
++// R4 CX-R4-001(检查点后同族复发→升级阶梯②:归一化管线职责上移,单一 owner 化):
++// shell 续行(行尾 `\` 紧贴换行,含 CRLF)是 POSIX shell 里唯一能把**单条命令的 token 流**
++// 拆到多行的通用词法形态——粘贴执行是一条命令,逐行扫描却两行各自不完整
++// (`gh \`+换行+`pr merge 487`:主契约 0 红、极性锁 filter 也看不见,实测两层全绿)。
++// 检查点谱系 B 当时只把「判据」收成单一实现,「文本→待判行」的切分仍散在两个循环各自
++// split('\n')——本次把整条预处理管线也收进单一 owner:先折叠续行、再切行、再归一;
++// 任何消费者(含鉴别测试)只许走 docLines/contractOffenders/promptMergeLines,不得自行 split 原文。
++// 对称审计:①`&&`/`|` 行尾续行不构成同类绕过——签名短语必然完整落在其中一行;
++// ②`\ `(反斜杠转义空格)后换行不是 shell 续行,regex 要求 `\` 紧贴换行,不误折;
++// ③CRLF(`\r\n`)与 LF 同折。
++// **能力边界(R5 owner 决策接受,不再打补丁)**:本函数把 `\`+换行替换为空格,是对
++// shell 续行的**近似**——真实 shell 是删除(`me\`+换行+`rge`→`merge`),故 token 内拆分
++// (CX-R5-001)、引号插入(`me''rge`)、命令替换(`$(echo merge)`)等图灵完备 shell 的词法
++// 变体仍会漏。此处不追加更多形态匹配:词法层穷尽 shell 变体是猫鼠循环(两对抗席 R5 判定不
++// 收敛)。**归因(R6 席① F487R6-001 修正)**:assertDisarmed 只守 tCap/rules 字段写入路径,
++// 与本守卫防的"文档文本被喂给分诊 LLM 后被遵从执行"是两条独立防线——后者靠
++// securityReviewPaths 路由转人工审查 + `/approve-merge` 快速通道需人类 admin 主动触发(loop
++// 无法自主触发)。本守卫本身仅为 T1 防无意漂移的 lint,漏判不构成 active-path 绕过。详见 PR
++// body 残余登记第 6 条。
++const foldShellContinuations = (s) => s.replace(/\\\r?\n[ \t]*/g, ' ')
++const docLines = (s) => foldShellContinuations(s).split('\n')
++
++// 单一判据消费管线(主契约 it、prompt 全量扫描 it、极性 it 与鉴别测试共用——生产断言
++// 与鉴别测试测的是同一个函数,不存在「测试红了但生产判据没变」的口径分叉)
++// 豁免判据唯一 owner:通用豁免表 + review-pr 唯一主体豁免(F487R4-001)
++const isExemptClause = (clause) =>
++  CLAUSE_EXEMPT_RE.test(clause) ||
++  (clause.includes('review-pr') && !CLAUSE_IMPERSONATION_RE.test(clause))
++const contractOffenders = (text) => {
++  const offenders = []
++  for (const line of docLines(text)) {
++    const visible = line.replace(/~~[^~]*~~/g, '') // 删除线 = 已废止语义,整段剔除
++    for (const rawClause of visible.split(/[,;.!?:，；、。！？：]/)) {
++      const clause = normalizeClause(rawClause)
++      if (CLAUSE_SIG_RE.test(clause) && !isExemptClause(clause)) offenders.push(clause.trim())
++    }
++  }
++  return offenders
++}
++const promptMergeLines = (text) => docLines(text).map(normalizeClause).filter((l) => l.includes('/approve-merge') || l.includes('gh pr merge'))
++
++// 有限签名枚举(T1,防无意漂移):签名集合 = 下方 sigRe 正则字面量本身,超出集合的新
++// 表达即漏判,不做语义解析——不再声称「任何回潮即红」(R2 三审 ②002:该旧声称与实现矛盾)。
++// 反向变异验收(见 PR 正文):maxAutoMergePerDay 0→1 / 恢复 merger 行 / defaultWhenAmbiguous
++// 改回 skip / t1BodyMarkers 恢复非空——每个变异各自恰红对应 1 条。
++
++describe('缴械契约守卫(review-pr-only,2026-08-04)', () => {
++  const rulesPath = resolve(__dirname, 'rules.json')
++  const rules = JSON.parse(readFileSync(rulesPath, 'utf8'))
++  const prRules = JSON.parse(readFileSync(resolve(__dirname, '..', '..', '..', 'agent-use', 'docs', 'pr-rules.json'), 'utf8'))
++  const promptDoc = readFileSync(resolve(__dirname, '..', '..', '..', 'docs', 'loops', 'bug-doctor-scheduler-prompts.md'), 'utf8')
++  const renderSrc = readFileSync(resolve(__dirname, '..', 'dashboard', 'render.mjs'), 'utf8')
++
++  it('rules.json:mergeAuthority 必须是 review-pr-only,maxAutoMergePerDay 必须为 0', () => {
++    expect(rules.mergeAuthority).toBe('review-pr-only')
++    expect(rules.t1.maxAutoMergePerDay).toBe(0)
++  })
++
++  it('pr-rules.json:t1BodyMarkers 必须为空数组(不存在能把 loop PR 送进 skip 的 body 标记)', () => {
++    expect(prRules.loopPrExclusion.t1BodyMarkers).toEqual([])
++  })
++
++  it('pr-rules.json:defaultWhenAmbiguous 必须是 t2(读不出 T-level 也进正常审查,不 skip)', () => {
++    expect(prRules.loopPrExclusion.defaultWhenAmbiguous).toBe('t2')
++  })
++
++  it('契约文档不得残留活跃的「bug-doctor 侧自动合并」语义(语法签名扫描,豁免按子句绑定不按整行)', () => {
++    // 扫描对象:bug-doctor.md 全文。签名:自动合并 / merger worker / 达标合并。
++    // R1 三审 F4:整行豁免可被同行混句绕过(前半句「已废止」,后半句写活跃扩权指令,
++    // 整行因含豁免词全部漏判)。收紧为:删除线内容先剔除;剩余文本按标点切子句,
++    // 豁免词必须与签名落在**同一子句**才生效。
++    // 残余声明(R2 三审 CX-R1-007):子句级绑定防的是"整行豁免被跨子句混句绕过"这类
++    // 无意漂移;同一子句内同时写豁免词和活跃指令(如全程无标点的长句)在词法层不可判,
++    // 属对抗性写法——本仓威胁模型是可信维护者的无意漂移,不设防敌(与 review-pr skill
++    // 状态目录的"防呆不防敌"口径一致)。
++    // R1(#487 三审)F-487-002/CX-003:此前 sigRe 只有 4 项中文短语枚举,却在注释与 PR body
++    // 里声称「语法签名扫描,任何回潮即红」——被两席各自构造反证(直接 `gh pr merge`、
++    // `/approve-merge` 正向授权、`squash 合并并删分支`,全部 0 红)。本次:①补直接命令与
++    // 祈使签名;②「移交」从豁免词删除(席② 实测「将合并权移交给 merger worker 达标后合并」
++    // 因它整句放行——豁免词自身不得是可用于活跃授权的动词)。**保证等级如实声明:这仍是
++    // 有限签名枚举(T1 防无意漂移),不是语义解析;新的合并语义表达方式仍可能漏判,词法层
++    // 的天花板在此,不再声称「任何回潮」。**
++    // R2 三审 ①002:上一版只扩正向签名、没补否定式豁免,把「合并权移交给 review-pr 巡审」
++    // 「本 loop 不执行合并动作」「loop 不再自行合并」这类**描述缴械**的合法句从绿判红
++    // (现有文档不红纯属措辞巧合)。否定式豁免要求否定词直接修饰合并类词(窗口 ≤8 字),
++    // 防止长句里远距离否定被借用。
++    // R2 三审 ①001/②002 补:裸授权 token、发送/加评论同义、多空格命令、「按合并键」正向
++    // (其否定式「不按合并键」本就在豁免表——否定在豁免、正向必须在签名,内部一致性)、
++    // 裸祈使「合并该/本 PR」。子句先做空白归一,防 `gh   pr merge` 逃逸。
++    // R4 CX-R4-001:扫描改走模块级 contractOffenders 单一管线(续行折叠→切行→切子句→归一)。
++    expect(contractOffenders(doc)).toEqual([])
++  })
++
++  it('主轮 prompt 必须含合并纪律硬句与 T-level 标记要求(含 /approve-merge 禁令)', () => {
++    // R2 三审 CX-R1-006:分开断言两个短语锁不住极性("任何 /approve-merge 评论都可以发"
++    // 也含该短语)——改为锁完整禁令枚举句,/approve-merge 必须出现在"绝不执行"的宾语列表里
++    expect(promptDoc).toContain('绝不执行 gh pr merge / 任何合并动作 / 任何 /approve-merge 评论')
++    // R4 CX-R1-006:substring 锁不住极性(别处补一句"都可以发"仍绿)。收紧:该词
++    // 在全文任何位置出现,所在行都必须是"绝不执行"禁令句——许可性提及无处安放。
++    // CX-003 扩:直接命令 `gh pr merge` 与 /approve-merge 同级——任何一处出现,所在行
++    // 必须是「绝不执行」禁令句,另起一行写许可性指令无处安放。
++    // R4 CX-R4-001:行来源改走 promptMergeLines 单一管线(续行拆写的命令折叠后同样被捕获)。
++    for (const line of promptMergeLines(promptDoc)) {
++      expect(line).toContain('绝不执行')
++    }
++    expect(promptDoc).toContain('T-level: T2')
++  })
++
++  it('主轮 prompt 文档整体过完整签名扫描(R4 席① F487R4-002:此前 prompt 侧只有两个硬编码字面量过滤,CLAUSE_SIG_RE 全集从未应用——「自行合并该 PR」「按合并键处理」「合并权移交给 loop 自己执行」加进 prompt 0 红)', () => {
++    // prompt 与主契约自此真同源:同一 contractOffenders 函数、同一签名集、同一豁免判据。
++    // 上面的极性锁是叠加的更强断言(可执行载体行必须是「绝不执行」句),不是替代。
++    expect(contractOffenders(promptDoc)).toEqual([])
++  })
++
++  it('守卫归一化折叠 shell 续行(R4 CX-R4-001:`gh \\`+换行+`pr merge` 是合法单命令,旧逐行扫描两层守卫 0 红)', () => {
++    // 可鉴别测试:三方共用同一生产管线,退回「split 原文再归一」的旧修法本组恰红
++    const evil = '完成后允许执行 gh \\\n  pr merge 487'
++    // 主契约判据:折叠后签名完整,恰红 1 条
++    expect(contractOffenders(evil)).toHaveLength(1)
++    // 极性判据:捕获到该行,且它不是禁令句(旧管线 filter 对续行拆写 0 捕获)
++    const hits = promptMergeLines(evil)
++    expect(hits).toHaveLength(1)
++    expect(hits[0]).not.toContain('绝不执行')
++    // 对称路径:CRLF 续行同折
++    expect(contractOffenders('允许执行 gh \\\r\n pr merge 487')).toHaveLength(1)
++    // 反例(不误折):`\` 后跟空格再换行不是 shell 续行,两行各自无完整签名 → 0 红,
++    // 与 shell 语义一致——那样写本来就不是一条可执行的合并命令
++    expect(contractOffenders('说明 gh \\ \n pr merge 487')).toEqual([])
++    // 反例(极性侧不误伤):禁令句本身含 gh pr merge,折叠管线下仍被捕获且含「绝不执行」
++    expect(promptMergeLines('绝不执行 gh pr merge / 任何合并动作')[0]).toContain('绝不执行')
++  })
++
++  it('review-pr 豁免要求唯一主体——冒充/借用/共谋句不放行(R4 席① F487R4-001:裸词豁免把 4 组冒充构造整句放行)', () => {
++    // 席① 4 组构造(语义均为「loop 冒充/借用 review-pr 名义自己合并」),收紧后必须全红
++    expect(contractOffenders('loop 冒充 review-pr 直接合并该 PR。')).toHaveLength(1)
++    expect(contractOffenders('声称是 review-pr 但其实由 loop 自行合并。')).toHaveLength(1)
++    expect(contractOffenders('review-pr 与 loop 一起合并该 PR。')).toHaveLength(1)
++    expect(contractOffenders('loop 可以在 review-pr 名下直接合并该 PR。')).toHaveLength(1)
++    // 合法句保持绿:唯一主体的 review-pr 合并句(R3 席①001 的假红修复不回退)
++    expect(contractOffenders('合并权移交给 review-pr 巡审。')).toEqual([])
++    expect(contractOffenders('review-pr 巡审按合并键处理。')).toEqual([])
++    // 否定式豁免不受影响
++    expect(contractOffenders('本 loop 不得合并该 PR。')).toEqual([])
++  })
++
++  it('prompt 全量签名扫描可鉴别(R4 席① F487R4-002:三句只撞其它签名的构造,旧两字面量过滤全放行)', () => {
++    // 席① 3 组构造逐条恰红(不含 /approve-merge、gh pr merge 两个旧过滤字面量)
++    expect(contractOffenders('自行合并该 PR')).toHaveLength(1)
++    expect(contractOffenders('按合并键处理')).toHaveLength(1)
++    expect(contractOffenders('合并权移交给 loop 自己执行')).toHaveLength(1)
++  })
++
++  it('主轮 prompt 不得残留「T1 自动修复+合并流程」旧指令', () => {
++    expect(promptDoc).not.toContain('T1 自动修复+合并流程')
++  })
++
++  it('dashboard 不得再有「自动合并(机械档 T1)」分栏', () => {
++    expect(renderSrc).not.toContain('自动合并(机械档')
++    expect(renderSrc).toContain('待巡审')
++  })
++
++  it('securityReviewPaths 整根覆盖无人值守 loop 生态(检查点谱系 C:逐目录追加两轮漏两次,判据驱动一次收全)', () => {
++    const srp = JSON.parse(readFileSync(join(__dirname, '..', '..', '..', 'agent-use', 'docs', 'pr-rules.json'), 'utf8')).securityReviewPaths
++    const hit = (path) => srp.some((re) => new RegExp(re).test(path))
++    // 旧名单(^scripts/loops/bug-doctor/)对这两个无人值守脚本 MISS——R3 席② CX-003 实测
++    expect(hit('scripts/loops/dashboard/render.mjs')).toBe(true)
++    expect(hit('scripts/loops/merge-thanks/from-github-event.mjs')).toBe(true)
++    expect(hit('scripts/loops/bug-doctor/gate.mjs')).toBe(true)
++    expect(hit('docs/loops/bug-doctor.md')).toBe(true)
++    expect(hit('src/App.tsx')).toBe(false) // 不过度扩——普通产品代码不进人工安全门
++  })
++
++  it('dashboard 活跃簇口径与 gate 同源(F-487-006:白名单枚举已删,统一引用 state.mjs 的 SETTLED_STATUSES)', () => {
++    // R1 三审 F3 的初版修法是往 render 白名单补 closed-unmerged——#487 三审 F-487-006
++    // 证明补名单治不了根(open-pr 又漏了):同一语义两处独立枚举必然漂移。终版修法是
++    // 结构性同源:render 不再有自己的名单,黑白名单漂移从构造上不可能。这里钉接线。
++    expect(renderSrc).toContain("import { SETTLED_STATUSES } from '../bug-doctor/state.mjs'")
++    expect(renderSrc).toContain('!SETTLED_STATUSES.has(c.status)')
++    expect(renderSrc).not.toContain('ACTIVE_STATUSES') // 白名单复活即红
++  })
++})
+diff --git a/scripts/loops/bug-doctor/gate.mjs b/scripts/loops/bug-doctor/gate.mjs
+index 82e7a060..f0f70c85 100644
+--- a/scripts/loops/bug-doctor/gate.mjs
++++ b/scripts/loops/bug-doctor/gate.mjs
+@@ -40,6 +40,7 @@ import {
+   WORKPACKET_FILE,
+   acquireLock,
+   appendLedger,
++  assertDisarmedRules,
+   appendLog,
+   defaultState,
+   loadFailureState,
+@@ -48,7 +49,7 @@ import {
+   releaseLock,
+   saveFailureState,
+   saveState,
+-} from './state.mjs'
++ SETTLED_STATUSES, } from './state.mjs'
+ 
+ const __dirname = dirname(fileURLToPath(import.meta.url))
+ const REPO_ROOT = resolve(__dirname, '..', '..', '..')
+@@ -82,7 +83,7 @@ const RECENT_WINDOW_HOURS = 48
+ const MAX_SAMPLES_PER_CLUSTER = 3
+ 
+ // 台账里视为"已处理"的簇状态:不进工作包(known-noise 由进化轮沉淀)
+-const SETTLED_STATUSES = new Set(['fixed', 'issue-filed', 'known-noise'])
++// SETTLED_STATUSES 移至 state.mjs(F-487-006 单一 owner),此处引用同一实例
+ // SC1 复发判定(RECURRENCE_SOURCE_STATUS + fail-closed 转移)已抽到共享模块
+ // recurrence.mjs —— 全仓唯一定义点,gate 与 sentry-intake 共用,禁止在任何
+ // 消费方重新手写(bd2 批次教训:第二份手抄实现抄回了 R1a 修掉的 fail-open)。
+@@ -175,6 +176,10 @@ const loadRules = () => {
+   const rules = JSON.parse(readFileSync(RULES_PATH, 'utf8'))
+   if (rules.version !== 1) throw new Error(`rules.json version=${rules.version} 不支持(当前实现 v1)`)
+   validateDebugLogNumericFields(rules)
++  // R2 三审 ①004:缴械断言在 gate 统一 rules 入口通电(锁后调用,不违 N03)——gate 自己的
++  // 写簇路径(upsertCluster tCap:'T2')从此也受缴械字段保护;消费的是**本轮实际加载**的
++  // rules(env 覆盖形态同样被校验,①003/②001 的规则源分叉在此闭合)。
++  assertDisarmedRules(rules)
+   return rules
+ }
+ 
+diff --git a/scripts/loops/bug-doctor/intake.mjs b/scripts/loops/bug-doctor/intake.mjs
+index cf68e63f..9cfd11b1 100644
+--- a/scripts/loops/bug-doctor/intake.mjs
++++ b/scripts/loops/bug-doctor/intake.mjs
+@@ -27,7 +27,7 @@ import { createHash } from 'node:crypto'
+ import { fileURLToPath } from 'node:url'
+ 
+ import { FINGERPRINT_VERSION, fingerprintOf, normalizeMessage } from './fingerprint.mjs'
+-import { acquireLock, appendLog, loadState, releaseLock, saveState } from './state.mjs'
++import { acquireLock, appendLog, loadState, releaseLock, saveState, assertDisarmed } from './state.mjs'
+ import { activeClusters, queueCounts, parseLogs } from '../dashboard/render.mjs'
+ 
+ const __dirname = dirname(fileURLToPath(import.meta.url))
+@@ -38,7 +38,7 @@ export const HUMAN_ORIGIN = 'human-report'
+ // 人工报告默认候诊级(展示层 P1;分诊会话核实后可升降,gate 不重算覆盖)
+ export const HUMAN_DEFAULT_SLEVEL = 'S1'
+ const MAX_SAMPLES_PER_CLUSTER = 3
+-// 与 dashboard ACTIVE_STATUSES 同源(经 activeClusters 导入使用,不在此重复定义)
++// 活跃簇判定经 dashboard 的 activeClusters 导入使用,其判据同源自 state.mjs 的 SETTLED_STATUSES(单一 owner,不在此重复定义)
+ const S_RANK = { S0: 0, S1: 1, S2: 2, S3: 3 }
+ // 展示层 P 编号 = 内部 S 级一一映射(团队沟通用 P,台账/打分内部用 S)
+ export const S_TO_P = { S0: 'P0', S1: 'P1', S2: 'P2', S3: 'P3' }
+@@ -203,6 +203,7 @@ export const applyReport = (state, { externalKey, reporter, description, level,
+     }
+   } else {
+     kind = 'created'
++    assertDisarmed() // R2 三审 ①004:人工报障建簇同为写簇路径,一并通电(读生效规则路径)
+     cluster = {
+       source: HUMAN_SOURCE,
+       pattern: normalizeMessage(description),
+diff --git a/scripts/loops/bug-doctor/rules.json b/scripts/loops/bug-doctor/rules.json
+index 554e5f75..49a1e430 100644
+--- a/scripts/loops/bug-doctor/rules.json
++++ b/scripts/loops/bug-doctor/rules.json
+@@ -1,4 +1,6 @@
+ {
++  "mergeAuthority": "review-pr-only",
++  "$mergeAuthority_comment": "owner 2026-08-04 拍板:bug-doctor 对任何 PR SOP 级禁用自动合并(流程层全部裁撤;共享身份的机器级隔离见台账包 D 择日项);review-pr 巡审是唯一自动合并主体;securityReviewPaths 命中的 PR 由 owner 手合,是唯一人工例外",
+   "$comment": "Mivo(原 bug-doctor)机器可读规则单一真相源(契约 docs/loops/bug-doctor.md 与本文件不一致时以本文件为准并回修契约)。gate 打分与主会话分诊共读。",
+   "version": 1,
+   "coreProcesses": [
+@@ -68,7 +70,7 @@
+     }
+   },
+   "t1": {
+-    "$comment": "T1 自动合并白名单与禁区。gate 只写 tCap 初值(命中禁区特征封顶 T2),最终 T 级由分诊对照 diff 文件集裁定。",
++    "$comment": "T1 仅作分诊遥测与低风险筛选,不代表合并权(owner 2026-08-04 决策:mergeAuthority=review-pr-only)。maxAutoMergePerDay 为兼容保留,固定为 0(SOP 级禁用,改动即违纪)——bug-doctor 按 SOP 级禁用一切合并动作,所有 loop PR 由 review-pr 巡审审查并合并。全部三条写簇路径(gate loadRules 入口/intake 人工报障建簇/sentry-intake runConsume 入口+upsert)一律只写 tCap=T2,且各自通电 assertDisarmed(Rules) 核验缴械字段——校验的是本轮实际加载的规则(含 MIVO_BUG_DOCTOR_RULES_PATH env 覆盖形态)——mergeAuthority/maxAutoMergePerDay 被改动时写路径直接抛错(fail-visible),这是这两个字段的运行时消费点,不是注释。分诊不得升回 T1;历史遗留 T1 由 loadState 一次性迁移。",
+     "changeTypeWhitelist": [
+       "hook 依赖数组",
+       "memoization",
+@@ -77,7 +79,7 @@
+       "纯文案样式"
+     ],
+     "maxFiles": 2,
+-    "maxAutoMergePerDay": 3,
++    "maxAutoMergePerDay": 0,
+     "forbiddenPaths": [
+       "src/lib/persist",
+       "src/kernel/",
+diff --git a/scripts/loops/bug-doctor/sentry-intake.mjs b/scripts/loops/bug-doctor/sentry-intake.mjs
+index 79c3da2f..7f6159ad 100644
+--- a/scripts/loops/bug-doctor/sentry-intake.mjs
++++ b/scripts/loops/bug-doctor/sentry-intake.mjs
+@@ -30,13 +30,14 @@ import { join, resolve, dirname, isAbsolute } from 'node:path'
+ import { createHash } from 'node:crypto'
+ import { fileURLToPath } from 'node:url'
+ 
+-import { acquireLock, appendLog, loadState, releaseLock, saveState } from './state.mjs'
++import { acquireLock, appendLog, loadState, releaseLock, saveState , assertDisarmed, assertDisarmedRules } from './state.mjs'
+ import { FINGERPRINT_VERSION } from './fingerprint.mjs'
+ import { applyRecurrence } from './recurrence.mjs'
+ 
+ const __dirname = dirname(fileURLToPath(import.meta.url))
+ const REPO_ROOT = resolve(__dirname, '..', '..', '..')
+-const RULES_PATH = join(__dirname, 'rules.json')
++// R2 三审 ②001:规则源必须与 gate 同一 env 表达式——否则 env 形态下守卫与执行分叉
++const RULES_PATH = process.env.MIVO_BUG_DOCTOR_RULES_PATH || join(__dirname, 'rules.json')
+ 
+ export const SENTRY_ORIGIN = 'trae-audit'
+ export const SEVERITY_TO_S = { P0: 'S0', P1: 'S1', P2: 'S2', P3: 'S3' }
+@@ -226,6 +227,12 @@ const actionIdOf = (item) => createHash('sha256').update(`${item.dim}|${item.fil
+ 
+ // ---- 簇 upsert(仅 t1-candidate 路由;origin=trae-audit,severity 直接映射 sLevel) ----
+ 
++// assertDisarmed 移至 state.mjs(R2 三审:双层化+生效路径绑定),此处引用同一实例
++
++// 检查点(R3 六件套)判据归一:本函数**不再自行读任何规则文件**——缴械校验由调用链
++// 入口完成(applyFindingsForDate 首行断言其收到的 rules 对象;CLI runConsume 入口另有
++// 一道)。写入点 ambient 重读正是 R3 CX-001 的洞:函数明收 rules 却校验环境路径,
++// 传入对象与校验对象可以是两份文件。
+ const upsertTraeCluster = (state, item, { dateStr, changeType, t1Accepted }) => {
+   const fp = item.fingerprint
+   let cluster = state.clusters[fp]
+@@ -236,7 +243,7 @@ const upsertTraeCluster = (state, item, { dateStr, changeType, t1Accepted }) =>
+       source: 'Trae audit',
+       pattern: `${item.dim}::${item.category}`,
+       sLevel: SEVERITY_TO_S[item.severity],
+-      tCap: t1Accepted ? 'T1' : 'T2',
++      tCap: 'T2', // 缴械(F-487-004b/CX-001):写侧不再产 T1——见 assertDisarmed,t1Accepted 仅作分拣遥测
+       count: 0,
+       clients: [],
+       firstSeen: pseudoReceivedAt,
+@@ -265,7 +272,7 @@ const upsertTraeCluster = (state, item, { dateStr, changeType, t1Accepted }) =>
+     // 实现修一漏一。
+     applyRecurrence(cluster, pseudoReceivedAt)
+     cluster.sLevel = SEVERITY_TO_S[item.severity]
+-    cluster.tCap = t1Accepted ? 'T1' : 'T2'
++    cluster.tCap = 'T2' // 缴械:同上,更新路径也只写 T2
+     cluster.changeType = changeType ?? cluster.changeType ?? null
+   }
+   cluster.count += 1
+@@ -280,6 +287,10 @@ const upsertTraeCluster = (state, item, { dateStr, changeType, t1Accepted }) =>
+  * @returns {{newFindings:number, newClusters:number, skipped:number, deduped:number}}
+  */
+ export const applyFindingsForDate = (state, { dateStr, items, rules, sentryRules }) => {
++  // 检查点不变量(disarm-assert-binding):校验的必须是**本次调用实际消费**的 rules 对象,
++  // 且失败在任何 consumedDates/decisions/簇写入**之前**——先写后抛会让 dedup 键已记、
++  // 重试 deduped=1,finding 永久丢失(R3 CX-001 方向二实测)。
++  assertDisarmedRules(rules)
+   const si = (state.sentryIntake ||= { consumedDates: {}, missingStreak: 0, lastMissingDate: null, degraded: false, decisions: {}, summary: {}, manualTickets: {} })
+   const t1Rules = rules.t1
+   const maxPerDay = sentryRules.maxPerDay ?? 2
+@@ -534,6 +545,7 @@ const stateDirFrom = (args) => resolve(args['state-dir'] || process.env.MIVO_BUG
+ 
+ const runConsume = (args) => {
+   const rules = JSON.parse(readFileSync(RULES_PATH, 'utf8'))
++  assertDisarmedRules(rules) // ②001:入口消费**已加载**的 rules——本轮拿什么跑就校验什么
+   const stateDir = stateDirFrom(args)
+   const now = typeof args.now === 'string' ? args.now : new Date().toISOString()
+   const dateStr = typeof args.date === 'string' ? args.date : shanghaiYesterdayString(now)
+diff --git a/scripts/loops/bug-doctor/sentry-intake.test.mjs b/scripts/loops/bug-doctor/sentry-intake.test.mjs
+index cd93075a..985f526c 100644
+--- a/scripts/loops/bug-doctor/sentry-intake.test.mjs
++++ b/scripts/loops/bug-doctor/sentry-intake.test.mjs
+@@ -1,5 +1,5 @@
+ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+-import { execFileSync } from 'node:child_process'
++import { execFileSync, spawnSync } from 'node:child_process'
+ import { createHash } from 'node:crypto'
+ import { tmpdir } from 'node:os'
+ import { dirname, join } from 'node:path'
+@@ -243,7 +243,7 @@ describe('SC-B2-3 T1 确定性预筛:changeType 白名单/forbiddenPaths/daily-c
+     expect(s1.sentryIntake.decisions[rejectedKey].reason).toBe('daily-cap')
+     // 被拒候选仍建簇(可见但非 T1)
+     expect(s1.clusters[fp('c')].tCap).toBe('T2')
+-    expect(s1.clusters[fp('a')].tCap).toBe('T1')
++    expect(s1.clusters[fp('a')].tCap).toBe('T2') // 缴械(F-487-004b):accepted 候选也只写 T2,t1-candidate 仅是分拣路由名
+   })
+ 
+   it('P2B-02 同日文件追加([A] 再 [A,B]):旧条目不重放,summary 恰为 2、簇 count 不翻倍、日上限跨运行累计', () => {
+@@ -283,7 +283,7 @@ describe('SC-B2-3 T1 确定性预筛:changeType 白名单/forbiddenPaths/daily-c
+     applyFindingsForDate(state, { dateStr: '2026-08-05', items: [mk('stkA', 'P0', 'src/a.tsx'), mk('stkB', 'P1', 'src/b.tsx'), mk('stkC', 'P0', 'src/c.tsx')], rules: RULES, sentryRules: RULES.sentryIntake })
+     const d = state.sentryIntake.decisions
+     expect(d[`2026-08-05|${fp('stkA')}`].result).toBe('accepted') // 不被覆写
+-    expect(state.clusters[fp('stkA')].tCap).toBe('T1') // 不降级
++    expect(state.clusters[fp('stkA')].tCap).toBe('T2') // 缴械:粘滞更新同样只写 T2
+     expect(state.clusters[fp('stkA')].sLevel).toBe('S0') // 内容升级生效(P0→S0)
+     expect(d[`2026-08-05|${fp('stkC')}`].result).toBe('rejected') // 配额未被释放,C 挤不进
+     const acceptedCount = Object.entries(d).filter(([k, v]) => k.startsWith('2026-08-05|') && v.result === 'accepted').length
+@@ -522,3 +522,72 @@ describe('SC-B2V2-04 sentryIntake 节持久化往返(stableState 未知节保留
+     expect(again.sentryIntake).toBeUndefined()
+   })
+ })
++
++
++// ── R2 ②001:规则源分叉闭合——守卫校验的必须是「本轮实际生效」的规则 ──
++describe('MIVO_BUG_DOCTOR_RULES_PATH env 覆盖形态下缴械守卫仍通电', () => {
++  it('env 指向被改回的规则(mergeAuthority=bug-doctor)→ runConsume 入口抛缴械错误,零写入', () => {
++    // R2 前的洞:gate 按 env 规则跑、assertDisarmed 读死仓内文件 → env 形态守卫失明。
++    // 现在 RULES_PATH 与 gate 同一 env 表达式,runConsume 入口消费已加载 rules。
++    const dir = mkdtempSync(join(tmpdir(), 'bd-rules-env-'))
++    try {
++      const evil = join(dir, 'evil-rules.json')
++      const real = JSON.parse(readFileSync(join(__dirname, 'rules.json'), 'utf8'))
++      writeFileSync(evil, JSON.stringify({ ...real, mergeAuthority: 'bug-doctor', t1: { ...real.t1, maxAutoMergePerDay: 2 } }))
++      const r = spawnSync(process.execPath, [CLI, 'consume', '--state-dir', dir, '--date', '2026-08-04'], {
++        encoding: 'utf8',
++        env: { ...process.env, MIVO_BUG_DOCTOR_RULES_PATH: evil, MIVO_SENTRY_FINDINGS_DIR: dir },
++      })
++      expect(r.status).not.toBe(0)
++      expect(`${r.stderr}${r.stdout}`).toContain('缴械字段被改动')
++    } finally { rmSync(dir, { recursive: true, force: true }) }
++  })
++})
++
++// ── 检查点(R3 六件套)可鉴别交错测试:区分「正确修法」与「上一轮只修一半的修法」──
++describe('disarm-assert-binding 不变量:校验对象 === 消费对象,失败前零写入', () => {
++  it('传入合法 rules + ambient 指向坏文件 → applyFindingsForDate 正常写入(旧修法在此红:写点 ambient 重读会误拿坏文件抛)', async () => {
++    const dir = mkdtempSync(join(tmpdir(), 'bd-cp-a1-'))
++    try {
++      const evil = join(dir, 'evil.json')
++      writeFileSync(evil, JSON.stringify({ mergeAuthority: 'bug-doctor', t1: { maxAutoMergePerDay: 9 } }))
++      process.env.MIVO_BUG_DOCTOR_RULES_PATH = evil // ambient 坏
++      try {
++        const { applyFindingsForDate: apply2 } = await import('./sentry-intake.mjs')
++        const state = defaultState(FINGERPRINT_VERSION)
++        // 必须带一个能走到 upsertTraeCluster 的合法 item——items:[] 走不到写入点,
++        // 旧修法(写入点 ambient 重读)就测不出来(首版测试正是这么漏的,当轮反向变异抓出)
++        const r = apply2(state, { dateStr: '2026-08-04', items: [finding({ fingerprint: fp('cpA1') })], rules: RULES, sentryRules: RULES.sentryIntake })
++        expect(r.newFindings + r.skipped).toBeGreaterThan(0) // 真消费了 item,且全程未抛
++      } finally { delete process.env.MIVO_BUG_DOCTOR_RULES_PATH }
++    } finally { rmSync(dir, { recursive: true, force: true }) }
++  })
++  it('传入武装态 rules → 入口抛,consumedDates/decisions/簇零变更(旧修法先写 dedup 键后抛 → 重试 deduped、finding 永久丢)', async () => {
++    const { applyFindingsForDate } = await import('./sentry-intake.mjs')
++    const armed = { mergeAuthority: 'bug-doctor', t1: { maxAutoMergePerDay: 2 } }
++    const state = { clusters: {}, sentryIntake: { consumedDates: {}, decisions: {} } }
++    expect(() => applyFindingsForDate(state, { dateStr: '2026-08-04', items: [{ any: 1 }], rules: armed, sentryRules: {} })).toThrow(/缴械字段被改动/)
++    expect(state.clusters).toEqual({})
++    expect(state.sentryIntake.consumedDates).toEqual({})
++    expect(state.sentryIntake.decisions).toEqual({})
++  })
++})
++
++// ── F-487-001/F-487-004b:缴械字段的运行时消费点(不是注释)──
++describe('assertDisarmed:mergeAuthority/maxAutoMergePerDay 是写路径的硬前置', () => {
++  it('缴械字段正常 → 放行;任一被改 → 写路径抛错(fail-visible,不静默恢复 T1 产源)', async () => {
++    const { assertDisarmed } = await import('./state.mjs') // R2:定义已移至 state.mjs(单一 owner)
++    const dir = mkdtempSync(join(tmpdir(), 'bd-disarm-assert-'))
++    try {
++      const ok = join(dir, 'ok.json')
++      writeFileSync(ok, JSON.stringify({ mergeAuthority: 'review-pr-only', t1: { maxAutoMergePerDay: 0 } }))
++      expect(() => assertDisarmed(ok)).not.toThrow()
++      const badAuth = join(dir, 'bad1.json')
++      writeFileSync(badAuth, JSON.stringify({ mergeAuthority: 'bug-doctor', t1: { maxAutoMergePerDay: 0 } }))
++      expect(() => assertDisarmed(badAuth)).toThrow(/缴械字段被改动/)
++      const badBudget = join(dir, 'bad2.json')
++      writeFileSync(badBudget, JSON.stringify({ mergeAuthority: 'review-pr-only', t1: { maxAutoMergePerDay: 1 } }))
++      expect(() => assertDisarmed(badBudget)).toThrow(/缴械字段被改动/)
++    } finally { rmSync(dir, { recursive: true, force: true }) }
++  })
++})
+diff --git a/scripts/loops/bug-doctor/state.mjs b/scripts/loops/bug-doctor/state.mjs
+index 89140bd1..a995965a 100644
+--- a/scripts/loops/bug-doctor/state.mjs
++++ b/scripts/loops/bug-doctor/state.mjs
+@@ -7,7 +7,8 @@
+ // 均为增量字段,不改动既定字段语义。
+ 
+ import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, unlinkSync, renameSync, statSync, lstatSync, readdirSync } from 'node:fs'
+-import { join } from 'node:path'
++import { join, dirname } from 'node:path'
++import { fileURLToPath } from 'node:url'
+ 
+ export const STATE_SCHEMA_VERSION = 1
+ 
+@@ -173,6 +174,44 @@ export const normalizePersistedTimestamps = (state) => {
+   return state
+ }
+ 
++// 缴械迁移(owner 2026-08-04 决策 mergeAuthority=review-pr-only):台账里遗留的
++// tCap='T1' 一律迁为 'T2'。T1 档的「自动合并」语义已废止,若不迁移,review-pr 的
++// detectLoopExclusion 走 state.json 兜底时会把这些 PR 判成 t1 → skip-loop-managed
++// → 没人审没人合,PR 挂死(三审 GPT 阻断①的断链路径之一)。迁移幂等。
++// 可观测性(F-487-003/CX-002 修订):计数经 Symbol 键随 state 对象传递(JSON.stringify
++// 天然忽略 Symbol,不进持久字段、不破坏 save(load(x)) 字节级幂等),日志由 saveState 在
++// rename 落盘**成功之后**恰记一次——留痕蕴含落盘;只读调用方(intake status/report)
++// 不 save 故零写盘零日志,不再出现「迁移日志刷了、磁盘还是 T1」的假完成记录。
++// 缴械断言(R2 三审 ①003/②001 修订:此前 assertDisarmed 读死仓内 rules.json,而 gate
++// 的规则源是 env MIVO_BUG_DOCTOR_RULES_PATH 可覆盖的——env 形态下「gate 按被改的规则跑、
++// 守卫看原封不动的文件」,头号机器强制绑错了对象。现在:①assertDisarmedRules 消费**已
++// 加载的 rules 对象**(调用方拿什么跑就校验什么);②assertDisarmed 读**生效路径**(与
++// gate 同一 env 表达式)。三条写簇路径(gate/intake/sentry-intake)全部通电(①004:
++// 此前只有 sentry-intake 一条,rules.json 注释「所有生产写入者核验」失实)。
++export const EFFECTIVE_RULES_PATH = () => process.env.MIVO_BUG_DOCTOR_RULES_PATH || join(dirname(fileURLToPath(import.meta.url)), 'rules.json')
++export const assertDisarmedRules = (r) => {
++  if (r?.mergeAuthority !== 'review-pr-only' || r?.t1?.maxAutoMergePerDay !== 0) {
++    throw new Error(`缴械字段被改动(mergeAuthority=${r?.mergeAuthority}, maxAutoMergePerDay=${r?.t1?.maxAutoMergePerDay}),tCap 写入路径拒绝执行——恢复 T1 自动合并须走 owner 决策,不是改配置。保护范围如实声明:罩住建簇/更新簇的 tCap 写入;mark-fixed 等不碰 tCap 的状态更新不在本断言范围(它们与 T1 产源无关)`)
++  }
++}
++export const assertDisarmed = (rulesPath = EFFECTIVE_RULES_PATH()) => assertDisarmedRules(JSON.parse(readFileSync(rulesPath, 'utf8')))
++
++// 收敛状态单一 owner(F-487-006):此前 gate 用黑名单(SETTLED 之外全 active)、dashboard
++// 用白名单(ACTIVE_STATUSES),同一语义两处独立枚举——新状态字(如 open-pr)进了黑名单
++// 语义却漏出白名单,在看板上隐身。全集判定只此一处,消费方一律 !SETTLED_STATUSES.has()。
++export const SETTLED_STATUSES = new Set(['fixed', 'issue-filed', 'known-noise'])
++
++export const TCAP_MIGRATED = Symbol('tCapMigrated')
++const migrateTCapToT2 = (parsed) => {
++  let n = 0
++  for (const c of Object.values(parsed.clusters ?? {})) {
++    // 畸形条目(null/非对象)跳过——同文件三个既有迁移同款 fail-open(F-487-008:
++    // 初版无此守卫,clusters:{"x":null} 会 TypeError 抛在 gate 全部清理之前,loop 永久楔死)
++    if (c && typeof c === 'object' && c.tCap === 'T1') { c.tCap = 'T2'; n += 1 }
++  }
++  return n
++}
++
+ export const loadState = (stateDir, fingerprintVersion) => {
+   const path = join(stateDir, STATE_FILE)
+   if (!existsSync(path)) return defaultState(fingerprintVersion)
+@@ -189,6 +228,7 @@ export const loadState = (stateDir, fingerprintVersion) => {
+   migrateRecentLevels(parsed)
+   normalizePersistedTimestamps(parsed)
+   backfillSettledTimestamps(parsed)
++  parsed[TCAP_MIGRATED] = migrateTCapToT2(parsed) // 日志推迟到 saveState 落盘后(见 TCAP_MIGRATED 注释)
+   const { approxSettledFps, unknownLevelFps } = collectSilentDegradationSignals(parsed.clusters)
+   parsed.lastSignals = { ...(parsed.lastSignals || {}), approxSettledFps, unknownLevelFps }
+   // 补齐增量字段(向后兼容旧骨架)
+@@ -224,6 +264,18 @@ export const saveState = (stateDir, state) => {
+   const tmp = `${path}.tmp-${process.pid}`
+   writeFileSync(tmp, `${JSON.stringify(stableState(state), null, 2)}\n`)
+   renameSync(tmp, path)
++  // 缴械迁移留痕:只在真正落盘成功后记,且同一 state 对象只记一次(记后清零,
++  // 防同轮多次 save 重复刷行)。构造的新 state(defaultState)无该 Symbol → 不记,正确。
++  if (state[TCAP_MIGRATED] > 0) {
++    // 留痕语义(R3 席② CX-005 修订):appendLog 失败**不清零**——下一次 save 重试,直到
++    // 真正写进 logs.md 才清(runbook 次日核验依赖该行,「失败即放弃」会让核验永远等不到)。
++    // 不抛:留痕失败不得破坏 saveState「返回即已落盘」契约(state.json rename 已成功)。
++    // 成功恰记一次;失败重试至成功——不是「0 或 1 次」。
++    try {
++      appendLog(stateDir, `${new Date().toISOString()} · state · 缴械迁移: tCap T1→T2 共 ${state[TCAP_MIGRATED]} 簇已落盘(mergeAuthority=review-pr-only)`)
++      state[TCAP_MIGRATED] = 0
++    } catch { /* 留痕失败保留计数,下轮 save 重试 */ }
++  }
+ }
+ 
+ // SC-BD1-R2-N01/N02:连续失败计数与 state.json 台账完全解耦,独立 sidecar 文件。
+diff --git a/scripts/loops/bug-doctor/state.test.mjs b/scripts/loops/bug-doctor/state.test.mjs
+index 11978e88..1899d100 100644
+--- a/scripts/loops/bug-doctor/state.test.mjs
++++ b/scripts/loops/bug-doctor/state.test.mjs
+@@ -8,6 +8,7 @@ import {
+   FAILURE_STATE_FILE,
+   LOCK_FILE,
+   STATE_SCHEMA_VERSION,
++  TCAP_MIGRATED,
+   acquireLock,
+   appendLedger,
+   appendLog,
+@@ -926,3 +927,97 @@ describe('ledger.csv / logs.md 只增', () => {
+     expect(content).toContain('- line-1\n- line-2\n')
+   })
+ })
++
++// ── 缴械迁移(owner 2026-08-04 mergeAuthority=review-pr-only):tCap T1→T2 ──
++describe('loadState 缴械迁移:遗留 tCap=T1 一律迁 T2', () => {
++  it('T1 全部迁 T2,迁移留痕 logs.md(不进持久字段,保 save/load 幂等);T2/缺失不动', () => {
++    const dir = mkdtempSync(join(tmpdir(), 'bd-tcap-mig-'))
++    try {
++      const s = defaultState(1)
++      s.clusters['a::t1'] = { source: 'a', pattern: 't1', sLevel: 'S2', tCap: 'T1', count: 1, clients: [], firstSeen: 't', lastSeen: 't', appVersions: [], status: 'open-pr', attempts: 0, issue: null, pr: 900, levels: [], recent: [], samples: [] }
++      s.clusters['b::t1'] = { source: 'b', pattern: 't1b', sLevel: 'S3', tCap: 'T1', count: 1, clients: [], firstSeen: 't', lastSeen: 't', appVersions: [], status: 'new', attempts: 0, issue: null, pr: null, levels: [], recent: [], samples: [] }
++      s.clusters['c::t2'] = { source: 'c', pattern: 't2', sLevel: 'S3', tCap: 'T2', count: 1, clients: [], firstSeen: 't', lastSeen: 't', appVersions: [], status: 'new', attempts: 0, issue: null, pr: null, levels: [], recent: [], samples: [] }
++      saveState(dir, s)
++      const loaded = loadState(dir, 1)
++      expect(loaded.clusters['a::t1'].tCap).toBe('T2')
++      expect(loaded.clusters['b::t1'].tCap).toBe('T2')
++      expect(loaded.clusters['c::t2'].tCap).toBe('T2')
++      // 留痕蕴含落盘(F-487-003/CX-002):load 只在内存迁移,**不得**写日志——
++      // 否则只读调用方(intake status)会刷「已迁移」假完成记录而磁盘仍是 T1
++      expect(existsSync(join(dir, 'logs.md'))).toBe(false)
++      saveState(dir, loaded)
++      // save 落盘成功后才恰记一次
++      expect(readFileSync(join(dir, 'logs.md'), 'utf8')).toContain('缴械迁移: tCap T1→T2 共 2 簇已落盘')
++      // 且磁盘上确实已无 T1(留痕与事实一致)
++      expect(readFileSync(join(dir, 'state.json'), 'utf8')).not.toContain('"tCap": "T1"')
++      // 同一对象再 save 不重复记行
++      const before = readFileSync(join(dir, 'logs.md'), 'utf8')
++      saveState(dir, loaded)
++      expect(readFileSync(join(dir, 'logs.md'), 'utf8')).toBe(before)
++    } finally { rmSync(dir, { recursive: true, force: true }) }
++  })
++
++  it('留痕失败保留计数下轮重试,恢复后恰记一次、再 save 不重复(R4 CX-R4-002:failure→retry→once 固化为回归,防 catch 提前清零旧回归)', () => {
++    const dir2 = mkdtempSync(join(tmpdir(), 'bd-tcap-retry-'))
++    try {
++      const s = defaultState(1)
++      s.clusters['r::t1'] = { source: 'a', pattern: 'p', sLevel: 'S2', tCap: 'T1', count: 1, clients: [], firstSeen: 't', lastSeen: 't', appVersions: [], status: 'new', attempts: 0, issue: null, pr: null, levels: [], recent: [], samples: [] }
++      saveState(dir2, s)
++      const loaded = loadState(dir2, 1) // 迁移计数 = 1
++      mkdirSync(join(dir2, 'logs.md')) // 注入 appendLog 失败:logs.md 被占为目录 → EISDIR
++      saveState(dir2, loaded) // 不抛(saveState「返回即已落盘」契约),计数保留
++      expect(readFileSync(join(dir2, 'state.json'), 'utf8')).not.toContain('"tCap": "T1"')
++      expect(loaded[TCAP_MIGRATED]).toBe(1) // 失败不清零——旧回归形状正是 catch 里提前清零
++      rmSync(join(dir2, 'logs.md'), { recursive: true, force: true }) // 恢复可写
++      saveState(dir2, loaded) // 重试成功:恰记一条并清零
++      const once = readFileSync(join(dir2, 'logs.md'), 'utf8')
++      expect(once.match(/缴械迁移/g)).toHaveLength(1)
++      expect(loaded[TCAP_MIGRATED]).toBe(0)
++      saveState(dir2, loaded) // 第三次 save:不重复记行
++      expect(readFileSync(join(dir2, 'logs.md'), 'utf8')).toBe(once)
++    } finally { rmSync(dir2, { recursive: true, force: true }) }
++  })
++
++  it('畸形簇条目(null/非对象)fail-open 跳过,不抛错(F-487-008:与同文件其余迁移同款;初版在此 TypeError 会楔死每轮 gate)', () => {
++    const dir = mkdtempSync(join(tmpdir(), 'bd-tcap-malformed-'))
++    try {
++      const s = defaultState(1)
++      s.clusters['ok::t1'] = { source: 'a', pattern: 'p', sLevel: 'S2', tCap: 'T1', count: 1, clients: [], firstSeen: 't', lastSeen: 't', appVersions: [], status: 'new', attempts: 0, issue: null, pr: null, levels: [], recent: [], samples: [] }
++      saveState(dir, s)
++      // 绕过 saveState 直接注入畸形条目(模拟外部损坏/跨版本数据)
++      const raw = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
++      raw.clusters['bad::null'] = null
++      raw.clusters['bad::str'] = 'garbage'
++      writeFileSync(join(dir, 'state.json'), JSON.stringify(raw))
++      const loaded = loadState(dir, 1) // 不得抛
++      expect(loaded.clusters['ok::t1'].tCap).toBe('T2')
++    } finally { rmSync(dir, { recursive: true, force: true }) }
++  })
++
++  it('save(load(x)) 字节级幂等在「输入真含 T1」时仍成立(F-487-005:此前 fixture 无 T1,幂等 oracle 从未经过迁移路径)', () => {
++    const dir = mkdtempSync(join(tmpdir(), 'bd-tcap-idem-'))
++    try {
++      const s = defaultState(1)
++      s.clusters['m::t1'] = { source: 'a', pattern: 'p', sLevel: 'S2', tCap: 'T1', count: 1, clients: [], firstSeen: 't', lastSeen: 't', appVersions: [], status: 'new', attempts: 0, issue: null, pr: null, levels: [], recent: [], samples: [] }
++      saveState(dir, s)
++      const first = saveThenRead(dir)   // 第一次 load(迁移)→save
++      const second = saveThenRead(dir)  // 第二次 load(无 T1 可迁)→save
++      expect(second).toBe(first)        // 字节级一致:迁移计数没进持久字段
++      function saveThenRead(d) { const st = loadState(d, 1); saveState(d, st); return readFileSync(join(d, 'state.json'), 'utf8') }
++    } finally { rmSync(dir, { recursive: true, force: true }) }
++  })
++
++  it('无遗留 T1 时迁移数为 0(幂等:迁移后再 load 不再计数)', () => {
++    const dir = mkdtempSync(join(tmpdir(), 'bd-tcap-mig0-'))
++    try {
++      const s = defaultState(1)
++      s.clusters['c::t2'] = { source: 'c', pattern: 't2', sLevel: 'S3', tCap: 'T2', count: 1, clients: [], firstSeen: 't', lastSeen: 't', appVersions: [], status: 'new', attempts: 0, issue: null, pr: null, levels: [], recent: [], samples: [] }
++      saveState(dir, s)
++      const first = loadState(dir, 1)
++      saveState(dir, first)
++      loadState(dir, 1)
++      // 无遗留 T1 → 不写迁移日志(0 不留痕,不刷屏)
++      expect(existsSync(join(dir, 'logs.md'))).toBe(false)
++    } finally { rmSync(dir, { recursive: true, force: true }) }
++  })
++})
+diff --git a/scripts/loops/dashboard/render.mjs b/scripts/loops/dashboard/render.mjs
+index 4a5228e8..16bcea4a 100644
+--- a/scripts/loops/dashboard/render.mjs
++++ b/scripts/loops/dashboard/render.mjs
+@@ -25,9 +25,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
+ const REPO_ROOT = resolve(__dirname, '../../..');
+ const REPO_SLUG = 'xindong/mivo-canvas';
+ const WINDOW_HOURS = 24;
+-// 'recurrent'(SC1):已结算(fixed/issue-filed)簇被晚到新记录重新打开后的状态,
+-// 必须回到活跃队列——否则复发的问题会在看板/intake 队列位置里隐身。
+-const ACTIVE_STATUSES = new Set(['new', 'triaged', 'in-progress', 'fix-attempted', 'recurrent']);
++// 活跃判定与 gate 同源(F-487-006:state.mjs 的 SETTLED_STATUSES 黑名单单一 owner)——
++// recurrent(复发重开)与 closed-unmerged(PR 关而未合、簇可重开)都是活跃态,由黑名单
++// 语义自然覆盖,无需在此逐状态枚举(旧的本地白名单及其逐状态注释已随删除)。
++import { SETTLED_STATUSES } from '../bug-doctor/state.mjs';
+ // 展示层 P 编号 = 内部 S 级一一映射(P3-9;内部字段不动)
+ const P_LABEL = { S0: 'P0', S1: 'P1', S2: 'P2', S3: 'P3' };
+ export const pLabel = (s) => P_LABEL[s] || String(s ?? '—');
+@@ -140,7 +141,7 @@ export function fetchGithub({ enabled, cachePath, now }) {
+ export function activeClusters(state) {
+   return Object.entries(state?.clusters || {})
+     .map(([fp, c]) => ({ fp, ...c }))
+-    .filter((c) => ACTIVE_STATUSES.has(c.status));
++    .filter((c) => !SETTLED_STATUSES.has(c.status));
+ }
+ 
+ export function queueCounts(clusters) {
+@@ -242,9 +243,15 @@ function prRow(p) {
+ }
+ 
+ function sectionDelivery({ gh, wp, state }) {
+-  const isAuto = (p) => (p.labels || []).some((l) => /t1|auto/i.test(l.name || l)) || /\[T1\]/.test(p.title || '');
+-  const auto = (gh.prs || []).filter(isAuto);
+-  const manual = (gh.prs || []).filter((p) => !isAuto(p));
++  // 2026-08-04 缴械:不再存在「自动合并机械档」——所有 loop PR 都等 review-pr 巡审合并。
++  // 分栏改为「已合并 / 待巡审」,按 PR 实际状态而非 T 级标签。
++  // CX-005:三态完整分区——每个 PR 恰进一栏。CLOSED(未合并即关)不可能再被巡审处理,
++  // 归入「待巡审」是可观测性失实;单列展示。
++  const stateOf = (p) => ((p.state || '').toUpperCase() === 'MERGED' || p.mergedAt) ? 'merged'
++    : (p.state || '').toUpperCase() === 'CLOSED' ? 'closed' : 'open';
++  const merged = (gh.prs || []).filter((p) => stateOf(p) === 'merged');
++  const pending = (gh.prs || []).filter((p) => stateOf(p) === 'open');
++  const closedUnmerged = (gh.prs || []).filter((p) => stateOf(p) === 'closed');
+   const issues = gh.issues || [];
+   // 批次2:origin=trae-audit 簇殿后排序已由 gate.mjs buildWorkpacket 完成(非 score 排序);
+   // 此处只按 score 取 Top8 展示,天然把 score 恒为 0 的 Trae 簇排到最后,来源标签另行标注
+@@ -264,8 +271,9 @@ function sectionDelivery({ gh, wp, state }) {
+ <section class="card" id="delivery">
+   <h2>② 交付</h2>
+   <div class="cols2">
+-    <div><h3>PR · 自动合并(机械档 T1)</h3>${tbl(auto, '暂无自动合并 PR')}</div>
+-    <div><h3>PR · 人审档(T2)</h3>${tbl(manual, '暂无待人审 PR')}</div>
++    <div><h3>PR · 已合并(由 review-pr 巡审执行)</h3>${tbl(merged, '暂无已合并 PR')}</div>
++    <div><h3>PR · 待巡审(loop 只开 PR 不合并)</h3>${tbl(pending, '暂无待巡审 PR')}</div>
++    <div><h3>PR · 已关闭未合并</h3>${tbl(closedUnmerged, '无')}</div>
+   </div>
+   <h3>Issue(T3 建档)</h3>
+   ${issues.length ? `<table><thead><tr><th>#</th><th>标题</th><th>状态</th><th>时间</th></tr></thead><tbody>${issues.map((i) =>
+diff --git a/scripts/loops/dashboard/render.test.mjs b/scripts/loops/dashboard/render.test.mjs
+index a385af11..ab490169 100644
+--- a/scripts/loops/dashboard/render.test.mjs
++++ b/scripts/loops/dashboard/render.test.mjs
+@@ -42,7 +42,8 @@ describe('computeLights 六流程状态灯', () => {
+ 
+ describe('activeClusters / queueCounts / dataAnchor', () => {
+   it('resolved/known-noise 不计入活跃', () => {
+-    const state = { clusters: { a: cluster({ status: 'resolved' }), b: cluster({ status: 'new', sLevel: 'S0' }), c: cluster({ status: 'known-noise' }) } }
++    // 'resolved' 是零生产写入点的遗留假状态字(F-487-006 修订时查实),换成真实 settled 状态 'fixed'
++    const state = { clusters: { a: cluster({ status: 'fixed' }), b: cluster({ status: 'new', sLevel: 'S0' }), c: cluster({ status: 'known-noise' }) } }
+     const act = activeClusters(state)
+     expect(act.length).toBe(1)
+     expect(queueCounts(act)).toEqual({ S0: 1, S1: 0, S2: 0, S3: 0 })
+@@ -237,3 +238,37 @@ describe('Mivo 更名 + P3-9 展示层映射', () => {
+     expect(traeTagIdx).toBeGreaterThan(persistRowIdx)
+   })
+ })
++
++
++// ── F-487-006/CX-005:三态分区 oracle——每个 PR 恰进一个分栏 ──
++describe('PR 三态分区与活跃簇同源判定', () => {
++  const mkPr = (n, state, mergedAt = null) => ({ number: n, title: `t${n}`, url: `https://x/${n}`, state, mergedAt, author: { login: 'x' }, createdAt: NOW })
++  const baseCtx = (over = {}) => ({
++    now: NOW, state: { clusters: {}, openPRs: [] }, wp: { clusters: [] }, baseline: null,
++    runs: [], ledger: parseLedger(''), gh: { prs: [], issues: [], stale: false, error: null, fetchedAt: NOW },
++    stateDirLabel: '/tmp/x', q: queueCounts([]), costTotal: 0, lights: computeLights([], RULES, NOW), anchor: NOW,
++    ...over,
++  })
++  it('OPEN→待巡审、MERGED→已合并、CLOSED→已关闭未合并,互不串栏(CX-005:CLOSED 不得冒充待巡审)', () => {
++    const html = buildHtml(baseCtx({ gh: { prs: [mkPr(1, 'OPEN'), mkPr(2, 'MERGED', NOW), mkPr(3, 'CLOSED')], issues: [], stale: false, error: null, fetchedAt: NOW } }))
++    const secs = html.split('<div><h3>')
++    const sec = (label) => secs.find((s) => s.startsWith(label) || s.includes(`>${label}`) || s.slice(0, 80).includes(label)) ?? ''
++    const pending = secs.find((s) => s.includes('待巡审')) ?? ''
++    const closed = secs.find((s) => s.includes('已关闭未合并')) ?? ''
++    const merged = secs.find((s) => s.includes('已合并(由 review-pr 执行)') || (s.includes('已合并') && !s.includes('已关闭'))) ?? ''
++    expect(pending).toContain('/1')
++    expect(pending).not.toContain('/3')
++    expect(closed).toContain('/3')
++    expect(closed).not.toContain('/1')
++    expect(merged).toContain('/2')
++  })
++  it('活跃簇判定与 gate 同源(SETTLED 黑名单):open-pr 状态不再隐身(F-487-006:旧白名单两边都不含它)', () => {
++    const state = { clusters: {
++      openpr: cluster({ status: 'open-pr' }),   // 旧白名单不含 → 曾在看板隐身;gate 却判它活跃
++      done: cluster({ status: 'fixed' }),        // settled → 不活跃
++      fresh: cluster({ status: 'new' }),
++    } }
++    const statuses = activeClusters(state).map((c) => c.status).sort()
++    expect(statuses).toEqual(['new', 'open-pr']) // fixed 被滤掉;open-pr 不再隐身
++  })
++})

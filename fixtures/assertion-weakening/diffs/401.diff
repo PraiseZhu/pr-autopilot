@@ -1,0 +1,81 @@
+diff --git a/ghost.json b/ghost.json
+index 2662bd59..5cf9ee61 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.2",
++  "version": "0.9.4",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/src/PluginApp.tsx b/src/PluginApp.tsx
+index a8be5906..d24d6755 100644
+--- a/src/PluginApp.tsx
++++ b/src/PluginApp.tsx
+@@ -1,5 +1,10 @@
++import { useCallback, useState } from 'react'
+ import { MivoCanvas } from '../../src/canvas/MivoCanvas'
+ import { ToastViewport } from '../../src/app/ToastViewport'
++import { MediaLightbox } from '../../src/app/MediaLightbox'
++import { DetailsTargetGuard } from '../../src/app/DetailsTargetGuard'
++import { isMediaRenderKind, renderKindForNode } from '../../src/model/canvasNodeRegistry'
++import { debugLogger } from '../../src/store/debugLogStore'
+ import { useCanvasStore } from '../../src/store/canvasStore'
+ import { usePluginHydration } from './usePluginHydration'
+ 
+@@ -14,10 +19,30 @@ import { usePluginHydration } from './usePluginHydration'
+  * 布局类沿用 App.css:mivo-app + project-collapsed + ai-collapsed 正好是
+  * "无侧栏、无 AI 面板、画布全铺"的形态;workspace/work-surface 是画布
+  * 尺寸计算依赖的容器层级。
++ *
++ * 详情入口只接图片/视频的 MediaLightbox;其余类型在插件里没有
++ * InspectorPanel,双击时记 warn 跳过(主站才有完整详情弹窗)。
+  */
+ export function PluginApp() {
+   const hydrated = usePluginHydration()
+   const sceneId = useCanvasStore((state) => state.sceneId)
++  // 打开时刻锁定目标(场景 + 节点),不跟随后续选区变化漂移。
++  // 越界关闭(agent 切场景等)由 DetailsTargetGuard 观察并回调清空。
++  const [lightboxTarget, setLightboxTarget] = useState<{ sceneId: string; nodeId: string }>()
++  const handleLightboxAutoClose = useCallback(() => setLightboxTarget(undefined), [])
++
++  const handleOpenDetails = useCallback(() => {
++    // onOpenDetails 在 selectNode 之后触发,此刻 store 里的 selectedNodeId 即目标节点。
++    const state = useCanvasStore.getState()
++    const node = state.nodes.find((item) => item.id === state.selectedNodeId)
++
++    if (node && isMediaRenderKind(renderKindForNode(node))) {
++      setLightboxTarget({ sceneId: state.sceneId, nodeId: node.id })
++      return
++    }
++
++    debugLogger.warn('Lightbox', `Details skipped in plugin for node type: ${node?.type ?? 'unknown'}`)
++  }, [])
+ 
+   if (!hydrated) {
+     return <div className="canvas-boot-placeholder" aria-busy="true" data-hydrated="false" />
+@@ -27,9 +52,20 @@ export function PluginApp() {
+     <main className="mivo-app project-collapsed ai-collapsed">
+       <div className="workspace">
+         <div className="work-surface">
+-          <MivoCanvas key={sceneId} />
++          <MivoCanvas key={sceneId} onOpenDetails={handleOpenDetails} />
+         </div>
+       </div>
++      {lightboxTarget ? (
++        <DetailsTargetGuard
++          targetSceneId={lightboxTarget.sceneId}
++          targetNodeId={lightboxTarget.nodeId}
++          watchNodeExists={false}
++          onAutoClose={handleLightboxAutoClose}
++        />
++      ) : null}
++      {lightboxTarget && lightboxTarget.sceneId === sceneId ? (
++        <MediaLightbox nodeId={lightboxTarget.nodeId} onClose={() => setLightboxTarget(undefined)} />
++      ) : null}
+       <ToastViewport />
+     </main>
+   )

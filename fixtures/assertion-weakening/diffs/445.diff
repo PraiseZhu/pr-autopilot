@@ -1,0 +1,13 @@
+diff --git a/ghost.json b/ghost.json
+index 3bf25875..bfe519d1 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.22",
++  "version": "0.9.23",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",

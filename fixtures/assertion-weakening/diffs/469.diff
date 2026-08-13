@@ -1,0 +1,18 @@
+diff --git a/src/cindy-theme.css b/src/cindy-theme.css
+index 0b80263a..c8149d81 100644
+--- a/src/cindy-theme.css
++++ b/src/cindy-theme.css
+@@ -236,6 +236,13 @@
+   border-color: color-mix(in srgb, var(--text-primary, #232323) 30%, var(--border-default, #d6d0c6));
+ }
+ 
++/* 点选常驻提示行:**故意不覆写**(J4 ⑧)。
++   原来这里按「主文字色掺 55% 抬升表面」推导,Light 下实测混出 rgb(134,132,127)
++   (相对亮度 0.2310),对面板底 #fffaf0(0.9592)只有 3.59:1 —— 12px 是 WCAG normal text,
++   AA 线 4.5:1,不合格。现在 App.css 那条规则改用 --muted(网页值 #756f67 = 4.78:1 过线),
++   而本文件顶部的文字三级映射已把 --muted → 宿主 --text-secondary:换肤交给宿主的
++   次级文字色角色(它对自己两套皮肤的对比度有保证),比在这里手调混色比例靠得住。 */
++
+ /* @ 下拉浮层:与工具坞浮层同一档抬升,避免同屏两层浮层色差。 */
+ .region-edit-suggest {
+   background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 94%, var(--text-primary, #232323) 6%);

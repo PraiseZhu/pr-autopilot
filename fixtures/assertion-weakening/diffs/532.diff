@@ -1,0 +1,3952 @@
+diff --git a/cindyplugin/src/__tests__/persistSyncCompact.test.ts b/cindyplugin/src/__tests__/persistSyncCompact.test.ts
+new file mode 100644
+index 00000000..74349215
+--- /dev/null
++++ b/cindyplugin/src/__tests__/persistSyncCompact.test.ts
+@@ -0,0 +1,94 @@
++import { readFileSync } from 'node:fs'
++import { fileURLToPath } from 'node:url'
++import { describe, expect, it, vi } from 'vitest'
++
++// #505 P1-6:compact 从 partialize 移到 storage flush 后,插件 persistSync 的
++// 手动 envelope(不经 zustand storage)必须与主站走**同一 compact 出口**
++// (compactCanvasPersistSlice),否则 asset/fills/relations/strokes/transform
++// 全量进档案(契约回归)。三层钉:
++//   1) 源码契约:persistSync 的 envelope 构建必须经 compactCanvasPersistSlice
++//   2) 字节契约:compactCanvasPersistSlice(partialize(state)) 与 #505 前
++//      「partialize 内嵌 compact」的输出逐字节一致
++//   3) 缓存契约:未变画布跨两次调用复用同一 compact 结果(零拷贝)
++
++vi.mock('../../../src/lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++
++const { canvasPersistOptions, compactCanvasPersistSlice } = await import(
++  '../../../src/store/canvasPersistConfig'
++)
++const { compactCanvasesForPersist } = await import('../../../src/store/canvasDocumentModel')
++import type { CanvasState } from '../../../src/store/canvasStore'
++
++const persistSyncSource = readFileSync(
++  fileURLToPath(new URL('../persist/persistSync.ts', import.meta.url)),
++  'utf8',
++)
++
++const node = {
++  id: 'n1',
++  type: 'image',
++  status: 'ready',
++  x: 1,
++  y: 2,
++  width: 100,
++  height: 80,
++  assetUrl: 'mivo-asset:xyz',
++  transform: { x: 1, y: 2, width: 100, height: 80, rotation: 0 },
++  asset: { kind: 'image', url: 'mivo-asset:xyz' },
++  fills: [{ id: 'f', type: 'image', url: 'mivo-asset:xyz' }],
++  relations: {},
++}
++
++const stateFixture = {
++  canvases: {
++    c1: { title: 'A', nodes: [node], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
++  },
++  projects: [],
++  sceneId: 'c1',
++  selectedNodeId: undefined,
++  selectedNodeIds: [],
++  activeTool: 'select',
++  lastMarkupShapeTool: 'rect',
++  brushStyle: { color: '#000', width: 8, kind: 'marker' },
++  drawStyle: { color: '#000' },
++  activeStampKind: 'star',
++  appliedAgentIntents: [],
++} as unknown as CanvasState
++
++/** #505 前的 partialize(compact 内嵌)原样重建,作字节参照。 */
++const legacyPartialize = (state: CanvasState) => ({
++  canvases: compactCanvasesForPersist(state.canvases),
++  projects: state.projects,
++  sceneId: state.sceneId,
++  selectedNodeId: state.selectedNodeId,
++  selectedNodeIds: state.selectedNodeIds,
++  activeTool: state.activeTool,
++  lastMarkupShapeTool: state.lastMarkupShapeTool,
++  brushStyle: state.brushStyle,
++  drawStyle: state.drawStyle,
++  activeStampKind: state.activeStampKind,
++  appliedAgentIntents: state.appliedAgentIntents,
++})
++
++describe('persistSync × compactCanvasPersistSlice(#505 P1-6)', () => {
++  it('源码契约:persistSync 的 envelope 必须经 compactCanvasPersistSlice(partialize(...)) 构建', () => {
++    expect(persistSyncSource).toMatch(/compactCanvasPersistSlice\(canvasPersistOptions\.partialize\(/)
++  })
++
++  it('字节契约:与 #505 前 partialize 内嵌 compact 的 envelope 逐字节一致(裁剪字段不进档案)', () => {
++    const current = JSON.stringify(compactCanvasPersistSlice(canvasPersistOptions.partialize(stateFixture)))
++    const legacy = JSON.stringify(legacyPartialize(stateFixture))
++    expect(current).toBe(legacy)
++    for (const dropped of ['"asset"', '"fills"', '"relations"', '"strokes"']) {
++      expect(current).not.toContain(dropped)
++    }
++  })
++
++  it('缓存契约:未变画布跨两次 envelope 构建复用同一 compact 结果(零拷贝)', () => {
++    const first = compactCanvasPersistSlice(canvasPersistOptions.partialize(stateFixture))
++    const second = compactCanvasPersistSlice(canvasPersistOptions.partialize(stateFixture))
++    expect(second.canvases.c1).toBe(first.canvases.c1)
++  })
++})
+diff --git a/cindyplugin/src/__tests__/pluginKernelDegradation.test.ts b/cindyplugin/src/__tests__/pluginKernelDegradation.test.ts
+new file mode 100644
+index 00000000..ced1b416
+--- /dev/null
++++ b/cindyplugin/src/__tests__/pluginKernelDegradation.test.ts
+@@ -0,0 +1,60 @@
++// @vitest-environment happy-dom
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #505 六审 F2:kernel=new + 无 IDB 时插件链不得静默丢写。usePluginHydration 在
++// restore/rehydrate 前 await ensureEffectiveKernelReady()(与主站同一把闸,调用点
++// 与顺序由 src/app/kernelDegradation.test 的源码契约钉住);本文件走**真实生产
++// 写读链**验证降级后果:真实 canvasStore 编辑 → persist(canvasPersistConfig 的
++// debounced storage,resolveTarget 按生效内核分流)→ flush → legacy 单 blob 落
++// LS(happy-dom 无 IDB = fallback 在环)→ 清快照后真实读回。requested-new 经
++// VITE_MIVO_KERNEL 钉住。
++
++vi.stubEnv('VITE_MIVO_KERNEL', 'new')
++
++const { kernelMode, getEffectiveKernelMode, ensureEffectiveKernelReady, __resetKernelDegradationForTests } =
++  await import('../../../src/app/kernelMode')
++const { __resetIdbOperationalProbeForTests } = await import('../../../src/lib/persistIdbStorage')
++const { useCanvasStore } = await import('../../../src/store/canvasStore')
++const { flushCanvasPersistWrite, __resetCanvasPersistStorageForTests } = await import(
++  '../../../src/store/canvasPersistConfig'
++)
++
++const NAME = 'mivo-canvas-demo'
++
++describe('插件链 kernel=new + 无 IDB:启动降级后编辑落 legacy 单 blob 且可读回', () => {
++  beforeEach(() => {
++    localStorage.clear()
++    __resetIdbOperationalProbeForTests()
++    __resetKernelDegradationForTests()
++    __resetCanvasPersistStorageForTests()
++  })
++
++  it('requested-new + 无 IDB → 生效 legacy;真实编辑 flush 后 LS 单 blob 非空、零 split 键、可读回', async () => {
++    expect(kernelMode).toBe('new') // 前提自检:请求值确为 new
++    expect(typeof indexedDB).toBe('undefined') // 前提自检:无 IDB 环境
++
++    // usePluginHydration 在任何 restore/rehydrate 前 await 的同一把闸(生产函数)
++    await ensureEffectiveKernelReady()
++    expect(getEffectiveKernelMode()).toBe('legacy')
++
++    // 真实编辑 → persist setItem(debounced storage)→ flush
++    useCanvasStore.getState().setActiveTool('brush')
++    await flushCanvasPersistWrite('plugin-degradation-test')
++
++    const raw = localStorage.getItem(NAME) // legacy 单 blob(LS fallback)
++    expect(raw).not.toBeNull()
++    const parsed = JSON.parse(raw!) as { state: { activeTool?: string }; version: number }
++    expect(parsed.state.activeTool).toBe('brush')
++    expect(parsed.version).toBe(12)
++    expect(localStorage.getItem(`${NAME}:document`)).toBeNull() // 零 split-domain 键
++    expect(localStorage.getItem(`${NAME}:session`)).toBeNull()
++
++    // 可读回(反假成功):清 read-your-writes 快照,逼 getItem 走底层真实读
++    __resetCanvasPersistStorageForTests()
++    const opts = useCanvasStore.persist.getOptions()
++    const readBack = (await opts.storage!.getItem(NAME)) as { state: { activeTool?: string }; version: number } | null
++    expect(readBack).not.toBeNull()
++    expect(readBack!.state.activeTool).toBe('brush')
++    expect(readBack!.version).toBe(12)
++  })
++})
+diff --git a/cindyplugin/src/persist/persistSync.ts b/cindyplugin/src/persist/persistSync.ts
+index c926195d..86b3b704 100644
+--- a/cindyplugin/src/persist/persistSync.ts
++++ b/cindyplugin/src/persist/persistSync.ts
+@@ -9,7 +9,7 @@
+  * 原样写回 IDB 再走正常 rehydrate,migrate/merge 链由上游代码保证——本模块
+  * 对画布内部结构零知识,只做整库搬运;资产按内容不可变增量落盘。
+  */
+-import { canvasPersistOptions } from '../../../src/store/canvasPersistConfig'
++import { canvasPersistOptions, compactCanvasPersistSlice } from '../../../src/store/canvasPersistConfig'
+ import { CANVAS_PERSIST_VERSION } from '../../../src/store/canvasGenerationHydration'
+ import { useCanvasStore } from '../../../src/store/canvasStore'
+ import { rawIdbStorage } from '../../../src/lib/persistIdbStorage'
+@@ -205,7 +205,10 @@ async function runFlush(): Promise<boolean> {
+   firstDirtyAt = 0
+   {
+     const state = useCanvasStore.getState()
+-    const partial = canvasPersistOptions.partialize(state)
++    // #505:compact 已从 partialize 移到 storage 层的 flush——本通道不经 zustand
++    // storage,必须显式走同一 compact 出口(compactCanvasPersistSlice),否则
++    // asset/fills/relations/strokes/transform 全量进档案(契约回归)。
++    const partial = compactCanvasPersistSlice(canvasPersistOptions.partialize(state))
+     const envelope = JSON.stringify({ state: partial, version: CANVAS_PERSIST_VERSION })
+ 
+     const urls = new Set<string>()
+diff --git a/cindyplugin/src/usePluginHydration.ts b/cindyplugin/src/usePluginHydration.ts
+index bec4ef16..6ce192fa 100644
+--- a/cindyplugin/src/usePluginHydration.ts
++++ b/cindyplugin/src/usePluginHydration.ts
+@@ -3,6 +3,7 @@ import { useCanvasStore } from '../../src/store/canvasStore'
+ import { useSettingsStore } from '../../src/store/settingsSlice'
+ import { debugLogger } from '../../src/store/debugLogStore'
+ import { beginCanvasHydration, markCanvasHydrationComplete } from '../../src/agent/canvasWriteGate'
++import { ensureEffectiveKernelReady } from '../../src/app/kernelMode'
+ import { drainPendingCanvasWrites } from './agent/pendingWriteDrain'
+ import { restoreFromDiskIfEmpty, startAutoSave } from './persist/persistSync'
+ 
+@@ -29,6 +30,10 @@ export function usePluginHydration(): boolean {
+       // 在本轮 restore/rehydrate 完成前被放行(§2.5-③ 同一失败模式的另一个触发路径)。
+       beginCanvasHydration()
+       try {
++        // #505:任何 restore/rehydrate/persist 写之前等生效内核判定(与主站
++        // useStoreHydration 同一把闸)——kernel=new + IDB 不可用时降级 legacy
++        // 单 blob 通道(LS fallback 在环),插件编辑不会静默不落盘。
++        await ensureEffectiveKernelReady()
+         // Cindy 重启后插件内存分区清零 → 先从磁盘档案恢复(同一次运行内
+         // 重开面板时 IDB 仍在,内部直接跳过)。恢复失败不阻塞挂载。
+         try {
+diff --git a/src/app/kernelBootTotal.test.ts b/src/app/kernelBootTotal.test.ts
+new file mode 100644
+index 00000000..50c8d207
+--- /dev/null
++++ b/src/app/kernelBootTotal.test.ts
+@@ -0,0 +1,63 @@
++// @vitest-environment happy-dom
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #505 八审 F2-余:ensureEffectiveKernelReady 必须 **total / never-reject**。
++// 它是 main 的 .then 链、主站 useStoreHydration、插件 usePluginHydration 三条链的
++// 公共前置——reject 会把三条链一起打死(auth 永不水合)。characterization:
++// dynamic import 失败 / probe 抛异常两例,都必须 resolve + fail-safe 降级 legacy +
++// error 落账,且下游(auth.hydrate 形态的 .then 链)照常执行。
++
++const state = vi.hoisted(() => ({ mode: 'import-boom' as 'import-boom' | 'probe-throw' }))
++const debugLogger = vi.hoisted(() => ({ log: vi.fn(), warn: vi.fn(), error: vi.fn() }))
++vi.mock('../store/debugLogStore', () => ({ debugLogger }))
++vi.mock('../lib/persistIdbStorage', () => {
++  if (state.mode === 'import-boom') {
++    throw new Error('import boom (chunk load failed)') // 模块级失败 → 动态 import reject
++  }
++  return {
++    probeIdbOperational: vi.fn(async () => {
++      throw new Error('probe boom (unswallowed)') // probe 自身抛出未吞异常
++    }),
++  }
++})
++
++vi.stubEnv('VITE_MIVO_KERNEL', 'new') // 请求值钉 new:走 probe 分支才有异常面
++
++describe('ensureEffectiveKernelReady total/never-reject(八审 F2-余 characterization)', () => {
++  beforeEach(() => {
++    vi.resetModules() // 每例重新求值 kernelMode(boot 单例/降级位归零)
++    debugLogger.error.mockClear()
++  })
++
++  const runCase = async () => {
++    const km = await import('./kernelMode')
++    const hydrateSpy = vi.fn()
++    // main.tsx 的链形态:boot reject 时 .then 永不执行 → auth 永不水合(这就是要防的)
++    await km.ensureEffectiveKernelReady().then(() => hydrateSpy())
++    expect(hydrateSpy).toHaveBeenCalledTimes(1) // 链存活:auth 照常 hydrate
++    expect(km.getEffectiveKernelMode()).toBe('legacy') // fail-safe 降级
++    const bootErrors = () =>
++      debugLogger.error.mock.calls.filter(
++        ([source, message]) => source === 'Kernel' && String(message).startsWith('effective-kernel boot 异常'),
++      )
++    const degradeErrors = () =>
++      debugLogger.error.mock.calls.filter(
++        ([source, message]) => source === 'Kernel' && String(message).includes('降级为 legacy'),
++      )
++    expect(bootErrors()).toHaveLength(1) // catch 兜底 error 恰一次
++    expect(degradeErrors()).toHaveLength(1) // 降级 error 恰一次
++    await km.ensureEffectiveKernelReady() // 幂等:单例缓存,不再抛/不再刷日志
++    expect(bootErrors()).toHaveLength(1)
++    expect(degradeErrors()).toHaveLength(1)
++  }
++
++  it('dynamic import 失败(chunk 加载失败形态)→ resolve + legacy + error 恰一次 + 下游链存活', async () => {
++    state.mode = 'import-boom'
++    await runCase()
++  })
++
++  it('probe 抛未吞异常 → 同口径 total 兜底', async () => {
++    state.mode = 'probe-throw'
++    await runCase()
++  })
++})
+diff --git a/src/app/kernelDegradation.test.ts b/src/app/kernelDegradation.test.ts
+new file mode 100644
+index 00000000..5f440b11
+--- /dev/null
++++ b/src/app/kernelDegradation.test.ts
+@@ -0,0 +1,182 @@
++// @vitest-environment happy-dom
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #505:kernel=new 无可用 IDB 的**启动降级**。
++// - probeIdbOperational 是真实 open + noop 事务的 operational 探测:覆盖
++//   「indexedDB 全局存在但用不了」的两类失败(open reject / transaction 抛错),
++//   纯存在性判定(旧口径)会误判可用。结果每会话缓存一次。
++// - **接线口 = ensureEffectiveKernelReady()**(probe + degrade 的共享 boot 单例):
++//   主站 useStoreHydration 与插件 usePluginHydration 在任何 restore/rehydrate 前
++//   都 await 它——本文件直接测这个生产函数(不手抄编排逻辑),并以源码契约钉住
++//   两条水合链的调用点与顺序。kernel=new 语义只在 operational IDB 下存在。
++
++import hydrationSource from './useStoreHydration.ts?raw'
++import pluginHydrationSource from '../../cindyplugin/src/usePluginHydration.ts?raw'
++import mainSource from '../main.tsx?raw'
++
++const debugLogger = { log: vi.fn(), warn: vi.fn(), error: vi.fn() }
++vi.mock('../store/debugLogStore', () => ({ debugLogger }))
++
++// kernelMode 在模块加载时一次性解析:经 VITE_MIVO_KERNEL env(动态索引,专为
++// vi.stubEnv 留的测试缝)把本测试文件的 kernel 请求值钉成 new。
++vi.stubEnv('VITE_MIVO_KERNEL', 'new')
++
++const { probeIdbOperational, __resetIdbOperationalProbeForTests, __resetIdbPersist } = await import(
++  '../lib/persistIdbStorage'
++)
++const {
++  kernelMode,
++  getEffectiveKernelMode,
++  isLegacyKernelEffective,
++  degradeKernelToLegacyForSession,
++  ensureEffectiveKernelReady,
++  warnIfEffectiveKernelBootPending,
++  __resetKernelDegradationForTests,
++} = await import('./kernelMode')
++
++/** open 即失败的假 indexedDB(全局存在,operational 不可用)。 */
++const brokenOpenIdb = () => ({
++  open: () => {
++    const request: { onerror?: (e: unknown) => void; onsuccess?: () => void; onupgradeneeded?: () => void; error: Error } = {
++      error: new Error('open rejected (private mode)'),
++    }
++    setTimeout(() => request.onerror?.({ target: request }), 0)
++    return request
++  },
++})
++
++/** open 成功但事务创建即抛的假 indexedDB(连接可开,事务层坏)。 */
++const brokenTxIdb = () => ({
++  open: () => {
++    const db = {
++      objectStoreNames: { contains: () => true },
++      transaction: () => {
++        throw new Error('tx aborted (quota lockdown)')
++      },
++      close: () => undefined,
++    }
++    const request: { onerror?: () => void; onsuccess?: () => void; onupgradeneeded?: () => void; result: unknown } = {
++      result: db,
++    }
++    setTimeout(() => request.onsuccess?.(), 0)
++    return request
++  },
++  deleteDatabase: () => {
++    const request: { onsuccess?: () => void; onerror?: () => void; onblocked?: () => void } = {}
++    setTimeout(() => request.onsuccess?.(), 0)
++    return request
++  },
++})
++
++describe('kernel=new 启动降级(operational 探测 + 会话级生效值)', () => {
++  beforeEach(async () => {
++    vi.unstubAllGlobals()
++    await __resetIdbPersist().catch(() => undefined)
++    __resetIdbOperationalProbeForTests()
++    __resetKernelDegradationForTests()
++    debugLogger.error.mockClear()
++  })
++
++  it('请求值确认:env 钉 kernel=new(降级测试的前提自检)', () => {
++    expect(kernelMode).toBe('new')
++    expect(getEffectiveKernelMode()).toBe('new')
++  })
++
++  it('open reject:operational 探测 false', async () => {
++    vi.stubGlobal('indexedDB', brokenOpenIdb())
++    expect(await probeIdbOperational()).toBe(false)
++  })
++
++  it('transaction 抛错:纯存在性判定会误判可用,operational 探测识破', async () => {
++    vi.stubGlobal('indexedDB', brokenTxIdb())
++    expect(typeof indexedDB).not.toBe('undefined') // 存在性判定会说"可用"
++    expect(await probeIdbOperational()).toBe(false)
++  })
++
++  it('探测缓存:会话内只探一次(第二次调用不再触发 open)', async () => {
++    let openCalls = 0
++    const counting = brokenOpenIdb()
++    vi.stubGlobal('indexedDB', {
++      open: () => {
++        openCalls += 1
++        return counting.open()
++      },
++    })
++    await probeIdbOperational()
++    await probeIdbOperational()
++    expect(openCalls).toBe(1)
++  })
++
++  it('降级:生效内核翻转 legacy,error 日志恰一次(重复调用不刷屏)', () => {
++    degradeKernelToLegacyForSession('IDB operational 探测失败(测试)')
++    expect(getEffectiveKernelMode()).toBe('legacy')
++    expect(isLegacyKernelEffective()).toBe(true)
++    expect(kernelMode).toBe('new') // 请求值不变——只降生效值
++    degradeKernelToLegacyForSession('再来一次')
++    const kernelErrors = debugLogger.error.mock.calls.filter(([source]) => source === 'Kernel')
++    expect(kernelErrors).toHaveLength(1)
++    expect(String(kernelErrors[0][1])).toContain('降级为 legacy')
++  })
++
++  it('接线口(生产函数):IDB 坏 → ensureEffectiveKernelReady 后生效内核 = legacy,幂等单飞', async () => {
++    vi.stubGlobal('indexedDB', brokenOpenIdb())
++    const first = ensureEffectiveKernelReady()
++    expect(ensureEffectiveKernelReady()).toBe(first) // 单例 boot promise(两条水合链共享)
++    await first
++    expect(getEffectiveKernelMode()).toBe('legacy')
++    await ensureEffectiveKernelReady() // 幂等
++    const kernelErrors = debugLogger.error.mock.calls.filter(([source]) => source === 'Kernel')
++    expect(kernelErrors).toHaveLength(1)
++  })
++
++  it('接线口(生产函数):IDB 可用 → ensureEffectiveKernelReady 后生效内核保持 new', async () => {
++    const { IDBFactory } = await import('fake-indexeddb')
++    vi.stubGlobal('indexedDB', new IDBFactory())
++    await ensureEffectiveKernelReady()
++    expect(await probeIdbOperational()).toBe(true) // operational 探测真过(非存在性)
++    expect(getEffectiveKernelMode()).toBe('new')
++    expect(isLegacyKernelEffective()).toBe(false)
++  })
++
++  it('接线契约:闸先于**一切持久化口**——main eager auth.hydrate / auth 屏障 / migrate / rehydrate / 插件 restore', () => {
++    // main.tsx 的 eager auth.hydrate 必须被闸串行化(.then 结构直接钉时序,
++    // 不靠 index 比较——await 后移到 hydrate 之后仍会被这里揪出)。
++    expect(mainSource).toMatch(
++      /ensureEffectiveKernelReady\(\)\s*\.then\(\(\) => useAuthStore\.getState\(\)\.hydrate\(\)\)/,
++    )
++    expect(mainSource).not.toMatch(/^void useAuthStore\.getState\(\)\.hydrate\(\)/m)
++    // useStoreHydration:闸 < auth.hydrate(hydrate 内的账号切换屏障会冻结通道)
++    const gateAt = hydrationSource.indexOf('await ensureEffectiveKernelReady()')
++    expect(gateAt).toBeGreaterThan(0)
++    expect(gateAt).toBeLessThan(hydrationSource.indexOf('useAuthStore.getState().hydrate()'))
++    // useStoreHydration:闸 < migrate 仪式 < rehydrate
++    expect(gateAt).toBeLessThan(hydrationSource.indexOf('migrateV10ToV11('))
++    expect(gateAt).toBeLessThan(hydrationSource.indexOf('.persist.rehydrate()'))
++    // 插件:闸 < 磁盘 restore
++    expect(pluginHydrationSource).toContain('await ensureEffectiveKernelReady()')
++    expect(pluginHydrationSource.indexOf('await ensureEffectiveKernelReady()')).toBeLessThan(
++      pluginHydrationSource.indexOf('restoreFromDiskIfEmpty()'),
++    )
++  })
++
++  it('运行时守卫(fail-visible):boot 未完成即解析通道 → error 恰一次;boot 完成后静默', async () => {
++    // boot 前调用(kernel=new 请求下)→ error 落账,且不重复刷
++    warnIfEffectiveKernelBootPending('test.resolveTarget')
++    warnIfEffectiveKernelBootPending('test.resolveTarget')
++    const pre = debugLogger.error.mock.calls.filter(
++      ([source, message]) => source === 'Kernel' && String(message).includes('boot 完成前'),
++    )
++    expect(pre).toHaveLength(1)
++
++    // boot 完成后 → 静默(守卫只抓编排回归,不骚扰正常路径)
++    __resetKernelDegradationForTests()
++    debugLogger.error.mockClear()
++    vi.stubGlobal('indexedDB', brokenOpenIdb())
++    await ensureEffectiveKernelReady()
++    warnIfEffectiveKernelBootPending('test.resolveTarget')
++    const post = debugLogger.error.mock.calls.filter(
++      ([source, message]) => source === 'Kernel' && String(message).includes('boot 完成前'),
++    )
++    expect(post).toHaveLength(0)
++  })
++})
+diff --git a/src/app/kernelMode.ts b/src/app/kernelMode.ts
+index 9289cdee..c9adc208 100644
+--- a/src/app/kernelMode.ts
++++ b/src/app/kernelMode.ts
+@@ -85,3 +85,81 @@ export function getKernelMode(): KernelMode {
+ 
+ export const isLegacyKernel = kernelMode === 'legacy'
+ export const isNewKernel = kernelMode === 'new'
++
++// ── #505 启动降级(会话级)────────────────────────────────────────────────────
++// kernel=new 的 split-domain canonical 依赖可用的 IndexedDB(两域一笔事务原子写);
++// IDB operational 探测失败(private mode / 配额封锁 / open 被 block)的环境里
++// kernel=new 语义不存在——**生效内核**降级为 legacy(URL/env 请求值仍在,但本会话
++// 不生效;与 rendererMode 非法值回退默认同款精神)。降级只发生在 useStoreHydration
++// 启动编排里、任何 persist 读写之前;error 日志恰一次。
++
++let degradedToLegacyThisSession = false
++
++/** 启动降级:kernel=new 请求 + IDB operational 探测失败 → 本会话生效内核 = legacy。 */
++export const degradeKernelToLegacyForSession = (reason: string): void => {
++  if (kernelMode !== 'new' || degradedToLegacyThisSession) return
++  degradedToLegacyThisSession = true
++  debugLogger.error('Kernel', `kernel=new 本会话降级为 legacy:${reason}(URL/env 请求值不生效,单 blob 通道)`)
++}
++
++/** 生效内核:持久化路径(persist backend / migrate 仪式 / e2e 物理键)一律读它,
++ *  不读启动请求值 isLegacyKernel/isNewKernel。 */
++export const getEffectiveKernelMode = (): KernelMode =>
++  degradedToLegacyThisSession ? 'legacy' : kernelMode
++
++export const isLegacyKernelEffective = (): boolean => getEffectiveKernelMode() === 'legacy'
++
++// 单例 boot promise:probe + degrade 的共享封装。主站 useStoreHydration 与插件
++// usePluginHydration 在任何 restore/rehydrate/persist 写之前都必须 await 它——
++// 生效内核的判定恰一次,两条水合链同一把闸,不存在旁路。
++// (probeIdbOperational 动态 import:kernelMode 被大量模块在加载期引用,静态挂上
++// persistIdbStorage 的依赖闭包会制造 app↔lib↔store 环;boot 路径一次性动态解析。)
++let effectiveKernelReady: Promise<void> | undefined
++let effectiveKernelBootCompleted = false
++let bootPendingWarned = false
++
++/** 等生效内核判定完成(幂等,单飞,**total/never-reject**)。kernel=legacy 请求值
++ *  下直接返回。任何异常(dynamic import 失败 / probe 未吞的异常)→ error 落账 +
++ *  按 fail-safe 降级 legacy + 照常 resolve——boot 是 main 的 .then 链、主站 hook、
++ *  插件 hook 三条链的公共前置,reject 会把三条链一起打死。 */
++export const ensureEffectiveKernelReady = (): Promise<void> => {
++  if (effectiveKernelReady) return effectiveKernelReady
++  effectiveKernelReady = (async () => {
++    try {
++      if (kernelMode !== 'new') return
++      const { probeIdbOperational } = await import('../lib/persistIdbStorage')
++      if (!(await probeIdbOperational())) {
++        degradeKernelToLegacyForSession('IDB operational 探测失败(open/事务不可用)')
++      }
++    } catch (error) {
++      debugLogger.error(
++        'Kernel',
++        `effective-kernel boot 异常,fail-safe 降级 legacy: ${error instanceof Error ? error.message : String(error)}`,
++      )
++      degradeKernelToLegacyForSession('boot 异常(import/probe 失败)')
++    } finally {
++      effectiveKernelBootCompleted = true
++    }
++  })()
++  return effectiveKernelReady
++}
++
++/** 运行时守卫(fail-visible,防未来编排回归):kernel=new 请求下,boot 完成前
++ *  就有调用方解析持久化通道 → error 落账恰一次。**只报警不阻塞**——写按当时
++ *  生效值冻结照常进行(阻塞会制造新的丢写面);正确编排下不可达。 */
++export const warnIfEffectiveKernelBootPending = (source: string): void => {
++  if (kernelMode !== 'new' || effectiveKernelBootCompleted || bootPendingWarned) return
++  bootPendingWarned = true
++  debugLogger.error(
++    'Kernel',
++    `${source} 在 effective-kernel boot 完成前解析持久化通道(编排顺序回归)——写按当时生效值冻结,未阻塞`,
++  )
++}
++
++/** 测试专用:重置会话降级位与 boot 单例。 */
++export const __resetKernelDegradationForTests = (): void => {
++  degradedToLegacyThisSession = false
++  effectiveKernelReady = undefined
++  effectiveKernelBootCompleted = false
++  bootPendingWarned = false
++}
+diff --git a/src/app/useStoreHydration.orchestration.test.tsx b/src/app/useStoreHydration.orchestration.test.tsx
+new file mode 100644
+index 00000000..9177e7c0
+--- /dev/null
++++ b/src/app/useStoreHydration.orchestration.test.tsx
+@@ -0,0 +1,139 @@
++// @vitest-environment happy-dom
++//
++// #505:auth.hydrate 的 outcome 必须贯穿到 useStoreHydration **编排层**(最终语义,
++// 九审终裁):
++// - 'reload-issued'(A→B 整页 reload 在途)→ 中止编排,不做无用功,hydrated 不放行。
++// - 'persist-busy'(首登屏障超时 fail-closed)→ **跳过一切盘面水合**(kv store 里有
++//   卡死写事务,chat/settings 与 canvas 共用同一 store,任何盘面读都会排队冻结首屏):
++//   migrate 0 次 + 三 rehydrate 各 0 次,但 hydrated **放行**——内存默认(匿名新会话)
++//   态可用;下次启动盘面静止后正常水合恢复。
++// - 'ok' → migrate + 三 rehydrate 全部照常。
++// 真挂 useStoreHydration(react-dom/client + React 19 act,harness 沿用
++// useRegionEditFreezeGuard 先例);依赖 store/迁移全 mock(编排控制流是本测试的唯一
++// 对象;kernel 生效值与 authSlice 行为各有专测),kernelMode mock 成 effective=new 让
++// migrate 断言有意义。共享 kv store 真实阻塞下的有界放行见
++// useStoreHydration.persistBusy.integration.test。
++import { act, useEffect } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++const spies = vi.hoisted(() => ({
++  hydrateMock: vi.fn<() => Promise<string>>(),
++  canvasRehydrate: vi.fn(async () => undefined),
++  chatRehydrate: vi.fn(async () => undefined),
++  settingsRehydrate: vi.fn(async () => undefined),
++  migrateSpy: vi.fn(async () => ({ ok: true, skipped: true })),
++  ensureSpy: vi.fn(async () => undefined),
++}))
++
++vi.mock('../store/canvasStore', () => ({
++  useCanvasStore: { persist: { rehydrate: spies.canvasRehydrate } },
++}))
++vi.mock('../store/chatStore', () => ({
++  useChatStore: { persist: { rehydrate: spies.chatRehydrate } },
++}))
++vi.mock('../store/settingsSlice', () => ({
++  useSettingsStore: { persist: { rehydrate: spies.settingsRehydrate } },
++}))
++vi.mock('../store/authSlice', () => ({
++  useAuthStore: { getState: () => ({ hydrate: spies.hydrateMock }) },
++}))
++vi.mock('../store/chatTaskReconcile', () => ({
++  reconcileExpiredChatTasks: vi.fn(async () => undefined),
++}))
++vi.mock('../store/debugLogStore', () => ({
++  debugLogger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
++}))
++const toastFeedback = { error: vi.fn(), success: vi.fn(), info: vi.fn() }
++vi.mock('../store/toastStore', () => ({ toastFeedback }))
++vi.mock('../i18n', () => ({ t: (key: string) => key }))
++vi.mock('./kernelMode', () => ({
++  ensureEffectiveKernelReady: spies.ensureSpy,
++  getEffectiveKernelMode: () => 'new', // 让 migrate 分支可达——0 次断言才有意义
++}))
++vi.mock('../kernel/persistMigration', () => ({ migrateV10ToV11: spies.migrateSpy }))
++vi.mock('../lib/persistIdbStorage', () => ({ rawIdbStorage: {} }))
++vi.mock('../lib/persistBoot', () => ({ bootPersistWiring: vi.fn(async () => undefined) }))
++
++const { useStoreHydration } = await import('./useStoreHydration')
++
++// persist-busy 下 rehydrate 根本不发生(跳过盘面水合),无需命名空间记录器;
++// 「UID 保持 anonymous」由真实 auth 接线专测钉住(authSlice.worldSwitch ③b 与
++// useStoreHydration.persistBusy.integration)。
++
++let container: HTMLDivElement
++let root: Root
++// 渲染期不许改外部变量(react-hooks/globals)——句柄在 effect 里外露(同
++// useRegionEditFreezeGuard.test 先例)。
++const observed = { hydrated: false }
++
++function Harness() {
++  const hydrated = useStoreHydration()
++  useEffect(() => {
++    observed.hydrated = hydrated
++  }, [hydrated])
++  return null
++}
++
++const mountAndSettle = async () => {
++  ;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++  container = document.createElement('div')
++  document.body.appendChild(container)
++  root = createRoot(container)
++  await act(async () => {
++    root.render(<Harness />)
++  })
++  // 排空 hook 内的 async 编排链
++  await act(async () => {
++    await new Promise((resolve) => setTimeout(resolve, 0))
++  })
++}
++
++describe('useStoreHydration 编排层 × auth outcome(八审 F1-余)', () => {
++  beforeEach(() => {
++    spies.hydrateMock.mockReset()
++    spies.canvasRehydrate.mockClear()
++    spies.chatRehydrate.mockClear()
++    spies.settingsRehydrate.mockClear()
++    spies.migrateSpy.mockClear()
++    spies.ensureSpy.mockClear()
++    observed.hydrated = false
++  })
++  afterEach(() => {
++    act(() => root.unmount())
++    container.remove()
++  })
++
++  it("outcome='persist-busy' → 跳过盘面水合(migrate 0 + 三 rehydrate 0)但 hydrated 放行(内存默认态)", async () => {
++    // 九审终裁:盘面读会排在卡死写事务后面——放行的前提是**不碰盘面**。与八轮
++    // 「冻结不放行」的区别:现在是「跳过并放行」,内存默认(匿名新会话)态可用。
++    spies.hydrateMock.mockResolvedValue('persist-busy')
++    await mountAndSettle()
++    expect(spies.hydrateMock).toHaveBeenCalled()
++    expect(spies.migrateSpy).not.toHaveBeenCalled()
++    expect(spies.canvasRehydrate).not.toHaveBeenCalled()
++    expect(spies.chatRehydrate).not.toHaveBeenCalled()
++    expect(spies.settingsRehydrate).not.toHaveBeenCalled()
++    expect(observed.hydrated).toBe(true) // 首屏放行,不等任何盘面事务
++  })
++
++  it("outcome='reload-issued'(A→B 整页 reload 在途)→ 同口径中止", async () => {
++    spies.hydrateMock.mockResolvedValue('reload-issued')
++    await mountAndSettle()
++    expect(spies.migrateSpy).not.toHaveBeenCalled()
++    expect(spies.canvasRehydrate).not.toHaveBeenCalled()
++    expect(spies.chatRehydrate).not.toHaveBeenCalled()
++    expect(spies.settingsRehydrate).not.toHaveBeenCalled()
++  })
++
++  it("outcome='ok' → 闸先行 + migrate + 三 rehydrate 全部照常,hydrated 放行", async () => {
++    spies.hydrateMock.mockResolvedValue('ok')
++    await mountAndSettle()
++    expect(spies.ensureSpy).toHaveBeenCalled() // effective-kernel 闸在链上
++    expect(spies.migrateSpy).toHaveBeenCalledTimes(1)
++    expect(spies.canvasRehydrate).toHaveBeenCalledTimes(1)
++    expect(spies.chatRehydrate).toHaveBeenCalledTimes(1)
++    expect(spies.settingsRehydrate).toHaveBeenCalledTimes(1)
++    expect(observed.hydrated).toBe(true)
++  })
++})
+diff --git a/src/app/useStoreHydration.persistBusy.integration.test.tsx b/src/app/useStoreHydration.persistBusy.integration.test.tsx
+new file mode 100644
+index 00000000..529c38e8
+--- /dev/null
++++ b/src/app/useStoreHydration.persistBusy.integration.test.tsx
+@@ -0,0 +1,179 @@
++// @vitest-environment happy-dom
++//
++// #505 九审阻塞项的实证口径:chat/settings 与 canvas 共用同一 IDB kv store——
++// kv 里有卡死的 readwrite 事务时,任何盘面读事务都会排在它后面。persist-busy
++// 若仍同步 await migrate/rehydrate,首屏照样永久冻结。本文件用 fake-indexeddb
++// **真实占住 kv store**(readwrite 事务 keep-alive),跑真实 authSlice.hydrate +
++// 真实 useStoreHydration(真 store / 真调度器单例 / 真 5s 生产屏障),断言:
++// - 屏障 timed-out → persist-busy → hook 在**有界时间内** hydrated=true(不等卡死事务)
++// - migrate 与 canvas/chat/settings 三个 rehydrate 零调用,UID 仍 anonymous
++// - 释放事务后无迟发水合(不会突然覆盖用户已可编辑的内存态)
++import 'fake-indexeddb/auto'
++import { useEffect } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++const { fetchMeMock, migrateSpy } = vi.hoisted(() => ({
++  fetchMeMock: vi.fn(),
++  migrateSpy: vi.fn(async () => ({ ok: true, skipped: true })),
++}))
++
++vi.mock('../lib/authClient', () => ({
++  fetchMe: fetchMeMock,
++  AuthError: class AuthError extends Error {},
++}))
++vi.mock('../kernel/persistMigration', async (importOriginal) => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  migrateV10ToV11: migrateSpy,
++}))
++const toastFeedback = { error: vi.fn(), success: vi.fn(), info: vi.fn() }
++vi.mock('../store/toastStore', () => ({ toastFeedback }))
++vi.mock('../store/chatTaskReconcile', () => ({
++  reconcileExpiredChatTasks: vi.fn(async () => undefined),
++}))
++vi.mock('../lib/persistBoot', () => ({
++  resumePersistQueue: vi.fn(),
++  bootPersistWiring: vi.fn(async () => undefined),
++}))
++// canvasStore/chatStore 模块图的常规重依赖桩(沿用 hydrationDurableSettle 先例)
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++vi.mock('../lib/assetStorage', () => ({
++  migrateUntaggedAssets: vi.fn(async () => undefined),
++  clearAssetsForUser: vi.fn(async () => undefined),
++  saveGeneratedAsset: vi.fn(),
++  saveImportedAsset: vi.fn(),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('../store/remoteDebugReporter', () => ({ reportRemoteDebugEntry: () => {} }))
++vi.mock('../store/generationFacade', () => ({
++  generationFacade: {
++    prepareChatSlot: vi.fn(),
++    generateIntoAiSlot: vi.fn(),
++    generateBesideNode: vi.fn(),
++    getSceneChangeInfo: vi.fn().mockReturnValue({ sceneChanged: false, currentSceneId: '', sceneTitle: '' }),
++  },
++}))
++vi.mock('../store/chatMaskEditFlow', () => ({
++  cancelMaskEditMessage: vi.fn(),
++  beginMaskEditMessage: vi.fn(() => 'mask-msg-stub'),
++  runMaskEditChatFlow: vi.fn(async () => {}),
++  finishMaskEditMessage: vi.fn(),
++  failMaskEditMessage: vi.fn(),
++  setChatStoreAccessor: vi.fn(() => {}),
++}))
++
++const { rawIdbStorage } = await import('../lib/persistIdbStorage')
++const { getPersistUserId } = await import('../lib/persistUserId')
++const { useCanvasStore } = await import('../store/canvasStore')
++const { useChatStore } = await import('../store/chatStore')
++const { useSettingsStore } = await import('../store/settingsSlice')
++const { useAuthStore } = await import('../store/authSlice')
++const { useStoreHydration } = await import('./useStoreHydration')
++
++const observed = { hydrated: false }
++
++function Harness() {
++  const hydrated = useStoreHydration()
++  useEffect(() => {
++    observed.hydrated = hydrated
++  }, [hydrated])
++  return null
++}
++
++/** 真实占住 kv store:readwrite 事务经连环 get 请求 keep-alive(IDB 事务只要还有
++ *  未完成请求就不提交;停止续命后自然提交释放)。同 store 的后续 readwrite/read
++ *  事务(canvas 落盘、rehydrate 读)都会排在它后面——这就是审核人实证的冻结面。 */
++const holdKvStore = (): Promise<() => void> =>
++  new Promise((resolveReady, rejectReady) => {
++    const req = indexedDB.open('mivo-canvas-persist', 1)
++    req.onerror = () => rejectReady(req.error)
++    req.onsuccess = () => {
++      const db = req.result
++      const tx = db.transaction('kv', 'readwrite')
++      const store = tx.objectStore('kv')
++      let released = false
++      const spin = () => {
++        if (released) {
++          db.close()
++          return
++        }
++        const r = store.get('__hold__')
++        r.onsuccess = spin
++      }
++      spin()
++      resolveReady(() => {
++        released = true
++      })
++    }
++  })
++
++const waitFor = async (predicate: () => boolean, timeoutMs: number, intervalMs = 50): Promise<boolean> => {
++  const deadline = Date.now() + timeoutMs
++  while (Date.now() < deadline) {
++    if (predicate()) return true
++    await new Promise((resolve) => setTimeout(resolve, intervalMs))
++  }
++  return predicate()
++}
++
++let root: Root | undefined
++let container: HTMLDivElement | undefined
++
++describe('persist-busy × 共享 kv store 真实阻塞(九审终裁实证)', () => {
++  afterEach(() => {
++    root?.unmount()
++    container?.remove()
++  })
++
++  it(
++    'kv 被真实 readwrite 事务占住 → 屏障 timed-out → 有界放行内存默认态,零盘面读,释放后无迟发水合',
++    async () => {
++      // 先经真实 adapter 建库建 store,再安放 keep-alive 阻塞事务
++      await rawIdbStorage.setItem('__warmup__', '1')
++      const releaseHold = await holdKvStore()
++
++      // 匿名会话的一笔编辑:persist setItem 暂存(屏障会把它 flush 成排队在阻塞
++      // 事务后面的卡死写——这正是 timed-out 的来源)
++      useCanvasStore.getState().setActiveTool('brush')
++
++      // 观测面:三个 rehydrate 只许 0 次(装在 mount 之前)
++      const canvasRehydrateSpy = vi.spyOn(useCanvasStore.persist, 'rehydrate')
++      const chatRehydrateSpy = vi.spyOn(useChatStore.persist, 'rehydrate')
++      const settingsRehydrateSpy = vi.spyOn(useSettingsStore.persist, 'rehydrate')
++
++      fetchMeMock.mockResolvedValue({ authenticated: true, user: { id: 'user-u', name: 'U' } })
++
++      container = document.createElement('div')
++      document.body.appendChild(container)
++      root = createRoot(container)
++      root.render(<Harness />)
++
++      // 有界放行:生产 5s 屏障 + 编排开销,10s 内必须 hydrated——阻塞事务全程未释放,
++      // 所以这个 true 只能来自「跳过盘面水合」的路径,不可能来自读到盘面。
++      const start = Date.now()
++      expect(await waitFor(() => observed.hydrated, 10_000)).toBe(true)
++      expect(Date.now() - start).toBeLessThan(10_000)
++
++      // fail-closed + 跳过语义齐备
++      expect(getPersistUserId()).toBe('anonymous') // 未切号
++      expect(useAuthStore.getState().status).toBe('unauthenticated')
++      expect(toastFeedback.error).toHaveBeenCalledTimes(1) // 已告知恰一次(文案键专测在 worldSwitch ③b)
++      expect(migrateSpy).not.toHaveBeenCalled()
++      expect(canvasRehydrateSpy).not.toHaveBeenCalled()
++      expect(chatRehydrateSpy).not.toHaveBeenCalled()
++      expect(settingsRehydrateSpy).not.toHaveBeenCalled()
++      expect(useCanvasStore.getState().activeTool).toBe('brush') // 内存态可用
++
++      // 释放阻塞事务:不得出现迟发水合(中途 rehydrate 会覆盖用户已开始的编辑)
++      releaseHold()
++      await new Promise((resolve) => setTimeout(resolve, 300))
++      expect(canvasRehydrateSpy).not.toHaveBeenCalled()
++      expect(chatRehydrateSpy).not.toHaveBeenCalled()
++      expect(settingsRehydrateSpy).not.toHaveBeenCalled()
++      expect(useCanvasStore.getState().activeTool).toBe('brush') // 内存态未被覆盖
++    },
++    20_000,
++  )
++})
+diff --git a/src/app/useStoreHydration.ts b/src/app/useStoreHydration.ts
+index dc5a213f..43b517b9 100644
+--- a/src/app/useStoreHydration.ts
++++ b/src/app/useStoreHydration.ts
+@@ -6,7 +6,7 @@ import { useSettingsStore } from '../store/settingsSlice'
+ import { reconcileExpiredChatTasks } from '../store/chatTaskReconcile'
+ import { debugLogger } from '../store/debugLogStore'
+ import { toastFeedback } from '../store/toastStore'
+-import { isLegacyKernel } from './kernelMode'
++import { ensureEffectiveKernelReady, getEffectiveKernelMode } from './kernelMode'
+ import { migrateV10ToV11 } from '../kernel/persistMigration'
+ import { rawIdbStorage } from '../lib/persistIdbStorage'
+ import { isLocalPersist } from '../lib/persistMode'
+@@ -44,12 +44,37 @@ export function useStoreHydration(): boolean {
+       try {
+         // FX-6: resolve the auth userId namespace BEFORE rehydrating persisted
+         // stores, so canvas/chat hydrate from mivo-*:<userId> (not anonymous).
+-        await useAuthStore.getState().hydrate()
+-        // S6b-2:?kernel=new 时 auth 后 rehydrate 前调 migrate 仪式(幂等,Lead ①)。
+-        // ?kernel=legacy(默认)不调,legacy 零变化(§8)。migrate 把 v10 单 blob 迁 v11
++        // #505:kernel=new 的生效值判定在**一切持久化口之前**收口——auth.hydrate
++        // 的账号切换屏障会入队冻结持久化通道,所以闸必须先于它(main.tsx 的 eager
++        // hydrate 同序;插件 usePluginHydration 同一把闸)。probe 失败则本会话生效
++        // 内核降级 legacy(split-domain 语义只在可用 IDB 下存在;单 blob 通道自带
++        // localStorage 降级)。此后所有持久化路径读生效值。
++        await ensureEffectiveKernelReady()
++        const authOutcome = await useAuthStore.getState().hydrate()
++        if (authOutcome === 'reload-issued') {
++          // #505:A→B 整页 reload 在途——中止本页编排(migrate/rehydrate 均不执行,
++          // 页面即将销毁,不做无用功)。
++          debugLogger.log(SOURCE, 'auth hydrate outcome=reload-issued,中止 store 编排(等待整页 reload)')
++          return
++        }
++        if (authOutcome === 'persist-busy') {
++          // #505(九审终裁):首登屏障超时 = kv store 里有卡死的写事务。chat/settings
++          // 与 canvas 共用同一 kv store,任何盘面读事务都会排在卡死写之后——此时
++          // 同步 await migrate/rehydrate 首屏照样永久冻结。所以**跳过一切 IDB 依赖
++          // 读**(kernel migrate + canvas/chat/settings 三个 rehydrate),以内存默认
++          // (匿名新会话)态直接放行首屏。不做后台重试/中途补水合(中途 rehydrate
++          // 会与用户已开始的编辑冲突)。恢复语义 = 下次启动:盘面静止后正常水合;
++          // 本次会话零认领零覆盖,既有匿名数据完好,会话内编辑经 pending 冻结匿名
++          // 键,事务解卡则照常落盘。toast 已由 auth 侧告知。
++          debugLogger.log(SOURCE, 'auth hydrate outcome=persist-busy:跳过盘面水合,内存默认态放行(下次启动恢复)')
++          if (!cancelled) setHydrated(true)
++          return
++        }
++        // S6b-2:kernel=new(生效)时 auth 后 rehydrate 前调 migrate 仪式(幂等,Lead ①)。
++        // legacy(默认/降级)不调,legacy 零变化(§8)。migrate 把 v10 单 blob 迁 v11
+         // document+session 三域(DocKernel canonical);幂等:document key 已存在则跳过(防重复迁移)。
+         // 失败:rollback 已在 migrateV10ToV11 内跑(§4.3);useStoreHydration 不阻塞 rehydrate(降级默认)。
+-        if (!isLegacyKernel) {
++        if (getEffectiveKernelMode() === 'new') {
+           try {
+             const result = await migrateV10ToV11(rawIdbStorage, 'mivo-canvas-demo')
+             if (result.skipped) {
+diff --git a/src/i18n/locales/en/toast.json b/src/i18n/locales/en/toast.json
+index f9dd69cc..7190f15b 100644
+--- a/src/i18n/locales/en/toast.json
++++ b/src/i18n/locales/en/toast.json
+@@ -78,7 +78,8 @@
+     "keyPersistFailed": "Failed to persist the key — please retry."
+   },
+   "auth": {
+-    "loginRequired": "Sign in to use this feature."
++    "loginRequired": "Sign in to use this feature.",
++    "persistBusyLogin": "Local storage is busy — sign-in did not complete. Please try again shortly."
+   },
+   "clipboardImage": {
+     "unsupported": "This browser cannot copy images to the clipboard.",
+diff --git a/src/i18n/locales/ja/toast.json b/src/i18n/locales/ja/toast.json
+index 31daea7c..47e320bd 100644
+--- a/src/i18n/locales/ja/toast.json
++++ b/src/i18n/locales/ja/toast.json
+@@ -78,7 +78,8 @@
+     "keyPersistFailed": "キーの保存に失敗しました。再試行してください。"
+   },
+   "auth": {
+-    "loginRequired": "この機能を使うにはログインしてください。"
++    "loginRequired": "この機能を使うにはログインしてください。",
++    "persistBusyLogin": "ローカルストレージが混雑しているため、ログインが完了しませんでした。しばらくしてから再試行してください。"
+   },
+   "clipboardImage": {
+     "unsupported": "このブラウザは画像のクリップボードコピーに対応していません。",
+diff --git a/src/i18n/locales/ko/toast.json b/src/i18n/locales/ko/toast.json
+index 848a40d1..aa09a181 100644
+--- a/src/i18n/locales/ko/toast.json
++++ b/src/i18n/locales/ko/toast.json
+@@ -78,7 +78,8 @@
+     "keyPersistFailed": "키 저장에 실패했습니다. 다시 시도하세요."
+   },
+   "auth": {
+-    "loginRequired": "이 기능을 사용하려면 먼저 로그인하세요."
++    "loginRequired": "이 기능을 사용하려면 먼저 로그인하세요.",
++    "persistBusyLogin": "로컬 저장소가 사용 중이어서 로그인이 완료되지 않았습니다. 잠시 후 다시 시도해 주세요."
+   },
+   "clipboardImage": {
+     "unsupported": "현재 브라우저는 이미지 클립보드 복사를 지원하지 않습니다.",
+diff --git a/src/i18n/locales/zh-CN/toast.json b/src/i18n/locales/zh-CN/toast.json
+index a61a498b..a276d5f1 100644
+--- a/src/i18n/locales/zh-CN/toast.json
++++ b/src/i18n/locales/zh-CN/toast.json
+@@ -78,7 +78,8 @@
+     "keyPersistFailed": "Key 持久化失败，请重试。"
+   },
+   "auth": {
+-    "loginRequired": "请先登录后再使用此功能。"
++    "loginRequired": "请先登录后再使用此功能。",
++    "persistBusyLogin": "本地存储繁忙，登录未完成，请稍后重试。"
+   },
+   "clipboardImage": {
+     "unsupported": "当前浏览器不支持复制图片到剪贴板。",
+diff --git a/src/kernel/docKernelPersistAdapter.contract.test.ts b/src/kernel/docKernelPersistAdapter.contract.test.ts
+index 2d73afe2..31632b5e 100644
+--- a/src/kernel/docKernelPersistAdapter.contract.test.ts
++++ b/src/kernel/docKernelPersistAdapter.contract.test.ts
+@@ -34,19 +34,24 @@ describe('S6b-1 docKernelPersistAdapter 源码契约 — DocKernel-backed persis
+     expect(source).toMatch(/docRaw == null|return null/)
+   })
+ 
+-  it('setItem partialize single → projectToThreeDomain 拆 document/session → 写两 key(version 11)', () => {
++  it('写路 partialize single → projectToThreeDomain 拆 document/session → 单事务原子写两个冻结键(version 11,#505)', () => {
+     expect(source).toMatch(/projectToThreeDomain\(blob\)/)
+-    expect(source).toMatch(/rawIdbStorage\.setItem\(documentKey\(name\)/)
+-    expect(source).toMatch(/rawIdbStorage\.setItem\(sessionKey\(name\)/)
++    // #505:两域必须一笔事务(rawIdbSetItemsAtomic),防并发 flush 交错出跨代半套;
++    // 物理键在冻结目标工厂入口一次性解析(frozenDocumentKey/frozenSessionKey),
++    // 写时不得再读可变全局(冻结目标架构)。
++    expect(source).toMatch(/const frozenDocumentKey = documentKey\(name\)/)
++    expect(source).toMatch(/const frozenSessionKey = sessionKey\(name\)/)
++    expect(source).toMatch(/rawIdbSetItemsAtomic\(\[/)
++    expect(source).toMatch(/name: frozenDocumentKey/)
++    expect(source).toMatch(/name: frozenSessionKey/)
+   })
+ 
+   it('setItem corrupt value → 不写(不破坏 canonical)', () => {
+     expect(source).toMatch(/return \/\/ corrupt value/)
+   })
+ 
+-  it('removeItem 删 document/session', () => {
+-    expect(source).toMatch(/rawIdbStorage\.removeItem\(documentKey\(name\)\)/)
+-    expect(source).toMatch(/rawIdbStorage\.removeItem\(sessionKey\(name\)\)/)
++  it('removeItem 原子删 document/session 两个冻结键(#505)', () => {
++    expect(source).toMatch(/rawIdbRemoveItemsAtomic\(\[frozenDocumentKey, frozenSessionKey\]\)/)
+   })
+ 
+   it('documentKey/sessionKey 用 namespacedKey 拼(与 migrateV10ToV11 一致,防 double-namespace)', () => {
+diff --git a/src/kernel/docKernelPersistAdapter.ts b/src/kernel/docKernelPersistAdapter.ts
+index 2e63b24d..a32cb89c 100644
+--- a/src/kernel/docKernelPersistAdapter.ts
++++ b/src/kernel/docKernelPersistAdapter.ts
+@@ -6,14 +6,20 @@
+ // getItem:读 document+session 两 key(via rawIdbStorage raw + namespacedKey 拼 documentKey/sessionKey)
+ //   → merge single envelope(zustand persist 期望 {state, version})。session 缺失优雅回退(Lead ②:
+ //   首次迁移前/被清理后 session 域可能不存在,merge 用空 session,不阻塞 document rehydrate)。
+-// setItem:partialize(state) single blob → projectToThreeDomain 拆 document/session → 写两 key(version 11)。
+-// removeItem:删 document/session。
++// 写/删:经 #505 冻结目标工厂——documentKey/sessionKey 在**入队时**解析并冻结,
++//   flush 时把 single blob 拆 document/session 后**一笔事务**原子落到冻结的两键
++//   (rawIdbSetItemsAtomic;version 11)。removeItem 同口径原子删两键。
++//
++// 无 IDB / IDB operational 探测失败的环境**没有 kernel=new**:useStoreHydration 在
++// 启动时把生效内核降级为 legacy(见 kernelMode.degradeKernelToLegacyForSession),
++// 本 adapter 只在 operational IDB 下被接线——rawIdb*Atomic 的无 IDB 拒绝(throw)
++// 仅作纵深防御(触发即 error 落账,不静默)。
+ //
+ // rawIdbStorage 是 raw(不经 namespacedKey,Lead ③ cast as RawStorage 集中导出);adapter 内部
+ // 用 namespacedKey(name) 拼 documentKey/sessionKey(与 migrateV10ToV11 一致,防 double-namespace)。
+-// ?kernel=legacy 时 canvasPersistConfig 仍用 idbStateStorage(single blob),legacy 零变化(§8)。
++// ?kernel=legacy(默认)时 canvasPersistConfig 仍用 idbStateStorage(single blob),legacy 零变化(§8)。
+ 
+-import { rawIdbStorage } from '../lib/persistIdbStorage'
++import { rawIdbRemoveItemsAtomic, rawIdbRemoveItemsAtomicStrict, rawIdbSetItemsAtomic, rawIdbStorage } from '../lib/persistIdbStorage'
+ import { namespacedKey } from '../lib/persistUserId'
+ import { projectToThreeDomain, type PersistedV10Blob } from './persistMigration'
+ 
+@@ -26,10 +32,44 @@ const V11 = 11
+ 
+ type Envelope = { state: unknown; version: number }
+ 
++/** #505 冻结目标工厂(kernel=new split 通道):入队时调用,document/session 两个
++ *  物理键此刻解析并冻结进闭包。write 把 single blob envelope 拆两域后一笔事务
++ *  原子落盘(防并发 flush 交错出「document 新 / session 旧」的跨代半套);
++ *  remove 原子删两键。key 用 documentKey 作为该目标的物理键身份。 */
++export const createDocKernelFrozenTarget = (name: string): {
++  key: string
++  write: (serialized: string) => Promise<void>
++  remove: () => Promise<void>
++  removeStrict: () => Promise<void>
++} => {
++  const frozenDocumentKey = documentKey(name)
++  const frozenSessionKey = sessionKey(name)
++  return {
++    key: frozenDocumentKey,
++    write: async (serialized: string): Promise<void> => {
++      // serialized = partialize(state) single blob envelope {state, version}
++      let blob: PersistedV10Blob
++      try {
++        blob = (JSON.parse(serialized) as Envelope).state as PersistedV10Blob
++      } catch {
++        return // corrupt value → 不写(不破坏 canonical)
++      }
++      const { document, session } = projectToThreeDomain(blob)
++      await rawIdbSetItemsAtomic([
++        { name: frozenDocumentKey, value: JSON.stringify({ state: document, version: V11 }) },
++        { name: frozenSessionKey, value: JSON.stringify({ state: session, version: V11 }) },
++      ])
++    },
++    remove: (): Promise<void> => rawIdbRemoveItemsAtomic([frozenDocumentKey, frozenSessionKey]),
++    // F4:logout 迟到写补删专用——失败 propagate,调度器补删失败 error 才有痕。
++    removeStrict: (): Promise<void> => rawIdbRemoveItemsAtomicStrict([frozenDocumentKey, frozenSessionKey]),
++  }
++}
++
+ /**
+  * docKernelPersistStorage:?kernel=new 时 canvasStore persist 的 storage backend。
+  * canonical = document+session 两 key(v11 三域,DocKernel canonical);legacy single blob 不用此。
+- * setters 不动(写 zustand state → persist setItem → 拆 document/session 写)。
++ * setItem/removeItem 委托冻结目标工厂(当前 uid 即时解析),与调度器 flush 同一条写路。
+  */
+ export const docKernelPersistStorage = {
+   getItem: async (name: string): Promise<string | null> => {
+@@ -58,21 +98,7 @@ export const docKernelPersistStorage = {
+     return JSON.stringify({ state: merged, version: V11 })
+   },
+ 
+-  setItem: async (name: string, value: string): Promise<void> => {
+-    // value = partialize(state) single blob envelope {state, version}
+-    let blob: PersistedV10Blob
+-    try {
+-      blob = (JSON.parse(value) as Envelope).state as PersistedV10Blob
+-    } catch {
+-      return // corrupt value → 不写(不破坏 canonical)
+-    }
+-    const { document, session } = projectToThreeDomain(blob)
+-    await rawIdbStorage.setItem(documentKey(name), JSON.stringify({ state: document, version: V11 }))
+-    await rawIdbStorage.setItem(sessionKey(name), JSON.stringify({ state: session, version: V11 }))
+-  },
++  setItem: (name: string, value: string): Promise<void> => createDocKernelFrozenTarget(name).write(value),
+ 
+-  removeItem: async (name: string): Promise<void> => {
+-    await rawIdbStorage.removeItem(documentKey(name))
+-    await rawIdbStorage.removeItem(sessionKey(name))
+-  },
++  removeItem: (name: string): Promise<void> => createDocKernelFrozenTarget(name).remove(),
+ }
+diff --git a/src/lib/persistIdbStorage.atomicFallback.test.ts b/src/lib/persistIdbStorage.atomicFallback.test.ts
+new file mode 100644
+index 00000000..c965347e
+--- /dev/null
++++ b/src/lib/persistIdbStorage.atomicFallback.test.ts
+@@ -0,0 +1,83 @@
++// @vitest-environment happy-dom
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #505:localStorage 无事务、staging 回滚不是 crash-atomic(崩在中途的半套会成为
++// 下次启动的 durable canonical)——原子原语在无 IDB 环境一律**拒绝**,不做非原子
++// 降级。kernel=new 不再有运行期回退通道:无可用 IDB 时生效内核在启动编排层降级
++// legacy(见 kernelDegradation.test),这里的拒绝只是纵深防御(触发即 error 落账)。
++// happy-dom 不实现 indexedDB → isIdbAvailable() = false,天然是无 IDB 环境。
++
++const debugLogger = { log: vi.fn(), warn: vi.fn(), error: vi.fn() }
++vi.mock('../store/debugLogStore', () => ({ debugLogger }))
++const toastFeedback = { error: vi.fn(), success: vi.fn(), info: vi.fn() }
++vi.mock('../store/toastStore', () => ({ toastFeedback }))
++
++const {
++  rawIdbSetItemsAtomic,
++  rawIdbRemoveItemsAtomic,
++  rawIdbRemoveItemsAtomicStrict,
++  probeIdbOperational,
++  createIdbFrozenTarget,
++  __resetIdbOperationalProbeForTests,
++} = await import('./persistIdbStorage')
++const { createDocKernelFrozenTarget } = await import('../kernel/docKernelPersistAdapter')
++
++const NAME = 'mivo-canvas-demo'
++const envelope = JSON.stringify({ state: { canvases: {}, sceneId: 'c1' }, version: 12 })
++
++describe('无 IDB 环境的原子原语拒绝(kernel=new 由启动降级兜底,这里是纵深防御)', () => {
++  beforeEach(() => {
++    expect(typeof indexedDB).toBe('undefined') // 前提自检:确实在无 IDB 环境
++    localStorage.clear()
++    debugLogger.error.mockClear()
++    debugLogger.warn.mockClear()
++    __resetIdbOperationalProbeForTests()
++  })
++
++  it('rawIdbSetItemsAtomic:无 IDB 一律拒绝(error 日志 + throw),不做非原子降级', async () => {
++    await expect(
++      rawIdbSetItemsAtomic([
++        { name: 'k1', value: 'v1' },
++        { name: 'k2', value: 'v2' },
++      ]),
++    ).rejects.toThrow(/refusing non-atomic fallback/)
++    expect(localStorage.getItem('k1')).toBeNull() // 一个 key 都不写,零半套
++    expect(localStorage.getItem('k2')).toBeNull()
++    expect(debugLogger.error).toHaveBeenCalledWith(
++      'Persist IDB',
++      expect.stringContaining('atomic multi-key write refused'),
++    )
++  })
++
++  it('rawIdbRemoveItemsAtomic:同口径拒绝——预置数据原样保留(拒绝 ≠ 半删)', async () => {
++    localStorage.setItem('k1', 'v1') // 预置:拒绝路径不得碰任何 key
++    localStorage.setItem('k2', 'v2')
++    await expect(rawIdbRemoveItemsAtomic(['k1', 'k2'])).rejects.toThrow(/refusing non-atomic fallback/)
++    await expect(rawIdbRemoveItemsAtomicStrict(['k1', 'k2'])).rejects.toThrow(/refusing non-atomic fallback/)
++    expect(localStorage.getItem('k1')).toBe('v1')
++    expect(localStorage.getItem('k2')).toBe('v2')
++  })
++
++  it('无 IDB 环境的 operational 探测 = false(启动降级的判定前提)', async () => {
++    expect(await probeIdbOperational()).toBe(false)
++  })
++
++  it('纵深防御:降级失守时 kernel=new 冻结目标的 write 拒绝而非写半套(调度器 error 落账)', async () => {
++    const target = createDocKernelFrozenTarget(NAME)
++    await expect(target.write(envelope)).rejects.toThrow(/refusing non-atomic fallback/)
++    // 零 split key 落进 localStorage(拒绝 = 一个 key 都不写)
++    expect(localStorage.getItem(`${NAME}:document`)).toBeNull()
++    expect(localStorage.getItem(`${NAME}:session`)).toBeNull()
++  })
++
++  it('降级会话写面收敛:legacy 冻结目标在无 IDB 环境只写单 blob 键,零 split/杂键外溢', async () => {
++    const target = createIdbFrozenTarget(NAME) // 降级会话(生效 legacy)的实际写通道
++    await target.write(envelope)
++    expect(localStorage.getItem(NAME)).toBe(envelope) // LS 单 blob 落盘 + 可读回
++    // 全部 localStorage 键收敛为恰好这一个——降级会话不产生任何 split-domain 键
++    const keys = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i))
++    expect(keys).toEqual([NAME])
++    await target.remove()
++    expect(localStorage.getItem(NAME)).toBeNull()
++  })
++})
+diff --git a/src/lib/persistIdbStorage.ts b/src/lib/persistIdbStorage.ts
+index 3788b86e..0f34ac10 100644
+--- a/src/lib/persistIdbStorage.ts
++++ b/src/lib/persistIdbStorage.ts
+@@ -274,6 +274,84 @@ export const syncToServer = async (): Promise<void> => {
+   // local 模式(默认)绝不发网络请求 → 生产零变化。
+ }
+ 
++// ── 物理键写原语(#505 冻结目标架构)────────────────────────────────────────
++// idbStateStorage 的 set/remove 语义按**物理键**抽出:调度器在入队时冻结
++// namespacedKey,flush 时经这两个原语落到冻结地址(不得在写时再读 uid)。
++// 语义与原 idbStateStorage.setItem/removeItem 逐行一致(bench skip / localStorage
++// 降级 / quota error+toast / 其余失败 warn 不 throw)。
++
++const setItemByPhysicalKey = async (physicalKey: string, value: string): Promise<void> => {
++  // Bench opt-out: the bench measures render perf, not persistence. Setting
++  // __MIVO_BENCH_PERSIST_SKIP__ makes setItem a no-op so 50k-node fixtures don't
++  // serialize+put on every replaceSnapshot (the old localStorage shim no-ops
++  // localStorage.setItem, which no longer intercepts this IDB-backed write).
++  if (
++    typeof globalThis !== 'undefined' &&
++    (globalThis as unknown as { __MIVO_BENCH_PERSIST_SKIP__?: boolean }).__MIVO_BENCH_PERSIST_SKIP__
++  ) {
++    return
++  }
++  if (!isIdbAvailable()) {
++    debugLogger.warn(SOURCE, 'IndexedDB unavailable; writing to localStorage')
++    if (typeof localStorage !== 'undefined') localStorage.setItem(physicalKey, value)
++    return
++  }
++  try {
++    await runTransaction('readwrite', (store) =>
++      store.put({ key: physicalKey, value } as unknown as KvRecord),
++    )
++    // P4c: fire-and-forget server sync — void syncToServer(name, value)
++  } catch (error) {
++    if (isQuotaError(error)) {
++      // Never silent — the user must know their canvas wasn't saved.
++      debugLogger.error(SOURCE, `quota exceeded writing ${physicalKey}; state not persisted`)
++      toastFeedback.error(t('toast.storage.quotaCanvas'))
++      return
++    }
++    debugLogger.warn(SOURCE, `setItem failed for ${physicalKey}: ${errMessage(error)}`)
++  }
++}
++
++const removeItemByPhysicalKey = async (physicalKey: string): Promise<void> => {
++  if (!isIdbAvailable()) {
++    if (typeof localStorage !== 'undefined') localStorage.removeItem(physicalKey)
++    return
++  }
++  try {
++    await runTransaction('readwrite', (store) => store.delete(physicalKey))
++  } catch (error) {
++    debugLogger.warn(SOURCE, `removeItem failed for ${physicalKey}: ${errMessage(error)}`)
++  }
++}
++
++/** strict 删除原语(#505 F4):失败 **propagate**——logout 迟到写补删专用。普通
++ *  removeItem 的 warn-不抛语义会把「补删失败=已清数据残留」吞成静默假成功,
++ *  调度器的补删失败 error 分支必须收到异常才能留痕。 */
++const removeItemByPhysicalKeyStrict = async (physicalKey: string): Promise<void> => {
++  if (!isIdbAvailable()) {
++    if (typeof localStorage !== 'undefined') localStorage.removeItem(physicalKey)
++    return
++  }
++  await runTransaction('readwrite', (store) => store.delete(physicalKey))
++}
++
++/** #505 冻结目标工厂(legacy 单 blob 通道):入队时调用,namespacedKey 此刻
++ *  解析并冻结进闭包——此后 uid 怎么变,这笔写都只落这个物理键。 */
++export const createIdbFrozenTarget = (name: string): {
++  key: string
++  write: (serialized: string) => Promise<void>
++  remove: () => Promise<void>
++  removeStrict: () => Promise<void>
++} => {
++  const frozenKey = namespacedKey(name)
++  return {
++    key: frozenKey,
++    write: (serialized: string) => setItemByPhysicalKey(frozenKey, serialized),
++    remove: () => removeItemByPhysicalKey(frozenKey),
++    removeStrict: () => removeItemByPhysicalKeyStrict(frozenKey),
++  }
++}
++
+ /**
+  * zustand persist StateStorage backed by IndexedDB. Pass to
+  * `createJSONStorage(() => idbStateStorage)` in FU4-2.
+@@ -300,49 +378,9 @@ export const idbStateStorage = {
+     }
+   },
+ 
+-  setItem: async (name: string, value: string): Promise<void> => {
+-    // Bench opt-out: the bench measures render perf, not persistence. Setting
+-    // __MIVO_BENCH_PERSIST_SKIP__ makes setItem a no-op so 50k-node fixtures don't
+-    // serialize+put on every replaceSnapshot (the old localStorage shim no-ops
+-    // localStorage.setItem, which no longer intercepts this IDB-backed write).
+-    if (
+-      typeof globalThis !== 'undefined' &&
+-      (globalThis as unknown as { __MIVO_BENCH_PERSIST_SKIP__?: boolean }).__MIVO_BENCH_PERSIST_SKIP__
+-    ) {
+-      return
+-    }
+-    if (!isIdbAvailable()) {
+-      debugLogger.warn(SOURCE, 'IndexedDB unavailable; writing to localStorage')
+-      if (typeof localStorage !== 'undefined') localStorage.setItem(namespacedKey(name), value)
+-      return
+-    }
+-    try {
+-      await runTransaction('readwrite', (store) =>
+-        store.put({ key: namespacedKey(name), value } as unknown as KvRecord),
+-      )
+-      // P4c: fire-and-forget server sync — void syncToServer(name, value)
+-    } catch (error) {
+-      if (isQuotaError(error)) {
+-        // Never silent — the user must know their canvas wasn't saved.
+-        debugLogger.error(SOURCE, `quota exceeded writing ${name}; state not persisted`)
+-        toastFeedback.error(t('toast.storage.quotaCanvas'))
+-        return
+-      }
+-      debugLogger.warn(SOURCE, `setItem failed for ${name}: ${errMessage(error)}`)
+-    }
+-  },
++  setItem: (name: string, value: string): Promise<void> => setItemByPhysicalKey(namespacedKey(name), value),
+ 
+-  removeItem: async (name: string): Promise<void> => {
+-    if (!isIdbAvailable()) {
+-      if (typeof localStorage !== 'undefined') localStorage.removeItem(namespacedKey(name))
+-      return
+-    }
+-    try {
+-      await runTransaction('readwrite', (store) => store.delete(namespacedKey(name)))
+-    } catch (error) {
+-      debugLogger.warn(SOURCE, `removeItem failed for ${name}: ${errMessage(error)}`)
+-    }
+-  },
++  removeItem: (name: string): Promise<void> => removeItemByPhysicalKey(namespacedKey(name)),
+ }
+ 
+ /**
+@@ -419,6 +457,105 @@ export const rawIdbStorage = {
+   },
+ } as unknown as RawStorage
+ 
++/** #505(P1-4/P0-1 收口):多 key 原子写——kernel=new 的 document+session 两域
++ *  必须一笔 readwrite 事务落盘,防并发 flush 交错出「跨代半套」(doc 新 sess 旧)。
++ *  语义对齐 rawIdbStorage.setItem:bench skip / quota toast / 失败 throw;
++ *  IDB 不可用一律拒绝(R3 finding4:无 crash-atomic 降级,调用方回退 legacy 单 blob)。 */
++export const rawIdbSetItemsAtomic = async (
++  entries: Array<{ name: string; value: string }>,
++): Promise<void> => {
++  if (
++    typeof globalThis !== 'undefined' &&
++    (globalThis as unknown as { __MIVO_BENCH_PERSIST_SKIP__?: boolean }).__MIVO_BENCH_PERSIST_SKIP__
++  ) {
++    return
++  }
++  if (!isIdbAvailable()) {
++    // R3 finding4 裁定:localStorage 无事务,staging 回滚只覆盖可捕获异常、不是
++    // crash-atomic(崩在中途的半套会成为下次启动的 durable canonical)。名字叫
++    // Atomic 就必须 fail-closed——无 IDB 一律**拒绝**多 key 写,不提供降级;
++    // kernel=new 的调用方(docKernelPersistAdapter)在到达这里之前就该回退
++    // legacy 单 blob 通道(单 key 单写天然原子)。
++    debugLogger.error(
++      SOURCE,
++      `IndexedDB unavailable — atomic multi-key write refused (no non-atomic fallback) [${entries.map((e) => e.name).join(', ')}]`,
++    )
++    throw new Error('rawIdbSetItemsAtomic: IndexedDB unavailable, refusing non-atomic fallback')
++  }
++  try {
++    await runReadWriteTx(async (store) => {
++      for (const entry of entries) {
++        await requestToPromise(store.put({ key: entry.name, value: entry.value } as unknown as KvRecord))
++      }
++    })
++  } catch (error) {
++    if (isQuotaError(error)) {
++      debugLogger.error(SOURCE, `quota exceeded writing atomic batch [${entries.map((e) => e.name).join(', ')}]; state not persisted`)
++      toastFeedback.error(t('toast.storage.quotaCanvasShort'))
++    } else {
++      debugLogger.warn(SOURCE, `atomic raw batch setItem failed: ${errMessage(error)}`)
++    }
++    throw error
++  }
++}
++
++/** #505 R3:IDB 可用性探针(存在性判定,legacy 通道内部降级用)。 */
++export const isIdbPersistAvailable = (): boolean => isIdbAvailable()
++
++/** #505:**operational** 探测——不止判 `indexedDB` 存在,而是真实 open + 一次
++ *  noop 读事务。private mode / 配额封锁 / open 被 block 等「全局在但用不了」的
++ *  环境都会在这里暴露。结果缓存(每会话一次):useStoreHydration 据此在启动时
++ *  决定 kernel=new 是否降级为 legacy(kernel=new 语义只在 operational IDB 下存在)。 */
++let idbOperationalProbe: Promise<boolean> | undefined
++export const probeIdbOperational = (): Promise<boolean> => {
++  if (idbOperationalProbe) return idbOperationalProbe
++  idbOperationalProbe = (async () => {
++    if (!isIdbAvailable()) return false
++    try {
++      await runTransaction<KvRecord | undefined>('readonly', (store) =>
++        store.get('__mivo-idb-operational-probe__') as IDBRequest<KvRecord | undefined>,
++      )
++      return true
++    } catch (error) {
++      debugLogger.error(SOURCE, `IDB operational 探测失败(open/事务不可用): ${errMessage(error)}`)
++      return false
++    }
++  })()
++  return idbOperationalProbe
++}
++
++/** 测试专用:重置 operational 探测缓存(配合 __resetIdbPersist)。 */
++export const __resetIdbOperationalProbeForTests = (): void => {
++  idbOperationalProbe = undefined
++}
++
++/** #505:多 key 原子删(kernel=new 两域 remove 的原子性)。IDB 事务内失败
++ *  warn 不 throw(语义对齐 rawIdbStorage.removeItem);无 IDB 拒绝(见内)。 */
++export const rawIdbRemoveItemsAtomic = async (names: string[]): Promise<void> => {
++  try {
++    await rawIdbRemoveItemsAtomicStrict(names)
++  } catch (error) {
++    // 无 IDB 拒绝照样上抛(那是纵深防御信号,不是可吞的运行期失败)。
++    if (error instanceof Error && error.message.includes('refusing non-atomic fallback')) throw error
++    debugLogger.warn(SOURCE, `atomic raw batch removeItem failed [${names.join(', ')}]: ${errMessage(error)}`)
++  }
++}
++
++/** strict 多 key 原子删(#505 F4):IDB 事务失败 **propagate**——logout 迟到写
++ *  补删专用(kernel=new 冻结目标的 removeStrict);普通 remove 走上面的 warn 版。 */
++export const rawIdbRemoveItemsAtomicStrict = async (names: string[]): Promise<void> => {
++  if (!isIdbAvailable()) {
++    // R3 finding4:与 setItems 同口径拒绝(调用方无 IDB 时应走 legacy 单 blob 通道)。
++    debugLogger.error(SOURCE, `IndexedDB unavailable — atomic multi-key remove refused [${names.join(', ')}]`)
++    throw new Error('rawIdbRemoveItemsAtomic: IndexedDB unavailable, refusing non-atomic fallback')
++  }
++  await runReadWriteTx(async (store) => {
++    for (const name of names) {
++      await requestToPromise(store.delete(name) as IDBRequest<undefined>)
++    }
++  })
++}
++
+ /**
+  * FX-6 clear the CURRENT user's cache namespace — called by authSlice.logout
+  * BEFORE the optimistic state clear + SSO redirect (the redirect unloads the
+diff --git a/src/main.tsx b/src/main.tsx
+index 1f2da68f..86e70adb 100644
+--- a/src/main.tsx
++++ b/src/main.tsx
+@@ -10,7 +10,7 @@ import { useChatStore } from './store/chatStore'
+ import { selectHasMivoKey, useSettingsStore } from './store/settingsSlice'
+ import { useAuthStore } from './store/authSlice'
+ import { getPersistUserId, namespacedKey } from './lib/persistUserId'
+-import { isLegacyKernel } from './app/kernelMode'
++import { ensureEffectiveKernelReady, isLegacyKernelEffective } from './app/kernelMode'
+ import { documentKey, sessionKey } from './kernel/docKernelPersistAdapter'
+ import { installRollbackTrigger } from './kernel/rollbackTrigger'
+ import { clearRegionEditDraft } from './canvas/regionEditDraft'
+@@ -101,9 +101,11 @@ if (window.__MIVO_E2E_ENABLED__ === true) {
+       hasMivoKey: () => selectHasMivoKey(useSettingsStore.getState()),
+     },
+     getPersistUserId,
+-    getKernelMode: () => (isLegacyKernel ? 'legacy' : 'new'),
+-    getCanvasPersistDocumentKey: (name: string) => (isLegacyKernel ? namespacedKey(name) : documentKey(name)),
+-    getCanvasPersistSessionKey: (name: string) => (isLegacyKernel ? namespacedKey(name) : sessionKey(name)),
++    // #505:e2e 桥读**生效内核**(kernel=new 在无可用 IDB 时启动降级 legacy)——
++    // harness 轮询的物理键必须与真实持久化通道一致。
++    getKernelMode: () => (isLegacyKernelEffective() ? 'legacy' : 'new'),
++    getCanvasPersistDocumentKey: (name: string) => (isLegacyKernelEffective() ? namespacedKey(name) : documentKey(name)),
++    getCanvasPersistSessionKey: (name: string) => (isLegacyKernelEffective() ? namespacedKey(name) : sessionKey(name)),
+     clearRegionEditDraft,
+   }
+   // 动态 import:整条动词链只在 e2e 开关打开时才加载,生产包不含它(canvasAgentVerbs
+@@ -120,8 +122,10 @@ installRollbackTrigger()
+ 
+ // SSO 网关方案:启动水合登录态(GET /api/auth/me,网关提供 / dev 桩)。
+ // 不阻塞渲染 —— 用户 chip 在 status='unknown' 时显示占位,水合完成后更新。
++// #505:effective-kernel boot **先于** eager auth.hydrate——hydrate 内的账号切换
++// 屏障会入队冻结持久化通道,必须在 kernel 生效值判定(probe+degrade)之后。
+ // TODO: SSO 网关登录失败时可能回跳带 error query(端点/参数待 ops 确认),届时补 toast。
+-void useAuthStore.getState().hydrate()
++void ensureEffectiveKernelReady().then(() => useAuthStore.getState().hydrate())
+ 
+ createRoot(document.getElementById('root')!).render(
+   <StrictMode>
+diff --git a/src/store/authSlice.persistDiscard.test.ts b/src/store/authSlice.persistDiscard.test.ts
+new file mode 100644
+index 00000000..04304021
+--- /dev/null
++++ b/src/store/authSlice.persistDiscard.test.ts
+@@ -0,0 +1,139 @@
++// @vitest-environment happy-dom
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #505 P0-2「退出即弃」顺序回归:logout 必须先丢弃暂存写、等在途写落定,
++// clearCurrentUserCache 才执行——之后 pagehide flush / 慢写回填都不可能把
++// 旧用户数据写回。两条时序:
++//   1) edit → logout → pagehide:pending 已被弃,pagehide 无可写
++//   2) slow in-flight → logout:clear 排在慢写落定之后(不会 clear 完又被回填)
++
++const order: string[] = []
++
++const { logSpy, warnSpy, errorSpy, clearSpy } = vi.hoisted(() => ({
++  logSpy: vi.fn(),
++  warnSpy: vi.fn(),
++  errorSpy: vi.fn(),
++  clearSpy: vi.fn(),
++}))
++
++vi.mock('./debugLogStore', () => ({
++  debugLogger: { log: logSpy, warn: warnSpy, error: errorSpy },
++  useDebugLogStore: { getState: () => ({ entries: [], addEntry: vi.fn(), clear: vi.fn() }) },
++  installConsoleCapture: () => {},
++}))
++vi.mock('../lib/persistIdbStorage', async (importOriginal) => {
++  const original = await importOriginal<Record<string, unknown>>()
++  return { ...original, clearCurrentUserCache: clearSpy }
++})
++
++const { namespacedKey } = await import('../lib/persistUserId')
++const { useAuthStore } = await import('./authSlice')
++const {
++  createDebouncedCompactPersistStorage,
++  __clearDebouncedPersistInstancesForTests,
++} = await import('./canvasPersistWriteScheduler')
++
++type Slice = Record<string, unknown>
++
++// logout 会写 window.location.href(SSO 跳转)——替换成惰性对象,只记录意图。
++Object.defineProperty(window, 'location', {
++  configurable: true,
++  value: { href: 'https://app.local/x', origin: 'https://app.local' },
++})
++
++const makeBackend = () => {
++  const backend = {
++    writes: [] as string[],
++    writeImpl: [] as Array<(key: string, value: string) => Promise<void>>,
++    resolveTarget: (name: string) => {
++      const key = namespacedKey(name)
++      return {
++        key,
++        write: async (value: string) => {
++          const impl = backend.writeImpl.shift()
++          if (impl) return impl(key, value)
++          backend.writes.push(value)
++          order.push('backend-write')
++        },
++        remove: async () => undefined,
++        removeStrict: async () => undefined,
++      }
++    },
++    readCurrent: async () => null,
++  }
++  return backend
++}
++
++const makeStorage = (backend: ReturnType<typeof makeBackend>, extra?: { skipLifecycleListeners?: boolean }) =>
++  createDebouncedCompactPersistStorage<Slice>({
++    resolveTarget: backend.resolveTarget,
++    readCurrent: backend.readCurrent,
++    compactAtFlush: (s) => s,
++    ...extra,
++  })
++
++describe('authSlice.logout × persist 防抖(P0-2 退出即弃)', () => {
++  beforeEach(() => {
++    __clearDebouncedPersistInstancesForTests()
++    order.length = 0
++    clearSpy.mockClear()
++    clearSpy.mockImplementation(async () => {
++      order.push('clear-cache')
++    })
++    useAuthStore.setState({ user: { id: 'user-a', name: 'A' } as never, status: 'authenticated' })
++  })
++
++  it('edit → logout → pagehide:暂存写被弃,pagehide 不产生任何回写', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend)
++    storage.setItem('mivo-canvas-demo', { state: { edited: 'by-A' }, version: 12 })
++    expect(storage.hasPendingWrite()).toBe(true)
++
++    await useAuthStore.getState().logout()
++    expect(storage.hasPendingWrite()).toBe(false) // discard 在 clear 之前完成
++
++    window.dispatchEvent(new Event('pagehide'))
++    await storage.flushAndSettle('drain')
++    expect(backend.writes).toHaveLength(0) // A 的编辑没有任何通道写回
++    expect(clearSpy).toHaveBeenCalledTimes(1)
++  })
++
++  it('slow in-flight → logout:clearCurrentUserCache 排在慢写落定之后(无回填窗口)', async () => {
++    const backend = makeBackend()
++    let releaseSlow: () => void = () => {}
++    backend.writeImpl.push(
++      () =>
++        new Promise<void>((resolve) => {
++          releaseSlow = () => {
++            order.push('backend-write')
++            resolve()
++          }
++        }),
++    )
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    storage.setItem('mivo-canvas-demo', { state: { edited: 'slow' }, version: 12 })
++    void storage.flushAndSettle('t1') // 在途慢写
++    for (let tick = 0; tick < 10; tick += 1) await Promise.resolve()
++
++    const logout = useAuthStore.getState().logout()
++    for (let tick = 0; tick < 10; tick += 1) await Promise.resolve()
++    expect(order).not.toContain('clear-cache') // barrier 生效:clear 等着慢写
++
++    releaseSlow()
++    await logout
++    expect(order).toEqual(['backend-write', 'clear-cache']) // 写完才 clear,clear 后无 job 存活
++  })
++
++  it('logout 吸收态:返回后任何 setItem(后台任务迟到)都被丢弃 + error', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend)
++    await useAuthStore.getState().logout()
++
++    storage.setItem('mivo-canvas-demo', { state: { late: 'background-task' }, version: 12 })
++    expect(storage.hasPendingWrite()).toBe(false) // 「退出即弃」是永久性的,不是一次性清扫
++    expect(errorSpy).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('logout 后丢弃'))
++    window.dispatchEvent(new Event('pagehide'))
++    await storage.flushAndSettle('drain')
++    expect(backend.writes).toHaveLength(0)
++  })
++})
+diff --git a/src/store/authSlice.ts b/src/store/authSlice.ts
+index d5fca9d2..6dad9b65 100644
+--- a/src/store/authSlice.ts
++++ b/src/store/authSlice.ts
+@@ -8,21 +8,35 @@
+ import { create } from 'zustand'
+ import { fetchMe, type AuthUser } from '../lib/authClient'
+ import { debugLogger } from './debugLogStore'
++import { toastFeedback } from './toastStore'
++import { t } from '../i18n'
+ import {
+   ANONYMOUS_USER_ID,
+   getPersistUserId,
+   setPersistUserId,
+ } from '../lib/persistUserId'
++import {
++  discardPersistWritesForLogout,
++  flushPersistBarrierForUserSwitch,
++} from './canvasPersistWriteScheduler'
+ import { clearCurrentUserCache } from '../lib/persistIdbStorage'
+ import { migrateUntaggedAssets } from '../lib/assetStorage'
+ 
+ export type AuthStatus = 'unknown' | 'authenticated' | 'unauthenticated'
+ 
++/** hydrate 的编排结果(#505):useStoreHydration 只在 'ok' 时继续 migrate/rehydrate。
++ *  - 'ok':水合完成(含正常未登录/fetch 失败按未登录——匿名世界照常编排)。
++ *  - 'reload-issued':A→B 切换已触发整页 reload,本页编排中止(不做无用功)。
++ *  - 'persist-busy':首登屏障超时,fail-closed 未切号(见 hydrate 内注释)。
++ *    编排层**跳过一切盘面水合**(kv store 里有卡死写事务,任何盘面读都会排队
++ *    冻结首屏),以内存默认态放行;下次启动盘面静止后正常水合恢复。 */
++export type AuthHydrateOutcome = 'ok' | 'reload-issued' | 'persist-busy'
++
+ type AuthState = {
+   user: AuthUser | null
+   status: AuthStatus
+   // 启动时调:GET /api/auth/me 水合登录态(网关 200 已登录 / 401 未登录)。
+-  hydrate: () => Promise<void>
++  hydrate: () => Promise<AuthHydrateOutcome>
+   // 未登录入口:整页跳转 SSO 网关登录页(service=mivo_canvas,redirect=当前页)。
+   login: () => Promise<void>
+   // 登出:先清当前用户缓存命名空间 + 本地态,再整页跳 SSO 网关登出端点清 .dsworks.cn session cookie。
+@@ -40,7 +54,7 @@ const SSO_LOGOUT_URL = 'https://auth.dsworks.cn/api/auth/logout'
+ // resolved userId namespace. Without dedupe, the store gate would start a second
+ // /api/auth/me fetch. The in-flight promise is cleared on completion so a later
+ // hydrate (e.g. detecting a mid-session account switch) re-runs fresh.
+-let hydrateInFlight: Promise<void> | null = null
++let hydrateInFlight: Promise<AuthHydrateOutcome> | null = null
+ 
+ export const useAuthStore = create<AuthState>()((set, get) => ({
+   user: null,
+@@ -48,16 +62,34 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
+ 
+   hydrate: async () => {
+     if (hydrateInFlight) return hydrateInFlight
+-    hydrateInFlight = (async () => {
++    hydrateInFlight = (async (): Promise<AuthHydrateOutcome> => {
+       try {
+         const me = await fetchMe()
+         if (me.authenticated && me.user) {
+-          const newUid = me.user.id
++          // #505(F7):uid 在 fetchMe/authSlice 边界 trim + 非空校验。uid 是持久化
++          // 命名空间的物理键成分,空/空白 uid 会把数据钉进畸形命名空间——非法值
++          // 按 auth 错误 fail-closed(未登录处理),不进任何持久化分支。
++          const newUid = typeof me.user.id === 'string' ? me.user.id.trim() : ''
++          if (!newUid) {
++            set({ user: null, status: 'unauthenticated' })
++            debugLogger.error('Auth', '/api/auth/me 返回非法 userId(空/空白),按未登录 fail-closed 处理')
++            return 'ok' // 水合完成(未登录态)——匿名世界照常编排
++          }
++          const user = { ...me.user, id: newUid } // 归一化后的 uid 单一真相,下游全用它
+           const prevUid = getPersistUserId()
+-          // FX-6: 非 logout 账号切换 — /api/auth/me 返回的 userId 与当前缓存命名空间
+-          // 不一致。整页重载让 stores 从新命名空间重新 hydrate(否则内存里仍是上个
+-          // 用户的画布)。全新启动 prevUid === 'anonymous' → 正常登录,非切换,不重载。
++          // #505 三分支(冻结目标架构:屏障只是「旧存量冲进旧键」,无激活协议):
++          // ① same UID(重复 hydrate / mid-session /me 刷新)→ no-op(归一化后比对)。
++          // ② A→B 切换 → 有界 flush 屏障(存量落 A 的冻结键)→ setUid → 整页 reload。
++          //    reload 前迟到启动的写目标在入队时已冻结为 A 键——落旧键无害,无需 gate。
++          // ③ anonymous→uid 首登 → 有界 flush 屏障(匿名存量冲净 raw key,保证 FX-6
++          //    认领读盘前 raw 已就位)→ setUid,页内继续。
+           if (prevUid !== ANONYMOUS_USER_ID && newUid !== prevUid) {
++            const { status } = await flushPersistBarrierForUserSwitch('account-switch')
++            if (status === 'timed-out') {
++              // A→B 无倒挂风险(迟到解卡的写只落 A 的冻结键 = A 世界合法终态),
++              // reload 照常;超时仅记账。
++              debugLogger.error('Auth', '账号切换屏障超时:reload 照常执行(迟到写只落 A 的冻结键,无倒挂面)')
++            }
+             setPersistUserId(newUid)
+             debugLogger.warn('Auth', `账号切换检测:${prevUid} → ${newUid},重载切换缓存命名空间`)
+             if (
+@@ -67,15 +99,29 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
+             ) {
+               window.location.reload()
+             }
+-            return
++            return 'reload-issued'
++          }
++          if (prevUid === ANONYMOUS_USER_ID && newUid !== prevUid) {
++            const { status } = await flushPersistBarrierForUserSwitch('first-login')
++            if (status === 'timed-out') {
++              // fail-closed(八审裁定):屏障超时 = 匿名盘面不静止(卡死写可能随时
++              // 解卡落 raw)。此时**不 setUid、不置 authenticated**——一旦切号,页内
++              // FX-6 认领先行后解卡的写会成为认领规则永不再覆盖的 raw 孤儿;不切号
++              // 则解卡写落 raw = 匿名世界自己的合法终态,无倒挂面。登录本次失败,
++              // 用户可稍后重试:服务端 session 仍在,下次启动/刷新 fetchMe 仍返回
++              // 同一用户,同一屏障在静止盘面上 settled 后自动完成切换,无需新机制。
++              set({ user: null, status: 'unauthenticated' })
++              debugLogger.error('Auth', '首登屏障超时:fail-closed 不切号,本次登录未完成(下次启动自然重试)')
++              toastFeedback.error(t('toast.auth.persistBusyLogin'))
++              return 'persist-busy'
++            }
++            setPersistUserId(newUid)
+           }
+-          // FX-6: 把命名空间钉到当前用户,stores 随后 hydrate 即从 mivo-*:<uid> 读。
+-          setPersistUserId(newUid)
+           // FX-6: 一次性认领 FX-6 前未带 userId 的存量 asset blob(防 logout 清不掉)。
+           // fire-and-forget,不阻塞 hydrate;node 测试环境无 indexedDB 直接 no-op。
+           void migrateUntaggedAssets(newUid)
+-          set({ user: me.user, status: 'authenticated' })
+-          debugLogger.log('Auth', `会话已恢复:${me.user.name} (${me.user.id})`)
++          set({ user, status: 'authenticated' })
++          debugLogger.log('Auth', `会话已恢复:${user.name} (${user.id})`)
+           // G1-a R2 F5:转入 authenticated 时恢复可能被 401 暂停的持久队列(dynamic import 防静态环;
+           // 队列未启动时 no-op,真正重放在 bootPersistWiring 已认证分支;此处覆盖未来 mid-session
+           // re-auth / token 刷新免重载场景)。
+@@ -95,9 +141,10 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
+         const msg = err instanceof Error ? err.message : String(err)
+         debugLogger.warn('Auth', `会话恢复失败,按未登录处理:${msg}`)
+       }
++      return 'ok'
+     })()
+     try {
+-      await hydrateInFlight
++      return await hydrateInFlight
+     } finally {
+       hydrateInFlight = null
+     }
+@@ -116,6 +163,13 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
+     // blob),再清本地态、跳网关登出。redirect 会卸载页面 —— redirect 之后才排队的
+     // IDB 写入永远落不到盘,所以清理必须在 set + 跳转之前 await 完。
+     // clearCurrentUserCache 在 node 测试环境(无 indexedDB)逐级 no-op,不抛、不发 toast。
++    // #505「退出即弃」:clear 之前丢弃全部暂存写 + 有界等在途落定 + 吸收态置位;
++    // 屏障超时后才落定的迟到写会按其冻结键被补删——任何通道都写不回旧用户数据。
++    const { status } = await discardPersistWritesForLogout()
++    if (status === 'timed-out') {
++      // 隐私优先照常推进(scheduler 已 error);迟到解卡的写由冻结键补删兜底。
++      debugLogger.error('Auth', 'logout 屏障超时:清理照常推进,迟到写按冻结键补删兜底')
++    }
+     await clearCurrentUserCache()
+     set({ user: null, status: 'unauthenticated' })
+     const redirect = `${window.location.origin}/`
+diff --git a/src/store/authSlice.worldSwitch.test.ts b/src/store/authSlice.worldSwitch.test.ts
+new file mode 100644
+index 00000000..ae7adc52
+--- /dev/null
++++ b/src/store/authSlice.worldSwitch.test.ts
+@@ -0,0 +1,215 @@
++// @vitest-environment happy-dom
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #505(F8):auth.hydrate 三分支的**真实接线**回归——不手调 scheduler
++// primitives 模拟 auth 侧,直接跑 authSlice.hydrate():
++//   ① same UID:重复 hydrate 世界不动(写照常收)
++//   ② A→B:有界 flush 屏障(存量落 A 的冻结键)→ setUid → reload 意图;
++//     屏障后的写冻结 B 键(与 main 的写时解析同语义,reload 在途)
++//   ③ anonymous→uid:有界 flush(匿名存量冲净 raw)→ setUid,页内继续,无间隙
++// 外加 F7:uid 在边界 trim + 非空校验(空/空白 fail-closed;含空白的同 uid
++// 归一化后走 no-op 分支)。
++
++const { logSpy, warnSpy, errorSpy, clearSpy, fetchMeMock } = vi.hoisted(() => ({
++  logSpy: vi.fn(),
++  warnSpy: vi.fn(),
++  errorSpy: vi.fn(),
++  clearSpy: vi.fn(async () => undefined),
++  fetchMeMock: vi.fn(),
++}))
++
++vi.mock('./debugLogStore', () => ({
++  debugLogger: { log: logSpy, warn: warnSpy, error: errorSpy },
++  useDebugLogStore: { getState: () => ({ entries: [], addEntry: vi.fn(), clear: vi.fn() }) },
++  installConsoleCapture: () => {},
++}))
++vi.mock('../lib/authClient', () => ({
++  fetchMe: fetchMeMock,
++  AuthError: class AuthError extends Error {},
++}))
++vi.mock('../lib/persistIdbStorage', async (importOriginal) => {
++  const original = await importOriginal<Record<string, unknown>>()
++  return { ...original, clearCurrentUserCache: clearSpy }
++})
++vi.mock('../lib/assetStorage', () => ({
++  migrateUntaggedAssets: vi.fn(async () => undefined),
++  clearAssetsForUser: vi.fn(async () => undefined),
++}))
++vi.mock('../lib/persistBoot', () => ({
++  resumePersistQueue: vi.fn(),
++  bootPersistWiring: vi.fn(),
++}))
++const toastFeedback = { error: vi.fn(), success: vi.fn(), info: vi.fn() }
++vi.mock('./toastStore', () => ({ toastFeedback }))
++vi.mock('../i18n', () => ({ t: (key: string) => key }))
++
++const { setPersistUserId, __resetPersistUserId, getPersistUserId, namespacedKey } = await import('../lib/persistUserId')
++const { useAuthStore } = await import('./authSlice')
++const { createDebouncedCompactPersistStorage, __clearDebouncedPersistInstancesForTests } = await import(
++  './canvasPersistWriteScheduler'
++)
++
++type Slice = Record<string, unknown>
++
++const reloadSpy = vi.fn()
++Object.defineProperty(window, 'location', {
++  configurable: true,
++  value: { href: 'https://app.local/x', origin: 'https://app.local', reload: reloadSpy },
++})
++
++const me = (id: string) => ({ authenticated: true, user: { id, name: id } })
++
++const NAME = 'mivo-canvas-demo'
++
++const makeBackend = () => {
++  const backend = {
++    /** [冻结物理键, 值] 记账。 */
++    writes: [] as Array<[string, string]>,
++    /** 注入:替换下一次写的实现(卡死注入)。 */
++    writeImpl: [] as Array<(key: string, value: string) => Promise<void>>,
++    /** 底层读计数:超时→reload 语义断言「页内未发生认领读」。 */
++    readCurrentCalls: 0,
++    resolveTarget: (name: string) => {
++      const key = namespacedKey(name)
++      return {
++        key,
++        write: async (value: string) => {
++          const impl = backend.writeImpl.shift()
++          if (impl) return impl(key, value)
++          backend.writes.push([key, value])
++        },
++        remove: async () => undefined,
++        removeStrict: async () => undefined,
++      }
++    },
++    readCurrent: async () => {
++      backend.readCurrentCalls += 1
++      return null
++    },
++  }
++  return backend
++}
++
++const makeStorage = (backend: ReturnType<typeof makeBackend>, extra?: { barrierTimeoutMs?: number }) =>
++  createDebouncedCompactPersistStorage<Slice>({
++    resolveTarget: backend.resolveTarget,
++    readCurrent: backend.readCurrent,
++    compactAtFlush: (s) => s,
++    ...extra,
++  })
++
++describe('authSlice.hydrate 三分支 × persist 冻结目标(F8 真实接线)+ F7 uid 校验', () => {
++  beforeEach(() => {
++    __clearDebouncedPersistInstancesForTests()
++    __resetPersistUserId()
++    reloadSpy.mockClear()
++    errorSpy.mockClear()
++    toastFeedback.error.mockClear()
++    fetchMeMock.mockReset()
++    useAuthStore.setState({ user: null, status: 'unknown' })
++  })
++
++  it('③ anonymous→uid:屏障把匿名存量冲进 raw 键 → setUid;随后的写冻结 u 键照常收单(无间隙)', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend)
++    storage.setItem(NAME, { state: { edited: 'anon' }, version: 12 })
++    fetchMeMock.mockResolvedValueOnce(me('user-u'))
++
++    expect(await useAuthStore.getState().hydrate()).toBe('ok')
++    expect(getPersistUserId()).toBe('user-u')
++    expect(backend.writes).toHaveLength(1)
++    expect(backend.writes[0][0]).toBe(NAME) // 匿名存量已被屏障冲出(raw 命名空间)
++
++    storage.setItem(NAME, { state: { edited: 'u-world' }, version: 12 }) // rehydrate 写回/后续编辑
++    expect(storage.hasPendingWrite()).toBe(true) // 冻结 u 键,立即收单——没有世界间隙
++    await storage.flushAndSettle('drain')
++    expect(backend.writes[1][0]).toBe(`${NAME}:user-u`)
++    expect(reloadSpy).not.toHaveBeenCalled()
++  })
++
++  it('③b anonymous→uid 屏障超时:fail-closed 不切号——outcome=persist-busy、toast+error 恰一次、零认领读、无 reload', async () => {
++    // 八审裁定:超时 = 匿名盘面不静止(卡死写可能随时解卡落 raw)。不切号则解卡
++    // 写落 raw = 匿名世界自己的合法终态,无倒挂面;登录本次失败,服务端 session
++    // 仍在,下次启动 fetchMe 仍返回 U,同一屏障在静止盘面上自然重试完成切换。
++    const backend = makeBackend()
++    const storage = makeStorage(backend, { barrierTimeoutMs: 30 }) // 短屏障(生产 5s)
++    backend.writeImpl.push(() => new Promise<void>(() => {})) // v1 写卡死跨 deadline
++    storage.setItem(NAME, { state: { edited: 'anon-v1' }, version: 12 })
++    void storage.flushAndSettle('t1') // v1 已启动并卡死
++    await new Promise((resolve) => setTimeout(resolve, 5))
++    storage.setItem(NAME, { state: { edited: 'anon-v2' }, version: 12 }) // 等待期还有暂存
++    fetchMeMock.mockResolvedValueOnce(me('user-u'))
++
++    const outcome = await useAuthStore.getState().hydrate()
++    expect(outcome).toBe('persist-busy') // outcome 上抛给 useStoreHydration 编排层
++    expect(getPersistUserId()).toBe('anonymous') // fail-closed:不切号
++    expect(useAuthStore.getState().status).toBe('unauthenticated') // 不置 authenticated
++    expect(reloadSpy).not.toHaveBeenCalled() // reload 方案已撤销(close-pending 不 abort 事务)
++    expect(errorSpy).toHaveBeenCalledWith('Auth', expect.stringContaining('首登屏障超时'))
++    expect(toastFeedback.error).toHaveBeenCalledTimes(1) // 用户被告知恰一次
++    expect(toastFeedback.error).toHaveBeenCalledWith('toast.auth.persistBusyLogin')
++    expect(backend.readCurrentCalls).toBe(0) // 页内未发生任何认领/底层读
++  })
++
++  it('① same UID:重复 hydrate 世界不动(写照常收,无 reload)', async () => {
++    const backend = makeBackend()
++    setPersistUserId('user-u')
++    const storage = makeStorage(backend)
++    fetchMeMock.mockResolvedValue(me('user-u'))
++    await useAuthStore.getState().hydrate()
++    await useAuthStore.getState().hydrate() // mid-session /me 刷新
++
++    storage.setItem(NAME, { state: { edited: 'still-alive' }, version: 12 })
++    expect(storage.hasPendingWrite()).toBe(true) // 世界从未被动过
++    expect(reloadSpy).not.toHaveBeenCalled()
++  })
++
++  it('② A→B:屏障把 A 存量冲进 A 的冻结键 → setUid(B)→ reload;屏障后的写冻结 B 键(main 同语义)', async () => {
++    const backend = makeBackend()
++    setPersistUserId('user-a')
++    const storage = makeStorage(backend)
++    storage.setItem(NAME, { state: { edited: 'a-edit' }, version: 12 })
++    fetchMeMock.mockResolvedValueOnce(me('user-b'))
++
++    expect(await useAuthStore.getState().hydrate()).toBe('reload-issued')
++    expect(reloadSpy).toHaveBeenCalledTimes(1)
++    expect(backend.writes).toHaveLength(1)
++    expect(backend.writes[0][0]).toBe(`${NAME}:user-a`) // A 存量 flush 进 A 命名空间
++    expect(getPersistUserId()).toBe('user-b')
++
++    // reload 在途窗口的写:入队冻结 B 键(与 main 的写时 namespacedKey 解析同语义;
++    // 冻结目标保证的是「切换前入队的写永落 A 键」,上面 writes[0] 即该保证)。
++    storage.setItem(NAME, { state: { edited: 'during-reload' }, version: 12 })
++    await storage.flushAndSettle('drain')
++    expect(backend.writes[1][0]).toBe(`${NAME}:user-b`)
++  })
++
++  it('F7:/me 返回空 uid → fail-closed 按未登录处理,不动命名空间、不 reload、error 留痕', async () => {
++    fetchMeMock.mockResolvedValueOnce(me(''))
++    await useAuthStore.getState().hydrate()
++    expect(useAuthStore.getState().status).toBe('unauthenticated')
++    expect(getPersistUserId()).toBe('anonymous')
++    expect(reloadSpy).not.toHaveBeenCalled()
++    expect(errorSpy).toHaveBeenCalledWith('Auth', expect.stringContaining('非法 userId'))
++  })
++
++  it('F7:/me 返回纯空白 uid → 同口径 fail-closed', async () => {
++    setPersistUserId('user-a') // 已登录会话遇到坏 /me 响应:命名空间也不得被切走
++    fetchMeMock.mockResolvedValueOnce(me('   '))
++    await useAuthStore.getState().hydrate()
++    expect(useAuthStore.getState().status).toBe('unauthenticated')
++    expect(getPersistUserId()).toBe('user-a')
++    expect(reloadSpy).not.toHaveBeenCalled()
++    expect(errorSpy).toHaveBeenCalledWith('Auth', expect.stringContaining('非法 userId'))
++  })
++
++  it('F7:带空白的同 uid(" user-u ")归一化后走 same-UID no-op 分支,不误判为 A→B 切换', async () => {
++    setPersistUserId('user-u')
++    fetchMeMock.mockResolvedValueOnce(me('  user-u  '))
++    await useAuthStore.getState().hydrate()
++    expect(useAuthStore.getState().status).toBe('authenticated')
++    expect(useAuthStore.getState().user?.id).toBe('user-u') // 下游拿到的是归一化 uid
++    expect(getPersistUserId()).toBe('user-u')
++    expect(reloadSpy).not.toHaveBeenCalled() // 没有被误判成账号切换
++  })
++})
+diff --git a/src/store/canvasDocumentModel.compactPersist.test.ts b/src/store/canvasDocumentModel.compactPersist.test.ts
+new file mode 100644
+index 00000000..62482d23
+--- /dev/null
++++ b/src/store/canvasDocumentModel.compactPersist.test.ts
+@@ -0,0 +1,162 @@
++import { describe, expect, it, vi } from 'vitest'
++
++// canvasDocumentModel 传递引入 demoScenes → demoImages 需要 document(node 测试
++// 环境没有)——与 leaferLinePaint.test.ts 同款 mock。
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++import {
++  compactCanvasesForPersist,
++  compactDocumentForPersist,
++  compactNodeForPersist,
++} from './canvasDocumentModel'
++import { cloneNode } from './nodeFactory'
++import type { CanvasDocument, MivoCanvasNode } from '../types/mivoCanvas'
++
++// #505 三刀中两刀的回归:
++// - 刀3(按需拷贝):新 compactNodeForPersist 的 JSON 输出必须与旧
++//   「cloneNode 全量深拷贝再 delete」实现逐字节一致(含键序)——旧算法在测试里
++//   原样重建作参照,覆盖已归一/legacy 未归一/带旋转/带畸形锚点四类节点。
++// - 刀2(只 compact 变更画布):同一 document 引用复用缓存输出(零拷贝),
++//   引用变化才重新 compact。
++
++/** 旧实现原样重建(#505 前的 canvasDocumentModel.ts:76-91),作字节参照。 */
++const legacyCompactNodeForPersist = (node: MivoCanvasNode): MivoCanvasNode => {
++  const compactNode = cloneNode(node)
++  const transform = compactNode.transform
++  const rotation = transform?.rotation ?? 0
++
++  delete compactNode.asset
++  delete compactNode.fills
++  delete compactNode.relations
++  delete compactNode.strokes
++  delete compactNode.transform
++
++  return {
++    ...compactNode,
++    ...(Math.abs(rotation) > 0.0001 ? { transform } : {}),
++  }
++}
++
++const baseNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode =>
++  ({
++    id: 'n1',
++    type: 'image',
++    status: 'ready',
++    title: 'Img',
++    x: 10,
++    y: 20,
++    width: 200,
++    height: 100,
++    assetUrl: 'mivo-asset:abc',
++    ...overrides,
++  }) as unknown as MivoCanvasNode
++
++const withTransform = (node: MivoCanvasNode, rotation = 0): MivoCanvasNode =>
++  ({
++    ...node,
++    transform: { x: node.x, y: node.y, width: node.width, height: node.height, rotation },
++    asset: { kind: 'image', url: node.assetUrl },
++    fills: [{ id: 'f', type: 'image', url: node.assetUrl }],
++    relations: {},
++  }) as unknown as MivoCanvasNode
++
++describe('compactNodeForPersist — 刀3 按需拷贝的字节等价', () => {
++  const cases: Array<[string, MivoCanvasNode]> = [
++    ['已归一节点(store 常态,零旋转)', withTransform(baseNode())],
++    ['已归一节点(带旋转 → transform 保留在末尾)', withTransform(baseNode(), 45)],
++    [
++      'legacy 未归一节点(无 transform/无 fills → 走全重建吸附路径)',
++      baseNode({ id: 'legacy', fontWeight: 500 } as Partial<MivoCanvasNode>),
++    ],
++    [
++      '梯外字重节点(fontWeight 600 → 吸附语义必须保持)',
++      withTransform(baseNode({ id: 'fw', type: 'text', text: 'hi', fontWeight: 600, assetUrl: undefined } as Partial<MivoCanvasNode>)),
++    ],
++    [
++      '带畸形 box 锚点(缺 width/height → 持久化时丢弃的语义必须保持)',
++      withTransform(
++        baseNode({
++          id: 'anchor',
++          experimentalAnchors: [
++            { id: 'a1', type: 'box', targetNodeId: 'n1', x: 0, y: 0, width: 10, height: 10, instruction: 'i', createdAt: 1 },
++            // 畸形:box 缺 width/height → 持久化时丢弃(旧 cloneNode 语义)
++            { id: 'a2', type: 'box', targetNodeId: 'n1', x: 0, y: 0, instruction: 'i', createdAt: 2 },
++          ],
++        } as Partial<MivoCanvasNode>),
++      ),
++    ],
++    [
++      '带 markupPoints/generation 嵌套的 markup 节点',
++      withTransform(
++        baseNode({
++          id: 'mk',
++          type: 'markup',
++          markupKind: 'arrow',
++          assetUrl: undefined,
++          markupPoints: [
++            { x: 0, y: 0 },
++            { x: 10, y: 10 },
++          ],
++          generation: { prompt: 'p', model: 'm', maskBounds: { x: 1, y: 2, width: 3, height: 4 } },
++        } as Partial<MivoCanvasNode>),
++      ),
++    ],
++  ]
++
++  for (const [label, node] of cases) {
++    it(`${label}:JSON 输出与旧 clone-then-delete 实现逐字节一致`, () => {
++      expect(JSON.stringify(compactNodeForPersist(node))).toBe(
++        JSON.stringify(legacyCompactNodeForPersist(node)),
++      )
++    })
++  }
++
++  it('丢弃字段集不变:asset/fills/relations/strokes 不落盘,零旋转不落 transform', () => {
++    const out = compactNodeForPersist(withTransform(baseNode()))
++    const json = JSON.parse(JSON.stringify(out)) as Record<string, unknown>
++    for (const dropped of ['asset', 'fills', 'relations', 'strokes', 'transform']) {
++      expect(json).not.toHaveProperty(dropped)
++    }
++  })
++})
++
++describe('compactDocumentForPersist — 刀2 只 compact 变更画布', () => {
++  const doc = (title: string): CanvasDocument =>
++    ({
++      title,
++      nodes: [withTransform(baseNode())],
++      edges: [],
++      tasks: [],
++      selectedNodeId: undefined,
++      selectedNodeIds: [],
++    }) as unknown as CanvasDocument
++
++  it('同一 document 引用 → 复用缓存输出(同引用,零拷贝)', () => {
++    const document = doc('A')
++    const first = compactDocumentForPersist(document)
++    const second = compactDocumentForPersist(document)
++    expect(second).toBe(first)
++  })
++
++  it('引用变化 → 重新 compact(新输出)', () => {
++    const document = doc('A')
++    const first = compactDocumentForPersist(document)
++    const changed = { ...document, title: 'B' } as CanvasDocument
++    const second = compactDocumentForPersist(changed)
++    expect(second).not.toBe(first)
++    expect(second.title).toBe('B')
++  })
++
++  it('compactCanvasesForPersist:未变画布复用上次结果,变更画布重算(输出仍含全部画布)', () => {
++    const unchanged = doc('Stay')
++    const before = doc('Old')
++    const round1 = compactCanvasesForPersist({ a: unchanged, b: before })
++    const after = { ...before, title: 'New' } as CanvasDocument
++    const round2 = compactCanvasesForPersist({ a: unchanged, b: after })
++    expect(Object.keys(round2)).toEqual(['a', 'b'])
++    expect(round2.a).toBe(round1.a) // 未变画布零拷贝复用
++    expect(round2.b).not.toBe(round1.b)
++    expect(round2.b.title).toBe('New')
++  })
++})
+diff --git a/src/store/canvasDocumentModel.ts b/src/store/canvasDocumentModel.ts
+index daef5369..f873c2d1 100644
+--- a/src/store/canvasDocumentModel.ts
++++ b/src/store/canvasDocumentModel.ts
+@@ -24,7 +24,8 @@ import {
+ } from '../lib/canvasAssetImport'
+ import { importedImageDisplaySize } from '../lib/imageSizing'
+ import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
+-import { normalizeCanvasNodesV2, setNodeTransform } from '../model/documentModelV2'
++import { normalizeCanvasNodesV2, normalizeCanvasNodeV2, setNodeTransform } from '../model/documentModelV2'
++import { normalizeAnchors } from '../model/anchorModel'
+ import { DEMO_SCENE_PROJECT_MAP, scenes, snapshotFromScene } from './demoScenes'
+ import { pushHistory, snapshotFromState as buildHistorySnapshot, type HistoryCloneFns } from './historyManager'
+ import {
+@@ -73,30 +74,58 @@ const hasContentPatch = (patch: CanvasDocumentPatch) =>
+ const shouldBumpUpdatedAt = (patch: CanvasDocumentPatch, bumpUpdatedAt?: boolean) =>
+   bumpUpdatedAt !== false && hasContentPatch(patch)
+ 
++// #505 按需拷贝:persist 输出只进 JSON.stringify(不做二次编辑),不需要 clone 隔离。
++// 旧实现每节点 cloneNode 全量深拷贝(cloneCanvasNodeV2 全重建 + markupPoints/generation/
++// anchors 等逐层复制)再 delete 5 个字段——拖拽逐帧触发时是最大单点。新实现:
++// - normalizeCanvasNodeV2 对已归一节点返回同引用(零分配);未归一节点(历史文档的
++//   梯外字重/legacy 几何等)仍走 cloneCanvasNodeV2 全重建,吸附语义与旧路径一致。
++// - rest 解构一次性丢弃不持久化字段(rest 保序 → JSON 键序与旧 clone-then-delete
++//   逐字节一致);transform 仅带旋转时按旧口径追加到末尾。
++// - experimentalAnchors 显式归一(旧路径经 cloneNode 的 normalizeAnchors 丢弃畸形
++//   box 锚点,持久化语义必须保持;对既有键覆写不改键序,无锚点时值为 undefined
++//   对 JSON 不可见)。
++// 共享嵌套引用对序列化安全:store 更新不可变,flush 时 stringify 的就是当次快照。
++const DROPPED_PERSIST_NODE_FIELDS: ReadonlySet<string> = new Set([
++  'asset',
++  'fills',
++  'relations',
++  'strokes',
++  'transform',
++])
++
+ export const compactNodeForPersist = (node: MivoCanvasNode): MivoCanvasNode => {
+-  const compactNode = cloneNode(node)
+-  const transform = compactNode.transform
++  const normalized = normalizeCanvasNodeV2(node)
++  const kept: Record<string, unknown> = {}
++  for (const key of Object.keys(normalized)) {
++    if (!DROPPED_PERSIST_NODE_FIELDS.has(key)) kept[key] = (normalized as unknown as Record<string, unknown>)[key]
++  }
++  kept.experimentalAnchors = normalizeAnchors(normalized.experimentalAnchors, true)
++  const transform = normalized.transform
+   const rotation = transform?.rotation ?? 0
++  if (Math.abs(rotation) > 0.0001) kept.transform = transform
+ 
+-  delete compactNode.asset
+-  delete compactNode.fills
+-  delete compactNode.relations
+-  delete compactNode.strokes
+-  delete compactNode.transform
++  return kept as unknown as MivoCanvasNode
++}
+ 
+-  return {
+-    ...compactNode,
+-    ...(Math.abs(rotation) > 0.0001 ? { transform } : {}),
++// #505 只 compact 变更画布:document 引用不可变(store 每次内容变更都换新对象),
++// 以引用为键缓存 compact 结果——partialize/flush 对未变画布零拷贝复用上次输出,
++// 输出 blob 仍含全部画布。WeakMap 随旧文档引用自动 GC,不需要失效逻辑。
++// 缓存值只进 JSON.stringify,任何消费方不得原地修改。
++const compactDocumentCache = new WeakMap<CanvasDocument, CanvasDocument>()
++
++export const compactDocumentForPersist = (document: CanvasDocument): CanvasDocument => {
++  const cached = compactDocumentCache.get(document)
++  if (cached) return cached
++  const compacted: CanvasDocument = {
++    ...document,
++    nodes: document.nodes.map(compactNodeForPersist),
++    tasks: cloneTasks(document.tasks),
++    selectedNodeIds: document.selectedNodeIds ? [...document.selectedNodeIds] : undefined,
+   }
++  compactDocumentCache.set(document, compacted)
++  return compacted
+ }
+ 
+-export const compactDocumentForPersist = (document: CanvasDocument): CanvasDocument => ({
+-  ...document,
+-  nodes: document.nodes.map(compactNodeForPersist),
+-  tasks: cloneTasks(document.tasks),
+-  selectedNodeIds: document.selectedNodeIds ? [...document.selectedNodeIds] : undefined,
+-})
+-
+ export const compactCanvasesForPersist = (canvases: Record<CanvasId, CanvasDocument>) =>
+   Object.fromEntries(
+     Object.entries(canvases).map(([canvasId, document]) => [canvasId, compactDocumentForPersist(document)]),
+diff --git a/src/store/canvasPersistConfig.ts b/src/store/canvasPersistConfig.ts
+index 7c68f515..abf5ff94 100644
+--- a/src/store/canvasPersistConfig.ts
++++ b/src/store/canvasPersistConfig.ts
+@@ -3,13 +3,14 @@
+ // canvasStore.ts facade. migrate/merge semantics are unchanged from the pre-FU4-2
+ // inline config; only `storage` (localStorage → IDB) and `skipHydration` (defer to
+ // the App-layer hydration gate) are new.
+-import { createJSONStorage } from 'zustand/middleware'
+-import { idbStateStorage } from '../lib/persistIdbStorage'
++import { createIdbFrozenTarget, idbStateStorage } from '../lib/persistIdbStorage'
+ import { compactCanvasesForPersist } from './canvasDocumentModel'
++import { createDebouncedCompactPersistStorage } from './canvasPersistWriteScheduler'
++import type { CanvasDocument, CanvasId } from '../types/mivoCanvas'
+ import { CANVAS_PERSIST_VERSION, consumeCanvasHydrationSettleCount, mergeCanvasPersistedState, migratePersistedState } from './canvasGenerationHydration'
+ import { debugLogger } from './debugLogStore'
+-import { isLegacyKernel } from '../app/kernelMode'
+-import { docKernelPersistStorage } from '../kernel/docKernelPersistAdapter'
++import { isLegacyKernelEffective, warnIfEffectiveKernelBootPending } from '../app/kernelMode'
++import { createDocKernelFrozenTarget, docKernelPersistStorage } from '../kernel/docKernelPersistAdapter'
+ import type { CanvasState } from './canvasStore'
+ 
+ // Local warn — identical to canvasStore's exported warnCanvas. Duplicated (not
+@@ -17,22 +18,70 @@ import type { CanvasState } from './canvasStore'
+ // for the options, so this module must not import canvasStore for a value.
+ const warnCanvas = (message: string) => debugLogger.warn('Canvas Store', message)
+ 
++// #505:partialize 输出的形状(canvases 为 store 原引用,compact 移到 flush 时)。
++type CanvasPersistedSlice = {
++  canvases: Record<CanvasId, CanvasDocument>
++} & Record<string, unknown>
++
++// #505 写防抖 storage:setItem 暂存最新快照,trailing debounce 到期才
++// compact + stringify + 底层写;visibilitychange/pagehide 强制 flush 兜底。
++// 底层 backend 仍按 kernel 分流(legacy: idbStateStorage / new: docKernelPersistStorage),
++// 两条路径同等受益;blob 形状与替换前 createJSONStorage 逐字节等价。
++/** #505 单一 compact 出口:scheduler 的 flush 与插件 persistSync 的手动 envelope
++ *  必须同源调用,保证两条落盘通道的 blob 形状一致(裁掉 asset/fills/relations/
++ *  strokes/零旋转 transform)。未变画布经 WeakMap 缓存零拷贝复用。 */
++export const compactCanvasPersistSlice = <S extends CanvasPersistedSlice>(slice: S): S => ({
++  ...slice,
++  canvases: compactCanvasesForPersist(slice.canvases),
++})
++
++const debouncedCanvasStorage = createDebouncedCompactPersistStorage<CanvasPersistedSlice>({
++  // #505 冻结目标:setItem 入队时按**生效内核**解析并冻结物理写目标(legacy:
++  // namespaced 单 key / kernel=new:document+session 两域原子写)。生效内核读
++  // isLegacyKernelEffective(kernel=new 在无可用 IDB 时于启动编排层降级 legacy)。
++  resolveTarget: (name) => {
++    // fail-visible 守卫(F2):kernel=new 请求下 boot 未完成即冻结通道 = 编排顺序
++    // 回归,error 落账恰一次;只报警不阻塞(写按当时生效值冻结)。
++    warnIfEffectiveKernelBootPending('canvasPersistConfig.resolveTarget')
++    return isLegacyKernelEffective() ? createIdbFrozenTarget(name) : createDocKernelFrozenTarget(name)
++  },
++  readCurrent: (name) => {
++    // 同一守卫也包读侧:getItem/rehydrate 在 boot 前旁路同样是编排回归,不许静默。
++    warnIfEffectiveKernelBootPending('canvasPersistConfig.readCurrent')
++    return isLegacyKernelEffective() ? idbStateStorage.getItem(name) : docKernelPersistStorage.getItem(name)
++  },
++  compactAtFlush: compactCanvasPersistSlice,
++})
++
++/** 测试锚 + 手动兜底:冲刷暂存的画布持久化写并等在途落定(统一有界屏障,5s)。 */
++export const flushCanvasPersistWrite = (reason = 'manual') => debouncedCanvasStorage.flushAndSettle(reason)
++
++/** 测试观测:是否有暂存未落盘的画布持久化写。 */
++export const hasPendingCanvasPersistWrite = () => debouncedCanvasStorage.hasPendingWrite()
++
++/** 测试专用:清空暂存与 read-your-writes 快照(测试直接 seed 底层存储前调用,
++ *  否则 getItem 会按语义正确地返回上个测试留下的更新快照而非 seed)。 */
++export const __resetCanvasPersistStorageForTests = () => debouncedCanvasStorage.__resetForTests()
++
+ export const canvasPersistOptions = {
+   name: 'mivo-canvas-demo',
+   version: CANVAS_PERSIST_VERSION,
+   // FU4-2: persist to IndexedDB (10k+ node snapshots exceed localStorage's ~5MB
+   // quota). skipHydration defers rehydrate to the App-layer hydration gate so the
+   // first paint is the real state, not a demo-seed flash. migrate/merge unchanged.
+-  // T1.2 S6b:?kernel=new 时 persist storage 切 DocKernel-backed adapter(读写 document+session
+-  // 三域 canonical,Lead ① persist backend,setters 不动);?kernel=legacy(默认)仍 idbStateStorage
+-  // (single blob,legacy 零变化 §8)。isLegacyKernel 模块常量(生命周期内不变)。
+-  storage: createJSONStorage(() => (isLegacyKernel ? idbStateStorage : docKernelPersistStorage)),
++  // T1.2 S6b:?kernel=new 时 persist backend 切 DocKernel-backed adapter(读写 document+session
++  // 三域 canonical);?kernel=legacy(默认)仍 idbStateStorage(single blob)。
++  // #505:两条 backend 外面统一包一层写防抖 storage(见上 debouncedCanvasStorage)。
++  storage: debouncedCanvasStorage,
+   skipHydration: true,
+   migrate: migratePersistedState,
+   merge: (persistedState: unknown, currentState: CanvasState) =>
+     mergeCanvasPersistedState(persistedState, currentState, migratePersistedState, warnCanvas),
++  // #505:partialize 不再逐次 compact——canvases 传原引用,compact 移到防抖 flush
++  // 时执行(compactAtFlush),拖拽逐帧的 partialize 成本降为一个小对象字面量。
++  // 持久化 blob 形状不变(flush 用同一 compactCanvasesForPersist)。
+   partialize: (state: CanvasState) => ({
+-    canvases: compactCanvasesForPersist(state.canvases),
++    canvases: state.canvases,
+     projects: state.projects,
+     sceneId: state.sceneId,
+     selectedNodeId: state.selectedNodeId,
+@@ -55,7 +104,10 @@ export const canvasPersistOptions = {
+   // import of useCanvasStore breaks the canvasStore ⇄ canvasPersistConfig static cycle
+   // (canvasStore statically imports this module for the options); the store is loaded
+   // by the time rehydrate runs, so the dynamic import resolves synchronously.
+-  onRehydrateStorage: () => async () => {
++  // #505 冻结目标架构下 rehydrate 无需任何协议:zustand 的迁移写回(setItem 先于
++  // 完成回调,middleware.js:424)就是一次普通的冻结键写,照常防抖落盘。
++  onRehydrateStorage: () => async (_state: unknown, error?: unknown) => {
++    if (error) return
+     const settled = consumeCanvasHydrationSettleCount()
+     if (settled <= 0) return
+     const { useCanvasStore } = await import('./canvasStore')
+diff --git a/src/store/canvasPersistWriteScheduler.integration.test.ts b/src/store/canvasPersistWriteScheduler.integration.test.ts
+new file mode 100644
+index 00000000..69956ce2
+--- /dev/null
++++ b/src/store/canvasPersistWriteScheduler.integration.test.ts
+@@ -0,0 +1,434 @@
++// @vitest-environment happy-dom
++import 'fake-indexeddb/auto'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #505 P2-7「真落盘」集成回归:不用自制 Map backend,用 fake-indexeddb + 真实
++// createIdbFrozenTarget / createDocKernelFrozenTarget 走完整链路(namespacedKey
++// 冻结/事务/迁移标记全在环),lifecycle flush 后从真实 adapter 读回断言。
++// - legacy:pagehide flush → IDB 读回 blob
++// - 冻结物理目标:切 UID 后迟到启动的写落**旧键**(A 自己的命名空间,合法),
++//   新键零写入;跨 UID 快照读不可见(键不同,结构性质)
++// - kernel=new:两域单事务原子写/删,flush 后两 key 完整、remove 后两 key 全无
++// - P1-4:put 已启动后 remove → 终态删除(IDB 事务创建序)
++// - F8:logout 屏障超时后迟到写真提交进 IDB → 按冻结键补删,终态 null
++
++const toastFeedback = { error: vi.fn(), success: vi.fn(), info: vi.fn() }
++vi.mock('./toastStore', () => ({ toastFeedback }))
++vi.mock('../store/toastStore', () => ({ toastFeedback }))
++
++const { debugLogger } = await import('./debugLogStore')
++const { setPersistUserId, __resetPersistUserId } = await import('../lib/persistUserId')
++const { idbStateStorage, rawIdbStorage, createIdbFrozenTarget, __resetIdbPersist } = await import(
++  '../lib/persistIdbStorage'
++)
++const { documentKey, sessionKey, docKernelPersistStorage, createDocKernelFrozenTarget } = await import(
++  '../kernel/docKernelPersistAdapter'
++)
++const {
++  createDebouncedCompactPersistStorage,
++  discardPersistWritesForLogout,
++  flushPersistBarrierForUserSwitch,
++  __clearDebouncedPersistInstancesForTests,
++} = await import('./canvasPersistWriteScheduler')
++
++type Slice = { canvases: Record<string, { title: string; nodes?: unknown[] }> } & Record<string, unknown>
++
++const NAME = 'mivo-canvas-demo'
++
++const value = (title: string): { state: Slice; version: number } => ({
++  state: { canvases: { c1: { title } }, activeTool: 'select' },
++  version: 12,
++})
++
++const makeLegacyStorage = (extra?: { skipLifecycleListeners?: boolean; barrierTimeoutMs?: number }) =>
++  createDebouncedCompactPersistStorage<Slice>({
++    resolveTarget: createIdbFrozenTarget,
++    readCurrent: (name) => idbStateStorage.getItem(name),
++    compactAtFlush: (s) => s,
++    ...extra,
++  })
++
++// 等真实 IDB 事务提交:fake-indexeddb 在宏任务边界推进,轮询读侧直到看见/确认无值。
++const waitForIdb = async (read: () => Promise<unknown> | unknown, predicate: (v: unknown) => boolean, tries = 50) => {
++  for (let attempt = 0; attempt < tries; attempt += 1) {
++    const current = await read()
++    if (predicate(current)) return current
++    await new Promise((resolve) => setTimeout(resolve, 5))
++  }
++  return read()
++}
++
++describe('scheduler × 真实 IDB adapter(fake-indexeddb)', () => {
++  beforeEach(async () => {
++    __clearDebouncedPersistInstancesForTests()
++    __resetPersistUserId()
++    sessionStorage.clear()
++    localStorage.clear()
++    await __resetIdbPersist()
++    vi.spyOn(debugLogger, 'log').mockImplementation(() => undefined)
++    vi.spyOn(debugLogger, 'warn').mockImplementation(() => undefined)
++    vi.spyOn(debugLogger, 'error').mockImplementation(() => undefined)
++  })
++  afterEach(async () => {
++    await __resetIdbPersist()
++    vi.restoreAllMocks()
++  })
++
++  it('legacy:pagehide flush → 真实 IDB 读回同一 blob(不 await flush promise)', async () => {
++    const storage = makeLegacyStorage()
++    storage.setItem(NAME, value('RealDisk'))
++    window.dispatchEvent(new Event('pagehide'))
++
++    const raw = (await waitForIdb(
++      () => idbStateStorage.getItem(NAME),
++      (v) => v != null,
++    )) as string | null
++    expect(raw).not.toBeNull()
++    const parsed = JSON.parse(raw!) as { state: Slice; version: number }
++    expect(parsed.state.canvases.c1.title).toBe('RealDisk')
++    expect(parsed.version).toBe(12)
++  })
++
++  it('冻结物理目标:A 的暂存写在(未走屏障的)切换后照常落 **A 自己的冻结键**,B 命名空间零写入', async () => {
++    setPersistUserId('user-a')
++    const storage = makeLegacyStorage()
++    storage.setItem(NAME, value('A-last-state')) // 入队时冻结 A 键
++    setPersistUserId('user-b') // 防抖窗口内切换(无屏障的最坏路径)
++    window.dispatchEvent(new Event('pagehide'))
++    await storage.flushAndSettle('drain')
++
++    // 用 raw 通道逐 key 断言(绕过命名空间自动拼接,直接看物理键):
++    // 迟到写落旧键 = 旧世界的合法终态;B 的命名空间结构性干净。
++    const aRaw = await waitForIdb(
++      () => rawIdbStorage.getItem(`${NAME}:user-a`),
++      (v) => v != null,
++    )
++    expect(aRaw).toContain('A-last-state')
++    expect(await rawIdbStorage.getItem(`${NAME}:user-b`)).toBeNull()
++    // B 世界经真实 adapter 也读不到 A 的内容(键不同)
++    const viaAdapter = await idbStateStorage.getItem(NAME)
++    expect(viaAdapter === null || !viaAdapter.includes('A-last-state')).toBe(true)
++  })
++
++  it('kernel=new:flush 后 document+session 两域完整;removeItem 后两域全无(原子)', async () => {
++    const storage = createDebouncedCompactPersistStorage<Slice>({
++      resolveTarget: createDocKernelFrozenTarget,
++      readCurrent: (name) => docKernelPersistStorage.getItem(name),
++      compactAtFlush: (s) => s,
++      skipLifecycleListeners: true,
++    })
++    storage.setItem(NAME, value('ThreeDomain'))
++    await storage.flushAndSettle('test')
++
++    const docRaw = (await waitForIdb(
++      () => rawIdbStorage.getItem(documentKey(NAME)),
++      (v) => v != null,
++    )) as string | null
++    const sessRaw = await rawIdbStorage.getItem(sessionKey(NAME))
++    expect(docRaw).not.toBeNull()
++    expect(sessRaw).not.toBeNull() // 两域同笔事务,不存在只落一半
++    expect((JSON.parse(docRaw!) as { version: number }).version).toBe(11)
++
++    await storage.removeItem(NAME)
++    await waitForIdb(
++      () => rawIdbStorage.getItem(documentKey(NAME)),
++      (v) => v == null,
++    )
++    expect(await rawIdbStorage.getItem(documentKey(NAME))).toBeNull()
++    expect(await rawIdbStorage.getItem(sessionKey(NAME))).toBeNull()
++  })
++
++  it('P1-4:set 落盘启动后紧跟 remove → 终态删除,旧写不复活 key', async () => {
++    const storage = makeLegacyStorage({ skipLifecycleListeners: true })
++    storage.setItem(NAME, value('Doomed'))
++    const flush = storage.flushAndSettle('test') // put 事务已创建
++    await storage.removeItem(NAME) // delete 事务随后创建 → IDB 按创建序提交
++    await flush
++    await new Promise((resolve) => setTimeout(resolve, 20))
++    expect(await idbStateStorage.getItem(NAME)).toBeNull()
++  })
++
++  it('切换流(真实 adapter):屏障冲 A 存量进 A 键;屏障后的写冻结 B 键——各世界各归各键', async () => {
++    setPersistUserId('user-a')
++    const storage = makeLegacyStorage()
++    storage.setItem(NAME, value('A-edit'))
++    await flushPersistBarrierForUserSwitch('account-switch') // 存量冲进 A(uid 未切)
++    setPersistUserId('user-b')
++    storage.setItem(NAME, value('B-world-write')) // 屏障后的写:入队冻结 B 键
++    window.dispatchEvent(new Event('pagehide'))
++    await storage.flushAndSettle('drain')
++    await new Promise((resolve) => setTimeout(resolve, 20))
++
++    const aRaw = await rawIdbStorage.getItem(`${NAME}:user-a`)
++    expect(aRaw).not.toBeNull()
++    expect(aRaw!).toContain('A-edit') // A 的存量编辑落进 A 命名空间
++    const bRaw = await rawIdbStorage.getItem(`${NAME}:user-b`)
++    expect(bRaw).toContain('B-world-write') // 屏障后的写落 B 键(与 main 的写时解析同语义)
++    expect(bRaw).not.toContain('A-edit')
++  })
++
++  // ── finding2:anonymous→uid 屏障 × FX-6 认领(真实 adapter 三例)──────────────
++  it('finding2-a:U 已有数据——匿名存量冲回 raw 后不污染 U,U 读到自己的数据', async () => {
++    // U 命名空间预置数据
++    setPersistUserId('user-u')
++    await idbStateStorage.setItem(NAME, JSON.stringify(value('U-own-data')))
++    __resetPersistUserId() // 回到匿名世界开工
++
++    const storage = makeLegacyStorage({ skipLifecycleListeners: true })
++    storage.setItem(NAME, value('anon-edit'))
++    await flushPersistBarrierForUserSwitch('first-login') // 匿名存量冲回 raw key(读盘前就位)
++    setPersistUserId('user-u')
++
++    const uRead = await storage.getItem(NAME) // U 世界读:U 键无快照 → 经真实 adapter
++    expect((uRead?.state as Slice).canvases.c1.title).toBe('U-own-data') // namespaced 已有数据,raw 不倒灌
++    expect(await rawIdbStorage.getItem(NAME)).toContain('anon-edit') // 匿名数据留在 raw,未泄进 U
++  })
++
++  it('finding2-b:U 空库——匿名存量冲回 raw,U 首读经 FX-6 迁移按既有规则认领', async () => {
++    const storage = makeLegacyStorage({ skipLifecycleListeners: true })
++    storage.setItem(NAME, value('anon-claimable'))
++    await flushPersistBarrierForUserSwitch('first-login')
++    setPersistUserId('user-u')
++
++    const uRead = await storage.getItem(NAME) // 触发 migrateToNamespaced 认领 raw
++    expect((uRead?.state as Slice).canvases.c1.title).toBe('anon-claimable')
++    expect(await rawIdbStorage.getItem(NAME)).toBeNull() // raw 已被认领删除
++    expect(await rawIdbStorage.getItem(`${NAME}:user-u`)).toContain('anon-claimable')
++  })
++
++  it('finding2-c:跨 UID 快照不可见——未走屏障的 uid 漂移下 getItem 不吐旧世界快照', async () => {
++    setPersistUserId('user-a')
++    const storage = makeLegacyStorage({ skipLifecycleListeners: true })
++    storage.setItem(NAME, value('A-private'))
++    setPersistUserId('user-b') // 对抗性:不走世界切换屏障直接漂移
++    const read = await storage.getItem(NAME) // A 键快照 ≠ B 键 → 结构性查不到,落底层读 B 命名空间
++    expect(read === null || !JSON.stringify(read).includes('A-private')).toBe(true)
++    expect(await rawIdbStorage.getItem(`${NAME}:user-b`)).toBeNull()
++  })
++
++  it('getItem 线性化 × 真实 IDB:pending 未落盘时 rehydrate 读到的也是最新快照', async () => {
++    const storage = makeLegacyStorage({ skipLifecycleListeners: true })
++    storage.setItem(NAME, value('Stale'))
++    await storage.flushAndSettle('seed')
++    storage.setItem(NAME, value('Fresh')) // pending
++    const read = await storage.getItem(NAME)
++    expect((read?.state as Slice).canvases.c1.title).toBe('Fresh')
++  })
++
++  it('F1 屏障排空到静止:慢写屏障中 + 等待期入队 v2 → 认领读盘前全部落定,U 认领到 v2、raw 无孤儿', async () => {
++    // 六审 F1 复现链:旧屏障只入口 flush 一次,等待期入队的 v2 逃逸,在 FX-6 认领
++    // raw(v1)之后才 debounce 落盘 → v2 成 raw 孤儿、U 永久停在 v1。
++    let releaseV1: (() => void) | undefined
++    const v1Gate = new Promise<void>((resolve) => {
++      releaseV1 = resolve
++    })
++    let gateArmed = true // 只慢第一笔(v1),后续写(v2)走真实速度
++    const storage = createDebouncedCompactPersistStorage<Slice>({
++      resolveTarget: (name) => {
++        const real = createIdbFrozenTarget(name)
++        return {
++          ...real,
++          write: async (serialized) => {
++            if (gateArmed) {
++              gateArmed = false
++              await v1Gate
++            }
++            await real.write(serialized)
++          },
++        }
++      },
++      readCurrent: (name) => idbStateStorage.getItem(name),
++      compactAtFlush: (s) => s,
++      skipLifecycleListeners: true,
++    })
++    storage.setItem(NAME, value('v1'))
++    const barrier = flushPersistBarrierForUserSwitch('first-login') // v1 写启动后卡住
++    await new Promise((resolve) => setTimeout(resolve, 5))
++    storage.setItem(NAME, value('v2')) // 屏障等待期用户还在编辑
++    releaseV1?.()
++    await barrier // 排空到静止:v2 也必须在屏障内落定
++
++    setPersistUserId('user-u')
++    const uRead = await storage.getItem(NAME) // FX-6 认领 raw(读盘)
++    expect((uRead?.state as Slice).canvases.c1.title).toBe('v2') // U 认领到的是最终态
++    expect(await rawIdbStorage.getItem(NAME)).toBeNull() // raw 无孤儿
++    expect(await rawIdbStorage.getItem(`${NAME}:user-u`)).toContain('v2')
++  })
++
++  it('F1 屏障超时 fail-closed:不切号 → 无倒挂面;盘面静止后的下次登录屏障自然完成切换', async () => {
++    // 八审场景(30ms deadline):v1 卡死跨 deadline + 等待期 v2。fail-closed 语义
++    // (authSlice.worldSwitch ③b 钉接线):timed-out → 不 setUid——之后解卡的写落
++    // raw = **匿名世界自己的合法终态**,不存在被 U 认领规则排除的孤儿;下次启动
++    // fetchMe 仍返回 U,同一屏障在静止盘面上 settled 后切换自然完成,无需新机制。
++    let releaseV1: (() => void) | undefined
++    const v1Gate = new Promise<void>((resolve) => {
++      releaseV1 = resolve
++    })
++    let gateArmed = true // 只卡 v1;解卡后的写走真实速度
++    const storage = createDebouncedCompactPersistStorage<Slice>({
++      resolveTarget: (name) => {
++        const real = createIdbFrozenTarget(name)
++        return {
++          ...real,
++          write: async (serialized) => {
++            if (gateArmed) {
++              gateArmed = false
++              await v1Gate
++            }
++            await real.write(serialized)
++          },
++        }
++      },
++      readCurrent: (name) => idbStateStorage.getItem(name),
++      compactAtFlush: (s) => s,
++      skipLifecycleListeners: true,
++      barrierTimeoutMs: 30,
++    })
++    storage.setItem(NAME, value('v1'))
++    const barrierPromise = flushPersistBarrierForUserSwitch('first-login') // v1 启动即卡死
++    await new Promise((resolve) => setTimeout(resolve, 5))
++    storage.setItem(NAME, value('v2')) // 等待期还在编辑
++    const { status } = await barrierPromise
++    expect(status).toBe('timed-out') // 状态上抛 → auth fail-closed,uid 保持 anonymous
++
++    // 稍后卡死写解卡:落的仍是入队时冻结的 raw 键 = 匿名世界合法终态(未切号,
++    // 没有任何认领规则会把它排除成孤儿)
++    releaseV1?.()
++    await waitForIdb(
++      () => rawIdbStorage.getItem(NAME),
++      (v) => v != null,
++    )
++    expect(await rawIdbStorage.getItem(`${NAME}:user-u`)).toBeNull() // U 命名空间未被建键
++
++    // 「下次启动自然重试」:盘面已静止,同一屏障 settled(把 v2 等剩余存量也冲净)
++    const retry = await flushPersistBarrierForUserSwitch('first-login')
++    expect(retry.status).toBe('settled')
++    setPersistUserId('user-u')
++    const uRead = await storage.getItem(NAME) // FX-6 认领:拿到完整最终态
++    expect((uRead?.state as Slice).canvases.c1.title).toBe('v2')
++    expect(await rawIdbStorage.getItem(NAME)).toBeNull() // raw 已认领,无孤儿
++    expect(await rawIdbStorage.getItem(`${NAME}:user-u`)).toContain('v2')
++  })
++
++  it('F8/F3 迟到写补删(真实 IDB 双闸):先证写真实提交且键非空,放行补删后终态 null', async () => {
++    // 双闸(六审 F3 反假绿):writeCommitted 闸——断言物理键**非空**证明迟到写
++    // 确实出现在盘上;removeAllowed 闸——补删被挡住直到上述断言完成,不给
++    // 「键从未被写过 → null 假绿」留门。
++    let releaseGate: (() => void) | undefined
++    const gate = new Promise<void>((resolve) => {
++      releaseGate = resolve
++    })
++    let signalCommitted: (() => void) | undefined
++    const committed = new Promise<void>((resolve) => {
++      signalCommitted = resolve
++    })
++    let allowRemove: (() => void) | undefined
++    const removeAllowed = new Promise<void>((resolve) => {
++      allowRemove = resolve
++    })
++    setPersistUserId('user-a')
++    const storage = createDebouncedCompactPersistStorage<Slice>({
++      resolveTarget: (name) => {
++        const real = createIdbFrozenTarget(name)
++        return {
++          ...real,
++          write: async (serialized) => {
++            await gate // 卡到 logout 屏障超时之后
++            await real.write(serialized) // 真实 IDB 提交(迟到落定)
++            signalCommitted?.()
++          },
++          removeStrict: async () => {
++            await removeAllowed // 挡住补删,先让测试断言「写确实出现在盘上」
++            await real.removeStrict()
++          },
++        }
++      },
++      readCurrent: (name) => idbStateStorage.getItem(name),
++      compactAtFlush: (s) => s,
++      skipLifecycleListeners: true,
++      barrierTimeoutMs: 50, // 测试注入短屏障(生产 5s)
++    })
++    storage.setItem(NAME, value('resurrect-attempt')) // 冻结 A 键
++    void storage.flushAndSettle('t1') // 写已启动,卡在 gate
++    await new Promise((resolve) => setTimeout(resolve, 5))
++
++    await discardPersistWritesForLogout() // 屏障 50ms 超时 → 推进 + arm 补删
++    releaseGate?.() // 迟到写此刻才真实提交进 IDB
++    await committed
++    const onDisk = await rawIdbStorage.getItem(`${NAME}:user-a`)
++    expect(onDisk).not.toBeNull() // 闸 1:写被证明真实出现过(补删仍被挡)
++    expect(onDisk!).toContain('resurrect-attempt')
++
++    allowRemove?.() // 闸 2:放行补删
++    await waitForIdb(
++      () => rawIdbStorage.getItem(`${NAME}:user-a`),
++      (v) => v == null,
++    )
++    expect(await rawIdbStorage.getItem(`${NAME}:user-a`)).toBeNull() // 终态:已清数据未被复活
++    expect(debugLogger.error).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('补删'))
++  })
++
++  it('F4 补删失败(真实 adapter):strict 删除在 IDB 层失败 → 补删失败 error 落账 + 残留可观测', async () => {
++    let releaseGate: (() => void) | undefined
++    const gate = new Promise<void>((resolve) => {
++      releaseGate = resolve
++    })
++    let signalCommitted: (() => void) | undefined
++    const committed = new Promise<void>((resolve) => {
++      signalCommitted = resolve
++    })
++    let allowRemove: (() => void) | undefined
++    const removeAllowed = new Promise<void>((resolve) => {
++      allowRemove = resolve
++    })
++    setPersistUserId('user-a')
++    const storage = createDebouncedCompactPersistStorage<Slice>({
++      resolveTarget: (name) => {
++        const real = createIdbFrozenTarget(name)
++        return {
++          ...real,
++          write: async (serialized) => {
++            await gate
++            await real.write(serialized)
++            signalCommitted?.()
++          },
++          removeStrict: async () => {
++            await removeAllowed
++            await real.removeStrict() // 真实 strict 原语——下面在 IDB 层打断它
++          },
++        }
++      },
++      readCurrent: (name) => idbStateStorage.getItem(name),
++      compactAtFlush: (s) => s,
++      skipLifecycleListeners: true,
++      barrierTimeoutMs: 50,
++    })
++    storage.setItem(NAME, value('sticky-residue'))
++    void storage.flushAndSettle('t1')
++    await new Promise((resolve) => setTimeout(resolve, 5))
++    await discardPersistWritesForLogout()
++    releaseGate?.()
++    await committed
++    expect(await rawIdbStorage.getItem(`${NAME}:user-a`)).not.toBeNull()
++
++    // IDB 层打断删除(fake-indexeddb 原型):strict 原语 propagate → 调度器补删失败 error
++    const deleteSpy = vi
++      .spyOn(IDBObjectStore.prototype, 'delete')
++      .mockImplementation(() => {
++        throw new Error('delete blocked (quota lockdown)')
++      })
++    allowRemove?.()
++    await waitForIdb(
++      () =>
++        (debugLogger.error as ReturnType<typeof vi.fn>).mock.calls.some(
++          ([source, message]) => source === 'Persist Debounce' && String(message).includes('补删失败'),
++        ),
++      (v) => v === true,
++    )
++    deleteSpy.mockRestore()
++    expect(debugLogger.error).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('补删失败'))
++    expect(debugLogger.error).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('delete blocked'))
++    // 残留可观测:补删失败 = 已清数据仍在盘上(这正是必须 error 留痕的原因)
++    expect(await rawIdbStorage.getItem(`${NAME}:user-a`)).toContain('sticky-residue')
++  })
++})
+diff --git a/src/store/canvasPersistWriteScheduler.test.ts b/src/store/canvasPersistWriteScheduler.test.ts
+new file mode 100644
+index 00000000..3689a79f
+--- /dev/null
++++ b/src/store/canvasPersistWriteScheduler.test.ts
+@@ -0,0 +1,483 @@
++// @vitest-environment happy-dom
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { createJSONStorage, type StateStorage } from 'zustand/middleware'
++
++// #505 写防抖的可观测锚(lead 验收口径):连发 N 次 setItem 只落 1 次底层写;
++// 关页前强制 flush 有测试锚定(S01/S02 假成功前科,不允许"看起来写了")。
++//
++// 架构锚(入队冻结物理目标):setItem 入队时同步冻结 {物理键, state 引用},
++// flush 只把冻结内容写到冻结地址——账号切换后迟到启动的写**落旧键**(合法的
++// 旧世界终态),不丢、不 gate、不报警;跨 UID 读不可见是「键不同查不到」的
++// 结构性质。logout 是唯一吸收态(丢 pending + 有界屏障 + 迟到写按冻结键补删)。
++
++const debugLogger = { log: vi.fn(), warn: vi.fn(), error: vi.fn() }
++vi.mock('./debugLogStore', () => ({ debugLogger }))
++
++const { setPersistUserId, __resetPersistUserId, namespacedKey } = await import('../lib/persistUserId')
++const {
++  createDebouncedCompactPersistStorage,
++  CANVAS_PERSIST_DEBOUNCE_MS,
++  discardPersistWritesForLogout,
++  flushPersistBarrierForUserSwitch,
++  __clearDebouncedPersistInstancesForTests,
++} = await import('./canvasPersistWriteScheduler')
++
++type Slice = { canvases: Record<string, { title: string }>; activeTool?: string }
++
++const NAME = 'mivo-canvas-demo'
++
++/** 冻结目标测试后端:resolveTarget 在调用时刻解析 namespacedKey 并冻结进闭包
++ *  (与生产 createIdbFrozenTarget 同构),写/删按物理键记账。 */
++const makeBackend = () => {
++  const data = new Map<string, string>()
++  const backend = {
++    data,
++    /** [物理键, 值] 记账(写落定时 push,便于断言"落到了哪个键")。 */
++    writeCalls: [] as Array<[string, string]>,
++    removeCalls: [] as string[],
++    /** 注入:替换下一次/全部写的实现(卡死/慢写/失败注入)。 */
++    writeImpl: [] as Array<(key: string, value: string) => Promise<void>>,
++    removeImpl: undefined as undefined | ((key: string) => Promise<void>),
++    /** 注入:strict 补删失败(F4——普通 remove 与补删 strict 是两条原语)。 */
++    removeStrictImpl: undefined as undefined | ((key: string) => Promise<void>),
++    resolveTarget: (name: string) => {
++      const frozenKey = namespacedKey(name)
++      const doRemove = async () => {
++        backend.removeCalls.push(frozenKey)
++        data.delete(frozenKey)
++      }
++      return {
++        key: frozenKey,
++        write: async (value: string) => {
++          const impl = backend.writeImpl.shift()
++          if (impl) return impl(frozenKey, value)
++          backend.writeCalls.push([frozenKey, value])
++          data.set(frozenKey, value)
++        },
++        remove: async () => {
++          if (backend.removeImpl) return backend.removeImpl(frozenKey)
++          return doRemove()
++        },
++        removeStrict: async () => {
++          if (backend.removeStrictImpl) return backend.removeStrictImpl(frozenKey)
++          return doRemove()
++        },
++      }
++    },
++    readCurrent: async (name: string) => data.get(namespacedKey(name)) ?? null,
++  }
++  return backend
++}
++
++const makeStorage = (backend: ReturnType<typeof makeBackend>, extra?: { skipLifecycleListeners?: boolean; barrierTimeoutMs?: number }) =>
++  createDebouncedCompactPersistStorage<Slice>({
++    resolveTarget: backend.resolveTarget,
++    readCurrent: backend.readCurrent,
++    compactAtFlush: (s) => s,
++    ...extra,
++  })
++
++const storageValue = (tool: string, title = 'T') => ({
++  state: { canvases: { c1: { title } }, activeTool: tool } as Slice,
++  version: 12,
++})
++
++const microtasks = async (ticks = 10) => {
++  for (let tick = 0; tick < ticks; tick += 1) await Promise.resolve()
++}
++
++describe('createDebouncedCompactPersistStorage — #505 写防抖(冻结物理目标)', () => {
++  beforeEach(() => {
++    __resetPersistUserId()
++    __clearDebouncedPersistInstancesForTests()
++    vi.useFakeTimers()
++    debugLogger.log.mockClear()
++    debugLogger.warn.mockClear()
++    debugLogger.error.mockClear()
++  })
++  afterEach(() => {
++    vi.useRealTimers()
++  })
++
++  it('可观测锚:连发 60 次 setItem(模拟拖拽逐帧),防抖窗内零底层写,到期恰 1 次写且是最后一帧', async () => {
++    const backend = makeBackend()
++    const compactAtFlush = vi.fn((s: Slice) => s)
++    const storage = createDebouncedCompactPersistStorage<Slice>({
++      resolveTarget: backend.resolveTarget,
++      readCurrent: backend.readCurrent,
++      compactAtFlush,
++      skipLifecycleListeners: true,
++    })
++
++    for (let frame = 0; frame < 60; frame += 1) {
++      storage.setItem(NAME, storageValue(`tool-${frame}`))
++      vi.advanceTimersByTime(16) // 60fps 帧间隔 < 防抖窗,持续重置
++    }
++    expect(backend.writeCalls).toHaveLength(0) // 拖拽期间零 persist 写
++    expect(compactAtFlush).not.toHaveBeenCalled() // compact 也不在热路径上
++
++    vi.advanceTimersByTime(CANVAS_PERSIST_DEBOUNCE_MS)
++    await storage.flushAndSettle('drain')
++    expect(backend.writeCalls).toHaveLength(1) // 停手后一次写
++    expect(compactAtFlush).toHaveBeenCalledTimes(1)
++    const [, written] = backend.writeCalls[0]
++    expect((JSON.parse(written) as { state: Slice }).state.activeTool).toBe('tool-59') // 落的是最后一帧
++  })
++
++  it('envelope 与被替换的 createJSONStorage 逐字节等价({ state, version } 键序/无空白)', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    const referenceCalls: string[] = []
++    const referenceData = new Map<string, string>()
++    const reference: StateStorage = {
++      getItem: async (name) => referenceData.get(name) ?? null,
++      setItem: async (name, value) => {
++        referenceCalls.push(value)
++        referenceData.set(name, value)
++      },
++      removeItem: async () => undefined,
++    }
++    const jsonStorage = createJSONStorage<Slice>(() => reference)!
++
++    const value = storageValue('select')
++    storage.setItem('k', value)
++    await storage.flushAndSettle('test')
++    await jsonStorage.setItem('k', value)
++
++    expect(backend.writeCalls[0][1]).toBe(referenceCalls[0])
++    // getItem 语义同样等价(JSON.parse 无 reviver;null 透传)
++    expect(await storage.getItem('k')).toEqual(await jsonStorage.getItem('k'))
++    expect(await storage.getItem('missing')).toBeNull()
++  })
++
++  it('关页兜底:pagehide 强制 flush 暂存写(真实事件,非手动调 flush)', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend)
++    storage.setItem(NAME, storageValue('brush'))
++    expect(backend.writeCalls).toHaveLength(0)
++
++    window.dispatchEvent(new Event('pagehide'))
++    await storage.flushAndSettle('drain')
++    expect(backend.writeCalls).toHaveLength(1)
++    expect(debugLogger.log).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('pagehide'))
++  })
++
++  it('切后台兜底:visibilitychange→hidden 强制 flush;可见态切换不触发', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend)
++    storage.setItem(NAME, storageValue('hand'))
++
++    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
++    document.dispatchEvent(new Event('visibilitychange'))
++    await Promise.resolve()
++    expect(backend.writeCalls).toHaveLength(0) // 回到可见不冲刷
++
++    Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
++    document.dispatchEvent(new Event('visibilitychange'))
++    await storage.flushAndSettle('drain')
++    expect(backend.writeCalls).toHaveLength(1)
++  })
++
++  it('真落盘验证(反假成功):flush 后 backend 可读回同一 blob,而不是只看调用发生', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    storage.setItem(NAME, storageValue('select', 'Saved'))
++    expect(await storage.flushAndSettle('test')).toBe('settled') // 正常路径返回 settled
++    const readBack = await storage.getItem(NAME)
++    expect((readBack?.state as Slice).canvases.c1.title).toBe('Saved')
++  })
++
++  it('flush 失败不静默:底层写抛错 → debugLogger.error 记账(含冻结键)', async () => {
++    const backend = makeBackend()
++    backend.writeImpl.push(async () => {
++      throw new Error('quota boom')
++    })
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    storage.setItem(NAME, storageValue('select'))
++    await storage.flushAndSettle('test')
++    expect(debugLogger.error).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('quota boom'))
++    expect(debugLogger.error).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining(NAME))
++  })
++
++  it('冻结窗口(P1-3):旧写卡死时 pagehide 立即启动最新快照的独立写,不排队等待', async () => {
++    // lifecycle 语义:不 await 任何 flush promise——浏览器不会等你;断言依据是
++    // 底层写已被以最新 payload 启动(= 最新快照已进入可独立提交的底层事务)。
++    const backend = makeBackend()
++    let stuckObserved = false
++    backend.writeImpl.push(
++      () =>
++        new Promise<void>(() => {
++          stuckObserved = true // 永不 resolve:模拟卡死的旧 IDB 写
++        }),
++    )
++    const storage = makeStorage(backend)
++
++    storage.setItem(NAME, storageValue('older'))
++    void storage.flushAndSettle('t1') // 旧写启动后卡死
++    await microtasks()
++    expect(stuckObserved).toBe(true)
++
++    storage.setItem(NAME, storageValue('newest'))
++    window.dispatchEvent(new Event('pagehide')) // 不 await——只看写是否已启动
++    await microtasks()
++
++    expect(backend.writeCalls).toHaveLength(1) // 最新写已独立落定,没有排在卡死写后面
++    expect((JSON.parse(backend.writeCalls[0][1]) as { state: Slice }).state.activeTool).toBe('newest')
++  })
++
++  it('代际顺序(P1-3):同键两次 flush 的底层写按提交顺序启动(创建序 = epoch 序)', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    storage.setItem('k', storageValue('older'))
++    const first = storage.flushAndSettle('t1')
++    storage.setItem('k', storageValue('newer'))
++    const second = storage.flushAndSettle('t2')
++    await first
++    await second
++    const tools = backend.writeCalls.map(([, v]) => (JSON.parse(v) as { state: Slice }).state.activeTool)
++    expect(tools).toEqual(['older', 'newer']) // 启动序即代际序;同连接 IDB 事务按创建序提交
++  })
++
++  it('冻结物理目标(核心):防抖窗内切换账号 → 迟到启动的写落**旧冻结键**,不丢、不报警、不污染新键', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend)
++    setPersistUserId('user-a')
++    storage.setItem(NAME, storageValue('a-edit')) // 入队时冻结 A 的物理键
++    setPersistUserId('user-b') // 防抖窗口内切换(uid 漂移)
++    window.dispatchEvent(new Event('pagehide'))
++    await storage.flushAndSettle('drain')
++    // 写照常发生——但落的是入队时刻冻结的 A 键(旧世界的合法终态),B 键零写入
++    expect(backend.writeCalls).toHaveLength(1)
++    expect(backend.writeCalls[0][0]).toBe(`${NAME}:user-a`)
++    expect(backend.data.has(`${NAME}:user-b`)).toBe(false)
++    expect(debugLogger.error).not.toHaveBeenCalled() // 合法路径,无需报警
++  })
++
++  it('跨 UID 读不可见(结构性质):旧世界快照键 ≠ 当前世界键,getItem 查不到,落底层读', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    setPersistUserId('user-a')
++    storage.setItem(NAME, storageValue('select', 'A-private'))
++    setPersistUserId('user-b') // 未走屏障的 uid 漂移(对抗性)
++    const read = await storage.getItem(NAME) // 查 B 键快照 → 无;底层 B 键 → 无
++    expect(read).toBeNull()
++    setPersistUserId('user-a') // 回到 A 世界:A 键快照仍是 A 的最新真相
++    const readA = await storage.getItem(NAME)
++    expect((readA?.state as Slice).canvases.c1.title).toBe('A-private')
++  })
++
++  it('读线性化(P1-5/R2):getItem read-your-writes——pending 即最新真相,直接返回不等盘', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    storage.setItem(NAME, storageValue('select', 'Old'))
++    await storage.flushAndSettle('seed')
++    storage.setItem(NAME, storageValue('select', 'Newest')) // pending 未落盘
++    const read = await storage.getItem(NAME)
++    expect((read?.state as Slice).canvases.c1.title).toBe('Newest') // 从快照直读
++    // R2:读不消费 pending——落盘仍由防抖照常执行,读写职责分离
++    expect(storage.hasPendingWrite()).toBe(true)
++  })
++
++  it('读活性(finding3):卡死在途写 + 无 pending → getItem 从快照及时返回,不 await 在途', async () => {
++    const backend = makeBackend()
++    backend.writeImpl.push(() => new Promise<void>(() => {})) // 永不 resolve
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    storage.setItem(NAME, storageValue('select', 'InFlight'))
++    void storage.flushAndSettle('t1') // 启动后卡死;pending 已清空
++    await microtasks()
++    expect(storage.hasPendingWrite()).toBe(false)
++
++    // 快照含「已启动 in-flight 的那份」——直接返回,不等那笔卡死的写
++    const read = await storage.getItem(NAME)
++    expect((read?.state as Slice).canvases.c1.title).toBe('InFlight')
++  })
++
++  it('读线性化:慢 A 在途 + 并发 setItem(B) + getItem → read-your-writes 直接返回 B,不等盘', async () => {
++    const backend = makeBackend()
++    let releaseA: () => void = () => {}
++    backend.writeImpl.push(
++      () =>
++        new Promise<void>((resolve) => {
++          releaseA = resolve // 慢 A 卡住
++        }),
++    )
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    storage.setItem(NAME, storageValue('select', 'A'))
++    void storage.flushAndSettle('t1') // A 在途卡死中
++    await microtasks()
++    storage.setItem(NAME, storageValue('select', 'B')) // 并发新真相
++
++    const read = await storage.getItem(NAME) // 不 release A——不等盘
++    expect((read?.state as Slice).canvases.c1.title).toBe('B')
++    releaseA()
++  })
++
++  it('removeItem 清掉同键暂存写(将删数据不再回写)、落 tombstone、透传删除', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    storage.setItem('k', storageValue('select'))
++    expect(storage.hasPendingWrite()).toBe(true)
++    await storage.removeItem('k')
++    expect(storage.hasPendingWrite()).toBe(false)
++    expect(backend.removeCalls).toEqual(['k'])
++    expect(await storage.getItem('k')).toBeNull() // tombstone:最新真相是删除
++    vi.advanceTimersByTime(CANVAS_PERSIST_DEBOUNCE_MS * 2)
++    await storage.flushAndSettle('drain')
++    expect(backend.writeCalls).toHaveLength(0)
++  })
++
++  it('账号切换屏障:flush 全部暂存进旧世界冻结键 + 等在途;屏障后 setItem 冻结新键照常收单(无间隙)', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    storage.setItem(NAME, storageValue('anon-edit')) // 匿名世界暂存(raw key)
++    expect((await flushPersistBarrierForUserSwitch('first-login')).status).toBe('settled')
++    expect(backend.writeCalls).toHaveLength(1)
++    expect(backend.writeCalls[0][0]).toBe(NAME) // 匿名存量冲进 raw key
++
++    setPersistUserId('user-u')
++    storage.setItem(NAME, storageValue('u-edit')) // 新世界写:冻结 u 键,立即收单
++    expect(storage.hasPendingWrite()).toBe(true) // 没有「世界间隙」概念
++    await storage.flushAndSettle('drain')
++    expect(backend.writeCalls[1][0]).toBe(`${NAME}:user-u`)
++  })
++
++  it('统一有界屏障:卡死在途写 → 屏障超时后照常推进,error 记账', async () => {
++    const backend = makeBackend()
++    backend.writeImpl.push(() => new Promise<void>(() => {})) // 永不 resolve
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    storage.setItem(NAME, storageValue('stuck'))
++    const barrier = storage.flushAndSettle('t1')
++    await vi.advanceTimersByTimeAsync(5000 + 100)
++    expect(await barrier).toBe('timed-out') // 超时状态上抛——auth 侧据此 fail-closed 不切号
++    expect(debugLogger.error).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('超时'))
++  })
++
++  it('logout 语义:discard 丢弃暂存并等在途写落定,此后 pagehide 零回写', async () => {
++    const backend = makeBackend()
++    let releaseSlow: () => void = () => {}
++    backend.writeImpl.push(
++      (key, value) =>
++        new Promise<void>((resolve) => {
++          releaseSlow = () => {
++            backend.writeCalls.push([key, value])
++            resolve()
++          }
++        }),
++    )
++    const storage = makeStorage(backend)
++    storage.setItem(NAME, storageValue('slow'))
++    void storage.flushAndSettle('t1') // 在途慢写
++    storage.setItem(NAME, storageValue('pending')) // 暂存写
++    await microtasks()
++
++    const discard = discardPersistWritesForLogout()
++    releaseSlow()
++    await discard
++    // 返回后:暂存写被弃、在途写已落定——此后 pagehide 也不会有任何回写
++    expect(storage.hasPendingWrite()).toBe(false)
++    window.dispatchEvent(new Event('pagehide'))
++    await storage.flushAndSettle('drain')
++    expect(backend.writeCalls).toHaveLength(1) // 只有那次在途慢写,pending 未复活
++  })
++
++  it('logout 吸收态:返回后任何 setItem/removeItem(后台任务迟到)都被丢弃 + error', async () => {
++    const backend = makeBackend()
++    const storage = makeStorage(backend)
++    await discardPersistWritesForLogout()
++
++    storage.setItem(NAME, storageValue('after-logout'))
++    expect(storage.hasPendingWrite()).toBe(false) // 「退出即弃」是永久性的
++    expect(debugLogger.error).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('logout 后丢弃 setItem'))
++    await storage.removeItem(NAME)
++    expect(backend.removeCalls).toHaveLength(0)
++    expect(debugLogger.error).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('logout 后丢弃 removeItem'))
++    window.dispatchEvent(new Event('pagehide'))
++    await storage.flushAndSettle('drain')
++    expect(backend.writeCalls).toHaveLength(0)
++  })
++
++  it('logout 有界屏障:卡死在途写 5s 超时后照常推进(隐私清理优先),error 记账', async () => {
++    const backend = makeBackend()
++    backend.writeImpl.push(() => new Promise<void>(() => {})) // 永不 resolve
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    storage.setItem(NAME, storageValue('stuck'))
++    void storage.flushAndSettle('t1')
++    await microtasks()
++
++    const logout = discardPersistWritesForLogout()
++    await vi.advanceTimersByTimeAsync(5000 + 100)
++    await logout // 不被卡死写阻塞
++    expect(debugLogger.error).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('超时'))
++  })
++
++  it('logout 迟到写补删:屏障超时后落定的写按**冻结键**补删(删的必然是原键),error 记账', async () => {
++    const backend = makeBackend()
++    let releaseLate: (() => void) | undefined
++    backend.writeImpl.push(
++      (key, value) =>
++        new Promise<void>((resolve) => {
++          releaseLate = () => {
++            backend.writeCalls.push([key, value])
++            backend.data.set(key, value)
++            resolve()
++          }
++        }),
++    )
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    setPersistUserId('user-a')
++    storage.setItem(NAME, storageValue('late')) // 冻结 A 键
++    void storage.flushAndSettle('t1') // 在途慢写
++    await microtasks()
++    setPersistUserId('user-b') // 落定前 uid 已漂移——补删仍必须删 A 键(冻结绑定)
++
++    const logout = discardPersistWritesForLogout()
++    await vi.advanceTimersByTimeAsync(5000 + 100) // 屏障超时推进
++    await logout
++    releaseLate?.() // 迟到写此刻才落定
++    await microtasks()
++    expect(backend.removeCalls).toEqual([`${NAME}:user-a`]) // 按冻结键补删,不是当前键
++    expect(backend.data.has(`${NAME}:user-a`)).toBe(false) // F3:终态断言——补删后数据不在
++    expect(debugLogger.error).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('补删'))
++  })
++
++  it('补删失败不静默:target.removeStrict 抛错(propagate 原语)→ 补删失败 error 留痕', async () => {
++    const backend = makeBackend()
++    let releaseLate: (() => void) | undefined
++    backend.writeImpl.push(
++      () =>
++        new Promise<void>((resolve) => {
++          releaseLate = resolve
++        }),
++    )
++    backend.removeStrictImpl = async () => {
++      throw new Error('remove boom')
++    }
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    storage.setItem(NAME, storageValue('late'))
++    void storage.flushAndSettle('t1')
++    await microtasks()
++
++    const logout = discardPersistWritesForLogout()
++    await vi.advanceTimersByTimeAsync(5000 + 100)
++    await logout
++    releaseLate?.()
++    await microtasks()
++    expect(debugLogger.error).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('补删失败'))
++    expect(debugLogger.error).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('remove boom'))
++  })
++
++  it('rehydrate 期间的迁移写回是一次普通冻结键写(无 gap/协议):setItem 永远照常收单', async () => {
++    // 冻结目标架构下没有「世界间隙」:zustand 迁移写回(middleware.js:424,setItem
++    // 先于完成回调)与任何其它写一样,入队冻结当前键、防抖落盘。
++    const backend = makeBackend()
++    const storage = makeStorage(backend, { skipLifecycleListeners: true })
++    await flushPersistBarrierForUserSwitch('first-login') // 屏障后……
++    setPersistUserId('user-u')
++    storage.setItem(NAME, storageValue('migration-writeback')) // ……rehydrate 中的写回
++    expect(storage.hasPendingWrite()).toBe(true)
++    await storage.flushAndSettle('drain')
++    expect(backend.writeCalls).toHaveLength(1)
++    expect(backend.writeCalls[0][0]).toBe(`${NAME}:user-u`)
++    expect((JSON.parse(backend.writeCalls[0][1]) as { state: Slice }).state.activeTool).toBe('migration-writeback')
++  })
++})
+diff --git a/src/store/canvasPersistWriteScheduler.ts b/src/store/canvasPersistWriteScheduler.ts
+new file mode 100644
+index 00000000..45c2f747
+--- /dev/null
++++ b/src/store/canvasPersistWriteScheduler.ts
+@@ -0,0 +1,358 @@
++// canvasPersistWriteScheduler — #505 持久化写防抖(P1-2 第一刀)。
++//
++// 此前 zustand persist 每次 store set()(含拖拽逐帧)都同步走
++// partialize → JSON.stringify(全库)→ IDB put,零防抖。本模块把 persist 的
++// storage 换成自定义 PersistStorage:setItem 只暂存最新 StorageValue(引用捕获,
++// store 不可变更新保证是当次一致快照),trailing debounce 到期才做
++// 「compact + stringify + 底层写」——重活全部移出编辑热路径。
++//
++// ── 架构:入队冻结物理目标(R5 终审裁定)──────────────────────────────────────
++// setItem **同步**解析并冻结写目标:{物理键(含 kernel 两域的已解析 key)、
++// 不可变 state 引用、写通道}。flush 的唯一职责 = 把冻结内容写到冻结地址
++// (compact + stringify 仍延迟到 flush,内容来自冻结的不可变引用,天然是入队
++// 时刻的世界)。账号切换后迟到启动的写只会落**旧物理键**——语义合法(那本来
++// 就是旧世界的最后状态),不需要任何 gate/激活协议/世界会话。此前各轮的
++// WorldSession / ticket / hydrating 缓冲 / page-ending 信号全部退役:陈旧写被
++// 改造为无害,而不是被验证与拒绝。
++//
++// - **pending / read-your-writes 快照都按冻结物理键索引**:getItem 查「当前世界
++//   物理键」的快照——跨 UID 不可见是结构性质(旧世界的 pending 键 ≠ 当前键,
++//   查不到),不再需要 uid 校验。remove 落 tombstone 读返回 null。快照含已启动
++//   in-flight 的那份,getItem 永不 await 在途写(活性)。
++// - **统一有界屏障**:flush 暂存 + 等在途合并为单一 barrier(默认 5s,超时
++//   error + 照常推进——隐私清理/跳转优先于卡死的写)。logout / A→B / 匿名首登
++//   三个调用点同一口径。
++// - **logout「退出即弃」**:同步丢全部 pending + 有界屏障 + 一次性置位吸收态
++//   (本页紧接 SSO redirect,此后 set/remove 丢弃 + error)。屏障(含超时)之后
++//   才落定的迟到写触发**按其冻结键**补删(删的必然是原键),补删失败 error 留痕。
++// - 代际顺序:per-物理键单调 epoch + IDB 同连接事务创建序(通过项,未动)。
++// - 关页兜底:visibilitychange→hidden 与 pagehide 双保险。失败绝不静默。
++//
++// getItem 的底层解析语义与被替换的 createJSONStorage 逐字节等价(JSON.parse 无
++// reviver,parse 错误照样上抛);envelope 键序同 zustand 原生 { state, version }。
++
++import type { StorageValue } from 'zustand/middleware'
++import { debugLogger } from './debugLogStore'
++
++const SOURCE = 'Persist Debounce'
++
++export const CANVAS_PERSIST_DEBOUNCE_MS = 800
++export const PERSIST_BARRIER_TIMEOUT_MS = 5000
++
++/** remove 的 tombstone:快照层记「最新真相是删除」,getItem 返回 null。 */
++const REMOVED = Symbol('persist-removed')
++
++/** 屏障结果:'timed-out' = 有在途写卡死跨过 deadline(error 已落账)。auth 侧
++ *  据此改变后续路径——anonymous→uid 超时必须 **fail-closed 不切号**(页内 FX-6
++ *  认领不能在「卡死写可能随时解卡落 raw」的盘面上做,否则认领后解卡的写成永久
++ *  raw 孤儿;不切号则解卡写落 raw = 匿名世界合法终态,下次启动自然重试)。 */
++export type PersistBarrierOutcome = 'settled' | 'timed-out'
++
++/** 入队时刻同步冻结的物理写目标。key 是冻结的物理键身份(legacy 单 blob:
++ *  namespaced key;kernel split:documentKey)——pending/快照索引与迟到补删都
++ *  锚定它;write/remove 闭包捕获**已解析**的物理键,不得再读任何可变全局。 */
++export type FrozenPersistTarget = {
++  key: string
++  write: (serialized: string) => Promise<void>
++  remove: () => Promise<void>
++  /** logout 迟到写补删专用:失败必须 **propagate**(普通 remove 维持底层
++   *  warn-不抛的旧语义,补删失败吞掉会让「已清数据残留」无痕)。 */
++  removeStrict: () => Promise<void>
++}
++
++type DebouncedPersistStorage<S> = {
++  getItem: (name: string) => Promise<StorageValue<S> | null>
++  setItem: (name: string, value: StorageValue<S>) => void
++  removeItem: (name: string) => Promise<void>
++  /** 统一有界屏障:冲刷全部暂存写 + 等在途落定(默认 5s,超时 error+推进并返回
++   *  'timed-out',调用方据此决定后续路径)。 */
++  flushAndSettle: (reason: string, timeoutMs?: number) => Promise<PersistBarrierOutcome>
++  /** 测试观测:是否有暂存未落盘的写。 */
++  hasPendingWrite: () => boolean
++  /** logout 专用:丢弃全部暂存 + 有界屏障 + 吸收态置位 + arm 迟到写补删。 */
++  __discardAndSettleForLogout: () => Promise<PersistBarrierOutcome>
++  /** 测试专用:清空暂存与 read-your-writes 快照(替代旧架构里「终结会话」的
++   *  测试隔离作用——生产无世界终结概念,快照与磁盘一样是会话内持久事实)。 */
++  __resetForTests: () => void
++}
++
++// 注册表:authSlice 经下面两个出口驱动屏障。本模块只依赖 debugLogStore,
++// authSlice 可安全 import(无环)。
++const instances = new Set<DebouncedPersistStorage<unknown>>()
++
++/** 账号切换屏障(A→B 与 anonymous→uid 同一口径):冲刷全部暂存写进**当前
++ *  (旧)世界的冻结键** + 有界等在途。在 setPersistUserId 之前 await。返回聚合
++ *  状态:任一实例超时 → 'timed-out'——anonymous→uid 据此 fail-closed 不切号
++ *  (页内认领不能面对「卡死写可能解卡落 raw」的活动盘面);settled 时切换后
++ *  新入队的写落新键、旧冻结键已静止。 */
++export const flushPersistBarrierForUserSwitch = async (
++  reason: string,
++): Promise<{ status: PersistBarrierOutcome }> => {
++  let status: PersistBarrierOutcome = 'settled'
++  for (const instance of instances) {
++    if ((await instance.flushAndSettle(reason)) === 'timed-out') status = 'timed-out'
++  }
++  return { status }
++}
++
++/** logout 屏障:「退出即弃」——丢弃暂存、有界等在途、置吸收态。返回后不存在
++ *  还能写回旧命名空间的正常通道;超时未决的迟到写落定时按其冻结键补删。返回
++ *  聚合状态供调用方日志口径(隐私清理无论 settled/timed-out 都照常推进)。 */
++export const discardPersistWritesForLogout = async (): Promise<{ status: PersistBarrierOutcome }> => {
++  let status: PersistBarrierOutcome = 'settled'
++  for (const instance of instances) {
++    if ((await instance.__discardAndSettleForLogout()) === 'timed-out') status = 'timed-out'
++  }
++  return { status }
++}
++
++/** 测试专用:清空实例注册表——跨测试残留的卡死实例会让注册表屏障永久等待。 */
++export const __clearDebouncedPersistInstancesForTests = (): void => {
++  instances.clear()
++}
++
++export const createDebouncedCompactPersistStorage = <S>(options: {
++  /** 同步解析**当前世界**的冻结物理写目标(legacy: namespaced 单 key /
++   *  kernel=new: document+session 两域原子写)。setItem/removeItem 入队时调用
++   *  一次并冻结返回值;getItem 每次调用以取「当前世界物理键」做快照索引。 */
++  resolveTarget: (name: string) => FrozenPersistTarget
++  /** 当前世界的底层读(快照未命中时走它;含各 adapter 的迁移/回退语义)。 */
++  readCurrent: (name: string) => Promise<string | null>
++  /** flush 时对暂存 state 做的压缩(compactCanvasesForPersist 等);输出进 JSON.stringify。 */
++  compactAtFlush: (state: S) => S
++  debounceMs?: number
++  /** 屏障超时(默认 5s);测试注入短超时以真实计时器验证超时路径。 */
++  barrierTimeoutMs?: number
++  /** 测试注入:跳过 window/document 生命周期监听注册。 */
++  skipLifecycleListeners?: boolean
++}): DebouncedPersistStorage<S> => {
++  const {
++    resolveTarget,
++    readCurrent,
++    compactAtFlush,
++    debounceMs = CANVAS_PERSIST_DEBOUNCE_MS,
++    barrierTimeoutMs = PERSIST_BARRIER_TIMEOUT_MS,
++  } = options
++
++  // pending / 快照 / epoch 全部按冻结物理键索引(代际顺序是物理键的属性)。
++  type PendingJob = { target: FrozenPersistTarget; value: StorageValue<S>; timer: ReturnType<typeof setTimeout> }
++  const pendingByKey = new Map<string, PendingJob>()
++  // read-your-writes:per-键「最新已接受快照」——setItem 接受即更新,写启动后仍
++  // 保留(含 in-flight 那份),getItem 直读它,永不等在途写。remove 落 tombstone。
++  const latestByKey = new Map<string, StorageValue<S> | typeof REMOVED>()
++  const inflight = new Set<Promise<void>>()
++  const nextEpochByKey = new Map<string, number>()
++  const lastStartedEpochByKey = new Map<string, number>()
++  // logout 吸收态:一次性置位(本页紧接 SSO redirect)。置位后 set/remove 丢弃
++  // + error;屏障(含超时)后落定的迟到写按其冻结键补删。
++  let loggedOut = false
++  let lateWriteCleanupArmed = false
++
++  const claimEpoch = (key: string): number => {
++    const epoch = (nextEpochByKey.get(key) ?? 0) + 1
++    nextEpochByKey.set(key, epoch)
++    return epoch
++  }
++
++  /** epoch 守卫:比已启动者旧的 job 一律拒绝(代际顺序不变量;当前实现里
++   *  claim 与 start 同步发生,理论上不会触发——这是防未来改动的兜底)。 */
++  const startAllowed = (key: string, epoch: number): boolean => {
++    const last = lastStartedEpochByKey.get(key) ?? 0
++    if (epoch <= last) {
++      debugLogger.warn(SOURCE, `superseded job(epoch ${epoch} ≤ ${last})拒绝启动:${key}`)
++      return false
++    }
++    lastStartedEpochByKey.set(key, epoch)
++    return true
++  }
++
++  const serializeSnapshot = (value: StorageValue<S>): string =>
++    JSON.stringify({ state: compactAtFlush(value.state), version: value.version })
++
++  /** 追踪在途写。isWrite 的 job 在 logout 屏障(含超时)后才落定 → 按其**冻结键**
++   *  补删(删的必然是原键——目标在入队时就冻结了),补删自身失败 error 留痕。 */
++  const track = (target: FrozenPersistTarget, job: Promise<void>, isWrite: boolean): Promise<void> => {
++    inflight.add(job)
++    void job.finally(() => {
++      inflight.delete(job)
++      if (isWrite && lateWriteCleanupArmed) {
++        debugLogger.error(SOURCE, `迟到写在 logout 终局后落定,按冻结键补删 ${target.key} 防复活已清数据`)
++        void target.removeStrict().catch((error) => {
++          debugLogger.error(
++            SOURCE,
++            `迟到写补删失败(${target.key}),已清数据可能残留: ${error instanceof Error ? error.message : String(error)}`,
++          )
++        })
++      }
++    })
++    return job
++  }
++
++  /** 启动一笔冻结写:内容(compact+stringify)此刻才算,但来自冻结的不可变引用;
++   *  地址是入队时冻结的物理键。同键落盘顺序由同一 IDB 连接的事务创建序
++   *  (= 本处调用序 = epoch 序)保证,写启动即同步进入底层事务队列。 */
++  const startWrite = (target: FrozenPersistTarget, value: StorageValue<S>, reason: string): Promise<void> => {
++    if (!startAllowed(target.key, claimEpoch(target.key))) return Promise.resolve()
++    const write = (async () => {
++      try {
++        await target.write(serializeSnapshot(value))
++      } catch (error) {
++        // 失败不可静默:底层 adapter 已按各自路径记 quota/降级日志,这里兜住
++        // compact/stringify 或未预期的 adapter 异常,保证任何一次丢写都有痕迹。
++        debugLogger.error(
++          SOURCE,
++          `flush(${reason}) 落盘失败,本次状态未持久化(${target.key}): ${error instanceof Error ? error.message : String(error)}`,
++        )
++      }
++    })()
++    return track(target, write, true)
++  }
++
++  /** 冲刷全部暂存写(立即启动,返回这批写的落定 Promise)。 */
++  const flushAllPending = (reason: string): Promise<void> => {
++    const started: Promise<void>[] = []
++    for (const [key, job] of pendingByKey) {
++      clearTimeout(job.timer)
++      pendingByKey.delete(key)
++      started.push(startWrite(job.target, job.value, reason))
++    }
++    return Promise.all(started).then(() => undefined)
++  }
++
++  const boundedSettle = async (all: () => Promise<void>, timeoutMs: number): Promise<PersistBarrierOutcome> => {
++    let timedOut = false
++    let timer: ReturnType<typeof setTimeout> | undefined
++    const timeout = new Promise<void>((resolve) => {
++      timer = setTimeout(() => {
++        timedOut = true
++        resolve()
++      }, timeoutMs)
++    })
++    await Promise.race([all(), timeout])
++    if (timer !== undefined) clearTimeout(timer)
++    if (timedOut) {
++      debugLogger.error(SOURCE, `屏障等待在途写超时(${timeoutMs}ms),照常推进——隐私清理/跳转优先于卡死的写`)
++      return 'timed-out'
++    }
++    return 'settled'
++  }
++
++  const flushAndSettle = (reason: string, timeoutMs = barrierTimeoutMs): Promise<PersistBarrierOutcome> =>
++    // 排空到静止:每轮重查 pending **和** inflight,两者皆空才返回——屏障等待期
++    // 新入队的写(如首登屏障慢写期间用户继续编辑)也在本屏障内落定,否则它会在
++    // FX-6 认领读盘之后才 debounce 落盘,成为 raw 孤儿。整体仍在单一超时上限内。
++    boundedSettle(async () => {
++      while (pendingByKey.size > 0 || inflight.size > 0) {
++        await flushAllPending(reason)
++        while (inflight.size > 0) {
++          await Promise.all([...inflight])
++        }
++      }
++    }, timeoutMs)
++
++  const storage: DebouncedPersistStorage<S> = {
++    getItem: async (name) => {
++      // read-your-writes:查**当前世界物理键**的快照——旧世界的快照键 ≠ 当前键,
++      // 跨 UID 不可见是结构性质。快照命中经同一 compact+stringify 管线返回。
++      const currentKey = resolveTarget(name).key
++      const snapshot = latestByKey.get(currentKey)
++      if (snapshot === REMOVED) return null
++      if (snapshot !== undefined) {
++        return JSON.parse(serializeSnapshot(snapshot)) as StorageValue<S>
++      }
++      const raw = await readCurrent(name)
++      if (raw == null) return null
++      return JSON.parse(raw) as StorageValue<S>
++    },
++    setItem: (name, value) => {
++      if (loggedOut) {
++        debugLogger.error(SOURCE, `logout 后丢弃 setItem(本页已「退出即弃」,紧接 SSO 跳转):${name}`)
++        return
++      }
++      // 入队即冻结:物理键/通道此刻解析,state 引用不可变——此后无论 uid 怎么
++      // 变,这笔写只会落这个键。
++      const target = resolveTarget(name)
++      latestByKey.set(target.key, value)
++      const existing = pendingByKey.get(target.key)
++      if (existing) clearTimeout(existing.timer)
++      const timer = setTimeout(() => {
++        const job = pendingByKey.get(target.key)
++        pendingByKey.delete(target.key)
++        if (job) void startWrite(job.target, job.value, 'debounce')
++      }, debounceMs)
++      pendingByKey.set(target.key, { target, value, timer })
++    },
++    removeItem: async (name) => {
++      if (loggedOut) {
++        debugLogger.error(SOURCE, `logout 后丢弃 removeItem(权威清理走 clearCurrentUserCache 直连 adapter):${name}`)
++        return
++      }
++      // remove 线性化:清同键暂存、落 tombstone、占 epoch 后立即启动删除。已启动
++      // 的旧 set 事务在 IDB 里排在本 delete 前(终态=删除);未启动的旧 set 已被清。
++      const target = resolveTarget(name)
++      const existing = pendingByKey.get(target.key)
++      if (existing) {
++        clearTimeout(existing.timer)
++        pendingByKey.delete(target.key)
++      }
++      latestByKey.set(target.key, REMOVED)
++      if (!startAllowed(target.key, claimEpoch(target.key))) return
++      await track(
++        target,
++        (async () => {
++          try {
++            await target.remove()
++          } catch (error) {
++            debugLogger.error(SOURCE, `removeItem 落盘失败(${target.key}): ${error instanceof Error ? error.message : String(error)}`)
++          }
++        })(),
++        false,
++      )
++    },
++    flushAndSettle,
++    hasPendingWrite: () => pendingByKey.size > 0,
++    __discardAndSettleForLogout: async () => {
++      // 同步丢弃全部暂存 + 快照,置吸收态——先于一切 await,discard 之后不存在
++      // 还能进入正常写通道的 job。
++      loggedOut = true
++      for (const job of pendingByKey.values()) clearTimeout(job.timer)
++      pendingByKey.clear()
++      latestByKey.clear()
++      // 有界等在途;屏障(含超时)完成后 arm 迟到写补删——无论当下有没有在途写
++      // 都要 arm(卡死写可能在任意晚的时刻落定)。
++      const outcome = await boundedSettle(async () => {
++        while (inflight.size > 0) {
++          await Promise.all([...inflight])
++        }
++      }, barrierTimeoutMs)
++      lateWriteCleanupArmed = true
++      return outcome
++    },
++    __resetForTests: () => {
++      for (const job of pendingByKey.values()) clearTimeout(job.timer)
++      pendingByKey.clear()
++      latestByKey.clear()
++    },
++  }
++
++  if (!options.skipLifecycleListeners) {
++    // 关页/切后台兜底:hidden 与 pagehide 双保险(移动端 tab 冻结常只发其一)。
++    // 不 await——浏览器不会等你;写启动即同步进入可独立提交的底层事务。
++    const lifecycleFlush = (reason: string) => {
++      if (pendingByKey.size > 0) debugLogger.log(SOURCE, `flush on ${reason}(关页/切后台兜底)`)
++      void flushAllPending(reason)
++    }
++    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
++      document.addEventListener('visibilitychange', () => {
++        if (document.visibilityState !== 'hidden') return
++        lifecycleFlush('visibilitychange')
++      })
++    }
++    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
++      window.addEventListener('pagehide', () => lifecycleFlush('pagehide'))
++    }
++  }
++
++  instances.add(storage as DebouncedPersistStorage<unknown>)
++  return storage
++}
+diff --git a/src/store/canvasStore.contract.test.ts b/src/store/canvasStore.contract.test.ts
+index 5a36ca6b..4561f20b 100644
+--- a/src/store/canvasStore.contract.test.ts
++++ b/src/store/canvasStore.contract.test.ts
+@@ -178,9 +178,13 @@ describe('contract: canvas persist v10 shape (partialize field set)', () => {
+     }
+   })
+ 
+-  it('integration: setState persists exactly the partialized field set to localStorage', () => {
++  it('integration: setState persists exactly the partialized field set to localStorage', async () => {
+     // Trigger the persist setItem path by mutating state.
++    // #505:persist 写有 trailing debounce(拖拽期间零写),契约测试用显式 flush
++    // 锚落盘后再断言 blob 形状——形状契约不变,时序契约由 scheduler 测试钉住。
+     useCanvasStore.getState().setActiveTool('brush')
++    const { flushCanvasPersistWrite } = await import('./canvasPersistConfig')
++    await flushCanvasPersistWrite('contract-test')
+     const raw = (globalThis as { localStorage: { getItem: (k: string) => string | null } }).localStorage.getItem('mivo-canvas-demo')
+     expect(raw).not.toBeNull()
+     const parsed = JSON.parse(raw!) as { state: Record<string, unknown>; version: number }
+@@ -190,59 +194,8 @@ describe('contract: canvas persist v10 shape (partialize field set)', () => {
+     expect(parsed.state.activeTool).toBe('brush')
+   })
+ 
+-  it('hydration: a persisted v8 state is rehydrated into the store', async () => {
+-    const persisted = {
+-      state: { canvases: { 'character-flow': { title: 'Hydrated', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] } }, sceneId: 'character-flow', selectedNodeId: undefined, selectedNodeIds: [], activeTool: 'select', brushStyle: { color: '#000000', width: 8, kind: 'marker' }, activeStampKind: useCanvasStore.getState().activeStampKind },
+-      version: 8,
+-    }
+-    ;(globalThis as { localStorage: { setItem: (k: string, v: string) => void } }).localStorage.setItem('mivo-canvas-demo', JSON.stringify(persisted))
+-    await useCanvasStore.persist.rehydrate()
+-    expect(useCanvasStore.getState().canvases['character-flow']?.title).toBe('Hydrated')
+-    expect(useCanvasStore.getState().brushStyle).toEqual({ color: '#000000', width: 8, kind: 'marker' })
+-  })
+-
+-  it('hydration: settles expired canvas generation slots/tasks and syncs the active document', async () => {
+-    const slot = aiSlotNode({
+-      status: 'generating',
+-      generation: { prompt: 'p', model: 'gpt-image-2', taskId: 'task-1' },
+-      aiWorkflow: { kind: 'slot', status: 'generating', operation: 'slot-generation', prompt: 'p' },
+-    })
+-    const runningTask = task({ status: 'running', progress: 42, stage: 'poll' })
+-    const persisted = {
+-      state: {
+-        canvases: {
+-          'character-flow': {
+-            title: 'Hydrated',
+-            nodes: [slot],
+-            edges: [],
+-            tasks: [runningTask],
+-            selectedNodeId: undefined,
+-            selectedNodeIds: [],
+-          },
+-        },
+-        sceneId: 'character-flow',
+-        selectedNodeId: undefined,
+-        selectedNodeIds: [],
+-        activeTool: 'select',
+-        brushStyle: { color: '#000000', width: 8, kind: 'marker' },
+-        activeStampKind: useCanvasStore.getState().activeStampKind,
+-      },
+-      version: 8,
+-    }
+-    ;(globalThis as { localStorage: { setItem: (k: string, v: string) => void } }).localStorage.setItem('mivo-canvas-demo', JSON.stringify(persisted))
+-
+-    await useCanvasStore.persist.rehydrate()
+-
+-    const state = useCanvasStore.getState()
+-    const activeDoc = state.canvases['character-flow']
+-    expect(activeDoc.nodes[0].aiWorkflow?.status).toBe('failed')
+-    expect(activeDoc.nodes[0].status).toBe('failed')
+-    expect(activeDoc.nodes[0].generation?.taskId).toBe('task-1')
+-    expect(activeDoc.tasks[0].status).toBe('failed')
+-    expect(activeDoc.tasks[0].progress).toBe(42)
+-    expect(state.nodes[0].aiWorkflow?.status).toBe('failed')
+-    expect(state.tasks[0].status).toBe('failed')
+-  })
++  // hydration × 迁移写回契约(v8 rehydrate / settle + 盘上 version=12)拆至
++  // canvasStore.hydrationMigration.contract.test.ts(本文件贴 structure-guard 900 行上限)。
+ })
+ 
+ describe('contract: chat persist v2 shape', () => {
+diff --git a/src/store/canvasStore.hydrationMigration.contract.test.ts b/src/store/canvasStore.hydrationMigration.contract.test.ts
+new file mode 100644
+index 00000000..148e4291
+--- /dev/null
++++ b/src/store/canvasStore.hydrationMigration.contract.test.ts
+@@ -0,0 +1,151 @@
++import { describe, expect, it, vi, beforeEach } from 'vitest'
++
++// canvasStore 的 hydration/迁移写回契约——从 canvasStore.contract.test.ts 拆出
++// (#505:该文件贴 structure-guard 900 行上限,F8 的盘上 version=12 断言把它顶爆,
++// 按守卫指引拆分入库)。两条契约:
++// 1) v8 存量 blob 真实 rehydrate 进 store;zustand 迁移写回(v8→v12)在冻结目标
++//    架构下就是一次普通冻结键写,flush 后盘上 version 必须升到 12。
++// 2) 过期 generating slot/task 在 rehydrate 时 settle,且 settle 后的迁移写回同样
++//    真实落盘 version=12。
++//
++// harness 与母文件同源:node env 无 window,vi.hoisted 先装内存 localStorage,
++// zustand persist 才会挂 api.persist;demoImages/assetStorage/remoteDebugReporter
++// 三桩保持 hermetic。
++
++vi.hoisted(() => {
++  const store = new Map<string, string>()
++  const memStorage = {
++    get length() {
++      return store.size
++    },
++    clear: () => store.clear(),
++    getItem: (k: string) => store.get(k) ?? null,
++    key: (i: number) => [...store.keys()][i] ?? null,
++    removeItem: (k: string) => {
++      store.delete(k)
++    },
++    setItem: (k: string, v: string) => {
++      store.set(k, String(v))
++    },
++  }
++  const g = globalThis as Record<string, unknown>
++  if (g.window === undefined) g.window = { localStorage: memStorage }
++  if (g.localStorage === undefined) g.localStorage = memStorage
++})
++
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++vi.mock('../lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(),
++  saveImportedAsset: vi.fn(),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('./remoteDebugReporter', () => ({
++  reportRemoteDebugEntry: () => {},
++}))
++
++import { useCanvasStore } from './canvasStore'
++import type { CanvasTask, MivoCanvasNode } from '../types/mivoCanvas'
++
++const aiSlotNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++  id: 'slot-1',
++  type: 'ai-slot',
++  title: 'Slot',
++  x: 40,
++  y: 60,
++  width: 320,
++  height: 320,
++  status: 'ready',
++  ...overrides,
++})
++
++const task = (overrides: Partial<CanvasTask> = {}): CanvasTask => ({
++  id: 'task-1',
++  label: '生成到槽位:Slot',
++  status: 'done',
++  progress: 100,
++  nodeIds: [],
++  ...overrides,
++})
++
++const ls = () =>
++  (globalThis as unknown as { localStorage: { setItem: (k: string, v: string) => void; getItem: (k: string) => string | null; clear: () => void } }).localStorage
++
++beforeEach(() => {
++  ls().clear()
++  useCanvasStore.setState({ ...useCanvasStore.getInitialState() } as never, true)
++})
++
++describe('contract: canvas hydration × 迁移写回(v8→v12 真实落盘)', () => {
++  it('hydration: a persisted v8 state is rehydrated into the store', async () => {
++    const persisted = {
++      state: { canvases: { 'character-flow': { title: 'Hydrated', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] } }, sceneId: 'character-flow', selectedNodeId: undefined, selectedNodeIds: [], activeTool: 'select', brushStyle: { color: '#000000', width: 8, kind: 'marker' }, activeStampKind: useCanvasStore.getState().activeStampKind },
++      version: 8,
++    }
++    // #505(冻结目标架构):seed 底层前清 read-your-writes 快照(替代旧架构的
++    // 「终结会话」测试隔离作用——否则 getItem 会按语义正确地返回上个测试留下的
++    // 更新快照而非 seed),随后走**真实 rehydrate**;zustand 的迁移写回(v8→v12)
++    // 就是一次普通的冻结键写,照常防抖落盘。
++    const { __resetCanvasPersistStorageForTests, flushCanvasPersistWrite } = await import('./canvasPersistConfig')
++    __resetCanvasPersistStorageForTests()
++    ls().setItem('mivo-canvas-demo', JSON.stringify(persisted))
++    await useCanvasStore.persist.rehydrate()
++    expect(useCanvasStore.getState().canvases['character-flow']?.title).toBe('Hydrated')
++    expect(useCanvasStore.getState().brushStyle).toEqual({ color: '#000000', width: 8, kind: 'marker' })
++    // F7/F8:zustand 迁移写回(v8→v12)经真实新路径落盘——盘上 version 必须升到 12
++    await flushCanvasPersistWrite('migration-writeback-drain')
++    const writtenBack = ls().getItem('mivo-canvas-demo')
++    expect((JSON.parse(writtenBack!) as { version: number }).version).toBe(12)
++  })
++
++  it('hydration: settles expired canvas generation slots/tasks and syncs the active document', async () => {
++    const slot = aiSlotNode({
++      status: 'generating',
++      generation: { prompt: 'p', model: 'gpt-image-2', taskId: 'task-1' },
++      aiWorkflow: { kind: 'slot', status: 'generating', operation: 'slot-generation', prompt: 'p' },
++    })
++    const runningTask = task({ status: 'running', progress: 42, stage: 'poll' })
++    const persisted = {
++      state: {
++        canvases: {
++          'character-flow': {
++            title: 'Hydrated',
++            nodes: [slot],
++            edges: [],
++            tasks: [runningTask],
++            selectedNodeId: undefined,
++            selectedNodeIds: [],
++          },
++        },
++        sceneId: 'character-flow',
++        selectedNodeId: undefined,
++        selectedNodeIds: [],
++        activeTool: 'select',
++        brushStyle: { color: '#000000', width: 8, kind: 'marker' },
++        activeStampKind: useCanvasStore.getState().activeStampKind,
++      },
++      version: 8,
++    }
++    // #505(冻结目标架构):seed 前清 read-your-writes 快照(测试隔离,同上例)。
++    const { __resetCanvasPersistStorageForTests, flushCanvasPersistWrite } = await import('./canvasPersistConfig')
++    __resetCanvasPersistStorageForTests()
++    ls().setItem('mivo-canvas-demo', JSON.stringify(persisted))
++
++    await useCanvasStore.persist.rehydrate()
++
++    const state = useCanvasStore.getState()
++    const activeDoc = state.canvases['character-flow']
++    expect(activeDoc.nodes[0].aiWorkflow?.status).toBe('failed')
++    expect(activeDoc.nodes[0].status).toBe('failed')
++    expect(activeDoc.nodes[0].generation?.taskId).toBe('task-1')
++    expect(activeDoc.tasks[0].status).toBe('failed')
++    expect(activeDoc.tasks[0].progress).toBe(42)
++    expect(state.nodes[0].aiWorkflow?.status).toBe('failed')
++    expect(state.tasks[0].status).toBe('failed')
++    // F8(version=12 断言补齐):迁移写回(v8→v12)走真实新路径落盘
++    await flushCanvasPersistWrite('migration-writeback-drain')
++    const writtenBack = ls().getItem('mivo-canvas-demo')
++    expect((JSON.parse(writtenBack!) as { version: number }).version).toBe(12)
++  })
++})
+diff --git a/src/store/hydrationDurableSettle.test.ts b/src/store/hydrationDurableSettle.test.ts
+index f749fd12..8d2f384f 100644
+--- a/src/store/hydrationDurableSettle.test.ts
++++ b/src/store/hydrationDurableSettle.test.ts
+@@ -218,6 +218,10 @@ describe('SC-15 R2: hydration settle must durable-writeback to persist storage',
+   })
+ 
+   it('canvas: ai-slot generating → aiWorkflow.status=failed durable in storage after rehydrate', async () => {
++    // #505(冻结目标架构):seed 底层前清 read-your-writes 快照(测试隔离——
++    // 否则 getItem 会按语义正确地返回本进程早前测试留下的更新快照而非 seed)。
++    const { __resetCanvasPersistStorageForTests } = await import('./canvasPersistConfig')
++    __resetCanvasPersistStorageForTests()
+     const sceneId: CanvasId = 'character-flow'
+     seedCanvas({
+       sceneId,
+@@ -248,6 +252,11 @@ describe('SC-15 R2: hydration settle must durable-writeback to persist storage',
+       }
+     })
+     expect(settledRaw).not.toBeNull()
++    // F8(version=12 断言补齐):seed v11 → migrate 写回走真实新路径,盘上版本必须升到 12
++    const { flushCanvasPersistWrite } = await import('./canvasPersistConfig')
++    await flushCanvasPersistWrite('migration-writeback-drain')
++    const finalRaw = ls().getItem('mivo-canvas-demo')
++    expect((JSON.parse(finalRaw!) as { version: number }).version).toBe(12)
+   })
+ 
+   it('gate: no settle (already-settled state) → no writeback, blob unchanged', async () => {

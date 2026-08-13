@@ -1,0 +1,3134 @@
+diff --git a/cindyplugin/src/__tests__/pluginKernelDegradation.test.ts b/cindyplugin/src/__tests__/pluginKernelDegradation.test.ts
+index ced1b416..a37968a8 100644
+--- a/cindyplugin/src/__tests__/pluginKernelDegradation.test.ts
++++ b/cindyplugin/src/__tests__/pluginKernelDegradation.test.ts
+@@ -45,7 +45,7 @@ describe('插件链 kernel=new + 无 IDB:启动降级后编辑落 legacy 单 blo
+     expect(raw).not.toBeNull()
+     const parsed = JSON.parse(raw!) as { state: { activeTool?: string }; version: number }
+     expect(parsed.state.activeTool).toBe('brush')
+-    expect(parsed.version).toBe(12)
++    expect(parsed.version).toBe(13)
+     expect(localStorage.getItem(`${NAME}:document`)).toBeNull() // 零 split-domain 键
+     expect(localStorage.getItem(`${NAME}:session`)).toBeNull()
+ 
+@@ -55,6 +55,6 @@ describe('插件链 kernel=new + 无 IDB:启动降级后编辑落 legacy 单 blo
+     const readBack = (await opts.storage!.getItem(NAME)) as { state: { activeTool?: string }; version: number } | null
+     expect(readBack).not.toBeNull()
+     expect(readBack!.state.activeTool).toBe('brush')
+-    expect(readBack!.version).toBe(12)
++    expect(readBack!.version).toBe(13)
+   })
+ })
+diff --git a/public/changelog.json b/public/changelog.json
+index 6e6c8214..cb599b29 100644
+--- a/public/changelog.json
++++ b/public/changelog.json
+@@ -1,13 +1,19 @@
+ {
+-  "lastGithash": "be1db9225417c2bfc52e0f0ae2eb3cb0828a880f",
+-  "updatedAt": "2026-08-06T08:41:46+08:00",
++  "lastGithash": "8718ed2e2d9c25efacceccaaa2d6eec69149b6a9",
++  "updatedAt": "2026-08-06T09:24:34+08:00",
+   "entries": [
+     {
+       "date": "2026-08-06",
+       "prs": [
+-        535
++        535,
++        532
++      ],
++      "features": [
++        {
++          "text": "编辑大画布更顺滑:画布内容改为空闲时才写入本地存储(拖拽过程零写盘),且只保存有改动的画布;退出登录、切换账号时的数据落盘也更稳,关页前会确保内容已保存。",
++          "by": "kirozeng"
++        }
+       ],
+-      "features": [],
+       "fixes": [
+         {
+           "text": "AI 助手读取画布的方式更高效：优先按所选区域读取，避免无谓的整板扫描，大画布场景下响应更快、消耗更低。",
+@@ -1966,4 +1972,4 @@
+       ]
+     }
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/src/canvas/CanvasNodeView.demoAsset.test.tsx b/src/canvas/CanvasNodeView.demoAsset.test.tsx
+new file mode 100644
+index 00000000..2e3ab1bb
+--- /dev/null
++++ b/src/canvas/CanvasNodeView.demoAsset.test.tsx
+@@ -0,0 +1,89 @@
++// @vitest-environment happy-dom
++import { act } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #506 显示验收:stress-test 场景节点换成 mivo-demo: 引用后,进入场景图片必须
++// 正常显示。真实链路:demoScenes 场景节点 → CanvasNodeView → useResolvedAssetUrl
++// → assetUrlLease → assetStorage.resolveAssetUrl(demo 分支惰性绘制)→ <img src=blob:>。
++// happy-dom 无 2d:stub canvas 提供最小可绘面;dom 渲染器下断言(leafer 侧走同一
++// acquireAssetUrl 缝,lease 生命周期契约见 assetUrlLease.demoAsset.test)。
++
++vi.mock('../render/rendererMode', () => ({ rendererMode: 'dom' }))
++
++const { snapshotFromScene } = await import('../store/demoScenes')
++const { CanvasNodeView } = await import('./CanvasNodeView')
++type CanvasNodeViewProps = import('./CanvasNodeView').CanvasNodeViewProps
++
++const makeFake2dCtx = () => {
++  const noop = () => undefined
++  return {
++    save: noop, restore: noop, translate: noop, beginPath: noop, closePath: noop,
++    moveTo: noop, lineTo: noop, arc: noop, arcTo: noop, ellipse: noop,
++    fill: noop, stroke: noop, fillRect: noop, fillText: noop, putImageData: noop,
++    getImageData: () => ({ data: new Uint8ClampedArray(320 * 420 * 4) }),
++    createLinearGradient: () => ({ addColorStop: noop }),
++    set fillStyle(_v: unknown) {}, set strokeStyle(_v: unknown) {},
++    set lineWidth(_v: unknown) {}, set globalAlpha(_v: unknown) {}, set font(_v: unknown) {},
++  } as unknown as CanvasRenderingContext2D
++}
++
++let container: HTMLDivElement
++let root: Root
++
++describe('CanvasNodeView × mivo-demo: 引用(#506 显示验收)', () => {
++  beforeEach(() => {
++    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation((() => makeFake2dCtx()) as never)
++    Object.defineProperty(HTMLCanvasElement.prototype, 'toBlob', {
++      configurable: true,
++      value: function toBlob(cb: (blob: Blob) => void) {
++        cb(new Blob(['demo-jpeg-bytes'], { type: 'image/jpeg' }))
++      },
++    })
++    ;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++    container = document.createElement('div')
++    document.body.appendChild(container)
++    root = createRoot(container)
++  })
++  afterEach(() => {
++    act(() => root.unmount())
++    container.remove()
++    vi.restoreAllMocks()
++  })
++
++  it('真实 stress 场景节点:img 解析出 blob: URL(不再有任何 data:image)', async () => {
++    const node = snapshotFromScene('stress-test').nodes.find((n) => n.id === 'stress-3')!
++    expect(node.assetUrl).toBe('mivo-demo:stress/3') // 种子已是微型引用
++    const props: CanvasNodeViewProps = {
++      node,
++      selected: false,
++      selectionPreview: false,
++      sectionDropTarget: false,
++      connectorDropTarget: false,
++      primarySelected: false,
++      editing: false,
++      effectiveLocked: false,
++      effectiveRendererMode: 'dom', // #524:改为必填 prop(不再自读全局)
++
++      handleSize: 10,
++      handleBorderWidth: 2,
++      selectionStrokeWidth: 2,
++      onResizeHandlePointerDown: () => {},
++      onMarkupPointPointerDown: () => {},
++      onTextResizeHandlePointerDown: () => {},
++      onUpdateText: () => {},
++      onFinishTextEdit: () => {},
++      onResizeNodeToContent: () => {},
++    }
++    await act(async () => {
++      root.render(<CanvasNodeView {...props} />)
++    })
++    await act(async () => {
++      await new Promise((resolve) => setTimeout(resolve, 10)) // 排空 lease 异步解析
++    })
++    const img = container.querySelector('img')
++    expect(img).not.toBeNull()
++    expect(img!.getAttribute('src') || '').toMatch(/^blob:/)
++    expect(container.innerHTML.includes('data:image')).toBe(false)
++  })
++})
+diff --git a/src/kernel/docKernelPersistAdapter.ts b/src/kernel/docKernelPersistAdapter.ts
+index a32cb89c..e0aa8c66 100644
+--- a/src/kernel/docKernelPersistAdapter.ts
++++ b/src/kernel/docKernelPersistAdapter.ts
+@@ -30,7 +30,16 @@ export const sessionKey = (name: string): string => `${namespacedKey(name)}:sess
+ 
+ const V11 = 11
+ 
++// #506 F3:**三域 schema 版本(V11)与 zustand persist 逻辑版本分离**。V11 描述的
++// 是磁盘布局(document+session 两 key 三域拆分),永远是 11;而 zustand 迁移链的
++// 逻辑版本(CANVAS_PERSIST_VERSION,现 13)随迁移演进。此前 getItem 对外恒报 11
++// → kernel=new 每次启动都重跑 v12/v13 迁移(还触发全量写回)。现在 setItem 把来
++// 件 envelope 的逻辑版本存进 document 记录的 persistVersion 字段,getItem 原样
++// 报回;历史记录(无此字段,含 migrateV10ToV11 刚产出的)按 11 报——恰好让
++// v11→13 迁移跑**一次**,写回后 persistVersion 落 13,此后零迁移零重写。
++
+ type Envelope = { state: unknown; version: number }
++type DocumentRecord = Envelope & { persistVersion?: number }
+ 
+ /** #505 冻结目标工厂(kernel=new split 通道):入队时调用,document/session 两个
+  *  物理键此刻解析并冻结进闭包。write 把 single blob envelope 拆两域后一笔事务
+@@ -49,14 +58,19 @@ export const createDocKernelFrozenTarget = (name: string): {
+     write: async (serialized: string): Promise<void> => {
+       // serialized = partialize(state) single blob envelope {state, version}
+       let blob: PersistedV10Blob
++      let persistVersion = V11
+       try {
+-        blob = (JSON.parse(serialized) as Envelope).state as PersistedV10Blob
++        const envelope = JSON.parse(serialized) as Envelope
++        blob = envelope.state as PersistedV10Blob
++        if (typeof envelope.version === 'number') persistVersion = envelope.version
+       } catch {
+         return // corrupt value → 不写(不破坏 canonical)
+       }
+       const { document, session } = projectToThreeDomain(blob)
++      // version=V11 是三域 schema 版本(磁盘布局);persistVersion 是 zustand 迁移
++      // 链的逻辑版本,随原子批存进 document 记录,getItem 原样报回(#506 F3)。
+       await rawIdbSetItemsAtomic([
+-        { name: frozenDocumentKey, value: JSON.stringify({ state: document, version: V11 }) },
++        { name: frozenDocumentKey, value: JSON.stringify({ state: document, version: V11, persistVersion }) },
+         { name: frozenSessionKey, value: JSON.stringify({ state: session, version: V11 }) },
+       ])
+     },
+@@ -77,8 +91,12 @@ export const docKernelPersistStorage = {
+     if (docRaw == null) return null // 无 document key → 未迁移/首次(canonical 不存在,rehydrate 回退默认)
+     // document corrupt → 视为无 canonical(不抛,rehydrate 回退)
+     let docState: Record<string, unknown>
++    let persistVersion: number
+     try {
+-      docState = (JSON.parse(docRaw) as Envelope).state as Record<string, unknown>
++      const docRecord = JSON.parse(docRaw) as DocumentRecord
++      docState = docRecord.state as Record<string, unknown>
++      // F3:对外报**逻辑版本**;历史记录无 persistVersion 按 V11(迁移恰跑一次)
++      persistVersion = typeof docRecord.persistVersion === 'number' ? docRecord.persistVersion : V11
+     } catch {
+       return null
+     }
+@@ -95,7 +113,7 @@ export const docKernelPersistStorage = {
+     // merge:document(canvases/projects/sceneId)+ session(顶层 selection/tools)→ single envelope
+     // session 顶层 selection 覆盖 document 顶层(但 document.canvases 内嵌 selection 不被覆盖)
+     const merged = { ...docState, ...sessState }
+-    return JSON.stringify({ state: merged, version: V11 })
++    return JSON.stringify({ state: merged, version: persistVersion })
+   },
+ 
+   setItem: (name: string, value: string): Promise<void> => createDocKernelFrozenTarget(name).write(value),
+diff --git a/src/kernel/docKernelPersistVersion.test.ts b/src/kernel/docKernelPersistVersion.test.ts
+new file mode 100644
+index 00000000..68bcd650
+--- /dev/null
++++ b/src/kernel/docKernelPersistVersion.test.ts
+@@ -0,0 +1,150 @@
++// @vitest-environment happy-dom
++import 'fake-indexeddb/auto'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #506 复审 F3:三域 schema 版本(11,磁盘布局)与 zustand persist 逻辑版本
++// (CANVAS_PERSIST_VERSION=13)分离。此前 adapter getItem 恒报 11 → kernel=new
++// 每次启动重跑 v12/v13 迁移并全量写回。契约(#532 会师后走冻结目标 + 写防抖
++// 调度器,persistVersion 随原子批存入 document 记录):
++// - 历史 canonical(无 persistVersion 字段)首启按 11 报 → 迁移链恰跑一次,
++//   写回后 document 记录 version 仍 =11(schema)、persistVersion=13(逻辑);
++// - 真实 IDB commit 口径的 #506 断言:写回后 canonical 里零 data:image;
++// - 第二次 rehydrate:adapter 报 13 → 零迁移零重写(调度器无入队写,记录字节不变)。
++
++vi.mock('../app/kernelMode', () => ({
++  kernelMode: 'new',
++  getKernelMode: () => 'new',
++  isLegacyKernel: false,
++  isNewKernel: true,
++  getEffectiveKernelMode: () => 'new',
++  isLegacyKernelEffective: () => false,
++  degradeKernelToLegacyForSession: () => {},
++  ensureEffectiveKernelReady: () => Promise.resolve(),
++  warnIfEffectiveKernelBootPending: () => {},
++  __resetKernelDegradationForTests: () => {},
++}))
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++vi.mock('../lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(),
++  saveImportedAsset: vi.fn(),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('../store/remoteDebugReporter', () => ({
++  reportRemoteDebugEntry: () => {},
++}))
++
++const { rawIdbStorage, __resetIdbPersist } = await import('../lib/persistIdbStorage')
++const { docKernelPersistStorage, documentKey, sessionKey } = await import('./docKernelPersistAdapter')
++const { projectToThreeDomain } = await import('./persistMigration')
++const { useCanvasStore } = await import('../store/canvasStore')
++const { flushCanvasPersistWrite, hasPendingCanvasPersistWrite, __resetCanvasPersistStorageForTests } = await import(
++  '../store/canvasPersistConfig'
++)
++const { modelNames } = await import('../store/demoScenes')
++
++const NAME = 'mivo-canvas-demo'
++const FAKE_BASE64 = `data:image/jpeg;base64,${'B'.repeat(20_000)}`
++
++const stressSeedNode = (index: number) => ({
++  id: `stress-${index}`,
++  type: 'image',
++  title: `Result ${String(index + 1).padStart(3, '0')}`,
++  x: index * 10,
++  y: 0,
++  width: 132,
++  height: 174,
++  status: 'ready',
++  assetUrl: FAKE_BASE64,
++  generation: {
++    prompt: '批量结果压力测试节点',
++    model: modelNames[index % modelNames.length],
++    size: '768x1024',
++    seed: 7000 + index,
++  },
++})
++
++describe('kernel=new 版本语义分离 × 真实 IDB 双启动(#506 F3)', () => {
++  beforeEach(async () => {
++    // 先丢弃上一测试的暂存写与 read-your-writes 快照,再清盘(#532 冻结目标架构
++    // 下 seed 底层前必须清快照,否则 getItem 语义正确地返回旧快照而非 seed)。
++    __resetCanvasPersistStorageForTests()
++    await __resetIdbPersist()
++    useCanvasStore.setState({ ...useCanvasStore.getInitialState() } as never, true)
++  })
++  afterEach(async () => {
++    vi.restoreAllMocks()
++    __resetCanvasPersistStorageForTests()
++    await __resetIdbPersist()
++  })
++
++  it('历史 v11 canonical(base64 种子)→ 首启迁移一次 + canonical 洗净 + persistVersion=13;二启零迁移零重写', async () => {
++    // 历史 canonical:migrateV10ToV11 时代的记录形状(无 persistVersion 字段)
++    const blobState = {
++      canvases: {
++        'stress-test': {
++          title: '100 张图片压力测试',
++          nodes: Array.from({ length: 5 }, (_, index) => stressSeedNode(index)),
++          edges: [],
++          tasks: [],
++          selectedNodeId: undefined,
++          selectedNodeIds: [],
++        },
++      },
++      sceneId: 'stress-test',
++      projects: [],
++      selectedNodeId: undefined,
++      selectedNodeIds: [],
++      activeTool: 'select',
++    }
++    const { document: docDomain, session: sessDomain } = projectToThreeDomain(blobState as never)
++    await rawIdbStorage.setItem(documentKey(NAME), JSON.stringify({ state: docDomain, version: 11 }))
++    await rawIdbStorage.setItem(sessionKey(NAME), JSON.stringify({ state: sessDomain, version: 11 }))
++    expect((await rawIdbStorage.getItem(documentKey(NAME)))!.includes('data:image')).toBe(true) // 前提自检
++
++    // ── 首次启动:persistVersion 缺省按 11 报 → 迁移链恰跑一次并写回 ──
++    await useCanvasStore.persist.rehydrate()
++    expect(hasPendingCanvasPersistWrite()).toBe(true) // 迁移写回已入队(防抖暂存)
++    await flushCanvasPersistWrite('migration-writeback-drain')
++
++    // 内存:种子洗成引用
++    const doc = useCanvasStore.getState().canvases['stress-test']
++    expect(doc.nodes.every((n) => n.assetUrl?.startsWith('mivo-demo:stress/'))).toBe(true)
++
++    // 真实 IDB commit 口径:canonical(document+session 两域)零 data:image;
++    // document 记录 version=11(schema)不变、persistVersion=13(逻辑)
++    const docAfter = await rawIdbStorage.getItem(documentKey(NAME))
++    const sessAfter = await rawIdbStorage.getItem(sessionKey(NAME))
++    expect(docAfter!.includes('data:image')).toBe(false)
++    expect(sessAfter!.includes('data:image')).toBe(false)
++    const docRecord = JSON.parse(docAfter!) as { version: number; persistVersion?: number }
++    expect(docRecord.version).toBe(11)
++    expect(docRecord.persistVersion).toBe(13)
++
++    // 二审 P2:adapter getItem 对外 envelope 直接断言逻辑版本 13(F3 的对外面)
++    const envelope = await docKernelPersistStorage.getItem(NAME)
++    expect((JSON.parse(envelope!) as { version: number }).version).toBe(13)
++
++    // ── 第二次 rehydrate(同盘面):adapter 报 13 → 零迁移零重写。
++    // 二审 P2(盘读鉴别力):rehydrate 前用 sentinel 污染内存——该 setState 触发
++    // 的防抖写被 __resetCanvasPersistStorageForTests 丢弃(盘面不动,同时清掉
++    // read-your-writes 快照,迫使二启真读盘)——二次 rehydrate 后 sentinel 必须
++    // 被盘面真相盖回,证明读的是盘而非内存残留。
++    useCanvasStore.setState((s) => ({
++      canvases: { ...s.canvases, 'stress-test': { ...s.canvases['stress-test'], title: 'SENTINEL-NOT-ON-DISK' } },
++    }))
++    __resetCanvasPersistStorageForTests() // 丢弃 sentinel 的暂存写,盘面不动
++    const docBeforeSecondBoot = await rawIdbStorage.getItem(documentKey(NAME))
++    expect(docBeforeSecondBoot!.includes('SENTINEL')).toBe(false) // sentinel 确未落盘
++    expect(useCanvasStore.getState().canvases['stress-test'].title).toBe('SENTINEL-NOT-ON-DISK')
++
++    await useCanvasStore.persist.rehydrate()
++    expect(hasPendingCanvasPersistWrite()).toBe(false) // 零迁移零重写:无入队写(v13==v13 无 migrate)
++    await flushCanvasPersistWrite('drain-anyway') // 双保险排空后看盘
++    expect(await rawIdbStorage.getItem(documentKey(NAME))).toBe(docBeforeSecondBoot) // 记录字节不变
++    const doc2 = useCanvasStore.getState().canvases['stress-test']
++    expect(doc2.title).toBe('100 张图片压力测试') // sentinel 被盘面真相盖回:读的确实是盘
++    expect(doc2.nodes.every((n) => n.assetUrl?.startsWith('mivo-demo:stress/'))).toBe(true) // 数据照常读回
++  })
++})
+diff --git a/src/lib/assetDownload.ts b/src/lib/assetDownload.ts
+index 47c07339..7fa4d43a 100644
+--- a/src/lib/assetDownload.ts
++++ b/src/lib/assetDownload.ts
+@@ -1,5 +1,6 @@
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import { isImportedAssetUrl, readImportedAssetFile } from './assetStorage'
++import { isDemoAssetUrl, renderDemoImageBlob } from './demoAssets'
+ 
+ const extensionForType = (type?: string) => {
+   if (!type) return ''
+@@ -59,6 +60,15 @@ export type AssetDownloadOutcome = 'completed' | 'no-asset' | 'asset-missing' |
+ export const downloadCanvasNodeOriginal = async (node: MivoCanvasNode): Promise<AssetDownloadOutcome> => {
+   if (!node.assetUrl) return 'no-asset'
+ 
++  // #506:demo 惰性引用(mivo-demo:)不可 fetch——现画成 blob 下载(与 data URL
++  // 时代的下载能力对齐;绘制失败按 asset-missing 口径)。
++  if (isDemoAssetUrl(node.assetUrl)) {
++    const blob = await renderDemoImageBlob(node.assetUrl)
++    if (!blob) return 'asset-missing'
++    downloadBlob(blob, filenameFor(node, blob.type))
++    return 'completed'
++  }
++
+   if (isImportedAssetUrl(node.assetUrl)) {
+     const asset = await readImportedAssetFile(node.assetUrl)
+     if (!asset) return 'asset-missing'
+diff --git a/src/lib/assetStorage.ts b/src/lib/assetStorage.ts
+index cee3cfb2..32a4d191 100644
+--- a/src/lib/assetStorage.ts
++++ b/src/lib/assetStorage.ts
+@@ -8,6 +8,7 @@ import { mimeFromFilename } from './mimeFromFilename'
+ // is dynamically imported from ./assetService only when a server path is hit,
+ // so importing assetStorage never pulls settingsSlice/persistIdbStorage.
+ import { isAssetsServerMode, isServerAssetUrl, isServerUploadableImage, serverAssetId, serverAssetUrl } from './assetServiceMode'
++import { isDemoAssetUrl, renderDemoImageBlob } from './demoAssets'
+ 
+ const DB_NAME = 'mivo-canvas-assets'
+ const DB_VERSION = 1
+@@ -381,6 +382,13 @@ export const resolveAssetUrl = async (assetUrl?: string) => {
+     const fetched = await fetchServerAssetBlob(serverAssetId(assetUrl))
+     return fetched ? URL.createObjectURL(fetched.blob) : ''
+   }
++  // #506:mivo-demo: 引用 → 惰性绘制成 blob URL(不进 IDB/store;经 assetUrlLease
++  // 引用计数共享与回收)。绘制失败(无 DOM/2d 或引用不合法)按既有 miss 口径
++  // 返回 ''(上层落 error 态,不 pending)。
++  if (isDemoAssetUrl(assetUrl)) {
++    const blob = await renderDemoImageBlob(assetUrl)
++    return blob ? URL.createObjectURL(blob) : ''
++  }
+   if (!isImportedAssetUrl(assetUrl)) return assetUrl
+ 
+   const asset = await withAssetStore<StoredAsset | undefined>('readonly', (store) =>
+diff --git a/src/lib/assetUrlLease.demoAsset.test.ts b/src/lib/assetUrlLease.demoAsset.test.ts
+new file mode 100644
+index 00000000..0a56a63b
+--- /dev/null
++++ b/src/lib/assetUrlLease.demoAsset.test.ts
+@@ -0,0 +1,166 @@
++// @vitest-environment happy-dom
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #506:mivo-demo: 引用走 assetUrlLease 的生命周期契约——惰性绘制成 blob URL、
++// 并发消费方共享一次绘制、引用计数归零即 revoke(离开场景自动释放)、re-acquire
++// 重新绘制(**没有模块级常驻缓存**,旧 imageCache 的只增不减 Map 已退役)。
++// happy-dom 无 2d 上下文:stub HTMLCanvasElement.getContext/toBlob 提供最小
++// 可绘面(计数绘制次数),URL.createObjectURL/revokeObjectURL 换成记账桩。
++
++const debugLogger = { log: vi.fn(), warn: vi.fn(), error: vi.fn() }
++vi.mock('../store/debugLogStore', () => ({ debugLogger }))
++const toastFeedback = { error: vi.fn(), success: vi.fn(), info: vi.fn() }
++vi.mock('../store/toastStore', () => ({ toastFeedback }))
++
++const { acquireAssetUrl, acquireAssetUrlLease, releasePendingAssetUrl, __leaseMapSize } = await import('./assetUrlLease')
++const { stressDemoAssetUrl, __demoDrawQueueSize } = await import('./demoAssets')
++
++const makeFake2dCtx = () => {
++  const noop = () => undefined
++  return {
++    save: noop, restore: noop, translate: noop, beginPath: noop, closePath: noop,
++    moveTo: noop, lineTo: noop, arc: noop, arcTo: noop, ellipse: noop,
++    fill: noop, stroke: noop, fillRect: noop, fillText: noop, putImageData: noop,
++    getImageData: () => ({ data: new Uint8ClampedArray(320 * 420 * 4) }),
++    createLinearGradient: () => ({ addColorStop: noop }),
++    set fillStyle(_v: unknown) {}, set strokeStyle(_v: unknown) {},
++    set lineWidth(_v: unknown) {}, set globalAlpha(_v: unknown) {}, set font(_v: unknown) {},
++  } as unknown as CanvasRenderingContext2D
++}
++
++let drawCount = 0
++let liveObjectUrls: Set<string>
++let revokedUrls: string[]
++let urlSeq = 0
++
++describe('assetUrlLease × mivo-demo: 惰性绘制生命周期(#506)', () => {
++  beforeEach(() => {
++    drawCount = 0
++    urlSeq = 0
++    liveObjectUrls = new Set()
++    revokedUrls = []
++    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation((() => makeFake2dCtx()) as never)
++    Object.defineProperty(HTMLCanvasElement.prototype, 'toBlob', {
++      configurable: true,
++      value: function toBlob(cb: (blob: Blob) => void) {
++        drawCount += 1
++        cb(new Blob(['demo-jpeg-bytes'], { type: 'image/jpeg' }))
++      },
++    })
++    vi.stubGlobal('URL', {
++      ...URL,
++      createObjectURL: () => {
++        const url = `blob:demo-${(urlSeq += 1)}`
++        liveObjectUrls.add(url)
++        return url
++      },
++      revokeObjectURL: (url: string) => {
++        liveObjectUrls.delete(url)
++        revokedUrls.push(url)
++      },
++    })
++  })
++  afterEach(() => {
++    vi.unstubAllGlobals()
++    vi.restoreAllMocks()
++  })
++
++  it('acquire → 惰性绘制一次,返回 blob: URL;并发消费方共享同一次绘制', async () => {
++    const url = stressDemoAssetUrl(7)
++    const [a, b] = await Promise.all([acquireAssetUrl(url), acquireAssetUrl(url)])
++    expect(a.url.startsWith('blob:')).toBe(true)
++    expect(b.url).toBe(a.url) // 共享一份
++    expect(drawCount).toBe(1) // 只画一次
++    a.release()
++    expect(liveObjectUrls.has(a.url)).toBe(true) // 还有消费方,未 revoke
++    b.release()
++    expect(liveObjectUrls.has(a.url)).toBe(false) // 归零即 revoke——离场自动释放
++    expect(revokedUrls).toEqual([a.url])
++    expect(__leaseMapSize()).toBe(0)
++  })
++
++  it('释放后 re-acquire 重新绘制(无模块级常驻缓存——旧 imageCache 语义退役)', async () => {
++    const url = stressDemoAssetUrl(3)
++    const first = await acquireAssetUrl(url)
++    first.release()
++    const second = await acquireAssetUrl(url)
++    expect(drawCount).toBe(2) // 第二次是新绘制,不是缓存命中
++    expect(second.url).not.toBe(first.url)
++    second.release()
++    expect(liveObjectUrls.size).toBe(0) // 零泄漏
++  })
++
++  it('不合法 demo 引用 → 解析 miss(url=\'\'),不缓存 miss、不抛', async () => {
++    const lease = await acquireAssetUrl('mivo-demo:stress/999')
++    expect(lease.url).toBe('')
++    expect(__leaseMapSize()).toBe(0) // miss 不占 lease 表
++    lease.release() // no-op 安全
++  })
++
++  it('非 demo/非资产 URL 原样透传(既有语义未被扩展破坏)', async () => {
++    const lease = await acquireAssetUrl('/demo-assets/courage-1.jpg')
++    expect(lease.url).toBe('/demo-assets/courage-1.jpg')
++    expect(drawCount).toBe(0)
++  })
++
++  // ── #506 四轮:pending 窗口离场释放,主体是每笔 acquire 的 token(经 lease 的
++  //    真实取消链;凭 URL/共享标记结账的旧口已退役)────────────────────────────
++  it('pending 离场:acquire 后绘制开始前用本笔 token 释放 → job 出队零绘制、lease 表空、本笔 lease 落定 miss+noop', async () => {
++    const url = stressDemoAssetUrl(11)
++    const { lease, token } = acquireAssetUrlLease(url) // 同步窗口:entry 已建、job 已入队、rAF 未跑
++    expect(__demoDrawQueueSize()).toBe(1)
++    expect(releasePendingAssetUrl(token)).toBe(true) // 最后一个消费者离场
++    expect(__demoDrawQueueSize()).toBe(0) // 未开始的绘制 job 即刻出队
++    expect(releasePendingAssetUrl(token)).toBe(false) // 同笔重复消费拒绝(幂等)
++    const settled = await lease
++    expect(settled.url).toBe('') // 本笔已被 token 消费:落定 miss 语义
++    settled.release() // noop——消费方无条件 release 不双扣
++    expect(drawCount).toBe(0) // stale 绘制零执行
++    expect(__leaseMapSize()).toBe(0)
++    expect(liveObjectUrls.size).toBe(0) // 零泄漏
++  })
++
++  it('多消费者 pending:一笔的 token 释放只结本笔的账(job 保留),另一笔照常落定并 release', async () => {
++    const url = stressDemoAssetUrl(12)
++    const first = acquireAssetUrlLease(url)
++    const second = acquireAssetUrlLease(url)
++    expect(releasePendingAssetUrl(first.token)).toBe(true) // 消费者 1 离场:job 保留
++    expect(__demoDrawQueueSize()).toBe(1)
++    const secondLease = await second.lease // 消费者 2 照常拿到绘制结果
++    expect(secondLease.url.startsWith('blob:')).toBe(true)
++    expect(drawCount).toBe(1)
++    const firstLease = await first.lease // 本笔已被 token 消费 → miss + noop
++    expect(firstLease.url).toBe('')
++    firstLease.release() // noop,不影响消费者 2 的引用
++    expect(__leaseMapSize()).toBe(1)
++    secondLease.release()
++    expect(liveObjectUrls.size).toBe(0)
++    expect(__leaseMapSize()).toBe(0)
++  })
++
++  it('已落定后 token 释放返回 false(维持「resolve 后 release」既有路径,不双扣)', async () => {
++    const url = stressDemoAssetUrl(13)
++    const { lease, token } = acquireAssetUrlLease(url)
++    const settled = await lease
++    expect(releasePendingAssetUrl(token)).toBe(false) // 已落定:pending 口不生效
++    settled.release()
++    expect(liveObjectUrls.size).toBe(0)
++    expect(__leaseMapSize()).toBe(0)
++  })
++
++  it('跨代拒绝:token 消费掉旧 entry 后同 URL 重挂新 entry,旧 token 再释放不影响新代', async () => {
++    const url = stressDemoAssetUrl(14)
++    const stale = acquireAssetUrlLease(url)
++    expect(releasePendingAssetUrl(stale.token)).toBe(true) // 旧代 entry 被摘、job 出队
++    const fresh = acquireAssetUrlLease(url) // 同 URL 新代 pending
++    expect(__demoDrawQueueSize()).toBe(1)
++    expect(releasePendingAssetUrl(stale.token)).toBe(false) // 旧 token 对新代无效
++    expect(__demoDrawQueueSize()).toBe(1) // 新代 job 未被旧 token 撤走
++    const freshLease = await fresh.lease
++    expect(freshLease.url.startsWith('blob:')).toBe(true) // 新代照常绘制落定
++    expect((await stale.lease).url).toBe('')
++    freshLease.release()
++    expect(liveObjectUrls.size).toBe(0)
++    expect(__leaseMapSize()).toBe(0)
++  })
++})
+diff --git a/src/lib/assetUrlLease.test.ts b/src/lib/assetUrlLease.test.ts
+index dddd96ce..6133e598 100644
+--- a/src/lib/assetUrlLease.test.ts
++++ b/src/lib/assetUrlLease.test.ts
+@@ -1,5 +1,5 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+-import { acquireAssetUrl, __leaseMapSize } from './assetUrlLease'
++import { acquireAssetUrl, acquireAssetUrlLease, releasePendingAssetUrl, __leaseMapSize } from './assetUrlLease'
+ import { debugLogger } from '../store/debugLogStore'
+ 
+ // Mock resolveAssetUrl so tests don't touch IDB. The mock calls the (spied)
+@@ -18,7 +18,10 @@ const resolveAssetUrlMock = vi.fn(async (assetUrl?: string): Promise<string> =>
+ })
+ 
+ vi.mock('./assetStorage', () => ({
+-  isImportedAssetUrl: (url?: string) => Boolean(url?.startsWith('mivo-asset:')),
++  // 与真实谓词同覆盖面(assetStorage.ts:105):mivo-asset:(本地 IDB)与
++  // mivo-sasset:(服务端内容寻址)都是 lease 要接管的 imported-asset 引用。
++  isImportedAssetUrl: (url?: string) =>
++    Boolean(url && (url.startsWith('mivo-asset:') || url.startsWith('mivo-sasset:'))),
+   resolveAssetUrl: (assetUrl?: string) => resolveAssetUrlMock(assetUrl),
+ }))
+ 
+@@ -280,3 +283,82 @@ describe('acquireAssetUrl — resolution reject does not poison the cache (N-02)
+     expect(__leaseMapSize()).toBe(0)
+   })
+ })
++
++// ── #506 四轮:pending 释放主体是每笔 acquire 的 token,不是 URL ────────────────
++// 同 URL 并存多笔 pending(失败重挂、A 换 B、多消费者)任意交错下,每笔恰一次
++// 终局(release / token 释放 / 落定后 release 三选一),leaseMap/refCount/blob
++// URL 零残留。
++describe('acquireAssetUrlLease — per-acquire token (#506 四轮)', () => {
++  beforeEach(() => {
++    // 组内多条测试改写过 implementation(deferred / 一次性 reject),这里还原
++    // 默认实现(文件顶部的 mockClear 只清计数不还原实现)。
++    resolveAssetUrlMock.mockReset().mockImplementation(async (assetUrl?: string): Promise<string> => {
++      if (!assetUrl) return ''
++      if (assetUrl.endsWith('-miss')) return ''
++      return URL.createObjectURL(new Blob([assetUrl], { type: 'image/png' }))
++    })
++  })
++
++  it('旧 acquire reject → 同 URL 新 acquire pending → 旧笔 token 释放不影响新 entry(F2 场景)', async () => {
++    const url = 'mivo-asset:regen'
++    resolveAssetUrlMock
++      .mockReset()
++      .mockImplementationOnce(async () => {
++        throw new Error('slow backend boom')
++      })
++      .mockImplementation(async (assetUrl?: string) => URL.createObjectURL(new Blob([assetUrl ?? ''])))
++
++    const first = acquireAssetUrlLease(url)
++    await expect(first.lease).rejects.toThrow('slow backend boom')
++    expect(__leaseMapSize()).toBe(0)
++
++    const second = acquireAssetUrlLease(url) // 失败重挂:同 URL 新代 pending
++    // 旧笔的 cleanup 此刻才跑(hook 卸载时序):本笔已 settled → false,
++    // 新代 entry 的引用计数分毫不动(旧 URL 键口径会在这里扣崩新代)。
++    expect(releasePendingAssetUrl(first.token)).toBe(false)
++
++    const lease = await second.lease
++    expect(lease.url.startsWith('blob:')).toBe(true) // 新代照常落定
++    expect(__leaseMapSize()).toBe(1)
++    lease.release()
++    expect(URL.revokeObjectURL).toHaveBeenCalledTimes(1) // 恰一次 revoke
++    expect(__leaseMapSize()).toBe(0)
++  })
++
++  // P2 定向回归:mivo-sasset(服务端资产)与 mivo-asset 同为 lease 接管的引用,
++  // pending/release 两条链都要有直接覆盖(此前 mock 只认 mivo-asset)。
++  for (const assetUrl of ['mivo-asset:slow-idb', 'mivo-sasset:slow-fetch']) {
++    it(`${assetUrl.split(':')[0]} deferred resolver:pending token 释放 → 孤儿解析恰一次 revoke 零残留`, async () => {
++      let resolveNow!: (url: string) => void
++      resolveAssetUrlMock.mockReset().mockImplementation(
++        () =>
++          new Promise<string>((resolve) => {
++            resolveNow = resolve
++          }),
++      )
++      const acquire = acquireAssetUrlLease(assetUrl)
++      expect(__leaseMapSize()).toBe(1)
++      expect(releasePendingAssetUrl(acquire.token)).toBe(true) // 最后一笔 pending 离场
++      expect(__leaseMapSize()).toBe(0) // entry 即刻摘除
++
++      const blobUrl = URL.createObjectURL(new Blob([assetUrl]))
++      resolveNow(blobUrl) // 慢 IDB/fetch 此刻才落定 → 孤儿解析
++      const lease = await acquire.lease
++      expect(lease.url).toBe('') // 本笔已消费:miss 语义
++      lease.release() // noop,不双扣
++      expect(URL.revokeObjectURL).toHaveBeenCalledTimes(1) // 孤儿 blob 当场 revoke,恰一次
++      expect(URL.revokeObjectURL).toHaveBeenCalledWith(blobUrl)
++      expect(__leaseMapSize()).toBe(0)
++    })
++  }
++
++  it('mivo-sasset 主路径:落定后 token 释放失效,release 恰一次 revoke(P2 定向回归)', async () => {
++    const { lease, token } = acquireAssetUrlLease('mivo-sasset:abc')
++    const settled = await lease
++    expect(settled.url.startsWith('blob:')).toBe(true)
++    expect(releasePendingAssetUrl(token)).toBe(false) // 已落定:pending 口不生效
++    settled.release()
++    expect(URL.revokeObjectURL).toHaveBeenCalledTimes(1)
++    expect(__leaseMapSize()).toBe(0)
++  })
++})
+diff --git a/src/lib/assetUrlLease.ts b/src/lib/assetUrlLease.ts
+index 81911d78..f2a21b11 100644
+--- a/src/lib/assetUrlLease.ts
++++ b/src/lib/assetUrlLease.ts
+@@ -1,53 +1,102 @@
+ // assetUrlLease — reference-counted asset URL lease (Phase 3a, lease track).
+ //
+-// Wraps assetStorage.resolveAssetUrl with a per-assetUrl refcount so multiple
+-// consumers mounting the same imported asset share ONE blob URL (one
+-// createObjectURL call) instead of one each. The blob is revoked only when the
+-// last consumer releases. This is the foundation for Leafer Image (3c) and any
+-// other renderer that needs a stable blob URL without double-revoking shared
+-// blobs.
++// Per-assetUrl refcount so multiple consumers mounting the same asset share
++// ONE blob URL (one createObjectURL call) instead of one each; the blob is
++// revoked only when the last consumer releases. Three URL schemes ride the
++// lease (isLeaseable):
++// - mivo-asset:  local IDB imports  — resolved via assetStorage.resolveAssetUrl;
++// - mivo-sasset: server content-addressed assets (T1.5) — same resolver,
++//   routed by prefix inside assetStorage;
++// - mivo-demo:   #506 demo seeds — lazily DRAWN via requestDemoImageDraw (no
++//   storage roundtrip; the pending window is cancellable, see below).
++// This is the foundation for Leafer Image (3c) and any other renderer that
++// needs a stable blob URL without double-revoking shared blobs.
+ //
+ // Design: plans/leafer-designs/phase3a-asset-lease-metrics.md §1.1-1.8.
+ //
+ // Red lines:
+-// - pass-through: empty / non-mivo-asset: URLs are NOT refcounted and NOT
+-//   revoked (resolveAssetUrl returns them as-is; nothing to revoke).
++// - pass-through: empty / non-leaseable URLs (http/data/local paths) are NOT
++//   refcounted and NOT revoked (returned as-is; nothing to revoke).
+ // - release is delivered ONLY after the acquire promise resolves (1.6), so
+ //   there is no "release before acquire" race. Pending-unmount is handled by
+-//   the hook's cancelled flag (1.5) — the hook releases in its .then when it
+-//   sees it was cancelled.
+-// - release is idempotent (released flag) and revokes only when refCount hits 0.
++//   the PER-ACQUIRE token (#506 四轮): the consumer that unmounts while its
++//   acquire is still in flight settles THAT acquire via
++//   releasePendingAssetUrl(token) — never by URL, never by shared flags.
++// - release is idempotent (released flag), generation-guarded (only acts on
++//   the entry it was minted for), and revokes only when refCount hits 0.
++//
++// #506 四轮不变量(pending 释放主体 = 每笔 acquire,不是 URL/entry):
++// 同一 URL 可并存多笔 pending acquire(A 换 B、失败重挂、多消费者),任意交错下
++// 每笔 acquire 恰有一次终局——release / token 释放 / 落定后 release 三选一;
++// leaseMap、refCount、blob URL 零残留。token 释放被消费后,该笔的 lease promise
++// 落定为 { url: '', release: noop },消费方无条件调用 release 也不会双扣。
+ 
+ import { debugLogger } from '../store/debugLogStore'
+ import { isImportedAssetUrl, resolveAssetUrl } from './assetStorage'
++import { isDemoAssetUrl, requestDemoImageDraw } from './demoAssets'
+ 
+ export type AssetLease = {
+   url: string
+   release: () => void
+ }
+ 
++/** Opaque per-acquire token (#506 四轮)。只能喂给 releasePendingAssetUrl;
++ *  跨代/跨笔无效(内部凭 entry 身份 + 本笔 settled/consumed 状态判定)。 */
++export type AssetLeaseToken = { readonly __assetLeaseToken: true }
++
++export type AssetLeaseAcquire = {
++  /** Resolves to the shared blob URL + this acquire's release. */
++  lease: Promise<AssetLease>
++  /** This acquire's identity for pending-window release. */
++  token: AssetLeaseToken
++}
++
+ type LeaseEntry = {
+   blobUrl: string
+   refCount: number
+   /** Shared in-flight resolution promise; concurrent acquires dedup on this. */
+   inFlight: Promise<string>
++  /** #506 三轮 F2:demo 绘制 job 的取消句柄——pending 消费者全部离场时把未开始
++   *  的绘制从队列移除(stale 绘制不再抢占新场景)。 */
++  cancelPending?: () => void
++  /** true = 仍在解析中(blobUrl 未落定)。token 释放只在此窗口生效。 */
++  resolving: boolean
++}
++
++/** Internal shape behind AssetLeaseToken. */
++type LeaseTokenInternal = {
++  assetUrl: string
++  /** The entry THIS acquire joined (identity for cross-generation rejection). */
++  entry: LeaseEntry | null
++  /** Resolution landed (then/catch ran) — pending release no longer applies. */
++  settled: boolean
++  /** Pending release already balanced this acquire's refCount. */
++  consumed: boolean
+ }
+ 
+ const leaseMap = new Map<string, LeaseEntry>()
+ const LEASE_SOURCE = 'Asset Lease'
+ 
++// #506:mivo-demo: 引用同样走 lease——惰性绘制的 blob URL 由引用计数共享,
++// 归零即 revoke(离开场景自动释放,不再有常驻 data URL 缓存)。谓词在本缝
++// 本地组合(不经 assetStorage 转发):demo 判定是纯前缀函数,且大量既有测试
++// 以窄面 mock assetStorage,新增转发导出会让它们全部 undefined 失效。
+ const isLeaseable = (assetUrl?: string): assetUrl is string =>
+-  Boolean(assetUrl && isImportedAssetUrl(assetUrl))
++  Boolean(assetUrl && (isImportedAssetUrl(assetUrl) || isDemoAssetUrl(assetUrl)))
+ 
+ const noopRelease = () => {}
+ 
+-const makeRelease = (assetUrl: string) => {
++const asToken = (token: LeaseTokenInternal): AssetLeaseToken => token as unknown as AssetLeaseToken
++
++const makeRelease = (assetUrl: string, boundEntry: LeaseEntry) => {
+   let released = false
+   return () => {
+     if (released) return
+     released = true
+     const entry = leaseMap.get(assetUrl)
+-    if (!entry) return
++    // 跨代守卫(#506 四轮):本笔的 entry 已被摘(孤儿/重挂后的新代占位)时不得
++    // 扣新代的引用——release 与 entry 同生同灭。
++    if (!entry || entry !== boundEntry) return
+     entry.refCount -= 1
+     if (entry.refCount > 0) return
+     if (entry.refCount < 0) {
+@@ -63,73 +112,154 @@ const makeRelease = (assetUrl: string) => {
+   }
+ }
+ 
++/** Entry-level settle bookkeeping — attached ONCE per entry, before any
++ *  per-acquire continuation (attach order guarantees it runs first):
++ *  - resolve: record blobUrl / clear resolving; drop miss entries so the next
++ *    acquire re-attempts; orphan resolution (entry already evicted by token
++ *    releases, blob landed anyway) revokes on the spot — no consumer remains
++ *    to release it.
++ *  - reject: drop the poisoned entry (identity-guarded) so the next acquire
++ *    re-resolves. Per-acquire warns are logged in each acquire's own chain. */
++const attachEntrySettle = (assetUrl: string, entry: LeaseEntry) => {
++  void entry.inFlight.then(
++    (blobUrl) => {
++      entry.resolving = false
++      if (leaseMap.get(assetUrl) !== entry) {
++        // #506 三轮 F2:孤儿解析——pending 消费者已全部离场(entry 被 token 释放
++        // 摘除)但绘制已开始、此刻才落定。没有任何在册消费者会 release,当场
++        // revoke 防泄漏。
++        if (blobUrl && blobUrl.startsWith('blob:')) URL.revokeObjectURL(blobUrl)
++        return
++      }
++      entry.blobUrl = blobUrl
++      if (!blobUrl || !blobUrl.startsWith('blob:')) {
++        // IDB miss or pass-through resolution — nothing to revoke. Drop the
++        // entry so the next acquire re-attempts resolution instead of caching
++        // a miss.
++        leaseMap.delete(assetUrl)
++      }
++    },
++    () => {
++      // Resolution rejected — drop the entry so the next acquire re-resolves
++      // instead of caching a rejected promise (poisoned cache, N-02).
++      // 身份守卫:token 释放可能已删本 entry 且同 URL 已建新 entry,不得误删新的。
++      entry.resolving = false
++      if (leaseMap.get(assetUrl) === entry) leaseMap.delete(assetUrl)
++    },
++  )
++}
++
++/** Per-acquire continuation: settles THIS acquire's token, then hands back the
++ *  lease result. A token consumed in the pending window resolves to miss + noop
++ *  so the consumer's unconditional release stays balanced (exactly one 终局). */
++const leaseForAcquire = (assetUrl: string, entry: LeaseEntry, token: LeaseTokenInternal): Promise<AssetLease> =>
++  entry.inFlight.then(
++    (blobUrl) => {
++      token.settled = true
++      if (token.consumed) {
++        // 本笔引用已在 pending 窗口被 token 释放扣平——回 miss 语义,release 为
++        // noop(消费方无条件 release 不双扣)。
++        return { url: '', release: noopRelease }
++      }
++      if (!blobUrl || !blobUrl.startsWith('blob:')) {
++        // Miss / pass-through: the entry-settle chain already dropped the entry.
++        return { url: blobUrl, release: noopRelease }
++      }
++      if (leaseMap.get(assetUrl) !== entry) {
++        // 孤儿解析已在 entry-settle 链 revoke——blob 不可用。
++        return { url: '', release: noopRelease }
++      }
++      return { url: blobUrl, release: makeRelease(assetUrl, entry) }
++    },
++    (err) => {
++      token.settled = true
++      debugLogger.warn(
++        LEASE_SOURCE,
++        `asset resolution rejected for ${assetUrl}; poisoned entry removed, rethrowing (${err instanceof Error ? err.message : String(err)})`,
++      )
++      throw err
++    },
++  )
++
+ /**
+- * Acquire a leased asset URL. Concurrent acquires for the same `mivo-asset:` URL
+- * share one createObjectURL call (deduped via the in-flight promise). Each
+- * successful acquire MUST be balanced by exactly one `release()` call; the last
+- * release revokes the blob URL.
++ * Acquire a leased asset URL with a per-acquire token (#506 四轮). Concurrent
++ * acquires for the same `mivo-asset:` / `mivo-demo:` URL share one resolution
++ * (deduped via the in-flight promise). Each acquire MUST reach exactly one 终局:
++ * - happy path: await `lease`, later call `release()`;
++ * - pending unmount: call `releasePendingAssetUrl(token)` — if it returns true
++ *   the refCount is balanced immediately (and a not-yet-started demo draw is
++ *   cancelled); the lease then resolves `{ url: '', release: noop }`, so the
++ *   consumer's post-settle `release()` stays safe either way.
+  *
+- * Empty / non-mivo-asset: URLs pass through untouched (no refcount, no revoke).
+- * IDB misses (resolveAssetUrl returns '') return `{ url: '', release: noop }`
+- * and drop the entry so the next acquire re-attempts resolution.
++ * Empty / non-leaseable URLs pass through untouched (no refcount, no revoke;
++ * token is pre-settled). IDB misses resolve `{ url: '', release: noop }` and
++ * drop the entry so the next acquire re-attempts resolution.
+  */
+-export const acquireAssetUrl = async (assetUrl?: string): Promise<AssetLease> => {
++export const acquireAssetUrlLease = (assetUrl?: string): AssetLeaseAcquire => {
+   if (!isLeaseable(assetUrl)) {
+-    return { url: assetUrl || '', release: noopRelease }
++    const token: LeaseTokenInternal = { assetUrl: assetUrl ?? '', entry: null, settled: true, consumed: false }
++    return {
++      lease: Promise.resolve({ url: assetUrl || '', release: noopRelease }),
++      token: asToken(token),
++    }
+   }
+ 
+   const existing = leaseMap.get(assetUrl)
+   if (existing) {
+     existing.refCount += 1
+-    let blobUrl: string
+-    try {
+-      blobUrl = await existing.inFlight
+-    } catch (err) {
+-      // The in-flight resolution rejected — a poisoned entry would otherwise
+-      // keep re-rejecting for every future acquire. Drop it so the next acquire
+-      // re-attempts resolution from scratch, then surface the original error.
+-      leaseMap.delete(assetUrl)
+-      debugLogger.warn(
+-        LEASE_SOURCE,
+-        `asset resolution rejected for ${assetUrl}; poisoned entry removed, rethrowing (${err instanceof Error ? err.message : String(err)})`,
+-      )
+-      throw err
+-    }
+-    // IDB miss / non-blob resolution: the originating acquire will drop the entry.
+-    // Hand back a no-op release — there is no blob to revoke.
+-    if (!blobUrl || !blobUrl.startsWith('blob:')) {
+-      return { url: blobUrl, release: noopRelease }
+-    }
+-    return { url: blobUrl, release: makeRelease(assetUrl) }
++    const token: LeaseTokenInternal = { assetUrl, entry: existing, settled: false, consumed: false }
++    return { lease: leaseForAcquire(assetUrl, existing, token), token: asToken(token) }
+   }
+ 
+-  const inFlight = resolveAssetUrl(assetUrl)
+-  const entry: LeaseEntry = { blobUrl: '', refCount: 1, inFlight }
++  // #506 三轮 F2:demo 引用不经 resolveAssetUrl,直接持有可取消的绘制请求——
++  // pending 消费者全部离场时 cancelPending 把未开始的 job 从队列移除。
++  let cancelPending: (() => void) | undefined
++  let inFlight: Promise<string>
++  if (isDemoAssetUrl(assetUrl)) {
++    const request = requestDemoImageDraw(assetUrl)
++    cancelPending = request.cancel
++    inFlight = request.promise.then((blob) => (blob ? URL.createObjectURL(blob) : ''))
++  } else {
++    inFlight = resolveAssetUrl(assetUrl)
++  }
++  const entry: LeaseEntry = { blobUrl: '', refCount: 1, inFlight, cancelPending, resolving: true }
+   leaseMap.set(assetUrl, entry)
++  attachEntrySettle(assetUrl, entry)
++  const token: LeaseTokenInternal = { assetUrl, entry, settled: false, consumed: false }
++  return { lease: leaseForAcquire(assetUrl, entry, token), token: asToken(token) }
++}
+ 
+-  let blobUrl: string
+-  try {
+-    blobUrl = await inFlight
+-  } catch (err) {
+-    // Resolution rejected — drop the entry so the next acquire re-resolves
+-    // instead of caching a rejected promise (poisoned cache, N-02).
+-    leaseMap.delete(assetUrl)
+-    debugLogger.warn(
+-      LEASE_SOURCE,
+-      `asset resolution rejected for ${assetUrl}; poisoned entry removed, rethrowing (${err instanceof Error ? err.message : String(err)})`,
+-    )
+-    throw err
+-  }
+-  entry.blobUrl = blobUrl
++/** Token-less compatibility entry — consumers that never release in the pending
++ *  window (download / clipboard bridges, tests). Same lease semantics. */
++export const acquireAssetUrl = (assetUrl?: string): Promise<AssetLease> => acquireAssetUrlLease(assetUrl).lease
+ 
+-  if (!blobUrl || !blobUrl.startsWith('blob:')) {
+-    // IDB miss or pass-through resolution — nothing to revoke. Drop the entry so
+-    // the next acquire re-attempts resolution instead of caching a miss.
+-    leaseMap.delete(assetUrl)
+-    return { url: blobUrl, release: noopRelease }
++/**
++ * #506 四轮:**解析未落定窗口**的本笔离场释放。主体是 token(某一笔 acquire),
++ * 不是 URL——同 URL 并存多笔 pending(A 换 B、失败重挂、多消费者)时,只结本笔
++ * 的账:扣掉本笔计入的引用;归零时取消未开始的 demo 绘制 job 并丢弃 entry
++ * (in-flight 对晚到的 await 方 resolve ''/miss 语义)。
++ *
++ * 返回 true = 已消费——本笔的 lease 会落定为 { url: '', release: noop },消费方
++ * 后续无条件 release 不会双扣;
++ * 返回 false = 本笔已落定 / 已消费过 / 本笔的 entry 已被摘(跨代拒绝)——一律
++ * 维持「lease 落定后 release」路径,对现存任何代际零影响。
++ */
++export const releasePendingAssetUrl = (token?: AssetLeaseToken): boolean => {
++  const internal = token as unknown as LeaseTokenInternal | undefined
++  if (!internal || !internal.entry || internal.settled || internal.consumed) return false
++  const entry = internal.entry
++  if (!entry.resolving) return false
++  if (leaseMap.get(internal.assetUrl) !== entry) return false // 跨代拒绝:本笔的 entry 已被摘
++  internal.consumed = true
++  entry.refCount -= 1
++  if (entry.refCount > 0) return true
++  if (entry.refCount < 0) {
++    debugLogger.warn(LEASE_SOURCE, `pending refCount underflow for ${internal.assetUrl}; clamped`)
++    entry.refCount = 0
+   }
+-
+-  return { url: blobUrl, release: makeRelease(assetUrl) }
++  leaseMap.delete(internal.assetUrl)
++  entry.cancelPending?.() // 未开始的 demo 绘制从队列移除;已开始/非 demo → no-op
++  return true
+ }
+ 
+ /** Test-only: expose the live entry count for assertions. Not exported to app code. */
+diff --git a/src/lib/demoAssetBridges.test.ts b/src/lib/demoAssetBridges.test.ts
+new file mode 100644
+index 00000000..618bc51d
+--- /dev/null
++++ b/src/lib/demoAssetBridges.test.ts
+@@ -0,0 +1,79 @@
++// @vitest-environment happy-dom
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #506 复审顺手项:换 scheme 后与 data URL 时代能力对齐的三条分支各一条
++// happy-path 定向测试——下载 / Copy as PNG 的位图解析 / 图生图与插件读像素共用的
++// assetBlobForNode。真实生产函数 + happy-dom canvas 桩(rAF 用真实实现,分批调度
++// 几 ms 内落定)。
++
++const debugLogger = { log: vi.fn(), warn: vi.fn(), error: vi.fn() }
++vi.mock('../store/debugLogStore', () => ({ debugLogger }))
++const toastFeedback = { error: vi.fn(), success: vi.fn(), info: vi.fn(), warn: vi.fn() }
++vi.mock('../store/toastStore', () => ({ toastFeedback }))
++vi.mock('../i18n', () => ({ t: (key: string) => key }))
++
++const { stressDemoAssetUrl } = await import('./demoAssets')
++const { downloadCanvasNodeOriginal } = await import('./assetDownload')
++const { resolveBitmapUrl } = await import('./imageNodeClipboard')
++const { assetBlobForNode } = await import('./mivoImageClient')
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++const demoNode = (index: number): MivoCanvasNode =>
++  ({
++    id: `stress-${index}`,
++    type: 'image',
++    title: `Result ${index + 1}`,
++    x: 0,
++    y: 0,
++    width: 132,
++    height: 174,
++    status: 'ready',
++    assetUrl: stressDemoAssetUrl(index),
++  }) as unknown as MivoCanvasNode
++
++const makeFake2dCtx = () => {
++  const noop = () => undefined
++  return {
++    save: noop, restore: noop, translate: noop, beginPath: noop, closePath: noop,
++    moveTo: noop, lineTo: noop, arc: noop, arcTo: noop, ellipse: noop,
++    fill: noop, stroke: noop, fillRect: noop, fillText: noop, putImageData: noop,
++    getImageData: () => ({ data: new Uint8ClampedArray(320 * 420 * 4) }),
++    createLinearGradient: () => ({ addColorStop: noop }),
++    set fillStyle(_v: unknown) {}, set strokeStyle(_v: unknown) {},
++    set lineWidth(_v: unknown) {}, set globalAlpha(_v: unknown) {}, set font(_v: unknown) {},
++  } as unknown as CanvasRenderingContext2D
++}
++
++describe('#506 demo 引用的能力对齐分支(happy-path 定向)', () => {
++  beforeEach(() => {
++    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation((() => makeFake2dCtx()) as never)
++    Object.defineProperty(HTMLCanvasElement.prototype, 'toBlob', {
++      configurable: true,
++      value: function toBlob(cb: (blob: Blob) => void) {
++        cb(new Blob(['demo-jpeg-bytes'], { type: 'image/jpeg' }))
++      },
++    })
++  })
++  afterEach(() => {
++    vi.restoreAllMocks()
++  })
++
++  it('下载:downloadCanvasNodeOriginal(demo 节点)→ completed(现画成 blob 触发下载)', async () => {
++    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
++    expect(await downloadCanvasNodeOriginal(demoNode(4))).toBe('completed')
++    expect(clickSpy).toHaveBeenCalledTimes(1) // 真触发了下载锚点
++  })
++
++  it('Copy as PNG 位图解析:resolveBitmapUrl(demo 引用)→ blob: URL + revoke 句柄', async () => {
++    const resolved = await resolveBitmapUrl(stressDemoAssetUrl(9))
++    expect(resolved.url.startsWith('blob:')).toBe(true)
++    expect(typeof resolved.revoke).toBe('function')
++    resolved.revoke?.() // 用后即焚,无泄漏
++  })
++
++  it('图生图/插件读像素:assetBlobForNode(demo 节点)→ JPEG Blob', async () => {
++    const blob = await assetBlobForNode(demoNode(2))
++    expect(blob).toBeInstanceOf(Blob)
++    expect(blob.type).toBe('image/jpeg')
++  })
++})
+diff --git a/src/lib/demoAssets.batch.test.ts b/src/lib/demoAssets.batch.test.ts
+new file mode 100644
+index 00000000..dcfe9022
+--- /dev/null
++++ b/src/lib/demoAssets.batch.test.ts
+@@ -0,0 +1,149 @@
++// @vitest-environment happy-dom
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #506 三轮 F2:绘制调度 = **时间预算切片**(每帧至少 1 张,超 DEMO_DRAW_FRAME_
++// BUDGET_MS 即让帧——固定张数在慢机上单帧仍可能 ~30ms)+ **取消语义**(job 未
++// 开始时最后消费者离场 → 从队列移除,stale 绘制不抢占新场景、不阻塞新请求)。
++// rAF 与时钟均为可控桩:每张画耗 3ms 假钟 → 8ms 预算 = 每帧恰 3 张。
++
++const { requestDemoImageDraw, renderDemoImageBlob, stressDemoAssetUrl, DEMO_DRAW_FRAME_BUDGET_MS, __demoDrawQueueSize } =
++  await import('./demoAssets')
++
++const makeFake2dCtx = () => {
++  const noop = () => undefined
++  return {
++    save: noop, restore: noop, translate: noop, beginPath: noop, closePath: noop,
++    moveTo: noop, lineTo: noop, arc: noop, arcTo: noop, ellipse: noop,
++    fill: noop, stroke: noop, fillRect: noop, fillText: noop, putImageData: noop,
++    getImageData: () => ({ data: new Uint8ClampedArray(320 * 420 * 4) }),
++    createLinearGradient: () => ({ addColorStop: noop }),
++    set fillStyle(_v: unknown) {}, set strokeStyle(_v: unknown) {},
++    set lineWidth(_v: unknown) {}, set globalAlpha(_v: unknown) {}, set font(_v: unknown) {},
++  } as unknown as CanvasRenderingContext2D
++}
++
++const MS_PER_DRAW = 3
++const DRAWS_PER_FRAME = 3 // 3ms/张 × 8ms 预算:画到第 3 张(9ms ≥ 8ms)让帧
++
++let drawCount = 0
++let fakeNowMs = 0
++let rafQueue: FrameRequestCallback[]
++
++const runFrame = () => {
++  const callbacks = rafQueue.splice(0)
++  for (const callback of callbacks) callback(0)
++}
++
++describe('demoAssets 时间预算分批 + 取消语义(#506 三轮 F2)', () => {
++  beforeEach(() => {
++    drawCount = 0
++    fakeNowMs = 0
++    rafQueue = []
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      rafQueue.push(callback)
++      return rafQueue.length
++    })
++    vi.stubGlobal('performance', { now: () => fakeNowMs })
++    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation((() => makeFake2dCtx()) as never)
++    Object.defineProperty(HTMLCanvasElement.prototype, 'toBlob', {
++      configurable: true,
++      value: function toBlob(cb: (blob: Blob) => void) {
++        drawCount += 1
++        fakeNowMs += MS_PER_DRAW // 每张画耗 3ms 假钟
++        cb(new Blob(['demo-jpeg-bytes'], { type: 'image/jpeg' }))
++      },
++    })
++  })
++  afterEach(() => {
++    for (let i = 0; i < 60 && (rafQueue.length > 0 || __demoDrawQueueSize() > 0); i += 1) runFrame()
++    vi.unstubAllGlobals()
++    vi.restoreAllMocks()
++  })
++
++  it('时间预算:100 张入队零同步绘制;每帧画到超 8ms 预算即让帧(3ms/张 → 每帧恰 3 张)', async () => {
++    const promises = Array.from({ length: 100 }, (_, index) => renderDemoImageBlob(stressDemoAssetUrl(index)))
++    expect(drawCount).toBe(0) // 同帧 mount 100 个节点:主线程零同步绘制
++    expect(DEMO_DRAW_FRAME_BUDGET_MS).toBe(8)
++
++    let frames = 0
++    while (__demoDrawQueueSize() > 0 && frames < 60) {
++      const before = drawCount
++      runFrame()
++      frames += 1
++      expect(drawCount - before).toBeLessThanOrEqual(DRAWS_PER_FRAME) // 超预算即让帧
++    }
++    expect(drawCount).toBe(100)
++    expect(frames).toBe(Math.ceil(100 / DRAWS_PER_FRAME)) // 100 张分布在 34 帧
++    const blobs = await Promise.all(promises)
++    expect(blobs.every((blob) => blob instanceof Blob)).toBe(true)
++  })
++
++  it('全量离场取消:100 请求在首帧前全部 cancel → 队列空、promise 全 resolve null、后续零绘制', async () => {
++    const requests = Array.from({ length: 100 }, (_, index) => requestDemoImageDraw(stressDemoAssetUrl(index)))
++    expect(__demoDrawQueueSize()).toBe(100)
++    for (const request of requests) request.cancel()
++    expect(__demoDrawQueueSize()).toBe(0) // 队列即刻清空
++    runFrame()
++    expect(drawCount).toBe(0) // stale 绘制一张都不画
++    const results = await Promise.all(requests.map((r) => r.promise))
++    expect(results.every((blob) => blob === null)).toBe(true)
++  })
++
++  it('中途取消:画了一帧后取消剩余 → 已开始的照常完成,未开始的移除;cancel 幂等', async () => {
++    const requests = Array.from({ length: 10 }, (_, index) => requestDemoImageDraw(stressDemoAssetUrl(index)))
++    runFrame() // 画 3 张
++    expect(drawCount).toBe(DRAWS_PER_FRAME)
++    for (const request of requests) {
++      request.cancel()
++      request.cancel() // 幂等
++    }
++    expect(__demoDrawQueueSize()).toBe(0)
++    runFrame()
++    expect(drawCount).toBe(DRAWS_PER_FRAME) // 取消后零新绘制
++    const results = await Promise.all(requests.map((r) => r.promise))
++    expect(results.slice(0, DRAWS_PER_FRAME).every((blob) => blob instanceof Blob)).toBe(true) // 已开始的画完
++    expect(results.slice(DRAWS_PER_FRAME).every((blob) => blob === null)).toBe(true)
++  })
++
++  it('新请求不被 stale job 阻塞:旧场景 100 张取消后,新请求首帧即画', async () => {
++    const stale = Array.from({ length: 100 }, (_, index) => requestDemoImageDraw(stressDemoAssetUrl(index)))
++    for (const request of stale) request.cancel() // 场景切换:全部离场
++    const fresh = renderDemoImageBlob(stressDemoAssetUrl(42))
++    expect(__demoDrawQueueSize()).toBe(1) // 队列里只有新请求
++    runFrame()
++    expect(drawCount).toBe(1)
++    expect(await fresh).toBeInstanceOf(Blob)
++  })
++
++  it('非法引用不入队直接 resolve null,不占帧预算', async () => {
++    expect(await renderDemoImageBlob('mivo-demo:stress/999')).toBeNull()
++    expect(__demoDrawQueueSize()).toBe(0)
++    expect(drawCount).toBe(0)
++  })
++
++  it('rAF 缺失环境:setTimeout 0 降级路径照常分批(审核补强项)', async () => {
++    // 手工 setTimeout 桩(vitest 假计时器会把同一虚拟时刻的链式 0ms timer 一口气
++    // 跑完,看不出分批)——逐"帧"手动放行,口径与 rAF 桩一致。
++    const timeoutQueue: Array<() => void> = []
++    vi.stubGlobal('requestAnimationFrame', undefined)
++    vi.stubGlobal('setTimeout', ((cb: () => void) => {
++      timeoutQueue.push(cb)
++      return 0
++    }) as never)
++    const runTimeoutFrame = () => {
++      const callbacks = timeoutQueue.splice(0)
++      for (const callback of callbacks) callback()
++    }
++    const promises = Array.from({ length: 7 }, (_, index) => renderDemoImageBlob(stressDemoAssetUrl(index)))
++    expect(drawCount).toBe(0)
++    runTimeoutFrame() // 第一批(3 张)
++    expect(drawCount).toBe(DRAWS_PER_FRAME)
++    runTimeoutFrame()
++    expect(drawCount).toBe(DRAWS_PER_FRAME * 2)
++    runTimeoutFrame()
++    expect(drawCount).toBe(7)
++    vi.unstubAllGlobals()
++    const blobs = await Promise.all(promises)
++    expect(blobs.every((blob) => blob instanceof Blob)).toBe(true)
++  })
++})
+diff --git a/src/lib/demoAssets.test.ts b/src/lib/demoAssets.test.ts
+new file mode 100644
+index 00000000..c87e2b13
+--- /dev/null
++++ b/src/lib/demoAssets.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it } from 'vitest'
++
++// #506:mivo-demo: 引用编解码与参数推导的纯函数契约。参数矩阵是渲染的单一
++// 真相源——demoScenes 种子与 v13 迁移都只存引用,同一引用必须永远推导出同一
++// 组绘制参数(否则迁移后老用户看到的图与原 base64 不一致)。
++
++import {
++  DEMO_ASSET_URL_PREFIX,
++  STRESS_DEMO_NODE_COUNT,
++  isDemoAssetUrl,
++  parseDemoAssetUrl,
++  stressDemoAssetUrl,
++  stressDemoImageOptions,
++} from './demoAssets'
++
++describe('demoAssets — mivo-demo: 引用编解码(#506)', () => {
++  it('编码/判定:stressDemoAssetUrl 产出 mivo-demo:stress/<index>,isDemoAssetUrl 识别', () => {
++    expect(stressDemoAssetUrl(0)).toBe('mivo-demo:stress/0')
++    expect(stressDemoAssetUrl(99)).toBe('mivo-demo:stress/99')
++    expect(isDemoAssetUrl(stressDemoAssetUrl(42))).toBe(true)
++    expect(isDemoAssetUrl('mivo-asset:abc')).toBe(false)
++    expect(isDemoAssetUrl('data:image/jpeg;base64,xxx')).toBe(false)
++    expect(isDemoAssetUrl(undefined)).toBe(false)
++    expect(DEMO_ASSET_URL_PREFIX).toBe('mivo-demo:')
++  })
++
++  it('round-trip:parse(encode(i)) 的参数与 stressDemoImageOptions(i) 全等(0..99)', () => {
++    for (let index = 0; index < STRESS_DEMO_NODE_COUNT; index += 1) {
++      expect(parseDemoAssetUrl(stressDemoAssetUrl(index))).toEqual(stressDemoImageOptions(index))
++    }
++  })
++
++  it('参数矩阵与旧 demoScenes 内联逐字段一致(迁移后图案不变的依据)', () => {
++    // 旧实现:label=R{i+1};mood 按 i%3 轮转;seed=3000+(i%12);accent/secondary 按 i%4 取色板
++    expect(stressDemoImageOptions(0)).toEqual({ label: 'R1', mood: 'character', seed: 3000, accent: '#a85232', secondary: '#d9c098' })
++    expect(stressDemoImageOptions(1)).toEqual({ label: 'R2', mood: 'variant', seed: 3001, accent: '#557463', secondary: '#a9beb0' })
++    expect(stressDemoImageOptions(2)).toEqual({ label: 'R3', mood: 'environment', seed: 3002, accent: '#566d89', secondary: '#b5c0d0' })
++    expect(stressDemoImageOptions(14)).toEqual({ label: 'R15', mood: 'environment', seed: 3002, accent: '#566d89', secondary: '#b5c0d0' })
++  })
++
++  it('parse 拒绝不合法引用(未知路径/越界 index/非数字)→ null,不抛', () => {
++    expect(parseDemoAssetUrl('mivo-demo:unknown/1')).toBeNull()
++    expect(parseDemoAssetUrl('mivo-demo:stress/100')).toBeNull() // 越界
++    expect(parseDemoAssetUrl('mivo-demo:stress/-1')).toBeNull()
++    expect(parseDemoAssetUrl('mivo-demo:stress/abc')).toBeNull()
++    expect(parseDemoAssetUrl('mivo-asset:xyz')).toBeNull()
++  })
++})
+diff --git a/src/lib/demoAssets.ts b/src/lib/demoAssets.ts
+new file mode 100644
+index 00000000..d2940f7f
+--- /dev/null
++++ b/src/lib/demoAssets.ts
+@@ -0,0 +1,410 @@
++// demoAssets — demo 图的 mivo-demo: 引用编解码 + 惰性绘制(#506)。
++//
++// 此前 demoScenes 的 stress-test 场景在 store 初始化时同步生成 100 张 base64
++// data URL(20-40KB/张)塞进节点 assetUrl:base64 进 store、进持久化 blob(全新
++// 用户第一天就背几 MB),模块级 imageCache 还把全量 data URL 常驻堆。现在节点只
++// 存 `mivo-demo:stress/<index>` 微型引用,渲染时经 assetStorage.resolveAssetUrl +
++// assetUrlLease 惰性绘制成 blob URL(引用计数归零即 revoke)。绘制函数自
++// demoImages.ts 原样迁移;demoImages.ts 保留 createDemoImage 兼容出口(无缓存)。
++
++export type DemoImageOptions = {
++  label: string
++  accent: string
++  secondary: string
++  mood: 'character' | 'environment' | 'variant' | 'asset'
++  seed: number
++}
++
++const seededRandom = (seed: number) => {
++  let value = seed % 2147483647
++  if (value <= 0) value += 2147483646
++  return () => {
++    value = (value * 16807) % 2147483647
++    return (value - 1) / 2147483646
++  }
++}
++
++const addNoise = (
++  ctx: CanvasRenderingContext2D,
++  width: number,
++  height: number,
++  seed: number,
++) => {
++  const random = seededRandom(seed)
++  const imageData = ctx.getImageData(0, 0, width, height)
++  const { data } = imageData
++
++  for (let index = 0; index < data.length; index += 4) {
++    const n = (random() - 0.5) * 18
++    data[index] += n
++    data[index + 1] += n
++    data[index + 2] += n
++  }
++
++  ctx.putImageData(imageData, 0, 0)
++}
++
++const roundedRect = (
++  ctx: CanvasRenderingContext2D,
++  x: number,
++  y: number,
++  width: number,
++  height: number,
++  radius: number,
++) => {
++  const r = Math.min(radius, width / 2, height / 2)
++  ctx.beginPath()
++  ctx.moveTo(x + r, y)
++  ctx.arcTo(x + width, y, x + width, y + height, r)
++  ctx.arcTo(x + width, y + height, x, y + height, r)
++  ctx.arcTo(x, y + height, x, y, r)
++  ctx.arcTo(x, y, x + width, y, r)
++  ctx.closePath()
++}
++
++const drawCharacter = (
++  ctx: CanvasRenderingContext2D,
++  options: DemoImageOptions,
++  random: () => number,
++) => {
++  const { accent, secondary } = options
++  ctx.save()
++  ctx.translate(160 + random() * 22, 105)
++
++  ctx.fillStyle = 'rgba(255,255,255,0.66)'
++  roundedRect(ctx, 80, 260, 155, 52, 18)
++  ctx.fill()
++
++  ctx.fillStyle = secondary
++  roundedRect(ctx, 74, 114, 168, 230, 72)
++  ctx.fill()
++
++  ctx.fillStyle = accent
++  ctx.beginPath()
++  ctx.ellipse(158, 108, 72, 88, -0.08, 0, Math.PI * 2)
++  ctx.fill()
++
++  ctx.fillStyle = 'rgba(18, 22, 26, 0.88)'
++  roundedRect(ctx, 92, 52, 132, 108, 48)
++  ctx.fill()
++
++  ctx.fillStyle = '#f3c7a2'
++  ctx.beginPath()
++  ctx.ellipse(158, 136, 54, 60, 0, 0, Math.PI * 2)
++  ctx.fill()
++
++  ctx.fillStyle = 'rgba(20, 24, 28, 0.9)'
++  ctx.beginPath()
++  ctx.ellipse(139, 130, 5, 7, 0, 0, Math.PI * 2)
++  ctx.ellipse(177, 130, 5, 7, 0, 0, Math.PI * 2)
++  ctx.fill()
++
++  ctx.strokeStyle = 'rgba(20, 24, 28, 0.58)'
++  ctx.lineWidth = 3
++  ctx.beginPath()
++  ctx.arc(158, 151, 16, 0.15, Math.PI - 0.15)
++  ctx.stroke()
++
++  ctx.fillStyle = 'rgba(255,255,255,0.34)'
++  for (let i = 0; i < 26; i += 1) {
++    const x = 42 + random() * 238
++    const y = 22 + random() * 330
++    ctx.fillRect(x, y, 2 + random() * 6, 2 + random() * 6)
++  }
++
++  ctx.restore()
++}
++
++const drawEnvironment = (
++  ctx: CanvasRenderingContext2D,
++  options: DemoImageOptions,
++  random: () => number,
++) => {
++  const { accent, secondary } = options
++
++  ctx.fillStyle = 'rgba(255,255,255,0.48)'
++  ctx.beginPath()
++  ctx.moveTo(0, 302)
++  for (let x = 0; x <= 320; x += 18) {
++    ctx.lineTo(x, 258 + random() * 46)
++  }
++  ctx.lineTo(320, 420)
++  ctx.lineTo(0, 420)
++  ctx.fill()
++
++  ctx.fillStyle = secondary
++  ctx.beginPath()
++  ctx.moveTo(0, 244)
++  for (let x = 0; x <= 320; x += 22) {
++    ctx.lineTo(x, 168 + random() * 56)
++  }
++  ctx.lineTo(320, 420)
++  ctx.lineTo(0, 420)
++  ctx.fill()
++
++  ctx.fillStyle = accent
++  for (let i = 0; i < 9; i += 1) {
++    const x = 28 + random() * 236
++    const y = 96 + random() * 180
++    roundedRect(ctx, x, y, 28 + random() * 44, 84 + random() * 96, 12)
++    ctx.fill()
++  }
++
++  ctx.strokeStyle = 'rgba(255,255,255,0.52)'
++  ctx.lineWidth = 2
++  for (let i = 0; i < 14; i += 1) {
++    const x = 18 + random() * 284
++    ctx.beginPath()
++    ctx.moveTo(x, 44)
++    ctx.lineTo(x + 18 - random() * 36, 360)
++    ctx.stroke()
++  }
++}
++
++const drawVariant = (
++  ctx: CanvasRenderingContext2D,
++  options: DemoImageOptions,
++  random: () => number,
++) => {
++  const { accent, secondary } = options
++  ctx.fillStyle = 'rgba(255,255,255,0.7)'
++  ctx.beginPath()
++  ctx.ellipse(160, 216, 116, 144, -0.08 + random() * 0.18, 0, Math.PI * 2)
++  ctx.fill()
++
++  ctx.fillStyle = secondary
++  ctx.beginPath()
++  ctx.ellipse(160, 174, 92, 96, random() * 0.2, 0, Math.PI * 2)
++  ctx.fill()
++
++  ctx.strokeStyle = accent
++  ctx.lineWidth = 12
++  ctx.beginPath()
++  ctx.arc(160, 198, 86, 0.2, Math.PI * 1.72)
++  ctx.stroke()
++
++  ctx.fillStyle = accent
++  for (let i = 0; i < 18; i += 1) {
++    ctx.beginPath()
++    ctx.arc(70 + random() * 180, 70 + random() * 260, 3 + random() * 9, 0, Math.PI * 2)
++    ctx.fill()
++  }
++}
++
++const drawAsset = (
++  ctx: CanvasRenderingContext2D,
++  options: DemoImageOptions,
++  random: () => number,
++) => {
++  const { accent, secondary } = options
++  for (let i = 0; i < 7; i += 1) {
++    ctx.fillStyle = i % 2 ? accent : secondary
++    roundedRect(ctx, 34 + i * 27, 92 + random() * 22, 88, 220 - i * 16, 24)
++    ctx.fill()
++  }
++
++  ctx.fillStyle = 'rgba(255,255,255,0.78)'
++  roundedRect(ctx, 74, 266, 176, 68, 18)
++  ctx.fill()
++}
++
++
++/** 绘制一张 demo 图到离屏 canvas(无缓存——调用方经 assetUrlLease 引用计数
++ *  共享/回收,不再有常驻 data URL 的模块级 Map)。无 DOM/2d 上下文(node 测试
++ *  环境)返回 null。 */
++export const drawDemoImage = (options: DemoImageOptions): HTMLCanvasElement | null => {
++  if (typeof document === 'undefined' || typeof document.createElement !== 'function') return null
++  const width = 320
++  const height = 420
++  const canvas = document.createElement('canvas')
++  canvas.width = width
++  canvas.height = height
++  const ctx = canvas.getContext('2d')
++  if (!ctx) return null
++
++  const random = seededRandom(options.seed)
++  const gradient = ctx.createLinearGradient(0, 0, width, height)
++  gradient.addColorStop(0, '#f6f1e7')
++  gradient.addColorStop(0.44, options.secondary)
++  gradient.addColorStop(1, '#26332f')
++  ctx.fillStyle = gradient
++  ctx.fillRect(0, 0, width, height)
++
++  ctx.globalAlpha = 0.16
++  ctx.strokeStyle = '#ffffff'
++  ctx.lineWidth = 1
++  for (let x = -40; x < width + 40; x += 28) {
++    ctx.beginPath()
++    ctx.moveTo(x, 0)
++    ctx.lineTo(x + 118, height)
++    ctx.stroke()
++  }
++  ctx.globalAlpha = 1
++
++  if (options.mood === 'character') drawCharacter(ctx, options, random)
++  if (options.mood === 'environment') drawEnvironment(ctx, options, random)
++  if (options.mood === 'variant') drawVariant(ctx, options, random)
++  if (options.mood === 'asset') drawAsset(ctx, options, random)
++
++  addNoise(ctx, width, height, options.seed)
++
++  ctx.fillStyle = 'rgba(15, 18, 20, 0.72)'
++  roundedRect(ctx, 18, 360, 284, 38, 13)
++  ctx.fill()
++
++  ctx.fillStyle = 'rgba(255,255,255,0.92)'
++  ctx.font = '700 18px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont'
++  ctx.fillText(options.label, 34, 385)
++
++  return canvas
++}
++
++// ── mivo-demo: 引用(#506)────────────────────────────────────────────────────
++// demo 图不再以 base64 data URL 进 store/持久化——节点只存微型引用
++// `mivo-demo:stress/<index>`,渲染时经 assetUrlLease 惰性生成 blob URL(引用
++// 计数归零即 revoke,离开场景自动释放)。参数从 index 确定性推导(与旧
++// demoScenes 内联矩阵逐字段一致),同一引用永远渲染同一张图。
++
++export const DEMO_ASSET_URL_PREFIX = 'mivo-demo:'
++
++export const isDemoAssetUrl = (assetUrl?: string): assetUrl is string =>
++  Boolean(assetUrl && assetUrl.startsWith(DEMO_ASSET_URL_PREFIX))
++
++export const STRESS_DEMO_NODE_COUNT = 100
++
++const STRESS_ACCENTS = ['#a85232', '#557463', '#566d89', '#7b5b4e'] as const
++const STRESS_SECONDARIES = ['#d9c098', '#a9beb0', '#b5c0d0', '#d4b89d'] as const
++
++/** stress-test 第 index 张图的绘制参数(单一真相源;demoScenes 种子与 v13 迁移
++ *  重建都从这里推导,不得再内联复制矩阵)。 */
++export const stressDemoImageOptions = (index: number): DemoImageOptions => ({
++  label: `R${index + 1}`,
++  mood: index % 3 === 0 ? 'character' : index % 3 === 1 ? 'variant' : 'environment',
++  seed: 3000 + (index % 12),
++  accent: STRESS_ACCENTS[index % 4],
++  secondary: STRESS_SECONDARIES[index % 4],
++})
++
++export const stressDemoAssetUrl = (index: number): string => `${DEMO_ASSET_URL_PREFIX}stress/${index}`
++
++/** 解析 mivo-demo: 引用 → 绘制参数;不认识的形状返回 null(渲染侧落 error 态,
++ *  不抛)。index 夹取到 [0, 99] 防越界引用产生 NaN 参数。 */
++export const parseDemoAssetUrl = (assetUrl: string): DemoImageOptions | null => {
++  if (!isDemoAssetUrl(assetUrl)) return null
++  const match = /^mivo-demo:stress\/(\d{1,3})$/.exec(assetUrl)
++  if (!match) return null
++  const index = Number(match[1])
++  if (!Number.isInteger(index) || index < 0 || index >= STRESS_DEMO_NODE_COUNT) return null
++  return stressDemoImageOptions(index)
++}
++
++// ── 分批绘制调度(#506 复审 F4 / 三轮 F2)──────────────────────────────────────
++// 首入 stress 场景时 100 个节点同帧 mount → 100 次 acquire 同帧同步画完 = 主线程
++// ~300ms 长任务。绘制请求进队列,每帧(rAF;无 rAF 环境退 setTimeout 0)按**时间
++// 预算**切片(DEMO_DRAW_FRAME_BUDGET_MS,每帧至少画 1 张、超预算即让帧——固定
++// 张数在慢机上单帧仍可能超 30ms)。job 携带取消句柄(requestDemoImageDraw 返回
++// {promise, cancel}):最后消费者在 job 开始前离场 → 从队列移除并 resolve null,
++// stale 绘制不再跨帧抢占新场景,新请求也不会排在已离场的 job 之后;已开始的
++// job 照常画完。未绘完时渲染层照常按异步加载占位(Leafer Image 本就异步)。
++
++export const DEMO_DRAW_FRAME_BUDGET_MS = 8
++
++type QueuedDemoDraw = {
++  options: DemoImageOptions
++  started: boolean
++  cancelled: boolean
++  resolve: (blob: Blob | null) => void
++}
++
++const demoDrawQueue: QueuedDemoDraw[] = []
++let demoDrawPumpScheduled = false
++
++const demoDrawNow = (): number =>
++  typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now()
++
++const scheduleDemoDrawFrame = (run: () => void): void => {
++  if (typeof requestAnimationFrame === 'function') {
++    requestAnimationFrame(() => run())
++    return
++  }
++  setTimeout(run, 0)
++}
++
++const drawQueuedDemoImage = (job: QueuedDemoDraw): void => {
++  const canvas = drawDemoImage(job.options)
++  if (!canvas) {
++    job.resolve(null)
++    return
++  }
++  if (typeof canvas.toBlob === 'function') {
++    canvas.toBlob((blob) => job.resolve(blob), 'image/jpeg', 0.78)
++    return
++  }
++  // toBlob 不可用的极端环境:退回 data URL 转 Blob(仍不进 store,仅本次渲染)。
++  try {
++    const dataUrl = canvas.toDataURL('image/jpeg', 0.78)
++    const [, base64] = dataUrl.split(',')
++    const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
++    job.resolve(new Blob([bytes], { type: 'image/jpeg' }))
++  } catch {
++    job.resolve(null)
++  }
++}
++
++const pumpDemoDrawQueue = (): void => {
++  demoDrawPumpScheduled = false
++  const frameStart = demoDrawNow()
++  // 时间预算切片:每帧至少推进 1 张(否则慢机上永不前进),超预算即让帧。
++  while (demoDrawQueue.length > 0) {
++    const job = demoDrawQueue.shift()!
++    job.started = true
++    drawQueuedDemoImage(job)
++    if (demoDrawNow() - frameStart >= DEMO_DRAW_FRAME_BUDGET_MS) break
++  }
++  if (demoDrawQueue.length > 0) scheduleDemoDrawPump()
++}
++
++const scheduleDemoDrawPump = (): void => {
++  if (demoDrawPumpScheduled) return
++  demoDrawPumpScheduled = true
++  scheduleDemoDrawFrame(pumpDemoDrawQueue)
++}
++
++export type DemoImageDrawRequest = {
++  promise: Promise<Blob | null>
++  /** 取消句柄:job 尚未开始 → 从队列移除并 resolve null(幂等);已开始/已完成
++   *  → no-op(本批画完,不中断)。 */
++  cancel: () => void
++}
++
++/** mivo-demo: 引用 → 可取消的绘制请求(惰性,无缓存,经时间预算分批调度)。
++ *  引用不合法立即 resolve null 且不占帧预算。 */
++export const requestDemoImageDraw = (assetUrl: string): DemoImageDrawRequest => {
++  const options = parseDemoAssetUrl(assetUrl)
++  if (!options) return { promise: Promise.resolve(null), cancel: () => undefined }
++  let resolveFn: (blob: Blob | null) => void = () => undefined
++  const promise = new Promise<Blob | null>((resolve) => {
++    resolveFn = resolve
++  })
++  const job: QueuedDemoDraw = { options, started: false, cancelled: false, resolve: resolveFn }
++  demoDrawQueue.push(job)
++  scheduleDemoDrawPump()
++  return {
++    promise,
++    cancel: () => {
++      if (job.started || job.cancelled) return
++      job.cancelled = true
++      const index = demoDrawQueue.indexOf(job)
++      if (index >= 0) demoDrawQueue.splice(index, 1)
++      job.resolve(null)
++    },
++  }
++}
++
++/** mivo-demo: 引用 → JPEG Blob(不可取消形态:下载/剪贴板/图生图等一次性消费方
++ *  明确要等结果)。 */
++export const renderDemoImageBlob = (assetUrl: string): Promise<Blob | null> =>
++  requestDemoImageDraw(assetUrl).promise
++
++/** 测试观测:当前排队未开始的绘制 job 数。 */
++export const __demoDrawQueueSize = (): number => demoDrawQueue.length
+diff --git a/src/lib/demoImages.ts b/src/lib/demoImages.ts
+index 0eb6d8ee..d7a6abed 100644
+--- a/src/lib/demoImages.ts
++++ b/src/lib/demoImages.ts
+@@ -1,254 +1,12 @@
+-type DemoImageOptions = {
+-  label: string
+-  accent: string
+-  secondary: string
+-  mood: 'character' | 'environment' | 'variant' | 'asset'
+-  seed: number
+-}
+-
+-const imageCache = new Map<string, string>()
+-
+-const seededRandom = (seed: number) => {
+-  let value = seed % 2147483647
+-  if (value <= 0) value += 2147483646
+-  return () => {
+-    value = (value * 16807) % 2147483647
+-    return (value - 1) / 2147483646
+-  }
+-}
+-
+-const addNoise = (
+-  ctx: CanvasRenderingContext2D,
+-  width: number,
+-  height: number,
+-  seed: number,
+-) => {
+-  const random = seededRandom(seed)
+-  const imageData = ctx.getImageData(0, 0, width, height)
+-  const { data } = imageData
+-
+-  for (let index = 0; index < data.length; index += 4) {
+-    const n = (random() - 0.5) * 18
+-    data[index] += n
+-    data[index + 1] += n
+-    data[index + 2] += n
+-  }
+-
+-  ctx.putImageData(imageData, 0, 0)
+-}
+-
+-const roundedRect = (
+-  ctx: CanvasRenderingContext2D,
+-  x: number,
+-  y: number,
+-  width: number,
+-  height: number,
+-  radius: number,
+-) => {
+-  const r = Math.min(radius, width / 2, height / 2)
+-  ctx.beginPath()
+-  ctx.moveTo(x + r, y)
+-  ctx.arcTo(x + width, y, x + width, y + height, r)
+-  ctx.arcTo(x + width, y + height, x, y + height, r)
+-  ctx.arcTo(x, y + height, x, y, r)
+-  ctx.arcTo(x, y, x + width, y, r)
+-  ctx.closePath()
+-}
+-
+-const drawCharacter = (
+-  ctx: CanvasRenderingContext2D,
+-  options: DemoImageOptions,
+-  random: () => number,
+-) => {
+-  const { accent, secondary } = options
+-  ctx.save()
+-  ctx.translate(160 + random() * 22, 105)
+-
+-  ctx.fillStyle = 'rgba(255,255,255,0.66)'
+-  roundedRect(ctx, 80, 260, 155, 52, 18)
+-  ctx.fill()
+-
+-  ctx.fillStyle = secondary
+-  roundedRect(ctx, 74, 114, 168, 230, 72)
+-  ctx.fill()
+-
+-  ctx.fillStyle = accent
+-  ctx.beginPath()
+-  ctx.ellipse(158, 108, 72, 88, -0.08, 0, Math.PI * 2)
+-  ctx.fill()
+-
+-  ctx.fillStyle = 'rgba(18, 22, 26, 0.88)'
+-  roundedRect(ctx, 92, 52, 132, 108, 48)
+-  ctx.fill()
+-
+-  ctx.fillStyle = '#f3c7a2'
+-  ctx.beginPath()
+-  ctx.ellipse(158, 136, 54, 60, 0, 0, Math.PI * 2)
+-  ctx.fill()
+-
+-  ctx.fillStyle = 'rgba(20, 24, 28, 0.9)'
+-  ctx.beginPath()
+-  ctx.ellipse(139, 130, 5, 7, 0, 0, Math.PI * 2)
+-  ctx.ellipse(177, 130, 5, 7, 0, 0, Math.PI * 2)
+-  ctx.fill()
+-
+-  ctx.strokeStyle = 'rgba(20, 24, 28, 0.58)'
+-  ctx.lineWidth = 3
+-  ctx.beginPath()
+-  ctx.arc(158, 151, 16, 0.15, Math.PI - 0.15)
+-  ctx.stroke()
+-
+-  ctx.fillStyle = 'rgba(255,255,255,0.34)'
+-  for (let i = 0; i < 26; i += 1) {
+-    const x = 42 + random() * 238
+-    const y = 22 + random() * 330
+-    ctx.fillRect(x, y, 2 + random() * 6, 2 + random() * 6)
+-  }
+-
+-  ctx.restore()
+-}
+-
+-const drawEnvironment = (
+-  ctx: CanvasRenderingContext2D,
+-  options: DemoImageOptions,
+-  random: () => number,
+-) => {
+-  const { accent, secondary } = options
+-
+-  ctx.fillStyle = 'rgba(255,255,255,0.48)'
+-  ctx.beginPath()
+-  ctx.moveTo(0, 302)
+-  for (let x = 0; x <= 320; x += 18) {
+-    ctx.lineTo(x, 258 + random() * 46)
+-  }
+-  ctx.lineTo(320, 420)
+-  ctx.lineTo(0, 420)
+-  ctx.fill()
+-
+-  ctx.fillStyle = secondary
+-  ctx.beginPath()
+-  ctx.moveTo(0, 244)
+-  for (let x = 0; x <= 320; x += 22) {
+-    ctx.lineTo(x, 168 + random() * 56)
+-  }
+-  ctx.lineTo(320, 420)
+-  ctx.lineTo(0, 420)
+-  ctx.fill()
+-
+-  ctx.fillStyle = accent
+-  for (let i = 0; i < 9; i += 1) {
+-    const x = 28 + random() * 236
+-    const y = 96 + random() * 180
+-    roundedRect(ctx, x, y, 28 + random() * 44, 84 + random() * 96, 12)
+-    ctx.fill()
+-  }
+-
+-  ctx.strokeStyle = 'rgba(255,255,255,0.52)'
+-  ctx.lineWidth = 2
+-  for (let i = 0; i < 14; i += 1) {
+-    const x = 18 + random() * 284
+-    ctx.beginPath()
+-    ctx.moveTo(x, 44)
+-    ctx.lineTo(x + 18 - random() * 36, 360)
+-    ctx.stroke()
+-  }
+-}
+-
+-const drawVariant = (
+-  ctx: CanvasRenderingContext2D,
+-  options: DemoImageOptions,
+-  random: () => number,
+-) => {
+-  const { accent, secondary } = options
+-  ctx.fillStyle = 'rgba(255,255,255,0.7)'
+-  ctx.beginPath()
+-  ctx.ellipse(160, 216, 116, 144, -0.08 + random() * 0.18, 0, Math.PI * 2)
+-  ctx.fill()
+-
+-  ctx.fillStyle = secondary
+-  ctx.beginPath()
+-  ctx.ellipse(160, 174, 92, 96, random() * 0.2, 0, Math.PI * 2)
+-  ctx.fill()
+-
+-  ctx.strokeStyle = accent
+-  ctx.lineWidth = 12
+-  ctx.beginPath()
+-  ctx.arc(160, 198, 86, 0.2, Math.PI * 1.72)
+-  ctx.stroke()
+-
+-  ctx.fillStyle = accent
+-  for (let i = 0; i < 18; i += 1) {
+-    ctx.beginPath()
+-    ctx.arc(70 + random() * 180, 70 + random() * 260, 3 + random() * 9, 0, Math.PI * 2)
+-    ctx.fill()
+-  }
+-}
+-
+-const drawAsset = (
+-  ctx: CanvasRenderingContext2D,
+-  options: DemoImageOptions,
+-  random: () => number,
+-) => {
+-  const { accent, secondary } = options
+-  for (let i = 0; i < 7; i += 1) {
+-    ctx.fillStyle = i % 2 ? accent : secondary
+-    roundedRect(ctx, 34 + i * 27, 92 + random() * 22, 88, 220 - i * 16, 24)
+-    ctx.fill()
+-  }
+-
+-  ctx.fillStyle = 'rgba(255,255,255,0.78)'
+-  roundedRect(ctx, 74, 266, 176, 68, 18)
+-  ctx.fill()
+-}
+-
+-export const createDemoImage = (options: DemoImageOptions) => {
+-  const cacheKey = JSON.stringify(options)
+-  const cached = imageCache.get(cacheKey)
+-  if (cached) return cached
+-
+-  const width = 320
+-  const height = 420
+-  const canvas = document.createElement('canvas')
+-  canvas.width = width
+-  canvas.height = height
+-  const ctx = canvas.getContext('2d')
+-  if (!ctx) return ''
+-
+-  const random = seededRandom(options.seed)
+-  const gradient = ctx.createLinearGradient(0, 0, width, height)
+-  gradient.addColorStop(0, '#f6f1e7')
+-  gradient.addColorStop(0.44, options.secondary)
+-  gradient.addColorStop(1, '#26332f')
+-  ctx.fillStyle = gradient
+-  ctx.fillRect(0, 0, width, height)
+-
+-  ctx.globalAlpha = 0.16
+-  ctx.strokeStyle = '#ffffff'
+-  ctx.lineWidth = 1
+-  for (let x = -40; x < width + 40; x += 28) {
+-    ctx.beginPath()
+-    ctx.moveTo(x, 0)
+-    ctx.lineTo(x + 118, height)
+-    ctx.stroke()
+-  }
+-  ctx.globalAlpha = 1
+-
+-  if (options.mood === 'character') drawCharacter(ctx, options, random)
+-  if (options.mood === 'environment') drawEnvironment(ctx, options, random)
+-  if (options.mood === 'variant') drawVariant(ctx, options, random)
+-  if (options.mood === 'asset') drawAsset(ctx, options, random)
+-
+-  addNoise(ctx, width, height, options.seed)
+-
+-  ctx.fillStyle = 'rgba(15, 18, 20, 0.72)'
+-  roundedRect(ctx, 18, 360, 284, 38, 13)
+-  ctx.fill()
+-
+-  ctx.fillStyle = 'rgba(255,255,255,0.92)'
+-  ctx.font = '700 18px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont'
+-  ctx.fillText(options.label, 34, 385)
+-
+-  const dataUrl = canvas.toDataURL('image/jpeg', 0.78)
+-  imageCache.set(cacheKey, dataUrl)
+-  return dataUrl
+-}
++// demoImages — 兼容出口(#506 后)。
++//
++// 绘制实现与 mivo-demo: 引用编解码全部迁往 demoAssets.ts:demo 图不再以 base64
++// data URL 进 store/持久化,模块级 imageCache(只增不减、全量 data URL 常驻堆)
++// 一并退役。本文件仅保留 createDemoImage 的历史签名(无缓存,每次现画)——生产
++// 代码已无调用方;大量既有测试以 vi.mock('../lib/demoImages') 桩掉本模块,保留
++// 模块路径与出口让这些桩继续成立。
++
++import { drawDemoImage, type DemoImageOptions } from './demoAssets'
++
++export const createDemoImage = (options: DemoImageOptions): string =>
++  drawDemoImage(options)?.toDataURL('image/jpeg', 0.78) ?? ''
+diff --git a/src/lib/imageNodeClipboard.ts b/src/lib/imageNodeClipboard.ts
+index 5805e3c7..624a1b96 100644
+--- a/src/lib/imageNodeClipboard.ts
++++ b/src/lib/imageNodeClipboard.ts
+@@ -5,13 +5,23 @@
+ 
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import { isImportedAssetUrl, readImportedAssetFile } from './assetStorage'
++import { isDemoAssetUrl, renderDemoImageBlob } from './demoAssets'
+ import { debugLogger } from '../store/debugLogStore'
+ import { toastFeedback } from '../store/toastStore'
+ import { t } from '../i18n'
+ 
+ const SOURCE = 'Image Clipboard'
+ 
+-const resolveBitmapUrl = async (assetUrl: string): Promise<{ url: string; revoke?: () => void }> => {
++/** exported for tests(#506 复审:demo 分支 happy-path 定向测试口;产品路径经 copyImageNodeAsPng)。 */
++export const resolveBitmapUrl = async (assetUrl: string): Promise<{ url: string; revoke?: () => void }> => {
++  // #506:demo 惰性引用(mivo-demo:)——现画成 blob URL 供位图解码(Copy as PNG
++  // 能力与 data URL 时代对齐;用后 revoke)。
++  if (isDemoAssetUrl(assetUrl)) {
++    const blob = await renderDemoImageBlob(assetUrl)
++    if (!blob) throw new Error(`demo asset render failed for ${assetUrl}`)
++    const url = URL.createObjectURL(blob)
++    return { url, revoke: () => URL.revokeObjectURL(url) }
++  }
+   if (!isImportedAssetUrl(assetUrl)) return { url: assetUrl }
+ 
+   const asset = await readImportedAssetFile(assetUrl)
+diff --git a/src/lib/mivoImageClient.ts b/src/lib/mivoImageClient.ts
+index 32b7feda..35386515 100644
+--- a/src/lib/mivoImageClient.ts
++++ b/src/lib/mivoImageClient.ts
+@@ -2,6 +2,7 @@ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import type { EnhanceRequest, EnhanceResponse, MivoEditRequest, MivoGenerateRequest, MivoImageQuality, MivoImageResponse } from '../types/generation'
+ import { debugLogger } from '../store/debugLogStore'
+ import { readImportedAssetFile } from './assetStorage'
++import { isDemoAssetUrl, renderDemoImageBlob } from './demoAssets'
+ import { authHeaders } from './authHeaders'
+ 
+ const defaultModel = 'gpt-image-2'
+@@ -220,6 +221,14 @@ export const enhanceMivoPrompt = async (request: EnhanceRequest): Promise<Enhanc
+ export const assetBlobForNode = async (node: MivoCanvasNode) => {
+   if (!node.assetUrl) throw new Error('Unable to read source image for generation')
+ 
++  // #506:demo 惰性引用(mivo-demo:)不可 fetch——现画成 blob(图生图/插件读像素
++  // 对 demo 图的能力与 data URL 时代对齐;绘制失败与下面 fetch 失败同口径抛错)。
++  if (isDemoAssetUrl(node.assetUrl)) {
++    const demoBlob = await renderDemoImageBlob(node.assetUrl)
++    if (demoBlob) return demoBlob
++    throw new Error('Unable to read source image for generation')
++  }
++
+   const importedAsset = await readImportedAssetFile(node.assetUrl)
+   if (importedAsset) return importedAsset.blob
+ 
+diff --git a/src/lib/useResolvedAssetUrl.contract.test.ts b/src/lib/useResolvedAssetUrl.contract.test.ts
+index de525067..1f621503 100644
+--- a/src/lib/useResolvedAssetUrl.contract.test.ts
++++ b/src/lib/useResolvedAssetUrl.contract.test.ts
+@@ -22,9 +22,10 @@ import hookSource from './useResolvedAssetUrl.ts?raw'
+ import leaseSource from './assetUrlLease.ts?raw'
+ 
+ describe('useResolvedAssetUrl — lease wiring contract (Phase 3a)', () => {
+-  it('imports acquireAssetUrl from ./assetUrlLease (goes through the lease, not resolveAssetUrl directly)', () => {
++  it('imports acquireAssetUrlLease from ./assetUrlLease (goes through the lease, not resolveAssetUrl directly)', () => {
+     expect(hookSource).toMatch(/from\s+['"]\.\/assetUrlLease['"]/)
+-    expect(hookSource).toContain('acquireAssetUrl')
++    // #506 四轮:token 版入口(同步返回本笔 token,pending 释放的主体)。
++    expect(hookSource).toContain('acquireAssetUrlLease')
+     // resolveAssetUrl is no longer imported by the hook — the lease owns IDB
+     // resolution. isImportedAssetUrl is still imported (pure predicate, no IO).
+     expect(hookSource).not.toMatch(/resolveAssetUrl/)
+@@ -42,8 +43,15 @@ describe('useResolvedAssetUrl — lease wiring contract (Phase 3a)', () => {
+   })
+ 
+   it('the cleanup branch releases only when localRelease is set (mutual exclusion with .then)', () => {
+-    const cleanupBranch = /if\s*\(\s*localRelease\s*\)\s*localRelease\(\)/
++    // #506 四轮:cleanup 已落定 → localRelease;未落定 → 用本笔 acquire 的 token
++    // 结账(releasePendingAssetUrl(token),跨代/跨笔无效);token 被消费后本笔
++    // lease 落定为 miss+noop,.then 的无条件 release 不双扣——每笔恰一次终局。
++    const cleanupBranch = /if\s*\(\s*localRelease\s*\)\s*\{\s*localRelease\(\)/
+     expect(cleanupBranch.test(hookSource)).toBe(true)
++    expect(hookSource).toContain('releasePendingAssetUrl(token)')
++    // URL 键口径(会污染同 URL 的其它笔/新代 entry)已退役,不得回潮。
++    expect(hookSource).not.toContain('releasePendingAssetUrl(assetUrl)')
++    expect(hookSource).not.toContain('pendingReleased')
+   })
+ 
+   it('sets active=false in cleanup so the .then sees the cancelled state', () => {
+diff --git a/src/lib/useResolvedAssetUrl.test.ts b/src/lib/useResolvedAssetUrl.test.ts
+index 3845a341..3165125b 100644
+--- a/src/lib/useResolvedAssetUrl.test.ts
++++ b/src/lib/useResolvedAssetUrl.test.ts
+@@ -34,9 +34,16 @@ describe('useResolvedAssetState 源码契约(接线事实)', () => {
+     expect(source).toContain("setResolvedAsset({ source: assetUrl, state: settledAssetState('') })")
+   })
+ 
+-  it('pending-unmount 时由 .then 分支释放 lease(互斥释放对保留)', () => {
+-    expect(source).toContain('if (!active) {')
+-    expect(source).toContain('release()')
+-    expect(source).toContain('if (localRelease) localRelease()')
++  it('pending-unmount 时由 .then 分支释放 lease(#506 四轮:主体是本笔 acquire 的 token)', () => {
++    // 本笔 token 存在 effect 闭包(acquireAssetUrlLease 同步返回)
++    expect(source).toContain('const { lease, token } = acquireAssetUrlLease(assetUrl)')
++    // .then 的 !active 分支无条件 release——token 已被 cleanup 消费时 release 是
++    // noop(lease 落定 miss+noop),恰一次终局、无双扣
++    expect(source).toMatch(/if \(!active\) \{[^}]*release\(\)/)
++    // cleanup:已落定走 localRelease;未落定用本笔 token 结账(demo 绘制可取消,
++    // 跨代/跨笔无效——旧 URL 键口径已退役)
++    expect(source).toMatch(/if \(localRelease\) \{\s*\n\s*localRelease\(\)/)
++    expect(source).toContain('releasePendingAssetUrl(token)')
++    expect(source).not.toContain('releasePendingAssetUrl(assetUrl)')
+   })
+ })
+diff --git a/src/lib/useResolvedAssetUrl.ts b/src/lib/useResolvedAssetUrl.ts
+index a2af3c54..12fc3cd5 100644
+--- a/src/lib/useResolvedAssetUrl.ts
++++ b/src/lib/useResolvedAssetUrl.ts
+@@ -1,6 +1,10 @@
+ import { useEffect, useState } from 'react'
+-import { acquireAssetUrl } from './assetUrlLease'
++import { acquireAssetUrlLease, releasePendingAssetUrl } from './assetUrlLease'
+ import { isImportedAssetUrl } from './assetStorage'
++import { isDemoAssetUrl } from './demoAssets'
++
++// #506:mivo-demo: 引用与库内资产同走 lease 解析;谓词本地组合(理由见 assetUrlLease)。
++const isLeaseResolvedAssetUrl = (assetUrl?: string) => isImportedAssetUrl(assetUrl) || isDemoAssetUrl(assetUrl)
+ 
+ export type ResolvedAssetStatus = 'pending' | 'resolved' | 'error'
+ 
+@@ -20,22 +24,29 @@ export function useResolvedAssetState(assetUrl?: string): ResolvedAssetState {
+   const [resolvedAsset, setResolvedAsset] = useState<{ source: string; state: ResolvedAssetState }>()
+ 
+   useEffect(() => {
+-    if (!assetUrl || !isImportedAssetUrl(assetUrl)) return
++    if (!assetUrl || !isLeaseResolvedAssetUrl(assetUrl)) return
+ 
+     let active = true
+     // localRelease is set on the happy path (mount still active when the lease
+     // resolves). The cleanup and the .then form a mutual-exclusion pair: exactly
+-    // one of them releases the lease.
++    // one of them settles this acquire.
+     // - If cleanup fires first (unmount during pending): active=false, localRelease
+-    //   unset → the .then sees active=false and releases.
++    //   unset → cleanup 经本笔 token 释放;若已落定(token 释放返回 false),
++    //   .then 看到 active=false 补 release。
+     // - If .then fires first: localRelease=release → cleanup releases on unmount.
++    // #506 四轮:pending 释放的主体是本笔 acquire 的 token(存于 effect 闭包),
++    // 同 URL 的其它笔/其它代互不影响;token 释放被消费后本笔 lease 落定为
++    // { url: '', release: noop },.then 的无条件 release 不会双扣。acquire
++    // reject 时 lease 层已把本笔标记 settled,cleanup 的 token 释放自然失效。
+     let localRelease: (() => void) | undefined
++    const { lease, token } = acquireAssetUrlLease(assetUrl)
+ 
+-    void acquireAssetUrl(assetUrl)
++    void lease
+       .then(({ url, release }) => {
+         if (!active) {
+-          // Unmounted while the lease was in flight. The acquire already counted
+-          // our reference, so we must release it exactly once here.
++          // Unmounted while the lease was in flight. If the cleanup already
++          // consumed this acquire via its token, release is a noop — exactly
++          // one 终局 per acquire either way.
+           release()
+           return
+         }
+@@ -50,12 +61,18 @@ export function useResolvedAssetState(assetUrl?: string): ResolvedAssetState {
+ 
+     return () => {
+       active = false
+-      if (localRelease) localRelease()
++      if (localRelease) {
++        localRelease()
++        return
++      }
++      // 解析未落定即离场:结本笔的账(最后一笔会把未开始的 demo 绘制从队列
++      // 移除)。已落定/已被摘 → false,维持「.then 补 release」路径。
++      releasePendingAssetUrl(token)
+     }
+   }, [assetUrl])
+ 
+   if (!assetUrl) return EMPTY_RESOLVED
+-  if (!isImportedAssetUrl(assetUrl)) return { status: 'resolved', url: assetUrl }
++  if (!isLeaseResolvedAssetUrl(assetUrl)) return { status: 'resolved', url: assetUrl }
+ 
+   return resolvedAsset?.source === assetUrl ? resolvedAsset.state : PENDING
+ }
+diff --git a/src/render/leaferImagePaint.pendingToken.test.ts b/src/render/leaferImagePaint.pendingToken.test.ts
+new file mode 100644
+index 00000000..bdd4eb3f
+--- /dev/null
++++ b/src/render/leaferImagePaint.pendingToken.test.ts
+@@ -0,0 +1,225 @@
++// @vitest-environment happy-dom
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// #506 四轮回归:pending 释放的主体 = 每笔 acquire 的 token(不是 URL、不是
++// entry 上的共享标记)。三审实测:URL/共享标记口径在「demo A→B→dispose(全程
++// 未到 rAF)」下泄漏 1 个队列 job——A 的释放状态污染了 B 这一笔。本文件钉死
++// token 化后的两条审核指定硬场景:
++//  1. demo 引用 A→B→dispose-before-rAF:队列 0 / 绘制 0 / lease 表 0;
++//  2. mivo-asset / mivo-sasset 慢解析(deferred resolver,慢 IDB/fetch)同场景:
++//     每个实际创建的 blob 恰一次 revoke(孤儿解析当场回收),零残留。
++
++vi.mock('leafer-ui', () => {
++  class FakeUI {
++    props: Record<string, unknown>
++    removed = false
++    constructor(props: Record<string, unknown> = {}) {
++      this.props = { ...props }
++    }
++    set(props: Record<string, unknown>) {
++      this.props = { ...this.props, ...props }
++    }
++    remove() {
++      this.removed = true
++    }
++  }
++  class FakeImage extends FakeUI {}
++  class FakeRect extends FakeUI {}
++  class FakeGroup extends FakeUI {
++    children: FakeUI[] = []
++    add(child: FakeUI) {
++      this.children.push(child)
++    }
++  }
++  class FakeBox extends FakeGroup {}
++  return { Image: FakeImage, Group: FakeGroup, Box: FakeBox, Rect: FakeRect }
++})
++
++vi.mock('./engineLodMode', () => ({
++  engineLodMode: 'on',
++  engineLodThresholdPx: 32,
++  isEngineLodRequested: true,
++}))
++
++// mivo-asset / mivo-sasset 都走 deferred resolver:测试手工控制落定时机,
++// 模拟慢 IDB / 慢 fetch(谓词覆盖面与真实 assetStorage.ts:105 一致)。
++const deferredResolvers: Array<{ url: string; resolve: (value: string) => void }> = []
++vi.mock('../lib/assetStorage', () => ({
++  isImportedAssetUrl: (url?: string) =>
++    Boolean(url && (url.startsWith('mivo-asset:') || url.startsWith('mivo-sasset:'))),
++  resolveAssetUrl: (url?: string) =>
++    new Promise<string>((resolve) => {
++      deferredResolvers.push({ url: url ?? '', resolve })
++    }),
++  readImportedAssetFile: () => Promise.resolve(undefined),
++}))
++
++const { createLeaferImagePaint } = await import('./leaferImagePaint')
++const { __leaseMapSize } = await import('../lib/assetUrlLease')
++const { stressDemoAssetUrl, __demoDrawQueueSize } = await import('../lib/demoAssets')
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++import type { RendererSyncContext } from './rendererAdapter'
++import type { Leafer } from 'leafer-ui'
++
++const flushPromises = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
++
++type FakeUI = { props: Record<string, unknown>; removed: boolean }
++
++const makeFakeLeafer = () => {
++  const children: FakeUI[] = []
++  return {
++    add: (child: FakeUI) => children.push(child),
++    children,
++  } as unknown as Leafer & { children: FakeUI[] }
++}
++
++const ctx = (scale = 1): RendererSyncContext => ({
++  viewport: { x: 0, y: 0, scale },
++  selectedNodeIds: new Set<string>(),
++  isPanning: false,
++})
++
++const imgNode = (id: string, assetUrl: string): MivoCanvasNode =>
++  ({
++    id,
++    type: 'image',
++    status: 'ready',
++    x: 0,
++    y: 0,
++    width: 500,
++    height: 500,
++    assetUrl,
++  }) as unknown as MivoCanvasNode
++
++const makeFake2dCtx = () => {
++  const noop = () => undefined
++  return {
++    save: noop, restore: noop, translate: noop, beginPath: noop, closePath: noop,
++    moveTo: noop, lineTo: noop, arc: noop, arcTo: noop, ellipse: noop,
++    fill: noop, stroke: noop, fillRect: noop, fillText: noop, putImageData: noop,
++    getImageData: () => ({ data: new Uint8ClampedArray(320 * 420 * 4) }),
++    createLinearGradient: () => ({ addColorStop: noop }),
++    set fillStyle(_v: unknown) {}, set strokeStyle(_v: unknown) {},
++    set lineWidth(_v: unknown) {}, set globalAlpha(_v: unknown) {}, set font(_v: unknown) {},
++  } as unknown as CanvasRenderingContext2D
++}
++
++let drawCount = 0
++let liveObjectUrls: Set<string>
++let revokedUrls: string[]
++let urlSeq = 0
++let rafQueue: FrameRequestCallback[]
++
++const runFrame = () => {
++  const callbacks = rafQueue.splice(0)
++  for (const callback of callbacks) callback(0)
++}
++
++describe('leaferImagePaint × per-acquire token(#506 四轮回归)', () => {
++  beforeEach(() => {
++    drawCount = 0
++    urlSeq = 0
++    liveObjectUrls = new Set()
++    revokedUrls = []
++    rafQueue = []
++    deferredResolvers.length = 0
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      rafQueue.push(callback)
++      return rafQueue.length
++    })
++    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation((() => makeFake2dCtx()) as never)
++    Object.defineProperty(HTMLCanvasElement.prototype, 'toBlob', {
++      configurable: true,
++      value: function toBlob(cb: (blob: Blob) => void) {
++        drawCount += 1
++        cb(new Blob(['demo-jpeg-bytes'], { type: 'image/jpeg' }))
++      },
++    })
++    vi.stubGlobal('URL', {
++      ...URL,
++      createObjectURL: () => {
++        const url = `blob:paint-${(urlSeq += 1)}`
++        liveObjectUrls.add(url)
++        return url
++      },
++      revokeObjectURL: (url: string) => {
++        liveObjectUrls.delete(url)
++        revokedUrls.push(url)
++      },
++    })
++  })
++  afterEach(() => {
++    vi.unstubAllGlobals()
++    vi.restoreAllMocks()
++  })
++
++  it('demo A→B→dispose(全程未到 rAF):队列 0 / 绘制 0 / lease 表 0(审核实测三审版泄漏 delta=1)', async () => {
++    const leafer = makeFakeLeafer()
++    const paint = createLeaferImagePaint(leafer)
++
++    paint.sync([imgNode('n1', stressDemoAssetUrl(1))], ctx()) // A 入队
++    expect(__demoDrawQueueSize()).toBe(1)
++
++    paint.sync([imgNode('n1', stressDemoAssetUrl(2))], ctx()) // A→B:A 以自己的 token 出队,B 入队
++    expect(__demoDrawQueueSize()).toBe(1)
++
++    paint.dispose() // rAF 还没跑:B 以自己的 token 出队
++    expect(__demoDrawQueueSize()).toBe(0)
++
++    runFrame() // 帧来了也无活可干
++    expect(drawCount).toBe(0)
++    await flushPromises()
++    expect(__leaseMapSize()).toBe(0)
++    expect(liveObjectUrls.size).toBe(0)
++    expect(revokedUrls).toEqual([]) // 没画过 → 无 blob 可回收(不是"回收掉了泄漏")
++  })
++
++  it('mivo-asset→mivo-sasset 慢解析同场景:两笔各自孤儿落定,恰一次 revoke 零残留', async () => {
++    const leafer = makeFakeLeafer()
++    const paint = createLeaferImagePaint(leafer)
++
++    paint.sync([imgNode('n1', 'mivo-asset:slow-idb')], ctx()) // A 在飞(deferred)
++    expect(deferredResolvers.length).toBe(1)
++    paint.sync([imgNode('n1', 'mivo-sasset:slow-fetch')], ctx()) // A→B:A 的 token 即刻结账
++    expect(deferredResolvers.length).toBe(2)
++    expect(__leaseMapSize()).toBe(1) // A 的 entry 已摘,只剩 B
++    paint.dispose() // B 也在 pending 窗口离场
++    expect(__leaseMapSize()).toBe(0)
++
++    // 慢 IDB / 慢 fetch 此刻才落定 → 两笔都是孤儿解析,blob 当场回收
++    const blobA = URL.createObjectURL(new Blob(['a']))
++    const blobB = URL.createObjectURL(new Blob(['b']))
++    deferredResolvers[0].resolve(blobA)
++    deferredResolvers[1].resolve(blobB)
++    await flushPromises()
++
++    expect(revokedUrls.sort()).toEqual([blobA, blobB].sort()) // 每个 blob 恰一次 revoke
++    expect(liveObjectUrls.size).toBe(0)
++    expect(__leaseMapSize()).toBe(0)
++  })
++
++  it('慢解析 A 落定于 B pending 期间:A 的 .then 只结 A 的账,B 照常落定应用', async () => {
++    const leafer = makeFakeLeafer()
++    const paint = createLeaferImagePaint(leafer)
++
++    paint.sync([imgNode('n1', 'mivo-asset:first')], ctx())
++    paint.sync([imgNode('n1', 'mivo-sasset:second')], ctx()) // 取代 A(A 的 token 已消费)
++
++    const blobA = URL.createObjectURL(new Blob(['a'])) // A 慢解析落定 → 孤儿回收
++    deferredResolvers[0].resolve(blobA)
++    await flushPromises()
++    expect(revokedUrls).toEqual([blobA])
++    expect(__leaseMapSize()).toBe(1) // B 的 entry 不受 A 影响
++
++    const blobB = URL.createObjectURL(new Blob(['b']))
++    deferredResolvers[1].resolve(blobB)
++    await flushPromises()
++    expect(liveObjectUrls.has(blobB)).toBe(true) // B 正常落定并被持有
++    expect((leafer.children[0] as FakeUI).props.url).toBe(blobB) // 应用的是 B 的 url
++
++    paint.dispose() // 已落定:走 releaseFn 正常释放
++    expect(revokedUrls.sort()).toEqual([blobA, blobB].sort())
++    expect(liveObjectUrls.size).toBe(0)
++    expect(__leaseMapSize()).toBe(0)
++  })
++})
+diff --git a/src/render/leaferImagePaint.ts b/src/render/leaferImagePaint.ts
+index ff45e243..a031d516 100644
+--- a/src/render/leaferImagePaint.ts
++++ b/src/render/leaferImagePaint.ts
+@@ -42,7 +42,7 @@
+ import { Box, Image, Rect } from 'leafer-ui'
+ import type { Leafer } from 'leafer-ui'
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+-import { acquireAssetUrl } from '../lib/assetUrlLease'
++import { acquireAssetUrlLease, releasePendingAssetUrl, type AssetLeaseToken } from '../lib/assetUrlLease'
+ import { debugLogger } from '../store/debugLogStore'
+ import { Layer } from './layers'
+ import { paintSignatureFor } from './leaferPaintSignature'
+@@ -69,12 +69,18 @@ type ImageEntry = {
+   assetUrl?: string
+   /** Set when the lease resolves; released on delete / kind-swap / assetUrl change. */
+   releaseFn?: () => void
+-  /** True while acquireAssetUrl is pending. */
+-  leaseInFlight?: boolean
++  /** #506 四轮:当前在飞的那一笔 acquire。pending 释放/取代都凭这一笔自己的
++   *  token 结账——entry 上不共享任何跨笔释放标记(A 换 B 时 A 的状态不许污染 B)。
++   *  每个 lease .then 只比对自己的 pending 记录身份。 */
++  pending?: PendingLease
+   /** Set on destroy so the async lease .then releases instead of applying the URL. */
+   disposed?: boolean
+ }
+ 
++/** One in-flight acquire (identity object — the .then closure compares itself
++ *  against entry.pending to know whether it is still the current acquire). */
++type PendingLease = { token: AssetLeaseToken }
++
+ export type LeaferImagePaint = {
+   /** Reconcile painted images to `nodes`. Returns create/update/delete counts
+    *  (收支 balance: every prev id is either updated or deleted, every new id is
+@@ -244,27 +250,34 @@ export const createLeaferImagePaint = (leafer: Leafer): LeaferImagePaint => {
+ 
+   /**
+    * Acquire a lease for `assetUrl` and apply the resolved URL when it lands.
+-   * Two async races are handled by the .then:
+-   *   - entry disposed (node deleted / kind swapped / Leafer destroyed) while the
+-   *     lease was in flight → release immediately, do not apply.
+-   *   - assetUrl changed again while this lease was in flight → release, the
+-   *     newer acquire will apply the current URL.
+-   * Both ensure the lease is released exactly once (no leak, no double-release).
++   * #506 四轮:每笔 acquire 自带 token + pending 身份记录,async races 全部按
++   * "本笔身份"判定,entry 上没有跨笔共享的释放标记:
++   *   - A 换 B(sync 换 URL)时,先用 A 自己的 token 结 A 的账(pending 窗口内
++   *     消费引用并取消未开始的 demo 绘制),再启动 B;
++   *   - .then 只认 entry.pending === 本笔——被取代/已销毁一律 release(token 已
++   *     消费时 release 是 noop,恰一次终局,无双扣)。
+    */
+   const acquireLease = (entry: ImageEntry, assetUrl: string | undefined) => {
++    if (entry.pending) {
++      // 上一笔仍在飞:用它自己的 token 终局它。pending 窗口 → 引用即刻扣平
++      // (未开始的 demo 绘制随之出队);已落定 → false,由它的 .then 按
++      // "已被取代"分支 release。
++      releasePendingAssetUrl(entry.pending.token)
++      entry.pending = undefined
++    }
+     entry.assetUrl = assetUrl
+-    entry.leaseInFlight = true
+-    void acquireAssetUrl(assetUrl)
++    const { lease, token } = acquireAssetUrlLease(assetUrl)
++    const myPending: PendingLease = { token }
++    entry.pending = myPending
++    void lease
+       .then(({ url, release }) => {
+-        entry.leaseInFlight = false
+-        if (entry.disposed) {
+-          release()
+-          return
+-        }
+-        if (entry.assetUrl !== assetUrl) {
++        if (entry.disposed || entry.pending !== myPending) {
++          // 宿主已销毁 / 本笔已被更新的 acquire 取代。release 恰平本笔的账——
++          // 若 destroy/取代时已在 pending 窗口经 token 消费,这里是 noop。
+           release()
+           return
+         }
++        entry.pending = undefined
+         entry.releaseFn = release
+         applyUrl(entry, url)
+         if (!url) {
+@@ -275,7 +288,7 @@ export const createLeaferImagePaint = (leafer: Leafer): LeaferImagePaint => {
+         }
+       })
+       .catch((error) => {
+-        entry.leaseInFlight = false
++        if (entry.pending === myPending) entry.pending = undefined
+         debugLogger.error(
+           SOURCE,
+           `acquire failed for ${assetUrl ?? '(none)'}: ${error instanceof Error ? error.message : String(error)}`,
+@@ -285,6 +298,13 @@ export const createLeaferImagePaint = (leafer: Leafer): LeaferImagePaint => {
+ 
+   const destroyEntry = (entry: ImageEntry) => {
+     entry.disposed = true
++    // #506 四轮:解析未落定即销毁(离场)→ 用本笔 token 结账,最后一笔会把
++    // 未开始的 demo 绘制 job 从队列移除;已落定 → false,.then 的 disposed
++    // 分支 release(token 已消费时 release 为 noop)。
++    if (entry.pending) {
++      releasePendingAssetUrl(entry.pending.token)
++      entry.pending = undefined
++    }
+     releaseLease(entry)
+     entry.object.remove()
+   }
+diff --git a/src/render/leaferPaintSignature.behavior.test.ts b/src/render/leaferPaintSignature.behavior.test.ts
+index ee8d463d..b18ae657 100644
+--- a/src/render/leaferPaintSignature.behavior.test.ts
++++ b/src/render/leaferPaintSignature.behavior.test.ts
+@@ -22,9 +22,15 @@ vi.mock('./projection', async (importOriginal) => {
+   return { ...actual, projectNode: vi.fn(actual.projectNode) }
+ })
+ 
+-// image 模块的 lease 走 acquireAssetUrl——mock 成同步 no-op，避免 async 计时干扰 set 计数。
++// image 模块的 lease 走 acquireAssetUrlLease(#506 四轮 token 制)——mock 成同步
++// no-op，避免 async 计时干扰 set 计数。
+ vi.mock('../lib/assetUrlLease', () => ({
+   acquireAssetUrl: vi.fn(() => Promise.resolve({ url: 'fake://url', release: () => {} })),
++  acquireAssetUrlLease: vi.fn(() => ({
++    lease: Promise.resolve({ url: 'fake://url', release: () => {} }),
++    token: {},
++  })),
++  releasePendingAssetUrl: vi.fn(() => false),
+ }))
+ 
+ import { projectNode } from './projection'
+diff --git a/src/store/canvasGenerationHydration.ts b/src/store/canvasGenerationHydration.ts
+index 68ad8787..7ca1d68b 100644
+--- a/src/store/canvasGenerationHydration.ts
++++ b/src/store/canvasGenerationHydration.ts
+@@ -1,6 +1,6 @@
+ import type { AiWorkflowStatus, CanvasDocument, CanvasId, CanvasTask, DemoSceneId } from '../types/mivoCanvas'
+ import { defaultStampKind } from '../canvas/stampDefs'
+-import { normalizeFontWeight } from '../model/documentModelV2'
++import { normalizeFontWeight, setNodeAsset } from '../model/documentModelV2'
+ import { debugLogger } from './debugLogStore'
+ import {
+   defaultBrushStyle,
+@@ -12,7 +12,8 @@ import {
+   patchCanvasDocument,
+   selectionFrom,
+ } from './canvasDocumentModel'
+-import { DEMO_PROJECTS, DEMO_SCENE_PROJECT_MAP } from './demoScenes'
++import { DEMO_PROJECTS, DEMO_SCENE_PROJECT_MAP, modelNames } from './demoScenes'
++import { STRESS_DEMO_NODE_COUNT, stressDemoAssetUrl } from '../lib/demoAssets'
+ import type { CanvasState } from './canvasStore'
+ 
+ // Local mirror of canvasStore.logCanvas so this module can log migration
+@@ -34,7 +35,7 @@ const warnCanvas = (message: string) => debugLogger.warn('Canvas Store', message
+ //   终态,不新增 'deleted' status)。migrate v<12 分支给存量 projects/canvases 的 undefined status 默认 'active'
+ //   (live 记录缺省=active,向后兼容;幂等:只填 undefined→'active',不覆盖既有 'archived')。archivedByCascade
+ //   是客户端本地字段(hydrate 不经 wire 暴露),migrate 不设(留 undefined=非级联归档)。
+-export const CANVAS_PERSIST_VERSION = 12
++export const CANVAS_PERSIST_VERSION = 13
+ 
+ // Persisted-state shape (subset of CanvasState that survives compactCanvasesForPersist).
+ type PersistedCanvasState = Partial<
+@@ -221,6 +222,76 @@ export const migratePersistedState = (persistedState: unknown, persistedVersion
+     }
+   }
+ 
++  // v13(#506 demo base64 清洗):stress-test 种子此前把 100 张 base64 data URL
++  // 塞进节点 assetUrl(合计 2-4MB,进 store 也进每一次持久化序列化)。种子已改存
++  // mivo-demo: 微型引用(渲染时惰性绘制);存量 blob 里**可证明**的 demo 种子节点
++  // 在此一次性洗成同一引用。判据从严(复审裁定):**歧义一律保留原 data URL**——
++  // 迁移绝不猜测非 demo 内容的出处,宁可留一张 base64 也不许覆盖用户的图。
++  //   前置:assetUrl 是 data:image 前缀(要洗的形态)。
++  //   完整生成签名(缺一不可):generation.prompt/size 恰为种子字面量、seed 为
++  //     [7000, 7100) 的整数、model 与 seed 推导的种子取值一致(modelNames[(seed-7000)%3])。
++  //   换图痕迹拒绝:assetSourceDimensions 存在 → 不动(种子从不携带源尺寸;任何
++  //     经产品换图流程落的图都会记录它——「复制后换图但保留元数据」在此被挡)。
++  //   id 形态(三轮 F1):canonical root `stress-<0..99>` + 可选复制链
++  //     `-copy-<timestamp>-<index>`(nodeFactory.createNodeCopy 的真实格式,可多段
++  //     嵌套),且 root index 必须与 seed-7000 一致;其余一切形态(stress-999 撞车、
++  //     非 stress 前缀、手造 id)→ 不动。禁止取模、禁止 fallback。
++  // 三处镜像原子同步(复审 F2):normalize 已把旧值镜像进 asset.url 与 image
++  // fills,只改 legacy assetUrl 会让 kernel 三域投影(toRecord)继续携带 base64——
++  // 经 setNodeAsset 等价路径同步 asset 域,image fill 的同值 assetUrl 一并替换。
++  // 幂等:洗后 assetUrl 非 data: 前缀,前置不再命中;仅 persistedVersion<13 执行
++  // (merge 重跑 migrate 传 CURRENT 不触发)。
++  if (persistedVersion < 13) {
++    const STRESS_SEED_PROMPT = '批量结果压力测试节点'
++    const STRESS_SEED_SIZE = '768x1024'
++    const provableStressSeedIndex = (node: (typeof canvases)[string]['nodes'][number]): number | null => {
++      const generation = node.generation
++      const seed = generation?.seed
++      const validSeed =
++        typeof seed === 'number' && Number.isInteger(seed) && seed >= 7000 && seed < 7000 + STRESS_DEMO_NODE_COUNT
++      if (!validSeed) return null
++      const seedIndex = seed - 7000
++      const fullSignature =
++        generation?.prompt === STRESS_SEED_PROMPT &&
++        generation?.size === STRESS_SEED_SIZE &&
++        generation?.model === modelNames[seedIndex % modelNames.length]
++      if (!fullSignature) return null
++      if (node.assetSourceDimensions) return null // 换图痕迹 → 歧义保留
++      // id 形态 = canonical root + 可选复制链(三轮 F1):真实复制走 nodeFactory
++      // createNodeCopy,id = `${source.id}-copy-<timestamp>-<index>`,可多段嵌套
++      // (copy of copy)。root index 必须与 seed 推导一致;其余一切形态(stress-999
++      // 撞车 / 非 stress 前缀 / 手造 id)→ 歧义保留。
++      const idMatch = /^stress-(0|[1-9]\d?)((?:-copy-\d+-\d+)+)?$/.exec(node.id)
++      if (!idMatch) return null
++      return Number(idMatch[1]) === seedIndex ? seedIndex : null // root 与 seed 错位 → 保留
++    }
++    let cleaned = 0
++    for (const [canvasId, document] of Object.entries(canvases)) {
++      if (!Array.isArray(document.nodes)) continue
++      let changed = false
++      const nodes = document.nodes.map((node) => {
++        if (typeof node.assetUrl !== 'string' || !node.assetUrl.startsWith('data:image')) return node
++        const index = provableStressSeedIndex(node)
++        if (index === null) return node
++        const staleDataUrl = node.assetUrl
++        const ref = stressDemoAssetUrl(index)
++        // setNodeAsset 等价原子同步:canonical asset 域 + legacy assetUrl 镜像一笔换
++        const withAsset = setNodeAsset(node, { ...(node.asset ?? {}), url: ref })
++        // image fill 的同值镜像(fillsForNode 由旧 assetUrl 合成)一并替换;其它 fill 不动
++        const fills = withAsset.fills?.map((fill) =>
++          fill.kind === 'image' && fill.assetUrl === staleDataUrl ? { ...fill, assetUrl: ref } : fill,
++        )
++        changed = true
++        cleaned += 1
++        return fills ? { ...withAsset, fills } : withAsset
++      })
++      if (changed) canvases[canvasId] = { ...document, nodes }
++    }
++    if (cleaned > 0) {
++      logCanvas(`Hydration 清洗 ${cleaned} 个 demo 种子节点的 base64 assetUrl → mivo-demo: 引用(migrated v${persistedVersion} → v13)`)
++    }
++  }
++
+   const activeDocument = documentFor(canvases, sceneId)
+   const selection = selectionFrom(activeDocument.selectedNodeIds, activeDocument.selectedNodeId, activeDocument.nodes)
+ 
+diff --git a/src/store/canvasStore.contract.test.ts b/src/store/canvasStore.contract.test.ts
+index 4561f20b..3b6dd055 100644
+--- a/src/store/canvasStore.contract.test.ts
++++ b/src/store/canvasStore.contract.test.ts
+@@ -151,8 +151,8 @@ describe('contract: canvas persist v10 shape (partialize field set)', () => {
+   it('pins the persist name and version', () => {
+     const opts = useCanvasStore.persist.getOptions()
+     expect(opts.name).toBe('mivo-canvas-demo')
+-    // 钉字面量 12(不引用 CANVAS_PERSIST_VERSION 常量):契约职责是钉现状,引用常量后"误改常量没写迁移"事故此契约不再报警 → 恒真断言无守卫价值。v12 = Phase 2 归档 status 字段引入(migrate v<12 分支默认 status='active',幂等)。
+-    expect(opts.version).toBe(12)
++    // 钉字面量 13(不引用 CANVAS_PERSIST_VERSION 常量):契约职责是钉现状,引用常量后"误改常量没写迁移"事故此契约不再报警 → 恒真断言无守卫价值。v13 = #506 demo 种子 base64 assetUrl 清洗为 mivo-demo: 引用(migrate v<13 分支,幂等)。
++    expect(opts.version).toBe(13)
+   })
+ 
+   it('pins the migrate function reference (A2 must not silently swap migrators)', () => {
+@@ -188,8 +188,8 @@ describe('contract: canvas persist v10 shape (partialize field set)', () => {
+     const raw = (globalThis as { localStorage: { getItem: (k: string) => string | null } }).localStorage.getItem('mivo-canvas-demo')
+     expect(raw).not.toBeNull()
+     const parsed = JSON.parse(raw!) as { state: Record<string, unknown>; version: number }
+-    // 钉字面量 12(同上:契约不引用常量,守住"误改常量没写迁移"事故)。v12 = Phase 2 归档 status 字段引入。
+-    expect(parsed.version).toBe(12)
++    // 钉字面量 13(同上:契约不引用常量,守住"误改常量没写迁移"事故)。v13 = #506 demo base64 清洗。
++    expect(parsed.version).toBe(13)
+     expect(Object.keys(parsed.state).sort()).toEqual(expectedFields)
+     expect(parsed.state.activeTool).toBe('brush')
+   })
+diff --git a/src/store/canvasStore.hydrationMigration.contract.test.ts b/src/store/canvasStore.hydrationMigration.contract.test.ts
+index 148e4291..979d69a1 100644
+--- a/src/store/canvasStore.hydrationMigration.contract.test.ts
++++ b/src/store/canvasStore.hydrationMigration.contract.test.ts
+@@ -1,12 +1,12 @@
+ import { describe, expect, it, vi, beforeEach } from 'vitest'
+ 
+ // canvasStore 的 hydration/迁移写回契约——从 canvasStore.contract.test.ts 拆出
+-// (#505:该文件贴 structure-guard 900 行上限,F8 的盘上 version=12 断言把它顶爆,
++// (#505:该文件贴 structure-guard 900 行上限,F8 的盘上 version 断言把它顶爆,
+ // 按守卫指引拆分入库)。两条契约:
+-// 1) v8 存量 blob 真实 rehydrate 进 store;zustand 迁移写回(v8→v12)在冻结目标
+-//    架构下就是一次普通冻结键写,flush 后盘上 version 必须升到 12。
++// 1) v8 存量 blob 真实 rehydrate 进 store;zustand 迁移写回(v8→v13,#506 后迁移链到 13)在冻结目标
++//    架构下就是一次普通冻结键写,flush 后盘上 version 必须升到 13。
+ // 2) 过期 generating slot/task 在 rehydrate 时 settle,且 settle 后的迁移写回同样
+-//    真实落盘 version=12。
++//    真实落盘 version=13。
+ //
+ // harness 与母文件同源:node env 无 window,vi.hoisted 先装内存 localStorage,
+ // zustand persist 才会挂 api.persist;demoImages/assetStorage/remoteDebugReporter
+@@ -77,7 +77,7 @@ beforeEach(() => {
+   useCanvasStore.setState({ ...useCanvasStore.getInitialState() } as never, true)
+ })
+ 
+-describe('contract: canvas hydration × 迁移写回(v8→v12 真实落盘)', () => {
++describe('contract: canvas hydration × 迁移写回(v8→v13 真实落盘)', () => {
+   it('hydration: a persisted v8 state is rehydrated into the store', async () => {
+     const persisted = {
+       state: { canvases: { 'character-flow': { title: 'Hydrated', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] } }, sceneId: 'character-flow', selectedNodeId: undefined, selectedNodeIds: [], activeTool: 'select', brushStyle: { color: '#000000', width: 8, kind: 'marker' }, activeStampKind: useCanvasStore.getState().activeStampKind },
+@@ -85,7 +85,7 @@ describe('contract: canvas hydration × 迁移写回(v8→v12 真实落盘)', ()
+     }
+     // #505(冻结目标架构):seed 底层前清 read-your-writes 快照(替代旧架构的
+     // 「终结会话」测试隔离作用——否则 getItem 会按语义正确地返回上个测试留下的
+-    // 更新快照而非 seed),随后走**真实 rehydrate**;zustand 的迁移写回(v8→v12)
++    // 更新快照而非 seed),随后走**真实 rehydrate**;zustand 的迁移写回(v8→v13)
+     // 就是一次普通的冻结键写,照常防抖落盘。
+     const { __resetCanvasPersistStorageForTests, flushCanvasPersistWrite } = await import('./canvasPersistConfig')
+     __resetCanvasPersistStorageForTests()
+@@ -93,10 +93,10 @@ describe('contract: canvas hydration × 迁移写回(v8→v12 真实落盘)', ()
+     await useCanvasStore.persist.rehydrate()
+     expect(useCanvasStore.getState().canvases['character-flow']?.title).toBe('Hydrated')
+     expect(useCanvasStore.getState().brushStyle).toEqual({ color: '#000000', width: 8, kind: 'marker' })
+-    // F7/F8:zustand 迁移写回(v8→v12)经真实新路径落盘——盘上 version 必须升到 12
++    // F7/F8:zustand 迁移写回(v8→v13)经真实新路径落盘——盘上 version 必须升到 13(#506)
+     await flushCanvasPersistWrite('migration-writeback-drain')
+     const writtenBack = ls().getItem('mivo-canvas-demo')
+-    expect((JSON.parse(writtenBack!) as { version: number }).version).toBe(12)
++    expect((JSON.parse(writtenBack!) as { version: number }).version).toBe(13)
+   })
+ 
+   it('hydration: settles expired canvas generation slots/tasks and syncs the active document', async () => {
+@@ -143,9 +143,9 @@ describe('contract: canvas hydration × 迁移写回(v8→v12 真实落盘)', ()
+     expect(activeDoc.tasks[0].progress).toBe(42)
+     expect(state.nodes[0].aiWorkflow?.status).toBe('failed')
+     expect(state.tasks[0].status).toBe('failed')
+-    // F8(version=12 断言补齐):迁移写回(v8→v12)走真实新路径落盘
++    // F8(version 断言补齐):迁移写回(v8→v13)走真实新路径落盘(#506 后迁移链到 13)
+     await flushCanvasPersistWrite('migration-writeback-drain')
+     const writtenBack = ls().getItem('mivo-canvas-demo')
+-    expect((JSON.parse(writtenBack!) as { version: number }).version).toBe(12)
++    expect((JSON.parse(writtenBack!) as { version: number }).version).toBe(13)
+   })
+ })
+diff --git a/src/store/demoAssetCleanup.migrate.test.ts b/src/store/demoAssetCleanup.migrate.test.ts
+new file mode 100644
+index 00000000..59891a9e
+--- /dev/null
++++ b/src/store/demoAssetCleanup.migrate.test.ts
+@@ -0,0 +1,304 @@
++import { describe, expect, it, vi, beforeEach } from 'vitest'
++
++// #506 验收锚:
++// 1) 新用户基线——初始 partialize 输出零 data:image,体积从几 MB(100×20-40KB
++//    base64)降到几十 KB 量级。
++// 2) 存量清洗(v<13 → v13)——demo 种子节点(含被复制进用户画布的种子复制品)的
++//    base64 assetUrl 洗成 mivo-demo: 引用;**真实 rehydrate** 走 zustand 迁移链,
++//    读回验证 = 断言 zustand 迁移写回后磁盘 blob(S01/S02 教训:不看内存看盘)。
++// 3) 边界——不带种子指纹的用户 data: 图一律不动(迁移不猜测非 demo 内容出处)。
++
++vi.hoisted(() => {
++  const store = new Map<string, string>()
++  const memStorage = {
++    get length() {
++      return store.size
++    },
++    clear: () => store.clear(),
++    getItem: (k: string) => store.get(k) ?? null,
++    key: (i: number) => [...store.keys()][i] ?? null,
++    removeItem: (k: string) => {
++      store.delete(k)
++    },
++    setItem: (k: string, v: string) => {
++      store.set(k, String(v))
++    },
++  }
++  const g = globalThis as Record<string, unknown>
++  if (g.window === undefined) g.window = { localStorage: memStorage }
++  if (g.localStorage === undefined) g.localStorage = memStorage
++})
++
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++vi.mock('../lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(),
++  saveImportedAsset: vi.fn(),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('./remoteDebugReporter', () => ({
++  reportRemoteDebugEntry: () => {},
++}))
++
++import { useCanvasStore } from './canvasStore'
++import { canvasPersistOptions, flushCanvasPersistWrite, __resetCanvasPersistStorageForTests } from './canvasPersistConfig'
++import { modelNames } from './demoScenes'
++import { createNodeCopy } from './nodeFactory'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++import type { CanvasState } from './canvasStore'
++
++const NAME = 'mivo-canvas-demo'
++const ls = () =>
++  (globalThis as unknown as {
++    localStorage: { setItem: (k: string, v: string) => void; getItem: (k: string) => string | null; clear: () => void }
++  }).localStorage
++
++// 逼真的 base64 载荷(~26KB/张,与旧 demo 图同量级)——体积断言要在真实量级上做。
++const FAKE_BASE64 = `data:image/jpeg;base64,${'A'.repeat(26_000)}`
++
++const stressSeedNode = (index: number): MivoCanvasNode =>
++  ({
++    id: `stress-${index}`,
++    type: 'image',
++    title: `Result ${String(index + 1).padStart(3, '0')}`,
++    x: (index % 10) * 162 - 740,
++    y: Math.floor(index / 10) * 214 - 520,
++    width: 132,
++    height: 174,
++    status: 'ready',
++    assetUrl: FAKE_BASE64,
++    generation: {
++      prompt: '批量结果压力测试节点',
++      model: modelNames[index % modelNames.length], // 完整签名:model 与 seed 推导一致
++      size: '768x1024',
++      seed: 7000 + index,
++    },
++  }) as unknown as MivoCanvasNode
++
++const v12Blob = (extraCanvases: Record<string, unknown> = {}) => ({
++  state: {
++    canvases: {
++      'stress-test': {
++        title: '100 张图片压力测试',
++        nodes: Array.from({ length: 100 }, (_, index) => stressSeedNode(index)),
++        edges: [],
++        tasks: [],
++        selectedNodeId: undefined,
++        selectedNodeIds: [],
++      },
++      ...extraCanvases,
++    },
++    sceneId: 'stress-test',
++    selectedNodeId: undefined,
++    selectedNodeIds: [],
++    activeTool: 'select',
++  },
++  version: 12,
++})
++
++beforeEach(() => {
++  ls().clear()
++  useCanvasStore.setState({ ...useCanvasStore.getInitialState() } as never, true)
++  // #532(写防抖 + 冻结目标)后:丢弃上一测试的暂存写 + read-your-writes 快照,
++  // 否则 seed 底层后 getItem 会按语义正确地返回旧快照/被迟发防抖写覆盖(参照
++  // canvasStore.hydrationMigration.contract.test.ts 的同款隔离)。
++  __resetCanvasPersistStorageForTests()
++})
++
++describe('#506 新用户基线:初始持久化输出零 base64、体积几十 KB 量级', () => {
++  it('partialize(初始态) 无 data:image;envelope 体积 < 200KB(旧基线 2-4MB)', () => {
++    const partialized = canvasPersistOptions.partialize(useCanvasStore.getState() as CanvasState)
++    const envelope = JSON.stringify({ state: partialized, version: 13 })
++    expect(envelope.includes('data:image')).toBe(false)
++    expect(envelope.length).toBeLessThan(200_000)
++    // stress 种子节点存的是微型引用
++    const stressNode = (partialized as { canvases: Record<string, { nodes: MivoCanvasNode[] }> }).canvases[
++      'stress-test'
++    ].nodes.find((n) => n.id === 'stress-42')
++    expect(stressNode?.assetUrl).toBe('mivo-demo:stress/42')
++  })
++})
++
++describe('#506 v13 迁移:存量 base64 demo 节点清洗(真实 rehydrate + 磁盘读回验证)', () => {
++  it('v12 blob(100×26KB base64)→ rehydrate → 内存节点为 mivo-demo: 引用;迁移写回后磁盘 blob 零 data:image、version=13、体积坍缩', async () => {
++    const seeded = JSON.stringify(v12Blob())
++    expect(seeded.length).toBeGreaterThan(2_000_000) // 前提自检:确实在 MB 量级上做断言
++    ls().setItem(NAME, seeded)
++
++    await useCanvasStore.persist.rehydrate()
++
++    // 内存:全部 stress 节点洗成对应 index 的引用(位置等其余字段不动)
++    const doc = useCanvasStore.getState().canvases['stress-test']
++    expect(doc.nodes).toHaveLength(100)
++    expect(doc.nodes.every((n) => n.assetUrl === `mivo-demo:stress/${/stress-(\d+)/.exec(n.id)?.[1]}`)).toBe(true)
++    expect(doc.nodes[7].x).toBe(7 * 162 - 740) // 内容字段未被重置
++
++    // F2(镜像原子同步):normalize 会把旧 assetUrl 镜像进 asset.url 与 image fill,
++    // 只改 legacy 字段会让 kernel 三域投影继续携带 base64——**完整节点 JSON** 断言
++    // 三处镜像全部同步(compact 会裁掉镜像,磁盘断言单独看不出来,这里必须看内存全量)。
++    const fullNodeJson = JSON.stringify(doc.nodes)
++    expect(fullNodeJson.includes('data:image')).toBe(false)
++    expect(doc.nodes[7].asset?.url).toBe('mivo-demo:stress/7')
++    const imageFill = doc.nodes[7].fills?.find((fill) => fill.kind === 'image')
++    expect(imageFill?.assetUrl).toBe('mivo-demo:stress/7')
++    // kernel 三域投影同样干净(kernel=new 真实 canonical 落盘断言见 docKernelPersistVersion.test)
++    const { projectToThreeDomain } = await import('../kernel/persistMigration')
++    const projected = projectToThreeDomain({
++      canvases: useCanvasStore.getState().canvases,
++      sceneId: 'stress-test',
++    } as never)
++    expect(JSON.stringify(projected.document).includes('data:image')).toBe(false)
++
++    // 磁盘读回验证(S01/S02):zustand 版本迁移触发写回;#532 后写回走防抖调度器,
++    // 先冲刷到落定再看盘。
++    await flushCanvasPersistWrite('migration-writeback-drain')
++    const written = ls().getItem(NAME)
++    expect(written).not.toBeNull()
++    expect(written!.includes('data:image')).toBe(false)
++    expect(written!.length).toBeLessThan(300_000) // MB → 几十/百 KB 量级
++    expect((JSON.parse(written!) as { version: number }).version).toBe(13)
++  })
++
++  it('真实复制链(三轮 F1):createNodeCopy 单次与多段副本同样清洗——id root 与 seed 一致', async () => {
++    // 生产真格式:nodeFactory.createNodeCopy → `${source.id}-copy-<timestamp>-<index>`,可多段
++    const singleCopy = createNodeCopy(stressSeedNode(23), 0)
++    const chainedCopy = createNodeCopy(createNodeCopy(stressSeedNode(7), 1), 2)
++    expect(singleCopy.id).toMatch(/^stress-23-copy-\d+-0$/) // 夹具自检:确实是生产 id 形态
++    expect(chainedCopy.id).toMatch(/^stress-7-copy-\d+-1-copy-\d+-2$/)
++    ls().setItem(
++      NAME,
++      JSON.stringify(
++        v12Blob({
++          'my-board': {
++            title: '我的画布',
++            nodes: [singleCopy, chainedCopy],
++            edges: [],
++            tasks: [],
++            selectedNodeId: undefined,
++            selectedNodeIds: [],
++          },
++        }),
++      ),
++    )
++    await useCanvasStore.persist.rehydrate()
++    const myBoard = useCanvasStore.getState().canvases['my-board']
++    const single = myBoard.nodes.find((n) => n.id === singleCopy.id)!
++    const chained = myBoard.nodes.find((n) => n.id === chainedCopy.id)!
++    expect(single.assetUrl).toBe('mivo-demo:stress/23')
++    expect(chained.assetUrl).toBe('mivo-demo:stress/7')
++    // 内存全量(含镜像)与盘上均零 data:image(盘上断言先冲刷防抖写回)
++    expect(JSON.stringify(myBoard.nodes).includes('data:image')).toBe(false)
++    await flushCanvasPersistWrite('migration-writeback-drain')
++    expect(ls().getItem(NAME)!.includes('data:image')).toBe(false)
++  })
++
++  it('边界:无种子指纹的用户 data: 图一律不动(不猜测非 demo 内容出处)', async () => {
++    const userNode = {
++      id: 'user-photo-1',
++      type: 'image',
++      title: '用户自己的 data 图',
++      x: 0,
++      y: 0,
++      width: 100,
++      height: 100,
++      status: 'ready',
++      assetUrl: 'data:image/png;base64,USERBYTES',
++    }
++    ls().setItem(
++      NAME,
++      JSON.stringify(
++        v12Blob({
++          'my-board': {
++            title: '我的画布',
++            nodes: [userNode],
++            edges: [],
++            tasks: [],
++            selectedNodeId: undefined,
++            selectedNodeIds: [],
++          },
++        }),
++      ),
++    )
++    await useCanvasStore.persist.rehydrate()
++    expect(useCanvasStore.getState().canvases['my-board'].nodes[0].assetUrl).toBe('data:image/png;base64,USERBYTES')
++  })
++
++  // ── F1 对抗五例(复审裁定:歧义一律保留原 data URL,禁止取模/禁止 fallback)──
++  const seedUserCanvas = (node: Record<string, unknown>) =>
++    ls().setItem(
++      NAME,
++      JSON.stringify(
++        v12Blob({
++          'my-board': { title: '我的画布', nodes: [node], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
++        }),
++      ),
++    )
++  const expectUntouched = async (nodeId: string, expected: string) => {
++    await useCanvasStore.persist.rehydrate()
++    const node = useCanvasStore.getState().canvases['my-board'].nodes.find((n) => n.id === nodeId)!
++    expect(node.assetUrl).toBe(expected)
++  }
++
++  it('对抗① id 撞车:stress-999(非 0..99 完整形)→ 不动,禁止取模成 99', async () => {
++    seedUserCanvas({ ...stressSeedNode(99), id: 'stress-999' })
++    await expectUntouched('stress-999', FAKE_BASE64)
++  })
++
++  it('对抗② prompt 撞车:复制链 id 合法但 model 与 seed 推导不一致 → 签名不完整,不动', async () => {
++    // 用合法复制链 id 让「签名一致性」成为唯一被试探的判据(id 判据单独试探见①⑥)
++    const node = stressSeedNode(5) as unknown as { generation: Record<string, unknown> }
++    seedUserCanvas({ ...stressSeedNode(5), id: 'stress-5-copy-1754300000000-0', generation: { ...node.generation, model: '用户自己的模型' } })
++    await expectUntouched('stress-5-copy-1754300000000-0', FAKE_BASE64)
++  })
++
++  it('对抗③ seed 缺失:复制链 id 合法、签名其余齐全但无 seed → 不动,禁止 fallback 0', async () => {
++    const node = stressSeedNode(5) as unknown as { generation: Record<string, unknown> }
++    const generation = { ...node.generation }
++    delete generation.seed
++    seedUserCanvas({ ...stressSeedNode(5), id: 'stress-5-copy-1754300000000-1', generation })
++    await expectUntouched('stress-5-copy-1754300000000-1', FAKE_BASE64)
++  })
++
++  it('对抗④ seed 越界:seed=7100 → 不动(复制链 index 只从合法 seed 还原,禁止取模)', async () => {
++    const node = stressSeedNode(0) as unknown as { generation: Record<string, unknown> }
++    seedUserCanvas({ ...stressSeedNode(0), id: 'stress-0-copy-1754300000000-0', generation: { ...node.generation, seed: 7100 } })
++    await expectUntouched('stress-0-copy-1754300000000-0', FAKE_BASE64)
++  })
++
++  it('对抗⑤ 复制后换图保留元数据:assetSourceDimensions 在(换图流程会记录)→ 不动,用户的图不被覆盖', async () => {
++    const replaced = {
++      ...createNodeCopy(stressSeedNode(8), 0), // 真实复制,再模拟换图:新 data: 图 + 记录源尺寸
++      assetUrl: 'data:image/png;base64,USER_REPLACED_BYTES',
++      asset: undefined,
++      fills: undefined,
++      assetSourceDimensions: { width: 800, height: 600 }, // 种子从不携带;换图痕迹
++    }
++    seedUserCanvas(replaced as unknown as Record<string, unknown>)
++    await expectUntouched(replaced.id, 'data:image/png;base64,USER_REPLACED_BYTES')
++  })
++
++  it('对抗⑦ 非 stress 前缀的手造 id(带完整签名)→ 不动(id 形态不在 canonical root + copy 链内)', async () => {
++    seedUserCanvas({ ...stressSeedNode(23), id: 'pasted-copy-abc' })
++    await expectUntouched('pasted-copy-abc', FAKE_BASE64)
++  })
++
++  it('对抗⑥ id 与 seed 错位:stress-3 携带 seed=7009 → 全签名一致性失败,不动', async () => {
++    const node = stressSeedNode(3) as unknown as { generation: Record<string, unknown> }
++    seedUserCanvas({ ...stressSeedNode(3), generation: { ...node.generation, seed: 7009, model: modelNames[9 % 3] } })
++    await expectUntouched('stress-3', FAKE_BASE64)
++  })
++
++  it('幂等:清洗后的 v13 blob 再次 rehydrate 不再变化(引用不再命中 data: 判据)', async () => {
++    ls().setItem(NAME, JSON.stringify(v12Blob()))
++    await useCanvasStore.persist.rehydrate()
++    await flushCanvasPersistWrite('migration-writeback-drain') // 首次迁移写回落定
++    const afterFirst = ls().getItem(NAME)
++    useCanvasStore.setState({ ...useCanvasStore.getInitialState() } as never, true)
++    __resetCanvasPersistStorageForTests() // 丢弃 reset 触发的暂存写(测试自扰,不是迁移)
++    await useCanvasStore.persist.rehydrate() // 第二次:盘上已是 v13
++    const doc = useCanvasStore.getState().canvases['stress-test']
++    expect(doc.nodes.every((n) => n.assetUrl?.startsWith('mivo-demo:stress/'))).toBe(true)
++    expect(afterFirst!.includes('data:image')).toBe(false)
++  })
++})
+diff --git a/src/store/demoScenes.ts b/src/store/demoScenes.ts
+index 796116f1..3f8bf6a1 100644
+--- a/src/store/demoScenes.ts
++++ b/src/store/demoScenes.ts
+@@ -1,4 +1,4 @@
+-import { createDemoImage } from '../lib/demoImages'
++import { stressDemoAssetUrl } from '../lib/demoAssets'
+ import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
+ import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
+ import type { CanvasProject, DemoSceneId, MivoCanvasNode, MivoCanvasSnapshot, SceneDefinition } from '../types/mivoCanvas'
+@@ -77,21 +77,6 @@ export const DEMO_SCENE_IDS_EXHAUSTIVE: Exclude<DemoSceneId, (typeof DEMO_SCENE_
+ export const isDemoSeedCanvasId = (canvasId: string, projectId?: string): boolean =>
+   DEMO_SCENE_ID_SET.has(canvasId) || (projectId !== undefined && DEMO_PROJECT_ID_SET.has(projectId))
+ 
+-const image = (
+-  label: string,
+-  mood: 'character' | 'environment' | 'variant' | 'asset',
+-  seed: number,
+-  accent: string,
+-  secondary: string,
+-) =>
+-  createDemoImage({
+-    label,
+-    mood,
+-    seed,
+-    accent,
+-    secondary,
+-  })
+-
+ export const makeNode = (
+   node: Omit<MivoCanvasNode, 'status' | 'type'> & Partial<Pick<MivoCanvasNode, 'status' | 'type'>>,
+ ): MivoCanvasNode =>
+@@ -281,13 +266,9 @@ const sceneDefinitions = (): Record<DemoSceneId, SceneDefinition> => {
+           y: Math.floor(index / 10) * 214 - 520,
+           width: 132,
+           height: 174,
+-          assetUrl: image(
+-            `R${index + 1}`,
+-            index % 3 === 0 ? 'character' : index % 3 === 1 ? 'variant' : 'environment',
+-            3000 + (index % 12),
+-            ['#a85232', '#557463', '#566d89', '#7b5b4e'][index % 4],
+-            ['#d9c098', '#a9beb0', '#b5c0d0', '#d4b89d'][index % 4],
+-          ),
++          // #506:不再内联生成 base64——节点只存 mivo-demo: 微型引用,渲染时经
++          // assetUrlLease 惰性绘制(参数矩阵单一真相源在 demoAssets.stressDemoImageOptions)。
++          assetUrl: stressDemoAssetUrl(index),
+           generation: {
+             prompt: '批量结果压力测试节点',
+             model: modelNames[index % modelNames.length],
+diff --git a/src/store/hydrationDurableSettle.test.ts b/src/store/hydrationDurableSettle.test.ts
+index 8d2f384f..e73fd6fa 100644
+--- a/src/store/hydrationDurableSettle.test.ts
++++ b/src/store/hydrationDurableSettle.test.ts
+@@ -252,11 +252,11 @@ describe('SC-15 R2: hydration settle must durable-writeback to persist storage',
+       }
+     })
+     expect(settledRaw).not.toBeNull()
+-    // F8(version=12 断言补齐):seed v11 → migrate 写回走真实新路径,盘上版本必须升到 12
++    // F8(version 断言补齐):seed v11 → migrate 写回走真实新路径,盘上版本必须升到 13(#506 后迁移链到 13)
+     const { flushCanvasPersistWrite } = await import('./canvasPersistConfig')
+     await flushCanvasPersistWrite('migration-writeback-drain')
+     const finalRaw = ls().getItem('mivo-canvas-demo')
+-    expect((JSON.parse(finalRaw!) as { version: number }).version).toBe(12)
++    expect((JSON.parse(finalRaw!) as { version: number }).version).toBe(13)
+   })
+ 
+   it('gate: no settle (already-settled state) → no writeback, blob unchanged', async () => {

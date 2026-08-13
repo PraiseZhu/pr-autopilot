@@ -1,0 +1,2054 @@
+diff --git a/docs/design-previews/region-edit/assets/product.css b/docs/design-previews/region-edit/assets/product.css
+index 9b51bbfd..3ac7f6e6 100644
+--- a/docs/design-previews/region-edit/assets/product.css
++++ b/docs/design-previews/region-edit/assets/product.css
+@@ -73,6 +73,8 @@ button {
+   --edge-derivation: #979a9d;
+   --edge-derivation-width: 2;
+   --edge-derivation-opacity: 0.88;
++  /* glow overlay 颜色:亮蓝色渐变头部色,与主线色独立。 */
++  --edge-glow-color: #3B82F6;
+   --rust: #b6572c;
+   --ochre: #b77928;
+   --blue: #566d89;
+@@ -7740,6 +7742,7 @@ button:disabled {
+ 
+ :root[data-mivo-theme='dark'] {
+   --edge-derivation: #9da8b5;
++  --edge-glow-color: #5AACFE;
+   --dialog-backdrop: rgba(0, 0, 0, 0.52);
+   --dialog-surface: #232322;
+   --dialog-ink: #f4f2ee;
+diff --git a/src/App.css b/src/App.css
+index 29ff02e0..09b1552d 100644
+--- a/src/App.css
++++ b/src/App.css
+@@ -27,6 +27,8 @@
+   --edge-derivation: #979a9d;
+   --edge-derivation-width: 2;
+   --edge-derivation-opacity: 0.88;
++  /* glow overlay 颜色:亮蓝色渐变头部色,与主线色独立。 */
++  --edge-glow-color: #3B82F6;
+   --rust: #b6572c;
+   --ochre: #b77928;
+   --blue: #566d89;
+@@ -7694,6 +7696,7 @@ button:disabled {
+ 
+ :root[data-mivo-theme='dark'] {
+   --edge-derivation: #9da8b5;
++  --edge-glow-color: #5AACFE;
+   --dialog-backdrop: rgba(0, 0, 0, 0.52);
+   --dialog-surface: #232322;
+   --dialog-ink: #f4f2ee;
+diff --git a/src/canvas/CanvasNodeView.tsx b/src/canvas/CanvasNodeView.tsx
+index 31a965cb..4d790ebf 100644
+--- a/src/canvas/CanvasNodeView.tsx
++++ b/src/canvas/CanvasNodeView.tsx
+@@ -352,9 +352,15 @@ export const CanvasNodeView = memo(function CanvasNodeView({
+           onFinishTextEdit={onFinishTextEdit}
+         />
+       ) : markupNode ? (
++        // 本分支只在 Leafer 没有真画本体时命中(!leaferPaintedNode,见上方
++        // markupTextOverlayOnly/markupSelectionShellOnly 的早退条件)——即
++        // ?renderer=dom 或降级会话。此时派生连线的选中态视觉反馈(加粗+流光)
++        // 完全由 MarkupNodeView 自己承担,没有旁路的 Leafer 图层顶替,必须传
++        // selected(SC-B6:DOM 侧与 Leafer 侧同样响应 hover∪选中,不能只响应 hover)。
+         <MarkupNodeView
+           node={node}
+           editing={editing}
++          selected={selected}
+           onUpdateText={onUpdateText}
+           onFinishTextEdit={onFinishTextEdit}
+         />
+diff --git a/src/canvas/MarkupNodeView.derivationGlow.test.tsx b/src/canvas/MarkupNodeView.derivationGlow.test.tsx
+new file mode 100644
+index 00000000..124f922c
+--- /dev/null
++++ b/src/canvas/MarkupNodeView.derivationGlow.test.tsx
+@@ -0,0 +1,222 @@
++// @vitest-environment happy-dom
++// SC-B6/B7/B8(PR-B 三审共识 g2 组):DOM 渲染器(?renderer=dom 回退通道,亦可由
++// Leafer init 失败自动降级触达)下派生连线的 hover∪选中视觉反馈,必须与 Leafer
++// 侧同表同式——修复前 DOM 侧只响应 hover(从未接收选中态)、从不退化 reduced-motion。
++//
++// renderToStaticMarkup 静态渲染即足够:"选中未 hover"正是静态渲染天然覆盖的场景
++// (glowHovered 是初始 useState(false),不需要模拟指针交互);reduced-motion 通过
++// mock window.matchMedia 的初值控制,同样在首次静态渲染里就能读到。
++// SC-C2 的用例(下方第二个 describe)例外:必须先让 glowHovered 真的变 true 再
++// 触发失焦/隐藏,静态渲染做不到这一步,改用 react-dom/client + React 19 act 的
++// 真实挂载(沿用 useDocumentThemeAttribute.test.ts 的先例)——dispatch 真实
++// PointerEvent('pointerover', {bubbles:true}) 触发 React 的 onPointerEnter
++// 合成事件(React 对 pointerenter/pointerleave 走 capture 委托,从 pointerover/
++// pointerout 派生;已用探针验证 dispatch 'pointerover' 确实能触发 onPointerEnter)。
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { act, createElement as h } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { renderToStaticMarkup } from 'react-dom/server'
++import { MarkupNodeView } from './MarkupNodeView'
++import { DOM_GLOW_LAYERS } from './derivationEdgeGlowLayers'
++import { DERIVATION_EDGE_GLOW_LAYER_TABLE } from '../model/derivationEdgeGlowLayerTable'
++import leaferEdgeHoverFxSource from '../render/leaferEdgeHoverFx.ts?raw'
++import markupNodeViewSource from './MarkupNodeView.tsx?raw'
++import { createDerivationEdgeNode } from '../store/nodeFactory'
++import type { CanvasEdge, MivoCanvasNode } from '../types/mivoCanvas'
++
++;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++
++const image = (id: string, x: number): MivoCanvasNode =>
++  ({
++    id,
++    type: 'image',
++    title: id,
++    x,
++    y: 0,
++    width: 100,
++    height: 100,
++    status: 'ready',
++  }) as MivoCanvasNode
++
++const derivationEdgeNode = (): MivoCanvasNode => {
++  const src = image('src', 0)
++  const tgt = image('tgt', 300)
++  const edge: CanvasEdge = { id: 'e1', from: 'src', to: 'tgt', type: 'edit', prompt: '', createdAt: 0 }
++  const node = createDerivationEdgeNode(edge, [src, tgt])
++  if (!node) throw new Error('fixture: derivation edge node not created')
++  return node
++}
++
++const mockMatchMedia = (matches: boolean) => {
++  window.matchMedia = vi.fn().mockImplementation((query: string) => ({
++    matches,
++    media: query,
++    addEventListener: vi.fn(),
++    removeEventListener: vi.fn(),
++  })) as unknown as typeof window.matchMedia
++}
++
++const renderMarkup = (node: MivoCanvasNode, selected: boolean) =>
++  renderToStaticMarkup(
++    h(MarkupNodeView, {
++      node,
++      editing: false,
++      selected,
++      onUpdateText: () => {},
++      onFinishTextEdit: () => {},
++    }),
++  )
++
++describe('MarkupNodeView 派生连线 DOM 渲染 — 选中态/reduced-motion/层表同源(SC-B6/B7/B8)', () => {
++  beforeEach(() => {
++    mockMatchMedia(false)
++  })
++  afterEach(() => {
++    vi.restoreAllMocks()
++  })
++
++  it('选中未 hover 也有流光:DOM 侧选中态必须与 hover 同样驱动加粗+流光', () => {
++    const html = renderMarkup(derivationEdgeNode(), true)
++    expect(html).toContain('markup-glow-overlay')
++    expect(html).toContain('stroke-width="6"') // DERIVATION_WIDE_STROKE:选中也加粗主线
++  })
++
++  it('对照:未选中且未 hover 不显示流光(证明上一条不是恒真渲染)', () => {
++    const html = renderMarkup(derivationEdgeNode(), false)
++    expect(html).not.toContain('markup-glow-overlay')
++  })
++
++  it('reduced-motion 退化为静态加粗:选中态命中 reduced-motion 时不跑流光动画,但线体仍加粗', () => {
++    mockMatchMedia(true)
++    const html = renderMarkup(derivationEdgeNode(), true)
++    expect(html).not.toContain('markup-glow-overlay')
++    expect(html).toContain('stroke-width="6"')
++  })
++
++  it('对照:非 reduced-motion 下选中态仍照常跑流光动画(证明上一条不是把动画整体关掉)', () => {
++    mockMatchMedia(false)
++    const html = renderMarkup(derivationEdgeNode(), true)
++    expect(html).toContain('markup-glow-overlay')
++  })
++
++  // ── SC-C3/SC-C4(PR-B R2 复核):层表单一来源,防漂移 ──
++  // 上一版靠转录比对(把 Leafer 侧私有 LAYER_TABLE 原样抄一份到这个测试文件里
++  // 逐项 toEqual)背书"两侧同值同序"——但转录本身就是"两份字面量"的证据:
++  // 任一侧真的改了数值,漂移只会在下次跑这条测试时被动发现,结构上并不是不
++  // 可能发生。现在两侧从 model/derivationEdgeGlowLayerTable.ts 同一个数组
++  // 派生,这条测试改成断言"同一来源",不是"数值恰好相等"。
++  it('层表跨渲染器防漂移(同一来源派生,非数值转录)', () => {
++    // DOM 侧:derivationEdgeGlowLayers.ts 的 DOM_GLOW_LAYERS 就是这个共享数组
++    // 本身(re-export),不是另起一份拷贝——同一个对象引用,不会"看起来一样
++    // 但其实是两份"。
++    expect(DOM_GLOW_LAYERS).toBe(DERIVATION_EDGE_GLOW_LAYER_TABLE)
++
++    // Leafer 侧:源码文本核实它也从同一个共享模块 import 并用 .map 派生,不再
++    // 手写数字字面量——防止有人在这边改了共享源,那边却悄悄加回一份"临时"表。
++    expect(leaferEdgeHoverFxSource).toMatch(
++      /import\s*\{\s*DERIVATION_EDGE_GLOW_LAYER_TABLE\s*\}\s*from\s*['"]\.\.\/model\/derivationEdgeGlowLayerTable['"]/,
++    )
++    expect(leaferEdgeHoverFxSource).not.toMatch(/\[\s*100\s*,\s*0\s*,\s*0\.1\d*\s*\]/)
++  })
++})
++
++describe('MarkupNodeView 派生连线 DOM 渲染 — 窗口失焦/页面隐藏后清 hover(SC-C2)', () => {
++  let container: HTMLDivElement
++  let root: Root
++
++  beforeEach(() => {
++    mockMatchMedia(false)
++    container = document.createElement('div')
++    document.body.appendChild(container)
++    root = createRoot(container)
++  })
++
++  afterEach(() => {
++    act(() => {
++      root.unmount()
++    })
++    container.remove()
++    vi.restoreAllMocks()
++  })
++
++  const mount = (selected: boolean) => {
++    act(() => {
++      root.render(
++        h(MarkupNodeView, {
++          node: derivationEdgeNode(),
++          editing: false,
++          selected,
++          onUpdateText: () => {},
++          onFinishTextEdit: () => {},
++        }),
++      )
++    })
++  }
++
++  const hoverOn = () => {
++    const svg = container.querySelector('svg.dom-markup-node')
++    if (!svg) throw new Error('fixture: derivation edge svg not found')
++    act(() => {
++      svg.dispatchEvent(new PointerEvent('pointerover', { bubbles: true }))
++    })
++  }
++
++  const hasGlow = () => Boolean(container.querySelector('.markup-glow-overlay'))
++
++  it('失焦或页面隐藏后未选中流光停止:blur 后 hover 产生的流光消失', () => {
++    mount(false)
++    hoverOn()
++    expect(hasGlow()).toBe(true) // 前提:真的先进入了 hover 态(否则下面的"停止"无判别力)
++
++    act(() => {
++      window.dispatchEvent(new Event('blur'))
++    })
++    expect(hasGlow()).toBe(false)
++  })
++
++  it('失焦或页面隐藏后未选中流光停止:页面隐藏(visibilitychange → hidden)同样让流光消失', () => {
++    mount(false)
++    hoverOn()
++    expect(hasGlow()).toBe(true)
++
++    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
++    act(() => {
++      document.dispatchEvent(new Event('visibilitychange'))
++    })
++    expect(hasGlow()).toBe(false)
++  })
++
++  it('对照:选中态连线在失焦后仍保持流光(不外溢——只清 hover,不清选中态)', () => {
++    mount(true)
++    expect(hasGlow()).toBe(true) // 选中态本身就该发光,不需要先 hover
++
++    act(() => {
++      window.dispatchEvent(new Event('blur'))
++    })
++    expect(hasGlow()).toBe(true) // 失焦后选中态兜底,仍然发光
++  })
++
++  it('对照:选中态连线在页面隐藏后仍保持流光', () => {
++    mount(true)
++    expect(hasGlow()).toBe(true)
++
++    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
++    act(() => {
++      document.dispatchEvent(new Event('visibilitychange'))
++    })
++    expect(hasGlow()).toBe(true)
++  })
++})
++
++describe('MarkupNodeView DOM glow 可观测性 — debugLogger 三态日志(SC-2)', () => {
++  // SC-2(Greptile review #3747828109):DOM 回退通道流光状态变化必须写 Debug Log,
++  // 与 Leafer 通道(leaferEdgeHoverFx)可观测性一致。源码级断言(与本文件"层表跨
++  // 渲染器防漂移"同手段):hover 清理 / reduced-motion 降级 / 流光动画启停 三处
++  // transition 各有 debugLogger.log 落点——删任一处即红。
++  it('hover 清理 / reduced-motion 降级 / 流光启停均经 debugLogger 记录', () => {
++    expect(markupNodeViewSource).toContain("debugLogger.log(SRC, 'glow: hover cleared")
++    expect(markupNodeViewSource).toContain('debugLogger.log(SRC, `reduced-motion:')
++    expect(markupNodeViewSource).toContain('debugLogger.log(SRC, `glow started on')
++    expect(markupNodeViewSource).toContain('debugLogger.log(SRC, `glow stopped on')
++  })
++})
+diff --git a/src/canvas/MarkupNodeView.tsx b/src/canvas/MarkupNodeView.tsx
+index 4446f662..b559782c 100644
+--- a/src/canvas/MarkupNodeView.tsx
++++ b/src/canvas/MarkupNodeView.tsx
+@@ -1,6 +1,7 @@
+-import type { CSSProperties } from 'react'
++import { type CSSProperties, useEffect, useRef, useState } from 'react'
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import { useCanvasStore } from '../store/canvasStore'
++import { isDerivationEdgeNode } from '../store/nodeFactory'
+ import { defaultNoteFillColor } from '../model/markupStyleDefaults'
+ import { brushOutlinePathFor } from '../model/brushGeometry'
+ import { arrowHeadRenderFor, effectiveEndHeadFor, effectiveStartHeadFor } from '../model/arrowHeadGeometry'
+@@ -30,6 +31,8 @@ import {
+ } from './markupTextGeometry'
+ import { stampSrcFor } from './stampDefs'
+ import { defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
++import { DERIVATION_WIDE_STROKE, DOM_GLOW_LAYERS } from './derivationEdgeGlowLayers'
++import { debugLogger } from '../store/debugLogStore'
+ 
+ /**
+  * markup 节点的 DOM 渲染(从 CanvasNodeView 抽出,结构守卫 900 行红线内的复用拆分)。
+@@ -40,6 +43,8 @@ import { defaultTextColor, defaultTextFontSize, defaultTextWeight } from './text
+  * strokeStyle 'none' = 无边框档(描边整组归零)。
+  */
+ 
++const SRC = 'DOM EdgeGlow'
++
+ export function MarkupTextLayer({
+   node,
+   points,
+@@ -113,14 +118,19 @@ export function MarkupTextLayer({
+   )
+ }
+ 
++
+ export function MarkupNodeView({
+   node,
+   editing,
++  selected,
+   onUpdateText,
+   onFinishTextEdit,
+ }: {
+   node: MivoCanvasNode
+   editing: boolean
++  /** 派生连线的 hover∪选中视觉反馈依赖它(SC-B6);其余 markup 类型不读这个 prop
++   *  ——选中外框由 CanvasNodeView 的通用 `.dom-node.selected` 壳承担,不重复。 */
++  selected?: boolean
+   onUpdateText: (nodeId: string, text: string) => void
+   onFinishTextEdit: (nodeId: string) => void
+ }) {
+@@ -133,12 +143,6 @@ export function MarkupNodeView({
+   // 变化本身就是触发源)。
+   useDocumentThemeAttribute()
+   const renderStyle = markupRenderStyleFor(node)
+-  // strokeStyle 'none'(无边框档):描边整组归零,与 Leafer 侧 strokeHidden 同语义。
+-  const strokeHidden = renderStyle.strokeStyle === 'none'
+-  const strokeWidth = strokeHidden ? 0 : renderStyle.strokeWidth
+-  const stroke = strokeHidden ? 'none' : renderStyle.stroke
+-  const fill = renderStyle.fill
+-  const strokeDasharray = renderStyle.strokeStyle === 'dashed' ? `${strokeWidth * 2.2} ${strokeWidth * 1.6}` : undefined
+   const points = node.markupPoints?.length ? node.markupPoints : defaultMarkupPointsFor(node)
+   const markerId = `markup-arrow-${node.id}`
+   const lineLabelActive = isLineMarkup(node) && (editing || Boolean(node.text?.trim()))
+@@ -149,6 +153,91 @@ export function MarkupNodeView({
+   const showStartArrow = startHead !== 'none'
+   const showEndArrow = endHead !== 'none'
+   const lineRoute = lineRouteOf(node.markupLineRoute)
++  // derivation edge glow overlay: hover ∪ 选中(SC-B6,与 Leafer 侧 hoveredIds∪
++  // selectedIds 同语义)驱动 toggle。
++  const isDerivation = isDerivationEdgeNode(node)
++  const [glowHovered, setGlowHovered] = useState(false)
++  // SC-C2:窗口失焦 / 页面隐藏时清 hover(与 Leafer 侧 useDerivationEdgeHover 的
++  // window pointerout/blur/visibilitychange 收尾同语义,见该 hook SC-B3 注释)。
++  // DOM 渲染器的 hover 态只靠 SVG onPointerLeave 清理——指针可能仍停在 SVG
++  // 上方不动,只是窗口本身失焦或标签页切到后台,那种情况下 onPointerLeave 永远
++  // 不会触发,未选中的流光会一直跑、rAF 持续烧帧。不触碰 selected——选中态由
++  // 下面 glowActive 的 `|| selected` 分支单独兜底,失焦后仍保持发光(与 SC-B3
++  // 同一设计取舍:清 hover 集,不清选中态)。
++  useEffect(() => {
++    if (!isDerivation || typeof window === 'undefined') return undefined
++    // SC-2: 与 Leafer 通道(useDerivationEdgeHover 的 blur/visibilitychange 收尾)对齐
++    // 可观测性——窗口失焦/页面隐藏清 hover 时落 Debug Log,便于降级渲染器诊断。
++    const clearHover = () => {
++      setGlowHovered(false)
++      debugLogger.log(SRC, 'glow: hover cleared (window blur/hidden, DOM)')
++    }
++    const onVisibilityChange = () => {
++      if (document.visibilityState === 'hidden') clearHover()
++    }
++    window.addEventListener('blur', clearHover)
++    document.addEventListener('visibilitychange', onVisibilityChange)
++    return () => {
++      window.removeEventListener('blur', clearHover)
++      document.removeEventListener('visibilitychange', onVisibilityChange)
++    }
++  }, [isDerivation])
++  const glowActive = isDerivation && (glowHovered || Boolean(selected))
++  // prefers-reduced-motion(SC-B7,与 leaferEdgeHoverFx 的 mq.matches 同语义):
++  // 激活态退化为静态加粗、不跑 dash 动画。初值直接读 matchMedia(不留一帧动画
++  // 闪烁),变更时订阅 change 事件跟随系统设置实时切换。
++  const [reducedMotion, setReducedMotion] = useState(
++    () => typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches,
++  )
++  useEffect(() => {
++    if (typeof window === 'undefined') return undefined
++    const mq = window.matchMedia('(prefers-reduced-motion: reduce)')
++    const onChange = (event: MediaQueryListEvent) => {
++      setReducedMotion(event.matches)
++      // SC-2: reduced-motion 降级镜像 leaferEdgeHoverFx 的 matchMedia change 日志口径。
++      debugLogger.log(SRC, `reduced-motion: ${event.matches ? 'enabled' : 'disabled'} (DOM)`)
++    }
++    mq.addEventListener('change', onChange)
++    return () => mq.removeEventListener('change', onChange)
++  }, [])
++  const showAnimatedGlow = glowActive && !reducedMotion
++  // strokeStyle 'none'(无边框档):描边整组归零,与 Leafer 侧 strokeHidden 同语义。
++  // glowActive 时加粗到 DERIVATION_WIDE_STROKE(与 leaferEdgeHoverFx.widenLine 同
++  // 语义)——reduced-motion 下也加粗,只是不叠加动画 dash 层,这正是"静态加粗"。
++  const strokeHidden = renderStyle.strokeStyle === 'none'
++  const strokeWidth = strokeHidden ? 0 : glowActive ? DERIVATION_WIDE_STROKE : renderStyle.strokeWidth
++  const stroke = strokeHidden ? 'none' : renderStyle.stroke
++  const fill = renderStyle.fill
++  const strokeDasharray = renderStyle.strokeStyle === 'dashed' ? `${strokeWidth * 2.2} ${strokeWidth * 1.6}` : undefined
++  // rAF-driven dashOffset animation for DOM glow layers (id-scoped per node)。
++  // hooks 必须在全部提前 return 之前(stamp/note 分支)——条件调用 hooks 会破坏
++  // hook 顺序(react-hooks/rules-of-hooks,2026-08-08 lint 抓出)。
++  const glowRafRef = useRef(0)
++  useEffect(() => {
++    if (!showAnimatedGlow) {
++      cancelAnimationFrame(glowRafRef.current)
++      return
++    }
++    // SC-2: 流光动画启停镜像 leaferEdgeHoverFx 的 'glow started/stopped on <id>' 日志。
++    debugLogger.log(SRC, `glow started on ${node.id} (DOM, ${DOM_GLOW_LAYERS.length} layers)`)
++    const startedAt = performance.now()
++    const tick = () => {
++      const baseOffset = ((performance.now() - startedAt) * 0.24) % 260
++      const overlays = document.querySelectorAll(`[data-node="${node.id}"] .markup-glow-overlay`)
++      for (let k = 0; k < overlays.length && k < DOM_GLOW_LAYERS.length; k++) {
++        // 与 leaferEdgeHoverFx.layerOffsetAt 同式:dashoffset 增大 = 图案朝路径
++        // 起点(源图)滑,要源 → 目标流动必须随时间递减(符号反了流向全反)。
++        const dashOff = (((260 - DOM_GLOW_LAYERS[k].relOff - baseOffset) % 260) + 260) % 260
++        ;(overlays[k] as SVGElement).setAttribute('stroke-dashoffset', String(dashOff))
++      }
++      glowRafRef.current = requestAnimationFrame(tick)
++    }
++    glowRafRef.current = requestAnimationFrame(tick)
++    return () => {
++      debugLogger.log(SRC, `glow stopped on ${node.id} (DOM)`)
++      cancelAnimationFrame(glowRafRef.current)
++    }
++  }, [showAnimatedGlow, node.id])
+ 
+   // 每端一个 <marker>(六档形状不同,不能共用一个 def):chevron 描边、其余实心,
+   // 全部用描边色;orient auto-start-reverse 让 start 端自动反向。
+@@ -249,13 +338,24 @@ export function MarkupNodeView({
+           )
+         : elbowSegmentsFor(routeStart, routeEnd, routeGap || undefined).map((polyline) => polylinePathFor(polyline))
+ 
++  // Derivation edge glow: color 现读 CSS 变量(主题切换自动跟随)。
++  const glowColor =
++    typeof document !== 'undefined'
++      ? getComputedStyle(document.documentElement).getPropertyValue('--edge-glow-color').trim() || '#3B82F6'
++      : '#3B82F6'
++
+   return (
+     <>
+       <svg
+         className="dom-markup-node"
++        data-node={isDerivation ? node.id : undefined}
+         viewBox={`0 0 ${Math.max(1, node.width)} ${Math.max(1, node.height)}`}
+         preserveAspectRatio="none"
+         aria-hidden="true"
++        {...(isDerivation ? {
++          onPointerEnter: () => setGlowHovered(true),
++          onPointerLeave: () => setGlowHovered(false),
++        } : {})}
+       >
+         <defs>
+           {headMarkerDef('start', startHead)}
+@@ -345,6 +445,22 @@ export function MarkupNodeView({
+                 markerEnd={index === routeSegmentPaths.length - 1 ? markerEndUrl : undefined}
+               />
+             ))}
++            {showAnimatedGlow
++              ? DOM_GLOW_LAYERS.map((layer, k) => (
++                  <path
++                    key={k}
++                    className="markup-glow-overlay"
++                    d={routePathD}
++                    fill="none"
++                    stroke={glowColor}
++                    strokeWidth={6}
++                    strokeLinecap="round"
++                    strokeLinejoin="round"
++                    strokeOpacity={layer.alpha}
++                    strokeDasharray={`${layer.len} ${260 - layer.len}`}
++                  />
++                ))
++              : null}
+           </>
+         ) : (
+           <>
+@@ -380,6 +496,23 @@ export function MarkupNodeView({
+                 />
+               )
+             })}
++            {showAnimatedGlow
++              ? DOM_GLOW_LAYERS.map((layer, k) => (
++                  <line
++                    key={k}
++                    className="markup-glow-overlay"
++                    x1={points[0]?.x ?? 0}
++                    y1={points[0]?.y ?? node.height}
++                    x2={points[1]?.x ?? node.width}
++                    y2={points[1]?.y ?? 0}
++                    stroke={glowColor}
++                    strokeWidth={6}
++                    strokeLinecap="round"
++                    strokeOpacity={layer.alpha}
++                    strokeDasharray={`${layer.len} ${260 - layer.len}`}
++                  />
++                ))
++              : null}
+           </>
+       )}
+       </svg>
+diff --git a/src/canvas/MivoCanvas.tsx b/src/canvas/MivoCanvas.tsx
+index d50fa0d9..336fb2e6 100644
+--- a/src/canvas/MivoCanvas.tsx
++++ b/src/canvas/MivoCanvas.tsx
+@@ -10,6 +10,7 @@ import {
+   type MouseEvent as ReactMouseEvent,
+ } from 'react'
+ import { useEngineSpikeRenderers } from '../render/useEngineSpikeRenderers'
++import { useDerivationEdgeHover } from '../render/useDerivationEdgeHover'
+ import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
+ import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvasAssetDrag'
+ import { canImportCanvasFile, importCanvasFileBatch, importImageUrlToCanvas } from '../lib/canvasAssetImport'
+@@ -275,6 +276,16 @@ export function MivoCanvas({
+     hostRef, viewport, visibleNodes, canvasRenderedNodes, isPanning, editingNodeId: editingTextNodeId, selectedNodeIds,
+   })
+ 
++  // Derivation edge hover: pointermove → hitTest → Leafer glow overlay.
++  // Leafer is hittable:false + pointer-events:none, so hover detection runs
++  // on the React event path using the existing hitTest.ts stroke hit functions.
++  useDerivationEdgeHover({
++    screenToCanvas,
++    nodes: visibleNodes,
++    selectedNodeIds,
++    rendererMode: effectiveRendererMode,
++  })
++
+   const openNodeContextMenu = useCallback(
+     (nodeId: string, clientX: number, clientY: number) => {
+       const position = clampContextMenuPosition(clientX, clientY)
+diff --git a/src/canvas/derivationEdgeGlowLayers.ts b/src/canvas/derivationEdgeGlowLayers.ts
+new file mode 100644
+index 00000000..b7461787
+--- /dev/null
++++ b/src/canvas/derivationEdgeGlowLayers.ts
+@@ -0,0 +1,15 @@
++// Derivation edge DOM glow:6 层 dash 彗星尾(长层淡短层浓,头部对齐)。独立
++// 成文(而不是留在 MarkupNodeView.tsx 里)是因为 react-refresh/only-export-components
++// 不允许组件文件里混出非组件常量。
++//
++// PR-B R2:数值单一来源已收到 model/derivationEdgeGlowLayerTable.ts,Leafer 侧
++// (render/leaferEdgeHoverFx.ts)从同一个数组派生。这里直接复用该来源,不再自己
++// 手写一份数字——两侧的"同值同序"从此是结构保证(同一个数组引用),不是靠测试
++// 转录背书。
++export { DERIVATION_EDGE_GLOW_LAYER_TABLE as DOM_GLOW_LAYERS } from '../model/derivationEdgeGlowLayerTable'
++
++// hover∪选中激活时的加粗宽度(与 leaferEdgeHoverFx.WIDE_STROKE 同值,理由同上
++// 不 import)。派生连线常态描边宽度读 --edge-derivation-width,默认 2
++// (canvasRenderAdapter.markupRenderStyleFor),与 leaferEdgeHoverFx.NORMAL_STROKE
++// 同值,加粗后两侧视觉一致。
++export const DERIVATION_WIDE_STROKE = 6
+diff --git a/src/model/derivationEdgeGlowLayerTable.ts b/src/model/derivationEdgeGlowLayerTable.ts
+new file mode 100644
+index 00000000..972a72ec
+--- /dev/null
++++ b/src/model/derivationEdgeGlowLayerTable.ts
+@@ -0,0 +1,26 @@
++// derivation edge glow overlay 的 6 层 dash 表 —— 单一物理来源。
++//
++// PR-B R2 复核(席③ major / 席① suggestion,两席都判该做):Leafer 侧
++// (render/leaferEdgeHoverFx.ts 的私有 LAYER_TABLE 元组)与 DOM 侧
++// (canvas/derivationEdgeGlowLayers.ts 的 DOM_GLOW_LAYERS 对象数组)此前各写
++//了一份,靠测试转录逐项比对背书"同值同序"——但转录本身就是"两份字面量"
++// 的证据,任一侧改了数值/顺序,漂移只会在下一次跑测试时被动发现,不是结构上
++// 不可能发生。收到这一处后,两侧从同一个数组派生,形状差异(元组 vs 对象)
++// 用映射解决,不再各写一份数字。
++//
++// 数值含义:[len, relOff, alpha] —— len=dash 段长度,relOff=相对偏移(GLOW_LEN
++// − len,让所有层头部对齐在同一位置),alpha=该层不透明度。长层淡、短层浓——
++// 方向配反会退化成平坦实心段(2026-08-08 踩过,见 leaferEdgeHoverFx.ts 头部
++// 注释)。Composited alpha 头→尾:0.87 → 0.71 → 0.53 → 0.37 → 0.23 → 0.10
++// (衰减 88%)。
++
++export type DerivationEdgeGlowLayer = { len: number; relOff: number; alpha: number }
++
++export const DERIVATION_EDGE_GLOW_LAYER_TABLE: readonly DerivationEdgeGlowLayer[] = [
++  { len: 100, relOff: 0, alpha: 0.10 },
++  { len: 78, relOff: 22, alpha: 0.14 },
++  { len: 58, relOff: 42, alpha: 0.18 },
++  { len: 40, relOff: 60, alpha: 0.26 },
++  { len: 24, relOff: 76, alpha: 0.38 },
++  { len: 11, relOff: 89, alpha: 0.55 },
++]
+diff --git a/src/model/edgeGlowColorDefaults.ts b/src/model/edgeGlowColorDefaults.ts
+new file mode 100644
+index 00000000..84acb3ba
+--- /dev/null
++++ b/src/model/edgeGlowColorDefaults.ts
+@@ -0,0 +1,15 @@
++// derivation edge glow overlay 的兜底色 —— CSS 变量解析失败/不可用(SSR、
++// happy-dom 等没有真实级联的场景)时用。仓内约定"空属性 = light",兜底必须
++// 落在 light 档(App.css :root 的 --edge-glow-color = #3B82F6),不能落在
++// dark 档(:root[data-mivo-theme='dark'] 的 #5AACFE)上,否则这些场景会渲染
++// 反主题的颜色,且与 DOM 渲染器(MarkupNodeView)的兜底方向不一致。
++//
++// 单独一个文件(而不是塞进消费点自己的模块):Leafer 侧(render/leaferEdgeHoverFx)
++// 与 DOM 侧的兜底常量此前各写了一份、且两份数值不同档(#5AACFE vs #3B82F6,
++// PR-B R1 审出的漂移)——把数值收到这一处,防止未来再长出第三份拷贝。
++
++/** derivation edge glow 颜色所读的 CSS 自定义属性名。 */
++export const EDGE_GLOW_COLOR_CSS_VAR = '--edge-glow-color'
++
++/** CSS 变量解析失败时的兜底色 —— light 档,与 App.css :root 声明同值。 */
++export const EDGE_GLOW_COLOR_FALLBACK = '#3B82F6'
+diff --git a/src/render/leaferEdgeHoverFx.test.ts b/src/render/leaferEdgeHoverFx.test.ts
+new file mode 100644
+index 00000000..74917220
+--- /dev/null
++++ b/src/render/leaferEdgeHoverFx.test.ts
+@@ -0,0 +1,458 @@
++import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
++import { EDGE_GLOW_COLOR_FALLBACK } from '../model/edgeGlowColorDefaults'
++import { DERIVATION_EDGE_GLOW_LAYER_TABLE } from '../model/derivationEdgeGlowLayerTable'
++import moduleSource from './leaferEdgeHoverFx.ts?raw'
++
++vi.mock('../store/debugLogStore', () => ({
++  debugLogger: { log: () => {}, warn: () => {}, error: () => {} },
++}))
++
++vi.mock('leafer-ui', () => {
++  class FakeUI {
++    props: Record<string, unknown>
++    _listeners: Record<string, Array<(...args: unknown[]) => void>>
++    _children: FakeUI[] = []
++    removed = false
++    constructor(props: Record<string, unknown> = {}) { this.props = { ...props }; this._listeners = {} }
++    // 真实 Leafer 的 Line/Path 把 points/path 暴露成实例级属性(直接 this.points,
++    // 不是 this.props.points——见 leafer-ui 源码 Line.isPointsMode getter)。
++    // pathDOf() 按真实形状读取,这里的 getter 代理回 props,让 fake 与真实实例
++    // 同一种读法(否则 pathDOf 在测试里永远读到 undefined,现读绑定测不出来)。
++    get points() { return this.props.points }
++    get path() { return this.props.path }
++    set(props: Record<string, unknown>) { Object.assign(this.props, props) }
++    remove() { this.removed = true }
++    on() { return this }
++  }
++  class FakeGroup extends FakeUI { add(child: FakeUI) { this._children.push(child) } }
++  class FakePath extends FakeUI {}
++  return { Group: FakeGroup, Path: FakePath, Line: FakePath, Ellipse: FakeUI, Polygon: FakeUI, Rect: FakeUI }
++})
++
++import { createLeaferEdgeHoverFx, type LeaferEdgeHoverFx } from './leaferEdgeHoverFx'
++import { Line, type Group } from 'leafer-ui'
++
++type TFakeUI = { props: Record<string, unknown>; _children: TFakeUI[]; removed: boolean }
++
++let fakeNow = 0
++let rafCbs: Array<FrameRequestCallback> = []
++let nextId = 1
++const fakeRaf = (cb: FrameRequestCallback): number => { const id = nextId++; rafCbs.push(cb); return id }
++const fakeCancelRaf = () => {}
++const flushRaf = (ms: number) => { fakeNow += ms; const cbs = [...rafCbs]; rafCbs = []; for (const cb of cbs) cb(0) }
++
++let MockGroup: new (p?: Record<string, unknown>) => Group
++let MockLine: new (p?: Record<string, unknown>) => Line
++beforeAll(async () => {
++  const m = await import('leafer-ui')
++  MockGroup = m.Group as unknown as new (p?: Record<string, unknown>) => Group
++  MockLine = m.Line as unknown as new (p?: Record<string, unknown>) => Line
++})
++
++const makeEdge = (nodeId: string) => {
++  const group = new MockGroup({})
++  const main = new MockLine({ points: [0, 0, 100, 0], stroke: '#5f6976', strokeWidth: 2 })
++  group.add(main as unknown as TFakeUI)
++  return { group, main, nodeId }
++}
++
++const glowLayers = (group: Group): TFakeUI[] =>
++  (group as unknown as TFakeUI)._children.filter((c) => c.props?.dashPattern !== undefined)
++const activeGlowLayers = (group: Group): TFakeUI[] =>
++  glowLayers(group).filter((c) => !c.removed)
++
++describe('leaferEdgeHoverFx — 6-layer comet dash overlay', () => {
++  let fx: LeaferEdgeHoverFx
++
++  beforeEach(() => { fakeNow = 0; rafCbs = []; nextId = 1; fx = createLeaferEdgeHoverFx({ now: () => fakeNow, raf: fakeRaf, cancelRaf: fakeCancelRaf }) })
++  afterEach(() => { fx.dispose(); vi.unstubAllGlobals() })
++
++  it('enterHover: widens line + creates 6-layer glow', () => {
++    const { group, main, nodeId } = makeEdge('e1')
++    fx.attachMain(nodeId, group, main)
++    fx.enterHover(nodeId)
++
++    expect(rafCbs.length).toBeGreaterThan(0)
++    flushRaf(16)
++    const layers = glowLayers(group)
++    expect(layers.length).toBe(6)
++    const dp = layers[0].props.dashPattern as number[]
++    expect(dp[0]).toBe(100)
++    expect(dp[1]).toBe(160)
++    // Line widened
++    expect((main as unknown as TFakeUI).props.strokeWidth).toBe(6)
++  })
++
++  it('leaveHover: all 6 glow layers removed (no leak)', () => {
++    const { group, main, nodeId } = makeEdge('e2')
++    fx.attachMain(nodeId, group, main)
++    fx.enterHover(nodeId)
++    flushRaf(16)
++    expect(activeGlowLayers(group).length).toBe(6)
++    fx.leaveHover(nodeId)
++    expect(activeGlowLayers(group).length).toBe(0)  // all removed
++    expect((main as unknown as TFakeUI).props.strokeWidth).toBe(2)
++  })
++
++  it('LOD entry stops running animation', () => {
++    const { group, main, nodeId } = makeEdge('e3')
++    fx.attachMain(nodeId, group, main)
++    fx.enterHover(nodeId)
++    flushRaf(16)
++    const layers = glowLayers(group)
++    fx.updateLod(nodeId, true)
++    expect(layers.every(l => l.removed)).toBe(true)
++  })
++
++  it('dispose cleans up', () => {
++    const { group, main, nodeId } = makeEdge('e4')
++    fx.attachMain(nodeId, group, main)
++    fx.enterHover(nodeId)
++    flushRaf(16)
++    expect(() => fx.dispose()).not.toThrow()
++  })
++
++  it('enterHover is idempotent', () => {
++    const { group, main, nodeId } = makeEdge('e5')
++    fx.attachMain(nodeId, group, main)
++    fx.enterHover(nodeId)
++    const before = (group as unknown as TFakeUI)._children.length
++    fx.enterHover(nodeId)
++    expect((group as unknown as TFakeUI)._children.length).toBe(before)
++  })
++
++  it('updateSelection starts glow', () => {
++    const { group, main, nodeId } = makeEdge('e6')
++    fx.attachMain(nodeId, group, main)
++    fx.updateSelection(nodeId, true)
++    flushRaf(16)
++    expect(activeGlowLayers(group).length).toBe(6)
++    expect((main as unknown as TFakeUI).props.strokeWidth).toBe(6)
++  })
++
++  // ── 判别钉 1(2026-08-08"两头实心"根因):alpha 必须走元素级 opacity ──
++  // Leafer 没有 strokeOpacity,写了会被静默忽略 → 六层全实心,彗星尾消失。
++  it('层透明度走元素级 opacity(长层淡短层浓),绝不携带 strokeOpacity', () => {
++    const { group, main, nodeId } = makeEdge('e7')
++    fx.attachMain(nodeId, group, main)
++    fx.enterHover(nodeId)
++    const layers = glowLayers(group)
++    expect(layers.map((l) => l.props.opacity)).toEqual([0.10, 0.14, 0.18, 0.26, 0.38, 0.55])
++    // 退回 strokeOpacity(被 Leafer 忽略)即红:
++    expect(layers.every((l) => !('strokeOpacity' in l.props))).toBe(true)
++    // 长层淡、短层浓 —— 方向反了会退化成平坦段:
++    const lens = layers.map((l) => (l.props.dashPattern as number[])[0])
++    for (let k = 1; k < lens.length; k++) {
++      expect(lens[k]).toBeLessThan(lens[k - 1])
++      expect(layers[k].props.opacity as number).toBeGreaterThan(layers[k - 1].props.opacity as number)
++    }
++  })
++
++  // ── 判别钉 2(2026-08-08"流向反了"根因):dashOffset 必须随时间递减 ──
++  // canvas2d 语义:offset 增大 = 图案朝路径起点(源图)滑。要源 → 目标流动,
++  // offset 必须递减;符号反了本测试当场红。
++  it('流向:dashOffset 随时间递减(光段向路径终点=目标图移动),各层头部对齐', () => {
++    const { group, main, nodeId } = makeEdge('e8')
++    fx.attachMain(nodeId, group, main)
++    fx.enterHover(nodeId)
++    flushRaf(16) // base = 16 × 0.24 = 3.84px
++    const layers = glowLayers(group)
++    const at1 = layers.map((l) => l.props.dashOffset as number)
++    flushRaf(16) // base = 7.68px
++    const at2 = layers.map((l) => l.props.dashOffset as number)
++    for (let k = 0; k < layers.length; k++) {
++      expect(at2[k]).toBeLessThan(at1[k]) // 递减 = 向目标流动(小步进无回绕)
++    }
++    // 头部对齐:同一帧内 (offset + relOff) 对全层同值 → 段头在同一路径位置
++    const relOffs = [0, 22, 42, 60, 76, 89]
++    const heads1 = at1.map((o, k) => Math.round((o + relOffs[k]) * 100) / 100)
++    expect(new Set(heads1).size).toBe(1)
++  })
++
++  // ── 判别钉 3(2026-08-08"点选不中/选中态缺失"):hover ∪ 选中 ──
++  it('选中保持流光:hover 离开不熄灭已选中的边,取消选中才熄灭', () => {
++    const { group, main, nodeId } = makeEdge('e9')
++    fx.attachMain(nodeId, group, main)
++    fx.enterHover(nodeId)
++    fx.updateSelection(nodeId, true)
++    fx.leaveHover(nodeId) // 仍选中 → 不熄灭
++    expect(activeGlowLayers(group).length).toBe(6)
++    expect((main as unknown as TFakeUI).props.strokeWidth).toBe(6)
++    fx.updateSelection(nodeId, false) // 取消选中 → 熄灭
++    expect(activeGlowLayers(group).length).toBe(0)
++    expect((main as unknown as TFakeUI).props.strokeWidth).toBe(2)
++  })
++
++  // ── PR-B 判别钉:glowColor() 只在 createGlows() 里定色一次(:149) ──
++  // glow 层存活期间(hover 中,或选中期间——可以无限长)不会自己跟着主题变;
++  // refreshThemeColor() 是补上的触发链出口,由已经把 theme 接进依赖数组的
++  // useLeaferSpikeRenderer 渲染 effect 调用(不是 tick() 里逐帧 getComputedStyle)。
++  it('refreshThemeColor():重读 --edge-glow-color 并应用到当前活跃 glow 层', () => {
++    const { group, main, nodeId } = makeEdge('e10')
++    fx.attachMain(nodeId, group, main)
++
++    vi.stubGlobal('document', { documentElement: { getAttribute: () => null } })
++    vi.stubGlobal('getComputedStyle', () => ({
++      getPropertyValue: (name: string) => (name === '--edge-glow-color' ? '#111111' : ''),
++    }))
++
++    fx.enterHover(nodeId)
++    flushRaf(16)
++    const before = activeGlowLayers(group)
++    expect(before.length).toBe(6)
++    expect(before.every((l) => l.props.stroke === '#111111')).toBe(true)
++
++    // 主题切换的可观测后果:CSS 变量的计算值变了(真实级联由 App.css 的
++    // [data-mivo-theme='dark'] 选择器完成;这里直接改级联后的最终值,断言的是
++    // "触发路径把新色应用到活跃层"这条链路,不是 CSS 级联本身)。
++    vi.stubGlobal('getComputedStyle', () => ({
++      getPropertyValue: (name: string) => (name === '--edge-glow-color' ? '#222222' : ''),
++    }))
++    fx.refreshThemeColor()
++
++    const after = activeGlowLayers(group)
++    expect(after.length).toBe(6) // 同一批层原地改色,不是销毁重建
++    expect(after.every((l) => l.props.stroke === '#222222')).toBe(true)
++  })
++
++  it('refreshThemeColor():没有活跃 glow 时是 no-op(不抛错)', () => {
++    const { group, main, nodeId } = makeEdge('e11')
++    fx.attachMain(nodeId, group, main)
++    expect(() => fx.refreshThemeColor()).not.toThrow()
++    expect(activeGlowLayers(group).length).toBe(0)
++  })
++
++  // ── SC-B1(blocker):LOD 门控与用户意图分离,进出天然对称 ──
++  // 旧 bug:进 LOD 分支直接把节点从 hoveredIds/selectedIds 里删,退出分支没有
++  // 对应的 restore——选中一条连线、缩小穿过 LOD 门限、再放大回来,流光永久
++  // 消失(useDerivationEdgeHover 只在 selectedNodeIds prop 变化时 diff 通知
++  // fx.updateSelection,选区本身没变就永不重新调用,fx 内部丢的状态没人补)。
++  // 现在 lodIds 是独立的门控集,hoveredIds/selectedIds 全程不受 LOD 影响。
++  it('选中后进出 LOD:流光恢复(不变量:选中态在 LOD 期间必须保持,退出后自动恢复,不经过 updateSelection)', () => {
++    const { group, main, nodeId } = makeEdge('e12')
++    fx.attachMain(nodeId, group, main)
++    fx.updateSelection(nodeId, true)
++    flushRaf(16)
++    expect(activeGlowLayers(group).length).toBe(6)
++
++    fx.updateLod(nodeId, true) // 缩小穿过 LOD 门限
++    expect(activeGlowLayers(group).length).toBe(0)
++    expect((main as unknown as TFakeUI).props.strokeWidth).toBe(2)
++
++    fx.updateLod(nodeId, false) // 放大回来——只调 updateLod,不重复调 updateSelection
++    flushRaf(16)
++    expect(activeGlowLayers(group).length).toBe(6)
++    expect((main as unknown as TFakeUI).props.strokeWidth).toBe(6)
++
++    // 取消选中后,LOD 循环不应无中生有地再次点亮(证明恢复靠的是意图集里
++    // 还有 id,不是 LOD 退出这个动作本身在"重开"glow)。
++    fx.updateSelection(nodeId, false)
++    expect(activeGlowLayers(group).length).toBe(0)
++    fx.updateLod(nodeId, true)
++    fx.updateLod(nodeId, false)
++    expect(activeGlowLayers(group).length).toBe(0)
++  })
++
++  it('hover(非选中)进出 LOD:与选中同一套门控机制,行为对称(不因触发源是 hover 还是选中而分叉出两套逻辑)', () => {
++    const { group, main, nodeId } = makeEdge('e13')
++    fx.attachMain(nodeId, group, main)
++    fx.enterHover(nodeId)
++    flushRaf(16)
++    expect(activeGlowLayers(group).length).toBe(6)
++
++    fx.updateLod(nodeId, true)
++    expect(activeGlowLayers(group).length).toBe(0)
++
++    fx.updateLod(nodeId, false)
++    flushRaf(16)
++    expect(activeGlowLayers(group).length).toBe(6) // hover 意图同样在 LOD 期间保留
++
++    fx.leaveHover(nodeId) // 真正离开才熄灭,LOD 进出本身不消耗 hover 意图
++    expect(activeGlowLayers(group).length).toBe(0)
++  })
++
++  // ── SC-B2:活跃 glow 的路径与当前主线绑定,不是建层时的静态拷贝 ──
++  // createGlows() 只在 startGlow 那一刻拷一次 pathDOf(entry.main);reconcile 对
++  // 同一个 main 对象 setProps(对象引用不变,只改几何 prop——这正是 leaferLinePaint
++  // 里"signature 变了但不需要重建"的更新路径)不会触发任何"重建/重同步 glow"的
++  // 调用点。改法:tick() 里每帧现读 entries 里主线的当前 path,而不是只信创建时
++  // 拷进 glow 对象的字符串——复用已经在跑的 per-frame 触发源,不新增机制。
++  it('主线 path 变化后活跃 glow 跟随', () => {
++    const { group, main, nodeId } = makeEdge('e14')
++    fx.attachMain(nodeId, group, main)
++    fx.enterHover(nodeId)
++    flushRaf(16)
++    let layers = activeGlowLayers(group)
++    expect(layers.length).toBe(6)
++    expect(layers.every((l) => l.props.path === 'M0 0 100 0')).toBe(true)
++
++    // 变更检测收紧(lead R2 复核):现读不等于无条件写。path 赋值要走 Leafer 的
++    // 路径数据解析/几何重建,连线静止的绝大多数帧不该白付这个代价——只有
++    // dashOffset 才是逐帧都要变的量。用 spy 记账每层 `.set()` 调用里带 path
++    // 键的次数,而不是只看最终 props 值(那样测不出"重复赋值"本身)。
++    const pathSetCallCount = (layer: TFakeUI): number =>
++      (layer as unknown as { set: { mock: { calls: unknown[][] } } }).set.mock.calls
++        .filter((args) => args[0] !== undefined && 'path' in (args[0] as Record<string, unknown>)).length
++    const spies = layers.map((l) =>
++      vi.spyOn(l as unknown as { set: (p: Record<string, unknown>) => void }, 'set'),
++    )
++
++    // 连续 5 帧,主线一动不动。
++    for (let i = 0; i < 5; i++) flushRaf(16)
++    for (const l of layers) {
++      expect(pathSetCallCount(l)).toBe(0) // 5 次 set 调用(dashOffset)都不该带 path 键
++    }
++
++    // 模拟 leaferLinePaint reconcile 对同一个 main 对象原地更新几何(拖动端点/
++    // 图片移动后连线跟着动;对象引用不变,只是 points 变了)。
++    main.set({ points: [0, 0, 200, 0] })
++
++    flushRaf(16)
++    layers = activeGlowLayers(group)
++    expect(layers.length).toBe(6) // 同一批层,不是销毁重建
++    expect(layers.every((l) => l.props.path === 'M0 0 200 0')).toBe(true)
++    for (const l of layers) {
++      expect(pathSetCallCount(l)).toBe(1) // 真变化那一帧,恰好补一次(不是从此每帧都重设)
++    }
++
++    // 变化落地后,再静止几帧不应再多算。
++    for (let i = 0; i < 3; i++) flushRaf(16)
++    for (const l of layers) {
++      expect(pathSetCallCount(l)).toBe(1)
++    }
++
++    spies.forEach((s) => s.mockRestore())
++  })
++
++  // ── SC-B4/SC-B5(同族):matchMedia change 监听器必须配对释放 ──
++  // 旧代码用内联匿名闭包 addEventListener,dispose() 拿不到同一个函数引用做
++  // removeEventListener,监听器永久挂着——控制器销毁后,系统的 reduced-motion
++  // 偏好变化仍会触达一个已经不该存在的实例。改法:具名 handler,dispose 配对
++  // 释放,与同 PR 内 pointermove/pointerdown 的既有配对口径一致。
++  type FakeMediaQueryList = {
++    matches: boolean
++    listeners: Array<(e: { matches: boolean }) => void>
++    addEventListener: (type: string, cb: (e: { matches: boolean }) => void) => void
++    removeEventListener: (type: string, cb: (e: { matches: boolean }) => void) => void
++    /** 模拟系统真实派发一次 change 事件(而不是测试自己遍历 listeners 数组
++     *  手工调用)——返回本次实际触达的监听器数,用来断言"派发了但没人接住"。 */
++    dispatch: (matches: boolean) => number
++  }
++  const makeFakeMql = (): FakeMediaQueryList => {
++    const listeners: Array<(e: { matches: boolean }) => void> = []
++    return {
++      matches: false,
++      listeners,
++      addEventListener: (_type, cb) => { listeners.push(cb) },
++      removeEventListener: (_type, cb) => {
++        const idx = listeners.indexOf(cb)
++        if (idx >= 0) listeners.splice(idx, 1)
++      },
++      dispatch: (matches) => {
++        const snapshot = [...listeners]
++        for (const cb of snapshot) cb({ matches })
++        return snapshot.length
++      },
++    }
++  }
++
++  it('监听器在 dispose 后计数归零', () => {
++    const mql = makeFakeMql()
++    vi.stubGlobal('window', { matchMedia: () => mql })
++    const localFx = createLeaferEdgeHoverFx({ now: () => fakeNow, raf: fakeRaf, cancelRaf: fakeCancelRaf })
++    expect(mql.listeners.length).toBe(1)
++    localFx.dispose()
++    expect(mql.listeners.length).toBe(0)
++  })
++
++  it('dispose 后 matchMedia change 不再触达已销毁控制器', () => {
++    const mql = makeFakeMql()
++    vi.stubGlobal('window', { matchMedia: () => mql })
++    const localFx = createLeaferEdgeHoverFx({ now: () => fakeNow, raf: fakeRaf, cancelRaf: fakeCancelRaf })
++    localFx.dispose()
++    // 模拟系统在 dispose 之后仍可能真实派发的 change 事件(OS 级偏好切换与
++    // 控制器生命周期没有先后保证)——已释放的实例不应再被触达。
++    const triggeredCount = mql.dispatch(true)
++    expect(triggeredCount).toBe(0)
++  })
++
++  // ── SC-C1(SC-B1 的同形复制,同一个错误在旁边 100 行处又留了一份):
++  // reduced-motion 是门控,不是销毁指令 ──
++  // 旧代码 onReducedMotionChange 只有 e.matches===true 的分支(清空 active、
++  // 移除所有 glow 层),matches===false 的退出分支什么都不做——hoveredIds/
++  // selectedIds 还留着用户意图(那正是上一波拆分门控集的目的),没人读它们
++  // 重新点亮。复现:选中连线 → 开系统减弱动效(动画停,加粗保留)→ 关掉
++  // (不需要任何用户交互)→ 流光必须自动恢复,不能卡在"加粗但无动画"直到
++  // 下一次 hover/selection 变化才被动带出来。
++  it('选中态下开关 reduced-motion 流光自动恢复', () => {
++    const mql = makeFakeMql()
++    vi.stubGlobal('window', { matchMedia: () => mql })
++    const localFx = createLeaferEdgeHoverFx({ now: () => fakeNow, raf: fakeRaf, cancelRaf: fakeCancelRaf })
++
++    const { group, main, nodeId } = makeEdge('e16')
++    localFx.attachMain(nodeId, group, main)
++    localFx.updateSelection(nodeId, true)
++    flushRaf(16)
++    expect(activeGlowLayers(group).length).toBe(6)
++    expect((main as unknown as TFakeUI).props.strokeWidth).toBe(6)
++
++    // 开系统减弱动效——只派发 change 事件,不调用任何 hover/selection API。
++    mql.dispatch(true)
++    expect(activeGlowLayers(group).length).toBe(0) // 动画停
++    expect((main as unknown as TFakeUI).props.strokeWidth).toBe(6) // 加粗保留(静态高亮,不是熄灭)
++
++    // 关掉——同样只派发 change 事件。选中意图全程没变,必须自动恢复动画,
++    // 不需要用户再 hover/点选一次。
++    mql.dispatch(false)
++    flushRaf(16)
++    expect(activeGlowLayers(group).length).toBe(6)
++    expect((main as unknown as TFakeUI).props.strokeWidth).toBe(6)
++
++    localFx.dispose()
++  })
++
++  // ── SC-B9:Leafer 侧兜底色必须与 DOM 侧同值、同档(light) ──
++  // 旧代码兜底 #5AACFE 是 App.css 的 dark 档值,方向反了(仓内约定"空属性 =
++  // light");DOM 侧(MarkupNodeView.tsx)一直兜底 #3B82F6(light),两渲染器
++  // 不一致。兜底常量已抽到 model/edgeGlowColorDefaults 单一声明点。
++  it('glow 兜底色与 DOM 侧同值(SSR/happy-dom 无级联场景,必须落在 light 档,不能是 dark 档 #5AACFE)', () => {
++    const { group, main, nodeId } = makeEdge('e15')
++    fx.attachMain(nodeId, group, main)
++    // 本文件默认 Node 测试环境,document 未定义 → glowColor() 走兜底分支
++    // (与 SSR / happy-dom 无级联场景同一条代码路径)。
++    fx.enterHover(nodeId)
++    const layers = glowLayers(group)
++    expect(layers.every((l) => l.props.stroke === EDGE_GLOW_COLOR_FALLBACK)).toBe(true)
++    // 与 DOM 侧(MarkupNodeView.tsx 硬编码的 '#3B82F6')同值同档;不是 dark 档。
++    expect(EDGE_GLOW_COLOR_FALLBACK).toBe('#3B82F6')
++  })
++
++  // ── SC-C3/SC-C4:层表单一来源,防漂移 ──
++  // 上一波 Leafer 侧(本文件私有 LAYER_TABLE 元组)与 DOM 侧
++  // (canvas/derivationEdgeGlowLayers.ts 的 DOM_GLOW_LAYERS 对象数组)各写了
++  // 一份,靠测试转录逐项比对背书"同值同序"——但转录本身就是"两份字面量"的
++  // 证据,任一侧改了数值/顺序,漂移只在下次跑测试时被动发现,结构上并不是
++  // 不可能。现在两侧从 model/derivationEdgeGlowLayerTable.ts 同一个数组派生
++  // (Leafer 侧用 .map 把对象形状转成元组,不再手写数字)。这条测试钉两件事:
++  // ①行为——glow 层的数值确实来自这个共享表,不是巧合相等;②结构——本文件
++  // 源码里不再有手写的元组数字字面量(用 ?raw 读自身源码文本核实,防止有人
++  // 悄悄加回一份"临时"字面量)。
++  it('层表单一来源(同一对象派生),源码内不再手写 LAYER_TABLE 字面量', () => {
++    const { group, main, nodeId } = makeEdge('e17')
++    fx.attachMain(nodeId, group, main)
++    fx.enterHover(nodeId)
++    const layers = glowLayers(group)
++    expect(layers.length).toBe(DERIVATION_EDGE_GLOW_LAYER_TABLE.length)
++    DERIVATION_EDGE_GLOW_LAYER_TABLE.forEach((expected, k) => {
++      const dashPattern = layers[k].props.dashPattern as number[]
++      expect(dashPattern[0]).toBe(expected.len)
++      expect(layers[k].props.opacity).toBe(expected.alpha)
++    })
++
++    // 源码里不该再出现手写的元组字面量(旧形态:`[100,   0, 0.10]` 这样按位置
++    // 摆的数字组)——只应有从共享来源 `.map()` 派生的那一行。
++    expect(moduleSource).not.toMatch(/\[\s*100\s*,\s*0\s*,\s*0\.1\d*\s*\]/)
++    // 正面锚点:确实是从共享来源派生,不是换了个名字继续手写。
++    expect(moduleSource).toMatch(/DERIVATION_EDGE_GLOW_LAYER_TABLE\.map/)
++  })
++})
+diff --git a/src/render/leaferEdgeHoverFx.ts b/src/render/leaferEdgeHoverFx.ts
+new file mode 100644
+index 00000000..7b548738
+--- /dev/null
++++ b/src/render/leaferEdgeHoverFx.ts
+@@ -0,0 +1,340 @@
++// leaferEdgeHoverFx — derivation edge glow overlay animation controller.
++//
++// Glow = N layered Paths with same dash cycle [GLOW_LEN+GAP_LEN], decreasing
++// segment length per layer, opacity per layer, and offset-aligned heads.
++// All layers share the same dashOffset delta per frame — the group translates
++// together, creating a "comet tail" (head solid, tail fading) per segment.
++//
++// Three states: Normal (thin), Hovered/Selected (thick + glow).
++// Four guard rails: single-edge animation, LOD stop, reduced-motion static,
++//   dispose cleanups.
++// Architecture: module-level singleton via getEdgeHoverFx(); no window global
++//   in production; DEV probe for e2e debugging.
++
++import { Path, type Group, type Line } from 'leafer-ui'
++import { DERIVATION_EDGE_GLOW_LAYER_TABLE } from '../model/derivationEdgeGlowLayerTable'
++import { EDGE_GLOW_COLOR_CSS_VAR, EDGE_GLOW_COLOR_FALLBACK } from '../model/edgeGlowColorDefaults'
++import { debugLogger } from '../store/debugLogStore'
++
++const SRC = 'Leafer EdgeHoverFx'
++
++// ── layered dash config ──────────────────────────────────────────────────────
++// 数值单一来源已收到 model/derivationEdgeGlowLayerTable.ts(DOM 侧
++// canvas/derivationEdgeGlowLayers.ts 从同一个数组派生)——这里只做形状派生
++// (对象 → 元组,给下面按下标 for 循环 + 数组解构用),不再手写一份数字。
++// relOffset = GLOW_LEN − dashLen → all layer heads aligned at position
++// GLOW_LEN(offset semantics: see tick)。长层淡、短层浓 —— 方向配反会退化成
++// 平坦实心段(2026-08-08 踩过)。Composited alpha head→tail: 0.87 → 0.71 →
++// 0.53 → 0.37 → 0.23 → 0.10(衰减 88%)。
++const LAYER_TABLE: Array<[number, number, number]> = DERIVATION_EDGE_GLOW_LAYER_TABLE.map(
++  ({ len, relOff, alpha }): [number, number, number] => [len, relOff, alpha],
++)
++const CYCLE_LEN = 260
++const FLOW_SPEED_PX_PER_MS = 0.24
++// hover/选中加粗到 6(用户 2026-08-08:再粗一点;常态 2 → 3 倍);glow 与加粗
++// 主线同宽,光段完整盖住线体。
++const WIDE_STROKE = 6
++const NORMAL_STROKE = 2
++const GLOW_STROKE = 6  // glow overlay width(与 WIDE_STROKE 同宽)
++
++const glowColor = (): string => {
++  if (typeof document === 'undefined') return EDGE_GLOW_COLOR_FALLBACK
++  return getComputedStyle(document.documentElement)
++    .getPropertyValue(EDGE_GLOW_COLOR_CSS_VAR).trim() || EDGE_GLOW_COLOR_FALLBACK
++}
++
++// ── types ────────────────────────────────────────────────────────────────────
++type EntryRef = { nodeId: string; group: Group; main: Line | Path }
++type ActiveAnim = {
++  nodeId: string
++  glows: Path[]    // N layers, [0] = base layer
++  raf: number
++  startedAt: number
++  /** 已应用到 glow 层的路径缓存,用于变更检测——tick() 每帧都要重设 dashOffset
++   *  (那个本来就逐帧变),但 path 只在与这份缓存不同时才重设 6 层 + 更新缓存。
++   *  path 赋值要做路径数据解析/几何重建,连线静止时(绝大多数帧)不能白付这个
++   *  代价——「每帧现读」不等于「每帧无条件写」,这是同一枚硬币的另一面
++   *  (对照:refreshThemeColor 不放进 tick() 逐帧 getComputedStyle,是同一条
++   *  「触发源可以是高频循环,但赋值必须先判断变没变」的原则)。 */
++  pathD: string
++}
++// Glow lifecycle = hovered ∪ selected: hover-leave must not kill a selected
++// edge's glow, deselect must not kill a still-hovered one. Both sets feed
++// syncGlowState which is the ONLY place that starts/stops the animation.
++
++type Probe = {
++  getActive: () => Array<{ nodeId: string; progress: number }>
++  getRegistered: () => string[]
++  simulateHover: (nodeId: string) => void
++  simulateLeave: (nodeId: string) => void
++}
++declare global { interface Window { __MIVO_EDGE_HOVER_FX__?: Probe } }
++
++export type LeaferEdgeHoverFx = {
++  registerEntry(nodeId: string): void
++  unregisterEntry(nodeId: string): void
++  updateLod(nodeId: string, isLod: boolean): void
++  attachMain(nodeId: string, group: Group, main: Line | Path): void
++  dispose(): void
++  enterHover(nodeId: string): void
++  leaveHover(nodeId: string): void
++  updateSelection(nodeId: string, selected: boolean): void
++  /** 主题切换触发源(由已经把 theme 接进依赖数组的渲染 effect 调用,见
++   *  useLeaferSpikeRenderer):重读 --edge-glow-color 并应用到当前所有活跃 glow
++   *  层——glowColor() 只在 createGlows() 里定色一次,glow 层存活期间(hover 中,
++   *  或选中期间,可以无限长)不会自己跟着主题变;这个方法补上那条触发链,而不是
++   *  在 tick() 里逐帧 getComputedStyle(6 层 × 60fps 的样式重算是性能坑)。 */
++  refreshThemeColor(): void
++}
++
++export type LeaferEdgeHoverFxOptions = {
++  now?: () => number; raf?: (cb: FrameRequestCallback) => number; cancelRaf?: (handle: number) => void
++}
++
++let activeInstance: LeaferEdgeHoverFx | null = null
++export const getEdgeHoverFx = (): LeaferEdgeHoverFx | null => activeInstance
++
++// ── helpers ──────────────────────────────────────────────────────────────────
++const pathDOf = (m: Line | Path): string => {
++  const p = m as unknown as Record<string, unknown>
++  return (p.path as string) || `M${(p.points as number[])?.join(' ') || ''}`
++}
++
++// ── factory ──────────────────────────────────────────────────────────────────
++export const createLeaferEdgeHoverFx = (
++  options: LeaferEdgeHoverFxOptions = {},
++): LeaferEdgeHoverFx => {
++  const nowFn = options.now ?? (() => (typeof performance !== 'undefined' ? performance.now() : Date.now()))
++  const rafFn = options.raf ?? ((cb) => (typeof requestAnimationFrame !== 'undefined' ? requestAnimationFrame(cb) : 0))
++  const cancelRafFn = options.cancelRaf ?? ((h) => { if (typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(h) })
++
++  const entries = new Map<string, EntryRef>()
++  const active = new Map<string, ActiveAnim>()
++
++  // reduced-motion。具名 handler(而不是内联匿名闭包)——dispose() 需要拿同一个
++  // 函数引用才能配对 removeEventListener,匿名闭包做不到,是本类监听器泄漏的
++  // 通病(同 PR 内 pointermove/pointerdown 都是具名配对,只这处漏)。
++  //
++  // reducedMotion 是门控,不是销毁指令——与 lodIds 同一套形状(SC-B1 的教训:
++  // 进入分支删状态、退出分支什么都不做,是"漏了对称的另一半")。两个方向都只
++  // 更新这个布尔,再对当前所有意图 id(hoveredIds ∪ selectedIds)重跑
++  // syncGlowState——可见性判定本身(见 syncGlowState)已经把 reducedMotion
++  // 算进去,这里不需要、也不允许分方向写专属逻辑(禁止 if (e.matches) 旁加
++  // else { restore } ,那是第三次犯同一个错)。
++  const mq = typeof window !== 'undefined' ? window.matchMedia('(prefers-reduced-motion: reduce)') : null
++  let reducedMotion = mq?.matches ?? false
++  const onReducedMotionChange = (e: MediaQueryListEvent) => {
++    reducedMotion = e.matches
++    const intentIds = new Set<string>([...hoveredIds, ...selectedIds])
++    for (const id of intentIds) syncGlowState(id)
++    debugLogger.log(SRC, `reduced-motion: ${e.matches ? 'enabled' : 'disabled'}, resynced ${intentIds.size} intent id(s)`)
++  }
++  mq?.addEventListener('change', onReducedMotionChange)
++
++  // DEV probe
++  const publishProbe = () => {
++    if (typeof window === 'undefined') return
++    if (!import.meta.env.DEV) { delete window.__MIVO_EDGE_HOVER_FX__; return }
++    window.__MIVO_EDGE_HOVER_FX__ = {
++      getActive: () => [...active.values()].map(a => ({ nodeId: a.nodeId, progress: nowFn() - a.startedAt })),
++      getRegistered: () => [...entries.keys()],
++      simulateHover: (id) => activeInstance?.enterHover(id),
++      simulateLeave: (id) => activeInstance?.leaveHover(id),
++    }
++  }
++
++  // ── tick: dashOffset = (CYCLE_LEN − relOff − baseOffset) mod CYCLE_LEN ──
++  // canvas2d/SVG dash semantics: a dash [L, gap] with offset O is visible at
++  // arc distance s where (s + O) mod CYCLE < L  ⟹  coverage starts at −O.
++  // Layer k gets O_k = −relOff_k − base (mod CYCLE) ⟹ covers
++  //   s ∈ [relOff_k + base, relOff_k + base + len_k).
++  // All layers END at base + GLOW_LEN → heads aligned at the leading edge.
++  // Direction proof: base grows ⟹ coverage start GROWS ⟹ segments move
++  // toward p1. markupPoints[0] is ALWAYS the source anchor
++  // (normalizeConnectorMarkupNodes: absolutePoints[0] = startBindingPoint),
++  // so p0=source, p1=target ⟹ flow is source → derived image on every edge.
++  // Flipping this sign reverses the flow — the direction test pins it.
++  const layerOffsetAt = (relOff: number, base: number): number =>
++    ((CYCLE_LEN - relOff - base) % CYCLE_LEN + CYCLE_LEN) % CYCLE_LEN
++  const tick = (nodeId: string) => {
++    const a = active.get(nodeId)
++    if (!a) return
++    const baseOffset = ((nowFn() - a.startedAt) * FLOW_SPEED_PX_PER_MS) % CYCLE_LEN
++    // 路径绑定,不是创建时拷贝:每帧从 entries 现读主线当前 path,而不是只信
++    // createGlows() 建层那一刻拷进 glow 对象的静态字符串。reconcile 对同一个
++    // main 对象原地 setProps(几何变了但对象引用不变)不会经过任何"重建 glow"
++    // 的调用点——如果 glow 的 path 只在建层时定一次,主线动了 glow 会画在旧
++    // 位置上。复用这个已经每帧在跑的 tick 循环当触发源,不新增机制;entry.main
++    // 的 path/points 只是普通对象属性读取,不是 getComputedStyle,逐帧读不是
++    // 性能坑。
++    //
++    // 但"现读"不等于"无条件写":path 赋值要走 Leafer 的路径数据解析/几何重建,
++    // 而实际几何只在拖动那几帧真的变——与 a.pathD 缓存比对,只在真的不同时才
++    // set 6 层 + 更新缓存,否则每秒 360 次(6 层 × 60fps)全是空转的重解析。
++    // dashOffset 没有这个问题,本来就是逐帧都要变的量,照旧每帧 set。
++    const entry = entries.get(nodeId)
++    const currentPathD = entry?.main ? pathDOf(entry.main) : undefined
++    const pathChanged = currentPathD !== undefined && currentPathD !== a.pathD
++    if (pathChanged) a.pathD = currentPathD as string
++    for (let k = 0; k < LAYER_TABLE.length; k++) {
++      const [, relOff] = LAYER_TABLE[k]
++      a.glows[k].set({
++        dashOffset: layerOffsetAt(relOff, baseOffset),
++        ...(pathChanged ? { path: currentPathD } : {}),
++      })
++    }
++    a.raf = rafFn(() => tick(nodeId))
++  }
++
++  // ── create N-layer glow ─────────────────────────────────────────────────
++  const createGlows = (entry: EntryRef): Path[] => {
++    const d = pathDOf(entry.main)
++    const c = glowColor()
++    // Leafer has NO strokeOpacity property (only element-level `opacity`,
++    // @leafer-ui/interface ICommonAttr) — using strokeOpacity renders every
++    // layer fully opaque and the comet tail degenerates into a solid bar.
++    // 用 opacity；此处退回 strokeOpacity 会让尾巴消失(见 opacity 判别测试)。
++    return LAYER_TABLE.map(([len, relOff, alpha]) => new Path({
++      path: d,
++      fill: undefined,
++      stroke: c,
++      strokeWidth: GLOW_STROKE,
++      strokeCap: 'round',
++      strokeJoin: 'round',
++      opacity: alpha,
++      dashPattern: [len, CYCLE_LEN - len],
++      dashOffset: layerOffsetAt(relOff, 0),  // heads aligned at GLOW_LEN (see tick)
++      visible: true,
++      zIndex: 998,
++      hitStroke: 'none',
++    }))
++  }
++
++  const widenLine = (e: EntryRef) => e.main.set({ strokeWidth: WIDE_STROKE })
++  const restoreLine = (e: EntryRef) => e.main.set({ strokeWidth: NORMAL_STROKE })
++
++  // ── hovered ∪ selected → glow state ─────────────────────────────────────
++  // hoveredIds/selectedIds = 用户意图(还 hover 着 / 已选中),只由真实用户事件
++  // 增删。lodIds = 可见性门控(当前几何太小,画不了 glow),只由 updateLod 增删。
++  // 两者分离——之前的 bug 是 LOD 进入分支把节点从 hoveredIds/selectedIds 里删,
++  // 把"门控"和"意图"焊死在同一个集合里,退出分支就没有意图可恢复了。现在
++  // syncGlowState 每次都从三个集合重新算,进/出 LOD 天然对称,不需要在退出
++  // 分支补 restore。
++  const hoveredIds = new Set<string>()
++  const selectedIds = new Set<string>()
++  const lodIds = new Set<string>()
++
++  /** 只停动画(cancel raf + 移除 glow 层 + 退出 active),不碰线宽——静态加粗
++   *  态(reduced-motion 下 wanted 但不动画)与"完全不 wanted"态共享这一步,
++   *  区别只在于调用方之后要不要接着 restoreLine。 */
++  const stopAnimation = (nodeId: string): boolean => {
++    const a = active.get(nodeId)
++    if (!a) return false
++    cancelRafFn(a.raf)
++    a.glows.forEach(g => g.remove())
++    active.delete(nodeId)
++    return true
++  }
++
++  /** 三态可见性判定的唯一落地点:off(不 wanted,细线无 glow)/ static(wanted
++   *  但 reducedMotion,粗线无 glow)/ animated(wanted 且非 reducedMotion,粗线
++   *  +跑动画)。三个态之间怎么切都从这一个函数走,不区分"从哪个态来的"——
++   *  hover/selection/LOD/reduced-motion 四个触发源全部只改各自的门控集合再
++   *  调用这一个函数,不写方向专属的进入/退出逻辑(SC-B1 的教训)。 */
++  const syncGlowState = (nodeId: string) => {
++    const wanted = (hoveredIds.has(nodeId) || selectedIds.has(nodeId)) && !lodIds.has(nodeId)
++    const entry = entries.get(nodeId)
++
++    if (!wanted) {
++      stopAnimation(nodeId)
++      if (entry && entry.main) restoreLine(entry)
++      debugLogger.log(SRC, `glow stopped on ${nodeId}`)
++      publishProbe()
++      return
++    }
++
++    if (!entry || !entry.main) { debugLogger.warn(SRC, `glow: ${nodeId} not registered — skipped`); return }
++    widenLine(entry)
++
++    if (reducedMotion) {
++      if (stopAnimation(nodeId)) {
++        debugLogger.log(SRC, `glow: reduced-motion, static highlight ${nodeId}`)
++        publishProbe()
++      }
++      return
++    }
++
++    if (active.has(nodeId)) return // 已经在跑,不重建
++
++    const glows = createGlows(entry)
++    glows.forEach(g => entry.group.add(g))
++    // pathD 缓存起点 = createGlows 里刚烘进 6 层的那个值,与它们实际同步——
++    // 第一个 tick 现读到同一个值,不会误判成"变了"而白 set 一次。
++    const anim: ActiveAnim = { nodeId, glows, raf: 0, startedAt: nowFn(), pathD: pathDOf(entry.main) }
++    active.set(nodeId, anim)
++    anim.raf = rafFn(() => tick(nodeId))
++    debugLogger.log(SRC, `glow started on ${nodeId} (${glows.length} layers)`)
++    publishProbe()
++  }
++
++  const enterHover: LeaferEdgeHoverFx['enterHover'] = (nodeId) => {
++    hoveredIds.add(nodeId)
++    syncGlowState(nodeId)
++  }
++
++  const leaveHover: LeaferEdgeHoverFx['leaveHover'] = (nodeId) => {
++    hoveredIds.delete(nodeId)
++    syncGlowState(nodeId)
++  }
++
++  const updateSelection: LeaferEdgeHoverFx['updateSelection'] = (nodeId, selected) => {
++    if (selected) selectedIds.add(nodeId)
++    else selectedIds.delete(nodeId)
++    syncGlowState(nodeId)
++  }
++
++  // ── management ──────────────────────────────────────────────────────────
++  const registerEntry: LeaferEdgeHoverFx['registerEntry'] = (id) => { entries.set(id, { nodeId: id, group: null as unknown as Group, main: null as unknown as Line }); publishProbe() }
++  const unregisterEntry: LeaferEdgeHoverFx['unregisterEntry'] = (id) => { hoveredIds.delete(id); selectedIds.delete(id); lodIds.delete(id); syncGlowState(id); entries.delete(id); publishProbe() }
++  // 门控集,不动用户意图:进 LOD 只加进 lodIds,出 LOD 只从 lodIds 删——
++  // hoveredIds/selectedIds 全程不变,syncGlowState 重算即可自然恢复。
++  const updateLod: LeaferEdgeHoverFx['updateLod'] = (id, isLod) => {
++    if (isLod) {
++      if (lodIds.has(id)) return
++      lodIds.add(id)
++      debugLogger.log(SRC, `updateLod: entered LOD, gating ${id}`)
++    } else {
++      if (!lodIds.has(id)) return
++      lodIds.delete(id)
++      debugLogger.log(SRC, `updateLod: exited LOD, ungating ${id}`)
++    }
++    syncGlowState(id)
++  }
++  const attachMain: LeaferEdgeHoverFx['attachMain'] = (id, g, m) => {
++    const e = entries.get(id)
++    if (e) { e.group = g; e.main = m } else entries.set(id, { nodeId: id, group: g, main: m })
++    publishProbe()
++  }
++  const dispose: LeaferEdgeHoverFx['dispose'] = () => {
++    for (const [,a] of active) { cancelRafFn(a.raf); a.glows.forEach(g => g.remove()) }
++    active.clear(); entries.clear(); activeInstance = null
++    mq?.removeEventListener('change', onReducedMotionChange)
++    if (typeof window !== 'undefined') delete window.__MIVO_EDGE_HOVER_FX__
++    debugLogger.log(SRC, 'disposed')
++  }
++
++  const refreshThemeColor: LeaferEdgeHoverFx['refreshThemeColor'] = () => {
++    if (active.size === 0) return
++    const c = glowColor()
++    for (const [, a] of active) {
++      a.glows.forEach((g) => g.set({ stroke: c }))
++    }
++  }
++
++  const fx = {
++    registerEntry, unregisterEntry, updateLod, attachMain, dispose,
++    enterHover, leaveHover, updateSelection, refreshThemeColor,
++  }
++  activeInstance = fx
++  return fx
++}
+diff --git a/src/render/leaferLinePaint.ts b/src/render/leaferLinePaint.ts
+index 1d6c8e9d..95f25e92 100644
+--- a/src/render/leaferLinePaint.ts
++++ b/src/render/leaferLinePaint.ts
+@@ -91,6 +91,7 @@ import {
+ } from '../model/lineRouteGeometry'
+ import { cubicOptionsForConnectors } from '../model/connectorGeometry'
+ import { isDerivationEdgeNode } from '../store/nodeFactory'
++import type { LeaferEdgeHoverFx } from './leaferEdgeHoverFx'
+ import type { MarkupArrowHead, MarkupLineRoute, MivoCanvasNode } from '../types/mivoCanvas'
+ import { debugLogger } from '../store/debugLogStore'
+ import { engineLodFillFor, shouldUseEngineLod } from './engineSpikeLod'
+@@ -214,6 +215,8 @@ export type LinePaintProps = {
+   /** 端点(六档),null = 该端无端点。 */
+   startHead: LineHeadPaint | null
+   endHead: LineHeadPaint | null
++  /** Path string for the glow overlay (full un-split path, all routes). */
++  overlayPathD: string | null
+ }
+ 
+ const firstVisibleStroke = (r: RenderNode) => r.strokes.find((stroke) => stroke.visible)
+@@ -392,6 +395,24 @@ export const linePaintPropsFor = (
+       opacity: strokeOpacity,
+     })
+ 
++    // Full unsplit path for the hover overlay (no label gap). Use the existing
++    // segment functions without gap to get the complete bezier/polyline path.
++    const fullOverlayPath =
++      route === 'smooth'
++        ? cubicPathFor(
++            rotatePoint(cubicSegmentsFor(start, end, undefined, bezierOpts)[0].p0),
++            rotatePoint(cubicSegmentsFor(start, end, undefined, bezierOpts)[0].cp1),
++            rotatePoint(cubicSegmentsFor(start, end, undefined, bezierOpts)[0].cp2),
++            rotatePoint(cubicSegmentsFor(start, end, undefined, bezierOpts)[0].p1),
++          )
++        : route === 'curved'
++          ? quadraticPathFor(
++              rotatePoint(curvedSegmentsFor(start, end, undefined, r.markupCurveBow)[0].p0),
++              rotatePoint(curvedSegmentsFor(start, end, undefined, r.markupCurveBow)[0].ctrl),
++              rotatePoint(curvedSegmentsFor(start, end, undefined, r.markupCurveBow)[0].p1),
++            )
++          : elbowSegmentsFor(start, end).map((polyline) => polylinePathFor(polyline.map(rotatePoint)))[0]
++
+     return {
+       route,
+       group: {
+@@ -403,6 +424,7 @@ export const linePaintPropsFor = (
+       second: segmentPaths.length > 1 ? routePathProps(segmentPaths[1]) : null,
+       startHead: showStartArrow ? headPaintFor(startHeadKind, p0, headAngles.start + rad) : null,
+       endHead: showEndArrow ? headPaintFor(endHeadKind, p1, headAngles.end + rad) : null,
++      overlayPathD: isDerivation ? fullOverlayPath : null,
+     }
+   }
+ 
+@@ -437,6 +459,7 @@ export const linePaintPropsFor = (
+         : null,
+     startHead: showStartArrow ? headPaintFor(startHeadKind, p0, angle + Math.PI) : null,
+     endHead: showEndArrow ? headPaintFor(endHeadKind, p1, angle) : null,
++    overlayPathD: isDerivation ? `M${p0.x} ${p0.y} L${p1.x} ${p1.y}` : null,
+   }
+ }
+ 
+@@ -474,7 +497,10 @@ const reconcileHead = (
+  * creates one when Leafer inits and disposes it when Leafer is destroyed; all
+  * line/arrow nodes seen by `sync` are reconciled against the previous call's set.
+  */
+-export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
++export const createLeaferLinePaint = (
++  leafer: Leafer,
++  hoverFx?: LeaferEdgeHoverFx,
++): LeaferLinePaint => {
+   const entries = new Map<string, LineEntry>()
+ 
+   const destroyEntry = (entry: LineEntry) => {
+@@ -543,6 +569,7 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
+       if (entry) {
+         destroyEntry(entry)
+         entries.delete(id)
++        hoverFx?.unregisterEntry(id)
+       }
+       deleted += 1
+     }
+@@ -558,6 +585,13 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
+         const entry = lod ? buildLodEntry(node.id, props as Record<string, unknown>, sig) : buildEntry(node.id, props as LinePaintProps, sig)
+         entries.set(node.id, entry)
+         leafer.add(entry.object)
++        // HoverFx: attachMain for non-LOD derivation edges (LOD = Rect, no path to animate)
++        if (!lod) {
++          const lp = props as LinePaintProps
++          if (lp.overlayPathD && entry.group && entry.main) {
++            hoverFx?.attachMain(node.id, entry.group, entry.main)
++          }
++        }
+         created += 1
+         continue
+       }
+@@ -569,6 +603,16 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
+         const entry = lod ? buildLodEntry(node.id, props as Record<string, unknown>, sig) : buildEntry(node.id, props as LinePaintProps, sig)
+         entries.set(node.id, entry)
+         leafer.add(entry.object)
++        // HoverFx: update LOD status + re-attach hit area
++        if (lod) {
++          hoverFx?.updateLod(node.id, true)
++        } else {
++          const lp = props as LinePaintProps
++          hoverFx?.updateLod(node.id, false)
++          if (lp.overlayPathD && entry.group && entry.main) {
++            hoverFx?.attachMain(node.id, entry.group, entry.main)
++          }
++        }
+         updated += 1
+         continue
+       }
+@@ -598,6 +642,7 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
+         const entry = buildEntry(node.id, lineProps, sig)
+         entries.set(node.id, entry)
+         leafer.add(entry.object)
++        if (lineProps.overlayPathD && entry.group && entry.main) hoverFx?.attachMain(node.id, entry.group, entry.main)
+         updated += 1
+         continue
+       }
+@@ -611,6 +656,7 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
+         const entry = buildEntry(node.id, lineProps, sig)
+         entries.set(node.id, entry)
+         leafer.add(entry.object)
++        if (lineProps.overlayPathD && entry.group && entry.main) hoverFx?.attachMain(node.id, entry.group, entry.main)
+         updated += 1
+         continue
+       }
+@@ -621,6 +667,7 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
+         const entry = buildEntry(node.id, lineProps, sig)
+         entries.set(node.id, entry)
+         leafer.add(entry.object)
++        if (lineProps.overlayPathD && entry.group && entry.main) hoverFx?.attachMain(node.id, entry.group, entry.main)
+         updated += 1
+         continue
+       }
+@@ -642,6 +689,7 @@ export const createLeaferLinePaint = (leafer: Leafer): LeaferLinePaint => {
+   const dispose: LeaferLinePaint['dispose'] = () => {
+     for (const entry of entries.values()) destroyEntry(entry)
+     entries.clear()
++    hoverFx?.dispose()
+   }
+ 
+   const paintedCount: LeaferLinePaint['paintedCount'] = () => entries.size
+diff --git a/src/render/useDerivationEdgeHover.test.ts b/src/render/useDerivationEdgeHover.test.ts
+new file mode 100644
+index 00000000..05347479
+--- /dev/null
++++ b/src/render/useDerivationEdgeHover.test.ts
+@@ -0,0 +1,220 @@
++// @vitest-environment happy-dom
++// SC-B3(PR-B 三审共识 g2 组):useDerivationEdgeHover 的窗口级 pointermove hover
++// 此前只在卸载时清理——指针离开浏览器窗口(或页面失焦/隐藏)后不再有 pointermove
++// 事件驱动 hitTest,hover 着一条**未选中**的连线时,hover 态会永远卡在那条线上、
++// rAF 持续烧帧(2026-08-09 三审同批同族问题)。本测试钉住:window pointerout
++// (relatedTarget 为 null,即真的离开文档,不是子元素间切换)/ blur / 页面隐藏
++// 三个信号都必须让未选中连线的动效停下来(fx.leaveHover),且不触碰选中态
++// (fx.updateSelection 从不被调;假 fx 用 hoveredIds∪selectedIds 的最小复刻验证
++// "选中的连线在指针离窗后仍然活跃",不只是断言"调对了函数名")。
++//
++// harness 沿用 useDocumentThemeAttribute.test.ts 的先例:react-dom/client +
++// React 19 act,不引入 @testing-library。mock 掉 leaferEdgeHoverFx 整个模块
++// (最小复刻其 hoveredIds∪selectedIds 语义)——真实动画机制由
++// leaferEdgeHoverFx.test.ts 单独覆盖,本测试只关心 hook 在正确时机调用了正确的
++// fx 方法。
++import { act, createElement } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++// React 19 act() 环境标记(本仓既有惯例,见 useRegionEditArmed.test.tsx 等)。
++;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++
++const hoveredIds = new Set<string>()
++const selectedIds = new Set<string>()
++const activeIds = () => new Set([...hoveredIds, ...selectedIds])
++
++const fxSpies = {
++  enterHover: vi.fn((id: string) => {
++    hoveredIds.add(id)
++  }),
++  leaveHover: vi.fn((id: string) => {
++    hoveredIds.delete(id)
++  }),
++  updateSelection: vi.fn((id: string, selected: boolean) => {
++    if (selected) selectedIds.add(id)
++    else selectedIds.delete(id)
++  }),
++}
++
++vi.mock('./leaferEdgeHoverFx', () => ({
++  getEdgeHoverFx: () => fxSpies,
++}))
++
++let container: HTMLDivElement
++let root: Root
++let rafQueue: FrameRequestCallback[]
++
++const flushRaf = () => {
++  const cbs = [...rafQueue]
++  rafQueue = []
++  cbs.forEach((cb) => cb(performance.now()))
++}
++
++beforeEach(() => {
++  rafQueue = []
++  vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
++    rafQueue.push(cb)
++    return rafQueue.length
++  })
++  vi.stubGlobal('cancelAnimationFrame', () => {})
++  hoveredIds.clear()
++  selectedIds.clear()
++  fxSpies.enterHover.mockClear()
++  fxSpies.leaveHover.mockClear()
++  fxSpies.updateSelection.mockClear()
++  container = document.createElement('div')
++  document.body.appendChild(container)
++  root = createRoot(container)
++})
++
++afterEach(() => {
++  act(() => {
++    root.unmount()
++  })
++  container.remove()
++  vi.unstubAllGlobals()
++  vi.resetModules()
++})
++
++// 直线路由(不是 createDerivationEdgeNode 出厂的 smooth):命中判定退回简单
++// distToSegment,构造一个可预测的命中点不依赖贝塞尔弯曲几何。
++const derivationEdgeNode = (id = 'derivation-e1'): MivoCanvasNode =>
++  ({
++    id,
++    type: 'markup',
++    title: 'Derivation',
++    x: 0,
++    y: 0,
++    width: 200,
++    height: 1,
++    status: 'ready',
++    locked: true,
++    markupKind: 'arrow',
++    markupLineRoute: 'straight',
++    markupStartArrow: false,
++    markupEndArrow: false,
++    markupPoints: [
++      { x: 0, y: 0 },
++      { x: 200, y: 0 },
++    ],
++    generation: { prompt: '', model: 'Mivo Derivation Edge', createdAt: 0 },
++  }) as unknown as MivoCanvasNode
++
++const mountHarness = async (nodes: MivoCanvasNode[], selectedNodeIds: string[] = []) => {
++  const { useDerivationEdgeHover } = await import('./useDerivationEdgeHover')
++  function Harness() {
++    useDerivationEdgeHover({
++      screenToCanvas: (x, y) => ({ x, y }),
++      nodes,
++      selectedNodeIds,
++      rendererMode: 'leafer',
++    })
++    return null
++  }
++  act(() => {
++    root.render(createElement(Harness))
++  })
++}
++
++const dispatchPointerMove = (x: number, y: number) => {
++  act(() => {
++    window.dispatchEvent(new PointerEvent('pointermove', { clientX: x, clientY: y }))
++  })
++}
++
++/** 命中派生连线正中点(node 是水平直线路由,(100, 0) 落在描边容差内)。 */
++const hoverOnto = (id = 'derivation-e1') => {
++  dispatchPointerMove(100, 0)
++  act(() => {
++    flushRaf()
++  })
++  expect(fxSpies.enterHover).toHaveBeenCalledWith(id)
++}
++
++describe('useDerivationEdgeHover — 指针离窗/失焦/页面隐藏后清 hover(SC-B3)', () => {
++  it('指针离窗后未选中连线停止动效:leaveHover 被调用,选中态从未被触碰', async () => {
++    const node = derivationEdgeNode()
++    await mountHarness([node])
++    hoverOnto(node.id)
++    expect(activeIds().has(node.id)).toBe(true)
++
++    act(() => {
++      window.dispatchEvent(new PointerEvent('pointerout', { relatedTarget: null }))
++    })
++
++    expect(fxSpies.leaveHover).toHaveBeenCalledWith(node.id)
++    expect(activeIds().has(node.id)).toBe(false) // 未选中,离窗后必须真的停
++    expect(fxSpies.updateSelection).not.toHaveBeenCalled() // 不触碰选中态
++  })
++
++  it('对照:选中的连线在指针离窗后仍然活跃(不外溢——只清 hover,不清 selection)', async () => {
++    const node = derivationEdgeNode()
++    await mountHarness([node], [node.id])
++    // selection effect 先把它标为选中(hoveredIds∪selectedIds 之一即活跃)。
++    expect(activeIds().has(node.id)).toBe(true)
++    hoverOnto(node.id)
++
++    act(() => {
++      window.dispatchEvent(new PointerEvent('pointerout', { relatedTarget: null }))
++    })
++
++    expect(fxSpies.leaveHover).toHaveBeenCalledWith(node.id) // hover 集仍被清
++    expect(activeIds().has(node.id)).toBe(true) // 但选中态兜底,仍然活跃
++  })
++
++  it('失焦(window blur)同样停止未选中连线的动效', async () => {
++    const node = derivationEdgeNode()
++    await mountHarness([node])
++    hoverOnto(node.id)
++
++    act(() => {
++      window.dispatchEvent(new Event('blur'))
++    })
++
++    expect(fxSpies.leaveHover).toHaveBeenCalledWith(node.id)
++    expect(activeIds().has(node.id)).toBe(false)
++  })
++
++  it('页面隐藏(visibilitychange → hidden)同样停止未选中连线的动效', async () => {
++    const node = derivationEdgeNode()
++    await mountHarness([node])
++    hoverOnto(node.id)
++
++    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
++    act(() => {
++      document.dispatchEvent(new Event('visibilitychange'))
++    })
++
++    expect(fxSpies.leaveHover).toHaveBeenCalledWith(node.id)
++    expect(activeIds().has(node.id)).toBe(false)
++  })
++
++  it('对照:没有 hover 时离窗不产生任何 leaveHover 调用(空转不误触发)', async () => {
++    const node = derivationEdgeNode()
++    await mountHarness([node])
++
++    act(() => {
++      window.dispatchEvent(new PointerEvent('pointerout', { relatedTarget: null }))
++    })
++
++    expect(fxSpies.leaveHover).not.toHaveBeenCalled()
++  })
++})
++
++describe('useDerivationEdgeHover — 重叠连线命中层级跟随 selected 提升(SC-1)', () => {
++  it('文档顺序靠前但已选中的连线,与文档顺序靠后未选中的连线重叠时,命中优先于后者', async () => {
++    // 两条几何完全重合的水平直线连线(同 defaultZOrderCompare 的 layer/renderOrder,
++    // 唯一差异是 selected)。selectedEdge 在 nodes 数组里排在前面(文档顺序更早,
++    // 裸 reverse 会让它排到最后、丢失第一命中);unselectedEdge 排在后面。
++    const selectedEdge = derivationEdgeNode('derivation-selected')
++    const unselectedEdge = derivationEdgeNode('derivation-unselected')
++    await mountHarness([selectedEdge, unselectedEdge], [selectedEdge.id])
++
++    // hoverOnto 断言 enterHover 被调用时传入指定 id——若命中层级仍是裸 reverse
++    // (未应用 selected 提升),真正被调用的会是 unselectedEdge.id,本断言会失败。
++    hoverOnto(selectedEdge.id)
++    expect(fxSpies.enterHover).not.toHaveBeenCalledWith(unselectedEdge.id)
++  })
++})
+diff --git a/src/render/useDerivationEdgeHover.ts b/src/render/useDerivationEdgeHover.ts
+new file mode 100644
+index 00000000..9a1914e3
+--- /dev/null
++++ b/src/render/useDerivationEdgeHover.ts
+@@ -0,0 +1,193 @@
++// useDerivationEdgeHover — React hook: pointermove → hitTest → edgeHoverFx glow,
++// plus selection → fx.updateSelection sync (选中的连线保持加粗+流光).
++//
++// Leafer is hittable:false + pointer-events:none, so hover detection runs on
++// the React event path: window pointermove → screenToCanvas → pointInMarkupStroke
++// against derivation edge nodes → getEdgeHoverFx().enterHover / leaveHover.
++//
++// 几何必须按 nodes 引用现算(缓存按引用失效):节点拖动/normalize 重写锚点后
++// markupPoints 会变,启动时投影一次的旧几何会让 hover 在移动过的线上永远
++// 命不中(2026-08-08 真机"有些连线 hover 不触发"的另一半根因;第一半是
++// hitTest 漏传锚点方向,见 hitTest.ts pointInMarkupStroke)。
++//
++// rAF 循环只在指针真的移动过时才跑 hitTest(同一点跳过),避免静止时 60fps
++// 空转全量命中计算。
++//
++// DOM renderer handles its own hover via MarkupNodeView's onPointerEnter.
++
++import { useEffect, useLayoutEffect, useRef } from 'react'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++import { isDerivationEdgeNode } from '../store/nodeFactory'
++import { pointInMarkupStroke, sortForHitTest } from './hitTest'
++import { projectNode, type RenderNode } from './projection'
++import { debugLogger } from '../store/debugLogStore'
++import { getEdgeHoverFx } from './leaferEdgeHoverFx'
++
++const SRC = 'DerivationEdgeHover'
++const HIT_TOLERANCE = 10
++
++export type DerivationEdgeHoverOptions = {
++  screenToCanvas: (clientX: number, clientY: number) => { x: number; y: number }
++  nodes: MivoCanvasNode[]
++  selectedNodeIds: string[]
++  rendererMode: 'dom' | 'leafer' | 'pixi'
++}
++
++export function useDerivationEdgeHover(options: DerivationEdgeHoverOptions): void {
++  const { selectedNodeIds, rendererMode } = options
++
++  const rafRef = useRef(0)
++  const lastHoveredRef = useRef<string | null>(null)
++  const pendingPointRef = useRef<{ x: number; y: number } | null>(null)
++  const processedPointRef = useRef<{ x: number; y: number } | null>(null)
++  const optsRef = useRef(options)
++  // latest-ref:写入放 layout effect(render 期写 ref 违反 react-hooks/refs);
++  // 读方都在 rAF/事件回调里,commit 后才跑,layout effect 时序足够新。
++  useLayoutEffect(() => {
++    optsRef.current = options
++  })
++
++  // 投影缓存:按 nodes 数组引用 + 选中集合失效。store 每次变更产出新数组引用,
++  // 引用没变 ⟹ 节点没动 ⟹ 缓存有效;引用变了才重投影。selectedNodeIds 单独
++  // 入键:选中态活在独立的 store slice,选中/取消选中一条连线不会让 nodes 换新
++  // 引用——只按 nodes 失效会让下面的 selected 提升读到选中变化前的旧快照。
++  const projCacheRef = useRef<{ src: MivoCanvasNode[] | null; selectedKey: string; edges: RenderNode[] }>({
++    src: null,
++    selectedKey: '',
++    edges: [],
++  })
++  const edgesForCurrentNodes = (): RenderNode[] => {
++    const ns = optsRef.current.nodes
++    const selectedIds = optsRef.current.selectedNodeIds
++    const selectedKey = selectedIds.join(',')
++    if (projCacheRef.current.src !== ns || projCacheRef.current.selectedKey !== selectedKey) {
++      const selectedSet = new Set(selectedIds)
++      // SC-1:命中层级必须跟随 selected 提升,与 interactionDispatch.ts 的主指针
++      // 命中路径同一套规则(defaultZOrderCompare)——否则两条重叠连线中文档顺序
++      // 靠前但已选中的那条会丢失第一命中,流光落到视觉下层的连线上。projectNode
++      // 不传 ctx 时 RenderNode.selected 恒为 false(见 projection.ts),所以必须
++      // 显式喂 selectedNodeIds;再用 sortForHitTest(而非裸 reverse)拿到应用了
++      // selected 提升的 back-to-front 顺序,最后 reverse 成 front-to-back 供下方
++      // for 循环首个命中即返回(与 hitTest.ts topmostNodeHit 的两步顺序一致)。
++      const edges = sortForHitTest(
++        ns
++          .filter((n) => isDerivationEdgeNode(n))
++          .map((n) => projectNode(n, { selectedNodeIds: selectedSet }))
++          .filter((r) => r.markupKind === 'arrow' || r.markupKind === 'line'),
++      ).reverse()
++      projCacheRef.current = { src: ns, selectedKey, edges }
++    }
++    return projCacheRef.current.edges
++  }
++
++  // ── hover: pointermove → hitTest → enter/leave ──────────────────────────
++  useEffect(() => {
++    if (rendererMode !== 'leafer') return
++
++    const processPending = () => {
++      const pt = pendingPointRef.current
++      // 同一点已处理过 → 跳过本帧(指针静止时不空转 hitTest)。
++      if (!pt || pt === processedPointRef.current) {
++        rafRef.current = requestAnimationFrame(processPending)
++        return
++      }
++      processedPointRef.current = pt
++
++      let hitId: string | null = null
++      for (const r of edgesForCurrentNodes()) {
++        if (pointInMarkupStroke(r, pt, HIT_TOLERANCE)) {
++          hitId = r.id
++          break
++        }
++      }
++
++      const fx = getEdgeHoverFx()
++      if (fx && hitId !== lastHoveredRef.current) {
++        if (lastHoveredRef.current) fx.leaveHover(lastHoveredRef.current)
++        if (hitId) fx.enterHover(hitId)
++        lastHoveredRef.current = hitId
++      }
++
++      rafRef.current = requestAnimationFrame(processPending)
++    }
++
++    const onPointerMove = (event: PointerEvent) => {
++      const canvasPt = optsRef.current.screenToCanvas(event.clientX, event.clientY)
++      pendingPointRef.current = { x: canvasPt.x, y: canvasPt.y }
++    }
++
++    // SC-B3:指针离窗/失焦/页面隐藏后不再有 pointermove 事件驱动 hitTest——
++    // hover 着一条未选中的连线时,hover 态会永远卡在那条线上、rAF 持续烧帧
++    // (2026-08-09 三审:指针移出浏览器窗口后 hover 卡死)。这里主动清 hover
++    // (fx.leaveHover);选中态不动——leaferEdgeHoverFx.syncGlowState 是
++    // hoveredIds∪selectedIds,清 hover 不会清掉已选中连线的发光(见该文件同一
++    // 并行修复批次)。
++    const clearHoverOnWindowExit = () => {
++      pendingPointRef.current = null
++      processedPointRef.current = null
++      if (!lastHoveredRef.current) return
++      getEdgeHoverFx()?.leaveHover(lastHoveredRef.current)
++      lastHoveredRef.current = null
++      debugLogger.log(SRC, 'hover cleared: pointer left window / lost focus / page hidden')
++    }
++    // relatedTarget === null → 指针真的离开了整个文档(不是在子元素间切换,
++    // 那种情况下一帧的 pointermove 会立刻重算命中,不需要特殊处理)。
++    const onPointerOut = (event: PointerEvent) => {
++      if (event.relatedTarget === null) clearHoverOnWindowExit()
++    }
++    const onVisibilityChange = () => {
++      if (document.visibilityState === 'hidden') clearHoverOnWindowExit()
++    }
++
++    window.addEventListener('pointermove', onPointerMove, { passive: true })
++    window.addEventListener('pointerout', onPointerOut)
++    window.addEventListener('blur', clearHoverOnWindowExit)
++    document.addEventListener('visibilitychange', onVisibilityChange)
++    rafRef.current = requestAnimationFrame(processPending)
++    debugLogger.log(SRC, 'hover detection active (projection follows node changes)')
++
++    return () => {
++      window.removeEventListener('pointermove', onPointerMove)
++      window.removeEventListener('pointerout', onPointerOut)
++      window.removeEventListener('blur', clearHoverOnWindowExit)
++      document.removeEventListener('visibilitychange', onVisibilityChange)
++      cancelAnimationFrame(rafRef.current)
++      if (lastHoveredRef.current) {
++        getEdgeHoverFx()?.leaveHover(lastHoveredRef.current)
++        lastHoveredRef.current = null
++      }
++      debugLogger.log(SRC, 'hover detection stopped')
++    }
++  }, [rendererMode])
++
++  // ── selection → fx.updateSelection(选中保持流光;点选连线 → Delete 可删) ──
++  const prevSelectedRef = useRef<Set<string>>(new Set())
++  useEffect(() => {
++    if (rendererMode !== 'leafer') return
++    const fx = getEdgeHoverFx()
++    if (!fx) return
++    const selectedSet = new Set(selectedNodeIds)
++    const current = new Set(
++      optsRef.current.nodes
++        .filter((n) => isDerivationEdgeNode(n) && selectedSet.has(n.id))
++        .map((n) => n.id),
++    )
++    for (const id of prevSelectedRef.current) {
++      if (!current.has(id)) fx.updateSelection(id, false)
++    }
++    for (const id of current) {
++      if (!prevSelectedRef.current.has(id)) fx.updateSelection(id, true)
++    }
++    prevSelectedRef.current = current
++  }, [rendererMode, selectedNodeIds])
++
++  // 卸载时清掉仍在选中态的流光(不放上面的 effect cleanup:那会在每次
++  // selectedNodeIds 变化时先全清再重建,造成闪烁)。
++  useEffect(() => {
++    return () => {
++      const fx = getEdgeHoverFx()
++      for (const id of prevSelectedRef.current) fx?.updateSelection(id, false)
++      prevSelectedRef.current = new Set()
++    }
++  }, [])
++}
+diff --git a/src/render/useLeaferSpikeRenderer.ts b/src/render/useLeaferSpikeRenderer.ts
+index 41650483..daf4450b 100644
+--- a/src/render/useLeaferSpikeRenderer.ts
++++ b/src/render/useLeaferSpikeRenderer.ts
+@@ -34,6 +34,7 @@ import {
+ import { createLeaferBrushStampPaint } from './leaferBrushStampPaint'
+ import { createLeaferImagePaint } from './leaferImagePaint'
+ import { createLeaferLinePaint } from './leaferLinePaint'
++import { createLeaferEdgeHoverFx } from './leaferEdgeHoverFx'
+ import { createLeaferShapePaint, leaferZOrderMapFor } from './leaferShapePaint'
+ import { createLeaferStampFx } from './leaferStampFx'
+ import { useDocumentThemeAttribute } from './useDocumentThemeAttribute'
+@@ -369,6 +370,9 @@ export const useLeaferSpikeRenderer = ({
+   // formalized into leaferLinePaint — consumes normalized markupPoints from the
+   // store only (connector geometry stays model-driven, D1).
+   const linePaintRef = useRef<ReturnType<typeof createLeaferLinePaint> | null>(null)
++  // Derivation edge hover flow animation controller (rAF + dashOffset).
++  // One per Leafer instance, shared across all line entries.
++  const edgeHoverFxRef = useRef<ReturnType<typeof createLeaferEdgeHoverFx> | null>(null)
+   // Phase 4c: markup brush/stamp paint is formalized into leaferBrushStampPaint
+   // (perfect-freehand outline via brushGeometry + stamp sticker image fill).
+   const brushStampPaintRef = useRef<ReturnType<typeof createLeaferBrushStampPaint> | null>(null)
+@@ -549,7 +553,8 @@ export const useLeaferSpikeRenderer = ({
+         // Bind the shape paint module (4a) to the same Leafer instance.
+         shapePaintRef.current = createLeaferShapePaint(leafer)
+         // Bind the line paint module (4b) to the same Leafer instance.
+-        linePaintRef.current = createLeaferLinePaint(leafer)
++        edgeHoverFxRef.current = createLeaferEdgeHoverFx()
++        linePaintRef.current = createLeaferLinePaint(leafer, edgeHoverFxRef.current)
+         // Bind the brush/stamp paint module (4c) to the same Leafer instance.
+         brushStampPaintRef.current = createLeaferBrushStampPaint(leafer)
+         // V2 stamp fx: bind after brushStampPaint so getStampObject is live. Leafer
+@@ -586,6 +591,8 @@ export const useLeaferSpikeRenderer = ({
+       imagePaintRef.current = null
+       shapePaintRef.current?.dispose()
+       shapePaintRef.current = null
++      edgeHoverFxRef.current?.dispose()
++      edgeHoverFxRef.current = null
+       linePaintRef.current?.dispose()
+       linePaintRef.current = null
+       // V2 stamp fx: dispose BEFORE brushStampPaint so the rAF never queries a
+@@ -747,6 +754,11 @@ export const useLeaferSpikeRenderer = ({
+       return
+     }
+ 
++    // 主题切换触发源(复用这个已经把 theme 接进依赖数组的 effect,不新增机制):
++    // glow 层的颜色只在创建时定过一次色,hover/选中期间(可以无限长)存活的 glow
++    // 不会自己跟着主题变——补上这条触发链。no-op 当没有活跃 glow 时。
++    edgeHoverFxRef.current?.refreshThemeColor()
++
+     const lodStats = summarizeEngineLod(paintedNodes, lodViewport)
+     recordEngineLodSummary('Leafer Spike', lodStats, lodSummaryRef)
+     // 4a (2b-2 z-order): one z-order map over the FULL painted list (shapes +

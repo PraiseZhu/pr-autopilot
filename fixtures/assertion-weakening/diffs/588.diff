@@ -1,0 +1,336 @@
+diff --git a/scripts/e2e/scenarios/archive-assets.evidence.test.mjs b/scripts/e2e/scenarios/archive-assets.evidence.test.mjs
+new file mode 100644
+index 00000000..313b45c7
+--- /dev/null
++++ b/scripts/e2e/scenarios/archive-assets.evidence.test.mjs
+@@ -0,0 +1,104 @@
++// scripts/e2e/scenarios/archive-assets.evidence.test.mjs
++// waitForArchiveNodePixelEvidence 的诚实性契约测试(F542-R1-CA-001 返修补上)。
++//
++// 为什么需要:该原语是 archive-assets leafer 恢复断言的新主证据——每个归档节点必须
++// 在其 ID 绑定的投影区域采到非空像素。双审 major 指出旧断言只验证聚合信号
++// (children/expected/global pixel),「stale 双对象」与「仅 text 有像素、image 未落画」
++// 两种反例都可假绿。新原语的接线层判定(3×3 子矩形网格 → 任一
++// sampleAvailable && intersects && nonEmpty 即证据成立)与 fail-closed 语义必须有
++// 契约测试钉住,否则下一次返修可能把像素证据悄悄改回聚合口径(正是本 finding 的形态)。
++//
++// 锁住四条(不启真浏览器:假 page 即可 —— 本原语与浏览器的唯一接触面是
++// projectedScreenRectForNode / sampleCanvasPixelInRect 内部的 page.evaluate):
++//   ① 两节点投影区域都有非空像素 → 返回含两节点 evidenceOk:true 的读数;
++//   ② 仅 image 区域无像素(text 正常)→ 期限内抛错,消息带 label 与末次读数
++//      (「image 不落画而 text 落画」反例必须让目标断言自身红);
++//   ③ 节点投影拿不到(store 无该节点 / shell 缺失)→ fail-closed 抛错,读数含 projected:null;
++//   ④ 单轮采样永不 settle → 仍在期限内抛错(硬期限;与 wait-async-predicate 第 4 条同款)。
++import { describe, expect, it } from 'vitest'
++import { waitForArchiveNodePixelEvidence } from './archive-assets.mjs'
++
++const TEXT_PROJECTED = { x: 0, y: 0, width: 240, height: 96 }
++const IMAGE_PROJECTED = { x: 360, y: 96, width: 64, height: 64 }
++
++/**
++ * 假 page:projectedScreenRectForNode 传 nodeId(string),sampleCanvasPixelInRect 传
++ * rect(object)。按 arg 形状分派:文本节点投影 x<100,image 投影 x>=360,采样响应按
++ * 矩形 x 坐标区分节点(imageProbe / textProbe 可各自定制)。evaluate 恒返回成功值。
++ */
++const fakePage = ({
++  textProbe = { sampleAvailable: true, intersects: true, nonEmpty: true },
++  imageProbe = { sampleAvailable: true, intersects: true, nonEmpty: true },
++} = {}) => ({
++  evaluate: async (_fn, arg) => {
++    if (typeof arg === 'string') {
++      return arg === 'archive-image' ? IMAGE_PROJECTED : TEXT_PROJECTED
++    }
++    return (arg?.x ?? 0) < 100 ? textProbe : imageProbe
++  },
++})
++
++describe('waitForArchiveNodePixelEvidence 契约', () => {
++  it('① 两节点投影区域都有非空像素 → 返回含两节点 evidenceOk:true 的读数', async () => {
++    const page = fakePage()
++    const got = await waitForArchiveNodePixelEvidence(page, ['archive-text', 'archive-image'], {
++      timeout: 2000,
++      interval: 5,
++      label: '测试:两节点均落画',
++    })
++    expect(got['archive-text'].evidenceOk).toBe(true)
++    expect(got['archive-image'].evidenceOk).toBe(true)
++    // 每个节点采样 3×3 网格 = 9 次
++    expect(got['archive-text'].probes).toHaveLength(9)
++    expect(got['archive-image'].probes).toHaveLength(9)
++  })
++
++  it('② image 不落画而 text 落画 → 期限内抛错,消息带 label 与末次读数(目标断言自身红)', async () => {
++    const page = fakePage({ imageProbe: { sampleAvailable: true, intersects: true, nonEmpty: false } })
++    const err = await waitForArchiveNodePixelEvidence(page, ['archive-text', 'archive-image'], {
++      timeout: 300,
++      interval: 5,
++      label: '测试:image 区域无像素',
++    }).catch((e) => e)
++    expect(err).toBeInstanceOf(Error)
++    expect(err.message).toContain('测试:image 区域无像素')
++    // 末次读数必须如实带出哪个节点、哪类证据失败,否则超时信息退化成"不知道当时是什么"
++    expect(err.message).toContain('archive-image')
++    expect(err.message).toContain('"evidenceOk":false')
++    expect(err.message).toContain('"archive-text"')
++  })
++
++  it('③ 节点投影拿不到(store 无该节点 / shell 缺失)→ fail-closed 抛错,读数含 projected:null', async () => {
++    const page = {
++      evaluate: async (_fn, arg) => (typeof arg === 'string' ? null : { sampleAvailable: true, intersects: true, nonEmpty: true }),
++    }
++    const err = await waitForArchiveNodePixelEvidence(page, ['archive-text', 'archive-image'], {
++      timeout: 300,
++      interval: 5,
++      label: '测试:投影缺失',
++    }).catch((e) => e)
++    expect(err).toBeInstanceOf(Error)
++    expect(err.message).toContain('测试:投影缺失')
++    expect(err.message).toContain('"projected":null')
++  })
++
++  it('④ 单轮采样永不 settle → 仍在期限内抛错(硬期限,防挂死)', async () => {
++    const page = { evaluate: () => new Promise(() => {}) }
++    const started = Date.now()
++    const err = await waitForArchiveNodePixelEvidence(page, ['archive-text', 'archive-image'], {
++      timeout: 300,
++      interval: 5,
++      label: '测试:采样永不返回',
++    }).catch((e) => e)
++    expect(err).toBeInstanceOf(Error)
++    expect(err.message).toContain('单轮采样未在期限内返回')
++    expect(Date.now() - started).toBeLessThan(3000)
++  })
++
++  it('timeout 非正数 → 直接报错,不做无期限等待', async () => {
++    const page = fakePage()
++    await expect(
++      waitForArchiveNodePixelEvidence(page, ['archive-text', 'archive-image'], { timeout: 0 }),
++    ).rejects.toThrow(/timeout 必须为正数/)
++  })
++})
+diff --git a/scripts/e2e/scenarios/archive-assets.mjs b/scripts/e2e/scenarios/archive-assets.mjs
+index e8294aed..8a12cf7f 100644
+--- a/scripts/e2e/scenarios/archive-assets.mjs
++++ b/scripts/e2e/scenarios/archive-assets.mjs
+@@ -1,6 +1,117 @@
+-import { waitForCanvasReady } from '../renderer-evidence.mjs'
++import {
++  projectedScreenRectForNode,
++  sampleCanvasPixelInRect,
++  waitForCanvasReady,
++} from '../renderer-evidence.mjs'
+ import { waitForAsyncPredicate } from '../wait-async-predicate.mjs'
+ 
++// F542-R1-CA-001(双审 major)修复:Leafer archive restore 断言必须把落画证据绑定到
++// 具体归档节点,聚合信号(children/expected/global pixel)只证明「Leafer 有东西」——
++// stale 双对象或仅 text 有像素时仍可假绿,不能作为「归档节点实际可用」的唯一证明。
++//
++// 本原语对每个 nodeId 的**投影区域**做真实 canvas 像素采样:投影矩形来自 store 几何 ×
++// data-viewport-*(projectedScreenRectForNode,与 useLeaferSpikeRenderer 同式),像素
++// 采样走 sampleCanvasPixelInRect(与 renderer-evidence 既有契约同一实现,不复制像素
++// 算法)。单采样点是文字字形间隙的盲区,故对投影矩形做 3×3 子矩形网格,任一子矩形
++// 满足 sampleAvailable && intersects && nonEmpty 即该节点落画证据成立;全部失败
++// (区域无像素 / 矩形不碰可见画布 / canvas 缺失或尺寸为 0)→ 节点证据不成立,fail-closed。
++// 轮询至 deadline:image 走异步 lease 解析,采样需等待位图真正落画(与 renderer 自身
++// sampleSoon 的 30×100ms 重试窗口同因)。超时是硬期限,单轮采样与剩余期限 race——
++// 页面卡死时不得挂到 job 级 timeout(与 wait-async-predicate 第 4 条同款失败形态)。
++const NODE_PIXEL_GRID = 3
++
++export const waitForArchiveNodePixelEvidence = async (
++  page,
++  nodeIds,
++  { timeout = 30000, interval = 200, label } = {},
++) => {
++  const what = label ?? `节点投影区域像素证据:${nodeIds.join(', ')}`
++  if (!(timeout > 0)) {
++    throw new Error(`waitForArchiveNodePixelEvidence: timeout 必须为正数(收到 ${timeout})`)
++  }
++  const deadline = Date.now() + timeout
++  let last = null
++  let everEvaluated = false
++  for (;;) {
++    const remaining = deadline - Date.now()
++    if (remaining <= 0) {
++      throw new Error(
++        everEvaluated
++          ? `waitForArchiveNodePixelEvidence 超时(${timeout}ms):${what} —— 末次读数 ${JSON.stringify(last)}`
++          : `waitForArchiveNodePixelEvidence 超时(${timeout}ms):${what} —— 一次都没采样完`,
++      )
++    }
++
++    const pending = (async () => {
++      const readout = {}
++      let allReady = true
++      for (const nodeId of nodeIds) {
++        const projected = await projectedScreenRectForNode(page, nodeId)
++        if (!projected) {
++          // store 无该节点 / shell 缺失 → 投影拿不到,证据不可用(fail-closed)。
++          readout[nodeId] = { projected: null }
++          allReady = false
++          continue
++        }
++        const probes = []
++        for (let row = 0; row < NODE_PIXEL_GRID; row += 1) {
++          for (let column = 0; column < NODE_PIXEL_GRID; column += 1) {
++            probes.push(
++              await sampleCanvasPixelInRect(page, {
++                x: projected.x + (projected.width * column) / NODE_PIXEL_GRID,
++                y: projected.y + (projected.height * row) / NODE_PIXEL_GRID,
++                width: projected.width / NODE_PIXEL_GRID,
++                height: projected.height / NODE_PIXEL_GRID,
++              }),
++            )
++          }
++        }
++        const evidenceOk = probes.some((probe) => probe.sampleAvailable && probe.intersects && probe.nonEmpty)
++        readout[nodeId] = { projected, probes, evidenceOk }
++        if (!evidenceOk) allReady = false
++      }
++      return { allReady, readout }
++    })()
++
++    let timer
++    let result
++    try {
++      result = await Promise.race([
++        pending,
++        new Promise((resolve) => {
++          timer = setTimeout(() => resolve(EXPIRED_SENTINEL), remaining)
++        }),
++      ])
++    } finally {
++      clearTimeout(timer)
++    }
++
++    if (result === EXPIRED_SENTINEL) {
++      // 放弃这轮采样:它可能永远不 settle。不能让它变成 unhandledRejection,但也不能
++      // 完全丢掉——迟到的错误可能正是最有指向性的一句(与 wait-async-predicate 同款)。
++      void Promise.resolve(pending).catch((err) => {
++        console.warn(
++          `[waitForArchiveNodePixelEvidence] 已放弃的采样稍后失败了(${what}):${err instanceof Error ? err.message : String(err)}`,
++        )
++      })
++      throw new Error(
++        `waitForArchiveNodePixelEvidence 超时(${timeout}ms):${what} —— 单轮采样未在期限内返回` +
++          `(页面卡死;末次已知读数 ${JSON.stringify(last)})`,
++      )
++    }
++
++    everEvaluated = true
++    last = result.readout
++    if (result.allReady) return result.readout
++
++    const left = deadline - Date.now()
++    if (left <= 0) continue
++    await new Promise((resolve) => setTimeout(resolve, Math.min(interval, left)))
++  }
++}
++
++const EXPIRED_SENTINEL = Symbol('archive-assets:node-pixel-evidence-expired')
++
+ export const runArchiveAssetsScenario = async (context) => {
+   const {
+     Buffer,
+@@ -156,21 +267,49 @@ export const runArchiveAssetsScenario = async (context) => {
+     )
+     await waitForAsyncPredicate(
+       page,
+-      async ({ moduleSpec, expectedDomCount }) => {
++      async ({ moduleSpec, expectedDomCount, isLeafer }) => {
+         const { useCanvasStore } = await import(moduleSpec)
+         const state = useCanvasStore.getState()
++        const restoredText = state.nodes.find((node) => node.id === 'archive-text')?.text || ''
++        const domTextOk = document
++          .querySelector('.dom-node.text-node .dom-text-node')
++          ?.textContent?.includes('Archive text')
++        const shell = document.querySelector('.canvas-shell')
++        const leaferChildren = Number(shell?.getAttribute('data-leafer-children') || 0)
++        const leaferExpected = Number(shell?.getAttribute('data-leafer-expected-children') || 0)
+         return (
+           state.canvases[state.sceneId]?.title === 'canvas-e2e-archive' &&
+           state.nodes.length === 2 &&
+           document.querySelectorAll('.dom-node').length === expectedDomCount &&
+-          document.querySelector('.dom-node.text-node .dom-text-node')?.textContent?.includes('Archive text')
++          // #504(lod 默认 on)后 leafer 模式 text 本体由 Leafer 真画,选中态 DOM 只有
++          // 纯选中壳(无 .dom-text-node)——文字内容改读 store;children/expected/
++          // pixel-nonempty 只作补充就绪信号,落画证据见下方逐节点像素采样
++          // (F542-R1-CA-001:聚合信号可被 stale 双对象或仅 text 有像素假绿)。
++          (isLeafer
++            ? restoredText.includes('Archive text') &&
++              leaferChildren === leaferExpected &&
++              leaferExpected === 2 &&
++              shell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
++            : Boolean(domTextOk))
+         )
+       },
+-      // leafer 模式 image 归 Leafer 真画:DOM 只剩 text 节点(1);dom 模式两个都在(2)。
+-      { moduleSpec: await canvasStoreSpec(), expectedDomCount: leaferMode ? 1 : 2 },
++      // leafer 模式 image 归 Leafer 真画:DOM 只剩 text 节点的纯选中壳(1);dom 模式两个都在(2)。
++      {
++        moduleSpec: await canvasStoreSpec(),
++        expectedDomCount: leaferMode ? 1 : 2,
++        isLeafer: leaferMode,
++      },
+       { label: 'canvas-e2e-archive 画布节点数达标' },
+     )
+     if (leaferMode) {
++      // F542-R1-CA-001:逐节点 ID 绑定的投影区域像素证据——archive-text 与
++      // archive-image 各自必须在其投影区域采到非空像素(采样失败即该节点未落画/
++      // 位置错误/canvas 缺失,fail-closed);聚合 children/expected 与全局像素仅作
++      // 上面的补充就绪信号,不充当落画证明。
++      await waitForArchiveNodePixelEvidence(page, ['archive-text', 'archive-image'], {
++        label: 'archive-text 与 archive-image 均在各自投影区域落画(逐节点像素证据)',
++      })
++      // 补充证据:store 侧 assetUrl 恢复(与 leaferImagePaint lease 同源)。
+       const restored = await page.evaluate(async (moduleSpec) => {
+         const { useCanvasStore } = await import(moduleSpec)
+         const node = useCanvasStore.getState().nodes.find((entry) => entry.id === 'archive-image')
+diff --git a/src/render/useLeaferSpikeRenderer.failsafe.test.ts b/src/render/useLeaferSpikeRenderer.failsafe.test.ts
+index aee93fe5..f7161279 100644
+--- a/src/render/useLeaferSpikeRenderer.failsafe.test.ts
++++ b/src/render/useLeaferSpikeRenderer.failsafe.test.ts
+@@ -47,6 +47,18 @@ describe('useLeaferSpikeRenderer — PR-R1 failsafe source contracts', () => {
+     })
+   })
+ 
++  describe('清理路径:inline loop 对象先移除再 destroy', () => {
++    it('cleanup 在 leafer?.destroy() 之前移除 painted 内联对象(带 children destroy 命中 Leafer watcher 崩溃路径,console-error guard 会拦 e2e)', () => {
++      // 场景切换时旧 MivoCanvas 会先用新场景 nodes 重渲染、把对象画进旧 leafer
++      // 再 unmount(archive-assets::leafer 实测);destroy 必须先清 children,否则
++      // watcher 先销毁 → childrenSortChange → __onAttrChange 读 __updatedList(null) 崩。
++      // 锁定「移除循环 → clear → destroy」的先后序,防止未来把 destroy 挪到前面。
++      expect(source).toMatch(
++        /for\s*\(\s*const\s*\{\s*object\s*\}\s*of\s*painted\.values\(\)\s*\)\s*object\.remove\(\)[\s\S]{0,200}?leafer\?\.destroy\(\)/,
++      )
++    })
++  })
++
+   describe('R-02: 像素探针 DEV 门控', () => {
+     it('sampleNonEmptyCanvasPixels 加 import.meta.env.DEV 门控', () => {
+       expect(source).toMatch(/sampleNonEmptyCanvasPixels[\s\S]*?import\.meta\.env\.DEV/)
+diff --git a/src/render/useLeaferSpikeRenderer.ts b/src/render/useLeaferSpikeRenderer.ts
+index 9ac29e15..41650483 100644
+--- a/src/render/useLeaferSpikeRenderer.ts
++++ b/src/render/useLeaferSpikeRenderer.ts
+@@ -594,11 +594,19 @@ export const useLeaferSpikeRenderer = ({
+       stampFxRef.current = null
+       brushStampPaintRef.current?.dispose()
+       brushStampPaintRef.current = null
++      // inline loop 的对象不属于任何 paint 模块的 dispose 范围:cleanup 必须显式移除
++      // 再 destroy。场景切换时旧 MivoCanvas(store 订阅)会用新场景 nodes 先重渲染、
++      // 把对象画进旧 leafer 再 unmount;带 children 的 leafer.destroy 会命中 Leafer
++      // 库的崩溃路径(watcher 先销毁、children 后清 → childrenSortChange →
++      // forceUpdate → watcher.__onAttrChange 读 __updatedList(null) 崩,Leafer 内部
++      // 捕获后 console.error,e2e console-error guard 拦截)。与下方
++      // rendererMode!=='leafer' 切离分支同款移除;remove() 有 parent 守卫,安全。
++      for (const { object } of painted.values()) object.remove()
++      painted.clear()
++      signatures.clear()
+       leafer?.destroy()
+       leaferRef.current = null
+       setLeaferReady(false)
+-      painted.clear()
+-      signatures.clear()
+       window.clearTimeout(panCacheEndTimerRef.current)
+       if (frozenCanvasRef.current) frozenCanvasRef.current.style.transform = ''
+       if (frozenCanvasRef.current) {

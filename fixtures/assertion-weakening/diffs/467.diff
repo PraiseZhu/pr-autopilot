@@ -1,0 +1,470 @@
+diff --git a/README.md b/README.md
+index 0262250a..4b5fc559 100644
+--- a/README.md
++++ b/README.md
+@@ -93,3 +93,30 @@ bash cindyplugin/build.sh     # vite 构建 + 拷贝 ghost.json/main.js/icon/ski
+   是超集;那份不确定的旧内容也不会被复用的物理路径覆盖,永久弃用只是白白牺牲一个
+   generation 号),但确实多一次不必要的往返与一个永久浪费的编号,**这部分残留未消
+   除**。详见设计稿 §4.4.2「残余边界·其三」(已更新为同一结论)。
++- **CODEX-001 冷启动 marker(`deposit/highwater.json`)机制的三条设计取舍**(list
++  报空数组、`maxGen<0`、进程内棘轮从未推进过——真首启与"清单撒谎"在观测上完全
++  相同这一类场景的修复):
++  - **marker 自身也可能丢**(外部删除 / 权限变更 / 双实例场景下被覆盖):marker
++    读不回来时,冷启动会退化成与"真首启"逐字节不可区分,这一次就识破不了清单
++    撒谎,退回本 PR(CODEX-001)修复之前对这个特定组合的风险水位——但这需要
++    **两个独立故障同时发生**(list 撒谎,且 marker 恰好也被单独销毁),不是本
++    修复常态路径上的行为。
++  - **marker 存在一个"偏低"窗口**:marker 是在状态文件确认写成功、棘轮推进**
++    之后**才紧随写入的(不是同一次原子操作,`cindy.fs` 不支持多文件事务)——
++    进程若恰好崩溃在这两次写之间,marker 会落后真实磁盘一代。这期间若冷启动
++    恰好遇上清单变短,会把这一代误判为可信空态。取舍理由:marker 偏高(写在
++    状态文件之前)会让它声称一个从未真正落盘过的 generation,此后任何一次
++    短清单都会被这个从未存在过的号永久判定 distrusted、需要人工删 marker 才能
++    解——是本机制自己新造的一种更容易触发的锁死;marker 偏低只是偶尔错过一次
++    识破撒谎的机会,不会新增锁死风险。两害相权,选偏低。
++  - **真首启与"清单撒谎"在 marker 也读不到时结构上不可区分,因此默认判定为
++    可信空态,不判 distrusted**:`main.js` 关于 `fsList` 的头注释(:320-322)
++    明写宿主契约——「目录不存在 → `{ok:true, entries:[]}`,不是错误…首次运行
++    走的是正常空清单路径,别指望用 `ok:false` 区分首次运行」;`fsReadResult`
++    (:290 上方)同样刻意没有 `absent` 档。两条合起来,"marker 从未写过"(每个
++    新装用户的常态首次体验)与"marker 被单独销毁而账本其实有历史"在观测上
++    逐字节相同,无法区分。若默认判 distrusted,后果不是"体验差"而是**自举
++    死锁**:首次提交被拒 → 状态文件与 marker 都没写成 → 下次冷启动观测完全
++    相同 → 永久拒绝,deposit 功能对新装用户根本无法启动。原始漏洞场景(先正常
++    提交到某个 generation,再冷启动遇到清单变短)不受影响——那时 marker 已经
++    在那次提交时写过,读回 `found` 且 generation>0,照样判 distrusted 挡住。
+diff --git a/ghost.json b/ghost.json
+index fea2a8de..2d4b0195 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.9",
++  "version": "0.9.10",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/main.js b/main.js
+index 856517ae..7a348b13 100644
+--- a/main.js
++++ b/main.js
+@@ -4344,6 +4344,13 @@ const DEPOSIT_LABEL_MAX = 64
+ // 不可变命名协议(设计稿 §4.4.2,移植自 docs/plan/workspace-binding-design.md §4.7.2):
+ // `deposit/state-<gen>-<writer>.json`,gen 十进制零填充 8 位(便于字典序,同源先例)。
+ const DEPOSIT_FILE_RE = /^state-(\d{8,})-([0-9a-f]{4,32})\.json$/i
++// P05-CODEX-001(#297 P0.5 Wave B-1)冷启动 highwater marker:固定文件名、不带
++// writer 短码(`DEPOSIT_WRITER` 每个进程重铸一次随机 16-hex,按 writer 命名会让
++// 新进程永远找不到自己"上一世"写的那份)。天然不匹配 `DEPOSIT_FILE_RE`,不参与
++// 候选枚举与整代退休扫描——完整判定逻辑见 `depositReadHighwaterMarker`。
++const DEPOSIT_HIGHWATER_NAME = 'highwater.json'
++const DEPOSIT_HIGHWATER_PATH = DEPOSIT_DIR + DEPOSIT_HIGHWATER_NAME
++const DEPOSIT_HIGHWATER_SCHEMA = 1
+ // SC8.2(八轮定案——方向A「源头硬闸」,替代已被推翻并整体删除的 sidecar 无损外置
+ // 方案,见 §4.10.6.1"设计偏离说明·再续二"):最终 envelope 的写入硬上限,按真实
+ // UTF-8 字节数(`depositByteLength`)判定,不是 payload、也不是字符串 `.length`。
+@@ -4832,18 +4839,22 @@ async function depositReadAllCandidates() {
+   // 目录,面板侧写这个目录的唯一入口是 `depositStore.ts` 的不可变命名协议
+   // (`state-<gen>-<writer>.json`),而 `DEPOSIT_ENABLED` flag 在本 PR 落地的前段
+   // 一直是关的(生产从未真正调用过 `deposit_media`/`deposit-state-save`)——也就是
+-  // 说 `deposit/` 目录**在生产环境从未被写入过任何内容**,不可能存在真实的旧 a/b
+-  // 格式历史数据;这里出现的不符合命名的文件只可能来自开发 / 测试环境手工放置,或
+-  // 未来协议版本的产物。安全忽略,但绝不静默——留痕让它可查,而不是自动兼容读取
+-  // 一份"不该存在"的旧格式(反而会把开发环境的手工测试脚手架误当成生产数据读入)。
+-  const unrecognized = names.filter((name) => !DEPOSIT_FILE_RE.test(name))
++  // 说 `deposit/` 目录**从未被写入过任何候选状态文件**(不可能存在真实的旧 a/b
++  // 格式历史数据)。P05-CODEX-001(#297 P0.5 Wave B-1)起,本 PR 额外在这个目录下
++  // 写一个固定名的 `highwater.json`(声明处见 `DEPOSIT_HIGHWATER_PATH`)——它是
++  // 已知合法的非候选文件,按精确文件名单独排除,不落进下面这条 unrecognized 留痕
++  // (不是放宽 `DEPOSIT_FILE_RE`,是专门认出这一个文件)。这里出现的其它不符合命名
++  // 的文件只可能来自开发 / 测试环境手工放置,或未来协议版本的产物。安全忽略,但
++  // 绝不静默——留痕让它可查,而不是自动兼容读取一份"不该存在"的旧格式(反而会把
++  // 开发环境的手工测试脚手架误当成生产数据读入)。
++  const unrecognized = names.filter((name) => name !== DEPOSIT_HIGHWATER_NAME && !DEPOSIT_FILE_RE.test(name))
+   if (unrecognized.length) {
+     diagSkip(
+       DIAG_SOURCE.deposit,
+       'deposit 候选枚举: 发现 ' +
+         unrecognized.length +
+         ' 个不符合当前协议命名的文件(如旧版 a/b 双槎命名),已忽略不计入候选——' +
+-        'deposit/ 目录在生产环境从未被写入过(DEPOSIT_ENABLED 全程未开,设计稿 §4.4.2),' +
++        'deposit/ 目录从未被写入过任何候选状态文件(DEPOSIT_ENABLED 全程未开,设计稿 §4.4.2),' +
+         '不存在需要兼容迁移的历史数据: ' +
+         unrecognized.slice(0, 5).join(','),
+     )
+@@ -5196,6 +5207,90 @@ function depositEnforceMapPendingMutex(payload) {
+   return dropped
+ }
+ 
++/**
++ * P05-CODEX-001(#297 P0.5 Wave B-1):冷启动 highwater marker。棘轮
++ * (`depositRatchetGeneration`)是纯内存变量,进程重启即归零——那一刻「清单报空」
++ * 与「清单在撒谎」在观测上完全相同(`readDepositState` 的 `maxGen < 0` 分支挡不住,
++ * 因为它的前提正是棘轮已经归零)。marker 把「本 profile 已确认成功提交过的最高
++ * generation」落盘成一份跨进程生命周期存活的痕迹,补上棘轮做不到的这一段。
++ *
++ * 只返回两档,语义直接对应 `readDepositState` 冷启动判定表的落脚点:
++ *   { kind: 'clean' }               无可信历史 —— 按可信空态处置(不 distrusted)
++ *   { kind: 'distrusted', reason }  有可信历史但这次清单报空,或 marker 内容本身
++ *                                   已损坏 —— 必须 fail-closed
++ *
++ * 关键洞察(裁决见 fix-p05-waveB1.md S-4 ④/⑤,别顺手改反):`fsReadResult` 的
++ * `found` 档本身就证明这份 marker 文件存在——全新安装从未写过 marker,永远不可能
++ * 产生 `found`。所以 `found`(不管内容是否合法)⟹ 这个 profile 有过 marker ⟹ 不是
++ * 全新安装,「首启会被误判」这条顾虑在 `found` 分支不适用:
++ *   - `found` + 合法 `generation > 0` → 本 profile 明明提交到过更高代,这次清单却
++ *     报空 → 撒谎 → distrusted,与 `maxGen < 棘轮` 分支走同一套处置。
++ *   - `found` + 内容非法(schema 不认 / generation 非负安全整数校验不过 / JSON
++ *     解析失败)→ 同样 distrusted,零代价(不可能是首启触发的)——挡住的是「marker
++ *     曾经记着高代、字节损坏了几位却被当空放行」这个小号版原始漏洞,与 A-2 棘轮
++ *     救援里 `kind:'invalid'` 判失败不判成功同一道理。
++ *   - `found` + 合法 `generation === 0` → 唯一的可信空态:写过 marker,但确实还
++ *     没成功提交过状态。
++ *
++ * `unresolved`(读不出来 / 文件不存在)判可信空态,不判 distrusted:`fsReadResult`
++ * 刻意没有 `absent` 档(声明处 :290 上方),「marker 从未写过」与「marker 存在但读
++ * 不出来」在回执上逐字节不可区分;若默认判 distrusted 就是自举死锁——每个新装
++ * 用户首次提交被拒 → 状态与 marker 都没写成 → 下次冷启动观测完全相同 → 永久卡死,
++ * deposit 功能对新装用户根本无法启动。这不削弱 CODEX-001 本体:原始漏洞场景是
++ * 「先正常写到某代,再冷启动遇空清单」,那时 marker 已经在那次提交时写过,读回
++ * `found` + generation>0,照样判 distrusted 挡住。
++ */
++async function depositReadHighwaterMarker() {
++  const result = await fsReadResult(DEPOSIT_HIGHWATER_PATH)
++  if (result.status !== 'found') {
++    diagSkip(DIAG_SOURCE.deposit, 'deposit 冷启动 marker 无可信记录(未写过或读不出来),按首次启动处置(可信空态)')
++    return { kind: 'clean' }
++  }
++  let parsed
++  try {
++    parsed = JSON.parse(result.content)
++  } catch {
++    diagFail(DIAG_SOURCE.deposit, 'deposit 冷启动 marker 内容不是合法 JSON,按不可信处理')
++    return { kind: 'distrusted', reason: 'marker 内容不是合法 JSON' }
++  }
++  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || parsed.schema !== DEPOSIT_HIGHWATER_SCHEMA) {
++    diagFail(DIAG_SOURCE.deposit, 'deposit 冷启动 marker schema 不认识,按不可信处理')
++    return { kind: 'distrusted', reason: 'marker schema 不认识' }
++  }
++  if (!Number.isSafeInteger(parsed.generation) || parsed.generation < 0) {
++    diagFail(DIAG_SOURCE.deposit, 'deposit 冷启动 marker generation 不是非负安全整数,按不可信处理')
++    return { kind: 'distrusted', reason: 'marker generation 不是非负安全整数' }
++  }
++  if (parsed.generation === 0) {
++    diagOk(DIAG_SOURCE.deposit, 'deposit 冷启动 marker 确认可信空态: generation=0')
++    return { kind: 'clean' }
++  }
++  diagFail(
++    DIAG_SOURCE.deposit,
++    'deposit 冷启动 marker 记录本 profile 曾提交到 gen=' + parsed.generation + ',这次清单却报空——清单在撒谎,按不可信处理',
++  )
++  return { kind: 'distrusted', reason: 'marker 记录曾提交到 gen=' + parsed.generation }
++}
++
++/**
++ * 写 marker——只能在状态提交成功、棘轮推进**之后**调用(声明处见
++ * `handleDepositStateSave` 尾部,不对称论证见该处注释:宁可偏低,不可偏高)。
++ * 失败不得把已经成功的状态提交拖成失败——只降级为"下次冷启动可能识别不出本次
++ * 已提交",走 `diagFail` 留痕,调用方不看返回值、不重试、不阻塞。
++ */
++async function depositWriteHighwaterMarker(generation) {
++  const text = JSON.stringify({ schema: DEPOSIT_HIGHWATER_SCHEMA, generation })
++  const result = await fsWriteResult(DEPOSIT_HIGHWATER_PATH, text)
++  if (result.status === 'ok') {
++    diagOk(DIAG_SOURCE.deposit, 'deposit 冷启动 marker 已更新: generation=' + generation)
++    return
++  }
++  diagFail(
++    DIAG_SOURCE.deposit,
++    'deposit 冷启动 marker 写入未确认(' + result.status + '),下次冷启动可能识别不出本次已提交到 gen=' + generation,
++  )
++}
++
+ /**
+  * 纯读:候选发现 + 校验 + 同代合并(设计稿 §4.4.2/§4.4.3「加载规则」,十一轮恢复
+  * 合并)。单写者+进程内串行之下,同代出现 ≥2 份有效候选仍是不可达态——只能来自
+@@ -5307,6 +5402,22 @@ async function readDepositState() {
+ 
+   if (maxGen < 0) {
+     if (corrupt) diagFail(DIAG_SOURCE.deposit, 'deposit 候选文件全部无效(' + corrupt + ' 个),降级为缓存空')
++    // P05-CODEX-001(#297 P0.5 Wave B-1):这里此前直接把"没有任何有效候选"当可信
++    // 空态放行——棘轮归零的新进程与"清单静默变短"在这一支完全无法区分(上面那道
++    // `depositRatchetGeneration > 0 && maxGen < depositRatchetGeneration` 挡不住,
++    // 因为它的前提就是棘轮已经归零)。跨进程存活的 marker 补上这一段:marker 记着
++    // 更高的 generation 就是清单在撒谎,同样走 fail-closed(判定细节见
++    // `depositReadHighwaterMarker` 头注释)。
++    const marker = await depositReadHighwaterMarker()
++    if (marker.kind === 'distrusted') {
++      diagFail(
++        DIAG_SOURCE.deposit,
++        'deposit 候选清单为空(maxGen<0),但冷启动 marker 判定不可信(' +
++          marker.reason +
++          ')——fail-closed,按不可信处理拒绝在这份清单上线性前进',
++      )
++      return { payload: null, generation: 0, corrupt, missing: true, usedNames: [], distrusted: true }
++    }
+     return { payload: null, generation: 0, corrupt, missing: candidates.length === 0, usedNames: [] }
+   }
+   if (corrupt) diagFail(DIAG_SOURCE.deposit, 'deposit 候选文件解析失败 ' + corrupt + ' 个: 按 generation 更大的合法候选回退')
+@@ -5652,6 +5763,10 @@ async function handleDepositStateSave(msg) {
+   // 这是本进程唯一"确认刚刚真的写成功了什么"的时刻,不能提前或延后到别处推断。
+   depositRatchetGeneration = generation
+   depositRatchetFileName = fileName
++  // P05-CODEX-001(#297 P0.5 Wave B-1):跨进程存活的冷启动 marker,必须晚于棘轮
++  // 推进才写(偏低不偏高,不对称论证见 `depositReadHighwaterMarker` 头注释)——
++  // 不阻塞、不影响本次提交结果,写失败只降级为"下次冷启动可能识别不出本次已提交"。
++  await depositWriteHighwaterMarker(generation)
+   await depositRetireOldGenerations(generation) // 非阻塞:退休失败不影响本次提交结果
+   // F1:此刻磁盘上 gen=`generation` 只有这一份候选(单写者+进程内串行下不可能有
+   // 别的候选与它同代),"当前已合并内容"就是它自己——对应的 sum 已经是完整性哈希,
+diff --git a/src/__tests__/depositBrain.test.ts b/src/__tests__/depositBrain.test.ts
+index fc982ea1..d7210f3a 100644
+--- a/src/__tests__/depositBrain.test.ts
++++ b/src/__tests__/depositBrain.test.ts
+@@ -661,8 +661,11 @@ describe('deposit 状态 — fsList 静默变短的 fail-closed 棘轮补丁(P1
+ 
+     const writer = deposit.writer
+     // 提交被拒不落盘:磁盘上仍然只有第一次提交的那份候选状态文件,没有被覆盖,也
+-    // 没有新的候选状态文件出现。
+-    expect(brain.files.size).toBe(1)
++    // 没有新的候选状态文件出现——不变量本意是"没有新**候选**",不是"目录里一个文件
++    // 都没有":P05-CODEX-001(本段)起,首次成功提交会额外落一份 `highwater.json`
++    // marker,它不是候选,断言排除它后按候选文件计数,不受影响。
++    const candidateFiles = Array.from(brain.files.keys()).filter((name) => name !== `${deposit.dir}highwater.json`)
++    expect(candidateFiles).toHaveLength(1)
+     expect(brain.files.has(`deposit/state-00000001-${writer}.json`)).toBe(true)
+ 
+     // ①(C-1 验收):读侧仍必须拿得到真实内容,不是伪造的空态。
+@@ -709,7 +712,10 @@ describe('deposit 状态 — fsList 静默变短的 fail-closed 棘轮补丁(P1
+     })
+     expect(blocked.ok).toBe(false)
+     expect(blocked.conflict).toBeUndefined()
+-    expect(brain.files.size).toBe(1)
++    // 提交被拒不落盘:仍只有第一次提交的那份候选状态文件。同上,排除首次成功提交
++    // 顺带落下的 `highwater.json` marker(P05-CODEX-001,本段)——它不是候选。
++    const blockedCandidates = Array.from(brain.files.keys()).filter((name) => name !== `${deposit.dir}highwater.json`)
++    expect(blockedCandidates).toHaveLength(1)
+ 
+     // ①读侧仍返回真实内容(这次 list 同样静默变短,救援再次成功)。
+     const loaded = await deposit.stateLoad()
+@@ -839,7 +845,11 @@ describe('deposit 状态 — fsList 静默变短的 fail-closed 棘轮补丁(P1
+     // 是 `{payload:null, generation:0}` 破产态,在其上构造信封写到磁盘最高代等于
+     // 把真实内容永久埋掉,正是本 PR 要防的事故;`fsReadResult` 没有 `absent` 档,
+     // 也不允许拿"棘轮文件读不回来"去证明"内容真的没了"。fail-closed 原语义保留。
+-    expect(brain.files.size).toBe(0)
++    // 断言按"零新增候选状态文件"表达,不是"目录里一个文件都没有"——marker 是
++    // 第一次成功提交时写的,这次 save 被拒不会重写它,也不会删它,应当仍在。
++    const candidateFiles = Array.from(brain.files.keys()).filter((name) => name !== `${deposit.dir}highwater.json`)
++    expect(candidateFiles).toHaveLength(0)
++    expect(brain.files.has(`${deposit.dir}highwater.json`)).toBe(true)
+ 
+     const loadResult = await deposit.stateLoad()
+     expect(loadResult.ok).toBe(false)
+@@ -1096,7 +1106,10 @@ describe('deposit 状态 — list 明确报错的四种形状同样 fail-closed(
+       expect(second.ok).toBe(false)
+       // 关键:gen1 的文件必须**逐字节**原样保留(不只是"文件还在"——被覆盖后文件也还在)。
+       expect(brain.files.get(gen1Name)).toBe(gen1Bytes)
+-      expect(brain.files.size).toBe(1)
++      // 按候选状态文件计数(排除 CODEX-001 起首次成功提交额外落盘的 highwater.json
++      // marker)——不变量是"没有新候选",不是"目录里只有一个文件"。
++      const candidateFiles = Array.from(brain.files.keys()).filter((name) => name !== `${deposit.dir}highwater.json`)
++      expect(candidateFiles).toHaveLength(1)
+ 
+       // load 侧的判据是「绝不能把不完整清单包装成**可信的空**」。本 fixture 只改
+       // listReply,从不让 fsRead 落空,棘轮文件在上面的首次提交里刚写成功,一直在
+@@ -1162,7 +1175,10 @@ describe('deposit 状态 — list 明确报错分支的两个子决策各自需
+     })
+     expect(second.ok).toBe(false)
+     expect(second.conflict).toBeUndefined()
+-    expect(brain.files.size).toBe(0)
++    // 按候选状态文件计数(排除首次成功提交额外落盘的 highwater.json marker)——
++    // 没有新候选出现,不是"目录里一个文件都没有"。
++    const candidateFiles = Array.from(brain.files.keys()).filter((name) => name !== `${deposit.dir}highwater.json`)
++    expect(candidateFiles).toHaveLength(0)
+ 
+     const loaded = await deposit.stateLoad()
+     expect(loaded.ok).toBe(false)
+@@ -1259,6 +1275,182 @@ describe('deposit 状态 — list 明确报错分支的两个子决策各自需
+   })
+ })
+ 
++// P05-CODEX-001(#297 P0.5 Wave B-1):棘轮(depositRatchetGeneration)是纯内存
++// 变量,进程重启即归零——那一刻"清单报空"与"清单在撒谎"在观测上完全相同,上面
++// 整段 P1/BLOCKER 修复全都堵不住,因为它们的前提都是棘轮已经推进过。跨进程存活的
++// highwater marker(main.js `DEPOSIT_HIGHWATER_PATH`)补上这一段。
++describe('deposit 状态 — 冷启动 highwater marker(P05-CODEX-001,#297 P0.5 Wave B-1)', () => {
++  it('finding 本体:写到 gen3 后新进程冷启动遇空清单(list 静默变短)→ marker 判定不可信,load 与 save 均拒绝,不产生新的候选状态文件', async () => {
++    const producer = depositBrain()
++    const producerDeposit = producer.brain.handles.deposit
++    const markerPath = `${producerDeposit.dir}highwater.json`
++
++    let base = { baseGeneration: 0, baseSum: producerDeposit.emptyRevisionSum }
++    for (let step = 0; step < 3; step += 1) {
++      const result = await producerDeposit.stateSave({ ...base, state: JSON.stringify({ version: 1, map: {} }) })
++      expect(result).toMatchObject({ ok: true, generation: step + 1 })
++      base = { baseGeneration: result.generation ?? 0, baseSum: result.revisionSum ?? '' }
++    }
++
++    const markerText = producer.brain.files.get(markerPath)
++    expect(markerText).toBeTruthy()
++    expect(JSON.parse(String(markerText))).toMatchObject({ schema: 1, generation: 3 })
++
++    // 新进程冷启动:棘轮归零,且这次把 marker 之外的候选状态文件全部"抹掉"——
++    // 精确复现 fsList 子目录 readdir 抖动回一份 ok:true 的静默变短清单(真实内容
++    // 其实还在,只是这次读不到)那个观测,不需要额外的 listReply 注入。
++    const cold = depositBrain({ files: { [markerPath]: String(markerText) } })
++    const coldDeposit = cold.brain.handles.deposit
++
++    const loaded = await coldDeposit.stateLoad()
++    expect(loaded.ok).toBe(false)
++
++    const saved = await coldDeposit.stateSave({
++      baseGeneration: 0,
++      baseSum: coldDeposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { orphan: { hash: 'c'.repeat(32), ext: '.png', depositedAt: 9, from: 'artifact' } },
++      }),
++    })
++    expect(saved.ok).toBe(false)
++    expect(saved.conflict).toBeUndefined()
++
++    // 不产生 gen1 文件:冷启动进程唯一应该存在的文件仍然只是那份 marker。
++    const candidateFiles = Array.from(cold.brain.files.keys()).filter((name) => name !== markerPath)
++    expect(candidateFiles).toHaveLength(0)
++
++    const { spy, stop } = attachPanelBridge(cold.brain)
++    await flushMicrotasks()
++    stop()
++    expect(spy.find('冷启动 marker').length).toBeGreaterThan(0)
++  })
++
++  it('候选枚举实测确认不会把 marker 当候选解析:marker 与真实候选共存时 corrupt=0,marker 不进 unrecognized 留痕(S-1 兼容点 2)', async () => {
++    const { brain } = depositBrain()
++    const deposit = brain.handles.deposit
++
++    const first = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({ version: 1, map: {} }),
++    })
++    expect(first.ok).toBe(true)
++    expect(brain.files.has('deposit/highwater.json')).toBe(true)
++
++    const state = await deposit.readState()
++    // marker 若被误当协议候选解析,会因结构不合法(缺 gen/writer/sum/payload)被
++    // 记进 corrupt——必须是 0。
++    expect(state.corrupt).toBe(0)
++    expect(state.generation).toBe(1)
++
++    const { spy, stop } = attachPanelBridge(brain)
++    await flushMicrotasks()
++    stop()
++    // marker 不该触发"不符合当前协议命名"的 unrecognized 留痕。
++    expect(spy.find('不符合当前协议命名').length).toBe(0)
++  })
++
++  it('marker found 且 generation=0 → 判可信空态,首次提交能正常成功', async () => {
++    const { brain } = depositBrain({
++      files: { 'deposit/highwater.json': JSON.stringify({ schema: 1, generation: 0 }) },
++    })
++    const deposit = brain.handles.deposit
++
++    const result = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({ version: 1, map: {} }),
++    })
++    expect(result).toMatchObject({ ok: true, generation: 1 })
++  })
++
++  it('marker unresolved(全新安装,从未写过)+ 空清单 → 判可信空态,首次提交必须成功(护栏:防止后人把这一档顺手改成 fail-closed 造成自举死锁)', async () => {
++    const { brain } = depositBrain() // 不预置任何文件,包括 marker——精确模拟全新安装
++    const deposit = brain.handles.deposit
++
++    const result = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({ version: 1, map: {} }),
++    })
++    // 若这里判 distrusted,就是自举死锁:每个新装用户的第一次提交都会被永久拒绝
++    // ——状态与 marker 都没写成,下次冷启动观测完全相同,永远卡死。
++    expect(result).toMatchObject({ ok: true, generation: 1 })
++  })
++
++  describe('marker found 但内容非法 → fail-closed distrusted,不当作无 marker 的可信空态(S-4 ④裁决:与 gen>0 同一档,不折进 unresolved)', () => {
++    const INVALID_MARKERS: Array<[string, string]> = [
++      ['schema 不是 1', JSON.stringify({ schema: 2, generation: 5 })],
++      ['generation 是负数', JSON.stringify({ schema: 1, generation: -1 })],
++      ['generation 不是安全整数', JSON.stringify({ schema: 1, generation: 1.5 })],
++      ['generation 是字符串', JSON.stringify({ schema: 1, generation: '3' })],
++      ['内容是数组不是对象', JSON.stringify([1, 2, 3])],
++      ['JSON 解析失败', '{not valid json'],
++    ]
++
++    it.each(INVALID_MARKERS)('%s → load 与 save 均拒绝,不产生新的候选状态文件', async (_label, markerContent) => {
++      const { brain } = depositBrain({
++        files: { 'deposit/highwater.json': markerContent },
++      })
++      const deposit = brain.handles.deposit
++
++      const loaded = await deposit.stateLoad()
++      expect(loaded.ok).toBe(false)
++
++      const saved = await deposit.stateSave({
++        baseGeneration: 0,
++        baseSum: deposit.emptyRevisionSum,
++        state: JSON.stringify({ version: 1, map: {} }),
++      })
++      expect(saved.ok).toBe(false)
++
++      const candidateFiles = Array.from(brain.files.keys()).filter((name) => name !== `${deposit.dir}highwater.json`)
++      expect(candidateFiles).toHaveLength(0)
++    })
++  })
++
++  it('marker 写失败(宿主拒绝)不阻塞状态提交:提交仍返回 ok,marker 未被写出,diagFail 留痕(不得把成功的提交拖成失败)', async () => {
++    const { brain } = depositBrain({
++      writeOutcome: (request) => (request.path === 'deposit/highwater.json' ? 'reject' : undefined),
++    })
++    const deposit = brain.handles.deposit
++
++    const result = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({ version: 1, map: {} }),
++    })
++    // 状态字节已经落盘、棘轮已推进——这次提交必须仍算成功;marker 写失败只降级
++    // 为"下次冷启动可能识别不出本次已提交",不是"这次提交没发生"。
++    expect(result).toMatchObject({ ok: true, generation: 1 })
++    expect(brain.files.has('deposit/highwater.json')).toBe(false)
++
++    const { spy, stop } = attachPanelBridge(brain)
++    await flushMicrotasks()
++    stop()
++    expect(spy.find('冷启动 marker 写入未确认').length).toBeGreaterThan(0)
++  })
++
++  it('整代退休(K=3)不删 marker:高 generation 触发退休扫描后 marker 仍在,内容是最新一次成功提交的 generation(main.js `depositRetireOldGenerations` 靠 DEPOSIT_FILE_RE 天然不匹配 marker,这里补断言钉住,不能只靠"正则不匹配"这个事实不出测试)', async () => {
++    const { brain } = depositBrain()
++    const deposit = brain.handles.deposit
++
++    let base = { baseGeneration: 0, baseSum: deposit.emptyRevisionSum }
++    for (let step = 0; step < 4; step += 1) {
++      const result = await deposit.stateSave({ ...base, state: JSON.stringify({ version: 1, map: {} }) })
++      expect(result.ok).toBe(true)
++      base = { baseGeneration: result.generation ?? 0, baseSum: result.revisionSum ?? '' }
++    }
++
++    // K=3,generation=4,cutoff=4-3=1 → gen<=1 的候选状态文件已被整代退休删除;
++    // marker 不匹配 DEPOSIT_FILE_RE,退休扫描 continue 跳过它,必须仍在。
++    expect(brain.files.has(`deposit/state-00000001-${deposit.writer}.json`)).toBe(false)
++    expect(brain.files.has('deposit/highwater.json')).toBe(true)
++    expect(JSON.parse(String(brain.files.get('deposit/highwater.json')))).toMatchObject({ schema: 1, generation: 4 })
++  })
++})
++
+ // BLOCKER 2:棘轮救援此前直接 spread 候选 payload,漏掉了正常单候选路径会做的
+ // `depositEnforceMapPendingMutex`。一份**字段全合法**、但 `map` 与 `pendingReleases`
+ // 同时引用同一个 hash 的信封(既有 A1 测试覆盖的可达跨面板 CAS 重放残态)因此能带着

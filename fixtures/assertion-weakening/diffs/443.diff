@@ -1,0 +1,371 @@
+diff --git a/README.md b/README.md
+index 4913daa3..0262250a 100644
+--- a/README.md
++++ b/README.md
+@@ -75,11 +75,21 @@ bash cindyplugin/build.sh     # vite 构建 + 拷贝 ghost.json/main.js/icon/ski
+   不知道名字就无法精确直读)。归因:`fsList` 不提供枚举完整性保证,与设计稿
+   §4.4.2 已登记的 lifecycle fencing 缺口同族,详见设计稿 §4.4.2「残余边界·其二」
+   与 §11 仍开项 G。
+-- **进程内棘轮只是磁盘最大代的下界,不是上界**:一次写入若回执为 `indeterminate`
+-  (宿主回包丢失/非法,但没有抛错——`fsWriteResult` 的第三档),`fsWrite` 会把它折
+-  叠进 `false`,当前代码据此判定"本次提交未发生"而不推进棘轮。若那次写其实已经
+-  落盘,棘轮不会跟着前进;若随后一次 `fsList` 恰好静默变短、仍显示旧 gen,棘轮的
+-  探测条件(`maxGen < 棘轮`)不成立,fail-closed 不会触发,下一次提交会以同名文件
+-  覆盖那份本可被下一次健康 list 读回的内容。**本 PR 不实现写路径三态 reconcile**
+-  (机制本体已登记为后续段),这里只如实登记这一探测盲区,详见设计稿 §4.4.2「残余
+-  边界·其三」。
++- **~~进程内棘轮只是磁盘最大代的下界,不是上界~~(段 A round 2 登记,已由段 B 的写
++  路径三态 reconcile 闭合)**:段 A 提交点原用折叠成布尔的 `fsWrite`,`indeterminate`
++  (宿主回包丢失/非法,但没有抛错——`fsWriteResult` 的第三档)会被无差别折叠进
++  `false`,当作"本次提交未发生"而不推进棘轮,留下"棘轮不是上界"的探测盲区。段 B
++  改用 `fsWriteResult` + `depositReconcileWrite`,提交点直读同一物理路径核实真相,
++  按三支处置:①`found` 且内容与本次信封逐字节一致 → 这次提交**确实发生了**,按
++  成功放行,**棘轮正常推进到这一代**(不再是"不知道有没有落盘就不涨"那半);②
++  `found` 但内容不是本次信封(路径已被占据)→ 拒绝覆盖,该 generation **永久弃用**;
++  ③`unresolved`(直读也确认失败)→ 同样按最坏情况拒绝且永久弃用该 generation。②③
++  两支都推高 `depositIndeterminateFloor`,下一次提交的 generation 号取
++  `max(current.generation, 棘轮, depositIndeterminateFloor) + 1`,**保证永不复用
++  同一个物理文件名**——原始盲区的核心后果「同名 `fsWrite` 覆盖本可被读回的内容」
++  已不可能发生。**闭合到什么程度,如实说清**:③(`unresolved`)这一支如果那次写其实
++  真的落盘了,电子脑本身仍会把这次提交回执为失败(无法在当下确认成功)——这不是
++  数据丢失(单写者架构下,面板收到失败会用同一批意图重新提交,下一代内容等价或
++  是超集;那份不确定的旧内容也不会被复用的物理路径覆盖,永久弃用只是白白牺牲一个
++  generation 号),但确实多一次不必要的往返与一个永久浪费的编号,**这部分残留未消
++  除**。详见设计稿 §4.4.2「残余边界·其三」(已更新为同一结论)。
+diff --git a/ghost.json b/ghost.json
+index 7cef516a..fea2a8de 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.8",
++  "version": "0.9.9",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/main.js b/main.js
+index 72a8a5ac..856517ae 100644
+--- a/main.js
++++ b/main.js
+@@ -4425,6 +4425,26 @@ const DEPOSIT_WRITER = mintDepositWriter()
+ let depositRatchetGeneration = 0
+ let depositRatchetFileName = ''
+ 
++/**
++ * P05-CODEX-003(A-1)的第三个下限:上面两个变量只记「确认成功」的历史,这个变量
++ * 记「本 writer 已经尝试过、但结果不确定、必须永久弃用」的最高 generation——
++ * `(generation, DEPOSIT_WRITER)` 是文件名的纯函数,弃用一个 generation 号等于
++ * 弃用它唯一对应的那个物理路径,任何后续提交都不许算出同一个号再去写它
++ * (`fsWriteResult` 的 `indeterminate` 之后,`depositReconcileWrite` reconcile 不出
++ * "确实是我方这次内容"时就会推高这个下限——见该函数头注释)。同样只增不减、纯内存、
++ * 进程重启即丢。
++ *
++ * **边界(CA-P05-2 复审裁决,lead round 2 明确否决过一次误用)**:这个下限只在
++ * `current` 本身可信(`readDepositState` 未返回 `distrusted`)的分支里参与
++ * generation 运算,解决的是"避开被弃用的名字",基线仍然是刚刚重新读到的、可信的
++ * `current.generation`。**不得**把它当作 distrusted 破产态(`current.payload:null,
++ * generation:0`)下可以直接写盘的依据——`fsReadResult` 没有 `absent` 档,不允许
++ * 从"棘轮文件读不回来"推出"内容真的没了";在破产态基线上构造信封写到磁盘最高代,
++ * 等于把可能仍然真实存在的内容永久盖住,是本 PR 全部机制要防的事故本体,不是修复。
++ * distrusted 时唯一正确动作是 fail-closed 拒绝(`handleDepositStateSave` 顶部)。
++ */
++let depositIndeterminateFloor = 0
++
+ /**
+  * 棘轮救援:直读棘轮记住的文件名,**必须**再过一遍 `depositValidateCandidate` 同一套
+  * 结构/完整性/语义校验才采信——棘轮只提供「该读哪个文件名」的线索,不代替对内容的
+@@ -5410,6 +5430,62 @@ async function handleDepositStateLoad() {
+  * 的"同代并集超上限"诊断分支同步恢复(见下方硬上限检查),用不同措辞区分"这次超限
+  * 是合并态本身太大"还是"单一写者自己持续增长撞到的上限"。
+  */
++/**
++ * A-1(P05-CODEX-003)+ 加固清单第 1 类事务性 reconciliation:`fsWriteResult` 三态里
++ * `indeterminate`(回执丢了 / 协议对不上,不知道有没有落盘)绝不能直接当"没写成"
++ * ——必须精确读回刚写的那一个物理路径才知道真相,按实际观察结果分支处置:
++ *
++ *   ok            → 直接放行,调用方按成功继续。
++ *   rejected      → 宿主明确回 `ok:false`,确定没写成,按既有"未发生"语义处置。
++ *   indeterminate → reconcile(`fsReadResult` 精确读回同一路径):
++ *     found 且内容与本次信封逐字节一致 → 这次提交**确实发生了**,按成功放行;
++ *     found 但内容不是本次信封       → 这个物理路径已被别的东西占据,绝不覆盖,
++ *                                      这个 generation 号永久弃用;
++ *     unresolved                     → 实际状态不可观察,按最坏情况保守处置——
++ *                                      不得声称"未发生",也不得放行调用方复用
++ *                                      这个 generation 号(靠 `depositIndeterminateFloor`
++ *                                      做到,声明处有完整说明)。
++ *
++ * 后两支都会推高 `depositIndeterminateFloor`——这一个 generation 号从此在本进程
++ * 生命周期内永远不会再被派发,不管后续 `readDepositState` 怎么算 `current.generation`。
++ */
++async function depositReconcileWrite(writeResult, path, expectedText, generation, fileName) {
++  if (writeResult.status === 'ok') return { ok: true }
++  if (writeResult.status === 'rejected') {
++    // 写文件失败 = 本次提交未发生,上一代(仍是磁盘上 generation 最大的有效候选)完好。
++    // N3 如实表述:这不是笼统的"只丢缓存"——本次载荷若含新增/换指纹产生的
++    // from:'deposit' 条目,它背后是一份已经真实占了宿主配额的指纹,提交未发生 =
++    // 本地不再知道这份配额该由谁认领 = 配额孤儿风险(设计稿 §4.10.4;P1a 尚未接线
++    // 自动补偿,消费在 P1b)。只有 migration/capability/artifact/ledger 条目丢了才
++    // 是纯缓存损失,下次重算即可。
++    diagFail(DIAG_SOURCE.deposit, 'deposit 状态提交失败: 文件写入失败 gen=' + generation)
++    return { ok: false, response: { ok: false, message: 'deposit 状态文件写入失败' } }
++  }
++  const readBack = await fsReadResult(path)
++  if (readBack.status === 'found' && readBack.content === expectedText) {
++    diagOk(
++      DIAG_SOURCE.deposit,
++      'deposit 状态提交回执不确定(indeterminate),但直读同一路径确认内容确实是本次载荷,按成功处置: gen=' + generation,
++    )
++    return { ok: true }
++  }
++  depositIndeterminateFloor = Math.max(depositIndeterminateFloor, generation)
++  if (readBack.status === 'found') {
++    diagFail(
++      DIAG_SOURCE.deposit,
++      'deposit 状态提交回执不确定(indeterminate),直读同一路径发现内容并非本次载荷——该物理路径已被占据,' +
++        '拒绝覆盖,generation=' + generation + ' 永久弃用不再复用: file=' + fileName,
++    )
++    return { ok: false, response: { ok: false, message: 'deposit 状态提交结果不确定且路径已被占据,拒绝覆盖' } }
++  }
++  diagFail(
++    DIAG_SOURCE.deposit,
++    'deposit 状态提交回执不确定(indeterminate)且直读同一路径也确认失败(是否落盘不可知)——不当作未提交,' +
++      '按最坏情况处置,generation=' + generation + ' 永久弃用不再复用: file=' + fileName,
++  )
++  return { ok: false, response: { ok: false, message: 'deposit 状态提交结果不确定,拒绝在同一物理路径重试' } }
++}
++
+ async function handleDepositStateSave(msg) {
+   const raw = typeof msg.state === 'string' ? msg.state : ''
+   let parsed
+@@ -5517,8 +5593,15 @@ async function handleDepositStateSave(msg) {
+       revisionSum: currentSum,
+     }
+   }
++  // A-1(P05-CODEX-003,lead round 2 明确保留):这个下限同时纳入
++  // `depositIndeterminateFloor`——上一次提交若曾经写回执不确定且 reconcile 不出
++  // 结果,那次用过的 generation 号永久弃用,即使这次 `current.generation` 看起来
++  // 还没追上,也不能把它派发出去复用同一物理文件名。**注意边界**:这个 floor 只在
++  // 「`current` 本身可信」(不 distrusted)的分支里参与运算——它解决的是"避开被
++  // 弃用的名字",基线仍然是刚刚重新读到的、可信的 `current`;不得把它挪去
++  // distrusted 破产态下当作可以直接写盘的依据(那正是上面被否决的恢复设计)。
++  const generation = Math.max(current.generation, depositRatchetGeneration, depositIndeterminateFloor) + 1
+ 
+-  const generation = current.generation + 1
+   parsed.generation = generation // 顶层 generation 由电子脑写死,面板自报的值不作数
+   const fileName = 'state-' + String(generation).padStart(8, '0') + '-' + DEPOSIT_WRITER + '.json'
+ 
+@@ -5556,25 +5639,13 @@ async function handleDepositStateSave(msg) {
+     diagFail(DIAG_SOURCE.deposit, 'deposit 状态提交被拒: 信封 ' + depositByteLength(envelopeText) + ' 字节超过单次写入上限')
+     return { ok: false, message: 'deposit 状态超过单次写入上限' }
+   }
+-  const fileOk = await fsWrite(DEPOSIT_DIR + fileName, envelopeText)
+-  if (!fileOk) {
+-    // `fileOk===false` 覆盖两种不同的底层回执(见 `fsWriteResult`/`fsWrite` 声明处
+-    // :250-273):宿主明确拒绝(`rejected`,确定没落盘)与不抛错的 `indeterminate`
+-    // (回包非法但没抛错,**不知道有没有落盘**)——`fsWrite` 把后者也折叠进 `false`。
+-    // C-3(段 A round 2,①席 CA-P05A-5)如实收窄:本分支只能确定"面板视角里这次
+-    // 提交没有被确认成功",**不能**确定"磁盘上一代真的还完好、这次写真的什么都
+-    // 没发生"——若底层其实是 indeterminate 且恰好已经落盘,棘轮不会推进(见声明处
+-    // 补充),那份内容会变成一个此后 `maxGen === 棘轮` 时探测不到的同代幽灵。本段
+-    // 不实现该缺口的三态 reconcile(登记为后续段),这里只如实标注不确定性,不再
+-    // 断言"上一代完好"这个在 indeterminate 分支下无法保证的结论。
+-    // N3 如实表述:这不是笼统的"只丢缓存"——本次载荷若含新增/换指纹产生的
+-    // from:'deposit' 条目,它背后是一份已经真实占了宿主配额的指纹,提交未确认成功 =
+-    // 本地不再知道这份配额该由谁认领 = 配额孤儿风险(设计稿 §4.10.4;P1a 尚未接线
+-    // 自动补偿,消费在 P1b)。只有 migration/capability/artifact/ledger 条目丢了才
+-    // 是纯缓存损失,下次重算即可。
+-    diagFail(DIAG_SOURCE.deposit, 'deposit 状态提交失败: 文件写入未被确认成功 gen=' + generation)
+-    return { ok: false, message: 'deposit 状态文件写入失败' }
+-  }
++  // A-1(P05-CODEX-003):提交点必须区分「明确拒绝」与「回执不确定」两档,不能用
++  // 折叠成布尔的 `fsWrite`(其头注释:265-268 明写「需要区分三档的新路径直接用
++  // fsWriteResult」,deposit 提交点正是那条新路径)——`depositReconcileWrite` 按
++  // 该函数头注释的三支处置。
++  const writeResult = await fsWriteResult(DEPOSIT_DIR + fileName, envelopeText)
++  const settled = await depositReconcileWrite(writeResult, DEPOSIT_DIR + fileName, envelopeText, generation, fileName)
++  if (!settled.ok) return settled.response
+ 
+   diagOk(DIAG_SOURCE.deposit, 'deposit 状态已提交: gen=' + generation + ' writer=' + DEPOSIT_WRITER)
+   // 棘轮前进(声明处 `depositRatchetGeneration` 有完整说明):只在这一刻更新——
+diff --git a/src/__tests__/depositBrain.test.ts b/src/__tests__/depositBrain.test.ts
+index a230ff49..fc982ea1 100644
+--- a/src/__tests__/depositBrain.test.ts
++++ b/src/__tests__/depositBrain.test.ts
+@@ -863,6 +863,175 @@ describe('deposit 状态 — fsList 静默变短的 fail-closed 棘轮补丁(P1
+   })
+ })
+ 
++// ── P05-CODEX-003(A-1):写回执三态 reconciliation ───────────────────────────
++//
++// `main.js:5440` 的提交点此前用的是折叠成布尔的 `fsWrite`,把「宿主明确拒绝」
++// (rejected)与「回执丢了/协议对不上」(indeterminate)折叠成同一个 `false`——
++// 而 `indeterminate` 时字节可能已经真的落盘(brainHarness 的 `malformed`/`throw`
++// 档忠实模拟这一点)。实测复现:第一次 save 回 `ok:false` 但字节已落盘,短清单下
++// 第二次 save 复用同一物理路径把第一次那份不确定内容覆盖掉。
++//
++// 修法(`depositReconcileWrite`):`indeterminate` 时精确读回刚写的那个路径,按
++// 实际观察结果分三支——found+一致按成功放行、found+不一致拒绝覆盖、unresolved
++// 按最坏情况处置——后两支都推高 `depositIndeterminateFloor`,永久弃用那个
++// generation 号,不管后续 `current.generation` 怎么算,都不会被再派发一次。
++describe('deposit 状态 — 写回执三态 reconciliation(P05-CODEX-003 / A-1)', () => {
++  it('写回执明确拒绝(rejected)→ 按既有语义处置为"确定没写成",不进 depositIndeterminateFloor,下一次仍从同一个号重试', async () => {
++    let blockGen1 = true
++    const { brain } = depositBrain({
++      writeGuard: (request) => !(blockGen1 && request.path.startsWith('deposit/state-00000001-')),
++    })
++    const deposit = brain.handles.deposit
++    const writer = deposit.writer
++
++    const first = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({ version: 1, map: {} }),
++    })
++    expect(first.ok).toBe(false)
++    expect(brain.files.size).toBe(0)
++
++    blockGen1 = false
++    const retried = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:a': { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'artifact' } },
++      }),
++    })
++    // rejected 是"确定没写成"——同一个 generation 号(1)没有被弄脏,放行后立刻
++    // 就能重试成功,不需要跳号。
++    expect(retried).toMatchObject({ ok: true, generation: 1 })
++    expect(brain.files.has(`deposit/state-00000001-${writer}.json`)).toBe(true)
++  })
++
++  it('写回执不确定(indeterminate)但直读同一路径确认内容确实是本次载荷 → 按成功处置,棘轮真的前进(found 一致支)', async () => {
++    const { brain } = depositBrain({
++      writeOutcome: (request) => (request.path.startsWith('deposit/state-00000001-') ? 'malformed' : undefined),
++    })
++    const deposit = brain.handles.deposit
++    const writer = deposit.writer
++
++    const result = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:a': { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'artifact' } },
++      }),
++    })
++    // malformed:字节确实落盘(回包只是协议对不上,不是 {ok:boolean}),reconcile
++    // 直读同一路径发现内容与本次信封逐字节一致 → 按成功处置,不是"回执不是
++    // {ok:true} 就等于没写成"。
++    expect(result).toMatchObject({ ok: true, generation: 1 })
++    expect(brain.files.has(`deposit/state-00000001-${writer}.json`)).toBe(true)
++
++    // 棘轮确实前进了:下一次提交必须是 gen2,不是重复用 gen1——证明 ratchet 真的
++    // 推了,不是"侥幸这次也算成功但内部状态没变"。
++    const next = await deposit.stateSave({
++      baseGeneration: 1,
++      baseSum: result.revisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:b': { hash: 'b'.repeat(32), ext: '.png', depositedAt: 2, from: 'artifact' } },
++      }),
++    })
++    expect(next).toMatchObject({ ok: true, generation: 2 })
++  })
++
++  it('写回执不确定(indeterminate)且直读发现同一路径已被别的内容占据 → 拒绝覆盖,该 generation 永久弃用不复用(found 不一致支)', async () => {
++    const { brain } = depositBrain({
++      writeOutcome: (request) => (request.path.startsWith('deposit/state-00000002-') ? 'throw' : undefined),
++    })
++    const deposit = brain.handles.deposit
++    const writer = deposit.writer
++
++    const first = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:a': { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'artifact' } },
++      }),
++    })
++    expect(first).toMatchObject({ ok: true, generation: 1 })
++
++    // gen2 的物理路径上已经有"别的内容"占着——不是我们这次要写的信封,模拟"这个号
++    // 曾经被某次已经不可追溯的尝试写过点什么"。写入本身会抛错(landsOnThrow 默认
++    // false,不覆盖这份既有内容),reconcile 直读同一路径会看到它而不是本次信封。
++    const collisionPath = `deposit/state-00000002-${writer}.json`
++    brain.files.set(collisionPath, 'someone-else-was-here')
++
++    const second = await deposit.stateSave({
++      baseGeneration: 1,
++      baseSum: first.revisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:b': { hash: 'b'.repeat(32), ext: '.png', depositedAt: 2, from: 'artifact' } },
++      }),
++    })
++    expect(second.ok).toBe(false)
++    expect(second.conflict).toBeUndefined()
++    // 既有内容原样保留,没有被覆盖。
++    expect(brain.files.get(collisionPath)).toBe('someone-else-was-here')
++
++    // 下一次提交必须跳过 gen2(永久弃用),落到 gen3——不能再算出同一个号去撞它。
++    const third = await deposit.stateSave({
++      baseGeneration: 1,
++      baseSum: first.revisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:c': { hash: 'c'.repeat(32), ext: '.png', depositedAt: 3, from: 'artifact' } },
++      }),
++    })
++    expect(third).toMatchObject({ ok: true, generation: 3 })
++    expect(brain.files.has(`deposit/state-00000003-${writer}.json`)).toBe(true)
++  })
++
++  it('写回执不确定(indeterminate)且直读同一路径也确认失败(unresolved)→ 不当作未提交,该 generation 永久弃用,下一次提交不得复用同一物理路径(P05-CODEX-003 实测复现)', async () => {
++    const { brain } = depositBrain({
++      writeOutcome: (request) => (request.path.startsWith('deposit/state-00000001-') ? 'throw' : undefined),
++    })
++    const deposit = brain.handles.deposit
++    const writer = deposit.writer
++
++    // 冷启动首次提交:写入抛错(landsOnThrow 默认 false,字节没有真的落盘——但
++    // 电子脑不知道,回执丢了不代表没写成),reconcile 直读同一路径也读不回来
++    // (unresolved,`files` 里确实没有这个 key)。
++    const first = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:a': { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'artifact' } },
++      }),
++    })
++    expect(first.ok).toBe(false)
++    // 不当作"未提交"→ 没有任何新文件是符合这次场景的事实(bytes 确实没落盘),但
++    // 这个 generation 号(1)从此永久弃用——不是"回执不确定就等于确定没写成,
++    // 下次还能用回这个号"。
++    expect(brain.files.size).toBe(0)
++
++    // 下一次提交(短清单/冷启动视角下磁盘仍然是空的,baseGeneration/baseSum 仍然
++    // 声称"空")必须跳到 gen2,不能算出 gen1 再去写它——否则就是 P05-CODEX-003
++    // 实测复现的那个洞:第二次 save 复用同一物理路径,把第一次那份不确定内容
++    // (万一它其实真的落盘了)覆盖掉。
++    const second = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:b': { hash: 'b'.repeat(32), ext: '.png', depositedAt: 2, from: 'artifact' } },
++      }),
++    })
++    expect(second).toMatchObject({ ok: true, generation: 2 })
++    expect(brain.files.has(`deposit/state-00000001-${writer}.json`)).toBe(false)
++    expect(brain.files.has(`deposit/state-00000002-${writer}.json`)).toBe(true)
++  })
++})
++
+ // ── r2-deposit 二轮对抗审查 BLOCKER 1 / BLOCKER 2 返修 ─────────────────────────
+ //
+ // BLOCKER 1:上一版修复只覆盖 list **静默变短**(ok:true 但条目少 → maxGen < 棘轮 →

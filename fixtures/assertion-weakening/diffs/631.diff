@@ -1,0 +1,330 @@
+diff --git a/scripts/e2e/scenarios/mask-point.mjs b/scripts/e2e/scenarios/mask-point.mjs
+index 71b1323d..a952227b 100644
+--- a/scripts/e2e/scenarios/mask-point.mjs
++++ b/scripts/e2e/scenarios/mask-point.mjs
+@@ -481,15 +481,104 @@ export const runMaskPointScenario = async (context) => {
+       else surface.style.width = `${w}px`
+       return true
+     }, width)
++  // **提交窗口探针**(nightly 31528951093 的直接因果证据)。下面「等两帧再逐帧采样」的
++  // 断言天然跳过了竞态窗口:壳收窄后菜单会不会**在 RO 回调返回那一刻**仍带旧 offsetX,
++  // 等到第二帧就已经自愈、量不到了。所以这里在压窄**之前**装一个后注册的 ResizeObserver ——
++  // 同一批 RO 通知按注册顺序派发,产品的 hook 先跑,探针后跑,探针回调执行时正处在
++  // 「产品 RO 已返回、浏览器尚未 paint」这段窗口内,此刻读到的 --flip-offset-x 就是
++  // **首个可见帧真正会用的值**。
++  //  · 旧实现(RO → rAF schedule,或普通 setState 排微任务):此刻仍是上一轮的旧偏移;
++  //  · flushSync 实现:React 在产品 RO 回调返回前已同步提交,此刻必须是新世代值。
++  // 判据用「窗口内的值 === 稳定后的值」,不写死具体像素:窄壳几何随视口/字体变,写死会脆。
++  await page.evaluate(() => {
++    const menu = document.querySelector('.region-edit-model-menu')
++    const shell = menu?.closest('.canvas-shell')
++    if (!menu || !shell) return
++    const readOffset = () => getComputedStyle(menu).getPropertyValue('--flip-offset-x').trim()
++    // armed:observe() 自带一次**初始投递**(与压窄无关,报的是当前尺寸),必须先消化掉,
++    // 否则记到的是压窄前的旧状态。下面 arm() 在初始投递之后才打开记录。
++    window.__mivoFlipCommitProbe = { inWindow: null, fired: 0, armed: false }
++    const probe = new ResizeObserver(() => {
++      const state = window.__mivoFlipCommitProbe
++      if (!state.armed) return
++      state.fired += 1
++      // 只记第一次:那一次对应壳收窄这批通知,后续抖动不覆盖首帧证据。
++      if (state.inWindow === null) {
++        state.inWindow = readOffset()
++        const s = shell.getBoundingClientRect()
++        const a = document.querySelector('.region-edit-model-select')?.getBoundingClientRect()
++        state.diag = {
++          shellW: +s.width.toFixed(1),
++          shellL: +s.left.toFixed(1),
++          anchorL: a ? +a.left.toFixed(1) : null,
++          menuL: +menu.getBoundingClientRect().left.toFixed(1),
++          inlineOffset: menu.style.getPropertyValue('--flip-offset-x'),
++        }
++      }
++    })
++    // 观察壳:产品 hook 也观察它(resizeObserver.observe(shell)),且产品先注册 → 先派发。
++    probe.observe(shell)
++    window.__mivoFlipCommitProbeDisconnect = () => probe.disconnect()
++    window.__mivoFlipCommitProbeArm = () => {
++      window.__mivoFlipCommitProbe.armed = true
++    }
++  })
++  // 消化初始投递(两帧),再武装探针 —— 此后触发的都是壳收窄那批通知。
++  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))))
++  await page.evaluate(() => window.__mivoFlipCommitProbeArm?.())
+   if (!(await shellSqueeze(160))) {
+     throw new Error('P4-model: 找不到 .work-surface,无法构造窄壳位形')
+   }
+   // 等两帧:一帧给 ResizeObserver → rAF 重量,一帧给重量后的重排
+   await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))))
++  {
++    const probe = await page.evaluate(() => {
++      const menu = document.querySelector('.region-edit-model-menu')
++      const state = window.__mivoFlipCommitProbe
++      window.__mivoFlipCommitProbeDisconnect?.()
++      if (!menu || !state) return null
++      const s = menu.closest('.canvas-shell')?.getBoundingClientRect()
++      const a = document.querySelector('.region-edit-model-select')?.getBoundingClientRect()
++      const m = menu.getBoundingClientRect()
++      const round = (r) => (r ? { l: +r.left.toFixed(1), r: +r.right.toFixed(1), w: +r.width.toFixed(1) } : null)
++      return {
++        fired: state.fired,
++        inWindow: state.inWindow,
++        diag: state.diag,
++        settled: getComputedStyle(menu).getPropertyValue('--flip-offset-x').trim(),
++        settledShellW: s ? +s.width.toFixed(1) : null,
++        settledRects: { shell: round(s), anchor: round(a), menu: round(m) },
++      }
++    })
++    if (!probe) {
++      throw new Error('P4-model: 提交窗口探针未装上,无法验证首帧偏移已同步提交')
++    }
++    if (probe.fired === 0) {
++      throw new Error('P4-model: 提交窗口探针未触发,窄壳未产生 ResizeObserver 通知')
++    }
++    // 无条件打印提交窗口的三个矩形与 offset 输入(不只在失败时)。窄壳竞态的归因判据是
++    // 「窗口内 shell / anchor / menu 分别处在哪个布局世代」,绿的时候也必须留下这份读数 ——
++    // 否则修好之后就再没有证据说明当初到底是哪一种失配,回归时也无从对照。
++    console.log(
++      `[mask-point] flip-commit-window fired=${probe.fired} inWindow=${JSON.stringify(probe.inWindow)} ` +
++        `settled=${JSON.stringify(probe.settled)} windowDiag=${JSON.stringify(probe.diag)} ` +
++        `settledRects=${JSON.stringify(probe.settledRects)}`,
++    )
++    if (probe.inWindow !== probe.settled) {
++      throw new Error(
++        `P4-model: RO 回调返回时 --flip-offset-x 尚未提交(首帧会带旧偏移): ` +
++          `窗口内=${probe.inWindow} 稳定后=${probe.settled} ` +
++          `diag=${JSON.stringify(probe.diag)} settledShellW=${probe.settledShellW}`,
++      )
++    }
++  }
+   // 逐帧采样:窄壳收窄后菜单不许出现"飘出壳外一帧、下一帧自愈"的瞬态。
+-  // 这是 SC-2 的逐帧回归断言 —— useRegionEditFlip 的 measure() 必须强制同步布局,
+-  // 使 anchor 与 shell 落在同一布局世代(否则 offsetX 按旧 anchorLeft 求值 → -624)。
+-  // 反向变异(去掉 offsetHeight flush)会在这里红,而不是靠整条场景偶发。
++  // 根因是 useRegionEditFlip 原先把重量排进 rAF —— 同一次壳尺寸变化里它既读到旧世代的
++  // anchor 屏幕位置(RegionEditOverlay 写 anchor 内联位置的 setState 尚未提交),又要等
++  // 下一帧才写出 --flip-offset-x,首个可见帧因此用未修正的偏移画菜单。修法是
++  // useRegionEditFlip 的 measureSync(flushSync 直出):既冲掉待提交的 anchor 位置、
++  // 使读到的 anchor 与 shell 同世代,也让偏移在本批通知内提交。反向变异(把 measureSync
++  // 换回 schedule)会在上面那条提交窗口探针先红,这里兜住"渲染真的飘出去"这一面。
+   {
+     const sampled = await page.evaluate(async () => {
+       const samples = []
+diff --git a/src/canvas/useRegionEditFlip.test.tsx b/src/canvas/useRegionEditFlip.test.tsx
+index 71ed171a..6e0bb1e2 100644
+--- a/src/canvas/useRegionEditFlip.test.tsx
++++ b/src/canvas/useRegionEditFlip.test.tsx
+@@ -227,7 +227,7 @@ describe('useRegionEditFlip — 首测与重测', () => {
+     expect(placement.flipped, '兜底若退回 0,这里会误判成"向下放得下"').toBe(true)
+   })
+ 
+-  it('打开期间**面板被重摆**(内联 style 变)→ 重测,方向不留陈旧', () => {
++  it('打开期间**面板被重摆**(内联 style 变)→ 立即同步重测,不必等下一帧', async () => {
+     render(true)
+     flushFrames()
+     expect(placement.flipped).toBe(false) // 40 高,向下装得下
+@@ -236,18 +236,16 @@ describe('useRegionEditFlip — 首测与重测', () => {
+     // 没有 scroll/resize,但 computeFloatingControls 会重写面板的内联 left/top。
+     geom.anchor = { top: 590, bottom: 598 } // 锚被推到贴底
+     const panel = container.querySelector('[data-anchor]') as HTMLElement
+-    act(() => {
++    // MutationObserver 是微任务派发;面板重摆现在走 measureSync(flushSync),微任务
++    // 一到就已经提交,不必再像早期版本那样多等一帧 rAF —— act(async) 包住这次微任务落地。
++    await act(async () => {
+       panel.setAttribute('style', 'top: 590px')
++      await Promise.resolve()
+     })
+-    // MutationObserver 是微任务派发,等一轮再跑 rAF
+-    return Promise.resolve().then(() => {
+-      expect(rafQueue.length).toBeGreaterThan(0)
+-      flushFrames()
+-      expect(placement.flipped, '锚贴底后必须翻上去').toBe(true)
+-    })
++    expect(placement.flipped, '锚贴底后必须立即同步翻上去').toBe(true)
+   })
+ 
+-  it('resize 触发重测(壳变矮 → 原本装得下的变装不下)', () => {
++  it('resize 触发同步重测(壳变矮 → 原本装得下的变装不下,不必等 rAF)', () => {
+     render(true)
+     flushFrames()
+     expect(placement.flipped).toBe(false)
+@@ -256,19 +254,24 @@ describe('useRegionEditFlip — 首测与重测', () => {
+     act(() => {
+       window.dispatchEvent(new Event('resize'))
+     })
+-    flushFrames()
+-    expect(placement.flipped).toBe(true)
++    // resize 现在走 measureSync(flushSync),act() 一返回就已经提交,不需要再 flushFrames()。
++    expect(placement.flipped, '同步路径下这里不该还需要 flushFrames() 才看到新位形').toBe(true)
+   })
+ 
+-  it('一帧内多个触发源只量一次(rAF 合并)', () => {
++  it('scroll 仍走 rAF 合并;resize 已改走同步,不再进队列', () => {
+     render(true)
+     flushFrames()
+     act(() => {
+-      window.dispatchEvent(new Event('resize'))
+-      window.dispatchEvent(new Event('resize'))
++      window.dispatchEvent(new Event('scroll'))
+       window.dispatchEvent(new Event('scroll'))
+     })
+-    expect(rafQueue.length).toBe(1)
++    expect(rafQueue.length, 'scroll 保持 rAF 合并:一帧内多次只排一次').toBe(1)
++    flushFrames()
++
++    act(() => {
++      window.dispatchEvent(new Event('resize'))
++    })
++    expect(rafQueue.length, 'resize 现在走 measureSync,不进 rAF 队列').toBe(0)
+   })
+ 
+   // 席① S1:原来那句「抖动由调用方滞回处理」是**假的**(没有任何滞回)。真正的理由是
+@@ -356,6 +359,24 @@ describe('useRegionEditFlip — 首测与重测', () => {
+     expect(placement.maxWidth, '壳被观察到变窄后必须重量').toBe(296)
+   })
+ 
++  // mask-point 窄壳首帧竞态(#297 nightly 31528951093)的修复点**只在本 hook**:
++  // measure() 原先一律靠 schedule() 走 rAF,而 ResizeObserver 通知在同一次
++  // "update the rendering" 里发生在 rAF 回调**之后** —— 在 RO 回调里新排的 rAF 落不进
++  // 本帧,只能等下一帧。所以壳收窄那一批通知返回时 --flip-offset-x/--flip-cap 还没写,
++  // 首个可见帧就用未修正的偏移画菜单。真实浏览器 e2e 的"提交窗口探针"
++  // (scripts/e2e/scenarios/mask-point.mjs)当场抓到:RO 回调返回时 inWindow 是空字符串,
++  // 稳定后却是 -13px。
++  //
++  // 「读到旧 anchor」那一半也由同一个 flushSync 解掉:RegionEditOverlay 的
++  // computeFloatingControls 写 anchor 内联位置走的是 setState,在 RO 回调里尚未提交;
++  // flushSync 会把它一并冲掉,measure 因此读到与 shell 同世代的 anchor。三组实测对照
++  // (工作树逐一回退验证,均以上述探针为判据):base 两侧都不改 → leafer/dom 各 3/3 红,
++  // 窗口内 anchorLeft=661 而壳已是 0..160;只改本文件 → leafer/dom 各 3/3 绿,窗口内
++  // anchorLeft 已是新世代的 25、offset 已提交为 -13px;反过来只在 RegionEditOverlay 侧
++  // 加 flushSync 而本文件不改 → 3/3 红(anchor 是新的,但 offset 仍未提交)。
++  // 结论:RegionEditOverlay 侧不需要改动,同步提交只需落在本 hook。
++  // 三个同步触发源(ResizeObserver / window resize / 面板重摆的 MutationObserver)与
++  // 「scroll 维持 rAF 合并」由本文件下面那组用例钉住。
+   // 席① R4-S1':横向进模型之后,「入参与位形无关」这条旧论证**不再成立** —— maxWidth 落成
+   // 内联 max-width → 换行变多 → scrollHeight 变大,blockHeight 依赖本函数自己的输出。
+   // 新论证是**分级收敛**(见 regionEditFlip 头注),这条用例把两级都钉住:
+diff --git a/src/canvas/useRegionEditFlip.ts b/src/canvas/useRegionEditFlip.ts
+index 44aa1e70..5684446d 100644
+--- a/src/canvas/useRegionEditFlip.ts
++++ b/src/canvas/useRegionEditFlip.ts
+@@ -1,6 +1,7 @@
+ // 二级浮层包含性的**测量与触发源**(PR-3 R1 M-B → R2 一次重写)。位形求解是纯函数
+ // solveFlipPlacement,见 regionEditFlip;这里只负责「什么时候重量」与「量什么」。
+ import { useEffect, useState, type RefObject } from 'react'
++import { flushSync } from 'react-dom'
+ 
+ import { solveFlipPlacement, type FlipAlign, type FlipPlacement } from './regionEditFlip'
+ 
+@@ -64,19 +65,29 @@ const naturalHeight = (block: HTMLElement): number =>
+ /**
+  * 量浮层相对画布壳的位置,返回位形(方向 + 需要时的高度上限)。
+  *
+- * **单一 remeasure + 多触发源注册表**(R2 要求:别一个事件一个补丁)。注册的触发源:
+- *  · 打开那一刻的首测(rAF,等这一帧布局落定);
+- *  · window resize —— 壳的边界变了;
+- *  · window scroll(capture 相)—— 页面/任意祖先滚动器滚动会平移壳与锚;
++ * **单一 remeasure + 多触发源注册表**(R2 要求:别一个事件一个补丁)。注册的触发源,
++ * 按是否必须在**当前这批 ResizeObserver 通知内**就把结果提交分两组(#297 nightly
++ * 31528951093:壳收窄那一批通知里,本 hook 原先把重量排进 rAF,offset 要等下一帧才写,
++ * 首个可见帧因此拿到未修正的偏移。见下方 measureSync 头注与 useRegionEditFlip.test.tsx
++ * 对应用例):
++ *
++ * **同步(measureSync,flushSync 直出,不进 rAF 队列)**——这些都可能与
++ * RegionEditOverlay 重摆浮层(computeFloatingControls 写 anchor 内联位置)命中同一次
++ * 壳尺寸变化,消费者算出来的修正值必须在本批通知内提交,不能等下一帧:
+  *  · block / anchor / **shell** 三者的 ResizeObserver —— 报错文案变长、锚尺寸变化,
+  *    以及**壳在 window resize 之外变宽窄**(侧栏开合就是这条路);
++ *  · window resize —— 壳的边界变了;
+  *  · anchor 与它所属浮层面板的 style 属性 MutationObserver —— **面板被重摆**。
+  *    这一条堵的是席② R2 给的可达路径:菜单开着时用 wheel / Cmd-wheel 平移缩放画布,
+  *    全程没有 pointerdown(点外关闭不触发)、也没有 scroll/resize 事件,
+  *    computeFloatingControls 却会把两块面板的内联 left/top 重写 —— 锚移了而方向陈旧。
+  *    面板位置就是写在 style 上的,观察 style 变化即可覆盖平移与缩放两种手势。
+  *
+- * 所有触发源汇到同一个 schedule(),用 rAF 合并:一帧内多个源同时响也只量一次。
++ * **仍走 rAF 合并(schedule())**——这两个没有同帧压力:
++ *  · 打开那一刻的首测(effect 本就在 paint 之后才跑,提前与否不影响正确性,
++ *    也不会撞上重摆浮层那次几何变化);
++ *  · window scroll(capture 相)—— 页面/任意祖先滚动器滚动只平移壳与锚,两者差值不变,
++ *    同步没有收益,高频滚动逐次 flush 反而是浪费。
+  */
+ export function useRegionEditFlip(
+   blockRef: RefObject<HTMLElement | null>,
+@@ -100,11 +111,13 @@ export function useRegionEditFlip(
+     let frame = 0
+     const measure = () => {
+       frame = 0
+-      // 先强制同步布局,再读 rect:React 的内联 style 写入与浏览器的几何重排异步,
+-      // 壳收窄时 shell 可能已按新世代重排、而 anchor 还停在旧世代(见 mask-point 窄壳
+-      // 竞态:offsetX 按旧 anchorLeft 求值 → 菜单飘出壳一帧)。读 offsetHeight 会 flush
+-      // 所有待处理的 style 变更与布局,使 anchor 与 shell 落在同一布局世代。
+-      // 显式 void:读取 offsetHeight 只为强制同步布局,返回值不用。
++      // 强制走一次同步布局,让刚提交的 style 变化落进接下来的 getBoundingClientRect 读数。
++      // **它只 flush 布局,不 flush React 待提交的 state** —— 所以单靠它堵不住窄壳竞态:
++      // 实测 base 上这行本就在,而提交窗口内读到的 anchorLeft 仍是旧世代的 661
++      // (壳已经是 0..160)。让 anchor 同世代的是下面 measureSync 里的 flushSync ——
++      // 它会把 React 上待提交的工作(含 RegionEditOverlay 写 anchor 内联位置那次 setState)
++      // 一并冲掉,measure 才读到新世代的 25。两件事别混:这行管布局算完没,
++      // 那个管 React 提交了没。
+       void block.offsetHeight
+       const anchorRect = anchor.getBoundingClientRect()
+       const shellRect = shell.getBoundingClientRect()
+@@ -140,12 +153,36 @@ export function useRegionEditFlip(
+       if (frame) return
+       frame = requestAnimationFrame(measure)
+     }
++    // 同帧提交(#297 nightly 31528951093 的唯一修复点)。规范里同一次 "update the
++    // rendering" 循环内,rAF 回调先于 ResizeObserver 通知派发 —— RO 回调里新排的 rAF
++    // 落不进本帧,只能等下一帧。所以窄壳那一批通知返回时 --flip-offset-x/--flip-cap
++    // 还没写,首个可见帧就用未修正的偏移画菜单(真实浏览器 e2e 的"提交窗口探针"当场抓到:
++    // RO 回调返回时 inWindow 仍是空字符串,而稳定后是 -13px)。
++    //
++    // flushSync 同时解掉「读到旧 anchor」那一半:它会把 React 上待提交的工作(含
++    // RegionEditOverlay 的 computeFloatingControls 写 anchor 内联位置那次 setState)
++    // 一并冲掉,measure 因此读到与 shell 同世代的 anchor。三组对照实测(base / 只修本文件 /
++    // 只在 RegionEditOverlay 侧加 flushSync):只修本文件 leafer+dom 各 3/3 绿且窗口内
++    // anchorLeft 已是新世代的 25;只修 RegionEditOverlay 侧 3/3 红(anchor 是新的但 offset
++    // 没提交)。所以修复点在这里,RegionEditOverlay 侧不需要动。
++    //
++    // 收编在途的 rAF 帧,避免同步跑完之后下一帧又空转着多量一次。
++    const measureSync = () => {
++      if (frame) {
++        cancelAnimationFrame(frame)
++        frame = 0
++      }
++      flushSync(measure)
++    }
+ 
+     schedule()
+-    window.addEventListener('resize', schedule)
+-    // capture 相:祖先里任意滚动器滚动都要重量(scroll 不冒泡到 window)。
++    window.addEventListener('resize', measureSync)
++    // capture 相:祖先里任意滚动器滚动都要重量(scroll 不冒泡到 window)。纯平移,anchor
++    // 与 shell 的差值不变,没有同帧提交的压力,维持 rAF 合并。
+     window.addEventListener('scroll', schedule, { capture: true, passive: true })
+-    const resizeObserver = new ResizeObserver(schedule)
++    // 这三路都在壳尺寸变化那一批通知里,必须同步提交(读到的 anchor 世代与提交时机都由
++    // measureSync 的 flushSync 一并解决),不再靠 rAF 合并。
++    const resizeObserver = new ResizeObserver(measureSync)
+     resizeObserver.observe(block)
+     resizeObserver.observe(anchor)
+     // **壳自己**也要观察(R4 席②第 4 问):壳在 window resize 之外变宽窄的路径是**侧栏开合**。
+@@ -155,7 +192,7 @@ export function useRegionEditFlip(
+     // 而壳的横向边界**已经变了**。直接观察壳把这个洞堵死。
+     resizeObserver.observe(shell)
+     // 面板重摆:位置写在内联 style 上,ResizeObserver 不响(尺寸没变),必须看属性变化。
+-    const styleObserver = new MutationObserver(schedule)
++    const styleObserver = new MutationObserver(measureSync)
+     const panel = anchor.closest('.region-edit-panel')
+     for (const node of new Set<Element>([anchor, ...(panel ? [panel] : [])])) {
+       styleObserver.observe(node, { attributes: true, attributeFilter: ['style'] })
+@@ -163,7 +200,7 @@ export function useRegionEditFlip(
+ 
+     return () => {
+       if (frame) cancelAnimationFrame(frame)
+-      window.removeEventListener('resize', schedule)
++      window.removeEventListener('resize', measureSync)
+       window.removeEventListener('scroll', schedule, { capture: true })
+       resizeObserver.disconnect()
+       styleObserver.disconnect()

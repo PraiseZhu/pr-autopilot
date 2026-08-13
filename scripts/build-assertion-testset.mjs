@@ -107,23 +107,51 @@ function main() {
     if (n) negatives.push(n);
   }
 
-  // 复制 diff 文件
-  for (const pr of [...positives, ...negatives]) {
-    const diffPath = join(diffsDir, `${pr.number}.diff`);
-    if (!existsSync(diffPath)) {
+  // 从 git 历史查找 PR commit 的 SHA
+  function findPrCommitSha(prNumber) {
+    for (const pattern of [`(#${prNumber})`, `#${prNumber}`]) {
       try {
-        // 尝试用 git merge-base 获取 diff
-        try {
-          const mergeBase = execFileSync('git', ['-C', MIVO, 'merge-base', `${pr.number}^`, `${pr.number}`], { encoding: 'utf8', timeout: 10000 }).trim();
-          const diff = execFileSync('git', ['-C', MIVO, 'diff', mergeBase, `${pr.number}`], { encoding: 'utf8', timeout: 10000 });
-          if (diff.trim()) writeFileSync(diffPath, diff);
-        } catch {
-          // 尝试用 show 获取
-          const diff = execFileSync('git', ['-C', MIVO, 'show', `${pr.number}`, '--format=diff', '--no-stat'], { encoding: 'utf8', timeout: 10000 });
-          if (diff.trim()) writeFileSync(diffPath, diff);
-        }
+        const sha = execFileSync('git', ['-C', MIVO, 'log', '--all', '--grep', pattern, '--format=%H', '-1'], { encoding: 'utf8', timeout: 15000 }).trim();
+        if (sha) return sha;
+      } catch { /* 下一种 pattern */ }
+    }
+    return null;
+  }
+
+  // 提取单个 PR 的 diff 文件
+  function extractDiffFile(prNumber) {
+    const diffPath = join(diffsDir, `${prNumber}.diff`);
+    if (existsSync(diffPath)) return true;
+
+    const sha = findPrCommitSha(prNumber);
+    if (!sha) return false;
+
+    // 对 merge commit: diff 第一个 parent 就是 PR 全量改动
+    try {
+      const diff = execFileSync('git', ['-C', MIVO, 'diff', `${sha}^`, sha], { encoding: 'utf8', timeout: 15000 });
+      if (diff.trim()) { writeFileSync(diffPath, diff); return true; }
+    } catch {
+      // fallback: git show
+      try {
+        const diff = execFileSync('git', ['-C', MIVO, 'show', sha, '--format='], { encoding: 'utf8', timeout: 15000 });
+        if (diff.trim()) { writeFileSync(diffPath, diff); return true; }
       } catch {}
     }
+    return false;
+  }
+
+  // 复制 diff 文件
+  for (const pr of [...positives, ...negatives]) {
+    extractDiffFile(pr.number);
+  }
+
+  // 关键 PR 必须能抽出 diff
+  const requiredPRs = [382, 410];
+  const missingRequired = requiredPRs.filter(n => !existsSync(join(diffsDir, `${n}.diff`)));
+  if (missingRequired.length > 0) {
+    process.stderr.write(`[FATAL] 关键 PR 的 diff 无法从 git 历史抽出: #${missingRequired.join(', #')}\n`);
+    process.stderr.write(`  确认 mivo-canvas 仓 (${MIVO}) 包含这些 PR 的 merge commit\n`);
+    process.exit(2);
   }
 
   // 正负样本都只保留 hasDiff===true 的条目

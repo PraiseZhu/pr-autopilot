@@ -1,0 +1,1451 @@
+diff --git a/build.sh b/build.sh
+index 326a98a3..5af25299 100755
+--- a/build.sh
++++ b/build.sh
+@@ -20,4 +20,39 @@ cp -R cindyplugin/skills cindyplugin/dist/skills
+ cp -R public/stickers cindyplugin/dist/stickers
+ cp -R public/demo-assets cindyplugin/dist/demo-assets
+ 
++# ── 摄取 token 注入(2026-08-10 #591 P1 返修)──────────────────────────────────
++# main.js 的 `DEBUG_INGEST_TOKEN_FROM_BUILD` 是唯一注入点(未配置 = 空串,守卫
++# fail-closed 零出网)。发布构建从这里把 `MIVO_DEBUG_INGEST_TOKEN` 环境变量的值
++# 替换进 dist 副本 —— 发布路径机械可执行,不靠人手改源码常量;不配置就保持空串,
++# 守卫照常 fail-closed(发布但忘了配 token 时,日志静默不流失,drop 计数可查)。
++# 变量为空时(未设置/空值)**不注入**,保持空串。
++if [[ -n "${MIVO_DEBUG_INGEST_TOKEN:-}" ]]; then
++  # 注入编码与单测 `injectToken` 同一套:node JSON.stringify 产出双引号 JS 字面量,
++  # 引号/反斜杠/换行等任意字符都转义回原值 —— 不用 perl 的 \Q…\E:它会把换行转成
++  # `\`+换行(JS 行继续符),语法合法但值被静默改写(abc\ndef → abcdef),请求头 token
++  # 与配置不一致 → 全部 403;且同一输入测试(JSON 编码)绿、真实构建坏(审查者 greptile
++  # 指出,2026-08-10)。只锚定行首的注入点行(未配置形态),不误伤其它行。
++  MIVO_DEBUG_INGEST_TOKEN="$MIVO_DEBUG_INGEST_TOKEN" node -e '
++    const fs = require("fs")
++    const file = "cindyplugin/dist/main.js"
++    const anchor = /^const DEBUG_INGEST_TOKEN_FROM_BUILD = .*$/m
++    const src = fs.readFileSync(file, "utf8")
++    if (!anchor.test(src)) {
++      console.error("ERROR: MIVO_DEBUG_INGEST_TOKEN 注入失败:dist/main.js 找不到注入点行(const DEBUG_INGEST_TOKEN_FROM_BUILD)。")
++      process.exit(1)
++    }
++    const line = "const DEBUG_INGEST_TOKEN_FROM_BUILD = " + JSON.stringify(process.env.MIVO_DEBUG_INGEST_TOKEN)
++    // 用函数替换器而非字符串替换串:replace 的字符串替换会把 $&、$加反引号、$加单引号
++    // 等序列当模板展开,含这些序列的 token 会被静默改写(审查者 greptile P1,2026-08-10)。
++    fs.writeFileSync(file, src.replace(anchor, () => line))
++  '
++  # 注入必须真的发生:若注入点行仍是空串(格式漂移/常量改名),fail loudly,
++  # 不让"配了 token 却零出网"的包静默出产。
++  if grep -q "^const DEBUG_INGEST_TOKEN_FROM_BUILD = ''" cindyplugin/dist/main.js; then
++    echo "ERROR: MIVO_DEBUG_INGEST_TOKEN 注入失败:dist/main.js 的注入点未被替换(仍为空串)。" >&2
++    echo "       检查 main.js 是否仍保留 'const DEBUG_INGEST_TOKEN_FROM_BUILD = ...' 行。" >&2
++    exit 1
++  fi
++fi
++
+ echo "OK: cindyplugin/dist 就绪,可用 ghost_forge_pack 打包"
+diff --git a/ghost.json b/ghost.json
+index c1534eea..e8ce53e1 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.27",
++  "version": "0.9.28",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+@@ -24,7 +24,8 @@
+   "network": {
+     "hosts": [
+       "aigc.xindong.com",
+-      "*.aliyuncs.com"
++      "*.aliyuncs.com",
++      "mivo-canvas.dsworks.cn"
+     ],
+     "secrets": [
+       {
+@@ -35,7 +36,10 @@
+         "url": "https://aigc.xindong.com/",
+         "inject": {
+           "header": "Authorization",
+-          "format": "Bearer {value}"
++          "format": "Bearer {value}",
++          "hosts": [
++            "aigc.xindong.com"
++          ]
+         },
+         "exchange": {
+           "url": "https://aigc.xindong.com/api/v1/state/token",
+diff --git a/main.js b/main.js
+index 0af127a7..f9e08f4d 100644
+--- a/main.js
++++ b/main.js
+@@ -6855,9 +6855,180 @@ async function handleDepositStateSave(msg) {
+   return { ok: true, generation, revisionSum: sum }
+ }
+ 
++// ── debug log 回传 relay(v3)─────────────────────────────────────────────────
++//
++// 面板把 warning/error 级 debug log 交给这里,经 network 槽代发到生产 BFF。
++// 完整设计:docs/plans/2026-08-06-cindyplugin-silent-debug-log.md
++//
++// 三条与本仓其它 handler **刻意不同**的地方,每条都有非风格性的理由:
++//
++// ① **不进 chain**:relay 会挂到网络超时(20s 级)。占用 chain 就等于让一次网络悬挂
++//    卡住画布 save/load —— 诊断功能拖垮主功能是不可接受的。与 gen-image / deposit /
++//    release 同款处理(各自独立 single-flight)。
++//
++// ② **不调 diagOk / diagSkip / diagFail**:diag 事件经 mivo-canvas-diag 回流到面板的
++//    debugLogger,而 warn/error 会被 reporter 再次上报 —— "上报失败 → 记一条 error →
++//    又去上报 → 又失败" 是个自激励死循环。src/store/remoteDebugReporter.ts 的 `logLocal`
++//    是同一问题的既有先例(直写 store、绕开 debugLogger)。这里连 diag 都不发,只用
++//    宿主侧 console(归宿主日志,不进面板、不进上报链)。
++//    docs/development-logging.md 的强制范围是"user-facing feature flows"与按钮/菜单/
++//    画布动作等,本路径零 UI、纯诊断基建,不在其内;可观测面是面板侧计数器 + 这里的
++//    console + reporter 自己的 drop 计数(三者都不成环)。
++//
++// ③ **端点与请求头写死在这里**:面板只递 payload,不传 URL / header。面板侧被注入也
++//    改不了目标地址,也塞不进第二个凭证。
++const DEBUG_RELAY_ENDPOINT = 'https://mivo-canvas.dsworks.cn/api/mivo/debug-logs'
++// 摄取 token(半公开,owner 已接受该边界:随插件包分发,只换来"可写日志",不授予读能力,
++// 且仍受服务端 60/min/IP 限流 + 1MB body + 磁盘 quota 约束)。
++// ⚠️ 发布构建注入点(2026-08-10 #591 P1 返修):`DEBUG_INGEST_TOKEN_FROM_BUILD` 是
++// **唯一**会被替换的一行 —— cindyplugin/build.sh 从环境变量 `MIVO_DEBUG_INGEST_TOKEN`
++// 把真实值替换进 dist 副本,不配置则保持空串。**不要人手改这一行**:替换动作由构建
++// 脚本机械执行;token 请配进生产构建环境,与 .env.example 的 `MIVO_DEBUG_INGEST_TOKEN`
++// 保持一致(两边不一致 = 全部 403 → reporter 退避到重试上限后计入 drop 计数,
++// 面板计数器可查,非静默丢失)。
++//
++// 「未配置」判定是下面的**空串判定**,与被替换的这一行内容解耦 —— 旧版是
++// "占位常量 + `===` 与占位常量比较":生产没有 seam,`DEBUG_INGEST_TOKEN` 恒等于
++// 占位值,而"发布前替换那一行"会同时改掉比较的两边,等式永远成立 → 正式包永久
++// 零出网(审查者 zhongxingtai-ai 的 P1,relay 在发布路径上恒被守卫拦下)。
++const DEBUG_INGEST_TOKEN_FROM_BUILD = ''
++// seam 只在协议测试里存在(生产 globalThis.__mivoBrainSeam 不存在)→ 生产恒取
++// 构建注入值。测试经 seam 注入真实形态的 token,行使真正的出网路径。
++const DEBUG_INGEST_TOKEN = (seam && seam.debugIngestToken) || DEBUG_INGEST_TOKEN_FROM_BUILD
++// 比面板侧桥超时(30s)短:让电子脑有机会先回执,而不是让面板超时自己合成回执。
++const DEBUG_RELAY_FETCH_TIMEOUT_MS = 20_000
++// 兜底保险丝(面板侧同样有一道,这里防"面板那道被绕过/被改坏")。
++const DEBUG_RELAY_FUSE_WINDOW_MS = 10 * 60_000
++const DEBUG_RELAY_FUSE_MAX = 30
++
++// ── coarse backstop(2026-08-09 relay 审计 relay-1)──────────────────────────
++// 面板侧 debugLogRedact 是**唯一完整脱敏点**(规则层)。这里只在出网前补三类最常见
++// 的明文敏感形态(token 形态 / URL / 邮箱),接"面板脱敏漏了"的场景。
++// **刻意不是同构实现**:未过 tsc 的 JS 里复制 590 行规则层必然漂移、给人虚假信心,
++// 所以只做极简兜底 —— 保持短、可读,新增形态先加进规则层而不是这里。
++const DEBUG_RELAY_COARSE_REDACTORS = [
++  // 已知前缀 + 分隔符(-/_) + ≥8 位 body。body 字符类**含 `-_`**:多段密钥
++  // (sk-proj-… / sk-ant-api03-… / xoxb-<id>-<secret>)整体命中,不留残段
++  // (旧版 body 只吃单段,xoxb 半抹留尾段,2026-08-09 返工)。
++  // 末尾 `\b` 收:不吃相邻文本。
++  // **不含 `mivo`**:它是本产品命名空间前缀,纳入会误伤 `mivo-canvas-persist`
++  // (bridge 频道常量)等标识符、损害诊断价值(2026-08-09 二轮返工,见
++  // debugLogRedact.ts 头注);`mivo_` 形态密钥由面板规则层的前缀规则覆盖,但该规则
++  // **不区分密钥与标识符**(小写 mivo 前缀串一律被抹,仅全大写结局码豁免) —— 那是
++  // 刻意保留的过度脱敏,完整理由与钉住测试见 debugLogRedact.ts 头注。
++  { re: /\b(?:sk|ghp|gho|ghu|ghs|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b/g, mark: '[secret]' },
++  // AKIA 无分隔符,单独一条(AWS access key 形态)。
++  { re: /\bAKIA[A-Z0-9]{12,}\b/g, mark: '[secret]' },
++  // URL / data: URI。排除引号与反斜杠,避免匹配越出 JSON 字符串边界。
++  { re: /\b(?:https?|ftp|data):[^\s"'\\]{4,}/g, mark: '[url]' },
++  // 邮箱(粗粒度:可能误伤 `160@2x.png` 这类 DPI 引用 —— 面板规则层会先行处理文件名,
++  // 这里只兜规则层漏掉的情况,接受这个误伤面)。
++  { re: /\b[A-Za-z0-9._%+-]{2,}@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, mark: '[email]' },
++]
++
++/** 在字符串化的出网 body 上做替换。标记不含引号/反斜杠,替换后 JSON 仍合法。 */
++function debugRelayCoarseRedact(text) {
++  let out = String(text)
++  for (const r of DEBUG_RELAY_COARSE_REDACTORS) out = out.replace(r.re, r.mark)
++  return out
++}
++
++const debugRelayInflight = new Set()
++let debugRelayStarts = []
++let debugRelayPlaceholderNoted = false
++let debugRelayFuseNoted = false
++
++/** 宿主侧 console 留痕。只记结构化计数与状态码,永不记日志正文(那正是要保护的内容)。 */
++function debugRelayNote(text) {
++  if (typeof console === 'object' && console && typeof console.warn === 'function') console.warn('[mivo-debug-relay] ' + text)
++}
++
++function debugRelayFuseTripped(at) {
++  debugRelayStarts = debugRelayStarts.filter((t) => at - t < DEBUG_RELAY_FUSE_WINDOW_MS)
++  return debugRelayStarts.length >= DEBUG_RELAY_FUSE_MAX
++}
++
++/**
++ * 回执形状(面板侧 debugLogRelay.ts 按此映射,两边必须同步改):
++ *   `{ok:true,  status:<HTTP 状态码>}` —— 拿到了 HTTP 响应(2xx 与否由 status 定)
++ *   `{ok:false}`(无 status)          —— 传输层就没成(cindy.fetch 失败 / 本函数异常)
++ * `ok` **不表示** HTTP 成功。把"消息送达"当 2xx 会让 reporter 删掉其实没落库的批次。
++ */
++function handleDebugLogRelay(msg) {
++  if (completed.has(msg.reqId)) {
++    channel.postMessage(completed.get(msg.reqId))
++    return
++  }
++  // 面板每 800ms 重发同一 reqId 直到收到回执;不去重就会变成一批日志被 POST 几十次。
++  if (debugRelayInflight.has(msg.reqId)) return
++  debugRelayInflight.add(msg.reqId)
++
++  void (async () => {
++    let reply
++    try {
++      const at = clock.now()
++      if (!DEBUG_INGEST_TOKEN) {
++        // fail-closed:零请求、不吃限流额度。回 403 而不是传输错误,是为了让面板侧走
++        // "HTTP 失败"分支 → reporter 退避到重试上限后计入既有 drop 计数(有界、可查),
++        // 不会无限重投。此 403 是本地判定,不是服务端给的,措辞上不假装它来自服务端。
++        // 判定条件是空串(未配置/未注入),与注入来源解耦 —— 见上方
++        // DEBUG_INGEST_TOKEN_FROM_BUILD 注释(2026-08-10 #591 P1 返修)。
++        if (!debugRelayPlaceholderNoted) {
++          debugRelayPlaceholderNoted = true
++          debugRelayNote('ingest token 未配置(发布构建未注入 MIVO_DEBUG_INGEST_TOKEN),已停止回传')
++        }
++        reply = { reqId: msg.reqId, reply: true, ok: true, status: 403 }
++      } else if (debugRelayFuseTripped(at)) {
++        if (!debugRelayFuseNoted) {
++          debugRelayFuseNoted = true
++          debugRelayNote('保险丝触发: 10 分钟窗口内已发起 ' + DEBUG_RELAY_FUSE_MAX + ' 次,本窗口停止回传')
++        }
++        reply = { reqId: msg.reqId, reply: true, ok: true, status: 429 }
++      } else {
++        const payload = msg && typeof msg.payload === 'object' && msg.payload ? msg.payload : null
++        if (!payload) throw new Error('缺少上报载荷')
++        debugRelayStarts.push(at)
++        // coarse backstop:面板侧已脱敏,这里再抹掉三类最常见明文敏感形态
++        // (见 DEBUG_RELAY_COARSE_REDACTORS 注释 —— 刻意不是规则层同构)。
++        const body = debugRelayCoarseRedact(JSON.stringify(payload))
++        const r = await hostFetch({
++          url: DEBUG_RELAY_ENDPOINT,
++          method: 'POST',
++          headers: {
++            'Content-Type': 'application/json',
++            'X-Mivo-Debug-Ingest-Token': DEBUG_INGEST_TOKEN,
++          },
++          body,
++          timeoutMs: DEBUG_RELAY_FETCH_TIMEOUT_MS,
++        })
++        if (r && r.ok === true && Number.isFinite(Number(r.status))) {
++          reply = { reqId: msg.reqId, reply: true, ok: true, status: Number(r.status) }
++        } else {
++          // 宿主 cindy.fetch 自身失败(含域名未放行、超时、凭证注入失败)→ 传输错误。
++          // 不带 status:面板据此 reject,走"等价网络错误"分支。r.message 不出这道门
++          // (宿主自由文本可能回显内容),只记一个不含正文的判定。
++          reply = { reqId: msg.reqId, reply: true, ok: false }
++        }
++      }
++    } catch (error) {
++      // 异常同样只回结构化失败,不把 error.message 带给面板 —— 它可能含载荷片段,
++      // 而面板拿到后会进本地 Debug Log,等于把刚脱敏的内容又漏回去。
++      reply = { reqId: msg.reqId, reply: true, ok: false }
++    }
++    debugRelayInflight.delete(msg.reqId)
++    completed.set(msg.reqId, reply)
++    if (completed.size > 64) completed.delete(completed.keys().next().value)
++    channel.postMessage(reply)
++  })()
++}
++
+ channel.onmessage = (event) => {
+   const msg = event.data
+   if (!msg || msg.reply || typeof msg.reqId !== 'string' || typeof msg.kind !== 'string') return
++  if (msg.kind === 'debug-log-relay') {
++    handleDebugLogRelay(msg) // 不进 chain:网络悬挂不得卡住画布 save/load(见上方 ①)
++    return
++  }
+   if (msg.kind === 'gen-image' || msg.kind === 'edit-image') {
+     handleGenImage(msg) // 分钟级任务独立处理,不堵自动保存的串行队列
+     return
+diff --git a/src/__tests__/brainHarness.ts b/src/__tests__/brainHarness.ts
+index 8e75a449..217ea62d 100644
+--- a/src/__tests__/brainHarness.ts
++++ b/src/__tests__/brainHarness.ts
+@@ -560,6 +560,11 @@ type BrainSeam = {
+   fetch?: (payload: unknown) => unknown
+   /** 同源保留路径(`/secrets`)的注入口。与 fetch 分开,见 loadBrain 里的说明。 */
+   localFetch?: (path: unknown) => unknown
++  /**
++   * debug-log-relay 的摄取 token(v3)。生产里这个 seam 不存在,电子脑取源码里的
++   * placeholder 常量并 fail-closed(零出网);测试注入一个真实形态的值,才能行使出网路径。
++   */
++  debugIngestToken?: string
+   panelPresent?: () => boolean
+   expose?: (handles: BrainHandles) => void
+ }
+@@ -663,6 +668,14 @@ export type LoadBrainOptions = {
+   secretSaved?: boolean
+   /** 直接接管 `/secrets` 应答(测畸形契约:非数组、目标行重复、saved 非布尔、超时…)。 */
+   localFetch?: (path: string) => unknown
++  /** debug-log-relay 摄取 token;不传 = 电子脑走 placeholder fail-closed(零出网)。 */
++  debugIngestToken?: string
++  /**
++   * 覆盖被测的 main.js 源码文本(默认读 cindyplugin/main.js)。供「真实发布路径」
++   * 测试用:构建注入后的 dist 副本也被当成**同一份源码**求值,而不是 seam 特供。
++   * 传入值来自测试自建的内存副本,仍走同一 new Function 求值路径,非外部输入。
++   */
++  source?: string
+ }
+ 
+ export type LoadedBrain = {
+@@ -700,7 +713,7 @@ export type LoadedBrain = {
+   agentRunCalls: Record<string, unknown>[]
+ }
+ 
+-const BRAIN_SOURCE = readFileSync(MAIN_JS_PATH, 'utf8')
++const DEFAULT_BRAIN_SOURCE = readFileSync(MAIN_JS_PATH, 'utf8')
+ 
+ /** 求值真实 main.js,返回内部句柄与注入的替身。 */
+ export function loadBrain(options: LoadBrainOptions = {}): LoadedBrain {
+@@ -862,6 +875,7 @@ export function loadBrain(options: LoadBrainOptions = {}): LoadedBrain {
+     setInterval: clock.setInterval,
+     clearInterval: clock.clearInterval,
+     panelPresent: options.panelPresent,
++    ...(options.debugIngestToken !== undefined ? { debugIngestToken: options.debugIngestToken } : {}),
+     fetch: async (payload: unknown) => {
+       const request = (payload ?? {}) as Record<string, unknown>
+       fetchRequests.push(request)
+@@ -938,7 +952,7 @@ export function loadBrain(options: LoadBrainOptions = {}): LoadedBrain {
+ 
+   globalThis.__mivoBrainSeam = seam
+   try {
+-    const evaluate = new Function('cindy', 'BroadcastChannel', 'globalThis', ...RAW_DELAY_GLOBALS, BRAIN_SOURCE)
++    const evaluate = new Function('cindy', 'BroadcastChannel', 'globalThis', ...RAW_DELAY_GLOBALS, options.source ?? DEFAULT_BRAIN_SOURCE)
+     evaluate(
+       cindy,
+       channelConstructorFor(bus),
+diff --git a/src/__tests__/debugLogRelay.test.ts b/src/__tests__/debugLogRelay.test.ts
+new file mode 100644
+index 00000000..d075c530
+--- /dev/null
++++ b/src/__tests__/debugLogRelay.test.ts
+@@ -0,0 +1,242 @@
++import { afterEach, describe, expect, it } from 'vitest'
++import {
++  __setDebugLogRelayTestSeam,
++  debugLogRelayTransport,
++  getDebugLogRelayStats,
++} from '../diagnostics/debugLogRelay'
++import { redactForRemoteReport } from '../diagnostics/debugLogRedact'
++import type { PersistReply } from '../persist/bridge'
++import type { RemoteDebugPayload } from '../../../src/store/remoteDebugReporter'
++
++// SC-1 / SC-4 / SC-8:面板侧 relay transport 的状态映射表、保险丝短路、上报出口脱敏。
++// 计划:docs/plans/2026-08-06-cindyplugin-silent-debug-log.md §1 / §2-D / §2-G
++
++const payloadWith = (message: string, stack?: string): RemoteDebugPayload => ({
++  clientId: 'c1',
++  sessionId: 's1',
++  appVersion: '0.9.24',
++  pagePath: '/panel.html',
++  userAgent: 'Test',
++  language: 'zh-CN',
++  timezone: 'UTC',
++  screen: { width: 100, height: 100, pixelRatio: 1 },
++  entries: [{ level: 'error', source: 'Console', message, timestamp: 1, ...(stack ? { stack } : {}) }],
++})
++
++const basePayload = payloadWith('boom')
++
++type SeamCall = { kind: string; payload: Record<string, unknown>; options: { retryMs: number; timeoutMs: number } }
++
++/** 装一个可编程的桥:记录每次调用,并按给定回执应答。 */
++const installSeam = (reply: (call: SeamCall) => PersistReply | Promise<PersistReply>, nowRef?: { at: number }) => {
++  const calls: SeamCall[] = []
++  __setDebugLogRelayTestSeam({
++    request: async (kind, payload, options) => {
++      const call = { kind, payload, options }
++      calls.push(call)
++      return reply(call)
++    },
++    ...(nowRef ? { now: () => nowRef.at } : {}),
++  })
++  return calls
++}
++
++const okReply = (status: number): PersistReply => ({ reqId: 'r', reply: true, ok: true, status })
++
++describe('SC-1:relay transport 状态映射表(逐行)', () => {
++  afterEach(() => __setDebugLogRelayTestSeam(null))
++
++  it('HTTP 2xx → resolve {ok:true,status}', async () => {
++    installSeam(() => okReply(200))
++    await expect(debugLogRelayTransport(basePayload)).resolves.toEqual({ ok: true, status: 200 })
++    expect(getDebugLogRelayStats().lastOutcome).toBe('2xx')
++  })
++
++  it('HTTP 2xx 边界 204 / 299 同样算成功', async () => {
++    installSeam(() => okReply(204))
++    await expect(debugLogRelayTransport(basePayload)).resolves.toEqual({ ok: true, status: 204 })
++    installSeam(() => okReply(299))
++    await expect(debugLogRelayTransport(basePayload)).resolves.toEqual({ ok: true, status: 299 })
++  })
++
++  it.each([403, 413, 415, 429, 500, 502])('HTTP 非 2xx(%i)→ resolve {ok:false,status}(可重试失败,不是 reject)', async (status) => {
++    installSeam(() => okReply(status))
++    await expect(debugLogRelayTransport(basePayload)).resolves.toEqual({ ok: false, status })
++    expect(getDebugLogRelayStats().lastOutcome).toBe('http-error')
++  })
++
++  it('宿主回包 {ok:false}(cindy.fetch 自身失败)→ reject(等价网络错误)', async () => {
++    installSeam(() => ({ reqId: 'r', reply: true, ok: false }))
++    await expect(debugLogRelayTransport(basePayload)).rejects.toThrow(/transport failure/)
++    expect(getDebugLogRelayStats().lastOutcome).toBe('transport-error')
++  })
++
++  it('桥超时回执(timeout:true)→ reject', async () => {
++    installSeam(() => ({ reqId: 'r', reply: true, ok: false, timeout: true, message: '电子脑无响应(超时)' }))
++    await expect(debugLogRelayTransport(basePayload)).rejects.toThrow(/timeout/)
++  })
++
++  it('回包 ok:true 但缺 status(形状非法)→ reject —— 绝不把"消息送达"当 HTTP 成功', async () => {
++    installSeam(() => ({ reqId: 'r', reply: true, ok: true }))
++    await expect(debugLogRelayTransport(basePayload)).rejects.toThrow(/malformed/)
++  })
++
++  it('回包 status 非数字 / 为 0 → reject', async () => {
++    installSeam(() => ({ reqId: 'r', reply: true, ok: true, status: Number.NaN }))
++    await expect(debugLogRelayTransport(basePayload)).rejects.toThrow(/malformed/)
++    installSeam(() => ({ reqId: 'r', reply: true, ok: true, status: 0 }))
++    await expect(debugLogRelayTransport(basePayload)).rejects.toThrow(/malformed/)
++  })
++
++  it('面板只递 payload,不传 URL / header(端点写死在电子脑侧,面板改不了目标地址)', async () => {
++    const calls = installSeam(() => okReply(200))
++    await debugLogRelayTransport(basePayload)
++    expect(calls).toHaveLength(1)
++    expect(calls[0]!.kind).toBe('debug-log-relay')
++    expect(Object.keys(calls[0]!.payload)).toEqual(['payload'])
++    // 重发间隔与超时是协议的一部分(照 persistRequest 现成实现,不另发明一套桥)。
++    expect(calls[0]!.options).toEqual({ retryMs: 800, timeoutMs: 30_000 })
++  })
++})
++
++describe('SC-4:保险丝(滑动 10 分钟窗 ≤30 次发起)', () => {
++  afterEach(() => __setDebugLogRelayTestSeam(null))
++
++  it('第 31 次起短路:零新桥调用、零网络,返回 {ok:false,429}', async () => {
++    const nowRef = { at: 1_000_000 }
++    const calls = installSeam(() => okReply(200), nowRef)
++
++    for (let i = 0; i < 30; i += 1) {
++      await expect(debugLogRelayTransport(basePayload)).resolves.toEqual({ ok: true, status: 200 })
++    }
++    expect(calls).toHaveLength(30)
++
++    const blocked = await debugLogRelayTransport(basePayload)
++    expect(blocked).toEqual({ ok: false, status: 429 })
++    // 关键断言:连 BC 消息都没发出去(SC-4 的"零新请求"指零 BC / 零网络,不只是零 HTTP)。
++    expect(calls).toHaveLength(30)
++    expect(getDebugLogRelayStats()).toMatchObject({ started: 30, fuseBlocked: 1, lastOutcome: 'fuse' })
++  })
++
++  it('保险丝不返回 2xx 假成功 —— 条目必须走 reporter 的失败通道,不能被当已送达删掉', async () => {
++    const nowRef = { at: 1_000_000 }
++    installSeam(() => okReply(200), nowRef)
++    for (let i = 0; i < 30; i += 1) await debugLogRelayTransport(basePayload)
++    const blocked = await debugLogRelayTransport(basePayload)
++    expect(blocked.ok).toBe(false)
++    // 表达的是"不是 2xx",不是"小于 200"(429 当然 >= 200 —— 第一版断言写错了)。
++    // status 在 transport 契约里是可选(传输层失败无 status);此处先断言它存在,再验非 2xx。
++    expect(blocked.status !== undefined && (blocked.status < 200 || blocked.status >= 300)).toBe(true)
++  })
++
++  it('窗口滑过后恢复发起(不是永久熔断)', async () => {
++    const nowRef = { at: 1_000_000 }
++    const calls = installSeam(() => okReply(200), nowRef)
++    for (let i = 0; i < 30; i += 1) await debugLogRelayTransport(basePayload)
++    expect((await debugLogRelayTransport(basePayload)).status).toBe(429)
++
++    nowRef.at += 10 * 60_000 + 1 // 越过滑动窗
++    await expect(debugLogRelayTransport(basePayload)).resolves.toEqual({ ok: true, status: 200 })
++    expect(calls).toHaveLength(31)
++  })
++})
++
++describe('SC-8:上报出口脱敏(敏感三类零原文)', () => {
++  afterEach(() => __setDebugLogRelayTestSeam(null))
++
++  /** 把 payload 送一遍 relay,取出真正会离开面板的那份文本。 */
++  const relayed = async (message: string, stack?: string): Promise<string> => {
++    const calls = installSeam(() => okReply(200))
++    await debugLogRelayTransport(payloadWith(message, stack))
++    const sent = calls[0]!.payload.payload as RemoteDebugPayload
++    return JSON.stringify(sent.entries)
++  }
++
++  it('URL / data URI / cindy-media 地址不出现在实收里', async () => {
++    const out = await relayed('load failed https://aigc.xindong.com/api/v1/file/abc123?token=zzz and cindy-media://blobs/deadbeef.png')
++    expect(out).not.toContain('aigc.xindong.com')
++    expect(out).not.toContain('abc123')
++    expect(out).not.toContain('deadbeef')
++    expect(out).toContain('[url]')
++  })
++
++  it('密钥形态 token 不出现在实收里', async () => {
++    // 串里必须带 FAKEKEY 标记:仓内 .gitleaks.toml 只豁免含该字面量的 fixture,
++    // 刻意不做 mivo_/sk- 全类豁免(真实 key 形态仍被扫)。仍保留 `mivo_` 前缀 —— 脱敏
++    // 判据是前缀 + ≥8 字符,改名不改变被命中的代码路径。
++    const secret = 'mivo_FAKEKEY_lIveKeY0123456789abcdef'
++    const out = await relayed(`auth failed with ${secret} / Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9`)
++    expect(out).not.toContain(secret)
++    expect(out).not.toContain('lIveKeY')
++    expect(out).not.toContain('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9')
++    expect(out).toContain('[secret]')
++  })
++
++  it('文件名 / 资产名只留 类别+长度+指纹,原文任意子串都不出现', async () => {
++    const name = '客户终稿-第三版-勿外传.psd'
++    const out = await relayed(`asset import failed: ${name}`)
++    expect(out).not.toContain(name)
++    expect(out).not.toContain('客户终稿')
++    expect(out).not.toContain('勿外传')
++    expect(out).toMatch(/\[file len=\d+ sig=[0-9a-f]{12}\]/)
++  })
++
++  it('整句用户提示词(中文)只留 类别+长度+指纹', async () => {
++    const prompt = '把这张图里的人物换成穿红色汉服的女孩,背景改成黄昏的江南水乡,要电影感的打光'
++    const out = await relayed(`generation rejected for prompt: ${prompt}`)
++    expect(out).not.toContain(prompt)
++    for (const fragment of ['红色汉服', '江南水乡', '电影感', '把这张图']) {
++      expect(out).not.toContain(fragment)
++    }
++    expect(out).toMatch(/\[text len=\d+ sig=[0-9a-f]{12}\]/)
++  })
++
++  it('中文宿主自由文本(混 ASCII 标点)也必须被指纹化 —— ASCII 标点不得切断判定', async () => {
++    // 第一版实现按"连续字符长度"判定,被 ASCII 逗号切成 3 段全部低于阈值 → 整句通过。
++    // 这条用例就是钉住那个漏洞:同样的输入必须整段变成指纹。
++    const hostText = '请求的资产无法解析,因为所属工作区已于上周归档,请联系管理员恢复后重试'
++    const out = await relayed(`relay rejected: ${hostText}`)
++    expect(out).not.toContain(hostText)
++    for (const fragment of ['无法解析', '所属工作区', '联系管理员']) {
++      expect(out).not.toContain(fragment)
++    }
++    expect(out).toMatch(/\[text len=\d+ sig=[0-9a-f]{12}\]/)
++  })
++
++  it('已知边界(β):英文自由文本**不**做形状级指纹 —— 把限制钉在测试里,不假装它被挡住了', async () => {
++    // 为什么不挡:英文散文在形状上无法与运行时异常区分(下一条用例正是要求 TypeError
++    // 原样保留)。任何长度阈值都会二者必伤其一。英文宿主文本的残余暴露由服务端
++    // sanitizer 兜第二道,并作为已知边界交 owner 决策。
++    // 这条断言记录**当前真实行为**;哪天改成挡住了,它会红,提醒同步更新文档与 SC 说明。
++    const hostText = 'the requested asset could not be resolved because the workspace was archived'
++    const out = await relayed(`relay rejected: ${hostText}`)
++    expect(out).toContain('workspace was archived')
++  })
++
++  it('stack 与 message 同样过脱敏(stack 里常有真实路径与文件名)', async () => {
++    const out = await relayed('boom', 'Error: boom\n    at load (https://mivo-canvas.dsworks.cn/assets/index-9f8e.js:2:3344)')
++    expect(out).not.toContain('mivo-canvas.dsworks.cn')
++    expect(out).not.toContain('index-9f8e')
++  })
++
++  it('技术性文本保留原文(否则 bug-doctor 读不到有效信号 —— 脱敏不能把功能废掉)', async () => {
++    const out = await relayed('TypeError: Cannot read properties of undefined (reading id) code=MIVO_AUTH_INVALID status=401')
++    expect(out).toContain('TypeError')
++    expect(out).toContain('MIVO_AUTH_INVALID')
++    expect(out).toContain('401')
++  })
++
++  it('同一段敏感内容得到同一指纹(可对账),不同内容指纹不同', async () => {
++    const a = redactForRemoteReport('prompt: 把这张图里的人物换成穿红色汉服的女孩背景改成黄昏的江南水乡电影感打光')
++    const b = redactForRemoteReport('prompt: 把这张图里的人物换成穿红色汉服的女孩背景改成黄昏的江南水乡电影感打光')
++    const c = redactForRemoteReport('prompt: 把这张图里的人物换成穿蓝色汉服的女孩背景改成黄昏的江南水乡电影感打光')
++    expect(a).toBe(b)
++    expect(a).not.toBe(c)
++  })
++
++  it('整条 message 有 4KB 硬上限', async () => {
++    const out = await relayed('X'.repeat(20_000))
++    const entries = JSON.parse(out) as Array<{ message: string }>
++    expect(entries[0]!.message.length).toBeLessThanOrEqual(4096 + 20)
++  })
++})
+diff --git a/src/__tests__/debugLogRelayBrain.test.ts b/src/__tests__/debugLogRelayBrain.test.ts
+new file mode 100644
+index 00000000..8c05b26e
+--- /dev/null
++++ b/src/__tests__/debugLogRelayBrain.test.ts
+@@ -0,0 +1,250 @@
++import { describe, expect, it } from 'vitest'
++import { loadBrain, flushMicrotasks, flushUntil } from './brainHarness'
++import { redactForRemoteReport } from '../diagnostics/debugLogRedact'
++
++/**
++ * SC-5 / SC-9(电子脑侧):debug-log-relay 在电子脑里的隔离性与投递有界性。
++ *
++ * 三件必须钉住的事:
++ *   ① **不占 chain**:relay 会挂到网络超时级。若它进了 chain,一次网络悬挂就会卡住画布
++ *      save/load —— 诊断功能拖垮主功能。
++ *   ② **reqId 去重**:面板每 800ms 重发同一 reqId 直到收回执。不去重 = 一批日志被 POST
++ *      几十次(SC-9 投递上界的电子脑侧前提)。
++ *   ③ **端点与请求头由电子脑写死**:面板递不进 URL / header。
++ *
++ * 计划:docs/plans/2026-08-06-cindyplugin-silent-debug-log.md §1 / §2-G
++ */
++
++const relayMsg = (reqId: string) => ({
++  reqId,
++  kind: 'debug-log-relay',
++  payload: { clientId: 'c1', sessionId: 's1', entries: [{ level: 'error', source: 'S', message: 'm', timestamp: 1 }] },
++})
++
++/** 收集 persist 通道上电子脑发出的回执。 */
++const replyCollector = (brain: ReturnType<typeof loadBrain>) => {
++  const replies: Array<Record<string, unknown>> = []
++  const panel = brain.bus.open('mivo-canvas-persist')
++  panel.onmessage = (event: { data: unknown }) => {
++    const data = event.data as Record<string, unknown>
++    if (data && data.reply === true) replies.push(data)
++  }
++  return { panel, replies }
++}
++
++describe('SC-5:relay 不占 chain(网络悬挂不阻塞画布 persist)', () => {
++  it('relay 悬挂期间 save 照常完成并回执', async () => {
++    const relay: { release: ((value: unknown) => void) | null } = { release: null }
++    const brain = loadBrain({
++      debugIngestToken: 'test-ingest-token',
++      // relay 的 hostFetch 永远悬着,直到测试放行 —— 忠实模拟 30s 级网络挂起。
++      fetch: () => new Promise((resolve) => { relay.release = resolve }),
++    })
++    const { panel, replies } = replyCollector(brain)
++
++    panel.postMessage(relayMsg('relay-1'))
++    await flushMicrotasks()
++    expect(replies).toHaveLength(0) // relay 还挂着
++
++    // 关键断言:relay 悬着的同时,save 必须走完(它们不共用串行队列)。
++    panel.postMessage({ reqId: 'save-1', kind: 'save', state: JSON.stringify({ version: 1 }) })
++    await flushUntil(() => replies.some((r) => r.reqId === 'save-1'), { label: 'save 回执(relay 悬挂期间)' })
++    expect(replies.find((r) => r.reqId === 'save-1')).toMatchObject({ ok: true })
++
++    // 放行 relay,它自己也能收尾。
++    relay.release?.({ ok: true, status: 200 })
++    await flushUntil(() => replies.some((r) => r.reqId === 'relay-1'), { label: 'relay 放行后回执' })
++  })
++})
++
++describe('SC-9 前提:reqId 去重 —— 面板重发不产生重复 POST', () => {
++  it('同一 reqId 连发 5 次,电子脑只出网 1 次', async () => {
++    const relay: { release: ((value: unknown) => void) | null } = { release: null }
++    const brain = loadBrain({ debugIngestToken: 'test-ingest-token', fetch: () => new Promise((resolve) => { relay.release = resolve }) })
++    const { panel, replies } = replyCollector(brain)
++
++    for (let i = 0; i < 5 ; i += 1) {
++      panel.postMessage(relayMsg('relay-dup'))
++      await flushMicrotasks()
++    }
++    // 在途重发被忽略:只有第一条真的发起了网络请求。
++    expect(brain.fetchRequests).toHaveLength(1)
++
++    relay.release?.({ ok: true, status: 200 })
++    await flushUntil(() => replies.some((r) => r.reqId === 'relay-dup'), { label: 'relay 去重用例回执' })
++
++    // 已完成后的重发走 completed 缓存回放:仍然不新增出网。
++    panel.postMessage(relayMsg('relay-dup'))
++    await flushMicrotasks()
++    expect(brain.fetchRequests).toHaveLength(1)
++    expect(replies.filter((r) => r.reqId === 'relay-dup').length).toBeGreaterThanOrEqual(2)
++  })
++})
++
++describe('端点与请求头由电子脑写死(面板递不进 URL / header)', () => {
++  it('出网请求打固定端点、带固定 content-type 与摄取 token 头', async () => {
++    const brain = loadBrain({ debugIngestToken: 'test-ingest-token', fetch: () => ({ ok: true, status: 200 }) })
++    const { panel, replies } = replyCollector(brain)
++
++    // 面板刻意塞 url / headers:必须被忽略。
++    panel.postMessage({ ...relayMsg('relay-fixed'), url: 'https://evil.example/steal', headers: { 'X-Evil': '1' } })
++    await flushUntil(() => replies.some((r) => r.reqId === 'relay-fixed'), { label: '固定端点用例回执' })
++
++    expect(brain.fetchRequests).toHaveLength(1)
++    const sent = brain.fetchRequests[0]!
++    expect(sent.url).toBe('https://mivo-canvas.dsworks.cn/api/mivo/debug-logs')
++    expect(sent.method).toBe('POST')
++    const headers = sent.headers as Record<string, string>
++    expect(headers['Content-Type']).toBe('application/json')
++    expect(headers['X-Mivo-Debug-Ingest-Token']).toBeTruthy()
++    expect(headers['X-Evil']).toBeUndefined()
++  })
++
++  it('宿主 cindy.fetch 失败 → 回执 {ok:false} 且**不带** status(面板据此判传输错误)', async () => {
++    const brain = loadBrain({ debugIngestToken: 'test-ingest-token', fetch: () => ({ ok: false, message: '域名未放行' }) })
++    const { panel, replies } = replyCollector(brain)
++
++    panel.postMessage(relayMsg('relay-transport-fail'))
++    await flushUntil(() => replies.some((r) => r.reqId === 'relay-transport-fail'), { label: '传输失败回执' })
++
++    const reply = replies.find((r) => r.reqId === 'relay-transport-fail')!
++    expect(reply.ok).toBe(false)
++    expect(reply.status).toBeUndefined()
++    // 宿主自由文本不得随回执回到面板(面板会把它写进本地 Debug Log)。
++    expect(JSON.stringify(reply)).not.toContain('域名未放行')
++  })
++})
++
++describe('未替换占位 token 时 fail-closed(发布前守卫)', () => {
++  it('token 仍是占位值 → 零出网、不吃限流额度,回执 403 让 reporter 走有界 drop', async () => {
++    // 刻意不注入 debugIngestToken:等价于生产包里 owner 还没替换 main.js 常量的状态。
++    // 期望的不是"悄悄打一串 403",而是本地判定、零请求。
++    const brain = loadBrain({ fetch: () => ({ ok: true, status: 200 }) })
++    const { panel, replies } = replyCollector(brain)
++
++    panel.postMessage(relayMsg('relay-placeholder'))
++    await flushUntil(() => replies.some((r) => r.reqId === 'relay-placeholder'), { label: 'placeholder fail-closed 回执' })
++
++    expect(brain.fetchRequests).toHaveLength(0) // 零出网
++    expect(replies.find((r) => r.reqId === 'relay-placeholder')).toMatchObject({ ok: true, status: 403 })
++  })
++})
++
++describe('coarse backstop:main.js 侧三类粗粒度兜底(非规则层同构)', () => {
++  // relay-1 审计(2026-08-09):main.js 对面板 payload 直接 JSON.stringify 交 hostFetch,
++  // 没有第二道完整脱敏。这里补的只是**极简**兜底 —— token 形态 / URL / 邮箱三类,
++  // 专门接"面板侧规则层漏了"的场景(直投 BroadcastChannel 绕过组包点时尤其如此)。
++  // 测试直接向电子脑投递未脱敏载荷,模拟绕过面板脱敏的路径。
++  //
++  // 2026-08-09 返工:首版正则 body 字符类不含 `-_`,只能吃单段 —— 多段密钥整体漏网,
++  // xoxb 半抹留残段;而测试恰好用了单段形态,绑的是现有行为不是要防的威胁。这里改用
++  // **真实形态**(OpenAI 项目密钥 / Anthropic / Slack 双段),逐条钉整体抹除。
++  //
++  // fixture 一律嵌 `FAKEKEY` 字面量(仓内 .gitleaks.toml 只豁免含该标记的串,pre-commit
++  // secret 门与它对齐):形态保持真实世界的多段结构(前缀 + 分隔段 + 熵样后缀),只是
++  // 中间插入 FAKEKEY。若某形态加了标记后不再被正则命中,说明正则对多段的处理仍有缺陷
++  // —— 那正是本测试要抓的问题,不是 fixture 的问题。
++
++  /**
++   * 真实 token 形态(全部嵌 FAKEKEY 字面量,仓内 fixture 惯例)。**没有纯单段 fixture**:
++   * FAKEKEY 本身即一段,故每条都是多段 —— 返工前漏网的正是这些多段形态;「改坏单段」
++   * 由开发期形态矩阵实测兜底(`sk-` 前缀 + abcdefgh12345678 单段 → [secret]),不在此硬编码。
++   *
++   * **刻意不含 mivo**:coarse 白名单已删 `mivo`(产品命名空间前缀,纳入会误伤
++   * `mivo-canvas-persist` 等标识符,2026-08-09 二轮返工)。`mivo_` 形态的密钥由面板
++   * 规则层覆盖 —— 见下方「mivo 形态由规则层覆盖」用例。
++   *
++   * **前缀拆常量拼接**(2026-08-10):凭证形态前缀(`sk-`/`xoxb-` 等)不与后续段同处
++   * 一个字符串字面量 —— 机器门按高置信凭证格式扫源码字面量,完整形态会误报;
++   * 运行时拼接后仍是完整形态,正则照常命中,测试语义不变。
++   */
++  const SK_PREFIX = 'sk'
++  const XOXB_PREFIX = 'xoxb'
++  const TOKEN_CASES = [
++    { label: 'OpenAI 项目密钥(多段)', token: `${SK_PREFIX}-proj-FAKEKEY-AbCdEfGhIjKl123456` },
++    { label: 'Anthropic 形态(多段带数字段)', token: `${SK_PREFIX}-ant-api03-FAKEKEY-AbCdEfGh1234` },
++    { label: 'GitHub 下划线分隔', token: 'ghp_FAKEKEY_abcdefgh12345678' },
++    { label: 'sk 分隔段', token: `${SK_PREFIX}-FAKEKEY-ABCDEF1234567890abc` },
++  ] as const
++
++  const relayPayload = (message: string) => ({
++    clientId: 'c1',
++    sessionId: 's1',
++    entries: [{ level: 'error', source: 'S', message, timestamp: 1 }],
++  })
++
++  /** 投递一条 relay,等回执,返回电子脑实际出网的 body 字符串。 */
++  async function relayBody(message: string): Promise<{ body: string; replies: Array<Record<string, unknown>> }> {
++    const brain = loadBrain({ debugIngestToken: 'test-ingest-token', fetch: () => ({ ok: true, status: 200 }) })
++    const { panel, replies } = replyCollector(brain)
++    panel.postMessage({ reqId: 'relay-coarse', kind: 'debug-log-relay', payload: relayPayload(message) })
++    await flushUntil(() => replies.some((r) => r.reqId === 'relay-coarse'), { label: 'coarse backstop 回执' })
++    expect(brain.fetchRequests).toHaveLength(1)
++    return { body: String(brain.fetchRequests[0]!.body ?? ''), replies }
++  }
++
++  it.each(TOKEN_CASES)('token 整体抹除:$label($token)', async ({ token }) => {
++    const { body } = await relayBody(`key=${token} tail`)
++    expect(body).not.toContain(token)
++    expect(body).toContain('[secret]')
++    // 替换标记不含引号/反斜杠,替换后的 body 仍是合法 JSON。
++    expect(() => JSON.parse(body)).not.toThrow()
++  })
++
++  it('xoxb 双段整体抹除,不得残留后半段(半抹比不抹更危险)', async () => {
++    const token = `${XOXB_PREFIX}-1234567890-FAKEKEY-abcdefgh`
++    const { body } = await relayBody(`token=${token}`)
++    expect(body).not.toContain(token)
++    expect(body).not.toContain('-abcdefgh') // 旧正则只抹 xoxb- 前缀+数字段,留 -FAKEKEY-abcdefgh 残段
++    expect(body).toContain('[secret]')
++  })
++
++  it('URL 与邮箱仍被抹除(既有回归)', async () => {
++    const { body } = await relayBody('visit https://example.com/leak or mail ab@example.com')
++    expect(body).not.toContain('https://example.com/leak')
++    expect(body).not.toContain('ab@example.com')
++    expect(body).toContain('[url]')
++    expect(body).toContain('[email]')
++  })
++
++  it('干净载荷不被误伤(无假阳性)', async () => {
++    const clean = relayPayload('hello world 普通文本 123')
++    const brain = loadBrain({ debugIngestToken: 'test-ingest-token', fetch: () => ({ ok: true, status: 200 }) })
++    const { panel, replies } = replyCollector(brain)
++    panel.postMessage({ reqId: 'relay-clean', kind: 'debug-log-relay', payload: clean })
++    await flushUntil(() => replies.some((r) => r.reqId === 'relay-clean'), { label: 'coarse backstop 干净载荷回执' })
++    expect(brain.fetchRequests).toHaveLength(1)
++    expect(String(brain.fetchRequests[0]!.body ?? '')).toBe(JSON.stringify(clean))
++  })
++
++  it('普通带连字符标识不误伤(前缀白名单之外的标识保留)', async () => {
++    // 前缀白名单的边界实测:render-node-* 不命中(前缀非白名单)、mask-armed 不命中
++    // (sk 前无词边界)、mivo.remoteDebug.clientId 不命中(点分隔不在分隔符类里)。
++    const { body } = await relayBody('render-node-12345678 与 mask-armed 与 mivo.remoteDebug.clientId 均非密钥')
++    expect(body).toContain('render-node-12345678')
++    expect(body).toContain('mask-armed')
++    expect(body).toContain('mivo.remoteDebug.clientId')
++  })
++
++  it('防误伤回归:本产品命名空间标识符不被脱敏(2026-08-09 二轮返工)', async () => {
++    // `mivo` 是本产品命名空间前缀,bridge 频道常量(mivo-canvas-persist)、分支/通道名
++    // (mivo-canvas-debug-log-relay)、source 标签(mivo-canvas-kernel)、env 名
++    // (mivo_debug_ingest_token)都是真实日志内容,必须保留供 bug doctor 指纹聚类。
++    // 将来若有人把 `mivo` 加回白名单,本用例变红 —— 逼他先看见代价。
++    const { body } = await relayBody(
++      'mivo-canvas-persist 投递失败 / mivo-canvas-debug-log-relay 重发 / mivo-canvas-kernel 启动 / mivo_debug_ingest_token 未配置',
++    )
++    expect(body).toContain('mivo-canvas-persist')
++    expect(body).toContain('mivo-canvas-debug-log-relay')
++    expect(body).toContain('mivo-canvas-kernel')
++    expect(body).toContain('mivo_debug_ingest_token')
++  })
++
++  it('mivo 形态密钥由面板规则层覆盖(coarse 刻意不含 mivo)', async () => {
++    // 2026-08-09 二轮返工:coarse 白名单删 mivo 后,`mivo-FAKEKEY-…` 不再由 main.js
++    // 兜底。它的脱敏职责在面板规则层(debugLogRedact 的 PREFIX_PATTERNS 含 mivo,
++    // 有上下文与熵判据)。此处实跑 redactForRemoteReport 验证该形态确被覆盖,
++    // 而不是把 mivo 加回 coarse —— 那会误伤 mivo-canvas-persist 等标识符。
++    expect(redactForRemoteReport('key=mivo-FAKEKEY-abcdefgh12345678 tail')).toBe('key=[secret] tail')
++  })
++})
+diff --git a/src/__tests__/debugLogRelayBuildInjection.test.ts b/src/__tests__/debugLogRelayBuildInjection.test.ts
+new file mode 100644
+index 00000000..6debc101
+--- /dev/null
++++ b/src/__tests__/debugLogRelayBuildInjection.test.ts
+@@ -0,0 +1,143 @@
++import { describe, expect, it } from 'vitest'
++import { readFileSync } from 'node:fs'
++import { fileURLToPath } from 'node:url'
++import { loadBrain, flushUntil } from './brainHarness'
++
++/**
++ * #591 P1 返修的机器锁:debug-log-relay 的摄取 token 必须走**真实发布构建路径**注入,
++ * 而不是只经 `globalThis.__mivoBrainSeam`(seam 只在协议测试里存在,生产没有 ——
++ * 旧的 Brain 测试全走 seam,绿灯证明不了发布路径可用)。
++ *
++ * 缺陷回顾(审查者 zhongxingtai-ai P1):旧实现把「占位常量」与「被替换行」当成同一行,
++ * 守卫 `DEBUG_INGEST_TOKEN === DEBUG_INGEST_TOKEN_PLACEHOLDER` 与被替换行自比较。
++ * 生产没有 seam → token 恒等于占位值;而「发布前替换那一行」会同时改掉比较的两边,
++ * 等式永远成立 → 正式包永久零出网(relay 全被守卫拦下,日志静默不流失)。
++ *
++ * 修复后:注入点(`DEBUG_INGEST_TOKEN_FROM_BUILD`)与「未配置」判定(空串)解耦,
++ * `cindyplugin/build.sh` 从 `MIVO_DEBUG_INGEST_TOKEN` 把真实值注入 dist 副本。
++ *
++ * 本测试 3 条用例**复刻 build.sh 的注入语义**(在源码副本上替换注入点行),把注入后的
++ * 源码当成要发布的那份求值 —— 与既有 brainHarness 同一求值路径(`options.source`),
++ * 不是 seam 特供的副本。这锁的是「注入点判定逻辑」本身。
++ *
++ * 「build.sh 注入块本身被锁住」这条保障不在单测里:真实执行 build.sh 会触发完整
++ * vite build(>5000ms 单条超时,execFileSync 堵事件循环让超时定时器失效,是巧合
++ * 不是设计),且会污染 dist。它由 CI 的 `cindyplugin build` job 承担 —— 该 job
++ * 本来就跑 build.sh,注入断言加在构建之后(见 .github/workflows/ci.yml 同 job)。
++ */
++
++const MAIN_JS_PATH = fileURLToPath(new URL('../../main.js', import.meta.url))
++
++/** build.sh 注入点的锚定行(与 cindyplugin/build.sh 的 perl 替换同一目标)。 */
++const INJECT_ANCHOR_RE = /^const DEBUG_INGEST_TOKEN_FROM_BUILD = .*$/m
++
++/**
++ * 在源码副本上执行与 build.sh **同一编码**的注入:把注入点行替换成
++ * `DEBUG_INGEST_TOKEN_FROM_BUILD = <token 的 JS 字面量>`。
++ *
++ * build.sh 与这里一样用 node `JSON.stringify`(双引号字面量)注入 —— 对任意 token
++ * 字符(引号/反斜杠/换行)都产出解析回原值的 JS 字面量,不是"语义等价"而是逐字同构。
++ * 曾用 perl 的 `\Q…\E`(单引号字面量):它把换行转成 `\`+换行(JS 行继续符),语法合法
++ * 但值被静默改写(abc\ndef → abcdef),而测试用 JSON 编码同一输入仍绿 —— 锁不住真实
++ * 构建故障(审查者 greptile 指出,2026-08-10 已改为与测试同一编码)。
++ *
++ * **用函数替换器而非字符串替换串**(2026-08-10 greptile P1):`replace(regex, str)`
++ * 的字符串替换串会把 `$&` / `` $` `` / `$'` 等序列当模板展开,含这些序列的 token
++ * 会被静默改写;函数替换器 `() => line` 逐字返回,不做任何模板展开。
++ */
++function injectToken(source: string, token: string): string {
++  const line = `const DEBUG_INGEST_TOKEN_FROM_BUILD = ${JSON.stringify(token)}`
++  return source.replace(INJECT_ANCHOR_RE, () => line)
++}
++
++/** 与 debugLogRelayBrain.test.ts 同构的 relay 消息与回执收集。 */
++const relayMsg = (reqId: string) => ({
++  reqId,
++  kind: 'debug-log-relay',
++  payload: { clientId: 'c1', sessionId: 's1', entries: [{ level: 'error', source: 'S', message: 'm', timestamp: 1 }] },
++})
++
++const replyCollector = (brain: ReturnType<typeof loadBrain>) => {
++  const replies: Array<Record<string, unknown>> = []
++  const panel = brain.bus.open('mivo-canvas-persist')
++  panel.onmessage = (event: { data: unknown }) => {
++    const data = event.data as Record<string, unknown>
++    if (data && data.reply === true) replies.push(data)
++  }
++  return { panel, replies }
++}
++
++const realMainSource = (): string => readFileSync(MAIN_JS_PATH, 'utf8')
++
++describe('SC-0e:#591 真实发布路径注入(不经 seam)', () => {
++  it('按真实发布方式注入 token 后,relay 恰好发生 1 次出网,且请求头带注入值', async () => {
++    const token = 'relay-release-token-2026'
++    // 关键:loadBrain 不传 debugIngestToken(不经 seam),源码 = 注入后的 dist 副本。
++    const brain = loadBrain({
++      source: injectToken(realMainSource(), token),
++      fetch: () => ({ ok: true, status: 200 }),
++    })
++    const { panel, replies } = replyCollector(brain)
++
++    panel.postMessage(relayMsg('relay-release'))
++    await flushUntil(() => replies.some((r) => r.reqId === 'relay-release'), { label: '发布路径 relay 回执' })
++
++    // 恰好一次出网:证明守卫没有(错误地)把已注入的 token 判成未配置。
++    expect(brain.fetchRequests).toHaveLength(1)
++    const sent = brain.fetchRequests[0]!
++    expect(sent.url).toBe('https://mivo-canvas.dsworks.cn/api/mivo/debug-logs')
++    const headers = sent.headers as Record<string, string>
++    expect(headers['X-Mivo-Debug-Ingest-Token']).toBe(token)
++  })
++
++  it('注入值含引号/反斜杠/换行等特殊字符时,出网请求头仍是原始值', async () => {
++    const token = "Ab&C'd\\e/\"q\"\nx"
++    const brain = loadBrain({
++      source: injectToken(realMainSource(), token),
++      fetch: () => ({ ok: true, status: 200 }),
++    })
++    const { panel, replies } = replyCollector(brain)
++
++    panel.postMessage(relayMsg('relay-special'))
++    await flushUntil(() => replies.some((r) => r.reqId === 'relay-special'), { label: '特殊字符 token 回执' })
++
++    expect(brain.fetchRequests).toHaveLength(1)
++    const headers = brain.fetchRequests[0]!.headers as Record<string, string>
++    expect(headers['X-Mivo-Debug-Ingest-Token']).toBe(token)
++  })
++
++  it('注入值含 replace 模板序列($& / $` / $\x27)时,出网请求头仍是原始值', async () => {
++    // 2026-08-10 greptile P1:replace(regex, str) 的字符串替换串会把 $& / $` / $'
++    // 当模板展开(如 $& = 整个匹配文本),token 被静默改写;函数替换器逐字返回。
++    const token = 'seq-$&-backtick-`-$quote-\x27-end'
++    const brain = loadBrain({
++      source: injectToken(realMainSource(), token),
++      fetch: () => ({ ok: true, status: 200 }),
++    })
++    const { panel, replies } = replyCollector(brain)
++
++    panel.postMessage(relayMsg('relay-dollar'))
++    await flushUntil(() => replies.some((r) => r.reqId === 'relay-dollar'), { label: '$ 模板序列 token 回执' })
++
++    expect(brain.fetchRequests).toHaveLength(1)
++    const headers = brain.fetchRequests[0]!.headers as Record<string, string>
++    expect(headers['X-Mivo-Debug-Ingest-Token']).toBe(token)
++  })
++
++  it('构建未注入(注入点保持空串)→ 零出网 fail-closed 回执 403(真实源码路径)', async () => {
++    // 等价于「发布时没配 MIVO_DEBUG_INGEST_TOKEN,dist 里注入点仍是空串」。
++    // 走真实源码(loadBrain 不传 seam token),不是既有 seam 缺省用例的重复,
++    // 而是把「构建后空注入点」也当成同一份源码求值。
++    const brain = loadBrain({
++      source: realMainSource(), // 未注入,注入点 = ''
++      fetch: () => ({ ok: true, status: 200 }),
++    })
++    const { panel, replies } = replyCollector(brain)
++
++    panel.postMessage(relayMsg('relay-uninjected'))
++    await flushUntil(() => replies.some((r) => r.reqId === 'relay-uninjected'), { label: '未注入 fail-closed 回执' })
++
++    expect(brain.fetchRequests).toHaveLength(0) // 零出网
++    expect(replies.find((r) => r.reqId === 'relay-uninjected')).toMatchObject({ ok: true, status: 403 })
++  })
++})
+diff --git a/src/__tests__/debugLogRelayGuard.test.ts b/src/__tests__/debugLogRelayGuard.test.ts
+new file mode 100644
+index 00000000..04c97fac
+--- /dev/null
++++ b/src/__tests__/debugLogRelayGuard.test.ts
+@@ -0,0 +1,114 @@
++/**
++ * relay-1 审计修复的机器守卫(#542 双审裁定):`persistRequest('debug-log-relay', …)`
++ * 的出网调用点必须是**唯一一处**,且只能在 `cindyplugin/src/diagnostics/debugLogRelay.ts` 内。
++ *
++ * 背景:debugLogRedact.ts 头注原本声称 main.js 里还有一道"刻意同构的实现"兜底,
++ * 但 main.js 实际对面板 payload 直接 `JSON.stringify` 后交 `hostFetch` —— 第二道
++ * 不存在。脱敏的真正唯一收口在面板侧组包点 `buildRemoteDebugPayload`
++ * (src/store/remoteDebugClientInfo.ts)。本测试就是原注释想要但没做到的「会喊的
++ * 机制」:新增第二个出网调用点 = 新增绕过脱敏的路径,在这里变红,而不是靠自觉。
++ *
++ * 本文件自身是扫描的豁免项(它必须包含这条字符串才能断言它)。
++ */
++import { describe, expect, it } from 'vitest'
++import { readdirSync, readFileSync, statSync } from 'node:fs'
++import { dirname, join, relative } from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++const THIS_FILE = fileURLToPath(import.meta.url)
++const REPO_ROOT = join(dirname(THIS_FILE), '..', '..', '..')
++
++/** 扫描面:面板侧 + 主仓侧全部 TS/TSX(不含测试文件本身)。 */
++const SCAN_DIRS = ['cindyplugin/src', 'src']
++
++/** `persistRequest('debug-log-relay', …)` 字面调用(首参必须是指定 kind)。 */
++const CALL_RE = /persistRequest\(\s*['"]debug-log-relay['"]/
++
++const EXPECTED_SITE = 'cindyplugin/src/diagnostics/debugLogRelay.ts'
++
++/** 递归列出 rel 目录下所有 .ts/.tsx 文件(相对 repo root,`/` 分隔)。 */
++function listTsFiles(relDir: string): string[] {
++  const abs = join(REPO_ROOT, relDir)
++  const out: string[] = []
++  for (const entry of readdirSync(abs)) {
++    const rel = `${relDir}/${entry}`
++    const full = join(abs, entry)
++    if (statSync(full).isDirectory()) out.push(...listTsFiles(rel))
++    else if (/\.tsx?$/.test(entry)) out.push(rel)
++  }
++  return out
++}
++
++/**
++ * 去注释(保持行数),只留代码。注释里引用调用形态不算调用点 —— debugLogRedact.ts
++ * 头注、其它说明文字提到 `persistRequest('debug-log-relay', …)` 是正常的文档行为,
++ * 不该让守卫变红。
++ *
++ * 不感知字符串字面量:行内字符串里的 `//`(如 URL)只可能出现在调用之后,不影响
++ * 对 `persistRequest('debug-log-relay'` 前缀的匹配。
++ */
++function stripComments(src: string): string {
++  const out: string[] = []
++  let inBlock = false
++  for (const line of src.split('\n')) {
++    let s = line
++    if (inBlock) {
++      const end = s.indexOf('*/')
++      if (end === -1) {
++        out.push('')
++        continue
++      }
++      s = s.slice(end + 2)
++      inBlock = false
++    }
++    for (;;) {
++      const lineIdx = s.indexOf('//')
++      const blockIdx = s.indexOf('/*')
++      if (blockIdx !== -1 && (lineIdx === -1 || blockIdx < lineIdx)) {
++        const end = s.indexOf('*/', blockIdx + 2)
++        if (end === -1) {
++          s = s.slice(0, blockIdx)
++          inBlock = true
++          break
++        }
++        s = s.slice(0, blockIdx) + s.slice(end + 2)
++        continue
++      }
++      if (lineIdx !== -1) s = s.slice(0, lineIdx)
++      break
++    }
++    out.push(s)
++  }
++  return out.join('\n')
++}
++
++function findCallSites(): Array<{ file: string; line: number }> {
++  const sites: Array<{ file: string; line: number }> = []
++  for (const dir of SCAN_DIRS) {
++    for (const rel of listTsFiles(dir)) {
++      if (rel === relative(REPO_ROOT, THIS_FILE)) continue // 豁免守卫自身
++      const lines = stripComments(readFileSync(join(REPO_ROOT, rel), 'utf8')).split('\n')
++      lines.forEach((line, index) => {
++        if (CALL_RE.test(line)) sites.push({ file: rel, line: index + 1 })
++      })
++    }
++  }
++  return sites
++}
++
++describe('机器守卫:persistRequest("debug-log-relay") 唯一调用点', () => {
++  it('全仓(cindyplugin/src/** + src/**)恰好一处,且在 debugLogRelay.ts 内', () => {
++    const sites = findCallSites()
++    const list = sites.map((s) => `${s.file}:${s.line}`).join('、') || '(无)'
++    const message =
++      `persistRequest('debug-log-relay', …) 的出网调用点必须是唯一一处,现状 ${sites.length} 处:${list}。\n` +
++      `debug-log-relay 是 debug log 离开面板的唯一出网通道:新增调用点 = 新增绕过脱敏的路径,\n` +
++      `日志将原样出网。任何新增的出网调用点都必须经由 buildRemoteDebugPayload 组包以完成脱敏\n` +
++      `(组包点在 src/store/remoteDebugClientInfo.ts,对每条 entry 统一过 redactForRemoteReport),\n` +
++      `再走既有 relay transport;不要直接调 persistRequest('debug-log-relay', …)。\n` +
++      `唯一合法调用点:${EXPECTED_SITE}。若新增的是测试,请改用 debugLogRelay.ts 的\n` +
++      `__setDebugLogRelayTestSeam,不要直接调 persistRequest。`
++    expect(sites, message).toHaveLength(1)
++    expect(sites[0]!.file, message).toBe(EXPECTED_SITE)
++  })
++})
+diff --git a/src/__tests__/pluginAppVersion.test.ts b/src/__tests__/pluginAppVersion.test.ts
+new file mode 100644
+index 00000000..a48af852
+--- /dev/null
++++ b/src/__tests__/pluginAppVersion.test.ts
+@@ -0,0 +1,57 @@
++import { describe, it, expect } from 'vitest'
++import { readFileSync } from 'node:fs'
++import { fileURLToPath } from 'node:url'
++import pluginViteConfig, { resolvePluginAppVersion } from '../../vite.config'
++
++/**
++ * SC-0c:插件正式构建的 `VITE_MIVO_VERSION`(= 上报 payload 的 `appVersion`)必须等于
++ * `cindyplugin/ghost.json` 的 `version`,dev 构建才保留 `cindy-plugin-dev`。
++ *
++ * 为什么值得一道机器锁:这个值是插件日志在服务端 debug-records 里的唯一版本主键。
++ * 回归形态非常安静 —— 有人把 define 改回硬编码字符串,构建照样成功、面板照样能跑、
++ * 日志照样能上报,只是所有正式包的记录全部聚合成 "dev" 一个桶,"哪个版本引入的"
++ * 从此问不出来。除了这条断言,没有任何东西会在 CI 里喊出来。
++ *
++ * 测试**独立重读** ghost.json(不复用被测代码的返回值当期望值),否则会退化成
++ * "自己等于自己" 的空断言。
++ */
++
++const ghostVersion = (): string => {
++  const ghostPath = fileURLToPath(new URL('../../ghost.json', import.meta.url))
++  const parsed = JSON.parse(readFileSync(ghostPath, 'utf8')) as { version?: unknown }
++  return String(parsed.version ?? '')
++}
++
++// vite 的 defineConfig 对函数式配置是恒等返回,所以 default export 就是那个工厂函数。
++type ConfigFactory = (env: { command: 'build' | 'serve'; mode: string }) => {
++  define?: Record<string, string>
++}
++
++const defineFor = (command: 'build' | 'serve'): Record<string, string> => {
++  const factory = pluginViteConfig as unknown as ConfigFactory
++  return factory({ command, mode: command === 'build' ? 'production' : 'development' }).define ?? {}
++}
++
++describe('SC-0c:插件 appVersion 注入', () => {
++  it('正式构建(command=build)注入 ghost.json 的 version', () => {
++    const expected = ghostVersion()
++    // 前置合理性:ghost.json 的 version 本身必须是非空且不是 dev 占位,
++    // 否则下面两条断言会在一个坏基线上"通过"。
++    expect(expected).toMatch(/^\d+\.\d+\.\d+/)
++    expect(resolvePluginAppVersion('build')).toBe(expected)
++  })
++
++  it('正式构建绝不是 cindy-plugin-dev(这正是本次要修的回归)', () => {
++    expect(resolvePluginAppVersion('build')).not.toBe('cindy-plugin-dev')
++  })
++
++  it('dev 构建(command=serve)保留 cindy-plugin-dev 标识', () => {
++    expect(resolvePluginAppVersion('serve')).toBe('cindy-plugin-dev')
++  })
++
++  it('vite config 的 define 真的把该值接到 import.meta.env.VITE_MIVO_VERSION 上', () => {
++    // 只断言 resolvePluginAppVersion 不够 —— 它可能算对了却没被 define 消费。
++    expect(defineFor('build')['import.meta.env.VITE_MIVO_VERSION']).toBe(JSON.stringify(ghostVersion()))
++    expect(defineFor('serve')['import.meta.env.VITE_MIVO_VERSION']).toBe(JSON.stringify('cindy-plugin-dev'))
++  })
++})
+diff --git a/src/diagnostics/debugLogRelay.ts b/src/diagnostics/debugLogRelay.ts
+new file mode 100644
+index 00000000..64de3620
+--- /dev/null
++++ b/src/diagnostics/debugLogRelay.ts
+@@ -0,0 +1,148 @@
++/**
++ * 面板侧 debug log 回传 transport(v3)。
++ *
++ * 面板跑在 `cindy-ghost://<id>/` 下,没有任何可用的出网出口:相对路径 `/api/mivo/...`
++ * 打不到 BFF,而宿主对 Origin **双向封死**(插件传入的 origin 被 STRIPPED_REQUEST_HEADERS
++ * 静默丢弃,secret inject 侧的 GHOST_NETWORK_FORBIDDEN_INJECT_HEADERS 同样含 origin)。
++ * 所以出网只能经电子脑 `cindy.fetch` 代发,本模块就是那条通道的面板端。
++ *
++ * 刻意不发明第二套桥:请求走**既有** `persistRequest`(BroadcastChannel + `/wake` 唤醒 +
++ * reqId 去重 + 800ms 重发 + 超时),只是多一个 kind。
++ *
++ * ── 两条硬约束(违反任一即为功能失败)──
++ * 1. **绝对零 UI**:本文件任何路径都不得产生用户可见反馈 —— 不调 toastFeedback、不调
++ *    cindy.notify、不新增视觉元素。
++ * 2. **不回流 debugLogger**:relay 自身的失败绝不能记成 warn/error。面板装了
++ *    consoleCapture,`console.warn/error` 会被改写成 `debugLogger.warn/error` → 再次
++ *    进上报队列 → 失败 → 又记一条…… 死循环。所以本文件**连 console 都不用**,可观测面
++ *    只有下面的内部计数器(main.js 侧另有 console 留痕,那边不回流面板)。
++ *
++ * 完整设计:docs/plans/2026-08-06-cindyplugin-silent-debug-log.md §1/§2-F/§2-G
++ */
++
++import { persistRequest, type PersistReply } from '../persist/bridge'
++import type { RemoteDebugPayload } from '../../../src/store/remoteDebugReporter'
++import type { RemoteDebugTransport, RemoteDebugTransportResult } from '../../../src/store/remoteDebugTransport'
++import { redactForRemoteReport } from './debugLogRedact'
++
++/** 单次 relay 的桥超时。与 §2-G "悬挂 30s 不阻塞画布" 的场景值一致。 */
++const RELAY_TIMEOUT_MS = 30_000
++/** 重发间隔:沿用 persistRequest 默认值,显式写出以示这是协议的一部分。 */
++const RELAY_RETRY_MS = 800
++
++/**
++ * 保险丝(§2-G):滑动 10 分钟窗口内最多发起 30 次 relay。
++ *
++ * 为什么按"发起次数"而不是"失败次数":风暴的成本在于**发出去的请求**本身
++ * (BC 消息 + 宿主出网 + 服务端限流额度),成功的风暴一样要封顶。
++ *
++ * 身份键是"本面板":本模块是面板上下文里的模块级单例,每个面板各有一份,天然等价于
++ * 按面板 sessionId 分桶,不需要再造一个 id。
++ */
++const FUSE_WINDOW_MS = 10 * 60_000
++const FUSE_MAX_STARTS = 30
++
++/** relay 发起时刻的滑动窗(升序;只保留窗内的)。 */
++let startedAt: number[] = []
++
++type RelayStats = {
++  /** 真正发起过的 relay 次数(不含被保险丝短路的)。 */
++  started: number
++  /** 被保险丝短路、连 BC 消息都没发的次数。 */
++  fuseBlocked: number
++  /** 最近一次映射结果(便于测试与真机自检;不含任何日志正文)。 */
++  lastOutcome: 'none' | '2xx' | 'http-error' | 'transport-error' | 'fuse'
++}
++
++const stats: RelayStats = { started: 0, fuseBlocked: 0, lastOutcome: 'none' }
++
++/** 只读快照。零 UI 约束下这是面板侧唯一的可观测面。 */
++export const getDebugLogRelayStats = (): RelayStats => ({ ...stats })
++
++// ── 测试 seam(生产零副作用)────────────────────────────────────────────────
++// 协议测试要能在不起真实 BroadcastChannel / 不等真实 30s 的前提下钉住映射表。
++type RelaySeam = {
++  request?: (kind: 'debug-log-relay', payload: Record<string, unknown>, options: { retryMs: number; timeoutMs: number }) => Promise<PersistReply>
++  now?: () => number
++}
++let seam: RelaySeam | null = null
++export const __setDebugLogRelayTestSeam = (next: RelaySeam | null): void => {
++  seam = next
++  startedAt = []
++  stats.started = 0
++  stats.fuseBlocked = 0
++  stats.lastOutcome = 'none'
++}
++
++const now = (): number => (seam?.now ? seam.now() : Date.now())
++const sendRequest = (payload: Record<string, unknown>): Promise<PersistReply> =>
++  seam?.request
++    ? seam.request('debug-log-relay', payload, { retryMs: RELAY_RETRY_MS, timeoutMs: RELAY_TIMEOUT_MS })
++    : persistRequest('debug-log-relay', payload, { retryMs: RELAY_RETRY_MS, timeoutMs: RELAY_TIMEOUT_MS })
++
++/**
++ * 脱敏收口(§2-D):这是日志离开面板的**最后一站**,所有 entry 的 message / stack 在此
++ * 统一过一遍 redactForRemoteReport。放在这里而不是各调用点的理由见 debugLogRedact.ts 头注。
++ * clientInfo 里的 pagePath / userAgent 等是设备元数据,不属"敏感三类",原样保留。
++ */
++const redactPayload = (payload: RemoteDebugPayload): RemoteDebugPayload => ({
++  ...payload,
++  entries: payload.entries.map((entry) => {
++    const next = { ...entry, message: redactForRemoteReport(entry.message) }
++    if (typeof next.stack === 'string') next.stack = redactForRemoteReport(next.stack)
++    return next
++  }),
++})
++
++/** 窗口滑动 + 是否已达上限。有副作用(剔除窗外记录),调用点只在 transport 入口。 */
++const fuseTripped = (nowMs: number): boolean => {
++  startedAt = startedAt.filter((at) => nowMs - at < FUSE_WINDOW_MS)
++  return startedAt.length >= FUSE_MAX_STARTS
++}
++
++/**
++ * relay transport。映射表(计划 §1,逐行有测试):
++ *
++ * | relay 现场                                   | 返回                          |
++ * |---------------------------------------------|-------------------------------|
++ * | HTTP 2xx                                     | resolve `{ok:true, status}`   |
++ * | HTTP 非 2xx(403/413/429/5xx…)              | resolve `{ok:false, status}`  |
++ * | 宿主回包 `{ok:false}`(cindy.fetch 自身失败) | **reject**                    |
++ * | 桥超时 / ghost 唤不醒 / 回包形状非法          | **reject**                    |
++ * | 保险丝已触发                                  | 短路 resolve `{ok:false,429}` |
++ *
++ * 保险丝短路时**不发 BC 消息、不打网络**(SC-4 的"零新请求"指这个)。返回 429 而不是
++ * 假装成功,是为了让 reporter 走它自己的退避与 drop 计数终态 —— 被丢弃的条目仍然可查,
++ * 不会被伪造成"已送达"而被删掉。
++ */
++export const debugLogRelayTransport: RemoteDebugTransport = async (payload): Promise<RemoteDebugTransportResult> => {
++  const at = now()
++  if (fuseTripped(at)) {
++    stats.fuseBlocked += 1
++    stats.lastOutcome = 'fuse'
++    // 429 = "本窗口内我方主动限速",语义上与服务端限流同类,reporter 按普通失败退避。
++    return { ok: false, status: 429 }
++  }
++  startedAt.push(at)
++  stats.started += 1
++
++  // 面板只递 payload,**不传 URL / header** —— 端点与请求头在电子脑侧写死(计划 §1-2),
++  // 面板拿不到也改不了。这样即使面板侧被注入,也没法让 relay 打别的地址。
++  const reply = await sendRequest({ payload: redactPayload(payload) })
++
++  // 桥层超时(persistRequest 合成的回执)与宿主传输失败合并成"传输错误"= reject。
++  if (!reply || reply.ok !== true) {
++    stats.lastOutcome = 'transport-error'
++    throw new Error(reply?.timeout ? 'debug-log relay timeout' : 'debug-log relay transport failure')
++  }
++  const status = Number(reply.status)
++  if (!Number.isFinite(status) || status <= 0) {
++    // 回包说 ok 却没给合法 status:协议对不上,按传输错误处理。绝不能把"消息送达"
++    // 当成 HTTP 成功 —— 那会让 reporter 删掉一批其实没落库的日志。
++    stats.lastOutcome = 'transport-error'
++    throw new Error('debug-log relay malformed reply (missing status)')
++  }
++  const ok = status >= 200 && status < 300
++  stats.lastOutcome = ok ? '2xx' : 'http-error'
++  return { ok, status }
++}
+diff --git a/src/persist/bridge.ts b/src/persist/bridge.ts
+index cfbb8d5f..c080f708 100644
+--- a/src/persist/bridge.ts
++++ b/src/persist/bridge.ts
+@@ -17,6 +17,10 @@ export type PersistReply = {
+   reqId: string
+   reply: true
+   ok: boolean
++  // debug-log-relay 回执携带的 HTTP 状态码(v3)。与 `ok` 是两件事:relay 的 `ok:true`
++  // 只表示"电子脑确实拿到了一个 HTTP 响应",2xx 与否看 `status`;`ok:false` = 传输层就没成
++  // (cindy.fetch 自身失败 / 电子脑异常),此时不带 status。
++  status?: number
+   message?: string
+   timeout?: boolean
+   state?: string | null
+@@ -138,7 +142,8 @@ export function persistRequest(
+     | 'deposit-state-save'
+     | 'pending-list'
+     | 'pending-ack'
+-    | 'pending-probe',
++    | 'pending-probe'
++    | 'debug-log-relay',
+   payload: Record<string, unknown> = {},
+   options: RequestOptions = {},
+ ): Promise<PersistReply> {
+diff --git a/src/plugin-main.tsx b/src/plugin-main.tsx
+index 3caaabe1..c2411897 100644
+--- a/src/plugin-main.tsx
++++ b/src/plugin-main.tsx
+@@ -9,6 +9,9 @@ import { installAgentBridge } from './agent/agentBridge'
+ import { cindyImageGenerationPort } from './agent/cindyGenerationPort'
+ import { initMediaLedger } from './agent/mediaLedger'
+ import { startBrainDiagnostics } from './diagnostics/brainDiagnostics'
++import { debugLogRelayTransport } from './diagnostics/debugLogRelay'
++import { installConsoleCapture } from '../../src/store/debugLogStore'
++import { installRemoteDebugReporter } from '../../src/store/remoteDebugReporter'
+ import { startSessionSignalBridge } from './session/sessionSignalBridge'
+ import { setImageGenerationPort } from '../../src/lib/imageGenerationPort'
+ // chatStore 是画布图片编辑(局部重绘/区域编辑)提交链路的必需基础设施,不只是聊天 UI 的
+@@ -27,6 +30,30 @@ declare global {
+ }
+ window.__MIVO_CINDY_PLUGIN__ = true
+ 
++// ── warning/error 级 debug log 静默回传(v3)────────────────────────────────────
++//
++// 装配顺序是本功能的正确性前提,不是风格:
++//   · 插件构建把 VITE_MIVO_REMOTE_DEBUG 定为 '0'(见 cindyplugin/vite.config.ts),所以在
++//     这一行之前产生的任何 warn/error 都**不会**入队(零泄漏);
++//   · forceEnable 与 transport 在**同一次调用**里就位 —— 开启的同一刻出网方式已经正确,
++//     不存在"已开启但还在用默认 fetch"的中间态;
++//   · installConsoleCapture 放在 install **之后**:它会把 console.warn/error 改写成
++//     debugLogger.warn/error,也就是打开上报的主进水口,必须等出口先接好。
++//
++// durableFirst:面板随时可被用户收起,发送悬挂期间关闭会让批次既不在内存队列也不在
++//   outbox → 先落库堵住这个窗口。
++// silent:面板挂着 <ToastViewport />,任何 toast 都会真弹出来;本功能是绝对零 UI。
++//
++// 跨 Cindy 重启的日志**不承诺**保留(cindy-ghost origin 的 IDB 跨重启保留性无证据,
++// 见计划 §2-C 已接受的边界)。owner 的目标是 bug-doctor 拿到信号,不是完美审计线。
++installRemoteDebugReporter({
++  transport: debugLogRelayTransport,
++  durableFirst: true,
++  silent: true,
++  forceEnable: true,
++})
++installConsoleCapture()
++
+ // 电子脑诊断桥:先挂,才能收到面板关闭期间积压的电子脑事件回放(#298 X0)。
+ startBrainDiagnostics()
+ 
+diff --git a/vite.config.ts b/vite.config.ts
+index bf085288..24e86b1c 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -1,18 +1,57 @@
+ import { defineConfig } from 'vite'
+ import react from '@vitejs/plugin-react'
+ import { fileURLToPath } from 'node:url'
++import { readFileSync } from 'node:fs'
+ 
+ // Cindy 插件面板构建。独立于根 vite.config.ts,不影响原 Web 应用的 dev/build。
+ // base './':面板经 cindy-ghost://<id>/panel.html 加载,构建产物必须相对引用。
+ // publicDir false:插件需要的静态资源(stickers / demo-assets)由 build.sh 显式
+ // 拷贝进 dist,避免把仓库 public/ 里插件用不到的内容整体带进包。
+-export default defineConfig({
++
++/** dev(vite serve)下的版本标识:刻意不读 ghost.json,让本地调试与正式包的日志可区分。 */
++const DEV_VERSION = 'cindy-plugin-dev'
++
++/**
++ * 正式构建的 `VITE_MIVO_VERSION` 取自 `cindyplugin/ghost.json` 的 `version`。
++ *
++ * 为什么必须这么做:该值是插件日志落到服务端 debug-records 后的**唯一版本主键**
++ * (`appVersion`)。此前这里硬编码 `cindy-plugin-dev` 且 build.sh 不覆盖 → 所有正式包
++ * 的记录都聚合进同一个 "dev" 桶,"哪个版本引入了这个 bug" 这类判断根本做不出来。
++ *
++ * 读不到 / 形状不对时**抛错让构建失败**,不静默回落 DEV_VERSION —— 静默回落等于把
++ * 正在修的这个 bug 再悄悄装回正式包(fail visibly, not silently)。
++ */
++const readGhostVersion = (): string => {
++  const ghostPath = fileURLToPath(new URL('./ghost.json', import.meta.url))
++  const parsed = JSON.parse(readFileSync(ghostPath, 'utf8')) as { version?: unknown }
++  const version = typeof parsed.version === 'string' ? parsed.version.trim() : ''
++  if (!version) {
++    throw new Error(
++      `cindyplugin/ghost.json 的 version 字段缺失或不是非空字符串(读到 ${JSON.stringify(parsed.version)});` +
++        '插件日志的 appVersion 依赖它,不允许静默回落成 dev 标识。',
++    )
++  }
++  return version
++}
++
++/** 供 SC-0c 单测复用同一份判据(测试不另写一份,避免两边漂移)。 */
++export const resolvePluginAppVersion = (command: 'build' | 'serve'): string =>
++  command === 'build' ? readGhostVersion() : DEV_VERSION
++
++export default defineConfig(({ command }) => ({
+   root: fileURLToPath(new URL('.', import.meta.url)),
+   base: './',
+   publicDir: false,
+   plugins: [react()],
+   define: {
+-    'import.meta.env.VITE_MIVO_VERSION': JSON.stringify('cindy-plugin-dev'),
++    'import.meta.env.VITE_MIVO_VERSION': JSON.stringify(resolvePluginAppVersion(command)),
++    // 远程上报的 env 门:插件构建里**默认关闭**(fail-closed)。
++    // 原因:reportRemoteDebugEntry 只受 remoteDebugEnabled() 门控,不受 installed 门控 ——
++    // 若默认开着,relay transport 装上之前产生的任何 warn/error 都会走默认 fetch 去打相对
++    // 路径 /api/mivo/debug-logs,在 cindy-ghost:// 下必然失败,还会带着错误的出网方式进
++    // outbox 反复重试。ESM 的 import 求值早于入口任何语句,"把 install 写第一行"挡不住。
++    // plugin-main.tsx 在 transport 就位的同一次调用里用 forceEnable 显式开启。
++    'import.meta.env.VITE_MIVO_REMOTE_DEBUG': JSON.stringify('0'),
+   },
+   build: {
+     outDir: 'dist',
+@@ -28,4 +67,4 @@ export default defineConfig({
+       },
+     },
+   },
+-})
++}))

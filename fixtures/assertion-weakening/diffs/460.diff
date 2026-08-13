@@ -1,0 +1,682 @@
+diff --git a/src/__tests__/depositMigration.test.ts b/src/__tests__/depositMigration.test.ts
+index 17167240..3df31d4f 100644
+--- a/src/__tests__/depositMigration.test.ts
++++ b/src/__tests__/depositMigration.test.ts
+@@ -12,11 +12,20 @@ import {
+   migrateLedgerIntoDepositStore,
+   setDepositLedgerReaderForTests,
+   setDepositMigrationClockForTests,
++  type LedgerReadOutcome,
+   type LedgerSnapshot,
+ } from '../agent/depositMigration'
+ import { loadDepositStore, lookupDeposit, peekDepositStoreForTests, recordDeposit } from '../agent/depositStore'
++import { resolveDepositEntry } from '../agent/depositPort'
++import { lookupMedia } from '../agent/mediaLedger'
+ import { debugLogger } from '../../../src/store/debugLogStore'
+-import { createDepositHarness, teardownDepositHarness, FAKE_HASH, type DepositHarness } from './depositTestHarness'
++import {
++  createDepositHarness,
++  teardownDepositHarness,
++  blobOfBytes,
++  FAKE_HASH,
++  type DepositHarness,
++} from './depositTestHarness'
+ 
+ let harness: DepositHarness
+ let ledgerReads = 0
+@@ -32,7 +41,16 @@ const ledgerOf = (count: number): LedgerSnapshot => {
+ const useLedger = (snapshot: LedgerSnapshot | null): void => {
+   setDepositLedgerReaderForTests(async () => {
+     ledgerReads += 1
+-    return snapshot
++    return { status: 'ok', ledger: snapshot }
++  })
++}
++
++/** 按顺序吐出不同的 `LedgerReadOutcome`,吐完固定在最后一个(供重试用例用)。 */
++const useLedgerSequence = (outcomes: LedgerReadOutcome[]): void => {
++  setDepositLedgerReaderForTests(async () => {
++    const outcome = outcomes[Math.min(ledgerReads, outcomes.length - 1)]
++    ledgerReads += 1
++    return outcome
+   })
+ }
+ 
+@@ -147,6 +165,35 @@ describe('迁移 — 中断恢复', () => {
+ 
+     await expect(lookupDeposit('mivo-asset:0')).resolves.toBeTruthy()
+   })
++
++  it('新代写成后崩(SC1b.6 镜像方向):提交已落盘成功,随即模拟崩溃重启 → 数据无损、幂等短路生效,零额外读写', async () => {
++    useLedger(ledgerOf(4))
++
++    const first = await migrateLedgerIntoDepositStore()
++    expect(first).toMatchObject({ alreadyDone: false, migrated: 4, committed: true })
++
++    // 「崩溃重启」:换一个干净会话读同一磁盘 —— 这次磁盘上**已经**落有成功提交的新代
++    // (与上面「写失败可恢复」测试的镜像:那条是提交失败后重启,这条是提交成功后
++    // 立即重启),证明"写成功那一刻之后崩"不会丢数据、也不会被误判成"未迁移"。
++    const disk = { ...Object.fromEntries(harness.brain.files) }
++    teardownDepositHarness()
++    harness = createDepositHarness({ files: disk })
++    setDepositMigrationClockForTests(() => 1_700_000_000_000)
++    useLedger(ledgerOf(4))
++
++    const reloaded = await loadDepositStore()
++    expect(reloaded.migration).toMatchObject({ version: DEPOSIT_MIGRATION_VERSION, migrated: 4 })
++    expect(Object.keys(reloaded.map)).toHaveLength(4)
++
++    const writesBeforeSecond = harness.fsRequests.filter((request) => request.op === 'write').length
++    const readsBeforeSecond = ledgerReads
++    const second = await migrateLedgerIntoDepositStore()
++
++    expect(second).toMatchObject({ alreadyDone: true, migrated: 0, skipped: 0, committed: true })
++    expect(ledgerReads).toBe(readsBeforeSecond) // 幂等短路发生在读账本之前:新会话里零额外读账本
++    expect(harness.fsRequests.filter((request) => request.op === 'write')).toHaveLength(writesBeforeSecond) // 零额外写
++    expect(Object.keys(peekDepositStoreForTests()?.map ?? {})).toHaveLength(4) // 无重复、无丢失
++  })
+ })
+ 
+ describe('迁移 — 脏数据', () => {
+@@ -241,20 +288,21 @@ describe('迁移 — 原型污染硬门(存量账本是不可信输入)', () =>
+   })
+ })
+ 
+-describe('迁移 — /kv 读取失败留痕(review:332 P1,不再静默坍缩成「无账本」)', () => {
+-  // 这三组不调用 useLedger:让 defaultReadLedger 真正跑,断言的是它自己的三条
++describe('迁移 — /kv 读取失败留痕(judge P1-C2:读取失败绝不得与「无账本」混同,绝不写完成标记)', () => {
++  // 这几组不调用 useLedger:让 defaultReadLedger 真正跑,断言的是它自己的三条
+   // 失败路径,不是测试替身。
+   afterEach(() => {
+     vi.unstubAllGlobals()
+   })
+ 
+-  it('/kv 非 2xx:留痕状态码,视作无存量账本但不阻断迁移', async () => {
++  it('/kv 非 2xx:留痕状态码,本轮不写迁移标记(保留重试资格,不当作「无账本」放过)', async () => {
+     vi.stubGlobal('fetch', async () => ({ ok: false, status: 500 }) as unknown as Response)
+     const warnSpy = vi.spyOn(debugLogger, 'warn')
+ 
+     const outcome = await migrateLedgerIntoDepositStore()
+ 
+-    expect(outcome).toMatchObject({ migrated: 0, skipped: 0, committed: true })
++    expect(outcome).toMatchObject({ alreadyDone: false, migrated: 0, skipped: 0, committed: false })
++    expect(peekDepositStoreForTests()?.migration).toBeUndefined() // 标记必须没写,否则下次被幂等短路永久漏迁
+     expect(warnSpy).toHaveBeenCalledWith(
+       'Cindy Deposit',
+       expect.stringContaining('status=500'),
+@@ -262,7 +310,7 @@ describe('迁移 — /kv 读取失败留痕(review:332 P1,不再静默坍缩成
+     warnSpy.mockRestore()
+   })
+ 
+-  it('/kv 网络级异常(含本机无宿主调试环境这个最常见子情形):留痕原因,不阻断迁移', async () => {
++  it('/kv 网络级异常(含本机无宿主调试环境这个最常见子情形):留痕原因,本轮不写迁移标记', async () => {
+     vi.stubGlobal(
+       'fetch',
+       async () => {
+@@ -273,7 +321,8 @@ describe('迁移 — /kv 读取失败留痕(review:332 P1,不再静默坍缩成
+ 
+     const outcome = await migrateLedgerIntoDepositStore()
+ 
+-    expect(outcome).toMatchObject({ migrated: 0, skipped: 0, committed: true })
++    expect(outcome).toMatchObject({ alreadyDone: false, migrated: 0, skipped: 0, committed: false })
++    expect(peekDepositStoreForTests()?.migration).toBeUndefined()
+     expect(warnSpy).toHaveBeenCalledWith(
+       'Cindy Deposit',
+       expect.stringContaining('fetch is not implemented'),
+@@ -281,7 +330,7 @@ describe('迁移 — /kv 读取失败留痕(review:332 P1,不再静默坍缩成
+     warnSpy.mockRestore()
+   })
+ 
+-  it('/kv 响应体解析失败:留痕原因,不阻断迁移', async () => {
++  it('/kv 响应体解析失败:留痕原因,本轮不写迁移标记', async () => {
+     vi.stubGlobal('fetch', async () => ({
+       ok: true,
+       json: async () => {
+@@ -292,7 +341,8 @@ describe('迁移 — /kv 读取失败留痕(review:332 P1,不再静默坍缩成
+ 
+     const outcome = await migrateLedgerIntoDepositStore()
+ 
+-    expect(outcome).toMatchObject({ migrated: 0, skipped: 0, committed: true })
++    expect(outcome).toMatchObject({ alreadyDone: false, migrated: 0, skipped: 0, committed: false })
++    expect(peekDepositStoreForTests()?.migration).toBeUndefined()
+     expect(warnSpy).toHaveBeenCalledWith(
+       'Cindy Deposit',
+       expect.stringContaining('Unexpected token in JSON'),
+@@ -300,6 +350,26 @@ describe('迁移 — /kv 读取失败留痕(review:332 P1,不再静默坍缩成
+     warnSpy.mockRestore()
+   })
+ 
++  it('第一次读取失败、第二次成功且有存量账本 → 真的重试并迁成(fetch ≥ 2 次,migrated=1)', async () => {
++    // 不用 vi.stubGlobal('fetch', ...) ——这条要证明"重试"这个行为本身,不是
++    // defaultReadLedger 的实现细节,所以走注入 reader,直接控制第几次调用返回什么。
++    useLedgerSequence([
++      { status: 'error', reason: 'temporary outage' },
++      { status: 'ok', ledger: ledgerOf(1) },
++    ])
++
++    const first = await migrateLedgerIntoDepositStore()
++    expect(first).toMatchObject({ alreadyDone: false, migrated: 0, skipped: 0, committed: false })
++    expect(peekDepositStoreForTests()?.migration).toBeUndefined()
++
++    const second = await migrateLedgerIntoDepositStore()
++
++    expect(second).toMatchObject({ alreadyDone: false, migrated: 1, skipped: 0, committed: true })
++    expect(ledgerReads).toBeGreaterThanOrEqual(2) // 真的又读了一次账本,不是命中幂等短路
++    expect(peekDepositStoreForTests()?.migration).toMatchObject({ version: DEPOSIT_MIGRATION_VERSION, migrated: 1 })
++    await expect(lookupDeposit('mivo-asset:0')).resolves.toMatchObject({ from: 'ledger' })
++  })
++
+   it('三条失败路径的日志文案互不相同,可据此区分根因(不是同一句糊过去)', async () => {
+     // 每种失败即便 migrated=0 也会把 migration.version 写盘(幂等标记不区分「真无
+     // 账本」与「读取失败」),所以三个场景之间必须换一份全新的 depositStore(含它
+@@ -334,3 +404,30 @@ describe('迁移 — /kv 读取失败留痕(review:332 P1,不再静默坍缩成
+     warnSpy.mockRestore()
+   })
+ })
++
++describe('迁移 — 粘贴/拖入/存量路径不写 ledger(SC1b.6)', () => {
++  // 粘贴/拖入/存量三条路在设计上共用同一条"未命中就寄存"路径(depositPort.ts
++  // 的 resolveDepositEntry,§4.3/§4.5 一视同仁);它天生不 import mediaLedger,
++  // 这里把"不写 ledger"这条不变量落成断言,不止是"代码没写"这件事的口头声明。
++  it('resolveDepositEntry 走寄存(未命中缓存)完成后,mediaLedger 无新增条目', async () => {
++    const assetUrl = 'mivo-asset:pasted-1'
++
++    await expect(resolveDepositEntry({ assetUrl, blob: blobOfBytes(1_024) })).resolves.toMatchObject({
++      hash: FAKE_HASH,
++      from: 'deposit',
++    })
++
++    expect(lookupMedia(assetUrl)).toBeUndefined()
++    await expect(lookupDeposit(assetUrl)).resolves.toMatchObject({ from: 'deposit' })
++  })
++
++  it('resolveDepositEntry 缓存命中(from=deposit)同样不触碰 mediaLedger', async () => {
++    const assetUrl = 'mivo-asset:existing-1'
++    await recordDeposit(assetUrl, { hash: FAKE_HASH, ext: '.png', depositedAt: 1, from: 'deposit' })
++
++    await expect(resolveDepositEntry({ assetUrl })).resolves.toMatchObject({ from: 'deposit' })
++
++    expect(lookupMedia(assetUrl)).toBeUndefined()
++    expect(harness.hostRequests).toHaveLength(0) // 缓存命中,连 deposit_media 都没发
++  })
++})
+diff --git a/src/__tests__/depositOwned.test.ts b/src/__tests__/depositOwned.test.ts
+new file mode 100644
+index 00000000..2806f1b5
+--- /dev/null
++++ b/src/__tests__/depositOwned.test.ts
+@@ -0,0 +1,190 @@
++/**
++ * owned 判定 + 生成/过户双写测试(SC1b.4,设计稿 §4.4.4 三类条目表)。
++ *
++ * 核心断言:`from:'artifact'`/`from:'ledger'` 命中 → `resolveDepositEntry`
++ * 零 `deposit_media`、零 `release_media`(双 spy,复用 T1a 已交付的
++ * `depositTestHarness` 的 `hostRequests`/`hostReleaseRequests`)。
++ *
++ * 本文件不接任何生产 callsite,只测 depositOwned.ts 的纯函数与它和 T1a 已交付的
++ * depositPort.ts(resolveDepositEntry/releaseHash)之间的 seam 行为。
++ */
++import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
++import { isOwnedDepositFrom, isOwnedDepositEntry, recordArtifactDeposit } from '../agent/depositOwned'
++import { resolveDepositEntry } from '../agent/depositPort'
++import { lookupDeposit, recordDeposit, type DepositEntry } from '../agent/depositStore'
++import { initMediaLedger, lookupMedia, resetMediaLedgerForTests } from '../agent/mediaLedger'
++import {
++  createDepositHarness,
++  teardownDepositHarness,
++  blobOfBytes,
++  FAKE_HASH,
++  type DepositHarness,
++} from './depositTestHarness'
++
++let harness: DepositHarness
++/** `/kv` 的假"磁盘":真实 GET/PUT 往返,让 ledger 的持久化断言不是纸面声明。 */
++let kvDisk: Record<string, unknown> = {}
++
++beforeEach(() => {
++  harness = createDepositHarness()
++  kvDisk = {}
++  resetMediaLedgerForTests()
++  // recordArtifactDeposit 现在 await `recordMediaDurable`(SC-T1c-fix.1),真的会立即
++  // 发 GET/PUT `/kv`,不再是"排一个 1.5s 后才可能触发的定时器"——必须给出真实往返的
++  // fetch 替身,而不是像本文件改动前那样靠"测试跑得比 1.5s 快"侧面绕开它。
++  vi.stubGlobal('window', {
++    setTimeout: (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms),
++    clearTimeout: (id: unknown) => globalThis.clearTimeout(id as never),
++  })
++  vi.stubGlobal('fetch', async (input: unknown, init?: { method?: string; body?: string }) => {
++    if (String(input) !== '/kv') throw new Error(`unexpected fetch target: ${String(input)}`)
++    if (init?.method === 'PUT') {
++      kvDisk = JSON.parse(String(init.body)) as Record<string, unknown>
++      return { ok: true, json: async () => kvDisk } as unknown as Response
++    }
++    return { ok: true, json: async () => kvDisk } as unknown as Response
++  })
++})
++
++afterEach(() => {
++  teardownDepositHarness()
++  resetMediaLedgerForTests()
++  vi.unstubAllGlobals()
++})
++
++const entryOf = (from: DepositEntry['from']): DepositEntry => ({
++  hash: FAKE_HASH,
++  ext: '.png',
++  depositedAt: 1,
++  from,
++  gen: 1,
++  writer: 'w',
++})
++
++describe('isOwnedDepositFrom / isOwnedDepositEntry(纯谓词)', () => {
++  it('artifact 与 ledger 是 owned,deposit 不是', () => {
++    expect(isOwnedDepositFrom('artifact')).toBe(true)
++    expect(isOwnedDepositFrom('ledger')).toBe(true)
++    expect(isOwnedDepositFrom('deposit')).toBe(false)
++  })
++
++  it('entry 版本覆盖三态 + 未命中(undefined)不是 owned', () => {
++    expect(isOwnedDepositEntry(entryOf('artifact'))).toBe(true)
++    expect(isOwnedDepositEntry(entryOf('ledger'))).toBe(true)
++    expect(isOwnedDepositEntry(entryOf('deposit'))).toBe(false)
++    expect(isOwnedDepositEntry(undefined)).toBe(false)
++  })
++})
++
++describe('owned 命中 → resolveDepositEntry 零 deposit_media 且零 release_media(SC1b.4 双 spy)', () => {
++  it('from=artifact 命中:返回缓存,零寄存请求、零释放请求', async () => {
++    const assetUrl = 'mivo-asset:artifact-1'
++    await recordDeposit(assetUrl, { hash: FAKE_HASH, ext: '.png', depositedAt: 1, from: 'artifact' })
++
++    const entry = await resolveDepositEntry({ assetUrl, blob: blobOfBytes(2_048) })
++
++    expect(entry).toMatchObject({ hash: FAKE_HASH, ext: '.png', from: 'artifact' })
++    expect(harness.hostRequests).toHaveLength(0)
++    expect(harness.hostReleaseRequests).toHaveLength(0)
++  })
++
++  it('from=ledger 命中:返回缓存,零寄存请求、零释放请求', async () => {
++    const assetUrl = 'mivo-asset:legacy-1'
++    await recordDeposit(assetUrl, { hash: FAKE_HASH, ext: '.png', depositedAt: 0, from: 'ledger' })
++
++    const entry = await resolveDepositEntry({ assetUrl })
++
++    expect(entry).toMatchObject({ hash: FAKE_HASH, ext: '.png', from: 'ledger' })
++    expect(harness.hostRequests).toHaveLength(0)
++    expect(harness.hostReleaseRequests).toHaveLength(0)
++  })
++})
++
++describe('生成/过户双写(recordArtifactDeposit,SC1b.4)', () => {
++  it('写入后 mediaLedger 与 depositMap 双双可查,depositMap from=artifact', async () => {
++    const assetUrl = 'mivo-asset:gen-1'
++
++    const result = await recordArtifactDeposit(assetUrl, { hash: FAKE_HASH, ext: '.png', bytes: 999 })
++
++    expect(result.ledgerWritten).toBe(true)
++    expect(result.commit?.ok).toBe(true)
++    expect(lookupMedia(assetUrl)).toMatchObject({ hash: FAKE_HASH, ext: '.png' })
++    await expect(lookupDeposit(assetUrl)).resolves.toMatchObject({ hash: FAKE_HASH, ext: '.png', from: 'artifact' })
++  })
++
++  it('双写全程零 deposit_media、零 release_media(不是走寄存换来的,是直接记账)', async () => {
++    await recordArtifactDeposit('mivo-asset:gen-2', { hash: FAKE_HASH, ext: '.png' })
++
++    expect(harness.hostRequests).toHaveLength(0)
++    expect(harness.hostReleaseRequests).toHaveLength(0)
++  })
++
++  it('双写完成后 resolveDepositEntry 命中缓存,不再重寄存(端到端 SC1b.4)', async () => {
++    const assetUrl = 'mivo-asset:gen-3'
++    await recordArtifactDeposit(assetUrl, { hash: FAKE_HASH, ext: '.png' })
++
++    const entry = await resolveDepositEntry({ assetUrl, blob: blobOfBytes(4_096) })
++
++    expect(entry).toMatchObject({ hash: FAKE_HASH, from: 'artifact' })
++    expect(harness.hostRequests).toHaveLength(0) // 缓存命中,没有发出任何 deposit_media
++  })
++
++  it('入参非法(缺 hash/ext)→ 两本账都不写', async () => {
++    const result = await recordArtifactDeposit('mivo-asset:bad-1', { hash: '', ext: '.png' })
++
++    expect(result.ledgerWritten).toBe(false)
++    expect(lookupMedia('mivo-asset:bad-1')).toBeUndefined()
++    await expect(lookupDeposit('mivo-asset:bad-1')).resolves.toBeUndefined()
++  })
++
++  it('depositMap 提交失败(写槎故障)→ ledger 仍已写,不当作配额孤儿处理', async () => {
++    teardownDepositHarness()
++    harness = createDepositHarness({ writeGuard: (request) => !request.path.startsWith('deposit/state-') })
++    const assetUrl = 'mivo-asset:gen-fail-1'
++
++    const result = await recordArtifactDeposit(assetUrl, { hash: FAKE_HASH, ext: '.png' })
++
++    expect(result.ledgerWritten).toBe(true)
++    expect(result.commit?.ok).toBe(false)
++    expect(lookupMedia(assetUrl)).toMatchObject({ hash: FAKE_HASH, ext: '.png' }) // ledger 侧不受影响
++  })
++
++  describe('共享磁盘重启(SC-T1c-fix.1 要求 4):断言重启后两本账的真实落盘状态,不只查内存态', () => {
++    it('① ledger 持久化成功、depositMap 提交失败 → 重启后 ledger 真有这条,depositMap 真没有', async () => {
++      teardownDepositHarness()
++      harness = createDepositHarness({ writeGuard: (request) => !request.path.startsWith('deposit/state-') })
++      const assetUrl = 'mivo-asset:reboot-fail-1'
++
++      const result = await recordArtifactDeposit(assetUrl, { hash: FAKE_HASH, ext: '.png' })
++      expect(result).toMatchObject({ ledgerWritten: true, commit: { ok: false } })
++
++      // 「重启」ledger:换一个干净的模块态,只从 kvDisk(真实 PUT 落盘的内容)重新加载,
++      // 不是继续读同一个内存 Map。
++      resetMediaLedgerForTests()
++      await initMediaLedger()
++      expect(lookupMedia(assetUrl)).toMatchObject({ hash: FAKE_HASH, ext: '.png' })
++
++      // 「重启」depositMap:换一个干净会话读同一份假磁盘。
++      const disk = { ...Object.fromEntries(harness.brain.files) }
++      teardownDepositHarness()
++      harness = createDepositHarness({ files: disk })
++      await expect(lookupDeposit(assetUrl)).resolves.toBeUndefined() // commit 失败,真没有这条
++    })
++
++    it('② ledger 持久化成功、depositMap 提交成功 → 随即崩溃重启,两本账都真的还在', async () => {
++      const assetUrl = 'mivo-asset:reboot-ok-1'
++
++      const result = await recordArtifactDeposit(assetUrl, { hash: FAKE_HASH, ext: '.png', bytes: 42 })
++      expect(result).toMatchObject({ ledgerWritten: true, commit: { ok: true } })
++
++      resetMediaLedgerForTests()
++      await initMediaLedger()
++      expect(lookupMedia(assetUrl)).toMatchObject({ hash: FAKE_HASH, ext: '.png' })
++
++      const disk = { ...Object.fromEntries(harness.brain.files) }
++      teardownDepositHarness()
++      harness = createDepositHarness({ files: disk })
++      await expect(lookupDeposit(assetUrl)).resolves.toMatchObject({ hash: FAKE_HASH, ext: '.png', from: 'artifact' })
++    })
++  })
++})
+diff --git a/src/agent/depositMigration.ts b/src/agent/depositMigration.ts
+index c639ff01..d2756fb0 100644
+--- a/src/agent/depositMigration.ts
++++ b/src/agent/depositMigration.ts
+@@ -25,49 +25,55 @@ const LEDGER_KV_KEY = 'mediaLedger'
+ 
+ export type LedgerSnapshot = Record<string, unknown>
+ 
++/**
++ * 读取结果打成 tagged outcome(SC-T1c-fix.2,judge P1-C2):`status:'ok'` 覆盖两种
++ * 真正等价的情形——`ledger` 为 `null` 代表"确实没有账本"(键不存在/响应体为空);
++ * `status:'error'` 代表"这次没读到,不代表没有"——**只有 `'ok'` 才允许写迁移完成
++ * 标记**,`'error'` 必须保留下次重试资格,不能被当成"无账本"悄悄放过。
++ */
++export type LedgerReadOutcome = { status: 'ok'; ledger: LedgerSnapshot | null } | { status: 'error'; reason: string }
++
+ /**
+  * 只读 `/kv`,永不 PUT。
+  *
+  * 三条失败路径分开留痕,不合并成一句「反正当无账本」:宿主在场但 `/kv` 返回
+  * non-OK、与「无宿主调试环境」的网络级异常、与响应体解析失败,是三种不同的根因;
+  * 合并成同一个静默 `null` 会让「本次迁移 0 migrated」查不出是哪一种(CLAUDE.md
+- * 的开发日志硬门禁:数据加载的失败/跳过路径必须写 Debug Log)。三条都不阻断整体
+- * 迁移(功能上仍视作「无存量账本」,幂等短路照常生效),只是分别留痕。
++ * 的开发日志硬门禁:数据加载的失败/跳过路径必须写 Debug Log)。三条都是**读取
++ * 失败**(`status:'error'`),不是"无存量账本"——调用方据此保留重试资格,不写
++ * 迁移完成标记。
+  */
+-const defaultReadLedger = async (): Promise<LedgerSnapshot | null> => {
++const defaultReadLedger = async (): Promise<LedgerReadOutcome> => {
+   let response: Response
+   try {
+     response = await fetch('/kv')
+   } catch (error) {
+-    // 网络级异常(含「本机无宿主调试环境」这个最常见的子情形):不是错误,视作无
+-    // 存量账本,但仍需留痕——否则它和下面的 non-OK 分支在日志里长得一样查不出来。
+-    debugLogger.warn(
+-      SOURCE,
+-      `deposit 迁移读取 /kv 异常,视作无存量账本:${error instanceof Error ? error.message : String(error)}`,
+-    )
+-    return null
++    // 网络级异常(含「本机无宿主调试环境」这个最常见的子情形):是一次读取失败,
++    // 不是"无存量账本"的事实——两者不可区分会让暂态故障永久漏迁,必须分开留痕。
++    const reason = error instanceof Error ? error.message : String(error)
++    debugLogger.warn(SOURCE, `deposit 迁移读取 /kv 异常(视为读取失败,不写迁移标记,保留下次重试资格):${reason}`)
++    return { status: 'error', reason }
+   }
+   if (!response.ok) {
+     // 宿主在场但 /kv 非 2xx:这正是本条要堵的坑——不留痕就与「无存量账本」不可区分,
+     // 0 migrated 查不出根因。只记状态码,不带响应体原文。
+-    debugLogger.warn(SOURCE, `deposit 迁移读取 /kv 失败(status=${response.status}),视作无存量账本`)
+-    return null
++    const reason = `status=${response.status}`
++    debugLogger.warn(SOURCE, `deposit 迁移读取 /kv 失败(${reason},视为读取失败,不写迁移标记,保留下次重试资格)`)
++    return { status: 'error', reason }
+   }
+   try {
+     // 经 readOwnProp 取:`/kv` 的响应体是不可信 JSON,普通 `kv[key]` 会落到原型链上。
+     const saved = readOwnProp(await response.json(), LEDGER_KV_KEY)
+-    return saved && typeof saved === 'object' ? (saved as LedgerSnapshot) : null
++    return { status: 'ok', ledger: saved && typeof saved === 'object' ? (saved as LedgerSnapshot) : null }
+   } catch (error) {
+-    debugLogger.warn(
+-      SOURCE,
+-      `deposit 迁移读取 /kv 响应解析失败,视作无存量账本:${error instanceof Error ? error.message : String(error)}`,
+-    )
+-    return null
++    const reason = error instanceof Error ? error.message : String(error)
++    debugLogger.warn(SOURCE, `deposit 迁移读取 /kv 响应解析失败(视为读取失败,不写迁移标记,保留下次重试资格):${reason}`)
++    return { status: 'error', reason }
+   }
+ }
+ 
+ let readLedger = defaultReadLedger
+-export const setDepositLedgerReaderForTests = (next?: () => Promise<LedgerSnapshot | null>): void => {
++export const setDepositLedgerReaderForTests = (next?: () => Promise<LedgerReadOutcome>): void => {
+   readLedger = next ?? defaultReadLedger
+ }
+ 
+@@ -104,7 +110,14 @@ export const migrateLedgerIntoDepositStore = async (): Promise<MigrationOutcome>
+     return { alreadyDone: true, migrated: 0, skipped: 0, committed: true }
+   }
+ 
+-  const ledger = await readLedger()
++  const outcome = await readLedger()
++  if (outcome.status === 'error') {
++    // 读取失败与"真的没有账本"不可区分不能被容忍(judge P1-C2):不写 migration
++    // 标记,保留 alreadyDone=false,下次调用会重新走一遍读取,不会被永久短路掉。
++    debugLogger.error(SOURCE, `deposit 迁移本轮未执行:读取存量账本失败(${outcome.reason}),留待下次重试`)
++    return { alreadyDone: false, migrated: 0, skipped: 0, committed: false }
++  }
++  const ledger = outcome.ledger
+   // 存量账本是不可信输入(磁盘 / 旧版本写的 `/kv` blob):键与字段都经 own-property
+   // 语义取,`__proto__` 之类的键在下游无原型 map 上只是普通键(depositStore 的
+   // `emptyMap`),不会静默替换原型、丢条目。
+diff --git a/src/agent/depositOwned.ts b/src/agent/depositOwned.ts
+new file mode 100644
+index 00000000..b4f0df47
+--- /dev/null
++++ b/src/agent/depositOwned.ts
+@@ -0,0 +1,103 @@
++/**
++ * owned 判定 + 生成/过户双写(设计稿 `docs/plan/cindy-deposit-media-design.md`
++ * §4.4.4 三类条目表,对应 SC1b.4)。
++ *
++ * `from:'artifact'`(生成产物/聊天附件过户回填)与 `from:'ledger'`(存量账本迁移)
++ * 两类条目**不占寄存配额、不可 `release_media`**——它们的指纹归宿主产物账管,不是
++ * 本插件寄存换来的。命中即"已 owned":`resolveDepositEntry`(depositPort.ts,T1a
++ * 已交付)对任何 `from` 的缓存命中都直接返回、不发 `deposit_media`,这本就是"绝不
++ * 重寄"的现有实现;本文件把"这条 from 是不是 owned"单独抽成可测的纯谓词,供 T1b2
++ * (LRU 淘汰前是否需要先 release)、T1e(接线时的判断点)复用,不必各自重新判定
++ * `from` 字面值。
++ *
++ * `recordArtifactDeposit` 是本段唯一的新写路径:生成产物落板 / 聊天附件过户上墙
++ * 后,现状只写 mediaLedger(`correlateNewAssets`/`correlatePlacedAttachments` 的
++ * 既有调用点)——切流后这条记账职责由 depositMap 承接(设计稿 §4.4.4),过渡期两本
++ * 账**双写**:ledger 继续按现状写(不改变那条既有路径的行为),depositMap 侧新增
++ * `from:'artifact'` 条目,使得切流后 `resolveDepositEntry` 缓存命中即可跳过重寄存。
++ *
++ * **双写顺序是持久化事实,不是内存写**(SC-T1c-fix.1,judge P1-C1):ledger 走
++ * `recordMediaDurable`——await 到它真正 PUT 落盘成功才提交 depositMap;ledger 落盘
++ * 失败则 depositMap 也不写,宁可两本账都没有,也不留半条映射(崩溃后只剩
++ * depositMap、ledger 缺条这种状态,过渡期消费 `from:'ledger'` 的旧路径会丢映射)。
++ *
++ * **本文件不接任何生产 callsite**:把 `correlateNewAssets` 里的裸
++ * `recordMedia(assetUrl, entry)` 换成 `recordArtifactDeposit(assetUrl, entry)`
++ * 是 T1e 的接线职责;本段只交付这一处逻辑与它的 seam 测试(执行纪律与 T1 完成点
++ * 总表:暗段 = 逻辑完成,生产完成点在 T1e/T1f)。
++ */
++import { debugLogger } from '../../../src/store/debugLogStore'
++import { recordMediaDurable } from './mediaLedger'
++import { recordDeposit, type DepositCommitResult, type DepositEntry, type DepositFrom } from './depositStore'
++
++const SOURCE = 'Cindy Deposit'
++
++/**
++ * `artifact`/`ledger` 不占寄存配额、不可 `release_media`(设计稿 §4.4.4 表)——
++ * 命中即 owned,不需要重新寄存,也绝不该被当作"该释放的寄存物"处理。
++ */
++export const isOwnedDepositFrom = (from: DepositFrom): boolean => from === 'artifact' || from === 'ledger'
++
++/** 便捷判定:未命中(`undefined`)不是 owned——调用方仍需走寄存。 */
++export const isOwnedDepositEntry = (entry: DepositEntry | undefined): boolean =>
++  entry !== undefined && isOwnedDepositFrom(entry.from)
++
++let now = (): number => Date.now()
++export const setDepositOwnedClockForTests = (next?: () => number): void => {
++  now = next ?? (() => Date.now())
++}
++
++export type ArtifactDepositInput = { hash: string; ext: string; bytes?: number }
++
++/**
++ * `ledgerWritten: true` 是"ledger 已确认持久化落盘"的事实陈述(`recordMediaDurable`
++ * 已 await 到 PUT 成功),不是"内存写过一次"——SC-T1c-fix.1 要求字段名不得说假话。
++ */
++export type ArtifactDepositResult =
++  | { ledgerWritten: false; commit?: undefined }
++  | { ledgerWritten: true; commit: DepositCommitResult }
++
++/**
++ * 生成产物落板 / 聊天附件过户上墙后的双写口。
++ *
++ * 入参非法(assetUrl/hash/ext 任一缺失)时**两本账都不写**——与既有 `recordMedia`
++ * 自身的防御一致(它对空 hash/ext 也是直接 return,不留半条记录),这里同样不产生
++ * 半条 depositMap 条目。
++ *
++ * 顺序是硬约束:ledger 必须先**持久化成功**才提交 depositMap;ledger 落盘失败则
++ * 直接返回、不碰 depositMap(SC-T1c-fix.1)——避免"depositMap 有、ledger 缺"的半条
++ * 映射(`recordDeposit` 是 await 的真实提交,若先调用它再异步写 ledger,两者完成
++ * 顺序会颠倒,崩溃窗口就会落在两次持久化之间)。
++ */
++export const recordArtifactDeposit = async (
++  assetUrl: string,
++  entry: ArtifactDepositInput,
++): Promise<ArtifactDepositResult> => {
++  if (!assetUrl || !entry.hash || !entry.ext) {
++    debugLogger.warn(SOURCE, 'artifact 双写跳过:assetUrl/hash/ext 缺失,ledger 与 depositMap 均不写')
++    return { ledgerWritten: false }
++  }
++  const ledgerPersisted = await recordMediaDurable(assetUrl, { hash: entry.hash, ext: entry.ext })
++  if (!ledgerPersisted) {
++    debugLogger.warn(SOURCE, 'artifact 双写中止:ledger 持久化未成功(非内存写失败),不提交 depositMap,避免半条映射')
++    return { ledgerWritten: false }
++  }
++  const commit = await recordDeposit(assetUrl, {
++    hash: entry.hash,
++    ext: entry.ext,
++    bytes: entry.bytes,
++    depositedAt: now(),
++    from: 'artifact',
++  })
++  if (!commit.ok) {
++    // depositMap 提交失败只丢缓存(设计稿 §4.4.1 两分支之一):ledger 已经确认落盘
++    // 不受影响,resolveSourceEntry 现状路径仍能查到这条产物;下一次落板重新触发
++    // 本函数即可补上 depositMap 侧的条目,不是配额孤儿(artifact 条目本就不占
++    // 寄存配额)。
++    debugLogger.warn(
++      SOURCE,
++      `artifact 双写:depositMap 落盘未成功(reason=${commit.reason ?? '未知'}),ledger 已持久化不受影响`,
++    )
++  }
++  return { ledgerWritten: true, commit }
++}
+diff --git a/src/agent/mediaLedger.ts b/src/agent/mediaLedger.ts
+index 456148ff..170fbbbf 100644
+--- a/src/agent/mediaLedger.ts
++++ b/src/agent/mediaLedger.ts
+@@ -39,18 +39,23 @@ export const initMediaLedger = (): Promise<void> => {
+   return loadPromise
+ }
+ 
++const buildLedgerPayload = (): Record<string, unknown> => {
++  const obj: Record<string, LedgerEntry> = {}
++  for (const [key, value] of ledger) obj[key] = value
++  return { ...kvCache, [KV_KEY]: obj }
++}
++
+ const schedulePersist = (): void => {
+   if (persistTimer !== undefined) window.clearTimeout(persistTimer)
+   persistTimer = window.setTimeout(() => {
+     persistTimer = undefined
+-    const obj: Record<string, LedgerEntry> = {}
+-    for (const [key, value] of ledger) obj[key] = value
+-    void fetch('/kv', { method: 'PUT', body: JSON.stringify({ ...kvCache, [KV_KEY]: obj }) }).catch(() => {})
++    void fetch('/kv', { method: 'PUT', body: JSON.stringify(buildLedgerPayload()) }).catch(() => {})
+   }, 1_500)
+ }
+ 
+-export const recordMedia = (assetUrl: string, entry: LedgerEntry): void => {
+-  if (!assetUrl || !entry.hash || !entry.ext) return
++/** 两条既有调用路径共用的内存写;返回 false = 入参非法,调用方不应继续持久化。 */
++const applyEntry = (assetUrl: string, entry: LedgerEntry): boolean => {
++  if (!assetUrl || !entry.hash || !entry.ext) return false
+   ledger.delete(assetUrl) // 重插保持 LRU 序
+   ledger.set(assetUrl, entry)
+   while (ledger.size > MAX_ENTRIES) {
+@@ -58,8 +63,46 @@ export const recordMedia = (assetUrl: string, entry: LedgerEntry): void => {
+     if (oldest === undefined) break
+     ledger.delete(oldest)
+   }
++  return true
++}
++
++export const recordMedia = (assetUrl: string, entry: LedgerEntry): void => {
++  if (!applyEntry(assetUrl, entry)) return
+   schedulePersist()
+ }
+ 
++/**
++ * 可 await、能报告成败的持久化写(SC-T1c-fix.1)。与 `recordMedia` 共享同一份内存
++ * 账本,但绕开它的 1.5s 防抖 + fire-and-forget:立即 PUT 并等待响应,返回值就是
++ * "这次写真的落盘了没有"的事实陈述,供调用方(`recordArtifactDeposit`)决定要不要
++ * 接着提交 depositMap。不改变 `recordMedia` 自身的既有行为——两条既有调用路径
++ * (`correlateNewAssets`/`correlatePlacedAttachments`)仍走原来的防抖写。
++ */
++export const recordMediaDurable = async (assetUrl: string, entry: LedgerEntry): Promise<boolean> => {
++  if (!applyEntry(assetUrl, entry)) return false
++  // 已经要立即持久化最新状态了,排队中的防抖 PUT 不再需要——避免多余的重复请求。
++  if (persistTimer !== undefined) {
++    window.clearTimeout(persistTimer)
++    persistTimer = undefined
++  }
++  try {
++    const response = await fetch('/kv', { method: 'PUT', body: JSON.stringify(buildLedgerPayload()) })
++    return response.ok
++  } catch {
++    return false
++  }
++}
++
+ export const lookupMedia = (assetUrl?: string): LedgerEntry | undefined =>
+   assetUrl ? ledger.get(assetUrl) : undefined
++
++/** 测试专用:重置为初始模块态,模拟"重启后重新读盘"。 */
++export const resetMediaLedgerForTests = (): void => {
++  ledger.clear()
++  kvCache = {}
++  loadPromise = null
++  if (persistTimer !== undefined) {
++    window.clearTimeout(persistTimer)
++    persistTimer = undefined
++  }
++}

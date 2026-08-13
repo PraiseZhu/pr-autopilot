@@ -1,0 +1,48 @@
+diff --git a/src/cindy-theme.css b/src/cindy-theme.css
+index a5417373..0b80263a 100644
+--- a/src/cindy-theme.css
++++ b/src/cindy-theme.css
+@@ -119,30 +119,38 @@
+ 
+ /* ── 右键菜单(节点/画布上下文菜单):对齐 Cindy 的浮层规则 ──
+    底 = 抬升表面,文字 = 主文字色,悬停 = 轻水洗,选中 = 强调色药丸。 */
+-.node-action-menu {
++.node-action-menu,
++.node-action-submenu {
+   background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 96%, var(--text-primary, #232323) 4%);
+   border-color: color-mix(in srgb, var(--text-primary, #232323) 14%, var(--border-default, #d6d0c6));
+ }
+ 
+-.node-action-menu button {
++.node-action-menu button,
++.node-action-submenu button {
+   color: color-mix(in srgb, var(--text-primary, #554f48) 84%, var(--surface, #fffaf0));
+   font-weight: 500;
+ }
+ 
+-.node-action-menu button:hover:not(.active):not(:disabled):not(.selected) {
++.node-action-menu button:hover:not(.active):not(:disabled):not(.selected),
++.node-action-submenu button:hover:not(.active):not(:disabled):not(.selected) {
+   color: var(--text-primary, #232323);
+   background: color-mix(in srgb, var(--text-primary, #232323) 9%, transparent);
+ }
+ 
+ .node-action-menu button.active,
+ .node-action-menu button.has-swatch.selected,
+-.node-action-menu button.has-line-preview.selected {
++.node-action-menu button.has-line-preview.selected,
++.node-action-submenu button.active,
++.node-action-submenu button.has-swatch.selected,
++.node-action-submenu button.has-line-preview.selected {
+   color: var(--accent-pure-cta-fg, #fffaf0);
+   background: var(--accent-cta-bg, #27302c);
+ }
+ 
+ .node-action-menu button:disabled,
+-.node-action-menu button:disabled:hover {
++.node-action-menu button:disabled:hover,
++.node-action-submenu button:disabled,
++.node-action-submenu button:disabled:hover {
+   color: color-mix(in srgb, var(--text-secondary, #554f48) 42%, transparent);
+   background: transparent;
+ }

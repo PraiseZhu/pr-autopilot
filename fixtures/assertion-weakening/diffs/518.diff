@@ -1,0 +1,1014 @@
+diff --git a/cindyplugin/main.js b/cindyplugin/main.js
+index f6b9984d..1e20c224 100644
+--- a/cindyplugin/main.js
++++ b/cindyplugin/main.js
+@@ -2744,37 +2744,192 @@ const MIVO_PATH_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
+ const MIVO_CHAT_BODY = '{"type":"freeform"}'
+ 
+ /**
+- * 「这台机器还没配 Mivo / 域名没放行」的判据——**只有这一类**才允许静默回落代办路径。
++ * 曾经的「还没配 Mivo / 域名没放行」判据。
+  *
+- * 为什么要这么窄:回落等于换一家上游重跑一单。业务失败(4xx/5xx/超时)如果也回落,
+- * 两条通道各出一次图 = 双扣费,而且用户看不出钱花在哪。所以判据只认「压根没接上」。
++ * **已退出路由判据(2026-08-05)**:它只能看错误文案,而 key 已配但失效时上游 401 的
++ * 文案(「未登录」「凭证」…)同样命中 → 「key 坏了」被误判成「压根没配 key」→ 静默
++ * 回落代办,用户以为在用自己的 Mivo 额度、实际在花 Cindy 配额。事故实录:2026-08-04
++ * 20:45–20:56 连续三单全部静默回落。
++ *
++ * 现在路由只认 `readSecretConfigState()`(问宿主保险库「到底存没存」),本正则仅保留给
++ * `diagReason` 之类的诊断分类用,**不得**再参与 `status` / `code` 取值。
+  */
+ const MIVO_UNCONFIGURED_RE =
+   /凭证|未配置|没有配置|请先配置|去设置|设置页|重新连接|重新登录|未登录|白名单|不在白名单|未声明|不允许的域名|network\s*槽|not configured|missing credential|no credential|credential.*(missing|not set)|not allowed|whitelist|forbidden host/i
+ 
++/**
++ * 出图结局码(闭集)。面板据此选文案,**不读任何上游原文** —— 上游/宿主的 raw message
++ * 只在本进程内做分型,不出这道门(否则 key 可能随错误回显落进 toast / TaskView /
++ * Debug Log / 宿主设置页快照)。
++ *
++ * 分类只看 `{ok, status}` 二元组:宿主 `cindy.fetch` 的传输失败形状只有
++ * `{ok:false, message}`(没有 status),所以 `ok:false` 一律归一到 TRANSPORT_UNKNOWN,
++ * 不做进一步细分。
++ */
++const GEN_CODE = {
++  // —— 响应派生(normalizeMivoReply 产出,只吃 {ok,status})——
++  AUTH_INVALID: 'MIVO_AUTH_INVALID', //      ok:true + 401 → Key 无效/过期,指向设置页
++  AUTH_FORBIDDEN: 'MIVO_AUTH_FORBIDDEN', //  ok:true + 403 → 权限不足,指向设置页
++  UPSTREAM_BUSY: 'MIVO_UPSTREAM_BUSY', //    ok:true + 429/5xx → 平台繁忙,只说稍后重试
++  UPSTREAM_ERROR: 'MIVO_UPSTREAM_ERROR', //  ok:true + 其他非 2xx
++  TRANSPORT_UNKNOWN: 'MIVO_TRANSPORT_UNKNOWN', // ok:false(含响应丢失)
++  // —— 非响应派生(各自 producer 产出)——
++  INTERNAL: 'MIVO_INTERNAL', //          2xx 之后的语义/形状/业务终态失败(catch-all)
++  CONFIG_UNKNOWN: 'MIVO_CONFIG_UNKNOWN', // 问不出「存没存」→ fail-fast,零上游请求
++  FALLBACK_QUOTA: 'MIVO_FALLBACK_QUOTA', // 没配 key,走 Cindy 代办**成功**(成功路径也要告知!)
++  CINDY_FALLBACK_FAILED: 'CINDY_FALLBACK_FAILED', // 没配 key,代办自己失败
++}
++
++/**
++ * 统一响应归一器:`{ok, status}` → 响应派生码;2xx 回 `null`(即「响应本身没问题」)。
++ * 三条 caller(text / upload / media)共用同一份判据 —— 各自手写会漂移:改图上传和
++ * 取件下载遇到同一个 401 得给出同一个码,否则「平台繁忙」会被误报成「Key 无效」。
++ */
++function normalizeMivoReply(reply) {
++  if (!reply || reply.ok !== true) return GEN_CODE.TRANSPORT_UNKNOWN
++  const status = Number(reply.status) || 0
++  if (status >= 200 && status < 300) return null
++  if (status === 401) return GEN_CODE.AUTH_INVALID
++  if (status === 403) return GEN_CODE.AUTH_FORBIDDEN
++  if (status === 429 || (status >= 500 && status < 600)) return GEN_CODE.UPSTREAM_BUSY
++  return GEN_CODE.UPSTREAM_ERROR
++}
++
++/**
++ * 结局错误的**品牌标记**(模块内 Symbol,外部对象拿不到)。
++ *
++ * 为什么需要它:handleGenImage 的外层 catch 会兜住**任何**异常——包括宿主 `cindy.send`
++ * reject 出来的、带着不受控 `message` 甚至恰好也叫 `genCode`/`safeMessage` 字段的外部
++ * 对象。只认字段名(鸭子类型)就等于让边界外的值直接改写回执码、把原文塞进面板;认这个
++ * Symbol 才能证明「这个错误是我们自己造的」。
++ */
++const GEN_ERR_BRAND = Symbol('mivoGenErr')
++const GEN_CODE_SET = new Set(Object.values(GEN_CODE))
++
++/** 带结局码的错误。`message` 只放码本身,永不放上游原文。 */
++function codedError(code) {
++  const error = new Error(code)
++  error.genCode = code
++  error[GEN_ERR_BRAND] = true
++  return error
++}
++
++/** 从任意捕获值安全提取结局码:非我方品牌、或码不在闭集 → 一律 INTERNAL。 */
++function genCodeOf(error) {
++  if (error && error[GEN_ERR_BRAND] === true && GEN_CODE_SET.has(error.genCode)) return error.genCode
++  return GEN_CODE.INTERNAL
++}
++
++/** 从任意捕获值安全提取可展示文案:只信我方品牌错误上的 safeMessage,其余一概不给。 */
++function genSafeMessageOf(error) {
++  if (error && error[GEN_ERR_BRAND] === true && typeof error.safeMessage === 'string') return error.safeMessage
++  return ''
++}
++
++/**
++ * 2xx 之后的语义/形状/业务终态失败 → 统一 INTERNAL。
++ *
++ * `note` 是**我们自己写的**固定中文短语(不是上游原文),只进诊断、不进对外回执 ——
++ * 排查时要知道到底是「会话 id 不合规」还是「签名地址解析不出」,但用户那边只需要
++ * 一句「稍后重试」,而混进上游原文就会把凭证带出去。
++ */
++function internalError(note) {
++  diagSkip(DIAG_SOURCE.gen, 'mivo 直连内部失败: ' + note)
++  const error = codedError(GEN_CODE.INTERNAL)
++  // `note` 是**我方源码里的固定中文**,不含上游内容,可以给用户看 —— 「签名地址域名未放行」
++  // 这类话比一句「出了点问题」有用得多。上游原文走的是另一条路(永不透传)。
++  error.safeMessage = note
++  return error
++}
++
++// —— key 配置态:路由的唯一判据 ——
++const MIVO_SECRET_KEY = 'mivo_api_key'
++const SECRETS_DEADLINE_MS = 3_000
++const CONFIG_STATE = { CONFIGURED: 'configured', UNCONFIGURED: 'unconfigured', UNKNOWN: 'unknown' }
++
++/**
++ * 同源保留路径出口(`/secrets` 等)。与 hostFetch 分开是刻意的:`/secrets` 走的是**宿主
++ * 同源 HTTP**,不是 network 槽的对外代发 —— 混用一个 seam 会让测试把「问保险库」错接到
++ * 「打 Mivo」的故障注入上。
++ */
++function localFetch(path) {
++  if (seam && seam.localFetch) return seam.localFetch(path)
++  if (typeof fetch !== 'function') return Promise.reject(new Error('no local fetch'))
++  return fetch(path)
++}
++
++/**
++ * 问宿主保险库:这台机器到底配没配 Mivo key。**这是分流的唯一判据**(不看错误文案)。
++ *
++ * 三态与它们的语义:
++ *   configured   —— 存了 → 只走 Mivo 直连,失败如实报,一次代办都不发
++ *   unconfigured —— 明确没存 → 只走 Cindy 代办(且要告知用户走的是代办)
++ *   unknown      —— 问不出来(读失败/超时/形状不对)→ fail-fast,两条通道都不走
++ *
++ * 为什么 unknown 要 fail-fast 而不是「保险起见走代办」:那正是事故的形状 —— 悄悄花掉
++ * 配额还让用户以为用的是自己的额度。问不出来就停下说清楚,比猜错方向更可取。
++ *
++ * 契约(宿主 GET /secrets):必须是数组,取 `key === 'mivo_api_key'` 的**唯一**一行,
++ * `saved` 必须是 boolean。数组缺失/目标行缺失/目标行重复/saved 非布尔/非 2xx/JSON 坏/
++ * 超 deadline —— 一律 unknown,不做乐观解读。
++ *
++ * **每次分流都要重新问**:brain 是长驻的,用户可能刚在设置页存了 key 或点了断开;缓存
++ * 一次配置态就会让下一单沿着旧判断走错通道(这正是「配了却还在花配额」的另一条路)。
++ */
++async function readSecretConfigState() {
++  // deadline 必须罩住**从发请求到 body 解析完**的全过程:fetch 先返回了 Response、
++  // 而 `json()` 挂死,是真实存在的失败形态(收口审反例)——只 race fetch 本身的话,
++  // race 在拿到 Response 那一刻就结束了,后面 json() 一挂整条生图链路永久 pending,
++  // 既不 fail-fast 也没有任何用户可见反馈。
++  const read = (async () => {
++    const reply = await localFetch('/secrets')
++    if (!reply || reply.ok !== true) return CONFIG_STATE.UNKNOWN
++    const list = await reply.json()
++    if (!Array.isArray(list)) return CONFIG_STATE.UNKNOWN
++    const rows = list.filter((item) => item && typeof item === 'object' && item.key === MIVO_SECRET_KEY)
++    // 缺行 = 从未配置(与既有消费者同口径:settings.js:16 的 find、pluginMivoKey.ts 的
++    // some 对缺行都判"未配置",不是"读不出"——历史上从未存过这个 key 时,宿主保险库
++    // 本就不会有这一行,这是正常态,不是异常态)。只有重复行才是真的读不出该信哪条。
++    if (rows.length > 1) return CONFIG_STATE.UNKNOWN
++    if (rows.length === 0) return CONFIG_STATE.UNCONFIGURED
++    const saved = rows[0].saved
++    if (typeof saved !== 'boolean') return CONFIG_STATE.UNKNOWN
++    return saved ? CONFIG_STATE.CONFIGURED : CONFIG_STATE.UNCONFIGURED
++  })()
++  // 超时后 read 仍可能晚到地 reject(比如 json 解析最终失败)——那时没人在等它了,
++  // 不接住会变成 unhandled rejection 噪音。
++  read.catch(() => {})
++  let timer = null
++  try {
++    return await Promise.race([
++      read,
++      new Promise((_, reject) => {
++        timer = clock.setTimeout(() => reject(codedError(GEN_CODE.CONFIG_UNKNOWN)), SECRETS_DEADLINE_MS)
++      }),
++    ])
++  } catch (error) {
++    return CONFIG_STATE.UNKNOWN
++  } finally {
++    if (timer !== null) clock.clearTimeout(timer)
++  }
++}
++
+ // 宿主网络代发出口。与 hostSend 同样的 seam 纪律:协议测试靠它做 spy 与故障注入。
+-// 生产环境 network 槽由身份卡声明,`cindy.fetch` 必在;真不在时回一条「未配置」类
+-// 结构化错误 → 走静默回落,不炸。
++// 生产环境 network 槽由身份卡声明,`cindy.fetch` 必在;真不在时回一条结构化传输错误
++// (ok:false)→ 归一成 MIVO_TRANSPORT_UNKNOWN 如实失败。**不再触发任何回落**:
++// 走不走代办只由 readSecretConfigState 决定(2026-08-05)。
+ function hostFetch(payload) {
+   if (seam && seam.fetch) return seam.fetch(payload)
+   if (typeof cindy !== 'object' || !cindy || typeof cindy.fetch !== 'function') {
+-    return Promise.resolve({ ok: false, unconfigured: true, message: 'network 槽不可用: 宿主未提供 cindy.fetch' })
++    return Promise.resolve({ ok: false, message: 'network 槽不可用: 宿主未提供 cindy.fetch' })
+   }
+   return cindy.fetch(payload)
+ }
+ 
+-/** 造一个带分类标记的 Mivo 错误:`unconfigured` 决定它能不能触发静默回落。 */
+-function mivoError(message, unconfigured) {
+-  const error = new Error(message)
+-  error.mivoUnconfigured = Boolean(unconfigured)
+-  return error
+-}
+-
+-function mivoTransportError(reply) {
+-  const message = (reply && typeof reply.message === 'string' && reply.message) || '网络代发失败'
+-  const unconfigured = Boolean(reply && reply.unconfigured === true) || MIVO_UNCONFIGURED_RE.test(message)
+-  return mivoError(message, unconfigured)
+-}
++// `mivoError` / `mivoTransportError` 已删除(2026-08-05)。前者靠 `mivoUnconfigured` 标记
++// 决定「能不能静默回落」,后者用错误文案正则给这个标记赋值 —— 这正是事故的机制:key 已配
++// 但失效时,上游 401 的文案命中正则,于是被当成「没配 key」悄悄改走代办。现在回落与否由
++// `readSecretConfigState()` 在发起请求**之前**决定,错误只承载 `genCode`,不再参与路由。
+ 
+ function mivoJson(text) {
+   try {
+@@ -2795,9 +2950,8 @@ async function mivoFetchText(path, body, callId) {
+   }
+   if (callId) payload.callId = callId
+   const reply = await hostFetch(payload)
+-  if (!reply || reply.ok !== true) throw mivoTransportError(reply)
+-  const status = Number(reply.status) || 0
+-  if (status < 200 || status >= 300) throw mivoError('Mivo 上游拒绝: HTTP ' + status, false)
++  const code = normalizeMivoReply(reply)
++  if (code) throw codedError(code)
+   return typeof reply.body === 'string' ? reply.body : ''
+ }
+ 
+@@ -2810,7 +2964,10 @@ async function mivoFetchMedia(url, callId) {
+   const payload = { url: url, as: 'media', timeoutMs: MIVO_MEDIA_TIMEOUT_MS }
+   if (callId) payload.callId = callId
+   const reply = await hostFetch(payload)
+-  if (!reply || reply.ok !== true) throw mivoTransportError(reply)
++  // 取件也走同一份归一器 —— 这条路径原先只判 `ok`、完全不看 status,下载遇到 401/429
++  // 时既没有分类也没有可给用户的话。
++  const code = normalizeMivoReply(reply)
++  if (code) throw codedError(code)
+   const media = reply.media
+   if (!media || typeof media !== 'object') return null
+   return media
+@@ -2825,8 +2982,8 @@ async function mivoEnsureChatSession(callId) {
+     (typeof json.object_id === 'string' && json.object_id) ||
+     (typeof json.chatSessionId === 'string' && json.chatSessionId) ||
+     ''
+-  if (!id) throw mivoError('Mivo 会话创建回执缺少会话 id', false)
+-  if (!MIVO_PATH_ID_RE.test(id)) throw mivoError('Mivo 会话创建回执的会话 id 不合规', false)
++  if (!id) throw internalError('Mivo 会话创建回执缺少会话 id')
++  if (!MIVO_PATH_ID_RE.test(id)) throw internalError('Mivo 会话创建回执的会话 id 不合规')
+   mivoChatSessionId = id
+   return id
+ }
+@@ -2862,22 +3019,25 @@ async function mivoSubmit(kind, prompt, aspectRatio, imageIds, callId, channel)
+     })
+     return mivoJson(await mivoFetchText('/message', body, callId))
+   }
++  // **不重试**。这里原本在首次失败后清掉会话再 send() 一次,为的是「会话过期不用重启
++  // 插件」;但它分不清两种失败:
++  //   ① 平台把这一单拒了(会话失效)—— 重发是安全的
++  //   ② 平台已经收单、只是回执丢了(网络/超时)—— 重发就是第二单,双扣 Mivo 额度
++  // 传输层失败恰恰无法区分这两者,所以宁可这一单失败。会话过期的便利性改由「失败即
++  // 清会话、下一次用户操作自然重建」承接 —— 代价是用户多点一次,不是多付一次钱。
+   let json
+   try {
+     json = await send()
+   } catch (error) {
+-    // 缓存的 chatSession 会过期/失效(平台侧 token 轮换即作废,见 BFF state.ts 的
+-    // 「新 token 作废旧 chatSession」)。作废重建重试一次——不重试的话第一单之后
+-    // 每次都得等用户重启插件。
+-    if (error && error.mivoUnconfigured) throw error
+-    if (!mivoChatSessionId) throw error
+-    mivoChatSessionId = ''
+-    diagSkip(DIAG_SOURCE.gen, 'mivo 会话已失效, 作废重建后重试一次 ' + diagReason(error && error.message))
+-    json = await send()
++    mivoChatSessionId = '' // 清掉可能已失效的会话,避免下一单继续撞同一个坏会话
++    throw error
+   }
+   const jobId = (typeof json.object_id === 'string' && json.object_id) || (typeof json.jobId === 'string' && json.jobId) || ''
+-  if (!jobId) throw mivoError('Mivo 提交回执缺少任务 id', false)
+-  if (!MIVO_PATH_ID_RE.test(jobId)) throw mivoError('Mivo 提交回执的任务 id 不合规', false)
++  // 2xx 但回执不合用:同样清会话(坏会话也可能表现成回执畸形),并归入 INTERNAL。
++  if (!jobId || !MIVO_PATH_ID_RE.test(jobId)) {
++    mivoChatSessionId = ''
++    throw internalError(jobId ? 'Mivo 提交回执的任务 id 不合规' : 'Mivo 提交回执缺少任务 id')
++  }
+   return jobId
+ }
+ 
+@@ -2894,9 +3054,9 @@ async function mivoPoll(jobId, callId) {
+     const content = json.content && typeof json.content === 'object' ? json.content : json
+     const status = String(content.status || content.state || 'pending')
+     if (status === 'completed') return Array.isArray(content.images) ? content.images : []
+-    if (status === 'failed') throw mivoError('Mivo 生成失败,可换个说法或稍后重试', false)
++    if (status === 'failed') throw internalError('Mivo 生成失败,可换个说法或稍后重试')
+     if (clock.now() - startedAt >= MIVO_POLL_DEADLINE_MS) {
+-      throw mivoError('Mivo 生成超时,可稍后重试、换比例或减少参考图', false)
++      throw internalError('Mivo 生成超时,可稍后重试、换比例或减少参考图')
+     }
+     await mivoSleep(MIVO_POLL_INTERVAL_MS)
+   }
+@@ -2924,23 +3084,33 @@ function mivoSignedUrl(text) {
+ async function mivoTakeImage(imagePath, callId) {
+   const parts = String(imagePath || '').split('/')
+   const fileId = parts[parts.length - 1] || ''
+-  if (!MIVO_FILE_ID_RE.test(fileId)) throw mivoError('Mivo 取件失败: 结果文件标识不合规', false)
+-  const direct = await mivoFetchMedia(MIVO_API + '/file/download/' + fileId, callId)
++  if (!MIVO_FILE_ID_RE.test(fileId)) throw internalError('Mivo 取件失败: 结果文件标识不合规')
++  let direct = null
++  try {
++    direct = await mivoFetchMedia(MIVO_API + '/file/download/' + fileId, callId)
++  } catch {
++    // 直下失败(含归一器给出的 401/403/429/5xx 分类码)一律落到 signUrl 兜底——已计费的单
++    // 不能因为直下这一个端点的瞬时故障就判死;signUrl 是完全不同的域名端点,原本就是为
++    // 这种情况准备的次选(见函数头注释)。收口审阻断:归一器接入前 direct 只判 transport
++    // 层 `ok`,状态码从不参与判定,因此永远走得到这里;现在状态码参与判定后,若不接住这
++    // 里的 throw,同样的故障会直接终止取件、永不尝试 signUrl。
++  }
+   if (direct) return direct
+   diagSkip(DIAG_SOURCE.gen, 'mivo 同源直下未返回媒体, 改走 signUrl 签名地址取件')
+   const signed = mivoSignedUrl(await mivoFetchText('/file/signUrl/' + fileId, null, callId))
+-  if (!signed) throw mivoError('Mivo 取件失败: 签名地址解析不出', false)
++  if (!signed) throw internalError('Mivo 取件失败: 签名地址解析不出')
+   let media
+   try {
+     media = await mivoFetchMedia(signed, callId)
+   } catch (error) {
+-    // 签名地址被白名单拦下时,message 里带的是「域名不允许」——那不是「插件没配好」,
+-    // 而是这套部署的 OSS 域名需要补进身份卡。绝不能借它触发回落(会双扣费)。
+-    // 原因先留痕再换成人话:签名域名到底是什么,只有真机跑过这条才知道。
+-    diagFail(DIAG_SOURCE.gen, 'mivo 签名地址取件失败 ' + diagReason(error && error.message))
+-    throw mivoError('Mivo 取件失败: 签名地址域名未放行,需把该 OSS 域名加入插件网络白名单', false)
+-  }
+-  if (!media) throw mivoError('Mivo 取件失败: 签名地址返回的不是媒体', false)
++    // 闭集码原样重抛:签名地址返回 401/403/429 时 normalizer 已给出正确的动作语义
++    // (「去设置页查 Key」vs「稍后重试」),这里再包一层 INTERNAL 会把它抹掉(收口审
++    // 阻断 2)。只有非我方品牌的异常(签名域名未放行等 transport 形态)才安全收敛。
++    if (error && error[GEN_ERR_BRAND] === true) throw error
++    diagFail(DIAG_SOURCE.gen, 'mivo 签名地址取件失败 code=' + genCodeOf(error))
++    throw internalError('Mivo 取件失败: 签名地址域名未放行,需把该 OSS 域名加入插件网络白名单')
++  }
++  if (!media) throw internalError('Mivo 取件失败: 签名地址返回的不是媒体')
+   return media
+ }
+ 
+@@ -2951,28 +3121,26 @@ async function mivoUploadSources(hashes, callId) {
+     const payload = { url: MIVO_API + '/file/', method: 'POST', upload: { hashes: [hash], field: 'file' } }
+     if (callId) payload.callId = callId
+     const reply = await hostFetch(payload)
+-    if (!reply || reply.ok !== true) throw mivoTransportError(reply)
+-    const status = Number(reply.status) || 0
+-    if (status < 200 || status >= 300) throw mivoError('Mivo 源图上传被拒: HTTP ' + status, false)
++    const code = normalizeMivoReply(reply)
++    if (code) throw codedError(code)
+     const json = mivoJson(typeof reply.body === 'string' ? reply.body : '')
+     // 回执三形态照抄 BFF mivoPlatformUploadOne:数组 / {files:[]} / {data:[]} / 裸对象。
+     const list = Array.isArray(json) ? json : Array.isArray(json.files) ? json.files : Array.isArray(json.data) ? json.data : [json]
+     const first = list[0] && typeof list[0] === 'object' ? list[0] : {}
+     const id = (typeof first.object_id === 'string' && first.object_id) || (typeof first._id === 'string' && first._id) || ''
+-    if (!id) throw mivoError('Mivo 源图上传回执缺少文件 id', false)
++    if (!id) throw codedError(GEN_CODE.INTERNAL) // 2xx 但回执没给 file id
+     ids.push(id)
+   }
+   return ids
+ }
+ 
+ /**
+- * Mivo 直连一单。返回三态:
+- *   { status:'ok', media, model, modelLabel }  出图成功(media 已落主机总仓,记本插件名下)
+- *   { status:'fallback', reason }              压根没接上(没配 key / 域名没放行)→ 静默回落代办
+- *   { status:'failed', message }               业务失败 → 如实报,**不回落**(避免双扣费)
++ * Mivo 直连一单。只有两态(2026-08-05 起没有 'fallback' 了——回不回落在**发起之前**
++ * 就由 readSecretConfigState 定死,这里失败绝不改道代办):
++ *   { status:'ok', media, model, modelLabel }        出图成功(media 已落主机总仓)
++ *   { status:'failed', code, safeMessage, submitted }  失败如实报;code ∈ GEN_CODE 闭集
+  *
+- * 「提交之后一律不回落」这条边界由 `submitted` 钉住:提交成功意味着平台侧可能已经开始
+- * 计费出图,此后再去点代办菜单就是花两份钱。
++ * `submitted` 只作诊断参考(「已提交,可能已计费」的留痕),不再参与任何路由决策。
+  */
+ async function mivoTryImage(msg, kind, sourceHashes) {
+   const callId = typeof msg.callId === 'string' && msg.callId ? msg.callId : ''
+@@ -2993,13 +3161,15 @@ async function mivoTryImage(msg, kind, sourceHashes) {
+       kind + ' 已提交 Mivo 直连: model=' + channel + ' promptChars=' + diagTextLen(msg.prompt),
+     )
+     const images = await mivoPoll(jobId, callId)
+-    if (!images.length) throw mivoError('Mivo 生成失败:结果为空', false)
++    if (!images.length) throw internalError('Mivo 生成失败:结果为空')
+     const media = await mivoTakeImage(images[0], callId)
+     return { status: 'ok', media: media, model: channel, modelLabel: spec.label }
+   } catch (error) {
+-    const message = String((error && error.message) || error)
+-    if (!submitted && error && error.mivoUnconfigured) return { status: 'fallback', reason: message }
+-    return { status: 'failed', message: message, submitted: submitted }
++    // 不再有 'fallback' 这一态:走不走代办已经由 `readSecretConfigState()` 在**发起之前**
++    // 定了。到了这里就是「配了 key、直连没成」,一律如实报,绝不改道代办。
++    // 码与文案都过品牌门:外部异常(宿主 reject / 未知抛错)一律 INTERNAL + 空文案,
++    // 它们身上就算恰好挂着 genCode/safeMessage 字段也不认(收口审反例 B:伪造字段)。
++    return { status: 'failed', code: genCodeOf(error), safeMessage: genSafeMessageOf(error), submitted: submitted }
+   }
+ }
+ 
+@@ -3007,14 +3177,17 @@ const GEN_VIA_MIVO = 'Mivo 直连'
+ const GEN_VIA_CINDY = 'Cindy 代办'
+ 
+ /**
+- * 生图/改图的**唯一取图入口**:Mivo 直连优先,未接通才回落宿主代办。
++ * 生图/改图的**唯一取图入口**。分流(2026-08-05 起)在**发起任何上游请求之前**由
++ * `readSecretConfigState()` 一锤定音:
++ *   configured   → 只走 Mivo 直连,失败如实报,一条代办都不发;
++ *   unconfigured → 只走 Cindy 代办,一个 Mivo 请求都不发;
++ *   unknown      → fail-fast,两条都不走。
++ * 错误文案/正则不再参与路由(旧判据正是 2026-08-04「key 失效被误判成没配 key、
++ * 静默改花 Cindy 配额」事故的机制)。
+  *
+- * 返回 `{ ok, raw, via, message?, width?, height?, model?, modelLabel? }` —— `raw` 是待过
+- * 信任边界的媒体回执(两条通道同形:主机落仓后的 `{hash, ext, url}`),`via` 只进诊断。
+- * 分流规则的两条硬边界:
+- *   ① 只有「压根没接上」(凭证未配置 / 域名未放行 / 没有 network 槽)才回落 —— 判据是
+- *      `MIVO_UNCONFIGURED_RE`,窄到不会吞业务错误;
+- *   ② 提交之后一律不回落 —— 平台侧可能已经开始计费出图,再点代办菜单就是花两份钱。
++ * 返回 `{ ok, raw, via, code?, safeMessage?, width?, height?, model?, modelLabel? }` ——
++ * `raw` 是待过信任边界的媒体回执(两条通道同形),`via` 只进诊断,`code` ∈ GEN_CODE
++ * 闭集(成功回落也带码:MIVO_FALLBACK_QUOTA,面板要据此告知用户走了代办额度)。
+  */
+ async function genOutcome(msg, kind) {
+   // 源图白名单校验在**分流之前**做一次:两条通道用同一份判据、同一条错误路径
+@@ -3025,31 +3198,35 @@ async function genOutcome(msg, kind) {
+           .filter((h) => typeof h === 'string' && MEDIA_HASH_RE.test(h))
+           .slice(0, 4)
+       : []
+-  if (kind === 'edit' && !sourceHashes.length) throw new Error('缺少合法的源图指纹')
+-  const mivo = await mivoTryImage(msg, kind, sourceHashes)
+-  if (mivo.status === 'ok') {
+-    return {
+-      ok: true,
+-      raw: mivo.media,
+-      via: GEN_VIA_MIVO,
+-      model: mivo.model,
+-      modelLabel: mivo.modelLabel,
+-    }
++  if (kind === 'edit' && !sourceHashes.length) throw internalError('缺少合法的源图指纹')
++
++  // —— 分流:问保险库,不猜 ——
++  const configState = await readSecretConfigState()
++
++  if (configState === CONFIG_STATE.UNKNOWN) {
++    // 问不出「存没存」→ 两条通道都不走。悄悄花配额比这一单失败糟得多。
++    diagSkip(DIAG_SOURCE.gen, kind + ' 未出图: 无法确认 Mivo Key 配置状态, 不猜通道 code=' + GEN_CODE.CONFIG_UNKNOWN)
++    return { ok: false, raw: null, via: GEN_VIA_MIVO, code: GEN_CODE.CONFIG_UNKNOWN }
+   }
+-  if (mivo.status === 'failed') {
++
++  if (configState === CONFIG_STATE.CONFIGURED) {
++    // 配了 key = 用户要用自己的 Mivo 额度。这条路只有成功和失败,没有「改走代办」。
++    const mivo = await mivoTryImage(msg, kind, sourceHashes)
++    if (mivo.status === 'ok') {
++      return { ok: true, raw: mivo.media, via: GEN_VIA_MIVO, model: mivo.model, modelLabel: mivo.modelLabel }
++    }
+     diagSkip(
+       DIAG_SOURCE.gen,
+-      kind +
+-        ' 不回落 Cindy 代办: ' +
+-        (mivo.submitted ? 'Mivo 已提交(可能已计费), 业务失败如实上报' : 'Mivo 失败原因不属于「未接通」, 如实上报') +
+-        ' ' + diagReason(mivo.message),
++      kind + ' 不回落 Cindy 代办(已配 Key, 直连失败如实上报): ' +
++        (mivo.submitted ? 'Mivo 已提交, 可能已计费 ' : '') + 'code=' + mivo.code,
+     )
+-    return { ok: false, raw: null, via: GEN_VIA_MIVO, message: mivo.message }
++    return { ok: false, raw: null, via: GEN_VIA_MIVO, code: mivo.code, safeMessage: mivo.safeMessage }
+   }
+-  diagSkip(
+-    DIAG_SOURCE.gen,
+-    kind + ' 回落 Cindy 代办: Mivo 未接通(未配置凭证或域名未放行) ' + diagReason(mivo.reason),
+-  )
++
++  // —— configState === UNCONFIGURED:没配 key,走 Cindy 代办,且**一个 Mivo 请求都不发** ——
++  // 仍记 skip(warn):虽然是预期行为,但确实跳过了直连路径,事后查账要能看出这一单
++  // 花的是 Cindy 配额还是用户自己的 Mivo 额度。
++  diagSkip(DIAG_SOURCE.gen, kind + ' 回落 Cindy 代办: 未配置 Mivo Key(配置后可用自己的 Mivo 额度)')
+   let request
+   if (msg.kind === 'edit-image') {
+     // 图生图:源图是插件名下媒体指纹(1–4 张,白名单校验已在函数开头做过)
+@@ -3065,11 +3242,17 @@ async function genOutcome(msg, kind) {
+   }
+   if (typeof msg.callId === 'string' && msg.callId) request.callId = msg.callId
+   const r = await hostSend(request)
++  const fallbackOk = Boolean(r && r.ok)
++  if (!fallbackOk) {
++    diagSkip(DIAG_SOURCE.gen, kind + ' Cindy 代办失败 code=' + GEN_CODE.CINDY_FALLBACK_FAILED)
++  }
+   return {
+-    ok: Boolean(r && r.ok),
++    ok: fallbackOk,
+     raw: r,
+     via: GEN_VIA_CINDY,
+-    message: (r && r.message) || '',
++    // 成功也带码:这条正是事故的要害 —— 回落成功时用户如果什么都看不到,就会以为
++    // 刚才那张图花的是自己的 Mivo 额度。
++    code: fallbackOk ? GEN_CODE.FALLBACK_QUOTA : GEN_CODE.CINDY_FALLBACK_FAILED,
+     width: r && r.width,
+     height: r && r.height,
+     model: r && r.model,
+@@ -3101,9 +3284,11 @@ function handleGenImage(msg) {
+       if (checked && !checked.media) {
+         // 宿主回执形状不合规 → 整条作废。不静默丢(面板会一直转),也不透传(那正是
+         // P1-② 的漏洞);给稳定机器码 + 既有四语通用文案,原文只进诊断的字段名摘要。
++        // 2026-08-05:原第十码 'HOST_MEDIA_INVALID' 归并进 MIVO_INTERNAL(D6 九码闭集)——
++        // consumer 按闭集查文案,闭集外的码等于没有契约。
+         reply = {
+           reqId: msg.reqId, reply: true, ok: false,
+-          code: 'HOST_MEDIA_INVALID',
++          code: GEN_CODE.INTERNAL,
+           message: cardText(cardLocaleCache, 'errUnknown'),
+         }
+         diagFail(
+@@ -3134,12 +3319,32 @@ function handleGenImage(msg) {
+             ' promptChars=' + diagTextLen(msg.prompt),
+         )
+       } else {
+-        reply = { reqId: msg.reqId, reply: true, ok: false, message: outcome.message || '生成失败' }
+-        diagFail(DIAG_SOURCE.gen, kind + ' 失败(' + outcome.via + '): ' + diagReason(reply.message))
++        // 对外只给稳定结局码 + 既有四语通用文案:上游/宿主原文一律不透传(它可能把
++        // 凭证原样回显,而回执会一路进面板 toast / TaskView / Debug Log / 设置页快照)。
++        // 面板按 code 选人话,见 cindyGenerationPort。
++        const code = outcome.code || GEN_CODE.INTERNAL
++        reply = {
++          reqId: msg.reqId, reply: true, ok: false,
++          code: code,
++          // 我方固定文案优先(具体且安全);没有就落既有四语通用文案。
++          message: outcome.safeMessage || cardText(cardLocaleCache, 'errUnknown'),
++        }
++        diagFail(DIAG_SOURCE.gen, kind + ' 失败(' + outcome.via + '): code=' + code)
+       }
++      // 成功也要带码:没配 key 时这一单花的是 Cindy 配额而不是用户自己的 Mivo 额度,
++      // 面板得据此告知一次 —— 事故的要害正是「回落成功却什么都不说」。
++      if (reply && reply.ok && outcome.code) reply.code = outcome.code
+     } catch (error) {
+-      reply = { reqId: msg.reqId, reply: true, ok: false, message: String((error && error.message) || error) }
+-      diagFail(DIAG_SOURCE.gen, kind + ' 异常: ' + diagReason(reply.message))
++      // 异常路径同理:不把 error.message 交给面板(它可能来自上游)。
++      // 这一层兜的是**任何**异常——包括宿主 `cindy.send` reject 出来的外部对象。码与文案
++      // 都必须过品牌门:非我方造的错误,码收敛 INTERNAL、文案落通用四语,原文一个字不出去
++      // (它可能回显凭证);诊断也只记码,不记原文的任何派生物(长度/指纹都能当侧信道)。
++      reply = {
++        reqId: msg.reqId, reply: true, ok: false,
++        code: genCodeOf(error),
++        message: genSafeMessageOf(error) || cardText(cardLocaleCache, 'errUnknown'),
++      }
++      diagFail(DIAG_SOURCE.gen, kind + ' 异常: code=' + reply.code + (error && error[GEN_ERR_BRAND] === true ? '' : ' (外部异常, 原文不记)'))
+     }
+     genInflight.delete(msg.reqId)
+     completed.set(msg.reqId, reply)
+@@ -6605,13 +6810,20 @@ if (seam && typeof seam.expose === 'function') {
+       modelChannel: MIVO_MODEL_CHANNEL,
+       payload: mivoPayload,
+       signedUrl: mivoSignedUrl,
+-      unconfiguredRe: MIVO_UNCONFIGURED_RE,
++      unconfiguredRe: MIVO_UNCONFIGURED_RE, // 仅诊断分类用,已不参与路由
+       pollIntervalMs: MIVO_POLL_INTERVAL_MS,
+       pollDeadlineMs: MIVO_POLL_DEADLINE_MS,
+       resetSession: () => {
+         mivoChatSessionId = ''
+       },
+       sessionId: () => mivoChatSessionId,
++      // —— 分流契约(2026-08-05)——
++      code: GEN_CODE,
++      configState: CONFIG_STATE,
++      normalizeReply: normalizeMivoReply,
++      readConfigState: readSecretConfigState,
++      secretKey: MIVO_SECRET_KEY,
++      secretsDeadlineMs: SECRETS_DEADLINE_MS,
+     },
+     exportTool: {
+       run: runExportTool,
+diff --git a/cindyplugin/src/__tests__/brainDiagnostics.test.ts b/cindyplugin/src/__tests__/brainDiagnostics.test.ts
+index 0a522f11..8cb80732 100644
+--- a/cindyplugin/src/__tests__/brainDiagnostics.test.ts
++++ b/cindyplugin/src/__tests__/brainDiagnostics.test.ts
+@@ -320,9 +320,14 @@ describe('电子脑诊断桥 — 真实事件三路径已接线', () => {
+     expect(spy.find('请求重发')[0]?.level).toBe('warn')
+     const failure = spy.find('gen 失败')[0]
+     expect(failure?.level).toBe('error')
+-    // 宿主原文可能回显提示词/用户内容,且 error 会远程上报 —— 只留类别+长度+签名
++    // 宿主原文可能回显提示词/用户内容/凭证,且 error 会远程上报 —— 只留**固定结局码**。
++    //
++    // 2026-08-05 起连「类别+长度+签名」也不留了:那三样都是原文的派生物(长度能推断凭证
++    // 长度,签名是稳定指纹),而它们不含原文子串,会让「原文没泄露」的子串断言假绿。
+     expect(failure?.message).not.toContain('额度不足')
+-    expect(failure?.message).toContain('reason=quota')
++    expect(failure?.message).toContain('code=CINDY_FALLBACK_FAILED')
++    expect(failure?.message).not.toContain('len=')
++    expect(failure?.message).not.toContain('sig=')
+   })
+ 
+   it('tool 面板未打开 → warn(可恢复),其他失败 → error,成功 → log', async () => {
+diff --git a/cindyplugin/src/__tests__/brainHarness.ts b/cindyplugin/src/__tests__/brainHarness.ts
+index dfb6bdf2..6fcd8a20 100644
+--- a/cindyplugin/src/__tests__/brainHarness.ts
++++ b/cindyplugin/src/__tests__/brainHarness.ts
+@@ -512,6 +512,13 @@ export type BrainMivoHandles = {
+   pollDeadlineMs: number
+   resetSession: () => void
+   sessionId: () => string
++  // —— 分流契约(2026-08-05)——
++  code: Record<string, string>
++  configState: Record<string, string>
++  normalizeReply: (reply: unknown) => string | null
++  readConfigState: () => Promise<string>
++  secretKey: string
++  secretsDeadlineMs: number
+ }
+ 
+ export type BrainHandles = {
+@@ -544,6 +551,8 @@ type BrainSeam = {
+   request?: (payload: unknown) => unknown
+   /** network 槽代发的注入口(生产走 cindy.fetch)。 */
+   fetch?: (payload: unknown) => unknown
++  /** 同源保留路径(`/secrets`)的注入口。与 fetch 分开,见 loadBrain 里的说明。 */
++  localFetch?: (path: unknown) => unknown
+   panelPresent?: () => boolean
+   expose?: (handles: BrainHandles) => void
+ }
+@@ -626,10 +635,22 @@ export type LoadBrainOptions = {
+    */
+   agentRun?: (payload: Record<string, unknown>) => unknown
+   /**
+-   * 注入 network 槽代发(`cindy.fetch`)的应答。不传 = 恒回「凭证未配置」类结构化错误,
+-   * 即「这台机器没配 Mivo key」——所有既有用例因此保持原有的 cindy-request 行为不变。
++   * 注入 network 槽代发(`cindy.fetch`)的应答。不传 = 恒回一条结构化传输错误。
++   *
++   * 注意:**它已经不再决定走哪条通道** —— 通道由下面的 `secretSaved` 决定(问保险库),
++   * 错误文案不再参与路由。
+    */
+   fetch?: (payload: Record<string, unknown>) => unknown
++  /**
++   * 这台机器配没配 Mivo key —— **分流的唯一判据**。
++   *   true            → configured:只走 Mivo 直连,失败如实报,零 cindy-request
++   *   false / 不传(默认)→ unconfigured:只走 Cindy 代办,零 Mivo 请求
++   *
++   * 「问不出配置态」(unknown → fail-fast)不走这个开关,用 `localFetch` 注入读取故障。
++   */
++  secretSaved?: boolean
++  /** 直接接管 `/secrets` 应答(测畸形契约:非数组、目标行重复、saved 非布尔、超时…)。 */
++  localFetch?: (path: string) => unknown
+ }
+ 
+ export type LoadedBrain = {
+@@ -644,6 +665,8 @@ export type LoadedBrain = {
+   hostRequests: unknown[]
+   /** 经 network 槽代发出去的请求(Mivo 直连协议断言用)。 */
+   fetchRequests: Array<Record<string, unknown>>
++  /** 本次运行里 `/secrets` 等同源保留路径被请求的顺序(用于断言「每次分流都重新问」)。 */
++  localFetchPaths: string[]
+   files: Map<string, string>
+   fsRequests: FsRequest[]
+   /** 宿主消息入口(tool-call / host-context-changed)。 */
+@@ -679,6 +702,7 @@ export function loadBrain(options: LoadBrainOptions = {}): LoadedBrain {
+   const hostRequests: unknown[] = []
+   const agentRunCalls: Record<string, unknown>[] = []
+   const fetchRequests: Array<Record<string, unknown>> = []
++  const localFetchPaths: string[] = []
+   let sendReply: unknown = { ok: true }
+   let sendThrows: Error | null = null
+ 
+@@ -820,6 +844,23 @@ export function loadBrain(options: LoadBrainOptions = {}): LoadedBrain {
+       }
+       return options.fetch(request)
+     },
++    // 同源保留路径(`/secrets`)。与 `fetch`(network 槽对外代发)刻意分开:混用一个
++    // seam 会让「问保险库存没存 key」被「打 Mivo 的故障注入」误伤。
++    //
++    // **不传 = 没配 key(unconfigured)**,与本 harness 既有约定一致:不关心 Mivo 分流的
++    // 用例(卡片/诊断/源图指代…)照旧走宿主代办路径,行为不变。
++    // 要测直连传 `secretSaved: true`;要测「问不出配置态」(fail-fast)用 `localFetch`
++    // 直接注入读取故障 —— 那一态属于分流契约测试,应当显式声明,不该靠默认值。
++    localFetch: async (path: unknown) => {
++      localFetchPaths.push(String(path))
++      if (options.localFetch) return options.localFetch(String(path))
++      const saved = options.secretSaved === true
++      return {
++        ok: true,
++        status: 200,
++        json: async () => [{ key: 'mivo_api_key', saved, tail: saved ? 'IAI' : undefined }],
++      }
++    },
+     expose: (exposed) => {
+       handles = exposed
+     },
+@@ -892,6 +933,7 @@ export function loadBrain(options: LoadBrainOptions = {}): LoadedBrain {
+     seamSent,
+     hostRequests,
+     fetchRequests,
++    localFetchPaths,
+     files,
+     fsRequests,
+     rawTimerUses,
+diff --git a/cindyplugin/src/__tests__/editOnceWithForcedRetry.test.ts b/cindyplugin/src/__tests__/editOnceWithForcedRetry.test.ts
+index 84e34811..0fe11c38 100644
+--- a/cindyplugin/src/__tests__/editOnceWithForcedRetry.test.ts
++++ b/cindyplugin/src/__tests__/editOnceWithForcedRetry.test.ts
+@@ -1,10 +1,14 @@
+ /**
+- * T1e §1.3/§3.3:"edit 失败强制重寄重试"的原语契约测试(设计稿 §11-B:"任一改图
+- * 失败后允许一次强制重寄存重试",不精确分类失败原因,1 次上限、不循环)。
++ * edit 失败后的指纹自愈原语测试(2026-08-05 语义变更)。
+  *
+- * 直接单测这个原语本身的重试语义,不经 submitEditTask 整条链路。
++ * 旧语义(T1e §11-B)是「任一失败后换指纹自动重寄一次」——其前提「宿主无稳定
++ * code、分不清失败原因」已不成立(GEN_CODE 闭集),且与 C10b 冲突:首单已被平台
++ * 收单只是回执丢失时,自动重寄 = 第二单,双扣 Mivo 额度(收口审阻断 1)。
+  *
+- * 端到端跑在真实 main.js 上(depositTestHarness),换指纹那一步走真实
++ * 新语义:**任何失败零自动重发**;指纹自愈降级为「失败后刷新指纹供下次用户重试」,
++ * 刷新是零生成零计费的寄存操作。本文件锁的就是「恰好 1 次业务请求」这条硬边界。
++ *
++ * 端到端跑在真实 main.js 上(depositTestHarness),换指纹走真实
+  * `refingerprintDepositEntry`,不是对着替身自说自话。
+  */
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+@@ -47,42 +51,40 @@ describe('editOnceWithForcedRetry — 首次成功', () => {
+   })
+ })
+ 
+-describe('editOnceWithForcedRetry — 首次失败,强制重寄后重试 1 次', () => {
+-  it('首次失败 → 换新指纹 → 用新 hash 重试一次 → 第二次成功', async () => {
++describe('editOnceWithForcedRetry — 首次失败:零自动重发,指纹自愈供下次用', () => {
++  it('首次失败 → 恰好 1 次业务请求(不自动重发,防双扣费)+ 指纹刷新确实发生', async () => {
+     await recordDeposit('mivo-asset:1', { hash: FAKE_HASH, ext: '.png', depositedAt: 1, from: 'deposit' })
+     const NEW_HASH = 'f'.repeat(32)
+     harness.setHostReply(() => ({ ok: true, hash: NEW_HASH, ext: '.png' }))
+ 
+-    let call = 0
+-    const doRequest = vi.fn(async (hash: string): Promise<PersistReply> => {
+-      call += 1
+-      return call === 1 ? failReply('内容审核失败') : okReply(hash)
+-    })
++    const doRequest = vi.fn(async (): Promise<PersistReply> => failReply('MIVO_TRANSPORT_UNKNOWN'))
+ 
+     const result = await editOnceWithForcedRetry('mivo-asset:1', blobOfBytes(32), doRequest, FAKE_HASH)
+ 
+-    expect(result).toMatchObject({ ok: true, hash: NEW_HASH })
+-    expect(doRequest).toHaveBeenCalledTimes(2)
+-    expect(doRequest).toHaveBeenNthCalledWith(1, FAKE_HASH)
+-    expect(doRequest).toHaveBeenNthCalledWith(2, NEW_HASH) // 第二次确实用了换出来的新指纹,不是重复旧 hash
+-    expect(harness.hostRequests).toHaveLength(1) // 换指纹确实发生了一次真实寄存
++    // 首次失败原样上报——即使这份失败可能只是「平台已收单但回执丢了」,也绝不能
++    // 靠自动重发去赌:赌错就是第二单。
++    expect(result).toMatchObject({ ok: false, message: 'MIVO_TRANSPORT_UNKNOWN' })
++    expect(doRequest).toHaveBeenCalledTimes(1) // 硬边界:业务请求恰好 1 次
++    expect(harness.hostRequests).toHaveLength(1) // 指纹刷新(寄存)发生了——自愈给下一次用户重试
+   })
+ 
+-  it('首次失败 → 重试也失败 → 照常报错,不第二次重试(SC1b.7 自愈至多 1 轮)', async () => {
++  it('刷新后的指纹供下一次用户主动重试使用(两次独立调用 = 两次用户点击,各 1 单)', async () => {
+     await recordDeposit('mivo-asset:1', { hash: FAKE_HASH, ext: '.png', depositedAt: 1, from: 'deposit' })
+     const NEW_HASH = 'a'.repeat(32)
+     harness.setHostReply(() => ({ ok: true, hash: NEW_HASH, ext: '.png' }))
+ 
+-    const doRequest = vi.fn(async (): Promise<PersistReply> => failReply('还是失败'))
+-
+-    const result = await editOnceWithForcedRetry('mivo-asset:1', blobOfBytes(32), doRequest, FAKE_HASH)
++    const doRequest = vi.fn(async (hash: string): Promise<PersistReply> => okReply(hash))
++    const first = vi.fn(async (): Promise<PersistReply> => failReply('宿主拒绝'))
+ 
+-    expect(result).toMatchObject({ ok: false, message: '还是失败' })
+-    expect(doRequest).toHaveBeenCalledTimes(2) // 恰好 2 次:首次 + 1 次重试,不是无限循环
+-    expect(harness.hostRequests).toHaveLength(1) // 换指纹本身还是发生了(只是第二次业务请求仍失败)
++    await editOnceWithForcedRetry('mivo-asset:1', blobOfBytes(32), first, FAKE_HASH)
++    expect(first).toHaveBeenCalledTimes(1)
++    // 模拟用户第二次点击:resolveDepositEntry 缓存已被刷新,入参 hash 已是新指纹
++    const second = await editOnceWithForcedRetry('mivo-asset:1', blobOfBytes(32), doRequest, NEW_HASH)
++    expect(second).toMatchObject({ ok: true, hash: NEW_HASH })
++    expect(doRequest).toHaveBeenCalledTimes(1) // 每次用户操作恰好 1 单
+   })
+ 
+-  it('首次失败但换指纹本身也失败(如寄存超限)→ 原样返回首次失败,不第二次尝试业务请求', async () => {
++  it('首次失败且换指纹本身也失败(如寄存超限)→ 仍原样返回首次失败', async () => {
+     const doRequest = vi.fn(async (): Promise<PersistReply> => failReply('首次失败原因'))
+     // 源图超过 50MB 上限,refingerprintDepositEntry 内部的 depositBlob 会抛 TOO_LARGE。
+     const oversized = blobOfBytes(50 * 1024 * 1024 + 1)
+@@ -90,7 +92,7 @@ describe('editOnceWithForcedRetry — 首次失败,强制重寄后重试 1 次',
+     const result = await editOnceWithForcedRetry('mivo-asset:1', oversized, doRequest, FAKE_HASH)
+ 
+     expect(result).toMatchObject({ ok: false, message: '首次失败原因' }) // 报的是首次失败,不是换指纹失败
+-    expect(doRequest).toHaveBeenCalledTimes(1) // 换指纹失败就不再调 doRequest 第二次
++    expect(doRequest).toHaveBeenCalledTimes(1)
+     expect(harness.hostRequests).toHaveLength(0) // 超限前置拦截,零寄存请求
+   })
+ 
+diff --git a/cindyplugin/src/__tests__/genMediaBoundary.test.ts b/cindyplugin/src/__tests__/genMediaBoundary.test.ts
+index 813a6d6c..03f7d75e 100644
+--- a/cindyplugin/src/__tests__/genMediaBoundary.test.ts
++++ b/cindyplugin/src/__tests__/genMediaBoundary.test.ts
+@@ -217,7 +217,7 @@ describe('端到端:不合规回执不进交卷载荷', () => {
+     const zh = await runGen(okReply({ url: LEAK_URL }), 'zh-CN')
+     const reply = zh.genReplies.find((item) => item.reqId === 'gen-1')
+     expect(reply?.ok).toBe(false)
+-    expect(reply?.code).toBe('HOST_MEDIA_INVALID')
++    expect(reply?.code).toBe('MIVO_INTERNAL' /* 2026-08-05: HOST_MEDIA_INVALID 归并进九码闭集 */)
+     expect(reply?.message).toBe('出了点问题,请稍后重试')
+     // 拒收既不静默丢(面板拿到终态,不会一直转)也不透传(原文不在回执里)
+     expect(JSON.stringify(reply)).not.toContain('/Users/')
+diff --git a/cindyplugin/src/__tests__/mivoChannel.test.ts b/cindyplugin/src/__tests__/mivoChannel.test.ts
+index 4e484c94..8ce1fff4 100644
+--- a/cindyplugin/src/__tests__/mivoChannel.test.ts
++++ b/cindyplugin/src/__tests__/mivoChannel.test.ts
+@@ -106,6 +106,14 @@ type RunOptions = {
+   hostReply?: Record<string, unknown>
+   /** 需要推进假时钟的场景(轮询等待)。 */
+   advanceMs?: number
++  /**
++   * 这台机器配没配 key(分流的唯一判据)。不传时按「有没有给 Mivo 应答」推断 ——
++   * 与本文件既有分组语义一致(「配了 key」组都注入 fetch,「没配 key」组都不注入)。
++   * 要测「问不出配置态」这一态,显式传 'unknown'。
++   */
++  configState?: 'configured' | 'unconfigured' | 'unknown'
++  /** 直接接管 `/secrets` 应答(测畸形契约)。 */
++  localFetch?: LoadBrainOptions['localFetch']
+ }
+ 
+ const runGen = async (options: RunOptions = {}): Promise<RunResult> => {
+@@ -123,6 +131,11 @@ const runGen = async (options: RunOptions = {}): Promise<RunResult> => {
+     panelPresent: () => false,
+     locale: 'zh-CN',
+     fetch: options.fetch,
++    // 'unknown' = 问不出配置态:注入 `/secrets` 读取故障(非 2xx)。
++    localFetch:
++      options.localFetch ??
++      (options.configState === 'unknown' ? () => ({ ok: false, status: 500, json: async () => [] }) : undefined),
++    secretSaved: options.configState ? options.configState === 'configured' : Boolean(options.fetch),
+     send: (payload) => {
+       const message = (payload ?? {}) as Record<string, unknown>
+       if (message.type === 'cindy-request') {
+@@ -144,6 +157,9 @@ const runGen = async (options: RunOptions = {}): Promise<RunResult> => {
+   brain.handles.handleGenImage(
+     options.msg ?? { reqId: 'gen-1', kind: 'gen-image', prompt: PROMPT, callId: 'call-1' },
+   )
++  // 先让 `/secrets` 配置态读取(同源、毫秒级)落定,再开始推假时钟——直接推 30s 会把
++  // 3s 的读取 deadline 一并误触发,那是测试时序伪影,不是生产形态。
++  await flushMicrotasks()
+   await flushUntil(() => replies.length > 0, {
+     label: 'handleGenImage 回执',
+     rounds: 64,
+@@ -413,13 +429,15 @@ describe('没配 key:静默回落宿主代办,老路径逐字段不变', () => {
+     expect(fell).toHaveLength(1)
+     expect(fell[0].level).toBe('warn')
+     expect(fell[0].source).toBe('Brain Gen')
+-    expect(fell[0].message).toContain('未配置凭证或域名未放行')
++    expect(fell[0].message).toContain('未配置 Mivo Key')
+   })
+ 
+-  it('回落只在提交之前发生:第一跳就失败,没有任何提交/上传流出', async () => {
++  it('没配 key 时一个 Mivo 请求都不发(不再「先试一跳再回落」)', async () => {
+     const run = await runGen()
+-    expect(run.fetches).toHaveLength(1)
+-    expect(String(run.fetches[0].url)).toBe('https://aigc.xindong.com/api/v1/message/chat')
++    // 旧行为:先打一次 /message/chat,失败了才回落。新行为:配置态在**发起之前**就问过了,
++    // 明确没配 key 就直接走代办 —— 零建会话、零上传、零提交、零轮询。
++    expect(run.fetches).toHaveLength(0)
++    expect(run.cindyRequests).toHaveLength(1)
+   })
+ 
+   it('「未接通」判据只认凭证/白名单类,不吞业务错误文案', () => {
+@@ -447,22 +465,28 @@ describe('没配 key:静默回落宿主代办,老路径逐字段不变', () => {
+ })
+ 
+ describe('业务失败:如实报错,绝不回落(避免双扣费)', () => {
++  // 期望的是**结局码**,不是文案:上游原文/内部细节都不出 brain(C11),面板按码查 i18n。
+   const cases: Array<[string, UpstreamOptions, string]> = [
+-    ['上游 failed', { pollStatuses: ['failed'] }, 'Mivo 生成失败'],
++    // 2xx 但业务终态 failed → 2xx 之后的语义失败
++    ['上游 failed', { pollStatuses: ['failed'] }, 'MIVO_INTERNAL'],
+     [
+-      '提交被拒 5xx',
++      // ok:false = 传输层失败(响应丢失/网络),无 status 可分类 → 统一归一
++      '提交被拒(传输失败)',
+       { override: (request) => (String(request.url).endsWith('/api/v1/message') ? { ok: false, message: 'upstream 500' } : null) },
+-      '',
++      'MIVO_TRANSPORT_UNKNOWN',
+     ],
+-    ['取件两条路都不通', { directMedia: false, signedAllowed: false }, '签名地址域名未放行'],
++    // 签名地址被宿主白名单拦下 = ok:false → 统一 TRANSPORT_UNKNOWN;闭集码原样透出,
++    // 不再被 signed-media catch 覆写成 INTERNAL(收口审阻断 2)
++    ['取件两条路都不通', { directMedia: false, signedAllowed: false }, 'MIVO_TRANSPORT_UNKNOWN'],
+   ]
+ 
+-  for (const [name, upstream, expectMessage] of cases) {
++  for (const [name, upstream, expectCode] of cases) {
+     it(`${name} → ok:false 且零 cindy-request`, async () => {
+       const run = await runGen({ fetch: mivoUpstream(upstream) })
+       expect(run.reply?.ok).toBe(false)
+       expect(run.cindyRequests).toHaveLength(0)
+-      if (expectMessage) expect(String(run.reply?.message)).toContain(expectMessage)
++      // 新契约(C11):对外只给稳定 code,不透传上游原文/具体文案 —— 具体文案由面板按 code 查 i18n。
++      if (expectCode) expect(run.reply?.code).toBe(expectCode)
+       const spy = attachPanelBridge(run.brain).spy
+       const failed = spy.find('失败(Mivo 直连)')
+       expect(failed).toHaveLength(1)
+@@ -477,7 +501,7 @@ describe('业务失败:如实报错,绝不回落(避免双扣费)', () => {
+   it('超时:到截止时间收口,给可行动的人话', async () => {
+     const run = await runGen({ fetch: mivoUpstream({ pollStatuses: ['pending'] }), advanceMs: 30_000 })
+     expect(run.reply?.ok).toBe(false)
+-    expect(String(run.reply?.message)).toContain('超时')
++    expect(run.reply?.code).toBe('MIVO_INTERNAL') // 轮询超时属 2xx 后业务终态 → INTERNAL
+     expect(run.cindyRequests).toHaveLength(0)
+   })
+ 
+@@ -491,7 +515,7 @@ describe('业务失败:如实报错,绝不回落(避免双扣费)', () => {
+       }),
+     })
+     expect(run.reply?.ok).toBe(false)
+-    expect(run.reply?.code).toBe('HOST_MEDIA_INVALID')
++    expect(run.reply?.code).toBe('MIVO_INTERNAL' /* 归并,同 genMediaBoundary */)
+     expect(JSON.stringify(run.reply)).not.toContain('/Users/')
+     expect(run.cindyRequests).toHaveLength(0)
+   })
+diff --git a/cindyplugin/src/agent/cindyGenerationPort.ts b/cindyplugin/src/agent/cindyGenerationPort.ts
+index 72115d26..b67735bb 100644
+--- a/cindyplugin/src/agent/cindyGenerationPort.ts
++++ b/cindyplugin/src/agent/cindyGenerationPort.ts
+@@ -197,15 +197,17 @@ const correlateNewAssets = (before: Set<string>, entries: Array<{ hash: string;
+ }
+ 
+ /**
+- * T1e §1.3/§3.3(edit 失败强制重寄重试,设计稿 §11-B):"任一改图失败后允许一次
+- * 强制重寄存重试"——宿主只给自由文本 message、无稳定 code,不精确分类失败原因,
+- * 失败就换新指纹重试一次,再失败照常报错、不第二次重试(SC1b.7 自愈至多 1
+- * 轮)。
++ * edit 一单 + 失败后的指纹自愈(2026-08-05 改)。
+  *
+- * 换指纹本身失败(`refingerprintDepositEntry` 抛错,如寄存超限/宿主拒收)—— 原样
+- * 返回首次失败,不把"换指纹失败"包装成第二次改图失败,两种失败原因不同不该
+- * 混在一起报。没有 `sourceAssetUrl`/`image`(无法重寄的场景,理论上不会发生,
+- * 因为能走到这里就必然已经解析出过一次 source)时同样原样返回首次失败。
++ * 它曾经是「任一改图失败后自动换指纹重寄一次」(T1e §11-B)——那条设计的前提是
++ * 「宿主只给自由文本、无稳定 code,分不清失败原因」。这个前提已经不成立(回执带
++ * GEN_CODE 闭集码),而它的行为与 C10b 直接冲突:首次 /message 已被平台收单、只是
++ * 回执丢了(MIVO_TRANSPORT_UNKNOWN)时,自动重寄就是**第二单**,双扣用户的 Mivo
++ * 额度——brain 层的「单 handler 恰好一次」挡不住这条消费层路径(收口审阻断 1)。
++ *
++ * 现在:**任何失败都不自动重提**。指纹过期的自愈保留但降级为「失败后只刷新指纹、
++ * 不重发」——刷新是本地/寄存操作,零生成零计费;下一次用户主动重试自然用上新指纹,
++ * 效果只差一次点击,不差一份钱。换指纹本身失败只留痕,不影响首次失败的如实上报。
+  */
+ export const editOnceWithForcedRetry = async (
+   sourceAssetUrl: string | undefined,
+@@ -215,16 +217,15 @@ export const editOnceWithForcedRetry = async (
+ ): Promise<PersistReply> => {
+   const first = await doRequest(firstHash)
+   if (first.ok) return first
+-  if (!sourceAssetUrl || !image) return first
+-  let refreshed: { hash: string }
+-  try {
+-    refreshed = await refingerprintDepositEntry({ assetUrl: sourceAssetUrl, blob: image })
+-  } catch (error) {
+-    debugLogger.warn(SOURCE, `edit 失败强制重寄:换指纹本身失败,放弃重试,原样报首次失败:${error instanceof Error ? error.message : String(error)}`)
+-    return first
++  if (sourceAssetUrl && image) {
++    try {
++      const refreshed = await refingerprintDepositEntry({ assetUrl: sourceAssetUrl, blob: image })
++      debugLogger.log(SOURCE, `edit 失败:已刷新源图指纹 hash=${refreshed.hash.slice(0, 8)} 供下次重试用,本次不自动重发(防双扣费)`)
++    } catch (error) {
++      debugLogger.warn(SOURCE, `edit 失败:刷新指纹也失败,原样报首次失败:${error instanceof Error ? error.message : String(error)}`)
++    }
+   }
+-  debugLogger.log(SOURCE, `edit 失败强制重寄:已换新指纹 hash=${refreshed.hash.slice(0, 8)},重试 1 次`)
+-  return doRequest(refreshed.hash)
++  return first
+ }
+ 
+ export const cindyImageGenerationPort: ImageGenerationPort = {
+diff --git a/docs/development-logging.md b/docs/development-logging.md
+index ddcdc217..cba50bed 100644
+--- a/docs/development-logging.md
++++ b/docs/development-logging.md
+@@ -39,7 +39,7 @@ Rules that apply to brain diagnostics specifically:
+ 
+ - The panel is often closed. Events go into a bounded queue (oldest dropped, drop count reported), are replayed exactly once when the panel reconnects, and are de-duplicated by sequence number, so a closed panel never means a silently lost failure.
+ - The panel re-sends every pending request on a timer (image generation retries every 5s for up to 28 minutes), so suppression logs for a re-send must pass a `repeatKey` (normally the `reqId`) to `diagSkip`: the first occurrence is recorded and later repeats stay silent. A visible warning must not become hundreds of identical entries.
+-- Failure paths must not embed foreign text. Host replies and exception messages can echo the prompt, a filename, or user content, and `warn`/`error` entries are uploaded by the remote debug reporter, so pass them through `diagReason`: it records `reason=<category> len=<n> sig=<hash>` instead of the original string. The raw message still travels to the host and the panel UI unchanged; only the diagnostic log is summarised.
++- Failure paths must not embed foreign text. Host replies and exception messages can echo the prompt, a filename, user content — or the user's API key — and `warn`/`error` entries are uploaded by the remote debug reporter. For the Mivo generation channel (2026-08-05, incident follow-up) the rule is strict: log **only the fixed outcome code** (`code=MIVO_…` from the `GEN_CODE` closed set). Do not log the raw message *or any derivative of it* — `diagReason`'s `reason=<category> len=<n> sig=<hash>` summary is itself a side channel (length reveals key length, the hash is a stable fingerprint), so it is no longer acceptable on these paths. The raw message must also never travel to the panel UI or BroadcastChannel replies on this channel: the reply carries the outcome code and a fixed i18n message. (`diagReason` remains in use on legacy non-credential paths pending migration.)
+ - Diagnostic messages describe what happened, they do not carry payloads. `redactDiag` replaces any URL (including `cindy-media://` media addresses) and HTML fragment and truncates the line; prompts are recorded as `promptChars=<n>` and media identity as an 8-character hash prefix. Never concatenate a raw prompt, media URL, or card HTML into a diagnostic message.
+ - Chat card transport (`card` slot) follows the same three paths: a version actually handed to the host logs, a middle version dropped by the local coalescer logs a warning that says `coalesced locally` (never blame the host, which only silently drops over-sends), and a host rejection or send exception logs an error. Success wording states that the send attempt completed — the host may still rate-limit or sanitise the version, so never claim delivery.
+ - A tool call that draws a card owns the whole visual outcome: the chat no longer renders the default media card for it. Every failure path must therefore converge into one `state:'done'` failure card on the same card slot (localised copy per error class, no `working` animation classes left behind) and only then submit `tool-result(ok:false, errorCode)`. Internal details stay in the diagnostic log; the card shows the desensitised reason plus what the user can do next. Plugin error codes must not reuse the host-reserved ones (`INTERNAL` / `TIMEOUT` / `GHOST_*`).
+diff --git a/scripts/changelog/test-publish-gate-isolation.sh b/scripts/changelog/test-publish-gate-isolation.sh
+index 57402c91..326ad4f2 100755
+--- a/scripts/changelog/test-publish-gate-isolation.sh
++++ b/scripts/changelog/test-publish-gate-isolation.sh
+@@ -100,9 +100,9 @@ probe_git_config() {
+     fi
+   else
+     if [ "$email" != "victim@local" ] || [ "$name" != "victim" ]; then
+-      pass "$label【反证】: 删掉剥离行后 victim config 确实被改写(email=$email name=$name)—— 注入有效,上一条的绿有鉴别力"
++      pass "${label}【反证】: 删掉剥离行后 victim config 确实被改写(email=$email name=$name)—— 注入有效,上一条的绿有鉴别力"
+     else
+-      fail "$label【反证失效】: 删掉剥离行后 victim config 仍未被改写 —— 注入没生效或 mutant 失效,本测试对真脚本的绿无鉴别力"
++      fail "${label}【反证失效】: 删掉剥离行后 victim config 仍未被改写 —— 注入没生效或 mutant 失效,本测试对真脚本的绿无鉴别力"
+     fi
+   fi
+ }
+diff --git a/scripts/verify-debug-logging.mjs b/scripts/verify-debug-logging.mjs
+index 737d8591..7f4b6a3b 100644
+--- a/scripts/verify-debug-logging.mjs
++++ b/scripts/verify-debug-logging.mjs
+@@ -1887,8 +1887,10 @@ checks.push(async () => {
+   requireSoleDecl('gen', 'lastGenByCallId.get(', 'the reply feeding imageUrl must come from lastGenByCallId')
+ 
+   // ⑥ 拒收路径必须留痕且不透传(三路径规则):稳定机器码 + 既有四语通用文案。
++  // 2026-08-05:机器码从专用的 'HOST_MEDIA_INVALID' 归并进 GEN_CODE 闭集(D6 九码契约,
++  // consumer 按闭集查 i18n,闭集外的码没有文案)——守卫跟着锁新契约。
+   const genBody = codeOf(sf, genFn)
+-  for (const needle of ["code:'HOST_MEDIA_INVALID'", "cardText(cardLocaleCache,'errUnknown')"]) {
++  for (const needle of ['code:GEN_CODE.INTERNAL', "cardText(cardLocaleCache,'errUnknown')"]) {
+     requireIncludes(genBody, needle, `${label} rejection wiring`)
+   }
+   requireIncludes(brain, '宿主回执媒体字段不合规', `${label} rejection log`)

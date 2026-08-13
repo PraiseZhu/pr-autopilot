@@ -1,0 +1,239 @@
+diff --git a/docs/loops/bug-doctor-scheduler-prompts.md b/docs/loops/bug-doctor-scheduler-prompts.md
+new file mode 100644
+index 00000000..aaecdd75
+--- /dev/null
++++ b/docs/loops/bug-doctor-scheduler-prompts.md
+@@ -0,0 +1,70 @@
++# Mivo(原 bug-doctor)· 主轮/补轮定时会话 Prompt(批次2:接入 Trae/Sentry 第三料源)
++
++> **交付边界(如实)**:本文件合并进 main = prompt 文档交付,**不等于生产已接线**。macmini 上实际驱动主轮/补轮的 mini scheduler 配置不在本仓库(不入 git,与部署主机同理由——见 `docs/loops/bug-doctor.md` 生产安全铁律),需 owner 手工把下方两段 prompt 粘贴进对应的定时会话配置里才会真正跑起来。
++> **消费日期语义(必读,审查修正)**:主轮 02:30 消费的是**昨日**的 findings 文件(gate 默认取上海昨日)——因为 TRAE 夜巡 **03:30** 才产出当天文件(见 MivoSentry `docs/deploy/trae-nightly-task.md`),02:30 取当天必然扑空,且次日主轮只看次日,当天产物会**永久漏消费**。滞后约一天,对代码审计类 findings 可接受;补历史某天用 `--sentry-date YYYY-MM-DD` 显式指定。
++> **验收标准**:下一次主轮跑完后,`history/loops/bug-doctor/logs.md` 新增一行含 `sentry=consumed`、`sentry=missing` 或 `sentry=degraded` 三者之一(对象是**昨日**文件的实际状态,不是三选一挑好看的);同一天的补轮那一行必须是 `sentry=skipped`(补轮 prompt 不带 `--include-sentry`,详见下方 §2)。
++> 上游契约:`docs/loops/bug-doctor.md`(loop 总契约,SOP 触发拓扑见其 §触发拓扑)。数据源契约见 `scripts/loops/bug-doctor/sentry-intake.mjs` 文件头注释与 `rules.json` 的 `sentryIntake` 段。
++
++## 队列纪律(两轮通用,写进 prompt 第一条)
++
++**生产 debug log / 人工报单(HumanReport)产生的 P0-P1,永远排在任何 Trae 簇之前处理。** Trae 簇(`origin: "trae-audit"`)在 workpacket 里本就殿后排序(见 `gate.mjs` `buildWorkpacket`),分诊时不要因为"T1 候选看起来省事"就插队处理——这条纪律是防止确定性预筛的候选抢占真实用户可见故障的处理顺序。
++
++---
++
++## §1 主轮 Prompt(02:30,`gate --include-sentry`)
++
++```
++你是 Mivo(原 bug-doctor)主轮工作会话。第一步跑 gate,消费三路信号(生产 debug log +
++nightly-e2e + 本次新增的 Trae/Sentry findings 第三料源):
++
++  node scripts/loops/bug-doctor/gate.mjs --include-sentry
++
++- 注意:sentry 消费的是**昨日**的 findings 文件(gate 默认即昨日,不要另传
++  --sentry-date;TRAE 夜巡 03:30 才产出当天文件,02:30 时它还不存在)。
++- gate 退出后读 stdout 的一行 JSON 摘要;若 status=locked,说明有其他实例在跑,直接结束
++  本轮(不重试、不排队)。
++- 打开 history/loops/bug-doctor/workpacket.json,检查 signals.sentry.status:
++  - "consumed":本轮正常消费了昨日 Trae findings,继续往下看 clusters 里 origin=
++    "trae-audit" 的项——这些是被 sentry-intake.mjs 预筛过的候选(tCap="T1" 表示结构性
++    预筛通过,"T2" 表示建了簇但不合 T1 资格,只是可见)。
++  - "missing":昨日 findings 文件不存在(Trae 夜巡昨天没跑成或路径没配对),
++    不是错误,继续走本轮其余工作,不要因此中断。
++  - "degraded":连续 3 个自然日缺失或文件本身损坏,这是需要人工核查的信号(macmini
++    上 MivoSentry 夜巡是否还在跑、findings 路径是否漂移),记进本轮战报,不要静默略过。
++- 按【队列纪律】处理完生产/人工的 P0-P1 之后,才轮到 Trae 簇:
++  - tCap="T1" 且 sLevel 不高于当前处理预算的候选,可以走既有 T1 自动修复+合并流程
++    (复现→最小修复→验证→审查→合并,禁区/白名单仍以 rules.json t1 段为准,sentry-intake
++    只是多了一层"这条 finding 结构上像不像 T1"的预筛,不代表跳过既有 T1 全部条件)。
++  - tCap="T2" 的 Trae 簇按普通 T2 流程处理(修复+PR 留人审),不按合并键。
++  - workpacket.signals.sentry.manualTicketCount > 0 时,对应的 deps-vuln/secret-pattern
++    发现不建簇、不用本轮 worker 处理——它们只产生了确定性 action id
++    (state.sentryIntake.manualTickets),后续建 GitHub issue 走 T3 既有流程,本轮只需
++    在战报里如实提一句"待建 N 个 manual-ticket",不要现场臆造修复方案。
++  - workpacket.signals.sentry.summary 里的 dim 计数(type-escape/test-health/debt-metric/
++    circular-dep)只进战报陈述,不产生任何工作项。
++- 其余步骤(分诊/修复/验证/审查/交付/收尾)按 docs/loops/bug-doctor.md 既有 SOP 不变。
++```
++
++## §2 补轮 Prompt(13:00,不带 `--include-sentry`)
++
++```
++你是 Mivo(原 bug-doctor)补轮工作会话。只消化上午新进的 S0/S1,赶 17:00 部署班车。
++
++  node scripts/loops/bug-doctor/gate.mjs
++
++**不要**加 `--include-sentry`:补轮的职责是清生产/人工的高优先级队列,不消费 Trae/Sentry
++findings,也不写、不改 state.sentryIntake 的任何字段(consumedDates/missingStreak/
++degraded/decisions/summary/manualTickets 全部原样不动)。本轮 gate 输出的
++signals.sentry.status 应为 "skipped";若看到其它值,说明有人在补轮 prompt 里误加了
++`--include-sentry`,按误配置处理并回退。
++
++其余步骤按 docs/loops/bug-doctor.md 既有 SOP 不变。
++```
++
++---
++
++## 已知局限(如实)
++
++- 本文件只是 prompt 文本;把它接进实际会跑的定时任务(maker 的主轮/补轮会话配置),需 owner 手工操作,PR 合并这一步不会自动生效。
++- Trae/Sentry findings 的产出方(MivoSentry 夜巡)与消费方(本 loop)是两个独立系统,findings 目录路径(`rules.json` 的 `sentryIntake.findingsDir`,默认 `~/mivo-ops/mivo-sentry/state`)漂移或 Trae 侧停跑,本 loop 只能通过 `missing`→`degraded` 的连续缺失信号侧面感知,不会主动去检查 Trae 进程状态。
++- `mark-fixed` 子命令(`node scripts/loops/bug-doctor/sentry-intake.mjs mark-fixed --fp <fp> --pr <n>`)目前需要人工或分诊会话显式调用,主轮/补轮 prompt 都不会自动执行——避免在 PR 尚未真正合并前就误标 fixed。
+diff --git a/docs/loops/bug-doctor.md b/docs/loops/bug-doctor.md
+index acac3d44..792c1e20 100644
+--- a/docs/loops/bug-doctor.md
++++ b/docs/loops/bug-doctor.md
+@@ -8,7 +8,7 @@
+ 
+ ## Goal
+ 
+-mivo 生产环境的用户可见错误随时间下降(当前由生产 debug log + nightly-e2e 两路已接信号驱动);React 健康分随时间上升是长期方向,但 gate 尚未对 react-baseline.json 做 diff/打分,这条暂不是本 loop 每轮实际推动的指标。每个工作轮:消化新错误簇 → 修复最高优先级的活 → 带证据交付 PR → 白名单内自动合并。
++mivo 生产环境的用户可见错误随时间下降(当前由生产 debug log + nightly-e2e 两路常驻信号驱动;批次2 起主轮另消费 Trae/Sentry findings 第三料源,仅显式 `--include-sentry`,见信号源表 #5);React 健康分随时间上升是长期方向,但 gate 尚未对 react-baseline.json 做 diff/打分,这条暂不是本 loop 每轮实际推动的指标。每个工作轮:消化新错误簇 → 修复最高优先级的活 → 带证据交付 PR → 白名单内自动合并。
+ 
+ **这是 monitor 型 loop,没有终点线。零新增信号的一轮 = 成功的一轮,不是浪费。永远不要为了显得忙碌而制造改动。**
+ 
+@@ -16,7 +16,7 @@ mivo 生产环境的用户可见错误随时间下降(当前由生产 debug log
+ 
+ ## 信号源(发现层,全部确定性脚本,零 LLM)
+ 
+-**接入状态(如实,2026-08-02 核实)**:仅 #1(生产 debug log)与 #3(nightly-e2e)已接,由 `gate.mjs` 实际拉取、聚类、计入打分与 S 级。#2(React 健康扫描)与 #4(verify:logging)在 gate 里仍是留空接口——不要按下表机制描述误以为已经在跑。
++**接入状态(如实,2026-08-04 更新)**:#1(生产 debug log)与 #3(nightly-e2e)常驻已接;#5(Trae/Sentry findings)批次2 起已接,但**仅主轮显式 `--include-sentry` 才消费**(补轮/默认不消费)。#2(React 健康扫描)与 #4(verify:logging)在 gate 里仍是留空接口——不要按下表机制描述误以为已经在跑。
+ 
+ | # | 来源 | 机制 |
+ |---|------|------|
+@@ -24,6 +24,7 @@ mivo 生产环境的用户可见错误随时间下降(当前由生产 debug log
+ | 2 | React 健康扫描(**未接,仅探测存在性**) | 设计意图:react-doctor v0.7.8(T3 spike 已选型:强制 `--no-telemetry`,健康分用基线内置本地公式)与 `react-baseline.json` diff,分数进看板、新增 error 级进队列作 S1 候选、warning 只动分数。**当前实现**:`gate.mjs` 只检测 `react-baseline.json` 是否存在(`present-not-diffed`/`skipped`),不 diff、不进打分、不产生 S1/S2 候选;diff 接入是另立任务 |
+ | 3 | nightly-e2e 云端结果(**已接**) | `gh run list --workflow=nightly-e2e` 查最近结论,红灯 = S0 信号(main 回归,早于用户报错) |
+ | 4 | verify:logging 违规(**未接**) | 设计意图:违规项建 S3 活。**当前实现**:`signals.verifyLogging` 固定输出 `{status:'skipped'}`;守卫命令本身已存在(`npm run verify:logging`),接入排队/建 S3 活是另立任务 |
++| 5 | Trae/Sentry findings(**已接,仅主轮显式 `--include-sentry` 才消费**) | 批次2 第三料源:`sentry-intake.mjs` 读 `<findingsDir>/findings-<date>.json`(路径 env `MIVO_SENTRY_FINDINGS_DIR` > `rules.json` `sentryIntake.findingsDir`),按 dim 分拣到三种互斥终点(t1-candidate 建簇进队列 / manual-ticket 只记确定性 action / summary-only 只进战报计数),T1 候选过结构性预筛(changeType 白名单 + forbiddenPaths)+ 每日上限。不带 flag 的任何模式(含补轮)一律 `skipped`,不碰 `state.sentryIntake`。主轮/补轮 prompt 文本见 `docs/loops/bug-doctor-scheduler-prompts.md` |
+ 
+ ## 触发拓扑(Q1/Q7 定稿)
+ 
+@@ -73,7 +74,7 @@ error 突增(单小时 >50)/ persist·迁移类数据完整性信号 / 鉴权异
+ 
+ ## SOP(每个工作轮)
+ 
+-1. **Gate**(确定性脚本):拉生产 debug log + nightly-e2e 两路已接信号(React baseline 仅探测存在性、verify:logging 未接,均留接口,见信号源表)→ 聚类打分 → 对照台账 → 产出工作包 JSON;空 → 记日志退出。
++1. **Gate**(确定性脚本):拉生产 debug log + nightly-e2e 两路已接信号(React baseline 仅探测存在性、verify:logging 未接,均留接口,见信号源表;主轮另带 `--include-sentry` 在同一把 gate 锁内消费 Trae/Sentry findings 第三料源,补轮不带)→ 聚类打分 → 对照台账 → 产出工作包 JSON;空 → 记日志退出。
+ 2. **分诊**(主会话,不改码):逐簇对照代码核实"真 bug 还是预期降级路径" → 定 S/T 级 → T0 告警、T3 提 issue → 按队列挑活(S0 全清,S1 按分,预算内带 S2)。
+ 3. **修复**(执行 worker,隔离 worktree off origin/main,worktree 建在 loop 目录与主 checkout 之外):**先复现**(写失败测试),复现不出降 T3;再最小修复。
+ 4. **验证**:worker 自跑 build/lint/test:unit/verify:logging/test:shell + 复现测试转绿;e2e worker 跑本地双进程 smoke(local persist 模式;server 模式受 PG 限制,如实标注)。
+@@ -188,9 +189,9 @@ history/loops/bug-doctor/
+ - 凌晨 T1 自动合并 → 9:00 上生产,无人眼环节(用户 2026-07-17 明确接受;白名单+四层验证对冲,风险不为零)。
+ - debug log 无 stack trace/操作序列,复现率有限,初期 T3 占比会偏高。
+ - appVersion 当前为 "0.0.0",回归检测失明,待前置 PR 修复。
+-- **信号接入现状(如实)**:目前只有生产 debug log + nightly-e2e 两路已接入 gate 打分;React baseline diff 与 verify:logging 接入均未开始(留接口,均为独立任务),不要按信号源表的"设计意图"描述误判为已经在跑。
++- **信号接入现状(如实,2026-08-04 更新)**:生产 debug log + nightly-e2e 两路常驻接入 gate 打分;Trae/Sentry findings(#5)批次2 起接入但仅主轮显式 `--include-sentry` 消费,且 Trae 簇不走日志打分公式(score 恒 0,severity 直映 sLevel)。React baseline diff 与 verify:logging 接入均未开始(留接口,均为独立任务),不要按信号源表的"设计意图"描述误判为已经在跑。
+ - **复发状态发射受消费方兼容开关限制(如实,SC-BD1-R1f)**:`rules.json` 的 `features.recurrenceEmit` 目前默认 `false`——但这个开关只管 B 层(对外发射,workpacket.json)。gate 碰到已结算(fixed/issue-filed)簇被晚于结算时刻的新记录命中时,**state.json 里的 A 层状态转移始终照常发生**(簇原地转 `recurrent`,写 `recurredAt`/`nextAction`,不受开关约束);开关关闭时只是不把这件事投影进工作包——workpacket 按结算前状态(`fixed`/`issue-filed`)呈现该簇,不发射 `recurrent`/`nextAction`。理由是时序而非文档:候选一旦对外发射,issue-filed 簇转 recurrent 后会送进尚不认识 `nextAction:"append-comment"` 的旧班车,可能重新建票而非追加评论。批次2 班车 prompt 完成该消费逻辑后,把该开关改 `true` 才对外实际发射。
+-- 两信号源都看不见"没人走过的死角",本 loop 不是测试替代品。
++- 已接入的信号源(不论几路)都看不见"没人走过的死角"——debug log/nightly 只反映跑过的路径,Trae 审计只反映静态可扫的模式;本 loop 不是测试替代品。措辞刻意不写死数量,免得每接一路都要回改这句(本句曾因写死"两信号源"与 #5 已接行自相矛盾,审查指出后改此形态)。
+ - e2e server 模式本地受 PG 限制,验证以 local 模式为主,nightly-e2e 云端兜底。
+ - **台账互斥锁的接管协议存在不可原子化的三方连环微秒级窗口**(`state.mjs` 陈锁 rename 收尸 + 验尸放回,2026-07-19 四轮审查后定版)。触发需四条件同时满足:①锁已陈死(持有进程崩溃超 TTL 60 分钟);②某旧观察者完成陈旧判定后恰在此处停顿;③停顿期间原尸体被另一接管者收走并换上新锁;④第三方进程在旧观察者恢复后的数个文件操作间隙精确插入。届时错收的新锁无法原位放回,**两个活会话之一的单轮 state 更新会被最后写者覆盖丢失**;saveState 原子写保证 state.json 结构不坏,丢失的更新可由后续 gate 重跑按记录 id 补回(debug log 簇)——人工报单行(intake)无自动重放,丢单需报单人重发。本协议**不承诺"fresh 锁绝不被旧观察者收走"**;若未来要求零丢失,升级路径是 OS 级 CAS(renameat2/RENAME_EXCL)或 flock,本期不做。
+ - **低样本量残留窄窗(如实,SC-BD1-R1e)**:`malformed < minAbsoluteMalformed(5) 且 nonBlankTotal < minSampleForRatio(20)` 但 `ratio` 已达阈值(如 4/4 全坏)时,gate 刻意不 fail-closed——样本太小不具统计意义,但如实标记 `state.lastSignals.debugLog.status = 'low-sample'`,不伪装成 `'ok'`。这是留下的边界,不是遗漏。
+diff --git a/scripts/loops/bug-doctor/docs-contract.test.mjs b/scripts/loops/bug-doctor/docs-contract.test.mjs
+index e90d5160..e53c6deb 100644
+--- a/scripts/loops/bug-doctor/docs-contract.test.mjs
++++ b/scripts/loops/bug-doctor/docs-contract.test.mjs
+@@ -102,3 +102,38 @@ describe('bug-doctor.md 运行时文件清单锚点守卫(SC-BD1-R5-P02)', () =>
+     expect(doc).toContain('gate-failures.json')
+   })
+ })
++
++describe('批次2:Trae/Sentry 第三料源的契约锚点(防止后续编辑把接入现状改回未接/删掉边界)', () => {
++  it('信号源表必须保留 #5 Trae/Sentry findings 行,且注明"仅主轮显式 --include-sentry 才消费"', () => {
++    expect(doc).toContain('Trae/Sentry findings(**已接,仅主轮显式 `--include-sentry` 才消费**)')
++  })
++
++  it('SOP Gate 步必须写明主轮带 flag 在同一把锁内消费、补轮不带', () => {
++    expect(doc).toContain('主轮另带 `--include-sentry` 在同一把 gate 锁内消费 Trae/Sentry findings 第三料源,补轮不带')
++  })
++
++  it('P4-01(blocker 修正)锚点:prompt 文档必须写明消费昨日文件 + TRAE 03:30 产出时刻的因果', () => {
++    const promptDoc = readFileSync(resolve(__dirname, '..', '..', '..', 'docs', 'loops', 'bug-doctor-scheduler-prompts.md'), 'utf8')
++    expect(promptDoc).toContain('消费的是**昨日**的 findings 文件')
++    expect(promptDoc).toContain('03:30')
++    expect(promptDoc).toContain('永久漏消费')
++  })
++
++  it('P4-02(矛盾修正)封口:写死信号源数量的旧措辞不得回潮(它们与 #5 已接行互斥)', () => {
++    expect(doc).not.toContain('仅 #1(生产 debug log)与 #3(nightly-e2e)已接')
++    expect(doc).not.toContain('目前只有生产 debug log + nightly-e2e 两路已接入 gate 打分')
++    // P4-02-RESIDUAL:第三处残留(已知局限段)——"两信号源都看不见"同样写死了数量
++    expect(doc).not.toContain('两信号源都看不见')
++    expect(doc).not.toContain('两个信号源都看不见')
++    // 正向锚点:改用不写死数量的形态
++    expect(doc).toContain('已接入的信号源(不论几路)都看不见')
++  })
++
++  it('班车 prompt 文档在场且声明交付边界(合并 ≠ 生产已接线,需 owner 手工粘贴)', () => {
++    const promptDoc = readFileSync(resolve(__dirname, '..', '..', '..', 'docs', 'loops', 'bug-doctor-scheduler-prompts.md'), 'utf8')
++    expect(promptDoc).toContain('不等于生产已接线')
++    expect(promptDoc).toContain('--include-sentry')
++    // 补轮纪律:明确写了补轮不带 flag,防止两轮 prompt 被复制粘贴成同一份
++    expect(promptDoc).toContain('不带 `--include-sentry`')
++  })
++})
+diff --git a/scripts/loops/dashboard/render.mjs b/scripts/loops/dashboard/render.mjs
+index fe0108b9..4a5228e8 100644
+--- a/scripts/loops/dashboard/render.mjs
++++ b/scripts/loops/dashboard/render.mjs
+@@ -246,11 +246,14 @@ function sectionDelivery({ gh, wp, state }) {
+   const auto = (gh.prs || []).filter(isAuto);
+   const manual = (gh.prs || []).filter((p) => !isAuto(p));
+   const issues = gh.issues || [];
++  // 批次2:origin=trae-audit 簇殿后排序已由 gate.mjs buildWorkpacket 完成(非 score 排序);
++  // 此处只按 score 取 Top8 展示,天然把 score 恒为 0 的 Trae 簇排到最后,来源标签另行标注
+   const top = [...(wp?.clusters || [])].sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 8)
+     .map((c) => {
+       const lc = state?.clusters?.[c.fp || `${c.source}::${c.pattern}`] || {};
++      const traeTag = c.origin === 'trae-audit' ? ' <span class="badge trae">Trae audit</span>' : '';
+       return `<tr><td><span class="badge ${String(c.sLevel).toLowerCase()}">${esc(pLabel(c.sLevel))}</span></td>
+-      <td class="num">${c.score ?? '—'}</td><td>${esc(c.source)}</td>
++      <td class="num">${c.score ?? '—'}</td><td>${esc(c.source)}${traeTag}</td>
+       <td class="pattern">${esc((c.pattern || '').slice(0, 90))}</td>
+       <td class="num">${lc.count ?? '—'}</td><td class="small">${esc(lc.status || '—')}</td></tr>`;
+     }).join('');
+@@ -329,6 +332,7 @@ h3{font-size:13px;margin:14px 0 6px;color:#aab0bc}
+ .badge{display:inline-block;padding:1px 7px;border-radius:9px;font-size:12px;margin-right:4px;background:#262b33}
+ .badge.s0{background:#5c1e22;color:#ff8589}.badge.s1{background:#5c4a1e;color:#ffd479}
+ .badge.s2{background:#1e3a5c;color:#79b8ff}.badge.s3{background:#24292f;color:#9da5b0}
++.badge.trae{background:#2b2140;color:#c9a5ff}
+ .pill{padding:1px 8px;border-radius:9px;font-size:12px}
+ .pill.merged{background:#3b2a5c;color:#c9a5ff}.pill.open{background:#1e4429;color:#7ee2a8}
+ .pill.closed{background:#5c1e22;color:#ff8589}
+diff --git a/scripts/loops/dashboard/render.test.mjs b/scripts/loops/dashboard/render.test.mjs
+index e0ab0943..a385af11 100644
+--- a/scripts/loops/dashboard/render.test.mjs
++++ b/scripts/loops/dashboard/render.test.mjs
+@@ -204,4 +204,36 @@ describe('Mivo 更名 + P3-9 展示层映射', () => {
+     expect(html).not.toContain('badge s0">S0') // 队列徽章不再出 S 编号(logs 原文 tooltip 不在此列)
+     expect(html).not.toContain('bug-doctor 状态看板')
+   })
++
++  it('批次2:origin=trae-audit 簇在 Top 簇台账里带 "Trae audit" 来源标签,非 trae 簇不带', () => {
++    const runs = parseLogs('- 2026-07-18T02:30:00+08:00 · mode=full · 新记录 1 · 新簇 1 · 活跃簇 2 · S0 1 · 工作包 2 簇\n')
++    const state = { clusters: {}, openPRs: [] }
++    const act = [cluster({ fp: 'a', sLevel: 'S0', levels: ['error'], status: 'new' })]
++    const ctx = {
++      now: NOW,
++      state,
++      wp: {
++        clusters: [
++          { fp: 'a', sLevel: 'S0', score: 9, source: 'Persist Boot', pattern: 'boom' },
++          { fp: 'b', sLevel: 'S1', score: 0, source: 'Trae audit', pattern: 'log-violation::missing-debug-log', origin: 'trae-audit' },
++        ],
++      },
++      baseline: null,
++      runs,
++      ledger: parseLedger(''),
++      gh: { prs: [], issues: [], stale: true, error: 'off', fetchedAt: null },
++      stateDirLabel: '/tmp/x',
++      q: queueCounts(act),
++      costTotal: 0,
++      lights: computeLights(act, RULES, NOW),
++      anchor: NOW,
++    }
++    const html = buildHtml(ctx)
++    expect(html).toContain('Trae audit</span>')
++    // 非 trae 行(Persist Boot)不应被误标:标签只出现在 trae 行,位置在 Persist 行之后
++    const persistRowIdx = html.indexOf('>Persist Boot<')
++    const traeTagIdx = html.indexOf('badge trae')
++    expect(persistRowIdx).toBeGreaterThan(-1)
++    expect(traeTagIdx).toBeGreaterThan(persistRowIdx)
++  })
+ })

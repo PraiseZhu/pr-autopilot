@@ -1,0 +1,1197 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 8168e2d6..bf011bc8 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -565,7 +565,7 @@ jobs:
+           set -o pipefail
+           mkdir -p test-artifacts
+           # --renderer=both 经 npm 的 -- 透传到 e2e-runner.mjs 的 parseRenderer。
+-          # 场景清单权威源:package.json 的 test:e2e:prod:subset(当前 7 场景)× 2 渲染器;
++          # 场景清单权威源:package.json 的 test:e2e:prod:subset(当前 9 场景)× 2 渲染器;
+           # 若实际时长逼近 20min 上限,改为 dom/leafer 矩阵并行。改 subset 清单时回来同步这里。
+           npm run test:e2e:prod:subset -- --renderer=both 2>&1 | tee test-artifacts/e2e-prod-subset.log
+ 
+diff --git a/README.md b/README.md
+index 3a514fee..ae67cdc7 100644
+--- a/README.md
++++ b/README.md
+@@ -94,6 +94,13 @@ React 19 · TypeScript · Vite · Zustand · Hono + @hono/node-server · perfect
+ - **怎么跳过**:仅在确认非代码问题(如紧急修复 CI 配置本身)时,用 `PREFLIGHT_SKIP=1 git push` 逃生。日常开发不要跳。`git push --no-verify` 同样会绕过本 hook(git 原生机制,无法禁止),但它静默无提示、不留任何记录,不推荐;需要跳过时请显式用 `PREFLIGHT_SKIP=1 git push`,意图可见。
+ - **手动接线**(老仓库或未跑过 install 时):`git config core.hooksPath .githooks`,或直接 `npm run prepare`。
+ 
++## 残余风险登记
++
++> **消费点文本契约的防护边界（#536 PR，与三审 origin 席定稿）**
++> 1. token 级守卫（`\bscreenToCanvasPoint\b` 全文件零出现）覆盖普通属性访问、别名/解构、import 重命名、字符串字面量提及；**不防** Unicode 转义标识符、字符串拼接构名、以及完全匿名的内联坐标数学重实现——文本静态检查对这三类在原理上无解。
++> 2. 行为层已有 `ai-edit-entry.mjs` SC5.2 以真实 DragEvent 验证 `.canvas-shell` 的 `handleCanvasDrop` 接线并创建 image 节点；`canvas-interactions.mjs` 也以真实右键交互验证节点/空白 context-menu wiring 与 actions，但这些均不读取或断言 `screenToCanvas` 算出的坐标值；`importLocalAssetAtClientPoint` / `onRegisterExternalAssetDrop` 未见行为测试；四个 handler 的**坐标值正确性**均无行为断言——真正的残余是坐标值，不是 handler 是否被调用。`viewportPostPanStaleRead.audit.test.tsx` 只挂载 `useViewport` + `useCanvasHitDispatch` 并直接调用 captured 函数，**证明的是 hook 层语义，不等于 MivoCanvas wiring 行为**。（两个测试文件自身注释已如实自曝此边界：contract 测试顶部写明 audit 'cannot detect whether MivoCanvas.tsx actually consumes the export'；audit 测试 :352-355 写明不判定 MivoCanvas wiring——本登记是把代码里已存在的如实声明提升为正式登记，非新增让步。）
++> 3. 因此本残余的现实兜底是**人工审查**（以及将来若排期的真实集成测试），不是现有自动化。「为四个 handler 补坐标值断言的行为层测试」记入后续排期候选，不在本 PR 范围。
++
+ ## 文档
+ 
+ - [产品与架构笔记](docs/product-notes.md)
+diff --git a/package.json b/package.json
+index ec7efc10..9cfffa82 100644
+--- a/package.json
++++ b/package.json
+@@ -20,7 +20,7 @@
+     "test:shell": "bash ops/postgres/test-asset-verify.sh && bash ops/postgres/test-restore-drill-matrix.sh && bash scripts/changelog/test-publish-gate.sh && bash scripts/changelog/test-publish-gate-isolation.sh",
+     "test:e2e": "npm run test:e2e:dev",
+     "test:e2e:dev": "node scripts/e2e-runner.mjs --topology=dev",
+-    "test:e2e:prod:subset": "VITE_MIVO_PERSIST=local npm run build && node scripts/e2e-runner.mjs --topology=prod --scenario=debug,canvas-interactions,canvas-export,chat-copy,chat-generation,mask,mask-reflow,variations-annotation",
++    "test:e2e:prod:subset": "VITE_MIVO_PERSIST=local npm run build && node scripts/e2e-runner.mjs --topology=prod --scenario=debug,canvas-interactions,canvas-export,zoom-tool,chat-copy,chat-generation,mask,mask-reflow,variations-annotation",
+     "test:e2e:gated:unauthorized": "node scripts/e2e-gated-check.mjs --mode=unauthorized",
+     "test:e2e:gated:authorized": "node scripts/e2e-gated-check.mjs --mode=authorized",
+     "test:e2e:prod:full": "VITE_MIVO_PERSIST=local npm run build && node scripts/e2e-runner.mjs --topology=prod",
+diff --git a/src/canvas/MivoCanvas.tsx b/src/canvas/MivoCanvas.tsx
+index f3115934..0be670f5 100644
+--- a/src/canvas/MivoCanvas.tsx
++++ b/src/canvas/MivoCanvas.tsx
+@@ -237,6 +237,7 @@ export function MivoCanvas({
+     updateEditingText,
+     finishTextEditing,
+     resolveCanvasHit,
++    screenToCanvas,
+     handleCanvasPointerDown,
+     handleCanvasPointerMove,
+     handleCanvasPointerEnd,
+@@ -262,18 +263,6 @@ export function MivoCanvas({
+     }
+   }, [resolveCanvasHit, handleCanvasPointerDown, isPanning, temporaryTool])
+ 
+-  const screenToCanvasPoint = useCallback(
+-    (clientX: number, clientY: number) => {
+-      const rect = shellRef.current?.getBoundingClientRect()
+-
+-      return {
+-        x: (clientX - (rect?.left || 0) - viewport.x) / viewport.scale,
+-        y: (clientY - (rect?.top || 0) - viewport.y) / viewport.scale,
+-      }
+-    },
+-    [viewport.scale, viewport.x, viewport.y],
+-  )
+-
+   const { nodes: canvasRenderedNodes, stats: virtualizationStats } = useCanvasVirtualization({
+     cullingMode, visibleNodes, shellSize, viewport, selectedNodeId, selectedNodeIds,
+     cropNodeId, maskEditNodeId: activeImageEditNodeId, contextMenuNodeId,
+@@ -290,10 +279,10 @@ export function MivoCanvas({
+         nodeId,
+         x: position.x,
+         y: position.y,
+-        canvasPosition: screenToCanvasPoint(clientX, clientY),
++        canvasPosition: screenToCanvas(clientX, clientY),
+       })
+     },
+-    [screenToCanvasPoint],
++    [screenToCanvas],
+   )
+ 
+   const handleOpenNodeDetails = useOpenNodeDetails(setContextMenu, selectNode, onOpenDetails)
+@@ -384,10 +373,10 @@ export function MivoCanvas({
+       const payload = parseLocalAssetDragPayload(dataTransfer)
+       if (!payload) return false
+ 
+-      void importImageUrlToCanvas(payload.url, payload.name, screenToCanvasPoint(clientX, clientY), addImportedImage).catch(handleImportError)
++      void importImageUrlToCanvas(payload.url, payload.name, screenToCanvas(clientX, clientY), addImportedImage).catch(handleImportError)
+       return true
+     },
+-    [addImportedImage, screenToCanvasPoint],
++    [addImportedImage, screenToCanvas],
+   )
+ 
+   const handleCanvasDragOver = useCallback((event: ReactDragEvent<HTMLElement>) => {
+@@ -406,7 +395,7 @@ export function MivoCanvas({
+       event.preventDefault()
+       event.stopPropagation()
+ 
+-      const position = screenToCanvasPoint(event.clientX, event.clientY)
++      const position = screenToCanvas(event.clientX, event.clientY)
+       const files = Array.from(event.dataTransfer.files)
+       if (files.length) {
+         void importCanvasFileBatch(files, position, addImportedFileNode)
+@@ -418,7 +407,7 @@ export function MivoCanvas({
+       const payload = parseLocalAssetDragPayload(event.dataTransfer)
+       if (payload) void importImageUrlToCanvas(payload.url, payload.name, position, addImportedImage).catch(handleImportError)
+     },
+-    [addImportedFileNode, addImportedImage, screenToCanvasPoint],
++    [addImportedFileNode, addImportedImage, screenToCanvas],
+   )
+ 
+   useEffect(() => {
+@@ -564,8 +553,8 @@ export function MivoCanvas({
+       openNodeContextMenu(target.nodeId, event.clientX, event.clientY); return
+     }
+     const position = clampContextMenuPosition(event.clientX, event.clientY, 300)
+-    setContextMenu({ kind: 'blank', x: position.x, y: position.y, canvasPosition: screenToCanvasPoint(event.clientX, event.clientY) })
+-  }, [brushToolActive, stampToolActive, storeActiveTool, cropNodeId, activeImageEditNodeId, resetPan, resolveCanvasHit, openNodeContextMenu, screenToCanvasPoint, selectNode, selectedNodeIds])
++    setContextMenu({ kind: 'blank', x: position.x, y: position.y, canvasPosition: screenToCanvas(event.clientX, event.clientY) })
++  }, [brushToolActive, stampToolActive, storeActiveTool, cropNodeId, activeImageEditNodeId, resetPan, resolveCanvasHit, openNodeContextMenu, screenToCanvas, selectNode, selectedNodeIds])
+ 
+   const handleCanvasDoubleClick = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+     if (isCanvasChromeTarget(event.target)) return
+diff --git a/src/canvas/interactionDispatch.ts b/src/canvas/interactionDispatch.ts
+index 0b293505..8850ad4d 100644
+--- a/src/canvas/interactionDispatch.ts
++++ b/src/canvas/interactionDispatch.ts
+@@ -19,7 +19,10 @@ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ 
+ type UseCanvasHitDispatchOptions = {
+   shellRef: RefObject<HTMLElement | null>
+-  viewport: ViewportLike
++  // ref,不是值:contextmenu 等 handler 常在同一事件里先 resetPan()(同步
++  // setViewport,但本轮 render 闭包捕获的值不会跟着变)再 resolveCanvasHit——
++  // 传值会读到 resetPan 之前的旧视口,传 ref 才能读到 resetPan 刚落的新值(#536 P1-4b)。
++  viewportRef: RefObject<ViewportLike>
+   nodes: MivoCanvasNode[]
+   selectedNodeIds: string[]
+   maskEditNodeId?: string
+@@ -38,7 +41,7 @@ export type EditOverlayCancelTarget = Extract<
+ 
+ export function useCanvasHitDispatch({
+   shellRef,
+-  viewport,
++  viewportRef,
+   nodes,
+   selectedNodeIds,
+   maskEditNodeId,
+@@ -69,13 +72,13 @@ export function useCanvasHitDispatch({
+     (clientX: number, clientY: number): HitTestTarget | null =>
+       resolveCanvasHitAtClientPoint(
+         shellRef.current?.getBoundingClientRect(),
+-        viewport,
++        viewportRef.current,
+         hitTestNodes,
+         clientX,
+         clientY,
+         { editState: activeEditState },
+       ),
+-    [activeEditState, hitTestNodes, shellRef, viewport],
++    [activeEditState, hitTestNodes, shellRef, viewportRef],
+   )
+ 
+   const cancelEditTarget = useCallback(
+diff --git a/src/canvas/screenToCanvasExport.contract.test.ts b/src/canvas/screenToCanvasExport.contract.test.ts
+new file mode 100644
+index 00000000..dccd7e18
+--- /dev/null
++++ b/src/canvas/screenToCanvasExport.contract.test.ts
+@@ -0,0 +1,140 @@
++// src/canvas/screenToCanvasExport.contract.test.ts
++// #536 P1-4b rev-verify guard: useCanvasInteractionController must forward
++// useViewport's screenToCanvas (ref-correct by construction, see
++// useViewport.ts:195-201 — default param `sourceViewport = viewportRef.current`
++// resolves fresh on every call) instead of MivoCanvas.tsx re-implementing its
++// own copy that reads the closure-captured `viewport` state (stale in the
++// mid-pan right-click-interrupt scenario: handleCanvasContextMenu calls
++// resetPan() then immediately reads coordinates in the SAME closure — see
++// viewportPostPanStaleRead.audit.test.tsx for the behavioral repro of that bug).
++//
++// Why a source contract, not a runtime render test: this repo has no React hook
++// render harness for the FULL controller (heavy zustand-store + many sub-hook
++// dependency chain — mounting it is high-cost/high-risk for what is fundamentally
++// a "are these two return values wired through" question). A source-text check
++// is the lightweight guard used elsewhere in this file's directory for exactly
++// this kind of wiring contract (see scene-reset.contract.test.ts's own rationale).
++// The BEHAVIORAL correctness of screenToCanvas itself (does it read the ref
++// fresh in the mid-pan-interrupt scenario) is covered separately by
++// viewportPostPanStaleRead.audit.test.tsx, which mounts useViewport directly —
++// that test cannot detect whether MivoCanvas.tsx actually consumes the export
++// (it never touches MivoCanvas.tsx or the controller), which is exactly the gap
++// this contract closes.
++
++import { describe, expect, it } from 'vitest'
++// `?raw` import (typed by vite/client) reads the source as a string — same
++// technique as scene-reset.contract.test.ts.
++import controllerSource from './useCanvasInteractionController.ts?raw'
++import canvasSource from './MivoCanvas.tsx?raw'
++
++describe('contract: useCanvasInteractionController exports screenToCanvas; MivoCanvas.tsx consumes it instead of a local duplicate (#536 P1-4b)', () => {
++  it('controller destructures screenToCanvas from its useViewport(...) call', () => {
++    const useViewportCallIdx = controllerSource.indexOf('} = useViewport(')
++    expect(useViewportCallIdx, 'useViewport(...) call site not found — controller structure changed, update this test').toBeGreaterThan(-1)
++    const destructureBlock = controllerSource.slice(0, useViewportCallIdx)
++    expect(destructureBlock).toMatch(/\bscreenToCanvas\b/)
++  })
++
++  it('controller forwards screenToCanvas in its own return object', () => {
++    const returnIdx = controllerSource.lastIndexOf('return {')
++    expect(returnIdx, 'return statement not found — controller structure changed, update this test').toBeGreaterThan(-1)
++    const returnBlock = controllerSource.slice(returnIdx)
++    expect(returnBlock).toMatch(/\bscreenToCanvas\b/)
++  })
++
++  it('MivoCanvas.tsx no longer defines a local screenToCanvasPoint duplicate (the P1-4b bug source)', () => {
++    expect(canvasSource).not.toMatch(/\bconst screenToCanvasPoint\s*=/)
++  })
++
++  it('MivoCanvas.tsx destructures screenToCanvas from useCanvasInteractionController(...)', () => {
++    const controllerCallIdx = canvasSource.indexOf('} = useCanvasInteractionController(')
++    expect(controllerCallIdx, 'useCanvasInteractionController(...) call site not found — MivoCanvas.tsx structure changed, update this test').toBeGreaterThan(-1)
++    const destructureBlock = canvasSource.slice(0, controllerCallIdx)
++    expect(destructureBlock).toMatch(/\bscreenToCanvas\b/)
++  })
++
++  // CDX-R1-C6-001 修正:此前这里是单条 matchAll(...).length >= 4 的存在性计数
++  // 校验,注释声称"足以拦住漏改"——三审 M7 变异实测证伪:把某一个真实消费点
++  // 改回 screenToCanvasPoint(...),同时在文件里任意无关处补一个诱饵调用
++  // screenToCanvas(0, 0),总数不变,计数校验仍然绿,但语义已经错了。
++  // 改为逐消费点绑定断言:每个消费点用其"前一条语句"和"后一条语句"的唯一
++  // 字符串界定出一个不重叠的代码窗口,分别断言窗口内调用的是 screenToCanvas(
++  // 而不是 screenToCanvasPoint。窗口边界与下一条语句相邻,不依赖行号。
++  //
++  // CDX-R2-C6-001 二次修正:上一版负向断言锚的是 /\bscreenToCanvasPoint\(/
++  // ——"标识符后紧跟左括号"的调用语法形态。三审第②席对抗实测证伪:诱饵放进
++  // 语义窗口内部(喂饱正向断言)+ 属性式调用 `legacyViewport.screenToCanvasPoint)(...)`
++  // 逃过"调用语法"正则(标识符后面跟的是 `)`,不是 `(`),9/9 照绿。
++  // 改为 token 级零出现:/\bscreenToCanvasPoint\b/,不再要求紧跟左括号,命中
++  // 普通属性访问、别名解构(`const { screenToCanvasPoint: f } = ...`)、
++  // import 重命名、字符串字面量提及。
++  //
++  // 边界(收窄口径,如实声明,不夸大):本文件是源码文本静态检查,只能拦住
++  // "标识符 screenToCanvasPoint 以某种 token 形式出现在源码文本里"这一类
++  // 绕法(上面列的四种普通变体)。**不防**:Unicode 转义标识符(如
++  // `screenToCanvasPoint`)、字符串拼接构名(如 `'screenToCanvas' + 'Point'`
++  // 再动态取值)、以及完全匿名的内联坐标数学重实现(不出现这个标识符,直接
++  // 手写等价公式)——文本静态检查对这三类在原理上无解,已登记进 README「残余
++  // 风险」区,不在本文件内声称覆盖。
++  it('node right-click canvasPosition (openNodeContextMenu) binds to screenToCanvas, not a screenToCanvasPoint token in any form', () => {
++    const startAnchor = 'const openNodeContextMenu = useCallback('
++    const endAnchor = 'const handleOpenNodeDetails = useOpenNodeDetails('
++    const start = canvasSource.indexOf(startAnchor)
++    expect(start, `start anchor not found — MivoCanvas.tsx structure changed: "${startAnchor}"`).toBeGreaterThan(-1)
++    const end = canvasSource.indexOf(endAnchor, start)
++    expect(end, `end anchor not found — MivoCanvas.tsx structure changed: "${endAnchor}"`).toBeGreaterThan(start)
++    const consumerWindow = canvasSource.slice(start, end)
++    expect(consumerWindow).toMatch(/\bscreenToCanvas\(/)
++    // token 级(不要求紧跟左括号):同时挡"调用语法"绕法(属性式调用
++    // `.screenToCanvasPoint)(...)`)和"诱饵塞进窗口内部"绕法——诱饵加的是
++    // screenToCanvas(0, 0),不含 screenToCanvasPoint 这个 token,不受影响。
++    expect(consumerWindow).not.toMatch(/\bscreenToCanvasPoint\b/)
++  })
++
++  it('local-asset drag-drop landing point (importLocalAssetAtClientPoint) binds to screenToCanvas, not a screenToCanvasPoint token in any form', () => {
++    const startAnchor = 'const importLocalAssetAtClientPoint = useCallback('
++    const endAnchor = 'const handleCanvasDragOver = useCallback('
++    const start = canvasSource.indexOf(startAnchor)
++    expect(start, `start anchor not found — MivoCanvas.tsx structure changed: "${startAnchor}"`).toBeGreaterThan(-1)
++    const end = canvasSource.indexOf(endAnchor, start)
++    expect(end, `end anchor not found — MivoCanvas.tsx structure changed: "${endAnchor}"`).toBeGreaterThan(start)
++    const consumerWindow = canvasSource.slice(start, end)
++    expect(consumerWindow).toMatch(/\bscreenToCanvas\(/)
++    expect(consumerWindow).not.toMatch(/\bscreenToCanvasPoint\b/)
++  })
++
++  it('file drag-drop landing point (handleCanvasDrop) binds to screenToCanvas, not a screenToCanvasPoint token in any form', () => {
++    const startAnchor = 'const handleCanvasDrop = useCallback('
++    const endAnchor = 'onRegisterExternalAssetDrop?.(importLocalAssetAtClientPoint)'
++    const start = canvasSource.indexOf(startAnchor)
++    expect(start, `start anchor not found — MivoCanvas.tsx structure changed: "${startAnchor}"`).toBeGreaterThan(-1)
++    const end = canvasSource.indexOf(endAnchor, start)
++    expect(end, `end anchor not found — MivoCanvas.tsx structure changed: "${endAnchor}"`).toBeGreaterThan(start)
++    const consumerWindow = canvasSource.slice(start, end)
++    expect(consumerWindow).toMatch(/\bscreenToCanvas\(/)
++    expect(consumerWindow).not.toMatch(/\bscreenToCanvasPoint\b/)
++  })
++
++  it('blank right-click canvasPosition (handleCanvasContextMenu) binds to screenToCanvas, not a screenToCanvasPoint token in any form', () => {
++    const startAnchor = 'const handleCanvasContextMenu = useCallback((event: ReactMouseEvent<HTMLElement>) => {'
++    const endAnchor = 'const handleCanvasDoubleClick = useCallback((event: ReactMouseEvent<HTMLElement>) => {'
++    const start = canvasSource.indexOf(startAnchor)
++    expect(start, `start anchor not found — MivoCanvas.tsx structure changed: "${startAnchor}"`).toBeGreaterThan(-1)
++    const end = canvasSource.indexOf(endAnchor, start)
++    expect(end, `end anchor not found — MivoCanvas.tsx structure changed: "${endAnchor}"`).toBeGreaterThan(start)
++    const consumerWindow = canvasSource.slice(start, end)
++    expect(consumerWindow).toMatch(/\bscreenToCanvas\(/)
++    expect(consumerWindow).not.toMatch(/\bscreenToCanvasPoint\b/)
++  })
++
++  it('MivoCanvas.tsx never mentions the screenToCanvasPoint token anywhere (token-level, decoy- and call-syntax-immune whole-file guard)', () => {
++    // 与上面 4 条逐点绑定断言互补,不是重复:这条不依赖窗口边界,覆盖整份
++    // 源码文本。升级为 token 级(而非"标识符后紧跟左括号"的调用语法级)后,
++    // 属性式调用 `obj.screenToCanvasPoint)(...)`、别名解构
++    // `const { screenToCanvasPoint: f } = ...`、import 重命名
++    // `import { screenToCanvasPoint as x }`、字符串字面量提及,全部命中。
++    // 只对 canvasSource(MivoCanvas.tsx)生效,不扫本文件自己的注释/controllerSource。
++    const staleTokenSites = [...canvasSource.matchAll(/\bscreenToCanvasPoint\b/g)]
++    expect(staleTokenSites.length, 'expected zero screenToCanvasPoint token occurrences (any syntactic form) in MivoCanvas.tsx').toBe(0)
++  })
++})
+diff --git a/src/canvas/useCanvasInteractionController.ts b/src/canvas/useCanvasInteractionController.ts
+index 1c88c0ec..2614c0a2 100644
+--- a/src/canvas/useCanvasInteractionController.ts
++++ b/src/canvas/useCanvasInteractionController.ts
+@@ -195,7 +195,7 @@ export function useCanvasInteractionController({
+   }), [beginFrameBox, beginMarkupBox, beginNodeMove, beginNodeMoveFromShell, beginPan, beginSelection, beginStampPlacement, beginTextBox, beginTextEdit, beginZoomGesture, startNodeResize])
+ 
+   const { resolveCanvasHit, dispatchPointerDown } = useCanvasHitDispatch({
+-    shellRef, viewport: viewportState, nodes, selectedNodeIds, maskEditNodeId, cropEditNodeId,
++    shellRef, viewportRef, nodes, selectedNodeIds, maskEditNodeId, cropEditNodeId,
+     editingTextNodeId, onCancelMaskEdit, onCancelCropEdit, exitTextEdit: discardEmptyEditingText })
+   const beginNodeResize = useCallback((nodeId: string, corner: ResizeCorner, event: ReactPointerEvent<HTMLButtonElement>) => {
+     activeToolHandler.onResizeHandlePointerDown(nodeId, corner, event, toolHandlerContext)
+@@ -276,7 +276,7 @@ export function useCanvasInteractionController({
+     activeTextCreationRect, activeFrameCreationRect, activeMarkupCreationRect, markupCreationBox,
+     stampPlacementPreview, selectionPreviewSet, beginGroupResize, beginSelectionSpacingDrag,
+     beginNodeResize, editTextNode, beginTextResize, beginMarkupPointMove, updateEditingText,
+-    finishTextEditing, resolveCanvasHit, handleCanvasPointerDown, handleCanvasPointerMove,
++    finishTextEditing, resolveCanvasHit, screenToCanvas, handleCanvasPointerDown, handleCanvasPointerMove,
+     handleCanvasPointerEnd, handleWheel, zoomTo, zoomBy, fitToBounds, fit, fitAll, fitSelection, resetView, resetPan,
+   }
+ }
+diff --git a/src/canvas/useViewport.panCommitRace.test.tsx b/src/canvas/useViewport.panCommitRace.test.tsx
+new file mode 100644
+index 00000000..fecdc4aa
+--- /dev/null
++++ b/src/canvas/useViewport.panCommitRace.test.tsx
+@@ -0,0 +1,327 @@
++// @vitest-environment happy-dom
++//
++// Issue #536 根因回归钉子:freeze-pan(virtualize+culling 默认 on)拖拽松手后,
++// 旧实现用 window.setTimeout 延迟 120ms 才把 viewportRef 汇入 React state。这段
++// 窗口内 viewportRef 已经是拖拽终点,但任何经 setViewport(current => ...) 起算的
++// 紧随操作(zoomTo/handleWheel)仍会拿 React state 的旧 current 计算,产生「屏幕
++// 已经在新位置,一操作却按旧位置跳」的错误结果——真机 nightly zoom-tool 断言即
++// 由此产生(PR #524 把 virtualize 默认值从 off 翻成 on 后激活了这条早已存在的
++// 竟态)。本文件钉住修复后的口径:commitViewport 统一入口让 ref 与 state 永远
++// 同步落地,拖拽松手后任意时点(0ms/119ms/120ms)的后续视口操作都必须基于拖拽
++// 终点,且不再有任何遗留的延迟提交 timer。
++//
++// 这是本仓第一处真挂载 useViewport 的测试(react-dom/client + React 19 的
++// act;不引入 @testing-library)——同 useRegionEditFreezeGuard.test.tsx 的先例:
++// 这条竟态只在「真实渲染时序下 state 提交延迟」这种场景下出现,纯函数测不出来。
++import { act, useEffect, useRef } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++import { viewportFromPan, viewportFromZoom, type PanState, type Viewport } from './canvasInteraction'
++
++vi.mock('../store/debugLogStore', () => ({
++  debugLogger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
++}))
++// 钉死生产默认组合(virtualize=on + culling=on → freezePanEnabled=true),不依赖
++// happy-dom 对 URL 的解析(两个模块都在 window.location.search 为空时也默认 on,
++// 但显式 mock 让本测试的前提独立于那两个模块的默认值是否将来改变)。
++vi.mock('../render/virtualizationMode', () => ({
++  virtualizationMode: 'on',
++  isDomVirtualizationRequested: true,
++}))
++vi.mock('../render/cullingMode', () => ({
++  cullingMode: 'on',
++  isCullingDisabled: false,
++}))
++
++const { useViewport } = await import('./useViewport')
++
++declare global {
++  // React 19 act() 环境开关
++  var IS_REACT_ACT_ENVIRONMENT: boolean | undefined
++}
++
++type ViewportApi = ReturnType<typeof useViewport>
++
++let api: ViewportApi
++let container: HTMLDivElement
++let root: Root
++let shellEl: HTMLDivElement | null
++
++const shellRect = {
++  left: 0,
++  top: 0,
++  width: 1000,
++  height: 800,
++  right: 1000,
++  bottom: 800,
++  x: 0,
++  y: 0,
++} as DOMRect
++
++function Harness() {
++  const shellRef = useRef<HTMLDivElement | null>(null)
++  const hook = useViewport({
++    shellRef,
++    sceneId: 'pan-commit-race-test',
++    nodes: [] as MivoCanvasNode[],
++    selectedNodes: [],
++    onCloseContextMenu: () => undefined,
++  })
++  // 句柄在 effect 里外露(渲染期赋值是副作用);每次 commit 后都重新赋值,拿到的
++  // 永远是本次渲染的最新 viewport/viewportRef。
++  useEffect(() => {
++    api = hook
++  })
++  return (
++    <div
++      className="canvas-shell"
++      ref={(el) => {
++        shellRef.current = el
++        if (el) {
++          shellEl = el
++          el.getBoundingClientRect = () => shellRect
++        }
++      }}
++    >
++      <div className="dom-canvas-layer" />
++    </div>
++  )
++}
++
++const render = () =>
++  act(() => {
++    root.render(<Harness />)
++  })
++
++const pointerEvt = (pointerId: number, clientX: number, clientY: number) =>
++  ({ pointerId, clientX, clientY }) as unknown as Parameters<ViewportApi['startPan']>[0]
++
++const wheelEvt = (opts: {
++  deltaX?: number
++  deltaY?: number
++  ctrlKey?: boolean
++  metaKey?: boolean
++  shiftKey?: boolean
++  clientX?: number
++  clientY?: number
++}) =>
++  ({
++    nativeEvent: { deltaX: opts.deltaX ?? 0, deltaY: opts.deltaY ?? 0, deltaMode: 0 },
++    ctrlKey: Boolean(opts.ctrlKey),
++    metaKey: Boolean(opts.metaKey),
++    shiftKey: Boolean(opts.shiftKey),
++    clientX: opts.clientX ?? 0,
++    clientY: opts.clientY ?? 0,
++  }) as unknown as Parameters<ViewportApi['handleWheel']>[0]
++
++let unmountedByTest = false
++
++beforeEach(() => {
++  globalThis.IS_REACT_ACT_ENVIRONMENT = true
++  window.localStorage.clear()
++  vi.useFakeTimers()
++  container = document.createElement('div')
++  document.body.appendChild(container)
++  root = createRoot(container)
++  shellEl = null
++  unmountedByTest = false
++  render()
++})
++
++afterEach(() => {
++  if (!unmountedByTest) act(() => root.unmount())
++  container.remove()
++  vi.useRealTimers()
++})
++
++/** 完成一次 freeze-pan 拖拽:startPan → 一次 tryMovePan(命令式快路径) → tryEndPan。
++ *  返回拖拽终点(用 canvasInteraction 的同一套纯函数独立算出,作为 oracle)。 */
++const performDrag = (pointerId: number, dx: number, dy: number): Viewport => {
++  const before = api.viewportRef.current
++  const pan: PanState = { pointerId, startClientX: 1000, startClientY: 1000, startX: before.x, startY: before.y }
++
++  act(() => {
++    api.startPan(pointerEvt(pointerId, 1000, 1000))
++  })
++  act(() => {
++    api.tryMovePan(pointerEvt(pointerId, 1000 + dx, 1000 + dy))
++  })
++  act(() => {
++    api.tryEndPan(pointerEvt(pointerId, 1000 + dx, 1000 + dy))
++  })
++
++  return viewportFromPan(pan, 1000 + dx, 1000 + dy, before)
++}
++
++/** mid-pan 被右键中断:startPan → 一次 tryMovePan(命令式快路径) → resetPan()
++ *  (不经过 tryEndPan——对应 MivoCanvas.tsx:554 handleCanvasContextMenu 的
++ *  resetPan() 调用)。返回中断时刻的最终视口。用于补齐 #536 P1-3(滚轮路径)/
++ *  P1-5(timer 生命周期)在"resetPan 中断"这条触发路径下的覆盖——见交卷说明,
++ *  这两类断言在 tryEndPan 路径下已由上面的 performDrag 系列覆盖。 */
++const performInterruptedDrag = (pointerId: number, dx: number, dy: number): Viewport => {
++  const before = api.viewportRef.current
++  const pan: PanState = { pointerId, startClientX: 1000, startClientY: 1000, startX: before.x, startY: before.y }
++
++  act(() => {
++    api.startPan(pointerEvt(pointerId, 1000, 1000))
++  })
++  act(() => {
++    api.tryMovePan(pointerEvt(pointerId, 1000 + dx, 1000 + dy))
++  })
++  act(() => {
++    api.resetPan()
++  })
++
++  return viewportFromPan(pan, 1000 + dx, 1000 + dy, before)
++}
++
++describe('useViewport — pan-end commit race (#536)', () => {
++  it('P1-1: pointerup 后 viewportRef / React viewport / shell data-viewport-* 立即三方一致,不再有分裂窗口', () => {
++    const after = performDrag(1, -200, 40)
++
++    expect(api.viewportRef.current).toEqual(after)
++    // 关键断言:旧实现里 tryEndPan 对 virtualize-pan 走 120ms 延迟 setViewport,
++    // 松手这一刻 api.viewport 仍是拖拽前的旧值,这一行在旧代码上会先失败。
++    expect(api.viewport).toEqual(after)
++    expect(shellEl?.dataset.viewportX).toBe(String(after.x))
++    expect(shellEl?.dataset.viewportY).toBe(String(after.y))
++    expect(shellEl?.dataset.viewportScale).toBe(String(after.scale))
++  })
++
++  it.each([0, 119, 120])('P1-3: 松手后 dt=%ims 时点击缩放必须基于拖拽终点,锚点误差 ≤2px', (dt) => {
++    const after = performDrag(2, -200, 40)
++    if (dt > 0) act(() => vi.advanceTimersByTime(dt))
++
++    const center = { clientX: 300, clientY: 220 }
++    act(() => {
++      api.zoomTo(2, center)
++    })
++
++    const expected = viewportFromZoom(after, shellRect, 2, center)
++    expect(api.viewportRef.current).toEqual(expected)
++    expect(api.viewport).toEqual(expected)
++
++    // 锚点不变式:center 对应的画布点在缩放前后必须落在同一屏幕位置(≤2px)。
++    const canvasPointBeforeZoom = {
++      x: (center.clientX - after.x) / after.scale,
++      y: (center.clientY - after.y) / after.scale,
++    }
++    const screenAfterZoomX = expected.x + canvasPointBeforeZoom.x * expected.scale
++    const screenAfterZoomY = expected.y + canvasPointBeforeZoom.y * expected.scale
++    expect(Math.abs(screenAfterZoomX - center.clientX)).toBeLessThanOrEqual(2)
++    expect(Math.abs(screenAfterZoomY - center.clientY)).toBeLessThanOrEqual(2)
++  })
++
++  it.each([0, 119, 120])('P1-3: 松手后 dt=%ims 时 Cmd/Ctrl+滚轮缩放必须基于拖拽终点', (dt) => {
++    const after = performDrag(3, 150, -60)
++    if (dt > 0) act(() => vi.advanceTimersByTime(dt))
++
++    const center = { clientX: 400, clientY: 300 }
++    act(() => {
++      api.handleWheel(wheelEvt({ deltaY: -100, metaKey: true, clientX: center.clientX, clientY: center.clientY }))
++    })
++
++    const factor = Math.exp(-(-100) * 0.002)
++    const expected = viewportFromZoom(after, shellRect, after.scale * factor, center)
++    expect(api.viewportRef.current).toEqual(expected)
++    expect(api.viewport).toEqual(expected)
++  })
++
++  it.each([0, 119, 120])('P1-3: 松手后 dt=%ims 时普通滚轮平移必须基于拖拽终点,不吞位移、不跳回', (dt) => {
++    const after = performDrag(4, -80, 20)
++    if (dt > 0) act(() => vi.advanceTimersByTime(dt))
++
++    act(() => {
++      api.handleWheel(wheelEvt({ deltaX: 30, deltaY: 15 }))
++    })
++
++    const expected: Viewport = { ...after, x: after.x - 30, y: after.y - 15 }
++    expect(api.viewportRef.current).toEqual(expected)
++    expect(api.viewport).toEqual(expected)
++  })
++
++  it('P1-5: timer 生命周期——拖拽收尾 / 新拖拽开始 / scene reset 后,fake timer 推进 200ms 均不产生额外状态写入', () => {
++    performDrag(5, -50, 10)
++    const afterDragSettled = api.viewport
++
++    act(() => vi.advanceTimersByTime(200))
++    expect(api.viewport).toEqual(afterDragSettled) // 旧实现这里 120ms 后会再触发一次 setViewport
++
++    // 新一轮拖拽开始前推进计时器同样不应触发任何额外提交(startPan 不再需要清理遗留 timer)。
++    act(() => {
++      api.startPan(pointerEvt(6, 0, 0))
++    })
++    act(() => vi.advanceTimersByTime(200))
++    expect(api.viewport).toEqual(afterDragSettled)
++    act(() => {
++      api.tryEndPan(pointerEvt(6, 0, 0))
++    })
++
++    // scene reset 之后同样无残留定时写入。
++    act(() => {
++      api.resetViewportForScene('pan-commit-race-test-2')
++    })
++    const afterReset = api.viewport
++    act(() => vi.advanceTimersByTime(200))
++    expect(api.viewport).toEqual(afterReset)
++  })
++
++  it('P1-5: 组件卸载后不遗留 viewport timer(卸载过程与之后推进计时器均不抛错)', () => {
++    performDrag(7, -30, 30)
++
++    expect(() => {
++      unmountedByTest = true
++      act(() => root.unmount())
++      act(() => vi.advanceTimersByTime(500))
++    }).not.toThrow()
++  })
++
++  // #536 P1-4b 交卷补充:audit worker 的 viewportPostPanStaleRead.audit.test.tsx
++  // 专项覆盖 resetPan() 中断后 resolveCanvasHit/screenToCanvas 的命中与坐标,但不
++  // 覆盖滚轮路径与 timer 生命周期——这两类断言在 tryEndPan(pointerup)路径下已由
++  // 上面的 performDrag 系列覆盖,这里补齐同一组断言在 resetPan(mid-pan 右键中断)
++  // 路径下的等价覆盖。
++  //
++  // 反向变异说明(如实标注,非回避):经实测(见交卷报告),这两条在只撤
++  // commitViewport 统一入口(核心修复 commit,仅改 useViewport.ts)时**不会**转红——
++  // resetPan() 在修复前就已经是同步 setViewport(viewportRef.current)(不像 tryEndPan
++  // 走 120ms setTimeout),两次独立 act() 调用之间 React 已完成渲染,旧代码的
++  // setViewport(current => ...) 此时读到的 current 已经是 resetPan 提交的新值。
++  // 这两条测的是"resetPan 路径在两次修复之后仍然正确"这一事实本身(防止未来重新
++  // 引入分裂窗口的回归),不是 核心修复 commit 单独的回归钉子;核心修复 commit 的回归判据仍以
++  // 本文件开头的 performDrag 系列(P1-1/P1-3/P1-5)与其反向变异验证为准。
++  it('P1-3 补充: mid-pan 被 resetPan() 中断后,紧接着 Cmd/Ctrl+滚轮缩放仍基于中断时的最终位置', () => {
++    const after = performInterruptedDrag(8, 150, -60)
++
++    const center = { clientX: 400, clientY: 300 }
++    act(() => {
++      api.handleWheel(wheelEvt({ deltaY: -100, metaKey: true, clientX: center.clientX, clientY: center.clientY }))
++    })
++
++    const factor = Math.exp(-(-100) * 0.002)
++    const expected = viewportFromZoom(after, shellRect, after.scale * factor, center)
++    expect(api.viewportRef.current).toEqual(expected)
++    expect(api.viewport).toEqual(expected)
++  })
++
++  it('P1-3 补充: mid-pan 被 resetPan() 中断后,紧接着普通滚轮平移仍基于中断时的最终位置,不吞位移、不跳回', () => {
++    const after = performInterruptedDrag(9, -80, 20)
++
++    act(() => {
++      api.handleWheel(wheelEvt({ deltaX: 30, deltaY: 15 }))
++    })
++
++    const expected: Viewport = { ...after, x: after.x - 30, y: after.y - 15 }
++    expect(api.viewportRef.current).toEqual(expected)
++    expect(api.viewport).toEqual(expected)
++  })
++
++  it('P1-5 补充: resetPan() 中断 pan 后同样无遗留 viewport timer,fake timer 推进 200ms 不产生额外状态写入', () => {
++    performInterruptedDrag(10, -50, 10)
++    const afterInterrupt = api.viewport
++
++    act(() => vi.advanceTimersByTime(200))
++    expect(api.viewport).toEqual(afterInterrupt)
++  })
++})
+diff --git a/src/canvas/useViewport.ts b/src/canvas/useViewport.ts
+index aac9aa69..67cc314c 100644
+--- a/src/canvas/useViewport.ts
++++ b/src/canvas/useViewport.ts
+@@ -115,12 +115,27 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
+   const panRef = useRef<PanState | null>(null)
+   const panCacheEnabled = useMemo(() => panCacheEnabledFromUrl(), [])
+   const freezePanEnabled = panCacheEnabled || virtualizedPanEnabled()
+-  const virtualizeCommitTimerRef = useRef<number | undefined>(undefined)
+   const persistedSceneRef = useRef(sceneId)
+   const viewportPersistenceTimerRef = useRef<number | undefined>(undefined)
+   const [viewport, setViewport] = useState<Viewport>(() => initialViewportFor(sceneId))
+   const [isPanning, setIsPanning] = useState(false)
+ 
++  // 唯一的视口提交入口(#536 根因修复)。此前 tryEndPan 在 freeze-pan 收尾时用
++  // window.setTimeout 延迟 120ms 才 setViewport(viewportRef.current):这段窗口内
++  // viewportRef 已经是拖拽终点,但 React `viewport` state 仍停在拖拽前的旧值——任何
++  // 紧随其后经 setViewport(current => ...) 算视口的调用(zoomTo/handleWheel 等)都会
++  // 拿这个旧 current 起算,产生"屏幕已经在新位置、一操作又按旧位置跳"的错误结果
++  // (nightly zoom-tool 断言即由此产生)。所有语义性视口写入统一经此函数落地:
++  // ref 与 state 在同一次调用里一起更新,不再有 ref 领先 state 的窗口。
++  // (freeze-pan 拖拽中的每帧命令式写入——tryMovePan 的 freezePanEnabled 分支——
++  // 刻意不经这里:那条路径为性能绕开 React 渲染,只在 pointerup 落地时才需要
++  // 汇入这个统一入口。)
++  const commitViewport = useCallback((updater: Viewport | ((current: Viewport) => Viewport)) => {
++    const next = typeof updater === 'function' ? (updater as (current: Viewport) => Viewport)(viewportRef.current) : updater
++    viewportRef.current = next
++    setViewport(next)
++  }, [])
++
+   useEffect(() => {
+     viewportRef.current = viewport
+     const shell = shellRef.current
+@@ -186,11 +201,11 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
+     if (!nextViewport) {
+       debugLogger.log('Camera', `Auto-focus skipped (${mode === 'reveal' ? 'already visible' : 'no shell size'}): ${pendingFocus.nodeId}`)
+     } else {
+-      setViewport(nextViewport)
++      commitViewport(nextViewport)
+       debugLogger.log('Camera', `Auto-focus ${mode} ${pendingFocus.nodeId} (${pendingFocus.source})`)
+     }
+     clearPlaceholderFocus()
+-  }, [nodes, pendingFocus, shellRef])
++  }, [commitViewport, nodes, pendingFocus, shellRef])
+ 
+   const screenToCanvas = useCallback(
+     (clientX: number, clientY: number, sourceViewport: Viewport = viewportRef.current) => {
+@@ -208,18 +223,10 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
+ 
+   const zoomTo = useCallback(
+     (nextScale: number, center?: { clientX: number; clientY: number }) => {
+-      // freeze-pan(virtualize 默认 on,#524)下,拖拽(如 resetView 的 Space+drag)把真实视口
+-      // 命令式写进 viewportRef 且 120ms 后才提交到 React state;zoom 若读 React state 里的
+-      // current(陈旧)算锚点会偏,与 shell dataset(applyViewportImperatively 从 viewportRef 写)
+-      // 不一致——resetView 后紧接 Z+Alt 即复现(e2e zoom-tool「Z+Alt blank click」)。
+-      // 改读 viewportRef.current:与 zoomBy 的 nextScale(已用 viewportRef.current.scale)同源,
+-      // 锚点与 shell dataset 对齐。非 freeze-pan(virtualize=off 逃生口)下两者相等,无变化。
+-      setViewport(() => {
+-        const rect = shellRef.current?.getBoundingClientRect()
+-        return viewportFromZoom(viewportRef.current, rect, nextScale, center)
+-      })
++      const rect = shellRef.current?.getBoundingClientRect()
++      commitViewport((current) => viewportFromZoom(current, rect, nextScale, center))
+     },
+-    [shellRef],
++    [commitViewport, shellRef],
+   )
+ 
+   const zoomBy = useCallback(
+@@ -234,9 +241,9 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
+       const rect = shellRef.current?.getBoundingClientRect()
+       const nextViewport = bounds ? viewportForBounds(bounds, rect, options) : undefined
+ 
+-      setViewport(nextViewport || defaultViewportFor(sceneId))
++      commitViewport(nextViewport || defaultViewportFor(sceneId))
+     },
+-    [sceneId, shellRef],
++    [commitViewport, sceneId, shellRef],
+   )
+ 
+   const fitAll = useCallback(() => {
+@@ -255,8 +262,8 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
+   // assertShortcutResetKeepsCenter 钉死该语义,勿改)。函数体保留(符合「只删展示层」),
+   // 当前无消费者;需回中时用 Shift+1 fitAll 作近似回家路,或绑 ⌘Shift+0 恢复入口。
+   const resetView = useCallback(() => {
+-    setViewport(defaultViewportFor(sceneId))
+-  }, [sceneId])
++    commitViewport(defaultViewportFor(sceneId))
++  }, [commitViewport, sceneId])
+ 
+   const handleWheel = useCallback(
+     (event: ReactWheelEvent<HTMLElement>) => {
+@@ -270,20 +277,19 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
+ 
+       const deltaX = event.shiftKey && delta.x === 0 ? delta.y : delta.x
+       const deltaY = event.shiftKey && delta.x === 0 ? 0 : delta.y
+-      setViewport((current) => ({
++      commitViewport((current) => ({
+         ...current,
+         x: current.x - deltaX,
+         y: current.y - deltaY,
+       }))
+     },
+-    [onCloseContextMenu, zoomBy],
++    [commitViewport, onCloseContextMenu, zoomBy],
+   )
+ 
+   // Low-level pan-state setup. The controller's beginPan orchestrates the full
+   // sequence (pointer capture + cross-cutting cleanup + clearSelection + startPan).
+   const startPan = useCallback(
+     (event: ReactPointerEvent<HTMLElement>) => {
+-      window.clearTimeout(virtualizeCommitTimerRef.current)
+       setIsPanning(true)
+       panRef.current = createPanState(event.pointerId, event.clientX, event.clientY, viewportRef.current)
+     },
+@@ -307,35 +313,32 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
+     [freezePanEnabled, shellRef],
+   )
+ 
+-  // Dispatcher (handleCanvasPointerEnd) pan branch.
++  // Dispatcher (handleCanvasPointerEnd) pan branch. freeze-pan(panCache 或
++  // virtualize+culling)拖拽全程只写 viewportRef + 命令式 DOM,松手这一刻必须
++  // 立即把 ref 汇入 React state——不再用 setTimeout 延后(#536 根因修复,详见
++  // commitViewport 上的注释)。
+   const tryEndPan = useCallback((event: ReactPointerEvent<HTMLElement>): void => {
+     if (panRef.current?.pointerId === event.pointerId) {
+       panRef.current = null
+-      if (panCacheEnabled) setViewport(viewportRef.current)
+-      else if (virtualizedPanEnabled()) {
+-        window.clearTimeout(virtualizeCommitTimerRef.current)
+-        virtualizeCommitTimerRef.current = window.setTimeout(() => setViewport(viewportRef.current), 120)
+-      }
++      if (freezePanEnabled) commitViewport(viewportRef.current)
+       setIsPanning(false)
+     }
+-  }, [panCacheEnabled])
++  }, [commitViewport, freezePanEnabled])
+ 
+   // Window blur reset (unconditional).
+   const resetPan = useCallback(() => {
+     panRef.current = null
+-    window.clearTimeout(virtualizeCommitTimerRef.current)
+-    if (freezePanEnabled) setViewport(viewportRef.current)
++    if (freezePanEnabled) commitViewport(viewportRef.current)
+     setIsPanning(false)
+-  }, [freezePanEnabled])
++  }, [commitViewport, freezePanEnabled])
+ 
+   // Scene reset (called from the controller's cross-cutting scene-reset rAF).
+   const resetViewportForScene = useCallback((nextSceneId: CanvasId) => {
+     persistedSceneRef.current = nextSceneId
+-    window.clearTimeout(virtualizeCommitTimerRef.current)
+-    setViewport(initialViewportFor(nextSceneId))
++    commitViewport(initialViewportFor(nextSceneId))
+     setIsPanning(false)
+     panRef.current = null
+-  }, [])
++  }, [commitViewport])
+ 
+   return {
+     viewport,
+diff --git a/src/canvas/viewportPostPanStaleRead.audit.test.tsx b/src/canvas/viewportPostPanStaleRead.audit.test.tsx
+new file mode 100644
+index 00000000..3c1718eb
+--- /dev/null
++++ b/src/canvas/viewportPostPanStaleRead.audit.test.tsx
+@@ -0,0 +1,358 @@
++// 注释术语图例:「核心修复 commit」= fix(canvas) pan 松手立即提交视口(commitViewport
++// 统一提交入口);「P1-4b commit」= fix(canvas) 右键中断 pan 改读 viewportRef。不写
++// SHA——本分支已经历 rebase,SHA 会漂移,语义名不会(具体 SHA 看 git log)。
++// @vitest-environment happy-dom
++//
++// mivo-canvas issue #536 — P1 + P1-4b 销账验证测试(audit worker 起草,落地时
++// 按下方两条勘误改正 + 接线随生产代码同步更新;原稿见
++// _tmp/wt-audit/src/canvas/viewportPostPanStaleRead.audit.test.tsx)。
++//
++// 背景:virtualize/lod 默认开启后 freezePanEnabled 为真,pan 过程中只更新
++// viewportRef(逐帧同步)与 DOM(imperative)。核心修复 commit(commitViewport
++// 统一提交入口)已经消灭了 tryEndPan 里 120ms setTimeout 造成的 ref/state 分裂
++// 窗口——但那个修法治不了这份文件锁的第二条独立缺口:handleCanvasContextMenu
++// (MivoCanvas.tsx:554→561)在**同一个函数调用里**先 resetPan()(同步 setViewport,
++// 不经过任何 timer)再调用 resolveCanvasHit/screenToCanvasPoint——resetPan() 内部
++// 调用 setViewport 不会让"当前函数体已经捕获的旧渲染闭包"跟着变(JS 闭包不会被
++// 后续 setState 追溯性改写),所以 resolveCanvasHit 用的仍是 pan **开始前**捕获的
++// 旧视口,而不是 resetPan() 刚同步提交的新视口。
++//
++// 修法(P1-4b commit):resolveCanvasHit(interactionDispatch.ts)与 MivoCanvas.tsx
++// 的坐标换算(现改用 useViewport 导出的 screenToCanvas,不再自己重写一份)都改成读
++// viewportRef.current,而不是某次渲染闭包捕获的 viewport 值——ref 在 resetPan()/
++// tryEndPan() 内部都是同步更新,读 ref 就不存在"闭包滞后"这个问题。
++//
++// 本测试真挂载 useViewport + useCanvasHitDispatch —— 与生产
++// useCanvasInteractionController.ts:67-71,197-199 完全相同的接线方式(把
++// useViewport 返回的 `viewportRef` 传给 useCanvasHitDispatch 的 `viewportRef`
++// 参数——生产接线在 P1-4b commit 已从传 `viewport` 值改成传 `viewportRef`,
++// Harness 已同步更新,不是原稿那份"传 viewport 值"的旧接线)。resolveCanvasHit
++// 正是 MivoCanvas.tsx 左键 dispatchPointerDown 与右键 handleCanvasContextMenu
++// (MivoCanvas.tsx:561)共用的同一个命中函数。
++//
++// 覆盖面前提(下方两条 vi.mock,#536 三审 R1 CDX-R1-C8-002 加固):本文件两个
++// describe 锁的竟态都只在 freeze-pan 路径(virtualizedPanEnabled() ===
++// virtualizationMode==='on' && cullingMode==='on')下存在——非 freeze-pan 分支
++// 走逐帧同步 setViewport,ref/state 从不分裂,这两条竟态天然不出现。此前本文件
++// 不显式钉两个 mode,隐式吃两个模块的默认值(当前恰好都是 'on');默认值一旦将来
++// 翻转,本文件会**静默**转绿(不再覆盖这两条竟态,却不报错)。现在显式 mock 成
++// 'on'(手法与 useViewport.panCommitRace.test.tsx 一致),并在每次 tryMovePan 之后
++// 加一条行为级自检(见下面 dragBy200Left 与 P1-4b 用例内的
++// assertFreezePanEngagedMidDrag):tryMovePan 的 freezePanEnabled 分支是
++// shell.dataset.viewportX/Y 在 useViewport.ts 里唯一的写入点(见
++// applyViewportImperatively 的调用点),这两个 dataset 属性有没有被写成拖拽中点,
++// 就是"freeze-pan 分支真的被选中"这件事本身的行为证据,不是重复断言 mock 的配置
++// 值本身。若两个 mode 的判定逻辑将来改了导致 freezePanEnabled 判假,这条自检会
++// 先于其余数值断言报错,错误信息直接点名"freeze-pan 覆盖丢失",不会被数值巧合
++// 掩盖成静默绿。
++//
++// 落地勘误(相对 audit worker 原稿,两处断言方向写反,锁的是当前 bug 行为而不是
++// 期望行为——原稿方向在 bug 在场的树上照样绿(锁的是 bug 行为本身,永不报警),
++// 勘误后才具备「修复在场绿、修复撤掉红」的正确方向(撤修复后的实测红绿分布
++// 见上方 P1-6 判据段,不在此重复数字):
++//   1. 第一个 describe 里"松手后 0ms"这条,原稿断言 dragBy200Left() 之后 state 仍是
++//      拖拽前的旧值 { x:688,... } —— 那是锁 commitViewport 修复前的行为。已改成断言
++//      期望行为 { x:488,... }(拖拽终点),配合下面 P1-6 判据核对。
++//   2. 第二个 describe(mid-pan 右键中断)里最后一条,原稿断言 resetPan() 之前捕获的
++//      旧 resolveCanvasHit 引用调用后仍 miss(toBeNull) —— 那也是锁 bug 行为。已改成
++//      断言期望行为(命中 n1),因为 resolveCanvasHit 改读 ref 后,"函数引用是不是
++//      resetPan 之前捕获的"已经不再重要——读的是 viewportRef.current,随时读随时新鲜。
++//
++// rebase 备注(2026-08-06,分支 rebase 到 origin/main b41994f2 之后复测):main 在
++// 此之间独立合入了 #539(commit b41994f2,窄面点修——只把 zoomTo 的锚点计算基准
++// 改读 viewportRef.current,不碰 120ms 分裂窗口本身)。rebase 时 useViewport.ts
++// 冲突,保留了我们的 commitViewport 版本:commitViewport 的 updater 本来就用
++// viewportRef.current 调用,zoomTo 经 commitViewport 后语义上已经吞并 #539,#539
++// 那 6 行注释(描述"陈旧 state"的旧根因)已不再匹配代码(commitViewport 下已无
++// 120ms 延迟窗口),已删除,不保留描述旧实现的化石。下面判据全部在 rebase 后的
++// 新树上重新实测——只有"只撤核心修复"那条的红集数字随之改变(#539 已经把 zoom
++// 相关用例提前兜绿),其余各条实测结果与 rebase 前一致。
++//
++// 判据(P1-6 反向变异,均为本轮 fix-core 分支亲手实测,非转述——见交卷报告的原始
++// 输出片段):
++//   - 当前状态(两处已改正 + 接线已同步 + 两个 mode 已显式钉住)在两次修复
++//     (核心修复 commit + P1-4b commit)都在场时应全绿,且**不需要 advance 任何计时器**——
++//     这是判据核心:如果绿只能靠 advance 计时器撑出来,说明改的不是这条缺口。
++//   - 只撤 P1-4b commit 的三个生产文件(interactionDispatch.ts/
++//     useCanvasInteractionController.ts/MivoCanvas.tsx,核心修复 commit 保留)→ 实测
++//     PASS 0 / FAIL 4,四条**一起**转红,不是"只第二个 describe 红、第一个
++//     describe 不受影响"——那是本分支初版(P1-4b 回归测试落地 commit)的错误声称(#536 三审 R1
++//     CDX-R1-C8-001 抓到,本次修正)。真实原因:本文件 Harness 只按**新接线**把
++//     `viewportRef`(RefObject)传给 useCanvasHitDispatch;三个文件回退后
++//     interactionDispatch.ts 的形参签名退回旧的 `viewport: ViewportLike`(值),
++//     Harness 传的 `viewportRef` 对不上这个旧形参名,destructure 出来的
++//     `viewport` 是 `undefined`——四条用例一旦调用 resolveCanvasHit(前三条直接
++//     调,第四条经 resolveCanvasHitCapturedBeforeResetPan 调)就会在
++//     interactionAdapter.ts:102 读 `undefined.x` 直接 TypeError 崩掉。这是接线层
++//     的运行时崩溃,不是语义红——P1-4b commit 把 useCanvasHitDispatch 的形参从值改成
++//     了 ref,这个接口改名让"文件级 revert 生产代码"与"测试按当前接线调用"天然
++//     耦合,**结构上不可能**只靠回退这三个文件单独隔离出 P1-4b 的语义效果。
++//     (真要隔离,需要另外构造一个按**旧签名**传值的 Harness 变体——生产代码
++//     回退 + 本文件 Harness 同步把 `viewportRef` 改传成 `viewport` 值——本轮已
++//     实测这个变体:PASS 3 / FAIL 1,唯一那条红恰好是第二个 describe 的目标断言
++//     (`AssertionError: expected null to deeply equal {kind:'node',nodeId:'n1'}`,
++//     干净的语义红,不是崩溃),第一个 describe 三条全绿。这个变体与当前生产接线
++//     冲突,不保留在树里,写在这里供后人复现。)
++//   - 两次修复都撤(核心修复 commit 与 P1-4b commit 都回退到 origin/main 当前状态,即含 #539
++//     的 b41994f2)→ 同样 PASS 0 / FAIL 4,但混着两类红:第一个 describe 的"0ms"
++//     用例是**真实的语义红**(688 vs 期望 488——退回 #539 之后的旧 useViewport.ts
++//     仍靠 tryEndPan 的 120ms setTimeout 延迟提交,0ms 时状态确实还没落地;#539
++//     只改了 zoomTo 的锚点读取,不影响这条 tryEndPan 路径);其余 3 条仍是上面
++//     同一个 TypeError 崩溃。方向性结论("两次修复都撤全部转红")仍然成立,但不能
++//     反过来说成"两个 describe 各自干净地隔离转红"——后 3 条红的是接线崩溃,不是
++//     核心修复 commit 或 P1-4b commit 任一条单独的语义证据。
++//   - P1-4b(P1-4b commit)本身的正确性,不再依赖"单撤该 commit 观察本文件"这条已经
++//     结构性失真的路径,改由三条独立证据支撑(均为本轮实测,原始数字见交卷报告):
++//     · 本文件 + useViewport.pan.test.ts + useViewport.panCommitRace.test.tsx +
++//       screenToCanvasExport.contract.test.ts 合跑 PASS 28 / FAIL 0,不 advance
++//       任何计时器;
++//     · 只撤核心修复(把 useViewport.ts 退回 origin/main 当前版本 b41994f2,即
++//       只保留 #539 的窄面点修,不含 commitViewport 统一入口)时,
++//       useViewport.panCommitRace.test.tsx 单独跑 PASS 11 / FAIL 4——4 例全红是
++//       "松手后立即读三方一致性(P1-1)/普通滚轮平移 dt=0ms 与 119ms(P1-3)/
++//       timer 生命周期幽灵写入(P1-5)"这一类断言;#539 已经把"点击缩放/
++//       Cmd+滚轮缩放读到拖拽前旧视口"这两类用例提前兜绿(它们不在红集里了),
++//       但 #539 没碰 tryEndPan 的 120ms 延迟提交本身,普通平移/三方一致性/
++//       timer 幽灵写入这四类因此仍然红,与本文件无关;
++//     · screenToCanvasExport.contract.test.ts 用源码文本契约锁住"MivoCanvas.tsx
++//       不得再有本地 `const screenToCanvasPoint =` 重写、且坐标换算调用点必须
++//       走 useCanvasInteractionController 转发的 screenToCanvas"——防止 P1-4b
++//       的接线被悄悄改回读闭包值。
++
++import { act, useEffect, useRef, type PointerEvent as ReactPointerEvent } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.mock('../store/debugLogStore', () => ({
++  debugLogger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
++}))
++// 钉死生产默认组合(virtualize=on + culling=on → freezePanEnabled=true),不依赖
++// 两个模块各自的默认值——手法与 useViewport.panCommitRace.test.tsx 一致(见本文件
++// 顶部"覆盖面前提"说明,CDX-R1-C8-002 加固)。
++vi.mock('../render/virtualizationMode', () => ({
++  virtualizationMode: 'on',
++  isDomVirtualizationRequested: true,
++}))
++vi.mock('../render/cullingMode', () => ({
++  cullingMode: 'on',
++  isCullingDisabled: false,
++}))
++
++import { useViewport } from './useViewport'
++import { useCanvasHitDispatch } from './interactionDispatch'
++import { clientPointToCanvas } from './canvasInteraction'
++import type { CanvasId, MivoCanvasNode } from '../types/mivoCanvas'
++import type { HitTestTarget } from '../render/interactionAdapter'
++
++type HarnessApi = {
++  viewport: { x: number; y: number; scale: number }
++  startPan: (event: ReactPointerEvent<HTMLElement>) => void
++  tryMovePan: (event: ReactPointerEvent<HTMLElement>) => boolean
++  tryEndPan: (event: ReactPointerEvent<HTMLElement>) => void
++  resetPan: () => void
++  resolveCanvasHit: (clientX: number, clientY: number) => HitTestTarget | null
++  // 生产实际消费的坐标换算入口(useViewport 导出,P1-4b commit 后 MivoCanvas.tsx
++  // 改用它取代本地重写的 screenToCanvasPoint)——不是测试自己另起一套公式。
++  screenToCanvas: (clientX: number, clientY: number) => { x: number; y: number }
++}
++
++let api: HarnessApi
++let container: HTMLDivElement
++let root: Root
++let shellEl: HTMLDivElement
++
++// 单个 100x100 的图片节点,canvas 空间占 [0,100]x[0,100](x:0,y:0)。
++const node = {
++  id: 'n1',
++  type: 'image',
++  title: 'n1',
++  x: 0,
++  y: 0,
++  width: 100,
++  height: 100,
++  status: 'ready',
++  assetUrl: '/a.png',
++} as unknown as MivoCanvasNode
++
++function Harness() {
++  const shellRef = useRef<HTMLDivElement | null>(shellEl)
++  const { viewport, viewportRef, startPan, tryMovePan, tryEndPan, resetPan, screenToCanvas } = useViewport({
++    shellRef,
++    sceneId: 'scene-a' as CanvasId,
++    nodes: [node],
++    selectedNodes: [],
++    onCloseContextMenu: () => {},
++  })
++  // 生产接线(P1-4b commit 后,见 useCanvasInteractionController.ts:197-198):
++  // useCanvasHitDispatch 收 viewportRef,不再收 viewport 值。
++  const { resolveCanvasHit } = useCanvasHitDispatch({
++    shellRef,
++    viewportRef,
++    nodes: [node],
++    selectedNodeIds: [],
++    exitTextEdit: () => {},
++  })
++  useEffect(() => {
++    api = { viewport, startPan, tryMovePan, tryEndPan, resetPan, resolveCanvasHit, screenToCanvas }
++  }, [viewport, startPan, tryMovePan, tryEndPan, resetPan, resolveCanvasHit, screenToCanvas])
++  return null
++}
++
++const pointerEvent = (pointerId: number, clientX: number, clientY: number) =>
++  ({ pointerId, clientX, clientY }) as unknown as ReactPointerEvent<HTMLElement>
++
++// 覆盖面自检(CDX-R1-C8-002 加固,细节见本文件顶部"覆盖面前提"说明)。
++// applyViewportImperatively 只在 useViewport.ts 的 tryMovePan 内 freezePanEnabled
++// 分支被调用——顶部两条 vi.mock 只保证"配置声称 virtualize=on+culling=on",不
++// 保证 freezePanEnabled 分支真的被选中(判定逻辑本身若被改动,mock 值不变但分支
++// 可能已经不认它)。直接断言 shell.dataset.viewportX/Y 在 tryMovePan 之后已经被
++// 写成拖拽中点,才是"freeze-pan 路径真的被走到"这件事本身的行为级证据。
++const assertFreezePanEngagedMidDrag = (expected: { x: number; y: number }) => {
++  expect(
++    shellEl.dataset.viewportX,
++    'freeze-pan 覆盖面自检失败:shell.dataset.viewportX 未写入,说明 tryMovePan 没有走 freezePanEnabled 分支(virtualizationMode/cullingMode 未按预期生效)——本文件锁的两条竟态都只在 freeze-pan 路径下存在,覆盖已经丢失',
++  ).toBe(String(expected.x))
++  expect(
++    shellEl.dataset.viewportY,
++    'freeze-pan 覆盖面自检失败:shell.dataset.viewportY 未写入,原因同上',
++  ).toBe(String(expected.y))
++}
++
++// 拖拽:从 (800,800) 平移到 (600,800),clientX 位移 -200 → 松手后新视口应为
++// (688-200, 240) = (488, 240)(默认视口 x:688,y:240,scale:1,见 defaultViewportFor)。
++const dragBy200Left = () => {
++  act(() => {
++    api.startPan(pointerEvent(1, 800, 800))
++  })
++  act(() => {
++    api.tryMovePan(pointerEvent(1, 600, 800))
++  })
++  // 拖拽中点即拖拽终点(本拖拽序列只 move 一次),此时 freeze-pan 分支应已把
++  // 该值命令式写进 shell.dataset。
++  assertFreezePanEngagedMidDrag({ x: 488, y: 240 })
++  act(() => {
++    api.tryEndPan(pointerEvent(1, 600, 800))
++  })
++}
++
++// 松手后用户在屏幕新位置 (538, 290) 点击/右键。用**新**视口(488,240)换算:
++// canvasX = 538-488 = 50, canvasY = 290-240 = 50 → 落在节点 [0,100]x[0,100] 内,应命中 n1。
++// 用**旧**视口(688,240,pan 前)换算会得到 canvasX = 538-688 = -150 → 落在节点外,应 miss。
++const clickClientX = 538
++const clickClientY = 290
++// clientPointToCanvas 只用 left/top(ClientRectLike 类型要求 width/height 同在,
++// 值本身不参与计算,给任意占位数值即可)。
++const rect = { left: 0, top: 0, width: 0, height: 0 }
++
++beforeEach(() => {
++  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
++  localStorage.clear()
++  shellEl = document.createElement('div')
++  document.body.appendChild(shellEl)
++  container = document.createElement('div')
++  document.body.appendChild(container)
++  root = createRoot(container)
++  act(() => {
++    root.render(<Harness />)
++  })
++})
++
++afterEach(() => {
++  act(() => {
++    root.unmount()
++  })
++  container.remove()
++  shellEl.remove()
++  vi.useRealTimers()
++})
++
++describe('#536 P1 — pan 松手后立即读取 viewport 必须基于拖拽终点(commitViewport 统一提交入口,核心修复 commit)', () => {
++  it('松手后 0ms(不 advance 计时器)——点击/右键的命中与坐标必须基于拖拽终点', () => {
++    // 松手前基线:旧视口下 state 就是默认值,ref 还未开始偏移。
++    expect(api.viewport).toEqual({ x: 688, y: 240, scale: 1 })
++
++    dragBy200Left()
++
++    // 判据核心:不 advance 任何计时器,立即断言。commitViewport 统一入口让
++    // tryEndPan 同步把 ref 汇入 state,不再有 120ms 延迟窗口。
++    expect(api.viewport).toEqual({ x: 488, y: 240, scale: 1 })
++
++    // 命中判定:用户看到的是拖完之后的画面,点在节点上应该选中它。
++    const hit = api.resolveCanvasHit(clickClientX, clickClientY)
++    expect(hit).toEqual({ kind: 'node', nodeId: 'n1' } satisfies HitTestTarget)
++
++    // 坐标判定(右键菜单 canvasPosition 用的公式)。
++    const canvasPoint = clientPointToCanvas(rect, api.viewport, clickClientX, clickClientY)
++    expect(canvasPoint).toEqual({ x: 50, y: 50 })
++  })
++
++  // 本文件只测 0ms/120ms,不补 119ms 变体:commitViewport 统一入口(核心修复 commit)删掉
++  // 了那个 120ms setTimeout 本身,现在已经没有任何 timer 能在 0ms 和 119ms 之间
++  // 制造差异——119ms 与 0ms 在当前实现下是同一件事(dt=119 变体已在
++  // useViewport.panCommitRace.test.tsx 的 P1-3 系列里跑过,数值与 dt=0 完全相同)。
++  it('对照组:120ms 后命中与坐标同样正确,数值应与 0ms 完全一致——已无 timer 可制造差异', () => {
++    dragBy200Left()
++
++    act(() => {
++      vi.advanceTimersByTime(120)
++    })
++
++    expect(api.viewport).toEqual({ x: 488, y: 240, scale: 1 })
++    expect(api.resolveCanvasHit(clickClientX, clickClientY)).toEqual({ kind: 'node', nodeId: 'n1' } satisfies HitTestTarget)
++    expect(clientPointToCanvas(rect, api.viewport, clickClientX, clickClientY)).toEqual({ x: 50, y: 50 })
++  })
++
++  it('对照组(基线):不拖拽时直接点击 (538,290) 本就应该 miss(默认视口下换算是 (-150,50),落在节点外)—— 确认上面的"命中/miss"翻转确实是 pan 造成的,不是坐标选点本身凑巧命中', () => {
++    expect(api.resolveCanvasHit(clickClientX, clickClientY)).toBeNull()
++  })
++})
++
++describe('#536 P1-4b — mid-pan 右键中断:resetPan() 之后,resolveCanvasHit/screenToCanvas 必须基于拖拽后的最终位置,不读中断前捕获的旧闭包(P1-4b commit)', () => {
++  // R3(MivoCanvas.tsx:552-554):平移中允许弹右键菜单,弹出即 resetPan() 终止本次平移。
++  // resetPan() 内部是同步 commitViewport(viewportRef.current)(没有 setTimeout),但
++  // handleCanvasContextMenu 这个函数体本身是同一次渲染捕获的闭包:它在调用 resetPan()
++  // 之后**同一个函数调用里**紧接着调用的 resolveCanvasHit,如果读的是闭包捕获的
++  // viewport 值,不会因为 resetPan() 内部调用了 setViewport 而被动更新——JS 闭包不会
++  // 被后续 setState 追溯性改写。核心修复 commit 只删 tryEndPan 里的 setTimeout,不改
++  // 这条路径(它压根不走 tryEndPan),必须靠 P1-4b commit 把 resolveCanvasHit /
++  // screenToCanvas 都改成读 viewportRef.current 才能修好。
++  it('mid-pan 右键中断:resetPan() 之后,即使用 resetPan() 之前捕获的旧函数引用调用,命中与坐标也必须基于 resetPan() 同步提交的新视口', () => {
++    act(() => {
++      api.startPan(pointerEvent(1, 800, 800))
++    })
++    act(() => {
++      api.tryMovePan(pointerEvent(1, 600, 800)) // 仍在拖拽中(panRef 未清空),ref 已到 488
++    })
++
++    // 覆盖面自检(同 dragBy200Left,见本文件顶部"覆盖面前提"说明)。
++    assertFreezePanEngagedMidDrag({ x: 488, y: 240 })
++
++    // 模拟 handleCanvasContextMenu 在同一次调用里先捕获这次渲染的 resolveCanvasHit /
++    // screenToCanvas,再调用 resetPan(),再用同一个(捕获时刻的)函数引用计算命中与
++    // 坐标——完全对应 MivoCanvas.tsx:554→561/567 的调用顺序与闭包生命周期。
++    const resolveCanvasHitCapturedBeforeResetPan = api.resolveCanvasHit
++    const screenToCanvasCapturedBeforeResetPan = api.screenToCanvas
++
++    act(() => {
++      api.resetPan() // 同步 commitViewport(viewportRef.current) → state 变成 488,240
++    })
++
++    // resetPan() 之后,state 确实已经提交为新值(证明 resetPan 本身没有延迟)。
++    expect(api.viewport).toEqual({ x: 488, y: 240, scale: 1 })
++
++    // 修复判据:即使用 resetPan() 之前捕获的旧函数引用调用,命中/坐标也必须正确——
++    // 因为 resolveCanvasHit/screenToCanvas 现在读的是 viewportRef.current(随时读
++    // 随时新鲜),不是某次渲染闭包捕获的 viewport 值,所以"函数引用是不是 resetPan
++    // 之前捕获的"已经不再重要。
++    expect(resolveCanvasHitCapturedBeforeResetPan(clickClientX, clickClientY)).toEqual({ kind: 'node', nodeId: 'n1' } satisfies HitTestTarget)
++    // 坐标判定改用 useViewport 实际导出的 screenToCanvas(不是测试自己重算的
++    // clientPointToCanvas)——它的默认参数本来就是 viewportRef.current(逐调用求值,
++    // 从未受这条竟态影响),这里钉住的是"该函数在 mid-pan 中断场景下仍然正确"这个
++    // 事实本身,防止后续改动把它退化成读闭包值。
++    // 注意:这条断言不判定 MivoCanvas.tsx 是否真的换用了它(那是 controller
++    // 导出 + MivoCanvas 消费的接线问题,由同目录的
++    // screenToCanvasExport.contract.test.ts 做源码级校验)——本测试只挂载
++    // useViewport 本身,不经过 useCanvasInteractionController/MivoCanvas.tsx。
++    expect(screenToCanvasCapturedBeforeResetPan(clickClientX, clickClientY)).toEqual({ x: 50, y: 50 })
++  })
++})

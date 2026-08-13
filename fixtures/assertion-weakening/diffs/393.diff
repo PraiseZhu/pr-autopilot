@@ -1,0 +1,3099 @@
+diff --git a/docs/bff-deployment.md b/docs/bff-deployment.md
+index b3628207..469526b1 100644
+--- a/docs/bff-deployment.md
++++ b/docs/bff-deployment.md
+@@ -134,6 +134,17 @@ per-user 的 `X-Mivo-Api-Key`(`mivo_` 前缀)与 `X-Gateway-Key`(`sk-` 前缀)
+ 
+ 这两个端点读取宿主机文件,只建议在受控内网或带额外访问控制的环境中启用。
+ 
++## Asset Service & Reaper
++
++`/api/assets`(POST/GET/DELETE,内容寻址资产存储)整体由 `MIVO_ENABLE_ASSET_SERVICE=1` 开启,默认关(未设 → `/api/assets/*` 全 404,见 `server/app.ts` 挂载门 + `server/__tests__/asset-gate.test.ts`)。启用时额外可配:
++
++| 变量 | 默认 | 含义 |
++|------|------|------|
++| `MIVO_ASSET_STORE_DIR` | `~/.mivo-canvas/assets` | 资产 bytes/meta/uploaders 落盘根目录(分片 `<hash[0:2]>/<hash>.bin/.meta.json/.uploaders`)。部署到持久卷时显式指定 |
++| `MIVO_ASSET_REAPER_INTERVAL_MS` | `21600000`(6h) | 周期 reaper 间隔。reaper 只在 asset service 开启时运行(`server/index.ts startAssetReaper`),清「attach 过又归零 + 7 天 grace 到期」的确定孤儿;**从未 attach 的资产一律豁免**(demo/local-only 画布结构性 unattached 引用,服务端无法区分,`exempted` 计数留痕)。设 `0` 或非正数 = **关闭** reaper(显式 opt-out)。非重入:上一轮未结束跳过本轮(fail-visible warn) |
++
++reaper 语义详见 `server/lib/assetStore.ts` `runScheduledReap` + `docs/decisions/api-surface.md` §4.4。建议生产把 `MIVO_ASSET_STORE_DIR` 挂持久卷,reaper 保持默认 6h(不可与 grace 窗口 7 天混为一谈——reaper 只清 grace 已到期的,不缩短 grace)。
++
+ ## 已废弃(勿用)
+ 
+ 以下在 SSO 网关方案切换后已删除/失效,文档不再保留:
+diff --git a/docs/decisions/api-surface.md b/docs/decisions/api-surface.md
+index 9356966a..bd25de9d 100644
+--- a/docs/decisions/api-surface.md
++++ b/docs/decisions/api-surface.md
+@@ -19,7 +19,7 @@
+ | `/api/projects` | document | 项目 CRUD;deleteProject 级联软删画布(DP-3,原子 tree #7) | DP-3、§13.5 |
+ | `/api/canvas` | document | 画布 record(nodes/edges/anchors)+ **chat 子资源(DP-6)**;节点级 PATCH(FX-4)+ revision 409 + 428 | DP-5、DP-6、FX-4、§13.5 |
+ | `/api/user-state` | user | per-user KV(selection/相机/偏好/草稿);key namespace allowlist + DP-7 递归敏感扫描(#9) | DP-1、DP-7、§13.1 |
+-| `/api/assets` | asset | **T1.5 #195 已实现**(POST/GET 真实 shape,§4.4 引用) | DP-5 payload、§13.2 AssetService |
++| `/api/assets` | asset | **T1.5 #195 已实现**(POST/GET/DELETE + attach/detach 真实 shape,§4.4 引用;DELETE 为 #313 owner 显式回收) | DP-5 payload、§13.2 AssetService |
+ 
+ **信封列(DP-5 + 返修 #6 orderKey)**——四端点共享的 record 物理形状,服务端只理解信封列,payload 是不透明 jsonb(节点级合并 tie-break 用 `revision`,不下沉到 payload 字段级):
+ 
+@@ -208,6 +208,17 @@ type RecordEntry = { id, revision, orderKey, payload }  // 返修 #6 orderKey
+ > |---|---|---|
+ > | `POST /api/assets` | multipart `image` 文件 OR JSON `{image: base64}` | 200 `CreateAssetResponse = {assetId, mimeType, originalName, sizeBytes, refcount, deduped}`(内容寻址:同 content hash → 同 assetId,**refcount=references.length**,bytes 复用) |
+ > | `GET /api/assets/:id` | —(id = sha256 hex 64) | 200 content **bytes** + `Content-Type: <sniffedMime>` + `Cache-Control: private`(immutable;owner-scoped:跨 owner GET → 404 无泄漏;env gate `MIVO_ENABLE_ASSET_SERVICE=1`,默认关 → /api/assets 404) |
++> | `DELETE /api/assets/:id`(#313 owner 显式回收未附加上传) | —(id = sha256 hex 64) | **proof-gate 次序与 POST/GET 对齐**:`resolveAssetOwner`(strict proof)先于一切校验(strict + 无 proof → 401 无泄漏,与 POST/GET 同序)→ bad-key 400 → 非 hash 形状 404 → `deleteUnattached` 原子判定。响应:200 `{kind:'deleted'}`;**404** missing / not-uploader 合流(不泄漏存在性,与 GET 的 missing-or-forbidden 一致);**409** `{code:'asset_has_references'}`(refcount>0,先 detach 干净再删);**409** `{code:'asset_shared_uploaders'}`(dedup 共上传:uploaders 集合 >1,任一方都不能单方面删走对方还没 attach 的字节)。不等 grace(显式意图);uploader + refcount 检查全部在 hash 锁内原子完成(`deleteIfSoleUploaderZeroRefs`,堵 stale 请求跨「旧 record 删除→他人同 hash 重上传」代际越权删除) |
++>
++> **周期 reaper(#313)never-attached 豁免**:reaper(`runScheduledReap`,interval `MIVO_ASSET_REAPER_INTERVAL_MS` 默认 6h)只清「attach 过又归零 + grace 到期」的确定孤儿;**从未 attach 的资产一律豁免**(demo/local-only 画布结构性 unattached 引用,服务端无法区分,`exempted` 计数留痕)——owner 显式 DELETE 不受此豁免影响(显式意图),但须过 sole-uploader + zero-refs 原子判定。reaper 与 DELETE 互不替代:reaper 是 owner-agnostic 的 grace 扫描,DELETE 是 owner-scoped 的显式回收。
++>
++> **owner 配额 purge 的 sole-uploader 门(#313 / codex-R3-E1)**:撞配额时触发的定向清理(`purgeOwnerEligible` → `deleteIfSoleUploaderPurgeEligible`)在**同一把 hash 锁内**重读 uploaders 集,`uploaders>1` 即跳过。理由:该清理由某个 owner 的上传动作触发、按 `record.ownerFp` 选中,若只复查 grace/refcount,首上传者 A 就能靠制造配额压力删掉 dedup 共上传者 B 仍持读权限的字节,**绕过 DELETE 的同一道 sole-uploader 门**(跨 owner 拒绝服务)。owner-agnostic 的系统级 sweep(`runScheduledReap`/`runPurgeSweep`)不带这道门 —— 它没有"A 删 B 的"越权语义,继续用 `deleteIfStillEligible`。**但"不带门"是前提不是许可**:`runPurgeSweep` 是三个 purge 入口中唯一既不查 uploaders、也不豁免 never-attached 的那个(当前零生产调用方),**禁止从 owner 或请求触发的路径调用** —— 一旦被接到管理端「立即清理」这类按钮上,上述跨 owner 越权语义会静默重开;需要 owner 触发的定向回收一律走 `purgeOwnerEligible`。
++>
++> **由此产生的配额权衡(如实记录)**:共上传的字节**不再计入首上传者的可回收空间** —— 显式 DELETE 永久 409、reaper 豁免 never-attached、配额 purge 跳过,三条路全关。首上传者撞配额时,只有其**独占**的 grace 到期资产能被腾出;若名下无独占可回收资产,新上传会拿到 **413** `{code:'quota_exceeded'}`(席③ 验收补正:**wire code 用下划线**,与本段另两个 409 码同形;`quota-exceeded` 是 store 内部 `QuotaUploadOutcome.kind` 的值,**客户端不要拿它匹配**)。这是安全优先于便利的自觉取舍(宁可 A 传不进,也不能让 A 删掉 B 仍可读的字节)。彻底解法需给 DELETE 加"只注销调用方 uploader 登记、`uploaders` 归空才删字节"语义 —— 属新的对外 wire 语义,归 follow-up。
++>
++> **怎么确认手上这个 413 是不是由该权衡引起(诊断指引,非契约保证)**:服务端在返回 413 时把本次 owner purge 的分项写进请求日志的 note —— `scanned` / `purged` / `skippedShared` / `notEligible`。**`skipped-shared-uploaders > 0` 即上述权衡正在生效**(有到期资产但因共上传被 sole-uploader 门跳过);全 0 则是名下确实没有可回收候选。
++> ⚠️ **这是诊断手段,不是 wire 契约**(席③ 提醒):note 的文本形态**不属于**本文档承诺的对外 shape,将来可能改格式或改为结构化字段,**客户端不得依赖其文本**。需要程序化判别时请依 `{code:'quota_exceeded'}` 与配额数值字段,而非日志文本。
++
+ >
+ > **N9:resolve seam 返回 bytes+mime,不返 AssetRef 元数据**——`ServerPersistAdapter.resolveAsset(assetId): Promise<ResolvedAsset | null>`,`ResolvedAsset = {bytes: Uint8Array; mimeType: string}`(GET 内容寻址 bytes,长缓存 private;null=404 env off/不存在/跨 owner)。`uploadAsset` 返 `CreateAssetResponse` 不变。
+ >
+diff --git a/scripts/e2e/scenarios/archive-assets.mjs b/scripts/e2e/scenarios/archive-assets.mjs
+index 6d1a7e74..e4f53cdb 100644
+--- a/scripts/e2e/scenarios/archive-assets.mjs
++++ b/scripts/e2e/scenarios/archive-assets.mjs
+@@ -175,6 +175,13 @@ export const runArchiveAssetsScenario = async (context) => {
+         throw new Error(`Importing a Mivo archive should restore embedded local assets (store assetUrl): ${JSON.stringify(restored)}`)
+       }
+     } else {
++      // #363:naturalWidth 是解码后才非零的属性,一次性同步读在全量运行(前序场景抢占
++      // 主线程/网络)下必然撞到未解码窗口 → 首败 naturalWidth:0。先等 complete +
++      // naturalWidth>0 再读值;单跑基线(D/E 行)本就绿,此等待不改变其语义。
++      await page.waitForFunction(() => {
++        const image = document.querySelector('[data-node-id="archive-image"] .dom-node-media img')
++        return image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0
++      })
+       const importedArchiveAsset = await page.locator('[data-node-id="archive-image"] .dom-node-media img').evaluate((image) => ({
+         src: image.getAttribute('src') || '',
+         naturalWidth: image instanceof HTMLImageElement ? image.naturalWidth : 0,
+diff --git a/scripts/e2e/scenarios/mask-point.mjs b/scripts/e2e/scenarios/mask-point.mjs
+index 542ae182..c2e1c5d8 100644
+--- a/scripts/e2e/scenarios/mask-point.mjs
++++ b/scripts/e2e/scenarios/mask-point.mjs
+@@ -1,32 +1,40 @@
+ // scripts/e2e/scenarios/mask-point.mjs
+-// rev4 变更 6：局部重绘只留点选（圆形区）。本场景验证点选工具的 UI 与交互（无生成）：
+-//  SC6.1 工具条只有"点选"，无框选/涂抹；默认 tool=point
+-//  SC6.2 点一下 → 生成圆形 region，不被拦截、无"请框选或涂抹"提示、提交按钮可用
+-//  SC6.6 多次点选叠加多个圆形区；undo/redo/clear 正常
++// #381 重写(2026-08-01):#369(批次D region-edit)废除了老「局部重绘 armed 按钮」
++// (点一下武装、再点图片下针)整条交互 —— 工具坞按钮改为无选中图片即 disabled、
++// 点击直接开 region-edit(RegionEditOverlay)。本场景按新契约钉工具坞入口 + 点选工具:
++//  P2   无选中图片(空画布 / 有图未选中)→ dock 按钮 disabled,tooltip 给出提示
++//  P3   选中图片 → dock 按钮 enabled → click → region-edit 直接打开;全程无 .mask-armed
++//  SC6.1 工具条精确三工具(点选/矩形/圈选,2026-07-31 用户定序,椭圆已下线);默认 tool=点选
++//  SC6.2 点选点一下 → 1 个圆形区(brush 单点),可见反馈(point-dot),无阻断错误(不触发
++//        regionTooSmall/loopTooSmall 的 en 基准文案),提交可用
++//  SC6.6 多次点选叠加;undo/redo/clear 正常
+ //
+-// SC6.3（点选提交→占位符→成功替换/失败消失）由 mask-reflow.mjs 的 SC4.x（成功）+
+-// SC5.3（失败）以点选驱动覆盖，此处不再重复生成。
+-
+-import { clickCanvasNode, nodeScreenRect } from '../renderer-evidence.mjs'
+-
+-// #154 四工具(toolItems,ImageMaskEditOverlay.tsx:93-98),顺序对齐 UI 渲染顺序。
+-// SC6.1 两处精确集合断言共用:矩形/圈选被删或改名必须红(只查 length+includes 会漏报)。
+-const EXPECTED_MASK_TOOLS = ['椭圆', '矩形', '圈选', '点选']
+-
+-const regionCounts = async (page) =>
+-  page.evaluate(() => {
+-    const overlay = document.querySelector('.image-mask-edit-overlay')
+-    return {
+-      region: Number(overlay?.getAttribute('data-region-count') || '0'),
+-      mask: Number(overlay?.getAttribute('data-mask-region-count') || '0'),
+-      point: Number(overlay?.getAttribute('data-point-anchor-count') || '0'),
+-    }
+-  })
++// 老场景中随 armed 交互一并废除、不再迁移的段(留痕,防"覆盖凭空消失"误判):
++//  - GREPTILE-P2(D4 disarm)/FIX-3(armed dblclick)——armed 状态已不存在,断言对象消失;
++//  - FIX-2(删目标图清草稿)——草稿仓已换 regionEditDraft(只有提交成功才清,取消/误关
++//    都保留,2026-08-01 契约),老"删除即清空"断言与新契约相悖;
++//  - SC-09(提交前 Esc 关浮层/提交后 Esc 不 cancel)——region-edit 的 Esc 是分级语义
++//    (先关下拉/取消选中,输入框有稿时只 blur),"Esc 必关浮层"前提不再成立;提交链路
++//    (占位/成功/失败)由 mask.mjs(mask-chat-card 主场景)与 mask-reflow SC4.x/SC5.3 覆盖。
++//  SC6.3(点选提交→占位→替换/消失)持续由 mask-reflow 以点选驱动覆盖,此处不重复生成。
++
++import { clickCanvasNode } from '../renderer-evidence.mjs'
++
++// 工具族单一来源 src/canvas/regionEditTools.ts regionEditToolItems(2026-07-31 用户定序:
++// 点选第一、矩形第二、圈选第三;椭圆与矩形语义重叠已下线)。#386(i18n Wave 3+4)把 label
++// 迁成 i18n key,可访问名取 en 基准(src/i18n/locales/en/menu.json menu.maskEdit.*):
++// point='Point select' / box='Rectangle' / loop='Lasso'。顺序断言:改序/删除/改名必红。
++const EXPECTED_REGION_TOOLS = ['Point select', 'Rectangle', 'Lasso']
++
++// region-edit 只暴露 data-region-count(RegionEditOverlay 根元素);老 overlay 的
++// data-mask-region-count / data-point-anchor-count 已随 ImageMaskEditOverlay 下线。
++const regionCount = async (page) =>
++  page.evaluate(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0'))
+ 
+ // Each point click commits a region on pointerdown. Move to the target then down/up.
+ const clickStage = async (page, fx, fy) => {
+   const stage = await page.locator('.image-mask-edit-stage').boundingBox()
+-  if (!stage) throw new Error('Mask edit stage should be visible')
++  if (!stage) throw new Error('Region edit stage should be visible')
+   await page.mouse.move(stage.x + stage.width * fx, stage.y + stage.height * fy)
+   await page.mouse.down()
+   await page.mouse.up()
+@@ -36,12 +44,12 @@ const clickStage = async (page, fx, fy) => {
+ // canvas occasionally drop a pointerdown, so retry ONLY while the region count is
+ // unchanged (a landed click increments by exactly 1 — never double-adds on retry).
+ const addPointRegion = async (page, fx, fy, { attempts = 6 } = {}) => {
+-  const before = (await regionCounts(page)).region
++  const before = await regionCount(page)
+   for (let attempt = 0; attempt < attempts; attempt += 1) {
+     await clickStage(page, fx, fy)
+     const deadline = Date.now() + 700
+     while (Date.now() < deadline) {
+-      const now = (await regionCounts(page)).region
++      const now = await regionCount(page)
+       if (now === before + 1) return before + 1
+       if (now > before + 1) throw new Error(`click added more than one region (${before} → ${now})`)
+       await new Promise((r) => setTimeout(r, 50))
+@@ -53,96 +61,57 @@ const addPointRegion = async (page, fx, fy, { attempts = 6 } = {}) => {
+ const waitForRegionCount = async (page, expected, { timeout = 5000 } = {}) => {
+   const deadline = Date.now() + timeout
+   while (Date.now() < deadline) {
+-    if ((await regionCounts(page)).region === expected) return
++    if ((await regionCount(page)) === expected) return
+     await new Promise((r) => setTimeout(r, 50))
+   }
+-  const last = await regionCounts(page)
+-  throw new Error(`Timed out waiting for region-count=${expected}, last=${JSON.stringify(last)}`)
++  throw new Error(`Timed out waiting for region-count=${expected}, last=${await regionCount(page)}`)
+ }
+ 
+ const cancelMaskEdit = async (page) => {
+-  // Cancel(X)按钮在 .image-mask-edit-close(工具条右上),不在 .image-mask-edit-history
+-  // (history 行是 undo/redo/clear)。选择器对齐当前 UI 结构(overlay 重构后 Cancel 移至 close)。
+   await page.locator('.image-mask-edit-close').click()
+-  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' }).catch(() => {})
+-}
+-
+-const clearCanvasSelection = async (page, moduleSpec) => {
+-  await page.evaluate(async (spec) => {
+-    const { useCanvasStore } = await import(spec)
+-    useCanvasStore.getState().selectNode(undefined)
+-  }, moduleSpec)
++  // SC-8(claude-C2):去掉吞错 `.catch(() => {})`——浮层未关就该红。waitForSelector
++  //   'detached' 在已分离时立即 resolve(不报错);只在超时未分离时 throw = 正是该测的失败。
++  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+ }
+ 
+-// contentEditable 富文本编辑器输入(对齐 mask.mjs fillMaskPrompt):prompt 输入区自
+-// 局部重绘由 region-edit 接管(2026-08-01):编辑器是 contentEditable .region-edit-input(富文本@芯片),旧的
+-// '.image-mask-edit-prompt textarea' 选择器失效。内联避免改共享文件。
++// contentEditable 富文本编辑器输入(对齐 mask.mjs fillMaskPrompt):prompt 编辑器是
++// contentEditable .region-edit-input(富文本@芯片)。
+ const fillMaskPrompt = async (page, text) => {
+   const editor = page.locator('.image-mask-edit-prompt .region-edit-input')
+   await editor.click()
+   await page.evaluate((t) => { document.execCommand('insertText', false, t) }, text)
+ }
+ 
+-// #154 锚点草稿:浮层关闭(X)记住锚点,同图重进恢复 → 多段 region 累积。
+-// 受影响段(FIX-3 dblclick 用同 imageId)开浮层前清 draft,使 region=0(钉 #154"不落 point")。
+-// clearMaskEditDraft 经 /src/canvas/maskEditDraftStore.ts 动态 import,仅 dev 有 Vite /src/,
+-// prod 必 404 → TypeError。prod skip(独立 scenario 进程=fresh context;FIX-3 region=0 断言同步
+-// skip,见下方 isProdTopology 守卫;armed/disarm 断言两拓扑照常跑)。
+-const clearMaskDraft = async (page, nodeId, isProdTopology) => {
+-  if (isProdTopology) {
+-    console.log('[mask-point] prod: clearMaskDraft skipped (dev-only /src/canvas/maskEditDraftStore.ts import — not in prod bridge)')
+-    return
+-  }
+-  await page.evaluate(async (id) => {
+-    const { clearMaskEditDraft } = await import('/src/canvas/maskEditDraftStore.ts')
+-    clearMaskEditDraft(id)
+-  }, nodeId)
+-}
+-
+ export const runMaskPointScenario = async (context) => {
+-  // ── 显式 SKIP(2026-08-01,非静默,重写债挂 Issue)────────────────────────────
+-  // #369(批次D region-edit)把本场景测的交互整条下线:老「局部重绘 armed 按钮」
+-  // (空画布可点出 warning、armed 后点图下针)废除,工具坞按钮改为无选中图片即
+-  // disabled、点击直接开 region-edit。#369 的 e2e 迁移(d19d743/6142a86)覆盖了
+-  // mask/mask-reflow/mask-multi-edit 与本场景的 prompt 选择器,但 P2/P3 armed
+-  // 契约段漏迁 → nightly 必红(先 #367 i18n 改名暴露,#380 修完暴露本层)。
+-  // 按 region-edit 新契约重写需要产品语义拍板(四工具/点选是否保留),归 #369
+-  // 作者 —— 重写完成后删除本 SKIP 块整段恢复执行。追踪 Issue:#381。
+-  console.log('[e2e-smoke] SKIP scenario=mask-point reason=region-edit(#369) 废除 armed 交互,场景待按新契约重写(Issue #381)')
+-  return
+-
+-  const { page, canvasStoreSpec, generatedImageB64, rendererMode, isProdTopology } = context
+-  const leaferMode = rendererMode === 'leafer'
++  const { page, canvasStoreSpec, rendererMode } = context
+   const spec = await canvasStoreSpec()
+ 
+-  // i18n Wave 1(#367)后工具坞按钮默认英文(t('tools.dock.inpaint') → en 'Inpaint');
+-  // 与兄弟场景的 dock 定位口径一致(canvas-interactions 用 'Draw'/'Brush' 等英文名)。
++  // i18n Wave 1(#367)后工具坞按钮英文 aria-label(t('tools.dock.inpaint') → en 'Inpaint');
++  // 与兄弟场景 dock 定位口径一致。面板内提交按钮(「局部重绘」)未迁 i18n,保持中文。
+   const dockMaskButton = page.locator('.canvas-tool-dock').getByRole('button', { name: 'Inpaint' })
+ 
+-  // P2 — no selected image and no image on canvas: dock entry stays enabled, warns, and does not arm.
+-  // createCanvas/selectNode 经 canvasStore bridge(两拓扑都可);clearToasts 走 /src/store/toastStore.ts
+-  // 动态 import,仅 dev 有 Vite /src/,prod 必 404 → TypeError(nightly-e2e 红灯)。prod skip
+-  // clearToasts(独立 scenario 进程 = fresh context,无 stale toast,P2 DOM warning 断言照常跑)。
++  // ── P2 — 无选中图片时 dock 按钮 disabled(新契约:不再是 enabled+warning toast)──
++  // 情形一:空画布(无任何图片)。
+   await page.evaluate(async (moduleSpec) => {
+     const { useCanvasStore } = await import(moduleSpec)
+     useCanvasStore.getState().createCanvas('E2E Mask Point Empty')
+     useCanvasStore.getState().selectNode(undefined)
+   }, spec)
+-  if (isProdTopology) {
+-    console.log('[mask-point] prod: clearToasts skipped (dev-only /src/store/toastStore.ts import — not in prod bridge; fresh context has no stale toasts), P2 DOM warning assertion still runs')
+-  } else {
+-    await page.evaluate(async () => {
+-      const { useToastStore } = await import('/src/store/toastStore.ts')
+-      useToastStore.getState().clearToasts()
+-    })
+-  }
+-  // 批次D(#369)语义:未选中图片时工具坞入口直接 disabled(老的"武装 + 警告 toast"
+-  // 路径整条下线),负例从"点击后警告"改为"按钮不可点"。
+-  if (!(await dockMaskButton.isDisabled())) {
+-    throw new Error('dock region-edit entry should be disabled with no image selected')
+-  }
++  await page.waitForFunction(() => {
++    const buttons = Array.from(document.querySelectorAll('.canvas-tool-dock button'))
++    const target = buttons.find((b) => (b.getAttribute('aria-label') || '') === 'Inpaint')
++    return Boolean(target) && target.disabled
++  })
++  const p2Empty = await dockMaskButton.evaluate((button) => ({
++    disabled: button.disabled,
++    tooltip: button.getAttribute('data-tooltip') || '',
++    armed: Boolean(document.querySelector('.canvas-shell.mask-armed')),
++  }))
++  if (!p2Empty.disabled) throw new Error(`P2: 空画布下 dock 按钮应 disabled, got ${JSON.stringify(p2Empty)}`)
++  if (!p2Empty.tooltip) throw new Error('P2: disabled 态应有 data-tooltip 提示(inpaintHint)')
++  if (p2Empty.armed) throw new Error('P2: 不应存在 .mask-armed(armed 交互已随 #369 下线)')
+ 
+-  // Fresh canvas with one real (loadable) image to open the mask editor onto.
++  // 情形二:画布上有图片但未选中 → 仍 disabled(disabled 依据是"选中的图片节点")。
+   const imageId = await page.evaluate(async (moduleSpec) => {
+     const { useCanvasStore } = await import(moduleSpec)
+     useCanvasStore.getState().createCanvas('E2E Mask Point')
+@@ -156,406 +125,88 @@ export const runMaskPointScenario = async (context) => {
+     useCanvasStore.getState().selectNode(undefined)
+     return node.id
+   }, spec)
++  if (!(await dockMaskButton.isDisabled())) {
++    throw new Error('P2: 有图但未选中时 dock 按钮仍应 disabled')
++  }
+ 
+-  // P3 — no selection: dock click arms, image click selects + opens overlay + drops the first point.
++  // ── P3 — 选中图片 → 按钮 enabled → click → region-edit 直接打开,无 armed 中间态 ──
++  await clickCanvasNode(page, rendererMode, imageId)
++  await page.waitForFunction(() => {
++    const buttons = Array.from(document.querySelectorAll('.canvas-tool-dock button'))
++    const target = buttons.find((b) => (b.getAttribute('aria-label') || '') === 'Inpaint')
++    return Boolean(target) && !target.disabled
++  })
+   await dockMaskButton.click()
+-  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+-  const armedButtonActive = await dockMaskButton.evaluate((button) => button.classList.contains('active'))
+-  if (!armedButtonActive) throw new Error('P3: dock mask button should be active while point selection is armed')
+-  const nodeBox = await nodeScreenRect(page, rendererMode, imageId)
+-  if (!nodeBox) throw new Error('P3: source image node should be visible')
+-  await page.mouse.click(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
+   await page.waitForSelector('.image-mask-edit-stage')
+-  // #154 变更(commit ac62c33):armed 首击只开浮层(默认椭圆),不再落 point 锚点
+-  // (useMaskPointArmed L288-294 有意移除 recordPendingInitialPoint,commit message
+-  // 「首击不再强制落点选锚点」)。原 P3「armed 首击落 point」前提被推翻,改为钉新
+-  // intended 行为:开 overlay + disarm + 选图 + 不落 point + 四工具 + 默认椭圆;
+-  // 再切点选 + clickStage 落首 point(等价验证点选工具落 point + marker/pin)。
+-  const p3Overlay = await page.evaluate(async ({ leaferMode, moduleSpec }) => {
++  const p3Overlay = await page.evaluate(async (moduleSpec) => {
+     const overlay = document.querySelector('.image-mask-edit-overlay')
+-    let selectedNodeId = document.querySelector('.dom-node.selected')?.getAttribute('data-node-id')
+-    if (leaferMode && !selectedNodeId) {
+-      const { useCanvasStore } = await import(moduleSpec)
+-      selectedNodeId = useCanvasStore.getState().selectedNodeId
+-    }
++    const { useCanvasStore } = await import(moduleSpec)
+     return {
+-      armed: document.querySelector('.canvas-shell')?.classList.contains('mask-armed'),
+-      selectedNodeId,
++      armed: Boolean(document.querySelector('.canvas-shell.mask-armed')),
++      regionEditRoot: Boolean(overlay?.classList.contains('region-edit-overlay')),
++      selectedNodeId: useCanvasStore.getState().selectedNodeId,
+       region: Number(overlay?.getAttribute('data-region-count') || '0'),
+-      mask: Number(overlay?.getAttribute('data-mask-region-count') || '0'),
+-      point: Number(overlay?.getAttribute('data-point-anchor-count') || '0'),
+-      markers: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-marker').length,
+-      pins: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-pin').length,
+       tools: Array.from(document.querySelectorAll('.image-mask-edit-tools button')).map((b) => (b.getAttribute('aria-label') || b.textContent || '').trim()),
+       activeTool: Array.from(document.querySelectorAll('.image-mask-edit-tools button.active')).map((b) => (b.getAttribute('aria-label') || '').trim()),
+     }
+-  }, { leaferMode, moduleSpec: spec })
+-  if (p3Overlay.armed) throw new Error(`P3(#154): armed 应在点图片后 disarm, got ${JSON.stringify(p3Overlay)}`)
+-  if (p3Overlay.selectedNodeId !== imageId) throw new Error(`P3: 应选中图片 ${imageId}, got ${JSON.stringify(p3Overlay)}`)
+-  if (p3Overlay.region !== 0 || p3Overlay.mask !== 0 || p3Overlay.point !== 0) {
+-    throw new Error(`P3(#154): armed 首击不应落 point/region, got ${JSON.stringify(p3Overlay)}`)
+-  }
+-  if (p3Overlay.markers !== 0 || p3Overlay.pins !== 0) {
+-    throw new Error(`P3(#154): armed 首击不应渲染 marker/pin, got ${JSON.stringify(p3Overlay)}`)
+-  }
+-  // SC6.1(#154 重写,原"只点选"被 #154 四工具推翻):工具条精确四工具(椭圆/矩形/圈选/点选,
+-  // 顺序对齐 ImageMaskEditOverlay.tsx:93-98 toolItems)+ 默认椭圆。矩形/圈选被删或改名必红。
+-  if (p3Overlay.tools.length !== EXPECTED_MASK_TOOLS.length ||
+-      !p3Overlay.tools.every((label, i) => label === EXPECTED_MASK_TOOLS[i])) {
+-    throw new Error(`SC6.1(#154): 工具条应精确为 ${JSON.stringify(EXPECTED_MASK_TOOLS)}, got ${JSON.stringify(p3Overlay.tools)}`)
+-  }
+-  if (p3Overlay.activeTool.length !== 1 || p3Overlay.activeTool[0] !== '椭圆') {
+-    throw new Error(`SC6.1(#154): 默认工具应唯一为椭圆, got ${JSON.stringify(p3Overlay.activeTool)}`)
+-  }
+-  // 切点选 + clickStage 落首 point(验证点选工具落 point + marker/pin;#154 后首击不落,
+-  // 改为手动切点选 + clickStage,等价原 P3 的"落首 point + marker"断言)
+-  await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+-  await addPointRegion(page, 0.5, 0.5)
+-  await waitForRegionCount(page, 1)
+-  const p3Point = await page.evaluate(() => ({
+-    mask: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-mask-region-count') || '0'),
+-    point: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-point-anchor-count') || '0'),
+-    markers: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-marker').length,
+-    pins: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-pin').length,
+-  }))
+-  if (p3Point.mask !== 1 || p3Point.point !== 0) {
+-    throw new Error(`P3: 点选 clickStage 应落 1 个 mask region(非 standalone point), got ${JSON.stringify(p3Point)}`)
+-  }
+-  if (p3Point.markers < 1 || p3Point.pins < 1) {
+-    throw new Error(`P3: 点选应渲染坐标 pin marker, got ${JSON.stringify(p3Point)}`)
+-  }
+-
+-  // FIX-3: initial armed point must not block legitimate fast follow-up points in the overlay.
+-  await clickStage(page, 0.42, 0.5)
+-  await clickStage(page, 0.58, 0.5)
+-  await waitForRegionCount(page, 3)
+-  const afterFastOverlayClicks = await regionCounts(page)
+-  if (afterFastOverlayClicks.mask !== 3 || afterFastOverlayClicks.point !== 0) {
+-    throw new Error(`FIX-3: two fast overlay points after armed initial point should both land, got ${JSON.stringify(afterFastOverlayClicks)}`)
+-  }
+-  await cancelMaskEdit(page)
+-  await clearCanvasSelection(page, spec)
+-
+-  // GREPTILE-P2: dock 直接入口（D4）调用 beginMaskEdit 时必须解除 armed。
+-  // 构造 armed 残留场景：无选区 dock click arm → 通过 store API 选中图片
+-  // （绕过 wrapNodePointerDown 的指针路径 disarm）→ 再次 dock click 走 D4 直接入口。
+-  // 修复前 beginMaskEdit 不 disarm，shell 会残留 mask-armed class。
+-  await dockMaskButton.click()
+-  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+-  await page.evaluate(async ({ moduleSpec, id }) => {
+-    const { useCanvasStore } = await import(moduleSpec)
+-    useCanvasStore.getState().selectNode(id)
+-  }, { moduleSpec: spec, id: imageId })
+-  await page.waitForFunction(async ({ id, leaferMode, moduleSpec }) => {
+-    if (document.querySelector(`[data-node-id="${id}"]`)?.classList.contains('selected')) return true
+-    if (!leaferMode) return false
+-    const { useCanvasStore } = await import(moduleSpec)
+-    return useCanvasStore.getState().selectedNodeId === id
+-  }, { id: imageId, leaferMode, moduleSpec: spec })
+-  await dockMaskButton.click()
+-  await page.waitForSelector('.image-mask-edit-stage')
+-  await page.waitForFunction(() => !document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+-  const d4Disarmed = await page.evaluate(() => ({
+-    armed: document.querySelector('.canvas-shell')?.classList.contains('mask-armed'),
+-    stageOpen: Boolean(document.querySelector('.image-mask-edit-stage')),
+-  }))
+-  if (d4Disarmed.armed || !d4Disarmed.stageOpen) {
+-    throw new Error(`GREPTILE-P2: D4 dock entry must disarm armed and open overlay, got ${JSON.stringify(d4Disarmed)}`)
+-  }
+-  await cancelMaskEdit(page)
+-  await clearCanvasSelection(page, spec)
+-
+-  // FIX-3(#154 重写):原"armed fast dblclick 落 1 initial region + 不重复"前提(armed 首击
+-  // 落 point)被 #154 移除(commit message「首击不再强制落点选锚点」)。改为钉 #154 后
+-  // 行为:armed dblclick → 开浮层 + disarm + 选图 + 不落 point(region=0)。
+-  // #154 锚点草稿同图恢复会累积 region,开浮层前清 imageId draft 使 region=0。
+-  await clearMaskDraft(page, imageId, isProdTopology)
+-  await dockMaskButton.click()
+-  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+-  await page.mouse.dblclick(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
+-  await page.waitForSelector('.image-mask-edit-stage')
+-  await page.waitForTimeout(120)
+-  const fastDoubleClickState = await page.evaluate(() => ({
+-    armed: document.querySelector('.canvas-shell')?.classList.contains('mask-armed'),
+-    detailsOpen: Boolean(document.querySelector('.details-dialog-backdrop')),
+-    region: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0'),
+-    mask: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-mask-region-count') || '0'),
+-    point: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-point-anchor-count') || '0'),
+-  }))
+-  if (fastDoubleClickState.armed || fastDoubleClickState.detailsOpen) {
+-    throw new Error(`FIX-3(#154): armed dblclick 应 disarm + 无 details dialog, got ${JSON.stringify(fastDoubleClickState)}`)
+-  }
+-  if (!isProdTopology && (fastDoubleClickState.region !== 0 || fastDoubleClickState.mask !== 0 || fastDoubleClickState.point !== 0)) {
+-    throw new Error(`FIX-3(#154): armed dblclick 不应落 point/region(首击只开浮层), got ${JSON.stringify(fastDoubleClickState)}`)
+-  }
+-  await cancelMaskEdit(page)
+-  await clearCanvasSelection(page, spec)
+-
+-  // FIX-3(#154 重写):原"armed slow dblclick 落 1 region + 第二击不重复"前提(armed 首击
+-  // 落 point)被 #154 移除。改为钉 #154:armed click → 开浮层 + 不落 point(region=0)。
+-  // 第二击在浮层已开后(armed 已 disarm),不落 armed point。清 draft 使 region=0。
+-  await clearMaskDraft(page, imageId, isProdTopology)
+-  await dockMaskButton.click()
+-  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+-  await page.mouse.click(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
+-  await page.waitForSelector('.image-mask-edit-stage')
+-  await page.waitForTimeout(450)
+-  await page.mouse.click(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
+-  await page.waitForTimeout(120)
+-  const slowDoubleClickCounts = await regionCounts(page)
+-  if (!isProdTopology && (slowDoubleClickCounts.region !== 0 || slowDoubleClickCounts.mask !== 0 || slowDoubleClickCounts.point !== 0)) {
+-    throw new Error(`FIX-3(#154): armed slow dblclick 不应落 point/region(首击只开浮层,第二击不重复落), got ${JSON.stringify(slowDoubleClickCounts)}`)
+-  }
+-  await cancelMaskEdit(page)
+-
+-  // SC-09 (mask-chat-card): 提交前 Esc 只关交互层（overlay/draft），不 abort 已提交任务。
+-  // 这里仍是提交前阶段：overlay 打开、prompt 聚焦、尚未点「局部重绘」。
+-  // Esc 关闭 overlay，不触达任何后台 task（此时还没有 task）。
+-  await clickCanvasNode(page, rendererMode, imageId)
+-  await page.waitForSelector('.selection-quick-toolbar')
+-  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+-  await page.waitForSelector('.image-mask-edit-stage')
+-  // #154: selection-quick-toolbar 入口打开浮层不落 point(默认椭圆需手动画),无 anchor
+-  // 时 prompt 区不渲染(hasAnyAnchor gate)。原 textarea.focus 前提(浮层打开即有 prompt)
+-  // 不再成立,改为直接 Esc 关浮层("提交前 Esc 只关交互层"核心仍覆盖;prompt 聚焦场景
+-  // 由 SC6.2 有 anchor 时覆盖)。
+-  await page.keyboard.press('Escape')
+-  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+-
+-  // SC-09 (mask-chat-card): 提交后 Esc 不 cancel —— 拦截 task GET 挂起，提交，按 Esc，
+-  // 断言 DELETE 未发生、card 仍 generating、release GET 后 done。
+-  // 准备：重新打开 overlay，画一个 region，填 prompt，提交。GET 挂起保证提交后仍 generating。
+-  let releaseSc09Get
+-  const sc09GetGate = new Promise((resolve) => { releaseSc09Get = resolve })
+-  let sc09GetCount = 0
+-  let sc09DeleteCount = 0
+-  // 先拦截 GET /tasks/* 与 DELETE，让 GET 挂起。
+-  await page.route('**/api/mivo/tasks/*', async (route) => {
+-    const method = route.request().method()
+-    if (method === 'DELETE') {
+-      sc09DeleteCount += 1
+-      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'canceled' }) })
+-      return
+-    }
+-    if (method !== 'GET') { await route.fallback(); return }
+-    sc09GetCount += 1
+-    await sc09GetGate
+-    await route.fulfill({
+-      status: 200,
+-      contentType: 'application/json',
+-      body: JSON.stringify({
+-        id: 'task-sc09',
+-        kind: 'edit',
+-        status: 'done',
+-        progress: 100,
+-        stage: 'done',
+-        requestId: 'e2e-sc09',
+-        model: 'gpt-image-2',
+-        result: { images: [{ b64: generatedImageB64 }] },
+-      }),
+-    })
+-  })
+-  // /enhance 返回 generate mode 快速通过（不 gate enhance，只 gate GET poll）。
+-  await page.route('**/api/mivo/enhance', async (route) => {
+-    await route.fulfill({
+-      status: 200,
+-      contentType: 'application/json',
+-      body: JSON.stringify({ mode: 'generate', scene: 'general', reasoning: 'e2e', richPrompt: 'e2e sc09 rich prompt', imgRatio: '1:1', quality: 'medium', enhanced: true }),
+-    })
+-  })
+-  // /tasks/edit POST 返回 202。
+-  await page.route('**/api/mivo/tasks/edit', async (route) => {
+-    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-sc09' }) })
+-  })
+-
+-  await clickCanvasNode(page, rendererMode, imageId)
+-  await page.waitForSelector('.selection-quick-toolbar')
+-  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+-  await page.waitForSelector('.image-mask-edit-stage')
+-  await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+-  await addPointRegion(page, 0.5, 0.5)
+-  await fillMaskPrompt(page, 'E2E SC-09 submit then Esc')
+-  await page.locator('.image-mask-edit-prompt').getByRole('button', { name: 'Inpaint' }).click()
+-  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+-  // 提交后 chat panel 应出现 generating 卡片（先确保 panel 展开）。
+-  if (await page.locator('.ai-panel.collapsed').isVisible()) {
+-    await page.getByRole('button', { name: 'Open AI panel' }).click()
+-    await page.waitForSelector('.chat-composer-textarea', { state: 'visible' })
+-  }
+-  await page.waitForSelector('.chat-message-assistant .chat-generating-indicator', { timeout: 5000 })
+-  // 等 /tasks/edit POST 落地（提交已发出）。
+-  await new Promise((r) => setTimeout(r, 300))
+-
+-  // 提交后按 Esc —— 不应 cancel task（Esc 只在 overlay 打开时关 overlay，overlay 已关）。
+-  const deleteBeforeEsc = sc09DeleteCount
+-  await page.keyboard.press('Escape')
+-  await new Promise((r) => setTimeout(r, 400))
+-  if (sc09DeleteCount !== deleteBeforeEsc) {
+-    throw new Error(`SC-09: Esc after submit must not DELETE task, got ${sc09DeleteCount - deleteBeforeEsc} DELETE(s)`)
+-  }
+-  // 卡片仍 generating（GET 挂起，未 done 也未 error）。
+-  const sc09CardWhilePending = await page.evaluate(() => {
+-    const last = document.querySelector('.chat-message-assistant:last-child')
+-    if (!last) return { found: false }
+-    return {
+-      found: true,
+-      hasGenerating: Boolean(last.querySelector('.chat-generating-indicator') || last.querySelector('.chat-thinking-placeholder')),
+-      hasError: Boolean(last.querySelector('.chat-error-row')),
+-    }
+-  })
+-  if (!sc09CardWhilePending.found || (!sc09CardWhilePending.hasGenerating) || sc09CardWhilePending.hasError) {
+-    throw new Error(`SC-09: card should still be generating after Esc (no cancel), got: ${JSON.stringify(sc09CardWhilePending)}`)
+-  }
+-
+-  // Release GET → done。
+-  releaseSc09Get()
+-  await page.waitForSelector('.chat-message-assistant .chat-result-image', { timeout: 10000 })
+-
+-  // 清理 SC-09 路由。
+-  await page.unroute('**/api/mivo/tasks/*')
+-  await page.unroute('**/api/mivo/enhance')
+-  await page.unroute('**/api/mivo/tasks/edit')
+-
+-  // FIX-2: deleting the target image while mask edit is active must clear all mask edit state.
+-  const deleteCase = await page.evaluate(async (moduleSpec) => {
+-    const { useCanvasStore } = await import(moduleSpec)
+-    useCanvasStore.getState().createCanvas('E2E Mask Delete Target')
+-    useCanvasStore.getState().addImportedImage('/demo-assets/courage-1.jpg', 'delete-source', 'source', { x: -120, y: 0 }, {
+-      dimensions: { width: 320, height: 320 },
+-      mimeType: 'image/jpeg',
+-      originalName: 'delete-source.jpg',
+-    })
+-    const sourceId = useCanvasStore.getState().nodes.at(-1).id
+-    useCanvasStore.getState().addImportedImage('/demo-assets/courage-1.jpg', 'survivor-source', 'source', { x: 260, y: 0 }, {
+-      dimensions: { width: 320, height: 320 },
+-      mimeType: 'image/jpeg',
+-      originalName: 'survivor-source.jpg',
+-    })
+-    const survivorId = useCanvasStore.getState().nodes.at(-1).id
+-    useCanvasStore.getState().selectNode(undefined)
+-    return { sourceId, survivorId }
+   }, spec)
+-  await page.waitForFunction(() => !document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
+-  await dockMaskButton.click()
+-  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+-  const deleteSourceBox = await nodeScreenRect(page, rendererMode, deleteCase.sourceId)
+-  if (!deleteSourceBox) throw new Error('FIX-2: delete source image should be visible')
+-  await page.mouse.click(deleteSourceBox.x + deleteSourceBox.width * 0.5, deleteSourceBox.y + deleteSourceBox.height * 0.5)
+-  await page.waitForSelector('.image-mask-edit-stage')
+-  // #154: armed 首击只开浮层不落 point(deleteCase.sourceId 新图,draft 空,region=0)。
+-  // FIX-2 测"删目标图清 mask edit state",须先构造一个可清理的 region 再删——否则空仓
+-  // 删除时若清理路径回归成 saveMaskEditDraft 残留 region,断言仍绿(漏报)。原
+-  // waitForRegionCount(1) 前提(armed 首击落 point)被 #154 移除,这里手动切点选补 region。
+-  await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+-  await addPointRegion(page, 0.5, 0.5)
+-  await waitForRegionCount(page, 1)
+-  await page.waitForFunction(() => document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
+-  await page.keyboard.press('Delete')
+-  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+-  await page.waitForFunction(
+-    async ({ sourceId, leaferMode, moduleSpec }) => {
+-      if (document.querySelector(`[data-node-id="${sourceId}"]`)) return false
+-      if (!leaferMode) return true
+-      // leafer 模式 image 本就无 DOM,"删除完成"以 store 中节点消失为证据。
+-      const { useCanvasStore } = await import(moduleSpec)
+-      return !useCanvasStore.getState().nodes.some((node) => node.id === sourceId)
+-    },
+-    { sourceId: deleteCase.sourceId, leaferMode, moduleSpec: spec },
+-  )
+-  await page.waitForFunction(() => !document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
+-  // 回归守卫:目标图删除后草稿仓应清空(getMaskEditDraft===undefined)。overlay 卸载
+-  // cleanup(ImageMaskEditOverlay.tsx:548-573)在 !stillExists 时 clearMaskEditDraft;若该
+-  // 清理路径回归成 saveMaskEditDraft 残留上方构造的 region,本断言会红。手动 poll 等被动
+-  // effect cleanup(useEffect cleanup 在 DOM detach 后异步执行)跑完,再断言空仓。
+-  if (isProdTopology) {
+-    console.log('[mask-point] prod: FIX-2 draft-empty regression assertion skipped (dev-only /src/canvas/maskEditDraftStore.ts import — not in prod bridge); delete-survivor DOM assertions still run')
+-  } else {
+-    const deadline = Date.now() + 2000
+-    let draft = null
+-    while (Date.now() < deadline) {
+-      draft = await page.evaluate(async (id) => {
+-        const { getMaskEditDraft } = await import('/src/canvas/maskEditDraftStore.ts')
+-        return getMaskEditDraft(id) ?? null
+-      }, deleteCase.sourceId)
+-      if (draft === null) break
+-      await new Promise((r) => setTimeout(r, 50))
+-    }
+-    if (draft !== null) {
+-      throw new Error(`FIX-2: 删除目标图后草稿应清空(getMaskEditDraft===undefined), got ${JSON.stringify(draft)}`)
+-    }
+-  }
+-  await clickCanvasNode(page, rendererMode, deleteCase.survivorId)
+-  await page.waitForSelector('.selection-quick-toolbar')
++  if (p3Overlay.armed) throw new Error(`P3: 全程不应出现 .mask-armed, got ${JSON.stringify(p3Overlay)}`)
++  if (!p3Overlay.regionEditRoot) throw new Error(`P3: 打开的应是 region-edit(RegionEditOverlay), got ${JSON.stringify(p3Overlay)}`)
++  if (p3Overlay.selectedNodeId !== imageId) throw new Error(`P3: 应保持选中图片 ${imageId}, got ${JSON.stringify(p3Overlay)}`)
++  if (p3Overlay.region !== 0) throw new Error(`P3: 新图打开不应带任何选区(无草稿), got ${JSON.stringify(p3Overlay)}`)
+ 
+-  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+-  await page.waitForSelector('.image-mask-edit-stage')
+-
+-  // ── SC6.1 — toolbar exposes only 点选; default tool=point ──
+-  const toolInfo = await page.evaluate(() => {
+-    const tools = Array.from(document.querySelectorAll('.image-mask-edit-tools button'))
+-    return {
+-      labels: tools.map((b) => (b.getAttribute('aria-label') || b.textContent || '').trim()),
+-      activeLabels: tools.filter((b) => b.classList.contains('active')).map((b) => (b.getAttribute('aria-label') || '').trim()),
+-    }
+-  })
+-  // SC6.1(#154 重写,原"只点选"被四工具推翻):工具条精确四工具(椭圆/矩形/圈选/点选,
+-  // 顺序对齐 ImageMaskEditOverlay.tsx:93-98 toolItems)+ 默认椭圆。矩形/圈选被删或改名必红。
+-  if (toolInfo.labels.length !== EXPECTED_MASK_TOOLS.length ||
+-      !toolInfo.labels.every((label, i) => label === EXPECTED_MASK_TOOLS[i])) {
+-    throw new Error(`SC6.1(#154): 工具条应精确为 ${JSON.stringify(EXPECTED_MASK_TOOLS)}, got ${JSON.stringify(toolInfo.labels)}`)
++  // ── SC6.1 — 工具条精确三工具(点选/矩形/圈选)+ 默认工具=点选 ──
++  // 默认值来源 RegionEditOverlay(restoredDraft?.tool ?? 'point');椭圆 2026-07-31 已
++  // 由用户拍板下线(regionEditTools.ts 头注释),老"四工具+默认椭圆"断言随 #369 作废。
++  if (p3Overlay.tools.length !== EXPECTED_REGION_TOOLS.length ||
++      !p3Overlay.tools.every((label, i) => label === EXPECTED_REGION_TOOLS[i])) {
++    throw new Error(`SC6.1: 工具条应精确为 ${JSON.stringify(EXPECTED_REGION_TOOLS)}, got ${JSON.stringify(p3Overlay.tools)}`)
+   }
+-  if (toolInfo.activeLabels.length !== 1 || toolInfo.activeLabels[0] !== '椭圆') {
+-    throw new Error(`SC6.1(#154): 默认工具应唯一为椭圆, got ${JSON.stringify(toolInfo.activeLabels)}`)
++  if (p3Overlay.activeTool.length !== 1 || p3Overlay.activeTool[0] !== 'Point select') {
++    throw new Error(`SC6.1: 默认工具应唯一为点选(en aria-label 'Point select'), got ${JSON.stringify(p3Overlay.activeTool)}`)
+   }
+ 
+-  // ── SC6.2 — one click → circular region, no block, submit enabled ──
+-  // #154 默认椭圆工具;点选工具下 clickStage 才落 point(同 mask-reflow openMaskPointRegion)。
++  // ── SC6.2 — 点选点一下 → 圆形区 + 可见反馈 + 无拦截 + 提交可用 ──
++  // 默认已是点选;仍显式点一次工具按钮(幂等),防上游默认值变化让本段静默漂移语义。
+   await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+   await addPointRegion(page, 0.5, 0.5)
+-  const afterClick = await regionCounts(page)
+-  if (afterClick.mask < 1) {
+-    throw new Error(`SC6.2: point click should create a circular mask region, got ${JSON.stringify(afterClick)}`)
+-  }
+-  if (afterClick.point !== 0) {
+-    throw new Error(`SC6.2: point click should not leave a standalone point anchor (it is a circle region), got ${JSON.stringify(afterClick)}`)
+-  }
+-  // 回归守卫（bug: 单点 brush 渲染成单点 polyline → 无任何可见反馈）：点选后
+-  // stage SVG 里必须出现紫色坐标 pin 标记（固定屏幕尺寸，尖端锚在点击坐标）。
++  await waitForRegionCount(page, 1)
++  // 可见反馈:点选区渲染薄荷青圆点标记(region-edit-point-dot;老 point-marker/pin
++  // 随 ImageMaskEditOverlay 下线,2026-08-01 用户图3 拍板的新标记形态)。
+   const visiblePointFeedback = await page.evaluate(() => ({
+-    markers: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-marker').length,
+-    pins: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-pin').length,
++    dots: document.querySelectorAll('.region-edit-point-dot').length,
++    leaders: document.querySelectorAll('.region-edit-point-leader').length,
+   }))
+-  if (visiblePointFeedback.markers < 1 || visiblePointFeedback.pins < 1) {
+-    throw new Error(`SC6.2: point click should render coordinate-pin marker feedback, got ${JSON.stringify(visiblePointFeedback)}`)
++  if (visiblePointFeedback.dots < 1 || visiblePointFeedback.leaders < 1) {
++    throw new Error(`SC6.2: 点选应渲染 point-dot + 引导线可见反馈, got ${JSON.stringify(visiblePointFeedback)}`)
+   }
+   const blocked = await page.evaluate(() => {
+     const err = document.querySelector('.image-mask-edit-error')?.textContent || ''
+-    return { errText: err, hasBlockMsg: /请框选或涂抹/.test(err) }
++    return { errText: err, hasBlockMsg: /Selection too small|Lasso too small/.test(err) }
+   })
+   if (blocked.hasBlockMsg) {
+-    throw new Error(`SC6.2: removed guard should not show "请框选或涂抹" prompt, got ${JSON.stringify(blocked.errText)}`)
++    throw new Error(`SC6.2: 点选不应触发"Selection too small"/"Lasso too small"拦截, got ${JSON.stringify(blocked.errText)}`)
+   }
+-  // Fill a prompt and confirm the 局部重绘 submit button is enabled (hasAnyAnchor).
+   await fillMaskPrompt(page, 'E2E point region enabled')
+   const submitDisabled = await page.locator('.image-mask-edit-prompt').getByRole('button', { name: 'Inpaint' }).isDisabled()
+-  if (submitDisabled) throw new Error('SC6.2: submit should be enabled after a point region + prompt')
++  if (submitDisabled) throw new Error('SC6.2: 点选区 + prompt 后提交按钮应可用')
+ 
+-  // ── SC6.6 — multiple circular regions stack; undo/redo/clear work ──
+-  // Keep clicks central (on the image, clear of the floating toolbar/prompt panels).
+-  await addPointRegion(page, 0.44, 0.48)
++  // ── SC6.6 — 多次点选叠加;undo/redo/clear 正常 ──
++  // 点位纵向错开:点选标记带**水平引导线 + 「标记N」胶囊**(向右延伸约百像素),
++  // 同一水平带上的后续点击会落在既有标记的胶囊/引导线上变成"选中"而非新增
++  // (首跑实测 (0.56,0.48) 被 (0.44,0.48) 的胶囊吃掉,stuck at 2)。
++  await addPointRegion(page, 0.35, 0.3)
+   await waitForRegionCount(page, 2)
+-  await addPointRegion(page, 0.56, 0.48)
++  await addPointRegion(page, 0.65, 0.72)
+   await waitForRegionCount(page, 3)
+-
+-  // SC6.6 scope (per plan §8): 多次点选叠加多个圆形区 + clear/undo 正常.
+-  // undo: 3 → 2.
++  // undo: 3 → 2(#386 后 aria-label = t('menu.maskEdit.undo') → en 'Undo')。
+   await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Undo', exact: true }).click()
+   await waitForRegionCount(page, 2)
+-  // clear: → 0.
+-  await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Clear marks', exact: true }).click()
++  // redo: 2 → 3。
++  await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Redo', exact: true }).click()
++  await waitForRegionCount(page, 3)
++  // clear: → 0。
++  await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Clear regions', exact: true }).click()
+   await waitForRegionCount(page, 0)
+ 
+   // Tear down the overlay so the shared page is clean for the next scenario.
+diff --git a/scripts/e2e/scenarios/migration.mjs b/scripts/e2e/scenarios/migration.mjs
+index f611498d..764d75d6 100644
+--- a/scripts/e2e/scenarios/migration.mjs
++++ b/scripts/e2e/scenarios/migration.mjs
+@@ -102,40 +102,27 @@ export const runMigrationScenario = async (context) => {
+       // renderer 参数,就绪信号复用 renderer-evidence 的按渲染器分流封装。
+       await migrationPage.goto(canvasUrl, { waitUntil: 'networkidle' })
+       await writePersistedKv(migrationPage, 'mivo-chat-demo', JSON.stringify(v1State))
+-      // ── FX-6 namespacing 时序修复（根因:非产品 bug,是本场景注入时序缺陷）──
++      // ── FX-6 namespacing 时序(#360 方案B:stale-raw 重查认领)──
+       // dev 拓扑 auth stub 返回 dev@local(已认证)→ app 的 idbStateStorage.getItem 经
+-      // FX-6 namespacing:migrateToNamespaced(src/lib/persistIdbStorage.ts:157-194) 把 legacy
+-      // raw key 认领到 namespaced key `mivo-chat-demo:<uid>`。该认领是 one-shot latch:
+-      // marker(`mivo-ns-migrated:<name>:<uid>`)置位后,后续 getItem 不再查 legacy raw key;
+-      // **且"什么都没找到"也会置位 marker**(persistIdbStorage.ts:188 注释原话:
+-      // "Whether we copied or found nothing... mark")。
++      // FX-6 namespacing:migrateToNamespaced(src/lib/persistIdbStorage.ts) 把 legacy raw key
++      // 认领到 namespaced key `mivo-chat-demo:<uid>`。
+       //
+-      // 本场景注入序列恰好踩中这条 latch:
++      // #360 方案B(2026-08-01 owner 拍板)取消了原 one-shot latch marker(`mivo-ns-migrated:`):
++      // namespaced key 为空时,每次 getItem 都重查 legacy raw key(认领 = copy raw→namespaced +
++      // delete raw,单 readwrite 事务原子化见 codex-B2);namespaced 已有数据时 raw 不覆盖(防
++      // stale raw 倒灌)。故本场景注入序列不再需要"清 marker"步骤——reload 后 getItem 见
++      // namespaced 空、重查 raw、认领刚写入的 v1 blob。
++      //
++      // 本场景注入序列:
+       //   1) goto(空 IDB)→ app 首次 rehydrate → migrateToNamespaced 跑在空 IDB、未找到 legacy
+-      //      raw key → **置位 marker**(没找到也置位);
++      //      raw key → namespaced 仍空(无 marker,下次仍会重查);
+       //   2) writePersistedKv 写 legacy raw key `mivo-chat-demo`(v1 blob,见上);
+-      //   3) reload → app rehydrate → migrateToNamespaced 见 marker 已置位 → **短路、不再查
+-      //      raw key** → 读 namespaced key(不存在)→ null → chatStore hydrate 成默认空状态
+-      //      → legacyUser undefined → clamp 断言"got undefined"(伪装成 clamp 坏,实为没 hydrate)。
+-      //
+-      // 修复:writePersistedKv 之后、reload 之前清掉所有 `mivo-ns-migrated:` 前缀的 marker,
+-      // 让 reload 的 getItem 重跑 migrateToNamespaced、认领刚写入的 legacy raw v1 blob
+-      // (copy raw→namespaced + delete raw,见下方 SC5' 认领断言)。前缀匹配顺带覆盖 canvas
+-      // store 的 marker,无副作用(此时无 canvas legacy 注入,清 marker 仅让下次 getItem 重新
+-      // 走认领逻辑;空 IDB 仍置位 marker,行为等价)。
++      //   3) reload → app rehydrate → migrateToNamespaced 见 namespaced 空、重查 raw → 认领 v1 blob
++      //      → chatStore hydrate 拿到 legacy 数据(见下方 SC5' 认领断言)。
+       //
+       // prod 拓扑不受影响:prod mock /api/auth/me→{authenticated:false}→ getPersistUserId()
+-      // 返回 anonymous → migrateToNamespaced 对 anonymous 早返回(persistIdbStorage.ts:159),
+-      // app 直接读 raw key `mivo-chat-demo`(不经 namespacing)→ 拿到 v1 blob → migrate v1→v2
+-      // → 断言过。本清 marker 操作在 prod 也跑(无 `mivo-ns-migrated:` marker 可清,空操作)。
+-      await migrationPage.evaluate(() => {
+-        const keys = []
+-        for (let i = 0; i < sessionStorage.length; i += 1) {
+-          const k = sessionStorage.key(i)
+-          if (k && k.startsWith('mivo-ns-migrated:')) keys.push(k)
+-        }
+-        for (const k of keys) sessionStorage.removeItem(k)
+-      })
++      // 返回 anonymous → migrateToNamespaced 对 anonymous 早返回,app 直接读 raw key
++      // `mivo-chat-demo`(不经 namespacing)→ 拿到 v1 blob → migrate v1→v2 → 断言过。
+       await migrationPage.reload({ waitUntil: 'networkidle' })
+       await waitForCanvasReady(migrationPage, rendererMode, { timeout: 15000 })
+       const migrated = await migrationPage.evaluate(async () => {
+diff --git a/server/index.ts b/server/index.ts
+index f335bfbd..c6c00bca 100644
+--- a/server/index.ts
++++ b/server/index.ts
+@@ -71,6 +71,43 @@ const startCompensationSweep = async (): Promise<void> => {
+   }, 60_000)
+ }
+ 
++// #313 周期 asset reaper:MIVO_ENABLE_ASSET_SERVICE=1 时启用。runScheduledReap 只清
++// 「attach 过又归零 + 7 天 grace 到期」的确定孤儿;从未 attach 的资产(含 demo/local-only
++// 画布结构性 unattached 引用,服务端无法区分)一律豁免(exempted 计数留痕)——硬约束见
++// issue #313 2026-07-30 评论。间隔 MIVO_ASSET_REAPER_INTERVAL_MS(默认 6h,设 0 关闭)。
++// 非重入:上一轮未结束跳过本轮(fail-visible warn),防 listRecords 慢时定时器堆叠。
++const startAssetReaper = (): void => {
++  if (!sharedAssetStore) return
++  const raw = process.env.MIVO_ASSET_REAPER_INTERVAL_MS
++  const intervalMs = raw === undefined ? 6 * 60 * 60 * 1000 : Number(raw)
++  if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
++    console.log(`[mivo-bff] asset reaper disabled (MIVO_ASSET_REAPER_INTERVAL_MS=${raw})`)
++    return
++  }
++  const store = sharedAssetStore
++  let running = false
++  const reap = async (label: string): Promise<void> => {
++    if (running) {
++      console.warn(`[mivo-bff] asset reaper(${label}) skipped: previous run still in progress`)
++      return
++    }
++    running = true
++    try {
++      const r = await store.runScheduledReap()
++      if (r.purged > 0 || r.exempted > 0) {
++        console.log(`[mivo-bff] asset reaper(${label}): purged=${r.purged} exempted-never-attached=${r.exempted} scanned=${r.scanned}`)
++      }
++    } catch (err) {
++      console.warn(`[mivo-bff] asset reaper(${label}) failed: ${err instanceof Error ? err.message : String(err)}`)
++    } finally {
++      running = false
++    }
++  }
++  void reap('startup')
++  setInterval(() => void reap('interval'), intervalMs)
++  console.log(`[mivo-bff] asset reaper enabled: interval=${intervalMs}ms (never-attached assets exempt — #313)`)
++}
++
+ const start = async (): Promise<void> => {
+   await Promise.all([sharedPersistBackend.ready, sharedPermissionBackend.ready])
+   // 顺序:G2.1 strict 三域 gate(fail-closed 拒启动)必须先于 P-6 saga sweep 启动——
+@@ -92,6 +129,8 @@ const start = async (): Promise<void> => {
+   )
+   // P-6 saga sweep:gate 通过后启动恢复(reconcile)+ 周期有界 sweep(60s);仅 PG 后端有跨重启语义,memory no-op。
+   void startCompensationSweep()
++  // #313 asset reaper:gate 通过后启动(startup 一轮 + 周期);asset service off → no-op。
++  startAssetReaper()
+   serve({ fetch: app.fetch, hostname: HOSTNAME, port: PORT }, (info) => {
+     const bound = `${info.address}:${info.port}`
+     const mode = PUBLIC_MODE ? 'public 0.0.0.0 (behind SSO gateway)' : 'local 127.0.0.1'
+diff --git a/server/lib/assetStore.test.ts b/server/lib/assetStore.test.ts
+index c650778b..1c3290e0 100644
+--- a/server/lib/assetStore.test.ts
++++ b/server/lib/assetStore.test.ts
+@@ -892,3 +892,313 @@ describe('assetStore — writeAtomic cause chain (P3-G)', () => {
+     }
+   })
+ })
++
++// ── #313:runScheduledReap(周期 reaper,demo 豁免硬约束)+ deleteUnattached ──────────
++describe('assetStore — runScheduledReap (#313 periodic reaper, never-attached exempt)', () => {
++  it('grace 到期:attach 过又归零 → purged;从未 attach(demo 结构性 unattached)→ exempted 不清', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const NOW = 100_000_000
++    // 确定孤儿:attach → detach 归零,grace 已过。
++    const orphan = await store.upload(pngBytes('reap-orphan'), 'image/png', 'o.png', OWNER_A, 1000)
++    await store.attach(orphan.assetId, 'n-o', OWNER_A, 2000)
++    await store.detach(orphan.assetId, 'n-o', OWNER_A, NOW - ASSET_GRACE_PERIOD_MS - 1000)
++    // demo 形态:上传后从未 attach(lastRefZeroAt=uploadTime,grace 同样已过)。
++    const demoLike = await store.upload(pngBytes('reap-demo'), 'image/png', 'd.png', OWNER_A, NOW - ASSET_GRACE_PERIOD_MS - 1000)
++    // 活资产:有引用。
++    const alive = await store.upload(pngBytes('reap-alive'), 'image/png', 'a.png', OWNER_A, 1000)
++    await store.attach(alive.assetId, 'n-a', OWNER_A, 2000)
++
++    const r = await store.runScheduledReap(NOW)
++    expect(r.scanned).toBe(3)
++    expect(r.purged).toBe(1)
++    expect(r.exempted).toBe(1)
++    expect(await store.getRecord(orphan.assetId)).toBeNull() // 确定孤儿被清
++    expect(await store.getRecord(demoLike.assetId)).not.toBeNull() // 从未 attach → 豁免
++    expect(await store.getRecord(alive.assetId)).not.toBeNull()
++  })
++
++  it('对比基线:runPurgeSweep(配额/全量路径)对同一状态会清掉从未 attach 的到期资产 —— reaper 的豁免是新增语义而非重复', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const NOW = 100_000_000
++    const demoLike = await store.upload(pngBytes('sweep-demo'), 'image/png', 'd.png', OWNER_A, NOW - ASSET_GRACE_PERIOD_MS - 1000)
++    const r = await store.runPurgeSweep(NOW)
++    expect(r.purged).toBe(1)
++    expect(await store.getRecord(demoLike.assetId)).toBeNull()
++  })
++
++  it('grace 未到期的确定孤儿不清(reaper 不绕过 grace)', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const NOW = 100_000_000
++    const recent = await store.upload(pngBytes('reap-recent'), 'image/png', 'r.png', OWNER_A, 1000)
++    await store.attach(recent.assetId, 'n-r', OWNER_A, 2000)
++    await store.detach(recent.assetId, 'n-r', OWNER_A, NOW - 1000)
++    const r = await store.runScheduledReap(NOW)
++    expect(r.purged).toBe(0)
++    expect(r.exempted).toBe(0)
++    expect(await store.getRecord(recent.assetId)).not.toBeNull()
++  })
++})
++
++describe('assetStore — deleteUnattached (#313 owner explicit reclaim)', () => {
++  it('uploader + refcount==0 → deleted(不等 grace);bytes/record 消失', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const { assetId } = await store.upload(pngBytes('del-ok'), 'image/png', 'x.png', OWNER_A, 1000)
++    // 刚上传(grace 远未到期)也可显式删——显式意图不需要冷静期。
++    const r = await store.deleteUnattached(assetId, OWNER_A, 2000)
++    expect(r.kind).toBe('deleted')
++    expect(await store.getRecord(assetId)).toBeNull()
++    expect(be._bytes.has(assetId)).toBe(false)
++  })
++
++  it('非 uploader → not-uploader,资产保留', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const { assetId } = await store.upload(pngBytes('del-owner'), 'image/png', 'x.png', OWNER_A, 1000)
++    const r = await store.deleteUnattached(assetId, OWNER_B, 2000)
++    expect(r.kind).toBe('not-uploader')
++    expect(await store.getRecord(assetId)).not.toBeNull()
++  })
++
++  it('refcount>0 → has-references,资产保留;detach 归零后可删', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const { assetId } = await store.upload(pngBytes('del-refs'), 'image/png', 'x.png', OWNER_A, 1000)
++    await store.attach(assetId, 'n-1', OWNER_A, 2000)
++    expect((await store.deleteUnattached(assetId, OWNER_A, 3000)).kind).toBe('has-references')
++    expect(await store.getRecord(assetId)).not.toBeNull()
++    await store.detach(assetId, 'n-1', OWNER_A, 4000)
++    expect((await store.deleteUnattached(assetId, OWNER_A, 5000)).kind).toBe('deleted')
++  })
++
++  it('missing → missing(幂等重删安全)', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const { assetId } = await store.upload(pngBytes('del-twice'), 'image/png', 'x.png', OWNER_A, 1000)
++    await store.deleteUnattached(assetId, OWNER_A, 2000)
++    expect((await store.deleteUnattached(assetId, OWNER_A, 3000)).kind).toBe('missing')
++  })
++})
++
++// ── codex-B1:deleteIfSoleUploaderZeroRefs——原子 sole-uploader 判定,堵代际越权 ──────────
++describe('assetStore — deleteUnattached 代际越权防护 (codex-B1 sole-uploader atomic)', () => {
++  it('代际竞态:旧 record 删除+他人同 hash 重上传后,stale 请求不得删掉新代资产', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const bytes = pngBytes('generational')
++    // A 上传 H(A sole uploader,refs=0)——stale 请求"检查时"看到的旧 record。
++    const { assetId } = await store.upload(bytes, 'image/png', 'a.png', OWNER_A, 1000)
++    expect(be._uploaders.get(assetId)?.has(OWNER_A)).toBe(true)
++    // 模拟"检查后 await 让位"期间的代际更替:reaper/他人删掉 A 的 record + B 同 hash 重上传
++    // (新代 record:B sole uploader,A 不在 uploaders;refs=0)。memory backend 同步无天然 await 间隙,
++    // 直接操作内部态精确模拟该时序(真 IDB 下这段发生在 deleteUnattached 两个 await 之间)。
++    be._records.delete(assetId)
++    be._bytes.delete(assetId)
++    be._uploaders.delete(assetId)
++    await store.upload(bytes, 'image/png', 'b.png', OWNER_B, 2000)
++    expect(be._uploaders.get(assetId)?.has(OWNER_B)).toBe(true)
++    expect(be._uploaders.get(assetId)?.has(OWNER_A)).toBe(false)
++    // A 的 stale 删除请求:旧 deleteUnattached 锁外已通过 uploader 检查,锁内 deleteIfStillEligible
++    //   只复查 refcount → 会误删 B 的新代资产。新原子方法锁内复查 uploader → A 非新代 uploader → not-uploader。
++    expect((await store.deleteUnattached(assetId, OWNER_A, 3000)).kind).toBe('not-uploader')
++    // B 的新代资产幸存(record + bytes 都在)。
++    expect(be._records.has(assetId)).toBe(true)
++    expect(be._bytes.has(assetId)).toBe(true)
++    // B 自己仍可正常删(sole uploader + refs=0)。
++    expect((await store.deleteUnattached(assetId, OWNER_B, 4000)).kind).toBe('deleted')
++    expect(be._records.has(assetId)).toBe(false)
++  })
++
++  it('dedup 双上传者:任一方 DELETE → shared-uploaders,资产保留(不得单方面删走对方字节)', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const bytes = pngBytes('co-uploaded')
++    const { assetId } = await store.upload(bytes, 'image/png', 'a.png', OWNER_A, 1000)
++    await store.upload(bytes, 'image/png', 'b.png', OWNER_B, 2000) // dedup → uploaders={A,B}
++    expect(be._uploaders.get(assetId)?.size).toBe(2)
++    expect((await store.deleteUnattached(assetId, OWNER_A, 3000)).kind).toBe('shared-uploaders')
++    expect(be._records.has(assetId)).toBe(true)
++    expect(be._bytes.has(assetId)).toBe(true)
++    expect((await store.deleteUnattached(assetId, OWNER_B, 4000)).kind).toBe('shared-uploaders')
++    expect(be._records.has(assetId)).toBe(true)
++  })
++
++  it('shared-uploaders 优先于 has-references(双上传者即使有引用也 409 shared,不得单方面删)', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const bytes = pngBytes('co-with-refs')
++    const { assetId } = await store.upload(bytes, 'image/png', 'a.png', OWNER_A, 1000)
++    await store.upload(bytes, 'image/png', 'b.png', OWNER_B, 2000) // uploaders={A,B}
++    await store.attach(assetId, 'n-a', OWNER_A, 3000) // refs=1,但 uploaders 仍 2
++    expect((await store.deleteUnattached(assetId, OWNER_A, 4000)).kind).toBe('shared-uploaders')
++    expect(be._records.has(assetId)).toBe(true)
++  })
++})
++
++// ── codex-R3-E1(blocker):owner 触发的配额 purge 不得删掉共上传者仍可读的资产 ────────
++// 洞的形状:purgeOwnerEligible 按 record.ownerFp 选中资产后,原先调只查 grace/refcount 的
++//   deleteIfStillEligible —— 于是首上传者 A 只要制造一次配额压力,就能删掉 dedup 共上传者 B
++//   仍持读权限的字节,绕过显式 DELETE 的 sole-uploader 门(跨 owner 拒绝服务)。
++// 修法:purge 改走 deleteIfSoleUploaderPurgeEligible(锁内重读 uploaders,共上传即跳过)。
++describe('assetStore — owner quota purge 不越权删共上传资产 (codex-R3-E1)', () => {
++  it('A 制造配额压力触发 purge → 共上传资产被跳过(B 仍可读),独占资产照常回收', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    // A 名下两个 grace 到期、refcount 0 的资产:一个被 B dedup 共上传,一个 A 独占。
++    // 二者对 purge 的唯一差别就是 uploaders.size —— 正是本 blocker 要求锁内重读的那一位。
++    const shared = pngBytes('shared-ab')
++    const solo = pngBytes('solo-a-old')
++    const sharedUp = await store.upload(shared, 'image/png', 's.png', OWNER_A, 1000)
++    const soloUp = await store.upload(solo, 'image/png', 'o.png', OWNER_A, 1000)
++    await store.upload(shared, 'image/png', 's.png', OWNER_B, 2000) // dedup → uploaders={A,B}
++    expect((await be.listUploaders(sharedUp.assetId)).sort()).toEqual([OWNER_A, OWNER_B].sort())
++    expect(await be.listUploaders(soloUp.assetId)).toEqual([OWNER_A])
++    // 从未 attach ⇒ refcount 0 且 lastRefZeroAt 自上传起计时;推进到两者 grace 均到期。
++    const AFTER_GRACE = 2000 + ASSET_GRACE_PERIOD_MS + 1
++    expect(isPurgeEligible((await store.getRecord(sharedUp.assetId))!, AFTER_GRACE)).toBe(true)
++    expect(isPurgeEligible((await store.getRecord(soloUp.assetId))!, AFTER_GRACE)).toBe(true)
++    expect(await store.readForOwner(sharedUp.assetId, OWNER_B)).not.toBeNull() // B 此刻可读
++
++    // 配额只容得下"保留的共上传 + 新文件"→ 新上传必须先经 purge 腾出 solo 的空间才放得进。
++    // (used = shared + solo > quota - fresh ⇒ 走 purgeOwnerEligible 慢路径)
++    const fresh = pngBytes('a-fresh-1')
++    const outcome = await store.uploadWithQuota(
++      fresh, 'image/png', 'f.png', OWNER_A, shared.length + fresh.length, AFTER_GRACE,
++    )
++
++    // 三条一起钉住修复的完整语义:
++    //  1) purge 真的跑了 —— A 独占的那个被回收(修复没把 purge 整体锁死);
++    //  2) 共上传的那个被跳过,B/A 仍可读(旧实现在此全红:它会连 B 的字节一起删);
++    //  3) 腾出 solo 的空间后新上传放得进 —— 跳过共上传不等于让 A 传不了东西。
++    expect(await store.getRecord(soloUp.assetId)).toBeNull()
++    expect(await store.getRecord(sharedUp.assetId)).not.toBeNull()
++    expect(await store.readForOwner(sharedUp.assetId, OWNER_B)).not.toBeNull()
++    expect(await store.readForOwner(sharedUp.assetId, OWNER_A)).not.toBeNull()
++    expect(outcome.kind).toBe('ok')
++  })
++
++  // claude-R4-A1:分项计数是那条配额权衡唯一的运行时信号,必须钉住 —— 否则"purge 跑了但
++  // 共上传全被门跳过"与"根本没有可清的东西"在生产日志上无法区分(route 用它写 413 的 note)。
++  it('purge 分项计数如实出到 quota-exceeded 上(skippedShared 是权衡在生效的唯一信号)', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const shared = pngBytes('cnt-shared-ab')
++    await store.upload(shared, 'image/png', 's.png', OWNER_A, 1000)
++    await store.upload(shared, 'image/png', 's.png', OWNER_B, 2000) // dedup → uploaders={A,B}
++    const AFTER_GRACE = 2000 + ASSET_GRACE_PERIOD_MS + 1
++
++    const fresh = pngBytes('cnt-fresh')
++    const outcome = await store.uploadWithQuota(
++      fresh, 'image/png', 'f.png', OWNER_A, fresh.length + 1, AFTER_GRACE,
++    )
++    expect(outcome.kind).toBe('quota-exceeded')
++    if (outcome.kind !== 'quota-exceeded') throw new Error('unreachable')
++    // 慢路径跑过 → 必须带分项;共上传那个被门跳过 → skippedShared=1、purged=0。
++    expect(outcome.purge).toEqual({ scanned: 1, purged: 0, skippedShared: 1, notEligible: 0 })
++  })
++
++  it('权衡:A 名下只有共上传资产时撞配额 → 拿 quota-exceeded 而非删掉 B 的字节', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const shared = pngBytes('shared-only-ab')
++    const up = await store.upload(shared, 'image/png', 's.png', OWNER_A, 1000)
++    await store.upload(shared, 'image/png', 's.png', OWNER_B, 2000) // dedup → uploaders={A,B}
++    const AFTER_GRACE = 2000 + ASSET_GRACE_PERIOD_MS + 1
++    expect(isPurgeEligible((await store.getRecord(up.assetId))!, AFTER_GRACE)).toBe(true)
++
++    // A 名下没有任何"独占的 grace 到期资产"可腾 → purge 无可回收项,配额压力无解。
++    const fresh = pngBytes('a-fresh-3')
++    const outcome = await store.uploadWithQuota(
++      fresh, 'image/png', 'f.png', OWNER_A, fresh.length + 1, AFTER_GRACE,
++    )
++
++    // 这是 §4.4 记录的自觉取舍:宁可 A 传不进,也不能让 A 删掉 B 仍可读的字节。
++    // 本用例存在的意义是把这个代价钉成契约 —— 将来有人为了"让 A 传进去"放宽跳过条件,
++    // 必须先在这里变红、被迫正面回答"那 B 的读权限怎么办"。
++    expect(outcome.kind).toBe('quota-exceeded')
++    expect(await store.getRecord(up.assetId)).not.toBeNull()
++    expect(await store.readForOwner(up.assetId, OWNER_B)).not.toBeNull()
++  })
++
++  it('fs 后端同样跳过共上传资产(锁内重读 uploaders 走的是真实文件,不是内存 Map)', async () => {
++    const root = await mkdtemp(join(tmpdir(), 'mivo-asset-r3e1-'))
++    try {
++      const be = createFsAssetBackend(root)
++      const store = createAssetStore(be)
++      const shared = pngBytes('fs-shared-ab')
++      const solo = pngBytes('fs-solo-a')
++      const sharedUp = await store.upload(shared, 'image/png', 's.png', OWNER_A, 1000)
++      const soloUp = await store.upload(solo, 'image/png', 'o.png', OWNER_A, 1000)
++      await store.upload(shared, 'image/png', 's.png', OWNER_B, 2000) // dedup → uploaders={A,B}
++      const AFTER_GRACE = 2000 + ASSET_GRACE_PERIOD_MS + 1
++
++      const fresh = pngBytes('fs-a-fresh')
++      const outcome = await store.uploadWithQuota(
++        fresh, 'image/png', 'f.png', OWNER_A, shared.length + fresh.length, AFTER_GRACE,
++      )
++
++      expect(await store.getRecord(soloUp.assetId)).toBeNull()          // 独占被回收
++      expect(await store.getRecord(sharedUp.assetId)).not.toBeNull()    // 共上传被跳过
++      expect(await store.readForOwner(sharedUp.assetId, OWNER_B)).not.toBeNull()
++      expect(outcome.kind).toBe('ok')
++    } finally {
++      await rm(root, { recursive: true, force: true })
++    }
++  })
++
++  it('分项 purged 也必须被钉住:独占资产被清但仍超额 → purged=1 且拿 quota-exceeded', async () => {
++    // claude-R5-C1:上一条用例里 purged 恒为 0,所以"把 `if (res.deleted) summary.purged += 1`
++    // 拿掉"这类变异**保持全绿** —— 而它的后果正是本修复要防的同一类误诊:413 日志从此永远
++    // 写 purged=0,运维会把"清了 N 个仍不够"读成"名下无可回收资产",把 sole-uploader 权衡
++    // 是否在生效判反。所以需要一个 purged>0 的场景把这一位也钉住。
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const solo = pngBytes('purged-solo-a')
++    const soloUp = await store.upload(solo, 'image/png', 'o.png', OWNER_A, 1000)
++    expect(await be.listUploaders(soloUp.assetId)).toEqual([OWNER_A])
++    const AFTER_GRACE = 1000 + ASSET_GRACE_PERIOD_MS + 1
++
++    // 配额刻意取 fresh.length - 1:purge 把独占那个腾掉后 used 归 0,但**仍**容不下新文件
++    // → 既走到了 purge(purged=1),又落在 quota-exceeded 分支(才有 purge 分项可断言)。
++    const fresh = pngBytes('purged-fresh')
++    const outcome = await store.uploadWithQuota(
++      fresh, 'image/png', 'f.png', OWNER_A, fresh.length - 1, AFTER_GRACE,
++    )
++    expect(outcome.kind).toBe('quota-exceeded')
++    if (outcome.kind !== 'quota-exceeded') throw new Error('unreachable')
++    expect(outcome.purge).toEqual({ scanned: 1, purged: 1, skippedShared: 0, notEligible: 0 })
++    expect(await store.getRecord(soloUp.assetId)).toBeNull() // 确实清掉了,不是计数虚报
++  })
++
++  it('对照:A 独占上传的 grace 到期资产仍被 purge 正常回收(修复没把 purge 锁死)', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const solo = pngBytes('solo-a')
++    const up = await store.upload(solo, 'image/png', 's.png', OWNER_A, 1000)
++    expect(await be.listUploaders(up.assetId)).toEqual([OWNER_A])
++    const AFTER_GRACE = 1000 + ASSET_GRACE_PERIOD_MS + 1
++    const fresh = pngBytes('a-fresh-2')
++    const outcome = await store.uploadWithQuota(
++      fresh, 'image/png', 'f.png', OWNER_A, fresh.length + 1, AFTER_GRACE,
++    )
++    expect(outcome.kind).toBe('ok')
++    expect(await store.getRecord(up.assetId)).toBeNull() // 独占 → 照常清
++  })
++
++  it('对照:grace 未到期的独占资产不被 purge(锁内仍复查 grace)', async () => {
++    const be = createMemoryAssetBackend()
++    const store = createAssetStore(be)
++    const solo = pngBytes('solo-fresh')
++    const up = await store.upload(solo, 'image/png', 's.png', OWNER_A, 1000)
++    const fresh = pngBytes('a-fresh-3')
++    // 配额只够一个 + grace 未到期 → purge 清不掉 → 新上传应被拒(413),旧资产留存。
++    const outcome = await store.uploadWithQuota(
++      fresh, 'image/png', 'f.png', OWNER_A, fresh.length + 1, 2000,
++    )
++    expect(outcome.kind).toBe('quota-exceeded')
++    expect(await store.getRecord(up.assetId)).not.toBeNull()
++  })
++})
+diff --git a/server/lib/assetStore.ts b/server/lib/assetStore.ts
+index ade1f11c..76688cfd 100644
+--- a/server/lib/assetStore.ts
++++ b/server/lib/assetStore.ts
+@@ -137,6 +137,16 @@ export type AssetRecord = {
+   /** Wall-clock ms when references last dropped to 0 (grace start). null while refs > 0.
+    *  Stamped at creation too if created with 0 refs (uploaded, no attach yet). */
+   lastRefZeroAt: number | null
++  /**
++   * #313 周期 reaper 的 demo 豁免判据:该 asset 是否**曾经**被 attach 过(attachRef 置位,
++   * 永不回退)。demo/local-only 画布的资产结构性从不 attach(canvas sync 对 demo 整体跳过,
++   * attach 随之不发生)——服务端无法区分"demo 画布本地引用中"与"真孤儿",故周期 reaper
++   * 只清 everAttached===true(attach 过又 detach 归零)的确定孤儿;从未 attach 的资产
++   * 仅在 owner 撞配额时经 purgeOwnerEligible 定向回收(既有行为)或 owner 显式 DELETE。
++   * 可选字段:存量 meta JSON 无此键(= 从未 attach 或写于本字段之前,一律按未 attach 豁免,
++   * fail-safe——宁可少清不可误删 demo 引用)。
++   */
++  everAttached?: boolean
+ }
+ 
+ /** Fields needed to create a fresh record (references/lastRefZeroAt are derived). */
+@@ -162,7 +172,27 @@ export type UploadedAsset = {
+  *  NOT trip the quota — a re-upload of already-stored bytes is always allowed. */
+ export type QuotaUploadOutcome =
+   | { kind: 'ok'; result: UploadedAsset }
+-  | { kind: 'quota-exceeded'; used: number; quota: number; size: number }
++  | { kind: 'quota-exceeded'; used: number; quota: number; size: number; purge?: OwnerPurgeSummary }
++
++/** 一次 owner 定向 purge 的结果分项(claude-R4-A1)。为什么必须出得来:共上传资产被
++ *  sole-uploader 门跳过后仍占着首上传者配额,若这里不留痕,运维只会看到一个**无解释的
++ *  413** —— "purge 跑了但按门全数跳过"和"根本没有可清的东西"在日志上无法区分。
++ *  本仓对同类静默已有先例:runScheduledReap 返回 exempted、由 server/index.ts 打点,
++ *  注释理由正是"防 reaper 跑了却什么都没清误判"。此处对齐该标准。
++ *  分层:assetStore 是纯 lib(零 console),计数由本类型出到调用方(route)去打日志。 */
++export type OwnerPurgeSummary = {
++  /** 本 owner 名下被扫到的 grace 到期候选数 */
++  scanned: number
++  /** 实际删掉的(独占上传 + grace 到期 + refcount 0) */
++  purged: number
++  /** 因 dedup 共上传被 sole-uploader 门跳过的 —— 这一项 >0 就是那条配额权衡在生效 */
++  skippedShared: number
++  /** 锁内复查后**未删**的其余情形。主因是并发 attach/detach 重置了 grace(`not-eligible`),
++   *  但 `else` 分支同时吸走 `missing`(记录已被别处删掉)与 `not-uploader`(理论不可达:upload 必写
++   *  ownerFp,rekey 在同一把 hash 锁内同时改 record 与 .uploaders)。**读生产日志时不要把
++   *  notEligible>0 一律当成 grace 竞态**(claude 审查席 appendix 提醒)。 */
++  notEligible: number
++}
+ 
+ export type AttachResult =
+   | { kind: 'attached' } // new reference inserted
+@@ -227,6 +257,34 @@ export type AssetStoreBackend = {
+    *  invisible FIRST (rename to tombstone), then delete bytes + uploaders + tombstone.
+    *  Any failure leaves "orphan bytes/uploaders, no record" — never "record, no bytes". */
+   deleteIfStillEligible(contentHash: string, now: number): Promise<{ deleted: boolean; reason: 'eligible' | 'not-eligible' | 'missing' }>
++  /**
++   * #313 + codex-R3-E1(blocker):**owner 触发的**配额 purge 专用原子原语。锁内依次查:
++   * record 存在 → ownerFp ∈ uploaders → uploaders 独占(>1 → shared-uploaders,**跳过不删**)
++   * → isPurgeEligible(refcount==0 + grace 到期,与 deleteIfStillEligible 同判据)。
++   *
++   * 为什么必须独立于 deleteIfStillEligible:purgeOwnerEligible 是**由某个 owner 的上传动作触发、
++   * 按 record.ownerFp 选中**的定向清理。若锁内不查 uploaders,首上传者 A 只要制造一次配额压力,
++   * 就能删掉 dedup 共上传者 B 仍持读权限的字节 —— 绕过显式 DELETE 的 sole-uploader 门,构成跨
++   * owner 拒绝服务(codex-R3-E1 确定性复现:B 从 readForOwner=true 变 404)。锁外预查 uploaders
++   * 解决不了竞态,必须在同一把 hash 锁内重读。
++   *
++   * 与 runPurgeSweep 的分界:后者是 owner-agnostic 的**系统级** GC(grace 到期即清,对所有 uploader
++   * 一视同仁),不含"A 删 B 的"越权语义,故照常用 deleteIfStillEligible、不加 uploaders 门。
++   */
++  deleteIfSoleUploaderPurgeEligible(
++    contentHash: string,
++    ownerFp: string,
++    now: number,
++  ): Promise<{ deleted: true; reason: 'eligible' } | { deleted: false; reason: 'missing' | 'not-uploader' | 'shared-uploaders' | 'not-eligible' }>
++  /** #313 + codex-B1:owner 显式 DELETE 的原子 sole-uploader 判定。在 hash 锁内**重读** record +
++   *  uploaders,依次判:record 无→missing;请求者不在 uploaders→not-uploader;uploaders 集合大小>1→
++   *  shared-uploaders(dedup 共上传时任何一方都不能单方面删走对方还没 attach 的字节);references>0→
++   *  has-references;全过→删(同 deleteIfStillEligible 的 purge 顺序:meta 不可见先行→bytes→uploaders→tomb)。
++   *  把 uploader 检查移进锁内,堵 stale 请求跨「旧 record 删除→他人同 hash 重上传」代际越权删除
++   *  (旧 deleteUnattached 锁外查 uploader、锁内只复查 refcount,record 代际更替后 stale 请求误删新代资产)。
++   *  返回判别联合:deleted===true 时 reason 恒 'eligible',deleted===false 时 reason 为非 eligible 集
++   *  (让 service 层 `if(deleted) return deleted; return reason` 经 TS 收窄不泄漏 'eligible')。 */
++  deleteIfSoleUploaderZeroRefs(contentHash: string, ownerFp: string): Promise<{ deleted: true; reason: 'eligible' } | { deleted: false; reason: 'missing' | 'not-uploader' | 'shared-uploaders' | 'has-references' }>
+   listRecords(): Promise<AssetRecord[]>
+   /**
+    * G2.2/P1-3:**strict** scan for owner-migration detector + rekey——同 listRecords 但对坏 shard/meta
+@@ -405,6 +463,42 @@ const readUploadersUnlocked = async (root: string, contentHash: string): Promise
+ // per-hash lock (no concurrent register for the same hash). appendFile is atomic for
+ // the line on POSIX (O_APPEND) → a lock-free concurrent isUploader read sees either
+ // the old or the new complete file, never a partial line.
++/**
++ * P1-B 物理删除序列的**单一实现**(codex-R2-A3:此前 deleteIfStillEligible 与
++ * deleteIfSoleUploaderZeroRefs 各抄一份,行为等价但将来只改一份会静默分叉)。
++ * 顺序不可变更:meta.json → .tmp-tombstone 原子重命名**先行**(readRecordUnlocked 只读
++ * *.meta.json,故 record 立即不可见 → attach→missing / GET→404),再 best-effort 删
++ * bytes → uploaders → tomb。任何中途失败只留下「孤儿 bytes/uploaders + 无 record」,
++ * 绝不留下「record 在、bytes 没了」(那才是 GET 拿到 record 却读不到字节的半状态)。
++ * 必须在调用方的 hash 锁内调用。返回 false = meta 已被并发清走,调用方应报 missing。
++ */
++const purgeArtifactsUnlocked = async (root: string, contentHash: string): Promise<boolean> => {
++  const meta = metaPath(root, contentHash)
++  const tomb = `${meta}.tmp-tombstone-${tempSuffix()}`
++  try {
++    await fs.rename(meta, tomb)
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
++    throw error
++  }
++  try {
++    await ignoreMissing(bytesPath(root, contentHash))
++  } catch {
++    // orphan bytes linger — no record points to them
++  }
++  try {
++    await ignoreMissing(uploadersPath(root, contentHash))
++  } catch {
++    // orphan uploaders linger — readForOwner checks getRecord first
++  }
++  try {
++    await ignoreMissing(tomb)
++  } catch {
++    // tombstone lingers — cleanOrphanTemps reaps it after the age threshold
++  }
++  return true
++}
++
+ const registerUploaderLocked = async (root: string, contentHash: string, ownerFp: string): Promise<void> => {
+   const existing = await readUploadersUnlocked(root, contentHash)
+   if (existing.includes(ownerFp)) return // idempotent — no duplicate line
+@@ -478,6 +572,9 @@ const readAllRecordsStrict = async (root: string): Promise<AssetRecord[]> => {
+       if (rec.lastRefZeroAt !== null && (typeof rec.lastRefZeroAt !== 'number' || !Number.isFinite(rec.lastRefZeroAt))) {
+         throw new Error(schemaErr(`lastRefZeroAt must be number|null, got ${JSON.stringify(rec.lastRefZeroAt)}`))
+       }
++      if (rec.everAttached !== undefined && typeof rec.everAttached !== 'boolean') {
++        throw new Error(schemaErr(`everAttached must be boolean|absent, got ${JSON.stringify(rec.everAttached)}`))
++      }
+       if (!Array.isArray(rec.references)) throw new Error(schemaErr('references must be an array'))
+       for (let i = 0; i < rec.references.length; i++) {
+         const ref = rec.references[i] as Partial<AssetReference> | undefined
+@@ -618,6 +715,7 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
+       if (exists) return { record, newlyAttached: false }
+       record.references = [...record.references, ref]
+       record.lastRefZeroAt = null // any ref → cancel a pending grace window
++      record.everAttached = true // #313:周期 reaper 只清 attach 过的确定孤儿(置位后永不回退)
+       await writeAtomic(metaPath(root, contentHash), JSON.stringify(record, null, 2), 'utf8')
+       return { record, newlyAttached: true }
+     })
+@@ -663,42 +761,54 @@ export const createFsAssetBackend = (root: string): AssetStoreBackend => ({
+       // Re-check eligibility UNDER the lock: a concurrent attach/detach that
+       // resurrected the asset would have taken the mutex first and flipped
+       // lastRefZeroAt to null / raised refs. If still eligible here, delete.
++      // 注:本方法**不查 uploaders**——它服务 owner-agnostic 的系统级 sweep(grace 到期即清,
++      // 对所有 uploader 一视同仁)。owner 触发的定向 purge 必须走
++      // deleteIfSoleUploaderPurgeEligible(codex-R3-E1),否则构成跨 owner 越权删除。
+       if (!isPurgeEligible(record, now)) return { deleted: false, reason: 'not-eligible' as const }
+-      // P1-B: make metadata invisible FIRST (atomic rename of meta.json → a
+-      // .tmp-tombstone). A reader (readRecordUnlocked reads *.meta.json only) now sees
+-      // no record → attach→missing, GET→404. If the rename throws non-ENOENT, the
+-      // record is still visible + bytes still present — consistent; a later sweep retries.
+-      const meta = metaPath(root, contentHash)
+-      const tomb = `${meta}.tmp-tombstone-${tempSuffix()}`
+-      try {
+-        await fs.rename(meta, tomb)
+-      } catch (error) {
+-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+-          return { deleted: false, reason: 'missing' as const } // raced away
+-        }
+-        throw error
+-      }
+-      // Bytes + uploaders + tombstone: best-effort, in that order. A failure here
+-      // leaves orphan bytes/uploaders + NO record — the acceptable half-state (a
+-      // future re-upload overwrites the bytes; cleanOrphanTemps reaps an old tomb).
+-      // It never leaves "record present, bytes gone" (the record is already invisible).
+-      try {
+-        await ignoreMissing(bytesPath(root, contentHash))
+-      } catch {
+-        // orphan bytes linger — no record points to them
+-      }
+-      try {
+-        await ignoreMissing(uploadersPath(root, contentHash))
+-      } catch {
+-        // orphan uploaders linger — readForOwner checks getRecord first, so this is
+-        // never consulted without a record
+-      }
+-      try {
+-        await ignoreMissing(tomb)
+-      } catch {
+-        // tombstone lingers — cleanOrphanTemps reaps it after the age threshold
+-      }
+-      return { deleted: true, reason: 'eligible' as const }
++      const purged = await purgeArtifactsUnlocked(root, contentHash)
++      return purged
++        ? { deleted: true, reason: 'eligible' as const }
++        : { deleted: false, reason: 'missing' as const }
++    })
++  },
++
++
++  async deleteIfSoleUploaderPurgeEligible(contentHash, ownerFp, now) {
++    assertValidAssetId(contentHash)
++    return withHashLock(contentHash, async () => {
++      // codex-R3-E1:owner 触发的配额 purge —— uploaders 检查必须在**同一把锁内**重读。
++      const record = await readRecordUnlocked(root, contentHash)
++      if (!record) return { deleted: false, reason: 'missing' as const }
++      const uploaders = await readUploadersUnlocked(root, contentHash)
++      if (!uploaders.includes(ownerFp)) return { deleted: false, reason: 'not-uploader' as const }
++      // 共上传 → 跳过:A 不得借配额压力删掉 B 仍持读权限的字节(跨 owner DoS 旁路)。
++      if (uploaders.length > 1) return { deleted: false, reason: 'shared-uploaders' as const }
++      // grace + refcount 与系统级 sweep 同判据(锁内复查,防并发 detach 重置 grace 后误删)。
++      if (!isPurgeEligible(record, now)) return { deleted: false, reason: 'not-eligible' as const }
++      const purged = await purgeArtifactsUnlocked(root, contentHash)
++      return purged
++        ? { deleted: true as const, reason: 'eligible' as const }
++        : { deleted: false as const, reason: 'missing' as const }
++    })
++  },
++
++  async deleteIfSoleUploaderZeroRefs(contentHash, ownerFp) {
++    assertValidAssetId(contentHash)
++    return withHashLock(contentHash, async () => {
++      // 锁内重读 record + uploaders——堵 stale 请求跨代际越权(旧 deleteUnattached 锁外查 uploader,
++      // record 被删+他人同 hash 重上传后,锁内只复查 refcount 的 deleteIfStillEligible 会误删新代资产)。
++      const record = await readRecordUnlocked(root, contentHash)
++      if (!record) return { deleted: false, reason: 'missing' as const }
++      const uploaders = await readUploadersUnlocked(root, contentHash)
++      if (!uploaders.includes(ownerFp)) return { deleted: false, reason: 'not-uploader' as const }
++      // dedup 共上传:任一方都不能单方面删走对方还没 attach 的字节(对方虽是 uploader,refs 可能仍 0)。
++      if (uploaders.length > 1) return { deleted: false, reason: 'shared-uploaders' as const }
++      if (record.references.length > 0) return { deleted: false, reason: 'has-references' as const }
++      // sole uploader + zero refs → 删(共享 P1-B 序列,单一实现见 purgeArtifactsUnlocked)。
++      const purged = await purgeArtifactsUnlocked(root, contentHash)
++      return purged
++        ? { deleted: true as const, reason: 'eligible' as const }
++        : { deleted: false as const, reason: 'missing' as const }
+     })
+   },
+ 
+@@ -955,6 +1065,7 @@ export const createMemoryAssetBackend = (): MemoryAssetBackend => {
+       if (!exists) {
+         record.references = [...record.references, ref]
+         record.lastRefZeroAt = null
++        record.everAttached = true // #313:与 fs backend 同语义
+         _records.set(contentHash, record)
+       }
+       return { record, newlyAttached: !exists }
+@@ -997,6 +1108,37 @@ export const createMemoryAssetBackend = (): MemoryAssetBackend => {
+       return { deleted: true, reason: 'eligible' }
+     },
+ 
++    async deleteIfSoleUploaderPurgeEligible(contentHash, ownerFp, now) {
++      assertValidAssetId(contentHash)
++      // codex-R3-E1:与 fs backend 同检查次序(Map ops 同步 = 锁内重读语义)。
++      const record = _records.get(contentHash)
++      if (!record) return { deleted: false, reason: 'missing' }
++      const uploaders = _uploaders.get(contentHash)
++      if (!uploaders || !uploaders.has(ownerFp)) return { deleted: false, reason: 'not-uploader' }
++      // 共上传 → 跳过(A 不得借配额压力删 B 仍可读的字节)。
++      if (uploaders.size > 1) return { deleted: false, reason: 'shared-uploaders' }
++      if (!isPurgeEligible(record, now)) return { deleted: false, reason: 'not-eligible' }
++      _records.delete(contentHash)
++      _bytes.delete(contentHash)
++      _uploaders.delete(contentHash)
++      return { deleted: true, reason: 'eligible' }
++    },
++
++    async deleteIfSoleUploaderZeroRefs(contentHash, ownerFp) {
++      assertValidAssetId(contentHash)
++      // Map ops 同步(同 event loop 无交错)= 锁内重读语义;与 fs backend 同检查次序。
++      const record = _records.get(contentHash)
++      if (!record) return { deleted: false, reason: 'missing' }
++      const uploaders = _uploaders.get(contentHash)
++      if (!uploaders || !uploaders.has(ownerFp)) return { deleted: false, reason: 'not-uploader' }
++      if (uploaders.size > 1) return { deleted: false, reason: 'shared-uploaders' }
++      if (record.references.length > 0) return { deleted: false, reason: 'has-references' }
++      _records.delete(contentHash)
++      _bytes.delete(contentHash)
++      _uploaders.delete(contentHash)
++      return { deleted: true, reason: 'eligible' }
++    },
++
+     async listRecords() {
+       return [..._records.values()]
+     },
+@@ -1116,7 +1258,29 @@ export type AssetStore = {
+   /** Delete records + bytes whose grace has expired. Re-checks eligibility atomically
+    *  per hash (P1.1): a concurrent attach during sweep aborts that asset's delete.
+    *  Callable sweep entry — recommended cron (see docs/decisions/soft-delete-semantics.md). */
++  /** **系统级 / 诊断专用 —— 禁止从 owner 或请求触发的路径调用**(claude-R4-A2)。
++   *  三个 purge 入口的护栏并不齐平,这是唯一"全无护栏"的那个:既不查 uploaders、也不豁免
++   *  never-attached(grace 到期即清,对所有 uploader 一视同仁)。它当前**零生产调用方**。
++   *  为什么要把边界写在这里:若将来有人把它接到任何由 owner/请求触发的路径(例如管理端
++   *  「立即清理」「腾空间」按钮),codex-R3-E1 的跨 owner 越权语义会**静默重开** ——
++   *  "owner-agnostic 所以不带门"是它的**前提**,不是"可以放心到处调"的许可。
++   *  需要 owner 触发的定向回收,一律走 purgeOwnerEligible(经 deleteIfSoleUploaderPurgeEligible,
++   *  锁内重读 uploaders、共上传即跳过)。 */
+   runPurgeSweep(now?: number): Promise<{ purged: number; scanned: number }>
++  /** #313 周期 reaper 入口(server/index.ts setInterval 调用):只清 everAttached===true 的
++   *  grace 到期孤儿(attach 过又归零 = 确定孤儿)。从未 attach 的资产(含 demo/local-only
++   *  画布结构性 unattached 的引用,服务端不可区分)一律豁免——它们只在 owner 撞配额时
++   *  经 purgeOwnerEligible 定向回收,或 owner 显式 DELETE。exempted = 本轮因"从未 attach"
++   *  被豁免的 grace 到期资产数(fail-visible 观测,防"reaper 跑了却什么都没清"误判)。 */
++  runScheduledReap(now?: number): Promise<{ purged: number; scanned: number; exempted: number }>
++  /** #313 owner 显式回收:DELETE /api/assets/:id。仅 uploader(non-uploader → not-uploader,
++   *  route 映射 404 防存在性泄漏)、仅 refcount==0(有引用 → has-references,route 409)。
++   *  不等 grace(显式意图);backend 在 hash 锁下复查 refcount==0(并发 attach 复活则中止)。 */
++  deleteUnattached(
++    assetId: string,
++    ownerFp: string,
++    now?: number,
++  ): Promise<{ kind: 'deleted' | 'missing' | 'not-uploader' | 'shared-uploaders' | 'has-references' }>
+   /** Test/diagnostic: read a record (no IO side effect). */
+   getRecord(assetId: string): Promise<AssetRecord | null>
+   /** G2.2 gate ②:ownerFp 是该 asset 的 uploader 吗(dedup uploader 注册表,.uploaders)?转发 backend.isUploader。 */
+@@ -1193,15 +1357,24 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
+   // P2-F: targeted purge of ONE owner's grace-expired refcount==0 assets. Frees
+   // quota room before an over-quota NEW upload is refused. (runPurgeSweep sweeps
+   // all owners; this is the owner-scoped slow-path equivalent.)
+-  const purgeOwnerEligible = async (ownerFp: string, at: number): Promise<void> => {
++  const purgeOwnerEligible = async (ownerFp: string, at: number): Promise<OwnerPurgeSummary> => {
++    const summary: OwnerPurgeSummary = { scanned: 0, purged: 0, skippedShared: 0, notEligible: 0 }
+     const records = await backend.listRecords()
+     for (const record of records) {
+       if (record.ownerFp !== ownerFp) continue
+       if (!isPurgeEligible(record, at)) continue
+-      // deleteIfStillEligible re-checks eligibility UNDER the hash lock (a concurrent
+-      // attach that resurrected the asset aborts the delete).
+-      await backend.deleteIfStillEligible(record.contentHash, at)
++      summary.scanned += 1
++      // codex-R3-E1(blocker):**必须**用锁内重读 uploaders 的原语。本函数是"由某个 owner 的
++      // 上传动作触发、按 record.ownerFp 选中"的定向清理 —— 若用只查 grace/refcount 的
++      // deleteIfStillEligible,首上传者 A 制造一次配额压力即可删掉 dedup 共上传者 B 仍持读权限的
++      // 字节,绕过显式 DELETE 的 sole-uploader 门(跨 owner DoS)。共上传 → 跳过不删。
++      const res = await backend.deleteIfSoleUploaderPurgeEligible(record.contentHash, ownerFp, at)
++      // claude-R4-A1:返回值不能丢 —— 'shared-uploaders' 是那条配额权衡唯一的运行时信号。
++      if (res.deleted) summary.purged += 1
++      else if (res.reason === 'shared-uploaders') summary.skippedShared += 1
++      else summary.notEligible += 1
+     }
++    return summary
+   }
+ 
+   const uploadWithQuota: AssetStore['uploadWithQuota'] = async (
+@@ -1215,11 +1388,12 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
+     return withOwnerLock(ownerFp, async () => {
+       const at = nowOrDefault(now)
+       let used = await ownerBytes(ownerFp)
++      let purgeSummary: OwnerPurgeSummary | undefined
+       if (used + bytes.length > quotaBytes) {
+         // P2-F slow path: an over-quota NEW upload first frees room by purging THIS
+         // owner's grace-expired refcount==0 assets, then recomputes used. If still
+         // over, admitUpload's hash-locked gate refuses (no bytes written).
+-        await purgeOwnerEligible(ownerFp, at)
++        purgeSummary = await purgeOwnerEligible(ownerFp, at)
+         used = await ownerBytes(ownerFp)
+       }
+       const contentHash = computeContentHash(bytes)
+@@ -1231,7 +1405,10 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
+         used,
+         at,
+       )
+-      if (outcome.kind === 'quota-exceeded') return outcome
++      // claude-R4-A1:慢路径跑过就把分项带出去,让 route 能把"为什么没腾出空间"写进日志。
++      if (outcome.kind === 'quota-exceeded') {
++        return purgeSummary ? { ...outcome, purge: purgeSummary } : outcome
++      }
+       const { record, newlyWritten } = outcome
+       return {
+         kind: 'ok' as const,
+@@ -1313,6 +1490,38 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
+     return { purged, scanned: records.length }
+   }
+ 
++  // #313 周期 reaper:demo 豁免为硬约束(2026-07-30 issue 评论)——从未 attach 的 grace 到期
++  // 资产不清(服务端分不出"demo 画布本地引用中"与"真孤儿",fail-safe 宁可少清),只清
++  // everAttached 的确定孤儿。豁免数单独计数返回,便于观测积压。
++  const runScheduledReap: AssetStore['runScheduledReap'] = async (now) => {
++    const at = nowOrDefault(now)
++    const records = await backend.listRecords()
++    let purged = 0
++    let exempted = 0
++    for (const record of records) {
++      if (!isPurgeEligible(record, at)) continue
++      if (record.everAttached !== true) {
++        exempted += 1
++        continue
++      }
++      const { deleted } = await backend.deleteIfStillEligible(record.contentHash, at)
++      if (deleted) purged += 1
++    }
++    await backend.cleanOrphanTemps(at)
++    return { purged, scanned: records.length, exempted }
++  }
++
++  // codex-B1:转发 backend.deleteIfSoleUploaderZeroRefs——uploader + refcount 检查全部移进 hash 锁内,
++  // 堵 stale 请求跨「旧 record 删除→他人同 hash 重上传」代际越权删除。`now` 留形参保既有调用签名
++  // (vestigial——显式 DELETE 不走 grace,原子方法不查时间)。shared-uploaders:dedup 共上传,任一方都不能
++  // 单方面删走对方还没 attach 的字节(route 映射 409 asset_shared_uploaders)。
++  const deleteUnattached: AssetStore['deleteUnattached'] = async (assetId, ownerFp) => {
++    assertValidAssetId(assetId)
++    const { deleted, reason } = await backend.deleteIfSoleUploaderZeroRefs(assetId, ownerFp)
++    if (deleted) return { kind: 'deleted' }
++    return { kind: reason } // missing | not-uploader | shared-uploaders | has-references
++  }
++
+   const getRecord: AssetStore['getRecord'] = async (assetId) => {
+     assertValidAssetId(assetId)
+     return backend.getRecord(assetId)
+@@ -1385,6 +1594,8 @@ export const createAssetStore = (backend: AssetStoreBackend): AssetStore => {
+     attach,
+     detach,
+     runPurgeSweep,
++    runScheduledReap,
++    deleteUnattached,
+     getRecord,
+     isUploader,
+     refcount,
+diff --git a/server/routes/assets.test.ts b/server/routes/assets.test.ts
+index 747286e6..d70a0a5e 100644
+--- a/server/routes/assets.test.ts
++++ b/server/routes/assets.test.ts
+@@ -653,3 +653,85 @@ describe('POST /api/assets — P1 decode concurrency gate', () => {
+     expect(decodeGateStats().waiting).toBe(0)
+   })
+ })
++
++// ── #313:DELETE /api/assets/:id — owner 显式回收未附加上传 ──────────────────────────
++describe('DELETE /api/assets/:id (#313 owner explicit reclaim)', () => {
++  const uploadAs = async (app: Hono<AppEnv>, key: string, color: { r: number; g: number; b: number }) => {
++    const bytes = await realPng(color)
++    const form = new FormData()
++    form.append('image', new File([new Uint8Array(bytes)], 'x.png', { type: 'image/png' }), 'x.png')
++    const res = await app.request('/api/assets', { method: 'POST', headers: { 'X-Mivo-Api-Key': key }, body: form })
++    expect(res.status).toBe(200)
++    return (await res.json() as { assetId: string }).assetId
++  }
++
++  it('uploader + refcount==0 → 200 deleted;record/bytes 消失,再 GET 404', async () => {
++    const be = createMemoryAssetBackend()
++    const app = buildApp(be)
++    const assetId = await uploadAs(app, MIVO_KEY, { r: 91, g: 1, b: 1 })
++    const res = await app.request(`/api/assets/${assetId}`, { method: 'DELETE', headers: { 'X-Mivo-Api-Key': MIVO_KEY } })
++    expect(res.status).toBe(200)
++    expect(await res.json()).toEqual({ kind: 'deleted' })
++    expect(be._records.has(assetId)).toBe(false)
++    expect(be._bytes.has(assetId)).toBe(false)
++    const get = await app.request(`/api/assets/${assetId}`, { headers: { 'X-Mivo-Api-Key': MIVO_KEY } })
++    expect(get.status).toBe(404)
++  })
++
++  it('非 uploader → 404(不泄漏存在性,与 GET missing-or-forbidden 同语义)', async () => {
++    const be = createMemoryAssetBackend()
++    const app = buildApp(be)
++    const assetId = await uploadAs(app, MIVO_KEY, { r: 92, g: 2, b: 2 })
++    const res = await app.request(`/api/assets/${assetId}`, { method: 'DELETE', headers: { 'X-Mivo-Api-Key': 'mivo_OTHERKEY_test' } })
++    expect(res.status).toBe(404)
++    expect(be._records.has(assetId)).toBe(true) // 未被删
++  })
++
++  it('refcount>0 → 409 asset_has_references,资产保留', async () => {
++    const be = createMemoryAssetBackend()
++    const app = buildApp(be)
++    const assetId = await uploadAs(app, MIVO_KEY, { r: 93, g: 3, b: 3 })
++    // 直接经 backend attach(绕过 attach 路由的 canvas authz,不是本用例的被测面)。
++    await be.attachRef(assetId, { nodeId: 'n-1', ownerFp: fp() })
++    const res = await app.request(`/api/assets/${assetId}`, { method: 'DELETE', headers: { 'X-Mivo-Api-Key': MIVO_KEY } })
++    expect(res.status).toBe(409)
++    expect((await res.json() as { code: string }).code).toBe('asset_has_references')
++    expect(be._records.has(assetId)).toBe(true)
++  })
++
++  it('不存在的 assetId → 404;非 hash 形状 → 404', async () => {
++    const be = createMemoryAssetBackend()
++    const app = buildApp(be)
++    const res = await app.request(`/api/assets/${'f'.repeat(64)}`, { method: 'DELETE', headers: { 'X-Mivo-Api-Key': MIVO_KEY } })
++    expect(res.status).toBe(404)
++    const bad = await app.request('/api/assets/not-a-hash', { method: 'DELETE', headers: { 'X-Mivo-Api-Key': MIVO_KEY } })
++    expect(bad.status).toBe(404)
++  })
++
++  it('删除后同字节可重新上传(content-addressed 语义完整)', async () => {
++    const be = createMemoryAssetBackend()
++    const app = buildApp(be)
++    const assetId = await uploadAs(app, MIVO_KEY, { r: 94, g: 4, b: 4 })
++    await app.request(`/api/assets/${assetId}`, { method: 'DELETE', headers: { 'X-Mivo-Api-Key': MIVO_KEY } })
++    const again = await uploadAs(app, MIVO_KEY, { r: 94, g: 4, b: 4 })
++    expect(again).toBe(assetId)
++    expect(be._records.has(assetId)).toBe(true)
++  })
++
++  it('dedup 双上传者 DELETE → 409 asset_shared_uploaders(任一方不得单方面删走对方字节)', async () => {
++    const be = createMemoryAssetBackend()
++    const app = buildApp(be)
++    const color = { r: 95, g: 5, b: 5 }
++    const assetId = await uploadAs(app, MIVO_KEY, color) // A 上传
++    await uploadAs(app, 'mivo_OTHERKEY_test', color) // B 同图 dedup → uploaders={A,B}
++    // 任一方都不能单方面删——对方虽是 uploader 但还没 attach,删了会 strand 对方读访问。
++    const a = await app.request(`/api/assets/${assetId}`, { method: 'DELETE', headers: { 'X-Mivo-Api-Key': MIVO_KEY } })
++    expect(a.status).toBe(409)
++    expect((await a.json() as { code: string }).code).toBe('asset_shared_uploaders')
++    expect(be._records.has(assetId)).toBe(true)
++    const b = await app.request(`/api/assets/${assetId}`, { method: 'DELETE', headers: { 'X-Mivo-Api-Key': 'mivo_OTHERKEY_test' } })
++    expect(b.status).toBe(409)
++    expect((await b.json() as { code: string }).code).toBe('asset_shared_uploaders')
++    expect(be._records.has(assetId)).toBe(true)
++  })
++})
+diff --git a/server/routes/assets.ts b/server/routes/assets.ts
+index 5ea364df..67c9923e 100644
+--- a/server/routes/assets.ts
++++ b/server/routes/assets.ts
+@@ -224,7 +224,16 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
+       const quotaBytes = getEnvConfig().assetOwnerQuotaBytes
+       const outcome = await store.uploadWithQuota(canon.canonicalBytes, canon.mimeType, originalName, ownerFp, quotaBytes)
+       if (outcome.kind === 'quota-exceeded') {
+-        log(413, 'quota-exceeded')
++        // claude-R4-A1:把 owner purge 的分项写进 note —— 否则"purge 跑了但共上传全被
++        // sole-uploader 门跳过"与"根本没有可清的东西"在日志上无法区分,运维只看到无解释的 413。
++        // skipped-shared>0 即是 §4.4 记录的那条配额权衡在生效(共上传字节不计入可回收空间)。
++        const pg = outcome.purge
++        log(
++          413,
++          pg
++            ? `quota-exceeded after owner purge: scanned=${pg.scanned} purged=${pg.purged} skipped-shared-uploaders=${pg.skippedShared} not-eligible=${pg.notEligible}`
++            : 'quota-exceeded',
++        )
+         return c.json(
+           { error: 'per-owner asset quota exceeded', code: 'quota_exceeded', quota: outcome.quota, used: outcome.used, size: outcome.size },
+           413,
+@@ -318,6 +327,55 @@ export const createAssetRoutes = (options: AssetRouteOptions): App => {
+     return c.body(hit.bytes as never)
+   })
+ 
++  // DELETE /api/assets/:id — #313 owner 显式回收未附加上传(客户端 attach 失败/放弃后主动清)。
++  //   仅 uploader:非 uploader → 404(与 GET 同语义,不泄漏存在性);
++  //   仅 unattached:refcount>0 → 409 asset_has_references(先 detach 干净再删);
++  //   不等 grace(显式意图);backend 在 hash 锁下复查 refcount==0(并发 attach 复活则 409)。
++  app.delete('/assets/:id', async (c) => {
++    const requestId = newRequestId()
++    c.header('X-Request-Id', requestId)
++    const t0 = Date.now()
++    const assetId = c.req.param('id')
++    const log = (status: number, note?: string): void => {
++      logRequest({ method: 'DELETE', path: `/api/assets/${shortHash(assetId)}`, requestId, status, latencyMs: Date.now() - t0, note })
++    }
++    // 对齐 POST/GET proof-gate 语义:resolveAssetOwner 先于一切校验(strict + 无 proof → 401 无泄漏)。
++    const ownerFp = resolveAssetOwner(c)
++    const badKey = rejectInvalidMivoApiKey(c)
++    if (badKey) {
++      log(400, 'bad-mivo-key')
++      return badKey
++    }
++    if (!ASSET_ID_RE.test(assetId)) {
++      log(404, 'invalid-id')
++      return plainTextNoContentType(c, 'Asset not found', 404)
++    }
++    const outcome = await store.deleteUnattached(assetId, ownerFp)
++    switch (outcome.kind) {
++      case 'deleted':
++        log(200, 'deleted')
++        return c.json({ kind: 'deleted' } as { kind: 'deleted' }, 200)
++      case 'missing':
++      case 'not-uploader':
++        // missing 与 not-uploader 同返 404(不泄漏存在性,与 GET 的 missing-or-forbidden 一致)。
++        log(404, outcome.kind === 'missing' ? 'missing' : 'not-uploader')
++        return plainTextNoContentType(c, 'Asset not found', 404)
++      case 'has-references':
++        log(409, 'has-references')
++        return c.json({ error: 'asset has live references; detach them first', code: 'asset_has_references' }, 409)
++      case 'shared-uploaders':
++        // codex-B1:dedup 共上传——任一 uploader 都不能单方面删走对方还没 attach 的字节。
++        // codex-R2-A2:文案不得暗示"让 co-uploader 先 detach 就能删"——判定序是 uploaders.size>1
++        //   先于 references>0,且 `.uploaders` 单调只增(全仓无 per-owner 摘除路径),所以共上传的
++        //   资产对任何一方都是**永久** 409。已知限制:因此"共上传且从未 attach"的资产没有 owner 侧
++        //   回收路径,只能靠撞配额时的 purgeOwnerEligible 或 grace 到期后的 reaper(而 reaper 又豁免
++        //   never-attached)兜底。根治要给 DELETE 加"只注销调用方的 uploader 登记、uploaders 归空才
++        //   删字节"语义 —— 那是新的对外 wire 语义,归 follow-up,不在本修范围。文案只说事实。
++        log(409, 'shared-uploaders')
++        return c.json({ error: 'asset is co-uploaded by another owner; a co-uploaded asset cannot be deleted by a single owner', code: 'asset_shared_uploaders' }, 409)
++    }
++  })
++
+   // ── G2.2(decision 1/2):asset attach/detach canvas-authz 双门谓词——堵"知 hash 即可跨用户 attach"安全洞 ──
+   // 决议(lead 定,A1 节):attach 须同时过两道门(detach 验引用画布 edit 权):
+   //   ① actor 对目标 canvas 有 edit(write)权:body 带 canvasId(不信裸 nodeId),服务端从权威 node 数据
+diff --git a/src/App.css b/src/App.css
+index 73a391b5..75c5d9f4 100644
+--- a/src/App.css
++++ b/src/App.css
+@@ -3789,6 +3789,8 @@ button:disabled {
+   background: var(--charcoal);
+ }
+ 
++/* node-action-swatch 是右键菜单项上的"当前色指示点"(glyph),不是取色器——
++   #321 结构迁移(选色 UI 归 color 模块)不适用于它,按 glyph 语义保留。 */
+ .node-action-swatch {
+   position: relative;
+   flex: 0 0 auto;
+@@ -5528,12 +5530,6 @@ button:disabled {
+   padding: 5px;
+ }
+ 
+-.selection-quick-toolbar-palette {
+-  display: grid;
+-  grid-template-columns: repeat(5, 28px);
+-  gap: 10px;
+-}
+-
+ .selection-quick-toolbar-choice-row {
+   display: flex;
+   gap: 5px;
+@@ -5567,47 +5563,8 @@ button:disabled {
+     0 0 0 1px rgba(28, 28, 27, 0.98);
+ }
+ 
+-.selection-quick-toolbar-menu button.palette-swatch-button {
+-  position: relative;
+-  display: inline-flex;
+-  width: 28px;
+-  min-width: 28px;
+-  height: 28px;
+-  padding: 0;
+-  /* hover/选中形状与通用色板(ColorSwatchPicker)统一:圆角方形。 */
+-  border-radius: 9px;
+-}
+-
+-.selection-quick-toolbar-menu button.palette-swatch-button:hover,
+-.selection-quick-toolbar-menu button.palette-swatch-button:focus-visible,
+-.selection-quick-toolbar-menu button.palette-swatch-button.selected {
+-  background: rgba(255, 250, 240, 0.14);
+-}
+-
+-.palette-swatch-button span {
+-  display: block;
+-  width: 20px;
+-  height: 20px;
+-  margin: auto;
+-  background: var(--swatch-color);
+-  border-radius: 999px;
+-}
+-
+-.palette-swatch-button.transparent span {
+-  background:
+-    linear-gradient(45deg, rgba(28, 28, 27, 0.22) 25%, transparent 25%),
+-    linear-gradient(-45deg, rgba(28, 28, 27, 0.22) 25%, transparent 25%),
+-    linear-gradient(45deg, transparent 75%, rgba(28, 28, 27, 0.22) 75%),
+-    linear-gradient(-45deg, transparent 75%, rgba(28, 28, 27, 0.22) 75%);
+-  background-color: rgba(255, 250, 240, 0.86);
+-  background-position: 0 0, 0 5px, 5px -5px, -5px 0;
+-  background-size: 10px 10px;
+-}
+-
+-/* 选中态与通用色板(ColorSwatchPicker)统一:紫框挂在按钮上(圆角方形)。 */
+-.selection-quick-toolbar-menu button.palette-swatch-button.selected {
+-  box-shadow: 0 0 0 2px #7b61ff;
+-}
++/* palette-swatch-button 旧色板样式已随 #321 结构迁移删除:最后一处 live 场景
++   (贴纸纸色)改走 color 模块的 ColorSwatchPicker(rows + allowCustom:false)。 */
+ 
+ /* 近黑 / 近白色块的可见性:一圈很淡的内描边(FigJam 同款);其余色块保持纯色。
+    描边色取 --picker-ink(宿主明暗上下文),所以"不需要的那一环"会与自身色块同色
+diff --git a/src/canvas/NodeActionMenu.tsx b/src/canvas/NodeActionMenu.tsx
+index ff2c42af..43726db4 100644
+--- a/src/canvas/NodeActionMenu.tsx
++++ b/src/canvas/NodeActionMenu.tsx
+@@ -84,6 +84,8 @@ export function NodeActionMenu({
+   }
+ 
+   const renderActionGlyph = ({ icon: Icon, text, swatch, linePreview }: CanvasActionItem) => {
++    // swatch glyph 是菜单项上的"当前色指示点",不是取色器;选色 UI 统一走 color 模块
++    // (ActionColorSwatchPicker),这个单色点按 glyph 语义保留(#321 审计结论)。
+     if (swatch) {
+       return (
+         <i
+diff --git a/src/canvas/SelectionQuickToolbar.tsx b/src/canvas/SelectionQuickToolbar.tsx
+index 58e47a14..6e4a1a47 100644
+--- a/src/canvas/SelectionQuickToolbar.tsx
++++ b/src/canvas/SelectionQuickToolbar.tsx
+@@ -225,9 +225,11 @@ export function SelectionQuickToolbar({
+   }: CanvasActionItem) => {
+     const hasMenu = Boolean(children?.length) || Boolean(colorPicker)
+     const menuOpen = openActionId === id
+-    const swatchActions = children?.filter((child) => child.swatch) || []
+-    const commandActions = children?.filter((child) => !child.swatch) || []
+-    const resolvedMenuVariant = menuVariant || (swatchActions.length > 0 ? 'palette' : 'list')
++    // #321:palette 变体(子项自渲 palette-swatch-button)已下线——最后一处 live 场景
++    // (贴纸纸色)迁入 color 模块(menuVariant 'color-picker' + colorPicker.rows)。
++    // 子项不再携带 swatch,children 一律按命令项渲染。
++    const commandActions = children || []
++    const resolvedMenuVariant = menuVariant || 'list'
+     const toggleMenu = () =>
+       setOpenMenu((current) => ({
+         selectionKey,
+@@ -255,36 +257,6 @@ export function SelectionQuickToolbar({
+             {colorPicker ? <ActionColorSwatchPicker config={colorPicker} /> : null}
+           </>
+         ) : null}
+-        {resolvedMenuVariant === 'palette' ? (
+-          <>
+-            <div className="selection-quick-toolbar-palette" role="none">
+-              {swatchActions.map((child) => (
+-                <button
+-                  key={child.id}
+-                  type="button"
+-                  role="menuitem"
+-                  className={`palette-swatch-button ${child.swatch?.transparent ? 'transparent' : ''} ${child.selected ? 'selected' : ''}`}
+-                  style={{ '--swatch-color': child.swatch?.color } as CSSProperties}
+-                  aria-label={child.label}
+-                  data-tooltip={child.label}
+-                  onMouseDown={preventToolButtonFocus}
+-                  disabled={child.disabled}
+-                  onClick={() => runAction(child)}
+-                >
+-                  <span className={isInkDarkColor(child.swatch?.color) ? 'swatch-ink-hint' : undefined} aria-hidden="true" />
+-                </button>
+-              ))}
+-            </div>
+-            {commandActions.length ? (
+-              <>
+-                <div className="selection-quick-toolbar-menu-divider" />
+-                <div className="selection-quick-toolbar-choice-row" role="none">
+-                  {commandActions.map(renderCompactMenuAction)}
+-                </div>
+-              </>
+-            ) : null}
+-          </>
+-        ) : null}
+         {resolvedMenuVariant === 'segmented' ? (
+           <div className="selection-quick-toolbar-choice-row" role="none">
+             {(children || []).map(renderCompactMenuAction)}
+@@ -295,31 +267,7 @@ export function SelectionQuickToolbar({
+             {(children || []).map(renderCompactMenuAction)}
+           </div>
+         ) : null}
+-        {resolvedMenuVariant === 'list' ? (
+-          <>
+-            {swatchActions.length ? (
+-              <div className="selection-quick-toolbar-palette" role="none">
+-                {swatchActions.map((child) => (
+-                  <button
+-                    key={child.id}
+-                    type="button"
+-                    role="menuitem"
+-                    className={`palette-swatch-button ${child.swatch?.transparent ? 'transparent' : ''} ${child.selected ? 'selected' : ''}`}
+-                    style={{ '--swatch-color': child.swatch?.color } as CSSProperties}
+-                    aria-label={child.label}
+-                    data-tooltip={child.label}
+-                    disabled={child.disabled}
+-                    onClick={() => runAction(child)}
+-                  >
+-                    <span className={isInkDarkColor(child.swatch?.color) ? 'swatch-ink-hint' : undefined} aria-hidden="true" />
+-                  </button>
+-                ))}
+-              </div>
+-            ) : null}
+-            {swatchActions.length && commandActions.length ? <div className="selection-quick-toolbar-menu-divider" /> : null}
+-            {commandActions.map(renderListMenuAction)}
+-          </>
+-        ) : null}
++        {resolvedMenuVariant === 'list' ? commandActions.map(renderListMenuAction) : null}
+       </div>
+     )
+ 
+diff --git a/src/canvas/actions/canvasActionTypes.ts b/src/canvas/actions/canvasActionTypes.ts
+index 0604f9dc..78e3d26a 100644
+--- a/src/canvas/actions/canvasActionTypes.ts
++++ b/src/canvas/actions/canvasActionTypes.ts
+@@ -25,7 +25,8 @@ export type CanvasActionItem = {
+   label: string
+   icon?: CanvasActionIcon
+   text?: string
+-  menuVariant?: 'list' | 'palette' | 'segmented' | 'icon-grid' | 'color-picker'
++  // 'palette' 变体已随 #321 下线(子项自渲色板 → color 模块 colorPicker.rows)。
++  menuVariant?: 'list' | 'segmented' | 'icon-grid' | 'color-picker'
+   swatch?: {
+     color: string
+     transparent?: boolean
+diff --git a/src/canvas/actions/canvasSyncRuntime.test.ts b/src/canvas/actions/canvasSyncRuntime.test.ts
+index f205c2fd..6c3bbd52 100644
+--- a/src/canvas/actions/canvasSyncRuntime.test.ts
++++ b/src/canvas/actions/canvasSyncRuntime.test.ts
+@@ -821,3 +821,63 @@ describe('canvasSyncRuntime — #284 demo seed canvas sync guard', () => {
+     __resetCanvasSyncRuntimeQueue()
+   })
+ })
++
++// ── #353(方案B):local-only 画布(demo 副本)节点级同步 guard ────────────────────────
++// demo seed 的副本(duplicateCanvas)拿新 id + projectId=undefined,双重逃逸 #284 的
++//   isDemoSeedCanvasId 判定 —— 节点改动仍会 submitChange 到服务端不存在的 canvas,必然
++//   终态拒绝(missing bundle base / 404)。方案B:副本带 localOnly 持久化标记,在
++//   enqueueCanvasSyncChanges 同一收口点拦(不 submit,每批恰 1 条 #353 warn,本地已生效)。
++describe('canvasSyncRuntime — #353 local-only canvas sync guard', () => {
++  beforeEach(() => {
++    vi.clearAllMocks()
++    __resetArchivedWriteNotice()
++  })
++
++  const copyDoc = (localOnly: boolean | undefined) => ({
++    title: 'Demo Copy',
++    createdAt: '2026-08-01T00:00:00.000Z',
++    updatedAt: '2026-08-01T00:00:00.000Z',
++    nodes: [],
++    edges: [],
++    tasks: [],
++    selectedNodeId: undefined,
++    selectedNodeIds: [],
++    // demo 副本契约:非 demo id + projectId undefined(#353 逃逸形态)
++    ...(localOnly ? { localOnly: true } : {}),
++  })
++
++  it('localOnly 副本 edit-node → 不 submitChange,恰好 1 条 #353 warn(含 canvasId)', async () => {
++    const { __resetCanvasSyncRuntimeQueue, enqueueCanvasSyncChanges, submitChange, useCanvasStore, useDebugLogStore } =
++      await loadRuntimeModule()
++    useDebugLogStore.setState({ entries: [] })
++    useCanvasStore.setState({ canvases: { 'demo-copy-1': copyDoc(true) } } as never)
++    const fakePort = { submitChange } as unknown as CanvasSyncPort
++    await enqueueCanvasSyncChanges(
++      'demo-copy-1',
++      [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['title'], value: 'renamed' }] }],
++      fakePort,
++    )
++    expect(submitChange).not.toHaveBeenCalled()
++    const warns = useDebugLogStore
++      .getState()
++      .entries.filter((e) => e.level === 'warning' && e.message.includes('local-only canvas'))
++    expect(warns).toHaveLength(1)
++    expect(warns[0].message).toContain('demo-copy-1')
++    expect(warns[0].message).toContain('#353')
++    __resetCanvasSyncRuntimeQueue()
++  })
++
++  it('变异防护:同形态副本但无 localOnly 标记 → 仍 submitChange(证明拦截依据是标记本身)', async () => {
++    const { __resetCanvasSyncRuntimeQueue, enqueueCanvasSyncChanges, submitChange, useCanvasStore } =
++      await loadRuntimeModule()
++    useCanvasStore.setState({ canvases: { 'demo-copy-1': copyDoc(undefined) } } as never)
++    const fakePort = { submitChange } as unknown as CanvasSyncPort
++    await enqueueCanvasSyncChanges(
++      'demo-copy-1',
++      [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['title'], value: 'renamed' }] }],
++      fakePort,
++    )
++    expect(submitChange).toHaveBeenCalledTimes(1)
++    __resetCanvasSyncRuntimeQueue()
++  })
++})
+diff --git a/src/canvas/actions/canvasSyncRuntime.ts b/src/canvas/actions/canvasSyncRuntime.ts
+index 607ff690..e8e37a7e 100644
+--- a/src/canvas/actions/canvasSyncRuntime.ts
++++ b/src/canvas/actions/canvasSyncRuntime.ts
+@@ -444,8 +444,18 @@ export const enqueueCanvasSyncChanges = (
+   //   Runtime 6 个簇,2026-07-29~30 首现)。在此唯一收口点拦:不 submit、不 enqueue attach/detach
+   //   (今天 rejected 分支也不发 side-effect,行为不变),每批一条 warn 说明跳过。fork-on-write(#297)不在本修范围。
+   //   projectId 从 store 的 canvases 文档取(documentFor);拿不到时 undefined,仅靠 scene id 命中即可拦。
+-  const projectId = documentFor(useCanvasStore.getState().canvases, canvasId).projectId
+-  if (isDemoSeedCanvasId(canvasId, projectId)) {
++  const canvasDocument = documentFor(useCanvasStore.getState().canvases, canvasId)
++  // #353(方案B):demo seed 的副本拿新 id + projectId=undefined,双重逃逸下方 demo 判定,
++  //   改动会向服务端不存在的 canvas 提交并必然终态拒绝(edit/delete/reorder missing bundle
++  //   base;create 404)。duplicateCanvas 已给这类副本打 localOnly 持久化标记,在同一收口点拦。
++  if (canvasDocument.localOnly) {
++    debugLogger.warn(
++      SOURCE,
++      `local-only canvas ${canvasId} sync skipped: ${changes.length} change(s) not submitted (#353 — demo 副本不上服务端,本地已生效)`,
++    )
++    return Promise.resolve()
++  }
++  if (isDemoSeedCanvasId(canvasId, canvasDocument.projectId)) {
+     debugLogger.warn(
+       SOURCE,
+       `demo seed canvas ${canvasId} sync skipped: ${changes.length} change(s) not submitted (#284 同族 — demo 画布不上服务端,本地已生效)`,
+diff --git a/src/canvas/actions/markupStyleActions.ts b/src/canvas/actions/markupStyleActions.ts
+index 0bcafb7d..b8e1779f 100644
+--- a/src/canvas/actions/markupStyleActions.ts
++++ b/src/canvas/actions/markupStyleActions.ts
+@@ -338,17 +338,19 @@ const noteStyleActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[] =
+ 
+   return [
+     {
++      // #321 结构迁移:纸色板改走 color 模块(ActionColorSwatchPicker)。贴纸语义
++      // 不变——rows 只给 5 档不透明纸色、allowCustom:false 锁死自由取色。
+       id: 'markup-fill-color',
+       label: t('menu.style.fillColor'),
+       swatch: swatchForColor(fillColor),
+-      menuVariant: 'palette',
+-      children: noteFillPresets.map((preset) => ({
+-        id: `markup-fill-${preset.value}`,
+-        label: t(preset.label),
+-        swatch: swatchForColor(preset.value),
+-        selected: fillColor === preset.value,
+-        onClick: () => setMarkupStyle(runtime, { markupFillColor: preset.value }),
+-      })),
++      menuVariant: 'color-picker',
++      colorPicker: {
++        value: fillColor,
++        rows: [noteFillPresets.map((preset) => preset.value)],
++        allowCustom: false,
++        source: 'Note fill',
++        onSelect: (color) => setMarkupStyle(runtime, { markupFillColor: color }),
++      },
+       onClick: () => setMarkupStyle(runtime, { markupFillColor: defaultNoteFillColor }),
+     },
+   ]
+@@ -429,17 +431,19 @@ export const markupMultiStyleActionsFor = (runtime: CanvasActionRuntime): Canvas
+ 
+     return [
+       {
++        // #321 结构迁移:同单选贴纸,多选纸色板也走 color 模块;混合取值时
++        // value=undefined,色板自然无选中环(原 palette 变体同语义)。
+         id: 'markup-fill-color',
+         label: t('menu.style.fillColor'),
+         swatch: swatchForColor(effectiveFillOf(primary?.markupFillColor)),
+-        menuVariant: 'palette',
+-        children: noteFillPresets.map((preset) => ({
+-          id: `markup-fill-${preset.value}`,
+-          label: t(preset.label),
+-          swatch: swatchForColor(preset.value),
+-          selected: commonFill === preset.value,
+-          onClick: () => setSelectedMarkupStyle(runtime, { markupFillColor: preset.value }),
+-        })),
++        menuVariant: 'color-picker',
++        colorPicker: {
++          value: commonFill,
++          rows: [noteFillPresets.map((preset) => preset.value)],
++          allowCustom: false,
++          source: 'Note fill (multi)',
++          onSelect: (color) => setSelectedMarkupStyle(runtime, { markupFillColor: color }),
++        },
+       },
+     ]
+   }
+diff --git a/src/canvas/actions/multiSelectionActions.test.ts b/src/canvas/actions/multiSelectionActions.test.ts
+index 08c5d01d..63b213cc 100644
+--- a/src/canvas/actions/multiSelectionActions.test.ts
++++ b/src/canvas/actions/multiSelectionActions.test.ts
+@@ -17,6 +17,7 @@
+ import { describe, expect, it, vi } from 'vitest'
+ import { quickToolbarGroupsFor } from './canvasActionModel'
+ import { createCanvasSelectionContext } from './canvasSelectionModel'
++import { noteFillPresets } from './markupStylePresets'
+ import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
+ import type { CanvasNodeType, MarkupKind, MivoCanvasNode } from '../../types/mivoCanvas'
+ 
+@@ -183,31 +184,32 @@ describe('multiSelectionActions · structure', () => {
+ // ─── P2:同类多选共享样式 ────────────────────────────────────────────────────────
+ 
+ describe('multiSelectionActions · P2 同类共享样式', () => {
+-  it('multi note×2 → 前置 multi-style 组(纸色板),子项分发 updateSelectedMarkupStyle', () => {
++  // #321 结构迁移:纸色板从 palette 变体(swatch 子项)改走 color 模块 colorPicker 配置。
++  it('multi note×2 → 前置 multi-style 组(纸色板走 colorPicker),onSelect 分发 updateSelectedMarkupStyle', () => {
+     const rt = createRuntime(ctx([markupNode('a', 'note'), markupNode('b', 'note')]))
+     const groups = quickToolbarGroupsFor(rt)
+     expect(orderedGroupIds(groups)).toEqual(['multi-style', 'multi'])
+     const fill = findAction(groups, 'markup-fill-color')
+-    expect(fill?.menuVariant).toBe('palette')
+-    const firstPreset = fill?.children?.[0]
+-    expect(firstPreset).toBeDefined()
+-    fire(groups, firstPreset!.id)
++    expect(fill?.menuVariant).toBe('color-picker')
++    // 贴纸语义:只有 5 档不透明纸色,锁死自由取色。
++    expect(fill?.colorPicker?.rows).toEqual([noteFillPresets.map((preset) => preset.value)])
++    expect(fill?.colorPicker?.allowCustom).toBe(false)
++    fill?.colorPicker?.onSelect(noteFillPresets[0].value)
+     expect(vi.mocked(rt.updateSelectedMarkupStyle)).toHaveBeenCalledTimes(1)
+     // 单节点路径不应被触发——多选样式必须走批量 action
+     expect(vi.mocked(rt.updateMarkupStyle)).not.toHaveBeenCalled()
+   })
+ 
+-  it('multi note×2 异色 → 色板无选中环(混合态);同色 → 命中共同色卡', () => {
++  it('multi note×2 异色 → colorPicker.value 空(混合态无选中环);同色 → value=共同色', () => {
+     const mixed = quickToolbarGroupsFor(
+       createRuntime(ctx([markupNode('a', 'note', { markupFillColor: '#ffd6e0' }), markupNode('b', 'note', { markupFillColor: '#cfe6ff' })])),
+     )
+-    expect(findAction(mixed, 'markup-fill-color')?.children?.some((c) => c.selected)).toBe(false)
++    expect(findAction(mixed, 'markup-fill-color')?.colorPicker?.value).toBeUndefined()
+ 
+     const same = quickToolbarGroupsFor(
+       createRuntime(ctx([markupNode('a', 'note', { markupFillColor: '#ffd6e0' }), markupNode('b', 'note', { markupFillColor: '#ffd6e0' })])),
+     )
+-    const selected = findAction(same, 'markup-fill-color')?.children?.filter((c) => c.selected)
+-    expect(selected?.map((c) => c.id)).toEqual(['markup-fill-#ffd6e0'])
++    expect(findAction(same, 'markup-fill-color')?.colorPicker?.value).toBe('#ffd6e0')
+   })
+ 
+   it('multi 线族(line+arrow 混排算同族)→ 线色 + 线宽', () => {
+diff --git a/src/canvas/color/ActionColorSwatchPicker.tsx b/src/canvas/color/ActionColorSwatchPicker.tsx
+index 60a24ffc..4797988a 100644
+--- a/src/canvas/color/ActionColorSwatchPicker.tsx
++++ b/src/canvas/color/ActionColorSwatchPicker.tsx
+@@ -13,6 +13,10 @@ export type ColorPickerActionConfig = {
+   alpha?: number
+   /** Debug Log 来源标签(透传给 ColorSwatchPicker 的 source)。 */
+   source: string
++  /** 覆盖预设色行(默认 baseSwatchRows)。贴纸纸色这类"受限预设"场景传自己的一排。 */
++  rows?: string[][]
++  /** 是否附自由取色 chip(默认 true)。贴纸必须锁死在预设纸色内,传 false。 */
++  allowCustom?: boolean
+   onSelect: (color: string) => void
+ }
+ 
+@@ -26,7 +30,8 @@ export function ActionColorSwatchPicker({ config }: { config: ColorPickerActionC
+     <ColorSwatchPicker
+       value={config.value}
+       source={config.source}
+-      rows={baseSwatchRows}
++      rows={config.rows ?? baseSwatchRows}
++      allowCustom={config.allowCustom ?? true}
+       alpha={config.alpha}
+       onSelect={config.onSelect}
+     />
+diff --git a/src/lib/persistBoot.integration.test.ts b/src/lib/persistBoot.integration.test.ts
+index e3a85363..3d73f9f7 100644
+--- a/src/lib/persistBoot.integration.test.ts
++++ b/src/lib/persistBoot.integration.test.ts
+@@ -539,6 +539,41 @@ describe('G1-a R2 F2 — canvas-meta hydrate 合并进 store.canvases(不 only-l
+     expect(c.metaRevision).toBe(7)
+     expect(c.nodes).toEqual([localNode]) // 本地 content 保留(G1-c content hydrate 未跑)
+   })
++
++  it('SC-4: server 列表含 X + 本地 X.localOnly=true → merged X 剥除 localOnly + 恰一条 warn;本地-only(不在 server)保留', async () => {
++    const warnSpy = vi.spyOn(debugLogger, 'warn').mockImplementation(() => undefined)
++    useCanvasStore.setState({
++      sceneId: 'c-srv',
++      canvases: {
++        // X:localOnly=true 但服务端确实存在(被污染的 localOnly bit,会永久跳同步分叉)。
++        'c-srv': { title: 'X', projectId: 'p1', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [], localOnly: true } as never,
++        // Y:localOnly=true 且不在服务端列表(真正的本地-only 副本,duplicate demo seed 产物)。
++        'c-local-only': { title: 'Y', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [], localOnly: true } as never,
++      },
++    })
++    const fakeAdapter = {
++      listProjects: async () => ({ projects: [] }),
++      listCanvas: async () => ({ canvases: [canvasMeta('c-srv', 'p1', 'X-srv', 5)] }),
++      listChatMessages: async () => ({ messages: [], orderRevision: 0 }),
++    } as unknown as ServerPersistAdapter
++    const fakeOpts = {
++      fetch: async () => new Response(JSON.stringify({ entries: {} }), { status: 200, headers: { 'content-type': 'application/json' } }),
++      baseUrl: '',
++      getAuthHeaders: () => authHeaders(),
++    }
++    await hydrateFromServer(fakeAdapter, fakeOpts)
++    // X(在 server 列表):localOnly 被剥除 + meta 刷新。
++    const x = useCanvasStore.getState().canvases['c-srv']!
++    expect(x.localOnly).toBeUndefined()
++    expect(x.title).toBe('X-srv')
++    expect(x.metaRevision).toBe(5)
++    // Y(不在 server 列表):localOnly 保留(本地-only 副本不动)。
++    expect(useCanvasStore.getState().canvases['c-local-only']!.localOnly).toBe(true)
++    // 恰一条 warn(X 的 localOnly 剥除留痕;Y 不剥除不 warn)。fail-visible。
++    const stripWarns = warnSpy.mock.calls.filter((c) => typeof c[1] === 'string' && c[1].includes('stripping polluted localOnly'))
++    expect(stripWarns).toHaveLength(1)
++    warnSpy.mockRestore()
++  })
+ })
+ 
+ describe('G1-a R2 F2 — user-state hydrate 落点(不 only-log)', () => {
+diff --git a/src/lib/persistBoot.ts b/src/lib/persistBoot.ts
+index ca7f2084..700b245e 100644
+--- a/src/lib/persistBoot.ts
++++ b/src/lib/persistBoot.ts
+@@ -849,6 +849,8 @@ export const hydrateFromServer = async (
+     let migrationCanvasCandidates = 0
+     let gapNoProject = 0
+     let skippedDemoCanvases = 0
++    // #353(方案B):local-only 画布(demo 副本)的显式跳过计数(boot-skip-local-only)。
++    let skippedLocalOnly = 0
+     // Phase 1 项3(2026-07-16 orphan-parent 跳收集,CR-2,与项2 停清 projectId 配套):停清后(项2),
+     //   projectId 指向"不在服务端列表且不在本地 candidates 集"项目的画布,会在下方被收集成 createCanvas op
+     //   → 服务端无此 project → 404 unknown-project terminal → F1(:280-311)永不种 marker → 每 boot 重收集 +
+@@ -866,6 +868,12 @@ export const hydrateFromServer = async (
+       const migratableParentIds = new Set(useCanvasStore.getState().projects.map((p) => p.id))
+       for (const [id, doc] of localCanvasEntries) {
+         if (serverCanvasIds.has(id)) continue // 已在服务端,不重复入队(SC-G)
++        // #353(方案B):local-only 画布(demo 副本)显式跳过——它有意不上服务端,
++        //   单独计数(boot-skip-local-only),不再混进 gapNoProject 的"疑似缺口"口径。
++        if (doc.localOnly) {
++          skippedLocalOnly++
++          continue
++        }
+         if (!doc.projectId) {
+           // demo/无 projectId canvas 无法 createCanvas(op projectId 必填)→ 跳过,fail-visible 计数。
+           gapNoProject++
+@@ -889,10 +897,10 @@ export const hydrateFromServer = async (
+         })
+         migrationCanvasCandidates++
+       }
+-      if (migrationCanvasCandidates > 0 || gapNoProject > 0 || skippedDemoCanvases > 0 || skippedOrphanParent > 0) {
++      if (migrationCanvasCandidates > 0 || gapNoProject > 0 || skippedDemoCanvases > 0 || skippedOrphanParent > 0 || skippedLocalOnly > 0) {
+         debugLogger.log(
+           SOURCE,
+-          `server hydrate: ${localCanvasEntries.length} local canvas(s) → migration-on-boot (createCanvas meta ops collected for ${migrationCanvasCandidates} local-only candidate(s)${gapNoProject > 0 ? `; ${gapNoProject} skipped (no projectId — demo, not migrable)` : ''}${skippedDemoCanvases > 0 ? `; ${skippedDemoCanvases} demo seed canvas(s) skipped (not migrated — would 404 unknown-project cross-owner; kept local)` : ''}${skippedOrphanParent > 0 ? `; ${skippedOrphanParent} orphan-parent canvas(s) skipped (projectId not migratable — not on server nor local candidate; would 404 unknown-project terminal + ERROR loop; kept local)` : ''}; content(nodes/edges) NOT migrated — V1 meta-only gap, retained local — see report)`,
++          `server hydrate: ${localCanvasEntries.length} local canvas(s) → migration-on-boot (createCanvas meta ops collected for ${migrationCanvasCandidates} local-only candidate(s)${gapNoProject > 0 ? `; ${gapNoProject} skipped (no projectId — demo, not migrable)` : ''}${skippedDemoCanvases > 0 ? `; ${skippedDemoCanvases} demo seed canvas(s) skipped (not migrated — would 404 unknown-project cross-owner; kept local)` : ''}${skippedLocalOnly > 0 ? `; ${skippedLocalOnly} local-only canvas(s) skipped (boot-skip-local-only — demo copy, intentionally not on server, #353)` : ''}${skippedOrphanParent > 0 ? `; ${skippedOrphanParent} orphan-parent canvas(s) skipped (projectId not migratable — not on server nor local candidate; would 404 unknown-project terminal + ERROR loop; kept local)` : ''}; content(nodes/edges) NOT migrated — V1 meta-only gap, retained local — see report)`,
+         )
+       }
+     }
+@@ -910,17 +918,30 @@ export const hydrateFromServer = async (
+         for (const meta of serverCanvases) {
+           const existing = local[meta.id]
+           if (existing) {
++            // SC-4(codex-major3):canvas 存在于服务端 → 强制剥除被污染的 localOnly bit,否则该画布永久跳同步分叉
++            //   (localOnly 仅对"不在服务端"的副本成立;此分支 id ∈ serverCanvases,localOnly:true 是脏数据,
++            //   多由 duplicate demo seed 副本 #353 打标后未在 hydrate 时清理)。fail-visible 留痕(模块禁静态
++            //   import store,沿用 debugLogger.warn 与既有 hydrate 日志同口径)。
++            if (existing.localOnly) {
++              debugLogger.warn(
++                SOURCE,
++                `hydrate: canvas ${meta.id} exists on server — stripping polluted localOnly bit (would permanently fork sync)`,
++              )
++            }
++            // 剥除 localOnly(服务端存在的画布不应带该 bit);spread 副本 + delete 避免 unused-var。
++            const rest = { ...existing }
++            delete rest.localOnly
+             // 刷新 meta 字段,保留本地 content(nodes/edges/tasks/selection)+ sourceTemplateId
+             // (sourceTemplateId 客户端是 DemoSceneId,服务端 string 不覆盖)。
+             merged[meta.id] = {
+-              ...existing,
++              ...rest,
+               title: meta.title,
+               projectId: meta.projectId,
+               metaRevision: meta.metaRevision,
+               contentVersion: meta.contentVersion,
+               updatedAt: meta.updatedAt,
+               // CR-8(Phase 2 归档):status 以 server 为准 reconcile(server archived→archived / 缺省→active),
+-              //   跨设备归档生效。archivedByCascade 是客户端本地字段(wire 不暴露),保留本地既有值(...existing 带)。
++              //   跨设备归档生效。archivedByCascade 是客户端本地字段(wire 不暴露),保留本地既有值(...rest 带)。
+               status: meta.status,
+             }
+           } else {
+diff --git a/src/lib/persistIdbStorage.fx6.test.ts b/src/lib/persistIdbStorage.fx6.test.ts
+index c5730478..f5a0a975 100644
+--- a/src/lib/persistIdbStorage.fx6.test.ts
++++ b/src/lib/persistIdbStorage.fx6.test.ts
+@@ -5,6 +5,8 @@ import {
+   idbStateStorage,
+ } from './persistIdbStorage'
+ import { __resetPersistUserId as resetUserId, setPersistUserId } from './persistUserId'
++import * as puid from './persistUserId'
++import { debugLogger } from '../store/debugLogStore'
+ 
+ // FX-6 acceptance tests — per-user cache namespacing for the canvas/chat KV
+ // adapter. Reuses the same in-memory IDB mock shape as persistIdbStorage.test.ts
+@@ -34,38 +36,108 @@ const memStorage = () => {
+ // Minimal in-memory IDB factory covering the adapter's touch points:
+ // open(name, version) → onupgradeneeded / onsuccess → IDBDatabase
+ // db.transaction(store, mode) → IDBTransaction.objectStore()
+-// store.get/put/delete → IDBRequest.onsuccess (microtask) then tx.oncomplete.
+-// Not spec-compliant — enough surface for idbStateStorage's three operations.
++// store.get/put/delete → IDBRequest.onsuccess then tx.oncomplete.
++//
++// codex-B2:扩展为支持 ① 单事务多操作(链式 await requestToPromise 之间不提前 commit——
++// pending 计数 + oncomplete 在 pending 归零的 microtask 才排程,新请求到达则重排)和
++// ② readwrite 事务串行化(同 store 的 readwrite 事务排队,FIFO,排队中的事务其请求
++// result **延迟到激活时**计算——看到前一事务提交后的状态,faithful IDB 语义)。readonly
++// 事务并发运行(不排队)。这让 migrateToNamespaced 的单事务认领在并发下可证先到先得。
+ const makeInMemoryIdb = (): IDBFactory => {
+   const dbs = new Map<string, { stores: Map<string, Map<string, unknown>>; version: number }>()
++  // Per-store readwrite serialization state (faithful IDB: a readwrite tx excludes other
++  // txs on the same store; they queue and run one at a time).
++  const storeStates = new WeakMap<Map<string, unknown>, { rwActive: boolean; rwQueue: Array<() => void> }>()
++  const getStoreState = (map: Map<string, unknown>) => {
++    let s = storeStates.get(map)
++    if (!s) {
++      s = { rwActive: false, rwQueue: [] }
++      storeStates.set(map, s)
++    }
++    return s
++  }
+ 
+-  const makeStore = (
+-    map: Map<string, unknown>,
+-    scheduleTxComplete: () => void,
+-  ): IDBObjectStore => {
+-    const mkReq = <T>(result: T, error: DOMException | null = null) => {
+-      const r = { onsuccess: null, onerror: null, result, error } as unknown as IDBRequest<T>
+-      queueMicrotask(() => {
+-        if (error) {
+-          ;(r as unknown as { onerror: ((ev: Event) => void) | null }).onerror?.(new Event('error'))
++  type Controller = {
++    mode: IDBTransactionMode
++    active: boolean
++    pending: number
++    completeScheduled: boolean
++    done: boolean
++    deferred: Array<() => void>
++    tx: { oncomplete: ((ev: Event) => void) | null; onerror: ((ev: Event) => void) | null; onabort: ((ev: Event) => void) | null; error: unknown }
++    storeState: { rwActive: boolean; rwQueue: Array<() => void> }
++  }
++
++  // Schedule tx.oncomplete (microtask) when pending hits 0. Re-arms: if a new request
++  // arrives before the scheduled microtask fires (pending > 0), the microtask no-ops and
++  // the next settle re-schedules — so a single readwrite tx can chain get→get→put→delete
++  // (each awaited) without oncomplete firing prematurely.
++  const scheduleComplete = (controller: Controller): void => {
++    if (controller.pending > 0) return
++    if (controller.completeScheduled) return
++    controller.completeScheduled = true
++    queueMicrotask(() => {
++      controller.completeScheduled = false
++      if (controller.pending > 0 || controller.done) return
++      controller.done = true
++      controller.tx.oncomplete?.(new Event('complete'))
++      // Release the readwrite slot + drain the queue (FIFO).
++      if (controller.mode === 'readwrite') {
++        const st = controller.storeState
++        if (st.rwQueue.length > 0) {
++          const next = st.rwQueue.shift()!
++          next()
+         } else {
+-          ;(r as unknown as { onsuccess: ((ev: Event) => void) | null }).onsuccess?.(new Event('success'))
++          st.rwActive = false
+         }
+-        scheduleTxComplete()
+-      })
+-      return r
++      }
++    })
++  }
++
++  const makeStore = (map: Map<string, unknown>, controller: Controller) => {
++    // MockReq 用可变 result(IDBRequest.result 是 readonly,直接 cast 会 TS2540)。
++    type MockReq = { onsuccess: ((ev: Event) => void) | null; onerror: ((ev: Event) => void) | null; result: unknown; error: DOMException | null }
++    // result 计算与 settle:active 时 result 即时算(状态即当前)、microtask settle;
++    // 排队中(active=false)时 result **延迟到激活时**算——看到前一事务提交后的状态。
++    const mkReq = (compute: () => unknown, error: DOMException | null = null): IDBRequest => {
++      const r: MockReq = { onsuccess: null, onerror: null, result: undefined, error }
++      if (controller.active) {
++        controller.pending++
++        r.result = compute()
++        queueMicrotask(() => {
++          controller.pending--
++          if (error) {
++            ;(r).onerror?.(new Event('error'))
++          } else {
++            ;(r).onsuccess?.(new Event('success'))
++          }
++          scheduleComplete(controller)
++        })
++      } else {
++        controller.deferred.push(() => {
++          r.result = compute()
++          if (error) {
++            ;(r).onerror?.(new Event('error'))
++          } else {
++            ;(r).onsuccess?.(new Event('success'))
++          }
++          // 激活后此 op 已 settle;若 callback 此后无新 op(run 早返回 / throw),
++          // pending 仍 0 → scheduleComplete 安排 oncomplete。
++          scheduleComplete(controller)
++        })
++      }
++      return r as unknown as IDBRequest
+     }
+     return {
+-      get: (key: string) => mkReq(map.has(key) ? map.get(key) : undefined),
++      get: (key: string) => mkReq(() => (map.has(key) ? map.get(key) : undefined)),
+       put: (value: unknown) => {
+         const rec = value as { key?: string }
+-        if (rec && typeof rec.key === 'string') map.set(rec.key, value)
+-        return mkReq<unknown>(rec?.key)
+-      },
+-      delete: (key: string) => {
+-        map.delete(key)
+-        return mkReq<unknown>(undefined)
++        return mkReq(() => {
++          if (rec && typeof rec.key === 'string') map.set(rec.key, value)
++          return undefined
++        })
+       },
++      delete: (key: string) => mkReq(() => { map.delete(key); return undefined }),
+     } as unknown as IDBObjectStore
+   }
+ 
+@@ -84,25 +156,50 @@ const makeInMemoryIdb = (): IDBFactory => {
+           createObjectStore: (storeName: string) => {
+             const m = new Map<string, unknown>()
+             entry!.stores.set(storeName, m)
+-            return makeStore(m, () => {})
++            const st = getStoreState(m)
++            const dummy = { mode: 'readonly', active: true, pending: 0, completeScheduled: false, done: false, deferred: [], tx: { oncomplete: null, onerror: null, onabort: null, error: null }, storeState: st } as unknown as Controller
++            return makeStore(m, dummy)
+           },
+-          transaction: (storeName: string) => {
+-            let storeMap = entry!.stores.get(storeName)
+-            if (!storeMap) {
+-              storeMap = new Map<string, unknown>()
+-              entry!.stores.set(storeName, storeMap)
++          transaction: (storeName: string, mode: IDBTransactionMode = 'readonly') => {
++            let map = entry!.stores.get(storeName)
++            if (!map) {
++              map = new Map<string, unknown>()
++              entry!.stores.set(storeName, map)
++            }
++            const storeState = getStoreState(map)
++            const controller: Controller = {
++              mode,
++              active: false,
++              pending: 0,
++              completeScheduled: false,
++              done: false,
++              deferred: [],
++              tx: { oncomplete: null, onerror: null, onabort: null, error: null },
++              storeState,
++            }
++            const tx = controller.tx as unknown as IDBTransaction
++            const store = makeStore(map, controller)
++
++            const activate = () => {
++              controller.active = true
++              // 排队期间 callback 已同步发了一个 deferred op(在第一个 await 挂起);激活时 settle 它。
++              const first = controller.deferred.shift()
++              if (first) first()
++              // 若 callback 未发 op 就返回(罕见:run 早 return / throw),deferred 空 → 直接触发 oncomplete。
++              if (!first) scheduleComplete(controller)
+             }
+-            const tx = { oncomplete: null, onerror: null, onabort: null, error: null } as unknown as IDBTransaction
+-            let completeScheduled = false
+-            const scheduleTxComplete = () => {
+-              if (completeScheduled) return
+-              completeScheduled = true
+-              queueMicrotask(() => {
+-                ;(tx as unknown as { oncomplete: ((ev: Event) => void) | null }).oncomplete?.(new Event('complete'))
+-              })
++
++            ;(tx as unknown as { objectStore: () => IDBObjectStore }).objectStore = () => store
++            if (mode === 'readwrite') {
++              if (storeState.rwActive) {
++                storeState.rwQueue.push(activate)
++              } else {
++                storeState.rwActive = true
++                controller.active = true
++              }
++            } else {
++              controller.active = true
+             }
+-            ;(tx as unknown as { objectStore: () => IDBObjectStore }).objectStore = () =>
+-              makeStore(storeMap!, scheduleTxComplete)
+             return tx
+           },
+           close: () => {},
+@@ -249,6 +346,140 @@ describe('FX-6: legacy → namespaced migration (one-time, data-loss prevention)
+   })
+ })
+ 
++describe('FX-6 #360(方案B): 空库首读后到达的 legacy raw 仍被认领(stale-raw 重查)', () => {
++  it('B1: 认证空库首读 null → 旧 tab 事后写入 legacy raw → 同 user 再读认领到数据', async () => {
++    // 新版 tab 先启动:空库、认证态,首读拿 null(原 latch 实现会在这里置位 marker)。
++    setPersistUserId('userA')
++    expect(await idbStateStorage.getItem(CANVAS)).toBeNull()
++    // 旧版 tab 此后才写入 legacy raw(pre-FX-6 代码写 raw key = anonymous 命名空间)。
++    setPersistUserId('anonymous')
++    await idbStateStorage.setItem(CANVAS, 'late-legacy')
++    // 同一 user 再读:方案B 重查 raw → 认领。原 latch 实现这里永远 null(#360 根因)。
++    setPersistUserId('userA')
++    expect(await idbStateStorage.getItem(CANVAS)).toBe('late-legacy')
++    // 认领 = copy + delete raw:anonymous 侧已空。
++    setPersistUserId('anonymous')
++    expect(await idbStateStorage.getItem(CANVAS)).toBeNull()
++  })
++
++  it('B2: 认领后再次出现的 stale raw 不覆盖 namespaced 数据(防倒灌不回归)', async () => {
++    setPersistUserId('userA')
++    expect(await idbStateStorage.getItem(CANVAS)).toBeNull()
++    setPersistUserId('anonymous')
++    await idbStateStorage.setItem(CANVAS, 'late-legacy')
++    setPersistUserId('userA')
++    expect(await idbStateStorage.getItem(CANVAS)).toBe('late-legacy') // 认领
++    await idbStateStorage.setItem(CANVAS, 'A-after-claim')
++    // 又一个从未升级的 tab 写入更旧的 raw —— 不许覆盖 A 的新数据。
++    setPersistUserId('anonymous')
++    await idbStateStorage.setItem(CANVAS, 'staler-legacy')
++    setPersistUserId('userA')
++    expect(await idbStateStorage.getItem(CANVAS)).toBe('A-after-claim')
++  })
++
++  it('B3: 空库反复读不产生副作用,raw 到达前一直 null、到达后立即认领', async () => {
++    setPersistUserId('userA')
++    expect(await idbStateStorage.getItem(CANVAS)).toBeNull()
++    expect(await idbStateStorage.getItem(CANVAS)).toBeNull()
++    expect(await idbStateStorage.getItem(CHAT)).toBeNull()
++    setPersistUserId('anonymous')
++    await idbStateStorage.setItem(CHAT, 'late-chat')
++    setPersistUserId('userA')
++    expect(await idbStateStorage.getItem(CHAT)).toBe('late-chat')
++    expect(await idbStateStorage.getItem(CANVAS)).toBeNull()
++  })
++
++  it('B4: 跨版本 tab 竞态正反例 — 先到先得,后到的 user 拿不到已认领数据', async () => {
++    // userA 空库首读(不再置任何 latch)。
++    setPersistUserId('userA')
++    expect(await idbStateStorage.getItem(CANVAS)).toBeNull()
++    // 旧 tab 写 raw;userB 抢先读 → B 认领。
++    setPersistUserId('anonymous')
++    await idbStateStorage.setItem(CANVAS, 'late-legacy')
++    setPersistUserId('userB')
++    expect(await idbStateStorage.getItem(CANVAS)).toBe('late-legacy')
++    // A 再读:raw 已被 B 认领删除,A 仍 null(与既有"先到先得"语义一致)。
++    setPersistUserId('userA')
++    expect(await idbStateStorage.getItem(CANVAS)).toBeNull()
++  })
++})
++
++// codex-B2:并发认领原子化——单 readwrite 事务内 get→get→put→delete。IDB 串行化同 store 的
++// readwrite 事务,故两个交错 getItem 恰一方认领(raw 恰删一次)、另一方 null。
++describe('FX-6 codex-B2: 并发认领原子化(单 readwrite 事务,先到先得)', () => {
++  it('同 user 双 tab 并发认领:恰一方执行认领(put+delete+log),另一方见已存在跳过;raw 恰删一次', async () => {
++    setPersistUserId('anonymous')
++    await idbStateStorage.setItem(CANVAS, 'legacy')
++    const logSpy = vi.spyOn(debugLogger, 'log').mockImplementation(() => undefined)
++    setPersistUserId('userA')
++    const [r1, r2] = await Promise.all([
++      idbStateStorage.getItem(CANVAS),
++      idbStateStorage.getItem(CANVAS),
++    ])
++    // 两 tab 共享 userA namespace:都拿到 legacy(首者写入 namespaced,次者在单事务内 get(physical)=
++    //   present → 早返回,不重复认领)。
++    expect(r1).toBe('legacy')
++    expect(r2).toBe('legacy')
++    // 恰一方认领(put+delete+log);次者跳过 → 恰一条 claim 日志(fail-visible,可观测原子性)。
++    const claims = logSpy.mock.calls.filter(
++      (c) => typeof c[1] === 'string' && c[1].includes('claimed atomically on read'),
++    )
++    expect(claims).toHaveLength(1)
++    // raw 已被认领删除(anonymous 空)。
++    setPersistUserId('anonymous')
++    expect(await idbStateStorage.getItem(CANVAS)).toBeNull()
++    logSpy.mockRestore()
++  })
++
++  it('不同 user 并发认领:恰一方认领、另一方 null(防跨账号缓存泄露)', async () => {
++    setPersistUserId('anonymous')
++    await idbStateStorage.setItem(CANVAS, 'legacy')
++    // persistUserId 是全局单例,并发 getItem 在 migrateToNamespaced 内读 uid 时已无法区分 caller
++    // (currentUserId 模块级,setPersistUserId 在首 caller 的 migrate 跑前已翻到次 caller)。用 spy 给
++    // 两个 caller 注入隔离 uid:getPersistUserId 首→userA/次→userB;namespacedKey 调用次序为
++    // A-migrate,B-migrate,A-final,B-final(奇 A 偶 B),与 caller 配对。真正模拟两 user 并发抢同一 raw。
++    let gpi = 0
++    let nsk = 0
++    const gSpy = vi.spyOn(puid, 'getPersistUserId').mockImplementation(() => {
++      gpi += 1
++      return gpi === 1 ? 'userA' : 'userB'
++    })
++    const nSpy = vi.spyOn(puid, 'namespacedKey').mockImplementation((name: string) => {
++      nsk += 1
++      const uid = nsk % 2 === 1 ? 'userA' : 'userB'
++      return `${name}:${uid}`
++    })
++    const pA = idbStateStorage.getItem(CANVAS)
++    const pB = idbStateStorage.getItem(CANVAS)
++    const [rA, rB] = await Promise.all([pA, pB])
++    gSpy.mockRestore()
++    nSpy.mockRestore()
++    // claude-R2-C1:**调用次数本身必须是断言**。奇偶配对注入依赖"恰 4 次 namespacedKey"
++    // (A-migrate, B-migrate, A-final, B-final)这条隐含不变量;将来谁改
++    // getItem / migrateToNamespaced 多调或少调一次,奇偶错位后两个 caller 可能双双解析到
++    // 同一 uid —— 本用例会静默退化成同文件上一条「同 user 双 tab」场景,而下面的断言
++    // (claimed===1 / empty===1 / raw 已删)在同 user 下**依然全部成立**,于是"防跨账号缓存
++    // 泄露"这条安全属性从此不再被验证、且没有任何信号。钉住次数,让漂移立刻红。
++    expect(nsk).toBe(4)
++    // 恰一方认领(首 caller userA),另一方 null(次 caller userB:其 readwrite 事务串行在 userA 之后,
++    //   get(raw)=null(userA 已删)→ 不复制进 userB namespace)。旧实现拆 4 事务,次 caller 的 readonly
++    //   get(name) 可交错在首 caller 的 put/delete 之前 → 见 raw 仍存在 → 复制进 userB(跨账号泄露)。
++    const claimed = [rA, rB].filter((r) => r === 'legacy').length
++    const empty = [rA, rB].filter((r) => r === null).length
++    expect(claimed).toBe(1)
++    expect(empty).toBe(1)
++    // raw 已删(认领者删)。
++    setPersistUserId('anonymous')
++    expect(await idbStateStorage.getItem(CANVAS)).toBeNull()
++    // 认领方持久持有,未认领方仍 null。
++    const aClaimed = rA === 'legacy'
++    setPersistUserId('userA')
++    expect(await idbStateStorage.getItem(CANVAS)).toBe(aClaimed ? 'legacy' : null)
++    setPersistUserId('userB')
++    expect(await idbStateStorage.getItem(CANVAS)).toBe(aClaimed ? null : 'legacy')
++  })
++})
++
+ describe('FX-6: clearCurrentUserCache — logout clears only the current namespace', () => {
+   it('clears A\'s canvas + chat without touching B', async () => {
+     setPersistUserId('userA')
+diff --git a/src/lib/persistIdbStorage.ts b/src/lib/persistIdbStorage.ts
+index c17aad90..3788b86e 100644
+--- a/src/lib/persistIdbStorage.ts
++++ b/src/lib/persistIdbStorage.ts
+@@ -104,6 +104,60 @@ const runTransaction = <T>(
+       }),
+   )
+ 
++/** Promise-wrap a single IDBRequest (onsuccess/onerror). */
++const requestToPromise = <T>(req: IDBRequest<T>): Promise<T> =>
++  new Promise<T>((resolve, reject) => {
++    req.onsuccess = () => resolve(req.result)
++    req.onerror = () => reject(req.error)
++  })
++
++/**
++ * Run a readwrite transaction that may issue MULTIPLE requests on the store
++ * (unlike runTransaction, which is single-request). The callback receives the
++ * object store and may `await requestToPromise(req)` between operations; the
++ * transaction stays alive across microtask continuations (a new request queued
++ * before the macrotask boundary keeps it from auto-committing) and resolves on
++ * `tx.oncomplete`. Used by FX-6 migrateToNamespaced's atomic claim
++ * (get→get→put→delete in ONE tx): IDB serializes readwrite transactions on a
++ * store, so two concurrent claims can't both copy the same legacy raw — the
++ * second tx sees the raw already deleted (or the namespaced key already present).
++ */
++const runReadWriteTx = async <T>(run: (store: IDBObjectStore) => Promise<T>): Promise<T> =>
++  openDb().then(
++    (db) =>
++      new Promise<T>((resolve, reject) => {
++        const tx = db.transaction(STORE_NAME, 'readwrite')
++        const store = tx.objectStore(STORE_NAME)
++        let outcome: { ok: true; value: T } | { ok: false; error: unknown } | undefined
++        run(store).then(
++          (value) => {
++            outcome = { ok: true, value }
++          },
++          (error) => {
++            outcome = { ok: false, error }
++            try {
++              tx.abort()
++            } catch {
++              // tx may already be aborting/inactive
++            }
++          },
++        )
++        tx.oncomplete = () => {
++          if (outcome?.ok) resolve(outcome.value)
++          else if (outcome?.ok === false) reject(outcome.error)
++          else reject(new Error('IDB transaction completed with no callback result'))
++        }
++        tx.onerror = () => {
++          if (outcome?.ok === false) reject(outcome.error)
++          else reject(tx.error ?? new Error('IDB transaction error'))
++        }
++        tx.onabort = () => {
++          if (outcome?.ok === false) reject(outcome.error)
++          else reject(tx.error ?? new Error('IDB transaction aborted'))
++        }
++      }),
++  )
++
+ const migratedMarker = (name: string) => `mivo-persist-migrated:${name}`
+ 
+ /**
+@@ -139,17 +193,22 @@ const migrateFromLocalStorage = async (name: string): Promise<void> => {
+   sessionStorage.setItem(migratedMarker(name), '1')
+ }
+ 
+-const nsMigratedMarker = (name: string, uid: string) => `mivo-ns-migrated:${name}:${uid}`
+-
+ /**
+- * FX-6 one-shot legacy → namespaced migration. Pre-FX-6 sessions wrote the canvas
+- * / chat state under the raw static name (no `:userId` suffix); once a user
+- * authenticates their cache must live under `name:<userId>`. On the first
++ * FX-6 legacy → namespaced migration. Pre-FX-6 sessions wrote the canvas / chat
++ * state under the raw static name (no `:userId` suffix); once a user
++ * authenticates their cache must live under `name:<userId>`. On every
+  * authenticated getItem, if the namespaced key is absent but the legacy raw key
+  * exists in IDB, copy it across and delete the legacy key — preventing data loss.
+  * Idempotent: the legacy key is deleted after a successful copy, so the next call
+- * finds the namespaced key present and short-circuits. A per-(name, user)
+- * sessionStorage marker skips the two extra IDB reads after the first boot per tab.
++ * finds the namespaced key present and returns early.
++ *
++ * #360(方案B,2026-08-01 owner 拍板):原实现有 per-(name, user) sessionStorage
++ * marker 当 one-shot latch,且**空库查无 raw 也置位** —— 跨版本 tab 重叠时(旧版
++ * tab 在新版 tab 空库启动后才写入 legacy raw),raw 永不被认领,重则空状态写回后
++ * 旧数据永久孤儿化。改为 stale-raw 重查认领:不再有 marker,namespaced 为空就查
++ * 一次 legacy raw。代价是 namespaced 有数据时每次 getItem 多一次 IDB 读——getItem
++ * 只在 rehydrate/设置读取等低频路径被调,可接受;换来"raw 何时到都认领得回"。
++ * namespaced 已有数据时 raw 仍不覆盖(防 stale raw 倒灌,语义与原实现一致)。
+  *
+  * Skipped entirely for the anonymous namespace — anonymous IS the raw key, so
+  * there is nothing to migrate and no namespaced target to migrate into. This also
+@@ -158,38 +217,37 @@ const nsMigratedMarker = (name: string, uid: string) => `mivo-ns-migrated:${name
+ const migrateToNamespaced = async (name: string): Promise<void> => {
+   const uid = getPersistUserId()
+   if (uid === ANONYMOUS_USER_ID) return
+-  if (typeof sessionStorage === 'undefined') return
+-  const marker = nsMigratedMarker(name, uid)
+-  if (sessionStorage.getItem(marker)) return
+ 
+   const physical = namespacedKey(name)
+   try {
+-    const existing = await runTransaction<KvRecord | undefined>('readonly', (store) =>
+-      store.get(physical) as IDBRequest<KvRecord | undefined>,
+-    )
+-    if (existing) {
+-      // Namespaced key already has data — nothing to migrate. Mark and done.
+-      sessionStorage.setItem(marker, '1')
+-      return
+-    }
+-    const legacy = await runTransaction<KvRecord | undefined>('readonly', (store) =>
+-      store.get(name) as IDBRequest<KvRecord | undefined>,
+-    )
+-    if (legacy) {
+-      await runTransaction('readwrite', (store) =>
++    // codex-B2:认领改为**单个 readwrite 事务**内 get(physical)→get(name)→put(physical)+delete(name)。
++    // 旧实现拆 4 个独立事务,两个已认证 tab(同用户或不同用户)可交错双双把同一 legacy raw 复制进
++    // 各自 namespace(跨账号缓存泄露 + 违背先到先得)。IDB 串行化同 store 的 readwrite 事务——先到的 tx
++    // 删掉 raw(或写入 namespaced),后到的 tx 在锁内重查 get(raw)=null / get(physical)=present → 不复制。
++    // 同事务内链式 request 合法(await requestToPromise 之间不退 macrotask,事务不自动提交)。
++    await runReadWriteTx(async (store) => {
++      const existing = await requestToPromise(
++        store.get(physical) as IDBRequest<KvRecord | undefined>,
++      )
++      if (existing) {
++        // Namespaced key already has data — stale raw must not overwrite it.
++        return
++      }
++      const legacy = await requestToPromise(
++        store.get(name) as IDBRequest<KvRecord | undefined>,
++      )
++      if (!legacy) return
++      await requestToPromise(
+         store.put({ key: physical, value: legacy.value } as unknown as KvRecord),
+       )
+-      await runTransaction('readwrite', (store) => store.delete(name))
++      await requestToPromise(store.delete(name))
+       debugLogger.log(
+         SOURCE,
+-        `migrated legacy cache key ${name} → ${physical} for user ${uid} (one-time)`,
++        `migrated legacy cache key ${name} → ${physical} for user ${uid} (claimed atomically on read)`,
+       )
+-    }
+-    // Whether we copied or found nothing, the legacy key is now either moved or
+-    // absent — mark so subsequent getItems skip the two extra reads this boot.
+-    sessionStorage.setItem(marker, '1')
++    })
+   } catch (error) {
+-    // Marker NOT set → next boot retries. Never silently lose the chance to migrate.
++    // Never silently lose the chance to migrate — next getItem retries.
+     debugLogger.warn(SOURCE, `namespace migration failed for ${name}: ${errMessage(error)}`)
+   }
+ }
+diff --git a/src/store/documentSlice.persist.test.ts b/src/store/documentSlice.persist.test.ts
+index 39b197dd..e3a0c8f1 100644
+--- a/src/store/documentSlice.persist.test.ts
++++ b/src/store/documentSlice.persist.test.ts
+@@ -554,3 +554,152 @@ describe('#302 — demo seed canvas 的 delete/duplicate/archive/unarchive guard
+     expect(calls.filter((c) => c.method === 'POST' && c.path === '/api/canvas/canvas-user-archive/archive')).toHaveLength(1)
+   })
+ })
++
++// ── #353(方案B)— demo 副本 localOnly 标记与 document 级 guard ──────────────────────
++// duplicateCanvas 出的 demo 副本拿新 id + projectId=undefined,双重逃逸 #302/#284 的
++// demo 判定 —— rename/delete 等 document 级操作会向服务端不存在的 canvas 入队,必然
++// 终态拒绝。方案B:副本打 localOnly 持久化标记,guardDemoSeedEnqueue 认得后一律
++// 本地生效、不入队(节点级 guard 见 canvasSyncRuntime.test.ts)。
++describe('#353 — demo 副本 localOnly:标记落位 + document 级操作不入队', () => {
++  const startCountingQueue = () => {
++    const counted = makeCountingFetch()
++    startPersistWriteQueue({ fetch: counted.fetch, baseUrl: '', getAuthHeaders: () => authHeaders() })
++    return counted
++  }
++  const drain = async (): Promise<void> => {
++    await flush()
++    const { drainPersistQueue } = await import('../lib/persistBoot')
++    await drainPersistQueue()
++  }
++  const seedDemoCanvas = () => {
++    useCanvasStore.setState({
++      projects: [{ id: DEMO_PROJECT_IDS.conceptBattlepass, name: 'Concept Battlepass', createdAt: 't' }],
++      canvases: { 'seed-alias': demoDoc('Demo Alias', DEMO_PROJECT_IDS.conceptBattlepass) },
++      sceneId: 'seed-alias',
++      nodes: [],
++      edges: [],
++      tasks: [],
++    } as never)
++  }
++
++  it('duplicate demo canvas → 副本带 localOnly:true;再复制副本 → 孙副本继承 localOnly', async () => {
++    startCountingQueue()
++    seedDemoCanvas()
++    const copyId = useCanvasStore.getState().duplicateCanvas('seed-alias')
++    expect(copyId).toBeTruthy()
++    expect(useCanvasStore.getState().canvases[copyId!]!.localOnly).toBe(true)
++    // 孙副本:源是 localOnly 副本(非 demo id),guard 靠标记本身认出,继续继承。
++    const grandId = useCanvasStore.getState().duplicateCanvas(copyId!)
++    expect(grandId).toBeTruthy()
++    expect(useCanvasStore.getState().canvases[grandId!]!.localOnly).toBe(true)
++    await drain()
++  })
++
++  it('rename/delete localOnly 副本 → 本地生效,不发任何 /api/canvas 请求', async () => {
++    const { calls } = startCountingQueue()
++    seedDemoCanvas()
++    const copyId = useCanvasStore.getState().duplicateCanvas('seed-alias')!
++    useCanvasStore.getState().renameCanvas(copyId, 'Renamed Copy')
++    await drain()
++    expect(useCanvasStore.getState().canvases[copyId]!.title).toBe('Renamed Copy')
++    useCanvasStore.getState().deleteCanvas(copyId)
++    await drain()
++    expect(useCanvasStore.getState().canvases[copyId]).toBeUndefined()
++    expect(calls.filter((c) => c.path.startsWith('/api/canvas'))).toHaveLength(0)
++  })
++
++  it('SC-3: archive localOnly 副本 → 本地归档生效(status=archived)、零 /api/canvas、无示例画布 toast', async () => {
++    const { calls } = startCountingQueue()
++    seedDemoCanvas()
++    const copyId = useCanvasStore.getState().duplicateCanvas('seed-alias')!
++    // 加一个 survivor,否则 resolveActiveCanvasAfterArchive 会拦(无活跃画布存留)。
++    useCanvasStore.setState((s) => ({ canvases: { ...s.canvases, survivor: demoDoc('Survivor') } }))
++    useCanvasStore.getState().archiveCanvas(copyId)
++    await drain()
++    expect(useCanvasStore.getState().canvases[copyId]!.status).toBe('archived')
++    expect(calls.filter((c) => c.path.startsWith('/api/canvas'))).toHaveLength(0)
++    // localOnly 副本放行本地归档,不应弹 demo 拦截 toast("Demo canvases can't be archived")(那是 demo seed 整体拦截的)。
++    const lastToast = useToastStore.getState().entries.at(-1)
++    expect(lastToast?.message).not.toBe("Demo canvases can't be archived") // #386 起 en 基准;写中文会永真(假绿)
++  })
++
++  it('SC-3: unarchive localOnly 副本 → 本地恢复 active、零 /api/canvas', async () => {
++    const { calls } = startCountingQueue()
++    seedDemoCanvas()
++    const copyId = useCanvasStore.getState().duplicateCanvas('seed-alias')!
++    useCanvasStore.setState((s) => ({ canvases: { ...s.canvases, survivor: demoDoc('Survivor') } }))
++    useCanvasStore.getState().archiveCanvas(copyId) // 本地归档
++    useCanvasStore.getState().unarchiveCanvas(copyId) // 本地恢复
++    await drain()
++    expect(useCanvasStore.getState().canvases[copyId]!.status).toBe('active')
++    expect(calls.filter((c) => c.path.startsWith('/api/canvas'))).toHaveLength(0)
++  })
++
++  it('SC-5: moveCanvasToProject localOnly 副本 → 本地移动生效(projectId 改)、零 /api/canvas', async () => {
++    const { calls } = startCountingQueue()
++    seedDemoCanvas()
++    const copyId = useCanvasStore.getState().duplicateCanvas('seed-alias')!
++    // 加一个真实项目作为 move target(非 demo project,否则被 #284 拦)。
++    useCanvasStore.setState((s) => ({ projects: [...s.projects, { id: 'p-real', name: 'Real Project', createdAt: 't' }] }))
++    useCanvasStore.getState().moveCanvasToProject(copyId, 'p-real')
++    await drain()
++    expect(useCanvasStore.getState().canvases[copyId]!.projectId).toBe('p-real')
++    expect(calls.filter((c) => c.path.startsWith('/api/canvas'))).toHaveLength(0)
++  })
++
++  it('SC-3: demo seed(非 localOnly)archive 仍整体拦截 + 示例画布 toast(不回归)', async () => {
++    const { calls } = startCountingQueue()
++    seedDemoCanvas()
++    useCanvasStore.setState((s) => ({ canvases: { ...s.canvases, survivor: demoDoc('Survivor') } }))
++    useCanvasStore.getState().archiveCanvas('seed-alias')
++    await drain()
++    // demo seed 整体拦截:status 不变 + 无 /api/canvas + toast。
++    expect(useCanvasStore.getState().canvases['seed-alias']!.status).not.toBe('archived')
++    expect(calls.filter((c) => c.path.startsWith('/api/canvas'))).toHaveLength(0)
++    expect(useToastStore.getState().entries.at(-1)).toMatchObject({
++      level: 'warning',
++      message: "Demo canvases can't be archived" // #386 起 toast 走 i18n(en 基准 toast.document.demoNoArchiveCanvas),
++    })
++  })
++
++  // codex-R2-A1(delta major):seed 判定必须无条件优先于 localOnly 位。原实现
++  //   `isDemoSeedCanvasId(...) && !document.localOnly` 让被污染/伪造 localOnly:true 的**真 seed**
++  //   绕过整体拦截 → persisted archived 覆盖 initial seed、hydrate 不恢复 active = 永久丢示例画布。
++  //   上一条用例只覆盖"非 localOnly 的 seed",故对该绕过假绿;本例专钉污染态。
++  it('codex-R2-A1: 真 demo seed 被污染 localOnly:true 后 archive 仍整体拦截(seed 硬身份优先)', async () => {
++    const { calls } = startCountingQueue()
++    seedDemoCanvas()
++    // 污染:给真 seed 画布强行置 localOnly(模拟脏持久化数据 / 伪造位)。
++    useCanvasStore.setState((s) => ({
++      canvases: {
++        ...s.canvases,
++        'seed-alias': { ...s.canvases['seed-alias']!, localOnly: true },
++        survivor: demoDoc('Survivor'),
++      },
++    }))
++    useCanvasStore.getState().archiveCanvas('seed-alias')
++    await drain()
++    // 仍须拦截:status 不变 + 零 /api/canvas + demo 拦截 toast。
++    expect(useCanvasStore.getState().canvases['seed-alias']!.status).not.toBe('archived')
++    expect(calls.filter((c) => c.path.startsWith('/api/canvas'))).toHaveLength(0)
++    expect(useToastStore.getState().entries.at(-1)).toMatchObject({
++      level: 'warning',
++      message: "Demo canvases can't be archived",
++    })
++  })
++
++  it('变异防护:非 localOnly 的普通画布 rename 仍正常入队(拦截依据是标记,不是误伤全体)', async () => {
++    const { calls } = startCountingQueue()
++    useCanvasStore.setState({
++      projects: [{ id: 'p-real', name: 'My Project', createdAt: 't' }],
++      canvases: { 'canvas-real': { ...demoDoc('Real', 'p-real'), metaRevision: 3 } },
++      sceneId: 'canvas-real',
++      nodes: [],
++      edges: [],
++      tasks: [],
++    } as never)
++    useCanvasStore.getState().renameCanvas('canvas-real', 'Renamed Real')
++    await drain()
++    expect(calls.filter((c) => c.path.startsWith('/api/canvas')).length).toBeGreaterThan(0)
++  })
++})
+diff --git a/src/store/documentSlice.ts b/src/store/documentSlice.ts
+index 43848ed2..8901cb8a 100644
+--- a/src/store/documentSlice.ts
++++ b/src/store/documentSlice.ts
+@@ -68,7 +68,13 @@ const guardDemoSeedEnqueue = (
+   canvasId: string,
+   projectId: string | undefined,
+   localOutcome: string,
++  localOnly?: boolean,
+ ): boolean => {
++  // #353(方案B):local-only 画布(demo 副本)与 demo seed 同待遇——本地生效,不入队。
++  if (localOnly) {
++    warnCanvas(`${action} ${canvasId} not enqueued: local-only canvas (#353 — ${localOutcome})`)
++    return true
++  }
+   if (!isDemoSeedCanvasId(canvasId, projectId)) return false
+   warnCanvas(`${action} ${canvasId} not enqueued: demo seed canvas (#302 — ${localOutcome})`)
+   return true
+@@ -209,6 +215,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
+       sourceId,
+       sourceDocument.projectId,
+       'copy kept locally as standalone; demo project does not exist on server',
++      sourceDocument.localOnly,
+     )
+     const id = createCanvasId()
+     // C8: duplicate does NOT inherit the source's timestamps — the copy is a new
+@@ -241,6 +248,11 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
+       }),
+       createdAt: now,
+       updatedAt: now,
++      // #353(方案B):demo seed / local-only 源的副本显式打 localOnly——副本新 id 不在
++      // DEMO_SCENE_ID_SET、projectId 又是 undefined,原本双重逃逸所有 demo guard,改动
++      // 会向服务端不存在的 canvas 提交。打标后同步各路径按 local-only 跳过(见
++      // canvasSyncRuntime / guardDemoSeedEnqueue / persistBoot)。
++      ...(demoSeedSource ? { localOnly: true as const } : {}),
+     }
+ 
+     set((current) => ({
+@@ -290,6 +302,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
+         targetId,
+         state.canvases[targetId].projectId,
+         'local delete applied; seed revives on next hydrate',
++        state.canvases[targetId].localOnly,
+       )
+ 
+       const remainingCanvases = { ...state.canvases }
+@@ -343,12 +356,28 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
+         warnCanvas(`Archive canvas skipped: already archived ${targetId}`)
+         return {}
+       }
+-      // 与 delete 不同，persisted archived document 会覆盖 initial seed，后续 hydrate 不会恢复 active。
+-      // 若只跳过入队会造成客户端 archived / 服务端无记录的长期矛盾，故整体拦截。
+-      if (guardDemoSeedEnqueue('archiveCanvas', targetId, document.projectId, 'archive blocked to keep seed active')) {
++      // SC-3(codex-major4 / claude-A1):区分 demo seed 与 localOnly 两因——旧实现用 guardDemoSeedEnqueue
++      //   当整体拦截开关,对 localOnly 也整体拦截 + demo 拦截 toast,但该语义只对 demo seed 成立
++      //   (persisted archived 会覆盖 initial seed,后续 hydrate 不恢复 active)。localOnly 副本不在服务端,
++      //   归档本地生效(status='archived')+ 跳 enqueue(warnCanvas 留痕,口径同 unarchiveCanvas)。
++      //   **seed 判定无条件优先(codex-R2-A1)**:demo seed 是硬身份(id ∈ DEMO_SCENE_ID_SET 或归属
++      //   DEMO_PROJECT_ID_SET),不得被 localOnly 位覆盖 —— 一个被污染/伪造 localOnly:true 的真 seed
++      //   若放行归档,persisted archived 覆盖 initial seed 后 hydrate 不恢复 active = 永久丢示例画布。
++      //   localOnly 副本天然不是 seed(duplicateCanvas 给 demo 副本的 projectId 恒 undefined + 新
++      //   canvas id 不在 DEMO_SCENE_ID_SET),故无需 !localOnly 限定即可正确落到下方本地归档路径。
++      if (isDemoSeedCanvasId(targetId, document.projectId)) {
+         toastFeedback.warn(t('toast.document.demoNoArchiveCanvas'))
+         return {}
+       }
++      // localOnly 副本不在服务端 → 跳 enqueue(本地归档已生效);warnCanvas 留痕(#353 口径)。
++      // guardDemoSeedEnqueue 对 localOnly 返 true 并 warn(demo seed 已上方整体拦截,此处 true 只可能是 localOnly)。
++      const skipArchiveEnqueue = guardDemoSeedEnqueue(
++        'archiveCanvas',
++        targetId,
++        document.projectId,
++        'local archive applied; local-only canvas not persisted (#353)',
++        document.localOnly,
++      )
+       const nextCanvases = {
+         ...state.canvases,
+         [targetId]: { ...document, status: 'archived' as const, archivedByCascade: false },
+@@ -362,7 +391,10 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
+ 
+       logCanvas(`Archived canvas "${document.title}" (${targetId})`)
+       // 直接归档:archivedByCascade=false(unarchiveProject 不恢复此画布;CR-5)。server 幂等:已归档→200 no-op。
+-      enqueuePersistWrite({ kind: 'archiveCanvas', canvasId: targetId })
++      // localOnly 副本跳 enqueue(不在服务端)。
++      if (!skipArchiveEnqueue) {
++        enqueuePersistWrite({ kind: 'archiveCanvas', canvasId: targetId })
++      }
+       if (resolution.kind === 'keep') {
+         return { canvases: nextCanvases }
+       }
+@@ -410,6 +442,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
+         targetId,
+         document.projectId,
+         'local unarchive applied; restored to active seed baseline',
++        document.localOnly,
+       )
+       const canvases = Object.fromEntries(
+         Object.entries(state.canvases).map(([id, doc]) => {
+@@ -501,7 +534,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
+     // #284:demo seed canvas 不入队(本地改名已由上方 patchCanvasDocument 落地,仅跳过服务端写)。
+     //   guard 放在 metaRevision 分支之前:create 分支是本 bug 的实际泄漏点,update 分支对 demo 理论
+     //   不可达(demo 从不上服务端 → 无 onSuccess 回灌 metaRevision),一并挡住免留缺口。
+-    if (guardDemoSeedEnqueue('renameCanvas', sceneId, existing.projectId, 'local rename applied; demo id is global and not persisted')) {
++    if (guardDemoSeedEnqueue('renameCanvas', sceneId, existing.projectId, 'local rename applied; demo id is global and not persisted', existing.localOnly)) {
+       return
+     }
+     // G1-a P1-2 / A2 前置 c:metaRevision 有值 → enqueue updateCanvas(PUT,If-Match = metaRevision)。
+@@ -567,7 +600,7 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
+       //   回灌 metaRevision。move-to-standalone(projectId undefined)无 target project → 不 enqueue(不可 persist)。
+       // #284:demo seed canvas 不入队(本地移动照常生效,见下方 return)。同 renameCanvas,guard 前置于
+       //   metaRevision 分支:create 分支是实际泄漏点,update 分支对 demo 理论不可达但一并挡住。
+-      if (!guardDemoSeedEnqueue('moveCanvasToProject', canvasId, document.projectId, 'local move applied; demo id is global and not persisted')) {
++      if (!guardDemoSeedEnqueue('moveCanvasToProject', canvasId, document.projectId, 'local move applied; demo id is global and not persisted', document.localOnly)) {
+         if (document.metaRevision !== undefined) {
+           enqueuePersistWrite({
+             kind: 'updateCanvas',
+diff --git a/src/types/mivoCanvas.ts b/src/types/mivoCanvas.ts
+index 328e2bd5..90e5a51d 100644
+--- a/src/types/mivoCanvas.ts
++++ b/src/types/mivoCanvas.ts
+@@ -533,6 +533,18 @@ export type CanvasDocument = {
+    * hydrate 不推断此字段(server 不经 wire 暴露;推断不安全——见 PR-B 报告"已知非阻断缺口")。
+    */
+   archivedByCascade?: boolean
++  /**
++   * #353(方案B,2026-08-01 owner 拍板):"仅本地"画布标记——目前唯一来源是 demo seed
++   * 画布的副本(duplicateCanvas):副本拿新 id + projectId=undefined,双重逃逸 demo guard,
++   * 改动会向服务端不存在的 canvas 提交并必然终态拒绝。置位后:
++   * - 节点级同步(enqueueCanvasSyncChanges)与 document 级入队(rename/move/delete/archive)
++   *   一律跳过 server 提交,本地照常生效;
++   * - persistBoot 迁移收集显式跳过(独立计数,不再混入 gapNoProject);
++   * - 再复制 localOnly 画布,副本继承 localOnly。
++   * 升级为用户真画布(fork-on-write)归 #297,不在本字段语义内。持久化进 IDB blob,
++   * 不入 wire 契约(local-only 画布 server 端本就不存在)。
++   */
++  localOnly?: boolean
+ }
+ 
+ export type SceneDefinition = {

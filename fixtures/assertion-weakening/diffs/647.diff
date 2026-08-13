@@ -1,0 +1,2724 @@
+diff --git a/shared/persist-contract.ts b/shared/persist-contract.ts
+index 2dd089e2..b0b9727b 100644
+--- a/shared/persist-contract.ts
++++ b/shared/persist-contract.ts
+@@ -1086,6 +1086,8 @@ const AI_WORKFLOW: Check = obj(
+     slotId: scalar(isStr), placement: scalar(isStrEnum(AI_WORKFLOW_PLACEMENT_VALUES)),
+     createdAt: scalar(isNum), progress: scalar(isNum), stage: scalar(isStr),
+     startedAt: scalar(isNum), elapsedSec: scalar(isNum),
++    // #297 编辑占位批次身份凭证(batchId+expectedCount+ordinal),随 slot 持久化。
++    batchId: scalar(isStr), expectedCount: scalar(isNum), ordinal: scalar(isNum),
+   },
+   ['kind'],
+ )
+diff --git a/src/agent/canvasAgentVerbs.test.ts b/src/agent/canvasAgentVerbs.test.ts
+index 0df470a4..1ee45ab1 100644
+--- a/src/agent/canvasAgentVerbs.test.ts
++++ b/src/agent/canvasAgentVerbs.test.ts
+@@ -33,7 +33,13 @@ const storeState = {
+   }),
+   sceneId: 'scene-1',
+   // #300:交互卡动作要能定位到"这张图所属的板",所以动词层现在会读 canvases 并可能 loadScene。
+-  canvases: { 'scene-1': {}, 'scene-2': {} } as Record<string, unknown>,
++  // 场景文档的 nodes 用 getter 指向同一份 live 数组:真实 store 的节点数组就住在场景
++  // 文档里(store.nodes 只是活跃场景的派生访问器),mock 两处分离会让按场景定位的
++  // 查询(如 edit 结果归属)在一个生产不存在的形状上取绿。
++  canvases: {
++    'scene-1': { get nodes() { return storeState.nodes } },
++    'scene-2': { get nodes() { return storeState.nodes } },
++  } as Record<string, unknown>,
+   loadScene: vi.fn((sceneId: string) => {
+     storeState.sceneId = sceneId
+   }),
+@@ -417,12 +423,15 @@ describe('可移植记录核(§六-9:落共享层,不含宿主身份字段)', ()
+   it('edit 成功时返回记录核:mode/prompt/sceneId/sourceNodeId/resultNodeId 齐备', async () => {
+     storeState.sceneId = 'scene-1'
+     storeState.nodes = [{ id: 'img-1', type: 'image', hidden: false, assetUrl: 'asset://a' }]
++    // 真实 store 的 generateImageEdit 成功路径必返回 commit 产出的节点 id(批次模式
++    // 为被替换 slot 的 id);mock 必须返回该形状 —— 返回 [] 是生产从不产生的形状,
++    // 会让「结果归属」断言落在一个假契约上。
+     vi.mocked(generationFacade.generateImageEdit).mockImplementation(async () => {
+       storeState.nodes = [
+         ...storeState.nodes,
+         { id: 'img-2', type: 'image', hidden: false, assetUrl: 'asset://b' },
+       ]
+-      return []
++      return ['img-2']
+     })
+     const result = await agentEditImage({ nodeId: 'img-1', prompt: '改成水彩' })
+     expect(result.status).toBe('ready')
+diff --git a/src/agent/canvasAgentVerbs.ts b/src/agent/canvasAgentVerbs.ts
+index 78fdeb2c..09f14090 100644
+--- a/src/agent/canvasAgentVerbs.ts
++++ b/src/agent/canvasAgentVerbs.ts
+@@ -275,34 +275,34 @@ export const agentEditImage = async (params: {
+   if (source.type !== 'image' || !source.assetUrl) {
+     throw new AgentVerbErrorImpl('NOT_IMAGE', '该节点不是图片节点,只能修改图片')
+   }
+-  const beforeIds = new Set(store.nodes.map((node) => node.id))
+   const sceneId = store.sceneId
+   try {
+-    await generationFacade.generateImageEdit(nodeId, 'prompt-edit', prompt, {
+-      agentRequestTag: optionalTag(readOwnProp(params, 'agentRequestTag')),
++    // 结果归属:结果节点按 generateImageEdit 返回值定位(批次模式=被替换 slot,单次=新建节点)。
++    const nodeIds = await generationFacade.generateImageEdit(nodeId, 'prompt-edit', prompt, {
++      agentRequestTag: optionalTag(readOwnProp(params, 'agentRequestTag'))
+     })
++    const resultNode = useCanvasStore
++      .getState()
++      .canvases[sceneId as CanvasId]?.nodes?.find((node) => node.id === nodeIds[0])
++    if (resultNode && resultNode.type === 'image' && resultNode.assetUrl) {
++      return {
++        nodeId: resultNode.id,
++        status: 'ready',
++        assetUrl: resultNode.assetUrl,
++        record: buildGenerationActionRecordCore({
++          mode: 'edit',
++          prompt,
++          sceneId,
++          sourceNodeId: nodeId,
++          resultNodeId: resultNode.id,
++          createdAt: Date.now(),
++        }),
++      }
++    }
+   } catch (error) {
+     const message = error instanceof Error ? error.message : String(error)
+     return { nodeId, status: 'failed', error: message }
+   }
+-  const created = useCanvasStore
+-    .getState()
+-    .nodes.find((node) => node.type === 'image' && !beforeIds.has(node.id) && node.assetUrl)
+-  if (created) {
+-    return {
+-      nodeId: created.id,
+-      status: 'ready',
+-      assetUrl: created.assetUrl,
+-      record: buildGenerationActionRecordCore({
+-        mode: 'edit',
+-        prompt,
+-        sceneId,
+-        sourceNodeId: nodeId,
+-        resultNodeId: created.id,
+-        createdAt: Date.now(),
+-      }),
+-    }
+-  }
+   return { nodeId, status: 'failed', error: '修改未产出图片' }
+ }
+ 
+diff --git a/src/canvas/actions/canvasCommand.serialize.test.ts b/src/canvas/actions/canvasCommand.serialize.test.ts
+index 637a2f9b..6aa32c73 100644
+--- a/src/canvas/actions/canvasCommand.serialize.test.ts
++++ b/src/canvas/actions/canvasCommand.serialize.test.ts
+@@ -272,6 +272,32 @@ describe('CanvasCommand serialize round-trip', () => {
+       options: { referenceAssetIds: ['ref-1'] },
+     })
+   })
++  it('derived_batch_options_are_exact: 序列化 allowlist 精确 —— 批次三元组是 runtime-only,不进序列化 command options', () => {
++    // 批次凭证(derivedBatchId/expectedCount/ordinal)与 signal/referenceFiles 同类:
++    // runtime-only,绝不进入可序列化 command options。序列化输出必须不含这三个键。
++    const json = serializeCanvasCommand({
++      kind: 'generate-image-edit',
++      sourceNodeId: 'img-1',
++      operation: 'area-edit',
++      prompt: 'p',
++      options: { model: 'gpt-image-2' },
++    })
++    expect(json).not.toContain('derivedBatchId')
++    expect(json).not.toContain('expectedCount')
++    expect(json).not.toContain('ordinal')
++    // 往返一致(无批次字段的 command 结构上就是"显式单次 count=1")
++    roundTrip({
++      kind: 'generate-image-edit',
++      sourceNodeId: 'img-1',
++      operation: 'area-edit',
++      prompt: 'p',
++    })
++    // generate-beside-node 同样不含批次字段(序列化层只有 count=1 形态)
++    const besideJson = serializeCanvasCommand({ kind: 'generate-beside-node', sourceNodeId: 'img-1', prompt: 'p' })
++    expect(besideJson).not.toContain('derivedBatchId')
++    expect(besideJson).not.toContain('expectedCount')
++    expect(besideJson).not.toContain('ordinal')
++  })
+   it.each(
+     ['slot-generation', 'beside-generation', 'annotation-edit', 'variation', 'prompt-edit', 'area-edit', 'remove-background', 'outpaint', 'upscale'] as const,
+   )('generate-image-edit (operation %s)', (operation) => {
+diff --git a/src/canvas/actions/canvasSyncRuntime.block3.test.ts b/src/canvas/actions/canvasSyncRuntime.block3.test.ts
+index 57581bf2..7cdb611a 100644
+--- a/src/canvas/actions/canvasSyncRuntime.block3.test.ts
++++ b/src/canvas/actions/canvasSyncRuntime.block3.test.ts
+@@ -489,4 +489,120 @@ describe('T2.2 Block 3 — deferred-kinds server-wire 验收矩阵', () => {
+     expect(enqueueAssetAttach).toHaveBeenCalledWith(SCENE, 'asset-gen', 'slot-1')
+     resetQueue()
+   })
++
++  // ── #297 批次(SC8:预建全部 slot 先于任何替换,沿同一 canvas 队列串行提交)────────
++  it('derived_batch_syncs_create_before_replace: startDerivedImageBatch 一次提交全部 slot create-node,替换 edit-node 在预建之后', async () => {
++    seed(seedCanvas(SCENE, [imageNode({ id: 'n1' })]))
++    const slotIds = useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: SCENE,
++      sourceNodeId: 'n1',
++      batchId: 'batch-1',
++      expectedCount: 2,
++    })
++    expect(slotIds).toHaveLength(2)
++    await flushSubmit()
++
++    // 预建 = 一次 scene-scoped mutation:2 个 create-node(全部 slot + generating 初始态)同批落 server
++    const createCalls = submitChange.mock.calls.filter(
++      (c) => (c[1] as { kind: string }).kind === 'create-node',
++    )
++    expect(createCalls.length).toBe(2)
++    expectAllCallsAnchorScene()
++    const createdIds = createCalls.map((c) => (c[1] as { node: { id: string } }).node.id)
++    expect(createdIds.sort()).toEqual([...slotIds].sort())
++    // 预建 slot 带批次身份与 generating 态落 server(metadata 随 create-node 全量)
++    const firstCreate = createCalls[0][1] as { node: { aiWorkflow?: { batchId?: string; status?: string } } }
++    expect(firstCreate.node.aiWorkflow?.batchId).toBe('batch-1')
++    expect(firstCreate.node.aiWorkflow?.status).toBe('generating')
++
++    // ordinal 0 替换:edit-node 在预建 create-node 之后(沿同一队列),替换结果带批次身份
++    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', {
++      sceneId: SCENE,
++      derivedBatchId: 'batch-1',
++      expectedCount: 2,
++      ordinal: 0,
++    })
++    await flushSubmit()
++    expect(nodeIds).toEqual([slotIds[0]])
++    const editCalls = submitChange.mock.calls.filter(
++      (c) => (c[1] as { kind: string }).kind === 'edit-node' && (c[1] as { nodeId: string }).nodeId === slotIds[0],
++    )
++    expect(editCalls.length).toBe(1)
++    const editIntents = (editCalls[0][1] as unknown as { intents: Array<{ fieldPath: string[] }> }).intents
++    // 替换 edit-node 携带批次身份继承(type→image);batchId 前后不变 → 无漂移 intent
++    // (server 端批次身份已由 create-node 全量携带,继承保留=零 diff)
++    expect(hasIntent(editIntents, 'type')).toBe(true)
++    expect(hasIntent(editIntents, 'aiWorkflow', 'batchId')).toBe(false)
++    // create 先于 replace 的顺序保证(同队列串行)
++    const createIdx = submitChange.mock.calls.findIndex(
++      (c) => (c[1] as { kind: string }).kind === 'create-node',
++    )
++    const editIdx = submitChange.mock.calls.findIndex(
++      (c) => (c[1] as { kind: string }).kind === 'edit-node',
++    )
++    expect(editIdx).toBeGreaterThan(createIdx)
++    resetQueue()
++  })
++
++  // 审查追加(SC8 反向变异发现的绑定性缺陷补测):derived_batch_syncs_create_before_replace
++  // 只用显式 await 分两段严格串行调用,JS 单线程下"先调 ordinal0 后调 ordinal1"的调用顺序
++  // 天然成立,即使把 canvasSyncRuntime.ts 的 queueByCanvas 串行化整段删掉该用例仍然全绿——
++  // 不真正绑定"沿同一 canvas 队列串行提交"这句 SC 字面要求。生产中 agentBridge.ts 的
++  // flushBatchGroup 用 Promise.all 并发触发多个 ordinal 的 generateImageEdit,真正需要保证
++  // 的是服务端同一时刻只有一个 in-flight submitChange(不并发发两个请求),不是调用顺序。
++  // 用 in-flight 计数器直接测并发度:mock 的 submitChangeImpl 在被调用时 +1、resolve 前记录
++  // 当时的最大并发数,resolve 后 -1。反向变异实测:删掉 queueByCanvas 后 maxConcurrent=2(红);
++  // 恢复后 maxConcurrent=1(绿)。
++  it('derived_batch_edit_submits_never_overlap_in_flight: 并发触发的两个 ordinal edit-node submitChange 不同时在途', async () => {
++    let inFlight = 0
++    let maxConcurrent = 0
++    handle = await loadRuntimeModule({
++      local: false,
++      submitChangeImpl: async (canvasId, change) => {
++        void canvasId
++        if (change.kind === 'edit-node') {
++          inFlight += 1
++          maxConcurrent = Math.max(maxConcurrent, inFlight)
++          await new Promise((resolve) => setTimeout(resolve, 20))
++          inFlight -= 1
++        }
++        return { kind: 'accepted', cursor: 'cursor' as never }
++      },
++    })
++    useCanvasStore = handle.useCanvasStore
++    submitChange = handle.submitChange
++    resetQueue = handle.__resetCanvasSyncRuntimeQueue
++    baseState = useCanvasStore.getInitialState()
++
++    seed(seedCanvas(SCENE, [imageNode({ id: 'n1' })]))
++    const slotIds = useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: SCENE,
++      sourceNodeId: 'n1',
++      batchId: 'batch-probe',
++      expectedCount: 2,
++    })
++    await flushSubmit()
++    submitChange.mockClear()
++
++    const p0 = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', {
++      sceneId: SCENE,
++      derivedBatchId: 'batch-probe',
++      expectedCount: 2,
++      ordinal: 0,
++    })
++    const p1 = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a dog', {
++      sceneId: SCENE,
++      derivedBatchId: 'batch-probe',
++      expectedCount: 2,
++      ordinal: 1,
++    })
++    await Promise.all([p0, p1])
++    await new Promise((resolve) => setTimeout(resolve, 60))
++
++    const editNodeCalls = submitChange.mock.calls.filter((c) => (c[1] as { kind: string }).kind === 'edit-node')
++    expect(editNodeCalls.length).toBe(2)
++    expect(new Set(editNodeCalls.map((c) => (c[1] as { nodeId: string }).nodeId))).toEqual(new Set(slotIds))
++    // 队列不变式:同一 canvasId 的 submitChange 从不并发在途(即使调用方并发发起)。
++    expect(maxConcurrent).toBe(1)
++  })
+ })
+diff --git a/src/kernel/mapping.test.ts b/src/kernel/mapping.test.ts
+index d06c67bf..b3883a49 100644
+--- a/src/kernel/mapping.test.ts
++++ b/src/kernel/mapping.test.ts
+@@ -196,3 +196,53 @@ describe('T1.2 S1 kernel mapping — 64 字段往返无损', () => {
+     expect(r.relations?.aiWorkflow).toBeUndefined()
+   })
+ })
++
++describe('③ #297 批次元数据 round-trip (SC9: batchId+expectedCount+ordinal+sourceNodeId 持久化)', () => {
++  it('derived_batch_metadata_round_trips: 批次 slot 的批次凭证经 toRecord/fromRecord 无损往返', () => {
++    const batchNode: MivoCanvasNode = {
++      ...imageNode,
++      id: 'n-batch-slot',
++      type: 'ai-slot',
++      status: 'generating',
++      locked: true,
++      aiWorkflow: {
++        kind: 'slot',
++        status: 'generating',
++        operation: 'area-edit',
++        prompt: 'p',
++        sourceNodeIds: ['n-src'],
++        placement: 'right',
++        batchId: 'batch-7',
++        expectedCount: 3,
++        ordinal: 2,
++      },
++    }
++    const record = toRecord(batchNode)
++    expect(record.aiWorkflow?.batchId).toBe('batch-7')
++    expect(record.aiWorkflow?.expectedCount).toBe(3)
++    expect(record.aiWorkflow?.ordinal).toBe(2)
++    expect(record.aiWorkflow?.sourceNodeIds).toEqual(['n-src'])
++
++    const round = fromRecord(record)
++    expect(round.aiWorkflow?.batchId).toBe('batch-7')
++    expect(round.aiWorkflow?.expectedCount).toBe(3)
++    expect(round.aiWorkflow?.ordinal).toBe(2)
++    expect(round.aiWorkflow?.sourceNodeIds).toEqual(['n-src'])
++    // 批次 slot 锁定状态与凭证一起持久化
++    expect(round.locked).toBe(true)
++  })
++
++  it('SC9: batchId 必须来自创建凭证,不得从位置/标题/reqId 推断 —— 无批次凭证的 slot 往返后仍无', () => {
++    const plainSlot: MivoCanvasNode = {
++      ...imageNode,
++      id: 'n-plain',
++      type: 'ai-slot',
++      status: 'ready',
++      aiWorkflow: { kind: 'slot', status: 'empty', operation: 'slot-generation', prompt: 'p', placement: 'slot' },
++    }
++    const round = fromRecord(toRecord(plainSlot))
++    expect(round.aiWorkflow?.batchId).toBeUndefined()
++    expect(round.aiWorkflow?.expectedCount).toBeUndefined()
++    expect(round.aiWorkflow?.ordinal).toBeUndefined()
++  })
++})
+diff --git a/src/store/canvasGenerationHydration.ts b/src/store/canvasGenerationHydration.ts
+index 7ca1d68b..a7872809 100644
+--- a/src/store/canvasGenerationHydration.ts
++++ b/src/store/canvasGenerationHydration.ts
+@@ -418,10 +418,22 @@ export const settleExpiredCanvasGenerations = (
+         }
+         counts.settledSlots += 1
+         changed = true
++        // #297 批次 slot(SC6):带 batchId 的 queued/generating slot 按原 ordinal
++        // 原位转 failed(不删除),并清 progress/stage/startedAt;非批次 slot 保持
++        // 既有 settle 行为(仅状态转 failed)。
++        if (node.aiWorkflow.batchId !== undefined) {
++          logCanvas(`Hydration settled batch slot ${node.id}(batchId=${node.aiWorkflow.batchId},ordinal=${node.aiWorkflow.ordinal})`)
++        }
+         return {
+           ...node,
+           status: node.status === 'generating' || node.status === 'queued' ? 'failed' as const : node.status,
+-          aiWorkflow: { ...node.aiWorkflow, status: 'failed' as const },
++          aiWorkflow: {
++            ...node.aiWorkflow,
++            status: 'failed' as const,
++            ...(node.aiWorkflow.batchId !== undefined
++              ? { progress: undefined, stage: undefined, startedAt: undefined }
++              : {}),
++          },
+         }
+       })
+       return [canvasId, changed ? { ...document, nodes, tasks } : document]
+diff --git a/src/store/canvasStateTypes.ts b/src/store/canvasStateTypes.ts
+index f7166e75..c983d24d 100644
+--- a/src/store/canvasStateTypes.ts
++++ b/src/store/canvasStateTypes.ts
+@@ -92,6 +92,31 @@ export type CanvasGenerationOptions = {
+    * 所以血缘源必须能与生成源分开指定。
+    */
+   lineageSourceId?: string
++  /**
++   * #297 编辑占位批次(runtime-only,不进序列化 command options):
++   * 要么三者齐全(derivedBatchId/expectedCount/ordinal),要么全部缺失
++   * (= 显式单次 count=1)。部分缺失 fail-closed——generateImageEdit /
++   * generateBesideNode 入口按 assertBatchTriplet 拒绝,不静默降级。
++   * ordinal 精确绑定 startDerivedImageBatch 预建的 slot,该 slotId 作为
++   * replaceSlotId 传给 commitGenerationResult。
++   */
++  derivedBatchId?: string
++  expectedCount?: number
++  ordinal?: number
++}
++
++/**
++ * #297 批次三元组 fail-closed 校验:任一字段存在但不同时齐全 → 抛错。
++ * 全缺(=单次 count=1)或全齐(=批次内第 ordinal 个)通过。
++ */
++export const assertBatchTriplet = (
++  options: Pick<CanvasGenerationOptions, 'derivedBatchId' | 'expectedCount' | 'ordinal'>,
++): void => {
++  const present = [options.derivedBatchId, options.expectedCount, options.ordinal].filter((v) => v !== undefined).length
++  if (present === 0) return
++  if (present !== 3 || options.derivedBatchId === undefined || options.expectedCount === undefined || options.ordinal === undefined) {
++    throw new Error('批次选项必须完整提供 derivedBatchId/expectedCount/ordinal,或全部省略(单次生成)')
++  }
+ }
+ export type SelectionArrangeMode = 'row' | 'column' | 'grid' | 'tidy'
+ export type BrushStyle = {
+@@ -365,6 +390,18 @@ export type CanvasState = {
+     prompt?: string,
+     options?: CanvasGenerationOptions,
+   ) => Promise<string[]>
++  /**
++   * #297 编辑占位批次:在任何 submitEditTask 前一次性创建 expectedCount 个
++   * generating ai-slot(centeredColumnPlacements 一次定位、尺寸=源图尺寸、
++   * locked=true)。返回按 ordinal 顺序排列的 slotIds。占位创建与 generating
++   * 初始状态作为一次 scene-scoped mutation 提交;活跃场景只 captureHistory 一次。
++   */
++  startDerivedImageBatch: (params: {
++    sceneId?: CanvasId
++    sourceNodeId: string
++    batchId: string
++    expectedCount: number
++  }) => string[]
+   commitGenerationResult: (payload: CommitGenerationResultPayload) => Promise<string[]>
+   toggleFavorite: (nodeId: string) => void
+   /** 媒体详情页标签编辑:trim + 去重 + 去空,结果为空数组时收敛为 undefined(不落盘)。 */
+diff --git a/src/store/commitGenerationResult.ts b/src/store/commitGenerationResult.ts
+index 8a877717..8d0cca82 100644
+--- a/src/store/commitGenerationResult.ts
++++ b/src/store/commitGenerationResult.ts
+@@ -1,6 +1,8 @@
+ // commitGenerationResult 实现体(从 documentSlice 拆出的纯重构,行为零变化)。
+ //
+ // 生成结果提交:资产落盘 → post-save 删除校验 → 结果节点原位替换/追加 + 衍生边。
++// #297 编辑占位批次分叉:被替换 slot 带 batchId 时按批次契约(高度锁定尺寸 +
++// 批次身份继承),其余 chat/mask slot 保持 equalArea 契约。
+ import type { StoreApi } from 'zustand'
+ import type { CanvasState } from './canvasStore'
+ import { saveGeneratedAsset } from '../lib/assetStorage'
+@@ -9,6 +11,7 @@ import {
+   AI_SLOT_GAP,
+   chooseAdjacentPlacement,
+   equalAreaSizeForDimensions,
++  heightLockedSizeForDimensions,
+   reflowRightObstacles,
+ } from './aiCanvasWorkflow'
+ import { blobFromCommittedGenerationImage, displaySizeForGeneratedAsset } from './canvasStoreLog'
+@@ -142,8 +145,13 @@ export const commitGenerationResultImpl = async (
+       // 替换时统一按结果图自然宽高比、与占位符等面积落画布——edit 结果与源图同
+       // 比例由生成本身保证,无需靠占位尺寸传递;结果无自然尺寸信息时 equalArea
+       // 内部回退占位尺寸。Non-slot placements 不变,仍用资产自然尺寸。
++      // #297 编辑占位批次(SC2):被替换 slot 带 batchId 时按批次契约分叉——
++      // 衍生批次 slot 用 heightLockedSizeForDimensions(高度锁定为占位高度,
++      // 与原图上下边缘一致),其余 chat/mask slot 保持 equalAreaSizeForDimensions。
+       const displaySize = replacingSlot
+-        ? equalAreaSizeForDimensions(fallbackSize, asset.sourceDimensions)
++        ? replacingSlot.aiWorkflow?.batchId
++          ? heightLockedSizeForDimensions(replacingSlot.height, asset.sourceDimensions)
++          : equalAreaSizeForDimensions(fallbackSize, asset.sourceDimensions)
+         : displaySizeForGeneratedAsset(asset, fallbackSize)
+       const placement = replacingSlot
+         ? { x: replacingSlot.x, y: replacingSlot.y }
+@@ -192,6 +200,17 @@ export const commitGenerationResultImpl = async (
+         operation,
+         sourceNode: lineageNode,
+         placementDirection: payload.placement || 'right',
++        // #297 批次身份继承:结果节点沿用被替换 slot 的 batchId/expectedCount/ordinal。
++        batchMetadata:
++          replacingSlot?.aiWorkflow?.batchId !== undefined &&
++          replacingSlot.aiWorkflow.expectedCount !== undefined &&
++          replacingSlot.aiWorkflow.ordinal !== undefined
++            ? {
++                batchId: replacingSlot.aiWorkflow.batchId,
++                expectedCount: replacingSlot.aiWorkflow.expectedCount,
++                ordinal: replacingSlot.aiWorkflow.ordinal,
++              }
++            : undefined,
+       })
+ 
+       createdNodeIds.push(nodeId)
+diff --git a/src/store/commitGenerationResultCrossScene.test.ts b/src/store/commitGenerationResultCrossScene.test.ts
+index 301be766..ae270116 100644
+--- a/src/store/commitGenerationResultCrossScene.test.ts
++++ b/src/store/commitGenerationResultCrossScene.test.ts
+@@ -58,6 +58,48 @@ vi.mock('./remoteDebugReporter', () => ({
+   reportRemoteDebugEntry: () => {},
+ }))
+ 
++// #297 批次 SC13:generateImageEdit 失败收敛需要 task 状态机 mock(与
++// generation.contract.test.ts 同构:submit/poll 边界 mock,不经 HTTP)。
++const mocks = vi.hoisted(() => ({
++  submitEditTask: vi.fn(),
++  submitGenerationTask: vi.fn(),
++  submitVariationsTask: vi.fn(),
++  pollTask: vi.fn(),
++  cancelTask: vi.fn(),
++  assetBlobForNode: vi.fn(),
++}))
++
++vi.mock('../lib/mivoTaskClient', async (importOriginal) => {
++  const original = await importOriginal<Record<string, unknown>>()
++  return {
++    ...original,
++    submitEditTask: mocks.submitEditTask,
++    submitGenerationTask: mocks.submitGenerationTask,
++    submitVariationsTask: mocks.submitVariationsTask,
++    pollTask: mocks.pollTask,
++    cancelTask: mocks.cancelTask,
++    taskPollIntervalMs: () => 0,
++    kindForFailedTask: (error: string) =>
++      /\btimeout\b|超时|timed[\s-]?out/i.test(error) ? 'upstream-timeout' : 'upstream-error',
++  }
++})
++
++vi.mock('../lib/mivoImageClient', async (importOriginal) => {
++  const original = await importOriginal<Record<string, unknown>>()
++  return {
++    ...original,
++    assetBlobForNode: mocks.assetBlobForNode,
++    MivoImageRequestError: class MivoImageRequestError extends Error {
++      kind: string
++      constructor(message: string, kind: string) {
++        super(message)
++        this.name = 'MivoImageRequestError'
++        this.kind = kind
++      }
++    },
++  }
++})
++
+ import { useCanvasStore } from './canvasStore'
+ import { useChatStore } from './chatStore'
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+@@ -136,6 +178,21 @@ beforeEach(() => {
+   if (ls) ls.clear()
+   useCanvasStore.setState({ ...baseState } as never, true)
+   useChatStore.setState({ ...useChatStore.getInitialState() } as never, true)
++  mocks.submitEditTask.mockReset().mockResolvedValue('t1')
++  mocks.submitGenerationTask.mockReset().mockResolvedValue('t1')
++  mocks.submitVariationsTask.mockReset().mockResolvedValue({ taskId: 't1', batchId: 'b1', count: 4 })
++  mocks.pollTask.mockReset().mockResolvedValue({
++    id: 't1',
++    kind: 'edit',
++    status: 'done',
++    progress: 100,
++    stage: 'done',
++    requestId: 'req-1',
++    model: 'gpt-image-2',
++    result: { images: [resultImage()] },
++  })
++  mocks.cancelTask.mockReset().mockResolvedValue(undefined)
++  mocks.assetBlobForNode.mockReset().mockResolvedValue(new Blob(['mock-source-bytes'], { type: 'image/png' }))
+ })
+ 
+ describe('跨场景 replace-slot 落板后的撤销(PR #469 Greptile P1)', () => {
+@@ -191,3 +248,133 @@ describe('跨场景 replace-slot 落板后的撤销(PR #469 Greptile P1)', () =>
+     expect(useCanvasStore.getState().nodes.map((n) => n.id)).toContain(extraId)
+   })
+ })
++
++describe('#297 编辑占位批次(SC2 高度锁定替换 / SC13 源图删除收敛)', () => {
++  const batchSlotNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++    id: 'slot-b0',
++    type: 'ai-slot',
++    title: 'Edit slot 0',
++    x: 366,
++    y: 20,
++    width: 300,
++    height: 200,
++    status: 'generating',
++    locked: true,
++    aiWorkflow: {
++      kind: 'slot',
++      status: 'generating',
++      operation: 'area-edit',
++      prompt: 'p',
++      sourceNodeIds: ['n1'],
++      placement: 'right',
++      batchId: 'batch-1',
++      expectedCount: 2,
++      ordinal: 0,
++    },
++    ...overrides,
++  })
++
++  it('batch_replacement_locks_height_only: 批次 slot 替换用 heightLockedSizeForDimensions,其余 slot 保持 equalAreaSizeForDimensions', async () => {
++    seedTwoScenes()
++    const docA = useCanvasStore.getState().canvases['scene-a']!
++    const nodes = [
++      imageNode({ id: 'n1' }),
++      batchSlotNode({ id: 'slot-b0' }),
++      batchSlotNode({
++        id: 'slot-chat',
++        x: 600,
++        y: 20,
++        width: 200,
++        height: 200,
++        status: 'ready',
++        aiWorkflow: { kind: 'slot', status: 'empty', operation: 'slot-generation', prompt: 'p', placement: 'slot' },
++      }),
++    ]
++    useCanvasStore.setState(
++      {
++        ...baseState,
++        canvases: { 'scene-a': { ...docA, nodes }, 'scene-b': docA },
++        sceneId: 'scene-a',
++        nodes,
++      } as never,
++      true,
++    )
++
++    // 批次 slot 替换:sourceDimensions 300x200 → heightLocked(200) = 300x200
++    const batchIds = await commitIntoA('slot-b0')
++    const batchResult = useCanvasStore.getState().nodes.find((n) => n.id === batchIds[0])
++    expect(batchResult?.height).toBe(200)
++    expect(batchResult?.width).toBe(300)
++    // 结果继承批次元数据 + 保持 slot.x/slot.y
++    expect(batchResult?.aiWorkflow?.batchId).toBe('batch-1')
++    expect(batchResult?.aiWorkflow?.expectedCount).toBe(2)
++    expect(batchResult?.aiWorkflow?.ordinal).toBe(0)
++    expect(batchResult?.x).toBe(366)
++    expect(batchResult?.y).toBe(20)
++
++    // 普通 chat slot(无批次)替换:equalAreaSizeForDimensions(200x200, 300x200)
++    // width = round(sqrt(200*200*300/200)) = 245,height = round(245*200/300) = 163
++    const chatIds = await commitIntoA('slot-chat')
++    const chatResult = useCanvasStore.getState().nodes.find((n) => n.id === chatIds[0])
++    expect(chatResult?.width).toBe(245)
++    expect(chatResult?.height).toBe(163)
++    expect(chatResult?.aiWorkflow?.batchId).toBeUndefined()
++  })
++
++  it('source_deletion_settles_batch_slots: 生成期间源图被删 → 该 ordinal 与同批 generating slot 原位转 failed(不整体删除)', async () => {
++    seedTwoScenes()
++    const docA = useCanvasStore.getState().canvases['scene-a']!
++    const nodes = [
++      imageNode({ id: 'n1' }),
++      batchSlotNode({ id: 'slot-b0' }),
++      batchSlotNode({ id: 'slot-b1', ...{ aiWorkflow: { ...batchSlotNode().aiWorkflow!, ordinal: 1 } } }),
++    ]
++    useCanvasStore.setState(
++      {
++        ...baseState,
++        canvases: { 'scene-a': { ...docA, nodes }, 'scene-b': docA },
++        sceneId: 'scene-a',
++        nodes,
++      } as never,
++      true,
++    )
++    // 让 poll 挂起 → 期间删除源图 → poll done 后 commit 抛 sourceDeletedSaved → catch 同批收敛
++    let resolvePoll!: (view: unknown) => void
++    mocks.pollTask.mockReturnValueOnce(new Promise((resolve) => { resolvePoll = resolve }))
++    const promise = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', {
++      sceneId: 'scene-a',
++      derivedBatchId: 'batch-1',
++      expectedCount: 2,
++      ordinal: 0,
++    })
++    for (let i = 0; i < 10; i++) await Promise.resolve()
++    // 源图被删(用户删除)
++    useCanvasStore.setState((s) => {
++      const d = s.canvases['scene-a']!
++      const nodes2 = d.nodes.filter((n) => n.id !== 'n1')
++      return { nodes: nodes2, canvases: { ...s.canvases, 'scene-a': { ...d, nodes: nodes2 } } }
++    })
++    resolvePoll({
++      id: 't1',
++      kind: 'edit',
++      status: 'done',
++      progress: 100,
++      stage: 'done',
++      requestId: 'req-1',
++      model: 'gpt-image-2',
++      result: { images: [resultImage()] },
++    })
++    await expect(promise).rejects.toThrow(/sourceDeleted/)
++    const s = useCanvasStore.getState()
++    // 两个 slot 都原位转 failed(不删除、不压缩列)
++    const slots = s.nodes.filter((n) => n.type === 'ai-slot')
++    expect(slots).toHaveLength(2)
++    slots.forEach((slot) => {
++      expect(slot.status).toBe('failed')
++      expect(slot.aiWorkflow?.status).toBe('failed')
++      expect(slot.aiWorkflow?.progress).toBeUndefined()
++      expect(slot.aiWorkflow?.stage).toBeUndefined()
++      expect(slot.aiWorkflow?.startedAt).toBeUndefined()
++    })
++  })
++})
+diff --git a/src/store/derivedBatchCoordinator.ts b/src/store/derivedBatchCoordinator.ts
+new file mode 100644
+index 00000000..fda70998
+--- /dev/null
++++ b/src/store/derivedBatchCoordinator.ts
+@@ -0,0 +1,200 @@
++// #297 编辑占位批次协调器(从 generationSlice 拆出的纯重构,行为零变化)。
++// 批次身份 = 显式凭证 batchId+expectedCount+ordinal;ordinal 按 batchId+ordinal 从文档查找,不推断。
++import type { StoreApi } from 'zustand'
++import { LocalizedKeyError } from '../lib/localizedKeyError'
++import type { AiWorkflowStatus, CanvasId, MivoCanvasNode } from '../types/mivoCanvas'
++import type { CanvasState } from './canvasStore'
++import { assertBatchTriplet } from './canvasStateTypes'
++import { AI_SLOT_GAP, centeredColumnPlacements } from './aiCanvasWorkflow'
++import { debugLogger } from './debugLogStore'
++import { makeNode } from './demoScenes'
++import { nodePrompt, normalizeCanvasNodes, patchCanvasDocument } from './canvasDocumentModel'
++import { createNodeId } from './nodeFactory'
++import { getSceneWrap } from '../lib/sceneWrapRegistry'
++
++/** 批次 slot 生成时用的模型(与 generationSlice 内单次生成同值)。 */
++const defaultMivoImageModel = 'gpt-image-2'
++
++/** 按持久化批次凭证找预建 slot(找不到返回 undefined → 调用方 fail-visible)。 */
++export const findBatchSlot = (doc: { nodes: MivoCanvasNode[] }, batchId: string, ordinal: number) =>
++  doc.nodes.find(
++    (node) =>
++      node.type === 'ai-slot' &&
++      !node.hidden &&
++      node.aiWorkflow?.batchId === batchId &&
++      node.aiWorkflow?.ordinal === ordinal,
++  )
++
++/** 把批次 slot 收敛为终态(failed/canceled):原位保留、清进度字段;
++ *  sourceDeleted 时同批仍 generating 的 slot 一并转 failed(SC13)。 */
++export const settleBatchSlotState = (
++  current: CanvasState,
++  targetSceneId: CanvasId,
++  options: {
++    slotId: string
++    batchId: string
++    status: 'failed' | 'canceled'
++    settleWholeBatch: boolean
++  },
++) => {
++  const targetDocument = current.canvases[targetSceneId]
++  if (!targetDocument) return {}
++  const nodes = targetDocument.nodes.map((node) => {
++    if (node.type !== 'ai-slot' || !node.aiWorkflow) return node
++    const inBatch = node.aiWorkflow.batchId === options.batchId
++    const isTarget = node.id === options.slotId
++    const stillGenerating =
++      node.status === 'generating' || node.aiWorkflow.status === 'generating' || node.aiWorkflow.status === 'queued'
++    const shouldSettle = isTarget || (options.settleWholeBatch && inBatch && stillGenerating)
++    if (!shouldSettle) return node
++    return {
++      ...node,
++      status: 'failed' as const,
++      aiWorkflow: {
++        ...node.aiWorkflow,
++        status: (isTarget ? options.status : 'failed') as AiWorkflowStatus,
++        progress: undefined,
++        stage: undefined,
++        startedAt: undefined,
++      },
++    }
++  })
++  return patchCanvasDocument(current, targetSceneId, { nodes })
++}
++
++/**
++ * 批次三元组校验 + ordinal 绑定 slot 的共用入口(generateImageEdit 与
++ * generateBesideNode 同一套 fail-closed 契约):要么齐全、要么全缺(单次 count=1),
++ * 部分缺失 fail-closed 并留痕;缺员 fail-visible(缺员不静默降级成单次生成)。
++ * 返回绑定到的预建 slot(单次路径 undefined)。
++ */
++export const bindBatchOrdinal = (
++  document: { nodes: MivoCanvasNode[] },
++  triplet: { derivedBatchId?: string; expectedCount?: number; ordinal?: number },
++): MivoCanvasNode | undefined => {
++  try {
++    assertBatchTriplet(triplet)
++  } catch (error) {
++    // fail-closed 拒绝也要留痕(否则「批次三元组部分缺失」在 Debug Log 里查不到根因)。
++    debugLogger.error(
++      'Derived Batch',
++      `批次三元组校验失败(derivedBatchId=${triplet.derivedBatchId},expectedCount=${triplet.expectedCount},ordinal=${triplet.ordinal}):${error instanceof Error ? error.message : String(error)}`,
++    )
++    throw error
++  }
++  const batchSlot =
++    triplet.derivedBatchId !== undefined
++      ? findBatchSlot(document, triplet.derivedBatchId, triplet.ordinal as number)
++      : undefined
++  // ordinal 精确绑定预建 slot;缺失 fail-visible(缺员不静默降级成单次生成)。
++  if (triplet.derivedBatchId !== undefined && !batchSlot) {
++    debugLogger.error(
++      'Derived Batch',
++      `批次 ${triplet.derivedBatchId} 的 ordinal ${triplet.ordinal} 没有预建 slot(先调用 startDerivedImageBatch)`,
++    )
++    throw new Error(
++      `批次 ${triplet.derivedBatchId} 的 ordinal ${triplet.ordinal} 没有预建 slot(先调用 startDerivedImageBatch)`,
++    )
++  }
++  if (batchSlot) {
++    debugLogger.log('Derived Batch', `ordinal ${triplet.ordinal} 绑定 slot ${batchSlot.id}(batchId=${triplet.derivedBatchId})`)
++  }
++  return batchSlot
++}
++
++export type DerivedBatchStartParams = {
++  sceneId?: CanvasId
++  sourceNodeId: string
++  batchId: string
++  expectedCount: number
++}
++
++/** startDerivedImageBatch action 的实现体(slice 只留委托行;set/get 参数化,行为不变)。 */
++export const startDerivedImageBatchImpl = (
++  set: StoreApi<CanvasState>['setState'],
++  get: StoreApi<CanvasState>['getState'],
++  params: DerivedBatchStartParams,
++): string[] => {
++  const targetSceneId = params.sceneId || get().sceneId
++  const state = get()
++  const document = state.canvases[targetSceneId]
++  if (!document) throw new LocalizedKeyError('chat.commit.canvasDeleted')
++  if (!params.batchId) throw new Error('批次必须携带非空 batchId')
++  if (!Number.isInteger(params.expectedCount) || params.expectedCount < 1 || params.expectedCount > 4) {
++    throw new Error(`批次 expectedCount 必须在 1-4 之间,收到 ${params.expectedCount}`)
++  }
++  const source = document.nodes.find(
++    (node) => node.id === params.sourceNodeId && node.type === 'image' && !node.hidden,
++  )
++  if (!source) throw new LocalizedKeyError('chat.commit.sourceDeleted')
++
++  const createdAt = Date.now()
++  const sourcePrompt = nodePrompt(source) || '基于当前参考图继续发散'
++  // #297:占位尺寸取源图尺寸,不走 defaultSizeForNodeType('ai-slot') 的 320×320。
++  const slotWidth = Math.round(source.width)
++  const slotHeight = Math.round(source.height)
++  // SC11:同批全部 slot 在预建时按 expectedCount 一次定位(列左缘固定、整列垂直居中)。
++  const placements = centeredColumnPlacements({
++    anchor: source,
++    count: params.expectedCount,
++    gap: AI_SLOT_GAP,
++    widths: Array.from({ length: params.expectedCount }, () => slotWidth),
++  })
++  const slots = placements.map((placement, ordinal) => {
++    const id = createNodeId('ai-slot')
++    return makeNode({
++      id,
++      type: 'ai-slot',
++      title: `编辑占位 ${ordinal + 1}/${params.expectedCount}`,
++      x: Math.round(placement.x),
++      y: Math.round(placement.y),
++      width: Math.round(placement.width),
++      height: Math.round(placement.height),
++      status: 'generating',
++      // SC14:批次 slot 锁定,UI 不允许移动/缩放/删除单个运行中 slot。
++      locked: true,
++      generation: {
++        prompt: sourcePrompt,
++        model: defaultMivoImageModel,
++        size: `${slotWidth}x${slotHeight}`,
++        taskId: `batch-${params.batchId}-${ordinal}`,
++        createdAt,
++      },
++      aiWorkflow: {
++        kind: 'slot',
++        status: 'generating',
++        operation: 'area-edit',
++        prompt: sourcePrompt,
++        sourceNodeIds: [source.id],
++        placement: 'right',
++        createdAt,
++        // SC9:批次身份凭证持久化到 slot(batchId 来自创建凭证,不从位置/标题/reqId 推断)。
++        batchId: params.batchId,
++        expectedCount: params.expectedCount,
++        ordinal,
++      },
++    })
++  })
++
++  // SC5:预建前活跃场景只 captureHistory 一次(占位/状态/替换不追加 history)。
++  if (targetSceneId === state.sceneId) {
++    get().captureHistory()
++  }
++  // SC8:预建全部 slot + 初始 generating 作为一次 scene-scoped mutation 提交,后续
++  // ordinal 的状态/替换/收敛沿同一 canvas 队列串行提交。
++  getSceneWrap()(targetSceneId, () => set((current) => {
++    const targetDocument = current.canvases[targetSceneId]
++    if (!targetDocument) return {}
++    return patchCanvasDocument(
++      current,
++      targetSceneId,
++      { nodes: normalizeCanvasNodes([...targetDocument.nodes, ...slots]) },
++      { history: false },
++    )
++  }))
++  debugLogger.log(
++    'Derived Batch',
++    `预建 ${params.expectedCount} 个编辑占位(batchId=${params.batchId},source=${source.id})`,
++  )
++  return slots.map((slot) => slot.id)
++}
+diff --git a/src/store/generation.batchPlacement.contract.test.ts b/src/store/generation.batchPlacement.contract.test.ts
+new file mode 100644
+index 00000000..befee687
+--- /dev/null
++++ b/src/store/generation.batchPlacement.contract.test.ts
+@@ -0,0 +1,375 @@
++import { describe, expect, it, vi, beforeEach } from 'vitest'
++
++// Hermetic setup (same approach as canvasStore.contract.test.ts): stub the demo-image canvas
++// renderer, the IndexedDB-backed asset store, and the remote debug-log flusher.
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++vi.mock('../lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async (_blob: Blob, name: string, type: string) => ({
++    assetUrl: 'mivo-asset://mock-asset',
++    name,
++    type,
++    sizeBytes: 1234,
++    hasTransparency: false,
++    size: '300x200',
++    sourceDimensions: { width: 300, height: 200 },
++  })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('./remoteDebugReporter', () => ({
++  reportRemoteDebugEntry: () => {},
++}))
++
++// P2-C1b: the 3 real generation actions now go through the async tasks API
++// (submitEditTask/submitGenerationTask → pollTask → cancelTask) instead of the
++// sync editMivoImage/generateMivoImage. The mock boundary moved from
++// mivoImageClient to mivoTaskClient; assetBlobForNode (still in mivoImageClient)
++// stays wired. Controlling submit/poll lets us exercise the task state machine
++// (running → done/canceled/failed) without HTTP. vi.hoisted keeps the mock fns
++// available to the vi.mock factory (which is hoisted above top-level declarations).
++const mocks = vi.hoisted(() => ({
++  submitEditTask: vi.fn(),
++  submitGenerationTask: vi.fn(),
++  submitVariationsTask: vi.fn(),
++  pollTask: vi.fn(),
++  cancelTask: vi.fn(),
++  assetBlobForNode: vi.fn(),
++}))
++
++vi.mock('../lib/mivoTaskClient', () => ({
++  submitEditTask: mocks.submitEditTask,
++  submitGenerationTask: mocks.submitGenerationTask,
++  submitVariationsTask: mocks.submitVariationsTask,
++  pollTask: mocks.pollTask,
++  cancelTask: mocks.cancelTask,
++  taskPollIntervalMs: () => 0,
++  kindForFailedTask: (error: string) =>
++    /\btimeout\b|超时|timed[\s-]?out/i.test(error) ? 'upstream-timeout' : 'upstream-error',
++}))
++
++vi.mock('../lib/mivoImageClient', () => ({
++  assetBlobForNode: mocks.assetBlobForNode,
++  MivoImageRequestError: class MivoImageRequestError extends Error {
++    kind: string
++    constructor(message: string, kind: string) {
++      super(message)
++      this.name = 'MivoImageRequestError'
++      this.kind = kind
++    }
++  },
++}))
++
++import { useCanvasStore } from './canvasStore'
++import { useCameraFocusStore } from './cameraFocusStore'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++// Helpers ---------------------------------------------------------------------
++
++function committedImage() {
++  return {
++    blob: new Blob(['mock-image-bytes'], { type: 'image/png' }),
++    title: 'Generated image 1',
++    width: 300,
++    height: 200,
++  }
++}
++
++const {
++  submitEditTask: mockSubmitEditTask,
++  submitGenerationTask: mockSubmitGenerationTask,
++  submitVariationsTask: mockSubmitVariationsTask,
++  pollTask: mockPollTask,
++  cancelTask: mockCancelTask,
++  assetBlobForNode: mockAssetBlobForNode,
++} = mocks
++
++// A done-view payload the poll loop will resolve with on success. progress=100 +
++// stage='done' + result.images matches the server's terminal shape.
++const doneView = (images = [committedImage()]) => ({
++  id: 't1',
++  kind: 'edit' as const,
++  status: 'done' as const,
++  progress: 100,
++  stage: 'done',
++  requestId: 'req-1',
++  model: 'gpt-image-2',
++  result: { images },
++})
++
++const failedView = (error: string) => ({
++  id: 't1',
++  kind: 'edit' as const,
++  status: 'failed' as const,
++  progress: 50,
++  stage: 'failed',
++  requestId: 'req-1',
++  model: 'gpt-image-2',
++  error,
++})
++
++const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++  id: 'n1',
++  type: 'image',
++  title: 'Image',
++  x: 10,
++  y: 20,
++  width: 300,
++  height: 200,
++  status: 'ready',
++  assetUrl: '/a.png',
++  ...overrides,
++})
++
++const baseState = useCanvasStore.getState()
++
++const seed = (overrides: Record<string, unknown> = {}) =>
++  useCanvasStore.setState({ ...baseState, ...overrides } as never, true)
++
++const seedCanvas = (sceneId: string, nodes: MivoCanvasNode[]) => {
++  const document = { title: sceneId, nodes, edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
++  return {
++    canvases: { [sceneId]: document },
++    sceneId,
++    nodes,
++    edges: [],
++    tasks: [],
++    selectedNodeId: undefined,
++    selectedNodeIds: [],
++  }
++}
++
++beforeEach(() => {
++  useCanvasStore.setState({ ...baseState } as never, true)
++  useCameraFocusStore.setState({ pendingFocus: undefined, generationFocusNodeIds: [] })
++  mockSubmitEditTask.mockReset().mockResolvedValue('t1')
++  mockSubmitGenerationTask.mockReset().mockResolvedValue('t1')
++  mockSubmitVariationsTask.mockReset().mockResolvedValue({ taskId: 't1', batchId: 'b1', count: 4 })
++  mockPollTask.mockReset().mockResolvedValue(doneView())
++  mockCancelTask.mockReset().mockResolvedValue(undefined)
++  mockAssetBlobForNode.mockReset().mockResolvedValue(new Blob(['mock-source-bytes'], { type: 'image/png' }))
++})
++
++/** 读当前 pendingFocus 并断言它是 generation-result 请求,返回其成员集。 */
++
++/** 本批 commit 产物节点集:调用前节点之外新增的「image 结果 ∪ failed 失败槽」。
++ *  注意不能用全量 nodes diff——syncDerivationEdgeNodes 会把衍生边物化成
++ *  derivation-edge 节点进 nodes 数组,那些不是焦点成员。 */
++
++// Tests -----------------------------------------------------------------------
++describe('contract: #297 编辑占位批次(SC10/11/12/14 预建与占位几何)', () => {
++  const source = () => imageNode({ id: 'n1', width: 300, height: 200 })
++
++  it('derived_batch_prebuilds_slots_before_submit: 预建全部 generating slot 后才允许 submitEditTask', async () => {
++    seed(seedCanvas('character-flow', [source()]))
++    const slotIds = useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'batch-1',
++      expectedCount: 2,
++    })
++    expect(slotIds).toHaveLength(2)
++    // 预建先于任何 submit:现在还没有网络调用
++    expect(mockSubmitEditTask).not.toHaveBeenCalled()
++    const s = useCanvasStore.getState()
++    const slots = s.nodes.filter((n) => n.type === 'ai-slot')
++    expect(slots).toHaveLength(2)
++    slots.forEach((slot, ordinal) => {
++      expect(slot.status).toBe('generating')
++      expect(slot.aiWorkflow?.status).toBe('generating')
++      expect(slot.aiWorkflow?.batchId).toBe('batch-1')
++      expect(slot.aiWorkflow?.expectedCount).toBe(2)
++      expect(slot.aiWorkflow?.ordinal).toBe(ordinal)
++      expect(slot.aiWorkflow?.sourceNodeIds).toEqual(['n1'])
++      expect(slot.locked).toBe(true)
++    })
++    // ordinal 精确绑定预建 slot:generateImageEdit(ordinal 0) 提交时 slot 已存在
++    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', {
++      derivedBatchId: 'batch-1',
++      expectedCount: 2,
++      ordinal: 0,
++    })
++    expect(mockSubmitEditTask).toHaveBeenCalledTimes(1)
++    expect(nodeIds).toHaveLength(1)
++    // 结果原位替换 slot 0;slot 1 保持 generating
++    const after = useCanvasStore.getState().nodes
++    expect(after.find((n) => n.id === nodeIds[0])?.type).toBe('image')
++    expect(after.find((n) => n.id === slotIds[1])?.status).toBe('generating')
++  })
++
++  it('derived_placeholder_matches_source_size: 占位尺寸取源图尺寸(不走 320×320)', () => {
++    seed(seedCanvas('character-flow', [source()]))
++    const slotIds = useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'batch-size',
++      expectedCount: 2,
++    })
++    const slots = useCanvasStore.getState().nodes.filter((n) => slotIds.includes(n.id))
++    slots.forEach((slot) => {
++      expect(slot.width).toBe(300)
++      expect(slot.height).toBe(200)
++    })
++  })
++
++  it('derived_batch_keeps_ordinal_positions: 按 ordinal 保留列位置,成功原位替换、失败转终态、不压缩重排', async () => {
++    seed(seedCanvas('character-flow', [source()]))
++    const slotIds = useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'batch-pos',
++      expectedCount: 3,
++    })
++    const before = useCanvasStore.getState().nodes.filter((n) => slotIds.includes(n.id))
++    // 同一列(左缘相同),y 递增
++    expect(new Set(before.map((n) => n.x)).size).toBe(1)
++    expect(before[1].y).toBeGreaterThan(before[0].y)
++    expect(before[2].y).toBeGreaterThan(before[1].y)
++    const slot0 = before[0]
++
++    // ordinal 0 成功 → 原位替换(x/y 不变)
++    const doneIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'ok', {
++      derivedBatchId: 'batch-pos',
++      expectedCount: 3,
++      ordinal: 0,
++    })
++    const result = useCanvasStore.getState().nodes.find((n) => n.id === doneIds[0])
++    expect(result?.x).toBe(slot0.x)
++    expect(result?.y).toBe(slot0.y)
++
++    // ordinal 1 失败 → slot 原位转 failed(不删除),位置不变
++    mockPollTask.mockResolvedValueOnce(failedView('boom'))
++    await expect(
++      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'bad', {
++        derivedBatchId: 'batch-pos',
++        expectedCount: 3,
++        ordinal: 1,
++      }),
++    ).rejects.toThrow(/boom/)
++    const slot1 = useCanvasStore.getState().nodes.find((n) => n.id === slotIds[1])
++    expect(slot1).toBeDefined()
++    expect(slot1?.status).toBe('failed')
++    expect(slot1?.aiWorkflow?.status).toBe('failed')
++    expect(slot1?.x).toBe(before[1].x)
++    expect(slot1?.y).toBe(before[1].y)
++
++    // ordinal 2 保持 generating,位置未被压缩/重排
++    const slot2 = useCanvasStore.getState().nodes.find((n) => n.id === slotIds[2])
++    expect(slot2?.status).toBe('generating')
++    expect(slot2?.x).toBe(before[2].x)
++    expect(slot2?.y).toBe(before[2].y)
++  })
++
++  it('derived_batch_running_slots_are_immutable: 运行中批次 slot locked=true 且保持 generating(不可移动/缩放/删除)', async () => {
++    seed(seedCanvas('character-flow', [source()]))
++    const slotIds = useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'batch-lock',
++      expectedCount: 2,
++    })
++    const slots = useCanvasStore.getState().nodes.filter((n) => slotIds.includes(n.id))
++    expect(slots).toHaveLength(2)
++    slots.forEach((slot) => {
++      expect(slot.locked).toBe(true)
++      expect(slot.status).toBe('generating')
++      expect(slot.aiWorkflow?.status).toBe('generating')
++    })
++    // locked 的 slot 不被右侧重排推走(canReflowNode 排除 locked)
++    const { reflowRightObstacles } = await import('./aiCanvasWorkflow')
++    const placed = { id: 'new', x: 200, y: 10, width: 100, height: 100 }
++    const moved = reflowRightObstacles(useCanvasStore.getState().nodes, placed)
++    const still = moved.filter((n) => slotIds.includes(n.id))
++    still.forEach((slot, i) => {
++      expect(slot.x).toBe(slots[i].x)
++      expect(slot.y).toBe(slots[i].y)
++    })
++  })
++})
++describe('contract: #297 编辑占位批次(SC4/SC5 失败收敛与单一撤销单元)', () => {
++  const source = () => imageNode({ id: 'n1', width: 300, height: 200 })
++
++  it('derived_batch_failure_settles_placeholder: 失败时对应 ordinal slot 原位转 failed 终态,不删除、清进度字段', async () => {
++    seed(seedCanvas('character-flow', [source()]))
++    const slotIds = useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'batch-fail',
++      expectedCount: 2,
++    })
++    // 给 slot0 预置 progress/stage/startedAt(模拟 poll 采样过),失败后必须清掉
++    useCanvasStore.setState((s) => {
++      const doc = s.canvases['character-flow']
++      const nodes = doc.nodes.map((n) =>
++        n.id === slotIds[0]
++          ? { ...n, aiWorkflow: { ...n.aiWorkflow!, progress: 55, stage: 'enhancing', startedAt: 1234 } }
++          : n,
++      )
++      return { nodes, canvases: { ...s.canvases, 'character-flow': { ...doc, nodes } } }
++    })
++    mockPollTask.mockResolvedValueOnce(failedView('boom'))
++    await expect(
++      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'bad', {
++        derivedBatchId: 'batch-fail',
++        expectedCount: 2,
++        ordinal: 0,
++      }),
++    ).rejects.toThrow(/boom/)
++
++    const s = useCanvasStore.getState()
++    // slot0 原位转 failed(不删除)
++    const slot0 = s.nodes.find((n) => n.id === slotIds[0])
++    expect(slot0).toBeDefined()
++    expect(slot0?.status).toBe('failed')
++    expect(slot0?.aiWorkflow?.status).toBe('failed')
++    expect(slot0?.aiWorkflow?.progress).toBeUndefined()
++    expect(slot0?.aiWorkflow?.stage).toBeUndefined()
++    expect(slot0?.aiWorkflow?.startedAt).toBeUndefined()
++    // 同批 slot1 保留 generating(不因 ordinal0 失败被删)
++    expect(s.nodes.find((n) => n.id === slotIds[1])?.status).toBe('generating')
++    // 任务状态照旧 failed
++    expect(s.tasks[0]?.status).toBe('failed')
++  })
++
++  it('derived_batch_is_one_undo_unit: 批次整链只压一次历史基线,undo 回生成前、redo 恢复混合态且不复活 generating 任务', async () => {
++    seed(seedCanvas('character-flow', [source()]))
++    // 预置一个历史基线(模拟此前已有编辑),startDerivedImageBatch 只在其上再压一次
++    useCanvasStore.getState().captureHistory()
++    expect(useCanvasStore.getState().historyPast).toHaveLength(1)
++
++    const slotIds = useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'batch-undo',
++      expectedCount: 2,
++    })
++    // 预建只 captureHistory 一次
++    expect(useCanvasStore.getState().historyPast).toHaveLength(2)
++
++    // ordinal 0 成功(替换不追加 history)
++    const doneIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'ok', {
++      derivedBatchId: 'batch-undo',
++      expectedCount: 2,
++      ordinal: 0,
++    })
++    expect(useCanvasStore.getState().historyPast).toHaveLength(2)
++    expect(useCanvasStore.getState().nodes.some((n) => n.id === doneIds[0])).toBe(true)
++
++    // undo → 恢复生成前快照(无 slot 无结果)
++    useCanvasStore.getState().undo()
++    let s = useCanvasStore.getState()
++    expect(s.nodes.some((n) => n.id === doneIds[0])).toBe(false)
++    expect(s.nodes.some((n) => n.id === slotIds[0])).toBe(false)
++    expect(s.nodes.some((n) => n.id === slotIds[1])).toBe(false)
++    // 任务不复活:generating/running 是任务非法态,断言无 running/queued 残留
++    expect(s.tasks.some((t) => t.status === 'running' || t.status === 'queued')).toBe(false)
++
++    // redo → 恢复调用 undo 时的混合状态(结果图 + 另一个 generating slot),不复活 generating 任务
++    useCanvasStore.getState().redo()
++    s = useCanvasStore.getState()
++    expect(s.nodes.some((n) => n.id === doneIds[0])).toBe(true)
++    expect(s.nodes.some((n) => n.id === slotIds[1])).toBe(true)
++    expect(s.tasks.some((t) => t.status === 'running' || t.status === 'queued')).toBe(false)
++  })
++})
+diff --git a/src/store/generation.contract.test.ts b/src/store/generation.contract.test.ts
+index f06d6345..9368e6ad 100644
+--- a/src/store/generation.contract.test.ts
++++ b/src/store/generation.contract.test.ts
+@@ -64,7 +64,6 @@ vi.mock('../lib/mivoImageClient', () => ({
+ import { useCanvasStore } from './canvasStore'
+ import { generationFacade } from './generationFacade'
+ import { useCameraFocusStore } from './cameraFocusStore'
+-import type { CameraFocusRequest } from './cameraFocusStore'
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ 
+ // Helpers ---------------------------------------------------------------------
+@@ -111,27 +110,6 @@ const failedView = (error: string) => ({
+   error,
+ })
+ 
+-// P2-C2: partial-view payload for variations (some success + some failure). The
+-// success subset travels in result.images (with variationIndex); the failed
+-// subset in failures[] (with variationIndex + desensitized error). partial does
+-// NOT reject — the action resolves the success subset. Images accept blob OR b64
+-// (committedImage() carries blob; runtime carries b64) — commitGenerationResult
+-// handles both via blobFromCommittedGenerationImage.
+-const partialView = (
+-  images: Array<{ b64?: string; blob?: Blob; variationIndex?: number }>,
+-  failures: Array<{ variationIndex: number; error: string }>,
+-) => ({
+-  id: 't1',
+-  kind: 'variations' as const,
+-  status: 'partial' as const,
+-  progress: 100,
+-  stage: 'done',
+-  requestId: 'req-1',
+-  model: 'gpt-image-2',
+-  result: { images },
+-  failures,
+-})
+-
+ const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+   id: 'n1',
+   type: 'image',
+@@ -189,29 +167,12 @@ beforeEach(() => {
+ })
+ 
+ /** 读当前 pendingFocus 并断言它是 generation-result 请求,返回其成员集。 */
+-const pendingResultMembers = (): string[] => {
+-  const pending: CameraFocusRequest | undefined = useCameraFocusStore.getState().pendingFocus
+-  if (!pending || pending.kind !== 'generation-result') {
+-    throw new Error(`expected generation-result focus request, got ${pending?.kind ?? 'none'}`)
+-  }
+-  return pending.memberNodeIds
+-}
+ 
+ /** 本批 commit 产物节点集:调用前节点之外新增的「image 结果 ∪ failed 失败槽」。
+  *  注意不能用全量 nodes diff——syncDerivationEdgeNodes 会把衍生边物化成
+  *  derivation-edge 节点进 nodes 数组,那些不是焦点成员。 */
+-const batchNodeIds = (beforeIds: Set<string>): string[] =>
+-  useCanvasStore
+-    .getState()
+-    .nodes.filter(
+-      (node) =>
+-        !beforeIds.has(node.id) &&
+-        ((node.type === 'image' && node.sourceNodeId) || (node.type === 'ai-slot' && node.status === 'failed')),
+-    )
+-    .map((node) => node.id)
+ 
+ // Tests -----------------------------------------------------------------------
+-
+ describe('contract: generation action signatures', () => {
+   it('generateImageEdit returns a Promise<string[]> (resolves to string[] on success)', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+@@ -296,7 +257,6 @@ describe('contract: generation action signatures', () => {
+   })
+ 
+ })
+-
+ describe('contract: generateImageEdit orchestration (mock network)', () => {
+   it('success: task transitions running→done, result committed, derivation edge created', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+@@ -407,7 +367,6 @@ describe('contract: generateImageEdit orchestration (mock network)', () => {
+     expect(useCanvasStore.getState().canvases['character-flow']!.tasks).toEqual([])
+   })
+ })
+-
+ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () => {
+   it('generateBesideNode: success marks the task done and commits a result node', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+@@ -563,7 +522,6 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
+     expect(finalState.historyFuture).toHaveLength(1)
+   })
+ })
+-
+ describe('contract: task state machine (generation actions)', () => {
+   // The CanvasTask status union is 'running' | 'queued' | 'failed' | 'done' | 'canceled'.
+   // The 3 real generation actions create a 'running' task directly (no 'queued' is ever produced
+@@ -626,220 +584,3 @@ describe('contract: task state machine (generation actions)', () => {
+     expect(taskFor(useCanvasStore.getState().tasks[0].id)?.progress).toBe(100)
+   })
+ })
+-
+-describe('contract: variations / annotation (P2-C2 de-mocked → async tasks API)', () => {
+-  it('generateVariations resolves with result nodeIds + commits derivation edges + done task', async () => {
+-    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    mockPollTask.mockResolvedValueOnce(
+-      doneView([committedImage(), committedImage(), committedImage(), committedImage()]),
+-    )
+-    const nodeIds = await useCanvasStore.getState().generateVariations('n1')
+-    expect(nodeIds).toHaveLength(4)
+-    const s = useCanvasStore.getState()
+-    expect(s.edges.filter((e) => e.from === 'n1')).toHaveLength(4)
+-    expect(s.tasks[0].status).toBe('done')
+-    expect(mockSubmitVariationsTask).toHaveBeenCalledWith(
+-      expect.objectContaining({ variations: expect.any(Array) }),
+-    )
+-  })
+-
+-  it('generateVariations partial (2 success + 1 failure) resolves the success subset + creates a visible failed slot', async () => {
+-    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    mockPollTask.mockResolvedValueOnce(
+-      partialView(
+-        [{ ...committedImage(), variationIndex: 0 }, { ...committedImage(), variationIndex: 1 }],
+-        [{ variationIndex: 2, error: 'Upstream error (500)' }],
+-      ),
+-    )
+-    const nodeIds = await useCanvasStore.getState().generateVariations('n1', [
+-      { prompt: 'p0' },
+-      { prompt: 'p1' },
+-      { prompt: 'p2' },
+-    ])
+-    // partial does NOT reject — resolves the success subset (2 of 3).
+-    expect(nodeIds).toHaveLength(2)
+-    const s = useCanvasStore.getState()
+-    // 失败槽位可见: a failed ai-slot node for the failed variation.
+-    const failedSlots = s.nodes.filter((n) => n.type === 'ai-slot' && n.status === 'failed')
+-    expect(failedSlots).toHaveLength(1)
+-    // partial resolves → done task carrying the success nodeIds.
+-    expect(s.tasks[0].status).toBe('done')
+-    expect(s.tasks[0].nodeIds).toEqual(nodeIds)
+-  })
+-
+-  it('generateVariations rejects when there is no source image', async () => {
+-    seed(seedCanvas('character-flow', []))
+-    await expect(useCanvasStore.getState().generateVariations()).rejects.toThrow(/没有可用的源图/)
+-    expect(useCanvasStore.getState().tasks).toHaveLength(0)
+-  })
+-})
+-
+-// ── p0-sc2:generateVariations 结果焦点请求(commit 全部落盘后发出)──
+-describe('contract: generateVariations 结果焦点请求(p0-sc2)', () => {
+-  const runVariations = (view: unknown) => {
+-    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    mockPollTask.mockResolvedValueOnce(view)
+-    return useCanvasStore.getState().generateVariations('n1')
+-  }
+-
+-  /** 本批 commit 产物节点集:调用前节点之外新增的「image 结果 ∪ failed 失败槽」。
+-   *  注意不能用全量 nodes diff——syncDerivationEdgeNodes 会把衍生边物化成
+-   *  derivation-edge 节点进 nodes 数组,那些不是焦点成员。 */
+-  const batchNodeIds = (beforeIds: Set<string>): string[] =>
+-    useCanvasStore
+-      .getState()
+-      .nodes.filter(
+-        (node) =>
+-          !beforeIds.has(node.id) &&
+-          ((node.type === 'image' && node.sourceNodeId) || (node.type === 'ai-slot' && node.status === 'failed')),
+-      )
+-      .map((node) => node.id)
+-
+-  it('2 成功 + 2 失败混合:commit 完成前无结果焦点请求;完成后成员集恰为 successIds ∪ 失败槽 id', async () => {
+-    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
+-    // C1 时序绑定:请求被调用当刻,全部成员 id 必须已存在于目标场景节点表——
+-    // 失败槽必须在请求之前落盘。反向变异(请求挪到失败槽 set 之前)此断言转红。
+-    const originalRequestResultFocus = useCameraFocusStore.getState().requestGenerationResultFocus
+-    const focusSpy = vi
+-      .spyOn(useCameraFocusStore.getState(), 'requestGenerationResultFocus')
+-      .mockImplementation((members, context) => {
+-        const nodeTable = useCanvasStore.getState().canvases['character-flow']?.nodes ?? []
+-        for (const id of members) {
+-          expect(nodeTable.some((node) => node.id === id)).toBe(true)
+-        }
+-        return originalRequestResultFocus(members, context)
+-      })
+-    try {
+-      // 受控 pending gate:把 poll 挂起,在 commit 完成前断言无结果焦点请求。
+-      let resolvePoll!: (view: unknown) => void
+-      mockPollTask.mockReturnValueOnce(new Promise((resolve) => { resolvePoll = resolve }))
+-      const promise = useCanvasStore.getState().generateVariations('n1')
+-
+-      // 挂在 poll 上(commit 未发生):无结果焦点请求、无 pendingFocus。
+-      expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
+-
+-      resolvePoll(
+-        partialView(
+-          [
+-            { ...committedImage(), variationIndex: 0 },
+-            { ...committedImage(), variationIndex: 1 },
+-          ],
+-          [
+-            { variationIndex: 2, error: 'Upstream error (500)' },
+-            { variationIndex: 3, error: 'Upstream error (500)' },
+-          ],
+-        ),
+-      )
+-      await promise
+-    } finally {
+-      focusSpy.mockRestore()
+-    }
+-
+-    const members = pendingResultMembers()
+-    // 成员集恰为本批 commit 产物:2 个成功 image + 2 个失败槽,无他。
+-    const expected = batchNodeIds(beforeIds)
+-    expect(new Set(members)).toEqual(new Set(expected))
+-    expect(members).toHaveLength(4)
+-    const s = useCanvasStore.getState()
+-    expect(s.nodes.filter((node) => node.status === 'failed')).toHaveLength(2)
+-    expect(s.nodes.filter((node) => node.type === 'image' && node.sourceNodeId === 'n1')).toHaveLength(2)
+-    // triggerNodeId = 成员首个。
+-    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({ triggerNodeId: members[0], source: 'generation-result' })
+-  })
+-
+-  it('done(images=[]) 时无请求且不崩溃', async () => {
+-    await runVariations(doneView([]))
+-    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
+-  })
+-})
+-
+-// ── p0-sc4:1/2/3/4 变体计数矩阵 + 2 成功 2 失败混合(slice 层成员 exact)──
+-describe('contract: 变体计数矩阵结果焦点(p0-sc4)', () => {
+-  it.each([1, 2, 3, 4])('变体 %i 张:完成后 pendingFocus 成员集恰为本批节点', async (count) => {
+-    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
+-    mockPollTask.mockResolvedValueOnce(doneView(Array.from({ length: count }, () => committedImage())))
+-    await useCanvasStore.getState().generateVariations('n1')
+-
+-    const members = pendingResultMembers()
+-    expect(members).toHaveLength(count)
+-    const expected = batchNodeIds(beforeIds)
+-    expect(new Set(members)).toEqual(new Set(expected))
+-  })
+-
+-  it('2 成功 2 失败混合:成员集恰为本批节点(successIds ∪ 失败槽)', async () => {
+-    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
+-    mockPollTask.mockResolvedValueOnce(
+-      partialView(
+-        [
+-          { ...committedImage(), variationIndex: 0 },
+-          { ...committedImage(), variationIndex: 1 },
+-        ],
+-        [
+-          { variationIndex: 2, error: 'Upstream error (500)' },
+-          { variationIndex: 3, error: 'Upstream error (500)' },
+-        ],
+-      ),
+-    )
+-    await useCanvasStore.getState().generateVariations('n1')
+-
+-    const members = pendingResultMembers()
+-    expect(members).toHaveLength(4)
+-    const expected = batchNodeIds(beforeIds)
+-    expect(new Set(members)).toEqual(new Set(expected))
+-  })
+-})
+-
+-// ── p1-sc1 / p1-sc2:edit / beside 结果焦点请求(slice 层)──
+-describe('contract: edit / beside 结果焦点请求(p1-sc1 / p1-sc2)', () => {
+-  it('generateImageEdit commit 完成后 pendingFocus 成员 = commit 返回的结果节点 id', async () => {
+-    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
+-    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat')
+-
+-    const members = pendingResultMembers()
+-    expect(nodeIds).toHaveLength(1)
+-    expect(members).toEqual(nodeIds)
+-    // 成员确实落在目标场景节点表(commit 产物 image 结果)。
+-    const expected = batchNodeIds(beforeIds)
+-    expect(new Set(members)).toEqual(new Set(expected))
+-  })
+-
+-  it('generateBesideNode commit 完成后 pendingFocus 成员 = 结果节点', async () => {
+-    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    const nodeIds = await useCanvasStore.getState().generateBesideNode('n1', 'a cat beside')
+-
+-    const members = pendingResultMembers()
+-    expect(members).toEqual(nodeIds)
+-    expect(members).toHaveLength(1)
+-  })
+-
+-  it('重叠完成:edit 与 beside 消费前先后 commit → pending 成员 = 两批 union(exact-union 不 latest-wins)', async () => {
+-    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    let resolveEdit!: (view: unknown) => void
+-    let resolveBeside!: (view: unknown) => void
+-    mockPollTask
+-      .mockReturnValueOnce(new Promise((resolve) => { resolveEdit = resolve }))
+-      .mockReturnValueOnce(new Promise((resolve) => { resolveBeside = resolve }))
+-    const editPromise = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'cat')
+-    const besidePromise = useCanvasStore.getState().generateBesideNode('n1', 'beside')
+-
+-    // 两批都挂在 poll 上:无请求。
+-    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
+-    // edit 先 commit → 成员=[edit 结果]。
+-    resolveEdit(doneView())
+-    await editPromise
+-    const afterEdit = pendingResultMembers()
+-    expect(afterEdit).toHaveLength(1)
+-    const editId = afterEdit[0]
+-    // beside 后 commit → union 合并,不覆盖。
+-    resolveBeside(doneView())
+-    await besidePromise
+-    const merged = pendingResultMembers()
+-    expect(merged).toHaveLength(2)
+-    expect(merged).toContain(editId)
+-    expect(merged[0]).toBe(editId) // 先到达者保持在前,后到达者并入(exact-union)。
+-  })
+-})
+diff --git a/src/store/generation.focus.contract.test.ts b/src/store/generation.focus.contract.test.ts
+new file mode 100644
+index 00000000..6f49626e
+--- /dev/null
++++ b/src/store/generation.focus.contract.test.ts
+@@ -0,0 +1,403 @@
++import { describe, expect, it, vi, beforeEach } from 'vitest'
++
++// Hermetic setup (same approach as canvasStore.contract.test.ts): stub the demo-image canvas
++// renderer, the IndexedDB-backed asset store, and the remote debug-log flusher.
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++vi.mock('../lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async (_blob: Blob, name: string, type: string) => ({
++    assetUrl: 'mivo-asset://mock-asset',
++    name,
++    type,
++    sizeBytes: 1234,
++    hasTransparency: false,
++    size: '300x200',
++    sourceDimensions: { width: 300, height: 200 },
++  })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('./remoteDebugReporter', () => ({
++  reportRemoteDebugEntry: () => {},
++}))
++
++// P2-C1b: the 3 real generation actions now go through the async tasks API
++// (submitEditTask/submitGenerationTask → pollTask → cancelTask) instead of the
++// sync editMivoImage/generateMivoImage. The mock boundary moved from
++// mivoImageClient to mivoTaskClient; assetBlobForNode (still in mivoImageClient)
++// stays wired. Controlling submit/poll lets us exercise the task state machine
++// (running → done/canceled/failed) without HTTP. vi.hoisted keeps the mock fns
++// available to the vi.mock factory (which is hoisted above top-level declarations).
++const mocks = vi.hoisted(() => ({
++  submitEditTask: vi.fn(),
++  submitGenerationTask: vi.fn(),
++  submitVariationsTask: vi.fn(),
++  pollTask: vi.fn(),
++  cancelTask: vi.fn(),
++  assetBlobForNode: vi.fn(),
++}))
++
++vi.mock('../lib/mivoTaskClient', () => ({
++  submitEditTask: mocks.submitEditTask,
++  submitGenerationTask: mocks.submitGenerationTask,
++  submitVariationsTask: mocks.submitVariationsTask,
++  pollTask: mocks.pollTask,
++  cancelTask: mocks.cancelTask,
++  taskPollIntervalMs: () => 0,
++  kindForFailedTask: (error: string) =>
++    /\btimeout\b|超时|timed[\s-]?out/i.test(error) ? 'upstream-timeout' : 'upstream-error',
++}))
++
++vi.mock('../lib/mivoImageClient', () => ({
++  assetBlobForNode: mocks.assetBlobForNode,
++  MivoImageRequestError: class MivoImageRequestError extends Error {
++    kind: string
++    constructor(message: string, kind: string) {
++      super(message)
++      this.name = 'MivoImageRequestError'
++      this.kind = kind
++    }
++  },
++}))
++
++import { useCanvasStore } from './canvasStore'
++import { useCameraFocusStore } from './cameraFocusStore'
++import type { CameraFocusRequest } from './cameraFocusStore'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++// Helpers ---------------------------------------------------------------------
++
++function committedImage() {
++  return {
++    blob: new Blob(['mock-image-bytes'], { type: 'image/png' }),
++    title: 'Generated image 1',
++    width: 300,
++    height: 200,
++  }
++}
++
++const {
++  submitEditTask: mockSubmitEditTask,
++  submitGenerationTask: mockSubmitGenerationTask,
++  submitVariationsTask: mockSubmitVariationsTask,
++  pollTask: mockPollTask,
++  cancelTask: mockCancelTask,
++  assetBlobForNode: mockAssetBlobForNode,
++} = mocks
++
++// A done-view payload the poll loop will resolve with on success. progress=100 +
++// stage='done' + result.images matches the server's terminal shape.
++const doneView = (images = [committedImage()]) => ({
++  id: 't1',
++  kind: 'edit' as const,
++  status: 'done' as const,
++  progress: 100,
++  stage: 'done',
++  requestId: 'req-1',
++  model: 'gpt-image-2',
++  result: { images },
++})
++
++// P2-C2: partial-view payload for variations (some success + some failure). The
++// success subset travels in result.images (with variationIndex); the failed
++// subset in failures[] (with variationIndex + desensitized error). partial does
++// NOT reject — the action resolves the success subset. Images accept blob OR b64
++// (committedImage() carries blob; runtime carries b64) — commitGenerationResult
++// handles both via blobFromCommittedGenerationImage.
++const partialView = (
++  images: Array<{ b64?: string; blob?: Blob; variationIndex?: number }>,
++  failures: Array<{ variationIndex: number; error: string }>,
++) => ({
++  id: 't1',
++  kind: 'variations' as const,
++  status: 'partial' as const,
++  progress: 100,
++  stage: 'done',
++  requestId: 'req-1',
++  model: 'gpt-image-2',
++  result: { images },
++  failures,
++})
++
++const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++  id: 'n1',
++  type: 'image',
++  title: 'Image',
++  x: 10,
++  y: 20,
++  width: 300,
++  height: 200,
++  status: 'ready',
++  assetUrl: '/a.png',
++  ...overrides,
++})
++
++const baseState = useCanvasStore.getState()
++
++const seed = (overrides: Record<string, unknown> = {}) =>
++  useCanvasStore.setState({ ...baseState, ...overrides } as never, true)
++
++const seedCanvas = (sceneId: string, nodes: MivoCanvasNode[]) => {
++  const document = { title: sceneId, nodes, edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
++  return {
++    canvases: { [sceneId]: document },
++    sceneId,
++    nodes,
++    edges: [],
++    tasks: [],
++    selectedNodeId: undefined,
++    selectedNodeIds: [],
++  }
++}
++
++beforeEach(() => {
++  useCanvasStore.setState({ ...baseState } as never, true)
++  useCameraFocusStore.setState({ pendingFocus: undefined, generationFocusNodeIds: [] })
++  mockSubmitEditTask.mockReset().mockResolvedValue('t1')
++  mockSubmitGenerationTask.mockReset().mockResolvedValue('t1')
++  mockSubmitVariationsTask.mockReset().mockResolvedValue({ taskId: 't1', batchId: 'b1', count: 4 })
++  mockPollTask.mockReset().mockResolvedValue(doneView())
++  mockCancelTask.mockReset().mockResolvedValue(undefined)
++  mockAssetBlobForNode.mockReset().mockResolvedValue(new Blob(['mock-source-bytes'], { type: 'image/png' }))
++})
++
++/** 读当前 pendingFocus 并断言它是 generation-result 请求,返回其成员集。 */
++const pendingResultMembers = (): string[] => {
++  const pending: CameraFocusRequest | undefined = useCameraFocusStore.getState().pendingFocus
++  if (!pending || pending.kind !== 'generation-result') {
++    throw new Error(`expected generation-result focus request, got ${pending?.kind ?? 'none'}`)
++  }
++  return pending.memberNodeIds
++}
++
++/** 本批 commit 产物节点集:调用前节点之外新增的「image 结果 ∪ failed 失败槽」。
++ *  注意不能用全量 nodes diff——syncDerivationEdgeNodes 会把衍生边物化成
++ *  derivation-edge 节点进 nodes 数组,那些不是焦点成员。 */
++const batchNodeIds = (beforeIds: Set<string>): string[] =>
++  useCanvasStore
++    .getState()
++    .nodes.filter(
++      (node) =>
++        !beforeIds.has(node.id) &&
++        ((node.type === 'image' && node.sourceNodeId) || (node.type === 'ai-slot' && node.status === 'failed')),
++    )
++    .map((node) => node.id)
++
++// Tests -----------------------------------------------------------------------
++describe('contract: variations / annotation (P2-C2 de-mocked → async tasks API)', () => {
++  it('generateVariations resolves with result nodeIds + commits derivation edges + done task', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(
++      doneView([committedImage(), committedImage(), committedImage(), committedImage()]),
++    )
++    const nodeIds = await useCanvasStore.getState().generateVariations('n1')
++    expect(nodeIds).toHaveLength(4)
++    const s = useCanvasStore.getState()
++    expect(s.edges.filter((e) => e.from === 'n1')).toHaveLength(4)
++    expect(s.tasks[0].status).toBe('done')
++    expect(mockSubmitVariationsTask).toHaveBeenCalledWith(
++      expect.objectContaining({ variations: expect.any(Array) }),
++    )
++  })
++
++  it('generateVariations partial (2 success + 1 failure) resolves the success subset + creates a visible failed slot', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(
++      partialView(
++        [{ ...committedImage(), variationIndex: 0 }, { ...committedImage(), variationIndex: 1 }],
++        [{ variationIndex: 2, error: 'Upstream error (500)' }],
++      ),
++    )
++    const nodeIds = await useCanvasStore.getState().generateVariations('n1', [
++      { prompt: 'p0' },
++      { prompt: 'p1' },
++      { prompt: 'p2' },
++    ])
++    // partial does NOT reject — resolves the success subset (2 of 3).
++    expect(nodeIds).toHaveLength(2)
++    const s = useCanvasStore.getState()
++    // 失败槽位可见: a failed ai-slot node for the failed variation.
++    const failedSlots = s.nodes.filter((n) => n.type === 'ai-slot' && n.status === 'failed')
++    expect(failedSlots).toHaveLength(1)
++    // partial resolves → done task carrying the success nodeIds.
++    expect(s.tasks[0].status).toBe('done')
++    expect(s.tasks[0].nodeIds).toEqual(nodeIds)
++  })
++
++  it('generateVariations rejects when there is no source image', async () => {
++    seed(seedCanvas('character-flow', []))
++    await expect(useCanvasStore.getState().generateVariations()).rejects.toThrow(/没有可用的源图/)
++    expect(useCanvasStore.getState().tasks).toHaveLength(0)
++  })
++})
++
++// ── p0-sc2:generateVariations 结果焦点请求(commit 全部落盘后发出)──
++describe('contract: generateVariations 结果焦点请求(p0-sc2)', () => {
++  const runVariations = (view: unknown) => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(view)
++    return useCanvasStore.getState().generateVariations('n1')
++  }
++
++  /** 本批 commit 产物节点集:调用前节点之外新增的「image 结果 ∪ failed 失败槽」。
++   *  注意不能用全量 nodes diff——syncDerivationEdgeNodes 会把衍生边物化成
++   *  derivation-edge 节点进 nodes 数组,那些不是焦点成员。 */
++  const batchNodeIds = (beforeIds: Set<string>): string[] =>
++    useCanvasStore
++      .getState()
++      .nodes.filter(
++        (node) =>
++          !beforeIds.has(node.id) &&
++          ((node.type === 'image' && node.sourceNodeId) || (node.type === 'ai-slot' && node.status === 'failed')),
++      )
++      .map((node) => node.id)
++
++  it('2 成功 + 2 失败混合:commit 完成前无结果焦点请求;完成后成员集恰为 successIds ∪ 失败槽 id', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
++    // C1 时序绑定:请求被调用当刻,全部成员 id 必须已存在于目标场景节点表——
++    // 失败槽必须在请求之前落盘。反向变异(请求挪到失败槽 set 之前)此断言转红。
++    const originalRequestResultFocus = useCameraFocusStore.getState().requestGenerationResultFocus
++    const focusSpy = vi
++      .spyOn(useCameraFocusStore.getState(), 'requestGenerationResultFocus')
++      .mockImplementation((members, context) => {
++        const nodeTable = useCanvasStore.getState().canvases['character-flow']?.nodes ?? []
++        for (const id of members) {
++          expect(nodeTable.some((node) => node.id === id)).toBe(true)
++        }
++        return originalRequestResultFocus(members, context)
++      })
++    try {
++      // 受控 pending gate:把 poll 挂起,在 commit 完成前断言无结果焦点请求。
++      let resolvePoll!: (view: unknown) => void
++      mockPollTask.mockReturnValueOnce(new Promise((resolve) => { resolvePoll = resolve }))
++      const promise = useCanvasStore.getState().generateVariations('n1')
++
++      // 挂在 poll 上(commit 未发生):无结果焦点请求、无 pendingFocus。
++      expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++
++      resolvePoll(
++        partialView(
++          [
++            { ...committedImage(), variationIndex: 0 },
++            { ...committedImage(), variationIndex: 1 },
++          ],
++          [
++            { variationIndex: 2, error: 'Upstream error (500)' },
++            { variationIndex: 3, error: 'Upstream error (500)' },
++          ],
++        ),
++      )
++      await promise
++    } finally {
++      focusSpy.mockRestore()
++    }
++
++    const members = pendingResultMembers()
++    // 成员集恰为本批 commit 产物:2 个成功 image + 2 个失败槽,无他。
++    const expected = batchNodeIds(beforeIds)
++    expect(new Set(members)).toEqual(new Set(expected))
++    expect(members).toHaveLength(4)
++    const s = useCanvasStore.getState()
++    expect(s.nodes.filter((node) => node.status === 'failed')).toHaveLength(2)
++    expect(s.nodes.filter((node) => node.type === 'image' && node.sourceNodeId === 'n1')).toHaveLength(2)
++    // triggerNodeId = 成员首个。
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({ triggerNodeId: members[0], source: 'generation-result' })
++  })
++
++  it('done(images=[]) 时无请求且不崩溃', async () => {
++    await runVariations(doneView([]))
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++  })
++})
++
++// ── p0-sc4:1/2/3/4 变体计数矩阵 + 2 成功 2 失败混合(slice 层成员 exact)──
++describe('contract: 变体计数矩阵结果焦点(p0-sc4)', () => {
++  it.each([1, 2, 3, 4])('变体 %i 张:完成后 pendingFocus 成员集恰为本批节点', async (count) => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
++    mockPollTask.mockResolvedValueOnce(doneView(Array.from({ length: count }, () => committedImage())))
++    await useCanvasStore.getState().generateVariations('n1')
++
++    const members = pendingResultMembers()
++    expect(members).toHaveLength(count)
++    const expected = batchNodeIds(beforeIds)
++    expect(new Set(members)).toEqual(new Set(expected))
++  })
++
++  it('2 成功 2 失败混合:成员集恰为本批节点(successIds ∪ 失败槽)', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
++    mockPollTask.mockResolvedValueOnce(
++      partialView(
++        [
++          { ...committedImage(), variationIndex: 0 },
++          { ...committedImage(), variationIndex: 1 },
++        ],
++        [
++          { variationIndex: 2, error: 'Upstream error (500)' },
++          { variationIndex: 3, error: 'Upstream error (500)' },
++        ],
++      ),
++    )
++    await useCanvasStore.getState().generateVariations('n1')
++
++    const members = pendingResultMembers()
++    expect(members).toHaveLength(4)
++    const expected = batchNodeIds(beforeIds)
++    expect(new Set(members)).toEqual(new Set(expected))
++  })
++})
++
++// ── p1-sc1 / p1-sc2:edit / beside 结果焦点请求(slice 层)──
++describe('contract: edit / beside 结果焦点请求(p1-sc1 / p1-sc2)', () => {
++  it('generateImageEdit commit 完成后 pendingFocus 成员 = commit 返回的结果节点 id', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
++    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat')
++
++    const members = pendingResultMembers()
++    expect(nodeIds).toHaveLength(1)
++    expect(members).toEqual(nodeIds)
++    // 成员确实落在目标场景节点表(commit 产物 image 结果)。
++    const expected = batchNodeIds(beforeIds)
++    expect(new Set(members)).toEqual(new Set(expected))
++  })
++
++  it('generateBesideNode commit 完成后 pendingFocus 成员 = 结果节点', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const nodeIds = await useCanvasStore.getState().generateBesideNode('n1', 'a cat beside')
++
++    const members = pendingResultMembers()
++    expect(members).toEqual(nodeIds)
++    expect(members).toHaveLength(1)
++  })
++
++  it('重叠完成:edit 与 beside 消费前先后 commit → pending 成员 = 两批 union(exact-union 不 latest-wins)', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    let resolveEdit!: (view: unknown) => void
++    let resolveBeside!: (view: unknown) => void
++    mockPollTask
++      .mockReturnValueOnce(new Promise((resolve) => { resolveEdit = resolve }))
++      .mockReturnValueOnce(new Promise((resolve) => { resolveBeside = resolve }))
++    const editPromise = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'cat')
++    const besidePromise = useCanvasStore.getState().generateBesideNode('n1', 'beside')
++
++    // 两批都挂在 poll 上:无请求。
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++    // edit 先 commit → 成员=[edit 结果]。
++    resolveEdit(doneView())
++    await editPromise
++    const afterEdit = pendingResultMembers()
++    expect(afterEdit).toHaveLength(1)
++    const editId = afterEdit[0]
++    // beside 后 commit → union 合并,不覆盖。
++    resolveBeside(doneView())
++    await besidePromise
++    const merged = pendingResultMembers()
++    expect(merged).toHaveLength(2)
++    expect(merged).toContain(editId)
++    expect(merged[0]).toBe(editId) // 先到达者保持在前,后到达者并入(exact-union)。
++  })
++})
+diff --git a/src/store/generationSlice.ts b/src/store/generationSlice.ts
+index 4433fcbf..2e89cfe4 100644
+--- a/src/store/generationSlice.ts
++++ b/src/store/generationSlice.ts
+@@ -1,7 +1,6 @@
+ import { LocalizedKeyError } from '../lib/localizedKeyError'
+ import type {
+   CanvasEdge,
+-  CanvasId,
+   CanvasTask,
+   MivoCanvasNode,
+   MivoCanvasSnapshot,
+@@ -11,55 +10,30 @@ import type { VariationParam } from '../types/generation'
+ import { MivoImageRequestError, assetBlobForNode } from '../lib/mivoImageClient'
+ import { getImageGenerationPort } from '../lib/imageGenerationPort'
+ import { getSceneWrap } from '../lib/sceneWrapRegistry'
+-import {
+-  kindForFailedTask,
+-  taskPollIntervalMs,
+-  type TaskFailure,
+-  type TaskResultImage,
+-} from '../lib/mivoTaskClient'
++import type { TaskFailure } from '../lib/mivoTaskClient'
+ import { errorCanvas, logCanvas, warnCanvas } from './canvasStoreLog'
+ import { useCameraFocusStore } from './cameraFocusStore'
+ import { createEdgeId, createNodeId, edgeTypeForOperation } from './nodeFactory'
+ import { t } from '../i18n'
++import { bindBatchOrdinal, settleBatchSlotState, startDerivedImageBatchImpl } from './derivedBatchCoordinator'
++import { debugLogger } from './debugLogStore'
+ import {
+   defaultDocument,
+   nodePrompt,
+   patchCanvasDocument,
+   rollbackLatestHistoryBaseline,
+ } from './canvasDocumentModel'
++import {
++  canceledTask,
++  doneTask,
++  failedTask,
++  isCanceledGenerationError,
++  newIdempotencyKey,
++  runTaskPollLoop,
++  upsertTask,
++} from './generationTaskHelpers'
+ 
+ const defaultMivoImageModel = 'gpt-image-2'
+-const upsertTask = (tasks: CanvasTask[], task: CanvasTask) => [
+-  task,
+-  ...tasks.filter((item) => item.id !== task.id),
+-].slice(0, 5)
+-
+-// P1 fix (rev-behavior): failed/canceled tasks preserve the last observed progress
+-// (not hardcoded 100), matching the server contract "失败/取消停在最后值". The caller
+-// passes the LIVE task (read from the store at catch time) so its progress reflects
+-// the last patchRunning sample — the stale `runningTask` (progress 0) is NOT used.
+-const failedTask = (task: CanvasTask, label: string): CanvasTask => ({
+-  ...task,
+-  label,
+-  status: 'failed',
+-})
+-
+-const canceledTask = (task: CanvasTask, label: string): CanvasTask => ({
+-  ...task,
+-  label,
+-  status: 'canceled',
+-})
+-
+-const doneTask = (task: CanvasTask, label: string, nodeIds: string[]): CanvasTask => ({
+-  ...task,
+-  label,
+-  status: 'done',
+-  progress: 100,
+-  nodeIds,
+-})
+-
+-const isCanceledGenerationError = (error: unknown, signal?: AbortSignal) =>
+-  Boolean(signal?.aborted) || (error instanceof MivoImageRequestError && error.kind === 'canceled')
+ 
+ // P2-C2: default variation params when the caller doesn't pass explicit ones
+ // (e.g. the InspectorPanel "Make variations" button). 4 variations reusing the
+@@ -103,108 +77,13 @@ const createFailedVariationSlot = (
+   return { node, edge }
+ }
+ 
+-// P2-C1b: one-time idempotency key per generation call. Retries (new action
+-// invocation) get a new key → new server task. Same-call re-submission (e.g. a
+-// transient POST timeout retried by the client) would reuse the key and dedupe
+-// server-side within the process lifetime. We don't currently retry in-action,
+-// so this is forward-compatible plumbing, not a retry loop.
+-const newIdempotencyKey = (): string => {
+-  const crypto = globalThis.crypto as Crypto | undefined
+-  if (crypto?.randomUUID) return crypto.randomUUID()
+-  return `mivo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+-}
+-
+-// Sleep that rejects with MivoImageRequestError(kind='canceled') if the signal
+-// aborts mid-wait — so the poll loop's await sleep() surfaces cancel promptly
+-// without waiting for the next GET.
+-const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+-  new Promise((resolve, reject) => {
+-    if (signal?.aborted) {
+-      reject(new MivoImageRequestError('图片请求已取消。', 'canceled'))
+-      return
+-    }
+-    const onAbort = () => {
+-      window.clearTimeout(id)
+-      reject(new MivoImageRequestError('图片请求已取消。', 'canceled'))
+-    }
+-    const id = window.setTimeout(() => {
+-      signal?.removeEventListener('abort', onAbort)
+-      resolve()
+-    }, ms)
+-    signal?.addEventListener('abort', onAbort, { once: true })
+-  })
+-
+-// P2-C1b: poll loop shared by the 3 real generation actions + P2-C2 variations.
+-// Submits already happened (serverTaskId in hand). Upserts the running task with
+-// the server's real progress/stage on each non-terminal poll. Returns nodeIds on
+-// done/partial (after onResult commits). Throws MivoImageRequestError on
+-// failed/canceled/unknown — the caller's catch sets the terminal task state and
+-// rethrows.
+-//
+-// Terminal-state mapping (per server/contracts/tasks-async.md):
+-//   done     → return nodeIds (caller sets doneTask)
+-//   partial  → return nodeIds (P2-C2 variations; onResult gets failures[] too;
+-//              the caller sets doneTask — partial resolves the success subset,
+-//              does NOT reject. Failures are surfaced via the task record.)
+-//   failed   → throw MivoImageRequestError(message, kindForFailedTask(message))
+-//              so chatStore.errorInfoForChat still classifies timeouts (怪癖 6)
+-//   canceled → throw canceled (caller sets canceledTask, never commits)
+-//   unknown  → throw 'task expired, retry' (server restarted; never commits)
+-const runTaskPollLoop = async (
+-  set: Parameters<SliceCreator>[0],
+-  args: {
+-    serverTaskId: string
+-    signal: AbortSignal | undefined
+-    localTask: CanvasTask
+-    sceneId: CanvasId
+-    onResult: (result: { images: TaskResultImage[]; failures?: TaskFailure[] }) => Promise<string[]>
+-  },
+-): Promise<string[]> => {
+-  const patchRunning = (progress: number, stage: string) =>
+-    set((current) => {
+-      const doc = current.canvases[args.sceneId]
+-      if (!doc) return {}
+-      return patchCanvasDocument(current, args.sceneId, {
+-        tasks: upsertTask(doc.tasks, { ...args.localTask, progress, stage, status: 'running' }),
+-      })
+-    })
+-
+-  for (;;) {
+-    if (args.signal?.aborted) {
+-      throw new MivoImageRequestError('图片请求已取消。', 'canceled')
+-    }
+-    const view = await getImageGenerationPort().pollTask(args.serverTaskId, args.signal)
+-
+-    if (view.status === 'running' || view.status === 'pending') {
+-      patchRunning(view.progress, view.stage)
+-      await sleep(taskPollIntervalMs(), args.signal)
+-      continue
+-    }
+-    if (view.status === 'done') {
+-      const images = view.result?.images ?? []
+-      return args.onResult({ images, failures: undefined })
+-    }
+-    // P2-C2: partial — variations batch where some edits succeeded. Resolve the
+-    // success subset (onResult commits it); failures[] travel along for the
+-    // caller to surface. Does NOT reject (only all-fail → failed → throws).
+-    if (view.status === 'partial') {
+-      const images = view.result?.images ?? []
+-      return args.onResult({ images, failures: view.failures })
+-    }
+-    if (view.status === 'failed') {
+-      const message = view.error || 'Generation failed'
+-      throw new MivoImageRequestError(message, kindForFailedTask(message))
+-    }
+-    if (view.status === 'canceled') {
+-      throw new MivoImageRequestError('图片请求已取消。', 'canceled')
+-    }
+-    // unknown — server restarted / task evicted. Never commit; surface retry.
+-    throw new MivoImageRequestError('任务已失效（服务端重启），请重试。', 'upstream-error')
+-  }
+-}
++// 任务轮询/终态构造/幂等键/取消判定已抽取至 ./generationTaskHelpers.ts(纯重构)。
+ 
+ export const createGenerationSlice: SliceCreator = (set, get) => ({
+   tasks: defaultDocument.tasks,
++  // #297 编辑占位批次预建:实现体在 derivedBatchCoordinator.ts(startDerivedImageBatchImpl),
++  // 此处只保留 set/get 委托,行为不变。
++  startDerivedImageBatch: (params) => startDerivedImageBatchImpl(set, get, params),
+   generateVariations: async (sourceNodeId, variations, options = {}) => {
+     const targetSceneId = options.sceneId || get().sceneId
+     const state = get()
+@@ -375,6 +254,15 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+     if (sourceNodeId && !source) throw new LocalizedKeyError('chat.commit.sourceDeleted')
+     if (!source) return []
+ 
++    // #297 批次三元组:要么齐全、要么全缺(单次 count=1);部分缺失 fail-closed。
++    // 校验/绑定/缺员报错统一走 bindBatchOrdinal(与 generateBesideNode 同一契约)。
++    const batchTriplet = {
++      derivedBatchId: options.derivedBatchId,
++      expectedCount: options.expectedCount,
++      ordinal: options.ordinal,
++    }
++    const batchSlot = bindBatchOrdinal(document, batchTriplet)
++
+     const resultPrompt = prompt.trim() || operationLabel
+     const model = options.model || defaultMivoImageModel
+     const runningTask: CanvasTask = {
+@@ -414,13 +302,12 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+         localTask: runningTask,
+         sceneId: targetSceneId,
+         onResult: async ({ images }) => {
+-          // p1-sc1:改图结果居中——commit 落地后对返回的结果节点 id 集发出显式
+-          // 成员集结果焦点请求(通常 1 个;N=1 是集合的退化情形)。agentEditImage、
+-          // AnchorOverlay area-edit、画布命令三类入口全部经本函数,slice 层一处
+-          // 接线即全覆盖。成员集来源是 commit 返回值,不用 beforeIds diff 撞值。
++          // 批次模式:结果原位替换预建 slot(batchSlot.id),按该 slot 的批次元数据
++          // 分叉尺寸策略(高度锁定)并继承批次身份。
+           const nodeIds = await get().commitGenerationResult({
+             sceneId: targetSceneId,
+             sourceNodeId: source.id,
++            replaceSlotId: batchSlot?.id,
+             resultImages: images,
+             prompt: resultPrompt,
+             model,
+@@ -428,6 +315,10 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+             taskId,
+             createDerivationEdge: options.createDerivationEdge,
+           })
++          // p1-sc1:改图结果居中——commit 落地后对返回的结果节点 id 集发出显式
++          // 成员集结果焦点请求(通常 1 个;N=1 是集合的退化情形)。agentEditImage、
++          // AnchorOverlay area-edit、画布命令三类入口全部经本函数,slice 层一处
++          // 接线即全覆盖。成员集来源是 commit 返回值,不用 beforeIds diff 撞值。
+           if (nodeIds.length > 0) {
+             useCameraFocusStore.getState().requestGenerationResultFocus(nodeIds, {
+               triggerNodeId: nodeIds[0],
+@@ -439,6 +330,9 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+           return nodeIds
+         },
+       })
++      if (batchSlot) {
++        debugLogger.log('Derived Batch', `ordinal ${batchTriplet.ordinal} 成功替换 slot ${batchSlot.id}`)
++      }
+       set((current) => {
+         const targetDocument = current.canvases[targetSceneId]
+         if (!targetDocument) return {}
+@@ -455,19 +349,64 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+       const message = error instanceof LocalizedKeyError
+         ? t(error.message, error.params)
+         : error instanceof Error ? error.message : 'Image edit failed'
+-      set((current) => {
+-        const targetDocument = current.canvases[targetSceneId]
+-        if (!targetDocument) return {}
+-        const liveTask = targetDocument.tasks.find((t) => t.id === runningTask.id) ?? runningTask
+-        return patchCanvasDocument(current, targetSceneId, {
+-          tasks: upsertTask(
+-            targetDocument.tasks,
+-            canceled
+-              ? canceledTask(liveTask, `${operationLabel} canceled`)
+-              : failedTask(liveTask, `${operationLabel}: ${message}`),
+-          ),
++      if (batchSlot) {
++        // SC4:批次模式 catch 把对应 ordinal slot 转 failed/canceled 终态
++        // (不删除、不压缩列),清 progress/stage/startedAt;任务状态照旧。
++        // SC13:源图被删(sourceDeletedSaved)时同批其它仍 generating 的 slot
++        // 一并原位转 failed(已完成结果保留)。
++        const isUserDeletedSlot =
++          error instanceof LocalizedKeyError &&
++          (error.message === 'chat.commit.slotDeleted' || error.message === 'chat.commit.slotDeletedSaved')
++        // SC13:源图被删(await 前 sourceDeleted 或资产落盘后 sourceDeletedSaved)
++        // 时同批其它仍 generating 的 slot 一并原位转 failed(已完成结果保留)。
++        const settleWholeBatch =
++          error instanceof LocalizedKeyError &&
++          (error.message === 'chat.commit.sourceDeleted' || error.message === 'chat.commit.sourceDeletedSaved')
++        if (isUserDeletedSlot) {
++          // SC3:用户已删 skip——用户删掉了批次 slot,收敛跳过(不重建、不删同批)。
++          debugLogger.warn('Derived Batch', `用户已删除 slot ${batchSlot.id},批次收敛跳过(batchId=${batchTriplet.derivedBatchId})`)
++        }
++        getSceneWrap()(targetSceneId, () => set((current) => {
++          const patch = settleBatchSlotState(current, targetSceneId, {
++            slotId: batchSlot.id,
++            batchId: batchTriplet.derivedBatchId as string,
++            status: canceled ? 'canceled' : 'failed',
++            settleWholeBatch,
++          })
++          const targetDocument = current.canvases[targetSceneId]
++          if (!targetDocument) return patch
++          const liveTask = targetDocument.tasks.find((t) => t.id === runningTask.id) ?? runningTask
++          return {
++            ...patch,
++            ...patchCanvasDocument(current, targetSceneId, {
++              tasks: upsertTask(
++                targetDocument.tasks,
++                canceled
++                  ? canceledTask(liveTask, `${operationLabel} canceled`)
++                  : failedTask(liveTask, `${operationLabel}: ${message}`),
++              ),
++            }),
++          }
++        }))
++        debugLogger.warn(
++          'Derived Batch',
++          `ordinal ${batchTriplet.ordinal} ${canceled ? '取消' : '失败'}${settleWholeBatch ? '(源图已删,同批收敛)' : ''},slot ${batchSlot.id} 原位转终态`,
++        )
++      } else {
++        set((current) => {
++          const targetDocument = current.canvases[targetSceneId]
++          if (!targetDocument) return {}
++          const liveTask = targetDocument.tasks.find((t) => t.id === runningTask.id) ?? runningTask
++          return patchCanvasDocument(current, targetSceneId, {
++            tasks: upsertTask(
++              targetDocument.tasks,
++              canceled
++                ? canceledTask(liveTask, `${operationLabel} canceled`)
++                : failedTask(liveTask, `${operationLabel}: ${message}`),
++            ),
++          })
+         })
+-      })
++      }
+       throw error
+     }
+   },
+@@ -485,6 +424,15 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+     if (sourceNodeId && !source) throw new LocalizedKeyError('chat.commit.sourceDeleted')
+     if (!source) return []
+ 
++    // #297 批次三元组(runtime-only):与 generateImageEdit 同一套 fail-closed 契约。
++    // 校验/绑定/缺员报错统一走 bindBatchOrdinal。
++    const batchTriplet = {
++      derivedBatchId: options.derivedBatchId,
++      expectedCount: options.expectedCount,
++      ordinal: options.ordinal,
++    }
++    const batchSlot = bindBatchOrdinal(document, batchTriplet)
++
+     const resultPrompt = prompt?.trim() || nodePrompt(source)
+     const model = options.model || defaultMivoImageModel
+     const taskId = createNodeId('task-beside-generation')
+@@ -542,14 +490,12 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+         localTask: runningTask,
+         sceneId: targetSceneId,
+         onResult: async ({ images }) => {
+-          // p1-sc2:旁生成结果居中——commit 落地后对返回的结果节点 id 集发出显式
+-          // 成员集结果焦点请求。聊天旁生成(chatStore 经 prepareChatSlot 的
+-          // mode:'beside' 分支走本函数,无开始时刻槽位焦点)同样获得居中——
+-          // 共识(2026-08-12):「出图必居中」延伸成立,不加 suppressResultFocus。
+-          // chat 主流程走 generateIntoAiSlot(槽位焦点已覆盖),不经本函数,行为不变。
++          // 批次模式:结果原位替换预建 slot(batchSlot.id),按该 slot 的批次元数据
++          // 分叉尺寸策略(高度锁定)并继承批次身份。
+           const nodeIds = await get().commitGenerationResult({
+             sceneId: targetSceneId,
+             sourceNodeId: source.id,
++            replaceSlotId: batchSlot?.id,
+             resultImages: images,
+             prompt: resultPrompt,
+             model,
+@@ -557,6 +503,12 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+             taskId,
+             createDerivationEdge: options.createDerivationEdge,
+           })
++          // p1-sc2:旁生成结果居中——commit 落地后对返回的结果节点 id 集发出显式
++          // 成员集结果焦点请求。聊天旁生成(chatStore 经 prepareChatSlot 的
++          // mode:'beside' 分支走本函数,无开始时刻槽位焦点)同样获得居中——
++          // 共识(2026-08-12):「出图必居中」延伸成立,不加 suppressResultFocus。
++          // chat 主流程走 generateIntoAiSlot(槽位焦点已覆盖),不经本函数,行为不变。
++          // 批次模式同样生效:成员集来源是 commit 返回值,不用 beforeIds diff 撞值。
+           if (nodeIds.length > 0) {
+             useCameraFocusStore.getState().requestGenerationResultFocus(nodeIds, {
+               triggerNodeId: nodeIds[0],
+@@ -568,6 +520,9 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+           return nodeIds
+         },
+       })
++      if (batchSlot) {
++        debugLogger.log('Derived Batch', `ordinal ${batchTriplet.ordinal} 成功替换 slot ${batchSlot.id}`)
++      }
+       set((current) => {
+         const targetDocument = current.canvases[targetSceneId]
+         if (!targetDocument) return {}
+@@ -584,19 +539,57 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+       const message = error instanceof LocalizedKeyError
+         ? t(error.message, error.params)
+         : error instanceof Error ? error.message : 'Generation failed'
+-      set((current) => {
+-        const targetDocument = current.canvases[targetSceneId]
+-        if (!targetDocument) return {}
+-        const liveTask = targetDocument.tasks.find((t) => t.id === runningTask.id) ?? runningTask
+-        return patchCanvasDocument(current, targetSceneId, {
+-          tasks: upsertTask(
+-            targetDocument.tasks,
+-            canceled
+-              ? canceledTask(liveTask, `旁边生成已取消：${source.title}`)
+-              : failedTask(liveTask, `旁边生成失败：${message}`),
+-          ),
++      if (batchSlot) {
++        const isUserDeletedSlot =
++          error instanceof LocalizedKeyError &&
++          (error.message === 'chat.commit.slotDeleted' || error.message === 'chat.commit.slotDeletedSaved')
++        const settleWholeBatch =
++          error instanceof LocalizedKeyError &&
++          (error.message === 'chat.commit.sourceDeleted' || error.message === 'chat.commit.sourceDeletedSaved')
++        if (isUserDeletedSlot) {
++          debugLogger.warn('Derived Batch', `用户已删除 slot ${batchSlot.id},批次收敛跳过(batchId=${batchTriplet.derivedBatchId})`)
++        }
++        getSceneWrap()(targetSceneId, () => set((current) => {
++          const patch = settleBatchSlotState(current, targetSceneId, {
++            slotId: batchSlot.id,
++            batchId: batchTriplet.derivedBatchId as string,
++            status: canceled ? 'canceled' : 'failed',
++            settleWholeBatch,
++          })
++          const targetDocument = current.canvases[targetSceneId]
++          if (!targetDocument) return patch
++          const liveTask = targetDocument.tasks.find((t) => t.id === runningTask.id) ?? runningTask
++          return {
++            ...patch,
++            ...patchCanvasDocument(current, targetSceneId, {
++              tasks: upsertTask(
++                targetDocument.tasks,
++                canceled
++                  ? canceledTask(liveTask, `旁边生成已取消：${source.title}`)
++                  : failedTask(liveTask, `旁边生成失败：${message}`),
++              ),
++            }),
++          }
++        }))
++        debugLogger.warn(
++          'Derived Batch',
++          `ordinal ${batchTriplet.ordinal} ${canceled ? '取消' : '失败'}${settleWholeBatch ? '(源图已删,同批收敛)' : ''},slot ${batchSlot.id} 原位转终态`,
++        )
++      } else {
++        set((current) => {
++          const targetDocument = current.canvases[targetSceneId]
++          if (!targetDocument) return {}
++          const liveTask = targetDocument.tasks.find((t) => t.id === runningTask.id) ?? runningTask
++          return patchCanvasDocument(current, targetSceneId, {
++            tasks: upsertTask(
++              targetDocument.tasks,
++              canceled
++                ? canceledTask(liveTask, `旁边生成已取消：${source.title}`)
++                : failedTask(liveTask, `旁边生成失败：${message}`),
++            ),
++          })
+         })
+-      })
++      }
+       throw error
+     }
+   },
+diff --git a/src/store/generationTaskHelpers.ts b/src/store/generationTaskHelpers.ts
+new file mode 100644
+index 00000000..07cc9f6e
+--- /dev/null
++++ b/src/store/generationTaskHelpers.ts
+@@ -0,0 +1,138 @@
++// 出图任务轮询/任务记录 helper(generationSlice 结构守卫余量抽取,行为零变化)。
++// 轮询循环、睡眠(取消感知)、任务终态构造、幂等键、取消判定。
++import type { CanvasId, CanvasTask } from '../types/mivoCanvas'
++import type { SliceCreator } from './canvasStateTypes'
++import { MivoImageRequestError } from '../lib/mivoImageClient'
++import { getImageGenerationPort } from '../lib/imageGenerationPort'
++import { kindForFailedTask, taskPollIntervalMs, type TaskFailure, type TaskResultImage } from '../lib/mivoTaskClient'
++import { patchCanvasDocument } from './canvasDocumentModel'
++
++export const upsertTask = (tasks: CanvasTask[], task: CanvasTask) =>
++  [task, ...tasks.filter((item) => item.id !== task.id)].slice(0, 5)
++
++// P1 fix (rev-behavior): failed/canceled tasks preserve the last observed progress
++// (not hardcoded 100), matching the server contract "失败/取消停在最后值". The caller
++// passes the LIVE task (read from the store at catch time) so its progress reflects
++// the last patchRunning sample — the stale `runningTask` (progress 0) is NOT used.
++export const failedTask = (task: CanvasTask, label: string): CanvasTask => ({
++  ...task,
++  label,
++  status: 'failed',
++})
++
++export const canceledTask = (task: CanvasTask, label: string): CanvasTask => ({
++  ...task,
++  label,
++  status: 'canceled',
++})
++
++export const doneTask = (task: CanvasTask, label: string, nodeIds: string[]): CanvasTask => ({
++  ...task,
++  label,
++  status: 'done',
++  progress: 100,
++  nodeIds,
++})
++
++export const isCanceledGenerationError = (error: unknown, signal?: AbortSignal) =>
++  Boolean(signal?.aborted) || (error instanceof MivoImageRequestError && error.kind === 'canceled')
++
++// R2 / #300 A5:one-time idempotency key per generation call. Retries (new action
++// invocation) get a new key → new server task. Same-call re-submission (e.g. a
++// transient POST timeout retried by the client) would reuse the key and dedupe
++// server-side within the process lifetime. We don't currently retry in-action,
++// so this is forward-compatible plumbing, not a retry loop.
++export const newIdempotencyKey = (): string => {
++  const crypto = globalThis.crypto as Crypto | undefined
++  if (crypto?.randomUUID) return crypto.randomUUID()
++  return `mivo-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
++}
++
++// Sleep that rejects with MivoImageRequestError(kind='canceled') if the signal
++// aborts mid-wait — so the poll loop's await sleep() surfaces cancel promptly
++// without waiting for the next GET.
++const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
++  new Promise((resolve, reject) => {
++    if (signal?.aborted) {
++      reject(new MivoImageRequestError('图片请求已取消。', 'canceled'))
++      return
++    }
++    const onAbort = () => {
++      window.clearTimeout(id)
++      reject(new MivoImageRequestError('图片请求已取消。', 'canceled'))
++    }
++    const id = window.setTimeout(() => {
++      signal?.removeEventListener('abort', onAbort)
++      resolve()
++    }, ms)
++    signal?.addEventListener('abort', onAbort, { once: true })
++  })
++
++// Poll loop shared by the 3 real generation actions + P2-C2 variations.
++// Submits already happened (serverTaskId in hand). Upserts the running task with
++// the server's real progress/stage on each non-terminal poll. Returns nodeIds on
++// done/partial (after onResult commits). Throws MivoImageRequestError on
++// failed/canceled/unknown — the caller's catch sets the terminal task state and
++// rethrows.
++//
++// Terminal-state mapping (per server/contracts/tasks-async.md):
++//   done     → return nodeIds (caller sets doneTask)
++//   partial  → return nodeIds (P2-C2 variations; onResult gets failures[] too;
++//              the caller sets doneTask — partial resolves the success subset,
++//              does NOT reject. Failures are surfaced via the task record.)
++//   failed   → throw MivoImageRequestError(message, kindForFailedTask(message))
++//              so chatStore.errorInfoForChat still classifies timeouts (怪癖 6)
++//   canceled → throw canceled (caller sets canceledTask, never commits)
++//   unknown  → throw 'task expired, retry' (server restarted; never commits)
++export const runTaskPollLoop = async (
++  set: Parameters<SliceCreator>[0],
++  args: {
++    serverTaskId: string
++    signal: AbortSignal | undefined
++    localTask: CanvasTask
++    sceneId: CanvasId
++    onResult: (result: { images: TaskResultImage[]; failures?: TaskFailure[] }) => Promise<string[]>
++  },
++): Promise<string[]> => {
++  const patchRunning = (progress: number, stage: string) =>
++    set((current) => {
++      const doc = current.canvases[args.sceneId]
++      if (!doc) return {}
++      return patchCanvasDocument(current, args.sceneId, {
++        tasks: upsertTask(doc.tasks, { ...args.localTask, progress, stage, status: 'running' }),
++      })
++    })
++
++  for (;;) {
++    if (args.signal?.aborted) {
++      throw new MivoImageRequestError('图片请求已取消。', 'canceled')
++    }
++    const view = await getImageGenerationPort().pollTask(args.serverTaskId, args.signal)
++
++    if (view.status === 'running' || view.status === 'pending') {
++      patchRunning(view.progress, view.stage)
++      await sleep(taskPollIntervalMs(), args.signal)
++      continue
++    }
++    if (view.status === 'done') {
++      const images = view.result?.images ?? []
++      return args.onResult({ images, failures: undefined })
++    }
++    // P2-C2: partial — variations batch where some edits succeeded. Resolve the
++    // success subset (onResult commits it); failures[] travel along for the
++    // caller to surface. Does NOT reject (only all-fail → failed → throws).
++    if (view.status === 'partial') {
++      const images = view.result?.images ?? []
++      return args.onResult({ images, failures: view.failures })
++    }
++    if (view.status === 'failed') {
++      const message = view.error || 'Generation failed'
++      throw new MivoImageRequestError(message, kindForFailedTask(message))
++    }
++    if (view.status === 'canceled') {
++      throw new MivoImageRequestError('图片请求已取消。', 'canceled')
++    }
++    // unknown — server restarted / task evicted. Never commit; surface retry.
++    throw new MivoImageRequestError('任务已失效（服务端重启），请重试。', 'upstream-error')
++  }
++}
+diff --git a/src/store/hydrationDurableSettle.test.ts b/src/store/hydrationDurableSettle.test.ts
+index e73fd6fa..98ffb749 100644
+--- a/src/store/hydrationDurableSettle.test.ts
++++ b/src/store/hydrationDurableSettle.test.ts
+@@ -259,6 +259,90 @@ describe('SC-15 R2: hydration settle must durable-writeback to persist storage',
+     expect((JSON.parse(finalRaw!) as { version: number }).version).toBe(13)
+   })
+ 
++  it('derived_batch_hydration_settles_durably: 刷新后带 batchId 的 queued/generating slot 按原 ordinal 原位转 failed 并清进度字段、回写持久层', async () => {
++    const { __resetCanvasPersistStorageForTests } = await import('./canvasPersistConfig')
++    __resetCanvasPersistStorageForTests()
++    const sceneId: CanvasId = 'character-flow'
++    // 批次 slot:带 batchId/expectedCount/ordinal + progress/stage/startedAt(poll 采样过)
++    const batchSlotA = slotNode({
++      id: 'slot-b0',
++      status: 'generating',
++      aiWorkflow: {
++        kind: 'slot',
++        status: 'generating',
++        operation: 'area-edit',
++        prompt: 'p',
++        batchId: 'batch-1',
++        expectedCount: 2,
++        ordinal: 0,
++        progress: 42,
++        stage: 'enhancing',
++        startedAt: 1234,
++      },
++    })
++    const batchSlotB = slotNode({
++      id: 'slot-b1',
++      status: 'queued',
++      aiWorkflow: {
++        kind: 'slot',
++        status: 'queued',
++        operation: 'area-edit',
++        prompt: 'p',
++        batchId: 'batch-1',
++        expectedCount: 2,
++        ordinal: 1,
++      },
++    })
++    // 非批次 generating slot(对照组):保持既有 settle 行为,但不该有进度字段清零之外的差异
++    const plainSlot = slotNode({ id: 'slot-plain' })
++    seedCanvas({
++      sceneId,
++      canvases: {
++        [sceneId]: document({ nodes: [batchSlotA, batchSlotB, plainSlot], tasks: [] }),
++      },
++    })
++
++    await useCanvasStore.persist.rehydrate()
++
++    // 内存:sanitize 按原 ordinal 原位转 failed
++    const canvases = useCanvasStore.getState().canvases
++    const slots = (canvases[sceneId]?.nodes || []).filter((n) => n.type === 'ai-slot')
++    const a = slots.find((n) => n.id === 'slot-b0')
++    expect(a?.aiWorkflow?.status).toBe('failed')
++    expect(a?.aiWorkflow?.ordinal).toBe(0)
++    expect(a?.aiWorkflow?.batchId).toBe('batch-1')
++    expect(a?.aiWorkflow?.progress).toBeUndefined()
++    expect(a?.aiWorkflow?.stage).toBeUndefined()
++    expect(a?.aiWorkflow?.startedAt).toBeUndefined()
++    const b = slots.find((n) => n.id === 'slot-b1')
++    expect(b?.aiWorkflow?.status).toBe('failed')
++    expect(b?.aiWorkflow?.ordinal).toBe(1)
++
++    // DURABLE:盘上批次 slot 已 failed 且进度字段清空
++    const settledRaw = await waitForBlob('mivo-canvas-demo', (raw) => {
++      try {
++        const parsed = JSON.parse(raw)
++        const cs = parsed?.state?.canvases ?? {}
++        const scene = Object.values(cs).find((c) =>
++          (Array.isArray((c as CanvasDocument).nodes) ? (c as CanvasDocument).nodes : []).some(
++            (n) => n.type === 'ai-slot' && n.aiWorkflow?.batchId === 'batch-1',
++          ),
++        ) as CanvasDocument | undefined
++        const nodes = Array.isArray(scene?.nodes) ? scene.nodes : []
++        return nodes.some(
++          (n) =>
++            n.aiWorkflow?.batchId === 'batch-1' &&
++            n.aiWorkflow?.status === 'failed' &&
++            n.aiWorkflow?.progress === undefined &&
++            n.aiWorkflow?.startedAt === undefined,
++        )
++      } catch {
++        return false
++      }
++    })
++    expect(settledRaw).not.toBeNull()
++  })
++
+   it('gate: no settle (already-settled state) → no writeback, blob unchanged', async () => {
+     // settle 计数=0 时不得无条件 rewrite（避免每次 reload 都重写 10k 节点 canvas blob）。
+     // seed 一条已 settled（error）消息 → rehydrate 不 settle → 不触发 writeback →
+diff --git a/src/store/nodeFactory.ts b/src/store/nodeFactory.ts
+index 7b9e66e9..dbec5f64 100644
+--- a/src/store/nodeFactory.ts
++++ b/src/store/nodeFactory.ts
+@@ -232,6 +232,8 @@ export type GenerationResultNodeOptions = {
+   operation: AiWorkflowOperation
+   sourceNode?: MivoCanvasNode
+   placementDirection?: AiWorkflowPlacement
++  /** #297 批次身份凭证:结果节点从被替换的批次 slot 继承(batchId+expectedCount+ordinal)。 */
++  batchMetadata?: { batchId: string; expectedCount: number; ordinal: number }
+ }
+ 
+ /**
+@@ -256,6 +258,7 @@ export const createGenerationResultNode = (options: GenerationResultNodeOptions)
+     operation,
+     sourceNode,
+     placementDirection,
++    batchMetadata,
+   } = options
+ 
+   return makeNode({
+@@ -296,6 +299,8 @@ export const createGenerationResultNode = (options: GenerationResultNodeOptions)
+       slotId: sourceNode?.type === 'ai-slot' ? sourceNode.id : undefined,
+       placement: placementDirection || 'right',
+       createdAt,
++      // #297 批次身份:结果节点继承被替换 slot 的批次元数据(SC9)。
++      ...(batchMetadata ? { ...batchMetadata } : {}),
+     },
+   })
+ }
+diff --git a/src/types/mivoCanvas.ts b/src/types/mivoCanvas.ts
+index ee8292bc..89107b9f 100644
+--- a/src/types/mivoCanvas.ts
++++ b/src/types/mivoCanvas.ts
+@@ -153,6 +153,13 @@ export type CanvasAiWorkflow = {
+   /** F5 (QoL batch): derived elapsed seconds (now - startedAt), patched on each
+    *  poll so the render stays pure (no Date.now() during render). */
+   elapsedSec?: number
++  /** #297 编辑占位批次:批次身份凭证(batchId+expectedCount+ordinal)随 slot 持久化。
++   *  batchId 来自发起批次的创建凭证,绝不从位置、标题或 reqId 相等推断。
++   *  占位阶段(ai-slot,status=generating/queued)写入;结果节点从被替换的 slot
++   *  继承(原位替换后 aiWorkflow 仍带同一批次身份)。 */
++  batchId?: string
++  expectedCount?: number
++  ordinal?: number
+ }
+ 
+ export type ImageCrop = {

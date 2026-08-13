@@ -1,0 +1,2557 @@
+diff --git a/docs/context-menu-standard.md b/docs/context-menu-standard.md
+index 6393ae46..107ba3fa 100644
+--- a/docs/context-menu-standard.md
++++ b/docs/context-menu-standard.md
+@@ -44,8 +44,7 @@
+ 
+ | 差异 | 理由 |
+ |---|---|
+-| 空白右键保留"在此新建"组 | Mivo 是 AI 画布,"在光标处建 AI 图槽/文本/标注"是高频起点;参考产品 F 工具坞没有 AI 槽概念 |
+-| 右键保留 AI generate 组(Generate beside / Make variations / …) | 每项都是工作流起点而非样式;参考产品 F 自己的 AI 图像编辑也是菜单式命令列表(见 quickbar-study §AI Image Edit) |
++| 空白右键保留"在此新建"组(文本/Markdown 等) | 在光标处快速建内容节点是高频起点;~~AI 图片占位/标注~~已随 #482 收口退役(2026-08-04,见 §3) |
+ | 右键保留 Hide / Show hidden | Mivo 有对象隐藏体系,参考产品 F 没有 |
+ | 右键保留 Fit selection / Fit all | 无限画布导航刚需,快捷条不承载 |
+ | Duplicate 不进右键 | Mivo 已定案 Duplicate 全面退场、仅留 ⌘D(PR #350),比 参考产品 F 更激进,维持 |
+@@ -131,7 +130,7 @@
+ | `align-*` / `distribute-*` | 多选 | 多选快捷条 Align 菜单(第 1 版 R15"右键换图标"作废,直接退场) |
+ | `rotate` / `flip-h` / `flip-v` / `replace-image` / `crop` | image | image 快捷条(6 键条已有;右键仅保留快捷条没有的 `reset-crop` / `copy-as-png`) |
+ 
+-**保留在右键**的类型专属项(不属于样式):`edit-markup-text`、`reset-crop`、`copy-as-png`、Section 的 `section-title-toggle` / `section-content-visibility` / section-lock 组 / `remove-section-only`、全部 Generate 组。
++**保留在右键**的类型专属项(不属于样式):`edit-markup-text`、`reset-crop`、`copy-as-png`、Section 的 `section-title-toggle` / `section-content-visibility` / section-lock 组 / `remove-section-only`、Generate 组仅剩 ai-slot 的 `generate-into-slot`(2026-08-04 #482 收口:`generate-beside` / `add-edit-note` / `variations` / `generate-from-annotation` 全部退场,批注功能全量退役)。
+ 
+ 退场后效果:image 右键从 17 项减到约 11 项;markup 右键不再有任何色板子菜单;右键菜单整体回到 参考产品 F 的"单屏、命令式"形态。
+ 
+@@ -152,7 +151,7 @@
+ | create | `paste` | Paste here | 粘贴到此处 | 剪贴板非空 | ✅ 已落地(label 收敛 Paste here,数量并入粘贴完成 toast,2026-08-01) |
+ | create | `new-text` | New text here | 在此新建文本 | 恒显 | 保留 |
+ | create | `new-section` | New section here | 在此新建 Section | 恒显 | 保留 |
+-| create | `new-ai-slot` | New AI image slot here | 在此新建 AI 图槽 | 恒显 | 保留 |
++| create | `new-ai-slot` | New AI image slot here | 在此新建 AI 图槽 | — | ✅ 已退场(2026-08-04 #482 收口:手动创建下线,生成管线自动占位保留;使用场景交互后续重新设计) |
+ | create | `new-arrow-markup` | New arrow markup | 新建箭头标注 | — | ✅ 已退场(2026-08-01 拍板,绘制类创建走工具坞) |
+ | create | `new-rect-markup` | New rectangle markup | 新建矩形标注 | — | ✅ 已退场(同上) |
+ | create | `new-note-markup` | New markup note | 新建标注便签 | — | ✅ 已退场(同上) |
+@@ -192,11 +191,11 @@
+ 
+ | 组 | id | label(EN) | 条件 | 说明 |
+ |---|---|---|---|---|
+-| generate | `generate-beside` | Generate beside | 单选 | 工作流起点,保留(§0.4) |
+-| generate | `add-edit-note` | Add edit note | 单选 | 同上 |
+-| generate | `variations` | Make variations | aiEditable/aiReference | 同上 |
++| generate | `generate-beside` | Generate beside | — | ✅ 已退场(2026-08-04 #482 收口:哑巴路径,AI 修改入口收敛到局部重绘管线) |
++| generate | `add-edit-note` | Add edit note | — | ✅ 已退场(同上;批注功能全量退役) |
++| generate | `variations` | Make variations | — | ✅ 已退场(同上;Inspector 的「生成变体」按钮保留) |
+ | edit | `reset-crop` | Reset crop | 已有裁切 | 快捷条没有,右键保留 |
+-| edit | `copy-as-png` | Copy as PNG | 单选 | 参考产品 F 对象右键同款(§0.1),保留 |
++| edit | `copy-as-png` | Copy as PNG | 单选 | 参考产品 F 对象右键同款(§0.1),保留(2026-08-04 owner 复核确认) |
+ 
+ (`crop` / `rotate` / `flip-h` / `flip-v` / `replace-image` 已退到快捷条唯一入口,§2.5a ✅)
+ 
+@@ -204,10 +203,10 @@
+ 
+ | 类型 | generate 组包含 | edit 组 | 备注 |
+ |---|---|---|---|
+-| text | `generate-beside`、`add-edit-note`、`variations`(如具备能力) | 无 | |
+-| annotation(编辑便签) | `generate-from-annotation`(Generate from note)、`generate-beside`、`variations` | 无 | 不出 `add-edit-note`(自己就是 note) |
++| text | 无(2026-08-04 #482 收口:生成组随图片右键三项同分支退场) | 无 | 文本手动文生图入口的回归方案归 #482 后续设计 |
++| annotation(编辑便签) | 无(批注功能 2026-08-04 全量退役) | 无 | 存量节点保留编辑:右键「编辑批注」/双击/快捷条 edit-note;创建与生成入口全部下线 |
+ | ai-slot | `generate-into-slot`(Generate into slot) | 无 | 不出 beside/note |
+-| task-placeholder | 同 image 的 generate 组 | **无(明文规则)** | 占位符没有像素,edit 组不适用——由"实现巧合"升级为明文标准 |
++| task-placeholder | 无(同 text,随同分支退场) | **无(明文规则)** | 占位符没有像素,edit 组不适用——由"实现巧合"升级为明文标准 |
+ 
+ ### 4.4 frame / Section 扩展(裁剪后)
+ 
+@@ -302,7 +301,8 @@
+ |---|---|---|---|
+ | §2.5a | 样式项从右键全面退场 | 2026-08-01 拍板,阶段 3 落地 | ✅ |
+ | §3 | 空白右键三个 markup 创建项退场;Paste 改名 "Paste here" | 同上 | ✅ |
+-| §4.2 | image 右键裁到 generate 3 项 + reset-crop + copy-as-png | 同上 | ✅ |
++| §4.2 | image 右键裁到 generate 3 项 + reset-crop + copy-as-png | 同上 | ✅(已被下行 #482 收口覆盖) |
++| #482 收口 | AI 入口收敛:image 右键 generate 3 项退场(edit 组=reset-crop+copy-as-png);空白右键 new-ai-slot 退场;AI 编辑▾下拉 5 项退场改直开局部重绘;批注全量退役;text/task 生成组随同分支退场 | 2026-08-04 owner 四条拍板 + 双审查席收口 | ✅ |
+ | R3 后半 | 框选/节点拖拽/crop/mask 中右键吞掉 | 同上 | ✅ |
+ | §5 | markdown/pdf/video 菜单项清单 | 拍板通过,阶段 4 已实装 | ✅ |
+ | §7 | 素材库右键 | 暂缓 | ⏳(等素材库功能定型) |
+diff --git a/docs/quickbar-study.md b/docs/quickbar-study.md
+index 6a1ec19e..3f8ea9f2 100644
+--- a/docs/quickbar-study.md
++++ b/docs/quickbar-study.md
+@@ -27,8 +27,8 @@ This note is a product and interaction study for Mivo. It intentionally studies
+    - colors use swatch palettes
+    - line weights use compact visual choices
+    - line styles use segmented choices
+-   - AI image edit uses a vertical command list because each action starts a workflow
+    - alignment uses an icon grid or compact icon list
++   (AI image edit no longer opens a command list — since #482 (2026-08-04) the AI Edit button opens the region-edit panel directly; see "AI Image Edit" below)
+ 5. Details are opened by double-click, not by a quick-bar button.
+ 6. The selected object's primary visible state should be reflected in the quick bar: selected color ring, active stroke style, active lock state, current title visibility, current line endpoint mode.
+ 7. Style controls are quick-bar exclusive (context-menu-standard §2.5a, 2026-08-01): right-click menus never mirror palette/weight/shape submenus, and Duplicate lives nowhere but Cmd/Ctrl+D (PR #350).
+@@ -37,14 +37,14 @@ This note is a product and interaction study for Mivo. It intentionally studies
+ 
+ | Selection | Primary quick bar | Secondary menus | Keep out of quick bar |
+ | --- | --- | --- | --- |
+-| Image | Crop, Rotate 90°, Flip H/V, Replace image, AI Edit | AI Edit workflow list | Details, Copy, Delete, Download |
++| Image | Crop, Rotate 90°, Flip H/V, Replace image, AI Edit | none — AI Edit opens the region-edit panel directly (#482, 2026-08-04) | Details, Copy, Delete, Download |
+ | Text | Size, Bold, Align, Color | Color swatches; future font/size menu | Copy, Delete, Details |
+ | Markup shape | Edit text, Fill, Line | Fill swatches, line palette + style + weight, arrowheads, corner radius | Copy, Download |
+ | Connector / Arrow | Edit text, Fill, Line, Arrowheads | endpoint/arrowhead choices, line choices | Copy |
+ | Section | Fill, Line, Rename, Title visibility, Lock, Focus | Fill palette, line palette + style + weight, lock choices | Copy, Delete with contents |
+ | Multi-select | Shared style controls when the whole selection is one markup family (2026-07-31 P2), then Group/Ungroup, Align, Tidy up (split-button) | Family style menus (note paper palette / shape fill+border / line color+width / brush color+width); Align/distribute grid; explicit row/column/grid behind the Tidy caret | Copy, Delete, Lock, Front |
+ | AI Slot | Generate, Front | future prompt/model choices | Copy, Delete |
+-| AI Annotation | Generate, Edit | future source/result choices | Copy, Delete |
++| AI Annotation (legacy nodes only — creation retired with #482) | Edit | none | Copy, Delete |
+ | Markdown | No quick bar for now | future display-mode toggle | Download, Copy, Delete |
+ | Video | No quick bar for now | future Play/Mute/Trim if needed | Download, Copy, Delete |
+ | PDF | Download original for now | future page picker / open detail | Copy, Delete |
+@@ -69,6 +69,10 @@ Custom color picker: implemented in-house (2026-07-29) as `src/canvas/color/Cust
+ 
+ ### AI Image Edit
+ 
++> ⚠️ 2026-08-04 #482 收口后本节仅存研究记录价值:下列 5 个下拉子项已全部下线,
++> 「AI 编辑」按钮(Sparkles/名称不变)改为点击直开局部重绘(区域编辑)面板;
++> 去背景/扩图/高清放大按 #482 规划未来以对话框预设 chips 形态回归,不回菜单。
++
+ Product F's public AI image-edit flow maps well to Mivo's image quick bar:
+ 
+ - Edit with prompt
+diff --git a/scripts/e2e/scenarios/canvas-interactions.mjs b/scripts/e2e/scenarios/canvas-interactions.mjs
+index 052d7dcb..d950e35e 100644
+--- a/scripts/e2e/scenarios/canvas-interactions.mjs
++++ b/scripts/e2e/scenarios/canvas-interactions.mjs
+@@ -108,14 +108,8 @@ export const runCanvasInteractionsScenario = async (context) => {
+       throw new Error(`Image selection quick toolbar should expose ${action}`)
+     }
+   }
+-  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  for (const action of ['Edit with prompt', 'Select area', 'Remove background', 'Expand', 'Boost resolution']) {
+-    if ((await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: action }).count()) !== 1) {
+-      throw new Error(`Image AI Edit quick menu should expose ${action}`)
+-    }
+-  }
+-  await page.keyboard.press('Escape')
+-  await page.waitForSelector('.selection-quick-toolbar-menu', { state: 'detached' })
++  // AI Edit 的下拉子菜单已随需求3+4下线(点击直开局部重绘,无子菜单)——不再点击验证,
++  // 避免真的进入 mask 编辑态影响下面的工具条样式/平移/框选断言。
+   const imageQuickToolbarStyle = await page.locator('.selection-quick-toolbar').evaluate((toolbar) => {
+     const style = getComputedStyle(toolbar)
+ 
+@@ -261,7 +255,7 @@ export const runCanvasInteractionsScenario = async (context) => {
+   for (const action of [
+     'New text here',
+     'New section here',
+-    'New AI image slot here',
++    // 'New AI image slot here' 已随需求1下线(2026-08 拍板)。
+     'Fit all objects',
+     'Select all objects',
+     'Import asset',
+@@ -283,6 +277,10 @@ export const runCanvasInteractionsScenario = async (context) => {
+       throw new Error(`${action} should have left the blank right-click menu (§3)`)
+     }
+   }
++  // 需求1(2026-08 拍板):AI 图片占位创建项退场,专属代码整条下线。
++  if ((await page.getByRole('menuitem', { name: 'New AI image slot here', exact: true }).count()) !== 0) {
++    throw new Error('New AI image slot here should have left the blank right-click menu (需求1)')
++  }
+   await page.keyboard.press('Escape')
+   await page.waitForSelector('.node-context-menu', { state: 'detached' })
+ 
+@@ -2024,8 +2022,6 @@ export const runCanvasInteractionsScenario = async (context) => {
+   for (const action of [
+     'Edit text',
+     'Copy text',
+-    'Generate beside',
+-    'Add edit note',
+     'Order',
+     'Delete text',
+   ]) {
+@@ -2037,6 +2033,14 @@ export const runCanvasInteractionsScenario = async (context) => {
+   if ((await page.getByRole('menuitem', { name: 'Duplicate text' }).count()) !== 0) {
+     throw new Error('Text right-click menu should keep Duplicate out (Cmd/Ctrl+D only)')
+   }
++  // 需求2(2026-08 拍板):generate-beside/add-edit-note 随图片右键 4 项一并整条
++  // 下线(同一 generationContextMenuGroupsFor 装配分支),文本节点右键的
++  // 「Generate beside」/「Add edit note」随之消失,属预期(lead 耦合地图已标注)。
++  for (const action of ['Generate beside', 'Add edit note']) {
++    if ((await page.getByRole('menuitem', { name: action }).count()) !== 0) {
++      throw new Error(`${action} should have left the text right-click menu (需求2)`)
++    }
++  }
+   await page.getByRole('menuitem', { name: 'Edit text' }).click()
+   await page.waitForSelector('.dom-node.text-node.editing .dom-text-editor')
+   await page.keyboard.press('Escape')
+@@ -2792,13 +2796,12 @@ export const runCanvasInteractionsScenario = async (context) => {
+   })
+   // 2026-07-31 用户:Duplicate 全面退场(工具条 + 右键),仅保留 Cmd/Ctrl+D 快捷键。
+   // §2.5a(2026-08-01 拍板):Crop/Rotate/Flip×2/Replace 退到快捷条唯一入口,
+-  // image 右键只留快捷条没有的 Reset crop(条件:该图已被上方 crop 段裁过)与
+-  // Copy as PNG。
++  // image 右键只留快捷条没有的 Reset crop(条件:该图已被上方 crop 段裁过)。
++  // 需求2(2026-08 拍板):Generate beside/Add edit note/Make variations 退场,
++  // 专属代码删干净;Copy as PNG 于 2026-08-04 owner 拍板恢复保留(与 #482
++  // 保留清单一致)——edit 组对 image 恒含它,reset-crop 仍随裁剪条件显示。
+   const expectedContextActions = [
+     'View details',
+-    'Generate beside',
+-    'Add edit note',
+-    'Make variations',
+     'Reset crop',
+     'Copy as PNG',
+     // 2026-08-01 用户:四个层级动作收进「Order」子菜单(右键菜单过长),顶层只留父项。
+@@ -2812,6 +2815,11 @@ export const runCanvasInteractionsScenario = async (context) => {
+       throw new Error(`Missing right-click menu action: ${action}`)
+     }
+   }
++  for (const action of ['Generate beside', 'Add edit note', 'Make variations']) {
++    if ((await page.getByRole('menuitem', { name: action, exact: true }).count()) !== 0) {
++      throw new Error(`${action} should have left the image right-click menu (需求2)`)
++    }
++  }
+   for (const action of ['Bring forward', 'Send backward', 'Bring to front', 'Send to back']) {
+     if ((await page.getByRole('menuitem', { name: action, exact: true }).count()) !== 0) {
+       throw new Error(`${action} should live inside the Order submenu, not at the top level`)
+@@ -3009,10 +3017,34 @@ export const runCanvasInteractionsScenario = async (context) => {
+   await wait(200)
+   await selectedNode.click()
+   await page.waitForSelector('.selection-quick-toolbar')
+-  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
++  // AI Edit 的下拉已随需求3+4下线(点击直开局部重绘,不再有子菜单),不能再充当
++  // R6 的"快捷条子菜单"试验对象——改用多选的 Align 子菜单(同一
++  // SelectionQuickToolbar 组件、同一 .selection-quick-toolbar-menu class,验证的
++  // 是同一套层叠机制,不是这颗按钮本身)。圈选 firstNode + secondImageNode 进多选。
++  const r6First = await selectedNode.boundingBox()
++  const r6Second = await secondImageNode.boundingBox()
++  if (!r6First || !r6Second) throw new Error('Missing node bounds for the R6 multi-select setup')
++  const r6MarqueeStart = clampToShell({
++    x: Math.min(r6First.x, r6Second.x) - marqueePad,
++    y: Math.max(r6First.y + r6First.height, r6Second.y + r6Second.height) + marqueePad,
++  })
++  const r6MarqueeEnd = clampToShell({
++    x: Math.max(r6First.x + r6First.width, r6Second.x + r6Second.width) + marqueePad,
++    y: Math.min(r6First.y, r6Second.y) - marqueePad,
++  })
++  await page.mouse.move(r6MarqueeStart.x, r6MarqueeStart.y)
++  await page.mouse.down()
++  await page.mouse.move(r6MarqueeEnd.x, r6MarqueeEnd.y, { steps: 8 })
++  await page.waitForFunction(() => document.querySelectorAll('.dom-node.selection-preview').length >= 2)
++  await page.mouse.up()
++  await page.waitForSelector('[data-selection-bounds="true"]')
++  await page.waitForSelector('.selection-quick-toolbar')
++  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Align' }).click()
+   await page.waitForSelector('.selection-quick-toolbar-menu')
+   const escapeLayerBox = await selectedNode.boundingBox()
+   if (!escapeLayerBox) throw new Error('Missing node bounds for the Escape layering regression')
++  // firstNode 已在圈选出的多选内:右键它不会塌成单选(handleCanvasContextMenu 对
++  // 已在选区内的目标直接开菜单,不重新 selectNode),保持子菜单与右键菜单共存的前提。
+   await page.mouse.click(escapeLayerBox.x + escapeLayerBox.width / 2, escapeLayerBox.y + escapeLayerBox.height - 16, { button: 'right' })
+   await page.waitForSelector('.node-context-menu')
+   if ((await page.locator('.selection-quick-toolbar-menu').count()) !== 1) {
+@@ -3025,6 +3057,8 @@ export const runCanvasInteractionsScenario = async (context) => {
+   }
+   await page.keyboard.press('Escape')
+   await page.waitForSelector('.selection-quick-toolbar-menu', { state: 'detached' })
++  // 恢复单选,R7 沿用 selectedNode/firstNodeId 的单选语义。
++  await selectedNode.click()
+ 
+   // B) R7 不复活:菜单开着时目标节点被隐藏 → 菜单立即关闭(state 同步清空);
+   //    节点重新可见后旧菜单不得按旧坐标复活。
+diff --git a/scripts/e2e/scenarios/mask-blackblock.mjs b/scripts/e2e/scenarios/mask-blackblock.mjs
+index 3d3abf68..771827b2 100644
+--- a/scripts/e2e/scenarios/mask-blackblock.mjs
++++ b/scripts/e2e/scenarios/mask-blackblock.mjs
+@@ -235,7 +235,6 @@ export const runMaskBlackblockScenario = async (context) => {
+     await clickCanvasNode(page, rendererMode, nodeId)
+     await page.waitForSelector('.selection-quick-toolbar')
+     await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-    await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+     await page.waitForSelector('.image-mask-edit-stage')
+     await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+   }
+diff --git a/scripts/e2e/scenarios/mask-concurrent.mjs b/scripts/e2e/scenarios/mask-concurrent.mjs
+index 4672c735..b4792b65 100644
+--- a/scripts/e2e/scenarios/mask-concurrent.mjs
++++ b/scripts/e2e/scenarios/mask-concurrent.mjs
+@@ -44,7 +44,6 @@ const openMaskEditorOn = async (page, rendererMode, sourceNodeId) => {
+   await clickCanvasNode(page, rendererMode, sourceNodeId)
+   await page.waitForSelector('.selection-quick-toolbar')
+   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+   await page.waitForSelector('.image-mask-edit-stage')
+   await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+ }
+diff --git a/scripts/e2e/scenarios/mask-cross-scene.mjs b/scripts/e2e/scenarios/mask-cross-scene.mjs
+index 10c0cc58..cb791be9 100644
+--- a/scripts/e2e/scenarios/mask-cross-scene.mjs
++++ b/scripts/e2e/scenarios/mask-cross-scene.mjs
+@@ -41,7 +41,6 @@ const openMaskEditorOn = async (page, rendererMode, sourceNodeId) => {
+   await clickCanvasNode(page, rendererMode, sourceNodeId)
+   await page.waitForSelector('.selection-quick-toolbar')
+   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+   await page.waitForSelector('.image-mask-edit-stage')
+   await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+ }
+diff --git a/scripts/e2e/scenarios/mask-hydration.mjs b/scripts/e2e/scenarios/mask-hydration.mjs
+index e807794b..b7ce8262 100644
+--- a/scripts/e2e/scenarios/mask-hydration.mjs
++++ b/scripts/e2e/scenarios/mask-hydration.mjs
+@@ -39,7 +39,6 @@ const openMaskEditorOn = async (page, rendererMode, sourceNodeId) => {
+   await clickCanvasNode(page, rendererMode, sourceNodeId)
+   await page.waitForSelector('.selection-quick-toolbar')
+   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+   await page.waitForSelector('.image-mask-edit-stage')
+   await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+ }
+diff --git a/scripts/e2e/scenarios/mask-multi-edit.mjs b/scripts/e2e/scenarios/mask-multi-edit.mjs
+index 459e614d..843b8fa1 100644
+--- a/scripts/e2e/scenarios/mask-multi-edit.mjs
++++ b/scripts/e2e/scenarios/mask-multi-edit.mjs
+@@ -275,7 +275,6 @@ export const runMaskMultiEditScenario = async (context) => {
+   await clickCanvasNode(page, rendererMode, sourceNodeId)
+   await page.waitForSelector('.selection-quick-toolbar')
+   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+   await page.waitForSelector('.image-mask-edit-stage')
+   // region-edit 工具族:点选/矩形/圈选(椭圆已下线)。矩形框住三个目标物。
+   await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Rectangle', exact: true }).click()
+diff --git a/scripts/e2e/scenarios/mask-reflow.mjs b/scripts/e2e/scenarios/mask-reflow.mjs
+index 2f74111f..bc2c2399 100644
+--- a/scripts/e2e/scenarios/mask-reflow.mjs
++++ b/scripts/e2e/scenarios/mask-reflow.mjs
+@@ -150,7 +150,6 @@ const openMaskPointRegion = async (page, sourceNodeId) => {
+   await clearRegionEditDraftFor(page, sourceNodeId)
+   await page.waitForSelector('.selection-quick-toolbar')
+   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+   await page.waitForSelector('.image-mask-edit-stage')
+   // Point tool is the default and only tool; click it explicitly for robustness.
+   await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+diff --git a/scripts/e2e/scenarios/mask-source-delete.mjs b/scripts/e2e/scenarios/mask-source-delete.mjs
+index 02ccd6c2..f7784b8b 100644
+--- a/scripts/e2e/scenarios/mask-source-delete.mjs
++++ b/scripts/e2e/scenarios/mask-source-delete.mjs
+@@ -40,7 +40,6 @@ const openMaskEditorOn = async (page, rendererMode, sourceNodeId) => {
+   await clickCanvasNode(page, rendererMode, sourceNodeId)
+   await page.waitForSelector('.selection-quick-toolbar')
+   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+   await page.waitForSelector('.image-mask-edit-stage')
+   await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+ }
+diff --git a/scripts/e2e/scenarios/mask-timeout-retry.mjs b/scripts/e2e/scenarios/mask-timeout-retry.mjs
+index 0dd7b132..2fca4123 100644
+--- a/scripts/e2e/scenarios/mask-timeout-retry.mjs
++++ b/scripts/e2e/scenarios/mask-timeout-retry.mjs
+@@ -44,7 +44,6 @@ const openMaskEditorOn = async (page, rendererMode, sourceNodeId) => {
+   await clickCanvasNode(page, rendererMode, sourceNodeId)
+   await page.waitForSelector('.selection-quick-toolbar')
+   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+   await page.waitForSelector('.image-mask-edit-stage')
+   await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+ }
+diff --git a/scripts/e2e/scenarios/mask.mjs b/scripts/e2e/scenarios/mask.mjs
+index c54d86f2..906dc74c 100644
+--- a/scripts/e2e/scenarios/mask.mjs
++++ b/scripts/e2e/scenarios/mask.mjs
+@@ -113,7 +113,6 @@ export const runMaskScenario = async (context) => {
+     await clickCanvasNode(page, rendererMode, sourceNodeId)
+     await page.waitForSelector('.selection-quick-toolbar')
+     await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-    await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+     await page.waitForSelector('.image-mask-edit-stage')
+     await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+   }
+diff --git a/scripts/e2e/scenarios/variations-annotation.mjs b/scripts/e2e/scenarios/variations-annotation.mjs
+index 0a699123..edde8615 100644
+--- a/scripts/e2e/scenarios/variations-annotation.mjs
++++ b/scripts/e2e/scenarios/variations-annotation.mjs
+@@ -1,17 +1,17 @@
+ // scripts/e2e/scenarios/variations-annotation.mjs
+-// P2-C2 — variations + annotation de-mock (SC4.1, roadmap §7 组 C). Mock the tasks
+-// API; verify the two de-mocked generation actions end-to-end:
+-//  ① variations partial (N=3, 2 success + 1 failure) → success subset committed as
+-//     result nodes + a visible "failed slot" ai-slot node for the failed variation
+-//  ② annotation area-edit → /tasks/edit carries normalized maskBounds (derived from
+-//     the annotation's canvas-coordinate annotationBounds) + a result node + edit edge
++// P2-C2 — variations de-mock (SC4.1, roadmap §7 组 C). Mock the tasks API; verify
++// the de-mocked generation action end-to-end:
++//  variations partial (N=3, 2 success + 1 failure) → success subset committed as
++//  result nodes + a visible "failed slot" ai-slot node for the failed variation
+ //
+-// Both actions are driven via store calls (page.evaluate + canvasStore module), not
+-// real button clicks: the InspectorPanel variations button + right-click annotation
+-// menu are off-screen-prone under Playwright (same hit-test flakiness as anchor-mvp).
+-// The store calls exercise the same React closures (submit → poll → commit).
++// (annotation area-edit 覆盖已随批注功能整条退役下线——需求2,2026-08 拍板;
++// generateFromAnnotation/add-annotation-node 已删,文件名与场景注册名保留不动。)
++//
++// Driven via store calls (page.evaluate + canvasStore module), not real button
++// clicks: the InspectorPanel variations button is off-screen-prone under
++// Playwright (same hit-test flakiness as anchor-mvp). The store call exercises
++// the same React closures (submit → poll → commit).
+ 
+-import { doneTaskView } from '../api-mocks.mjs'
+ import { readTotalNodeCount, waitForTotalNodeCountAtLeast } from '../renderer-evidence.mjs'
+ 
+ const resolveCanvasStoreSpec = async (page) => {
+@@ -35,7 +35,6 @@ export const runVariationsAnnotationScenario = async (context) => {
+   // Single handler for /api/mivo/tasks/** — dispatches by method + task id. The
+   // default page mocks (attachDefaultMivoApiMocks) are registered earlier; this
+   // later registration takes precedence (Playwright matches LIFO).
+-  let annotationMaskBounds = null
+   const handler = async (route) => {
+     const req = route.request()
+     const method = req.method()
+@@ -51,31 +50,6 @@ export const runVariationsAnnotationScenario = async (context) => {
+       return
+     }
+ 
+-    // POST /api/mivo/tasks/edit → 202 {taskId}; capture maskBounds + sourceSize to
+-    // verify the annotation area-edit path (BFF synthesizes the mask from these).
+-    if (method === 'POST' && url.includes('/api/mivo/tasks/edit')) {
+-      try {
+-        const formRequest = new Request('http://127.0.0.1/api/mivo/tasks/edit', {
+-          method: 'POST',
+-          headers: req.headers(),
+-          body: req.postDataBuffer(),
+-        })
+-        const formData = await formRequest.formData()
+-        annotationMaskBounds = {
+-          maskBounds: String(formData.get('maskBounds') || ''),
+-          sourceSize: String(formData.get('sourceSize') || ''),
+-        }
+-      } catch {
+-        annotationMaskBounds = null
+-      }
+-      await route.fulfill({
+-        status: 202,
+-        contentType: 'application/json',
+-        body: JSON.stringify({ taskId: 'task-anno' }),
+-      })
+-      return
+-    }
+-
+     if (method === 'GET') {
+       // variations task → partial (2 success + 1 failure)
+       if (url.includes('/task-var')) {
+@@ -101,15 +75,6 @@ export const runVariationsAnnotationScenario = async (context) => {
+         })
+         return
+       }
+-      // annotation task → done (1 image)
+-      if (url.includes('/task-anno')) {
+-        await route.fulfill({
+-          status: 200,
+-          contentType: 'application/json',
+-          body: JSON.stringify(doneTaskView([{ b64: generatedImageB64 }])),
+-        })
+-        return
+-      }
+     }
+ 
+     if (method === 'DELETE') {
+@@ -125,7 +90,7 @@ export const runVariationsAnnotationScenario = async (context) => {
+   }
+   await page.route('**/api/mivo/tasks/**', handler)
+ 
+-  // Resolve the first image node on the canvas (the variations + annotation source).
++  // Resolve the first image node on the canvas (the variations source).
+   const imageId = await page.evaluate(async (moduleSpec) => {
+     const { useCanvasStore } = await import(moduleSpec)
+     const state = useCanvasStore.getState()
+@@ -134,7 +99,7 @@ export const runVariationsAnnotationScenario = async (context) => {
+   }, spec)
+   if (!imageId) throw new Error('variations-annotation: no image node to use as source')
+ 
+-  // ─── ① variations partial (2 success + 1 failure) ───────────────────────────
++  // variations partial (2 success + 1 failure) ─────────────────────────────
+   const beforeVariationsCount = await countRenderedNodes()
+   await page.evaluate(async (moduleSpecAndId) => {
+     const { useCanvasStore } = await import(moduleSpecAndId.spec)
+@@ -186,101 +151,5 @@ export const runVariationsAnnotationScenario = async (context) => {
+     throw new Error(`variations: task.nodeIds should hold the 2 success ids, got ${variationsState.taskNodeIds}`)
+   }
+ 
+-  // ─── ② annotation bounds → generation (area-edit) ──────────────────────────
+-  // Seed an annotation node with canvas-coordinate annotationBounds pointing at a
+-  // sub-region of the source image, + aiWorkflow.sourceNodeIds so the action can
+-  // resolve the source. Uses setState (mirrors seedCanvas) so the new field rides
+-  // along without a dedicated action.
+-  const annotationId = await page.evaluate(async (moduleSpecAndId) => {
+-    const { useCanvasStore } = await import(moduleSpecAndId.spec)
+-    const state = useCanvasStore.getState()
+-    const sceneId = state.sceneId
+-    const doc = state.canvases[sceneId]
+-    if (!doc) throw new Error('annotation: active scene doc missing')
+-    const image = doc.nodes.find((n) => n.id === moduleSpecAndId.id)
+-    if (!image) throw new Error('annotation: source image missing')
+-    const id = `anno-e2e-${Date.now().toString(36)}`
+-    const annotation = {
+-      id,
+-      type: 'annotation',
+-      title: 'E2E annotation',
+-      x: image.x + 10,
+-      y: image.y + 10,
+-      width: 60,
+-      height: 60,
+-      status: 'ready',
+-      text: 'make the corner red',
+-      parentIds: [image.id],
+-      annotationBounds: { x: image.x + 10, y: image.y + 10, width: 60, height: 60 },
+-      aiWorkflow: { kind: 'annotation', sourceNodeIds: [image.id] },
+-    }
+-    const newNodes = [...doc.nodes, annotation]
+-    useCanvasStore.setState({
+-      canvases: { ...state.canvases, [sceneId]: { ...doc, nodes: newNodes } },
+-      nodes: newNodes,
+-      selectedNodeId: id,
+-      selectedNodeIds: [id],
+-    })
+-    return id
+-  }, { spec, id: imageId })
+-
+-  const beforeAnnotationCount = await countRenderedNodes()
+-  await page.evaluate(async (moduleSpecAndId) => {
+-    const { useCanvasStore } = await import(moduleSpecAndId.spec)
+-    await useCanvasStore.getState().generateFromAnnotation(moduleSpecAndId.id)
+-  }, { spec, id: annotationId })
+-  // 1 result node from the edit.
+-  if (rendererMode === 'leafer') {
+-    await waitForTotalNodeCountAtLeast(page, beforeAnnotationCount + 1)
+-  } else {
+-    await page.waitForFunction(
+-      (c) => document.querySelectorAll('.dom-node').length >= c + 1,
+-      beforeAnnotationCount,
+-    )
+-  }
+-
+-  // /tasks/edit carried maskBounds (normalized 0-1) + sourceSize — the BFF area-edit
+-  // path. Verify the normalization: the annotationBounds were a 60×60 region offset
+-  // 10px into the source, so normalized x/y/width/height should be 10/W, 10/H, 60/W,
+-  // 60/H (all in [0,1]).
+-  if (!annotationMaskBounds?.maskBounds) {
+-    throw new Error(`annotation: /tasks/edit should carry maskBounds, got ${JSON.stringify(annotationMaskBounds)}`)
+-  }
+-  const parsedBounds = JSON.parse(annotationMaskBounds.maskBounds)
+-  const parsedSize = JSON.parse(annotationMaskBounds.sourceSize)
+-  if (
+-    typeof parsedBounds?.x !== 'number' || typeof parsedBounds?.y !== 'number' ||
+-    typeof parsedBounds?.width !== 'number' || typeof parsedBounds?.height !== 'number' ||
+-    !parsedBounds.x || !parsedBounds.width ||
+-    parsedBounds.x < 0 || parsedBounds.x > 1 || parsedBounds.width <= 0 || parsedBounds.width > 1
+-  ) {
+-    throw new Error(`annotation: maskBounds should be normalized 0-1, got ${JSON.stringify(parsedBounds)}`)
+-  }
+-  if (typeof parsedSize?.width !== 'number' || typeof parsedSize?.height !== 'number') {
+-    throw new Error(`annotation: sourceSize should carry width/height, got ${JSON.stringify(parsedSize)}`)
+-  }
+-
+-  const annotationState = await page.evaluate(async (moduleSpecAndId) => {
+-    const { useCanvasStore } = await import(moduleSpecAndId.spec)
+-    const state = useCanvasStore.getState()
+-    // Result node from the annotation edit (type image, edit edge from the source).
+-    const task = state.tasks.find((t) => t.label?.startsWith('批注修图'))
+-    const editEdge = state.edges.find((e) => e.type === 'edit' && e.to === task?.nodeIds?.[0])
+-    return {
+-      taskStatus: task?.status,
+-      taskNodeIds: task?.nodeIds?.length ?? 0,
+-      editEdgeExists: Boolean(editEdge),
+-    }
+-  }, { spec, id: annotationId })
+-  if (annotationState.taskStatus !== 'done') {
+-    throw new Error(`annotation: task should be done, got ${annotationState.taskStatus}`)
+-  }
+-  if (annotationState.taskNodeIds !== 1) {
+-    throw new Error(`annotation: should commit 1 result node, got ${annotationState.taskNodeIds}`)
+-  }
+-  if (!annotationState.editEdgeExists) {
+-    throw new Error('annotation: an edit derivation edge should link source → result')
+-  }
+-
+   await page.unroute('**/api/mivo/tasks/**', handler)
+ }
+diff --git a/src/canvas/MaskPointIcon.tsx b/src/canvas/MaskPointIcon.tsx
+index c9ae888f..c971a13f 100644
+--- a/src/canvas/MaskPointIcon.tsx
++++ b/src/canvas/MaskPointIcon.tsx
+@@ -1,7 +1,9 @@
+ // 局部重绘「坐标 pin」图标(自绘变体,非 Lovart 复刻):头部圆更小、内点占比更大
+ // (r 2.75/6 vs 常见 3/8)、尾部收窄带内凹、顶部加一截定位刻线(pin + 坐标混合)。
+-// 几何常量共享给两处消费方 —— CanvasToolDock 的线框按钮版与 mask overlay 的
+-// 实心锚点版,保证两处形状一字不差。pin 尖端固定在 (12, 22),锚点定位以它为准。
++// 几何常量供 mask overlay 的实心锚点版(MaskPointMarker)使用;工具条曾有的线框
++// 按钮版(MaskPointIcon)已随「AI 编辑」下拉退场(#482 需求4)下线——#469 起
++// CanvasToolDock 的局部重绘按钮改用 RegionEditIcon,不再依赖这份几何常量。
++// pin 尖端固定在 (12, 22),锚点定位以它为准。
+ 
+ const PIN_BODY_D = 'M12 22C10.4 18.9 6 14.8 6 10a6 6 0 1 1 12 0C18 14.8 13.6 18.9 12 22Z'
+ const PIN_DOT = { cx: 12, cy: 10, r: 2.75 }
+@@ -9,33 +11,6 @@ const PIN_TICK = { x: 12, y1: 0.75, y2: 3 }
+ const PIN_TIP = { x: 12, y: 22 }
+ const PIN_VIEWBOX = 24
+ 
+-type MaskPointIconProps = {
+-  size?: number
+-  className?: string
+-}
+-
+-// 工具条按钮版:线框风格对齐 lucide(currentColor / strokeWidth 2 / round cap)。
+-export function MaskPointIcon({ size = 20, className }: MaskPointIconProps) {
+-  return (
+-    <svg
+-      className={className}
+-      width={size}
+-      height={size}
+-      viewBox={`0 0 ${PIN_VIEWBOX} ${PIN_VIEWBOX}`}
+-      fill="none"
+-      stroke="currentColor"
+-      strokeWidth={2}
+-      strokeLinecap="round"
+-      strokeLinejoin="round"
+-      aria-hidden="true"
+-    >
+-      <path d={PIN_BODY_D} />
+-      <circle cx={PIN_DOT.cx} cy={PIN_DOT.cy} r={PIN_DOT.r} fill="currentColor" stroke="none" />
+-      <line x1={PIN_TICK.x} y1={PIN_TICK.y1} x2={PIN_TICK.x} y2={PIN_TICK.y2} />
+-    </svg>
+-  )
+-}
+-
+ type MaskPointMarkerProps = {
+   tipX: number
+   tipY: number
+diff --git a/src/canvas/actions/canvasActionEmitters.ts b/src/canvas/actions/canvasActionEmitters.ts
+index 92492d12..24497fd8 100644
+--- a/src/canvas/actions/canvasActionEmitters.ts
++++ b/src/canvas/actions/canvasActionEmitters.ts
+@@ -48,10 +48,6 @@ const moveLayerAction = (runtime: CanvasActionRuntime, move: LayerMove) => {
+   else applyCanvasCommand({ kind: 'move-node-layer', nodeId, move }, runtime)
+ }
+ 
+-const makeVariations = (runtime: CanvasActionRuntime) => {
+-  void runtime.generateVariations(primaryNodeId(runtime))
+-}
+-
+ const generateBesidePrimary = (runtime: CanvasActionRuntime) => {
+   void runtime.generateBesideNode(primaryNodeId(runtime))
+ }
+@@ -60,53 +56,6 @@ const generateIntoPrimarySlot = (runtime: CanvasActionRuntime) => {
+   void runtime.generateIntoAiSlot(primaryNodeId(runtime))
+ }
+ 
+-const addAnnotationForPrimary = (runtime: CanvasActionRuntime) => {
+-  applyCanvasCommand({ kind: 'add-annotation-node', sourceNodeId: primaryNodeId(runtime) }, runtime)
+-}
+-
+-const beginImageEditPrompt = (
+-  runtime: CanvasActionRuntime,
+-  operation: Parameters<CanvasActionRuntime['generateImageEdit']>[1],
+-  instruction: string,
+-  titlePrefix: string,
+-) => {
+-  const nodeId = primaryNodeId(runtime)
+-  if (!nodeId) return
+-
+-  const noteId = applyCanvasCommand(
+-    {
+-      kind: 'add-annotation-node',
+-      sourceNodeId: nodeId,
+-      instruction,
+-      options: {
+-        operation,
+-        title: `${titlePrefix} for ${runtime.context.primaryNode?.title || 'image'}`,
+-      },
+-    },
+-    runtime,
+-  )
+-  if (!noteId) return
+-
+-  applyCanvasCommand({ kind: 'set-active-tool', toolId: 'select' }, runtime)
+-  // add-annotation-node is a sync kind (no bridge) — runtime returns string|undefined.
+-  // #208 widened applyCanvasCommand's return to a broad union (string|string[]|Promise)
+-  // to cover async generation; narrow to string before handing to onEditText.
+-  // Behavior == pre-rewiring (`runtime.addAnnotationNode` returned string|undefined).
+-  if (typeof noteId === 'string') runtime.onEditText?.(noteId)
+-}
+-
+-const generateImageEditForPrimary = (
+-  runtime: CanvasActionRuntime,
+-  operation: Parameters<CanvasActionRuntime['generateImageEdit']>[1],
+-  prompt: string,
+-) => {
+-  void runtime.generateImageEdit(primaryNodeId(runtime), operation, prompt)
+-}
+-
+-const generateFromPrimaryAnnotation = (runtime: CanvasActionRuntime) => {
+-  void runtime.generateFromAnnotation(primaryNodeId(runtime))
+-}
+-
+ const cropPrimaryNode = (runtime: CanvasActionRuntime) => {
+   const nodeId = primaryNodeId(runtime)
+   if (!nodeId) return
+@@ -242,18 +191,6 @@ const createFrameAtContext = (runtime: CanvasActionRuntime) => {
+   applyCanvasCommand({ kind: 'add-frame-node', position: runtime.canvasPosition }, runtime)
+ }
+ 
+-const createAiSlotAtContext = (runtime: CanvasActionRuntime) => {
+-  const position = runtime.canvasPosition || { x: 0, y: 0 }
+-  applyCanvasCommand(
+-    {
+-      kind: 'add-ai-slot-node',
+-      position: { x: position.x - 160, y: position.y - 160 },
+-    },
+-    runtime,
+-  )
+-}
+-
+-
+ const importAssetAtContext = (runtime: CanvasActionRuntime) => {
+   if (runtime.canvasPosition && runtime.onImportAssetAt) {
+     runtime.onImportAssetAt(runtime.canvasPosition)
+@@ -316,13 +253,8 @@ export {
+   duplicateAction,
+   deleteAction,
+   moveLayerAction,
+-  makeVariations,
+   generateBesidePrimary,
+   generateIntoPrimarySlot,
+-  addAnnotationForPrimary,
+-  beginImageEditPrompt,
+-  generateImageEditForPrimary,
+-  generateFromPrimaryAnnotation,
+   cropPrimaryNode,
+   resetPrimaryImageCrop,
+   rotatePrimaryImage,
+@@ -339,7 +271,6 @@ export {
+   sectionStyleStateFor,
+   createTextAtContext,
+   createFrameAtContext,
+-  createAiSlotAtContext,
+   importAssetAtContext,
+   importAssetFolderAtContext,
+   selectAll,
+diff --git a/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts b/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
+index c6b83842..0b6df800 100644
+--- a/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
++++ b/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
+@@ -70,8 +70,7 @@ const ctx = (nodes: MivoCanvasNode[], primary?: MivoCanvasNode) =>
+ // ─── mock runtime ────────────────────────────────────────────────────────────────
+ 
+ /** 构造全 mock 的 CanvasActionRuntime。每个方法都是 vi.fn()，可在测试里断言调用意图。
+- *  string 返回方法给默认返回值以走通 happy path（addAnnotationNode 返回 'note-id'
+- *  使 beginImageEditPrompt 走到 setActiveTool + onEditText；测试边界时按需 override）。 */
++ *  string 返回方法给默认返回值以走通 happy path;测试边界时按需 override。 */
+ const createRuntime = (
+   context: ReturnType<typeof ctx>,
+   overrides: Partial<CanvasActionRuntime> & { allNodeIdsOverride?: string[] } = {},
+@@ -98,7 +97,6 @@ const createRuntime = (
+     addTextNode: vi.fn(() => 'text-id'),
+     addFrameNode: vi.fn(() => 'frame-id'),
+     addAiSlotNode: vi.fn(() => 'slot-id'),
+-    addAnnotationNode: vi.fn(() => 'note-id'),
+     addMarkupNode: vi.fn(() => 'markup-id'),
+     updateMarkupStyle: vi.fn(),
+     updateSectionStyle: vi.fn(),
+@@ -109,7 +107,6 @@ const createRuntime = (
+     generateImageEdit: vi.fn(async () => []),
+     generateBesideNode: vi.fn(async () => []),
+     generateIntoAiSlot: vi.fn(async () => []),
+-    generateFromAnnotation: vi.fn(async () => []),
+     updateSelectedMarkupStyle: vi.fn(),
+     duplicateNode: vi.fn(),
+     duplicateSelectedNodes: vi.fn(),
+@@ -174,11 +171,12 @@ describe('canvasActionModel — characterization · part 2 (③ markup/AI-edit 
+   // markup style dispatch 表征已拆至 markupStyleActions.dispatch.test.ts(结构守卫 900 行红线)。
+ 
+ 
+-  describe('image AI edit context-menu dispatch', () => {
+-    // 注：imageAiEditActionsFor 仅出现在 quick toolbar 的 ai-edit-menu，contextMenu 不挂。
+-    // 这一组专门钉这个边界 + 测 quick toolbar 子项的分发意图。
+-
+-    it('contextMenu 不直接挂 imageAiEditActions（仅 quick toolbar 有）', () => {
++  // §4(需求3+4,2026-08 拍板):imageAiEditActionsFor 的 5 个下拉子项(edit-with-prompt /
++  // select-area-edit / remove-background / expand-image / boost-resolution)随
++  // AI 编辑下拉整条下线;ai-edit-menu 不再挂 children,点击直接调
++  // onStartImageMaskEdit(复用原「框选区域」的 handler)。
++  describe('image AI edit dispatch (ai-edit-menu → 直开局部重绘)', () => {
++    it('contextMenu 不挂 imageAiEditActions(仅曾属于 quick toolbar,现已整条下线)', () => {
+       const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('a')])))
+       expect(hasAction(groups, 'remove-background')).toBe(false)
+       expect(hasAction(groups, 'expand-image')).toBe(false)
+@@ -187,80 +185,22 @@ describe('canvasActionModel — characterization · part 2 (③ markup/AI-edit 
+       expect(hasAction(groups, 'select-area-edit')).toBe(false)
+     })
+ 
+-    it('quick toolbar ai-edit-menu 含 5 个子项（固定顺序）', () => {
++    it('quick toolbar ai-edit-menu 无 children(下拉已下线)', () => {
+       const groups = quickToolbarGroupsFor(createRuntime(ctx([imageNode('a')])))
+       const menu = findAction(groups, 'ai-edit-menu')
+-      expect(menu?.children?.map((c) => c.id)).toEqual([
+-        'edit-with-prompt', 'select-area-edit', 'remove-background', 'expand-image', 'boost-resolution',
+-      ])
++      expect(menu?.children).toBeUndefined()
+     })
+ 
+-    it('select-area-edit → onStartImageMaskEdit(id)（可选回调）', () => {
++    it('ai-edit-menu 点击 → onStartImageMaskEdit(id)（可选回调，复用原 select-area-edit 的 handler）', () => {
+       const onStartImageMaskEdit = vi.fn()
+       const rt = createRuntime(ctx([imageNode('a')]), { onStartImageMaskEdit })
+-      fire(quickToolbarGroupsFor(rt), 'select-area-edit')
++      fire(quickToolbarGroupsFor(rt), 'ai-edit-menu')
+       expect(onStartImageMaskEdit).toHaveBeenCalledWith('a')
+     })
+ 
+-    it('select-area-edit 无 onStartImageMaskEdit 时不抛（可选链安全）', () => {
++    it('ai-edit-menu 无 onStartImageMaskEdit 时不抛（可选链安全）', () => {
+       const rt = createRuntime(ctx([imageNode('a')]), { onStartImageMaskEdit: undefined })
+-      expect(() => fire(quickToolbarGroupsFor(rt), 'select-area-edit')).not.toThrow()
+-    })
+-
+-    it('remove-background → generateImageEdit(id, remove-background, <prompt>)', () => {
+-      const rt = createRuntime(ctx([imageNode('a')]))
+-      fire(quickToolbarGroupsFor(rt), 'remove-background')
+-      const call = vi.mocked(rt.generateImageEdit).mock.calls[0]
+-      expect(call?.[0]).toBe('a')
+-      expect(call?.[1]).toBe('remove-background')
+-      expect(call?.[2]).toContain('background')
+-    })
+-
+-    it('expand-image → generateImageEdit(id, outpaint, …)', () => {
+-      const rt = createRuntime(ctx([imageNode('a')]))
+-      fire(quickToolbarGroupsFor(rt), 'expand-image')
+-      const call = vi.mocked(rt.generateImageEdit).mock.calls[0]
+-      expect(call?.[1]).toBe('outpaint')
+-    })
+-
+-    it('boost-resolution → generateImageEdit(id, upscale, …)', () => {
+-      const rt = createRuntime(ctx([imageNode('a')]))
+-      fire(quickToolbarGroupsFor(rt), 'boost-resolution')
+-      const call = vi.mocked(rt.generateImageEdit).mock.calls[0]
+-      expect(call?.[1]).toBe('upscale')
+-    })
+-
+-    it('edit-with-prompt → addAnnotationNode(id, undefined, instruction, {operation:prompt-edit, title}) 后 setActiveTool(select) + onEditText(noteId)', () => {
+-      const onEditText = vi.fn()
+-      const rt = createRuntime(ctx([imageNode('a', { title: 'Cat' })]), { onEditText })
+-      fire(quickToolbarGroupsFor(rt), 'edit-with-prompt')
+-      expect(vi.mocked(rt.addAnnotationNode)).toHaveBeenCalledWith(
+-        'a', undefined, 'Describe the image edit here',
+-        { operation: 'prompt-edit', title: 'Prompt edit for Cat' },
+-      )
+-      expect(vi.mocked(rt.setActiveTool)).toHaveBeenCalledWith('select')
+-      expect(onEditText).toHaveBeenCalledWith('note-id')
+-    })
+-
+-    it('edit-with-prompt 无 title → title 回退到 image（源码 || "image" 分支）', () => {
+-      // 真正构造无 title 的 fixture（显式置空串），让 primaryNode?.title 为 falsy，
+-      // 命中 beginImageEditPrompt 里 `|| 'image'` 的回退分支（canvasActionModel.ts:137）。
+-      // 改源码回退值时该用例必红；上方 'Cat' 用例覆盖正常标题路径作对照。
+-      const rt = createRuntime(ctx([imageNode('a', { title: '' })]))
+-      fire(quickToolbarGroupsFor(rt), 'edit-with-prompt')
+-      const call = vi.mocked(rt.addAnnotationNode).mock.calls[0]
+-      expect(call?.[3]).toEqual({ operation: 'prompt-edit', title: 'Prompt edit for image' })
+-    })
+-
+-    it('edit-with-prompt · addAnnotationNode 返 undefined → 早退，不调 setActiveTool/onEditText', () => {
+-      const onEditText = vi.fn()
+-      const rt = createRuntime(ctx([imageNode('a')]), {
+-        onEditText,
+-        addAnnotationNode: vi.fn(() => undefined) as unknown as CanvasActionRuntime['addAnnotationNode'],
+-      })
+-      fire(quickToolbarGroupsFor(rt), 'edit-with-prompt')
+-      expect(vi.mocked(rt.setActiveTool)).not.toHaveBeenCalled()
+-      expect(onEditText).not.toHaveBeenCalled()
++      expect(() => fire(quickToolbarGroupsFor(rt), 'ai-edit-menu')).not.toThrow()
+     })
+   })
+ 
+@@ -292,9 +232,9 @@ describe('canvasActionModel — characterization · part 2 (③ markup/AI-edit 
+       expect(deepActionIds(groups)).toEqual(['fill-slot', 'bring-front'])
+     })
+ 
+-    it('annotation quick toolbar → generate-from-note / edit-note', () => {
++    it('annotation quick toolbar → 仅 edit-note(生成项随批注退役下线;legacy 节点编辑入口保留,F2)', () => {
+       const groups = quickToolbarGroupsFor(createRuntime(ctx([annotationNode('n1')])))
+-      expect(deepActionIds(groups)).toEqual(['generate-from-note', 'edit-note'])
++      expect(deepActionIds(groups)).toEqual(['edit-note'])
+     })
+ 
+     it('frame quick toolbar → section-fill/line/rename-frame/section-content-visibility/section-lock/fit-section?(onFitSelection)', () => {
+@@ -419,19 +359,6 @@ describe('canvasActionModel — characterization · part 2 (③ markup/AI-edit 
+       expect(vi.mocked(rt.generateIntoAiSlot)).toHaveBeenCalledWith('s1')
+     })
+ 
+-    it('annotation generate-from-note → generateFromAnnotation(id)', () => {
+-      const rt = createRuntime(ctx([annotationNode('n1')]))
+-      fire(quickToolbarGroupsFor(rt), 'generate-from-note')
+-      expect(vi.mocked(rt.generateFromAnnotation)).toHaveBeenCalledWith('n1')
+-    })
+-
+-    it('annotation edit-note → onEditText(id)', () => {
+-      const onEditText = vi.fn()
+-      const rt = createRuntime(ctx([annotationNode('n1')]), { onEditText })
+-      fire(quickToolbarGroupsFor(rt), 'edit-note')
+-      expect(onEditText).toHaveBeenCalledWith('n1')
+-    })
+-
+     it('text generate-beside-text → generateBesideNode(id)', () => {
+       const rt = createRuntime(ctx([textNode('t1')]))
+       fire(quickToolbarGroupsFor(rt), 'generate-beside-text')
+@@ -543,19 +470,6 @@ describe('canvasActionModel — characterization · part 2 (③ markup/AI-edit 
+       expect(vi.mocked(rt.addFrameNode)).toHaveBeenCalledWith(pos)
+     })
+ 
+-    it('有 canvasPosition → new-ai-slot → addAiSlotNode(pos-160)', () => {
+-      const pos = { x: 200, y: 200 }
+-      const rt = createRuntime(ctx([]), { canvasPosition: pos })
+-      fire(contextMenuGroupsFor(rt), 'new-ai-slot')
+-      expect(vi.mocked(rt.addAiSlotNode)).toHaveBeenCalledWith({ x: 40, y: 40 })
+-    })
+-
+-    it('缺 canvasPosition → new-ai-slot → addAiSlotNode({-160,-160})（默认 {0,0}）', () => {
+-      const rt = createRuntime(ctx([]), { canvasPosition: undefined })
+-      fire(contextMenuGroupsFor(rt), 'new-ai-slot')
+-      expect(vi.mocked(rt.addAiSlotNode)).toHaveBeenCalledWith({ x: -160, y: -160 })
+-    })
+-
+     it('new-*-markup 已从空白右键退场(§3,2026-08-01 拍板;绘制类创建走工具坞)', () => {
+       const rt = createRuntime(ctx([]), { canvasPosition: { x: 200, y: 200 } })
+       const groups = contextMenuGroupsFor(rt)
+@@ -564,6 +478,12 @@ describe('canvasActionModel — characterization · part 2 (③ markup/AI-edit 
+       }
+     })
+ 
++    it('new-ai-slot 已从空白右键退场(需求1,2026-08 拍板;createAiSlotAtContext/add-ai-slot-node 已下线)', () => {
++      const rt = createRuntime(ctx([]), { canvasPosition: { x: 200, y: 200 } })
++      const groups = contextMenuGroupsFor(rt)
++      expect(findAction(groups, 'new-ai-slot')).toBeUndefined()
++    })
++
+     it('import-asset 有 canvasPosition + onImportAssetAt → onImportAssetAt(pos)', () => {
+       const pos = { x: 7, y: 8 }
+       const onImportAssetAt = vi.fn()
+diff --git a/src/canvas/actions/canvasActionModel.characterization.test.ts b/src/canvas/actions/canvasActionModel.characterization.test.ts
+index f722c6f7..17bce56c 100644
+--- a/src/canvas/actions/canvasActionModel.characterization.test.ts
++++ b/src/canvas/actions/canvasActionModel.characterization.test.ts
+@@ -66,8 +66,7 @@ const ctx = (nodes: MivoCanvasNode[], primary?: MivoCanvasNode) =>
+ // ─── mock runtime ────────────────────────────────────────────────────────────────
+ 
+ /** 构造全 mock 的 CanvasActionRuntime。每个方法都是 vi.fn()，可在测试里断言调用意图。
+- *  string 返回方法给默认返回值以走通 happy path（addAnnotationNode 返回 'note-id'
+- *  使 beginImageEditPrompt 走到 setActiveTool + onEditText；测试边界时按需 override）。 */
++ *  string 返回方法给默认返回值以走通 happy path;测试边界时按需 override。 */
+ const createRuntime = (
+   context: ReturnType<typeof ctx>,
+   overrides: Partial<CanvasActionRuntime> & { allNodeIdsOverride?: string[] } = {},
+@@ -94,7 +93,6 @@ const createRuntime = (
+     addTextNode: vi.fn(() => 'text-id'),
+     addFrameNode: vi.fn(() => 'frame-id'),
+     addAiSlotNode: vi.fn(() => 'slot-id'),
+-    addAnnotationNode: vi.fn(() => 'note-id'),
+     addMarkupNode: vi.fn(() => 'markup-id'),
+     updateMarkupStyle: vi.fn(),
+     updateSectionStyle: vi.fn(),
+@@ -105,7 +103,6 @@ const createRuntime = (
+     generateImageEdit: vi.fn(async () => []),
+     generateBesideNode: vi.fn(async () => []),
+     generateIntoAiSlot: vi.fn(async () => []),
+-    generateFromAnnotation: vi.fn(async () => []),
+     duplicateNode: vi.fn(),
+     duplicateSelectedNodes: vi.fn(),
+     groupSelectedNodes: vi.fn(),
+@@ -173,9 +170,12 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       expect(groupIds(groups)).toEqual(['canvas', 'create'])
+       // 真实顺序：create 在前，canvas 在后（非字母序）
+       expect(orderedGroupIds(groups)).toEqual(['create', 'canvas'])
+-      // §3(2026-08-01 拍板):三个 markup 创建项退场,创建走工具坞。
++      // §3(2026-08-01 拍板):三个 markup 创建项退场,创建走工具坞。§4(需求1,
++      // 2026-08 拍板):new-ai-slot 退场,专属代码(createAiSlotAtContext/
++      // add-ai-slot-node)已随之下线——ai-slot 节点仍是生成管线占位符,建槽改走
++      // canvas_generate_image agent verb 与局部重绘预建槽(store addAiSlotNode 保留)。
+       expect(deepActionIds(groups)).toEqual([
+-        'new-text', 'new-section', 'new-ai-slot',
++        'new-text', 'new-section',
+         // #297 P3-15:目录导入与单文件导入并列在 create 组末尾
+         'import-asset', 'import-asset-folder',
+       ])
+@@ -229,13 +229,14 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+   })
+ 
+   describe('contextMenuGroupsFor · single-node base structure', () => {
+-    it('single image: inspect + generate/edit + arrange + export + danger', () => {
++    it('single image(未裁剪): inspect + edit(copy-as-png) + arrange + export + danger(generate 组随需求2下线)', () => {
+       const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('img-1')])))
+-      expect(groupIds(groups)).toEqual(['arrange', 'danger', 'edit', 'export', 'generate', 'inspect', 'organize'])
++      expect(groupIds(groups)).toEqual(['arrange', 'danger', 'edit', 'export', 'inspect', 'organize'])
+       // 真实返回顺序（源码 contextMenuGroupsFor 的 return 拼装顺序，非字母序）：
+-      // inspect → node 扩展(generate,edit) → organize → arrange → export → danger
++      // inspect → node 扩展(generate 空不出现;edit 恒含 copy-as-png,2026-08-04
++      // owner 拍板恢复) → organize → arrange → export → danger
+       expect(orderedGroupIds(groups)).toEqual([
+-        'inspect', 'generate', 'edit', 'organize', 'arrange', 'export', 'danger',
++        'inspect', 'edit', 'organize', 'arrange', 'export', 'danger',
+       ])
+       // inspect 含 view-details / copy;duplicate 2026-07-31 全面退场(用户拍板)
+       expect(hasAction(groups, 'view-details')).toBe(true)
+@@ -502,16 +503,20 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+   // ─── ② 续：node-type 扩展的存在性 ────────────────────────────────────────────
+ 
+   describe('node-type context-menu extensions', () => {
+-    it('image → generate 组含 generate-beside / add-edit-note / variations;edit 组只剩 copy-as-png(+条件 reset-crop,§2.5a)', () => {
++    // §4(需求2,2026-08 拍板):generate-beside / add-edit-note / variations
++    // 退场——annotation 创建与生成入口(add-edit-note 的 addAnnotationForPrimary、
++    // generate-from-annotation 的 generateFromPrimaryAnnotation)随之整条下线。
++    // image/task-placeholder/text 右键的 generate 组因此只剩 slotSelected 分支
++    // (对这三类型恒为 false)。edit 组仅 image 出现:copy-as-png 恒有
++    // (2026-08-04 owner 拍板恢复保留)+ reset-crop 条件显示。
++    it('image → 无 generate 组;edit 组恒含 copy-as-png,裁剪后追加 reset-crop', () => {
+       const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('a')])))
+-      expect(hasAction(groups, 'generate-beside')).toBe(true)
+-      expect(hasAction(groups, 'add-edit-note')).toBe(true)
+-      expect(hasAction(groups, 'variations')).toBe(true)
+-      expect(hasAction(groups, 'copy-as-png')).toBe(true)
+-      for (const id of ['crop', 'rotate', 'flip-h', 'flip-v', 'replace-image']) expect(hasAction(groups, id), id).toBe(false)
+-      expect(hasAction(groups, 'reset-crop')).toBe(false) // 无 imageCrop 时不出现
++      expect(groupIds(groups)).not.toContain('generate')
++      expect(deepActionIds(groups.filter((g) => g.id === 'edit'))).toEqual(['copy-as-png'])
++      for (const id of ['generate-beside', 'add-edit-note', 'variations', 'crop', 'rotate', 'flip-h', 'flip-v', 'replace-image'])
++        expect(hasAction(groups, id), id).toBe(false)
+       const cropped = contextMenuGroupsFor(createRuntime(ctx([imageNode('a', { imageCrop: { x: 0, y: 0, width: 10, height: 10 } })])))
+-      expect(hasAction(cropped, 'reset-crop')).toBe(true)
++      expect(deepActionIds(cropped.filter((g) => g.id === 'edit'))).toEqual(['reset-crop', 'copy-as-png'])
+     })
+ 
+     it('image → 无 generate-into-slot / generate-from-annotation（非 slot/annotation）', () => {
+@@ -528,26 +533,22 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       expect(hasAction(groups, 'crop')).toBe(false)
+     })
+ 
+-    it('annotation → generate 组含 generate-from-annotation + generate-beside；无 add-edit-note', () => {
++    it('annotation → 无 generate / edit 组(退役后与其它非 slot 类型同形)', () => {
+       const groups = contextMenuGroupsFor(createRuntime(ctx([annotationNode('n1')])))
+-      expect(hasAction(groups, 'generate-from-annotation')).toBe(true)
+-      expect(hasAction(groups, 'generate-beside')).toBe(true)
+-      expect(hasAction(groups, 'add-edit-note')).toBe(false)
++      expect(groupIds(groups)).not.toContain('generate')
++      expect(groupIds(groups)).not.toContain('edit')
+     })
+ 
+-    it('text → generate 组含 generate-beside + add-edit-note；无 variations/crop', () => {
++    it('text → 无 generate 组(generate-beside / add-edit-note 随需求2退场)；无 variations/crop', () => {
+       const groups = contextMenuGroupsFor(createRuntime(ctx([textNode('t1')])))
+-      expect(hasAction(groups, 'generate-beside')).toBe(true)
+-      expect(hasAction(groups, 'add-edit-note')).toBe(true)
++      expect(groupIds(groups)).not.toContain('generate')
+       expect(hasAction(groups, 'variations')).toBe(false)
+       expect(hasAction(groups, 'crop')).toBe(false)
+     })
+ 
+-    it('task-placeholder → 与 image 同走 generate 扩展，有 variations 但无 crop', () => {
++    it('task-placeholder → 无 generate 组(与 image 同一装配分支同步退场)', () => {
+       const groups = contextMenuGroupsFor(createRuntime(ctx([taskNode('tp1')])))
+-      expect(hasAction(groups, 'generate-beside')).toBe(true)
+-      expect(hasAction(groups, 'add-edit-note')).toBe(true)
+-      expect(hasAction(groups, 'variations')).toBe(true)
++      expect(groupIds(groups)).not.toContain('generate')
+       expect(hasAction(groups, 'crop')).toBe(false)
+     })
+ 
+@@ -767,36 +768,12 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       expect(onDownloadOriginal).toHaveBeenCalledWith(primary)
+     })
+ 
+-    it('generate-beside · image → generateBesideNode(id)', () => {
+-      const rt = createRuntime(ctx([imageNode('a')]))
+-      fire(contextMenuGroupsFor(rt), 'generate-beside')
+-      expect(vi.mocked(rt.generateBesideNode)).toHaveBeenCalledWith('a')
+-    })
+-
+-    it('variations · image → generateVariations(id)', () => {
+-      const rt = createRuntime(ctx([imageNode('a')]))
+-      fire(contextMenuGroupsFor(rt), 'variations')
+-      expect(vi.mocked(rt.generateVariations)).toHaveBeenCalledWith('a')
+-    })
+-
+-    it('add-edit-note · image → addAnnotationNode(id)', () => {
+-      const rt = createRuntime(ctx([imageNode('a')]))
+-      fire(contextMenuGroupsFor(rt), 'add-edit-note')
+-      expect(vi.mocked(rt.addAnnotationNode)).toHaveBeenCalledWith('a')
+-    })
+-
+     it('generate-into-slot · ai-slot → generateIntoAiSlot(id)', () => {
+       const rt = createRuntime(ctx([aiSlotNode('s1')]))
+       fire(contextMenuGroupsFor(rt), 'generate-into-slot')
+       expect(vi.mocked(rt.generateIntoAiSlot)).toHaveBeenCalledWith('s1')
+     })
+ 
+-    it('generate-from-annotation · annotation → generateFromAnnotation(id)', () => {
+-      const rt = createRuntime(ctx([annotationNode('n1')]))
+-      fire(contextMenuGroupsFor(rt), 'generate-from-annotation')
+-      expect(vi.mocked(rt.generateFromAnnotation)).toHaveBeenCalledWith('n1')
+-    })
+-
+     it('crop · image → onCropNode(id)', () => {
+       const onCropNode = vi.fn()
+       const rt = createRuntime(ctx([imageNode('a')]), { onCropNode })
+diff --git a/src/canvas/actions/canvasActionModel.ts b/src/canvas/actions/canvasActionModel.ts
+index 2d48e94b..c43cde1b 100644
+--- a/src/canvas/actions/canvasActionModel.ts
++++ b/src/canvas/actions/canvasActionModel.ts
+@@ -10,10 +10,8 @@ import {
+   LocateFixed,
+   Lock,
+   Maximize2,
+-  MessageSquareText,
+   PanelTop,
+   Pencil,
+-  SquareDashed,
+   SquareMousePointer,
+   Sparkles,
+   Type,
+@@ -51,11 +49,8 @@ export type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from '.
+ import {
+   deleteAction,
+   moveLayerAction,
+-  makeVariations,
+   generateBesidePrimary,
+   generateIntoPrimarySlot,
+-  addAnnotationForPrimary,
+-  generateFromPrimaryAnnotation,
+   downloadPrimaryOriginal,
+   renamePrimaryNode,
+   setSectionStyle,
+@@ -64,7 +59,6 @@ import {
+   sectionStyleStateFor,
+   createTextAtContext,
+   createFrameAtContext,
+-  createAiSlotAtContext,
+   selectAll,
+   copySelectedNodes,
+   groupSelectedNodes,
+@@ -143,12 +137,7 @@ const generationContextMenuGroupsFor: NodeActionExtension = (runtime) => {
+   const { context } = runtime
+   if (context.kind !== 'single') return []
+ 
+-  const canUseImageAi = hasAnyCapability(context, 'aiEditable') || hasAnyCapability(context, 'aiReference')
+   const slotSelected = hasAnyCapability(context, 'aiSlot')
+-  const annotationSelected = hasAnyCapability(context, 'annotation')
+-  const canGenerateBeside = !slotSelected && context.primaryNode?.type !== 'frame'
+-  const canAddAnnotation = !slotSelected && !annotationSelected && context.primaryNode?.type !== 'frame'
+-  const canCropPrimary = context.primaryNode?.type === 'image'
+   const generateActions: CanvasActionItem[] = [
+     ...(slotSelected
+       ? [
+@@ -160,61 +149,23 @@ const generationContextMenuGroupsFor: NodeActionExtension = (runtime) => {
+           },
+         ]
+       : []),
+-    ...(annotationSelected
+-      ? [
+-          {
+-            id: 'generate-from-annotation',
+-            label: t('menu.generate.fromNote'),
+-            icon: Sparkles,
+-            onClick: () => generateFromPrimaryAnnotation(runtime),
+-          },
+-        ]
+-      : []),
+-    ...(canGenerateBeside
+-      ? [
+-          {
+-            id: 'generate-beside',
+-            label: t('menu.generate.beside'),
+-            icon: Sparkles,
+-            onClick: () => generateBesidePrimary(runtime),
+-          },
+-        ]
+-      : []),
+-    ...(canAddAnnotation
+-      ? [
+-          {
+-            id: 'add-edit-note',
+-            label: t('menu.generate.addEditNote'),
+-            icon: MessageSquareText,
+-            onClick: () => addAnnotationForPrimary(runtime),
+-          },
+-        ]
+-      : []),
+-    ...(canUseImageAi
+-      ? [
+-          { id: 'variations', label: t('menu.generate.variations'), icon: Sparkles, onClick: () => makeVariations(runtime) },
+-        ]
+-      : []),
+   ]
++  // edit 组只给 image:copy-as-png 恒有、reset-crop 随 imageCrop 条件显示。
++  // type 守卫不可省——本装配同时服务 ai-slot,不守卫会把 copy-as-png 漏给它。
++  const editActions =
++    context.primaryNode?.type === 'image' ? imageContextEditActionsFor(runtime) : []
+ 
+   return [
+     ...(generateActions.length ? [{ id: 'generate', actions: generateActions }] : []),
+-    ...(canCropPrimary
+-      ? [
+-          {
+-            id: 'edit',
+-            actions: imageContextEditActionsFor(runtime),
+-          },
+-        ]
+-      : []),
++    ...(editActions.length ? [{ id: 'edit', actions: editActions }] : []),
+   ]
+ }
+ 
+ const contextMenuExtensionsByNodeType: Partial<Record<CanvasNodeType, NodeActionExtension>> = {
++  // 生成组退役后(2026-08 需求2),generationContextMenuGroupsFor 只对 image(带裁剪
++  // 的 edit 组)和 ai-slot(生成到占位)产出内容;text/annotation/task-placeholder
++  // 的挂载已是恒空,一并摘除。
+   image: generationContextMenuGroupsFor,
+-  'task-placeholder': generationContextMenuGroupsFor,
+-  text: generationContextMenuGroupsFor,
+-  annotation: generationContextMenuGroupsFor,
+   'ai-slot': generationContextMenuGroupsFor,
+   frame: sectionContextMenuGroupsFor,
+   markup: markupContextMenuGroupsFor,
+@@ -256,9 +207,8 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+             : []),
+           { id: 'new-text', label: t('menu.create.newText'), icon: Type, onClick: () => createTextAtContext(runtime) },
+           { id: 'new-section', label: t('menu.create.newSection'), icon: PanelTop, onClick: () => createFrameAtContext(runtime) },
+-          { id: 'new-ai-slot', label: t('menu.create.newAiSlot'), icon: SquareDashed, onClick: () => createAiSlotAtContext(runtime) },
+               // §3(2026-08-01 拍板):三个 markup 创建项退场——绘制类创建走
+-              // 工具坞;空白右键保留文本/Section/AI 槽三个高频起点。
++              // 工具坞;空白右键保留文本/Section 两个高频起点(AI 图片占位项已下线)。
+         ],
+       },
+       {
+@@ -477,11 +427,14 @@ const aiSlotQuickToolbarGroupsFor: NodeActionExtension = (runtime) => [
+   },
+ ]
+ 
++// 批注退役(需求2/3,2026-08)后 legacy annotation 节点的快捷条只留编辑入口——
++// 生成项(generate-from-note)随 generateFromAnnotation 整条下线,但存量节点的
++// 文字编辑不属于退役面(sol 审查席 F2,2026-08-04 采纳):右键「编辑批注」/双击
++// 之外,快捷条这条常用入口一并保留。
+ const annotationQuickToolbarGroupsFor: NodeActionExtension = (runtime) => [
+   {
+     id: 'annotation',
+     actions: [
+-      { id: 'generate-from-note', label: t('menu.generate.generate'), icon: Sparkles, onClick: () => generateFromPrimaryAnnotation(runtime) },
+       { id: 'edit-note', label: t('menu.generate.edit'), icon: Type, onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || '') },
+     ],
+   },
+diff --git a/src/canvas/actions/canvasActionTypes.ts b/src/canvas/actions/canvasActionTypes.ts
+index a9c8180d..f4a76005 100644
+--- a/src/canvas/actions/canvasActionTypes.ts
++++ b/src/canvas/actions/canvasActionTypes.ts
+@@ -98,12 +98,6 @@ export type CanvasActionRuntime = {
+   addTextNode: (position: { x: number; y: number }, text?: string) => string
+   addFrameNode: (position: { x: number; y: number }, size?: { width: number; height: number }, title?: string) => string
+   addAiSlotNode: (position: { x: number; y: number }, size?: { width: number; height: number }, prompt?: string) => string
+-  addAnnotationNode: (
+-    sourceNodeId?: string,
+-    position?: { x: number; y: number },
+-    instruction?: string,
+-    options?: { operation?: AiWorkflowOperation; title?: string },
+-  ) => string | undefined
+   addMarkupNode: (
+     kind: MarkupKind,
+     position: { x: number; y: number },
+@@ -174,7 +168,6 @@ export type CanvasActionRuntime = {
+     prompt?: string,
+     options?: CanvasGenerationOptions,
+   ) => Promise<string[]>
+-  generateFromAnnotation: (annotationNodeId?: string, options?: CanvasGenerationOptions) => Promise<string[]>
+   /** Duplicate 已全面退出菜单/快捷条(2026-07-31 用户拍板,仅留 ⌘D 快捷键);
+    *  这两个 runtime 方法的唯一消费者是命令通道(canvasCommandExecutor),
+    *  勿在菜单装配里复用。 */
+diff --git a/src/canvas/actions/canvasCommand.serialize.test.ts b/src/canvas/actions/canvasCommand.serialize.test.ts
+index c511d536..637a2f9b 100644
+--- a/src/canvas/actions/canvasCommand.serialize.test.ts
++++ b/src/canvas/actions/canvasCommand.serialize.test.ts
+@@ -53,29 +53,6 @@ describe('CanvasCommand serialize round-trip', () => {
+   it('add-frame-node (position only)', () => {
+     roundTrip({ kind: 'add-frame-node', position: { x: 5, y: 5 } })
+   })
+-  it('add-ai-slot-node (full)', () => {
+-    roundTrip({
+-      kind: 'add-ai-slot-node',
+-      position: { x: 100, y: 100 },
+-      size: { width: 320, height: 320 },
+-      prompt: 'a cat',
+-    })
+-  })
+-  it('add-ai-slot-node (position only)', () => {
+-    roundTrip({ kind: 'add-ai-slot-node', position: { x: 0, y: 0 } })
+-  })
+-  it('add-annotation-node (all optionals)', () => {
+-    roundTrip({
+-      kind: 'add-annotation-node',
+-      sourceNodeId: 'img-1',
+-      position: { x: 50, y: 50 },
+-      instruction: 'remove bg',
+-      options: { operation: 'remove-background', title: 'Edit for image' },
+-    })
+-  })
+-  it('add-annotation-node (bare)', () => {
+-    roundTrip({ kind: 'add-annotation-node' })
+-  })
+   it('add-markup-node (arrow with points + connector bindings)', () => {
+     roundTrip({
+       kind: 'add-markup-node',
+@@ -320,13 +297,6 @@ describe('CanvasCommand serialize round-trip', () => {
+       options: { quality: 'high' },
+     })
+   })
+-  it('generate-from-annotation (full)', () => {
+-    roundTrip({
+-      kind: 'generate-from-annotation',
+-      annotationNodeId: 'note-1',
+-      options: { imgRatio: '1:1' },
+-    })
+-  })
+ 
+   // ── Mask edit (PR1: round-trip only, apply deferred) ─────────────────────────
+   // The mask-edit hard piece (review-plan-a.md:45). Two fixture families per F1:
+@@ -386,8 +356,6 @@ describe('CanvasCommand serialize round-trip', () => {
+   const ROUND_TRIP_FIXTURES: Record<CanvasCommandKind, CanvasCommand> = {
+     'add-text-node': { kind: 'add-text-node', position: { x: 0, y: 0 } },
+     'add-frame-node': { kind: 'add-frame-node', position: { x: 0, y: 0 } },
+-    'add-ai-slot-node': { kind: 'add-ai-slot-node', position: { x: 0, y: 0 } },
+-    'add-annotation-node': { kind: 'add-annotation-node' },
+     'add-markup-node': { kind: 'add-markup-node', markupKind: 'rect', position: { x: 0, y: 0 } },
+     'update-markup-style': { kind: 'update-markup-style', nodeId: 'm', style: {} },
+     'update-selected-markup-style': { kind: 'update-selected-markup-style', style: { markupFillColor: '#ffe27a' } },
+@@ -422,7 +390,6 @@ describe('CanvasCommand serialize round-trip', () => {
+     'generate-image-edit': { kind: 'generate-image-edit', operation: 'upscale', prompt: 'p' },
+     'generate-beside-node': { kind: 'generate-beside-node' },
+     'generate-into-ai-slot': { kind: 'generate-into-ai-slot' },
+-    'generate-from-annotation': { kind: 'generate-from-annotation' },
+     'mask-edit': {
+       kind: 'mask-edit',
+       sourceNodeId: 'img',
+@@ -469,16 +436,16 @@ describe('CanvasCommand kind partition (F3②: APPLIED ∪ DEFERRED = KINDS, dis
+     )
+   })
+ 
+-  it('CANVAS_COMMAND_KINDS has 35 kinds', () => {
+-    expect(CANVAS_COMMAND_KINDS.length).toBe(35)
++  it('CANVAS_COMMAND_KINDS has 32 kinds', () => {
++    expect(CANVAS_COMMAND_KINDS.length).toBe(32)
+   })
+ 
+-  it('CANVAS_COMMAND_APPLIED_KINDS has 28 kinds', () => {
+-    expect(CANVAS_COMMAND_APPLIED_KINDS.length).toBe(28)
++  it('CANVAS_COMMAND_APPLIED_KINDS has 26 kinds', () => {
++    expect(CANVAS_COMMAND_APPLIED_KINDS.length).toBe(26)
+   })
+ 
+-  it('CANVAS_COMMAND_DEFERRED_KINDS has 7 kinds (incl. mask-edit)', () => {
+-    expect(CANVAS_COMMAND_DEFERRED_KINDS.length).toBe(7)
++  it('CANVAS_COMMAND_DEFERRED_KINDS has 6 kinds (incl. mask-edit)', () => {
++    expect(CANVAS_COMMAND_DEFERRED_KINDS.length).toBe(6)
+     expect(CANVAS_COMMAND_DEFERRED_KINDS).toContain('mask-edit')
+   })
+ })
+diff --git a/src/canvas/actions/canvasCommand.ts b/src/canvas/actions/canvasCommand.ts
+index 15a86ece..e5255c7c 100644
+--- a/src/canvas/actions/canvasCommand.ts
++++ b/src/canvas/actions/canvasCommand.ts
+@@ -135,26 +135,12 @@ export type CanvasMarkupNodeOptions = {
+   lineRoute?: MarkupLineRoute
+ }
+ 
+-/** Annotation creation options — mirrors CanvasActionRuntime.addAnnotationNode's options arg. */
+-export type CanvasAnnotationOptions = {
+-  operation?: AiWorkflowOperation
+-  title?: string
+-}
+-
+ // ─── CanvasCommand union ───────────────────────────────────────────────────────
+ 
+ export type CanvasCommand =
+   // ── Node creation ──────────────────────────────────────────────────────────────
+   | { kind: 'add-text-node'; position: CanvasCommandPoint; text?: string }
+   | { kind: 'add-frame-node'; position: CanvasCommandPoint; size?: CanvasCommandSize; title?: string }
+-  | { kind: 'add-ai-slot-node'; position: CanvasCommandPoint; size?: CanvasCommandSize; prompt?: string }
+-  | {
+-      kind: 'add-annotation-node'
+-      sourceNodeId?: string
+-      position?: CanvasCommandPoint
+-      instruction?: string
+-      options?: CanvasAnnotationOptions
+-    }
+   | {
+       kind: 'add-markup-node'
+       markupKind: MarkupKind
+@@ -240,11 +226,6 @@ export type CanvasCommand =
+       prompt?: string
+       options?: CanvasCommandGenerationOptions
+     }
+-  | {
+-      kind: 'generate-from-annotation'
+-      annotationNodeId?: string
+-      options?: CanvasCommandGenerationOptions
+-    }
+   // ── Mask edit (PR1: type + round-trip; apply landed in #208 / PR2) ────────────
+   // The mask-edit hard piece (review-plan-a.md:45): serializable counterpart of
+   // ImageMaskSubmitPayload (src/canvas/imageMaskGeometry.ts). Two-stage asset rule:
+@@ -288,8 +269,6 @@ export type CanvasCommand =
+ export const CANVAS_COMMAND_KINDS = [
+   'add-text-node',
+   'add-frame-node',
+-  'add-ai-slot-node',
+-  'add-annotation-node',
+   'add-markup-node',
+   'update-markup-style',
+   'update-selected-markup-style',
+@@ -319,7 +298,6 @@ export const CANVAS_COMMAND_KINDS = [
+   'generate-image-edit',
+   'generate-beside-node',
+   'generate-into-ai-slot',
+-  'generate-from-annotation',
+   'mask-edit',
+ ] as const
+ 
+@@ -333,8 +311,6 @@ const CANVAS_COMMAND_KIND_SET: ReadonlySet<string> = new Set(CANVAS_COMMAND_KIND
+ export const CANVAS_COMMAND_APPLIED_KINDS = [
+   'add-text-node',
+   'add-frame-node',
+-  'add-ai-slot-node',
+-  'add-annotation-node',
+   'add-markup-node',
+   'update-markup-style',
+   'update-selected-markup-style',
+@@ -374,7 +350,6 @@ export const CANVAS_COMMAND_DEFERRED_KINDS = [
+   'generate-image-edit',
+   'generate-beside-node',
+   'generate-into-ai-slot',
+-  'generate-from-annotation',
+   'mask-edit',
+ ] as const
+ 
+diff --git a/src/canvas/actions/canvasCommandExecutor.deferred.test.ts b/src/canvas/actions/canvasCommandExecutor.deferred.test.ts
+index 0161031d..21de99ab 100644
+--- a/src/canvas/actions/canvasCommandExecutor.deferred.test.ts
++++ b/src/canvas/actions/canvasCommandExecutor.deferred.test.ts
+@@ -210,21 +210,6 @@ describe('applyCanvasCommand — two-stage asset apply with bridge (PR2)', () =>
+     )
+   })
+ 
+-  it('generate-from-annotation → resolve refs → runtime.generateFromAnnotation', async () => {
+-    const rt = createMockRuntime()
+-    vi.mocked(rt.generateFromAnnotation).mockResolvedValue(['a-1'])
+-    const bridge = createMockAssetBridge()
+-    await applyCanvasCommand(
+-      { kind: 'generate-from-annotation', annotationNodeId: 'ann-1', options: { referenceAssetIds: ['r1'] } },
+-      rt,
+-      bridge,
+-    )
+-    expect(vi.mocked(rt.generateFromAnnotation)).toHaveBeenCalledWith(
+-      'ann-1',
+-      expect.objectContaining({ referenceFiles: [expect.any(File)] }),
+-    )
+-  })
+-
+   it('mask-edit → resolve maskAssetId + markedImageAssetId → submitImageMaskEdit with assembled payload', async () => {
+     const rt = createMockRuntime()
+     const bridge = createMockAssetBridge()
+diff --git a/src/canvas/actions/canvasCommandExecutor.test.ts b/src/canvas/actions/canvasCommandExecutor.test.ts
+index addd6efe..b6c78333 100644
+--- a/src/canvas/actions/canvasCommandExecutor.test.ts
++++ b/src/canvas/actions/canvasCommandExecutor.test.ts
+@@ -58,57 +58,11 @@ describe('applyCanvasCommand — node creation dispatch', () => {
+     )
+     expect(id).toBe('frame-id')
+   })
+-  it('add-ai-slot-node → addAiSlotNode(position, size, prompt)', () => {
+-    const rt = createMockRuntime()
+-    applyCanvasCommand(
+-      {
+-        kind: 'add-ai-slot-node',
+-        position: { x: 1, y: 1 },
+-        size: { width: 320, height: 320 },
+-        prompt: 'cat',
+-      },
+-      rt,
+-    )
+-    expect(vi.mocked(rt.addAiSlotNode)).toHaveBeenCalledWith(
+-      { x: 1, y: 1 },
+-      { width: 320, height: 320 },
+-      'cat',
+-    )
+-  })
+   it('add-frame-node (position only) → addFrameNode(position)', () => {
+     const rt = createMockRuntime()
+     applyCanvasCommand({ kind: 'add-frame-node', position: { x: 9, y: 9 } }, rt)
+     expect(vi.mocked(rt.addFrameNode).mock.calls[0]).toEqual([{ x: 9, y: 9 }])
+   })
+-  it('add-ai-slot-node (position only) → addAiSlotNode(position)', () => {
+-    const rt = createMockRuntime()
+-    applyCanvasCommand({ kind: 'add-ai-slot-node', position: { x: 3, y: 4 } }, rt)
+-    expect(vi.mocked(rt.addAiSlotNode).mock.calls[0]).toEqual([{ x: 3, y: 4 }])
+-  })
+-  it('add-annotation-node → addAnnotationNode(sourceNodeId, position, instruction, options)', () => {
+-    const rt = createMockRuntime()
+-    applyCanvasCommand(
+-      {
+-        kind: 'add-annotation-node',
+-        sourceNodeId: 'img-1',
+-        position: { x: 50, y: 50 },
+-        instruction: 'rm bg',
+-        options: { operation: 'remove-background', title: 'Edit for image' },
+-      },
+-      rt,
+-    )
+-    expect(vi.mocked(rt.addAnnotationNode)).toHaveBeenCalledWith(
+-      'img-1',
+-      { x: 50, y: 50 },
+-      'rm bg',
+-      { operation: 'remove-background', title: 'Edit for image' },
+-    )
+-  })
+-  it('add-annotation-node (source only) → addAnnotationNode(sourceNodeId)', () => {
+-    const rt = createMockRuntime()
+-    applyCanvasCommand({ kind: 'add-annotation-node', sourceNodeId: 'img-1' }, rt)
+-    expect(vi.mocked(rt.addAnnotationNode).mock.calls[0]).toEqual(['img-1'])
+-  })
+   it('add-markup-node → addMarkupNode(kind, position, geometry, options)', () => {
+     const rt = createMockRuntime()
+     const options = {
+@@ -303,13 +257,6 @@ describe('applyCanvasCommand — return value contract', () => {
+     )
+     expect(id).toBe('custom-id')
+   })
+-  it('add-annotation-node returns undefined when runtime returns undefined', () => {
+-    const rt = createMockRuntime()
+-    vi.mocked(rt.addAnnotationNode).mockReturnValue(undefined)
+-    const id = applyCanvasCommand({ kind: 'add-annotation-node' }, rt)
+-    expect(vi.mocked(rt.addAnnotationNode).mock.calls[0]).toEqual([])
+-    expect(id).toBeUndefined()
+-  })
+   it('non-creation commands return undefined', () => {
+     const rt = createMockRuntime()
+     const id = applyCanvasCommand({ kind: 'delete-node', nodeId: 'a' }, rt)
+@@ -458,8 +405,6 @@ function buildDeferredCommand(kind: string): CanvasCommandForTest {
+       return { kind } as CanvasCommandForTest
+     case 'generate-into-ai-slot':
+       return { kind } as CanvasCommandForTest
+-    case 'generate-from-annotation':
+-      return { kind } as CanvasCommandForTest
+     case 'mask-edit':
+       return {
+         kind,
+diff --git a/src/canvas/actions/canvasCommandExecutor.ts b/src/canvas/actions/canvasCommandExecutor.ts
+index aa1a41f8..2248b300 100644
+--- a/src/canvas/actions/canvasCommandExecutor.ts
++++ b/src/canvas/actions/canvasCommandExecutor.ts
+@@ -11,7 +11,7 @@
+ // This module implements apply for the **sync document-mutation** commands (PR1)
+ // AND the **two-stage-asset** commands (PR2 — this slice). The sync commands
+ // drive a synchronous runtime call returning void or a created node id. The
+-// two-stage-asset commands (import-asset, 5 generation kinds, mask-edit) need a
++// two-stage-asset commands (import-asset, 4 generation kinds, mask-edit) need a
+ // CanvasCommandAssetBridge to resolve `referenceAssetIds` / `assetId` /
+ // `maskAssetId` / `markedImageAssetId` back to File/Blob via /api/assets (T1.5
+ // #195), then dispatch. With NO bridge the apply is still "not wired for this
+@@ -20,8 +20,7 @@
+ //
+ // RETURN CONTRACT
+ // - Sync node-creation commands return the newly created node id (string),
+-//   mirroring runtime.addTextNode / addFrameNode / addAiSlotNode / addMarkupNode
+-//   (→ string) and addAnnotationNode (→ string | undefined).
++//   mirroring runtime.addTextNode / addFrameNode / addMarkupNode (→ string).
+ // - Sync non-creating commands return undefined.
+ // - Two-stage-asset commands return a Promise: import-asset → Promise<string>
+ //   (new node id), generation → Promise<string[]> (created node ids, mirroring
+@@ -222,8 +221,6 @@ const payloadError = (kind: string, field: string, reason: string) =>
+ const CANVAS_COMMAND_PAYLOAD_SHAPE: Record<CanvasCommandKind, readonly FieldCheck[]> = {
+   'add-text-node': [{ key: 'position', check: 'point' }],
+   'add-frame-node': [{ key: 'position', check: 'point' }],
+-  'add-ai-slot-node': [{ key: 'position', check: 'point' }],
+-  'add-annotation-node': [],
+   'add-markup-node': [
+     { key: 'markupKind', check: 'string' },
+     { key: 'position', check: 'point' },
+@@ -272,7 +269,6 @@ const CANVAS_COMMAND_PAYLOAD_SHAPE: Record<CanvasCommandKind, readonly FieldChec
+   ],
+   'generate-beside-node': [],
+   'generate-into-ai-slot': [],
+-  'generate-from-annotation': [],
+   'mask-edit': [
+     { key: 'sourceNodeId', check: 'string' },
+     { key: 'prompt', check: 'string' },
+@@ -365,21 +361,6 @@ export const applyCanvasCommand = (
+         command.size,
+         command.title,
+       )
+-    case 'add-ai-slot-node':
+-      return invokeRuntimeWithTrimmedTrailingUndefineds(
+-        runtime.addAiSlotNode,
+-        command.position,
+-        command.size,
+-        command.prompt,
+-      )
+-    case 'add-annotation-node':
+-      return invokeRuntimeWithTrimmedTrailingUndefineds(
+-        runtime.addAnnotationNode,
+-        command.sourceNodeId,
+-        command.position,
+-        command.instruction,
+-        command.options,
+-      )
+     case 'add-markup-node':
+       return runtime.addMarkupNode(
+         command.markupKind,
+@@ -472,7 +453,7 @@ export const applyCanvasCommand = (
+       return undefined
+ 
+     // ── Two-stage asset apply (PR2) ─────────────────────────────────────────────
+-    // These seven kinds need a CanvasCommandAssetBridge to resolve assetIds →
++    // These six kinds need a CanvasCommandAssetBridge to resolve assetIds →
+     // File/Blob via /api/assets (T1.5). With no bridge the apply is still "not
+     // wired for this caller" → CanvasCommandDeferredError (the PR1 boundary +
+     // tests stay green). With a bridge each kind dispatches to an async helper
+@@ -494,9 +475,6 @@ export const applyCanvasCommand = (
+     case 'generate-into-ai-slot':
+       if (!bridge) throw new CanvasCommandDeferredError(command.kind, DEFERRED_REASON)
+       return applyGenerateIntoAiSlot(command, runtime, bridge)
+-    case 'generate-from-annotation':
+-      if (!bridge) throw new CanvasCommandDeferredError(command.kind, DEFERRED_REASON)
+-      return applyGenerateFromAnnotation(command, runtime, bridge)
+     case 'mask-edit':
+       if (!bridge) throw new CanvasCommandDeferredError(command.kind, DEFERRED_REASON)
+       return applyMaskEdit(command, bridge)
+@@ -626,15 +604,6 @@ const applyGenerateIntoAiSlot = async (
+   return runtime.generateIntoAiSlot(command.slotId, command.prompt, options)
+ }
+ 
+-const applyGenerateFromAnnotation = async (
+-  command: Extract<CanvasCommand, { kind: 'generate-from-annotation' }>,
+-  runtime: CanvasActionRuntime,
+-  bridge: CanvasCommandAssetBridge,
+-): Promise<string[]> => {
+-  const options = await mapGenerationOptions(command.options, bridge)
+-  return runtime.generateFromAnnotation(command.annotationNodeId, options)
+-}
+-
+ /**
+  * Assemble the ImageMaskSubmitPayload from the serializable mask-edit command:
+  * resolve maskAssetId → mask Blob (if present) and markedImageAssetId →
+diff --git a/src/canvas/actions/canvasCommandExecutorTestFactories.ts b/src/canvas/actions/canvasCommandExecutorTestFactories.ts
+index 0180868b..46bf7883 100644
+--- a/src/canvas/actions/canvasCommandExecutorTestFactories.ts
++++ b/src/canvas/actions/canvasCommandExecutorTestFactories.ts
+@@ -21,7 +21,6 @@ export const createMockRuntime = (): CanvasActionRuntime => {
+     addTextNode: vi.fn(() => 'text-id'),
+     addFrameNode: vi.fn(() => 'frame-id'),
+     addAiSlotNode: vi.fn(() => 'slot-id'),
+-    addAnnotationNode: vi.fn(() => 'note-id'),
+     addMarkupNode: vi.fn(() => 'markup-id'),
+     updateMarkupStyle: vi.fn(),
+     updateSelectedMarkupStyle: vi.fn(),
+@@ -33,7 +32,6 @@ export const createMockRuntime = (): CanvasActionRuntime => {
+     generateImageEdit: vi.fn(async () => []),
+     generateBesideNode: vi.fn(async () => []),
+     generateIntoAiSlot: vi.fn(async () => []),
+-    generateFromAnnotation: vi.fn(async () => []),
+     duplicateNode: vi.fn(),
+     duplicateSelectedNodes: vi.fn(),
+     groupSelectedNodes: vi.fn(),
+diff --git a/src/canvas/actions/canvasSyncRuntime.ts b/src/canvas/actions/canvasSyncRuntime.ts
+index e8e37a7e..ad113764 100644
+--- a/src/canvas/actions/canvasSyncRuntime.ts
++++ b/src/canvas/actions/canvasSyncRuntime.ts
+@@ -543,7 +543,6 @@ export const wrapCanvasActionRuntimeWithSync = (runtime: CanvasActionRuntime): C
+     addTextNode: wrapMutation(runtime.addTextNode),
+     addFrameNode: wrapMutation(runtime.addFrameNode),
+     addAiSlotNode: wrapMutation(runtime.addAiSlotNode),
+-    addAnnotationNode: wrapMutation(runtime.addAnnotationNode),
+     addMarkupNode: wrapMutation(runtime.addMarkupNode),
+     updateMarkupStyle: wrapMutation(runtime.updateMarkupStyle),
+     updateSelectedMarkupStyle: wrapMutation(runtime.updateSelectedMarkupStyle),
+diff --git a/src/canvas/actions/imageActionGroups.ts b/src/canvas/actions/imageActionGroups.ts
+index 679934f0..0a1b59a0 100644
+--- a/src/canvas/actions/imageActionGroups.ts
++++ b/src/canvas/actions/imageActionGroups.ts
+@@ -1,29 +1,23 @@
+ // imageActionGroups — image-node quick-toolbar / context-menu action builders.
+ // Extracted from canvasActionModel (structure-guard growth budget): everything
+-// image-editing specific lives here — the AI edit workflow list, the flat
+-// 6-button quick bar (2026-07-28 user decision: discoverability over
+-// compactness) and the right-click edit cluster.
++// image-editing specific lives here — the flat 6-button quick bar (2026-07-28
++// user decision: discoverability over compactness) and the right-click edit
++// cluster.
+ 
+ import {
+   Copy,
+   Crop,
+-  Eraser,
+-  Wand2,
+   FlipHorizontal2,
+   FlipVertical2,
+   ImageUp,
+-  Maximize2,
+   RotateCw,
+   Sparkles,
+ } from 'lucide-react'
+ import { t } from '../../i18n'
+-import { MaskPointIcon } from '../MaskPointIcon'
+ import { hasAnyCapability } from './canvasSelectionModel'
+ import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
+ import {
+   primaryNodeId,
+-  beginImageEditPrompt,
+-  generateImageEditForPrimary,
+   cropPrimaryNode,
+   resetPrimaryImageCrop,
+   rotatePrimaryImage,
+@@ -32,75 +26,16 @@ import {
+   copyPrimaryImageAsPng,
+ } from './canvasActionEmitters'
+ 
+-export const imageAiEditActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[] => [
+-  {
+-    id: 'edit-with-prompt',
+-    label: t('menu.image.editWithPrompt'),
+-    icon: Wand2,
+-    onClick: () =>
+-      beginImageEditPrompt(
+-        runtime,
+-        'prompt-edit',
+-        t('menu.image.promptEditPlaceholder'),
+-        t('menu.image.promptEditTitle'),
+-      ),
+-  },
+-  {
+-    id: 'select-area-edit',
+-    label: t('menu.image.selectArea'),
+-    icon: MaskPointIcon,
+-    onClick: () => {
+-      const nodeId = primaryNodeId(runtime)
+-      if (nodeId) runtime.onStartImageMaskEdit?.(nodeId)
+-    },
+-  },
+-  {
+-    id: 'remove-background',
+-    label: t('menu.image.removeBackground'),
+-    icon: Eraser,
+-    onClick: () =>
+-      generateImageEditForPrimary(
+-        runtime,
+-        'remove-background',
+-        'Remove the background and keep the subject as a clean transparent cutout.',
+-      ),
+-  },
+-  {
+-    id: 'expand-image',
+-    label: t('menu.image.expand'),
+-    icon: Maximize2,
+-    onClick: () =>
+-      generateImageEditForPrimary(
+-        runtime,
+-        'outpaint',
+-        'Expand the image beyond its current edges while preserving the original composition.',
+-      ),
+-  },
+-  {
+-    id: 'boost-resolution',
+-    label: t('menu.image.boostResolution'),
+-    text: 'HD',
+-    onClick: () =>
+-      generateImageEditForPrimary(
+-        runtime,
+-        'upscale',
+-        'Increase image resolution and preserve the original visual content.',
+-      ),
+-  },
+-]
+-
++// 需求4(2026-08 拍板):AI 编辑不再展开下拉——点击直接打开局部重绘(区域编辑)
++// 面板,复用 onStartImageMaskEdit 通路(原「框选区域」子项的 handler)。
+ const aiEditMenuAction = (runtime: CanvasActionRuntime): CanvasActionItem => ({
+   id: 'ai-edit-menu',
+   label: t('menu.image.aiEdit'),
+   icon: Sparkles,
+-  children: imageAiEditActionsFor(runtime),
+-  onClick: () =>
+-    beginImageEditPrompt(
+-      runtime,
+-      'prompt-edit',
+-      t('menu.image.promptEditPlaceholder'),
+-      t('menu.image.promptEditTitle'),
+-    ),
++  onClick: () => {
++    const nodeId = primaryNodeId(runtime)
++    if (nodeId) runtime.onStartImageMaskEdit?.(nodeId)
++  },
+ })
+ 
+ export const imageQuickToolbarGroupsFor = (runtime: CanvasActionRuntime): CanvasActionGroup[] => {
+@@ -123,7 +58,8 @@ export const imageQuickToolbarGroupsFor = (runtime: CanvasActionRuntime): Canvas
+ 
+ /** Right-click "edit" cluster for a single image node. */
+ // §2.5a(2026-08-01 拍板):crop/rotate/flip×2/replace 退到 image 快捷条唯一
+-// 入口;右键只留快捷条没有的两项(Reset crop 条件显示、Copy as PNG)。
++// 入口;右键只留快捷条没有的两项(Reset crop 条件显示、Copy as PNG——
++// 2026-08-04 owner 拍板保留,与 #482 保留清单一致)。
+ export const imageContextEditActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[] => [
+   ...(runtime.context.primaryNode?.imageCrop
+     ? [
+diff --git a/src/canvas/actions/useCanvasActionRuntime.ts b/src/canvas/actions/useCanvasActionRuntime.ts
+index 6264a42a..0340226a 100644
+--- a/src/canvas/actions/useCanvasActionRuntime.ts
++++ b/src/canvas/actions/useCanvasActionRuntime.ts
+@@ -72,7 +72,6 @@ export const useCanvasActionRuntime = ({
+   const addTextNode = useCanvasStore((state) => state.addTextNode)
+   const addFrameNode = useCanvasStore((state) => state.addFrameNode)
+   const addAiSlotNode = useCanvasStore((state) => state.addAiSlotNode)
+-  const addAnnotationNode = useCanvasStore((state) => state.addAnnotationNode)
+   const addMarkupNode = useCanvasStore((state) => state.addMarkupNode)
+   const updateMarkupStyle = useCanvasStore((state) => state.updateMarkupStyle)
+   const updateSelectedMarkupStyle = useCanvasStore((state) => state.updateSelectedMarkupStyle)
+@@ -83,7 +82,6 @@ export const useCanvasActionRuntime = ({
+   const generateBesideNode = useCanvasStore((state) => state.generateBesideNode)
+   const generateImageEdit = useCanvasStore((state) => state.generateImageEdit)
+   const generateIntoAiSlot = useCanvasStore((state) => state.generateIntoAiSlot)
+-  const generateFromAnnotation = useCanvasStore((state) => state.generateFromAnnotation)
+   const rotateImageNode = useCanvasStore((state) => state.rotateImageNode)
+   const flipImageNode = useCanvasStore((state) => state.flipImageNode)
+   const resetImageCrop = useCanvasStore((state) => state.resetImageCrop)
+@@ -131,7 +129,6 @@ export const useCanvasActionRuntime = ({
+     addTextNode,
+     addFrameNode,
+     addAiSlotNode,
+-    addAnnotationNode,
+     addMarkupNode,
+     updateMarkupStyle,
+     updateSelectedMarkupStyle,
+@@ -143,7 +140,6 @@ export const useCanvasActionRuntime = ({
+     generateImageEdit,
+     generateBesideNode,
+     generateIntoAiSlot,
+-    generateFromAnnotation,
+     duplicateNode,
+     duplicateSelectedNodes,
+     groupSelectedNodes,
+diff --git a/src/canvas/useMaskEditOverlay.ts b/src/canvas/useMaskEditOverlay.ts
+index 35a8f701..523260cc 100644
+--- a/src/canvas/useMaskEditOverlay.ts
++++ b/src/canvas/useMaskEditOverlay.ts
+@@ -54,7 +54,7 @@ export function useMaskEditOverlay(
+   // Leafer 真 bug 修复(FU e2e 甄别):plain-URL 节点(demo-assets / eagle 等,
+   // 非 mivo-asset:)且无 assetSourceDimensions 时,metrics 链的最后一环是 image
+   // DOM 节点的 <img onLoad> 上报;leafer 模式 image 无 DOM,该环永不发生 →
+-  // overlay 永不挂载(AI Edit → Select area 无响应)。这里补一个 overlay 自己的
++  // overlay 永不挂载(点快捷条「AI 编辑」直开局部重绘无响应)。这里补一个 overlay 自己的
+   // 兜底解码:metrics 未解出时用 Image() 直接量 resolvedMaskAssetUrl,量到即回
+   // 写 metrics cache,双模式等价(dom 模式下 metrics 先到,兜底不触发)。
+   const [probedNaturalSize, setProbedNaturalSize] = useState<{ url: string; dims: NaturalSize } | undefined>()
+diff --git a/src/i18n/locales/en/menu.json b/src/i18n/locales/en/menu.json
+index 7dfb63fb..4b3978cd 100644
+--- a/src/i18n/locales/en/menu.json
++++ b/src/i18n/locales/en/menu.json
+@@ -2,8 +2,7 @@
+   "create": {
+     "pasteHere": "Paste here",
+     "newText": "New text here",
+-    "newSection": "New section here",
+-    "newAiSlot": "New AI image slot here"
++    "newSection": "New section here"
+   },
+   "canvas": {
+     "fitAll": "Fit all objects",
+@@ -103,10 +102,6 @@
+   },
+   "generate": {
+     "intoSlot": "Generate into slot",
+-    "fromNote": "Generate from note",
+-    "beside": "Generate beside",
+-    "addEditNote": "Add edit note",
+-    "variations": "Make variations",
+     "generate": "Generate",
+     "edit": "Edit"
+   },
+@@ -118,14 +113,7 @@
+     "flipV": "Flip vertical",
+     "replace": "Replace image",
+     "copyAsPng": "Copy as PNG",
+-    "aiEdit": "AI Edit",
+-    "editWithPrompt": "Edit with prompt",
+-    "selectArea": "Select area",
+-    "removeBackground": "Remove background",
+-    "expand": "Expand",
+-    "boostResolution": "Boost resolution",
+-    "promptEditTitle": "Prompt edit",
+-    "promptEditPlaceholder": "Describe the image edit here"
++    "aiEdit": "AI Edit"
+   },
+   "style": {
+     "shape": "Shape",
+diff --git a/src/i18n/locales/ja/menu.json b/src/i18n/locales/ja/menu.json
+index 0f913b9d..b597e7b3 100644
+--- a/src/i18n/locales/ja/menu.json
++++ b/src/i18n/locales/ja/menu.json
+@@ -2,8 +2,7 @@
+   "create": {
+     "pasteHere": "ここに貼り付け",
+     "newText": "ここにテキストを追加",
+-    "newSection": "ここにセクションを追加",
+-    "newAiSlot": "ここにAI画像スロットを追加"
++    "newSection": "ここにセクションを追加"
+   },
+   "canvas": {
+     "fitAll": "すべてのオブジェクトを表示",
+@@ -102,10 +101,6 @@
+   },
+   "generate": {
+     "intoSlot": "スロットに生成",
+-    "fromNote": "メモから生成",
+-    "beside": "横に生成",
+-    "addEditNote": "編集メモを追加",
+-    "variations": "バリエーション生成",
+     "generate": "生成",
+     "edit": "編集"
+   },
+@@ -117,14 +112,7 @@
+     "flipV": "上下反転",
+     "replace": "画像を差し替え",
+     "copyAsPng": "PNGとしてコピー",
+-    "aiEdit": "AI編集",
+-    "editWithPrompt": "プロンプトで編集",
+-    "selectArea": "範囲選択",
+-    "removeBackground": "背景を削除",
+-    "expand": "拡張",
+-    "boostResolution": "解像度を上げる",
+-    "promptEditTitle": "プロンプト編集",
+-    "promptEditPlaceholder": "編集内容をここに入力"
++    "aiEdit": "AI編集"
+   },
+   "style": {
+     "shape": "形状",
+diff --git a/src/i18n/locales/ko/menu.json b/src/i18n/locales/ko/menu.json
+index 71490129..94a51203 100644
+--- a/src/i18n/locales/ko/menu.json
++++ b/src/i18n/locales/ko/menu.json
+@@ -2,8 +2,7 @@
+   "create": {
+     "pasteHere": "여기에 붙여넣기",
+     "newText": "여기에 텍스트 추가",
+-    "newSection": "여기에 섹션 추가",
+-    "newAiSlot": "여기에 AI 이미지 슬롯 추가"
++    "newSection": "여기에 섹션 추가"
+   },
+   "canvas": {
+     "fitAll": "모든 개체 보기",
+@@ -102,10 +101,6 @@
+   },
+   "generate": {
+     "intoSlot": "슬롯에 생성",
+-    "fromNote": "메모로 생성",
+-    "beside": "옆에 생성",
+-    "addEditNote": "수정 메모 추가",
+-    "variations": "변형 생성",
+     "generate": "생성",
+     "edit": "편집"
+   },
+@@ -117,14 +112,7 @@
+     "flipV": "상하 반전",
+     "replace": "이미지 교체",
+     "copyAsPng": "PNG로 복사",
+-    "aiEdit": "AI 편집",
+-    "editWithPrompt": "프롬프트로 편집",
+-    "selectArea": "영역 선택",
+-    "removeBackground": "배경 제거",
+-    "expand": "확장",
+-    "boostResolution": "해상도 높이기",
+-    "promptEditTitle": "프롬프트 편집",
+-    "promptEditPlaceholder": "수정할 내용을 입력하세요"
++    "aiEdit": "AI 편집"
+   },
+   "style": {
+     "shape": "모양",
+diff --git a/src/i18n/locales/zh-CN/menu.json b/src/i18n/locales/zh-CN/menu.json
+index 8111b3f0..81978978 100644
+--- a/src/i18n/locales/zh-CN/menu.json
++++ b/src/i18n/locales/zh-CN/menu.json
+@@ -2,8 +2,7 @@
+   "create": {
+     "pasteHere": "粘贴到此处",
+     "newText": "在此新建文本",
+-    "newSection": "在此新建分区",
+-    "newAiSlot": "在此新建 AI 图片占位"
++    "newSection": "在此新建分区"
+   },
+   "canvas": {
+     "fitAll": "适应全部对象",
+@@ -102,10 +101,6 @@
+   },
+   "generate": {
+     "intoSlot": "生成到占位",
+-    "fromNote": "按便签生成",
+-    "beside": "在旁生成",
+-    "addEditNote": "添加修改批注",
+-    "variations": "生成变体",
+     "generate": "生成",
+     "edit": "编辑"
+   },
+@@ -117,14 +112,7 @@
+     "flipV": "垂直翻转",
+     "replace": "替换图片",
+     "copyAsPng": "复制为 PNG",
+-    "aiEdit": "AI 编辑",
+-    "editWithPrompt": "按提示词修改",
+-    "selectArea": "框选区域",
+-    "removeBackground": "移除背景",
+-    "expand": "扩展",
+-    "boostResolution": "提升分辨率",
+-    "promptEditTitle": "提示词修改",
+-    "promptEditPlaceholder": "在这里描述要修改的内容"
++    "aiEdit": "AI 编辑"
+   },
+   "style": {
+     "shape": "形状",
+diff --git a/src/model/aiCanvasCommands.test.ts b/src/model/aiCanvasCommands.test.ts
+deleted file mode 100644
+index f7ae31aa..00000000
+--- a/src/model/aiCanvasCommands.test.ts
++++ /dev/null
+@@ -1,88 +0,0 @@
+-import { describe, expect, it } from 'vitest'
+-import type { MivoCanvasNode } from '../types/mivoCanvas'
+-import { createAiResultNode } from './aiCanvasCommands'
+-
+-const sourceNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+-  id: 'source-1',
+-  type: 'image',
+-  title: 'Source',
+-  x: 10,
+-  y: 20,
+-  width: 300,
+-  height: 200,
+-  status: 'ready',
+-  assetUrl: '/source.png',
+-  ...overrides,
+-})
+-
+-describe('aiCanvasCommands', () => {
+-  it('creates a normalized beside-generation result node', () => {
+-    const node = createAiResultNode({
+-      id: 'result-1',
+-      title: 'AI result from Source',
+-      sourceNodes: [sourceNode()],
+-      anchorNode: sourceNode(),
+-      operation: 'beside-generation',
+-      prompt: 'make it brighter',
+-      placement: 'right',
+-      position: { x: 360, y: 20 },
+-      size: { width: 300, height: 200 },
+-      assetUrl: '/result.png',
+-      createdAt: 12345,
+-      taskId: 'task-result-1',
+-      model: 'Mivo Mock Image Workflow',
+-      strength: 0.58,
+-    })
+-
+-    expect(node).toMatchObject({
+-      id: 'result-1',
+-      type: 'image',
+-      title: 'AI result from Source',
+-      x: 360,
+-      y: 20,
+-      width: 300,
+-      height: 200,
+-      assetUrl: '/result.png',
+-      parentIds: ['source-1'],
+-    })
+-    expect(node.transform).toEqual({ x: 360, y: 20, width: 300, height: 200, rotation: 0 })
+-    expect(node.asset).toEqual({ url: '/result.png' })
+-    expect(node.relations?.parentIds).toEqual(['source-1'])
+-    expect(node.aiWorkflow).toMatchObject({
+-      kind: 'result',
+-      status: 'ready',
+-      operation: 'beside-generation',
+-      prompt: 'make it brighter',
+-      sourceNodeIds: ['source-1'],
+-      anchorNodeId: 'source-1',
+-      placement: 'right',
+-      createdAt: 12345,
+-    })
+-    expect(node.relations?.aiWorkflow).toEqual(node.aiWorkflow)
+-  })
+-
+-  it('records slot and annotation relation fields when provided', () => {
+-    const node = createAiResultNode({
+-      id: 'result-2',
+-      title: 'Edited result',
+-      sourceNodes: [sourceNode()],
+-      anchorNode: sourceNode({ id: 'annotation-1', type: 'annotation' }),
+-      annotationNode: sourceNode({ id: 'annotation-1', type: 'annotation' }),
+-      slotNode: sourceNode({ id: 'slot-1', type: 'ai-slot' }),
+-      operation: 'annotation-edit',
+-      prompt: 'fix hand',
+-      placement: 'slot',
+-      position: { x: 0, y: 0 },
+-      size: { width: 100, height: 120 },
+-      assetUrl: '/edited.png',
+-      createdAt: 1,
+-      taskId: 'task-result-2',
+-    })
+-
+-    expect(node.parentIds).toEqual(['source-1', 'annotation-1', 'slot-1'])
+-    expect(node.aiWorkflow?.sourceNodeIds).toEqual(['source-1'])
+-    expect(node.aiWorkflow?.annotationNodeId).toBe('annotation-1')
+-    expect(node.aiWorkflow?.slotId).toBe('slot-1')
+-    expect(node.relations?.parentIds).toEqual(['source-1', 'annotation-1', 'slot-1'])
+-  })
+-})
+diff --git a/src/model/aiCanvasCommands.ts b/src/model/aiCanvasCommands.ts
+deleted file mode 100644
+index 6d972554..00000000
+--- a/src/model/aiCanvasCommands.ts
++++ /dev/null
+@@ -1,93 +0,0 @@
+-import type {
+-  AiWorkflowOperation,
+-  AiWorkflowPlacement,
+-  MivoCanvasNode,
+-} from '../types/mivoCanvas'
+-import { normalizeCanvasNodeV2, setNodeAsset, setNodeRelations } from './documentModelV2'
+-
+-export type CreateAiResultNodeInput = {
+-  id: string
+-  title: string
+-  sourceNodes: MivoCanvasNode[]
+-  anchorNode: MivoCanvasNode
+-  annotationNode?: MivoCanvasNode
+-  slotNode?: MivoCanvasNode
+-  operation: AiWorkflowOperation
+-  prompt: string
+-  placement: AiWorkflowPlacement
+-  position: { x: number; y: number }
+-  size: { width: number; height: number }
+-  assetUrl: string
+-  createdAt: number
+-  taskId: string
+-  model?: string
+-  strength?: number
+-  groupId?: string
+-}
+-
+-const uniqueIds = (nodes: Array<MivoCanvasNode | undefined>) => {
+-  const ids = nodes.map((node) => node?.id).filter((id): id is string => Boolean(id))
+-  return Array.from(new Set(ids))
+-}
+-
+-export const createAiResultNode = ({
+-  id,
+-  title,
+-  sourceNodes,
+-  anchorNode,
+-  annotationNode,
+-  slotNode,
+-  operation,
+-  prompt,
+-  placement,
+-  position,
+-  size,
+-  assetUrl,
+-  createdAt,
+-  taskId,
+-  model = 'Mivo Mock Image Workflow',
+-  strength,
+-  groupId,
+-}: CreateAiResultNodeInput): MivoCanvasNode => {
+-  const sourceNodeIds = uniqueIds(sourceNodes)
+-  const parentIds = uniqueIds([...sourceNodes, annotationNode, slotNode])
+-  const aiWorkflow = {
+-    kind: 'result' as const,
+-    status: 'ready' as const,
+-    operation,
+-    prompt,
+-    sourceNodeIds,
+-    anchorNodeId: anchorNode.id,
+-    annotationNodeId: annotationNode?.id,
+-    slotId: slotNode?.id,
+-    placement,
+-    createdAt,
+-  }
+-  const normalized = normalizeCanvasNodeV2({
+-    id,
+-    type: 'image',
+-    title,
+-    x: Math.round(position.x),
+-    y: Math.round(position.y),
+-    width: Math.round(size.width),
+-    height: Math.round(size.height),
+-    assetUrl,
+-    status: 'ready',
+-    parentIds,
+-    groupId,
+-    generation: {
+-      prompt,
+-      model,
+-      size: `${Math.round(size.width)}x${Math.round(size.height)}`,
+-      seed: createdAt % 99999,
+-      strength,
+-      taskId,
+-    },
+-    aiWorkflow,
+-  })
+-
+-  return setNodeRelations(setNodeAsset(normalized, { url: assetUrl }), {
+-    parentIds,
+-    aiWorkflow,
+-  })
+-}
+diff --git a/src/store/canvasStateTypes.ts b/src/store/canvasStateTypes.ts
+index de0091bc..13bc6165 100644
+--- a/src/store/canvasStateTypes.ts
++++ b/src/store/canvasStateTypes.ts
+@@ -280,12 +280,6 @@ export type CanvasState = {
+     prompt?: string,
+     options?: { sceneId?: CanvasId },
+   ) => string
+-  addAnnotationNode: (
+-    sourceNodeId?: string,
+-    position?: { x: number; y: number },
+-    instruction?: string,
+-    options?: { operation?: AiWorkflowOperation; title?: string },
+-  ) => string | undefined
+   addMarkupNode: (
+     kind: MarkupKind,
+     position: { x: number; y: number },
+@@ -367,7 +361,6 @@ export type CanvasState = {
+     prompt?: string,
+     options?: CanvasGenerationOptions,
+   ) => Promise<string[]>
+-  generateFromAnnotation: (annotationNodeId?: string, options?: CanvasGenerationOptions) => Promise<string[]>
+   commitGenerationResult: (payload: CommitGenerationResultPayload) => Promise<string[]>
+   toggleFavorite: (nodeId: string) => void
+   /** 媒体详情页标签编辑:trim + 去重 + 去空,结果为空数组时收敛为 undefined(不落盘)。 */
+diff --git a/src/store/generation.contract.test.ts b/src/store/generation.contract.test.ts
+index 47240f1a..f23768ee 100644
+--- a/src/store/generation.contract.test.ts
++++ b/src/store/generation.contract.test.ts
+@@ -155,19 +155,6 @@ const aiSlotNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode =>
+   ...overrides,
+ })
+ 
+-const annotationNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+-  id: 'anno-1',
+-  type: 'annotation',
+-  title: 'Annotation',
+-  x: 0,
+-  y: 0,
+-  width: 100,
+-  height: 80,
+-  status: 'ready',
+-  text: 'make it blue',
+-  ...overrides,
+-})
+-
+ const baseState = useCanvasStore.getState()
+ 
+ const seed = (overrides: Record<string, unknown> = {}) =>
+@@ -283,18 +270,6 @@ describe('contract: generation action signatures', () => {
+     expect(nodeIds.every((id) => typeof id === 'string')).toBe(true)
+   })
+ 
+-  it('generateFromAnnotation returns a Promise<string[]>', async () => {
+-    seed({
+-      ...seedCanvas('character-flow', [imageNode({ id: 'n1' }), annotationNode({ id: 'anno-1', parentIds: ['n1'] })]),
+-      selectedNodeId: 'anno-1',
+-      selectedNodeIds: ['anno-1'],
+-    })
+-    const result = useCanvasStore.getState().generateFromAnnotation('anno-1')
+-    expect(result).toBeInstanceOf(Promise)
+-    const nodeIds = await result
+-    expect(Array.isArray(nodeIds)).toBe(true)
+-    expect(nodeIds.every((id) => typeof id === 'string')).toBe(true)
+-  })
+ })
+ 
+ describe('contract: generateImageEdit orchestration (mock network)', () => {
+@@ -667,19 +642,6 @@ describe('contract: variations / annotation (P2-C2 de-mocked → async tasks API
+     expect(s.tasks[0].nodeIds).toEqual(nodeIds)
+   })
+ 
+-  it('generateFromAnnotation resolves with a result node + edit edge + done task', async () => {
+-    seed({
+-      ...seedCanvas('character-flow', [imageNode({ id: 'n1' }), annotationNode({ id: 'anno-1', parentIds: ['n1'] })]),
+-      selectedNodeId: 'anno-1',
+-      selectedNodeIds: ['anno-1'],
+-    })
+-    const nodeIds = await useCanvasStore.getState().generateFromAnnotation('anno-1')
+-    expect(nodeIds).toHaveLength(1)
+-    const s = useCanvasStore.getState()
+-    expect(s.edges.some((e) => e.type === 'edit')).toBe(true)
+-    expect(s.tasks[0].status).toBe('done')
+-  })
+-
+   it('generateVariations rejects when there is no source image', async () => {
+     seed(seedCanvas('character-flow', []))
+     await expect(useCanvasStore.getState().generateVariations()).rejects.toThrow(/没有可用的源图/)
+diff --git a/src/store/generationFacade.ts b/src/store/generationFacade.ts
+index afb0306f..0c9c7266 100644
+--- a/src/store/generationFacade.ts
++++ b/src/store/generationFacade.ts
+@@ -1,4 +1,4 @@
+-// generationFacade — stable entry for the 5 generation actions (SC3.1).
++// generationFacade — stable entry for the 4 generation actions (SC3.1).
+ //
+ // chatStore imports THIS, not useCanvasStore.getState(), so the chat layer is
+ // decoupled from the canvas store's internal slice composition (A2 may re-split
+@@ -29,7 +29,7 @@ type ChatSlotPrep =
+ const freshlyCreatedChatSlots = new Set<string>()
+ 
+ export const generationFacade = {
+-  // ─── the 5 generation actions (stable signatures; delegate to the live store) ───
++  // ─── the 4 generation actions (stable signatures; delegate to the live store) ───
+   generateImageEdit: (...args: Parameters<CanvasState['generateImageEdit']>) =>
+     useCanvasStore.getState().generateImageEdit(...args),
+   generateBesideNode: (...args: Parameters<CanvasState['generateBesideNode']>) =>
+@@ -53,8 +53,6 @@ export const generationFacade = {
+   },
+   generateVariations: (...args: Parameters<CanvasState['generateVariations']>) =>
+     useCanvasStore.getState().generateVariations(...args),
+-  generateFromAnnotation: (...args: Parameters<CanvasState['generateFromAnnotation']>) =>
+-    useCanvasStore.getState().generateFromAnnotation(...args),
+ 
+   // ─── chat-specific flow: decide beside vs slot + create/reuse the slot ───
+   // Sync: the slot is created BEFORE the async generate, so on failure chatStore
+diff --git a/src/store/generationSlice.ts b/src/store/generationSlice.ts
+index afa38890..cb21444f 100644
+--- a/src/store/generationSlice.ts
++++ b/src/store/generationSlice.ts
+@@ -7,7 +7,7 @@ import type {
+   MivoCanvasSnapshot,
+ } from '../types/mivoCanvas'
+ import type { SliceCreator } from './canvasStateTypes'
+-import type { VariationParam, NormalizedMaskBounds } from '../types/generation'
++import type { VariationParam } from '../types/generation'
+ import { MivoImageRequestError, assetBlobForNode } from '../lib/mivoImageClient'
+ import { getImageGenerationPort } from '../lib/imageGenerationPort'
+ import { getSceneWrap } from '../lib/sceneWrapRegistry'
+@@ -102,23 +102,6 @@ const createFailedVariationSlot = (
+   return { node, edge }
+ }
+ 
+-// P2-C2: normalize an annotation node's canvas-coordinate annotationBounds to the
+-// source image's relative 0-1 maskBounds (BFF synthesizes the area mask PNG from
+-// this). Returns undefined when the annotation has no bounds (whole-image edit).
+-const normalizeAnnotationBounds = (
+-  source: MivoCanvasNode,
+-  annotation: MivoCanvasNode,
+-): NormalizedMaskBounds | undefined => {
+-  const bounds = annotation.annotationBounds
+-  if (!bounds || source.width <= 0 || source.height <= 0) return undefined
+-  return {
+-    x: (bounds.x - source.x) / source.width,
+-    y: (bounds.y - source.y) / source.height,
+-    width: bounds.width / source.width,
+-    height: bounds.height / source.height,
+-  }
+-}
+-
+ // P2-C1b: one-time idempotency key per generation call. Retries (new action
+ // invocation) get a new key → new server task. Same-call re-submission (e.g. a
+ // transient POST timeout retried by the client) would reuse the key and dedupe
+@@ -763,125 +746,4 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+       throw error
+     }
+   },
+-  generateFromAnnotation: async (annotationNodeId, options = {}) => {
+-    const targetSceneId = options.sceneId || get().sceneId
+-    const state = get()
+-    const document = state.canvases[targetSceneId]
+-    if (!document) throw new LocalizedKeyError('chat.commit.canvasDeleted')
+-    const annotation =
+-      (annotationNodeId
+-        ? document.nodes.find((node) => node.id === annotationNodeId && node.type === 'annotation' && !node.hidden)
+-        : undefined) ||
+-      document.nodes.find((node) => node.id === document.selectedNodeId && node.type === 'annotation' && !node.hidden)
+-    if (annotationNodeId && !annotation) throw new Error('批注节点已删除，无法继续生成。')
+-    if (!annotation) throw new Error('没有可用的批注，无法生成。')
+-
+-    const sourceId = annotation.aiWorkflow?.sourceNodeIds?.[0] || annotation.parentIds?.[0]
+-    const source = sourceId
+-      ? document.nodes.find((node) => node.id === sourceId && node.type === 'image' && !node.hidden)
+-      : undefined
+-    if (sourceId && !source) throw new LocalizedKeyError('chat.commit.sourceDeleted')
+-    if (!source) throw new Error('批注未关联可用源图，无法生成。')
+-
+-    const resultPrompt = annotation.text?.trim() || nodePrompt(annotation, '根据批注生成修订版图片')
+-    const model = source.generation?.model || defaultMivoImageModel
+-    const taskId = createNodeId('task-annotation-edit')
+-    const runningTask: CanvasTask = {
+-      id: taskId,
+-      label: `批注修图：${source.title}`,
+-      status: 'running',
+-      progress: 0,
+-      nodeIds: [],
+-    }
+-
+-    set((current) => {
+-      const doc = current.canvases[targetSceneId]
+-      if (!doc) return {}
+-      return patchCanvasDocument(current, targetSceneId, { tasks: upsertTask(doc.tasks, runningTask) })
+-    })
+-
+-    // Normalize the annotation's canvas-coordinate bounds to the source image's
+-    // relative 0-1 maskBounds; the BFF synthesizes the area mask PNG from this.
+-    // No bounds ⇒ whole-image prompt-edit (no mask).
+-    const maskBounds = normalizeAnnotationBounds(source, annotation)
+-
+-    let serverTaskId: string | undefined
+-    try {
+-      if (options.signal?.aborted) throw new MivoImageRequestError('图片请求已取消。', 'canceled')
+-      const image = await assetBlobForNode(source)
+-      // sourceSize must be the image's natural pixel size, not the node's canvas
+-      // display size, so the BFF synthesizes the area mask at matching resolution
+-      // (maskBounds are 0-1 relative, so only resolution changes). Falls back to
+-      // the node display size if the blob cannot be decoded.
+-      let sourceNaturalSize = { width: source.width, height: source.height }
+-      try {
+-        const bitmap = await createImageBitmap(image)
+-        sourceNaturalSize = { width: bitmap.width, height: bitmap.height }
+-        bitmap.close?.()
+-      } catch {
+-        // keep node display size fallback
+-      }
+-      serverTaskId = await getImageGenerationPort().submitEditTask({
+-        image,
+-        prompt: resultPrompt,
+-        maskBounds,
+-        sourceSize: maskBounds ? sourceNaturalSize : undefined,
+-        imgRatio: options.imgRatio,
+-        quality: options.quality,
+-        model,
+-        idempotencyKey: newIdempotencyKey(),
+-        signal: options.signal,
+-        // A5:请求级关联令牌原样下行(嵌入式宿主端口按它取本次上下文;HTTP 客户端忽略)。
+-        agentRequestTag: options.agentRequestTag,
+-      })
+-      const nodeIds = await runTaskPollLoop(set, {
+-        serverTaskId,
+-        signal: options.signal,
+-        localTask: runningTask,
+-        sceneId: targetSceneId,
+-        onResult: async ({ images }) =>
+-          get().commitGenerationResult({
+-            sceneId: targetSceneId,
+-            sourceNodeId: source.id,
+-            resultImages: images,
+-            prompt: resultPrompt,
+-            model,
+-            kind: 'edit',
+-            taskId,
+-            maskBounds: annotation.annotationBounds,
+-          }),
+-      })
+-      set((current) => {
+-        const doc = current.canvases[targetSceneId]
+-        if (!doc) return {}
+-        return patchCanvasDocument(current, targetSceneId, {
+-          tasks: upsertTask(doc.tasks, doneTask(runningTask, `批注修图：${source.title}`, nodeIds)),
+-        })
+-      })
+-      logCanvas(`Generated from annotation "${annotation.title}"`)
+-      return nodeIds
+-    } catch (error) {
+-      const canceled = isCanceledGenerationError(error, options.signal)
+-      if (canceled && serverTaskId) {
+-        await getImageGenerationPort().cancelTask(serverTaskId)
+-      }
+-      const message = error instanceof LocalizedKeyError
+-        ? t(error.message, error.params)
+-        : error instanceof Error ? error.message : 'Annotation edit failed'
+-      set((current) => {
+-        const doc = current.canvases[targetSceneId]
+-        if (!doc) return {}
+-        const liveTask = doc.tasks.find((t) => t.id === runningTask.id) ?? runningTask
+-        return patchCanvasDocument(current, targetSceneId, {
+-          tasks: upsertTask(
+-            doc.tasks,
+-            canceled
+-              ? canceledTask(liveTask, `批注修图已取消：${source.title}`)
+-              : failedTask(liveTask, `批注修图失败：${message}`),
+-          ),
+-        })
+-      })
+-      throw error
+-    }
+-  },
+ })
+diff --git a/src/store/nodeCreationSlice.ts b/src/store/nodeCreationSlice.ts
+index 7d9be67c..769402d6 100644
+--- a/src/store/nodeCreationSlice.ts
++++ b/src/store/nodeCreationSlice.ts
+@@ -262,68 +262,6 @@ export const createNodeCreationSlice: SliceCreator = (set, get) => ({
+     logCanvas(`Created AI slot ${id}`)
+     return id
+   },
+-  addAnnotationNode: (sourceNodeId, position, instruction, options) => {
+-    const id = createNodeId('annotation')
+-    const defaultSize = defaultSizeForNodeType('annotation')
+-    const createdAt = Date.now()
+-    let created = false
+-
+-    set((state) => {
+-      const source =
+-        state.nodes.find((node) => node.id === sourceNodeId && !node.hidden) ||
+-        state.nodes.find((node) => node.id === state.selectedNodeId && !node.hidden)
+-      if (!source) {
+-        warnCanvas('Annotation creation skipped: no source node selected')
+-        return {}
+-      }
+-
+-      const note = instruction?.trim() || 'Describe the image edit here'
+-      const x = Math.round(position?.x ?? source.x + 28)
+-      const y = Math.round(position?.y ?? source.y - 132)
+-      const annotation = makeNode({
+-        id,
+-        type: 'annotation',
+-        title: options?.title || `Edit note for ${source.title}`,
+-        text: note,
+-        fontSize: 18,
+-        textColor: '#4f4548',
+-        fontWeight: 700,
+-        textAlign: 'left',
+-        textAutoWidth: false,
+-        x,
+-        y,
+-        width: defaultSize.width,
+-        height: defaultSize.height,
+-        status: 'ready',
+-        parentIds: [source.id],
+-        generation: {
+-          prompt: note,
+-          model: 'Annotation brief',
+-          size: 'canvas-note',
+-          seed: createdAt % 99999,
+-        },
+-        aiWorkflow: {
+-          kind: 'annotation',
+-          status: 'ready',
+-          operation: options?.operation || 'annotation-edit',
+-          prompt: note,
+-          sourceNodeIds: [source.id],
+-          anchorNodeId: source.id,
+-          createdAt,
+-        },
+-      })
+-      created = true
+-
+-      return patchWithHistory(state, {
+-        selectedNodeId: id,
+-        selectedNodeIds: [id],
+-        nodes: normalizeCanvasNodes([...state.nodes, annotation]),
+-      })
+-    })
+-
+-    if (created) logCanvas(`Created annotation ${id}`)
+-    return created ? id : undefined
+-  },
+   addMarkupNode: (kind, position, geometry, options) => {
+     const id = createNodeId('markup')
+     const defaultSize = defaultSizeForNodeType('markup')

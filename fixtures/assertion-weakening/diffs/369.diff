@@ -1,0 +1,659 @@
+diff --git a/scripts/e2e/scenarios/mask-point.mjs b/scripts/e2e/scenarios/mask-point.mjs
+index 542ae182..667a19a7 100644
+--- a/scripts/e2e/scenarios/mask-point.mjs
++++ b/scripts/e2e/scenarios/mask-point.mjs
+@@ -1,32 +1,39 @@
+ // scripts/e2e/scenarios/mask-point.mjs
+-// rev4 变更 6：局部重绘只留点选（圆形区）。本场景验证点选工具的 UI 与交互（无生成）：
+-//  SC6.1 工具条只有"点选"，无框选/涂抹；默认 tool=point
+-//  SC6.2 点一下 → 生成圆形 region，不被拦截、无"请框选或涂抹"提示、提交按钮可用
+-//  SC6.6 多次点选叠加多个圆形区；undo/redo/clear 正常
++// #381 重写(2026-08-01):#369(批次D region-edit)废除了老「局部重绘 armed 按钮」
++// (点一下武装、再点图片下针)整条交互 —— 工具坞按钮改为无选中图片即 disabled、
++// 点击直接开 region-edit(RegionEditOverlay)。本场景按新契约钉工具坞入口 + 点选工具:
++//  P2   无选中图片(空画布 / 有图未选中)→ dock 按钮 disabled,tooltip 给出提示
++//  P3   选中图片 → dock 按钮 enabled → click → region-edit 直接打开;全程无 .mask-armed
++//  SC6.1 工具条精确三工具(点选/矩形/圈选,2026-07-31 用户定序,椭圆已下线);默认 tool=点选
++//  SC6.2 点选点一下 → 1 个圆形区(brush 单点),可见反馈(point-dot),无"请框选或涂抹",提交可用
++//  SC6.6 多次点选叠加;undo/redo/clear 正常
+ //
+-// SC6.3（点选提交→占位符→成功替换/失败消失）由 mask-reflow.mjs 的 SC4.x（成功）+
+-// SC5.3（失败）以点选驱动覆盖，此处不再重复生成。
+-
+-import { clickCanvasNode, nodeScreenRect } from '../renderer-evidence.mjs'
+-
+-// #154 四工具(toolItems,ImageMaskEditOverlay.tsx:93-98),顺序对齐 UI 渲染顺序。
+-// SC6.1 两处精确集合断言共用:矩形/圈选被删或改名必须红(只查 length+includes 会漏报)。
+-const EXPECTED_MASK_TOOLS = ['椭圆', '矩形', '圈选', '点选']
+-
+-const regionCounts = async (page) =>
+-  page.evaluate(() => {
+-    const overlay = document.querySelector('.image-mask-edit-overlay')
+-    return {
+-      region: Number(overlay?.getAttribute('data-region-count') || '0'),
+-      mask: Number(overlay?.getAttribute('data-mask-region-count') || '0'),
+-      point: Number(overlay?.getAttribute('data-point-anchor-count') || '0'),
+-    }
+-  })
++// 老场景中随 armed 交互一并废除、不再迁移的段(留痕,防"覆盖凭空消失"误判):
++//  - GREPTILE-P2(D4 disarm)/FIX-3(armed dblclick)——armed 状态已不存在,断言对象消失;
++//  - FIX-2(删目标图清草稿)——草稿仓已换 regionEditDraft(只有提交成功才清,取消/误关
++//    都保留,2026-08-01 契约),老"删除即清空"断言与新契约相悖;
++//  - SC-09(提交前 Esc 关浮层/提交后 Esc 不 cancel)——region-edit 的 Esc 是分级语义
++//    (先关下拉/取消选中,输入框有稿时只 blur),"Esc 必关浮层"前提不再成立;提交链路
++//    (占位/成功/失败)由 mask.mjs(mask-chat-card 主场景)与 mask-reflow SC4.x/SC5.3 覆盖。
++//  SC6.3(点选提交→占位→替换/消失)持续由 mask-reflow 以点选驱动覆盖,此处不重复生成。
++
++import { clickCanvasNode } from '../renderer-evidence.mjs'
++
++// 工具族单一来源 src/canvas/regionEditTools.ts regionEditToolItems(2026-07-31 用户定序:
++// 点选第一、矩形第二、圈选第三;椭圆与矩形语义重叠已下线)。#386(i18n Wave 3+4)把 label
++// 迁成 i18n key,可访问名取 en 基准(src/i18n/locales/en/menu.json menu.maskEdit.*):
++// point='Point select' / box='Rectangle' / loop='Lasso'。顺序断言:改序/删除/改名必红。
++const EXPECTED_REGION_TOOLS = ['Point select', 'Rectangle', 'Lasso']
++
++// region-edit 只暴露 data-region-count(RegionEditOverlay 根元素);老 overlay 的
++// data-mask-region-count / data-point-anchor-count 已随 ImageMaskEditOverlay 下线。
++const regionCount = async (page) =>
++  page.evaluate(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0'))
+ 
+ // Each point click commits a region on pointerdown. Move to the target then down/up.
+ const clickStage = async (page, fx, fy) => {
+   const stage = await page.locator('.image-mask-edit-stage').boundingBox()
+-  if (!stage) throw new Error('Mask edit stage should be visible')
++  if (!stage) throw new Error('Region edit stage should be visible')
+   await page.mouse.move(stage.x + stage.width * fx, stage.y + stage.height * fy)
+   await page.mouse.down()
+   await page.mouse.up()
+@@ -36,12 +43,12 @@ const clickStage = async (page, fx, fy) => {
+ // canvas occasionally drop a pointerdown, so retry ONLY while the region count is
+ // unchanged (a landed click increments by exactly 1 — never double-adds on retry).
+ const addPointRegion = async (page, fx, fy, { attempts = 6 } = {}) => {
+-  const before = (await regionCounts(page)).region
++  const before = await regionCount(page)
+   for (let attempt = 0; attempt < attempts; attempt += 1) {
+     await clickStage(page, fx, fy)
+     const deadline = Date.now() + 700
+     while (Date.now() < deadline) {
+-      const now = (await regionCounts(page)).region
++      const now = await regionCount(page)
+       if (now === before + 1) return before + 1
+       if (now > before + 1) throw new Error(`click added more than one region (${before} → ${now})`)
+       await new Promise((r) => setTimeout(r, 50))
+@@ -53,96 +60,55 @@ const addPointRegion = async (page, fx, fy, { attempts = 6 } = {}) => {
+ const waitForRegionCount = async (page, expected, { timeout = 5000 } = {}) => {
+   const deadline = Date.now() + timeout
+   while (Date.now() < deadline) {
+-    if ((await regionCounts(page)).region === expected) return
++    if ((await regionCount(page)) === expected) return
+     await new Promise((r) => setTimeout(r, 50))
+   }
+-  const last = await regionCounts(page)
+-  throw new Error(`Timed out waiting for region-count=${expected}, last=${JSON.stringify(last)}`)
++  throw new Error(`Timed out waiting for region-count=${expected}, last=${await regionCount(page)}`)
+ }
+ 
+ const cancelMaskEdit = async (page) => {
+-  // Cancel(X)按钮在 .image-mask-edit-close(工具条右上),不在 .image-mask-edit-history
+-  // (history 行是 undo/redo/clear)。选择器对齐当前 UI 结构(overlay 重构后 Cancel 移至 close)。
+   await page.locator('.image-mask-edit-close').click()
+   await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' }).catch(() => {})
+ }
+ 
+-const clearCanvasSelection = async (page, moduleSpec) => {
+-  await page.evaluate(async (spec) => {
+-    const { useCanvasStore } = await import(spec)
+-    useCanvasStore.getState().selectNode(undefined)
+-  }, moduleSpec)
+-}
+-
+-// contentEditable 富文本编辑器输入(对齐 mask.mjs fillMaskPrompt):prompt 输入区自
+-// 局部重绘由 region-edit 接管(2026-08-01):编辑器是 contentEditable .region-edit-input(富文本@芯片),旧的
+-// '.image-mask-edit-prompt textarea' 选择器失效。内联避免改共享文件。
++// contentEditable 富文本编辑器输入(对齐 mask.mjs fillMaskPrompt):prompt 编辑器是
++// contentEditable .region-edit-input(富文本@芯片)。
+ const fillMaskPrompt = async (page, text) => {
+   const editor = page.locator('.image-mask-edit-prompt .region-edit-input')
+   await editor.click()
+   await page.evaluate((t) => { document.execCommand('insertText', false, t) }, text)
+ }
+ 
+-// #154 锚点草稿:浮层关闭(X)记住锚点,同图重进恢复 → 多段 region 累积。
+-// 受影响段(FIX-3 dblclick 用同 imageId)开浮层前清 draft,使 region=0(钉 #154"不落 point")。
+-// clearMaskEditDraft 经 /src/canvas/maskEditDraftStore.ts 动态 import,仅 dev 有 Vite /src/,
+-// prod 必 404 → TypeError。prod skip(独立 scenario 进程=fresh context;FIX-3 region=0 断言同步
+-// skip,见下方 isProdTopology 守卫;armed/disarm 断言两拓扑照常跑)。
+-const clearMaskDraft = async (page, nodeId, isProdTopology) => {
+-  if (isProdTopology) {
+-    console.log('[mask-point] prod: clearMaskDraft skipped (dev-only /src/canvas/maskEditDraftStore.ts import — not in prod bridge)')
+-    return
+-  }
+-  await page.evaluate(async (id) => {
+-    const { clearMaskEditDraft } = await import('/src/canvas/maskEditDraftStore.ts')
+-    clearMaskEditDraft(id)
+-  }, nodeId)
+-}
+-
+ export const runMaskPointScenario = async (context) => {
+-  // ── 显式 SKIP(2026-08-01,非静默,重写债挂 Issue)────────────────────────────
+-  // #369(批次D region-edit)把本场景测的交互整条下线:老「局部重绘 armed 按钮」
+-  // (空画布可点出 warning、armed 后点图下针)废除,工具坞按钮改为无选中图片即
+-  // disabled、点击直接开 region-edit。#369 的 e2e 迁移(d19d743/6142a86)覆盖了
+-  // mask/mask-reflow/mask-multi-edit 与本场景的 prompt 选择器,但 P2/P3 armed
+-  // 契约段漏迁 → nightly 必红(先 #367 i18n 改名暴露,#380 修完暴露本层)。
+-  // 按 region-edit 新契约重写需要产品语义拍板(四工具/点选是否保留),归 #369
+-  // 作者 —— 重写完成后删除本 SKIP 块整段恢复执行。追踪 Issue:#381。
+-  console.log('[e2e-smoke] SKIP scenario=mask-point reason=region-edit(#369) 废除 armed 交互,场景待按新契约重写(Issue #381)')
+-  return
+-
+-  const { page, canvasStoreSpec, generatedImageB64, rendererMode, isProdTopology } = context
+-  const leaferMode = rendererMode === 'leafer'
++  const { page, canvasStoreSpec, rendererMode } = context
+   const spec = await canvasStoreSpec()
+ 
+-  // i18n Wave 1(#367)后工具坞按钮默认英文(t('tools.dock.inpaint') → en 'Inpaint');
+-  // 与兄弟场景的 dock 定位口径一致(canvas-interactions 用 'Draw'/'Brush' 等英文名)。
++  // i18n Wave 1(#367)后工具坞按钮英文 aria-label(t('tools.dock.inpaint') → en 'Inpaint');
++  // 与兄弟场景 dock 定位口径一致。面板内提交按钮(「局部重绘」)未迁 i18n,保持中文。
+   const dockMaskButton = page.locator('.canvas-tool-dock').getByRole('button', { name: 'Inpaint' })
+ 
+-  // P2 — no selected image and no image on canvas: dock entry stays enabled, warns, and does not arm.
+-  // createCanvas/selectNode 经 canvasStore bridge(两拓扑都可);clearToasts 走 /src/store/toastStore.ts
+-  // 动态 import,仅 dev 有 Vite /src/,prod 必 404 → TypeError(nightly-e2e 红灯)。prod skip
+-  // clearToasts(独立 scenario 进程 = fresh context,无 stale toast,P2 DOM warning 断言照常跑)。
++  // ── P2 — 无选中图片时 dock 按钮 disabled(新契约:不再是 enabled+warning toast)──
++  // 情形一:空画布(无任何图片)。
+   await page.evaluate(async (moduleSpec) => {
+     const { useCanvasStore } = await import(moduleSpec)
+     useCanvasStore.getState().createCanvas('E2E Mask Point Empty')
+     useCanvasStore.getState().selectNode(undefined)
+   }, spec)
+-  if (isProdTopology) {
+-    console.log('[mask-point] prod: clearToasts skipped (dev-only /src/store/toastStore.ts import — not in prod bridge; fresh context has no stale toasts), P2 DOM warning assertion still runs')
+-  } else {
+-    await page.evaluate(async () => {
+-      const { useToastStore } = await import('/src/store/toastStore.ts')
+-      useToastStore.getState().clearToasts()
+-    })
+-  }
+-  // 批次D(#369)语义:未选中图片时工具坞入口直接 disabled(老的"武装 + 警告 toast"
+-  // 路径整条下线),负例从"点击后警告"改为"按钮不可点"。
+-  if (!(await dockMaskButton.isDisabled())) {
+-    throw new Error('dock region-edit entry should be disabled with no image selected')
+-  }
++  await page.waitForFunction(() => {
++    const buttons = Array.from(document.querySelectorAll('.canvas-tool-dock button'))
++    const target = buttons.find((b) => (b.getAttribute('aria-label') || '') === 'Inpaint')
++    return Boolean(target) && target.disabled
++  })
++  const p2Empty = await dockMaskButton.evaluate((button) => ({
++    disabled: button.disabled,
++    tooltip: button.getAttribute('data-tooltip') || '',
++    armed: Boolean(document.querySelector('.canvas-shell.mask-armed')),
++  }))
++  if (!p2Empty.disabled) throw new Error(`P2: 空画布下 dock 按钮应 disabled, got ${JSON.stringify(p2Empty)}`)
++  if (!p2Empty.tooltip) throw new Error('P2: disabled 态应有 data-tooltip 提示(inpaintHint)')
++  if (p2Empty.armed) throw new Error('P2: 不应存在 .mask-armed(armed 交互已随 #369 下线)')
+ 
+-  // Fresh canvas with one real (loadable) image to open the mask editor onto.
++  // 情形二:画布上有图片但未选中 → 仍 disabled(disabled 依据是"选中的图片节点")。
+   const imageId = await page.evaluate(async (moduleSpec) => {
+     const { useCanvasStore } = await import(moduleSpec)
+     useCanvasStore.getState().createCanvas('E2E Mask Point')
+@@ -156,406 +122,88 @@ export const runMaskPointScenario = async (context) => {
+     useCanvasStore.getState().selectNode(undefined)
+     return node.id
+   }, spec)
++  if (!(await dockMaskButton.isDisabled())) {
++    throw new Error('P2: 有图但未选中时 dock 按钮仍应 disabled')
++  }
+ 
+-  // P3 — no selection: dock click arms, image click selects + opens overlay + drops the first point.
++  // ── P3 — 选中图片 → 按钮 enabled → click → region-edit 直接打开,无 armed 中间态 ──
++  await clickCanvasNode(page, rendererMode, imageId)
++  await page.waitForFunction(() => {
++    const buttons = Array.from(document.querySelectorAll('.canvas-tool-dock button'))
++    const target = buttons.find((b) => (b.getAttribute('aria-label') || '') === 'Inpaint')
++    return Boolean(target) && !target.disabled
++  })
+   await dockMaskButton.click()
+-  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+-  const armedButtonActive = await dockMaskButton.evaluate((button) => button.classList.contains('active'))
+-  if (!armedButtonActive) throw new Error('P3: dock mask button should be active while point selection is armed')
+-  const nodeBox = await nodeScreenRect(page, rendererMode, imageId)
+-  if (!nodeBox) throw new Error('P3: source image node should be visible')
+-  await page.mouse.click(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
+   await page.waitForSelector('.image-mask-edit-stage')
+-  // #154 变更(commit ac62c33):armed 首击只开浮层(默认椭圆),不再落 point 锚点
+-  // (useMaskPointArmed L288-294 有意移除 recordPendingInitialPoint,commit message
+-  // 「首击不再强制落点选锚点」)。原 P3「armed 首击落 point」前提被推翻,改为钉新
+-  // intended 行为:开 overlay + disarm + 选图 + 不落 point + 四工具 + 默认椭圆;
+-  // 再切点选 + clickStage 落首 point(等价验证点选工具落 point + marker/pin)。
+-  const p3Overlay = await page.evaluate(async ({ leaferMode, moduleSpec }) => {
++  const p3Overlay = await page.evaluate(async (moduleSpec) => {
+     const overlay = document.querySelector('.image-mask-edit-overlay')
+-    let selectedNodeId = document.querySelector('.dom-node.selected')?.getAttribute('data-node-id')
+-    if (leaferMode && !selectedNodeId) {
+-      const { useCanvasStore } = await import(moduleSpec)
+-      selectedNodeId = useCanvasStore.getState().selectedNodeId
+-    }
++    const { useCanvasStore } = await import(moduleSpec)
+     return {
+-      armed: document.querySelector('.canvas-shell')?.classList.contains('mask-armed'),
+-      selectedNodeId,
++      armed: Boolean(document.querySelector('.canvas-shell.mask-armed')),
++      regionEditRoot: Boolean(overlay?.classList.contains('region-edit-overlay')),
++      selectedNodeId: useCanvasStore.getState().selectedNodeId,
+       region: Number(overlay?.getAttribute('data-region-count') || '0'),
+-      mask: Number(overlay?.getAttribute('data-mask-region-count') || '0'),
+-      point: Number(overlay?.getAttribute('data-point-anchor-count') || '0'),
+-      markers: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-marker').length,
+-      pins: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-pin').length,
+       tools: Array.from(document.querySelectorAll('.image-mask-edit-tools button')).map((b) => (b.getAttribute('aria-label') || b.textContent || '').trim()),
+       activeTool: Array.from(document.querySelectorAll('.image-mask-edit-tools button.active')).map((b) => (b.getAttribute('aria-label') || '').trim()),
+     }
+-  }, { leaferMode, moduleSpec: spec })
+-  if (p3Overlay.armed) throw new Error(`P3(#154): armed 应在点图片后 disarm, got ${JSON.stringify(p3Overlay)}`)
+-  if (p3Overlay.selectedNodeId !== imageId) throw new Error(`P3: 应选中图片 ${imageId}, got ${JSON.stringify(p3Overlay)}`)
+-  if (p3Overlay.region !== 0 || p3Overlay.mask !== 0 || p3Overlay.point !== 0) {
+-    throw new Error(`P3(#154): armed 首击不应落 point/region, got ${JSON.stringify(p3Overlay)}`)
+-  }
+-  if (p3Overlay.markers !== 0 || p3Overlay.pins !== 0) {
+-    throw new Error(`P3(#154): armed 首击不应渲染 marker/pin, got ${JSON.stringify(p3Overlay)}`)
+-  }
+-  // SC6.1(#154 重写,原"只点选"被 #154 四工具推翻):工具条精确四工具(椭圆/矩形/圈选/点选,
+-  // 顺序对齐 ImageMaskEditOverlay.tsx:93-98 toolItems)+ 默认椭圆。矩形/圈选被删或改名必红。
+-  if (p3Overlay.tools.length !== EXPECTED_MASK_TOOLS.length ||
+-      !p3Overlay.tools.every((label, i) => label === EXPECTED_MASK_TOOLS[i])) {
+-    throw new Error(`SC6.1(#154): 工具条应精确为 ${JSON.stringify(EXPECTED_MASK_TOOLS)}, got ${JSON.stringify(p3Overlay.tools)}`)
+-  }
+-  if (p3Overlay.activeTool.length !== 1 || p3Overlay.activeTool[0] !== '椭圆') {
+-    throw new Error(`SC6.1(#154): 默认工具应唯一为椭圆, got ${JSON.stringify(p3Overlay.activeTool)}`)
+-  }
+-  // 切点选 + clickStage 落首 point(验证点选工具落 point + marker/pin;#154 后首击不落,
+-  // 改为手动切点选 + clickStage,等价原 P3 的"落首 point + marker"断言)
+-  await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+-  await addPointRegion(page, 0.5, 0.5)
+-  await waitForRegionCount(page, 1)
+-  const p3Point = await page.evaluate(() => ({
+-    mask: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-mask-region-count') || '0'),
+-    point: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-point-anchor-count') || '0'),
+-    markers: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-marker').length,
+-    pins: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-pin').length,
+-  }))
+-  if (p3Point.mask !== 1 || p3Point.point !== 0) {
+-    throw new Error(`P3: 点选 clickStage 应落 1 个 mask region(非 standalone point), got ${JSON.stringify(p3Point)}`)
+-  }
+-  if (p3Point.markers < 1 || p3Point.pins < 1) {
+-    throw new Error(`P3: 点选应渲染坐标 pin marker, got ${JSON.stringify(p3Point)}`)
+-  }
+-
+-  // FIX-3: initial armed point must not block legitimate fast follow-up points in the overlay.
+-  await clickStage(page, 0.42, 0.5)
+-  await clickStage(page, 0.58, 0.5)
+-  await waitForRegionCount(page, 3)
+-  const afterFastOverlayClicks = await regionCounts(page)
+-  if (afterFastOverlayClicks.mask !== 3 || afterFastOverlayClicks.point !== 0) {
+-    throw new Error(`FIX-3: two fast overlay points after armed initial point should both land, got ${JSON.stringify(afterFastOverlayClicks)}`)
+-  }
+-  await cancelMaskEdit(page)
+-  await clearCanvasSelection(page, spec)
+-
+-  // GREPTILE-P2: dock 直接入口（D4）调用 beginMaskEdit 时必须解除 armed。
+-  // 构造 armed 残留场景：无选区 dock click arm → 通过 store API 选中图片
+-  // （绕过 wrapNodePointerDown 的指针路径 disarm）→ 再次 dock click 走 D4 直接入口。
+-  // 修复前 beginMaskEdit 不 disarm，shell 会残留 mask-armed class。
+-  await dockMaskButton.click()
+-  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+-  await page.evaluate(async ({ moduleSpec, id }) => {
+-    const { useCanvasStore } = await import(moduleSpec)
+-    useCanvasStore.getState().selectNode(id)
+-  }, { moduleSpec: spec, id: imageId })
+-  await page.waitForFunction(async ({ id, leaferMode, moduleSpec }) => {
+-    if (document.querySelector(`[data-node-id="${id}"]`)?.classList.contains('selected')) return true
+-    if (!leaferMode) return false
+-    const { useCanvasStore } = await import(moduleSpec)
+-    return useCanvasStore.getState().selectedNodeId === id
+-  }, { id: imageId, leaferMode, moduleSpec: spec })
+-  await dockMaskButton.click()
+-  await page.waitForSelector('.image-mask-edit-stage')
+-  await page.waitForFunction(() => !document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+-  const d4Disarmed = await page.evaluate(() => ({
+-    armed: document.querySelector('.canvas-shell')?.classList.contains('mask-armed'),
+-    stageOpen: Boolean(document.querySelector('.image-mask-edit-stage')),
+-  }))
+-  if (d4Disarmed.armed || !d4Disarmed.stageOpen) {
+-    throw new Error(`GREPTILE-P2: D4 dock entry must disarm armed and open overlay, got ${JSON.stringify(d4Disarmed)}`)
+-  }
+-  await cancelMaskEdit(page)
+-  await clearCanvasSelection(page, spec)
+-
+-  // FIX-3(#154 重写):原"armed fast dblclick 落 1 initial region + 不重复"前提(armed 首击
+-  // 落 point)被 #154 移除(commit message「首击不再强制落点选锚点」)。改为钉 #154 后
+-  // 行为:armed dblclick → 开浮层 + disarm + 选图 + 不落 point(region=0)。
+-  // #154 锚点草稿同图恢复会累积 region,开浮层前清 imageId draft 使 region=0。
+-  await clearMaskDraft(page, imageId, isProdTopology)
+-  await dockMaskButton.click()
+-  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+-  await page.mouse.dblclick(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
+-  await page.waitForSelector('.image-mask-edit-stage')
+-  await page.waitForTimeout(120)
+-  const fastDoubleClickState = await page.evaluate(() => ({
+-    armed: document.querySelector('.canvas-shell')?.classList.contains('mask-armed'),
+-    detailsOpen: Boolean(document.querySelector('.details-dialog-backdrop')),
+-    region: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0'),
+-    mask: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-mask-region-count') || '0'),
+-    point: Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-point-anchor-count') || '0'),
+-  }))
+-  if (fastDoubleClickState.armed || fastDoubleClickState.detailsOpen) {
+-    throw new Error(`FIX-3(#154): armed dblclick 应 disarm + 无 details dialog, got ${JSON.stringify(fastDoubleClickState)}`)
+-  }
+-  if (!isProdTopology && (fastDoubleClickState.region !== 0 || fastDoubleClickState.mask !== 0 || fastDoubleClickState.point !== 0)) {
+-    throw new Error(`FIX-3(#154): armed dblclick 不应落 point/region(首击只开浮层), got ${JSON.stringify(fastDoubleClickState)}`)
+-  }
+-  await cancelMaskEdit(page)
+-  await clearCanvasSelection(page, spec)
+-
+-  // FIX-3(#154 重写):原"armed slow dblclick 落 1 region + 第二击不重复"前提(armed 首击
+-  // 落 point)被 #154 移除。改为钉 #154:armed click → 开浮层 + 不落 point(region=0)。
+-  // 第二击在浮层已开后(armed 已 disarm),不落 armed point。清 draft 使 region=0。
+-  await clearMaskDraft(page, imageId, isProdTopology)
+-  await dockMaskButton.click()
+-  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+-  await page.mouse.click(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
+-  await page.waitForSelector('.image-mask-edit-stage')
+-  await page.waitForTimeout(450)
+-  await page.mouse.click(nodeBox.x + nodeBox.width * 0.5, nodeBox.y + nodeBox.height * 0.5)
+-  await page.waitForTimeout(120)
+-  const slowDoubleClickCounts = await regionCounts(page)
+-  if (!isProdTopology && (slowDoubleClickCounts.region !== 0 || slowDoubleClickCounts.mask !== 0 || slowDoubleClickCounts.point !== 0)) {
+-    throw new Error(`FIX-3(#154): armed slow dblclick 不应落 point/region(首击只开浮层,第二击不重复落), got ${JSON.stringify(slowDoubleClickCounts)}`)
+-  }
+-  await cancelMaskEdit(page)
+-
+-  // SC-09 (mask-chat-card): 提交前 Esc 只关交互层（overlay/draft），不 abort 已提交任务。
+-  // 这里仍是提交前阶段：overlay 打开、prompt 聚焦、尚未点「局部重绘」。
+-  // Esc 关闭 overlay，不触达任何后台 task（此时还没有 task）。
+-  await clickCanvasNode(page, rendererMode, imageId)
+-  await page.waitForSelector('.selection-quick-toolbar')
+-  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+-  await page.waitForSelector('.image-mask-edit-stage')
+-  // #154: selection-quick-toolbar 入口打开浮层不落 point(默认椭圆需手动画),无 anchor
+-  // 时 prompt 区不渲染(hasAnyAnchor gate)。原 textarea.focus 前提(浮层打开即有 prompt)
+-  // 不再成立,改为直接 Esc 关浮层("提交前 Esc 只关交互层"核心仍覆盖;prompt 聚焦场景
+-  // 由 SC6.2 有 anchor 时覆盖)。
+-  await page.keyboard.press('Escape')
+-  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+-
+-  // SC-09 (mask-chat-card): 提交后 Esc 不 cancel —— 拦截 task GET 挂起，提交，按 Esc，
+-  // 断言 DELETE 未发生、card 仍 generating、release GET 后 done。
+-  // 准备：重新打开 overlay，画一个 region，填 prompt，提交。GET 挂起保证提交后仍 generating。
+-  let releaseSc09Get
+-  const sc09GetGate = new Promise((resolve) => { releaseSc09Get = resolve })
+-  let sc09GetCount = 0
+-  let sc09DeleteCount = 0
+-  // 先拦截 GET /tasks/* 与 DELETE，让 GET 挂起。
+-  await page.route('**/api/mivo/tasks/*', async (route) => {
+-    const method = route.request().method()
+-    if (method === 'DELETE') {
+-      sc09DeleteCount += 1
+-      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ status: 'canceled' }) })
+-      return
+-    }
+-    if (method !== 'GET') { await route.fallback(); return }
+-    sc09GetCount += 1
+-    await sc09GetGate
+-    await route.fulfill({
+-      status: 200,
+-      contentType: 'application/json',
+-      body: JSON.stringify({
+-        id: 'task-sc09',
+-        kind: 'edit',
+-        status: 'done',
+-        progress: 100,
+-        stage: 'done',
+-        requestId: 'e2e-sc09',
+-        model: 'gpt-image-2',
+-        result: { images: [{ b64: generatedImageB64 }] },
+-      }),
+-    })
+-  })
+-  // /enhance 返回 generate mode 快速通过（不 gate enhance，只 gate GET poll）。
+-  await page.route('**/api/mivo/enhance', async (route) => {
+-    await route.fulfill({
+-      status: 200,
+-      contentType: 'application/json',
+-      body: JSON.stringify({ mode: 'generate', scene: 'general', reasoning: 'e2e', richPrompt: 'e2e sc09 rich prompt', imgRatio: '1:1', quality: 'medium', enhanced: true }),
+-    })
+-  })
+-  // /tasks/edit POST 返回 202。
+-  await page.route('**/api/mivo/tasks/edit', async (route) => {
+-    await route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ taskId: 'task-sc09' }) })
+-  })
+-
+-  await clickCanvasNode(page, rendererMode, imageId)
+-  await page.waitForSelector('.selection-quick-toolbar')
+-  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+-  await page.waitForSelector('.image-mask-edit-stage')
+-  await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+-  await addPointRegion(page, 0.5, 0.5)
+-  await fillMaskPrompt(page, 'E2E SC-09 submit then Esc')
+-  await page.locator('.image-mask-edit-prompt').getByRole('button', { name: 'Inpaint' }).click()
+-  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+-  // 提交后 chat panel 应出现 generating 卡片（先确保 panel 展开）。
+-  if (await page.locator('.ai-panel.collapsed').isVisible()) {
+-    await page.getByRole('button', { name: 'Open AI panel' }).click()
+-    await page.waitForSelector('.chat-composer-textarea', { state: 'visible' })
+-  }
+-  await page.waitForSelector('.chat-message-assistant .chat-generating-indicator', { timeout: 5000 })
+-  // 等 /tasks/edit POST 落地（提交已发出）。
+-  await new Promise((r) => setTimeout(r, 300))
+-
+-  // 提交后按 Esc —— 不应 cancel task（Esc 只在 overlay 打开时关 overlay，overlay 已关）。
+-  const deleteBeforeEsc = sc09DeleteCount
+-  await page.keyboard.press('Escape')
+-  await new Promise((r) => setTimeout(r, 400))
+-  if (sc09DeleteCount !== deleteBeforeEsc) {
+-    throw new Error(`SC-09: Esc after submit must not DELETE task, got ${sc09DeleteCount - deleteBeforeEsc} DELETE(s)`)
+-  }
+-  // 卡片仍 generating（GET 挂起，未 done 也未 error）。
+-  const sc09CardWhilePending = await page.evaluate(() => {
+-    const last = document.querySelector('.chat-message-assistant:last-child')
+-    if (!last) return { found: false }
+-    return {
+-      found: true,
+-      hasGenerating: Boolean(last.querySelector('.chat-generating-indicator') || last.querySelector('.chat-thinking-placeholder')),
+-      hasError: Boolean(last.querySelector('.chat-error-row')),
+-    }
+-  })
+-  if (!sc09CardWhilePending.found || (!sc09CardWhilePending.hasGenerating) || sc09CardWhilePending.hasError) {
+-    throw new Error(`SC-09: card should still be generating after Esc (no cancel), got: ${JSON.stringify(sc09CardWhilePending)}`)
+-  }
+-
+-  // Release GET → done。
+-  releaseSc09Get()
+-  await page.waitForSelector('.chat-message-assistant .chat-result-image', { timeout: 10000 })
+-
+-  // 清理 SC-09 路由。
+-  await page.unroute('**/api/mivo/tasks/*')
+-  await page.unroute('**/api/mivo/enhance')
+-  await page.unroute('**/api/mivo/tasks/edit')
+-
+-  // FIX-2: deleting the target image while mask edit is active must clear all mask edit state.
+-  const deleteCase = await page.evaluate(async (moduleSpec) => {
+-    const { useCanvasStore } = await import(moduleSpec)
+-    useCanvasStore.getState().createCanvas('E2E Mask Delete Target')
+-    useCanvasStore.getState().addImportedImage('/demo-assets/courage-1.jpg', 'delete-source', 'source', { x: -120, y: 0 }, {
+-      dimensions: { width: 320, height: 320 },
+-      mimeType: 'image/jpeg',
+-      originalName: 'delete-source.jpg',
+-    })
+-    const sourceId = useCanvasStore.getState().nodes.at(-1).id
+-    useCanvasStore.getState().addImportedImage('/demo-assets/courage-1.jpg', 'survivor-source', 'source', { x: 260, y: 0 }, {
+-      dimensions: { width: 320, height: 320 },
+-      mimeType: 'image/jpeg',
+-      originalName: 'survivor-source.jpg',
+-    })
+-    const survivorId = useCanvasStore.getState().nodes.at(-1).id
+-    useCanvasStore.getState().selectNode(undefined)
+-    return { sourceId, survivorId }
+   }, spec)
+-  await page.waitForFunction(() => !document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
+-  await dockMaskButton.click()
+-  await page.waitForFunction(() => document.querySelector('.canvas-shell')?.classList.contains('mask-armed'))
+-  const deleteSourceBox = await nodeScreenRect(page, rendererMode, deleteCase.sourceId)
+-  if (!deleteSourceBox) throw new Error('FIX-2: delete source image should be visible')
+-  await page.mouse.click(deleteSourceBox.x + deleteSourceBox.width * 0.5, deleteSourceBox.y + deleteSourceBox.height * 0.5)
+-  await page.waitForSelector('.image-mask-edit-stage')
+-  // #154: armed 首击只开浮层不落 point(deleteCase.sourceId 新图,draft 空,region=0)。
+-  // FIX-2 测"删目标图清 mask edit state",须先构造一个可清理的 region 再删——否则空仓
+-  // 删除时若清理路径回归成 saveMaskEditDraft 残留 region,断言仍绿(漏报)。原
+-  // waitForRegionCount(1) 前提(armed 首击落 point)被 #154 移除,这里手动切点选补 region。
+-  await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+-  await addPointRegion(page, 0.5, 0.5)
+-  await waitForRegionCount(page, 1)
+-  await page.waitForFunction(() => document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
+-  await page.keyboard.press('Delete')
+-  await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
+-  await page.waitForFunction(
+-    async ({ sourceId, leaferMode, moduleSpec }) => {
+-      if (document.querySelector(`[data-node-id="${sourceId}"]`)) return false
+-      if (!leaferMode) return true
+-      // leafer 模式 image 本就无 DOM,"删除完成"以 store 中节点消失为证据。
+-      const { useCanvasStore } = await import(moduleSpec)
+-      return !useCanvasStore.getState().nodes.some((node) => node.id === sourceId)
+-    },
+-    { sourceId: deleteCase.sourceId, leaferMode, moduleSpec: spec },
+-  )
+-  await page.waitForFunction(() => !document.querySelector('.mivo-app')?.classList.contains('ai-collapsed'))
+-  // 回归守卫:目标图删除后草稿仓应清空(getMaskEditDraft===undefined)。overlay 卸载
+-  // cleanup(ImageMaskEditOverlay.tsx:548-573)在 !stillExists 时 clearMaskEditDraft;若该
+-  // 清理路径回归成 saveMaskEditDraft 残留上方构造的 region,本断言会红。手动 poll 等被动
+-  // effect cleanup(useEffect cleanup 在 DOM detach 后异步执行)跑完,再断言空仓。
+-  if (isProdTopology) {
+-    console.log('[mask-point] prod: FIX-2 draft-empty regression assertion skipped (dev-only /src/canvas/maskEditDraftStore.ts import — not in prod bridge); delete-survivor DOM assertions still run')
+-  } else {
+-    const deadline = Date.now() + 2000
+-    let draft = null
+-    while (Date.now() < deadline) {
+-      draft = await page.evaluate(async (id) => {
+-        const { getMaskEditDraft } = await import('/src/canvas/maskEditDraftStore.ts')
+-        return getMaskEditDraft(id) ?? null
+-      }, deleteCase.sourceId)
+-      if (draft === null) break
+-      await new Promise((r) => setTimeout(r, 50))
+-    }
+-    if (draft !== null) {
+-      throw new Error(`FIX-2: 删除目标图后草稿应清空(getMaskEditDraft===undefined), got ${JSON.stringify(draft)}`)
+-    }
+-  }
+-  await clickCanvasNode(page, rendererMode, deleteCase.survivorId)
+-  await page.waitForSelector('.selection-quick-toolbar')
++  if (p3Overlay.armed) throw new Error(`P3: 全程不应出现 .mask-armed, got ${JSON.stringify(p3Overlay)}`)
++  if (!p3Overlay.regionEditRoot) throw new Error(`P3: 打开的应是 region-edit(RegionEditOverlay), got ${JSON.stringify(p3Overlay)}`)
++  if (p3Overlay.selectedNodeId !== imageId) throw new Error(`P3: 应保持选中图片 ${imageId}, got ${JSON.stringify(p3Overlay)}`)
++  if (p3Overlay.region !== 0) throw new Error(`P3: 新图打开不应带任何选区(无草稿), got ${JSON.stringify(p3Overlay)}`)
+ 
+-  await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+-  await page.locator('.selection-quick-toolbar-menu').getByRole('menuitem', { name: 'Select area' }).click()
+-  await page.waitForSelector('.image-mask-edit-stage')
+-
+-  // ── SC6.1 — toolbar exposes only 点选; default tool=point ──
+-  const toolInfo = await page.evaluate(() => {
+-    const tools = Array.from(document.querySelectorAll('.image-mask-edit-tools button'))
+-    return {
+-      labels: tools.map((b) => (b.getAttribute('aria-label') || b.textContent || '').trim()),
+-      activeLabels: tools.filter((b) => b.classList.contains('active')).map((b) => (b.getAttribute('aria-label') || '').trim()),
+-    }
+-  })
+-  // SC6.1(#154 重写,原"只点选"被四工具推翻):工具条精确四工具(椭圆/矩形/圈选/点选,
+-  // 顺序对齐 ImageMaskEditOverlay.tsx:93-98 toolItems)+ 默认椭圆。矩形/圈选被删或改名必红。
+-  if (toolInfo.labels.length !== EXPECTED_MASK_TOOLS.length ||
+-      !toolInfo.labels.every((label, i) => label === EXPECTED_MASK_TOOLS[i])) {
+-    throw new Error(`SC6.1(#154): 工具条应精确为 ${JSON.stringify(EXPECTED_MASK_TOOLS)}, got ${JSON.stringify(toolInfo.labels)}`)
++  // ── SC6.1 — 工具条精确三工具(点选/矩形/圈选)+ 默认工具=点选 ──
++  // 默认值来源 RegionEditOverlay(restoredDraft?.tool ?? 'point');椭圆 2026-07-31 已
++  // 由用户拍板下线(regionEditTools.ts 头注释),老"四工具+默认椭圆"断言随 #369 作废。
++  if (p3Overlay.tools.length !== EXPECTED_REGION_TOOLS.length ||
++      !p3Overlay.tools.every((label, i) => label === EXPECTED_REGION_TOOLS[i])) {
++    throw new Error(`SC6.1: 工具条应精确为 ${JSON.stringify(EXPECTED_REGION_TOOLS)}, got ${JSON.stringify(p3Overlay.tools)}`)
+   }
+-  if (toolInfo.activeLabels.length !== 1 || toolInfo.activeLabels[0] !== '椭圆') {
+-    throw new Error(`SC6.1(#154): 默认工具应唯一为椭圆, got ${JSON.stringify(toolInfo.activeLabels)}`)
++  if (p3Overlay.activeTool.length !== 1 || p3Overlay.activeTool[0] !== 'Point select') {
++    throw new Error(`SC6.1: 默认工具应唯一为点选(en aria-label 'Point select'), got ${JSON.stringify(p3Overlay.activeTool)}`)
+   }
+ 
+-  // ── SC6.2 — one click → circular region, no block, submit enabled ──
+-  // #154 默认椭圆工具;点选工具下 clickStage 才落 point(同 mask-reflow openMaskPointRegion)。
++  // ── SC6.2 — 点选点一下 → 圆形区 + 可见反馈 + 无拦截 + 提交可用 ──
++  // 默认已是点选;仍显式点一次工具按钮(幂等),防上游默认值变化让本段静默漂移语义。
+   await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+   await addPointRegion(page, 0.5, 0.5)
+-  const afterClick = await regionCounts(page)
+-  if (afterClick.mask < 1) {
+-    throw new Error(`SC6.2: point click should create a circular mask region, got ${JSON.stringify(afterClick)}`)
+-  }
+-  if (afterClick.point !== 0) {
+-    throw new Error(`SC6.2: point click should not leave a standalone point anchor (it is a circle region), got ${JSON.stringify(afterClick)}`)
+-  }
+-  // 回归守卫（bug: 单点 brush 渲染成单点 polyline → 无任何可见反馈）：点选后
+-  // stage SVG 里必须出现紫色坐标 pin 标记（固定屏幕尺寸，尖端锚在点击坐标）。
++  await waitForRegionCount(page, 1)
++  // 可见反馈:点选区渲染薄荷青圆点标记(region-edit-point-dot;老 point-marker/pin
++  // 随 ImageMaskEditOverlay 下线,2026-08-01 用户图3 拍板的新标记形态)。
+   const visiblePointFeedback = await page.evaluate(() => ({
+-    markers: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-marker').length,
+-    pins: document.querySelectorAll('.image-mask-edit-stage svg .image-mask-edit-point-pin').length,
++    dots: document.querySelectorAll('.region-edit-point-dot').length,
++    leaders: document.querySelectorAll('.region-edit-point-leader').length,
+   }))
+-  if (visiblePointFeedback.markers < 1 || visiblePointFeedback.pins < 1) {
+-    throw new Error(`SC6.2: point click should render coordinate-pin marker feedback, got ${JSON.stringify(visiblePointFeedback)}`)
++  if (visiblePointFeedback.dots < 1 || visiblePointFeedback.leaders < 1) {
++    throw new Error(`SC6.2: 点选应渲染 point-dot + 引导线可见反馈, got ${JSON.stringify(visiblePointFeedback)}`)
+   }
+   const blocked = await page.evaluate(() => {
+     const err = document.querySelector('.image-mask-edit-error')?.textContent || ''
+     return { errText: err, hasBlockMsg: /请框选或涂抹/.test(err) }
+   })
+   if (blocked.hasBlockMsg) {
+-    throw new Error(`SC6.2: removed guard should not show "请框选或涂抹" prompt, got ${JSON.stringify(blocked.errText)}`)
++    throw new Error(`SC6.2: 点选不应被"请框选或涂抹"拦截, got ${JSON.stringify(blocked.errText)}`)
+   }
+-  // Fill a prompt and confirm the 局部重绘 submit button is enabled (hasAnyAnchor).
+   await fillMaskPrompt(page, 'E2E point region enabled')
+   const submitDisabled = await page.locator('.image-mask-edit-prompt').getByRole('button', { name: 'Inpaint' }).isDisabled()
+-  if (submitDisabled) throw new Error('SC6.2: submit should be enabled after a point region + prompt')
++  if (submitDisabled) throw new Error('SC6.2: 点选区 + prompt 后提交按钮应可用')
+ 
+-  // ── SC6.6 — multiple circular regions stack; undo/redo/clear work ──
+-  // Keep clicks central (on the image, clear of the floating toolbar/prompt panels).
+-  await addPointRegion(page, 0.44, 0.48)
++  // ── SC6.6 — 多次点选叠加;undo/redo/clear 正常 ──
++  // 点位纵向错开:点选标记带**水平引导线 + 「标记N」胶囊**(向右延伸约百像素),
++  // 同一水平带上的后续点击会落在既有标记的胶囊/引导线上变成"选中"而非新增
++  // (首跑实测 (0.56,0.48) 被 (0.44,0.48) 的胶囊吃掉,stuck at 2)。
++  await addPointRegion(page, 0.35, 0.3)
+   await waitForRegionCount(page, 2)
+-  await addPointRegion(page, 0.56, 0.48)
++  await addPointRegion(page, 0.65, 0.72)
+   await waitForRegionCount(page, 3)
+-
+-  // SC6.6 scope (per plan §8): 多次点选叠加多个圆形区 + clear/undo 正常.
+-  // undo: 3 → 2.
++  // undo: 3 → 2(#386 后 aria-label = t('menu.maskEdit.undo') → en 'Undo')。
+   await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Undo', exact: true }).click()
+   await waitForRegionCount(page, 2)
+-  // clear: → 0.
+-  await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Clear marks', exact: true }).click()
++  // redo: 2 → 3。
++  await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Redo', exact: true }).click()
++  await waitForRegionCount(page, 3)
++  // clear: → 0。
++  await page.locator('.image-mask-edit-history').getByRole('button', { name: 'Clear regions', exact: true }).click()
+   await waitForRegionCount(page, 0)
+ 
+   // Tear down the overlay so the shared page is clean for the next scenario.

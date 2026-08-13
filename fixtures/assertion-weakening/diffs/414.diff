@@ -1,0 +1,698 @@
+diff --git a/src/__tests__/depositStore.test.ts b/src/__tests__/depositStore.test.ts
+index d106e1d7..9327d50e 100644
+--- a/src/__tests__/depositStore.test.ts
++++ b/src/__tests__/depositStore.test.ts
+@@ -12,10 +12,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { debugLogger } from '../../../src/store/debugLogStore'
+ import {
+   DEPOSIT_COMMIT_MAX_ATTEMPTS,
++  DEPOSIT_LOCAL_WRITER_PLACEHOLDER,
+   DEPOSIT_MAP_MAX_ENTRIES,
+   DEPOSIT_PENDING_GEN,
+   DEPOSIT_RELEASED_FLOOR_MAX_ENTRIES,
+   DEPOSIT_PENDING_WRITER,
++  DEPOSIT_STATE_HARD_BYTES,
++  DEPOSIT_STATE_SOFT_BYTES,
+   depositHashRefCount,
+   dequeuePendingRelease,
+   enqueuePendingRelease,
+@@ -25,6 +28,7 @@ import {
+   parseDepositState,
+   peekDepositRevisionSumForTests,
+   peekDepositStoreForTests,
++  peekDepositWriterForTests,
+   recordCapabilityMark,
+   recordDeposit,
+   recordMigration,
+@@ -34,6 +38,7 @@ import {
+   type DepositState,
+ } from '../agent/depositStore'
+ import type { PersistReply } from '../persist/bridge'
++import { canonicalSum } from '../../../src/lib/canonicalHash'
+ import { createDepositHarness, teardownDepositHarness, FAKE_HASH } from './depositTestHarness'
+ 
+ const draft = (hash: string, depositedAt: number, from: 'deposit' | 'artifact' | 'ledger' = 'deposit'): DepositEntryDraft => ({
+@@ -1139,17 +1144,656 @@ describe('depositStore — 墓碑 TTL 与 GC 水位(设计稿 §4.10.6.1)', () =
+ 
+ // 八轮返修必测清单(①③⑤⑥⑦②④在此;⑧⑩main.js 侧见 depositBrain.test.ts;⑨全仓
+ // grep 核对,不是可自动化的 vitest 断言,报告里单独给证据)。
+-describe('depositStore — 诚实兜底', () => {
+-  afterEach(() => {
+-    teardownDepositHarness()
++describe('depositStore — 八轮返修:源头硬闸(方向A,替代已删除的 sidecar)', () => {
++  it('①floor 已满 + 墓碑 TTL 到期:普通提交仍必须成功,墓碑原样留存(不因为容量闸就让整次提交失败)', async () => {
++    let nowMs = 1_700_000_000_000
++    setDepositClockForTests(() => nowMs)
++    createDepositHarness()
++
++    await loadDepositStore()
++    const seeded = peekDepositStoreForTests()
++    if (!seeded) throw new Error('unreachable: load 后必有 memory')
++    for (let index = 0; index < DEPOSIT_RELEASED_FLOOR_MAX_ENTRIES; index += 1) {
++      seeded.releasedFloor['seed-' + index] = { generation: 1, at: nowMs }
++    }
++
++    await recordDeposit('mivo-asset:1', draft('h', 1, 'deposit'))
++    await invalidateDeposit('mivo-asset:1')
++    nowMs += 25 * 60 * 60 * 1_000 // 超 TTL,触发这条墓碑的 GC 尝试(floor 已满,预期延后转换)
++
++    const result = await recordDeposit('mivo-asset:2', draft('h2', 2, 'deposit'))
++    // 关键断言:容量闸只挡"转换成 floor"这一步,不挡这次提交本身——提交必须成功。
++    expect(result.ok).toBe(true)
++    expect(peekDepositStoreForTests()?.releasedTombstones['mivo-asset:1']).toBeTruthy()
++  })
++
++  it('②floor 满后跨 K 代安全退休窗口腾位:被延后的墓碑在退休腾位的同一次提交里转换收敛', async () => {
++    let nowMs = 1_700_000_000_000
++    setDepositClockForTests(() => nowMs)
++    createDepositHarness()
++
++    // 白盒预置:floor 灌满(数量闸),且都在 generation=1——一旦 currentGen 跨过
++    // releaseGen(1)+K(3)=4,会被安全退休整批清除,腾出位置。
++    await loadDepositStore()
++    const seeded = peekDepositStoreForTests()
++    if (!seeded) throw new Error('unreachable')
++    for (let index = 0; index < DEPOSIT_RELEASED_FLOOR_MAX_ENTRIES; index += 1) {
++      seeded.releasedFloor['seed-' + index] = { generation: 1, at: nowMs }
++    }
++
++    await recordDeposit('mivo-asset:1', draft('h', 1, 'deposit')) // gen1
++    await invalidateDeposit('mivo-asset:1') // gen2,创建墓碑
++    nowMs += 25 * 60 * 60 * 1_000 // 超 TTL
++
++    await recordDeposit('mivo-asset:2', draft('h2', 2, 'deposit')) // gen3:3>=1+3? 否,floor 未到退休窗口,墓碑延后
++    expect(peekDepositStoreForTests()?.releasedTombstones['mivo-asset:1']).toBeTruthy()
++    expect(peekDepositStoreForTests()?.releasedFloor['mivo-asset:1']).toBeUndefined()
++
++    await recordDeposit('mivo-asset:3', draft('h3', 3, 'deposit')) // gen4:4>=1+3 → seed floor 整批退休腾位,同一次提交里墓碑转换收敛
++    const after = peekDepositStoreForTests()
++    expect(after?.releasedTombstones['mivo-asset:1']).toBeUndefined()
++    expect(after?.releasedFloor['mivo-asset:1']).toBeDefined()
++    expect(Object.keys(after?.releasedFloor ?? {}).filter((key) => key.startsWith('seed-'))).toHaveLength(0)
+   })
+ 
+-  it('两槽皆坏 → 缓存空 + 迁移标记缺失(不产生错数据)', async () => {
++  it('③floor 满且 generation 不前进:重复 load(不触发提交)绝不会剪任何墓碑——GC 只在 commitNow 里跑', async () => {
++    let nowMs = 1_700_000_000_000
++    setDepositClockForTests(() => nowMs)
++    createDepositHarness()
++
++    await recordDeposit('mivo-asset:1', draft('h', 1, 'deposit'))
++    await invalidateDeposit('mivo-asset:1')
++    const seeded = peekDepositStoreForTests()
++    if (!seeded) throw new Error('unreachable')
++    for (let index = 0; index < DEPOSIT_RELEASED_FLOOR_MAX_ENTRIES; index += 1) {
++      seeded.releasedFloor['seed-' + index] = { generation: 1, at: nowMs }
++    }
++    nowMs += 25 * 60 * 60 * 1_000 // 超 TTL
++
++    await loadDepositStore()
++    await loadDepositStore()
++    await loadDepositStore()
++
++    const after = peekDepositStoreForTests()
++    expect(after?.releasedTombstones['mivo-asset:1']).toBeTruthy()
++    expect(Object.keys(after?.releasedFloor ?? {})).toHaveLength(DEPOSIT_RELEASED_FLOOR_MAX_ENTRIES)
++  })
++
++  // ④(边界精确到字节,含中文 assetUrl 的真实字节贡献)拆成 A/B 两个独立测试,各自
++  // 用一份全新 harness——避免共享一份 harness 时中间那次"撤回"额外触发一次全量
++  // ~12.5MB 的完整性哈希(main.js 每次成功提交都会现算 sum,即使内容没变),两个
++  // 独立测试各自只有一次这种量级的哈希,更快也更不容易因为叠加耗时而超时。
++  const byteLen = (text: string): number => new TextEncoder().encode(text).length
++  const chineseAssetUrlPrefix = 'mivo-asset://中文断点测试-'
++  const buildChineseAssetUrl = (): string => chineseAssetUrlPrefix + '中'.repeat(50)
++  // SC9.2(九轮修正):这里必须用真实的目标 gen/writer——真正的容量闸
++  // (`evaluateReleaseEvidenceCapacity`)预演时会把仍带占位符的条目盖上这次要用的
++  // 真实值,再按**信封**(`{schema,gen,writer,sum,payload}`)口径量字节,不是裸
++  // `DepositState`。这里若继续用占位符 `gen:-1/writer:''` 自己独立算一份"预期"
++  // 边界,就是拿旧的错判据给新的正确实现校验——两边算法一旦分叉,谁错都测不出来
++  // (八轮那次假绿就是这么漏的)。`sum` 字段固定 32 位十六进制(`canonicalSum` 的
++  // 输出长度与内容无关),这里不必真跑一次哈希,用等长占位串即可,字节数完全一致。
++  const DUMMY_SUM = 'x'.repeat(32)
++  const targetGenWriter = (): { gen: number; writer: string } => {
++    const snap = peekDepositStoreForTests()
++    if (!snap) throw new Error('unreachable')
++    return { gen: snap.generation + 1, writer: peekDepositWriterForTests() }
++  }
++  const buildProbeEntry = (hash: string, gen: number, writer: string) => ({
++    hash,
++    from: 'deposit' as const,
++    // `at` 必须用真实时间戳的位数(13 位毫秒级)——真实 mutate 里写的是 `now()`,
++    // 若这里用一个位数少的占位数字(如 1),边际字节数会被低估几个字节,精确凑出的
++    // 边界就会跟着偏移(踩过一次才发现的坑:不是"数值",是"数值的十进制位数"要对齐)。
++    at: Date.now(),
++    gen,
++    writer,
++  })
++  const setCapacityPad = (padLen: number): void => {
++    const snap = peekDepositStoreForTests()
++    if (!snap) throw new Error('unreachable')
++    // `capability.reason` 是自由文本字段(唯一带 `string` 载荷的现成字段),纯用来
++    // 精确控制序列化后的字节数,不代表真实能力缓存语义。
++    snap.capability = { supported: true, at: 1, reason: 'x'.repeat(Math.max(0, padLen)) }
++  }
++  const envelopeBytes = (payload: unknown, gen: number, writer: string): number =>
++    byteLen(JSON.stringify({ schema: 1, gen, writer, sum: DUMMY_SUM, payload }))
++  const computeMarginalAndBase = (
++    hash: string,
++    probeEntry: ReturnType<typeof buildProbeEntry>,
++    gen: number,
++    writer: string,
++  ): { marginal: number; base: number } => {
++    const snap = peekDepositStoreForTests()
++    if (!snap) throw new Error('unreachable')
++    const base = envelopeBytes({ ...snap, generation: gen, pendingReleases: {} }, gen, writer)
++    const withEntry = envelopeBytes({ ...snap, generation: gen, pendingReleases: { [hash]: probeEntry } }, gen, writer)
++    return { marginal: withEntry - base, base }
++  }
++
++  it(
++    '④a projected 恰好 == 软闸(含中文 assetUrl,按真实字节数不是 UTF-16 code units)必须放行',
++    async () => {
++      createDepositHarness()
++      await loadDepositStore()
++      const chineseAssetUrl = buildChineseAssetUrl()
++      await recordDeposit(chineseAssetUrl, draft('a'.repeat(32), 1, 'deposit'))
++      await invalidateDeposit(chineseAssetUrl)
++      expect(peekDepositStoreForTests()?.releasedTombstones[chineseAssetUrl]).toBeTruthy()
++
++      const hash = 'b'.repeat(32)
++      const { gen, writer } = targetGenWriter()
++      const probeEntry = buildProbeEntry(hash, gen, writer)
++      setCapacityPad(0)
++      let { marginal, base } = computeMarginalAndBase(hash, probeEntry, gen, writer)
++      setCapacityPad(DEPOSIT_STATE_SOFT_BYTES - marginal - base)
++      ;({ marginal, base } = computeMarginalAndBase(hash, probeEntry, gen, writer))
++      expect(base + marginal).toBe(DEPOSIT_STATE_SOFT_BYTES) // 前提断言:确实精确落在软闸上
++
++      const result = await enqueuePendingRelease(hash, 'deposit')
++      expect(result.ok).toBe(true)
++      expect(result.code).toBeUndefined()
++      expect(peekDepositStoreForTests()?.pendingReleases[hash]).toBeTruthy()
++    },
++    30_000, // main.js 每次成功提交都要对 ~12.5MB payload 现算完整性哈希,真实 CPU 耗时。
++  )
++
++  it(
++    '④b projected 恰好 == 软闸 + 1 且比改动前更大(含中文 assetUrl):必须拒绝',
++    async () => {
++      const harness = createDepositHarness()
++      await loadDepositStore()
++      const chineseAssetUrl = buildChineseAssetUrl()
++      await recordDeposit(chineseAssetUrl, draft('a'.repeat(32), 1, 'deposit'))
++      await invalidateDeposit(chineseAssetUrl)
++      expect(peekDepositStoreForTests()?.releasedTombstones[chineseAssetUrl]).toBeTruthy()
++
++      const hash = 'b'.repeat(32)
++      const { gen, writer } = targetGenWriter()
++      const probeEntry = buildProbeEntry(hash, gen, writer)
++      setCapacityPad(0)
++      let { marginal, base } = computeMarginalAndBase(hash, probeEntry, gen, writer)
++      setCapacityPad(DEPOSIT_STATE_SOFT_BYTES + 1 - marginal - base)
++      ;({ marginal, base } = computeMarginalAndBase(hash, probeEntry, gen, writer))
++      expect(base + marginal).toBe(DEPOSIT_STATE_SOFT_BYTES + 1) // 前提断言
++      expect(base).toBeLessThan(DEPOSIT_STATE_SOFT_BYTES + 1) // current 本身没有更大,拒绝确实是因为"超软闸且比改动前更大"这条
++
++      // SC9.7-b 同族扫查补测:④b 与⑥是同一缺陷形状(容量拒绝类),之前只断言了回执
++      // 字段和内存态,没断言磁盘/落盘往返副作用——补齐同一套五元组基线。
++      const filesBefore = harness.brain.files.size
++      const fsWritesBefore = harness.fsRequests.filter((request) => request.op === 'write').length
++      const fsRequestsBefore = harness.fsRequests.length
++      const revisionBefore = peekDepositRevisionSumForTests()
++      const genBefore = peekDepositStoreForTests()?.generation
++
++      const result = await enqueuePendingRelease(hash, 'deposit')
++      expect(result.ok).toBe(false)
++      expect(result.code).toBe('RELEASE_EVIDENCE_CAPACITY')
++      expect(peekDepositStoreForTests()?.pendingReleases[hash]).toBeUndefined()
++      // 磁盘上任何一份候选文件都不应该出现这个 hash——同⑥的落盘内容检查。
++      for (const [, text] of harness.brain.files) expect(String(text)).not.toContain(hash)
++
++      expect(harness.brain.files.size).toBe(filesBefore)
++      expect(harness.fsRequests.filter((request) => request.op === 'write').length).toBe(fsWritesBefore)
++      expect(harness.fsRequests.length).toBe(fsRequestsBefore)
++      expect(peekDepositRevisionSumForTests()).toBe(revisionBefore)
++      expect(peekDepositStoreForTests()?.generation).toBe(genBefore)
++    },
++    30_000,
++  )
++
++  it(
++    '⑤map→tombstone 是缩减(负 delta):即便当前状态已经超软闸,缩减操作仍必须放行,不能把"缩减"也挡死',
++    async () => {
++      createDepositHarness()
++      const assetUrl = 'mivo-asset://shrink-test'
++      await recordDeposit(assetUrl, draft('a'.repeat(32), 1, 'deposit'))
++
++      const snap = peekDepositStoreForTests()
++      if (!snap) throw new Error('unreachable')
++      const withoutPad = byteLen(JSON.stringify({ ...snap, capability: { supported: true, at: 1, reason: '' } }))
++      snap.capability = { supported: true, at: 1, reason: 'x'.repeat(Math.max(0, DEPOSIT_STATE_SOFT_BYTES - withoutPad + 1_000)) }
++      const currentBytes = byteLen(JSON.stringify(peekDepositStoreForTests()))
++      expect(currentBytes).toBeGreaterThan(DEPOSIT_STATE_SOFT_BYTES) // 前提断言:确实已经超软闸
++
++      const result = await invalidateDeposit(assetUrl)
++      expect(result.ok).toBe(true) // 缩减操作(map→tombstone)必须放行,不能因为已经超软闸就一律拒绝
++      expect(peekDepositStoreForTests()?.releasedTombstones[assetUrl]).toBeTruthy()
++      expect(peekDepositStoreForTests()?.map[assetUrl]).toBeUndefined()
++    },
++    30_000,
++  )
++
++  it(
++    '⑥新增 pendingReleases 证据的正 delta 超软闸:拒绝,且内存/dirty/磁盘均不产生这条新证据',
++    async () => {
++      const harness = createDepositHarness()
++      await loadDepositStore()
++      const snap = peekDepositStoreForTests()
++      if (!snap) throw new Error('unreachable')
++      const withoutPad = byteLen(JSON.stringify({ ...snap, capability: { supported: true, at: 1, reason: '' } }))
++      snap.capability = { supported: true, at: 1, reason: 'x'.repeat(Math.max(0, DEPOSIT_STATE_SOFT_BYTES - withoutPad + 1_000)) }
++      const currentBytes = byteLen(JSON.stringify(peekDepositStoreForTests()))
++      expect(currentBytes).toBeGreaterThan(DEPOSIT_STATE_SOFT_BYTES)
++
++      // SC9.7-b(九轮交叉审补测——与 SC9.6①/②同族,这条⑥当时漏补):容量拒绝必须是
++      // 真零副作用,不只是回执字段"看起来拒绝了"。五元组基线在拒绝调用之前取——
++      // files/fsWrite/fsRequests/revision/generation 拒绝之后必须原样不动,任何一项
++      // 前进都说明拒绝路径仍在悄悄发起一次多余的落盘往返(旧实现的真实 bug 形状)。
++      const filesBefore = harness.brain.files.size
++      const fsWritesBefore = harness.fsRequests.filter((request) => request.op === 'write').length
++      const fsRequestsBefore = harness.fsRequests.length
++      const revisionBefore = peekDepositRevisionSumForTests()
++      const genBefore = peekDepositStoreForTests()?.generation
++
++      const hash = 'c'.repeat(32)
++      const result = await enqueuePendingRelease(hash, 'deposit')
++      expect(result.ok).toBe(false)
++      expect(result.code).toBe('RELEASE_EVIDENCE_CAPACITY')
++      expect(peekDepositStoreForTests()?.pendingReleases[hash]).toBeUndefined()
++      // 磁盘上任何一份候选文件都不应该出现这个 hash——这条证据从未离开过"没有发生"的状态。
++      for (const [, text] of harness.brain.files) expect(String(text)).not.toContain(hash)
++
++      expect(harness.brain.files.size).toBe(filesBefore)
++      expect(harness.fsRequests.filter((request) => request.op === 'write').length).toBe(fsWritesBefore)
++      expect(harness.fsRequests.length).toBe(fsRequestsBefore)
++      expect(peekDepositRevisionSumForTests()).toBe(revisionBefore)
++      expect(peekDepositStoreForTests()?.generation).toBe(genBefore)
++    },
++    30_000,
++  )
++
++  it('⑦floor 已满时,普通非释放类提交(recordDeposit)仍必须成功——容量硬闸只挡"创造新释放证据",不挡其它任何提交', async () => {
++    createDepositHarness()
++    await loadDepositStore()
++    const seeded = peekDepositStoreForTests()
++    if (!seeded) throw new Error('unreachable')
++    for (let index = 0; index < DEPOSIT_RELEASED_FLOOR_MAX_ENTRIES; index += 1) {
++      seeded.releasedFloor['seed-' + index] = { generation: 1, at: 1 }
++    }
++
++    const result = await recordDeposit('mivo-asset:ordinary', draft('a'.repeat(32), 1, 'deposit'))
++    expect(result.ok).toBe(true)
++    expect(peekDepositStoreForTests()?.map['mivo-asset:ordinary']).toBeTruthy()
++  })
++
++  // 十轮定案(SC10.4,根治 judge-i P1-1):admission 门从"只挡释放证据"扩大到覆盖
++  // 全部五个正增长入口——recordDeposit/recordMigration/recordCapabilityMark 之前
++  // 完全无闸,超限内容会先无条件写进真实 memory,main.js 的硬闸只在落盘那一刻才
++  // 拒绝,被拒内容却已经永久卡在 memory 里,后续每次提交都会因为这条"幽灵"内容
++  // 重新撞硬闸。下面三条各自复刻⑥的"真零副作用"五元组基线,外加"被拒内容不进
++  // 真实 memory"这条 P1-1 特有断言。
++  it(
++    'SC10.4-a:recordCapabilityMark 在已超软闸的基线上换一个更大的 reason → 拒绝,新 capability 不进真实 memory(不是"看起来拒绝了,其实已经写进内存")',
++    async () => {
++      const harness = createDepositHarness()
++      await loadDepositStore()
++      const snap = peekDepositStoreForTests()
++      if (!snap) throw new Error('unreachable')
++      const withoutPad = byteLen(JSON.stringify({ ...snap, capability: { supported: true, at: 1, reason: '' } }))
++      // 基线已经带一份小 capability,推过软闸——下面提交一份 reason 明显更长的新
++      // capability,必然是净增长,不会因为"恰好和已有值一样大"而被①/②两条豁免
++      // 规则误放行。
++      const originalReasonLength = Math.max(0, DEPOSIT_STATE_SOFT_BYTES - withoutPad + 1_000)
++      snap.capability = { supported: true, at: 1, reason: 'x'.repeat(originalReasonLength) }
++      const currentBytes = byteLen(JSON.stringify(peekDepositStoreForTests()))
++      expect(currentBytes).toBeGreaterThan(DEPOSIT_STATE_SOFT_BYTES) // 前提断言
++
++      const filesBefore = harness.brain.files.size
++      const fsWritesBefore = harness.fsRequests.filter((request) => request.op === 'write').length
++      const fsRequestsBefore = harness.fsRequests.length
++      const revisionBefore = peekDepositRevisionSumForTests()
++      const genBefore = peekDepositStoreForTests()?.generation
++
++      const result = await recordCapabilityMark({ supported: true, at: 1, reason: 'x'.repeat(currentBytes) })
++      expect(result.ok).toBe(false)
++      expect(result.code).toBe('RELEASE_EVIDENCE_CAPACITY')
++      // P1-1 核心断言:被拒的新 capability 没有覆盖进真实 memory——旧值原样保留,
++      // 不是"内存已经脏了,只是磁盘没写"这种半吊子零副作用。
++      expect(peekDepositStoreForTests()?.capability?.reason).toHaveLength(originalReasonLength)
++
++      expect(harness.brain.files.size).toBe(filesBefore)
++      expect(harness.fsRequests.filter((request) => request.op === 'write').length).toBe(fsWritesBefore)
++      expect(harness.fsRequests.length).toBe(fsRequestsBefore)
++      expect(peekDepositRevisionSumForTests()).toBe(revisionBefore)
++      expect(peekDepositStoreForTests()?.generation).toBe(genBefore)
++    },
++    30_000,
++  )
++
++  it(
++    'SC10.4-b:recordMigration 批量条目在已超软闸时被整批拒绝——不是"迁了一半",map 与 migration 标记都不进真实 memory',
++    async () => {
++      const harness = createDepositHarness()
++      await loadDepositStore()
++      const snap = peekDepositStoreForTests()
++      if (!snap) throw new Error('unreachable')
++      const withoutPad = byteLen(JSON.stringify({ ...snap, capability: { supported: true, at: 1, reason: '' } }))
++      snap.capability = { supported: true, at: 1, reason: 'x'.repeat(Math.max(0, DEPOSIT_STATE_SOFT_BYTES - withoutPad + 1_000)) }
++      expect(byteLen(JSON.stringify(peekDepositStoreForTests()))).toBeGreaterThan(DEPOSIT_STATE_SOFT_BYTES) // 前提断言
++
++      const filesBefore = harness.brain.files.size
++      const fsWritesBefore = harness.fsRequests.filter((request) => request.op === 'write').length
++      const fsRequestsBefore = harness.fsRequests.length
++      const revisionBefore = peekDepositRevisionSumForTests()
++      const genBefore = peekDepositStoreForTests()?.generation
++
++      const entries: Array<readonly [string, DepositEntryDraft]> = [
++        ['mivo-asset:mig-1', draft('m1'.repeat(16), 1, 'ledger')],
++        ['mivo-asset:mig-2', draft('m2'.repeat(16), 2, 'ledger')],
++      ]
++      const result = await recordMigration(entries, { version: 1, at: 1, migrated: 2 })
++      expect(result.ok).toBe(false)
++      expect(result.code).toBe('RELEASE_EVIDENCE_CAPACITY')
++      // 整批原子失败:两条条目都不在,migration 标记也不在——不是"部分条目迁了、
++      // 标记没写"这种错位态(recordMigration 头部注释本就要求这份原子性)。
++      expect(peekDepositStoreForTests()?.map['mivo-asset:mig-1']).toBeUndefined()
++      expect(peekDepositStoreForTests()?.map['mivo-asset:mig-2']).toBeUndefined()
++      expect(peekDepositStoreForTests()?.migration).toBeUndefined()
++
++      expect(harness.brain.files.size).toBe(filesBefore)
++      expect(harness.fsRequests.filter((request) => request.op === 'write').length).toBe(fsWritesBefore)
++      expect(harness.fsRequests.length).toBe(fsRequestsBefore)
++      expect(peekDepositRevisionSumForTests()).toBe(revisionBefore)
++      expect(peekDepositStoreForTests()?.generation).toBe(genBefore)
++    },
++    30_000,
++  )
++
++  it(
++    'SC10.4-c:recordDeposit 在已超软闸时新增映射被拒绝——map 条目不进真实 memory,伴随的 tombstone/pendingReleases 清理也一并不发生(原子)',
++    async () => {
++      const harness = createDepositHarness()
++      await loadDepositStore()
++      const snap = peekDepositStoreForTests()
++      if (!snap) throw new Error('unreachable')
++      const withoutPad = byteLen(JSON.stringify({ ...snap, capability: { supported: true, at: 1, reason: '' } }))
++      snap.capability = { supported: true, at: 1, reason: 'x'.repeat(Math.max(0, DEPOSIT_STATE_SOFT_BYTES - withoutPad + 1_000)) }
++      // 预置一条"本该在 recordDeposit 同一事务里被清理"的 pendingReleases——用它验证
++      // 拒绝确实原子:不能只挡住 map 新增,却让 pendingReleases 清理单独漏出去生效。
++      const hash = 'd'.repeat(32)
++      snap.pendingReleases[hash] = { hash, from: 'deposit', at: 1, gen: 1, writer: DEPOSIT_PENDING_WRITER }
++      expect(byteLen(JSON.stringify(peekDepositStoreForTests()))).toBeGreaterThan(DEPOSIT_STATE_SOFT_BYTES) // 前提断言
++
++      const filesBefore = harness.brain.files.size
++      const fsWritesBefore = harness.fsRequests.filter((request) => request.op === 'write').length
++      const fsRequestsBefore = harness.fsRequests.length
++      const revisionBefore = peekDepositRevisionSumForTests()
++      const genBefore = peekDepositStoreForTests()?.generation
++
++      const result = await recordDeposit('mivo-asset:sc104c', draft(hash, 1, 'deposit'))
++      expect(result.ok).toBe(false)
++      expect(result.code).toBe('RELEASE_EVIDENCE_CAPACITY')
++      expect(peekDepositStoreForTests()?.map['mivo-asset:sc104c']).toBeUndefined()
++      // 原子性:被拒时连带的 pendingReleases 清理也不发生——不是"map 挡住了,
++      // pendingReleases 那半却偷偷生效了"。
++      expect(peekDepositStoreForTests()?.pendingReleases[hash]).toBeTruthy()
++
++      expect(harness.brain.files.size).toBe(filesBefore)
++      expect(harness.fsRequests.filter((request) => request.op === 'write').length).toBe(fsWritesBefore)
++      expect(harness.fsRequests.length).toBe(fsRequestsBefore)
++      expect(peekDepositRevisionSumForTests()).toBe(revisionBefore)
++      expect(peekDepositStoreForTests()?.generation).toBe(genBefore)
++    },
++    30_000,
++  )
++})
++
++// 九轮返修:SC9.2(容量闸预演口径缺口)已并入上面 ④a/④b(改用真实 gen/writer,
++// 见其头部注释);SC9.3 三层修法里"main.js 侧同代并集诊断"(SC9.3c)在
++// depositBrain.test.ts 单独测(main.js 真实合并路径,不是这里的 mock transport)。
++describe('depositStore — 九轮返修:多写者场景下源头硬闸的补完(SC9.3a/9.3b)', () => {
++  const byteLen = (text: string): number => new TextEncoder().encode(text).length
++
++  it('SC9.3a:软闸必须严格小于硬闸的一半——两个各自独立守住软闸的写者,同代并集永远不可能撞上硬闸', () => {
++    // 这条断言直接编码"改软闸"这个修法本身的数学前提(设计稿 §4.10.6.1 与常量
++    // 注释同一处推导):任何未来改动这两个常量,只要破坏了这条不等式,就重新打开
++    // SC9.3 的多写者同代并集自锁窗口——常量漂移不该只靠人读注释发现。
++    expect(DEPOSIT_STATE_SOFT_BYTES * 2).toBeLessThan(DEPOSIT_STATE_HARD_BYTES)
++  })
++
++  it(
++    'SC9.3b:CAS 冲突重放的落点(remote)已经超软闸——放弃本次重放里新创造的释放证据,保留其余 dirty 字段照常提交(不是整次提交失败)',
++    async () => {
++      // 复刻 judge `conflictBypass` 反例:本地视角很小(容量闸预检时必然放行),
++      // 但冲突回执带回的 remote 已经超软闸——旧实现只在提交前判过一次「本地视角」,
++      // overlay 换成 remote 基线之后从未复判,新证据照样跟着 overlay 一起被提交,
++      // 让远端体积继续增长。
++      createDepositHarness()
++      await loadDepositStore()
++
++      const withoutPad = byteLen(
++        JSON.stringify({
++          version: 1,
++          generation: 1,
++          map: {},
++          releasedTombstones: {},
++          releasedFloor: {},
++          pendingReleases: {},
++          capability: { supported: true, at: 1, reason: '' },
++        }),
++      )
++      const remoteBase = {
++        version: 1,
++        generation: 1,
++        map: {},
++        releasedTombstones: {},
++        releasedFloor: {},
++        pendingReleases: {},
++        capability: { supported: true, at: 1, reason: 'x'.repeat(Math.max(0, DEPOSIT_STATE_SOFT_BYTES + 1_000 - withoutPad)) },
++      }
++      const remoteBytes = byteLen(JSON.stringify(remoteBase))
++      expect(remoteBytes).toBeGreaterThan(DEPOSIT_STATE_SOFT_BYTES) // 前提断言:remote 确实已经超软闸
++
++      let saveCalls = 0
++      let replayedState: string | null = null
++      setDepositTransport((async (kind: string, payload?: Record<string, unknown>) => {
++        if (kind === 'deposit-state-load') {
++          return { reqId: 'l', reply: true, ok: true, state: null, generation: 0, revisionSum: 'deposit-empty-v1' } as PersistReply
++        }
++        saveCalls += 1
++        if (saveCalls === 1) {
++          return {
++            reqId: 'c',
++            reply: true,
++            ok: false,
++            conflict: true,
++            state: JSON.stringify(remoteBase),
++            generation: 1,
++            revisionSum: 'remote-sum',
++          } as PersistReply
++        }
++        replayedState = String(payload?.state)
++        return { reqId: 's', reply: true, ok: true, generation: 2, revisionSum: 's2' } as PersistReply
++      }) as never)
++
++      const hash = 'd'.repeat(32)
++      const result = await enqueuePendingRelease(hash, 'deposit')
++
++      expect(result.ok).toBe(true) // 提交整体没有失败(map/migration/capability 等其余字段仍照常并入)
++      expect(saveCalls).toBe(2) // 确实经历了一次冲突 + 一次重放
++      const replayedBytes = replayedState ? byteLen(replayedState) : -1
++      expect(replayedBytes).toBe(remoteBytes) // 重放净增长为 0——新证据被放弃,不是"略微超一点也放过去"
++      expect(peekDepositStoreForTests()?.pendingReleases[hash]).toBeUndefined() // 内存里也不该留这条被放弃的证据
++      if (!replayedState) throw new Error('unreachable')
++      expect(JSON.parse(replayedState).pendingReleases[hash]).toBeUndefined() // 落盘内容里更不该有
++    },
++    30_000,
++  )
++
++  it.each<[number, number]>([
++    [9, 10],
++    [99, 100],
++  ])(
++    'judge-h P2(十轮定案修复,gen %i→%i 位数进位):CAS 冲突重放的容量复判必须把 projected/remote 两侧的 payload.generation 都戳到 targetGen 再量字节,否则少算 1 字节,本该拒绝的重放会被误放行',
++    async (remoteGen, targetGen) => {
++      createDepositHarness()
++      setDepositClockForTests(() => 1_700_000_000_000) // 固定 13 位毫秒时间戳,entrySize 计算不受真实时钟位数漂移影响
++      await loadDepositStore()
++
++      // 与生产 measureEnvelopeBytes 同口径:outer gen 与 payload.generation 都是
++      // targetGen(修复后的正确戳法),writer 用生产同一个占位常量(字节数必须
++      // 完全对齐,不能自己另起一个长度不同的字符串)。
++      const hash = 'e'.repeat(32)
++      const envelopeBytes = (payload: Record<string, unknown>): number =>
++        new TextEncoder().encode(
++          JSON.stringify({ schema: 1, gen: targetGen, writer: DEPOSIT_LOCAL_WRITER_PLACEHOLDER, sum: canonicalSum(payload), payload }),
++        ).length
++      const baseShape = (reason: string, withEntry: boolean) => ({
++        version: 1,
++        generation: targetGen,
++        map: {},
++        releasedTombstones: {},
++        releasedFloor: {},
++        pendingReleases: withEntry
++          ? { [hash]: { hash, from: 'deposit', at: 1_700_000_000_000, gen: targetGen, writer: DEPOSIT_LOCAL_WRITER_PLACEHOLDER } }
++          : {},
++        capability: { supported: true, at: 1, reason },
++      })
++      // entrySize:重放叠加的这一条 pendingReleases 新证据,在信封里实际占多少字节
++      // (与 pad 长度无关,只取决于 hash/at/gen/writer 的固定形状)——必须先量出来,
++      // 才能精确反推"remote 自身"要垫到多大,才能让"remote + 这条新证据"恰好卡在
++      // 软闸 + 1(不能直接拿 SOFT+1 当 remote 自身的目标,那样会把新证据的体积也
++      // 算进 remote 里,超调 100+ 字节,盖过了 1 字节位数进位差异本身的可观测性)。
++      const entrySize = envelopeBytes(baseShape('', true)) - envelopeBytes(baseShape('', false))
++      const withoutPad = envelopeBytes(baseShape('', false))
++      const padLen = Math.max(0, DEPOSIT_STATE_SOFT_BYTES + 1 - entrySize - withoutPad)
++      const remoteBase = baseShape('x'.repeat(padLen), false)
++      const remoteBytes = envelopeBytes(remoteBase)
++      const projectedBytes = envelopeBytes(baseShape('x'.repeat(padLen), true))
++      // 前提断言:remote 自身按"正确戳到 targetGen"的口径量,叠加这条新证据之后
++      // (projectedBytes)恰好卡在软闸 + 1——若量测漏戳一位数(payload.generation
++      // 仍是 remoteGen),两侧都会各少 1 字节,projectedBytes 会变成恰好等于软闸
++      // (不超),下面的放弃就不会发生,hash 会被误放行。
++      expect(projectedBytes).toBe(DEPOSIT_STATE_SOFT_BYTES + 1)
++      expect(remoteBytes).toBeLessThanOrEqual(DEPOSIT_STATE_SOFT_BYTES) // 前提断言:remote 自身没有单独超限,拒绝确实是"新证据把它推过线"这条
++
++      let saveCalls = 0
++      let replayedState: string | null = null
++      setDepositTransport((async (kind: string, payload?: Record<string, unknown>) => {
++        if (kind === 'deposit-state-load') {
++          return { reqId: 'l', reply: true, ok: true, state: null, generation: 0, revisionSum: 'deposit-empty-v1' } as PersistReply
++        }
++        saveCalls += 1
++        if (saveCalls === 1) {
++          return {
++            reqId: 'c',
++            reply: true,
++            ok: false,
++            conflict: true,
++            state: JSON.stringify(remoteBase), // 磁盘上实际存的 payload.generation 就是 remoteGen(尚未前进)
++            generation: remoteGen,
++            revisionSum: 'remote-sum',
++          } as PersistReply
++        }
++        replayedState = String(payload?.state)
++        return { reqId: 's', reply: true, ok: true, generation: targetGen, revisionSum: 's2' } as PersistReply
++      }) as never)
++
++      const result = await enqueuePendingRelease(hash, 'deposit')
++
++      expect(result.ok).toBe(true) // 整次提交没有失败,只是这条新证据被放弃
++      expect(saveCalls).toBe(2)
++      if (!replayedState) throw new Error('unreachable')
++      // 核心断言(judge-h P2):这条新证据被正确放弃——只有在 remoteBytes 按"戳到
++      // targetGen"的正确口径量出 SOFT+1(而不是漏戳一位数导致的 SOFT,SOFT 不超限
++      // 就不会触发放弃,hash 会被误放行)时,这里才会是 undefined。落盘的 `state`
++      // 字符串本身不必携带 targetGen(main.js 收到后会用自己的权威值整体覆盖
++      // `parsed.generation`,§4.4.2/`handleDepositStateSave` 的既有行为,不是本轮
++      // 判据),所以这里只断言证据取舍的结果,不再比对 replayedState 的整体字节数。
++      expect(JSON.parse(replayedState).pendingReleases[hash]).toBeUndefined()
++    },
++    30_000,
++  )
++})
++
++// 九轮交叉审(独立于主审)追加发现:容量硬闸拒绝时,旧实现的 `mutateAndCommit` 仍
++// 无条件发起一次落盘往返——内容与磁盘完全一致,却仍然真实前进一次 generation、
++// 真实写出一份新文件。之前的测试(⑤/⑥)只断言了内存/dirty 没有这条证据、从没
++// 数过磁盘写入次数或 generation 是否真的前进,漏了这一层。
++describe('depositStore — 九轮交叉审追加:SC9.6 容量拒绝的真零副作用(含磁盘/generation)', () => {
++  const byteLen = (text: string): number => new TextEncoder().encode(text).length
++
++  it(
++    'SC9.6①:本次 mutation 只包含被拒的释放证据、没有其它任何 dirty 字段——整个提交必须不发生:零 fs 写入,generation 不前进',
++    async () => {
++      const harness = createDepositHarness()
++      await loadDepositStore()
++      const snap = peekDepositStoreForTests()
++      if (!snap) throw new Error('unreachable')
++      const withoutPad = byteLen(JSON.stringify({ ...snap, capability: { supported: true, at: 1, reason: '' } }))
++      snap.capability = { supported: true, at: 1, reason: 'x'.repeat(Math.max(0, DEPOSIT_STATE_SOFT_BYTES - withoutPad + 1_000)) }
++
++      const filesBefore = harness.brain.files.size
++      const genBefore = peekDepositStoreForTests()?.generation
++
++      const hash = 'f'.repeat(32)
++      const result = await enqueuePendingRelease(hash, 'deposit')
++
++      expect(result.ok).toBe(false)
++      expect(result.code).toBe('RELEASE_EVIDENCE_CAPACITY')
++      expect(harness.brain.files.size).toBe(filesBefore) // 零 fs 写入——不是"写了但内容干净",是压根没写
++      expect(peekDepositStoreForTests()?.generation).toBe(genBefore) // generation 原地不动
++    },
++    30_000,
++  )
++
++  it(
++    'SC9.6②:同一批次里除了被拒的释放证据还有其它合法 dirty 字段(另一次并发的 dequeuePendingRelease)——commit 正常发生,但被拒的证据不进入落盘内容',
++    async () => {
++      const harness = createDepositHarness()
++      await loadDepositStore()
++      const snap = peekDepositStoreForTests()
++      if (!snap) throw new Error('unreachable')
++      const withoutPad = byteLen(JSON.stringify({ ...snap, capability: { supported: true, at: 1, reason: '' } }))
++      snap.capability = { supported: true, at: 1, reason: 'x'.repeat(Math.max(0, DEPOSIT_STATE_SOFT_BYTES - withoutPad + 1_000)) }
++      // SC10.4(十轮定案——admission 门统一覆盖 recordDeposit 之后):这份基线已经
++      // 蓄意推过软闸,任何"净增长"的 mutation(包括 recordDeposit 新增 map 条目)
++      // 现在都会被同一道门拒绝——不再是"只挡释放证据"。这条批次原子性测试要选一个
++      // 净减少的合法操作才能验证"其它字段不被连带拖累",改用 `dequeuePendingRelease`
++      // (纯删除,不创造任何新证据,不受这道门管辖)。
++      const legitHash = 'b1'.repeat(16)
++      snap.pendingReleases[legitHash] = { hash: legitHash, from: 'deposit', at: 1, gen: 1, writer: DEPOSIT_PENDING_WRITER }
++
++      // 不在两次调用之间 await——两者的 mutator 都挂在同一个已 resolve 的
++      // `loadDepositStore()` 上,按微任务队列的 FIFO 顺序依次同步跑完,都落进同一份
++      // 尚未被 `enqueueCommit` 摘取的全局 `dirty` 里,才能验证"同一批"这个前提
++      // (与上面 N3 三审测试用显式 gate 控制的是不同的竞态窗口:这里要的是"两个
++      // mutator 在 `enqueueCommit` 摘取快照之前都跑完",不是"跨 await 的在途 mutation")。
++      const hash = 'a1'.repeat(16)
++      const legitCommit = dequeuePendingRelease(legitHash)
++      const rejectedCommit = enqueuePendingRelease(hash, 'deposit')
++
++      const [legitResult, rejectedResult] = await Promise.all([legitCommit, rejectedCommit])
++
++      expect(legitResult.ok).toBe(true) // 其它合法字段的提交没有被这次拒绝连带拖累
++      expect(rejectedResult.ok).toBe(false)
++      expect(rejectedResult.code).toBe('RELEASE_EVIDENCE_CAPACITY')
++      expect(peekDepositStoreForTests()?.pendingReleases[legitHash]).toBeUndefined() // 合法的删除确实落地了
++      expect(peekDepositStoreForTests()?.pendingReleases[hash]).toBeUndefined() // 被拒的证据没有
++
++      // 落盘内容里同样只有合法变更,没有被拒的那条证据(不是"内存干净、磁盘脏"这种半吊子)。
++      // 按 commit 回执的 generation 直接定位这次提交真正落盘的那份信封,不靠内容猜。
++      let sawEnvelope = false
++      for (const [name, text] of harness.brain.files) {
++        if (!name.includes(`state-${String(legitResult.generation).padStart(8, '0')}-`)) continue
++        const parsed = JSON.parse(String(text)) as { payload?: { pendingReleases?: Record<string, unknown> } }
++        sawEnvelope = true
++        expect(parsed.payload?.pendingReleases?.[legitHash]).toBeUndefined()
++        expect(parsed.payload?.pendingReleases?.[hash]).toBeUndefined()
++      }
++      expect(sawEnvelope).toBe(true) // 前提断言:确实找到了那份承载合法删除的落盘信封
++    },
++    30_000,
++  )
++})
++
++describe('depositStore — 诚实兜底', () => {
++  it('候选全部无效 → 缓存空 + 迁移标记缺失(不产生错数据)', async () => {
+     createDepositHarness({
+       files: {
+-        'deposit/state-a.json': '{broken',
+-        'deposit/state-b.json': 'also broken',
+-        'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-a.json', generation: 9 }),
++        'deposit/state-00000009-aaaaaaaa.json': '{broken',
++        'deposit/state-00000009-bbbbbbbb.json': 'also broken',
+       },
+     })
+ 

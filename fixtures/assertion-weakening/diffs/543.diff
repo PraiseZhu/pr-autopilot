@@ -1,0 +1,111 @@
+diff --git a/ghost.json b/ghost.json
+index 04bbc407..47358c77 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.25",
++  "version": "0.9.26",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/settings.html b/settings.html
+index bbcb67b7..5df62adb 100644
+--- a/settings.html
++++ b/settings.html
+@@ -83,7 +83,30 @@
+     white-space: nowrap;
+     cursor: pointer;
+   }
+-  .btn-primary { background: var(--accent-cta-bg-pure, #111111); color: var(--accent-pure-cta-fg, #ffffff) }
++  /* 主按钮(保存 / 校验 / 重试)= Cindy 宿主的「反相 CTA」标准对:Dark 白底黑字 / Light 深底白字。
++     owner 2026-08-06 实测反馈:此前是深色药丸,压在宿主深色卡片底上几乎看不见。
++
++     **权威源是 Cindy 本体,不是本插件的 src/cindy-theme.css**(那只是 mivo 自己的镜像层)。
++     宿主 apps/desktop/src/renderer/themes/colors.ts 注册了三个相关 token:
++       --accent-cta-bg       light #262626 / dark #ffffff   「反相 CTA 背景」
++       --accent-cta-bg-pure  light #000000 / dark #ffffff   「Pure CTA 背景」
++       --accent-pure-cta-fg  light #ffffff / dark #000000   「Pure CTA 文字」
++     而 cindy-brain/ghostPanelTheme.ts 的注入白名单只放行**其中两个**,并且原注释写明了用途:
++       「反相 CTA 一对(意识设置页的主按钮要与宿主 CTA 同观感;2026-07-13 filo-google
++         「连接账号」实撞:不放行时 fallback 黑底,暗色主题下反了)」
++         '--accent-cta-bg', '--accent-pure-cta-fg'
++     所以这一对就是插件设置页主按钮的**标准**,自带明暗反相,不需要我们自己拼。
++
++     此前那个 bug 的真因是**引了没进白名单的那一个**:`--accent-cta-bg-pure` 是真实注册的
++     token(不是编错的名字),但它不在 ghost 注入白名单里 → 沙箱内永不解析 → 一路落到旧的
++     `#111111` 回退值 → 深按钮压深卡。前景那半 `--accent-pure-cta-fg` 从一开始就引对了
++     (它 Dark 下就是 #000000 黑字;colors.ts 里还专门有一行「不能借 accent-pure-cta-fg:
++     那个会在 Dark 翻成黑」为证)。与 filo-google 2026-07-13 那次是同一个坑的同一侧。
++
++     回退值取 Dark 档(#ffffff / #000000):两个 token 都在白名单内、正常必被注入,回退只在
++     注入失败时兜底,而那次事故的教训正是「fallback 落成黑底会在暗色主题下反」。
++     **尺寸与圆角不动**(仍全部由 .btn 基类单点定义)。 */
++  .btn-primary { background: var(--accent-cta-bg, #ffffff); color: var(--accent-pure-cta-fg, #000000) }
+   .btn-primary:disabled { opacity: 0.5; cursor: not-allowed }
+   .btn-pill { background: transparent; color: inherit; border-color: var(--border-default, #e4e4e0) }
+   .link-row { margin-top: 10px; font-size: 13px }
+diff --git a/src/__tests__/mivoSettingsCard.test.ts b/src/__tests__/mivoSettingsCard.test.ts
+index fbf2a719..64c40ae3 100644
+--- a/src/__tests__/mivoSettingsCard.test.ts
++++ b/src/__tests__/mivoSettingsCard.test.ts
+@@ -305,8 +305,14 @@ describe('SC-C3 零蓝紫:颜色与属性双白名单(反转判据,未知一律
+     // 宿主 token + 中性回退值(回退值本身也在本白名单的色相自检覆盖内)
+     'var(--surface, #fff)',
+     'var(--border-default, #e4e4e0)',
+-    'var(--accent-cta-bg-pure, #111111)',
+-    'var(--accent-pure-cta-fg, #ffffff)',
++    // 主按钮 = Cindy 宿主的「反相 CTA」标准对(ghostPanelTheme.ts 注入白名单里那两个:
++    // --accent-cta-bg light #262626 / dark #ffffff,--accent-pure-cta-fg light #ffffff /
++    // dark #000000),自带明暗反相。为什么**不能**用同族的 `--accent-cta-bg-pure`:它虽是
++    // 真实 token,却没进 ghost 注入白名单,沙箱内永不解析 —— 详见 settings.html 那段注释。
++    // 登记在此仅为通过本白名单 —— 白名单只管"有没有引入色相",不校验对比度,
++    // 那由 mivoSettingsCardDom 的 computed 断言与人眼负责。
++    'var(--accent-cta-bg, #ffffff)',
++    'var(--accent-pure-cta-fg, #000000)',
+   ])
+   /** 卡片 CSS 里允许出现的属性名。新增属性必须来这里登记 —— 免得颜色藏在没人扫的属性里
+    *  (box-shadow / outline / fill / stroke / background-image 的渐变都能带颜色)。 */
+diff --git a/src/__tests__/mivoSettingsCardDom.test.ts b/src/__tests__/mivoSettingsCardDom.test.ts
+index 1f2dd7c6..cebaa5a8 100644
+--- a/src/__tests__/mivoSettingsCardDom.test.ts
++++ b/src/__tests__/mivoSettingsCardDom.test.ts
+@@ -71,6 +71,36 @@ describe('SC-C2/C13 R3 尺寸不变量:computed-style 断言(四按钮一个尺
+     expect(getComputedStyle(document.getElementById('badge') as HTMLElement).backgroundColor).not.toBe('')
+   })
+ 
++  // ↓ 两条**色值**断言(三审 R1 席① C1-F1/C1-F2):此前本文件只锁盒模型,而 PR 验收标准写的
++  // 「回退路径 computed 值恰为 bg=#ffffff / color=#000000」与「Dark 白底深字 / Light 深底浅字」
++  // 两条都没有对应断言 —— 声称未上锁。补上之后这两句话才从"作者自述"变成"机器锁"。
++  // happy-dom 实测:不做颜色归一化(`#ffffff` 读回来还是 `#ffffff`),且**能解析注入的自定义属性**,
++  // 所以下面两条都真能咬合。
++  it('宿主 token 缺席时:computed 色值恰为白底黑字(= owner 已确认的观感,C1-F1)', () => {
++    mount()
++    const s = getComputedStyle(document.getElementById('primary') as HTMLElement)
++    expect(s.backgroundColor || s.background).toBe('#ffffff')
++    expect(s.color).toBe('#000000')
++  })
++
++  // 下面两条用的**不是**合成值,而是 Cindy 宿主 colors.ts 里「反相 CTA 一对」的真实注册值
++  // (--accent-cta-bg light #262626 / dark #ffffff;--accent-pure-cta-fg light #ffffff /
++  // dark #000000)。所以它们锁的不是"某个变量接到了某个属性"这种接线细节,而是 owner 的原话
++  // 需求本身:**暗色模式白按钮、亮色模式深按钮**。宿主换肤时重灌 :root,本卡跟着走。
++  it('宿主注入 Dark 档 CTA 值 → 白底黑字(owner 要的暗色观感,C1-F2)', () => {
++    mount(':root { --accent-cta-bg: #ffffff; --accent-pure-cta-fg: #000000 }')
++    const s = getComputedStyle(document.getElementById('primary') as HTMLElement)
++    expect(s.backgroundColor || s.background).toBe('#ffffff')
++    expect(s.color).toBe('#000000')
++  })
++
++  it('宿主注入 Light 档 CTA 值 → 深底白字(自动反相,不会白压浅卡,C1-F2)', () => {
++    mount(':root { --accent-cta-bg: #262626; --accent-pure-cta-fg: #ffffff }')
++    const s = getComputedStyle(document.getElementById('primary') as HTMLElement)
++    expect(s.backgroundColor || s.background).toBe('#262626')
++    expect(s.color).toBe('#ffffff')
++  })
++
+   it('保存/校验/重试/断开:computed padding、border-radius、border 宽度三项全相等', () => {
+     mount()
+     const boxes = buttons().map(boxOf)

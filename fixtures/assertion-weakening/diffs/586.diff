@@ -1,0 +1,51 @@
+diff --git a/src/lib/persistBoot.integration.test.ts b/src/lib/persistBoot.integration.test.ts
+index 5acc335d..cde51f26 100644
+--- a/src/lib/persistBoot.integration.test.ts
++++ b/src/lib/persistBoot.integration.test.ts
+@@ -109,6 +109,13 @@ beforeEach(async () => {
+   resetStoreProjects()
+ })
+ 
++afterEach(() => {
++  // stop the 5s interval at test end — beforeEach's stop only fires before the NEXT test,
++  // leaving a 5s window (current-test tail → next beforeEach) for the leaked timer to fire.
++  // stopPersistWriteQueue is synchronous; no await needed.
++  stopPersistWriteQueue()
++})
++
+ describe('G1-a P1-1 — local 模式 0 网络请求(队列未启动 → enqueue no-op)', () => {
+   it('createProject / renameProject / deleteProject 均 0 fetch(local inert)', async () => {
+     const { calls } = makeCountingFetch()
+diff --git a/src/lib/writeRetryQueue.test.ts b/src/lib/writeRetryQueue.test.ts
+index e33e8f2e..7ee5e4b6 100644
+--- a/src/lib/writeRetryQueue.test.ts
++++ b/src/lib/writeRetryQueue.test.ts
+@@ -836,14 +836,20 @@ describe('FX-5 crash/reload recovery', () => {
+     // NOT replay it into another 401.
+     const exec2 = seqExecutor([{ status: 'success' }])
+     const q2 = makeQueue(exec2.fn)
+-    await q2.start()
+-    expect(q2.isPaused()).toBe(true)
+-    expect(exec2.calls).toHaveLength(0) // paused → no drain (no redundant 401)
+-    // resume() (auth layer, after re-login) → drains
+-    await q2.resume()
+-    expect(q2.isPaused()).toBe(false)
+-    expect(exec2.calls).toHaveLength(1)
+-    expect(await q2.pendingCount()).toBe(0)
++    try {
++      await q2.start()
++      expect(q2.isPaused()).toBe(true)
++      expect(exec2.calls).toHaveLength(0) // paused → no drain (no redundant 401)
++      // resume() (auth layer, after re-login) → drains
++      await q2.resume()
++      expect(q2.isPaused()).toBe(false)
++      expect(exec2.calls).toHaveLength(1)
++      expect(await q2.pendingCount()).toBe(0)
++    } finally {
++      // stop the 5s interval so it cannot leak into later tests (a leaked timer would
++      // ghost-drain the shared IDB with this stale executor mid-later-test)
++      q2.stop()
++    }
+   })
+ 
+   it('a memStore-fallback record stays visible after IDB recovers (no silent loss)', async () => {

@@ -1,0 +1,186 @@
+diff --git a/server/contracts/debug-logs.json b/server/contracts/debug-logs.json
+index 2dad6b6a..80e989d5 100644
+--- a/server/contracts/debug-logs.json
++++ b/server/contracts/debug-logs.json
+@@ -2,7 +2,7 @@
+   "endpoint": "/api/mivo/debug-logs",
+   "summary": "Remote debug log collector. POST: normalize (warning/error only) + sanitize + JSONL append. GET: query with token-gated access. Shares pure helpers with vite.config.test.ts (normalizeRemoteDebugPayload / sanitizeRemoteDebugText / filterRemoteDebugRecords). Runtime truth since P1-c BFF migration: server/routes/debug-logs.ts (dev middleware vite.config.ts is the historical baseline only). D9 (non-Origin ingest token gate) exists in the BFF route only.",
+   "sourceFile": "server/routes/debug-logs.ts (BFF, post-migration truth); dev middleware vite.config.ts L1413-L1416 (historical baseline)",
+-  "dispatchRef": "debugLogsRoute.post('/debug-logs') L326-L367 → hasDebugIngestGrant L188-L194 (D9) + isOriginAllowed L137-L163; dev baseline handleRemoteDebugLogRequest vite.config.ts L419-L457",
++  "dispatchRef": "debugLogsRoute.post('/debug-logs') → hasDebugIngestGrant (D9) + isOriginAllowed; dev baseline handleRemoteDebugLogRequest vite.config.ts L419-L457",
+   "methods": {
+     "POST": "append records",
+     "GET": "query records",
+@@ -70,7 +70,7 @@
+       "request": { "method": "POST", "headers": { "x-mivo-debug-ingest-token": "<matching token>" }, "body": { "entries": [{ "level": "warning", "source": "S", "message": "m", "timestamp": 1 }] } },
+       "expected": { "status": 200, "body": { "ok": true, "accepted": 1 } },
+       "source": "code-derived (BFF post-migration; dev middleware has no D9)",
+-      "sourceRef": "debug-logs.ts L332-L335 (hasDebugIngestGrant gate) + L188-L194; tokenEquals L107-L111",
++      "sourceRef": "debug-logs.ts POST gate (hasDebugIngestGrant + isOriginAllowed 双入口判定) + hasDebugIngestGrant 定义; tokenEquals",
+       "note": "No Origin header present; host-side cindy.fetch strips Origin both ways. Still subject to Content-Type 415 / per-IP rate limit 429 / 1MB body 413 / disk quota 413 — the token gate only replaces the Origin check."
+     },
+     {
+@@ -79,7 +79,7 @@
+       "request": { "method": "POST", "headers": {}, "body": { "entries": [{ "level": "warning", "source": "S", "message": "m", "timestamp": 1 }] } },
+       "expected": { "status": 403, "body": { "ok": false, "error": "Origin not allowed" } },
+       "source": "code-derived (BFF post-migration)",
+-      "sourceRef": "debug-logs.ts L332-L338; isOriginAllowed L148-L150 (prod: no Origin → false)"
++      "sourceRef": "debug-logs.ts POST gate (falls through to isOriginAllowed); isOriginAllowed prod 分支 (no Origin → false)"
+     },
+     {
+       "name": "D9-2b: POST no Origin + wrong token → 403",
+@@ -87,7 +87,7 @@
+       "request": { "method": "POST", "headers": { "x-mivo-debug-ingest-token": "<wrong token>" }, "body": { "entries": [{ "level": "warning", "source": "S", "message": "m", "timestamp": 1 }] } },
+       "expected": { "status": 403, "body": { "ok": false, "error": "Origin not allowed" } },
+       "source": "code-derived (BFF post-migration)",
+-      "sourceRef": "debug-logs.ts L188-L194 (tokenEquals mismatch → hasDebugIngestGrant false → fall through to Origin gate → 403)"
++      "sourceRef": "debug-logs.ts hasDebugIngestGrant (tokenEquals mismatch → false → fall through to Origin gate → 403)"
+     },
+     {
+       "name": "D9-2c: POST no Origin + token unset env → 403 (fail-closed)",
+@@ -95,7 +95,7 @@
+       "request": { "method": "POST", "headers": { "x-mivo-debug-ingest-token": "<any token>" }, "body": { "entries": [{ "level": "warning", "source": "S", "message": "m", "timestamp": 1 }] } },
+       "expected": { "status": 403, "body": { "ok": false, "error": "Origin not allowed" } },
+       "source": "code-derived (BFF post-migration)",
+-      "sourceRef": "debug-logs.ts L190-L191 (configured empty → hasDebugIngestGrant false) — behavior byte-identical to pre-D9"
++      "sourceRef": "debug-logs.ts hasDebugIngestGrant (configured empty → false) — behavior byte-identical to pre-D9"
+     },
+     {
+       "name": "D9-3: POST with Origin + matching token still cannot bypass allowlist",
+@@ -103,7 +103,7 @@
+       "request": { "method": "POST", "headers": { "origin": "https://evil.example", "x-mivo-debug-ingest-token": "<matching token>" }, "body": { "entries": [{ "level": "warning", "source": "S", "message": "m", "timestamp": 1 }] } },
+       "expected": { "status": 403, "body": { "ok": false, "error": "Origin not allowed" } },
+       "source": "code-derived (BFF post-migration)",
+-      "sourceRef": "debug-logs.ts L189 (hasDebugIngestGrant: origin present → always false); L332-L338 (falls through to isOriginAllowed → allowlist/same-origin only)",
++      "sourceRef": "debug-logs.ts hasDebugIngestGrant (origin present → always false); POST gate falls through to isOriginAllowed → allowlist/same-origin only",
+       "note": "Invariant ②: token never participates when Origin is present; Origin chain (same-origin allow / cross-origin allowlist / malformed reject) is byte-unchanged."
+     },
+     {
+@@ -112,7 +112,7 @@
+       "request": { "method": "GET", "headers": { "x-mivo-debug-ingest-token": "<matching ingest token>" } },
+       "expected": { "status": 403, "body": { "ok": false, "error": "Debug report token required" } },
+       "source": "code-derived (BFF post-migration)",
+-      "sourceRef": "debug-logs.ts L369-L371 (hasViewAccess only reads x-mivo-debug-token / ?token= vs MIVO_DEBUG_VIEW_TOKEN); ingest token grants no read capability"
++      "sourceRef": "debug-logs.ts hasViewAccess (only reads x-mivo-debug-token / ?token= vs MIVO_DEBUG_VIEW_TOKEN); ingest token grants no read capability"
+     }
+   ],
+   "getScenarios": [
+diff --git a/server/routes/debug-logs.route.test.ts b/server/routes/debug-logs.route.test.ts
+index 222ae89b..64149c1f 100644
+--- a/server/routes/debug-logs.route.test.ts
++++ b/server/routes/debug-logs.route.test.ts
+@@ -1025,3 +1025,60 @@ describe('debug-logs route — D9: ingest token(POST-only)+ Origin 路径回归
+     expect(res.status).toBe(200)
+   })
+ })
++
++// ── 空串 Origin 行为锁(issue #545 唯一担心的语义分歧场景)────────────────────────
++// hasOrigin(唯一 falsy 语义源)把 undefined 与空串统一判为『无 Origin』。本块锁死跨函数
++// 不变式:isOriginAllowed 与 hasDebugIngestGrant 对空串的判定必须同为『无 Origin』——
++// 即『空串 Origin』与『缺失 Origin』行为逐字节等价。三条分别锁 POST 判定式里两条并列
++// 判据对空串的判定一致:(a) 走 token 支路(与 D9 无 Origin + 正确 token 等价);
++// (b)(c) 走 Origin 支路(生产 fail-closed / 非生产 dev compat,与无 Origin 各分支等价)。
++describe('debug-logs route — 空串 Origin 行为锁(空串与缺失 Origin 等价)', () => {
++  // 与既有 INGEST 同样拼接构造,避免被字面量扫描误判成真凭证。
++  const EMPTY_ORIGIN_INGEST = ['empty-origin', 'ingest', 'fixture'].join('-')
++  const EMPTY_ORIGIN_ENV = ['NODE_ENV', 'MIVO_PUBLIC', 'MIVO_PUBLIC_ORIGIN', 'MIVO_DEBUG_INGEST_TOKEN', 'MIVO_DEBUG_ALLOWED_ORIGINS', 'MIVO_DEBUG_POST_RATE_LIMIT', 'MIVO_DEBUG_VIEW_TOKEN']
++  const saved: Record<string, string | undefined> = {}
++  beforeEach(() => {
++    for (const n of EMPTY_ORIGIN_ENV) saved[n] = process.env[n]
++    for (const n of EMPTY_ORIGIN_ENV) delete process.env[n]
++    __resetDebugLogsRateLimit()
++  })
++  afterEach(() => {
++    for (const n of EMPTY_ORIGIN_ENV) {
++      if (saved[n] === undefined) delete process.env[n]
++      else process.env[n] = saved[n]
++    }
++    __resetDebugLogsRateLimit()
++  })
++
++  // 与 D9 relayPost 同构,仅多 origin:'' 头(空串 header 能传进 handler:底层走真实
++  // Headers,c.req.header('origin') 拿到 '' 而非 undefined)。
++  const emptyOriginPost = (token?: string) =>
++    request(
++      'POST',
++      jsonBody({ clientId: 'c1', sessionId: 's1', entries: [{ level: 'error', source: 'Plugin', message: 'm', timestamp: 1 }] }),
++      token === undefined
++        ? { 'content-type': 'application/json', origin: '' }
++        : { 'content-type': 'application/json', origin: '', 'x-mivo-debug-ingest-token': token },
++    )
++
++  it('生产 + 空串 Origin + 正确 ingest token → 200(空串走 token 入口,与无 Origin 同)', async () => {
++    process.env.NODE_ENV = 'production'
++    process.env.MIVO_DEBUG_INGEST_TOKEN = EMPTY_ORIGIN_INGEST
++    const res = await emptyOriginPost(EMPTY_ORIGIN_INGEST)
++    expect(res.status).toBe(200)
++    expect((await json(res)).accepted).toBe(1)
++  })
++
++  it('生产 + 空串 Origin + 无 token → 403(空串不因非 undefined 被当作有 Origin 而走 allowlist 分支)', async () => {
++    process.env.NODE_ENV = 'production'
++    const res = await emptyOriginPost()
++    expect(res.status).toBe(403)
++    expect((await json(res)).error).toBe('Origin not allowed')
++  })
++
++  it('非生产 + 空串 Origin + 无 token → 200(dev compat 分支同样把空串当无 Origin)', async () => {
++    const res = await emptyOriginPost()
++    expect(res.status).toBe(200)
++    expect((await json(res)).accepted).toBe(1)
++  })
++})
+diff --git a/server/routes/debug-logs.ts b/server/routes/debug-logs.ts
+index 7464f443..e5570582 100644
+--- a/server/routes/debug-logs.ts
++++ b/server/routes/debug-logs.ts
+@@ -135,6 +135,16 @@ const isSameOrigin = (
+   return true
+ }
+ 
++// hasOrigin:『这个请求有没有带 Origin』的唯一 falsy 语义源(undefined 与空串均视为无)。
++// 三个消费点全部经此 predicate——改"没有 Origin"的含义时只需改这一处:
++//   isOriginAllowed 生产 fail-closed 分支 / 开发 dev-compat 分支 — 均为 `!hasOrigin(origin)` 早退,
++//     早退之后函数剩余部分 origin 被收窄为 string(isSameOrigin / parseSerializedOrigin /
++//     rawSet.has / LOCALHOST_ORIGIN.test 直接吃它,不需 as 断言);
++//   hasDebugIngestGrant 不变式② — `hasOrigin(origin)` 正向早退,该分支内不使用 origin 值。
++// 返回 type predicate(origin is string) 而非 boolean: boolean 不产生收窄,上述四处会报 TS2345,
++// 只能靠 as 断言补救——那是"我保证",predicate 是编译器验证。
++const hasOrigin = (origin: string | undefined): origin is string => Boolean(origin)
++
+ const isOriginAllowed = (
+   origin: string | undefined,
+   allowed: { explicit: boolean; rawSet: Set<string>; normSet: Set<string> },
+@@ -146,8 +156,9 @@ const isOriginAllowed = (
+   //   MIVO_DEBUG_ALLOWED_ORIGINS 显式配置(归一匹配,大小写/默认端口对称);无 Origin 维持 fail-closed
+   //   (浏览器 POST 必带 Origin;非浏览器生产不应打 debug POST)。返修前(R2-4)"无 allowlist 一律拒(含同源)"
+   //   把同源浏览器 POST 也拒了 → 客户端 debugLogger 写入全 403 → prod e2e 4 场景红。
++  // 「无 Origin」判据统一走 hasOrigin(唯一 falsy 语义源,见其定义处)。
+   if (isProdBoundary()) {
+-    if (!origin) return false // fail-closed:无 Origin 拒(浏览器 POST 必带 Origin;非浏览器生产不应打 debug POST)
++    if (!hasOrigin(origin)) return false // fail-closed:无 Origin 拒(浏览器 POST 必带 Origin;非浏览器生产不应打 debug POST)
+     if (isSameOrigin(origin, hostHeader, protoHeader)) return true // 同源:默认放行(lead 裁定)
+     if (allowed.explicit) {
+       // 跨域:allowlist 归一匹配(R5:畸形 Origin 不进 allowlist — parseSerializedOrigin 拒则 false)。
+@@ -158,7 +169,7 @@ const isOriginAllowed = (
+     return false // 跨域无 allowlist:拒
+   }
+   // 非生产:dev compat(零变化 — 无 Origin 放行 + allowlist 原始字符串匹配 + localhost 兜底)
+-  if (!origin) return true // non-browser / same-origin request carries no Origin
++  if (!hasOrigin(origin)) return true // non-browser / same-origin request carries no Origin
+   if (allowed.explicit) return allowed.rawSet.has(origin)
+   return LOCALHOST_ORIGIN.test(origin)
+ }
+@@ -184,10 +195,9 @@ const isOriginAllowed = (
+ //   ② 请求带 Origin → 恒 false(哪怕 token 配了且头也对),既有 Origin 判定链
+ //      (同源放行 / 跨域 allowlist / 畸形拒绝)完全不受影响,不存在"拿 token 绕过
+ //      Origin allowlist"的旁路。
+-// "无 Origin" 的判据与 isOriginAllowed 用同一套 falsy 语义(空串也算无),避免两个
+-// 函数对"没有 Origin"的理解出现缝隙。
++// "无 Origin" 判据与 isOriginAllowed 共用 hasOrigin(唯一 falsy 语义源,空串也算无)。
+ const hasDebugIngestGrant = (origin: string | undefined, headerToken: string | undefined): boolean => {
+-  if (origin) return false // 不变式②:带 Origin 的请求一律走既有 Origin 链,本入口不介入
++  if (hasOrigin(origin)) return false // 不变式②:带 Origin 的请求一律走既有 Origin 链,本入口不介入
+   const configured = process.env.MIVO_DEBUG_INGEST_TOKEN?.trim() ?? ''
+   if (!configured) return false // 不变式①:未配置 → fail-closed 关闭
+   if (!headerToken) return false

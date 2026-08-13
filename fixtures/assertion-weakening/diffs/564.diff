@@ -1,0 +1,1659 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index bf011bc8..f63d1b38 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -557,9 +557,6 @@ jobs:
+       - name: Install Playwright Chromium
+         run: npx playwright install --with-deps chromium
+ 
+-      - name: Build production bundle
+-        run: npm run build
+-
+       - name: Run prod subset e2e (dom + leafer)
+         run: |
+           set -o pipefail
+@@ -567,6 +564,9 @@ jobs:
+           # --renderer=both 经 npm 的 -- 透传到 e2e-runner.mjs 的 parseRenderer。
+           # 场景清单权威源:package.json 的 test:e2e:prod:subset(当前 9 场景)× 2 渲染器;
+           # 若实际时长逼近 20min 上限,改为 dom/leafer 矩阵并行。改 subset 清单时回来同步这里。
++          # #560:build 已内嵌在 test:e2e:prod:subset script 本身(VITE_MIVO_PERSIST=local
++          # npm run build && ...),不再需要本 job 独立的 "Build production bundle" 步骤——
++          # 旧版两处各 build 一次,workflow 层那次的产物会被这里立即覆盖,纯浪费一次 build。
+           npm run test:e2e:prod:subset -- --renderer=both 2>&1 | tee test-artifacts/e2e-prod-subset.log
+ 
+       # leafer 阶段 skip 清单汇总进 job summary —— 不许静默。
+@@ -588,8 +588,19 @@ jobs:
+             echo '```'
+           } >> "$GITHUB_STEP_SUMMARY"
+ 
+-      - name: Upload failing e2e artifacts
+-        if: failure()
++      # #560:e2e-runner.mjs 自身已在上一步跑测试期间调用过一次台账校验(结果已写进
++      # job summary);这里独立补一步是为了覆盖"e2e-runner.mjs 从未启动"的 setup 阶段
++      # 失败(build 炸掉、dev/BFF server 起不来等)——那种情况下 runId 从未生成,LATEST
++      # 指针缺失,需要一条明确诊断,而不是让读者去翻原始测试日志猜。always() 保证
++      # 正常成功与失败两类 run 都跑这步。
++      - name: E2E ledger summary
++        if: always()
++        run: node scripts/e2e/ledger-summary.mjs --latest
++
++      # #560:上传条件同样改 always()——正常成功与失败两类 run 都要能下载到 ledger
++      # artifact(不再只在 job 红了才留证据),配上一步 ledger-summary 一起服务同一诉求。
++      - name: Upload e2e artifacts
++        if: always()
+         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+           name: e2e-prod-subset-artifacts
+@@ -629,10 +640,9 @@ jobs:
+       - name: Install Playwright Chromium
+         run: npx playwright install --with-deps chromium
+ 
+-      - name: Build production bundle
+-        run: npm run build
+-
+       # 阻断:kernel gate 失败即令本 step 红 → job 红 → 挡 PR 合并(required check)。
++      # #560:build 已内嵌在 test:e2e:prod:subset script 本身,不再需要本 job 独立的
++      # "Build production bundle" 步骤(同 e2e-prod-subset job 的理由,见上方注释)。
+       - name: Run prod subset e2e (kernel=new)
+         run: |
+           set -o pipefail
+@@ -653,8 +663,16 @@ jobs:
+             echo '```'
+           } >> "$GITHUB_STEP_SUMMARY"
+ 
+-      - name: Upload failing e2e artifacts
+-        if: failure()
++      # #560:同 e2e-prod-subset job——覆盖"e2e-runner.mjs 从未启动"的 setup 阶段失败,
++      # 那种情况下 runId 从未生成,需要一条明确诊断。
++      - name: E2E ledger summary
++        if: always()
++        run: node scripts/e2e/ledger-summary.mjs --latest
++
++      # #560:上传条件同样改 always()——正常成功与失败两类 run 都要能下载到 ledger
++      # artifact(不再只在 job 红了才留证据),配上一步 ledger-summary 一起服务同一诉求。
++      - name: Upload e2e artifacts
++        if: always()
+         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+           name: e2e-kernel-gate-artifacts
+diff --git a/.github/workflows/nightly-e2e.yml b/.github/workflows/nightly-e2e.yml
+index ccb6d9a6..69603304 100644
+--- a/.github/workflows/nightly-e2e.yml
++++ b/.github/workflows/nightly-e2e.yml
+@@ -46,17 +46,29 @@ jobs:
+       - name: Install Playwright Chromium
+         run: npx playwright install --with-deps chromium
+ 
+-      - name: Build production bundle
+-        run: npm run build
+-
++      # #560:build 已内嵌在 test:e2e:prod:full script 本身(package.json:
++      # VITE_MIVO_PERSIST=local npm run build && ...),不再需要本 job 独立的
++      # "Build production bundle" 步骤——旧版两处各 build 一次,workflow 层那次的
++      # 产物会被这里立即覆盖,纯浪费一次 build。
+       - name: Run full prod e2e
+         run: |
+           set -o pipefail
+           mkdir -p test-artifacts
+           npm run test:e2e:prod:full 2>&1 | tee test-artifacts/nightly-e2e-prod-full.log
+ 
+-      - name: Upload failing nightly artifacts
+-        if: failure()
++      # #560:e2e-runner.mjs 自身已在上一步跑测试期间调用过一次台账校验(结果已写进
++      # job summary);这里独立补一步是为了覆盖"e2e-runner.mjs 从未启动"的 setup 阶段
++      # 失败——那种情况下 runId 从未生成,LATEST 指针缺失,需要一条明确诊断。always()
++      # 保证正常成功与失败两类 run 都跑这步。
++      - name: E2E ledger summary
++        if: always()
++        run: node scripts/e2e/ledger-summary.mjs --latest
++
++      # #560:上传条件同样改 always()——正常成功与失败两类 run 都要能下载到 ledger
++      # artifact,配上一步 ledger-summary 一起服务同一诉求;步骤名去掉"failing"前缀
++      # 与新条件对齐(不再是"只在失败时上传")。
++      - name: Upload nightly artifacts
++        if: always()
+         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+           name: nightly-e2e-prod-full-artifacts
+@@ -116,9 +128,10 @@ jobs:
+       - name: Install Playwright Chromium
+         run: npx playwright install --with-deps chromium
+ 
+-      - name: Build production bundle
+-        run: npm run build
+-
++      # #560 核实结论:test:e2e:gated:authorized(scripts/e2e-gated-check.mjs)是纯 fetch
++      # 打 BFF 的 HTTP 检查,不起浏览器、不读 dist/(见该脚本文件头注释"CI 无需 Playwright
++      # 或构建产物"),原 "Build production bundle" 步骤在本 job 里从未被下游任何步骤消费,
++      # 纯浪费——直接删除,不是"改脚本让它自带 build"(它压根不需要 build)。
+       - name: Run direct real-upstream auth smoke
+         run: |
+           set -o pipefail
+diff --git a/scripts/ci/structure-guard.mjs b/scripts/ci/structure-guard.mjs
+index 966e023d..a714c6e3 100644
+--- a/scripts/ci/structure-guard.mjs
++++ b/scripts/ci/structure-guard.mjs
+@@ -83,6 +83,30 @@ function resolveSpecPath(spec, fromFileRel) {
+   }
+   return segs.join('/')
+ }
++// Rule ⑤ 用:AST 提取所有 `<expr>.newContext(` 调用点(seat①-claude-adv R1 复现:旧版
++// `content.includes('browser.newContext(')` 是字面子串匹配,只认标识符恰好叫 browser 这一种
++// 写法,`const b = browser; b.newContext(...)` 这种重命名/中间变量即可绕过,且与同文件里
++// rule④ 的 AST 方案不一致。改为遍历 CallExpression,只要属性访问名恰好是 newContext 就命中,
++// 不依赖接收者标识符名字——与判断"是否经过 newObservedContext 包装"这件事的语义(有没有走
++// 封装函数,而非"变量叫不叫 browser")对齐。仍非绝对防御(如 obj['newContext'](...) 计算属性访问
++// 不会命中),但已消灭"改个变量名就绕过"这一最直接的旁路,威胁模型是防意外遗漏不是防故意规避。
++function scanNewContextCallSites(rel, content) {
++  const hits = []
++  const sf = ts.createSourceFile(rel || 'scan.mjs', content, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS)
++  function visit(node) {
++    if (
++      ts.isCallExpression(node) &&
++      ts.isPropertyAccessExpression(node.expression) &&
++      node.expression.name.text === 'newContext'
++    ) {
++      hits.push(node)
++    }
++    ts.forEachChild(node, visit)
++  }
++  visit(sf)
++  return hits
++}
++
+ // Rule ④: server 非 routes 层(lib/persist/platform/tasks)禁 import server/routes。
+ // routing 是 server 顶层,下层不得反向依赖 routes。纯函数(入参 [{rel, content}]),便于 fixture 红测。
+ export function checkServerDirectionRule(files) {
+@@ -108,6 +132,10 @@ const warnings = []
+ const failures = []
+ 
+ function listTsFiles(dir) {
++  return listFilesByExt(dir, /\.(ts|tsx)$/)
++}
++
++function listFilesByExt(dir, pattern) {
+   const out = []
+   const stack = [dir]
+   while (stack.length) {
+@@ -128,7 +156,7 @@ function listTsFiles(dir) {
+       }
+       if (st.isDirectory()) {
+         stack.push(full)
+-      } else if (/\.(ts|tsx)$/.test(entry)) {
++      } else if (pattern.test(entry)) {
+         out.push(full)
+       }
+     }
+@@ -315,6 +343,33 @@ const dirViolations = checkServerDirectionRule(serverFileList)
+ for (const v of dirViolations) failures.push(v)
+ console.log(`[OK] server 分层方向: ${serverFileList.length} 个生产 server 文件扫描,${dirViolations.length} 方向违规(基线 0,非 routes→routes 即 FAIL)`)
+ 
++// --- 规则 ⑤ e2e context 观测覆盖(scripts/e2e/** 禁裸 .newContext();#560)---
++// pageerror 观测靠 attachPageErrorObserver 挂在 context 上(browser-error-guard.mjs),
++// 场景自建 context 若绕开 newObservedContext() 直接 browser.newContext(),该 context 上
++// 的未捕获异常永远进不了诊断——migration.mjs/coordinate-probe.mjs 早年各自 newContext()
++// 时就漏挂过一次,直到人工发现才补。newObservedContext 是唯一合规入口,本规则防止未来
++// 再有场景绕开它;只扫 scripts/e2e/**(scripts/visual-diff.mjs、scripts/bench/collect.mjs
++// 的 newContext 不在 e2e 观测范围内,天然不在扫描目录中)。
++// 用 scanNewContextCallSites(AST 属性访问名匹配,见上方定义)而非字面子串匹配:旧版
++// `content.includes('browser.newContext(')` 只认接收者恰好叫 browser,`const b = browser`
++// 重命名一次即可绕过(seat①-claude-adv R1 复现)。
++const OBSERVED_CONTEXT_HELPER_REL = 'scripts/e2e/browser-error-guard.mjs'
++const e2eScanFiles = listFilesByExt(join(REPO_ROOT, 'scripts/e2e'), /\.mjs$/)
++let bareContextHits = 0
++for (const f of e2eScanFiles) {
++  const rel = relative(REPO_ROOT, f).replace(/\\/g, '/')
++  if (rel === OBSERVED_CONTEXT_HELPER_REL) continue // newObservedContext 自身实现里的 .newContext( 调用是合法的
++  const content = readFileSync(f, 'utf8')
++  const hits = scanNewContextCallSites(rel, content)
++  if (hits.length) {
++    bareContextHits += hits.length
++    failures.push(
++      `[FAIL] 裸 .newContext() 调用(${hits.length} 处): ${rel} —— 未经 newObservedContext 挂 pageerror 观测,改用 newObservedContext(browser, options)(browser-error-guard.mjs),否则该 context 的未捕获异常永远进不了诊断(#560)`
++    )
++  }
++}
++console.log(`[OK] e2e context 观测覆盖: ${e2eScanFiles.length} 个 scripts/e2e/**/*.mjs 文件扫描,${bareContextHits} 处裸 newContext(基线 0,任何命中即 FAIL)`)
++
+ // --- 汇总 ---
+ console.log(`\n结构守卫: ${allFiles.length} 个文件扫描完毕,${failures.length} FAIL,${warnings.length} WARN`)
+ 
+diff --git a/scripts/ci/structure-guard.test.mjs b/scripts/ci/structure-guard.test.mjs
+index ba9d31b0..b69b51e9 100644
+--- a/scripts/ci/structure-guard.test.mjs
++++ b/scripts/ci/structure-guard.test.mjs
+@@ -1,7 +1,8 @@
+-// scripts/ci/structure-guard.test.mjs — A7a-3 新规则红测。
+-// 两条新规则各配「故意违规 → FAIL」+「干净 → PASS」:
++// scripts/ci/structure-guard.test.mjs — A7a-3 + #560 新规则红测。
++// 各规则配「故意违规 → FAIL」+「干净 → PASS」:
+ //  ④ server 分层方向(非 routes 层禁 import server/routes)
+ //  ① 扩面:src/app 入扫描(LibraryWorkspace 白名单;非白名单 >900 绝对 FAIL)
++//  ⑤ e2e context 观测覆盖(scripts/e2e/** 禁裸 browser.newContext(),#560)
+ //
+ // 用 MIVO_GUARD_ROOT 把扫描根重定向到临时 fixture 目录,spawn 真守卫脚本,验实际行为。
+ // .mjs:守卫是无 .d.ts 的 ESM 脚本,.ts 导入触发 TS7016;且守卫内联执行(导入会跑全脚本),
+@@ -202,6 +203,53 @@ describe('structure-guard rule ④ server 分层方向 (A7a-3)', () => {
+   })
+ })
+ 
++describe('structure-guard rule ⑤ e2e context 观测覆盖 (#560)', () => {
++  it('RED: scripts/e2e/** 下裸 browser.newContext( → FAIL,恰好拦住这 1 条', () => {
++    const root = makeFixture([
++      CHATSTORE,
++      { path: 'scripts/e2e/foo-scenario.mjs', content: "export const run = async (browser) => {\n  const ctx = await browser.newContext({ viewport: { width: 1, height: 1 } })\n  return ctx\n}\n" },
++    ])
++    const { exit, out } = runGuard(root)
++    expect(exit).toBe(1)
++    expect(out).toContain('裸 .newContext(')
++    expect(out).toContain('scripts/e2e/foo-scenario.mjs')
++  })
++
++  it('CLEAN: scripts/e2e/** 下改用 newObservedContext(browser, ...) → PASS(不误报)', () => {
++    const root = makeFixture([
++      CHATSTORE,
++      { path: 'scripts/e2e/foo-scenario.mjs', content: "import { newObservedContext } from './browser-error-guard.mjs'\nexport const run = async (browser) => {\n  const ctx = await newObservedContext(browser, { viewport: { width: 1, height: 1 } })\n  return ctx\n}\n" },
++    ])
++    const { exit, out } = runGuard(root)
++    expect(exit).toBe(0)
++    expect(out).not.toContain('裸 .newContext(')
++  })
++
++  it('CLEAN: scripts/e2e/browser-error-guard.mjs 自身的 browser.newContext( 实现不被误伤(排除该文件)', () => {
++    const root = makeFixture([
++      CHATSTORE,
++      { path: 'scripts/e2e/browser-error-guard.mjs', content: "export const newObservedContext = async (browser, options) => {\n  const context = await browser.newContext(options)\n  return context\n}\n" },
++    ])
++    const { exit, out } = runGuard(root)
++    expect(exit).toBe(0)
++    expect(out).not.toContain('裸 .newContext(')
++  })
++
++  it('RED(#560 R1 seat①-claude-adv 复现):变量重命名后调用 .newContext( → 仍 FAIL,不能靠接收者字面量叫 browser 才检测', () => {
++    // 旧版 `content.includes('browser.newContext(')` 是字面子串匹配,只认接收者恰好
++    // 叫 browser——`const b = browser; b.newContext(...)` 这种一次重命名即可绕过。
++    // 改为 AST 匹配任意 `<expr>.newContext(` 属性访问后,此处必须仍能命中。
++    const root = makeFixture([
++      CHATSTORE,
++      { path: 'scripts/e2e/bypass-scenario.mjs', content: "export const run = async (browser) => {\n  const b = browser\n  const ctx = await b.newContext({ viewport: { width: 1, height: 1 } })\n  return ctx\n}\n" },
++    ])
++    const { exit, out } = runGuard(root)
++    expect(exit).toBe(1)
++    expect(out).toContain('裸 .newContext(')
++    expect(out).toContain('scripts/e2e/bypass-scenario.mjs')
++  })
++})
++
+ describe('structure-guard rule ① 扩面:src/app 入扫描 (A7a-3)', () => {
+   it('RED: src/app 非白名单文件 >900 行 → FAIL', () => {
+     const root = makeFixture([
+diff --git a/scripts/e2e-runner.mjs b/scripts/e2e-runner.mjs
+index 0c2a3551..cfd5b3a3 100644
+--- a/scripts/e2e-runner.mjs
++++ b/scripts/e2e-runner.mjs
+@@ -1,23 +1,16 @@
+ import { spawn } from 'node:child_process'
+ import { fileURLToPath } from 'node:url'
+ import { scenarioOrder } from './e2e/scenarios/index.mjs'
+-import { appendLedgerRecord, buildLedgerRecord, readAttemptFragments } from './e2e/result-ledger.mjs'
+-
+-// 台账(report-only):子进程 close 后读它写下的 attempt fragment,合并进单次尝试的
+-// 记录。fallbackStatus/fallbackMessage 只在子进程连 fragment 都没写下时兜底(例如
+-// dev/bff server 启动失败,scenario 从未真正跑起来)——报告失败但缺细节,好过一条
+-// 台账记录都没有。
+-const readCellAttemptResult = (scenarioName, attempt, fallbackStatus, fallbackMessage) => {
+-  const fragments = readAttemptFragments()
+-  const fragment = fragments.find((f) => f.scenario === scenarioName) ?? null
+-  return {
+-    attempt,
+-    status: fragment?.status ?? fallbackStatus,
+-    durationMs: fragment?.durationMs ?? 0,
+-    message: fragment?.message ?? fallbackMessage ?? null,
+-    pageErrors: fragment?.pageErrors ?? [],
+-  }
+-}
++import {
++  appendLedgerRecord,
++  buildRunId,
++  buildLedgerRecord,
++  getHeadSha,
++  resolveAttemptResult,
++  writeLatestPointer,
++  writeManifest,
++} from './e2e/result-ledger.mjs'
++import { printSummary } from './e2e/ledger-summary.mjs'
+ 
+ const parseTopology = (argv) => {
+   for (let index = 0; index < argv.length; index += 1) {
+@@ -180,13 +173,23 @@ if (persist === 'server') {
+ } else {
+   // local/shadow 档:走原 scenario 矩阵,透传 --persist 旗标给 e2e-smoke(前端 persistMode.ts 读 URL ?persist=)。
+ 
+-
+ const rendererModes = renderer === 'both' ? ['dom', 'leafer'] : [renderer]
+ // both → 先 legacy 后 new(contract §7);单值 → [该值]。kernel 维度在最外层串行。
+ const kernelModes = kernel === 'both' ? ['legacy', 'new'] : [kernel]
+ 
++// 台账(#560 SC-3/SC-4):每次 run 生成唯一 runId,写 manifest(含 expectedCells 笛卡尔积)
++// 与 LATEST 指针(CI 的 job-summary 步骤是与测试步骤分离的独立 step,读不到本进程内部
++// 变量,只能靠这个落盘指针找到该读哪个 runId 目录)。runId 经 env 传给每个子进程,子
++// 进程按 runId+cell+attempt 写各自独立的 fragment 文件——不再有"全局固定路径,连跑
++// 两次互相覆盖"的问题(旧版 ATTEMPT_FRAGMENT_PATH/LEDGER_PATH 是 cwd 下固定路径)。
++const runId = buildRunId()
++const headSha = getHeadSha()
++writeLatestPointer(runId)
++const manifest = writeManifest({ runId, headSha, topology, persist, kernelModes, rendererModes, selectedScenarios })
++console.log(`[e2e-runner] runId=${runId} schemaVersion=${manifest.schemaVersion} headSha=${headSha ?? 'unknown'} expectedCells=${manifest.expectedCells.length}`)
++
+ const runScenarioAttempt = (scenarioName, index, attempt, rendererMode, kernelMode) =>
+-  new Promise((resolve, reject) => {
++  new Promise((resolvePromise) => {
+     const scenarioPort = String(portBase + index * 10 + attempt)
+     console.log(`[e2e-runner] topology=${topology} scenario=${scenarioName} kernel=${kernelMode} renderer=${rendererMode} attempt=${attempt} port=${scenarioPort} base=${portBase}`)
+     const child = spawn(
+@@ -198,67 +201,99 @@ const runScenarioAttempt = (scenarioName, index, attempt, rendererMode, kernelMo
+           ...process.env,
+           MIVO_E2E_PORT: scenarioPort,
+           MIVO_E2E_PORT_BASE: String(portBase),
++          MIVO_E2E_RUN_ID: runId,
++          MIVO_E2E_ATTEMPT: String(attempt),
+         },
+       },
+     )
+ 
+-    child.on('close', (code) => {
+-      if (code === 0) {
+-        resolve()
+-        return
+-      }
+-      reject(new Error(`Scenario failed: ${scenarioName} kernel=${kernelMode} renderer=${rendererMode} (exit ${code ?? 'unknown'})`))
+-    })
++    // #560 SC-1:不再把非零 exit 转译成 reject——子进程的退出码本身就是终局真值,原样
++    // 交给调用方判定 status(result-ledger.mjs 的 resolveAttemptResult),不经
++    // "resolve/reject"丢失原始 code。
++    // 同时保留 signal(seat①-claude-adv R1 建议):子进程被信号杀死(OOM/超时 kill)时
++    // Node 的 close 回调 code 为 null、signal 才带真实原因,`code ?? 1` 会把它悄悄归一成
++    // "exit 1",诊断消息里就看不出"是被杀的"这个关键区别——只丢字符串,不改判定语义
++    // (exitCode 仍是 code ?? 1,FAIL 判定不变)。
++    child.on('close', (code, signal) => resolvePromise({ code: code ?? 1, signal }))
+   })
+ 
+-const maxAttempts = 2
++const describeExit = (code, signal) => (signal ? `killed by signal ${signal}` : `exit ${code}`)
+ 
+-// 每 kernel 维度通过数追踪(--kernel=both 报告分维度输出)。
+-const perKernelPassed = Object.fromEntries(kernelModes.map((mode) => [mode, 0]))
++const maxAttempts = 2
++let runnerError = null
+ 
+ // 笛卡尔积 (kernel × renderer × scenario),kernel 最外层串行 → 与 --renderer=both 同构,
+-// 只是多一层维度。renderer 在内层,保证同一 kernel 下 dom/leafer 连续跑完。
+-for (const kernelMode of kernelModes) {
+-  for (const rendererMode of rendererModes) {
+-    for (const [index, scenarioName] of selectedScenarios.entries()) {
+-      let succeeded = false
+-      const cellAttempts = []
++// 只是多一层维度。renderer 在内层,保证同一 kernel 下 dom/leafer 连续跑完。整段包 try/
++// catch(#560):某个格重试耗尽是真实失败,仍要让最终 exit code 非零,但不能让它连
++// ledger-summary 都不跑——早失败的 run 里"后面的格从未跑到"本身也是台账该如实报告的
++// 缺格状态,不是把校验步骤也一并跳过。
++try {
++  for (const kernelMode of kernelModes) {
++    for (const rendererMode of rendererModes) {
++      for (const [index, scenarioName] of selectedScenarios.entries()) {
++        const cell = { scenario: scenarioName, renderer: rendererMode, kernel: kernelMode, topology }
++        let succeeded = false
++        const cellAttempts = []
++
++        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
++          const { code, signal } = await runScenarioAttempt(scenarioName, index, attempt, rendererMode, kernelMode)
++          const result = resolveAttemptResult({
++            runId,
++            cell,
++            attempt,
++            exitCode: code,
++            fallbackMessage: `Scenario failed: ${scenarioName} kernel=${kernelMode} renderer=${rendererMode} (${describeExit(code, signal)})`,
++          })
++          cellAttempts.push(result)
++
++          if (code === 0) {
++            succeeded = true
++            break
++          }
+ 
+-      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+-        try {
+-          await runScenarioAttempt(scenarioName, index, attempt, rendererMode, kernelMode)
+-          cellAttempts.push(readCellAttemptResult(scenarioName, attempt, 'PASS'))
+-          succeeded = true
+-          break
+-        } catch (error) {
+-          const message = error instanceof Error ? error.message : String(error)
+-          cellAttempts.push(readCellAttemptResult(scenarioName, attempt, 'FAIL', message))
+           if (attempt === maxAttempts) {
+-            // 台账:重试耗尽,落最终 FAIL 记录后再按原样 rethrow——exit code / 上层
+-            // 行为与本次改动之前完全一致,台账只是多记一笔。
+-            appendLedgerRecord(buildLedgerRecord({ scenario: scenarioName, renderer: rendererMode, kernel: kernelMode, topology, attempts: cellAttempts }))
+-            throw error
++            // 台账:重试耗尽,落最终 FAIL 记录后再抛错——exit code / 整体失败语义与本次
++            // 改动之前一致(仍抛错终止、仍非零退出);诊断消息文本改为携带"after N
++            // attempts",不再原样复用旧版 reject 消息,台账只是多记一笔。
++            appendLedgerRecord(runId, buildLedgerRecord({ runId, scenario: scenarioName, renderer: rendererMode, kernel: kernelMode, topology, attempts: cellAttempts }))
++            throw new Error(`Scenario failed after ${maxAttempts} attempts: ${scenarioName} kernel=${kernelMode} renderer=${rendererMode} (${describeExit(code, signal)})`)
+           }
+           console.warn(
+-            `[e2e-runner] retrying scenario=${scenarioName} kernel=${kernelMode} renderer=${rendererMode} after attempt=${attempt} failure: ${message}`,
++            `[e2e-runner] retrying scenario=${scenarioName} kernel=${kernelMode} renderer=${rendererMode} after attempt=${attempt} failure: ${result.message}`,
+           )
+         }
+-      }
+ 
+-      if (!succeeded) {
+-        throw new Error(`Scenario failed after ${maxAttempts} attempts: ${scenarioName} kernel=${kernelMode} renderer=${rendererMode}`)
+-      }
++        if (!succeeded) {
++          throw new Error(`Scenario failed after ${maxAttempts} attempts: ${scenarioName} kernel=${kernelMode} renderer=${rendererMode}`)
++        }
+ 
+-      // 台账:本「格」成功(可能是重试后成功,也可能是 leafer-skip 的 N_A)。
+-      appendLedgerRecord(buildLedgerRecord({ scenario: scenarioName, renderer: rendererMode, kernel: kernelMode, topology, attempts: cellAttempts }))
++        // 台账:本「格」成功(可能是重试后成功,也可能是 leafer-skip 的 N_A)。
++        appendLedgerRecord(runId, buildLedgerRecord({ runId, scenario: scenarioName, renderer: rendererMode, kernel: kernelMode, topology, attempts: cellAttempts }))
++      }
+     }
+   }
+-  // 跑到这里 = 该 kernel 下所有 renderer×scenario 全过(失败已 throw)。
+-  perKernelPassed[kernelMode] = selectedScenarios.length * rendererModes.length
++} catch (error) {
++  runnerError = error instanceof Error ? error : new Error(String(error))
+ }
+ 
+-const kernelBreakdown = kernelModes.map((mode) => `kernel=${mode}:${perKernelPassed[mode]}`).join(' ')
+-console.log(
+-  `[e2e-runner] topology=${topology} persist=${persist} kernel=${kernel} renderer=${renderer} passed ${selectedScenarios.length} scenario(s) across ${kernelModes.length} kernel mode(s) x ${rendererModes.length} renderer mode(s) [${kernelBreakdown}]`,
+-)
++// 台账(#560 SC-5/SC-8):四态计数与 job summary 统一由 ledger-summary.mjs 读盘算出,不再
++// 自己维护一份"selectedScenarios.length * rendererModes.length"硬乘计数(旧版那样算会
++// 把从未真正跑起来的 N_A 格也算进"passed")——runner 的终端输出与 CI 里 ledger-summary.mjs
++// --latest 的输出用同一次计算,不会跑偏。
++const summary = printSummary(runId)
++
++if (runnerError) {
++  console.error(runnerError)
++}
++if (!summary.ok) {
++  console.error('[e2e-runner] 台账校验未通过(见上方 [ledger-summary] fail-closed 明细)')
++}
++if (runnerError || !summary.ok) {
++  process.exitCode = 1
++} else {
++  const { counts } = summary
++  console.log(
++    `[e2e-runner] topology=${topology} persist=${persist} kernel=${kernel} renderer=${renderer} PASS=${counts.PASS} RETRY_PASS=${counts.RETRY_PASS} FAIL=${counts.FAIL} N_A=${counts.N_A} (passed=${counts.PASS + counts.RETRY_PASS})`,
++  )
++}
+ }
+diff --git a/scripts/e2e-smoke.mjs b/scripts/e2e-smoke.mjs
+index 86239eca..d9f4dead 100644
+--- a/scripts/e2e-smoke.mjs
++++ b/scripts/e2e-smoke.mjs
+@@ -15,7 +15,7 @@ import { assertPublicModeSecurity } from './e2e/prod-auth-assertions.mjs'
+ import { startUpstreamMockServer } from './e2e/upstream-mock-server.mjs'
+ import { leaferSkippedScenarios, scenarioOrder, scenarioRunners } from './e2e/scenarios/index.mjs'
+ import { drainPageErrors, resetPageErrorSink } from './e2e/browser-error-guard.mjs'
+-import { recordAttemptFragment, resetAttemptFragments } from './e2e/result-ledger.mjs'
++import { buildRunId, recordAttemptFragment } from './e2e/result-ledger.mjs'
+ import {
+   clearAllStorage,
+   createBaseUrl,
+@@ -109,6 +109,12 @@ const resolvePersist = (argv) => {
+   return 'local'
+ }
+ const persistMode = resolvePersist(cliArgs)
++// #560:runId + attempt 透传自 e2e-runner.mjs(经 env),让本进程写下的 fragment 精确
++// 归属到某次 run 的某个 attempt(fragmentPath 按 runId+cell+attempt 编码文件名)。
++// 手动直跑 smoke.mjs(不经 runner)时没有这两个 env,各自退化为"独立一次性
++// run"(buildRunId() 自产)与 attempt=1,不依赖 runner 也能正常落盘。
++const runId = process.env.MIVO_E2E_RUN_ID || buildRunId()
++const attempt = Number(process.env.MIVO_E2E_ATTEMPT || '1')
+ const useRealUpstream = process.env.MIVO_E2E_USE_REAL_UPSTREAM === '1'
+ const disableApiRouteMocks = process.env.MIVO_E2E_DISABLE_API_ROUTE_MOCKS === '1'
+ const securityPort = requestedPort
+@@ -184,9 +190,8 @@ let server
+ 
+ try {
+   await prepareSmokeArtifacts()
+-  // 台账(report-only):每个 attempt 是一个全新进程,启动时先清空自己的 fragment
+-  // 记录——e2e-runner.mjs 在子进程 close 后读它,不会读到上一个 attempt 的残留。
+-  resetAttemptFragments()
++  // #560:不再需要"启动时清空共享 fragment 文件"——fragmentPath 按 runId+cell+attempt
++  // 编码文件名,每个 attempt 天然写自己的文件,不会读到其它 attempt 的残留。
+   await runCommand('npm', ['run', 'verify:logging'])
+   server = startTopologyServer({
+     activePort: securityPort,
+@@ -544,11 +549,7 @@ try {
+   // e2e-runner.mjs 事后只看得到子进程 exit 0,猜不出。不影响任何 pass/fail 语义。
+   for (const name of requestedScenarioNames) {
+     if (!selectedScenarios.includes(name)) {
+-      recordAttemptFragment({
+-        scenario: name,
+-        renderer: rendererMode,
+-        kernel: kernelMode,
+-        topology,
++      recordAttemptFragment(runId, { scenario: name, renderer: rendererMode, kernel: kernelMode, topology }, attempt, {
+         status: 'N_A',
+         durationMs: 0,
+         message: leaferSkippedScenarios[name] ?? null,
+@@ -605,6 +606,16 @@ try {
+     scenarioContext.readLibrarySurfaceColors = readLibrarySurfaceColors
+   }
+ 
++  // 台账(#560 SC-2):scenario 通过后不立刻落 PASS fragment——screenshot / console-error
++  // 检查还没跑,此刻宣告 PASS 可能被之后的 post-gate 打脸(旧版正是如此:PASS fragment
++  // 先落盘,console guard 才 throw,e2e-runner.mjs 仍读到 PASS)。改为:先把
++  // {cell, fragment} 暂存,等这轮 invocation 的全部 post-gate 都过了才真正写 PASS;
++  // guard 抛错时,把所有暂存的 PASS 降级为 FAIL(带该错误 message)再写。
++  // 已知限制,如实声明:allErrors 是跨 scenario 累积(见下方 allErrors.push),console
++  // error 精确定位到"是哪一格"做不到,只能标注"本 attempt 内某处失败"——runner 的
++  // 实际用法始终是单 scenario 一次 invocation,该限制在此路径下不生效;只在手动一次
++  // 传多个 --scenario 时才会体现为多格共享同一条诊断。
++  const pendingPassFragments = []
+   for (let index = 0; index < selectedScenarios.length; index += 1) {
+     const scenarioName = selectedScenarios[index]
+     if (index > 0) {
+@@ -613,29 +624,28 @@ try {
+       rebindSmokePage(await createScenarioSmokePage())
+     }
+     scenarioContext.firstNodeId = undefined
+-    await bootstrapBaseCanvas()
++    // #560 SC-6:reset 移到 bootstrap 之前(原先在之后)——旧序会让 bootstrap 阶段(两次
++    // page.goto + clearAllStorage + rehydrate)产生的未捕获异常先被收集又被清空,永远
++    // 进不了 diagnostics.pageErrors。
+     resetPageErrorSink()
++    await bootstrapBaseCanvas()
+     const scenarioStartedAt = Date.now()
++    const cell = { scenario: scenarioName, renderer: rendererMode, kernel: kernelMode, topology }
+     try {
+       await scenarioRunners[scenarioName](scenarioContext)
+-      recordAttemptFragment({
+-        scenario: scenarioName,
+-        renderer: rendererMode,
+-        kernel: kernelMode,
+-        topology,
+-        status: 'PASS',
+-        durationMs: Date.now() - scenarioStartedAt,
+-        message: null,
+-        pageErrors: drainPageErrors(),
++      pendingPassFragments.push({
++        cell,
++        fragment: {
++          status: 'PASS',
++          durationMs: Date.now() - scenarioStartedAt,
++          message: null,
++          pageErrors: drainPageErrors(),
++        },
+       })
+     } catch (error) {
+       // 台账(report-only):只多记一笔,不改变原有失败语义——原样 rethrow,exit
+       // code / e2e-runner.mjs 的重试判定与本次改动之前完全一致。
+-      recordAttemptFragment({
+-        scenario: scenarioName,
+-        renderer: rendererMode,
+-        kernel: kernelMode,
+-        topology,
++      recordAttemptFragment(runId, cell, attempt, {
+         status: 'FAIL',
+         durationMs: Date.now() - scenarioStartedAt,
+         message: error instanceof Error ? error.message : String(error),
+@@ -645,7 +655,6 @@ try {
+     }
+   }
+ 
+-
+   allErrors.push(...errors)
+   await page.screenshot({ path: 'test-artifacts/e2e-smoke.png', fullPage: true })
+   await browser.close()
+@@ -656,7 +665,17 @@ try {
+     !e.includes('status of 504 (Gateway Timeout)'),
+   )
+   if (realErrors.length) {
+-    throw new Error(`Console errors:\n${realErrors.join('\n')}`)
++    // 台账(#560 SC-2):post-gate(console error)失败——所有暂存的 PASS 降级为 FAIL,
++    // 带同一条诊断(上方"已知限制":无法精确归属到具体哪个 scenario)。
++    const consoleErrorMessage = `Console errors:\n${realErrors.join('\n')}`
++    for (const { cell, fragment } of pendingPassFragments) {
++      recordAttemptFragment(runId, cell, attempt, { ...fragment, status: 'FAIL', message: consoleErrorMessage })
++    }
++    throw new Error(consoleErrorMessage)
++  }
++
++  for (const { cell, fragment } of pendingPassFragments) {
++    recordAttemptFragment(runId, cell, attempt, fragment)
+   }
+ 
+   console.log('E2E smoke test passed')
+diff --git a/scripts/e2e/browser-error-guard.mjs b/scripts/e2e/browser-error-guard.mjs
+index 95726e93..929d3dab 100644
+--- a/scripts/e2e/browser-error-guard.mjs
++++ b/scripts/e2e/browser-error-guard.mjs
+@@ -8,8 +8,9 @@
+ // (`context.on('page', ...)`)而不是单个 Page,场景自建的 newPage()/newContext() 因此
+ // 自动被覆盖——旧版 harness.mjs 的 page.on('pageerror') 只盯自己创建的那一个 page,
+ // coordinate-probe.mjs 的 dpr2Context 与 migration.mjs 的 migrationContext 各自
+-// browser.newContext()+newPage() 绕过了它,两处的未捕获异常一直没人在看。isOurApp
+-// 过滤思路同源(滤掉 chrome-extension:// / about: 等第三方噪音,不算作 app 自身异常)。
++// browser.newContext()+newPage() 绕过了它,两处的未捕获异常一直没人在看(#560 起两处
++// 已改用下方 newObservedContext,不再绕过)。isOurApp 过滤思路同源(滤掉
++// chrome-extension:// / about: 等第三方噪音,不算作 app 自身异常)。
+ //
+ // 去重用 WeakSet(思路借鉴 danmaku-anywhere 的 console-watcher.ts,但该仓 license 是
+ // NOASSERTION——只借用"用 WeakSet 防重复挂载"这个思路,不拷贝其代码):
+@@ -67,6 +68,18 @@ export const attachPageErrorObserver = (context) => {
+   context.on('page', (page) => hookPageForErrors(page))
+ }
+ 
++/**
++ * browser.newContext() + attachPageErrorObserver() 的合并入口(#560)。场景自建 context
++ * (旧版 migration.mjs/coordinate-probe.mjs 都各自手写这两行)若绕开 attachPageErrorObserver,
++ * 该 context 上的未捕获异常永远进不了诊断——本函数是唯一合规入口,配 structure-guard.mjs
++ * 的 e2e context 观测覆盖规则,新场景绕开它会被 CI 拦住,不再靠人工记得补挂。
++ */
++export const newObservedContext = async (browser, options) => {
++  const context = await browser.newContext(options)
++  attachPageErrorObserver(context)
++  return context
++}
++
+ /** e2e-smoke.mjs 在每个 scenario 开跑前调用,清空共享 sink。 */
+ export const resetPageErrorSink = () => {
+   pageErrorSink = []
+diff --git a/scripts/e2e/harness.mjs b/scripts/e2e/harness.mjs
+index ae2f6357..2c57301d 100644
+--- a/scripts/e2e/harness.mjs
++++ b/scripts/e2e/harness.mjs
+@@ -3,7 +3,7 @@ import path from 'node:path'
+ import { mkdir, rm } from 'node:fs/promises'
+ import { chromium } from 'playwright'
+ import { attachDefaultMivoApiMocks } from './api-mocks.mjs'
+-import { attachPageErrorObserver } from './browser-error-guard.mjs'
++import { newObservedContext } from './browser-error-guard.mjs'
+ 
+ export const createBaseUrl = (port) => `http://127.0.0.1:${port}`
+ 
+@@ -609,14 +609,14 @@ export const createSmokePage = async ({
+   mockAuthMe = false,
+ }) => {
+   const browser = await chromium.launch({ headless: true })
+-  const context = await browser.newContext({
++  // context 级未捕获异常观测(report-only,见 browser-error-guard.mjs)由
++  // newObservedContext 内部挂载,必须在 context.newPage() 之前完成——这里天然满足,
++  // 因为下面第一个 newPage() 还没调用。
++  const context = await newObservedContext(browser, {
+     viewport: { width: 1512, height: 900 },
+     deviceScaleFactor: 1,
+     extraHTTPHeaders,
+   })
+-  // context 级未捕获异常观测(report-only,见 browser-error-guard.mjs)。必须在
+-  // context.newPage() 之前挂,才能覆盖下面这一个初始 page。
+-  attachPageErrorObserver(context)
+   // mainfix R3: flip the e2e bridge flag in BOTH topologies so main.tsx populates
+   // `__MIVO_E2E__` (incl. getPersistUserId) everywhere. Previously only
+   // installE2EStoreBridge (prod-only) set it, so dev never had the bridge and
+@@ -667,7 +667,7 @@ export const createSmokePage = async ({
+     if (message.type() === 'error' && !message.text().includes('__MIVO_E2E_EXPECTED_ERROR__')) errors.push(message.text())
+   })
+ 
+-  // 浏览器未捕获异常观测已挪到 context 级(见上方 attachPageErrorObserver 调用 +
++  // 浏览器未捕获异常观测已挪到 context 级(见上方 newObservedContext 调用 +
+   // browser-error-guard.mjs)——旧版这里只挂在这一个 page 上,场景自建的
+   // newPage()/newContext()(coordinate-probe.mjs/migration.mjs)绕过监听。
+ 
+diff --git a/scripts/e2e/ledger-summary.mjs b/scripts/e2e/ledger-summary.mjs
+new file mode 100644
+index 00000000..9c66b63e
+--- /dev/null
++++ b/scripts/e2e/ledger-summary.mjs
+@@ -0,0 +1,180 @@
++// scripts/e2e/ledger-summary.mjs — 严格 ledger reader/validator(#560)。
++//
++// fail-closed:manifest 缺失/坏、ledger 缺失/坏行、记录的 runId/headSha/schemaVersion
++// 与 manifest 不符、缺格、重复格——任一命中都在 ok:false 里列出具体原因,不再像旧版
++// readJsonlSafe 那样把坏行静默 filter(Boolean) 丢弃、缺格/重复格完全没人检测。
++//
++// 这是本仓 ledger 数据的唯一权威读法——e2e-runner.mjs 的终端计数、CI job summary 都
++// 消费本模块的 summarizeRun() 输出,不各自维护一份平行计数(避免两处统计跑偏)。
++import { appendFileSync, existsSync, readFileSync } from 'node:fs'
++import { cellKey, ledgerPath, manifestPath, readLatestRunId } from './result-ledger.mjs'
++
++const FOUR_STATES = ['PASS', 'RETRY_PASS', 'FAIL', 'N_A']
++
++/**
++ * 读取并校验一次 run 的 manifest.json + ledger.jsonl。
++ * 返回 { ok, errors, counts, records, manifest, retryPassCells }。
++ * ok=false 时 counts 仍尽量给出(能算多少算多少),不因校验失败就完全不输出统计——
++ * 诊断价值优先于"要么全对要么什么都不给"。
++ */
++export const summarizeRun = (runId) => {
++  const errors = []
++
++  if (!runId) {
++    return { ok: false, errors: ['未提供 runId,且 test-artifacts/e2e-runs/LATEST 指针缺失或为空'], counts: null, records: [], manifest: null, retryPassCells: [] }
++  }
++
++  const manifestFile = manifestPath(runId)
++  if (!existsSync(manifestFile)) {
++    return { ok: false, errors: [`manifest 缺失:${manifestFile}(疑似 e2e-runner.mjs 从未启动,或在写 manifest 前就已崩溃——setup 阶段失败)`], counts: null, records: [], manifest: null, retryPassCells: [] }
++  }
++
++  let manifest
++  try {
++    manifest = JSON.parse(readFileSync(manifestFile, 'utf8'))
++  } catch (err) {
++    return { ok: false, errors: [`manifest JSON 解析失败:${manifestFile}(${err instanceof Error ? err.message : String(err)})`], counts: null, records: [], manifest: null, retryPassCells: [] }
++  }
++
++  const ledgerFile = ledgerPath(runId)
++  if (!existsSync(ledgerFile)) {
++    errors.push(`ledger 缺失:${ledgerFile}(manifest 存在但 ledger 从未写入——疑似所有 scenario 尚未跑完就中止)`)
++    return { ok: false, errors, counts: null, records: [], manifest, retryPassCells: [] }
++  }
++
++  const raw = readFileSync(ledgerFile, 'utf8')
++  // 保留原始行号(不先 filter(Boolean) 再算 index)——文件中若存在中间空行(如手工
++  // 编辑/写坏导致),先 filter 会让 index 与真实行号错位,报错行号失真。
++  const rawLines = raw.split('\n')
++  const records = []
++  rawLines.forEach((rawLine, index) => {
++    const line = rawLine.trim()
++    if (!line) return
++    try {
++      records.push(JSON.parse(line))
++    } catch (err) {
++      errors.push(`ledger 第 ${index + 1} 行 JSON 解析失败:${err instanceof Error ? err.message : String(err)}`)
++    }
++  })
++
++  const expectedKeys = new Set((manifest.expectedCells ?? []).map((cell) => cellKey(cell)))
++
++  for (const record of records) {
++    if (record.runId !== manifest.runId) {
++      errors.push(`记录 runId 不符(name=${record.name}):记录=${record.runId} manifest=${manifest.runId}`)
++    }
++    if (record.schemaVersion !== manifest.schemaVersion) {
++      errors.push(`记录 schemaVersion 不符(name=${record.name}):记录=${record.schemaVersion} manifest=${manifest.schemaVersion}`)
++    }
++    if (record.headSha !== manifest.headSha) {
++      errors.push(`记录 headSha 不符(name=${record.name}):记录=${record.headSha} manifest=${manifest.headSha}`)
++    }
++    // #560 codex-adversarial R1 CAX-2:name 字段本身在 expectedKeys 里,不代表这条记录
++    // 真的对应该格——name 是随记录一起写入的普通字符串字段,可能与 scenario/renderer/
++    // kernel/topology 四个字段各自的取值不一致(伪造/写坏都可能产生);必须用四字段重算
++    // 一遍 cellKey,严格要求与 record.name 逐字相等,不能只信 name 本身。
++    const recomputedKey = cellKey({ scenario: record.scenario, renderer: record.renderer, kernel: record.kernel, topology: record.topology })
++    if (recomputedKey !== record.name) {
++      errors.push(`记录 name 与字段不符(name=${record.name}):由 scenario/renderer/kernel/topology 字段重算得 ${recomputedKey}`)
++    }
++    // #560 codex-adversarial R1 CAX-2:旧版只检查"expectedKeys 里的格是否都出现过"(漏格),
++    // 没检查反方向——ledger 里混入一条 manifest 从未声明的 foreign key,旧版会放过。
++    if (!expectedKeys.has(record.name)) {
++      errors.push(`未声明的格:${record.name}(不在 manifest.expectedCells 中,疑似伪造/写坏的记录)`)
++    }
++    // #560 codex-adversarial R1 CAX-1:exit code 判定为 PASS/RETRY_PASS,但 resolveAttemptResult
++    // 标记了 evidenceMissing(exitCode===0 但对应 attempt 没有 fragment 佐证)——不能排除
++    // 这本该是 N_A(leafer-skip 等)却因 fragment 写失败被误判成 PASS 的可能,严格校验对此
++    // fail-closed(不静默信任"没证据的绿")。
++    if (record.evidenceMissing === true) {
++      errors.push(`记录证据缺失(name=${record.name}):status=${record.status} 但无 fragment 佐证(exit code 判定,不能排除实为 N_A)`)
++    }
++  }
++
++  const seenCells = new Map()
++  for (const record of records) {
++    const key = record.name
++    const count = (seenCells.get(key) ?? 0) + 1
++    seenCells.set(key, count)
++    if (count === 2) {
++      errors.push(`重复格:${key}(单次 run 内出现 ≥2 条终态记录)`)
++    }
++  }
++
++  for (const key of expectedKeys) {
++    if (!seenCells.has(key)) {
++      errors.push(`缺格:${key}(manifest.expectedCells 声明但 ledger 无对应终态记录)`)
++    }
++  }
++
++  const counts = { PASS: 0, RETRY_PASS: 0, FAIL: 0, N_A: 0 }
++  const retryPassCells = []
++  for (const record of records) {
++    if (FOUR_STATES.includes(record.status)) {
++      counts[record.status] += 1
++    } else {
++      errors.push(`未知 status:${record.status}(name=${record.name})`)
++    }
++    if (record.status === 'RETRY_PASS') retryPassCells.push(record.name)
++  }
++
++  return { ok: errors.length === 0, errors, counts, records, manifest, retryPassCells }
++}
++
++const formatSummaryText = (runId, summary) => {
++  const lines = [`[ledger-summary] run=${runId}`]
++  if (!summary.ok) {
++    lines.push(`[ledger-summary] fail-closed — ${summary.errors.length} 处台账问题:`)
++    for (const err of summary.errors) lines.push(`  - ${err}`)
++  }
++  if (summary.counts) {
++    const { counts, retryPassCells } = summary
++    lines.push(`[ledger-summary] PASS=${counts.PASS} RETRY_PASS=${counts.RETRY_PASS} FAIL=${counts.FAIL} N_A=${counts.N_A}`)
++    if (retryPassCells.length) {
++      lines.push(`[ledger-summary] RETRY_PASS cells: ${retryPassCells.join(', ')}`)
++    }
++  }
++  return lines.join('\n')
++}
++
++/** 打印到 stdout,若 GITHUB_STEP_SUMMARY 存在则同时追加写入该文件。返回 summarizeRun() 的结果。 */
++export const printSummary = (runId) => {
++  const summary = summarizeRun(runId)
++  const text = formatSummaryText(runId ?? '(unknown)', summary)
++  console.log(text)
++  const stepSummaryPath = process.env.GITHUB_STEP_SUMMARY
++  if (stepSummaryPath) {
++    try {
++      appendFileSync(stepSummaryPath, `${text}\n`)
++    } catch (err) {
++      console.warn(`[ledger-summary] 写 GITHUB_STEP_SUMMARY 失败: ${err instanceof Error ? err.message : String(err)}`)
++    }
++  }
++  return summary
++}
++
++const isMainModule = () => {
++  try {
++    return import.meta.url === `file://${process.argv[1]}`
++  } catch {
++    return false
++  }
++}
++
++if (isMainModule()) {
++  const argv = process.argv.slice(2)
++  const runIdIdx = argv.indexOf('--run-id')
++  const useLatest = argv.includes('--latest')
++  const runId = runIdIdx >= 0 ? argv[runIdIdx + 1] : useLatest ? readLatestRunId() : null
++
++  if (!runId) {
++    console.error('[ledger-summary] 用法: node scripts/e2e/ledger-summary.mjs --run-id <runId> | --latest')
++    if (useLatest) {
++      console.error('[ledger-summary] --latest 指定,但 test-artifacts/e2e-runs/LATEST 指针缺失或为空(疑似 e2e-runner.mjs 从未启动——setup 阶段失败)')
++    }
++    process.exit(2)
++  }
++
++  const summary = printSummary(runId)
++  process.exit(summary.ok ? 0 : 1)
++}
+diff --git a/scripts/e2e/ledger-summary.test.mjs b/scripts/e2e/ledger-summary.test.mjs
+new file mode 100644
+index 00000000..a39ed510
+--- /dev/null
++++ b/scripts/e2e/ledger-summary.test.mjs
+@@ -0,0 +1,258 @@
++// scripts/e2e/ledger-summary.test.mjs — #560 严格 validator 的反向变异测试。
++//
++// 直接对真实磁盘路径(result-ledger.mjs 的 manifestPath/ledgerPath/runDir)写 fixture,
++// 跑 summarizeRun(),验 fail-closed 行为——不 mock fs,走真实读写路径,才能锁住"坏行
++// 不再静默 filter(Boolean) 丢弃"这类行为(mock 掉 fs 会连带把要验证的行为一起 mock 没)。
++// test-artifacts/ 已 gitignore(见 .gitignore:13),afterEach 清理每个测试自己的 runId
++// 目录,不影响其它并行跑的 e2e 产物。
++import { afterEach, describe, expect, it } from 'vitest'
++import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
++import { dirname } from 'node:path'
++import { ledgerPath, manifestPath, runDir } from './result-ledger.mjs'
++import { summarizeRun } from './ledger-summary.mjs'
++
++const usedRunIds = []
++afterEach(() => {
++  for (const runId of usedRunIds) {
++    try {
++      rmSync(runDir(runId), { recursive: true, force: true })
++    } catch {}
++  }
++  usedRunIds.length = 0
++})
++
++const testRunId = (suffix) => {
++  const runId = `test-ledger-summary-${suffix}-${process.pid}`
++  usedRunIds.push(runId)
++  return runId
++}
++
++const writeManifestFile = (runId, overrides = {}) => {
++  const manifest = {
++    runId,
++    schemaVersion: '1',
++    headSha: 'abc1234',
++    topology: 'dev',
++    persist: 'local',
++    kernelModes: ['legacy'],
++    rendererModes: ['dom'],
++    selectedScenarios: ['debug', 'mask'],
++    expectedCells: [
++      { scenario: 'debug', renderer: 'dom', kernel: 'legacy', topology: 'dev' },
++      { scenario: 'mask', renderer: 'dom', kernel: 'legacy', topology: 'dev' },
++    ],
++    recordedAt: new Date(0).toISOString(),
++    ...overrides,
++  }
++  const path = manifestPath(runId)
++  mkdirSync(dirname(path), { recursive: true })
++  writeFileSync(path, JSON.stringify(manifest))
++  return manifest
++}
++
++const record = (overrides = {}) => ({
++  runId: overrides.runId ?? undefined,
++  schemaVersion: '1',
++  name: 'debug::dom::legacy::dev',
++  scenario: 'debug',
++  renderer: 'dom',
++  kernel: 'legacy',
++  topology: 'dev',
++  status: 'PASS',
++  durationMs: 100,
++  flaky: false,
++  retries: 0,
++  retryAttempts: [],
++  message: null,
++  headSha: 'abc1234',
++  diagnostics: { pageErrors: [] },
++  recordedAt: new Date(0).toISOString(),
++  ...overrides,
++})
++
++const writeLedgerLines = (runId, lines) => {
++  const path = ledgerPath(runId)
++  mkdirSync(dirname(path), { recursive: true })
++  writeFileSync(path, `${lines.join('\n')}\n`)
++}
++
++describe('ledger-summary summarizeRun — 正常路径', () => {
++  it('CLEAN: manifest + ledger 完整匹配 → ok=true,四态计数正确', () => {
++    const runId = testRunId('clean')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug', status: 'PASS' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask', status: 'RETRY_PASS' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(true)
++    expect(summary.errors).toHaveLength(0)
++    expect(summary.counts).toEqual({ PASS: 1, RETRY_PASS: 1, FAIL: 0, N_A: 0 })
++    expect(summary.retryPassCells).toEqual(['mask::dom::legacy::dev'])
++  })
++})
++
++describe('ledger-summary summarizeRun — fail-closed 反向变异(#560)', () => {
++  it('RED: manifest 缺失 → ok=false,明确指出 manifest 路径', () => {
++    const runId = testRunId('no-manifest')
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('manifest 缺失'))).toBe(true)
++  })
++
++  it('RED: manifest JSON 损坏 → ok=false,明确指出解析失败', () => {
++    const runId = testRunId('bad-manifest-json')
++    const path = manifestPath(runId)
++    mkdirSync(dirname(path), { recursive: true })
++    writeFileSync(path, '{not json')
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('manifest JSON 解析失败'))).toBe(true)
++  })
++
++  it('RED: ledger 缺失(manifest 存在)→ ok=false,明确指出 ledger 路径', () => {
++    const runId = testRunId('no-ledger')
++    writeManifestFile(runId)
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('ledger 缺失'))).toBe(true)
++  })
++
++  it('RED: ledger 某一行 JSON 截断/写坏 → ok=false,指出具体第几行', () => {
++    const runId = testRunId('bad-ledger-line')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug' })),
++      '{"name":"mask::dom::legacy::dev","status":"PASS"', // 截断:缺右括号
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('ledger 第 2 行 JSON 解析失败'))).toBe(true)
++    // 缺格仍应命中:坏行没能解析出 mask 记录
++    expect(summary.errors.some((e) => e.includes('缺格:mask::dom::legacy::dev'))).toBe(true)
++  })
++
++  it('RED: 人为造重复 cellKey → ok=false,恰好点名该 cellKey', () => {
++    const runId = testRunId('dup-cell')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug' })),
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('重复格:debug::dom::legacy::dev'))).toBe(true)
++  })
++
++  it('RED: 删掉一个 expectedCells 声明的格(缺格)→ ok=false,恰好点名该 cellKey', () => {
++    const runId = testRunId('missing-cell')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug' })),
++      // mask 的记录被"删掉"了
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('缺格:mask::dom::legacy::dev'))).toBe(true)
++  })
++
++  it('RED: 混入错误 runId → ok=false,指出该记录', () => {
++    const runId = testRunId('wrong-runid')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId: 'some-other-run', name: 'debug::dom::legacy::dev', scenario: 'debug' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('记录 runId 不符'))).toBe(true)
++  })
++
++  it('RED: 混入错误 headSha → ok=false,指出该记录', () => {
++    const runId = testRunId('wrong-headsha')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug', headSha: 'wrongsha' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('记录 headSha 不符'))).toBe(true)
++  })
++
++  it('RED: 混入错误 schemaVersion → ok=false,指出该记录', () => {
++    const runId = testRunId('wrong-schema')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug', schemaVersion: '99' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('记录 schemaVersion 不符'))).toBe(true)
++  })
++
++  it('控制组:什么都不破坏时 ok=true(反向变异测试的对照)', () => {
++    const runId = testRunId('control')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(true)
++  })
++
++  it('RED(#560 R1 codex-adversarial CAX-2):name 落在 expectedKeys 里,但 scenario/renderer 字段被改写成别的值 → ok=false,指出 name 与字段不符', () => {
++    const runId = testRunId('cax2-field-mismatch')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      // name 字段本身合法(在 expectedCells 里),但 scenario/renderer 被篡改——
++      // 旧版校验只信 name 字符串,这条会被放过;新版必须用四字段重算 cellKey 拦下。
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'WRONG_SCENARIO', renderer: 'WRONG_RENDERER' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('记录 name 与字段不符'))).toBe(true)
++  })
++
++  it('RED(#560 R1 codex-adversarial CAX-2):混入一条 manifest 从未声明的 foreign key → ok=false,恰好点名该 cellKey', () => {
++    const runId = testRunId('cax2-foreign-key')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++      // manifest.expectedCells 从未声明过这一格——旧版校验只检查"expectedKeys 是否都
++      // 出现过"(漏格方向),没检查反方向(多出未声明的格),这条会被放过。
++      JSON.stringify(record({ runId, name: 'totally-unexpected::dom::legacy::dev', scenario: 'totally-unexpected' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('未声明的格:totally-unexpected::dom::legacy::dev'))).toBe(true)
++  })
++
++  it('RED(#560 R1 codex-adversarial CAX-1):记录带 evidenceMissing=true → ok=false,明确指出证据缺失而不是静默信任这条 PASS', () => {
++    const runId = testRunId('cax1-evidence-missing')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug', status: 'PASS', evidenceMissing: true })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('记录证据缺失'))).toBe(true)
++  })
++
++  it('控制组:evidenceMissing=false 时不触发证据缺失校验', () => {
++    const runId = testRunId('cax1-control')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug', status: 'PASS', evidenceMissing: false })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(true)
++  })
++})
+diff --git a/scripts/e2e/result-ledger.mjs b/scripts/e2e/result-ledger.mjs
+index 634626db..2f3a7153 100644
+--- a/scripts/e2e/result-ledger.mjs
++++ b/scripts/e2e/result-ledger.mjs
+@@ -6,29 +6,44 @@
+ // 本仓的扩展:①「格」定位字段 {scenario,renderer,kernel,topology}(唯一定位一次
+ // scenario×renderer×kernel×topology 的执行);②终态枚举改为
+ // PASS/RETRY_PASS/FAIL/N_A(替换 CTRF 原生的小写 passed/failed/skipped/pending/other——
+-// 本台账目前只喂给仓内 e2e-runner.mjs/e2e-smoke.mjs 自己读,不接 CTRF 官方生态工具,
+-// 用更贴合本仓语境的枚举更直白;N_A 专用于 leafer-skip 等结构性不执行的格,不与
+-// PASS 混淆);③ headSha + diagnostics.pageErrors(browser-error-guard.mjs 采集)。
++// 本台账目前只喂给仓内 e2e-runner.mjs/e2e-smoke.mjs/ledger-summary.mjs 自己读,不接
++// CTRF 官方生态工具,用更贴合本仓语境的枚举更直白;N_A 专用于 leafer-skip 等结构性
++// 不执行的格,不与 PASS 混淆);③ headSha + diagnostics.pageErrors(browser-error-guard.mjs
++// 采集);④ runId + schemaVersion(#560:每次 run 唯一,配 ledger-summary.mjs 做完整性校验)。
+ //
+ // report-only:本模块不抛错、不影响任何 pass/fail 语义,只负责落盘,读写失败均静默
+ // 降级(缺一条台账记录好于让台账写坏一次真实的 e2e 判定)。
+ //
+-// 两层文件:
+-//  - ATTEMPT_FRAGMENT_PATH:单次 smoke.mjs 进程(= e2e-runner.mjs 的一次 attempt)的
+-//    临时记录。resetAttemptFragments() 在进程刚启动时清空(每个 attempt 是全新进程,
+-//    清空即隔离);进程内每跑完一个 scenario(PASS/FAIL)或判定 N_A 就 append 一行。
+-//    e2e-runner.mjs 在子进程 close 后读它,合并进最终台账,随后该文件内容即可废弃
+-//    (下一个 attempt 的子进程会在自己启动时再次清空)。
+-//  - LEDGER_PATH:跨 attempt 累积的最终台账。e2e-runner.mjs 在某个「格」的重试循环
+-//    结束后(成功或耗尽重试)写入一条汇总记录。
++// 三层文件,全部按 runId 隔离在 test-artifacts/e2e-runs/<runId>/ 下(#560 修复"全局
++// 固定路径,长期本地开发同一文件混入历次运行,且无字段可区分"的问题——旧版
++// ATTEMPT_FRAGMENT_PATH/LEDGER_PATH 是 cwd 下固定路径,resetAttemptFragments() 只在
++// 子进程刚启动时清一次,不同 run 之间没有任何隔离手段):
++//  - manifest.json:run 开始时写一次,含 runId/schemaVersion/headSha/拓扑参数与
++//    expectedCells(笛卡尔积展开的「这次应该跑哪些格」)——ledger-summary.mjs 靠它
++//    判断"缺格"。
++//  - fragments/<scenario>-<renderer>-<kernel>-<topology>-attempt<N>.jsonl:单个「格」
++//    单次 attempt 的临时记录,按 cell 四字段(文件名用 `-` 拼接,见 cellFileStem)+
++//    attempt 编码进文件名(不再靠"进程隔离+全局清空"这种脆弱假设——旧版
++//    e2e-runner.mjs 用 `fragments.find(f => f.scenario
++//    === name)` 模糊匹配同一份共享文件,attempt2 子进程若在写自己的记录前就崩溃,
++//    会读到 attempt1 残留的记录当作 attempt2 结果)。e2e-runner.mjs 在子进程 close
++//    后按 runId+cell+attempt 精确读这一个文件。
++//  - ledger.jsonl:跨 attempt 累积的最终台账,run 内 append-only(不同 run 有不同
++//    runId 目录,天然不会跨 run 累积)。e2e-runner.mjs 在某个「格」的重试循环结束后
++//    (成功或耗尽重试)写入一条汇总记录。
+ 
+ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+ import { dirname, resolve } from 'node:path'
+ import { execFileSync } from 'node:child_process'
+ 
++export const SCHEMA_VERSION = '1'
++
+ const ARTIFACT_DIR = resolve(process.cwd(), 'test-artifacts')
+-export const ATTEMPT_FRAGMENT_PATH = resolve(ARTIFACT_DIR, 'e2e-attempt-fragments.jsonl')
+-export const LEDGER_PATH = resolve(ARTIFACT_DIR, 'e2e-result-ledger.jsonl')
++export const RUNS_DIR = resolve(ARTIFACT_DIR, 'e2e-runs')
++// 指向"最近一次 run 的 runId"——runId 是运行期动态生成的,CI workflow 的 job-summary
++// 步骤是与测试步骤分离的独立 step,拿不到子进程内部生成的值,只能靠这个落盘指针
++// 找到该去读哪个 runId 目录(ledger-summary.mjs --latest 消费它)。
++export const LATEST_POINTER_PATH = resolve(RUNS_DIR, 'LATEST')
+ 
+ const ensureDir = (filePath) => {
+   const dir = dirname(filePath)
+@@ -46,48 +61,141 @@ export const getHeadSha = () => {
+   return cachedHeadSha
+ }
+ 
+-/** 供当前 smoke.mjs 进程在最开始清空自己的 attempt 记录(每个 attempt = 一个全新进程)。 */
+-export const resetAttemptFragments = () => {
+-  ensureDir(ATTEMPT_FRAGMENT_PATH)
+-  writeFileSync(ATTEMPT_FRAGMENT_PATH, '')
++/** e2e-runner.mjs 在启动时调用一次,生成本次 run 的唯一 runId,经 env 传给子进程。 */
++export const buildRunId = () => {
++  const sha = getHeadSha() ?? 'nosha'
++  return `${sha.slice(0, 8)}-${Date.now()}-${process.pid}`
+ }
+ 
+-/** smoke.mjs 每跑完一个 scenario(PASS/FAIL/N_A)调用一次,append 一行 JSON。 */
+-export const recordAttemptFragment = (fragment) => {
++export const runDir = (runId) => resolve(RUNS_DIR, runId)
++export const manifestPath = (runId) => resolve(runDir(runId), 'manifest.json')
++export const ledgerPath = (runId) => resolve(runDir(runId), 'ledger.jsonl')
++
++/** 唯一定位一个「格」= scenario::renderer::kernel::topology(与 buildLedgerRecord 的 name 字段同源)。 */
++export const cellKey = ({ scenario, renderer, kernel, topology }) => `${scenario}::${renderer}::${kernel}::${topology}`
++
++const cellFileStem = ({ scenario, renderer, kernel, topology }) => `${scenario}-${renderer}-${kernel}-${topology}`
++
++export const fragmentPath = (runId, cell, attempt) =>
++  resolve(runDir(runId), 'fragments', `${cellFileStem(cell)}-attempt${attempt}.jsonl`)
++
++/** e2e-runner.mjs 在启动时(computed runId 之后、spawn 任何子进程之前)调用一次。 */
++export const writeLatestPointer = (runId) => {
+   try {
+-    ensureDir(ATTEMPT_FRAGMENT_PATH)
+-    appendFileSync(ATTEMPT_FRAGMENT_PATH, `${JSON.stringify(fragment)}\n`)
++    ensureDir(LATEST_POINTER_PATH)
++    writeFileSync(LATEST_POINTER_PATH, runId)
++  } catch (err) {
++    console.warn(`[result-ledger] writeLatestPointer failed: ${err instanceof Error ? err.message : String(err)}`)
++  }
++}
++
++export const readLatestRunId = () => {
++  if (!existsSync(LATEST_POINTER_PATH)) return null
++  try {
++    const raw = readFileSync(LATEST_POINTER_PATH, 'utf8').trim()
++    return raw || null
++  } catch {
++    return null
++  }
++}
++
++/**
++ * e2e-runner.mjs 在 selectedScenarios/rendererModes/kernelModes 确定后、跑任何 scenario
++ * 之前调用一次。expectedCells 是本次 run「应该」产生终态记录的完整格清单(笛卡尔积展开)——
++ * ledger-summary.mjs 拿它跟 ledger.jsonl 实际写下的记录比对,发现缺格。
++ */
++export const writeManifest = ({ runId, headSha, topology, persist, kernelModes, rendererModes, selectedScenarios }) => {
++  const expectedCells = []
++  for (const kernel of kernelModes) {
++    for (const renderer of rendererModes) {
++      for (const scenario of selectedScenarios) {
++        expectedCells.push({ scenario, renderer, kernel, topology })
++      }
++    }
++  }
++  const manifest = {
++    runId,
++    schemaVersion: SCHEMA_VERSION,
++    headSha,
++    topology,
++    persist,
++    kernelModes,
++    rendererModes,
++    selectedScenarios,
++    expectedCells,
++    recordedAt: new Date().toISOString(),
++  }
++  const path = manifestPath(runId)
++  ensureDir(path)
++  writeFileSync(path, JSON.stringify(manifest, null, 2))
++  return manifest
++}
++
++/**
++ * e2e-smoke.mjs 每跑完一个 scenario(PASS/FAIL/N_A)调用一次,写(覆盖,不追加——每个
++ * runId+cell+attempt 组合按设计恰好对应一条记录)对应的 fragment 文件一行 JSON。
++ */
++export const recordAttemptFragment = (runId, cell, attempt, fragment) => {
++  try {
++    const path = fragmentPath(runId, cell, attempt)
++    ensureDir(path)
++    writeFileSync(path, `${JSON.stringify(fragment)}\n`)
+   } catch (err) {
+     // report-only:台账写失败不阻断真实的 e2e 判定,只打印诊断。
+     console.warn(`[result-ledger] recordAttemptFragment failed: ${err instanceof Error ? err.message : String(err)}`)
+   }
+ }
+ 
+-const readJsonlSafe = (path) => {
+-  if (!existsSync(path)) return []
+-  const raw = readFileSync(path, 'utf8')
+-  return raw
+-    .split('\n')
+-    .map((line) => line.trim())
+-    .filter(Boolean)
+-    .map((line) => {
+-      try {
+-        return JSON.parse(line)
+-      } catch {
+-        return null // 单行坏了不拖垂全体——report-only,宁可丢一行不整体抛错
+-      }
+-    })
+-    .filter(Boolean)
++/** e2e-runner.mjs 在子进程 close 后读取该 runId+cell+attempt 对应的 fragment(不存在返回 null)。 */
++export const readAttemptFragment = (runId, cell, attempt) => {
++  const path = fragmentPath(runId, cell, attempt)
++  if (!existsSync(path)) return null
++  try {
++    const raw = readFileSync(path, 'utf8').trim()
++    if (!raw) return null
++    return JSON.parse(raw.split('\n')[0])
++  } catch {
++    return null
++  }
+ }
+ 
+-/** e2e-runner.mjs 在子进程 close 后读取本次 attempt 写下的 fragment(s)。 */
+-export const readAttemptFragments = () => readJsonlSafe(ATTEMPT_FRAGMENT_PATH)
++/**
++ * #560 SC-1:把子进程 exit code 与它写下的 fragment 合并成一次 attempt 的最终结果。
++ * exit code 是终局真值——exitCode !== 0 时无论 fragment 说什么都强制 FAIL(旧版 bug:
++ * `fragment?.status ?? fallbackStatus` 只要 fragment 存在就永远压倒调用方传入的
++ * fallbackStatus,子进程写了 PASS fragment 后 post-gate 才 throw 的场景,ledger 记的
++ * 是 PASS,但进程 exit 其实非 0)。fragment 只在 exitCode===0 时贡献 status(用于区分
++ * PASS/N_A),任何 exit code 下都贡献 message/pageErrors 等诊断字段。
++ *
++ * evidenceMissing(codex-adversarial R1 CAX-1 review 实测复现的真实缺口):exitCode===0
++ * 但 fragment 不存在——可能是 recordAttemptFragment 写失败(该函数本身 report-only,
++ * 写失败只 console.warn,不影响真实判定,见下方 recordAttemptFragment 注释),此时无法
++ * 区分"这本该是 N_A(leafer-skip)但写失败"与"这真的是无证据支撑的 PASS"。exit code
++ * 仍是终局真值,不因此改判 FAIL(那会违反"report-only 不阻断真实判定"的既有设计,见
++ * appendLedgerRecord 同一原则);但必须让这种降级证据*可见*,不能让它长得跟一条有完整
++ * fragment 佐证的 PASS 一模一样——buildLedgerRecord 据此把 evidenceMissing 写进最终
++ * 记录,ledger-summary.mjs 的严格校验对此 fail-closed(见该文件)。
++ */
++export const resolveAttemptResult = ({ runId, cell, attempt, exitCode, fallbackMessage }) => {
++  const fragment = readAttemptFragment(runId, cell, attempt)
++  const exitOk = exitCode === 0
++  const status = !exitOk ? 'FAIL' : fragment?.status === 'N_A' ? 'N_A' : 'PASS'
++  return {
++    attempt,
++    status,
++    durationMs: fragment?.durationMs ?? 0,
++    message: !exitOk ? fragment?.message ?? fallbackMessage ?? `exit code ${exitCode}` : fragment?.message ?? null,
++    pageErrors: fragment?.pageErrors ?? [],
++    evidenceMissing: exitOk && !fragment,
++  }
++}
+ 
+ /** e2e-runner.mjs 在某个「格」的重试循环结束后写入最终汇总记录。 */
+-export const appendLedgerRecord = (record) => {
++export const appendLedgerRecord = (runId, record) => {
+   try {
+-    ensureDir(LEDGER_PATH)
+-    appendFileSync(LEDGER_PATH, `${JSON.stringify(record)}\n`)
++    const path = ledgerPath(runId)
++    ensureDir(path)
++    appendFileSync(path, `${JSON.stringify(record)}\n`)
+   } catch (err) {
+     console.warn(`[result-ledger] appendLedgerRecord failed: ${err instanceof Error ? err.message : String(err)}`)
+   }
+@@ -103,8 +211,12 @@ export const appendLedgerRecord = (record) => {
+  *  - 只有一次 attempt → 终态就是那次的 PASS/FAIL。
+  *  - 多次 attempt 且其中至少一次 PASS → RETRY_PASS(flaky=true)。
+  *  - 多次 attempt 全部 FAIL(重试耗尽)→ FAIL(flaky=false——这是稳定失败,不是抖动)。
++ *
++ * message 字段(#560 修复):RETRY_PASS 曾被强制置 null,丢失"当初为什么失败"的诊断——
++ * 点名一条 RETRY_PASS 却看不到它 flaky 的原因。现改为:FAIL 取最后一次失败的 message;
++ * RETRY_PASS 取第一次失败(attempts 中第一条 status==='FAIL')的 message。
+  */
+-export const buildLedgerRecord = ({ scenario, renderer, kernel, topology, attempts }) => {
++export const buildLedgerRecord = ({ runId, scenario, renderer, kernel, topology, attempts }) => {
+   const last = attempts[attempts.length - 1]
+   const retries = attempts.length - 1
+   const anyPassed = attempts.some((a) => a.status === 'PASS')
+@@ -127,8 +239,22 @@ export const buildLedgerRecord = ({ scenario, renderer, kernel, topology, attemp
+     }
+   }
+ 
++  const firstFailure = attempts.find((a) => a.status === 'FAIL')
++  const message =
++    status === 'FAIL' ? last.message ?? null
++    : status === 'RETRY_PASS' ? firstFailure?.message ?? null
++    : null
++
++  // #560 codex-adversarial R1 CAX-1:终态是 PASS/RETRY_PASS 时,若"胜出"的那次 attempt
++  // 缺 fragment 佐证(resolveAttemptResult 标的 evidenceMissing),必须把这条信息带进
++  // 最终记录——不然一条"exit=0 但没写 fragment"的降级 PASS 会长得跟一条有完整证据的
++  // PASS 一模一样,ledger-summary.mjs 的严格校验也无从拦截。
++  const evidenceMissing = (status === 'PASS' || status === 'RETRY_PASS') && attempts.some((a) => a.status === 'PASS' && a.evidenceMissing)
++
+   return {
+-    name: `${scenario}::${renderer}::${kernel}::${topology}`,
++    runId,
++    schemaVersion: SCHEMA_VERSION,
++    name: cellKey({ scenario, renderer, kernel, topology }),
+     scenario,
+     renderer,
+     kernel,
+@@ -137,13 +263,14 @@ export const buildLedgerRecord = ({ scenario, renderer, kernel, topology, attemp
+     durationMs: last.durationMs,
+     flaky,
+     retries,
++    evidenceMissing,
+     retryAttempts: attempts.map((a) => ({
+       attempt: a.attempt,
+       status: a.status,
+       duration: a.durationMs,
+       message: a.message ?? null,
+     })),
+-    message: status === 'FAIL' ? last.message ?? null : null,
++    message,
+     headSha: getHeadSha(),
+     diagnostics: {
+       pageErrors: [...pageErrorsByFingerprint.values()],
+diff --git a/scripts/e2e/result-ledger.test.mjs b/scripts/e2e/result-ledger.test.mjs
+index ef9e92c2..6339e739 100644
+--- a/scripts/e2e/result-ledger.test.mjs
++++ b/scripts/e2e/result-ledger.test.mjs
+@@ -1,15 +1,17 @@
+-// scripts/e2e/result-ledger.test.mjs — buildLedgerRecord 终态/flaky 推导单测。
++// scripts/e2e/result-ledger.test.mjs — buildLedgerRecord 终态/flaky 推导单测,
++// resolveAttemptResult(#560 SC-1)exit-code 终局真值单测。
+ //
+-// 只测纯函数(buildLedgerRecord),不起 Playwright/子进程——这段逻辑是本 PR 里唯一
+-// 有判断分支的部分(PASS/RETRY_PASS/FAIL/N_A 四态 + flaky 推导),错了会直接把
+-// 「假绿」台账变成「假台账」,值得独立锁定。
+-import { describe, it, expect } from 'vitest'
+-import { buildLedgerRecord } from './result-ledger.mjs'
++// 只测纯函数/轻量磁盘读写,不起 Playwright/子进程——这段逻辑是本 PR 里唯一有判断
++// 分支的部分(PASS/RETRY_PASS/FAIL/N_A 四态 + flaky 推导 + exit-code 终局真值),
++// 错了会直接把「假绿」台账变成「假台账」,值得独立锁定。
++import { afterEach, describe, it, expect } from 'vitest'
++import { rmSync } from 'node:fs'
++import { buildLedgerRecord, recordAttemptFragment, resolveAttemptResult, runDir } from './result-ledger.mjs'
+ 
+ const attempt = (overrides) => ({ attempt: 1, status: 'PASS', durationMs: 100, message: null, pageErrors: [], ...overrides })
+ 
+ const cell = (attempts) =>
+-  buildLedgerRecord({ scenario: 'debug', renderer: 'dom', kernel: 'legacy', topology: 'prod', attempts })
++  buildLedgerRecord({ runId: 'test-run', scenario: 'debug', renderer: 'dom', kernel: 'legacy', topology: 'prod', attempts })
+ 
+ describe('buildLedgerRecord', () => {
+   it('单次 attempt 且 PASS → 终态 PASS,retries=0,flaky=false', () => {
+@@ -36,6 +38,21 @@ describe('buildLedgerRecord', () => {
+     expect(record.retryAttempts).toHaveLength(2)
+   })
+ 
++  it('#560 SC-9:RETRY_PASS 保留首次失败的 message,不再强制 null(点名后能看到 flaky 的原因)', () => {
++    const record = cell([
++      attempt({ attempt: 1, status: 'FAIL', message: 'transient boom' }),
++      attempt({ attempt: 2, status: 'PASS' }),
++    ])
++    expect(record.status).toBe('RETRY_PASS')
++    expect(record.message).toBe('transient boom')
++  })
++
++  it('runId/schemaVersion 字段写入记录(#560)', () => {
++    const record = cell([attempt({ status: 'PASS' })])
++    expect(record.runId).toBe('test-run')
++    expect(record.schemaVersion).toBe('1')
++  })
++
+   it('控制组:全部 attempt 都是首次 PASS(单次)→ flaky=false,不与上一条混淆', () => {
+     const record = cell([attempt({ status: 'PASS' })])
+     expect(record.flaky).toBe(false)
+@@ -73,3 +90,93 @@ describe('buildLedgerRecord', () => {
+     expect(record.name).toBe('debug::dom::legacy::prod')
+   })
+ })
++
++describe('resolveAttemptResult(#560 SC-1:exit code 是终局真值)', () => {
++  const usedRunIds = []
++  afterEach(() => {
++    for (const runId of usedRunIds) {
++      try { rmSync(runDir(runId), { recursive: true, force: true }) } catch {}
++    }
++    usedRunIds.length = 0
++  })
++  const testRunId = (suffix) => {
++    const runId = `test-resolve-attempt-${suffix}-${process.pid}`
++    usedRunIds.push(runId)
++    return runId
++  }
++  const testCell = { scenario: 'debug', renderer: 'dom', kernel: 'legacy', topology: 'dev' }
++
++  it('exitCode=0 + fragment PASS → status PASS', () => {
++    const runId = testRunId('exit0-pass')
++    recordAttemptFragment(runId, testCell, 1, { status: 'PASS', durationMs: 42, message: null, pageErrors: [] })
++    const result = resolveAttemptResult({ runId, cell: testCell, attempt: 1, exitCode: 0 })
++    expect(result.status).toBe('PASS')
++    expect(result.durationMs).toBe(42)
++  })
++
++  it('exitCode=0 + fragment N_A → status N_A', () => {
++    const runId = testRunId('exit0-na')
++    recordAttemptFragment(runId, testCell, 1, { status: 'N_A', durationMs: 0, message: 'leafer skip', pageErrors: [] })
++    const result = resolveAttemptResult({ runId, cell: testCell, attempt: 1, exitCode: 0 })
++    expect(result.status).toBe('N_A')
++  })
++
++  it('反向变异(旧版真实 bug 复现场景):子进程写了 PASS fragment,但随后 post-gate 让进程 exit 非 0 → status 必须是 FAIL,不能是 PASS', () => {
++    const runId = testRunId('exit1-stale-pass')
++    // 模拟"scenario 本身通过、随后 console error guard 才 throw"——若没有 SC-2 的
++    // fragment 延迟写入修复,fragment 会先落盘 PASS;SC-1 作为纵深防御,即便 fragment
++    // 仍是 PASS,exit code 非 0 也必须强制 FAIL,不能让 fragment 压倒真实退出码。
++    recordAttemptFragment(runId, testCell, 1, { status: 'PASS', durationMs: 100, message: null, pageErrors: [] })
++    const result = resolveAttemptResult({ runId, cell: testCell, attempt: 1, exitCode: 1, fallbackMessage: 'Console errors: boom' })
++    expect(result.status).toBe('FAIL')
++    expect(result.message).toBe('Console errors: boom')
++  })
++
++  it('exitCode 非 0 且 fragment 完全不存在(子进程崩溃在写 fragment 之前)→ status FAIL,message 取 fallback', () => {
++    const runId = testRunId('exit1-no-fragment')
++    const result = resolveAttemptResult({ runId, cell: testCell, attempt: 1, exitCode: 1, fallbackMessage: 'Scenario failed: debug (exit 1)' })
++    expect(result.status).toBe('FAIL')
++    expect(result.message).toBe('Scenario failed: debug (exit 1)')
++  })
++
++  it('#560 R1 codex-adversarial CAX-1:exitCode=0 但 fragment 缺失(疑似 recordAttemptFragment 写失败)→ evidenceMissing=true,不能跟有完整证据的 PASS 长得一样', () => {
++    const runId = testRunId('exit0-no-fragment')
++    const result = resolveAttemptResult({ runId, cell: testCell, attempt: 1, exitCode: 0 })
++    expect(result.status).toBe('PASS')
++    expect(result.evidenceMissing).toBe(true)
++  })
++
++  it('控制组:exitCode=0 且 fragment 存在 → evidenceMissing=false', () => {
++    const runId = testRunId('exit0-pass-evidence-present')
++    recordAttemptFragment(runId, testCell, 1, { status: 'PASS', durationMs: 10, message: null, pageErrors: [] })
++    const result = resolveAttemptResult({ runId, cell: testCell, attempt: 1, exitCode: 0 })
++    expect(result.evidenceMissing).toBe(false)
++  })
++})
++
++describe('buildLedgerRecord.evidenceMissing(#560 R1 codex-adversarial CAX-1 传导)', () => {
++  it('终态 PASS 且胜出 attempt 的 evidenceMissing=true → 记录级 evidenceMissing=true', () => {
++    const record = cell([attempt({ status: 'PASS', evidenceMissing: true })])
++    expect(record.status).toBe('PASS')
++    expect(record.evidenceMissing).toBe(true)
++  })
++
++  it('控制组:终态 PASS 且 evidenceMissing=false → 记录级 evidenceMissing=false', () => {
++    const record = cell([attempt({ status: 'PASS', evidenceMissing: false })])
++    expect(record.evidenceMissing).toBe(false)
++  })
++
++  it('终态 RETRY_PASS,胜出的第二次 attempt evidenceMissing=true → 记录级 evidenceMissing=true', () => {
++    const record = cell([
++      attempt({ attempt: 1, status: 'FAIL', message: 'transient' }),
++      attempt({ attempt: 2, status: 'PASS', evidenceMissing: true }),
++    ])
++    expect(record.status).toBe('RETRY_PASS')
++    expect(record.evidenceMissing).toBe(true)
++  })
++
++  it('终态 FAIL 时不判 evidenceMissing(该字段只服务 PASS/RETRY_PASS 的证据缺失场景)', () => {
++    const record = cell([attempt({ status: 'FAIL', evidenceMissing: true, message: 'boom' })])
++    expect(record.evidenceMissing).toBe(false)
++  })
++})
+diff --git a/scripts/e2e/scenarios/coordinate-probe.mjs b/scripts/e2e/scenarios/coordinate-probe.mjs
+index 33da9fd0..0f916fdc 100644
+--- a/scripts/e2e/scenarios/coordinate-probe.mjs
++++ b/scripts/e2e/scenarios/coordinate-probe.mjs
+@@ -24,7 +24,7 @@
+  * 且真画证据非空。zoom/pan 驱动用真实交互（Ctrl+wheel / 裸滚轮）。
+  */
+ 
+-import { attachPageErrorObserver } from '../browser-error-guard.mjs'
++import { newObservedContext } from '../browser-error-guard.mjs'
+ import { installE2EStoreBridge } from '../harness.mjs'
+ import { listStoreNodes, projectedScreenRectForNode, sampleCanvasPixelInRect } from '../renderer-evidence.mjs'
+ 
+@@ -396,13 +396,13 @@ export const runCoordinateProbeScenario = async (context) => {
+   let dpr2Results = []
+   let dpr2Error = null
+   try {
+-    const dpr2Context = await browser.newContext({ viewport: { width: 1920, height: 1080 }, deviceScaleFactor: 2, colorScheme: 'light' })
+     // 本场景自建 context,harness.mjs 里挂的 context 级 pageerror 观测覆盖不到这里——
+-    // 单独补挂(见 browser-error-guard.mjs)。
+-    attachPageErrorObserver(dpr2Context)
++    // newObservedContext 内部补挂(见 browser-error-guard.mjs);#564 的结构守卫禁止
++    // 场景里裸用 browser.newContext,必须走这个 helper 才能保证观测不漏挂。
++    const dpr2Context = await newObservedContext(browser, { viewport: { width: 1920, height: 1080 }, deviceScaleFactor: 2, colorScheme: 'light' })
+     // createSmokePage 给主 context 挂的两个 addInitScript(E2E 桥开关 + 首登缺 key
+-    // 自动弹设置面板的抑制开关)只在那个 context 生效——这里是 browser.newContext()
+-    // 新开的一份,不会继承。缺了抑制开关时,AutoPromptSettings 会在空 storage 的
++    // 自动弹设置面板的抑制开关)只在那个 context 生效——这里是新开的一份 context,
++    // 不会继承。缺了抑制开关时,AutoPromptSettings 会在空 storage 的
+     // 新 context 上把 Settings 面板弹出来盖在画布正中心,吞掉这里要测的
+     // wheel/pan 手势(2026-08 实测:1920 宽视口下面板恰好居中覆盖,zoom/pan 断言
+     // 恒得到零位移——这是本次改造新增了"真的断言 viewport 变化"才第一次暴露的
+diff --git a/scripts/e2e/scenarios/migration.mjs b/scripts/e2e/scenarios/migration.mjs
+index ac7eddc0..2b5fb7b9 100644
+--- a/scripts/e2e/scenarios/migration.mjs
++++ b/scripts/e2e/scenarios/migration.mjs
+@@ -1,5 +1,5 @@
+ import { installE2EStoreBridge, writePersistedKv } from '../harness.mjs'
+-import { attachPageErrorObserver } from '../browser-error-guard.mjs'
++import { newObservedContext } from '../browser-error-guard.mjs'
+ import { waitForCanvasReady } from '../renderer-evidence.mjs'
+ 
+ export const runMigrationScenario = async (context) => {
+@@ -9,20 +9,19 @@ export const runMigrationScenario = async (context) => {
+   // 注入 v1 结构（gemini + 21:9 override + 含 generationContext.imgRatio=21:9 的旧 error 消息），
+   // rehydrate 后断言 override=auto + 消息 context 已 clamp + 弹层无 21:9
+   {
+-    const migrationContext = await browser.newContext({
++    // 本场景自建 context(bypasses createSmokePage),harness.mjs 里挂的 context 级
++    // pageerror 观测覆盖不到这里——newObservedContext 内部补挂(见 browser-error-guard.mjs)。
++    const migrationContext = await newObservedContext(browser, {
+       viewport: { width: 1512, height: 900 },
+       deviceScaleFactor: 1,
+       extraHTTPHeaders: prodExtraHTTPHeaders,
+     })
+-    // 本场景自建 context(bypasses createSmokePage),harness.mjs 里挂的 context 级
+-    // pageerror 观测覆盖不到这里——单独补挂(见 browser-error-guard.mjs)。
+-    attachPageErrorObserver(migrationContext)
+     if (isProdTopology) {
+       await installE2EStoreBridge(migrationContext)
+     }
+     // mainfix R3 把 __MIVO_E2E_ENABLED__ flag 从 installE2EStoreBridge 挪到 createSmokePage
+     // (harness.mjs:599-601),让 main.tsx 在两拓扑都填 window.__MIVO_E2E__。本场景用
+-    // browser.newContext 自建上下文(line 19 注释:bypasses createSmokePage),flag 漏设 →
++    // newObservedContext 自建上下文(上方注释:bypasses createSmokePage),flag 漏设 →
+     // main.tsx 不填 bridge global → chatStore bridge module 抛 'Missing E2E store bridge:
+     // useChatStore'(nightly-e2e 红灯 run 29598669120)。此处补 flag,与 createSmokePage 同源;
+     // bridge 路由拦截已在 installE2EStoreBridge 装好,evaluate 动态 import chatStore.ts 在 prod

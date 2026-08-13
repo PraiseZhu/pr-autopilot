@@ -1,0 +1,78 @@
+diff --git a/main.js b/main.js
+index 7a348b13..7d564170 100644
+--- a/main.js
++++ b/main.js
+@@ -3699,6 +3699,9 @@ const SNAPSHOT_PAGE_MAX_BYTES = 262_144
+ const SNAPSHOT_PAGE_MIN_MAX_BYTES = 8_192
+ const SNAPSHOT_PAGE_MAX_MAX_BYTES = 1_048_576
+ const SNAPSHOT_PANEL_TIMEOUT_MS = 6000
++// 选中观测组的护栏(#297 T2a2,与共享层 `MAX_SELECTED_IMAGE_NODE_IDS`
++// `src/agent/snapshotRegion.ts` 同值):超出即截断,不静默丢弃。
++const SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS = 64
+ 
+ // 面板未打开/离线降级/无事可做属于「可恢复的跳过」,记 warn;其余失败记 error
+ // (口径:invalid / not-found / locked / hidden / scene-mismatch → error)。
+@@ -3788,6 +3791,30 @@ function parseOfflineMaxBytes(value) {
+   return { ok: true, value }
+ }
+ 
++/**
++ * 选中观测组的原子派生(#297 T2a2,与共享层 `deriveSelectedImageObservation`
++ * `src/agent/snapshotRegion.ts` 同规则):对原始 snapshot 的 selectedNodeIds、
++ * 裁剪到「结果集」(离线路径无过滤 → 整份快照的节点)。
++ */
++function deriveSelectedImageObservation(rawSelectedNodeIds, includedIds, nodesById) {
++  const selectedIncluded = (Array.isArray(rawSelectedNodeIds) ? rawSelectedNodeIds : []).filter((id) =>
++    includedIds.has(id),
++  )
++  const selectedImageIds = selectedIncluded.filter((id) => {
++    const found = nodesById.get(id)
++    return Boolean(found) && found.type === 'image'
++  })
++  const truncated = selectedImageIds.length > SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS
++  const result = {
++    selectedImageNodeIds: truncated
++      ? selectedImageIds.slice(0, SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS)
++      : selectedImageIds,
++    selectedNodeCount: selectedIncluded.length,
++  }
++  if (truncated) result.selectedImageNodesTruncated = true
++  return result
++}
++
+ /**
+  * 离线快照首页:与共享层 readSnapshotPage(snapshot, {maxBytes}) 的无过滤首页同规则
+  * ——节点原序贪心装到 maxBytes(未传时默认 SNAPSHOT_PAGE_MAX_BYTES,与共享层
+@@ -3809,15 +3836,23 @@ function snapshotOfflineFirstPage(snapshot, maxBytes = SNAPSHOT_PAGE_MAX_BYTES)
+     annotations: nodes.filter((node) => node && node.type === 'annotation').length,
+     results: nodes.filter((node) => node && node.aiWorkflow && node.aiWorkflow.kind === 'result').length,
+   }
+-  const base = {
+-    version: snapshot && snapshot.version,
+-    sceneId: snapshot && snapshot.sceneId,
+-    selectedNodeIds: [],
+-    summary,
+-    nodes: [],
+-    edges: [],
+-    links: [],
+-  }
++  const selectedImageObservation = deriveSelectedImageObservation(
++    snapshot && snapshot.selectedNodeIds,
++    existing,
++    new Map(nodes.map((node) => [node && node.id, node])),
++  )
++  const base = Object.assign(
++    {
++      version: snapshot && snapshot.version,
++      sceneId: snapshot && snapshot.sceneId,
++      selectedNodeIds: [],
++      summary,
++      nodes: [],
++      edges: [],
++      links: [],
++    },
++    selectedImageObservation,
++  )
+   const skeletonBytes = bytesOf(Object.assign({}, base, { truncated: true })) + 96
+ 
+   // F8 零-dangling(共享层同口径):任何指向结果集外的 id 引用都剥离并计数。离线

@@ -1,0 +1,1252 @@
+diff --git a/cindyplugin/build.sh b/cindyplugin/build.sh
+index c9fc9de6..326a98a3 100755
+--- a/cindyplugin/build.sh
++++ b/cindyplugin/build.sh
+@@ -11,8 +11,8 @@ cp cindyplugin/ghost.json cindyplugin/dist/
+ cp cindyplugin/main.js cindyplugin/dist/
+ cp cindyplugin/icon.jpg cindyplugin/dist/
+ # 设置区(network 槽的 Mivo API Key 长期管理):声明 user 凭证时 settingsHtml 是硬要求。
+-cp cindyplugin/settings.html cindyplugin/dist/
+-cp cindyplugin/settings.js cindyplugin/dist/
++# settings.html / settings.js 现在由上面的 vite 构建产出(第二个 rollup 入口),不再直接 cp
++# —— 设置页要 import 校验 sender,手抄版会与 src/ 下的实现漂移。
+ cp -R cindyplugin/skills cindyplugin/dist/skills
+ # 画布运行时以绝对路径 /stickers/*.svg(印章)与 /demo-assets/*.jpg(演示
+ # 种子场景)引用这两组静态资源;在 cindy-ghost://<id>/ 下绝对路径解析到包根,
+diff --git a/cindyplugin/ghost.json b/cindyplugin/ghost.json
+index fa9e3e61..04bbc407 100644
+--- a/cindyplugin/ghost.json
++++ b/cindyplugin/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.24",
++  "version": "0.9.25",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/cindyplugin/settings.html b/cindyplugin/settings.html
+index fd7579a7..bbcb67b7 100644
+--- a/cindyplugin/settings.html
++++ b/cindyplugin/settings.html
+@@ -1,37 +1,135 @@
+ <!doctype html>
+ <meta charset="utf-8" />
+-<!-- 设置区:Mivo API Key 的长期管理(添加/替换/清除)。
++<!-- 设置区:Mivo API Key 的长期管理(添加/替换/清除)+ 真实连通性校验。
++     视觉基准 = _tmp/debug/mivo-key-ui-mockup.html(R3,owner 已确认):
++       骨架固定顺序 head-row → action-row → link-row → error-row(四态同一顺序,
++       错误提示永远在链接之后,不挤在中间把链接推下去);
++       四按钮(保存/校验/重试/断开)共用 .btn 基类 —— 同一 padding、同一 pill 圆角;
++       转圈动画只出现在右上角徽标里,按钮上永不出现;
++       零蓝紫:全稿不引入 mivo 旧主色 violet 与 Cindy Focus Blue 这两支色相,链接与焦点态
++       改用中性 currentColor。
+      底色/字色由主机注入基线提供,这里不铺整页底色(会与相邻设置卡片脱节)。
++     语义色只用「亮暗同值」的两个:已连接绿 #2AAE5B、错误红 #ef4444(Cindy
++     --card-status-done / --error-flat),其余中性一律 currentColor + opacity —— 这样
++     双主题下都成立,不必猜宿主注入了哪些 token 名(R3 稿是固定深色 chrome,它的中性
++     刻度不能照搬)。
+      CSP 同源不放行内联 <script>,逻辑必须外挂 settings.js。 -->
++<style>
++  .mivo-card { font-size: 13px; line-height: 1.6 }
++  .head-row { display: flex; align-items: flex-start; gap: 10px }
++  .title-block { flex: 1 1 auto; min-width: 0 }
++  .title { font-weight: 500; font-size: 14px }
++  .desc { margin-top: 2px; font-size: 13px; opacity: 0.66 }
++  .state-badge {
++    flex: 0 0 auto;
++    display: inline-flex;
++    align-items: center;
++    gap: 4px;
++    margin-top: 1px;
++    padding: 3px 9px;
++    border-radius: 9999px;
++    font-size: 11px;
++    font-weight: 500;
++    white-space: nowrap;
++  }
++  .state-badge.is-unconfigured { color: currentColor; background: rgba(128, 128, 128, 0.16); opacity: 0.7 }
++  .state-badge.is-pending { color: currentColor; background: rgba(128, 128, 128, 0.16); opacity: 0.85 }
++  .state-badge.is-connected { color: #2aae5b; background: rgba(42, 174, 91, 0.18) }
++  .state-badge.is-failed { color: #ef4444; background: rgba(239, 68, 68, 0.18) }
++  /* 纯 CSS border-spin,颜色跟随徽标文字色;按钮上不加同款动画(R3 反馈①)。 */
++  .badge-spinner {
++    display: inline-block;
++    flex: 0 0 auto;
++    width: 9px;
++    height: 9px;
++    border: 1.5px solid currentColor;
++    border-right-color: transparent;
++    border-radius: 50%;
++    animation: badge-spin 0.7s linear infinite;
++  }
++  @keyframes badge-spin {
++    to {
++      transform: rotate(360deg);
++    }
++  }
++  .action-row { margin-top: 12px }
++  .key-row { display: flex; gap: 8px; align-items: center }
++  .key-input {
++    flex: 1 1 200px;
++    min-width: 0;
++    padding: 6px 12px;
++    border-radius: 9999px;
++    background: var(--surface, #fff);
++    color: inherit;
++    border: 1px solid var(--border-default, #e4e4e0);
++    font-size: 13px;
++    font-family: inherit;
++    outline: none;
++  }
++  .key-input:focus { border-color: currentColor }
++  .key-input.is-error { border-color: #ef4444 }
++  .key-input:disabled { opacity: 0.5; cursor: not-allowed }
++  .conn-row { display: flex; align-items: center; justify-content: space-between; gap: 10px }
++  .conn-status { font-size: 13px; opacity: 0.66 }
++  /* 四按钮同尺寸同圆角(R3 反馈③):padding / border-radius / border 宽度都只在这里定义一次。
++     实色按钮也留 1px transparent 边框占位,免得 filled 与 outline 差出 1px。 */
++  .btn {
++    padding: 5px 14px;
++    border-radius: 9999px;
++    border: 1px solid transparent;
++    font-size: 12px;
++    font-weight: 500;
++    font-family: inherit;
++    white-space: nowrap;
++    cursor: pointer;
++  }
++  .btn-primary { background: var(--accent-cta-bg-pure, #111111); color: var(--accent-pure-cta-fg, #ffffff) }
++  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed }
++  .btn-pill { background: transparent; color: inherit; border-color: var(--border-default, #e4e4e0) }
++  .link-row { margin-top: 10px; font-size: 13px }
++  .link-row a { color: inherit; text-decoration: none }
++  .link-row a:hover { text-decoration: underline }
++  .error-row {
++    display: flex;
++    align-items: flex-start;
++    gap: 6px;
++    margin-top: 8px;
++    padding: 8px 10px;
++    border: 1px solid rgba(239, 68, 68, 0.45);
++    border-radius: 12px;
++    background: rgba(239, 68, 68, 0.1);
++    color: #ef4444;
++    font-size: 13px;
++  }
++  [hidden] { display: none !important }
++</style>
+ <body style="margin: 0; padding: 12px 0">
+-  <div style="font-size: 13px; line-height: 1.6">
+-    <div style="font-weight: 700; margin-bottom: 4px">Mivo API Key</div>
+-    <div id="hint" style="opacity: 0.7; margin-bottom: 8px">
+-      填了就用公司 Mivo 平台出图(Nano Banana Pro);不填继续走 Cindy 代办。
++  <div class="mivo-card">
++    <div class="head-row">
++      <div class="title-block">
++        <div class="title">Mivo API Key</div>
++        <div class="desc">填了就用公司 Mivo 平台出图(Nano Banana Pro);不填继续走 Cindy 代办。</div>
++      </div>
++      <span id="badge" class="state-badge is-pending" role="status" aria-live="polite">
++        <span id="badge-spinner" class="badge-spinner" aria-hidden="true"></span>
++        <span id="badge-icon" aria-hidden="true"></span>
++        <span id="badge-text">读取中</span>
++      </span>
+     </div>
+-    <div id="state" style="opacity: 0.7; margin-bottom: 8px">读取中…</div>
+-    <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap">
+-      <input
+-        id="key"
+-        type="password"
+-        placeholder="mivo_…"
+-        autocomplete="off"
+-        style="
+-          flex: 1 1 200px;
+-          padding: 6px 8px;
+-          border-radius: 6px;
+-          background: var(--surface, #fff);
+-          color: inherit;
+-          border: 1px solid var(--border-default, #e4e4e0);
+-        "
+-      />
+-      <button id="save" style="padding: 6px 12px; border-radius: 6px">保存</button>
+-      <button id="clear" style="padding: 6px 12px; border-radius: 6px">清除</button>
++    <div class="action-row">
++      <div id="key-row" class="key-row" hidden>
++        <input id="key" type="password" placeholder="mivo_…" autocomplete="off" class="key-input" />
++        <button id="primary" class="btn btn-primary">保存</button>
++      </div>
++      <div id="conn-row" class="conn-row" hidden>
++        <span id="conn-status" class="conn-status"></span>
++        <button id="disconnect" class="btn btn-pill">断开</button>
++      </div>
+     </div>
+-    <div style="margin-top: 8px">
+-      <a href="https://aigc.xindong.com/" style="color: var(--accent, #2563eb)">前往 Mivo 平台获取 Key ↗</a>
++    <div class="link-row">
++      <a href="https://aigc.xindong.com/">前往 Mivo 平台获取 Key ↗</a>
+     </div>
+-    <div id="feedback" role="status" style="margin-top: 8px; min-height: 18px; opacity: 0.85"></div>
++    <div id="error-row" class="error-row" role="alert" hidden><span id="error-text"></span></div>
+   </div>
+-  <script src="/settings.js"></script>
++  <script type="module" src="./settings.js"></script>
+ </body>
+diff --git a/cindyplugin/settings.js b/cindyplugin/settings.js
+index 88fcd31f..3c3c1b0b 100644
+--- a/cindyplugin/settings.js
++++ b/cindyplugin/settings.js
+@@ -1,56 +1,35 @@
+-// 设置区逻辑:Mivo API Key 的收单与清除。
++// 设置页接线层:把 settingsCard 的 view model 刷到 DOM,把 DOM 事件喂回控制器。
+ //
+-// 红线(手册 §4.7/§4.8):收单即交 —— 值只经 PUT /secrets/<key> 一次性交给主机保险库,
+-// 绝不落 /kv、BroadcastChannel、日志或任何自存路径;/secrets 只查回 {key,saved,tail?},
+-// 永远拿不回明文。
+-const SECRET_KEY = 'mivo_api_key'
+-const $ = (selector) => document.querySelector(selector)
+-
+-const say = (text) => {
+-  $('#feedback').textContent = text
+-}
++// 这一层只剩**装配**:状态机在 src/settings/settingsCard.ts、DOM 渲染在
++// src/settings/settingsView.ts,两者都被单测直接跑。本文件不含任何判断逻辑,也因此不需要
++// (也无法)被测试 import —— 它模块顶层就 card.start(),一 import 就发 fetch。
++//
++// 红线(手册 §4.7/§4.8,与改动前一致):收单即交 —— 值只经 PUT /secrets/<key> 一次性交给
++// 宿主保险库,绝不落 /kv、BroadcastChannel、日志或任何自存路径;/secrets 只查回
++// {key,saved,tail?},永远拿不回明文。
++//
++// 经 vite 构建(cindyplugin/vite.config.ts 的第二个入口),因此可以直接 import 复用
++// PR-B 已合并的校验 sender —— 校验逻辑只有一份,不在纯 JS 页里重抄一遍。
++import { createMivoKeyValidateSender } from './src/settings/mivoKeyValidateSender'
++import { createSettingsCard, SECRET_KEY } from './src/settings/settingsCard'
++import { renderSettingsCard } from './src/settings/settingsView'
+ 
+-async function refresh() {
+-  try {
+-    const list = await (await fetch('/secrets')).json()
+-    const row = Array.isArray(list) ? list.find((item) => item && item.key === SECRET_KEY) : null
+-    if (row && row.saved) {
+-      $('#state').textContent = row.tail ? '已配置(尾号 …' + row.tail + '),Mivo 直连生效' : '已配置,Mivo 直连生效'
+-    } else {
+-      $('#state').textContent = '未配置,当前走 Cindy 代办出图'
+-    }
+-  } catch (error) {
+-    $('#state').textContent = '读取配置状态失败,可稍后重开设置页'
+-  }
+-}
++const $ = (id) => document.getElementById(id)
+ 
+-$('#save').addEventListener('click', async () => {
+-  const value = $('#key').value.trim()
+-  if (!value) {
+-    say('请先粘贴 Key')
+-    return
+-  }
+-  say('保存中…')
+-  try {
+-    const res = await fetch('/secrets/' + SECRET_KEY, { method: 'PUT', body: JSON.stringify({ value: value }) })
+-    $('#key').value = '' // 立刻清空输入框:明文不在页面上多留一秒
+-    if (res.status === 204) say('已保存')
+-    else say('保存失败(HTTP ' + res.status + ')')
+-  } catch (error) {
+-    say('保存失败,请重试')
+-  }
+-  await refresh()
++const card = createSettingsCard({
++  readSecrets: async () => (await fetch('/secrets')).json(),
++  putSecret: async (value) =>
++    (await fetch('/secrets/' + SECRET_KEY, { method: 'PUT', body: JSON.stringify({ value: value }) })).status,
++  deleteSecret: async () => (await fetch('/secrets/' + SECRET_KEY, { method: 'DELETE' })).status,
++  sender: createMivoKeyValidateSender(),
++  render: renderSettingsCard,
+ })
+ 
+-$('#clear').addEventListener('click', async () => {
+-  say('清除中…')
+-  try {
+-    await fetch('/secrets/' + SECRET_KEY, { method: 'DELETE' })
+-    say('已清除,后续出图回落 Cindy 代办')
+-  } catch (error) {
+-    say('清除失败,请重试')
+-  }
+-  await refresh()
++$('primary').addEventListener('click', () => {
++  void card.save($('key').value)
++})
++$('disconnect').addEventListener('click', () => {
++  void card.disconnect()
+ })
+ 
+-void refresh()
++void card.start()
+diff --git a/cindyplugin/src/__tests__/mivoSettingsCard.test.ts b/cindyplugin/src/__tests__/mivoSettingsCard.test.ts
+new file mode 100644
+index 00000000..fbf2a719
+--- /dev/null
++++ b/cindyplugin/src/__tests__/mivoSettingsCard.test.ts
+@@ -0,0 +1,434 @@
++/**
++ * Mivo API Key 设置卡(PR-C)· 五态状态机 + 保存/断开矩阵 + R3 视觉不变量。
++ * SC 对照:_tmp/debug/mivo-key-sc.md §5(SC-C1..C9)+ §2 的 D4。
++ *
++ * 状态机断言跑在真实 `createSettingsCard` 上(注入 fetch 三档与假 sender);视觉断言跑在
++ * **真实 settings.html 源文本**上 —— 见文件末尾那组测试的注释,那里说明了为什么不是
++ * computed-style。
++ */
++import { describe, expect, it } from 'vitest'
++import { readFileSync } from 'node:fs'
++import { fileURLToPath } from 'node:url'
++import { createSettingsCard, SECRET_KEY } from '../settings/settingsCard'
++import type { CardView } from '../settings/settingsCard'
++import type { MivoKeyValidateOutcome } from '../settings/mivoKeyValidateSender'
++
++const TAIL = 'a1b2'
++const savedRow = (tail?: string) => [{ key: SECRET_KEY, saved: true, ...(tail ? { tail } : {}) }]
++
++type Calls = { put: string[]; del: number; validate: number; cancel: number; reads: number }
++
++const makeCard = (options: {
++  secrets?: () => Promise<unknown>
++  putStatus?: number | (() => Promise<number>)
++  deleteStatus?: number | (() => Promise<number>)
++  outcome?: MivoKeyValidateOutcome | (() => Promise<MivoKeyValidateOutcome>)
++}) => {
++  const calls: Calls = { put: [], del: 0, validate: 0, cancel: 0, reads: 0 }
++  const views: CardView[] = []
++  const card = createSettingsCard({
++    readSecrets: async () => {
++      calls.reads += 1
++      return options.secrets ? options.secrets() : []
++    },
++    putSecret: async (value) => {
++      calls.put.push(value)
++      const s = options.putStatus ?? 204
++      return typeof s === 'number' ? s : s()
++    },
++    deleteSecret: async () => {
++      calls.del += 1
++      const s = options.deleteStatus ?? 204
++      return typeof s === 'number' ? s : s()
++    },
++    sender: {
++      validate: async () => {
++        calls.validate += 1
++        const o = options.outcome ?? 'valid'
++        return typeof o === 'string' ? o : o()
++      },
++      cancel: () => {
++        calls.cancel += 1
++      },
++    },
++    render: (view) => views.push({ ...view }),
++  })
++  return { card, calls, views }
++}
++
++// ── SC-C1:/secrets × 校验结果 × in-flight → 唯一 UI 输出(逐格)────────────────
++describe('SC-C1 迁移表:开页路径', () => {
++  it('/secrets 无该 key → unconfigured(输入框可编辑 + 保存,零校验)', async () => {
++    const { card, calls } = makeCard({ secrets: async () => [] })
++    await card.start()
++    expect(card.view.state).toBe('unconfigured')
++    expect(card.view.badgeText).toBe('未配置')
++    expect(card.view).toMatchObject({ showInput: true, inputDisabled: false, primaryLabel: '保存', primaryDisabled: false })
++    expect(card.view.badgeIcon).toBe('') // R3 反馈⑤:未配置徽标没有前缀符号
++    expect(calls.validate).toBe(0) // 没 key 不打校验
++  })
++
++  it('/secrets saved=true → 先 validating(读取中→校验中都是转圈徽标)→ valid → connected 带尾号', async () => {
++    const { card, views, calls } = makeCard({ secrets: async () => savedRow(TAIL), outcome: 'valid' })
++    await card.start()
++    // R3 骨架:loading 与 validating 共用同款转圈徽标,文字分别「读取中」/「校验中」。
++    expect(views[0]).toMatchObject({ state: 'loading', badgeText: '读取中', badgeSpinner: true })
++    const validating = views.find((v) => v.state === 'validating')
++    expect(validating).toMatchObject({ badgeText: '校验中', badgeSpinner: true, inputDisabled: true, primaryLabel: '校验', primaryDisabled: true })
++    expect(calls.validate).toBe(1) // 「已连接」= 真校验过,不是 saved=true 就吹(R3 根因)
++    expect(card.view.state).toBe('connected')
++    expect(card.view.badgeText).toBe('已连接')
++    expect(card.view.badgeIcon).toBe('✓')
++    expect(card.view.statusText).toContain('尾号 …' + TAIL) // SC-C2:tail 唯一来源是 /secrets.tail
++    expect(card.view.showInput).toBe(false) // 已连接态无输入框(SC-C7:改 key 必须先断开)
++    expect(card.view.showDisconnect).toBe(true)
++  })
++
++  it('/secrets 抛错 → 不猜未配置也不猜已连接,落 failed 并说清是读取失败', async () => {
++    const { card, calls } = makeCard({
++      secrets: async () => {
++        throw new Error('boom')
++      },
++    })
++    await card.start()
++    expect(card.view.state).toBe('failed')
++    expect(card.view.errorText).toContain('读取配置状态失败')
++    expect(calls.validate).toBe(0)
++  })
++
++  const FAILURES: Array<[Exclude<MivoKeyValidateOutcome, 'valid' | 'cancelled'>, string]> = [
++    ['auth-invalid', 'Key 无效'],
++    ['auth-forbidden', '没有访问权限'],
++    ['unavailable', '暂时连不上'],
++    ['timeout', '校验超时'],
++  ]
++  for (const [outcome, fragment] of FAILURES) {
++    it(`校验 ${outcome} → failed(红徽标 + 重试 + 输入框红边),文案区分得开`, async () => {
++      const { card } = makeCard({ secrets: async () => savedRow(), outcome })
++      await card.start()
++      expect(card.view.state).toBe('failed')
++      expect(card.view).toMatchObject({ badgeText: '连接失败', badgeIcon: '✕', badgeSpinner: false, inputError: true, primaryLabel: '重试' })
++      expect(card.view.errorText).toContain(fragment)
++    })
++  }
++
++  it('校验 cancelled(新一轮已接管)→ 旧轮不许改 UI,停在 validating', async () => {
++    const { card } = makeCard({ secrets: async () => savedRow(), outcome: 'cancelled' })
++    await card.start()
++    expect(card.view.state).toBe('validating') // 旧轮既不判成功也不判失败
++  })
++})
++
++// ── SC-C5:保存/删除失败矩阵 ───────────────────────────────────────────────────
++describe('SC-C5 保存矩阵:只有 204 才推进到校验', () => {
++  it('空值 → 零 PUT 零校验,只提示', async () => {
++    const { card, calls } = makeCard({ secrets: async () => [] })
++    await card.start()
++    await card.save('   ')
++    expect(calls.put).toHaveLength(0)
++    expect(calls.validate).toBe(0)
++    expect(card.view.state).toBe('unconfigured')
++    expect(card.view.errorText).toContain('请先粘贴 Key')
++  })
++
++  it('PUT 非 204 → 不发起校验,落 failed 并说清 Key 未入库', async () => {
++    const { card, calls } = makeCard({ secrets: async () => [], putStatus: 500 })
++    await card.start()
++    await card.save('mivo_abc')
++    expect(calls.put).toEqual(['mivo_abc'])
++    expect(calls.validate).toBe(0) // 没入库就别校验(否则会拿旧 key 的结论骗人)
++    expect(card.view.state).toBe('failed')
++    expect(card.view.errorText).toContain('未入库')
++  })
++
++  it('PUT 抛错 → 同样零校验,落 failed', async () => {
++    const { card, calls } = makeCard({
++      secrets: async () => [],
++      putStatus: async () => {
++        throw new Error('offline')
++      },
++    })
++    await card.start()
++    await card.save('mivo_abc')
++    expect(calls.validate).toBe(0)
++    expect(card.view.state).toBe('failed')
++  })
++
++  it('PUT 204 → 推进校验;保存前先 cancel 旧轮(代际推进,防迟到回执落到新 key 上)', async () => {
++    const { card, calls } = makeCard({ secrets: async () => savedRow(TAIL), outcome: 'valid' })
++    await card.start()
++    const cancelsBefore = calls.cancel
++    await card.save('  mivo_new  ')
++    expect(calls.put).toEqual(['mivo_new']) // trim 后提交
++    expect(calls.cancel).toBe(cancelsBefore + 1)
++    expect(card.view.state).toBe('connected')
++  })
++
++  it('validating/connected/failed 三态的输入框都不许保留真实 key(view 层契约)', async () => {
++    const { card, views } = makeCard({ secrets: async () => savedRow(), outcome: 'auth-invalid' })
++    await card.start()
++    // 契约:showInput=false 或 inputDisabled=true 时接线层清空 input(settings.js);
++    // failed 态输入框可编辑,但那是用户重贴新 key 的空框——保存成功后立刻进 validating(禁用)。
++    for (const v of views) {
++      if (v.state === 'validating') expect(v.inputDisabled).toBe(true)
++      if (v.state === 'connected') expect(v.showInput).toBe(false)
++    }
++    expect(card.view.state).toBe('failed')
++  })
++})
++
++describe('SC-C5/C7 断开矩阵:二次确认 + 只有 204 才退回未配置', () => {
++  const connected = () => makeCard({ secrets: async () => savedRow(TAIL), outcome: 'valid' })
++
++  it('第一次点断开 → 零 DELETE,只把按钮换成「确认断开」', async () => {
++    const { card, calls } = connected()
++    await card.start()
++    await card.disconnect()
++    expect(calls.del).toBe(0) // confirm=false 分支:一个 DELETE 都不发
++    expect(card.view.state).toBe('connected')
++    expect(card.view.disconnectLabel).toBe('确认断开')
++  })
++
++  it('第二次点 + 204 → unconfigured 且焦点回输入框(SC-C7 换 key 流程)', async () => {
++    const { card, calls } = connected()
++    await card.start()
++    await card.disconnect()
++    await card.disconnect()
++    expect(calls.del).toBe(1)
++    expect(card.view.state).toBe('unconfigured')
++    expect(card.view.focusInput).toBe(true)
++  })
++
++  it('DELETE 非 204 → 保持已连接(含尾号文案不丢),只叠一条错误', async () => {
++    const { card, calls } = makeCard({ secrets: async () => savedRow(TAIL), outcome: 'valid', deleteStatus: 500 })
++    await card.start()
++    await card.disconnect()
++    await card.disconnect()
++    expect(calls.del).toBe(1)
++    expect(card.view.state).toBe('connected') // 没删掉就不许显示成未配置
++    expect(card.view.statusText).toContain('尾号 …' + TAIL)
++    expect(card.view.errorText).toContain('仍在库中')
++    expect(card.view.disconnectLabel).toBe('断开') // 确认态复位,不会一按就删
++  })
++
++  it('DELETE 抛错 → 同样保持已连接', async () => {
++    const { card } = makeCard({
++      secrets: async () => savedRow(TAIL),
++      outcome: 'valid',
++      deleteStatus: async () => {
++        throw new Error('offline')
++      },
++    })
++    await card.start()
++    await card.disconnect()
++    await card.disconnect()
++    expect(card.view.state).toBe('connected')
++    expect(card.view.errorText).toContain('清除失败')
++  })
++
++  it('非已连接态调 disconnect → 零 DELETE(没有"未配置也能删"这种路径)', async () => {
++    const { card, calls } = makeCard({ secrets: async () => [] })
++    await card.start()
++    await card.disconnect()
++    await card.disconnect()
++    expect(calls.del).toBe(0)
++  })
++})
++
++// ── R3 视觉不变量:断言在 settings.html **源文本**上 ───────────────────────────
++//
++// 分工(第 1 轮审查 P1 返修后):**尺寸不变量以 `mivoSettingsCardDom.test.ts` 的
++// computed-style 断言为准**,那里跑在 happy-dom 上、管的是"最终渲染出来是什么",任何选择器
++// 写坏都抓得住。本文件留的是**结构性**判据(骨架顺序、spinner 归属、a11y 属性、零蓝紫色相、
++// 外链逐字相等)—— 这些用源文本判更直接,且不依赖 DOM 环境。
++//
++// ⚠ 上一版这里写着「computed-style 在本仓返回空串所以只能降级成源文本断言」,**那句是错的**:
++// 本仓装的是 happy-dom(没有 jsdom,归因的仓都写错了),它对类选择器正常级联。审查方还实测出
++// 纯源文本断言有可复现的规避路径(用 `#primary` id 选择器覆盖尺寸,不落在 `.btn-*` 块体内,
++// R3 已破而用例全绿)。记在这里,别再拿"环境不支持"当降级理由而不先去验。
++// 真机双主题四态截图(SC-C8)仍需 owner 过目,不作机器门 —— PR 描述里如实标 not_run。
++const HTML = readFileSync(fileURLToPath(new URL('../../settings.html', import.meta.url)), 'utf8')
++
++describe('SC-C2 R3 骨架与尺寸(源文本断言)', () => {
++  it('骨架顺序固定 head-row → action-row → link-row → error-row', () => {
++    const order = ['class="head-row"', 'class="action-row"', 'class="link-row"', 'id="error-row"'].map((needle) =>
++      HTML.indexOf(needle),
++    )
++    expect(order.every((i) => i > 0)).toBe(true)
++    expect(order).toEqual([...order].sort((a, b) => a - b)) // 错误提示在链接之后
++  })
++
++  it('四按钮共用 .btn 基类:padding / border-radius / border 宽度只定义一次', () => {
++    // 四个按钮元素(保存·校验·重试 是同一个 #primary,断开是 #disconnect)都带 class="btn "
++    const buttons = HTML.match(/<button[^>]*>/g) ?? []
++    expect(buttons).toHaveLength(2)
++    for (const tag of buttons) expect(tag).toContain('class="btn ')
++    // 尺寸只在 .btn 里出现一次:变体类(.btn-primary/.btn-pill)不许再写 padding/border-radius
++    for (const variant of ['.btn-primary {', '.btn-pill {']) {
++      const body = HTML.slice(HTML.indexOf(variant), HTML.indexOf('}', HTML.indexOf(variant)))
++      expect(body).not.toMatch(/padding|border-radius/)
++    }
++  })
++
++  it('spinner 只存在于徽标内,按钮上没有(R3 反馈①)', () => {
++    const badge = HTML.slice(HTML.indexOf('id="badge"'), HTML.indexOf('</span>\n    </div>'))
++    expect(badge).toContain('id="badge-spinner"')
++    expect((HTML.match(/badge-spinner/g) ?? []).length).toBe(3) // CSS 类 + keyframes 归属 + DOM 节点
++    for (const tag of HTML.match(/<button[^>]*>/g) ?? []) expect(tag).not.toContain('spinner')
++  })
++
++  it('无障碍:徽标 aria-live、错误 role=alert、spinner aria-hidden', () => {
++    expect(HTML).toMatch(/id="badge"[^>]*aria-live="polite"/)
++    expect(HTML).toMatch(/id="error-row"[^>]*role="alert"/)
++    expect(HTML).toMatch(/id="badge-spinner"[^>]*aria-hidden="true"/)
++  })
++})
++
++describe('SC-C3 零蓝紫:颜色与属性双白名单(反转判据,未知一律红)', () => {
++  // 前三轮的教训:靠正则枚举**违规**写法必然漏 —— R1 漏 id 选择器、R2 漏第二个 style 块、
++  // R3 漏 `rgb(65 124 221 / .9)` 空格语法 / 4 位 hex / `darkblue`。每次补一个,下一个还在。
++  //
++  // 也不能改用 computed 值判色相:**实测 happy-dom 不做颜色归一化** —— 声明 `darkblue`
++  // 读回来还是 `"darkblue"`,`#41CF` 还是 `"#41CF"`,`rgb(65 124 221 / 0.9)` 原样,
++  // 未解析的 `var()` 直接给空串。所以解析问题只会换个地方,不会消失。
++  //
++  // 改法是**反转判据**:卡片 CSS 里能出现的**属性名**与**颜色值**都走白名单,
++  // 任何没登记过的写法(不论什么语法)一律红。这样"我没想到的写法"从 fail-open 变成
++  // fail-closed —— 想加新颜色就得来这里登记一行并说明理由,顺手也就被 review 看见。
++  const ALLOWED_COLORS = new Set([
++    // 中性:全部靠继承与不透明度,不引入任何色相
++    'currentColor', 'inherit', 'transparent',
++    'rgba(128, 128, 128, 0.16)', // 徽标底(灰,未配置/进行中共用)
++    // 两个「亮暗同值」的语义色(Cindy --card-status-done / --error-flat)
++    '#2aae5b', 'rgba(42, 174, 91, 0.18)', // 已连接绿 + 其底色
++    '#ef4444', 'rgba(239, 68, 68, 0.18)', 'rgba(239, 68, 68, 0.45)', 'rgba(239, 68, 68, 0.1)', // 错误红 + 底/边
++    // 宿主 token + 中性回退值(回退值本身也在本白名单的色相自检覆盖内)
++    'var(--surface, #fff)',
++    'var(--border-default, #e4e4e0)',
++    'var(--accent-cta-bg-pure, #111111)',
++    'var(--accent-pure-cta-fg, #ffffff)',
++  ])
++  /** 卡片 CSS 里允许出现的属性名。新增属性必须来这里登记 —— 免得颜色藏在没人扫的属性里
++   *  (box-shadow / outline / fill / stroke / background-image 的渐变都能带颜色)。 */
++  const ALLOWED_PROPS = new Set([
++    'align-items', 'animation', 'background', 'border', 'border-color', 'border-radius',
++    'border-right-color', 'box-sizing', 'color', 'cursor', 'display', 'flex', 'font-family',
++    'font-size', 'font-weight', 'gap', 'height', 'justify-content', 'line-height', 'margin',
++    'text-decoration',
++    'margin-top', 'min-width', 'opacity', 'outline', 'padding', 'transform', 'white-space', 'width',
++  ])
++  /** 带颜色的属性:它们的值要逐个 token 过颜色白名单。 */
++  const COLOR_PROPS = new Set(['background', 'border', 'border-color', 'border-right-color', 'color', 'outline'])
++
++  /** 从 settings.html 抽出全部声明(全部 <style> 块 + 全部行内 style 属性)。 */
++  const declarations = (): Array<{ prop: string; value: string }> => {
++    const css = [...HTML.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/g)].map((m) => m[1]).join('\n')
++    const inline = [...HTML.matchAll(/\sstyle="([^"]*)"/g)].map((m) => m[1]).join(';')
++    // 只扫**大括号内部**(最内层块体)+ 行内属性 —— 否则 `.key-input:disabled` 这类伪类选择器
++    // 会被当成 `prop: value` 混进来。@keyframes / @media 的头不是块体,自动被排除,而它们
++    // 内部的声明照旧收得到(最内层块)。
++    const bodies = [...css.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/\{([^{}]*)\}/g)].map((m) => m[1])
++    const body = bodies.join(';') + ';' + inline
++    const out: Array<{ prop: string; value: string }> = []
++    for (const m of body.matchAll(/([a-zA-Z-]+)\s*:\s*([^;{}]+)/g)) {
++      const prop = m[1].trim().toLowerCase()
++      const value = m[2].trim()
++      if (!value) continue
++      out.push({ prop, value })
++    }
++    return out
++  }
++
++  it('抽取有效(非空、覆盖到已知的行内声明与第二类块)', () => {
++    const decls = declarations()
++    expect(decls.length).toBeGreaterThan(30) // 抽空了就别静默通过
++    expect(decls.some((d) => d.prop === 'margin' && d.value === '0')).toBe(true) // body 的行内 style
++    expect(decls.some((d) => d.prop === 'transform')).toBe(true) // @keyframes 内部的声明也进来了
++  })
++
++  it('每个属性名都在白名单里(新属性必须登记,免得颜色藏在没人扫的属性里)', () => {
++    const unknown = [...new Set(declarations().map((d) => d.prop))].filter((p) => !ALLOWED_PROPS.has(p))
++    expect(unknown).toEqual([])
++  })
++
++  it('卡片不得自己定义 CSS 自定义属性(只消费宿主 token,不改写)', () => {
++    // 第 3 轮审查的实测探针:在 `<body style="… --border-default: rgb(65 124 221)">` 上重定义
++    // 宿主 token,输入框与「断开」按钮就真渲染成 Focus Blue,而颜色白名单看的是 `var(...)`
++    // 整体、看不见被改掉的值。本卡片从来只**读** token(带中性回退值),一处也不定义,
++    // 所以这条直接禁掉定义 —— 比去追每个 var 的实际取值简单也更严。
++    const defined = declarations().filter((d) => d.prop.startsWith('--'))
++    expect(defined.map((d) => d.prop + ': ' + d.value)).toEqual([])
++  })
++
++  it('每个颜色 token 都在白名单里(任何未登记写法一律红,不论语法)', () => {
++    const offenders: string[] = []
++    for (const { prop, value } of declarations()) {
++      if (!COLOR_PROPS.has(prop)) continue
++      // 复合值(如 `1px solid currentColor`)按 token 切;`var(...)`/`rgba(...)` 整体保留。
++      for (const token of value.match(/(?:var|rgba?|hsla?|oklch|lab|lch|color-mix)\([^)]*\)|[^\s]+/g) ?? []) {
++        if (/^[\d.]+(px|em|rem|%)?$/.test(token)) continue // 宽度
++        if (['solid', 'dashed', 'dotted', 'none', '0'].includes(token)) continue // 线型
++        if (!ALLOWED_COLORS.has(token)) offenders.push(prop + ': ' + token)
++      }
++    }
++    expect(offenders).toEqual([])
++  })
++
++  it('白名单自身零蓝紫(色相 190°–290° 且饱和度 >0.12 即违规;含 var() 的回退值)', () => {
++    const hueOf = (r: number, g: number, b: number) => {
++      const [rr, gg, bb] = [r / 255, g / 255, b / 255]
++      const max = Math.max(rr, gg, bb)
++      const min = Math.min(rr, gg, bb)
++      if (max === min) return null
++      const d = max - min
++      let h = max === rr ? ((gg - bb) / d) % 6 : max === gg ? (bb - rr) / d + 2 : (rr - gg) / d + 4
++      h *= 60
++      return h < 0 ? h + 360 : h
++    }
++    const isBlueViolet = (h: number | null, sat: number) => h !== null && sat > 0.12 && h >= 190 && h <= 290
++    const check = (r: number, g: number, b: number, label: string) => {
++      const max = Math.max(r, g, b) / 255
++      const min = Math.min(r, g, b) / 255
++      const sat = max === 0 ? 0 : (max - min) / max
++      if (isBlueViolet(hueOf(r, g, b), sat)) return label
++      return null
++    }
++    const bad: string[] = []
++    for (const token of ALLOWED_COLORS) {
++      for (const m of token.matchAll(/#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b/g)) {
++        const hex = m[1].length === 3 ? m[1].replace(/./g, (c) => c + c) : m[1]
++        const [r, g, b] = [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16))
++        const hit = check(r, g, b, token)
++        if (hit) bad.push(hit)
++      }
++      for (const m of token.matchAll(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/g)) {
++        const hit = check(Number(m[1]), Number(m[2]), Number(m[3]), token)
++        if (hit) bad.push(hit)
++      }
++    }
++    expect(bad).toEqual([])
++    // 自检:探测器认得出 violet 与 Focus Blue(否则上面那条是恒真的)
++    for (const hex of ['#6957e8', '#417CDD']) {
++      const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16))
++      expect(check(r, g, b, hex)).toBe(hex)
++    }
++  })
++})
++
++describe('SC-C4 字号门:UI 字号全部落在 9..14px', () => {
++  it('settings.html 的每个 font-size 都在区间内(反向变异:改成 18px 必须红)', () => {
++    const sizes = [...HTML.matchAll(/font-size:\s*(\d+(?:\.\d+)?)px/g)].map((m) => Number(m[1]))
++    expect(sizes.length).toBeGreaterThan(3)
++    for (const size of sizes) expect(size).toBeGreaterThanOrEqual(9)
++    for (const size of sizes) expect(size).toBeLessThanOrEqual(14)
++  })
++})
++
++describe('SC-C6 外链 href 与 ghost.json 声明逐字相等', () => {
++  it('href 原样等于 network.secrets[0].url(宿主按逐字比对放行外链,不等就点了没反应)', () => {
++    const ghost = JSON.parse(readFileSync(fileURLToPath(new URL('../../ghost.json', import.meta.url)), 'utf8'))
++    const declared = ghost.network.secrets.find((s: { key: string }) => s.key === SECRET_KEY).url
++    const hrefs = [...HTML.matchAll(/href="([^"]+)"/g)].map((m) => m[1])
++    expect(hrefs).toEqual([declared])
++  })
++})
+diff --git a/cindyplugin/src/__tests__/mivoSettingsCardDom.test.ts b/cindyplugin/src/__tests__/mivoSettingsCardDom.test.ts
+new file mode 100644
+index 00000000..1f2dd7c6
+--- /dev/null
++++ b/cindyplugin/src/__tests__/mivoSettingsCardDom.test.ts
+@@ -0,0 +1,163 @@
++// @vitest-environment happy-dom
++/**
++ * 设置卡的 **computed-style 真断言** + render 层 DOM 行为(PR-C 第 1 轮审查 P1 返修)。
++ *
++ * 为什么单独一个文件:这些断言需要 DOM 环境(happy-dom),而 `mivoSettingsCard.test.ts` 里
++ * 的状态机断言是纯 node 的,合在一起会让整份用例白付 DOM 环境的启动代价。
++ *
++ * ⚠ 返修由来(记账,别再犯):上一版我在 `mivoSettingsCard.test.ts` 里写了「本仓单测环境的
++ * `getComputedStyle` 对外链 <style> 的类选择器返回空串,所以 R3 的尺寸不变量只能降级成源
++ * 文本断言」——**这句是错的**。本仓装的是 happy-dom(`devDependencies` 里没有 jsdom,我连
++ * 归因的仓都写错了),而 happy-dom 对类选择器正常级联。审查方还实测出那套源文本断言有可
++ * 复现的规避路径:在 <style> 末尾追加一条 `#primary { padding: 20px 40px }`(不落在
++ * `.btn-primary`/`.btn-pill` 块体内),R3「四按钮同尺寸同圆角」已破而全部用例照旧全绿。
++ * 所以这里改回按 R3 原本要求的 computed-style 断言 —— 它管的是「最终渲染出来是什么」,
++ * 不管你是用哪条选择器写坏的。源文本断言保留在另一文件里(骨架顺序、spinner 归属、a11y
++ * 属性那些结构性判据用源文本更直接),但**尺寸不变量以本文件为准**。
++ *
++ * 路径解析注意:happy-dom 下 `import.meta.url` 是 http URL,`fileURLToPath` 会抛
++ * `The URL must be of scheme file`,所以这里用 `process.cwd()` 拼仓库相对路径。
++ */
++import { beforeEach, describe, expect, it } from 'vitest'
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++import { renderSettingsCard } from '../settings/settingsView'
++import type { CardView } from '../settings/settingsCard'
++
++const PLUGIN_DIR = join(process.cwd(), 'cindyplugin')
++const HTML = readFileSync(join(PLUGIN_DIR, 'settings.html'), 'utf8')
++
++/** 把 settings.html 的 <style> 与 <body> 内容挂进当前 document(可选追加一段覆盖样式做变异)。 */
++const mount = (extraCss = '') => {
++  // ⚠ `matchAll` 抽**全部** <style> 块,不是第一个(第 2 轮审查 P1):上一版用单次 exec,
++  // 于是破坏性规则写进第二个 <style> 块时 R3 已破而 32 条用例照旧全绿 —— 抽取范围本身
++  // 成了规避面。同理 `<style[^>]*>` 而非 `<style>`:带属性(如 media="all")的块也要收。
++  const styles = [...HTML.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/g)].map((m) => m[1]).join('\n')
++  const body = /<body[^>]*>([\s\S]*?)<\/body>/.exec(HTML)?.[1] ?? ''
++  expect(styles.length).toBeGreaterThan(100) // 抽取失败就别静默跑成空断言
++  expect(body).toContain('id="badge"')
++  document.head.innerHTML = `<style>${styles}${extraCss}</style>`
++  // 剥掉 <script src>:happy-dom 会为它抛常态 NotSupportedError 噪声,而本文件只量样式与
++  // DOM 行为,不需要真加载模块(生产入口由 vite 重写,形态已在构建产物侧核过)。
++  document.body.innerHTML = body.replace(/<script[\s\S]*?<\/script>/g, '')
++  // ⚠ 把 <body> **标签自身的属性**也搬过来(第 3 轮审查):只取 innerHTML 会丢掉
++  // `<body style="margin:0;padding:12px 0">` 这类行内声明,于是写在 body 属性上的声明与
++  // CSS 自定义属性对 computed 断言完全不可见 —— 又是一条"取材范围即规避面"。
++  const bodyTag = /<body([^>]*)>/.exec(HTML)?.[1] ?? ''
++  for (const attr of bodyTag.matchAll(/([a-zA-Z-]+)\s*=\s*"([^"]*)"/g)) {
++    document.body.setAttribute(attr[1], attr[2])
++  }
++}
++
++const buttons = () => Array.from(document.querySelectorAll('button')) as HTMLElement[]
++const boxOf = (el: HTMLElement) => {
++  const s = getComputedStyle(el)
++  return { padding: s.padding, borderRadius: s.borderRadius, borderWidth: s.borderWidth }
++}
++
++beforeEach(() => {
++  document.head.innerHTML = ''
++  document.body.innerHTML = ''
++})
++
++describe('SC-C2/C13 R3 尺寸不变量:computed-style 断言(四按钮一个尺寸一个圆角)', () => {
++  it('自检:computed-style 在本环境确实可用(不是空串对空串的恒真断言)', () => {
++    mount()
++    const box = boxOf(buttons()[0])
++    // 这条是上面那段返修记账的机器证据:如果哪天换了测试环境导致 computed 又变空串,
++    // 本条先红,提示"下面那些相等断言此刻已退化成恒真",而不是让它们静默失效。
++    expect(box.padding).not.toBe('')
++    expect(box.borderRadius).not.toBe('')
++    expect(getComputedStyle(document.getElementById('badge') as HTMLElement).backgroundColor).not.toBe('')
++  })
++
++  it('保存/校验/重试/断开:computed padding、border-radius、border 宽度三项全相等', () => {
++    mount()
++    const boxes = buttons().map(boxOf)
++    expect(boxes.length).toBe(2) // #primary(保存/校验/重试 共用)+ #disconnect
++    // R3 反馈③ 的原话是"四按钮一个尺寸一个圆角大小"。文案换(保存→校验→重试)不换元素,
++    // 所以元素只有两个,断言的是这两个的盒模型完全一致。
++    expect(boxes[1]).toEqual(boxes[0])
++    expect(boxes[0].borderRadius).toContain('9999px') // pill
++  })
++
++  it('变异防线:任何选择器把某个按钮的尺寸改掉都会红(不只是改 .btn-* 块体)', () => {
++    // 审查方实测的规避路径:用 id 选择器绕过"变体类里不许写 padding"那条源文本断言。
++    mount('#primary { padding: 20px 40px; border-radius: 2px }')
++    const boxes = buttons().map(boxOf)
++    expect(boxes[1]).not.toEqual(boxes[0]) // 证明本文件的断言抓得住这条路径
++  })
++
++  it('转圈徽标在 badge 内、且 badge 有语义色背景;字号全部落在 9..14px', () => {
++    mount()
++    const badge = document.getElementById('badge') as HTMLElement
++    expect(badge.contains(document.getElementById('badge-spinner'))).toBe(true)
++    // 只查**卡片子树**:`html`/`body` 的字号在生产里由宿主注入基线决定(测试环境里是
++    // happy-dom 的 16px 默认值),不是本卡片的样式,拿它断言等于在测 happy-dom。
++    const card = document.querySelector('.mivo-card') as HTMLElement
++    for (const el of [card, ...(Array.from(card.querySelectorAll('*')) as HTMLElement[])]) {
++      const size = getComputedStyle(el).fontSize
++      if (!size || !size.endsWith('px')) continue
++      const px = Number.parseFloat(size)
++      if (!Number.isFinite(px) || px === 0) continue
++      expect(px).toBeGreaterThanOrEqual(9)
++      expect(px).toBeLessThanOrEqual(14)
++    }
++  })
++})
++
++// ── render 层:接线层的凭证卫生(此前零覆盖,审查记为 gap)────────────────────────
++// 跑的是**生产那一份** `renderSettingsCard`(第 2 轮审查:上一版在测试里复刻了这段逻辑,
++// 再用一条「逐字对照生产文件字符串」的断言防漂移 —— 审查方指出那条锁法过紧,生产侧做等价
++// 重写就会误红,而复刻体本身仍可能与生产体分叉。把 render 提成 settingsView.ts 之后,
++// 复刻与逐字断言一起删掉,测的就是真东西)。
++describe('SC-C5 render 层:非可输入态一律清空输入框(明文不在页面上留)', () => {
++  const viewOf = (patch: Partial<CardView>): CardView => ({
++    state: 'unconfigured',
++    badgeText: '未配置',
++    badgeIcon: '',
++    badgeSpinner: false,
++    showInput: true,
++    inputDisabled: false,
++    inputError: false,
++    primaryLabel: '保存',
++    primaryDisabled: false,
++    showPrimary: true,
++    showDisconnect: false,
++    disconnectLabel: '断开',
++    statusText: '',
++    errorText: '',
++    focusInput: false,
++    ...patch,
++  })
++
++  it('showInput=false 或 inputDisabled=true → value 被清空;可输入态保留用户正在打的字', () => {
++    mount()
++    const input = document.getElementById('key') as HTMLInputElement
++
++    input.value = 'mivo_secret_plain'
++    renderSettingsCard(viewOf({ state: 'connected', showInput: false, showDisconnect: true }), document)
++    expect(input.value).toBe('')
++
++    input.value = 'mivo_secret_plain'
++    renderSettingsCard(viewOf({ state: 'validating', inputDisabled: true }), document)
++    expect(input.value).toBe('')
++
++    input.value = 'mivo_half_typed'
++    renderSettingsCard(viewOf({ state: 'unconfigured' }), document)
++    expect(input.value).toBe('mivo_half_typed') // 别把用户打了一半的字擦掉
++  })
++
++  it('徽标类名随态切换、错误行只在有文案时出现(渲染契约的其余部分也跑生产实现)', () => {
++    mount()
++    renderSettingsCard(viewOf({ state: 'connected', badgeText: '已连接', badgeIcon: '✓', showInput: false, showDisconnect: true, statusText: '已连接(尾号 …a1b2)' }), document)
++    expect((document.getElementById('badge') as HTMLElement).className).toBe('state-badge is-connected')
++    expect((document.getElementById('error-row') as HTMLElement).hidden).toBe(true)
++    expect((document.getElementById('conn-status') as HTMLElement).textContent).toContain('尾号')
++
++    renderSettingsCard(viewOf({ state: 'failed', badgeText: '连接失败', badgeIcon: '✕', inputError: true, primaryLabel: '重试', errorText: 'Key 无效或已过期' }), document)
++    expect((document.getElementById('badge') as HTMLElement).className).toBe('state-badge is-failed')
++    expect((document.getElementById('error-row') as HTMLElement).hidden).toBe(false)
++    expect((document.getElementById('key') as HTMLElement).classList.contains('is-error')).toBe(true)
++  })
++})
+diff --git a/cindyplugin/src/settings/settingsCard.ts b/cindyplugin/src/settings/settingsCard.ts
+new file mode 100644
+index 00000000..a235ac08
+--- /dev/null
++++ b/cindyplugin/src/settings/settingsCard.ts
+@@ -0,0 +1,272 @@
++/**
++ * Mivo API Key 设置卡控制器(PR-C,D4 五态状态机)。
++ *
++ * 为什么把逻辑抽成这个纯模块:设置页是宿主沙箱页(手册 §4.8),真实环境里只有 DOM 与
++ * `fetch`。把「状态迁移」与「怎么画」切开之后,迁移表可以被逐格断言(SC-C1),而 settings.js
++ * 只剩一层照 view model 刷 DOM 的搬运——没有判断逻辑,也就没有需要靠截图才能验的分支。
++ *
++ * 五态(D4):loading / unconfigured / validating / connected / failed。
++ * `loading` 与 `validating` 共用同款转圈徽标(文字分别「读取中」/「校验中」),所以视觉上
++ * 仍是 owner 确认的 R3 四种外观。
++ *
++ * 红线(手册 §4.7/§4.8,与改动前一致):key 只经 `PUT /secrets/<key>` 一次性交给宿主保险库,
++ * 绝不落 /kv、BroadcastChannel、日志或任何自存路径;`/secrets` 只查回 {key,saved,tail?},
++ * 永远拿不回明文。校验也不碰明文——它只是让电子脑按门铃(见 mivoKeyValidateSender)。
++ *
++ * 「已连接」的语义(R3 根因):**校验通过**才算连上。只凭 `/secrets.saved===true` 显示
++ * 「直连生效」是虚假确认(key 入库 ≠ 通道走通),这是本轮要修掉的东西。所以开页时
++ * saved=true 也要真打一次校验,状态先落 validating。
++ */
++import type { MivoKeyValidateOutcome, MivoKeyValidateSender } from './mivoKeyValidateSender'
++
++export type CardState = 'loading' | 'unconfigured' | 'validating' | 'connected' | 'failed'
++
++export type CardView = {
++  state: CardState
++  /** 右上角徽标文字(R3:未配置 / 读取中 / 校验中 / 已连接 / 连接失败)。 */
++  badgeText: string
++  /** 徽标前缀符号;spinner 态与未配置态都没有符号(R3 反馈⑤去掉了「○」)。 */
++  badgeIcon: '' | '✓' | '✕'
++  /** 转圈动画只出现在徽标里,按钮上永不出现(R3 反馈①)。 */
++  badgeSpinner: boolean
++  showInput: boolean
++  inputDisabled: boolean
++  inputError: boolean
++  /** 保存 / 校验 / 重试 —— 同一个按钮,只换文案与禁用态(R3:四按钮同尺寸同圆角)。 */
++  primaryLabel: string
++  primaryDisabled: boolean
++  showPrimary: boolean
++  showDisconnect: boolean
++  /** 二次确认:第一次点「断开」只换文案,不发 DELETE(SC-C5 的 confirm=false 分支)。 */
++  disconnectLabel: string
++  /** 已连接态的单行状态文字(含尾号);其余态为空。 */
++  statusText: string
++  /** 失败态的错误提示;固定渲染在链接行之后(R3 骨架顺序)。 */
++  errorText: string
++  /** 断开成功后要把焦点交回输入框(SC-C7:换 key = 先断开再输入)。 */
++  focusInput: boolean
++}
++
++export type SecretRow = { key: string; saved?: boolean; tail?: string }
++
++export type SettingsCardDeps = {
++  /** GET /secrets → 数组;抛错/形状不符都当「读不出来」。 */
++  readSecrets: () => Promise<unknown>
++  /** PUT /secrets/<key> → HTTP 状态码。 */
++  putSecret: (value: string) => Promise<number>
++  /** DELETE /secrets/<key> → HTTP 状态码。 */
++  deleteSecret: () => Promise<number>
++  sender: Pick<MivoKeyValidateSender, 'validate' | 'cancel'>
++  render: (view: CardView) => void
++}
++
++export const SECRET_KEY = 'mivo_api_key'
++
++/** verdict/超时 → 失败文案(闭集;自由文本进不来)。 */
++const FAILURE_TEXT: Record<Exclude<MivoKeyValidateOutcome, 'valid' | 'cancelled'>, string> = {
++  'auth-invalid': 'Key 无效或已过期,请到 Mivo 平台重新获取后再保存',
++  'auth-forbidden': '这个 Key 没有访问权限,请在 Mivo 平台确认账号权限',
++  unavailable: '暂时连不上 Mivo 平台(网络或服务波动),可稍后重试',
++  timeout: '校验超时,可稍后重试;期间出图会回落 Cindy 代办',
++}
++
++const EMPTY: CardView = {
++  state: 'loading',
++  badgeText: '读取中',
++  badgeIcon: '',
++  badgeSpinner: true,
++  showInput: false,
++  inputDisabled: true,
++  inputError: false,
++  primaryLabel: '保存',
++  primaryDisabled: true,
++  showPrimary: false,
++  showDisconnect: false,
++  disconnectLabel: '断开',
++  statusText: '',
++  errorText: '',
++  focusInput: false,
++}
++
++const findRow = (list: unknown): SecretRow | null => {
++  if (!Array.isArray(list)) return null
++  for (const item of list) {
++    if (item && typeof item === 'object' && (item as SecretRow).key === SECRET_KEY) return item as SecretRow
++  }
++  return null
++}
++
++export const createSettingsCard = (deps: SettingsCardDeps) => {
++  let view: CardView = { ...EMPTY }
++  /** 断开的二次确认闸门:false 时点「断开」只推进它,不发 DELETE。 */
++  let disconnectArmed = false
++
++  const show = (patch: Partial<CardView>) => {
++    view = { ...EMPTY, ...patch }
++    deps.render(view)
++  }
++
++  const toUnconfigured = (options: { errorText?: string; focusInput?: boolean } = {}) => {
++    disconnectArmed = false
++    show({
++      state: 'unconfigured',
++      badgeText: '未配置',
++      badgeSpinner: false,
++      showInput: true,
++      inputDisabled: false,
++      showPrimary: true,
++      primaryLabel: '保存',
++      primaryDisabled: false,
++      errorText: options.errorText ?? '',
++      focusInput: options.focusInput ?? false,
++    })
++  }
++
++  const toFailed = (errorText: string) => {
++    disconnectArmed = false
++    show({
++      state: 'failed',
++      badgeText: '连接失败',
++      badgeIcon: '✕',
++      badgeSpinner: false,
++      showInput: true,
++      inputDisabled: false,
++      inputError: true,
++      showPrimary: true,
++      primaryLabel: '重试',
++      primaryDisabled: false,
++      errorText,
++    })
++  }
++
++  const toConnected = (tail?: string) => {
++    disconnectArmed = false
++    show({
++      state: 'connected',
++      badgeText: '已连接',
++      badgeIcon: '✓',
++      badgeSpinner: false,
++      showDisconnect: true,
++      statusText: tail ? '已连接(尾号 …' + tail + '),出图走 Mivo 直连' : '已连接,出图走 Mivo 直连',
++    })
++  }
++
++  const toValidating = () => {
++    disconnectArmed = false
++    show({
++      state: 'validating',
++      badgeText: '校验中',
++      badgeSpinner: true,
++      showInput: true,
++      inputDisabled: true,
++      showPrimary: true,
++      // R3 反馈③:校验态按钮文案是「校验」(owner 逐字指定),不是「校验中…」。
++      primaryLabel: '校验',
++      primaryDisabled: true,
++    })
++  }
++
++  /** 读一次 /secrets,只为拿尾号;读不到就退化成不带尾号的文案,不影响已连接结论。 */
++  const tailOf = async (): Promise<string | undefined> => {
++    try {
++      return findRow(await deps.readSecrets())?.tail
++    } catch {
++      return undefined
++    }
++  }
++
++  const runValidate = async () => {
++    toValidating()
++    const outcome = await deps.sender.validate()
++    if (outcome === 'cancelled') return // 新一轮已接管,旧轮不许改 UI
++    if (outcome === 'valid') {
++      toConnected(await tailOf())
++      return
++    }
++    toFailed(FAILURE_TEXT[outcome])
++  }
++
++  return {
++    get view() {
++      return view
++    },
++
++    /** 开页:读 /secrets → 有 key 就真校验一次,没有就未配置。 */
++    async start() {
++      show({ ...EMPTY })
++      let row: SecretRow | null
++      try {
++        row = findRow(await deps.readSecrets())
++      } catch {
++        // 读不出配置状态时不敢猜「未配置」(会误导用户重新贴 key),也不敢猜「已连接」。
++        toFailed('读取配置状态失败,可关掉设置页重开一次')
++        return
++      }
++      if (!row || !row.saved) {
++        toUnconfigured()
++        return
++      }
++      await runValidate()
++    },
++
++    /** 保存:仅 HTTP 204 才推进到校验;非 204 一律留在原地并报错(SC-C5)。 */
++    async save(rawValue: string) {
++      const value = rawValue.trim()
++      if (!value) {
++        // 空值不发请求。停在当前可输入态(unconfigured / failed 都可能),只换提示。
++        if (view.state === 'failed') toFailed('请先粘贴 Key')
++        else toUnconfigured({ errorText: '请先粘贴 Key' })
++        return
++      }
++      deps.sender.cancel() // 代际推进:旧校验轮的迟到回执不许落到这一轮的 UI 上
++      let status: number
++      try {
++        status = await deps.putSecret(value)
++      } catch {
++        toFailed('保存失败,请重试')
++        return
++      }
++      if (status !== 204) {
++        toFailed('保存失败(HTTP ' + status + '),Key 未入库')
++        return
++      }
++      await runValidate()
++    },
++
++    /**
++     * 断开:两段式。第一次点只把按钮换成「确认断开」(零 DELETE);第二次才真删。
++     * 只有 204 才退回未配置,其余保持已连接不动(SC-C5)。
++     */
++    async disconnect() {
++      if (view.state !== 'connected') return
++      if (!disconnectArmed) {
++        disconnectArmed = true
++        view = { ...view, disconnectLabel: '确认断开' }
++        deps.render(view)
++        return
++      }
++      deps.sender.cancel()
++      const connectedBefore = view
++      /** 删除失败要「保持原状态」(SC-C5),所以原样留住这份已连接视图,只叠一条错误。 */
++      const keepConnected = (errorText: string) => {
++        disconnectArmed = false
++        view = { ...connectedBefore, disconnectLabel: '断开', errorText }
++        deps.render(view)
++      }
++      let status: number
++      try {
++        status = await deps.deleteSecret()
++      } catch {
++        keepConnected('清除失败,请重试')
++        return
++      }
++      if (status !== 204) {
++        keepConnected('清除失败(HTTP ' + status + '),Key 仍在库中')
++        return
++      }
++      toUnconfigured({ focusInput: true }) // SC-C7:断开成功后焦点回输入框
++    },
++  }
++}
++
++export type SettingsCard = ReturnType<typeof createSettingsCard>
+diff --git a/cindyplugin/src/settings/settingsView.ts b/cindyplugin/src/settings/settingsView.ts
+new file mode 100644
+index 00000000..6e931ef6
+--- /dev/null
++++ b/cindyplugin/src/settings/settingsView.ts
+@@ -0,0 +1,55 @@
++/**
++ * 设置卡的渲染层:把 `settingsCard` 的 view model 刷到真实 DOM。**零判断** ——
++ * 「什么态显示什么」全在 settingsCard.ts,这里只搬运。
++ *
++ * 为什么单独成模块(第 2 轮审查):此前这段住在 `settings.js` 里,而 settings.js 是 ESM 且
++ * 模块顶层就 `card.start()`(一 import 就发 fetch),测试没法直接引它 —— 于是上一版在测试里
++ * **复刻**了这段的凭证卫生分支,再加一条「逐字对照生产文件字符串」的断言防漂移。审查方指出
++ * 那条锁法过紧:生产侧做等价重写(如换成三元表达式)会误红,而复刻体本身仍可能与生产体分叉。
++ * 提成模块后测试直接跑**生产这一份**,两个问题一起消失。
++ */
++import type { CardView } from './settingsCard'
++
++const BADGE_CLASS: Record<CardView['state'], string> = {
++  loading: 'is-pending',
++  validating: 'is-pending',
++  unconfigured: 'is-unconfigured',
++  connected: 'is-connected',
++  failed: 'is-failed',
++}
++
++/** 渲染一次。`doc` 可注入,便于测试挂在自己准备好的 document 上。 */
++export const renderSettingsCard = (view: CardView, doc: Document = document): void => {
++  const $ = (id: string) => doc.getElementById(id) as HTMLElement
++
++  $('badge').className = 'state-badge ' + BADGE_CLASS[view.state]
++  $('badge-text').textContent = view.badgeText
++  $('badge-icon').textContent = view.badgeIcon
++  $('badge-spinner').hidden = !view.badgeSpinner
++
++  $('key-row').hidden = !view.showInput
++  $('conn-row').hidden = !view.showDisconnect
++  $('conn-status').textContent = view.statusText
++
++  const input = $('key') as HTMLInputElement
++  input.disabled = view.inputDisabled
++  input.classList.toggle('is-error', view.inputError)
++  // 非可输入态一律清空输入框(SC-C5)。**准确说是哪几态**(第 3 轮审查指出此前注释与实现
++  // 不符):connected(showInput=false)与 validating(inputDisabled=true)会清;**failed 态不清**
++  // —— 它的输入框是可编辑的,用户刚贴进去的明文仍在这个 `<input type=password>` 的 value 里。
++  // 那不构成外泄(未持久化、未广播、未进日志、未回显,与任何普通密码框同级),但别把它写成
++  // 「三态都不带 key」。
++  if (!view.showInput || view.inputDisabled) input.value = ''
++
++  const primary = $('primary') as HTMLButtonElement
++  primary.hidden = !view.showPrimary
++  primary.textContent = view.primaryLabel
++  primary.disabled = view.primaryDisabled
++
++  $('disconnect').textContent = view.disconnectLabel
++
++  $('error-row').hidden = !view.errorText
++  $('error-text').textContent = view.errorText
++
++  if (view.focusInput) input.focus()
++}
+diff --git a/cindyplugin/vite.config.ts b/cindyplugin/vite.config.ts
+index 1f403534..bf085288 100644
+--- a/cindyplugin/vite.config.ts
++++ b/cindyplugin/vite.config.ts
+@@ -18,7 +18,14 @@ export default defineConfig({
+     outDir: 'dist',
+     emptyOutDir: true,
+     rollupOptions: {
+-      input: fileURLToPath(new URL('./panel.html', import.meta.url)),
++      // 两个入口:面板 + 设置页。设置页从"纯 JS 手抄 + build.sh 直接 cp"改成走构建,
++      // 是为了让它能 import PR-B 已合并的校验 sender —— 否则校验逻辑要在设置页里再抄
++      // 一份(两份实现必然漂移)。设置页与面板是同款沙箱页(手册 §4.8),面板本就以
++      // vite 的 module script 形态在生产跑,所以设置页用同一形态没有新增未验证面。
++      input: {
++        panel: fileURLToPath(new URL('./panel.html', import.meta.url)),
++        settings: fileURLToPath(new URL('./settings.html', import.meta.url)),
++      },
+     },
+   },
+ })

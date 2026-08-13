@@ -1,0 +1,207 @@
+diff --git a/scripts/e2e/harness.mjs b/scripts/e2e/harness.mjs
+index 9227aebe..9887d806 100644
+--- a/scripts/e2e/harness.mjs
++++ b/scripts/e2e/harness.mjs
+@@ -200,10 +200,26 @@ export const readPersistedKv = async (page, key, opts = {}) => {
+  *  (NOT namespaced) on purpose: legacy injection simulates a pre-FX-6 session whose
+  *  state lived under the un-suffixed key, and the app's `migrateToNamespaced` claims
+  *  it on first authenticated read. Resolving through `namespacedKey` here would race
+- *  with the chat store's own async write to the namespaced key and clobber v1. */
++ *  with the chat store's own async write to the namespaced key and clobber v1.
++ *
++ *  Fail-visible (SC9): every IDB failure path — open error, kv store absent, tx
++ *  onerror, tx onabort, tx throw — rejects with cause instead of silently resolving.
++ *  tx.onabort is a DISTINCT completion path from onerror (abort often follows error);
++ *  a one-time settle guard ensures the first of {oncomplete, onerror, onabort} wins and
++ *  the promise never double-settles or hangs to a context-less Playwright timeout
++ *  (mirrors src/lib/persistIdbStorage.ts:100-103). Previously all paths `resolve()`d and
++ *  onabort was unhandled → a failed/aborted v1 injection masqueraded as success (or hung
++ *  to a context-less timeout), and the downstream hydrate assertion looked like a "clamp
++ *  bug" — see migration.mjs root cause. A failed write now propagates so the scenario
++ *  fails loudly at the inject step, not two steps later as a misleading migrate assertion. */
+ export const writePersistedKv = async (page, key, value) => {
+   await page.evaluate(async ({ k, v }) => {
+-    return new Promise((resolve) => {
++    return new Promise((resolve, reject) => {
++      let settled = false
++      // One-time settle guard: tx abort often follows onerror; without this the second
++      // handler would double-settle (or mask the first reject). Mirrors the product helper
++      // src/lib/persistIdbStorage.ts:100-103 which handles tx.onerror AND tx.onabort.
++      const settle = (fn) => { if (settled) return; settled = true; fn() }
+       const req = indexedDB.open('mivo-canvas-persist', 1)
+       req.onupgradeneeded = () => {
+         if (!req.result.objectStoreNames.contains('kv')) {
+@@ -212,18 +228,18 @@ export const writePersistedKv = async (page, key, value) => {
+       }
+       req.onsuccess = () => {
+         const db = req.result
+-        if (!db.objectStoreNames.contains('kv')) { db.close(); resolve(); return }
++        if (!db.objectStoreNames.contains('kv')) { settle(() => { db.close(); reject(new Error(`writePersistedKv: IDB 'kv' store absent after open (key=${k})`)) }); return }
+         try {
+           const tx = db.transaction('kv', 'readwrite')
+           tx.objectStore('kv').put({ key: k, value: v })
+-          tx.oncomplete = () => { db.close(); resolve() }
+-          tx.onerror = () => { db.close(); resolve() }
+-        } catch {
+-          db.close()
+-          resolve()
++          tx.oncomplete = () => settle(() => { db.close(); resolve() })
++          tx.onerror = () => { const e = tx.error; settle(() => { db.close(); reject(new Error(`writePersistedKv: IDB readwrite tx failed (key=${k}): ${e && e.message ? e.message : String(e)}`)) }) }
++          tx.onabort = () => { const e = tx.error; settle(() => { db.close(); reject(new Error(`writePersistedKv: IDB readwrite tx aborted (key=${k}): ${e && e.message ? e.message : 'aborted'}`)) }) }
++        } catch (err) {
++          settle(() => { db.close(); reject(new Error(`writePersistedKv: IDB tx throw (key=${k}): ${err && err.message ? err.message : String(err)}`)) })
+         }
+       }
+-      req.onerror = () => resolve()
++      req.onerror = () => { const e = req.error; settle(() => reject(new Error(`writePersistedKv: IDB open failed (key=${k}): ${e && e.message ? e.message : String(e)}`))) }
+     })
+   }, { k: key, v: value })
+ }
+diff --git a/scripts/e2e/scenarios/migration.mjs b/scripts/e2e/scenarios/migration.mjs
+index e1c9c647..ac60b788 100644
+--- a/scripts/e2e/scenarios/migration.mjs
++++ b/scripts/e2e/scenarios/migration.mjs
+@@ -94,7 +94,7 @@ export const runMigrationScenario = async (context) => {
+             ],
+           },
+           selectedModel: 'gemini-3-pro-image',
+-          paramOverrides: { imgRatio: '21:9', quality: 'auto' },
++          paramOverrides: { imgRatio: '21:9', quality: 'high' },
+         },
+         version: 1,
+       }
+@@ -102,6 +102,40 @@ export const runMigrationScenario = async (context) => {
+       // renderer 参数,就绪信号复用 renderer-evidence 的按渲染器分流封装。
+       await migrationPage.goto(canvasUrl, { waitUntil: 'networkidle' })
+       await writePersistedKv(migrationPage, 'mivo-chat-demo', JSON.stringify(v1State))
++      // ── FX-6 namespacing 时序修复（根因:非产品 bug,是本场景注入时序缺陷）──
++      // dev 拓扑 auth stub 返回 dev@local(已认证)→ app 的 idbStateStorage.getItem 经
++      // FX-6 namespacing:migrateToNamespaced(src/lib/persistIdbStorage.ts:157-194) 把 legacy
++      // raw key 认领到 namespaced key `mivo-chat-demo:<uid>`。该认领是 one-shot latch:
++      // marker(`mivo-ns-migrated:<name>:<uid>`)置位后,后续 getItem 不再查 legacy raw key;
++      // **且"什么都没找到"也会置位 marker**(persistIdbStorage.ts:188 注释原话:
++      // "Whether we copied or found nothing... mark")。
++      //
++      // 本场景注入序列恰好踩中这条 latch:
++      //   1) goto(空 IDB)→ app 首次 rehydrate → migrateToNamespaced 跑在空 IDB、未找到 legacy
++      //      raw key → **置位 marker**(没找到也置位);
++      //   2) writePersistedKv 写 legacy raw key `mivo-chat-demo`(v1 blob,见上);
++      //   3) reload → app rehydrate → migrateToNamespaced 见 marker 已置位 → **短路、不再查
++      //      raw key** → 读 namespaced key(不存在)→ null → chatStore hydrate 成默认空状态
++      //      → legacyUser undefined → clamp 断言"got undefined"(伪装成 clamp 坏,实为没 hydrate)。
++      //
++      // 修复:writePersistedKv 之后、reload 之前清掉所有 `mivo-ns-migrated:` 前缀的 marker,
++      // 让 reload 的 getItem 重跑 migrateToNamespaced、认领刚写入的 legacy raw v1 blob
++      // (copy raw→namespaced + delete raw,见下方 SC5' 认领断言)。前缀匹配顺带覆盖 canvas
++      // store 的 marker,无副作用(此时无 canvas legacy 注入,清 marker 仅让下次 getItem 重新
++      // 走认领逻辑;空 IDB 仍置位 marker,行为等价)。
++      //
++      // prod 拓扑不受影响:prod mock /api/auth/me→{authenticated:false}→ getPersistUserId()
++      // 返回 anonymous → migrateToNamespaced 对 anonymous 早返回(persistIdbStorage.ts:159),
++      // app 直接读 raw key `mivo-chat-demo`(不经 namespacing)→ 拿到 v1 blob → migrate v1→v2
++      // → 断言过。本清 marker 操作在 prod 也跑(无 `mivo-ns-migrated:` marker 可清,空操作)。
++      await migrationPage.evaluate(() => {
++        const keys = []
++        for (let i = 0; i < sessionStorage.length; i += 1) {
++          const k = sessionStorage.key(i)
++          if (k && k.startsWith('mivo-ns-migrated:')) keys.push(k)
++        }
++        for (const k of keys) sessionStorage.removeItem(k)
++      })
+       await migrationPage.reload({ waitUntil: 'networkidle' })
+       await waitForCanvasReady(migrationPage, rendererMode, { timeout: 15000 })
+       const migrated = await migrationPage.evaluate(async () => {
+@@ -112,8 +146,11 @@ export const runMigrationScenario = async (context) => {
+         const legacyUser = (state.messagesByScene['character-flow'] || []).find((m) => m.id === 'msg-user-legacy')
+         const legacyAsst = (state.messagesByScene['character-flow'] || []).find((m) => m.id === 'msg-asst-legacy')
+         return {
++          legacyUserPresent: !!legacyUser,
++          legacyAsstPresent: !!legacyAsst,
+           selectedModel: state.selectedModel,
+           paramOverridesImgRatio: state.paramOverrides.imgRatio,
++          paramOverridesQuality: state.paramOverrides.quality,
+           userRequestedImgRatio: legacyUser?.generationContext?.requestedImgRatio,
+           userImgRatio: legacyUser?.generationContext?.imgRatio,
+           asstRequestedImgRatio: legacyAsst?.generationContext?.requestedImgRatio,
+@@ -121,6 +158,20 @@ export const runMigrationScenario = async (context) => {
+         }
+       })
+       if (!migrated) throw new Error('Migration test could not load chatStore')
++      // 前置断言(SC3):v1 注入被读到并 hydrate。失败信息直指注入/hydrate,不再伪装成 clamp 坏。
++      // 这条本应在最初就存在 —— 它的缺失让本轮误诊成"迁移 clamp 坏了"多花一轮才纠正。
++      if (!migrated.legacyUserPresent) {
++        throw new Error('Migration: v1 注入/hydrate 失败 —— msg-user-legacy 未在 hydrate 后的 chatStore.messagesByScene 出现。可能:IDB 注入失败 / FX-6 ns-marker 未清致 getItem 读空 namespaced key / hydration gate 未跑。')
++      }
++      if (!migrated.legacyAsstPresent) {
++        throw new Error('Migration: v1 注入/hydrate 失败 —— msg-asst-legacy 未在 hydrate 后的 chatStore.messagesByScene 出现(同上原因)。')
++      }
++      // 非默认值见证(SC4):paramOverrides.quality 注入 'high'(chatStore 默认 'auto'),
++      // migrate 不改 quality(chatStoreMigrate.ts:93 原样回填),存活即证明读到的是 hydrate 后
++      // 的真实实例,而非未 hydrate 的默认空实例(默认 'auto' 会在此失败,不再伪装通过)。
++      if (migrated.paramOverridesQuality !== 'high') {
++        throw new Error(`Migration: paramOverrides.quality 应存活 'high'(非默认值见证,默认 'auto'),got ${migrated.paramOverridesQuality} —— 'auto' 即读到未 hydrate 的默认实例。`)
++      }
+       if (migrated.selectedModel !== 'gemini-3-pro-image') {
+         throw new Error(`Persist v1→v2 should keep selectedModel=gemini, got ${migrated.selectedModel}`)
+       }
+@@ -139,6 +190,60 @@ export const runMigrationScenario = async (context) => {
+       if (migrated.asstImgRatio !== undefined) {
+         throw new Error(`Persist v1→v2 should clamp legacy asst imgRatio off 21:9 (to undefined), got ${JSON.stringify(migrated.asstImgRatio)}`)
+       }
++      // FX-6 认领断言(SC5'):reload 后 migrateToNamespaced 应已把 legacy raw key 认领到
++      // namespaced key(copy raw→namespaced + delete raw)。让本场景真正覆盖 FX-6 legacy 认领
++      // 路径,而非只是"数据非空"恰好跑绿。
++      // - prod/anonymous:不经 namespacing(migrateToNamespaced 对 anonymous 早返回),
++      //   namespacedKey === raw key,认领不适用,正当跳过(SC-N2 例外:anonymous 才静默)。
++      // - bridge 不可用(dev 本该有):本场景用 addInitScript 保证 __MIVO_E2E_ENABLED__=true,
++      //   main.tsx 必挂 __MIVO_E2E__.getPersistUserId。取不到 = bridge 挂载链断了,真出问题,
++      //   不许静默跳过(否则覆盖静默流失,和 mivo-ns-migrated latch 同一类"沉默的坑"),抛错。
++      // - IDB get 出错:不吞成 {present:false}(会把"读不到"误导成"没认领",正是这轮误诊的套路),
++      //   直接 reject 带原因,让失败在 claim 步骤当场可见(同 writePersistedKv 的 fail-visible 标准)。
++      const claim = await migrationPage.evaluate(async () => {
++        const bridge = globalThis.__MIVO_E2E__
++        const hasGetter = !!(bridge && typeof bridge.getPersistUserId === 'function')
++        const uid = hasGetter ? bridge.getPersistUserId() : null
++        const namespacedKey = uid && uid !== 'anonymous' ? `mivo-chat-demo:${uid}` : 'mivo-chat-demo'
++        const get = (k) => new Promise((resolve, reject) => {
++          let settled = false
++          // One-time settle guard + tx-level events (oncomplete/onerror/onabort), mirroring
++          // src/lib/persistIdbStorage.ts:100-103. tx.onabort is distinct from onerror (abort
++          // often follows error); without it the promise could hang to a context-less
++          // Playwright timeout. settle ensures only the first of them fires.
++          const settle = (fn) => { if (settled) return; settled = true; fn() }
++          const req = indexedDB.open('mivo-canvas-persist', 1)
++          req.onsuccess = () => {
++            const db = req.result
++            if (!db.objectStoreNames.contains('kv')) { settle(() => { db.close(); reject(new Error(`Migration FX-6 claim: IDB 'kv' store absent (get key=${k})`)) }); return }
++            try {
++              const tx = db.transaction('kv', 'readonly')
++              const r = tx.objectStore('kv').get(k)
++              let present = false
++              r.onsuccess = () => { present = !!r.result }
++              r.onerror = () => { const e = r.error; settle(() => { db.close(); reject(new Error(`Migration FX-6 claim: IDB get request failed (key=${k}): ${e && e.message ? e.message : String(e)}`)) }) }
++              tx.oncomplete = () => settle(() => { db.close(); resolve({ present }) })
++              tx.onerror = () => { const e = tx.error; settle(() => { db.close(); reject(new Error(`Migration FX-6 claim: IDB readonly tx failed (key=${k}): ${e && e.message ? e.message : String(e)}`)) }) }
++              tx.onabort = () => { const e = tx.error; settle(() => { db.close(); reject(new Error(`Migration FX-6 claim: IDB readonly tx aborted (key=${k}): ${e && e.message ? e.message : 'aborted'}`)) }) }
++            } catch (e) { settle(() => { db.close(); reject(new Error(`Migration FX-6 claim: IDB tx throw (key=${k}): ${e && e.message ? e.message : String(e)}`)) }) }
++          }
++          req.onerror = () => { const e = req.error; settle(() => reject(new Error(`Migration FX-6 claim: IDB open failed (get key=${k}): ${e && e.message ? e.message : String(e)}`))) }
++        })
++        return { hasGetter, uid, namespacedKey, raw: await get('mivo-chat-demo'), namespaced: await get(namespacedKey) }
++      })
++      // SC-N2:bridge 不可用 → 不许静默跳过(dev 本该有 bridge,取不到=挂载链断,抛错)。
++      if (!claim.hasGetter || claim.uid === null || claim.uid === undefined) {
++        throw new Error(`Migration FX-6 claim: bridge 不可用(hasGetter=${claim.hasGetter}, uid=${claim.uid}) —— FX-6 认领断言无法执行。dev 拓扑本场景用 addInitScript 保证 __MIVO_E2E_ENABLED__=true,main.tsx 应挂 __MIVO_E2E__.getPersistUserId;取不到 = bridge 挂载链断了,不许静默跳过。`)
++      }
++      // SC-N1:IDB get 出错时已在 get 里 reject 带原因(不吞成 absent)。这里只在 IDB 正常时断言认领语义。
++      if (claim.uid !== 'anonymous') {
++        if (!claim.namespaced.present) {
++          throw new Error(`Migration FX-6 claim: 认领后 namespaced key '${claim.namespacedKey}' 应存在(uid=${claim.uid}),got absent —— migrateToNamespaced 未认领 legacy raw blob。`)
++        }
++        if (claim.raw.present) {
++          throw new Error(`Migration FX-6 claim: 认领后 legacy raw key 'mivo-chat-demo' 应被删除,got present(uid=${claim.uid}) —— migrateToNamespaced 拷贝后未 delete raw。`)
++        }
++      }
+       // 弹层无 21:9（含 4:3）
+       await migrationPage.locator('[aria-label="选择比例和质量"]').click()
+       await migrationPage.waitForSelector('#chat-ratio-popover .chat-ratio-btn')

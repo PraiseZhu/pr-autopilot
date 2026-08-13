@@ -1,0 +1,2027 @@
+diff --git a/cindyplugin/src/cindy-theme.css b/cindyplugin/src/cindy-theme.css
+index 152627b6..88b0ec61 100644
+--- a/cindyplugin/src/cindy-theme.css
++++ b/cindyplugin/src/cindy-theme.css
+@@ -407,7 +407,8 @@
+    @ 引用下拉与自绘的出图模型下拉(L2 ③)同底同描边 —— 两者都是这块面板里弹出的
+    第二层,视觉必须同源(App.css 那边也是共用一套 token)。 */
+ .region-edit-suggest,
+-.region-edit-model-menu {
++.region-edit-model-menu,
++.region-edit-params-menu {
+   background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 94%, var(--text-primary, #232323) 6%);
+   border-color: color-mix(in srgb, var(--text-primary, #232323) 14%, var(--border-default, #d6d0c6));
+ }
+diff --git a/docs/design-previews/region-edit/assets/product.css b/docs/design-previews/region-edit/assets/product.css
+index b0635486..1f45e612 100644
+--- a/docs/design-previews/region-edit/assets/product.css
++++ b/docs/design-previews/region-edit/assets/product.css
+@@ -6874,6 +6874,243 @@ button:disabled {
+   opacity: 0.85;
+ }
+ 
++/* ── 「更多参数」入口(画质/比例/张数)──────────────────────────────────
++   位置:底部提交行里,模型下拉与发送键之间那段空白(实测该行是 flex + gap:8px,
++   左侧下拉 width:fit-content、右侧发送键 margin-left:auto,中间本来就空着,
++   插入本入口**不需要加宽面板**,--ai-panel-w 保持 340px 不动)。
++   浮层定位复用模型下拉那套 --flip-* 契约:JS 侧 useRegionEditFlip 现读这些变量算
++   容纳与越界修正,**变量名与语义必须与 .region-edit-model-menu 同源**,不能只写死值。 */
++.region-edit-params-field {
++  position: relative;
++  display: inline-flex;
++  flex: none;
++}
++
++/* 下拉箭头:与 .region-edit-model-field::after 同一套几何(4.5px 方角旋转 45°),
++   两个入口并排时必须看起来是同族控件 —— owner 实测反馈「样式要和选模型一样」。 */
++.region-edit-params-field::after {
++  content: '';
++  position: absolute;
++  top: 50%;
++  right: 7px;
++  width: 4.5px;
++  height: 4.5px;
++  border-right: 1.25px solid currentColor;
++  border-bottom: 1.25px solid currentColor;
++  transform: translateY(-65%) rotate(45deg);
++  opacity: 0.7;
++  pointer-events: none;
++}
++
++/* 触发器与模型下拉逐条对齐:同 min-height、同字号、**同为透明底无描边**
++   (原来的胶囊描边 + --muted 弱化色让它看起来像禁用态,owner 实测指出)。
++   右内边距 20px 给箭头让位,左 8px 容纳比例图标。 */
++.region-edit-params-trigger {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  min-height: 30px;
++  padding: 0 20px 0 8px;
++  color: var(--ink);
++  font-size: var(--text-md);
++  background: none;
++  border: 1px solid transparent;
++  border-radius: var(--radius-md);
++  cursor: pointer;
++}
++
++.region-edit-params-trigger:hover:not(:disabled) {
++  background: var(--region-btn-hover);
++}
++
++.region-edit-params-trigger:disabled {
++  opacity: 0.45;
++  cursor: default;
++}
++
++.region-edit-params-trigger:focus-visible {
++  outline: 2px solid var(--line-strong);
++  outline-offset: -2px;
++}
++
++/* 摘要文案随所选档变长(「原比例 · 标准画质 · 1张」最长约 14 字),极窄壳下省略而不是
++   把发送键挤出行外 —— 完整值仍在 aria-label 里,读屏器不受影响。
++   浮层最小宽已从 400 抬到 460(见 maskEditFloatingControls),常态不会触发省略。 */
++.region-edit-params-summary {
++  overflow: hidden;
++  max-width: 16ch;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.region-edit-params-menu {
++  /* 与 .region-edit-model-menu 逐枚同源:JS 现读 --flip-gap 算容纳、写 --flip-cap
++     与 --flip-offset-x。参数面板比模型菜单宽(比例组一行放 3 枚图标项),
++     故设计上限单独给 300px 而不是沿用 420 —— 但**语义与消费方式完全一致**。 */
++  --flip-gap: 4px;
++  /* 380(owner 2026-08-11 两轮反馈「按钮窄」):3 列等分下每列净宽 ~112,
++     「原比例」四字加内边距也不顶边。上限仍小于模型菜单的 420。 */
++  --flip-max-width: 380px;
++  --flip-cap: var(--flip-max-width);
++  --flip-align: left;
++  position: absolute;
++  top: calc(100% + var(--flip-gap));
++  left: 0;
++  transform: translateX(var(--flip-offset-x, 0px));
++  /* 工具条浮层(.region-edit-tool-panel)与提交行是**无 z-index 的兄弟节点**,纯按
++     DOM 顺序层叠,而它排在提交行之后 → 会盖住本浮层(owner 实测截图)。给一个高于
++     兄弟浮层的层级把它压回去;12 远低于抽屉侧栏(80),不会反过来盖住宿主 UI。 */
++  z-index: 12;
++  display: flex;
++  flex-direction: column;
++  gap: 12px;
++  width: max-content;
++  max-width: var(--flip-cap);
++  padding: 12px;
++  background: var(--panel-surface);
++  border: 1px solid var(--line);
++  border-radius: var(--radius-md);
++  box-shadow: var(--shadow);
++}
++
++/* 同 model-menu:贴画布底边时向上开,否则被 .canvas-shell 的 overflow:clip 裁掉。 */
++.region-edit-params-menu.is-flipped {
++  top: auto;
++  bottom: calc(100% + var(--flip-gap));
++}
++
++/* 首帧隐形,避免「先向下展开被工具条压住、再跳到上方」的闪动(owner 2026-08-11 实测)。
++   useRegionEditFlip 是「先按向下渲染 → rAF 里量 → 需要则翻上」的两帧机制,本面板比
++   模型下拉高得多,中间那帧很扎眼。
++   用**纯 CSS 动画**而不是 React 状态:项目 lint 禁止 effect 里 setState;而 placement
++   的字段全是可选的(maxHeight/maxWidth/offsetX 只在需要钳制时才写),拿它们当「已测量」
++   判据会让不越界的常见情形永远隐形(实测点了没反应)。
++   visibility 而非 opacity:必须保留盒子参与布局,否则 hook 量不到自然高度。 */
++@keyframes region-edit-params-reveal {
++  from {
++    visibility: hidden;
++  }
++  to {
++    visibility: visible;
++  }
++}
++
++.region-edit-params-menu {
++  animation: region-edit-params-reveal 0.06s step-end;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .region-edit-params-menu {
++    animation-duration: 0.01s;
++  }
++}
++
++/* 高度装不下时内部滚动(JS 写 max-height 到内联 style)。 */
++.region-edit-params-menu.is-clamped {
++  overflow-y: auto;
++}
++
++.region-edit-param-group {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++}
++
++.region-edit-param-title {
++  color: var(--quiet);
++  font-size: var(--text-sm);
++}
++
++/* 一组按钮横向铺开、超宽换行。**等分列宽**而不是各自内容宽:参照图里比例组是
++   规整网格,一行 3 枚等宽;文字组(画质/张数)同理等分,避免「1K」比「标准画质」窄
++   一半的参差感(owner 实测要求「宽度自适应」= 同组等宽铺满,不是各管各)。 */
++.region-edit-param-row {
++  display: grid;
++  grid-template-columns: repeat(3, 1fr);
++  gap: 6px;
++}
++
++.region-edit-param-option {
++  position: relative;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  gap: 4px;
++  min-height: 30px;
++  padding: 6px 8px;
++  color: var(--ink);
++  font-size: var(--text-md);
++  /* 常态 = **描边式**(owner 2026-08-11 定):给按钮铺底会把面板整体压深一级,
++     与模型下拉菜单的观感对不齐。透明底 + 细描边既能看出可点,又不改变面板明度。 */
++  background: transparent;
++  border: 1px solid var(--line);
++  border-radius: var(--radius-md);
++  cursor: pointer;
++}
++
++/* 带图标的项(比例组):图标在上、文字在下,与参照图一致。 */
++.region-edit-param-option.has-icon {
++  flex-direction: column;
++  gap: 5px;
++  padding: 8px 6px;
++}
++
++/* hover = 轻水洗(与工具坞按钮、模型选项同一枚变量)。
++   **不能**用 --region-cta-bg-hover:那是「强调实底的 hover」,网页版直接等于 --ink
++   深色实底,盖在未选中项上会变成深块 + 深字(owner 实测截图)。 */
++.region-edit-param-option:hover:not(.is-active) {
++  background: var(--region-btn-hover);
++  border-color: var(--line-strong);
++}
++
++/* 选中 = 强调块实底(与工具坞 active、提交钮同一套品牌药丸语义):
++   Dark 档 --region-cta-bg 是亮底 + 深字,Light 档反之 —— 全局既有约定,
++   不再自创「描边 + 水洗」那套弱选中(owner 实测指出暗色下选中应是白底)。 */
++.region-edit-param-option.is-active {
++  color: var(--region-cta-fg);
++  background: var(--region-cta-bg);
++}
++
++.region-edit-param-option:focus-visible {
++  outline: 2px solid var(--line-strong);
++  outline-offset: -2px;
++}
++
++/* 比例形状图标:空心矩形,尺寸由组件按比例内联给。选中态跟随文字色(currentColor)
++   才能在强调实底上翻转,不能写死。 */
++/* 图标等高框:所有比例项的图标都占同样的 16×16,形状只在框内变化 —— 这样一行里
++   竖图(2:3)、横图(3:2)、方图的**文字基线才对齐**(owner 2026-08-11 实测错位)。 */
++.region-edit-ratio-icon-box {
++  display: flex;
++  flex: none;
++  align-items: center;
++  justify-content: center;
++  width: 16px;
++  height: 16px;
++}
++
++.region-edit-ratio-icon {
++  flex: none;
++  border: 1.25px solid currentColor;
++  border-radius: 2px;
++  opacity: 0.85;
++}
++
++/* 「原比例」的四角取景框(SVG):线色跟随 currentColor,选中态自动翻转。 */
++.region-edit-ratio-corners {
++  display: block;
++  opacity: 0.85;
++}
++
++.region-edit-param-label {
++  line-height: 1.1;
++}
++
++/* 4K 的「较慢」角标:实测该档轮询时长约为 1K 的数倍,给一枚视��提示,
++   文案走 data-tooltip(悬停可读),不占按钮宽度。 */
++/* 4K 的「生成较慢」只走 data-tooltip 文案提示,**不画角标**
++   (owner 2026-08-11:小红点像报错,不要)。 */
++
+ /* 工具面板(K8 ①):输入面板下方**居中悬浮**的独立小卡(参考图形态)。定位:内联 style
+    给 left = 输入面板中线 + top,这里用 translateX(-50%) 把自己拉回中心,宽度随内容。
+    中和共享工具条骨架的「纵向堆叠 + 自己的浮卡视觉」,只留按钮排布;卡片外观走浮层壳。 */
+@@ -7366,6 +7603,14 @@ button:disabled {
+   backdrop-filter: blur(12px);
+ }
+ 
++/* 输入面板里弹出二级浮层(出图参数)时,把整块抬到工具条之上。
++   **必须抬这一层**:输入面板自己是 z-index:1 的定位元素 = 独立层叠上下文,
++   浮层无论写多高的 z-index 都只在这个「1」的盒子内部生效,压不过同为 1 但 DOM
++   靠后的工具条(owner 2026-08-11 连续两轮实测仍被遮挡,前一次只抬浮层没用)。 */
++.image-mask-edit-prompt.has-open-popover {
++  z-index: 3;
++}
++
+ /* 工具条两排：第一排工具靠左 + 关闭靠最右；第二排撤销/重复/删除。 */
+ .image-mask-edit-toolbar {
+   display: flex;
+@@ -11855,7 +12100,8 @@ button:disabled {
+    @ 引用下拉与自绘的出图模型下拉(L2 ③)同底同描边 —— 两者都是这块面板里弹出的
+    第二层,视觉必须同源(App.css 那边也是共用一套 token)。 */
+ .region-edit-suggest,
+-.region-edit-model-menu {
++.region-edit-model-menu,
++.region-edit-params-menu {
+   background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 94%, var(--text-primary, #232323) 6%);
+   border-color: color-mix(in srgb, var(--text-primary, #232323) 14%, var(--border-default, #d6d0c6));
+ }
+diff --git a/docs/design-previews/region-edit/screenshots/01-entry-closed.png b/docs/design-previews/region-edit/screenshots/01-entry-closed.png
+new file mode 100644
+index 00000000..4896f196
+Binary files /dev/null and b/docs/design-previews/region-edit/screenshots/01-entry-closed.png differ
+diff --git a/docs/design-previews/region-edit/screenshots/02-panel-open.webp b/docs/design-previews/region-edit/screenshots/02-panel-open.webp
+new file mode 100644
+index 00000000..90647e0b
+Binary files /dev/null and b/docs/design-previews/region-edit/screenshots/02-panel-open.webp differ
+diff --git a/docs/design-previews/region-edit/screenshots/03-panel-dark.webp b/docs/design-previews/region-edit/screenshots/03-panel-dark.webp
+new file mode 100644
+index 00000000..a88e4df1
+Binary files /dev/null and b/docs/design-previews/region-edit/screenshots/03-panel-dark.webp differ
+diff --git a/src/App.css b/src/App.css
+index 4dfa6540..c7ef3727 100644
+--- a/src/App.css
++++ b/src/App.css
+@@ -6828,6 +6828,243 @@ button:disabled {
+   opacity: 0.85;
+ }
+ 
++/* ── 「更多参数」入口(画质/比例/张数)──────────────────────────────────
++   位置:底部提交行里,模型下拉与发送键之间那段空白(实测该行是 flex + gap:8px,
++   左侧下拉 width:fit-content、右侧发送键 margin-left:auto,中间本来就空着,
++   插入本入口**不需要加宽面板**,--ai-panel-w 保持 340px 不动)。
++   浮层定位复用模型下拉那套 --flip-* 契约:JS 侧 useRegionEditFlip 现读这些变量算
++   容纳与越界修正,**变量名与语义必须与 .region-edit-model-menu 同源**,不能只写死值。 */
++.region-edit-params-field {
++  position: relative;
++  display: inline-flex;
++  flex: none;
++}
++
++/* 下拉箭头:与 .region-edit-model-field::after 同一套几何(4.5px 方角旋转 45°),
++   两个入口并排时必须看起来是同族控件 —— owner 实测反馈「样式要和选模型一样」。 */
++.region-edit-params-field::after {
++  content: '';
++  position: absolute;
++  top: 50%;
++  right: 7px;
++  width: 4.5px;
++  height: 4.5px;
++  border-right: 1.25px solid currentColor;
++  border-bottom: 1.25px solid currentColor;
++  transform: translateY(-65%) rotate(45deg);
++  opacity: 0.7;
++  pointer-events: none;
++}
++
++/* 触发器与模型下拉逐条对齐:同 min-height、同字号、**同为透明底无描边**
++   (原来的胶囊描边 + --muted 弱化色让它看起来像禁用态,owner 实测指出)。
++   右内边距 20px 给箭头让位,左 8px 容纳比例图标。 */
++.region-edit-params-trigger {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  min-height: 30px;
++  padding: 0 20px 0 8px;
++  color: var(--ink);
++  font-size: var(--text-md);
++  background: none;
++  border: 1px solid transparent;
++  border-radius: var(--radius-md);
++  cursor: pointer;
++}
++
++.region-edit-params-trigger:hover:not(:disabled) {
++  background: var(--region-btn-hover);
++}
++
++.region-edit-params-trigger:disabled {
++  opacity: 0.45;
++  cursor: default;
++}
++
++.region-edit-params-trigger:focus-visible {
++  outline: 2px solid var(--line-strong);
++  outline-offset: -2px;
++}
++
++/* 摘要文案随所选档变长(「原比例 · 标准画质 · 1张」最长约 14 字),极窄壳下省略而不是
++   把发送键挤出行外 —— 完整值仍在 aria-label 里,读屏器不受影响。
++   浮层最小宽已从 400 抬到 460(见 maskEditFloatingControls),常态不会触发省略。 */
++.region-edit-params-summary {
++  overflow: hidden;
++  max-width: 16ch;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.region-edit-params-menu {
++  /* 与 .region-edit-model-menu 逐枚同源:JS 现读 --flip-gap 算容纳、写 --flip-cap
++     与 --flip-offset-x。参数面板比模型菜单宽(比例组一行放 3 枚图标项),
++     故设计上限单独给 300px 而不是沿用 420 —— 但**语义与消费方式完全一致**。 */
++  --flip-gap: 4px;
++  /* 380(owner 2026-08-11 两轮反馈「按钮窄」):3 列等分下每列净宽 ~112,
++     「原比例」四字加内边距也不顶边。上限仍小于模型菜单的 420。 */
++  --flip-max-width: 380px;
++  --flip-cap: var(--flip-max-width);
++  --flip-align: left;
++  position: absolute;
++  top: calc(100% + var(--flip-gap));
++  left: 0;
++  transform: translateX(var(--flip-offset-x, 0px));
++  /* 工具条浮层(.region-edit-tool-panel)与提交行是**无 z-index 的兄弟节点**,纯按
++     DOM 顺序层叠,而它排在提交行之后 → 会盖住本浮层(owner 实测截图)。给一个高于
++     兄弟浮层的层级把它压回去;12 远低于抽屉侧栏(80),不会反过来盖住宿主 UI。 */
++  z-index: 12;
++  display: flex;
++  flex-direction: column;
++  gap: 12px;
++  width: max-content;
++  max-width: var(--flip-cap);
++  padding: 12px;
++  background: var(--panel-surface);
++  border: 1px solid var(--line);
++  border-radius: var(--radius-md);
++  box-shadow: var(--shadow);
++}
++
++/* 同 model-menu:贴画布底边时向上开,否则被 .canvas-shell 的 overflow:clip 裁掉。 */
++.region-edit-params-menu.is-flipped {
++  top: auto;
++  bottom: calc(100% + var(--flip-gap));
++}
++
++/* 首帧隐形,避免「先向下展开被工具条压住、再跳到上方」的闪动(owner 2026-08-11 实测)。
++   useRegionEditFlip 是「先按向下渲染 → rAF 里量 → 需要则翻上」的两帧机制,本面板比
++   模型下拉高得多,中间那帧很扎眼。
++   用**纯 CSS 动画**而不是 React 状态:项目 lint 禁止 effect 里 setState;而 placement
++   的字段全是可选的(maxHeight/maxWidth/offsetX 只在需要钳制时才写),拿它们当「已测量」
++   判据会让不越界的常见情形永远隐形(实测点了没反应)。
++   visibility 而非 opacity:必须保留盒子参与布局,否则 hook 量不到自然高度。 */
++@keyframes region-edit-params-reveal {
++  from {
++    visibility: hidden;
++  }
++  to {
++    visibility: visible;
++  }
++}
++
++.region-edit-params-menu {
++  animation: region-edit-params-reveal 0.06s step-end;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .region-edit-params-menu {
++    animation-duration: 0.01s;
++  }
++}
++
++/* 高度装不下时内部滚动(JS 写 max-height 到内联 style)。 */
++.region-edit-params-menu.is-clamped {
++  overflow-y: auto;
++}
++
++.region-edit-param-group {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++}
++
++.region-edit-param-title {
++  color: var(--quiet);
++  font-size: var(--text-sm);
++}
++
++/* 一组按钮横向铺开、超宽换行。**等分列宽**而不是各自内容宽:参照图里比例组是
++   规整网格,一行 3 枚等宽;文字组(画质/张数)同理等分,避免「1K」比「标准画质」窄
++   一半的参差感(owner 实测要求「宽度自适应」= 同组等宽铺满,不是各管各)。 */
++.region-edit-param-row {
++  display: grid;
++  grid-template-columns: repeat(3, 1fr);
++  gap: 6px;
++}
++
++.region-edit-param-option {
++  position: relative;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  gap: 4px;
++  min-height: 30px;
++  padding: 6px 8px;
++  color: var(--ink);
++  font-size: var(--text-md);
++  /* 常态 = **描边式**(owner 2026-08-11 定):给按钮铺底会把面板整体压深一级,
++     与模型下拉菜单的观感对不齐。透明底 + 细描边既能看出可点,又不改变面板明度。 */
++  background: transparent;
++  border: 1px solid var(--line);
++  border-radius: var(--radius-md);
++  cursor: pointer;
++}
++
++/* 带图标的项(比例组):图标在上、文字在下,与参照图一致。 */
++.region-edit-param-option.has-icon {
++  flex-direction: column;
++  gap: 5px;
++  padding: 8px 6px;
++}
++
++/* hover = 轻水洗(与工具坞按钮、模型选项同一枚变量)。
++   **不能**用 --region-cta-bg-hover:那是「强调实底的 hover」,网页版直接等于 --ink
++   深色实底,盖在未选中项上会变成深块 + 深字(owner 实测截图)。 */
++.region-edit-param-option:hover:not(.is-active) {
++  background: var(--region-btn-hover);
++  border-color: var(--line-strong);
++}
++
++/* 选中 = 强调块实底(与工具坞 active、提交钮同一套品牌药丸语义):
++   Dark 档 --region-cta-bg 是亮底 + 深字,Light 档反之 —— 全局既有约定,
++   不再自创「描边 + 水洗」那套弱选中(owner 实测指出暗色下选中应是白底)。 */
++.region-edit-param-option.is-active {
++  color: var(--region-cta-fg);
++  background: var(--region-cta-bg);
++}
++
++.region-edit-param-option:focus-visible {
++  outline: 2px solid var(--line-strong);
++  outline-offset: -2px;
++}
++
++/* 比例形状图标:空心矩形,尺寸由组件按比例内联给。选中态跟随文字色(currentColor)
++   才能在强调实底上翻转,不能写死。 */
++/* 图标等高框:所有比例项的图标都占同样的 16×16,形状只在框内变化 —— 这样一行里
++   竖图(2:3)、横图(3:2)、方图的**文字基线才对齐**(owner 2026-08-11 实测错位)。 */
++.region-edit-ratio-icon-box {
++  display: flex;
++  flex: none;
++  align-items: center;
++  justify-content: center;
++  width: 16px;
++  height: 16px;
++}
++
++.region-edit-ratio-icon {
++  flex: none;
++  border: 1.25px solid currentColor;
++  border-radius: 2px;
++  opacity: 0.85;
++}
++
++/* 「原比例」的四角取景框(SVG):线色跟随 currentColor,选中态自动翻转。 */
++.region-edit-ratio-corners {
++  display: block;
++  opacity: 0.85;
++}
++
++.region-edit-param-label {
++  line-height: 1.1;
++}
++
++/* 4K 的「较慢」角标:实测该档轮询时长约为 1K 的数倍,给一枚视��提示,
++   文案走 data-tooltip(悬停可读),不占按钮宽度。 */
++/* 4K 的「生成较慢」只走 data-tooltip 文案提示,**不画角标**
++   (owner 2026-08-11:小红点像报错,不要)。 */
++
+ /* 工具面板(K8 ①):输入面板下方**居中悬浮**的独立小卡(参考图形态)。定位:内联 style
+    给 left = 输入面板中线 + top,这里用 translateX(-50%) 把自己拉回中心,宽度随内容。
+    中和共享工具条骨架的「纵向堆叠 + 自己的浮卡视觉」,只留按钮排布;卡片外观走浮层壳。 */
+@@ -7320,6 +7557,14 @@ button:disabled {
+   backdrop-filter: blur(12px);
+ }
+ 
++/* 输入面板里弹出二级浮层(出图参数)时,把整块抬到工具条之上。
++   **必须抬这一层**:输入面板自己是 z-index:1 的定位元素 = 独立层叠上下文,
++   浮层无论写多高的 z-index 都只在这个「1」的盒子内部生效,压不过同为 1 但 DOM
++   靠后的工具条(owner 2026-08-11 连续两轮实测仍被遮挡,前一次只抬浮层没用)。 */
++.image-mask-edit-prompt.has-open-popover {
++  z-index: 3;
++}
++
+ /* 工具条两排：第一排工具靠左 + 关闭靠最右；第二排撤销/重复/删除。 */
+ .image-mask-edit-toolbar {
+   display: flex;
+diff --git a/src/canvas/RegionEditOverlay.tsx b/src/canvas/RegionEditOverlay.tsx
+index 142f6234..c0ed5b30 100644
+--- a/src/canvas/RegionEditOverlay.tsx
++++ b/src/canvas/RegionEditOverlay.tsx
+@@ -71,6 +71,7 @@ import { RegionEditFloatingControls, RegionEditMarks } from './regionEditOverlay
+ import { useRegionEditFreezeGuard } from './useRegionEditFreezeGuard'
+ import { useRegionEditKeyboard } from './useRegionEditKeyboard'
+ import { useRegionEditModelChoice } from './useRegionEditModelChoice'
++import { useRegionEditParams } from './useRegionEditParams'
+ import type { RegionEditTool } from './regionEditTools'
+ import { toContainer, type Viewport } from '../render/EditOverlayLayer'
+ import { LocalizedKeyError } from '../lib/localizedKeyError'
+@@ -130,6 +131,10 @@ export function RegionEditOverlay({
+   // 状态**保留草稿里的选择** —— 隐藏只影响能不能改,不影响提交带什么(S7:原注释写
+   // 「状态仍留默认值」与实现不符,草稿里的非默认 model 照样会被恢复并提交)。
+   const { model, changeModel, showModelSelect } = useRegionEditModelChoice(restoredDraft?.model)
++  // 出图参数(比例/画质/张数,PR #630 P1):跟模型一起从草稿恢复 —— 用户重开浮层时
++  // 上次选的非默认参数原样回来,不回落模型默认值;params 一旦被用户改过,由 hook 内
++  // setParams/模型收敛接管,草稿 initial 只做首次挂载入口。
++  const { params, setParams } = useRegionEditParams(model, restoredDraft?.params)
+   const [regions, setRegions] = useState<ImageMaskRegion[]>(restoredDraft?.regions ?? [])
+   // 撤销/重做栈:条目同时记录 regions 与 body 两端(删除/清空会重写 @引用编号,
+   // undo/redo 必须把 body 一起回滚;用户此后编辑过输入框则跳过,不吞输入)。
+@@ -196,8 +201,8 @@ export function RegionEditOverlay({
+   // 草稿随手同步(高频、纯内存,不记日志):选区/指令/工具任一变化就覆盖同键。
+   // 空内容等价删除,「打开就关」不会留下空壳草稿。
+   useEffect(() => {
+-    saveRegionEditDraft(node.id, { body, regions, tool, model, naturalSize })
+-  }, [body, regions, tool, model, node.id, naturalSize])
++    saveRegionEditDraft(node.id, { body, regions, tool, model, params, naturalSize })
++  }, [body, regions, tool, model, params, node.id, naturalSize])
+ 
+   const updateDraft = (nextDraft?: DraftRegion) => {
+     draftRef.current = nextDraft
+@@ -361,6 +366,18 @@ export function RegionEditOverlay({
+     // (hook 在它的定义之前就被调用);闭包里调用时才求值。
+     onSuggestKey: (event) => handleEditorKeyDown(event),
+     onEscape: (event) => handleEditorKeyDown(event),
++    // 回车提交(owner 2026-08-11 实测缺失):换行已在 hook 里拦掉,这里只负责发。
++    // 判据与提交按钮的 disabled 逐字同源(canSubmitRegionEdit + 冻结态)——否则空指令
++    // 敲回车会走进 submit 再被下游拒掉,白刷一条「提交跳过:指令为空」的 warn。
++    // 箭头包一层避开 TDZ(submit / frozen 都在后面定义)。
++    onSubmitKey: () => {
++      // 读 editor.readBody() 的 DOM 现值,不用闭包里的 body:回调在 hook 初始化时定格,
++      // 闭包捕获的是首帧空串,拿它判 canSubmit 会让回车永远被判成「指令为空」。
++      // 引用后定义的 editor 不踩 TDZ —— 与上面 onSuggestKey 同理,箭头体在**事件发生
++      // 时**才求值,那时 editor 早已初始化完毕。
++      if (frozenRef.current || !canSubmitRegionEdit(editor.readBody())) return
++      void submit()
++    },
+     // 独立芯片行摘除后,hover 高亮与点选中挪到输入框内嵌芯片本体上。
+     onChipHover: setHoverIndex,
+     onChipSelect: setSelectedIndex,
+@@ -692,6 +709,7 @@ export function RegionEditOverlay({
+         naturalSize,
+         resolvedAssetUrl,
+         model,
++        params,
+         onSubmit,
+         claimSubmit,
+       })
+@@ -781,6 +799,8 @@ export function RegionEditOverlay({
+         model={model}
+         onModelChange={changeModel}
+         showModelSelect={showModelSelect}
++        params={params}
++        onParamsChange={setParams}
+         submitting={submitting}
+         frozen={frozen}
+         assembling={assembling}
+diff --git a/src/canvas/RegionEditParamsSelect.test.tsx b/src/canvas/RegionEditParamsSelect.test.tsx
+new file mode 100644
+index 00000000..ff18b36a
+--- /dev/null
++++ b/src/canvas/RegionEditParamsSelect.test.tsx
+@@ -0,0 +1,158 @@
++// @vitest-environment happy-dom
++import { act } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { RegionEditParamsSelect } from './RegionEditParamsSelect'
++import { regionEditDefaultParams, type RegionEditParams } from './regionEditParams'
++import { isRegionEditControlMenuOpen } from '../lib/menuOverlayStack'
++
++let container: HTMLDivElement
++let root: Root
++const onChange = vi.fn()
++const onOpenChange = vi.fn()
++
++const mount = (props: { params?: RegionEditParams; disabled?: boolean } = {}) => {
++  act(() => {
++    root.render(
++      <RegionEditParamsSelect
++        model="gemini-3-pro-image"
++        params={props.params ?? regionEditDefaultParams('gemini-3-pro-image')}
++        disabled={props.disabled ?? false}
++        onChange={onChange}
++        onOpenChange={onOpenChange}
++      />,
++    )
++  })
++}
++const trigger = () => container.querySelector<HTMLButtonElement>('.region-edit-params-trigger')!
++const menu = () => container.querySelector<HTMLDivElement>('.region-edit-params-menu')
++const options = () => [...container.querySelectorAll<HTMLButtonElement>('[role="option"]')]
++const click = (node: HTMLElement) => act(() => node.click())
++const keydown = (key: string, target: EventTarget = window) =>
++  act(() => target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })))
++
++beforeEach(() => {
++  container = document.createElement('div')
++  document.body.appendChild(container)
++  root = createRoot(container)
++  onChange.mockClear()
++  onOpenChange.mockClear()
++})
++afterEach(() => {
++  act(() => root.unmount())
++  container.remove()
++})
++
++describe('RegionEditParamsSelect — 行为契约', () => {
++  it('展开→冻结→解冻不复开、不夺焦点(F-A2-1/ADV-A2-1)', () => {
++    const elsewhere = document.createElement('input')
++    document.body.appendChild(elsewhere)
++    mount()
++    click(trigger())
++    expect(menu()).not.toBeNull()
++    mount({ disabled: true })
++    expect(menu()).toBeNull()
++    elsewhere.focus()
++    mount({ disabled: false })
++    expect(menu()).toBeNull()
++    expect(document.activeElement).toBe(elsewhere)
++    elsewhere.remove()
++  })
++
++  it('ArrowDown 打开并聚焦当前项,上下箭头环绕漫游', () => {
++    mount()
++    keydown('ArrowDown', trigger())
++    expect(menu()).not.toBeNull()
++    expect(document.activeElement).toBe(options()[1]) // 默认 2K
++    keydown('ArrowDown', options()[1])
++    expect(document.activeElement).toBe(options()[2])
++    keydown('ArrowUp', options()[2])
++    expect(document.activeElement).toBe(options()[1])
++  })
++
++  it('Esc 只关本层并把焦点还给触发器', () => {
++    mount()
++    click(trigger())
++    const event = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
++    act(() => window.dispatchEvent(event))
++    expect(menu()).toBeNull()
++    expect(event.defaultPrevented).toBe(true)
++    expect(document.activeElement).toBe(trigger())
++  })
++
++  it('点外关闭;Tab 焦点离开整个控件也关闭', () => {
++    mount()
++    click(trigger())
++    act(() => document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })))
++    expect(menu()).toBeNull()
++
++    click(trigger())
++    const outside = document.createElement('button')
++    document.body.appendChild(outside)
++    act(() => outside.focus())
++    expect(menu()).toBeNull()
++    outside.remove()
++  })
++
++  it('选择参数保持面板打开、回调新值并把焦点还给触发器', () => {
++    mount()
++    click(trigger())
++    const fourK = options().find((option) => option.textContent === '4K')!
++    click(fourK)
++    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
++      quality: { kind: 'resolution', value: '4K' },
++    }))
++    expect(menu()).not.toBeNull()
++    expect(document.activeElement).toBe(trigger())
++  })
++
++  it('选择→回焦触发器→真实 Tab 顺序先关菜单,且不阻止浏览器默认移动(ADV-A2-2)', () => {
++    mount()
++    click(trigger())
++    click(options()[2])
++    expect(document.activeElement).toBe(trigger())
++    // 旧测试直接 outside.focus() 跳过了浏览器真实 Tab 顺序 —— trigger 后面紧跟菜单
++    // options,Tab 的下一站仍在 root 内,onBlur 不会关。这里直接派发 trigger 的 Tab。
++    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
++    act(() => trigger().dispatchEvent(tab))
++    expect(menu()).toBeNull()
++    expect(tab.defaultPrevented, '关闭菜单但必须让浏览器继续默认 Tab 移焦').toBe(false)
++    expect(isRegionEditControlMenuOpen(document)).toBe(false)
++  })
++
++  it('触发器 aria-haspopup 与实际 listbox role 一致', () => {
++    mount()
++    expect(trigger().getAttribute('aria-haspopup')).toBe('listbox')
++    click(trigger())
++    expect(menu()?.getAttribute('role')).toBe('listbox')
++  })
++
++  it('英文 locale 下摘要和 GPT 画质选项不混入中文(ADV-E2-3)', async () => {
++    const { default: i18n } = await import('../i18n')
++    await act(async () => i18n.changeLanguage('en'))
++    const gpt = regionEditDefaultParams('gpt-image-2')
++    act(() => {
++      root.render(
++        <RegionEditParamsSelect
++          model="gpt-image-2"
++          params={gpt}
++          disabled={false}
++          onChange={onChange}
++        />,
++      )
++    })
++    expect(trigger().textContent).toContain('Original · Medium · 1')
++    click(trigger())
++    expect(options().map((option) => option.textContent)).toEqual(expect.arrayContaining(['Low', 'Medium', 'High']))
++    expect(container.textContent).not.toMatch(/[低中高张]/)
++    await act(async () => i18n.changeLanguage('zh-CN'))
++  })
++
++  it('参数菜单真实类名进入画布快捷键让行选择器', () => {
++    mount()
++    expect(isRegionEditControlMenuOpen(document)).toBe(false)
++    click(trigger())
++    expect(isRegionEditControlMenuOpen(document)).toBe(true)
++  })
++})
+diff --git a/src/canvas/RegionEditParamsSelect.tsx b/src/canvas/RegionEditParamsSelect.tsx
+new file mode 100644
+index 00000000..dc2db784
+--- /dev/null
++++ b/src/canvas/RegionEditParamsSelect.tsx
+@@ -0,0 +1,300 @@
++// src/canvas/RegionEditParamsSelect.tsx
++// 区域编辑底部工具条的「更多参数」入口:触发器显示当前档摘要,点开是分组面板
++// (画质 / 比例 / 张数,每组一行按钮),交互与 RegionEditModelSelect 逐条对齐 ——
++// 贴边翻转(useRegionEditFlip)、捕获相 pointerdown 点外关闭、捕获相 Escape 只关本层、
++// data-canvas-ui 豁免「点画布空白关面板」。刻意**不复用** .canvas-tool-flyout:
++// 那套锚在工具坞按钮下方展开,受 .canvas-shell 裁切约束与本面板不同。
++//
++// 档位取值全部来自 regionEditParams(实测口径),本组件只负责渲染与选中态,不判定
++// 哪些档合法 —— 模型切换后的收敛由 clampRegionEditParams 在上层做。
++import {
++  useEffect,
++  useLayoutEffect,
++  useRef,
++  useState,
++  type KeyboardEvent as ReactKeyboardEvent,
++  type ReactNode,
++} from 'react'
++
++import { t } from '../i18n'
++import { handleOverlayEscape } from '../lib/menuOverlayStack'
++import { debugLogger } from '../store/debugLogStore'
++import { RegionEditRatioIcon } from './regionEditRatioIcon'
++import { flipStyle } from './regionEditFlip'
++import { useRegionEditFlip } from './useRegionEditFlip'
++import {
++  REGION_EDIT_RATIO_SOURCE,
++  isSameRegionEditQuality,
++  regionEditCounts,
++  regionEditQualityOptions,
++  regionEditRatioOptions,
++  type RegionEditCount,
++  type RegionEditParams,
++  type RegionEditQuality,
++  type RegionEditRatio,
++} from './regionEditParams'
++import type { MaskEditModelId } from './imageMaskGeometry'
++
++type RegionEditParamsSelectProps = {
++  model: MaskEditModelId
++  params: RegionEditParams
++  /** 冻结(提交中/装配中)时不许改参数,与模型下拉同语义。 */
++  disabled: boolean
++  onChange: (next: RegionEditParams) => void
++  /** 浮层开合回传:输入面板据此临时抬高 z-index,否则二级浮层会被工具条压住
++   *  (输入面板自身 z-index:1 形成层叠上下文,子层再高也翻不出去)。 */
++  onOpenChange?: (open: boolean) => void
++}
++
++export function RegionEditParamsSelect({
++  model,
++  params,
++  disabled,
++  onChange,
++  onOpenChange,
++}: RegionEditParamsSelectProps) {
++  const [open, setOpen] = useState(false)
++  const openRef = useRef(open)
++  const rootRef = useRef<HTMLSpanElement | null>(null)
++  const menuRef = useRef<HTMLDivElement | null>(null)
++  const triggerRef = useRef<HTMLButtonElement | null>(null)
++
++  // 冻结时**真实清零**内部 open 与父层抬层状态,不能只用 open&&!disabled 派生隐藏。
++  // 否则提交失败解冻后菜单会无操作复开、重新抬高父层并可能夺焦点(F-A2-1/ADV-A2-1)。
++  // 与 RegionEditModelSelect 的同族修复一致,渲染期同步调整避免中间帧。
++  if (open && disabled) setOpen(false)
++  const menuOpen = open && !disabled
++  // 父层抬层与日志是外部副作用,不能放 render 里。render 期只同步收起 state；layout
++  // effect 在浏览器绘制前完成通知,不会露出「面板已隐藏但父层仍抬高」的一帧。
++  useLayoutEffect(() => {
++    const wasOpen = openRef.current
++    openRef.current = open
++    if (!disabled || !wasOpen) return
++    onOpenChange?.(false)
++    debugLogger.log('Region Edit', '出图参数面板因提交冻结而关闭')
++  }, [disabled, onOpenChange, open])
++  // 签名与模型下拉一致:(浮层 ref, 锚 ref, 是否启用)。
++  const placement = useRegionEditFlip(menuRef, rootRef, menuOpen)
++
++  // 开合的出口有四个(点触发器/点外/Esc/禁用),统一走这里回传,免得逐个改漏。
++  // 回调**不能**写在 setState 的 updater 里:updater 跑在渲染阶段,那里调用父层
++  // setState 会触发 React 的「渲染 A 时更新 B」报错(#489 实测,e2e console-error
++  // 门当场判红)。这里用 openRef 现读当前值,回调留在事件回调里。
++  const setOpenAndNotify = (value: boolean, reason: 'trigger' | 'outside' | 'escape' | 'blur' = 'trigger') => {
++    if (openRef.current === value) return
++    openRef.current = value
++    setOpen(value)
++    onOpenChange?.(value && !disabled)
++    debugLogger.log('Region Edit', `出图参数面板${value ? '打开' : '关闭'}:${reason}`)
++  }
++
++  // 打开后焦点落到当前画质项(若无匹配则首项),与模型下拉的真焦点漫游一致。
++  useEffect(() => {
++    if (!menuOpen) return
++    const options = menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]')
++    const active = [...(options ?? [])].find((option) => option.getAttribute('aria-selected') === 'true')
++    ;(active ?? options?.[0])?.focus()
++  }, [menuOpen])
++
++  useEffect(() => {
++    if (!menuOpen) return undefined
++    const closeOnOutside = (event: PointerEvent) => {
++      if (rootRef.current?.contains(event.target as Node)) return
++      setOpenAndNotify(false, 'outside')
++    }
++    // 与模型下拉同款:捕获相注册,抢在画布全局 Escape(→ onCancelMaskEdit)之前,
++    // 让 Esc 只关本层浮层而不是整个重绘面板。
++    const closeOnEscape = (event: KeyboardEvent) => {
++      handleOverlayEscape(event, () => {
++        setOpenAndNotify(false, 'escape')
++        triggerRef.current?.focus()
++      })
++    }
++    window.addEventListener('pointerdown', closeOnOutside, { capture: true })
++    window.addEventListener('keydown', closeOnEscape, { capture: true })
++    return () => {
++      window.removeEventListener('pointerdown', closeOnOutside, { capture: true })
++      window.removeEventListener('keydown', closeOnEscape, { capture: true })
++    }
++    // setOpenAndNotify 每次渲染都是新函数,进依赖会让监听每帧重挂;它内部只读 ref
++    // 与最新 props,不存在闭包过期问题,故刻意只依赖开合态。
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [menuOpen])
++
++  // 改一个维度不关面板:用户通常连着调两三项(与截图里 Cindy 的参数面板一致)。
++  const patch = (next: Partial<RegionEditParams>) => onChange({ ...params, ...next })
++
++  const onTriggerKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
++    // 选项选择后焦点会回触发器,菜单仍保持展开。此时真实 Tab 顺序的下一站是 DOM 中
++    // 紧跟触发器的第一个 option(仍在 root 内),root onBlur 因 relatedTarget 仍在内部
++    // 不会关闭 —— 菜单持续存在、画布快捷键也持续让行(ADV-A2-2 R3 实证)。
++    // 触发器在菜单展开时收到 Tab，先收起但**不 preventDefault**，让浏览器照常把焦点
++    // 移到控件外的下一个可聚焦元素。
++    if (menuOpen && event.key === 'Tab') {
++      setOpenAndNotify(false, 'blur')
++      return
++    }
++    if (menuOpen || (event.key !== 'ArrowDown' && event.key !== 'ArrowUp')) return
++    event.preventDefault()
++    setOpenAndNotify(true)
++  }
++
++  const onMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
++    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
++    event.preventDefault()
++    const options = [...(menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]') ?? [])]
++    if (!options.length) return
++    const from = options.findIndex((option) => option === event.target)
++    const step = event.key === 'ArrowDown' ? 1 : -1
++    options[(Math.max(0, from) + step + options.length) % options.length].focus()
++  }
++
++  const qualityOptions = regionEditQualityOptions(model).map((option) => ({
++    ...option,
++    label:
++      option.value.kind === 'quality'
++        ? t(`chat.quality.${option.value.value}`)
++        : option.label,
++  }))
++  const ratioOptions = regionEditRatioOptions(model)
++  // regionEditParamsSummary 是领域层的中文/debug 摘要；UI/ARIA 必须在组件层按 locale 组装。
++  const qualitySummary =
++    qualityOptions.find((option) => isSameRegionEditQuality(option.value, params.quality))?.label ??
++    params.quality.value
++  const ratioSummary = params.ratio === REGION_EDIT_RATIO_SOURCE ? t('menu.maskEdit.sourceRatio') : params.ratio
++  const summary = [ratioSummary, qualitySummary, t('menu.maskEdit.countValue', { count: String(params.count) })].join(' · ')
++  const paramsLabel = t('menu.maskEdit.paramsLabel')
++  const qualityLabel = t('menu.maskEdit.qualityLabel')
++  const ratioLabel = t('menu.maskEdit.ratioLabel')
++  const countLabel = t('menu.maskEdit.countLabel')
++
++  const groupButton = (
++    key: string,
++    label: string,
++    selected: boolean,
++    onPick: () => void,
++    opts?: { slow?: boolean; icon?: ReactNode },
++  ) => (
++    <button
++      key={key}
++      type="button"
++      className={['region-edit-param-option', opts?.icon ? 'has-icon' : '', selected ? 'is-active' : '']
++        .filter(Boolean)
++        .join(' ')}
++      role="option"
++      aria-selected={selected}
++      onClick={() => {
++        onPick()
++        // 面板保持展开以便连续调项；把焦点还给触发器，避免选项列表随模型收敛重建时
++        // 焦点掉到 body。此处是真事件回调，读取 ref 不触发 react-hooks/refs。
++        triggerRef.current?.focus()
++      }}
++      // 4K 明显更慢(实测轮询时长翻倍),给个可读提示而不是只靠角标。
++      {...(opts?.slow ? { 'data-tooltip': t('menu.maskEdit.slowGeneration') } : {})}
++    >
++      {opts?.icon}
++      <span className="region-edit-param-label">{label}</span>
++    </button>
++  )
++
++  return (
++    <span
++      className="region-edit-params-field"
++      ref={rootRef}
++      onBlur={(event) => {
++        if (rootRef.current?.contains(event.relatedTarget as Node | null)) return
++        setOpenAndNotify(false, 'blur')
++      }}
++    >
++      <button
++        ref={triggerRef}
++        type="button"
++        className="region-edit-params-trigger"
++        disabled={disabled}
++        aria-haspopup="listbox"
++        aria-expanded={menuOpen}
++        aria-label={t('menu.maskEdit.paramsWithValue', { value: summary })}
++        onClick={() => setOpenAndNotify(!open)}
++        onKeyDown={onTriggerKeyDown}
++      >
++        {/* 前缀 = 当前比例的形状图标(与比例组同一枚组件),比抽象滑块图标更快读出
++            「这里管画幅」;保持原比例时与面板内选项同款四角取景框(owner 2026-08-11:
++            触发器与选项造型必须一致,不得用 1:1 实心占位冒充)。 */}
++        <RegionEditRatioIcon
++          ratio={params.ratio === REGION_EDIT_RATIO_SOURCE ? '1:1' : params.ratio}
++          dashed={params.ratio === REGION_EDIT_RATIO_SOURCE}
++        />
++        <span className="region-edit-params-summary">{summary}</span>
++      </button>
++      {menuOpen ? (
++        <div
++          ref={menuRef}
++          className={[
++            'region-edit-params-menu',
++            placement.flipped ? 'is-flipped' : '',
++            // maxHeight 非空 = 该侧装不下自然高度,需内部滚动(与模型下拉同判据)。
++            placement.maxHeight != null ? 'is-clamped' : '',
++          ]
++            .filter(Boolean)
++            .join(' ')}
++          style={flipStyle(placement)}
++          role="listbox"
++          aria-label={paramsLabel}
++          data-canvas-ui="true"
++          onKeyDown={onMenuKeyDown}
++        >
++          <div className="region-edit-param-group" role="group" aria-label={qualityLabel}>
++            <span className="region-edit-param-title">{qualityLabel}</span>
++            <div className="region-edit-param-row">
++              {qualityOptions.map((option) =>
++                groupButton(
++                  `${option.value.kind}-${option.value.value}`,
++                  option.label,
++                  isSameRegionEditQuality(option.value, params.quality),
++                  () => patch({ quality: option.value as RegionEditQuality }),
++                  { slow: option.slow },
++                ),
++              )}
++            </div>
++          </div>
++
++          <div className="region-edit-param-group" role="group" aria-label={ratioLabel}>
++            <span className="region-edit-param-title">{ratioLabel}</span>
++            <div className="region-edit-param-row">
++              {/* 「保持原比例」恒排首位:它是默认档,也是区域编辑的语义本位
++                  (在原图上改一块,不动画幅)。选了别的比例才会让 AI 补画适配。 */}
++              {groupButton(
++                'ratio-source',
++                t('menu.maskEdit.sourceRatio'),
++                params.ratio === REGION_EDIT_RATIO_SOURCE,
++                () => patch({ ratio: REGION_EDIT_RATIO_SOURCE }),
++                // 「跟随源图」没有确定形状,用虚线框表达「按原样」,与实线的具体比例区分开。
++                { icon: <RegionEditRatioIcon ratio="1:1" dashed /> },
++              )}
++              {ratioOptions.map((ratio) =>
++                groupButton(
++                  `ratio-${ratio}`,
++                  ratio,
++                  params.ratio === (ratio as RegionEditRatio),
++                  () => patch({ ratio }),
++                  { icon: <RegionEditRatioIcon ratio={ratio} /> },
++                ),
++              )}
++            </div>
++          </div>
++
++          <div className="region-edit-param-group" role="group" aria-label={countLabel}>
++            <span className="region-edit-param-title">{countLabel}</span>
++            <div className="region-edit-param-row">
++              {regionEditCounts.map((count) =>
++                groupButton(`count-${count}`, t('menu.maskEdit.countValue', { count: String(count) }), params.count === count, () =>
++                  patch({ count: count as RegionEditCount }),
++                ),
++              )}
++            </div>
++          </div>
++        </div>
++      ) : null}
++    </span>
++  )
++}
+diff --git a/src/canvas/maskEditFloatingControls.ts b/src/canvas/maskEditFloatingControls.ts
+index d7087086..7192a705 100644
+--- a/src/canvas/maskEditFloatingControls.ts
++++ b/src/canvas/maskEditFloatingControls.ts
+@@ -17,8 +17,11 @@ const floatingControlsGap = 10
+ const floatingToolbarHeight = 114
+ // 加宽（用户 2026-07-07）：4 个工具按钮 + 关闭要能在一排放下，不换行；顺带让
+ // prompt 描述少折行。竖图时浮层宽度以前只有 ~320，「点选」会被挤到第二行。
+-const floatingControlsMinWidth = 400
+-const floatingControlsMaxWidth = 480
++// 再加宽（用户 2026-08-11 实测）：底部提交行从「模型下拉 + 发送键」变成
++// 「模型下拉 + 参数入口 + 发送键」，400 下三者相互挤压（参数摘要「原比例 · 2K · 1张」
++// 本身就有 ~15 字符）。+60 让最窄态也能一排放下，最大值同步抬以免宽图时反而更紧。
++const floatingControlsMinWidth = 460
++const floatingControlsMaxWidth = 540
+ 
+ const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max)
+ 
+diff --git a/src/canvas/regionEditDraft.test.ts b/src/canvas/regionEditDraft.test.ts
+index 2c030b4d..6b03a9c6 100644
+--- a/src/canvas/regionEditDraft.test.ts
++++ b/src/canvas/regionEditDraft.test.ts
+@@ -12,15 +12,18 @@ import {
+   type RegionEditDraftSnapshot,
+ } from './regionEditDraft'
+ import type { ImageMaskRegion } from './imageMaskGeometry'
++import type { RegionEditParams } from './regionEditParams'
+ 
+ const naturalSize = { width: 800, height: 600 }
+ const box: ImageMaskRegion = { type: 'box', x: 10, y: 10, width: 100, height: 80 }
++const defaultParams: RegionEditParams = { quality: { kind: 'resolution', value: '2K' }, ratio: 'source', count: 1 }
+ 
+ const snapshot = (overrides: Partial<RegionEditDraftSnapshot> = {}): RegionEditDraftSnapshot => ({
+   body: '把@区域1 改成蓝色',
+   regions: [box],
+   tool: 'box',
+   model: 'gemini-3-pro-image',
++  params: defaultParams,
+   naturalSize,
+   ...overrides,
+ })
+@@ -110,3 +113,66 @@ describe('regionEditDraft — 出图模型跟着草稿走', () => {
+     expect(restoreRegionEditDraft('node-model-2', naturalSize)).toBeUndefined()
+   })
+ })
++
++// PR #630 P1:出图参数(比例/画质/张数)与模型同一保留语义 —— 用户选过的非默认参数
++// 重开浮层原样恢复,不回落模型默认值;尺寸失配整份丢弃时一起丢。
++describe('regionEditDraft — 出图参数跟着草稿走', () => {
++  it('存的参数在同尺寸重开时原样恢复', () => {
++    const params: RegionEditParams = { quality: { kind: 'resolution', value: '4K' }, ratio: '4:3', count: 4 }
++    saveRegionEditDraft('node-params', snapshot({ params }))
++    expect(restoreRegionEditDraft('node-params', naturalSize)?.snapshot?.params).toEqual(params)
++  })
++
++  it('尺寸失配整份丢弃时参数一起丢(不把旧参数套在新图上)', () => {
++    const params: RegionEditParams = { quality: { kind: 'quality', value: 'high' }, ratio: '21:9', count: 2 }
++    saveRegionEditDraft('node-params-2', snapshot({ params }))
++    const restored = restoreRegionEditDraft('node-params-2', { width: 1024, height: 768 })
++    expect(restored).toEqual({ dropped: true })
++    expect(restoreRegionEditDraft('node-params-2', naturalSize)).toBeUndefined()
++  })
++})
++
++// PR #630 P1(2026-08-13 Greptile 追加):**仅参数草稿** —— 用户不填指令不画选区、只选
++// 非默认比例/画质/张数,草稿也必须保存(否则重开回默认,选择丢失)。「空草稿」的定义
++// 从「无正文+无区域」收窄为「无正文+无区域+参数是模型默认」;默认参数且无正文/区域仍删。
++describe('regionEditDraft — 仅参数草稿保存(Greptile P1 追加)', () => {
++  it('无正文/无区域 + 非默认 params → 保存并恢复(仅参数草稿不被空草稿清理)', () => {
++    const nonDefault: RegionEditParams = { quality: { kind: 'resolution', value: '4K' }, ratio: '4:3', count: 4 }
++    saveRegionEditDraft('node-paramsonly', snapshot({ body: '', regions: [], params: nonDefault }))
++    const restored = restoreRegionEditDraft('node-paramsonly', naturalSize)?.snapshot
++    expect(restored?.body).toBe('')
++    expect(restored?.regions).toEqual([])
++    expect(restored?.params).toEqual(nonDefault)
++  })
++
++  it('无正文/无区域 + 默认 params → 仍删空草稿(用户没留下任何东西)', () => {
++    saveRegionEditDraft('node-paramsonly-2', snapshot({ body: '', regions: [] }))
++    expect(restoreRegionEditDraft('node-paramsonly-2', naturalSize)).toBeUndefined()
++  })
++
++  it('非默认判断相对 snapshot.model 的默认值:GPT 默认 medium,存 low 仍是有效草稿', () => {
++    const gptLow: RegionEditParams = { quality: { kind: 'quality', value: 'low' }, ratio: 'source', count: 1 }
++    saveRegionEditDraft('node-paramsonly-3', snapshot({ body: '', regions: [], model: 'gpt-image-2', params: gptLow }))
++    const restored = restoreRegionEditDraft('node-paramsonly-3', naturalSize)?.snapshot
++    expect(restored?.model).toBe('gpt-image-2')
++    expect(restored?.params).toEqual(gptLow)
++  })
++
++  it('body/regions 有内容时默认 params 不构成空草稿(原有语义不变)', () => {
++    saveRegionEditDraft('node-paramsonly-4', snapshot())
++    expect(restoreRegionEditDraft('node-paramsonly-4', naturalSize)?.snapshot?.body).toBe('把@区域1 改成蓝色')
++  })
++})
++
++// PR #630 P1:Overlay 接线契约 —— params 进草稿保存 + 从草稿恢复入口,防回归
++// (与「提交成功不清草稿」文本契约同款:浮层无 hook render harness,用源码契约钉住)。
++describe('regionEditDraft — Overlay 接线契约', () => {
++  it('useRegionEditParams 带草稿 params 恢复入口', () => {
++    expect(overlaySource).toContain('useRegionEditParams(model, restoredDraft?.params)')
++  })
++
++  it('save 草稿携带 params 且依赖数组含 params', () => {
++    expect(overlaySource).toContain('saveRegionEditDraft(node.id, { body, regions, tool, model, params, naturalSize })')
++    expect(overlaySource).toContain('[body, regions, tool, model, params, node.id, naturalSize]')
++  })
++})
+diff --git a/src/canvas/regionEditDraft.ts b/src/canvas/regionEditDraft.ts
+index 5631b7dc..b82f435c 100644
+--- a/src/canvas/regionEditDraft.ts
++++ b/src/canvas/regionEditDraft.ts
+@@ -16,6 +16,7 @@
+ // 数据 —— 跨会话恢复一份指向可能已改动图片的旧选区,比丢草稿更糟。
+ import type { ImageMaskRegion, MaskEditModelId } from './imageMaskGeometry'
+ import type { RegionEditTool } from './regionEditTools'
++import { regionEditDefaultParams, type RegionEditParams } from './regionEditParams'
+ 
+ type NaturalSize = { width: number; height: number }
+ 
+@@ -26,6 +27,11 @@ export type RegionEditDraftSnapshot = {
+   /** 出图模型选择(K1 Task 2):与 body/regions/tool 同一保留语义 —— 重开同一张图
+    *  时连模型一起恢复;尺寸失配整份丢弃时它也一起丢。 */
+   model: MaskEditModelId
++  /** 出图参数(比例/画质/张数,PR #630 P1):与 model 同一保留语义 —— 用户选过的
++   *  非默认参数重开浮层时原样恢复,不回落模型默认值;尺寸失配整份丢弃时一起丢。
++   *  **可选**:改动前落的草稿没有这个字段(旧草稿是合法状态,恢复方回默认值);
++   *  新 save 的快照必带。 */
++  params?: RegionEditParams
+   /** 存草稿时源图的 natural 尺寸:选区坐标在这个像素空间里,图被换掉/重裁后
+    *  尺寸不同,旧坐标会指错位置 —— 恢复前必须核对,不匹配整份丢弃。 */
+   naturalSize: NaturalSize
+@@ -33,10 +39,26 @@ export type RegionEditDraftSnapshot = {
+ 
+ const drafts = new Map<string, RegionEditDraftSnapshot>()
+ 
++/** 默认参数 = 该模型「什么都没选」的形态(NANO 2K/保持原比例/1 张,GPT 中/保持原比例/1 张)。 */
++const isDefaultParams = (snapshot: RegionEditDraftSnapshot): boolean => {
++  if (!snapshot.params) return true // 旧草稿无 params 字段 = 什么都没选
++  const d = regionEditDefaultParams(snapshot.model)
++  return (
++    snapshot.params.ratio === d.ratio &&
++    snapshot.params.count === d.count &&
++    snapshot.params.quality.kind === d.quality.kind &&
++    snapshot.params.quality.value === d.quality.value
++  )
++}
++
+ const isEmptyDraft = (snapshot: RegionEditDraftSnapshot): boolean =>
+-  snapshot.body.trim().length === 0 && snapshot.regions.length === 0
++  snapshot.body.trim().length === 0 &&
++  snapshot.regions.length === 0 &&
++  isDefaultParams(snapshot)
+ 
+-/** 每次选区/指令/工具变化都同步进来(高频调用,不记日志);空草稿等价于删除。 */
++/** 每次选区/指令/工具/参数变化都同步进来(高频调用,不记日志);「空草稿」等价于删除。
++ *  空 = 无正文 + 无区域 + 参数是模型默认(Greptile P1 追加:仅选非默认参数也是有效草稿,
++ *  重开要恢复,不能被空草稿清理)。 */
+ export const saveRegionEditDraft = (nodeId: string, snapshot: RegionEditDraftSnapshot): void => {
+   if (isEmptyDraft(snapshot)) {
+     drafts.delete(nodeId)
+diff --git a/src/canvas/regionEditOverlayRender.tsx b/src/canvas/regionEditOverlayRender.tsx
+index ae4401c5..d3ca36d7 100644
+--- a/src/canvas/regionEditOverlayRender.tsx
++++ b/src/canvas/regionEditOverlayRender.tsx
+@@ -8,6 +8,7 @@
+ // 注意:以上颜色只作用于画布 UI 层;发给模型的标注图(图2)仍是 regionDescribe 的
+ // 红色标注,画布色与标注图色分离是有意设计,改这里不会影响模型输入。
+ import { Redo2, SendHorizontal, Trash2, Undo2, X } from 'lucide-react'
++import { useState } from 'react'
+ import type {
+   ClipboardEvent as ReactClipboardEvent,
+   KeyboardEvent as ReactKeyboardEvent,
+@@ -28,6 +29,8 @@ import { useTranslation } from 'react-i18next'
+ import { t } from '../i18n'
+ import { RegionEditErrorBar } from './RegionEditErrorBar'
+ import { RegionEditModelSelect } from './RegionEditModelSelect'
++import { RegionEditParamsSelect } from './RegionEditParamsSelect'
++import type { RegionEditParams } from './regionEditParams'
+ import { regionEditToolItems, regionToolFor, type RegionEditTool } from './regionEditTools'
+ import { RegionToolGlyph } from './regionToolGlyphs'
+ 
+@@ -503,6 +506,10 @@ export type RegionEditFloatingControlsProps = {
+   onModelChange: (model: MaskEditModelId) => void
+   /** false → 整行下拉不渲染(未配置 Mivo Key;布局回落为「工具行在最上」的现状)。 */
+   showModelSelect: boolean
++  /** 「更多参数」当前档与回调(与模型下拉同一显示门:showModelSelect 为真才渲染)。
++   *  可选:存量调用方(如 RegionEditOverlay.test 的裸 props)不传时按默认档渲染。 */
++  params?: RegionEditParams
++  onParamsChange?: (next: RegionEditParams) => void
+   /** 后台任务在跑:发送键 aria/tooltip 三态选择器的最高优先分支——submitting=「取消请求」,
+    *  否则 assembling=「处理中」、空闲=「生成」(见下方 aria-label 三元链;「退出」文案键不在本文件消费)。 */
+   submitting: boolean
+@@ -550,6 +557,8 @@ export function RegionEditFloatingControls({
+   model,
+   onModelChange,
+   showModelSelect,
++  params,
++  onParamsChange,
+   submitting,
+   assembling,
+   frozen,
+@@ -590,11 +599,21 @@ export function RegionEditFloatingControls({
+   // 交互边界逐项随迁:两块都带 data-canvas-ui="true"(缺了它点面板会被当成点画布 →
+   // 点外取消把面板关掉)与 onPointerDown stopPropagation;冻结门/点外关闭/Esc 都作用在
+   // 整个浮层(父层按 regionEditNodeId 卸载,与块数无关)。
++  //
++  // 二级浮层(出图参数)展开时,输入面板要临时抬到工具面板之上:两块共用一条
++  // `z-index: 1` 的规则,输入面板因此是独立层叠上下文,子层无论多高都翻不出去,
++  // 而工具面板 DOM 在后 → 恒压住它(owner 2026-08-11 连续两轮实测)。
++  const [paramsOpen, setParamsOpen] = useState(false)
++
+   return (
+     <div className="image-mask-edit-floating-layer" data-canvas-ui="true">
+       <div
+         ref={toolbarRef}
+-        className="image-mask-edit-prompt region-edit-panel region-edit-input-panel"
++        className={
++          paramsOpen
++            ? 'image-mask-edit-prompt region-edit-panel region-edit-input-panel has-open-popover'
++            : 'image-mask-edit-prompt region-edit-panel region-edit-input-panel'
++        }
+         data-canvas-ui="true"
+         style={{ left: layout.left, top: layout.toolbarTop, width: layout.width }}
+         onPointerDown={(event) => event.stopPropagation()}
+@@ -669,6 +688,17 @@ export function RegionEditFloatingControls({
+                   label={t('menu.maskEdit.modelLabel')}
+                 />
+               ) : null}
++              {/* 「更多参数」:与模型下拉同一道显示门 —— 参数档位是分模型的,模型都
++                  不让选时露出参数只会让用户困惑(2026-08-11 与 owner 对齐)。 */}
++              {showModelSelect && params && onParamsChange ? (
++                <RegionEditParamsSelect
++                  model={model}
++                  params={params}
++                  disabled={frozen}
++                  onChange={onParamsChange}
++                  onOpenChange={setParamsOpen}
++                />
++              ) : null}
+               {/* 生成进行中时这颗按钮**自己变成「取消请求」**(K7 ④:原来由 ✕ 承担,✕ 已删):
+                   submitting → 可点,点它走 onCancel(与老 ✕ 的取消语义逐字相同);
+                   assembling(装配标注图那一小段)→ 维持禁用文案「处理中」,那段没有可取消的
+diff --git a/src/canvas/regionEditRatioIcon.tsx b/src/canvas/regionEditRatioIcon.tsx
+new file mode 100644
+index 00000000..96d82f85
+--- /dev/null
++++ b/src/canvas/regionEditRatioIcon.tsx
+@@ -0,0 +1,51 @@
++// src/canvas/regionEditRatioIcon.tsx
++// 比例选项的形状图标:一枚按目标宽高比缩放的空心矩形(参考 Cindy 生图面板的比例组)。
++// 纯几何,不引图标库 —— lucide 没有「任意比例矩形」这种按数据变形的图标。
++//
++// 尺寸策略:长边固定 14px,短边按比例推算,最小 5px(21:9 的短边算出来才 6px,
++// 再小就看不出是矩形了)。这样一排图标视觉重量一致,又能一眼看出横竖与胖瘦。
++
++type RatioIconProps = {
++  /** 形如 '16:9' / '1:1';解析失败按 1:1 画(不抛错,UI 不因脏值崩)。 */
++  ratio: string
++  /** 「原比例」专用:四角取景框 = 跟随源图、形状不定(owner 2026-08-11 指定造型)。 */
++  dashed?: boolean
++}
++
++const LONG = 14
++const MIN_SHORT = 5
++
++export function RegionEditRatioIcon({ ratio, dashed }: RatioIconProps) {
++  const [rawW, rawH] = ratio.split(':').map((part) => Number(part))
++  const w = Number.isFinite(rawW) && rawW > 0 ? rawW : 1
++  const h = Number.isFinite(rawH) && rawH > 0 ? rawH : 1
++  const landscape = w >= h
++  const short = Math.max(MIN_SHORT, Math.round((LONG * Math.min(w, h)) / Math.max(w, h)))
++  const width = landscape ? LONG : short
++  const height = landscape ? short : LONG
++
++  // 外层是**固定 16×16 的等高框**,形状只在框内变化:各项图标占位一致,下面的文字
++  // 才能对齐(owner 2026-08-11 实测:图标高度不一 → 2:3 / 3:2 / 4:5 的文字错位)。
++  if (dashed) {
++    // 「原比例」= 四角取景框(owner 指定):只画四个角,表达「按源图取景、形状不定」,
++    // 比虚线矩形干净得多。用 SVG 而不是 CSS 拼边,线端与圆角才可控。
++    return (
++      <span className="region-edit-ratio-icon-box" aria-hidden="true">
++        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" className="region-edit-ratio-corners">
++          <path
++            d="M1 5V2.5A1.5 1.5 0 0 1 2.5 1H5M9 1h2.5A1.5 1.5 0 0 1 13 2.5V5M13 9v2.5a1.5 1.5 0 0 1-1.5 1.5H9M5 13H2.5A1.5 1.5 0 0 1 1 11.5V9"
++            stroke="currentColor"
++            strokeWidth="1.4"
++            strokeLinecap="round"
++          />
++        </svg>
++      </span>
++    )
++  }
++
++  return (
++    <span className="region-edit-ratio-icon-box" aria-hidden="true">
++      <span className="region-edit-ratio-icon" style={{ width: `${width}px`, height: `${height}px` }} />
++    </span>
++  )
++}
+diff --git a/src/canvas/regionEditState.ts b/src/canvas/regionEditState.ts
+index a5b229a8..57e4675b 100644
+--- a/src/canvas/regionEditState.ts
++++ b/src/canvas/regionEditState.ts
+@@ -8,6 +8,7 @@
+ //   undo/redo 必须把 body 一起回滚,否则引用静默指错区域(生成错误提示词);
+ //   但用户此后编辑过输入框时跳过 body 回滚,不吞用户输入。
+ import { buildRegionEditSubmission } from './regionEditSubmit'
++import type { RegionEditParams } from './regionEditParams'
+ import { debugLogger } from '../store/debugLogStore'
+ import {
+   appendRegionRefToBody,
+@@ -212,6 +213,7 @@ export const requestRegionEditSubmit = async ({
+   naturalSize,
+   resolvedAssetUrl,
+   model,
++  params,
+   onSubmit,
+   claimSubmit,
+ }: {
+@@ -221,6 +223,8 @@ export const requestRegionEditSubmit = async ({
+   resolvedAssetUrl: string
+   /** 用户在面板里选的出图模型(K1 Task 2),原样透传给装配器 → payload.model。 */
+   model: MaskEditModelId
++  /** 「更多参数」面板的画质/比例/张数,同样原样透传。缺省 = 该模型默认档。 */
++  params?: RegionEditParams
+   onSubmit: (payload: ImageMaskSubmitPayload) => Promise<void>
+   /** 认领提交权(浮层的冻结闸提供):false = 装配期间已被取消。**必填** —— 可选参
+    *  「缺省放行」是 fail-open,漏传就静默退回无保护提交;必填让 tsc 直接拦(J9 Task 2)。 */
+@@ -235,7 +239,7 @@ export const requestRegionEditSubmit = async ({
+     'Region Edit',
+     regions.length ? `提交区域编辑:${regions.length} 个区域` : '提交区域编辑:零选区(纯文字指令,整图改图)',
+   )
+-  const payload = await buildRegionEditSubmission({ body, regions, naturalSize, resolvedAssetUrl, model })
++  const payload = await buildRegionEditSubmission({ body, regions, naturalSize, resolvedAssetUrl, model, params })
+   if (!claimSubmit()) {
+     debugLogger.warn('Region Edit', '装配快照已丢弃:装配完成前浮层已退出/被取消,不提交')
+     return 'aborted'
+diff --git a/src/canvas/regionEditTheme.test.ts b/src/canvas/regionEditTheme.test.ts
+index 162d0452..16a21e9a 100644
+--- a/src/canvas/regionEditTheme.test.ts
++++ b/src/canvas/regionEditTheme.test.ts
+@@ -210,8 +210,27 @@ describe('region-edit L1 — 下拉去框 + 报错条圆角(两条都靠不了
+     ]) {
+       expect(rule, `自绘下拉面板缺少 ${declaration}(与 .region-edit-suggest 同源)`).toContain(declaration)
+     }
+-    // 皮肤层:两层浮层写在同一条规则里(成组选择器),抬升不可能只给一半
+-    expect(themeCss).toMatch(/\.region-edit-suggest,\s*\n\.region-edit-model-menu \{/)
++    // 皮肤层:同族浮层写在同一条规则里(成组选择器),抬升不可能只给一部分。
++    // 2026-08-11 加入 params-menu(「更多参数」):它漏在组外时,插件暗色下参数面板
++    // 比模型下拉浅一档 —— owner 实测截图确认,正是本条不变量要防的 K9 同族坑。
++    // 双向守卫:从 App.css 中枚举全部 `region-edit-*-menu` 浮层,要求它们都出现在
++    // 主题抬升组里。旧版在枚举后又 filter 回 model/params 两项硬编码 —— 看似动态、
++    // 实则新增第三个菜单仍全绿(F-A2R2-1 变异实证),比普通漏测更危险。
++    // 需要排除的非同族菜单必须进**排除表**并写理由,不能用包含表把新成员静默过滤掉。
++    const allMenus = [...new Set(
++      [...appCss.matchAll(/\.([a-z0-9-]*region-edit-[a-z0-9-]*menu)\b/g)].map((m) => m[1]),
++    )]
++    const excludedMenus = new Set<string>([
++      // 当前无排除项。将来若出现工具/右键菜单,需在此逐项登记并说明为何不与下拉同档抬升。
++    ])
++    const expected = allMenus.filter((name) => !excludedMenus.has(name))
++    const groupStart = themeCss.indexOf('.region-edit-suggest,')
++    expect(groupStart, '找不到同族浮层主题抬升组').toBeGreaterThan(0)
++    const groupRule = themeCss.slice(groupStart, themeCss.indexOf('}', groupStart))
++    for (const name of expected) {
++      expect(groupRule, `同族浮层 .${name} 必须进入主题抬升成组选择器`).toContain(`.${name}`)
++    }
++    expect(groupRule).toContain('background: color-mix')
+   })
+ 
+   // L2 ③ + L2-F1:抬层是一根**跷跷板**,两头分时成立,守卫必须同时钉住两头。
+diff --git a/src/canvas/regionRefSuggestState.test.ts b/src/canvas/regionRefSuggestState.test.ts
+index 2eec66a5..d0dc7067 100644
+--- a/src/canvas/regionRefSuggestState.test.ts
++++ b/src/canvas/regionRefSuggestState.test.ts
+@@ -198,12 +198,21 @@ describe('regionEditorKeyPlan — 富文本宿主上的按键归属(批次F 回
+     expect(regionEditorKeyPlan('Escape', true, true)).toBe('escape')
+   })
+ 
+-  it('下拉关着:Esc 归浮层分级、Enter 归编辑器拦截、Backspace 归芯片整删', () => {
++  it('下拉关着:Esc 归浮层分级、Enter 提交、Backspace 归芯片整删', () => {
+     expect(regionEditorKeyPlan('Escape', false, false)).toBe('escape')
+-    expect(regionEditorKeyPlan('Enter', false, false)).toBe('block-enter')
++    // 2026-08-11:'block-enter' → 'submit'。语义从「只拦换行」变成「拦换行 + 提交」——
++    // 拦截仍在(contentEditable 的块级包装会破坏 body 序列化),只是拦完顺带发出去。
++    // 旧行为让回车成了哑键(owner 实测「敲回车不触发发送」)。
++    expect(regionEditorKeyPlan('Enter', false, false)).toBe('submit')
+     expect(regionEditorKeyPlan('Backspace', false, false)).toBe('chip-delete')
+   })
+ 
++  // IME 合成态的回车是输入法在确认候选词,必须放行给浏览器 —— 若也判成 submit,
++  // 中文用户选词那一下就会把半成品指令提交出去。
++  it('IME 合成中的 Enter 仍然放行,不提交', () => {
++    expect(regionEditorKeyPlan('Enter', true, false)).toBe('passthrough')
++  })
++
+   it('下拉开着时 Backspace 不被下拉吃掉(芯片整删照旧可用)', () => {
+     expect(regionEditorKeyPlan('Backspace', false, true)).toBe('chip-delete')
+   })
+diff --git a/src/canvas/regionRefSuggestState.ts b/src/canvas/regionRefSuggestState.ts
+index 51051978..00187c4b 100644
+--- a/src/canvas/regionRefSuggestState.ts
++++ b/src/canvas/regionRefSuggestState.ts
+@@ -97,7 +97,7 @@ export const activeRegionRefSuggestItem = (state: RegionRefSuggestState): Region
+  *
+  * 优先级:下拉开着时它先拿(方向键/确认/关闭),其余才归编辑器自己(拦回车、芯片整删)。
+  */
+-export type RegionEditorKeyPlan = 'suggest' | 'escape' | 'block-enter' | 'chip-delete' | 'passthrough'
++export type RegionEditorKeyPlan = 'suggest' | 'escape' | 'submit' | 'chip-delete' | 'passthrough'
+ 
+ export const regionEditorKeyPlan = (
+   key: string,
+@@ -110,8 +110,10 @@ export const regionEditorKeyPlan = (
+     if ((key === 'Enter' || key === 'Tab' || key === 'Escape') && !composing) return 'suggest'
+   }
+   if (key === 'Escape') return 'escape'
+-  // 回车会在 contentEditable 里插块级包装、破坏序列化;IME 合成态不拦(拦了输入法卡住)。
+-  if (key === 'Enter') return composing ? 'passthrough' : 'block-enter'
++  // 回车会在 contentEditable 里插块级包装、破坏序列化,所以必须拦;拦下之后**顺带提交**
++  // (owner 2026-08-11 实测「敲回车不触发发送」—— 旧实现拦完就没下文,回车成了哑键)。
++  // IME 合成态不拦:那一下是输入法在确认候选词,拦了输入法会卡住。
++  if (key === 'Enter') return composing ? 'passthrough' : 'submit'
+   if (key === 'Backspace') return 'chip-delete'
+   return 'passthrough'
+ }
+diff --git a/src/canvas/useRegionEditKeyboard.test.tsx b/src/canvas/useRegionEditKeyboard.test.tsx
+index f1441e10..9ff857f9 100644
+--- a/src/canvas/useRegionEditKeyboard.test.tsx
++++ b/src/canvas/useRegionEditKeyboard.test.tsx
+@@ -12,12 +12,12 @@ import { act } from 'react'
+ import { createRoot, type Root } from 'react-dom/client'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+-// 让行门的两枚探针都可控:菜单恒关,模型下拉由 modelMenuOpen 这面旗控制
++// 让行门的两枚探针都可控:菜单恒关,模型下拉由 controlMenuOpen 这面旗控制
+ // (真实实现按 DOM 选择器查,这里不必挂真面板 —— 门的行为才是被测对象)。
+-let modelMenuOpen = false
++let controlMenuOpen = false
+ vi.mock('../lib/menuOverlayStack', () => ({
+   isContextMenuOpen: () => false,
+-  isRegionEditModelMenuOpen: () => modelMenuOpen,
++  isRegionEditControlMenuOpen: () => controlMenuOpen,
+ }))
+ 
+ import { useRegionEditKeyboard } from './useRegionEditKeyboard'
+@@ -109,7 +109,7 @@ describe('useRegionEditKeyboard — 控件聚焦时让行(M3)', () => {
+   // 自绘面板后 event.target 是 BUTTON(刻意不算控件),不显式让行就会:Esc 去清选中
+   // 选区、Backspace 去删选区、Cmd+Z 去撤销,而不是关下拉。
+   it('自绘模型下拉开着时:三键都不触发画布动作、也不被拦', () => {
+-    modelMenuOpen = true
++    controlMenuOpen = true
+     try {
+       const events = threeKeys(targetEl(document.createElement('button')))
+       expect(removeRegion).not.toHaveBeenCalled()
+@@ -117,7 +117,7 @@ describe('useRegionEditKeyboard — 控件聚焦时让行(M3)', () => {
+       expect(clearSelection).not.toHaveBeenCalled()
+       expect(events.map((event) => event.defaultPrevented)).toEqual([false, false, false])
+     } finally {
+-      modelMenuOpen = false
++      controlMenuOpen = false
+     }
+   })
+ 
+diff --git a/src/canvas/useRegionEditKeyboard.ts b/src/canvas/useRegionEditKeyboard.ts
+index 9782a3b6..6e7f494f 100644
+--- a/src/canvas/useRegionEditKeyboard.ts
++++ b/src/canvas/useRegionEditKeyboard.ts
+@@ -5,7 +5,7 @@
+ // 两条都读 frozenRef(**实时**冻结值,不是渲染镜像):装配一开始就同步置真,键盘从那一
+ // 刻起再也改不了 regions/body(J6 R3-NEW-02 的不变量)。
+ import { useEffect } from 'react'
+-import { isContextMenuOpen, isRegionEditModelMenuOpen } from '../lib/menuOverlayStack'
++import { isContextMenuOpen, isRegionEditControlMenuOpen } from '../lib/menuOverlayStack'
+ 
+ type RegionEditKeyboardOptions = {
+   /** 实时冻结值(submitting || assembling)。 */
+@@ -56,7 +56,7 @@ export function useRegionEditKeyboard({
+   useEffect(() => {
+     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+       if (frozenRef.current) return
+-      if (isTextEntry(event.target) || isRegionEditModelMenuOpen()) return
++      if (isTextEntry(event.target) || isRegionEditControlMenuOpen()) return
+       if (event.key === 'Delete' || event.key === 'Backspace') {
+         if (selectedIndexRef.current == null) return
+         event.preventDefault()
+@@ -83,7 +83,7 @@ export function useRegionEditKeyboard({
+       // R6(menuOverlayStack)菜单优先门:本 handler 今天只管 Cmd/Ctrl+Z,这道门钉住
+       // 未来加 Escape 分支时也不能在菜单开着的同帧清下层状态。
+       if (isContextMenuOpen() && event.key === 'Escape') return
+-      if (isRegionEditModelMenuOpen()) return
++      if (isRegionEditControlMenuOpen()) return
+       if (frozenRef.current) return
+       if (event.key.toLowerCase() !== 'z' || !(event.metaKey || event.ctrlKey)) return
+       if (isTextEntry(event.target)) return
+diff --git a/src/canvas/useRegionEditParams.test.tsx b/src/canvas/useRegionEditParams.test.tsx
+new file mode 100644
+index 00000000..6ebef1f9
+--- /dev/null
++++ b/src/canvas/useRegionEditParams.test.tsx
+@@ -0,0 +1,168 @@
++// @vitest-environment happy-dom
++// A2 R2 席③ UP-1-reuse:clampRegionEditParams 纯函数有测试 ≠ hook 接线已测。
++// 本文件真挂载 hook，覆盖 model effect / paramsRef / 日志与用户 setParams 路径。
++import { act, useEffect, useRef } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.mock('../store/debugLogStore', () => ({ debugLogger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() } }))
++
++import { debugLogger } from '../store/debugLogStore'
++import { regionEditDefaultParams, type RegionEditParams } from './regionEditParams'
++import { useRegionEditParams } from './useRegionEditParams'
++import type { MaskEditModelId } from './imageMaskGeometry'
++
++let api: ReturnType<typeof useRegionEditParams>
++let firstRenderParams: RegionEditParams | null
++let container: HTMLDivElement
++let root: Root
++
++function Harness({ model, initial }: { model: MaskEditModelId; initial?: RegionEditParams }) {
++  const value = useRegionEditParams(model, initial)
++  // **渲染期**捕获首次渲染的 params(模型 effect 跑之前)——锁定「初始化器已 clamp」,
++  // 不被模型 effect 首挂载的兜底收敛掩盖(那会让变异 B 假绿)。写 ref 是 render 期允许的
++  // 缓存模式;外部断言变量只在 effect 里赋值(render 期写外部变量会触发 eslint 违规)。
++  const firstRenderRef = useRef<RegionEditParams | null>(null)
++  if (firstRenderRef.current === null) firstRenderRef.current = value.params
++  useEffect(() => {
++    api = value
++    firstRenderParams = firstRenderRef.current
++  }, [value])
++  return null
++}
++
++const render = (model: MaskEditModelId, initial?: RegionEditParams) =>
++  act(() => root.render(<Harness model={model} initial={initial} />))
++
++beforeEach(() => {
++  ;(globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++  vi.mocked(debugLogger.log).mockClear()
++  vi.mocked(debugLogger.warn).mockClear()
++  container = document.createElement('div')
++  document.body.appendChild(container)
++  root = createRoot(container)
++})
++afterEach(() => {
++  act(() => root.unmount())
++  container.remove()
++})
++
++describe('useRegionEditParams — 模型切换收敛接线', () => {
++  it('NANO 4:3 + 4K → 切 GPT 后比例回 source、画质回 medium，并 warn 一次', () => {
++    render('gemini-3-pro-image')
++    act(() => api.setParams({ quality: { kind: 'resolution', value: '4K' }, ratio: '4:3', count: 4 }))
++    vi.mocked(debugLogger.warn).mockClear()
++
++    render('gpt-image-2')
++    expect(api.params).toEqual({ quality: { kind: 'quality', value: 'medium' }, ratio: 'source', count: 4 })
++    expect(debugLogger.warn).toHaveBeenCalledTimes(1)
++    expect(String(vi.mocked(debugLogger.warn).mock.calls[0][1])).toContain('出图参数随模型收敛')
++  })
++
++  it('两模型都支持的比例不被覆盖；只收敛 quality kind', () => {
++    render('gemini-3-pro-image')
++    act(() => api.setParams({ quality: { kind: 'resolution', value: '2K' }, ratio: '16:9', count: 2 }))
++    render('gpt-image-2')
++    expect(api.params.ratio).toBe('16:9')
++    expect(api.params.quality).toEqual({ kind: 'quality', value: 'medium' })
++    expect(api.params.count).toBe(2)
++  })
++
++  it('同模型重复渲染无需收敛，不改状态、不误报 warn', () => {
++    render('gemini-3-pro-image')
++    const before = api.params
++    vi.mocked(debugLogger.warn).mockClear()
++    render('gemini-3-pro-image')
++    expect(api.params).toBe(before)
++    expect(debugLogger.warn).not.toHaveBeenCalled()
++  })
++})
++
++describe('useRegionEditParams — 同模型脏 initial 初挂载收敛(Greptile P1 追加)', () => {
++  it('同模型脏 initial(非法 ratio/kind/value)→ 首帧即 clamp 到合法域,不直发平台', () => {
++    // NANO 模型塞 GPT 的 quality kind + NANO 白名单外的比例:挂载期就要收敛,
++    // 不能等「切模型 effect」——同模型重开不切模型,脏值会原样进提交。
++    // count 是合法值(张数与模型无关,clamp 不改它),只收敛 ratio/quality。
++    // 断言**首帧渲染值**(firstRenderParams,模型 effect 跑之前):去掉初始化器 clamp,
++    // 首帧就是脏值,本条转红 —— 模型 effect 首挂载的兜底收敛不会让这条假绿。
++    // ratio 用 '7:9'(非白名单档)模拟脏值,类型上以 unknown 断言绕过合法类型。
++    const dirty = { quality: { kind: 'quality', value: 'high' }, ratio: '7:9', count: 2 } as unknown as RegionEditParams
++    render('gemini-3-pro-image', dirty)
++    expect(firstRenderParams).toEqual({ quality: { kind: 'resolution', value: '2K' }, ratio: 'source', count: 2 })
++  })
++
++  it('初挂载被收敛 → mounted effect 一次性 warn,不在 render 期写 logger', () => {
++    const dirty = { quality: { kind: 'quality', value: 'high' }, ratio: '7:9', count: 2 } as unknown as RegionEditParams
++    render('gemini-3-pro-image', dirty)
++    expect(debugLogger.warn).toHaveBeenCalledTimes(1)
++    expect(String(vi.mocked(debugLogger.warn).mock.calls[0][1])).toContain('草稿参数不在当前模型合法域,已收敛回落默认')
++    // 不重复:同模型再渲染不刷第二条
++    vi.mocked(debugLogger.warn).mockClear()
++    render('gemini-3-pro-image')
++    expect(debugLogger.warn).not.toHaveBeenCalled()
++  })
++
++  it('合法 initial 初挂载不收敛 → 不 warn', () => {
++    const ok: RegionEditParams = { quality: { kind: 'resolution', value: '4K' }, ratio: '4:3', count: 4 }
++    render('gemini-3-pro-image', ok)
++    expect(api.params).toEqual(ok)
++    expect(debugLogger.warn).not.toHaveBeenCalled()
++  })
++
++  it('无 initial(旧 draft 无 params)→ 默认值,不 warn', () => {
++    render('gemini-3-pro-image')
++    expect(api.params).toEqual(regionEditDefaultParams('gemini-3-pro-image'))
++    expect(debugLogger.warn).not.toHaveBeenCalled()
++  })
++})
++
++describe('useRegionEditParams — 用户 setParams 日志', () => {
++  it('只记录实际变化项；相同值不写日志也不更新引用', () => {
++    render('gemini-3-pro-image')
++    const before = api.params
++    act(() => api.setParams(before))
++    expect(debugLogger.log).not.toHaveBeenCalled()
++    expect(api.params).toBe(before)
++
++    const next: RegionEditParams = { ...before, count: 4 }
++    act(() => api.setParams(next))
++    expect(api.params).toBe(next)
++    expect(debugLogger.log).toHaveBeenCalledTimes(1)
++    expect(String(vi.mocked(debugLogger.log).mock.calls[0][1])).toContain('生成数量:4张')
++    expect(debugLogger.warn).not.toHaveBeenCalled()
++  })
++})
++
++// PR #630 P1:草稿恢复入口 —— initial 只在首次挂载生效,之后由 setParams / 模型收敛
++// effect 接管;无 initial 时回落模型默认值;草稿参数与新模型不兼容时收敛不豁免。
++describe('useRegionEditParams — 草稿恢复入口(PR #630 P1)', () => {
++  it('有 initial 时初始 params 取草稿值而非模型默认', () => {
++    const fromDraft: RegionEditParams = { quality: { kind: 'resolution', value: '4K' }, ratio: '4:3', count: 4 }
++    render('gemini-3-pro-image', fromDraft)
++    expect(api.params).toEqual(fromDraft)
++  })
++
++  it('无 initial 时回落模型默认值(回归)', () => {
++    render('gemini-3-pro-image')
++    expect(api.params).toEqual(regionEditDefaultParams('gemini-3-pro-image'))
++  })
++
++  it('草稿参数与新模型不兼容 → 模型收敛 effect 收敛 + warn(initial 不豁免收敛)', () => {
++    render('gemini-3-pro-image', { quality: { kind: 'resolution', value: '4K' }, ratio: '4:3', count: 4 })
++    vi.mocked(debugLogger.warn).mockClear()
++    render('gpt-image-2')
++    expect(api.params).toEqual({ quality: { kind: 'quality', value: 'medium' }, ratio: 'source', count: 4 })
++    expect(debugLogger.warn).toHaveBeenCalledTimes(1)
++    expect(String(vi.mocked(debugLogger.warn).mock.calls[0][1])).toContain('出图参数随模型收敛')
++  })
++
++  it('草稿参数与新模型比例域兼容时比例/张数不被覆盖(仅 quality kind 随模型收敛)', () => {
++    render('gemini-3-pro-image', { quality: { kind: 'resolution', value: '2K' }, ratio: '16:9', count: 2 })
++    vi.mocked(debugLogger.warn).mockClear()
++    render('gpt-image-2')
++    expect(api.params.ratio).toBe('16:9')
++    expect(api.params.count).toBe(2)
++    expect(api.params.quality).toEqual({ kind: 'quality', value: 'medium' })
++    expect(debugLogger.warn).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/src/canvas/useRegionEditParams.ts b/src/canvas/useRegionEditParams.ts
+new file mode 100644
+index 00000000..e6fc7059
+--- /dev/null
++++ b/src/canvas/useRegionEditParams.ts
+@@ -0,0 +1,98 @@
++// src/canvas/useRegionEditParams.ts
++// 「更多参数」的状态与日志。与 useRegionEditModelChoice 并列:那个管模型,这个管
++// 画质/比例/张数,两者通过 model 联动 —— 换模型时参数要收敛到新模型的合法域。
++//
++// 日志按 docs/development-logging.md:参数变更是「会改变后续出图结果」的用户动作,
++// 逐次记 debugLogger.log;收敛(用户没主动改却被系统改掉的档)记 warn,因为那是
++// 跳过/降级路径,用户看到的选中态会变,必须留痕。
++import { useCallback, useEffect, useRef, useState } from 'react'
++
++import { debugLogger } from '../store/debugLogStore'
++import { regionEditModelName } from './regionEditModel'
++import {
++  REGION_EDIT_RATIO_SOURCE,
++  clampRegionEditParams,
++  isSameRegionEditQuality,
++  regionEditDefaultParams,
++  regionEditParamsSummary,
++  type RegionEditParams,
++} from './regionEditParams'
++import type { MaskEditModelId } from './imageMaskGeometry'
++
++const ratioText = (params: RegionEditParams): string =>
++  params.ratio === REGION_EDIT_RATIO_SOURCE ? '保持原比例' : params.ratio
++
++/** 只报真正变了的那一项,避免每次点击刷三条无差别日志。 */
++const diffText = (prev: RegionEditParams, next: RegionEditParams, model: MaskEditModelId): string | null => {
++  if (!isSameRegionEditQuality(prev.quality, next.quality)) {
++    const label = regionEditParamsSummary(next, model).split(' · ')[1]
++    return `画质:${label}`
++  }
++  if (prev.ratio !== next.ratio) return `比例:${ratioText(next)}`
++  if (prev.count !== next.count) return `生成数量:${next.count}张`
++  return null
++}
++
++export function useRegionEditParams(model: MaskEditModelId, initial?: RegionEditParams): {
++  params: RegionEditParams
++  setParams: (next: RegionEditParams) => void
++} {
++  // 草稿恢复入口(PR #630 P1):浮层重开时把用户上次选过的非默认参数原样带回来,
++  // 不回落模型默认值;无草稿时走模型默认。**初始化器里先 clamp 一次**(Greptile P1 追加):
++  // 草稿可能是为别的模型存的/被写进脏值(非法 ratio/kind/value),首帧就必须收敛到当前
++  // 模型合法域 —— 同模型重开不触发「切模型 effect」,不在这里收敛脏值会原样进提交。
++  // 收敛是纯函数,不写日志;收敛留痕由下方 mounted effect 一次性记(不在 render 期写 logger)。
++  const [params, setParamsState] = useState<RegionEditParams>(() => {
++    const base = initial ?? regionEditDefaultParams(model)
++    return clampRegionEditParams(base, model)
++  })
++  // 初挂载时 initial 被收敛过 → 记一次 warn(跳过/降级路径留痕;用户没主动改但选中态变了)。
++  // 放 effect 而不是初始化器/updater:渲染期写 debugLogStore 会触发「渲染 A 时更新 B」
++  // 的 React 报错(#489 实测),且 StrictMode dev 双调不会重复记。
++  const initialClampedRef = useRef<RegionEditParams>(initial ? clampRegionEditParams(initial, model) : initial)
++  useEffect(() => {
++    const clamped = initialClampedRef.current
++    if (clamped && clamped !== initial) {
++      debugLogger.warn('Region Edit', '草稿参数不在当前模型合法域,已收敛回落默认')
++    }
++  }, [])
++  // 与 useRegionEditModelChoice 同款:日志写在事件回调/effect 里,不在 setState updater
++  // 里 —— updater 跑在渲染阶段,写 debugLogStore 会触发「渲染 A 时更新 B」的 React 报错
++  // (#489 实测,e2e 的 console-error 门当场判红)。
++  const paramsRef = useRef(params)
++
++  const setParams = useCallback(
++    (next: RegionEditParams) => {
++      const prev = paramsRef.current
++      const changed = diffText(prev, next, model)
++      if (!changed) return
++      paramsRef.current = next
++      debugLogger.log('Region Edit', `出图参数调整:${changed}`)
++      setParamsState(next)
++    },
++    [model],
++  )
++
++  // 模型变了 → 收敛参数。画质档在两模型间是两套参数(resolution vs quality),比例域
++  // 也不同,不收敛会把非法档发给平台。被改掉的项记 warn(用户没主动改,但选中态变了)。
++  useEffect(() => {
++    const current = paramsRef.current
++    const clamped = clampRegionEditParams(current, model)
++    if (clamped === current) return
++    const qualityChanged = !isSameRegionEditQuality(clamped.quality, current.quality)
++    const ratioChanged = clamped.ratio !== current.ratio
++    if (!qualityChanged && !ratioChanged) return
++    paramsRef.current = clamped
++    setParamsState(clamped)
++    const parts = [
++      qualityChanged ? '画质档' : '',
++      ratioChanged ? `比例(${ratioText(current)} 该模型不支持)` : '',
++    ].filter(Boolean)
++    debugLogger.warn(
++      'Region Edit',
++      `出图参数随模型收敛:${regionEditModelName(model)} → ${parts.join('、')}回落默认`,
++    )
++  }, [model])
++
++  return { params, setParams }
++}
+diff --git a/src/canvas/useRegionRefEditor.ts b/src/canvas/useRegionRefEditor.ts
+index c6bedafa..45fbe7e8 100644
+--- a/src/canvas/useRegionRefEditor.ts
++++ b/src/canvas/useRegionRefEditor.ts
+@@ -46,6 +46,7 @@ export function useRegionRefEditor({
+   suggestOpen,
+   onSuggestKey,
+   onEscape,
++  onSubmitKey,
+   onChipHover,
+   onChipSelect,
+ }: {
+@@ -66,6 +67,9 @@ export function useRegionRefEditor({
+   onSuggestKey: (event: ReactKeyboardEvent<HTMLDivElement>) => void
+   /** 下拉关着时的 Escape(浮层 Esc 分级)。 */
+   onEscape: (event: ReactKeyboardEvent<HTMLDivElement>) => void
++  /** 回车提交(下拉关着、非 IME 合成态)。换行已在编辑器内拦掉,这里只管发。
++   *  可选:不给就退回「只拦换行不提交」的旧行为,不会误触发。 */
++  onSubmitKey?: () => void
+   /** 点/悬停内嵌芯片 → 联动画布选区(独立芯片行摘除后,这两个交互挪到芯片本体上)。 */
+   onChipHover: (index?: number) => void
+   onChipSelect: (index: number) => void
+@@ -308,8 +312,10 @@ export function useRegionRefEditor({
+         onEscape(event)
+         return
+       }
+-      if (plan === 'block-enter') {
++      if (plan === 'submit') {
++        // 先拦掉 contentEditable 的换行插入(块级包装会破坏 body 序列化),再提交。
+         event.preventDefault()
++        onSubmitKey?.()
+         return
+       }
+       if (plan === 'chip-delete') {
+@@ -320,7 +326,7 @@ export function useRegionRefEditor({
+         onBodyChange(removal.body, removal.caret)
+       }
+     },
+-    [annotations, onBodyChange, onEscape, onSuggestKey, readBody, readCaret, renderBody, suggestOpen],
++    [annotations, onBodyChange, onEscape, onSubmitKey, onSuggestKey, readBody, readCaret, renderBody, suggestOpen],
+   )
+ 
+   /**
+diff --git a/src/i18n/locales/en/menu.json b/src/i18n/locales/en/menu.json
+index 5c97dd4f..af52388e 100644
+--- a/src/i18n/locales/en/menu.json
++++ b/src/i18n/locales/en/menu.json
+@@ -261,6 +261,14 @@
+     "describeWithRefs": "Describe the edit… mark an area, then @ it to target that area; when marking with Point select, name what to change (e.g. remove the bell)",
+     "modelLabel": "Model",
+     "modelWithValue": "Model: {{value}}",
++    "paramsLabel": "Generation settings",
++    "paramsWithValue": "Generation settings: {{value}}",
++    "qualityLabel": "Quality",
++    "ratioLabel": "Aspect ratio",
++    "countLabel": "Number of images",
++    "sourceRatio": "Original",
++    "slowGeneration": "Slower generation",
++    "countValue": "{{count}}",
+     "editing": "Generating…",
+     "imageTooLarge": "Image size {{width}} x {{height}} is too large — import a lower-resolution version before AI editing."
+   },
+diff --git a/src/i18n/locales/ja/menu.json b/src/i18n/locales/ja/menu.json
+index 24b1aeda..d845d969 100644
+--- a/src/i18n/locales/ja/menu.json
++++ b/src/i18n/locales/ja/menu.json
+@@ -260,6 +260,14 @@
+     "describeWithRefs": "編集内容を入力…領域をマークして @ で参照すればその領域だけ修正でき、「クリック選択」でマークした場合は変更対象を明記してください（例：鈴を消す）",
+     "modelLabel": "生成モデル",
+     "modelWithValue": "生成モデル：{{value}}",
++    "paramsLabel": "生成設定",
++    "paramsWithValue": "生成設定：{{value}}",
++    "qualityLabel": "画質",
++    "ratioLabel": "縦横比",
++    "countLabel": "生成枚数",
++    "sourceRatio": "元の比率",
++    "slowGeneration": "生成に時間がかかります",
++    "countValue": "{{count}}枚",
+     "editing": "生成中...",
+     "imageTooLarge": "画像サイズ {{width}} x {{height}} が大きすぎます。AI編集には低解像度版をインポートしてください。"
+   },
+diff --git a/src/i18n/locales/ko/menu.json b/src/i18n/locales/ko/menu.json
+index 2615bb0d..fd9eea7c 100644
+--- a/src/i18n/locales/ko/menu.json
++++ b/src/i18n/locales/ko/menu.json
+@@ -260,6 +260,14 @@
+     "describeWithRefs": "수정할 내용을 입력하세요… 영역을 표시한 뒤 @로 참조하면 해당 영역만 수정할 수 있고, ‘클릭 선택’으로 표시할 때는 바꿀 대상을 적어주세요(예: 방울 제거)",
+     "modelLabel": "생성 모델",
+     "modelWithValue": "생성 모델: {{value}}",
++    "paramsLabel": "생성 설정",
++    "paramsWithValue": "생성 설정: {{value}}",
++    "qualityLabel": "화질",
++    "ratioLabel": "화면 비율",
++    "countLabel": "생성 수량",
++    "sourceRatio": "원본 비율",
++    "slowGeneration": "생성이 느립니다",
++    "countValue": "{{count}}장",
+     "editing": "생성 중...",
+     "imageTooLarge": "이미지 크기 {{width}} x {{height}}가 너무 큽니다. AI 편집 전에 낮은 해상도 버전을 가져오세요."
+   },
+diff --git a/src/i18n/locales/zh-CN/menu.json b/src/i18n/locales/zh-CN/menu.json
+index dd64e157..41fcb8e4 100644
+--- a/src/i18n/locales/zh-CN/menu.json
++++ b/src/i18n/locales/zh-CN/menu.json
+@@ -260,6 +260,14 @@
+     "describeWithRefs": "描述要改什么…标记区域后可@它，针对该区域修改；用“点选”标记时，需写明修改对象（如：去除铃铛）",
+     "modelLabel": "出图模型",
+     "modelWithValue": "出图模型：{{value}}",
++    "paramsLabel": "出图参数",
++    "paramsWithValue": "出图参数：{{value}}",
++    "qualityLabel": "画质",
++    "ratioLabel": "比例",
++    "countLabel": "生成数量",
++    "sourceRatio": "原比例",
++    "slowGeneration": "生成较慢",
++    "countValue": "{{count}}张",
+     "editing": "生成中...",
+     "imageTooLarge": "图片尺寸 {{width}} x {{height}} 过大，AI 编辑请先导入较低分辨率版本。"
+   },
+diff --git a/src/lib/menuOverlayStack.contract.test.ts b/src/lib/menuOverlayStack.contract.test.ts
+index 1f46d54e..63efc4da 100644
+--- a/src/lib/menuOverlayStack.contract.test.ts
++++ b/src/lib/menuOverlayStack.contract.test.ts
+@@ -33,6 +33,7 @@ const CAPTURE_KEYDOWN_FILES = [
+   'canvas/ImageCropOverlay.tsx', // crop Enter/Escape(isContextMenuOpen 让行)
+   'canvas/ImageMaskEditOverlay.tsx', // Cmd/Ctrl+Z 撤销重做(装了菜单优先门)
+   'canvas/RegionEditModelSelect.tsx', // 自绘出图模型下拉 Escape(handleOverlayEscape);L2 ③
++  'canvas/RegionEditParamsSelect.tsx', // 「更多参数」浮层 Escape(handleOverlayEscape),同 L2 ③ 范式
+   'canvas/SelectionQuickToolbar.tsx', // 快捷条子菜单 Escape(handleOverlayEscape)
+   'canvas/TextFormatToolbar.tsx', // 文字条子菜单 Escape(handleOverlayEscape)
+   'canvas/useMaskPointArmed.ts', // mask 待放点 Escape(isContextMenuOpen 让行)
+diff --git a/src/lib/menuOverlayStack.ts b/src/lib/menuOverlayStack.ts
+index b4b2417b..76dfaf6f 100644
+--- a/src/lib/menuOverlayStack.ts
++++ b/src/lib/menuOverlayStack.ts
+@@ -17,10 +17,16 @@ export const isContextMenuOpen = (doc: QueryableDocument = document): boolean =>
+ // 原来那里是原生 <select>,靠 isTextEntry 的 SELECT 分支天然独占键盘;换成自绘面板后
+ // 这道让行必须显式补上,否则 Esc/Backspace 会被画布抢走(L2 ③ 的回归口)。
+ export const regionEditModelMenuSelector = '.region-edit-model-menu'
++export const regionEditParamsMenuSelector = '.region-edit-params-menu'
++/** 自绘的区域编辑控件都应独占键盘。维护 selector 时别只补一个调用点。 */
++export const regionEditControlMenuSelector = `${regionEditModelMenuSelector}, ${regionEditParamsMenuSelector}`
+ 
+ export const isRegionEditModelMenuOpen = (doc: QueryableDocument = document): boolean =>
+   Boolean(doc.querySelector(regionEditModelMenuSelector))
+ 
++export const isRegionEditControlMenuOpen = (doc: QueryableDocument = document): boolean =>
++  Boolean(doc.querySelector(regionEditControlMenuSelector))
++
+ type OverlayEscapeEvent = Pick<KeyboardEvent, 'key' | 'preventDefault' | 'stopImmediatePropagation'>
+ 
+ /**

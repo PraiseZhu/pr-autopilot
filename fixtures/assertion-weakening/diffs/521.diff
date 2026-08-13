@@ -1,0 +1,445 @@
+diff --git a/cindyplugin/src/__tests__/genOutcomeToast.test.ts b/cindyplugin/src/__tests__/genOutcomeToast.test.ts
+new file mode 100644
+index 00000000..2024e517
+--- /dev/null
++++ b/cindyplugin/src/__tests__/genOutcomeToast.test.ts
+@@ -0,0 +1,228 @@
++/**
++ * consumer 显码链路测试(SC v6 §3 A4.2/A4.3/A4.4/A4.7)。
++ *
++ * 断言穿过**真实** cindyGenerationPort + 真实 toastStore + 真实 i18n:回执上的结局码
++ * 必须变成用户看得见的 toast(级别、文案都对),且去重作用域是「每任务/每 batch」——
++ * 不是进程全局(全局集会让第二次回落静默,事故重演;收口审反例)。
++ * persistRequest 与 deposit 层 mock 掉:这里测的是消费链,不是传输层。
++ */
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++const persistRequestMock = vi.hoisted(() => vi.fn())
++vi.mock('../persist/bridge', () => ({
++  persistRequest: persistRequestMock,
++}))
++vi.mock('../agent/depositPort', () => ({
++  resolveDepositEntry: vi.fn(async () => ({ hash: 'a'.repeat(64), ext: '.png' })),
++  refingerprintDepositEntry: vi.fn(async () => ({ hash: 'a'.repeat(64), ext: '.png' })),
++}))
++vi.mock('../agent/depositOwned', () => ({
++  recordArtifactDeposit: vi.fn(async () => ({ ledgerWritten: true })),
++}))
++vi.mock('../../../src/store/canvasStore', () => ({
++  useCanvasStore: { getState: () => ({ nodes: [] }) },
++}))
++
++import { cindyImageGenerationPort } from '../agent/cindyGenerationPort'
++import { useToastStore } from '../../../src/store/toastStore'
++import { t } from '../../../src/i18n'
++
++const HASH = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
++
++const toasts = () => useToastStore.getState().entries
++
++const pollUntilTerminal = async (taskId: string) => {
++  for (let i = 0; i < 400; i += 1) {
++    const view = await cindyImageGenerationPort.pollTask(taskId) // 每轮现拉,不能闭包捕获快照
++    if (view.status !== 'running') return view
++    await new Promise((resolve) => setTimeout(resolve, 5))
++  }
++  throw new Error(`任务 ${taskId} 未在预算内到达终态`)
++}
++
++// 成功路径需要 /media 取回与 FileReader;node 环境补最小 shim。
++const installMediaShims = () => {
++  vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, blob: async () => new Blob(['x']) })))
++  class FakeReader {
++    result: string | null = null
++    onload: (() => void) | null = null
++    onerror: (() => void) | null = null
++    readAsDataURL() {
++      this.result = 'data:image/png;base64,eHg='
++      queueMicrotask(() => this.onload?.())
++    }
++  }
++  vi.stubGlobal('FileReader', FakeReader)
++  vi.stubGlobal('window', { setInterval, clearInterval } as unknown as Window)
++}
++
++beforeEach(() => {
++  persistRequestMock.mockReset()
++  useToastStore.getState().clearToasts()
++  installMediaShims()
++})
++afterEach(() => {
++  vi.unstubAllGlobals()
++})
++
++const FAIL_CODES: Array<[string, string]> = [
++  ['MIVO_CONFIG_UNKNOWN', 'toast.mivoGen.configUnknown'],
++  ['MIVO_AUTH_INVALID', 'toast.mivoGen.authInvalid'],
++  ['MIVO_AUTH_FORBIDDEN', 'toast.mivoGen.authForbidden'],
++  ['MIVO_UPSTREAM_BUSY', 'toast.mivoGen.upstreamBusy'],
++  ['MIVO_UPSTREAM_ERROR', 'toast.mivoGen.upstreamError'],
++  ['MIVO_TRANSPORT_UNKNOWN', 'toast.mivoGen.transportUnknown'],
++  ['MIVO_INTERNAL', 'toast.mivoGen.internal'],
++  ['CINDY_FALLBACK_FAILED', 'toast.mivoGen.cindyFallbackFailed'],
++]
++
++describe('SC-A4.2 失败码 → error toast(真实 store、真实 i18n 文案)× gen/edit', () => {
++  for (const [code, key] of FAIL_CODES) {
++    it(`gen · ${code}`, async () => {
++      persistRequestMock.mockResolvedValue({ ok: false, code, message: '出了点问题' })
++      const taskId = await cindyImageGenerationPort.submitGenerationTask({ prompt: 'p', idempotencyKey: 'ik' } as never)
++      const view = await pollUntilTerminal(taskId)
++      expect(view.status).toBe('failed')
++      expect(toasts()).toHaveLength(1)
++      expect(toasts()[0].level).toBe('error')
++      expect(toasts()[0].message).toBe(t(key))
++    })
++  }
++  // edit 同样逐码全覆盖(SC-A4.2 明定 9 码 × {gen,edit},不抽样)
++  for (const [code, key] of FAIL_CODES) {
++    it(`edit · ${code}`, async () => {
++      persistRequestMock.mockResolvedValue({ ok: false, code, message: '出了点问题' })
++      const taskId = await cindyImageGenerationPort.submitEditTask({ prompt: 'p', sourceAssetUrl: 'asset://x', image: new Blob(['s']), idempotencyKey: 'ik-e' } as never)
++      const view = await pollUntilTerminal(taskId)
++      expect(view.status).toBe('failed')
++      expect(toasts()).toHaveLength(1)
++      expect(toasts()[0].level).toBe('error') // 与 gen 同格:级别也逐格锁死
++      expect(toasts()[0].message).toBe(t(key))
++    })
++  }
++})
++
++describe('SC-A4.3 关键闸门:回落成功必须有 info 提示(每任务恰一次)', () => {
++  it('gen · ok + MIVO_FALLBACK_QUOTA → TaskView done + info toast === 1', async () => {
++    persistRequestMock.mockResolvedValue({ ok: true, code: 'MIVO_FALLBACK_QUOTA', hash: HASH, ext: '.png' })
++    const taskId = await cindyImageGenerationPort.submitGenerationTask({ prompt: 'p', idempotencyKey: 'ik' } as never)
++    const view = await pollUntilTerminal(taskId)
++    expect(view.status).toBe('done')
++    expect(toasts()).toHaveLength(1)
++    expect(toasts()[0].level).toBe('info')
++    expect(toasts()[0].message).toBe(t('toast.mivoGen.fallbackQuota'))
++  })
++
++  it('直连成功(无码)→ 零 toast(不打扰)', async () => {
++    persistRequestMock.mockResolvedValue({ ok: true, hash: HASH, ext: '.png', modelLabel: 'Nano Banana Pro' })
++    const taskId = await cindyImageGenerationPort.submitGenerationTask({ prompt: 'p', idempotencyKey: 'ik' } as never)
++    const view = await pollUntilTerminal(taskId)
++    expect(view.status).toBe('done')
++    expect(toasts()).toHaveLength(0)
++  })
++})
++
++describe('SC-A4.3 关键闸门(edit 侧)+ 跨层单次提交(收口审阻断 1 的回归锁)', () => {
++  it('edit · ok + MIVO_FALLBACK_QUOTA → done + info toast === 1 + 额度语义文案', async () => {
++    persistRequestMock.mockResolvedValue({ ok: true, code: 'MIVO_FALLBACK_QUOTA', hash: HASH, ext: '.png' })
++    const taskId = await cindyImageGenerationPort.submitEditTask({ prompt: 'p', sourceAssetUrl: 'asset://x', image: new Blob(['s']), idempotencyKey: 'ik-eg' } as never)
++    const view = await pollUntilTerminal(taskId)
++    expect(view.status).toBe('done')
++    expect(toasts()).toHaveLength(1)
++    expect(toasts()[0].level).toBe('info')
++    expect(toasts()[0].message).toBe(t('toast.mivoGen.fallbackQuota')) // 解析后文案
++    expect(toasts()[0].message).toMatch(/quota|Key/i) // 额度语义:说清花的是共享额度、配 Key 可用自己的
++  })
++
++  it('edit · 首次 TRANSPORT_UNKNOWN → persist 恰好 1 次(消费层零自动重发,防双扣费)', async () => {
++    // 事故语义:平台可能已收单、只是回执丢了——消费层若自动换指纹重发,就是第二单。
++    persistRequestMock.mockResolvedValue({ ok: false, code: 'MIVO_TRANSPORT_UNKNOWN', message: 'x' })
++    const taskId = await cindyImageGenerationPort.submitEditTask({ prompt: 'p', sourceAssetUrl: 'asset://x', image: new Blob(['s']), idempotencyKey: 'ik-e1' } as never)
++    const view = await pollUntilTerminal(taskId)
++    expect(view.status).toBe('failed')
++    expect(persistRequestMock).toHaveBeenCalledTimes(1)
++  })
++
++  it('variations · 3 单全部 TRANSPORT_UNKNOWN → persist 恰好 3 次(每变体 1 次,零重发)', async () => {
++    persistRequestMock.mockResolvedValue({ ok: false, code: 'MIVO_TRANSPORT_UNKNOWN', message: 'x' })
++    const { taskId } = await cindyImageGenerationPort.submitVariationsTask({
++      sourceAssetUrl: 'asset://x',
++      image: new Blob(['s']),
++      idempotencyKey: 'ik-v1',
++      variations: [{ prompt: 'v1' }, { prompt: 'v2' }, { prompt: 'v3' }],
++    } as never)
++    const view = await pollUntilTerminal(taskId)
++    expect(view.status).toBe('failed')
++    expect(persistRequestMock).toHaveBeenCalledTimes(3)
++  })
++})
++
++describe('SC-A4.4 动作指引:只有 401/403 指向设置页', () => {
++  // 默认 locale = en(node 无 navigator):settings 措辞只允许出现在 auth 两码。
++  it('文案分界(en catalog)', () => {
++    const pointing = ['toast.mivoGen.authInvalid', 'toast.mivoGen.authForbidden']
++    const notPointing = [
++      'toast.mivoGen.fallbackQuota',
++      'toast.mivoGen.configUnknown',
++      'toast.mivoGen.upstreamBusy',
++      'toast.mivoGen.upstreamError',
++      'toast.mivoGen.transportUnknown',
++      'toast.mivoGen.internal',
++      'toast.mivoGen.cindyFallbackFailed',
++    ]
++    for (const key of pointing) expect(t(key)).toMatch(/settings/i)
++    for (const key of notPointing) expect(t(key)).not.toMatch(/settings/i)
++    // busy/transport 不得暗示 key 坏了
++    expect(t('toast.mivoGen.upstreamBusy')).not.toMatch(/key/i)
++    expect(t('toast.mivoGen.transportUnknown')).not.toMatch(/key/i)
++  })
++})
++
++describe('SC-A4.7 去重作用域 = 每任务/每 batch,不是进程全局', () => {
++  it('两个先后任务、同一个码 → toast 累计 2(进程级 Set 的错误实现在此变红)', async () => {
++    persistRequestMock.mockResolvedValue({ ok: false, code: 'MIVO_TRANSPORT_UNKNOWN', message: 'x' })
++    const first = await cindyImageGenerationPort.submitGenerationTask({ prompt: 'p1', idempotencyKey: 'ik1' } as never)
++    await pollUntilTerminal(first)
++    const second = await cindyImageGenerationPort.submitGenerationTask({ prompt: 'p2', idempotencyKey: 'ik2' } as never)
++    await pollUntilTerminal(second)
++    expect(toasts()).toHaveLength(2)
++  })
++
++  it('两个先后任务的回落成功 info 同样各提示一次(A4.3 闸门的跨任务延伸)', async () => {
++    persistRequestMock.mockResolvedValue({ ok: true, code: 'MIVO_FALLBACK_QUOTA', hash: HASH, ext: '.png' })
++    const first = await cindyImageGenerationPort.submitGenerationTask({ prompt: 'p1', idempotencyKey: 'ik1' } as never)
++    await pollUntilTerminal(first)
++    const second = await cindyImageGenerationPort.submitGenerationTask({ prompt: 'p2', idempotencyKey: 'ik2' } as never)
++    await pollUntilTerminal(second)
++    expect(toasts()).toHaveLength(2)
++    expect(toasts().every((entry) => entry.level === 'info')).toBe(true)
++  })
++
++  it('variations 一个 batch 内 3 单同码失败 → toast === 1', async () => {
++    persistRequestMock.mockResolvedValue({ ok: false, code: 'MIVO_UPSTREAM_BUSY', message: 'x' })
++    const { taskId } = await cindyImageGenerationPort.submitVariationsTask({
++      sourceAssetUrl: 'asset://x',
++      image: new Blob(['s']),
++      idempotencyKey: 'ik-v',
++      variations: [{ prompt: 'v1' }, { prompt: 'v2' }, { prompt: 'v3' }],
++    } as never)
++    const view = await pollUntilTerminal(taskId)
++    expect(view.status).toBe('failed')
++    expect(toasts()).toHaveLength(1)
++    expect(toasts()[0].message).toBe(t('toast.mivoGen.upstreamBusy'))
++  })
++})
++
++describe('SC-A4.5(运行时侧):toast 决策只看 code,不看 modelLabel', () => {
++  it('同一失败码在不同 modelLabel 下给同一条 toast', async () => {
++    persistRequestMock.mockResolvedValue({ ok: false, code: 'MIVO_UPSTREAM_BUSY', message: 'x', modelLabel: 'GPT Image 2.0' })
++    const a = await cindyImageGenerationPort.submitGenerationTask({ prompt: 'p1', idempotencyKey: 'ik1' } as never)
++    await pollUntilTerminal(a)
++    const firstMessage = toasts()[0].message
++    useToastStore.getState().clearToasts()
++    persistRequestMock.mockResolvedValue({ ok: false, code: 'MIVO_UPSTREAM_BUSY', message: 'x', modelLabel: 'Nano Banana Pro' })
++    const b = await cindyImageGenerationPort.submitGenerationTask({ prompt: 'p2', idempotencyKey: 'ik2' } as never)
++    await pollUntilTerminal(b)
++    expect(toasts()[0].message).toBe(firstMessage)
++  })
++})
+diff --git a/cindyplugin/src/agent/cindyGenerationPort.ts b/cindyplugin/src/agent/cindyGenerationPort.ts
+index b67735bb..64594b96 100644
+--- a/cindyplugin/src/agent/cindyGenerationPort.ts
++++ b/cindyplugin/src/agent/cindyGenerationPort.ts
+@@ -15,12 +15,74 @@ import type { TaskFailure, TaskResultImage, TaskView } from '../../../src/lib/mi
+ import { buildRegionCoordinatePrompt } from '../../../src/lib/regionEditPrompt'
+ import { useCanvasStore } from '../../../src/store/canvasStore'
+ import { debugLogger } from '../../../src/store/debugLogStore'
++import { toastFeedback } from '../../../src/store/toastStore'
++import { t } from '../../../src/i18n'
+ import { persistRequest, type PersistReply } from '../persist/bridge'
+ import { refingerprintDepositEntry, resolveDepositEntry } from './depositPort'
+ import { recordArtifactDeposit } from './depositOwned'
+ 
+ const SOURCE = 'Cindy Plugin Generation'
+ 
++/**
++ * 电子脑生图回执的结局码 → 用户提示(2026-08-05,配合 main.js 的 GEN_CODE 闭集)。
++ *
++ * 为什么按**码**选文案而不是读回执里的 message:message 那一侧曾经透传过宿主/上游
++ * 原文,正是"Key 失效却悄悄改走 Cindy 配额、用户毫无感知"事故的一部分。码是闭集、
++ * 文案在四语 catalog 里写死,谁也夹带不了私货。**判定通道也绝不看 modelLabel**——
++ * 模型名是展示字段,拿它推断走了哪条通道等于把契约建在文案上。
++ *
++ * 特别注意 fallbackQuota 是**成功**回执上的码:没配 Key、代办出图成功。它必须有
++ * info 提示——事故的要害正是"回落成功却一声不吭",用户以为花的是自己的 Mivo 额度。
++ */
++const GEN_OUTCOME_TOAST: Record<string, { level: 'info' | 'error'; key: string }> = {
++  MIVO_FALLBACK_QUOTA: { level: 'info', key: 'toast.mivoGen.fallbackQuota' },
++  MIVO_CONFIG_UNKNOWN: { level: 'error', key: 'toast.mivoGen.configUnknown' },
++  MIVO_AUTH_INVALID: { level: 'error', key: 'toast.mivoGen.authInvalid' },
++  MIVO_AUTH_FORBIDDEN: { level: 'error', key: 'toast.mivoGen.authForbidden' },
++  MIVO_UPSTREAM_BUSY: { level: 'error', key: 'toast.mivoGen.upstreamBusy' },
++  MIVO_UPSTREAM_ERROR: { level: 'error', key: 'toast.mivoGen.upstreamError' },
++  MIVO_TRANSPORT_UNKNOWN: { level: 'error', key: 'toast.mivoGen.transportUnknown' },
++  MIVO_INTERNAL: { level: 'error', key: 'toast.mivoGen.internal' },
++  CINDY_FALLBACK_FAILED: { level: 'error', key: 'toast.mivoGen.cindyFallbackFailed' },
++}
++
++/**
++ * 按回执结局码给用户反馈(toast + Debug Log)。
++ *
++ * `seen` 是**每任务/每 batch 一个**的去重集,由各 submit*Task 闭包自建自传——
++ * 刻意不做模块级全局集:全局集会让"同一个码全进程只提示一次",第二次生图照样
++ * 回落时用户又什么都看不到,事故原样重演(收口审反例)。变体 batch 内多单同码
++ * 失败共享一个集 = 一个 batch 至多一条;两个先后任务各自的集独立 = 各提示一次。
++ */
++const notifyGenOutcome = (seen: Set<string>, reply: { ok?: boolean; code?: unknown }): void => {
++  const code = typeof reply.code === 'string' && reply.code ? reply.code : ''
++  if (!code) {
++    // 成功且无码 = Mivo 直连正常出图,无需打扰;失败却无码 = 契约破损,要留痕。
++    if (!reply.ok) debugLogger.warn(SOURCE, '失败回执缺结局码(契约破损),按内部错误提示')
++    if (!reply.ok && !seen.has('MIVO_INTERNAL')) {
++      seen.add('MIVO_INTERNAL')
++      toastFeedback.error(t('toast.mivoGen.internal'))
++    }
++    return
++  }
++  if (seen.has(code)) return
++  seen.add(code)
++  const spec = GEN_OUTCOME_TOAST[code]
++  if (!spec) {
++    // 闭集外的码不该存在;不静默吞(fail visibly),记警告并给通用错误提示。
++    debugLogger.warn(SOURCE, `未知结局码 code=${code},按内部错误提示`)
++    toastFeedback.error(t('toast.mivoGen.internal'))
++    return
++  }
++  if (spec.level === 'info') {
++    debugLogger.log(SOURCE, `生图走 Cindy 代办成功(未配 Mivo Key) code=${code}`)
++    toastFeedback.info(t(spec.key))
++  } else {
++    debugLogger.error(SOURCE, `生图失败 code=${code}`)
++    toastFeedback.error(t(spec.key))
++  }
++}
++
+ export type AgentGenerationContext = {
+   /** 工具触发的生成带上原始 tool callId(归因/续命);面板自发操作不带。 */
+   callId?: string
+@@ -254,6 +316,7 @@ export const cindyImageGenerationPort: ImageGenerationPort = {
+     // 面板 UI 流程:按画布侧比例意图折算(web 行为对齐)。
+     const aspectRatio = ctx ? (ctx.aspectRatio ?? undefined) : mapUiRatio(request.imgRatio)
+     const beforeAssets = currentAssetUrls()
++    const seenCodes = new Set<string>() // 本任务的提示去重集(勿提为模块级,见 notifyGenOutcome)
+     void (async () => {
+       try {
+         // 分钟级任务:重发间隔放宽(电子脑按 reqId 去重,重发安全),超时给足。
+@@ -262,6 +325,7 @@ export const cindyImageGenerationPort: ImageGenerationPort = {
+           { prompt: request.prompt, callId, aspectRatio },
+           { retryMs: 5_000, timeoutMs: 28 * 60_000 },
+         )
++        notifyGenOutcome(seenCodes, reply)
+         if (!reply.ok || !reply.hash || !reply.ext) {
+           pending.view = {
+             ...pending.view,
+@@ -339,6 +403,7 @@ export const cindyImageGenerationPort: ImageGenerationPort = {
+     trimTasks()
+ 
+     const beforeAssets = currentAssetUrls()
++    const seenCodes = new Set<string>() // 本任务的提示去重集
+     void (async () => {
+       try {
+         const doRequest = (hash: string) =>
+@@ -354,6 +419,7 @@ export const cindyImageGenerationPort: ImageGenerationPort = {
+             { retryMs: 5_000, timeoutMs: 28 * 60_000 },
+           )
+         const reply = await editOnceWithForcedRetry(request.sourceAssetUrl, request.image, doRequest, source.hash)
++        notifyGenOutcome(seenCodes, reply)
+         if (!reply.ok || !reply.hash || !reply.ext) {
+           pending.view = { ...pending.view, status: 'failed', progress: 100, stage: 'failed', error: reply.message || '修改失败' }
+           return
+@@ -400,6 +466,7 @@ export const cindyImageGenerationPort: ImageGenerationPort = {
+ 
+     const callId = contextFor(request.agentRequestTag)?.callId
+     const beforeAssets = currentAssetUrls()
++    const seenCodes = new Set<string>() // 整个 batch 共享:同码多单失败只提示一次
+     void (async () => {
+       const images: TaskResultImage[] = []
+       const failures: TaskFailure[] = []
+@@ -416,6 +483,7 @@ export const cindyImageGenerationPort: ImageGenerationPort = {
+               { retryMs: 5_000, timeoutMs: 28 * 60_000 },
+             )
+           const reply = await editOnceWithForcedRetry(request.sourceAssetUrl, request.image, doRequest, source.hash)
++          notifyGenOutcome(seenCodes, reply)
+           if (!reply.ok || !reply.hash || !reply.ext) throw new Error(reply.message || '生成失败')
+           const res = await fetch(`/media/${reply.hash}${reply.ext}`)
+           if (!res.ok) throw new Error(`产物取回失败(${res.status})`)
+diff --git a/src/i18n/locales/en/toast.json b/src/i18n/locales/en/toast.json
+index 845e2354..f9dd69cc 100644
+--- a/src/i18n/locales/en/toast.json
++++ b/src/i18n/locales/en/toast.json
+@@ -177,5 +177,16 @@
+     "brainTimeout": "Cindy didn't respond in time. Please try again.",
+     "badReceipt": "The upload receipt was incomplete. Please try again.",
+     "failed": "This image couldn't be uploaded and can't be used as an edit source right now."
++  },
++  "mivoGen": {
++    "fallbackQuota": "This image used Cindy's shared quota. Configure your Mivo API Key to use your own Mivo credits.",
++    "configUnknown": "Could not confirm Mivo Key status. Nothing was generated — please try again later.",
++    "authInvalid": "Your Mivo Key is invalid or expired. Please check it in the plugin settings.",
++    "authForbidden": "Your Mivo Key lacks permission. Please check it in the plugin settings.",
++    "upstreamBusy": "Mivo platform is busy. Please try again later.",
++    "upstreamError": "Mivo platform returned an error. Please try again later.",
++    "transportUnknown": "Network unreachable or no response from the platform. Please try again later.",
++    "internal": "Generation failed. Please try again later.",
++    "cindyFallbackFailed": "Cindy fallback generation failed. Please try again later."
+   }
+ }
+diff --git a/src/i18n/locales/ja/toast.json b/src/i18n/locales/ja/toast.json
+index ffe5252a..31daea7c 100644
+--- a/src/i18n/locales/ja/toast.json
++++ b/src/i18n/locales/ja/toast.json
+@@ -173,5 +173,16 @@
+     "brainTimeout": "Cindy から応答がありませんでした。再度お試しください。",
+     "badReceipt": "アップロードの受信情報が不完全です。再度お試しください。",
+     "failed": "この画像のアップロードに失敗したため、現在は編集用の元画像として使用できません。"
++  },
++  "mivoGen": {
++    "fallbackQuota": "今回の画像は Cindy の共有枠で生成されました。Mivo API Key を設定すると自分の Mivo 枠を使えます。",
++    "configUnknown": "Mivo Key の設定状態を確認できず、生成を行いませんでした。しばらくしてからお試しください。",
++    "authInvalid": "Mivo Key が無効か期限切れです。プラグイン設定でご確認ください。",
++    "authForbidden": "Mivo Key の権限が不足しています。プラグイン設定でご確認ください。",
++    "upstreamBusy": "Mivo プラットフォームが混雑しています。しばらくしてからお試しください。",
++    "upstreamError": "Mivo プラットフォームがエラーを返しました。しばらくしてからお試しください。",
++    "transportUnknown": "ネットワークに接続できないか、応答がありません。しばらくしてからお試しください。",
++    "internal": "生成に失敗しました。しばらくしてからお試しください。",
++    "cindyFallbackFailed": "Cindy 代行での生成に失敗しました。しばらくしてからお試しください。"
+   }
+ }
+diff --git a/src/i18n/locales/ko/toast.json b/src/i18n/locales/ko/toast.json
+index a77594a8..848a40d1 100644
+--- a/src/i18n/locales/ko/toast.json
++++ b/src/i18n/locales/ko/toast.json
+@@ -173,5 +173,16 @@
+     "brainTimeout": "Cindy가 응답하지 않았습니다. 다시 시도하세요.",
+     "badReceipt": "업로드 접수 정보가 불완전합니다. 다시 시도하세요.",
+     "failed": "이 이미지를 업로드하지 못해 현재 편집 소스로 사용할 수 없습니다."
++  },
++  "mivoGen": {
++    "fallbackQuota": "이번 이미지는 Cindy 공용 할당량으로 생성되었습니다. Mivo API Key를 설정하면 자신의 Mivo 할당량을 사용할 수 있습니다.",
++    "configUnknown": "Mivo Key 설정 상태를 확인할 수 없어 생성하지 않았습니다. 잠시 후 다시 시도해 주세요.",
++    "authInvalid": "Mivo Key가 유효하지 않거나 만료되었습니다. 플러그인 설정에서 확인해 주세요.",
++    "authForbidden": "Mivo Key 권한이 부족합니다. 플러그인 설정에서 확인해 주세요.",
++    "upstreamBusy": "Mivo 플랫폼이 혼잡합니다. 잠시 후 다시 시도해 주세요.",
++    "upstreamError": "Mivo 플랫폼에서 오류를 반환했습니다. 잠시 후 다시 시도해 주세요.",
++    "transportUnknown": "네트워크에 연결할 수 없거나 응답이 없습니다. 잠시 후 다시 시도해 주세요.",
++    "internal": "생성에 실패했습니다. 잠시 후 다시 시도해 주세요.",
++    "cindyFallbackFailed": "Cindy 대행 생성에 실패했습니다. 잠시 후 다시 시도해 주세요."
+   }
+ }
+diff --git a/src/i18n/locales/zh-CN/toast.json b/src/i18n/locales/zh-CN/toast.json
+index c85a70f1..a61a498b 100644
+--- a/src/i18n/locales/zh-CN/toast.json
++++ b/src/i18n/locales/zh-CN/toast.json
+@@ -173,5 +173,16 @@
+     "brainTimeout": "电子脑无响应,请重试。",
+     "badReceipt": "寄存回执不完整,请重试。",
+     "failed": "这张图寄存失败,暂时不能作为改图源。"
++  },
++  "mivoGen": {
++    "fallbackQuota": "本次出图走了 Cindy 代办额度;配置 Mivo API Key 后可使用自己的 Mivo 额度。",
++    "configUnknown": "无法确认 Mivo Key 配置状态,本次未出图,请稍后重试。",
++    "authInvalid": "Mivo Key 无效或已过期,请到插件设置页检查。",
++    "authForbidden": "Mivo Key 权限不足,请到插件设置页检查。",
++    "upstreamBusy": "Mivo 平台繁忙,请稍后重试。",
++    "upstreamError": "Mivo 平台返回异常,请稍后重试。",
++    "transportUnknown": "网络不可达或平台无响应,请稍后重试。",
++    "internal": "生成失败,请稍后重试。",
++    "cindyFallbackFailed": "Cindy 代办出图失败,请稍后重试。"
+   }
+ }

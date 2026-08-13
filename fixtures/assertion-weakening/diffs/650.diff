@@ -1,0 +1,2725 @@
+diff --git a/cindyplugin/src/__tests__/editBatchPublicRoute.test.ts b/cindyplugin/src/__tests__/editBatchPublicRoute.test.ts
+index c0d910b2..1ea97737 100644
+--- a/cindyplugin/src/__tests__/editBatchPublicRoute.test.ts
++++ b/cindyplugin/src/__tests__/editBatchPublicRoute.test.ts
+@@ -213,9 +213,12 @@ describe('canvas_edit_image 公共工具全链透传进入批次聚合路径', (
+     const results = sent.filter((m) => m.type === 'tool-result')
+     expect(results).toHaveLength(2)
+     results.forEach((r) => expect(r.ok).toBe(true))
+-    // 单次路径:新节点不带 batchId(各自独立生成,不是批次 slot)
++    // 单次路径(β2 接线后):无批次字段 → expectedCount:1 owner 批次——结果带
++    // 批次身份(batch-owner 预建列的正常产物),但 expectedCount=1(单次语义,
++    // 不是多成员聚合)。批次路由的唯一开关仍是批次凭证字段。
+     const s = useCanvasStore.getState()
+     const withBatchId = s.nodes.filter((n) => n.aiWorkflow?.batchId !== undefined)
+-    expect(withBatchId).toHaveLength(0)
++    expect(withBatchId).toHaveLength(2)
++    withBatchId.forEach((n) => expect(n.aiWorkflow?.expectedCount).toBe(1))
+   })
+ })
+diff --git a/scripts/e2e/scenarios/chat-generation.mjs b/scripts/e2e/scenarios/chat-generation.mjs
+index 77028f0d..96815dbd 100644
+--- a/scripts/e2e/scenarios/chat-generation.mjs
++++ b/scripts/e2e/scenarios/chat-generation.mjs
+@@ -205,6 +205,14 @@ export const runChatGenerationScenario = async (context) => {
+     throw new Error(`Expected at least ${countBeforeGenerate + 1} nodes after chat generation result, got ${generatedCount}`)
+   }
+ 
++  // P1b(beta2):placement:'batch' 在批次发起时即预建 slot 节点(+1 计数立刻满足,
++  // 结果落地是原位替换),节点数断言不能再用作"任务已完成"信号——否则进度采样
++  // 会在轮询中途被读取([100,0] 类假红)。改为等任务终态:采样序列到达 100。
++  await page.waitForFunction(() => {
++    const samples = window.__mivoProgressSamples || []
++    return samples.length >= 1 && samples[samples.length - 1] === 100
++  }, { timeout: 20000 })
++
+   // P2-C1b: assert ≥3 strictly increasing, non-hardcoded progress samples from
+   // the tasks API (10→30→60→100 — not the old hardcoded 20→100 jump).
+   const progressSamples = await page.evaluate(() => {
+@@ -222,11 +230,16 @@ export const runChatGenerationScenario = async (context) => {
+   }
+   // leafer 模式 image 无 DOM;data-ai-* 与 store node.aiWorkflow 同源(CanvasNodeView
+   // 直接透传),leafer 分支从 store 读同字段。
++  // P1b(beta2):chat 主路径走 placement:'batch'(expectedCount=1)——结果原位替换
++  // 预建 slot,operation 为 'slot-generation'(非 legacy 的 'beside-generation')。
++  const RESULT_OPERATIONS = ['beside-generation', 'slot-generation']
+   const besideResult = leaferMode
+     ? await page.evaluate(async (moduleSpec) => {
+         const { useCanvasStore } = await import(moduleSpec)
+         const results = useCanvasStore.getState().nodes.filter(
+-          (node) => node.aiWorkflow?.kind === 'result' && node.aiWorkflow?.operation === 'beside-generation',
++          (node) =>
++            node.aiWorkflow?.kind === 'result' &&
++            (node.aiWorkflow?.operation === 'beside-generation' || node.aiWorkflow?.operation === 'slot-generation'),
+         )
+         const node = results.at(-1)
+         if (!node) return { id: null, kind: null, operation: null, sourceNodeIds: null }
+@@ -237,15 +250,20 @@ export const runChatGenerationScenario = async (context) => {
+           sourceNodeIds: node.aiWorkflow.sourceNodeIds?.join(',') ?? null,
+         }
+       }, await canvasStoreSpec())
+-    : await page.locator('.dom-node[data-ai-kind="result"][data-ai-operation="beside-generation"]').last().evaluate((node) => ({
+-        id: node.getAttribute('data-node-id'),
+-        kind: node.getAttribute('data-ai-kind'),
+-        operation: node.getAttribute('data-ai-operation'),
+-        sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
+-      }))
++    : await page
++        .locator(
++          '.dom-node[data-ai-kind="result"][data-ai-operation="beside-generation"], .dom-node[data-ai-kind="result"][data-ai-operation="slot-generation"]',
++        )
++        .last()
++        .evaluate((node) => ({
++          id: node.getAttribute('data-node-id'),
++          kind: node.getAttribute('data-ai-kind'),
++          operation: node.getAttribute('data-ai-operation'),
++          sourceNodeIds: node.getAttribute('data-ai-source-node-ids'),
++        }))
+   if (
+     besideResult.kind !== 'result' ||
+-    besideResult.operation !== 'beside-generation' ||
++    !RESULT_OPERATIONS.includes(besideResult.operation) ||
+     !besideResult.sourceNodeIds?.includes(firstNodeId)
+   ) {
+     throw new Error(`Immediate generation should create a derived result beside the selected source: ${JSON.stringify(besideResult)}`)
+diff --git a/scripts/e2e/scenarios/mask-reflow.mjs b/scripts/e2e/scenarios/mask-reflow.mjs
+index d02fed44..5410f33e 100644
+--- a/scripts/e2e/scenarios/mask-reflow.mjs
++++ b/scripts/e2e/scenarios/mask-reflow.mjs
+@@ -296,7 +296,11 @@ export const runMaskReflowScenario = async (context) => {
+   // legit store-hook technique; the default /tasks/** progressive mock completes it.
+   await page.evaluate(async ({ moduleSpec, id }) => {
+     const { useCanvasStore } = await import(moduleSpec)
+-    await useCanvasStore.getState().generateBesideNode(id, 'e2e beside no-reflow', {})
++    // F9:P1b 起排布意图 fail-closed,直调必须显式声明(单张批次,同 chat 有源语义)。
++    await useCanvasStore.getState().generateBesideNode(id, 'e2e beside no-reflow', {
++      placement: 'batch',
++      expectedCount: 1,
++    })
+   }, { moduleSpec: spec, id: besideA.id })
+   {
+     const deadline = Date.now() + 15000
+diff --git a/scripts/e2e/scenarios/variations-annotation.mjs b/scripts/e2e/scenarios/variations-annotation.mjs
+index edde8615..95516478 100644
+--- a/scripts/e2e/scenarios/variations-annotation.mjs
++++ b/scripts/e2e/scenarios/variations-annotation.mjs
+@@ -103,11 +103,12 @@ export const runVariationsAnnotationScenario = async (context) => {
+   const beforeVariationsCount = await countRenderedNodes()
+   await page.evaluate(async (moduleSpecAndId) => {
+     const { useCanvasStore } = await import(moduleSpecAndId.spec)
+-    await useCanvasStore.getState().generateVariations(moduleSpecAndId.id, [
+-      { prompt: 'variation one' },
+-      { prompt: 'variation two' },
+-      { prompt: 'variation three' },
+-    ])
++    // F9:P1b 起排布意图 fail-closed,直调必须显式声明(3 变体批次发起)。
++    await useCanvasStore.getState().generateVariations(
++      moduleSpecAndId.id,
++      [{ prompt: 'variation one' }, { prompt: 'variation two' }, { prompt: 'variation three' }],
++      { placement: 'batch', expectedCount: 3 },
++    )
+   }, { spec, id: imageId })
+   // 2 success result nodes + 1 failed slot = +3 nodes.
+   if (rendererMode === 'leafer') {
+diff --git a/src/agent/canvasAgentVerbs.test.ts b/src/agent/canvasAgentVerbs.test.ts
+index 1ee45ab1..f3eea2a3 100644
+--- a/src/agent/canvasAgentVerbs.test.ts
++++ b/src/agent/canvasAgentVerbs.test.ts
+@@ -189,7 +189,7 @@ describe('原型污染入参不得驱动真实写入(#297 安全加固)', () =>
+       undefined,
+     )
+     // 画幅意图同样读不到:生成选项为空对象,而非 { imgRatio: '3:2' }。
+-    expect(generationFacade.generateIntoAiSlot).toHaveBeenCalledWith('slot-1', '一只猫', {})
++    expect(generationFacade.generateIntoAiSlot).toHaveBeenCalledWith('slot-1', '一只猫', { placement: 'legacy' })
+     storeState.nodes = []
+   })
+ 
+@@ -240,7 +240,7 @@ describe('原型污染入参不得驱动真实写入(#297 安全加固)', () =>
+ 
+     await agentGenerateImage(args)
+ 
+-    expect(generationFacade.generateIntoAiSlot).toHaveBeenCalledWith('slot-1', '一只猫', {})
++    expect(generationFacade.generateIntoAiSlot).toHaveBeenCalledWith('slot-1', '一只猫', { placement: 'legacy' })
+     storeState.nodes = []
+   })
+ 
+@@ -281,7 +281,7 @@ describe('原型污染入参不得驱动真实写入(#297 安全加固)', () =>
+     expect(tagGetter).not.toHaveBeenCalled()
+     expect(storeState.loadScene).not.toHaveBeenCalled()
+     expect(storeState.sceneId).toBe('scene-1')
+-    expect(generationFacade.generateIntoAiSlot).toHaveBeenCalledWith('slot-1', '一只猫', {})
++    expect(generationFacade.generateIntoAiSlot).toHaveBeenCalledWith('slot-1', '一只猫', { placement: 'legacy' })
+     storeState.nodes = []
+   })
+ 
+@@ -486,6 +486,129 @@ describe('可移植记录核(§六-9:落共享层,不含宿主身份字段)', ()
+   })
+ })
+ 
++// ── G2(修复轮2):edit 批次凭证三态——畸形输入不得被静默重解释 ──
++describe('agentEditImage 批次凭证三态(G2)', () => {
++  const editOptions = () => vi.mocked(generationFacade.generateImageEdit).mock.calls[0][3] as Record<string, unknown>
++
++  it('单次 edit 无凭证 → expectedCount:1 批次发起(placement=batch)', async () => {
++    storeState.sceneId = 'scene-1'
++    storeState.nodes = [{ id: 'img-1', type: 'image', hidden: false, assetUrl: 'asset://a' }]
++    vi.mocked(generationFacade.generateImageEdit).mockImplementation(async () => {
++      storeState.nodes = [
++        ...storeState.nodes,
++        { id: 'img-2', type: 'image', hidden: false, assetUrl: 'asset://b' },
++      ]
++      // 返回 commit 产出的节点 id(P1a3 结果归属按返回值定位,返回 [] 是
++      // 生产从不产生的形状,会让归属断言落在假契约上)
++      return ['img-2']
++    })
++    const result = await agentEditImage({ nodeId: 'img-1', prompt: 'p' })
++    expect(result.status).toBe('ready')
++    const options = editOptions()
++    expect(options.placement).toBe('batch')
++    expect(options.expectedCount).toBe(1)
++    expect(options.derivedBatchId).toBeUndefined()
++    expect(options.ordinal).toBeUndefined()
++    vi.mocked(generationFacade.generateImageEdit).mockReset()
++    storeState.nodes = []
++  })
++
++  it('全齐三元组 → member 原样透传(不改写字段)', async () => {
++    storeState.sceneId = 'scene-1'
++    storeState.nodes = [{ id: 'img-1', type: 'image', hidden: false, assetUrl: 'asset://a' }]
++    vi.mocked(generationFacade.generateImageEdit).mockImplementation(async () => {
++      storeState.nodes = [
++        ...storeState.nodes,
++        { id: 'img-2', type: 'image', hidden: false, assetUrl: 'asset://b' },
++      ]
++      // 返回 commit 产出的节点 id(P1a3 结果归属按返回值定位,返回 [] 是
++      // 生产从不产生的形状,会让归属断言落在假契约上)
++      return ['img-2']
++    })
++    const result = await agentEditImage({ nodeId: 'img-1', prompt: 'p', derivedBatchId: 'b9', expectedCount: 2, ordinal: 1 })
++    expect(result.status).toBe('ready')
++    const options = editOptions()
++    expect(options.derivedBatchId).toBe('b9')
++    expect(options.expectedCount).toBe(2)
++    expect(options.ordinal).toBe(1)
++    expect(options.placement).toBeUndefined()
++    vi.mocked(generationFacade.generateImageEdit).mockReset()
++    storeState.nodes = []
++  })
++
++  it('部分凭证(只带 expectedCount)→ 原样透传,不得重解释为 owner count=1', async () => {
++    storeState.sceneId = 'scene-1'
++    storeState.nodes = [{ id: 'img-1', type: 'image', hidden: false, assetUrl: 'asset://a' }]
++    vi.mocked(generationFacade.generateImageEdit).mockRejectedValue(new Error('排布意图缺失'))
++    const result = await agentEditImage({ nodeId: 'img-1', prompt: 'p', expectedCount: 2 })
++    expect(result.status).toBe('failed')
++    const options = editOptions()
++    // 原样透传:placement 未注入(不会吞成 expectedCount:1),store 侧 fail-closed 拒绝。
++    expect(options.placement).toBeUndefined()
++    expect(options.expectedCount).toBe(2)
++    expect(options.derivedBatchId).toBeUndefined()
++    expect(options.ordinal).toBeUndefined()
++    expect(String(result.error)).toContain('排布意图缺失')
++    vi.mocked(generationFacade.generateImageEdit).mockReset()
++    storeState.nodes = []
++  })
++
++  it('部分凭证(只带 derivedBatchId)→ 原样透传,不得重解释', async () => {
++    storeState.sceneId = 'scene-1'
++    storeState.nodes = [{ id: 'img-1', type: 'image', hidden: false, assetUrl: 'asset://a' }]
++    vi.mocked(generationFacade.generateImageEdit).mockRejectedValue(new Error('排布意图缺失'))
++    const result = await agentEditImage({ nodeId: 'img-1', prompt: 'p', derivedBatchId: 'b9' })
++    expect(result.status).toBe('failed')
++    const options = editOptions()
++    expect(options.placement).toBeUndefined()
++    expect(options.derivedBatchId).toBe('b9')
++    expect(options.expectedCount).toBeUndefined()
++    expect(options.ordinal).toBeUndefined()
++    vi.mocked(generationFacade.generateImageEdit).mockReset()
++    storeState.nodes = []
++  })
++
++  // H1(fix3):presence 必须按 own-property 判定。显式携带 null/undefined 值的
++  // 凭证键不得被静默算成「未提供」→ 走全缺分支重解释为新批次 expectedCount:1。
++  it('H1: {derivedBatchId:null} 显式携带 → 部分凭证透传,不得重解释为单次 edit', async () => {
++    storeState.sceneId = 'scene-1'
++    storeState.nodes = [{ id: 'img-1', type: 'image', hidden: false, assetUrl: 'asset://a' }]
++    vi.mocked(generationFacade.generateImageEdit).mockRejectedValue(new Error('排布意图缺失'))
++    const result = await agentEditImage({ nodeId: 'img-1', prompt: 'p', derivedBatchId: null as unknown as string })
++    expect(result.status).toBe('failed')
++    const options = editOptions()
++    // 未注入 placement= batch(不被吞成 expectedCount:1),store 侧 fail-closed 拒绝。
++    expect(options.placement).toBeUndefined()
++    expect(options.derivedBatchId).toBeUndefined()
++    expect(options.expectedCount).toBeUndefined()
++    expect(String(result.error)).toContain('排布意图缺失')
++    vi.mocked(generationFacade.generateImageEdit).mockReset()
++    storeState.nodes = []
++  })
++
++  it('H1: 三键全 null → 原样透传归一为 undefined,不得重解释(store fail-closed)', async () => {
++    storeState.sceneId = 'scene-1'
++    storeState.nodes = [{ id: 'img-1', type: 'image', hidden: false, assetUrl: 'asset://a' }]
++    vi.mocked(generationFacade.generateImageEdit).mockRejectedValue(new Error('排布意图缺失'))
++    const result = await agentEditImage({
++      nodeId: 'img-1',
++      prompt: 'p',
++      derivedBatchId: null as unknown as string,
++      expectedCount: null as unknown as number,
++      ordinal: null as unknown as number,
++    })
++    expect(result.status).toBe('failed')
++    const options = editOptions()
++    expect(options.placement).toBeUndefined()
++    expect(options.derivedBatchId).toBeUndefined()
++    expect(options.expectedCount).toBeUndefined()
++    expect(options.ordinal).toBeUndefined()
++    expect(String(result.error)).toContain('排布意图缺失')
++    vi.mocked(generationFacade.generateImageEdit).mockReset()
++    storeState.nodes = []
++  })
++})
++
+ // ── p1-sc5:agentEditImage 传导链 verb 层证据 ──
+ // verb 层不新增任何镜头代码——居中由 p1-sc1 的 slice 层接线自动获得。本条断言
+ // agentEditImage 恒经 generationFacade.generateImageEdit 以正确参数传导,不存在
+diff --git a/src/agent/canvasAgentVerbs.ts b/src/agent/canvasAgentVerbs.ts
+index 6bfdcc00..f414bf1d 100644
+--- a/src/agent/canvasAgentVerbs.ts
++++ b/src/agent/canvasAgentVerbs.ts
+@@ -284,23 +284,55 @@ export const agentEditImage = async (params: {
+     throw new AgentVerbErrorImpl('NOT_IMAGE', '该节点不是图片节点,只能修改图片')
+   }
+   const sceneId = store.sceneId
+-  const derivedBatchId =
+-    params.derivedBatchId !== undefined && params.derivedBatchId !== null ? String(params.derivedBatchId) : undefined
+   try {
+     // 结果归属:直接用 generateImageEdit 的返回值(commit 产出的节点 id)—— 批次模式
+     // 下每个 ordinal 原位替换自己的 slot(节点 id 保持为 slot id),单次模式为本次
+     // 提交创建的新节点。绝不再用「全局第一个新 image」:并发批次成员会互相抢报
+     // 先完成的那一个 ordinal,污染回复 nodeId 与动作记录归属。
+-    const nodeIds = await generationFacade.generateImageEdit(nodeId, 'prompt-edit', prompt, {
+-      agentRequestTag: optionalTag(readOwnProp(params, 'agentRequestTag')),
+-      ...(derivedBatchId !== undefined
+-        ? {
+-            derivedBatchId,
+-            expectedCount: Number(params.expectedCount),
+-            ordinal: Number(params.ordinal),
+-          }
+-        : {}),
+-    })
++    // P1b:G2(修复轮2)+H1(fix3)edit 凭证三态——畸形输入(只传 expectedCount/ordinal,
++    // 或传 null/undefined 混合)不得被静默重解释:
++    //   全齐(derivedBatchId+expectedCount+ordinal,按 own-property 判定)
++    //     → member 透传;
++    //   全缺(三个键都不存在)→ expectedCount:1 批次发起(单次 edit 语义);
++    //   部分缺 / 显式携带 null 或 undefined 值 → 原样透传交 store fail-closed
++    //     拒绝(不改写、不猜测)。
++    // H1:presence 判定——null 必须算「携带」(否则 `{derivedBatchId:null}` 被算成
++    // 未提供 → presentCount=0 → 静默重解释为单次 edit),undefined 必须算「未提供」
++    // (main.js 透传会显式携带 undefined 值键,那是框架约定不是凭证)。所以按
++    // 值判定(v !== undefined):null → 携带 → 部分凭证 fail-closed;undefined → 不携带。
++    const credKeys = ['derivedBatchId', 'expectedCount', 'ordinal'] as const
++    const bId = readOwnProp(params, 'derivedBatchId')
++    const eCount = readOwnProp(params, 'expectedCount')
++    const ord = readOwnProp(params, 'ordinal')
++    const providedCount = credKeys.filter((key) => readOwnProp(params, key) !== undefined).length
++    let nodeIds: string[] | undefined
++    if (providedCount === 3 && bId != null && eCount != null && ord != null) {
++      nodeIds = await generationFacade.generateImageEdit(nodeId, 'prompt-edit', prompt, {
++        agentRequestTag: optionalTag(readOwnProp(params, 'agentRequestTag')),
++        derivedBatchId: String(bId),
++        expectedCount: Number(eCount),
++        ordinal: Number(ord),
++      })
++    } else if (providedCount === 0) {
++      nodeIds = await generationFacade.generateImageEdit(nodeId, 'prompt-edit', prompt, {
++        agentRequestTag: optionalTag(readOwnProp(params, 'agentRequestTag')),
++        placement: 'batch' as const,
++        expectedCount: 1,
++      })
++    } else {
++      // 部分凭证(或显式携带 null/undefined 值):原样透传(未提供的字段缺省
++      // undefined,显式 null 也归一为 undefined),store 侧 assertPlacementIntent
++      // 对部分缺失 fail-closed 抛错,禁止重解释。
++      const passBatch = bId == null ? undefined : String(bId)
++      const passCount = eCount == null ? undefined : Number(eCount)
++      const passOrdinal = ord == null ? undefined : Number(ord)
++      nodeIds = await generationFacade.generateImageEdit(nodeId, 'prompt-edit', prompt, {
++        agentRequestTag: optionalTag(readOwnProp(params, 'agentRequestTag')),
++        derivedBatchId: passBatch,
++        expectedCount: passCount,
++        ordinal: passOrdinal,
++      })
++    }
+     const resultNode = useCanvasStore
+       .getState()
+       .canvases[sceneId as CanvasId]?.nodes?.find((node) => node.id === nodeIds[0])
+@@ -381,7 +413,11 @@ export const agentGenerateImage = async (params: {
+     activeSceneId: useCanvasStore.getState().sceneId,
+   })
+   try {
++    // P1b:纯文生图无源图、无对齐基准 → 显式 legacy(与 chat 无源进槽同语义),
++    // 不得走「什么都不传」的隐式路径(assertPlacementIntent 对全缺 fail-closed)。
++    debugLogger.log('Agent Generate', `文生图进槽 ${slot.id} 走 placement=legacy(无源图无对齐基准)`)
+     await generationFacade.generateIntoAiSlot(slot.id, prompt, {
++      placement: 'legacy',
+       ...(aspectRatio ? { imgRatio: aspectRatio } : {}),
+       ...(lineageSourceId ? { lineageSourceId } : {}),
+       agentRequestTag: optionalTag(readOwnProp(params, 'agentRequestTag')),
+diff --git a/src/app/InspectorPanel.tsx b/src/app/InspectorPanel.tsx
+index c890edbd..b93e8f97 100644
+--- a/src/app/InspectorPanel.tsx
++++ b/src/app/InspectorPanel.tsx
+@@ -408,7 +408,7 @@ export function InspectorPanel({ nodeId, onClose }: InspectorPanelProps) {
+ 
+         <div className="panel-actions">
+           {canMakeVariations ? (
+-            <button type="button" className="primary-action" onClick={() => void generateVariations(node.id)}>
++            <button type="button" className="primary-action" onClick={() => void generateVariations(node.id, undefined, { placement: 'batch', expectedCount: 4 })}>
+               <Sparkles size={16} />
+               {t('inspector.makeVariations')}
+             </button>
+diff --git a/src/canvas/AnchorOverlay.tsx b/src/canvas/AnchorOverlay.tsx
+index 3871d5e9..dcdef6d9 100644
+--- a/src/canvas/AnchorOverlay.tsx
++++ b/src/canvas/AnchorOverlay.tsx
+@@ -117,10 +117,11 @@ export const AnchorOverlay = ({ viewport }: Props) => {
+           ? ` [anchor box @ ${anchor.x},${anchor.y} ${anchor.width}x${anchor.height}]`
+           : ` [anchor point @ ${anchor.x},${anchor.y}]`
+       const prompt = `${trimmed}${geometry}`
++      // P1b:锚点浮层显式声明排布意图——expectedCount=1 批次(预建占位 + 高度锁定)。
+       const resultNodeIds =
+         anchor.type === 'box'
+-          ? await generateImageEdit(node.id, 'area-edit', prompt)
+-          : await generateBesideNode(node.id, prompt)
++          ? await generateImageEdit(node.id, 'area-edit', prompt, { placement: 'batch', expectedCount: 1 })
++          : await generateBesideNode(node.id, prompt, { placement: 'batch', expectedCount: 1 })
+       if (resultNodeIds.length) recordAnchorResult(node.id, anchor.id, resultNodeIds)
+     } catch (err) {
+       setError(err instanceof Error ? err.message : 'chat.anchor.generateFailed')
+diff --git a/src/canvas/actions/canvasActionEmitters.ts b/src/canvas/actions/canvasActionEmitters.ts
+index e74e6f49..ae46e992 100644
+--- a/src/canvas/actions/canvasActionEmitters.ts
++++ b/src/canvas/actions/canvasActionEmitters.ts
+@@ -50,11 +50,13 @@ const moveLayerAction = (runtime: CanvasActionRuntime, move: LayerMove) => {
+ }
+ 
+ const generateBesidePrimary = (runtime: CanvasActionRuntime) => {
+-  void runtime.generateBesideNode(primaryNodeId(runtime))
++  // P1b:旁生成走 expectedCount=1 批次(预建占位 + 高度锁定),显式声明排布意图。
++  void runtime.generateBesideNode(primaryNodeId(runtime), undefined, { placement: 'batch', expectedCount: 1 })
+ }
+ 
+ const generateIntoPrimarySlot = (runtime: CanvasActionRuntime) => {
+-  void runtime.generateIntoAiSlot(primaryNodeId(runtime))
++  // P1b:进槽无图像源可作对齐基准,显式声明 legacy(不隐式、不抛错)。
++  void runtime.generateIntoAiSlot(primaryNodeId(runtime), undefined, { placement: 'legacy' })
+ }
+ 
+ const cropPrimaryNode = (runtime: CanvasActionRuntime) => {
+diff --git a/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts b/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
+index 0b6df800..eb56599f 100644
+--- a/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
++++ b/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
+@@ -353,16 +353,23 @@ describe('canvasActionModel — characterization · part 2 (③ markup/AI-edit 
+       expect(onCropNode).toHaveBeenCalledWith('a')
+     })
+ 
+-    it('ai-slot fill-slot → generateIntoAiSlot(id)', () => {
++    it('ai-slot fill-slot → generateIntoAiSlot(id, undefined, legacy)', () => {
+       const rt = createRuntime(ctx([aiSlotNode('s1')]))
+       fire(quickToolbarGroupsFor(rt), 'fill-slot')
+-      expect(vi.mocked(rt.generateIntoAiSlot)).toHaveBeenCalledWith('s1')
++      // P1b:emitters 显式声明排布意图(进槽无源图 → legacy)。
++      expect(vi.mocked(rt.generateIntoAiSlot)).toHaveBeenCalledWith('s1', undefined, {
++        placement: 'legacy',
++      })
+     })
+ 
+-    it('text generate-beside-text → generateBesideNode(id)', () => {
++    it('text generate-beside-text → generateBesideNode(id, undefined, batch:1)', () => {
+       const rt = createRuntime(ctx([textNode('t1')]))
+       fire(quickToolbarGroupsFor(rt), 'generate-beside-text')
+-      expect(vi.mocked(rt.generateBesideNode)).toHaveBeenCalledWith('t1')
++      // P1b:emitters 显式声明排布意图(旁生成 → expectedCount=1 批次)。
++      expect(vi.mocked(rt.generateBesideNode)).toHaveBeenCalledWith('t1', undefined, {
++        placement: 'batch',
++        expectedCount: 1,
++      })
+     })
+ 
+     it('text edit-text → onEditText(id)', () => {
+@@ -372,6 +379,22 @@ describe('canvasActionModel — characterization · part 2 (③ markup/AI-edit 
+       expect(onEditText).toHaveBeenCalledWith('t1')
+     })
+ 
++    it('canvas_ui_entries_declare_batch_intent: UI 快捷条生成入口选项形状防漂移聚合断言', () => {
++      // ai-slot 进槽 → legacy(无源图无对齐基准)
++      const slotRt = createRuntime(ctx([aiSlotNode('s1')]))
++      fire(quickToolbarGroupsFor(slotRt), 'fill-slot')
++      expect(vi.mocked(slotRt.generateIntoAiSlot)).toHaveBeenCalledWith('s1', undefined, {
++        placement: 'legacy',
++      })
++      // text 旁生成 → batch + expectedCount:1(源图边缘对齐)
++      const textRt = createRuntime(ctx([textNode('t1')]))
++      fire(quickToolbarGroupsFor(textRt), 'generate-beside-text')
++      expect(vi.mocked(textRt.generateBesideNode)).toHaveBeenCalledWith('t1', undefined, {
++        placement: 'batch',
++        expectedCount: 1,
++      })
++    })
++
+     it('frame rename-frame → onRenameNode(id)', () => {
+       const onRenameNode = vi.fn()
+       const rt = createRuntime(ctx([frameNode('f1')]), { onRenameNode })
+diff --git a/src/canvas/actions/canvasActionModel.characterization.test.ts b/src/canvas/actions/canvasActionModel.characterization.test.ts
+index fbc5df35..29ba6dcc 100644
+--- a/src/canvas/actions/canvasActionModel.characterization.test.ts
++++ b/src/canvas/actions/canvasActionModel.characterization.test.ts
+@@ -779,10 +779,13 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       expect(onDownloadOriginal).toHaveBeenCalledWith(primary)
+     })
+ 
+-    it('generate-into-slot · ai-slot → generateIntoAiSlot(id)', () => {
++    it('generate-into-slot · ai-slot → generateIntoAiSlot(id, undefined, legacy)', () => {
+       const rt = createRuntime(ctx([aiSlotNode('s1')]))
+       fire(contextMenuGroupsFor(rt), 'generate-into-slot')
+-      expect(vi.mocked(rt.generateIntoAiSlot)).toHaveBeenCalledWith('s1')
++      // P1b:emitters 显式声明排布意图(进槽无源图 → legacy)。
++      expect(vi.mocked(rt.generateIntoAiSlot)).toHaveBeenCalledWith('s1', undefined, {
++        placement: 'legacy',
++      })
+     })
+ 
+     it('crop · image → onCropNode(id)', () => {
+diff --git a/src/canvas/actions/canvasActionModel.slotFill.test.ts b/src/canvas/actions/canvasActionModel.slotFill.test.ts
+new file mode 100644
+index 00000000..289c1d0c
+--- /dev/null
++++ b/src/canvas/actions/canvasActionModel.slotFill.test.ts
+@@ -0,0 +1,90 @@
++/**
++ * F4:生成中/批次占位槽禁二次填充——contextMenu + quickbar 双面正反测试。
++ * 独立文件:canvasActionModel.characterization.test.ts / .quickbar.test.ts 均已
++ * 逼近 900 行 structure-guard 红线,F4 用例提至此(行为契约见
++ * canvasSelectionModel.slotAcceptingFill 实现注释)。
++ */
++import { describe, expect, it, vi } from 'vitest'
++import { contextMenuGroupsFor, quickToolbarGroupsFor } from './canvasActionModel'
++import { createCanvasSelectionContext } from './canvasSelectionModel'
++import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
++import type { CanvasNodeType, MivoCanvasNode } from '../../types/mivoCanvas'
++
++type NodeSeed = Partial<MivoCanvasNode> & { id: string; type: CanvasNodeType }
++
++const node = (seed: NodeSeed): MivoCanvasNode =>
++  ({ title: seed.id, x: 0, y: 0, width: 100, height: 100, status: 'ready', ...seed }) as MivoCanvasNode
++
++const aiSlotNode = (id: string, over: Partial<MivoCanvasNode> = {}) => node({ id, type: 'ai-slot', ...over })
++
++const ctx = (nodes: MivoCanvasNode[]) => createCanvasSelectionContext(nodes)
++
++const createRuntime = (context: ReturnType<typeof ctx>): CanvasActionRuntime =>
++  ({
++    context,
++    clipboardCount: 0,
++    hiddenCount: 0,
++    allNodeIds: context.nodes.map((n) => n.id),
++    setActiveTool: vi.fn(),
++    generateVariations: vi.fn(async () => []),
++    generateImageEdit: vi.fn(async () => []),
++    generateBesideNode: vi.fn(async () => []),
++    generateIntoAiSlot: vi.fn(async () => []),
++  }) as unknown as CanvasActionRuntime
++
++const hasAction = (groups: CanvasActionGroup[], id: string) =>
++  groups.some((g) => g.actions.some((a) => a.id === id || a.children?.some((c) => c.id === id)))
++const groupIds = (groups: CanvasActionGroup[]) => groups.map((g) => g.id).sort()
++const deepActionIds = (groups: CanvasActionGroup[]): string[] =>
++  groups.flatMap((g) => g.actions.flatMap((a) => [a.id, ...(a.children?.map((c) => c.id) ?? [])]))
++const fire = (groups: CanvasActionGroup[], id: string) => {
++  const action: CanvasActionItem | undefined = groups
++    .flatMap((g) => g.actions.flatMap((a) => [a, ...(a.children ?? [])]))
++    .find((a) => a.id === id)
++  if (!action?.onClick) throw new Error(`action not found or no onClick: ${id}`)
++  action.onClick()
++}
++
++describe('F4 ai-slot 禁二次填充(contextMenu)', () => {
++  it('ai-slot generating → 无 generate-into-slot(生成中禁二次填充)', () => {
++    const groups = contextMenuGroupsFor(
++      createRuntime(ctx([aiSlotNode('s1', { status: 'generating', aiWorkflow: { status: 'generating' } as never })])),
++    )
++    expect(hasAction(groups, 'generate-into-slot')).toBe(false)
++    expect(groupIds(groups)).not.toContain('generate')
++  })
++
++  it('ai-slot 批次占位 → 无 generate-into-slot(批次槽由协调器按 ordinal 填充)', () => {
++    const groups = contextMenuGroupsFor(
++      createRuntime(ctx([aiSlotNode('s1', { aiWorkflow: { batchId: 'b1', expectedCount: 2, ordinal: 1 } as never })])),
++    )
++    expect(hasAction(groups, 'generate-into-slot')).toBe(false)
++  })
++
++  it('ai-slot 空闲(ready)→ generate-into-slot 可用且触发 legacy', () => {
++    const rt = createRuntime(ctx([aiSlotNode('s1')]))
++    fire(contextMenuGroupsFor(rt), 'generate-into-slot')
++    expect(vi.mocked(rt.generateIntoAiSlot)).toHaveBeenCalledWith('s1', undefined, { placement: 'legacy' })
++  })
++})
++
++describe('F4 ai-slot 禁二次填充(quickbar)', () => {
++  it('ai-slot generating → 无 fill-slot,bring-front 保留', () => {
++    const groups = quickToolbarGroupsFor(
++      createRuntime(ctx([aiSlotNode('s1', { status: 'generating', aiWorkflow: { status: 'generating' } as never })])),
++    )
++    expect(deepActionIds(groups)).toEqual(['bring-front'])
++  })
++
++  it('ai-slot 批次占位 → 无 fill-slot', () => {
++    const groups = quickToolbarGroupsFor(
++      createRuntime(ctx([aiSlotNode('s1', { aiWorkflow: { batchId: 'b1', expectedCount: 2, ordinal: 1 } as never })])),
++    )
++    expect(deepActionIds(groups)).toEqual(['bring-front'])
++  })
++
++  it('ai-slot 空闲(ready)→ fill-slot / bring-front 齐全', () => {
++    const groups = quickToolbarGroupsFor(createRuntime(ctx([aiSlotNode('s1')])))
++    expect(deepActionIds(groups)).toEqual(['fill-slot', 'bring-front'])
++  })
++})
+diff --git a/src/canvas/actions/canvasActionModel.ts b/src/canvas/actions/canvasActionModel.ts
+index cac533ee..dc9e5281 100644
+--- a/src/canvas/actions/canvasActionModel.ts
++++ b/src/canvas/actions/canvasActionModel.ts
+@@ -33,7 +33,7 @@ import {
+ } from './sectionStyleActions'
+ import { debugLogger } from '../../store/debugLogStore'
+ import type { CanvasNodeType } from '../../types/mivoCanvas'
+-import { hasAnyCapability, hasCommonCapability } from './canvasSelectionModel'
++import { hasAnyCapability, hasCommonCapability, slotAcceptingFill } from './canvasSelectionModel'
+ import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
+ import {
+   aiEditActionFor,
+@@ -138,7 +138,7 @@ const generationContextMenuGroupsFor: NodeActionExtension = (runtime) => {
+   const { context } = runtime
+   if (context.kind !== 'single') return []
+ 
+-  const slotSelected = hasAnyCapability(context, 'aiSlot')
++  const slotSelected = hasAnyCapability(context, 'aiSlot') && slotAcceptingFill(runtime)
+   const imageSelected = context.primaryNode?.type === 'image'
+   const generateActions: CanvasActionItem[] = [
+     ...(slotSelected
+@@ -417,7 +417,7 @@ const aiSlotQuickToolbarGroupsFor: NodeActionExtension = (runtime) => [
+   {
+     id: 'ai-slot',
+     actions: [
+-      { id: 'fill-slot', label: t('menu.generate.generate'), icon: ImagePlus, onClick: () => generateIntoPrimarySlot(runtime) },
++      ...(slotAcceptingFill(runtime) ? [{ id: 'fill-slot', label: t('menu.generate.generate'), icon: ImagePlus, onClick: () => generateIntoPrimarySlot(runtime) }] : []),
+       { id: 'bring-front', label: t('menu.layer.front'), icon: ChevronsUp, onClick: () => moveLayerAction(runtime, 'front') },
+     ],
+   },
+diff --git a/src/canvas/actions/canvasCommand.ts b/src/canvas/actions/canvasCommand.ts
+index e5255c7c..e25cd5e5 100644
+--- a/src/canvas/actions/canvasCommand.ts
++++ b/src/canvas/actions/canvasCommand.ts
+@@ -77,6 +77,14 @@ export type CanvasCommandGenerationOptions = {
+   model?: string
+   /** Two-stage asset: reference image Blobs uploaded → content-hash assetIds. Resolved to File[] at apply (PR2). */
+   referenceAssetIds?: string[]
++  /** P1b 排布意图(runtime-only,可序列化字段随命令透传回放侧,保证跨端一致):
++   *  placement: 'legacy' | 'batch';批次成员三元组 derivedBatchId/expectedCount/ordinal。
++   *  回放侧 mapGenerationOptions 原样透传给 store action;丢失会导致批次列
++   *  布局只在发起端生效、另一端看到旧排布。 */
++  placement?: 'legacy' | 'batch'
++  derivedBatchId?: string
++  expectedCount?: number
++  ordinal?: number
+ }
+ 
+ /**
+diff --git a/src/canvas/actions/canvasCommandExecutor.test.ts b/src/canvas/actions/canvasCommandExecutor.test.ts
+index b6c78333..3b8f3f61 100644
+--- a/src/canvas/actions/canvasCommandExecutor.test.ts
++++ b/src/canvas/actions/canvasCommandExecutor.test.ts
+@@ -24,6 +24,7 @@ import {
+   deserializeCanvasCommand,
+   serializeCanvasCommand,
+ } from './canvasCommand'
++import type { CanvasCommandAssetBridge } from './canvasCommandExecutor'
+ 
+ describe('applyCanvasCommand — node creation dispatch', () => {
+   it('add-text-node → addTextNode(position, text); returns new id', () => {
+@@ -418,3 +419,68 @@ function buildDeferredCommand(kind: string): CanvasCommandForTest {
+ }
+ 
+ type CanvasCommandForTest = Parameters<typeof applyCanvasCommand>[0]
++
++// P1b:回放侧三元组透传端到端(p1b-replay-consumes-triplet)。
++// 命令 options 携带批次三元组 → serialize → deserialize → apply → 断言
++// runtime 收到的 options 与原始逐字段相等(发起端与回放侧排布一致)。
++describe('applyCanvasCommand — replay preserves batch triplet (P1b)', () => {
++  const bridge: CanvasCommandAssetBridge = {
++    resolveAssetFile: async () => new File(['x'], 'x.png', { type: 'image/png' }),
++    addImportedAssetNode: async () => 'imported-id',
++    submitImageMaskEdit: async () => ['mask-id'],
++  }
++
++  it('replay_preserves_batch_triplet_end_to_end: serialize→deserialize→回放,store 侧收到三字段逐字段相等', async () => {
++    const rt = createMockRuntime()
++    const original = {
++      kind: 'generate-beside-node' as const,
++      sourceNodeId: 'n1',
++      prompt: 'a cat',
++      options: { placement: 'batch' as const, expectedCount: 1 },
++    }
++    const roundTripped = deserializeCanvasCommand(serializeCanvasCommand(original))
++    await applyCanvasCommand(roundTripped, rt, bridge)
++    expect(rt.generateBesideNode).toHaveBeenCalledWith(
++      'n1',
++      'a cat',
++      expect.objectContaining({ placement: 'batch', expectedCount: 1 }),
++    )
++
++    const member = {
++      kind: 'generate-beside-node' as const,
++      sourceNodeId: 'n1',
++      prompt: 'a cat',
++      options: { derivedBatchId: 'b1', expectedCount: 2, ordinal: 1 },
++    }
++    const memberRoundTripped = deserializeCanvasCommand(serializeCanvasCommand(member))
++    await applyCanvasCommand(memberRoundTripped, rt, bridge)
++    expect(rt.generateBesideNode).toHaveBeenCalledWith(
++      'n1',
++      'a cat',
++      expect.objectContaining({ derivedBatchId: 'b1', expectedCount: 2, ordinal: 1 }),
++    )
++  })
++
++  it('负向:剥掉 ordinal → 回放侧不静默补值(round-trip 保真,缺失会原样到 store 触发 fail-closed)', async () => {
++    const rt = createMockRuntime()
++    const stripped = {
++      kind: 'generate-beside-node' as const,
++      sourceNodeId: 'n1',
++      prompt: 'a cat',
++      options: { derivedBatchId: 'b1', expectedCount: 2 },
++    }
++    const roundTripped = deserializeCanvasCommand(serializeCanvasCommand(stripped))
++    await applyCanvasCommand(roundTripped, rt, bridge)
++    // 不静默降级:ordinal 不会凭空出现,回放侧收到的与序列化前逐字段一致。
++    expect(rt.generateBesideNode).toHaveBeenCalledWith(
++      'n1',
++      'a cat',
++      expect.not.objectContaining({ ordinal: expect.anything() }),
++    )
++    expect(rt.generateBesideNode).toHaveBeenCalledWith(
++      'n1',
++      'a cat',
++      expect.objectContaining({ derivedBatchId: 'b1', expectedCount: 2 }),
++    )
++  })
++})
+diff --git a/src/canvas/actions/canvasSelectionModel.ts b/src/canvas/actions/canvasSelectionModel.ts
+index 9733e99a..f2416a22 100644
+--- a/src/canvas/actions/canvasSelectionModel.ts
++++ b/src/canvas/actions/canvasSelectionModel.ts
+@@ -53,3 +53,18 @@ export const hasAnyCapability = (
+   context: CanvasSelectionContext,
+   capability: CanvasObjectCapability,
+ ) => context.anyCapabilities.has(capability)
++
++// F4:生成中/批次占位槽禁止二次填充——生成进行中(generating/queued)或已属于
++// 某批次(aiWorkflow.batchId 非空,批次成员槽由批次协调器按 ordinal 填充)的
++// ai-slot 不得再被填充菜单/快捷条触发,杜绝 legacy 二次请求竞态删槽。
++export const slotAcceptingFill = (runtime: { context: CanvasSelectionContext }): boolean => {
++  const node = runtime.context.primaryNode
++  return Boolean(
++    node &&
++      node.type === 'ai-slot' &&
++      node.status !== 'generating' &&
++      node.aiWorkflow?.status !== 'generating' &&
++      node.aiWorkflow?.status !== 'queued' &&
++      !node.aiWorkflow?.batchId,
++  )
++}
+diff --git a/src/canvas/actions/canvasSyncRuntime.block1.test.ts b/src/canvas/actions/canvasSyncRuntime.block1.test.ts
+index 2be4cef9..00a3eb11 100644
+--- a/src/canvas/actions/canvasSyncRuntime.block1.test.ts
++++ b/src/canvas/actions/canvasSyncRuntime.block1.test.ts
+@@ -313,7 +313,7 @@ describe('T2.2 Block 1 — ai-slot 占位落 server + rollback(delete-node)', ()
+     const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'cat' })
+     await drain()
+     pollTask.mockResolvedValueOnce(failedView('boom'))
+-    await expect(generationFacade.generateIntoAiSlot(prep.slotId, 'cat', { sceneId: 'c1' })).rejects.toThrow(/boom/)
++    await expect(generationFacade.generateIntoAiSlot(prep.slotId, 'cat', { sceneId: 'c1', placement: 'legacy' })).rejects.toThrow(/boom/)
+     await drain()
+ 
+     const createCalls = submitChange.mock.calls.filter(([cid, ch]) => cid === 'c1' && (ch as { kind?: string }).kind === 'create-node')
+@@ -337,7 +337,7 @@ describe('T2.2 Block 1 — ai-slot 占位落 server + rollback(delete-node)', ()
+     const controller = new AbortController()
+     controller.abort()
+     await expect(
+-      generationFacade.generateIntoAiSlot(prep.slotId, 'cat', { sceneId: 'c1', signal: controller.signal }),
++      generationFacade.generateIntoAiSlot(prep.slotId, 'cat', { sceneId: 'c1', signal: controller.signal, placement: 'legacy' }),
+     ).rejects.toThrow()
+     await drain()
+ 
+@@ -358,7 +358,7 @@ describe('T2.2 Block 1 — ai-slot 占位落 server + rollback(delete-node)', ()
+     const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'cat' })
+     await drain()
+     pollTask.mockResolvedValueOnce(failedView('boom'))
+-    await expect(generationFacade.generateIntoAiSlot(prep.slotId, 'cat', { sceneId: 'c1' })).rejects.toThrow(/boom/)
++    await expect(generationFacade.generateIntoAiSlot(prep.slotId, 'cat', { sceneId: 'c1', placement: 'legacy' })).rejects.toThrow(/boom/)
+     await drain()
+ 
+     expect(submitChange).not.toHaveBeenCalled()
+@@ -373,7 +373,7 @@ describe('T2.2 Block 1 — ai-slot 占位落 server + rollback(delete-node)', ()
+     const prep1 = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'cat' })
+     await drain()
+     pollTask.mockResolvedValueOnce(failedView('boom'))
+-    await expect(generationFacade.generateIntoAiSlot(prep1.slotId, 'cat', { sceneId: 'c1' })).rejects.toThrow(/boom/)
++    await expect(generationFacade.generateIntoAiSlot(prep1.slotId, 'cat', { sceneId: 'c1', placement: 'legacy' })).rejects.toThrow(/boom/)
+     await drain()
+ 
+     // 失败已删 A(delete-node for prep1.slotId)
+@@ -410,7 +410,7 @@ describe('T2.2 Block 1 — ai-slot 占位落 server + rollback(delete-node)', ()
+     // runtime.generateIntoAiSlot(菜单路径)失败 → F4 注入 onSceneMutation → catch 删 slot 发 delete-node。
+     // 覆盖 baselineSnapshot rollback 分支:菜单不传 skipSlotHistoryBaseline → generateIntoAiSlot:586 捕获 baselineSnapshot
+     // → catch 走 rollbackLatestHistoryBaseline(chat F1 走 skipSlotHistoryBaseline→filter 分支,此例补 rollback 分支)。
+-    await expect(runtime.generateIntoAiSlot(slotId, 'cat', { sceneId: 'c1' })).rejects.toThrow(/boom/)
++    await expect(runtime.generateIntoAiSlot(slotId, 'cat', { sceneId: 'c1', placement: 'legacy' })).rejects.toThrow(/boom/)
+     await drain()
+ 
+     expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'delete-node', nodeId: slotId }))
+diff --git a/src/canvas/actions/canvasSyncRuntime.block3.test.ts b/src/canvas/actions/canvasSyncRuntime.block3.test.ts
+index 7cdb611a..96629a05 100644
+--- a/src/canvas/actions/canvasSyncRuntime.block3.test.ts
++++ b/src/canvas/actions/canvasSyncRuntime.block3.test.ts
+@@ -400,7 +400,9 @@ describe('T2.2 Block 3 — deferred-kinds server-wire 验收矩阵', () => {
+       ),
+     )
+     seed(seedCanvas(SCENE, [imageNode({ id: 'n1' })]))
+-    await useCanvasStore.getState().generateVariations('n1', undefined, {})
++    // server-wire 矩阵:验证 failedSlots 经 wrap → create-node(失败槽位新建),
++    // 走显式 legacy 保留原行为(批次模式失败槽是预建 slot settle,非 create-node)。
++    await useCanvasStore.getState().generateVariations('n1', undefined, { placement: 'legacy' })
+     await flushSubmit()
+     expectAllCallsAnchorScene() // P2:逐 call 锚 SCENE(canvasId)
+     const createNodeCalls = submitChange.mock.calls.filter(
+@@ -449,7 +451,7 @@ describe('T2.2 Block 3 — deferred-kinds server-wire 验收矩阵', () => {
+     const { generationFacade } = await import('../../store/generationFacade')
+     seed(seedCanvas(SCENE, [aiSlotNode({ id: 'slot-1' })]))
+     // 用与 slot 原始 prompt('a cat')不同的 prompt,使 generation.prompt/aiWorkflow.prompt 在 generating edit-node 里"变"出 intent
+-    await generationFacade.generateIntoAiSlot('slot-1', 'a refreshed cat', { sceneId: SCENE })
++    await generationFacade.generateIntoAiSlot('slot-1', 'a refreshed cat', { sceneId: SCENE, placement: 'legacy' })
+     await flushSubmit()
+ 
+     // 全链 submitChange 均锚 SCENE(canvasId)
+diff --git a/src/lib/safeArgs.ts b/src/lib/safeArgs.ts
+index c227999e..2c6081e6 100644
+--- a/src/lib/safeArgs.ts
++++ b/src/lib/safeArgs.ts
+@@ -50,6 +50,11 @@ const defineOwn = (target: Record<string, unknown>, key: string, value: unknown)
+ /** 读单个字段:只认 own 数据属性,读不到返回 undefined(不落原型链)。 */
+ export const readOwnProp = (source: unknown, key: string): unknown => ownDataProp(source, key).value
+ 
++/** 判 own 数据属性**是否存在**(含值为 null/undefined 的显式键)。presence 判定
++ *  必须按「键有没有被显式携带」而非「值是否非空」——H1(fix3)前 canvasAgentVerbs
++ *  按值判 presence,`{derivedBatchId:null}` 被算成未提供 → 静默重解释为新批次。 */
++export const hasOwnDataProp = (source: unknown, key: string): boolean => ownDataProp(source, key).hit
++
+ /**
+  * 按 allowlist 收窄:只保留 allowlist 里**确实存在**的 own 数据属性。
+  * allowlist 外的键(含 `__proto__`)一概不进结果;缺席的键不会被写成 undefined,
+diff --git a/src/store/canvasDocumentModel.ts b/src/store/canvasDocumentModel.ts
+index f873c2d1..26f22c2e 100644
+--- a/src/store/canvasDocumentModel.ts
++++ b/src/store/canvasDocumentModel.ts
+@@ -823,3 +823,23 @@ export const importedAssetModelFor = (type: Exclude<CanvasAssetNodeType, 'markdo
+   if (type === 'video') return 'Imported Video'
+   return 'Imported'
+ }
++
++// F5:chat 有源判定兜底——sourceNodeType 缺失或陈旧(节点已被替换/移动)时,
++// 按 sourceNodeId 现场解析节点类型,不单信 UI 布尔。纯函数(供 chatStore 单测)。
++// 语义:节点在场且是 image 类型才视为「有源图」。
++// G4(修复轮2):sourceNodeId 在场但节点已删/被隐藏 → 一律按无源(undefined)处理,
++// 不得回退陈旧 sourceNodeType——陈旧布尔会把已删源的 retry 误判成有源(走批次),
++// 而实际应按无源→legacy。
++export const resolvedSourceNodeType = (
++  sourceNodeId: string | undefined,
++  sourceNodeType: string | undefined,
++  nodes: Array<{ id: string; type: string; hidden?: boolean }>,
++): string | undefined => {
++  if (sourceNodeId) {
++    const live = nodes.find((node) => node.id === sourceNodeId && !node.hidden)
++    // 节点在场 → 现场类型;节点已删或被隐藏 → 无源(undefined),不回退陈旧布尔。
++    return live ? live.type : undefined
++  }
++  // 从未指定源:退回传入的 UI 布尔(不强制类型兜底)。
++  return sourceNodeType
++}
+diff --git a/src/store/canvasStateTypes.ts b/src/store/canvasStateTypes.ts
+index 2855be64..e6b828c5 100644
+--- a/src/store/canvasStateTypes.ts
++++ b/src/store/canvasStateTypes.ts
+@@ -115,7 +115,11 @@ export type CanvasGenerationOptions = {
+ export const assertBatchTriplet = (
+   options: Pick<CanvasGenerationOptions, 'derivedBatchId' | 'expectedCount' | 'ordinal'>,
+ ): void => {
+-  const present = [options.derivedBatchId, options.expectedCount, options.ordinal].filter((v) => v !== undefined).length
++  // H1(fix3):null 不是合法凭证,与 undefined 同为「未携带」——否则三键全 null 被
++  // 算成 present=3 → 误判完整三元组,拿 null batchId 找 slot 永远找不到。
++  const present = [options.derivedBatchId, options.expectedCount, options.ordinal].filter(
++    (v) => v !== undefined && v !== null,
++  ).length
+   if (present === 0) return
+   if (present !== 3 || options.derivedBatchId === undefined || options.expectedCount === undefined || options.ordinal === undefined) {
+     throw new Error('批次选项必须完整提供 derivedBatchId/expectedCount/ordinal,或全部省略(单次生成)')
+diff --git a/src/store/chatStore.test.ts b/src/store/chatStore.test.ts
+index 0fdd21a3..bb05ab86 100644
+--- a/src/store/chatStore.test.ts
++++ b/src/store/chatStore.test.ts
+@@ -64,6 +64,12 @@ const genFacadeSpies = vi.hoisted(() => ({
+   generateIntoAiSlot: vi.fn(),
+   generateBesideNode: vi.fn(),
+   getSceneChangeInfo: vi.fn(),
++  // F5:真实实现按 sourceNodeId 现场解析节点类型;测试 mock 默认退回传入布尔,
++  // 有源判定测试显式覆写为 'image' 以驱动 beside 分支。
++  // G4:签名含目标 sceneId(跨场景 retry 断言用)。
++  resolveLiveSourceNodeType: vi.fn(
++    (_sceneId: string | undefined, _id: string | undefined, type: string | undefined) => type,
++  ),
+ }))
+ vi.mock('./generationFacade', () => ({ generationFacade: genFacadeSpies }))
+ 
+@@ -177,6 +183,218 @@ describe('sendMessage (S03b: 参考图保存失败不丢消息)', () => {
+   })
+ })
+ 
++describe('chat_entries_declare_batch_intent (F6: chat 生成入口显式声明批次意图)', () => {
++  beforeEach(() => {
++    genFacadeSpies.prepareChatSlot.mockReset()
++    genFacadeSpies.generateIntoAiSlot.mockReset()
++    genFacadeSpies.generateBesideNode.mockReset()
++    genFacadeSpies.getSceneChangeInfo.mockReset()
++    vi.mocked(enhanceMivoPrompt).mockReset()
++  })
++
++  it('sendMessage 无源图(进槽)→ 调 generateIntoAiSlot 且 options 带 placement:legacy', async () => {
++    genFacadeSpies.prepareChatSlot.mockReturnValue({ slotId: 'slot-1', mode: 'into-slot' })
++    genFacadeSpies.getSceneChangeInfo.mockReturnValue({ sceneChanged: false, currentSceneId: 'scene-1' })
++    genFacadeSpies.generateIntoAiSlot.mockResolvedValueOnce(['node-1'])
++    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: false })
++    await useChatStore.getState().sendMessage({ sceneId: 'scene-1', text: '画一只猫' })
++    expect(genFacadeSpies.generateIntoAiSlot).toHaveBeenCalledTimes(1)
++    const [, , options] = genFacadeSpies.generateIntoAiSlot.mock.calls[0]
++    // P1b:进槽必须显式 legacy,不得隐式旧路径
++    expect(options).toMatchObject({ placement: 'legacy' })
++  })
++
++  it('sendMessage 有源图(旁生成)→ 调 generateBesideNode 且 options 带 placement:batch + expectedCount:1', async () => {
++    genFacadeSpies.prepareChatSlot.mockReturnValue({ slotId: undefined, mode: 'beside' })
++    genFacadeSpies.getSceneChangeInfo.mockReturnValue({ sceneChanged: false, currentSceneId: 'scene-1' })
++    genFacadeSpies.generateBesideNode.mockResolvedValueOnce(['node-1'])
++    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: false })
++    // F5:mock 兜底默认按传入布尔返回,这里显式给 image 驱动 beside 分支。
++    vi.mocked(genFacadeSpies.resolveLiveSourceNodeType).mockReturnValueOnce('image')
++    await useChatStore.getState().sendMessage({
++      sceneId: 'scene-1',
++      text: '换个风格',
++      selectedNodeId: 'img1',
++      selectedNodeType: 'image',
++    })
++    expect(genFacadeSpies.generateBesideNode).toHaveBeenCalledTimes(1)
++    const [, , options] = genFacadeSpies.generateBesideNode.mock.calls[0]
++    expect(options).toMatchObject({ placement: 'batch', expectedCount: 1 })
++  })
++
++  it('retryMessage 无源图 → 进槽且显式 legacy(有源分支见下方两个 G4 用例)', async () => {
++    genFacadeSpies.prepareChatSlot.mockReturnValue({ slotId: 'slot-1', mode: 'into-slot' })
++    genFacadeSpies.getSceneChangeInfo.mockReturnValue({ sceneChanged: false, currentSceneId: 'scene-1' })
++    genFacadeSpies.generateIntoAiSlot.mockResolvedValueOnce(['node-1'])
++    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: false })
++    useChatStore.setState({
++      messagesByScene: {
++        'scene-1': [
++          { id: 'u1', role: 'user', kind: 'text', text: 'x', createdAt: 0, status: 'done' },
++          {
++            id: 'a1', role: 'assistant', kind: 'text', text: '', createdAt: 0, status: 'error',
++            error: '上游超时', errorKind: 'timeout',
++            generationContext: {
++              model: 'gpt-image-2',
++              requestedImgRatio: 'auto', requestedQuality: 'auto',
++              finalPrompt: 'x',
++            },
++          },
++        ],
++      },
++    } as never)
++    await useChatStore.getState().retryMessage({ sceneId: 'scene-1', messageId: 'a1' })
++    const [, , options] = genFacadeSpies.generateIntoAiSlot.mock.calls[0]
++    expect(options).toMatchObject({ placement: 'legacy' })
++  })
++
++  // G4(修复轮2):跨场景 retry——消息属 scene-2,活跃板是 scene-1;有源解析必须
++  // 锚定 chat 目标 sceneId(本板文档),不能按活跃板解析(否则漏判有源/误判有源)。
++  it('retryMessage 跨场景有源 → resolveLiveSourceNodeType 锚定 chat 目标 sceneId', async () => {
++    genFacadeSpies.prepareChatSlot.mockReturnValue({ slotId: undefined, mode: 'beside' })
++    genFacadeSpies.getSceneChangeInfo.mockReturnValue({ sceneChanged: false, currentSceneId: 'scene-1' })
++    genFacadeSpies.generateBesideNode.mockResolvedValueOnce(['node-1'])
++    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: false })
++    vi.mocked(genFacadeSpies.resolveLiveSourceNodeType).mockReturnValueOnce('image')
++    vi.mocked(genFacadeSpies.resolveLiveSourceNodeType).mockClear()
++    useChatStore.setState({
++      messagesByScene: {
++        'scene-2': [
++          { id: 'u1', role: 'user', kind: 'text', text: 'x', createdAt: 0, status: 'done' },
++          {
++            id: 'a1', role: 'assistant', kind: 'text', text: '', createdAt: 0, status: 'error',
++            error: '上游超时', errorKind: 'timeout',
++            generationContext: {
++              model: 'gpt-image-2',
++              requestedImgRatio: 'auto', requestedQuality: 'auto',
++              finalPrompt: 'x',
++              sourceNodeId: 'img1',
++              sourceNodeType: 'image',
++            },
++          },
++        ],
++      },
++    } as never)
++    await useChatStore.getState().retryMessage({ sceneId: 'scene-2', messageId: 'a1' })
++    // 解析器收到的是目标板 scene-2(不是活跃板 scene-1)。
++    expect(genFacadeSpies.resolveLiveSourceNodeType).toHaveBeenCalledWith('scene-2', 'img1', 'image')
++    expect(genFacadeSpies.generateBesideNode).toHaveBeenCalledTimes(1)
++    const [, , options] = genFacadeSpies.generateBesideNode.mock.calls[0]
++    expect(options).toMatchObject({ placement: 'batch', expectedCount: 1 })
++  })
++
++  // G4(修复轮2):源已删——有陈旧 sourceNodeType('image')但节点不在场,解析器按
++  // G4 语义返回 undefined(无源)→ legacy 进槽,不得因陈旧布尔误判有源走批次。
++  it('retryMessage 源已删(陈旧 sourceNodeType)→ 解析为无源 → legacy 进槽', async () => {
++    genFacadeSpies.prepareChatSlot.mockReturnValue({ slotId: 'slot-1', mode: 'into-slot' })
++    genFacadeSpies.getSceneChangeInfo.mockReturnValue({ sceneChanged: false, currentSceneId: 'scene-1' })
++    genFacadeSpies.generateIntoAiSlot.mockResolvedValueOnce(['node-1'])
++    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: false })
++    vi.mocked(genFacadeSpies.resolveLiveSourceNodeType).mockReturnValueOnce(undefined)
++    vi.mocked(genFacadeSpies.resolveLiveSourceNodeType).mockClear()
++    useChatStore.setState({
++      messagesByScene: {
++        'scene-1': [
++          { id: 'u1', role: 'user', kind: 'text', text: 'x', createdAt: 0, status: 'done' },
++          {
++            id: 'a1', role: 'assistant', kind: 'text', text: '', createdAt: 0, status: 'error',
++            error: '上游超时', errorKind: 'timeout',
++            generationContext: {
++              model: 'gpt-image-2',
++              requestedImgRatio: 'auto', requestedQuality: 'auto',
++              finalPrompt: 'x',
++              sourceNodeId: 'img-gone',
++              sourceNodeType: 'image',
++            },
++          },
++        ],
++      },
++    } as never)
++    await useChatStore.getState().retryMessage({ sceneId: 'scene-1', messageId: 'a1' })
++    expect(genFacadeSpies.resolveLiveSourceNodeType).toHaveBeenCalledWith('scene-1', 'img-gone', 'image')
++    expect(genFacadeSpies.generateIntoAiSlot).toHaveBeenCalledTimes(1)
++    const [, , options] = genFacadeSpies.generateIntoAiSlot.mock.calls[0]
++    expect(options).toMatchObject({ placement: 'legacy' })
++  })
++
++  // P1(beta2 修复):re-enhance 分支(无 finalPrompt → 重跑 enhance)不得单信持久化
++  // context.sourceNodeType。跨场景/源删除时该布尔陈旧,与生成时的 live resolve(G4/F5)
++  // 分裂:enhance 前须现场解析,且 await 后生成侧仍重新解析(不缓存跨 await)。
++  it('retryMessage 跨场景源已删且无 finalPrompt → re-enhance hasSelectedImage=false,生成 legacy', async () => {
++    genFacadeSpies.prepareChatSlot.mockReturnValue({ slotId: 'slot-1', mode: 'into-slot' })
++    genFacadeSpies.getSceneChangeInfo.mockReturnValue({ sceneChanged: false, currentSceneId: 'scene-1' })
++    genFacadeSpies.generateIntoAiSlot.mockResolvedValueOnce(['node-1'])
++    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: false })
++    // 源缺失/隐藏:现场解析返回 undefined(无源),尽管持久化 sourceNodeType='image'。
++    vi.mocked(genFacadeSpies.resolveLiveSourceNodeType).mockReturnValueOnce(undefined)
++    vi.mocked(genFacadeSpies.resolveLiveSourceNodeType).mockClear()
++    useChatStore.setState({
++      messagesByScene: {
++        'scene-2': [
++          { id: 'u1', role: 'user', kind: 'text', text: 'x', createdAt: 0, status: 'done' },
++          {
++            id: 'a1', role: 'assistant', kind: 'text', text: '', createdAt: 0, status: 'error',
++            error: '上游超时', errorKind: 'timeout',
++            // 无 finalPrompt → retry 必须重跑 enhance(进入 re-enhance 分支)
++            generationContext: {
++              model: 'gpt-image-2',
++              requestedImgRatio: 'auto', requestedQuality: 'auto',
++              sourceNodeId: 'img-gone',
++              sourceNodeType: 'image',
++            },
++          },
++        ],
++      },
++    } as never)
++    await useChatStore.getState().retryMessage({ sceneId: 'scene-2', messageId: 'a1' })
++    // re-enhance 分支也现场解析,且锚定 chat 目标 sceneId(不是活跃板 scene-1)。
++    expect(genFacadeSpies.resolveLiveSourceNodeType).toHaveBeenCalledWith('scene-2', 'img-gone', 'image')
++    // 解析为无源 → enhancer 不得看到陈旧 'image' 布尔。
++    expect(vi.mocked(enhanceMivoPrompt)).toHaveBeenCalledWith(
++      expect.objectContaining({ hasSelectedImage: false }),
++    )
++    // 生成走 legacy 进槽(不得因陈旧布尔误判有源走 beside/batch)。
++    expect(genFacadeSpies.generateIntoAiSlot).toHaveBeenCalledTimes(1)
++    const [, , options] = genFacadeSpies.generateIntoAiSlot.mock.calls[0]
++    expect(options).toMatchObject({ placement: 'legacy' })
++  })
++
++  it('retryMessage 有源且无 finalPrompt → re-enhance hasSelectedImage=true,生成 beside/batch', async () => {
++    genFacadeSpies.prepareChatSlot.mockReturnValue({ slotId: undefined, mode: 'beside' })
++    genFacadeSpies.getSceneChangeInfo.mockReturnValue({ sceneChanged: false, currentSceneId: 'scene-1' })
++    genFacadeSpies.generateBesideNode.mockResolvedValueOnce(['node-1'])
++    vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: false })
++    vi.mocked(genFacadeSpies.resolveLiveSourceNodeType).mockReturnValueOnce('image')
++    vi.mocked(genFacadeSpies.resolveLiveSourceNodeType).mockClear()
++    useChatStore.setState({
++      messagesByScene: {
++        'scene-1': [
++          { id: 'u1', role: 'user', kind: 'text', text: 'x', createdAt: 0, status: 'done' },
++          {
++            id: 'a1', role: 'assistant', kind: 'text', text: '', createdAt: 0, status: 'error',
++            error: '上游超时', errorKind: 'timeout',
++            generationContext: {
++              model: 'gpt-image-2',
++              requestedImgRatio: 'auto', requestedQuality: 'auto',
++              sourceNodeId: 'img1',
++              sourceNodeType: 'image',
++            },
++          },
++        ],
++      },
++    } as never)
++    await useChatStore.getState().retryMessage({ sceneId: 'scene-1', messageId: 'a1' })
++    expect(vi.mocked(enhanceMivoPrompt)).toHaveBeenCalledWith(
++      expect.objectContaining({ hasSelectedImage: true }),
++    )
++    // enhance 前一次 live resolve + await 后生成侧再一次 live resolve(不缓存跨 await)。
++    expect(genFacadeSpies.resolveLiveSourceNodeType).toHaveBeenCalledTimes(2)
++    expect(genFacadeSpies.generateBesideNode).toHaveBeenCalledTimes(1)
++    const [, , options] = genFacadeSpies.generateBesideNode.mock.calls[0]
++    expect(options).toMatchObject({ placement: 'batch', expectedCount: 1 })
++  })
++})
++
+ // S01: sendMessage(:228) / retryMessage(:494) 第二道 isBusy return 不能静默丢输入。
+ // send 路径：参考图已落 IDB，必须落失败态消息引用 referenceAssetUrls（不孤儿、不丢输入）。
+ // retry 路径：targetMsg 仍在、referenceFiles 临时读出未消费，warn 后 return 即可。
+diff --git a/src/store/chatStore.ts b/src/store/chatStore.ts
+index 03c5f2b7..f7d48067 100644
+--- a/src/store/chatStore.ts
++++ b/src/store/chatStore.ts
+@@ -1,8 +1,8 @@
+ import { create } from 'zustand'
+ import { persist } from 'zustand/middleware'
+-import type { EnhanceDegradedReason, GenerationRatio, MivoImageQuality } from '../types/generation'
++import type { MivoImageQuality } from '../types/generation'
+ import { readImportedAssetFile, saveImportedAsset } from '../lib/assetStorage'
+-import { enhanceMivoPrompt, type MivoImageRequestErrorKind } from '../lib/mivoImageClient'
++import { enhanceMivoPrompt } from '../lib/mivoImageClient'
+ import { getModelCapabilities } from '../lib/modelCapabilities'
+ import { settleCanvasGenerationLocally } from './canvasGenerationCancel'
+ import { fallbackCancelTarget } from './chatGenerationHydration'
+@@ -16,6 +16,7 @@ import { isChatBlockedForAnonymous, enqueueChatAppend, registerChatStoreAccessor
+ import { chatPersistOptions } from './chatPersistConfig'
+ import { t } from '../i18n'
+ import {
++
+   canceledGenerationMessage,
+   displayChatError,
+   errorInfoForChat,
+@@ -23,107 +24,9 @@ import {
+   isTimeoutErrorKind,
+   referenceAssetMissingMessage,
+ } from './chatErrorKeys'
++import type { ChatGenerationContext, ChatMessage, ChatState } from './chatStoreTypes'
++export type { ChatMessageStatus, ChatMessageOrigin, ChatMessageErrorKind, ChatEnhanceResult, ChatParamOverrides, MaskEditMessageContext, ChatGenerationContext, ChatMessage, ChatState } from './chatStoreTypes'
+ 
+-export type ChatMessageStatus = 'enhancing' | 'generating' | 'done' | 'error'
+-export type ChatMessageOrigin = 'chat' | 'mask-edit'
+-export type ChatMessageErrorKind = MivoImageRequestErrorKind | 'unknown'
+-
+-export type ChatEnhanceResult = {
+-  scene?: string
+-  reasoning?: string
+-  richPrompt?: string
+-  imgRatio?: GenerationRatio
+-  quality?: MivoImageQuality
+-  /** FIX-3: 收窄为 union，不放宽回 string。persisted legacy 字符串在
+-   *  chatStoreMigrate.sanitizeEnhanceDegradedReason 处 runtime normalize。 */
+-  degradedReason?: EnhanceDegradedReason
+-  /** W4: 哪一档 LLM 降级（primary/fallback），透传自 EnhanceResponse.stage。 */
+-  stage?: 'primary' | 'fallback'
+-}
+-
+-export type ChatParamOverrides = {
+-  imgRatio: 'auto' | GenerationRatio
+-  quality: 'auto' | MivoImageQuality
+-}
+-
+-export type MaskEditMessageContext = {
+-  sourceTitle?: string
+-  serverTaskId?: string
+-  sourceDeleted?: boolean
+-  phase?: 'enhancing' | 'submitting' | 'polling' | 'self-heal-retry'
+-}
+-
+-export type ChatGenerationContext = {
+-  sourceNodeId?: string
+-  sourceNodeType?: string
+-  referenceAssetUrls?: string[]
+-  model: string
+-  requestedImgRatio: ChatParamOverrides['imgRatio']
+-  requestedQuality: ChatParamOverrides['quality']
+-  imgRatio?: GenerationRatio
+-  quality?: MivoImageQuality
+-  finalPrompt?: string
+-  pendingSlotId?: string
+-  /** FIX-4: chat 模式澄清附言（replyText）持久化到 context，retry 不重跑 enhance
+-   *  时也能从 context 读回并在生成成功后 appendNotice，与 send 路径语义一致。 */
+-  noticeText?: string
+-  /** mask-chat-card: mask edit 卡片状态机。runtime 不持久化（abortController/Blob 不可序列化），
+-   *  但 serverTaskId/sourceDeleted 持久化供刷新后 cancel fallback 与归因。 */
+-  maskEdit?: MaskEditMessageContext
+-}
+-
+-export type ChatMessage = {
+-  id: string
+-  role: 'user' | 'assistant'
+-  kind?: 'text' | 'notice'
+-  text: string
+-  createdAt: number
+-  status: ChatMessageStatus
+-  enhance?: ChatEnhanceResult
+-  resultNodeIds?: string[]
+-  origin?: ChatMessageOrigin
+-  error?: string
+-  /** error 为语义 key(chat.*)且带插值时的参数;渲染端 t(error, errorParams)。 */
+-  errorParams?: Record<string, string>
+-  errorKind?: ChatMessageErrorKind
+-  timeoutRetryKey?: string
+-  timeoutRetryCount?: number
+-  selectedNodeId?: string
+-  selectedNodeType?: string
+-  generationContext?: ChatGenerationContext
+-  retryDisabledReason?: string
+-}
+-
+-export type ChatState = {
+-  messagesByScene: Record<string, ChatMessage[]>
+-  // P2-3(sol 返修):R-7 local-only 保留证明。enqueueChatAppend 置位 msgId(该消息 pending append、
+-  // 未 drain 到 PG);hydrateChatForScene 见该 id 在 server 集则清位(synced)。hydrate 时 local-only
+-  // 消息(id 不在 server 集)仅当在此 sidecar 内才保留(= pending append);否则按 server canonical 删除
+-  // (远端已删不复活)。持久化经 chatPersistConfig partialize,跨 boot 存活(boot 时 IDB rehydrate 先于
+-  // hydrate,sidecar 在 hydrate 前就绪,不依赖 queue.start 载入 IDB pending,无 boot-order 竞态)。
+-  unsyncedChatMsgIds: Record<string, string[]>
+-  selectedModel: string
+-  paramOverrides: ChatParamOverrides
+-  isBusy: boolean
+-  sendMessage: (options: {
+-    sceneId: string
+-    text: string
+-    selectedNodeId?: string
+-    selectedNodeType?: string
+-    referenceFiles?: File[]
+-  }) => Promise<void>
+-  appendNotice: (options: {
+-    sceneId: string
+-    origin: ChatMessageOrigin
+-    nodeIds?: string[]
+-    prompt?: string
+-  }) => void
+-  retryMessage: (options: { sceneId: string; messageId: string; qualityOverride?: MivoImageQuality }) => Promise<void>
+-  cancelGeneration: (options?: { sceneId?: string; messageId?: string }) => void
+-  clearScene: (sceneId: string) => void
+-  setSelectedModel: (modelId: string) => void
+-  setParamOverride: (key: keyof ChatParamOverrides, value: string) => void
+-}
+ 
+ const createMessageId = () => `msg-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+ let activeChatAbortController: AbortController | null = null
+@@ -318,7 +221,11 @@ export const useChatStore = create<ChatState>()(
+ 
+         try {
+           const history = historyForEnhance(existingMessages)
+-          const hasSelectedImage = selectedNodeType === 'image'
++          // F5:selectedNodeType 缺失/陈旧时按 sourceNodeId 现场解析节点类型兜底
++          // (不单信 UI 布尔);节点已删/被隐藏 → 无源(undefined → legacy)。
++          // G4:解析锚定 chat 目标 sceneId,不用当前活跃板(跨场景 retry)。
++          const hasSelectedImage =
++            generationFacade.resolveLiveSourceNodeType(sceneId, selectedNodeId, selectedNodeType) === 'image'
+ 
+           const enhanceResult = await enhanceMivoPrompt({
+             prompt: text,
+@@ -399,9 +306,18 @@ export const useChatStore = create<ChatState>()(
+             }))
+           }
+ 
++          // P1b:排布意图由是否有源图决定——有源图(旁生成)走 expectedCount=1 批次
++          // (预建占位 + 高度锁定);无源图(进槽)走显式 legacy,不由 UI 状态推断。
+           const nodeIds = prep.mode === 'beside' && selectedNodeId
+-            ? await generationFacade.generateBesideNode(selectedNodeId, finalPrompt, genOptions)
+-            : await generationFacade.generateIntoAiSlot(prep.slotId, finalPrompt, genOptions)
++            ? await generationFacade.generateBesideNode(selectedNodeId, finalPrompt, {
++                ...genOptions,
++                placement: 'batch',
++                expectedCount: 1,
++              })
++            : await generationFacade.generateIntoAiSlot(prep.slotId, finalPrompt, {
++                ...genOptions,
++                placement: 'legacy',
++              })
+ 
+           const sceneChange = generationFacade.getSceneChangeInfo(sceneId)
+           if (sceneChange.sceneChanged) {
+@@ -600,11 +516,17 @@ export const useChatStore = create<ChatState>()(
+             }))
+ 
+             const userIndex = messages.findIndex((m) => m.id === userMsg.id)
++            // P1(beta2 修复):re-enhance 分支不单信持久化 context.sourceNodeType——跨场景/
++            // 源删除时该布尔陈旧,与生成时的 live resolve(G4/F5)分裂。enhance 前现场解析,
++            // 且 await 后生成侧仍重新解析(不缓存跨 await,期间状态可能变化)。
++            const hasSelectedImage =
++              generationFacade.resolveLiveSourceNodeType(sceneId, context.sourceNodeId, context.sourceNodeType) ===
++              'image'
+             const enhanceResult = await enhanceMivoPrompt({
+               prompt: userMsg.text,
+               modelId: context.model,
+               history: historyForEnhance(messages.slice(0, Math.max(0, userIndex))),
+-              hasSelectedImage: context.sourceNodeType === 'image',
++              hasSelectedImage,
+               sceneId,
+               signal: abortController.signal,
+             })
+@@ -667,7 +589,11 @@ export const useChatStore = create<ChatState>()(
+ 
+           // P2-A3: generation via the facade (SC3.1). prepareChatSlot reuses the
+           // existing pendingSlotId if the slot is still present, else creates one.
+-          const hasSelectedImage = context.sourceNodeType === 'image' && Boolean(context.sourceNodeId)
++          // F5:sourceNodeType 缺失/陈旧时按 sourceNodeId 现场解析(不单信持久化布尔)。
++          // G4:解析锚定 chat 目标 sceneId,不用当前活跃板(跨场景 retry)。
++          const hasSelectedImage =
++            generationFacade.resolveLiveSourceNodeType(sceneId, context.sourceNodeId, context.sourceNodeType) ===
++            'image'
+           const prep = generationFacade.prepareChatSlot({
+             sceneId,
+             selectedNodeId: context.sourceNodeId,
+@@ -687,9 +613,17 @@ export const useChatStore = create<ChatState>()(
+             }))
+           }
+ 
++          // P1b:排布意图由是否有源图决定(同上)。
+           const nodeIds = prep.mode === 'beside' && context.sourceNodeId
+-            ? await generationFacade.generateBesideNode(context.sourceNodeId, finalPrompt, genOptions)
+-            : await generationFacade.generateIntoAiSlot(prep.slotId, finalPrompt, genOptions)
++            ? await generationFacade.generateBesideNode(context.sourceNodeId, finalPrompt, {
++                ...genOptions,
++                placement: 'batch',
++                expectedCount: 1,
++              })
++            : await generationFacade.generateIntoAiSlot(prep.slotId, finalPrompt, {
++                ...genOptions,
++                placement: 'legacy',
++              })
+ 
+           const sceneChange = generationFacade.getSceneChangeInfo(sceneId)
+           if (sceneChange.sceneChanged) {
+diff --git a/src/store/chatStoreTypes.ts b/src/store/chatStoreTypes.ts
+new file mode 100644
+index 00000000..bf035818
+--- /dev/null
++++ b/src/store/chatStoreTypes.ts
+@@ -0,0 +1,103 @@
++import type { EnhanceDegradedReason, GenerationRatio, MivoImageQuality } from '../types/generation'
++import type { MivoImageRequestErrorKind } from '../lib/mivoImageClient'
++
++export type ChatMessageStatus = 'enhancing' | 'generating' | 'done' | 'error'
++export type ChatMessageOrigin = 'chat' | 'mask-edit'
++export type ChatMessageErrorKind = MivoImageRequestErrorKind | 'unknown'
++
++export type ChatEnhanceResult = {
++  scene?: string
++  reasoning?: string
++  richPrompt?: string
++  imgRatio?: GenerationRatio
++  quality?: MivoImageQuality
++  /** FIX-3: 收窄为 union，不放宽回 string。persisted legacy 字符串在
++   *  chatStoreMigrate.sanitizeEnhanceDegradedReason 处 runtime normalize。 */
++  degradedReason?: EnhanceDegradedReason
++  /** W4: 哪一档 LLM 降级（primary/fallback），透传自 EnhanceResponse.stage。 */
++  stage?: 'primary' | 'fallback'
++}
++
++export type ChatParamOverrides = {
++  imgRatio: 'auto' | GenerationRatio
++  quality: 'auto' | MivoImageQuality
++}
++
++export type MaskEditMessageContext = {
++  sourceTitle?: string
++  serverTaskId?: string
++  sourceDeleted?: boolean
++  phase?: 'enhancing' | 'submitting' | 'polling' | 'self-heal-retry'
++}
++
++export type ChatGenerationContext = {
++  sourceNodeId?: string
++  sourceNodeType?: string
++  referenceAssetUrls?: string[]
++  model: string
++  requestedImgRatio: ChatParamOverrides['imgRatio']
++  requestedQuality: ChatParamOverrides['quality']
++  imgRatio?: GenerationRatio
++  quality?: MivoImageQuality
++  finalPrompt?: string
++  pendingSlotId?: string
++  /** FIX-4: chat 模式澄清附言（replyText）持久化到 context，retry 不重跑 enhance
++   *  时也能从 context 读回并在生成成功后 appendNotice，与 send 路径语义一致。 */
++  noticeText?: string
++  /** mask-chat-card: mask edit 卡片状态机。runtime 不持久化（abortController/Blob 不可序列化），
++   *  但 serverTaskId/sourceDeleted 持久化供刷新后 cancel fallback 与归因。 */
++  maskEdit?: MaskEditMessageContext
++}
++
++export type ChatMessage = {
++  id: string
++  role: 'user' | 'assistant'
++  kind?: 'text' | 'notice'
++  text: string
++  createdAt: number
++  status: ChatMessageStatus
++  enhance?: ChatEnhanceResult
++  resultNodeIds?: string[]
++  origin?: ChatMessageOrigin
++  error?: string
++  /** error 为语义 key(chat.*)且带插值时的参数;渲染端 t(error, errorParams)。 */
++  errorParams?: Record<string, string>
++  errorKind?: ChatMessageErrorKind
++  timeoutRetryKey?: string
++  timeoutRetryCount?: number
++  selectedNodeId?: string
++  selectedNodeType?: string
++  generationContext?: ChatGenerationContext
++  retryDisabledReason?: string
++}
++
++export type ChatState = {
++  messagesByScene: Record<string, ChatMessage[]>
++  // P2-3(sol 返修):R-7 local-only 保留证明。enqueueChatAppend 置位 msgId(该消息 pending append、
++  // 未 drain 到 PG);hydrateChatForScene 见该 id 在 server 集则清位(synced)。hydrate 时 local-only
++  // 消息(id 不在 server 集)仅当在此 sidecar 内才保留(= pending append);否则按 server canonical 删除
++  // (远端已删不复活)。持久化经 chatPersistConfig partialize,跨 boot 存活(boot 时 IDB rehydrate 先于
++  // hydrate,sidecar 在 hydrate 前就绪,不依赖 queue.start 载入 IDB pending,无 boot-order 竞态)。
++  unsyncedChatMsgIds: Record<string, string[]>
++  selectedModel: string
++  paramOverrides: ChatParamOverrides
++  isBusy: boolean
++  sendMessage: (options: {
++    sceneId: string
++    text: string
++    selectedNodeId?: string
++    selectedNodeType?: string
++    referenceFiles?: File[]
++  }) => Promise<void>
++  appendNotice: (options: {
++    sceneId: string
++    origin: ChatMessageOrigin
++    nodeIds?: string[]
++    prompt?: string
++  }) => void
++  retryMessage: (options: { sceneId: string; messageId: string; qualityOverride?: MivoImageQuality }) => Promise<void>
++  cancelGeneration: (options?: { sceneId?: string; messageId?: string }) => void
++  clearScene: (sceneId: string) => void
++  setSelectedModel: (modelId: string) => void
++  setParamOverride: (key: keyof ChatParamOverrides, value: string) => void
++}
+diff --git a/src/store/derivedBatchCoordinator.ts b/src/store/derivedBatchCoordinator.ts
+index ca8d9d83..10c08f1b 100644
+--- a/src/store/derivedBatchCoordinator.ts
++++ b/src/store/derivedBatchCoordinator.ts
+@@ -117,12 +117,15 @@ export type PlacementIntent = 'legacy' | 'batch-owner' | 'batch-member'
+ export const assertPlacementIntent = (
+   options: Pick<CanvasGenerationOptions, 'placement' | 'derivedBatchId' | 'expectedCount' | 'ordinal'>,
+ ): PlacementIntent => {
+-  const tripletPresent = [options.derivedBatchId, options.expectedCount, options.ordinal].filter(
+-    (value) => value !== undefined,
+-  ).length
++  // H1(fix3):present 判定必须把 null 排除在「携带」之外——显式 null 不是合法凭证,
++  // 否则三键全 null 会被 `filter(v !== undefined)` 算成 3 个 present → 误判 batch-member
++  // (bindBatchOrdinal 拿 null batchId 找 slot 永远找不到,错误信息误导)。null 一律
++  // 视为缺失,与动词层 hasOwnDataProp 归一化后的形状一致(verbs 侧显式 null → undefined)。
++  const isPresent = (value: unknown): boolean => value !== undefined && value !== null
++  const tripletPresent = [options.derivedBatchId, options.expectedCount, options.ordinal].filter(isPresent).length
+   if (options.placement === 'legacy') {
+     // 三态互斥:legacy 与批次凭证互斥,携带任一批次字段即 fail-closed(不静默忽略)。
+-    const stray = [options.derivedBatchId, options.expectedCount, options.ordinal].filter((v) => v !== undefined)
++    const stray = [options.derivedBatchId, options.expectedCount, options.ordinal].filter(isPresent)
+     if (stray.length > 0) {
+       const message = `排布意图互斥冲突:placement=legacy 不得携带批次字段(derivedBatchId=${options.derivedBatchId},expectedCount=${options.expectedCount},ordinal=${options.ordinal})`
+       debugLogger.error('Derived Batch', message)
+@@ -138,7 +141,7 @@ export const assertPlacementIntent = (
+       throw new Error(message)
+     }
+     // 三态互斥:batch-owner 不得携带成员侧凭证(derivedBatchId/ordinal 属批次成员)。
+-    const ownerStray = [options.derivedBatchId, options.ordinal].filter((v) => v !== undefined)
++    const ownerStray = [options.derivedBatchId, options.ordinal].filter(isPresent)
+     if (ownerStray.length > 0) {
+       const message = `排布意图互斥冲突:批次发起(placement=batch)不得携带成员侧凭证(derivedBatchId=${options.derivedBatchId},ordinal=${options.ordinal})`
+       debugLogger.error('Derived Batch', message)
+@@ -159,15 +162,10 @@ export const assertPlacementIntent = (
+     )
+     return 'batch-member'
+   }
+-  if (tripletPresent === 0) {
+-    // β1(store-contract 节):全部缺失 → legacy 静默(旧行为,调用点未接线时
+-    // 保持发布级兼容)。β2(entry-wiring 节)把此处改为 fail-closed 抛错。
+-    debugLogger.log('Derived Batch', '排布意图:未显式声明,按 legacy 静默(旧路径)')
+-    return 'legacy'
+-  }
+-  // 部分缺失(1-2 个字段)→ fail-closed 抛错:与 α 基线 generationSlice 语义一致
+-  // (齐全/全缺二选一,部分缺失抛错),修复 β1 把部分缺失静默 legacy 的回归。
+-  const message = `排布意图部分缺失:必须提供完整三元组(derivedBatchId/expectedCount/ordinal)或全缺走 legacy,收到 placement=${options.placement},derivedBatchId=${options.derivedBatchId},expectedCount=${options.expectedCount},ordinal=${options.ordinal}`
++  // β2(entry-wiring 节):激活版——全缺/部分缺一律 fail-closed 抛错。
++  // (β1 兼容态为「全缺→legacy 静默」,已在本节激活为抛错;G1 修复轮2 保证
++  // β1 节部分缺失抛错、β2 节全缺也抛错,两节语义在各自合并后都成立。)
++  const message = `排布意图缺失:必须提供完整三元组(derivedBatchId/expectedCount/ordinal)或显式 placement(legacy|batch),收到 placement=${options.placement},derivedBatchId=${options.derivedBatchId},expectedCount=${options.expectedCount},ordinal=${options.ordinal}`
+   debugLogger.error('Derived Batch', message)
+   throw new Error(message)
+ }
+@@ -415,6 +413,11 @@ export const settleBatchCatch = (
+     // M3:任务 patch 必须基于 settled doc——拿 pre-settle current 重新
+     // patchCanvasDocument 会把 canonical 画布节点覆盖回 generating(顶层镜像
+     // 说 failed 而 persisted 的 canonical 说 generating,reload 复活 zombie)。
++    // G7(修复轮2,fix3 H3 前置到 β2):tasks patch 必须基于 settle 后的文档构建,
++    // 不得用未 settle 的 current 重拼 canvases[sceneId]——patchCanvasDocument 会从
++    // current 重读 nodes,把失败槽刚转的 failed 状态覆盖回 generating(任务 label
++    // 已更新、槽位却没转终态,生产可见 bug;commitVariationsBatch 早已按同一纪律
++    // 处理,见其内注释)。
+     const settledDoc = patch.canvases?.[params.sceneId]
+     if (!settledDoc) return patch
+     const liveTask = settledDoc.tasks.find((t) => t.id === params.runningTask.id) ?? params.runningTask
+@@ -423,9 +426,11 @@ export const settleBatchCatch = (
+       params.canceled ? { ...liveTask, label: params.canceledLabel, status: 'canceled' as const }
+         : { ...liveTask, label: params.failedLabel, status: 'failed' as const },
+     )
++    // 活跃画布顶层同步:settle 的 patch 只含顶层 nodes,不含顶层 tasks——若目标
++    // 即活跃画布,顶层 tasks 必须同步为 nextTasks(否则 UI 读顶层 tasks 仍见 running)。
++    // (顶层 tasks 镜像只随活跃画布更新;非活跃画布只写 canonical。)
+     return {
+       ...patch,
+-      // 顶层 tasks 镜像只随活跃画布更新;非活跃画布只写 canonical。
+       ...(params.sceneId === current.sceneId ? { tasks: nextTasks } : {}),
+       canvases: {
+         ...patch.canvases,
+diff --git a/src/store/generation.batchPlacement.contract.test.ts b/src/store/generation.batchPlacement.contract.test.ts
+index 604084a8..6db138e4 100644
+--- a/src/store/generation.batchPlacement.contract.test.ts
++++ b/src/store/generation.batchPlacement.contract.test.ts
+@@ -116,6 +116,21 @@ const failedView = (error: string) => ({
+ // (committedImage() carries blob; runtime carries b64) — commitGenerationResult
+ // handles both via blobFromCommittedGenerationImage.
+ 
++const partialView = (
++  images: Array<{ b64?: string; blob?: Blob; variationIndex?: number }>,
++  failures: Array<{ variationIndex: number; error: string }>,
++) => ({
++  id: 't1',
++  kind: 'variations' as const,
++  status: 'partial' as const,
++  progress: 100,
++  stage: 'done',
++  requestId: 'req-1',
++  model: 'gpt-image-2',
++  result: { images },
++  failures,
++})
++
+ const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+   id: 'n1',
+   type: 'image',
+@@ -380,3 +395,66 @@ describe('contract: #297 编辑占位批次(SC4/SC5 失败收敛与单一撤销
+     expect(s.tasks.some((t) => t.status === 'running' || t.status === 'queued')).toBe(false)
+   })
+ })
++
++describe('contract: variations / annotation (P2-C2 de-mocked → async tasks API)', () => {
++  it('generateVariations resolves with result nodeIds + commits derivation edges + done task', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(
++      doneView([committedImage(), committedImage(), committedImage(), committedImage()]),
++    )
++    // P1b:variations 批次化(默认 4 变体 → 4 预建占位,结果原位替换)。
++    const nodeIds = await useCanvasStore.getState().generateVariations('n1', undefined, {
++      placement: 'batch',
++      expectedCount: 4,
++    })
++    expect(nodeIds).toHaveLength(4)
++    const s = useCanvasStore.getState()
++    expect(s.edges.filter((e) => e.from === 'n1')).toHaveLength(4)
++    expect(s.tasks[0].status).toBe('done')
++    expect(mockSubmitVariationsTask).toHaveBeenCalledWith(
++      expect.objectContaining({ variations: expect.any(Array) }),
++    )
++  })
++
++  it('generateVariations partial (2 success + 1 failure) resolves the success subset + creates a visible failed slot', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(
++      partialView(
++        [{ ...committedImage(), variationIndex: 0 }, { ...committedImage(), variationIndex: 1 }],
++        [{ variationIndex: 2, error: 'Upstream error (500)' }],
++      ),
++    )
++    const nodeIds = await useCanvasStore.getState().generateVariations(
++      'n1',
++      [
++        { prompt: 'p0' },
++        { prompt: 'p1' },
++        { prompt: 'p2' },
++      ],
++      { placement: 'batch', expectedCount: 3 },
++    )
++    // partial does NOT reject — resolves the success subset (2 of 3).
++    expect(nodeIds).toHaveLength(2)
++    const s = useCanvasStore.getState()
++    // 失败槽位可见: a failed ai-slot node for the failed variation。
++    const slot2 = s.nodes.find((n) => n.aiWorkflow?.ordinal === 2)
++    expect(slot2?.type).toBe('ai-slot')
++    expect(slot2?.status).toBe('failed')
++    const failedSlots = s.nodes.filter((n) => n.type === 'ai-slot' && n.status === 'failed')
++    expect(failedSlots).toHaveLength(1)
++    // 原位保留:失败槽仍在原 ordinal 位置(不删除、不压缩列)。
++    const failedSlot = failedSlots[0]
++    expect(failedSlot?.aiWorkflow?.ordinal).toBe(2)
++    // partial resolves → done task carrying the success nodeIds.
++    expect(s.tasks[0].status).toBe('done')
++    expect(s.tasks[0].nodeIds).toEqual(nodeIds)
++  })
++
++  it('generateVariations rejects when there is no source image', async () => {
++    seed(seedCanvas('character-flow', []))
++    await expect(useCanvasStore.getState().generateVariations()).rejects.toThrow(/没有可用的源图/)
++    expect(useCanvasStore.getState().tasks).toHaveLength(0)
++  })
++})
++
++// ── p0-sc2:generateVariations 结果焦点请求(commit 全部落盘后发出)──
+\ No newline at end of file
+diff --git a/src/store/generation.batchTerminal.contract.test.ts b/src/store/generation.batchTerminal.contract.test.ts
+index fa27c83d..a129d2e1 100644
+--- a/src/store/generation.batchTerminal.contract.test.ts
++++ b/src/store/generation.batchTerminal.contract.test.ts
+@@ -7,6 +7,7 @@
+ //   - generateIntoAiSlot 批次模式:按 ordinal 绑定(与 slotId 冲突抛错)
+ //   - 三态互斥:legacy 携带批次字段 / batch-owner 携带成员凭证 → 抛错(F2)
+ import { describe, expect, it, vi, beforeEach } from 'vitest'
++import { settleBatchCatch } from './derivedBatchCoordinator'
+ 
+ // Hermetic setup(与 generation.contract.test.ts 同构)。
+ vi.mock('../lib/demoImages', () => ({ createDemoImage: () => 'data:image/png;base64,mock-demo-image' }))
+@@ -500,6 +501,65 @@ describe('contract: settleBatchCatch canonical document terminal (M3)', () => {
+   })
+ })
+ 
++// H3(fix3):settleBatchCatch 修复的测试绑定——断言 settle 后**顶层 nodes/tasks 与
++// canvases[sceneId] 镜像双侧**都是 failed 终态。旧 bug(双 spread 用未 settle 的
++// current 重拼 canvases[sceneId])只读顶层断言全绿,镜像侧把 failed 覆盖回
++// generating,本测试必须在旧 bug 树上转红(反向变异见 delivery evidence)。
++describe('contract: settleBatchCatch 双侧终态镜像 (H3)', () => {
++  const runningTask = () => ({
++    id: 'task-settle',
++    label: '生成中',
++    status: 'running' as const,
++    progress: 40,
++    nodeIds: [],
++  })
++
++  it('settle 后顶层 nodes/tasks 与 canvases[sceneId] 双侧 failed 终态(槽位不复活为 generating)', () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const slotIds = useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'batch-settle',
++      expectedCount: 2,
++    })
++    // 预置任务 running(模拟轮询中),且目标画布即活跃画布(G7 生产 bug 场景:
++    // 失败收敛发生时用户正停留在批次画布,顶层 nodes/tasks 必须同步终态)
++    useCanvasStore.setState((s) => ({
++      tasks: [runningTask()],
++      canvases: { ...s.canvases, 'character-flow': { ...s.canvases['character-flow'], tasks: [runningTask()] } },
++    }))
++    settleBatchCatch(useCanvasStore.setState, {
++      sceneId: 'character-flow',
++      slotId: slotIds[0],
++      batchId: 'batch-settle',
++      canceled: false,
++      settleWholeBatch: false,
++      isUserDeletedSlot: false,
++      runningTask: runningTask(),
++      canceledLabel: '已取消',
++      failedLabel: '生成失败',
++      ordinalLabel: '0',
++    })
++    const top = useCanvasStore.getState()
++    const sceneDoc = top.canvases['character-flow']
++    // 顶层 nodes:slot0 必须 failed(不复活 generating)
++    const topSlot0 = top.nodes.find((n) => n.id === slotIds[0])
++    expect(topSlot0?.aiWorkflow?.status).toBe('failed')
++    // 顶层 tasks:running → failed
++    expect(top.tasks.find((t) => t.id === 'task-settle')?.status).toBe('failed')
++    // 镜像侧 canvases[sceneId]:nodes 与 tasks 与顶层**逐字段一致**(旧 bug 把
++    // failed 覆盖回 generating 的地方,双侧必须同为 failed 终态)
++    const sceneSlot0 = sceneDoc.nodes.find((n) => n.id === slotIds[0])
++    expect(sceneSlot0?.aiWorkflow?.status).toBe('failed')
++    expect(sceneDoc.tasks.find((t) => t.id === 'task-settle')?.status).toBe('failed')
++    // 双侧镜像一致(同一失败槽不出现一侧 failed 一侧 generating 的分裂)
++    expect(sceneSlot0?.aiWorkflow?.status).toBe(topSlot0?.aiWorkflow?.status)
++    expect(sceneDoc.tasks.find((t) => t.id === 'task-settle')?.status).toBe(
++      top.tasks.find((t) => t.id === 'task-settle')?.status,
++    )
++  })
++})
++
+ // ─── beta1 GPT P1 修复(M4):批次成员语义校验(caller + persisted 独立校验) ──────
+ describe('contract: batch member semantic validation (M4)', () => {
+   it('member_caller_expectedCount_zero_rejects: 调用方 expectedCount=0 → fail-closed 抛错', async () => {
+diff --git a/src/store/generation.contract.test.ts b/src/store/generation.contract.test.ts
+index 0ee9c58f..421a523d 100644
+--- a/src/store/generation.contract.test.ts
++++ b/src/store/generation.contract.test.ts
+@@ -181,16 +181,13 @@ beforeEach(() => {
+ describe('contract: generation action signatures', () => {
+   it('generateImageEdit returns a Promise<string[]> (resolves to string[] on success)', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    const result = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat')
++    const result = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { placement: 'legacy' })
+     expect(result).toBeInstanceOf(Promise)
+     const nodeIds = await result
+     expect(Array.isArray(nodeIds)).toBe(true)
+     expect(nodeIds.every((id) => typeof id === 'string')).toBe(true)
+ 
+-    // Strengthened binding (rev-verify top-3 weakest): each returned id is a real
+-    // result node in the target scene, sourced from n1, with a derivation edge
+-    // from n1, and the associated task reached terminal 'done' carrying exactly
+-    // these nodeIds (not just "is a string array").
++    // Strengthened binding: real result nodes sourced from n1, edge, task done.
+     const s = useCanvasStore.getState()
+     nodeIds.forEach((id) => {
+       const node = s.nodes.find((n) => n.id === id)
+@@ -204,14 +201,16 @@ describe('contract: generation action signatures', () => {
+ 
+   it('generateBesideNode returns a Promise<string[]>', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    const nodeIds = await useCanvasStore.getState().generateBesideNode('n1', 'a cat')
++    // P1b:旁生成走 expectedCount=1 批次(预建占位 + 高度锁定),不再断言旧 1:1 等面积。
++    const nodeIds = await useCanvasStore.getState().generateBesideNode('n1', 'a cat', {
++      placement: 'batch',
++      expectedCount: 1,
++    })
+     expect(Array.isArray(nodeIds)).toBe(true)
+     expect(nodeIds.length).toBeGreaterThan(0)
+ 
+-    // Strengthened binding: result node is sourced from n1 + placed on the
+-    // source's right side (chooseAdjacentPlacement 'right' → x = source.x +
+-    // source.width + margin, so x ≥ source.x + source.width) + a 'generate'
+-    // derivation edge from n1 + task 'done'.
++    // P1b 新排布:占位在源图右侧边缘对齐、高度锁定;结果原位替换占位(x/y 不变、
++    // height 仍等于锚点高度)。sourceNodeId 继承 + 'generate' 衍生边 + task done。
+     const s = useCanvasStore.getState()
+     const source = s.nodes.find((n) => n.id === 'n1')
+     expect(source).toBeDefined()
+@@ -220,6 +219,8 @@ describe('contract: generation action signatures', () => {
+       expect(node).toBeDefined()
+       expect(node?.sourceNodeId).toBe('n1')
+       expect(node?.x).toBeGreaterThanOrEqual(source!.x + source!.width)
++      expect(node?.y).toBe(source!.y)
++      expect(node?.height).toBe(Math.round(source!.height))
+     })
+     expect(
+       s.edges.filter((e) => nodeIds.includes(e.to) && e.from === 'n1' && e.type === 'generate'),
+@@ -229,7 +230,7 @@ describe('contract: generation action signatures', () => {
+ 
+   it('generateIntoAiSlot returns a Promise<string[]>', async () => {
+     seed(seedCanvas('character-flow', [aiSlotNode({ id: 'slot-1' })]))
+-    const nodeIds = await useCanvasStore.getState().generateIntoAiSlot('slot-1', 'a cat')
++    const nodeIds = await useCanvasStore.getState().generateIntoAiSlot('slot-1', 'a cat', { placement: 'legacy' })
+     expect(Array.isArray(nodeIds)).toBe(true)
+     expect(nodeIds.length).toBeGreaterThan(0)
+ 
+@@ -252,13 +253,37 @@ describe('contract: generation action signatures', () => {
+ 
+   // P2-C2: variations/annotation now return Promise<string[]> (de-mocked → async
+   // tasks API), matching the other 3 generation actions.
++  // P1b:variations 走批次列(默认 4 变体预建 4 占位,结果原位替换),断言新排布。
+   it('generateVariations returns a Promise<string[]>', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    const result = useCanvasStore.getState().generateVariations('n1')
++    // P1a3 M2 分区校验:0..count-1 每个 ordinal 必须 accounted。mock 必须返回
++    // 与 expectedCount 等量的、带 variationIndex 的结果图——单图 view 是生产
++    // 从不产生的形状(变体任务必然回报全部变体),会让分区断言落在假契约上。
++    mockPollTask.mockResolvedValueOnce(
++      doneView(
++        [0, 1, 2, 3].map((variationIndex) => ({ ...committedImage(), variationIndex })),
++      ),
++    )
++    const result = useCanvasStore.getState().generateVariations('n1', undefined, {
++      placement: 'batch',
++      expectedCount: 4,
++    })
+     expect(result).toBeInstanceOf(Promise)
+     const nodeIds = await result
+     expect(Array.isArray(nodeIds)).toBe(true)
+     expect(nodeIds.every((id) => typeof id === 'string')).toBe(true)
++
++    // 新行为:结果节点原位替换预建占位(同列左缘 x 相等、y 与源图边缘对齐、高度锁定)。
++    const s = useCanvasStore.getState()
++    const source = s.nodes.find((n) => n.id === 'n1')
++    expect(source).toBeDefined()
++    expect(nodeIds.length).toBeGreaterThan(0)
++    nodeIds.forEach((id) => {
++      const node = s.nodes.find((n) => n.id === id)
++      expect(node).toBeDefined()
++      expect(node?.sourceNodeId).toBe('n1')
++      expect(node?.height).toBe(Math.round(source!.height))
++    })
+   })
+ 
+ })
+@@ -266,9 +291,7 @@ describe('contract: generation action signatures', () => {
+ describe('contract: generateImageEdit orchestration (mock network)', () => {
+   it('success: task transitions running→done, result committed, derivation edge created', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat')
+-
+-    // task ended 'done'
++    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { placement: 'legacy' })
+     const tasks = useCanvasStore.getState().tasks
+     expect(tasks).toHaveLength(1)
+     expect(tasks[0].status).toBe('done')
+@@ -288,7 +311,7 @@ describe('contract: generateImageEdit orchestration (mock network)', () => {
+     controller.abort()
+ 
+     await expect(
+-      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { signal: controller.signal }),
++      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { signal: controller.signal, placement: 'legacy' }),
+     ).rejects.toThrow()
+ 
+     const tasks = useCanvasStore.getState().tasks
+@@ -316,7 +339,7 @@ describe('contract: generateImageEdit orchestration (mock network)', () => {
+       return { id: 't1', kind: 'edit', status: 'running', progress: 60, stage: 'poll', requestId: 'r', model: 'gpt-image-2' }
+     })
+ 
+-    const promise = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { signal: controller.signal })
++    const promise = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { signal: controller.signal, placement: 'legacy' })
+     await expect(promise).rejects.toThrow()
+ 
+     const task = useCanvasStore.getState().tasks[0]
+@@ -333,7 +356,7 @@ describe('contract: generateImageEdit orchestration (mock network)', () => {
+     mockPollTask.mockResolvedValueOnce(failedView('upstream 500'))
+ 
+     await expect(
+-      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat'),
++      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { placement: 'legacy' }),
+     ).rejects.toThrow(/upstream 500/)
+ 
+     const tasks = useCanvasStore.getState().tasks
+@@ -363,7 +386,7 @@ describe('contract: generateImageEdit orchestration (mock network)', () => {
+       selectedNodeIds: [],
+     })
+ 
+-    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { sceneId: 'other-scene' })
++    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { sceneId: 'other-scene', placement: 'legacy' })
+ 
+     expect(nodeIds.length).toBeGreaterThan(0)
+     expect(useCanvasStore.getState().canvases['other-scene']!.nodes.map((n) => n.id)).toContain(nodeIds[0])
+@@ -377,7 +400,11 @@ describe('contract: generateImageEdit orchestration (mock network)', () => {
+ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () => {
+   it('generateBesideNode: success marks the task done and commits a result node', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    const nodeIds = await useCanvasStore.getState().generateBesideNode('n1', 'a cat beside')
++    // P1b:旁生成走 expectedCount=1 批次(预建占位 + 高度锁定)。
++    const nodeIds = await useCanvasStore.getState().generateBesideNode('n1', 'a cat beside', {
++      placement: 'batch',
++      expectedCount: 1,
++    })
+     expect(nodeIds.length).toBeGreaterThan(0)
+     const tasks = useCanvasStore.getState().tasks
+     expect(tasks[0].status).toBe('done')
+@@ -386,7 +413,7 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
+ 
+   it('generateIntoAiSlot: success marks the task done and commits a result node (uses submitGenerationTask for a slot)', async () => {
+     seed(seedCanvas('character-flow', [aiSlotNode({ id: 'slot-1' })]))
+-    const nodeIds = await useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot')
++    const nodeIds = await useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot', { placement: 'legacy' })
+     expect(nodeIds.length).toBeGreaterThan(0)
+     expect(useCanvasStore.getState().tasks[0].status).toBe('done')
+     expect(mockSubmitGenerationTask).toHaveBeenCalled()
+@@ -395,7 +422,7 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
+   it('generateIntoAiSlot: undo after success returns to the ready empty slot', async () => {
+     seed(seedCanvas('character-flow', [aiSlotNode({ id: 'slot-1', x: 12, y: 24 })]))
+ 
+-    const nodeIds = await useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot')
++    const nodeIds = await useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot', { placement: 'legacy' })
+ 
+     expect(nodeIds).toEqual(['slot-1'])
+     let node = useCanvasStore.getState().nodes.find((item) => item.id === 'slot-1')
+@@ -413,7 +440,7 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
+     seed(seedCanvas('character-flow', [aiSlotNode({ id: 'slot-1', x: 12, y: 24 })]))
+     mockPollTask.mockResolvedValueOnce(failedView('boom'))
+ 
+-    await expect(useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot')).rejects.toThrow(/boom/)
++    await expect(useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot', { placement: 'legacy' })).rejects.toThrow(/boom/)
+ 
+     const state = useCanvasStore.getState()
+     expect(state.nodes.some((node) => node.id === 'slot-1')).toBe(false)
+@@ -429,7 +456,7 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
+     controller.abort()
+ 
+     await expect(
+-      useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot', { signal: controller.signal }),
++      useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot', { signal: controller.signal, placement: 'legacy' }),
+     ).rejects.toThrow()
+ 
+     const state = useCanvasStore.getState()
+@@ -466,7 +493,7 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
+     mockPollTask.mockResolvedValueOnce(failedView('boom'))
+ 
+     await expect(
+-      generationFacade.generateIntoAiSlot(prep.slotId, 'fill the slot', { sceneId: 'character-flow' }),
++      generationFacade.generateIntoAiSlot(prep.slotId, 'fill the slot', { sceneId: 'character-flow', placement: 'legacy' }),
+     ).rejects.toThrow(/boom/)
+ 
+     const state = useCanvasStore.getState()
+@@ -484,7 +511,7 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
+     let resolvePoll!: (view: unknown) => void
+     mockPollTask.mockReturnValueOnce(new Promise((resolve) => { resolvePoll = resolve }))
+ 
+-    const generatePromise = useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot')
++    const generatePromise = useCanvasStore.getState().generateIntoAiSlot('slot-1', 'fill the slot', { placement: 'legacy' })
+     // 让 generateIntoAiSlot 跑到 poll 挂起（submitGenerationTask 已 mock 立即 resolve）
+     for (let i = 0; i < 10; i++) await Promise.resolve()
+     expect(mockPollTask).toHaveBeenCalled()
+@@ -541,7 +568,7 @@ describe('contract: task state machine (generation actions)', () => {
+ 
+   it('running → done on success', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat')
++    await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { placement: 'legacy' })
+     expect(useCanvasStore.getState().tasks[0].status).toBe('done')
+   })
+ 
+@@ -550,7 +577,7 @@ describe('contract: task state machine (generation actions)', () => {
+     const controller = new AbortController()
+     controller.abort()
+     await expect(
+-      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { signal: controller.signal }),
++      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { signal: controller.signal, placement: 'legacy' }),
+     ).rejects.toThrow()
+     expect(useCanvasStore.getState().tasks[0].status).toBe('canceled')
+   })
+@@ -559,19 +586,19 @@ describe('contract: task state machine (generation actions)', () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+     mockPollTask.mockResolvedValueOnce(failedView('boom'))
+     await expect(
+-      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat'),
++      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { placement: 'legacy' }),
+     ).rejects.toThrow(/boom/)
+     expect(useCanvasStore.getState().tasks[0].status).toBe('failed')
+   })
+ 
+   it('terminal tasks are not re-transitioned by a later action (no done→running regression)', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'first')
++    await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'first', { placement: 'legacy' })
+     const firstTaskId = useCanvasStore.getState().tasks[0].id
+     expect(useCanvasStore.getState().tasks[0].status).toBe('done')
+ 
+     // a second action creates a NEW task (different id); the first stays 'done'
+-    await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'second')
++    await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'second', { placement: 'legacy' })
+     const tasks = useCanvasStore.getState().tasks
+     const firstTask = tasks.find((t) => t.id === firstTaskId)
+     expect(firstTask?.status).toBe('done')
+@@ -580,14 +607,14 @@ describe('contract: task state machine (generation actions)', () => {
+   it('task list is capped at 5 (upsertTask keeps the most recent)', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+     for (let i = 0; i < 7; i++) {
+-      await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', `p${i}`)
++      await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', `p${i}`, { placement: 'legacy' })
+     }
+     expect(useCanvasStore.getState().tasks.length).toBeLessThanOrEqual(5)
+   })
+ 
+   it('done task nodeIds are populated with the committed result ids', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat')
++    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', { placement: 'legacy' })
+     expect(useCanvasStore.getState().tasks[0].nodeIds).toEqual(nodeIds)
+     expect(taskFor(useCanvasStore.getState().tasks[0].id)?.progress).toBe(100)
+   })
+diff --git a/src/store/generation.focus.contract.test.ts b/src/store/generation.focus.contract.test.ts
+index f1554e00..dedbe579 100644
+--- a/src/store/generation.focus.contract.test.ts
++++ b/src/store/generation.focus.contract.test.ts
+@@ -181,59 +181,11 @@ const batchNodeIds = (beforeIds: Set<string>): string[] =>
+ 
+ // Tests -----------------------------------------------------------------------
+ 
+-describe('contract: variations / annotation (P2-C2 de-mocked → async tasks API)', () => {
+-  it('generateVariations resolves with result nodeIds + commits derivation edges + done task', async () => {
+-    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    mockPollTask.mockResolvedValueOnce(
+-      doneView([committedImage(), committedImage(), committedImage(), committedImage()]),
+-    )
+-    const nodeIds = await useCanvasStore.getState().generateVariations('n1')
+-    expect(nodeIds).toHaveLength(4)
+-    const s = useCanvasStore.getState()
+-    expect(s.edges.filter((e) => e.from === 'n1')).toHaveLength(4)
+-    expect(s.tasks[0].status).toBe('done')
+-    expect(mockSubmitVariationsTask).toHaveBeenCalledWith(
+-      expect.objectContaining({ variations: expect.any(Array) }),
+-    )
+-  })
+-
+-  it('generateVariations partial (2 success + 1 failure) resolves the success subset + creates a visible failed slot', async () => {
+-    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    mockPollTask.mockResolvedValueOnce(
+-      partialView(
+-        [{ ...committedImage(), variationIndex: 0 }, { ...committedImage(), variationIndex: 1 }],
+-        [{ variationIndex: 2, error: 'Upstream error (500)' }],
+-      ),
+-    )
+-    const nodeIds = await useCanvasStore.getState().generateVariations('n1', [
+-      { prompt: 'p0' },
+-      { prompt: 'p1' },
+-      { prompt: 'p2' },
+-    ])
+-    // partial does NOT reject — resolves the success subset (2 of 3).
+-    expect(nodeIds).toHaveLength(2)
+-    const s = useCanvasStore.getState()
+-    // 失败槽位可见: a failed ai-slot node for the failed variation.
+-    const failedSlots = s.nodes.filter((n) => n.type === 'ai-slot' && n.status === 'failed')
+-    expect(failedSlots).toHaveLength(1)
+-    // partial resolves → done task carrying the success nodeIds.
+-    expect(s.tasks[0].status).toBe('done')
+-    expect(s.tasks[0].nodeIds).toEqual(nodeIds)
+-  })
+-
+-  it('generateVariations rejects when there is no source image', async () => {
+-    seed(seedCanvas('character-flow', []))
+-    await expect(useCanvasStore.getState().generateVariations()).rejects.toThrow(/没有可用的源图/)
+-    expect(useCanvasStore.getState().tasks).toHaveLength(0)
+-  })
+-})
+-
+-// ── p0-sc2:generateVariations 结果焦点请求(commit 全部落盘后发出)──
+ describe('contract: generateVariations 结果焦点请求(p0-sc2)', () => {
+-  const runVariations = (view: unknown) => {
++  const runVariations = (view: unknown, options: Record<string, unknown> = {}) => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+     mockPollTask.mockResolvedValueOnce(view)
+-    return useCanvasStore.getState().generateVariations('n1')
++    return useCanvasStore.getState().generateVariations('n1', undefined, options as never)
+   }
+ 
+   /** 本批 commit 产物节点集:调用前节点之外新增的「image 结果 ∪ failed 失败槽」。
+@@ -268,7 +220,10 @@ describe('contract: generateVariations 结果焦点请求(p0-sc2)', () => {
+       // 受控 pending gate:把 poll 挂起,在 commit 完成前断言无结果焦点请求。
+       let resolvePoll!: (view: unknown) => void
+       mockPollTask.mockReturnValueOnce(new Promise((resolve) => { resolvePoll = resolve }))
+-      const promise = useCanvasStore.getState().generateVariations('n1')
++      const promise = useCanvasStore.getState().generateVariations('n1', undefined, {
++        placement: 'batch',
++        expectedCount: 4,
++      })
+ 
+       // 挂在 poll 上(commit 未发生):无结果焦点请求、无 pendingFocus。
+       expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
+@@ -303,7 +258,7 @@ describe('contract: generateVariations 结果焦点请求(p0-sc2)', () => {
+   })
+ 
+   it('done(images=[]) 时无请求且不崩溃', async () => {
+-    await runVariations(doneView([]))
++    await runVariations(doneView([]), { placement: 'legacy' })
+     expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
+   })
+ })
+@@ -314,7 +269,11 @@ describe('contract: 变体计数矩阵结果焦点(p0-sc4)', () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+     const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
+     mockPollTask.mockResolvedValueOnce(doneView(Array.from({ length: count }, () => committedImage())))
+-    await useCanvasStore.getState().generateVariations('n1')
++    await useCanvasStore.getState().generateVariations(
++      'n1',
++      Array.from({ length: count }, (_, i) => ({ prompt: `v${i}` })),
++      { placement: 'batch', expectedCount: count },
++    )
+ 
+     const members = pendingResultMembers()
+     expect(members).toHaveLength(count)
+@@ -337,7 +296,10 @@ describe('contract: 变体计数矩阵结果焦点(p0-sc4)', () => {
+         ],
+       ),
+     )
+-    await useCanvasStore.getState().generateVariations('n1')
++    await useCanvasStore.getState().generateVariations('n1', undefined, {
++      placement: 'batch',
++      expectedCount: 4,
++    })
+ 
+     const members = pendingResultMembers()
+     expect(members).toHaveLength(4)
+@@ -351,7 +313,9 @@ describe('contract: edit / beside 结果焦点请求(p1-sc1 / p1-sc2)', () => {
+   it('generateImageEdit commit 完成后 pendingFocus 成员 = commit 返回的结果节点 id', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+     const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
+-    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat')
++    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat', {
++      placement: 'legacy',
++    })
+ 
+     const members = pendingResultMembers()
+     expect(nodeIds).toHaveLength(1)
+@@ -363,7 +327,9 @@ describe('contract: edit / beside 结果焦点请求(p1-sc1 / p1-sc2)', () => {
+ 
+   it('generateBesideNode commit 完成后 pendingFocus 成员 = 结果节点', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+-    const nodeIds = await useCanvasStore.getState().generateBesideNode('n1', 'a cat beside')
++    const nodeIds = await useCanvasStore.getState().generateBesideNode('n1', 'a cat beside', {
++      placement: 'legacy',
++    })
+ 
+     const members = pendingResultMembers()
+     expect(members).toEqual(nodeIds)
+@@ -377,8 +343,12 @@ describe('contract: edit / beside 结果焦点请求(p1-sc1 / p1-sc2)', () => {
+     mockPollTask
+       .mockReturnValueOnce(new Promise((resolve) => { resolveEdit = resolve }))
+       .mockReturnValueOnce(new Promise((resolve) => { resolveBeside = resolve }))
+-    const editPromise = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'cat')
+-    const besidePromise = useCanvasStore.getState().generateBesideNode('n1', 'beside')
++    const editPromise = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'cat', {
++      placement: 'legacy',
++    })
++    const besidePromise = useCanvasStore.getState().generateBesideNode('n1', 'beside', {
++      placement: 'legacy',
++    })
+ 
+     // 两批都挂在 poll 上:无请求。
+     expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
+diff --git a/src/store/generationBatchContract.test.ts b/src/store/generationBatchContract.test.ts
+index a3ff067a..508014ec 100644
+--- a/src/store/generationBatchContract.test.ts
++++ b/src/store/generationBatchContract.test.ts
+@@ -145,7 +145,6 @@ beforeEach(() => {
+   mockAssetBlobForNode.mockReset().mockResolvedValue(new Blob(['mock-source-bytes'], { type: 'image/png' }))
+ })
+ 
+-
+ describe('contract: variations prebuilds column and keeps ordinals', () => {
+   it.each([2, 3, 4])(
+     'variations_prebuilds_column_and_keeps_ordinals: N=%i 预建 N 占位,成功原位替换,与 centeredColumnPlacements 逐字段相等',
+@@ -341,16 +340,22 @@ describe('contract: placement intent is three-state mutually exclusive (F2)', ()
+     expect(assertPlacementIntent({ derivedBatchId: 'b1', expectedCount: 2, ordinal: 1 })).toBe('batch-member')
+   })
+ 
+-  // G1(修复轮2):β1 语义修正——全缺→legacy 静默(β1 兼容态),部分缺(1-2 字段)
+-  // → fail-closed 抛错(与 α 基线 generationSlice 一致)。此前的「部分缺也 legacy」
+-  // 是锁错误行为,已在修复轮2 修正。
+-  it('β1 全缺 → legacy 静默(调用点未接线时旧行为)', () => {
+-    expect(assertPlacementIntent({})).toBe('legacy')
++  // G1(修复轮2):β1 节部分缺失→抛错(全缺→legacy 静默兼容态,见 β1 commit);
++  // β2(entry-wiring 节)激活版:全缺也抛错。两节测试各自按合并后的语义锁定。
++  it('β2 全缺/部分缺均抛错: 未显式声明或三元组不完整 → fail-closed', () => {
++    expect(() => assertPlacementIntent({})).toThrow(/排布意图缺失/)
++    expect(() => assertPlacementIntent({ derivedBatchId: 'b1', expectedCount: 2 })).toThrow(/排布意图缺失/)
++    expect(() => assertPlacementIntent({ expectedCount: 2 })).toThrow(/排布意图缺失/)
++    expect(() => assertPlacementIntent({ ordinal: 0 })).toThrow(/排布意图缺失/)
+   })
+ 
+-  it('β1 部分缺失 → 抛错: 只带 derivedBatchId/expectedCount 任一 → fail-closed', () => {
+-    expect(() => assertPlacementIntent({ derivedBatchId: 'b1', expectedCount: 2 })).toThrow(/部分缺失/)
+-    expect(() => assertPlacementIntent({ expectedCount: 2 })).toThrow(/部分缺失/)
+-    expect(() => assertPlacementIntent({ ordinal: 0 })).toThrow(/部分缺失/)
++  // H1(fix3):null 不是合法凭证——显式 null 与 undefined 同为「未携带」,
++  // 三键全 null 不得被 `filter(v !== undefined)` 算成 3 个 present → 误判 batch-member。
++  it('H1: 三键全 null → 与全缺同判,fail-closed 抛错(不得静默按 batch-member 绑定)', () => {
++    expect(() =>
++      assertPlacementIntent({ derivedBatchId: null as unknown as string, expectedCount: null as unknown as number, ordinal: null as unknown as number }),
++    ).toThrow(/排布意图缺失/)
++    // 单键 null 同样视为缺失 → 部分缺,抛错。
++    expect(() => assertPlacementIntent({ derivedBatchId: 'b1', expectedCount: 2, ordinal: null as unknown as number })).toThrow(/排布意图缺失/)
+   })
+ })
+diff --git a/src/store/generationEntryContract.test.ts b/src/store/generationEntryContract.test.ts
+new file mode 100644
+index 00000000..7c2aafe5
+--- /dev/null
++++ b/src/store/generationEntryContract.test.ts
+@@ -0,0 +1,93 @@
++// P1b 出图入口排布意图契约测试(新文件,不追加进逼近阈值的 generation.contract.test.ts)。
++//
++// 覆盖:
++//   - assertPlacementIntent 三态 fail-closed(完整三元组/显式 legacy/部分缺失/全缺)
++//   - 纯文生图显式 legacy 声明(debugLogger 留痕,证明是显式而非遗漏)
++//   - 枚举守卫(no_generation_entry_lacks_placement_intent)由
++//     generationEntryEnumerationGuard.test.ts 承担(动态派生+反向变异,本文件不重复)
++import { describe, expect, it, vi, beforeEach } from 'vitest'
++
++vi.mock('./remoteDebugReporter', () => ({ reportRemoteDebugEntry: () => {} }))
++
++import { debugLogger } from './debugLogStore'
++import { assertPlacementIntent } from './derivedBatchCoordinator'
++import type { CanvasGenerationOptions } from './canvasStateTypes'
++
++const options = (
++  partial: Partial<Pick<CanvasGenerationOptions, 'placement' | 'derivedBatchId' | 'expectedCount' | 'ordinal'>>,
++) => partial
++
++describe('contract: placement intent fail-closed', () => {
++  beforeEach(() => {
++    vi.restoreAllMocks()
++  })
++
++  it('placement_intent_is_fail_closed: 完整三元组 → batch-member', () => {
++    const intent = assertPlacementIntent(
++      options({ derivedBatchId: 'b1', expectedCount: 3, ordinal: 1 }),
++    )
++    expect(intent).toBe('batch-member')
++  })
++
++  it('placement_intent_is_fail_closed: 显式 legacy → legacy(不抛错,记录声明)', () => {
++    const logSpy = vi.spyOn(debugLogger, 'log')
++    const intent = assertPlacementIntent(options({ placement: 'legacy' }))
++    expect(intent).toBe('legacy')
++    expect(logSpy).toHaveBeenCalledWith(
++      'Derived Batch',
++      expect.stringContaining('legacy'),
++    )
++  })
++
++  it('placement_intent_is_fail_closed: placement:batch + expectedCount → batch-owner', () => {
++    const intent = assertPlacementIntent(options({ placement: 'batch', expectedCount: 2 }))
++    expect(intent).toBe('batch-owner')
++  })
++
++  it('placement_intent_is_fail_closed: 部分缺失 → 抛错 + debugLogger.error', () => {
++    const errorSpy = vi.spyOn(debugLogger, 'error')
++    expect(() => assertPlacementIntent(options({ derivedBatchId: 'b1' }))).toThrow(
++      /排布意图缺失/,
++    )
++    expect(errorSpy).toHaveBeenCalled()
++  })
++
++  it('placement_intent_is_fail_closed: 全缺 → 抛错 + debugLogger.error(不再静默走旧路径)', () => {
++    const errorSpy = vi.spyOn(debugLogger, 'error')
++    expect(() => assertPlacementIntent(options({}))).toThrow(/排布意图缺失/)
++    expect(errorSpy).toHaveBeenCalledWith('Derived Batch', expect.stringContaining('排布意图缺失'))
++  })
++
++  it('placement_intent_is_fail_closed: placement:batch 缺 expectedCount → 抛错', () => {
++    expect(() => assertPlacementIntent(options({ placement: 'batch' }))).toThrow(
++      /expectedCount/,
++    )
++  })
++
++  it('placement_intent_is_fail_closed: placement:batch expectedCount 越界 → 抛错', () => {
++    expect(() => assertPlacementIntent(options({ placement: 'batch', expectedCount: 5 }))).toThrow(
++      /expectedCount/,
++    )
++    expect(() => assertPlacementIntent(options({ placement: 'batch', expectedCount: 0 }))).toThrow(
++      /expectedCount/,
++    )
++  })
++})
++
++describe('contract: text-only generation declares legacy', () => {
++  beforeEach(() => {
++    vi.restoreAllMocks()
++  })
++
++  it('text_only_generation_declares_legacy: 纯文生图(无源图)调用点显式 legacy 声明', () => {
++    // 无源图 = 无对齐基准与高度锁定对象 → 显式 placement:'legacy' 而非「没传三元组」
++    // 的隐式行为(后者已被 fail-closed 变为抛错)。
++    const logSpy = vi.spyOn(debugLogger, 'log')
++    const intent = assertPlacementIntent(options({ placement: 'legacy' }))
++    expect(intent).toBe('legacy')
++    expect(logSpy).toHaveBeenCalledWith(
++      'Derived Batch',
++      expect.stringContaining('placement=legacy'),
++    )
++  })
++})
+diff --git a/src/store/generationEntryEnumerationGuard.test.ts b/src/store/generationEntryEnumerationGuard.test.ts
+new file mode 100644
+index 00000000..a3f335a6
+--- /dev/null
++++ b/src/store/generationEntryEnumerationGuard.test.ts
+@@ -0,0 +1,384 @@
++// P1b 出图入口枚举守卫(SC p1b-entry-enumeration-guard)。
++//
++// 真相源动态派生:从 generationSlice.ts 的 store action 契约现场提取全部出图类
++// action 名(正则 `^  (generate\w+):`),再据此枚举生产调用点——不把 4 个函数名
++// 写死进测试。清单中每一项要么带完整三元组/placement 声明,要么经透传通道
++// (executor mapGenerationOptions spread 命令类型契约字段)消费。
++//
++// 调用点文件集**不再硬编码**:全仓递归扫描(SCAN_ROOTS = src/ + cindyplugin/src/
++// + scripts/e2e/scenarios/),排除测试文件与定义/纯委托/协调器宿主;新增调用点
++// 文件自动纳入守卫,漏声明即红。透传通道(executor/runtime wrapper)单独验证
++// spread 存在后才放行。
++//
++// 反向变异:向**新建临时文件**注入一行未声明调用 → 断言必须转红;不红说明
++// 守卫只认死名单,判 fail。
++import { describe, expect, it } from 'vitest'
++import { readFileSync, writeFileSync, rmSync, readdirSync, statSync } from 'node:fs'
++import { join } from 'node:path'
++
++const repoRoot = process.cwd()
++
++const generationSliceSource = () => readFileSync(join(repoRoot, 'src/store/generationSlice.ts'), 'utf8')
++
++/** 动态派生:从 store action 契约提取全部出图类 action 名。 */
++const extractGenerationActionNames = (source: string): string[] =>
++  Array.from(source.matchAll(/^ {2}(generate\w+): /gm), (m) => m[1])
++
++/** 扫描根:新增目录/文件自动纳入守卫。 */
++const SCAN_ROOTS = ['src', 'cindyplugin/src', 'scripts/e2e/scenarios']
++
++/** 定义/纯委托/协调器宿主:出图 action 的定义处与签名透传,不是调用点。 */
++const EXCLUDED_HOST_FILES = [
++  'src/store/generationSlice.ts',
++  'src/store/generationFacade.ts',
++  'src/store/derivedBatchCoordinator.ts',
++]
++
++/** 透传通道:executor 的 mapGenerationOptions 以 ...shared spread 原样透传命令
++ *  类型契约字段(含 placement/derivedBatchId/expectedCount/ordinal),故其调用
++ *  点不经字面量声明也满足「意图可达 store」;canvasSyncRuntime 的
++ *  generateIntoAiSlot wrapper 以 ...options 原样透传并仅注入 onSceneMutation。
++ *  此白名单必须验证 spread 存在,否则透传通道失效时守卫静默放行。 */
++const passthroughChannels = (): string[] => {
++  const executor = readFileSync(join(repoRoot, 'src/canvas/actions/canvasCommandExecutor.ts'), 'utf8')
++  if (!executor.includes('...shared')) {
++    throw new Error('executor mapGenerationOptions 不再 spread 透传 → 透传通道失效,枚举守卫无法成立')
++  }
++  const runtime = readFileSync(join(repoRoot, 'src/canvas/actions/canvasSyncRuntime.ts'), 'utf8')
++  if (!runtime.includes('...options')) {
++    throw new Error('canvasSyncRuntime generateIntoAiSlot 不再 ...options 透传 → 透传通道失效,枚举守卫无法成立')
++  }
++  return ['src/canvas/actions/canvasCommandExecutor.ts', 'src/canvas/actions/canvasSyncRuntime.ts']
++}
++
++/** 全仓递归枚举候选调用点文件(.ts/.tsx/.mjs;排除测试/定义宿主/依赖目录)。 */
++export const candidateEntryFiles = (): string[] => {
++  const found: string[] = []
++  const walk = (dir: string) => {
++    for (const entry of readdirSync(dir, { withFileTypes: true })) {
++      const full = join(dir, entry.name)
++      if (entry.isDirectory()) {
++        if (entry.name === 'node_modules' || entry.name === '__tests__') continue
++        walk(full)
++        continue
++      }
++      if (!/\.(ts|tsx|mjs)$/.test(entry.name)) continue
++      if (/\.(test|spec)\.tsx?$/.test(entry.name)) continue
++      const rel = full.replace(`${repoRoot}/`, '')
++      if (EXCLUDED_HOST_FILES.includes(rel)) continue
++      found.push(rel)
++    }
++  }
++  for (const root of SCAN_ROOTS) {
++    const rootPath = join(repoRoot, root)
++    if (statSync(rootPath, { throwIfNoEntry: false })) walk(rootPath)
++  }
++  return found
++}
++
++const DECLARATION_TOKENS = ['placement', 'derivedBatchId', 'expectedCount', 'ordinal', 'legacy']
++
++/** 每个 action 的调用形态:成员调用 + 字符串字面量动态属性调用(G3 修复轮2 补)。 */
++const callPatternsFor = (action: string): string[] => [
++  `${action}(`,
++  `['${action}'](`,
++  `["${action}"](`,
++]
++
++// H2(fix3):动态属性调用 = 任何 `[<标识符或字符串字面量>](` 形态的成员调用
++// (computed-property),不限于变量名恰为 `action`——`api[verb](`、`api[key](`、
++// `api['verb'](` 全算。无法静态解出具体 action 的一律计为「可疑调用点」,
++// 要求该文件显式声明或豁免(fail-closed,宁可误报)。
++const COMPUTED_PROPERTY_RE = /\[[A-Za-z_$][A-Za-z0-9_$]*\]\(|\[['"][^'"]+['"]\]\(/
++
++/** 行内是否存在任何 computed-property 形态的成员调用(`x[<id|str>](`)。 */
++const hasComputedPropertyCall = (line: string): boolean => {
++  // 纯注释行(// 或 /* 起头的 JSDoc/注释里的示例文本,如 `records[recordId](`)不是
++  // 调用点——注释内出现的 computed-property 形态会被误报(示例文本是文档不是代码)。
++  if (/^\s*(\/\/|\/\*|\*)/.test(line)) return false
++  // 已知非出图动态成员调用:debugLogger[level]( 的接收者是日志对象,其动态成员
++  // 是日志级别,不可能成为 generate* action。显式豁免(名单外的新 computed 调用
++  // 仍按可疑调用点 fail-closed)。
++  if (/debugLogger\[[^\]]+\]\(/.test(line)) return false
++  return COMPUTED_PROPERTY_RE.test(line)
++}
++
++/**
++ * H2(fix3):调用点级透传豁免绑定到该调用**表达式的数据流内**,而非文本邻窗——
++ * 解析该调用(必要时跨行)的括号配对实参范围:
++ *   - 实参列表内直接含透传标记(...options/...shared/mapGenerationOptions)→ 豁免;
++ *   - 实参列表里的变量在前一语句由 `mapGenerationOptions(...)` 赋值 → 豁免
++ *     (executor 形态:`const options = await mapGenerationOptions(command.options, bridge)` +
++ *     `runtime.generateVariations(..., options)`,实参 `options` 的真实来源就是透传);
++ *   - 其它一律不豁免——邻近无关文本(±3 行窗口内刚好有标记的下一行)不得触发豁免。
++ */
++const isPassthroughExempt = (lines: string[], index: number, callStart: number): boolean => {
++  const callArgs = extractCallArgs(lines, index, callStart)
++  if (callArgs === null) return false
++  if (callArgs.includes('...options') || callArgs.includes('...shared') || callArgs.includes('mapGenerationOptions')) {
++    return true
++  }
++  // 实参变量在前一语句由 mapGenerationOptions 赋值 → 透传来源真实(executor 形态)。
++  const prevLine = lines[index - 1]
++  if (prevLine && /mapGenerationOptions\(/.test(prevLine) && /const\s+options\s*=/.test(prevLine)) return true
++  return false
++}
++
++/** 提取调用表达式的实参文本(跨行括号配对;无法配平返回 null)。
++ *  fromIdx 为该行实参扫描起点:必须从**实际命中的调用位置**起算,不能取该行
++ *  第一个 `(`——同一行前置的其它函数调用(如 `await wrap(store.generateVariations(...))`)
++ *  会抢错括号,算出错误实参。 */
++const extractCallArgs = (lines: string[], index: number, fromIdx: number): string | null => {
++  const line = lines[index]
++  const openIdx = line.indexOf('(', fromIdx)
++  if (openIdx === -1) return null
++  let depth = 0
++  let start = false
++  let chunk = ''
++  let cursor = index
++  let cursorInLine = openIdx
++  const maxLines = Math.min(lines.length, index + 12)
++  while (cursor < maxLines) {
++    const text = lines[cursor]
++    const from = cursor === index ? cursorInLine : 0
++    for (let c = from; c < text.length; c += 1) {
++      const ch = text[c]
++      if (ch === '(') {
++        depth += 1
++        start = true
++      } else if (ch === ')') {
++        depth -= 1
++        if (start && depth === 0) {
++          chunk += text.slice(from, c)
++          return chunk
++        }
++      }
++      if (start) chunk += ch
++    }
++    cursor += 1
++    cursorInLine = 0
++  }
++  return null
++}
++
++/** 单文件扫描:声明判据绑定到**当前调用表达式的实参文本**(跨行括号配对),
++ *  不再扫调用点后 3 行文本窗口——邻行无关注释(如 `// legacy 兼容说明`)/无关
++ *  变量曾可骗过旧判据,造成漏传凭证的调用点假绿。括号无法配平时 fail-closed
++ *  按未声明处理(宁红勿绿)。 */
++const undeclaredInFile = (rel: string, actions: string[]): Array<{ action: string; file: string; line: number }> => {
++  const text = readFileSync(join(repoRoot, rel), 'utf8')
++  const lines = text.split('\n')
++  const sites: Array<{ action: string; file: string; line: number }> = []
++  lines.forEach((line, index) => {
++    let hit: string | null = null
++    let callStart = 0
++    for (const action of actions) {
++      // 记录实际命中的调用位置(供 extractCallArgs 从该处起算括号配对)。
++      const patIdx = callPatternsFor(action).reduce(
++        (acc, pattern) => {
++          const i = line.indexOf(pattern)
++          return i === -1 ? acc : acc === -1 ? i : Math.min(acc, i)
++        },
++        -1,
++      )
++      if (patIdx !== -1) {
++        hit = action
++        callStart = patIdx
++        break
++      }
++    }
++    if (!hit && hasComputedPropertyCall(line)) {
++      // 动态属性调用(任意 `[<id|字面量>](` 形态,H2 修复轮3 从 `action` 单变量放宽):
++      // 无法静态验证意图,一律按潜在未声明调用点对待(fail-closed,宁可误报)。
++      const cp = line.match(COMPUTED_PROPERTY_RE)
++      hit = 'generate*'
++      callStart = cp ? cp.index ?? 0 : 0
++    }
++    if (!hit) return
++    if (isPassthroughExempt(lines, index, callStart)) return
++    const args = extractCallArgs(lines, index, callStart)
++    if (args === null || !DECLARATION_TOKENS.some((token) => args.includes(token))) {
++      sites.push({ action: hit, file: rel, line: index + 1 })
++    }
++  })
++  return sites
++}
++
++/**
++ * 枚举并判定:每个出图 action 的生产调用点都必须「意图已声明」或「调用点级透传」。
++ * 全仓扫描由 candidateEntryFiles() 派生文件集(不硬编码清单)。
++ * passthroughChannels() 仍执行 spread 存在性健全检查(spread 消失即 throw),
++ * 但不再整文件豁免宿主文件——豁免收窄到 isPassthroughExempt 判定的调用点级。
++ */
++export const unDeclaredEntrySites = (): Array<{ action: string; file: string; line: number }> => {
++  const actions = extractGenerationActionNames(generationSliceSource())
++  passthroughChannels()
++  const sites: Array<{ action: string; file: string; line: number }> = []
++  for (const file of candidateEntryFiles()) {
++    sites.push(...undeclaredInFile(file, actions))
++  }
++  return sites
++}
++
++describe('contract: no generation entry lacks placement intent', () => {
++  it('no_generation_entry_lacks_placement_intent: 全部出图调用点已声明意图(未声明条数==0)', () => {
++    const actions = extractGenerationActionNames(generationSliceSource())
++    // 真相源是动态派生的 action 清单(至少 4 个出图 action)。
++    expect(actions).toContain('generateVariations')
++    expect(actions).toContain('generateImageEdit')
++    expect(actions).toContain('generateBesideNode')
++    expect(actions).toContain('generateIntoAiSlot')
++    // 文件集全仓派生,至少覆盖 src/ 与 scripts/e2e/scenarios/(含 canvasAgentVerbs.ts)。
++    const files = candidateEntryFiles()
++    expect(files).toContain('src/agent/canvasAgentVerbs.ts')
++    expect(files).toContain('src/store/chatStore.ts')
++    expect(files.some((f) => f.startsWith('scripts/e2e/scenarios/'))).toBe(true)
++    const sites = unDeclaredEntrySites()
++    expect(sites).toEqual([])
++  })
++
++  it('反向变异:新建临时文件注入未声明调用点 → 断言转红(守卫对新增文件敏感)', () => {
++    const tempRel = 'src/store/__enumGuardMutation.tmp.ts'
++    const tempPath = join(repoRoot, tempRel)
++    writeFileSync(tempPath, 'export const probe = async () => {\n  await generateBesideNode(node.id, prompt)\n}\n')
++    try {
++      const actions = extractGenerationActionNames(generationSliceSource())
++      const sites = undeclaredInFile(tempRel, actions)
++      // 注入的调用点没有声明 token → 必须被枚举到;扫不到说明守卫只认死名单。
++      expect(sites.length).toBeGreaterThan(0)
++      expect(sites[0].action).toBe('generateBesideNode')
++      // 全仓扫描入口也必须看到它(临时文件真实存在于扫描根内)。
++      expect(unDeclaredEntrySites().some((s) => s.file === tempRel)).toBe(true)
++    } finally {
++      rmSync(tempPath, { force: true })
++    }
++  })
++
++  it('反向变异:动态属性调用注入(`api[\'generateVariations\'](`)→ 断言转红', () => {
++    const tempRel = 'src/store/__enumGuardDynMutation.tmp.ts'
++    const tempPath = join(repoRoot, tempRel)
++    writeFileSync(
++      tempPath,
++      "export const probe = async () => {\n  await api['generateVariations'](node.id, prompts)\n}\n",
++    )
++    try {
++      const actions = extractGenerationActionNames(generationSliceSource())
++      const sites = undeclaredInFile(tempRel, actions)
++      expect(sites.length).toBeGreaterThan(0)
++      expect(sites.some((s) => s.action === 'generateVariations')).toBe(true)
++      expect(unDeclaredEntrySites().some((s) => s.file === tempRel)).toBe(true)
++    } finally {
++      rmSync(tempPath, { force: true })
++    }
++  })
++
++  it('反向变异:动态属性调用注入(`api[action](`)→ 断言转红(变量形态无法静态验证)', () => {
++    const tempRel = 'src/store/__enumGuardDynVarMutation.tmp.ts'
++    const tempPath = join(repoRoot, tempRel)
++    writeFileSync(tempPath, 'export const probe = async () => {\n  await api[action](node.id, prompt)\n}\n')
++    try {
++      const sites = undeclaredInFile(tempRel, extractGenerationActionNames(generationSliceSource()))
++      expect(sites.length).toBeGreaterThan(0)
++      expect(sites.some((s) => s.action === 'generate*')).toBe(true)
++      expect(unDeclaredEntrySites().some((s) => s.file === tempRel)).toBe(true)
++    } finally {
++      rmSync(tempPath, { force: true })
++    }
++  })
++
++  it('反向变异(H2):`api[verb](`(变量名非 action)注入 → 断言转红(任意 computed 变量都算可疑)', () => {
++    const tempRel = 'src/store/__enumGuardH2VarMutation.tmp.ts'
++    const tempPath = join(repoRoot, tempRel)
++    writeFileSync(tempPath, 'export const probe = async () => {\n  await api[verb](node.id, prompt)\n}\n')
++    try {
++      const sites = undeclaredInFile(tempRel, extractGenerationActionNames(generationSliceSource()))
++      // verb 变量名(非 action)也必须被识别为动态属性调用 → 可疑调用点。
++      expect(sites.some((s) => s.action === 'generate*')).toBe(true)
++      expect(unDeclaredEntrySites().some((s) => s.file === tempRel)).toBe(true)
++    } finally {
++      rmSync(tempPath, { force: true })
++    }
++  })
++
++  it('反向变异(H2):`api[\'verb\'](`(字符串字面量非 action)注入 → 断言转红', () => {
++    const tempRel = 'src/store/__enumGuardH2StrMutation.tmp.ts'
++    const tempPath = join(repoRoot, tempRel)
++    writeFileSync(tempPath, "export const probe = async () => {\n  await api['verb'](node.id, prompt)\n}\n")
++    try {
++      const sites = undeclaredInFile(tempRel, extractGenerationActionNames(generationSliceSource()))
++      expect(sites.some((s) => s.action === 'generate*')).toBe(true)
++      expect(unDeclaredEntrySites().some((s) => s.file === tempRel)).toBe(true)
++    } finally {
++      rmSync(tempPath, { force: true })
++    }
++  })
++
++  it('反向变异(邻窗假绿):漏传调用 + 下一行无关 `// legacy` 注释 → 守卫必须转红(旧判据被注释骗过)', () => {
++    const tempRel = 'src/store/__enumGuardAdjCommentMutation.tmp.ts'
++    const tempPath = join(repoRoot, tempRel)
++    // 复现缺陷形态:调用点实参没有声明字段,邻行却有 `legacy` 字样。
++    writeFileSync(
++      tempPath,
++      [
++        "import { useCanvasStore } from './canvasStore'",
++        'export const leaky = async () => {',
++        "  await useCanvasStore.getState().generateVariations('n1', 'p')",
++        '  // legacy 兼容说明：此注释与上面调用无关',
++        '}',
++        '',
++      ].join('\n'),
++    )
++    try {
++      const sites = undeclaredInFile(tempRel, extractGenerationActionNames(generationSliceSource()))
++      // 声明判据必须绑定实参:邻行注释不得构成声明 → 该调用点必须被枚举为未声明。
++      expect(sites.some((s) => s.action === 'generateVariations')).toBe(true)
++      expect(unDeclaredEntrySites().some((s) => s.file === tempRel)).toBe(true)
++    } finally {
++      rmSync(tempPath, { force: true })
++    }
++  })
++
++  it('反向变异(邻窗假绿):漏传调用 + 下一行无关 `const placement = ...` 变量 → 守卫必须转红(旧判据被变量骗过)', () => {
++    const tempRel = 'src/store/__enumGuardAdjVarMutation.tmp.ts'
++    const tempPath = join(repoRoot, tempRel)
++    writeFileSync(
++      tempPath,
++      [
++        "import { useCanvasStore } from './canvasStore'",
++        'export const leaky = async () => {',
++        "  await useCanvasStore.getState().generateVariations('n1', 'p')",
++        "  const placement = 'unrelated'",
++        '}',
++        '',
++      ].join('\n'),
++    )
++    try {
++      const sites = undeclaredInFile(tempRel, extractGenerationActionNames(generationSliceSource()))
++      // 与调用无关的邻行变量声明不构成该调用的意图声明 → 必须转红。
++      expect(sites.some((s) => s.action === 'generateVariations')).toBe(true)
++      expect(unDeclaredEntrySites().some((s) => s.file === tempRel)).toBe(true)
++    } finally {
++      rmSync(tempPath, { force: true })
++    }
++  })
++
++  it('反向变异:临时新增第 5 个 generate* action(改 generationSlice)+ 未声明调用 → 守卫转红', () => {
++    const slicePath = join(repoRoot, 'src/store/generationSlice.ts')
++    const original = readFileSync(slicePath, 'utf8')
++    const tempRel = 'src/store/__enumGuardActionMutation.tmp.ts'
++    const tempPath = join(repoRoot, tempRel)
++    try {
++      // 临时往 generationSlice 追加第 5 个出图 action(纯文本追加,守卫按文本派生清单;
++      // finally 恢复原文)。
++      writeFileSync(slicePath, `${original}\n  generateSweepMutation: (async () => {}) as never\n`)
++      writeFileSync(tempPath, 'export const probe = async () => {\n  await generateSweepMutation(node.id, prompt)\n}\n')
++      const actions = extractGenerationActionNames(readFileSync(slicePath, 'utf8'))
++      expect(actions).toContain('generateSweepMutation')
++      // 新 action 的真实调用点未声明 → 全仓扫描必须看到它。
++      expect(unDeclaredEntrySites().some((s) => s.file === tempRel)).toBe(true)
++    } finally {
++      writeFileSync(slicePath, original)
++      rmSync(tempPath, { force: true })
++    }
++  })
++})
+diff --git a/src/store/generationFacade.ts b/src/store/generationFacade.ts
+index 0c9c7266..080e635b 100644
+--- a/src/store/generationFacade.ts
++++ b/src/store/generationFacade.ts
+@@ -18,7 +18,7 @@ import type { CanvasGenerationOptions, CanvasState } from './canvasStore'
+ import type { CanvasId } from '../types/mivoCanvas'
+ import { defaultSizeForNodeType } from '../model/canvasNodeRegistry'
+ import { AI_SLOT_GAP, chooseAdjacentPlacement } from './aiCanvasWorkflow'
+-import { firstAnchorImageFor } from './canvasDocumentModel'
++import { firstAnchorImageFor, resolvedSourceNodeType } from './canvasDocumentModel'
+ import { wrapMutationForScene } from '../canvas/actions/canvasSyncRuntime'
+ import { LocalizedKeyError } from '../lib/localizedKeyError'
+ 
+@@ -121,6 +121,21 @@ export const generationFacade = {
+     return { mode: 'slot', slotId }
+   },
+ 
++  // F5:chat 有源判定兜底——chatStore 不直接读 canvas store,经本回调现场解析
++  // sourceNodeId 对应节点的实时类型(不单信持久化的 UI 布尔)。
++  // G4(修复轮2):解析必须用 chat 目标 sceneId 的文档,而非当前活跃 state.sceneId
++  // ——跨场景 retry(用户切到别的板再重试本板的 chat 消息)时按活跃板解析会漏判有源。
++  resolveLiveSourceNodeType: (
++    sceneId: string | undefined,
++    sourceNodeId: string | undefined,
++    sourceNodeType: string | undefined,
++  ): string | undefined => {
++    const state = useCanvasStore.getState()
++    const doc = sceneId ? state.canvases[sceneId] : state.canvases[state.sceneId]
++    const nodes = doc?.nodes ?? []
++    return resolvedSourceNodeType(sourceNodeId, sourceNodeType, nodes)
++  },
++
+   // ─── read-only: did the active scene change during generation? (cross-scene notice) ───
+   getSceneChangeInfo: (expectedSceneId: CanvasId) => {
+     const state = useCanvasStore.getState()
+diff --git a/src/store/resolvedSourceNodeType.test.ts b/src/store/resolvedSourceNodeType.test.ts
+new file mode 100644
+index 00000000..78ff4252
+--- /dev/null
++++ b/src/store/resolvedSourceNodeType.test.ts
+@@ -0,0 +1,36 @@
++// F5:chat 有源判定兜底——resolvedSourceNodeType 纯函数测试。
++// 独立文件:canvasDocumentModel.test.ts 逼近 900 行 structure-guard 红线,
++// F5 用例外提至此(行为契约见 canvasDocumentModel.ts 内的实现注释)。
++import { describe, expect, it } from 'vitest'
++import { resolvedSourceNodeType } from './canvasDocumentModel'
++
++describe('resolvedSourceNodeType (F5 chat 有源判定兜底)', () => {
++  const image = { id: 'img1', type: 'image', hidden: false }
++  const text = { id: 'txt1', type: 'text', hidden: false }
++  const hidden = { id: 'h1', type: 'image', hidden: true }
++
++  it('sourceNodeId 在场且是 image → 现场解析为 image(不依赖传入布尔)', () => {
++    expect(resolvedSourceNodeType('img1', 'text', [image, text])).toBe('image')
++  })
++
++  it('sourceNodeId 缺失 → 退回传入的 sourceNodeType', () => {
++    expect(resolvedSourceNodeType(undefined, 'image', [image])).toBe('image')
++    expect(resolvedSourceNodeType(undefined, undefined, [image])).toBeUndefined()
++  })
++
++  // G4(修复轮2):节点已删/被隐藏 → 一律无源(undefined),不回退陈旧 sourceNodeType。
++  // 此前「退回传入值」把已删源的 retry 误判成有源(走批次),实际应按无源→legacy。
++  it('sourceNodeId 对应节点已删 → 无源(undefined,不回退陈旧布尔)', () => {
++    expect(resolvedSourceNodeType('gone', 'image', [image, text])).toBeUndefined()
++    expect(resolvedSourceNodeType('gone', undefined, [image, text])).toBeUndefined()
++  })
++
++  it('sourceNodeId 对应节点被隐藏 → 无源(undefined,不回退陈旧布尔)', () => {
++    expect(resolvedSourceNodeType('h1', 'image', [image, text, hidden])).toBeUndefined()
++    expect(resolvedSourceNodeType('h1', undefined, [image, text, hidden])).toBeUndefined()
++  })
++
++  it('sourceNodeId 对应节点是 text → 现场解析为 text(UI 布尔陈旧时纠正)', () => {
++    expect(resolvedSourceNodeType('txt1', 'image', [image, text])).toBe('text')
++  })
++})

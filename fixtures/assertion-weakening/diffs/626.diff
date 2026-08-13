@@ -1,0 +1,114 @@
+diff --git a/src/canvas/maskEditGeneration.test.ts b/src/canvas/maskEditGeneration.test.ts
+index e4f2787d..2f274a3a 100644
+--- a/src/canvas/maskEditGeneration.test.ts
++++ b/src/canvas/maskEditGeneration.test.ts
+@@ -426,6 +426,81 @@ describe('runMaskEditGeneration callbacks + return value (SC-13)', () => {
+     expect(result.nodeIds).toEqual(['n1'])
+   })
+ 
++  /** 区域编辑豁免用例的共享装配:只有 payload 不同,其余(源图/占位/spy)完全一致。 */
++  const runRegionEditInspectionCase = async (payloadExtra: Record<string, unknown>) => {
++    const source = imageNode({ id: 'src-1' })
++    seed(seedCanvas('character-flow', [source]))
++    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
++    useCanvasStore.setState({
++      commitGenerationResult: vi.fn(async () => ['n1']),
++    } as never)
++
++    taskClientSpies.submitEditTask.mockResolvedValue('task-1')
++    taskClientSpies.pollTask.mockResolvedValue({
++      status: 'done', progress: 100, stage: 'done',
++      result: { images: [{ b64: 'dark-poster-b64' }] },
++    })
++    // 检测 mock 成恒判 hit:被调用就必然触发自愈重发,故"零第二单"能反证它没被调。
++    inspectArtifactsSpy.mockResolvedValue(artifactHit())
++
++    return runMaskEditGeneration({
++      sceneId: 'character-flow',
++      source,
++      slotId,
++      resolvedAssetUrl: undefined,
++      payload: {
++        prompt: 'p',
++        sourceSize: { width: 200, height: 200 },
++        maskBounds: { x: 10, y: 10, width: 50, height: 50 },
++        model: 'gpt-image-2',
++        ...payloadExtra,
++      } as never,
++      imgRatio: '1:1' as never,
++      signal: new AbortController().signal,
++    })
++  }
++
++  const REGION_RECT = { n: 1, kind: 'rect', left: 1, top: 1, right: 20, bottom: 20 }
++
++  it('region-edit 完整表单豁免黑块检测:rects 与 body 都在场时即使有 maskBounds 也不检测、不自愈重发', async () => {
++    // 用户实测事故(黑底海报源图):GPT 区域编辑走整图重生成,没有"洞→黑"失败模式,
++    // 检测把正常黑底当伪影 → 自愈重发第二单(双倍扣费)→ 仍"异常" → 好图被丢弃报失败。
++    const result = await runRegionEditInspectionCase({
++      regionRects: [REGION_RECT],
++      regionBody: '区域1 去除LOGO',
++    })
++
++    expect(inspectArtifactsSpy).not.toHaveBeenCalled() // 检测整个跳过
++    expect(taskClientSpies.submitEditTask).toHaveBeenCalledTimes(1) // 不自愈重发(零第二单)
++    expect(result.nodeIds).toEqual(['n1']) // 好图照常 commit
++  })
++
++  // 单字段是**生产构造器产不出的异常组合**(regionEditSubmit.ts 成对产出 rects+body)。
++  // 判据用 AND 而非 OR,正是为了不把"任一残留可选字段都能关掉质量保护"写进契约
++  // (R1 席② ADV-1)。下面三条锁死:异常组合下检测**仍须被调用**,防判据被改回 OR。
++  //
++  // 检测 mock 恒判 hit ⇒ 被调用就必然走完整自愈链(重试一次 → 二次仍 hit → 抛
++  // "结果异常")。所以"抛出该错误"本身就是检测被调用的证据,断言要接住它;
++  // 若判据被改回 OR,这三条会因为**没抛错**而失败(rejects 断言不满足)。
++  const EXPECT_INSPECTED = 'AI 编辑结果异常'
++
++  it('异常组合 body-only + maskBounds:检测仍被调用(不因单字段豁免)', async () => {
++    await expect(runRegionEditInspectionCase({ regionBody: '只有正文没有选区' })).rejects.toThrow(EXPECT_INSPECTED)
++    expect(inspectArtifactsSpy).toHaveBeenCalled()
++  })
++
++  it('异常组合 rects-only + maskBounds:检测仍被调用(不因单字段豁免)', async () => {
++    await expect(runRegionEditInspectionCase({ regionRects: [REGION_RECT] })).rejects.toThrow(EXPECT_INSPECTED)
++    expect(inspectArtifactsSpy).toHaveBeenCalled()
++  })
++
++  it('空白 body + rects + maskBounds:trim 后为空不算完整表单,检测仍被调用', async () => {
++    await expect(
++      runRegionEditInspectionCase({ regionRects: [REGION_RECT], regionBody: '   ' }),
++    ).rejects.toThrow(EXPECT_INSPECTED)
++    expect(inspectArtifactsSpy).toHaveBeenCalled()
++  })
++
+   it('onSelfHealRetry: 首 attempt done+black → 第二 attempt → onSelfHealRetry([task-1, task-2]) 被调', async () => {
+     const source = imageNode({ id: 'src-1' })
+     seed(seedCanvas('character-flow', [source]))
+diff --git a/src/canvas/maskEditGeneration.ts b/src/canvas/maskEditGeneration.ts
+index be693c08..b6213034 100644
+--- a/src/canvas/maskEditGeneration.ts
++++ b/src/canvas/maskEditGeneration.ts
+@@ -380,7 +380,22 @@ export const runMaskEditGeneration = async (args: {
+     // 会把选区渲染成纯黑。gemini 双图路是基于干净图1【整图重生成】，没有洞→黑的失败
+     // 模式，这套近黑连通块检测在深色图内容上纯误报（用户实测:图出来了却被判「结果
+     // 异常」）。故 gemini 路直接跳过黑块检测，结果照常 commit。
+-    const canInspect = model === 'gpt-image-2' && Boolean(payload.maskBounds && images[0]?.b64)
++    // 扩面：**region-edit 同样豁免**。区域编辑的 GPT 走平台整图重生成
++    // （server/tasks/runner.ts 的 usePlatform 对无 mask blob 的 GPT 判真;插件 Mivo 直连
++    // 恒无 mask），与 gemini 双图路同为无洞形态。用户实测（黑底海报源图，平台任务
++    // 2026-08-11T13:31Z 那批的时序为证）：好图 → 误判黑块 → 自愈重发第二单（双倍扣费）
++    // → 仍判"异常" → 两张好图全被丢弃报失败。检测因此只留给真正带 maskBounds 的
++    // alpha-mask 挖洞路（annotation area-edit：带 bounds；brush mask 上传无 bounds，
++    // 由上方 maskBounds 前置条件天然跳过，不在本豁免的作用范围内）。
++    //
++    // ⚠ 判据是 **AND（完整表单）不是 OR**，别"优化"成 OR：regionRects 与 regionBody 由
++    // regionEditSubmit.ts 的同一处构造器成对产出，单字段在场是**生产构造器产不出的异常
++    // 组合**。用 OR 等于承诺"任一残留可选字段都能关掉质量保护"，把信任边界从实现扩到
++    // 契约（R1 席② ADV-1）。零选区形态（K6：用户只打字不圈选）不受本判据影响——那时
++    // boundsForRegions 返回 undefined（imageMaskGeometry.ts），canInspect 的 maskBounds
++    // 前置条件本就不满足，压根进不到检测。
++    const regionEditForm = Boolean(payload.regionRects?.length) && Boolean(payload.regionBody?.trim())
++    const canInspect = model === 'gpt-image-2' && !regionEditForm && Boolean(payload.maskBounds && images[0]?.b64)
+     if (canInspect) {
+       // 历史洞区：source 若是上次局部重绘的结果（generation.maskBounds + maskSourceSize），
+       // 把上次洞区从"上次源图空间"等比映射到"当前源图空间"作为高优先检测区。

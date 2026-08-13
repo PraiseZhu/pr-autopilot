@@ -1,0 +1,727 @@
+diff --git a/.github/workflows/nightly-e2e.yml b/.github/workflows/nightly-e2e.yml
+index 95fd2cae..2c9db891 100644
+--- a/.github/workflows/nightly-e2e.yml
++++ b/.github/workflows/nightly-e2e.yml
+@@ -1,9 +1,9 @@
+ # Nightly full prod-topology e2e.
+ #
+ # - mock-upstream full sweep runs daily and can also be started manually
+-# - e2e-prod-full 按 kernel 矩阵拆分(legacy/new × --renderer=both,每 child 74 格 =
+-#   37 场景 × dom/leafer;fail-fast:false 保证两腿都跑完);aggregate job 下载两份
+-#   artifact 合并校验 148 格(#561)。改前:单 job 无 kernel 矩阵(默认 dom×legacy)。
++# - e2e-prod-full 按 kernel 矩阵拆分(legacy/new × --renderer=both,每 child 76 格 =
++#   38 场景 × dom/leafer;fail-fast:false 保证两腿都跑完);aggregate job 下载两份
++#   artifact 合并校验 152 格(#561)。改前:单 job 无 kernel 矩阵(默认 dom×legacy)。
+ # - real-upstream placeholder job is wired for GitHub Secrets, but skips cleanly when
+ #   secrets are absent (default on this repo today)
+ # - failure notification uses GitHub Actions defaults (repository / user email)
+@@ -63,8 +63,8 @@ jobs:
+       # 产物会被这里立即覆盖,纯浪费一次 build。
+       # #561:kernel 矩阵。——renderer=both 与 --kernel= 经 npm 的 -- 透传到
+       # e2e-runner.mjs(--topology=prod 由 test:e2e:prod:full script 本体携带,
+-      # 等效显式);每 child 74 格(37 场景 × dom/leafer,leafer 下 canvas-interactions
+-      # 按 leaferSkippedScenarios 显式 skip),两 child 合计 148 格。
++      # 等效显式);每 child 76 格(38 场景 × dom/leafer,leafer 下 canvas-interactions
++      # 按 leaferSkippedScenarios 显式 skip),两 child 合计 152 格。
+       - name: Run full prod e2e (kernel=${{ matrix.kernel }})
+         run: |
+           set -euo pipefail
+@@ -133,13 +133,13 @@ jobs:
+           retention-days: 14
+ 
+   # #561:aggregate job——下载两份 per-kernel ledger artifact(nightly-e2e-ledger-*),
+-  # 合并校验 148 格。
++  # 合并校验 152 格。
+   # if: always():child 失败也要跑,校验器把缺格如实报出来(而不是把"没跑完"静默
+   # 变成"没结果")。下载用 actions/download-artifact v7.0.0(SHA 由
+   # `gh api repos/actions/download-artifact/tags` 解析,与仓内 upload-artifact
+   # v7.0.1 同主版本、artifact 后端一致;全仓首次引入 download-artifact)。
+   aggregate:
+-    name: aggregate ledger (148 cells)
++    name: aggregate ledger (152 cells)
+     needs: e2e-prod-full
+     if: always()
+     runs-on: ubuntu-latest
+@@ -189,21 +189,21 @@ jobs:
+ 
+       # #561:真实调用已定型(W7 定稿,实现契约 lead 实测):
+       #   --dir <kernel>=<路径> ×2(kernel ∈ {legacy,new} 各一次,路径 = run 目录本身,
+-      #   canonical 布局 A)+ --expect-total 必填无默认值(nightly 传 148)。
++      #   canonical 布局 A)+ --expect-total 必填无默认值(nightly 传 152)。
+       # 退出码:0=通过;1=校验失败(缺格/重复/计数不符);2=用法/输入错误(含 manifest
+       # 结构非法);3=校验器内部错误。tee 前 mkdir:下载只落 dl/,不再隐式创建
+       # test-artifacts/,漏 mkdir 会让 tee 失败连带把校验结果误标红。
+-      - name: Aggregate ledger (148 cells)
++      - name: Aggregate ledger (152 cells)
+         run: |
+           set -euo pipefail
+           mkdir -p test-artifacts
+-          node scripts/e2e/ledger-aggregate.mjs --dir legacy=dl/legacy --dir new=dl/new --expect-total 148 2>&1 | tee test-artifacts/aggregate.log
++          node scripts/e2e/ledger-aggregate.mjs --dir legacy=dl/legacy --dir new=dl/new --expect-total 152 2>&1 | tee test-artifacts/aggregate.log
+ 
+       - name: Surface aggregate result in job summary
+         if: always()
+         run: |
+           {
+-            echo '## nightly aggregate (148 cells, kernel × renderer)'
++            echo '## nightly aggregate (152 cells, kernel × renderer)'
+             echo ''
+             echo '```'
+             tail -n 40 test-artifacts/aggregate.log 2>/dev/null || echo '(无日志:校验器可能未启动,见上方 step 日志)'
+diff --git a/package.json b/package.json
+index a9b96c64..19c7f33e 100644
+--- a/package.json
++++ b/package.json
+@@ -20,7 +20,7 @@
+     "test:shell": "bash ops/postgres/test-asset-verify.sh && bash ops/postgres/test-restore-drill-matrix.sh && bash scripts/changelog/test-publish-gate.sh && bash scripts/changelog/test-publish-gate-isolation.sh",
+     "test:e2e": "npm run test:e2e:dev",
+     "test:e2e:dev": "node scripts/e2e-runner.mjs --topology=dev",
+-    "test:e2e:prod:subset": "VITE_MIVO_PERSIST=local npm run build && node scripts/e2e-runner.mjs --topology=prod --scenario=debug,canvas-interactions,canvas-export,zoom-tool,chat-copy,chat-generation,mask,mask-reflow,variations-annotation",
++    "test:e2e:prod:subset": "VITE_MIVO_PERSIST=local npm run build && node scripts/e2e-runner.mjs --topology=prod --scenario=p1b-batch-column,debug,canvas-interactions,canvas-export,zoom-tool,chat-copy,chat-generation,mask,mask-reflow,variations-annotation",
+     "test:e2e:gated:unauthorized": "node scripts/e2e-gated-check.mjs --mode=unauthorized",
+     "test:e2e:gated:authorized": "node scripts/e2e-gated-check.mjs --mode=authorized",
+     "test:e2e:prod:full": "VITE_MIVO_PERSIST=local npm run build && node scripts/e2e-runner.mjs --topology=prod",
+diff --git a/scripts/e2e/ledger-aggregate.test.mjs b/scripts/e2e/ledger-aggregate.test.mjs
+index 97cc69aa..495065cc 100644
+--- a/scripts/e2e/ledger-aggregate.test.mjs
++++ b/scripts/e2e/ledger-aggregate.test.mjs
+@@ -217,10 +217,10 @@ const runCli = (args) =>
+ // ---------------------------------------------------------------------------
+ 
+ describe('ledger-aggregate — 正常路径', () => {
+-  it('CLEAN: 双 child 各 74 格(73 PASS + 1 N_A),合计 148 → ok=true', () => {
++  it('CLEAN: 双 child 各 76 格(75 PASS + 1 N_A),合计 152 → ok=true', () => {
+     // 漂移哨兵:场景增删时这一条先红,提醒同步更新
+     // .github/workflows/nightly-e2e.yml 的 --expect-total 字面量。
+-    expect(scenarioOrder.length).toBe(37)
++    expect(scenarioOrder.length).toBe(38)
+     const a = buildChild({ kernel: 'legacy' })
+     const b = buildChild({ kernel: 'new' })
+     const result = runAggregate({ a, b })
+diff --git a/scripts/e2e/nightly-matrix-contract.test.mjs b/scripts/e2e/nightly-matrix-contract.test.mjs
+index cce8aa65..5a211a80 100644
+--- a/scripts/e2e/nightly-matrix-contract.test.mjs
++++ b/scripts/e2e/nightly-matrix-contract.test.mjs
+@@ -1,8 +1,8 @@
+ // scripts/e2e/nightly-matrix-contract.test.mjs — B2:nightly-e2e.yml 矩阵字面量 ↔ scenarioOrder
+ // 一致性哨兵(PR 期拦截,替代"只在夜间响"的兜底)。
+ //
+-// 动机(issue #561 沿革):workflow 里 `--expect-total 148` 是字面量,而真实矩阵
+-// 148 = scenarioOrder(37) × renderer(2) × kernel(2)。B1 的 ledger-aggregate 校验器
++// 动机(issue #561 沿革):workflow 里 `--expect-total 152` 是字面量,而真实矩阵
++// 152 = scenarioOrder(38) × renderer(2) × kernel(2)。B1 的 ledger-aggregate 校验器
+ // 兜底只在夜间运行响应(scenarioOrder 变多 → 实际格数 ≠ expect-total → aggregate job
+ // 红),PR 期场景数/形状变了不响。本条把 workflow 字面量与 scenarioOrder 绑到一处,
+ // CI test:unit(vitest run)PR 期即拦,不必等夜间。
+@@ -17,14 +17,19 @@
+ // 与依赖它的断言双双变红是正确行为;为把红集压成 1 条而给断言开「返回而不断言」
+ // 的早退路径,代价是断言恒真——那个交换永远不值得。
+ //
+-//   M1  --expect-total 改数(148→150) → 预测 {主断言}(提取 it 全过,只主断言红)
++//   M1  --expect-total 改数(152→150) → 预测 {主断言}(提取 it 全过,只主断言红)
+ //   M2  kernel 列表 2 项 → 1 项       → 预测 {主断言}(kernel 提取 it 只解析不设数量
+-//                                         门槛,1 项合法;主断言 148≠37×2×1=74 红)
++//                                         门槛,1 项合法;主断言 152≠38×2×1=76 红)
+ //   M3  删掉 --renderer=both          → 预测 {renderer 存在 it, 主断言}(前置条件被
+ //                                         破坏 → 前置检查与依赖它的断言双双变红)
+ //
+ // 路径解析:workflow 用相对本文件的 URL(CI 与本地 cwd 可能不同,禁 process.cwd())。
+ // 默认路径必须是真实相对路径;NIGHTLY_E2E_WORKFLOW_PATH 仅供变异验证注入,不改默认值。
++//
++// 归属契约(G9 修正):gamma 只拥有本矩阵同步——38 场景 / 152 总格 / 76 每 child 格——
++// 的职责,集中锚点在下方 GAMMA_OWNED_MATRIX_SYNC 常量与「gamma 归属锁」用例。
++// chatStore retry 用例改名属 beta2 G4 交付范围,gamma 不拥有、不得在任何声称中算作
++// 本节交付项;矩阵范围变化必须先改锚点再改 workflow 字面量,禁止绕过锚点直接改字面量。
+ 
+ import { readFileSync } from 'node:fs'
+ import { fileURLToPath } from 'node:url'
+@@ -37,6 +42,18 @@ const DEFAULT_WORKFLOW_PATH = fileURLToPath(
+ // 变异验证注入点(默认保持真实相对路径,不为了可测性改默认值)。
+ const workflowPath = process.env.NIGHTLY_E2E_WORKFLOW_PATH || DEFAULT_WORKFLOW_PATH
+ 
++// ── G9 归属锚点:gamma 只拥有 38/152/76 矩阵同步 ──────────────────────────────
++// 38 = scenarioOrder 场景数;76 = 每 kernel child 格数(38 × renderer 2);
++// 152 = 总格数(76 × kernel 2)。五个值全部被「gamma 归属锁」用例消费,不是装饰性注释。
++// 矩阵范围变化(新增/删除场景、矩阵维度增减)必须显式更新这里,再同步 workflow 字面量。
++const GAMMA_OWNED_MATRIX_SYNC = {
++  scenarioCount: 38,
++  rendererCount: 2,
++  kernelCount: 2,
++  expectTotal: 152,
++  perKernelCells: 76,
++}
++
+ // ── 三个提取器,全部 fail-closed:提取不到/形状异常即抛错,绝不静默返回缺省 ──────
+ 
+ // --expect-total 字面量:必须恰好出现 1 次(0 次 = 校验器没接上;≥2 次 = 有第二条
+@@ -111,4 +128,16 @@ describe('nightly-e2e.yml 矩阵字面量 ↔ scenarioOrder 契约', () => {
+     const expected = scenarioOrder.length * rendererCount * kernelCount
+     expect(expectTotal).toBe(expected)
+   })
++
++  // 归属契约锚点(gamma G9):左值来自 live scenarioOrder,右值来自上方常量。
++  // 与漂移哨兵互补——哨兵抓「workflow 字面量与场景数不一致」,本用例锁「gamma 声称
++  // 的 38/152/76 范围没有漂移」:场景数变了但没更新锚点 = 红,逼矩阵范围变化先落锚点。
++  // M1-M3 变异只改 workflow 文件,不触本用例,上方预测红集不变。
++  it('gamma 归属锁:矩阵同步保持 38/152/76(scenarioOrder 漂移即红)', () => {
++    const { scenarioCount, rendererCount, kernelCount, expectTotal, perKernelCells } =
++      GAMMA_OWNED_MATRIX_SYNC
++    expect(scenarioOrder.length).toBe(scenarioCount)                          // 38 场景
++    expect(scenarioOrder.length * rendererCount).toBe(perKernelCells)         // 每 child 76 格
++    expect(scenarioOrder.length * rendererCount * kernelCount).toBe(expectTotal) // 152 总格
++  })
+ })
+diff --git a/scripts/e2e/scenarios/index.mjs b/scripts/e2e/scenarios/index.mjs
+index e3692673..f9a44679 100644
+--- a/scripts/e2e/scenarios/index.mjs
++++ b/scripts/e2e/scenarios/index.mjs
+@@ -32,6 +32,7 @@ import { runProjectSidebarScenario } from './project-sidebar.mjs'
+ import { runShellSidebarScenario } from './shell-sidebar.mjs'
+ import { runStampOverlapScenario } from './stamp-overlap.mjs'
+ import { runVariationsAnnotationScenario } from './variations-annotation.mjs'
++import { runP1bBatchColumnScenario } from './p1b-batch-column.mjs'
+ import { runZoomToolScenario } from './zoom-tool.mjs'
+ import { runUserChipScenario } from './userchip.mjs'
+ import { runAutoPromptSettingsScenario } from './auto-prompt-settings.mjs'
+@@ -48,6 +49,7 @@ export const scenarioOrder = [
+   'input-focus',
+   'markup-text-overlay',
+   'zoom-tool',
++  'p1b-batch-column',
+   'chat-generation',
+   'chat-copy',
+   'mask',
+@@ -127,6 +129,7 @@ export const scenarioRunners = {
+   'shell-sidebar': runShellSidebarScenario,
+   'stamp-overlap': runStampOverlapScenario,
+   'variations-annotation': runVariationsAnnotationScenario,
++  'p1b-batch-column': runP1bBatchColumnScenario,
+   'zoom-tool': runZoomToolScenario,
+   'userchip': runUserChipScenario,
+   'auto-prompt-settings': runAutoPromptSettingsScenario,
+diff --git a/scripts/e2e/scenarios/p1b-batch-column.mjs b/scripts/e2e/scenarios/p1b-batch-column.mjs
+new file mode 100644
+index 00000000..6ddabc08
+--- /dev/null
++++ b/scripts/e2e/scenarios/p1b-batch-column.mjs
+@@ -0,0 +1,500 @@
++// scripts/e2e/scenarios/p1b-batch-column.mjs
++// P1b — 批次占位列真实渲染验收(SC p1b-e2e-fullchain-column)。
++// 覆盖两条链路:
++//   A) 批次入口(startDerivedImageBatch expectedCount=3):网络提交前 3 个预建占位
++//      逐项渲染可见、同列左缘 x 相等、高度=源图;乱序完成(ordinal 1 先回)后节点位置不变。
++//   B) chat 旁生成(expectedCount=1):占位与源图边缘对齐,完成后原位替换高度锁定。
++// 页面内测试桥(route mock 任务 API)+ store 直读断言 bounds。
++
++import { waitForNodeRendered } from '../renderer-evidence.mjs'
++
++const resolveCanvasStoreSpec = async (page) => {
++  return page.evaluate(() => {
++    const resource = performance
++      .getEntriesByType('resource')
++      .map((entry) => entry.name)
++      .find((name) => name.includes('/src/store/canvasStore.ts'))
++    return resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/canvasStore.ts'
++  })
++}
++
++/** 把批次中心平移到视口中心(space+drag,与 archive-assets 既有 pan 手法同式)。
++ *  预建列按 SC11 垂直居中于源图,3×源高 + gap 超过视口高度时首/尾 slot 落在
++ *  视口外;virtualize/lod 默认 on 时视口外节点不材料化(无 DOM 壳)——「占位
++ *  渲染可见」的证据必须先让用户看得见它们。内容跟随光标:
++ *  viewportFromPan 下 viewport.{x,y} += 鼠标位移,故拖 dx/dy 后批次中心进视口中心。 */
++const panBatchIntoView = async (page, slots) => {
++  const shell = page.locator('.canvas-shell')
++  const shellBox = await shell.boundingBox()
++  if (!shellBox) throw new Error('panBatchIntoView: canvas-shell 无 boundingBox')
++  const vp = await page.evaluate(() => {
++    const shell = document.querySelector('.canvas-shell')
++    return {
++      x: Number(shell?.getAttribute('data-viewport-x') || 0),
++      y: Number(shell?.getAttribute('data-viewport-y') || 0),
++      scale: Number(shell?.getAttribute('data-viewport-scale') || 1),
++    }
++  })
++  const centerX = slots.reduce((sum, slot) => sum + slot.x, 0) / slots.length
++  const centerY = slots.reduce((sum, slot) => sum + slot.y, 0) / slots.length
++  const dx = shellBox.x + shellBox.width / 2 - (vp.x + centerX * vp.scale)
++  const dy = shellBox.y + shellBox.height / 2 - (vp.y + centerY * vp.scale)
++  const startX = shellBox.x + shellBox.width / 2
++  const startY = shellBox.y + shellBox.height / 2
++  await page.keyboard.down('Space')
++  await page.mouse.move(startX, startY)
++  await page.mouse.down()
++  await page.mouse.move(startX + dx, startY + dy, { steps: 12 })
++  await page.mouse.up()
++  await page.keyboard.up('Space')
++}
++
++export const runP1bBatchColumnScenario = async (context) => {
++  const { page, generatedImageB64, rendererMode } = context
++  const spec = await resolveCanvasStoreSpec(page)
++
++  // G7(修复轮2)重做:乱序段不再「await 整个 generateVariations 才断中态」——
++  // 生产轮询(generationTaskHelpers runTaskPollLoop)只在终态提交结果,单任务
++  // 的中态在干净树上不可达,旧断言是假象。改为**两个独立任务共享 batchId**
++  // (ordinal 0/1/2 各自经 generateIntoAiSlot 分任务路径提交,各自在自身终态
++  // 提交)——mock 让 ordinal 1 先终态完成、ordinal 0 暂缓、ordinal 2 失败,
++  // 此时可观测真实中态:ordinal 1 已替换、ordinal 0 仍占位、列位置不变。
++  // chat 旁生成走 submitEditTask(POST /tasks/edit)→ 202(BFF 无 key 会 500,必须拦)。
++  let releaseOrdinal0 = false
++  const handler = async (route) => {
++    const req = route.request()
++    const method = req.method()
++    const url = req.url()
++    if (method === 'POST' && url.includes('/api/mivo/tasks/edit')) {
++      await route.fulfill({
++        status: 202,
++        contentType: 'application/json',
++        body: JSON.stringify({ taskId: 'task-beside' }),
++      })
++      return
++    }
++    if (method === 'GET' && url.includes('/task-beside')) {
++      await route.fulfill({
++        status: 200,
++        contentType: 'application/json',
++        body: JSON.stringify({
++          id: 'task-beside',
++          kind: 'edit',
++          status: 'done',
++          progress: 100,
++          stage: 'done',
++          requestId: 'r-beside',
++          model: 'gpt-image-2',
++          result: { images: [{ b64: generatedImageB64, variationIndex: 0 }] },
++        }),
++      })
++      return
++    }
++    // 独立任务分任务路径:POST /tasks/generate 按 prompt 路由到 ordinal 专属 taskId,
++    // 每个 ordinal 的轮询互不干扰(G7:两个独立任务共享 batchId 的真实中态)。
++    if (method === 'POST' && url.includes('/api/mivo/tasks/generate')) {
++      const body = req.postDataJSON?.() ?? {}
++      const prompt = String(body.prompt ?? '')
++      const taskId = prompt.includes('ordinal-1')
++        ? 'task-g7-1'
++        : prompt.includes('ordinal-2')
++          ? 'task-g7-2'
++          : 'task-g7-0'
++      await route.fulfill({
++        status: 202,
++        contentType: 'application/json',
++        body: JSON.stringify({ taskId }),
++      })
++      return
++    }
++    if (method === 'GET' && url.includes('/task-g7-1')) {
++      // ordinal 1 先终态完成(首 poll 即 done)。
++      await route.fulfill({
++        status: 200,
++        contentType: 'application/json',
++        body: JSON.stringify({
++          id: 'task-g7-1',
++          kind: 'generate',
++          status: 'done',
++          progress: 100,
++          stage: 'done',
++          requestId: 'r-g7-1',
++          model: 'gpt-image-2',
++          result: { images: [{ b64: generatedImageB64, variationIndex: 0 }] },
++        }),
++      })
++      return
++    }
++    if (method === 'GET' && url.includes('/task-g7-2')) {
++      // ordinal 2 失败:槽位原位转 failed(留列位)。
++      await route.fulfill({
++        status: 200,
++        contentType: 'application/json',
++        body: JSON.stringify({
++          id: 'task-g7-2',
++          kind: 'generate',
++          status: 'failed',
++          progress: 0,
++          stage: 'failed',
++          requestId: 'r-g7-2',
++          model: 'gpt-image-2',
++          error: 'Upstream error (500)',
++        }),
++      })
++      return
++    }
++    if (method === 'GET' && url.includes('/task-g7-0')) {
++      // ordinal 0 暂缓:releaseOrdinal0=false 前保持 running(真实中态窗口),
++      // 放行后首 poll 即 done。
++      if (!releaseOrdinal0) {
++        await route.fulfill({
++          status: 200,
++          contentType: 'application/json',
++          body: JSON.stringify({
++            id: 'task-g7-0',
++            kind: 'generate',
++            status: 'running',
++            progress: 30,
++            stage: 'running',
++            requestId: 'r-g7-0',
++            model: 'gpt-image-2',
++            result: { images: [] },
++          }),
++        })
++      } else {
++        await route.fulfill({
++          status: 200,
++          contentType: 'application/json',
++          body: JSON.stringify({
++            id: 'task-g7-0',
++            kind: 'generate',
++            status: 'done',
++            progress: 100,
++            stage: 'done',
++            requestId: 'r-g7-0',
++            model: 'gpt-image-2',
++            result: { images: [{ b64: generatedImageB64, variationIndex: 0 }] },
++          }),
++        })
++      }
++      return
++    }
++    // 其它 API 请求(asset 保存等)放行默认 mock。
++    await route.continue()
++  }
++  await page.route('**/api/mivo/tasks/**', handler)
++
++  // A) 预建列:startDerivedImageBatch(expectedCount=3)→ 3 个占位 slot,记录列位。
++  const prebuilt = await page.evaluate(
++    async ({ moduleSpec }) => {
++      const { useCanvasStore } = await import(moduleSpec)
++      const { nodes } = useCanvasStore.getState()
++      const source = nodes.find((n) => n.type === 'image' && !n.hidden)
++      if (!source) throw new Error('no source image')
++      const slotIds = await useCanvasStore.getState().startDerivedImageBatch({
++        sceneId: useCanvasStore.getState().sceneId,
++        sourceNodeId: source.id,
++        batchId: 'b-g7',
++        expectedCount: 3,
++      })
++      const s = useCanvasStore.getState()
++      const doc = s.canvases[s.sceneId] ?? s
++      return slotIds.map((id) => {
++        const node = doc.nodes.find((n) => n.id === id)
++        if (!node) throw new Error(`prebuilt slot missing: ${id}`)
++        return { id, ordinal: node.aiWorkflow?.ordinal, x: node.x, y: node.y }
++      })
++    },
++    { moduleSpec: spec },
++  )
++  if (prebuilt.length !== 3) {
++    throw new Error(`批次预建列异常:slotIds=${JSON.stringify(prebuilt)}`)
++  }
++
++  // 网络提交前:先把整列平移进视口(预建列可能超出视口,见 panBatchIntoView),
++  // 再对 3 个预建 slot **逐项**等渲染(renderer-aware waitForNodeRendered:
++  // dom 等 [data-node-id] 壳;leafer 等 DOM 壳 / leafer sync 追平)。旧「总数 ≥4」
++  // 断言是总数替代逐项证据——单个 slot 缺失会被总数抹平,已废弃;任一个 slot
++  // 缺失必须 fail-visible(waitForNodeRendered 超时抛错并点名缺失的 slot id)。
++  await panBatchIntoView(page, prebuilt)
++  for (const slot of prebuilt) {
++    await waitForNodeRendered(page, rendererMode, slot.id)
++  }
++
++  // B) 三个独立任务并行发起(不 await 聚合):ordinal 1 先终态、ordinal 2 失败、
++  // ordinal 0 暂缓。每个任务各自提交/轮询,谁先终态谁先提交——真实中态窗口。
++  await page.evaluate(
++    async ({ moduleSpec, slots }) => {
++      const { useCanvasStore } = await import(moduleSpec)
++      slots.forEach((slot) => {
++        const prompt = `g7 ${slot.ordinal === 1 ? 'ordinal-1' : slot.ordinal === 2 ? 'ordinal-2' : 'ordinal-0'} probe`
++        void useCanvasStore
++          .getState()
++          .generateIntoAiSlot(slot.id, prompt, {
++            derivedBatchId: 'b-g7',
++            expectedCount: 3,
++            ordinal: slot.ordinal,
++          })
++          .catch(() => {})
++      })
++    },
++    { moduleSpec: spec, slots: prebuilt },
++  )
++
++  // 中态断言(真实可观测):ordinal 1 已原位替换成 image(带 assetUrl、列位置
++  // 不变),ordinal 0 仍是 ai-slot 占位;ordinal 2 已原位转 failed(终态)。
++  // 手动轮询(不用 waitForFunction——它在本 prod 页面恒即时返回,断言会被跳过)。
++  const midStartedAt = Date.now()
++  let midOk = false
++  while (Date.now() - midStartedAt < 15000) {
++    const obs = await page.evaluate(
++      ({ moduleSpec, prebuilt }) => {
++        return import(moduleSpec).then(({ useCanvasStore }) => {
++          const s = useCanvasStore.getState()
++          const { nodes } = s.canvases[s.sceneId] ?? s
++          const read = (ordinal) => {
++            const n = nodes.find((x) => x.aiWorkflow?.batchId === 'b-g7' && x.aiWorkflow?.ordinal === ordinal)
++            if (!n) return null
++            return { type: n.type, status: n.status, x: n.x, y: n.y, hasAsset: Boolean(n.assetUrl) }
++          }
++          const slot1 = read(1)
++          const slot0 = read(0)
++          const p1 = prebuilt.find((p) => p.ordinal === 1)
++          return {
++            midOk:
++              slot1?.type === 'image' &&
++              Boolean(slot1?.hasAsset) &&
++              slot1.x === p1.x &&
++              slot1.y === p1.y &&
++              slot0?.type === 'ai-slot',
++          }
++        })
++      },
++      { moduleSpec: spec, prebuilt },
++    )
++    if (obs.midOk) {
++      midOk = true
++      break
++    }
++    await new Promise((resolve) => setTimeout(resolve, 200))
++  }
++  if (!midOk) {
++    throw new Error('中态 15s 内未出现:ordinal 1 应已替换成 image 且 ordinal 0 仍为占位')
++  }
++
++  // 显式中态快照(evidence 用):ordinal 1 已替换、ordinal 0 仍占位、列位置不变。
++  const midSnapshot = await page.evaluate(
++    ({ moduleSpec, prebuilt }) => {
++      return import(moduleSpec).then(({ useCanvasStore }) => {
++        const s = useCanvasStore.getState()
++        const { nodes } = s.canvases[s.sceneId] ?? s
++        const read = (ordinal) => {
++          const n = nodes.find((x) => x.aiWorkflow?.batchId === 'b-g7' && x.aiWorkflow?.ordinal === ordinal)
++          if (!n) return null
++          return { type: n.type, status: n.status, x: n.x, y: n.y, hasAsset: Boolean(n.assetUrl), ordinal: n.aiWorkflow?.ordinal }
++        }
++        return { slot0: read(0), slot1: read(1), slot2: read(2), prebuilt }
++      })
++    },
++    { moduleSpec: spec, prebuilt },
++  )
++  const p1 = prebuilt.find((p) => p.ordinal === 1)
++  // H4(fix3):中态观测的 elapsed 落日志进 evidence——「中态窗口实测成立」要有
++  // 可审计的实测值(此前 delivery 里 ~206ms 无证据支撑,已删精确数字)。
++  console.log(
++    `[p1b-batch-column] 中态窗口实测成立:ordinal1 已替换/ordinal0 仍占位,elapsed=${Date.now() - midStartedAt}ms`,
++  )
++  if (midSnapshot.slot1?.type !== 'image' || !midSnapshot.slot1?.hasAsset) {
++    throw new Error(`中态 ordinal 1 未替换:${JSON.stringify(midSnapshot.slot1)}`)
++  }
++  if (midSnapshot.slot1.x !== p1.x || midSnapshot.slot1.y !== p1.y) {
++    throw new Error(`中态列位置漂移:${JSON.stringify(midSnapshot.slot1)} vs prebuilt ${JSON.stringify(p1)}`)
++  }
++  if (midSnapshot.slot0?.type !== 'ai-slot') {
++    throw new Error(`中态 ordinal 0 提前替换:${JSON.stringify(midSnapshot.slot0)}`)
++  }
++
++  // 放行 ordinal 0 → 等它终态完成(全部提交)。手动轮询(与中态同一套:
++  // waitForFunction 在本仓 prod 页面上恒即时返回,断言会被跳过,必须自己轮询)。
++  releaseOrdinal0 = true
++  const releaseStartedAt = Date.now()
++  let slot0Done = false
++  // H4(fix3):st 必须声明在 while 外——块内 let 在超时分支外引用会 ReferenceError,
++  // 让「未终态」诊断本身崩掉,超时信息打不出来。
++  let st
++  while (Date.now() - releaseStartedAt < 15000) {
++    st = await page.evaluate(
++      ({ moduleSpec }) => {
++        return import(moduleSpec).then(({ useCanvasStore }) => {
++          const s = useCanvasStore.getState()
++          const { nodes } = s.canvases[s.sceneId] ?? s
++          const slot0 = nodes.find((n) => n.aiWorkflow?.batchId === 'b-g7' && n.aiWorkflow?.ordinal === 0)
++          return { type: slot0?.type ?? null, hasAsset: Boolean(slot0?.assetUrl) }
++        })
++      },
++      { moduleSpec: spec },
++    )
++    if (st.type === 'image' && st.hasAsset) {
++      slot0Done = true
++      break
++    }
++    await new Promise((resolve) => setTimeout(resolve, 200))
++  }
++  if (!slot0Done) {
++    throw new Error(`放行后 ordinal 0 未终态完成(type=${st?.type},hasAsset=${st?.hasAsset},elapsed=${Date.now() - releaseStartedAt}ms)`)
++  }
++
++  // B) chat 旁生成(expectedCount=1):**真走 chatStore.sendMessage**(F10:不直调
++  // store action)——有源图(选中 image)→ prepareChatSlot beside → generateBesideNode
++  // 批次:1。chat 与 canvas 是同一 store 树,import chatStore 后 sendMessage 内部
++  // 经 generationFacade 命中同一 mock 的 POST /tasks/edit。
++  await page.evaluate(
++    async ({ moduleSpec }) => {
++      const { useCanvasStore } = await import(moduleSpec)
++      // chatStore 与 canvasStore 同策略动态解析(performance resource entries 找
++      // 真实模块 URL,兜底裸路径;dev 由 vite 直接服务、prod 由 installE2EStoreBridge
++      // route 拦截返回 bridge 模块,两者都可导入)——禁止硬编码裸路径,与
++      // chat-generation/migration/chat-copy 等场景的既有模式一致。
++      const chatResource = performance
++        .getEntriesByType('resource')
++        .map((entry) => entry.name)
++        .find((name) => name.includes('/src/store/chatStore.ts'))
++      const chatSpec = chatResource
++        ? new URL(chatResource).pathname + new URL(chatResource).search
++        : '/src/store/chatStore.ts'
++      const { useChatStore } = await import(chatSpec)
++      const { nodes } = useCanvasStore.getState()
++      const source = nodes.find((n) => n.type === 'image' && !n.hidden)
++      if (!source) throw new Error('no source image')
++      // sendMessage:选中源图 + 显式 selectedNodeType=image → chat 有源旁生成。
++      await useChatStore.getState().sendMessage({
++        sceneId: useCanvasStore.getState().sceneId,
++        text: 'a cat beside',
++        selectedNodeId: source.id,
++        selectedNodeType: 'image',
++      })
++    },
++    { moduleSpec: spec },
++  )
++  // 等待 chat 生成任务 done(手动轮询,同上——waitForFunction 恒即时返回不可用)。
++  const chatWaitStartedAt = Date.now()
++  let chatDone = false
++  while (Date.now() - chatWaitStartedAt < 15000) {
++    const chatState = await page.evaluate(
++      ({ moduleSpec }) => {
++        return import(moduleSpec).then(({ useCanvasStore }) => {
++          const s = useCanvasStore.getState()
++          const tasks = s.canvases[s.sceneId]?.tasks ?? s.tasks
++          return tasks.some((t) => t.status === 'done' && t.label.includes('旁边生成'))
++        })
++      },
++      { moduleSpec: spec },
++    )
++    if (chatState) {
++      chatDone = true
++      break
++    }
++    await new Promise((resolve) => setTimeout(resolve, 200))
++  }
++  if (!chatDone) {
++    throw new Error('chat 旁生成任务 15s 内未 done')
++  }
++
++  // 断言:变体结果乱序完成后 ordinal 位置不变(store 直读 bounds)。
++  const bounds = await page.evaluate(
++    ({ moduleSpec }) => {
++      return import(moduleSpec).then(({ useCanvasStore }) => {
++        const s = useCanvasStore.getState()
++        const { nodes } = s.canvases[s.sceneId] ?? s
++        const source = nodes.find((n) => n.type === 'image' && !n.hidden)
++        if (!source) return { error: 'no source' }
++        // 结果节点批次身份继承自被替换 slot 的 batchId(makeNode 展开进 aiWorkflow)。
++        const results = nodes.filter(
++          (n) => n.aiWorkflow?.batchId && n.type === 'image' && n.id !== source.id,
++        )
++        const failedSlots = nodes
++          .filter((n) => n.type === 'ai-slot' && n.status === 'failed')
++          .map((n) => ({
++            id: n.id,
++            x: n.x,
++            y: n.y,
++            ordinal: n.aiWorkflow?.ordinal,
++            batchId: n.aiWorkflow?.batchId,
++          }))
++        const tasks = s.canvases[s.sceneId]?.tasks ?? s.tasks
++        return {
++          sourceX: source.x,
++          sourceY: source.y,
++          sourceH: Math.round(source.height),
++          results: results.map((n) => ({
++            id: n.id,
++            x: n.x,
++            y: n.y,
++            width: n.width,
++            height: n.height,
++            ordinal: n.aiWorkflow?.ordinal,
++            batchId: n.aiWorkflow?.batchId,
++          })),
++          failedSlots,
++          taskStatuses: tasks.map((t) => ({ id: t.id, status: t.status, label: t.label })),
++          allNodes: nodes.map((n) => ({
++            id: n.id,
++            type: n.type,
++            status: n.status,
++            batchId: n.aiWorkflow?.batchId,
++            metaBatchId: n.batchMetadata?.batchId,
++          })),
++          beside: nodes
++            .filter((n) => n.aiWorkflow?.batchId?.includes('batch-beside'))
++            .map((n) => ({ x: n.x, y: n.y, width: n.width, height: n.height })),
++        }
++      })
++    },
++    { moduleSpec: spec },
++  )
++  if (bounds.error) throw new Error(`bounds 采集失败:${bounds.error}`)
++  // A) 共享 batchId b-g7 的独立任务批:N=3 中 2 成功——同列左缘 x 相等、
++  //    高度=源图高度、ordinal 0/1 完整;失败槽**绑定该批次 ordinal 2**(不是
++  //    全局 failedCount):原位转 failed 且留列位(位置=预建列位)。
++  const g7Results = bounds.results.filter((r) => r.batchId === 'b-g7')
++  if (g7Results.length < 2) {
++    throw new Error(`b-g7 列结果不足:${JSON.stringify(bounds.results)}`)
++  }
++  const g7Ordinals = g7Results.map((r) => r.ordinal).sort()
++  if (JSON.stringify(g7Ordinals) !== JSON.stringify([0, 1])) {
++    throw new Error(`独立任务乱序完成后 b-g7 ordinal 丢失:${JSON.stringify(g7Ordinals)}`)
++  }
++  // G7+H3(fix3):失败槽必须绑定具体 **batchId+ordinal 双条件**——ordinal 2 且属于
++  // b-g7 批次的 slot 转 failed 且留在预建列位。只按 ordinal 找可能误中其它批次
++  // (如 batch-beside)同名 ordinal 的失败槽,削弱绑定。
++  const failedSlot2 = bounds.failedSlots.find((f) => f.batchId === 'b-g7' && f.ordinal === 2)
++  if (!failedSlot2) {
++    throw new Error(
++      `b-g7 ordinal 2 失败槽缺失(双条件 batchId=b-g7 && ordinal=2):${JSON.stringify(bounds.failedSlots)};g7slots=${JSON.stringify(
++        bounds.allNodes.filter((n) => n.batchId === 'b-g7'),
++      )}`,
++    )
++  }
++  const p2 = prebuilt.find((p) => p.ordinal === 2)
++  if (failedSlot2.x !== p2.x || failedSlot2.y !== p2.y) {
++    throw new Error(`ordinal 2 失败槽列位漂移:${JSON.stringify(failedSlot2)} vs prebuilt ${JSON.stringify(p2)}`)
++  }
++  // b-g7 结果同列左缘 x 相等、高度锁定。
++  const g7Xs = new Set(g7Results.map((r) => r.x))
++  if (g7Xs.size !== 1) {
++    throw new Error(`b-g7 结果左缘 x 不一致:${JSON.stringify(g7Results)}`)
++  }
++  for (const r of g7Results) {
++    if (r.height !== bounds.sourceH) {
++      throw new Error(`b-g7 结果高度未锁定:${JSON.stringify(r)} vs 源高 ${bounds.sourceH}`)
++    }
++  }
++  // B) chat 旁生成:占位 y === 源 y、高度锁定。
++  if (bounds.beside.length < 1) {
++    throw new Error('chat 旁生成结果缺失')
++  }
++  const beside = bounds.beside[0]
++  if (beside.y !== bounds.sourceY || beside.height !== bounds.sourceH) {
++    throw new Error(`chat 旁生成未边缘对齐:${JSON.stringify(beside)} vs 源 y=${bounds.sourceY} h=${bounds.sourceH}`)
++  }
++}
+diff --git a/src/canvas/actions/canvasCommand.serialize.test.ts b/src/canvas/actions/canvasCommand.serialize.test.ts
+index d70e26ad..2994b32f 100644
+--- a/src/canvas/actions/canvasCommand.serialize.test.ts
++++ b/src/canvas/actions/canvasCommand.serialize.test.ts
+@@ -273,11 +273,10 @@ describe('CanvasCommand serialize round-trip', () => {
+     })
+   })
+   it('derived_batch_options_are_exact: 序列化 allowlist 精确 —— 批次三元组是 runtime-only,不进序列化 command options', () => {
+-    // 批次凭证(derivedBatchId/expectedCount/ordinal)与 signal/referenceFiles 同类:
+-    // runtime-only,绝不进入可序列化 command options。序列化输出必须不含这三个键。
+-    // (P1b F7 更正:批次三元组由 executor 的 mapGenerationOptions 以 ...shared spread
+-    //  原样透传——「不进序列化」仅指 runtime-only 字段不落盘,不是「三元组不存在」;
+-    //  单次生成仍以 count=1 批次语义透传,见 chat/UI 入口。)
++    // G9(修复轮2)描述清理:批次三元组(derivedBatchId/expectedCount/ordinal)与
++    // signal/referenceFiles 同类 runtime-only,不落序列化 command options——序列化
++    // 输出必须不含这三个键;执行时经 executor 的 mapGenerationOptions ...shared
++    // spread 原样透传(见 β2 接线),单次生成以 count=1 批次语义透传(chat/UI 入口)。
+     const json = serializeCanvasCommand({
+       kind: 'generate-image-edit',
+       sourceNodeId: 'img-1',

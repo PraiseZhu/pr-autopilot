@@ -1,0 +1,1339 @@
+diff --git a/docs/context-menu-standard.md b/docs/context-menu-standard.md
+index 9303c143..9d5de199 100644
+--- a/docs/context-menu-standard.md
++++ b/docs/context-menu-standard.md
+@@ -88,7 +88,7 @@
+ - R2. 右键落在未选中节点上 → 先把该节点设为唯一选区再弹菜单;落在已选中节点上 → 保持现有选区(多选菜单)。
+ - R3. ✅ **工具模式门禁**:
+   - 绘制模式(brush / stamp)进行中 → **吞掉右键,不弹菜单**;
+-  - 空格平移 / 滚轮平移中 → **允许弹菜单**(弹出即终止本次平移惯性;"终止惯性"暂未实现,见 §8 已知缺口②——R3 记部分完成);
++  - 空格平移 / 滚轮平移中 → **允许弹菜单**(弹出即终止本次平移——阶段 2 已实现,开菜单前 resetPan);
+   - 框选拖拽、节点拖拽、crop/mask 编辑进行中 → 吞掉(⏳ 建议值,可复议)。
+ - R4. Chrome UI(工具坞、快捷工具条、选项条、crop/mask overlay、菜单自身)上右键 → 一律不弹画布菜单也不弹浏览器菜单。实现上 `isCanvasChromeTarget` 与 `isCanvasUiTarget` 两张白名单必须收敛为同一来源,禁止各组件自行兜底。
+ 
+@@ -174,13 +174,13 @@
+ |---|---|---|---|---|---|---|
+ | inspect | `view-details` | 按类型:Edit text / Edit note / Rename section / Generate into slot / View details | — | 仅单选 | ✅ | ✅ |
+ | inspect | `copy` | Copy {object} / Copy N {objects} | ⌘C | 恒显 | ✅ | ✅ |
+-| inspect | `fit-selection` | Fit selection | — | 恒显 | ✅ | ✅ |
++| inspect | `fit-selection` | Fit selection | ⇧2 | 恒显 | ✅ | ✅ |
+ | inspect | `paste` | Paste here | ⌘V | 剪贴板非空 | ✅ | ✅ |
+ | organize | `group` | Group N objects | ⌘G | 多选且全体可编组 | ✅ | ✅ |
+-| organize | `ungroup` | Ungroup | — | 选区含已编组节点 | ✅ | ✅ |
+-| organize | `toggle-lock` | Lock/Unlock {object} | ⇧⌘L ⏳ | 全体可锁(单选 Section 除外,走 section-lock 组) | ✅ | ✅ |
++| organize | `ungroup` | Ungroup | ⇧⌘G | 选区含已编组节点 | ✅ | ✅ |
++| organize | `toggle-lock` | Lock/Unlock {object} | ⇧⌘L(阶段 2 实装快捷键) | 全体可锁(单选 Section 除外,走 section-lock 组) | ✅ | ✅ |
+ | organize | `hide` | Hide {object} | — | 全体可隐藏 | ✅ | ✅ |
+-| arrange | `arrange-order`(父项,子菜单收纳四项:`bring-forward` / `send-backward` / `bring-front` / `send-back`) | Order →(Bring forward / Send backward / Bring to front / Send to back) | ⌘] / ⌘[ / ] / [(子项) | 全体 layerable | ✅ | ✅ |
++| arrange | `arrange-order`(父项,子菜单收纳四项:`bring-forward` / `send-backward` / `bring-front` / `send-back`) | Order →(Bring forward / Send backward / Bring to front / Send to back) | ] / [ / ⇧] / ⇧[(子项;Mivo 实际键位,与参考产品 F 的 ⌘ 系不同) | 全体 layerable | ✅ | ✅ |
+ 
+ > 2026-08-01 用户拍板:四个层级动作收进「Order/层级」子菜单——右键菜单过长。这是 R12a"命令式子菜单"允许的形态(非色板/分档选择器)。
+ | export | `download` | Download / Download original | — | 全体 exportable(含 locked 态——修复 markup locked 丢失问题) | ⚠️ 部分 | ⚠️ 部分 |
+@@ -293,7 +293,7 @@
+ - 分发表结构守卫:`scripts/e2e-smoke.mjs` 强制 `contextMenuExtensionsByNodeType` / `quickToolbarExtensionsByNodeType` 存在。
+ - `docs/quickbar-study.md` 与本文档互为姊妹篇:快捷条侧改动记那边,右键侧记这边;§2.5a 落地后需在那边 Core Rules 补一条"样式操作快捷条唯一"。
+ - 已盘出的 16 项实现问题及代码位置见会话盘点记录;修复分批进行,每批 PR 引用本文档对应规则编号。
+-- **已知缺口(2026-08-01 对抗审查发现,待排期)**:① 菜单 Download 对无 assetUrl 的节点(markup/text/section)尚无真实导出——渲染导出管线(`renderCanvasExportBitmap`,agent canvas_export 在用)已存在但菜单未接线,现阶段点击给 toast+日志反馈,不静默;② R3"平移中弹菜单即终止平移惯性"未实现(多键鼠标中键按住时右键,pan ref 仍活),留待阶段 2 与 clamp 收敛一起做。
++- **已知缺口(2026-08-01 对抗审查发现,待排期)**:① 菜单 Download 对无 assetUrl 的节点(markup/text/section)尚无真实导出——渲染导出管线(`renderCanvasExportBitmap`,agent canvas_export 在用)已存在但菜单未接线,现阶段点击给 toast+日志反馈,不静默。(原缺口②"平移惯性终止"已于阶段 2 补齐。)
+ 
+ ## 附:待拍板清单(第 2 版)
+ 
+diff --git a/scripts/e2e/scenarios/canvas-interactions.mjs b/scripts/e2e/scenarios/canvas-interactions.mjs
+index d0033094..5f58cb54 100644
+--- a/scripts/e2e/scenarios/canvas-interactions.mjs
++++ b/scripts/e2e/scenarios/canvas-interactions.mjs
+@@ -2853,6 +2853,20 @@ export const runCanvasInteractionsScenario = async (context) => {
+     throw new Error(`Bring to front should move the node to the top layer: got ${topNodeId}`)
+   }
+ 
++  // R19 键位真伪回归(阶段 2 对抗审查):物理 Shift+[ 的 event.key 是 '{',层级
++  // 快捷键必须按 event.code(BracketLeft/Right)分发。用真实键盘事件验证,不许
++  // 人工构造 key='[' + shiftKey 掩盖问题。
++  await page.keyboard.press('[')
++  await page.waitForFunction(
++    (id) => [...document.querySelectorAll('.dom-node')].at(-1)?.getAttribute('data-node-id') !== id,
++    firstNodeId,
++  )
++  await page.keyboard.press('Shift+]')
++  await page.waitForFunction(
++    (id) => [...document.querySelectorAll('.dom-node')].at(-1)?.getAttribute('data-node-id') === id,
++    firstNodeId,
++  )
++
+   // Duplicate 菜单项已退场:复制副本走 Cmd/Ctrl+D 快捷键(2026-07-31 用户)。
+   await selectedNode.click()
+   await pressCanvasShortcut('d')
+diff --git a/scripts/e2e/scenarios/project-sidebar.mjs b/scripts/e2e/scenarios/project-sidebar.mjs
+index d0db902d..769d6e16 100644
+--- a/scripts/e2e/scenarios/project-sidebar.mjs
++++ b/scripts/e2e/scenarios/project-sidebar.mjs
+@@ -169,6 +169,26 @@ export const runProjectSidebarScenario = async (context) => {
+     }
+   }
+ 
++  // --- 3b. R10(context-menu-standard,阶段 2):子菜单 hover 即开(~150ms 意图
++  //         延迟)+ 点击仍可展开;划到普通项收起;Escape 关整个菜单 ---------------
++  {
++    await setupState(page, canvasStoreSpec)
++    await wait()
++    await openCanvasMenu(page, 'Canvas Standalone')
++    // hover 停留(不点击)→ 子菜单展开(auto-wait 覆盖 150ms 延迟)。
++    await page.locator('.sidebar-context-menu-item').filter({ hasText: 'Move to project' }).hover()
++    await page.locator('.sidebar-context-menu-submenu').waitFor({ state: 'visible' })
++    // 划到普通项 → 子菜单收起。
++    await page.locator('.sidebar-context-menu-item').filter({ hasText: 'Rename' }).first().hover()
++    await page.locator('.sidebar-context-menu-submenu').waitFor({ state: 'detached' })
++    // 点击展开仍然可用(触屏回退路径)。
++    await page.locator('.sidebar-context-menu-item').filter({ hasText: 'Move to project' }).click()
++    await page.locator('.sidebar-context-menu-submenu').waitFor({ state: 'visible' })
++    // Escape 关闭整个菜单(含子菜单)。
++    await page.keyboard.press('Escape')
++    await page.locator('.sidebar-context-menu').waitFor({ state: 'detached' })
++  }
++
+   // --- 4. 画板删除新范式(PR-C2 P1-2):active 菜单无「删除」;归档 → 回收站彻底删除;
+   //        末块 active 画板归档 guard --------------------------------------------
+   {
+diff --git a/src/App.css b/src/App.css
+index 35ac5510..d67256fc 100644
+--- a/src/App.css
++++ b/src/App.css
+@@ -3845,6 +3845,18 @@ button:disabled {
+   opacity: 0.68;
+ }
+ 
++/* R19:菜单项右侧的快捷键提示——弱化灰字,hover 反色时跟随按钮前景。 */
++.node-action-shortcut {
++  flex: 0 0 auto;
++  margin-left: auto;
++  font-family: inherit;
++  font-size: 11px;
++  font-weight: 600;
++  letter-spacing: 0.02em;
++  opacity: 0.52;
++  white-space: nowrap;
++}
++
+ .node-action-submenu {
+   position: fixed;
+   z-index: 120;
+diff --git a/src/app/sidebar/ContextMenu.tsx b/src/app/sidebar/ContextMenu.tsx
+index 621fc7a4..06c017b2 100644
+--- a/src/app/sidebar/ContextMenu.tsx
++++ b/src/app/sidebar/ContextMenu.tsx
+@@ -2,12 +2,14 @@
+ //
+ // No Radix. Portal to document.body, fixed-positioned at the cursor, viewport-
+ // clamped (right/bottom overflow flips). Escape + pointerdown-outside close.
+-// Submenus open on CLICK (not hover) — v1 accepts the maker-hover-vs-click delta
+-// as a locked decision (D2/v1 子菜单点击展开). role=menu/menuitem/separator.
++// Submenus open on HOVER (~150ms intent delay) AND on click —— context-menu-
++// standard R10(2026-07-31 拍板)推翻了 v1"仅点击展开"的锁定决策,全站子菜单
++// 手感与画布右键菜单对齐。role=menu/menuitem/separator.
+ import { useEffect, useMemo, useRef, useState } from 'react'
+ import { createPortal } from 'react-dom'
+ import type { LucideIcon } from 'lucide-react'
+ import { ChevronRight } from 'lucide-react'
++import { clampMenuPosition, menuViewportMargin, submenuHoverDelayMs } from '../../lib/menuOverlayLayout'
+ 
+ export type ContextMenuItem =
+   | {
+@@ -30,6 +32,7 @@ const MENU_PADDING = 12
+ const SUBMENU_WIDTH = 244
+ const SUBMENU_MAX_HEIGHT = 240
+ 
++
+ export function ContextMenu(props: {
+   position: { x: number; y: number }
+   items: ContextMenuItem[]
+@@ -38,6 +41,7 @@ export function ContextMenu(props: {
+   const { position, items, onClose } = props
+   const ref = useRef<HTMLDivElement>(null)
+   const [openSubmenu, setOpenSubmenu] = useState<{ id: string; flipX: boolean; flipY: boolean } | null>(null)
++  const hoverTimerRef = useRef<number | undefined>(undefined)
+ 
+   // 调用方内联传 onClose(每次渲染新引用);经 ref 转发让全局监听器只注册一次,
+   // 避免每次重渲都卸载/重挂 document 级监听(Greptile P2)。
+@@ -57,19 +61,32 @@ export function ContextMenu(props: {
+     return () => {
+       document.removeEventListener('keydown', onKey)
+       document.removeEventListener('pointerdown', onPointer)
++      window.clearTimeout(hoverTimerRef.current)
+     }
+   }, [])
+ 
+-  // Viewport clamp: flip right→left and bottom→up when the menu would overflow.
++  // Viewport clamp(R8:夹取语义走 menuOverlayLayout 单一来源,边距全站统一)。
+   const style = useMemo(() => {
+     const estimatedHeight = items.length * ITEM_HEIGHT + MENU_PADDING
+-    const x = Math.min(position.x, window.innerWidth - MENU_WIDTH - 8)
+-    const y = Math.min(position.y, window.innerHeight - estimatedHeight - 8)
+-    return { left: Math.max(8, x), top: Math.max(8, y) }
++    const clamped = clampMenuPosition(position.x, position.y, { width: MENU_WIDTH, maxHeight: estimatedHeight })
++    return { left: clamped.x, top: clamped.y }
+   }, [position, items.length])
+ 
+   const close = () => onClose()
+ 
++  const cancelHoverOpen = () => window.clearTimeout(hoverTimerRef.current)
++
++  // Viewport-edge handling for the submenu (mirrors the root menu clamp): flip
++  // to the left edge / open upward when the default placement would overflow.
++  const openSubmenuFor = (id: string, button: HTMLElement) => {
++    const rect = button.getBoundingClientRect()
++    setOpenSubmenu({
++      id,
++      flipX: rect.right + SUBMENU_WIDTH > window.innerWidth - menuViewportMargin,
++      flipY: rect.top + SUBMENU_MAX_HEIGHT > window.innerHeight - menuViewportMargin,
++    })
++  }
++
+   return createPortal(
+     <div className="sidebar-context-menu" ref={ref} style={style} role="menu">
+       {items.map((item) => {
+@@ -91,22 +108,24 @@ export function ContextMenu(props: {
+               <button
+                 type="button"
+                 role="menuitem"
++                aria-expanded={isOpen}
+                 className={`sidebar-context-menu-item${isOpen ? ' is-open' : ''}`}
++                onPointerEnter={(event) => {
++                  // R10:hover 即开(带意图延迟);已开则不打扰。
++                  if (isOpen) return
++                  const button = event.currentTarget
++                  cancelHoverOpen()
++                  hoverTimerRef.current = window.setTimeout(() => openSubmenuFor(item.id, button), submenuHoverDelayMs)
++                }}
++                onPointerLeave={cancelHoverOpen}
+                 onClick={(event) => {
+                   event.stopPropagation()
++                  cancelHoverOpen()
+                   if (isOpen) {
+                     setOpenSubmenu(null)
+                     return
+                   }
+-                  // Viewport-edge handling for the submenu (mirrors the root menu
+-                  // clamp): flip to the left edge / open upward when the default
+-                  // right/down placement would overflow.
+-                  const rect = event.currentTarget.getBoundingClientRect()
+-                  setOpenSubmenu({
+-                    id: item.id,
+-                    flipX: rect.right + SUBMENU_WIDTH > window.innerWidth - 8,
+-                    flipY: rect.top + SUBMENU_MAX_HEIGHT > window.innerHeight - 8,
+-                  })
++                  openSubmenuFor(item.id, event.currentTarget)
+                 }}
+               >
+                 <span className="sidebar-context-menu-icon">{Icon ? <Icon size={14} /> : null}</span>
+@@ -139,7 +158,7 @@ export function ContextMenu(props: {
+                         </button>
+                       )
+                     }
+-                    // Nested submenus are not supported in v1 (single-level click-open).
++                    // Nested submenus are not supported (single-level, R11).
+                     return null
+                   })}
+                 </div>
+@@ -155,6 +174,11 @@ export function ContextMenu(props: {
+             role="menuitem"
+             className={`sidebar-context-menu-item${item.danger ? ' is-danger' : ''}`}
+             disabled={item.disabled}
++            onPointerEnter={() => {
++              // 划到普通项:取消待展开计时并收起已开子菜单(标准菜单手感)。
++              cancelHoverOpen()
++              setOpenSubmenu(null)
++            }}
+             onClick={() => {
+               if (item.disabled) return
+               item.onSelect()
+diff --git a/src/canvas/CanvasContextMenu.tsx b/src/canvas/CanvasContextMenu.tsx
+index 8a3ab960..df593bab 100644
+--- a/src/canvas/CanvasContextMenu.tsx
++++ b/src/canvas/CanvasContextMenu.tsx
+@@ -1,4 +1,5 @@
+ import { useLayoutEffect, useRef, type ReactNode } from 'react'
++import { menuViewportMargin } from '../lib/menuOverlayLayout'
+ 
+ type CanvasContextMenuProps = {
+   x: number
+@@ -6,7 +7,8 @@ type CanvasContextMenuProps = {
+   children: ReactNode
+ }
+ 
+-const contextMenuMargin = 12
++// R8:边距取 menuOverlayLayout 单一来源(全站菜单统一 12px)。
++const contextMenuMargin = menuViewportMargin
+ const minimumMenuHeight = 180
+ 
+ const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max)
+diff --git a/src/canvas/MivoCanvas.tsx b/src/canvas/MivoCanvas.tsx
+index a2a91b67..ad386c83 100644
+--- a/src/canvas/MivoCanvas.tsx
++++ b/src/canvas/MivoCanvas.tsx
+@@ -235,6 +235,7 @@ export function MivoCanvas({
+     handleWheel,
+     fitAll,
+     fitSelection,
++    resetPan,
+   } = useCanvasInteractionController({
+     shellRef, sceneId, nodes: visibleNodes, selectedNodeIds, maskEditNodeId: activeImageEditNodeId,
+     // FigJam semantics: pointerdown outside the crop overlay APPLIES the crop
+@@ -536,6 +537,9 @@ export function MivoCanvas({
+       debugLogger.log('Context Menu', `Skipped: drawing tool active (${storeActiveTool})`)
+       return
+     }
++    // R3 后半:平移中允许弹菜单,但弹出即终止本次平移(多键鼠标中键仍按住时
++    // 右键,pan 追踪不再吃后续位移)。非平移态调用是幂等 no-op。
++    resetPan()
+     // DOM-first(见 nodeIdFromDomTarget):右键哪个 DOM 开哪个菜单,fallback 坐标兜底空白。
+     const targetNodeId = nodeIdFromDomTarget(event.target)
+     if (targetNodeId) {
+@@ -549,7 +553,7 @@ export function MivoCanvas({
+     }
+     const position = clampContextMenuPosition(event.clientX, event.clientY, 300)
+     setContextMenu({ kind: 'blank', x: position.x, y: position.y, canvasPosition: screenToCanvasPoint(event.clientX, event.clientY) })
+-  }, [brushToolActive, stampToolActive, storeActiveTool, resolveCanvasHit, openNodeContextMenu, screenToCanvasPoint, selectNode, selectedNodeIds])
++  }, [brushToolActive, stampToolActive, storeActiveTool, resetPan, resolveCanvasHit, openNodeContextMenu, screenToCanvasPoint, selectNode, selectedNodeIds])
+ 
+   const handleCanvasDoubleClick = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+     if (isCanvasChromeTarget(event.target)) return
+diff --git a/src/canvas/NodeActionMenu.tsx b/src/canvas/NodeActionMenu.tsx
+index 7f5cca36..f6c96594 100644
+--- a/src/canvas/NodeActionMenu.tsx
++++ b/src/canvas/NodeActionMenu.tsx
+@@ -1,4 +1,4 @@
+-import { Fragment, useCallback, useState, type CSSProperties } from 'react'
++import { Fragment, useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
+ import { useTranslation } from 'react-i18next'
+ import { createPortal } from 'react-dom'
+ import { ChevronRight } from 'lucide-react'
+@@ -6,6 +6,7 @@ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import { contextMenuGroupsFor, type CanvasActionItem } from './actions/canvasActionModel'
+ import { useCanvasActionRuntime } from './actions/useCanvasActionRuntime'
+ import { ActionColorSwatchPicker } from './color/ActionColorSwatchPicker'
++import { submenuHoverDelayMs } from '../lib/menuOverlayLayout'
+ 
+ type NodeActionMenuProps = {
+   node?: MivoCanvasNode
+@@ -116,6 +117,12 @@ export function NodeActionMenu({
+     return Icon ? <Icon size={16} /> : <b>{text}</b>
+   }
+ 
++  // R10:hover 展开带全站统一的意图延迟(menuOverlayLayout.submenuHoverDelayMs),
++  // 划过父项不误开;click/focus 仍即时展开。
++  const hoverOpenTimerRef = useRef<number | undefined>(undefined)
++  const cancelHoverOpen = useCallback(() => window.clearTimeout(hoverOpenTimerRef.current), [])
++  useEffect(() => () => window.clearTimeout(hoverOpenTimerRef.current), [])
++
+   const openChildMenu = useCallback((actionId: string, button: HTMLButtonElement, submenuWidth = 188) => {
+     const rect = button.getBoundingClientRect()
+     const viewport = window.visualViewport
+@@ -148,7 +155,7 @@ export function NodeActionMenu({
+     action: CanvasActionItem,
+     nested = false,
+   ) => {
+-    const { id, label, swatch, linePreview, selected, danger, disabled, children, colorPicker, onClick } = action
++    const { id, label, swatch, linePreview, selected, danger, disabled, children, colorPicker, onClick, shortcut } = action
+     // colorPicker 项(画笔颜色)与 children 一样按"带子菜单"处理:子菜单内容换成
+     // 通用色板组件。定位宽度按色板实宽(一排 12 格 ≈ 440px),不然沿用 188 会在
+     // 右缘误判"放得下"而溢出屏幕。
+@@ -166,13 +173,22 @@ export function NodeActionMenu({
+           className={`${danger ? 'danger' : ''} ${hasChildren ? 'has-children' : ''} ${swatch ? 'has-swatch' : ''} ${linePreview ? 'has-line-preview' : ''} ${selected ? 'selected' : ''} ${submenuOpen ? 'active' : ''}`}
+           disabled={disabled}
+           onPointerEnter={(event) => {
+-            if (hasChildren) openChildMenu(id, event.currentTarget, submenuWidth)
+-            else if (!nested) setOpenSubmenu({ side: 'right' })
++            cancelHoverOpen()
++            if (hasChildren) {
++              if (submenuOpen) return
++              const button = event.currentTarget
++              hoverOpenTimerRef.current = window.setTimeout(
++                () => openChildMenu(id, button, submenuWidth),
++                submenuHoverDelayMs,
++              )
++            } else if (!nested) setOpenSubmenu({ side: 'right' })
+           }}
++          onPointerLeave={cancelHoverOpen}
+           onFocus={(event) => {
+             if (hasChildren) openChildMenu(id, event.currentTarget, submenuWidth)
+           }}
+           onClick={(event) => {
++            cancelHoverOpen()
+             if (hasChildren) {
+               openChildMenu(id, event.currentTarget, submenuWidth)
+               return
+@@ -183,6 +199,12 @@ export function NodeActionMenu({
+         >
+           {renderActionGlyph(action)}
+           <span>{label}</span>
++          {/* R19:真实生效的快捷键在菜单项右侧提示;带子菜单的父项让位给 chevron。 */}
++          {shortcut && !hasChildren ? (
++            <kbd className="node-action-shortcut" aria-hidden="true">
++              {shortcut}
++            </kbd>
++          ) : null}
+           {hasChildren ? <ChevronRight className="node-action-chevron" size={15} /> : null}
+         </button>
+         {hasChildren && submenuOpen
+diff --git a/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts b/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
+index 99e17600..5a2b6328 100644
+--- a/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
++++ b/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
+@@ -3,11 +3,12 @@
+  *
+  * 本文件 + canvasActionModel.characterization.test.ts 共同构成 canvasActionModel.ts 的行为
+  * baseline。拆为两文件是为满足项目 structure-guard 的"非白名单 src 文件 ≤900 行"硬门槛
+- * （新文件无法走白名单增量语义,见 PR 描述）；合并 baseline 315 expect / 203 tests
+- * （part1 162/107 + part2 153/96）见 PR 描述。
++ * （新文件无法走白名单增量语义,见 PR 描述）；T0.4① 迁移基线 = 315 expect / 203 tests
++ * （part1 162/107 + part2 153/96）。
+  *
+- * 迁移后测试一字不改；若测试本身暴露出疑似 bug,默认钉现状、bug 单列进 PR 描述
+- * "发现的现状疑点"段,不在测试里"修对"。
++ * T0.4① 迁移当时"一字不改";其后随行为标准演进同步更新(2026-08-01 右键菜单
++ * 标准化阶段 1/2:quickbar no-shortcut guard 等),计数不再冻结。若测试暴露疑似
++ * bug,默认钉现状、bug 单列进 PR 描述。
+  *
+  * part 2 覆盖：
+  *  ③ markup style + image AI-edit 子菜单 dispatch — mock runtime 断言 store 调用意图与参数
+@@ -724,10 +725,50 @@ describe('canvasActionModel — characterization · part 2 (③ markup/AI-edit 
+       ])
+     })
+   })
++
++  // R19(阶段 2):shortcut 提示只属于右键菜单——快捷工具条任何 action(含 children)
++  // 都不得携带 shortcut 字段(两装配函数共用 action model,这里钉住不串味)。
++  it('quick toolbar 全量不携带 shortcut 字段(R19 只渲染在右键菜单)', () => {
++    const contexts = [
++      ctx([imageNode('a')]),
++      ctx([imageNode('a'), imageNode('b')]),
++      ctx([frameNode('f1')]),
++      ctx([frameNode('f2', { sectionLockMode: 'all' })]),
++      ctx([textNode('t1')]),
++      ctx([annotationNode('n1')]),
++      ctx([aiSlotNode('s1')]),
++      ctx([taskNode('k1')]),
++      ctx([pdfNode('p1')]),
++      ctx([markdownNode('d1')]),
++      ctx([videoNode('v1')]),
++      ctx([markupNode('m1', 'arrow')]),
++      ctx([markupNode('m2', 'rect')]),
++      ctx([markupNode('m3', 'note')]),
++      ctx([markupNode('m4', 'brush')]),
++      ctx([markupNode('m5', 'stamp')]),
++      ctx([markupNode('m6', 'rect'), markupNode('m7', 'rect')]),
++      // multi 的独立装配分支逐一覆盖(第三轮对抗审查):全锁 multi 早退分支、
++      // note/arrow-line/brush 三个同族样式分支——今天都无 shortcut,守卫钉死
++      // 未来串味。
++      ctx([imageNode('lk1', { locked: true }), imageNode('lk2', { locked: true })]),
++      ctx([markupNode('nn1', 'note'), markupNode('nn2', 'note')]),
++      ctx([markupNode('ll1', 'arrow'), markupNode('ll2', 'line')]),
++      ctx([markupNode('bb1', 'brush'), markupNode('bb2', 'brush')]),
++    ]
++    for (const context of contexts) {
++      const groups = quickToolbarGroupsFor(createRuntime(context))
++      const assertNoShortcut = (action: CanvasActionItem) => {
++        expect(action.shortcut, `${action.id} 不应带 shortcut`).toBeUndefined()
++        action.children?.forEach(assertNoShortcut)
++      }
++      groups.forEach((group) => group.actions.forEach(assertNoShortcut))
++    }
++  })
+ })
+ 
+-// BASELINE COUNT (part 2): part 2 = 153 expect / 96 tests。part 1+2 合计 315 expect / 203 tests
+-// （part1 162 expect / 107 tests,含 10 个 it.each 参数化行）。迁移前后须一致；
+-// 若数量变化说明行为已改变,需在 PR 中显式说明。
++// BASELINE COUNT (part 2): T0.4① 迁移基线 = 153 expect / 96 tests(part 1+2 合计
++// 315 expect / 203 tests)。2026-08-01 右键菜单标准化阶段 2 起追加 R19 守卫
++// (quickbar no-shortcut guard 等),计数随守卫演进,不再冻结;行为性变更仍须在
++// PR 中显式说明。
+ // 分块：③ markup/AI-edit 分发 · quick toolbar 结构与分发（含 orderedGroupIds）·
+ // ④ 边界 · 导出 presets。
+diff --git a/src/canvas/actions/canvasActionModel.characterization.test.ts b/src/canvas/actions/canvasActionModel.characterization.test.ts
+index 88adf264..f90170bd 100644
+--- a/src/canvas/actions/canvasActionModel.characterization.test.ts
++++ b/src/canvas/actions/canvasActionModel.characterization.test.ts
+@@ -3,11 +3,12 @@
+  *
+  * 本文件 + canvasActionModel.characterization.quickbar.test.ts 共同构成 canvasActionModel.ts
+  * 的行为 baseline。拆为两文件是为满足项目 structure-guard 的"非白名单 src 文件 ≤900 行"硬门槛
+- * （新文件无法走白名单增量语义,见 PR 描述）；合并 baseline 315 expect / 203 tests
+- * （part1 162/107 + part2 153/96；part1 含 10 个 it.each 参数化行）见 PR 描述。
++ * （新文件无法走白名单增量语义,见 PR 描述）；T0.4① 迁移基线 = 315 expect / 203 tests
++ * （part1 162/107 + part2 153/96；part1 含 10 个 it.each 参数化行）。
+  *
+- * 迁移后测试一字不改；若测试本身暴露出疑似 bug,默认钉现状、bug 单列进 PR 描述
+- * "发现的现状疑点"段,不在测试里"修对"。
++ * T0.4① 迁移当时"一字不改";其后随行为标准演进同步更新(2026-08-01 阶段 1/2:
++ * locked markup export、arrange 嵌套、R19 shortcut 钉表等),计数不再冻结。
++ * 若测试暴露疑似 bug,默认钉现状、bug 单列进 PR 描述。
+  *
+  * part 1 覆盖：
+  *  ① 菜单/action 结构快照 — blank / single / multi 各上下文下可见 group/action 集合
+@@ -16,8 +17,8 @@
+  *
+  * 硬约束：只读 canvasActionModel.ts 的导出,绝不改其本体；runtime 全程 mock。
+  */
+-
+ import { describe, expect, it, vi } from 'vitest'
++import { menuShortcuts } from './menuShortcuts'
+ import { contextMenuGroupsFor } from './canvasActionModel'
+ import { createCanvasSelectionContext } from './canvasSelectionModel'
+ import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
+@@ -238,16 +239,33 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       // inspect 含 view-details / copy;duplicate 2026-07-31 全面退场(用户拍板)
+       expect(hasAction(groups, 'view-details')).toBe(true)
+       expect(hasAction(groups, 'copy')).toBe(true)
+-      // 2026-08-01 用户拍板:arrange 组顶层只有「层级」父项,四个层级动作全部
+-      // 收进其 children(右键菜单过长);id/分发不变,只是嵌套。
++      // 2026-08-01 用户拍板:arrange 组顶层只有「层级」父项,四项收进 children
++      // (id/分发不变);R19 快捷键提示钉表——与 menuShortcuts 同源,句句为真。
+       const arrangeGroup = groups.find((group) => group.id === 'arrange')
+       expect(arrangeGroup?.actions.map((action) => action.id)).toEqual(['arrange-order'])
+       expect(arrangeGroup?.actions[0]?.children?.map((child) => child.id)).toEqual([
+         'bring-forward', 'send-backward', 'bring-front', 'send-back',
+       ])
++      const corePins: Array<[string, string]> = [
++        ['copy', menuShortcuts.copy], ['toggle-lock', menuShortcuts.lock], ['delete', menuShortcuts.delete],
++        ['bring-forward', menuShortcuts.bringForward], ['send-backward', menuShortcuts.sendBackward],
++        ['bring-front', menuShortcuts.bringToFront], ['send-back', menuShortcuts.sendToBack],
++      ]
++      for (const [id, hint] of corePins) expect(findAction(groups, id)?.shortcut, id).toBe(hint)
+       expect(hasAction(groups, 'duplicate')).toBe(false)
+-      // danger 含 delete
+-      expect(hasAction(groups, 'delete')).toBe(true)
++      expect(hasAction(groups, 'delete')).toBe(true) // danger 含 delete
++    })
++
++    it('R19 shortcut 钉表 · 条件项(paste/fit/group/ungroup/select-all/fit-all)', () => {
++      const single = contextMenuGroupsFor(createRuntime(ctx([imageNode('a')]), { clipboardCount: 2, onFitSelection: vi.fn() }))
++      const multi = contextMenuGroupsFor(createRuntime(ctx([imageNode('a'), imageNode('b')])))
++      const grouped = contextMenuGroupsFor(createRuntime(ctx([imageNode('a', { groupId: 'g1' }), imageNode('b', { groupId: 'g1' })])))
++      const blank = contextMenuGroupsFor(createRuntime(ctx([]), { clipboardCount: 1, onFitAll: vi.fn(), allNodeIdsOverride: ['x'] }))
++      const pins: Array<[CanvasActionGroup[], string, string]> = [
++        [single, 'paste', menuShortcuts.paste], [single, 'fit-selection', menuShortcuts.fitSelection],
++        [multi, 'group', menuShortcuts.group], [grouped, 'ungroup', menuShortcuts.ungroup], [blank, 'paste', menuShortcuts.paste],
++        [blank, 'select-all', menuShortcuts.selectAll], [blank, 'fit-all', menuShortcuts.fitAll]]
++      for (const [groups2, id, hint] of pins) expect(findAction(groups2, id)?.shortcut, id).toBe(hint)
+     })
+ 
+     it('single image: view-details 标签为 View details，icon 非 Pencil', () => {
+@@ -454,12 +472,9 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       expect(groupIds(groups)).not.toContain('arrange')
+     })
+ 
+-    // 疑点 6 完整钉阵：locked 后哪些类型仍保 export、哪些丢 export。
+-    // 源码真相（canvasNodeRegistry lockedCapabilities）：image/task/text/ai-slot/annotation/
+-    // markup 及 file 系(markdown/pdf/video)显式补 'exportable'(markup 于 context-menu-standard
+-    // §4.1 修复批补齐,锁定不再丢 Download)；frame(=['frame'])经 organizationCapabilities
+-    // 不含 exportable → 丢 export。
+-    // 菜单出现 export 由 hasCommonCapability(context,'exportable') 决定。
++    // 疑点 6 完整钉阵：locked 后哪些类型仍保 export。源码真相：image/task/text/ai-slot/
++    // annotation/markup 及 file 系显式补 'exportable'(markup 于标准 §4.1 修复批补齐);
++    // frame(=['frame'])经 organizationCapabilities 不含 exportable → 丢 export。
+     it.each([
+       ['image', imageNode('a', { locked: true })],
+       ['text', textNode('a', { locked: true })],
+@@ -877,8 +892,9 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+   })
+ })
+ 
+-// BASELINE COUNT (part 1): part 1 = 162 expect / 107 tests（97 `it` + 2 个 `it.each` = 8+2 参数化行）。
+-// part 1+2 合计 315 expect / 203 tests（part2 153 expect / 96 tests）。迁移前后须一致；
++// BASELINE COUNT (part 1): T0.4① 迁移基线 = 162 expect / 107 tests（97 `it` + 2 个 `it.each` = 8+2 参数化行,
++// part 1+2 合计 315 expect / 203 tests）。2026-08-01 右键菜单标准化阶段 1/2 起追加守卫
++// (R19 shortcut 钉表等),计数随守卫演进,不再冻结;
+ // 若数量变化说明行为已改变,需在 PR 中显式说明。
+ // 分块：① 结构快照（含 orderedGroupIds 真实顺序钉阵）② 能力矩阵（含 locked/exportable 10 类型矩阵）
+ // ③ contextMenu/section 分发。
+diff --git a/src/canvas/actions/canvasActionModel.ts b/src/canvas/actions/canvasActionModel.ts
+index d9e21636..2c9228f5 100644
+--- a/src/canvas/actions/canvasActionModel.ts
++++ b/src/canvas/actions/canvasActionModel.ts
+@@ -27,10 +27,14 @@ import {
+ import { t } from '../../i18n'
+ import { objectNameFor } from './objectNames'
+ import { arrangeContextMenuGroup } from './layerActionGroups'
++import { menuShortcuts } from './menuShortcuts'
+ import { markupContextMenuGroupsFor, markupQuickToolbarGroupsFor } from './markupStyleActions'
+-import { swatchForColor } from './markupStylePresets'
+-import { SlantDashedLineIcon, SlantLineIcon } from '../drawToolIcons'
+-import { wavyWidthIcons } from '../lineWidthIcons'
++import {
++  sectionContentToggleAction,
++  sectionFillAction,
++  sectionLineAction,
++  sectionLockToolbarAction,
++} from './sectionStyleActions'
+ import { debugLogger } from '../../store/debugLogStore'
+ import type { CanvasNodeType } from '../../types/mivoCanvas'
+ import { hasAnyCapability, hasCommonCapability } from './canvasSelectionModel'
+@@ -86,126 +90,6 @@ export {
+   noteFillPresets,
+ } from './markupStylePresets'
+ 
+-// 2026-07-30 用户:Section 颜色选择与通用颜色组件对齐——填充/边框都走
+-// ColorSwatchPicker(menuVariant 'color-picker',与画笔/形状族同一套),预设
+-// 色板(sectionFillPresets/sectionBorderPresets)退役。边框菜单保留线型/线宽
+-// 选项行(色板上方),与形状族 Border 菜单同形态。
+-const sectionFillAction = (runtime: CanvasActionRuntime, fillColor: string): CanvasActionItem => ({
+-  id: 'section-fill',
+-  label: t('menu.section.fill'),
+-  swatch: swatchForColor(fillColor),
+-  menuVariant: 'color-picker',
+-  colorPicker: {
+-    value: fillColor,
+-    source: 'Section fill',
+-    onSelect: (color) => setSectionStyle(runtime, { sectionFillColor: color }),
+-  },
+-  onClick: () => setSectionStyle(runtime, { sectionFillColor: fillColor }),
+-})
+-
+-// 线型 = 斜线图标、线宽 = 波浪三档图标(2026-07-30 用户,FigJam 同款;与
+-// markupStyleActions 的线族/形状族同一组 drawToolIcons,全站一套)。
+-const sectionLineOptionActionsFor = (
+-  runtime: CanvasActionRuntime,
+-  lineStyle: 'solid' | 'dashed',
+-  lineWidth: number,
+-): CanvasActionItem[] => [
+-  {
+-    id: 'section-line-solid',
+-    label: t('menu.style.solidLine'),
+-    icon: SlantLineIcon,
+-    selected: lineStyle === 'solid',
+-    onClick: () => setSectionStyle(runtime, { sectionBorderStyle: 'solid' }),
+-  },
+-  {
+-    id: 'section-line-dashed',
+-    label: t('menu.style.dashedLine'),
+-    icon: SlantDashedLineIcon,
+-    selected: lineStyle === 'dashed',
+-    onClick: () => setSectionStyle(runtime, { sectionBorderStyle: 'dashed' }),
+-  },
+-  {
+-    id: 'section-line-thin',
+-    label: t('menu.style.thin'),
+-    icon: wavyWidthIcons[0],
+-    selected: lineWidth === 1,
+-    onClick: () => setSectionStyle(runtime, { sectionBorderWidth: 1 }),
+-  },
+-  {
+-    id: 'section-line-medium',
+-    label: t('menu.style.medium'),
+-    icon: wavyWidthIcons[1],
+-    selected: lineWidth === 2,
+-    onClick: () => setSectionStyle(runtime, { sectionBorderWidth: 2 }),
+-  },
+-  {
+-    id: 'section-line-bold',
+-    label: t('menu.style.bold'),
+-    icon: wavyWidthIcons[2],
+-    selected: lineWidth === 4,
+-    onClick: () => setSectionStyle(runtime, { sectionBorderWidth: 4 }),
+-  },
+-]
+-
+-const sectionLineAction = (
+-  runtime: CanvasActionRuntime,
+-  lineColor: string,
+-  lineStyle: 'solid' | 'dashed',
+-  lineWidth: number,
+-): CanvasActionItem => ({
+-  id: 'section-line',
+-  label: t('menu.section.line'),
+-  linePreview: { color: lineColor, width: lineWidth, dashed: lineStyle === 'dashed' },
+-  menuVariant: 'color-picker',
+-  children: sectionLineOptionActionsFor(runtime, lineStyle, lineWidth),
+-  colorPicker: {
+-    value: lineColor,
+-    source: 'Section line',
+-    onSelect: (color) => setSectionStyle(runtime, { sectionBorderColor: color }),
+-  },
+-  onClick: () => setSectionStyle(runtime, { sectionBorderColor: lineColor }),
+-})
+-
+-// 2026-07-30 用户:Section 的"隐藏"= 隐藏内容(截图3)——子节点退出渲染,盒体
+-// 画斜纹占位;标题显隐仍是右键菜单里的独立项(Hide title)。
+-const sectionContentToggleAction = (runtime: CanvasActionRuntime): CanvasActionItem => {
+-  const section = runtime.context.primaryNode
+-  const hidden = Boolean(section?.sectionContentHidden)
+-
+-  return {
+-    id: 'section-content-visibility',
+-    label: hidden ? t('menu.section.showContents') : t('menu.section.hideContents'),
+-    icon: hidden ? EyeOff : Eye,
+-    selected: hidden,
+-    onClick: () => {
+-      debugLogger.log('Section', `${hidden ? 'Show' : 'Hide'} contents for section ${section?.id || '(none)'}`)
+-      setSectionStyle(runtime, { sectionContentHidden: !hidden })
+-    },
+-  }
+-}
+-
+-const sectionLockToolbarAction = (runtime: CanvasActionRuntime): CanvasActionItem => {
+-  const section = runtime.context.primaryNode
+-  const locked = Boolean(section?.sectionLockMode)
+-
+-  return {
+-    id: 'section-lock',
+-    label: locked ? t('menu.section.unlock') : t('menu.section.lock'),
+-    icon: locked ? Unlock : Lock,
+-    children: [
+-      { id: 'section-lock-all', label: t('menu.section.lockAll'), icon: Lock, onClick: () => setSectionLockMode(runtime, 'all') },
+-      {
+-        id: 'section-lock-background',
+-        label: t('menu.section.lockBackgroundOnly'),
+-        icon: PanelTop,
+-        onClick: () => setSectionLockMode(runtime, 'background'),
+-      },
+-      { id: 'section-unlock', label: t('menu.section.unlockSection'), icon: Unlock, disabled: !locked, onClick: () => setSectionLockMode(runtime) },
+-    ],
+-    onClick: () => setSectionLockMode(runtime, locked ? undefined : 'background'),
+-  }
+-}
+-
+ type NodeActionExtension = (runtime: CanvasActionRuntime) => CanvasActionGroup[]
+ 
+ const sectionContextMenuGroupsFor: NodeActionExtension = (runtime) => {
+@@ -373,6 +257,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+                   id: 'paste',
+                   label: t('menu.create.paste', { count: runtime.clipboardCount }),
+                   icon: Clipboard,
++                  shortcut: menuShortcuts.paste,
+                   onClick: () => pasteClipboardNodes(runtime),
+                 },
+               ]
+@@ -394,6 +279,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+                   id: 'fit-all',
+                   label: t('menu.canvas.fitAll'),
+                   icon: LocateFixed,
++                  shortcut: menuShortcuts.fitAll,
+                   onClick: runtime.onFitAll,
+                 },
+               ]
+@@ -404,6 +290,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+                   id: 'select-all',
+                   label: t('menu.canvas.selectAll'),
+                   icon: SquareMousePointer,
++                  shortcut: menuShortcuts.selectAll,
+                   onClick: () => selectAll(runtime),
+                 },
+               ]
+@@ -472,6 +359,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+               ? t('menu.inspect.copyMulti', { count: selectedCount, name: objectName })
+               : t('menu.inspect.copySingle', { name: objectName }),
+           icon: Copy,
++          shortcut: menuShortcuts.copy,
+           onClick: () => copySelectedNodes(runtime),
+         },
+         ...(runtime.onFitSelection
+@@ -480,6 +368,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+                 id: 'fit-selection',
+                 label: t('menu.inspect.fitSelection'),
+                 icon: LocateFixed,
++                shortcut: menuShortcuts.fitSelection,
+                 onClick: runtime.onFitSelection,
+               },
+             ]
+@@ -490,6 +379,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+                 id: 'paste',
+                 label: t('menu.create.paste', { count: runtime.clipboardCount }),
+                 icon: Clipboard,
++                shortcut: menuShortcuts.paste,
+                 onClick: () => pasteClipboardNodes(runtime),
+               },
+             ]
+@@ -508,6 +398,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+                       id: 'group',
+                       label: t('menu.organize.groupCount', { count: selectedCount }),
+                       icon: Group,
++                      shortcut: menuShortcuts.group,
+                       onClick: () => groupSelectedNodes(runtime),
+                     },
+                   ]
+@@ -518,6 +409,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+                       id: 'ungroup',
+                       label: t('menu.organize.ungroup'),
+                       icon: Ungroup,
++                      shortcut: menuShortcuts.ungroup,
+                       onClick: () => ungroupSelectedNodes(runtime),
+                     },
+                   ]
+@@ -530,6 +422,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+                         ? t('menu.organize.lock', { name: objectName })
+                         : t('menu.organize.unlock', { name: objectName }),
+                       icon: runtime.context.nodes.some((node) => !node.locked) ? Lock : Unlock,
++                      shortcut: menuShortcuts.lock,
+                       onClick: () => toggleSelectedNodesLocked(runtime),
+                     },
+                   ]
+@@ -599,6 +492,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+                 ? t('menu.delete.multi', { count: selectedCount, name: objectName })
+                 : t('menu.delete.single', { name: objectName }),
+           icon: Trash2,
++          shortcut: menuShortcuts.delete,
+           danger: true,
+           onClick: () => deleteAction(runtime),
+         },
+diff --git a/src/canvas/actions/canvasActionTypes.ts b/src/canvas/actions/canvasActionTypes.ts
+index 78e3d26a..31c50673 100644
+--- a/src/canvas/actions/canvasActionTypes.ts
++++ b/src/canvas/actions/canvasActionTypes.ts
+@@ -44,6 +44,9 @@ export type CanvasActionItem = {
+   selected?: boolean
+   danger?: boolean
+   disabled?: boolean
++  /** 右键菜单右侧的快捷键提示文案(R19,menuShortcuts.ts)。只给真实生效的
++   *  快捷键;快捷工具条不渲染此字段。 */
++  shortcut?: string
+   /** segmented/choice 行内在本项前插一条竖分隔线(如线型菜单的"路由 | 实虚"分组)。 */
+   dividerBefore?: boolean
+   children?: CanvasActionItem[]
+diff --git a/src/canvas/actions/layerActionGroups.ts b/src/canvas/actions/layerActionGroups.ts
+index 75a513e1..1d1fa4e3 100644
+--- a/src/canvas/actions/layerActionGroups.ts
++++ b/src/canvas/actions/layerActionGroups.ts
+@@ -1,6 +1,7 @@
+ import { ArrowDown, ArrowUp, ChevronsDown, ChevronsUp, Layers } from 'lucide-react'
+ import { t } from '../../i18n'
+ import { moveLayerAction } from './canvasActionEmitters'
++import { menuShortcuts } from './menuShortcuts'
+ import type { CanvasActionGroup, CanvasActionRuntime } from './canvasActionTypes'
+ 
+ // 右键菜单 arrange 组(context-menu-standard §4.1)。2026-08-01 用户拍板:四个
+@@ -14,10 +15,10 @@ export const arrangeContextMenuGroup = (runtime: CanvasActionRuntime): CanvasAct
+       label: t('menu.layer.order'),
+       icon: Layers,
+       children: [
+-        { id: 'bring-forward', label: t('menu.layer.bringForward'), icon: ArrowUp, onClick: () => moveLayerAction(runtime, 'forward') },
+-        { id: 'send-backward', label: t('menu.layer.sendBackward'), icon: ArrowDown, onClick: () => moveLayerAction(runtime, 'backward') },
+-        { id: 'bring-front', label: t('menu.layer.bringToFront'), icon: ChevronsUp, onClick: () => moveLayerAction(runtime, 'front') },
+-        { id: 'send-back', label: t('menu.layer.sendToBack'), icon: ChevronsDown, onClick: () => moveLayerAction(runtime, 'back') },
++        { id: 'bring-forward', label: t('menu.layer.bringForward'), icon: ArrowUp, shortcut: menuShortcuts.bringForward, onClick: () => moveLayerAction(runtime, 'forward') },
++        { id: 'send-backward', label: t('menu.layer.sendBackward'), icon: ArrowDown, shortcut: menuShortcuts.sendBackward, onClick: () => moveLayerAction(runtime, 'backward') },
++        { id: 'bring-front', label: t('menu.layer.bringToFront'), icon: ChevronsUp, shortcut: menuShortcuts.bringToFront, onClick: () => moveLayerAction(runtime, 'front') },
++        { id: 'send-back', label: t('menu.layer.sendToBack'), icon: ChevronsDown, shortcut: menuShortcuts.sendToBack, onClick: () => moveLayerAction(runtime, 'back') },
+       ],
+     },
+   ],
+diff --git a/src/canvas/actions/menuShortcuts.ts b/src/canvas/actions/menuShortcuts.ts
+new file mode 100644
+index 00000000..680add18
+--- /dev/null
++++ b/src/canvas/actions/menuShortcuts.ts
+@@ -0,0 +1,25 @@
++// menuShortcuts — 右键菜单快捷键提示文案(context-menu-standard R19,2026-07-31 拍板)。
++// 只登记 useGlobalCanvasEvents / 原生 copy/paste 里真实生效的快捷键:菜单上的
++// 提示必须句句为真。文案按平台分 mac(符号)
++// 与其它(Ctrl+ 前缀)。
++const isMacLike =
++  typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || '')
++
++const mod = (key: string) => (isMacLike ? `⌘${key}` : `Ctrl+${key}`)
++const shiftMod = (key: string) => (isMacLike ? `⇧⌘${key}` : `Ctrl+Shift+${key}`)
++
++export const menuShortcuts = {
++  copy: mod('C'),
++  paste: mod('V'),
++  group: mod('G'),
++  ungroup: shiftMod('G'),
++  lock: shiftMod('L'),
++  delete: isMacLike ? '⌫' : 'Del',
++  selectAll: mod('A'),
++  fitAll: isMacLike ? '⇧1' : 'Shift+1',
++  fitSelection: isMacLike ? '⇧2' : 'Shift+2',
++  bringForward: ']',
++  sendBackward: '[',
++  bringToFront: isMacLike ? '⇧]' : 'Shift+]',
++  sendToBack: isMacLike ? '⇧[' : 'Shift+[',
++} as const
+diff --git a/src/canvas/actions/sectionStyleActions.ts b/src/canvas/actions/sectionStyleActions.ts
+new file mode 100644
+index 00000000..afce4ad4
+--- /dev/null
++++ b/src/canvas/actions/sectionStyleActions.ts
+@@ -0,0 +1,132 @@
++// sectionStyleActions — Section(frame)的样式/工具条动作装配件,从
++// canvasActionModel.ts 抽出(结构守卫大文件减重,与 markupStyleActions 同款
++// 拆分形态)。填充/边框色板、线型线宽、内容显隐、Section 锁四组 helper;
++// 消费方:canvasActionModel 的 section 右键/快捷条装配。
++import { Eye, EyeOff, Lock, PanelTop, Unlock } from 'lucide-react'
++import { t } from '../../i18n'
++import { debugLogger } from '../../store/debugLogStore'
++import { setSectionLockMode, setSectionStyle } from './canvasActionEmitters'
++import { swatchForColor } from './markupStylePresets'
++import { SlantDashedLineIcon, SlantLineIcon } from '../drawToolIcons'
++import { wavyWidthIcons } from '../lineWidthIcons'
++import type { CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
++
++// 2026-07-30 用户:Section 颜色选择与通用颜色组件对齐——填充/边框都走
++// ColorSwatchPicker(menuVariant 'color-picker',与画笔/形状族同一套),预设
++// 色板(sectionFillPresets/sectionBorderPresets)退役。边框菜单保留线型/线宽
++// 选项行(色板上方),与形状族 Border 菜单同形态。
++export const sectionFillAction = (runtime: CanvasActionRuntime, fillColor: string): CanvasActionItem => ({
++  id: 'section-fill',
++  label: t('menu.section.fill'),
++  swatch: swatchForColor(fillColor),
++  menuVariant: 'color-picker',
++  colorPicker: {
++    value: fillColor,
++    source: 'Section fill',
++    onSelect: (color) => setSectionStyle(runtime, { sectionFillColor: color }),
++  },
++  onClick: () => setSectionStyle(runtime, { sectionFillColor: fillColor }),
++})
++
++// 线型 = 斜线图标、线宽 = 波浪三档图标(2026-07-30 用户,FigJam 同款;与
++// markupStyleActions 的线族/形状族同一组 drawToolIcons,全站一套)。
++const sectionLineOptionActionsFor = (
++  runtime: CanvasActionRuntime,
++  lineStyle: 'solid' | 'dashed',
++  lineWidth: number,
++): CanvasActionItem[] => [
++  {
++    id: 'section-line-solid',
++    label: t('menu.style.solidLine'),
++    icon: SlantLineIcon,
++    selected: lineStyle === 'solid',
++    onClick: () => setSectionStyle(runtime, { sectionBorderStyle: 'solid' }),
++  },
++  {
++    id: 'section-line-dashed',
++    label: t('menu.style.dashedLine'),
++    icon: SlantDashedLineIcon,
++    selected: lineStyle === 'dashed',
++    onClick: () => setSectionStyle(runtime, { sectionBorderStyle: 'dashed' }),
++  },
++  {
++    id: 'section-line-thin',
++    label: t('menu.style.thin'),
++    icon: wavyWidthIcons[0],
++    selected: lineWidth === 1,
++    onClick: () => setSectionStyle(runtime, { sectionBorderWidth: 1 }),
++  },
++  {
++    id: 'section-line-medium',
++    label: t('menu.style.medium'),
++    icon: wavyWidthIcons[1],
++    selected: lineWidth === 2,
++    onClick: () => setSectionStyle(runtime, { sectionBorderWidth: 2 }),
++  },
++  {
++    id: 'section-line-bold',
++    label: t('menu.style.bold'),
++    icon: wavyWidthIcons[2],
++    selected: lineWidth === 4,
++    onClick: () => setSectionStyle(runtime, { sectionBorderWidth: 4 }),
++  },
++]
++
++export const sectionLineAction = (
++  runtime: CanvasActionRuntime,
++  lineColor: string,
++  lineStyle: 'solid' | 'dashed',
++  lineWidth: number,
++): CanvasActionItem => ({
++  id: 'section-line',
++  label: t('menu.section.line'),
++  linePreview: { color: lineColor, width: lineWidth, dashed: lineStyle === 'dashed' },
++  menuVariant: 'color-picker',
++  children: sectionLineOptionActionsFor(runtime, lineStyle, lineWidth),
++  colorPicker: {
++    value: lineColor,
++    source: 'Section line',
++    onSelect: (color) => setSectionStyle(runtime, { sectionBorderColor: color }),
++  },
++  onClick: () => setSectionStyle(runtime, { sectionBorderColor: lineColor }),
++})
++
++// 2026-07-30 用户:Section 的"隐藏"= 隐藏内容(截图3)——子节点退出渲染,盒体
++// 画斜纹占位;标题显隐仍是右键菜单里的独立项(Hide title)。
++export const sectionContentToggleAction = (runtime: CanvasActionRuntime): CanvasActionItem => {
++  const section = runtime.context.primaryNode
++  const hidden = Boolean(section?.sectionContentHidden)
++
++  return {
++    id: 'section-content-visibility',
++    label: hidden ? t('menu.section.showContents') : t('menu.section.hideContents'),
++    icon: hidden ? EyeOff : Eye,
++    selected: hidden,
++    onClick: () => {
++      debugLogger.log('Section', `${hidden ? 'Show' : 'Hide'} contents for section ${section?.id || '(none)'}`)
++      setSectionStyle(runtime, { sectionContentHidden: !hidden })
++    },
++  }
++}
++
++export const sectionLockToolbarAction = (runtime: CanvasActionRuntime): CanvasActionItem => {
++  const section = runtime.context.primaryNode
++  const locked = Boolean(section?.sectionLockMode)
++
++  return {
++    id: 'section-lock',
++    label: locked ? t('menu.section.unlock') : t('menu.section.lock'),
++    icon: locked ? Unlock : Lock,
++    children: [
++      { id: 'section-lock-all', label: t('menu.section.lockAll'), icon: Lock, onClick: () => setSectionLockMode(runtime, 'all') },
++      {
++        id: 'section-lock-background',
++        label: t('menu.section.lockBackgroundOnly'),
++        icon: PanelTop,
++        onClick: () => setSectionLockMode(runtime, 'background'),
++      },
++      { id: 'section-unlock', label: t('menu.section.unlockSection'), icon: Unlock, disabled: !locked, onClick: () => setSectionLockMode(runtime) },
++    ],
++    onClick: () => setSectionLockMode(runtime, locked ? undefined : 'background'),
++  }
++}
+diff --git a/src/canvas/canvasInteraction.test.ts b/src/canvas/canvasInteraction.test.ts
+index 41dbdea8..b71eb47c 100644
+--- a/src/canvas/canvasInteraction.test.ts
++++ b/src/canvas/canvasInteraction.test.ts
+@@ -11,6 +11,8 @@ import {
+   runtimeToolFor,
+   shouldStartCanvasSurfaceInteraction,
+   isCanvasUiTarget,
++  handleLockShortcut,
++  resolveLockShortcut,
+   nativeContextMenuAllowed,
+   zoomMarqueeOverlayRect,
+   hasActiveTextSelection,
+@@ -282,3 +284,68 @@ describe('nativeContextMenuAllowed / isCanvasUiTarget(R4 右键 gate)', () => {
+     expect(isCanvasUiTarget(bar)).toBe(true)
+   })
+ })
++
++
++// R19/⇧⌘L 锁定快捷键分发决策(第二/三轮对抗审查):无选区不拦截;单选 Section
++// 显式走 setSectionLockMode 钉死 Lock all ↔ 解锁的产品语义;混选 generic 安全
++// (store 对 frame 双写 locked + sectionLockMode,见 nodeMutationSlice.lock.test)。
++describe('resolveLockShortcut(⇧⌘L 分发决策)', () => {
++  it('无选区 → ignore(不 preventDefault,留给浏览器/系统)', () => {
++    expect(resolveLockShortcut([])).toEqual({ kind: 'ignore' })
++  })
++
++  it('单选 Section(未锁)→ section 语义 Lock all', () => {
++    const section = baseNode({ id: 's1', type: 'frame' })
++    expect(resolveLockShortcut([section])).toEqual({ kind: 'section', nodeId: 's1', nextMode: 'all' })
++  })
++
++  it('单选 Section(已锁)→ section 语义解锁', () => {
++    const section = baseNode({ id: 's1', type: 'frame', sectionLockMode: 'background' })
++    expect(resolveLockShortcut([section])).toEqual({ kind: 'section', nodeId: 's1', nextMode: undefined })
++  })
++
++  it('普通单选/多选(含混入 Section 的多选)→ generic 翻转(与菜单 toggle-lock 同源)', () => {
++    expect(resolveLockShortcut([baseNode({ id: 'a' })])).toEqual({ kind: 'generic' })
++    expect(
++      resolveLockShortcut([baseNode({ id: 'a' }), baseNode({ id: 's1', type: 'frame' })]),
++    ).toEqual({ kind: 'generic' })
++  })
++})
++
++
++// ⇧⌘L 完整接线(第三轮对抗审查):从 preventDefault 真伪到分发目标,不经 DOM。
++describe('handleLockShortcut(⇧⌘L 接线:preventDefault + dispatch 目标)', () => {
++  const makeDispatch = () => ({
++    setSectionLockMode: vi.fn(),
++    toggleSelectedNodesLocked: vi.fn(),
++  })
++
++  it('无选区 → 返回 false 且不 preventDefault(按键留给浏览器)', () => {
++    const event = { preventDefault: vi.fn() }
++    const dispatch = makeDispatch()
++    expect(handleLockShortcut(event, [], dispatch)).toBe(false)
++    expect(event.preventDefault).not.toHaveBeenCalled()
++    expect(dispatch.setSectionLockMode).not.toHaveBeenCalled()
++    expect(dispatch.toggleSelectedNodesLocked).not.toHaveBeenCalled()
++  })
++
++  it('单选 Section → preventDefault + setSectionLockMode(id, "all"/undefined)', () => {
++    const event = { preventDefault: vi.fn() }
++    const dispatch = makeDispatch()
++    expect(handleLockShortcut(event, [baseNode({ id: 's1', type: 'frame' })], dispatch)).toBe(true)
++    expect(event.preventDefault).toHaveBeenCalledTimes(1)
++    expect(dispatch.setSectionLockMode).toHaveBeenCalledWith('s1', 'all')
++    expect(dispatch.toggleSelectedNodesLocked).not.toHaveBeenCalled()
++  })
++
++  it('普通/混合选区 → preventDefault + toggleSelectedNodesLocked', () => {
++    const event = { preventDefault: vi.fn() }
++    const dispatch = makeDispatch()
++    expect(
++      handleLockShortcut(event, [baseNode({ id: 'a' }), baseNode({ id: 's1', type: 'frame' })], dispatch),
++    ).toBe(true)
++    expect(event.preventDefault).toHaveBeenCalledTimes(1)
++    expect(dispatch.toggleSelectedNodesLocked).toHaveBeenCalledTimes(1)
++    expect(dispatch.setSectionLockMode).not.toHaveBeenCalled()
++  })
++})
+diff --git a/src/canvas/canvasInteraction.ts b/src/canvas/canvasInteraction.ts
+index 2b829042..fff90afd 100644
+--- a/src/canvas/canvasInteraction.ts
++++ b/src/canvas/canvasInteraction.ts
+@@ -1,4 +1,5 @@
+-import type { MivoCanvasNode, ToolId } from '../types/mivoCanvas'
++import type { MivoCanvasNode, SectionLockMode, ToolId } from '../types/mivoCanvas'
++import { clampMenuPosition } from '../lib/menuOverlayLayout'
+ import {
+   getSnappedFreeResize,
+   getSnappedPosition,
+@@ -207,6 +208,49 @@ export const frameTitleNodeIdFromTarget = (target: EventTarget | null): string |
+   return nodeIdFromDomTarget(target)
+ }
+ 
++// R19/⇧⌘L 锁定快捷键的分发决策(纯函数,单测覆盖)。与右键菜单语义对齐:
++// - 无选区 → ignore,连 preventDefault 都不做(把 Cmd+Shift+L 留给浏览器/系统);
++// - 单选 Section → 显式走 canonical 的 setSectionLockMode,钉死 Lock all ↔ 解锁
++//   的产品语义(与菜单排除单选 Section 的 generic toggle-lock 保持一致);
++// - 其余选区(含混入 Section 的多选)→ 与菜单 toggle-lock 同源的 generic 翻转;
++//   generic 对 frame 已由 store 双写 locked + sectionLockMode(nodeMutationSlice
++//   阶段 2 根因修复),两字段不会再出现矛盾态。
++export type LockShortcutDecision =
++  | { kind: 'ignore' }
++  | { kind: 'section'; nodeId: string; nextMode: 'all' | undefined }
++  | { kind: 'generic' }
++
++export const resolveLockShortcut = (selectedNodes: MivoCanvasNode[]): LockShortcutDecision => {
++  if (!selectedNodes.length) return { kind: 'ignore' }
++  const single = selectedNodes.length === 1 ? selectedNodes[0] : undefined
++  if (single?.type === 'frame') {
++    return { kind: 'section', nodeId: single.id, nextMode: single.sectionLockMode ? undefined : 'all' }
++  }
++  // 混选含 Section 也走 generic(store 已对 frame 双写,安全,见顶部注释)。
++  return { kind: 'generic' }
++}
++
++/** ⇧⌘L 的完整接线(依赖全部注入、可直接单测的接线函数——它会调用
++ *  event.preventDefault 与 dispatch,有副作用,不是纯函数):从"是否
++ *  preventDefault"到"分发哪个动作"整段可测。selectedNodes 由调用方用 selectedNodesFromState 解析
++ *  (selectedNodeIds 空时回退 selectedNodeId、过滤 hidden 的仓内标准语义)。
++ *  返回是否消费了本次按键(false = 留给浏览器)。 */
++export const handleLockShortcut = (
++  event: Pick<Event, 'preventDefault'>,
++  selectedNodes: MivoCanvasNode[],
++  dispatch: {
++    setSectionLockMode: (nodeId: string, mode?: SectionLockMode) => void
++    toggleSelectedNodesLocked: () => void
++  },
++): boolean => {
++  const decision = resolveLockShortcut(selectedNodes)
++  if (decision.kind === 'ignore') return false
++  event.preventDefault()
++  if (decision.kind === 'section') dispatch.setSectionLockMode(decision.nodeId, decision.nextMode)
++  else dispatch.toggleSelectedNodesLocked()
++  return true
++}
++
+ // R4(context-menu-standard):右键的 UI gate 直接复用 isCanvasUiTarget 单一来源
+ // (chrome UI 上既不弹画布菜单也不弹浏览器菜单)。唯一例外是画布文字编辑器与
+ // 显式 opt-in 的输入框(data-native-menu="true",如 anchor 指令输入)——原生
+@@ -231,18 +275,10 @@ export const isCanvasChromeTarget = (target: EventTarget | null) =>
+ 
+ const contextMenuWidth = 252
+ const contextMenuMaxHeight = 620
+-const contextMenuMargin = 12
+-
+-export const clampContextMenuPosition = (clientX: number, clientY: number, maxHeight = contextMenuMaxHeight) => ({
+-  x: Math.min(
+-    Math.max(contextMenuMargin, clientX),
+-    Math.max(contextMenuMargin, window.innerWidth - contextMenuWidth - contextMenuMargin),
+-  ),
+-  y: Math.min(
+-    Math.max(contextMenuMargin, clientY),
+-    Math.max(contextMenuMargin, window.innerHeight - maxHeight - contextMenuMargin),
+-  ),
+-})
++
++// R8:夹取语义收敛到 menuOverlayLayout 单一来源;这里只保留画布菜单的形态参数。
++export const clampContextMenuPosition = (clientX: number, clientY: number, maxHeight = contextMenuMaxHeight) =>
++  clampMenuPosition(clientX, clientY, { width: contextMenuWidth, maxHeight })
+ 
+ export const clientPointToCanvas = (
+   rect: ClientRectLike | undefined,
+diff --git a/src/canvas/useCanvasInteractionController.ts b/src/canvas/useCanvasInteractionController.ts
+index 78ff4df7..1c88c0ec 100644
+--- a/src/canvas/useCanvasInteractionController.ts
++++ b/src/canvas/useCanvasInteractionController.ts
+@@ -277,6 +277,6 @@ export function useCanvasInteractionController({
+     stampPlacementPreview, selectionPreviewSet, beginGroupResize, beginSelectionSpacingDrag,
+     beginNodeResize, editTextNode, beginTextResize, beginMarkupPointMove, updateEditingText,
+     finishTextEditing, resolveCanvasHit, handleCanvasPointerDown, handleCanvasPointerMove,
+-    handleCanvasPointerEnd, handleWheel, zoomTo, zoomBy, fitToBounds, fit, fitAll, fitSelection, resetView,
++    handleCanvasPointerEnd, handleWheel, zoomTo, zoomBy, fitToBounds, fit, fitAll, fitSelection, resetView, resetPan,
+   }
+ }
+diff --git a/src/canvas/useGlobalCanvasEvents.ts b/src/canvas/useGlobalCanvasEvents.ts
+index ea2226bd..b844a5d1 100644
+--- a/src/canvas/useGlobalCanvasEvents.ts
++++ b/src/canvas/useGlobalCanvasEvents.ts
+@@ -1,11 +1,12 @@
+ import { useEffect, useRef } from 'react'
+ import type { RuntimeCanvasTool } from './canvasInteraction'
+ import type { SnapGuide } from './canvasGeometry'
+-import { hasActiveTextSelection, isEditingTarget } from './canvasInteraction'
++import { handleLockShortcut, hasActiveTextSelection, isEditingTarget } from './canvasInteraction'
+ import { toolForKeyboardShortcut } from './canvasToolRegistry'
+ import { importImageFileToCanvas } from '../lib/canvasAssetImport'
+ import { handleImportError } from './canvasImportHandlers'
+ import { useCanvasStore } from '../store/canvasStore'
++import { selectedNodesFromState } from '../store/canvasDocumentModel'
+ import { debugLogger } from '../store/debugLogStore'
+ import { wrapMutation } from './actions/canvasSyncRuntime'
+ import { createArrowNudgeThrottle, type ArrowKey } from './arrowNudgeThrottle'
+@@ -268,19 +269,34 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
+         return
+       }
+ 
+-      if (event.key === '[') {
++      // 层级快捷键按物理键位(event.code)分发:Shift+[ 的 event.key 是 '{',
++      // 旧的 key === '[' 分支在 shift 组合下永远不可达(⇧[/⇧] 一直是死键,
++      // 阶段 2 对抗审查修复)。
++      if (event.code === 'BracketLeft') {
+         event.preventDefault()
+         // A2 SC:moveSelectedLayer 改 orderKey(document mutation),经 wrapMutation 包(取参包)。
+         wrapMutation(store.moveSelectedLayer)(event.shiftKey ? 'back' : 'backward')
+         return
+       }
+ 
+-      if (event.key === ']') {
++      if (event.code === 'BracketRight') {
+         event.preventDefault()
+         wrapMutation(store.moveSelectedLayer)(event.shiftKey ? 'front' : 'forward')
+         return
+       }
+ 
++      // R19/⇧⌘L:锁定/解锁选中对象。接线全在 handleLockShortcut(可单测):
++      // 无选区不拦截(留给浏览器);单选 Section 走 section 锁语义;选区解析用
++      // selectedNodesFromState 标准语义(selectedNodeId 回退 + hidden 过滤,
++      // 第三轮对抗审查修复 selectedNodeIds-only 的误判 ignore)。
++      if (modifier && event.shiftKey && key === 'l') {
++        handleLockShortcut(event, selectedNodesFromState(store), {
++          setSectionLockMode: wrapMutation(store.setSectionLockMode),
++          toggleSelectedNodesLocked: wrapMutation(store.toggleSelectedNodesLocked),
++        })
++        return
++      }
++
+       if (!modifier && key === 'e') {
+         event.preventDefault()
+         store.setActiveTool('markup-brush')
+diff --git a/src/lib/menuOverlayLayout.ts b/src/lib/menuOverlayLayout.ts
+new file mode 100644
+index 00000000..b6753638
+--- /dev/null
++++ b/src/lib/menuOverlayLayout.ts
+@@ -0,0 +1,18 @@
++// menuOverlayLayout — 右键菜单/浮层视口夹取的单一来源(context-menu-standard R8)。
++// 此前画布菜单(canvasInteraction/CanvasContextMenu)与侧栏菜单(sidebar/ContextMenu)
++// 各写一份 clamp 常量(12/12/8 三种边距):统一为本模块的 12px 边距与同一夹取
++// 语义。各菜单的宽高是自己的形态参数,由调用方传入,不在这里集中。
++export const menuViewportMargin = 12
++
++// R10:子菜单 hover 意图延迟(全站统一手感)——划过不误开,停留才展开。
++export const submenuHoverDelayMs = 150
++
++export const clampMenuPosition = (
++  clientX: number,
++  clientY: number,
++  size: { width: number; maxHeight: number },
++  margin: number = menuViewportMargin,
++): { x: number; y: number } => ({
++  x: Math.min(Math.max(margin, clientX), Math.max(margin, window.innerWidth - size.width - margin)),
++  y: Math.min(Math.max(margin, clientY), Math.max(margin, window.innerHeight - size.maxHeight - margin)),
++})
+diff --git a/src/store/nodeMutationSlice.lock.test.ts b/src/store/nodeMutationSlice.lock.test.ts
+new file mode 100644
+index 00000000..de8fe2c3
+--- /dev/null
++++ b/src/store/nodeMutationSlice.lock.test.ts
+@@ -0,0 +1,62 @@
++// @vitest-environment happy-dom
++// toggleSelectedNodesLocked 的 Section 双写语义(2026-08-01 阶段 2 对抗审查根因
++// 修复):generic 翻转对 frame 必须同步 locked + sectionLockMode,否则混选含
++// Section 时锁不干净/解不干净(两字段矛盾态)。真 store 测试,不 mock slice。
++import { beforeEach, describe, expect, it } from 'vitest'
++import { useCanvasStore } from './canvasStore'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++const node = (seed: Partial<MivoCanvasNode> & { id: string }): MivoCanvasNode =>
++  ({
++    type: 'image',
++    title: seed.id,
++    x: 0,
++    y: 0,
++    width: 100,
++    height: 100,
++    status: 'ready',
++    ...seed,
++  }) as MivoCanvasNode
++
++describe('toggleSelectedNodesLocked — frame 双写 locked + sectionLockMode', () => {
++  beforeEach(() => {
++    useCanvasStore.setState({
++      nodes: [
++        node({ id: 'img' }),
++        node({ id: 'sec', type: 'frame' }),
++      ],
++      selectedNodeId: undefined,
++      selectedNodeIds: ['img', 'sec'],
++    })
++  })
++
++  it('混选加锁:frame 得到 locked=true 且 sectionLockMode="all"(无矛盾态)', () => {
++    useCanvasStore.getState().toggleSelectedNodesLocked()
++    const nodes = useCanvasStore.getState().nodes
++    const frame = nodes.find((item) => item.id === 'sec')
++    const image = nodes.find((item) => item.id === 'img')
++    expect(image?.locked).toBe(true)
++    expect(frame?.locked).toBe(true)
++    expect(frame?.sectionLockMode).toBe('all')
++  })
++
++  it('混选解锁:frame 的 sectionLockMode 一并清空(不残留 "all")', () => {
++    useCanvasStore.setState({
++      nodes: [
++        node({ id: 'img', locked: true }),
++        node({ id: 'sec', type: 'frame', locked: true, sectionLockMode: 'all' }),
++      ],
++      selectedNodeIds: ['img', 'sec'],
++    })
++    useCanvasStore.getState().toggleSelectedNodesLocked()
++    const frame = useCanvasStore.getState().nodes.find((item) => item.id === 'sec')
++    expect(frame?.locked).toBe(false)
++    expect(frame?.sectionLockMode).toBeUndefined()
++  })
++
++  it('selectedNodeIds 空但 selectedNodeId 命中 → 仍生效(标准选区回退语义)', () => {
++    useCanvasStore.setState({ selectedNodeIds: [], selectedNodeId: 'img' })
++    useCanvasStore.getState().toggleSelectedNodesLocked()
++    expect(useCanvasStore.getState().nodes.find((item) => item.id === 'img')?.locked).toBe(true)
++  })
++})
+diff --git a/src/store/nodeMutationSlice.ts b/src/store/nodeMutationSlice.ts
+index eaf0c262..84c07227 100644
+--- a/src/store/nodeMutationSlice.ts
++++ b/src/store/nodeMutationSlice.ts
+@@ -619,9 +619,18 @@ export const createNodeMutationSlice: SliceCreator = (set, get) => ({
+       const selectedSet = new Set(selectedNodeIds)
+       const selectedNodes = state.nodes.filter((node) => selectedSet.has(node.id))
+       const shouldLock = selectedNodes.some((node) => !node.locked)
+-      const nodes = state.nodes.map((node) =>
+-        selectedSet.has(node.id) ? { ...node, locked: shouldLock } : node,
+-      )
++      // Section(frame)的锁定真源是 sectionLockMode(setSectionLockMode 双写
++      // locked + sectionLockMode):generic 翻转必须同步双写,否则混选含 Section
++      // 时会写出 locked=true 而 sectionLockMode 空(锁不住样式面板之外的 UI 态)
++      // 或 locked=false 而 sectionLockMode 残留(解锁解不干净)的自相矛盾状态
++      // (2026-08-01 阶段 2 对抗审查)。
++      const nodes = state.nodes.map((node) => {
++        if (!selectedSet.has(node.id)) return node
++        if (node.type === 'frame') {
++          return { ...node, locked: shouldLock, sectionLockMode: shouldLock ? ('all' as const) : undefined }
++        }
++        return { ...node, locked: shouldLock }
++      })
+ 
+       return patchWithHistory(state, { nodes, selectedNodeId: state.selectedNodeId, selectedNodeIds })
+     }),

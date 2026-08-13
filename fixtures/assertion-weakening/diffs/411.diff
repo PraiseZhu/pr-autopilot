@@ -1,0 +1,353 @@
+diff --git a/src/__tests__/depositStore.test.ts b/src/__tests__/depositStore.test.ts
+index be8ed478..27979d54 100644
+--- a/src/__tests__/depositStore.test.ts
++++ b/src/__tests__/depositStore.test.ts
+@@ -1,24 +1,28 @@
+ /**
+- * depositStore 契约测试(R-M 前段;设计稿 §4.4.2 / §4.4.3)。
++ * depositStore 契约测试(P1a;设计稿 §4.4.2 / §4.4.3 / §4.4.4 / §4.10.6 / §4.10.6.1)。
+  *
+- * 分两层:
+- *  ① 纯函数层 —— 合并规则与解析兜底(不碰传输);
+- *  ② 端到端层 —— 经真实 main.js 的槽 + 指针提交,断言内存权威 / 串行队列 /
+- *     generation CAS 合并重试,以及「两槽皆坏 → 缓存空,代价有界不产生错数据」。
++ * 分三层:
++ *  ① 纯函数层 —— 解析兜底与原型污染硬门(不碰传输);
++ *  ② 端到端层 —— 经真实 main.js 的不可变命名协议提交,断言内存权威 / 串行队列 /
++ *     LRU / tombstone / pendingReleases 读写语义;
++ *  ③ CAS 冲突层 —— 磁盘 generation 被外部推进后,断言「本实例未提交变更重放」
++ *     而不是对称合并(last-write-wins 已作废),含释放-复活防护。
+  */
+-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import {
+   DEPOSIT_COMMIT_MAX_ATTEMPTS,
+   DEPOSIT_MAP_MAX_ENTRIES,
+-  // 桥接(S1→S3 临时):占位常量把新必填 gen/writer 填满,S3 本文件改用终态 draft() 后移除。
++  DEPOSIT_PENDING_GEN,
++  DEPOSIT_PENDING_WRITER,
++  invalidateDeposit,
+   loadDepositStore,
+   lookupDeposit,
+   parseDepositState,
+   peekDepositRevisionSumForTests,
+   peekDepositStoreForTests,
++  recordCapabilityMark,
+   recordDeposit,
+   recordMigration,
+-  invalidateDeposit,
+   setDepositTransport,
+   type DepositEntryDraft,
+ } from '../agent/depositStore'
+@@ -34,6 +38,7 @@ const draft = (hash: string, depositedAt: number, from: 'deposit' | 'artifact' |
+ 
+ afterEach(() => {
+   teardownDepositHarness()
++  vi.restoreAllMocks() // N3:防止 vi.spyOn(debugLogger, ...) 的调用记录跨用例串味
+ })
+ 
+ describe('depositStore — 解析兜底', () => {
+@@ -45,12 +50,12 @@ describe('depositStore — 解析兜底', () => {
+     expect(parseDepositState(42)).toBeNull()
+   })
+ 
+-  it('槽内 generation 缺失视作 0;脏条目被剔除', () => {
++  it('generation 缺失视作 0;脏条目被剔除', () => {
+     const parsed = parseDepositState(
+       JSON.stringify({
+         version: 1,
+         map: {
+-          good: { hash: 'aaa', ext: '.png', depositedAt: 3 },
++          good: { hash: 'aaa', ext: '.png', depositedAt: 3, from: 'deposit', gen: 1, writer: 'aaaa1111' },
+           noHash: { ext: '.png' },
+           noExt: { hash: 'bbb' },
+           wrongType: 'nope',
+@@ -61,27 +66,59 @@ describe('depositStore — 解析兜底', () => {
+     expect(parsed?.generation).toBe(0)
+     expect(Object.keys(parsed?.map ?? {})).toEqual(['good'])
+   })
++
++  it('map 条目缺 from(老格式)按最保守值 ledger 补齐(设计稿 §4.4.4 纪律 3)', () => {
++    const parsed = parseDepositState(
++      JSON.stringify({ version: 1, map: { legacy: { hash: 'aaa', ext: '.png', depositedAt: 1 } } } as unknown),
++    )
++    expect(parsed?.map.legacy.from).toBe('ledger')
++  })
++
++  it('map 条目缺 gen/writer(老格式)按缺省口径补齐,不抛错', () => {
++    const parsed = parseDepositState(
++      JSON.stringify({ version: 1, map: { legacy: { hash: 'aaa', ext: '.png', depositedAt: 1, from: 'deposit' } } }),
++    )
++    expect(parsed?.map.legacy.gen).toBe(0)
++    expect(typeof parsed?.map.legacy.writer).toBe('string')
++  })
++
++  it('releasedTombstones / pendingReleases 缺字段的脏条目被剔除,合法条目保留', () => {
++    const parsed = parseDepositState(
++      JSON.stringify({
++        version: 1,
++        map: {},
++        releasedTombstones: { a: { hash: 'aaa', at: 1, gen: 1, writer: 'w' }, b: { at: 1 } },
++        pendingReleases: { aaa: { hash: 'aaa', from: 'deposit', at: 1, gen: 1, writer: 'w' }, bad: { at: 1 } },
++      }),
++    )
++    expect(Object.keys(parsed?.releasedTombstones ?? {})).toEqual(['a'])
++    expect(Object.keys(parsed?.pendingReleases ?? {})).toEqual(['aaa'])
++  })
++
++  it('releasedFloor 缺失时为空 record,存在时按 assetUrl 解析(B3:per-asset 取代全局水位)', () => {
++    const noFloor = parseDepositState(JSON.stringify({ version: 1, map: {} }))
++    expect(noFloor?.releasedFloor).toEqual({})
++
++    const withFloor = parseDepositState(
++      JSON.stringify({ version: 1, map: {}, releasedFloor: { shared: { generation: 5, at: 9 }, bad: { at: 1 } } }),
++    )
++    expect(withFloor?.releasedFloor).toEqual({ shared: { generation: 5, at: 9 } }) // 缺 generation 的脏条目被剔除
++  })
+ })
+ 
+ describe('depositStore — 原型污染硬门(§六-8 对抗输入;共享 src/lib/safeArgs 语义)', () => {
+-  // 槽内容与存量账本都是不可信输入,而 map 的键就是里面的 assetUrl。用普通 `{}`
+-  // 做 map 时 `map['__proto__'] = entry` 命中 Object.prototype 的 setter →
+-  // 条目静默消失、日志仍报「已缓存 N 条」(fail-silent 数据丢失);反向
+-  // `map['toString']` 又会读到继承的函数并被当成合法 entry。
+-  it('槽里的 __proto__ 键作为普通条目保留,不替换 map 原型', () => {
++  it('槎里的 __proto__ 键作为普通条目保留,不替换 map 原型', () => {
+     const parsed = parseDepositState(
+-      `{"version":1,"map":{"__proto__":{"hash":"aaa","ext":".png","depositedAt":1},"ok":{"hash":"bbb","ext":".png","depositedAt":2}}}`,
++      `{"version":1,"map":{"__proto__":{"hash":"aaa","ext":".png","depositedAt":1,"from":"deposit"},"ok":{"hash":"bbb","ext":".png","depositedAt":2,"from":"deposit"}}}`,
+     )
+ 
+     expect(parsed).not.toBeNull()
+-    // 原型没被换掉:map 是无原型袋
+     expect(Object.getPrototypeOf(parsed?.map)).toBeNull()
+-    // 条目没有静默消失 —— 这正是普通 `{}` 会丢掉的那一条
+     expect(Object.keys(parsed?.map ?? {}).sort()).toEqual(['__proto__', 'ok'])
+     expect(parsed?.map['__proto__']?.hash).toBe('aaa')
+   })
+ 
+-  it('继承键读不到:map[\'toString\'] 不返回 Object.prototype 上的函数', async () => {
++  it("继承键读不到:map['toString'] 不返回 Object.prototype 上的函数", async () => {
+     createDepositHarness()
+     expect(await lookupDeposit('toString')).toBeUndefined()
+     expect(await lookupDeposit('constructor')).toBeUndefined()
+@@ -89,14 +126,13 @@ describe('depositStore — 原型污染硬门(§六-8 对抗输入;共享 src/li
+   })
+ 
+   it('entry 字段只认 own 数据属性:继承来的 hash/ext 不能冒充合法条目', () => {
+-    // 一个原型上带 hash/ext 的对象:普通 `entry.hash` 读得到,own-descriptor 读不到。
+     const polluted = Object.create({ hash: 'inherited', ext: '.png' }) as Record<string, unknown>
+     const parsed = parseDepositState({ version: 1, map: { evil: polluted } })
+ 
+     expect(Object.keys(parsed?.map ?? {})).toEqual([])
+   })
+ 
+-  it('entry 字段不触发 accessor:带 getter 的槽条目视为不存在', () => {
++  it('entry 字段不触发 accessor:带 getter 的槎条目视为不存在', () => {
+     let touched = 0
+     const withGetter = {}
+     Object.defineProperty(withGetter, 'hash', {
+@@ -125,22 +161,27 @@ describe('depositStore — 原型污染硬门(§六-8 对抗输入;共享 src/li
+   })
+ })
+ 
+-describe('depositStore — 端到端提交(真实 main.js 槽 + 指针)', () => {
++describe('depositStore — 端到端提交(真实 main.js 不可变命名协议)', () => {
+   beforeEach(() => {
+     createDepositHarness()
+   })
+ 
+-  it('首次 load 拿到空状态;record 后经槽提交并可读回', async () => {
++  it('首次 load 拿到空状态;record 后经提交并可读回,条目盖上真实 gen/writer', async () => {
+     const initial = await loadDepositStore()
+     expect(initial.generation).toBe(0)
+ 
+     const result = await recordDeposit('mivo-asset:1', draft(FAKE_HASH, 111, 'deposit'))
+     expect(result).toMatchObject({ ok: true, generation: 1, attempts: 1 })
+-    await expect(lookupDeposit('mivo-asset:1')).resolves.toMatchObject({ hash: FAKE_HASH })
++
++    const entry = await lookupDeposit('mivo-asset:1')
++    expect(entry).toMatchObject({ hash: FAKE_HASH, from: 'deposit' })
++    // 业务代码不手填 gen/writer:提交成功后应盖上真实值,不再是占位符。
++    expect(entry?.gen).not.toBe(DEPOSIT_PENDING_GEN)
++    expect(entry?.writer).not.toBe(DEPOSIT_PENDING_WRITER)
++    expect(entry?.gen).toBe(1)
+ 
+     // 换一个「新会话」重读同一磁盘:状态确实落了盘
+-    const harness = createDepositHarness()
+-    void harness
++    createDepositHarness()
+     expect(peekDepositStoreForTests()).toBeNull()
+   })
+ 
+@@ -172,6 +213,134 @@ describe('depositStore — 端到端提交(真实 main.js 槽 + 指针)', () =>
+     expect(Object.keys(peekDepositStoreForTests()?.map ?? {})).toHaveLength(6)
+   })
+ 
++  it('第一批提交在途(await transport 未返回)时到达的新 mutation 不被首批成功后的 dirty 清空连带抹掉(finding 2)', async () => {
++    // SC11.9 锚定(2026-08-01):本条同时是 `commitNow` 循环顶部(`unionDirty` →
++    // `stampDirtyEntries`)在**无冲突路径**上的唯一覆盖——两次提交全程都直接成功,
++    // `applyLocalOverlay`(冲突重放路径的另一套盖戳机制)从未执行,`second` 的
++    // 占位符 gen/writer 只能靠这里的盖戳变真戳。短路循环顶部的 `unionDirty`/
++    // `stampDirtyEntries` 会使本条变红(已实测);冲突重放路径的对应覆盖见下方
++    // 「提交在途...不能以占位符 gen/writer 落盘」一条,两者路径不重叠,不可互相替代。
++    await loadDepositStore()
++
++    // 用可控 transport 卡住第一次 deposit-state-save 的回执,直到测试放行——这样能
++    // 精确命中"首批已摘取 dirty 快照、正在 await transport"这个窗口再注入第二个
++    // mutation:第二个 mutation 的 dirty 标记必须落进*下一批*的快照,不能被第一批
++    // 提交成功后的清空动作(旧实现是无条件 `dirty = emptyDirty()`)连带抹掉。
++    let releaseFirstSave: (() => void) | undefined
++    const firstSaveGate = new Promise<void>((resolve) => {
++      releaseFirstSave = resolve
++    })
++    let firstSaveStarted: (() => void) | undefined
++    const firstSaveStartedGate = new Promise<void>((resolve) => {
++      firstSaveStarted = resolve
++    })
++    let saveCount = 0
++    setDepositTransport((async (kind: string) => {
++      if (kind === 'deposit-state-load') {
++        return { reqId: 'l', reply: true, ok: true, state: null, generation: 0 } as PersistReply
++      }
++      saveCount += 1
++      if (saveCount === 1) {
++        firstSaveStarted?.()
++        await firstSaveGate
++        return { reqId: 's1', reply: true, ok: true, generation: 1 } as PersistReply
++      }
++      return { reqId: `s${saveCount}`, reply: true, ok: true, generation: saveCount } as PersistReply
++    }) as never)
++
++    const firstCommit = recordDeposit('mivo-asset:first', draft('h1', 1, 'deposit'))
++    await firstSaveStartedGate // 首批已摘取 dirty 快照并进入 transport 等待
++
++    const secondCommit = recordDeposit('mivo-asset:second', draft('h2', 2, 'deposit'))
++    releaseFirstSave?.()
++
++    const [firstResult, secondResult] = await Promise.all([firstCommit, secondCommit])
++    expect(firstResult.ok).toBe(true)
++    expect(secondResult.ok).toBe(true)
++
++    const map = peekDepositStoreForTests()?.map ?? {}
++    // 两条都必须盖上真实 gen/writer,不是占位符——旧实现的症状是第二条落盘时
++    // gen=-1、writer=''(dirty 被首批的成功回调提前清空,stampDirtyEntries 对它是空操作)。
++    expect(map['mivo-asset:first']?.gen).not.toBe(DEPOSIT_PENDING_GEN)
++    expect(map['mivo-asset:second']?.gen).not.toBe(DEPOSIT_PENDING_GEN)
++    expect(map['mivo-asset:second']?.writer).not.toBe(DEPOSIT_PENDING_WRITER)
++  })
++
++  it('CAS 冲突重放期间到达的新 mutation 不因 memory 整体替换而消失(B2 回归)', async () => {
++    // judge 反例时序:首批 save 卡住 → 注入第二个 mutation → 外部写者直接推进磁盘
++    // → 首批的 transport 调用放行后撞上 CAS 冲突、重放 → 两次 Promise 都 ok:true,
++    // 但第二个 mutation 的值曾经会消失(旧实现的 applyLocalOverlay 只认首批快照,
++    // 把当时已经真实改了 memory、但还没被摘取成自己批次的第二个 mutation 一起丢弃;
++    // 第二批稍后自己的 commitNow 因为找不到条目而对它是空操作)。
++    const harness = createDepositHarness()
++    await loadDepositStore()
++
++    let releaseFirstSave: (() => void) | undefined
++    const firstSaveGate = new Promise<void>((resolve) => {
++      releaseFirstSave = resolve
++    })
++    let firstSaveStarted: (() => void) | undefined
++    const firstSaveStartedGate = new Promise<void>((resolve) => {
++      firstSaveStarted = resolve
++    })
++    let saveCount = 0
++    // 传输层原样转发到*同一个* harness.brain 的真实 handler(不是手写假回执)——
++    // 这样"外部写者直接推进磁盘"这一步才会被首批的转发调用真实看到,CAS 冲突是
++    // main.js 自己判出来的,不是测试手工构造的。
++    setDepositTransport((async (kind: string, payload?: Record<string, unknown>) => {
++      if (kind === 'deposit-state-load') {
++        return { reqId: 'l', reply: true, ...(await harness.brain.handles.deposit.stateLoad()) } as PersistReply
++      }
++      saveCount += 1
++      const thisCall = saveCount
++      if (thisCall === 1) {
++        firstSaveStarted?.()
++        await firstSaveGate
++      }
++      const raw = await harness.brain.handles.deposit.stateSave(payload as { baseGeneration: number; writer: string; state: string })
++      return { reqId: `s${thisCall}`, reply: true, ...raw } as PersistReply
++    }) as never)
++
++    const firstCommit = recordDeposit('mivo-asset:first', draft('h1', 1, 'deposit'))
++    await firstSaveStartedGate // 首批已把请求发进(卡住的)transport,payload 已序列化完毕
++
++    // 第二个 mutation 在首批仍卡在 transport 里时到达。
++    const secondCommit = recordDeposit('mivo-asset:second', draft('h2', 2, 'deposit'))
++    // 让 mutateAndCommit 里的 `await loadDepositStore()` 走完并同步跑完 mutator——
++    // 确保"第二个 mutation 已经落进活的全局 dirty"这一步,在下面的外部写者/放行
++    // 动作之前**确定性地**发生,不依赖两条独立 await 链谁先被微任务队列排到。
++    await Promise.resolve()
++    await Promise.resolve()
++
++    // 外部写者(另一个电子脑实例)直接对同一份磁盘提交,推进 generation——首批放行
++    // 后会用一个已经过期的 baseGeneration 去撞,真实触发 CAS 冲突。F1:这次直调
++    // 也需要匹配的 baseSum——此刻磁盘仍是最初 `loadDepositStore()` 看到的真空状态
++    // (首批/第二批提交都还卡在 transport 里,没有真的落盘),`peekDepositRevisionSumForTests()`
++    // 此刻记的正是那次 load 拿到的哨兵值。
++    const external = await harness.brain.handles.deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: peekDepositRevisionSumForTests(),
++      writer: 'ffffffff',
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:external': { hash: 'ext', ext: '.png', depositedAt: 1, from: 'deposit', gen: 1, writer: 'ffffffff' } },
++      }),
++    })
++    expect(external.ok).toBe(true)
++
++    releaseFirstSave?.()
++
++    const [firstResult, secondResult] = await Promise.all([firstCommit, secondCommit])
++    expect(firstResult.ok).toBe(true)
++    expect(firstResult.attempts).toBeGreaterThan(1) // 确认真的撞过冲突、走了重放
++    expect(secondResult.ok).toBe(true)
++
++    const map = peekDepositStoreForTests()?.map ?? {}
++    expect(map['mivo-asset:first']).toBeTruthy()
++    expect(map['mivo-asset:second']).toBeTruthy() // judge 反例:这条此前会消失
++    expect(map['mivo-asset:external']).toBeTruthy()
++  })
++
+   it('迁移标记与寄存映射并发:两者结果都在(同属一份状态)', async () => {
+     await loadDepositStore()
+ 
+@@ -186,10 +355,34 @@ describe('depositStore — 端到端提交(真实 main.js 槽 + 指针)', () =>
+     expect(current?.map['mivo-asset:legacy']).toMatchObject({ from: 'ledger' })
+   })
+ 
+-  it('自愈:invalidate 删掉失效映射,下次查不到', async () => {
++  it('能力负缓存标记:写入后可读回', async () => {
++    await recordCapabilityMark({ supported: false, at: 42, reason: 'unknown kind' })
++    expect(peekDepositStoreForTests()?.capability).toMatchObject({ supported: false, at: 42 })
++  })
++
++  it('自愈:invalidate 删掉失效映射,下次查不到;from:deposit 的条目留下墓碑', async () => {
+     await recordDeposit('mivo-asset:1', draft(FAKE_HASH, 1, 'deposit'))
+     await invalidateDeposit('mivo-asset:1')
++
+     await expect(lookupDeposit('mivo-asset:1')).resolves.toBeUndefined()
++    expect(peekDepositStoreForTests()?.releasedTombstones['mivo-asset:1']).toMatchObject({ hash: FAKE_HASH })
++  })
++
++  it('自愈:invalidate 一个 from:artifact 的条目不留墓碑(它不是本插件的寄存物)', async () => {
++    await recordDeposit('mivo-asset:2', draft('art-hash', 1, 'artifact'))
++    await invalidateDeposit('mivo-asset:2')
++
++    await expect(lookupDeposit('mivo-asset:2')).resolves.toBeUndefined()
++    expect(peekDepositStoreForTests()?.releasedTombstones['mivo-asset:2']).toBeUndefined()
++  })
++
++  it('重新寄存会取消同一会话里尚未提交的墓碑意图', async () => {
++    await recordDeposit('mivo-asset:3', draft('h1', 1, 'deposit'))
++    await invalidateDeposit('mivo-asset:3')
++    await recordDeposit('mivo-asset:3', draft('h2', 2, 'deposit'))
++
++    expect(peekDepositStoreForTests()?.releasedTombstones['mivo-asset:3']).toBeUndefined()
++    expect(peekDepositStoreForTests()?.map['mivo-asset:3']).toMatchObject({ hash: 'h2' })
+   })
+ 
+   it('LRU:超上限按 depositedAt 从旧到新淘汰', async () => {

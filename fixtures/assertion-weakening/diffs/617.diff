@@ -1,0 +1,155 @@
+diff --git a/ghost.json b/ghost.json
+index 4761ef4e..afc6ee5f 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.30",
++  "version": "0.9.31",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/src/__tests__/pluginCanvasSettings.test.tsx b/src/__tests__/pluginCanvasSettings.test.tsx
+index 9312a3b3..4166e17a 100644
+--- a/src/__tests__/pluginCanvasSettings.test.tsx
++++ b/src/__tests__/pluginCanvasSettings.test.tsx
+@@ -92,7 +92,7 @@ describe('PluginApp canvas settings entry', () => {
+     expect(document.activeElement).toBe(gear)
+ 
+     click(gear)
+-    click(document.querySelector('.canvas-settings-panel .settings-panel-header button')!)
++    click(document.querySelector('.canvas-settings-panel .canvas-settings-close')!)
+     expect(document.querySelector('.canvas-settings-backdrop')).toBeNull()
+     expect(document.activeElement).toBe(gear)
+   })
+diff --git a/src/cindy-theme.css b/src/cindy-theme.css
+index 6b32c332..09639652 100644
+--- a/src/cindy-theme.css
++++ b/src/cindy-theme.css
+@@ -37,6 +37,61 @@
+   --canvas: color-mix(in srgb, var(--surface, #ebe4d7) 88%, #000000 12%);
+ }
+ 
++/* ── 皮肤颜色:强制亮/暗档(设置 → 外观 → 皮肤颜色)─────────────────────────
++   要点:这里覆写的是**宿主 token 本身**,不是上面那层 mivo 侧的 --ink/--panel。
++   原因是本文件里还有几十条规则直接掺 var(--text-primary) / var(--surface) /
++   var(--accent-cta-bg) 做 color-mix(工具坞、右键菜单、区域编辑面板…);只改 mivo
++   token 会让那些规则继续用宿主当前皮肤的值,拼出"半亮半暗"。改宿主 token 则上面
++   的映射与全部派生规则一起跟着走,「亮色」拿到的就是 Cindy 亮色皮肤那一套颜色,
++   而不是另发明一套(这正是 owner 2026-08-09 反馈的「亮色颜色变了」)。
++
++   值 = **CINDY Light / CINDY Dark** 这对皮肤的 colors 表原值(Mivo 只认这一套),
++   机器可读镜像在 docs/design-previews/region-edit/fixtures/cindy-default-skin-palettes.json,
++   canvasSkinPalette.test.ts 断言两边逐 token 一致,宿主换值时先红。
++   ⚠️ 不要拿同目录 cindy-theme-tokens.json 的值填这里:那份是 token 的**基础注册值**
++   (#f8f8f6 / #1f1f1e …),与 cindy-light / cindy-dark 的取值不同。2026-08-09 首版
++   正是填错了那份,owner 实测「暗色比跟随档浅一档、亮色整个变暖」
++   ——CINDY Dark 的 surface 是 #2a2828 而非 #1f1f1e。
++
++   color-scheme 跟着一起写:手册说别写死它,但这里整套调色板都被我们接管了,
++   若把它留在宿主档,原生控件(滚动条/select)会落到与面板相反的明暗档 ——
++   属于手册所说「真要覆盖就跟着主机主题一起换」的那种情形。
++
++   特异度:宿主是用 <style> 里的 `:root{…}`(0-0-1)注入这批变量的,
++   属性选择器 0-1-1 稳压,不需要 !important。
++   跟随档不落属性 → 整块不命中 → 回落上面的宿主映射。
++
++   覆写范围 = 本仓 var() 实际读到的宿主 token + --panel-bg。少一个就会在强制档下
++   泄漏宿主当前皮肤、拼出"半亮半暗",所以 canvasSkinPalette.test.ts 有一条守卫
++   扫全仓 var(--<宿主 token>) 用量,新用了没加进这两块就判红。
++   --panel-bg 是唯一的例外项:本仓没人 var() 它,但**宿主注入的**
++   `body{background:var(--panel-bg,var(--surface))}` 会读,漏掉它面板底就还是宿主色。 */
++:root[data-mivo-canvas-skin='light'] {
++  color-scheme: light;
++  --panel-bg: #ededed;
++  --surface: #ededed;
++  --surface-elevated: #f8f8f8;
++  --border-default: #dcdfe3;
++  --text-primary: #3c3f43;
++  --text-secondary: #8c8e94;
++  --text-tertiary: #686b72;
++  --accent-cta-bg: #3c3f43;
++  --accent-pure-cta-fg: #fcfcfc;
++}
++
++:root[data-mivo-canvas-skin='dark'] {
++  color-scheme: dark;
++  --panel-bg: #2a2828;
++  --surface: #2a2828;
++  --surface-elevated: #312f2f;
++  --border-default: #434343;
++  --text-primary: #d4d4d4;
++  --text-secondary: #6f6f6f;
++  --text-tertiary: #bfc1c4;
++  --accent-cta-bg: #eeeeee;
++  --accent-pure-cta-fg: #252222;
++}
++
+ /* Cindy only supplies theme colors; pattern geometry stays owned by MivoCanvas.
+    这里掺 --text-primary 是对的,不要跟着上面 --canvas 一起改成掺黑:网格要"与底色
+    反相"才可见,而 text-primary 恰好总与 surface 反相(Light 深墨 / Dark 亮色),
+@@ -73,54 +128,14 @@
+   transform: scale(0.96);
+ }
+ 
+-.canvas-settings-panel {
+-  width: min(420px, calc(100vw - 32px));
+-  max-height: min(480px, calc(100vh - 32px));
+-  color: var(--text-secondary, #756f67);
+-  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 96%, var(--text-primary, #232323) 4%);
+-  border-color: color-mix(in srgb, var(--text-primary, #232323) 14%, var(--border-default, #d6d0c6));
+-  box-shadow: 0 24px 64px color-mix(in srgb, var(--text-primary, #232323) 24%, transparent);
+-}
+-
+-.canvas-settings-panel .settings-panel-header {
+-  border-color: color-mix(in srgb, var(--text-primary, #232323) 10%, var(--border-default, #d6d0c6));
+-}
+-
+-.canvas-settings-panel .settings-panel-header strong,
+-.canvas-settings-panel .canvas-appearance-option-label {
+-  color: var(--text-primary, #232323);
+-}
+-
+-.canvas-settings-panel .settings-panel-header button {
+-  color: var(--text-secondary, #756f67);
+-}
+-
+-.canvas-settings-panel .settings-panel-header button:hover {
+-  background: color-mix(in srgb, var(--text-primary, #232323) 8%, transparent);
+-}
+-
+-.canvas-settings-panel .canvas-appearance-option {
+-  color: var(--text-secondary, #756f67);
+-  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 88%, var(--text-primary, #232323) 12%);
+-  border-color: color-mix(in srgb, var(--text-primary, #232323) 14%, var(--border-default, #d6d0c6));
+-}
+-
+-.canvas-settings-panel .canvas-appearance-option:hover {
+-  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 80%, var(--text-primary, #232323) 20%);
+-}
+-
+-.canvas-settings-panel .canvas-appearance-option.selected {
+-  color: var(--text-primary, #232323);
+-  border-color: var(--accent-cta-bg, #27302c);
+-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-cta-bg, #27302c) 18%, transparent);
+-}
+-
+-.canvas-settings-panel .canvas-pattern-preview {
+-  border-color: color-mix(in srgb, var(--text-primary, #232323) 12%, var(--border-default, #d6d0c6));
+-  background-color: var(--canvas);
+-  --mivo-canvas-pattern-preview-line-color: color-mix(in srgb, var(--text-primary, #27302c) 14%, transparent);
+-  --mivo-canvas-pattern-preview-dot-color: color-mix(in srgb, var(--text-primary, #27302c) 25%, transparent);
+-}
++/* 画布设置浮层**刻意没有插件专属规则**:壳体、导航、行标签、分段控件在 App.css
++   里已经全部走 --panel-2 / --panel / --ink,而本文件顶部已把这三者映射到宿主
++   token,换肤自动跟随。曾经有过一份逐条复写,拆掉的两个理由记下来防再犯:
++   ① 壳底掺 4% 文字色会让它比"抬升面"更沉,于是左侧导航(--panel = --surface,
++      亮色下反而更亮)与内容区在 Light 下几乎同色,分栏消失;
++   ② 阴影用 color-mix(--text-primary …) 推导,在 Dark 下文字色是亮的 → 浮层
++      四周变成一圈白色光晕(2026-08-09 实拍)。阴影属于"光"不属于"皮肤",
++      沿用 App.css 的固定深色即可。 */
+ 
+ /* 原 ::before 是米色高光晕染(写死的暖白/苔绿),主题化后改为中性表面提亮 */
+ .canvas-shell::before {

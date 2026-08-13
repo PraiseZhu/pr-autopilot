@@ -1,0 +1,621 @@
+diff --git a/docs/loops/bug-doctor-cutover-runbook.md b/docs/loops/bug-doctor-cutover-runbook.md
+index 83fb8c86..343d506f 100644
+--- a/docs/loops/bug-doctor-cutover-runbook.md
++++ b/docs/loops/bug-doctor-cutover-runbook.md
+@@ -98,6 +98,7 @@ review-pr 的跟进闭环(审出问题 → 自动开跟进会话修)依赖 mini
+ 
+ - [ ] 02:30 主轮战报:只出现 `pr-created`/`review-pending` 类状态字,无任何「已合并」自述
+ - [ ] 巡审侧(每小时):loop PR 进入正常审查(logs 无 `skip-loop-managed`)
++- [ ] patrol 日志出现 `[mivo:reconcile]` 行(对账器已接线);超 10 个未收敛 PR 时应见「环绕轮转」字样
+ - [ ] 若台账有遗留 tCap=T1:logs.md 出现「缴械迁移: tCap T1→T2 共 N 簇」一行
+ 
+ ## 回滚
+diff --git a/docs/loops/bug-doctor.md b/docs/loops/bug-doctor.md
+index 26e0d60d..66e58339 100644
+--- a/docs/loops/bug-doctor.md
++++ b/docs/loops/bug-doctor.md
+@@ -78,7 +78,9 @@ T1 原语义「自动修 + 自动合并」已废止,**bug-doctor 侧自动合并
+ 4. **验证**:worker 自跑 build/lint/test:unit/verify:logging/test:shell + 复现测试转绿;e2e worker 跑本地双进程 smoke(local persist 模式;server 模式受 PG 限制,如实标注)。
+ 5. **审查**:review worker 独立审 diff;任何 finding → 取消 T1 资格降 T2。
+ 6. **交付**:开 PR(证据齐全,**body 必须含独立一行 `T-level: T2`**——review-pr 按它与台账双重认定托管档,漏写时台账 tCap 兜底,两者都读不出也会按 pr-rules 的 defaultWhenAmbiguous=t2 进审,不会挂死);Slack 通知;**到此为止,不做任何合并动作**——审查与合并由 review-pr 巡审承担,审出问题会经 fix-handoff 派回跟进会话修复。
+-7. **收尾**:无论成败 `worktree remove --force`;更新 State(游标/台账/PR)、Logs 追加一行(含成本;PR 相关状态字统一用:`pr-created` / `review-pending` / `fix-handoff` / `merged-by-review-pr` / `closed-unmerged`,不再出现「已自动合并」——合并由 review-pr 巡审执行,战报只转述台账已知状态);战报经 `scripts/loops/bug-doctor/broadcast.mjs`(notify.mjs webhook,Mivo 机器人身份)发 `#mivo-canvas`(静默日一行摘要),不再走会话层已连接的 Slack 通道。
++6.5 **合并后对账**(替代旧「T1 自动合并后兜底」——那个触发时点已随 T1 合并档消失):patrol 每小时在 gate 成功后串行跑 `reconcile-merged.mjs`,把已被 review-pr 合并的 loop PR 幂等写回台账(fixed/mergeSha/mergedBy=review-pr;CLOSED 未合并 → closed-unmerged),并对新 mergeOID 做本地 main `npm run preflight` 核验——结果绑定到**包含该 OID 的树**:本地 checkout 尚未 pull 到该合并、工作树脏、核验期间 HEAD 变化、或本轮 preflight 配额已用尽(`MAX_PREFLIGHT_PER_RUN`)时,一律按 `pending-tree` 挂账逐轮重试(**仅「本地 checkout 未含该 OID」这一类在滞留超 24h 时发一次性 T0 提示 pull 链路停摆;树脏/配额用尽/期间 HEAD 变这三类静默挂账、不告警**),树跟上后核验落终态(green/red),终态按 RESULT_RANK 单调、已落盘的强结论不被弱结论覆盖(red 为吸收态);红 → 写 revert-required + Slack T0 告警(revert PR 人工开、仍走 review-pr 审合,本环节不代开)——防两个绿 PR 语义冲突。
++SLA:patrol 每小时提供入口,**对账与核验都按 backlog 逐轮消化,均不承诺固定时限**(撞锁/gate 占用/gh 失败都会延后)。**无饥饿的机制两侧不同**:对账每轮最多查 `MAX_PR_QUERIES_PER_RUN` 个 PR,并用**持久游标环绕轮转**(游标记本轮查过的最大 PR 号,存 `reconcile-state.json` 的 `queryCursorPr`)——因为未收敛 PR 只要保持 OPEN 就不会离开待查集,固定取前缀会让后缀永久饥饿(已合并 PR 永不被对账、红 main 永不被发现);核验侧不需要游标,跑过的项落 green/red 即离开 `pending-tree` 队列,而 HEAD 未含的项根本不消耗配额。
++7. **收尾**:无论成败 `worktree remove --force`;更新 State(游标/台账/PR)、Logs 追加一行(含成本;PR 相关状态字统一用:`pr-created` / `review-pending` / `fix-handoff` / `merged-by-review-pr` / `closed-unmerged`,不再出现「已自动合并」——合并由 review-pr 巡审执行、合并事实由 reconcile-merged.mjs 对账写回,战报只转述台账);战报经 `scripts/loops/bug-doctor/broadcast.mjs`(notify.mjs webhook,Mivo 机器人身份)发 `#mivo-canvas`(静默日一行摘要),不再走会话层已连接的 Slack 通道。
+ 
+ **并发与防失控**(借鉴 cindy review-pr 实测机制):
+ - **文件重叠守卫**:分诊派工前求各簇疑似文件集交集,重叠簇不并行(串行或只派一个),防 3 个修复 worker 互踩;
+diff --git a/scripts/loops/bug-doctor/patrol.mjs b/scripts/loops/bug-doctor/patrol.mjs
+index 7727de5f..35b32f16 100644
+--- a/scripts/loops/bug-doctor/patrol.mjs
++++ b/scripts/loops/bug-doctor/patrol.mjs
+@@ -168,6 +168,16 @@ const main = async () => {
+     return
+   }
+ 
++  // ---- loop PR 合并后对账(缴械配套,owner 2026-08-04):gate 成功且未撞锁后串行跑。
++  // best-effort——对账失败只记日志,不影响巡逻主职责(S0 告警);本 hourly 轮只提供对账入口、不保证固定时限(单轮 PR 查询上限 MAX_PR_QUERIES_PER_RUN,超额簇下轮继续)。
++  {
++    const rec = spawnSync(process.execPath, [join(__dirname, 'reconcile-merged.mjs'), '--state-dir', stateDir], {
++      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
++    })
++    if (rec.status !== 0) log(`reconcile-merged 非零退出(${rec.status}): ${(rec.stderr || '').slice(-200)}`)
++    else if (rec.stderr) process.stderr.write(rec.stderr)
++  }
++
+   // 当前 S0 告警项(summary.s0 为本轮权威计数;为 0 时不读工作包,直接清空标记)
+   let currentAlerts = []
+   let clustersByFp = {}
+diff --git a/scripts/loops/bug-doctor/reconcile-merged.mjs b/scripts/loops/bug-doctor/reconcile-merged.mjs
+new file mode 100644
+index 00000000..b5934973
+--- /dev/null
++++ b/scripts/loops/bug-doctor/reconcile-merged.mjs
+@@ -0,0 +1,306 @@
++#!/usr/bin/env node
++// reconcile-merged.mjs — loop PR 合并后对账器(缴械配套,owner 2026-08-04 决策;三审 R1-R9 修订)。
++// bug-doctor 不再自动合并(mergeAuthority=review-pr-only),loop PR 由 review-pr 巡审合并;本脚本
++// 接替旧「6.5 T1 合并后兜底」,做与合并主体无关的确定性对账。职责(全部幂等):
++//   1. 带 pr 号且未收敛的簇查 gh 终态:MERGED→fixed(记 mergeSha/mergedBy='review-pr',合并主体
++//      语义非 GitHub actor);CLOSED→closed-unmerged(可重开);OPEN→不动。
++//   2. 新 mergeOID 在「本地干净树已含该 OID」时核验 main 健康并落终态(green/red);HEAD 未含/树脏/期间 HEAD 变/
++//      配额用尽(MAX_PREFLIGHT_PER_RUN)→ pending-tree 挂账重试,**仅「HEAD 未含」这类滞留超 24h 才发一次性 T0**(另三类静默挂账不告警);红 → revert-required + T0。
++//      终态按 RESULT_RANK 单调:已落盘的强结论不被弱结论覆盖(red 为吸收态)。
++//   3. 并发:持 gate 同一把 gate.lock(占用即让路);锁内只做同步事务(运行时强制;实测量级毫秒,同步 IO 无硬上界),慢工全在锁外 → 常态下活锁不被当陈锁收尸(极端:同步 IO 长时停顿致持锁超 TTL 仍可被接管,见 PR 残余登记)。
++//   4. SLA:patrol 每小时调用(gate 成功后串行,best-effort);对账与核验都按 backlog 逐轮消化(每轮上限
++//      分别为 MAX_PR_QUERIES_PER_RUN / MAX_PREFLIGHT_PER_RUN),**均不承诺固定时限**(撞锁/gate 占用/gh
++//      失败都会延后)。无饥饿的机制两侧不同:对账侧靠持久游标环绕轮转(未收敛 PR 保持 OPEN 时不会离开
++//      待查集,故必须有游标);核验侧不需要游标——跑过的项 preflight 落 green/red 即离开 pending-tree
++//      队列,而 HEAD 未含的项根本不消耗配额。**改动 queue 的 filter 前请先想清这条**。
++// 退出码:0=完成/无事可做/锁占用跳过;1=对账出错(gh 全挂/锁被接管/sidecar 损坏);2=参数错误
++
++import { spawnSync } from 'node:child_process'
++import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
++import { join, resolve, dirname } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import { loadNotifyConfig, sendAlert, appendPendingAlert } from './notify.mjs'
++import { loadState, saveState, acquireLock, releaseLock, STATE_FILE } from './state.mjs'
++import { FINGERPRINT_VERSION } from './fingerprint.mjs'
++
++const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
++const REPO_ROOT = resolve(SCRIPT_DIR, '..', '..', '..')
++export const RECONCILE_STATE_FILE = 'reconcile-state.json' // 与 state.json 解耦(SC-BD1-R2-N01:对账器记账不能危及主台账)
++// TTL 取权威源 rules.json loop.lockTtlMinutes(gate/intake 同一值):本地写死会在权威值调小后让 gate 提前收尸本进程活锁
++const lockTtlMinutes = () => {
++  try {
++    const t = JSON.parse(readFileSync(join(SCRIPT_DIR, 'rules.json'), 'utf8'))?.loop?.lockTtlMinutes
++    return Number.isFinite(t) && t > 0 ? t : 60
++  } catch { return 60 }
++}
++// 结果单调性:red 是吸收态,已落盘结论不得被并发旧队列的弱结论降级(R10 CX-R1-016:并发时 green 会抹掉 red)
++const RESULT_RANK = { 'pending-tree': 0, skipped: 1, green: 2, red: 3 }
++const PENDING_TREE_ALERT_HOURS = 24 // 滞留超此未核验 → 一次性 T0(监控 git pull 停摆)
++// 慢工的挂死上限(与锁无关——慢工全在锁外,见 withLock):只兜单轮墙钟与 API 用量
++export const GH_TIMEOUT_MS = 60_000
++export const MAX_PR_QUERIES_PER_RUN = 10
++export const MAX_PREFLIGHT_PER_RUN = 2
++export const PREFLIGHT_TIMEOUT_MS = 1_800_000
++
++const log = (msg) => process.stderr.write(`[mivo:reconcile] ${msg}\n`)
++
++const parseArgs = (argv) => {
++  const args = {}
++  for (let i = 0; i < argv.length; i += 1) {
++    const a = argv[i]
++    if (a === '--state-dir') args['state-dir'] = argv[++i]
++    else if (a === '--input-prs') args['input-prs'] = argv[++i]
++    else if (a === '--no-gh') args['no-gh'] = true
++    else if (a === '--no-preflight') args['no-preflight'] = true
++    else if (a === '--json-out') args['json-out'] = true
++    else {
++      process.stderr.write(`未知参数: ${a}\n`)
++      process.exit(2)
++    }
++  }
++  return args
++}
++
++// 临界区闸:回调必须同步(运行时强制)。R6-R8 三轮枚举「持锁上界=子阶段之和」每轮都漏项
++// (preflight→gh→pending queue/告警),根因是持锁时干慢活;改为慢工全在锁外,不再算上界。
++export const withLock = (stateDir, fn) => {
++  const lock = acquireLock(stateDir, { ttlMinutes: lockTtlMinutes(), owner: 'reconcile' })
++  if (!lock.acquired) return { acquired: false, holder: lock.holder }
++  try {
++    const value = fn()
++    // 惯例不够,运行时强制(R9 席① F16):返回 thenable 说明锁内有异步慢工,直接炸
++    if (value && typeof value.then === 'function') throw new Error('withLock 回调必须同步:锁内禁止 await 慢工')
++    return { acquired: true, value }
++  } finally {
++    const release = releaseLock(stateDir, { token: lock.token })
++    if (!release.ok) log(`releaseLock 失败(${release.reason}),锁将由 TTL 自愈`)
++  }
++}
++
++// 仅 tracked:脏树验证的不是 HEAD 内容,不得绑定 OID(CX-R1-001)
++const treeDirty = () => (spawnSync('git', ['status', '--porcelain', '-uno'], { encoding: 'utf8', cwd: REPO_ROOT }).stdout || '').trim() !== ''
++
++export const loadReconcileState = (stateDir) => {
++  const p = join(stateDir, RECONCILE_STATE_FILE)
++  if (!existsSync(p)) return { schemaVersion: 1, verifiedMergeOids: {}, queryCursorPr: 0 }
++  try {
++    const parsed = JSON.parse(readFileSync(p, 'utf8'))
++    if (parsed.schemaVersion !== 1) throw new Error(`reconcile-state schemaVersion=${parsed.schemaVersion} 不识别`)
++    // queryCursorPr 必须显式带出:本函数只返回白名单字段,漏列即每轮读回 0、游标形同不存在
++    return { schemaVersion: 1, verifiedMergeOids: parsed.verifiedMergeOids || {}, queryCursorPr: Number.isInteger(parsed.queryCursorPr) ? parsed.queryCursorPr : 0 }
++  } catch (err) {
++    // fail-visible:不静默重建(会丢 revert-required 未决记录),抛给调用方
++    throw new Error(`reconcile-state.json 损坏: ${err.message}`)
++  }
++}
++
++const saveReconcileState = (stateDir, st) => {
++  const p = join(stateDir, RECONCILE_STATE_FILE)
++  const tmp = `${p}.tmp-${process.pid}`
++  writeFileSync(tmp, `${JSON.stringify(st, null, 2)}\n`)
++  renameSync(tmp, p)
++}
++
++/** 纯函数:pending-tree 记录滞留超阈值返回滞留毫秒数,否则 null(可单测)。 */
++export const stalePendingAgeMs = (rec, nowMs, thresholdHours = PENDING_TREE_ALERT_HOURS) => {
++  if (!rec || rec.preflight !== 'pending-tree') return null
++  const t = Date.parse(rec.at)
++  if (!Number.isFinite(t)) return null
++  const age = nowMs - t
++  return age > thresholdHours * 3_600_000 ? age : null
++}
++
++/** 纯函数:给定簇集合与 PR 终态查询结果,算出台账变更集(不落盘,可单测)。 */
++export const planReconciliation = (clusters, prStates) => {
++  const changes = []
++  for (const [fp, c] of Object.entries(clusters ?? {})) {
++    const pr = Number(c.pr)
++    if (!pr || Number.isNaN(pr)) continue
++    if (c.status === 'fixed' || c.status === 'closed-unmerged') continue
++    const ps = prStates[pr]
++    if (!ps) continue // 查不到 = 本轮不动(gh 失败按失败计,不当 closed 处理)
++    if (ps.state === 'MERGED' && ps.mergeSha) {
++      changes.push({ fp, pr, to: 'fixed', mergeSha: ps.mergeSha, mergedAt: ps.mergedAt || null })
++    } else if (ps.state === 'CLOSED') {
++      changes.push({ fp, pr, to: 'closed-unmerged' })
++    }
++  }
++  return changes
++}
++
++const ghPrState = (pr) => {
++  const run = spawnSync('gh', ['pr', 'view', String(pr), '--json', 'state,mergeCommit,mergedAt'], {
++    encoding: 'utf8', cwd: REPO_ROOT, timeout: GH_TIMEOUT_MS,
++  })
++  if (run.status !== 0) return null
++  try {
++    const d = JSON.parse(run.stdout)
++    return { state: d.state, mergeSha: d.mergeCommit?.oid || null, mergedAt: d.mergedAt || null }
++  } catch { return null }
++}
++
++// OID 绑定:HEAD 是否已含该 mergeSha(exit 0=含;1=不含;128=本地无此对象,同按"树未跟上"等 pull)
++const headContainsOid = (oid) => {
++  const run = spawnSync('git', ['merge-base', '--is-ancestor', oid, 'HEAD'], { cwd: REPO_ROOT })
++  return run.status === 0
++}
++
++const runPreflight = () => {
++  const run = spawnSync('npm', ['run', 'preflight'], { encoding: 'utf8', cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'], timeout: PREFLIGHT_TIMEOUT_MS })
++  return { ok: run.status === 0, exit: run.status }
++}
++
++/** 锁外核验:树检查 + preflight + 告警;每项结果用一次短锁写回 sidecar。deps 可注入以便单测。 */
++export const verifyPending = async ({ stateDir, queue, skipPreflight = false, maxPreflight = MAX_PREFLIGHT_PER_RUN, deps = {} }) => {
++  const d = {
++    headContains: headContainsOid, treeDirty, preflight: runPreflight, notify: sendAlert,
++    headSha: () => spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8', cwd: REPO_ROOT }).stdout?.trim() || null,
++    ...deps,
++  }
++  const verified = []
++  let runs = 0
++  for (const item of queue) {
++    const rec = { pr: item.pr, preflight: 'pending-tree', lastCheckedAt: new Date().toISOString() }
++    let alert = null
++    if (skipPreflight) rec.preflight = 'skipped'
++    else if (!d.headContains(item.mergeSha)) {
++      if (stalePendingAgeMs(item.prev, Date.now()) !== null && !item.prev?.pendingAlertedAt) {
++        rec.pendingAlertedAt = new Date().toISOString()
++        alert = {
++          title: '⏳ [mivo] mergeOID 健康核验滞留超24h(本地树未跟上)',
++          text: `PR #${item.pr} 的 mergeOID ${item.mergeSha.slice(0, 8)} 挂账 pending-tree 已超 ${PENDING_TREE_ALERT_HOURS}h——本地 checkout 一直未包含该合并,git pull 链路可能停摆。核验在树跟上前不会发生,请人工检查 mini 的 pull(凭证/磁盘/调度)。台账:${stateDir}/${RECONCILE_STATE_FILE}`,
++        }
++      }
++    } else if (runs >= maxPreflight) log(`本轮 preflight 已达上限 ${maxPreflight},${item.mergeSha.slice(0, 8)} 挂账下轮`)
++    else if (d.treeDirty()) log('工作树有 tracked 改动,核验挂账重试(脏树的绿不算数)')
++    else {
++      const before = d.headSha()
++      runs += 1
++      const res = d.preflight()
++      if (!before || before !== d.headSha() || d.treeDirty()) log('HEAD/工作树在核验期间变化,结果作废挂账重试')
++      else {
++        rec.preflight = res.ok ? 'green' : 'red'
++        rec.verifiedOnHead = before
++        if (!res.ok) {
++          alert = {
++            title: '🛑 [mivo] loop PR 合并后 main preflight 红',
++            text: [
++              `PR #${item.pr} 合并(${item.mergeSha.slice(0, 8)})后本地 main 全套 preflight 失败(exit=${res.exit},核验树 HEAD=${(before || '').slice(0, 8)})。`,
++              'revert-required:请人工执行 `gh pr create` 开 revert PR(revert 同样走 review-pr 审查合并,本对账器不代开)。',
++              `台账:${stateDir}/${RECONCILE_STATE_FILE}`,
++            ].join('\n'),
++          }
++        }
++      }
++    }
++    verified.push({ mergeSha: item.mergeSha, preflight: rec.preflight })
++    // 告警在锁外发(网络等待不进临界区);await 到底,失败落 pending-alerts(CX-R1-004)
++    if (alert) {
++      try { await d.notify({ stateDir, config: loadNotifyConfig(stateDir), ...alert }) } catch { appendPendingAlert(stateDir, alert.title, alert.text) }
++    }
++    const w = withLock(stateDir, () => { // 短锁:合并进最新盘面,不覆盖并发 writer
++      const cur = loadReconcileState(stateDir)
++      const prev = cur.verifiedMergeOids[item.mergeSha] || {}
++      if ((RESULT_RANK[rec.preflight] ?? 0) < (RESULT_RANK[prev.preflight] ?? 0)) return `拒绝降级 ${prev.preflight}→${rec.preflight}`
++      cur.verifiedMergeOids[item.mergeSha] = { ...prev, ...rec, at: prev.at || rec.lastCheckedAt }
++      saveReconcileState(stateDir, cur)
++    })
++    // 撞锁或降级被拒 → 本项结果没落盘;不静默丢弃(R9 席① F15 / R10 CX-R1-016)
++    if (!w.acquired) log(`${item.mergeSha.slice(0, 8)} 结果未落盘(锁被 ${w.holder?.owner ?? '未知'} 持有),下轮重核`)
++    else if (w.value) log(`${item.mergeSha.slice(0, 8)} ${w.value}(并发旧队列)`)
++  }
++  return verified
++}
++
++const main = async () => {
++  const args = parseArgs(process.argv.slice(2))
++  const stateDir = resolve(args['state-dir'] || process.env.MIVO_BUG_DOCTOR_STATE_DIR || join(REPO_ROOT, 'history', 'loops', 'bug-doctor'))
++  const statePath = join(stateDir, STATE_FILE)
++  if (!existsSync(statePath)) { log('state.json 不存在,无事可做'); return 0 }
++
++  // A(锁外):查 PR 终态。快照只用来决定查哪些 PR;变更集在 B 用锁内新鲜 state 重算
++  const snap = loadState(stateDir, FINGERPRINT_VERSION)
++  const allPrNums = [...new Set(Object.values(snap.clusters ?? {})
++    .filter((c) => c.pr && c.status !== 'fixed' && c.status !== 'closed-unmerged')
++    .map((c) => Number(c.pr)))]
++  // 公平轮转。R17 席② 证伪了原来的「固定前缀 + 余下下轮」:未收敛 PR 只要保持 OPEN 就不会离开
++  // allPrNums(filter 只排除 fixed/closed-unmerged),所以固定取前缀会让后缀**永久饥饿**——已合并的
++  // PR 永不被对账、其 mergeOID 永不进核验队列、红 main 永不被发现。游标记「本轮查过的最大 PR 号」,
++  // 按号排序后从它之后取起、环绕回头:列表增删对该语义无害(新 PR 号更大会先被取到,已收敛的消失
++  // 不影响游标),且不需要与 allPrNums 的下标对齐。
++  const sortedPrNums = [...allPrNums].sort((a, b) => a - b)
++  const afterPr = loadReconcileState(stateDir).queryCursorPr // 损坏即抛(此时 state 未动,比 B 阶段更早失败)
++  const prNums = [...sortedPrNums.filter((n) => n > afterPr), ...sortedPrNums.filter((n) => n <= afterPr)]
++    .slice(0, MAX_PR_QUERIES_PER_RUN)
++  if (allPrNums.length > prNums.length) log(`PR 查询数超上界,本轮查 ${prNums.length}/${allPrNums.length}(游标 >${afterPr} 起,环绕轮转,其余下轮轮到)`)
++  const nextCursorPr = prNums.length ? prNums[prNums.length - 1] : afterPr
++  const prStates = {}
++  let ghFailures = 0
++  if (args['no-gh']) {
++    // 测试口必须经过同一条截断/轮转路径。原实现 Object.assign 吃全量输入,使 MAX_PR_QUERIES_PER_RUN
++    // 在整个测试套件零覆盖——上面那个饥饿缺陷正因此 10 轮无人测出(R17 席① 踩坑后核实)。
++    if (args['input-prs']) {
++      const all = JSON.parse(readFileSync(args['input-prs'], 'utf8'))
++      for (const n of prNums) if (all[n] !== undefined) prStates[n] = all[n]
++    }
++  } else {
++    for (const n of prNums) { const ps = ghPrState(n); if (ps) prStates[n] = ps; else ghFailures += 1 }
++  }
++
++  // B(锁内,同步事务;实测量级毫秒):新鲜读 → 算变更 → 新 OID 先入 sidecar 待核验(写序不变量 CX-R1-003:
++  //   入队先于簇标 fixed,否则中途 kill 会让核验永久丢失)→ 写台账
++  const b = withLock(stateDir, () => {
++    const rawHadLegacyT1 = /"tCap":\s*"T1"/.test(readFileSync(statePath, 'utf8')) // 迁移落盘探测(CX-R1-008)
++    const state = loadState(stateDir, FINGERPRINT_VERSION) // 走 schema/fingerprint 守卫与稳定序列化(CX-R1-010)
++    const clusters = state.clusters ?? {}
++    const rst = loadReconcileState(stateDir) // 损坏即抛:此时 state 未动,核验不会丢
++    const changes = planReconciliation(clusters, prStates)
++    let sidecarDirty = false
++    for (const ch of changes) {
++      if (ch.to !== 'fixed' || !ch.mergeSha || rst.verifiedMergeOids[ch.mergeSha]) continue // 按 mergeSha 去重(CX-R2-011)
++      rst.verifiedMergeOids[ch.mergeSha] = { pr: ch.pr, preflight: 'pending-tree', at: new Date().toISOString() }
++      sidecarDirty = true
++    }
++    if (nextCursorPr !== rst.queryCursorPr) { rst.queryCursorPr = nextCursorPr; sidecarDirty = true }
++    if (sidecarDirty) saveReconcileState(stateDir, rst)
++    for (const ch of changes) {
++      const c = clusters[ch.fp]
++      if (ch.to === 'fixed') {
++        c.status = 'fixed'
++        c.fixedAt = ch.mergedAt ? new Date(ch.mergedAt).toISOString() : new Date().toISOString()
++        c.mergeSha = ch.mergeSha
++        c.mergedBy = 'review-pr'
++      } else {
++        c.status = 'closed-unmerged'
++        c.closedAt = new Date().toISOString()
++      }
++    }
++    if (changes.length > 0 || rawHadLegacyT1) saveState(stateDir, state)
++    const queue = Object.entries(rst.verifiedMergeOids)
++      .filter(([, r]) => r.preflight === 'pending-tree')
++      .map(([mergeSha, r]) => ({ mergeSha, pr: r.pr, prev: r }))
++    return { changes, queue }
++  })
++  if (!b.acquired) { log(`gate.lock 被占用(holder=${b.holder?.owner ?? '未知'}),本轮跳过`); return 0 }
++  const { changes, queue } = b.value
++
++  const verified = await verifyPending({ stateDir, queue, skipPreflight: !!args['no-preflight'] }) // C:锁外慢工
++
++  const summary = {
++    status: 'ok', reconciled: changes.length,
++    fixed: changes.filter((c) => c.to === 'fixed').length,
++    closedUnmerged: changes.filter((c) => c.to === 'closed-unmerged').length,
++    verified, ghFailures,
++  }
++  if (args['json-out']) process.stdout.write(`${JSON.stringify(summary)}\n`)
++  log(`对账完成: fixed=${summary.fixed} closed-unmerged=${summary.closedUnmerged} 核验动作=${verified.length} gh失败=${ghFailures}`)
++  return ghFailures > 0 && changes.length === 0 && prNums.length > 0 ? 1 : 0
++}
++
++const isDirectRun = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
++if (isDirectRun) {
++  main().then((code) => process.exit(code ?? 0)).catch((err) => {
++    process.stderr.write(`${err.message}\n`)
++    process.exit(1)
++  })
++}
+diff --git a/scripts/loops/bug-doctor/reconcile-merged.test.mjs b/scripts/loops/bug-doctor/reconcile-merged.test.mjs
+new file mode 100644
+index 00000000..3fa5e50f
+--- /dev/null
++++ b/scripts/loops/bug-doctor/reconcile-merged.test.mjs
+@@ -0,0 +1,255 @@
++// reconcile-merged.test.mjs — 合并后对账器单测(缴械配套 SC-B4)。
++// 纯函数层测 planReconciliation;整脚本层用 --no-gh --no-preflight + 临时 stateDir
++// 测台账写回与 sidecar 去重(不碰网络、不跑真 preflight)。
++
++import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join, dirname, resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import { spawnSync } from 'node:child_process'
++import { describe, expect, it, afterEach } from 'vitest'
++import { planReconciliation, loadReconcileState, stalePendingAgeMs, verifyPending, withLock, RECONCILE_STATE_FILE } from './reconcile-merged.mjs'
++
++const __dirname = dirname(fileURLToPath(import.meta.url))
++const SCRIPT = resolve(__dirname, 'reconcile-merged.mjs')
++
++describe('planReconciliation(纯函数)', () => {
++  it('MERGED 且有 mergeSha → fixed;CLOSED → closed-unmerged;OPEN/查不到 → 不动', () => {
++    const clusters = {
++      a: { pr: 101, status: 'issue-filed' },
++      b: { pr: 102, status: 'open-pr' },
++      c: { pr: 103, status: 'open-pr' },
++      d: { pr: 104, status: 'open-pr' },
++    }
++    const prStates = {
++      101: { state: 'MERGED', mergeSha: 'abc123', mergedAt: '2026-08-04T00:00:00Z' },
++      102: { state: 'CLOSED', mergeSha: null },
++      103: { state: 'OPEN', mergeSha: null },
++      // 104 查不到(gh 失败)
++    }
++    const changes = planReconciliation(clusters, prStates)
++    expect(changes).toEqual([
++      { fp: 'a', pr: 101, to: 'fixed', mergeSha: 'abc123', mergedAt: '2026-08-04T00:00:00Z' },
++      { fp: 'b', pr: 102, to: 'closed-unmerged' },
++    ])
++  })
++
++  it('已收敛簇(fixed/closed-unmerged)与无 pr 号簇不参与对账(幂等前提)', () => {
++    const clusters = {
++      done: { pr: 201, status: 'fixed' },
++      closed: { pr: 202, status: 'closed-unmerged' },
++      nopr: { status: 'open' },
++      strpr: { pr: '203', status: 'open-pr' }, // 历史字符串 pr 号要归一化
++    }
++    const prStates = { 201: { state: 'MERGED', mergeSha: 'x' }, 202: { state: 'MERGED', mergeSha: 'y' }, 203: { state: 'MERGED', mergeSha: 'z', mergedAt: null } }
++    const changes = planReconciliation(clusters, prStates)
++    expect(changes).toEqual([{ fp: 'strpr', pr: 203, to: 'fixed', mergeSha: 'z', mergedAt: null }])
++  })
++
++  it('MERGED 但缺 mergeSha → 不写 fixed(宁可下轮重查,不落无锚记录)', () => {
++    const changes = planReconciliation({ a: { pr: 1, status: 'open-pr' } }, { 1: { state: 'MERGED', mergeSha: null } })
++    expect(changes).toEqual([])
++  })
++
++  it('接线层:两个挂死上限必须真的传进 spawnSync(单元断言锁不住接线——被删就是无界)', () => {
++    const src = readFileSync(resolve(__dirname, 'reconcile-merged.mjs'), 'utf8')
++    expect(src).toContain('timeout: GH_TIMEOUT_MS')
++    expect(src).toContain('timeout: PREFLIGHT_TIMEOUT_MS')
++  })
++
++  it('stalePendingAgeMs:仅 pending-tree 且滞留超阈值才返回时长(告警门,防 pull 停摆静默)', () => {
++    const now = Date.parse('2026-08-05T00:00:00Z')
++    const at = (h) => new Date(now - h * 3_600_000).toISOString()
++    expect(stalePendingAgeMs({ preflight: 'pending-tree', at: at(25) }, now)).toBeGreaterThan(0)
++    expect(stalePendingAgeMs({ preflight: 'pending-tree', at: at(23) }, now)).toBeNull()
++    expect(stalePendingAgeMs({ preflight: 'green', at: at(48) }, now)).toBeNull()
++    expect(stalePendingAgeMs({ preflight: 'pending-tree', at: 'not-a-date' }, now)).toBeNull()
++    expect(stalePendingAgeMs(null, now)).toBeNull()
++  })
++})
++
++describe('整脚本(--no-gh --no-preflight,临时 stateDir)', () => {
++  let dir
++  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); dir = null })
++
++  // 簇形状要过 loadState 的 schema/fingerprint 守卫与 stableState 序列化(CX-R1-010)
++  const mkCluster = (extra) => ({ clients: [], appVersions: [], levels: [], recent: [], samples: [], ...extra })
++  const seedState = (clusters) => {
++    dir = mkdtempSync(join(tmpdir(), 'bd-reconcile-test-'))
++    const shaped = Object.fromEntries(Object.entries(clusters).map(([fp, c]) => [fp, mkCluster(c)]))
++    writeFileSync(join(dir, 'state.json'), JSON.stringify({ schemaVersion: 1, fingerprintVersion: 1, clusters: shaped }, null, 2))
++    return dir
++  }
++  const run = (extra = []) => spawnSync(process.execPath, [SCRIPT, '--state-dir', dir, '--no-gh', '--no-preflight', '--json-out', ...extra], { encoding: 'utf8' })
++
++  it('对账写回台账:fixed 带 mergeSha/mergedBy=review-pr;sidecar 记 skipped 不冒充已核验', () => {
++    seedState({ f1: { pr: 301, status: 'open-pr' }, f2: { pr: 301, status: 'open-pr' } }) // 同 PR 两簇:核验必须只跑一次
++    const prsFile = join(dir, 'prs.json')
++    writeFileSync(prsFile, JSON.stringify({ 301: { state: 'MERGED', mergeSha: 'deadbeef01', mergedAt: '2026-08-04T01:00:00Z' } }))
++    const r = run(['--input-prs', prsFile])
++    expect(r.status).toBe(0)
++    const summary1 = JSON.parse(r.stdout.trim().split('\n').pop())
++    expect(summary1.verified).toHaveLength(1) // mergeSha 去重(CX-R2-011)
++    const st = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
++    expect(st.clusters.f1.status).toBe('fixed')
++    expect(st.clusters.f2.status).toBe('fixed')
++    expect(st.clusters.f1.mergeSha).toBe('deadbeef01')
++    expect(st.clusters.f1.mergedBy).toBe('review-pr')
++    expect(st.clusters.f1.fixedAt).toBe('2026-08-04T01:00:00.000Z') // 写入即归一到毫秒口径,防下轮 load/save 字节漂移
++    const rst = loadReconcileState(dir)
++    expect(rst.verifiedMergeOids.deadbeef01.preflight).toBe('skipped')
++  })
++
++  it('幂等:第二次运行零变更、sidecar 不重复记(同一 mergeOID 永不重复核验)', () => {
++    seedState({ f1: { pr: 301, status: 'open-pr' } })
++    const prsFile = join(dir, 'prs.json')
++    writeFileSync(prsFile, JSON.stringify({ 301: { state: 'MERGED', mergeSha: 'deadbeef01', mergedAt: '2026-08-04T01:00:00Z' } }))
++    run(['--input-prs', prsFile])
++    const first = readFileSync(join(dir, RECONCILE_STATE_FILE), 'utf8')
++    const r2 = run(['--input-prs', prsFile])
++    const summary = JSON.parse(r2.stdout.trim().split('\n').pop())
++    expect(summary.reconciled).toBe(0)
++    expect(readFileSync(join(dir, RECONCILE_STATE_FILE), 'utf8')).toBe(first)
++  })
++
++  it('CLOSED 未合并 → closed-unmerged,不进核验队列', () => {
++    seedState({ c1: { pr: 302, status: 'open-pr' } })
++    const prsFile = join(dir, 'prs.json')
++    writeFileSync(prsFile, JSON.stringify({ 302: { state: 'CLOSED' } }))
++    const r = run(['--input-prs', prsFile])
++    const st = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
++    expect(st.clusters.c1.status).toBe('closed-unmerged')
++    const summary = JSON.parse(r.stdout.trim().split('\n').pop())
++    expect(summary.verified).toEqual([])
++  })
++
++  it('sidecar 损坏 → 显式报错退出,不静默重建(fail-visible)', () => {
++    seedState({ f1: { pr: 303, status: 'open-pr' } })
++    writeFileSync(join(dir, RECONCILE_STATE_FILE), '{broken')
++    const prsFile = join(dir, 'prs.json')
++    writeFileSync(prsFile, JSON.stringify({ 303: { state: 'MERGED', mergeSha: 'beef02', mergedAt: null } }))
++    const r = run(['--input-prs', prsFile])
++    expect(r.status).not.toBe(0)
++    expect(r.stderr).toContain('reconcile-state.json 损坏')
++  })
++
++  it('未知参数 → exit 2(不静默忽略——#481 旧 gate 的教训)', () => {
++    seedState({})
++    const r = spawnSync(process.execPath, [SCRIPT, '--bogus-flag'], { encoding: 'utf8' })
++    expect(r.status).toBe(2)
++  })
++
++  it('gate.lock 被他人持有 → exit 0 跳过,state 一字不动(不与班车竞写)', () => {
++    seedState({ f1: { pr: 401, status: 'open-pr' } })
++    writeFileSync(join(dir, 'gate.lock'), `${JSON.stringify({ pid: 99999, owner: 'gate:full', token: 'other', acquiredAt: new Date().toISOString() })}\n`)
++    const before = readFileSync(join(dir, 'state.json'), 'utf8')
++    const prsFile = join(dir, 'prs.json')
++    writeFileSync(prsFile, JSON.stringify({ 401: { state: 'MERGED', mergeSha: 'aa11', mergedAt: null } }))
++    const r = run(['--input-prs', prsFile])
++    expect(r.status).toBe(0)
++    expect(r.stderr).toContain('本轮跳过')
++    expect(readFileSync(join(dir, 'state.json'), 'utf8')).toBe(before)
++  })
++
++  const stubDeps = (over = {}) => ({ headContains: () => true, treeDirty: () => false, headSha: () => 'headsha1', preflight: () => ({ ok: true, exit: 0 }), notify: async () => {}, ...over })
++  const pend = (mergeSha, pr) => [{ mergeSha, pr, prev: { preflight: 'pending-tree', at: new Date().toISOString() } }]
++
++  it('结果单调性:已落盘的 red 不得被并发旧队列的 green 覆盖(revert-required 事实不可抹)', async () => {
++    seedState({})
++    const q = pend('mono1', 603)
++    await verifyPending({ stateDir: dir, queue: q, deps: stubDeps({ preflight: () => ({ ok: false, exit: 1 }) }) })
++    await verifyPending({ stateDir: dir, queue: q, deps: stubDeps() }) // 同一旧队列的 green 试图覆盖
++    expect(loadReconcileState(dir).verifiedMergeOids.mono1.preflight).toBe('red')
++  })
++
++  it('结构不变量:慢工(preflight)执行期间不得持有 gate.lock——锁内只做同步事务', async () => {
++    // 直接钉住结构:注入的假 preflight 在被调用那刻探测锁文件,必须不存在(锁已在 B 阶段释放)
++    seedState({})
++    let lockHeldDuringPreflight = null
++    const verified = await verifyPending({ stateDir: dir, queue: pend('abc123', 601),
++      deps: stubDeps({ preflight: () => { lockHeldDuringPreflight = existsSync(join(dir, 'gate.lock')); return { ok: true, exit: 0 } } }) })
++    expect(lockHeldDuringPreflight).toBe(false)
++    expect(verified).toEqual([{ mergeSha: 'abc123', preflight: 'green' }])
++    expect(loadReconcileState(dir).verifiedMergeOids.abc123.verifiedOnHead).toBe('headsha1')
++  })
++
++  it('结构不变量:告警(sendAlert)执行期间同样不得持有 gate.lock', async () => {
++    // R9 席① F14:「锁内 await 告警」才是 R8 重放证实的数据丢失载体,必须有断言盯着
++    seedState({})
++    let lockHeldDuringNotify = null
++    await verifyPending({ stateDir: dir, queue: pend('red001', 602),
++      deps: stubDeps({ preflight: () => ({ ok: false, exit: 1 }), // 红 → 走 revert-required 告警路径
++        notify: async () => { lockHeldDuringNotify = existsSync(join(dir, 'gate.lock')) } }) })
++    expect(lockHeldDuringNotify).toBe(false)
++    expect(loadReconcileState(dir).verifiedMergeOids.red001.preflight).toBe('red')
++  })
++
++  it('withLock 运行时强制回调同步:回调返回 thenable 直接抛(惯例不足以防回归)', () => {
++    seedState({})
++    expect(() => withLock(dir, () => Promise.resolve(1))).toThrow(/必须同步/)
++  })
++
++  // ── 公平轮转 oracle(R17 席② 证伪「固定前缀 + 余下下轮」)──
++  // 这组测试必须真正经过 prNums 截断:原实现的 --no-gh 分支 Object.assign 吃全量输入,
++  // 使 MAX_PR_QUERIES_PER_RUN 零覆盖、饥饿缺陷 10 轮无人测出。现在 --no-gh 也按 prNums 过滤。
++  const seedManyOpen = (n, mergedPr) => {
++    const clusters = {}
++    for (let i = 1; i <= n; i += 1) clusters[`fp${String(i).padStart(2, '0')}`] = { pr: 500 + i, status: 'open-pr' }
++    seedState(clusters)
++    const prsFile = join(dir, 'prs.json')
++    const prs = {}
++    for (let i = 1; i <= n; i += 1) {
++      prs[500 + i] = 500 + i === mergedPr
++        ? { state: 'MERGED', mergeSha: `sha${mergedPr}`, mergedAt: '2026-08-05T00:00:00Z' }
++        : { state: 'OPEN', mergeSha: null }
++    }
++    writeFileSync(prsFile, JSON.stringify(prs))
++    return prsFile
++  }
++
++  it('超上限时游标环绕:第 11 个 PR 不会被永久饥饿(前 10 个持续 OPEN 也终会轮到)', () => {
++    // 11 个未收敛簇,只有第 11 个(pr=511)已 MERGED。前 10 个永远 OPEN,故永不离开待查集——
++    // 固定取前缀的旧实现下 511 永远查不到;有游标后第二轮必然轮到它。
++    const prsFile = seedManyOpen(11, 511)
++    const r1 = run(['--input-prs', prsFile])
++    expect(r1.status).toBe(0)
++    expect(r1.stderr).toContain('环绕轮转')
++    // 第一轮:游标从 0 起 → 查 501..510,511 没被查到,簇仍未收敛
++    expect(JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).clusters.fp11.status).toBe('open-pr')
++    expect(loadReconcileState(dir).queryCursorPr).toBe(510)
++    // 第二轮:游标 >510 → 511 排第一个被查到 → fixed(旧实现在这里会再查一次 501..510,511 永久饥饿)
++    const r2 = run(['--input-prs', prsFile])
++    expect(r2.status).toBe(0)
++    const st2 = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
++    expect(st2.clusters.fp11.status).toBe('fixed')
++    expect(st2.clusters.fp11.mergeSha).toBe('sha511')
++    // 第二轮取 [511, 501..509](从 >510 起环绕),故游标停在 509——每轮推进 10 个位置,
++    // 11 个 PR 持续轮转不饥饿。旧实现这里会是 510 且永远不动。
++    expect(loadReconcileState(dir).queryCursorPr).toBe(509)
++  })
++
++  it('未超上限时不轮转:游标停在本轮最大 PR 号,单轮即全查(不引入额外延迟)', () => {
++    const prsFile = seedManyOpen(3, 503)
++    const r = run(['--input-prs', prsFile])
++    expect(r.status).toBe(0)
++    expect(r.stderr).not.toContain('环绕轮转')
++    expect(JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).clusters.fp03.status).toBe('fixed')
++    expect(loadReconcileState(dir).queryCursorPr).toBe(503)
++  })
++
++  it('游标持久化在 sidecar 且被 loadReconcileState 带出(白名单漏列即每轮读回 0、游标形同不存在)', () => {
++    const prsFile = seedManyOpen(11, 511)
++    run(['--input-prs', prsFile])
++    const raw = JSON.parse(readFileSync(join(dir, RECONCILE_STATE_FILE), 'utf8'))
++    expect(raw.queryCursorPr).toBe(510)               // 真的写进了磁盘
++    expect(loadReconcileState(dir).queryCursorPr).toBe(510) // 且读得回来
++  })
++
++  it('磁盘遗留 tCap=T1 → 即使零对账变更也强制落盘迁移(缩短 review-pr 读到旧 T1 的窗口)', () => {
++    seedState({ f1: { pr: 402, status: 'open-pr', tCap: 'T1' } })
++    const r = run([])
++    expect(r.status).toBe(0)
++    const st = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
++    expect(st.clusters.f1.tCap).toBe('T2')
++  })
++})

@@ -1,0 +1,723 @@
+diff --git a/src/__tests__/depositStore.test.ts b/src/__tests__/depositStore.test.ts
+index 27979d54..d106e1d7 100644
+--- a/src/__tests__/depositStore.test.ts
++++ b/src/__tests__/depositStore.test.ts
+@@ -9,11 +9,16 @@
+  *     而不是对称合并(last-write-wins 已作废),含释放-复活防护。
+  */
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { debugLogger } from '../../../src/store/debugLogStore'
+ import {
+   DEPOSIT_COMMIT_MAX_ATTEMPTS,
+   DEPOSIT_MAP_MAX_ENTRIES,
+   DEPOSIT_PENDING_GEN,
++  DEPOSIT_RELEASED_FLOOR_MAX_ENTRIES,
+   DEPOSIT_PENDING_WRITER,
++  depositHashRefCount,
++  dequeuePendingRelease,
++  enqueuePendingRelease,
+   invalidateDeposit,
+   loadDepositStore,
+   lookupDeposit,
+@@ -23,8 +28,10 @@ import {
+   recordCapabilityMark,
+   recordDeposit,
+   recordMigration,
++  setDepositClockForTests,
+   setDepositTransport,
+   type DepositEntryDraft,
++  type DepositState,
+ } from '../agent/depositStore'
+ import type { PersistReply } from '../persist/bridge'
+ import { createDepositHarness, teardownDepositHarness, FAKE_HASH } from './depositTestHarness'
+@@ -403,11 +410,268 @@ describe('depositStore — 端到端提交(真实 main.js 不可变命名协议)
+   })
+ })
+ 
+-describe('depositStore — generation CAS:本实例未提交变更重放(设计稿 §4.10.6.1,last-write-wins 已作废)', () => {
+-  afterEach(() => {
+-    teardownDepositHarness()
++describe('depositStore — PR#366 review 必改(2026-08-01):内存权威身份分叉与成功路径盖戳守卫', () => {
++  beforeEach(() => {
++    createDepositHarness()
++  })
++
++  it('CAS 冲突重放后 loadDepositStore 与 peekDepositStoreForTests 必须是同一对象,否则后续 recordDeposit 静默不落盘', async () => {
++    const harness = createDepositHarness()
++    await loadDepositStore()
++
++    const first = await recordDeposit('mivo-asset:a', draft('ha', 1, 'deposit'))
++    expect(first.ok).toBe(true)
++
++    // 外部写者(另一个电子脑实例)直接推进磁盘,绕开本实例的提交队列,制造下一次
++    // 提交必然撞上的 CAS 冲突——不是测试手工构造 conflict,是 main.js 自己判出来的。
++    const external = await harness.brain.handles.deposit.stateSave({
++      baseGeneration: first.generation,
++      baseSum: peekDepositRevisionSumForTests(),
++      writer: 'ffffffff',
++      state: JSON.stringify({
++        version: 1,
++        map: {
++          'mivo-asset:external': {
++            hash: 'ext',
++            ext: '.png',
++            depositedAt: 1,
++            from: 'deposit',
++            gen: first.generation + 1,
++            writer: 'ffffffff',
++          },
++        },
++      }),
++    })
++    expect(external.ok).toBe(true)
++
++    const second = await recordDeposit('mivo-asset:b', draft('hb', 2, 'deposit'))
++    expect(second.ok).toBe(true)
++    expect(second.attempts).toBeGreaterThan(1) // 确认真的撞过冲突、走了重放,不是幸运一次过
++
++    // 核心断言:两个读取入口必须拿到同一个对象。旧实现里 `loadPromise` 只在首次
++    // load 时赋值、此后永不重置,冲突重放把 `memory` 换成新对象后,这里会分叉。
++    const viaLoad = await loadDepositStore()
++    const viaPeek = peekDepositStoreForTests()
++    expect(viaLoad).toBe(viaPeek)
++
++    const third = await recordDeposit('mivo-asset:c', draft('hc', 3, 'deposit'))
++    expect(third.ok).toBe(true)
++
++    // 最新一代候选文件必须真的落盘含有 b 与 c——旧实现:c 的 mutator 改在
++    // loadPromise 缓存的旧对象上,commitNow 序列化的是当前 memory,c 静默不落盘
++    // (仍然回 ok:true)。这里直接读磁盘(main.js readDepositState),不经面板缓存。
++    const disk = await harness.brain.handles.deposit.readState()
++    const diskMap = (disk.payload as { map?: Record<string, unknown> } | null)?.map ?? {}
++    expect(diskMap['mivo-asset:b']).toBeTruthy()
++    expect(diskMap['mivo-asset:c']).toBeTruthy()
++
++    // lookupDeposit 也走 loadDepositStore(),必须与磁盘一致——旧实现下它会返回
++    // "看似仍能读到"的 c(读的是那个从未真正参与提交的旧对象),制造「读自己的写」
++    // 的假象,而磁盘上其实没有。
++    await expect(lookupDeposit('mivo-asset:c')).resolves.toMatchObject({ hash: 'hc' })
++  })
++
++  it('提交在途(await transport 未返回)时到达的新 mutation,必须被同一次 commitNow 的盖戳并入,不能以占位符 gen/writer 落盘', async () => {
++    // 触发机制说明(2026-08-02 由 conflict 取代 writerCollision,PR#366 review
++    // 必改项原意图保留——这条守卫来自 `unionDirty(batch, dirty)`,防"提交在途期间
++    // 到达的新 mutation 只挂在活 dirty 里、没被摘进本批快照,重放/重试时被当作
++    // 不存在而以占位符 gen/writer 落盘"):原实现用手工构造的 `writerCollision:true`
++    // 回执触发 `commitNow` 同一次调用内的重试——那是**多写者架构**的写者短码碰撞
++    // 重试路径,十轮单写者改写已把它删除(main.js 不再产生、`commitNow` 不再识别
++    // `writerCollision` 字段,全仓 grep 零命中)。单写者架构下 `commitNow` 唯一的
++    // 重试触发条件是 `reply.conflict`——继续用 writerCollision 等于在测一条已经
++    // 不可达的路,必须换成真实可达的路径:让一个外部写者在 attempt 1 的请求"在途"
++    // 期间真的推进磁盘一代,main.js 自己判出 CAS 冲突(不是测试手工构造回执)。
++    //
++    // SC11.9 锚定(2026-08-01):本条覆盖的是冲突重放路径——depositStore.ts 的
++    // `reply.conflict` 分支里那次 `unionDirty` → `applyLocalOverlay` 自带的无条件
++    // 盖戳。短路该处会使本条变红(已实测)。注意:同一批 key 在 attempt 2 会被
++    // `commitNow` 循环顶部的 `stampDirtyEntries` 重复盖一遍完全相同的值(两处之间
++    // 零 await,`dirty` 不可能变化)——那是幂等 no-op,不代表 `stampDirtyEntries`
++    // 在本条测试里被真实覆盖。`stampDirtyEntries` 在无冲突路径上的唯一覆盖见上方
++    // 「第一批提交在途...(finding 2)」一条,两者路径不重叠,不可互相替代。
++    const harness = createDepositHarness()
++    await loadDepositStore()
++
++    let releaseFirstAttempt: (() => void) | undefined
++    const firstAttemptGate = new Promise<void>((resolve) => {
++      releaseFirstAttempt = resolve
++    })
++    let firstAttemptStarted: (() => void) | undefined
++    const firstAttemptStartedGate = new Promise<void>((resolve) => {
++      firstAttemptStarted = resolve
++    })
++
++    let saveCount = 0
++    setDepositTransport((async (kind: string, payload?: Record<string, unknown>) => {
++      if (kind === 'deposit-state-load') {
++        return { reqId: 'l', reply: true, ...(await harness.brain.handles.deposit.stateLoad()) } as PersistReply
++      }
++      saveCount += 1
++      const thisCall = saveCount
++      if (thisCall === 1) {
++        firstAttemptStarted?.()
++        await firstAttemptGate
++        // 外部写者(另一个电子脑实例)在 attempt 1 的回执还没回来这段窗口内,真的
++        // 把磁盘推进了一代——制造下一行 attempt 1 真实提交必然撞上的 CAS 冲突,
++        // 不是测试手工构造 `conflict:true` 回执,是 main.js 自己判出来的(同上面
++        // "CAS 冲突重放后 loadDepositStore..." 用例的手法)。
++        const external = await harness.brain.handles.deposit.stateSave({
++          baseGeneration: 0,
++          baseSum: harness.brain.handles.deposit.emptyRevisionSum,
++          state: JSON.stringify({
++            version: 1,
++            map: { 'mivo-asset:external': { hash: 'ext', ext: '.png', depositedAt: 1, from: 'deposit' } },
++          }),
++        })
++        expect(external.ok).toBe(true)
++        const raw = await harness.brain.handles.deposit.stateSave(payload as { baseGeneration: number; baseSum?: string; state: string })
++        return { reqId: 's1', reply: true, ...raw } as PersistReply
++      }
++      const raw = await harness.brain.handles.deposit.stateSave(payload as { baseGeneration: number; baseSum?: string; state: string })
++      return { reqId: `s${thisCall}`, reply: true, ...raw } as PersistReply
++    }) as never)
++
++    const firstCommit = recordDeposit('mivo-asset:first', draft('h1', 1, 'deposit'))
++    await firstAttemptStartedGate // attempt 1 已发出、正卡在回执等待,payload 已序列化完毕
++
++    // 首批提交在途期间到达的新 mutation。它自己的 enqueueCommit() 会另起一条排在
++    // commitTail 之后的提交(不复用 waitingCommit)——但它的条目已经被直接写进共享
++    // `memory.map`,此刻仍是占位符 gen/writer。若 attempt 1 冲突重放时的盖戳只认
++    // `batch`(本行 finding 的退化写法),这个占位符会原样序列化进重放之后的落盘
++    // 内容——main.js `depositValidateSemantics` 判 `gen<0` 为整份候选无效,后续
++    // `second` 自己的提交在 CAS 重放时会把 `first` 一并当作"磁盘本来就是空的"重放
++    // 掉,`first` 静默从磁盘消失(即使 `firstResult.ok` 依然是 true)。
++    const secondCommit = recordDeposit('mivo-asset:second', draft('h2', 2, 'deposit'))
++    await Promise.resolve()
++    await Promise.resolve()
++
++    releaseFirstAttempt?.() // 放行:外部写者推进磁盘 → attempt 1 真实撞冲突 → 重放
++
++    const [firstResult, secondResult] = await Promise.all([firstCommit, secondCommit])
++    expect(firstResult.ok).toBe(true)
++    expect(firstResult.attempts).toBeGreaterThan(1) // 确认真的撞过冲突、走了重试(不是幸运一次过)
++    expect(secondResult.ok).toBe(true)
++
++    // 磁盘上真实落盘的候选必须三条都在、都盖了真实 gen/writer——不能是占位符,
++    // 也不能因为占位符污染导致整份候选被判无效后"second 自己的提交健康、first
++    // 却在这次健康背后被悄悄冲掉"。这里直接读磁盘(main.js readDepositState),
++    // 不经面板缓存。
++    const disk = await harness.brain.handles.deposit.readState()
++    expect(disk.payload).not.toBeNull() // 一旦占位符落盘,main.js 语义校验会让它变 null
++    expect(disk.missing).toBe(false)
++    const diskMap = (disk.payload as { map?: Record<string, unknown> } | null)?.map ?? {}
++
++    expect(diskMap['mivo-asset:external']).toBeTruthy() // 外部写者那条真实存在于磁盘,不是空想的冲突源
++    const firstEntry = diskMap['mivo-asset:first'] as { gen?: number; writer?: string } | undefined
++    expect(firstEntry).toBeTruthy() // 核心断言:旧实现下这条会从磁盘上消失
++    expect(firstEntry?.gen).not.toBe(DEPOSIT_PENDING_GEN)
++
++    const secondEntry = diskMap['mivo-asset:second'] as { gen?: number; writer?: string } | undefined
++    expect(secondEntry).toBeTruthy()
++    expect(secondEntry?.gen).not.toBe(DEPOSIT_PENDING_GEN)
++    expect(secondEntry?.writer).not.toBe(DEPOSIT_PENDING_WRITER)
++
++    // 且这份文件能被原样读回(语义校验没判它无效)——用真实 stateLoad 再走一遍
++    // 面板侧的读取路径,与 handles.deposit.readState() 的直读互相印证。
++    const reload = await harness.brain.handles.deposit.stateLoad()
++    expect(reload.ok).toBe(true)
++    expect(reload.state).not.toBeNull()
+   })
++})
+ 
++describe('depositStore — SC1a.9 待重试释放队列(pendingReleases,消费在 P1b)', () => {
++  beforeEach(() => {
++    createDepositHarness()
++  })
++
++  it('enqueue 一个已无其它 map 引用的 hash → 写入队列', async () => {
++    await enqueuePendingRelease('lonely-hash', 'deposit')
++    const state = peekDepositStoreForTests()
++    expect(state?.pendingReleases['lonely-hash']).toMatchObject({ hash: 'lonely-hash', from: 'deposit' })
++  })
++
++  it('enqueue 一个仍被 map 引用的 hash → 跳过,不入队(设计稿 SC1a.9)', async () => {
++    await recordDeposit('mivo-asset:1', draft('shared-hash', 1, 'deposit'))
++    await enqueuePendingRelease('shared-hash', 'deposit')
++
++    expect(peekDepositStoreForTests()?.pendingReleases['shared-hash']).toBeUndefined()
++  })
++
++  it('from 不是 deposit → 拒绝入队,不静默改写成 deposit(finding 5)', async () => {
++    // SSOT(round2-plan-v3.md SC1a.9):artifact/ledger 条目不是本插件的寄存物,
++    // 调用方即便传了它们的 hash 也不该被静默"洗白"成 deposit 排队释放。
++    await enqueuePendingRelease('artifact-hash', 'artifact')
++    await enqueuePendingRelease('ledger-hash', 'ledger')
++
++    expect(peekDepositStoreForTests()?.pendingReleases['artifact-hash']).toBeUndefined()
++    expect(peekDepositStoreForTests()?.pendingReleases['ledger-hash']).toBeUndefined()
++  })
++
++  it('磁盘上 from 不是 deposit 的 pendingReleases 条目 → parser 整条剔除,不改写(finding 5)', () => {
++    const parsed = parseDepositState(
++      JSON.stringify({
++        version: 1,
++        map: {},
++        pendingReleases: {
++          bad: { hash: 'bad', from: 'artifact', at: 1, gen: 1, writer: 'aaaaaaaa' },
++          good: { hash: 'good', from: 'deposit', at: 1, gen: 1, writer: 'aaaaaaaa' },
++        },
++      }),
++    )
++    expect(Object.keys(parsed?.pendingReleases ?? {})).toEqual(['good'])
++  })
++
++  it('N1 反例(并发):Promise.all(enqueue, recordDeposit 同一 hash) → 两者不共存,以先跑到 mutator 的那个为准', async () => {
++    // judge 实跑反例:旧实现的 refcount 检查在 mutateAndCommit 外,检查与写入不
++    // 原子——并发场景下两次调用都会"成功",live map 与 pendingReleases 同一个 hash
++    // 同时存在。原子化之后,不论两个 mutator 谁先跑到,结果都必须是二者恰好一个
++    // 生效:map 里有它 → pendingReleases 就不该有;pendingReleases 里有它 → 说明
++    // enqueue 先跑到且当时确实无引用,map 那次的写入仍然生效(它们操作不同字段,
++    // 不冲突),但 recordDeposit 的原子清理会在*它自己*的 mutator 里把刚被 enqueue
++    // 放进去的 pending 摘掉——所以无论顺序,最终必须收敛到"不共存"。
++    await Promise.all([enqueuePendingRelease('shared-hash', 'deposit'), recordDeposit('mivo-asset:1', draft('shared-hash', 1, 'deposit'))])
++
++    const state = peekDepositStoreForTests()
++    const inMap = Boolean(state?.map['mivo-asset:1'])
++    const inPending = Boolean(state?.pendingReleases['shared-hash'])
++    expect(inMap).toBe(true) // recordDeposit 总是生效(它写的是不同的字段/键)
++    expect(inPending).toBe(false) // 不允许与 live map 同 hash 共存
++  })
++
++  it('N1 反例(顺序):先 enqueue 再 recordDeposit 同一 hash → recordDeposit 原子摘掉 pending 残留', async () => {
++    await enqueuePendingRelease('shared-hash', 'deposit')
++    expect(peekDepositStoreForTests()?.pendingReleases['shared-hash']).toBeTruthy() // enqueue 先跑,当时确实无引用
++
++    await recordDeposit('mivo-asset:1', draft('shared-hash', 1, 'deposit'))
++
++    // 同一个 hash 现在又活跃在 map 里,旧的待释放记录必须被原子清掉,不能残留。
++    expect(peekDepositStoreForTests()?.pendingReleases['shared-hash']).toBeUndefined()
++    expect(peekDepositStoreForTests()?.map['mivo-asset:1']).toBeTruthy()
++  })
++
++  it('depositHashRefCount 排除指定 assetUrl 计数(自愈换指纹场景用)', async () => {
++    await recordDeposit('mivo-asset:1', draft('h', 1, 'deposit'))
++    await recordDeposit('mivo-asset:2', draft('h', 2, 'deposit'))
++    const state = peekDepositStoreForTests() as DepositState
++    expect(depositHashRefCount(state, 'h')).toBe(2)
++    expect(depositHashRefCount(state, 'h', 'mivo-asset:1')).toBe(1)
++  })
++
++  it('dequeue 移除队列条目(P1b 重试成功回调路径)', async () => {
++    await enqueuePendingRelease('lonely-hash', 'deposit')
++    await dequeuePendingRelease('lonely-hash')
++    expect(peekDepositStoreForTests()?.pendingReleases['lonely-hash']).toBeUndefined()
++  })
++
++  it('按 hash 键天然去重:重复 enqueue 同一 hash 不产生多条', async () => {
++    await enqueuePendingRelease('h', 'deposit')
++    await enqueuePendingRelease('h', 'deposit')
++    expect(Object.keys(peekDepositStoreForTests()?.pendingReleases ?? {})).toEqual(['h'])
++  })
++})
++
++describe('depositStore — generation CAS:本实例未提交变更重放(设计稿 §4.10.6.1,last-write-wins 已作废)', () => {
+   it('磁盘 generation 被外部推进 → 重放本实例未提交变更,两边条目都不丢', async () => {
+     const harness = createDepositHarness()
+     await recordDeposit('mivo-asset:mine', draft('mine', 1, 'deposit'))
+@@ -443,15 +707,144 @@ describe('depositStore — generation CAS:本实例未提交变更重放(设计
+     expect(map['mivo-asset:mine']).toBeTruthy() // 本实例更早的提交也在(已在磁盘上)
+   })
+ 
++  it('B3 三审:CAS 冲突重放之后(不只是首次直提交)releasedFloor 的安全退休依然生效', async () => {
++    const harness = createDepositHarness()
++    await recordDeposit('mivo-asset:mine', draft('mine', 1, 'deposit')) // gen 1
++
++    // 模拟另一个写者把磁盘推进到 gen=2,带着一条早就该安全退休的 floor(releaseGen=0)。
++    // 本实例接下来的提交会撞 CAS 冲突、重放到 remote 基线上,重放之后紧接着的
++    // 那一轮循环攻顶会用 targetGen=remote.generation(2)+1=3 重新判一遍退休——
++    // 3>=0+3=3,已经跨过窗口,断言它没有原样带过去。
++    // F1:同上,直调需要与磁盘当前内容匹配的 baseSum 才能落盘,否则这份"模拟另一
++    // 个写者"的提交自己就会先被判 conflict。
++    const savedFloorResult = await harness.brain.handles.deposit.stateSave({
++      baseGeneration: 1,
++      baseSum: peekDepositRevisionSumForTests(),
++      writer: 'ffffffff',
++      state: JSON.stringify({
++        version: 1,
++        map: {
++          'mivo-asset:mine': { hash: 'mine', ext: '.png', depositedAt: 1, from: 'deposit', gen: 1, writer: 'aaaaaaaa' },
++        },
++        releasedFloor: { 'stale-asset': { generation: 0, at: 1 } },
++      }),
++    })
++    expect(savedFloorResult.ok).toBe(true)
++
++    const result = await recordDeposit('mivo-asset:second', draft('second', 60, 'deposit'))
++    expect(result.ok).toBe(true)
++    expect(result.attempts).toBeGreaterThan(1) // 确认真的撞过冲突、走了重放路径
++
++    // 冲突重放之后的这次提交,最终落盘的状态里不带这条早就该退休的 floor。
++    expect(peekDepositStoreForTests()?.releasedFloor['stale-asset']).toBeUndefined()
++  })
++
++  it('实例 A release + 删条目、实例 B 持旧快照重放 → 该 assetUrl 不复活(§4.10.6.1 核心场景)', async () => {
++    // finding 3:原版给"B"另起一个 createDepositHarness()——depositTestHarness.ts
++    // 的 createDepositHarness 每次都是全新的 loadBrain(),files 各自独立(fs.ts §
++    // 604:`new Map(Object.entries(options.files ?? {}))`),B 的磁盘从头就是空的,
++    // 'mivo-asset:shared' 从未存在于 B 的磁盘上——"没被复活"只是因为它本来就不在,
++    // 不是防复活逻辑真的生效了。改成本实例(depositStore 单例)扮演"B",A 的释放
++    // 经 harness.brain.handles.deposit.stateSave 直接写向*同一份*假磁盘(与两写者
++    // 场景测试同一手法,见上面"磁盘 generation 被外部推进"用例)。
++    const harness = createDepositHarness()
++
++    // B(本实例)先寄存,持有 gen=1、'shared' 存在的内存态。
++    await recordDeposit('mivo-asset:shared', draft('old-hash', 1, 'deposit'))
++    const genBeforeRelease = peekDepositStoreForTests()?.generation ?? 0
++
++    // A:另一个写者,直接对同一份磁盘提交 release(map 删键 + 留墓碑),base 对齐
++    // 磁盘当前 gen——这次提交合法落盘,磁盘前进到 gen+1,B 对此一无所知(B 的内存
++    // 态仍停在 release 之前)。
++    // F1:同上,直调需要与磁盘当前内容匹配的 baseSum(此刻正是 B 刚提交成功后记的值)。
++    const released = await harness.brain.handles.deposit.stateSave({
++      baseGeneration: genBeforeRelease,
++      baseSum: peekDepositRevisionSumForTests(),
++      writer: 'ffffffff',
++      state: JSON.stringify({
++        version: 1,
++        map: {},
++        releasedTombstones: {
++          // at 必须是"刚刚"的真实时间戳,不能用像 100 这种小占位值——B 的重试第 2 次
++          // 尝试会把这份合并回来的墓碑喂给 pruneExpiredTombstones(用真实 Date.now()
++          // 判 TTL,本测试没有 mock 时钟),太旧的 at 会被当场剪掉,反而验证不出
++          // "没被复活"是靠仲裁逻辑,还是靠墓碑活着挡住。
++          'mivo-asset:shared': { hash: 'old-hash', at: Date.now(), gen: genBeforeRelease + 1, writer: 'ffffffff' },
++        },
++      }),
++    })
++    expect(released.ok).toBe(true)
++
++    // B 提交一个与 shared 无关的变更:B 的 CAS 基线(genBeforeRelease)落后于磁盘
++    // 已合并的最新 gen,必然冲突,走"重读磁盘 + 重放本实例未提交变更"。
++    const resultB = await recordDeposit('mivo-asset:unrelated', draft('u', 2, 'deposit'))
++    expect(resultB.ok).toBe(true)
++    expect(resultB.attempts).toBeGreaterThan(1) // 走过一次冲突重试,不是幸运一次过
++
++    const finalState = peekDepositStoreForTests()
++    expect(finalState?.map['mivo-asset:shared']).toBeUndefined() // 没被 B 的旧快照复活
++    expect(finalState?.releasedTombstones['mivo-asset:shared']).toBeTruthy() // A 的墓碑仍在
++    expect(finalState?.map['mivo-asset:unrelated']).toBeTruthy()
++  })
++
++  it('B 本次也重新寄存过被 A 释放的 assetUrl(未提交的本地变更)→ 单条重放复活为新条目,tombstone 被新条目取代', async () => {
++    // SC11.3(修真假绿):原版这里的外部 `stateSave` 漏传 `baseSum`——main.js 的
++    // CAS 判据是 generation **与**内容指纹双因子(F1),缺 `baseSum` 时按不匹配
++    // 处理,一律回 conflict、不落盘(见 `handleDepositStateSave` 的 `baseSum` 分支)。
++    // 于是这次"模拟另一实例释放"的提交自始至终没有真正写盘,下面的 `recordDeposit`
++    // 只是在本实例已提交的旧状态上追加一次寻常提交,从未真正撞上冲突、也从未真的
++    // 走过 `applyLocalOverlay` 重放——"tombstone 被新条目取代"这条断言恒真(压根没有
++    // 磁盘墓碑可取代),测不出互斥不变量是否真的生效。补上正确的 `baseSum`,让这次
++    // 外部释放真正落盘、真正推进 generation,本实例接下来的提交才会真的撞冲突。
++    const harness = createDepositHarness()
++    await recordDeposit('mivo-asset:shared', draft('old-hash', 1, 'deposit'))
++
++    // 模拟另一实例(同一磁盘,不同 writer)释放了该条目并推进了 generation。
++    // at 必须是"刚刚"的真实时间戳(N2 假绿修复):用像 100 这种远古占位值,墓碑会在
++    // 下一次重试的 pruneExpiredTombstones 里被 GC 的 24h TTL 顺手剪掉——断言
++    // "墓碑被取代"因此恒真,测不出下面这条真正要验证的互斥不变量(map 重放同一
++    // asset 时必须显式摘掉同键墓碑)是否真的生效。
++    const diskBefore = peekDepositStoreForTests()
++    const released = await harness.brain.handles.deposit.stateSave({
++      baseGeneration: diskBefore?.generation ?? 0,
++      baseSum: peekDepositRevisionSumForTests(),
++      writer: 'eeeeeeee',
++      state: JSON.stringify({
++        version: 1,
++        map: {},
++        releasedTombstones: {
++          'mivo-asset:shared': { hash: 'old-hash', at: Date.now(), gen: (diskBefore?.generation ?? 0) + 1, writer: 'eeeeeeee' },
++        },
++      }),
++    })
++    // 自证这次外部释放真的落盘了(不是又一次悄悄冲突):generation 必须真的前进。
++    expect(released.ok).toBe(true)
++    expect(released.generation).toBe((diskBefore?.generation ?? 0) + 1)
++
++    // 本实例这次会话里"恰好也"重新寄存了同一个 assetUrl(不知道对方已经释放它)。
++    // 本实例的内存基线此刻已落后于磁盘(磁盘刚被外部释放推进了一代)——这次提交
++    // 必然撞上一次真实冲突,走 `applyLocalOverlay` 重放,不是走运一次过。
++    const result = await recordDeposit('mivo-asset:shared', draft('new-hash', 2, 'deposit'))
++
++    expect(result.ok).toBe(true)
++    expect(result.attempts).toBeGreaterThan(1) // 确认真的撞过冲突、走了重放路径,不是白走一遍
++    const entry = peekDepositStoreForTests()?.map['mivo-asset:shared']
++    expect(entry).toMatchObject({ hash: 'new-hash' }) // 复活为新条目,hash 是新值
++    // 互斥不变量(N2):同一个 assetUrl 不能同时出现在 map 与 releasedTombstones 里——
++    // 这次是靠 applyLocalOverlay 重放 map 时显式摘掉同键墓碑做到的,不是 GC 剪的。
++    expect(peekDepositStoreForTests()?.releasedTombstones['mivo-asset:shared']).toBeUndefined()
++  })
++
+   it('CAS 一直冲突 → 重试用尽后只丢缓存,不写错映射', async () => {
+     createDepositHarness()
+     await loadDepositStore()
+ 
+     let saves = 0
+     setDepositTransport((async (kind: string) => {
+-      if (kind === 'deposit-state-load') return { reqId: 'l', reply: true, ok: true, state: null, generation: 0 } as PersistReply
++      if (kind === 'deposit-state-load') {
++        return { reqId: 'l', reply: true, ok: true, state: null, generation: 0 } as PersistReply
++      }
+       saves += 1
+-      // 每次都回冲突,且带一个 generation 一直前进的对方状态
+       return {
+         reqId: 's',
+         reply: true,
+@@ -483,23 +876,269 @@ describe('depositStore — generation CAS:本实例未提交变更重放(设计
+     })
+   })
+ 
+-  it('传输抛错 / 被拒 → 只丢缓存,内存态照旧可用', async () => {
++  it('SC7.6a(替换假绿):冲突回执 state:null 是权威空态,不是"不可解析"——重放后必须真正提交成功', async () => {
++    // 七轮追加:旧版 SC6.1 回归测试只调了 main.js 侧 `stateSave`,断言的是回执本身
++    // 的形状(`state:null`/`generation:0`),从没经过 `depositStore.ts:826` 那句
++    // "`reply.state` 为 falsy 就当 emptyState()"的消费逻辑——把那句改回
++    // `parseDepositState(reply.state)` 那份测试仍然全绿(它压根没跑到这段代码)。
++    // 这里直接用 `setDepositTransport` 在 depositStore.ts 消费的层面构造同一场景:
++    // 第一次 save 收到"权威空态"冲突回执(`state: null`,真空磁盘,不是解析失败),
++    // 第二次 save(重放后的 retry)才成功。旧实现在这里会把 `parseDepositState(null)`
++    // 判成不可解析,直接 `return { ok:false, reason:'conflict' }`——不会有第二次
++    // save,`saves` 停在 1、`result.ok` 是 false。改回旧逻辑此测试必须变红。
++    createDepositHarness()
++    await loadDepositStore()
++
++    let saves = 0
++    setDepositTransport((async (kind: string) => {
++      if (kind === 'deposit-state-load') return { reqId: 'l', reply: true, ok: true, state: null, generation: 0 } as PersistReply
++      saves += 1
++      if (saves === 1) {
++        return {
++          reqId: 's',
++          reply: true,
++          ok: false,
++          conflict: true,
++          state: null,
++          generation: 0,
++          revisionSum: 'empty-sum-placeholder',
++        } as PersistReply
++      }
++      return { reqId: 's', reply: true, ok: true, generation: saves, revisionSum: 'sum-after-retry' } as PersistReply
++    }) as never)
++
++    const result = await recordDeposit('mivo-asset:1', draft('aaaa', 1, 'deposit'))
++
++    expect(result).toMatchObject({ ok: true, attempts: 2 })
++    expect(saves).toBe(2)
++  })
++
++  it('传输抛错 / 被拒(from:deposit 条目)→ 内存态照旧可用,但日志如实提示配额孤儿风险,不是笼统"只丢缓存"(N3)', async () => {
+     createDepositHarness()
+     await loadDepositStore()
+     setDepositTransport((async (kind: string) => {
+       if (kind === 'deposit-state-load') return { reqId: 'l', reply: true, ok: true, state: null, generation: 0 } as PersistReply
+       throw new Error('bridge down')
+     }) as never)
++    const errorSpy = vi.spyOn(debugLogger, 'error')
++    errorSpy.mockClear() // 防御性清空:vi.spyOn 复用已有 spy 实例时会带着上一个用例的调用记录
+ 
+     await expect(recordDeposit('mivo-asset:1', draft('aaaa', 1, 'deposit'))).resolves.toMatchObject({
+       ok: false,
+       reason: 'transport',
+     })
+-    // 内存态仍然可用(缓存不是账本:落盘失败只是下次多一次往返)
++    // 内存态仍然可用(下次改图能重寄存,不是"这张图改不了")
+     await expect(lookupDeposit('mivo-asset:1')).resolves.toMatchObject({ hash: 'aaaa' })
++    // N3:这条丢的是 from:'deposit' 条目,背后占着真实宿主配额——日志必须提配额
++    // 孤儿风险,不能说成笼统的"只丢缓存"(该表述只适用于 migration/capability/
++    // artifact/ledger 条目)。
++    expect(errorSpy).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('配额孤儿风险'))
++    expect(errorSpy).not.toHaveBeenCalledWith(expect.anything(), expect.stringContaining('只丢缓存'))
++  })
++
++  it('传输抛错(migration 条目,非 from:deposit)→ 日志如实说只丢缓存(N3)', async () => {
++    createDepositHarness()
++    await loadDepositStore()
++    setDepositTransport((async (kind: string) => {
++      if (kind === 'deposit-state-load') return { reqId: 'l', reply: true, ok: true, state: null, generation: 0 } as PersistReply
++      throw new Error('bridge down')
++    }) as never)
++    const errorSpy = vi.spyOn(debugLogger, 'error')
++    errorSpy.mockClear() // 防御性清空:vi.spyOn 复用已有 spy 实例时会带着上一个用例的调用记录
++
++    // recordMigration 写入的是 from:'ledger' 的 map 条目,不占宿主寄存配额——丢了
++    // 确实只是下次重跑迁移,日志不该被 N3 的"配额孤儿"措辞误伤。
++    await expect(
++      recordMigration([['mivo-asset:legacy', draft('legacyhash', 0, 'ledger')]], { version: 1, at: 5, migrated: 1 }),
++    ).resolves.toMatchObject({ ok: false, reason: 'transport' })
++    expect(errorSpy).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('只丢缓存'))
++    expect(errorSpy).not.toHaveBeenCalledWith(expect.anything(), expect.stringContaining('配额孤儿风险'))
++  })
++
++  it('N3 三审:失败出口不能用 await 之前算的旧 effective——await 期间到达的 from:deposit mutation 必须被日志看见(judge 时序反例)', async () => {
++    // judge 时序:首批只碰 from:'ledger' 的迁移条目(若按旧口径,丢了"只丢缓存")→
++    // 首批的 transport 调用卡住期间,第二个 mutation(from:'deposit')到达并已经
++    // 真实改了 memory → 首批回执"被拒"(rejected,不是冲突)。旧实现在 await 之前就
++    // 算好了 effective,失败出口复用那份旧快照——看不到 await 期间到达的新 mutation,
++    // 日志仍然说"只丢缓存",漏报了真实的配额孤儿风险。
++    const harness = createDepositHarness()
++    await loadDepositStore()
++
++    let releaseFirstSave: (() => void) | undefined
++    const firstSaveGate = new Promise<void>((resolve) => {
++      releaseFirstSave = resolve
++    })
++    let firstSaveStarted: (() => void) | undefined
++    const firstSaveStartedGate = new Promise<void>((resolve) => {
++      firstSaveStarted = resolve
++    })
++    setDepositTransport((async (kind: string, payload?: Record<string, unknown>) => {
++      if (kind === 'deposit-state-load') {
++        return { reqId: 'l', reply: true, ...(await harness.brain.handles.deposit.stateLoad()) } as PersistReply
++      }
++      void payload
++      firstSaveStarted?.()
++      await firstSaveGate
++      // 电子脑如实拒绝(不是 CAS 冲突)。
++      return { reqId: 's1', reply: true, ok: false, message: '模拟宿主拒绝' } as PersistReply
++    }) as never)
++
++    const migrationCommit = recordMigration(
++      [['mivo-asset:legacy', draft('legacyhash', 0, 'ledger')]],
++      { version: 1, at: 5, migrated: 1 },
++    )
++    await firstSaveStartedGate // 首批已经把只含 legacy 条目的 payload 序列化完毕、卡在 transport 里
++
++    const errorSpy = vi.spyOn(debugLogger, 'error')
++    errorSpy.mockClear()
++
++    // await 期间到达的新 mutation:from:'deposit',首批 payload 序列化时根本看不到它。
++    const depositCommit = recordDeposit('mivo-asset:fresh', draft('fresh-hash', 1, 'deposit'))
++    await Promise.resolve()
++    await Promise.resolve() // 确保 depositCommit 的 mutator 已经同步跑完、真实改了 memory/dirty
++
++    releaseFirstSave?.()
++    const [migrationResult] = await Promise.all([migrationCommit, depositCommit])
++    expect(migrationResult.ok).toBe(false)
++    expect(migrationResult.reason).toBe('rejected')
++
++    // 失败出口现算「本批 ∪ 当下活的 dirty」,能看见 await 期间到达的 from:'deposit'
++    // mutation,如实报配额孤儿风险——不能因为首批 payload 本身只有 legacy 条目就
++    // 说"只丢缓存"。
++    expect(errorSpy).toHaveBeenCalledWith(expect.anything(), expect.stringContaining('配额孤儿风险'))
++    expect(errorSpy).not.toHaveBeenCalledWith(expect.anything(), expect.stringContaining('只丢缓存'))
++  })
++})
++
++describe('depositStore — 墓碑 TTL 与 GC 水位(设计稿 §4.10.6.1)', () => {
++  it('超过 TTL 的墓碑在下一次提交时被清理,并记录 per-asset releasedFloor(B3)', async () => {
++    let nowMs = 1_700_000_000_000
++    setDepositClockForTests(() => nowMs)
++    createDepositHarness()
++
++    await recordDeposit('mivo-asset:1', draft('h', 1, 'deposit'))
++    await invalidateDeposit('mivo-asset:1')
++    expect(peekDepositStoreForTests()?.releasedTombstones['mivo-asset:1']).toBeTruthy()
++
++    nowMs += 25 * 60 * 60 * 1_000 // 前进 25 小时,超过 24h TTL
++    await recordDeposit('mivo-asset:2', draft('h2', 2, 'deposit')) // 任意一次提交都会顺带 GC
++
++    const state = peekDepositStoreForTests()
++    expect(state?.releasedTombstones['mivo-asset:1']).toBeUndefined()
++    // 记录挂在这个 assetUrl 自己名下,不是全局单一水位(B3:取代 tombstoneGcFloor)。
++    expect(state?.releasedFloor['mivo-asset:1']?.generation).toBeDefined()
++    // 不相关的 asset(mivo-asset:2)不该有 releasedFloor 记录——它从未被释放过。
++    expect(state?.releasedFloor['mivo-asset:2']).toBeUndefined()
++  })
++
++  it('时钟回拨不会让同一 asset 的 releasedFloor.at 倒退(GC 判定不因回拨提前剪枝)', async () => {
++    let nowMs = 1_700_000_000_000
++    setDepositClockForTests(() => nowMs)
++    createDepositHarness()
++
++    // 同一个 assetUrl 释放两次(中间重新寄存),两次都age 过 TTL 触发 GC,验证*这个
++    // asset 自己*的 releasedFloor.at 单调不减——per-asset 记录后,监控的是"每个
++    // asset 自己的历史",不是曾经的全局单一水位。
++    await recordDeposit('mivo-asset:1', draft('h', 1, 'deposit'))
++    await invalidateDeposit('mivo-asset:1')
++    nowMs += 25 * 60 * 60 * 1_000
++    await recordDeposit('mivo-asset:2', draft('h2', 2, 'deposit'))
++    const floorAfterFirstGc = peekDepositStoreForTests()?.releasedFloor['mivo-asset:1']?.at ?? 0
++    expect(floorAfterFirstGc).toBeGreaterThan(0)
++
++    nowMs -= 10 * 60 * 60 * 1_000 // 回拨 10 小时
++    await recordDeposit('mivo-asset:1', draft('h3', 3, 'deposit'))
++    await invalidateDeposit('mivo-asset:1')
++    nowMs += 25 * 60 * 60 * 1_000 // 再前进,触发第二次 GC(仍是同一个 asset)
++    await recordDeposit('mivo-asset:4', draft('h4', 4, 'deposit'))
++
++    const floorAfterSecondGc = peekDepositStoreForTests()?.releasedFloor['mivo-asset:1']?.at ?? 0
++    expect(floorAfterSecondGc).toBeGreaterThanOrEqual(floorAfterFirstGc)
++  })
++
++  it('GC 不剪还有未消费 pendingReleases 的 hash 的墓碑(finding 3)', async () => {
++    let nowMs = 1_700_000_000_000
++    setDepositClockForTests(() => nowMs)
++    createDepositHarness()
++
++    await recordDeposit('mivo-asset:1', draft('h', 1, 'deposit'))
++    await invalidateDeposit('mivo-asset:1')
++    await enqueuePendingRelease('h', 'deposit') // release 失败,排队待重试——还没真正释放完
++
++    nowMs += 25 * 60 * 60 * 1_000 // 前进 25 小时,超过 24h TTL
++    await recordDeposit('mivo-asset:2', draft('h2', 2, 'deposit')) // 任意一次提交都会顺带 GC
++
++    // 墓碑不能被剪:它是"这个 hash 已释放"的唯一凭据,先没了的话,一份还留着旧
++    // 映射的过期本地状态(另一面板实例的陈旧内存)万一被当作权威读回,会在没有
++    // tombstone 挡着的情况下把它复活。
++    const state = peekDepositStoreForTests()
++    expect(state?.releasedTombstones['mivo-asset:1']).toBeTruthy()
++
++    // 一旦 pendingReleases 被消费掉(重试成功),GC 才允许把墓碑剪掉。
++    await dequeuePendingRelease('h')
++    await recordDeposit('mivo-asset:3', draft('h3', 3, 'deposit'))
++    expect(peekDepositStoreForTests()?.releasedTombstones['mivo-asset:1']).toBeUndefined()
++  })
++
++  it('B3 三审:releasedFloor 按整代退休窗口(K=3)安全清除,不是数量或 TTL 单独决定', async () => {
++    let nowMs = 1_700_000_000_000
++    setDepositClockForTests(() => nowMs)
++    createDepositHarness()
++
++    await recordDeposit('mivo-asset:1', draft('h', 1, 'deposit')) // gen 1
++    await invalidateDeposit('mivo-asset:1') // gen 2,墓碑自己的 gen=2(releaseGen=2)
++    nowMs += 25 * 60 * 60 * 1_000 // 超 24h TTL
++    await recordDeposit('mivo-asset:2', draft('h2', 2, 'deposit')) // gen 3,顺带 GC:floor.generation=2
++    expect(peekDepositStoreForTests()?.releasedFloor['mivo-asset:1']).toMatchObject({ generation: 2 })
++    expect(peekDepositStoreForTests()?.generation).toBe(3)
++
++    // currentGen(下一次提交的 targetGen)还没跨过 releaseGen+K=2+3=5,原样保留。
++    await recordDeposit('mivo-asset:3', draft('h3', 3, 'deposit')) // gen 4,4>=5? 否
++    expect(peekDepositStoreForTests()?.releasedFloor['mivo-asset:1']).toBeDefined()
++
++    // 跨过窗口:targetGen=5,5>=5 → 安全退休,清除。
++    await recordDeposit('mivo-asset:4', draft('h4', 4, 'deposit')) // gen 5
++    expect(peekDepositStoreForTests()?.releasedFloor['mivo-asset:1']).toBeUndefined()
++  })
++
++  it('B3 三审:releasedFloor 已达上限时,新过期的墓碑延后转换(证据原样留在 releasedTombstones,不做 LRU 强退挤掉已有条目)', async () => {
++    let nowMs = 1_700_000_000_000
++    setDepositClockForTests(() => nowMs)
++    createDepositHarness()
++
++    // 白盒预置(避免跑 2000 次真实提交):直接灌满已在上限的 floor——具体内容不影响
++    // 本测试要验证的"净增一条时延后转换,不挤掉已有条目"这个行为。
++    await loadDepositStore()
++    const seeded = peekDepositStoreForTests()
++    if (!seeded) throw new Error('unreachable: load 后必有 memory')
++    for (let index = 0; index < DEPOSIT_RELEASED_FLOOR_MAX_ENTRIES; index += 1) {
++      seeded.releasedFloor['seed-' + index] = { generation: 1, at: nowMs }
++    }
++
++    const warnSpy = vi.spyOn(debugLogger, 'warn')
++    warnSpy.mockClear()
++
++    await recordDeposit('mivo-asset:1', draft('h', 1, 'deposit'))
++    await invalidateDeposit('mivo-asset:1')
++    nowMs += 25 * 60 * 60 * 1_000 // 超 TTL,触发这条墓碑的 GC 尝试
++    await recordDeposit('mivo-asset:2', draft('h2', 2, 'deposit'))
++
++    const after = peekDepositStoreForTests()
++    // 已达上限 + 这是一条净增(不是覆盖已有 key)→ 延后转换:墓碑原样留着,不是被
++    // 压缩成 floor。
++    expect(after?.releasedTombstones['mivo-asset:1']).toBeTruthy()
++    expect(after?.releasedFloor['mivo-asset:1']).toBeUndefined()
++    // 已有的 2000 条 seed floor 一条没少——不是靠挤掉别人来腾位置(judge 反例①要堵的口子)。
++    expect(Object.keys(after?.releasedFloor ?? {})).toHaveLength(DEPOSIT_RELEASED_FLOOR_MAX_ENTRIES)
++    // SC8.3(八轮):warn 文案改为覆盖条目数闸与字节闸的统一措辞,不再是"已达上限"
++    // 这句只对应条目数闸的老文案——这里改断言"容量硬闸延后剪"这句两种闸都会出现的
++    // 共同前缀,不依赖具体是哪一道闸触发的措辞细节。
++    expect(warnSpy.mock.calls.some((call) => String(call[1]).includes('容量硬闸延后剪'))).toBe(true)
+   })
+ })
+ 
++// 八轮返修必测清单(①③⑤⑥⑦②④在此;⑧⑩main.js 侧见 depositBrain.test.ts;⑨全仓
++// grep 核对,不是可自动化的 vitest 断言,报告里单独给证据)。
+ describe('depositStore — 诚实兜底', () => {
+   afterEach(() => {
+     teardownDepositHarness()

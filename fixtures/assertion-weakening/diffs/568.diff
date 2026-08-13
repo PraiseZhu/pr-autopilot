@@ -1,0 +1,1683 @@
+diff --git a/docs/loops/bug-doctor.md b/docs/loops/bug-doctor.md
+index 66e58339..a18c4aa7 100644
+--- a/docs/loops/bug-doctor.md
++++ b/docs/loops/bug-doctor.md
+@@ -135,8 +135,18 @@ SLA:patrol 每小时提供入口,**对账与核验都按 backlog 逐轮消化,
+ 交互类(@接单/按钮批准)= 二期 T-Intake。
+ 
+ **投递方式(按类别拆开,避免与实际接线漂移)**:
+-- **T0 告警(#1)**:脚本层,整点轻巡由 `patrol.mjs` 经 `notify.mjs` 的 `sendAlert` 走 Slack incoming webhook 投递(webhook 写在 `<stateDir>/notify.env` 的 `SLACK_WEBHOOK_URL`,不入库),Mivo 机器人身份。
+-- **每日战报(#3)**:主会话收尾时把播报正文管道给 `scripts/loops/bug-doctor/broadcast.mjs --title "<标题>"`(内部同样调 `loadNotifyConfig`/`sendAlert`),同一 webhook、同一 Mivo 身份,**不再使用会话层已连接的 Slack 通道发送**——旧做法以用户本人身份发出,与脚本层告警形成双重身份,已统一收口。webhook 未配置或投递失败时,`sendAlert` 自动降级到 `<stateDir>/pending-alerts.md`(必落),不引入"换一个身份/通道重发"这种兜底,避免重新制造双身份;不静默丢,失败可从 `pending-alerts.md` 事后核对补报。降级路径另有 macOS 桌面横幅,但**默认关闭**,需 `MIVO_NOTIFY_DESKTOP=1` 显式开启(2026-08-05 owner 拍板:生产 stateDir 已配 Slack、本不该走降级,真正会弹的是测试与本地复现的临时 stateDir,内容是假 OID/假 PR 号,纯噪音)。桌面横幅只是尽力而为,关掉不影响上面"必落"的保证。
++- **T0 告警(#1)**:脚本层,整点轻巡由 `patrol.mjs` 经 `notify.mjs` 的 `sendAlert` 走 Slack incoming webhook 投递(webhook 写在 `<stateDir>/notify.env` 的 `SLACK_WEBHOOK_URL`,不入库),Mivo 机器人身份。发送前先经 `scripts/loops/bug-doctor/persona-shell.mjs`(tone=`p0-alert`)尝试追加一行人格收尾句,见下方「人格壳润色(persona-shell)」。
++- **每日战报(#3)**:主会话收尾时把播报正文管道给 `scripts/loops/bug-doctor/broadcast.mjs --title "<标题>"`(内部同样调 `loadNotifyConfig`/`sendAlert`,发送前先经 `persona-shell.mjs` 尝试追加一行人格收尾句,tone=`daily-report`),同一 webhook、同一 Mivo 身份,**不再使用会话层已连接的 Slack 通道发送**——旧做法以用户本人身份发出,与脚本层告警形成双重身份,已统一收口。webhook 未配置或投递失败时,`sendAlert` 自动降级到 `<stateDir>/pending-alerts.md`(必落),不引入"换一个身份/通道重发"这种兜底,避免重新制造双身份;不静默丢,失败可从 `pending-alerts.md` 事后核对补报。降级路径另有 macOS 桌面横幅,但**默认关闭**,需 `MIVO_NOTIFY_DESKTOP=1` 显式开启(2026-08-05 owner 拍板:生产 stateDir 已配 Slack、本不该走降级,真正会弹的是测试与本地复现的临时 stateDir,内容是假 OID/假 PR 号,纯噪音)。桌面横幅只是尽力而为,关掉不影响上面"必落"的保证。
++
++**人格壳润色(persona-shell,2026-08-06 新增)**:P0 告警与每日战报此前是纯技术信息 dump(数字/URL/簇指纹/台账路径全是事实,没有一丝 Mivo 的语气)。`persona-shell.mjs` 只做一件事:在**不改一个字原文**的前提下,让 LLM 产出一行极短的态度收尾句追加在正文末尾——事实校验因此从"猜哪些字符串是事实"简化为"这一行本身是否守规矩"(不含数字/URL/#号/反引号,表情按 tone 配额,详见该文件头注释)。
++
++- **默认关闭**:`MIVO_PERSONA_SHELL_ENABLE` 必须显式设为 `'1'` 才会尝试请求;未设置时零网络调用,行为与改动前完全一致。`MIVO_PERSONA_SHELL_DISABLE='1'` 优先级最高,网关抽风时不用改代码/重新部署即可临时熄火。
++- **模型固定,不设回退链**:`deepseek/deepseek-v4-flash`(可用 `MIVO_PERSONA_SHELL_MODEL` 覆盖,仅供测试/临时排障),**单次尝试,失败不换模型**——P0 是 hourly critical alert,多试一次模型意味着多等一轮超时,不值得为润色多拖延告警。
++- **超时按 tone 收紧**:P0(`p0-alert`)5 秒,每日战报(`daily-report`)15 秒;超时/网络错误/HTTP 非 200/响应无内容/输出校验不过,**一律回落发送原始文案**,不阻断、不重试、不静默丢。
++- **key 来源**:复用 `scripts/loops/merge-thanks/from-github-event.mjs` 同名的 `MIVO_CHANGELOG_LLM_KEY`,经 `notify.mjs` 的 `loadNotifyConfig`(`<stateDir>/notify.env` 或进程环境变量)读取;未配置时直接跳过(`reason: 'llm-key-missing'`),不算错误。
++- **失明告警(`buildBlindnessAlert`)不接入**:loop 自己连续失败已是"巡检本身瘫了"的极端信号,不该再叠加一层可能失败的网络调用,维持零 LLM。
++- **代码合入 ≠ 生产生效**:本机/macmini 的 `notify.env` 是否已配置 `MIVO_CHANGELOG_LLM_KEY` 是运维待办,不在代码验收范围——未配置时功能行为是设计内的 fail-open"跳过",不是缺陷。
++- **已知残余风险(owner 已知悉并明确接受)**:事实断言校验(`FACT_CLAIM_MARKERS` 等)是黑名单机制,三审过程中已多轮扩充覆盖故障播报领域已发现的具体变体,但结构上无法保证穷尽全部中文自然语言表达——理论上仍可能有未枚举到的"已恢复/已解决"类同义说法通过校验被追加到正文末尾。值班处置**必须以告警正文本体为准**,收尾句仅为装饰性语气,不代表状态判定。owner 拍板维持当前黑名单校验实现,不改为"从固定短句库选择"的模板机制(会牺牲收尾句的上下文相关性)。
+ - **PR 合并播报(#5)——同仓 PR 唯一发送方是云端 workflow(2026-08-01 owner 拍板);
+   fork(跨仓)PR 由本机兜底**:同仓由
+   `.github/workflows/merge-thanks.yml` 在 `pull_request: closed` 且 `merged==true` 时发出,
+diff --git a/scripts/loops/bug-doctor/broadcast.mjs b/scripts/loops/bug-doctor/broadcast.mjs
+index f4350964..966d833b 100644
+--- a/scripts/loops/bug-doctor/broadcast.mjs
++++ b/scripts/loops/bug-doctor/broadcast.mjs
+@@ -7,6 +7,10 @@
+ // notify.mjs(loadNotifyConfig/sendAlert),让会话层播报也统一经 webhook 以 Mivo 身份发出。
+ // 契约见 docs/loops/bug-doctor.md「通知与播报」节。
+ //
++// 发送前经 persona-shell.mjs(tone='daily-report')尝试追加一行人格收尾句:默认关闭
++// (MIVO_PERSONA_SHELL_ENABLE=1 才尝试),单次超时 15s,失败/禁用一律照发主会话写好的原始
++// 正文,不阻断、不重试、不换模型——与 P0 告警(patrol.mjs)共用同一份降级契约,只是 tone 不同。
++//
+ // 用法: <正文> | node scripts/loops/bug-doctor/broadcast.mjs --title "<标题>" [--state-dir <dir>]
+ //   --title:必填,播报标题行。
+ //   正文:从 stdin 读取,原样投递(非 TTY 场景才读,避免交互式误跑时无限等待 EOF)。
+@@ -17,11 +21,11 @@
+ // 绝不能拖累调用方(主会话收尾 / loop 收尾脚本)。sendAlert 自身已做 webhook →
+ // pending-alerts.md + 桌面通知的降级,这里再包一层顶层 try/catch 兜底"notify.mjs 装载
+ // 本身都失败"的极端情况。输出恒为一行 JSON:
+-//   { ok, title, channel: 'api'|'webhook'|'degraded'|'error', desktopNotified?, error? }
++//   { ok, title, channel: 'api'|'webhook'|'degraded'|'error', desktopNotified?, shellApplied?, shellReason?, error? }
+ 
+ import { readFileSync } from 'node:fs'
+ import { resolve, join, dirname } from 'node:path'
+-import { fileURLToPath } from 'node:url'
++import { fileURLToPath, pathToFileURL } from 'node:url'
+ 
+ function printResult(obj) {
+   process.stdout.write(`${JSON.stringify(obj, null, 2)}\n`)
+@@ -32,34 +36,104 @@ function argAfter(flag) {
+   return i >= 0 ? (process.argv[i + 1] ?? '') : ''
+ }
+ 
+-try {
+-  const title = argAfter('--title')
+-  if (!title) {
+-    printResult({ ok: false, channel: 'error', error: '缺少 --title' })
++// R6-CX-002 续(codex-adversarial R7 补充):title/text 的类型校验已统一到 runBroadcast 里,
++// 但 stateDir 此前完全没有默认值——CLI 路径的 main() 总会算出一个具体路径再传进来,直接调用
++// 本导出函数省略 stateDir 时,`loadNotifyConfig(stateDir)` 内部 `join(undefined, ...)` 会
++// 抛未分类 TypeError,复现了同一类"CLI 挡了、函数没挡"的分裂。抽成共享函数,让 main() 与
++// runBroadcast 的默认值算法保持同一份实现,不会出现两处独立维护而漂移。
++function defaultStateDir() {
++  const __dirname = dirname(fileURLToPath(import.meta.url))
++  const REPO_ROOT = resolve(__dirname, '..', '..', '..')
++  return resolve(process.env.MIVO_BUG_DOCTOR_STATE_DIR || join(REPO_ROOT, 'history', 'loops', 'bug-doctor'))
++}
++
++/**
++ * 组装(经 persona-shell 尝试追加人格壳)+ 投递一条会话层播报。抽成导出函数(不像原来
++ * 全部塞在顶层 try 里)——只有这样才能在单测里 mock notify.mjs/persona-shell.mjs 做行为
++ * 断言,不用真的起子进程打真实网络。
++ *
++ * **必填校验写在这里,不写在 CLI 的 main()**(hardening-checklist 第 5 类「函数入口和 CLI
++ * 入口同等 fail-closed」;2026-08-06 review 实测:改之前 main() 单独挡了缺 --title,但直接
++ * 调用本导出函数 `runBroadcast({ text })` 不传 title 会绕过检查,产出标题字面量为
++ * `"undefined"` 的告警并落进 pending-alerts.md,`ok` 还报 `true`)——校验只在一处,CLI 与
++ * 未来任何直接调用方天然共享同一条 fail-closed 规则,不会出现"CLI 挡了、函数没挡"的分裂。
++ */
++export async function runBroadcast(params) {
++  // R6-CX-002(codex-adversarial R6):原先直接在函数签名里解构 `{ title, text, stateDir }`——
++  // 调用方传 `undefined`/`null`/不传参数(`runBroadcast()`)时,解构本身就会抛出未分类的
++  // TypeError,绕过下面全部 fail-closed 校验直接崩给调用方,违反本文件开头"退出码恒 0,
++  // 从不抛出"的核心契约(CLI 路径靠外层 try/catch 兜住看不出来,但直接调用方没有这层保护)。
++  // 用 `??` 把 `null`/`undefined` 一并归一成空对象,让后续 typeof 检查照常接管。
++  const { title, text, stateDir: rawStateDir } = params ?? {}
++  // R2-CX-003(codex-adversarial R2):`!title` 只挡 falsy 值,挡不住类型错误——传对象/数组/
++  // 数字等 truthy 非字符串 title 会一路流到 sendAlert,被字符串化成 "[object Object]" 这类
++  // 内容写进 pending-alerts.md,`ok` 还报 `true`。CLI 入口的 argAfter 只会产出字符串或
++  // undefined,不会触发这条,但直接调用本导出函数的路径没有这层保护,必须在唯一校验点补上
++  // 类型检查(同上方"必填校验写在这里,不写在 main()"的理由,不能只挡 CLI 挡不住函数调用)。
++  if (typeof title !== 'string' || title.trim() === '') {
++    return { ok: false, channel: 'error', error: '缺少 --title' }
++  }
++  // PR-PS-R3-CX-002(codex-adversarial R3):上面只加了 title 的类型校验,text 同样是直接调用
++  // 路径可传入的必填字段,同样会被非字符串值(对象/数组等)绕过后字符串化成 "[object Object]"
++  // 写进 pending-alerts.md——CLI 路径的 stdin 读取只产出字符串,不会触发,但直接调用方没有
++  // 这层保护,必须同一处补齐。
++  if (typeof text !== 'string') {
++    return { ok: false, channel: 'error', error: 'text 必须是字符串' }
++  }
++  // stateDir 契约(lead 拍板,2026-08-07):省略该字段 / `null` / `undefined` 三者视为"未指定",
++  // 回落 defaultStateDir()——这与 CLI 路径 main() 总会算出一个具体路径再传进来的语义一致,
++  // 是保留的现有行为。除此之外的任何非字符串值({}/0/[]/true 等)或空/纯空白字符串,此前会
++  // 一路流到 `loadNotifyConfig(stateDir)` 内部的 `join()`,分别抛出未分类的
++  // `ERR_INVALID_ARG_TYPE`/`ENOENT: mkdir ''`,违反本文件开头"退出码恒 0,从不抛出"的契约。
++  // 同 title/text 已有的 typeof 校验风格,在唯一校验点补上同等的受控返回,不抛异常。
++  let stateDir
++  if (rawStateDir === null || rawStateDir === undefined) {
++    stateDir = defaultStateDir()
++  } else if (typeof rawStateDir !== 'string' || rawStateDir.trim() === '') {
++    return { ok: false, channel: 'error', error: 'stateDir 必须是非空字符串' }
+   } else {
+-    const __dirname = dirname(fileURLToPath(import.meta.url))
+-    const REPO_ROOT = resolve(__dirname, '..', '..', '..')
+-    const stateDir = resolve(
+-      argAfter('--state-dir') || process.env.MIVO_BUG_DOCTOR_STATE_DIR || join(REPO_ROOT, 'history', 'loops', 'bug-doctor'),
+-    )
++    stateDir = rawStateDir
++  }
++  // 动态 import(而非顶层 import):notify.mjs / persona-shell.mjs 装载失败只应让调用方的
++  // catch 兜住,不该让整个播报能力在模块装载阶段就以非 0 退出。
++  const { loadNotifyConfig, sendAlert } = await import('./notify.mjs')
++  const { buildPersonaShell } = await import('./persona-shell.mjs')
++  const config = loadNotifyConfig(stateDir)
++  const shell = await buildPersonaShell({ tone: 'daily-report', title, text, key: config.MIVO_CHANGELOG_LLM_KEY })
++  const result = await sendAlert({ stateDir, config, title: shell.title, text: shell.text })
++  return {
++    ok: true,
++    title: shell.title,
++    ...result,
++    shellApplied: shell.applied,
++    ...(shell.reason ? { shellReason: shell.reason } : {}),
++  }
++}
++
++async function main() {
++  const title = argAfter('--title')
++  const stateDir = resolve(argAfter('--state-dir') || defaultStateDir())
+ 
+-    let text = ''
+-    if (!process.stdin.isTTY) {
+-      try {
+-        text = readFileSync(0, 'utf8').trim()
+-      } catch {
+-        /* stdin 不可读(极少见)—— 允许空文本,仍照常投递标题 */
+-      }
++  let text = ''
++  if (!process.stdin.isTTY) {
++    try {
++      text = readFileSync(0, 'utf8').trim()
++    } catch {
++      /* stdin 不可读(极少见)—— 允许空文本,仍照常投递标题 */
+     }
++  }
+ 
+-    // 动态 import(而非顶层 import):notify.mjs 装载失败只应让这里落进 catch,
+-    // 不该让整个播报能力在模块装载阶段就以非 0 退出。
+-    const { loadNotifyConfig, sendAlert } = await import('./notify.mjs')
+-    const config = loadNotifyConfig(stateDir)
+-    const result = await sendAlert({ stateDir, config, title, text })
++  printResult(await runBroadcast({ title, text, stateDir }))
++}
+ 
+-    printResult({ ok: true, title, ...result })
++// 只有被当脚本直接跑时才执行 main —— 被 import(单测 runBroadcast)时不产生任何副作用
++// (读 stdin/发真实网络请求)。与 patrol.mjs / from-github-event.mjs 同一种自我识别写法。
++const invokedDirectly = process.argv[1]
++  && pathToFileURL(resolve(process.argv[1])).href === import.meta.url
++if (invokedDirectly) {
++  try {
++    await main()
++  } catch (e) {
++    printResult({ ok: false, channel: 'error', error: String(e?.message ?? e) })
+   }
+-} catch (e) {
+-  printResult({ ok: false, channel: 'error', error: String(e?.message ?? e) })
+ }
+diff --git a/scripts/loops/bug-doctor/broadcast.test.mjs b/scripts/loops/bug-doctor/broadcast.test.mjs
+new file mode 100644
+index 00000000..ce23ab18
+--- /dev/null
++++ b/scripts/loops/bug-doctor/broadcast.test.mjs
+@@ -0,0 +1,212 @@
++// broadcast.test.mjs — runBroadcast 的 persona-shell 接入行为(mock notify.mjs/persona-shell.mjs,
++// 不打真实网络;子进程 CLI 契约另用 execFileSync 覆盖"缺 --title"与"invokedDirectly 守卫生效"两点)
++import { execFileSync } from 'node:child_process'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { dirname, join } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.mock('./notify.mjs', () => ({
++  loadNotifyConfig: vi.fn(() => ({ MIVO_CHANGELOG_LLM_KEY: 'k' })),
++  sendAlert: vi.fn(async () => ({ channel: 'webhook', desktopNotified: false })),
++}))
++vi.mock('./persona-shell.mjs', () => ({
++  buildPersonaShell: vi.fn(),
++}))
++
++import { loadNotifyConfig, sendAlert } from './notify.mjs'
++import { buildPersonaShell } from './persona-shell.mjs'
++import { runBroadcast } from './broadcast.mjs'
++
++const __dirname = dirname(fileURLToPath(import.meta.url))
++const BROADCAST = join(__dirname, 'broadcast.mjs')
++
++beforeEach(() => {
++  vi.clearAllMocks()
++  loadNotifyConfig.mockReturnValue({ MIVO_CHANGELOG_LLM_KEY: 'k' })
++  sendAlert.mockResolvedValue({ channel: 'webhook', desktopNotified: false })
++})
++
++describe('runBroadcast — persona-shell 接入行为', () => {
++  it('persona-shell 成功追加壳时,sendAlert 与最终输出都带 shell 处理后的 title,shellApplied=true', async () => {
++    buildPersonaShell.mockResolvedValue({
++      title: '壳标题', text: '原文\n壳收尾', attempted: true, applied: true, model: 'deepseek/deepseek-v4-flash', latencyMs: 20, reason: null,
++    })
++    const out = await runBroadcast({ title: '原标题', text: '原文', stateDir: '/tmp/x' })
++
++    expect(buildPersonaShell).toHaveBeenCalledWith({ tone: 'daily-report', title: '原标题', text: '原文', key: 'k' })
++    expect(sendAlert.mock.calls[0][0]).toMatchObject({ title: '壳标题', text: '原文\n壳收尾' })
++    expect(out).toMatchObject({ ok: true, title: '壳标题', channel: 'webhook', shellApplied: true })
++    expect(out.shellReason).toBeUndefined()
++  })
++
++  // R2-CX-003(codex-adversarial R2):原 `!title` 校验只挡 falsy 值,挡不住类型错误——直接
++  // 调用 runBroadcast 传对象/数组等 truthy 非字符串 title 会绕过检查,一路流到 sendAlert
++  // 被字符串化成 "[object Object]" 写进 pending-alerts.md,且 `ok` 还报 `true`。
++  it('title 是非字符串(如对象)时拒绝,不透传给 sendAlert', async () => {
++    const out = await runBroadcast({ title: { a: 1 }, text: '正文', stateDir: '/tmp/x' })
++    expect(out).toEqual({ ok: false, channel: 'error', error: '缺少 --title' })
++    expect(sendAlert).not.toHaveBeenCalled()
++  })
++
++  it('title 是空白字符串时拒绝(同缺失语义)', async () => {
++    const out = await runBroadcast({ title: '   ', text: '正文', stateDir: '/tmp/x' })
++    expect(out).toEqual({ ok: false, channel: 'error', error: '缺少 --title' })
++    expect(sendAlert).not.toHaveBeenCalled()
++  })
++
++  // R6-CX-002(codex-adversarial R6):原先直接在函数签名解构参数,调用方传 undefined/null/
++  // 不传参数时解构本身就抛未分类 TypeError,绕过全部 fail-closed 校验直接崩给调用方——
++  // 违反本文件"退出码恒 0,从不抛出"的契约。三种调用形态都不应抛异常。
++  it.each([undefined, null, '__no_arg__'])('调用方传 %s 时不抛异常,返回标准缺失错误', async (arg) => {
++    const out = arg === '__no_arg__' ? await runBroadcast() : await runBroadcast(arg)
++    expect(out).toEqual({ ok: false, channel: 'error', error: '缺少 --title' })
++    expect(sendAlert).not.toHaveBeenCalled()
++  })
++
++  // R6-CX-002 续(codex-adversarial R7 补充):title/text 都给了但省略 stateDir 时,曾在
++  // loadNotifyConfig(undefined) 内部 join(undefined, ...) 处抛未分类 TypeError——同一类
++  // "CLI 挡了、函数没挡"的分裂。这里断言 loadNotifyConfig 收到的 stateDir 是具体字符串
++  // (defaultStateDir() 算出的默认值),不是 undefined,不抛异常。
++  it('title/text 都给了但省略 stateDir 时,不抛异常,loadNotifyConfig 收到具体默认路径', async () => {
++    buildPersonaShell.mockResolvedValue({
++      title: 't', text: 'b', attempted: false, applied: false, model: null, latencyMs: null, reason: 'disabled-by-default',
++    })
++    const out = await runBroadcast({ title: 't', text: 'b' })
++    expect(out.ok).toBe(true)
++    expect(loadNotifyConfig).toHaveBeenCalledTimes(1)
++    expect(typeof loadNotifyConfig.mock.calls[0][0]).toBe('string')
++    expect(loadNotifyConfig.mock.calls[0][0].length).toBeGreaterThan(0)
++  })
++
++  // R8-CX-001(codex-adversarial R8):默认参数只在属性值为 undefined 时触发——显式传
++  // `stateDir: null`(不是省略)时上一轮的写法不生效,null 原样流到 loadNotifyConfig(null)
++  // 仍抛未分类 TypeError。改用 `??` 后应同时覆盖"省略"与"显式 null"两种情况。
++  it('title/text 都给了但显式传 stateDir: null 时,同样不抛异常,走同一份默认路径', async () => {
++    buildPersonaShell.mockResolvedValue({
++      title: 't', text: 'b', attempted: false, applied: false, model: null, latencyMs: null, reason: 'disabled-by-default',
++    })
++    const out = await runBroadcast({ title: 't', text: 'b', stateDir: null })
++    expect(out.ok).toBe(true)
++    expect(loadNotifyConfig).toHaveBeenCalledTimes(1)
++    expect(typeof loadNotifyConfig.mock.calls[0][0]).toBe('string')
++    expect(loadNotifyConfig.mock.calls[0][0].length).toBeGreaterThan(0)
++  })
++
++  // SC-1/SC-4(lead 2026-08-07 拍板的 stateDir 契约,worker 复现验证):`null`/`undefined`/省略
++  // 三者视为"未指定",回落 defaultStateDir()(上面两条用例已覆盖)。此处覆盖契约的另一半——
++  // 除此之外的任何非字符串值({}/0/[]/true 等)或空/纯空白字符串,此前会一路流到
++  // `loadNotifyConfig()` 内部的 `join()`,分别抛出未分类的 `ERR_INVALID_ARG_TYPE`(对象/数字/
++  // 数组/布尔)或 `ENOENT: mkdir ''`(空/纯空白字符串),而不是本文件开头承诺的"退出码恒 0,
++  // 从不抛出"。这些值与 null/undefined 处理方式不同,是因为它们不是"调用方没传"的自然表达
++  // (省略字段/明确传 null),而是传了一个类型或内容错误的值——理应受控拒绝,不该被悄悄
++  // 当作"未指定"兜底成默认路径,那样会掩盖调用方的用法错误。
++  it.each([
++    ['{}', {}],
++    ['0', 0],
++    ["''", ''],
++    ["'   '", '   '],
++    ['[]', []],
++    ['true', true],
++  ])('stateDir 是畸形值 %s 时拒绝,不抛异常,不透传给 sendAlert/loadNotifyConfig', async (_label, badStateDir) => {
++    const out = await runBroadcast({ title: '正常标题', text: '正文', stateDir: badStateDir })
++    expect(out).toEqual({ ok: false, channel: 'error', error: 'stateDir 必须是非空字符串' })
++    expect(loadNotifyConfig).not.toHaveBeenCalled()
++    expect(sendAlert).not.toHaveBeenCalled()
++  })
++
++  // PR-PS-R3-CX-002(codex-adversarial R3):title 补了类型校验,text 是同一直接调用路径上
++  // 同样必填的字段,此前没有同等保护——object/array 等非字符串 text 会被字符串化成
++  // "[object Object]" 写进播报。
++  it('text 是非字符串(如对象)时拒绝,不透传给 sendAlert', async () => {
++    const out = await runBroadcast({ title: '正常标题', text: { bad: true }, stateDir: '/tmp/x' })
++    expect(out).toEqual({ ok: false, channel: 'error', error: 'text 必须是字符串' })
++    expect(sendAlert).not.toHaveBeenCalled()
++  })
++
++  it('persona-shell 失败/禁用时,sendAlert 收到未经改动的原始 title/text,shellApplied=false 带 reason', async () => {
++    buildPersonaShell.mockResolvedValue({
++      title: '原标题', text: '原文', attempted: false, applied: false, model: null, latencyMs: null, reason: 'disabled-by-default',
++    })
++    const out = await runBroadcast({ title: '原标题', text: '原文', stateDir: '/tmp/x' })
++
++    expect(sendAlert.mock.calls[0][0]).toMatchObject({ title: '原标题', text: '原文' })
++    expect(out).toMatchObject({ ok: true, title: '原标题', shellApplied: false, shellReason: 'disabled-by-default' })
++  })
++})
++
++describe('runBroadcast × persona-shell 真实实现集成(CX-005 修复:反向变异,不靠占位 mock 自证)', () => {
++  // 同 patrol.test.mjs 的同名描述:上面两条用例的手写占位值只证明"转发逻辑接线正确",
++  // 不证明 persona-shell.mjs 的真实降级实现真的不改事实。这里用 vi.importActual 拿真实
++  // 实现塞回 mock 位,实跑验证「默认关闭时 sendAlert 收到的是调用方传入的原始 title/text,
++  // 逐字不变」。
++  it('真实(非 mock)buildPersonaShell 默认关闭时,sendAlert 收到的 title/text 与调用方传入值逐字相等', async () => {
++    const { buildPersonaShell: realBuildPersonaShell } = await vi.importActual('./persona-shell.mjs')
++    buildPersonaShell.mockImplementation(realBuildPersonaShell)
++
++    // PR-PS-R5-SUG-001(codex-adversarial R5):runBroadcast 调 buildPersonaShell 时不传 env,
++    // 真实实现默认读 process.env——这条测试断言"默认关闭时不发请求"依赖的是宿主环境本身
++    // 没设 MIVO_PERSONA_SHELL_ENABLE,不是测试自己保证的,显式清空/还原,不依赖环境状态。
++    // SC-2(a)(2026-08-07 worker 复现验证):MIVO_PERSONA_SHELL_DISABLE 优先级高于 ENABLE
++    // (见 persona-shell.mjs buildPersonaShell 的判断顺序),原实现只 snapshot/清空/还原了
++    // ENABLE 一个变量——若宿主环境恰好设了 DISABLE=1,真实实现会先命中 disabled-by-env 分支,
++    // 断言的 reason 变成 'disabled-by-env' 而非本测试要验证的 'disabled-by-default',同样
++    // 依赖宿主环境状态而非测试自己保证。两个变量必须同等 snapshot/清空/finally 还原。
++    const prevEnable = process.env.MIVO_PERSONA_SHELL_ENABLE
++    const prevDisable = process.env.MIVO_PERSONA_SHELL_DISABLE
++    delete process.env.MIVO_PERSONA_SHELL_ENABLE
++    delete process.env.MIVO_PERSONA_SHELL_DISABLE
++    try {
++      const out = await runBroadcast({ title: '原标题', text: '原文', stateDir: '/tmp/x' })
++
++      expect(sendAlert.mock.calls[0][0]).toMatchObject({ title: '原标题', text: '原文' })
++      expect(out).toMatchObject({ ok: true, title: '原标题', shellApplied: false })
++      expect(out.shellReason).toBe('disabled-by-default')
++    } finally {
++      if (prevEnable === undefined) delete process.env.MIVO_PERSONA_SHELL_ENABLE
++      else process.env.MIVO_PERSONA_SHELL_ENABLE = prevEnable
++      if (prevDisable === undefined) delete process.env.MIVO_PERSONA_SHELL_DISABLE
++      else process.env.MIVO_PERSONA_SHELL_DISABLE = prevDisable
++    }
++  })
++})
++
++describe('broadcast.mjs CLI 契约(子进程,不 mock,验证 invokedDirectly 守卫与缺参数分支)', () => {
++  // SC-2(b)(2026-08-07 worker 复现验证):此前只清了 SLACK_*/MIVO_CHANGELOG_LLM_KEY,persona
++  // 开关(MIVO_PERSONA_SHELL_ENABLE/_DISABLE)仍从父进程(跑 vitest 的那个 shell)原样继承——
++  // 若父进程环境恰好设了其中之一,子进程 CLI 契约测试断言的 shellReason 就会随宿主环境漂移,
++  // 而不是由测试自己钉死。显式清空为空字符串,与 persona-shell.mjs 的默认关闭判断对齐。
++  const run = (args, input = '') =>
++    execFileSync(process.execPath, [BROADCAST, ...args], {
++      encoding: 'utf8',
++      input,
++      stdio: ['pipe', 'pipe', 'pipe'],
++      env: {
++        ...process.env,
++        SLACK_WEBHOOK_URL: '',
++        SLACK_BOT_TOKEN: '',
++        SLACK_CHANNEL_ID: '',
++        MIVO_CHANGELOG_LLM_KEY: '',
++        MIVO_PERSONA_SHELL_ENABLE: '',
++        MIVO_PERSONA_SHELL_DISABLE: '',
++      },
++    })
++
++  it('缺 --title 时输出 ok:false,不抛异常,退出码 0', () => {
++    const out = JSON.parse(run([]))
++    expect(out).toMatchObject({ ok: false, channel: 'error', error: '缺少 --title' })
++  })
++
++  it('作为脚本直接跑时正常投递(默认关闭 persona-shell,走 degrade 落 pending-alerts,退出码 0)', () => {
++    const stateDir = mkdtempSync(join(tmpdir(), 'mivo-broadcast-cli-'))
++    try {
++      const out = JSON.parse(run(['--title', 't', '--state-dir', stateDir], 'body'))
++      expect(out.ok).toBe(true)
++      expect(out.shellApplied).toBe(false)
++      expect(out.shellReason).toBe('disabled-by-default')
++    } finally {
++      rmSync(stateDir, { recursive: true, force: true })
++    }
++  })
++})
+diff --git a/scripts/loops/bug-doctor/notify.mjs b/scripts/loops/bug-doctor/notify.mjs
+index 62ba193e..be32f904 100644
+--- a/scripts/loops/bug-doctor/notify.mjs
++++ b/scripts/loops/bug-doctor/notify.mjs
+@@ -31,7 +31,10 @@ export const loadNotifyConfig = (stateDir) => {
+       config[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim()
+     }
+   }
+-  for (const key of ['SLACK_WEBHOOK_URL', 'SLACK_BOT_TOKEN', 'SLACK_CHANNEL_ID']) {
++  // MIVO_CHANGELOG_LLM_KEY:persona-shell.mjs 复用的 LLM 网关 key(与
++  // scripts/loops/merge-thanks/from-github-event.mjs 同名同源,云端走 GitHub Actions
++  // secrets,本地/macmini 走这里的 notify.env 或进程环境变量)。
++  for (const key of ['SLACK_WEBHOOK_URL', 'SLACK_BOT_TOKEN', 'SLACK_CHANNEL_ID', 'MIVO_CHANGELOG_LLM_KEY']) {
+     if (process.env[key]) config[key] = process.env[key]
+   }
+   return config
+diff --git a/scripts/loops/bug-doctor/notify.test.mjs b/scripts/loops/bug-doctor/notify.test.mjs
+index 098650d4..3875f228 100644
+--- a/scripts/loops/bug-doctor/notify.test.mjs
++++ b/scripts/loops/bug-doctor/notify.test.mjs
+@@ -36,15 +36,42 @@ describe('pending-alerts 落地模板(Mivo 署名)', () => {
+ })
+ 
+ const SLACK_ENV_KEYS = ['SLACK_WEBHOOK_URL', 'SLACK_BOT_TOKEN', 'SLACK_CHANNEL_ID']
++// persona-shell.mjs 复用的 LLM 网关 key,与上面三个 SLACK_* 走同一套 notify.env / 进程环境变量
++// 读取逻辑,但独立列出(不混进 SLACK_ENV_KEYS)——避免误改成"四个 Slack key"这种错误心智模型。
++const LLM_ENV_KEYS = ['MIVO_CHANGELOG_LLM_KEY']
++const ALL_ENV_KEYS = [...SLACK_ENV_KEYS, ...LLM_ENV_KEYS]
+ 
+ describe('loadNotifyConfig', () => {
+   it('notify.env KV 解析,进程环境变量优先', () => {
+-    const prev = Object.fromEntries(SLACK_ENV_KEYS.map((k) => [k, process.env[k]]))
+-    for (const k of SLACK_ENV_KEYS) delete process.env[k]
++    const prev = Object.fromEntries(ALL_ENV_KEYS.map((k) => [k, process.env[k]]))
++    for (const k of ALL_ENV_KEYS) delete process.env[k]
+     try {
+       expect(loadNotifyConfig(dir)).toEqual({})
+     } finally {
+-      for (const k of SLACK_ENV_KEYS) if (prev[k] !== undefined) process.env[k] = prev[k]
++      for (const k of ALL_ENV_KEYS) if (prev[k] !== undefined) process.env[k] = prev[k]
++    }
++  })
++
++  it('MIVO_CHANGELOG_LLM_KEY 可从 notify.env 文件读出,不影响既有 SLACK_* 三键', () => {
++    writeFileSync(join(dir, 'notify.env'), 'MIVO_CHANGELOG_LLM_KEY=sk-test-from-file\nSLACK_BOT_TOKEN=xoxb-file\n')
++    const prev = Object.fromEntries(ALL_ENV_KEYS.map((k) => [k, process.env[k]]))
++    for (const k of ALL_ENV_KEYS) delete process.env[k]
++    try {
++      expect(loadNotifyConfig(dir)).toEqual({ MIVO_CHANGELOG_LLM_KEY: 'sk-test-from-file', SLACK_BOT_TOKEN: 'xoxb-file' })
++    } finally {
++      for (const k of ALL_ENV_KEYS) if (prev[k] !== undefined) process.env[k] = prev[k]
++    }
++  })
++
++  it('MIVO_CHANGELOG_LLM_KEY 的进程环境变量优先于 notify.env 文件同名值', () => {
++    writeFileSync(join(dir, 'notify.env'), 'MIVO_CHANGELOG_LLM_KEY=sk-from-file\n')
++    const prev = process.env.MIVO_CHANGELOG_LLM_KEY
++    process.env.MIVO_CHANGELOG_LLM_KEY = 'sk-from-process-env'
++    try {
++      expect(loadNotifyConfig(dir).MIVO_CHANGELOG_LLM_KEY).toBe('sk-from-process-env')
++    } finally {
++      if (prev === undefined) delete process.env.MIVO_CHANGELOG_LLM_KEY
++      else process.env.MIVO_CHANGELOG_LLM_KEY = prev
+     }
+   })
+ })
+diff --git a/scripts/loops/bug-doctor/patrol.mjs b/scripts/loops/bug-doctor/patrol.mjs
+index 35b32f16..112b68cf 100644
+--- a/scripts/loops/bug-doctor/patrol.mjs
++++ b/scripts/loops/bug-doctor/patrol.mjs
+@@ -1,12 +1,18 @@
+ #!/usr/bin/env node
+-// patrol.mjs — Mivo(原 bug-doctor)T5 整点轻巡 wrapper(launchd 每小时调用,零 LLM;不改 gate 已验收逻辑,只消费其输出)
++// patrol.mjs — Mivo(原 bug-doctor)T5 整点轻巡 wrapper(launchd 每小时调用;判定逻辑零 LLM,
++// 不改 gate 已验收逻辑,只消费其输出)
+ //
+ // 职责:
+ //   1. 跑 gate --s0-only(互斥锁/游标/台账/logs 全部由 gate 自理);
+ //   2. 工作包出现"新"S0 告警项 → 经 notify.mjs 投递;幂等去重:同一告警项持续存在不重发,
+-//      从工作包消失后清除标记,复发再发(契约"幂等标记,重复触发不重复建档");
++//      从工作包消失后清除标记,复发再发(契约"幂等标记,重复触发不重复建档")。发送前可选经
++//      persona-shell.mjs 追加一行人格收尾句(默认关闭,MIVO_PERSONA_SHELL_ENABLE=1 才尝试;
++//      单次超时 5s,失败/禁用一律照发原始文案,不阻断、不重试、不换模型——见 persona-shell.mjs
++//      文件头说明);
+ //   3. gate 连续失败 ≥ rules.loop.consecutiveFailureAlertThreshold → 自告警"loop 已失明"
+-//      (6h 去重窗防每小时刷屏;gate 成功即清除去重标记,新一轮连败重新告警);
++//      (6h 去重窗防每小时刷屏;gate 成功即清除去重标记,新一轮连败重新告警)。**此路径不接
++//      persona-shell**,维持原样零 LLM——失明是"巡检本身瘫了"的极端信号,不应再叠加一层
++//      可能失败的网络调用;
+ //   4. 正常空转轮(无新 S0、无失败)零告警零消息。
+ //
+ // 用法: node scripts/loops/bug-doctor/patrol.mjs [--state-dir <dir>] [--input <jsonl>] [--no-gh]
+@@ -21,6 +27,7 @@ import { join, resolve, dirname } from 'node:path'
+ import { fileURLToPath } from 'node:url'
+ 
+ import { loadNotifyConfig, sendAlert } from './notify.mjs'
++import { buildPersonaShell } from './persona-shell.mjs'
+ import { appendLog, loadFailureState, WORKPACKET_FILE } from './state.mjs'
+ 
+ const __dirname = dirname(fileURLToPath(import.meta.url))
+@@ -100,6 +107,23 @@ const parseLastJsonLine = (stdout) => {
+ const alertKeyOf = (alert) =>
+   alert.kind === 'cluster' ? `cluster:${alert.fp}` : `nightly-red:${alert.url || alert.conclusion || 'unknown'}`
+ 
++/**
++ * 组装 + 投递新 S0(P0)告警:先经 persona-shell 尝试追加一行人格收尾句(失败/禁用即用
++ * 原始文案,不阻断),再经 notify.mjs 投递,最后落 appendLog/日志行。抽成独立导出函数
++ * (不像 buildS0Alert 那样是纯模板)——main() 依赖真实 gate 子进程产出的工作包,不适合
++ * 直接单测这段"是否真的调用了 persona-shell、失败时是否真的用了原始文案"的行为,拆出来
++ * 才能 mock sendAlert/buildPersonaShell 做行为断言。
++ */
++export async function dispatchNewS0Alert({ newAlerts, clustersByFp, stateDir, config, currentKeys }) {
++  const { title, text } = buildS0Alert({ newAlerts, clustersByFp, stateDir })
++  const shell = await buildPersonaShell({ tone: 'p0-alert', title, text, key: config.MIVO_CHANGELOG_LLM_KEY })
++  const res = await sendAlert({ stateDir, config, title: shell.title, text: shell.text })
++  const shellNote = `shell=${shell.applied}${shell.reason ? `(${shell.reason})` : ''}`
++  appendLog(stateDir, `${new Date().toISOString()} · patrol · P0 告警已发(channel=${res.channel},新 ${newAlerts.length} 项/在场 ${currentKeys.size} 项,${shellNote})`)
++  log(`P0 告警已发(channel=${res.channel},新 ${newAlerts.length} 项,${shellNote})`)
++  return { res, shell }
++}
++
+ const describeAlert = (alert, clustersByFp) => {
+   if (alert.kind === 'nightly-red') {
+     return `• nightly-e2e 红灯(${alert.conclusion || 'failure'}): ${alert.url || '无 url'}`
+@@ -194,10 +218,7 @@ const main = async () => {
+   const newAlerts = currentAlerts.filter((a) => !patrolState.alertedS0[alertKeyOf(a)])
+ 
+   if (newAlerts.length > 0) {
+-    const { title, text } = buildS0Alert({ newAlerts, clustersByFp, stateDir })
+-    const res = await sendAlert({ stateDir, config, title, text })
+-    appendLog(stateDir, `${new Date().toISOString()} · patrol · P0 告警已发(channel=${res.channel},新 ${newAlerts.length} 项/在场 ${currentKeys.size} 项)`)
+-    log(`P0 告警已发(channel=${res.channel},新 ${newAlerts.length} 项)`)
++    await dispatchNewS0Alert({ newAlerts, clustersByFp, stateDir, config, currentKeys })
+   } else {
+     log(`无新 P0(在场 ${currentKeys.size} 项均已告警或为零),零消息`)
+   }
+diff --git a/scripts/loops/bug-doctor/patrol.test.mjs b/scripts/loops/bug-doctor/patrol.test.mjs
+index 7de31e71..9f6f8ebe 100644
+--- a/scripts/loops/bug-doctor/patrol.test.mjs
++++ b/scripts/loops/bug-doctor/patrol.test.mjs
+@@ -3,9 +3,23 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
+ import { tmpdir } from 'node:os'
+ import { dirname, join } from 'node:path'
+ import { fileURLToPath } from 'node:url'
+-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+-import { buildBlindnessAlert, buildS0Alert } from './patrol.mjs'
++// vi.mock 提前声明(hoisted):dispatchNewS0Alert 的单测需要 mock sendAlert/buildPersonaShell
++// 做行为断言(是否真的调用了、传给 sendAlert 的 title/text 是不是 shell 处理后的结果)。
++// 只影响本测试文件的 ESM 模块图,不影响下方 execFileSync 起的真实子进程(那是独立 Node 进程,
++// 不共享 vitest 的 mock 注册表)。
++vi.mock('./notify.mjs', async (importOriginal) => {
++  const actual = await importOriginal()
++  return { ...actual, sendAlert: vi.fn(async () => ({ channel: 'webhook', desktopNotified: false })) }
++})
++vi.mock('./persona-shell.mjs', () => ({
++  buildPersonaShell: vi.fn(),
++}))
++
++import { sendAlert } from './notify.mjs'
++import { buildPersonaShell } from './persona-shell.mjs'
++import { buildBlindnessAlert, buildS0Alert, dispatchNewS0Alert } from './patrol.mjs'
+ 
+ const __dirname = dirname(fileURLToPath(import.meta.url))
+ const PATROL = join(__dirname, 'patrol.mjs')
+@@ -139,3 +153,117 @@ describe('SC-BD1-R2-N01/N02 patrol 连败告警行为:告警确实被发出,不
+     expect(logs).toContain('失明告警已发')
+   })
+ })
++
++describe('dispatchNewS0Alert — persona-shell 接入行为(mock sendAlert/buildPersonaShell)', () => {
++  let dir
++
++  beforeEach(() => {
++    dir = mkdtempSync(join(tmpdir(), 'bug-doctor-dispatch-'))
++    vi.clearAllMocks()
++  })
++
++  afterEach(() => {
++    rmSync(dir, { recursive: true, force: true })
++  })
++
++  const alert = { kind: 'cluster', fp: 'X::y', source: 'X', pattern: 'y' }
++  const clustersByFp = {}
++
++  it('persona-shell 成功追加壳时,sendAlert 收到 shell 处理后的 title/text(不是原始值)', async () => {
++    buildPersonaShell.mockResolvedValue({
++      title: '壳标题', text: '壳正文', attempted: true, applied: true, model: 'deepseek/deepseek-v4-flash', latencyMs: 12, reason: null,
++    })
++    const currentKeys = new Set([alert.fp])
++    await dispatchNewS0Alert({ newAlerts: [alert], clustersByFp, stateDir: dir, config: { MIVO_CHANGELOG_LLM_KEY: 'k' }, currentKeys })
++
++    expect(buildPersonaShell).toHaveBeenCalledTimes(1)
++    expect(buildPersonaShell.mock.calls[0][0]).toMatchObject({ tone: 'p0-alert', key: 'k' })
++    expect(sendAlert).toHaveBeenCalledTimes(1)
++    expect(sendAlert.mock.calls[0][0]).toMatchObject({ title: '壳标题', text: '壳正文' })
++  })
++
++  it('persona-shell 失败/禁用时,sendAlert 收到与 buildS0Alert 完全一致的原始 title/text(零阻断契约)', async () => {
++    buildPersonaShell.mockResolvedValue({
++      title: '原标题占位', text: '原正文占位', attempted: false, applied: false, model: null, latencyMs: null, reason: 'disabled-by-default',
++    })
++    // buildPersonaShell 是 mock,不会真的把 title/text 回传成 buildS0Alert 的原始值——这里
++    // 故意让 mock 返回值 ≠ buildS0Alert 的真实输出,以此证明 dispatchNewS0Alert 确实是把
++    // buildS0Alert 的原始输出喂给了 buildPersonaShell(而不是自己另起一份),即便 mock 篡改了
++    // 返回值,sendAlert 收到的也必然是 mock 返回的这份(因为 applied:false 分支下代码语义是
++    // "直接转发 shell.title/shell.text",这与真实 persona-shell.mjs 在 applied:false 时
++    // title/text 原样等于输入的契约一致——mock 层的返回值本身模拟的正是这条契约)。
++    const currentKeys = new Set([alert.fp])
++    await dispatchNewS0Alert({ newAlerts: [alert], clustersByFp, stateDir: dir, config: {}, currentKeys })
++
++    expect(sendAlert.mock.calls[0][0]).toMatchObject({ title: '原标题占位', text: '原正文占位' })
++  })
++
++  it('appendLog 与 stderr 日志行都带 shell 状态,便于事后从 logs.md 排查是否真的润色了', async () => {
++    buildPersonaShell.mockResolvedValue({
++      title: 't', text: 'x', attempted: true, applied: false, model: 'deepseek/deepseek-v4-flash', latencyMs: 5001, reason: 'llm-error: timeout',
++    })
++    const currentKeys = new Set([alert.fp])
++    await dispatchNewS0Alert({ newAlerts: [alert], clustersByFp, stateDir: dir, config: {}, currentKeys })
++    const logs = readFileSync(join(dir, 'logs.md'), 'utf8')
++    expect(logs).toContain('shell=false(llm-error: timeout)')
++  })
++})
++
++describe('dispatchNewS0Alert × persona-shell 真实实现集成(CX-005 修复:反向变异,不靠占位 mock 自证)', () => {
++  let dir
++
++  beforeEach(() => {
++    dir = mkdtempSync(join(tmpdir(), 'bug-doctor-dispatch-real-'))
++    vi.clearAllMocks()
++  })
++
++  afterEach(() => {
++    rmSync(dir, { recursive: true, force: true })
++  })
++
++  const alert = { kind: 'cluster', fp: 'X::y', source: 'X', pattern: 'y' }
++  const clustersByFp = {}
++
++  // 上面几条用例的 mock 返回值(如「壳标题」「原标题占位」)是手写占位,只证明"转发逻辑
++  // 正确接线",不证明"persona-shell.mjs 的真实降级实现真的不改事实"——那条契约由
++  // persona-shell.test.mjs 直接测(SC-2),但两份测试从未在同一条断言链路里连起来过。这里
++  // 用 vi.importActual 拿真实实现塞回 mock 位,做一次真正的反向变异:预测「真实实现在默认
++  // 关闭时必然不发请求、必然原样返回输入」,实跑验证预测是否成立——这才是能拒绝"调用方偏离
++  // 契约"这类回归的证据,不是自证。
++  it('真实(非 mock)buildPersonaShell 默认关闭时,dispatchNewS0Alert 转发给 sendAlert 的 title/text 与 buildS0Alert 的原始输出逐字相等', async () => {
++    const { buildPersonaShell: realBuildPersonaShell } = await vi.importActual('./persona-shell.mjs')
++    buildPersonaShell.mockImplementation(realBuildPersonaShell)
++
++    // PR-PS-R5-SUG-001(codex-adversarial R5):dispatchNewS0Alert 调 buildPersonaShell 时不传
++    // env,真实实现默认读 process.env——这条测试断言"默认关闭时不发请求"依赖的是宿主环境
++    // 本身没设 MIVO_PERSONA_SHELL_ENABLE,不是测试自己保证的。若宿主/CI 环境恰好设了该变量
++    // (如其他工具全局污染),这里会真的用假 key 'k' 打一次外网请求。显式清空/还原,让这条
++    // 测试的前提不依赖任何环境状态。
++    const prevEnable = process.env.MIVO_PERSONA_SHELL_ENABLE
++    delete process.env.MIVO_PERSONA_SHELL_ENABLE
++    try {
++      const expected = buildS0Alert({ newAlerts: [alert], clustersByFp, stateDir: dir })
++      const currentKeys = new Set([alert.fp])
++      await dispatchNewS0Alert({ newAlerts: [alert], clustersByFp, stateDir: dir, config: { MIVO_CHANGELOG_LLM_KEY: 'k' }, currentKeys })
++
++      expect(sendAlert).toHaveBeenCalledTimes(1)
++      expect(sendAlert.mock.calls[0][0]).toMatchObject({ title: expected.title, text: expected.text })
++    } finally {
++      if (prevEnable === undefined) delete process.env.MIVO_PERSONA_SHELL_ENABLE
++      else process.env.MIVO_PERSONA_SHELL_ENABLE = prevEnable
++    }
++  })
++})
++
++describe('失明告警路径不接入 persona-shell(用户已明确否决,仅 P0 告警接入)', () => {
++  it('buildBlindnessAlert 的调用代码块内不引用 buildPersonaShell(结构性回归守卫)', () => {
++    const src = readFileSync(join(__dirname, 'patrol.mjs'), 'utf8')
++    const blockStart = src.indexOf('const { title, text } = buildBlindnessAlert(')
++    const blockEnd = src.indexOf('process.exit(run.status')
++    expect(blockStart, 'buildBlindnessAlert 调用点应存在').toBeGreaterThan(-1)
++    expect(blockEnd, 'gate 失败路径的收尾标记应存在').toBeGreaterThan(blockStart)
++    const block = src.slice(blockStart, blockEnd)
++    expect(block).not.toContain('buildPersonaShell')
++    expect(block).not.toContain('persona-shell')
++  })
++})
+diff --git a/scripts/loops/bug-doctor/persona-shell.mjs b/scripts/loops/bug-doctor/persona-shell.mjs
+new file mode 100644
+index 00000000..93fadab2
+--- /dev/null
++++ b/scripts/loops/bug-doctor/persona-shell.mjs
+@@ -0,0 +1,377 @@
++// persona-shell.mjs — Mivo 播报「人格壳」润色(P0 告警 / 每日战报共用)
++//
++// 定位:不改一个字的事实。原始 title/text 逐字不变,只在 text 末尾追加一行经黑名单
++// 校验的极短收尾句,失败(禁用/缺 key/超时/网络错误/校验不过)统一回落"完全不加壳"的
++// 原始文案——绝不抛异常,绝不让调用方的告警/播报因为这一层而延迟到不可接受、或干脆发不出去。
++//
++// 与 scripts/loops/merge-thanks/from-github-event.mjs 的差异(故意,不是遗漏):
++//   - 那边让模型改写整段"改动要点"(长文本、多信息点),这里模型只产出一行不含任何事实的
++//     态度收尾句——事实校验因此从"正则猜测哪些字符串是事实"简化为"壳本身是否守规矩",
++//     不会有事实被模型悄悄改掉的风险。
++//   - 那边失败会换一个回退模型再试一次;这里**单次尝试,不换模型**——P0 告警是 hourly
++//     critical alert,多试一次模型意味着多等一轮超时,不值得为了润色多拖延一次。
++//
++// 默认关闭:MIVO_PERSONA_SHELL_ENABLE!=='1' 时直接跳过,不发任何请求。
++// 熄火开关:MIVO_PERSONA_SHELL_DISABLE==='1' 优先级最高,网关抽风时不用改代码/重新部署。
++//
++// 网关地址**不接受环境变量覆盖**(2026-08-06 review 实测:曾提供 MIVO_PERSONA_SHELL_LLM_BASE
++// 覆盖开关,但请求会带着真实 key 打向该地址——若该变量被意外/恶意改写,等于把凭证连同
++// 完整告警正文一起发到任意主机,构成 SSRF/凭证外泄口子;且该开关在本文件的测试里从未被
++// 用到,纯属没有真实需要的 speculative 灵活性,直接删掉)。要切换网关只能改这个常量。
++//
++// 跑单测:npx vitest run scripts/loops/bug-doctor/persona-shell.test.mjs
++
++const LLM_BASE_DEFAULT = 'https://llm-proxy.tapsvc.com/v1'
++const MODEL_DEFAULT = 'deepseek/deepseek-v4-flash'
++
++// R6-CX-001(codex-adversarial R6):正常成功响应顶多几 KB(系统提示词回执 + 一行 ≤44 字的
++// 壳),64KB 是留了大量安全余量后的硬上限,超出即视为网关异常行为,见 chat() 里的用法。
++const MAX_RESPONSE_BYTES = 64 * 1024
++
++// tone → 单次请求超时(ms)。P0 是 hourly critical alert,超时必须短;每日战报不那么紧急,
++// 给多一点余量,但也不能长到让"主轮收尾"卡住太久。
++export const TIMEOUT_MS_BY_TONE = {
++  'p0-alert': 5_000,
++  'daily-report': 15_000,
++}
++
++// 表情配额(对齐 review-pr SKILL.md「对外话术与人格边界」的分级 + 禁用集):
++//   - p0-alert 比模板 E 还淡一档:只允许「从容」的 😌,不允许带得意/傲气的 😏/😤——
++//     故障告警不该显得云淡风轻。
++//   - daily-report 对齐模板 F 的允许集,但排除仅限私聊通道的 👀。
++const ALLOWED_EMOJI_BY_TONE = {
++  'p0-alert': ['😌'],
++  'daily-report': ['😏', '😤', '🤨', '😌', '🙃'],
++}
++
++// 全局禁用集(两种 tone 都不许出现):状态/分类图标(工程化,不是"Mivo 在表态")、
++// 极端/夸张情绪、🙄(几乎只读作嫌弃对方,踩硬红线"傲娇只针对事")。
++const FORBIDDEN_EMOJI = [
++  '🟢', '🟡', '🔴', '📦', '⏳', '⚠️', '📌', '🔍', '✨', '⏸️',
++  '😡', '🤬', '😭', '😱', '🥺', '💀', '🔥', '🎉', '😍',
++  '🙄',
++]
++
++const MAX_SHELL_LENGTH = 44
++
++// 中文数字词(2026-08-06 review 两席独立各发现一次:阿拉伯数字黑名单堵不住"两次"/"第三次"
++// 这类中文数字词,而它们在"壳只表态度、不承载事实"的设计意图下同样不该出现)。这是可穷举的
++// 有限字符集,不是自然语言数字理解。**故意不含单独的「一」**——"一起"/"一下"/"一定"/"一样"
++// 这类非数字用法在日常中文里极常见,若一并拉黑会让绝大多数自然语句被误杀,壳几乎打不出去;
++// 其余数字字符在非计数语境里罕见得多,拉黑的误伤面小,拉黑收益明显更高。
++// R2-CX-002(codex-adversarial R2):原枚举漏了「零」(零问题/零阻塞——同样是数量断言)与「半」
++// (半数认可——同样是数量断言)。两者补齐,理由与其余数字字符一致:非计数语境下罕见,拉黑
++// 误伤面小。R4-CX-002(codex-adversarial R4)最初只补了「壹」,R5 复审用「贰次确认」证明
++// 这不是完整修复——票据/账目场景的大写数字(壹贰叁肆伍陆柒捌玖拾佰仟萬)是一个**封闭、
++// 有限**的字符集(不像量词是开放的自然语言集合),这次一次性补全整个集合,不再逐个补,
++// 避免下一轮再被找出「还漏了叁」。
++const CHINESE_NUMERAL_CHARS = ['二', '三', '四', '五', '六', '七', '八', '九', '十', '百', '千', '万', '亿', '两', '几', '零', '半', '壹', '贰', '叁', '肆', '伍', '陆', '柒', '捌', '玖', '拾', '佰', '仟', '萬']
++
++// R2-CX-002(codex-adversarial R2):「第一项」/「第一位」/「第一名」这类"第"+"一"+任意计数
++// 量词的组合,同样绕过了 CHINESE_ORDINAL_PHRASES(该名单只枚举了"一"+次/回/趟/遍/度/番,
++// 量词是开放集合,枚举不完)。"第"在现代汉语里几乎只用于构成序数(第一/第二/...),不整体
++// 拉黑「一」的理由(见上,避免误杀"一起"/"一下")在这里不适用——直接拉黑"第"字符本身,
++// 一次性堵住所有"第 + 任意量词"的序数断言,不必逐个枚举量词。R4-CX-002(codex-adversarial
++// R4):「首次」/「首个」/「首轮」用"首"做同样的序数标记,补上同理。
++const ORDINAL_MARKER_CHARS = ['第', '首']
++
++// R4-CX-002(codex-adversarial R4)→R7 升级(codex-adversarial R7 提出新论证,非新例子):
++// 壳的核心契约是"只表态度,不承载事实",但完成度/严重性断言("已经处理完毕"/"情况非常
++// 严重"/"当前完全正常")不含任何数字或序数标记字符,原校验完全拦不住。R7 指出这不是继续
++// 枚举的问题,而是"enabled 成功路径"本身缺一层保护:P0 值班者可能把壳误读成最新恢复状态
++// (如告警正文写"仍待处理",壳却输出"当前完全正常"),default-off 只限制启用时机、fail-open
++// 只兜网络失败,两者都不保护"请求成功但内容与事实矛盾"这条路径。
++//
++// 与量词枚举(F4→F5→F6)的关键区别:量词是**通用汉语**的开放集合,枚举不完;但这里的词汇
++// 局限在**故障播报这一个窄领域**——中文里描述"已解决/严重/紧急/恢复/崩溃/正常/危险"的
++// 核心词汇是有限的,不是通用自然语言分类问题。所以这次不是"再打一个补丁词",是把覆盖面从
++// 2 个代表词扩到这个领域的核心词表,显著缩小 R7 描述的具体伤害场景发生概率。**如实声明
++// 边界**:仍不追求词法层面 100% 穷尽(如"彻底""搞好""平安无事"这类不常见的同义变体、
++// 或未来 LLM 想出的全新表达仍可能漏——这条边界的存在本身在 F6 那轮已被 seat①独立验证为
++// "无可匹配结构性锚点的语义分类问题",与量词那类有清晰语法模式的开放集合不同),但已从
++// "两个代表词"升级为"覆盖故障播报领域核心状态/严重性词汇表"。
++const FACT_CLAIM_MARKERS = ['已', '严重', '解决', '解除', '紧急', '尚未', '稳定', '恢复', '崩溃', '瘫痪', '正常', '危险', '搞定']
++
++// 「一」+ 计数量词组成的序数/频率词。F5 最初用枚举短语堵"一次"/"一回"等,但 R3 两席
++// 各自独立找到了枚举堵不住的新变体("新一轮"[seat②的 PR-PS-R3-CX-001]、"头一场"
++// [seat①的 F6])——枚举式黑名单在"量词是开放的自然语言集合"这个根因面前永远打地鼠。
++// 改为结构性判据:「一」紧跟**任意单个 CJK 字符**构成的两字组合一律拉黑,除非落在下面
++// 显式豁免的安全短语里(这些是已确认的常见非数字用法,不是量词组合)。这样堵住的是
++// 整个"一+量词"模式,不必再逐个补量词字符。
++const ONE_CHAR_SAFE_PHRASES = ['一起', '一下', '一定', '一样', '一圈']
++
++const SYSTEM_PROMPT_SHARED = `你要在一条已经写全部事实的运维消息末尾,追加一句极短的态度收尾句。
++
++严格规则:
++1. 只输出这一句,不要换行、不要任何前后缀、不要引号包裹。
++2. 绝对不能包含任何数字、URL、# 号、反引号、文件路径、函数名、专有名词——这些事实已经在
++   前面完整写过了,你的任务只是表达"看到了这件事"的态度,不是复述或改写事实。
++3. 长度不超过 ${MAX_SHELL_LENGTH} 个字符(含表情)。
++4. 全中文,不使用任何 emoji 之外的符号装饰。`
++
++const SYSTEM_PROMPT_BY_TONE = {
++  'p0-alert': `${SYSTEM_PROMPT_SHARED}
++
++语气:冷静、克制,像是"我看到了,在处理"的态度,不俏皮不得意——这是故障告警,不是可以云淡风轻
++的场合。表情最多用 1 个,只能是 😌,句尾。也可以不用表情。`,
++  'daily-report': `${SYSTEM_PROMPT_SHARED}
++
++语气:可以略活泼,像是当天工作收尾时的自然感慨。表情最多用 1 个,从 😏/😤/🤨/😌/🙃 中选,
++句尾。也可以不用表情。`,
++}
++
++/**
++ * 校验一行"人格壳"是否合规。纯函数,可直接单测。
++ * 返回 { ok: true } 或 { ok: false, reason }。
++ *
++ * 白名单是唯一防线(hardening-checklist 第 6 类:exact,不是 subset)——不逐项排查黑名单,
++ * 因为黑名单测不完 Slack 控制语法的全集(2026-08-06 review 实测:`<!channel>`/`<!here>`/
++ * `*粗体*`/裸 CR 全部绕过了纯黑名单版本,`<!channel>`/`<!here>` 会真的 @ 全频道,不是
++ * 无害的格式问题)。剥掉本 tone 允许的表情后,剩余字符必须**全部**落在纯中文字符区间——
++ * 凡不在允许集里的字符,不论是什么,一律拒绝,不猜它是否安全。
++ */
++export function validateShellLine(line, tone) {
++  if (typeof line !== 'string') return { ok: false, reason: 'not-a-string' }
++  const trimmed = line.trim()
++  if (!trimmed) return { ok: false, reason: 'empty' }
++  if (/[\r\n]/.test(trimmed)) return { ok: false, reason: 'multi-line' }
++  if (trimmed.length > MAX_SHELL_LENGTH) return { ok: false, reason: `too-long(${trimmed.length})` }
++  if (/\d/.test(trimmed)) return { ok: false, reason: 'contains-digit' }
++  const numeralHit = CHINESE_NUMERAL_CHARS.find((c) => trimmed.includes(c))
++  if (numeralHit) return { ok: false, reason: `contains-chinese-numeral(${numeralHit})` }
++  const ordinalMarkerHit = ORDINAL_MARKER_CHARS.find((c) => trimmed.includes(c))
++  if (ordinalMarkerHit) return { ok: false, reason: `contains-ordinal-marker(${ordinalMarkerHit})` }
++  const factClaimHit = FACT_CLAIM_MARKERS.find((c) => trimmed.includes(c))
++  if (factClaimHit) return { ok: false, reason: `contains-fact-claim-marker(${factClaimHit})` }
++  // 「一」+ 任意单个 CJK 字符的两字组合,不在安全短语豁免表里 → 视为量词组合一律拒绝
++  // (不把命中的具体字符带进 reason——同 disallowed-char 的纪律,只报分类)。
++  const oneCharCombos = trimmed.match(/一[一-鿿]/gu) ?? []
++  if (oneCharCombos.some((combo) => !ONE_CHAR_SAFE_PHRASES.includes(combo))) {
++    return { ok: false, reason: 'contains-chinese-ordinal' }
++  }
++  if (trimmed.includes('#')) return { ok: false, reason: 'contains-hash' }
++  if (trimmed.includes('`')) return { ok: false, reason: 'contains-backtick' }
++  if (/https?:\/\//i.test(trimmed)) return { ok: false, reason: 'contains-url' }
++
++  const forbiddenHit = FORBIDDEN_EMOJI.find((e) => trimmed.includes(e))
++  if (forbiddenHit) return { ok: false, reason: `forbidden-emoji(${forbiddenHit})` }
++
++  const allowed = ALLOWED_EMOJI_BY_TONE[tone] ?? []
++  let rest = trimmed
++  for (const e of allowed) rest = rest.split(e).join('')
++  if (!/^[一-鿿]+$/u.test(rest)) {
++    // R2-CX-001(codex-adversarial R2):`rest` 是剥掉允许表情后剩下的原始 LLM 输出——不论
++    // 校验拒绝的是什么,reason 都不得把它原样带出去(同 chat() 里"只抛固定分类错误消息"的
++    // 纪律,理由一致:这条 reason 会经 buildPersonaShell 的 `invalid-output: ${v.reason}`
++    // 一路传到 patrol.mjs 的 appendLog/broadcast.mjs 的 printResult,落进 logs.md/stdout。
++    // 只报长度,不报内容。
++    return { ok: false, reason: `disallowed-char(len=${rest.length})` }
++  }
++
++  // 允许集里的表情最多出现 1 次(同 SKILL.md「同一条不堆叠」的纪律)。
++  const allowedCount = allowed.reduce((sum, e) => sum + trimmed.split(e).length - 1, 0)
++  if (allowedCount > 1) return { ok: false, reason: 'too-many-emoji' }
++
++  // suggestion(codex-adversarial R2):system prompt 明确要求表情"句尾",但此前只校验数量
++  // 不校验位置,"😌挺好的呢"这类表情在句首的输出会被放行。壳只有一个允许表情名额,直接判它
++  // 是否在结尾即可,不必解析整句结构。
++  if (allowedCount === 1) {
++    const usedEmoji = allowed.find((e) => trimmed.includes(e))
++    if (!trimmed.endsWith(usedEmoji)) return { ok: false, reason: 'emoji-not-at-end' }
++  }
++
++  return { ok: true }
++}
++
++/**
++ * 按字节数上限读取响应体,超限时立即 cancel 底层流并抛出,不等整段读完。
++ *
++ * F16(claude-adversarial R8):原实现是"先 `res.text()` 读完整个响应体,再判断长度"——
++ * 这个顺序本身就是漏洞所在:`res.text()` 会无条件把底层 stream 完整读进内存,不管读了
++ * 多少字节都不会中途停下。Content-Length 早退检查只在网关**诚实上报**该 header 时有效;
++ * 一个不发/发错该 header 的网关(不管是故意的还是单纯 bug),这层检查形同不存在——已用
++ * 50MB mock 响应实测复现:`res.text()` 2ms 内把 50MB 全部读进内存,读完之后才轮到长度
++ * 判断,而内存早已经分配出去了。改成边读边数字节,一旦超限立刻 `cancel()` 底层 reader,
++ * 从根上不让超限的字节进内存,不是"读完再后悔"。
++ *
++ * 测试 mock 若不提供 `res.body`(WHATWG ReadableStream,原生 fetch 的 Response 总会有,
++ * 只有手写 mock 才可能没有)——退回直接调用 `res.text()`,不做流式截断;这类 mock 场景
++ * 靠上面的 Content-Length 早退 + 下面兜底的整段长度判断(仍然保留,覆盖不了流式场景但
++ * 覆盖 mock 场景)。
++ */
++async function readBoundedText(res, maxBytes) {
++  if (!res.body || typeof res.body.getReader !== 'function') {
++    // 没有 stream 可读(手写 mock 未提供 res.body)——退回 text() 一次性读完,读完后仍要
++    // 补一次字节数判断:不能因为走的是兜底分支就放弃"响应体过大直接拒绝"这条防线。
++    const raw = await res.text()
++    if (Buffer.byteLength(raw, 'utf8') > maxBytes) {
++      throw new Error('llm-response-too-large')
++    }
++    return raw
++  }
++  const reader = res.body.getReader()
++  const chunks = []
++  let total = 0
++  while (true) {
++    const { done, value } = await reader.read()
++    if (done) break
++    total += value.byteLength ?? value.length ?? 0
++    if (total > maxBytes) {
++      await reader.cancel().catch(() => {})
++      throw new Error('llm-response-too-large')
++    }
++    chunks.push(value)
++  }
++  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf8')
++}
++
++/**
++ * 打网关。失败抛错,由调用方决定回退原文。不重试、不换模型。
++ *
++ * **只抛固定分类的错误消息,绝不把远端响应正文原样带进 Error**(2026-08-06 review 实测:
++ * HTTP 非 200 时原实现把 `raw.slice(0,200)` 拼进 `Error.message`,而这条消息经
++ * `buildPersonaShell` 的 `reason` 字段一路传到 `patrol.mjs` 的 `appendLog`(落盘 logs.md)
++ * 与 `broadcast.mjs` 的 `printResult`(打到 stdout)——若网关端(或中间人)在错误响应体里
++ * 回显了请求内容的片段,凭证就可能借这条链路间接回显进持久化日志/公开输出。分类错误
++ * 消息本身不含任何来自响应体的原文,这条回显路径从根上不存在。
++ */
++async function chat({ model, key, messages, timeoutMs }) {
++  const controller = new AbortController()
++  const timer = setTimeout(() => controller.abort(), timeoutMs)
++  try {
++    let raw
++    let res
++    try {
++      res = await fetch(`${LLM_BASE_DEFAULT}/chat/completions`, {
++        method: 'POST',
++        headers: { Authorization: `Bearer ${key}`, 'content-type': 'application/json' },
++        // 只发 model + messages + temperature —— 与 merge-thanks 同一套请求形状。
++        // 不加 max_tokens:该网关对带 max_tokens 的请求会 404(见
++        // scripts/loops/merge-thanks/from-github-event.mjs 的同一条踩坑记录)。
++        body: JSON.stringify({ model, messages, temperature: 0.4 }),
++        signal: controller.signal,
++      })
++      // R6-CX-001(codex-adversarial R6):真实成功响应最多是"系统提示词回执 + 一行 ≤44 字的
++      // 壳"包在 JSON 里,量级顶多几 KB——一个正常网关不该也不需要返回超大响应体。这里先看
++      // Content-Length,超出直接拒绝,不必先把整个响应体读进内存再判断(64KB 已远超正常量级
++      // 的安全余量)。没有该 header(如 chunked encoding)时下面读完 raw 后还有兜底判断。
++      const contentLength = Number(res.headers?.get?.('content-length'))
++      if (Number.isFinite(contentLength) && contentLength > MAX_RESPONSE_BYTES) {
++        throw new Error('llm-response-too-large')
++      }
++      // R4-CX-001(codex-adversarial R4):上一轮只包住了 fetch() 本身,响应体读取错误(如
++      // 连接中途断开)仍会带着原始 message 直接抛出——同一条"reason 只允许固定分类字符串"
++      // 的纪律必须覆盖到读取响应体这一步,不能只包一半。F16(claude-adversarial R8):
++      // readBoundedText 边读边数字节,超限立即 cancel 底层流,不再是"读完整段再判断长度"。
++      raw = await readBoundedText(res, MAX_RESPONSE_BYTES)
++    } catch (networkErr) {
++      // R2-CX-001(codex-adversarial R2 补充):fetch 本身抛出的错误(超时 abort/DNS 失败/
++      // 连接被拒)未经分类就会被 buildPersonaShell 的 catch 块原样截取 message 拼进
++      // reason——虽然这类错误通常只是连接层诊断信息,不像 HTTP 错误体那样可能回显请求内容,
++      // 但同一条"reason 只允许固定分类字符串"的纪律理应无差别覆盖,不留"这条路径大概安全"
++      // 的例外。统一归类为固定字符串,不透传 networkErr.message。llm-response-too-large 是
++      // 我们自己抛的分类错误(不含原始内容),原样透传是安全的,单独放行不重新归类。
++      if (networkErr.message === 'llm-response-too-large') throw networkErr
++      throw new Error(controller.signal.aborted ? 'llm-timeout' : 'llm-network-error')
++    }
++    if (!res.ok) throw new Error(`llm-http-${res.status}`)
++    let data
++    try {
++      data = JSON.parse(raw)
++    } catch {
++      throw new Error('llm-invalid-json')
++    }
++    const content = data?.choices?.[0]?.message?.content
++    if (!content) throw new Error('llm-no-content')
++    return String(content).trim()
++  } finally {
++    clearTimeout(timer)
++  }
++}
++
++/**
++ * 尝试给一条播报追加人格壳。title 永远原样返回,不做任何修改。
++ * 全程 fail-open:任何失败都返回 applied:false 与原始 text,不抛异常。
++ *
++ * @param {{tone: 'p0-alert'|'daily-report', title: string, text: string, key?: string,
++ *   env?: NodeJS.ProcessEnv}} params
++ */
++export async function buildPersonaShell({ tone, title, text, key, env = process.env }) {
++  const base = { title, text, model: null, latencyMs: null }
++  let model = null
++  let t0 = null
++
++  // 结构性兜底(单审提出,2026-08-07 lead 拍板):本文件头把"绝不抛异常"写成核心契约,但此前
++  // 只靠函数体内逐处 try/catch 的控制流保证,没有一层顶层兜底。同一类"未捕获异常违反
++  // never-throws 契约"的缺陷已在本 PR 审查里独立复现 4 次(broadcast.mjs 的
++  // runBroadcast(undefined) 解构、stateDir: null、stateDir 其余畸形值、这里的
++  // res.text() 响应体读取路径),每次都是点状修一处。这里补上顶层 try/catch:函数体内任何
++  // 未来新增的同步操作,即使漏加局部 try/catch,也会被这层接住,不会让"绝不抛异常"的核心
++  // 契约悄悄破功。
++  try {
++    if (env.MIVO_PERSONA_SHELL_DISABLE === '1') {
++      return { ...base, attempted: false, applied: false, reason: 'disabled-by-env' }
++    }
++    if (env.MIVO_PERSONA_SHELL_ENABLE !== '1') {
++      return { ...base, attempted: false, applied: false, reason: 'disabled-by-default' }
++    }
++    if (!key) {
++      return { ...base, attempted: false, applied: false, reason: 'llm-key-missing' }
++    }
++
++    model = env.MIVO_PERSONA_SHELL_MODEL || MODEL_DEFAULT
++    const timeoutMs = TIMEOUT_MS_BY_TONE[tone] ?? TIMEOUT_MS_BY_TONE['daily-report']
++    const systemPrompt = SYSTEM_PROMPT_BY_TONE[tone] ?? SYSTEM_PROMPT_BY_TONE['daily-report']
++
++    t0 = Date.now()
++    let raw
++    try {
++      raw = await chat({
++        model,
++        key,
++        timeoutMs,
++        messages: [
++          { role: 'system', content: systemPrompt },
++          { role: 'user', content: `标题:${title}\n\n正文:\n${text}` },
++        ],
++      })
++    } catch (e) {
++      return {
++        ...base,
++        attempted: true,
++        applied: false,
++        model,
++        latencyMs: Date.now() - t0,
++        reason: `llm-error: ${String(e?.message ?? e).slice(0, 200)}`,
++      }
++    }
++
++    const latencyMs = Date.now() - t0
++    const v = validateShellLine(raw, tone)
++    if (!v.ok) {
++      return { ...base, attempted: true, applied: false, model, latencyMs, reason: `invalid-output: ${v.reason}` }
++    }
++
++    return {
++      title,
++      text: `${text}\n${raw.trim()}`,
++      attempted: true,
++      applied: true,
++      model,
++      latencyMs,
++      reason: null,
++    }
++  } catch {
++    // 兜底层本身不能是新的抛出点:不透传 catch 到的原始异常文本(同全文件"reason 只允许
++    // 固定分类字符串"的纪律),latencyMs 尽力取已知的 t0 重新计算一次,若这一步本身也抛出
++    // (如触发本次兜底的异常源就是 Date.now() 被 mock 成抛异常)则保持 null,不让兜底代码
++    // 自己再制造一次 uncaught throw。
++    let latencyMs = null
++    try {
++      latencyMs = t0 === null ? null : Date.now() - t0
++    } catch {
++      /* 保持 null */
++    }
++    return { ...base, attempted: true, applied: false, model, latencyMs, reason: 'unexpected-error' }
++  }
++}
+diff --git a/scripts/loops/bug-doctor/persona-shell.test.mjs b/scripts/loops/bug-doctor/persona-shell.test.mjs
+new file mode 100644
+index 00000000..29449a91
+--- /dev/null
++++ b/scripts/loops/bug-doctor/persona-shell.test.mjs
+@@ -0,0 +1,507 @@
++// persona-shell.test.mjs — 降级链路 + 壳校验规则的契约测试(全离线,mock global.fetch)
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { buildPersonaShell, TIMEOUT_MS_BY_TONE, validateShellLine } from './persona-shell.mjs'
++
++const ENABLED_ENV = { MIVO_PERSONA_SHELL_ENABLE: '1' }
++
++const mockFetchOnce = (impl) => {
++  const fn = vi.fn(impl)
++  vi.stubGlobal('fetch', fn)
++  return fn
++}
++
++const chatResponse = (content) => ({
++  ok: true,
++  status: 200,
++  text: async () => JSON.stringify({ choices: [{ message: { content } }] }),
++})
++
++afterEach(() => {
++  vi.unstubAllGlobals()
++  vi.useRealTimers()
++})
++
++describe('validateShellLine — 黑名单校验', () => {
++  it('合规:纯中文短句 + 1 个 p0-alert 允许表情', () => {
++    expect(validateShellLine('我盯着呢😌', 'p0-alert')).toEqual({ ok: true })
++  })
++
++  it('合规:daily-report 允许表情 😤', () => {
++    expect(validateShellLine('今天扫了一圈😤', 'daily-report')).toEqual({ ok: true })
++  })
++
++  it('拒绝:含数字', () => {
++    expect(validateShellLine('这是第2次了', 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:含 URL', () => {
++    expect(validateShellLine('看 https://x.com 就懂', 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:含 # 号', () => {
++    expect(validateShellLine('对照 #123 看', 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:含反引号', () => {
++    expect(validateShellLine('去看 `foo.mjs`', 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:超长', () => {
++    expect(validateShellLine('啊'.repeat(45), 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:多行', () => {
++    expect(validateShellLine('第一行\n第二行', 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:空字符串', () => {
++    expect(validateShellLine('   ', 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:裸 CR(不止 \\n,\\r 也算多行)', () => {
++    expect(validateShellLine('第一段\r第二段', 'p0-alert').ok).toBe(false)
++  })
++
++  // CX-001(codex-adversarial R1):Slack 控制语法 <!channel>/<!here> 会真的 @ 全频道,
++  // *粗体* 会触发 mrkdwn 渲染——旧的纯黑名单校验对这些字符一个都不拦,已改为 exact 白名单
++  // (仅允许纯中文字符 + 配额内表情),下面四条各挡一种控制语法。
++  it('拒绝:Slack 全频道提及 <!channel>', () => {
++    expect(validateShellLine('<!channel>', 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:Slack 在线提及 <!here>', () => {
++    expect(validateShellLine('<!here>', 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:Slack mrkdwn 粗体语法 *文本*', () => {
++    expect(validateShellLine('*紧急*', 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:裸域名(无 https:// 前缀,不会被 contains-url 命中,靠白名单兜底)', () => {
++    expect(validateShellLine('看google.com就懂', 'p0-alert').ok).toBe(false)
++  })
++
++  // F2(claude-adversarial R1):旧版 stray-emoji 正则漏了 Miscellaneous Technical 区块
++  // (U+2300–23FF,含 ⏰⏱⏲⏹⏺),现改用 exact 白名单后天然覆盖——不在允许集里的表情
++  // 一律落进 disallowed-char,不再靠枚举 Unicode 区块挡。
++  it('拒绝:未在允许集里的技术类表情 ⏰(此前的 stray-emoji 正则漏了这个 Unicode 区块)', () => {
++    expect(validateShellLine('还在盯⏰', 'p0-alert').ok).toBe(false)
++  })
++
++  // F4/SUG-1(claude-adversarial 与 upstream-preview 独立各发现一次):阿拉伯数字黑名单堵不住
++  // 中文数字词。"一"故意排除在黑名单外(见 persona-shell.mjs 里的说明),避免误杀"一起"/
++  // "一下"这类极常见的非数字用法。
++  it('拒绝:中文数字词"两次"(阿拉伯数字黑名单堵不住这类表达)', () => {
++    expect(validateShellLine('两次盯着了', 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:中文数字词"第三次"', () => {
++    expect(validateShellLine('第三次了', 'p0-alert').ok).toBe(false)
++  })
++
++  it('合规:含"一"但非数字用法的常见短语不应被误杀("一起"/"一下")', () => {
++    expect(validateShellLine('一起加油', 'daily-report')).toEqual({ ok: true })
++    expect(validateShellLine('松一下', 'daily-report')).toEqual({ ok: true })
++    expect(validateShellLine('一定可以', 'daily-report')).toEqual({ ok: true })
++    expect(validateShellLine('心情一样', 'daily-report')).toEqual({ ok: true })
++  })
++
++  // F5(claude-adversarial R1 复审):数字词黑名单故意不含单独的"一",但"第一次"/"头一次"/
++  // "又一次"/"第一回"这类"一"+计数量词的组合仍在做序数/频率断言(暗示"这是第几次发生",
++  // 可能与实际次数不符),同样违反"壳不承载事实"的契约——四个真实变体全部验证。
++  it.each(['第一次遇到', '头一次', '又一次', '第一回'])('拒绝:"一"+计数量词组成的序数/频率短语"%s"', (s) => {
++    expect(validateShellLine(s, 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:p0-alert 用了带得意感的 😏(不在该 tone 允许集里)', () => {
++    expect(validateShellLine('搞定了😏', 'p0-alert').ok).toBe(false)
++  })
++
++  it('拒绝:全局禁用集里的状态图标 🔴', () => {
++    expect(validateShellLine('🔴 出问题了', 'daily-report').ok).toBe(false)
++  })
++
++  it('拒绝:全局禁用集里的极端情绪 😱', () => {
++    expect(validateShellLine('吓死了😱', 'daily-report').ok).toBe(false)
++  })
++
++  it('拒绝:🙄(读作嫌弃对方,踩人格红线)', () => {
++    expect(validateShellLine('又来了🙄', 'daily-report').ok).toBe(false)
++  })
++
++  it('拒绝:同一条堆叠 2 个允许表情', () => {
++    expect(validateShellLine('搞定😏😤', 'daily-report').ok).toBe(false)
++  })
++
++  it('拒绝:未在两份名单里枚举到的陌生表情', () => {
++    expect(validateShellLine('好耶🎊', 'daily-report').ok).toBe(false)
++  })
++
++  // R2-CX-002(codex-adversarial R2):数字词黑名单原漏了「零」/「半」,同样是数量断言。
++  it.each(['零问题', '零阻塞'])('拒绝:中文数字词"零"(此前黑名单漏了这个字)"%s"', (s) => {
++    expect(validateShellLine(s, 'daily-report').ok).toBe(false)
++  })
++  it('拒绝:中文数字词"半"(此前黑名单漏了这个字,"半数认可"仍是数量断言)', () => {
++    expect(validateShellLine('半数认可', 'daily-report').ok).toBe(false)
++  })
++
++  // R2-CX-002(codex-adversarial R2):"第"+"一"+任意计数量词绕过了 CHINESE_ORDINAL_PHRASES
++  // 的枚举("项"不在该名单里),现改为直接拉黑"第"字符本身,一次性堵住整类绕过。
++  it.each(['第一项确认', '第一位选手', '第一名'])('拒绝:"第"开头的序数断言(枚举短语堵不住的变体)"%s"', (s) => {
++    expect(validateShellLine(s, 'daily-report').ok).toBe(false)
++  })
++
++  // R2-CX-001(codex-adversarial R2):disallowed-char 的 reason 此前把剩余原始内容(可能来自
++  // 外部 LLM 输出)原样拼进返回值,一路传到 patrol.mjs/broadcast.mjs 的日志与 stdout——
++  // 同 chat() 里"reason 只允许固定分类字符串"的纪律,这里也不得携带任何原文片段。
++  it('disallowed-char 的 reason 不包含原始内容,只报长度', () => {
++    const r = validateShellLine('挺好呢SUPERSECRETLEAK', 'p0-alert')
++    expect(r).toEqual({ ok: false, reason: 'disallowed-char(len=18)' })
++    expect(r.reason).not.toContain('SUPERSECRETLEAK')
++  })
++
++  // suggestion(codex-adversarial R2):system prompt 要求表情"句尾",此前只校验数量、不校验
++  // 位置,表情出现在句首同样会被放行。
++  it('拒绝:允许表情出现在句首(system prompt 要求句尾)', () => {
++    expect(validateShellLine('😌挺好的呢', 'p0-alert')).toEqual({ ok: false, reason: 'emoji-not-at-end' })
++  })
++  it('合规:允许表情在句尾', () => {
++    expect(validateShellLine('挺好的呢😌', 'p0-alert')).toEqual({ ok: true })
++  })
++
++  // R3(codex-adversarial 的 PR-PS-R3-CX-001 + claude-adversarial 的 F6,两席独立发现同一根因):
++  // F5 的枚举短语黑名单(一次/一回/一趟/一遍/一度/一番)堵不住"新一轮"/"头一场"这类不在枚举
++  // 里的"一"+量词组合——枚举式黑名单打不完开放的自然语言量词集合。已改为结构性判据("一"+
++  // 任意单个 CJK 字符,不在安全短语豁免表里一律拒绝),这里验证两个具体绕过变体确已堵住,
++  // 且不依赖任何新枚举。
++  it.each(['新一轮', '头一场'])('拒绝:枚举短语堵不住的"一"+量词新变体"%s"(结构性判据兜底)', (s) => {
++    expect(validateShellLine(s, 'daily-report').ok).toBe(false)
++  })
++
++  it('合规:"一圈"是常见非量词断言的口语用法("扫了一圈"),不应被结构性判据误杀', () => {
++    expect(validateShellLine('今天扫了一圈', 'daily-report')).toEqual({ ok: true })
++  })
++
++  // R4-CX-002(codex-adversarial R4):补票据大写数字「壹」与序数标记「首」,同 R2-CX-002 的
++  // 补齐理由——都是已知字符集的遗漏,不是新开一类判据。
++  it('拒绝:票据大写数字"壹"(此前黑名单漏了这个字)', () => {
++    expect(validateShellLine('壹条问题', 'daily-report').ok).toBe(false)
++  })
++  // R5(codex-adversarial R5):只补「壹」不够——"贰次确认"证明大写数字是一个封闭字符集,
++  // 漏一个就有一个绕过,这里补全整个集合并验证其中一个代表字符。
++  it('拒绝:票据大写数字"贰"(补全整个封闭字符集,不再逐个补)', () => {
++    expect(validateShellLine('贰次确认', 'daily-report').ok).toBe(false)
++  })
++  it('拒绝:序数标记"首"(首次/首个/首轮,同"第"字符同理)', () => {
++    expect(validateShellLine('首次处理', 'daily-report').ok).toBe(false)
++  })
++
++  // R4-CX-002(codex-adversarial R4):壳不含任何数字/序数标记也可能断言完成度/严重性事实
++  // ("已经处理完毕"/"情况非常严重"),这类开放自然语言集合无法穷尽,这里只堵本轮实测到的
++  // 两个最典型场景,不是穷尽方案(同 F6/量词枚举的已知残余风险取舍)。
++  it('拒绝:完成度事实断言"已经处理完毕"', () => {
++    expect(validateShellLine('已经处理完毕', 'daily-report')).toEqual({ ok: false, reason: 'contains-fact-claim-marker(已)' })
++  })
++  it('拒绝:严重性事实断言"情况非常严重"', () => {
++    expect(validateShellLine('情况非常严重', 'daily-report')).toEqual({ ok: false, reason: 'contains-fact-claim-marker(严重)' })
++  })
++
++  // R7(codex-adversarial R7 提出新论证:装饰句可能被 P0 值班者误读为最新恢复状态,而
++  // default-off/fail-open 都不保护"请求成功但内容与事实矛盾"这条路径)——把覆盖面从两个
++  // 代表词扩到故障播报领域的核心状态/严重性词汇表,逐一验证扩充后的标记词。
++  it.each([
++    ['问题解决', '解决'],
++    ['警报解除', '解除'],
++    ['风险紧急', '紧急'],
++    ['尚未处理', '尚未'],
++    ['系统稳定', '稳定'],
++    ['恢复正常了', '恢复'],
++    ['崩溃了', '崩溃'],
++    ['瘫痪了', '瘫痪'],
++    ['当前完全正常', '正常'],
++    ['情况很危险', '危险'],
++    ['全部搞定', '搞定'],
++  ])('拒绝:扩充后的故障领域状态/严重性词汇"%s"', (s, marker) => {
++    expect(validateShellLine(s, 'daily-report')).toEqual({ ok: false, reason: `contains-fact-claim-marker(${marker})` })
++  })
++})
++
++describe('buildPersonaShell — 降级链路(默认关闭 → 缺 key → 网络/超时/校验失败 → 成功)', () => {
++  it('MIVO_PERSONA_SHELL_ENABLE 未设置时直接跳过,不发任何请求', async () => {
++    const fetchMock = mockFetchOnce(() => chatResponse('x'))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: {} })
++    expect(r).toMatchObject({ title: 'T', text: 'B', attempted: false, applied: false, reason: 'disabled-by-default' })
++    expect(fetchMock).not.toHaveBeenCalled()
++  })
++
++  it('MIVO_PERSONA_SHELL_DISABLE=1 优先级最高,即使 ENABLE=1 也跳过', async () => {
++    const fetchMock = mockFetchOnce(() => chatResponse('x'))
++    const r = await buildPersonaShell({
++      tone: 'p0-alert',
++      title: 'T',
++      text: 'B',
++      key: 'k',
++      env: { ...ENABLED_ENV, MIVO_PERSONA_SHELL_DISABLE: '1' },
++    })
++    expect(r).toMatchObject({ attempted: false, applied: false, reason: 'disabled-by-env' })
++    expect(fetchMock).not.toHaveBeenCalled()
++  })
++
++  it('key 未配置时直接跳过', async () => {
++    const fetchMock = mockFetchOnce(() => chatResponse('x'))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: undefined, env: ENABLED_ENV })
++    expect(r).toMatchObject({ attempted: false, applied: false, reason: 'llm-key-missing' })
++    expect(fetchMock).not.toHaveBeenCalled()
++  })
++
++  it('网关返回非 200 → 回落原文,reason 含 llm-error', async () => {
++    mockFetchOnce(async () => ({ ok: false, status: 500, text: async () => 'boom' }))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    expect(r.applied).toBe(false)
++    expect(r.title).toBe('T')
++    expect(r.text).toBe('B')
++    expect(r.attempted).toBe(true)
++    expect(r.reason).toMatch(/^llm-error:/)
++  })
++
++  // CX-003(codex-adversarial R1):HTTP 错误响应正文若被原样拼进 reason,会经
++  // patrol.mjs 的 appendLog(落盘 logs.md)/broadcast.mjs 的 printResult(打到 stdout)一路
++  // 传出去——若网关端(或中间人)在错误响应体里回显了请求内容片段(如带 key 的 header),
++  // 凭证就可能借这条链路间接回显进持久化日志/公开输出。reason 现在只允许固定分类字符串,
++  // 不得原样带出响应正文的任何片段。
++  it('网关返回非 200 时,reason 绝不包含响应正文原文(即使正文里混入了看起来像凭证的内容)', async () => {
++    mockFetchOnce(async () => ({ ok: false, status: 500, text: async () => 'server saw Bearer SUPERSECRET-KEY-VALUE' }))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'real-key-abc', env: ENABLED_ENV })
++    expect(r.reason).toBe('llm-error: llm-http-500')
++    expect(r.reason).not.toContain('SUPERSECRET')
++    expect(r.reason).not.toContain('Bearer')
++  })
++
++  it('响应无 content → 回落原文', async () => {
++    mockFetchOnce(async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ choices: [{}] }) }))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    expect(r.applied).toBe(false)
++    expect(r.text).toBe('B')
++    expect(r.reason).toMatch(/^llm-error:/)
++  })
++
++  it('响应不是合法 JSON → 回落原文,reason 为固定分类(不泄露响应正文原文)', async () => {
++    mockFetchOnce(async () => ({ ok: true, status: 200, text: async () => 'not json, contains Bearer LEAKED-TOKEN' }))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    expect(r.applied).toBe(false)
++    expect(r.text).toBe('B')
++    expect(r.reason).toBe('llm-error: llm-invalid-json')
++    expect(r.reason).not.toContain('LEAKED-TOKEN')
++  })
++
++  // R2-CX-001(codex-adversarial R2 补充):fetch 本身抛出的网络层错误(非 HTTP 错误响应,而是
++  // 连接失败/DNS 等)此前未经分类,message 会被原样截取拼进 reason。现在统一归类为固定字符串。
++  it('fetch 抛出网络层错误(非超时)→ 回落原文,reason 为固定分类,不透传原始 message', async () => {
++    mockFetchOnce(() => Promise.reject(new Error('some raw network diagnostic with SECRET-XYZ')))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    expect(r.applied).toBe(false)
++    expect(r.text).toBe('B')
++    expect(r.reason).toBe('llm-error: llm-network-error')
++    expect(r.reason).not.toContain('SECRET-XYZ')
++  })
++
++  // R4-CX-001(codex-adversarial R4):上一轮的 try/catch 只包住了 fetch() 调用本身,`res.text()`
++  // 的响应体读取错误(如连接中途断开)仍在保护范围外,原样透传 message。
++  it('res.text() 读取响应体时抛出错误 → 回落原文,reason 为固定分类,不透传原始 message', async () => {
++    mockFetchOnce(async () => ({
++      ok: true,
++      status: 200,
++      text: () => Promise.reject(new Error('body stream error with Bearer STREAM-SECRET-XYZ')),
++    }))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    expect(r.applied).toBe(false)
++    expect(r.text).toBe('B')
++    expect(r.reason).toBe('llm-error: llm-network-error')
++    expect(r.reason).not.toContain('STREAM-SECRET-XYZ')
++  })
++
++  // R6-CX-001(codex-adversarial R6):正常成功响应顶多几 KB,此前 res.text() 读取响应体前
++  // 没有任何长度上限,一个异常网关可以返回任意大的响应体,被完整缓冲/JSON.parse 后才在
++  // too-long 校验里被拒绝。两种场景都要拦:带 Content-Length 头(拒绝在 text() 之前)与
++  // 不带该头(text() 之后兜底)。
++  it('响应体带 Content-Length 且超出上限 → 在读取响应体之前就拒绝', async () => {
++    const bigContent = '汉'.repeat(1_000_000)
++    const bodyText = JSON.stringify({ choices: [{ message: { content: bigContent } }] })
++    const textFn = vi.fn(async () => bodyText)
++    mockFetchOnce(async () => ({
++      ok: true,
++      status: 200,
++      headers: { get: () => String(Buffer.byteLength(bodyText)) },
++      text: textFn,
++    }))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    expect(r.applied).toBe(false)
++    expect(r.reason).toBe('llm-error: llm-response-too-large')
++    expect(textFn).not.toHaveBeenCalled()
++  })
++
++  it('响应体无 Content-Length 头且超出上限 → 读取后兜底拒绝,不进入 JSON.parse', async () => {
++    const bigContent = '汉'.repeat(1_000_000)
++    mockFetchOnce(async () => ({
++      ok: true,
++      status: 200,
++      headers: { get: () => null },
++      text: async () => JSON.stringify({ choices: [{ message: { content: bigContent } }] }),
++    }))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    expect(r.applied).toBe(false)
++    expect(r.reason).toBe('llm-error: llm-response-too-large')
++  })
++
++  // R8-CX-001(codex-adversarial R8):兜底判断此前用 `raw.length`(JS UTF-16 code unit 数)
++  // 当字节数——纯中文内容 UTF-8 编码后是 3 倍字节,3 万汉字的 `.length` 才 3 万,远低于
++  // 64KB 上限,但编码后实际约 9 万字节,早已超限却没被拦住,只是后面被不相关的 too-long
++  // 校验间接兜住。这里构造一个 `.length` 未超限但 UTF-8 字节数确实超限的例子,断言按字节
++  // 数正确拒绝。
++  it('响应体 .length 未超限但 UTF-8 字节数超限(纯中文 3 倍字节)→ 仍按字节数正确拒绝', async () => {
++    const bigContent = '汉'.repeat(30_040)
++    const bodyText = JSON.stringify({ choices: [{ message: { content: bigContent } }] })
++    expect(bodyText.length).toBeLessThan(64 * 1024)
++    expect(Buffer.byteLength(bodyText, 'utf8')).toBeGreaterThan(64 * 1024)
++    mockFetchOnce(async () => ({
++      ok: true,
++      status: 200,
++      headers: { get: () => null },
++      text: async () => bodyText,
++    }))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    expect(r.applied).toBe(false)
++    expect(r.reason).toBe('llm-error: llm-response-too-large')
++  })
++
++  // F16(claude-adversarial R8):上面两条测试用的 mock 只有 `.text()`,验证的是"读完之后再
++  // 拒绝"这条兜底路径——但真实 fetch 的 Response 总有 `.body`(WHATWG ReadableStream),
++  // 之前 `res.text()` 会无条件把整个 stream 读进内存,不管读了多少字节都不会中途停下,
++  // Content-Length 缺失/被网关略去时这层保护形同不存在。这里用真实 stream 语义的 mock
++  // (模拟远超上限的总量),断言：①最终仍正确拒绝;②真的中途停止(实际消费的字节数远小于
++  // mock 总量,不是"读完 50MB 才发现超限");③reader.cancel() 被调用,不是读完才丢弃。
++  it('响应体经真实 stream(res.body.getReader)读取,超限时中途 cancel,不读完整个流', async () => {
++    let cancelled = false
++    let chunksServed = 0
++    const CHUNK_SIZE = 8192
++    const TOTAL_CHUNKS_IF_UNBOUNDED = 20_000 // 若不中途停止将读满 ~156MB
++    const reader = {
++      read: vi.fn(async () => {
++        if (cancelled || chunksServed >= TOTAL_CHUNKS_IF_UNBOUNDED) return { done: true, value: undefined }
++        chunksServed += 1
++        return { done: false, value: new Uint8Array(CHUNK_SIZE) }
++      }),
++      cancel: vi.fn(async () => {
++        cancelled = true
++      }),
++    }
++    mockFetchOnce(async () => ({
++      ok: true,
++      status: 200,
++      headers: { get: () => null },
++      body: { getReader: () => reader },
++    }))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    expect(r.applied).toBe(false)
++    expect(r.reason).toBe('llm-error: llm-response-too-large')
++    expect(reader.cancel).toHaveBeenCalledTimes(1)
++    // 64KB 上限 / 8KB 每块 = 最多 9 块就该触发拒绝,远小于模拟的 20000 块总量。
++    expect(chunksServed).toBeLessThan(20)
++  })
++
++  it('超时 → abort,回落原文,reason 含 llm-error(不抛异常)', async () => {
++    mockFetchOnce(
++      (url, init) =>
++        new Promise((_resolve, reject) => {
++          init.signal.addEventListener('abort', () => reject(new Error('The operation was aborted')))
++        }),
++    )
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    expect(r.applied).toBe(false)
++    expect(r.text).toBe('B')
++    expect(r.reason).toMatch(/^llm-error:/)
++  }, 10_000)
++
++  it('校验不过(壳含数字)→ 回落原文,reason 含 invalid-output', async () => {
++    mockFetchOnce(async () => chatResponse('这是第2次了'))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    expect(r.applied).toBe(false)
++    expect(r.text).toBe('B')
++    expect(r.reason).toMatch(/^invalid-output:/)
++  })
++
++  it('成功:title 原样返回,text 追加一行壳,不重试不换模型', async () => {
++    const fetchMock = mockFetchOnce(async () => chatResponse('我盯着呢😌'))
++    const r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    expect(r).toMatchObject({ title: 'T', text: 'B\n我盯着呢😌', attempted: true, applied: true, reason: null })
++    expect(r.model).toBe('deepseek/deepseek-v4-flash')
++    expect(fetchMock).toHaveBeenCalledTimes(1)
++  })
++
++  it('请求体不含 max_tokens,模型固定 deepseek/deepseek-v4-flash', async () => {
++    const fetchMock = mockFetchOnce(async () => chatResponse('挺好😌'))
++    await buildPersonaShell({ tone: 'daily-report', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    const [, init] = fetchMock.mock.calls[0]
++    const body = JSON.parse(init.body)
++    expect(body).not.toHaveProperty('max_tokens')
++    expect(body.model).toBe('deepseek/deepseek-v4-flash')
++  })
++
++  // CX-002(codex-adversarial R1):网关地址曾可经 MIVO_PERSONA_SHELL_LLM_BASE 环境变量覆盖,
++  // 而请求会带着真实 key 打向该地址——若该变量被意外/恶意改写,等于把凭证连同完整告警
++  // 正文一起发到任意主机(SSRF/凭证外泄)。现已彻底移除该覆盖能力,这里断言:即使显式设置
++  // 该环境变量,请求仍然只会打向固定的网关地址,不受影响。
++  it('MIVO_PERSONA_SHELL_LLM_BASE 环境变量不再有任何效果,请求始终打向固定网关地址', async () => {
++    const fetchMock = mockFetchOnce(async () => chatResponse('挺好😌'))
++    await buildPersonaShell({
++      tone: 'daily-report',
++      title: 'T',
++      text: 'B',
++      key: 'k',
++      env: { ...ENABLED_ENV, MIVO_PERSONA_SHELL_LLM_BASE: 'https://attacker.example.com' },
++    })
++    const [url] = fetchMock.mock.calls[0]
++    expect(url).toBe('https://llm-proxy.tapsvc.com/v1/chat/completions')
++  })
++
++  it('超时时长按 tone 区分:p0-alert=5000ms,daily-report=15000ms', () => {
++    expect(TIMEOUT_MS_BY_TONE['p0-alert']).toBe(5_000)
++    expect(TIMEOUT_MS_BY_TONE['daily-report']).toBe(15_000)
++  })
++
++  it('可通过 env.MIVO_PERSONA_SHELL_MODEL 覆盖模型(供测试/临时排障使用),但不引入回退链', async () => {
++    const fetchMock = mockFetchOnce(async () => chatResponse('挺好😌'))
++    const r = await buildPersonaShell({
++      tone: 'daily-report',
++      title: 'T',
++      text: 'B',
++      key: 'k',
++      env: { ...ENABLED_ENV, MIVO_PERSONA_SHELL_MODEL: 'deepseek/deepseek-v4-pro' },
++    })
++    expect(r.model).toBe('deepseek/deepseek-v4-pro')
++    expect(fetchMock).toHaveBeenCalledTimes(1)
++  })
++})
++
++// SC-6(单审提出,2026-08-07 lead 拍板):"绝不抛异常"此前只靠函数体内逐处 try/catch 的控制流
++// 保证,没有一层顶层结构性兜底——同一类"未捕获异常违反 never-throws 契约"的缺陷已在本 PR
++// 审查里独立复现 4 次,每次都是点状修一处。这里不测已知的某个具体调用点,而是用一个"任意
++// 未被专门处理的同步操作抛出未预期异常"的场景(mock Date.now 抛错,发生在 fetch 调用之前),
++// 证明顶层兜底真的接住了这类"没被专门想到"的异常,不是靠又补一处局部 try/catch 侥幸过关。
++describe('buildPersonaShell — 顶层结构性兜底(反向验证:未被专门处理的同步异常也不应打破 never-throws 契约)', () => {
++  it('内部出现非预期异常(Date.now 被 mock 成抛异常)时不抛出,回落原始 title/text,reason 为固定分类且不含原始异常文本', async () => {
++    const dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
++      throw new Error('boom-unexpected-SECRET-XYZ')
++    })
++    let r
++    try {
++      r = await buildPersonaShell({ tone: 'p0-alert', title: 'T', text: 'B', key: 'k', env: ENABLED_ENV })
++    } finally {
++      dateNowSpy.mockRestore()
++    }
++    expect(r).toMatchObject({ title: 'T', text: 'B', attempted: true, applied: false, reason: 'unexpected-error' })
++    expect(r.latencyMs).toBeNull()
++    expect(JSON.stringify(r)).not.toContain('boom-unexpected-SECRET-XYZ')
++  })
++})
+diff --git a/scripts/loops/merge-thanks/from-github-event.mjs b/scripts/loops/merge-thanks/from-github-event.mjs
+index 16c5eadb..28538bbd 100644
+--- a/scripts/loops/merge-thanks/from-github-event.mjs
++++ b/scripts/loops/merge-thanks/from-github-event.mjs
+@@ -350,7 +350,7 @@ async function main() {
+     // 同仓 PR 缺配置代表 secrets 真的坏了,必须报,复用配置前的判定原文不变。
+     // provenance 必须显式算出来再传(CX-5):豁免只对真实 pull_request 事件成立,
+     // workflow_dispatch 手动补发即使 payload 里带了看起来像 fork 的 head/base 也不给。
+-    finish({ ok: true, posted: false, reason: describeSlackNotConfigured(pr, resolveEventProvenance()) })
++    finish({ ok: true, pr: pr.number, url: pr.html_url ?? null, posted: false, reason: describeSlackNotConfigured(pr, resolveEventProvenance()) })
+     process.exit(0)
+   }
+ 
+@@ -364,7 +364,11 @@ async function main() {
+     if (!threadPosted) threadReason = tr?.reason ?? 'unknown'
+   }
+   finish({
+-    ok: true, pr: pr.number, posted, channel: result.channel,
++    ok: true, pr: pr.number, url: pr.html_url ?? null, posted, channel: result.channel,
++    // messageTs:仅 posted(api 通道)时有意义,供人工核对"每个 merge 是否各自独立送达一条
++    // 主消息"——本脚本对每个 pull_request:closed 事件各自独立跑一次,没有任何跨调用共享
++    // 状态,两次不同 PR 的调用之间不会互相感知(见 from-github-event.test.mjs 的回归测试)。
++    messageTs: posted ? (result.ts ?? null) : null,
+     ...(posted ? {} : { reason: describeChannelFailure(result.channel) }),
+     threadPosted, ...(threadReason ? { threadReason } : {}),
+     identity: { tier: ident.tier, ...(ident.reason ? { reason: ident.reason } : {}) },
+diff --git a/scripts/loops/merge-thanks/from-github-event.test.mjs b/scripts/loops/merge-thanks/from-github-event.test.mjs
+index 94501c2b..d22e01a1 100644
+--- a/scripts/loops/merge-thanks/from-github-event.test.mjs
++++ b/scripts/loops/merge-thanks/from-github-event.test.mjs
+@@ -394,6 +394,71 @@ describe('make-dispatch-event.mjs 真实产出 → 分类器判定,不用手写
+   })
+ })
+ 
++// SC-7(用户截图「两个合并被合并进同一条播报」的调查结论):本脚本对每个
++// pull_request:closed 事件各自独立跑一次 main(),不落地任何跨调用共享状态(不像
++// notify-merge-ack.mjs 那样有去重台账文件)——两次不同 PR 号的独立进程调用之间物理上不
++// 可能互相感知。这里子进程分别喂两个不同 PR 号的 merged 事件(同仓、无 Slack 配置,走
++// slack-not-configured 分支),断言各自输出正确对应的 pr/url,证明"一次合并一条播报"这条
++// 契约在本脚本层面成立(截图里的"挤在一起"是 Slack 客户端对连续消息的展示折叠,不是本
++// 脚本把两条合并揽成一条)。
++describe('SC-7:两次独立 merge 事件互不干扰(各自恰产生一条独立结果,无共享去重/批量状态)', () => {
++  let dir
++
++  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'merge-thanks-independence-')) })
++  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
++
++  const runScript = (env) =>
++    execFileSync(process.execPath, [SCRIPT_PATH], {
++      encoding: 'utf8',
++      env: { PATH: process.env.PATH, ...env },
++    })
++
++  // 同仓 PR 缺 Slack 配置属于真故障(需要 ::error:: 注解,见 formatAnnotation),stdout 里
++  // JSON 结果之后会紧跟这一行——同 line 70-75 的既有裁法,只取前半段 JSON 块。
++  const parseResult = (stdout) => {
++    const idx = stdout.indexOf('\n::error')
++    return JSON.parse(idx === -1 ? stdout : stdout.slice(0, idx))
++  }
++
++  const mergedEvent = (number, htmlUrl) => ({
++    pull_request: {
++      number,
++      merged: true,
++      title: `t${number}`,
++      body: `b${number}`,
++      html_url: htmlUrl,
++      user: { login: 'someone', type: 'User' },
++      head: { repo: { full_name: 'xindong/mivo-canvas' } },
++      base: { repo: { full_name: 'xindong/mivo-canvas' } },
++    },
++  })
++
++  it('两个不同 PR 号的合并事件,各自独立子进程调用,各自输出正确对应的 pr/url,互不混淆', () => {
++    const eventA = join(dir, 'a.json')
++    const eventB = join(dir, 'b.json')
++    writeFileSync(eventA, JSON.stringify(mergedEvent(533, 'https://github.com/xindong/mivo-canvas/pull/533')))
++    writeFileSync(eventB, JSON.stringify(mergedEvent(524, 'https://github.com/xindong/mivo-canvas/pull/524')))
++
++    const resultA = parseResult(runScript({ GITHUB_EVENT_NAME: 'pull_request', GITHUB_EVENT_PATH: eventA }))
++    const resultB = parseResult(runScript({ GITHUB_EVENT_NAME: 'pull_request', GITHUB_EVENT_PATH: eventB }))
++
++    expect(resultA).toMatchObject({ pr: 533, url: 'https://github.com/xindong/mivo-canvas/pull/533' })
++    expect(resultB).toMatchObject({ pr: 524, url: 'https://github.com/xindong/mivo-canvas/pull/524' })
++    // 未配置 Slack 时两者都不会真的 posted,但各自的 reason 都是同仓缺配置(告警),而不是
++    // 因为"上一次调用已经处理过"之类的互相感知导致的异常分支。
++    expect(resultA.posted).toBe(false)
++    expect(resultB.posted).toBe(false)
++    expect(resultA.reason).toBe('slack-not-configured(需 SLACK_BOT_TOKEN + SLACK_CHANNEL_ID)')
++    expect(resultB.reason).toBe(resultA.reason)
++  })
++
++  it('本脚本目录内不存在任何去重/批量台账文件(结构性佐证:没有可以把两条合并"揽成一条"的共享状态)', () => {
++    const src = readFileSync(SCRIPT_PATH, 'utf8')
++    expect(src).not.toMatch(/dedup|DEDUP/i)
++    expect(src).not.toContain('writeFileSync')
++  })
++})
++
+ describe('formatAnnotation — 按 Actions workflow command 规则转义 reason/error(SC6)', () => {
+   it('error 含换行 → 转义为 %0A,整条注解仍是单行,不产生第二条可解析的 workflow command', () => {
+     const line = formatAnnotation({ posted: false, reason: 'merge-thanks-error', error: 'boom\nline2' })

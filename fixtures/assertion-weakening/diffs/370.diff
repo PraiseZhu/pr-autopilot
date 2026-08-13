@@ -1,0 +1,3531 @@
+diff --git a/.github/dependabot.yml b/.github/dependabot.yml
+index 58572372..2cc86576 100644
+--- a/.github/dependabot.yml
++++ b/.github/dependabot.yml
+@@ -40,11 +40,10 @@ updates:
+           - minor
+           - patch
+ 
+-  # workflow 里全是浮动 tag(actions/checkout@v4 / actions/github-script@v7 等),
+-  # 且仓库 Actions 设置为 allowed_actions=all + sha_pinning_required=false ——
+-  # 第三方 action 的 tag 被劫持即可在 CI 内执行任意代码,而 pr-hygiene 持
+-  # pull-requests:write、daily-changelog 持 MIVO_CHANGELOG_PAT。
+-  # Dependabot 至少把 action 升级变成一条可审的 PR(彻底解法是 SHA pin,另议)。
++  # 2026-08-01 起全部 workflow 的 uses 均已 40 位 SHA-pin(+行尾版本注释),
++  # semgrep docker 镜像钉 manifest digest —— tag 劫持面已收口。Dependabot 的职责
++  # 从「把浮动 tag 升级变成可审 PR」变为「按注释识别版本、自动提 SHA bump PR」
++  # (dependabot 原生支持 `action@<sha> # vX.Y.Z` 注释格式)。
+   - package-ecosystem: github-actions
+     directory: /
+     schedule:
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index fbc43ce3..67eb8cbe 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -34,6 +34,10 @@ jobs:
+   build-and-test:
+     name: lint + tsc + unit + logging
+     runs-on: ubuntu-latest
++    # 全 job 补 timeout(2026-08-01 门禁收尾):无超时的 job 卡死会吃满 6h 配额,
++    # 且 concurrency cancel-in-progress 只救得了新推送、救不了夜间静默悬挂。
++    # 取值 = 近期正常时长 × ~3 冗余。
++    timeout-minutes: 15
+     steps:
+       # fetch-depth: 0 是必需的,不是优化:单元测试里有两条**相对 merge-base** 的门禁
+       # ——`cardManifest.test.ts`(ghost.json 版本严格递增 / 槽位只增不减)与
+@@ -51,12 +55,12 @@ jobs:
+       # refs/remotes/origin/main 可达),structure-guard job 已用同一方案验证。
+       # 代价:全历史克隆比浅克隆慢(本仓当前 639 commit / .git 约 64MB,秒级差异)。
+       - name: Checkout (full history for merge-base guards in unit tests)
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+         with:
+           fetch-depth: 0
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+           cache: npm
+@@ -80,6 +84,12 @@ jobs:
+       - name: Verify logging rules
+         run: npm run verify:logging
+ 
++      # 内网基础设施字面量守卫(2026-08-01 门禁收尾):AGENTS.md「部署机信息不进代码」
++      # 此前零机器执行,实证翻车见 scripts/ci/check-internal-literals.mjs 头注释。
++      # 阻断项:本 job 是 required check,红即挡合并。规则/豁免机制见守卫脚本。
++      - name: Internal infra literals guard
++        run: node scripts/ci/check-internal-literals.mjs
++
+       # R2-8:ops/postgres shell 回归 + shellcheck 进入 CI 自动验收(此前 test-asset-verify.sh 等无任何
+       # package script/CI/preflight 引用 → F3 矩阵/F6/F7 singleflight/F2 预算断言无自动闸门)。
+       # 依赖 bash + jq(ubuntu-latest 预装);无 docker/PG(纯函数 + 合成 tar/COPY 块)。
+@@ -101,12 +111,18 @@ jobs:
+   bench:
+     name: bench (perf report, non-blocking)
+     runs-on: ubuntu-latest
++    timeout-minutes: 10
++    # actions:read 供趋势对比步下载上一次 main 运行的 bench-result artifact
++    #(workflow 级 permissions 只有 contents:read,job 级在此放宽一项)。
++    permissions:
++      contents: read
++      actions: read
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+           cache: npm
+@@ -144,6 +160,143 @@ jobs:
+         run: |
+           echo "::warning::微基准 leaferPaintSignature 超阈值或异常（非阻断，仅报告，不挡合并）。详见 job summary 与上方 bench step 日志；沿革见 issue #172。"
+ 
++      # ── bench 趋势对比(2026-08-01 门禁收尾)────────────────────────────────
++      # 痛点:p95 每次进 summary 但无历史对比,「每次 +5% 不破阈值」的缓慢劣化永远
++      # 发现不了 —— 阈值契约只兜底线,不看斜率。做法:每次运行把结果 JSON 存为
++      # artifact;对比基线取「main 分支最近一次带该 artifact 的已完成运行」(PR 与
++      # main push 都和 main 基线比)。差异 >20% 发 warning(非阻断,与本 job 定位一致)。
++      # 首跑无基线 → 明确输出「无历史」,不是异常不误报。
++      - name: Upload bench result artifact (trend baseline)
++        if: always()
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
++        with:
++          name: bench-result
++          path: /tmp/pr-r2-bench-result.json
++          # 结果文件缺失(bench setup 阶段异常)时不让上传步翻红:上面的 summary 步
++          # 已经把「文件未生成」说清楚了,这里静默跳过即可。
++          if-no-files-found: ignore
++          retention-days: 90
++
++      - name: Compare with latest main baseline (non-blocking)
++        if: always()
++        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
++        with:
++          script: |
++            const fs = require('fs');
++            const { execFileSync } = require('child_process');
++            const owner = context.repo.owner, repo = context.repo.repo;
++            const THRESHOLD_PCT = 20;
++            const METRICS = ['dragOneP95Ms', 'allChangedP95Ms'];
++            // 基准口径字段:两侧必须完全一致才可比(2026-08-01 返修:PR 改 N/RUNS 时
++            // 直接算 Δ% 会产出假提升/假回归 —— 口径变化 = 无可比基线,新口径由该
++            // main run 自己建立)。
++            const PARAMS = ['nodes', 'runs'];
++            // 严格数值:typeof number + 有限 + >0(2026-08-01 返修:Number(null)=0 的
++            // 强转病 —— 与本仓 npm audit 假 clean 同款教训;基线 0 还会除出 Infinity)。
++            // 口径字段一并纳入合法性(第二轮审查:两侧都缺 nodes/runs 时 undefined===
++            // undefined 会让口径检查空转,未知负载下的伪趋势照算)—— nodes/runs 必须
++            // 是正整数,当前结果非法=本次无结果,基线非法=继续找下一 run。
++            const validMetrics = (o) => o && typeof o === 'object'
++              && METRICS.every((m) => typeof o[m] === 'number' && Number.isFinite(o[m]) && o[m] > 0)
++              && PARAMS.every((p) => Number.isSafeInteger(o[p]) && o[p] > 0);
++            const out = ['## bench 趋势对比(vs 最近一次 main 基线,non-blocking)', ''];
++            const finish = async () => core.summary.addRaw(out.join('\n') + '\n').write();
++
++            // 当前结果:文件缺失/损坏 → 说明后跳过(不翻红,bench step 日志里有真相)。
++            let cur = null;
++            try {
++              cur = JSON.parse(fs.readFileSync('/tmp/pr-r2-bench-result.json', 'utf8'));
++              // 诊断按维度精确归因(verify-r3 P3):timing 与口径字段分开报,别把
++              // nodes/runs 非法说成 p95 的问题。
++              if (!validMetrics(cur)) {
++                const badTiming = METRICS.filter((m) => !(typeof cur?.[m] === 'number' && Number.isFinite(cur?.[m]) && cur?.[m] > 0));
++                const badParams = PARAMS.filter((p) => !(Number.isSafeInteger(cur?.[p]) && cur?.[p] > 0));
++                throw new Error([
++                  badTiming.length ? badTiming.join('/') + ' 缺失、非数值或非正数' : '',
++                  badParams.length ? badParams.join('/') + ' 缺失或非正整数(基准口径字段)' : '',
++                ].filter(Boolean).join(';'));
++              }
++            } catch (e) {
++              out.push('_(本次无可用 bench 结果(' + e.message + '),跳过趋势对比 —— 见 bench step 日志)_');
++              await finish(); return;
++            }
++
++            // 基线:main 上最近一次带可用 bench-result artifact 的 **push** 运行(排除本次)。
++            // event:'push' + 客户端双重校验(2026-08-01 返修:branch 过滤匹配的是 head
++            // branch,同名 main 的 PR run 也会入选污染基线)。只翻最近 10 次:更早的
++            // 基线对「趋势」已无意义,翻多了白耗 API。
++            // 单个 artifact 损坏只跳过该 run 继续找(2026-08-01 返修:此前一个坏
++            // artifact 触发外层 catch 直接放弃整个搜索);每轮独立解压目录防残留。
++            let baseline = null, baseRun = null;
++            const skipped = [];
++            try {
++              const runs = await github.rest.actions.listWorkflowRuns({
++                owner, repo, workflow_id: 'ci.yml', branch: 'main', event: 'push',
++                status: 'completed', per_page: 10,
++              });
++              for (const run of runs.data.workflow_runs) {
++                if (run.id === context.runId) continue;
++                if (run.event !== 'push' || run.head_branch !== 'main') continue; // 防御性双重校验
++                try {
++                  const arts = await github.rest.actions.listWorkflowRunArtifacts({
++                    owner, repo, run_id: run.id, per_page: 100,
++                  });
++                  const a = arts.data.artifacts.find((x) => x.name === 'bench-result' && !x.expired);
++                  if (!a) continue;
++                  const dl = await github.rest.actions.downloadArtifact({
++                    owner, repo, artifact_id: a.id, archive_format: 'zip',
++                  });
++                  const dir = '/tmp/bench-baseline-' + run.id;
++                  fs.mkdirSync(dir, { recursive: true });
++                  fs.writeFileSync(dir + '/a.zip', Buffer.from(dl.data));
++                  execFileSync('unzip', ['-o', dir + '/a.zip', '-d', dir]);
++                  const parsed = JSON.parse(fs.readFileSync(dir + '/pr-r2-bench-result.json', 'utf8'));
++                  if (!validMetrics(parsed)) { skipped.push('#' + run.run_number + '(指标非法)'); continue; }
++                  baseline = parsed; baseRun = run; break;
++                } catch (e) {
++                  skipped.push('#' + run.run_number + '(' + ((e && e.message) || String(e)).slice(0, 80) + ')');
++                }
++              }
++            } catch (e) {
++              // 对比是增值功能,基线获取失败不该让非阻断 job 翻红;但要说清楚,不静默。
++              out.push('_(基线获取失败:' + e.message + ' —— 本次不对比,非安全/正确性结论)_');
++              await finish(); return;
++            }
++            if (!baseline) {
++              out.push('_(main 最近 10 次 push 运行里没有可用的 bench-result 基线 —— 首跑建立基线属正常,本次不对比'
++                + (skipped.length ? ';损坏/非法 artifact 已跳过:' + skipped.join(', ') : '') + ')_');
++              await finish(); return;
++            }
++
++            // 口径一致性:nodes/runs 任一缺失或不相等 → 无可比基线,不算 Δ%。
++            const paramDiff = PARAMS.filter((p) => cur[p] !== baseline[p]);
++            if (paramDiff.length) {
++              out.push('_(基准口径变化(' + paramDiff.map((p) => p + ': ' + baseline[p] + '→' + cur[p]).join(', ')
++                + '),与基线不可比 —— 本次不对比;新口径由下一次 main push 建立基线)_');
++              await finish(); return;
++            }
++
++            out.push('基线:main run [#' + baseRun.run_number + '](' + baseRun.html_url + ')'
++              + '(`' + baseRun.head_sha.slice(0, 8) + '`,' + baseRun.created_at + ')', '');
++            out.push('| metric | baseline | current | Δ% |');
++            out.push('|--------|----------|---------|----|');
++            let regressed = [];
++            for (const m of METRICS) {
++              const b = Number(baseline[m]), c = Number(cur[m]);
++              const pct = ((c - b) / b) * 100;
++              const mark = pct > THRESHOLD_PCT ? ' ⚠️' : '';
++              if (pct > THRESHOLD_PCT) regressed.push(m + ' +' + pct.toFixed(1) + '%');
++              out.push('| ' + m + ' | ' + b.toFixed(3) + ' ms | ' + c.toFixed(3) + ' ms | '
++                + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%' + mark + ' |');
++            }
++            out.push('', '> 阈值:单指标相对基线劣化 >' + THRESHOLD_PCT + '% 发 warning(非阻断)。'
++              + '共享 runner 抖动大,单次超标先看 rerun 是否复现,连续多次超标才当趋势。');
++            if (regressed.length) {
++              core.warning('bench 趋势劣化(非阻断):' + regressed.join(', ')
++                + ' —— 相对 main 基线 run #' + baseRun.run_number + '。共享 runner 有抖动,连续复现才算趋势。');
++            }
++            await finish();
++
+   # deps-audit job（非阻断）—— 2026-07-30 门禁评估补:CI 此前完全不看依赖,
+   # 可以在已知高危未修的状态下无限合并(评估当天 Dependabot 有一条 open HIGH
+   # postcss GHSA-r28c-9q8g-f849 已挂 6 天)。
+@@ -182,12 +335,13 @@ jobs:
+   deps-audit:
+     name: deps audit (non-blocking)
+     runs-on: ubuntu-latest
++    timeout-minutes: 5
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+           cache: npm
+@@ -314,17 +468,18 @@ jobs:
+   structure-guard:
+     name: structure guard (anti-regression)
+     runs-on: ubuntu-latest
++    timeout-minutes: 10
+     steps:
+       # v2 增量语义需要 merge-base(HEAD, base) 可达,故全量 fetch。
+       # MIVO_GUARD_BASE_SHA 注入 PR base SHA;push 事件(无 PR context)时为空,
+       # 守卫回退用 git merge-base HEAD origin/main。
+       - name: Checkout (full history for merge-base)
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+         with:
+           fetch-depth: 0
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+           cache: npm
+@@ -356,10 +511,10 @@ jobs:
+     timeout-minutes: 20
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+           cache: npm
+@@ -368,7 +523,7 @@ jobs:
+         run: npm ci
+ 
+       - name: Cache Playwright Chromium
+-        uses: actions/cache@v4
++        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+         with:
+           path: ~/.cache/ms-playwright
+           key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
+@@ -409,7 +564,7 @@ jobs:
+ 
+       - name: Upload failing e2e artifacts
+         if: failure()
+-        uses: actions/upload-artifact@v7
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+           name: e2e-prod-subset-artifacts
+           path: test-artifacts
+@@ -428,10 +583,10 @@ jobs:
+     timeout-minutes: 20
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+           cache: npm
+@@ -440,7 +595,7 @@ jobs:
+         run: npm ci
+ 
+       - name: Cache Playwright Chromium
+-        uses: actions/cache@v4
++        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+         with:
+           path: ~/.cache/ms-playwright
+           key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
+@@ -474,7 +629,7 @@ jobs:
+ 
+       - name: Upload failing e2e artifacts
+         if: failure()
+-        uses: actions/upload-artifact@v7
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+           name: e2e-kernel-gate-artifacts
+           path: test-artifacts
+@@ -494,10 +649,10 @@ jobs:
+     timeout-minutes: 12
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+           cache: npm
+@@ -506,7 +661,7 @@ jobs:
+         run: npm ci
+ 
+       - name: Cache Playwright Chromium
+-        uses: actions/cache@v4
++        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+         with:
+           path: ~/.cache/ms-playwright
+           key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
+@@ -550,7 +705,7 @@ jobs:
+ 
+       - name: Upload visual-diff artifacts
+         if: failure() || cancelled()
+-        uses: actions/upload-artifact@v7
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+           name: visual-diff-artifacts
+           path: test-artifacts/visual-diff
+@@ -576,10 +731,10 @@ jobs:
+           - unauthorized
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+           cache: npm
+@@ -596,7 +751,7 @@ jobs:
+ 
+       - name: Upload failing gated artifacts
+         if: failure()
+-        uses: actions/upload-artifact@v7
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+           name: e2e-token-gated-${{ matrix.mode }}-artifacts
+           path: test-artifacts
+@@ -659,10 +814,10 @@ jobs:
+       MIVO_PG_UNIT_DB_PERM: mivocanvas_unit_perm
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+           cache: npm
+@@ -789,7 +944,7 @@ jobs:
+ 
+       - name: Upload pg-suite artifacts
+         if: failure() || cancelled()
+-        uses: actions/upload-artifact@v7
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+           name: pg-suite-artifacts
+           path: test-artifacts
+@@ -838,10 +993,10 @@ jobs:
+       MIVO_E2E_RESET_TOKEN: e2e-reset-token
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+           cache: npm
+@@ -875,9 +1030,363 @@ jobs:
+ 
+       - name: Upload failing e2e artifacts
+         if: failure() || cancelled()
+-        uses: actions/upload-artifact@v7
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+           name: e2e-persist-server-artifacts
+           path: test-artifacts
+           if-no-files-found: warn
+           retention-days: 14
++
++  # ── cindyplugin 构建门禁(2026-08-01 门禁收尾,阻断)──────────────────────────
++  # 痛点:cindyplugin/ 是插件交付物,版本高频迭代(ghost.json 0.7.x→0.8.x 连跳),但
++  # CI 此前对它**零覆盖** —— build.sh 全靠开发者本地自觉。本 job 把「manifest 是
++  # 合法 JSON 且关键字段在 + 插件 bundle 能构建 + 产物形状与运行时引用完整」变成
++  # 每 PR 阻断项。
++  # 边界诚实声明(2026-08-01 gpt-5.6-sol 审查 P2 修正):本 gate 覆盖**构建可行性 +
++  # manifest 浅层格式 + 产物引用完整性**三层;#347 那类宿主 pack 期深校验失败
++  # (未知能力键、字段长度超限等 schema 语义)它拦不住 —— 深层校验的单一真相源是
++  # 宿主 ghost_forge_pack,CI 侧维护宿主键集副本只会造名单漂移病,有意不做。
++  # 阻断语义:失败即 job 红;注册为 required check 后挡合并(照 pg-suite 先例,
++  # ruleset/经典保护为 PR 外 lead 动作)。同 PR 已把本 check 名同步进
++  # deploy-green-ref REQUIRED_ON_MAIN 与 watchdog 两处名单 —— 三处必须一起改。
++  cindyplugin-build:
++    name: cindyplugin build
++    runs-on: ubuntu-latest
++    timeout-minutes: 10
++    steps:
++      - name: Checkout
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
++
++      - name: Setup Node (LTS)
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
++        with:
++          node-version: lts/*
++          cache: npm
++
++      - name: Install dependencies
++        run: npm ci
++
++      # manifest 基本面:合法 JSON + 打包最低要求字段(id/version/entry/name/icon)。
++      # version 必须是 x.y.z 数字三段 —— cardManifest.test.ts 的「版本严格递增」
++      # 守的是跨 commit 语义,这里守的是「单点格式合法」,两层互补。
++      # entry/icon 约束为包内相对路径(拒绝绝对路径/`..`):它们随后作为 dist 校验的
++      # 依据 —— manifest 指哪,产物就必须有哪(2026-08-01 返修:此前 sanity 与 dist
++      # 校验彼此脱钩,entry 改成 missing.js 时两步都绿,宿主装入才翻车)。
++      - name: Manifest sanity (ghost.json)
++        run: |
++          node -e "
++            const m = JSON.parse(require('fs').readFileSync('cindyplugin/ghost.json', 'utf8'));
++            for (const k of ['id', 'version', 'entry', 'name']) {
++              if (!m[k] || typeof m[k] !== 'string') throw new Error('ghost.json 缺少或非法字段: ' + k);
++            }
++            if (!/^\d+\.\d+\.\d+$/.test(m.version)) throw new Error('ghost.json version 非 x.y.z 格式: ' + m.version);
++            for (const k of ['entry', 'icon']) {
++              const v = m[k];
++              if (k === 'icon' && v === undefined) continue; // icon 可选:缺省只允许 undefined
++              // 空串也拒绝(第二轮审查:icon:'' 曾同时绕过这里和 dist 校验的 falsy 判断)
++              if (typeof v !== 'string' || v === '' || v.startsWith('/') || v.split('/').includes('..')) {
++                throw new Error('ghost.json ' + k + ' 必须是非空包内相对路径(无绝对/..): ' + JSON.stringify(v));
++              }
++            }
++            console.log('ghost.json OK: id=' + m.id + ' version=' + m.version + ' entry=' + m.entry + ' icon=' + (m.icon || '(无)'));
++          "
++
++      - name: Build plugin bundle (cindyplugin/build.sh)
++        run: bash cindyplugin/build.sh
++
++      # 产物完整性(2026-08-01 返修加强):
++      #   1. manifest 引用完整性:dist/<entry>、dist/<icon> 按 ghost.json 实际值校验
++      #      非空普通文件,不硬编码 main.js;
++      #   2. Vite 核心产物:panel.html 非空 + assets/ 非空,并解析 panel.html 里的
++      #      相对 script/style 引用逐一验存在(vite input/output 漂移时立刻红);
++      #   3. 运行时引用资产:从源码 grep 实际引用的 /stickers/*.svg 与 /demo-assets/*
++      #      字面路径,逐个对 dist 验非空 —— 清单自维护,删任一被引用文件即红
++      #      (此前只验目录存在,空目录/缺单个印章都能溜过去,运行时 404)。
++      - name: Verify dist shape & referenced assets
++        run: |
++          set -e
++          node -e "
++            const fs = require('fs');
++            const m = JSON.parse(fs.readFileSync('cindyplugin/ghost.json', 'utf8'));
++            const mustFile = (p, why) => {
++              const st = fs.existsSync(p) && fs.statSync(p);
++              if (!st || !st.isFile() || st.size === 0) throw new Error('dist 缺少或为空: ' + p + '(' + why + ')');
++            };
++            const path = require('path');
++            const distRoot = path.resolve('cindyplugin/dist');
++            mustFile('cindyplugin/dist/' + m.entry, 'manifest entry');
++            // icon 与 sanity 步同语义:undefined=缺省,存在必须非空(falsy 判断会被 '' 绕过)
++            if (m.icon !== undefined) mustFile('cindyplugin/dist/' + m.icon, 'manifest icon');
++            mustFile('cindyplugin/dist/ghost.json', 'manifest 本体');
++            mustFile('cindyplugin/dist/panel.html', 'vite 面板入口');
++            const assets = fs.existsSync('cindyplugin/dist/assets') ? fs.readdirSync('cindyplugin/dist/assets') : [];
++            if (!assets.length) throw new Error('dist/assets 缺失或为空(vite 产物布局漂移?)');
++            // panel.html 的相对引用逐一验存在(忽略 http(s)/data/协议相对)。
++            // containment(第二轮审查 P1):resolve 后必须仍在 dist 根内 —— ../ghost.json
++            // 这类上跳引用会命中仓内同名文件而假绿,但打进包里的 dist 并没有它,
++            // 宿主加载即 404。(本注释不用反引号:整段在 shell 双引号串里,反引号=命令替换)
++            const html = fs.readFileSync('cindyplugin/dist/panel.html', 'utf8');
++            const refs = [...html.matchAll(/(?:src|href)=\"([^\"]+)\"/g)].map((x) => x[1])
++              .filter((u) => !/^(?:https?:|data:|\/\/)/.test(u));
++            for (const u of refs) {
++              const rel = u.split(/[?#]/)[0].replace(/^\.?\//, '');
++              const abs = path.resolve(distRoot, rel);
++              if (abs !== distRoot && !abs.startsWith(distRoot + path.sep)) {
++                throw new Error('panel.html 引用越出 dist 根(打包后必然失效): ' + u);
++              }
++              mustFile(path.relative(process.cwd(), abs), 'panel.html 引用');
++            }
++            if (!fs.existsSync('cindyplugin/dist/skills') || !fs.readdirSync('cindyplugin/dist/skills').length) {
++              throw new Error('dist/skills 缺失或为空');
++            }
++            console.log('dist 形状 OK: entry/icon/panel/assets(' + assets.length + ')/skills 就绪, panel 相对引用 ' + refs.length + ' 条全在');
++          "
++          # 源码引用的静态资产清单(自维护):src/cindyplugin 里出现的字面路径必须在 dist 里非空存在
++          refs=$(grep -rhoE "/(stickers|demo-assets)/[A-Za-z0-9._-]+\.[A-Za-z0-9]+" src cindyplugin --include='*.ts' --include='*.tsx' | sort -u)
++          [ -n "$refs" ] || { echo "::error::未从源码提取到任何 stickers/demo-assets 引用 —— 提取正则或源码结构变了,请同步本步骤"; exit 1; }
++          n=0
++          while IFS= read -r r; do
++            f="cindyplugin/dist$r"
++            [ -s "$f" ] || { echo "::error::源码引用的资产在 dist 缺失或为空: $r"; exit 1; }
++            n=$((n+1))
++          done <<< "$refs"
++          echo "运行时引用资产 OK($n 个,全部非空)"
++
++  # ── semgrep 基线 SAST(2026-08-01 门禁收尾,非阻断)───────────────────────────
++  # 痛点:org trunk-guard 里的 CodeQL 规则因 GHAS 未启用永久空转(repo 侧无解,材料
++  # 已转 org owner),而「静态安全扫描」这个能力可以自建:semgrep OSS 免费、红绿在
++  # job 本地判定、完全不碰被 403 的 code-scanning API。实证:#334 的原型污染硬化
++  # 是人肉审查发现的;gitleaks 只扫 secret 形态,不扫代码模式(原型污染/eval/路径拼接)。
++  # 为什么非阻断(照 deps-audit 先例):规则集随 semgrep 版本演进,新规则可能把无关
++  # PR 打红;基线期先看信噪比,转 required 由 lead 依据几周数据另行决策。
++  # docker 镜像钉 **manifest digest**(2026-08-01 gpt-5.6-sol 审查 P1:tag 可被上游
++  # 重指,且容器挂载整个 $PWD —— checkout 默认把 GITHUB_TOKEN 持久化进 .git/config,
++  # 恶意镜像可读走 token;action 层的 SHA-pin 覆盖不了这条执行依赖):
++  # digest 钉死字节 + persist-credentials:false 让容器无凭据可读,双层。
++  semgrep:
++    name: semgrep baseline (non-blocking)
++    runs-on: ubuntu-latest
++    timeout-minutes: 15
++    steps:
++      - name: Checkout (no credentials — mounted into third-party container)
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
++        with:
++          persist-credentials: false
++
++      # 退出码语义(第二轮审查更正:semgrep scan **默认有 findings 也退 0**,只有加
++      # `--error` 才以 1 表示 findings —— 故显式加 --error,rc 才携带信息):
++      #   0=完成且 0 findings;1=完成且有 findings;其余=扫描器自身故障。
++      # rc 落盘参与四态判定,并与 results 做交叉一致性校验(rc 与 results 矛盾 =
++      # 报告不可信)。`set +e` + 落盘仅防 step 提前红,判定不吞信息。
++      # 扫描范围:仓库根(semgrep 默认跳过 .gitignore 内容),显式排除文档与产物
++      # —— 白名单目录制会让 shared/ 这类新增顶层生产模块静默漏扫(审查实证)。
++      - name: Semgrep scan (p/default, digest-pinned docker)
++        continue-on-error: true
++        run: |
++          mkdir -p test-artifacts
++          set +e
++          docker run --rm -v "$PWD":/src -w /src \
++            semgrep/semgrep@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b \
++            semgrep scan --config p/default --metrics=off --json --error \
++              --output test-artifacts/semgrep.json \
++              --exclude docs --exclude test-artifacts --exclude history \
++              . \
++              2> test-artifacts/semgrep.err
++          echo "$?" > test-artifacts/semgrep.rc
++          # ↑ digest = semgrep/semgrep:1.172.0 的多架构 manifest(2026-08-01 核验);
++          #   升级流程:改 digest + 本注释的版本号,走显式 diff。
++          true
++
++      # 四态判定(clean / findings / findings-partial / inconclusive),与 deps-audit
++      # 同款契约:报告不可信时明确说「本次没有结论」,绝不折叠成绿。判定要素三个:
++      # rc(0/1=扫描完成,其余=故障)、results、errors(非空=覆盖不完整)。
++      # clean 的充要条件 = rc==0 && results 空 && errors 空;errors 非空时即便
++      # results 空也只能 inconclusive —— 「没扫全的 0 findings」不是安全结论。
++      # 本步不 continue-on-error:判定器坏了必须可见。
++      - name: Classify and surface semgrep result
++        if: always()
++        run: |
++          cat > /tmp/semgrep-verdict.cjs <<'NODE'
++          const fs = require('fs');
++          const out = [];
++          let state = 'inconclusive', reason = '', results = null, errors = [];
++          try {
++            const rcRaw = fs.readFileSync('test-artifacts/semgrep.rc', 'utf8').trim();
++            if (!/^\d+$/.test(rcRaw)) throw new Error('rc 文件内容非法:' + JSON.stringify(rcRaw));
++            const rc = Number(rcRaw);
++            const r = JSON.parse(fs.readFileSync('test-artifacts/semgrep.json', 'utf8'));
++            if (!r || typeof r !== 'object' || !Array.isArray(r.results)) {
++              throw new Error('semgrep JSON 顶层缺 results 数组');
++            }
++            // errors 必须真的是数组(第二轮审查:`?: []` 会把「字段缺失/形状变了」
++            // 静默吞成 0 errors —— 那是 schema 漂移信号,必须 inconclusive)。
++            if (!Array.isArray(r.errors)) throw new Error('semgrep JSON 顶层缺 errors 数组(schema 漂移?)');
++            results = r.results;
++            errors = r.errors;
++            if (rc !== 0 && rc !== 1) {
++              throw new Error('semgrep 退出码 ' + rc + '(非 0/1)= 扫描器自身故障,报告不可信');
++            }
++            // rc 与 results 交叉一致(--error 模式契约):矛盾即报告不可信。
++            if (rc === 0 && results.length > 0) throw new Error('rc=0 但 results=' + results.length + ',与 --error 契约矛盾');
++            if (rc === 1 && results.length === 0) throw new Error('rc=1 但 results 为空,与 --error 契约矛盾');
++            if (results.length > 0) {
++              state = errors.length > 0 ? 'findings-partial' : 'findings';
++            } else if (errors.length > 0) {
++              throw new Error('results 为空但 semgrep 自报 ' + errors.length
++                + ' 条解析/规则错误 —— 覆盖不完整,「0 findings」不能当安全结论');
++            } else {
++              state = 'clean'; // 此处必然 rc===0 && 0 results && 0 errors(充要条件)
++            }
++          } catch (e) {
++            reason = (e && e.message) || String(e);
++          }
++          out.push('## semgrep 基线扫描(p/default,non-blocking)', '');
++          if (state === 'clean') {
++            out.push('✅ **0 findings**,扫描完整(rc=0,errors=0;范围=仓库根,排除 docs/test-artifacts/history 与 .gitignore 内容)。');
++          } else if (state === 'findings' || state === 'findings-partial') {
++            const bySev = { ERROR: [], WARNING: [], INFO: [] };
++            for (const f of results) {
++              const sev = (f.extra && f.extra.severity) || 'INFO';
++              (bySev[sev] || bySev.INFO).push(f);
++            }
++            out.push('⚠️ **' + results.length + ' findings**(非阻断,不挡合并):'
++              + ' ERROR=' + bySev.ERROR.length + ' WARNING=' + bySev.WARNING.length
++              + ' INFO=' + bySev.INFO.length);
++            if (state === 'findings-partial') {
++              out.push('', '🟡 **且覆盖不完整**:semgrep 自报 ' + errors.length
++                + ' 条解析/规则错误 —— 以上 findings 有效,但「只有这些」不成立,未扫到的部分无结论。');
++            }
++            const fmt = (f) => '- `' + f.check_id + '` — ' + f.path + ':' + (f.start && f.start.line || '?');
++            const top = [...bySev.ERROR, ...bySev.WARNING].slice(0, 20);
++            if (top.length) {
++              out.push('', '<details><summary>ERROR/WARNING 明细(前 ' + top.length + ' 条)</summary>', '',
++                ...top.map(fmt), '</details>');
++            }
++          } else {
++            out.push('🟡 **本次扫描没有产出结果** —— 报告不可信:' + reason);
++            out.push('', '这既不代表有问题也不代表没有(常见成因:registry 拉规则失败/docker 拉镜像失败)。');
++            const err = fs.existsSync('test-artifacts/semgrep.err')
++              ? fs.readFileSync('test-artifacts/semgrep.err', 'utf8').trimEnd().split('\n').slice(-20).join('\n') : '';
++            if (err) out.push('', '<details><summary>semgrep stderr(末 20 行)</summary>', '', '```', err, '```', '</details>');
++          }
++          out.push('', '> 口径:`semgrep scan --config p/default --metrics=off`,docker 镜像钉 manifest digest(= 1.172.0);');
++          out.push('> clean 充要条件 = rc==0 && 0 results && 0 errors,errors 非空一律降级 partial/inconclusive。');
++          out.push('> 非阻断基线期:是否转 required 依据几周信噪比另行决策(同 deps-audit/bench 先例)。');
++          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out.join('\n') + '\n');
++          if (state === 'findings' || state === 'findings-partial') {
++            console.log('::warning::semgrep 发现 ' + results.length + ' 条 findings'
++              + (state === 'findings-partial' ? '(且覆盖不完整:' + errors.length + ' 条扫描错误)' : '')
++              + '(非阻断,仅报告),见 job summary。');
++          } else if (state === 'inconclusive') {
++            console.log('::warning::semgrep 未产出可信结果(' + reason + ')—— 这不是安全结论,需要结论请重跑本 job。');
++          }
++          NODE
++          node /tmp/semgrep-verdict.cjs
++
++      - name: Upload semgrep raw report
++        if: always()
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
++        with:
++          name: semgrep-report
++          path: test-artifacts/semgrep.json
++          if-no-files-found: ignore
++          retention-days: 14
++
++  # ── coverage 报告(2026-08-01 门禁收尾,非阻断)───────────────────────────────
++  # 痛点:vitest 此前无任何 coverage 配置 —— 5000+ 单测听着厚,但 server/persist
++  # (6.3kL,持久化+权限)这类高危模块哪块裸奔没人知道。先只报告不阻断:阈值
++  # 门禁要等有了几周基线、知道"正常水位"是多少才有意义,凭空拍阈值只会天天红。
++  # 单列 job 不进 build-and-test:v8 插桩让全量单测明显变慢,不该拖 required 主链路。
++  coverage:
++    name: coverage report (non-blocking)
++    runs-on: ubuntu-latest
++    timeout-minutes: 20
++    steps:
++      - name: Checkout
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
++        with:
++          # 与 build-and-test 同理由:单测里有相对 merge-base 的门禁,浅克隆必红。
++          fetch-depth: 0
++
++      - name: Setup Node (LTS)
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
++        with:
++          node-version: lts/*
++          cache: npm
++
++      - name: Install dependencies
++        run: npm ci
++
++      # continue-on-error:测试失败的红灯归 build-and-test(required)管,本 job 只管
++      # 出覆盖率数字 —— 同一套测试在两个 job 各红一次只会制造重复噪音。
++      # (vitest 4 的 coverage.reportOnFailure 默认 false + coverage.clean 默认 true:
++      #  测试失败时不会产出可被误读的残缺 summary,下游步会走「无结论」分支。)
++      #
++      # coverage.include 显式声明交付源码范围(2026-08-01 gpt-5.6-sol 审查 P2:
++      # 不配 include 时 v8 只统计「本次测试实际加载到」的文件,完全没被任何测试
++      # import 的文件不会以 0% 出现 —— 恰好漏掉本 job 要定位的裸奔模块,总覆盖率
++      # 也被抬高)。exclude 掉测试文件与类型声明,分母只留生产代码。
++      - name: Run unit tests with coverage (v8)
++        continue-on-error: true
++        run: >
++          npx vitest run
++          --coverage.enabled
++          --coverage.provider=v8
++          --coverage.reporter=json-summary
++          --coverage.reporter=text-summary
++          --coverage.include='src/**/*.{ts,tsx}'
++          --coverage.include='server/**/*.ts'
++          --coverage.include='shared/**/*.ts'
++          --coverage.include='cindyplugin/**/*.{ts,tsx}'
++          --coverage.exclude='**/*.test.*'
++          --coverage.exclude='**/*.spec.*'
++          --coverage.exclude='**/__tests__/**'
++          --coverage.exclude='**/*.d.ts'
++          --coverage.exclude='**/dist/**'
++
++      - name: Surface coverage summary
++        if: always()
++        run: |
++          cat > /tmp/coverage-summary.cjs <<'NODE'
++          const fs = require('fs');
++          const out = ['## coverage 报告(vitest v8,non-blocking)', ''];
++          try {
++            const s = JSON.parse(fs.readFileSync('coverage/coverage-summary.json', 'utf8'));
++            const t = s.total;
++            out.push('| 维度 | 覆盖率 | covered/total |');
++            out.push('|------|--------|---------------|');
++            for (const k of ['lines', 'statements', 'branches', 'functions']) {
++              out.push('| ' + k + ' | **' + t[k].pct + '%** | ' + t[k].covered + '/' + t[k].total + ' |');
++            }
++            // 按顶层目录聚合(lines):看清 src/ vs server/ 的水位差,定位裸奔模块。
++            const byDir = new Map();
++            for (const [file, v] of Object.entries(s)) {
++              if (file === 'total' || !v || !v.lines) continue;
++              const rel = file.replace(process.cwd() + '/', '');
++              const seg = rel.split('/');
++              const dir = seg.length > 1 ? seg[0] + (seg[1] && !seg[1].includes('.') ? '/' + seg[1] : '') : rel;
++              const cur = byDir.get(dir) || { covered: 0, total: 0 };
++              cur.covered += v.lines.covered; cur.total += v.lines.total;
++              byDir.set(dir, cur);
++            }
++            const rows = [...byDir.entries()]
++              .filter(([, v]) => v.total > 0)
++              .sort((a, b) => a[1].covered / a[1].total - b[1].covered / b[1].total)
++              .slice(0, 15);
++            if (rows.length) {
++              out.push('', '<details><summary>模块水位(lines,最低 ' + rows.length + ' 个目录)</summary>', '');
++              out.push('| 目录 | lines% | covered/total |', '|------|--------|---------------|');
++              for (const [d, v] of rows) {
++                out.push('| ' + d + ' | ' + ((v.covered / v.total) * 100).toFixed(1) + '% | ' + v.covered + '/' + v.total + ' |');
++              }
++              out.push('', '</details>');
++            }
++            out.push('', '> 非阻断报告期:不设阈值。有了几周水位基线后,是否对高危模块'
++              + '(server/persist 等)设下限门禁另行决策。');
++          } catch (e) {
++            out.push('_(coverage-summary.json 缺失或损坏:' + ((e && e.message) || String(e))
++              + ' —— 测试可能在 setup 阶段异常,见上方 step 日志。本次无覆盖率结论。)_');
++          }
++          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out.join('\n') + '\n');
++          NODE
++          node /tmp/coverage-summary.cjs
+diff --git a/.github/workflows/daily-changelog.yml b/.github/workflows/daily-changelog.yml
+index 8efee061..952dbd56 100644
+--- a/.github/workflows/daily-changelog.yml
++++ b/.github/workflows/daily-changelog.yml
+@@ -25,13 +25,13 @@ jobs:
+       CHANGELOG_REWRITE_JSON: /tmp/mivo-changelog-rewrite.json
+     steps:
+       - name: Checkout full history
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+         with:
+           fetch-depth: 0
+           persist-credentials: false
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+ 
+diff --git a/.github/workflows/deploy-green-ref.yml b/.github/workflows/deploy-green-ref.yml
+index 2963f864..539e6241 100644
+--- a/.github/workflows/deploy-green-ref.yml
++++ b/.github/workflows/deploy-green-ref.yml
+@@ -12,17 +12,17 @@
+ # 语义:生产永远 = 最新**绿灯** main。main 红着时 ref 不动,部署窗口拿到的是上一个
+ # 绿灯版本(继续可部署,不是拒绝部署 —— 带病版本永远到不了 ref 上)。
+ #
+-# 绿灯定义(main push 上实际会跑且阻断性的三项;e2e 系列 job 都是 pull_request-only,
+-# main push 上不存在,不能列 —— 列了 ref 永远不动):
+-#   lint + tsc + unit + logging / structure guard (anti-regression) / secret scan (gitleaks)
+-# bench 与 deps audit 是设计上的非阻断(non-blocking),不纳入。
++# 绿灯定义 = main push 上实际会跑且阻断性的 job,权威名单是下方代码里的
++# REQUIRED_ON_MAIN(静态注释不落数量,防名单增删时文案漂移 —— 第二轮审查教训)。
++# e2e 系列 job 都是 pull_request-only,main push 上不存在,不能列(列了 ref 永远不动);
++# bench / deps audit / semgrep baseline / coverage report 是设计上的非阻断,不纳入。
+ # ⚠️ ci.yml / secret-scan.yml 若增删改名 main-push 阻断 job,必须回来同步 REQUIRED_ON_MAIN,
+ # repo-health-watchdog 会核对本文件与实际 workflow 的存在性,但核不了这个名单的语义。
+ #
+ # 防倒退:candidate 必须是当前 ref 的后代(compareCommits status=ahead)才推进,
+ # 且 updateRef 用 force:false(服务端二道闸,只许 fast-forward)。
+ # 乱序事件(CI 与 secret-scan 完成顺序不定、旧 run 迟到)因此天然安全:
+-# 每次事件都独立验「该 SHA 三项全绿 + 是前进」,不满足就不动,幂等。
++# 每次事件都独立验「该 SHA 名单全绿 + 是前进」,不满足就不动,幂等。
+ #
+ # ref 的初始创建:2026-07-31 手工建于 fc9993dd(当时的绿灯 main)。若被误删,
+ # 本 workflow 会在下一次 main 全绿时自动重建(下方 404 分支)。
+@@ -50,6 +50,7 @@ jobs:
+   advance:
+     name: advance deploy/green on green main
+     runs-on: ubuntu-latest
++    timeout-minutes: 5
+     steps:
+       - name: Verify checks and fast-forward deploy/green
+         # SHA pin:本 job 持 contents:write(能移动部署 ref)。3a2844b = v9.0.0,
+@@ -62,12 +63,20 @@ jobs:
+ 
+             // workflow_dispatch 用于手工补推(如 ref 被误删后不想等下一次合并):
+             // 对 main 当前 HEAD 走同一套全绿验证,不特殊放行。
++            //
++            // 不看触发 run 的整体 conclusion(2026-08-01 gpt-5.6-sol 审查 P1):CI 里
++            // 存在设计上非阻断的 job(bench/deps-audit/semgrep/coverage),它们翻红会把
++            // CI workflow 整体打成 failure —— 若在此提前 return,而 secret-scan 事件又
++            // 总是先到(实测早 2-3 分钟,当时 CI 未完不推进),就没有第三个事件来补推,
++            // deploy/green 会卡死到下一次 main push:「非阻断」实际变成了阻断部署。
++            // 正确语义:任何 completed 事件都按 REQUIRED_ON_MAIN 名单裁决该 SHA,
++            // 名单自会拒掉真正的 required 红灯,不需要整体 conclusion 这道错误的粗筛。
+             let sha;
+             const run = context.payload.workflow_run;
+             if (run) {
+               if (run.conclusion !== 'success') {
+-                core.info('触发 run(' + run.name + ')结论 ' + run.conclusion + ',不评估。');
+-                return;
++                core.info('触发 run(' + run.name + ')整体结论 ' + run.conclusion
++                  + '(可能只是非阻断 job 红)—— 仍按 REQUIRED_ON_MAIN 名单评估该 SHA。');
+               }
+               sha = run.head_sha;
+             } else {
+@@ -80,6 +89,7 @@ jobs:
+               'lint + tsc + unit + logging',
+               'structure guard (anti-regression)',
+               'secret scan (gitleaks)',
++              'cindyplugin build',
+             ];
+             const runs = await github.paginate(github.rest.checks.listForRef, {
+               owner, repo, ref: sha, per_page: 100,
+@@ -135,5 +145,5 @@ jobs:
+             core.info('deploy/green → ' + sha.slice(0, 8));
+             await core.summary
+               .addHeading('🟢 deploy/green 已推进', 2)
+-              .addRaw('`' + sha.slice(0, 8) + '` — 三项 main 阻断 checks 全绿。下一个部署窗口(9:00/17:00)将部署此版本。')
++              .addRaw('`' + sha.slice(0, 8) + '` — ' + REQUIRED_ON_MAIN.length + ' 项 main 阻断 checks 全绿。下一个部署窗口(9:00/17:00)将部署此版本。')
+               .write();
+diff --git a/.github/workflows/main-health.yml b/.github/workflows/main-health.yml
+index d01b25bd..b7d6d7fd 100644
+--- a/.github/workflows/main-health.yml
++++ b/.github/workflows/main-health.yml
+@@ -62,15 +62,15 @@ jobs:
+   report:
+     name: main health (red -> issue)
+     runs-on: ubuntu-latest
++    timeout-minutes: 5
+     steps:
+       - name: Open/update or close the health issue
+-        # SHA pin(Greptile #348 P2 security)。本 job 持 issues:write —— 浮动 tag 被重指
+-        # 或上游发布链路被攻陷时,main 上任一受监控 workflow 完成都会执行替换后的代码,
+-        # 而它有权创建/篡改/关闭任意 Issue,**包括把 main 红灯 Issue 直接关掉** ——
+-        # 正好抹掉本 workflow 存在的意义。全仓 SHA pin 是独立议题(本 PR 已为此加了
+-        # dependabot 的 github-actions 生态),这里先钉住权限最高的这一个:
+-        # 引入一条更严的基线不算引入第二种 pattern。
+-        # f28e40c = v7.1.0;dependabot 会带版本注释自动升 SHA。
++        # SHA pin(Greptile #348 P2 security)。本 job 持 issues:write —— 上游发布链路
++        # 被攻陷时,main 上任一受监控 workflow 完成都会执行替换后的代码,而它有权
++        # 创建/篡改/关闭任意 Issue,**包括把 main 红灯 Issue 直接关掉** —— 正好抹掉
++        # 本 workflow 存在的意义。2026-08-01 起全仓 action 均已 SHA-pin;dependabot
++        # (github-actions 生态)按行尾版本注释自动提 SHA bump PR。
++        # 3a2844b = v9.0.0(dependabot #356 升级)。
+         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+         with:
+           script: |
+@@ -213,15 +213,18 @@ jobs:
+                 '',
+                 '### 为什么这条要当回事',
+                 '',
+-                'maker 每日 **9:00 / 17:00** 自动拉 main 部署'
+-                  + '(`git pull origin main && npm ci && npm run build && pm2 restart`)。',
+-                'main 红着的时候部署照跑 —— 若这不是 flake 而是真回归,下一个部署窗口会把它送上生产。',
++                'maker 每日 **9:00 / 17:00** 自动部署 `deploy/green` ref 所指的最新绿灯 main'
++                  + '(2026-07-31 起带 CI 绿灯门,带病版本到不了生产)。',
++                'main 红着时部署会停留在上一个绿灯版本 —— 红灯不修,**后续所有合并都无法上生产**,',
++                '生产与 main 的差距会越拖越大。',
+                 '',
+                 '### 处理方式',
+                 '',
+                 '1. 打开上面的 run 看失败 job 与日志;',
+                 '2. 判断是 flake 还是真回归(本仓已知 flake:PG 连接池 `connection pool exhausted / statement_timeout`);',
+-                '3. 真回归 → 立刻修或回滚;flake → 记一笔并重跑;',
++                '3. 真回归 → 立刻修或回滚;flake → **给本 Issue 加 label `flake`** 再重跑'
++                  + '(label 即台账:按 `label:ci-red label:flake` 检索历史 flake,同一签名反复出现'
++                  + ' → 该测试该修稳定性了,而不是继续重跑);',
+                 '4. main 上同一 workflow 下一次 **success** 时,本 Issue 会自动关闭,不需要手动关。',
+                 '',
+                 '> 本 Issue 由 `.github/workflows/main-health.yml` 自动维护。',
+@@ -240,11 +243,23 @@ jobs:
+                 });
+                 core.info('已更新既有红灯 Issue #' + existing.number + ' 并追加一条失败记录。');
+               } else {
+-                const created = await github.rest.issues.create({
+-                  owner, repo,
+-                  title: '⛔ main 红灯:' + wfName,
+-                  body,
+-                });
++                // ci-red label = flake 台账的另一半:红灯 Issue 全部带它,配合人工补打的
++                // `flake` label 即可按 `label:ci-red label:flake` 检索 flake 史(SC-6 最小台账)。
++                // label 缺失(被删/改名,REST 422/404)时**降级为无 label 重建**而不是让本步
++                // 冒泡翻红 —— 本 job 的第一职责是把红灯变可见,台账是第二职责,不许第二
++                // 职责的故障弄瞎第一职责(watchdog 每日核对两枚 label 存在性,漂移会被看见)。
++                let created;
++                try {
++                  created = await github.rest.issues.create({
++                    owner, repo, title: '⛔ main 红灯:' + wfName, body, labels: ['ci-red'],
++                  });
++                } catch (e) {
++                  if (e.status !== 422 && e.status !== 404) throw e;
++                  core.warning('带 ci-red label 建 Issue 失败(' + e.status + ',label 被删/改名?)—— 降级为无 label 重试;台账检索将失真,见 watchdog 告警。');
++                  created = await github.rest.issues.create({
++                    owner, repo, title: '⛔ main 红灯:' + wfName, body,
++                  });
++                }
+                 core.info('已新建红灯 Issue #' + created.data.number + '。');
+               }
+               // 本 job 自身保持绿:它的职责是"把红灯变可见",不是"再红一次"。
+diff --git a/.github/workflows/nightly-e2e.yml b/.github/workflows/nightly-e2e.yml
+index fec8060f..45956ca0 100644
+--- a/.github/workflows/nightly-e2e.yml
++++ b/.github/workflows/nightly-e2e.yml
+@@ -26,10 +26,10 @@ jobs:
+     timeout-minutes: 20
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+           cache: npm
+@@ -38,7 +38,7 @@ jobs:
+         run: npm ci
+ 
+       - name: Cache Playwright Chromium
+-        uses: actions/cache@v4
++        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+         with:
+           path: ~/.cache/ms-playwright
+           key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
+@@ -57,7 +57,7 @@ jobs:
+ 
+       - name: Upload failing nightly artifacts
+         if: failure()
+-        uses: actions/upload-artifact@v7
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+           name: nightly-e2e-prod-full-artifacts
+           path: test-artifacts
+@@ -67,6 +67,7 @@ jobs:
+   real-upstream-gate:
+     name: real upstream gate
+     runs-on: ubuntu-latest
++    timeout-minutes: 5
+     outputs:
+       has_secrets: ${{ steps.gate.outputs.has_secrets }}
+     steps:
+@@ -95,10 +96,10 @@ jobs:
+       MIVO_LLM_API_KEY: ${{ secrets.MIVO_LLM_API_KEY }}
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+ 
+       - name: Setup Node (LTS)
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: lts/*
+           cache: npm
+@@ -107,7 +108,7 @@ jobs:
+         run: npm ci
+ 
+       - name: Cache Playwright Chromium
+-        uses: actions/cache@v4
++        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+         with:
+           path: ~/.cache/ms-playwright
+           key: ${{ runner.os }}-playwright-chromium-${{ hashFiles('package-lock.json') }}
+@@ -128,7 +129,7 @@ jobs:
+ 
+       - name: Upload failing real-upstream artifacts
+         if: failure()
+-        uses: actions/upload-artifact@v7
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+           name: nightly-e2e-real-upstream-artifacts
+           path: test-artifacts
+diff --git a/.github/workflows/pr-hygiene.yml b/.github/workflows/pr-hygiene.yml
+index d6d27d04..a8fb221c 100644
+--- a/.github/workflows/pr-hygiene.yml
++++ b/.github/workflows/pr-hygiene.yml
+@@ -71,9 +71,10 @@ jobs:
+     name: conflict sentinel (CI silent-skip guard)
+     if: github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch'
+     runs-on: ubuntu-latest
++    timeout-minutes: 15
+     steps:
+       - name: Detect zero-coverage (conflict or unenqueued CI) and fail visibly
+-        uses: actions/github-script@v9
++        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+         with:
+           script: |
+             const MARKER = '<!-- pr-hygiene:conflict -->';
+@@ -348,9 +349,10 @@ jobs:
+     name: stale branch reminder (daily 09:30 UTC+8)
+     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+     runs-on: ubuntu-latest
++    timeout-minutes: 10
+     steps:
+       - name: Remind stale branches
+-        uses: actions/github-script@v9
++        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+         with:
+           script: |
+             const MARKER = '<!-- pr-hygiene:stale -->';
+diff --git a/.github/workflows/repo-health-watchdog.yml b/.github/workflows/repo-health-watchdog.yml
+index 9b71be19..0685347f 100644
+--- a/.github/workflows/repo-health-watchdog.yml
++++ b/.github/workflows/repo-health-watchdog.yml
+@@ -9,14 +9,16 @@
+ #   - deploy-green-ref 推进器自己坏死 → deploy/green 停在旧位,部署静默冻结在老版本。
+ # 监控器需要一个不依赖「被监控者发出事件」的外部心跳 —— 就是本 workflow(schedule)。
+ #
+-# 只做三类可用 GITHUB_TOKEN 完成的核对(经典分支保护 GET 需要 administration 权限,
++# 只做以下几类可用 GITHUB_TOKEN 完成的核对(经典分支保护 GET 需要 administration 权限,
+ # GITHUB_TOKEN 拿不到,故经典侧漂移核不了 —— 已通过 2026-07-31 手工对齐 + 「改 ruleset
+ # 必须同步改经典保护」的注释约定兜住;ruleset 侧本 workflow 核):
+ #   1. 预期 workflow 清单:存在 + state=active + 名字与 allowlist 完全一致;
+ #   2. main-health.yml 触发名单里的每个名字都真实存在于当前 workflows(防改名失联);
+-#   3. deploy/green 心跳:main HEAD 三项阻断 checks 已全绿超过宽限期,ref 却还落后
++#   3. deploy/green 心跳:main HEAD 全部阻断 checks(REQUIRED_ON_MAIN 名单)已全绿超过宽限期,ref 却还落后
+ #      → 推进器疑似死亡;
+-#   4. (尽力而为)ruleset 19734383 的 required checks 与预期 10 项一致,读不到则跳过。
++#   4. (尽力而为)ruleset 19734383 的 required checks 与预期名单(EXPECTED_RULESET_CHECKS,
++#      2026-08-01 起 11 项)一致,读不到则跳过;
++#   5. flake 台账 label(ci-red / flake)存在性。
+ # 发现问题 → 开/更新一个 marker Issue;本轮干净且有开着的 Issue → 自动关闭。
+ # Issue 归属校验与 main-health 同款:只认 github-actions[bot] 创建的。
+ 
+@@ -38,6 +40,7 @@ jobs:
+   watchdog:
+     name: watchdog (config drift & silent death)
+     runs-on: ubuntu-latest
++    timeout-minutes: 5
+     steps:
+       - name: Verify workflows, main-health allowlist, green-ref heartbeat
+         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+@@ -97,10 +100,12 @@ jobs:
+ 
+             // ── 3. deploy/green 心跳:main 全绿超宽限期而 ref 未跟上 ────────────
+             const GRACE_MS = 2 * 60 * 60 * 1000;   // 2h:远大于 CI 全程 + 事件投递抖动
++            // 与 deploy-green-ref.yml 的 REQUIRED_ON_MAIN 同源同步(改一处必改另一处)。
+             const REQUIRED_ON_MAIN = [
+               'lint + tsc + unit + logging',
+               'structure guard (anti-regression)',
+               'secret scan (gitleaks)',
++              'cindyplugin build',
+             ];
+             try {
+               const mainHead = (await github.rest.repos.getBranch({ owner, repo, branch: 'main' })).data.commit;
+@@ -124,7 +129,7 @@ jobs:
+                   }
+                   const allGreen = REQUIRED_ON_MAIN.every(n => best.get(n)?.conclusion === 'success');
+                   if (allGreen) {
+-                    findings.push('main HEAD ' + mainHead.sha.slice(0, 8) + ' 三项阻断 checks 已全绿超过 '
++                    findings.push('main HEAD ' + mainHead.sha.slice(0, 8) + ' ' + REQUIRED_ON_MAIN.length + ' 项阻断 checks 已全绿超过 '
+                       + Math.round(age / 3600000) + 'h,deploy/green 仍停在 ' + green.slice(0, 8)
+                       + ' —— 推进器「deploy green ref」疑似坏死,部署被静默冻结在旧版本。'
+                       + '看它的 run 日志;临时补推:手动 dispatch 该 workflow。');
+@@ -143,6 +148,7 @@ jobs:
+               'e2e kernel gate (new)', 'e2e token gate (authorized)',
+               'e2e token gate (unauthorized)', 'visual diff (dom vs leafer)',
+               'pg suite (PG16)', 'e2e persist server (PG smoke)',
++              'cindyplugin build', // 2026-08-01 增:插件构建门禁(merge 后 lead 已同步 ruleset+经典保护)
+             ].sort();
+             try {
+               const rs = await github.request('GET /repos/{owner}/{repo}/rulesets/{id}', {
+@@ -160,6 +166,30 @@ jobs:
+               core.info('ruleset 读取失败(' + (e.status || e.message) + '),该项核对跳过(GITHUB_TOKEN 权限所限,非告警)。');
+             }
+ 
++            // ── 5. flake 台账 label 存在性(2026-08-01 增)─────────────────────────
++            // main-health 建红灯 Issue 时带 ci-red label(缺 label 时它自己会降级重试,
++            // 告警不丢,但台账 `label:ci-red label:flake` 检索会失真)。预建 label 不是
++            // 自愈机制 —— 被删要在这里被看见。
++            // 两枚 label 的失效后果不同,诊断分开写(第二轮审查 P3):
++            // ci-red 缺失 → main-health 建 Issue 降级为无 label(它有 fail-open 重试);
++            // flake 缺失 → 人工 flake 标记打不上,联合检索(label:ci-red label:flake)失效。
++            const LABEL_IMPACT = {
++              'ci-red': 'main-health 建红灯 Issue 将降级为无 label(告警不丢,台账检索失真)',
++              'flake': '人工 flake 标记无法打上,flake 台账联合检索(label:ci-red label:flake)失效',
++            };
++            for (const name of ['ci-red', 'flake']) {
++              try {
++                await github.rest.issues.getLabel({ owner, repo, name });
++              } catch (e) {
++                if (e.status === 404) {
++                  findings.push('label「' + name + '」不存在 —— ' + LABEL_IMPACT[name]
++                    + '。重建:仓库 Labels 页或 gh api -X POST /labels。');
++                } else {
++                  findings.push('label「' + name + '」核对失败(' + e.message + '),未完成。');
++                }
++              }
++            }
++
+             // ── 汇总:开/更新/关闭 marker Issue ──────────────────────────────
+             const issues = await github.paginate(github.rest.issues.listForRepo, {
+               owner, repo, state: 'open', per_page: 100,
+diff --git a/.github/workflows/secret-scan.yml b/.github/workflows/secret-scan.yml
+index 53a357a7..04d0d743 100644
+--- a/.github/workflows/secret-scan.yml
++++ b/.github/workflows/secret-scan.yml
+@@ -25,10 +25,11 @@ jobs:
+   gitleaks:
+     name: secret scan (gitleaks)
+     runs-on: ubuntu-latest
++    timeout-minutes: 10
+     steps:
+       # fetch-depth: 0 取全历史 —— gitleaks 扫提交历史,且 PR commit range 需 base SHA 可达
+       - name: Checkout (full history for gitleaks)
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+         with:
+           fetch-depth: 0
+ 
+diff --git a/AGENTS.md b/AGENTS.md
+index 22e1fddc..7c49437c 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -54,7 +54,7 @@ MIVO_DEPLOY_HOST=10.102.80.15 MIVO_DEPLOY_USER=yanjian scripts/merge-and-deploy.
+ - **部署脚本**:`/AIGC_Group/mivo-canvas/deploy.sh`(只在服务器上,不提交进本仓库)。
+   2026-07-31 起带 **CI 绿灯门**:部署对象不再是 main tip,而是 `deploy/green` ref 所指的
+   **最新绿灯 main commit**(该 ref 由 `.github/workflows/deploy-green-ref.yml` 在 main 的
+-  三项阻断 checks 全绿后自动推进;main 红着时 ref 不动,部署窗口拿到的是上一个绿灯版本,
++  全部阻断 checks(权威名单 = 该 workflow 的 REQUIRED_ON_MAIN,此处不落数量防漂移)全绿后自动推进;main 红着时 ref 不动,部署窗口拿到的是上一个绿灯版本,
+   带病版本到不了生产)。禁止手动 `git pull origin main` 直接部署 —— 那会绕过绿灯门。脚本五步:
+   1. `git checkout main && git fetch origin`
+   2. 绿灯门:`git reset --hard origin/deploy/green`(ref 缺失则 fail-closed 拒绝部署)
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 1efdcad6..b1a06416 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -104,7 +104,7 @@ Project MivoCanvas/
+ - **部署脚本**:`/AIGC_Group/mivo-canvas/deploy.sh`(只在服务器上,不提交进本仓库)。
+   2026-07-31 起带 **CI 绿灯门**:部署对象不再是 main tip,而是 `deploy/green` ref 所指的
+   **最新绿灯 main commit**(该 ref 由 `.github/workflows/deploy-green-ref.yml` 在 main 的
+-  三项阻断 checks 全绿后自动推进;main 红着时 ref 不动,部署窗口拿到的是上一个绿灯版本,
++  全部阻断 checks(权威名单 = 该 workflow 的 REQUIRED_ON_MAIN,此处不落数量防漂移)全绿后自动推进;main 红着时 ref 不动,部署窗口拿到的是上一个绿灯版本,
+   带病版本到不了生产)。脚本五步:
+   1. `git checkout main && git fetch origin`
+   2. 绿灯门:`git reset --hard origin/deploy/green`(ref 缺失则 fail-closed 拒绝部署)
+diff --git a/ops/postgres/docker-compose.yml b/ops/postgres/docker-compose.yml
+index 6b0cdae6..f869044f 100644
+--- a/ops/postgres/docker-compose.yml
++++ b/ops/postgres/docker-compose.yml
+@@ -65,9 +65,11 @@ services:
+ 
+ # ── 网络(固定 ipam,防自动选段抢占企业内网;见文件头注释 + runbook §0.2/§9)──
+ # 选段依据(192.168.228.0/24):
+-#   * 避开 172.16.0.0/12(172.16-31.x):公司在用 172.26.x(边缘网关 172.26.164.81),
++#   * 避开 172.16.0.0/12(172.16-31.x):公司办公网在用 172.26.x(边缘网关也在该段,
++#     具体地址见 runbook,不写进仓库代码),
+ #     docker 默认用户桥池也从该 /12 分配(postgres_default 正是抢到 172.26.0.0/16);
+-#   * 避开 10.0.0.0/8:服务器网段 10.102.x(见 runbook §0.1 共享机 10.102.80.15);
++#   * 避开 10.0.0.0/8:共享服务器内网在该段(具体网段/主机见 runbook §0.1,内网
++#     地址不写进仓库代码 —— check-internal-literals 守卫硬禁);
+ #   * 避开 172.17.0.0/16:docker0 默认桥;
+ #   * 选 192.168.228.0/24:/24(254 可用地址)足够单容器;228 段冷门,远离常见
+ #     192.168.0/1 办公/家庭段,进一步降冲突概率。
+diff --git a/package-lock.json b/package-lock.json
+index a5af33fb..2855ff83 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -34,6 +34,7 @@
+         "@types/react": "^19.2.14",
+         "@types/react-dom": "^19.2.3",
+         "@vitejs/plugin-react": "^6.0.4",
++        "@vitest/coverage-v8": "^4.1.10",
+         "eslint": "^10.8.0",
+         "eslint-plugin-react-hooks": "^7.1.1",
+         "eslint-plugin-react-refresh": "^0.5.2",
+@@ -82,6 +83,7 @@
+       "integrity": "sha512-RgHBCvtjbOK2gXSNBNIkNoEc9qoVEtau3hj8gEqKQuL3HZAibKarWFEI3Lfm6EYKkLalOh8eSrj9b+ch9H/VBA==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "@babel/code-frame": "^7.29.7",
+         "@babel/generator": "^7.29.7",
+@@ -300,6 +302,16 @@
+         "node": ">=6.9.0"
+       }
+     },
++    "node_modules/@bcoe/v8-coverage": {
++      "version": "1.0.2",
++      "resolved": "https://registry.npmjs.org/@bcoe/v8-coverage/-/v8-coverage-1.0.2.tgz",
++      "integrity": "sha512-6zABk/ECA/QYSCQ1NGiVwwbQerUCZ+TQbp64Q3AgmfNvurHH0j8TtXa1qbShXA6qqkpAj4V5W8pP6mLe1mcMqA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
+     "node_modules/@emnapi/core": {
+       "version": "1.11.1",
+       "resolved": "https://registry.npmjs.org/@emnapi/core/-/core-1.11.1.tgz",
+@@ -1583,7 +1595,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/app/-/app-2.2.7.tgz",
+       "integrity": "sha512-ZTQlwOdZgmyuZnKcljfdtVKkggHE6BYwhUn3RzRks3Qfnwe9MiMoAqaqSWrtbPKdzfKoXvqznEuW7Pm58q9Jgw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer-ui/data": "2.2.7",
+         "@leafer-ui/display": "2.2.7",
+@@ -1595,7 +1606,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/canvas/-/canvas-2.2.7.tgz",
+       "integrity": "sha512-H0vmt+YoQ1/+UDiobHE0eqdmQ0EY+4nkwGRXPly/D0TWdj0lMhrPtQhP2iAtmMYQxpV9nDaCF5DbLLR9DSjLyw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -1611,7 +1621,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/core/-/core-2.2.7.tgz",
+       "integrity": "sha512-AexqNYarSNuJOoiuxhrFTU1Y5HNLlL9hURKVM1p/XkxZy/69WY0eW0Lk6lGoAhQ+Qj3youMny5YU6NT2suZ9fw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/canvas": "2.2.7",
+         "@leafer/data": "2.2.7",
+@@ -1635,15 +1644,13 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/data/-/data-2.2.7.tgz",
+       "integrity": "sha512-To2E54rIGQRtkoHDJRiw7nLsZJW5Co+zKAYu1LCOr2Sq1SaWkY6SxcR3ShHDvWgChBYtpY/6mFmdz7hQkr8NLA==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/app/node_modules/@leafer/debug": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/debug/-/debug-2.2.7.tgz",
+       "integrity": "sha512-JvYazHVjyvDkn/5z77OmKhVe4Uhc1+vwTJL7hLIczYYY31rPJFqd7qm4eToHMGsr/VQHdUDGReAYNBgUsTpTDg==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -1654,7 +1661,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/decorator/-/decorator-2.2.7.tgz",
+       "integrity": "sha512-BecQ0AZHhqnbvS8bjrzPyWNIuwHWKLAOOfLgrSYgzp2qHCpadopQgyZ1+bvm6V84PTlX5Q3ui20S3+gXOI2JxA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -1666,7 +1672,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display/-/display-2.2.7.tgz",
+       "integrity": "sha512-Q0venUeZRWTVpEOJkSttSxnV8lbgYRAwqXCLIzzIneHhgVNKWWRIWqhizldRhMlNYwCqRUqlxfGQUbWUt2dF/Q==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -1685,7 +1690,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display-module/-/display-module-2.2.7.tgz",
+       "integrity": "sha512-yGgmXd6a1tL2pUqx7wZ0GRm+EwHihroDr7lXwuTx+tKWl0oO+NOln/37/dlc6pU4kO3inYktKBp5nx6qlQyWIw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -1699,7 +1703,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/event/-/event-2.2.7.tgz",
+       "integrity": "sha512-WirCEvs67dh8w4Gd9iFlqbwMavFQ+Lja/EBXnW5EaQ/bu6Opg3+6BUDDWd4vordDdvg9tkI3TINwl6UXy/v+0w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/decorator": "2.2.7",
+@@ -1712,7 +1715,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/file/-/file-2.2.7.tgz",
+       "integrity": "sha512-2c30wQSRRoNxaQJHHbXSYETL0Nr9kx1sJoDGvEY75u+wk4nRZJK0ifIEkl7gdKCPi/YaVc5Yl6szELlySA7yFA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -1725,7 +1727,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/helper/-/helper-2.2.7.tgz",
+       "integrity": "sha512-yVcknYfmo5o006+j5UuU4/P+t9ZOWVo/ZAK9lbCGHglywqxadRAHQ097hZRXkran2hZb2LnfMsJMXaGjPeAtZw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7",
+@@ -1737,7 +1738,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/image/-/image-2.2.7.tgz",
+       "integrity": "sha512-/aeqkZOoHVA+wBLAX7EQRZQiGul7NBUkegUa9GXNF/VRkC5d4QSmWKM3ry2O+pMP63Rvl8DA1oC8jhFBOgkFmA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/file": "2.2.7",
+@@ -1751,7 +1751,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/layout/-/layout-2.2.7.tgz",
+       "integrity": "sha512-qO6yY8KcCOKj4bzCUP+ZCssTiP+1pVhzzTnYiEpz5Bmqhs5OMT5PR5+tGMFuSxnczK6DF+TR9mfU8mDFFltTIA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/helper": "2.2.7",
+@@ -1763,22 +1762,19 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/list/-/list-2.2.7.tgz",
+       "integrity": "sha512-ihVc3B7qIHoiVkqq/i8zlwBl4o3dTwR3DRUVxC7DdjU5avuD+9Pbjem5dCVS2uovP7dapDV89aZOjQ/3tMOSmg==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/app/node_modules/@leafer/math": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/math/-/math-2.2.7.tgz",
+       "integrity": "sha512-aHWyjC+Jts+EmOywIuPd4NExzLx3JQjjPMZG6iP+PDseJL20o371mtNYhJoMASdS0Q2uc+cYMjF+vZylfMSjqw==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/app/node_modules/@leafer/path": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/path/-/path-2.2.7.tgz",
+       "integrity": "sha512-rOSvkUAQVRF00lJewzSt8JIpMbuWwsD1b3BXUNgzWGzzqLDAoQfzd+YZ70zvrczLukds90wvHv22vlFuSX76fQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -1790,7 +1786,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/platform/-/platform-2.2.7.tgz",
+       "integrity": "sha512-z2mw/6xAoN4i4FdWf7ksY14O/OIHNJJgSUDlKwCuwpF55wI+5YXM++66NCNZxBB/dgrjFsfM+JxRCdKiDxR9bw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7"
+@@ -1801,7 +1796,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/task/-/task-2.2.7.tgz",
+       "integrity": "sha512-fK2NfBIWre6TF6ZgSN6vBwf4stAliKNcGuKwe9dERF8Olig9AaawiOa/adBg4kUHSuPgTnQbi/K32XrFIcROMw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/debug": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -1812,7 +1806,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/bounds/-/bounds-2.2.7.tgz",
+       "integrity": "sha512-1VKCKJ2GQXdNaU4baPOp9pGKB3L3rC+lCj82+Tg3STryu3mLKFX7qe+t+8k0fYBbKB5GoZ6tuS26l21AjjFHrA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/core": "2.2.7"
+       }
+@@ -1822,7 +1815,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/canvas/-/canvas-2.2.7.tgz",
+       "integrity": "sha512-H0vmt+YoQ1/+UDiobHE0eqdmQ0EY+4nkwGRXPly/D0TWdj0lMhrPtQhP2iAtmMYQxpV9nDaCF5DbLLR9DSjLyw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -1838,7 +1830,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/core/-/core-2.2.7.tgz",
+       "integrity": "sha512-AexqNYarSNuJOoiuxhrFTU1Y5HNLlL9hURKVM1p/XkxZy/69WY0eW0Lk6lGoAhQ+Qj3youMny5YU6NT2suZ9fw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/canvas": "2.2.7",
+         "@leafer/data": "2.2.7",
+@@ -1862,15 +1853,13 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/data/-/data-2.2.7.tgz",
+       "integrity": "sha512-To2E54rIGQRtkoHDJRiw7nLsZJW5Co+zKAYu1LCOr2Sq1SaWkY6SxcR3ShHDvWgChBYtpY/6mFmdz7hQkr8NLA==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/bounds/node_modules/@leafer/debug": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/debug/-/debug-2.2.7.tgz",
+       "integrity": "sha512-JvYazHVjyvDkn/5z77OmKhVe4Uhc1+vwTJL7hLIczYYY31rPJFqd7qm4eToHMGsr/VQHdUDGReAYNBgUsTpTDg==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -1881,7 +1870,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/decorator/-/decorator-2.2.7.tgz",
+       "integrity": "sha512-BecQ0AZHhqnbvS8bjrzPyWNIuwHWKLAOOfLgrSYgzp2qHCpadopQgyZ1+bvm6V84PTlX5Q3ui20S3+gXOI2JxA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -1893,7 +1881,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display/-/display-2.2.7.tgz",
+       "integrity": "sha512-Q0venUeZRWTVpEOJkSttSxnV8lbgYRAwqXCLIzzIneHhgVNKWWRIWqhizldRhMlNYwCqRUqlxfGQUbWUt2dF/Q==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -1912,7 +1899,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display-module/-/display-module-2.2.7.tgz",
+       "integrity": "sha512-yGgmXd6a1tL2pUqx7wZ0GRm+EwHihroDr7lXwuTx+tKWl0oO+NOln/37/dlc6pU4kO3inYktKBp5nx6qlQyWIw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -1926,7 +1912,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/event/-/event-2.2.7.tgz",
+       "integrity": "sha512-WirCEvs67dh8w4Gd9iFlqbwMavFQ+Lja/EBXnW5EaQ/bu6Opg3+6BUDDWd4vordDdvg9tkI3TINwl6UXy/v+0w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/decorator": "2.2.7",
+@@ -1939,7 +1924,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/file/-/file-2.2.7.tgz",
+       "integrity": "sha512-2c30wQSRRoNxaQJHHbXSYETL0Nr9kx1sJoDGvEY75u+wk4nRZJK0ifIEkl7gdKCPi/YaVc5Yl6szELlySA7yFA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -1952,7 +1936,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/helper/-/helper-2.2.7.tgz",
+       "integrity": "sha512-yVcknYfmo5o006+j5UuU4/P+t9ZOWVo/ZAK9lbCGHglywqxadRAHQ097hZRXkran2hZb2LnfMsJMXaGjPeAtZw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7",
+@@ -1964,7 +1947,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/image/-/image-2.2.7.tgz",
+       "integrity": "sha512-/aeqkZOoHVA+wBLAX7EQRZQiGul7NBUkegUa9GXNF/VRkC5d4QSmWKM3ry2O+pMP63Rvl8DA1oC8jhFBOgkFmA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/file": "2.2.7",
+@@ -1978,7 +1960,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/layout/-/layout-2.2.7.tgz",
+       "integrity": "sha512-qO6yY8KcCOKj4bzCUP+ZCssTiP+1pVhzzTnYiEpz5Bmqhs5OMT5PR5+tGMFuSxnczK6DF+TR9mfU8mDFFltTIA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/helper": "2.2.7",
+@@ -1990,22 +1971,19 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/list/-/list-2.2.7.tgz",
+       "integrity": "sha512-ihVc3B7qIHoiVkqq/i8zlwBl4o3dTwR3DRUVxC7DdjU5avuD+9Pbjem5dCVS2uovP7dapDV89aZOjQ/3tMOSmg==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/bounds/node_modules/@leafer/math": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/math/-/math-2.2.7.tgz",
+       "integrity": "sha512-aHWyjC+Jts+EmOywIuPd4NExzLx3JQjjPMZG6iP+PDseJL20o371mtNYhJoMASdS0Q2uc+cYMjF+vZylfMSjqw==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/bounds/node_modules/@leafer/path": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/path/-/path-2.2.7.tgz",
+       "integrity": "sha512-rOSvkUAQVRF00lJewzSt8JIpMbuWwsD1b3BXUNgzWGzzqLDAoQfzd+YZ70zvrczLukds90wvHv22vlFuSX76fQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2017,7 +1995,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/platform/-/platform-2.2.7.tgz",
+       "integrity": "sha512-z2mw/6xAoN4i4FdWf7ksY14O/OIHNJJgSUDlKwCuwpF55wI+5YXM++66NCNZxBB/dgrjFsfM+JxRCdKiDxR9bw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7"
+@@ -2028,7 +2005,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/task/-/task-2.2.7.tgz",
+       "integrity": "sha512-fK2NfBIWre6TF6ZgSN6vBwf4stAliKNcGuKwe9dERF8Olig9AaawiOa/adBg4kUHSuPgTnQbi/K32XrFIcROMw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/debug": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -2146,7 +2122,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/data/-/data-2.2.7.tgz",
+       "integrity": "sha512-P2LVoKIYtQhj6S+lGnM+q7yqgwyOErrFc7gOHGeJHiSJW0eH4WD/W67CutPFmBhXRHrGS1lya2xz9xqUHwzBPA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer-ui/external": "2.2.7",
+         "@leafer/core": "2.2.7"
+@@ -2157,7 +2132,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/canvas/-/canvas-2.2.7.tgz",
+       "integrity": "sha512-H0vmt+YoQ1/+UDiobHE0eqdmQ0EY+4nkwGRXPly/D0TWdj0lMhrPtQhP2iAtmMYQxpV9nDaCF5DbLLR9DSjLyw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2173,7 +2147,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/core/-/core-2.2.7.tgz",
+       "integrity": "sha512-AexqNYarSNuJOoiuxhrFTU1Y5HNLlL9hURKVM1p/XkxZy/69WY0eW0Lk6lGoAhQ+Qj3youMny5YU6NT2suZ9fw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/canvas": "2.2.7",
+         "@leafer/data": "2.2.7",
+@@ -2197,15 +2170,13 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/data/-/data-2.2.7.tgz",
+       "integrity": "sha512-To2E54rIGQRtkoHDJRiw7nLsZJW5Co+zKAYu1LCOr2Sq1SaWkY6SxcR3ShHDvWgChBYtpY/6mFmdz7hQkr8NLA==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/data/node_modules/@leafer/debug": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/debug/-/debug-2.2.7.tgz",
+       "integrity": "sha512-JvYazHVjyvDkn/5z77OmKhVe4Uhc1+vwTJL7hLIczYYY31rPJFqd7qm4eToHMGsr/VQHdUDGReAYNBgUsTpTDg==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -2216,7 +2187,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/decorator/-/decorator-2.2.7.tgz",
+       "integrity": "sha512-BecQ0AZHhqnbvS8bjrzPyWNIuwHWKLAOOfLgrSYgzp2qHCpadopQgyZ1+bvm6V84PTlX5Q3ui20S3+gXOI2JxA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2228,7 +2198,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display/-/display-2.2.7.tgz",
+       "integrity": "sha512-Q0venUeZRWTVpEOJkSttSxnV8lbgYRAwqXCLIzzIneHhgVNKWWRIWqhizldRhMlNYwCqRUqlxfGQUbWUt2dF/Q==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2247,7 +2216,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display-module/-/display-module-2.2.7.tgz",
+       "integrity": "sha512-yGgmXd6a1tL2pUqx7wZ0GRm+EwHihroDr7lXwuTx+tKWl0oO+NOln/37/dlc6pU4kO3inYktKBp5nx6qlQyWIw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2261,7 +2229,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/event/-/event-2.2.7.tgz",
+       "integrity": "sha512-WirCEvs67dh8w4Gd9iFlqbwMavFQ+Lja/EBXnW5EaQ/bu6Opg3+6BUDDWd4vordDdvg9tkI3TINwl6UXy/v+0w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/decorator": "2.2.7",
+@@ -2274,7 +2241,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/file/-/file-2.2.7.tgz",
+       "integrity": "sha512-2c30wQSRRoNxaQJHHbXSYETL0Nr9kx1sJoDGvEY75u+wk4nRZJK0ifIEkl7gdKCPi/YaVc5Yl6szELlySA7yFA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2287,7 +2253,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/helper/-/helper-2.2.7.tgz",
+       "integrity": "sha512-yVcknYfmo5o006+j5UuU4/P+t9ZOWVo/ZAK9lbCGHglywqxadRAHQ097hZRXkran2hZb2LnfMsJMXaGjPeAtZw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7",
+@@ -2299,7 +2264,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/image/-/image-2.2.7.tgz",
+       "integrity": "sha512-/aeqkZOoHVA+wBLAX7EQRZQiGul7NBUkegUa9GXNF/VRkC5d4QSmWKM3ry2O+pMP63Rvl8DA1oC8jhFBOgkFmA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/file": "2.2.7",
+@@ -2313,7 +2277,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/layout/-/layout-2.2.7.tgz",
+       "integrity": "sha512-qO6yY8KcCOKj4bzCUP+ZCssTiP+1pVhzzTnYiEpz5Bmqhs5OMT5PR5+tGMFuSxnczK6DF+TR9mfU8mDFFltTIA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/helper": "2.2.7",
+@@ -2325,22 +2288,19 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/list/-/list-2.2.7.tgz",
+       "integrity": "sha512-ihVc3B7qIHoiVkqq/i8zlwBl4o3dTwR3DRUVxC7DdjU5avuD+9Pbjem5dCVS2uovP7dapDV89aZOjQ/3tMOSmg==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/data/node_modules/@leafer/math": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/math/-/math-2.2.7.tgz",
+       "integrity": "sha512-aHWyjC+Jts+EmOywIuPd4NExzLx3JQjjPMZG6iP+PDseJL20o371mtNYhJoMASdS0Q2uc+cYMjF+vZylfMSjqw==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/data/node_modules/@leafer/path": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/path/-/path-2.2.7.tgz",
+       "integrity": "sha512-rOSvkUAQVRF00lJewzSt8JIpMbuWwsD1b3BXUNgzWGzzqLDAoQfzd+YZ70zvrczLukds90wvHv22vlFuSX76fQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2352,7 +2312,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/platform/-/platform-2.2.7.tgz",
+       "integrity": "sha512-z2mw/6xAoN4i4FdWf7ksY14O/OIHNJJgSUDlKwCuwpF55wI+5YXM++66NCNZxBB/dgrjFsfM+JxRCdKiDxR9bw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7"
+@@ -2363,7 +2322,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/task/-/task-2.2.7.tgz",
+       "integrity": "sha512-fK2NfBIWre6TF6ZgSN6vBwf4stAliKNcGuKwe9dERF8Olig9AaawiOa/adBg4kUHSuPgTnQbi/K32XrFIcROMw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/debug": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -2374,7 +2332,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/decorator/-/decorator-2.2.7.tgz",
+       "integrity": "sha512-CSStGc3KcmFq6JmBLnPyx9rBG++rEu6T0khKmrCUg94gDDg/C4oQcuMQOFePJNJkY8hhXvfq/EJL0xAouDCg6Q==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/core": "2.2.7"
+       }
+@@ -2384,7 +2341,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/canvas/-/canvas-2.2.7.tgz",
+       "integrity": "sha512-H0vmt+YoQ1/+UDiobHE0eqdmQ0EY+4nkwGRXPly/D0TWdj0lMhrPtQhP2iAtmMYQxpV9nDaCF5DbLLR9DSjLyw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2400,7 +2356,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/core/-/core-2.2.7.tgz",
+       "integrity": "sha512-AexqNYarSNuJOoiuxhrFTU1Y5HNLlL9hURKVM1p/XkxZy/69WY0eW0Lk6lGoAhQ+Qj3youMny5YU6NT2suZ9fw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/canvas": "2.2.7",
+         "@leafer/data": "2.2.7",
+@@ -2424,15 +2379,13 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/data/-/data-2.2.7.tgz",
+       "integrity": "sha512-To2E54rIGQRtkoHDJRiw7nLsZJW5Co+zKAYu1LCOr2Sq1SaWkY6SxcR3ShHDvWgChBYtpY/6mFmdz7hQkr8NLA==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/decorator/node_modules/@leafer/debug": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/debug/-/debug-2.2.7.tgz",
+       "integrity": "sha512-JvYazHVjyvDkn/5z77OmKhVe4Uhc1+vwTJL7hLIczYYY31rPJFqd7qm4eToHMGsr/VQHdUDGReAYNBgUsTpTDg==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -2443,7 +2396,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/decorator/-/decorator-2.2.7.tgz",
+       "integrity": "sha512-BecQ0AZHhqnbvS8bjrzPyWNIuwHWKLAOOfLgrSYgzp2qHCpadopQgyZ1+bvm6V84PTlX5Q3ui20S3+gXOI2JxA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2455,7 +2407,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display/-/display-2.2.7.tgz",
+       "integrity": "sha512-Q0venUeZRWTVpEOJkSttSxnV8lbgYRAwqXCLIzzIneHhgVNKWWRIWqhizldRhMlNYwCqRUqlxfGQUbWUt2dF/Q==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2474,7 +2425,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display-module/-/display-module-2.2.7.tgz",
+       "integrity": "sha512-yGgmXd6a1tL2pUqx7wZ0GRm+EwHihroDr7lXwuTx+tKWl0oO+NOln/37/dlc6pU4kO3inYktKBp5nx6qlQyWIw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2488,7 +2438,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/event/-/event-2.2.7.tgz",
+       "integrity": "sha512-WirCEvs67dh8w4Gd9iFlqbwMavFQ+Lja/EBXnW5EaQ/bu6Opg3+6BUDDWd4vordDdvg9tkI3TINwl6UXy/v+0w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/decorator": "2.2.7",
+@@ -2501,7 +2450,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/file/-/file-2.2.7.tgz",
+       "integrity": "sha512-2c30wQSRRoNxaQJHHbXSYETL0Nr9kx1sJoDGvEY75u+wk4nRZJK0ifIEkl7gdKCPi/YaVc5Yl6szELlySA7yFA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2514,7 +2462,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/helper/-/helper-2.2.7.tgz",
+       "integrity": "sha512-yVcknYfmo5o006+j5UuU4/P+t9ZOWVo/ZAK9lbCGHglywqxadRAHQ097hZRXkran2hZb2LnfMsJMXaGjPeAtZw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7",
+@@ -2526,7 +2473,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/image/-/image-2.2.7.tgz",
+       "integrity": "sha512-/aeqkZOoHVA+wBLAX7EQRZQiGul7NBUkegUa9GXNF/VRkC5d4QSmWKM3ry2O+pMP63Rvl8DA1oC8jhFBOgkFmA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/file": "2.2.7",
+@@ -2540,7 +2486,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/layout/-/layout-2.2.7.tgz",
+       "integrity": "sha512-qO6yY8KcCOKj4bzCUP+ZCssTiP+1pVhzzTnYiEpz5Bmqhs5OMT5PR5+tGMFuSxnczK6DF+TR9mfU8mDFFltTIA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/helper": "2.2.7",
+@@ -2552,22 +2497,19 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/list/-/list-2.2.7.tgz",
+       "integrity": "sha512-ihVc3B7qIHoiVkqq/i8zlwBl4o3dTwR3DRUVxC7DdjU5avuD+9Pbjem5dCVS2uovP7dapDV89aZOjQ/3tMOSmg==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/decorator/node_modules/@leafer/math": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/math/-/math-2.2.7.tgz",
+       "integrity": "sha512-aHWyjC+Jts+EmOywIuPd4NExzLx3JQjjPMZG6iP+PDseJL20o371mtNYhJoMASdS0Q2uc+cYMjF+vZylfMSjqw==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/decorator/node_modules/@leafer/path": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/path/-/path-2.2.7.tgz",
+       "integrity": "sha512-rOSvkUAQVRF00lJewzSt8JIpMbuWwsD1b3BXUNgzWGzzqLDAoQfzd+YZ70zvrczLukds90wvHv22vlFuSX76fQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2579,7 +2521,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/platform/-/platform-2.2.7.tgz",
+       "integrity": "sha512-z2mw/6xAoN4i4FdWf7ksY14O/OIHNJJgSUDlKwCuwpF55wI+5YXM++66NCNZxBB/dgrjFsfM+JxRCdKiDxR9bw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7"
+@@ -2590,7 +2531,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/task/-/task-2.2.7.tgz",
+       "integrity": "sha512-fK2NfBIWre6TF6ZgSN6vBwf4stAliKNcGuKwe9dERF8Olig9AaawiOa/adBg4kUHSuPgTnQbi/K32XrFIcROMw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/debug": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -2601,7 +2541,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/display/-/display-2.2.7.tgz",
+       "integrity": "sha512-9rxvMjj55DbPd4GOJqYTwPzPSVf+FyAUkCIuL8v3g3MQJTPTENLKv4eRJ8NI3ehf6jQdfVDrEbd8pFejR//h/w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer-ui/data": "2.2.7",
+         "@leafer-ui/decorator": "2.2.7",
+@@ -2615,7 +2554,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/display-module/-/display-module-2.2.7.tgz",
+       "integrity": "sha512-llkL9So2CszgO+i3B+nQk0qp1s1yF++PjibimChT5Y/SXUXgDVLgxvZ+7lAn6USse/t3qMKEYSXDW7RU+nVoxg==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer-ui/bounds": "2.2.7",
+         "@leafer-ui/data": "2.2.7",
+@@ -2627,7 +2565,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/canvas/-/canvas-2.2.7.tgz",
+       "integrity": "sha512-H0vmt+YoQ1/+UDiobHE0eqdmQ0EY+4nkwGRXPly/D0TWdj0lMhrPtQhP2iAtmMYQxpV9nDaCF5DbLLR9DSjLyw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2643,7 +2580,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/core/-/core-2.2.7.tgz",
+       "integrity": "sha512-AexqNYarSNuJOoiuxhrFTU1Y5HNLlL9hURKVM1p/XkxZy/69WY0eW0Lk6lGoAhQ+Qj3youMny5YU6NT2suZ9fw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/canvas": "2.2.7",
+         "@leafer/data": "2.2.7",
+@@ -2667,15 +2603,13 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/data/-/data-2.2.7.tgz",
+       "integrity": "sha512-To2E54rIGQRtkoHDJRiw7nLsZJW5Co+zKAYu1LCOr2Sq1SaWkY6SxcR3ShHDvWgChBYtpY/6mFmdz7hQkr8NLA==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/display/node_modules/@leafer/debug": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/debug/-/debug-2.2.7.tgz",
+       "integrity": "sha512-JvYazHVjyvDkn/5z77OmKhVe4Uhc1+vwTJL7hLIczYYY31rPJFqd7qm4eToHMGsr/VQHdUDGReAYNBgUsTpTDg==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -2686,7 +2620,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/decorator/-/decorator-2.2.7.tgz",
+       "integrity": "sha512-BecQ0AZHhqnbvS8bjrzPyWNIuwHWKLAOOfLgrSYgzp2qHCpadopQgyZ1+bvm6V84PTlX5Q3ui20S3+gXOI2JxA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2698,7 +2631,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display/-/display-2.2.7.tgz",
+       "integrity": "sha512-Q0venUeZRWTVpEOJkSttSxnV8lbgYRAwqXCLIzzIneHhgVNKWWRIWqhizldRhMlNYwCqRUqlxfGQUbWUt2dF/Q==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2717,7 +2649,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display-module/-/display-module-2.2.7.tgz",
+       "integrity": "sha512-yGgmXd6a1tL2pUqx7wZ0GRm+EwHihroDr7lXwuTx+tKWl0oO+NOln/37/dlc6pU4kO3inYktKBp5nx6qlQyWIw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2731,7 +2662,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/event/-/event-2.2.7.tgz",
+       "integrity": "sha512-WirCEvs67dh8w4Gd9iFlqbwMavFQ+Lja/EBXnW5EaQ/bu6Opg3+6BUDDWd4vordDdvg9tkI3TINwl6UXy/v+0w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/decorator": "2.2.7",
+@@ -2744,7 +2674,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/file/-/file-2.2.7.tgz",
+       "integrity": "sha512-2c30wQSRRoNxaQJHHbXSYETL0Nr9kx1sJoDGvEY75u+wk4nRZJK0ifIEkl7gdKCPi/YaVc5Yl6szELlySA7yFA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2757,7 +2686,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/helper/-/helper-2.2.7.tgz",
+       "integrity": "sha512-yVcknYfmo5o006+j5UuU4/P+t9ZOWVo/ZAK9lbCGHglywqxadRAHQ097hZRXkran2hZb2LnfMsJMXaGjPeAtZw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7",
+@@ -2769,7 +2697,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/image/-/image-2.2.7.tgz",
+       "integrity": "sha512-/aeqkZOoHVA+wBLAX7EQRZQiGul7NBUkegUa9GXNF/VRkC5d4QSmWKM3ry2O+pMP63Rvl8DA1oC8jhFBOgkFmA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/file": "2.2.7",
+@@ -2783,7 +2710,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/layout/-/layout-2.2.7.tgz",
+       "integrity": "sha512-qO6yY8KcCOKj4bzCUP+ZCssTiP+1pVhzzTnYiEpz5Bmqhs5OMT5PR5+tGMFuSxnczK6DF+TR9mfU8mDFFltTIA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/helper": "2.2.7",
+@@ -2795,22 +2721,19 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/list/-/list-2.2.7.tgz",
+       "integrity": "sha512-ihVc3B7qIHoiVkqq/i8zlwBl4o3dTwR3DRUVxC7DdjU5avuD+9Pbjem5dCVS2uovP7dapDV89aZOjQ/3tMOSmg==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/display/node_modules/@leafer/math": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/math/-/math-2.2.7.tgz",
+       "integrity": "sha512-aHWyjC+Jts+EmOywIuPd4NExzLx3JQjjPMZG6iP+PDseJL20o371mtNYhJoMASdS0Q2uc+cYMjF+vZylfMSjqw==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/display/node_modules/@leafer/path": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/path/-/path-2.2.7.tgz",
+       "integrity": "sha512-rOSvkUAQVRF00lJewzSt8JIpMbuWwsD1b3BXUNgzWGzzqLDAoQfzd+YZ70zvrczLukds90wvHv22vlFuSX76fQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2822,7 +2745,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/platform/-/platform-2.2.7.tgz",
+       "integrity": "sha512-z2mw/6xAoN4i4FdWf7ksY14O/OIHNJJgSUDlKwCuwpF55wI+5YXM++66NCNZxBB/dgrjFsfM+JxRCdKiDxR9bw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7"
+@@ -2833,7 +2755,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/task/-/task-2.2.7.tgz",
+       "integrity": "sha512-fK2NfBIWre6TF6ZgSN6vBwf4stAliKNcGuKwe9dERF8Olig9AaawiOa/adBg4kUHSuPgTnQbi/K32XrFIcROMw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/debug": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -2858,7 +2779,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/canvas/-/canvas-2.2.7.tgz",
+       "integrity": "sha512-H0vmt+YoQ1/+UDiobHE0eqdmQ0EY+4nkwGRXPly/D0TWdj0lMhrPtQhP2iAtmMYQxpV9nDaCF5DbLLR9DSjLyw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2874,7 +2794,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/core/-/core-2.2.7.tgz",
+       "integrity": "sha512-AexqNYarSNuJOoiuxhrFTU1Y5HNLlL9hURKVM1p/XkxZy/69WY0eW0Lk6lGoAhQ+Qj3youMny5YU6NT2suZ9fw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/canvas": "2.2.7",
+         "@leafer/data": "2.2.7",
+@@ -2898,15 +2817,13 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/data/-/data-2.2.7.tgz",
+       "integrity": "sha512-To2E54rIGQRtkoHDJRiw7nLsZJW5Co+zKAYu1LCOr2Sq1SaWkY6SxcR3ShHDvWgChBYtpY/6mFmdz7hQkr8NLA==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/draw/node_modules/@leafer/debug": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/debug/-/debug-2.2.7.tgz",
+       "integrity": "sha512-JvYazHVjyvDkn/5z77OmKhVe4Uhc1+vwTJL7hLIczYYY31rPJFqd7qm4eToHMGsr/VQHdUDGReAYNBgUsTpTDg==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -2917,7 +2834,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/decorator/-/decorator-2.2.7.tgz",
+       "integrity": "sha512-BecQ0AZHhqnbvS8bjrzPyWNIuwHWKLAOOfLgrSYgzp2qHCpadopQgyZ1+bvm6V84PTlX5Q3ui20S3+gXOI2JxA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2929,7 +2845,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display/-/display-2.2.7.tgz",
+       "integrity": "sha512-Q0venUeZRWTVpEOJkSttSxnV8lbgYRAwqXCLIzzIneHhgVNKWWRIWqhizldRhMlNYwCqRUqlxfGQUbWUt2dF/Q==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2948,7 +2863,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display-module/-/display-module-2.2.7.tgz",
+       "integrity": "sha512-yGgmXd6a1tL2pUqx7wZ0GRm+EwHihroDr7lXwuTx+tKWl0oO+NOln/37/dlc6pU4kO3inYktKBp5nx6qlQyWIw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2962,7 +2876,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/event/-/event-2.2.7.tgz",
+       "integrity": "sha512-WirCEvs67dh8w4Gd9iFlqbwMavFQ+Lja/EBXnW5EaQ/bu6Opg3+6BUDDWd4vordDdvg9tkI3TINwl6UXy/v+0w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/decorator": "2.2.7",
+@@ -2975,7 +2888,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/file/-/file-2.2.7.tgz",
+       "integrity": "sha512-2c30wQSRRoNxaQJHHbXSYETL0Nr9kx1sJoDGvEY75u+wk4nRZJK0ifIEkl7gdKCPi/YaVc5Yl6szELlySA7yFA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -2988,7 +2900,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/helper/-/helper-2.2.7.tgz",
+       "integrity": "sha512-yVcknYfmo5o006+j5UuU4/P+t9ZOWVo/ZAK9lbCGHglywqxadRAHQ097hZRXkran2hZb2LnfMsJMXaGjPeAtZw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7",
+@@ -3000,7 +2911,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/image/-/image-2.2.7.tgz",
+       "integrity": "sha512-/aeqkZOoHVA+wBLAX7EQRZQiGul7NBUkegUa9GXNF/VRkC5d4QSmWKM3ry2O+pMP63Rvl8DA1oC8jhFBOgkFmA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/file": "2.2.7",
+@@ -3014,7 +2924,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/layout/-/layout-2.2.7.tgz",
+       "integrity": "sha512-qO6yY8KcCOKj4bzCUP+ZCssTiP+1pVhzzTnYiEpz5Bmqhs5OMT5PR5+tGMFuSxnczK6DF+TR9mfU8mDFFltTIA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/helper": "2.2.7",
+@@ -3026,22 +2935,19 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/list/-/list-2.2.7.tgz",
+       "integrity": "sha512-ihVc3B7qIHoiVkqq/i8zlwBl4o3dTwR3DRUVxC7DdjU5avuD+9Pbjem5dCVS2uovP7dapDV89aZOjQ/3tMOSmg==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/draw/node_modules/@leafer/math": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/math/-/math-2.2.7.tgz",
+       "integrity": "sha512-aHWyjC+Jts+EmOywIuPd4NExzLx3JQjjPMZG6iP+PDseJL20o371mtNYhJoMASdS0Q2uc+cYMjF+vZylfMSjqw==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/draw/node_modules/@leafer/path": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/path/-/path-2.2.7.tgz",
+       "integrity": "sha512-rOSvkUAQVRF00lJewzSt8JIpMbuWwsD1b3BXUNgzWGzzqLDAoQfzd+YZ70zvrczLukds90wvHv22vlFuSX76fQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3053,7 +2959,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/platform/-/platform-2.2.7.tgz",
+       "integrity": "sha512-z2mw/6xAoN4i4FdWf7ksY14O/OIHNJJgSUDlKwCuwpF55wI+5YXM++66NCNZxBB/dgrjFsfM+JxRCdKiDxR9bw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7"
+@@ -3064,7 +2969,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/task/-/task-2.2.7.tgz",
+       "integrity": "sha512-fK2NfBIWre6TF6ZgSN6vBwf4stAliKNcGuKwe9dERF8Olig9AaawiOa/adBg4kUHSuPgTnQbi/K32XrFIcROMw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/debug": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -3168,7 +3072,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/event/-/event-2.2.7.tgz",
+       "integrity": "sha512-DtfPmYILi2FayhxcYJ+XQ2AMQ2KfNjb5gNtrJFnmgE/gjHLTM7nRXdfhHDH1kF3fCHgT3Q3Trxnz4ZULyIvlpA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/core": "2.2.7"
+       }
+@@ -3178,7 +3081,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/canvas/-/canvas-2.2.7.tgz",
+       "integrity": "sha512-H0vmt+YoQ1/+UDiobHE0eqdmQ0EY+4nkwGRXPly/D0TWdj0lMhrPtQhP2iAtmMYQxpV9nDaCF5DbLLR9DSjLyw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3194,7 +3096,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/core/-/core-2.2.7.tgz",
+       "integrity": "sha512-AexqNYarSNuJOoiuxhrFTU1Y5HNLlL9hURKVM1p/XkxZy/69WY0eW0Lk6lGoAhQ+Qj3youMny5YU6NT2suZ9fw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/canvas": "2.2.7",
+         "@leafer/data": "2.2.7",
+@@ -3218,15 +3119,13 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/data/-/data-2.2.7.tgz",
+       "integrity": "sha512-To2E54rIGQRtkoHDJRiw7nLsZJW5Co+zKAYu1LCOr2Sq1SaWkY6SxcR3ShHDvWgChBYtpY/6mFmdz7hQkr8NLA==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/event/node_modules/@leafer/debug": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/debug/-/debug-2.2.7.tgz",
+       "integrity": "sha512-JvYazHVjyvDkn/5z77OmKhVe4Uhc1+vwTJL7hLIczYYY31rPJFqd7qm4eToHMGsr/VQHdUDGReAYNBgUsTpTDg==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -3237,7 +3136,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/decorator/-/decorator-2.2.7.tgz",
+       "integrity": "sha512-BecQ0AZHhqnbvS8bjrzPyWNIuwHWKLAOOfLgrSYgzp2qHCpadopQgyZ1+bvm6V84PTlX5Q3ui20S3+gXOI2JxA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3249,7 +3147,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display/-/display-2.2.7.tgz",
+       "integrity": "sha512-Q0venUeZRWTVpEOJkSttSxnV8lbgYRAwqXCLIzzIneHhgVNKWWRIWqhizldRhMlNYwCqRUqlxfGQUbWUt2dF/Q==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3268,7 +3165,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display-module/-/display-module-2.2.7.tgz",
+       "integrity": "sha512-yGgmXd6a1tL2pUqx7wZ0GRm+EwHihroDr7lXwuTx+tKWl0oO+NOln/37/dlc6pU4kO3inYktKBp5nx6qlQyWIw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3282,7 +3178,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/event/-/event-2.2.7.tgz",
+       "integrity": "sha512-WirCEvs67dh8w4Gd9iFlqbwMavFQ+Lja/EBXnW5EaQ/bu6Opg3+6BUDDWd4vordDdvg9tkI3TINwl6UXy/v+0w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/decorator": "2.2.7",
+@@ -3295,7 +3190,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/file/-/file-2.2.7.tgz",
+       "integrity": "sha512-2c30wQSRRoNxaQJHHbXSYETL0Nr9kx1sJoDGvEY75u+wk4nRZJK0ifIEkl7gdKCPi/YaVc5Yl6szELlySA7yFA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3308,7 +3202,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/helper/-/helper-2.2.7.tgz",
+       "integrity": "sha512-yVcknYfmo5o006+j5UuU4/P+t9ZOWVo/ZAK9lbCGHglywqxadRAHQ097hZRXkran2hZb2LnfMsJMXaGjPeAtZw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7",
+@@ -3320,7 +3213,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/image/-/image-2.2.7.tgz",
+       "integrity": "sha512-/aeqkZOoHVA+wBLAX7EQRZQiGul7NBUkegUa9GXNF/VRkC5d4QSmWKM3ry2O+pMP63Rvl8DA1oC8jhFBOgkFmA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/file": "2.2.7",
+@@ -3334,7 +3226,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/layout/-/layout-2.2.7.tgz",
+       "integrity": "sha512-qO6yY8KcCOKj4bzCUP+ZCssTiP+1pVhzzTnYiEpz5Bmqhs5OMT5PR5+tGMFuSxnczK6DF+TR9mfU8mDFFltTIA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/helper": "2.2.7",
+@@ -3346,22 +3237,19 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/list/-/list-2.2.7.tgz",
+       "integrity": "sha512-ihVc3B7qIHoiVkqq/i8zlwBl4o3dTwR3DRUVxC7DdjU5avuD+9Pbjem5dCVS2uovP7dapDV89aZOjQ/3tMOSmg==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/event/node_modules/@leafer/math": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/math/-/math-2.2.7.tgz",
+       "integrity": "sha512-aHWyjC+Jts+EmOywIuPd4NExzLx3JQjjPMZG6iP+PDseJL20o371mtNYhJoMASdS0Q2uc+cYMjF+vZylfMSjqw==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/event/node_modules/@leafer/path": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/path/-/path-2.2.7.tgz",
+       "integrity": "sha512-rOSvkUAQVRF00lJewzSt8JIpMbuWwsD1b3BXUNgzWGzzqLDAoQfzd+YZ70zvrczLukds90wvHv22vlFuSX76fQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3373,7 +3261,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/platform/-/platform-2.2.7.tgz",
+       "integrity": "sha512-z2mw/6xAoN4i4FdWf7ksY14O/OIHNJJgSUDlKwCuwpF55wI+5YXM++66NCNZxBB/dgrjFsfM+JxRCdKiDxR9bw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7"
+@@ -3384,7 +3271,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/task/-/task-2.2.7.tgz",
+       "integrity": "sha512-fK2NfBIWre6TF6ZgSN6vBwf4stAliKNcGuKwe9dERF8Olig9AaawiOa/adBg4kUHSuPgTnQbi/K32XrFIcROMw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/debug": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -3395,7 +3281,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/external/-/external-2.2.7.tgz",
+       "integrity": "sha512-uKROw1Rn1Z88Q28Ikz0lwnFchO+oydcOwlD4JV9qExBBVv6ZORGxfUP/QHDjp2hsQ+tet7VupnfPMmRsnb6Ojw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/core": "2.2.7"
+       }
+@@ -3405,7 +3290,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/canvas/-/canvas-2.2.7.tgz",
+       "integrity": "sha512-H0vmt+YoQ1/+UDiobHE0eqdmQ0EY+4nkwGRXPly/D0TWdj0lMhrPtQhP2iAtmMYQxpV9nDaCF5DbLLR9DSjLyw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3421,7 +3305,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/core/-/core-2.2.7.tgz",
+       "integrity": "sha512-AexqNYarSNuJOoiuxhrFTU1Y5HNLlL9hURKVM1p/XkxZy/69WY0eW0Lk6lGoAhQ+Qj3youMny5YU6NT2suZ9fw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/canvas": "2.2.7",
+         "@leafer/data": "2.2.7",
+@@ -3445,15 +3328,13 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/data/-/data-2.2.7.tgz",
+       "integrity": "sha512-To2E54rIGQRtkoHDJRiw7nLsZJW5Co+zKAYu1LCOr2Sq1SaWkY6SxcR3ShHDvWgChBYtpY/6mFmdz7hQkr8NLA==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/external/node_modules/@leafer/debug": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/debug/-/debug-2.2.7.tgz",
+       "integrity": "sha512-JvYazHVjyvDkn/5z77OmKhVe4Uhc1+vwTJL7hLIczYYY31rPJFqd7qm4eToHMGsr/VQHdUDGReAYNBgUsTpTDg==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -3464,7 +3345,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/decorator/-/decorator-2.2.7.tgz",
+       "integrity": "sha512-BecQ0AZHhqnbvS8bjrzPyWNIuwHWKLAOOfLgrSYgzp2qHCpadopQgyZ1+bvm6V84PTlX5Q3ui20S3+gXOI2JxA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3476,7 +3356,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display/-/display-2.2.7.tgz",
+       "integrity": "sha512-Q0venUeZRWTVpEOJkSttSxnV8lbgYRAwqXCLIzzIneHhgVNKWWRIWqhizldRhMlNYwCqRUqlxfGQUbWUt2dF/Q==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3495,7 +3374,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display-module/-/display-module-2.2.7.tgz",
+       "integrity": "sha512-yGgmXd6a1tL2pUqx7wZ0GRm+EwHihroDr7lXwuTx+tKWl0oO+NOln/37/dlc6pU4kO3inYktKBp5nx6qlQyWIw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3509,7 +3387,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/event/-/event-2.2.7.tgz",
+       "integrity": "sha512-WirCEvs67dh8w4Gd9iFlqbwMavFQ+Lja/EBXnW5EaQ/bu6Opg3+6BUDDWd4vordDdvg9tkI3TINwl6UXy/v+0w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/decorator": "2.2.7",
+@@ -3522,7 +3399,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/file/-/file-2.2.7.tgz",
+       "integrity": "sha512-2c30wQSRRoNxaQJHHbXSYETL0Nr9kx1sJoDGvEY75u+wk4nRZJK0ifIEkl7gdKCPi/YaVc5Yl6szELlySA7yFA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3535,7 +3411,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/helper/-/helper-2.2.7.tgz",
+       "integrity": "sha512-yVcknYfmo5o006+j5UuU4/P+t9ZOWVo/ZAK9lbCGHglywqxadRAHQ097hZRXkran2hZb2LnfMsJMXaGjPeAtZw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7",
+@@ -3547,7 +3422,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/image/-/image-2.2.7.tgz",
+       "integrity": "sha512-/aeqkZOoHVA+wBLAX7EQRZQiGul7NBUkegUa9GXNF/VRkC5d4QSmWKM3ry2O+pMP63Rvl8DA1oC8jhFBOgkFmA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/file": "2.2.7",
+@@ -3561,7 +3435,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/layout/-/layout-2.2.7.tgz",
+       "integrity": "sha512-qO6yY8KcCOKj4bzCUP+ZCssTiP+1pVhzzTnYiEpz5Bmqhs5OMT5PR5+tGMFuSxnczK6DF+TR9mfU8mDFFltTIA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/helper": "2.2.7",
+@@ -3573,22 +3446,19 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/list/-/list-2.2.7.tgz",
+       "integrity": "sha512-ihVc3B7qIHoiVkqq/i8zlwBl4o3dTwR3DRUVxC7DdjU5avuD+9Pbjem5dCVS2uovP7dapDV89aZOjQ/3tMOSmg==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/external/node_modules/@leafer/math": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/math/-/math-2.2.7.tgz",
+       "integrity": "sha512-aHWyjC+Jts+EmOywIuPd4NExzLx3JQjjPMZG6iP+PDseJL20o371mtNYhJoMASdS0Q2uc+cYMjF+vZylfMSjqw==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/external/node_modules/@leafer/path": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/path/-/path-2.2.7.tgz",
+       "integrity": "sha512-rOSvkUAQVRF00lJewzSt8JIpMbuWwsD1b3BXUNgzWGzzqLDAoQfzd+YZ70zvrczLukds90wvHv22vlFuSX76fQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3600,7 +3470,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/platform/-/platform-2.2.7.tgz",
+       "integrity": "sha512-z2mw/6xAoN4i4FdWf7ksY14O/OIHNJJgSUDlKwCuwpF55wI+5YXM++66NCNZxBB/dgrjFsfM+JxRCdKiDxR9bw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7"
+@@ -3611,7 +3480,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/task/-/task-2.2.7.tgz",
+       "integrity": "sha512-fK2NfBIWre6TF6ZgSN6vBwf4stAliKNcGuKwe9dERF8Olig9AaawiOa/adBg4kUHSuPgTnQbi/K32XrFIcROMw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/debug": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -3622,7 +3490,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/hit/-/hit-2.2.7.tgz",
+       "integrity": "sha512-ha04FMjkS8wuH9XFHUvUBfEZwRwq7GBHoTfxr552hYefAgW4/4F1Jyb0XArqoMbrytrPot/aMXSlVsFBaNUpzA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer-ui/draw": "2.2.7",
+         "@leafer/core": "2.2.7"
+@@ -3633,7 +3500,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/canvas/-/canvas-2.2.7.tgz",
+       "integrity": "sha512-H0vmt+YoQ1/+UDiobHE0eqdmQ0EY+4nkwGRXPly/D0TWdj0lMhrPtQhP2iAtmMYQxpV9nDaCF5DbLLR9DSjLyw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3649,7 +3515,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/core/-/core-2.2.7.tgz",
+       "integrity": "sha512-AexqNYarSNuJOoiuxhrFTU1Y5HNLlL9hURKVM1p/XkxZy/69WY0eW0Lk6lGoAhQ+Qj3youMny5YU6NT2suZ9fw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/canvas": "2.2.7",
+         "@leafer/data": "2.2.7",
+@@ -3673,15 +3538,13 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/data/-/data-2.2.7.tgz",
+       "integrity": "sha512-To2E54rIGQRtkoHDJRiw7nLsZJW5Co+zKAYu1LCOr2Sq1SaWkY6SxcR3ShHDvWgChBYtpY/6mFmdz7hQkr8NLA==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/hit/node_modules/@leafer/debug": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/debug/-/debug-2.2.7.tgz",
+       "integrity": "sha512-JvYazHVjyvDkn/5z77OmKhVe4Uhc1+vwTJL7hLIczYYY31rPJFqd7qm4eToHMGsr/VQHdUDGReAYNBgUsTpTDg==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -3692,7 +3555,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/decorator/-/decorator-2.2.7.tgz",
+       "integrity": "sha512-BecQ0AZHhqnbvS8bjrzPyWNIuwHWKLAOOfLgrSYgzp2qHCpadopQgyZ1+bvm6V84PTlX5Q3ui20S3+gXOI2JxA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3704,7 +3566,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display/-/display-2.2.7.tgz",
+       "integrity": "sha512-Q0venUeZRWTVpEOJkSttSxnV8lbgYRAwqXCLIzzIneHhgVNKWWRIWqhizldRhMlNYwCqRUqlxfGQUbWUt2dF/Q==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3723,7 +3584,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display-module/-/display-module-2.2.7.tgz",
+       "integrity": "sha512-yGgmXd6a1tL2pUqx7wZ0GRm+EwHihroDr7lXwuTx+tKWl0oO+NOln/37/dlc6pU4kO3inYktKBp5nx6qlQyWIw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3737,7 +3597,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/event/-/event-2.2.7.tgz",
+       "integrity": "sha512-WirCEvs67dh8w4Gd9iFlqbwMavFQ+Lja/EBXnW5EaQ/bu6Opg3+6BUDDWd4vordDdvg9tkI3TINwl6UXy/v+0w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/decorator": "2.2.7",
+@@ -3750,7 +3609,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/file/-/file-2.2.7.tgz",
+       "integrity": "sha512-2c30wQSRRoNxaQJHHbXSYETL0Nr9kx1sJoDGvEY75u+wk4nRZJK0ifIEkl7gdKCPi/YaVc5Yl6szELlySA7yFA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3763,7 +3621,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/helper/-/helper-2.2.7.tgz",
+       "integrity": "sha512-yVcknYfmo5o006+j5UuU4/P+t9ZOWVo/ZAK9lbCGHglywqxadRAHQ097hZRXkran2hZb2LnfMsJMXaGjPeAtZw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7",
+@@ -3775,7 +3632,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/image/-/image-2.2.7.tgz",
+       "integrity": "sha512-/aeqkZOoHVA+wBLAX7EQRZQiGul7NBUkegUa9GXNF/VRkC5d4QSmWKM3ry2O+pMP63Rvl8DA1oC8jhFBOgkFmA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/file": "2.2.7",
+@@ -3789,7 +3645,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/layout/-/layout-2.2.7.tgz",
+       "integrity": "sha512-qO6yY8KcCOKj4bzCUP+ZCssTiP+1pVhzzTnYiEpz5Bmqhs5OMT5PR5+tGMFuSxnczK6DF+TR9mfU8mDFFltTIA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/helper": "2.2.7",
+@@ -3801,22 +3656,19 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/list/-/list-2.2.7.tgz",
+       "integrity": "sha512-ihVc3B7qIHoiVkqq/i8zlwBl4o3dTwR3DRUVxC7DdjU5avuD+9Pbjem5dCVS2uovP7dapDV89aZOjQ/3tMOSmg==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/hit/node_modules/@leafer/math": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/math/-/math-2.2.7.tgz",
+       "integrity": "sha512-aHWyjC+Jts+EmOywIuPd4NExzLx3JQjjPMZG6iP+PDseJL20o371mtNYhJoMASdS0Q2uc+cYMjF+vZylfMSjqw==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/hit/node_modules/@leafer/path": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/path/-/path-2.2.7.tgz",
+       "integrity": "sha512-rOSvkUAQVRF00lJewzSt8JIpMbuWwsD1b3BXUNgzWGzzqLDAoQfzd+YZ70zvrczLukds90wvHv22vlFuSX76fQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -3828,7 +3680,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/platform/-/platform-2.2.7.tgz",
+       "integrity": "sha512-z2mw/6xAoN4i4FdWf7ksY14O/OIHNJJgSUDlKwCuwpF55wI+5YXM++66NCNZxBB/dgrjFsfM+JxRCdKiDxR9bw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7"
+@@ -3839,7 +3690,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/task/-/task-2.2.7.tgz",
+       "integrity": "sha512-fK2NfBIWre6TF6ZgSN6vBwf4stAliKNcGuKwe9dERF8Olig9AaawiOa/adBg4kUHSuPgTnQbi/K32XrFIcROMw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/debug": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -3850,7 +3700,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/interaction/-/interaction-2.2.7.tgz",
+       "integrity": "sha512-yxIP+VvLCSG6S6ar+2LmF03la4FC1ajXf9e0ai9Aj7qONoIZ/9PhxFXggkBR8OUAQFsdXRyg86m0IOQ7c5VyVA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer-ui/draw": "2.2.7",
+         "@leafer-ui/event": "2.2.7",
+@@ -4009,7 +3858,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/canvas/-/canvas-2.2.7.tgz",
+       "integrity": "sha512-H0vmt+YoQ1/+UDiobHE0eqdmQ0EY+4nkwGRXPly/D0TWdj0lMhrPtQhP2iAtmMYQxpV9nDaCF5DbLLR9DSjLyw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -4025,7 +3873,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/core/-/core-2.2.7.tgz",
+       "integrity": "sha512-AexqNYarSNuJOoiuxhrFTU1Y5HNLlL9hURKVM1p/XkxZy/69WY0eW0Lk6lGoAhQ+Qj3youMny5YU6NT2suZ9fw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/canvas": "2.2.7",
+         "@leafer/data": "2.2.7",
+@@ -4049,15 +3896,13 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/data/-/data-2.2.7.tgz",
+       "integrity": "sha512-To2E54rIGQRtkoHDJRiw7nLsZJW5Co+zKAYu1LCOr2Sq1SaWkY6SxcR3ShHDvWgChBYtpY/6mFmdz7hQkr8NLA==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/interaction/node_modules/@leafer/debug": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/debug/-/debug-2.2.7.tgz",
+       "integrity": "sha512-JvYazHVjyvDkn/5z77OmKhVe4Uhc1+vwTJL7hLIczYYY31rPJFqd7qm4eToHMGsr/VQHdUDGReAYNBgUsTpTDg==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -4068,7 +3913,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/decorator/-/decorator-2.2.7.tgz",
+       "integrity": "sha512-BecQ0AZHhqnbvS8bjrzPyWNIuwHWKLAOOfLgrSYgzp2qHCpadopQgyZ1+bvm6V84PTlX5Q3ui20S3+gXOI2JxA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -4080,7 +3924,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display/-/display-2.2.7.tgz",
+       "integrity": "sha512-Q0venUeZRWTVpEOJkSttSxnV8lbgYRAwqXCLIzzIneHhgVNKWWRIWqhizldRhMlNYwCqRUqlxfGQUbWUt2dF/Q==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -4099,7 +3942,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/display-module/-/display-module-2.2.7.tgz",
+       "integrity": "sha512-yGgmXd6a1tL2pUqx7wZ0GRm+EwHihroDr7lXwuTx+tKWl0oO+NOln/37/dlc6pU4kO3inYktKBp5nx6qlQyWIw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -4113,7 +3955,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/event/-/event-2.2.7.tgz",
+       "integrity": "sha512-WirCEvs67dh8w4Gd9iFlqbwMavFQ+Lja/EBXnW5EaQ/bu6Opg3+6BUDDWd4vordDdvg9tkI3TINwl6UXy/v+0w==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/decorator": "2.2.7",
+@@ -4126,7 +3967,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/file/-/file-2.2.7.tgz",
+       "integrity": "sha512-2c30wQSRRoNxaQJHHbXSYETL0Nr9kx1sJoDGvEY75u+wk4nRZJK0ifIEkl7gdKCPi/YaVc5Yl6szELlySA7yFA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -4139,7 +3979,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/helper/-/helper-2.2.7.tgz",
+       "integrity": "sha512-yVcknYfmo5o006+j5UuU4/P+t9ZOWVo/ZAK9lbCGHglywqxadRAHQ097hZRXkran2hZb2LnfMsJMXaGjPeAtZw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/math": "2.2.7",
+@@ -4151,7 +3990,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/image/-/image-2.2.7.tgz",
+       "integrity": "sha512-/aeqkZOoHVA+wBLAX7EQRZQiGul7NBUkegUa9GXNF/VRkC5d4QSmWKM3ry2O+pMP63Rvl8DA1oC8jhFBOgkFmA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/file": "2.2.7",
+@@ -4165,7 +4003,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/layout/-/layout-2.2.7.tgz",
+       "integrity": "sha512-qO6yY8KcCOKj4bzCUP+ZCssTiP+1pVhzzTnYiEpz5Bmqhs5OMT5PR5+tGMFuSxnczK6DF+TR9mfU8mDFFltTIA==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/helper": "2.2.7",
+@@ -4177,22 +4014,19 @@
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/list/-/list-2.2.7.tgz",
+       "integrity": "sha512-ihVc3B7qIHoiVkqq/i8zlwBl4o3dTwR3DRUVxC7DdjU5avuD+9Pbjem5dCVS2uovP7dapDV89aZOjQ/3tMOSmg==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/interaction/node_modules/@leafer/math": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/math/-/math-2.2.7.tgz",
+       "integrity": "sha512-aHWyjC+Jts+EmOywIuPd4NExzLx3JQjjPMZG6iP+PDseJL20o371mtNYhJoMASdS0Q2uc+cYMjF+vZylfMSjqw==",
+-      "license": "MIT",
+-      "peer": true
++      "license": "MIT"
+     },
+     "node_modules/@leafer-ui/interaction/node_modules/@leafer/path": {
+       "version": "2.2.7",
+       "resolved": "https://registry.npmjs.org/@leafer/path/-/path-2.2.7.tgz",
+       "integrity": "sha512-rOSvkUAQVRF00lJewzSt8JIpMbuWwsD1b3BXUNgzWGzzqLDAoQfzd+YZ70zvrczLukds90wvHv22vlFuSX76fQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7",
+@@ -4204,7 +4038,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/platform/-/platform-2.2.7.tgz",
+       "integrity": "sha512-z2mw/6xAoN4i4FdWf7ksY14O/OIHNJJgSUDlKwCuwpF55wI+5YXM++66NCNZxBB/dgrjFsfM+JxRCdKiDxR9bw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/data": "2.2.7",
+         "@leafer/debug": "2.2.7"
+@@ -4215,7 +4048,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer/task/-/task-2.2.7.tgz",
+       "integrity": "sha512-fK2NfBIWre6TF6ZgSN6vBwf4stAliKNcGuKwe9dERF8Olig9AaawiOa/adBg4kUHSuPgTnQbi/K32XrFIcROMw==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer/debug": "2.2.7",
+         "@leafer/math": "2.2.7"
+@@ -4425,7 +4257,6 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/render/-/render-2.2.7.tgz",
+       "integrity": "sha512-4Ep5jJRf+0d5gWMGeh6AIPUoRpuyuPMs5Bf1+BSB/mOuhxJJX9SGClKMiuYoyYWF4D8G52vUBflgtOp9v13x6g==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "@leafer-ui/external": "2.2.7"
+       }
+@@ -4599,6 +4430,7 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/interface/-/interface-2.2.5.tgz",
+       "integrity": "sha512-69kR4XFa1GNChwiShDxLAEwxEbGjFHsqbUJuoPkPGCiC1fEtqzCsGyK87Zt60L8ifideQVT71onBzNgj3T1Lhg==",
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "@leafer/interface": "2.2.5"
+       }
+@@ -4616,7 +4448,8 @@
+       "version": "2.2.5",
+       "resolved": "https://registry.npmjs.org/@leafer/interface/-/interface-2.2.5.tgz",
+       "integrity": "sha512-vgdUO043QATAgutQalh1rVzqDqxsh2YpZ50dv9zOqpx3kZOV69JZfXIrJNRXzo3AkbiogKbNTTzE48HiuZzsrQ==",
+-      "license": "MIT"
++      "license": "MIT",
++      "peer": true
+     },
+     "node_modules/@leafer/canvas": {
+       "version": "2.2.5",
+@@ -5354,6 +5187,7 @@
+       "resolved": "https://registry.npmjs.org/@types/react/-/react-19.2.17.tgz",
+       "integrity": "sha512-MXfmqaVPEVgkBT/aY0aGCkRWWtByiYQXo3xdQ8r5RzuFrPiRn8Gar2tQdXSUQ2GKV3bkXckek89V8wQBY2Q/Aw==",
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "csstype": "^3.2.2"
+       }
+@@ -5436,6 +5270,7 @@
+       "integrity": "sha512-CZ4nMxWwgu1HEEFNkeaCptra9QCtkmKdgf3sWh1rl1trIhmxLilgTV4cwcbQ4wemnT4sWQN8CaKOmdYx+g2gMA==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "@typescript-eslint/scope-manager": "8.65.0",
+         "@typescript-eslint/types": "8.65.0",
+@@ -5666,6 +5501,38 @@
+         }
+       }
+     },
++    "node_modules/@vitest/coverage-v8": {
++      "version": "4.1.10",
++      "resolved": "https://registry.npmjs.org/@vitest/coverage-v8/-/coverage-v8-4.1.10.tgz",
++      "integrity": "sha512-IM49HmthevbgAO4anp1hwtoT9wYe59w0LR00gr+eagHE+ZJ5lK4sLPeO0ubgoJcwLk6dehU3R24N+FbEEKDc8g==",
++      "dev": true,
++      "license": "MIT",
++      "peer": true,
++      "dependencies": {
++        "@bcoe/v8-coverage": "^1.0.2",
++        "@vitest/utils": "4.1.10",
++        "ast-v8-to-istanbul": "^1.0.0",
++        "istanbul-lib-coverage": "^3.2.2",
++        "istanbul-lib-report": "^3.0.1",
++        "istanbul-reports": "^3.2.0",
++        "magicast": "^0.5.2",
++        "obug": "^2.1.1",
++        "std-env": "^4.0.0-rc.1",
++        "tinyrainbow": "^3.1.0"
++      },
++      "funding": {
++        "url": "https://opencollective.com/vitest"
++      },
++      "peerDependencies": {
++        "@vitest/browser": "4.1.10",
++        "vitest": "4.1.10"
++      },
++      "peerDependenciesMeta": {
++        "@vitest/browser": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/@vitest/expect": {
+       "version": "4.1.10",
+       "resolved": "https://registry.npmjs.org/@vitest/expect/-/expect-4.1.10.tgz",
+@@ -5800,6 +5667,7 @@
+       "integrity": "sha512-xRQbDb9BnwDafYNn6Vwl839DYVjqXYb1XVGtWAZ1kcDc6iwAL4hg3B1dZlRiuENFeO2H53gFG3in621AdERVAg==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "bin": {
+         "acorn": "bin/acorn"
+       },
+@@ -5844,6 +5712,25 @@
+         "node": ">=12"
+       }
+     },
++    "node_modules/ast-v8-to-istanbul": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/ast-v8-to-istanbul/-/ast-v8-to-istanbul-1.0.5.tgz",
++      "integrity": "sha512-UPAgKJFSEGMWSDr3LX4tqnAb4f7KGT8O40Tyx8wbYmmZ/yn58lNCm8h3svs3eXgiGd5AXxz8NDOvXWvicq+rJA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/trace-mapping": "^0.3.31",
++        "estree-walker": "^3.0.3",
++        "js-tokens": "^10.0.0"
++      }
++    },
++    "node_modules/ast-v8-to-istanbul/node_modules/js-tokens": {
++      "version": "10.0.0",
++      "resolved": "https://registry.npmjs.org/js-tokens/-/js-tokens-10.0.0.tgz",
++      "integrity": "sha512-lM/UBzQmfJRo9ABXbPWemivdCW8V2G8FHaHdypQaIy523snUjog0W71ayWXTjiR+ixeMyVHN2XcpnTd/liPg/Q==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/bail": {
+       "version": "2.0.2",
+       "resolved": "https://registry.npmjs.org/bail/-/bail-2.0.2.tgz",
+@@ -5910,6 +5797,7 @@
+         }
+       ],
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "baseline-browser-mapping": "^2.10.42",
+         "caniuse-lite": "^1.0.30001800",
+@@ -6228,6 +6116,7 @@
+       "integrity": "sha512-nuKKvN+oIBO0koN7Tm7dlkmnkc21mtt0QJLwAKzjLq14y6lRTdVG36MZHJ8eQHwdJMwZbQNMlPOYedMq/oVJvQ==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "workspaces": [
+         "packages/*"
+       ],
+@@ -6615,6 +6504,7 @@
+       "integrity": "sha512-XSt8tMzbW9ymE7687xztkO1ckR7qJNQ3LywY9vlYGhGi3zXrGBHuUo2Cl1ztZaICW+1eAGdkLbj6iwVqDT33kg==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "@types/node": ">=20.0.0",
+         "@types/whatwg-mimetype": "^3.0.2",
+@@ -6628,6 +6518,16 @@
+         "node": ">=20.0.0"
+       }
+     },
++    "node_modules/has-flag": {
++      "version": "4.0.0",
++      "resolved": "https://registry.npmjs.org/has-flag/-/has-flag-4.0.0.tgz",
++      "integrity": "sha512-EykJT/Q1KjTWctppgIAgfSO0tKVuZUjhgMr17kqTumMl6Afv3EISleU7qZUzoXDFTAHTDC4NOoG/ZxU3EvlMPQ==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=8"
++      }
++    },
+     "node_modules/hast-util-to-jsx-runtime": {
+       "version": "2.3.6",
+       "resolved": "https://registry.npmjs.org/hast-util-to-jsx-runtime/-/hast-util-to-jsx-runtime-2.3.6.tgz",
+@@ -6690,10 +6590,18 @@
+       "resolved": "https://registry.npmjs.org/hono/-/hono-4.12.32.tgz",
+       "integrity": "sha512-XcuyW9qE2kJn07PkecMOBd5Vq/hMy7mmGw+idz1yblbg9N17ijJODrvPkn7/dwL3Kulj8LcRJ69DLOWf91dRUg==",
+       "license": "MIT",
++      "peer": true,
+       "engines": {
+         "node": ">=16.9.0"
+       }
+     },
++    "node_modules/html-escaper": {
++      "version": "2.0.2",
++      "resolved": "https://registry.npmjs.org/html-escaper/-/html-escaper-2.0.2.tgz",
++      "integrity": "sha512-H2iMtd0I4Mt5eYiapRdIDjp+XzelXQ0tFE4JS7YFwFevXXMmOp9myNrUvCg0D6ws8iqkRPBfKHgbwig1SmlLfg==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/html-parse-stringify": {
+       "version": "4.0.1",
+       "resolved": "https://registry.npmjs.org/html-parse-stringify/-/html-parse-stringify-4.0.1.tgz",
+@@ -6732,6 +6640,7 @@
+         }
+       ],
+       "license": "MIT",
++      "peer": true,
+       "peerDependencies": {
+         "typescript": "^5 || ^6 || ^7"
+       },
+@@ -6870,6 +6779,45 @@
+         "url": "https://github.com/sponsors/dmonad"
+       }
+     },
++    "node_modules/istanbul-lib-coverage": {
++      "version": "3.2.2",
++      "resolved": "https://registry.npmjs.org/istanbul-lib-coverage/-/istanbul-lib-coverage-3.2.2.tgz",
++      "integrity": "sha512-O8dpsF+r0WV/8MNRKfnmrtCWhuKjxrq2w+jpzBL5UZKTi2LeVWnWOmWRxFlesJONmc+wLAGvKQZEOanko0LFTg==",
++      "dev": true,
++      "license": "BSD-3-Clause",
++      "engines": {
++        "node": ">=8"
++      }
++    },
++    "node_modules/istanbul-lib-report": {
++      "version": "3.0.1",
++      "resolved": "https://registry.npmjs.org/istanbul-lib-report/-/istanbul-lib-report-3.0.1.tgz",
++      "integrity": "sha512-GCfE1mtsHGOELCU8e/Z7YWzpmybrx/+dSTfLrvY8qRmaY6zXTKWn6WQIjaAFw069icm6GVMNkgu0NzI4iPZUNw==",
++      "dev": true,
++      "license": "BSD-3-Clause",
++      "dependencies": {
++        "istanbul-lib-coverage": "^3.0.0",
++        "make-dir": "^4.0.0",
++        "supports-color": "^7.1.0"
++      },
++      "engines": {
++        "node": ">=10"
++      }
++    },
++    "node_modules/istanbul-reports": {
++      "version": "3.2.0",
++      "resolved": "https://registry.npmjs.org/istanbul-reports/-/istanbul-reports-3.2.0.tgz",
++      "integrity": "sha512-HGYWWS/ehqTV3xN10i23tkPkpH46MLCIMFNCaaKNavAXTF1RkqxawEPtnjnGZ6XKSInBKkiOA5BKS+aZiY3AvA==",
++      "dev": true,
++      "license": "BSD-3-Clause",
++      "dependencies": {
++        "html-escaper": "^2.0.0",
++        "istanbul-lib-report": "^3.0.0"
++      },
++      "engines": {
++        "node": ">=8"
++      }
++    },
+     "node_modules/js-binary-schema-parser": {
+       "version": "2.0.3",
+       "resolved": "https://registry.npmjs.org/js-binary-schema-parser/-/js-binary-schema-parser-2.0.3.tgz",
+@@ -7110,6 +7058,7 @@
+       "resolved": "https://registry.npmjs.org/@leafer-ui/interface/-/interface-2.2.5.tgz",
+       "integrity": "sha512-69kR4XFa1GNChwiShDxLAEwxEbGjFHsqbUJuoPkPGCiC1fEtqzCsGyK87Zt60L8ifideQVT71onBzNgj3T1Lhg==",
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "@leafer/interface": "2.2.5"
+       }
+@@ -7127,7 +7076,8 @@
+       "version": "2.2.5",
+       "resolved": "https://registry.npmjs.org/@leafer/interface/-/interface-2.2.5.tgz",
+       "integrity": "sha512-vgdUO043QATAgutQalh1rVzqDqxsh2YpZ50dv9zOqpx3kZOV69JZfXIrJNRXzo3AkbiogKbNTTzE48HiuZzsrQ==",
+-      "license": "MIT"
++      "license": "MIT",
++      "peer": true
+     },
+     "node_modules/levn": {
+       "version": "0.4.1",
+@@ -7481,6 +7431,47 @@
+         "@jridgewell/sourcemap-codec": "^1.5.5"
+       }
+     },
++    "node_modules/magicast": {
++      "version": "0.5.4",
++      "resolved": "https://registry.npmjs.org/magicast/-/magicast-0.5.4.tgz",
++      "integrity": "sha512-llBEhWm1SacoRwgHUoQJYtwp4PBLF4faQi5TCpIGyGs9n4y5+juI0tDgyKIfpqxckRHaHzouUEph3THklWh03w==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@babel/parser": "^7.29.7",
++        "@babel/types": "^7.29.7",
++        "source-map-js": "^1.2.1"
++      }
++    },
++    "node_modules/make-dir": {
++      "version": "4.0.0",
++      "resolved": "https://registry.npmjs.org/make-dir/-/make-dir-4.0.0.tgz",
++      "integrity": "sha512-hXdUTZYIVOt1Ex//jAQi+wTZZpUpwBj/0QsOzqegb3rGMMeJiSEu5xLHnYfBrRV4RH2+OCSOO95Is/7x1WJ4bw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "semver": "^7.5.3"
++      },
++      "engines": {
++        "node": ">=10"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/sindresorhus"
++      }
++    },
++    "node_modules/make-dir/node_modules/semver": {
++      "version": "7.8.5",
++      "resolved": "https://registry.npmjs.org/semver/-/semver-7.8.5.tgz",
++      "integrity": "sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==",
++      "dev": true,
++      "license": "ISC",
++      "bin": {
++        "semver": "bin/semver.js"
++      },
++      "engines": {
++        "node": ">=10"
++      }
++    },
+     "node_modules/markdown-table": {
+       "version": "3.0.4",
+       "resolved": "https://registry.npmjs.org/markdown-table/-/markdown-table-3.0.4.tgz",
+@@ -8527,6 +8518,7 @@
+       "resolved": "https://registry.npmjs.org/pg/-/pg-8.22.0.tgz",
+       "integrity": "sha512-8wih1vVIBMxoUM2oB4soJsD9tDnDpLv4OXBJ+EJzFsvycD+lfyIreC2gGHq78f8jbLLt+bvlPTFdFZfJkOuzAA==",
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "pg-connection-string": "^2.14.0",
+         "pg-pool": "^3.14.0",
+@@ -8624,6 +8616,7 @@
+       "integrity": "sha512-RvwwcruNjI1ncT5xRakeyS9Lf8lcItv34KD+aif+VH9kduAyfYBipGh12274xtenIPZ119/R9BdTBa8gAwSh0A==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "engines": {
+         "node": ">=12"
+       },
+@@ -8815,6 +8808,7 @@
+       "resolved": "https://registry.npmjs.org/react/-/react-19.2.8.tgz",
+       "integrity": "sha512-PWaYA1L/q9u2u7xYQi+Y3L3Yfnie7XyLeaJICV1MGD6LprsBxcAqGjYyr0eY3p+QdsA+x/Irkt4Qif8D63+Sbw==",
+       "license": "MIT",
++      "peer": true,
+       "engines": {
+         "node": ">=0.10.0"
+       }
+@@ -9167,6 +9161,19 @@
+         "inline-style-parser": "0.2.7"
+       }
+     },
++    "node_modules/supports-color": {
++      "version": "7.2.0",
++      "resolved": "https://registry.npmjs.org/supports-color/-/supports-color-7.2.0.tgz",
++      "integrity": "sha512-qpCAvRl9stuOHveKsn7HncJRvv501qIacKzQlO/+Lwxc9+0q2wLyv4Dfvt80/DPn2pqOBsJdDiogXGR9+OvwRw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "has-flag": "^4.0.0"
++      },
++      "engines": {
++        "node": ">=8"
++      }
++    },
+     "node_modules/tiny-lru": {
+       "version": "11.4.7",
+       "resolved": "https://registry.npmjs.org/tiny-lru/-/tiny-lru-11.4.7.tgz",
+@@ -9313,6 +9320,7 @@
+       "integrity": "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==",
+       "devOptional": true,
+       "license": "Apache-2.0",
++      "peer": true,
+       "bin": {
+         "tsc": "bin/tsc",
+         "tsserver": "bin/tsserver"
+@@ -9523,6 +9531,7 @@
+       "integrity": "sha512-7ULLwsCdYx/nRyrpiEwvqb5TFHrMVZyBt+rg/OAXT7rgj/z+DtTDyKFeLAdDkubDVDKD8jOsndmy7m55XcfUsw==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "lightningcss": "^1.32.0",
+         "picomatch": "^4.0.5",
+@@ -9616,6 +9625,7 @@
+       "integrity": "sha512-R9jUTe5S4Qb0HCd4TNqpC7oGcrMssMRGXLW80ubjWsW9VH5GF8y1Y0SFLY9AbqSk6nt0PnOx4H4WNJYZ13GUPw==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "dependencies": {
+         "@vitest/expect": "4.1.10",
+         "@vitest/mocker": "4.1.10",
+@@ -9828,6 +9838,7 @@
+       "integrity": "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==",
+       "dev": true,
+       "license": "MIT",
++      "peer": true,
+       "funding": {
+         "url": "https://github.com/sponsors/colinhacks"
+       }
+diff --git a/package.json b/package.json
+index 8a58ea18..88bb0111 100644
+--- a/package.json
++++ b/package.json
+@@ -28,7 +28,7 @@
+     "start:server": "tsx server/index.ts",
+     "contract:diff": "node scripts/contract-diff.mjs",
+     "codemap": "node scripts/codemap.mjs",
+-    "preflight": "npm run check:i18n && tsc -b && npm run lint && npm run verify:logging && node scripts/ci/structure-guard.mjs && npm run test:unit && npm run test:shell",
++    "preflight": "npm run check:i18n && tsc -b && npm run lint && npm run verify:logging && node scripts/ci/structure-guard.mjs && node scripts/ci/check-internal-literals.mjs && npm run test:unit && npm run test:shell",
+     "prepare": "git rev-parse --git-dir >/dev/null 2>&1 && git config core.hooksPath .githooks || true",
+     "check:i18n": "node scripts/check-i18n.mjs"
+   },
+@@ -59,6 +59,7 @@
+     "@types/react": "^19.2.14",
+     "@types/react-dom": "^19.2.3",
+     "@vitejs/plugin-react": "^6.0.4",
++    "@vitest/coverage-v8": "^4.1.10",
+     "eslint": "^10.8.0",
+     "eslint-plugin-react-hooks": "^7.1.1",
+     "eslint-plugin-react-refresh": "^0.5.2",
+diff --git a/scripts/ci/check-internal-literals.mjs b/scripts/ci/check-internal-literals.mjs
+new file mode 100644
+index 00000000..05c4c4fc
+--- /dev/null
++++ b/scripts/ci/check-internal-literals.mjs
+@@ -0,0 +1,181 @@
++#!/usr/bin/env node
++// check-internal-literals.mjs — 内网基础设施字面量守卫(守卫家族;借鉴 cindy 主仓
++// check-endpoint-literals 的「单一来源门禁」设计,配置按本仓语境重写)。
++//
++// 为什么存在(2026-08-01 门禁收尾):AGENTS.md 部署规则明文要求「部署机信息不得
++// 硬编码进 scripts/ 脚本本体(脚本的 MIVO_DEPLOY_HOST/MIVO_DEPLOY_USER 必须保持
++// 无默认值)」,但该规则此前**零机器执行** —— 实证:scripts/loops/bug-doctor/gate.mjs
++// 曾把 `user@10.102.x.x` 硬编码为 env fallback(本守卫落地当轮修掉),AGENTS.md
++// 靠人肉根本钉不住。本守卫把规则变成 CI 阻断项。
++//
++// 威胁模型(2026-08-01 gpt-5.6-sol 审查后写明,不许超卖):本守卫防的是**明文、
++// 连续字面量**的顺手硬编码 —— 即 gate.mjs 那类真实翻车形态。它不防刻意混淆
++// (字符串拼接 `'10.' + '102...'`、escape 编码、运行时拼装):任何词法守卫都防不住
++// 刻意绕过,那属于恶意行为,归 code review / 安全审计管,不在本守卫承诺内。
++//
++// 扫描范围(2026-08-01 审查返修:白名单目录制 → 全仓排除制):git tracked 全部
++// 文件,减去显式排除(见 EXCLUDES,每条带理由)与二进制(NUL 探测)。此前只扫
++// 5 个目录 + 固定扩展名,vite.config.ts / shared/ / tracked plist / Dockerfile
++// 这些真实可写入内网地址的位置全在盲区 —— 排除制下新增文件默认**在**守卫视野内。
++//
++// 规则(两层,精度优先 —— 大量测试 fixture 用 10.0.0.x 教学值,不能一刀切):
++//   1. 硬禁(零豁免,测试与 allowlist 一律不放行):部署网段前缀 `10.102.` ——
++//      这是真实生产网段,任何形态(完整 IP / 子网写法)都不允许出现在扫描范围内。
++//   2. RFC1918 完整 IPv4 字面量(10/8、172.16/12、192.168/16)默认违规,两类豁免:
++//      a. 测试代码(basename 含 .test./.spec.,或位于 __tests__/、scripts/e2e/):
++//         SSRF 防护、e2e reset 等测试必须用私网 IP 当反例 fixture,天然合法;
++//      b. FILE_ALLOWLIST 显式列出的文件(带理由,见下)。
++//   loopback(127.x)/0.0.0.0 等不属于内网基础设施信息,不在规则内。
++//
++// 权威通道说明:本守卫在 CI(干净 checkout,required check)上的运行是权威判定;
++// 本地 preflight 运行是开发便利,扫的是工作区现状 —— 「提交坏内容再清工作区」
++// 骗得过本地,骗不过 CI。任何文件读取失败一律 fail-closed(exit 2),不静默跳过。
++//
++// 退出码:0=干净;1=有违规(逐条 file:line + 修法);2=运行错误(git 不可用/文件读取失败)。
++import { execFileSync } from 'node:child_process'
++import { readFileSync, realpathSync } from 'node:fs'
++import { resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++// ── 规则定义 ──────────────────────────────────────────────────────────────
++// 硬禁:生产部署网段前缀。用前缀而非完整 IP,连 `10.102.x` 这种子网提及也拦。
++// 左边界 (?<![\d.]):版本串 `1.10.102.3` 的中段不误报(与 RFC1918 层同语义)。
++export const HARD_BAN = { name: 'deploy-subnet-10.102.*', re: /(?<![\d.])10\.102\./ }
++
++// RFC1918 完整 IPv4。octet 收紧 0-255,两侧都锁边界:
++//   左 (?<![\d.]) 防 `1.10.0.0.1` 前挂,右 (?![\d.]) 防五段串 `10.0.0.1.2` 与
++//   超范围 `10.999.999.999`(999 不是合法 octet,整串不该命中)。
++const OCTET = '(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)'
++export const RFC1918 = [
++  { name: 'rfc1918-10/8', re: new RegExp(`(?<![\\d.])10\\.${OCTET}\\.${OCTET}\\.${OCTET}(?![\\d.])`) },
++  { name: 'rfc1918-172.16/12', re: new RegExp(`(?<![\\d.])172\\.(1[6-9]|2\\d|3[01])\\.${OCTET}\\.${OCTET}(?![\\d.])`) },
++  { name: 'rfc1918-192.168/16', re: new RegExp(`(?<![\\d.])192\\.168\\.${OCTET}\\.${OCTET}(?![\\d.])`) },
++]
++
++// 测试代码豁免(仅对 RFC1918 层;硬禁层无豁免)。
++// .test./.spec. 只认 **basename**(2026-08-01 返修:此前匹配整条路径,目录名含
++// `.test.` 的生产文件 `server/foo.test.data/config.ts` 会被误豁免);
++// 目录级豁免仅 __tests__/ 与 scripts/e2e/ 两个既定测试根。
++export const isTestPath = (path) =>
++  /(?:^|\/)[^/]*\.(?:test|spec)\.[^/]+$/.test(path)
++  || /(?:^|\/)__tests__\//.test(path)
++  || /^scripts\/e2e\//.test(path)
++
++// 显式豁免文件 → 理由(仅 RFC1918 层)。新增条目必须写清「为什么这个文件需要
++// 私网 IP 字面量」,review 时按理由审。
++export const FILE_ALLOWLIST = new Map([
++  [
++    'server/lib/proxyImageSecurity.ts',
++    'SSRF 防护实现本体:私网段判定逻辑与文档注释(10.0.0.0/8 等)是它的业务内容',
++  ],
++  [
++    'ops/postgres/docker-compose.yml',
++    '固定 ipam 选段(192.168.228.0/24)与避段依据注释:本地容器网段规划,非部署主机信息',
++  ],
++  [
++    'ops/postgres/docker-compose.e2e.yml',
++    '同上:e2e 独立 ipam 选段(192.168.229.0/24),本地容器网段规划,非部署主机信息',
++  ],
++])
++
++// 全仓排除(每条带理由;排除制的纪律是「排得少而明确」,新增排除必须过 review):
++export const EXCLUDES = [
++  { re: /^docs\//, reason: '文档区按其定位记录内网拓扑,归另一治理问题,AGENTS.md 规则边界本来就是代码本体' },
++  { re: /^AGENTS\.md$/, reason: 'AGENTS.md 自身是部署地址的唯一许可记载处(其部署规则原文如此约定)' },
++  { re: /\.(png|jpe?g|gif|webp|ico|woff2?|ttf|otf|eot|pdf|zip|jar|mp[34]|mov|cindy)$/i, reason: '二进制资产(另有 NUL 探测兜底)' },
++]
++
++// 守卫自身与其测试是唯一的整体豁免(含硬禁层):规则定义、注释示例、测试 fixture
++// 必然包含被禁字面量本身(同 .gitleaks.toml 不扫自己)。除这两个文件外硬禁零豁免。
++const SELF_FILES = new Set([
++  'scripts/ci/check-internal-literals.mjs',
++  'scripts/ci/check-internal-literals.test.mjs',
++])
++
++// ── 纯函数:单文件内容检查(vitest 单测覆盖) ────────────────────────────────
++export const checkContent = (path, content) => {
++  const violations = []
++  const exempt = isTestPath(path) || FILE_ALLOWLIST.has(path)
++  const lines = content.split('\n')
++  for (let i = 0; i < lines.length; i += 1) {
++    const line = lines[i]
++    if (HARD_BAN.re.test(line)) {
++      violations.push({ path, line: i + 1, rule: HARD_BAN.name, text: line.trim(), hard: true })
++      continue // 同一行命中硬禁即够,不再叠报 RFC1918
++    }
++    if (exempt) continue
++    for (const r of RFC1918) {
++      if (r.re.test(line)) {
++        violations.push({ path, line: i + 1, rule: r.name, text: line.trim(), hard: false })
++        break
++      }
++    }
++  }
++  return violations
++}
++
++// 二进制探测:前 8KB 含 NUL 即视为二进制跳过(git 同款启发式)。
++const looksBinary = (buf) => buf.subarray(0, 8192).includes(0)
++
++// ── CLI 主流程 ────────────────────────────────────────────────────────────
++const main = () => {
++  let files
++  try {
++    files = execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
++      .split('\0')
++      .filter((f) => f && !SELF_FILES.has(f) && !EXCLUDES.some((e) => e.re.test(f)))
++  } catch (e) {
++    console.error(`[internal-literals] git ls-files 失败:${e.message}`)
++    process.exit(2)
++  }
++
++  const all = []
++  let scanned = 0
++  for (const f of files) {
++    let buf
++    try {
++      buf = readFileSync(f)
++    } catch (e) {
++      // fail-closed(2026-08-01 返修):读不到就下不了结论,静默跳过等于给「index 有
++      // 坏内容、工作区被清掉」这类形态留 fail-open 通道。CI 干净 checkout 上读失败
++      // 本身就是异常,必须可见。
++      console.error(`[internal-literals] 读取失败即 fail-closed:${f}:${e.message}`)
++      process.exit(2)
++    }
++    if (looksBinary(buf)) continue
++    scanned += 1
++    all.push(...checkContent(f, buf.toString('utf8')))
++  }
++
++  if (all.length === 0) {
++    console.log(`[internal-literals] OK:${scanned} 个文本文件无内网基础设施字面量(tracked ${files.length},二进制跳过 ${files.length - scanned})`)
++    process.exit(0)
++  }
++
++  console.error(`[internal-literals] 发现 ${all.length} 处内网字面量违规:\n`)
++  for (const v of all) {
++    console.error(`  ${v.path}:${v.line} [${v.rule}${v.hard ? ',硬禁' : ''}] ${v.text}`)
++  }
++  console.error(`
++修法(按 AGENTS.md 部署规则):
++  - 部署主机/内网地址改从环境变量或本地不入库配置读取,代码里不留默认值;
++  - 测试需要私网 IP 当 fixture → 放测试文件(*.test.*/*.spec.* basename、__tests__/、scripts/e2e/)即可豁免;
++  - 非测试文件确有正当理由(如 SSRF 判定实现)→ 在本脚本 FILE_ALLOWLIST 加条目并写明理由;
++  - \`10.102.*\` 为生产部署网段,零豁免:任何文件(含测试/allowlist)都不允许出现。`)
++  process.exit(1)
++}
++
++// 仅作为 CLI 入口时执行(被 vitest import 时不跑)。
++// realpath + 绝对路径全等比较(2026-08-01 返修):此前用 basename endsWith,同名
++// importer 会误触发 main,Windows 反斜杠路径下则永不触发(preflight 静默空转)。
++const isCliEntry = () => {
++  if (!process.argv[1]) return false
++  try {
++    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1]))
++  } catch {
++    return false
++  }
++}
++if (isCliEntry()) {
++  main()
++}
+diff --git a/scripts/ci/check-internal-literals.test.mjs b/scripts/ci/check-internal-literals.test.mjs
+new file mode 100644
+index 00000000..7197c3bf
+--- /dev/null
++++ b/scripts/ci/check-internal-literals.test.mjs
+@@ -0,0 +1,96 @@
++// check-internal-literals 守卫单测(vitest,随 test:unit / required gate 跑)。
++// 覆盖:硬禁零豁免语义与两侧边界、RFC1918 三段与 octet 范围、测试路径豁免
++// (basename 语义)、allowlist 豁免、版本号/五段串/loopback 不误报、排除清单形状。
++// fixture 里的内网 IP 是被测样本,本测试文件在守卫扫描中属 SELF_FILES 整体豁免。
++import { describe, expect, it } from 'vitest'
++import { EXCLUDES, FILE_ALLOWLIST, checkContent, isTestPath } from './check-internal-literals.mjs'
++
++describe('check-internal-literals', () => {
++  it('硬禁:部署网段前缀在任何文件都违规(含测试路径与 allowlist 文件)', () => {
++    for (const path of [
++      'server/lib/foo.ts',
++      'server/lib/foo.test.ts', // 测试豁免不覆盖硬禁
++      'server/lib/proxyImageSecurity.ts', // allowlist 豁免不覆盖硬禁
++      'scripts/loops/bug-doctor/com.mivo.bug-doctor.patrol.plist', // 非代码扩展也在视野内
++      'Dockerfile', // 无扩展名文件也在视野内
++    ]) {
++      const v = checkContent(path, "const HOST = 'user@10.102.80.15'")
++      expect(v, path).toHaveLength(1)
++      expect(v[0].hard).toBe(true)
++    }
++    // 子网写法(非完整 IP)也拦
++    expect(checkContent('scripts/a.mjs', '// 服务器在 10.102.x 段')).toHaveLength(1)
++  })
++
++  it('硬禁边界:版本串中段不误报,独立 token 命中', () => {
++    expect(checkContent('src/a.ts', "const v = '1.10.102.3'")).toHaveLength(0) // dotted 前缀挂载
++    expect(checkContent('src/a.ts', "const v = 'v10.102.3'")).toHaveLength(1) // 字母前缀仍是独立 dotted token
++  })
++
++  it('RFC1918:非测试代码里的 10/8、172.16/12、192.168/16 完整 IP 违规', () => {
++    const samples = ['10.0.0.5', '172.16.1.1', '172.31.255.255', '192.168.1.100']
++    for (const ip of samples) {
++      const v = checkContent('server/lib/foo.ts', `fetch('http://${ip}/x')`)
++      expect(v, ip).toHaveLength(1)
++      expect(v[0].hard).toBe(false)
++    }
++  })
++
++  it('RFC1918 边界:超范围 octet、五段串、dotted 前后挂载不误报', () => {
++    for (const line of [
++      "const bad = '10.999.999.999'", // 999 非法 octet
++      "const five = '10.0.0.1.2'", // 五段串
++      "const pre = '1.10.0.0.1'", // 前挂
++      'version "3.192.168.1.4"', // 版本串
++    ]) {
++      expect(checkContent('server/lib/foo.ts', line), line).toHaveLength(0)
++    }
++    // 合法边界值仍命中
++    expect(checkContent('server/lib/foo.ts', "x('10.255.255.255')")).toHaveLength(1)
++  })
++
++  it('测试路径豁免只认 basename 与既定测试根,目录名含 .test. 不豁免', () => {
++    const line = "resolveIps = async () => ['10.0.0.5']"
++    expect(checkContent('server/__tests__/foo.ts', line)).toHaveLength(0)
++    expect(checkContent('server/lib/foo.test.ts', line)).toHaveLength(0)
++    expect(checkContent('server/lib/foo.spec.tsx', line)).toHaveLength(0)
++    expect(checkContent('scripts/e2e/mock.mjs', line)).toHaveLength(0)
++    // 反例:目录名含 .test. 的生产文件不豁免
++    expect(checkContent('server/foo.test.data/config.ts', line)).toHaveLength(1)
++    expect(isTestPath('server/foo.test.data/config.ts')).toBe(false)
++  })
++
++  it('allowlist 文件豁免 RFC1918', () => {
++    const line = 'subnet: "192.168.228.0/24"'
++    for (const f of FILE_ALLOWLIST.keys()) {
++      expect(checkContent(f, line), f).toHaveLength(0)
++    }
++  })
++
++  it('不误报:loopback、公网 IP、172 非私网段', () => {
++    for (const line of [
++      "const local = 'http://127.0.0.1:41595'",
++      "const dns = '8.8.8.8'",
++      "const notPrivate = '172.15.0.1'", // 172.16/12 之外
++      "const notPrivate2 = '172.32.0.1'",
++    ]) {
++      expect(checkContent('server/lib/foo.ts', line), line).toHaveLength(0)
++    }
++  })
++
++  it('多行内容逐行定位 line 号,一行只报一条', () => {
++    const content = ["const a = 'ok'", "const b = '192.168.0.1 and 10.0.0.1'", "const c = '10.1.2.3'"].join('\n')
++    const v = checkContent('server/lib/foo.ts', content)
++    expect(v.map((x) => x.line)).toEqual([2, 3])
++  })
++
++  it('排除清单:docs/ 与 AGENTS.md 被排除,shared/ 与仓根配置不被排除', () => {
++    const excluded = (p) => EXCLUDES.some((e) => e.re.test(p))
++    expect(excluded('docs/runbook/t1.1-pg-provisioning.md')).toBe(true)
++    expect(excluded('AGENTS.md')).toBe(true)
++    expect(excluded('shared/persist-contract.ts')).toBe(false)
++    expect(excluded('vite.config.ts')).toBe(false)
++    expect(excluded('scripts/loops/bug-doctor/com.mivo.bug-doctor.patrol.plist')).toBe(false)
++    expect(excluded('Dockerfile')).toBe(false)
++  })
++})
+diff --git a/scripts/loops/bug-doctor/gate.mjs b/scripts/loops/bug-doctor/gate.mjs
+index 738c0339..ea8b6ca9 100644
+--- a/scripts/loops/bug-doctor/gate.mjs
++++ b/scripts/loops/bug-doctor/gate.mjs
+@@ -44,7 +44,25 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
+ const REPO_ROOT = resolve(__dirname, '..', '..', '..')
+ const RULES_PATH = join(__dirname, 'rules.json')
+ 
+-const SSH_HOST = process.env.MIVO_BUG_DOCTOR_SSH_HOST || 'zhuzan@10.102.80.15'
++// 部署主机绝不硬编码(AGENTS.md 部署规则,check-internal-literals 守卫 CI 阻断):
++// 解析顺序 env → state-dir 本地文件 ssh-host(history/loops/ 不入 git) → 缺失时
++// fetchProductionRecords fail-fast(走 gate 既有失败路径:连败 ≥3 轻巡报"loop 失明")。
++// macmini 执行副本的配置:patrol plist EnvironmentVariables + state-dir/ssh-host 双写。
++// 值必须是 user@host / hostname 语法(2026-08-01 审查返修):ssh-host 文件被误写/
++// 污染成 `-oProxyCommand=...` 这类 leading-dash 值时,OpenSSH 会把它当选项解析,
++// 最坏触发本地命令执行;多行/控制符值则以难诊断方式失败并累计连败。白名单校验 +
++// 调用处 `--` 终止选项区,双保险。
++const SSH_HOST_RE = /^(?:[A-Za-z0-9](?:[A-Za-z0-9._-]{0,63})@)?[A-Za-z0-9](?:[A-Za-z0-9._-]{0,253})$/
++const resolveSshHost = (stateDir) => {
++  const fromEnv = process.env.MIVO_BUG_DOCTOR_SSH_HOST
++  const raw = (fromEnv && fromEnv.trim())
++    || (existsSync(join(stateDir, 'ssh-host')) ? readFileSync(join(stateDir, 'ssh-host'), 'utf8').trim() : '')
++  if (!raw) return null
++  if (!SSH_HOST_RE.test(raw)) {
++    throw new Error(`SSH 主机值非法(须为 user@host 或 hostname,不接受选项形态/空白/多行):${JSON.stringify(raw.slice(0, 80))}`)
++  }
++  return raw
++}
+ const SSH_LOG_GLOB = process.env.MIVO_BUG_DOCTOR_LOG_GLOB || '/AIGC_Group/mivo-canvas/data/debug-logs/*.jsonl'
+ const NIGHTLY_WORKFLOW = process.env.MIVO_BUG_DOCTOR_NIGHTLY_WORKFLOW || 'nightly-e2e'
+ const RETENTION_DAYS = 7
+@@ -108,10 +126,18 @@ const matchesAny = (res, text) => res.some((re) => re.test(text))
+ // ---- 信号源① 生产 debug log ----
+ 
+ // 生产只读铁律:仅 cat,glob 由服务端 shell 展开;本进程对远端不执行任何写命令。
+-const fetchProductionRecords = () => {
++const fetchProductionRecords = (stateDir) => {
++  const sshHost = resolveSshHost(stateDir)
++  if (!sshHost) {
++    throw new Error(
++      '未配置生产日志 SSH 主机:设 MIVO_BUG_DOCTOR_SSH_HOST 环境变量,或写 <state-dir>/ssh-host 文件'
++      + '(部署主机不入代码,见 AGENTS.md 部署规则与 scripts/ci/check-internal-literals.mjs)',
++    )
++  }
+   const command = `cat ${SSH_LOG_GLOB}`
+-  log(`SSH 只读拉数: ssh ${SSH_HOST} '${command}'`)
+-  const raw = execFileSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', SSH_HOST, command], {
++  log(`SSH 只读拉数: ssh ${sshHost} '${command}'`)
++  // `--` 终止选项区:即使校验被绕过,destination 也不可能被当作 ssh 选项。
++  const raw = execFileSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '--', sshHost, command], {
+     encoding: 'utf8',
+     stdio: ['ignore', 'pipe', 'pipe'],
+     maxBuffer: 64 * 1024 * 1024,
+@@ -400,7 +426,7 @@ const main = () => {
+     state = loadState(stateDir, FINGERPRINT_VERSION)
+ 
+     // -- 信号源① debug log(--input 为离线/测试通道,跳过 SSH)--
+-    const allRecords = args.input ? parseJsonlRecords(readFileSync(args.input, 'utf8')) : fetchProductionRecords()
++    const allRecords = args.input ? parseJsonlRecords(readFileSync(args.input, 'utf8')) : fetchProductionRecords(stateDir)
+ 
+     // 增量识别:记录 id 去重为主(gap-check 扩窗/游标重置天然免疫重复计数),游标为辅
+     const silentFailureRes = compilePatterns(rules.sLevels.s0.silentFailureMessagePatterns)
+diff --git a/scripts/loops/bug-doctor/gate.test.mjs b/scripts/loops/bug-doctor/gate.test.mjs
+index 095a50dd..572f1948 100644
+--- a/scripts/loops/bug-doctor/gate.test.mjs
++++ b/scripts/loops/bug-doctor/gate.test.mjs
+@@ -1,5 +1,5 @@
+ import { execFileSync } from 'node:child_process'
+-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
++import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import { dirname, join } from 'node:path'
+ import { fileURLToPath } from 'node:url'
+@@ -162,3 +162,71 @@ describe('gate 端到端(fixture 驱动,零网络)', () => {
+     expect(JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).consecutiveGateFailures).toBe(0)
+   })
+ })
++
++// ── 生产 SSH 主机解析与参数拼装(离线;Greptile #370 P2:此前该路径被 --input 全绕过)──
++// 真 ssh 用 PATH 假脚本顶替:把 argv 逐行写进 SSH_ARGS_OUT 后输出空(0 条记录),
++// 全程零网络。覆盖:env→文件优先级、值白名单校验 fail-fast、`--` 终止选项区。
++describe('生产 SSH 主机解析(PATH 假 ssh,零网络)', () => {
++  const runGateSsh = ({ env = {}, fakeSsh = false, expectFail = false } = {}) => {
++    const bin = join(dir, 'fake-bin')
++    const argsOut = join(dir, 'ssh-args.txt')
++    const finalEnv = { ...process.env, MIVO_BUG_DOCTOR_STATE_DIR: '', ...env }
++    delete finalEnv.MIVO_BUG_DOCTOR_SSH_HOST
++    if (env.MIVO_BUG_DOCTOR_SSH_HOST !== undefined) finalEnv.MIVO_BUG_DOCTOR_SSH_HOST = env.MIVO_BUG_DOCTOR_SSH_HOST
++    if (fakeSsh) {
++      mkdirSync(bin, { recursive: true })
++      writeFileSync(join(bin, 'ssh'), '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$SSH_ARGS_OUT"\nexit 0\n', { mode: 0o755 })
++      finalEnv.PATH = `${bin}:${finalEnv.PATH}`
++      finalEnv.SSH_ARGS_OUT = argsOut
++    }
++    try {
++      const stdout = execFileSync(process.execPath, [GATE, '--no-gh', '--state-dir', dir], {
++        encoding: 'utf8',
++        stdio: ['ignore', 'pipe', 'pipe'],
++        env: finalEnv,
++      })
++      return { code: 0, summary: JSON.parse(stdout.trim().split('\n').at(-1)), argsOut }
++    } catch (err) {
++      if (!expectFail) throw err
++      return { code: err.status, stderr: String(err.stderr || ''), argsOut }
++    }
++  }
++
++  it('未配置主机 → fail-fast,报错指明两条配置通道', () => {
++    const r = runGateSsh({ expectFail: true })
++    expect(r.code).toBe(1)
++    expect(r.stderr).toContain('未配置生产日志 SSH 主机')
++  })
++
++  it('选项形态/多行等非法值被白名单校验拒绝,不会到达 ssh', () => {
++    for (const bad of ['-oProxyCommand=touch /tmp/pwned', '-F/tmp/ssh-config', 'host\nsecond-line', 'user@@host']) {
++      const r = runGateSsh({ env: { MIVO_BUG_DOCTOR_SSH_HOST: bad }, expectFail: true })
++      expect(r.code, JSON.stringify(bad)).toBe(1)
++      expect(r.stderr, JSON.stringify(bad)).toContain('SSH 主机值非法')
++    }
++    // 纯空白 = 未设置(trim 后空),走"未配置"分支而不是"非法"
++    const blank = runGateSsh({ env: { MIVO_BUG_DOCTOR_SSH_HOST: ' ' }, expectFail: true })
++    expect(blank.code).toBe(1)
++    expect(blank.stderr).toContain('未配置生产日志 SSH 主机')
++  })
++
++  it('state-dir/ssh-host 文件通道生效,argv 含 BatchMode 且 `--` 紧邻 destination 之前', () => {
++    writeFileSync(join(dir, 'ssh-host'), 'mivo-e2e@example-host.internal\n')
++    const r = runGateSsh({ fakeSsh: true })
++    expect(r.code).toBe(0)
++    const args = readFileSync(r.argsOut, 'utf8').trim().split('\n')
++    expect(args).toContain('BatchMode=yes')
++    const dashIdx = args.indexOf('--')
++    expect(dashIdx).toBeGreaterThan(-1)
++    expect(args[dashIdx + 1]).toBe('mivo-e2e@example-host.internal')
++  })
++
++  it('env 优先于 ssh-host 文件', () => {
++    writeFileSync(join(dir, 'ssh-host'), 'file-user@file-host\n')
++    const r = runGateSsh({ fakeSsh: true, env: { MIVO_BUG_DOCTOR_SSH_HOST: 'env-user@env-host' } })
++    expect(r.code).toBe(0)
++    const args = readFileSync(r.argsOut, 'utf8')
++    expect(args).toContain('env-user@env-host')
++    expect(args).not.toContain('file-host')
++  })
++})
