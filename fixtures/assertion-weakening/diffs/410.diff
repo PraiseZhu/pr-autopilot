@@ -1,0 +1,773 @@
+diff --git a/src/__tests__/depositBrain.test.ts b/src/__tests__/depositBrain.test.ts
+index e6574d3e..f8a2d810 100644
+--- a/src/__tests__/depositBrain.test.ts
++++ b/src/__tests__/depositBrain.test.ts
+@@ -18,7 +18,7 @@ import { readFileSync } from 'node:fs'
+ import { fileURLToPath } from 'node:url'
+ import { describe, expect, it } from 'vitest'
+ import { canonicalSum } from '../../../src/lib/canonicalHash'
+-import { flushMicrotasks, loadBrain } from './brainHarness'
++import { attachPanelBridge, flushMicrotasks, loadBrain } from './brainHarness'
+ import { readGuardBaseFile } from './mergeBaseGuard'
+ import type { LoadBrainOptions, LoadedBrain } from './brainHarness'
+ 
+@@ -485,6 +485,73 @@ describe('deposit 状态 — 候选校验:结构损坏/信封篡改的高代候
+   })
+ })
+ 
++describe('deposit 状态 — 整代退休 K=3(设计稿 §4.4.3.1)', () => {
++  it('每次提交成功后删除 gen ≤ 新gen−K 的旧代全部文件,不分 writer', async () => {
++    const { brain } = depositBrain()
++    const deposit = brain.handles.deposit
++    expect(deposit.retainGenerations).toBe(3)
++
++    for (let index = 0; index < 6; index += 1) {
++      const current = await deposit.stateLoad()
++      // F1:baseSum 原样接上一次 load/save 回执给的 revisionSum(opaque echo)。
++      await deposit.stateSave({
++        baseGeneration: current.generation,
++        baseSum: current.revisionSum,
++        writer: 'aaaaaaaa',
++        state: JSON.stringify({ version: 1, map: {} }),
++      })
++    }
++
++    // 提交到 gen=6 后,只应保留 gen 4/5/6(K=3),更早的 1/2/3 已被整代退休。
++    const remainingGens = Array.from(brain.files.keys())
++      .map((name) => deposit.fileRe.exec(name.replace('deposit/', '')))
++      .filter(Boolean)
++      .map((match) => Number((match as RegExpExecArray)[1]))
++      .sort((a, b) => a - b)
++    expect(remainingGens).toEqual([4, 5, 6])
++  })
++
++  it('退休不影响本次提交结果:退休阶段 list 未知时非阻塞跳过(diagSkip),不影响已成功的提交', async () => {
++    // SC10.1 之后,四层碰撞检测已删除,一次成功提交只经过至多 2 次 list:①CAS 检查
++    // (readDepositState);②写盘成功后的整代退休——退休只在 `generation - K >= 0`
++    // (K=3)时才真的发起 list(否则 cutoff<0 直接 return),所以先跑两次正常提交把
++    // generation 推到 2,第三次提交(gen 2→3)才会真正触发退休的 list 调用,这里只让
++    // *那一次*失败,前面全部照常成功——这样才是真正在测"退休失败不阻塞已经成功的
++    // 提交",不是把提交本身也测挂了。
++    let listCalls = 0
++    let failFromCall = Infinity
++    const { brain } = depositBrain({
++      listReply: (_request, names) => {
++        listCalls += 1
++        return listCalls < failFromCall
++          ? { ok: true, op: 'list', entries: names.map((path) => ({ path, bytes: 1, mtime: 1 })) }
++          : { ok: false }
++      },
++    })
++    // F1:三次提交依次串联,每次的 baseSum 原样接上一次回执的 revisionSum。
++    const save1 = await brain.handles.deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: brain.handles.deposit.emptyRevisionSum,
++      state: JSON.stringify({ version: 1, map: {} }),
++    })
++    const save2 = await brain.handles.deposit.stateSave({
++      baseGeneration: 1,
++      baseSum: save1.revisionSum,
++      state: JSON.stringify({ version: 1, map: {} }),
++    })
++    const callsBeforeThirdSave = listCalls
++    failFromCall = callsBeforeThirdSave + 2 // 第三次提交的 CAS 检查照常成功,第 2 次(退休)开始失败
++
++    const result = await brain.handles.deposit.stateSave({
++      baseGeneration: 2,
++      baseSum: save2.revisionSum,
++      state: JSON.stringify({ version: 1, map: {} }),
++    })
++    expect(result).toMatchObject({ ok: true, generation: 3 })
++    expect(listCalls).toBeGreaterThan(callsBeforeThirdSave + 1) // 确认退休那次 list 确实发生过并失败了,不是没跑到
++  })
++})
++
+ describe('deposit 状态 — generation CAS', () => {
+   const validEnvelope = (gen: number, writer: string, payload: Record<string, unknown>) =>
+     JSON.stringify({ schema: 1, gen, writer, sum: canonicalSum(payload), payload })
+@@ -528,6 +595,228 @@ describe('deposit 状态 — generation CAS', () => {
+   })
+ })
+ 
++describe('deposit 状态 — 十轮定案:单写者架构(SC10.0-SC10.3)', () => {
++  const validEnvelope = (gen: number, writer: string, payload: Record<string, unknown>) =>
++    JSON.stringify({ schema: 1, gen, writer, sum: canonicalSum(payload), payload })
++
++  it('SC10.7①:两个面板"实例"(不同 baseGeneration 认知)先后经同一条 chain 提交 → 后到者 conflict + 重放成功,磁盘扫描后同一代只有一份候选(不会出现两份同代文件)', async () => {
++    const { brain } = depositBrain()
++    const deposit = brain.handles.deposit
++
++    // 面板 A:从空磁盘出发提交。
++    const fromA = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({ version: 1, map: { a: { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit' } } }),
++    })
++    expect(fromA).toMatchObject({ ok: true, generation: 1 })
++
++    // 面板 B:同样从"空磁盘"这份认知出发(它从未见过 A 刚提交的内容)→ 必然 conflict,
++    // 按设计稿 §4.4.3 层 3 重放本实例(B)未提交的变更到 A 之后的基线上重试。
++    const fromB1 = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({ version: 1, map: { b: { hash: 'b'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit' } } }),
++    })
++    expect(fromB1).toMatchObject({ ok: false, conflict: true, generation: 1 })
++    const remoteAfterA = JSON.parse(String(fromB1.state))
++    expect(remoteAfterA.map.a).toBeTruthy() // 冲突回执带回 A 已经落盘的权威内容
++
++    // B 按重放规则,以 A 的内容为基线叠加自己的 b,重新提交。
++    const fromB2 = await deposit.stateSave({
++      baseGeneration: fromB1.generation,
++      baseSum: fromB1.revisionSum,
++      state: JSON.stringify({ version: 1, map: { ...remoteAfterA.map, b: { hash: 'b'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit' } } }),
++    })
++    expect(fromB2).toMatchObject({ ok: true, generation: 2 })
++
++    // 单写者架构下,任意时刻磁盘上每一代最多一份候选——扫描全部文件按 gen 分组,
++    // 断言没有任何一代出现过 ≥2 份文件(不会有"同代双候选"这种残留)。
++    const genGroups = new Map<string, number>()
++    for (const name of brain.files.keys()) {
++      const match = deposit.fileRe.exec(name.replace('deposit/', ''))
++      if (!match) continue
++      genGroups.set(match[1], (genGroups.get(match[1]) ?? 0) + 1)
++    }
++    for (const count of genGroups.values()) expect(count).toBe(1)
++
++    const finalLoaded = await deposit.stateLoad()
++    const finalState = JSON.parse(String(finalLoaded.state))
++    expect(finalState.map.a).toBeTruthy()
++    expect(finalState.map.b).toBeTruthy()
++  })
++
++  it('SC11.1(取代 SC10.7③):载入时人工篡改 deposit/ 目录、放入同代两份有效候选(单写者架构下的不可达态)→ 逐字段合并全部内容,不丢弃任一候选,并 diagFail 留痕', async () => {
++    const { brain } = depositBrain({
++      files: {
++        // 两份都是有效候选(sum 与内容一致),文件名/gen 完全对得上协议——唯一"异常"
++        // 只是同代出现了两份,只可能来自人工篡改或双 App 实例(§4.4.2 已知边界)。
++        'deposit/state-00000004-cccccccccccccccc.json': validEnvelope(4, 'cccccccccccccccc', {
++          version: 1,
++          map: { fromC: { hash: 'c'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit', gen: 4, writer: 'cccccccccccccccc' } },
++        }),
++        'deposit/state-00000004-aaaaaaaaaaaaaaaa.json': validEnvelope(4, 'aaaaaaaaaaaaaaaa', {
++          version: 1,
++          map: { fromA: { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit', gen: 4, writer: 'aaaaaaaaaaaaaaaa' } },
++        }),
++      },
++    })
++
++    // 先跑一次不接诊断桥的 load(与 depositBrain 的 panelPresent:false 一致,
++    // main.js 的诊断事件此时只进有界队列,不会立即推送)。
++    const loaded = await brain.handles.deposit.stateLoad()
++    const state = JSON.parse(String(loaded.state))
++
++    // SC11.1:两份候选各自独占的映射都必须在——不是"谁字典序小就整份采信谁",
++    // 那会让落败候选独占的内容在整代退休之后真的从磁盘上消失(judge-j 反例)。
++    expect(state.map.fromA).toBeTruthy()
++    expect(state.map.fromC).toBeTruthy()
++    expect(loaded.generation).toBe(4)
++
++    // 再接上诊断桥:它一挂上就发 diag-hello,electron 脑把上面那次 load 已经
++    // 排进队列的事件整批回放——用它验证 fail-visible,不能悄悄合并就完事,异常
++    // 本身(同代出现 ≥2 份候选)仍必须留痕。
++    const { spy, stop } = attachPanelBridge(brain)
++    await flushMicrotasks()
++    stop()
++    expect(spy.find('同代多候选').length).toBeGreaterThan(0)
++  })
++
++  it('SC11.1 精确场景(judge-j):旧/新电子脑各自读空盘、写 gen1(不同 writer)→ load 返回两份 map 的并集 → 提交 gen2 吸收全部 → 整代退休后信息零丢失', async () => {
++    const oldBrain = depositBrain()
++    const newBrain = depositBrain()
++
++    // 旧电子脑:读空盘(从未写过任何文件),写下第一代,握有自己独立铸造的 writer。
++    const oldResult = await oldBrain.brain.handles.deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: oldBrain.brain.handles.deposit.emptyRevisionSum,
++      state: JSON.stringify({ version: 1, map: { oldAsset: { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit' } } }),
++    })
++    expect(oldResult).toMatchObject({ ok: true, generation: 1 })
++
++    // 新电子脑:同样从空盘出发(它从未见过旧电子脑刚落盘的内容),独立铸造另一个
++    // writer,同样写下第一代——两者对"磁盘是空的"这份认知完全独立,不是谁等谁。
++    const newResult = await newBrain.brain.handles.deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: newBrain.brain.handles.deposit.emptyRevisionSum,
++      state: JSON.stringify({ version: 1, map: { newAsset: { hash: 'b'.repeat(32), ext: '.png', depositedAt: 2, from: 'deposit' } } }),
++    })
++    expect(newResult).toMatchObject({ ok: true, generation: 1 })
++
++    const oldWriter = oldBrain.brain.handles.deposit.writer
++    const newWriter = newBrain.brain.handles.deposit.writer
++    expect(oldWriter).not.toBe(newWriter) // 两个独立进程各自铸造的写者短码不同(SC10.1 单写者前提)
++
++    // 模拟共享磁盘:真实场景里两个电子脑写的是同一个 deposit/ 目录,这里的假 fs
++    // 各自独立,用一个"读者"电子脑的磁盘视角汇总两份真实落盘的候选文件。
++    const oldFileName = `deposit/state-00000001-${oldWriter}.json`
++    const newFileName = `deposit/state-00000001-${newWriter}.json`
++    const reader = depositBrain({
++      files: {
++        [oldFileName]: String(oldBrain.brain.files.get(oldFileName)),
++        [newFileName]: String(newBrain.brain.files.get(newFileName)),
++      },
++    })
++
++    const loaded = await reader.brain.handles.deposit.stateLoad()
++    expect(loaded.generation).toBe(1)
++    const mergedPayload = JSON.parse(String(loaded.state))
++    expect(mergedPayload.map.oldAsset).toBeTruthy()
++    expect(mergedPayload.map.newAsset).toBeTruthy() // 并集,不是任选一
++
++    // 随后提交 gen2:面板原样回填刚 load 出来的 baseGeneration/baseSum(opaque echo),
++    // 磁盘由此收敛——合并只发生在内存态,真正落盘靠这次提交。
++    const commit = await reader.brain.handles.deposit.stateSave({
++      baseGeneration: loaded.generation,
++      baseSum: loaded.revisionSum,
++      state: loaded.state,
++    })
++    expect(commit).toMatchObject({ ok: true, generation: 2 })
++    const gen2File = JSON.parse(String(reader.brain.files.get(`deposit/state-00000002-${reader.brain.handles.deposit.writer}.json`)))
++    expect(gen2File.payload.map.oldAsset).toBeTruthy()
++    expect(gen2File.payload.map.newAsset).toBeTruthy()
++
++    // 整代退休:K=3,此刻 generation=2,cutoff=2-3=-1<0,尚不到退休窗口,gen1 两份候选都还在。
++    expect(reader.brain.files.get(oldFileName)).toBeTruthy()
++    expect(reader.brain.files.get(newFileName)).toBeTruthy()
++
++    // 再推进三次提交把 generation 推过 K=3 保留窗口,验证 gen1 两份候选被整代退休
++    // 删除,但两条信息已经在 gen2 起的每一代里持续携带,零丢失。
++    let base = { baseGeneration: commit.generation, baseSum: commit.revisionSum }
++    const carried = loaded.state
++    for (let step = 0; step < 3; step += 1) {
++      const result = await reader.brain.handles.deposit.stateSave({ ...base, state: carried })
++      expect(result.ok).toBe(true)
++      base = { baseGeneration: result.generation, baseSum: result.revisionSum }
++    }
++    // generation 现在是 5,退休 cutoff = 5-3 = 2,gen<=2 的旧文件(含 gen1 两份候选)全部删除。
++    expect(reader.brain.files.get(oldFileName)).toBeUndefined()
++    expect(reader.brain.files.get(newFileName)).toBeUndefined()
++
++    const finalLoaded = await reader.brain.handles.deposit.stateLoad()
++    const finalPayload = JSON.parse(String(finalLoaded.state))
++    expect(finalPayload.map.oldAsset).toBeTruthy() // 零丢失:信息已经通过合并 + 连续提交带到最新代
++    expect(finalPayload.map.newAsset).toBeTruthy()
++  })
++
++  it(
++    'SC11.1 合并态 HARD 闸(SC9.3c 恢复):两份"看起来正常"的同代候选合并后超硬上限 → fail-visible 保留全部候选文件、不写新代,诊断措辞与单写者通用超限不同',
++    async () => {
++      // 复刻 judge `concurrentMergeLock` 反例:两个写者各自独立攒了一批 pendingReleases
++      // (每份单独看都不算离谱的大小),main.js 从磁盘同代合并时把两份**并集**在一起——
++      // 合并结果超过硬上限,而这不是"你这次提交太大",是"这条 asset 生态的同代候选
++      // 本身已经无法用常规提交收敛"。判据必须能区分这两种情况,给出不同的诊断措辞。
++      const buildPayload = (offset: number, writer: string) => {
++        const pendingReleases: Record<string, unknown> = {}
++        for (let index = 0; index < 57_000; index += 1) {
++          const hash = (offset + index).toString(16).padStart(32, '0')
++          pendingReleases[hash] = { hash, from: 'deposit', at: 1, gen: 1, writer }
++        }
++        return { version: 1, generation: 1, map: {}, pendingReleases }
++      }
++      const payloadA = buildPayload(0, 'aaaaaaaaaaaaaaaa')
++      const payloadB = buildPayload(1_000_000, 'bbbbbbbbbbbbbbbb')
++      const envelope = (writer: string, payload: Record<string, unknown>) =>
++        JSON.stringify({ schema: 1, gen: 1, writer, sum: canonicalSum(payload), payload })
++
++      const oldFileName = 'deposit/state-00000001-aaaaaaaaaaaaaaaa.json'
++      const newFileName = 'deposit/state-00000001-bbbbbbbbbbbbbbbb.json'
++      const { brain } = depositBrain({
++        files: {
++          [oldFileName]: envelope('aaaaaaaaaaaaaaaa', payloadA),
++          [newFileName]: envelope('bbbbbbbbbbbbbbbb', payloadB),
++        },
++      })
++      const deposit = brain.handles.deposit
++
++      const loaded = await deposit.stateLoad()
++      expect(String(loaded.state).length).toBeGreaterThan(0) // 前提断言:load 本身不受体积影响,总能读出并集(SC11.1)
++
++      const filesBefore = brain.files.size
++      // 原样把刚合并出来的并集重新提交(等价于"什么都没改,只是想让代际往前走一步"
++      // ——判据反例里最刺眼的场景:连"不增长"都推不动)。
++      const save = await deposit.stateSave({
++        baseGeneration: loaded.generation,
++        baseSum: loaded.revisionSum,
++        state: String(loaded.state),
++      })
++
++      expect(save.ok).toBe(false)
++      expect(save.message).toBe('deposit 状态同代并集超上限,需人工介入')
++      expect(save.message).not.toBe('deposit 状态超过单次写入上限') // 必须与单写者通用超限走不同措辞
++      expect(save.conflict).toBeFalsy() // 确认这次拒绝真的是体积判据,不是 CAS 冲突
++
++      // fail-visible(SC11.1 承重条款):全部候选文件原样保留——不删、不择一、不
++      // 静默丢任何一份内容;且这次拒绝真的没有写出任何新代文件。
++      expect(brain.files.get(oldFileName)).toBeTruthy()
++      expect(brain.files.get(newFileName)).toBeTruthy()
++      expect(brain.files.size).toBe(filesBefore) // 一个文件都没多、没少
++      expect(brain.files.get(`deposit/state-00000002-${deposit.writer}.json`)).toBeUndefined()
++    },
++    30_000, // 两份 ~8MB 候选各算一次哈希 + 合并后 ~16MB 的信封再算一次,真实 CPU 耗时。
++  )
++})
++
+ describe('deposit — 三路径日志', () => {
+   it('成功 / 跳过 / 失败各走对应 diag 级别,且只记 hash 前 8 位', async () => {
+     const { brain } = depositBrain()
+@@ -603,3 +892,456 @@ describe('ghost.json — 前段口径(能力项与工具预算)', () => {
+     }
+   })
+ })
++
++// 五轮返修:F1 原始反例 + judge-b 独立扫描的 5 个 P1(A1~A5)。CASE 编号对应
++// judge-b 对抗脚本 /tmp/297-judge-b-adversarial.ts 的 CASE1/4/5/6/7/8/9(CASE2/3
++// 已被现有"generation CAS"/#349 describe 块覆盖,不重复)。
++describe('deposit 状态 — 五轮返修:F1 分裂反例 + judge-b 对抗回归(CASE1/4/5/6/7/8/9)', () => {
++  const validEnvelope = (gen: number, writer: string, payload: Record<string, unknown>) =>
++    JSON.stringify({ schema: 1, gen, writer, sum: canonicalSum(payload), payload })
++
++  it('F1 原反例:分裂侧提交 baseGeneration 数值恰好相等但内容陈旧的整表 → 判 conflict,不接受为线性提交', async () => {
++    // 四审复审的核心场景:磁盘当前 gen=5 由两份候选合并而来——一份带 floor(X 已在
++    // gen=3 释放),另一份带 X 的陈旧 map 主张(gen=2)。真正的合并结果应当否决陈旧
++    // map、保留 floor。分裂侧写者 B 从未读过这份合并结果,只知道自己独立提交链路
++    // 恰好也走到了 baseGeneration=5(纯数值巧合),并原样携带自己記忆里的陈旧 X。
++    const { brain } = depositBrain({
++      files: {
++        'deposit/state-00000005-aaaaaaaa.json': validEnvelope(5, 'aaaaaaaa', {
++          version: 1,
++          map: {},
++          releasedFloor: { X: { generation: 3, at: 1 } },
++        }),
++        'deposit/state-00000005-bbbbbbbb.json': validEnvelope(5, 'bbbbbbbb', {
++          version: 1,
++          map: { X: { hash: 'stale-hash', ext: '.png', depositedAt: 1, from: 'deposit', gen: 2, writer: 'cccccccc' } },
++        }),
++      },
++    })
++
++    // B 从未 load 过合并结果,直接用"baseGeneration 数值恰好等于 5"+自己陈旧的整表
++    // 提交,且不带 baseSum(它压根不知道真正的内容指纹是什么)。
++    const result = await brain.handles.deposit.stateSave({
++      baseGeneration: 5,
++      writer: 'dddddddd',
++      state: JSON.stringify({
++        version: 1,
++        map: { X: { hash: 'stale-hash', ext: '.png', depositedAt: 1, from: 'deposit', gen: 2, writer: 'cccccccc' } },
++      }),
++    })
++
++    // 必须判 conflict,不是 ok:true——generation-only CAS 会在这里错误放行(四审
++    // 反例),revision-CAS 必须堵住。
++    expect(result.ok).toBe(false)
++    expect(result.conflict).toBe(true)
++    // 回执带回的是真正的合并结果:X 的陈旧 map 主张被否决,floor 记录还在(还没
++    // 跨过 K=3 的安全退休窗口:5 < 3+3)。
++    const merged = JSON.parse(String(result.state))
++    expect(merged.map.X).toBeUndefined()
++    expect(merged.releasedFloor.X).toMatchObject({ generation: 3 })
++    // 磁盘没有被 B 这次提交冲掉——两份原候选原样还在,没有新文件出现。
++    expect(brain.files.size).toBe(2)
++  })
++
++  it('A1 续:单候选(非合并路径)自身内部就违反互斥时,同样要被纠正', async () => {
++    const liveHash = 'b'.repeat(32)
++    const { brain } = depositBrain({
++      files: {
++        'deposit/state-00000001-aaaaaaaa.json': validEnvelope(1, 'aaaaaaaa', {
++          version: 1,
++          map: { live: { hash: liveHash, ext: '.png', depositedAt: 1, from: 'deposit', gen: 0, writer: 'aaaaaaaa' } },
++          pendingReleases: { [liveHash]: { hash: liveHash, from: 'deposit', at: 1, gen: 0, writer: 'aaaaaaaa' } },
++        }),
++      },
++    })
++
++    const loaded = await brain.handles.deposit.stateLoad()
++    const merged = JSON.parse(String(loaded.state))
++    expect(merged.map.live.hash).toBe(liveHash)
++    expect(merged.pendingReleases[liveHash]).toBeUndefined()
++  })
++
++  it('A4(judge-b CASE9,SC1a.6):不符合当前协议命名的旧文件被忽略且留痕,不静默', async () => {
++    const { brain } = depositBrain({
++      files: {
++        'deposit/state-a.json': JSON.stringify({
++          version: 1,
++          generation: 5,
++          map: { legacy: { hash: '9'.repeat(32), ext: '.png', depositedAt: 5, from: 'deposit', gen: 5, writer: 'legacy-writer' } },
++          migration: { version: 1, at: 1, migrated: 1 },
++        }),
++      },
++    })
++
++    const loaded = await brain.handles.deposit.stateLoad()
++    // 安全忽略(设计稿证据:deposit/ 生产从未被写入过)——不是兼容读取旧格式,
++    // 结果仍是诚实的缓存空,不是把旧格式硬凑成一份"看起来合法"的状态。
++    expect(loaded.state).toBeNull()
++    expect(loaded.generation).toBe(0)
++    // 但必须留痕:通过附带的诊断回调断言至少发生过一次 diagSkip(如实标注忽略了
++    // 什么),而不是这个文件全程无声无息地消失——这里用 attachPanelBridge 接住
++    // 电子脑的诊断广播来验证。
++    const { spy, stop } = attachPanelBridge(brain)
++    await brain.handles.deposit.stateLoad()
++    stop()
++    expect(spy.find('不符合当前协议命名').length).toBeGreaterThan(0)
++  })
++
++  it('A5(judge-b CASE4):语义不可能的 releasedFloor(声称释放代大于信封自己的 gen)使整份候选无效,不能压制同代真实候选', async () => {
++    const { brain } = depositBrain({
++      files: {
++        'deposit/state-00000002-11111111.json': validEnvelope(2, '11111111', {
++          version: 1,
++          map: { target: { hash: '1'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit', gen: 2, writer: '11111111' } },
++          releasedFloor: { target: { generation: 9_999_999, at: 1 } }, // gen=2 的信封不可能知道第 9999999 代的事
++        }),
++        'deposit/state-00000002-22222222.json': validEnvelope(2, '22222222', {
++          version: 1,
++          map: { peer: { hash: '2'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit', gen: 2, writer: '22222222' } },
++        }),
++      },
++    })
++
++    const loaded = await brain.handles.deposit.stateLoad()
++    const merged = JSON.parse(String(loaded.state))
++    // 伪造 floor 的那份候选整份无效——它的 target/伪造 floor 都不该出现;peer(来自
++    // 另一份合法候选)正常在场。
++    expect(merged.releasedFloor?.target).toBeUndefined()
++    expect(merged.map.peer).toBeTruthy()
++    // target 本该在(它自己那份候选的 map 主张 gen=2 也是合法的,只是信封本身因
++    // 携带伪造 floor 被整体判无效,连累了它自己合法的 map 主张——这是"整份候选
++    // 退出选择"策略预期的代价,不是遗漏)。
++    expect(merged.map.target).toBeUndefined()
++  })
++
++  it('A5(judge-b CASE5):generation 不是安全整数的候选判无效,不会让 +1 递增静默停滞', async () => {
++    const unsafeGen = Number.MAX_SAFE_INTEGER + 1
++    const { brain } = depositBrain({
++      files: {
++        [`deposit/state-${unsafeGen}-33333333.json`]: validEnvelope(unsafeGen, '33333333', { version: 1, map: {} }),
++      },
++    })
++
++    const loaded = await brain.handles.deposit.stateLoad()
++    // 不安全整数的候选被判无效——诚实降级为缓存空,不是采信一个会让 generation
++    // 永久停滞在同一个数值上的候选。
++    expect(loaded.state).toBeNull()
++    expect(loaded.generation).toBe(0)
++  })
++
++  it.each<[string, unknown]>([
++    ['省略字段(undefined)', undefined],
++    ['null', null],
++    ['空串', ''],
++    ['false', false],
++    ['空数组', []],
++    ["字符串'0'", '0'],
++  ])(
++    'SC6.4/SC6.10(judge-b CASE6 + 六轮参数化,baseGeneration=%s):即使 baseSum 正确匹配,generation 因子本身也必须 fail-closed',
++    async (_label, badBaseGeneration) => {
++      // 关键改造(SC6.10 第二部分):旧版 CASE6 测试让 generation 与 revisionSum
++      // 两个 CAS 因子**同时**缺失/非法,即使断言通过也证明不了"专门针对 generation
++      // 这一个因子缺失"这条路径本身被正确处理——可能只是靠 revisionSum 那个因子
++      // 兜底判的 conflict,generation 检查自己是不是 fail-closed 根本没被单独验证到。
++      // 这里让 `baseSum` **正确匹配**磁盘当前内容,只让 `baseGeneration` 一个因子
++      // 非法——单独隔离验证 generation 检查本身(`typeof === 'number' &&
++      // Number.isSafeInteger(...) && >= 0`)确实会把 `null`/`''`/`false`/`[]`/`'0'`
++      // 字符串这些"能被 `Number()` 隐式转换成合法数值"的取值,一律按不匹配处理
++      // (不经过那次会吃掉类型信息的隐式转换,SC6.4)。
++      // SC7.6b(七轮追加,修复假绿):旧版权威磁盘 gen=1,而这六个非法值里除
++      // `undefined`(`Number(undefined)=NaN`)外全部经 `Number(...)` 隐式转换后
++      // 落在 `0`——`0 !== 1` 本身就会触发 CAS 的 generation 数值不等分支判
++      // conflict,跟"类型门有没有真的生效"毫无关系,回退成 `Number(...)` 判据这
++      // 条测试照样全绿,证明不了 SC6.4 的类型门在做事。改成权威磁盘**真空**
++      // (gen=0),baseSum 用真正的空态 revisionSum——这样类型门若被回退成
++      // `Number(badBaseGeneration)`,`null`/`''`/`false`/`[]`/`'0'` 五个值全部
++      // 隐式转换成 `0`,数值上与磁盘真实的 `0` 相等,CAS 会误判"匹配"直接放行
++      // 盲写;只有 `undefined → NaN` 这一格无论类型门在不在都会被 `isSafeInteger`
++      // 挡住,回退后依旧是绿的——五格必红、一格常绿,才是真正隔离验证了 generation
++      // 类型门本身。
++      const { brain } = depositBrain()
++      const deposit = brain.handles.deposit
++
++      const result = await deposit.stateSave({
++        baseGeneration: badBaseGeneration,
++        baseSum: deposit.emptyRevisionSum,
++        writer: '55555555',
++        state: JSON.stringify({
++          version: 1,
++          map: { blind: { hash: '5'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit', gen: 0, writer: '55555555' } },
++        }),
++      })
++
++      expect(result.ok).toBe(false)
++      expect(result.conflict).toBe(true)
++      // 没有新文件被写入——不是"盲写成功"。
++      expect(brain.files.size).toBe(0)
++    },
++  )
++})
++
++// 六轮返修:双审(judge-sc3 + judge-b)合并 SC 清单剩余的 SC6.1/6.2/6.5/6.6/6.8/6.9。
++describe('deposit 状态 — 六轮返修:双审合并 SC 清单回归', () => {
++  const validEnvelope = (gen: number, writer: string, payload: Record<string, unknown>) =>
++    JSON.stringify({ schema: 1, gen, writer, sum: canonicalSum(payload), payload })
++
++  it('SC6.5:容量判据按真实 UTF-8 字节数,不是 UTF-16 code units——中文重复串在 .length 视角"没超限"但真实字节超限', async () => {
++    const { brain } = depositBrain()
++    const deposit = brain.handles.deposit
++    const first = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      writer: 'aaaaaaaa',
++      state: JSON.stringify({ version: 1, map: {} }),
++    })
++    expect(first.ok).toBe(true)
++
++    // 中文字符在 UTF-16 里通常占 1 个 code unit,在 UTF-8 里占 3 字节——构造一份
++    // `.length`(UTF-16 code units)明显小于 15MB、但真实 UTF-8 编码后明显大于
++    // 15MB 的 payload。这个字段与 releasedFloor 无关,应当直接按真实字节数判定
++    // 超限、原样拒写(不是猜删任何字段)。
++    const chinesePad = '中'.repeat(6_000_000)
++    const oversizedUtf8 = JSON.stringify({ version: 1, map: {}, migration: { version: 1, at: 1, migrated: 1, pad: chinesePad } })
++    // 前提断言:UTF-16 `.length` 本身小于上限——如果判据用的是 `.length` 而不是
++    // 真实 UTF-8 字节数,这份 payload 会被误判"没超限"而放行落盘。
++    expect(oversizedUtf8.length).toBeLessThan(deposit.stateMaxBytes)
++    expect(new TextEncoder().encode(oversizedUtf8).length).toBeGreaterThan(deposit.stateMaxBytes)
++
++    const result = await deposit.stateSave({
++      baseGeneration: 1,
++      baseSum: first.revisionSum,
++      writer: 'bbbbbbbb',
++      state: oversizedUtf8,
++    })
++    expect(result.ok).toBe(false)
++    expect(brain.files.get('deposit/state-00000002-bbbbbbbb.json')).toBeUndefined()
++  })
++
++  it('SC6.6 续:候选携带未知(超过 DEPOSIT_KNOWN_VERSION)的 version 时整份候选无效,不压过同代合法候选', async () => {
++    const { brain } = depositBrain({
++      files: {
++        // 未来协议版本,当前这份 main.js 不认识——不能假装认识还硬凑出合并结果。
++        'deposit/state-00000004-aaaaaaaaaaaaaaaa.json': validEnvelope(4, 'aaaaaaaaaaaaaaaa', {
++          version: 999,
++          map: { future: { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit', gen: 4, writer: 'aaaaaaaaaaaaaaaa' } },
++        }),
++        'deposit/state-00000004-bbbbbbbbbbbbbbbb.json': validEnvelope(4, 'bbbbbbbbbbbbbbbb', {
++          version: 1,
++          map: { known: { hash: 'b'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit', gen: 4, writer: 'bbbbbbbbbbbbbbbb' } },
++        }),
++      },
++    })
++    const loaded = await brain.handles.deposit.stateLoad()
++    const merged = JSON.parse(String(loaded.state))
++    expect(merged.map.future).toBeUndefined()
++    expect(merged.map.known).toBeTruthy()
++    expect(merged.version).toBe(1)
++  })
++
++  it('SC6.1(judge /tmp/297-p1a-old-revision.ts 场景的 main.js 侧等价复现):conflict 回执 state:null 是权威空态,不是"不可解析"', async () => {
++    const { brain } = depositBrain()
++    // 磁盘真空:conflict 回执的 state 必然是 null(main.js 对空态如实回 null,不是
++    // 因为解析失败)。
++    const result = await brain.handles.deposit.stateSave({
++      baseGeneration: 5, // 数值不匹配,必然冲突
++      baseSum: 'irrelevant',
++      writer: 'aaaaaaaa',
++      state: JSON.stringify({ version: 1, map: {} }),
++    })
++    expect(result.ok).toBe(false)
++    expect(result.conflict).toBe(true)
++    expect(result.state).toBeNull()
++    expect(result.generation).toBe(0)
++    expect(result.revisionSum).toBe(brain.handles.deposit.emptyRevisionSum)
++  })
++
++  it('SC6.2:releasedTombstones/pendingReleases 条目的 gen 也必须是非负安全整数(不止 map/releasedFloor)', async () => {
++    const poisonedTombstone = {
++      version: 1,
++      map: {},
++      releasedTombstones: {
++        poisoned: { hash: '1'.repeat(32), at: 1, gen: 1.5, writer: 'aaaaaaaaaaaaaaaa' },
++      },
++    }
++    const poisonedPending = {
++      version: 1,
++      map: {},
++      pendingReleases: {
++        [`${'2'.repeat(32)}`]: { hash: '2'.repeat(32), from: 'deposit', at: 1, gen: -1, writer: 'bbbbbbbbbbbbbbbb' },
++      },
++    }
++    const { brain: brainA } = depositBrain({
++      files: { 'deposit/state-00000002-aaaaaaaaaaaaaaaa.json': validEnvelope(2, 'aaaaaaaaaaaaaaaa', poisonedTombstone) },
++    })
++    const loadedA = await brainA.handles.deposit.stateLoad()
++    expect(loadedA.state).toBeNull() // 唯一候选因语义违规整份判无效 → 诚实降级为缓存空
++
++    const { brain: brainB } = depositBrain({
++      files: { 'deposit/state-00000002-bbbbbbbbbbbbbbbb.json': validEnvelope(2, 'bbbbbbbbbbbbbbbb', poisonedPending) },
++    })
++    const loadedB = await brainB.handles.deposit.stateLoad()
++    expect(loadedB.state).toBeNull()
++  })
++})
++
++// 七轮返修:双审(judge-a2 主审 + judge-c 交叉)共识的 4 条与 floor/sidecar 体积方案
++// 无关的项(SC7.1/SC7.4)。SC7.6a/SC7.6b 是测试假绿修复,改在原测试所在位置就地
++// 修——见 depositStore.test.ts 的 SC7.6a 与本文件 SC6.4/SC6.10 参数化测试的 SC7.6b 改造。
++describe('deposit 状态 — 七轮返修:双审共识 SC7.1/7.4', () => {
++  const validEnvelope = (gen: number, writer: string, payload: Record<string, unknown>) =>
++    JSON.stringify({ schema: 1, gen, writer, sum: canonicalSum(payload), payload })
++
++  it.each<[string, Record<string, unknown>]>([
++    [
++      'map.gen 是数字字符串',
++      {
++        version: 1,
++        map: { x: { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit', gen: '1', writer: 'aaaaaaaaaaaaaaaa' } },
++      },
++    ],
++    [
++      'releasedTombstones.gen 是 false',
++      { version: 1, map: {}, releasedTombstones: { x: { hash: 'a'.repeat(32), at: 1, gen: false, writer: 'aaaaaaaaaaaaaaaa' } } },
++    ],
++    ['releasedFloor.generation 是 null', { version: 1, map: {}, releasedFloor: { x: { generation: null, at: 1 } } }],
++    [
++      'pendingReleases.gen 是空数组',
++      {
++        version: 1,
++        map: {},
++        pendingReleases: { ['b'.repeat(32)]: { hash: 'b'.repeat(32), from: 'deposit', at: 1, gen: [], writer: 'aaaaaaaaaaaaaaaa' } },
++      },
++    ],
++  ])(
++    'SC7.1(judge /tmp/297-p1a-r6-gen-type-adversarial.ts 场景,%s):四类字段的 gen 若不是 number 类型,即使 Number(...) 隐式转换后数值自洽,整份候选也必须无效',
++    async (_label, payload) => {
++      // 旧门先 `Number(entry[field])` 再判 `isSafeInteger`——字符串'1'/false/null/
++      // 空数组四类值都会先被隐式转换成合法数值(1/0/0/0)才判,类型信息在转换那一步
++      // 就已经被吃掉,这四类"字节自洽但类型不是 number"的伪造值会被放过,凭空造出
++      // 的 checksum 自洽候选被当合法权威采信、赢过真实同代候选(judge 反例)。修复
++      // 后必须先判 `typeof === 'number'`,类型不对整份候选无效,诚实降级为缓存空。
++      const { brain } = depositBrain({
++        files: { 'deposit/state-00000002-aaaaaaaaaaaaaaaa.json': validEnvelope(2, 'aaaaaaaaaaaaaaaa', payload) },
++      })
++      const loaded = await brain.handles.deposit.stateLoad()
++      expect(loaded.state).toBeNull()
++      expect(loaded.generation).toBe(0)
++    },
++  )
++
++  it.each<[string, unknown]>([
++    ['null', null],
++    ["字符串'0'", '0'],
++    ['false', false],
++  ])(
++    'SC11.4①(拆回单候选半边,version=%s):候选校验必须先判原始类型再判安全整数,单候选路径整份无效',
++    async (_label, badVersion) => {
++      // 旧门先 `Number(payload.version)` 再判 isSafeInteger——null/false/字符串'0'
++      // 都会被隐式转换成合法的数值 0,让整份候选被判"有效",但 payload.version 这个
++      // 字段本身从未被改写,单候选加载路径(原样 spread payload)会把这个非 number
++      // 原始值透传出去,与面板侧 `depositStore.ts` 的 `readFiniteNumber` 契约(只认
++      // 真正的 number)不一致。修复后:单候选路径必须把整份候选判无效(state:null)。
++      const payload = { version: badVersion, map: { a: { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit' } } }
++      const { brain } = depositBrain({
++        files: {
++          'deposit/state-00000004-aaaaaaaaaaaaaaaa.json': validEnvelope(4, 'aaaaaaaaaaaaaaaa', payload),
++        },
++      })
++      const loaded = await brain.handles.deposit.stateLoad()
++      expect(loaded.state).toBeNull() // 单候选:整份无效,不是"透传原始非 number 值"
++      expect(loaded.generation).toBe(0)
++    },
++  )
++
++  it('SC11.4②(拆回单候选半边):version:0 的单候选,load 之后仍原样为 0,不被任何默认值悄悄推高', async () => {
++    const payload = { version: 0, map: { a: { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit' } } }
++    const { brain } = depositBrain({
++      files: { 'deposit/state-00000004-aaaaaaaaaaaaaaaa.json': validEnvelope(4, 'aaaaaaaaaaaaaaaa', payload) },
++    })
++    const loaded = await brain.handles.deposit.stateLoad()
++    expect(JSON.parse(String(loaded.state)).version).toBe(0)
++  })
++})
++
++// 八轮返修必测清单⑧⑩(main.js 侧;①-⑦⑩(面板端)见 depositStore.test.ts;⑨全仓
++// grep 核对,不是可自动化的 vitest 断言,报告里单独给证据)。
++describe('deposit 状态 — 八轮返修:源头硬闸(方向A,main.js 侧)', () => {
++  it(
++    '⑧最终 envelope(含 schema/gen/writer/sum 包装,不是裸 payload)字节数在硬上限 / 硬上限+1 的边界行为',
++    async () => {
++      const { brain } = depositBrain()
++      const deposit = brain.handles.deposit
++      const writer = deposit.writer // SC10.1:单写者架构下,进程生命周期唯一常量。
++      const first = await deposit.stateSave({
++        baseGeneration: 0,
++        baseSum: deposit.emptyRevisionSum,
++        state: JSON.stringify({ version: 1, map: {} }),
++      })
++      expect(first.ok).toBe(true)
++
++      // envelope = {schema,gen,writer,sum,payload}——sum 恒为 32 位十六进制(固定
++      // 长度,不随内容变化),schema/gen/writer 也是固定长度,所以 envelope 字节数
++      // 相对 payload 里 pad 长度是**严格线性**关系:pad 每加 1 个 ASCII 字符,
++      // envelope 恰好多 1 字节。不需要二分搜索(那样要在 15MB 量级上重复现算完整性
++      // 哈希,CPU 耗时会指数级不划算)——直接量出 pad=0 时的 envelope 字节数,反推
++      // 出恰好落在硬上限的 pad 长度即可。
++      const buildPayloadWithPad = (padLen: number) =>
++        JSON.stringify({ version: 1, map: {}, migration: { version: 1, at: 1, migrated: 1, pad: 'x'.repeat(Math.max(0, padLen)) } })
++
++      const envelopeBytesFor = (payloadText: string, generation: number): number => {
++        const payload = JSON.parse(payloadText) as Record<string, unknown>
++        payload.generation = generation
++        const sum = canonicalSum(payload)
++        return new TextEncoder().encode(JSON.stringify({ schema: 1, gen: generation, writer, sum, payload })).length
++      }
++
++      const emptyEnvelopeBytes = envelopeBytesFor(buildPayloadWithPad(0), 2)
++      const padAtHard = deposit.stateMaxBytes - emptyEnvelopeBytes
++      expect(padAtHard).toBeGreaterThan(0)
++
++      const atHard = buildPayloadWithPad(padAtHard)
++      expect(envelopeBytesFor(atHard, 2)).toBe(deposit.stateMaxBytes) // 前提断言:精确落在硬上限上
++      const resultAtHard = await deposit.stateSave({ baseGeneration: 1, baseSum: first.revisionSum, state: atHard })
++      expect(resultAtHard.ok).toBe(true)
++      const atHardGeneration = resultAtHard.generation
++      if (atHardGeneration === undefined) throw new Error('unreachable: ok:true 必有 generation')
++
++      // SC9.1(九轮修正——测试假绿):`overHard` 这次提交必须以 `resultAtHard` 之后的
++      // 真实磁盘基线(gen=2)为 CAS 基线——继续沿用上一步的 `baseGeneration:1` 会让
++      // 这次提交先撞上一次跟体积无关的 CAS 冲突而 `ok:false`,体积判据本身从未被
++      // 真正跑到,测试会在产品有 bug 时依然误报绿(踩过一次的假绿:main.js 曾经
++      // 只判裸 payload 不判信封,超上限的信封照样被接受写入磁盘,这个测试当时因为
++      // CAS 基线过期而没能揭穿它)。
++      const overHard = buildPayloadWithPad(padAtHard + 1)
++      expect(envelopeBytesFor(overHard, atHardGeneration + 1)).toBe(deposit.stateMaxBytes + 1) // 前提断言
++      const resultOverHard = await deposit.stateSave({
++        baseGeneration: atHardGeneration,
++        baseSum: resultAtHard.revisionSum,
++        state: overHard,
++      })
++      expect(resultOverHard.ok).toBe(false)
++      expect(resultOverHard.conflict).toBeFalsy() // 确认这次拒绝真的是体积判据,不是 CAS 冲突
++      expect(brain.files.get(`deposit/state-00000003-${writer}.json`)).toBeUndefined()
++    },
++    30_000, // 硬上限量级(15MB)的完整性哈希两次(atHard/overHard),真实 CPU 耗时。
++  )
++
++  it('⑩save 成功回执的 revisionSum 必须等于紧接着 stateLoad 的 revisionSum——删除 sidecar 后,同一份内容只有一处哈希来源,不再有 core/overflow 合并导致的不一致', async () => {
++    const { brain } = depositBrain()
++    const deposit = brain.handles.deposit
++
++    const saveResult = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { a: { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'deposit', gen: 1, writer: 'aaaaaaaa' } },
++        releasedFloor: { x: { generation: 1, at: 1 } },
++      }),
++    })
++    expect(saveResult.ok).toBe(true)
++
++    const loadResult = await deposit.stateLoad()
++    expect(loadResult.revisionSum).toBe(saveResult.revisionSum)
++  })
++})

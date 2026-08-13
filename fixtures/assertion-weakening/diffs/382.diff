@@ -1,0 +1,22 @@
+diff --git a/scripts/e2e/scenarios/mask-point.mjs b/scripts/e2e/scenarios/mask-point.mjs
+index 2a14cf3d..79851e3d 100644
+--- a/scripts/e2e/scenarios/mask-point.mjs
++++ b/scripts/e2e/scenarios/mask-point.mjs
+@@ -100,6 +100,17 @@ const clearMaskDraft = async (page, nodeId, isProdTopology) => {
+ }
+ 
+ export const runMaskPointScenario = async (context) => {
++  // ── 显式 SKIP(2026-08-01,非静默,重写债挂 Issue)────────────────────────────
++  // #369(批次D region-edit)把本场景测的交互整条下线:老「局部重绘 armed 按钮」
++  // (空画布可点出 warning、armed 后点图下针)废除,工具坞按钮改为无选中图片即
++  // disabled、点击直接开 region-edit。#369 的 e2e 迁移(d19d743/6142a86)覆盖了
++  // mask/mask-reflow/mask-multi-edit 与本场景的 prompt 选择器,但 P2/P3 armed
++  // 契约段漏迁 → nightly 必红(先 #367 i18n 改名暴露,#380 修完暴露本层)。
++  // 按 region-edit 新契约重写需要产品语义拍板(四工具/点选是否保留),归 #369
++  // 作者 —— 重写完成后删除本 SKIP 块整段恢复执行。追踪 Issue:#381。
++  console.log('[e2e-smoke] SKIP scenario=mask-point reason=region-edit(#369) 废除 armed 交互,场景待按新契约重写(Issue #381)')
++  return
++
+   const { page, canvasStoreSpec, generatedImageB64, rendererMode, isProdTopology } = context
+   const leaferMode = rendererMode === 'leafer'
+   const spec = await canvasStoreSpec()

@@ -1,0 +1,4002 @@
+{
+  "generated": "2026-08-13T12:53:37.288Z",
+  "source": "/Users/praise/AI-Agent/Claude/projects/Project MivoCanvas/_tmp/debug/pr-taxonomy/detail",
+  "total_entries": 250,
+  "positives": [
+    {
+      "number": 341,
+      "title": "fix(chat): popover 关闭后的焦点归属分路径处理",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/e2e/scenarios/chat-copy.mjs",
+        "src/app/chat/ChatComposer.tsx",
+        "src/app/chat/ModelSelectorPopover.tsx",
+        "src/app/chat/RatioPopover.tsx"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 344,
+      "title": "feat(canvas): 下线右下角缩放控制条,缩放/复位/fit 全部走快捷键",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/src/cindy-theme.css",
+        "cindyplugin/src/i18n/dict.ts",
+        "cindyplugin/src/i18n/translator.ts",
+        "docs/product-notes.md",
+        "history/brief/overview.md",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "scripts/e2e/scenarios/chat-generation.mjs",
+        "scripts/e2e/scenarios/zoom-tool.mjs",
+        "src/App.css",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/canvasInteraction.ts",
+        "src/canvas/useViewport.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 345,
+      "title": "feat(cindyplugin): 面板关闭写入用有界取证第三态取代补偿删除+墓碑链(#297 修正版①)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/skills/mivo-canvas-board/SKILL.md",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/deferBrainDeath.test.ts",
+        "cindyplugin/src/__tests__/deferEnqueueConcurrency.adversarial.test.ts",
+        "cindyplugin/src/__tests__/deferQueue.test.ts",
+        "cindyplugin/src/__tests__/deferReceiptEvidence.adversarial.test.ts",
+        "cindyplugin/src/__tests__/deferTransportReplay.test.ts",
+        "scripts/verify-debug-logging.mjs",
+        "src/agent/pendingCanvasWrite.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 346,
+      "title": "feat(canvas): 绘制功能改版(FigJam 对齐)+ Section 优化与全站弹窗/图标统一",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/src/i18n/dict.ts",
+        "public/changelog.json",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "scripts/e2e/scenarios/markup-text-overlay.mjs",
+        "shared/persist-contract.ts",
+        "src/App.css",
+        "src/app/dialog/ModalDialog.tsx",
+        "src/app/sidebar/ConfirmDialog.tsx",
+        "src/canvas/BrushOptionsBar.tsx",
+        "src/canvas/CanvasNodeView.tsx",
+        "src/canvas/CanvasPromptDialog.tsx",
+        "src/canvas/CanvasTextEditor.tsx",
+        "src/canvas/CanvasToolDock.tsx",
+        "src/canvas/DrawOptionsBar.tsx",
+        "src/canvas/MarkupCreationPreview.tsx",
+        "src/canvas/MarkupNodeView.tsx",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/NodeActionMenu.tsx",
+        "src/canvas/SelectionQuickToolbar.tsx",
+        "src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts",
+        "src/canvas/actions/canvasActionModel.characterization.test.ts",
+        "src/canvas/actions/canvasActionModel.ts",
+        "src/canvas/actions/canvasActionTypes.ts",
+        "src/canvas/actions/canvasCommand.ts",
+        "src/canvas/actions/markupStyleActions.dispatch.test.ts",
+        "src/canvas/actions/markupStyleActions.ts",
+        "src/canvas/actions/markupStylePresets.ts",
+        "src/canvas/arrowHeadIcons.ts",
+        "src/canvas/canvasInteraction.ts",
+        "src/canvas/canvasRenderAdapter.ts",
+        "src/canvas/canvasToolRegistry.ts",
+        "src/canvas/color/colorSwatchPalette.ts",
+        "src/canvas/drawToolIcons.tsx",
+        "src/canvas/interactionDispatch.ts",
+        "src/canvas/lineWidthIcons.ts",
+        "src/canvas/markupTextGeometry.ts",
+        "src/canvas/useTextAnnotation.ts",
+        "src/kernel/mapping.ts",
+        "src/kernel/records.ts",
+        "src/lib/snapshotValidation.ts",
+        "src/model/arrowHeadGeometry.ts",
+        "src/model/documentModelV2.ts",
+        "src/model/lineRouteGeometry.ts",
+        "src/model/markupShapeGeometry.ts",
+        "src/render/hitTest.ts",
+        "src/render/leaferLinePaint.test.ts",
+        "src/render/leaferLinePaint.ts",
+        "src/render/leaferPaintSignature.ts",
+        "src/render/leaferShapePaint.ts",
+        "src/render/leaferSpikeFilter.ts",
+        "src/render/projection.ts",
+        "src/store/canvasDocumentModel.ts",
+        "src/store/canvasGenerationHydration.ts",
+        "src/store/canvasPersistConfig.ts",
+        "src/store/canvasStateTypes.ts",
+        "src/store/canvasStore.contract.test.ts",
+        "src/store/nodeCreationSlice.ts",
+        "src/store/selectionSlice.ts",
+        "src/types/mivoCanvas.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 349,
+      "title": "fix(#297): 合并列车残余风险修复(5 项)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/arrangeWiring.test.ts",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/cardActionConcurrency.test.ts",
+        "cindyplugin/src/__tests__/depositBrain.test.ts",
+        "cindyplugin/src/__tests__/exportTool.test.ts",
+        "cindyplugin/src/__tests__/toolBudget.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 350,
+      "title": "feat(canvas): 多选工具条瘦身+智能 Tidy+同类多选改样式;Duplicate 退场;剪贴板体验重做(错位/鼠标落点/新鲜度仲裁)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/src/cindy-theme.css",
+        "cindyplugin/src/i18n/dict.ts",
+        "docs/figjam-quickbar-study.md",
+        "public/changelog.json",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "src/App.css",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/NodeActionMenu.tsx",
+        "src/canvas/SelectionQuickToolbar.tsx",
+        "src/canvas/TextFormatToolbar.tsx",
+        "src/canvas/actions/canvasActionEmitters.ts",
+        "src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts",
+        "src/canvas/actions/canvasActionModel.characterization.test.ts",
+        "src/canvas/actions/canvasActionModel.ts",
+        "src/canvas/actions/canvasActionTypes.ts",
+        "src/canvas/actions/canvasCommand.serialize.test.ts",
+        "src/canvas/actions/canvasCommand.ts",
+        "src/canvas/actions/canvasCommandExecutor.test.ts",
+        "src/canvas/actions/canvasCommandExecutor.ts",
+        "src/canvas/actions/canvasCommandExecutorTestFactories.ts",
+        "src/canvas/actions/canvasSyncRuntime.ts",
+        "src/canvas/actions/markupStyleActions.dispatch.test.ts",
+        "src/canvas/actions/markupStyleActions.test.ts",
+        "src/canvas/actions/markupStyleActions.ts",
+        "src/canvas/actions/multiSelectionActions.test.ts",
+        "src/canvas/actions/multiSelectionActions.ts",
+        "src/canvas/actions/useCanvasActionRuntime.ts",
+        "src/canvas/useCanvasInteractionController.ts",
+        "src/canvas/useGlobalCanvasEvents.contract.test.ts",
+        "src/canvas/useGlobalCanvasEvents.ts",
+        "src/store/canvasDocumentModel.test.ts",
+        "src/store/canvasDocumentModel.ts",
+        "src/store/canvasStateTypes.ts",
+        "src/store/nodeCopyOffset.test.ts",
+        "src/store/nodeCreationSlice.ts",
+        "src/store/nodeFactory.ts",
+        "src/store/selectionSlice.ts",
+        "src/store/updateSelectedMarkupStyle.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 351,
+      "title": "fix(#284): demo seed 画布节点级同步 guard(拦 enqueueCanvasSyncChanges 必然终态拒绝)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "src/canvas/actions/canvasSyncRuntime.block3.test.ts",
+        "src/canvas/actions/canvasSyncRuntime.test.ts",
+        "src/canvas/actions/canvasSyncRuntime.ts",
+        "src/canvas/actions/canvasSyncRuntime.updatenode.test.ts",
+        "src/store/demoScenes.test.ts",
+        "src/store/demoScenes.ts",
+        "src/store/documentSlice.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 354,
+      "title": "fix(e2e): migration dev 拓扑 FX-6 ns-marker 竞态致 chatStore 读空 hydrate (Mivo loop P2·T2)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/e2e/harness.mjs",
+        "scripts/e2e/scenarios/migration.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 365,
+      "title": "fix(types): Node Buffer → Web BlobPart 边界包 Uint8Array,解 @types/node 26 的 TS2322(#361 前置)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "server/routes/assets.test.ts",
+        "server/routes/assetsAttachDetach.test.ts",
+        "server/routes/assetsAuthzMatrix.test.ts",
+        "server/routes/tasks.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 366,
+      "title": "feat(#297 P1a): deposit 状态协议追平——单写者写路径 + 读侧同代吸收 + 容量闸 + 墓碑/待释放队列",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/cardTransport.test.ts",
+        "cindyplugin/src/__tests__/depositBrain.test.ts",
+        "cindyplugin/src/__tests__/depositStore.test.ts",
+        "cindyplugin/src/agent/depositMigration.ts",
+        "cindyplugin/src/agent/depositPort.ts",
+        "cindyplugin/src/agent/depositStore.ts",
+        "cindyplugin/src/persist/bridge.ts",
+        "docs/plan/cindy-deposit-media-design.md",
+        "src/lib/canonicalHash.test.ts",
+        "src/lib/canonicalHash.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 367,
+      "title": "feat(i18n): 主站与插件统一多语言地基(Wave 1)——菜单/工具条四语可用",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        ".github/workflows/ci.yml",
+        "CLAUDE.md",
+        "cindyplugin/src/i18n/translator.ts",
+        "cindyplugin/src/plugin-main.tsx",
+        "docs/baseline-inventory.md",
+        "docs/context-menu-standard.md",
+        "docs/mivo-system-inventory.md",
+        "docs/product-notes.md",
+        "docs/quickbar-study.md",
+        "package-lock.json",
+        "package.json",
+        "scripts/check-i18n.mjs",
+        "src/canvas/BrushOptionsBar.tsx",
+        "src/canvas/CanvasToolDock.tsx",
+        "src/canvas/DrawOptionsBar.tsx",
+        "src/canvas/NodeActionMenu.tsx",
+        "src/canvas/SelectionQuickToolbar.tsx",
+        "src/canvas/StampOptionsBar.tsx",
+        "src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts",
+        "src/canvas/actions/canvasActionModel.ts",
+        "src/canvas/actions/imageActionGroups.ts",
+        "src/canvas/actions/importActionGroups.ts",
+        "src/canvas/actions/markupStyleActions.ts",
+        "src/canvas/actions/markupStylePresets.ts",
+        "src/canvas/actions/multiSelectionActions.ts",
+        "src/canvas/actions/objectNames.ts",
+        "src/canvas/canvasToolRegistry.ts",
+        "src/canvas/color/ColorSwatchPicker.tsx",
+        "src/canvas/color/CustomColorPicker.tsx",
+        "src/canvas/stampDefs.ts",
+        "src/i18n/__tests__/i18nCompleteness.test.ts",
+        "src/i18n/index.ts",
+        "src/i18n/locale.ts",
+        "src/i18n/locales/en/index.ts",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/en/tools.json",
+        "src/i18n/locales/ja/index.ts",
+        "src/i18n/locales/ja/menu.json",
+        "src/i18n/locales/ja/tools.json",
+        "src/i18n/locales/ko/index.ts",
+        "src/i18n/locales/ko/menu.json",
+        "src/i18n/locales/ko/tools.json",
+        "src/i18n/locales/zh-CN/index.ts",
+        "src/i18n/locales/zh-CN/menu.json",
+        "src/i18n/locales/zh-CN/tools.json",
+        "src/main.tsx",
+        "src/model/brushGeometry.ts",
+        "tsconfig.app.json"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 368,
+      "title": "fix(#297 P1c): 降级文案能力口径改写 + 翻译作用域收窄到降级提示",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/depositFlagOff.test.ts",
+        "cindyplugin/src/agent/cindyGenerationPort.ts",
+        "cindyplugin/src/i18n/dict.ts",
+        "cindyplugin/src/i18n/translator.test.ts",
+        "cindyplugin/src/i18n/translator.ts",
+        "package-lock.json",
+        "package.json",
+        "public/changelog.json",
+        "src/canvas/AnchorOverlay.tsx"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 369,
+      "title": "feat(canvas): 局部重绘全面重做——Lumina 式圈哪改哪 + 插件 Mivo 直连(0.9.0)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        ".gitleaks.toml",
+        "cindyplugin/build.sh",
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/settings.html",
+        "cindyplugin/settings.js",
+        "cindyplugin/src/__tests__/brainDiagnostics.test.ts",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/cardActionHarness.ts",
+        "cindyplugin/src/__tests__/depositBrain.test.ts",
+        "cindyplugin/src/__tests__/mivoChannel.test.ts",
+        "cindyplugin/src/__tests__/pluginEntryInit.test.ts",
+        "cindyplugin/src/__tests__/portEditRatio.test.ts",
+        "cindyplugin/src/agent/cindyGenerationPort.ts",
+        "cindyplugin/src/cindy-theme.css",
+        "cindyplugin/src/plugin-main.tsx",
+        "docs/design-previews/region-edit/adjudications/web.panel-dark.json",
+        "docs/design-previews/region-edit/adjudications/web.panel-light.json",
+        "docs/design-previews/region-edit/assets/component.bundle.js",
+        "docs/design-previews/region-edit/assets/component.css",
+        "docs/design-previews/region-edit/assets/courage-1-GVKJTP5M.jpg",
+        "docs/design-previews/region-edit/assets/mivo-logo.svg",
+        "docs/design-previews/region-edit/assets/product.css",
+        "docs/design-previews/region-edit/baselines/web/panel-dark.png",
+        "docs/design-previews/region-edit/baselines/web/panel-light.png",
+        "docs/design-previews/region-edit/build.mjs",
+        "docs/design-previews/region-edit/capture-sandbox.mjs",
+        "docs/design-previews/region-edit/capture-theme-fixture.mjs",
+        "docs/design-previews/region-edit/component-build-core.mjs",
+        "docs/design-previews/region-edit/component.inputs.json",
+        "docs/design-previews/region-edit/extract-helpers.mjs",
+        "docs/design-previews/region-edit/extract.mjs",
+        "docs/design-previews/region-edit/fixtures/cindy-theme-tokens.json",
+        "docs/design-previews/region-edit/gate-keyboard.mjs",
+        "docs/design-previews/region-edit/index.html",
+        "docs/design-previews/region-edit/pixel-artifacts/web.panel-dark.baseline.png",
+        "docs/design-previews/region-edit/pixel-artifacts/web.panel-dark.demo.png",
+        "docs/design-previews/region-edit/pixel-artifacts/web.panel-dark.diff.png",
+        "docs/design-previews/region-edit/pixel-artifacts/web.panel-light.baseline.png",
+        "docs/design-previews/region-edit/pixel-artifacts/web.panel-light.demo.png",
+        "docs/design-previews/region-edit/pixel-artifacts/web.panel-light.diff.png",
+        "docs/design-previews/region-edit/product-css.mjs",
+        "docs/design-previews/region-edit/repo-glob.mjs",
+        "docs/design-previews/region-edit/report-pixel.json",
+        "docs/design-previews/region-edit/report.json",
+        "docs/design-previews/region-edit/shims/README.md",
+        "docs/design-previews/region-edit/shims/_template.ts",
+        "docs/design-previews/region-edit/shims/debugLogStore.ts",
+        "docs/design-previews/region-edit/spec.json",
+        "docs/design-previews/region-edit/src/bootstrap.tsx",
+        "docs/design-previews/region-edit/truth.json",
+        "scripts/e2e/scenarios/mask-blackblock.mjs",
+        "scripts/e2e/scenarios/mask-concurrent.mjs",
+        "scripts/e2e/scenarios/mask-cross-scene.mjs",
+        "scripts/e2e/scenarios/mask-hydration.mjs",
+        "scripts/e2e/scenarios/mask-multi-edit.mjs",
+        "scripts/e2e/scenarios/mask-point.mjs",
+        "scripts/e2e/scenarios/mask-reflow.mjs",
+        "scripts/e2e/scenarios/mask-source-delete.mjs",
+        "scripts/e2e/scenarios/mask-timeout-retry.mjs",
+        "scripts/e2e/scenarios/mask.mjs",
+        "src/App.css",
+        "src/canvas/CanvasToolDock.tsx",
+        "src/canvas/MaskCropOverlayHost.tsx",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/RegionEditIcon.test.tsx",
+        "src/canvas/RegionEditIcon.tsx",
+        "src/canvas/RegionEditOverlay.test.tsx",
+        "src/canvas/RegionEditOverlay.tsx",
+        "src/canvas/imageMaskGeometry.ts",
+        "src/canvas/maskEditGeneration.test.ts",
+        "src/canvas/maskEditGeneration.ts",
+        "src/canvas/maskEditSubmit.ts",
+        "src/canvas/regionEditDraft.test.ts",
+        "src/canvas/regionEditDraft.ts",
+        "src/canvas/regionEditOverlayRender.tsx",
+        "src/canvas/regionEditState.test.ts",
+        "src/canvas/regionEditState.ts",
+        "src/canvas/regionEditSubmit.test.ts",
+        "src/canvas/regionEditSubmit.ts",
+        "src/canvas/regionEditTheme.test.ts",
+        "src/canvas/regionEditTools.test.ts",
+        "src/canvas/regionEditTools.ts",
+        "src/canvas/regionRefSuggestState.test.ts",
+        "src/canvas/regionRefSuggestState.ts",
+        "src/canvas/regionRefTokens.test.ts",
+        "src/canvas/regionRefTokens.ts",
+        "src/canvas/regionRefs.test.ts",
+        "src/canvas/regionRefs.ts",
+        "src/canvas/regionResize.test.ts",
+        "src/canvas/regionResize.ts",
+        "src/canvas/regionShapes.ts",
+        "src/canvas/regionToolGlyphs.tsx",
+        "src/canvas/useCanvasInteractionController.ts",
+        "src/canvas/useGlobalCanvasEvents.ts",
+        "src/canvas/useMaskPointArmed.ts",
+        "src/canvas/useRegionEdit.ts",
+        "src/canvas/useRegionRefEditor.ts",
+        "src/i18n/locales/en/tools.json",
+        "src/i18n/locales/ja/tools.json"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 370,
+      "title": "ci: 剩余审查缺口收口——cindyplugin 门禁/内网字面量守卫/semgrep/coverage/SHA-pin/bench 趋势",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        ".github/dependabot.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/daily-changelog.yml",
+        ".github/workflows/deploy-green-ref.yml",
+        ".github/workflows/main-health.yml",
+        ".github/workflows/nightly-e2e.yml",
+        ".github/workflows/pr-hygiene.yml",
+        ".github/workflows/repo-health-watchdog.yml",
+        ".github/workflows/secret-scan.yml",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "ops/postgres/docker-compose.yml",
+        "package-lock.json",
+        "package.json",
+        "scripts/ci/check-internal-literals.mjs",
+        "scripts/ci/check-internal-literals.test.mjs",
+        "scripts/loops/bug-doctor/gate.mjs",
+        "scripts/loops/bug-doctor/gate.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 379,
+      "title": "feat(i18n): 多语言 Wave 2——toast/详情面板/弹窗/文字格式条/裁剪蒙版条全量四语化",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/pendingWriteDrain.test.ts",
+        "cindyplugin/src/agent/pendingWriteDrain.ts",
+        "cindyplugin/src/i18n/translator.ts",
+        "package-lock.json",
+        "scripts/e2e/scenarios/archive-canvas.mjs",
+        "scripts/e2e/scenarios/archive-cr6-409.mjs",
+        "scripts/e2e/scenarios/archive-project.mjs",
+        "scripts/e2e/scenarios/archive-ui-trash.mjs",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "scripts/e2e/scenarios/chat-copy.mjs",
+        "scripts/e2e/scenarios/mask-blackblock.mjs",
+        "scripts/e2e/scenarios/mask-concurrent.mjs",
+        "scripts/e2e/scenarios/mask-cross-scene.mjs",
+        "scripts/e2e/scenarios/mask-hydration.mjs",
+        "scripts/e2e/scenarios/mask-multi-edit.mjs",
+        "scripts/e2e/scenarios/mask-point.mjs",
+        "scripts/e2e/scenarios/mask-reflow.mjs",
+        "scripts/e2e/scenarios/mask-source-delete.mjs",
+        "scripts/e2e/scenarios/mask-timeout-retry.mjs",
+        "scripts/e2e/scenarios/mask.mjs",
+        "scripts/e2e/scenarios/project-sidebar.mjs",
+        "scripts/verify-debug-logging.mjs",
+        "src/app/InspectorPanel.tsx",
+        "src/app/ProjectSidebar.tsx",
+        "src/app/ToastViewport.tsx",
+        "src/app/chat/copyPromptText.test.ts",
+        "src/app/chat/copyPromptText.ts",
+        "src/app/dialog/ModalDialog.tsx",
+        "src/app/sidebar/CanvasRow.tsx",
+        "src/app/sidebar/ConfirmDialog.tsx",
+        "src/app/sidebar/ProjectRow.tsx",
+        "src/app/useStoreHydration.ts",
+        "src/canvas/CanvasPromptDialog.tsx",
+        "src/canvas/ImageCropOverlay.tsx",
+        "src/canvas/ImageMaskEditOverlay.tsx",
+        "src/canvas/RegionEditOverlay.test.tsx",
+        "src/canvas/RegionEditOverlay.tsx",
+        "src/canvas/TextFormatToolbar.tsx",
+        "src/canvas/actions/canvasSyncRuntime.test.ts",
+        "src/canvas/canvasImportHandlers.test.ts",
+        "src/canvas/canvasImportHandlers.ts",
+        "src/canvas/regionEditOverlayRender.tsx",
+        "src/canvas/regionEditTools.test.ts",
+        "src/canvas/regionEditTools.ts",
+        "src/canvas/useImageEditActions.tsx",
+        "src/canvas/useMaskPointArmed.ts",
+        "src/i18n/__tests__/i18nCompleteness.test.ts",
+        "src/i18n/locales/en/dialog.json",
+        "src/i18n/locales/en/index.ts",
+        "src/i18n/locales/en/inspector.json",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/en/toast.json",
+        "src/i18n/locales/ja/dialog.json",
+        "src/i18n/locales/ja/index.ts",
+        "src/i18n/locales/ja/inspector.json",
+        "src/i18n/locales/ja/menu.json",
+        "src/i18n/locales/ja/toast.json",
+        "src/i18n/locales/ko/dialog.json",
+        "src/i18n/locales/ko/index.ts",
+        "src/i18n/locales/ko/inspector.json",
+        "src/i18n/locales/ko/menu.json",
+        "src/i18n/locales/ko/toast.json",
+        "src/i18n/locales/zh-CN/dialog.json",
+        "src/i18n/locales/zh-CN/index.ts",
+        "src/i18n/locales/zh-CN/inspector.json",
+        "src/i18n/locales/zh-CN/menu.json",
+        "src/i18n/locales/zh-CN/toast.json",
+        "src/kernel/rollbackTrigger.test.ts",
+        "src/kernel/rollbackTrigger.ts",
+        "src/lib/archivedWriteNotice.test.ts",
+        "src/lib/archivedWriteNotice.ts",
+        "src/lib/imageNodeClipboard.ts",
+        "src/lib/mivoTaskClient.ts",
+        "src/lib/persistBoot.integration.test.ts",
+        "src/lib/persistBoot.ts",
+        "src/lib/persistIdbStorage.test.ts",
+        "src/lib/persistIdbStorage.ts",
+        "src/lib/writeRetryQueue.test.ts",
+        "src/lib/writeRetryQueue.ts",
+        "src/render/useLeaferSpikeRenderer.ts",
+        "src/render/usePixiSpikeRenderer.ts",
+        "src/store/archiveActions.test.ts",
+        "src/store/changelogStore.ts",
+        "src/store/documentSlice.persist.test.ts",
+        "src/store/documentSlice.ts",
+        "src/store/projectsSlice.persist.test.ts",
+        "src/store/projectsSlice.ts",
+        "src/store/remoteDebugReporter.ts",
+        "src/store/settingsSlice.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 380,
+      "title": "fix(e2e): mask-point 工具坞按钮改按英文 Inpaint 定位(修 #377 nightly 红灯)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "scripts/e2e/scenarios/mask-point.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 382,
+      "title": "test(e2e): mask-point 显式 SKIP(#369 废除其所测交互),重写债挂 #381",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "scripts/e2e/scenarios/mask-point.mjs"
+      ],
+      "hasDiff": true
+    },
+    {
+      "number": 385,
+      "title": "feat(#297 P2): 卡片「基于这张图继续」——一次性票据触发 agent.run + 三态收据卡",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/agentManifest.test.ts",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/cardActionContinue.test.ts",
+        "cindyplugin/src/__tests__/cardActionHarness.ts",
+        "cindyplugin/src/__tests__/cardActions.test.ts",
+        "cindyplugin/src/__tests__/cardRender.test.ts",
+        "cindyplugin/src/__tests__/depositBrain.test.ts",
+        "scripts/card-height-check.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 386,
+      "title": "feat(i18n): 多语言 Wave 3+4——侧栏/设置/素材库/聊天四语化,主站语言设置项,插件文案替换器退役",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/depositFlagOff.test.ts",
+        "cindyplugin/src/__tests__/importFolderI18n.test.ts",
+        "cindyplugin/src/__tests__/pendingWriteDrain.test.ts",
+        "cindyplugin/src/agent/cindyGenerationPort.ts",
+        "cindyplugin/src/agent/pendingWriteDrain.ts",
+        "cindyplugin/src/i18n/dict.ts",
+        "cindyplugin/src/i18n/translator.test.ts",
+        "cindyplugin/src/i18n/translator.ts",
+        "package-lock.json",
+        "scripts/e2e/scenarios/archive-canvas.mjs",
+        "scripts/e2e/scenarios/archive-cr6-409.mjs",
+        "scripts/e2e/scenarios/archive-project.mjs",
+        "scripts/e2e/scenarios/archive-ui-trash.mjs",
+        "scripts/e2e/scenarios/auto-prompt-settings.mjs",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "scripts/e2e/scenarios/changelog.mjs",
+        "scripts/e2e/scenarios/chat-copy.mjs",
+        "scripts/e2e/scenarios/chat-generation.mjs",
+        "scripts/e2e/scenarios/mask-blackblock.mjs",
+        "scripts/e2e/scenarios/mask-concurrent.mjs",
+        "scripts/e2e/scenarios/mask-cross-scene.mjs",
+        "scripts/e2e/scenarios/mask-hydration.mjs",
+        "scripts/e2e/scenarios/mask-multi-edit.mjs",
+        "scripts/e2e/scenarios/mask-point.mjs",
+        "scripts/e2e/scenarios/mask-reflow.mjs",
+        "scripts/e2e/scenarios/mask-source-delete.mjs",
+        "scripts/e2e/scenarios/mask-timeout-retry.mjs",
+        "scripts/e2e/scenarios/mask.mjs",
+        "scripts/e2e/scenarios/migration.mjs",
+        "scripts/e2e/scenarios/project-sidebar.mjs",
+        "scripts/e2e/scenarios/userchip.mjs",
+        "scripts/verify-debug-logging.mjs",
+        "scripts/visual-diff.mjs",
+        "src/App.css",
+        "src/App.tsx",
+        "src/app/ChangelogPanel.tsx",
+        "src/app/InspectorPanel.tsx",
+        "src/app/LibraryWorkspace.tsx",
+        "src/app/ProjectSidebar.tsx",
+        "src/app/ProjectSidebarControls.tsx",
+        "src/app/ToastViewport.tsx",
+        "src/app/chat/ChatComposer.tsx",
+        "src/app/chat/ChatMessageList.tsx",
+        "src/app/chat/ChatPanel.tsx",
+        "src/app/chat/ChatResultImage.tsx",
+        "src/app/chat/EnhanceParamCard.tsx",
+        "src/app/chat/ModelSelectorPopover.tsx",
+        "src/app/chat/RatioPopover.tsx",
+        "src/app/chat/chatDisplayLabels.ts",
+        "src/app/chat/copyPromptText.test.ts",
+        "src/app/chat/copyPromptText.ts",
+        "src/app/dialog/ModalDialog.tsx",
+        "src/app/libraryAssetPresenters.ts",
+        "src/app/settings/GatewayKeyDialog.tsx",
+        "src/app/settings/MivoKeyDialog.tsx",
+        "src/app/settings/MivoKeySection.tsx",
+        "src/app/settings/SettingsPanel.tsx",
+        "src/app/settings/UserChip.tsx",
+        "src/app/sidebar/CanvasRow.tsx",
+        "src/app/sidebar/ConfirmDialog.tsx",
+        "src/app/sidebar/ProjectRow.tsx",
+        "src/app/useStoreHydration.ts",
+        "src/canvas/AnchorOverlay.tsx",
+        "src/canvas/CanvasNodeView.tsx",
+        "src/canvas/CanvasPromptDialog.tsx",
+        "src/canvas/ImageCropOverlay.tsx",
+        "src/canvas/ImageMaskEditOverlay.tsx",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/RegionEditOverlay.test.tsx",
+        "src/canvas/RegionEditOverlay.tsx",
+        "src/canvas/TextFormatToolbar.tsx",
+        "src/canvas/actions/canvasSyncRuntime.test.ts",
+        "src/canvas/canvasImportHandlers.test.ts",
+        "src/canvas/canvasImportHandlers.ts",
+        "src/canvas/imageMaskGeometry.ts",
+        "src/canvas/maskEditToolItems.ts",
+        "src/canvas/regionEditOverlayRender.tsx",
+        "src/canvas/regionEditTools.test.ts",
+        "src/canvas/regionEditTools.ts",
+        "src/canvas/useImageEditActions.tsx",
+        "src/canvas/useMaskPointArmed.test.ts",
+        "src/canvas/useMaskPointArmed.ts",
+        "src/canvas/useRegionEdit.ts",
+        "src/i18n/__tests__/i18nCompleteness.test.ts",
+        "src/i18n/__tests__/localePreference.test.ts",
+        "src/i18n/index.ts",
+        "src/i18n/locales/en/chat.json",
+        "src/i18n/locales/en/dialog.json",
+        "src/i18n/locales/en/index.ts",
+        "src/i18n/locales/en/inspector.json",
+        "src/i18n/locales/en/library.json",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/en/settings.json",
+        "src/i18n/locales/en/sidebar.json",
+        "src/i18n/locales/en/toast.json",
+        "src/i18n/locales/en/tools.json",
+        "src/i18n/locales/ja/chat.json",
+        "src/i18n/locales/ja/dialog.json",
+        "src/i18n/locales/ja/index.ts",
+        "src/i18n/locales/ja/inspector.json"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 387,
+      "title": "feat(#297): P2 continue 动作生产实现 + 必需的既有测试适配(拆分 1/3)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/cardActionHarness.ts",
+        "cindyplugin/src/__tests__/cardActions.test.ts",
+        "cindyplugin/src/__tests__/depositBrain.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 388,
+      "title": "test(#297): P2 continue 测试底座 + SC2.1-2.9 核心矩阵(拆分 2/3)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/agentManifest.test.ts",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/cardActionContinue.test.ts",
+        "cindyplugin/src/__tests__/cardActionHarness.ts",
+        "cindyplugin/src/__tests__/cardActions.test.ts",
+        "cindyplugin/src/__tests__/cardRender.test.ts",
+        "cindyplugin/src/__tests__/depositBrain.test.ts",
+        "scripts/card-height-check.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 389,
+      "title": "test(#297): P2 continue 返修回归矩阵(拆分 3/3)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/cardActionContinue.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 393,
+      "title": "fix: 审计批量修复 6 项——FX-6 认领语义 / demo 副本 localOnly / 资产回收 / 颜色迁移收尾 / e2e 双修复 (#360/#353/#313/#321/#363/#381)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "docs/bff-deployment.md",
+        "docs/decisions/api-surface.md",
+        "scripts/e2e/scenarios/archive-assets.mjs",
+        "scripts/e2e/scenarios/mask-point.mjs",
+        "scripts/e2e/scenarios/migration.mjs",
+        "server/index.ts",
+        "server/lib/assetStore.test.ts",
+        "server/lib/assetStore.ts",
+        "server/routes/assets.test.ts",
+        "server/routes/assets.ts",
+        "src/App.css",
+        "src/canvas/NodeActionMenu.tsx",
+        "src/canvas/SelectionQuickToolbar.tsx",
+        "src/canvas/actions/canvasActionTypes.ts",
+        "src/canvas/actions/canvasSyncRuntime.test.ts",
+        "src/canvas/actions/canvasSyncRuntime.ts",
+        "src/canvas/actions/markupStyleActions.ts",
+        "src/canvas/actions/multiSelectionActions.test.ts",
+        "src/canvas/color/ActionColorSwatchPicker.tsx",
+        "src/lib/persistBoot.integration.test.ts",
+        "src/lib/persistBoot.ts",
+        "src/lib/persistIdbStorage.fx6.test.ts",
+        "src/lib/persistIdbStorage.ts",
+        "src/store/documentSlice.persist.test.ts",
+        "src/store/documentSlice.ts",
+        "src/types/mivoCanvas.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 395,
+      "title": "fix: 右键菜单标准化阶段1——行为修复批 + 层级子菜单收纳 + 子菜单全局样式",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/src/cindy-theme.css",
+        "docs/context-menu-standard.md",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "src/App.css",
+        "src/canvas/AnchorOverlay.tsx",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/NodeActionMenu.tsx",
+        "src/canvas/SelectionQuickToolbar.tsx",
+        "src/canvas/TextFormatToolbar.tsx",
+        "src/canvas/actions/canvasActionModel.characterization.test.ts",
+        "src/canvas/actions/canvasActionModel.ts",
+        "src/canvas/actions/layerActionGroups.ts",
+        "src/canvas/canvasInteraction.test.ts",
+        "src/canvas/canvasInteraction.ts",
+        "src/canvas/useCanvasInteractionController.ts",
+        "src/canvas/useGlobalCanvasEvents.ts",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/en/toast.json",
+        "src/i18n/locales/ja/menu.json",
+        "src/i18n/locales/ja/toast.json",
+        "src/i18n/locales/ko/menu.json",
+        "src/i18n/locales/ko/toast.json",
+        "src/i18n/locales/zh-CN/menu.json",
+        "src/i18n/locales/zh-CN/toast.json",
+        "src/model/canvasNodeRegistry.contract.test.ts",
+        "src/model/canvasNodeRegistry.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 396,
+      "title": "feat: 右键菜单标准化阶段2——clamp 收敛/子菜单 hover 统一/快捷键提示/锁定快捷键",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "docs/context-menu-standard.md",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "scripts/e2e/scenarios/project-sidebar.mjs",
+        "src/App.css",
+        "src/app/sidebar/ContextMenu.tsx",
+        "src/canvas/CanvasContextMenu.tsx",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/NodeActionMenu.tsx",
+        "src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts",
+        "src/canvas/actions/canvasActionModel.characterization.test.ts",
+        "src/canvas/actions/canvasActionModel.ts",
+        "src/canvas/actions/canvasActionTypes.ts",
+        "src/canvas/actions/layerActionGroups.ts",
+        "src/canvas/actions/menuShortcuts.ts",
+        "src/canvas/actions/sectionStyleActions.ts",
+        "src/canvas/canvasInteraction.test.ts",
+        "src/canvas/canvasInteraction.ts",
+        "src/canvas/useCanvasInteractionController.ts",
+        "src/canvas/useGlobalCanvasEvents.ts",
+        "src/lib/menuOverlayLayout.ts",
+        "src/store/nodeMutationSlice.lock.test.ts",
+        "src/store/nodeMutationSlice.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 397,
+      "title": "feat: 右键菜单标准化阶段3——样式项退场/空白菜单裁剪/拖拽门禁",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "docs/context-menu-standard.md",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "scripts/e2e/scenarios/markup-text-overlay.mjs",
+        "scripts/visual-diff.mjs",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/actions/canvasActionEmitters.ts",
+        "src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts",
+        "src/canvas/actions/canvasActionModel.characterization.test.ts",
+        "src/canvas/actions/canvasActionModel.ts",
+        "src/canvas/actions/imageActionGroups.ts",
+        "src/canvas/actions/markupStyleActions.dispatch.test.ts",
+        "src/canvas/actions/markupStyleActions.test.ts",
+        "src/canvas/actions/markupStyleActions.ts",
+        "src/canvas/canvasInteraction.test.ts",
+        "src/canvas/canvasInteraction.ts",
+        "src/i18n/__tests__/i18nCompleteness.test.ts",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/en/toast.json",
+        "src/i18n/locales/ja/menu.json",
+        "src/i18n/locales/ja/toast.json",
+        "src/i18n/locales/ko/menu.json",
+        "src/i18n/locales/ko/toast.json",
+        "src/i18n/locales/zh-CN/menu.json",
+        "src/i18n/locales/zh-CN/toast.json"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 398,
+      "title": "feat(shared): canonicalHash 128-bit 内容指纹 + deposit CAS 协议字段与常量族 (#297 P1a 拆分 1/10)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/src/persist/bridge.ts",
+        "src/lib/canonicalHash.test.ts",
+        "src/lib/canonicalHash.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 399,
+      "title": "fix(cindyplugin): card/defer 超限判据改真实 UTF-8 字节 + brainHarness 声明新协议句柄契约 (#297 P1a 拆分 2/10)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/cardTransport.test.ts",
+        "docs/plan/cindy-deposit-media-design.md"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 401,
+      "title": "feat(canvas): 双击图片/视频打开媒体详情 lightbox(主站+插件)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/src/PluginApp.tsx",
+        "scripts/e2e/scenarios/archive-assets.mjs",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "src/App.css",
+        "src/App.tsx",
+        "src/app/DetailsTargetGuard.tsx",
+        "src/app/InspectorPanel.tsx",
+        "src/app/MediaLightbox.tsx",
+        "src/canvas/canvasInteraction.test.ts",
+        "src/canvas/canvasInteraction.ts",
+        "src/canvas/useGlobalCanvasEvents.ts",
+        "src/i18n/locales/en/inspector.json",
+        "src/i18n/locales/en/toast.json",
+        "src/i18n/locales/ja/inspector.json",
+        "src/i18n/locales/ja/toast.json",
+        "src/i18n/locales/ko/inspector.json",
+        "src/i18n/locales/ko/toast.json",
+        "src/i18n/locales/zh-CN/inspector.json",
+        "src/i18n/locales/zh-CN/toast.json",
+        "src/lib/menuOverlayStack.contract.test.ts",
+        "src/lib/useResolvedAssetUrl.contract.test.ts",
+        "src/lib/useResolvedAssetUrl.test.ts",
+        "src/lib/useResolvedAssetUrl.ts",
+        "src/model/canvasNodeRegistry.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 403,
+      "title": "feat(cindyplugin): deposit 状态协议类型扇出——entry 盖戳字段与释放证据三容器",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/depositMigration.test.ts",
+        "cindyplugin/src/__tests__/depositPort.test.ts",
+        "cindyplugin/src/__tests__/depositStore.test.ts",
+        "cindyplugin/src/agent/depositMigration.ts",
+        "cindyplugin/src/agent/depositPort.ts",
+        "cindyplugin/src/agent/depositStore.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 405,
+      "title": "feat(cindyplugin): deposit 提交机——dirty 追踪 + 内容指纹 CAS 重放 + 容量节流与墓碑 GC",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/depositStore.test.ts",
+        "cindyplugin/src/agent/depositMigration.ts",
+        "cindyplugin/src/agent/depositPort.ts",
+        "cindyplugin/src/agent/depositStore.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 406,
+      "title": "feat(cindyplugin): deposit 五入口收口——盖戳提交 + 释放证据入队 + port/migration 迁移到精确 API",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/depositMigration.test.ts",
+        "cindyplugin/src/__tests__/depositPort.test.ts",
+        "cindyplugin/src/__tests__/depositStore.test.ts",
+        "cindyplugin/src/agent/depositMigration.ts",
+        "cindyplugin/src/agent/depositPort.ts",
+        "cindyplugin/src/agent/depositStore.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 407,
+      "title": "feat(cindyplugin): main.js 接线不可变命名协议——读候选族 + 双因子 CAS + 信封提交",
+      "types": [
+        "xtest_used",
+        "deleted_test_block"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/depositBrain.test.ts",
+        "cindyplugin/src/__tests__/depositStore.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 408,
+      "title": "chore(cindyplugin): 清理 deposit 旧双槽协议残留与合并规则死代码",
+      "types": [
+        "deleted_test_block"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/depositStore.test.ts",
+        "cindyplugin/src/agent/depositStore.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 409,
+      "title": "feat(context-menu): 右键菜单标准化阶段4——§5 文档动作实装 + 全仓 Escape 分层收口",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "docs/context-menu-standard.md",
+        "docs/quickbar-study.md",
+        "scripts/verify-debug-logging.mjs",
+        "src/App.css",
+        "src/app/LibraryWorkspace.tsx",
+        "src/app/sidebar/ContextMenu.tsx",
+        "src/canvas/ImageCropOverlay.tsx",
+        "src/canvas/ImageMaskEditOverlay.tsx",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/NodeActionMenu.tsx",
+        "src/canvas/RegionEditOverlay.tsx",
+        "src/canvas/SelectionQuickToolbar.tsx",
+        "src/canvas/TextFormatToolbar.tsx",
+        "src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts",
+        "src/canvas/actions/canvasActionModel.ts",
+        "src/canvas/actions/canvasActionTypes.ts",
+        "src/canvas/actions/clipboardActionItems.ts",
+        "src/canvas/actions/documentActionGroups.ts",
+        "src/canvas/actions/useCanvasActionRuntime.ts",
+        "src/canvas/canvasImportHandlers.ts",
+        "src/canvas/canvasInteraction.test.ts",
+        "src/canvas/canvasInteraction.ts",
+        "src/canvas/useFileNodeActions.test.ts",
+        "src/canvas/useFileNodeActions.ts",
+        "src/canvas/useMaskPointArmed.ts",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/en/toast.json",
+        "src/i18n/locales/ja/menu.json",
+        "src/i18n/locales/ja/toast.json",
+        "src/i18n/locales/ko/menu.json",
+        "src/i18n/locales/ko/toast.json",
+        "src/i18n/locales/zh-CN/menu.json",
+        "src/i18n/locales/zh-CN/toast.json",
+        "src/lib/menuOverlayStack.contract.test.ts",
+        "src/lib/menuOverlayStack.test.ts",
+        "src/lib/menuOverlayStack.ts",
+        "src/store/canvasStateTypes.ts",
+        "src/store/nodeMutationSlice.replaceFile.test.ts",
+        "src/store/nodeMutationSlice.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 411,
+      "title": "test(cindyplugin): depositStore 端到端提交回归扩充——不可变命名协议盖戳与原型污染硬门",
+      "types": [
+        "deleted_test_block"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/depositStore.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 412,
+      "title": "test(cindyplugin): depositStore 身份分叉守卫 + 待重试释放队列 + CAS 重放 + 墓碑 GC 回归",
+      "types": [
+        "deleted_test_block"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/depositStore.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 414,
+      "title": "test(cindyplugin): depositStore 源头硬闸容量拒绝回归(八轮 + 九轮多写者 + SC9.6 零副作用)",
+      "types": [
+        "deleted_test_block"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/depositStore.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 417,
+      "title": "fix(server): reaper everAttached 回填 + 豁免计数拆分 (#313)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "docs/bff-deployment.md",
+        "scripts/e2e/scenarios/mask-point.mjs",
+        "server/index.ts",
+        "server/lib/assetStore.test.ts",
+        "server/lib/assetStore.ts",
+        "vitest.config.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 418,
+      "title": "fix(scripts): codemap 值级/type-only 边分层检测 + --circular-json 环闸门 (#413)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        ".github/workflows/ci.yml",
+        "package.json",
+        "scripts/ci/cycle-guard.baseline.json",
+        "scripts/ci/cycle-guard.mjs",
+        "scripts/ci/cycle-guard.test.mjs",
+        "scripts/codemap.mjs",
+        "scripts/codemap.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 419,
+      "title": "fix(ci): merge-thanks 真实合并事件下必然读错事件文件（致谢一条都发不出）",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        ".github/workflows/merge-thanks.yml",
+        "scripts/loops/merge-thanks/from-github-event.mjs",
+        "scripts/loops/merge-thanks/from-github-event.test.mjs",
+        "scripts/loops/merge-thanks/resolve-slack-identity.test.mjs",
+        "scripts/loops/merge-thanks/workflow-contract.mjs",
+        "scripts/loops/merge-thanks/workflow-contract.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 420,
+      "title": "chore(cindyplugin): 移除交互卡三动作(regen/restyle/continue)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/cardActionConcurrency.test.ts",
+        "cindyplugin/src/__tests__/cardActionContinue.test.ts",
+        "cindyplugin/src/__tests__/cardActionHarness.ts",
+        "cindyplugin/src/__tests__/cardActions.test.ts",
+        "cindyplugin/src/__tests__/cardRender.test.ts",
+        "cindyplugin/src/__tests__/cardWiring.test.ts",
+        "package.json",
+        "scripts/card-height-check.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 429,
+      "title": "style(ui): 文本输入框聚焦不再出现外圈绿环——焦点改为框内表达",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "public/changelog.json",
+        "scripts/e2e/scenarios/index.mjs",
+        "scripts/e2e/scenarios/input-focus.mjs",
+        "src/App.css",
+        "src/canvas/AnchorOverlay.tsx"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 430,
+      "title": "feat(canvas): 媒体详情页信息浮层——基本信息/AI 上下文/标签/注释/下载(主站+插件)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "public/changelog.json",
+        "shared/persist-contract.ts",
+        "src/App.css",
+        "src/app/MediaLightbox.tsx",
+        "src/i18n/locales/en/inspector.json",
+        "src/i18n/locales/en/toast.json",
+        "src/i18n/locales/ja/inspector.json",
+        "src/i18n/locales/ja/toast.json",
+        "src/i18n/locales/ko/inspector.json",
+        "src/i18n/locales/ko/toast.json",
+        "src/i18n/locales/zh-CN/inspector.json",
+        "src/i18n/locales/zh-CN/toast.json",
+        "src/kernel/mapping.ts",
+        "src/kernel/records.ts",
+        "src/lib/assetDownload.ts",
+        "src/lib/snapshotValidation.test.ts",
+        "src/lib/snapshotValidation.ts",
+        "src/store/canvasStateTypes.ts",
+        "src/store/nodeFactory.ts",
+        "src/store/nodeMutationSlice.meta.test.ts",
+        "src/store/nodeMutationSlice.ts",
+        "src/types/mivoCanvas.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 431,
+      "title": "feat(design): 设计规范落地——design.md 定稿 + 字重四档归一 + 设计 token CI 守卫",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        ".github/workflows/ci.yml",
+        "bench/pixi-probe/index.html",
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/settings.html",
+        "docs/design-previews/region-edit/assets/product.css",
+        "docs/design-previews/region-edit/index.html",
+        "docs/design.md",
+        "package.json",
+        "public/changelog.json",
+        "scripts/ci/design-token-mirror.mjs",
+        "scripts/ci/design-token-mirror.test.mjs",
+        "scripts/loops/dashboard/render.mjs",
+        "src/App.css",
+        "src/app/InspectorPanel.tsx",
+        "src/canvas/TextFormatToolbar.tsx",
+        "src/canvas/canvasInteraction.ts",
+        "src/lib/demoImages.ts",
+        "src/model/documentModelV2.test.ts",
+        "src/model/documentModelV2.ts",
+        "src/store/canvasGenerationHydration.test.ts",
+        "src/store/canvasGenerationHydration.ts",
+        "src/store/nodeCreationSlice.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 434,
+      "title": "feat(card): 生成期间不出卡,成功卡只放图",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/cardEditLabel.test.ts",
+        "cindyplugin/src/__tests__/cardRender.test.ts",
+        "cindyplugin/src/__tests__/cardWiring.test.ts",
+        "cindyplugin/src/__tests__/deferPresence.test.ts",
+        "cindyplugin/src/__tests__/notifyWiring.test.ts",
+        "scripts/verify-debug-logging.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 435,
+      "title": "fix(card): 失败卡副文本行高提成常量并补对账断言",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/cardRender.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 437,
+      "title": "fix(changelog): 发布前双层门查——跨日可见性+幂等门 + 同日分支域门（含竞态防护）",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        ".claude/skills/generate-changelog/SKILL.md",
+        ".github/workflows/daily-changelog.yml",
+        "scripts/changelog/RUNBOOK.md",
+        "scripts/changelog/auto-changelog.mjs",
+        "scripts/changelog/auto-changelog.test.mjs",
+        "scripts/changelog/test-publish-gate.sh"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 438,
+      "title": "fix(ci): main-health 告警口径修正——非部署阻断红灯弱化措辞 + 空转 success 不再假关台账",
+      "types": [
+        "test_skipped",
+        "xtest_used",
+        "relaxed_matcher"
+      ],
+      "files": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/deploy-green-ref.yml",
+        ".github/workflows/main-health.yml",
+        "agent-use/docs/pr-rules.json",
+        "scripts/ci/check-workflow-permissions.mjs",
+        "scripts/ci/check-workflow-permissions.test.mjs",
+        "scripts/ci/main-health-logic.mjs",
+        "scripts/ci/main-health-logic.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 442,
+      "title": "fix(deposit): 进程内棘轮 fail-closed——堵住 fsList 静默变短/明确报错导致的 CAS 误判覆盖(#297 P0.5 段1/3)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/README.md",
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/depositBrain.test.ts",
+        "docs/plan/cindy-deposit-media-design.md"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 443,
+      "title": "fix(deposit): 写路径三态 reconcile——indeterminate 回执不当作\"没写成\" (#297 P0.5 段B)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/README.md",
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/depositBrain.test.ts",
+        "docs/plan/cindy-deposit-media-design.md"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 444,
+      "title": "fix(deposit): 冷启动 highwater marker——真首启与清单撒谎在观测上不可区分 (#297 P0.5 段C)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/README.md",
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/depositBrain.test.ts",
+        "docs/plan/cindy-deposit-media-design.md"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 445,
+      "title": "feat(ui): 工具栏视觉与交互统一——选中态收敛、hover 与激活态分离、绘制工具记忆持久化",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "docs/design-previews/region-edit/assets/product.css",
+        "docs/design.md",
+        "src/App.css",
+        "src/canvas/CanvasToolDock.tsx",
+        "src/canvas/color/README.md",
+        "src/kernel/persistMigration.ts",
+        "src/store/canvasGenerationHydration.ts",
+        "src/store/canvasKernelParity.contract.test.ts",
+        "src/store/canvasPersistConfig.ts",
+        "src/store/canvasStateTypes.ts",
+        "src/store/canvasStore.contract.test.ts",
+        "src/store/selectionSlice.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 446,
+      "title": "feat(#297 T2a1): importBatchId 批次戳(导入链全路径 + 内部资产板粘贴)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "src/lib/canvasAssetImport.importBatchId.test.ts",
+        "src/lib/canvasAssetImport.ts",
+        "src/lib/imageSizing.ts",
+        "src/lib/importBatchId.test.ts",
+        "src/lib/importBatchId.ts",
+        "src/store/aiCanvasWorkflow.test.ts",
+        "src/store/aiCanvasWorkflow.ts",
+        "src/store/importBatchStamp.test.ts",
+        "src/store/nodeCreationSlice.ts",
+        "src/store/selectionSlice.ts",
+        "src/types/mivoCanvas.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 447,
+      "title": "feat(#297 T2a2): 选中观测组原子派生(selectedImageNodeIds/selectedNodeCount)+ 800 行红线拆分",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "src/agent/canvasAgentVerbs.test.ts",
+        "src/agent/snapshotRegion.selectionObservation.test.ts",
+        "src/agent/snapshotRegion.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 448,
+      "title": "feat(#297 T2b): 选中观测组三态归一化(main.js egress)+ ghost 发布面收口(G1/G2/G3)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainSnapshot.test.ts",
+        "src/agent/snapshotRegion.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 449,
+      "title": "fix(#297 T2c): 补 T2 对抗审查 4 个 P1 + r2-select Finding 1(真实桥交接锁选中观测组三字段)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/agentBridgeWriteGate.test.ts",
+        "cindyplugin/src/__tests__/brainSnapshot.test.ts",
+        "server/routes/canvas.route.test.ts",
+        "shared/persist-contract.ts",
+        "src/agent/canvasAgentVerbs.test.ts",
+        "src/kernel/mapping.test.ts",
+        "src/kernel/mapping.ts",
+        "src/kernel/records.ts",
+        "src/lib/snapshotValidation.test.ts",
+        "src/lib/snapshotValidation.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 450,
+      "title": "feat(#297 T3a): mediaNodeIds 暗态运输 + 独立校验/offline 合成(含 800 行拆分)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/agentBridgeMediaNodeIds.test.ts",
+        "cindyplugin/src/__tests__/brainSnapshot.test.ts",
+        "cindyplugin/src/__tests__/brainSnapshotFixtures.ts",
+        "cindyplugin/src/__tests__/brainSnapshotMedia.test.ts",
+        "cindyplugin/src/agent/agentBridge.ts",
+        "scripts/verify-debug-logging.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 451,
+      "title": "feat(#297 T3b1): 逐 id 真实解析 + mediaStates(不需 deposit 通电)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/src/__tests__/agentBridgeMediaNodeIds.test.ts",
+        "cindyplugin/src/__tests__/agentBridgeMediaResolve.test.ts",
+        "cindyplugin/src/agent/agentBridge.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 452,
+      "title": "fix(#297 T3b1-fix): AST 接线锁改按绑定来源校验 + 原型污染硬门 + ext 单一入口 + typed diag trigger",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/agentBridgeMediaResolve.test.ts",
+        "cindyplugin/src/__tests__/brainSnapshotMedia.test.ts",
+        "cindyplugin/src/__tests__/codemap.d.ts",
+        "cindyplugin/src/agent/agentBridge.ts",
+        "cindyplugin/src/agent/mediaRefFormat.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 453,
+      "title": "feat(#297 T3b2): receiptHash → 落盘路径推导公式(deriveMediaFilePath)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/mediaFilePathFormula.test.ts",
+        "cindyplugin/src/agent/mediaRefFormat.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 454,
+      "title": "feat(#297 T3c-draft): canvas_snapshot 纪律文本起草 + mediaNodeIds schema 结构(暗态,未激活)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/canvasSnapshotMediaDisciplineText.test.ts",
+        "cindyplugin/src/__tests__/toolBudget.test.ts",
+        "cindyplugin/src/agent/agentBridge.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 455,
+      "title": "fix(#297 T3-fix): 补 r2-vision 二轮审 BLOCKER 2/3(hash 校验统一入口 + ghost 公式措辞)+ 顺带修既存 verify:logging 红",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/src/__tests__/canvasSnapshotMediaDisciplineText.test.ts",
+        "cindyplugin/src/__tests__/mediaRefHashGate.test.ts",
+        "cindyplugin/src/agent/depositMigration.ts",
+        "cindyplugin/src/agent/mediaRefFormat.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 456,
+      "title": "fix(#297 T3-fix): 补 r2-vision MAJOR 4——AST 接线锁加 R6 堵 namespace 逃逸口 + 800 行拆分",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/agentBridgeMediaResolve.test.ts",
+        "cindyplugin/src/__tests__/depositBindingLock.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 457,
+      "title": "fix(#297 B12): 三段深挖收口——hash 逃逸回归 + depositPort 转发/动态 import 逃逸 + resolveImport 扩展名缺陷",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/agentBridgeMediaResolve.test.ts",
+        "cindyplugin/src/__tests__/depositBindingLock.test.ts",
+        "cindyplugin/src/__tests__/depositMigration.test.ts",
+        "cindyplugin/src/__tests__/mediaRefHashGate.test.ts",
+        "cindyplugin/src/agent/agentBridge.ts",
+        "scripts/codemap.mjs",
+        "scripts/codemap.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 458,
+      "title": "feat(#297 T1a): release-media 传输 + main.js handler + releaseHash port API",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/depositFlagOff.test.ts",
+        "cindyplugin/src/__tests__/depositTestHarness.ts",
+        "cindyplugin/src/__tests__/releaseBrain.test.ts",
+        "cindyplugin/src/__tests__/releasePort.test.ts",
+        "cindyplugin/src/agent/depositPort.ts",
+        "cindyplugin/src/persist/bridge.ts",
+        "scripts/verify-debug-logging.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 459,
+      "title": "feat(#297 T1x): 回收降范围重组——只保留补偿释放,砍掉自动回收",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/depositCrashCompensation.test.ts",
+        "cindyplugin/src/__tests__/depositPort.test.ts",
+        "cindyplugin/src/__tests__/depositStore.test.ts",
+        "cindyplugin/src/__tests__/releaseBrain.test.ts",
+        "cindyplugin/src/__tests__/releasePort.test.ts",
+        "cindyplugin/src/agent/depositPort.ts",
+        "cindyplugin/src/agent/depositStore.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 460,
+      "title": "fix(#297 T1c): owned 判定纯函数 + ledger 持久化前置 + 迁移读失败不写完成标记",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/depositMigration.test.ts",
+        "cindyplugin/src/__tests__/depositOwned.test.ts",
+        "cindyplugin/src/agent/depositMigration.ts",
+        "cindyplugin/src/agent/depositOwned.ts",
+        "cindyplugin/src/agent/mediaLedger.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 461,
+      "title": "feat(#297 T1e): 编辑接线降范围底座 + depositOwned 集成",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/src/PluginApp.tsx",
+        "cindyplugin/src/__tests__/depositBindingLock.test.ts",
+        "cindyplugin/src/__tests__/depositFlagOff.test.ts",
+        "cindyplugin/src/__tests__/editOnceWithForcedRetry.test.ts",
+        "cindyplugin/src/agent/cindyGenerationPort.ts",
+        "src/store/generationSlice.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 462,
+      "title": "feat(#297 T1d): deposit 失败矩阵四语文案 + quota/kind 纯判定(就绪未接线)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/depositFailureClassifiers.test.ts",
+        "cindyplugin/src/__tests__/depositFailureCopy.test.ts",
+        "cindyplugin/src/__tests__/depositFailureMatrixGuards.test.ts",
+        "cindyplugin/src/agent/depositFailureClassifiers.ts",
+        "cindyplugin/src/agent/depositFailureCopy.ts",
+        "src/i18n/locales/en/toast.json",
+        "src/i18n/locales/ja/toast.json",
+        "src/i18n/locales/ko/toast.json",
+        "src/i18n/locales/zh-CN/toast.json"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 463,
+      "title": "feat(#297 T1d-wire): 失败矩阵接线 + describeDepositFailure 护栏 + 循环引用拆除",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/depositFailureClassifiers.test.ts",
+        "cindyplugin/src/__tests__/depositFailureCopy.test.ts",
+        "cindyplugin/src/__tests__/depositFailureMatrixGuards.test.ts",
+        "cindyplugin/src/__tests__/depositPort.test.ts",
+        "cindyplugin/src/agent/depositFailureClassifiers.ts",
+        "cindyplugin/src/agent/depositPort.ts",
+        "cindyplugin/src/agent/depositStore.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 464,
+      "title": "feat(#297 T1f): 切流——ghost.json 加 cindy.media 能力键 + 删 DEPOSIT_ENABLED,寄存路径无条件生效",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/PluginApp.tsx",
+        "cindyplugin/src/__tests__/correlateNewAssets.test.ts",
+        "cindyplugin/src/__tests__/depositBrain.test.ts",
+        "cindyplugin/src/__tests__/depositFlagOff.test.ts",
+        "cindyplugin/src/__tests__/depositPort.test.ts",
+        "cindyplugin/src/__tests__/editOnceWithForcedRetry.test.ts",
+        "cindyplugin/src/__tests__/portEditRatio.test.ts",
+        "cindyplugin/src/agent/agentBridge.ts",
+        "cindyplugin/src/agent/cindyGenerationPort.ts",
+        "cindyplugin/src/agent/depositPort.ts",
+        "cindyplugin/src/persist/bridge.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 465,
+      "title": "test(#297 T1f-cov): 三入口收敛性 + 反向断言代码级覆盖",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/sourceEntryConvergence.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 466,
+      "title": "fix(loops): bug-doctor P0 修复 + 九轮三席审查挖出的 8 blocker 静默失效全修",
+      "types": [
+        "test_skipped",
+        "xtest_used",
+        "deleted_test_block"
+      ],
+      "files": [
+        "docs/loops/bug-doctor.md",
+        "scripts/loops/bug-doctor/docs-contract.test.mjs",
+        "scripts/loops/bug-doctor/gate.mjs",
+        "scripts/loops/bug-doctor/gate.test.mjs",
+        "scripts/loops/bug-doctor/intake.mjs",
+        "scripts/loops/bug-doctor/intake.test.mjs",
+        "scripts/loops/bug-doctor/patrol.mjs",
+        "scripts/loops/bug-doctor/patrol.test.mjs",
+        "scripts/loops/bug-doctor/rules.json",
+        "scripts/loops/bug-doctor/sc-binding.test.mjs",
+        "scripts/loops/bug-doctor/sensitive-literals.test.mjs",
+        "scripts/loops/bug-doctor/state.mjs",
+        "scripts/loops/bug-doctor/state.test.mjs",
+        "scripts/loops/dashboard/render.mjs",
+        "scripts/loops/dashboard/render.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 467,
+      "title": "fix(deposit): 冷启动 highwater marker——真首启与清单撒谎在观测上不可区分 (#297 P0.5 段C,取代 #444)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/README.md",
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/depositBrain.test.ts",
+        "docs/plan/cindy-deposit-media-design.md"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 469,
+      "title": "feat(canvas): 局部重绘交互升级——待命态/自动芯片/点选提示/草稿保留 + 结果留痕",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/src/cindy-theme.css",
+        "docs/design-previews/region-edit/assets/product.css",
+        "public/changelog.json",
+        "scripts/e2e/region-edit-draft.mjs",
+        "scripts/e2e/scenarios/mask-blackblock.mjs",
+        "scripts/e2e/scenarios/mask-concurrent.mjs",
+        "scripts/e2e/scenarios/mask-cross-scene.mjs",
+        "scripts/e2e/scenarios/mask-hydration.mjs",
+        "scripts/e2e/scenarios/mask-multi-edit.mjs",
+        "scripts/e2e/scenarios/mask-point.mjs",
+        "scripts/e2e/scenarios/mask-reflow.mjs",
+        "scripts/e2e/scenarios/mask-source-delete.mjs",
+        "scripts/e2e/scenarios/mask-timeout-retry.mjs",
+        "scripts/e2e/scenarios/mask.mjs",
+        "shared/persist-contract.ts",
+        "src/App.css",
+        "src/app/MediaLightbox.tsx",
+        "src/canvas/CanvasToolDock.tsx",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/RegionEditOverlay.test.tsx",
+        "src/canvas/RegionEditOverlay.tsx",
+        "src/canvas/maskEditGeneration.test.ts",
+        "src/canvas/maskEditGeneration.ts",
+        "src/canvas/regionEditAbortRegistry.ts",
+        "src/canvas/regionEditArmed.test.ts",
+        "src/canvas/regionEditArmed.ts",
+        "src/canvas/regionEditAssemblyWindow.test.ts",
+        "src/canvas/regionEditAssemblyWindow.ts",
+        "src/canvas/regionEditDraft.test.ts",
+        "src/canvas/regionEditDraft.ts",
+        "src/canvas/regionEditGesture.ts",
+        "src/canvas/regionEditOverlayRender.tsx",
+        "src/canvas/regionEditState.test.ts",
+        "src/canvas/regionEditState.ts",
+        "src/canvas/regionRefs.test.ts",
+        "src/canvas/regionRefs.ts",
+        "src/canvas/useGlobalCanvasEvents.contract.test.ts",
+        "src/canvas/useGlobalCanvasEvents.ts",
+        "src/canvas/useRegionEdit.ts",
+        "src/canvas/useRegionEditArmed.test.tsx",
+        "src/canvas/useRegionEditArmed.ts",
+        "src/canvas/useRegionEditFreezeGuard.test.tsx",
+        "src/canvas/useRegionEditFreezeGuard.ts",
+        "src/canvas/useRegionEditKeyboard.ts",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/en/tools.json",
+        "src/i18n/locales/ja/menu.json",
+        "src/i18n/locales/ja/tools.json",
+        "src/i18n/locales/ko/menu.json",
+        "src/i18n/locales/ko/tools.json",
+        "src/i18n/locales/zh-CN/menu.json",
+        "src/i18n/locales/zh-CN/tools.json",
+        "src/kernel/mapping.test.ts",
+        "src/kernel/records.ts",
+        "src/lib/generationPromptDisplay.test.ts",
+        "src/lib/generationPromptDisplay.ts",
+        "src/lib/menuOverlayStack.contract.test.ts",
+        "src/lib/serverPersistAdapter.contract.test.ts",
+        "src/lib/snapshotValidation.ts",
+        "src/main.tsx",
+        "src/model/markupStyleDefaults.ts",
+        "src/model/regionEditNoteLayout.test.ts",
+        "src/model/regionEditNoteLayout.ts",
+        "src/store/canvasDocumentModel.ts",
+        "src/store/commitGenerationResultCrossScene.test.ts",
+        "src/store/commitGenerationResultNote.test.ts",
+        "src/store/documentSlice.ts",
+        "src/store/nodeFactory.test.ts",
+        "src/store/nodeFactory.ts",
+        "src/store/regionEditNoteCommit.ts",
+        "src/types/generation.ts",
+        "src/types/mivoCanvas.ts",
+        "vitest.config.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 473,
+      "title": "fix(cindyplugin): canvas_snapshot 描述超宿主 1024 硬限导致插件整包拒装 + 补 manifest 长度门",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/src/__tests__/manifestHostLimits.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 474,
+      "title": "fix(cindyplugin): fsList 子目录清单被整份丢弃——宿主 path 相对 ghost 根,插件当平铺名逐条跳过(deposit 账本/离线队列生产不可用的根因)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/deferTransportReplay.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 475,
+      "title": "refactor(bd2 1/5): SC1 复发判定抽共享模块——全仓唯一定义点,杀掉手抄 fail-open 的复发路径",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/loops/bug-doctor/gate.mjs",
+        "scripts/loops/bug-doctor/recurrence.mjs",
+        "scripts/loops/bug-doctor/recurrence.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 476,
+      "title": "feat(bd2 2/5): sentry-intake 第三料源模块——消化 TRAE/MivoSentry 夜巡 findings",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/loops/bug-doctor/gate.mjs",
+        "scripts/loops/bug-doctor/recurrence.mjs",
+        "scripts/loops/bug-doctor/recurrence.test.mjs",
+        "scripts/loops/bug-doctor/rules.json",
+        "scripts/loops/bug-doctor/sentry-intake.mjs",
+        "scripts/loops/bug-doctor/sentry-intake.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 477,
+      "title": "test(bd2 3/5): sentry-intake 测试补齐至 45 条——路由/预筛/粘滞/原型键/mark-fixed/CLI",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/loops/bug-doctor/sentry-intake.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 478,
+      "title": "feat(bd2 4/5): gate 接入 --include-sentry——同锁消费/殿后排序/昨日默认(修跨系统时序 blocker)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/loops/bug-doctor/gate.mjs",
+        "scripts/loops/bug-doctor/gate.test.mjs",
+        "scripts/loops/bug-doctor/sentry-intake.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 479,
+      "title": "feat(bd2 5/5): dashboard Trae 标签 + 班车 prompt 文档 + 契约锚点",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "docs/loops/bug-doctor-scheduler-prompts.md",
+        "docs/loops/bug-doctor.md",
+        "scripts/loops/bug-doctor/docs-contract.test.mjs",
+        "scripts/loops/bug-doctor/gate.mjs",
+        "scripts/loops/bug-doctor/gate.test.mjs",
+        "scripts/loops/bug-doctor/sentry-intake.test.mjs",
+        "scripts/loops/dashboard/render.mjs",
+        "scripts/loops/dashboard/render.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 480,
+      "title": "feat(#297 选中直读): canvas_selection 工具 + selectionOutOfScope——「没选」与「选了但在范围外」不再同形",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/skills/mivo-canvas-board/SKILL.md",
+        "cindyplugin/src/__tests__/agentBridgeSelection.test.ts",
+        "cindyplugin/src/__tests__/agentManifest.test.ts",
+        "cindyplugin/src/__tests__/arrangeWiring.test.ts",
+        "cindyplugin/src/__tests__/brainSnapshot.test.ts",
+        "cindyplugin/src/__tests__/canvasSelectionTool.test.ts",
+        "cindyplugin/src/__tests__/depositBrain.test.ts",
+        "cindyplugin/src/__tests__/exportManifest.test.ts",
+        "cindyplugin/src/__tests__/notifyManifest.test.ts",
+        "cindyplugin/src/__tests__/sessionManifest.test.ts",
+        "cindyplugin/src/__tests__/toolBudget.test.ts",
+        "cindyplugin/src/__tests__/toolResultSweep.test.ts",
+        "cindyplugin/src/__tests__/updateNodeTool.test.ts",
+        "cindyplugin/src/agent/agentBridge.ts",
+        "scripts/verify-debug-logging.mjs",
+        "src/agent/snapshotRegion.selectionObservation.test.ts",
+        "src/agent/snapshotRegion.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 481,
+      "title": "fix(hooks): pre-push 剥离全部 repo-local git env(修 fixture 静默污染真仓)+ sentry 时间口径校正",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        ".githooks/pre-push",
+        "docs/design-previews/region-edit/product-css.mjs",
+        "docs/loops/bug-doctor-scheduler-prompts.md",
+        "package.json",
+        "scripts/changelog/test-publish-gate-isolation.sh",
+        "scripts/changelog/test-publish-gate.sh",
+        "scripts/loops/bug-doctor/docs-contract.test.mjs",
+        "scripts/loops/bug-doctor/gate.mjs",
+        "scripts/loops/bug-doctor/gate.test.mjs",
+        "scripts/loops/bug-doctor/sentry-intake.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 483,
+      "title": "fix(e2e): waitForFunction 的 async 谓词根本没在等——19 处改真等 + AST 守卫钉死",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        ".github/workflows/ci.yml",
+        "package.json",
+        "scripts/ci/e2e-wait-guard.mjs",
+        "scripts/ci/e2e-wait-guard.test.mjs",
+        "scripts/e2e/renderer-evidence.mjs",
+        "scripts/e2e/scenarios/ai-slot-placeholder.mjs",
+        "scripts/e2e/scenarios/archive-assets.mjs",
+        "scripts/e2e/scenarios/chat-copy.mjs",
+        "scripts/e2e/scenarios/chat-generation.mjs",
+        "scripts/e2e/scenarios/mask-reflow.mjs",
+        "scripts/e2e/scenarios/stamp-overlap.mjs",
+        "scripts/e2e/wait-async-predicate.contract.test.ts",
+        "scripts/e2e/wait-async-predicate.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 487,
+      "title": "feat(bug-doctor): 缴械——合并权整体移交 review-pr 巡审(SOP 级禁用 + 守卫)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "agent-use/docs/pr-rules.json",
+        "docs/loops/bug-doctor-cutover-runbook.md",
+        "docs/loops/bug-doctor-scheduler-prompts.md",
+        "docs/loops/bug-doctor.md",
+        "docs/plan/bug-doctor-execution-plan.md",
+        "docs/plan/bug-doctor-phase2-tasks.md",
+        "docs/plan/bug-doctor-tasks.md",
+        "docs/plan/bug-doctor-unknowns-map.md",
+        "scripts/loops/bug-doctor/docs-contract.test.mjs",
+        "scripts/loops/bug-doctor/gate.mjs",
+        "scripts/loops/bug-doctor/intake.mjs",
+        "scripts/loops/bug-doctor/rules.json",
+        "scripts/loops/bug-doctor/sentry-intake.mjs",
+        "scripts/loops/bug-doctor/sentry-intake.test.mjs",
+        "scripts/loops/bug-doctor/state.mjs",
+        "scripts/loops/bug-doctor/state.test.mjs",
+        "scripts/loops/dashboard/render.mjs",
+        "scripts/loops/dashboard/render.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 488,
+      "title": "refactor(canvas): AI 入口收敛与死功能剔除——空白 AI 占位/图片右键生成组/AI 编辑下拉退役,快捷条 AI 编辑直开局部重绘(关联 #482)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "docs/context-menu-standard.md",
+        "docs/quickbar-study.md",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "scripts/e2e/scenarios/mask-blackblock.mjs",
+        "scripts/e2e/scenarios/mask-concurrent.mjs",
+        "scripts/e2e/scenarios/mask-cross-scene.mjs",
+        "scripts/e2e/scenarios/mask-hydration.mjs",
+        "scripts/e2e/scenarios/mask-multi-edit.mjs",
+        "scripts/e2e/scenarios/mask-reflow.mjs",
+        "scripts/e2e/scenarios/mask-source-delete.mjs",
+        "scripts/e2e/scenarios/mask-timeout-retry.mjs",
+        "scripts/e2e/scenarios/mask.mjs",
+        "scripts/e2e/scenarios/variations-annotation.mjs",
+        "src/canvas/MaskPointIcon.tsx",
+        "src/canvas/actions/canvasActionEmitters.ts",
+        "src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts",
+        "src/canvas/actions/canvasActionModel.characterization.test.ts",
+        "src/canvas/actions/canvasActionModel.ts",
+        "src/canvas/actions/canvasActionTypes.ts",
+        "src/canvas/actions/canvasCommand.serialize.test.ts",
+        "src/canvas/actions/canvasCommand.ts",
+        "src/canvas/actions/canvasCommandExecutor.deferred.test.ts",
+        "src/canvas/actions/canvasCommandExecutor.test.ts",
+        "src/canvas/actions/canvasCommandExecutor.ts",
+        "src/canvas/actions/canvasCommandExecutorTestFactories.ts",
+        "src/canvas/actions/canvasSyncRuntime.ts",
+        "src/canvas/actions/imageActionGroups.ts",
+        "src/canvas/actions/useCanvasActionRuntime.ts",
+        "src/canvas/useMaskEditOverlay.ts",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/ja/menu.json",
+        "src/i18n/locales/ko/menu.json",
+        "src/i18n/locales/zh-CN/menu.json",
+        "src/model/aiCanvasCommands.test.ts",
+        "src/model/aiCanvasCommands.ts",
+        "src/store/canvasStateTypes.ts",
+        "src/store/generation.contract.test.ts",
+        "src/store/generationFacade.ts",
+        "src/store/generationSlice.ts",
+        "src/store/nodeCreationSlice.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 489,
+      "title": "feat(canvas): 局部重绘二期·功能——删结果便签+出图模型下拉+纯文字提交",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/mivoChannel.test.ts",
+        "cindyplugin/src/__tests__/portEditRatio.test.ts",
+        "cindyplugin/src/agent/cindyGenerationPort.ts",
+        "cindyplugin/src/cindy-theme.css",
+        "docs/design-previews/region-edit/assets/product.css",
+        "docs/ui-previews/region-edit-panel-preview.html",
+        "public/changelog.json",
+        "scripts/e2e/api-mocks.mjs",
+        "scripts/e2e/harness.mjs",
+        "scripts/e2e/scenarios/mask-point.mjs",
+        "scripts/e2e/scenarios/mask.mjs",
+        "src/App.css",
+        "src/canvas/RegionEditOverlay.test.tsx",
+        "src/canvas/RegionEditOverlay.tsx",
+        "src/canvas/regionEditDraft.test.ts",
+        "src/canvas/regionEditDraft.ts",
+        "src/canvas/regionEditModel.test.ts",
+        "src/canvas/regionEditModel.ts",
+        "src/canvas/regionEditOverlayRender.tsx",
+        "src/canvas/regionEditPreview.test.ts",
+        "src/canvas/regionEditPreview.ts",
+        "src/canvas/regionEditState.test.ts",
+        "src/canvas/regionEditState.ts",
+        "src/canvas/regionEditSubmit.test.ts",
+        "src/canvas/regionEditSubmit.ts",
+        "src/canvas/useRegionEditKeyboard.test.tsx",
+        "src/canvas/useRegionEditKeyboard.ts",
+        "src/canvas/useRegionEditModelChoice.test.tsx",
+        "src/canvas/useRegionEditModelChoice.ts",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/ja/menu.json",
+        "src/i18n/locales/ko/menu.json",
+        "src/i18n/locales/zh-CN/menu.json",
+        "src/lib/pluginMivoKey.ts",
+        "src/lib/regionEditPrompt.ts",
+        "src/main.e2eBridge.test.ts",
+        "src/main.tsx",
+        "src/model/markupStyleDefaults.ts",
+        "src/model/regionEditNoteLayout.test.ts",
+        "src/model/regionEditNoteLayout.ts",
+        "src/store/commitGenerationResultCrossScene.test.ts",
+        "src/store/commitGenerationResultNote.test.ts",
+        "src/store/documentSlice.ts",
+        "src/store/nodeFactory.ts",
+        "src/store/regionEditNoteCommit.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 493,
+      "title": "feat(tooling): repo:worktrees 只读巡检——worktree 风险分类台账",
+      "types": [],
+      "files": [
+        "package.json",
+        "scripts/repo-worktrees-core.mjs",
+        "scripts/repo-worktrees.mjs",
+        "scripts/repo-worktrees.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 496,
+      "title": "feat(ci): PR 契约门——模板结构双向锁 + UI 改动设计依据字段校验",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        ".github/pull_request_template.md",
+        ".github/workflows/ci.yml",
+        "agent-use/docs/pr-rules.json",
+        "scripts/ci/check-pr-contract.mjs",
+        "scripts/ci/check-pr-contract.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 497,
+      "title": "fix(canvas): 复制为 PNG 补齐旋转/镜像 + 多选合成,剪贴板哨兵改为不可见",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "scripts/e2e/scenarios/copy-as-png.mjs",
+        "scripts/e2e/scenarios/index.mjs",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/NodeActionMenu.tsx",
+        "src/canvas/SelectionQuickToolbar.tsx",
+        "src/canvas/actions/canvasActionEmitters.ts",
+        "src/canvas/actions/canvasActionModel.characterization.test.ts",
+        "src/canvas/actions/canvasActionModel.copyAsPng.test.ts",
+        "src/canvas/actions/canvasActionModel.ts",
+        "src/canvas/actions/canvasActionTypes.ts",
+        "src/canvas/actions/clipboardActionItems.ts",
+        "src/canvas/actions/imageActionGroups.ts",
+        "src/canvas/actions/useCanvasActionRuntime.ts",
+        "src/canvas/useGlobalCanvasEvents.ts",
+        "src/canvas/useImageEditActions.tsx",
+        "src/i18n/locales/en/toast.json",
+        "src/i18n/locales/ja/toast.json",
+        "src/i18n/locales/ko/toast.json",
+        "src/i18n/locales/zh-CN/toast.json",
+        "src/lib/canvasClipboardSentinel.test.ts",
+        "src/lib/canvasClipboardSentinel.ts",
+        "src/lib/imageClipboardGeometry.test.ts",
+        "src/lib/imageClipboardGeometry.ts",
+        "src/lib/imageNodeClipboard.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 498,
+      "title": "test(bug-doctor): 守卫——降级路径不得把桌面横幅泄漏到真实世界",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/loops/bug-doctor/notify.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 499,
+      "title": "feat(canvas): 局部重绘二期·面板改版——双浮层+工具条重排+圆形发送键+文案定稿",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/cindy-theme.css",
+        "docs/design-previews/region-edit/assets/product.css",
+        "public/changelog.json",
+        "scripts/e2e/blank-point.mjs",
+        "scripts/e2e/scenarios/mask-point.mjs",
+        "scripts/e2e/scenarios/mask.mjs",
+        "src/App.css",
+        "src/canvas/RegionEditOverlay.test.tsx",
+        "src/canvas/RegionEditOverlay.tsx",
+        "src/canvas/regionEditOverlayRender.tsx",
+        "src/canvas/regionEditPreview.test.ts",
+        "src/canvas/regionEditPreview.ts",
+        "src/canvas/regionEditTheme.test.ts",
+        "src/canvas/regionEditTools.ts",
+        "src/canvas/regionRefSuggestState.test.ts",
+        "src/canvas/useRegionEditModelChoice.ts",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/ja/menu.json",
+        "src/i18n/locales/ko/menu.json",
+        "src/i18n/locales/zh-CN/menu.json"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 500,
+      "title": "feat(canvas): AI 编辑三入口统一——工具坞改名换图标+图片右键第三入口+生成到占位右键去重(#482 收口二批)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/correlateNewAssets.test.ts",
+        "cindyplugin/src/agent/cindyGenerationPort.ts",
+        "docs/context-menu-standard.md",
+        "docs/design.md",
+        "docs/plan/ai-edit-entry-close-out-2.md",
+        "docs/plan/cindy-panel-task-protocol.md",
+        "docs/quickbar-study.md",
+        "scripts/e2e/scenarios/ai-edit-entry.mjs",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "scripts/e2e/scenarios/index.mjs",
+        "scripts/e2e/scenarios/mask-blackblock.mjs",
+        "scripts/e2e/scenarios/mask-concurrent.mjs",
+        "scripts/e2e/scenarios/mask-cross-scene.mjs",
+        "scripts/e2e/scenarios/mask-hydration.mjs",
+        "scripts/e2e/scenarios/mask-multi-edit.mjs",
+        "scripts/e2e/scenarios/mask-point.mjs",
+        "scripts/e2e/scenarios/mask-reflow.mjs",
+        "scripts/e2e/scenarios/mask-source-delete.mjs",
+        "scripts/e2e/scenarios/mask-timeout-retry.mjs",
+        "scripts/e2e/scenarios/mask.mjs",
+        "server/lib/maskPng.ts",
+        "src/canvas/CanvasToolDock.test.tsx",
+        "src/canvas/CanvasToolDock.tsx",
+        "src/canvas/MaskPointIcon.tsx",
+        "src/canvas/RegionEditIcon.test.tsx",
+        "src/canvas/RegionEditIcon.tsx",
+        "src/canvas/RegionEditOverlay.test.tsx",
+        "src/canvas/actions/canvasActionModel.aiEditEntry.test.ts",
+        "src/canvas/actions/canvasActionModel.characterization.test.ts",
+        "src/canvas/actions/canvasActionModel.ts",
+        "src/canvas/actions/imageActionGroups.ts",
+        "src/canvas/maskEditGeneration.test.ts",
+        "src/canvas/maskEditGeneration.ts",
+        "src/canvas/regionEditOverlayRender.tsx",
+        "src/i18n/locales/en/chat.json",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/en/tools.json",
+        "src/i18n/locales/ja/chat.json",
+        "src/i18n/locales/ja/menu.json",
+        "src/i18n/locales/ja/tools.json",
+        "src/i18n/locales/ko/chat.json",
+        "src/i18n/locales/ko/menu.json",
+        "src/i18n/locales/ko/tools.json",
+        "src/i18n/locales/zh-CN/chat.json",
+        "src/i18n/locales/zh-CN/menu.json",
+        "src/i18n/locales/zh-CN/tools.json",
+        "src/store/chatTaskReconcile.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 501,
+      "title": "feat(bug-doctor): 合并后对账器 + 公平轮转(修永久饥饿缺陷)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "docs/loops/bug-doctor-cutover-runbook.md",
+        "docs/loops/bug-doctor.md",
+        "scripts/loops/bug-doctor/patrol.mjs",
+        "scripts/loops/bug-doctor/reconcile-merged.mjs",
+        "scripts/loops/bug-doctor/reconcile-merged.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 518,
+      "title": "fix(plugin): 配了 Mivo Key 就必须走 Key——回落判据改问保险库,不再猜错误文案 [列车①/4]",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainDiagnostics.test.ts",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/editOnceWithForcedRetry.test.ts",
+        "cindyplugin/src/__tests__/genMediaBoundary.test.ts",
+        "cindyplugin/src/__tests__/mivoChannel.test.ts",
+        "cindyplugin/src/agent/cindyGenerationPort.ts",
+        "docs/development-logging.md",
+        "scripts/changelog/test-publish-gate-isolation.sh",
+        "scripts/verify-debug-logging.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 519,
+      "title": "test(plugin): Mivo 分流配置态契约测试——三态/禁缓存/动作表/事故原形锁 [列车②/4]",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/mivoRouteConfig.test.ts",
+        "cindyplugin/src/__tests__/mivoRouteHarness.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 520,
+      "title": "test(plugin): Mivo 分流安全边界测试——阶段矩阵/双扣费/凭证 canary [列车③/4]",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/mivoRouteSafety.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 521,
+      "title": "feat(plugin): 生图结局码接通面板提示——回落走了代办额度,用户看得见 [列车④/4]",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/genOutcomeToast.test.ts",
+        "cindyplugin/src/__tests__/mivoRouteSafety.test.ts",
+        "cindyplugin/src/agent/cindyGenerationPort.ts",
+        "src/i18n/locales/en/toast.json",
+        "src/i18n/locales/ja/toast.json",
+        "src/i18n/locales/ko/toast.json",
+        "src/i18n/locales/zh-CN/toast.json"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 524,
+      "title": "perf(render): virtualize/lod 默认开启——20k 拖动 p95 108→25ms,含翻转暴露的 z 序修复与 text 编辑壳补齐",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "CLAUDE.md",
+        "TECH_DEBT_AUDIT.md",
+        "bench/baselines/p1-collector-default-sanity-20k-dpr1-2026-08-05.json",
+        "bench/baselines/p1-escape-offoff-leafer-20k-dpr1-2026-08-05.json",
+        "bench/baselines/p1-newdefault-leafer-20k-cpu4x-dpr1-2026-08-05.json",
+        "bench/baselines/p1-newdefault-leafer-20k-dpr1-2026-08-05.json",
+        "bench/baselines/p1-panfix-sanity-20k-dpr1-2026-08-05.json",
+        "bench/baselines/p1-postreview-sanity-20k-dpr1-2026-08-05.json",
+        "docs/decisions/dual-track-removal-decisions.md",
+        "docs/decisions/leafer-phase5-text-spike-2026-07-05.md",
+        "docs/decisions/virtualization-0e-2026-07-05.md",
+        "public/changelog.json",
+        "scripts/bench/collect.mjs",
+        "scripts/bench/evidence-gate.contract.test.ts",
+        "scripts/bench/evidence-gate.mjs",
+        "scripts/e2e/renderer-evidence.mjs",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "src/canvas/CanvasNodeView.markupTextOverlay.test.tsx",
+        "src/canvas/CanvasNodeView.rendererDegrade.test.tsx",
+        "src/canvas/CanvasNodeView.tsx",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/useCanvasVirtualization.fallback.test.ts",
+        "src/canvas/useCanvasVirtualization.ts",
+        "src/canvas/useCanvasVirtualization.warn.test.tsx",
+        "src/canvas/useViewport.pan.test.ts",
+        "src/canvas/useViewport.ts",
+        "src/render/engineLodMode.test.ts",
+        "src/render/engineLodMode.ts",
+        "src/render/leaferImagePaint.test.ts",
+        "src/render/leaferPaintSignature.test.ts",
+        "src/render/leaferSpikeFilter.test.ts",
+        "src/render/leaferSpikeFilter.ts",
+        "src/render/textPaintMode.ts",
+        "src/render/useLeaferSpikeRenderer.textEditShell.test.ts",
+        "src/render/useLeaferSpikeRenderer.ts",
+        "src/render/virtualizationMode.test.ts",
+        "src/render/virtualizationMode.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 526,
+      "title": "fix(canvas): 区域编辑输入框 IME 组合态异常 + 首次未自动聚焦（拆分列车 1/3：生产代码）",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "src/canvas/RegionEditOverlay.test.tsx",
+        "src/canvas/RegionEditOverlay.tsx",
+        "src/canvas/regionEditOverlayRender.tsx",
+        "src/canvas/regionEditState.ts",
+        "src/canvas/useRegionEditDeferredOps.ts",
+        "src/canvas/useRegionEditFloatingLayout.ts",
+        "src/canvas/useRegionEditImageGeometry.ts",
+        "src/canvas/useRegionRefEditor.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 527,
+      "title": "feat(canvas): 局部重绘面板打磨——自绘模型下拉+底纹定稿+框选改名+光标根治",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/src/cindy-theme.css",
+        "docs/design-previews/region-edit/assets/product.css",
+        "public/changelog.json",
+        "scripts/e2e/scenarios/mask-multi-edit.mjs",
+        "scripts/e2e/scenarios/mask-point.mjs",
+        "scripts/e2e/scenarios/mask.mjs",
+        "src/App.css",
+        "src/canvas/RegionEditErrorBar.tsx",
+        "src/canvas/RegionEditModelSelect.test.tsx",
+        "src/canvas/RegionEditModelSelect.tsx",
+        "src/canvas/RegionEditOverlay.test.tsx",
+        "src/canvas/RegionEditOverlay.tsx",
+        "src/canvas/regionEditFlip.test.ts",
+        "src/canvas/regionEditFlip.ts",
+        "src/canvas/regionEditOverlayRender.tsx",
+        "src/canvas/regionEditState.test.ts",
+        "src/canvas/regionEditState.ts",
+        "src/canvas/regionEditTheme.test.ts",
+        "src/canvas/useRegionEditFlip.test.tsx",
+        "src/canvas/useRegionEditFlip.ts",
+        "src/canvas/useRegionEditKeyboard.test.tsx",
+        "src/canvas/useRegionEditKeyboard.ts",
+        "src/canvas/useRegionRefEditor.caret.test.tsx",
+        "src/canvas/useRegionRefEditor.ts",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/ja/menu.json",
+        "src/i18n/locales/ko/menu.json",
+        "src/i18n/locales/zh-CN/menu.json",
+        "src/lib/menuOverlayStack.contract.test.ts",
+        "src/lib/menuOverlayStack.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 528,
+      "title": "feat(plugin): Mivo Key 校验协议——brain 探针 + BC sender(dormant seam)[B/3]",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/mivoKeyValidate.test.ts",
+        "cindyplugin/src/settings/mivoKeyValidateSender.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 529,
+      "title": "test(canvas): IME 合成期 body 同步 — hook 层核心证明（拆分列车 2/3）",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "src/canvas/RegionEditOverlay.test.tsx",
+        "src/canvas/RegionEditOverlay.tsx",
+        "src/canvas/useRegionEditDeferredOps.ts",
+        "src/canvas/useRegionEditImageGeometry.ts",
+        "src/canvas/useRegionRefEditor.test.tsx"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 530,
+      "title": "test(canvas): IME 修复的真挂载防护网 + 键盘运行时闭环（拆分列车 3/3）",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "public/changelog.json",
+        "src/canvas/RegionEditOverlay.runtime.test.tsx",
+        "src/canvas/RegionEditOverlay.test.tsx",
+        "src/canvas/RegionEditOverlay.tsx",
+        "src/canvas/useRegionEditDeferredOps.ts",
+        "src/canvas/useRegionEditImageGeometry.ts",
+        "src/canvas/useRegionEditKeyboard.test.tsx"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 531,
+      "title": "feat(plugin): 提交幂等台账——跨请求/跨重启防双扣费(R9)[A2/3]",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/mivoIdempotency.test.ts",
+        "cindyplugin/src/__tests__/mivoKeyValidate.test.ts",
+        "cindyplugin/src/__tests__/mivoRouteHarness.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 532,
+      "title": "perf(persist): 写防抖+按画布增量序列化——拖拽期零落盘,含世界切换数据安全加固",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/persistSyncCompact.test.ts",
+        "cindyplugin/src/__tests__/pluginKernelDegradation.test.ts",
+        "cindyplugin/src/persist/persistSync.ts",
+        "cindyplugin/src/usePluginHydration.ts",
+        "src/app/kernelBootTotal.test.ts",
+        "src/app/kernelDegradation.test.ts",
+        "src/app/kernelMode.ts",
+        "src/app/useStoreHydration.orchestration.test.tsx",
+        "src/app/useStoreHydration.persistBusy.integration.test.tsx",
+        "src/app/useStoreHydration.ts",
+        "src/i18n/locales/en/toast.json",
+        "src/i18n/locales/ja/toast.json",
+        "src/i18n/locales/ko/toast.json",
+        "src/i18n/locales/zh-CN/toast.json",
+        "src/kernel/docKernelPersistAdapter.contract.test.ts",
+        "src/kernel/docKernelPersistAdapter.ts",
+        "src/lib/persistIdbStorage.atomicFallback.test.ts",
+        "src/lib/persistIdbStorage.ts",
+        "src/main.tsx",
+        "src/store/authSlice.persistDiscard.test.ts",
+        "src/store/authSlice.ts",
+        "src/store/authSlice.worldSwitch.test.ts",
+        "src/store/canvasDocumentModel.compactPersist.test.ts",
+        "src/store/canvasDocumentModel.ts",
+        "src/store/canvasPersistConfig.ts",
+        "src/store/canvasPersistWriteScheduler.integration.test.ts",
+        "src/store/canvasPersistWriteScheduler.test.ts",
+        "src/store/canvasPersistWriteScheduler.ts",
+        "src/store/canvasStore.contract.test.ts",
+        "src/store/canvasStore.hydrationMigration.contract.test.ts",
+        "src/store/hydrationDurableSettle.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 534,
+      "title": "feat(plugin): 设置卡接入真实 Key 校验 + R3 视觉(PR-C,D4 五态)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/build.sh",
+        "cindyplugin/ghost.json",
+        "cindyplugin/settings.html",
+        "cindyplugin/settings.js",
+        "cindyplugin/src/__tests__/mivoSettingsCard.test.ts",
+        "cindyplugin/src/__tests__/mivoSettingsCardDom.test.ts",
+        "cindyplugin/src/settings/settingsCard.ts",
+        "cindyplugin/src/settings/settingsView.ts",
+        "cindyplugin/vite.config.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 538,
+      "title": "perf(canvas): demo 种子图弃 base64——mivo-demo 微型引用+惰性绘制,v13 迁移清洗存量(#506)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/pluginKernelDegradation.test.ts",
+        "public/changelog.json",
+        "src/canvas/CanvasNodeView.demoAsset.test.tsx",
+        "src/kernel/docKernelPersistAdapter.ts",
+        "src/kernel/docKernelPersistVersion.test.ts",
+        "src/lib/assetDownload.ts",
+        "src/lib/assetStorage.ts",
+        "src/lib/assetUrlLease.demoAsset.test.ts",
+        "src/lib/assetUrlLease.test.ts",
+        "src/lib/assetUrlLease.ts",
+        "src/lib/demoAssetBridges.test.ts",
+        "src/lib/demoAssets.batch.test.ts",
+        "src/lib/demoAssets.test.ts",
+        "src/lib/demoAssets.ts",
+        "src/lib/demoImages.ts",
+        "src/lib/imageNodeClipboard.ts",
+        "src/lib/mivoImageClient.ts",
+        "src/lib/useResolvedAssetUrl.contract.test.ts",
+        "src/lib/useResolvedAssetUrl.test.ts",
+        "src/lib/useResolvedAssetUrl.ts",
+        "src/render/leaferImagePaint.pendingToken.test.ts",
+        "src/render/leaferImagePaint.ts",
+        "src/render/leaferPaintSignature.behavior.test.ts",
+        "src/store/canvasGenerationHydration.ts",
+        "src/store/canvasStore.contract.test.ts",
+        "src/store/canvasStore.hydrationMigration.contract.test.ts",
+        "src/store/demoAssetCleanup.migrate.test.ts",
+        "src/store/demoScenes.ts",
+        "src/store/hydrationDurableSettle.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 540,
+      "title": "feat(cindyplugin): 插件版 debug log 静默回传(零 UI)+ 服务端非 Origin 摄取入口",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        ".env.example",
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/debugLogRelay.test.ts",
+        "cindyplugin/src/__tests__/debugLogRelayBrain.test.ts",
+        "cindyplugin/src/__tests__/pluginAppVersion.test.ts",
+        "cindyplugin/src/diagnostics/debugLogRedact.ts",
+        "cindyplugin/src/diagnostics/debugLogRelay.ts",
+        "cindyplugin/src/persist/bridge.ts",
+        "cindyplugin/src/plugin-main.tsx",
+        "cindyplugin/vite.config.ts",
+        "docs/plans/2026-08-06-cindyplugin-silent-debug-log.md",
+        "server/routes/debug-logs.route.test.ts",
+        "server/routes/debug-logs.ts",
+        "src/store/remoteDebugReporter.test.ts",
+        "src/store/remoteDebugReporter.ts",
+        "src/store/remoteDebugTransport.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 541,
+      "title": "feat(server): debug-logs POST 新增非 Origin 摄取入口(token 门,fail-closed)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        ".env.example",
+        "docs/bff-deployment.md",
+        "docs/plans/2026-08-06-cindyplugin-silent-debug-log.md",
+        "server/contracts/contract.test.ts",
+        "server/contracts/debug-logs.json",
+        "server/contracts/deployment-snippet.test.ts",
+        "server/contracts/env-matrix.md",
+        "server/routes/debug-logs.route.test.ts",
+        "server/routes/debug-logs.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 542,
+      "title": "feat(cindyplugin): 插件版 debug log 静默回传(零 UI)+ 共享 reporter 可插拔",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/debugLogRelay.test.ts",
+        "cindyplugin/src/__tests__/debugLogRelayBrain.test.ts",
+        "cindyplugin/src/__tests__/pluginAppVersion.test.ts",
+        "cindyplugin/src/diagnostics/debugLogRedact.ts",
+        "cindyplugin/src/diagnostics/debugLogRelay.ts",
+        "cindyplugin/src/persist/bridge.ts",
+        "cindyplugin/src/plugin-main.tsx",
+        "cindyplugin/vite.config.ts",
+        "src/store/remoteDebugReporter.test.ts",
+        "src/store/remoteDebugReporter.ts",
+        "src/store/remoteDebugTransport.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 543,
+      "title": "fix(plugin): 设置卡主按钮改从底色反转——修深色卡上深压深,弃掉编错名的 accent token",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/settings.html",
+        "cindyplugin/src/__tests__/mivoSettingsCard.test.ts",
+        "cindyplugin/src/__tests__/mivoSettingsCardDom.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 544,
+      "title": "test: 固定 Vitest 的 i18n 语言基准，修复中文环境单测失败",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "src/i18n/__tests__/localePreference.test.ts",
+        "vitest.config.ts",
+        "vitest.setup.test.ts",
+        "vitest.setup.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 546,
+      "title": "refactor(design): establish font-size tokens and ratchet",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "docs/design-previews/region-edit/assets/product.css",
+        "docs/design.md",
+        "package.json",
+        "public/changelog.json",
+        "scripts/ci/design-token-mirror.mjs",
+        "scripts/ci/font-size-ratchet.mjs",
+        "scripts/ci/font-size-ratchet.test.mjs",
+        "src/App.css"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 547,
+      "title": "fix(canvas): pan 松手立即提交视口——消灭 freeze-pan 的 ref/state 分裂窗口 (#536)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        ".github/workflows/ci.yml",
+        "README.md",
+        "package.json",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/interactionDispatch.ts",
+        "src/canvas/screenToCanvasExport.contract.test.ts",
+        "src/canvas/useCanvasInteractionController.ts",
+        "src/canvas/useViewport.panCommitRace.test.tsx",
+        "src/canvas/useViewport.ts",
+        "src/canvas/viewportPostPanStaleRead.audit.test.tsx"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 548,
+      "title": "test(e2e): project-sidebar reload 前显式 flush #532 防抖写——修 nightly .project-row 超时回归",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/e2e/scenarios/project-sidebar.mjs",
+        "src/main.tsx"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 551,
+      "title": "fix(plugin): 设置卡「读取中」有界超时+可辨认初始文案+读取失败重试语义",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/settings.html",
+        "cindyplugin/src/__tests__/mivoSettingsCard.test.ts",
+        "cindyplugin/src/__tests__/mivoSettingsCardDom.test.ts",
+        "cindyplugin/src/settings/settingsCard.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 558,
+      "title": "feat(e2e): 每格 CTRF 风格结果台账 + context 级浏览器异常观测",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/e2e-runner.mjs",
+        "scripts/e2e-smoke.mjs",
+        "scripts/e2e/browser-error-guard.mjs",
+        "scripts/e2e/harness.mjs",
+        "scripts/e2e/result-ledger.mjs",
+        "scripts/e2e/result-ledger.test.mjs",
+        "scripts/e2e/scenarios/coordinate-probe.mjs",
+        "scripts/e2e/scenarios/migration.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 563,
+      "title": "test(e2e): coordinate-probe 改用真实 Leafer 渲染证据",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/e2e/renderer-evidence.mjs",
+        "scripts/e2e/scenarios/coordinate-probe.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 564,
+      "title": "fix(e2e): 台账可信化——exit-code 终局真值 + runId 隔离 + 严格 validator (#560)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/nightly-e2e.yml",
+        "scripts/ci/structure-guard.mjs",
+        "scripts/ci/structure-guard.test.mjs",
+        "scripts/e2e-runner.mjs",
+        "scripts/e2e-smoke.mjs",
+        "scripts/e2e/browser-error-guard.mjs",
+        "scripts/e2e/harness.mjs",
+        "scripts/e2e/ledger-summary.mjs",
+        "scripts/e2e/ledger-summary.test.mjs",
+        "scripts/e2e/result-ledger.mjs",
+        "scripts/e2e/result-ledger.test.mjs",
+        "scripts/e2e/scenarios/coordinate-probe.mjs",
+        "scripts/e2e/scenarios/migration.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 567,
+      "title": "fix(canvas): 模型菜单窄壳重排前强制同步布局——修 offsetX 跨布局世代瞬态 (#566)",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/e2e/scenarios/mask-point.mjs",
+        "src/canvas/useRegionEditFlip.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 568,
+      "title": "fix(bug-doctor): Mivo Slack 播报接入人格壳润色(persona-shell)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "docs/loops/bug-doctor.md",
+        "scripts/loops/bug-doctor/broadcast.mjs",
+        "scripts/loops/bug-doctor/broadcast.test.mjs",
+        "scripts/loops/bug-doctor/notify.mjs",
+        "scripts/loops/bug-doctor/notify.test.mjs",
+        "scripts/loops/bug-doctor/patrol.mjs",
+        "scripts/loops/bug-doctor/patrol.test.mjs",
+        "scripts/loops/bug-doctor/persona-shell.mjs",
+        "scripts/loops/bug-doctor/persona-shell.test.mjs",
+        "scripts/loops/merge-thanks/from-github-event.mjs",
+        "scripts/loops/merge-thanks/from-github-event.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 569,
+      "title": "fix(e2e): chat-copy 外部点击落点改 document.body,消除 setPointerCapture 假异常",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/e2e/scenarios/chat-copy.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 571,
+      "title": "test(e2e): 补 ledger-summary 四态计数与输入分支的零覆盖测试 (#561 前置)",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "public/changelog.json",
+        "scripts/e2e/ledger-summary.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 572,
+      "title": "ci(nightly): 覆盖 Leafer × legacy/new 的完整 144 格 E2E 矩阵 (#561)",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        ".github/workflows/nightly-e2e.yml",
+        "public/changelog.json",
+        "scripts/e2e/ledger-aggregate.mjs",
+        "scripts/e2e/ledger-aggregate.test.mjs",
+        "scripts/e2e/ledger-summary.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 573,
+      "title": "feat(reporter): 支持插件可插拔 transport(A1 共享层拆分)+ R1 三席修复",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "src/store/remoteDebugClientInfo.ts",
+        "src/store/remoteDebugReporter.plugin.test.ts",
+        "src/store/remoteDebugReporter.test.ts",
+        "src/store/remoteDebugReporter.ts",
+        "src/store/remoteDebugTransport.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 574,
+      "title": "feat(e2e): 新增跨 child 台账聚合校验器 ledger-aggregate (#561 拆分 1/2)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        ".github/workflows/nightly-e2e.yml",
+        "scripts/e2e/ledger-aggregate.mjs",
+        "scripts/e2e/ledger-aggregate.test.mjs",
+        "scripts/e2e/nightly-matrix-contract.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 575,
+      "title": "ci(nightly): 接线 legacy/new × dom/leafer 完整 148 格矩阵 (#561)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        ".github/workflows/nightly-e2e.yml",
+        "scripts/e2e/nightly-matrix-contract.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 576,
+      "title": "fix(e2e): #571 后续修复——null/数组/标量顶层输入 fail-closed + 完整 counts 防桶污染断言 (Refs #571, #561)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "scripts/e2e/ledger-summary.mjs",
+        "scripts/e2e/ledger-summary.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 577,
+      "title": "fix(e2e): manifest/ledger 合法 JSON null/数组/标量 fail-closed 而非 TypeError",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "scripts/e2e/ledger-summary.mjs",
+        "scripts/e2e/ledger-summary.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 578,
+      "title": "feat(review-pr): require automated review before auto-merge",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "agent-use/docs/pr-rules.json",
+        "scripts/loops/bug-doctor/docs-contract.test.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 580,
+      "title": "test(bench): 补图片像素内存基准——真实位图 × 三点生命周期采样(#508)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "bench/README.md",
+        "bench/baselines/p2-0-image-mem-count-ladder-r1024-dpr1-2026-08-09.json",
+        "bench/baselines/p2-0-image-mem-res-ladder-c12-dpr1-2026-08-09.json",
+        "package.json",
+        "scripts/bench/baseline-write.mjs",
+        "scripts/bench/collect-image-mem.mjs",
+        "scripts/bench/image-mem-gate-mutation-check.mjs",
+        "scripts/bench/image-mem-gate.contract.test.ts",
+        "scripts/bench/image-mem-gate.mjs",
+        "scripts/bench/image-mem-interrupt.contract.test.ts",
+        "scripts/bench/image-mem-lib.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 585,
+      "title": "perf(assets): #509 客户端资产 GC——孤儿资产宽限期回收 + 只增缓存清理",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "public/changelog.json",
+        "src/app/assetGcBoot.test.ts",
+        "src/app/assetGcBoot.ts",
+        "src/app/useStoreHydration.ts",
+        "src/lib/assetGc.test.ts",
+        "src/lib/assetGc.ts",
+        "src/lib/assetStorage.ts",
+        "src/lib/imageMetricsCache.test.ts",
+        "src/lib/imageMetricsCache.ts",
+        "src/lib/persistBoot.integration.test.ts",
+        "src/lib/persistBoot.sceneHydration.test.ts",
+        "src/lib/persistBoot.ts",
+        "src/lib/persistIdbStorage.ts",
+        "src/lib/snapshotCursorStore.test.ts",
+        "src/lib/snapshotCursorStore.ts",
+        "src/main.tsx",
+        "src/store/chatHydration.characterization.test.ts",
+        "src/store/chatPersistSync.ts",
+        "src/store/documentSlice.persist.test.ts",
+        "src/store/documentSlice.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 586,
+      "title": "test: 修复 writeRetryQueue/persistBoot 测试 interval 生命周期泄漏",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "src/lib/persistBoot.integration.test.ts",
+        "src/lib/writeRetryQueue.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 587,
+      "title": "fix(persist): 写防抖增加独立 maxWait 上界——高频写入永不落盘的数据丢失窗口",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "src/store/canvasPersistWriteScheduler.test.ts",
+        "src/store/canvasPersistWriteScheduler.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 588,
+      "title": "fix(e2e): archive-assets leafer 场景切换 destroy 崩溃 + 逐节点投影像素证据",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "scripts/e2e/scenarios/archive-assets.evidence.test.mjs",
+        "scripts/e2e/scenarios/archive-assets.mjs",
+        "src/render/useLeaferSpikeRenderer.failsafe.test.ts",
+        "src/render/useLeaferSpikeRenderer.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 589,
+      "title": "fix(e2e): canvas-interactions prod 首跑 resize 竞态——paste toast 遮挡 SE 手柄",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "scripts/e2e/scenarios/canvas-interactions.mjs"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 591,
+      "title": "feat(cindyplugin): 插件版 debug log 静默回传 relay(拆分链缺失的出网接线)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        ".github/workflows/ci.yml",
+        "cindyplugin/build.sh",
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/debugLogRelay.test.ts",
+        "cindyplugin/src/__tests__/debugLogRelayBrain.test.ts",
+        "cindyplugin/src/__tests__/debugLogRelayBuildInjection.test.ts",
+        "cindyplugin/src/__tests__/debugLogRelayGuard.test.ts",
+        "cindyplugin/src/__tests__/pluginAppVersion.test.ts",
+        "cindyplugin/src/diagnostics/debugLogRelay.ts",
+        "cindyplugin/src/persist/bridge.ts",
+        "cindyplugin/src/plugin-main.tsx",
+        "cindyplugin/vite.config.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 598,
+      "title": "feat: 印章工具增加落点预览",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "docs/design-previews/region-edit/assets/product.css",
+        "scripts/e2e/renderer-evidence.mjs",
+        "scripts/e2e/scenarios/canvas-interactions.mjs",
+        "scripts/e2e/scenarios/coordinate-probe.mjs",
+        "scripts/e2e/scenarios/mask.mjs",
+        "scripts/e2e/scenarios/stamp-overlap.mjs",
+        "src/App.css",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/useBrushStamp.ts",
+        "src/canvas/useCanvasInteractionController.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 599,
+      "title": "feat(canvas): 支持网格/点状底纹与 Cindy 设置入口",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/src/PluginApp.tsx",
+        "cindyplugin/src/__tests__/pluginCanvasSettings.test.tsx",
+        "cindyplugin/src/cindy-theme.css",
+        "docs/design-previews/region-edit/assets/product.css",
+        "server/persist/permissionBackend.contract.dual.test.ts",
+        "src/App.css",
+        "src/app/settings/CanvasAppearanceSection.test.tsx",
+        "src/app/settings/CanvasAppearanceSection.tsx",
+        "src/app/settings/CanvasSettingsPanel.tsx",
+        "src/app/settings/GatewayKeyDialog.tsx",
+        "src/app/settings/KeyDialogEscapeBubbling.test.tsx",
+        "src/app/settings/MivoKeyDialog.tsx",
+        "src/app/settings/SettingsPanel.logging.test.ts",
+        "src/app/settings/SettingsPanel.tsx",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/canvasInteraction.test.ts",
+        "src/canvas/canvasInteraction.ts",
+        "src/canvas/canvasPattern.test.ts",
+        "src/canvas/canvasPattern.ts",
+        "src/canvas/useCanvasInteractionController.ts",
+        "src/canvas/useViewport.pan.test.ts",
+        "src/canvas/useViewport.ts",
+        "src/i18n/locales/en/settings.json",
+        "src/i18n/locales/ja/settings.json",
+        "src/i18n/locales/ko/settings.json",
+        "src/i18n/locales/zh-CN/settings.json",
+        "src/store/canvasAppearanceStore.test.ts",
+        "src/store/canvasAppearanceStore.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 601,
+      "title": "feat(store): B 出网脱敏接线——buildRemoteDebugPayload 唯一组包点",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "src/store/remoteDebugClientInfo.ts",
+        "src/store/remoteDebugReporter.outbox.test.ts",
+        "src/store/remoteDebugReporter.test.ts",
+        "src/store/remoteDebugReporter.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 602,
+      "title": "feat(canvas): derivation edge 贝塞尔曲线化(smooth 路由+主题配色+可删/LOD/面板语义)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "docs/design-previews/region-edit/assets/product.css",
+        "src/App.css",
+        "src/canvas/CanvasNodeView.tsx",
+        "src/canvas/MarkupNodeView.tsx",
+        "src/canvas/SelectionQuickToolbar.tsx",
+        "src/canvas/canvasRenderAdapter.test.ts",
+        "src/canvas/canvasRenderAdapter.ts",
+        "src/canvas/markupTextGeometry.ts",
+        "src/lib/snapshotValidation.test.ts",
+        "src/lib/snapshotValidation.ts",
+        "src/model/connectorGeometry.ts",
+        "src/model/lineRouteGeometry.test.ts",
+        "src/model/lineRouteGeometry.ts",
+        "src/render/engineSpikeLod.test.ts",
+        "src/render/engineSpikeLod.ts",
+        "src/render/hitTest.test.ts",
+        "src/render/hitTest.ts",
+        "src/render/leaferLinePaint.test.ts",
+        "src/render/leaferLinePaint.ts",
+        "src/render/leaferPaintSignature.test.ts",
+        "src/render/leaferPaintSignature.ts",
+        "src/render/projection.ts",
+        "src/render/rendererAdapter.ts",
+        "src/render/useDocumentThemeAttribute.test.ts",
+        "src/render/useDocumentThemeAttribute.ts",
+        "src/render/useLeaferSpikeRenderer.ts",
+        "src/store/canvasDocumentModel.derivationGuard.test.ts",
+        "src/store/nodeFactory.test.ts",
+        "src/store/nodeFactory.ts",
+        "src/store/nodeMutationSlice.derivationEdgeDelete.test.ts",
+        "src/store/nodeMutationSlice.ts",
+        "src/store/selectionSlice.ts",
+        "src/types/mivoCanvas.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 603,
+      "title": "feat(canvas): 插件设置面板收敛 + 皮肤颜色跟随 Cindy 主题",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "bench/README.md",
+        "bench/baselines/p2-0-image-mem-count-ladder-r1024-dpr1-2026-08-08.json",
+        "bench/baselines/p2-0-image-mem-res-ladder-c12-dpr1-2026-08-08.json",
+        "bench/baselines/p2-2-after-sweep-c12-dpr1-2026-08-08.json",
+        "bench/baselines/p2-2-panfps-leafer-20k-dpr1-2026-08-08.json",
+        "bench/baselines/p2-2-step0-control-remove-c12-r2048-dpr1-2026-08-08.json",
+        "bench/baselines/p2-2-step0-destroy-probe-c12-r2048-dpr1-2026-08-08.json",
+        "cindyplugin/ghost.json",
+        "cindyplugin/src/__tests__/pluginCanvasSettings.test.tsx",
+        "cindyplugin/src/cindy-theme.css",
+        "docs/design-previews/region-edit/assets/product.css",
+        "docs/design-previews/region-edit/fixtures/cindy-default-skin-palettes.json",
+        "docs/design.md",
+        "package.json",
+        "scripts/bench/collect-image-mem.mjs",
+        "scripts/bench/image-mem-gate.contract.test.ts",
+        "scripts/bench/image-mem-gate.mjs",
+        "scripts/bench/image-mem-lib.mjs",
+        "src/App.css",
+        "src/app/settings/CanvasAppearanceSection.test.tsx",
+        "src/app/settings/CanvasAppearanceSection.tsx",
+        "src/app/settings/CanvasSettingsAppearanceSection.test.tsx",
+        "src/app/settings/CanvasSettingsAppearanceSection.tsx",
+        "src/app/settings/CanvasSettingsPanel.tsx",
+        "src/canvas/canvasPattern.test.ts",
+        "src/canvas/canvasPattern.ts",
+        "src/i18n/locales/en/settings.json",
+        "src/i18n/locales/ja/settings.json",
+        "src/i18n/locales/ko/settings.json",
+        "src/i18n/locales/zh-CN/settings.json",
+        "src/render/leaferBrushStampPaint.test.ts",
+        "src/render/leaferBrushStampPaint.ts",
+        "src/render/leaferImagePaint.pendingToken.test.ts",
+        "src/render/leaferImagePaint.test.ts",
+        "src/render/leaferImagePaint.ts",
+        "src/render/useLeaferSpikeRenderer.textEditShell.test.ts",
+        "src/render/useLeaferSpikeRenderer.ts",
+        "src/store/canvasAppearanceStore.test.ts",
+        "src/store/canvasAppearanceStore.ts",
+        "src/store/canvasSkinPalette.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 611,
+      "title": "feat(canvas): derivation edge hover/选中彗星尾流光 + 加粗反馈",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "docs/design-previews/region-edit/assets/product.css",
+        "src/App.css",
+        "src/canvas/CanvasNodeView.tsx",
+        "src/canvas/MarkupNodeView.derivationGlow.test.tsx",
+        "src/canvas/MarkupNodeView.tsx",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/derivationEdgeGlowLayers.ts",
+        "src/model/derivationEdgeGlowLayerTable.ts",
+        "src/model/edgeGlowColorDefaults.ts",
+        "src/render/leaferEdgeHoverFx.test.ts",
+        "src/render/leaferEdgeHoverFx.ts",
+        "src/render/leaferLinePaint.ts",
+        "src/render/useDerivationEdgeHover.test.ts",
+        "src/render/useDerivationEdgeHover.ts",
+        "src/render/useLeaferSpikeRenderer.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 617,
+      "title": "feat(canvas): 插件设置面板收敛 + 皮肤颜色跟随 Cindy 主题",
+      "types": [
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/src/__tests__/pluginCanvasSettings.test.tsx",
+        "cindyplugin/src/cindy-theme.css",
+        "docs/design-previews/region-edit/assets/product.css",
+        "docs/design-previews/region-edit/fixtures/cindy-default-skin-palettes.json",
+        "docs/design.md",
+        "src/App.css",
+        "src/app/settings/CanvasAppearanceSection.test.tsx",
+        "src/app/settings/CanvasAppearanceSection.tsx",
+        "src/app/settings/CanvasSettingsAppearanceSection.test.tsx",
+        "src/app/settings/CanvasSettingsAppearanceSection.tsx",
+        "src/app/settings/CanvasSettingsPanel.tsx",
+        "src/canvas/canvasPattern.test.ts",
+        "src/canvas/canvasPattern.ts",
+        "src/i18n/locales/en/settings.json",
+        "src/i18n/locales/ja/settings.json",
+        "src/i18n/locales/ko/settings.json",
+        "src/i18n/locales/zh-CN/settings.json",
+        "src/store/canvasAppearanceStore.test.ts",
+        "src/store/canvasAppearanceStore.ts",
+        "src/store/canvasSkinPalette.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 620,
+      "title": "fix(canvas): 浮层上松开印章不恢复预览",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "public/changelog.json",
+        "scripts/e2e/scenarios/stamp-overlap.mjs",
+        "src/canvas/useBrushStamp.contract.test.ts",
+        "src/canvas/useBrushStamp.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 622,
+      "title": "refactor(server): debug-logs 提取 hasOrigin 共享 predicate 并补空串行为锁测试",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "server/contracts/debug-logs.json",
+        "server/routes/debug-logs.route.test.ts",
+        "server/routes/debug-logs.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 623,
+      "title": "fix(canvas): align hit-area cursors and stamp release gating",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "docs/design-previews/region-edit/assets/product.css",
+        "public/changelog.json",
+        "src/App.css",
+        "src/App.tsx",
+        "src/app/ChangelogPanel.tsx",
+        "src/app/LibraryWorkspace.tsx",
+        "src/app/MediaLightbox.tsx",
+        "src/app/ProjectSidebar.tsx",
+        "src/app/settings/CanvasSettingsPanel.tsx",
+        "src/app/settings/GatewayKeyDialog.tsx",
+        "src/app/settings/MivoKeyDialog.tsx",
+        "src/app/settings/SettingsPanel.tsx",
+        "src/canvas/canvasInteraction.test.ts",
+        "src/canvas/canvasInteraction.ts",
+        "src/canvas/useBrushStamp.contract.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 625,
+      "title": "feat(canvas): agent 并发生图占位符集合镜头跟随，装不下时缩放居中 (#297)",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "src/agent/canvasAgentVerbs.test.ts",
+        "src/agent/canvasAgentVerbs.ts",
+        "src/canvas/autoFocusPlaceholder.test.ts",
+        "src/canvas/autoFocusPlaceholder.ts",
+        "src/canvas/maskEditGeneration.test.ts",
+        "src/canvas/useViewport.panCommitRace.test.tsx",
+        "src/canvas/useViewport.ts",
+        "src/store/cameraFocusStore.test.ts",
+        "src/store/cameraFocusStore.ts",
+        "src/store/generationFacade.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 626,
+      "title": "fix(canvas): 区域编辑豁免黑块检测,修好图被误判丢弃与双倍扣费",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "src/canvas/maskEditGeneration.test.ts",
+        "src/canvas/maskEditGeneration.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 628,
+      "title": "feat(region-edit): 「更多参数」参数模型 + BFF 通道分发 + 占位符落图",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/changelogAutoPopup.test.ts",
+        "cindyplugin/src/__tests__/changelogGeometryGuard.ts",
+        "server/__tests__/c1a.test.ts",
+        "server/__tests__/p1c.test.ts",
+        "server/lib/config.test.ts",
+        "server/lib/config.ts",
+        "server/platform/job.ts",
+        "server/routes/tasks.ts",
+        "server/tasks/runner.ts",
+        "shared/regionEditCapabilities.test.ts",
+        "shared/regionEditCapabilities.ts",
+        "src/canvas/imageMaskGeometry.ts",
+        "src/canvas/maskEditFloatingControls.ts",
+        "src/canvas/maskEditGeneration.ts",
+        "src/canvas/maskEditParamsPassthrough.test.ts",
+        "src/canvas/maskEditSlotPlan.test.ts",
+        "src/canvas/maskEditSlotPlan.ts",
+        "src/canvas/regionEditParams.test.ts",
+        "src/canvas/regionEditParams.ts",
+        "src/canvas/regionEditSubmit.test.ts",
+        "src/canvas/regionEditSubmit.ts",
+        "src/canvas/useMaskPointArmed.ts",
+        "src/lib/mivoTaskClient.ts",
+        "src/lib/regionEditPrompt.ts",
+        "src/store/chatMaskEditFlow.test.ts",
+        "src/store/chatMaskEditFlow.ts",
+        "src/store/commitGenerationResult.multiSlotBatch.test.ts",
+        "src/store/commitGenerationResult.ts",
+        "src/store/maskEditTaskRuntime.ts",
+        "src/store/multiSlotPlacement.ts",
+        "src/store/multiSlotStaleCleanup.test.ts",
+        "src/types/generation.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 629,
+      "title": "feat(plugin): 出图参数透传 Mivo 直连 + 多图取件 + 恢复取件",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/brainHarness.ts",
+        "cindyplugin/src/__tests__/mivoChannel.test.ts",
+        "cindyplugin/src/__tests__/mivoIdempotency.test.ts",
+        "cindyplugin/src/agent/cindyGenerationPort.ts",
+        "cindyplugin/src/persist/bridge.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 630,
+      "title": "feat(region-edit): 「更多参数」面板 UI(比例/画质/张数)",
+      "types": [
+        "test_skipped",
+        "relaxed_matcher"
+      ],
+      "files": [
+        "cindyplugin/src/cindy-theme.css",
+        "docs/design-previews/region-edit/assets/product.css",
+        "docs/design-previews/region-edit/screenshots/01-entry-closed.png",
+        "docs/design-previews/region-edit/screenshots/02-panel-open.webp",
+        "docs/design-previews/region-edit/screenshots/03-panel-dark.webp",
+        "src/App.css",
+        "src/canvas/RegionEditOverlay.tsx",
+        "src/canvas/RegionEditParamsSelect.test.tsx",
+        "src/canvas/RegionEditParamsSelect.tsx",
+        "src/canvas/maskEditFloatingControls.ts",
+        "src/canvas/regionEditDraft.test.ts",
+        "src/canvas/regionEditDraft.ts",
+        "src/canvas/regionEditOverlayRender.tsx",
+        "src/canvas/regionEditRatioIcon.tsx",
+        "src/canvas/regionEditState.ts",
+        "src/canvas/regionEditTheme.test.ts",
+        "src/canvas/regionRefSuggestState.test.ts",
+        "src/canvas/regionRefSuggestState.ts",
+        "src/canvas/useRegionEditKeyboard.test.tsx",
+        "src/canvas/useRegionEditKeyboard.ts",
+        "src/canvas/useRegionEditParams.test.tsx",
+        "src/canvas/useRegionEditParams.ts",
+        "src/canvas/useRegionRefEditor.ts",
+        "src/i18n/locales/en/menu.json",
+        "src/i18n/locales/ja/menu.json",
+        "src/i18n/locales/ko/menu.json",
+        "src/i18n/locales/zh-CN/menu.json",
+        "src/lib/menuOverlayStack.contract.test.ts",
+        "src/lib/menuOverlayStack.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 631,
+      "title": "fix(canvas): 二级浮层几何回调同帧提交，根治 mask-point 窄壳首帧竞态",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "scripts/e2e/scenarios/mask-point.mjs",
+        "src/canvas/useRegionEditFlip.test.tsx",
+        "src/canvas/useRegionEditFlip.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 632,
+      "title": "fix(canvas): 选工具即退出 AI 编辑（待命态与浮层两形态）",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "docs/evidence/region-edit-select-tool/01-idle.png",
+        "docs/evidence/region-edit-select-tool/02-armed.png",
+        "docs/evidence/region-edit-select-tool/03-panel-open.png",
+        "docs/evidence/region-edit-select-tool/04-after-v.png",
+        "docs/evidence/region-edit-select-tool/README.md",
+        "src/canvas/CanvasToolDock.test.tsx",
+        "src/canvas/CanvasToolDock.tsx",
+        "src/canvas/MivoCanvas.tsx",
+        "src/canvas/regionEditArmed.test.ts",
+        "src/canvas/useCanvasInteractionController.ts",
+        "src/canvas/useGlobalCanvasEvents.contract.test.ts",
+        "src/canvas/useGlobalCanvasEvents.ts",
+        "src/canvas/useRegionEditArmed.test.tsx",
+        "src/canvas/useRegionEditArmed.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 634,
+      "title": "feat(changelog): 插件版更新公告移植（入口/面板/暗色/自动弹窗）",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "README.md",
+        "cindyplugin/build.sh",
+        "cindyplugin/src/PluginApp.tsx",
+        "cindyplugin/src/__tests__/changelogAutoPopup.test.ts",
+        "cindyplugin/src/__tests__/changelogGeometryGuard.ts",
+        "cindyplugin/src/__tests__/mergeBaseGuard.ts",
+        "cindyplugin/src/__tests__/pluginCanvasSettings.test.tsx",
+        "cindyplugin/src/__tests__/pluginChangelogEntry.test.tsx",
+        "cindyplugin/src/__tests__/pluginChangelogHydration.test.tsx",
+        "cindyplugin/src/changelogAutoPopup.ts",
+        "cindyplugin/src/cindy-theme.css",
+        "cindyplugin/src/usePluginHydration.ts",
+        "docs/design-previews/region-edit/assets/product.css",
+        "docs/design.md",
+        "src/app/settings/CanvasSettingsPanel.tsx",
+        "src/app/useStoreHydration.ts",
+        "src/canvas/changelogTheme.test.ts",
+        "src/i18n/locales/en/settings.json",
+        "src/i18n/locales/ja/settings.json",
+        "src/i18n/locales/ko/settings.json",
+        "src/i18n/locales/zh-CN/settings.json",
+        "src/store/changelogStore.test.ts",
+        "src/store/changelogStore.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 637,
+      "title": "feat(canvas): 出图结果落地镜头居中全链路覆盖 + 注册表场景键化 (#297)",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "src/App.test.tsx",
+        "src/App.tsx",
+        "src/agent/canvasAgentVerbs.test.ts",
+        "src/app/sidebar/projectSidebarModel.ts",
+        "src/canvas/autoFocusPlaceholder.test.ts",
+        "src/canvas/autoFocusPlaceholder.ts",
+        "src/canvas/maskEditGeneration.placeholder.test.ts",
+        "src/canvas/maskEditGeneration.request.test.ts",
+        "src/canvas/maskEditGeneration.selfHeal.test.ts",
+        "src/canvas/maskEditGeneration.ts",
+        "src/canvas/useViewport.panCommitRace.test.tsx",
+        "src/canvas/useViewport.ts",
+        "src/store/cameraFocusStore.test.ts",
+        "src/store/cameraFocusStore.ts",
+        "src/store/generation.contract.test.ts",
+        "src/store/generationFacade.test.ts",
+        "src/store/generationSlice.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 638,
+      "title": "fix(cindyplugin): 更新公告遮罩透明 + 未读红点右上角定位",
+      "types": [
+        "test_skipped",
+        "xtest_used"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/pluginChangelogEntry.test.tsx",
+        "cindyplugin/src/cindy-theme.css",
+        "docs/design-previews/region-edit/assets/product.css",
+        "src/canvas/changelogTheme.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 640,
+      "title": "test(store): centeredColumnPlacements 单边对齐补 height=Math.round(anchor.height) 绑定断言",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "src/store/aiCanvasWorkflow.test.ts",
+        "src/store/aiCanvasWorkflow.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 641,
+      "title": "fix(store): 批次聚合硬化(store 侧) — 身份冻结/短缺预建前拒绝/生命周期注册/结果按 slot 归属",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "shared/persist-contract.ts",
+        "src/agent/canvasAgentVerbs.test.ts",
+        "src/agent/canvasAgentVerbs.ts",
+        "src/canvas/actions/canvasCommand.serialize.test.ts",
+        "src/canvas/actions/canvasSyncRuntime.block3.test.ts",
+        "src/kernel/mapping.test.ts",
+        "src/store/canvasGenerationHydration.ts",
+        "src/store/canvasStateTypes.ts",
+        "src/store/commitGenerationResult.ts",
+        "src/store/commitGenerationResultCrossScene.test.ts",
+        "src/store/derivedBatchCoordinator.ts",
+        "src/store/generation.contract.test.ts",
+        "src/store/generationSlice.ts",
+        "src/store/hydrationDurableSettle.test.ts",
+        "src/store/nodeFactory.ts",
+        "src/types/mivoCanvas.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 642,
+      "title": "feat(cindyplugin): 公共 edit 工具批次 schema 透传与聚合桥接 + refactor(store): 轮询/终态 helper 抽取",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/agentBridgeSelection.test.ts",
+        "cindyplugin/src/__tests__/editBatchPublicRoute.test.ts",
+        "cindyplugin/src/agent/agentBridge.ts",
+        "src/store/generationSlice.ts",
+        "src/store/generationTaskHelpers.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 643,
+      "title": "fix(store): P1b β1 store-contract 节 — 批次机制纯增量 + G1G5 硬化 + 终态 canonical transition(合成 main #637 镜头聚焦)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "src/canvas/actions/canvasCommand.serialize.test.ts",
+        "src/store/canvasStateTypes.ts",
+        "src/store/derivedBatchCoordinator.ts",
+        "src/store/generation.batchPlacement.contract.test.ts",
+        "src/store/generation.batchTerminal.contract.test.ts",
+        "src/store/generation.contract.test.ts",
+        "src/store/generation.focus.contract.test.ts",
+        "src/store/generationBatchContract.test.ts",
+        "src/store/generationSlice.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 644,
+      "title": "fix(agent): β2 entry-wiring 节 — H1 presence 值语义 + 错误激活 + main #637 镜头契约适配",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/editBatchPublicRoute.test.ts",
+        "scripts/e2e/scenarios/mask-reflow.mjs",
+        "scripts/e2e/scenarios/variations-annotation.mjs",
+        "src/agent/canvasAgentVerbs.test.ts",
+        "src/agent/canvasAgentVerbs.ts",
+        "src/app/InspectorPanel.tsx",
+        "src/canvas/AnchorOverlay.tsx",
+        "src/canvas/actions/canvasActionEmitters.ts",
+        "src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts",
+        "src/canvas/actions/canvasActionModel.characterization.test.ts",
+        "src/canvas/actions/canvasActionModel.slotFill.test.ts",
+        "src/canvas/actions/canvasActionModel.ts",
+        "src/canvas/actions/canvasCommand.ts",
+        "src/canvas/actions/canvasCommandExecutor.test.ts",
+        "src/canvas/actions/canvasSelectionModel.ts",
+        "src/canvas/actions/canvasSyncRuntime.block1.test.ts",
+        "src/canvas/actions/canvasSyncRuntime.block3.test.ts",
+        "src/lib/safeArgs.ts",
+        "src/store/canvasDocumentModel.ts",
+        "src/store/canvasStateTypes.ts",
+        "src/store/chatStore.test.ts",
+        "src/store/chatStore.ts",
+        "src/store/chatStoreTypes.ts",
+        "src/store/derivedBatchCoordinator.ts",
+        "src/store/generation.batchPlacement.contract.test.ts",
+        "src/store/generation.batchTerminal.contract.test.ts",
+        "src/store/generation.contract.test.ts",
+        "src/store/generation.focus.contract.test.ts",
+        "src/store/generationBatchContract.test.ts",
+        "src/store/generationEntryContract.test.ts",
+        "src/store/generationEntryEnumerationGuard.test.ts",
+        "src/store/generationFacade.ts",
+        "src/store/resolvedSourceNodeType.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 645,
+      "title": "fix(e2e): gamma 节 — 场景注册补全 + 夜间矩阵契约同步 + CI 矩阵字面量对齐",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        ".github/workflows/nightly-e2e.yml",
+        "cindyplugin/ghost.json",
+        "package.json",
+        "scripts/e2e/ledger-aggregate.test.mjs",
+        "scripts/e2e/nightly-matrix-contract.test.mjs",
+        "scripts/e2e/scenarios/index.mjs",
+        "scripts/e2e/scenarios/p1b-batch-column.mjs",
+        "src/canvas/actions/canvasCommand.serialize.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 647,
+      "title": "fix(store): 批次聚合硬化(store 侧) — 身份冻结/短缺预建前拒绝/生命周期注册/结果按 slot 归属 (r3)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "shared/persist-contract.ts",
+        "src/agent/canvasAgentVerbs.test.ts",
+        "src/agent/canvasAgentVerbs.ts",
+        "src/canvas/actions/canvasCommand.serialize.test.ts",
+        "src/canvas/actions/canvasSyncRuntime.block3.test.ts",
+        "src/kernel/mapping.test.ts",
+        "src/store/canvasGenerationHydration.ts",
+        "src/store/canvasStateTypes.ts",
+        "src/store/commitGenerationResult.ts",
+        "src/store/commitGenerationResultCrossScene.test.ts",
+        "src/store/derivedBatchCoordinator.ts",
+        "src/store/generation.batchPlacement.contract.test.ts",
+        "src/store/generation.contract.test.ts",
+        "src/store/generation.focus.contract.test.ts",
+        "src/store/generationSlice.ts",
+        "src/store/generationTaskHelpers.ts",
+        "src/store/hydrationDurableSettle.test.ts",
+        "src/store/nodeFactory.ts",
+        "src/types/mivoCanvas.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 648,
+      "title": "feat(cindyplugin): 公共 edit 工具批次 schema 透传与聚合桥接 + chore(store): coordinator 注释恢复 (r3)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/ghost.json",
+        "cindyplugin/main.js",
+        "cindyplugin/src/__tests__/agentBridgeSelection.test.ts",
+        "cindyplugin/src/__tests__/editBatchPublicRoute.test.ts",
+        "cindyplugin/src/agent/agentBridge.ts",
+        "src/agent/canvasAgentVerbs.ts",
+        "src/store/derivedBatchCoordinator.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 649,
+      "title": "fix(store): P1b β1 store-contract 节 — 批次机制纯增量 + G1G5 硬化 + 终态 canonical transition(合成 main #637 镜头聚焦) (r3)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "src/canvas/actions/canvasCommand.serialize.test.ts",
+        "src/store/canvasStateTypes.ts",
+        "src/store/derivedBatchCoordinator.ts",
+        "src/store/generation.batchPlacement.contract.test.ts",
+        "src/store/generation.batchTerminal.contract.test.ts",
+        "src/store/generation.contract.test.ts",
+        "src/store/generation.focus.contract.test.ts",
+        "src/store/generationBatchContract.test.ts",
+        "src/store/generationSlice.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 650,
+      "title": "fix(agent): β2 entry-wiring 节 — 抛错激活 + 全部调用点接线 + G2/G3/G4/H1/H2/H3 硬化 + chatStoreTypes 提取 (r3)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        "cindyplugin/src/__tests__/editBatchPublicRoute.test.ts",
+        "scripts/e2e/scenarios/chat-generation.mjs",
+        "scripts/e2e/scenarios/mask-reflow.mjs",
+        "scripts/e2e/scenarios/variations-annotation.mjs",
+        "src/agent/canvasAgentVerbs.test.ts",
+        "src/agent/canvasAgentVerbs.ts",
+        "src/app/InspectorPanel.tsx",
+        "src/canvas/AnchorOverlay.tsx",
+        "src/canvas/actions/canvasActionEmitters.ts",
+        "src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts",
+        "src/canvas/actions/canvasActionModel.characterization.test.ts",
+        "src/canvas/actions/canvasActionModel.slotFill.test.ts",
+        "src/canvas/actions/canvasActionModel.ts",
+        "src/canvas/actions/canvasCommand.ts",
+        "src/canvas/actions/canvasCommandExecutor.test.ts",
+        "src/canvas/actions/canvasSelectionModel.ts",
+        "src/canvas/actions/canvasSyncRuntime.block1.test.ts",
+        "src/canvas/actions/canvasSyncRuntime.block3.test.ts",
+        "src/lib/safeArgs.ts",
+        "src/store/canvasDocumentModel.ts",
+        "src/store/canvasStateTypes.ts",
+        "src/store/chatStore.test.ts",
+        "src/store/chatStore.ts",
+        "src/store/chatStoreTypes.ts",
+        "src/store/derivedBatchCoordinator.ts",
+        "src/store/generation.batchPlacement.contract.test.ts",
+        "src/store/generation.batchTerminal.contract.test.ts",
+        "src/store/generation.contract.test.ts",
+        "src/store/generation.focus.contract.test.ts",
+        "src/store/generationBatchContract.test.ts",
+        "src/store/generationEntryContract.test.ts",
+        "src/store/generationEntryEnumerationGuard.test.ts",
+        "src/store/generationFacade.ts",
+        "src/store/resolvedSourceNodeType.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 651,
+      "title": "fix(e2e): gamma 节 — p1b-batch-column 场景 + 矩阵同步 38/152/76 + 归属锁 (r3)",
+      "types": [
+        "deleted_assertion"
+      ],
+      "files": [
+        ".github/workflows/nightly-e2e.yml",
+        "package.json",
+        "scripts/e2e/ledger-aggregate.test.mjs",
+        "scripts/e2e/nightly-matrix-contract.test.mjs",
+        "scripts/e2e/scenarios/chat-generation.mjs",
+        "scripts/e2e/scenarios/index.mjs",
+        "scripts/e2e/scenarios/p1b-batch-column.mjs",
+        "src/canvas/actions/canvasCommand.serialize.test.ts"
+      ],
+      "hasDiff": false
+    },
+    {
+      "number": 653,
+      "title": "fix(canvas): prevent mask toolbar overlap and narrow-shell clipping",
+      "types": [
+        "test_skipped"
+      ],
+      "files": [
+        "docs/design-previews/region-edit/assets/product.css",
+        "scripts/e2e/scenarios/mask-blackblock.mjs",
+        "src/App.css",
+        "src/canvas/maskEditFloatingControls.ts",
+        "src/canvas/regionEditOverlayRender.tsx"
+      ],
+      "hasDiff": false
+    }
+  ],
+  "negatives": [
+    {
+      "number": 410,
+      "title": "test(cindyplugin): deposit 电子脑侧协议回归补全——整代退休 K=3 + 单写者架构 + 五~八轮返修",
+      "files": [
+        "cindyplugin/src/__tests__/depositBrain.test.ts"
+      ],
+      "hasDiff": true
+    }
+  ]
+}
