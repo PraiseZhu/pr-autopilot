@@ -133,6 +133,7 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    | `failed` | `blocked` | 重试计数 ≥ `maxRetries`，转人工 |
    | `fixing` | `checking` | 自动修复完成，**必须重新执行完整格式闸**（不得因「修过一次」直接放行） |
    | `fixing` | `blocked` | 自动修复自身失败（无法生成修复补丁/快照还原失败），转人工 |
+   | `blocked` | `pending` | lead 人工修复完成，手动重置（重试计数器归零，见下方「阻断出口」第 2 条） |
 
    **重试上限**：`maxRetries` 默认 3，由目标仓 `agent-use/docs/pr-rules.json` 的
    `formatGate.maxRetries` 字段配置（缺省 = 3；malformed → fail-closed，拒绝执行）。
@@ -178,7 +179,7 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    | G3 | 规模入口闸 | `size-gate.mjs` | STOP → 不得进入 Phase 2；WARN → 继续但须台账登记拆分规划 |
    | G4 | 标题/正文模板合规闸 | `pr-format-gate.mjs` | FAIL → 进入格式闸状态机修复分支（§6b） |
 
-   **合取规则**：G1 ∧ G2 ∧ G3 ∧ G4 = true 才进入 Phase 2。任一间 FAIL/STOP 阻断后续闸的执行。
+   **合取规则**：G1 ∧ G2 ∧ G3 ∧ G4 = true 才进入 Phase 2。任一门 FAIL/STOP 阻断后续闸的执行。
 
    **判定基准一致性规则**：
 
@@ -194,7 +195,7 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
         若因任何原因（如人工操作顺序错误）导致 G4 在 G3 之前执行并取得 PASS，G3 判 STOP 后
         该 PASS 结论**标记为 stale**——因为 G3 STOP 要求拆分 PR，拆分后 PR 标题/正文必然变化，
         原 G4 结论不再有效。
-      - 拆分后各子 PR 必须**各自重跑**完整四闸（G1→G2→G3→G4），不得复用拆分前任一间结论。
+      - 拆分后各子 PR 必须**各自重跑**完整四闸（G1→G2→G3→G4），不得复用拆分前任一门结论。
       - 台账记录：`format-gate: stale(上游 size-gate STOP，拆分后重跑)`。
 
    3. **自动修复改动文件后，G1 和 G2 的判定基准不变**：
