@@ -29,10 +29,14 @@ try {
 function runPositiveTests(testset) {
   const results = [];
   for (const pos of testset.positives) {
+    if (!pos.hasDiff) {
+      results.push({ number: pos.number, title: pos.title, diff: 'N/A', pass: true, findings: -1, detail: 'not_run: hasDiff=false', tags: pos.types });
+      continue;
+    }
     const diffPath = join(DIFFS, `${pos.number}.diff`);
-    if (!existsSync(diffPath)) continue;
+    if (!existsSync(diffPath)) { results.push({ number: pos.number, title: pos.title, diff: `${pos.number}.diff`, pass: true, findings: -1, detail: 'not_run: diff file missing', tags: pos.types }); continue; }
     const diff = readFileSync(diffPath, 'utf8');
-    if (!diff.trim()) continue;
+    if (!diff.trim()) { results.push({ number: pos.number, title: pos.title, diff: `${pos.number}.diff`, pass: true, findings: -1, detail: 'not_run: diff empty', tags: pos.types }); continue; }
     try {
       const result = detectAssertionWeakening(diff);
       const hasFindings = result.summary.total > 0;
@@ -56,10 +60,14 @@ function runPositiveTests(testset) {
 function runNegativeTests(testset) {
   const results = [];
   for (const neg of testset.negatives) {
+    if (!neg.hasDiff) {
+      results.push({ number: neg.number, title: neg.title, diff: 'N/A', pass: true, findings: -1, detail: 'not_run: hasDiff=false', tags: [] });
+      continue;
+    }
     const diffPath = join(DIFFS, `${neg.number}.diff`);
-    if (!existsSync(diffPath)) continue;
+    if (!existsSync(diffPath)) { results.push({ number: neg.number, title: neg.title, diff: `${neg.number}.diff`, pass: true, findings: -1, detail: 'not_run: diff file missing', tags: [] }); continue; }
     const diff = readFileSync(diffPath, 'utf8');
-    if (!diff.trim()) continue;
+    if (!diff.trim()) { results.push({ number: neg.number, title: neg.title, diff: `${neg.number}.diff`, pass: true, findings: -1, detail: 'not_run: diff empty', tags: [] }); continue; }
     try {
       const result = detectAssertionWeakening(diff);
       results.push({
@@ -135,12 +143,14 @@ async function main() {
   const positiveResults = runPositiveTests(testset);
   const posPass = positiveResults.filter(r => r.pass);
   const posFail = positiveResults.filter(r => !r.pass);
+  const posSkipped = positiveResults.filter(r => r.detail.startsWith('not_run'));
   const posTotal = positiveResults.length;
 
   // 第②组
   const negativeResults = runNegativeTests(testset);
   const negPass = negativeResults.filter(r => r.pass);
   const negFail = negativeResults.filter(r => !r.pass);
+  const negSkipped = negativeResults.filter(r => r.detail.startsWith('not_run'));
   const negTotal = negativeResults.length;
 
   // 特检 #382
@@ -152,8 +162,10 @@ async function main() {
 
   // 输出摘要
   console.log('=== 断言弱化检测器回归 ===');
-  console.log(`正样本: ${posPass.length}/${posTotal} 通过, ${posFail.length} 失败`);
-  console.log(`负样本: ${negPass.length}/${negTotal} 通过, ${negFail.length} 失败`);
+  const posSkippedStr = posSkipped.length > 0 ? ` (${posSkipped.length} 无 diff 跳过)` : '';
+  const negSkippedStr = negSkipped.length > 0 ? ` (${negSkipped.length} 无 diff 跳过)` : '';
+  console.log(`正样本: ${posPass.length}/${posTotal} 通过, ${posFail.length} 失败${posSkippedStr}`);
+  console.log(`负样本: ${negPass.length}/${negTotal} 通过, ${negFail.length} 失败${negSkippedStr}`);
   console.log(`#382: ${pr382 ? (pr382.pass ? '✓ 命中' : '✗ 漏报') : 'N/A'}`);
   console.log(`#410: ${pr410 ? (pr410.pass ? '✓ 0 findings' : `✗ ${pr410.findings} findings`) : 'N/A'}`);
   console.log(`软链一致性: ${symlinkResults[0]?.pass ? '✓ 一致' : '✗ 不一致'}`);
@@ -166,6 +178,10 @@ async function main() {
   if (negFail.length > 0) {
     console.log('\n--- 负样本失败 ---');
     for (const f of negFail) console.log(`  #${f.number} ${f.title}: ${f.detail}`);
+  }
+  if (posSkipped.length > 0 || negSkipped.length > 0) {
+    console.log('\n--- 无 diff 跳过 ---');
+    for (const s of [...posSkipped, ...negSkipped]) console.log(`  #${s.number} ${s.title}: ${s.detail}`);
   }
 
   // 末行: failed 标签集合或 pass

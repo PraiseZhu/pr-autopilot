@@ -126,20 +126,26 @@ function main() {
     }
   }
 
+  // 正负样本都只保留 hasDiff===true 的条目
+  const keptPositives = positives.filter(p => existsSync(join(diffsDir, `${p.number}.diff`)));
+  const keptNegatives = negatives.filter(n => existsSync(join(diffsDir, `${n.number}.diff`)));
+  const droppedPositives = positives.length - keptPositives.length;
+  const droppedNegatives = negatives.length - keptNegatives.length;
+
   const testset = {
     generated: new Date().toISOString(),
     source: TAXONOMY_DIR,
     total_entries: entries.length,
-    positives: positives.map(p => ({
+    positives: keptPositives.map(p => ({
       number: p.number, title: p.title,
       types: measurePR(p)?.types || [],
       files: (p.files||[]).map(f => f.path),
-      hasDiff: existsSync(join(diffsDir, `${p.number}.diff`)),
+      hasDiff: true,
     })),
-    negatives: negatives.map(n => ({
+    negatives: keptNegatives.map(n => ({
       number: n.number, title: n.title,
       files: (n.files||[]).map(f => f.path),
-      hasDiff: existsSync(join(diffsDir, `${n.number}.diff`)),
+      hasDiff: true,
     })),
   };
 
@@ -147,9 +153,11 @@ function main() {
 
   process.stdout.write(JSON.stringify({
     status: 'ok', total_entries: entries.length,
-    positive_count: positives.length, negative_count: negatives.length,
-    has_382_in_positive: positives.some(p => p.number === 382),
-    has_410_in_negative: negatives.some(n => n.number === 410),
+    positive_count: keptPositives.length, negative_count: keptNegatives.length,
+    kept_with_diff: keptPositives.length + keptNegatives.length,
+    dropped_no_diff: droppedPositives + droppedNegatives,
+    has_382_in_positive: keptPositives.some(p => p.number === 382),
+    has_410_in_negative: keptNegatives.some(n => n.number === 410),
     output_dir: args.out,
   }, null, 2) + '\n');
   process.exit(0);
