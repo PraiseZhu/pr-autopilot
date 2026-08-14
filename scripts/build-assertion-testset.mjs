@@ -1,16 +1,42 @@
 #!/usr/bin/env node
 // scripts/build-assertion-testset.mjs — 从 PR taxonomy 构建断言弱化测试集
-// 用法: node scripts/build-assertion-testset.mjs --out <dir>
+// 用法: node scripts/build-assertion-testset.mjs --out <dir> [--mivo-dir <path>] [--taxonomy-dir <path>]
+//   输入路径可通过 CLI 参数或环境变量指定:
+//     --mivo-dir <path>       mivo-canvas 仓路径 (默认: $MIVO_CANVAS_DIR)
+//     --taxonomy-dir <path>   PR taxonomy detail 目录 (默认: $TAXONOMY_DIR, 或 $MIVO_CANVAS_DIR/_tmp/debug/pr-taxonomy/detail)
+//   若未指定 --mivo-dir 且 $MIVO_CANVAS_DIR 为空，脚本会尝试从当前工作目录向上查找 git 仓根。
 // 输出: fixtures/assertion-weakening/testset.json + diffs/<n>.diff
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const MIVO = '/Users/praise/AI-Agent/Claude/projects/Project MivoCanvas';
-const TAXONOMY_DIR = join(MIVO, '_tmp', 'debug', 'pr-taxonomy', 'detail');
+
+function findGitRoot(startDir) {
+  let d = resolve(startDir);
+  while (d !== '/') {
+    if (existsSync(join(d, '.git'))) return d;
+    const parent = dirname(d);
+    if (parent === d) break;
+    d = parent;
+  }
+  return null;
+}
+
+function resolveMivoDir(cliArg) {
+  if (cliArg) return cliArg;
+  if (process.env.MIVO_CANVAS_DIR) return process.env.MIVO_CANVAS_DIR;
+  return findGitRoot(process.cwd()) || null;
+}
+
+function resolveTaxonomyDir(cliArg, mivoDir) {
+  if (cliArg) return cliArg;
+  if (process.env.TAXONOMY_DIR) return process.env.TAXONOMY_DIR;
+  if (mivoDir) return join(mivoDir, '_tmp', 'debug', 'pr-taxonomy', 'detail');
+  return null;
+}
 
 const ASSERTION_WEAKENING_KEYWORDS = [
   'skip', '跳过', '弱化', '删断言', '删除断言', 'xdescribe', 'xtest', 'xit',
@@ -20,7 +46,7 @@ const ASSERTION_WEAKENING_KEYWORDS = [
 
 // 判断形态
 function measurePR(pr) {
-  const text = `${pr.title} ${pr.body} ${(pr.files||[]).map(f => f.path).join(' ')}`;
+  const text = `${pr.title} ${pr.body}`;
   const low = text.toLowerCase();
   const types = [];
   const files = pr.files || [];
@@ -64,14 +90,21 @@ function main() {
   const args = {};
   for (let i = 2; i < process.argv.length; i++) {
     if (process.argv[i] === '--out') { args.out = process.argv[++i]; }
+    else if (process.argv[i] === '--mivo-dir') { args.mivoDir = process.argv[++i]; }
+    else if (process.argv[i] === '--taxonomy-dir') { args.taxonomyDir = process.argv[++i]; }
   }
   if (!args.out) { process.stderr.write('[FAIL] 请指定 --out <dir>\n'); process.exit(2); }
+
+  const MIVO = resolveMivoDir(args.mivoDir);
+  if (!MIVO) { process.stderr.write('[FAIL] 无法确定 mivo-canvas 仓路径。请通过 --mivo-dir <path> 或环境变量 MIVO_CANVAS_DIR 指定\n'); process.exit(2); }
+  const TAXONOMY_DIR = resolveTaxonomyDir(args.taxonomyDir, MIVO);
+  if (!TAXONOMY_DIR) { process.stderr.write('[FAIL] 无法确定 taxonomy 目录。请通过 --taxonomy-dir <path> 或环境变量 TAXONOMY_DIR 指定\n'); process.exit(2); }
 
   if (!existsSync(args.out)) mkdirSync(args.out, { recursive: true });
   const diffsDir = join(args.out, 'diffs');
   if (!existsSync(diffsDir)) mkdirSync(diffsDir, { recursive: true });
 
-  if (!existsSync(TAXONOMY_DIR)) { process.stderr.write(`[FAIL] taxonomy 目录不存在: ${TAXONOMY_DIR}\n`); process.exit(2); }
+  if (!existsSync(TAXONOMY_DIR)) { process.stderr.write(`[FAIL] taxonomy 目录不存在: ${TAXONOMY_DIR}。请通过 --taxonomy-dir <path> 或环境变量 TAXONOMY_DIR 指定正确的路径\n`); process.exit(2); }
 
   const entries = [];
   for (const name of readdirSync(TAXONOMY_DIR)) {

@@ -96,7 +96,7 @@ export function parseDiff(diff) {
     if (line.startsWith('deleted file mode')) { if (currentFile) currentFile.status = 'deleted'; continue; }
     if (line.startsWith('rename from') || line.startsWith('rename to') || line.startsWith('index ') || line.startsWith('--- ') || line.startsWith('+++ ')) continue;
     if (line.startsWith('@@ ')) { if (currentFile && currentHunk) { currentFile.hunks.push(currentHunk); } currentHunk = { header: line, lines: [] }; continue; }
-    if (currentHunk) { const type = line[0] === '-' ? 'removed' : line[0] === '+' ? 'added' : 'context'; currentHunk.lines.push({ type, content: line }); }
+    if (currentHunk) { const type = line[0] === '-' ? 'removed' : line[0] === '+' ? 'added' : 'context'; currentHunk.lines.push({ type, content: line.slice(1) }); }
   }
   if (currentFile) { if (currentHunk) currentFile.hunks.push(currentHunk); files.push(currentFile); }
   return files;
@@ -105,10 +105,10 @@ export function parseDiff(diff) {
 // ── 检测逻辑 ──
 export function isTestFile(filename) {
   const base = filename.split('/').pop() || '';
-  // 标准测试文件扩展名
+  // 标准测试文件扩展名（对 basename 判定）
   if (/\.(test|spec|e2e)\.(mjs|js|ts|jsx|tsx)$/.test(base)) return true;
-  // __tests__ / __test__ 目录
-  if (base.includes('__tests__') || base.includes('__test__')) return true;
+  // __tests__ / __test__ 目录（对完整路径判定，与 builder 的 path.includes('__tests__') 一致）
+  if (filename.includes('__tests__') || filename.includes('__test__')) return true;
   if (base.startsWith('test-') || base.startsWith('spec-')) return true;
   // e2e scenario 文件（路径含 /e2e/ 或 /scenarios/）
   if (/\/e2e\//.test(filename) || /\/scenarios\//.test(filename)) return true;
@@ -158,21 +158,21 @@ export function detectAssertionWeakening(diff) {
 
       // 5. 注释掉的断言
       for (const line of added) {
-        const t = line.replace(/^\+/, '').trimStart();
+        const t = line.trimStart();
         if ((t.startsWith('//') || t.startsWith('/*')) && isAssertionLine(t.replace(/^\/\/\s*/, '').replace(/^\/\*.*\*\/\s*/, ''))) {
           findings.push({ file: file.file, type: 'commented_assertion', severity: 'high', detail: `注释掉断言: ${t.substring(0, 120)}` });
         }
       }
 
       // 6. early return 在断言前
-      for (const line of added) {
-        if (/^\+\s*return\s*[;}]/.test(line)) {
-          const idx = hunk.lines.findIndex(l => l.content === line);
-          if (idx >= 0) {
-            const afterReturn = hunk.lines.slice(idx + 1).filter(l => l.type === 'removed' || l.type === 'added');
-            if (afterReturn.some(l => l.type === 'removed' && isAssertionLine(l.content))) {
-              findings.push({ file: file.file, type: 'early_return_before_assertion', severity: 'high', detail: `early return 使断言不可达: ${line.trim().substring(0, 120)}` });
-            }
+      for (let i = 0; i < hunk.lines.length; i++) {
+        const l = hunk.lines[i];
+        if (l.type !== 'added') continue;
+        const line = l.content;
+        if (/^\s*return\s*[;}]/.test(line)) {
+          const afterReturn = hunk.lines.slice(i + 1).filter(l2 => l2.type === 'removed' || l2.type === 'added');
+          if (afterReturn.some(l2 => l2.type === 'removed' && isAssertionLine(l2.content))) {
+            findings.push({ file: file.file, type: 'early_return_before_assertion', severity: 'high', detail: `early return 使断言不可达: ${line.trim().substring(0, 120)}` });
           }
         }
       }
@@ -184,17 +184,11 @@ export function detectAssertionWeakening(diff) {
       // 8. 缩小的测试集合
       for (const ns of detectNarrowedSet(removed, added)) findings.push({ file: file.file, type: 'narrowed_test_set', severity: 'medium', detail: ns });
 
-      // 9. SKIP 日志 + 提前 return（#382 形态）
-      for (const line of added) {
-        if (/console\.log\(.*SKIP/i.test(line) && /^\+\s*return\s*[;}]/.test(line)) {
-          findings.push({ file: file.file, type: 'skip_log_early_return', severity: 'high', detail: `SKIP 日志+提前 return: ${line.trim().substring(0, 120)}` });
-        }
-      }
-      // 9b. 跨行 SKIP 日志 + 后续 return
+      // 9. SKIP 日志 + 提前 return（#382 形态）——跨行分支
       for (let i = 0; i < added.length; i++) {
-        if (/console\.log\(.*SKIP/i.test(added[i]) && !/^\+\s*return\s*[;}]/.test(added[i])) {
+        if (/console\.log\(.*SKIP/i.test(added[i]) && !/^\s*return\s*[;}]/.test(added[i])) {
           for (let j = i + 1; j < Math.min(i + 4, added.length); j++) {
-            if (/^\+\s*return\s*[;}]?/.test(added[j]) || /^\+\s*return\s*$/.test(added[j])) {
+            if (/^\s*return\s*[;}]?/.test(added[j]) || /^\s*return\s*$/.test(added[j])) {
               findings.push({ file: file.file, type: 'skip_log_early_return', severity: 'high', detail: `SKIP 日志+后续 return: ${added[i].trim().substring(0, 80)} | ${added[j].trim().substring(0, 80)}` });
               break;
             }
@@ -220,11 +214,22 @@ function findRemovedTestBlocks(removed, added) {
   for (const line of removed) {
     const t = line.trim();
     if (/^(it|test|describe)\s*\(/.test(t)) {
-      inBlock = true; pending = line; depth = 1;
-      for (const ch of t) { if (ch === '(') depth++; if (ch === ')') depth--; }
-      if (depth === 0 && inBlock) { blocks.push(t); pending = ''; inBlock = false; } continue;
+      inBlock = true; pending = line;
+      // 跳过 it/test/describe 自身的 '(' —— 它已由 depth=1 表示
+      const firstParen = t.indexOf('(');
+      depth = 1;
+      for (let i = firstParen + 1; i < t.length; i++) {
+        const ch = t[i];
+        if (ch === '(') depth++;
+        if (ch === ')') depth--;
+      }
+      if (depth <= 0) { blocks.push(t); pending = ''; inBlock = false; } continue;
     }
-    if (inBlock) { for (const ch of t) { if (ch === '(') depth++; if (ch === ')') depth--; } pending += '\n' + line; if (depth <= 0) { blocks.push(pending); pending = ''; inBlock = false; } }
+    if (inBlock) {
+      for (const ch of t) { if (ch === '(') depth++; if (ch === ')') depth--; }
+      pending += '\n' + line;
+      if (depth <= 0) { blocks.push(pending); pending = ''; inBlock = false; }
+    }
   }
   return blocks;
 }

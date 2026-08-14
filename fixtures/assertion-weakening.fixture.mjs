@@ -22,7 +22,7 @@ try {
   detectAssertionWeakening = mod.detectAssertionWeakening;
 } catch (e) {
   console.error(`[FATAL] 加载主脚本失败: ${e.message}`);
-  process.exit(1);
+  process.exit(2);
 }
 
 // ── 第①组: 正样本检测 ──
@@ -30,23 +30,28 @@ function runPositiveTests(testset) {
   const results = [];
   for (const pos of testset.positives) {
     if (!pos.hasDiff) {
-      results.push({ number: pos.number, title: pos.title, diff: 'N/A', pass: true, findings: -1, detail: 'not_run: hasDiff=false', tags: pos.types });
+      results.push({ number: pos.number, title: pos.title, diff: 'N/A', pass: false, findings: -1, detail: 'not_run: hasDiff=false', tags: pos.types });
       continue;
     }
     const diffPath = join(DIFFS, `${pos.number}.diff`);
-    if (!existsSync(diffPath)) { results.push({ number: pos.number, title: pos.title, diff: `${pos.number}.diff`, pass: true, findings: -1, detail: 'not_run: diff file missing', tags: pos.types }); continue; }
+    if (!existsSync(diffPath)) { results.push({ number: pos.number, title: pos.title, diff: `${pos.number}.diff`, pass: false, findings: -1, detail: 'not_run: diff file missing', tags: pos.types }); continue; }
     const diff = readFileSync(diffPath, 'utf8');
-    if (!diff.trim()) { results.push({ number: pos.number, title: pos.title, diff: `${pos.number}.diff`, pass: true, findings: -1, detail: 'not_run: diff empty', tags: pos.types }); continue; }
+    if (!diff.trim()) { results.push({ number: pos.number, title: pos.title, diff: `${pos.number}.diff`, pass: false, findings: -1, detail: 'not_run: diff empty', tags: pos.types }); continue; }
     try {
       const result = detectAssertionWeakening(diff);
+      const foundTypes = new Set(result.findings.map(f => f.type));
       const hasFindings = result.summary.total > 0;
+      const typesMatch = pos.types.length === 0 || pos.types.some(t => foundTypes.has(t));
+      const pass = hasFindings && typesMatch;
       results.push({
         number: pos.number,
         title: pos.title,
         diff: `${pos.number}.diff`,
-        pass: hasFindings,
+        pass,
         findings: result.summary.total,
-        detail: hasFindings ? `OK: ${result.summary.total} findings` : `MISS: 0 findings (expected >0)`,
+        detail: !hasFindings ? `MISS: 0 findings (expected >0)`
+          : !typesMatch ? `MISMATCH: expected types [${pos.types.join(',')}] not in [${[...foundTypes].join(',')}]`
+          : `OK: ${result.summary.total} findings`,
         tags: pos.types,
       });
     } catch (e) {
@@ -61,13 +66,13 @@ function runNegativeTests(testset) {
   const results = [];
   for (const neg of testset.negatives) {
     if (!neg.hasDiff) {
-      results.push({ number: neg.number, title: neg.title, diff: 'N/A', pass: true, findings: -1, detail: 'not_run: hasDiff=false', tags: [] });
+      results.push({ number: neg.number, title: neg.title, diff: 'N/A', pass: false, findings: -1, detail: 'not_run: hasDiff=false', tags: [] });
       continue;
     }
     const diffPath = join(DIFFS, `${neg.number}.diff`);
-    if (!existsSync(diffPath)) { results.push({ number: neg.number, title: neg.title, diff: `${neg.number}.diff`, pass: true, findings: -1, detail: 'not_run: diff file missing', tags: [] }); continue; }
+    if (!existsSync(diffPath)) { results.push({ number: neg.number, title: neg.title, diff: `${neg.number}.diff`, pass: false, findings: -1, detail: 'not_run: diff file missing', tags: [] }); continue; }
     const diff = readFileSync(diffPath, 'utf8');
-    if (!diff.trim()) { results.push({ number: neg.number, title: neg.title, diff: `${neg.number}.diff`, pass: true, findings: -1, detail: 'not_run: diff empty', tags: [] }); continue; }
+    if (!diff.trim()) { results.push({ number: neg.number, title: neg.title, diff: `${neg.number}.diff`, pass: false, findings: -1, detail: 'not_run: diff empty', tags: [] }); continue; }
     try {
       const result = detectAssertionWeakening(diff);
       results.push({
@@ -136,22 +141,22 @@ function runSymlinkConsistencyTest() {
 // ── 主流程 ──
 async function main() {
   // 加载测试集
-  if (!existsSync(TESTSET)) { console.error('[FATAL] 测试集不存在'); process.exit(1); }
+  if (!existsSync(TESTSET)) { console.error('[FATAL] 测试集不存在'); process.exit(2); }
   const testset = JSON.parse(readFileSync(TESTSET, 'utf8'));
 
   // 第①组
   const positiveResults = runPositiveTests(testset);
-  const posPass = positiveResults.filter(r => r.pass);
-  const posFail = positiveResults.filter(r => !r.pass);
-  const posSkipped = positiveResults.filter(r => r.detail.startsWith('not_run'));
-  const posTotal = positiveResults.length;
+  const posSkipped = positiveResults.filter(r => r.detail && r.detail.startsWith('not_run'));
+  const posPass = positiveResults.filter(r => r.pass && !r.detail?.startsWith('not_run'));
+  const posFail = positiveResults.filter(r => !r.pass && !r.detail?.startsWith('not_run'));
+  const posTotal = positiveResults.filter(r => !r.detail?.startsWith('not_run')).length;
 
   // 第②组
   const negativeResults = runNegativeTests(testset);
-  const negPass = negativeResults.filter(r => r.pass);
-  const negFail = negativeResults.filter(r => !r.pass);
-  const negSkipped = negativeResults.filter(r => r.detail.startsWith('not_run'));
-  const negTotal = negativeResults.length;
+  const negSkipped = negativeResults.filter(r => r.detail && r.detail.startsWith('not_run'));
+  const negPass = negativeResults.filter(r => r.pass && !r.detail?.startsWith('not_run'));
+  const negFail = negativeResults.filter(r => !r.pass && !r.detail?.startsWith('not_run'));
+  const negTotal = negativeResults.filter(r => !r.detail?.startsWith('not_run')).length;
 
   // 特检 #382
   const pr382 = positiveResults.find(r => r.number === 382);
