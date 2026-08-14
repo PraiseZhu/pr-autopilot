@@ -4,8 +4,9 @@
 //
 // 注: 这个 fixture 的 cwd 固定在 fixtures/ 下（run-all.sh 的 cd 或绝对路径）
 
-import { readFileSync, existsSync, mkdirSync, writeFileSync, symlinkSync, renameSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, symlinkSync, renameSync, mkdtempSync, rmSync, cpSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 
@@ -14,7 +15,8 @@ const FIXTURE_FILE = fileURLToPath(import.meta.url);
 const ROOT = join(HERE, '..');
 const MAIN = join(ROOT, 'scripts', 'detect-assertion-weakening.mjs');
 const TESTSET = join(HERE, 'assertion-weakening', 'testset.json');
-const DIFFS = join(HERE, 'assertion-weakening', 'diffs');
+const diffsDirIdx = process.argv.indexOf('--diffs-dir');
+const DIFFS = diffsDirIdx !== -1 ? process.argv[diffsDirIdx + 1] : join(HERE, 'assertion-weakening', 'diffs');
 
 // 动态 import 主脚本
 let detectAssertionWeakening;
@@ -95,47 +97,44 @@ function runNegativeTests(testset) {
 // ── 第③组: 软链一致性测（sc-t4-5） ──
 function runSymlinkConsistencyTest() {
   const results = [];
-  const tmpDir = '/tmp/aex-a-t4-skills-bin';
-  if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
+  const tmpDir = mkdtempSync(join(tmpdir(), 'aex-t4-symlink-'));
 
-  // 创建软链
-  const symlinkPath = join(tmpDir, 'detect-assertion-weakening.mjs');
   try {
-    if (existsSync(symlinkPath)) execFileSync('rm', [symlinkPath]);
+    // 创建软链
+    const symlinkPath = join(tmpDir, 'detect-assertion-weakening.mjs');
     symlinkSync(MAIN, symlinkPath);
-  } catch (e) {
-    return [{ pass: false, detail: `创建软链失败: ${e.message}` }];
+
+    // 用同一 diff 比直接路径和软链路径
+    const testDiff = join(DIFFS, '382.diff');
+    if (!existsSync(testDiff)) return [{ pass: false, detail: '382.diff 不存在，跳过软链测试' }];
+
+    try {
+      // 直接调用
+      const directResult = detectAssertionWeakening(readFileSync(testDiff, 'utf8'));
+      // 通过软链调 CLI（exit code 1 是正常发现，不要抛）
+      let symlinkOutput = '';
+      const sp = spawnSync('node', [symlinkPath, '--diff', testDiff], { encoding: 'utf8', timeout: 15000 });
+      symlinkOutput = sp.stdout || '';
+      if (!symlinkOutput) symlinkOutput = sp.stderr || '';
+      const symlinkResult = JSON.parse(symlinkOutput);
+
+      const directTotal = directResult.summary.total;
+      const symlinkTotal = symlinkResult.summary.total;
+      const pass = directTotal === symlinkTotal;
+      results.push({
+        pass,
+        detail: pass ? `一致: 直接=${directTotal}, 软链=${symlinkTotal}` : `不一致: 直接=${directTotal}, 软链=${symlinkTotal}`,
+        direct_total: directTotal,
+        symlink_total: symlinkTotal,
+      });
+    } catch (e) {
+      results.push({ pass: false, detail: `软链测试失败: ${e.message}` });
+    }
+  } finally {
+    // 清理进程唯一临时目录
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 
-  // 用同一 diff 比直接路径和软链路径
-  const testDiff = join(DIFFS, '382.diff');
-  if (!existsSync(testDiff)) return [{ pass: false, detail: '382.diff 不存在，跳过软链测试' }];
-
-  try {
-    // 直接调用
-    const directResult = detectAssertionWeakening(readFileSync(testDiff, 'utf8'));
-    // 通过软链调 CLI（exit code 1 是正常发现，不要抛）
-    let symlinkOutput = '';
-    const sp = spawnSync('node', [symlinkPath, '--diff', testDiff], { encoding: 'utf8', timeout: 15000 });
-    symlinkOutput = sp.stdout || '';
-    if (!symlinkOutput) symlinkOutput = sp.stderr || '';
-    const symlinkResult = JSON.parse(symlinkOutput);
-
-    const directTotal = directResult.summary.total;
-    const symlinkTotal = symlinkResult.summary.total;
-    const pass = directTotal === symlinkTotal;
-    results.push({
-      pass,
-      detail: pass ? `一致: 直接=${directTotal}, 软链=${symlinkTotal}` : `不一致: 直接=${directTotal}, 软链=${symlinkTotal}`,
-      direct_total: directTotal,
-      symlink_total: symlinkTotal,
-    });
-  } catch (e) {
-    results.push({ pass: false, detail: `软链测试失败: ${e.message}` });
-  }
-
-  // 清理
-  try { execFileSync('rm', [symlinkPath]); } catch {}
   return results;
 }
 
@@ -206,61 +205,72 @@ async function main() {
 
 // ── FAM-4 回归测试：语料缺失必须让 fixture 失败 ──
 // 用法: node fixtures/assertion-weakening.fixture.mjs --check-fam4
-// 用 410.diff（仅负样本引用，不污染软链测试）做语料缺失反例
+// 在隔离副本上做语料缺失实验，不碰工作区 tracked 的 diffs/410.diff
 async function checkFam4() {
   const diff410 = join(DIFFS, '410.diff');
-  const bak410 = join(DIFFS, '410.diff.fam4-bak');
 
   if (!existsSync(diff410)) {
     console.log('FAM-4 SKIP: 410.diff 不存在，无法执行回归');
     process.exit(2);
   }
 
-  // 1. 先确认当前状态（零 skipped）是绿的
-  console.log('--- FAM-4 对照组: 语料完整 ---');
-  const ctrl = spawnSync(process.execPath, [FIXTURE_FILE], { encoding: 'utf8', timeout: 30000, cwd: HERE });
-  const ctrlPass = ctrl.status === 0 && /^pass$/m.test(ctrl.stdout.trim());
-  console.log(`对照组 exit=${ctrl.status} ${ctrlPass ? '✓ pass' : '✗ 非预期失败'}`);
-  if (!ctrlPass) {
-    console.log(ctrl.stdout.trim());
-    console.log('FAM-4 FAIL: 对照组应 pass，但 exit ≠ 0');
-    process.exit(1);
-  }
+  // 创建隔离临时目录，拷贝全部 diffs 到副本上操作
+  const isoDir = mkdtempSync(join(tmpdir(), 'aex-t4-fam4-'));
+  let exitCode = 1;
 
-  // 2. 单一变更：移走 410.diff → 语料缺失
-  let expFail = false;
-  let expOutput = '';
   try {
-    renameSync(diff410, bak410);
+    const isoDiffs = join(isoDir, 'diffs');
+    cpSync(DIFFS, isoDiffs, { recursive: true });
+    const iso410 = join(isoDiffs, '410.diff');
+    const isoBak = join(isoDiffs, '410.diff.fam4-bak');
+
+    // 1. 先确认当前状态（零 skipped）是绿的
+    console.log('--- FAM-4 对照组: 语料完整 ---');
+    const ctrl = spawnSync(process.execPath, [FIXTURE_FILE, '--diffs-dir', isoDiffs], { encoding: 'utf8', timeout: 30000, cwd: HERE });
+    const ctrlPass = ctrl.status === 0 && /^pass$/m.test(ctrl.stdout.trim());
+    console.log(`对照组 exit=${ctrl.status} ${ctrlPass ? '✓ pass' : '✗ 非预期失败'}`);
+    if (!ctrlPass) {
+      console.log(ctrl.stdout.trim());
+      console.log('FAM-4 FAIL: 对照组应 pass，但 exit ≠ 0');
+      exitCode = 1;
+      return;
+    }
+
+    // 2. 单一变更：在隔离副本上移走 410.diff → 语料缺失
+    renameSync(iso410, isoBak);
 
     console.log('\n--- FAM-4 实验组: 410.diff 缺失（语料不可用）---');
-    const exp = spawnSync(process.execPath, [FIXTURE_FILE], { encoding: 'utf8', timeout: 30000, cwd: HERE });
-    expFail = exp.status !== 0 && /^failed/m.test(exp.stdout.trim());
-    expOutput = exp.stdout.trim();
+    const exp = spawnSync(process.execPath, [FIXTURE_FILE, '--diffs-dir', isoDiffs], { encoding: 'utf8', timeout: 30000, cwd: HERE });
+    const expFail = exp.status !== 0 && /^failed/m.test(exp.stdout.trim());
+    const expOutput = exp.stdout.trim();
     console.log(`实验组 exit=${exp.status} ${expFail ? '✓ 预期失败（exit 1）' : '✗ 应 exit 1 但未失败'}`);
     console.log(expOutput);
+    if (!expFail) {
+      console.log('FAM-4 FAIL: 语料缺失时 fixture 应 exit 1，实际未失败');
+      exitCode = 1;
+      return;
+    }
+
+    // 3. 恢复后再次确认绿
+    renameSync(isoBak, iso410);
+    console.log('\n--- FAM-4 恢复验证: 语料恢复后应重新绿 ---');
+    const restore = spawnSync(process.execPath, [FIXTURE_FILE, '--diffs-dir', isoDiffs], { encoding: 'utf8', timeout: 30000, cwd: HERE });
+    const restorePass = restore.status === 0 && /^pass$/m.test(restore.stdout.trim());
+    console.log(`恢复后 exit=${restore.status} ${restorePass ? '✓ pass' : '✗ 非预期失败'}`);
+    if (!restorePass) {
+      console.log(restore.stdout.trim());
+      console.log('FAM-4 FAIL: 恢复后应 pass');
+      exitCode = 1;
+      return;
+    }
+
+    console.log('\nFAM-4 PASS: 语料缺失 → exit 1 ✓  语料恢复 → exit 0 ✓');
+    exitCode = 0;
   } finally {
-    // 恢复（必须在 process.exit 前执行，因为 exit 不触发 finally）
-    if (existsSync(bak410)) renameSync(bak410, diff410);
+    // 清理隔离副本（无论成功失败都清）
+    try { rmSync(isoDir, { recursive: true, force: true }); } catch {}
+    if (exitCode !== undefined) process.exit(exitCode);
   }
-  if (!expFail) {
-    console.log('FAM-4 FAIL: 语料缺失时 fixture 应 exit 1，实际未失败');
-    process.exit(1);
-  }
-
-  // 3. 恢复后再次确认绿
-  console.log('\n--- FAM-4 恢复验证: 语料恢复后应重新绿 ---');
-  const restore = spawnSync(process.execPath, [FIXTURE_FILE], { encoding: 'utf8', timeout: 30000, cwd: HERE });
-  const restorePass = restore.status === 0 && /^pass$/m.test(restore.stdout.trim());
-  console.log(`恢复后 exit=${restore.status} ${restorePass ? '✓ pass' : '✗ 非预期失败'}`);
-  if (!restorePass) {
-    console.log(restore.stdout.trim());
-    console.log('FAM-4 FAIL: 恢复后应 pass');
-    process.exit(1);
-  }
-
-  console.log('\nFAM-4 PASS: 语料缺失 → exit 1 ✓  语料恢复 → exit 0 ✓');
-  process.exit(0);
 }
 
 // ── 入口 ──
