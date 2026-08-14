@@ -78,19 +78,23 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
      落盘并记入 PR body，**绑定 head_sha，改一行即失效**；push-guard 终闸同口径复验（膨胀绕不过）。
    实测依据：规模与 review 轮数是断崖关系（54 行一轮合并 / 292 行 4 轮 / 450 行振荡 8 轮报废；
    本仓 #297 P1a 5662 行事后拆 13 节）。
-6. **PR 标题/正文模板合规闸**（D2，2026-08-06）:
+6. **PR 标题/正文模板合规闸（格式闸前置——派审前最后一道机检）**（D2，2026-08-06；t3 加固，2026-08-13）:
+
+   ### 6a. 执行命令与结果语义
    ```
    node scripts/pr-format-gate.mjs --repo-dir . --base origin/main \
      --title "<PR 标题>" --body-file <PR 正文文件>
    ```
-   - `PASS` → 继续。`FAIL`（exit 1）→ **Phase 1 FAIL**：按输出的 `missing_sections` / 标题原因
-     改正文或标题，重跑至 PASS。`SKIP`（exit 0）→ 目标仓 merge-base 树未声明格式契约，本门
-     **无判据**；台账如实记 `format-gate: skipped(无配置)`，**不得**记成"格式检查通过"。
+   - `PASS` → 进入步骤 6b 状态机的 `passed` 状态，准入 Phase 2 派审。
+   - `FAIL`（exit 1）→ 进入步骤 6b 状态机的 `failed` 状态，触发自动修复分支。
+   - `SKIP`（exit 0）→ 目标仓 merge-base 树未声明格式契约，本门**无判据**；台账如实记
+     `format-gate: skipped(无配置)`，**不得**记成"格式检查通过"；视同 `passed` 进入 Phase 2。
    - 配置源 = **双读取严格交集**（D2-B，2026-08-06）：merge-base 树 + 候选树（HEAD）各读一份
      `agent-use/docs/pr-rules.json`、各判一次，任一侧 FAIL 即 FAIL——只读 base 会在「PR 自身
      收紧规则」时与 review-pr（读候选 checkout）裁决相反，复活 D2 死锁；只读候选回到 B2-F1
      绕闸。两侧均无判据才 SKIP；任一侧 malformed → fail-closed exit 3。口径刻意对齐 review-pr
      的 `context.mjs`（第三席的职责就是预演 review-pr 的裁决，口径一致才是正确性判据）。
+
    > **为什么这道门在 Phase 1，不在审查席**（D2 死锁修复，2026-08-06 实测代价一整轮三席）：
    > 「正文缺一个必填段落」此前只能由第三席判 `format-gate=fail` → conjunct④ 要求全部
    > gate_checks ∈ {pass,n_a} → 共识永不 PASS → **不写 artifact**（实测：fail 时 CLI 根本不
@@ -102,6 +106,185 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    > gate_id**：第三席照旧填报它，只是"缺必填段落"这个成因在 Phase 1 之后已不可能存在，
    > 该 gate 回到它该管的语义判断上。任何「给 gate fail 开补救口」的方案都要削弱 fail-closed，
    > 本仓禁止。
+
+   ### 6b. 格式闸状态机（t3 加固，2026-08-13）
+
+   格式闸的执行流程为显式状态机。以下状态与转移是**规范性定义**——任何实现（脚本/人工）必须遵循。
+
+   **状态**：
+
+   | 状态 | 标识 | 含义 |
+   |------|------|------|
+   | 待检测 | `pending` | 格式闸尚未对本轮 candidate 执行 |
+   | 检测中 | `checking` | 格式闸正在执行（`pr-format-gate.mjs` 运行中） |
+   | 通过 | `passed` | 格式闸返回 PASS 或 SKIP，准入 Phase 2 派审 |
+   | 未过 | `failed` | 格式闸返回 FAIL，存在缺失段落或标题不合规 |
+   | 修复中 | `fixing` | 正在执行自动修复（补全缺失段落/修正标题格式） |
+   | 阻断 | `blocked` | 自动修复失败或重试耗尽，转人工处理 |
+
+   **转移**：
+
+   | 起点 | 终点 | 触发条件 |
+   |------|------|---------|
+   | `pending` | `checking` | 执行 `pr-format-gate.mjs` |
+   | `checking` | `passed` | exit 0 且 result ∈ {PASS, SKIP} |
+   | `checking` | `failed` | exit 1（result = FAIL） |
+   | `checking` | `blocked` | exit 3（malformed / 配置错误 / fail-closed），台账记录原因 |
+   | `failed` | `fixing` | 重试计数 < `maxRetries`（默认 3），触发自动修复 |
+   | `failed` | `blocked` | 重试计数 ≥ `maxRetries`，转人工 |
+   | `failed` | `blocked` | 快照生成失败（进入 fixing 前的 `cp -p` 失败），转人工 |
+   | `fixing` | `checking` | 自动修复完成，**必须重新执行完整格式闸**（不得因「修过一次」直接放行） |
+   | `fixing` | `blocked` | 自动修复自身失败（无法生成修复补丁/快照还原失败），转人工 |
+   | `blocked` | `pending` | lead 人工修复完成，手动重置（重试计数器归零，见下方「阻断出口」第 2 条） |
+
+   **重试上限**：`maxRetries` 默认 3，为 lead 侧规范性计数（格式闸自动修复的重试次数上限）。
+   `pr-format-gate.mjs` 当前不读取该字段；重试计数由 lead 在台账中维护。
+   每次重检前必须重新执行完整 `pr-format-gate.mjs`，**不得**因「已修过一次」跳过检测直接进入
+   `passed`。
+
+   **阻断出口**（到达 `blocked` 状态时）：
+   1. lead 在台账记录阻断原因、已尝试的修复次数、最后一轮 `missing_sections` 输出
+   2. lead 人工修复后从 `pending` 重新开始（重试计数器归零，因为输入已实质性变更）
+   3. **不得绕过格式闸直接进入 Phase 2**——`blocked` 状态下无自动或直接转移；人工修复后经 `pending` 重新完整检测才可 `passed`
+
+   ### 6c. 自动修复前快照（t3 加固，2026-08-13；会话绑定加固，2026-08-14）
+
+   自动修复是对文件（PR 正文文件、可能还包括 changelog 等关联文件）的写操作，可能覆盖掉本来正确的写法。
+   修复前**必须**生成可回退快照。
+
+   **快照必须绑定当前自动修复会话**。快照目录由 `mktemp -d` 原子创建于工作区外（`/tmp/`），
+   目录名由系统保证唯一，创建与归属一步到位——不存在「先命名再建目录」的 TOCTOU 窗口：
+   ```bash
+   SNAP_DIR="$(mktemp -d /tmp/.pre-format-fix-snap-XXXXXXXX)"
+   ```
+   `mktemp -d` 保证目录名唯一且原子创建。若创建失败（已存在/权限不足/冲突）→ **blocked**，
+   状态机转移至 `failed→blocked`（`mktemp` 非零退出即 fail-closed，不得降级为 `mkdir -p` 或
+   自造目录名）。`SNAP_DIR` 为绝对路径，在所有后续步骤（回退、清单核验、清理）中均使用该
+   绝对路径，进入 Phase 2 无需 `mv`——快照目录自始至终在工作区外，不会出现在 `git status` 中。
+
+   **进入 `fixing` 前的残留检测**（加固类 1：不可逆/快照）：
+   进入 `fixing` 状态前，必须检测是否存在**残留快照**——上次会话遗留的 `.pre-format-fix.bak` 文件
+   或工作区内 `.pre-format-fix-snap-*` 目录、或 `/tmp/` 下 `.pre-format-fix-snap-*` 目录（非当前
+   `$SNAP_DIR` 的），无法证明属于当前会话。检测到残留 → **fail-closed**，不得进入
+   `fixing` 状态，状态机转移至 `blocked`（§6b 的 `failed→blocked` 转移：「快照生成失败」扩展为同时
+   覆盖残留快照场景）。归属不明（快照目录名不含可识别的会话身份）→ 同口径 fail-closed，转人工确认/清理。
+   当前会话自有目录（与 `$SNAP_DIR` 整串相等）不视为残留，**排除检测**——避免自动修复会话
+   因自己刚创建的空目录被残留检测拦下而永远进不了 `fixing`。非精确匹配的 `.pre-format-fix-snap-*`
+   目录一律 fail-closed，不得仅凭 PID 子串匹配或时间戳推断豁免。
+
+   **快照生成**（残留检测通过后、进入 `fixing` 状态前执行，同一自动修复会话内**仅首次生成**）：
+   ```bash
+   # SNAP_DIR 已由 mktemp -d 原子创建，目录已存在，无需再 mkdir
+   ```
+   快照以**仓库相对路径为键**，在 `$SNAP_DIR` 内落一份映射清单（`$SNAP_DIR/.snap-manifest`），
+   记录每条「仓库相对路径 → 快照文件名」的映射。清单以 tab 分隔两列（相对路径 \t 快照文件名）。
+   ```bash
+   # 对 PR 正文文件，以仓库相对路径为键复制到会话快照目录
+   # 快照文件名 = 仓库相对路径的转义（'/' 替换为 '_'）
+   # 注意：该转义在存在 '_'/'/' 歧义时可能碰撞（如 a/b.md 与 a_b.md → 同一快照名），
+   # 由清单的重名检查 fail-closed 兜住
+   SNAP_NAME="<仓库相对路径，斜杠替换为下划线>"
+   cp -p "<仓库相对路径>" "$SNAP_DIR/$SNAP_NAME"
+   printf '%s\t%s\n' "<仓库相对路径>" "$SNAP_NAME" >> "$SNAP_DIR/.snap-manifest"
+   ```
+   若自动修复还涉及其他文件（如 changelog），每个被修改文件同口径：以仓库相对路径为键复制到同一
+   `$SNAP_DIR`，并追加映射条目到 `.snap-manifest`。
+
+   **禁止仅因 `.pre-format-fix.bak` 或快照目录已存在就跳过生成**——旧快照可能是上一会话的残留，
+   其内容不等于本轮格式闸检测开始前的原文，直接复用会把旧基线当成本轮基线，导致回退回到错误版本。
+   残留检测为 fail-closed，不是静默跳过。
+
+   **同一自动修复会话内，首次生成后后续 `failed→fixing` 重试不得对同一文件再次 `cp -p` 覆盖快照**——
+   快照必须始终保留本轮格式闸检测开始前的原文，不得被半修复结果覆盖。回退始终还原到该原文。
+
+   **回退命令**（修复后若被打回或发现修复引入新问题）：
+   ```bash
+   # 从映射清单逐文件还原到本轮格式闸检测开始前的原文（按仓库相对路径取回）
+   # 清单以 tab 分隔，IFS 限定 tab 避免含空格路径被错误分词
+   while IFS=$'\t' read -r rel_path snap_name; do
+     cp "$SNAP_DIR/$snap_name" "$rel_path"
+   done < "$SNAP_DIR/.snap-manifest"
+   ```
+   还原后工作区状态与修复前逐字节一致。快照目录保留到 Phase 2 回退判断结束后（台账确认本轮修复
+   已通过全部审查、不再需要回退），届时由台账步骤统一清理。在回退判断点到达前，不得删除快照目录。
+
+   **部分快照判据**（以映射清单为唯一可求值判据）：快照目录存在时，检查 `$SNAP_DIR/.snap-manifest`：
+   - 清单缺失 → fail-closed（快照不完整，无法可靠回退）
+   - 清单条目数与目录内除 `.snap-manifest` 外的实际文件数不符 → fail-closed（存在未登记或缺失的快照文件）
+   - 清单内存在重复的相对路径或快照文件名 → fail-closed（映射非单射）
+   - 清单每一行声明的 `snap_name` 文件不存在于 `$SNAP_DIR` → fail-closed（快照文件缺失，无法可靠回退；
+     反例：清单声明 A→a、B→b，目录实际只有 a 和一个无关残留 x → 条目数（2）vs 文件数（2）一致但 b
+     缺失，该条单独兜住。**不得只比基数**）
+   - 清单中的任何相对路径或快照文件名含 tab 字符 → fail-closed（tab 是清单列分隔符，路径含 tab
+     会把一行拆成多列，回退还原时取错文件）
+   以上任一条件触发，均不得进入 `fixing` 状态，状态机转移至 `blocked`，转人工确认/清理。
+   该判据对任意快照目录（含上一会话残留）均仅凭目录自身内容即可判定完整性，不依赖当前轮次
+   尚未确定的文件集。
+
+   **快照目录与 Phase 2 clean 工作区门**：快照目录由 `mktemp -d` 创建在 `/tmp/` 下，自始至终在
+   工作区外，不会出现在 `git status --porcelain` 中，不会打红 Phase 2 的 clean 工作区门。
+   因此进入 Phase 2 无需 `mv`——`SNAP_DIR` 的绝对路径始终有效，回退循环、清单核验、清理
+   均消费同一绝对路径。不得在回退判断点到达前 `rm -rf` 唯一回退源——快照是修复可逆性的
+   唯一解，提前删除将使承诺的回退能力无法兑现。
+
+   > **「先自动修」与原 evidence 声称的「无破坏性操作」自相矛盾**（加固类 1）：自动修复一旦
+   > 写入文件就不再是纯只读检查。快照机制是这条矛盾的唯一解——它让自动修复变成**可逆**操作，
+   > 修复失败或引入新问题时存在一条命令回到修复前。快照绑定会话后，残留快照不会在新会话中
+   > 被误认为有效基线。映射清单提供单射映射，使不同目录下 basename 相同的文件不再互相覆盖，
+   > 并使部分快照判据成为可求值——仅凭快照目录自身内容即可判定完整性。加固类 1（不可逆/快照）
+   > 完整覆盖：生成前检测残留、归属不明或部分快照一律 fail-closed 转人工，禁止静默复用旧基线。
+
+   ### 6d. 四闸合取顺序与判定基准（t3 加固，2026-08-13）
+
+   Phase 1 的四道确定性闸门按以下顺序执行，**全部通过**（含 SKIP 视同通过）才准进入 Phase 2 派审：
+
+   | 序号 | 闸 | 脚本 | 失败语义 |
+   |------|----|------|---------|
+   | G1 | 类型检查（typecheck-merged） | Phase 1 步骤 1 | 失败 → Phase 1 FAIL，修复后从 G1 重跑 |
+   | G2 | 意图契约校验 | `intent-check.mjs` | exit 1/2 → Phase 1 FAIL，修复后从 G2 重跑 |
+   | G3 | 规模入口闸 | `size-gate.mjs` | STOP → 不得进入 Phase 2；WARN → 继续但须台账登记拆分规划 |
+   | G4 | 标题/正文模板合规闸 | `pr-format-gate.mjs` | FAIL → 进入格式闸状态机修复分支（§6b） |
+
+   **合取规则**：G1 ∧ G2 ∧ G3 ∧ G4 = true 才进入 Phase 2。任一门 FAIL/STOP 阻断后续闸的执行。
+
+   **判定基准一致性规则**：
+
+   1. **自动修复改动文件后，下游消费者必须使用修复后的最终状态**：
+      - 格式闸自动修复改动 PR 正文或关联文件后，Phase 2 审查席拿到的 `bundle.pr_body` 必须是
+        修复后的定稿版本。不得出现「格式闸判的是修复后 body，但 Phase 2 的 `review_input_hash`
+        算的是修复前 body」的数据不一致。
+      - 若自动修复还改动了其他文件（如 changelog），Phase 1.5 预扫和 Phase 2 三审的 diff 基准
+        必须是修复后的树——不得存在「A 闸判修复前 diff、B 闸判修复后 diff」的混合状态。
+
+   2. **规模闸 STOP 使格式闸结论作废（stale）**：
+      - 规模闸（G3）在格式闸（G4）**之前**执行。若 G3 判 STOP，后续闸不再执行（合取规则已阻断）。
+        若因任何原因（如人工操作顺序错误）导致 G4 在 G3 之前执行并取得 PASS，G3 判 STOP 后
+        该 PASS 结论**标记为 stale**——因为 G3 STOP 要求拆分 PR，拆分后 PR 标题/正文必然变化，
+        原 G4 结论不再有效。
+      - 拆分后各子 PR 必须**各自重跑**完整四闸（G1→G2→G3→G4），不得复用拆分前任一门结论。
+      - 台账记录：`format-gate: stale(上游 size-gate STOP，拆分后重跑)`。
+
+   3. **自动修复改动文件后，G1 和 G2 的判定基准不变**：
+      - G1（typecheck-merged）的输入是 `merge-base..HEAD` 的代码 diff，格式闸自动修复不改源码，
+        因此 G1 不受影响。
+      - G2（intent-check）的输入是 `.pr-intent.md` 与 PR body marker 区块，格式闸自动修复可能
+        改动 PR body 正文但不应改动 marker 区块（marker 内容由 `intent-check.mjs` 管理，格式闸
+        自动修复不触碰 marker）。若格式闸自动修复意外改动了 marker 区块，G2 必须重跑。
+      - 若未来格式闸扩展为可修改源码文件，本条规则须同步更新。
+
+   4. **格式闸自动修复改动文件后，规模闸结论作废（stale）**：
+      - 格式闸（G4）自动修复若改动计入规模闸（G3）输入的文件（如 changelog），已取得的 G3
+        结论（PASS/WARN/STOP）必须标记为 stale——因为 G4 修复改变了 G3 判定所依赖的 diff 范围。
+      - 未重跑 G3 不得带着旧 G3 结论进入 Phase 2。
+      - 台账记录：`size-gate: stale(下游 format-gate 自动修复改动规模输入，重跑)`。
+      - 此条与规则 2（G3 STOP → G4 stale）互为反向——自动修复对任一闸门输入文件的改动，都
+        必须使另一闸门的既有结论失效，不得只写单一方向的传导。
+
+   > **四闸合取顺序的设计理由**：G3（规模）必须在 G4（格式）之前——规模闸判 STOP 时格式闸的
+   > PASS 结论在拆分后立即作废，所以把格式闸放在规模闸之后、作为派审前最后一道闸，避免「格式
+   > 闸 PASS → 规模闸 STOP → 拆分 → 子 PR 忘跑格式闸」的静默漏检路径。G1（类型检查）与 G2
+   > （意图）放在前面是因为它们是其余闸的锚定上下文——类型不对或意图缺失，后续闸的判定缺乏
+   > 语义基础。
 
 ## Phase 1.5 — 预扫自清洗（haiku，定格 candidate 之前）
 
