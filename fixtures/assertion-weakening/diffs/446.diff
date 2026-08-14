@@ -1,0 +1,775 @@
+diff --git a/src/lib/canvasAssetImport.importBatchId.test.ts b/src/lib/canvasAssetImport.importBatchId.test.ts
+new file mode 100644
+index 00000000..05e8b441
+--- /dev/null
++++ b/src/lib/canvasAssetImport.importBatchId.test.ts
+@@ -0,0 +1,148 @@
++// importBatchId 接线契约(#297 T2a1):同一次导入调用的全部节点共享同一个批次戳,
++// 独立的导入调用互不相同。与 canvasAssetImport.batch.test.ts(批量配额/伪 MIME)
++// 是两件事,分文件避免"批"(quota 的批)与"批次戳"(importBatchId 的批)混读。
++//
++// 单测跑在 node 环境,assetStorage / 尺寸测量 / 日志同款注入替身(与既有批量测试
++// 同一套 mock,行为不重复钉,只钉"批次戳怎么分配")。
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++import type { AddImportedFileNode, AddImportedImage } from './canvasAssetImport'
++import { IMPORT_BATCH_ID_PATTERN } from './importBatchId'
++
++const savedFiles: string[] = []
++
++vi.mock('./assetStorage', () => ({
++  saveImportedAsset: vi.fn(async (file: File) => {
++    savedFiles.push(file.name)
++    return {
++      assetUrl: `imported:${file.name}`,
++      title: file.name,
++      name: file.name,
++      size: '10x10',
++      sizeBytes: file.size,
++      type: file.type,
++      dimensions: { width: 10, height: 10 },
++      sourceDimensions: { width: 10, height: 10 },
++    }
++  }),
++  deleteImportedAsset: vi.fn(async () => true),
++}))
++
++vi.mock('./imageSizing', () => ({
++  importedImageDisplaySize: () => ({ width: 100, height: 80 }),
++}))
++
++vi.mock('../store/debugLogStore', () => ({
++  debugLogger: { log: () => {}, warn: () => {}, error: () => {} },
++}))
++
++const {
++  importCanvasFileBatch,
++  importFileToCanvas,
++  importImageFileToCanvas,
++  importImageFilesToCanvas,
++} = await import('./canvasAssetImport')
++
++const PNG_SIGNATURE = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
++const png = (name: string): File => new File([PNG_SIGNATURE], name, { type: 'image/png' })
++
++const position = { x: 0, y: 0 }
++
++type CapturedNodeCall = { assetUrl: string; importBatchId?: string }
++
++/** 捕获 addImportedFileNode 每次调用的 assetUrl + metadata.importBatchId。 */
++const captureFileNodeCalls = () => {
++  const calls: CapturedNodeCall[] = []
++  const fn: AddImportedFileNode = (_type, assetUrl, _title, _size, _position, metadata) => {
++    calls.push({ assetUrl, importBatchId: metadata?.importBatchId })
++  }
++  return { calls, fn }
++}
++
++/** 捕获 addImportedImage 每次调用的 assetUrl + metadata.importBatchId。 */
++const captureImageCalls = () => {
++  const calls: CapturedNodeCall[] = []
++  const fn: AddImportedImage = (assetUrl, _title, _size, _position, metadata) => {
++    calls.push({ assetUrl, importBatchId: metadata?.importBatchId })
++  }
++  return { calls, fn }
++}
++
++beforeEach(() => {
++  savedFiles.length = 0
++})
++
++describe('importCanvasFileBatch — 同批文件共享同一批次戳', () => {
++  it('三个文件落板,importBatchId 全等且格式合法', async () => {
++    const { calls, fn } = captureFileNodeCalls()
++    await importCanvasFileBatch([png('a.png'), png('b.png'), png('c.png')], position, fn)
++
++    expect(calls).toHaveLength(3)
++    const ids = calls.map((call) => call.importBatchId)
++    expect(ids[0]).toMatch(IMPORT_BATCH_ID_PATTERN)
++    expect(new Set(ids).size).toBe(1)
++  })
++
++  it('两次独立的批量导入调用产出不同的批次戳', async () => {
++    const first = captureFileNodeCalls()
++    await importCanvasFileBatch([png('a.png')], position, first.fn)
++    const second = captureFileNodeCalls()
++    await importCanvasFileBatch([png('b.png')], position, second.fn)
++
++    expect(first.calls[0].importBatchId).not.toBe(second.calls[0].importBatchId)
++  })
++})
++
++describe('importImageFilesToCanvas — 同批图片共享同一批次戳', () => {
++  it('多张图片同批导入,importBatchId 全等', async () => {
++    const { calls, fn } = captureImageCalls()
++    await importImageFilesToCanvas([png('a.png'), png('b.png'), png('c.png')], position, fn)
++
++    expect(calls).toHaveLength(3)
++    const ids = calls.map((call) => call.importBatchId)
++    expect(new Set(ids).size).toBe(1)
++    expect(ids[0]).toMatch(IMPORT_BATCH_ID_PATTERN)
++  })
++
++  it('两次独立调用产出不同的批次戳(不是同一批)', async () => {
++    const first = captureImageCalls()
++    await importImageFilesToCanvas([png('a.png')], position, first.fn)
++    const second = captureImageCalls()
++    await importImageFilesToCanvas([png('b.png')], position, second.fn)
++
++    expect(first.calls[0].importBatchId).not.toBe(second.calls[0].importBatchId)
++  })
++})
++
++describe('单文件入口 — 每次调用各自铸造一个批次(批次大小为一)', () => {
++  it('importFileToCanvas 两次独立调用产出不同批次戳', async () => {
++    const first = captureFileNodeCalls()
++    await importFileToCanvas({ file: png('a.png'), position, addImportedFileNode: first.fn })
++    const second = captureFileNodeCalls()
++    await importFileToCanvas({ file: png('b.png'), position, addImportedFileNode: second.fn })
++
++    expect(first.calls[0].importBatchId).toMatch(IMPORT_BATCH_ID_PATTERN)
++    expect(first.calls[0].importBatchId).not.toBe(second.calls[0].importBatchId)
++  })
++
++  it('importImageFileToCanvas 独立调用(未传 importBatchId)自行铸造', async () => {
++    const first = captureImageCalls()
++    await importImageFileToCanvas({ file: png('a.png'), position, addImportedImage: first.fn })
++    const second = captureImageCalls()
++    await importImageFileToCanvas({ file: png('b.png'), position, addImportedImage: second.fn })
++
++    expect(first.calls[0].importBatchId).toMatch(IMPORT_BATCH_ID_PATTERN)
++    expect(first.calls[0].importBatchId).not.toBe(second.calls[0].importBatchId)
++  })
++
++  it('importImageFileToCanvas 传入 importBatchId 时原样复用,不另铸新的', async () => {
++    const { calls, fn } = captureImageCalls()
++    await importImageFileToCanvas({
++      file: png('a.png'),
++      position,
++      addImportedImage: fn,
++      importBatchId: 'ib-1700000000000-0-deadbeef',
++    })
++
++    expect(calls[0].importBatchId).toBe('ib-1700000000000-0-deadbeef')
++  })
++})
+diff --git a/src/lib/canvasAssetImport.ts b/src/lib/canvasAssetImport.ts
+index 874e2df0..db1bbc65 100644
+--- a/src/lib/canvasAssetImport.ts
++++ b/src/lib/canvasAssetImport.ts
+@@ -4,6 +4,8 @@ import { deleteImportedAsset, saveImportedAsset } from './assetStorage'
+ import { inspectFileSignature } from './fileSignature'
+ // 扩展名 → MIME 的唯一一份实现(含原型键守卫);曾在本文件与 assetStorage 各有一份逐字拷贝。
+ import { mimeFromFilename } from './mimeFromFilename'
++// 批次戳(#297 T2a1):每个"批"在这里铸造一次,详见 importBatchId.ts 顶部注释。
++import { createImportBatchId } from './importBatchId'
+ import { debugLogger } from '../store/debugLogStore'
+ import type { CanvasAssetNodeType } from '../types/mivoCanvas'
+ 
+@@ -36,6 +38,8 @@ export type CanvasImageImportSource = {
+   position: { x: number; y: number }
+   offset?: number
+   addImportedImage: AddImportedImage
++  /** 同一次批量导入(见 importImageFilesToCanvas)共用的批次戳;单张导入时不传,本函数自行铸造。 */
++  importBatchId?: string
+ }
+ 
+ export type CanvasFileImportSource = {
+@@ -274,6 +278,7 @@ const addPreparedImportToCanvas = (
+   prepared: PreparedCanvasFileImport,
+   position: { x: number; y: number },
+   addImportedFileNode: AddImportedFileNode,
++  importBatchId: string,
+ ) => {
+   addImportedFileNode(
+     prepared.type,
+@@ -281,7 +286,7 @@ const addPreparedImportToCanvas = (
+     prepared.asset.title,
+     prepared.sizeLabel,
+     position,
+-    prepared.metadata,
++    { ...prepared.metadata, importBatchId },
+   )
+ }
+ 
+@@ -302,6 +307,7 @@ export const importFileToCanvas = async ({
+       y: position.y - prepared.displaySize.height / 2 + offsetPoint.y,
+     },
+     addImportedFileNode,
++    createImportBatchId(),
+   )
+ 
+   debugLogger.log('Canvas Import', `Imported file: ${file.name}`)
+@@ -313,6 +319,7 @@ export const importImageFileToCanvas = async ({
+   position,
+   offset = 0,
+   addImportedImage,
++  importBatchId,
+ }: CanvasImageImportSource) => {
+   // 与批量目录导入同一道字节签名闸(review:331 第八轮):此前只有目录路径过闸,
+   // 单张拖入/粘贴/URL 落图直接存盘 —— 同一个坏文件换个入口就绕过,SVG 又被刻意
+@@ -349,7 +356,7 @@ export const importImageFileToCanvas = async ({
+       x: position.x - displaySize.width / 2 + offset,
+       y: position.y - displaySize.height / 2 + offset,
+     },
+-    asset,
++    { ...asset, importBatchId: importBatchId ?? createImportBatchId() },
+   )
+ 
+   debugLogger.log('Canvas Import', `Imported image file: ${file.name}`)
+@@ -365,6 +372,10 @@ export const importImageFilesToCanvas = async (
+   const skippedCount = files.length - imageFiles.length
+   if (skippedCount) debugLogger.warn('Canvas Import', `Skipped ${skippedCount} non-image file${skippedCount === 1 ? '' : 's'}`)
+ 
++  // 同一次多文件导入共享同一个批次戳(#297 T2a1):铸造一次,逐文件复用,而不是
++  // 让 importImageFileToCanvas 各自铸造(那会把"一次拖 10 张图"拆成 10 个独立批次)。
++  const importBatchId = createImportBatchId()
++
+   // 逐文件隔离(与批量目录导入同精神):一个坏文件不拖垮同批其余文件;
+   // 失败已在 importImageFileToCanvas 内 warn 留痕,这里只如实计数。
+   let importedCount = 0
+@@ -375,6 +386,7 @@ export const importImageFilesToCanvas = async (
+         position,
+         offset: index * 28,
+         addImportedImage,
++        importBatchId,
+       })
+       importedCount += 1
+     } catch {
+@@ -518,7 +530,10 @@ export const importCanvasFileBatch = async (
+     rejected.push({ name: entry.file.name, reason: entry.detail ? 'failed' : 'unsupported', detail: entry.detail })
+   }
+ 
+-  const { placed, failed } = layoutPreparedImports(preparedEntries, position, addImportedFileNode)
++  // 整批共享同一个批次戳(#297 T2a1):在真正落板之前铸造一次,逐项复用——
++  // 与 importImageFilesToCanvas 同一精神,一次目录/多文件导入是一批,不是 N 批。
++  const importBatchId = createImportBatchId()
++  const { placed, failed } = layoutPreparedImports(preparedEntries, position, addImportedFileNode, importBatchId)
+   for (const failure of failed) {
+     rejected.push({ name: failure.file.name, reason: 'failed', detail: failure.detail })
+   }
+@@ -564,6 +579,7 @@ const layoutPreparedImports = (
+   preparedEntries: PreparedBatchEntry[],
+   position: { x: number; y: number },
+   addImportedFileNode: AddImportedFileNode,
++  importBatchId: string,
+ ): { placed: PreparedBatchEntry[]; failed: Array<{ file: File; detail: string }> } => {
+   const rowGap = 56
+   const columnGap = 56
+@@ -611,6 +627,7 @@ const layoutPreparedImports = (
+             y: rowTop + (row.height - entry.prepared.displaySize.height) / 2,
+           },
+           addImportedFileNode,
++          importBatchId,
+         )
+         placed.push(entry)
+       } catch (error) {
+diff --git a/src/lib/imageSizing.ts b/src/lib/imageSizing.ts
+index f77eacf4..06bb43ea 100644
+--- a/src/lib/imageSizing.ts
++++ b/src/lib/imageSizing.ts
+@@ -7,6 +7,8 @@ export type ImportedImageMetadata = {
+   dimensions?: ImageDimensions
+   sourceDimensions?: ImageDimensions
+   hasTransparency?: boolean
++  /** 导入批次戳(#297 T2a1,见 `../lib/importBatchId.ts`)——同一次导入的所有节点共享同一值。 */
++  importBatchId?: string
+ }
+ 
+ const fallbackImportedImageSize = {
+diff --git a/src/lib/importBatchId.test.ts b/src/lib/importBatchId.test.ts
+new file mode 100644
+index 00000000..1d0c632e
+--- /dev/null
++++ b/src/lib/importBatchId.test.ts
+@@ -0,0 +1,106 @@
++// importBatchId 契约测试(#297 T2a1,设计稿 §2.11-③ 全量)。
++//
++// 五类钉死:格式冻结 / 同批全等 / 同毫秒 seq 异 / 排序三分支 / 并列输出。
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import {
++  __resetImportBatchSessionForTest,
++  compareImportBatchIds,
++  createImportBatchId,
++  IMPORT_BATCH_ID_PATTERN,
++  isSameImportBatch,
++  parseImportBatchId,
++} from './importBatchId'
++
++beforeEach(() => {
++  __resetImportBatchSessionForTest()
++})
++
++describe('createImportBatchId — 格式冻结', () => {
++  it('匹配 ib-<epochMs>-<seq>-<nonce8>,epochMs 十进制不补零,nonce8 为 8 位小写 hex', () => {
++    const id = createImportBatchId()
++    expect(id).toMatch(IMPORT_BATCH_ID_PATTERN)
++    const parsed = parseImportBatchId(id)
++    expect(parsed).toBeDefined()
++    expect(Number.isInteger(parsed!.epochMs)).toBe(true)
++    expect(parsed!.nonce8).toMatch(/^[0-9a-f]{8}$/)
++  })
++
++  it('同一会话内 nonce8 恒定(所有批次共用)', () => {
++    const first = createImportBatchId()
++    const second = createImportBatchId()
++    expect(parseImportBatchId(first)!.nonce8).toBe(parseImportBatchId(second)!.nonce8)
++  })
++
++  it('格式不识别的字符串解析为 undefined(不宽松兜底)', () => {
++    expect(parseImportBatchId('not-a-batch-id')).toBeUndefined()
++    expect(parseImportBatchId('ib-123-1-XYZ12345')).toBeUndefined() // 大写不在 nonce8 字符集
++    expect(parseImportBatchId('ib-123-1-abcd')).toBeUndefined() // nonce8 长度不足
++  })
++})
++
++describe('createImportBatchId — 同毫秒两次导入 seq 必不同', () => {
++  it('同一 epochMs 下连续两次调用产出整串不同的批次戳', () => {
++    vi.useFakeTimers()
++    vi.setSystemTime(1_700_000_000_000)
++    try {
++      const first = createImportBatchId()
++      const second = createImportBatchId()
++      expect(parseImportBatchId(first)!.epochMs).toBe(parseImportBatchId(second)!.epochMs)
++      expect(parseImportBatchId(first)!.seq).not.toBe(parseImportBatchId(second)!.seq)
++      expect(first).not.toBe(second)
++    } finally {
++      vi.useRealTimers()
++    }
++  })
++})
++
++describe('isSameImportBatch — 同批判定 = 整串相等', () => {
++  it('两次调用同一批(同一次导入内)全等', () => {
++    const batchId = createImportBatchId()
++    // 同一次导入的多个节点共享同一个已铸造好的字符串,不是各自调用 createImportBatchId。
++    expect(isSameImportBatch(batchId, batchId)).toBe(true)
++  })
++
++  it('两次独立调用产出的不同批次戳判定为不同批', () => {
++    const a = createImportBatchId()
++    const b = createImportBatchId()
++    expect(isSameImportBatch(a, b)).toBe(false)
++  })
++
++  it('undefined(存量节点无字段)判定为不同批,不抛错', () => {
++    expect(isSameImportBatch(undefined, undefined)).toBe(false)
++    expect(isSameImportBatch(createImportBatchId(), undefined)).toBe(false)
++  })
++})
++
++describe('compareImportBatchIds — 排序契约三分支 + 并列', () => {
++  const idOf = (epochMs: number, seq: number, nonce8: string) => `ib-${epochMs}-${seq}-${nonce8}`
++
++  it('分支①:epochMs 不同 → 数值序,大者更近', () => {
++    expect(compareImportBatchIds(idOf(200, 0, 'aaaaaaaa'), idOf(100, 0, 'aaaaaaaa'))).toBe('newer')
++    expect(compareImportBatchIds(idOf(100, 0, 'aaaaaaaa'), idOf(200, 0, 'aaaaaaaa'))).toBe('older')
++  })
++
++  it('分支②:epochMs 相等且 nonce8 相同(同一会话)→ 比 seq,大者更近', () => {
++    expect(compareImportBatchIds(idOf(100, 5, 'aaaaaaaa'), idOf(100, 3, 'aaaaaaaa'))).toBe('newer')
++    expect(compareImportBatchIds(idOf(100, 3, 'aaaaaaaa'), idOf(100, 5, 'aaaaaaaa'))).toBe('older')
++  })
++
++  it('分支③(并列):epochMs 相等且 nonce8 不同(跨会话同毫秒)→ tie,不产生确定顺序', () => {
++    expect(compareImportBatchIds(idOf(100, 0, 'aaaaaaaa'), idOf(100, 0, 'bbbbbbbb'))).toBe('tie')
++    expect(compareImportBatchIds(idOf(100, 9, 'aaaaaaaa'), idOf(100, 0, 'bbbbbbbb'))).toBe('tie')
++  })
++
++  it('整串相等(同一批)也落在 nonce8 相同 + seq 相等的退化分支,判定为 tie', () => {
++    const id = idOf(100, 0, 'aaaaaaaa')
++    expect(compareImportBatchIds(id, id)).toBe('tie')
++  })
++
++  it('格式不识别时抛错,不静默返回 tie(fail-visible)', () => {
++    expect(() => compareImportBatchIds('garbage', idOf(100, 0, 'aaaaaaaa'))).toThrow()
++  })
++})
++
++afterEach(() => {
++  vi.useRealTimers()
++})
+diff --git a/src/lib/importBatchId.ts b/src/lib/importBatchId.ts
+new file mode 100644
+index 00000000..f2f4e4ec
+--- /dev/null
++++ b/src/lib/importBatchId.ts
+@@ -0,0 +1,108 @@
++// importBatchId —— 导入批次戳(#297 P3 T2a1「选中即批次」的数据层基石,设计稿
++// §2.11-③ / §3.2 carve-out)。
++//
++// 同一次拖拽/粘贴/URL 落图导入的所有节点共享同一个批次标识,供 Agent 在用户未
++// 选中任何节点、但存在"刚导入的这一批"这条批次线索时兜底(纪律文本见 ghost.json
++// canvas_snapshot 描述,T3c 落地)。本模块只负责生成与比较,不做任何"挑批次"的
++// 决策——那是 Agent 纪律,不是数据层职责。
++//
++// 格式冻结:`ib-<epochMs>-<seq>-<nonce8>`。三段各自的角色:
++// - epochMs:导入时刻毫秒时间戳,十进制不补零,天然给出"哪个更近"的主排序键;
++// - seq:会话内单调递增计数器,保证同一毫秒内的两次导入互不相同;
++// - nonce8:整个应用会话启动时生成一次、该会话所有批次共用的 8 位小写十六进制
++//   随机串——不同会话(不同浏览器标签/不同一次刷新)的 seq 序列域不可比较,
++//   nonce8 不同就是这件事的信号,而不是碰撞检测(4→8 位只是把碰撞压到工程可
++//   忽略,不保证绝对唯一,如实声明)。
++//
++// 同批判定 = 整串相等(不比较字段,严格字符串比较即可,写这个只是让调用方不用
++// 自己拼字符串比较逻辑)。
++
++const NONCE8_PATTERN = /^[0-9a-f]{8}$/
++export const IMPORT_BATCH_ID_PATTERN = /^ib-(\d+)-(\d+)-([0-9a-f]{8})$/
++
++export type ParsedImportBatchId = {
++  epochMs: number
++  seq: number
++  nonce8: string
++}
++
++/** 解析失败(格式不识别)返回 undefined——不做宽松兜底,调用方按"无批次线索"处理。 */
++export const parseImportBatchId = (value: string): ParsedImportBatchId | undefined => {
++  const match = IMPORT_BATCH_ID_PATTERN.exec(value)
++  if (!match) return undefined
++
++  const epochMs = Number(match[1])
++  const seq = Number(match[2])
++  if (!Number.isSafeInteger(epochMs) || !Number.isSafeInteger(seq)) return undefined
++
++  return { epochMs, seq, nonce8: match[3] }
++}
++
++const randomHex8 = (): string => {
++  if (typeof crypto !== 'undefined' && 'getRandomValues' in crypto) {
++    const bytes = crypto.getRandomValues(new Uint8Array(4))
++    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
++  }
++  // 兜底(理论上现代运行时都有 crypto.getRandomValues):与仓内既有 id 生成器
++  // (nodeFactory.createGroupId 等)同款 Math.random 兜底,只是补足到 8 位十六进制。
++  return Math.random().toString(16).slice(2).padEnd(8, '0').slice(0, 8)
++}
++
++/** 会话 nonce:整个应用会话生命周期内只生成一次(模块级单例,随页面刷新重置)。 */
++let sessionNonce8: string | undefined
++
++/** 仅供测试重置会话状态(nonce + seq),不导出给业务代码调用。 */
++export const __resetImportBatchSessionForTest = (): void => {
++  sessionNonce8 = undefined
++  sessionSeq = 0
++}
++
++const getSessionNonce8 = (): string => {
++  if (!sessionNonce8) sessionNonce8 = randomHex8()
++  if (!NONCE8_PATTERN.test(sessionNonce8)) {
++    throw new Error(`importBatchId: session nonce8 生成结果不合法: ${sessionNonce8}`)
++  }
++  return sessionNonce8
++}
++
++/** 会话内单调递增计数器——保证同一毫秒内先后两次导入的批次戳整串不同。 */
++let sessionSeq = 0
++
++/** 每次调用铸造一个新批次戳。调用方负责"一次导入调用一次",不要在逐节点循环里调用。 */
++export const createImportBatchId = (): string => {
++  const epochMs = Date.now()
++  const seq = sessionSeq
++  sessionSeq += 1
++  return `ib-${epochMs}-${seq}-${getSessionNonce8()}`
++}
++
++/** 同批判定(设计稿 §2.11-③:"同批判定 = 整串相等")。 */
++export const isSameImportBatch = (a: string | undefined, b: string | undefined): boolean =>
++  Boolean(a) && a === b
++
++export type ImportBatchOrder = 'newer' | 'older' | 'tie'
++
++/**
++ * 排序契约(设计稿 §2.11-③):
++ * 1. 先比 epochMs 数值,大者更近;
++ * 2. epochMs 相等时,仅当 nonce8 相同(同一会话、同一 seq 序列域)才比较 seq 数值,大者更近;
++ * 3. epochMs 相等且 nonce8 不同(跨会话同毫秒,seq 不可比)——一律 'tie'(并列)。
++ *
++ * 'tie' 是契约里的第三种确定性结果,不是"无法判断"的降级:调用方(Agent 纪律)看到
++ * 'tie' 必须反问,不得自行挑选。格式不识别时抛错——这两个字符串按约定只应来自
++ * `createImportBatchId()` 或既有节点的存量字段,格式错误意味着上游已经违反了契约。
++ */
++export const compareImportBatchIds = (a: string, b: string): ImportBatchOrder => {
++  const parsedA = parseImportBatchId(a)
++  const parsedB = parseImportBatchId(b)
++  if (!parsedA || !parsedB) {
++    throw new Error('compareImportBatchIds: 入参不是合法的 importBatchId(格式 ib-<epochMs>-<seq>-<nonce8>)')
++  }
++
++  if (parsedA.epochMs !== parsedB.epochMs) {
++    return parsedA.epochMs > parsedB.epochMs ? 'newer' : 'older'
++  }
++  if (parsedA.nonce8 !== parsedB.nonce8) return 'tie'
++  if (parsedA.seq === parsedB.seq) return 'tie'
++  return parsedA.seq > parsedB.seq ? 'newer' : 'older'
++}
+diff --git a/src/store/aiCanvasWorkflow.test.ts b/src/store/aiCanvasWorkflow.test.ts
+index c8ca8b37..8c8b2dd1 100644
+--- a/src/store/aiCanvasWorkflow.test.ts
++++ b/src/store/aiCanvasWorkflow.test.ts
+@@ -6,7 +6,7 @@ vi.mock('./remoteDebugReporter', () => ({
+ 
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import { useDebugLogStore } from './debugLogStore'
+-import { equalAreaSizeForDimensions, reflowRightObstacles } from './aiCanvasWorkflow'
++import { buildAiContextSnapshot, equalAreaSizeForDimensions, reflowRightObstacles } from './aiCanvasWorkflow'
+ 
+ const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+   id: 'img-1',
+@@ -99,3 +99,22 @@ describe('equalAreaSizeForDimensions (chat slot 替换按结果图比例落画
+     expect(equalAreaSizeForDimensions(base, { width: 0, height: 900 })).toEqual(base)
+   })
+ })
++
++// #297 T2a1(设计稿 §2.11-③「投影带出」):importBatchId 是 MivoCanvasNode 的可选字段,
++// 快照投影(MivoCanvasNode → AiCanvasContextNode)必须原样带出;存量节点无字段则
++// 投影结果里也是 undefined(不是空字符串、不是伪造的默认批次)。
++describe('buildAiContextSnapshot — importBatchId 投影带出', () => {
++  it('携带 importBatchId 的节点投影后字段原样保留', () => {
++    const node = imageNode({ id: 'a', importBatchId: 'ib-1700000000000-0-deadbeef' })
++    const snapshot = buildAiContextSnapshot({ sceneId: 's', nodes: [node], edges: [], selectedNodeIds: [] })
++
++    expect(snapshot.nodes[0].importBatchId).toBe('ib-1700000000000-0-deadbeef')
++  })
++
++  it('存量节点无该字段 → 投影结果里是 undefined,不是伪造值', () => {
++    const node = imageNode({ id: 'a' })
++    const snapshot = buildAiContextSnapshot({ sceneId: 's', nodes: [node], edges: [], selectedNodeIds: [] })
++
++    expect(snapshot.nodes[0].importBatchId).toBeUndefined()
++  })
++})
+diff --git a/src/store/aiCanvasWorkflow.ts b/src/store/aiCanvasWorkflow.ts
+index 5efed38e..097668b3 100644
+--- a/src/store/aiCanvasWorkflow.ts
++++ b/src/store/aiCanvasWorkflow.ts
+@@ -258,6 +258,7 @@ export const buildAiContextSnapshot = (state: AiContextState): AiCanvasContextSn
+       assetMimeType: node.assetMimeType,
+       assetOriginalName: node.assetOriginalName,
+       assetSizeBytes: node.assetSizeBytes,
++      importBatchId: node.importBatchId,
+       sectionId: node.sectionId,
+       targetNodeId: node.targetNodeId,
+       markupKind: node.markupKind,
+diff --git a/src/store/importBatchStamp.test.ts b/src/store/importBatchStamp.test.ts
+new file mode 100644
+index 00000000..ba2ff7d1
+--- /dev/null
++++ b/src/store/importBatchStamp.test.ts
+@@ -0,0 +1,149 @@
++// importBatchId 在 store 层的落地(#297 T2a1):
++// 1. addImportedFileNode 把 metadata.importBatchId 原样写进节点(canvasAssetImport
++//    在这之前铸造,这里只验证 store 侧不丢字段);
++// 2. pasteClipboardAssets(Eagle 素材板粘贴,"内部资产板粘贴入口" [J4-④])同次粘贴
++//    的全部节点共享同一个新批次戳;
++// 3. pasteClipboardNodes(复制既有画布节点)不得伪造新的 importBatchId——有就原样
++//    保留,没有就仍然没有。
++//
++// 跑在真实 store 上,与 nodeCopyOffset.test.ts 同一套 hermetic 前置。
++import { describe, expect, it, vi } from 'vitest'
++
++vi.hoisted(() => {
++  const store = new Map<string, string>()
++  const memStorage = {
++    get length() {
++      return store.size
++    },
++    clear: () => store.clear(),
++    getItem: (k: string) => store.get(k) ?? null,
++    key: (i: number) => [...store.keys()][i] ?? null,
++    removeItem: (k: string) => {
++      store.delete(k)
++    },
++    setItem: (k: string, v: string) => {
++      store.set(k, String(v))
++    },
++  }
++  const g = globalThis as Record<string, unknown>
++  if (g.window === undefined) g.window = { localStorage: memStorage }
++  if (g.localStorage === undefined) g.localStorage = memStorage
++})
++
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++vi.mock('./remoteDebugReporter', () => ({
++  reportRemoteDebugEntry: () => {},
++}))
++
++import { useCanvasStore } from './canvasStore'
++import { normalizeCanvasNodes } from './canvasDocumentModel'
++import { IMPORT_BATCH_ID_PATTERN } from '../lib/importBatchId'
++import type { CanvasAssetClipboardItem } from '../app/assetLibraryModel'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++const seed = (nodes: MivoCanvasNode[], selected: string[] = []) => {
++  const base = useCanvasStore.getState()
++  const normalized = normalizeCanvasNodes(nodes)
++  useCanvasStore.setState(
++    {
++      ...base,
++      canvases: {
++        s: { title: 's', nodes: normalized, edges: [], tasks: [], selectedNodeId: selected[0], selectedNodeIds: selected },
++      },
++      sceneId: 's',
++      nodes: normalized,
++      edges: [],
++      tasks: [],
++      selectedNodeId: selected[0],
++      selectedNodeIds: selected,
++      historyPast: [],
++      historyFuture: [],
++      clipboardNodes: [],
++      clipboardAssets: [],
++    } as never,
++    true,
++  )
++}
++
++const img = (id: string, overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode =>
++  ({ id, type: 'image', title: id, x: 100, y: 100, width: 200, height: 150, status: 'ready', assetUrl: '/a.png', ...overrides }) as MivoCanvasNode
++
++const clipboardAsset = (id: string, url: string): CanvasAssetClipboardItem => ({
++  id,
++  sourceId: 'eagle',
++  name: `${id}.png`,
++  title: `${id}.png`,
++  url,
++  sourcePath: `/library/${id}.png`,
++})
++
++describe('addImportedFileNode — metadata.importBatchId 原样落到节点', () => {
++  it('落板节点携带调用方传入的 importBatchId', () => {
++    seed([])
++    useCanvasStore.getState().addImportedFileNode('image', '/imported.png', 'Imported', 'source', { x: 0, y: 0 }, {
++      importBatchId: 'ib-1700000000000-0-deadbeef',
++    })
++    const node = useCanvasStore.getState().nodes[0]
++    expect(node.importBatchId).toBe('ib-1700000000000-0-deadbeef')
++  })
++
++  it('未传 importBatchId 时节点该字段为 undefined(不自行铸造——那是 canvasAssetImport 的职责)', () => {
++    seed([])
++    useCanvasStore.getState().addImportedFileNode('image', '/imported.png', 'Imported', 'source', { x: 0, y: 0 })
++    expect(useCanvasStore.getState().nodes[0].importBatchId).toBeUndefined()
++  })
++})
++
++describe('pasteClipboardAssets — 同次粘贴共享同一新批次戳', () => {
++  it('两个 Eagle 素材同次粘贴,落地节点 importBatchId 全等且格式合法', () => {
++    seed([])
++    useCanvasStore.setState({
++      clipboardAssets: [clipboardAsset('e1', 'eagle://e1'), clipboardAsset('e2', 'eagle://e2')],
++    } as never)
++
++    useCanvasStore.getState().pasteClipboardAssets({ x: 0, y: 0 })
++
++    const nodes = useCanvasStore.getState().nodes
++    expect(nodes).toHaveLength(2)
++    expect(nodes[0].importBatchId).toMatch(IMPORT_BATCH_ID_PATTERN)
++    expect(nodes[0].importBatchId).toBe(nodes[1].importBatchId)
++  })
++
++  it('两次独立粘贴产出不同的批次戳(不是同一批)', () => {
++    seed([])
++    useCanvasStore.setState({ clipboardAssets: [clipboardAsset('e1', 'eagle://e1')] } as never)
++    useCanvasStore.getState().pasteClipboardAssets({ x: 0, y: 0 })
++    const firstBatch = useCanvasStore.getState().nodes[0].importBatchId
++
++    useCanvasStore.setState({ clipboardAssets: [clipboardAsset('e2', 'eagle://e2')] } as never)
++    useCanvasStore.getState().pasteClipboardAssets({ x: 200, y: 200 })
++    const nodes = useCanvasStore.getState().nodes
++    const secondBatch = nodes[nodes.length - 1].importBatchId
++
++    expect(secondBatch).not.toBe(firstBatch)
++  })
++})
++
++describe('pasteClipboardNodes — 复制既有节点不伪造新导入批次', () => {
++  it('复制"存量无批次线索"的节点 → 副本仍然没有 importBatchId', () => {
++    seed([img('a')], ['a'])
++    useCanvasStore.getState().copySelectedNodes()
++    useCanvasStore.getState().pasteClipboardNodes({ x: 500, y: 500 })
++
++    const clone = useCanvasStore.getState().nodes.find((node) => node.id !== 'a')
++    expect(clone).toBeDefined()
++    expect(clone!.importBatchId).toBeUndefined()
++  })
++
++  it('复制"带批次戳"的节点 → 副本原样保留源批次戳,不新造', () => {
++    seed([img('a', { importBatchId: 'ib-1700000000000-0-deadbeef' })], ['a'])
++    useCanvasStore.getState().copySelectedNodes()
++    useCanvasStore.getState().pasteClipboardNodes({ x: 500, y: 500 })
++
++    const clone = useCanvasStore.getState().nodes.find((node) => node.id !== 'a')
++    expect(clone).toBeDefined()
++    expect(clone!.importBatchId).toBe('ib-1700000000000-0-deadbeef')
++  })
++})
+diff --git a/src/store/nodeCreationSlice.ts b/src/store/nodeCreationSlice.ts
+index ec9b5ebb..7d9be67c 100644
+--- a/src/store/nodeCreationSlice.ts
++++ b/src/store/nodeCreationSlice.ts
+@@ -79,6 +79,7 @@ export const createNodeCreationSlice: SliceCreator = (set, get) => ({
+             assetMimeType: metadata?.mimeType,
+             assetOriginalName: metadata?.originalName,
+             assetSizeBytes: metadata?.sizeBytes,
++            importBatchId: metadata?.importBatchId,
+             markdownDisplayMode: type === 'markdown' ? markdownDisplayMode : undefined,
+             imageHasTransparency: type === 'image' ? metadata?.hasTransparency : undefined,
+             assetSourceDimensions: type === 'image' ? metadata?.sourceDimensions : undefined,
+diff --git a/src/store/selectionSlice.ts b/src/store/selectionSlice.ts
+index aed68e45..78263fe1 100644
+--- a/src/store/selectionSlice.ts
++++ b/src/store/selectionSlice.ts
+@@ -3,6 +3,10 @@ import { defaultStampKind } from '../canvas/stampDefs'
+ import { brushKindDefaultAlpha } from '../model/brushGeometry'
+ import { withColorAlpha } from '../model/colorAlpha'
+ import { setNodeTransform } from '../model/documentModelV2'
++// 批次戳(#297 T2a1):Eagle 素材板粘贴是一次"导入"(与拖入/系统粘贴同义),同次
++// paste 的全部节点共享一个新批次;区别于 pasteClipboardNodes(复制既有画布节点,
++// 不是导入,不铸造批次戳——见该函数实现)。
++import { createImportBatchId } from '../lib/importBatchId'
+ import { logCanvas, warnCanvas } from './canvasStoreLog'
+ import { makeNode } from './demoScenes'
+ import {
+@@ -362,6 +366,7 @@ export const createSelectionSlice: SliceCreator = (set) => ({
+       const cellWidth = Math.max(...displaySizes.map((size) => size.width)) + gap
+       const cellHeight = Math.max(...displaySizes.map((size) => size.height)) + gap
+       const createdAt = Date.now()
++      const importBatchId = createImportBatchId()
+       const nodes = state.clipboardAssets.map((asset, index) => {
+         const displaySize = displaySizes[index]
+         const column = index % columns
+@@ -378,6 +383,7 @@ export const createSelectionSlice: SliceCreator = (set) => ({
+           height: displaySize.height,
+           assetUrl: asset.url,
+           assetOriginalName: asset.name,
++          importBatchId,
+           status: 'ready',
+           generation: {
+             prompt: 'Eagle 素材库复制粘贴导入，可作为后续 AI 上下文',
+diff --git a/src/types/mivoCanvas.ts b/src/types/mivoCanvas.ts
+index ed32983a..2a682b18 100644
+--- a/src/types/mivoCanvas.ts
++++ b/src/types/mivoCanvas.ts
+@@ -340,6 +340,11 @@ export type MivoCanvasNode = {
+   markdownDisplayMode?: MarkdownDisplayMode
+   imageHasTransparency?: boolean
+   assetSourceDimensions?: ImageDimensions
++  /** 导入批次戳(#297 T2a1,`src/lib/importBatchId.ts`):同一次拖拽/粘贴导入的所有节点共享
++   *  同一值,供 Agent 在无选中时按"最近一批"兜底(设计稿 §2.11-③)。存量节点无此字段 = 无
++   *  批次线索。web/Cindy 双形态同义的形态中性业务字段,§3.2 carve-out 明确豁免 §3 红线
++   *  (红线挡的是 Cindy 专属媒体概念,如 depositHash/mediaRef,不含本字段)。 */
++  importBatchId?: string
+   imageCrop?: ImageCrop
+   /** Mirror flags for image nodes (render-level; imageCrop stays in source space). */
+   imageFlipH?: boolean
+@@ -400,6 +405,8 @@ export type AiCanvasContextNode = {
+   assetMimeType?: string
+   assetOriginalName?: string
+   assetSizeBytes?: number
++  /** 见 {@link MivoCanvasNode.importBatchId}——快照投影原样带出。 */
++  importBatchId?: string
+   sectionId?: string
+   targetNodeId?: string
+   markupKind?: MarkupKind

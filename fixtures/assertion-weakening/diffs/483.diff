@@ -1,0 +1,953 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index c4123f99..8168e2d6 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -108,6 +108,14 @@ jobs:
+       - name: Internal infra literals guard
+         run: node scripts/ci/check-internal-literals.mjs
+ 
++      # e2e 等待静默失效守卫(2026-08-04):Playwright 的 waitForFunction 不 await 谓词
++      # 返回值,async 谓词返回的 Promise 恒 truthy → 第一次轮询就判真,这个"等待"根本
++      # 没在等。落地当轮全仓 19 处(含几乎所有场景共用的 waitForNodeRendered)。挂在
++      # 本 job(既有 required check)内,不新增 check 名 —— 新 check 名在 ruleset 里
++      # 未登记会让所有 PR 卡在"缺失"。规则与声明盲区见守卫脚本头注释。
++      - name: e2e wait guard (waitForFunction 谓词不得返回 Promise)
++        run: node scripts/ci/e2e-wait-guard.mjs
++
+       # R2-8:ops/postgres shell 回归 + shellcheck 进入 CI 自动验收(此前 test-asset-verify.sh 等无任何
+       # package script/CI/preflight 引用 → F3 矩阵/F6/F7 singleflight/F2 预算断言无自动闸门)。
+       # 依赖 bash + jq(ubuntu-latest 预装);无 docker/PG(纯函数 + 合成 tar/COPY 块)。
+diff --git a/package.json b/package.json
+index 78ac9d08..ec7efc10 100644
+--- a/package.json
++++ b/package.json
+@@ -29,7 +29,7 @@
+     "contract:diff": "node scripts/contract-diff.mjs",
+     "codemap": "node scripts/codemap.mjs",
+     "check:cycles": "node scripts/ci/cycle-guard.mjs",
+-    "preflight": "npm run check:i18n && tsc -b && npm run lint && npm run verify:logging && npm run verify:design && npm run check:cycles && node scripts/ci/structure-guard.mjs && node scripts/ci/check-internal-literals.mjs && npm run test:unit && npm run test:shell",
++    "preflight": "npm run check:i18n && tsc -b && npm run lint && npm run verify:logging && npm run verify:design && npm run check:cycles && node scripts/ci/structure-guard.mjs && node scripts/ci/check-internal-literals.mjs && node scripts/ci/e2e-wait-guard.mjs && npm run test:unit && npm run test:shell",
+     "prepare": "git rev-parse --git-dir >/dev/null 2>&1 && git config core.hooksPath .githooks || true",
+     "check:i18n": "node scripts/check-i18n.mjs"
+   },
+diff --git a/scripts/ci/e2e-wait-guard.mjs b/scripts/ci/e2e-wait-guard.mjs
+new file mode 100644
+index 00000000..4253183e
+--- /dev/null
++++ b/scripts/ci/e2e-wait-guard.mjs
+@@ -0,0 +1,155 @@
++#!/usr/bin/env node
++// e2e-wait-guard.mjs — `page.waitForFunction` 谓词返回 Promise 的静默失效守卫(守卫家族)。
++//
++// 为什么存在(2026-08-04):Playwright 的 `waitForFunction` **不 await** 谓词的返回值,
++// 它只判返回值的真假。async 谓词返回的是一个 Promise 对象 —— Promise 恒 truthy ——
++// 于是**第一次轮询就判真**,这个"等待"根本没在等。实测(chromium,timeout 1500ms):
++//   () => false                  → TimeoutError after 1505ms   ← 正常
++//   async () => false            → RESOLVED after 1ms          ← 静默失效
++//   () => Promise.resolve(false) → RESOLVED after 2ms          ← 静默失效
++// 落地当轮全仓有 19 处这种写法(scripts/e2e/ 下 7 个文件),其中 renderer-evidence.mjs
++// 的 waitForNodeRendered 是几乎所有场景共用的核心等待。表现是"看着在等其实没等":
++// 断言跑在状态未就绪的时刻,失败点漂到下游、报出与真实原因无关的错(#469 实测:残留
++// markup 节点 intercepts pointer events,却在 30s 后报成"点不到图片")。
++//
++// 正确写法:改用 `waitForAsyncPredicate`(scripts/e2e/wait-async-predicate.mjs)——
++// 它用 `page.evaluate` 轮询,而 `page.evaluate` **会** await 谓词返回的 Promise。
++// 谓词函数体一个字都不用改,只换调用壳。
++//
++// 威胁模型(不许超卖):本守卫按 AST 抓两类**字面可判**的形态 ——
++//   1. 谓词是 async 函数/箭头(`async () => …`、`async function () {}`);
++//   2. 谓词是非 async 箭头,但简洁体直接是 `Promise.…` / `new Promise(…)`,或简洁体是 `.then(` 链。
++// 它**不防**:谓词以标识符传入(`waitForFunction(myPred, …)`,需类型推导)、运行时
++// 拼装的函数、以及谓词内部同步返回一个来自别处的 Promise 变量。那几类要靠 review。
++// 反过来也不误报:sync 谓词内部出现 `await`(词法扫描会误判)在 AST 下天然不命中。
++//
++// 扫描范围:git tracked 的 .mjs / .js / .ts / .tsx,减去 EXCLUDES(每条带理由)。
++// 排除制而非白名单制 —— 新增文件默认**在**守卫视野内。
++//
++// 退出码:0=干净;1=有违规(逐条 file:line + 修法);2=运行错误(git 不可用/解析失败)。
++import { execFileSync } from 'node:child_process'
++import { readFileSync } from 'node:fs'
++import { fileURLToPath } from 'node:url'
++import ts from 'typescript'
++
++/** 排除目录/文件(每条必须带理由;不加理由的排除会在 review 里被打回)。 */
++export const EXCLUDES = [
++  { prefix: 'node_modules/', why: '第三方依赖,不属本仓代码' },
++  { prefix: 'dist/', why: '构建产物' },
++  // 本守卫与其单测自身要把违规形态当 fixture 写出来,整体豁免。
++  { prefix: 'scripts/ci/e2e-wait-guard', why: '守卫自身与其单测的 fixture' },
++]
++
++const SCAN_EXT = new Set(['.mjs', '.js', '.ts', '.tsx'])
++
++export const isExcluded = (path) => EXCLUDES.some((e) => path.startsWith(e.prefix))
++
++/** 谓词节点是否"返回 Promise"(两类字面可判形态,见文件头威胁模型)。 */
++const promiseReturningReason = (node) => {
++  const isFn = ts.isArrowFunction(node) || ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node)
++  if (!isFn) return null
++  const isAsync = node.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)
++  if (isAsync) return 'async 谓词返回 Promise(恒 truthy)'
++  // 非 async 箭头:简洁体直接是 Promise.… / new Promise(…),或简洁体是 .then( 链
++  // (new Promise 那半是 Greptile 云端审查补上的漏口:`() => new Promise(...)` 同样恒 truthy)
++  const body = node.body
++  if (!body) return null
++  const text = body.getText?.() ?? ''
++  if (/^\s*(?:new\s+)?Promise\s*(?:\.|\()/.test(text)) return '谓词返回 Promise(恒 truthy)'
++  if (/\.then\s*\(/.test(text) && !ts.isBlock(body)) return '谓词简洁体返回 .then(…) 链(恒 truthy)'
++  return null
++}
++
++/**
++ * 扫一份源码,返回违规列表。纯函数,便于单测直接喂 fixture。
++ * @returns {{path:string,line:number,reason:string}[]}
++ */
++/**
++ * 按扩展名选解析模式。**不能一律用 ScriptKind.JS**:守卫自己声明 .ts/.tsx 在视野内,而 JS
++ * 模式下 TS 的表达式泛型(`new Set<string>()`)会被判语法错误 —— 配上 fail-closed 的抛错,
++ * 就把「解析器用错了模式」升级成 exit 2。实测:全仓 775 个 tracked .ts/.tsx 里 234 个(30%)
++ * 在 JS 模式下抛解析失败;换成按扩展名选模式后归零。当下没红纯属侥幸(CLI 有
++ * `text.includes('waitForFunction')` 前置过滤,唯一命中的 src/main.tsx 恰好不含表达式泛型),
++ * 但本 PR 自己就往 scripts/e2e/ 放了个 .ts —— 下一次编辑就是雷区(第 2 轮审查 F5)。
++ */
++const scriptKindFor = (path) =>
++  path.endsWith('.tsx') ? ts.ScriptKind.TSX : path.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS
++
++export const checkSource = (path, text) => {
++  const violations = []
++  const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, scriptKindFor(path))
++  // fail-closed:ts.createSourceFile 对语法错误**不抛**,只把诊断挂在 parseDiagnostics 上。
++  // 不显式检查的话,一份语法坏掉的源码会被静默判成"0 违规"——而 .mjs 既不过 tsc
++  // (tsconfig.node.json 只 include vite 配置)也不过 eslint(files 只有 **/*.{ts,tsx}),
++  // 于是没有任何一道门会发现它坏了。守卫自己变成静默漏检,正是它要治的病(单席审查 F3)。
++  if (sf.parseDiagnostics?.length) {
++    const first = sf.parseDiagnostics[0]
++    const { line } = sf.getLineAndCharacterOfPosition(first.start ?? 0)
++    throw new Error(
++      `解析失败(语法错误,无法可靠判定):${path}:${line + 1} ${ts.flattenDiagnosticMessageText(first.messageText, ' ')}`,
++    )
++  }
++  const visit = (node) => {
++    if (
++      ts.isCallExpression(node) &&
++      ts.isPropertyAccessExpression(node.expression) &&
++      node.expression.name.text === 'waitForFunction' &&
++      node.arguments.length > 0
++    ) {
++      const reason = promiseReturningReason(node.arguments[0])
++      if (reason) {
++        const { line } = sf.getLineAndCharacterOfPosition(node.arguments[0].getStart(sf))
++        violations.push({ path, line: line + 1, reason })
++      }
++    }
++    ts.forEachChild(node, visit)
++  }
++  visit(sf)
++  return violations
++}
++
++// ── CLI ───────────────────────────────────────────────────────────────────
++const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]
++if (isMain) {
++  let files
++  try {
++    files = execFileSync('git', ['ls-files', '-z'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
++      .split('\0')
++      .filter(Boolean)
++      .filter((p) => SCAN_EXT.has(p.slice(p.lastIndexOf('.'))) && !isExcluded(p))
++  } catch (err) {
++    console.error(`[e2e-wait-guard] 运行错误:git ls-files 失败 —— ${err.message}`)
++    process.exit(2)
++  }
++
++  const all = []
++  for (const path of files) {
++    let text
++    try {
++      text = readFileSync(path, 'utf8')
++    } catch (err) {
++      // fail-closed:读不到就是运行错误,不静默跳过(跳过等于给漏检发免罪符)
++      console.error(`[e2e-wait-guard] 运行错误:读取 ${path} 失败 —— ${err.message}`)
++      process.exit(2)
++    }
++    if (!text.includes('waitForFunction')) continue
++    try {
++      all.push(...checkSource(path, text))
++    } catch (err) {
++      console.error(`[e2e-wait-guard] 运行错误:解析 ${path} 失败 —— ${err.message}`)
++      process.exit(2)
++    }
++  }
++
++  if (all.length === 0) {
++    console.log(`[e2e-wait-guard] OK — ${files.length} 个文件扫描,0 处 waitForFunction 谓词返回 Promise`)
++    process.exit(0)
++  }
++  console.error(`[e2e-wait-guard] FAIL — ${all.length} 处 waitForFunction 谓词返回 Promise(等待静默失效):`)
++  for (const v of all) console.error(`  ${v.path}:${v.line}  ${v.reason}`)
++  console.error('')
++  console.error('  修法:改用 waitForAsyncPredicate(scripts/e2e/wait-async-predicate.mjs),')
++  console.error('       谓词函数体不用动 —— 它用 page.evaluate 轮询,evaluate 会 await 返回的 Promise。')
++  console.error('       如果谓词本来不需要 async,把 async 去掉即可(sync 谓词 waitForFunction 是正确的)。')
++  process.exit(1)
++}
+diff --git a/scripts/ci/e2e-wait-guard.test.mjs b/scripts/ci/e2e-wait-guard.test.mjs
+new file mode 100644
+index 00000000..7d5cd7ae
+--- /dev/null
++++ b/scripts/ci/e2e-wait-guard.test.mjs
+@@ -0,0 +1,108 @@
++// e2e-wait-guard 守卫单测(vitest,随 test:unit / required gate 跑)。
++//
++// 覆盖:两类会命中的形态(async 谓词 / 返回 Promise 的简洁体)、不该误报的形态
++// (sync 谓词、谓词内部嵌套 async 回调)、以及**已声明不承诺**的盲区(标识符谓词、
++// block 体里 .then)——盲区用断言钉住,是为了让「以后有人扩大承诺」时必须同时改测试,
++// 而不是让盲区悄悄被当成"守住了"。
++// fixture 里的违规写法是被测样本,本文件与守卫本体在扫描中整体豁免(见 EXCLUDES)。
++import { describe, expect, it } from 'vitest'
++import { EXCLUDES, checkSource, isExcluded } from './e2e-wait-guard.mjs'
++
++const P = 'scripts/e2e/scenarios/fixture.mjs'
++
++describe('e2e-wait-guard', () => {
++  it('命中:async 箭头谓词', () => {
++    const v = checkSource(P, 'await page.waitForFunction(async (x) => x > 1, 2)')
++    expect(v).toHaveLength(1)
++    expect(v[0].reason).toContain('async 谓词')
++  })
++
++  it('命中:async function 表达式谓词', () => {
++    expect(checkSource(P, 'await page.waitForFunction(async function () { return true })')).toHaveLength(1)
++  })
++
++  it('命中:非 async 但简洁体直接返回 Promise', () => {
++    expect(checkSource(P, 'await page.waitForFunction(() => Promise.resolve(false))')).toHaveLength(1)
++    expect(checkSource(P, 'await page.waitForFunction(() => readIt().then((v) => v === 1))')).toHaveLength(1)
++    // new Promise(...) 简洁体同样恒 truthy(Greptile 云端审查补上的漏口)
++    expect(checkSource(P, 'await page.waitForFunction(() => new Promise((r) => setTimeout(r, 10)))')).toHaveLength(1)
++    expect(checkSource(P, 'await page.waitForFunction(() => Promise.all([a, b]))')).toHaveLength(1)
++  })
++
++  it('不误报:sync 谓词(waitForFunction 的正确用法)', () => {
++    expect(checkSource(P, 'await page.waitForFunction(() => document.title === "x")')).toHaveLength(0)
++    expect(checkSource(P, 'await page.waitForFunction(function () { return window.ready })')).toHaveLength(0)
++  })
++
++  it('不误报:sync 谓词内部嵌套 async 回调(词法扫描会误判,AST 不会)', () => {
++    const src = 'await page.waitForFunction(() => { register(async () => { await x() }); return window.done })'
++    expect(checkSource(P, src)).toHaveLength(0)
++  })
++
++  it('不误报:替代原语 waitForAsyncPredicate 的 async 谓词是正确用法', () => {
++    const src = 'await waitForAsyncPredicate(page, async (s) => (await load(s)).ok, spec, { label: "x" })'
++    expect(checkSource(P, src)).toHaveLength(0)
++  })
++
++  it('行号指向谓词所在行(多行调用形态)', () => {
++    const src = ['// head', 'await page.waitForFunction(', '  async ({ a }) => a,', '  { a: 1 },', ')'].join('\n')
++    const v = checkSource(P, src)
++    expect(v).toHaveLength(1)
++    expect(v[0].line).toBe(3)
++  })
++
++  it('一份源码里多处各自记账', () => {
++    const src = 'await page.waitForFunction(async () => 1)\nawait page.waitForFunction(async () => 2)\nawait page.waitForFunction(() => 3)'
++    expect(checkSource(P, src)).toHaveLength(2)
++  })
++
++  it('解析模式按扩展名选:.ts/.tsx 的表达式泛型不得被当成语法错误(fail-closed 不许假红)', () => {
++    // 第 2 轮审查 F5:守卫声明 .ts/.tsx 在视野内,但一律用 ScriptKind.JS 解析 —— JS 模式下
++    // `new Set<string>()` 是语法错误,配上 F3 的抛错就把「解析器用错模式」升级成 exit 2。
++    // 实测当时全仓 775 个 tracked .ts/.tsx 有 234 个(30%)会抛。对这一整类文件,守卫只能崩、
++    // 永远报不出违规 —— fail-open 换成了假红,同样是没守住。
++    const tsSrc = 'const s = new Set<string>()\nawait page.waitForFunction(async () => s.size > 0)\n'
++    expect(() => checkSource('scripts/e2e/helper.ts', tsSrc)).not.toThrow()
++    expect(checkSource('scripts/e2e/helper.ts', tsSrc)).toHaveLength(1)
++    const tsxSrc = 'const m = new Map<string, number>()\nconst El = () => <div>{m.size}</div>\nawait page.waitForFunction(async () => m.size > 0)\n'
++    expect(() => checkSource('src/a.tsx', tsxSrc)).not.toThrow()
++    expect(checkSource('src/a.tsx', tsxSrc)).toHaveLength(1)
++  })
++
++  it('fail-closed:源码语法坏掉时必须抛错(→CLI exit 2),不得静默判 0 违规', () => {
++    // ts.createSourceFile 对语法错误**不抛**,只挂 parseDiagnostics —— 不显式检查就会把
++    // 一份坏掉的源码判成"干净"。而 .mjs 既不过 tsc 也不过 eslint,没有第二道门兜着,
++    // 守卫自己就成了静默漏检(单席审查 F3)。这两种形态实测都会让后面真实的违规被吞掉。
++    for (const [name, src] of [
++      ['未闭合模板串', 'const a = `unclosed\nawait page.waitForFunction(async () => 1)\n'],
++      ['未闭合块注释', '/* unclosed\nawait page.waitForFunction(async () => 1)\n'],
++    ]) {
++      expect(() => checkSource(P, src), name).toThrow(/解析失败/)
++    }
++    // 反向对照:语法正确的源码不因本检查误抛
++    expect(() => checkSource(P, 'await page.waitForFunction(() => true)')).not.toThrow()
++  })
++
++  it('声明的盲区(不承诺拦):谓词以标识符传入 / block 体里 .then', () => {
++    // 需类型推导才知道 myPred 是不是 async —— 文件头威胁模型已声明不承诺
++    expect(checkSource(P, 'await page.waitForFunction(myPred, arg)')).toHaveLength(0)
++    // block 体:返回值可能是 sync 的,.then 只是副作用调用 —— 不做启发式猜测
++    expect(checkSource(P, 'await page.waitForFunction(() => { poll().then(noop); return window.ok })')).toHaveLength(0)
++  })
++
++  it('按方法名匹配:任何 receiver 的 .waitForFunction 都在视野内(frame/locator 亦然)', () => {
++    expect(checkSource(P, 'await frame.waitForFunction(async () => 1)')).toHaveLength(1)
++  })
++
++  it('排除清单:每条都带理由,且前缀匹配生效', () => {
++    expect(EXCLUDES.length).toBeGreaterThan(0)
++    for (const e of EXCLUDES) {
++      expect(typeof e.prefix).toBe('string')
++      expect(e.prefix.length).toBeGreaterThan(0)
++      expect(e.why, e.prefix).toBeTruthy()
++    }
++    expect(isExcluded('node_modules/pkg/a.mjs')).toBe(true)
++    expect(isExcluded('scripts/ci/e2e-wait-guard.test.mjs')).toBe(true)
++    expect(isExcluded('scripts/e2e/scenarios/mask.mjs')).toBe(false)
++  })
++})
+diff --git a/scripts/e2e/renderer-evidence.mjs b/scripts/e2e/renderer-evidence.mjs
+index a8c85418..bcec9538 100644
+--- a/scripts/e2e/renderer-evidence.mjs
++++ b/scripts/e2e/renderer-evidence.mjs
+@@ -28,6 +28,8 @@
+ /** 画布就绪(demo 场景 3 张图已可见)。dom:等 demo 首图 <img>;leafer:等
+  *  data-leafer-children 追平 expected 且像素采样非空(与 e2e-smoke
+  *  bootstrapBaseCanvas 同口径)。场景内 reload / 切回 Canvas tab 后使用。 */
++import { waitForAsyncPredicate } from './wait-async-predicate.mjs'
++
+ export const waitForCanvasReady = async (page, rendererMode, { timeout = 30000 } = {}) => {
+   if (rendererMode === 'leafer') {
+     await page.waitForFunction(() => {
+@@ -49,7 +51,7 @@ export const waitForNodeRendered = async (page, rendererMode, nodeId, { timeout
+     await page.waitForSelector(`[data-node-id="${nodeId}"]`, { timeout })
+     return
+   }
+-  await page.waitForFunction(async (id) => {
++  await waitForAsyncPredicate(page, async (id) => {
+     if (document.querySelector(`[data-node-id="${CSS.escape(id)}"]`)) return true
+     const resource = performance.getEntriesByType('resource').map((entry) => entry.name).find((name) => name.includes('/src/store/canvasStore.ts'))
+     const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/canvasStore.ts'
+@@ -59,7 +61,7 @@ export const waitForNodeRendered = async (page, rendererMode, nodeId, { timeout
+     const expected = Number(shell?.getAttribute('data-leafer-expected-children') || 0)
+     const children = Number(shell?.getAttribute('data-leafer-children') || 0)
+     return expected > 0 && children === expected
+-  }, nodeId, { timeout })
++  }, nodeId, { label: '节点已渲染(DOM 命中 / leafer 子节点数达标)', timeout })
+ }
+ 
+ /** 节点屏幕矩形 {x,y,width,height}。dom:boundingBox;leafer:优先 DOM 壳
+diff --git a/scripts/e2e/scenarios/ai-slot-placeholder.mjs b/scripts/e2e/scenarios/ai-slot-placeholder.mjs
+index 79d38cff..d2dc57d9 100644
+--- a/scripts/e2e/scenarios/ai-slot-placeholder.mjs
++++ b/scripts/e2e/scenarios/ai-slot-placeholder.mjs
+@@ -1,4 +1,5 @@
+ import { doneTaskView, failedTaskView } from '../api-mocks.mjs'
++import { waitForAsyncPredicate } from '../wait-async-predicate.mjs'
+ 
+ // scripts/e2e/scenarios/ai-slot-placeholder.mjs
+ // AI Slot 占位符功能 e2e（docs/ai-slot-placeholder-fix-plan.md）。走「聊天首次生成 =
+@@ -182,12 +183,14 @@ export const runAiSlotPlaceholderScenario = async (context) => {
+   // ───────────────────────────────────────────────────────────────────────────
+   const setup = await createBlankCanvasWithImages(page, spec, [{ title: 'anchor-A', x: 0, y: 0, width: 300, height: 300 }])
+   const anchor = setup.images[0]
+-  await page.waitForFunction(
++  await waitForAsyncPredicate(
++    page,
+     async ({ moduleSpec, id }) => {
+       const { useCanvasStore } = await import(moduleSpec)
+       return useCanvasStore.getState().nodes.some((n) => n.id === id && n.type === 'image')
+     },
+     { moduleSpec: spec, id: anchor.id },
++    { label: '目标节点变成 image 类型' },
+   )
+ 
+   const gate = await installGatedTasksMock(page, generatedImageB64)
+diff --git a/scripts/e2e/scenarios/archive-assets.mjs b/scripts/e2e/scenarios/archive-assets.mjs
+index 9493451a..e8294aed 100644
+--- a/scripts/e2e/scenarios/archive-assets.mjs
++++ b/scripts/e2e/scenarios/archive-assets.mjs
+@@ -1,4 +1,5 @@
+ import { waitForCanvasReady } from '../renderer-evidence.mjs'
++import { waitForAsyncPredicate } from '../wait-async-predicate.mjs'
+ 
+ export const runArchiveAssetsScenario = async (context) => {
+   const {
+@@ -55,7 +56,8 @@ export const runArchiveAssetsScenario = async (context) => {
+   })
+   await newCanvasButton.click()
+   // 标题药丸已移除;新建画布的标题/计数校验改读 store(active canvas title + 空节点)。
+-  await page.waitForFunction(
++  await waitForAsyncPredicate(
++    page,
+     async (moduleSpec) => {
+       const { useCanvasStore } = await import(moduleSpec)
+       const state = useCanvasStore.getState()
+@@ -66,6 +68,7 @@ export const runArchiveAssetsScenario = async (context) => {
+       )
+     },
+     await canvasStoreSpec(),
++    { label: '画布重置为 Untitled Canvas 且节点清空' },
+   )
+   if ((await page.getByRole('button', { name: 'Untitled Canvas' }).count()) !== 1) {
+     throw new Error('Creating a canvas should add a dynamic standalone canvas row')
+@@ -151,7 +154,8 @@ export const runArchiveAssetsScenario = async (context) => {
+       },
+       { storeSpec: await canvasStoreSpec(), archiveText: JSON.stringify(archive) },
+     )
+-    await page.waitForFunction(
++    await waitForAsyncPredicate(
++      page,
+       async ({ moduleSpec, expectedDomCount }) => {
+         const { useCanvasStore } = await import(moduleSpec)
+         const state = useCanvasStore.getState()
+@@ -164,6 +168,7 @@ export const runArchiveAssetsScenario = async (context) => {
+       },
+       // leafer 模式 image 归 Leafer 真画:DOM 只剩 text 节点(1);dom 模式两个都在(2)。
+       { moduleSpec: await canvasStoreSpec(), expectedDomCount: leaferMode ? 1 : 2 },
++      { label: 'canvas-e2e-archive 画布节点数达标' },
+     )
+     if (leaferMode) {
+       const restored = await page.evaluate(async (moduleSpec) => {
+@@ -549,10 +554,10 @@ export const runArchiveAssetsScenario = async (context) => {
+   await page.locator('.asset-detail-panel').getByRole('button', { name: 'Add to canvas' }).click()
+   await page.waitForSelector('.canvas-shell')
+   if (leaferMode) {
+-    await page.waitForFunction(async (moduleSpec) => {
++    await waitForAsyncPredicate(page, async (moduleSpec) => {
+       const { useCanvasStore } = await import(moduleSpec)
+       return useCanvasStore.getState().nodes.some((node) => node.id.startsWith('imported-'))
+-    }, await canvasStoreSpec())
++    }, await canvasStoreSpec(), { label: 'imported- 前缀节点已入 store' })
+   } else {
+     await page.waitForFunction(
+       () =>
+diff --git a/scripts/e2e/scenarios/chat-copy.mjs b/scripts/e2e/scenarios/chat-copy.mjs
+index f4286fcd..fa75e6aa 100644
+--- a/scripts/e2e/scenarios/chat-copy.mjs
++++ b/scripts/e2e/scenarios/chat-copy.mjs
+@@ -5,6 +5,8 @@
+ //  SC4 用户提示词气泡下的拷贝按钮复制全文 + toast「已复制」
+ // harness 已授予 clipboard-read/write 权限(harness.mjs grantPermissions)。
+ 
++import { waitForAsyncPredicate } from '../wait-async-predicate.mjs'
++
+ const storeHelpers = async (context) => {
+   const spec = await context.canvasStoreSpec()
+   const readClipboardNodesCount = () =>
+@@ -265,25 +267,26 @@ export const runChatCopyScenario = async (context) => {
+   }, { moduleSpec: spec, nodeId: firstNodeId })
+   await page.evaluate(() => { if (document.activeElement instanceof HTMLElement) document.activeElement.blur() })
+   await page.keyboard.press('ControlOrMeta+c')
+-  await page.waitForFunction(async (moduleSpec) => {
++  await waitForAsyncPredicate(page, async (moduleSpec) => {
+     const { useCanvasStore } = await import(moduleSpec)
+     return useCanvasStore.getState().clipboardNodes.length === 1
+-  }, spec, { timeout: 5000 })
++  }, spec, { label: 'clipboardNodes 收到 1 项', timeout: 5000 })
+   const nodesBeforeCanvasPaste = (await readCanvasState()).nodes.length
+   await page.keyboard.press('ControlOrMeta+v')
+-  await page.waitForFunction(
++  await waitForAsyncPredicate(
++    page,
+     async ({ moduleSpec, before }) => {
+       const { useCanvasStore } = await import(moduleSpec)
+       return useCanvasStore.getState().nodes.length === before + 1
+     },
+     { moduleSpec: spec, before: nodesBeforeCanvasPaste },
+-    { timeout: 5000 },
++    { label: '粘贴后节点数 +1', timeout: 5000 },
+   )
+ 
+   // ── SC4: 拷贝按钮复制提示词全文 + toast「已复制」──
+   await page.evaluate(() => navigator.clipboard.writeText(''))
+   await page.locator('.chat-message-user .chat-copy-prompt-btn').first().click()
+-  await page.waitForFunction(async (expected) => (await navigator.clipboard.readText()) === expected, promptText, { timeout: 5000 })
++  await waitForAsyncPredicate(page, async (expected) => (await navigator.clipboard.readText()) === expected, promptText, { label: '系统剪贴板文本等于 prompt', timeout: 5000 })
+   const copyToastVisible = await page.locator('.toast-item.success .toast-message', { hasText: 'Copied' }).first().isVisible().catch(() => false)
+   if (!copyToastVisible) {
+     throw new Error('SC4: copy button should toast 已复制')
+diff --git a/scripts/e2e/scenarios/chat-generation.mjs b/scripts/e2e/scenarios/chat-generation.mjs
+index 283d3c3a..77028f0d 100644
+--- a/scripts/e2e/scenarios/chat-generation.mjs
++++ b/scripts/e2e/scenarios/chat-generation.mjs
+@@ -1,5 +1,6 @@
+ import { failedTaskView, doneTaskView } from '../api-mocks.mjs'
+ import { clickCanvasNode, nodeScreenRect } from '../renderer-evidence.mjs'
++import { waitForAsyncPredicate } from '../wait-async-predicate.mjs'
+ 
+ const readViewport = async (page) => {
+   const viewport = await page.evaluate(() => {
+@@ -271,7 +272,8 @@ export const runChatGenerationScenario = async (context) => {
+     'manual pan before chat result locate',
+   )
+   await page.locator('.chat-result-image-btn').last().click()
+-  await page.waitForFunction(
++  await waitForAsyncPredicate(
++    page,
+     async ({ nodeId, leaferMode, moduleSpec }) => {
+       if (document.querySelector(`[data-node-id="${nodeId}"]`)?.classList.contains('selected')) return true
+       if (!leaferMode) return false
+@@ -280,6 +282,7 @@ export const runChatGenerationScenario = async (context) => {
+       return state.selectedNodeId === nodeId || (state.selectedNodeIds || []).includes(nodeId)
+     },
+     { nodeId: besideResult.id, leaferMode, moduleSpec: await canvasStoreSpec() },
++    { label: '目标节点进入选中态' },
+   )
+   await waitForViewport(
+     page,
+@@ -364,12 +367,14 @@ export const runChatGenerationScenario = async (context) => {
+     const { useCanvasStore } = await import(moduleSpec)
+     useCanvasStore.getState().selectNode(undefined)
+   }, await canvasStoreSpec())
+-  await page.waitForFunction(
++  await waitForAsyncPredicate(
++    page,
+     async (moduleSpec) => {
+       const { useCanvasStore } = await import(moduleSpec)
+       return !useCanvasStore.getState().selectedNodeId
+     },
+     await canvasStoreSpec(),
++    { label: '选中态已清空' },
+   )
+   await page.waitForTimeout(100)
+   await page.evaluate(async () => {
+@@ -936,19 +941,21 @@ export const runChatGenerationScenario = async (context) => {
+ 
+   await page.getByRole('button', { name: '4 张变体结果' }).click()
+   // 标题药丸已移除;画布切换改用 store 的 active canvas title 校验(等价原 .top-title-lockup 读法)。
+-  await page.waitForFunction(async (moduleSpec) => {
++  await waitForAsyncPredicate(page, async (moduleSpec) => {
+     const { useCanvasStore } = await import(moduleSpec)
+     const state = useCanvasStore.getState()
+     return state.canvases[state.sceneId]?.title === '4 张变体结果'
+-  }, await canvasStoreSpec())
++  }, await canvasStoreSpec(), { label: '画布标题变为「4 张变体结果」' })
+   await page.getByRole('button', { name: '角色参考图流程' }).click()
+-  await page.waitForFunction(
++  await waitForAsyncPredicate(
++    page,
+     async ({ moduleSpec, count }) => {
+       const { useCanvasStore } = await import(moduleSpec)
+       const state = useCanvasStore.getState()
+       return state.sceneId === 'character-flow' && state.nodes.length === count
+     },
+     { moduleSpec: await canvasStoreSpec(), count: workflowCount },
++    { label: '切到 character-flow 且节点数达标' },
+   )
+ 
+   // 画布 Rename / Duplicate / Delete 原仅通过标题药丸的 "..." 菜单可达,药丸移除后这些
+@@ -995,12 +1002,14 @@ export const runChatGenerationScenario = async (context) => {
+     Object.defineProperty(event, 'clipboardData', { value: transfer })
+     window.dispatchEvent(event)
+   })
+-  await page.waitForFunction(
++  await waitForAsyncPredicate(
++    page,
+     async ({ moduleSpec, count }) => {
+       const { useCanvasStore } = await import(moduleSpec)
+       return useCanvasStore.getState().nodes.length === count + 1
+     },
+     { moduleSpec: await canvasStoreSpec(), count: countBeforeClipboardPaste },
++    { label: '节点数 +1' },
+   )
+ 
+   // 缩放条已随 UI 精简移除:⌘/Ctrl+0 归一缩放(本场景此前无 pan/zoom,视口本就在默认位)
+@@ -1033,12 +1042,14 @@ export const runChatGenerationScenario = async (context) => {
+     Object.defineProperty(event, 'clipboardData', { value: transfer })
+     window.dispatchEvent(event)
+   })
+-  await page.waitForFunction(
++  await waitForAsyncPredicate(
++    page,
+     async ({ moduleSpec, count }) => {
+       const { useCanvasStore } = await import(moduleSpec)
+       return useCanvasStore.getState().nodes.filter((node) => node.type === 'image').length === count + 1
+     },
+     { moduleSpec: await canvasStoreSpec(), count: countBeforeTransparentPaste },
++    { label: 'image 节点数 +1' },
+   )
+   if (!leaferMode) {
+   const transparentImageNode = page.locator('.dom-node[data-node-type="image"]').last()
+diff --git a/scripts/e2e/scenarios/mask-reflow.mjs b/scripts/e2e/scenarios/mask-reflow.mjs
+index d83daafa..2f74111f 100644
+--- a/scripts/e2e/scenarios/mask-reflow.mjs
++++ b/scripts/e2e/scenarios/mask-reflow.mjs
+@@ -17,6 +17,7 @@
+ import { doneTaskView, failedTaskView } from '../api-mocks.mjs'
+ import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
+ import { clearRegionEditDraftFor } from '../region-edit-draft.mjs'
++import { waitForAsyncPredicate } from '../wait-async-predicate.mjs'
+ 
+ // contentEditable 富文本编辑器输入(对齐 mask.mjs fillMaskPrompt):click 聚焦 +
+ // execCommand insertText 触发 input 事件,让 overlay 的 hasText/占位符逻辑生效。
+@@ -184,12 +185,14 @@ export const runMaskReflowScenario = async (context) => {
+     { title: 'reflow-B', x: 500, y: 0, width: 300, height: 300 },
+     { title: 'reflow-C', x: 900, y: 0, width: 300, height: 300 },
+   ])
+-  await page.waitForFunction(
++  await waitForAsyncPredicate(
++    page,
+     async ({ moduleSpec, id }) => {
+       const { useCanvasStore } = await import(moduleSpec)
+       return useCanvasStore.getState().nodes.some((n) => n.id === id && n.type === 'image')
+     },
+     { moduleSpec: spec, id: imgC.id },
++    { label: '目标节点变成 image 类型' },
+   )
+ 
+   await clickCanvasNode(page, rendererMode, imgA.id)
+@@ -280,12 +283,14 @@ export const runMaskReflowScenario = async (context) => {
+     { title: 'beside-A', x: 0, y: 0, width: 300, height: 300 },
+     { title: 'beside-B', x: 400, y: 0, width: 300, height: 300 },
+   ])
+-  await page.waitForFunction(
++  await waitForAsyncPredicate(
++    page,
+     async ({ moduleSpec, id }) => {
+       const { useCanvasStore } = await import(moduleSpec)
+       return useCanvasStore.getState().nodes.some((n) => n.id === id && n.type === 'image')
+     },
+     { moduleSpec: spec, id: besideB.id },
++    { label: '目标节点变成 image 类型' },
+   )
+   const besideImagesBefore = (await readNodeGeometry(page, spec)).filter((n) => n.type === 'image').length
+   // Drive the real beside-generation action (chat's non-slot path) directly — a
+@@ -319,12 +324,14 @@ export const runMaskReflowScenario = async (context) => {
+     { title: 'fail-A', x: 0, y: 0, width: 300, height: 300 },
+     { title: 'fail-B', x: 500, y: 0, width: 300, height: 300 },
+   ])
+-  await page.waitForFunction(
++  await waitForAsyncPredicate(
++    page,
+     async ({ moduleSpec, id }) => {
+       const { useCanvasStore } = await import(moduleSpec)
+       return useCanvasStore.getState().nodes.some((n) => n.id === id && n.type === 'image')
+     },
+     { moduleSpec: spec, id: failB.id },
++    { label: '目标节点变成 image 类型' },
+   )
+   await clickCanvasNode(page, rendererMode, failA.id)
+   await openMaskPointRegion(page, failA.id)
+diff --git a/scripts/e2e/scenarios/stamp-overlap.mjs b/scripts/e2e/scenarios/stamp-overlap.mjs
+index 7da465dc..68692346 100644
+--- a/scripts/e2e/scenarios/stamp-overlap.mjs
++++ b/scripts/e2e/scenarios/stamp-overlap.mjs
+@@ -21,6 +21,8 @@
+  * (它只覆盖 inline 文本,看不到 brushStamp 私有 entries —— 见 D6)。
+  */
+ 
++import { waitForAsyncPredicate } from '../wait-async-predicate.mjs'
++
+ const readViewport = async (page) =>
+   page.evaluate(() => {
+     const shell = document.querySelector('.canvas-shell')
+@@ -214,7 +216,8 @@ export const runStampOverlapScenario = async (context) => {
+   await page.mouse.click(center.x, center.y)
+   try {
+     const spec = await canvasStoreSpec(page)
+-    await page.waitForFunction(
++    await waitForAsyncPredicate(
++      page,
+       async ([moduleSpec, expected]) => {
+         const { useCanvasStore } = await import(moduleSpec)
+         return (
+@@ -223,10 +226,16 @@ export const runStampOverlapScenario = async (context) => {
+         )
+       },
+       [spec, before + 1],
+-      { timeout: 5000 },
++      { label: 'stamp 节点数达到期望值', timeout: 5000 },
++    )
++  } catch (err) {
++    // 原因必须原样带出:改成真等之前这个 catch 是死代码(等待恒立即为真、永不抛),现在它是
++    // 最可能失败的那条路径 —— 裸 catch 会把等待带的 label 与末次读数整条丢掉,只留一句
++    // 猜测("点击可能未命中"),等于新增的诊断在最需要它的地方看不见。
++    throw new Error(
++      `stamp-overlap: 放置 stamp 后计数未增(before=${before}) —— 点击可能未命中画布;原始等待失败:${err instanceof Error ? err.message : String(err)}`,
++      { cause: err },
+     )
+-  } catch {
+-    throw new Error(`stamp-overlap: 放置 stamp 后计数未增(before=${before}) —— 点击可能未命中画布`)
+   }
+ 
+   if (rendererMode !== 'leafer') {
+@@ -271,7 +280,8 @@ export const runStampOverlapScenario = async (context) => {
+     await page.mouse.down()
+     await page.mouse.move(startX + 60, startY + 25, { steps: 6 })
+     await page.mouse.up()
+-    await page.waitForFunction(
++    await waitForAsyncPredicate(
++      page,
+       async ([moduleSpec, id, beforeWidth]) => {
+         const { useCanvasStore } = await import(moduleSpec)
+         const node = useCanvasStore.getState().nodes.find((n) => n.id === id)
+@@ -284,7 +294,7 @@ export const runStampOverlapScenario = async (context) => {
+         )
+       },
+       [spec, selectedId, beforeResize.width],
+-      { timeout: 5000 },
++      { label: '目标 stamp 节点宽度已变化', timeout: 5000 },
+     )
+     const afterResize = await readStampNode(page, selectedId)
+     if (!afterResize || Math.abs(afterResize.width - afterResize.height) > 0.001) {
+diff --git a/scripts/e2e/wait-async-predicate.contract.test.ts b/scripts/e2e/wait-async-predicate.contract.test.ts
+new file mode 100644
+index 00000000..f2645ec0
+--- /dev/null
++++ b/scripts/e2e/wait-async-predicate.contract.test.ts
+@@ -0,0 +1,129 @@
++// scripts/e2e/wait-async-predicate.contract.test.ts
++// waitForAsyncPredicate 的诚实性契约测试(单席审查 F1 返修补上)。
++//
++// 为什么需要:本原语是 19 处等待的共同壳,其中 renderer-evidence 的 waitForNodeRendered
++// 被十几个场景共用。初版把「超时」只实现成两次求值之间的检查,而 page.evaluate 自己没有
++// 超时 —— 单次求值挂住(谓词里的 await 永不 settle、页面主线程冻结)就永远不返回,等待从
++// 「带 label 的报错」退化成「挂到 job 级 timeout 被无诊断 kill」。那正是本原语要消灭的
++// 静默形态,却在原语自己身上复现了一遍;没有契约测试是它能一路走到评审的直接原因。
++//
++// 锁住四条(不启真浏览器:假 page 即可 —— 本原语与浏览器的唯一接触面就是 page.evaluate):
++//   ① 谓词为真 → 返回**序列化后的值**(evaluate 语义,不是 JSHandle);
++//   ② 谓词恒假 → 在期限内抛错,消息带 label 与末次读数;
++//   ③ 谓词抛错 → 原样冒出去,不被当成"还没到"而继续轮询;
++//   ④ **单次 page.evaluate 永不 settle → 仍必须在期限内抛错**(硬期限;这条是 F1 本体)。
++import { describe, expect, it } from 'vitest'
++import { waitForAsyncPredicate } from './wait-async-predicate.mjs'
++
++type FakePage = { evaluate: (...args: unknown[]) => unknown; calls: number }
++
++/** 按调用次数给出返回值的假 page;values 用尽后重复最后一个。 */
++const pageReturning = (...values: unknown[]): FakePage => {
++  const page = {
++    calls: 0,
++    evaluate: async () => {
++      const v = values[Math.min(page.calls, values.length - 1)]
++      page.calls += 1
++      if (v instanceof Error) throw v
++      return v
++    },
++  }
++  return page as FakePage
++}
++
++describe('waitForAsyncPredicate 契约', () => {
++  it('① 谓词为真 → 返回该值本身(序列化语义)', async () => {
++    const page = pageReturning(false, false, { ok: 1 })
++    const got = await waitForAsyncPredicate(page as never, () => null, undefined, {
++      timeout: 2000,
++      interval: 1,
++      label: '测试:第三次才为真',
++    })
++    expect(got).toEqual({ ok: 1 })
++    expect(page.calls).toBe(3)
++  })
++
++  it('② 谓词恒假 → 期限内抛错,消息带 label 与末次读数', async () => {
++    const page = pageReturning(0)
++    const started = Date.now()
++    await expect(
++      waitForAsyncPredicate(page as never, () => null, undefined, {
++        timeout: 150,
++        interval: 10,
++        label: '测试:恒假',
++      }),
++    ).rejects.toThrow(/测试:恒假/)
++    expect(Date.now() - started).toBeLessThan(1500)
++    // 末次读数必须如实带出,否则超时信息退化成"不知道当时是什么"
++    const err = await waitForAsyncPredicate(page as never, () => null, undefined, {
++      timeout: 60,
++      interval: 10,
++      label: 'x',
++    }).catch((e: Error) => e)
++    expect((err as Error).message).toContain('谓词末次返回 0')
++  })
++
++  it('③ 谓词抛错 → 原样冒出,不被当成"还没到"继续轮询', async () => {
++    const boom = new Error('页面炸了:模块 import 失败')
++    const page = pageReturning(boom)
++    await expect(
++      waitForAsyncPredicate(page as never, () => null, undefined, { timeout: 5000, interval: 10, label: 'y' }),
++    ).rejects.toThrow('页面炸了:模块 import 失败')
++    // 只求值一次就冒出去,没有把真故障当"未就绪"反复重试到超时
++    expect(page.calls).toBe(1)
++  })
++
++  it('④ 单次 page.evaluate 永不 settle → 仍在期限内抛错(硬期限,F1 本体)', async () => {
++    // 反向变异检验点:把实现里 evaluate 与剩余期限的 race 去掉,本例必挂住 → 变红。
++    const page = { calls: 0, evaluate: () => new Promise(() => {}) } as unknown as FakePage
++    const started = Date.now()
++    const err = await waitForAsyncPredicate(page as never, () => null, undefined, {
++      timeout: 120,
++      interval: 10,
++      label: '测试:evaluate 挂住',
++    }).catch((e: Error) => e)
++    const elapsed = Date.now() - started
++    expect(err).toBeInstanceOf(Error)
++    expect((err as Error).message).toContain('单次 page.evaluate 未在期限内返回')
++    expect((err as Error).message).toContain('测试:evaluate 挂住')
++    expect(elapsed).toBeLessThan(1500)
++  })
++
++  it('⑤ 谓词抛错后不得残留定时器(否则进程要挂满 timeout 才退出)', async () => {
++    // 第 2 轮审查 F4:clearTimeout 原本写在 await 之后,谓词 reject 时被跳过 —— 实测错误 1ms
++    // 抛出、进程 30s 后才退。scenario 是 e2e-runner spawn 的子进程且 runner 无 per-scenario
++    // timeout,于是失败场景会在打印完错误后再挂满 timeout,多个叠加把 job 推向 job 级 timeout。
++    const before = process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length
++    const page = { calls: 0, evaluate: async () => { throw new Error('页面炸了') } } as unknown as FakePage
++    await expect(
++      waitForAsyncPredicate(page as never, () => null, undefined, { timeout: 30000, label: '测试:谓词抛错' }),
++    ).rejects.toThrow('页面炸了')
++    const after = process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length
++    expect(after, '谓词抛错路径必须已 clearTimeout(反向变异:把 finally 去掉本条必红)').toBeLessThanOrEqual(before)
++  })
++
++  it('⑥ timeout 非正数 → 立刻报错,不沿用 Playwright「0=禁用超时」语义', async () => {
++    for (const bad of [0, -1, Number.NaN]) {
++      await expect(
++        waitForAsyncPredicate(pageReturning(true) as never, () => null, undefined, { timeout: bad, label: 'x' }),
++      ).rejects.toThrow(/timeout 必须为正数/)
++    }
++  })
++
++  it('④b 被放弃的求值稍后 reject 不得变成 unhandledRejection', async () => {
++    let rejectLater: ((e: Error) => void) | undefined
++    const page = {
++      calls: 0,
++      evaluate: () =>
++        new Promise((_resolve, reject) => {
++          rejectLater = reject
++        }),
++    } as unknown as FakePage
++    await expect(
++      waitForAsyncPredicate(page as never, () => null, undefined, { timeout: 60, interval: 10, label: 'z' }),
++    ).rejects.toThrow('单次 page.evaluate 未在期限内返回')
++    // 放弃之后那次求值才 reject —— 实现必须已经挂上吞错回调
++    rejectLater?.(new Error('迟到的失败'))
++    await new Promise((resolve) => setTimeout(resolve, 20))
++  })
++})
+diff --git a/scripts/e2e/wait-async-predicate.mjs b/scripts/e2e/wait-async-predicate.mjs
+new file mode 100644
+index 00000000..d1b312ff
+--- /dev/null
++++ b/scripts/e2e/wait-async-predicate.mjs
+@@ -0,0 +1,120 @@
++// wait-async-predicate — 谓词需要 await 的等待原语。
++//
++// 为什么不能用 page.waitForFunction:它**不 await** 谓词的返回值,只判真假。async
++// 谓词返回的是 Promise 对象,而 Promise 恒 truthy —— 于是第一次轮询就判真,这个
++// "等待"根本没在等。实测(chromium,timeout 1500ms):
++//   () => false                  → TimeoutError after 1505ms   ← 正常
++//   async () => false            → RESOLVED after 1ms          ← 静默失效
++//   () => Promise.resolve(false) → RESOLVED after 2ms          ← 静默失效
++// 后果不是"等待变短"这么轻:断言会跑在状态未就绪的时刻,失败点漂到下游、报出与真实
++// 原因无关的错(#469 实测:残留 markup 节点 intercepts pointer events,却在 30s 后
++// 报成"点不到图片")。这类失效由 scripts/ci/e2e-wait-guard.mjs 机器拦截。
++//
++// 本原语改用 page.evaluate 轮询 —— evaluate **会** await 谓词返回的 Promise,所以
++// 谓词函数体一个字都不用改,只换调用壳。
++//
++// **超时是硬期限**:除了两次求值之间检查期限,单次 page.evaluate 本身也与剩余期限
++// race。这一条是返修补上的(2026-08-04 单席审查 F1):初版只在两次求值之间检查,而
++// page.evaluate 自己没有超时,于是「谓词里的 await 永不 settle」(dev 拓扑下 Vite 转换
++// 卡住 → `await import(moduleSpec)` 挂住;`await navigator.clipboard.readText()` 挂住;
++// 页面主线程被长任务冻结)会让整个等待挂死 —— 从「30s 带 label 的报错」退化成「CI 撞
++// job 级 timeout 被无诊断 kill」,恰恰是本原语要消灭的静默形态。
++//
++// 与 waitForFunction 的语义差异(调用方需知情;这份清单必须与实现同步,不许自称完整
++// 却漏项 —— 初版漏了第 4、5 条):
++//   1. 返回**序列化后的值**(evaluate 语义),不是 JSHandle;
++//   2. 超时抛的是带 label 与末次读数的普通 Error,不是 Playwright TimeoutError;
++//   3. 轮询由本进程驱动(默认 100ms),不是页面内 rAF —— 适合等 store/DOM 的稳定态,
++//      不适合逐帧采样;
++//   4. **导航会让它直接失败**:执行上下文被 page.goto/reload 销毁时 page.evaluate 直接
++//      reject("Execution context was destroyed"),而 waitForFunction 会在新上下文重试。
++//      所以不要把本原语紧跟在导航之后 —— 要等导航后的状态,先 waitForLoadState/
++//      waitForSelector 让上下文稳定,再用它;
++//   5. 超时放弃的那次 evaluate **仍可能在后台完成**:我们不再等它,但它稍后若失败会以
++//      `console.warn` 打出来(不吞 —— 那条迟到的错误可能正是最有指向性的一句),它对页面的
++//      副作用也不会被撤销,所以谓词应保持只读,不要在谓词里改 store;
++//   6. **timeout 必须为正数**:Playwright 的 `timeout: 0` 表示"禁用超时",本原语直接报错 ——
++//      无期限的等待正是它要消灭的东西。
++//
++// 谓词在页面上下文执行,与 evaluate 同规则:只能收可序列化参数(arg),不能闭包捕获
++// Node 侧变量。
++//
++// 契约由 wait-async-predicate.contract.test.ts 钉住(假 page,不启浏览器)。
++
++/** 单次求值超期的哨兵(不可能与谓词的真实返回值相等)。 */
++const EXPIRED = Symbol('wait-async-predicate:expired')
++
++export const waitForAsyncPredicate = async (
++  page,
++  predicate,
++  arg,
++  { timeout = 30000, interval = 100, label } = {},
++) => {
++  const what = label ?? '(未命名条件)'
++  // timeout<=0 直接报错,不沿用 Playwright「0 = 禁用超时」的语义:本原语存在的理由就是
++  // 「等待失败必须在硬期限内发生」,一个无期限的等待正是它要消灭的东西(第 2 轮审查带出的
++  // 语义差异,当前无调用方传 0)。也不静默当成「一次都不求值」——那是最难查的行为。
++  if (!(timeout > 0)) {
++    throw new Error(`waitForAsyncPredicate: timeout 必须为正数(收到 ${timeout});本原语不支持无期限等待`)
++  }
++  const deadline = Date.now() + timeout
++  let last
++  let everEvaluated = false
++
++  for (;;) {
++    const remaining = deadline - Date.now()
++    if (remaining <= 0) {
++      throw new Error(
++        everEvaluated
++          ? `waitForAsyncPredicate 超时(${timeout}ms):${what} —— 谓词末次返回 ${JSON.stringify(last)}`
++          : `waitForAsyncPredicate 超时(${timeout}ms):${what} —— 谓词一次都没求值完`,
++      )
++    }
++
++    // 谓词自身抛错不吞:让它原样冒出去(页面报错/模块 import 失败属真故障,不是"还没到")。
++    const pending = page.evaluate(predicate, arg)
++    let timer
++    let value
++    try {
++      value = await Promise.race([
++        pending,
++        new Promise((resolve) => {
++          timer = setTimeout(() => resolve(EXPIRED), remaining)
++        }),
++      ])
++    } finally {
++      // 必须放 finally:谓词 reject 时 await 直接抛,写在 await 之后的 clearTimeout 会被跳过,
++      // 那个定时器就一直挂着 —— 实测「谓词立即抛错 + timeout 30000」时错误 1ms 就抛出,但
++      // 进程要等满 30s 才退出。scenario 是 e2e-runner spawn 的子进程且 runner 没有 per-scenario
++      // timeout,于是每个走这条路径失败的场景都会在打印完错误后再挂满 timeout 才退,多个叠加
++      // 会把 job 推向 job 级 timeout —— 又是「撞 job timeout 被无诊断 kill」换了个形状。
++      // (第 2 轮审查 F4;谓词抛错正是最常见的失败路径,不是边角。)
++      clearTimeout(timer)
++    }
++
++    if (value === EXPIRED) {
++      // 放弃这次求值:它可能永远不 settle,也可能稍后才 reject。不能让它变成
++      // unhandledRejection 把整个 runner 带下去,但也不能把它**完全**丢掉 —— 迟到的那条
++      // 错误可能正是最有指向性的一句(例如导航场景的 "Execution context was destroyed",
++      // 见上方语义差异第 4 条)。所以降级成 warn 打出来,不吞。
++      void Promise.resolve(pending).catch((err) => {
++        console.warn(
++          `[waitForAsyncPredicate] 已放弃的求值稍后失败了(${what}):${err instanceof Error ? err.message : String(err)}`,
++        )
++      })
++      throw new Error(
++        `waitForAsyncPredicate 超时(${timeout}ms):${what} —— 单次 page.evaluate 未在期限内返回` +
++          `(页面卡死、或谓词里的 await 永不 settle;末次已知返回 ${JSON.stringify(last)})`,
++      )
++    }
++
++    everEvaluated = true
++    if (value) return value
++    last = value
++
++    const left = deadline - Date.now()
++    // 期限已到 → 回到循环开头统一抛超时,不在这里复写一份文案。
++    if (left <= 0) continue
++    await new Promise((resolve) => setTimeout(resolve, Math.min(interval, left)))
++  }
++}

@@ -1,0 +1,660 @@
+diff --git a/src/__tests__/depositMigration.test.ts b/src/__tests__/depositMigration.test.ts
+index 8014e6a5..24f4b266 100644
+--- a/src/__tests__/depositMigration.test.ts
++++ b/src/__tests__/depositMigration.test.ts
+@@ -14,16 +14,7 @@ import {
+   setDepositMigrationClockForTests,
+   type LedgerSnapshot,
+ } from '../agent/depositMigration'
+-import {
+-  // 桥接(S1→S4 临时):占位常量填满新必填 gen/writer;S4 把 recordDeposit 签名换成
+-  // DepositEntryDraft 后这两个字段变多余属性,随之移除。零新逻辑。
+-  DEPOSIT_PENDING_GEN,
+-  DEPOSIT_PENDING_WRITER,
+-  loadDepositStore,
+-  lookupDeposit,
+-  peekDepositStoreForTests,
+-  recordDeposit,
+-} from '../agent/depositStore'
++import { loadDepositStore, lookupDeposit, peekDepositStoreForTests, recordDeposit } from '../agent/depositStore'
+ import { debugLogger } from '../../../src/store/debugLogStore'
+ import { createDepositHarness, teardownDepositHarness, FAKE_HASH, type DepositHarness } from './depositTestHarness'
+ 
+@@ -109,14 +100,7 @@ describe('迁移 — 幂等与重复执行', () => {
+   })
+ 
+   it('已有 deposit 来源的键不被 ledger 覆盖(deposit 更权威)', async () => {
+-    await recordDeposit('mivo-asset:0', {
+-      hash: FAKE_HASH,
+-      ext: '.webp',
+-      depositedAt: 99,
+-      from: 'deposit',
+-      gen: DEPOSIT_PENDING_GEN,
+-      writer: DEPOSIT_PENDING_WRITER,
+-    })
++    await recordDeposit('mivo-asset:0', { hash: FAKE_HASH, ext: '.webp', depositedAt: 99, from: 'deposit' })
+     useLedger(ledgerOf(1))
+ 
+     const outcome = await migrateLedgerIntoDepositStore()
+diff --git a/src/__tests__/depositPort.test.ts b/src/__tests__/depositPort.test.ts
+index f3c49bad..86bf08c0 100644
+--- a/src/__tests__/depositPort.test.ts
++++ b/src/__tests__/depositPort.test.ts
+@@ -21,15 +21,7 @@ import {
+   setDepositClockForTests,
+   setDepositSleepForTests,
+ } from '../agent/depositPort'
+-import {
+-  // 桥接(S1→S4 临时):占位常量填满新必填 gen/writer;S4 把 recordDeposit 签名换成
+-  // DepositEntryDraft 后这两个字段变多余属性,随之移除。零新逻辑。
+-  DEPOSIT_PENDING_GEN,
+-  DEPOSIT_PENDING_WRITER,
+-  lookupDeposit,
+-  peekDepositStoreForTests,
+-  recordDeposit,
+-} from '../agent/depositStore'
++import { lookupDeposit, peekDepositStoreForTests, recordDeposit } from '../agent/depositStore'
+ import type { PersistReply } from '../persist/bridge'
+ import { blobOfBytes, createDepositHarness, teardownDepositHarness, FAKE_HASH, type DepositHarness } from './depositTestHarness'
+ 
+@@ -76,14 +68,7 @@ describe('depositPort — lazy 寄存与缓存', () => {
+   })
+ 
+   it('命中缓存 → 零寄存请求(lazy 的价值)', async () => {
+-    await recordDeposit('mivo-asset:1', {
+-      hash: FAKE_HASH,
+-      ext: '.png',
+-      depositedAt: 1,
+-      from: 'deposit',
+-      gen: DEPOSIT_PENDING_GEN,
+-      writer: DEPOSIT_PENDING_WRITER,
+-    })
++    await recordDeposit('mivo-asset:1', { hash: FAKE_HASH, ext: '.png', depositedAt: 1, from: 'deposit' })
+ 
+     const entry = await resolveDepositEntry({ assetUrl: 'mivo-asset:1', blob: blobOfBytes(64) })
+ 
+@@ -92,14 +77,7 @@ describe('depositPort — lazy 寄存与缓存', () => {
+   })
+ 
+   it('迁移进来的条目(from=ledger)同样命中,不重复寄存', async () => {
+-    await recordDeposit('mivo-asset:legacy', {
+-      hash: FAKE_HASH,
+-      ext: '.png',
+-      depositedAt: 0,
+-      from: 'ledger',
+-      gen: DEPOSIT_PENDING_GEN,
+-      writer: DEPOSIT_PENDING_WRITER,
+-    })
++    await recordDeposit('mivo-asset:legacy', { hash: FAKE_HASH, ext: '.png', depositedAt: 0, from: 'ledger' })
+ 
+     await expect(resolveDepositEntry({ assetUrl: 'mivo-asset:legacy', blob: blobOfBytes(64) })).resolves.toMatchObject({
+       from: 'ledger',
+diff --git a/src/__tests__/depositStore.test.ts b/src/__tests__/depositStore.test.ts
+index 1d82ed08..f061a17c 100644
+--- a/src/__tests__/depositStore.test.ts
++++ b/src/__tests__/depositStore.test.ts
+@@ -16,14 +16,13 @@ import {
+   loadDepositStore,
+   lookupDeposit,
+   mergeDepositStates,
+-  // 桥接(S3→S4 临时):mutateDepositStore 在本段被提交机取代,过渡期由 legacy 包装承接;
+-  // S4 五入口落地后本文件迁到终态 recordMigration,此别名随之移除。
+-  mutateAndCommitLegacyBridge as mutateDepositStore,
+   parseDepositState,
+   peekDepositStoreForTests,
+   recordDeposit,
++  recordMigration,
+   invalidateDeposit,
+   setDepositTransport,
++  type DepositEntryDraft,
+   type DepositState,
+ } from '../agent/depositStore'
+ import type { PersistReply } from '../persist/bridge'
+@@ -40,6 +39,13 @@ const entry = (hash: string, depositedAt: number, from: 'deposit' | 'ledger' = '
+   writer: DEPOSIT_PENDING_WRITER,
+ })
+ 
++const draft = (hash: string, depositedAt: number, from: 'deposit' | 'artifact' | 'ledger' = 'deposit'): DepositEntryDraft => ({
++  hash,
++  ext: '.png',
++  depositedAt,
++  from,
++})
++
+ const state = (partial: Partial<DepositState> = {}): DepositState => ({
+   version: 1,
+   generation: 0,
+@@ -247,15 +253,14 @@ describe('depositStore — 端到端提交(真实 main.js 槽 + 指针)', () =>
+     await loadDepositStore()
+ 
+     await Promise.all([
+-      mutateDepositStore((draft) => {
+-        draft.migration = { version: 1, at: 5, migrated: 2 }
+-      }),
+-      recordDeposit('mivo-asset:x', entry('xxxx', 7, 'deposit')),
++      recordMigration([['mivo-asset:legacy', draft('legacyhash', 0, 'ledger')]], { version: 1, at: 5, migrated: 1 }),
++      recordDeposit('mivo-asset:x', draft('xxxx', 7, 'deposit')),
+     ])
+ 
+     const current = peekDepositStoreForTests()
+     expect(current?.migration?.version).toBe(1)
+     expect(current?.map['mivo-asset:x']).toBeTruthy()
++    expect(current?.map['mivo-asset:legacy']).toMatchObject({ from: 'ledger' })
+   })
+ 
+   it('自愈:invalidate 删掉失效映射,下次查不到', async () => {
+@@ -266,11 +271,14 @@ describe('depositStore — 端到端提交(真实 main.js 槽 + 指针)', () =>
+ 
+   it('LRU:超上限按 depositedAt 从旧到新淘汰', async () => {
+     await loadDepositStore()
+-    await mutateDepositStore((draft) => {
+-      for (let index = 0; index < DEPOSIT_MAP_MAX_ENTRIES + 5; index += 1) {
+-        draft.map[`mivo-asset:${index}`] = entry(`h${index}`, index, 'deposit')
+-      }
+-    })
++    // 一次性灌入(复用 recordMigration 的批量提交路径,单次提交而非 5005 次往返)——
++    // trimMap 在同一次 mutateAndCommit 内的 mutator 执行完毕后立刻生效,不需要真的
++    // 走满 5005 次网络往返才能验证淘汰逻辑。
++    const bulk: Array<[string, DepositEntryDraft]> = Array.from({ length: DEPOSIT_MAP_MAX_ENTRIES + 5 }, (_, index) => [
++      `mivo-asset:${index}`,
++      draft(`h${index}`, index, 'deposit'),
++    ])
++    await recordMigration(bulk, { version: 1, at: 0, migrated: bulk.length })
+ 
+     const map = peekDepositStoreForTests()?.map ?? {}
+     expect(Object.keys(map)).toHaveLength(DEPOSIT_MAP_MAX_ENTRIES)
+diff --git a/src/agent/depositMigration.ts b/src/agent/depositMigration.ts
+index 4f321660..a5c39d75 100644
+--- a/src/agent/depositMigration.ts
++++ b/src/agent/depositMigration.ts
+@@ -15,14 +15,7 @@
+  */
+ import { readOwnProp } from '../../../src/lib/safeArgs'
+ import { debugLogger } from '../../../src/store/debugLogStore'
+-import {
+-  // 桥接(S1→S4 临时):占位盖戳,S4 迁移后随 staged 改用 DepositEntryDraft 一起移除。
+-  DEPOSIT_PENDING_GEN,
+-  DEPOSIT_PENDING_WRITER,
+-  loadDepositStore,
+-  mutateAndCommitLegacyBridge,
+-  type DepositEntry,
+-} from './depositStore'
++import { loadDepositStore, recordMigration, type DepositEntryDraft } from './depositStore'
+ 
+ const SOURCE = 'Cindy Deposit'
+ 
+@@ -117,7 +110,7 @@ export const migrateLedgerIntoDepositStore = async (): Promise<MigrationOutcome>
+   const keys = ledger ? Object.keys(ledger) : []
+   let migrated = 0
+   let skipped = 0
+-  const staged: Array<[string, DepositEntry]> = []
++  const staged: Array<[string, DepositEntryDraft]> = []
+   for (const assetUrl of keys) {
+     const raw = readOwnProp(ledger, assetUrl)
+     const hash = readOwnProp(raw, 'hash')
+@@ -128,16 +121,12 @@ export const migrateLedgerIntoDepositStore = async (): Promise<MigrationOutcome>
+     }
+     // 已有 deposit 记录的键不覆盖(deposit 来源比 ledger 更权威)。
+     if (store.map[assetUrl]) continue
+-    // 桥接(S1→S4 临时):gen/writer 占位值满足新必填形状。
+-    staged.push([assetUrl, { hash, ext, depositedAt: 0, from: 'ledger', gen: DEPOSIT_PENDING_GEN, writer: DEPOSIT_PENDING_WRITER }])
++    staged.push([assetUrl, { hash, ext, depositedAt: 0, from: 'ledger' }])
+     migrated += 1
+   }
+   if (skipped) debugLogger.warn(SOURCE, `deposit 迁移跳过 ${skipped} 条非法存量条目(缺 hash/ext 或类型错),不阻断整体迁移`)
+ 
+-  const result = await mutateAndCommitLegacyBridge((draft) => {
+-    for (const [assetUrl, entry] of staged) draft.map[assetUrl] = entry
+-    draft.migration = { version: DEPOSIT_MIGRATION_VERSION, at: now(), migrated }
+-  })
++  const result = await recordMigration(staged, { version: DEPOSIT_MIGRATION_VERSION, at: now(), migrated })
+   if (result.ok) {
+     debugLogger.log(SOURCE, `deposit 迁移完成:搬入 ${migrated} 条,跳过 ${skipped} 条,gen=${result.generation}`)
+   } else {
+diff --git a/src/agent/depositPort.ts b/src/agent/depositPort.ts
+index 37e360a7..acd4bf0c 100644
+--- a/src/agent/depositPort.ts
++++ b/src/agent/depositPort.ts
+@@ -13,15 +13,11 @@
+ import { debugLogger } from '../../../src/store/debugLogStore'
+ import { persistRequest, type PersistReply } from '../persist/bridge'
+ import {
+-  // 桥接(S1→S4 临时):DEPOSIT_PENDING_GEN/DEPOSIT_PENDING_WRITER 用于占位盖戳,S4 迁移后随
+-  // entry 改用 DepositEntryDraft 一起移除。
+-  DEPOSIT_PENDING_GEN,
+-  DEPOSIT_PENDING_WRITER,
+   loadDepositStore,
+   lookupDeposit,
+-  mutateAndCommitLegacyBridge,
++  recordCapabilityMark,
+   recordDeposit,
+-  type DepositEntry,
++  type DepositEntryDraft,
+ } from './depositStore'
+ 
+ const SOURCE = 'Cindy Deposit'
+@@ -163,9 +159,7 @@ const noteCapability = async (supported: boolean, reason?: string): Promise<void
+   const state = await loadDepositStore()
+   const mark = state.capability
+   if (mark && mark.supported === supported) return // 无变化不写盘
+-  await mutateAndCommitLegacyBridge((draft) => {
+-    draft.capability = { supported, at: now(), reason }
+-  })
++  await recordCapabilityMark({ supported, at: now(), reason })
+   if (supported) debugLogger.log(SOURCE, 'deposit 能力探测:宿主支持,清除负缓存')
+   else debugLogger.warn(SOURCE, `deposit 能力探测:宿主不支持,写入负缓存(${DEPOSIT_CAPABILITY_TTL_MS / 3_600_000}h TTL)`)
+ }
+@@ -235,7 +229,7 @@ export const depositBlob = async (blob: Blob, label: string = DEPOSIT_LABEL): Pr
+ 
+ // single-flight:同一 assetUrl 的并发寄存合并为一次请求。变体批量(同源串行 N 次
+ // 改图)因此只寄存 1 次,天然不撞「≥1s/张」频控(设计稿 §4.5)。
+-const inflight = new Map<string, Promise<DepositEntry>>()
++const inflight = new Map<string, Promise<DepositEntryDraft>>()
+ 
+ /**
+  * 兑换改图源指纹:缓存命中直接用,未命中就寄存。
+@@ -245,12 +239,12 @@ export const resolveDepositEntry = async (input: {
+   assetUrl?: string
+   blob?: Blob
+   label?: string
+-}): Promise<DepositEntry> => {
++}): Promise<DepositEntryDraft> => {
+   const assetUrl = input.assetUrl
+   if (!assetUrl) throw new DepositError('DEPOSIT_FAILED', '缺少源图身份(assetUrl),无法寄存。')
+   const cached = await lookupDeposit(assetUrl)
+   if (cached) {
+-    debugLogger.log(SOURCE, `deposit 命中缓存:hash=${cached.hash.slice(0, 8)} from=${cached.from ?? 'deposit'}`)
++    debugLogger.log(SOURCE, `deposit 命中缓存:hash=${cached.hash.slice(0, 8)} from=${cached.from}`)
+     return cached
+   }
+   if (!input.blob) throw new DepositError('DEPOSIT_FAILED', '源图字节不可用,无法寄存。')
+@@ -262,17 +256,15 @@ export const resolveDepositEntry = async (input: {
+   }
+   const pending = (async () => {
+     const receipt = await depositBlob(input.blob as Blob, input.label ?? DEPOSIT_LABEL)
+-    const entry: DepositEntry = {
++    const entry: DepositEntryDraft = {
+       hash: receipt.hash,
+       ext: receipt.ext,
+       bytes: receipt.bytes,
+       depositedAt: now(),
+       from: 'deposit',
+-      // 桥接(S1→S4 临时):gen/writer 尚未接入提交层盖戳,占位值满足新必填形状。
+-      gen: DEPOSIT_PENDING_GEN,
+-      writer: DEPOSIT_PENDING_WRITER,
+     }
+     // 写映射的唯一时机 = 收到 ok:true 且 hash/ext 均合法之后(设计稿 §4.7)。
++    // gen/writer 由提交层盖戳(depositStore.ts,设计稿 §4.10.6.1),这里不手填。
+     await recordDeposit(assetUrl, entry)
+     return entry
+   })()
+diff --git a/src/agent/depositStore.ts b/src/agent/depositStore.ts
+index c29ad6ea..8f784d81 100644
+--- a/src/agent/depositStore.ts
++++ b/src/agent/depositStore.ts
+@@ -1194,21 +1194,78 @@ const mutateAndCommit = async (mutator: (state: DepositState) => void): Promise<
+ }
+ 
+ /**
+- * 桥接(S3→S4 临时,非最终 API):depositPort.ts/depositMigration.ts 迁移到
+- * recordCapabilityMark/recordMigration 之前,仍需要一个能真正提交的旧式入口
+- * (mutateDepositStore→本函数纯改名)。它们改的只有 capability/migration 两个
+- * 字段,但从外部摸不到模块私有的 `dirty`——不标记的话,enqueueCommit 的 SC9.6
+- * isEmptyDirty 短路会把这次改动误判成"批次是空的",直接跳过真正落盘(main.js
+- * 侧从未收到 deposit-state-save)。保守地把这两个位都标脏,换来"这批一定会被
+- * 提交",S4 落地时随调用点迁移到精确标记的 recordCapabilityMark/recordMigration
+- * 一并删除本函数。
++ * SC10.4(十轮定案——统一 admission 门,根治 judge-i P1-1):正增长 mutation 入口
++ * 被拒时,拒绝内容绝不能留在活内存里——判据 = `evaluateReleaseEvidenceCapacity`
++ * 的 `mutate` 回调是否只碰传入的 `draft`(纯函数),从不touch 真实 `state`/模块级
++ * `dirty`。下面三个函数与既有的 `invalidateDeposit`/`enqueuePendingRelease` 同一
++ * 个 box 模式:先在 `evaluateReleaseEvidenceCapacity` 的克隆上试算,只有
++ * `allowed:true` 才把**同一份**改动真正应用到 `state`/`dirty` 上——拒绝时 mutator
++ * 提前 return,真实 `state`/`dirty` 分毫未动(五元组零副作用),不像旧实现那样
++ * 先无条件 mutate 真实 `state` 再指望 main.js 的硬闸兜底,把超限内容永久卡死在
++ * 面板内存里(judge-i 实测:16MiB 的 reason 字段被拒后仍留在 memory,后续所有
++ * 提交因为它撞硬闸)。
+  */
+-export const mutateAndCommitLegacyBridge = (mutator: (state: DepositState) => void): Promise<DepositCommitResult> =>
+-  mutateAndCommit((state) => {
+-    mutator(state)
+-    dirty.migration = true
++
++/** 写能力负缓存标记(设计稿 §5)。SC10.4:落地前统一走容量 admission 门。 */
++export const recordCapabilityMark = (mark: DepositCapabilityMark): Promise<DepositCommitResult> => {
++  const box: { rejected: ReleaseEvidenceRejection | null } = { rejected: null }
++  return mutateAndCommit((state) => {
++    const gate = evaluateReleaseEvidenceCapacity((draft) => {
++      draft.capability = mark
++    })
++    if (!gate.allowed) {
++      box.rejected = { currentBytes: gate.currentBytes, projectedBytes: gate.projectedBytes }
++      return
++    }
++    state.capability = mark
+     dirty.capability = true
++  }).then((result) => {
++    if (!box.rejected) return result
++    debugLogger.warn(
++      SOURCE,
++      `deposit 释放证据容量硬闸拒绝(SC10.4):recordCapabilityMark ${describeReleaseEvidenceCapacity(box.rejected.currentBytes, box.rejected.projectedBytes)}——不产生新证据,capability 原样保留`,
++    )
++    return { ok: false, code: 'RELEASE_EVIDENCE_CAPACITY', reason: 'capacity', generation: result.generation, attempts: 0 }
+   })
++}
++
++/**
++ * 存量账本迁移(设计稿 §7):新增一批 `from:'ledger'` 草稿条目并同步写迁移标记,
++ * **同一次提交**(不拆两次写,否则会出现「map 迁了标记没写」的错位态)。
++ * 条目的 `gen`/`writer` 由提交层盖戳,这里只标记它们与迁移标记为 dirty。
++ * SC10.4:落地前统一走容量 admission 门,整批原子拒绝——不接受"迁了一半"。
++ */
++export const recordMigration = (
++  entries: ReadonlyArray<readonly [string, DepositEntryDraft]>,
++  mark: DepositMigrationMark,
++): Promise<DepositCommitResult> => {
++  const box: { rejected: ReleaseEvidenceRejection | null } = { rejected: null }
++  return mutateAndCommit((state) => {
++    const gate = evaluateReleaseEvidenceCapacity((draft) => {
++      for (const [assetUrl, draft2] of entries) {
++        draft.map[assetUrl] = { ...draft2, gen: DEPOSIT_PENDING_GEN, writer: DEPOSIT_PENDING_WRITER }
++      }
++      draft.migration = mark
++    })
++    if (!gate.allowed) {
++      box.rejected = { currentBytes: gate.currentBytes, projectedBytes: gate.projectedBytes }
++      return
++    }
++    for (const [assetUrl, draft] of entries) {
++      state.map[assetUrl] = { ...draft, gen: DEPOSIT_PENDING_GEN, writer: DEPOSIT_PENDING_WRITER }
++      dirty.mapSet.add(assetUrl)
++    }
++    state.migration = mark
++    dirty.migration = true
++  }).then((result) => {
++    if (!box.rejected) return result
++    debugLogger.warn(
++      SOURCE,
++      `deposit 释放证据容量硬闸拒绝(SC10.4):recordMigration entries=${entries.length} ${describeReleaseEvidenceCapacity(box.rejected.currentBytes, box.rejected.projectedBytes)}——整批不产生新证据,map/migration 原样保留`,
++    )
++    return { ok: false, code: 'RELEASE_EVIDENCE_CAPACITY', reason: 'capacity', generation: result.generation, attempts: 0 }
++  })
++}
+ 
+ export const lookupDeposit = async (assetUrl?: string): Promise<DepositEntry | undefined> => {
+   if (!assetUrl) return undefined
+@@ -1216,32 +1273,263 @@ export const lookupDeposit = async (assetUrl?: string): Promise<DepositEntry | u
+   return state.map[assetUrl]
+ }
+ 
+-export const recordDeposit = (assetUrl: string, entry: DepositEntry): Promise<DepositCommitResult> =>
+-  // 桥接(S3→S4 临时):mutateDepositStore 已改名为 mutateAndCommit;新增 dirty 标记,
+-  // 满足 enqueueCommit 的 SC9.6 isEmptyDirty 短路判据(否则本次写入会被误判为"空批"
+-  // 而从不真正落盘)。
+-  mutateAndCommit((state) => {
+-    state.map[assetUrl] = entry
++/**
++ * 写一条寄存/产物映射(业务代码传草稿,gen/writer 由提交层盖戳,§4.10.6.1)。
++ * SC10.4:落地前统一走容量 admission 门——map 新增与 tombstone/pendingReleases
++ * 清理是同一次原子改动,被拒时两者都不发生(不能只清理不新增,那样会把一个仍
++ * 有效的 hash 错误地从"待释放"里摘走却没有对应的新映射接住它)。
++ */
++export const recordDeposit = (assetUrl: string, draft: DepositEntryDraft): Promise<DepositCommitResult> => {
++  const box: { rejected: ReleaseEvidenceRejection | null } = { rejected: null }
++  return mutateAndCommit((state) => {
++    const gate = evaluateReleaseEvidenceCapacity((d) => {
++      d.map[assetUrl] = { ...draft, gen: DEPOSIT_PENDING_GEN, writer: DEPOSIT_PENDING_WRITER }
++      delete d.releasedTombstones[assetUrl]
++      delete d.pendingReleases[draft.hash]
++    })
++    if (!gate.allowed) {
++      box.rejected = { currentBytes: gate.currentBytes, projectedBytes: gate.projectedBytes }
++      return
++    }
++    state.map[assetUrl] = { ...draft, gen: DEPOSIT_PENDING_GEN, writer: DEPOSIT_PENDING_WRITER }
+     dirty.mapSet.add(assetUrl)
++    // 新映射覆盖了任何本次会话尚未提交的墓碑意图(重新寄存后,之前那条"我要删它"的
++    // 打算已经不成立)。
+     dirty.tombstoneSet.delete(assetUrl)
++    delete state.releasedTombstones[assetUrl]
++    // N1(SC1a.9 反向清理):这个 hash 现在又活跃在 map 里了——若它还挂在
++    // pendingReleases 队列里(例如之前 release 失败排队重试,现在同一个 hash 被
++    // 重新引用),必须原子摘掉,否则 P1b 的消费者会对一个用户仍在引用的 hash 调
++    // release_media,把还在用的产物删掉。与下面 enqueuePendingRelease 的原子检查
++    // 互为对偶:两者谁先跑到,mutator 内的同步检查都能看见对方刚做的改动
++    // (mutateAndCommit 的 mutator 是同步函数,不会被另一次调用的 mutator 打断)。
++    if (state.pendingReleases[draft.hash]) {
++      delete state.pendingReleases[draft.hash]
++      dirty.pendingSet.delete(draft.hash)
++      dirty.pendingDelete.add(draft.hash)
++    }
++  }).then((result) => {
++    if (!box.rejected) return result
++    debugLogger.warn(
++      SOURCE,
++      `deposit 释放证据容量硬闸拒绝(SC10.4):recordDeposit assetUrl=${assetUrl.slice(0, 60)} ${describeReleaseEvidenceCapacity(box.rejected.currentBytes, box.rejected.projectedBytes)}——不产生新映射,map/tombstone/pendingReleases 原样保留`,
++    )
++    return { ok: false, code: 'RELEASE_EVIDENCE_CAPACITY', reason: 'capacity', generation: result.generation, attempts: 0 }
+   })
++}
+ 
+-/** 自愈路径:指纹已失效 → 淘汰该条,下次改图重寄存(设计稿 §4.7 最后一行)。 */
+-export const invalidateDeposit = (assetUrl: string): Promise<DepositCommitResult> =>
+-  // 桥接(S3→S4 临时):同上。
+-  mutateAndCommit((state) => {
++/**
++ * SC8.4/SC10.4(八轮定案「源头硬闸」,十轮扩大为统一 admission 门):任何正增长
++ * mutation(`recordDeposit`/`recordMigration`/`recordCapabilityMark` 新增 map/
++ * migration/capability,或新 `releasedTombstones[assetUrl]`/新增 `pendingReleases[hash]`)
++ * 落地前,在一份**内存副本**上完整模拟"这次改动 + 盖目标 gen/writer + 跑一遍 GC
++ * (安全退休 + 墓碑 GC)"之后的最终体积,判断是否放行:
++ *   ①最终体积 <= 软闸(`DEPOSIT_STATE_SOFT_BYTES`):放行;
++ *   ②最终体积 > 软闸,但不超过**改动前**的体积(本次是缩减/不增长,例如同一个
++ *     key 的更新只是刷新 `at` 时间戳,体积几乎不变):放行——否则一旦越过软闸,
++ *     连"不增长的更新"都会被挡死,状态永远回不到软闸以内;
++ *   ③最终体积 > 软闸且比改动前**更大**:拒绝。
++ *
++ * 只挡"创造新证据/新内容"这个动作本身,不猜删任何已经存在的内容——这正是"源头
++ * 硬闸"与已删除的 sidecar 方案的本质区别:sidecar 试图在没有事务原语的宿主上手搓
++ * 一次"写两个文件当一个事务"的多文件协议,组合面复杂;这里只在**写之前**判断
++ * "要不要让这次改动发生",判断本身是纯内存操作,不涉及任何跨文件一致性问题。
++ *
++ * `mutate` 必须是**纯函数**,只改传入的 `draft`,绝不能引用/改动模块级的
++ * `dirty`——这里传入的是一份供估算用的副本,如果 `mutate` 顺手改了全局 `dirty`,
++ * 即使这次判定为拒绝,`dirty` 里也会残留一条本不该存在的脏键,污染下一次真正的
++ * 提交(调用方必须另外、独立地对真实 `state`/`dirty` 做同样的改动,只有在这里
++ * 判定 `allowed:true` 之后才做——五个调用方 `recordDeposit`/`recordMigration`/
++ * `recordCapabilityMark`/`invalidateDeposit`/`enqueuePendingRelease` 统一用同一个
++ * box 模式,拒绝时真实 `state`/`dirty` 分毫未动,SC10.4 根治 judge-i P1-1)。
++ */
++const evaluateReleaseEvidenceCapacity = (
++  mutate: (draft: DepositState) => void,
++): { allowed: true } | { allowed: false; currentBytes: number; projectedBytes: number } => {
++  const baseline = memory ?? emptyState()
++  const targetGen = baseline.generation + 1
++  const writer = DEPOSIT_LOCAL_WRITER_PLACEHOLDER
++
++  // "改动前"的对照面同样要按信封 + 盖戳口径量(`measureEnvelopeBytes`),否则
++  // ②比较(projected <= current)会变成"信封 vs 裸 state"的两种单位互相比,
++  // 任何缩减型改动都会被误判成"变大了"。
++  const currentBytes = measureEnvelopeBytes(baseline, targetGen, writer)
++
++  const draft = cloneStateForCapacityEstimate(baseline)
++  mutate(draft)
++  retireReleasedFloor(draft, targetGen)
++  pruneExpiredTombstones(draft, targetGen, writer)
++  const projectedBytes = measureEnvelopeBytes(draft, targetGen, writer)
++
++  if (projectedBytes <= DEPOSIT_STATE_SOFT_BYTES || projectedBytes <= currentBytes) return { allowed: true }
++  return { allowed: false, currentBytes, projectedBytes }
++}
++
++/** SC8.4:容量硬闸拒绝的字节快照。 */
++type ReleaseEvidenceRejection = { currentBytes: number; projectedBytes: number }
++
++/** SC8.4:容量硬闸拒绝时的诊断行——current/projected/soft/hard 字节 + 三类证据结构的条目数。 */
++const describeReleaseEvidenceCapacity = (currentBytes: number, projectedBytes: number): string => {
++  const state = memory ?? emptyState()
++  return (
++    `current=${currentBytes} projected=${projectedBytes} soft=${DEPOSIT_STATE_SOFT_BYTES} hard=${DEPOSIT_STATE_HARD_BYTES} ` +
++    `floor=${Object.keys(state.releasedFloor).length} tombstones=${Object.keys(state.releasedTombstones).length} pending=${Object.keys(state.pendingReleases).length}`
++  )
++}
++
++/**
++ * 淘汰/自愈路径:忘掉本地映射,下次改图重新走 dedup 或重寄存(设计稿 §4.7 最后一行)。
++ * `from:'deposit'` 的条目必须留墓碑(§4.10.6,否则一份过期的本地/重放状态可能把它
++ * 复活);`artifact`/`ledger` 条目直接删键即可——它们不是本插件的寄存物,没有
++ * 「复活后占配额」的风险。
++ *
++ * SC8.4:即将新增一条 tombstone 时先过源头硬闸——若被拒,**整次 invalidate 原子
++ * 失败**,map 条目与 tombstone 都不动:不能只删 map 不留 tombstone,那样一份
++ * `from:'deposit'` 的旧映射会在没有任何证据挡着的情况下被复活(§4.10.6 的复活
++ * 防护本来就是靠"删映射必须同时留证据"这条不变量撑住的)。
++ */
++export const invalidateDeposit = (assetUrl: string): Promise<DepositCommitResult> => {
++  // 用对象包一层再存拒绝结果(不是直接 `let x: T | null`)——TS 对"闭包内被赋值的
++  // 外层 let 变量"在闭包外的窄化分析在这种写法下会把类型收窄成 `never`(已用最小
++  // 复现验证是 TS 本身的控制流分析局限,不是这里的逻辑错误);属性读取不触发这个
++  // 问题。
++  const box: { rejected: ReleaseEvidenceRejection | null } = { rejected: null }
++  return mutateAndCommit((state) => {
++    const existing = state.map[assetUrl]
++    if (existing && existing.from === 'deposit' && !state.releasedTombstones[assetUrl]) {
++      const gate = evaluateReleaseEvidenceCapacity((draft) => {
++        delete draft.map[assetUrl]
++        draft.releasedTombstones[assetUrl] = { hash: existing.hash, at: now(), gen: DEPOSIT_PENDING_GEN, writer: DEPOSIT_PENDING_WRITER }
++      })
++      if (!gate.allowed) {
++        box.rejected = { currentBytes: gate.currentBytes, projectedBytes: gate.projectedBytes }
++        return
++      }
++    }
+     delete state.map[assetUrl]
+     dirty.mapSet.delete(assetUrl)
+     dirty.mapDelete.add(assetUrl)
++    if (existing && existing.from === 'deposit') {
++      state.releasedTombstones[assetUrl] = {
++        hash: existing.hash,
++        at: now(),
++        gen: DEPOSIT_PENDING_GEN,
++        writer: DEPOSIT_PENDING_WRITER,
++      }
++      dirty.tombstoneSet.add(assetUrl)
++    }
++  }).then((result) => {
++    if (!box.rejected) return result
++    debugLogger.warn(
++      SOURCE,
++      `deposit 释放证据容量硬闸拒绝(SC8.4):invalidateDeposit assetUrl=${assetUrl.slice(0, 60)} ${describeReleaseEvidenceCapacity(box.rejected.currentBytes, box.rejected.projectedBytes)}——不产生新证据,map 条目原样保留`,
++    )
++    return { ok: false, code: 'RELEASE_EVIDENCE_CAPACITY', reason: 'capacity', generation: result.generation, attempts: 0 }
++  })
++}
++
++/** 该 hash 是否仍被 map 中的其它条目引用(设计稿 §4.10.5:按 hash 而非 assetUrl 释放)。 */
++export const depositHashRefCount = (state: DepositState, hash: string, excludeAssetUrl?: string): number => {
++  let count = 0
++  for (const [assetUrl, entry] of Object.entries(state.map)) {
++    if (assetUrl === excludeAssetUrl) continue
++    if (entry.hash === hash) count += 1
++  }
++  return count
++}
++
++/**
++ * SC1a.9:把一个失败的 release 记入待重试队列。只允许 `from:'deposit'` 且该 hash
++ * 已无其它 map 引用(否则它仍在被使用,不该排队释放);按 hash 键天然去重。
++ * 消费(实际重试调 release_media)在 P1b 接线,本函数只建状态。
++ *
++ * `from` 必须由调用方显式传入(通常是被 invalidate 的那条 map 条目自己的 `from`),
++ * 不接受裸 hash(finding 5:旧签名只收 hash,内部硬写 `from:'deposit'`,等于替调用方
++ * 的判断背书——调用方若拿一个 `artifact`/`ledger` 的 hash 误调这个函数,也会被无声
++ * 编成合法的 deposit 释放请求)。非 `'deposit'` 直接拒绝入队,不静默转换。
++ *
++ * N1:「无其它 map 引用」的检查必须与写入在**同一次** `mutateAndCommit` 的 mutator
++ * 里完成——旧实现先 `await loadDepositStore()` 读一次 state 判断,再另起一次
++ * `mutateAndCommit` 写,两次 await 之间有窗口;`recordDeposit` 若刚好在这个窗口期
++ * 给同一个 hash 写入新映射,refcount 检查读到的是窗口打开前的旧状态,判定"无引用"
++ * 后照样把它排进待释放队列——造成 live map 与 pendingReleases 同 hash 共存
++ * (judge `Promise.all(enqueue, recordDeposit)` 反例;顺序执行也会因两次 mutateAndCommit
++ * 之间的窗口残留同样问题)。`mutateAndCommit` 的 mutator 是同步函数,不会被另一次
++ * `mutateAndCommit` 调用的 mutator 打断,把检查搬进 mutator 内部就消除了这个窗口。
++ *
++ * SC8.4:refcount 检查通过之后,同一个 mutator 里紧接着过一次源头硬闸——若被拒,
++ * 不入队(pendingReleases 不新增/不更新这条),但**不影响** refcount 检查本身的
++ * 正确性(它只是判"这个 hash 现在该不该排队释放",跟"排不排队"这件事本身要不要
++ * 因为容量被挡是两个独立的判断)。
++ */
++export const enqueuePendingRelease = async (hash: string, from: DepositFrom): Promise<DepositCommitResult> => {
++  if (from !== 'deposit') {
++    const state = await loadDepositStore()
++    debugLogger.log(SOURCE, `deposit 待释放队列拒绝:hash=${hash.slice(0, 8)} 来源是 ${from},不是 deposit,不入队`)
++    return { ok: true, generation: state.generation, attempts: 0 }
++  }
++  let skippedForRefCount = false
++  // 同 invalidateDeposit:对象包一层规避闸内赋值在闭包外被 TS 收窄成 `never` 的
++  // 控制流分析局限。
++  const box: { rejected: ReleaseEvidenceRejection | null } = { rejected: null }
++  const result = await mutateAndCommit((state) => {
++    if (depositHashRefCount(state, hash) > 0) {
++      skippedForRefCount = true
++      return
++    }
++    const gate = evaluateReleaseEvidenceCapacity((draft) => {
++      draft.pendingReleases[hash] = { hash, from: 'deposit', at: now(), gen: DEPOSIT_PENDING_GEN, writer: DEPOSIT_PENDING_WRITER }
++    })
++    if (!gate.allowed) {
++      box.rejected = { currentBytes: gate.currentBytes, projectedBytes: gate.projectedBytes }
++      return
++    }
++    state.pendingReleases[hash] = { hash, from: 'deposit', at: now(), gen: DEPOSIT_PENDING_GEN, writer: DEPOSIT_PENDING_WRITER }
++    dirty.pendingSet.add(hash)
++  })
++  if (skippedForRefCount) {
++    debugLogger.log(SOURCE, `deposit 待释放队列跳过:hash 仍被引用 hash=${hash.slice(0, 8)}`)
++  }
++  if (box.rejected) {
++    debugLogger.warn(
++      SOURCE,
++      `deposit 释放证据容量硬闸拒绝(SC8.4):enqueuePendingRelease hash=${hash.slice(0, 8)} ${describeReleaseEvidenceCapacity(box.rejected.currentBytes, box.rejected.projectedBytes)}——不入队`,
++    )
++    return { ok: false, code: 'RELEASE_EVIDENCE_CAPACITY', reason: 'capacity', generation: result.generation, attempts: 0 }
++  }
++  return result
++}
++
++/** SC1a.9:从待重试队列移除(P1b 的重试成功回调会调用它)。 */
++export const dequeuePendingRelease = (hash: string): Promise<DepositCommitResult> =>
++  mutateAndCommit((state) => {
++    delete state.pendingReleases[hash]
++    dirty.pendingSet.delete(hash)
++    dirty.pendingDelete.add(hash)
+   })
+ 
+-/** 测试用:清空模块内存态与提交队列。 */
++/** 测试用:清空本模块内存态与提交队列。 */
+ export const resetDepositStoreForTests = (): void => {
+   memory = null
+   loadPromise = null
+   commitTail = Promise.resolve()
+   waitingCommit = null
++  dirty = emptyDirty()
++  baseRevisionSum = null
++  resetDepositCapacityWarnThrottleForTests()
+ }
+ 
++/** 测试用:读取本模块当前记的 CAS 内容指纹基线(F1)。 */
++export const peekDepositRevisionSumForTests = (): string | null => baseRevisionSum
++
+ /** 测试用:不经桥直接看当前内存态(未 load 过时为 null)。 */
+ export const peekDepositStoreForTests = (): DepositState | null => memory
++
++/**
++ * 测试用:SC10.1 之后本地已不再铸造/持有写者短码,统一返回定长占位常量——
++ * 保留这个导出只是为了不动旧测试的调用面,不代表这个值有任何仲裁意义。
++ */
++export const peekDepositWriterForTests = (): string => DEPOSIT_LOCAL_WRITER_PLACEHOLDER
++
++/** 便于电子脑侧同语义实现互相核对的导出(不在生产路径上被调用,纯供测试/文档引用)。 */
++export const depositIntegritySum = canonicalSum

@@ -1,0 +1,660 @@
+diff --git a/scripts/e2e/renderer-evidence.mjs b/scripts/e2e/renderer-evidence.mjs
+index 35ba58d6..c78db8d9 100644
+--- a/scripts/e2e/renderer-evidence.mjs
++++ b/scripts/e2e/renderer-evidence.mjs
+@@ -67,21 +67,27 @@ export const waitForNodeRendered = async (page, rendererMode, nodeId, { timeout
+   }, nodeId, { label: '节点已渲染(DOM 命中 / leafer 子节点数达标)', timeout })
+ }
+ 
+-/** 节点屏幕矩形 {x,y,width,height}。dom:boundingBox;leafer:优先 DOM 壳
+- *  boundingBox(非真画类型),否则 store 几何 × data-viewport-* 投影
+- *  (与 getPaintedNodes screenRect 同式)。找不到返回 null。 */
+-export const nodeScreenRect = async (page, rendererMode, nodeId) => {
+-  if (rendererMode !== 'leafer') {
+-    return page.locator(`[data-node-id="${nodeId}"]`).boundingBox()
+-  }
+-  return page.evaluate(async (id) => {
+-    const element = document.querySelector(`[data-node-id="${CSS.escape(id)}"]`)
+-    if (element) {
+-      const rect = element.getBoundingClientRect()
+-      return { x: rect.left, y: rect.top, width: rect.width, height: rect.height }
+-    }
+-    const resource = performance.getEntriesByType('resource').map((entry) => entry.name).find((name) => name.includes('/src/store/canvasStore.ts'))
+-    const moduleSpec = resource ? new URL(resource).pathname + new URL(resource).search : '/src/store/canvasStore.ts'
++/** 纯 store 几何 × data-viewport-* 投影(不看 DOM 壳、不做 preferred 分支)。
++ *  与 getPaintedNodes screenRect / nodeScreenRect 的 store 分支同式——是本文件里
++ *  "store→screen 投影"这条公式的唯一实现,nodeScreenRect 与坐标探针的独立交叉
++ *  验证都调它,不允许再各自内联一份。找不到节点/shell 返回 null。 */
++export const projectedScreenRectForNode = async (page, nodeId) =>
++  page.evaluate(async (id) => {
++    // 精确匹配同源 + pathname + initiatorType,不用子串匹配(子串会误命中任何
++    // query 里恰好带这段文本的无关资源,如
++    // /src/unrelated.ts?probe=/src/store/canvasStore.ts——codex-adversarial R1 F1
++    // 实测指出)。同源+initiator 校验进一步拦掉跨源资源、或非 script 加载类型
++    // 恰好共享该 pathname 的情形(R2 复审同一条 finding 指出 pathname-only 仍未
++    // 绑定 origin/initiator;query 留给合法资源自身携带的值,不额外约束——本仓
++    // 威胁模型下该 query 只来自 Vite/route 拦截桥自产,不受外部输入影响)。
++    const resource = performance.getEntriesByType('resource').find((entry) => {
++      if (entry.initiatorType !== 'script') return false
++      try {
++        const url = new URL(entry.name)
++        return url.origin === location.origin && url.pathname === '/src/store/canvasStore.ts'
++      } catch { return false }
++    })
++    const moduleSpec = resource ? new URL(resource.name).pathname + new URL(resource.name).search : '/src/store/canvasStore.ts'
+     const { useCanvasStore } = await import(moduleSpec)
+     const node = useCanvasStore.getState().nodes.find((entry) => entry.id === id)
+     const shell = document.querySelector('.canvas-shell')
+@@ -97,6 +103,21 @@ export const nodeScreenRect = async (page, rendererMode, nodeId) => {
+       height: node.height * scale,
+     }
+   }, nodeId)
++
++/** 节点屏幕矩形 {x,y,width,height}。dom:boundingBox;leafer:优先 DOM 壳
++ *  boundingBox(非真画类型),否则 projectedScreenRectForNode 投影。找不到返回 null。 */
++export const nodeScreenRect = async (page, rendererMode, nodeId) => {
++  if (rendererMode !== 'leafer') {
++    return page.locator(`[data-node-id="${nodeId}"]`).boundingBox()
++  }
++  const element = await page.evaluate((id) => {
++    const el = document.querySelector(`[data-node-id="${CSS.escape(id)}"]`)
++    if (!el) return null
++    const rect = el.getBoundingClientRect()
++    return { x: rect.left, y: rect.top, width: rect.width, height: rect.height }
++  }, nodeId)
++  if (element) return element
++  return projectedScreenRectForNode(page, nodeId)
+ }
+ 
+ /** 点击节点(默认中心)。dom:locator.click(与既有行为一致);leafer:投影
+@@ -141,3 +162,65 @@ export const waitForTotalNodeCountAtLeast = async (page, count, { timeout = 3000
+     { timeout },
+   )
+ }
++
++/** 从 canvasStore 枚举非 hidden 节点(最多 limit 条),逐条标注是否仍有独立 DOM 壳
++ *  (annotation/ai-slot/task-placeholder/note 文字壳等 leafer 模式仍渲染 DOM 的类型)。
++ *  用于需要"证据来源与仅 DEV 暴露的调试全局/DOM 采样脱钩"的场景——两种拓扑都可用
++ *  (见文件头 store 模块解析说明)。 */
++export const listStoreNodes = async (page, { limit = 6 } = {}) =>
++  page.evaluate(async (max) => {
++    // 精确匹配同源 + pathname + initiatorType(见 projectedScreenRectForNode 同款注释)。
++    const resource = performance.getEntriesByType('resource').find((entry) => {
++      if (entry.initiatorType !== 'script') return false
++      try {
++        const url = new URL(entry.name)
++        return url.origin === location.origin && url.pathname === '/src/store/canvasStore.ts'
++      } catch { return false }
++    })
++    const moduleSpec = resource ? new URL(resource.name).pathname + new URL(resource.name).search : '/src/store/canvasStore.ts'
++    const { useCanvasStore } = await import(moduleSpec)
++    const nodes = useCanvasStore.getState().nodes.filter((node) => !node.hidden).slice(0, max)
++    return nodes.map((node) => ({
++      id: node.id,
++      type: node.type,
++      hasDomShell: Boolean(document.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`)),
++    }))
++  }, limit)
++
++/** 对给定屏幕坐标点(viewport CSS px,与 getBoundingClientRect 同坐标系)做一次真实
++ *  canvas 像素采样,判定该点 alpha 是否非空。用于替代 prod 下恒真的
++ *  data-leafer-pixel-nonempty(该字段在生产构建里从不真的扫描像素——见
++ *  useLeaferSpikeRenderer.ts 的 R-02 注释)——这是坐标投影公式唯一能对上"真的画在
++ *  那里"这件事的位置证据来源,不能用它自证自己。canvas 不存在/尺寸为 0/getImageData
++ *  抛错(如被污染)时返回 sampleAvailable:false,调用方据此判定证据不可用而非误判为空。 */
++export const sampleCanvasPixelInRect = async (page, rect) =>
++  page.evaluate(({ x, y, width, height }) => {
++    const canvas = document.querySelector('.canvas-shell canvas')
++    if (!canvas || canvas.width < 1 || canvas.height < 1) return { sampleAvailable: false, nonEmpty: null, intersects: false }
++    const canvasRect = canvas.getBoundingClientRect()
++    if (canvasRect.width < 1 || canvasRect.height < 1) return { sampleAvailable: false, nonEmpty: null, intersects: false }
++    // 取「目标矩形 ∩ 可见画布」而不是只看矩形中心点。中心点判据无法区分两种情形:
++    // ① 节点被 zoom/pan 合法移出视口(中心在外,但矩形常仍与画布相交,证据依然可取)
++    // ② 投影公式算错、把节点甩到画布外(矩形与画布完全不相交)
++    // 中心点判据把两者都归为"无判据"而跳过 → ② 被静默放行(实测变异 G:只让 image 在
++    // 非 baseline 阶段偏移 99999px,旧实现整场通过)。改用交集后 ② 表现为 intersects=false,
++    // 调用方可据此 fail-closed。
++    const left = Math.max(x, canvasRect.left)
++    const top = Math.max(y, canvasRect.top)
++    const right = Math.min(x + width, canvasRect.right)
++    const bottom = Math.min(y + height, canvasRect.bottom)
++    if (!(right > left && bottom > top)) return { sampleAvailable: false, nonEmpty: null, intersects: false }
++    const scaleX = canvas.width / canvasRect.width
++    const scaleY = canvas.height / canvasRect.height
++    // 采样点取交集中心——必落在画布内,无需 clamp,故不会拿邻近像素冒充目标证据。
++    const localX = Math.min(canvas.width - 1, Math.max(0, Math.round(((left + right) / 2 - canvasRect.left) * scaleX)))
++    const localY = Math.min(canvas.height - 1, Math.max(0, Math.round(((top + bottom) / 2 - canvasRect.top) * scaleY)))
++    try {
++      const context = canvas.getContext('2d', { willReadFrequently: true })
++      if (!context) return { sampleAvailable: false, nonEmpty: null, intersects: true }
++      const data = context.getImageData(localX, localY, 1, 1).data
++      return { sampleAvailable: true, nonEmpty: data[3] > 0, intersects: true }
++    } catch (error) {
++      return { sampleAvailable: false, nonEmpty: null, intersects: true, error: error instanceof Error ? error.message : String(error) }
++    }
++  }, rect)
+diff --git a/scripts/e2e/scenarios/coordinate-probe.mjs b/scripts/e2e/scenarios/coordinate-probe.mjs
+index c5fda4f4..33da9fd0 100644
+--- a/scripts/e2e/scenarios/coordinate-probe.mjs
++++ b/scripts/e2e/scenarios/coordinate-probe.mjs
+@@ -1,21 +1,40 @@
+ /**
+- * 坐标 probe scenario（Leafer 接入 PR-1 / Phase 0a 工装）。
++ * 坐标 probe scenario（issue #559：改用真实 Leafer 渲染证据）。
+  *
+- * 在不同 zoom / pan / DPR 下，采样若干节点的四角/中心屏幕坐标
+- * （getBoundingClientRect），输出 JSON artifact。
++ * 在不同 zoom / pan / DPR 下，采样若干节点的屏幕坐标，输出 JSON artifact。
+  *
+- * text/connector 等非 Leafer 真画节点在 dom/leafer 两种模式都走 DOM；leafer
+- * 模式额外记录 image/frame 的 Leafer probe screenRect，用来定位 DOM 坐标一致但真画几何偏移的问题。
++ * text/connector 等非 Leafer 真画节点在 dom/leafer 两种模式都走 DOM，坐标应逐
++ * 像素一致。leafer 模式下 image/frame 等真画节点没有 DOM 镜像（Leafer 画在
++ * canvas 上，不产生 DOM 节点）——证据改走 renderer-evidence.mjs 的稳定层：
++ * `.canvas-shell` 的 data-leafer-* 观测属性（children/expected/syncVersion）+
++ * canvasStore 节点几何 × data-viewport-* 投影（与生产 useLeaferSpikeRenderer
++ * 同式，见 renderer-evidence.mjs 的 projectedScreenRectForNode），不再依赖仅
++ * DEV 暴露的调试全局（该全局在 prod 构建被 tree-shake，生产下探针结构性拿
++ * 不到 leafer 证据——见 issue #559）。
+  *
+- * probe 性质：不断言精确值，仅校验采样到足够节点 + viewport 已推进，
+- * 避免空跑。zoom/pan 驱动用真实交互（Ctrl+wheel / hand-drag），actual
+- * viewport 随同采样记录，后续对照以 actual 为准。
++ * 投影公式本身是符号计算，不能自证正确——额外补一个"这个投影矩形里真的有像素"
++ * 的独立证据：对 baseline demo 场景里一个不带 DOM 壳的真画节点（image），在其
++ * 投影矩形中心做一次真实 canvas 像素采样（sampleCanvasPixelInRect），取代 prod 下
++ * 恒真的 data-leafer-pixel-nonempty。另外为了让"screenRect 与投影是否一致"这条
++ * 检查不是同源自证（默认 demo 场景全是 image，没有天然带 DOM 壳的节点类型），
++ * leafer 模式下额外用 addMarkupNode 直建一个 note 节点（自带初始文字，leafer
++ * 模式仍渲染文字壳）作为独立交叉验证对象。
++ *
++ * probe 性质：不断言精确值，仅校验采样到足够节点、viewport 已按预期方向推进、
++ * 且真画证据非空。zoom/pan 驱动用真实交互（Ctrl+wheel / 裸滚轮）。
+  */
+ 
+ import { attachPageErrorObserver } from '../browser-error-guard.mjs'
++import { installE2EStoreBridge } from '../harness.mjs'
++import { listStoreNodes, projectedScreenRectForNode, sampleCanvasPixelInRect } from '../renderer-evidence.mjs'
+ 
+ const SAMPLE_NODE_LIMIT = 6
+-const ARTIFACT_PATH = 'test-artifacts/coordinate-probe.json'
++const SCHEMA_VERSION = 2
++const CROSS_SOURCE_TOLERANCE_PX = 2
++// pan 手势的滚轮增量。断言侧从这两个常量派生期望方向(见 assertViewportProgression),
++// 手势侧也只从这里取值——两边共用单一来源,改了增量不会与方向断言脱节。
++const PAN_DELTA_X = 160
++const PAN_DELTA_Y = -100
+ 
+ const round = (value, digits = 3) => (value == null ? null : Number(value.toFixed(digits)))
+ 
+@@ -31,7 +50,77 @@ const readViewport = async (page) =>
+     }
+   })
+ 
+-const sampleNodes = async (page) => {
++const readShellStats = async (page) =>
++  page.evaluate(() => {
++    const shell = document.querySelector('.canvas-shell')
++    return {
++      expectedChildren: Number(shell?.getAttribute('data-leafer-expected-children') || 0),
++      children: Number(shell?.getAttribute('data-leafer-children') || 0),
++      syncVersion: Number(shell?.getAttribute('data-leafer-sync-version') || 0),
++    }
++  })
++
++const readDomRect = async (page, nodeId) =>
++  page.evaluate((id) => {
++    const element = document.querySelector(`[data-node-id="${CSS.escape(id)}"]`)
++    if (!element) return null
++    const rect = element.getBoundingClientRect()
++    return { x: rect.left, y: rect.top, width: rect.width, height: rect.height }
++  }, nodeId)
++
++// 独立交叉验证对象：一个自带初始文字的 note markup（leafer 模式仍渲染文字壳，
++// 与 markup-text-overlay.mjs 场景同一套直建手法）。放在 demo 图片下方空白区，
++// 不与已有 3 张 courage-*.jpg 重叠。只在 leafer 模式创建——dom 模式控制组零改动。
++const seedCrossSourceProbeNode = async (page, canvasStoreSpec) => {
++  const moduleSpec = await canvasStoreSpec()
++  await page.evaluate(async (spec) => {
++    const { useCanvasStore } = await import(spec)
++    useCanvasStore.getState().addMarkupNode('note', { x: -40, y: 260 }, { width: 160, height: 96 })
++  }, moduleSpec)
++}
++
++/** leafer 模式的证据集合：shell 观测属性 + store 节点(带独立 DOM 壳标注) +
++ *  单点真实像素锚定。取代原来对仅 DEV 暴露的调试全局的读取。 */
++const sampleLeaferEvidence = async (page) => {
++  const shellStats = await readShellStats(page)
++  const storeNodesRaw = await listStoreNodes(page, { limit: SAMPLE_NODE_LIMIT })
++  const storeNodes = []
++  for (const entry of storeNodesRaw) {
++    const projected = await projectedScreenRectForNode(page, entry.id)
++    const domRect = entry.hasDomShell ? await readDomRect(page, entry.id) : null
++    storeNodes.push({ id: entry.id, type: entry.type, hasDomShell: entry.hasDomShell, projected, domRect })
++  }
++  // 像素锚定的候选**只能**是没有 DOM 壳的真画节点(image/frame):有 DOM 壳的节点已由
++  // assertCrossSourceConsistency 用真实 DOMRect 独立校验,而真画节点没有 DOM 参照,
++  // 像素是它们唯一的位置证据。**刻意不做"退化到任意节点"的兜底**——退化到 note 会让
++  // 「只有 image 投影算错」的 bug 同时躲过两道门(实测变异 G 复现)。
++  //
++  // 逐个候选试到第一个与可见画布有交集的为止:单个节点被 zoom/pan 合法移出视口是常态,
++  // 但 demo 场景的多张图不可能同时全部移出——真的全部无交集,就是投影错了,由断言侧
++  // fail-closed(candidatesTried>0 && anchored===false)。
++  const pixelCandidates = storeNodes.filter(
++    (node) => !node.hasDomShell && node.projected && node.projected.width > 4 && node.projected.height > 4,
++  )
++  let pixelAnchor = { sampleAvailable: false, nonEmpty: null, intersects: false }
++  let pixelAnchorNodeId = null
++  for (const candidate of pixelCandidates) {
++    const sampled = await sampleCanvasPixelInRect(page, candidate.projected)
++    if (sampled.intersects) {
++      pixelAnchor = sampled
++      pixelAnchorNodeId = candidate.id
++      break
++    }
++  }
++  return {
++    shellStats,
++    storeNodes,
++    pixelAnchor,
++    pixelAnchorNodeId,
++    pixelCandidatesTried: pixelCandidates.length,
++  }
++}
++
++const sampleNodes = async (page, rendererMode) => {
+   const shellBox = await page.locator('.canvas-shell').boundingBox()
+   const sample = await page.evaluate((limit) => {
+     const preferred = Array.from(
+@@ -67,12 +156,8 @@ const sampleNodes = async (page) => {
+     })
+   }, SAMPLE_NODE_LIMIT)
+   const viewport = await readViewport(page)
+-  const leafer = await page.evaluate(() => {
+-    const stats = window.__MIVO_LEAFER_SPIKE__?.getStats?.() || null
+-    const paintedNodes = window.__MIVO_LEAFER_SPIKE__?.getPaintedNodes?.().slice(0, 6) || []
+-    return { stats, paintedNodes }
+-  })
+-  return { viewport, shellBox, nodeCount: sample.length, nodes: sample, leafer }
++  const leaferEvidence = rendererMode === 'leafer' ? await sampleLeaferEvidence(page) : null
++  return { viewport, shellBox, nodeCount: sample.length, nodes: sample, leaferEvidence }
+ }
+ 
+ const wheelZoom = async (page, steps, direction) => {
+@@ -91,43 +176,65 @@ const wheelZoom = async (page, steps, direction) => {
+   await page.waitForTimeout(120)
+ }
+ 
+-const handPan = async (page, dx, dy) => {
++const handPan = async (page, deltaX, deltaY) => {
+   const shell = page.locator('.canvas-shell')
+   const box = await shell.boundingBox()
+-  const startX = box.x + box.width * 0.5
+-  const startY = box.y + box.height * 0.5
+-  await page.mouse.move(startX, startY)
+-  await page.mouse.down()
+-  await page.mouse.move(startX + dx, startY + dy, { steps: 12 })
+-  await page.mouse.up()
++  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
++  // pan 走裸滚轮(useViewport.ts handleWheel 的无 ctrl/meta 分支:
++  // x: current.x - deltaX, y: current.y - deltaY),与 wheelZoom 的 Ctrl+滚轮是
++  // 两套完全不同的手势(markup-text-overlay.mjs 场景同款"滚轮=pan,Ctrl+滚轮
++  // 才是zoom"注释)。此前用左键点击拖拽:默认 select 工具下空白区左键拖拽触发
++  // 的是选框(beginSelection),不是 pan——viewport 实测恒不变,是本次改造顺带
++  // 发现并修的一个测试手势 bug,不是本 SC 的正题但会让 pan 断言必然失败。
++  await page.mouse.wheel(deltaX, deltaY)
+   await page.waitForTimeout(120)
+ }
+ 
+-const probeSequence = async (page, labelPrefix) => {
++const probeSequence = async (page, labelPrefix, rendererMode) => {
+   const results = []
+   // Baseline at default viewport (scale ~1 after load).
+-  results.push({ label: `${labelPrefix}-baseline`, ...(await sampleNodes(page)) })
++  results.push({ label: `${labelPrefix}-baseline`, ...(await sampleNodes(page, rendererMode)) })
+   // Zoom in twice.
+   await wheelZoom(page, 4, 1)
+-  results.push({ label: `${labelPrefix}-zoom-in-1`, ...(await sampleNodes(page)) })
++  results.push({ label: `${labelPrefix}-zoom-in-1`, ...(await sampleNodes(page, rendererMode)) })
+   await wheelZoom(page, 6, 1)
+-  results.push({ label: `${labelPrefix}-zoom-in-2`, ...(await sampleNodes(page)) })
++  results.push({ label: `${labelPrefix}-zoom-in-2`, ...(await sampleNodes(page, rendererMode)) })
+   // Zoom out toward small scale.
+   await wheelZoom(page, 12, -1)
+-  results.push({ label: `${labelPrefix}-zoom-out`, ...(await sampleNodes(page)) })
++  results.push({ label: `${labelPrefix}-zoom-out`, ...(await sampleNodes(page, rendererMode)) })
+   // Pan at this zoom.
+-  await handPan(page, 160, -100)
+-  results.push({ label: `${labelPrefix}-pan`, ...(await sampleNodes(page)) })
++  await handPan(page, PAN_DELTA_X, PAN_DELTA_Y)
++  results.push({ label: `${labelPrefix}-pan`, ...(await sampleNodes(page, rendererMode)) })
+   return results
+ }
+ 
++const serializeLeaferEvidence = (evidence) => {
++  if (!evidence) return null
++  return {
++    shellStats: evidence.shellStats,
++    pixelAnchor: evidence.pixelAnchor,
++    pixelAnchorNodeId: evidence.pixelAnchorNodeId,
++    storeNodes: evidence.storeNodes.map((node) => ({
++      id: node.id,
++      type: node.type,
++      hasDomShell: node.hasDomShell,
++      projected: node.projected
++        ? { x: round(node.projected.x), y: round(node.projected.y), width: round(node.projected.width), height: round(node.projected.height) }
++        : null,
++      domRect: node.domRect
++        ? { x: round(node.domRect.x), y: round(node.domRect.y), width: round(node.domRect.width), height: round(node.domRect.height) }
++        : null,
++    })),
++  }
++}
++
+ const serialize = (results) =>
+   results.map((r) => ({
+     label: r.label,
+     viewport: r.viewport,
+     shellBox: r.shellBox,
+     nodeCount: r.nodeCount,
+-    leafer: r.leafer,
++    leaferEvidence: serializeLeaferEvidence(r.leaferEvidence),
+     nodes: (r.nodes || []).map((node) => ({
+       id: node.id,
+       sampleKind: node.sampleKind,
+@@ -140,12 +247,150 @@ const serialize = (results) =>
+     })),
+   }))
+ 
++// zoom-in-1.scale > baseline.scale > ... > zoom-out.scale;pan 前后 scale 近似
++// 不变,x/y 至少一项按拖拽方向(dx=160 右, dy=-100 上)变化。dpr1/dpr2、dom/leafer
++// 四组都跑这条——viewport 模型与 renderer 无关,不应只在 leafer 模式下验证。
++const assertViewportProgression = (results, label) => {
++  const byStage = Object.fromEntries(results.map((r) => [r.label.slice(r.label.indexOf('-') + 1), r]))
++  const baseline = byStage.baseline?.viewport
++  const zoomIn1 = byStage['zoom-in-1']?.viewport
++  const zoomIn2 = byStage['zoom-in-2']?.viewport
++  const zoomOut = byStage['zoom-out']?.viewport
++  const pan = byStage.pan?.viewport
++  if (!baseline || !zoomIn1 || !zoomIn2 || !zoomOut || !pan) {
++    throw new Error(`Coordinate probe framework check failed: ${label} missing stage results for viewport progression check`)
++  }
++  if (!(zoomIn1.scale > baseline.scale)) {
++    throw new Error(`Coordinate probe framework check failed: ${label} zoom-in-1.scale(${zoomIn1.scale}) not > baseline.scale(${baseline.scale})`)
++  }
++  if (!(zoomIn2.scale > zoomIn1.scale)) {
++    throw new Error(`Coordinate probe framework check failed: ${label} zoom-in-2.scale(${zoomIn2.scale}) not > zoom-in-1.scale(${zoomIn1.scale})`)
++  }
++  if (!(zoomOut.scale < zoomIn2.scale)) {
++    throw new Error(`Coordinate probe framework check failed: ${label} zoom-out.scale(${zoomOut.scale}) not < zoom-in-2.scale(${zoomIn2.scale})`)
++  }
++  const scaleDrift = Math.abs(pan.scale - zoomOut.scale)
++  if (scaleDrift > 0.01) {
++    throw new Error(`Coordinate probe framework check failed: ${label} pan.scale(${pan.scale}) drifted from zoom-out.scale(${zoomOut.scale}) by ${scaleDrift}`)
++  }
++  // pan 必须验**方向**,不能只验"动过"。方向真相源是生产的 handleWheel 无 ctrl 分支
++  // (useViewport.ts): `x: current.x - deltaX, y: current.y - deltaY`。本场景
++  // handPan(PAN_DELTA_X=160, PAN_DELTA_Y=-100) 经 page.mouse.wheel 落到该公式,故:
++  //   dx 应 == -PAN_DELTA_X = -160(负)
++  //   dy 应 == -PAN_DELTA_Y = +100(正)
++  // 只查 `Math.abs(dx)<1 && Math.abs(dy)<1`(旧写法)仅能捕获"两轴都没动",符号反转
++  // (如生产误写成 current.x + deltaX)会被放行——Greptile Issue 1 实测指出,该弱化是
++  // 本 PR 前一轮修 pan 手势时把方向假设改错后顺手删掉方向检查造成的,此处补回。
++  const dx = pan.x - zoomOut.x
++  const dy = pan.y - zoomOut.y
++  const expectedDx = -PAN_DELTA_X
++  const expectedDy = -PAN_DELTA_Y
++  if (Math.sign(dx) !== Math.sign(expectedDx) || Math.abs(dx) < 1) {
++    throw new Error(
++      `Coordinate probe framework check failed: ${label} pan x moved wrong way — `
++      + `expected sign(${expectedDx}) with |dx|>=1, got dx=${dx}`,
++    )
++  }
++  if (Math.sign(dy) !== Math.sign(expectedDy) || Math.abs(dy) < 1) {
++    throw new Error(
++      `Coordinate probe framework check failed: ${label} pan y moved wrong way — `
++      + `expected sign(${expectedDy}) with |dy|>=1, got dy=${dy}`,
++    )
++  }
++}
++
++// leafer 模式的证据交叉验证:同一节点的 screenRect(真实 DOM boundingClientRect)
++// 与 store×viewport 投影必须在容差内一致。只对"仍有独立 DOM 壳"的节点有意义——
++// 两者同源自证不构成验证(issue #559 明确指出的问题)。至少要有过一次比较,否则
++// 视为该检查本轮从未真正跑过,不允许静默判过。
++const assertCrossSourceConsistency = (allStageResults, label) => {
++  let comparisons = 0
++  for (const stage of allStageResults) {
++    for (const node of stage.leaferEvidence?.storeNodes || []) {
++      if (!node.hasDomShell || !node.domRect || !node.projected) continue
++      comparisons += 1
++      const dx = Math.abs(node.domRect.x - node.projected.x)
++      const dy = Math.abs(node.domRect.y - node.projected.y)
++      // 也要比宽高——只查 x/y 会漏掉"位置对、尺寸错"的渲染回归(codex-adversarial
++      // R1 F2 实测指出:note 壳原点不动但被错误缩放到别的宽高,旧版每个 DPR 阶段都会
++      // 放行)。
++      const dw = Math.abs(node.domRect.width - node.projected.width)
++      const dh = Math.abs(node.domRect.height - node.projected.height)
++      if (dx > CROSS_SOURCE_TOLERANCE_PX || dy > CROSS_SOURCE_TOLERANCE_PX || dw > CROSS_SOURCE_TOLERANCE_PX || dh > CROSS_SOURCE_TOLERANCE_PX) {
++        throw new Error(
++          `Coordinate probe cross-source mismatch: ${label} node ${node.id} at ${stage.label} `
++          + `domRect(${node.domRect.x},${node.domRect.y},${node.domRect.width}x${node.domRect.height}) vs `
++          + `projected(${node.projected.x},${node.projected.y},${node.projected.width}x${node.projected.height}) `
++          + `diverge by (${round(dx)}, ${round(dy)}, ${round(dw)}, ${round(dh)})px`,
++        )
++      }
++    }
++  }
++  if (comparisons === 0) {
++    throw new Error(`Coordinate probe framework check failed: ${label} cross-source consistency check had zero comparable nodes (seed node missing DOM shell in every stage)`)
++  }
++}
++
++// 像素锚定必须**逐阶段**断言,不能只查 baseline:只在 zoom/pan/DPR2 下画错位置或没画
++// 的回归,数据虽已逐阶段采集却不会让测试失败(Greptile Issue 2 指出;与本文件既有的
++// 「采了但没断言」同一形态)。
++//
++// 关键:**每个有候选的阶段都必须成功锚定**,不允许"这一阶段没锚上但别的阶段锚上了就算过"。
++// 旧实现用「投影中心是否在画布内」放过越界阶段 + 全局 asserted>=1 收口,被实测变异 G
++// 击穿:只让 image 在非 baseline 阶段偏移 99999px(note 与 baseline 都不受影响),三道
++// 检查全部放行——交叉验证只看有 DOM 壳的 note、baseline 硬断言只看 scale=1、其余阶段
++// 因"越界"被跳过。现在判据换成矩形与画布的交集,且候选耗尽即 fail-closed。
++const assertPixelAnchorAcrossStages = (allStageResults, label) => {
++  let anchoredStages = 0
++  for (const stage of allStageResults) {
++    const evidence = stage.leaferEvidence
++    if (!evidence) continue
++    const anchor = evidence.pixelAnchor
++    const tried = evidence.pixelCandidatesTried ?? 0
++    // 该阶段一个真画候选都没有(如场景本身没有 image/frame)→ 无判据,不苛求。
++    if (tried === 0) continue
++    // 有候选却没有任何一个与可见画布相交 → 投影把整批真画节点都甩出了画布。
++    // 合法的 zoom/pan 只会移出其中一部分,不可能全部——这里必须红。
++    if (!anchor?.intersects) {
++      throw new Error(
++        `Coordinate probe framework check failed: ${label} no painted node intersects the visible canvas at `
++        + `${stage.label} (tried ${tried} candidate(s)) —— 投影疑似把整批真画节点算到画布外`,
++      )
++    }
++    if (!anchor.sampleAvailable) {
++      throw new Error(
++        `Coordinate probe framework check failed: ${label} pixel anchor unavailable at ${stage.label} `
++        + `(node=${evidence.pixelAnchorNodeId ?? 'n/a'}, ${JSON.stringify(anchor)})`,
++      )
++    }
++    if (anchor.nonEmpty !== true) {
++      throw new Error(
++        `Coordinate probe framework check failed: ${label} pixel anchor empty at ${stage.label} `
++        + `— Leafer 未在投影矩形与画布的交集中心绘制任何非透明像素 `
++        + `(node=${evidence.pixelAnchorNodeId ?? 'n/a'})`,
++      )
++    }
++    anchoredStages += 1
++  }
++  if (anchoredStages === 0) {
++    throw new Error(
++      `Coordinate probe framework check failed: ${label} pixel anchor was never asserted in any stage`
++      + `——该检查本轮无判据,不允许静默通过`,
++    )
++  }
++}
++
+ export const runCoordinateProbeScenario = async (context) => {
+-  const { page, browser, canvasUrl, baseUrl } = context
++  const { page, browser, canvasUrl, baseUrl, rendererMode, kernelMode, isProdTopology, canvasStoreSpec } = context
++  const topology = isProdTopology ? 'prod' : 'dev'
+   const fs = await import('node:fs/promises')
+   const path = await import('node:path')
+ 
+-  const dpr1Results = await probeSequence(page, 'dpr1')
++  if (rendererMode === 'leafer') {
++    await seedCrossSourceProbeNode(page, canvasStoreSpec)
++  }
++
++  const dpr1Results = await probeSequence(page, 'dpr1', rendererMode)
+ 
+   // DPR 2 probe (new context; subset to keep runtime bounded).
+   let dpr2Results = []
+@@ -155,23 +400,56 @@ export const runCoordinateProbeScenario = async (context) => {
+     // 本场景自建 context,harness.mjs 里挂的 context 级 pageerror 观测覆盖不到这里——
+     // 单独补挂(见 browser-error-guard.mjs)。
+     attachPageErrorObserver(dpr2Context)
++    // createSmokePage 给主 context 挂的两个 addInitScript(E2E 桥开关 + 首登缺 key
++    // 自动弹设置面板的抑制开关)只在那个 context 生效——这里是 browser.newContext()
++    // 新开的一份,不会继承。缺了抑制开关时,AutoPromptSettings 会在空 storage 的
++    // 新 context 上把 Settings 面板弹出来盖在画布正中心,吞掉这里要测的
++    // wheel/pan 手势(2026-08 实测:1920 宽视口下面板恰好居中覆盖,zoom/pan 断言
++    // 恒得到零位移——这是本次改造新增了"真的断言 viewport 变化"才第一次暴露的
++    // 既有测试缺口,过去只查 dpr2Error+nodeCount,从未验证过交互是否生效)。
++    await dpr2Context.addInitScript(() => {
++      window.__MIVO_E2E_ENABLED__ = true
++      window.__MIVO_E2E_DISABLE_AUTO_PROMPT__ = true
++    })
++    // leafer 模式要在 dpr2Page 上用 canvasStore 直建交叉验证种子节点(见下方
++    // seedCrossSourceProbeNode)——prod 拓扑下 /src/store/canvasStore.ts 不是真实
++    // 静态文件,需要同一份 route 拦截桥(与主 context 的 enableStoreBridgeModules
++    // 同一实现,见 harness.mjs)。dev 拓扑下 vite 直接服务源码,不需要也不应该装。
++    if (rendererMode === 'leafer' && isProdTopology) {
++      await installE2EStoreBridge(dpr2Context)
++    }
+     const dpr2Page = await dpr2Context.newPage()
+     await dpr2Page.emulateMedia({ reducedMotion: 'reduce' })
+     await dpr2Page.goto(canvasUrl || baseUrl, { waitUntil: 'networkidle' })
+     await dpr2Page.addStyleTag({ content: '*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important;}' })
+     await dpr2Page.waitForSelector('.canvas-shell')
+-    if (context.rendererMode === 'leafer') {
++    if (rendererMode === 'leafer') {
+       await dpr2Page.waitForFunction(() => {
+         const shell = document.querySelector('.canvas-shell')
+         const expected = Number(shell?.getAttribute('data-leafer-expected-children') || 0)
+         const children = Number(shell?.getAttribute('data-leafer-children') || 0)
+         return expected > 0 && children === expected && shell?.getAttribute('data-leafer-pixel-nonempty') === 'true'
+       }, { timeout: 15000 })
++      // dpr2 是独立 context/page,自己的 store 是一份新实例——交叉验证种子节点
++      // 也要在这份新 page 上单独补种,不能复用 dpr1 page 上已建的那个。
++      const dpr2StoreSpec = () =>
++        dpr2Page.evaluate(() => {
++          // 精确匹配同源 + pathname + initiatorType(见 renderer-evidence.mjs 同款注释)。
++          const resource = performance.getEntriesByType('resource').find((entry) => {
++            if (entry.initiatorType !== 'script') return false
++            try {
++              const url = new URL(entry.name)
++              return url.origin === location.origin && url.pathname === '/src/store/canvasStore.ts'
++            } catch { return false }
++          })
++          return resource ? new URL(resource.name).pathname + new URL(resource.name).search : '/src/store/canvasStore.ts'
++        })
++      await seedCrossSourceProbeNode(dpr2Page, dpr2StoreSpec)
+     } else {
+       await dpr2Page.waitForSelector('img[src="/demo-assets/courage-1.jpg"]')
+     }
+     await dpr2Page.waitForTimeout(300)
+-    dpr2Results = await probeSequence(dpr2Page, 'dpr2')
++    dpr2Results = await probeSequence(dpr2Page, 'dpr2', rendererMode)
+     await dpr2Context.close()
+   } catch (error) {
+     dpr2Error = error instanceof Error ? error.message : String(error)
+@@ -179,10 +457,17 @@ export const runCoordinateProbeScenario = async (context) => {
+ 
+   const artifact = {
+     protocol: {
++      schema: SCHEMA_VERSION,
+       scenario: 'coordinate-probe',
+-      renderer: context.rendererMode,
++      topology,
++      renderer: rendererMode,
++      kernel: kernelMode,
+       dprValues: [1, 2],
+-      note: 'text/connector 等非 Leafer 真画节点两模式都走 DOM；坐标应逐像素一致。Leafer 模式额外记录真画节点 probe rect。',
++      note: 'text/connector 等非 Leafer 真画节点两模式都走 DOM，坐标应逐像素一致。'
++        + 'leafer 模式的真画节点(image/frame)没有 DOM 镜像，证据改走 data-leafer-* 观测'
++        + '属性 + canvasStore 几何投影 + 单点真实像素锚定，不再依赖仅 DEV 暴露的调试'
++        + '全局。data-leafer-pixel-nonempty 在 prod 下恒为 true(不做真实扫描)，不作为'
++        + '证据来源，仅用于 waitForFunction 就绪判断。',
+       sampleNodeLimit: SAMPLE_NODE_LIMIT,
+     },
+     dpr1: serialize(dpr1Results),
+@@ -191,17 +476,41 @@ export const runCoordinateProbeScenario = async (context) => {
+ 
+   const artifactDir = path.resolve(process.cwd(), 'test-artifacts')
+   await fs.mkdir(artifactDir, { recursive: true })
+-  const artifactFile = `coordinate-probe-${context.rendererMode}.json`
++  const artifactFile = `coordinate-probe-${topology}-${rendererMode}-${kernelMode}.json`
+   await fs.writeFile(path.join(artifactDir, artifactFile), `${JSON.stringify(artifact, null, 2)}\n`)
+ 
+-  // Framework self-check: baseline DPR=1 must sample >=3 nodes and have a non-zero viewport scale.
++  // Framework self-check: baseline DPR=1 must have real evidence of painted content.
+   const baseline = dpr1Results[0]
+-  const leaferPaintedCount = baseline?.leafer?.stats?.children || 0
+-  if (!baseline || (baseline.nodeCount < 3 && leaferPaintedCount < 3)) {
+-    throw new Error(
+-      `Coordinate probe framework check failed: expected >=3 sampled DOM nodes or Leafer painted nodes at DPR=1 baseline, `
+-      + `got dom=${baseline?.nodeCount ?? 0} leafer=${leaferPaintedCount}`,
++  if (!baseline) {
++    throw new Error('Coordinate probe framework check failed: no DPR=1 baseline result')
++  }
++  if (rendererMode === 'leafer') {
++    const stats = baseline.leaferEvidence?.shellStats
++    if (!stats || stats.expectedChildren <= 0 || stats.children !== stats.expectedChildren) {
++      throw new Error(
++        `Coordinate probe framework check failed: leafer shell stats not settled at DPR=1 baseline, `
++        + `got expectedChildren=${stats?.expectedChildren ?? 0} children=${stats?.children ?? 0}`,
++      )
++    }
++    if (!stats.syncVersion || stats.syncVersion <= 0) {
++      throw new Error(`Coordinate probe framework check failed: leafer syncVersion not advanced (${stats.syncVersion})`)
++    }
++    const validStoreNodeIds = new Set(
++      (baseline.leaferEvidence?.storeNodes || [])
++        .filter((node) => node.projected && Number.isFinite(node.projected.x) && Number.isFinite(node.projected.y))
++        .map((node) => node.id),
+     )
++    if (validStoreNodeIds.size < 3) {
++      throw new Error(`Coordinate probe framework check failed: expected >=3 unique store-backed node rects at DPR=1 baseline, got ${validStoreNodeIds.size}`)
++    }
++    // baseline 这一格是硬要求(此刻节点必然在视口内,没有"界外"借口可用);其余阶段
++    // 由下方 assertPixelAnchorAcrossStages 逐阶段覆盖。
++    const anchor = baseline.leaferEvidence?.pixelAnchor
++    if (!anchor?.sampleAvailable || anchor.nonEmpty !== true) {
++      throw new Error(`Coordinate probe framework check failed: leafer pixel anchor not confirmed non-empty at DPR=1 baseline (${JSON.stringify(anchor)})`)
++    }
++  } else if (baseline.nodeCount < 3) {
++    throw new Error(`Coordinate probe framework check failed: expected >=3 sampled DOM nodes at DPR=1 baseline, got dom=${baseline.nodeCount}`)
+   }
+   if (!baseline.viewport.scale || baseline.viewport.scale <= 0) {
+     throw new Error(`Coordinate probe framework check failed: viewport scale not reported (${baseline.viewport.scale})`)
+@@ -209,4 +518,14 @@ export const runCoordinateProbeScenario = async (context) => {
+   if (dpr2Error) {
+     throw new Error(`Coordinate probe DPR=2 context failed: ${dpr2Error}`)
+   }
++
++  assertViewportProgression(dpr1Results, 'dpr1')
++  assertViewportProgression(dpr2Results, 'dpr2')
++
++  if (rendererMode === 'leafer') {
++    assertCrossSourceConsistency(dpr1Results, 'dpr1')
++    assertCrossSourceConsistency(dpr2Results, 'dpr2')
++    assertPixelAnchorAcrossStages(dpr1Results, 'dpr1')
++    assertPixelAnchorAcrossStages(dpr2Results, 'dpr2')
++  }
+ }

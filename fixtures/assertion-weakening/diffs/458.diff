@@ -1,0 +1,692 @@
+diff --git a/main.js b/main.js
+index cdf8dd17..f942d49e 100644
+--- a/main.js
++++ b/main.js
+@@ -57,6 +57,7 @@ const DIAG_SOURCE = {
+   card: 'Brain Card',
+   notify: 'Brain Notify',
+   deposit: 'Brain Deposit',
++  release: 'Brain Release',
+   session: 'Brain Session',
+   // #297 P3-13:面板关闭写入降级(presence 探测 / 队列入队 / 对账)。
+   defer: 'Brain Defer',
+@@ -4561,6 +4562,11 @@ const DEPOSIT_RETAIN_GENERATIONS = 3
+ // fail-visible 警告,从不据此主动删除任何一条尚未证明安全的记录(B3 三审)。
+ const DEPOSIT_RELEASED_FLOOR_MAX_ENTRIES = 2000
+ const depositInflight = new Set()
++// release-media 的 reqId 去重表(与 depositInflight 同语义、各自维护,设计稿 §4.10.1)。
++// 面板侧已经按 hash 做过 single-flight(depositPort.ts releaseHash),这里只处理
++// 「同一 reqId 因未收到回执而重发」这一种情形,不做跨 reqId 的 hash 级合并
++// ——那是面板侧的职责,电子脑侧继续只认 reqId(与 deposit 一致的分层)。
++const releaseInflight = new Set()
+ 
+ /**
+  * SC10.0/SC10.1(十轮定案——单写者架构):main.js 是宿主级单例(多窗口/多会话共享
+@@ -4867,6 +4873,58 @@ function handleDepositMedia(msg) {
+   })()
+ }
+ 
++/**
++ * release-media(T1a 基建;设计稿 §4.10.1):把面板已确认无引用的寄存物指纹交给
++ * 宿主 release_media 还回配额。入参只有 `hash`——不需要 label / callId(与宿主
++ * API 形状一致)。`released:false`(该指纹本就无引用)不是失败,原样透传给面板,
++ * 由 depositPort.ts 的 releaseHash 判「ok:true 即成功」。
++ */
++function handleReleaseMedia(msg) {
++  if (completed.has(msg.reqId)) {
++    diagSkip(DIAG_SOURCE.release, 'release 请求重放: 已完成, 回放缓存回执(后续重发不再逐条记)', msg.reqId)
++    channel.postMessage(completed.get(msg.reqId))
++    return
++  }
++  if (releaseInflight.has(msg.reqId)) {
++    diagSkip(DIAG_SOURCE.release, 'release 请求重发: 仍在途, 已忽略(后续重发不再逐条记)', msg.reqId)
++    return
++  }
++  releaseInflight.add(msg.reqId)
++  void (async () => {
++    let reply
++    try {
++      const hash = typeof msg.hash === 'string' ? msg.hash : ''
++      if (!MEDIA_HASH_RE.test(hash)) {
++        reply = { reqId: msg.reqId, reply: true, ok: false, message: '缺少合法的释放目标 hash' }
++        diagSkip(DIAG_SOURCE.release, 'release 前置拦截: hash 不合法, 未发请求')
++      } else {
++        const r = await hostSend({ type: 'cindy-request', kind: 'release_media', hash })
++        if (r && r.ok) {
++          reply = {
++            reqId: msg.reqId, reply: true, ok: true,
++            released: Boolean(r.released),
++            quotaUsedBytes: Number.isFinite(r.quotaUsedBytes) ? r.quotaUsedBytes : undefined,
++            quotaLimitBytes: Number.isFinite(r.quotaLimitBytes) ? r.quotaLimitBytes : undefined,
++          }
++          diagOk(DIAG_SOURCE.release, 'release 完成: hash=' + diagHash8(hash) + ' released=' + (reply.released ? 'yes' : 'no(no-op)'))
++        } else {
++          // 宿主不给稳定 errorCode(同 deposit_media,设计稿 §4.1/§11-③ 已解):失败分类
++          // 只能靠 message 文本,不透传 r.code(从来是 undefined)。
++          reply = { reqId: msg.reqId, reply: true, ok: false, message: (r && r.message) || 'release 失败' }
++          diagFail(DIAG_SOURCE.release, 'release 失败: 宿主回执不成功 ' + diagReason(reply.message))
++        }
++      }
++    } catch (error) {
++      reply = { reqId: msg.reqId, reply: true, ok: false, message: String((error && error.message) || error) }
++      diagFail(DIAG_SOURCE.release, 'release 异常: ' + diagReason(reply.message))
++    }
++    releaseInflight.delete(msg.reqId)
++    completed.set(msg.reqId, reply)
++    if (completed.size > 64) completed.delete(completed.keys().next().value)
++    channel.postMessage(reply)
++  })()
++}
++
+ // 恢复语义(设计稿 §4.4.2/§4.4.3,十一轮改写):候选发现 + 校验全部是**纯读**
+ // (无写、无锁)。规则:① 对 deposit/ 做一次有界 list;② 候选 = 全部**有效**的
+ // `state-<gen>-<writer>.json`(有效 = JSON 可解析、`sum` 与 `payload` 重算一致、且
+@@ -5973,6 +6031,10 @@ channel.onmessage = (event) => {
+     handleDepositMedia(msg) // 秒级但同样不进 chain:堵住 chain 会拖慢自动保存
+     return
+   }
++  if (msg.kind === 'release-media') {
++    handleReleaseMedia(msg) // 同 deposit:秒级、不进 chain(设计稿 §4.10.6 顺序硬约束)
++    return
++  }
+   chain = chain.then(async () => {
+     if (completed.has(msg.reqId)) {
+       diagSkip(DIAG_SOURCE.persist, msg.kind + ' 请求重放: 已完成, 回放缓存回执(后续重发不再逐条记)', msg.reqId)
+@@ -6383,6 +6445,10 @@ if (seam && typeof seam.expose === 'function') {
+       // (`state-<gen>-<writer>.json`)要用它,不能再假设/硬编码某个值。
+       writer: DEPOSIT_WRITER,
+     },
++    release: {
++      media: handleReleaseMedia,
++      inflightCount: () => releaseInflight.size,
++    },
+     session: {
+       handle: handleSessionEvent,
+       last: () => lastSessionSignal,
+diff --git a/src/__tests__/brainHarness.ts b/src/__tests__/brainHarness.ts
+index 5a923ffe..5b05e599 100644
+--- a/src/__tests__/brainHarness.ts
++++ b/src/__tests__/brainHarness.ts
+@@ -389,6 +389,13 @@ export type BrainDepositHandles = {
+   writer: string
+ }
+ 
++/** T1a 基建:release-media 的内部句柄(设计稿 §4.10.1)。 */
++export type BrainReleaseHandles = {
++  media: (msg: unknown) => void
++  /** reqId 级去重表的当前在途数(同 deposit.inflightCount 语义)。 */
++  inflightCount: () => number
++}
++
+ /** subscribe 槽会话事件(#297 R11a)。信号形状与共享层 BindingSignal 一致。 */
+ export type BrainSessionSignal = {
+   scopeToken: string
+@@ -512,6 +519,7 @@ export type BrainHandles = {
+   exportTool: BrainExportHandles
+   safeArgs: BrainSafeArgsHandles
+   deposit: BrainDepositHandles
++  release: BrainReleaseHandles
+   session: BrainSessionHandles
+   defer: BrainDeferHandles
+   fs: BrainFsHandles
+diff --git a/src/__tests__/depositFlagOff.test.ts b/src/__tests__/depositFlagOff.test.ts
+index 16ff04df..af9f10ba 100644
+--- a/src/__tests__/depositFlagOff.test.ts
++++ b/src/__tests__/depositFlagOff.test.ts
+@@ -3,7 +3,8 @@
+  *
+  * 证明手段(不靠「看着没变」):
+  *  ① 不在账下的源图 → 抛**与本 PR 之前逐字一致**的现状文案(字符串锁);
+- *  ② 全程零 `deposit-media` / `deposit-state-*` 消息(桥 postMessage 全量记账);
++ *  ② 全程零 `deposit-media` / `deposit-state-*` / `release-media` 消息(桥
++ *    postMessage 全量记账,双 spy 统一判据见 `isDepositOrReleaseKind`);
+  *  ③ 全程 depositStore 从未被 load(模块内存态仍为 null)——连一次多余的读盘都没有;
+  *  ④ ledger 读写调用序列与现状一致:只有一次 `GET /kv`;
+  *  ⑤ 正向对照:在账下的源图照旧发出 `edit-image` 且 hashes 取自 ledger,
+@@ -46,6 +47,17 @@ const LEDGER_HASH = 'c'.repeat(32)
+ 
+ type Posted = Record<string, unknown>
+ 
++/**
++ * T1a 基建之后本组升级为**双 spy**:release-media 与 deposit-media 是两个独立的
++ * kind 前缀,`startsWith('deposit')` 单独一条挡不住一次误发的 release 请求。
++ * flag 关期间(T1a~T1e 暗段执行纪律 4)两者必须同时为零,这里统一成一个判据,
++ * 避免两份筛选条件各自维护后来漂移。
++ */
++const isDepositOrReleaseKind = (message: Posted): boolean => {
++  const kind = String(message.kind)
++  return kind.startsWith('deposit') || kind.startsWith('release')
++}
++
+ const posted: Posted[] = []
+ const fetched: string[] = []
+ const replyForNextRequest: Record<string, unknown> = { ok: false, message: '测试短路' }
+@@ -118,7 +130,7 @@ describe('flag 关 — 现状路径逐字节不变', () => {
+     ).rejects.toThrow(LEGACY_MESSAGE)
+ 
+     // 零 deposit 传输
+-    expect(posted.filter((message) => String(message.kind).startsWith('deposit'))).toHaveLength(0)
++    expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
+     // depositStore 一次都没读盘(连 load 都没发生)
+     expect(peekDepositStoreForTests()).toBeNull()
+     // ledger 读序列:只有一次 GET /kv
+@@ -146,7 +158,7 @@ describe('flag 关 — 现状路径逐字节不变', () => {
+       }),
+     ).rejects.toThrow(LEGACY_MESSAGE)
+ 
+-    expect(posted.filter((message) => String(message.kind).startsWith('deposit'))).toHaveLength(0)
++    expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
+     expect(peekDepositStoreForTests()).toBeNull()
+   })
+ 
+@@ -163,7 +175,7 @@ describe('flag 关 — 现状路径逐字节不变', () => {
+     const editRequests = posted.filter((message) => message.kind === 'edit-image')
+     expect(editRequests).toHaveLength(1)
+     expect(editRequests[0]).toMatchObject({ kind: 'edit-image', prompt: '换个颜色', hashes: [LEDGER_HASH] })
+-    expect(posted.filter((message) => String(message.kind).startsWith('deposit'))).toHaveLength(0)
++    expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
+     expect(peekDepositStoreForTests()).toBeNull()
+   })
+ 
+@@ -204,7 +216,7 @@ describe('mask 门禁次序不变量(R8-H 边界,与 flag 无关)', () => {
+     await expect(promise).rejects.not.toThrow(LEGACY_MESSAGE)
+ 
+     // 次序正确时连源图兑换都没进 → 任何形态的寄存/改图请求都不该发出
+-    expect(posted.filter((message) => String(message.kind).startsWith('deposit'))).toHaveLength(0)
++    expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
+     expect(posted.filter((message) => message.kind === 'edit-image')).toHaveLength(0)
+   })
+ })
+diff --git a/src/__tests__/depositTestHarness.ts b/src/__tests__/depositTestHarness.ts
+index 32405da3..1ab4f6b2 100644
+--- a/src/__tests__/depositTestHarness.ts
++++ b/src/__tests__/depositTestHarness.ts
+@@ -4,6 +4,10 @@
+  *   depositPort → 假传输 → 真 main.js handler → 假宿主 cindy.send → 回执 →
+  *   depositStore → 真 main.js 槽 + 指针提交 → 假 fs
+  * 不另造一套协议替身,避免「替身与真源码漂移」。
++ *
++ * T1a 基建:双 spy——`hostRequests`(deposit_media)与 `hostReleaseRequests`
++ * (release_media)各自独立记账,T1a~T1e 暗段的下游测试(以及后续段)靠两份
++ * 一起断言「正常路径零 deposit/release 请求」(执行纪律 4)。
+  */
+ import { loadBrain, type FsRequest, type LoadedBrain } from './brainHarness'
+ import type { PersistReply } from '../persist/bridge'
+@@ -25,16 +29,34 @@ export type FakeHostReply = {
+   quotaLimitBytes?: number
+ }
+ 
++/** T1a 基建:release_media 的假宿主回执(设计稿 §4.10.1)。 */
++export type FakeHostReleaseReply = {
++  ok: boolean
++  released?: boolean
++  message?: string
++  quotaUsedBytes?: number
++  quotaLimitBytes?: number
++}
++
+ export const FAKE_HASH = 'b'.repeat(32)
+ 
+ export type DepositHarness = {
+   brain: LoadedBrain
+   /** 经 cindy.send 到宿主的 deposit_media 请求(计数用:断言「零寄存请求」）。 */
+   hostRequests: Array<Record<string, unknown>>
++  /**
++   * 双 spy 之二(T1a 基建):经 cindy.send 到宿主的 release_media 请求。T1a~T1e
++   * 暗段期间,消费方(depositPort/depositBrain 等测试)与后续段(T1b-T1e)都靠
++   * 这一份 + 上面 `hostRequests` 一起断言「正常路径零 deposit/release 请求」
++   * (执行纪律 4)。
++   */
++  hostReleaseRequests: Array<Record<string, unknown>>
+   /** 电子脑落盘请求(断言介质隔离:deposit/ 之外一个不碰)。 */
+   fsRequests: FsRequest[]
+   /** 让下一次宿主寄存回执按需变化。 */
+   setHostReply: (reply: (payload: Record<string, unknown>) => FakeHostReply) => void
++  /** 让下一次宿主释放回执按需变化。 */
++  setHostReleaseReply: (reply: (payload: Record<string, unknown>) => FakeHostReleaseReply) => void
+ }
+ 
+ /**
+@@ -48,12 +70,17 @@ export const createDepositHarness = (
+   resetDepositPortForTests()
+ 
+   const hostRequests: Array<Record<string, unknown>> = []
++  const hostReleaseRequests: Array<Record<string, unknown>> = []
+   let hostReply: (payload: Record<string, unknown>) => FakeHostReply = () => ({
+     ok: true,
+     hash: FAKE_HASH,
+     ext: '.png',
+     bytes: 1_024,
+   })
++  let hostReleaseReply: (payload: Record<string, unknown>) => FakeHostReleaseReply = () => ({
++    ok: true,
++    released: true,
++  })
+ 
+   const brain = loadBrain({
+     files: options.files,
+@@ -65,6 +92,10 @@ export const createDepositHarness = (
+         hostRequests.push(message)
+         return hostReply(message)
+       }
++      if (message.kind === 'release_media') {
++        hostReleaseRequests.push(message)
++        return hostReleaseReply(message)
++      }
+       return { ok: true }
+     },
+   })
+@@ -81,7 +112,7 @@ export const createDepositHarness = (
+   }) as typeof import('../persist/bridge').persistRequest
+ 
+   const mediaTransport = ((kind, payload = {}) => {
+-    if (kind !== 'deposit-media') throw new Error(`depositPort 不应发出 kind=${kind}`)
++    if (kind !== 'deposit-media' && kind !== 'release-media') throw new Error(`depositPort 不应发出 kind=${kind}`)
+     seq += 1
+     const reqId = `media-${seq}`
+     return new Promise<PersistReply>((resolve) => {
+@@ -93,7 +124,8 @@ export const createDepositHarness = (
+           resolve(data)
+         }
+       }
+-      brain.handles.deposit.media({ reqId, kind: 'deposit-media', ...payload })
++      const handler = kind === 'deposit-media' ? brain.handles.deposit.media : brain.handles.release.media
++      handler({ reqId, kind, ...payload })
+     })
+   }) as typeof import('../persist/bridge').persistRequest
+ 
+@@ -103,10 +135,14 @@ export const createDepositHarness = (
+   return {
+     brain,
+     hostRequests,
++    hostReleaseRequests,
+     fsRequests: brain.fsRequests,
+     setHostReply: (reply) => {
+       hostReply = reply
+     },
++    setHostReleaseReply: (reply) => {
++      hostReleaseReply = reply
++    },
+   }
+ }
+ 
+diff --git a/src/__tests__/releaseBrain.test.ts b/src/__tests__/releaseBrain.test.ts
+new file mode 100644
+index 00000000..fb7504e2
+--- /dev/null
++++ b/src/__tests__/releaseBrain.test.ts
+@@ -0,0 +1,185 @@
++/**
++ * release_media 电子脑侧契约测试(T1a 基建;设计稿 §4.10.1)。
++ *
++ * 覆盖:
++ *  - release_media 请求形状(kind/hash)、成功回执(released:true/false 均视为成功)、
++ *    结构化配额两数透传;
++ *  - hash 前置校验(缺失/不合法格式)→ 零 cindy.send;
++ *  - reqId 重放去重与在途忽略(同 deposit_media 语义,重发绝不变成重复释放);
++ *  - 宿主 ok:false → 透传 message,不带 code(宿主不为 release_media 提供稳定码,
++ *    与 deposit_media 同一条纪律,设计稿 §4.1/§11-③)。
++ *
++ * 断言跑在真实 cindyplugin/main.js 源码上,复用 #298 X0 的 brainHarness,不自建
++ * 一套替身协议(避免「替身与真源码漂移」)。
++ */
++import { describe, expect, it } from 'vitest'
++import { flushMicrotasks, loadBrain } from './brainHarness'
++import type { LoadBrainOptions, LoadedBrain } from './brainHarness'
++
++type HostReleaseReply = {
++  ok: boolean
++  released?: boolean
++  message?: string
++  quotaUsedBytes?: number
++  quotaLimitBytes?: number
++}
++
++const HASH = 'a'.repeat(32)
++
++/** 起一个电子脑,记下 release_media 宿主请求与经 persist channel 回给面板的回执。 */
++const releaseBrain = (
++  options: { reply?: (payload: unknown) => HostReleaseReply } & Omit<LoadBrainOptions, 'send'> = {},
++) => {
++  const hostRequests: Array<Record<string, unknown>> = []
++  const brain: LoadedBrain = loadBrain({
++    ...options,
++    panelPresent: () => false,
++    send: (payload) => {
++      const message = payload as Record<string, unknown>
++      if (message.kind === 'release_media') hostRequests.push(message)
++      return options.reply ? options.reply(payload) : { ok: true, released: true }
++    },
++  })
++  const replies: Array<Record<string, unknown>> = []
++  const panel = brain.bus.open('mivo-canvas-persist')
++  panel.onmessage = (event) => {
++    const data = event.data as Record<string, unknown>
++    if (data && data.reply) replies.push(data)
++  }
++  return { brain, hostRequests, replies, panel }
++}
++
++describe('release_media — 请求形状与成功回执', () => {
++  it('按宿主契约发 cindy-request(入参只有 hash),回执带 released', async () => {
++    const { brain, hostRequests, replies } = releaseBrain({
++      reply: () => ({ ok: true, released: true, quotaUsedBytes: 512, quotaLimitBytes: 1_073_741_824 }),
++    })
++
++    brain.handles.release.media({ reqId: 'r1', kind: 'release-media', hash: HASH })
++    await flushMicrotasks()
++
++    expect(hostRequests).toHaveLength(1)
++    expect(hostRequests[0]).toEqual({ type: 'cindy-request', kind: 'release_media', hash: HASH })
++    expect(replies).toHaveLength(1)
++    expect(replies[0]).toMatchObject({
++      reqId: 'r1',
++      ok: true,
++      released: true,
++      quotaUsedBytes: 512,
++      quotaLimitBytes: 1_073_741_824,
++    })
++  })
++
++  it('released:false 视为成功,不报错不重试(设计稿 §4.10.1:该指纹本就无引用)', async () => {
++    const { brain, hostRequests, replies } = releaseBrain({ reply: () => ({ ok: true, released: false }) })
++
++    brain.handles.release.media({ reqId: 'r1', kind: 'release-media', hash: HASH })
++    await flushMicrotasks()
++
++    expect(hostRequests).toHaveLength(1)
++    expect(replies[0]).toMatchObject({ reqId: 'r1', ok: true, released: false })
++  })
++})
++
++describe('release_media — hash 前置校验(零 cindy.send)', () => {
++  it('缺 hash → 前置拦截,不发请求,不带 code', async () => {
++    const { brain, hostRequests, replies } = releaseBrain()
++
++    brain.handles.release.media({ reqId: 'r1', kind: 'release-media' })
++    await flushMicrotasks()
++
++    expect(hostRequests).toHaveLength(0)
++    expect(replies[0]).toMatchObject({ reqId: 'r1', ok: false })
++    expect(replies[0].code).toBeUndefined()
++  })
++
++  it('hash 格式不合法(过短/非 hex)→ 前置拦截,不发请求', async () => {
++    const { brain, hostRequests, replies } = releaseBrain()
++
++    brain.handles.release.media({ reqId: 'r1', kind: 'release-media', hash: 'short' })
++    await flushMicrotasks()
++
++    expect(hostRequests).toHaveLength(0)
++    expect(replies[0]).toMatchObject({ reqId: 'r1', ok: false })
++  })
++})
++
++describe('release_media — 重发去重(重发绝不变成重复释放)', () => {
++  it('同 reqId 重放回放缓存回执,不再打宿主', async () => {
++    const { brain, hostRequests, replies } = releaseBrain()
++
++    brain.handles.release.media({ reqId: 'r1', kind: 'release-media', hash: HASH })
++    await flushMicrotasks()
++    expect(hostRequests).toHaveLength(1)
++
++    brain.handles.release.media({ reqId: 'r1', kind: 'release-media', hash: HASH })
++    await flushMicrotasks()
++
++    expect(hostRequests).toHaveLength(1) // 关键:没有第二次释放
++    expect(replies).toHaveLength(2)
++    expect(replies[1]).toMatchObject({ reqId: 'r1', ok: true, released: true })
++  })
++
++  it('在途重发被忽略:只释放一次、只回一次', async () => {
++    const gate: { release?: (reply: HostReleaseReply) => void } = {}
++    const { brain, hostRequests, replies } = releaseBrain({
++      reply: () =>
++        new Promise<HostReleaseReply>((resolve) => {
++          gate.release = resolve
++        }) as unknown as HostReleaseReply,
++    })
++
++    brain.handles.release.media({ reqId: 'r1', kind: 'release-media', hash: HASH })
++    await flushMicrotasks()
++    brain.handles.release.media({ reqId: 'r1', kind: 'release-media', hash: HASH })
++    await flushMicrotasks()
++
++    expect(hostRequests).toHaveLength(1)
++    expect(brain.handles.release.inflightCount()).toBe(1)
++    expect(replies).toHaveLength(0)
++
++    gate.release?.({ ok: true, released: true })
++    await flushMicrotasks()
++    expect(replies).toHaveLength(1)
++    expect(brain.handles.release.inflightCount()).toBe(0)
++  })
++})
++
++describe('release_media — 失败矩阵', () => {
++  it('宿主 ok:false → 透传 message,不带 code,不带 released', async () => {
++    const { brain, replies } = releaseBrain({ reply: () => ({ ok: false, message: '宿主拒绝' }) })
++
++    brain.handles.release.media({ reqId: 'r1', kind: 'release-media', hash: HASH })
++    await flushMicrotasks()
++
++    expect(replies[0]).toMatchObject({ reqId: 'r1', ok: false, message: '宿主拒绝' })
++    expect(replies[0].code).toBeUndefined()
++    expect(replies[0].released).toBeUndefined()
++  })
++
++  it('宿主异常(cindy.send 抛错)→ 按失败处理,message 携带异常原因', async () => {
++    const { brain, replies } = releaseBrain({
++      reply: () => {
++        throw new Error('宿主离线')
++      },
++    })
++
++    brain.handles.release.media({ reqId: 'r1', kind: 'release-media', hash: HASH })
++    await flushMicrotasks()
++
++    expect(replies[0]).toMatchObject({ reqId: 'r1', ok: false })
++    expect(String(replies[0].message)).toContain('宿主离线')
++  })
++})
++
++describe('release-media — 分发路径(channel.onmessage,不进 chain)', () => {
++  it('经 mivo-canvas-persist channel 投递 kind=release-media 同样被处理', async () => {
++    const { hostRequests, panel } = releaseBrain()
++
++    panel.postMessage({ reqId: 'r1', kind: 'release-media', hash: HASH })
++    await flushMicrotasks()
++
++    expect(hostRequests).toHaveLength(1)
++    expect(hostRequests[0]).toMatchObject({ kind: 'release_media', hash: HASH })
++  })
++})
+diff --git a/src/__tests__/releasePort.test.ts b/src/__tests__/releasePort.test.ts
+new file mode 100644
+index 00000000..5e5993d2
+--- /dev/null
++++ b/src/__tests__/releasePort.test.ts
+@@ -0,0 +1,91 @@
++/**
++ * depositPort releaseHash 契约测试(T1a 基建;设计稿 §4.10.1/§4.10.5)。
++ *
++ * 覆盖:成功释放、released:false 视为成功、hash 前置校验(不合法格式零请求)、
++ * 同一 hash 并发 single-flight 合并为一次请求、失败如实返回不重试、失败后
++ * in-flight 表清空可重试。
++ *
++ * 端到端跑在真实 main.js 上(depositTestHarness 的双 spy 之二:hostReleaseRequests),
++ * 不是对着替身自说自话。
++ */
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { releaseHash } from '../agent/depositPort'
++import { createDepositHarness, teardownDepositHarness, FAKE_HASH, type DepositHarness } from './depositTestHarness'
++
++let harness: DepositHarness
++
++beforeEach(() => {
++  harness = createDepositHarness()
++})
++
++afterEach(() => {
++  teardownDepositHarness()
++})
++
++describe('releaseHash — 成功路径', () => {
++  it('成功释放 → ok:true,released 与配额两数原样透传', async () => {
++    harness.setHostReleaseReply(() => ({ ok: true, released: true, quotaUsedBytes: 100, quotaLimitBytes: 1_000 }))
++
++    await expect(releaseHash(FAKE_HASH)).resolves.toEqual({
++      ok: true,
++      released: true,
++      quotaUsedBytes: 100,
++      quotaLimitBytes: 1_000,
++    })
++    expect(harness.hostReleaseRequests).toHaveLength(1)
++    expect(harness.hostReleaseRequests[0]).toMatchObject({ hash: FAKE_HASH })
++  })
++
++  it('released:false 视为成功,不报错(设计稿 §4.10.1:该指纹本就无引用)', async () => {
++    harness.setHostReleaseReply(() => ({ ok: true, released: false }))
++
++    await expect(releaseHash(FAKE_HASH)).resolves.toMatchObject({ ok: true, released: false })
++  })
++})
++
++describe('releaseHash — hash 前置校验(零请求)', () => {
++  it('不合法 hash(过短)→ 前置拦截,ok:false,不发请求', async () => {
++    await expect(releaseHash('short')).resolves.toMatchObject({ ok: false })
++    expect(harness.hostReleaseRequests).toHaveLength(0)
++  })
++
++  it('空字符串 → 前置拦截,不发请求', async () => {
++    await expect(releaseHash('')).resolves.toMatchObject({ ok: false })
++    expect(harness.hostReleaseRequests).toHaveLength(0)
++  })
++})
++
++describe('releaseHash — single-flight(hash 级,与 deposit 的 assetUrl 级各自独立)', () => {
++  it('同一 hash 并发 3 次只发 1 次释放请求,三个调用拿同一结果', async () => {
++    const results = await Promise.all([releaseHash(FAKE_HASH), releaseHash(FAKE_HASH), releaseHash(FAKE_HASH)])
++
++    expect(harness.hostReleaseRequests).toHaveLength(1)
++    expect(results.every((result) => result.ok)).toBe(true)
++  })
++
++  it('不同 hash 并发各自发请求,互不合并', async () => {
++    const hashB = 'c'.repeat(32)
++    await Promise.all([releaseHash(FAKE_HASH), releaseHash(hashB)])
++
++    expect(harness.hostReleaseRequests).toHaveLength(2)
++    expect(harness.hostReleaseRequests.map((request) => request.hash).sort()).toEqual([FAKE_HASH, hashB].sort())
++  })
++
++  it('失败后 in-flight 表清空,下次可重试(不是永久合并)', async () => {
++    harness.setHostReleaseReply(() => ({ ok: false, message: 'boom' }))
++    await expect(releaseHash(FAKE_HASH)).resolves.toMatchObject({ ok: false, message: 'boom' })
++
++    harness.setHostReleaseReply(() => ({ ok: true, released: true }))
++    await expect(releaseHash(FAKE_HASH)).resolves.toMatchObject({ ok: true, released: true })
++    expect(harness.hostReleaseRequests).toHaveLength(2)
++  })
++})
++
++describe('releaseHash — 不做重试(职责闭合选 A 案:重试是上层调用方的事)', () => {
++  it('单次失败即返回,不内部重试', async () => {
++    harness.setHostReleaseReply(() => ({ ok: false, message: '宿主拒绝' }))
++
++    await expect(releaseHash(FAKE_HASH)).resolves.toEqual({ ok: false, message: '宿主拒绝' })
++    expect(harness.hostReleaseRequests).toHaveLength(1)
++  })
++})
+diff --git a/src/agent/depositPort.ts b/src/agent/depositPort.ts
+index acd4bf0c..777d816c 100644
+--- a/src/agent/depositPort.ts
++++ b/src/agent/depositPort.ts
+@@ -276,7 +276,59 @@ export const resolveDepositEntry = async (input: {
+   }
+ }
+ 
+-/** 测试用:清空 single-flight 表。 */
++export type ReleaseResult = {
++  ok: boolean
++  /** `released:false` = 该指纹本就无引用,不是错误(设计稿 §4.10.1)。 */
++  released?: boolean
++  quotaUsedBytes?: number
++  quotaLimitBytes?: number
++  message?: string
++}
++
++// release 的 single-flight 键是 **hash**,与上面 deposit 的 assetUrl 键是两张独立
++// 的表(职责闭合选 A 案 [J4-③]:release 归本段,不与 T1b 的 pendingReleases 队列
++// 合并)。同一 hash 的并发释放请求只应产生一次 release_media 调用(设计稿
++// §4.10.6 顺序硬约束「同一 hash 的并发 release 走 single-flight 合并」)——三个
++// 接线点(LRU 淘汰前 / 换指纹 / sweep)在 T1e 接线时可能对同一 hash 并发触发,
++// 这里统一收口,调用方不需要各自实现合并。
++const releaseInflight = new Map<string, Promise<ReleaseResult>>()
++
++/**
++ * 释放一个寄存物指纹(设计稿 §4.10.1)。**不做重试**——失败原样如实返回,由调用方
++ * (T1b2 sweep / T1b3 补偿 / T1e 三接线点)决定要不要记入 `pendingReleases` 待重试
++ * 队列;本函数只负责"发一次 + 合并并发"这个原语职责。
++ */
++export const releaseHash = async (hash: string): Promise<ReleaseResult> => {
++  if (!HASH_RE.test(hash)) {
++    return { ok: false, message: '缺少合法的释放目标 hash' }
++  }
++  const existing = releaseInflight.get(hash)
++  if (existing) {
++    debugLogger.log(SOURCE, `release 合并并发请求:hash=${hash.slice(0, 8)} 已有释放在途(single-flight)`)
++    return existing
++  }
++  const pending = (async (): Promise<ReleaseResult> => {
++    const reply = await transport('release-media', { hash }, { retryMs: DEPOSIT_RETRY_MS, timeoutMs: DEPOSIT_TIMEOUT_MS })
++    if (!reply.ok) {
++      debugLogger.error(SOURCE, `release 失败:hash=${hash.slice(0, 8)} ${reply.message || '无原因'}`)
++      return { ok: false, message: reply.message }
++    }
++    debugLogger.log(
++      SOURCE,
++      `release 完成:hash=${hash.slice(0, 8)} released=${reply.released ? 'yes' : 'no(no-op)'}`,
++    )
++    return { ok: true, released: reply.released, quotaUsedBytes: reply.quotaUsedBytes, quotaLimitBytes: reply.quotaLimitBytes }
++  })()
++  releaseInflight.set(hash, pending)
++  try {
++    return await pending
++  } finally {
++    releaseInflight.delete(hash)
++  }
++}
++
++/** 测试用:清空 single-flight 表(deposit 与 release 两张)。 */
+ export const resetDepositPortForTests = (): void => {
+   inflight.clear()
++  releaseInflight.clear()
+ }
+diff --git a/src/persist/bridge.ts b/src/persist/bridge.ts
+index 50d061e9..6fccffab 100644
+--- a/src/persist/bridge.ts
++++ b/src/persist/bridge.ts
+@@ -101,6 +101,14 @@ export type PersistReply = {
+   revisionSum?: string
+   /** CAS 冲突:磁盘 generation 已前进,state 带回当前已合并的磁盘状态供重放重试。 */
+   conflict?: boolean
++  /**
++   * release-media 回执(设计稿 §4.10.1):`true` = 宿主确实释放了一份寄存物;
++   * `false` = 该指纹在本插件名下已无引用——**这不是错误**,判「释放成功」的唯一
++   * 依据是 `ok:true`,`released` 只用于日志区分「真释放 / 本来就没有」。复用上面
++   * 已有的 `hash?`/`quotaUsedBytes?`/`quotaLimitBytes?`/`message?` 字段,不新增
++   * `code?`(宿主同样不为 release_media 提供稳定错误码)。
++   */
++  released?: boolean
+ }
+ 
+ export type PersistAssetMeta = {
+@@ -125,6 +133,7 @@ export function persistRequest(
+     | 'gen-image'
+     | 'edit-image'
+     | 'deposit-media'
++    | 'release-media'
+     | 'deposit-state-load'
+     | 'deposit-state-save'
+     | 'pending-list'

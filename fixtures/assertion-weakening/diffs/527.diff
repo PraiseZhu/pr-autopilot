@@ -1,0 +1,48 @@
+diff --git a/src/cindy-theme.css b/src/cindy-theme.css
+index 672a9bf2..80289968 100644
+--- a/src/cindy-theme.css
++++ b/src/cindy-theme.css
+@@ -253,27 +253,26 @@
+   border-color: color-mix(in srgb, var(--text-primary, #232323) 16%, var(--border-default, #d6d0c6));
+ }
+ 
+-/* 出图模型下拉(K1 Task 2):与富文本输入区同一档抬升 —— 缺省的 --panel-surface 在
+-   Dark 下是奶油实底,一个亮色下拉贴在暗面板上就是「贴纸」(2026-07-31 用户点名过
+-   同一类问题)。文字**故意不覆写**:正文走 --ink(映射到 --text-primary),两套皮肤的
+-   对比度由宿主的文字角色保证,同点选提示行的处理(J4 ⑧),这里不手调混色比例。
+-   K3:可见 label 已去掉(文案转 aria-label);紧凑宽度与自绘 chevron 都在 App.css 里
+-   用 fit-content / currentColor 写成**与皮肤无关**的形态,所以这边只需要继续管底与描边,
+-   不必为这两条各加一份暗色变体。 */
++/* 出图模型下拉:L1 ① 起**去边框**(用户真机反馈,参考 Cindy 聊天输入框的选择器)——
++   原来这里给它「抬升一档的底 + 描边」是为了让亮色下拉不在暗面板上像贴纸;现在它常态
++   就是透明底、直接坐在面板上,那份抬升反而把「去框」抵消掉,所以**整条退掉**,只保留
++   hover 的轻底(由 :root 的 --region-btn-hover 供给,已按宿主文字色推导,两肤方向都对)。
++   文字仍**故意不覆写**:走 --ink → --text-primary,对比度由宿主文字角色保证(同 J4 ⑧)。
++   紧凑宽度、自绘 chevron、前置图标都在 App.css 里写成与皮肤无关的形态(fit-content /
++   currentColor),这边不需要各加一份暗色变体。 */
+ .region-edit-model-select {
+-  background: color-mix(in srgb, var(--text-primary, #232323) 5%, var(--surface-elevated, #fffaf0));
+-  border-color: color-mix(in srgb, var(--text-primary, #232323) 16%, var(--border-default, #d6d0c6));
++  background: none;
++  border-color: transparent;
+ }
+ 
+-/* 点选常驻提示行:**故意不覆写**(J4 ⑧)。
+-   原来这里按「主文字色掺 55% 抬升表面」推导,Light 下实测混出 rgb(134,132,127)
+-   (相对亮度 0.2310),对面板底 #fffaf0(0.9592)只有 3.59:1 —— 12px 是 WCAG normal text,
+-   AA 线 4.5:1,不合格。现在 App.css 那条规则改用 --muted(网页值 #756f67 = 4.78:1 过线),
+-   而本文件顶部的文字三级映射已把 --muted → 宿主 --text-secondary:换肤交给宿主的
+-   次级文字色角色(它对自己两套皮肤的对比度有保证),比在这里手调混色比例靠得住。 */
++/* (点选常驻提示行的覆写豁免说明随该行一起下线:L1 ② 删了常驻行,L2 ① 起提示并进
++   底纹文案本身 —— placeholder 走 --muted,映射与其他次级文字一致,不需要单独覆写。) */
+ 
+-/* @ 下拉浮层:与工具坞浮层同一档抬升,避免同屏两层浮层色差。 */
+-.region-edit-suggest {
++/* 浮层们:与工具坞浮层同一档抬升,避免同屏两层浮层色差。
++   @ 引用下拉与自绘的出图模型下拉(L2 ③)同底同描边 —— 两者都是这块面板里弹出的
++   第二层,视觉必须同源(App.css 那边也是共用一套 token)。 */
++.region-edit-suggest,
++.region-edit-model-menu {
+   background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 94%, var(--text-primary, #232323) 6%);
+   border-color: color-mix(in srgb, var(--text-primary, #232323) 14%, var(--border-default, #d6d0c6));
+ }

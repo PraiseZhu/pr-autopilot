@@ -1,0 +1,824 @@
+diff --git a/docs/evidence/region-edit-select-tool/01-idle.png b/docs/evidence/region-edit-select-tool/01-idle.png
+new file mode 100644
+index 00000000..33c7eacf
+Binary files /dev/null and b/docs/evidence/region-edit-select-tool/01-idle.png differ
+diff --git a/docs/evidence/region-edit-select-tool/02-armed.png b/docs/evidence/region-edit-select-tool/02-armed.png
+new file mode 100644
+index 00000000..e0826acc
+Binary files /dev/null and b/docs/evidence/region-edit-select-tool/02-armed.png differ
+diff --git a/docs/evidence/region-edit-select-tool/03-panel-open.png b/docs/evidence/region-edit-select-tool/03-panel-open.png
+new file mode 100644
+index 00000000..22b9fbea
+Binary files /dev/null and b/docs/evidence/region-edit-select-tool/03-panel-open.png differ
+diff --git a/docs/evidence/region-edit-select-tool/04-after-v.png b/docs/evidence/region-edit-select-tool/04-after-v.png
+new file mode 100644
+index 00000000..33c7eacf
+Binary files /dev/null and b/docs/evidence/region-edit-select-tool/04-after-v.png differ
+diff --git a/docs/evidence/region-edit-select-tool/README.md b/docs/evidence/region-edit-select-tool/README.md
+new file mode 100644
+index 00000000..205abff4
+--- /dev/null
++++ b/docs/evidence/region-edit-select-tool/README.md
+@@ -0,0 +1,14 @@
++# AI 编辑工具切换 — UI 证据
++
++工具坞（`.canvas-tool-dock`）四态实拍，2× DPR，区域裁切。用于 PR「选工具即退出 AI 编辑」的 UI 变更证据。
++
++采集方式：本地 dev（Vite + BFF 双进程）+ Playwright，经 `__MIVO_E2E__` 桥控制选中态，逐态截 `.canvas-tool-dock`。
++
++| 文件 | 态 | 断言 |
++|---|---|---|
++| `01-idle.png` | 空闲 | 选择工具亮，AI 编辑灭 |
++| `02-armed.png` | 待命（未选图点 AI 编辑） | AI 编辑亮，选择工具灭 |
++| `03-panel-open.png` | **浮层已开**（选中图按 J） | AI 编辑亮、选择工具灭 —— 修复前此态按钮不亮，即用户报障现场 |
++| `04-after-v.png` | 浮层开着按 `V` | 浮层关闭，焦点回到选择工具 |
++
++`01` 与 `04` 视觉一致是预期结果：按 `V` 之后应当精确回到空闲态。
+diff --git a/src/canvas/CanvasToolDock.test.tsx b/src/canvas/CanvasToolDock.test.tsx
+index d5fa3450..eb4efcb9 100644
+--- a/src/canvas/CanvasToolDock.test.tsx
++++ b/src/canvas/CanvasToolDock.test.tsx
+@@ -81,6 +81,27 @@ describe('CanvasToolDock — AI 编辑按钮(#482 三入口统一)', () => {
+     expect(withHandler).not.toContain('disabled')
+   })
+ 
++  // 2026-08-12 用户报障(截图):选中图片后按 J,面板已经开在图下面了,工具坞的 AI 编辑
++  // 按钮却不亮、焦点还留在「选择」上。病根:按钮的 active 只绑 regionEditArmed(待命),
++  // 而「已选中图片」这条路径**直接开面板、跳过待命**,按钮自然亮不起来。面板开着同样
++  // 是「AI 编辑正在进行」,必须一并算进激活态,且沿用待命那道排他(此刻高亮只归它)。
++  it('面板开着(regionEditOpen)按钮同样 active —— 选中图片按 J 的路径不进待命', () => {
++    const open = aiEditButtonMarkup(
++      renderToStaticMarkup(<CanvasToolDock onStartRegionEdit={() => {}} regionEditOpen />),
++      'AI Edit',
++    )
++    expect(open).toContain('class="active"')
++  })
++
++  it('面板开着时其它工具按钮一律不 active(排他,与待命同款)', () => {
++    const html = renderToStaticMarkup(<CanvasToolDock onStartRegionEdit={() => {}} regionEditOpen />)
++    const selectBtn = (html.match(/<button[^>]*>.*?<\/button>/gs) || []).find((b) =>
++      b.includes('aria-label="Select"'),
++    )
++    expect(selectBtn, '应存在选择工具按钮').toBeTruthy()
++    expect(selectBtn).not.toContain('class="active"')
++  })
++
+   it('待命态(regionEditArmed)按钮呈 active;非待命不 active', () => {
+     const armed = aiEditButtonMarkup(
+       renderToStaticMarkup(<CanvasToolDock onStartRegionEdit={() => {}} regionEditArmed />),
+@@ -100,3 +121,33 @@ describe('CanvasToolDock — AI 编辑按钮(#482 三入口统一)', () => {
+     expect(dockSource).toContain('<Sparkles size={20} />')
+   })
+ })
++
++// 2026-08-12 用户报障:AI 编辑待命中点「选择」工具没反应(同值切换,待命的释放门是
++// 边沿触发的,看不见)。工具坞的每个按钮都必须经 selectTool 包装(内部转 onSelectToolByUser),
++// 不能裸调 setActiveTool —— 否则待命赖着不走,工具坞高亮也一直被 AI 编辑按钮抢着。
++describe('CanvasToolDock — 工具按钮经「用户主动选工具」出口(源码契约)', () => {
++  it('工具按钮一律走 selectTool 包装,不裸调 setActiveTool', () => {
++    // 裸调禁令:组件里不得再出现本地标识符 setActiveTool(...) 的调用。
++    // store 选择器改名成 setActiveToolRaw,只有 selectTool 包装的兜底分支调它;
++    // 正则排除 state.setActiveTool(选择器取值,不是调用)与 setActiveToolRaw。
++    expect(dockSource).toContain('const setActiveToolRaw = useCanvasStore((state) => state.setActiveTool)')
++    expect(dockSource).not.toMatch(/(?<![.\w])setActiveTool(?!Raw)\(/)
++  })
++
++  it('包装接线:有 onSelectToolByUser 走它,没有则退化成裸 setActiveTool(SSR/独立渲染不炸)', () => {
++    expect(dockSource).toMatch(/if \(onSelectToolByUser\) onSelectToolByUser\(toolId, [\s\S]*?\)\s*\n\s*else setActiveToolRaw\(toolId\)/)
++  })
++
++  it('五个工具点击位点各自都用 selectTool(逐点钉,一处漏改就红)', () => {
++    // Draw 主键:选中记忆里的形状工具
++    expect(dockSource).toContain('selectTool(primaryMarkupTool.id)')
++    // Draw 二级面板:回调整体透传
++    expect(dockSource).toContain('onSelectTool={selectTool}')
++    // 画笔/印章:点击后还要开 popover(带 enabled 前置)
++    expect(dockSource).toMatch(/if \(!enabled\) return\s*\n\s*selectTool\(id\)\s*\n\s*popover\.toggle\(\)/)
++    // 选择工具:单行 onClick(就是本次 bug 的现场)
++    expect(dockSource).toContain('onClick={() => selectTool(id)}')
++    // 其它工具:enabled 守卫版
++    expect(dockSource).toMatch(/if \(enabled\) selectTool\(id\)/)
++  })
++})
+diff --git a/src/canvas/CanvasToolDock.tsx b/src/canvas/CanvasToolDock.tsx
+index 412ea276..4f662ee3 100644
+--- a/src/canvas/CanvasToolDock.tsx
++++ b/src/canvas/CanvasToolDock.tsx
+@@ -1,4 +1,4 @@
+-import { Fragment, useEffect, useMemo } from 'react'
++import { Fragment, useCallback, useEffect, useMemo } from 'react'
+ import { useTranslation } from 'react-i18next'
+ import { Sparkles } from 'lucide-react'
+ import { BrushOptionsBar } from './BrushOptionsBar'
+@@ -24,6 +24,14 @@ type CanvasToolDockProps = {
+   onStartRegionEdit?: () => void
+   /** 待命态(等用户点目标图片):按钮呈 active。 */
+   regionEditArmed?: boolean
++  /** 区域编辑浮层已打开:按钮同样呈 active。
++   *  「已选中图片」时点 AI 编辑 / 按 J 会**直接开面板、跳过待命**,只绑 regionEditArmed
++   *  的话面板开着按钮却不亮、焦点还留在「选择」上(2026-08-12 用户报障)。 */
++  regionEditOpen?: boolean
++  /** 「用户主动选工具」出口:待命时点任一工具按钮都必须先退待命再落工具。
++   *  不给就退回裸 setActiveTool —— 待命中选「选择」是同值切换,释放门(边沿触发)
++   *  看不见,待命会赖着不走(2026-08-12 用户报障)。 */
++  onSelectToolByUser?: (toolId: ToolId, reason: string) => void
+ }
+ 
+ export function CanvasToolDock({
+@@ -31,15 +39,29 @@ export function CanvasToolDock({
+   temporaryToolActive = false,
+   onStartRegionEdit,
+   regionEditArmed = false,
++  regionEditOpen = false,
++  onSelectToolByUser,
+ }: CanvasToolDockProps) {
++  // 「AI 编辑正在进行」的完整语义 = 待命等点图 **或** 浮层已经开着。按钮高亮与下面
++  // 那道排他都取它:只取待命的话,「选中图片直接开面板」这条路径下按钮不亮(报障截图)。
++  const regionEditActive = regionEditArmed || regionEditOpen
+   // 注册表 label 是 i18n key,这里 t() 成当前语言;useTranslation 保证语言切换时重渲染。
+   const { t } = useTranslation()
+   const activeTool = useCanvasStore((state) => state.activeTool)
+-  const setActiveTool = useCanvasStore((state) => state.setActiveTool)
++  const setActiveToolRaw = useCanvasStore((state) => state.setActiveTool)
++  // 工具坞上的每一次点击都是**用户主动选工具**:统一走这个包装,顺手退掉 AI 编辑待命。
++  // 没接回调时退化成 store 原始 action(SSR 契约测/独立渲染场景),行为与老版本一致。
++  const selectTool = useCallback(
++    (toolId: ToolId) => {
++      if (onSelectToolByUser) onSelectToolByUser(toolId, `工具坞选中 ${toolId}`)
++      else setActiveToolRaw(toolId)
++    },
++    [onSelectToolByUser, setActiveToolRaw],
++  )
+   const shownTool = previewTool || (isCanvasToolEnabled(activeTool) ? activeTool : 'select')
+   // 待命(局部重绘)是排他模式:此刻高亮只归重绘按钮,其它工具按钮一律不显示 active
+   // (J9 P1-1 ③:原来重绘按钮取 regionEditArmed、其它取 shownTool===id,互不排斥 → 双 active)。
+-  const toolActive = (id: ToolId) => shownTool === id && !regionEditArmed
++  const toolActive = (id: ToolId) => shownTool === id && !regionEditActive
+   const markupShapeToolSet = useMemo(() => new Set<ToolId>(markupShapeToolIds), [])
+   const markupShapeTools = useMemo(
+     () => canvasToolRegistry.filter((tool) => markupShapeToolSet.has(tool.id)) as Array<
+@@ -90,7 +112,7 @@ export function CanvasToolDock({
+ 
+         if (id === markupShapeToolIds[0]) {
+           const PrimaryIcon = primaryMarkupTool.icon
+-          const isActive = Boolean(activeMarkupShapeTool) && !regionEditArmed
++          const isActive = Boolean(activeMarkupShapeTool) && !regionEditActive
+ 
+           return (
+             <div
+@@ -103,7 +125,7 @@ export function CanvasToolDock({
+                 className={isActive ? 'active' : ''}
+                 onMouseDown={preventToolButtonFocus}
+                 onClick={() => {
+-                  setActiveTool(primaryMarkupTool.id)
++                  selectTool(primaryMarkupTool.id)
+                   drawPopover.toggle()
+                 }}
+                 aria-label={t('tools.draw')}
+@@ -113,7 +135,7 @@ export function CanvasToolDock({
+                 <PrimaryIcon size={20} />
+               </button>
+               <div className="canvas-tool-flyout" role="menu" aria-label={t('tools.dock.drawTools')} data-canvas-ui="true">
+-                <DrawOptionsBar shownTool={shownTool} onSelectTool={setActiveTool} />
++                <DrawOptionsBar shownTool={shownTool} onSelectTool={selectTool} />
+               </div>
+             </div>
+           )
+@@ -133,7 +155,7 @@ export function CanvasToolDock({
+                 onMouseDown={preventToolButtonFocus}
+                 onClick={() => {
+                   if (!enabled) return
+-                  setActiveTool(id)
++                  selectTool(id)
+                   popover.toggle()
+                 }}
+                 aria-label={t(label)}
+@@ -157,7 +179,7 @@ export function CanvasToolDock({
+                 type="button"
+                 className={toolActive(id) ? 'active' : ''}
+                 onMouseDown={preventToolButtonFocus}
+-                onClick={() => setActiveTool(id)}
++                onClick={() => selectTool(id)}
+                 aria-label={t(label)}
+                 data-tooltip={shortcut ? `${t(label)} (${shortcut})` : t(label)}
+               >
+@@ -174,7 +196,7 @@ export function CanvasToolDock({
+                   恒为「AI 编辑 (J)」。 */}
+               <button
+                 type="button"
+-                className={regionEditArmed ? 'active' : ''}
++                className={regionEditActive ? 'active' : ''}
+                 onMouseDown={preventToolButtonFocus}
+                 onClick={() => onStartRegionEdit?.()}
+                 disabled={!onStartRegionEdit}
+@@ -194,7 +216,7 @@ export function CanvasToolDock({
+             className={toolActive(id) ? 'active' : ''}
+             onMouseDown={preventToolButtonFocus}
+             onClick={() => {
+-              if (enabled) setActiveTool(id)
++              if (enabled) selectTool(id)
+             }}
+             aria-label={t(label)}
+             data-tooltip={shortcut ? `${t(label)} (${shortcut})` : t(label)}
+diff --git a/src/canvas/MivoCanvas.tsx b/src/canvas/MivoCanvas.tsx
+index 336fb2e6..40e54e95 100644
+--- a/src/canvas/MivoCanvas.tsx
++++ b/src/canvas/MivoCanvas.tsx
+@@ -185,11 +185,16 @@ export function MivoCanvas({
+     cancelMaskEdit,
+     submitMaskEdit,
+   })
+-  // 待命态(2026-08-03 用户:工具条按钮永远可点,点完工具再点图片也能开面板)。
+-  const { regionEditArmed, openRegionEdit, toggleRegionEditArmed, disarmRegionEdit, handleShellPointerDown } = useRegionEditArmed({
++  // 待命/浮层共用「选工具即退出」;closeRegionEditPanel 必须 useCallback 稳定:
++  // 它经 selectToolByUser 进入 useGlobalCanvasEvents 的 window 监听 effect 依赖,
++  // 内联箭头会让全局监听器随 nodes 等高频渲染反复卸载重装。
++  const closeRegionEditPanel = useCallback(() => cancelRegionEdit('用户切换工具退出'), [cancelRegionEdit])
++  const { regionEditArmed, openRegionEdit, toggleRegionEditArmed, disarmRegionEdit, selectToolByUser, handleShellPointerDown } = useRegionEditArmed({
+     interactionRef: maskPointInteractionRef,
+     beginRegionEdit,
+     fallbackPointerDown: wrapCanvasPointerDown,
++    regionEditNodeId,
++    closeRegionEditPanel,
+   })
+   // 工具条按钮 / 快捷键 J 的统一入口:选中图片就直接开浮层,否则进入待命态
+   // (再按一次收起)。节点判定读 store 现值(与 CanvasToolDock 的 selectedImageNodeId 同判据)。
+@@ -255,6 +260,7 @@ export function MivoCanvas({
+     // FigJam semantics: pointerdown outside the crop overlay APPLIES the crop
+     // (commitCropFromOutside); explicit cancel is Escape / the Cancel button.
+     onCancelMaskEdit: cancelActiveImageEdit, onStartRegionEdit: startRegionEditByShortcut,
++    onSelectToolByUser: selectToolByUser,
+     cropEditNodeId: cropNodeId, onCancelCropEdit: commitCropFromOutside,
+     contextMenuOpen: Boolean(contextMenu), onCloseContextMenu: closeContextMenu, backgroundPattern,
+   })
+@@ -629,6 +635,8 @@ export function MivoCanvas({
+         temporaryToolActive={Boolean(temporaryTool)}
+         onStartRegionEdit={() => startRegionEditOrArm('工具条按钮')}
+         regionEditArmed={regionEditArmed}
++        regionEditOpen={Boolean(regionEditNodeId)}
++        onSelectToolByUser={selectToolByUser}
+       />
+       {/* 画笔/印章选项已并入 CanvasToolDock 的点击式 popover(统一二级面板) */}
+       <div
+diff --git a/src/canvas/regionEditArmed.test.ts b/src/canvas/regionEditArmed.test.ts
+index dd5aadec..7754c974 100644
+--- a/src/canvas/regionEditArmed.test.ts
++++ b/src/canvas/regionEditArmed.test.ts
+@@ -8,6 +8,7 @@ import {
+ } from './regionEditArmed'
+ import mivoCanvasSource from './MivoCanvas.tsx?raw'
+ import armedHookSource from './useRegionEditArmed.ts?raw'
++import regionEditSource from './useRegionEdit.ts?raw'
+ 
+ const base = {
+   armed: true,
+@@ -222,12 +223,14 @@ describe('接线契约:开面板入口与 UI 门', () => {
+     expect(mivoCanvasSource.match(/beginRegionEdit/g)).toHaveLength(2)
+   })
+ 
+-  it('J4④/J9:待命 state 只有 setArmed 一个出口;setArmed(false,…) 的直写点恰好四处', () => {
++  it('J4④/J9:待命 state 只有 setArmed 一个出口;setArmed(false,…) 的直写点恰好五处', () => {
+     // 单一 owner:真正写 React state 的只有 setArmed 自己(destructure 不算调用)。
+     expect(armedHookSource.match(/setRegionEditArmedState\(/g)).toHaveLength(1)
+-    // 四处 = ① openRegionEdit 的 disarm 回调 ② disarmRegionEdit(被动释放,给互斥浮层用)
+-    // ③ 订阅里的条件表释放(J9 P1-1)④ Esc 退出;toggle 走 setArmed(!armedRef.current)。
+-    expect(armedHookSource.match(/setArmed\(false/g)).toHaveLength(4)
++    // 五处 = ① openRegionEdit 的 disarm 回调 ② disarmRegionEdit(被动释放,给互斥浮层用)
++    // ③ 订阅里的条件表释放(J9 P1-1)④ Esc 退出 ⑤ selectToolByUser(用户主动选工具,
++    //   2026-08-12:待命期 activeTool 恒为 select,点 select 是同值切换、③ 的边沿判据
++    //   看不见,不给它自己的出口就退不出待命);toggle 走 setArmed(!armedRef.current)。
++    expect(armedHookSource.match(/setArmed\(false/g)).toHaveLength(5)
+   })
+ 
+   // J9 P1-1:释放路径属跳过/降级,按 development-logging 记 warn(不是 log)。
+@@ -263,4 +266,32 @@ describe('接线契约:开面板入口与 UI 门', () => {
+     expect(uiGateAt).toBeGreaterThan(-1)
+     expect(uiGateAt).toBeLessThan(hitAt)
+   })
++
++  // R3 SC-1:closeRegionEditPanel 必须 useCallback 稳定 —— 它进 selectToolByUser 的
++  // 依赖,而 selectToolByUser 又进 useGlobalCanvasEvents 的 window 监听 effect 依赖
++  // 数组;每次渲染新建的箭头会让全局监听器随 MivoCanvas 任意重渲染(含 nodes 高频
++  // 变化)反复卸载重装。引用稳定性通过「输入稳定」达成(修复方不许把依赖摘掉
++  // 换稳定 —— 那会变成 stale closure),故同时钉死依赖数组。
++  it('R3 SC-1:closeRegionEditPanel 是 useCallback 稳定引用(依赖 cancelRegionEdit),内联箭头被禁', () => {
++    expect(mivoCanvasSource).toContain(
++      "const closeRegionEditPanel = useCallback(() => cancelRegionEdit('用户切换工具退出'), [cancelRegionEdit])",
++    )
++    // 传入处必须是变量引用,不许退回内联箭头。
++    expect(mivoCanvasSource).not.toContain('closeRegionEditPanel: () => cancelRegionEdit')
++    // selectToolByUser 的依赖数组保留 closeRegionEditPanel(稳定的输入,不是摘除依赖)。
++    expect(armedHookSource).toContain('[setArmed, closeRegionEditPanel]')
++  })
++
++  // R3 SC-2:同一次「选工具关闭浮层」只产生一条 Region Edit 关闭日志 —— 由
++  // cancelRegionEdit(useRegionEdit)带 nodeId 记,selectToolByUser 不再重复写。
++  it('R3 SC-2:selectToolByUser 不重复写浮层关闭日志,cancelRegionEdit 保留带 nodeId 的单一关闭日志', () => {
++    const panelBranch = armedHookSource.slice(armedHookSource.indexOf('if (panelNodeIdRef.current)'))
++    const panelBranchBody = panelBranch.slice(0, panelBranch.indexOf('useCanvasStore.getState().setActiveTool(toolId)'))
++    expect(panelBranchBody).toContain('closeRegionEditPanel?.()')
++    expect(panelBranchBody).not.toMatch(/debugLogger/)
++    // 关闭日志的唯一来源:cancelRegionEdit 内带 nodeId 的那条。
++    expect(regionEditSource).toContain(
++      "debugLogger.log('Region Edit', `区域编辑浮层关闭(${regionEditNodeIdRef.current}):${reason}`)",
++    )
++  })
+ })
+diff --git a/src/canvas/useCanvasInteractionController.ts b/src/canvas/useCanvasInteractionController.ts
+index 81ba29df..ae645487 100644
+--- a/src/canvas/useCanvasInteractionController.ts
++++ b/src/canvas/useCanvasInteractionController.ts
+@@ -1,7 +1,7 @@
+ import { useCallback, useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
+ import { useCanvasStore } from '../store/canvasStore'
+ import { wrapMutation } from './actions/canvasSyncRuntime'
+-import type { CanvasId, MivoCanvasNode } from '../types/mivoCanvas'
++import type { CanvasId, MivoCanvasNode, ToolId } from '../types/mivoCanvas'
+ import type { ResizeCorner, SnapGuide } from './canvasGeometry'
+ import { boundsForNodes, isActiveSelectionRect, previewIdsFromSelectionBox, runtimeToolFor, selectionRectFromBox, type RuntimeCanvasTool } from './canvasInteraction'
+ import { canvasToolHandlers, type CanvasToolHandlerContext } from './canvasToolHandlers'
+@@ -29,6 +29,9 @@ type UseCanvasInteractionControllerOptions = {
+   onCancelMaskEdit?: () => void
+   /** 局部重绘快捷键(J)的动作:透传给 useGlobalCanvasEvents。 */
+   onStartRegionEdit?: () => void
++  /** 工具快捷键(V/H/T/…)的「用户主动选工具」出口:透传给 useGlobalCanvasEvents,
++   *  与工具坞按钮同款先退 AI 编辑待命再落工具。 */
++  onSelectToolByUser?: (toolId: ToolId, reason: string) => void
+   cropEditNodeId?: string
+   onCancelCropEdit?: () => void
+   /** 右键菜单是否打开:透传给 useGlobalCanvasEvents 做 Escape 分层退出(R6)。 */
+@@ -41,7 +44,7 @@ type UseCanvasInteractionControllerOptions = {
+ // returns are destructured to bare stable callbacks so React.memo on
+ // CanvasNodeView skips unchanged nodes (object deps would recreate callbacks).
+ export function useCanvasInteractionController({
+-  shellRef, sceneId, nodes, selectedNodeIds, maskEditNodeId, onCancelMaskEdit, onStartRegionEdit, cropEditNodeId, onCancelCropEdit, contextMenuOpen, onCloseContextMenu, backgroundPattern,
++  shellRef, sceneId, nodes, selectedNodeIds, maskEditNodeId, onCancelMaskEdit, onStartRegionEdit, onSelectToolByUser, cropEditNodeId, onCancelCropEdit, contextMenuOpen, onCloseContextMenu, backgroundPattern,
+ }: UseCanvasInteractionControllerOptions) {
+   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([])
+   const [activeSectionDropTargetId, setActiveSectionDropTargetId] = useState<string | undefined>()
+@@ -245,7 +248,7 @@ export function useCanvasInteractionController({
+   }, [tryEndEraser, tryEndFrameCreation, tryEndGroupResize, tryEndMarkupCreation, tryEndMarkupPointTransform, tryEndNodeTransform, tryEndPan, tryEndSelection, tryEndSpacing, tryEndStamp, tryEndTextCreation, tryEndTextResize, tryEndZoomGesture])
+ 
+   useGlobalCanvasEvents({
+-    maskEditNodeId, onCancelMaskEdit, onStartRegionEdit, contextMenuOpen, onCloseContextMenu, setTemporaryTool, setEditingTextNodeId,
++    maskEditNodeId, onCancelMaskEdit, onStartRegionEdit, onSelectToolByUser, contextMenuOpen, onCloseContextMenu, setTemporaryTool, setEditingTextNodeId,
+     setSnapGuides, setActiveConnectorDropTargetId, setZoomOutCursor, zoomBy, zoomTo, fitAll, fitSelection,
+     viewportCenter, canvasPointAtClient, resetMarquee, resetNodeTransform, resetPan, resetTextAnnotation,
+     resetBrushStamp, resetGroupTransform, resetZoomGesture,
+diff --git a/src/canvas/useGlobalCanvasEvents.contract.test.ts b/src/canvas/useGlobalCanvasEvents.contract.test.ts
+index a22e3143..484a7a74 100644
+--- a/src/canvas/useGlobalCanvasEvents.contract.test.ts
++++ b/src/canvas/useGlobalCanvasEvents.contract.test.ts
+@@ -130,6 +130,53 @@ describe('F1: useGlobalCanvasEvents 快捷键路径经 wrapMutation(源码契约
+     expect(source).toContain('wrapMutation(() => store.pasteClipboardAssets(pointerDropPoint()))()')
+   })
+ 
++  // 2026-08-12 用户报障:AI 编辑待命中按 V 切不回选择工具(待命置位时已把 activeTool
++  //   归位成 select,此时按 V 是同值切换 → 待命的释放门是边沿触发的、拿不到 diff → 待命
++  //   赖着不走)。工具快捷键必须经 onSelectToolByUser 出口(先退待命再落工具),不能裸调
++  //   store.setActiveTool。语义由 useRegionEditArmed.test.tsx 的「用户主动选工具即退出待命」
++  //   覆盖,本文件只钉源码接线事实(本仓无键盘 E2E harness,见文件头注释)。
++  it('工具快捷键(V/H/T/…)→ onSelectToolByUser 出口,裸 store.setActiveTool 只作兜底', () => {
++    const branch = source.slice(source.indexOf('const shortcutTool = modifier ? undefined : toolForKeyboardShortcut(key)'))
++    const body = branch.slice(0, branch.indexOf('ARROW_KEYS.has(event.key)'))
++    expect(body).toContain('if (onSelectToolByUser) onSelectToolByUser(shortcutTool,')
++    expect(body).toContain('else store.setActiveTool(shortcutTool)')
++    // 出口必须在裸调之前(顺序反了 = 裸调恒生效,出口成摆设)
++    expect(body.indexOf('onSelectToolByUser(shortcutTool,')).toBeLessThan(body.indexOf('else store.setActiveTool(shortcutTool)'))
++  })
++
++  // E(橡皮)在通用 shortcutTool 分支**之前**单独 return,上面那条契约的切片从
++  // `const shortcutTool` 才开始,物理上覆盖不到它 —— 同一条不变量由两个独立分支兑现,
++  // 只钉其中一个,另一个被改回裸调时全部测试仍然全绿(2026-08-13 review 抓到的守卫缺口)。
++  it('E(橡皮)分支同样经 onSelectToolByUser 出口,裸 store.setActiveTool 只作兜底', () => {
++    const branch = source.slice(source.indexOf("if (!modifier && key === 'e')"))
++    const body = branch.slice(0, branch.indexOf('const shortcutTool = modifier ? undefined : toolForKeyboardShortcut(key)'))
++    expect(body).toContain("if (onSelectToolByUser) onSelectToolByUser('markup-brush',")
++    expect(body).toContain("else store.setActiveTool('markup-brush')")
++    // 出口必须在裸调之前(顺序反了 = 裸调恒生效,出口成摆设)
++    expect(body.indexOf("onSelectToolByUser('markup-brush',")).toBeLessThan(body.indexOf("else store.setActiveTool('markup-brush')"))
++  })
++
++  // 三审席② A1 经 owner 定性为「答」:Space 抓手 / Z 缩放是按住生效、松开还原的
++  // 临时态(pressTemporaryTool,不改 activeTool),不是「切换到某个工具」。AI 编辑浮层
++  // 开着时允许按住空格平移看上下文,强行关浮层会丢掉已圈区域。钉死这个区分。
++  it('临时工具键(Space/Z)走 pressTemporaryTool 且提前 return,不经 onSelectToolByUser', () => {
++    const spaceBranch = source.slice(source.indexOf("if (event.code === 'Space')"))
++    const spaceBody = spaceBranch.slice(0, spaceBranch.indexOf("if (event.code === 'KeyZ'"))
++    expect(spaceBody).toContain("pressTemporaryTool('hand')")
++    expect(spaceBody).not.toContain('onSelectToolByUser')
++    expect(spaceBody).toContain('return')
++
++    const zBranch = source.slice(source.indexOf("if (event.code === 'KeyZ'"))
++    const zBody = zBranch.slice(0, zBranch.indexOf("if (event.key === 'Escape')"))
++    expect(zBody).toContain("pressTemporaryTool('zoom')")
++    expect(zBody).not.toContain('onSelectToolByUser')
++  })
++
++  it('Esc 全局重置的 select 归位是程序自校,**不**走用户出口(否则会被当成用户切工具)', () => {
++    // 这条归位发生在 Escape 分支:清选区/收工具态的兜底,不带用户选工具的意图。
++    expect(source).toContain("if (store.activeTool !== 'select') store.setActiveTool('select')")
++  })
++
+   it('非 document mutation 的快捷键不在此契约范围(纯 UI 态;useBrushStamp pointer 旁路单列 sibling)', () => {
+     // 边界声明(A2 SC lead 裁定):selectNodes/selectNode/setActiveTool/setBrushStyle/copySelectedNodes
+     //   (clipboard 只读)/zoomBy/zoomTo/fitAll/fitSelection/reset* 不改 document/nodes/edges,不进
+diff --git a/src/canvas/useGlobalCanvasEvents.ts b/src/canvas/useGlobalCanvasEvents.ts
+index bbdec0f4..b5491fe4 100644
+--- a/src/canvas/useGlobalCanvasEvents.ts
++++ b/src/canvas/useGlobalCanvasEvents.ts
+@@ -1,6 +1,7 @@
+ import { useEffect, useRef } from 'react'
+ import type { RuntimeCanvasTool } from './canvasInteraction'
+ import type { SnapGuide } from './canvasGeometry'
++import type { ToolId } from '../types/mivoCanvas'
+ import { handleLockShortcut, hasActiveTextSelection, hasOpenCanvasModal, isEditingTarget } from './canvasInteraction'
+ import { toolForKeyboardShortcut } from './canvasToolRegistry'
+ import { importImageFileToCanvas } from '../lib/canvasAssetImport'
+@@ -30,6 +31,10 @@ export type GlobalEventsApi = {
+    *  节点判定与待命开合都在调用方包装里(MivoCanvas.startRegionEditOrArm),
+    *  这里只做按键分发。 */
+   onStartRegionEdit?: () => void
++  /** 「用户主动选工具」出口(V/H/T/F/P/A/L/R/O/N/S/E 这些工具快捷键):与工具坞按钮同款,
++   *  先退 AI 编辑待命再落工具。待命中按 V 是同值切换,释放门(边沿触发)看不见,不走这个
++   *  出口的话待命会赖着不走(2026-08-12 用户报障)。不给则退化成裸 setActiveTool。 */
++  onSelectToolByUser?: (toolId: ToolId, reason: string) => void
+   onCloseContextMenu: () => void
+   setTemporaryTool: (tool: RuntimeCanvasTool | undefined) => void
+   setEditingTextNodeId: (id: string | undefined) => void
+@@ -62,6 +67,7 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
+     maskEditNodeId,
+     onCancelMaskEdit,
+     onStartRegionEdit,
++    onSelectToolByUser,
+     contextMenuOpen,
+     onCloseContextMenu,
+     setTemporaryTool,
+@@ -313,7 +319,10 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
+ 
+       if (!modifier && key === 'e') {
+         event.preventDefault()
+-        store.setActiveTool('markup-brush')
++        // E(橡皮)同样是用户主动选工具:与下面 V/H/T/… 那条走同一出口,保持
++        // 「工具快捷键一律先退 AI 编辑待命」这条不变量,别在这里留特例。
++        if (onSelectToolByUser) onSelectToolByUser('markup-brush', '快捷键 E 选中橡皮')
++        else store.setActiveTool('markup-brush')
+         if (store.brushStyle.kind !== 'eraser') store.setBrushStyle({ kind: 'eraser' })
+         return
+       }
+@@ -330,7 +339,10 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
+       const shortcutTool = modifier ? undefined : toolForKeyboardShortcut(key)
+       if (shortcutTool) {
+         event.preventDefault()
+-        store.setActiveTool(shortcutTool)
++        // 用户主动选工具:经 onSelectToolByUser 先退 AI 编辑待命再落工具(待命中按 V 是
++        // 同值切换,不走这条出口的话释放门看不见 → 待命赖着不走)。
++        if (onSelectToolByUser) onSelectToolByUser(shortcutTool, `快捷键 ${key.toUpperCase()} 选中 ${shortcutTool}`)
++        else store.setActiveTool(shortcutTool)
+         if (shortcutTool === 'markup-brush') {
+           // P always means "draw": leaving eraser mode goes back to the marker.
+           if (store.brushStyle.kind === 'eraser') store.setBrushStyle({ kind: 'marker' })
+@@ -530,6 +542,7 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
+     maskEditNodeId,
+     onCancelMaskEdit,
+     onStartRegionEdit,
++    onSelectToolByUser,
+     contextMenuOpen,
+     onCloseContextMenu,
+     resetBrushStamp,
+diff --git a/src/canvas/useRegionEditArmed.test.tsx b/src/canvas/useRegionEditArmed.test.tsx
+index 6f42a5e2..4646b5a8 100644
+--- a/src/canvas/useRegionEditArmed.test.tsx
++++ b/src/canvas/useRegionEditArmed.test.tsx
+@@ -36,6 +36,7 @@ vi.mock('../lib/demoImages', () => ({
+ vi.mock('../store/remoteDebugReporter', () => ({ reportRemoteDebugEntry: () => {} }))
+ 
+ import { useCanvasStore } from '../store/canvasStore'
++import { debugLogger, useDebugLogStore } from '../store/debugLogStore'
+ import { useRegionEditArmed } from './useRegionEditArmed'
+ import type { MaskPointArmedInteractionApi } from './useMaskPointArmed'
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+@@ -48,17 +49,25 @@ let root: Root
+ 
+ const beginRegionEdit = vi.fn(() => true)
+ const fallbackPointerDown = vi.fn()
+-
+-function Harness() {
++const closeRegionEditPanel = vi.fn()
++function Harness({ panelNodeId, tick }: { panelNodeId?: string; tick?: number }) {
+   const interactionRef = useRef<MaskPointArmedInteractionApi>({
+     resolveCanvasHit: () => null,
+     temporaryTool: undefined,
+     isPanning: false,
+   } as unknown as MaskPointArmedInteractionApi)
+-  const armed = useRegionEditArmed({ interactionRef, beginRegionEdit, fallbackPointerDown })
++  const armed = useRegionEditArmed({
++    interactionRef,
++    beginRegionEdit,
++    fallbackPointerDown,
++    regionEditNodeId: panelNodeId,
++    closeRegionEditPanel,
++  })
+   useEffect(() => {
+     api = armed
+   }, [armed])
++  // tick 只作「强制重渲染」的触发点(稳定引用测试用),不参与任何逻辑。
++  void tick
+   return null
+ }
+ 
+@@ -104,10 +113,18 @@ const arm = () => {
+   expect(api.regionEditArmed).toBe(true)
+ }
+ 
++/** 模拟「区域编辑浮层已打开」——真实实现里由 MivoCanvas 的 regionEditNodeId 驱动。 */
++const openPanel = () => {
++  act(() => {
++    root.render(<Harness panelNodeId="panel-node" />)
++  })
++}
++
+ beforeEach(() => {
+   ;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
+   beginRegionEdit.mockClear()
+   fallbackPointerDown.mockClear()
++  closeRegionEditPanel.mockClear()
+   seed()
+   container = document.createElement('div')
+   document.body.appendChild(container)
+@@ -240,3 +257,182 @@ describe('useRegionEditArmed — 置位前先自校再置位(J9 P1-1 续修)', (
+     expect(api.regionEditArmed).toBe(false)
+   })
+ })
++
++// 用户主动选工具的出口(2026-08-12 用户报障):待命期间点工具坞「选择」或按 V 没反应,
++// 反而再点一次「AI 编辑」才切回选择工具 —— 释放门是**边沿触发**的,而待命置位时已把
++// activeTool 归位成 select,此时再选 select 前后同值、订阅拿不到 diff,待命永不释放
++// (按钮一直亮着、工具坞高亮也被它抢着)。治法不是让 setActiveTool 同值也发信号
++// (内部自校归位路径都会被误判成用户切走),而是给「用户主动选工具」一个显式出口。
++describe('useRegionEditArmed — 用户主动选工具即退出待命', () => {
++  it('待命中选「选择」工具(与当前 activeTool 同值)→ 待命必须释放', () => {
++    arm()
++    expect(useCanvasStore.getState().activeTool).toBe('select')
++    act(() => {
++      api.selectToolByUser('select', '测试:工具坞点选择工具')
++    })
++    expect(api.regionEditArmed).toBe(false)
++    expect(useCanvasStore.getState().activeTool).toBe('select')
++  })
++
++  it('待命中选别的工具(值真的变了)→ 同样释放,且工具真的切过去', () => {
++    arm()
++    act(() => {
++      api.selectToolByUser('markup-rect', '测试:工具坞点矩形')
++    })
++    expect(api.regionEditArmed).toBe(false)
++    expect(useCanvasStore.getState().activeTool).toBe('markup-rect')
++  })
++
++  it('非待命时可用且幂等:只切工具,不产生多余的释放日志', () => {
++    act(() => {
++      api.selectToolByUser('select', '测试:未待命点选择工具')
++    })
++    expect(api.regionEditArmed).toBe(false)
++    expect(useCanvasStore.getState().activeTool).toBe('select')
++  })
++
++  it('守卫:裸 setActiveTool 同值仍不释放(内部自校归位路径靠这条不被误判成用户切走)', () => {
++    arm()
++    act(() => {
++      useCanvasStore.getState().setActiveTool('select')
++    })
++    expect(api.regionEditArmed).toBe(true)
++  })
++
++  // 2026-08-12 用户报障(第三条):AI 编辑**面板已经开着**时,点工具坞选择工具 / 按 V
++  // 关不掉面板。原 selectToolByUser 只退待命,没管已打开的面板;又因待命期 activeTool
++  // 恒为 select,点 select 是同值切换,什么都不会发生 → 用户被困在 AI 编辑里。
++  it('面板已打开时选工具 → 关闭面板(选择工具与其它工具都要能退出 AI 编辑)', () => {
++    openPanel()
++    act(() => {
++      api.selectToolByUser('select', '测试:面板开着点选择工具')
++    })
++    expect(closeRegionEditPanel).toHaveBeenCalledTimes(1)
++    expect(useCanvasStore.getState().activeTool).toBe('select')
++  })
++
++  it('面板没开时选工具 → 不去调关面板(不给无关路径发多余动作)', () => {
++    closeRegionEditPanel.mockClear()
++    act(() => {
++      api.selectToolByUser('markup-rect', '测试:面板没开点矩形')
++    })
++    expect(closeRegionEditPanel).not.toHaveBeenCalled()
++  })
++
++  it('日志级别:用户主动选工具记 log(常规开合),不记 warn(warn 留给被动失效)', () => {
++    arm()
++    useDebugLogStore.setState({ entries: [] } as never)
++    act(() => {
++      api.selectToolByUser('select', '测试:工具坞点选择工具')
++    })
++    const regionEntries = useDebugLogStore.getState().entries.filter((e) => e.source === 'Region Edit')
++    expect(regionEntries.length).toBeGreaterThan(0)
++    expect(regionEntries.every((e) => e.level === 'log')).toBe(true)
++  })
++
++  it('对照:被动失效(切场景)仍记 warn,两类释放在 Debug Log 里分得开', () => {
++    arm()
++    useDebugLogStore.setState({ entries: [] } as never)
++    act(() => {
++      useCanvasStore.getState().loadScene('scene-b')
++    })
++    const regionEntries = useDebugLogStore.getState().entries.filter((e) => e.source === 'Region Edit')
++    expect(regionEntries.some((e) => e.level === 'warning')).toBe(true)
++  })
++})
++
++// R3 SC-1:closeRegionEditPanel 的引用稳定性 —— 它进 selectToolByUser 的依赖,而
++// selectToolByUser 又进 useGlobalCanvasEvents 的 window 监听 effect 依赖数组;
++// 若 closeRegionEditPanel 每次渲染新建,全局监听器会随 MivoCanvas 任意重渲染
++// (含 nodes 高频变化)反复卸载重装。这里用真 hook 挂载证明依赖接线:
++// 稳定输入 → 引用不漂移(正确形状);不稳定输入 → 引用漂移(依赖真的在咬,非空转)。
++describe('useRegionEditArmed — closeRegionEditPanel 引用稳定性(R3 SC-1)', () => {
++  it('传入稳定 closeRegionEditPanel 时,selectToolByUser 跨渲染引用稳定(不触发 window 监听 effect churn)', () => {
++    // 模块级 closeRegionEditPanel 是 vi.fn()(挂载期创建一次、渲染间稳定)。
++    act(() => {
++      root.render(<Harness tick={1} />)
++    })
++    const first = api.selectToolByUser
++    act(() => {
++      // 同一实例重渲染(Harness 同类型同位置,仅 tick 变化)。
++      root.render(<Harness tick={2} />)
++    })
++    expect(api.selectToolByUser).toBe(first)
++  })
++
++  it('对照:closeRegionEditPanel 每渲染新建时 selectToolByUser 跟随漂移(依赖接线反证)', () => {
++    // 赋值发生在 useEffect(异步闭包)里,TS 的 CFA 追不到,读取处用非空断言。
++    let unstableApi: HarnessApi | undefined
++    function UnstableCloseHarness({ tick }: { tick: number }) {
++      const interactionRef = useRef<MaskPointArmedInteractionApi>({
++        resolveCanvasHit: () => null,
++        temporaryTool: undefined,
++        isPanning: false,
++      } as unknown as MaskPointArmedInteractionApi)
++      const armed = useRegionEditArmed({
++        interactionRef,
++        beginRegionEdit,
++        fallbackPointerDown,
++        regionEditNodeId: 'panel-node',
++        // 故意复刻 SC-1 修复前的形态:每次渲染新建内联箭头。
++        closeRegionEditPanel: () => closeRegionEditPanel(),
++      })
++      useEffect(() => {
++        unstableApi = armed
++      }, [armed])
++      void tick
++      return null
++    }
++    act(() => {
++      root.render(<UnstableCloseHarness tick={1} />)
++    })
++    const first = unstableApi!.selectToolByUser
++    act(() => {
++      root.render(<UnstableCloseHarness tick={2} />)
++    })
++    expect(unstableApi!.selectToolByUser).not.toBe(first)
++  })
++})
++
++// R3 SC-2:关闭浮层只产生**一条** Region Edit 关闭日志 —— 由 closeRegionEditPanel
++// 内部(cancelRegionEdit)带 nodeId 记,selectToolByUser 自己不再重复写。
++describe('useRegionEditArmed — 浮层关闭日志单一来源(R3 SC-2)', () => {
++  it('面板开着时选工具 → 关闭日志恰好一条,且带 nodeId(来自 closeRegionEditPanel 内部)', () => {
++    let loggingApi: HarnessApi
++    function LoggingCloseHarness({ tick }: { tick: number }) {
++      const interactionRef = useRef<MaskPointArmedInteractionApi>({
++        resolveCanvasHit: () => null,
++        temporaryTool: undefined,
++        isPanning: false,
++      } as unknown as MaskPointArmedInteractionApi)
++      const armed = useRegionEditArmed({
++        interactionRef,
++        beginRegionEdit,
++        fallbackPointerDown,
++        regionEditNodeId: 'panel-node',
++        // 模拟真实接线:MivoCanvas 的 closeRegionEditPanel = cancelRegionEdit,
++        // 后者在 useRegionEdit 内部带 nodeId 记关闭日志。
++        closeRegionEditPanel: () => {
++          debugLogger.log('Region Edit', '区域编辑浮层关闭(panel-node):用户切换工具退出')
++        },
++      })
++      useEffect(() => {
++        loggingApi = armed
++      }, [armed])
++      void tick
++      return null
++    }
++    act(() => {
++      root.render(<LoggingCloseHarness tick={1} />)
++    })
++    useDebugLogStore.setState({ entries: [] } as never)
++    act(() => {
++      loggingApi.selectToolByUser('select', '测试:面板开着点选择工具')
++    })
++    const regionEntries = useDebugLogStore.getState().entries.filter((e) => e.source === 'Region Edit')
++    const closeLogs = regionEntries.filter((e) => e.message.includes('区域编辑浮层关闭'))
++    expect(closeLogs).toHaveLength(1)
++    // 单一关闭日志必须带 nodeId(是 cancelRegionEdit 那条,不是旧的无 nodeId 重复日志)。
++    expect(closeLogs[0].message).toContain('panel-node')
++  })
++})
+diff --git a/src/canvas/useRegionEditArmed.ts b/src/canvas/useRegionEditArmed.ts
+index 26d17ced..3bd977e9 100644
+--- a/src/canvas/useRegionEditArmed.ts
++++ b/src/canvas/useRegionEditArmed.ts
+@@ -14,6 +14,7 @@ import {
+   shouldConsumeArmedEscape,
+ } from './regionEditArmed'
+ import type { MaskPointArmedInteractionApi } from './useMaskPointArmed'
++import type { ToolId } from '../types/mivoCanvas'
+ 
+ type UseRegionEditArmedOptions = {
+   /** 画布外壳的命中测试与默认 pointerdown(与老 armed 通道共用同一个镜像 ref)。 */
+@@ -22,15 +23,27 @@ type UseRegionEditArmedOptions = {
+   beginRegionEdit: (nodeId: string) => boolean
+   /** 非待命路径的默认处理(老局部重绘通道的包装,内含点外收尾)。 */
+   fallbackPointerDown: (event: ReactPointerEvent<HTMLElement>) => void
++  /** 区域编辑浮层当前挂在哪个节点上;undefined = 浮层没开。 */
++  regionEditNodeId?: string
++  /** 关掉已打开的区域编辑浮层(复用画布级 Esc/点外那条收尾)。 */
++  closeRegionEditPanel?: () => void
+ }
+ 
+ export function useRegionEditArmed({
+   interactionRef,
+   beginRegionEdit,
+   fallbackPointerDown,
++  regionEditNodeId,
++  closeRegionEditPanel,
+ }: UseRegionEditArmedOptions) {
+   const [regionEditArmed, setRegionEditArmedState] = useState(false)
+   const armedRef = useRef(false)
++  // 浮层开着与否的现值镜像:selectToolByUser 存进 useCallback 后不该因浮层开关失效重建,
++  // 所以读 ref 拿此刻真值,不把 regionEditNodeId 绑进依赖数组。
++  const panelNodeIdRef = useRef(regionEditNodeId)
++  useEffect(() => {
++    panelNodeIdRef.current = regionEditNodeId
++  }, [regionEditNodeId])
+ 
+   /**
+    * 待命态的**单一出口**。level:用户主动的开合(按钮/快捷键/Esc/面板打开)是常规操作
+@@ -93,6 +106,38 @@ export function useRegionEditArmed({
+     [setArmed],
+   )
+ 
++  /**
++   * 「用户主动选工具」的出口(2026-08-12 用户报障:待命中点选择工具/按 V 没反应,
++   * 反过来再点一次 AI 编辑才切回选择工具)。
++   *
++   * 病根在**释放门是边沿触发**:置位时已把 activeTool 归位成 select(见上面的 toggle),
++   * 此后用户再选 select,前后同值、订阅拿不到 diff,条件表 ① 判不出「工具切走」→ 待命
++   * 永不释放,工具坞高亮也一直被它抢着(toolActive 里 !regionEditArmed 这道排他)。
++   *
++   * 不改 setActiveTool 让它同值也发信号:那条是全局通道,文字标注收尾、Esc 重置、
++   * 撤销归位等一堆**程序自校**路径都走它,同值发信号会把它们统统误判成「用户切走」。
++   * 这里只给带用户意图的两条入口(工具坞按钮、键盘快捷键)一个显式出口:先释放待命,
++   * 再落工具。释放走 setArmed 同一出口,日志与其它被动释放同级(warn)。
++   */
++  const selectToolByUser = useCallback(
++    (toolId: ToolId, reason: string) => {
++      // 用户主动换工具是**常规开合**,不是「语义失效被动释放」:走 setArmed 的 log 档,
++      // 别借 disarmRegionEdit(那条恒 warn,是留给跳过/降级路径的 —— 混用会让 Debug Log
++      // 里正常操作和真正的被动失效分不开)。
++      if (armedRef.current) setArmed(false, reason)
++      // AI 编辑有**两个**在场形态:待命等点图、浮层已经开着。选工具要两个都退干净,
++      // 只退待命的话「选中图片直接开面板」那条路径下用户被困在浮层里 —— 点选择工具
++      // 和按 V 都没反应(浮层期 activeTool 恒为 select,同值切换什么也不会发生)。
++      // 关闭日志由 closeRegionEditPanel → cancelRegionEdit 内部带 nodeId 记一条
++      // (useRegionEdit),这里不重复写,否则同一次关闭刷两条 Region Edit 日志。
++      if (panelNodeIdRef.current) {
++        closeRegionEditPanel?.()
++      }
++      useCanvasStore.getState().setActiveTool(toolId)
++    },
++    [setArmed, closeRegionEditPanel],
++  )
++
+   const handleShellPointerDown = useCallback(
+     (event: ReactPointerEvent<HTMLElement>) => {
+       const { resolveCanvasHit, temporaryTool, isPanning } = interactionRef.current
+@@ -159,5 +204,12 @@ export function useRegionEditArmed({
+     return () => window.removeEventListener('keydown', handleEscape, { capture: true })
+   }, [setArmed])
+ 
+-  return { regionEditArmed, openRegionEdit, toggleRegionEditArmed, disarmRegionEdit, handleShellPointerDown }
++  return {
++    regionEditArmed,
++    openRegionEdit,
++    toggleRegionEditArmed,
++    disarmRegionEdit,
++    selectToolByUser,
++    handleShellPointerDown,
++  }
+ }

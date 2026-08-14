@@ -1,0 +1,306 @@
+diff --git a/ghost.json b/ghost.json
+index 0929c645..58399849 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.14",
++  "version": "0.9.15",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+@@ -64,7 +64,7 @@
+   "tools": [
+     {
+       "name": "canvas_snapshot",
+-      "description": "读取画布当前内容的结构化快照:节点(文字/图片/分区/标注)、位置尺寸、连线与衍生关系。默认读整块活跃画布;画布很大时用 region(画布世界坐标矩形)或 sectionId(只读某个分区及其全部子节点)缩小范围,二者互斥。单次返回上限 256KB,超出会只返回第一页并带 nextCursor——把它原样传回 cursor 继续读(翻页期间画布被改动会返回 STALE_CURSOR,那时重新从第一页开始)。返回内容含 selectedImageNodeIds(用户当前选中且在本次结果集内的图片节点 id 列表)与 selectedNodeCount(选中节点总数,不限类型)。用户说「这张」/「选中的图」时,从 selectedImageNodeIds 取 id,显式传给 canvas_edit_image 的 nodeId——canvas_edit_image 不会自动读取当前选中,必须显式传 id。返回 JSON;面板未打开时返回最近一次自动保存的快照并注明来源(离线快照不支持过滤与翻页)。默认只读结构,零寄存请求;要看某几张图的像素时用 mediaNodeIds 显式点名(最多 8 个,必须是本次调用返回的这一页里的图片节点 id),返回里会带 mediaStates(逐 id 的 available/imageRef 或 unavailable/reason)与 mediaSummary(requested/available/unavailable 计数)。available 的 imageRef 只是引用(形如 cindy-media://blobs/<hash><ext>),不含像素;要看像素直接用 Read 工具读取推导出的落盘路径:<Cindy 应用 userData 目录>/cindy-media/blobs/<hash 前 2 位小写>/<hash><ext>(macOS 上 userData 目录即 ~/Library/Application Support/Cindy)。一次要看的图超过 8 张时:先分页遍历拿到完整候选清单并固化目标 id,再按页遍历、在包含目标 id 的那一页调用里点名该页目标(每页最多 8 个);维护「已成功读取」与「已知不可读」两个 id 集合,完成条件是两者的并集覆盖固化目标清单全部 id——不要按调用次数累加 requested 计数(会随 STALE_CURSOR 重新遍历而虚高),也不要只看第一批结果就下结论。遇到 STALE_CURSOR 时从第一页重新遍历,固化的目标清单不因此改变。",
++      "description": "读取画布当前内容的结构化快照:节点(文字/图片/分区/标注)、位置尺寸、连线与衍生关系。默认读整块活跃画布;画布很大时用 region(画布世界坐标矩形)或 sectionId(只读某个分区及其全部子节点)缩小范围,二者互斥。单次返回上限 256KB,超出会只返回第一页并带 nextCursor——把它原样传回 cursor 继续读(翻页期间画布被改动会返回 STALE_CURSOR,那时重新从第一页开始)。返回内容含 selectedImageNodeIds(用户当前选中且在本次结果集内的图片节点 id 列表)与 selectedNodeCount(选中节点总数,不限类型)。用户说「这张」/「选中的图」时,从 selectedImageNodeIds 取 id,显式传给 canvas_edit_image 的 nodeId——canvas_edit_image 不会自动读取当前选中,必须显式传 id。返回 JSON;面板未打开时返回最近一次自动保存的快照并注明来源(离线快照不支持过滤与翻页)。默认只读结构,零寄存请求;要看某几张图的像素时用 mediaNodeIds 显式点名(最多 8 个,必须是本次调用返回的这一页里的图片节点 id),返回里会带 mediaStates(逐 id 的 available/imageRef 或 unavailable/reason)与 mediaSummary(requested/available/unavailable 计数)。available 的 imageRef 只是引用(形如 cindy-media://blobs/<hash><ext>),不含像素;要看像素直接用 Read 工具读取推导出的落盘路径:<Cindy 应用 userData 目录>/cindy-media/blobs/<hash 原样前 2 个字符>/<hash><ext>——分片键取 hash 自身前 2 个字符,原样使用,不做大小写转换(hash 是 BBcd… 时分片目录就是 BB,不是 bb;大小写敏感文件系统上转换了就读不到)(macOS 上 userData 目录即 ~/Library/Application Support/Cindy)。一次要看的图超过 8 张时:先分页遍历拿到完整候选清单并固化目标 id,再按页遍历、在包含目标 id 的那一页调用里点名该页目标(每页最多 8 个);维护「已成功读取」与「已知不可读」两个 id 集合,完成条件是两者的并集覆盖固化目标清单全部 id——不要按调用次数累加 requested 计数(会随 STALE_CURSOR 重新遍历而虚高),也不要只看第一批结果就下结论。遇到 STALE_CURSOR 时从第一页重新遍历,固化的目标清单不因此改变。",
+       "parameters": {
+         "type": "object",
+         "properties": {
+diff --git a/src/__tests__/canvasSnapshotMediaDisciplineText.test.ts b/src/__tests__/canvasSnapshotMediaDisciplineText.test.ts
+index 16d464fb..299891f9 100644
+--- a/src/__tests__/canvasSnapshotMediaDisciplineText.test.ts
++++ b/src/__tests__/canvasSnapshotMediaDisciplineText.test.ts
+@@ -16,6 +16,8 @@ import { readFileSync } from 'node:fs'
+ import { fileURLToPath } from 'node:url'
+ import { describe, expect, it } from 'vitest'
+ 
++import { deriveMediaFilePath } from '../agent/mediaRefFormat'
++
+ const GHOST_PATH = fileURLToPath(new URL('../../ghost.json', import.meta.url))
+ const MAIN_JS_PATH = fileURLToPath(new URL('../../main.js', import.meta.url))
+ const AGENT_BRIDGE_PATH = fileURLToPath(new URL('../agent/agentBridge.ts', import.meta.url))
+@@ -76,13 +78,30 @@ describe('SC-T3c.1 canvas_snapshot 描述文本与 mediaNodeIds 生产代码对
+     expect(tool.description).toContain('cindy-media://blobs/<hash><ext>')
+   })
+ 
+-  it('description 里的落盘路径推导公式与 T0 冻结契约的分片规则(前 2 位)描述一致', () => {
++  it('description 教给 agent 的落盘路径公式,与 deriveMediaFilePath 的实际行为逐字一致(不是文本自洽)', () => {
+     const tool = canvasSnapshotTool()
+-    // 公式本身的可执行版本在 T3b2 的 deriveMediaFilePath(独立 PR,不在本分支)——
+-    // 本条只锁"文本自己内部有没有前后矛盾"这一层:分片键的位数描述与路径模板
+-    // 里出现的位数一致,防止散文改写时把"前 2 位"悄悄改成别的数字却漏改模板。
+-    expect(tool.description).toContain('前 2 位小写')
+-    expect(tool.description).toContain('blobs/<hash 前 2 位小写>/<hash><ext>')
++    // 这条曾经只做"文本自己内部不矛盾"(断言同一个错短语出现两次),因此当 ghost 写
++    // 「前 2 位小写」而实现是原样 `hash.slice(0,2)` 时它照样全绿——r2-vision 二轮审
++    // BLOCKER 3。根因是当时 deriveMediaFilePath 在兄弟分支上、本分支 import 不到;
++    // T3c 重排到 T3b2 之上后它已在树内,所以改成真正跑一遍实现来对账。
++    //
++    // 大写 hash 是关键夹具:只有它能区分「原样」与「转小写」两种规则——小写 hash 在
++    // 两种规则下结果相同,拿它做夹具等于什么都没测。
++    const upperHash = 'BB'.repeat(16) // 32 位十六进制,前 2 位大写
++    const actual = deriveMediaFilePath(upperHash, '.png', '/root')
++    expect(actual).toEqual({ ok: true, path: `/root/blobs/BB/${upperHash}.png` })
++
++    // 实现的分片键 = hash 原样前 2 字符(大小写不变)。文本必须教同一条规则。
++    expect(tool.description).toContain('blobs/<hash 原样前 2 个字符>/<hash><ext>')
++    expect(tool.description).toContain('原样使用,不做大小写转换')
++
++    // 反向:文本不得在路径公式附近教任何大小写转换——`<hash 前 2 位小写>` 这类措辞
++    // 会把 agent 引到 /blobs/bb/ 而实现落在 /blobs/BB/,在大小写敏感文件系统上读不到。
++    const pathSentence = tool.description.slice(
++      tool.description.indexOf('cindy-media/blobs/'),
++      tool.description.indexOf('macOS 上 userData'),
++    )
++    expect(pathSentence).not.toMatch(/位小写|转小写|toLowerCase|位大写|转大写|toUpperCase/)
+   })
+ 
+   it('description 不得只字未提 mediaSummary/mediaStates 输出形状(否则 agent 拿到字段却不知道怎么解读)', () => {
+diff --git a/src/__tests__/mediaRefHashGate.test.ts b/src/__tests__/mediaRefHashGate.test.ts
+new file mode 100644
+index 00000000..fff8680b
+--- /dev/null
++++ b/src/__tests__/mediaRefHashGate.test.ts
+@@ -0,0 +1,112 @@
++/**
++ * imageRef 的 hash 形状门(r2-vision 二轮审 BLOCKER 2 返修)。
++ *
++ * 被修的缺陷:`buildImageRef` 只校验 ext、**hash 原样插值**,而从来没有生产 callsite 的
++ * `deriveMediaFilePath` 反倒校验了 hash —— 走生产的那个不校验,不走生产的那个校验,正好
++ * 反了。存量账本是不可信输入(`depositMigration.ts` 原先只校验「非空字符串」),一个
++ * `{hash:'../../sensitive', ext:'.png'}` 就能产出 `cindy-media://blobs/../../sensitive.png`
++ * 并被 `agentBridge.ts:214` 的 else 分支之外标成 `available`;ghost 又教外部 agent 把 hash
++ * 原样代入落盘路径,于是 agent 的 Read 目标可能逃出 blobs 分片目录。
++ *
++ * ── 本文件证明什么、不证明什么(诚实边界)──
++ *
++ * r2-vision 要求的是 `recordMigration`→snapshot 端到端用例。本文件**没有**重建那套端到端
++ * 台子(真实 depositPort + 真实 main.js + 假宿主,见 agentBridgeMediaResolve.test.ts 的
++ * harness),而是用「单元断言 + 结构充分性断言」组合替代:
++ *
++ *   1. 单元层:非法 hash 一律拿不到 imageRef(`buildImageRef` 返 null);
++ *   2. 结构层:断言 `buildImageRef` 是 `cindy-media://blobs/` 在生产代码里的**唯一**构造
++ *      点 —— 这一条是让第 1 条从「必要」升级为「充分」的关键。少了它,第 1 条只能证明
++ *      「这个函数不产出非法引用」,证明不了「生产不会从别处产出非法引用」。
++ *   3. 迁移层:非法 hash 的存量条目不进 depositMap(纵深防御,不是主防线)。
++ *
++ * 这个替代是有代价的:它不覆盖「桥层拿到 null 之后是否真的落 unavailable/unknown」这一
++ * 跳 —— 那一跳由 agentBridgeMediaResolve.test.ts 已有的非法 ext 用例覆盖(同一 else
++ * 分支,与 hash 合法性无关)。如果将来那个 else 分支被改动,本文件抓不到。
++ */
++import { readFileSync } from 'node:fs'
++import { fileURLToPath } from 'node:url'
++import { describe, expect, it } from 'vitest'
++
++import { buildImageRef, deriveMediaFilePath, normalizeImageRefHash } from '../agent/mediaRefFormat'
++
++const MEDIA_REF_FORMAT_PATH = fileURLToPath(new URL('../agent/mediaRefFormat.ts', import.meta.url))
++const AGENT_BRIDGE_PATH = fileURLToPath(new URL('../agent/agentBridge.ts', import.meta.url))
++
++/**
++ * 剥掉块注释与行注释,只留可执行代码。
++ *
++ * `//` 的行注释规则必须排除 `://` —— 否则 `cindy-media://blobs/...` 这个模板字面量本身
++ * 会被当成行注释起点整行删掉,断言就永远数到 0 个构造点而"全绿"。我写这条断言时正好
++ * 踩了一次:这类文本扫描的脆性,与本轮 r2-vision 抓的文本门假绿是同一个根因。
++ */
++const stripComments = (source: string): string =>
++  source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1')
++
++/** 32 位合法 hex(小写),以及它的大写形态——T0 契约要求两者都原样保留。 */
++const LOWER_HASH = 'ab'.repeat(16)
++const UPPER_HASH = LOWER_HASH.toUpperCase()
++
++const ILLEGAL_HASHES: Array<[string, unknown]> = [
++  ['路径上级引用(本次 BLOCKER 的原型)', '../../sensitive'],
++  ['含正斜杠', 'abcdef0123456789/etc/passwd'],
++  ['含反斜杠', 'abcdef0123456789\\windows'],
++  ['非 hex 字符', 'zzzzzzzzzzzzzzzz'],
++  ['15 位(短于下界 16)', 'a'.repeat(15)],
++  ['129 位(长于上界 128)', 'a'.repeat(129)],
++  ['空字符串', ''],
++  ['非字符串 · null', null],
++  ['非字符串 · 数字', 12345],
++  ['非字符串 · 对象', { hash: LOWER_HASH }],
++]
++
++describe('BLOCKER 2 · hash 形状门:非法 hash 一律拿不到 imageRef', () => {
++  it.each(ILLEGAL_HASHES)('buildImageRef 拒绝非法 hash(%s)', (_label, badHash) => {
++    // 关键:ext 是完全合法的 —— 证明拒绝来自 hash 校验本身,不是被 ext 门顺手挡住的。
++    expect(buildImageRef(badHash, '.png')).toBeNull()
++  })
++
++  it.each(ILLEGAL_HASHES)('deriveMediaFilePath 同样拒绝(两个入口复用同一套判据)', (_label, badHash) => {
++    const result = deriveMediaFilePath(badHash, '.png', '/root')
++    expect(result.ok).toBe(false)
++  })
++
++  it('合法 hex 原样保留大小写(T0 契约:不做大小写转换或格式再加工)', () => {
++    expect(buildImageRef(LOWER_HASH, '.png')).toBe(`cindy-media://blobs/${LOWER_HASH}.png`)
++    expect(buildImageRef(UPPER_HASH, '.png')).toBe(`cindy-media://blobs/${UPPER_HASH}.png`)
++    // 大小写混合也原样 —— 不归一成任何一侧。
++    const mixed = `${UPPER_HASH.slice(0, 8)}${LOWER_HASH.slice(8)}`
++    expect(buildImageRef(mixed, '.png')).toBe(`cindy-media://blobs/${mixed}.png`)
++  })
++
++  it('legacy 无点 ext 仍按既有约定补点(hash 门不得回归 ext 的既有行为)', () => {
++    expect(buildImageRef(LOWER_HASH, 'png')).toBe(`cindy-media://blobs/${LOWER_HASH}.png`)
++  })
++
++  it('normalizeImageRefHash 的 reason 说清了判据,不是空话', () => {
++    const bad = normalizeImageRefHash('../../sensitive')
++    expect(bad.ok).toBe(false)
++    if (!bad.ok) expect(bad.reason).toContain('16-128 位 hex')
++  })
++})
++
++describe('BLOCKER 2 · 结构充分性:buildImageRef 是唯一生产构造点', () => {
++  it('生产代码里 `cindy-media://blobs/` 的字符串拼接只出现在 buildImageRef 内', () => {
++    const source = readFileSync(MEDIA_REF_FORMAT_PATH, 'utf8')
++    // 去掉块注释与行注释,只看可执行代码 —— 注释里为了讲清缺陷会引用该前缀(本文件头部
++    // 与 mediaRefFormat.ts 头部都有),不能把注释当构造点。
++    const code = stripComments(source)
++    const hits = code.match(/cindy-media:\/\/blobs\//g) ?? []
++    expect(hits).toHaveLength(1)
++    // 且这一处必须落在 buildImageRef 的函数体里(用 hashResult.hash 而非裸 hash 插值,
++    // 即「已过校验的值」才允许进模板)。
++    expect(code).toContain('`cindy-media://blobs/${hashResult.hash}${extResult.ext}`')
++  })
++
++  it('agentBridge.ts 构造 available 引用时只经 buildImageRef,不自行拼前缀', () => {
++    const source = readFileSync(AGENT_BRIDGE_PATH, 'utf8')
++    const code = stripComments(source)
++    expect(code).toContain('buildImageRef(entry.hash, entry.ext)')
++    expect(code).not.toMatch(/cindy-media:\/\/blobs\//)
++  })
++})
+diff --git a/src/agent/depositMigration.ts b/src/agent/depositMigration.ts
+index a5c39d75..c639ff01 100644
+--- a/src/agent/depositMigration.ts
++++ b/src/agent/depositMigration.ts
+@@ -16,6 +16,7 @@
+ import { readOwnProp } from '../../../src/lib/safeArgs'
+ import { debugLogger } from '../../../src/store/debugLogStore'
+ import { loadDepositStore, recordMigration, type DepositEntryDraft } from './depositStore'
++import { normalizeImageRefHash } from './mediaRefFormat'
+ 
+ const SOURCE = 'Cindy Deposit'
+ 
+@@ -119,6 +120,15 @@ export const migrateLedgerIntoDepositStore = async (): Promise<MigrationOutcome>
+       skipped += 1
+       continue
+     }
++    // hash 形状门(r2-vision 二轮审 BLOCKER 2 的纵深防御):存量账本是不可信输入,
++    // 上面那行只挡住"缺失/非字符串",挡不住 `../../sensitive` 这种路径形状的 hash。
++    // 主防线在消费边界(`buildImageRef` 已拒绝非法 hash,不产出 imageRef),这里再挡
++    // 一道是为了不把已知非法的条目写进 depositMap ——但**不能只靠这里**:迁移之外还有
++    // 别的写入历史(旧版本直接写过的 map),消费边界必须独立重新校验。
++    if (!normalizeImageRefHash(hash).ok) {
++      skipped += 1
++      continue
++    }
+     // 已有 deposit 记录的键不覆盖(deposit 来源比 ledger 更权威)。
+     if (store.map[assetUrl]) continue
+     staged.push([assetUrl, { hash, ext, depositedAt: 0, from: 'ledger' }])
+diff --git a/src/agent/mediaRefFormat.ts b/src/agent/mediaRefFormat.ts
+index 1c95867f..df6b8826 100644
+--- a/src/agent/mediaRefFormat.ts
++++ b/src/agent/mediaRefFormat.ts
+@@ -36,20 +36,52 @@ export const normalizeImageRefExt = (rawExt: unknown): ImageRefExtResult => {
+ }
+ 
+ /**
+- * imageRef(`cindy-media://blobs/<hash><ext>`)的唯一构造入口。ext 校验失败时返回
+- * `null`——调用方据此把该 id 判 `unavailable`(fail closed),不得退回到原样拼接。
++ * receiptHash 十六进制指纹的形状校验(与 `agentBridge.ts` 的 `fetchOwnedMediaFile`
++ * 同一正则,统一规则不重新发明)。
+  */
+-export const buildImageRef = (hash: string, rawExt: unknown): string | null => {
+-  const extResult = normalizeImageRefExt(rawExt)
+-  if (!extResult.ok) return null
+-  return `cindy-media://blobs/${hash}${extResult.ext}`
++const HASH_RE = /^[a-f0-9]{16,128}$/i
++
++export type ImageRefHashResult = { ok: true; hash: string } | { ok: false; reason: string }
++
++/**
++ * hash 形状校验的唯一入口(与 `normalizeImageRefExt` 同级)。
++ *
++ * 为什么必须与 ext 同级(r2-vision 二轮审 BLOCKER 2):此前只有 ext 走校验,hash 在
++ * `buildImageRef` 里**原样插值**,而 `deriveMediaFilePath` 反倒校验了 hash——**走生产的
++ * 那个不校验,不走生产的那个校验,正好反了**。存量账本是不可信输入(`depositMigration.ts`
++ * 只校验 `typeof hash === 'string' && hash`),一个 `{hash:'../../sensitive'}` 就能产出
++ * `cindy-media://blobs/../../sensitive.png` 并被标成 `available`;ghost 又教外部 agent 把
++ * hash 原样代入落盘路径,于是 Read 目标可能逃出 blobs 分片目录。
++ *
++ * 教训记在这里:上一版把「路径形状」只想成了 ext 的问题(见 `normalizeImageRefExt` 里
++ * 对 `/`、`\`、`..` 的拦截),却漏了同一条路径里的另一个插值点。**同一个模板里的每个
++ * 插值点都要各自校验,不能因为其中一个校验过了就推断整条路径安全。**
++ *
++ * 注意这里不做大小写归一:T0 冻结契约要求 hash「原样使用,不做大小写转换或格式再加工」,
++ * 所以只校验形状、原样返回。
++ */
++export const normalizeImageRefHash = (rawHash: unknown): ImageRefHashResult => {
++  if (typeof rawHash !== 'string' || !rawHash) {
++    return { ok: false, reason: 'hash 缺失或非字符串' }
++  }
++  if (!HASH_RE.test(rawHash)) {
++    return { ok: false, reason: `hash 不是合法的十六进制指纹(16-128 位 hex):${rawHash}` }
++  }
++  return { ok: true, hash: rawHash }
+ }
+ 
+ /**
+- * receiptHash 十六进制指纹的形状校验(与 `agentBridge.ts` 的 `fetchOwnedMediaFile`
+- * 同一正则,统一规则不重新发明)。
++ * imageRef(`cindy-media://blobs/<hash><ext>`)的唯一构造入口。**hash 或 ext 任一校验
++ * 失败都返回 `null`**——调用方据此把该 id 判 `unavailable`(fail closed),不得退回到
++ * 原样拼接。
+  */
+-const HASH_RE = /^[a-f0-9]{16,128}$/i
++export const buildImageRef = (hash: unknown, rawExt: unknown): string | null => {
++  const hashResult = normalizeImageRefHash(hash)
++  if (!hashResult.ok) return null
++  const extResult = normalizeImageRefExt(rawExt)
++  if (!extResult.ok) return null
++  return `cindy-media://blobs/${hashResult.hash}${extResult.ext}`
++}
+ 
+ export type MediaFilePathResult = { ok: true; path: string } | { ok: false; reason: string }
+ 
+@@ -69,16 +101,15 @@ export type MediaFilePathResult = { ok: true; path: string } | { ok: false; reas
+  * 「面板侧生产代码不得持有宿主通道」门禁是 regex 扫源码、只剥行注释不剥块注释,
+  * 点式形态会让这份纯注释被判成违规(门禁语义没问题,是它读不出块注释)。
+  */
+-export const deriveMediaFilePath = (hash: string, rawExt: unknown, mediaRoot: string): MediaFilePathResult => {
+-  if (typeof hash !== 'string' || !HASH_RE.test(hash)) {
+-    return { ok: false, reason: `hash 不是合法的十六进制指纹:${String(hash)}` }
+-  }
++export const deriveMediaFilePath = (hash: unknown, rawExt: unknown, mediaRoot: string): MediaFilePathResult => {
++  const hashResult = normalizeImageRefHash(hash)
++  if (!hashResult.ok) return hashResult
+   const extResult = normalizeImageRefExt(rawExt)
+   if (!extResult.ok) return extResult
+   if (typeof mediaRoot !== 'string' || !mediaRoot) {
+     return { ok: false, reason: 'mediaRoot 缺失或非字符串' }
+   }
+   const root = mediaRoot.endsWith('/') ? mediaRoot.slice(0, -1) : mediaRoot
+-  const shard = hash.slice(0, 2)
+-  return { ok: true, path: `${root}/blobs/${shard}/${hash}${extResult.ext}` }
++  const shard = hashResult.hash.slice(0, 2)
++  return { ok: true, path: `${root}/blobs/${shard}/${hashResult.hash}${extResult.ext}` }
+ }

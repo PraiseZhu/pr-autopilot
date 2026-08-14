@@ -1,0 +1,186 @@
+diff --git a/scripts/loops/bug-doctor/gate.mjs b/scripts/loops/bug-doctor/gate.mjs
+index e004c3b5..45291b57 100644
+--- a/scripts/loops/bug-doctor/gate.mjs
++++ b/scripts/loops/bug-doctor/gate.mjs
+@@ -30,6 +30,7 @@ import { createHash } from 'node:crypto'
+ import { fileURLToPath } from 'node:url'
+ 
+ import { FINGERPRINT_VERSION, fingerprintOf, normalizeMessage } from './fingerprint.mjs'
++import { applyRecurrence } from './recurrence.mjs'
+ import {
+   STATE_FILE,
+   WORKPACKET_FILE,
+@@ -78,12 +79,9 @@ const MAX_SAMPLES_PER_CLUSTER = 3
+ 
+ // 台账里视为"已处理"的簇状态:不进工作包(known-noise 由进化轮沉淀)
+ const SETTLED_STATUSES = new Set(['fixed', 'issue-filed', 'known-noise'])
+-// SC1 复发簇:仅这两种"已处理"状态可被晚于其结算时刻的新记录重新打开;
+-// known-noise 是"判定为非 bug"的沉淀结论,不适用复发语义,不在此列。
+-const RECURRENCE_SOURCE_STATUS = {
+-  fixed: { settledAtField: 'fixedAt', nextAction: 're-fix' },
+-  'issue-filed': { settledAtField: 'issueFiledAt', nextAction: 'append-comment' },
+-}
++// SC1 复发判定(RECURRENCE_SOURCE_STATUS + fail-closed 转移)已抽到共享模块
++// recurrence.mjs —— 全仓唯一定义点,gate 与 sentry-intake 共用,禁止在任何
++// 消费方重新手写(bd2 批次教训:第二份手抄实现抄回了 R1a 修掉的 fail-open)。
+ const HOUR_MS = 3_600_000
+ 
+ // ---- 基础工具 ----
+@@ -372,19 +370,8 @@ const upsertRecord = (state, rec, flags) => {
+     // (状态转移,只写 state.json,只有 gate 自己读)——不受消费方兼容开关约束,
+     // 始终按 R1a 的 fail-closed 判定正常进行。开关只管 B 层(要不要把这件事
+     // 告诉工作包消费方),在 buildWorkpacket 里控制,见那里的注释。
+-    const recur = RECURRENCE_SOURCE_STATUS[cluster.status]
+-    if (recur) {
+-      const settledAt = cluster[recur.settledAtField]
+-      // fail-closed(SC-BD1-R1a):缺结算时间戳(生产异常态,写入方漏写)不重开;
+-      // 原 `!settledAt ||` 会让 settledAt 恒 undefined 时无条件重开,把"没写时间戳"
+-      // 误判成"永远复发"。只有结算时刻确实存在且新记录晚于它,才是真复发。
+-      if (settledAt && rec.receivedAt > settledAt) {
+-        cluster.status = 'recurrent'
+-        cluster.recurredAt = rec.receivedAt
+-        cluster.nextAction = recur.nextAction
+-        recurred = true
+-      }
+-    }
++    // 判定与状态转移本体在 recurrence.mjs(fail-closed,SC-BD1-R1a 注释见彼处)。
++    recurred = applyRecurrence(cluster, rec.receivedAt)
+   }
+   cluster.count += 1
+   if (rec.receivedAt < cluster.firstSeen) cluster.firstSeen = rec.receivedAt
+diff --git a/scripts/loops/bug-doctor/recurrence.mjs b/scripts/loops/bug-doctor/recurrence.mjs
+new file mode 100644
+index 00000000..383352b6
+--- /dev/null
++++ b/scripts/loops/bug-doctor/recurrence.mjs
+@@ -0,0 +1,45 @@
++// recurrence.mjs — SC1 复发判定的唯一权威实现(全仓单一定义点)
++//
++// 为什么抽成共享模块(bd2 批次,治类不治例):
++//   批次 1 的 SC-BD1-R1a 在 gate.mjs 里把复发判定从 fail-open(`!settledAt ||`)
++//   修成 fail-closed 后,批次 2 初版的 sentry-intake.mjs 又把修复前的旧判定
++//   手抄了一份——同一个决策存在两份实现,修一份漏一份。本模块让第二份实现
++//   物理上不存在:gate.mjs 与 sentry-intake.mjs 都必须 import 这里,任何一侧
++//   再手写判定都应在 review 中按重复实现打回。
++//
++// 语义(与 gate.mjs 抽出前逐字等价):
++//   仅 fixed / issue-filed 两种"已处理"状态可被晚于其结算时刻的新记录重新
++//   打开;known-noise 是"判定为非 bug"的沉淀结论,不适用复发语义,不在此列。
++export const RECURRENCE_SOURCE_STATUS = {
++  fixed: { settledAtField: 'fixedAt', nextAction: 're-fix' },
++  'issue-filed': { settledAtField: 'issueFiledAt', nextAction: 'append-comment' },
++}
++
++/**
++ * 对簇原地应用 SC1 复发状态转移。
++ *
++ * fail-closed(SC-BD1-R1a):缺结算时间戳(生产异常态,写入方漏写)不重开;
++ * 原 `!settledAt ||` 写法会让 settledAt 恒 undefined 时无条件重开,把"没写
++ * 时间戳"误判成"永远复发"。只有结算时刻确实存在且新记录晚于它,才是真复发。
++ * receivedAt <= 结算时刻的记录(晚到的历史回填)不重开,由调用方按各自的
++ * 通用逻辑正常并入计数/样本。
++ *
++ * @param {object} cluster  台账簇(status / fixedAt / issueFiledAt 等字段原地改写)
++ * @param {number|string} receivedAt  新记录的接收时刻。两个消费方(gate /
++ *   sentry-intake)实际均用 ISO-8601 UTC 字符串,与 fixedAt/issueFiledAt 同
++ *   格式——同格式字符串的字典序即时序,`>` 比较对 ISO 串与 epoch ms 都成立;
++ *   但**不得混用两种类型**(数字与字符串比较恒 false,会把真复发静默吞掉)。
++ * @returns {boolean} 是否发生了复发转移(true 时 cluster 已被写为 recurrent)
++ */
++export function applyRecurrence(cluster, receivedAt) {
++  const recur = RECURRENCE_SOURCE_STATUS[cluster.status]
++  if (!recur) return false
++  const settledAt = cluster[recur.settledAtField]
++  if (settledAt && receivedAt > settledAt) {
++    cluster.status = 'recurrent'
++    cluster.recurredAt = receivedAt
++    cluster.nextAction = recur.nextAction
++    return true
++  }
++  return false
++}
+diff --git a/scripts/loops/bug-doctor/recurrence.test.mjs b/scripts/loops/bug-doctor/recurrence.test.mjs
+new file mode 100644
+index 00000000..29d1a99b
+--- /dev/null
++++ b/scripts/loops/bug-doctor/recurrence.test.mjs
+@@ -0,0 +1,79 @@
++// recurrence.test.mjs — 共享复发判定的直接单测(SC-B2V2-01)
++//
++// 这些用例锁的是"唯一定义点"的行为本体;gate.test.mjs 既有的复发用例锁的
++// 是 gate 消费方接线不变。两层合起来构成反向变异的双侧红:把本模块判定
++// 改回 fail-open(`!settledAt ||`),此处与 gate 侧必须同时变红。
++import { describe, expect, it } from 'vitest'
++import { RECURRENCE_SOURCE_STATUS, applyRecurrence } from './recurrence.mjs'
++
++const T0 = Date.parse('2026-08-01T00:00:00Z')
++const T1 = T0 + 3_600_000
++
++describe('SC1 复发判定共享模块:fail-closed 状态转移(全仓唯一定义点)', () => {
++  it('SC-B2V2-01 fixed 簇 + fixedAt 在场 + 新记录更晚 → 转 recurrent / re-fix', () => {
++    const cluster = { status: 'fixed', fixedAt: T0 }
++    expect(applyRecurrence(cluster, T1)).toBe(true)
++    expect(cluster.status).toBe('recurrent')
++    expect(cluster.recurredAt).toBe(T1)
++    expect(cluster.nextAction).toBe('re-fix')
++  })
++
++  it('SC-B2V2-01 issue-filed 簇 + issueFiledAt 在场 + 新记录更晚 → 转 recurrent / append-comment', () => {
++    const cluster = { status: 'issue-filed', issueFiledAt: T0 }
++    expect(applyRecurrence(cluster, T1)).toBe(true)
++    expect(cluster.status).toBe('recurrent')
++    expect(cluster.nextAction).toBe('append-comment')
++  })
++
++  it('SC-B2V2-01 fail-closed(SC-BD1-R1a):fixedAt 缺失 → 不重开,簇原样', () => {
++    const cluster = { status: 'fixed' }
++    expect(applyRecurrence(cluster, T1)).toBe(false)
++    expect(cluster.status).toBe('fixed')
++    expect(cluster.recurredAt).toBeUndefined()
++    expect(cluster.nextAction).toBeUndefined()
++  })
++
++  it('SC-B2V2-01 fail-closed(SC-BD1-R1a):issueFiledAt 缺失 → 不重开', () => {
++    const cluster = { status: 'issue-filed' }
++    expect(applyRecurrence(cluster, T1)).toBe(false)
++    expect(cluster.status).toBe('issue-filed')
++  })
++
++  it('SC-B2V2-01 晚到的历史回填(receivedAt <= 结算时刻)→ 不重开', () => {
++    const cluster = { status: 'fixed', fixedAt: T1 }
++    expect(applyRecurrence(cluster, T0)).toBe(false)
++    expect(applyRecurrence({ status: 'fixed', fixedAt: T1 }, T1)).toBe(false)
++  })
++
++  it('SC-B2V2-01 known-noise 不适用复发语义 → 永不重开', () => {
++    const cluster = { status: 'known-noise', fixedAt: T0 }
++    expect(applyRecurrence(cluster, T1)).toBe(false)
++    expect(cluster.status).toBe('known-noise')
++  })
++
++  it('SC-B2V2-01 非结算状态(open/recurrent 等)不触发转移', () => {
++    for (const status of ['open', 'recurrent', 'triaged', undefined]) {
++      const cluster = { status, fixedAt: T0 }
++      expect(applyRecurrence(cluster, T1)).toBe(false)
++      expect(cluster.status).toBe(status)
++    }
++  })
++
++  it('SC-B2V2-01 生产货币是 ISO-8601 UTC 字符串:字典序比较正确触发/不触发复发', () => {
++    // gate 的 rec.receivedAt 与 sentry-intake 的 pseudoReceivedAt、以及
++    // applyMarkFixed 写入的 fixedAt(gh 的 mergedAt)都是 ISO 字符串——锁住
++    // 这一层,防止未来有人把一侧改成 epoch ms 造成类型混比恒 false。
++    const cluster = { status: 'fixed', fixedAt: '2026-08-01T00:00:00.000Z' }
++    expect(applyRecurrence(cluster, '2026-08-02T00:00:00.000Z')).toBe(true)
++    expect(cluster.status).toBe('recurrent')
++    const backfill = { status: 'fixed', fixedAt: '2026-08-01T00:00:00.000Z' }
++    expect(applyRecurrence(backfill, '2026-07-31T00:00:00.000Z')).toBe(false)
++    expect(backfill.status).toBe('fixed')
++  })
++
++  it('SC-B2V2-01 定义点唯一性:RECURRENCE_SOURCE_STATUS 恰含 fixed 与 issue-filed 两键', () => {
++    expect(Object.keys(RECURRENCE_SOURCE_STATUS).sort()).toEqual(['fixed', 'issue-filed'])
++    expect(RECURRENCE_SOURCE_STATUS.fixed.settledAtField).toBe('fixedAt')
++    expect(RECURRENCE_SOURCE_STATUS['issue-filed'].settledAtField).toBe('issueFiledAt')
++  })
++})

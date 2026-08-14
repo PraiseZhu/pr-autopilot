@@ -1,0 +1,129 @@
+diff --git a/scripts/e2e/ledger-summary.mjs b/scripts/e2e/ledger-summary.mjs
+index 9c66b63e..17e22ba6 100644
+--- a/scripts/e2e/ledger-summary.mjs
++++ b/scripts/e2e/ledger-summary.mjs
+@@ -35,6 +35,13 @@ export const summarizeRun = (runId) => {
+   } catch (err) {
+     return { ok: false, errors: [`manifest JSON 解析失败:${manifestFile}(${err instanceof Error ? err.message : String(err)})`], counts: null, records: [], manifest: null, retryPassCells: [] }
+   }
++  // #571 GPT finding:JSON.parse 成功不代表内容是对象——合法 JSON 的 null/数组/标量同样
++  // 会让下方 manifest.expectedCells 抛 TypeError。fail-closed:点名 manifest 并早退,
++  // 不访问任何 manifest 字段。
++  if (manifest === null || typeof manifest !== 'object' || Array.isArray(manifest)) {
++    const type = manifest === null ? 'null' : Array.isArray(manifest) ? 'array' : typeof manifest
++    return { ok: false, errors: [`manifest 内容不是对象:${manifestFile}(JSON.parse 成功但值为 ${type},疑似被截断/写坏)`], counts: null, records: [], manifest: null, retryPassCells: [] }
++  }
+ 
+   const ledgerFile = ledgerPath(runId)
+   if (!existsSync(ledgerFile)) {
+@@ -51,7 +58,16 @@ export const summarizeRun = (runId) => {
+     const line = rawLine.trim()
+     if (!line) return
+     try {
+-      records.push(JSON.parse(line))
++      const parsed = JSON.parse(line)
++      // #571 GPT finding:行内容 "null" 时 JSON.parse 不抛,但 null 没有 name/runId,
++      // 直接 push 会在下方 record.runId 抛 TypeError。fail-closed:点名行号并跳过该行,
++      // 不进 records 参与后续校验(缺格检查会另行点名受影响的格,不吞错)。
++      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
++        const type = parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed
++        errors.push(`ledger 第 ${index + 1} 行 JSON 解析成功但值不是对象:${type}(疑似写坏的行)`)
++        return
++      }
++      records.push(parsed)
+     } catch (err) {
+       errors.push(`ledger 第 ${index + 1} 行 JSON 解析失败:${err instanceof Error ? err.message : String(err)}`)
+     }
+diff --git a/scripts/e2e/ledger-summary.test.mjs b/scripts/e2e/ledger-summary.test.mjs
+index bda7b909..a93c53ef 100644
+--- a/scripts/e2e/ledger-summary.test.mjs
++++ b/scripts/e2e/ledger-summary.test.mjs
+@@ -258,7 +258,7 @@ describe('ledger-summary summarizeRun — fail-closed 反向变异(#560)', () =>
+ })
+ 
+ describe('ledger-summary summarizeRun — 四态计数 N_A/FAIL 覆盖(#561 W1 SC16)', () => {
+-  it('CLEAN: N_A 记录正确计入 counts.N_A', () => {
++  it('CLEAN: N_A 记录正确计入 counts.N_A,且不污染其它桶(#571 双审:只断 N_A 会让"N_A 同时 +FAIL"类变异仍绿)', () => {
+     const runId = testRunId('count-na')
+     writeManifestFile(runId)
+     writeLedgerLines(runId, [
+@@ -267,10 +267,12 @@ describe('ledger-summary summarizeRun — 四态计数 N_A/FAIL 覆盖(#561 W1 S
+     ])
+     const summary = summarizeRun(runId)
+     expect(summary.ok).toBe(true)
+-    expect(summary.counts.N_A).toBe(1)
++    // 完整 counts 断言:任一桶被污染(如 N_A 同时计入 FAIL)都会红;
++    // mask 那条走 record() 默认 status='PASS',所以 PASS=1
++    expect(summary.counts).toEqual({ PASS: 1, RETRY_PASS: 0, FAIL: 0, N_A: 1 })
+   })
+ 
+-  it('CLEAN: FAIL 记录正确计入 counts.FAIL', () => {
++  it('CLEAN: FAIL 记录正确计入 counts.FAIL,且不污染其它桶(#571 双审:只断 FAIL 会让"FAIL 同时 +N_A"类变异仍绿)', () => {
+     const runId = testRunId('count-fail')
+     writeManifestFile(runId)
+     writeLedgerLines(runId, [
+@@ -279,7 +281,9 @@ describe('ledger-summary summarizeRun — 四态计数 N_A/FAIL 覆盖(#561 W1 S
+     ])
+     const summary = summarizeRun(runId)
+     expect(summary.ok).toBe(true)
+-    expect(summary.counts.FAIL).toBe(1)
++    // 完整 counts 断言:任一桶被污染(如 FAIL 同时计入 N_A)都会红;
++    // mask 那条走 record() 默认 status='PASS',所以 PASS=1
++    expect(summary.counts).toEqual({ PASS: 1, RETRY_PASS: 0, FAIL: 1, N_A: 0 })
+   })
+ 
+   it('对照组: 不含 N_A 记录时 counts.N_A 保持 0', () => {
+@@ -320,6 +324,39 @@ describe('ledger-summary summarizeRun — 输入分支覆盖(#561 W1 SC17)', ()
+     expect(summary.errors.some((e) => e.includes('未提供 runId'))).toBe(true)
+   })
+ 
++  it('RED(#571 GPT):manifest 是合法 JSON 但值为 null → 不抛异常,ok=false 明确报 manifest 问题', () => {
++    // 实测当前实现:manifest 内容写 "null" 时 JSON.parse 不抛,但 summarizeRun 在
++    // ledger-summary.mjs:60 (manifest.expectedCells) 直接 TypeError——违反 fail-closed
++    // 契约。本测试暴露该崩溃;生产修复需扩路径(ledger-summary.mjs)。
++    const runId = testRunId('null-manifest')
++    const path = manifestPath(runId)
++    mkdirSync(dirname(path), { recursive: true })
++    writeFileSync(path, 'null')
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('manifest'))).toBe(true)
++  })
++
++  it('RED(#571 GPT):ledger 某行是合法 JSON 但值为 null → 不抛异常,ok=false 指出该行', () => {
++    // 实测当前实现:行内容 "null" JSON.parse 不抛,但 summarizeRun 在
++    // ledger-summary.mjs:63 (record.runId) 直接 TypeError——违反 fail-closed 契约。
++    // 本测试暴露该崩溃;生产修复需扩路径(ledger-summary.mjs)。
++    const runId = testRunId('null-ledger-line')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      'null',
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('ledger 第 1 行'))).toBe(true)
++  })
++
+   it("RED: summarizeRun('') → fail-closed 早退,errors 含未提供 runId 文案", () => {
+     const summary = summarizeRun('')
+     expect(summary.ok).toBe(false)
+@@ -335,7 +372,11 @@ describe('ledger-summary summarizeRun — 输入分支覆盖(#561 W1 SC17)', ()
+     ])
+     const summary = summarizeRun(runId)
+     expect(summary.ok).toBe(false)
+-    expect(summary.errors.some((e) => e.includes('未知 status:PENDING'))).toBe(true)
+-    expect(summary.errors.some((e) => e.includes('debug::dom::legacy::dev'))).toBe(true)
++    // 绑定到同一 error 对象:status 与 cellKey 必须出现在同一条 error 里(#571 双审:
++    // 旧写法两条独立 some() 谓词,生产拆成两条独立 error——一条含"未知 status:PENDING"、
++    // 另一条含 cellKey——时仍绿;filter 后必须恰好 1 条且同时含两者)
++    const statusErrors = summary.errors.filter((e) => e.includes('未知 status:PENDING'))
++    expect(statusErrors).toHaveLength(1)
++    expect(statusErrors[0]).toContain('debug::dom::legacy::dev')
+   })
+ })

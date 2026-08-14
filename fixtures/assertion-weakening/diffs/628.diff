@@ -1,0 +1,3019 @@
+diff --git a/cindyplugin/src/__tests__/changelogAutoPopup.test.ts b/cindyplugin/src/__tests__/changelogAutoPopup.test.ts
+index 80fd084f..3f81b6ad 100644
+--- a/cindyplugin/src/__tests__/changelogAutoPopup.test.ts
++++ b/cindyplugin/src/__tests__/changelogAutoPopup.test.ts
+@@ -42,7 +42,12 @@ import { act, createElement, useEffect, type ReactElement } from 'react'
+ import { createRoot, type Root } from 'react-dom/client'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { readGuardBaseFile, resolveGuardBase } from './mergeBaseGuard'
+-import { CHANGELOG_RULE_RE, scanAddedGeometryViolations, scanBlocksForGeometry } from './changelogGeometryGuard'
++import {
++  CHANGELOG_RULE_RE,
++  changelogRuleBlocks,
++  scanAddedGeometryViolations,
++  scanBlocksForGeometry,
++} from './changelogGeometryGuard'
+ 
+ // happy-dom 环境下 Vite 会把 new URL(rel, import.meta.url) 静态转换成
+ // http://localhost:3000/...(dev-server 资产 URL 模式),fileURLToPath 直接炸。
+@@ -371,15 +376,20 @@ describe('pop-sc3 复用同一面板类 + 同一套关闭路径(渲染层)', ()
+     expect(variantClasses, '不允许出现第二个 changelog-*-panel 变体类').toEqual(['changelog-panel'])
+   })
+ 
+-  it('② src/App.css 在本 PR 的 diff 里零改动', (ctx) => {
++  it('② App.css 的 changelog 规则块与本 PR 的 base 逐字节相同(不禁止无关 App.css 改动)', (ctx) => {
+     const baseText = readGuardBaseFile('src/App.css', 'pop-sc3-appcss')
+     if (baseText === null) {
+-      ctx.skip('本地取不到 diff 基准,无法断言 App.css 零改动(mergeBaseGuard 已打横幅)')
++      ctx.skip('本地取不到 diff 基准,无法断言 changelog 规则零改动(mergeBaseGuard 已打横幅)')
+       return
+     }
+-    // diff base..HEAD 为空 ⟺ base 处 blob 与 HEAD 处 blob 逐字节相同
++    // 历史原因:本用例原先是「App.css 整 blob 与本 PR 零改动」——那来自某个 PR 为防
++    // 改动 changelog 面板而把「该 PR 不动 App.css」误写成「全仓永久不得动 App.css」。
++    // 网页版 App.css 会被无关改动合法修改(如 A2 的「更多参数」选择器样式),整 blob
++    // 对比把 unrelated 改动误伤成 changelog 回归。收窄为只比较 changelog 相关规则块:
++    // 保留「changelog 面板零改动」的原始意图,又不禁止与 changelog 无关的 App.css 演进;
++    // changelog 面板的几何由 ③(新增几何声明)与 ①(面板类唯一)继续守。
+     const headText = gitTrim(['show', 'HEAD:src/App.css'])
+-    expect(headText, 'App.css 同时服务网页版,本 PR 对它零改动').toBe(baseText)
++    expect(changelogRuleBlocks(headText), 'changelog 面板规则不得被本 PR 改动').toEqual(changelogRuleBlocks(baseText))
+   })
+ 
+   it('③ 本 PR 未引入对 .changelog-backdrop/.changelog-panel 的几何声明', (ctx) => {
+diff --git a/cindyplugin/src/__tests__/changelogGeometryGuard.ts b/cindyplugin/src/__tests__/changelogGeometryGuard.ts
+index 2c26d998..fb137417 100644
+--- a/cindyplugin/src/__tests__/changelogGeometryGuard.ts
++++ b/cindyplugin/src/__tests__/changelogGeometryGuard.ts
+@@ -23,6 +23,16 @@ export const GEOMETRY_PROPS_RE =
+ /** `.changelog-backdrop` / `.changelog-panel` 的规则块(跨行,含块首)。 */
+ export const CHANGELOG_RULE_RE = /\.changelog-(?:backdrop|panel)[^{}]*\{[^}]*\}/g
+ 
++/**
++ * 从一份 CSS 源码提取 `.changelog-backdrop` / `.changelog-panel` 的规则块原文。
++ *
++ * 供 pop-sc3 ② 用:把「App.css 在本 PR 零改动」这条过宽断言收窄为「changelog 相关规则
++ * 块与 base 逐字节相同」——网页版 App.css 会被无关改动(如参数选择器样式)合法修改,
++ * 整 blob 对比会把 unrelated 改动误伤成 changelog 回归;只比 changelog 规则块,既保留
++ * 「changelog 面板零改动」的原始意图,又不禁止与 changelog 无关的 App.css 演进。
++ */
++export const changelogRuleBlocks = (css: string): string[] => [...css.matchAll(CHANGELOG_RULE_RE)].map((match) => match[0])
++
+ /**
+  * diff 的 added 行:过滤 `+` 开头、跳过 `+++` 文件头,逐行剥离**单个** `+` 前缀。
+  * 剥离后的行才是 CSS 源文本,`^`/`;`/`{` 前导才能按 CSS 语义命中。
+diff --git a/server/__tests__/c1a.test.ts b/server/__tests__/c1a.test.ts
+index 8f722648..c8293808 100644
+--- a/server/__tests__/c1a.test.ts
++++ b/server/__tests__/c1a.test.ts
+@@ -36,7 +36,13 @@ const BASE_ENV: Record<string, string> = {
+   MIVO_LLM_API_KEY: 'sk_test',
+   MIVO_UPSTREAM_TIMEOUT_MS: '5000',
+   MIVO_EDIT_UPSTREAM_TIMEOUT_MS: '5000',
+-  MIVO_PLATFORM_POLL_DEADLINE_MS: '600',
++  // F-C1(R1 三审席①):不得用 MIVO_PLATFORM_POLL_DEADLINE_MS 全局覆盖 —— 它会把
++  // 1K/2K/4K 三档抹平成同一个值,「pollDeadlineMs=600」类断言无法区分『代码正确选中
++  // 2K 档』与『错误落回 1K 档但被 env 覆盖成同数』。改用三档独立值,让档位选择可观测:
++  // GPT high → 2K 档 700;错误落 1K 档会露馅成 600。
++  MIVO_PLATFORM_POLL_DEADLINE_1K_MS: '600',
++  MIVO_PLATFORM_POLL_DEADLINE_2K_MS: '700',
++  MIVO_PLATFORM_POLL_DEADLINE_4K_MS: '800',
+   MIVO_PLATFORM_POLL_INTERVAL_MS: '20',
+ }
+ 
+@@ -175,8 +181,13 @@ describe('C1a — progress is monotonic + stage-driven (not hardcoded)', () => {
+       expect(taskLog).toMatch(/ts=\d{4}-\d{2}-\d{2}T[\d:.]+Z/)
+       expect(taskLog).toContain('quality=high')
+       expect(taskLog).toContain('imgRatio=16:9')
+-      expect(taskLog).toContain('resolution=2K')
+-      expect(taskLog).toContain('pollDeadlineMs=600')
++      // 2026-08-11:GPT 通道改为只发 quality(平台侧 resolution 对它无效,实测塞 4K
++      // 仍出 2048²)。日志如实记 q:<档> 而不是兜一个平台没收到的 resolution 值。
++      expect(taskLog).toContain('resolution=q:high')
++      // F-C1:GPT quality=high 无 resolution 的**真实调用形状**必须选中 2K 档(700)。
++      // 三档 env 已拆开(600/700/800),若 deadline resolver 退化成只看 resolution,
++      // GPT 拿 undefined → 落 1K 档 → 日志露馅成 600,本条断言即红。
++      expect(taskLog).toContain('pollDeadlineMs=700')
+       expect(taskLog).toContain('platformJobIdHash=job-1')
+     } finally {
+       logSpy.mockRestore()
+@@ -438,3 +449,96 @@ describe('C1a — edit task (platform, no mask)', () => {
+     expect(mockState.lastEditBodyText).toMatch(/name="model"[\s\S]*gpt-image-2/)
+   })
+ })
++
++// ── ADV-E1(R1 三审席②):BFF 按目标模型 exact 校验外部参数域 ──
++// 客户端不能作为信任边界:前端白名单只放行 GPT 6 档,但 multipart 直传的
++// imgRatio/resolution/count 若被 BFF 用跨模型宽集合接受并静默夹取,非法值会
++// 在用户不知情时被改成别的出图参数。这些用例锁「非法输入 → 明确 4xx」。
++describe('C1a — region-edit param domain validation (ADV-E1)', () => {
++  const editForm = (extra: Record<string, string> = {}): FormData => {
++    const form = new FormData()
++    form.append('image', new File([Buffer.from('png-bytes')], 'image.png', { type: 'image/png' }))
++    form.append('prompt', 'edit this')
++    // extra.model 覆盖默认模型;不能重复 append('model'),firstMultipartField 只取第一个。
++    form.append('model', extra.model ?? 'gpt-image-2')
++    for (const [k, v] of Object.entries(extra)) {
++      if (k !== 'model') form.append(k, v)
++    }
++    return form
++  }
++
++  it('GPT 非法比例 4:3(前端域外、跨模型宽域内)→ 400,不静默改 1:1', async () => {
++    const r = await req('/api/mivo/tasks/edit', { method: 'POST', body: editForm({ imgRatio: '4:3' }) })
++    expect(r.status).toBe(400)
++    expect(String(field(r.body, 'error'))).toMatch(/imgRatio/)
++    expect(mockState.submitCalls).toBe(0)
++  })
++
++  it('GPT 不接受 resolution 字段(该通道无 resolution 概念)→ 400', async () => {
++    const r = await req('/api/mivo/tasks/edit', { method: 'POST', body: editForm({ resolution: '4K' }) })
++    expect(r.status).toBe(400)
++    expect(String(field(r.body, 'error'))).toMatch(/resolution/)
++  })
++
++  it('NANO 非法 resolution 8K → 400;合法 4K 放行', async () => {
++    const bad = await req('/api/mivo/tasks/edit', {
++      method: 'POST',
++      body: editForm({ resolution: '8K', model: 'gemini-3-pro-image' }),
++    })
++    expect(bad.status).toBe(400)
++    expect(String(field(bad.body, 'error'))).toMatch(/resolution/)
++    const ok = await req('/api/mivo/tasks/edit', {
++      method: 'POST',
++      body: editForm({ resolution: '4K', model: 'gemini-3-pro-image' }),
++    })
++    expect(ok.status).toBe(202)
++  })
++
++  it('count 非整数或越界 → 400(2.9/0/5),不再静默截断夹取', async () => {
++    for (const bad of ['2.9', '0', '5', 'abc']) {
++      const r = await req('/api/mivo/tasks/edit', { method: 'POST', body: editForm({ count: bad }) })
++      expect(r.status).toBe(400)
++      expect(String(field(r.body, 'error'))).toMatch(/count/)
++    }
++    const ok = await req('/api/mivo/tasks/edit', { method: 'POST', body: editForm({ count: '2' }) })
++    expect(ok.status).toBe(202)
++  })
++
++  it('generate JSON 同样按模型 exact 校验 imgRatio 与 n', async () => {
++    const badRatio = await req('/api/mivo/tasks/generate', jsonReq({ prompt: 'a cat', model: 'gpt-image-2', imgRatio: '5:4' }))
++    expect(badRatio.status).toBe(400)
++    expect(String(field(badRatio.body, 'error'))).toMatch(/imgRatio/)
++    const badN = await req('/api/mivo/tasks/generate', jsonReq({ prompt: 'a cat', model: 'gpt-image-2', n: 7 }))
++    expect(badN.status).toBe(400)
++    expect(String(field(badN.body, 'error'))).toMatch(/n|count/)
++  })
++
++  it('llm-proxy 模型(doubao)不受平台模型校验约束(既有行为不变)', async () => {
++    const r = await req('/api/mivo/tasks/generate', jsonReq({ prompt: 'a cat', model: 'doubao-seedance-2-0-260128', imgRatio: '4:3' }))
++    expect(r.status).toBe(202)
++  })
++})
++
++// ── ADV-A2(R1 三审席②):多图回传 —— 请求 n>1 时平台回的每一张都必须进结果 ──
++// 旧实现固定读 poll.images[0],n=2/4 时其余张被静默丢弃。此测试用真实 mock 形状
++// (mockUpstream.pollImages 数组,下载走 signUrl + /dl 两跳真实 HTTP)锁回归:
++// 把 job.ts 换回 255fda0~1 的旧实现,result.images 只剩 1 张,本条即红。
++describe('C1a — multi-image result completeness (ADV-A2)', () => {
++  it('count=2 时平台回的 2 张都进入任务结果(不丢第二张)', async () => {
++    mockState.pollImages = ['/dl/img-1', '/dl/img-2']
++    const form = new FormData()
++    form.append('image', new File([Buffer.from('png-bytes')], 'image.png', { type: 'image/png' }))
++    form.append('prompt', 'edit this')
++    form.append('model', 'gemini-3-pro-image')
++    form.append('count', '2')
++    const create = await req('/api/mivo/tasks/edit', { method: 'POST', body: form })
++    expect(create.status).toBe(202)
++    const done = await pollTask(field(create.body, 'taskId') as string, (b) => b.status === 'done' || b.status === 'failed', 2000)
++    expect(done).not.toBeNull()
++    expect(done!.status).toBe('done')
++    expect(done!.result?.images).toHaveLength(2)
++    expect(done!.result?.images?.[0]?.b64).toBeTruthy()
++    expect(done!.result?.images?.[1]?.b64).toBeTruthy()
++    expect(mockState.downloadCalls).toBe(2)
++  })
++})
+diff --git a/server/__tests__/p1c.test.ts b/server/__tests__/p1c.test.ts
+index e25aff50..5c31d606 100644
+--- a/server/__tests__/p1c.test.ts
++++ b/server/__tests__/p1c.test.ts
+@@ -202,7 +202,10 @@ describe('platform channel — generate/edit job', () => {
+     mockState.downloadResetSequence = [true, true]
+     const r = await req('/api/mivo/generate', jsonReq({ prompt: 'a cat', model: 'gpt-image-2' }))
+     expect(r.status).toBe(502)
+-    expect((r.body as { error: string }).error).toBe('platform download retry exhausted')
++    // ADV-A2(多图部分失败策略)后:全部下载失败 → 502「生成失败：结果下载失败」
++    // (用户友好文案),不再是内部异常名 'platform download retry exhausted'。
++    // 本测试的核心契约(不重提完整平台任务)不变。
++    expect((r.body as { error: string }).error).toBe('生成失败：结果下载失败')
+     expect(mockState.submitCalls).toBe(1)
+     expect(mockState.pollCalls).toBe(2)
+     expect(mockState.signUrlCalls).toBe(2)
+diff --git a/server/lib/config.test.ts b/server/lib/config.test.ts
+index cebb3caa..5dddb51f 100644
+--- a/server/lib/config.test.ts
++++ b/server/lib/config.test.ts
+@@ -6,6 +6,7 @@ const deadlineEnvKeys = [
+   'MIVO_PLATFORM_POLL_DEADLINE_MS',
+   'MIVO_PLATFORM_POLL_DEADLINE_1K_MS',
+   'MIVO_PLATFORM_POLL_DEADLINE_2K_MS',
++  'MIVO_PLATFORM_POLL_DEADLINE_4K_MS',
+   'MIVO_EDIT_UPSTREAM_TIMEOUT_MS',
+ ] as const
+ 
+@@ -26,27 +27,55 @@ describe('platform poll deadline config', () => {
+     }
+   })
+ 
+-  it('defaults to 240s for 1K and 300s for 2K', () => {
++  // 4K 档于 2026-08-11 随「更多参数」开放(实测出 4096²,像素量 4 倍于 2K),
++  // 默认给 600s;归一化也认它,不再落回 1K。
++  it('defaults to 240s for 1K, 300s for 2K and 600s for 4K', () => {
+     const config = getEnvConfig()
+-    expect(config.platformPollDeadlineByResolutionMs).toEqual({ '1K': 240_000, '2K': 300_000 })
++    expect(config.platformPollDeadlineByResolutionMs).toEqual({ '1K': 240_000, '2K': 300_000, '4K': 600_000 })
+     expect(resolveMivoPlatformPollDeadlineMs('1K', config)).toBe(240_000)
+     expect(resolveMivoPlatformPollDeadlineMs('2K', config)).toBe(300_000)
++    expect(resolveMivoPlatformPollDeadlineMs('4K', config)).toBe(600_000)
+     expect(resolveMivoPlatformPollDeadlineMs('unknown', config)).toBe(240_000)
+   })
+ 
++  // R1 三审 blocker(席① F-A1 / 席② ADV-A3,盲审下独立双报):2026-08-11 起 GPT 通道
++  // 只发 quality 不发 resolution,只看 resolution 会让 GPT 请求恒收到 undefined →
++  // 归一成 1K → 拿 240s,比改造前(quality=high 换算成 2K)少 60s,本该成功的高画质
++  // 请求被 BFF 自己判超时报 504。这几条锁住「按通道取档」。
++  it('GPT 通道无 resolution 时按 quality 定档:high 拿 2K 的 300s 而非 1K 的 240s', () => {
++    const config = getEnvConfig()
++    expect(resolveMivoPlatformPollDeadlineMs(undefined, config, 'high')).toBe(300_000)
++    expect(resolveMivoPlatformPollDeadlineMs(undefined, config, 'medium')).toBe(240_000)
++    expect(resolveMivoPlatformPollDeadlineMs(undefined, config, 'low')).toBe(240_000)
++  })
++
++  it('resolution 在场时优先于 quality(NANO 通道两者可能都带)', () => {
++    const config = getEnvConfig()
++    expect(resolveMivoPlatformPollDeadlineMs('4K', config, 'low')).toBe(600_000)
++    expect(resolveMivoPlatformPollDeadlineMs('1K', config, 'high')).toBe(240_000)
++  })
++
++  it('两者都缺或都非法时落回 1K(不因新增 quality 分支而改变既有兜底)', () => {
++    const config = getEnvConfig()
++    expect(resolveMivoPlatformPollDeadlineMs(undefined, config, undefined)).toBe(240_000)
++    expect(resolveMivoPlatformPollDeadlineMs('unknown', config, 'bogus')).toBe(240_000)
++  })
++
+   it('uses MIVO_PLATFORM_POLL_DEADLINE_MS as a global override for both tiers', () => {
+     process.env.MIVO_PLATFORM_POLL_DEADLINE_MS = '1234'
+     const config = getEnvConfig()
+-    expect(config.platformPollDeadlineByResolutionMs).toEqual({ '1K': 1234, '2K': 1234 })
++    expect(config.platformPollDeadlineByResolutionMs).toEqual({ '1K': 1234, '2K': 1234, '4K': 1234 })
+     expect(config.platformPollDeadlineMs).toBe(1234)
+   })
+ 
+   it('allows independent tier overrides', () => {
+     process.env.MIVO_PLATFORM_POLL_DEADLINE_1K_MS = '2401'
+     process.env.MIVO_PLATFORM_POLL_DEADLINE_2K_MS = '3002'
++    process.env.MIVO_PLATFORM_POLL_DEADLINE_4K_MS = '6004'
+     const config = getEnvConfig()
+-    expect(config.platformPollDeadlineByResolutionMs).toEqual({ '1K': 2401, '2K': 3002 })
+-    expect(config.platformPollDeadlineMs).toBe(3002)
++    expect(config.platformPollDeadlineByResolutionMs).toEqual({ '1K': 2401, '2K': 3002, '4K': 6004 })
++    // 标量取三档最大值(它是「最长有效超时」的语义)。
++    expect(config.platformPollDeadlineMs).toBe(6004)
+   })
+ })
+ 
+diff --git a/server/lib/config.ts b/server/lib/config.ts
+index b16125ce..e6378093 100644
+--- a/server/lib/config.ts
++++ b/server/lib/config.ts
+@@ -39,7 +39,8 @@ export type MivoImageRatio = keyof typeof mivoImageSizeMap
+ export type MivoImageQuality = keyof (typeof mivoImageSizeMap)['1:1']
+ export type MivoImageResponse = { images: Array<{ b64: string }> }
+ export type PlatformCtx = { platformKey: string; platformEndpoint: string }
+-export type MivoPlatformResolution = '1K' | '2K'
++/** 平台 resolution 档。4K 于 2026-08-11 实测可用(出 4096²),随「更多参数」开放。 */
++export type MivoPlatformResolution = '1K' | '2K' | '4K'
+ 
+ // ─── Env-derived config (lazy; tests override via process.env) ───────────────
+ export type MivoEnvConfig = {
+@@ -82,13 +83,15 @@ const num = (value: string | undefined, fallback: number): number => {
+ }
+ 
+ export const normalizeMivoPlatformResolution = (resolution: unknown): MivoPlatformResolution =>
+-  resolution === '2K' ? '2K' : '1K'
++  resolution === '4K' ? '4K' : resolution === '2K' ? '2K' : '1K'
+ 
+ export const getEnvConfig = (): MivoEnvConfig => {
+   const platformPollDeadlineOverride = num(process.env.MIVO_PLATFORM_POLL_DEADLINE_MS, 0)
+   const platformPollDeadlineByResolutionMs: Record<MivoPlatformResolution, number> = {
+     '1K': num(process.env.MIVO_PLATFORM_POLL_DEADLINE_1K_MS, platformPollDeadlineOverride || 240_000),
+     '2K': num(process.env.MIVO_PLATFORM_POLL_DEADLINE_2K_MS, platformPollDeadlineOverride || 300_000),
++    // 4K 实测轮询时长远超 2K(像素量是 4 倍),给 600s;沿用同一枚 override 语义。
++    '4K': num(process.env.MIVO_PLATFORM_POLL_DEADLINE_4K_MS, platformPollDeadlineOverride || 600_000),
+   }
+   return {
+     imageApiKey: process.env.MIVO_IMAGE_API_KEY || '',
+@@ -108,6 +111,7 @@ export const getEnvConfig = (): MivoEnvConfig => {
+     platformPollDeadlineMs: Math.max(
+       platformPollDeadlineByResolutionMs['1K'],
+       platformPollDeadlineByResolutionMs['2K'],
++      platformPollDeadlineByResolutionMs['4K'],
+     ),
+     platformPollDeadlineByResolutionMs,
+     platformPollIntervalMs: num(process.env.MIVO_PLATFORM_POLL_INTERVAL_MS, 2_500),
+@@ -124,10 +128,39 @@ export const getEnvConfig = (): MivoEnvConfig => {
+   }
+ }
+ 
++/**
++ * GPT 通道的 quality 档 → 等价的轮询开销档。
++ *
++ * **只用于选超时窗口,不是「quality 能换算成 resolution」**——那个换算在出图参数上是错的
++ * (三档 quality 只能映射 1K/1K/2K,见 types/generation)。这里问的是另一个问题:
++ * 「这一档大概要跑多久」。GPT high 实出 2880²,轮询耗时与 NANO 2K 同量级,所以共用 2K 的窗口。
++ */
++const GPT_QUALITY_DEADLINE_TIER: Record<string, MivoPlatformResolution> = {
++  low: '1K',
++  medium: '1K',
++  high: '2K',
++}
++
++/**
++ * 轮询截止时限。**必须同时看 resolution 与 quality**:
++ * 2026-08-11 起 GPT 通道只发 quality 不发 resolution,只看 resolution 会让 GPT 请求恒收到
++ * undefined → 归一成 '1K' → 拿 240s。而改造前 GPT quality='high' 会被换算成 resolution='2K'
++ * 拿到 300s —— 于是「只发 quality」这个正确的改动反而把高画质请求的超时窗口砍短了 60s,
++ * 本该成功的请求被 BFF 自己判超时报 504(R1 三审席①F-A1 blocker / 席②ADV-A3,独立双报)。
++ */
+ export const resolveMivoPlatformPollDeadlineMs = (
+   resolution: unknown,
+   config: Pick<MivoEnvConfig, 'platformPollDeadlineByResolutionMs'> = getEnvConfig(),
+-): number => config.platformPollDeadlineByResolutionMs[normalizeMivoPlatformResolution(resolution)]
++  quality?: unknown,
++): number => {
++  // resolution 在场直接用它(NANO 通道);缺席时回落 quality 的等价档(GPT 通道)。
++  const tier =
++    resolution === '4K' || resolution === '2K' || resolution === '1K'
++      ? normalizeMivoPlatformResolution(resolution)
++      : (typeof quality === 'string' && GPT_QUALITY_DEADLINE_TIER[quality]) ||
++        normalizeMivoPlatformResolution(resolution)
++  return config.platformPollDeadlineByResolutionMs[tier]
++}
+ 
+ /**
+  * edit-timeout-batch: mask edit (llm-proxy /edits) 上游超时分级。#63 的分辨率分级只覆盖
+diff --git a/server/platform/job.ts b/server/platform/job.ts
+index 9d70e8bd..faa1916a 100644
+--- a/server/platform/job.ts
++++ b/server/platform/job.ts
+@@ -5,6 +5,7 @@
+ import { Buffer } from 'node:buffer'
+ import type { PlatformCtx } from '../lib/config'
+ import { getEnvConfig, resolveMivoPlatformPollDeadlineMs } from '../lib/config'
++import { REGION_EDIT_CAPABILITIES, type RegionEditPlatformModel } from '../../shared/regionEditCapabilities'
+ import { mivoPlatformEnsureChatSession, mivoPlatformFetch, sanitizePlatformError } from './state'
+ 
+ export const MIVO_PLATFORM_CHANNELS: Record<string, { modelType: string; version: string }> = {
+@@ -16,8 +17,14 @@ export const MIVO_PLATFORM_CHANNELS: Record<string, { modelType: string; version
+ // (no mask file); region semantics travel inside the prompt instead.
+ export const nanoBananaImageModel = 'gemini-3-pro-image'
+ 
+-const mivoPlatformRatioSet = new Set(['1:1', '16:9', '9:16', '4:3', '3:4', '2:3', '3:2', '4:5', '5:4'])
++// quality→resolution 的**存量换算**(前端不带 resolution 档时的兜底路径)。
++// 注意 low 与 medium 都落 1K:三档 quality 只能表达两种分辨率,这正是「更多参数」
++// 必须另发 resolution 字段的原因(复用它会让用户选 4K 实出 2K)。
+ const mivoResolutionMap: Record<string, string> = { low: '1K', medium: '1K', high: '2K' }
++// 比例/分辨率/张数的合法域统一走 shared/regionEditCapabilities(ADV-E1 单一真相源,
++// 与前端 regionEditParams 同表)。21:9 两模型实测可出图(NANO 1584x672 / GPT
++// 2352x1008),已在该表内;这里不再维护跨模型宽集合 —— 宽集合放行 GPT 本不存在的
++// 4:3/3:4/4:5/5:4 等值,再静默改成 1:1,用户无从知晓。
+ 
+ export type PlatformJobParams = {
+   modelType: string
+@@ -29,6 +36,8 @@ export type PlatformJobMetadata = {
+   resolution?: string
+   pollDeadlineMs?: number
+   platformJobIdHash?: string
++  /** 多图回传时下载失败的张数(有几张算几张的部分失败策略)。0 不写。 */
++  partialDownloadFailures?: number
+ }
+ 
+ export type PlatformJobResult =
+@@ -129,18 +138,69 @@ const withPlatformTransientRetry = async <T>(
+   }
+ }
+ 
++/**
++ * 组装平台 payload。两个通道的画质是**两套参数**(2026-08-11 实测):
++ *   NANOBANANA → `resolution` 精确定尺寸(1K/2K/4K → 1024²/2048²/4096²)
++ *   GPT        → `quality` 质量意图,像素由平台定(low/medium/high → 1024²/2048²/2880²)
++ * 旧实现对两个通道都发 resolution,GPT 侧那枚是被忽略的冗余字段(实测塞 4K 仍出 2048²)。
++ * 现在按通道分发,并接受前端「更多参数」传下来的 resolution / count。
++ */
+ export const resolveMivoPlatformPayload = (
+   modelId: string,
+   imgRatio: unknown,
+   quality: string,
+   prompt: string,
+   images?: string[],
++  extras?: { resolution?: unknown; count?: unknown },
+ ): PlatformJobParams => {
+   const channel = MIVO_PLATFORM_CHANNELS[modelId]
+-  const rawRatio = typeof imgRatio === 'string' ? imgRatio : '1:1'
+-  const clampedRatio = mivoPlatformRatioSet.has(rawRatio) ? rawRatio : '1:1'
+-  const resolution = mivoResolutionMap[quality] || '1K'
+-  const payload: Record<string, unknown> = { prompt, imgRatio: clampedRatio, resolution, n: 1 }
++  const isGpt = channel?.modelType === 'GPT'
++  const caps = REGION_EDIT_CAPABILITIES[modelId as RegionEditPlatformModel]
++  // ADV-E1:域外显式值 fail-closed(路由层已 4xx;这里兜内部/同步调用方)—— 抛错
++  // 进任务失败,错误信息即排障线索;不再静默夹取(未知比例→1:1、count 截断夹到 1~4)。
++  // 未覆盖模型(无 caps)维持存量兜底语义,不被本契约约束。
++  const rawRatio = typeof imgRatio === 'string' && imgRatio.length > 0 ? imgRatio : undefined
++  if (rawRatio !== undefined && caps && !caps.ratios.includes(rawRatio)) {
++    throw new Error(
++      `imgRatio '${rawRatio}' is not supported for model ${modelId} (allowed: ${caps.ratios.join(', ')})`,
++    )
++  }
++  const clampedRatio = rawRatio ?? '1:1'
++  // 张数:平台 n。实测 NANO 要 4 可能只回 3 —— 少回由下游按实际数量落图,不在此重试。
++  // 显式 count 必须是 1~4 的整数(前端只提供 1/2/4,平台接受 1~4);2.9/0/7/abc 一律拒绝。
++  let n = 1
++  if (extras?.count !== undefined && extras.count !== null && extras.count !== '') {
++    const parsed = typeof extras.count === 'number' ? extras.count : Number(String(extras.count))
++    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 4) {
++      throw new Error(`count must be an integer between 1 and 4 (got '${String(extras.count)}')`)
++    }
++    n = parsed
++  }
++  const payload: Record<string, unknown> = { prompt, imgRatio: clampedRatio, n }
++  if (isGpt) {
++    payload.quality = quality
++  } else {
++    // 前端给了 resolution 档就用它(1K/2K/4K 直达);没给则走存量 quality 换算表。
++    const explicit =
++      typeof extras?.resolution === 'string' && extras.resolution.length > 0 ? extras.resolution : undefined
++    if (caps) {
++      if (explicit !== undefined) {
++        if (caps.resolutions.length === 0) {
++          throw new Error(`resolution is not supported for model ${modelId} (this channel uses quality instead)`)
++        }
++        if (!caps.resolutions.includes(explicit)) {
++          throw new Error(
++            `resolution '${explicit}' is not supported for model ${modelId} (allowed: ${caps.resolutions.join(', ')})`,
++          )
++        }
++        payload.resolution = explicit
++      } else {
++        payload.resolution = mivoResolutionMap[quality] ?? '1K'
++      }
++    } else {
++      payload.resolution = explicit ?? mivoResolutionMap[quality] ?? '1K'
++    }
++  }
+   if (images && images.length) payload.images = images
+   return {
+     modelType: channel?.modelType || 'NANOBANANA',
+@@ -370,7 +430,12 @@ const runMivoPlatformImageJobOnce = async (
+   const poll = await mivoPlatformPollJob(ctx, jobId, signal, onProgress, metadata.pollDeadlineMs)
+   if (poll.status === 'aborted') return { aborted: true }
+   if (poll.status === 'timeout') {
+-    const isHigh = params.payload.resolution === '2K'
++    // 高开销档 = NANO 的 2K/4K,或 GPT 的 high(GPT 通道没有 resolution 字段,
++    // 2026-08-11 起只发 quality —— 旧实现只看 resolution,GPT 侧恒判低档)。
++    const isHigh =
++      params.payload.resolution === '2K' ||
++      params.payload.resolution === '4K' ||
++      params.payload.quality === 'high'
+     return {
+       status: 504,
+       body: {
+@@ -387,14 +452,35 @@ const runMivoPlatformImageJobOnce = async (
+     }
+     return { status: 502, body: { error: poll.error || '生成失败' }, metadata }
+   }
+-  const imgPath = poll.images?.[0]
+-  if (!imgPath) {
++  // 多图回传(R1 席② ADV-A2):请求 n>1 时平台会回多张,旧实现固定读 images[0],
++  // 其余被静默丢弃 —— 张数能力做了一半,用户选 4 张只拿到 1 张。
++  // 上限夹到请求的 n:平台可能多回(实测未见,但协议没承诺不会),多下载即多花带宽,
++  // 且会让画布收到比占位符更多的结果无处安放。
++  const requestedCount = Number(params.payload.n)
++  const maxImages = Number.isFinite(requestedCount) && requestedCount >= 1 ? Math.trunc(requestedCount) : 1
++  const imgPaths = (poll.images ?? []).slice(0, maxImages)
++  if (!imgPaths.length) {
+     return { status: 502, body: { error: '生成失败：结果为空' }, metadata }
+   }
+   onProgress?.({ stage: 'download', progress: 95 })
+-  const buf = await mivoPlatformDownloadImage(ctx, imgPath, signal)
++  // 部分失败策略:**有几张算几张**,不因个别下载失败让整单归零 —— 平台侧已出图已计费,
++  // 全盘否定等于把用户已付费的结果一起丢掉(与 2026-08-11 黑块误判丢好图同类教训)。
++  // 全部失败才判 502。失败的张数落 metadata 供排障,不静默。
++  const settled = await Promise.allSettled(
++    imgPaths.map((p) => mivoPlatformDownloadImage(ctx, p, signal)),
++  )
++  const images = settled
++    .filter((r): r is PromiseFulfilledResult<Buffer> => r.status === 'fulfilled')
++    .map((r) => ({ b64: r.value.toString('base64') }))
++  if (!images.length) {
++    return { status: 502, body: { error: '生成失败：结果下载失败' }, metadata }
++  }
++  const failedCount = settled.length - images.length
++  if (failedCount > 0) {
++    metadata = { ...metadata, partialDownloadFailures: failedCount }
++  }
+   onProgress?.({ stage: 'done', progress: 100 })
+-  return { status: 200, body: { images: [{ b64: buf.toString('base64') }] }, metadata }
++  return { status: 200, body: { images }, metadata }
+ }
+ 
+ // Platform image job runner: submit + poll + download + normalize {images:[{b64}]}.
+@@ -407,13 +493,22 @@ export const runMivoPlatformImageJob = async (
+   signal?: AbortSignal,
+   onProgress?: OnProgress,
+ ): Promise<PlatformJobResult> => {
+-  const resolution = String(params.payload.resolution || '1K')
++  // GPT 通道没有 resolution 概念(只发 quality),此时如实记 quality 档而不是兜成
++  // '1K' —— 兜底会在日志里写出一个平台从未收到的值,排障时误导人。
++  const resolution = String(
++    params.payload.resolution || (params.payload.quality ? `q:${params.payload.quality}` : '1K'),
++  )
+   let metadata: PlatformJobMetadata = { resolution }
+   return withPlatformTransientRetry('image-job', signal, async () => {
+     try {
+       metadata = {
+         resolution,
+-        pollDeadlineMs: resolveMivoPlatformPollDeadlineMs(params.payload.resolution),
++        // 双参数:GPT 通道无 resolution,靠 quality 定档(见 resolveMivoPlatformPollDeadlineMs)。
++        pollDeadlineMs: resolveMivoPlatformPollDeadlineMs(
++          params.payload.resolution,
++          undefined,
++          params.payload.quality,
++        ),
+       }
+       return await runMivoPlatformImageJobOnce(ctx, params, signal, onProgress, metadata)
+     } catch (error) {
+diff --git a/server/routes/tasks.ts b/server/routes/tasks.ts
+index efbb1288..12a847ae 100644
+--- a/server/routes/tasks.ts
++++ b/server/routes/tasks.ts
+@@ -27,6 +27,7 @@ import {
+   readJsonBody,
+ } from '../lib/request'
+ import { RequestBodyTooLargeError } from '../lib/upstream'
++import { validateRegionEditCapabilities } from '../../shared/regionEditCapabilities'
+ import { cancelTask, createTask, failTask, getTaskForOwner, toView, type TaskView } from '../tasks/registry'
+ import { runEditTask, runGenerateTask, runVariationsTask, type VariationParam } from '../tasks/runner'
+ 
+@@ -63,6 +64,19 @@ tasksRoute.post('/generate', async (c) => {
+     return c.json({ error: 'prompt is required' }, 400)
+   }
+   const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultMivoImageModel
++  // ADV-E1(R1 三审席②):按目标模型 exact 校验外部参数域 —— 客户端不能作为信任边界,
++  // 跨模型宽集合 + 静默夹取会把用户没选过的值悄悄改成别的出图参数。平台模型域外
++  // 输入明确 4xx;llm-proxy 模型(本契约未覆盖)维持既有行为。
++  const violations = validateRegionEditCapabilities({
++    model,
++    imgRatio: body.imgRatio,
++    quality: body.quality,
++    count: body.n,
++  })
++  if (violations.length > 0) {
++    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-region-edit-params' })
++    return c.json({ error: violations.map((v) => v.message).join('; ') }, 400)
++  }
+   const idempotencyKey = c.req.header('idempotency-key') || undefined
+   const platformKey = c.req.header('x-mivo-api-key')?.trim() || undefined
+   // FX-2 / G2.1: owner key for the task registry (per-user isolation). resolveTaskOwner
+@@ -117,6 +131,20 @@ tasksRoute.post('/edit', async (c) => {
+     return c.json({ error: 'prompt is required' }, 400)
+   }
+   const modelField = firstMultipartField(fields, 'model').trim() || defaultMivoImageModel
++  // ADV-E1:同上 —— region-edit「更多参数」字段(imgRatio/resolution/count)与 quality
++  // 按目标模型 exact 校验,域外输入明确 4xx,不再由 job.ts 静默夹取(未知比例→1:1、
++  // count 截断、GPT 收 resolution 等)。空字段 = 缺省,不校验。
++  const violations = validateRegionEditCapabilities({
++    model: modelField,
++    imgRatio: firstMultipartField(fields, 'imgRatio'),
++    resolution: firstMultipartField(fields, 'resolution'),
++    quality: firstMultipartField(fields, 'quality'),
++    count: firstMultipartField(fields, 'count'),
++  })
++  if (violations.length > 0) {
++    logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'bad-region-edit-params' })
++    return c.json({ error: violations.map((v) => v.message).join('; ') }, 400)
++  }
+   const uploadedMask = multipartFiles(files, 'mask')[0]
+   const references = [...multipartFiles(files, 'reference[]'), ...multipartFiles(files, 'reference')]
+   const idempotencyKey = c.req.header('idempotency-key') || undefined
+@@ -180,6 +208,10 @@ tasksRoute.post('/edit', async (c) => {
+       prompt,
+       imgRatio: firstMultipartField(fields, 'imgRatio'),
+       quality: firstMultipartField(fields, 'quality'),
++      // region-edit「更多参数」:NANO 的分辨率档与出图张数。缺省 = 存量行为
++      // (resolution 走 quality 换算表、n=1)。
++      resolution: firstMultipartField(fields, 'resolution'),
++      count: firstMultipartField(fields, 'count'),
+       model: modelField,
+       mask,
+       references,
+diff --git a/server/tasks/runner.ts b/server/tasks/runner.ts
+index 8e5242e0..be380bf8 100644
+--- a/server/tasks/runner.ts
++++ b/server/tasks/runner.ts
+@@ -159,6 +159,10 @@ export type GenerateParams = {
+   prompt: string
+   imgRatio?: unknown
+   quality?: unknown // raw; normalized here
++  /** region-edit「更多参数」:NANO 分辨率档(1K/2K/4K)。在场时优先于 quality 换算。 */
++  resolution?: unknown
++  /** region-edit「更多参数」:出图张数(平台 n,1~4)。 */
++  count?: unknown
+   model?: unknown // raw; normalized here
+   n?: unknown
+   /** Per-request mivo_ key from the X-Mivo-Api-Key header (B1: keys live
+@@ -168,6 +172,10 @@ export type GenerateParams = {
+ }
+ 
+ export type EditParams = {
++  /** region-edit「更多参数」:NANO 分辨率档(1K/2K/4K)。在场时优先于 quality 换算。 */
++  resolution?: unknown
++  /** region-edit「更多参数」:出图张数(平台 n,1~4)。 */
++  count?: unknown
+   image: File
+   prompt: string
+   imgRatio?: unknown
+@@ -222,7 +230,10 @@ export const runGenerateTask = async (taskId: string, params: GenerateParams): P
+         })
+         return
+       }
+-      const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(model, params.imgRatio, quality, params.prompt)
++      const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(model, params.imgRatio, quality, params.prompt, undefined, {
++        resolution: params.resolution,
++        count: params.count,
++      })
+       logContext.imgRatio = typeof payload.imgRatio === 'string' ? payload.imgRatio : undefined
+       logContext.resolution = typeof payload.resolution === 'string' ? payload.resolution : undefined
+       const result = await runMivoPlatformImageJob(platformCtx, { modelType, modelFormat, payload }, record.controller.signal, progressSink(taskId))
+@@ -341,7 +352,10 @@ export const runEditTask = async (taskId: string, params: EditParams): Promise<v
+               params.subjectsJson,
+             )
+           : params.prompt
+-      const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(model, params.imgRatio, quality, platformPrompt, fileIds)
++      const { modelType, modelFormat, payload } = resolveMivoPlatformPayload(model, params.imgRatio, quality, platformPrompt, fileIds, {
++        resolution: params.resolution,
++        count: params.count,
++      })
+       logContext.imgRatio = typeof payload.imgRatio === 'string' ? payload.imgRatio : undefined
+       logContext.resolution = typeof payload.resolution === 'string' ? payload.resolution : undefined
+       const result = await runMivoPlatformImageJob(platformCtx, { modelType, modelFormat, payload }, record.controller.signal, progressSink(taskId))
+diff --git a/shared/regionEditCapabilities.test.ts b/shared/regionEditCapabilities.test.ts
+new file mode 100644
+index 00000000..a15bd789
+--- /dev/null
++++ b/shared/regionEditCapabilities.test.ts
+@@ -0,0 +1,98 @@
++// shared/regionEditCapabilities.test.ts
++// 区域编辑能力表 + exact 校验器的纯函数契约(2026-08-12 ADV-E1)。
++// 端到端路径(路由 4xx)由 server/__tests__/c1a.test.ts 锁;这里锁纯函数本身,
++// 保证「前端取域」与「BFF 校验」共用同一张表的形状不漂移。
++import { describe, it, expect } from 'vitest'
++import {
++  REGION_EDIT_CAPABILITIES,
++  REGION_EDIT_PLATFORM_MODELS,
++  validateRegionEditCapabilities,
++} from './regionEditCapabilities'
++
++describe('REGION_EDIT_CAPABILITIES — 每模型 exact 域', () => {
++  it('两张表都只登记平台出图模型', () => {
++    expect(REGION_EDIT_PLATFORM_MODELS).toEqual(['gpt-image-2', 'gemini-3-pro-image'])
++    expect(Object.keys(REGION_EDIT_CAPABILITIES).sort()).toEqual(
++      [...REGION_EDIT_PLATFORM_MODELS].sort(),
++    )
++  })
++
++  it('GPT:6 档比例、无 resolution、三档 quality;NANO:10 档比例、1K/2K/4K、三档 quality', () => {
++    const gpt = REGION_EDIT_CAPABILITIES['gpt-image-2']
++    expect(gpt.ratios).toEqual(['1:1', '2:3', '3:2', '16:9', '9:16', '21:9'])
++    expect(gpt.resolutions).toEqual([])
++    expect(gpt.qualities).toEqual(['low', 'medium', 'high'])
++    expect([gpt.countMin, gpt.countMax]).toEqual([1, 4])
++
++    const nano = REGION_EDIT_CAPABILITIES['gemini-3-pro-image']
++    expect(nano.ratios).toHaveLength(10)
++    expect(nano.ratios).toContain('21:9') // 实测可出图
++    expect(nano.resolutions).toEqual(['1K', '2K', '4K'])
++    expect(nano.qualities).toEqual(['low', 'medium', 'high'])
++    expect([nano.countMin, nano.countMax]).toEqual([1, 4])
++  })
++
++  it('NANO 比例域是 GPT 的超集(4:3/3:4/4:5/5:4 是 NANO 独有)', () => {
++    const nano = new Set(REGION_EDIT_CAPABILITIES['gemini-3-pro-image'].ratios)
++    const gpt = new Set(REGION_EDIT_CAPABILITIES['gpt-image-2'].ratios)
++    for (const r of gpt) expect(nano.has(r)).toBe(true)
++    for (const r of ['4:3', '3:4', '4:5', '5:4']) expect(nano.has(r)).toBe(true)
++  })
++})
++
++describe('validateRegionEditCapabilities — exact 校验', () => {
++  it('合法输入零违规', () => {
++    expect(
++      validateRegionEditCapabilities({ model: 'gpt-image-2', imgRatio: '21:9', quality: 'high', count: 4 }),
++    ).toEqual([])
++    expect(
++      validateRegionEditCapabilities({ model: 'gemini-3-pro-image', imgRatio: '4:3', resolution: '4K', count: 2 }),
++    ).toEqual([])
++    // 空字符串 = 字段缺省,跳过
++    expect(validateRegionEditCapabilities({ model: 'gpt-image-2', imgRatio: '', resolution: '', count: '' })).toEqual([])
++  })
++
++  it('GPT 拒绝 NANO 独有比例(跨模型宽域内、前端域外)', () => {
++    const vs = validateRegionEditCapabilities({ model: 'gpt-image-2', imgRatio: '4:3' })
++    expect(vs).toHaveLength(1)
++    expect(vs[0].field).toBe('imgRatio')
++    expect(vs[0].message).toContain('4:3')
++    expect(vs[0].message).toContain('gpt-image-2')
++  })
++
++  it('GPT 拒绝任何 resolution(该通道无此概念)', () => {
++    const vs = validateRegionEditCapabilities({ model: 'gpt-image-2', resolution: '4K' })
++    expect(vs).toHaveLength(1)
++    expect(vs[0].field).toBe('resolution')
++  })
++
++  it('NANO 拒绝 8K;接受 1K/2K/4K', () => {
++    expect(validateRegionEditCapabilities({ model: 'gemini-3-pro-image', resolution: '8K' })[0].field).toBe('resolution')
++    expect(validateRegionEditCapabilities({ model: 'gemini-3-pro-image', resolution: '1K' })).toEqual([])
++  })
++
++  it('count 必须是 1~4 整数:2.9/0/7/abc 都违规,字符串数字 2 合法', () => {
++    for (const bad of [2.9, 0, 7, 'abc', '2.9', '']) {
++      const vs = validateRegionEditCapabilities({ model: 'gpt-image-2', count: bad })
++      if (bad === '') {
++        expect(vs).toEqual([])
++      } else {
++        expect(vs).toHaveLength(1)
++        expect(vs[0].field).toBe('count')
++      }
++    }
++    expect(validateRegionEditCapabilities({ model: 'gpt-image-2', count: '2' })).toEqual([])
++    expect(validateRegionEditCapabilities({ model: 'gpt-image-2', count: 2 })).toEqual([])
++  })
++
++  it('quality 非法值违规', () => {
++    const vs = validateRegionEditCapabilities({ model: 'gpt-image-2', quality: 'bogus' })
++    expect(vs).toHaveLength(1)
++    expect(vs[0].field).toBe('quality')
++  })
++
++  it('非平台模型(本契约未覆盖)一律放行', () => {
++    expect(validateRegionEditCapabilities({ model: 'doubao-seedance-2-0-260128', imgRatio: '4:3' })).toEqual([])
++    expect(validateRegionEditCapabilities({ model: 'unknown-model', resolution: '99K', count: 42 })).toEqual([])
++  })
++})
+diff --git a/shared/regionEditCapabilities.ts b/shared/regionEditCapabilities.ts
+new file mode 100644
+index 00000000..fd48e072
+--- /dev/null
++++ b/shared/regionEditCapabilities.ts
+@@ -0,0 +1,110 @@
++// shared/regionEditCapabilities.ts
++// 区域编辑「更多参数」+ BFF 提交链路的**单一能力真相源**(2026-08-12 R1 三审席②
++// ADV-E1):前端 regionEditParams.ts 的取值域与 server 侧 BFF 校验都从这里取,
++// 避免「前端白名单 6 档、BFF 跨模型宽集合 10 档」这类域漂移 —— 宽集合放行的值
++// 要么被静默夹成别的出图参数,要么被平台侧拒绝,用户都无从知晓。
++//
++// 取值来源:2026-08-11 对 Mivo 平台(aigc.xindong.com)的真实探测任务(详见
++// src/canvas/regionEditParams.ts 头注释):21:9 两模型实测可出图;NANO 的 8K
++// 平台侧判生成失败不放行;GPT 通道无 resolution 概念(只发 quality)。
++//
++// 本文件必须是纯模块:零依赖、零副作用,src 与 server 两侧都能 import。
++
++/** 走本能力契约的平台出图模型(其余模型走 llm-proxy 路径,域校验在各自路由)。 */
++export const REGION_EDIT_PLATFORM_MODELS = ['gpt-image-2', 'gemini-3-pro-image'] as const
++export type RegionEditPlatformModel = (typeof REGION_EDIT_PLATFORM_MODELS)[number]
++
++export type RegionEditModelCapabilities = {
++  /** imgRatio 合法档。GPT 平台侧 5 档 + 实测可用的 21:9 = 6 档;NANO 9 档 + 21:9 = 10 档。 */
++  ratios: readonly string[]
++  /** resolution 合法档。GPT 通道无 resolution 概念 → 空数组 = 任何显式值都非法。 */
++  resolutions: readonly string[]
++  /** quality 合法档。 */
++  qualities: readonly string[]
++  /** count(平台 n)合法整数区间。前端只提供 1/2/4,平台接受 1~4。 */
++  countMin: number
++  countMax: number
++}
++
++export const REGION_EDIT_CAPABILITIES: Record<RegionEditPlatformModel, RegionEditModelCapabilities> = {
++  'gpt-image-2': {
++    ratios: ['1:1', '2:3', '3:2', '16:9', '9:16', '21:9'],
++    resolutions: [],
++    qualities: ['low', 'medium', 'high'],
++    countMin: 1,
++    countMax: 4,
++  },
++  'gemini-3-pro-image': {
++    ratios: ['1:1', '16:9', '9:16', '4:3', '3:4', '2:3', '3:2', '4:5', '5:4', '21:9'],
++    resolutions: ['1K', '2K', '4K'],
++    qualities: ['low', 'medium', 'high'],
++    countMin: 1,
++    countMax: 4,
++  },
++}
++
++export type RegionEditCapabilityViolation = { field: string; message: string }
++
++/**
++ * 按目标模型 exact 校验外部提交参数。非平台模型(本契约未覆盖)一律放行 ——
++ * 它们的域校验在 llm-proxy 路径各自的逻辑里。空字符串视为「字段缺省」跳过。
++ * 非法值返回逐条违规(不抛错),调用方决定 4xx 还是 fail-closed。
++ */
++export const validateRegionEditCapabilities = (input: {
++  model: string
++  imgRatio?: unknown
++  resolution?: unknown
++  quality?: unknown
++  count?: unknown
++}): RegionEditCapabilityViolation[] => {
++  const caps = REGION_EDIT_CAPABILITIES[input.model as RegionEditPlatformModel]
++  if (!caps) return []
++  const violations: RegionEditCapabilityViolation[] = []
++
++  if (input.imgRatio !== undefined && input.imgRatio !== null && input.imgRatio !== '') {
++    const ratio = String(input.imgRatio)
++    if (!caps.ratios.includes(ratio)) {
++      violations.push({
++        field: 'imgRatio',
++        message: `imgRatio '${ratio}' is not supported for model ${input.model} (allowed: ${caps.ratios.join(', ')})`,
++      })
++    }
++  }
++
++  if (input.resolution !== undefined && input.resolution !== null && input.resolution !== '') {
++    const resolution = String(input.resolution)
++    if (caps.resolutions.length === 0) {
++      violations.push({
++        field: 'resolution',
++        message: `resolution is not supported for model ${input.model} (this channel uses quality instead)`,
++      })
++    } else if (!caps.resolutions.includes(resolution)) {
++      violations.push({
++        field: 'resolution',
++        message: `resolution '${resolution}' is not supported for model ${input.model} (allowed: ${caps.resolutions.join(', ')})`,
++      })
++    }
++  }
++
++  if (input.quality !== undefined && input.quality !== null && input.quality !== '') {
++    const quality = String(input.quality)
++    if (!caps.qualities.includes(quality)) {
++      violations.push({
++        field: 'quality',
++        message: `quality '${quality}' is not supported for model ${input.model} (allowed: ${caps.qualities.join(', ')})`,
++      })
++    }
++  }
++
++  if (input.count !== undefined && input.count !== null && input.count !== '') {
++    const parsed = typeof input.count === 'number' ? input.count : Number(String(input.count))
++    if (!Number.isInteger(parsed) || parsed < caps.countMin || parsed > caps.countMax) {
++      violations.push({
++        field: 'count',
++        message: `count must be an integer between ${caps.countMin} and ${caps.countMax} (got '${String(input.count)}')`,
++      })
++    }
++  }
++
++  return violations
++}
+diff --git a/src/canvas/imageMaskGeometry.ts b/src/canvas/imageMaskGeometry.ts
+index 672031eb..b8f4dce6 100644
+--- a/src/canvas/imageMaskGeometry.ts
++++ b/src/canvas/imageMaskGeometry.ts
+@@ -1,5 +1,5 @@
+ import type { ImageCrop } from '../types/mivoCanvas'
+-import type { MivoImageQuality, RegionRectPct } from '../types/generation'
++import type { GenerationRatio, MivoImageQuality, MivoPlatformResolutionValue, RegionRectPct } from '../types/generation'
+ import { LocalizedKeyError } from '../lib/localizedKeyError'
+ 
+ export type ImageMaskPoint = {
+@@ -45,6 +45,16 @@ export type ImageMaskSubmitPayload = {
+   sourceSize: { width: number; height: number }
+   /** W2 (QoL batch): low/medium quality selector on the overlay; default medium (FIX-5). */
+   quality?: MivoImageQuality
++  /**
++   * region-edit「更多参数」:NANO 专用的平台 `resolution` 档(1K/2K/4K,实测直达)。
++   * 与 quality **互斥使用** —— 三档 quality 只能换算出 1K/1K/2K,表达不了 4K,复用
++   * 它会让「选 4K 实出 2K」(2026-08-11 单测逮到)。在场时 BFF 以本字段为准。
++   */
++  resolution?: MivoPlatformResolutionValue
++  /** region-edit「更多参数」:目标比例。缺省 = 保持源图比例(改造前的唯一行为)。 */
++  imgRatio?: GenerationRatio
++  /** region-edit「更多参数」:出图张数(平台 n)。缺省 1。实测 NANO 要 4 可能回 3。 */
++  count?: number
+   /** Mask-edit dual-model selector; default gemini (maskEditDefaultModel). */
+   model?: MaskEditModelId
+   /** Anchor semantics: recognizer label for what the selection contains (single-anchor legacy). */
+diff --git a/src/canvas/maskEditFloatingControls.ts b/src/canvas/maskEditFloatingControls.ts
+index b5cd2502..d7087086 100644
+--- a/src/canvas/maskEditFloatingControls.ts
++++ b/src/canvas/maskEditFloatingControls.ts
+@@ -41,14 +41,16 @@ export function computeFloatingControls({
+ 
+   const stageRect = stage.getBoundingClientRect()
+   const shellRect = shell.getBoundingClientRect()
+-  // 抽屉侧栏(position:fixed, z-index 80)浮在画布之上,会盖住浮层左半。测出它的
+-  // 右边界,把浮层左界推到抽屉右侧,避免工具条钻到栏后无法操作。
++  // 侧栏(position:fixed, z-index 80)浮在画布之上,会盖住浮层左半。测出它的
++  // 右边界,把浮层左界推到侧栏右侧,避免工具条钻到栏后无法操作。
++  // 2026-08-13 修复:原实现只避让抽屉形态(.drawer),固定浮层形态的侧栏同样
++  // z-index 80 盖住画布左缘,镜头把节点摆到左侧时工具条会钻到栏后被拦截。
+   let leftBound = floatingControlsMargin
+-  const drawer = shell.ownerDocument.querySelector('.project-sidebar.drawer:not(.closed)') as HTMLElement | null
+-  if (drawer) {
+-    const drawerRect = drawer.getBoundingClientRect()
+-    if (drawerRect.width > 0 && drawerRect.right > shellRect.left) {
+-      leftBound = Math.max(leftBound, drawerRect.right - shellRect.left + floatingControlsGap)
++  const sidebar = shell.ownerDocument.querySelector('.project-sidebar:not(.closed)') as HTMLElement | null
++  if (sidebar) {
++    const sidebarRect = sidebar.getBoundingClientRect()
++    if (sidebarRect.width > 0 && sidebarRect.right > shellRect.left) {
++      leftBound = Math.max(leftBound, sidebarRect.right - shellRect.left + floatingControlsGap)
+     }
+   }
+   const maxWidth = Math.max(floatingControlsMinWidth, shellRect.width - leftBound - floatingControlsMargin)
+diff --git a/src/canvas/maskEditGeneration.ts b/src/canvas/maskEditGeneration.ts
+index d773affc..dcb4e446 100644
+--- a/src/canvas/maskEditGeneration.ts
++++ b/src/canvas/maskEditGeneration.ts
+@@ -29,6 +29,7 @@ import {
+ } from '../lib/mivoTaskClient'
+ import { getImageGenerationPort } from '../lib/imageGenerationPort'
+ import { maskEditDefaultModel, maskEditQualityFor, type ImageMaskSubmitPayload, type MaskEditModelId } from './imageMaskGeometry'
++import { maskEditSlotPlanFor } from './maskEditSlotPlan'
+ 
+ /** mask-chat-card: runMaskEditGeneration 回调，让 chat flow 驱动卡片状态而不直写 chat。 */
+ export type MaskEditGenerationCallbacks = {
+@@ -102,27 +103,47 @@ export const prepareMaskEditPlaceholder = (
+   source: MivoCanvasNode,
+   prompt: string,
+   model: string = maskEditDefaultModel,
+-): { slotId: string; baselineSnapshot: MivoCanvasSnapshot | undefined } => {
+-  // 规格(2026-07-05 用户澄清):所有生图占位符一律 1:1 方形 loading,局部重绘不例外
+-  // (此前按源图全尺寸建占位 → 用户看到 3:2 大占位符);结果比例由生成本身保证
+-  // (edit 结果与源图同比例),替换时按结果图自然比例等面积落画布(documentSlice)。
+-  const slotSize = defaultSizeForNodeType('ai-slot')
++  /** 「更多参数」的张数/比例/画质(owner 2026-08-11,取代 2026-07-05「一律 1:1 单占位」
++   *  旧规):选 4 张放 4 个占位;占位框按目标比例画;画质档放大展示面积。缺省 = 旧行为
++   *  的**张数与尺寸**(单占位、基准面积),但比例改跟源图 —— 见 maskEditSlotPlanFor 的
++   *  比例优先级。旧规「一律 1:1 方形」当时的理由是「按源图全尺寸建占位太大」,那是
++   *  尺寸问题不是比例问题;等面积换算已经解决了尺寸,方形反而让 loading 与结果对不上。 */
++  plan?: Pick<ImageMaskSubmitPayload, 'count' | 'imgRatio' | 'sourceSize' | 'resolution' | 'quality'>,
++): { slotId: string; slotIds: string[]; baselineSnapshot: MivoCanvasSnapshot | undefined } => {
++  const slotPlan = maskEditSlotPlanFor({
++    baseSize: defaultSizeForNodeType('ai-slot'),
++    count: plan?.count,
++    imgRatio: plan?.imgRatio,
++    sourceSize: plan?.sourceSize,
++    resolution: plan?.resolution,
++    quality: plan?.quality,
++  })
++  const slotSize = slotPlan.slotSize
+   // T2.2 Block 1:slot create + 初始 'generating' status(reflow)同包 wrapMutationForScene →
+   // create-node slot + edit-node reflowed nodes + edit-node slot-status 一次提交,使 server base
+   // 含 reflow(防 removeMaskEditPlaceholder 的 position-revert diff 施于未 reflow 的 server base 致错位)。
+   // local 模式 gate 不发;sceneId 锚定入参(可非活跃画布)。
+-  const slotId = wrapMutationForScene(sceneId, () => {
+-    const id = useCanvasStore
+-      .getState()
+-      .addAiSlotNode(
+-        { x: source.x + source.width + AI_SLOT_GAP, y: source.y },
+-        slotSize,
+-        prompt,
+-        { sceneId },
+-      )
+-    patchMaskEditSlotStatus(sceneId, id, 'generating', prompt, model)
+-    return id
++  // 多占位纵向排(第 2..n 个在第 1 个下方逐个叠),与结���落图的 right 流不打架。
++  const slotIds = wrapMutationForScene(sceneId, () => {
++    const ids: string[] = []
++    for (let i = 0; i < slotPlan.count; i++) {
++      const id = useCanvasStore
++        .getState()
++        .addAiSlotNode(
++          {
++            x: source.x + source.width + AI_SLOT_GAP,
++            y: source.y + i * (slotSize.height + AI_SLOT_GAP),
++          },
++          slotSize,
++          prompt,
++          { sceneId },
++        )
++      patchMaskEditSlotStatus(sceneId, id, 'generating', prompt, model)
++      ids.push(id)
++    }
++    return ids
+   })()
++  const slotId = slotIds[0]
+   // S01: addAiSlotNode 内部 { history: true } 仅在 sceneId === state.sceneId 时
+   // push 基线。非活跃场景下不 push，栈顶是无关快照 —— 此时 baselineSnapshot 必须
+   // 置 undefined，否则 removeMaskEditPlaceholder 的 expectedBaseline 校验会误判。
+@@ -141,8 +162,12 @@ export const prepareMaskEditPlaceholder = (
+     activeSceneId: useCanvasStore.getState().sceneId,
+     source: 'mask-edit',
+   })
+-  debugLogger.log('Canvas', `Prepared mask edit placeholder for ${source.title}`)
+-  return { slotId, baselineSnapshot }
++  debugLogger.log(
++    'Canvas',
++    `Prepared ${slotIds.length} mask edit placeholder(s) for ${source.title}` +
++      ` (${slotSize.width}x${slotSize.height}, tier x${slotPlan.tierScale})`,
++  )
++  return { slotId, slotIds, baselineSnapshot }
+ }
+ 
+ /** Remove the placeholder on failure/cancel: revert to the pre-generation history
+@@ -270,6 +295,10 @@ export const runMaskEditGeneration = async (args: {
+   sceneId: string
+   source: MivoCanvasNode
+   slotId: string
++  /** 多张形态下 prepare 建的全部占位(含 slotId 本身,顺序即纵向排布顺序)。
++   *  缺省 = 只有 slotId 一个,与单张形态等价。结果多于占位数时余量按 placement
++   *  自然落图,少于时未用到的占位由 documentSlice 清理。 */
++  slotIds?: string[]
+   resolvedAssetUrl: string | undefined
+   payload: ImageMaskSubmitPayload
+   imgRatio: MivoImageRatio
+@@ -278,12 +307,23 @@ export const runMaskEditGeneration = async (args: {
+   /** mask-chat-card: chat flow 经回调驱动卡片状态，runMaskEditGeneration 不再直写 chat。 */
+   callbacks?: MaskEditGenerationCallbacks
+ }): Promise<{ nodeIds: string[]; sourceDeleted: boolean }> => {
+-  const { sceneId, source, slotId, resolvedAssetUrl, payload, imgRatio, signal } = args
++  const { sceneId, source, slotId, resolvedAssetUrl, payload, signal } = args
+   const callbacks = args.callbacks ?? {}
+   // Mask-edit dual-model: overlay/chat 传 payload.model，缺省 gemini。质量按模型
+   // 固定（gemini→high=2K，gpt→medium=1K）；显式 quality 仍优先（chat 路径可覆盖）。
+   const model: MaskEditModelId = payload.model ?? maskEditDefaultModel
+   const quality: MivoImageQuality | undefined = args.quality ?? payload.quality ?? maskEditQualityFor(model)
++  // 「更多参数」的三个字段(R1 席② ADV-A1)。此前本函数只读外层 args.imgRatio、
++  // 完全不读 payload 的三个字段 —— regionEditSubmit 装配好的比例/分辨率/张数
++  // 在这一跳被整个丢弃,PR 声称的「端到端透传」到这里就断了。
++  //
++  // 优先级 payload > args:payload 是**本次提交装配出的参数**(区域编辑面板的用户
++  // 选择),args.imgRatio 是调用方(chatMaskEditFlow)从更早的上下文带下来的旧参数。
++  // 两者冲突时以本次选择为准,否则用户在面板改了比例却被上游旧值覆盖。
++  // args 侧保留为兜底:局部重绘等不走「更多参数」的路径只有 args.imgRatio。
++  const imgRatio: MivoImageRatio = (payload.imgRatio as MivoImageRatio | undefined) ?? args.imgRatio
++  const resolution = payload.resolution
++  const count = payload.count
+   const startedAt = Date.now()
+   const image = await readCanvasImageBlob(source, resolvedAssetUrl)
+ 
+@@ -326,6 +366,10 @@ export const runMaskEditGeneration = async (args: {
+       prompt: payload.prompt,
+       imgRatio,
+       quality,
++      // NANO 的精确分辨率档与张数:两者都只在「更多参数」路径在场,
++      // 缺省时不发字段(与改造前同形,BFF 侧走存量 quality 换算与 n=1)。
++      ...(resolution ? { resolution } : {}),
++      ...(count && count > 1 ? { count } : {}),
+       model,
+       idempotencyKey,
+       signal,
+@@ -462,6 +506,10 @@ export const runMaskEditGeneration = async (args: {
+         ? { sourceNodeId: source.id, lineageSourceId: source.id, createDerivationEdge: true as const }
+         : {}),
+       replaceSlotId: slotId,
++      // 多占位:把全部占位交给 documentSlice 逐张替换(第 i 张结果落第 i 个占位),
++      // 同时让同批结果共用一个展示尺寸 —— 否则 4 张同参数出的图会因各自
++      // sourceDimensions 的细微差异在画布上大小不一(owner 2026-08-11 实测反馈)。
++      replaceSlotIds: args.slotIds,
+       reflow: true,
+       resultImages: images,
+       prompt: payload.prompt,
+diff --git a/src/canvas/maskEditParamsPassthrough.test.ts b/src/canvas/maskEditParamsPassthrough.test.ts
+new file mode 100644
+index 00000000..627b230b
+--- /dev/null
++++ b/src/canvas/maskEditParamsPassthrough.test.ts
+@@ -0,0 +1,155 @@
++// R1 三审席② ADV-A1:runMaskEditGeneration 此前只读外层 args.imgRatio、完全不读
++// payload 的 imgRatio/resolution/count —— regionEditSubmit 装配好的参数在这一跳被
++// 整个丢弃,PR 声称的「端到端透传」到这里就断了。本文件锁住「装配出的参数必须原样
++// 到达提交端口」这条不变量,旧实现下前三条必红(已实测验证)。
++//
++// 独立成文件而非并进 maskEditGeneration.test.ts:后者已 875 行,加这组会越过结构
++// 守卫的 900 行上限。按守卫的要求「拆分后入库」,不上调 baseline。
++import { describe, expect, it, vi, beforeEach } from 'vitest'
++
++// Hermetic setup: 与 maskEditGeneration.test.ts 同口径(canvasStore 在模块加载期
++// 触发 scenes()、资产读写走 IndexedDB、debug 日志会外发),三者都要打桩。
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++vi.mock('../lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async (_blob: Blob, name: string, type: string) => ({
++    assetUrl: 'mivo-asset://mock-asset',
++    name,
++    type,
++    sizeBytes: 1234,
++    hasTransparency: false,
++    size: '200x200',
++    sourceDimensions: { width: 200, height: 200 },
++  })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('../store/remoteDebugReporter', () => ({
++  reportRemoteDebugEntry: () => {},
++}))
++
++const taskClientSpies = vi.hoisted(() => ({
++  submitEditTask: vi.fn(),
++  pollTask: vi.fn(),
++  cancelTask: vi.fn(),
++}))
++vi.mock('../lib/mivoTaskClient', () => ({
++  submitEditTask: taskClientSpies.submitEditTask,
++  pollTask: taskClientSpies.pollTask,
++  cancelTask: taskClientSpies.cancelTask,
++  taskPollIntervalMs: () => 10000,
++  kindForFailedTask: () => 'upstream-error',
++}))
++vi.mock('../lib/canvasImageSource', () => ({
++  readCanvasImageBlob: vi.fn(
++    async () => new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], 'src.png', { type: 'image/png' }),
++  ),
++}))
++const inspectArtifactsSpy = vi.hoisted(() => vi.fn())
++vi.mock('../lib/maskResultInspection', () => ({
++  inspectMaskResultForBlackArtifacts: inspectArtifactsSpy,
++  mapBoundsToResultSpace: (b: unknown) => b,
++}))
++
++import { useCanvasStore } from '../store/canvasStore'
++import { prepareMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++  id: 'src-1',
++  type: 'image',
++  title: 'Source',
++  x: 0,
++  y: 0,
++  width: 200,
++  height: 200,
++  status: 'ready',
++  assetUrl: '/a.png',
++  ...overrides,
++})
++
++const baseState = useCanvasStore.getState()
++
++const seedCanvas = (sceneId: string, nodes: MivoCanvasNode[]) => {
++  const document = { title: sceneId, nodes, edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
++  return {
++    canvases: { [sceneId]: document },
++    sceneId,
++    nodes,
++    edges: [],
++    tasks: [],
++    selectedNodeId: undefined,
++    selectedNodeIds: [],
++  }
++}
++
++describe('「更多参数」端到端透传到 submitEditTask (ADV-A1)', () => {
++  beforeEach(() => {
++    useCanvasStore.setState({ ...baseState } as never, true)
++    taskClientSpies.submitEditTask.mockReset()
++    taskClientSpies.pollTask.mockReset()
++    taskClientSpies.cancelTask.mockReset()
++    inspectArtifactsSpy.mockReset()
++  })
++
++  const runWithPayload = async (payloadExtra: Record<string, unknown>, argsImgRatio = '1:1') => {
++    const source = imageNode({ id: 'src-1' })
++    useCanvasStore.setState({ ...baseState, ...seedCanvas('character-flow', [source]) } as never, true)
++    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
++    taskClientSpies.submitEditTask.mockResolvedValueOnce('task-1')
++    taskClientSpies.pollTask.mockResolvedValueOnce({
++      status: 'done',
++      progress: 100,
++      stage: 'done',
++      result: { images: [{ b64: 'aGk=', mimeType: 'image/png' }] },
++    })
++    inspectArtifactsSpy.mockReturnValue({ hasArtifact: false, components: [] })
++    await runMaskEditGeneration({
++      sceneId: 'character-flow',
++      source,
++      slotId,
++      resolvedAssetUrl: undefined,
++      payload: {
++        prompt: 'p',
++        sourceSize: { width: 200, height: 200 },
++        model: 'gemini-3-pro-image',
++        ...payloadExtra,
++      } as never,
++      imgRatio: argsImgRatio as never,
++      signal: new AbortController().signal,
++    })
++    return taskClientSpies.submitEditTask.mock.calls[0][0] as Record<string, unknown>
++  }
++
++  it('① payload.imgRatio 送达,且优先于外层 args.imgRatio(面板选择压过上游旧值)', async () => {
++    const req = await runWithPayload({ imgRatio: '16:9' }, '1:1')
++    expect(req.imgRatio).toBe('16:9')
++  })
++
++  it('payload 无 imgRatio 时回落 args(局部重绘等不走「更多参数」的路径)', async () => {
++    const req = await runWithPayload({}, '9:16')
++    expect(req.imgRatio).toBe('9:16')
++  })
++
++  it('② payload.resolution 送达(NANO 的精确分辨率档)', async () => {
++    const req = await runWithPayload({ imgRatio: '1:1', resolution: '4K' })
++    expect(req.resolution).toBe('4K')
++  })
++
++  it('③ payload.count 送达(张数)', async () => {
++    const req = await runWithPayload({ imgRatio: '1:1', count: 4 })
++    expect(req.count).toBe(4)
++  })
++
++  it('缺省时不发 resolution/count 字段,与改造前同形(BFF 走存量 quality 换算与 n=1)', async () => {
++    const req = await runWithPayload({ imgRatio: '1:1' })
++    expect(req).not.toHaveProperty('resolution')
++    expect(req).not.toHaveProperty('count')
++  })
++
++  it('count=1 也不发字段(单张是缺省语义,发 n=1 与不发等价但徒增协议面)', async () => {
++    const req = await runWithPayload({ imgRatio: '1:1', count: 1 })
++    expect(req).not.toHaveProperty('count')
++  })
++})
+diff --git a/src/canvas/maskEditSlotPlan.test.ts b/src/canvas/maskEditSlotPlan.test.ts
+new file mode 100644
+index 00000000..e5794e35
+--- /dev/null
++++ b/src/canvas/maskEditSlotPlan.test.ts
+@@ -0,0 +1,107 @@
++import { describe, expect, it } from 'vitest'
++
++import { maskEditSlotPlanFor, resolutionBadgeForSize } from './maskEditSlotPlan'
++
++const BASE = { width: 320, height: 320 }
++const areaOf = (s: { width: number; height: number }) => s.width * s.height
++
++describe('maskEditSlotPlanFor — 张数', () => {
++  it('缺省 = 1 个占位(旧行为)', () => {
++    expect(maskEditSlotPlanFor({ baseSize: BASE }).count).toBe(1)
++  })
++
++  it('选几张就画几个框', () => {
++    expect(maskEditSlotPlanFor({ baseSize: BASE, count: 4 }).count).toBe(4)
++  })
++
++  it('夹到平台上限 4,不放行 5', () => {
++    expect(maskEditSlotPlanFor({ baseSize: BASE, count: 9 }).count).toBe(4)
++  })
++
++  it('非法输入(NaN/负数/小数/字符串)一律落回合法档', () => {
++    expect(maskEditSlotPlanFor({ baseSize: BASE, count: Number.NaN }).count).toBe(1)
++    expect(maskEditSlotPlanFor({ baseSize: BASE, count: -3 }).count).toBe(1)
++    expect(maskEditSlotPlanFor({ baseSize: BASE, count: 2.9 }).count).toBe(2)
++    expect(maskEditSlotPlanFor({ baseSize: BASE, count: '3' as unknown as number }).count).toBe(3)
++  })
++})
++
++describe('maskEditSlotPlanFor — 比例优先级', () => {
++  it('显式 imgRatio 优先于源图', () => {
++    const plan = maskEditSlotPlanFor({
++      baseSize: BASE,
++      imgRatio: '16:9',
++      sourceSize: { width: 1000, height: 1000 },
++    })
++    expect(plan.slotSize.width / plan.slotSize.height).toBeCloseTo(16 / 9, 1)
++  })
++
++  it('无 imgRatio 时跟源图比例——这是「保持原比例」的落点,不是恒定方形', () => {
++    const plan = maskEditSlotPlanFor({ baseSize: BASE, sourceSize: { width: 1264, height: 848 } })
++    expect(plan.slotSize.width / plan.slotSize.height).toBeCloseTo(1264 / 848, 1)
++    expect(plan.slotSize.width).toBeGreaterThan(plan.slotSize.height)
++  })
++
++  it('两者都没有才回退基准尺寸自身比例', () => {
++    const plan = maskEditSlotPlanFor({ baseSize: { width: 400, height: 200 } })
++    expect(plan.slotSize.width / plan.slotSize.height).toBeCloseTo(2, 1)
++  })
++})
++
++describe('maskEditSlotPlanFor — 画质分档', () => {
++  it('缺省档面积 = 基准面积', () => {
++    const plan = maskEditSlotPlanFor({ baseSize: BASE })
++    expect(areaOf(plan.slotSize)).toBeCloseTo(areaOf(BASE), -3)
++  })
++
++  it('高档比低档大,且 4K > 2K > 1K 单调', () => {
++    const a1k = areaOf(maskEditSlotPlanFor({ baseSize: BASE, resolution: '1K' }).slotSize)
++    const a2k = areaOf(maskEditSlotPlanFor({ baseSize: BASE, resolution: '2K' }).slotSize)
++    const a4k = areaOf(maskEditSlotPlanFor({ baseSize: BASE, resolution: '4K' }).slotSize)
++    expect(a2k).toBeGreaterThan(a1k)
++    expect(a4k).toBeGreaterThan(a2k)
++  })
++
++  it('GPT 的 quality 档与 NANO 的 resolution 档各自生效(两套参数不互相换算)', () => {
++    const byQuality = areaOf(maskEditSlotPlanFor({ baseSize: BASE, quality: 'high' }).slotSize)
++    const byResolution = areaOf(maskEditSlotPlanFor({ baseSize: BASE, resolution: '4K' }).slotSize)
++    // high 与 4K 恰好同系数,但走的是两条 key —— 断言的是「quality 也能分档」而非两者相等的必然性
++    expect(byQuality).toBeGreaterThan(areaOf(maskEditSlotPlanFor({ baseSize: BASE, quality: 'low' }).slotSize))
++    expect(byResolution).toBeGreaterThan(areaOf(maskEditSlotPlanFor({ baseSize: BASE, resolution: '1K' }).slotSize))
++  })
++
++  it('resolution 在场时优先于 quality(NANO 通道两个字段都可能带)', () => {
++    const plan = maskEditSlotPlanFor({ baseSize: BASE, resolution: '1K', quality: 'high' })
++    expect(areaOf(plan.slotSize)).toBeCloseTo(areaOf(BASE), -3)
++  })
++
++  it('等面积换算:同一档下横竖两个比例的面积相当(16:9 与 9:16 份量一致)', () => {
++    const land = areaOf(maskEditSlotPlanFor({ baseSize: BASE, imgRatio: '16:9' }).slotSize)
++    const port = areaOf(maskEditSlotPlanFor({ baseSize: BASE, imgRatio: '9:16' }).slotSize)
++    expect(land / port).toBeCloseTo(1, 1)
++  })
++})
++
++describe('resolutionBadgeForSize — 由结果尺寸反推档位', () => {
++  it('长边判据:2K 的 16:9 实出 2528x1696 判 2K', () => {
++    expect(resolutionBadgeForSize({ width: 2528, height: 1696 })).toBe('2K')
++  })
++
++  it('4K 档', () => {
++    expect(resolutionBadgeForSize({ width: 4096, height: 4096 })).toBe('4K')
++  })
++
++  it('1K 不打角标(低档无需标注)', () => {
++    expect(resolutionBadgeForSize({ width: 1024, height: 1024 })).toBeUndefined()
++  })
++
++  it('缺尺寸/非法尺寸不打角标', () => {
++    expect(resolutionBadgeForSize(undefined)).toBeUndefined()
++    expect(resolutionBadgeForSize({ width: 0, height: 100 })).toBeUndefined()
++  })
++
++  it('窄幅高清按长边判档,不因面积小而降档', () => {
++    // 2K 的 21:9 约 2528x1084:面积不到 2048² 的 65%,但长边够,仍是 2K
++    expect(resolutionBadgeForSize({ width: 2528, height: 1084 })).toBe('2K')
++  })
++})
+diff --git a/src/canvas/maskEditSlotPlan.ts b/src/canvas/maskEditSlotPlan.ts
+new file mode 100644
+index 00000000..8b26872d
+--- /dev/null
++++ b/src/canvas/maskEditSlotPlan.ts
+@@ -0,0 +1,123 @@
++import type { GenerationRatio, MivoImageQuality, MivoPlatformResolutionValue } from '../types/generation'
++
++/**
++ * 区域编辑占位符的排布计划(owner 2026-08-11 「更多参数」)。
++ *
++ * 取代 2026-07-05 的「一律 1:1 单占位」旧规。三件事:
++ *   ① 张数 → 占位个数(选 4 张就画 4 个框,不是画 1 个等 4 张挤进来)
++ *   ② 比例 → 占位框的形状(loading 期间就是目标形状,出图时不跳变)
++ *   ③ 画质 → 占位框的展示面积(4K 比 1K 大一圈,用户在画布上分得清哪批是高清)
++ *
++ * 纯函数、无副作用:输入参数与基准尺寸,输出占位数与单个占位的宽高。
++ * 调用方(maskEditGeneration)负责按这个计划真正建节点。
++ */
++
++/** 平台单批上限(NANO/GPT 双通道实测同为 4)。要更多得分批,不在本函数解决。 */
++const SLOT_COUNT_MAX = 4
++
++/**
++ * 画质档 → 占位面积缩放系数。
++ *
++ * 这不是真实像素比(1K→4K 的像素是 16 倍,照搬会让 4K 占位撑爆画布),而是**可分辨的
++ * 视觉分档**:相邻两档差 20% 左右,并排时一眼能看出高低,又不至于让高档挤走别的节点。
++ * resolution 与 quality 两套 key 并存,因为两个通道用的是不同参数(NANO 发 resolution、
++ * GPT 发 quality),这里按谁在场用谁,不做互相换算——换算本身就是错的(三档 quality
++ * 只能映射 1K/1K/2K,见 types/generation 的说明)。
++ */
++const TIER_SCALE: Record<string, number> = {
++  '1K': 1,
++  '2K': 1.2,
++  '4K': 1.45,
++  low: 1,
++  medium: 1.2,
++  high: 1.45,
++}
++
++/** 比例 id → 宽高比数值。GenerationRatio 全集,缺一个就会在下面回退到源图/方形。 */
++const RATIO_VALUE: Record<GenerationRatio, number> = {
++  '1:1': 1,
++  '3:2': 3 / 2,
++  '2:3': 2 / 3,
++  '16:9': 16 / 9,
++  '9:16': 9 / 16,
++  '4:3': 4 / 3,
++  '3:4': 3 / 4,
++  '21:9': 21 / 9,
++  '5:4': 5 / 4,
++  '4:5': 4 / 5,
++}
++
++export type MaskEditSlotPlanInput = {
++  /** 占位符基准尺寸(defaultSizeForNodeType('ai-slot')),缩放与比例都以它的面积为基准。 */
++  baseSize: { width: number; height: number }
++  count?: number
++  imgRatio?: GenerationRatio
++  /** 源图尺寸。imgRatio 缺席(=「保持原比例」)时占位跟它走。 */
++  sourceSize?: { width: number; height: number }
++  resolution?: MivoPlatformResolutionValue
++  quality?: MivoImageQuality
++}
++
++export type MaskEditSlotPlan = {
++  count: number
++  slotSize: { width: number; height: number }
++  /** 本次采用的画质缩放系数。产出它是为了让调用方把「为什么这个占位这么大」写进
++   *  Debug Log —— 占位尺寸是宽高比与画质档两个因素的乘积,只看结果尺寸排障时
++   *  分不清是哪一个造成的。 */
++  tierScale: number
++}
++
++/**
++ * 比例优先级:**显式 imgRatio > 源图比例 > 基准尺寸自身比例**。
++ *
++ * 中间那档是「保持原比例」的落点——用户没动比例时,占位框跟源图形状走而不是恒定方形。
++ * 这与提交链路的语义一致(那边也是「没选=按源图算」),两处必须同一口径,否则会出现
++ * 「占位是方的、出图是宽的」这种 loading 与结果对不上的跳变。
++ */
++const targetAspectFor = (input: MaskEditSlotPlanInput): number => {
++  if (input.imgRatio && RATIO_VALUE[input.imgRatio]) return RATIO_VALUE[input.imgRatio]
++  const source = input.sourceSize
++  if (source && source.width > 0 && source.height > 0) return source.width / source.height
++  return Math.max(1, input.baseSize.width) / Math.max(1, input.baseSize.height)
++}
++
++export const maskEditSlotPlanFor = (input: MaskEditSlotPlanInput): MaskEditSlotPlan => {
++  const rawCount = Number(input.count)
++  const count = Number.isFinite(rawCount) ? Math.min(SLOT_COUNT_MAX, Math.max(1, Math.trunc(rawCount))) : 1
++
++  // 画质缩放:resolution 在场用它,否则用 quality,都没有就是 1(旧行为)。
++  const tierKey = input.resolution ?? input.quality
++  const scale = (tierKey && TIER_SCALE[tierKey]) || 1
++
++  // 等面积换算:面积 = base 面积 × scale²,再按目标宽高比分配宽高。
++  // 用面积而不是直接缩宽度,是为了让不同比例的占位在画布上「份量」可比 ——
++  // 16:9 与 9:16 应该看起来一样大,只是躺着和立着的区别。
++  const aspect = targetAspectFor(input)
++  const baseArea = Math.max(1, input.baseSize.width * input.baseSize.height) * scale * scale
++  const width = Math.round(Math.sqrt(baseArea * aspect))
++  const height = Math.round(width / aspect)
++
++  return {
++    count,
++    slotSize: {
++      width: Math.max(1, width),
++      height: Math.max(1, height),
++    },
++    tierScale: scale,
++  }
++}
++
++/**
++ * 由结果图的实际尺寸反推分辨率档,供画布节点打角标。
++ *
++ * 判据用**长边像素**而不是面积:平台各档的实际输出不是严格的 1024/2048/4096 方形
++ * (改图会按比例给,如 2K 的 16:9 实出 2528×1696),长边最稳定。阈值取档位中值偏下,
++ * 让边界情况(比如 2K 的窄幅图)落进它该在的档而不是降一档。
++ */
++export const resolutionBadgeForSize = (size?: { width: number; height: number }): '2K' | '4K' | undefined => {
++  if (!size || size.width <= 0 || size.height <= 0) return undefined
++  const longEdge = Math.max(size.width, size.height)
++  if (longEdge >= 3600) return '4K'
++  if (longEdge >= 2000) return '2K'
++  return undefined
++}
+diff --git a/src/canvas/regionEditParams.test.ts b/src/canvas/regionEditParams.test.ts
+new file mode 100644
+index 00000000..9544efb5
+--- /dev/null
++++ b/src/canvas/regionEditParams.test.ts
+@@ -0,0 +1,175 @@
++import { describe, expect, it } from 'vitest'
++import { maskEditQualityFor } from './imageMaskGeometry'
++import {
++  REGION_EDIT_RATIO_SOURCE,
++  clampRegionEditParams,
++  closestRegionEditRatio,
++  regionEditDefaultParams,
++  regionEditParamsSummary,
++  regionEditQualityOptions,
++  regionEditRatioOptions,
++  resolveRegionEditRatio,
++} from './regionEditParams'
++
++describe('regionEditParams — 默认值必须等于改造前的线上行为', () => {
++  // 这两条是本次改动的核心安全网:面板加了参数入口后,用户「一个都不动」时
++  // 出图必须和加参数之前逐字节同形态。默认值一旦漂移 = 悄悄改变存量行为。
++  // NANO 今天发 quality='high',BFF 换算表 high→'2K' ⇒ 默认分辨率档必须是 2K。
++  // 这条曾在初版实现里写错(把 4K 也编码成 high,用户选 4K 实出 2K),由本测试逮到。
++  it('NANO 默认档 = 2K,且与线上 high→2K 的换算结果一致', () => {
++    const model = 'gemini-3-pro-image' as const
++    expect(maskEditQualityFor(model)).toBe('high') // 线上现值
++    expect(regionEditDefaultParams(model).quality).toEqual({ kind: 'resolution', value: '2K' })
++  })
++
++  it('GPT 默认档 = 中,与线上 medium 一致', () => {
++    const model = 'gpt-image-2' as const
++    expect(maskEditQualityFor(model)).toBe('medium') // 线上现值
++    expect(regionEditDefaultParams(model).quality).toEqual({ kind: 'quality', value: 'medium' })
++  })
++
++  it('NANO 的档位是 resolution 而非 quality —— 两者不可复用同一编码', () => {
++    // 防回归:三档 quality 只能映射出 1K/1K/2K 两种分辨率,表达不了 4K。
++    const opts = regionEditQualityOptions('gemini-3-pro-image')
++    expect(opts.every((o) => o.value.kind === 'resolution')).toBe(true)
++    expect(opts.map((o) => o.value.value)).toEqual(['1K', '2K', '4K'])
++    expect(regionEditQualityOptions('gpt-image-2').every((o) => o.value.kind === 'quality')).toBe(true)
++  })
++
++  it('两模型默认都是「保持原比例 + 单张」(改造前没有这两个参数)', () => {
++    for (const model of ['gemini-3-pro-image', 'gpt-image-2'] as const) {
++      const d = regionEditDefaultParams(model)
++      expect(d.ratio).toBe(REGION_EDIT_RATIO_SOURCE)
++      expect(d.count).toBe(1)
++    }
++  })
++})
++
++describe('regionEditParams — 分模型档位(实测值)', () => {
++  it('NANO 画质显示 1K/2K/4K,4K 打慢标', () => {
++    const opts = regionEditQualityOptions('gemini-3-pro-image')
++    expect(opts.map((o) => o.label)).toEqual(['1K', '2K', '4K'])
++    expect(opts.find((o) => o.label === '4K')?.slow).toBe(true)
++  })
++
++  it('GPT 画质显示 低/中/高,不打慢标(平台自定像素,high=2880² 非 4K)', () => {
++    const opts = regionEditQualityOptions('gpt-image-2')
++    expect(opts.map((o) => o.label)).toEqual(['低', '中', '高'])
++    expect(opts.some((o) => o.slow)).toBe(false)
++  })
++
++  it('两模型比例档数不同,但都含实测可用的 21:9', () => {
++    expect(regionEditRatioOptions('gemini-3-pro-image')).toHaveLength(10)
++    expect(regionEditRatioOptions('gpt-image-2')).toHaveLength(6)
++    expect(regionEditRatioOptions('gemini-3-pro-image')).toContain('21:9')
++    expect(regionEditRatioOptions('gpt-image-2')).toContain('21:9')
++  })
++
++  it('GPT 不支持 NANO 独有的 4:3 / 5:4 等档', () => {
++    const gpt = regionEditRatioOptions('gpt-image-2')
++    for (const r of ['4:3', '3:4', '4:5', '5:4'] as const) expect(gpt).not.toContain(r)
++  })
++})
++
++describe('clampRegionEditParams — 切模型时收敛非法比例', () => {
++  it('NANO 独有比例切到 GPT → 回落保持原比例(不静默换成用户没选过的比例)', () => {
++    const params = { quality: { kind: 'resolution', value: '4K' }, ratio: '4:3', count: 2 } as const
++    const next = clampRegionEditParams(params, 'gpt-image-2')
++    expect(next.ratio).toBe(REGION_EDIT_RATIO_SOURCE)
++    // 画质换算到 GPT 的默认档(resolution 档在 GPT 不存在),张数不受影响
++    expect(next.quality).toEqual({ kind: 'quality', value: 'medium' })
++    expect(next.count).toBe(2)
++  })
++
++  it('两模型共有的比例切模型后保留', () => {
++    const params = { quality: { kind: 'quality', value: 'low' }, ratio: '16:9', count: 1 } as const
++    expect(clampRegionEditParams(params, 'gpt-image-2').ratio).toBe('16:9')
++    expect(clampRegionEditParams(params, 'gemini-3-pro-image').ratio).toBe('16:9')
++  })
++
++  it('保持原比例态在任何模型下都合法', () => {
++    const params = { quality: { kind: 'quality', value: 'medium' }, ratio: REGION_EDIT_RATIO_SOURCE, count: 4 } as const
++    expect(clampRegionEditParams(params, 'gpt-image-2')).toEqual(params)
++  })
++})
++
++describe('regionEditParamsSummary — 触发按钮摘要', () => {
++  it('默认态显示「保持原比例 · 2K · 1张」(NANO)', () => {
++    const model = 'gemini-3-pro-image' as const
++    expect(regionEditParamsSummary(regionEditDefaultParams(model), model)).toBe('保持原比例 · 2K · 1张')
++  })
++
++  it('GPT 默认态显示「保持原比例 · 中 · 1张」', () => {
++    const model = 'gpt-image-2' as const
++    expect(regionEditParamsSummary(regionEditDefaultParams(model), model)).toBe('保持原比例 · 中 · 1张')
++  })
++
++  it('选了具体比例与多张时如实显示', () => {
++    const params = { quality: { kind: 'resolution', value: '1K' }, ratio: '21:9', count: 4 } as const
++    expect(regionEditParamsSummary(params, 'gemini-3-pro-image')).toBe('21:9 · 1K · 4张')
++  })
++})
++
++describe('「保持原比例」= 算源图最近档,不是不发比例', () => {
++  // R1 三审席③ UP-1:不发 imgRatio 时平台一律出 1:1 正方形而非源图比例(2026-08-11 实测)。
++  // 旧实现「保持原比例 = 不发字段」因此实际出方图,与用户预期相反。
++  it('横幅源图落到横比例档,不是 1:1', () => {
++    const ratio = closestRegionEditRatio({ width: 1264, height: 848 }, 'gemini-3-pro-image')
++    expect(ratio).toBe('3:2')
++  })
++
++  it('竖幅源图落到竖比例档', () => {
++    expect(closestRegionEditRatio({ width: 848, height: 1264 }, 'gemini-3-pro-image')).toBe('2:3')
++  })
++
++  it('方图源图才落 1:1', () => {
++    expect(closestRegionEditRatio({ width: 1000, height: 1000 }, 'gemini-3-pro-image')).toBe('1:1')
++  })
++
++  it('档位集按模型收窄:4:3 源图在 NANO 精确命中,在 GPT 只能落最近的 3:2', () => {
++    const size = { width: 1200, height: 900 }
++    expect(closestRegionEditRatio(size, 'gemini-3-pro-image')).toBe('4:3')
++    expect(closestRegionEditRatio(size, 'gpt-image-2')).toBe('3:2')
++  })
++
++  it('极端宽幅落到最宽档 21:9,不会溢出档位集', () => {
++    expect(closestRegionEditRatio({ width: 3000, height: 1000 }, 'gemini-3-pro-image')).toBe('21:9')
++  })
++
++  it('退化尺寸(0/负数)不崩,落回方形', () => {
++    expect(closestRegionEditRatio({ width: 0, height: 0 }, 'gemini-3-pro-image')).toBe('1:1')
++  })
++
++  it('resolveRegionEditRatio:显式选的比例优先于源图', () => {
++    const params = { quality: { kind: 'resolution', value: '2K' }, ratio: '16:9', count: 1 } as const
++    expect(resolveRegionEditRatio(params, 'gemini-3-pro-image', { width: 1264, height: 848 })).toBe('16:9')
++  })
++
++  it('resolveRegionEditRatio:「保持原比例」换算成源图最近档而非返回 source 标记', () => {
++    const params = regionEditDefaultParams('gemini-3-pro-image')
++    const resolved = resolveRegionEditRatio(params, 'gemini-3-pro-image', { width: 1264, height: 848 })
++    expect(resolved).toBe('3:2')
++    expect(resolved).not.toBe(REGION_EDIT_RATIO_SOURCE)
++  })
++})
++
++describe('比例改动 → 提示词切补画版(产品语义:不裁图,让 AI 补)', () => {
++  it('保持原比例:沿用原 footer(整图保护语义)', async () => {
++    const { buildRegionEditPrompt } = await import('../lib/regionEditPrompt')
++    const prompt = buildRegionEditPrompt('把猫改成狗')
++    expect(prompt).toContain('标注位置以外的所有内容必须保持完全不变')
++    expect(prompt).not.toContain('输出画面比例必须是')
++  })
++
++  it('改了比例:footer 换成补画版,且**不再**出现互相矛盾的整图保护句', () => {
++    // 两句同时在场会让模型二选一(要么不扩、要么整图重绘),必须是替换而非追加。
++    return import('../lib/regionEditPrompt').then(({ buildRegionEditPrompt }) => {
++      const prompt = buildRegionEditPrompt('把猫改成狗', '16:9')
++      expect(prompt).toContain('输出画面比例必须是 16:9')
++      expect(prompt).toContain('向不足的方向自然补画延展')
++      expect(prompt).not.toContain('标注位置以外的所有内容必须保持完全不变')
++      // 红标注保护在两个版本里都必须在
++      expect(prompt).toContain('不得出现红色标注')
++    })
++  })
++})
+diff --git a/src/canvas/regionEditParams.ts b/src/canvas/regionEditParams.ts
+new file mode 100644
+index 00000000..4208021c
+--- /dev/null
++++ b/src/canvas/regionEditParams.ts
+@@ -0,0 +1,186 @@
++// src/canvas/regionEditParams.ts
++// 区域编辑「更多参数」的取值模型:画质 / 比例 / 张数,按模型分档。
++//
++// 所有取值都来自 2026-08-11 对 Mivo 平台(aigc.xindong.com)的**实测**,不是文档推断
++// ——发真实任务、等出图、量首图像素得到的结论(多轮探测;具体任务数见平台后台记录,
++// 此处不承诺精确计数,F-G1):
++//
++//   NANO(gemini-3-pro-image)  resolution=1K → 1024²;4K → 4096²(实测);8K → 平台侧生成失败
++//                             ratio=21:9 → 1584x672;n=4 → 实回 3 张(平台不保证足量)
++//   GPT (gpt-image-2)         quality=high → 2880²;不带 quality → 2048²;low → 1024²
++//                             ratio=21:9 → 2352x1008;n=4 → 实回 4 张
++//
++// 合法域(比例/分辨率/张数)的**单一真相源**是 shared/regionEditCapabilities.ts:
++// BFF 校验与前端取值同表,避免「前端白名单 6 档、BFF 宽集合 10 档」的域漂移
++// (2026-08-12 R1 三审席② ADV-E1)。
++//
++// 两模型的画质**不是同一种参数**,刻意不统一文案:
++//   - NANO 走 `resolution`,是**精确尺寸承诺**(要 4K 给 4096²);
++//   - GPT  走 `quality`,是**质量意图**,像素由平台定(high 给 2880² 而非 4096²)。
++// 把 GPT 的 high 标成「4K」会虚标,Cindy 官方插件(xd-mivo)也是分开两套档位显示。
++//
++// 传输侧**不能**复用 quality 三档编码表达 NANO 的分辨率(2026-08-11 单测逮到):
++// 现有 BFF 换算表是 low→1K / medium→1K / high→2K,三档只映射出两种分辨率,且 high
++// 已被线上占用为 2K。若把 UI 的「4K」也编码成 high,用户选 4K 实际出 2K —— 同一个
++// 编码两处含义不同,是静默的功能欺骗。
++// 因此 NANO 侧新增独立字段 `resolution`(1K/2K/4K 原样直达平台),quality 字段仅
++// GPT 使用。两个字段互斥,由模型决定用哪个,BFF 侧据此组包。
++import type { GenerationRatio, MivoImageQuality, MivoPlatformResolutionValue } from '../types/generation'
++import { REGION_EDIT_CAPABILITIES } from '../../shared/regionEditCapabilities'
++import type { MaskEditModelId } from './imageMaskGeometry'
++
++/** NANO 专用:平台 `resolution` 档(8K 实测被平台判生成失败,不开放)。类型见 types/generation。 */
++export const regionEditResolutions = REGION_EDIT_CAPABILITIES['gemini-3-pro-image'].resolutions
++export type RegionEditResolution = MivoPlatformResolutionValue
++
++/** 比例的「保持原图」态:不发 imgRatio,输出尺寸跟随源图(区域编辑的历史默认行为)。 */
++export const REGION_EDIT_RATIO_SOURCE = 'source' as const
++export type RegionEditRatio = typeof REGION_EDIT_RATIO_SOURCE | GenerationRatio
++
++/** 张数:平台 n 字段。4 张实测 NANO 可能少回(见文件头),按实回数量落图。 */
++export const regionEditCounts = [1, 2, 4] as const
++export type RegionEditCount = (typeof regionEditCounts)[number]
++
++/**
++ * 画质在两个模型上是**两种不同的参数**,故用可辨识联合而不是一个 quality 字段:
++ *   NANO → { kind:'resolution', value:'1K'|'2K'|'4K' }  精确尺寸承诺,直达平台 resolution
++ *   GPT  → { kind:'quality',    value:'low'|'medium'|'high' }  质量意图,像素由平台定
++ * 这样「用户选的档」与「线上发出去的值」永远一一对应,不存在换算歧义。
++ */
++export type RegionEditQuality =
++  | { kind: 'resolution'; value: RegionEditResolution }
++  | { kind: 'quality'; value: MivoImageQuality }
++
++export type RegionEditParams = {
++  quality: RegionEditQuality
++  ratio: RegionEditRatio
++  count: RegionEditCount
++}
++
++/** 画质档在 UI 上的显示名(按模型分)。 */
++export type QualityOption = { value: RegionEditQuality; label: string; slow?: boolean }
++
++const nanoQuality = (value: RegionEditResolution): RegionEditQuality => ({ kind: 'resolution', value })
++const gptQuality = (value: MivoImageQuality): RegionEditQuality => ({ kind: 'quality', value })
++
++const NANO_QUALITIES: QualityOption[] = [
++  { value: nanoQuality('1K'), label: '1K' },
++  { value: nanoQuality('2K'), label: '2K' },
++  // 4K 实测 4096²,轮询明显更久 → 打慢标,BFF 侧另配更长超时。
++  { value: nanoQuality('4K'), label: '4K', slow: true },
++]
++
++const GPT_QUALITIES: QualityOption[] = [
++  { value: gptQuality('low'), label: '低' },
++  { value: gptQuality('medium'), label: '中' },
++  { value: gptQuality('high'), label: '高' },
++]
++
++// 比例域取 shared/regionEditCapabilities 的每模型 exact 表(BFF 校验同表,防漂移)。
++// NANO 平台侧 9 档 + 实测可用的 21:9 = 10 档;GPT 平台侧 5 档 + 21:9 = 6 档。
++const NANO_RATIOS = REGION_EDIT_CAPABILITIES['gemini-3-pro-image'].ratios as readonly GenerationRatio[]
++const GPT_RATIOS = REGION_EDIT_CAPABILITIES['gpt-image-2'].ratios as readonly GenerationRatio[]
++
++export const regionEditQualityOptions = (model: MaskEditModelId): QualityOption[] =>
++  model === 'gpt-image-2' ? GPT_QUALITIES : NANO_QUALITIES
++
++export const regionEditRatioOptions = (model: MaskEditModelId): readonly GenerationRatio[] =>
++  model === 'gpt-image-2' ? GPT_RATIOS : NANO_RATIOS
++
++/**
++ * 默认参数 = **今天的线上行为**,一个都不动时出图与改造前同形态:
++ *   NANO 今天发 quality='high',经 BFF 换算表 high→'2K' ⇒ 默认档 = 2K(**不是 4K**);
++ *   GPT  今天发 quality='medium' ⇒ 默认档 = 中。
++ * 比例保持原图、单张,都是改造前根本不存在的参数,默认即「不发」。
++ * 这条契约是「默认状态就是目前状态」的落点,改动它等于悄悄改变存量用户的出图结果
++ * (单测 regionEditParams.test.ts 对着 maskEditQualityFor 与换算表锁死)。
++ */
++export const regionEditDefaultParams = (model: MaskEditModelId): RegionEditParams => ({
++  quality: model === 'gpt-image-2' ? gptQuality('medium') : nanoQuality('2K'),
++  ratio: REGION_EDIT_RATIO_SOURCE,
++  count: 1,
++})
++
++/**
++ * 切换模型时把参数收敛到新模型的合法域:画质三档两模型都全,恒合法;比例可能越界
++ * (NANO 独有的 4:3/3:4/4:5/5:4 在 GPT 不存在)→ 回落「保持原图」而不是静默换一个
++ * 用户没选过的比例;张数与模型无关。
++ */
++export const clampRegionEditParams = (params: RegionEditParams, model: MaskEditModelId): RegionEditParams => {
++  const ratioOk =
++    params.ratio === REGION_EDIT_RATIO_SOURCE || regionEditRatioOptions(model).includes(params.ratio)
++  const ratio = ratioOk ? params.ratio : REGION_EDIT_RATIO_SOURCE
++  // 画质是分模型的两套参数(resolution vs quality):换了模型,旧档 kind 必然不匹配
++  // 新模型 → 回落该模型的默认档(NANO=2K / GPT=中),即「维持现状」那一档。
++  const kindOk = params.quality.kind === (model === 'gpt-image-2' ? 'quality' : 'resolution')
++  const quality = kindOk ? params.quality : regionEditDefaultParams(model).quality
++  // 无需收敛时**返回原对象**:调用方(useRegionEditParams 的模型切换 effect)靠引用
++  // 相等判断「这次要不要写状态 + 记 warn」,恒返回新对象会让它每次模型变更都误报。
++  if (ratioOk && kindOk) return params
++  return { ...params, ratio, quality }
++}
++
++/** 比例 id → 宽高比数值。用于「保持原比例」时从源图尺寸挑最近档。 */
++const RATIO_VALUE: Record<GenerationRatio, number> = {
++  '1:1': 1,
++  '3:2': 3 / 2,
++  '2:3': 2 / 3,
++  '16:9': 16 / 9,
++  '9:16': 9 / 16,
++  '4:3': 4 / 3,
++  '3:4': 3 / 4,
++  '21:9': 21 / 9,
++  '5:4': 5 / 4,
++  '4:5': 4 / 5,
++}
++
++/**
++ * 「保持原比例」的落地实现:从源图尺寸挑该模型可用档里最接近的一个。
++ *
++ * **不发 imgRatio 不等于跟随源图** —— 2026-08-11 实测:不带比例参数时平台一律出 1:1
++ * 正方形。所以「保持原比例」必须由前端算出具体档位发出去(R1 三审席③ UP-1 / 席② ADV-A1)。
++ *
++ * 距离用**对数**而非线性差:log 尺度下「放大 1.2 倍」与「缩小 1.2 倍」等距,挑出来的档
++ * 在视觉上才是真的最近。线性差会系统性偏向宽比例(16:9 与 1:1 的线性差 0.78,而 1:1 与
++ * 9:16 只差 0.44,同样是「差一档」却权重不同)。口径与 useMaskPointArmed 的同名实现一致
++ * (那份是 chat 生图路径的,档位集更窄;两处将来值得合并成单一真相源,不在本 PR 范围)。
++ *
++ * 档位集取**该模型的合法域**:NANO 10 档能挑到 4:3/5:4 这类接近方形的档,GPT 只有 6 档,
++ * 1264×848(1.49)在两个模型上分别落到 3:2(1.5)与 3:2 —— 恰好同档,但 4:3 源图在 NANO
++ * 会精确命中 4:3,在 GPT 只能落 3:2,这是模型能力差异不是 bug。
++ */
++export const closestRegionEditRatio = (
++  size: { width: number; height: number },
++  model: MaskEditModelId,
++): GenerationRatio => {
++  const options = regionEditRatioOptions(model)
++  const ratio = Math.max(1, size.width) / Math.max(1, size.height)
++  return options.reduce((best, candidate) =>
++    Math.abs(Math.log(ratio / RATIO_VALUE[candidate])) < Math.abs(Math.log(ratio / RATIO_VALUE[best]))
++      ? candidate
++      : best,
++  )
++}
++
++/**
++ * 提交时的实际比例:显式选了就用选的,「保持原比例」则从源图算最近档。
++ * 返回值恒为具体档位 —— 提交链路**永远发 imgRatio**,不再有「不发」这个分支。
++ */
++export const resolveRegionEditRatio = (
++  params: RegionEditParams,
++  model: MaskEditModelId,
++  sourceSize: { width: number; height: number },
++): GenerationRatio =>
++  params.ratio === REGION_EDIT_RATIO_SOURCE ? closestRegionEditRatio(sourceSize, model) : params.ratio
++
++const sameQuality = (a: RegionEditQuality, b: RegionEditQuality): boolean =>
++  a.kind === b.kind && a.value === b.value
++
++/** 触发按钮上的摘要文案:「保持原比例 · 2K · 1张」。 */
++export const regionEditParamsSummary = (params: RegionEditParams, model: MaskEditModelId): string => {
++  const quality = regionEditQualityOptions(model).find((q) => sameQuality(q.value, params.quality))
++  const ratio = params.ratio === REGION_EDIT_RATIO_SOURCE ? '保持原比例' : params.ratio
++  return [ratio, quality?.label ?? params.quality.value, `${params.count}张`].join(' · ')
++}
++
++export { sameQuality as isSameRegionEditQuality }
+diff --git a/src/canvas/regionEditSubmit.test.ts b/src/canvas/regionEditSubmit.test.ts
+index 79e039e5..5a7d5936 100644
+--- a/src/canvas/regionEditSubmit.test.ts
++++ b/src/canvas/regionEditSubmit.test.ts
+@@ -2,6 +2,7 @@
+ // 区域编辑提交装配单测:双图首选形态、标注图失败降级坐标形态、payload 字段契约。
+ import { describe, it, expect, vi, beforeEach } from 'vitest'
+ import { buildRegionEditSubmission } from './regionEditSubmit'
++import { REGION_EDIT_RATIO_SOURCE, type RegionEditParams } from './regionEditParams'
+ import type { ImageMaskRegion } from './imageMaskGeometry'
+ 
+ const buildAnchorMarkedImage = vi.hoisted(() => vi.fn())
+@@ -192,3 +193,103 @@ describe('buildRegionEditSubmission — 零选区纯文字', () => {
+     expect(payload.maskBounds).toBeUndefined()
+   })
+ })
++
++// ── F-C2(R1 三审席①):「更多参数」非默认 params 的装配行为 ──
++// 旧用例全部只走 params 缺省路径;新增的 quality/resolution/imgRatio/count 条件
++// 装配与「比例改动 → 补画子句」分支必须有直接断言。
++describe('buildRegionEditSubmission — 「更多参数」非默认 params', () => {
++  const gptParams = (over: Partial<RegionEditParams>): RegionEditParams => ({
++    quality: { kind: 'quality', value: 'medium' },
++    ratio: REGION_EDIT_RATIO_SOURCE,
++    count: 1,
++    ...over,
++  })
++  const nanoParams = (over: Partial<RegionEditParams>): RegionEditParams => ({
++    quality: { kind: 'resolution', value: '2K' },
++    ratio: REGION_EDIT_RATIO_SOURCE,
++    count: 1,
++    ...over,
++  })
++
++  it('GPT 显式改比例 16:9:imgRatio=16:9,双图形态带补画子句(授权向外延展)', async () => {
++    buildAnchorMarkedImage.mockResolvedValue(new Blob(['marked'], { type: 'image/png' }))
++    const payload = await buildRegionEditSubmission({
++      body: '把1号区域改成蓝色',
++      regions,
++      naturalSize,
++      resolvedAssetUrl: 'blob:source',
++      model: 'gpt-image-2',
++      params: gptParams({ ratio: '16:9' }),
++    })
++    expect(payload.imgRatio).toBe('16:9')
++    expect(payload.prompt).toContain('输出画面比例必须是 16:9')
++    // 补画子句明确授权外延:不是拉伸、不是加黑边。
++    expect(payload.prompt).toContain('自然补画延展')
++  })
++
++  it('「保持原比例」:imgRatio 为源图最近档(1000x2000 → 9:16),**不带**补画子句', async () => {
++    buildAnchorMarkedImage.mockResolvedValue(new Blob(['marked'], { type: 'image/png' }))
++    const payload = await buildRegionEditSubmission({
++      body: '把1号区域改成蓝色',
++      regions,
++      naturalSize,
++      resolvedAssetUrl: 'blob:source',
++      model: 'gpt-image-2',
++      params: gptParams({}), // ratio 保持 source
++    })
++    // 1000x2000 = 0.5 → GPT 档位里对数距离最近的是 9:16(0.5625)。
++    expect(payload.imgRatio).toBe('9:16')
++    // 画幅没变,补画子句按用户选择(有效.ratio)判据不给 —— 发了反而诱导模型扩画面。
++    expect(payload.prompt).not.toContain('输出画面比例必须是')
++  })
++
++  it('NANO 选 4K:resolution=4K 原样下发,quality 仍为线上等价编码 high', async () => {
++    buildAnchorMarkedImage.mockResolvedValue(null)
++    const payload = await buildRegionEditSubmission({
++      body: '改成蓝色',
++      regions,
++      naturalSize,
++      resolvedAssetUrl: 'blob:source',
++      model: 'gemini-3-pro-image',
++      params: nanoParams({ quality: { kind: 'resolution', value: '4K' } }),
++    })
++    expect(payload.resolution).toBe('4K')
++    expect(payload.quality).toBe('high')
++  })
++
++  it('GPT 选 high:quality=high,不发 resolution 字段(GPT 通道无此概念)', async () => {
++    buildAnchorMarkedImage.mockResolvedValue(null)
++    const payload = await buildRegionEditSubmission({
++      body: '改成蓝色',
++      regions,
++      naturalSize,
++      resolvedAssetUrl: 'blob:source',
++      model: 'gpt-image-2',
++      params: gptParams({ quality: { kind: 'quality', value: 'high' } }),
++    })
++    expect(payload.quality).toBe('high')
++    expect(payload.resolution).toBeUndefined()
++  })
++
++  it('count>1 才下发 count 字段:4 → 下发,1 → 不发(存量行为不变)', async () => {
++    buildAnchorMarkedImage.mockResolvedValue(null)
++    const four = await buildRegionEditSubmission({
++      body: '改成蓝色',
++      regions,
++      naturalSize,
++      resolvedAssetUrl: 'blob:source',
++      model: 'gemini-3-pro-image',
++      params: nanoParams({ count: 4 }),
++    })
++    expect(four.count).toBe(4)
++    const one = await buildRegionEditSubmission({
++      body: '改成蓝色',
++      regions,
++      naturalSize,
++      resolvedAssetUrl: 'blob:source',
++      model: 'gemini-3-pro-image',
++      params: nanoParams({ count: 1 }),
++    })
++    expect(one.count).toBeUndefined()
++  })
++})
+diff --git a/src/canvas/regionEditSubmit.ts b/src/canvas/regionEditSubmit.ts
+index c80a85d0..e5c007cb 100644
+--- a/src/canvas/regionEditSubmit.ts
++++ b/src/canvas/regionEditSubmit.ts
+@@ -9,6 +9,12 @@
+ //   与局部重绘同一降级哲学 —— 识别性辅助失败绝不阻塞出图。
+ // regionRects 恒随 payload 透传:web HTTP 客户端忽略;Cindy 插件端口用它拼
+ // 坐标提示词(插件发不了本地合成的标注图,协议无入账口子,2026-07-29 调研)。
++import {
++  REGION_EDIT_RATIO_SOURCE,
++  regionEditDefaultParams,
++  resolveRegionEditRatio,
++  type RegionEditParams,
++} from './regionEditParams'
+ import {
+   boundsForRegions,
+   maskEditQualityFor,
+@@ -32,17 +38,26 @@ export async function buildRegionEditSubmission({
+   naturalSize,
+   resolvedAssetUrl,
+   model,
++  params,
+ }: {
+   /** 用户指令原文(按「N号区域」引用),不扩写不改写。 */
+   body: string
+   regions: ImageMaskRegion[]
+   naturalSize: { width: number; height: number }
+   resolvedAssetUrl: string
+-  /** 用户在面板里选的出图模型(K1 Task 2)。质量档按模型固定,见 maskEditQualityFor。 */
++  /** 用户在面板里选的出图模型(K1 Task 2)。 */
+   model: MaskEditModelId
++  /** 「更多参数」面板选的画质/比例/张数。省略 = 该模型的默认档(等于改造前行为)。 */
++  params?: RegionEditParams
+ }): Promise<ImageMaskSubmitPayload> {
+   // @区域N(UI 召唤符)→ 区域N,与外壳/标注图编号对齐;两条形态与 regionBody 同源。
+   const normalizedBody = normalizeRegionRefs(body)
++  // 参数缺省 = 该模型默认档;默认档的编码结果与改造前逐字段同形(见 regionEditParams
++  // 的默认值契约与其单测),所以「不开参数面板」的既有链路行为不变。
++  const effective = params ?? regionEditDefaultParams(model)
++  // 「保持原比例」在这里就落成具体档位:不发 imgRatio 平台会出 1:1 正方形而非源图比例
++  // (2026-08-11 实测,R1 三审席③ UP-1)。effectiveRatio 恒为可发出的具体值。
++  const effectiveRatio = resolveRegionEditRatio(effective, model, naturalSize)
+   const rects = regionRectsPct(regions, naturalSize)
+   // 零选区(K6:用户只打字)= 一次普通的整图改图:标注图无从可画(没有形状),
+   // 提示词退成纯指令原文,maskBounds 也天然是 undefined(boundsForRegions 空数组返 undefined)
+@@ -53,7 +68,14 @@ export async function buildRegionEditSubmission({
+       ? await buildAnchorMarkedImage(resolvedAssetUrl, naturalSize, shapes)
+       : null
+   const prompt = markedImage
+-    ? buildRegionEditPrompt(normalizedBody)
++    ? buildRegionEditPrompt(
++        normalizedBody,
++        // 补画子句只在**用户显式改了比例**时给:此时画幅要变,需要授权模型向外延展。
++        // 「保持原比例」虽然现在也发具体 imgRatio(见 effectiveRatio),但那是源图自己的
++        // 比例、画幅不变,发补画子句反而会诱导模型去扩画面 —— 判据必须看用户的选择
++        // (effective.ratio),不能看发出去的值(effectiveRatio),两者已不再等同。
++        effective.ratio !== REGION_EDIT_RATIO_SOURCE ? effectiveRatio : undefined,
++      )
+     : buildRegionCoordinatePrompt(normalizedBody, rects)
+   if (markedImage) {
+     debugLogger.log('Region Edit', `提交装配完成:双图形态,${rects.length} 个区域`)
+@@ -62,12 +84,26 @@ export async function buildRegionEditSubmission({
+   } else {
+     debugLogger.warn('Region Edit', `标注图不可用,降级坐标文字形态(${rects.length} 个区域),不阻塞出图`)
+   }
++  // 三点对账埋点之一(装配层):用户实测「比例慢一拍」(2026-08-11,平台实收=上一单
++  // 的比例)但代码审读找不到错位点 —— 在装配、端口、电子脑三处各记一次实际参数,
++  // 三份日志并排即可定位错位发生在哪一跳。此处记「装配时刻的 effective 参数」。
++  debugLogger.log(
++    'Region Edit',
++    `装配参数对账:model=${model} ratio=${effectiveRatio} quality=${effective.quality.kind}:${effective.quality.value} count=${effective.count}`,
++  )
+   return {
+     prompt,
+     maskBounds: boundsForRegions(regions, naturalSize),
+     sourceSize: naturalSize,
+     model,
+-    quality: maskEditQualityFor(model),
++    // NANO 走 resolution 档:quality 仍发线上等价编码(平台组包时以 resolution 为准),
++    // GPT 走 quality 档:直接发用户选的档位。
++    quality: effective.quality.kind === 'quality' ? effective.quality.value : maskEditQualityFor(model),
++    ...(effective.quality.kind === 'resolution' ? { resolution: effective.quality.value } : {}),
++    // **恒发 imgRatio**:不发的话平台出 1:1 正方形而不是源图比例(2026-08-11 实测)。
++    // 「保持原比例」由 resolveRegionEditRatio 换算成源图的最近档,这里已是具体值。
++    imgRatio: effectiveRatio,
++    ...(effective.count > 1 ? { count: effective.count } : {}),
+     markedImage: markedImage ?? undefined,
+     regionRects: rects,
+     regionBody: normalizedBody.trim(),
+diff --git a/src/canvas/useMaskPointArmed.ts b/src/canvas/useMaskPointArmed.ts
+index 3d69a153..70fe39bd 100644
+--- a/src/canvas/useMaskPointArmed.ts
++++ b/src/canvas/useMaskPointArmed.ts
+@@ -156,7 +156,20 @@ export function useMaskPointArmed({
+       // 防快速双击/大图 toBlob 慢导致双提交（两个 placeholder + 两组 chat message + 两条 edit POST）。
+       setMaskEditSubmittingNodeId(nodeId)
+       try {
+-        const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder(targetSceneId, source, payload.prompt)
++        // 占位计划(owner 2026-08-11):张数=占位数、占位框按目标比例、画质档放大。
++        const { slotId, slotIds, baselineSnapshot } = prepareMaskEditPlaceholder(
++          targetSceneId,
++          source,
++          payload.prompt,
++          payload.model,
++          {
++            count: payload.count,
++            imgRatio: payload.imgRatio,
++            sourceSize: payload.sourceSize,
++            resolution: payload.resolution,
++            quality: payload.quality,
++          },
++        )
+         // mask-chat-card: 调度后台任务，不 await 全程。创建 chat enhancing card + runtime
+         // record 后立即关闭 overlay；enhance→edit→finish 由 runMaskEditChatFlow 后台驱动，
+         // 卡片状态由 chatMaskEditFlow 经 callbacks 收口。多 mask 并发允许（不 abort 旧任务）。
+@@ -174,6 +187,7 @@ export function useMaskPointArmed({
+           sceneId: targetSceneId,
+           messageId,
+           slotId,
++          slotIds,
+           baselineSnapshot,
+           abortController,
+           source,
+@@ -189,6 +203,7 @@ export function useMaskPointArmed({
+           sceneId: targetSceneId,
+           messageId,
+           slotId,
++          slotIds,
+           baselineSnapshot,
+           abortController,
+           source,
+diff --git a/src/lib/mivoTaskClient.ts b/src/lib/mivoTaskClient.ts
+index e40747dc..4d839374 100644
+--- a/src/lib/mivoTaskClient.ts
++++ b/src/lib/mivoTaskClient.ts
+@@ -202,11 +202,17 @@ export const submitEditTask = async (
+     formData.append('reference[]', blob, fileNameForBlob(blob, `reference-${index + 1}.png`))
+   })
+   formData.set('prompt', request.prompt)
+-  formData.set('imgRatio', request.imgRatio || '1:1')
++  // 比例缺省**不再兜底成 1:1**(region-edit「保持原比例」的落点):区域编辑是在原图上
++  // 改一块,画幅本应跟随源图;旧的 `|| '1:1'` 会把非方图强行改成正方形。
++  // 生图路径恒带 imgRatio,不受影响。
++  if (request.imgRatio) formData.set('imgRatio', request.imgRatio)
+   // Quality 留空时不下发字段 —— 与 submitGenerationTask 一致（chat 生图路径：
+   // auto = 不显式传 quality，server normalizeMivoQuality 对缺省默认即 medium）。
+   // 之前 `request.quality || 'medium'` 会把 auto 强制回填成 medium，破坏 auto 语义。
+   if (request.quality) formData.set('quality', request.quality)
++  // region-edit「更多参数」:NANO 分辨率档与张数,缺省不下发(= 存量行为)。
++  if (request.resolution) formData.set('resolution', request.resolution)
++  if (request.count && request.count > 1) formData.set('count', String(request.count))
+   formData.set('model', request.model || defaultModel)
+ 
+   const response = await fetchWithTimeout(
+diff --git a/src/lib/regionEditPrompt.ts b/src/lib/regionEditPrompt.ts
+index ab850090..35fcb980 100644
+--- a/src/lib/regionEditPrompt.ts
++++ b/src/lib/regionEditPrompt.ts
+@@ -27,9 +27,23 @@ const dualHeader =
+   '帮我修改图1。图2 是系统标注副本,标注不是画面内容:红色方框/圈选线是编辑区域(编号对应"区域N"),红色圆环是点位标记(编号对应"标记N",编辑它指向的对象,影响范围按画面内容判断)。请对照图2 的编号,在图1 上完成以下编辑要求。'
+ const dualFooter = '标注位置以外的所有内容必须保持完全不变;输出图中不得出现红色标注和数字序号。'
+ 
+-/** 双图形态外壳:正文为用户指令原文(按「N号区域」引用),不做任何改写。 */
+-export const buildRegionEditPrompt = (body: string): string =>
+-  `${dualHeader}\n编辑要求:\n${body.trim()}\n${dualFooter}`
++/**
++ * 改画幅时的补画子句。**必须替换掉 dualFooter 而不是追加**:footer 里那句
++ * 「标注位置以外的所有内容必须保持完全不变」与「把画面扩展到新比例」直接矛盾 ——
++ * 两句同时在场,模型要么无视扩展要求(出原比例)、要么无视保护要求(整图重绘)。
++ * 用户在参数面板显式改了比例 = 授权动画幅,此时保护语义收窄为「已有画面内容不变形」。
++ */
++const ratioFooter = (ratio: string): string =>
++  // 比例值本身带冒号(如 16:9),这里的分隔符不能再用冒号 —— 「16:9:以原图…」会读成
++  // 三段式比例。用句号断开,后半句是补画方式的说明。
++  `输出画面比例必须是 ${ratio}。以原图内容为中心,向不足的方向自然补画延展(不是拉伸、不是加黑边/白边),` +
++  '补出来的部分要与原图光影、透视、风格连续。原有画面内容除标注位置的编辑要求外保持不变,不得裁切主体;' +
++  '输出图中不得出现红色标注和数字序号。'
++
++/** 双图形态外壳:正文为用户指令原文(按「N号区域」引用),不做任何改写。
++ *  targetRatio 在场 = 用户在「更多参数」里改了比例,footer 换成补画版。 */
++export const buildRegionEditPrompt = (body: string, targetRatio?: string): string =>
++  `${dualHeader}\n编辑要求:\n${body.trim()}\n${targetRatio ? ratioFooter(targetRatio) : dualFooter}`
+ 
+ /** 百分比取一位小数(≈官方 0-999 千分位精度;整百分比在大图上误差可达十几像素)。 */
+ const pct = (value: number): number => Math.round(value * 1000) / 10
+diff --git a/src/store/chatMaskEditFlow.test.ts b/src/store/chatMaskEditFlow.test.ts
+index 0a283849..81483b2b 100644
+--- a/src/store/chatMaskEditFlow.test.ts
++++ b/src/store/chatMaskEditFlow.test.ts
+@@ -584,15 +584,32 @@ describe('retryMaskEditMessage (Item3)', () => {
+     expect(getMaskEditTask(messageId)).toBeDefined()
+ 
+     // retry 准备：新 slotId + enhance/generation mock 成功
+-    maskEditGenSpies.prepareMaskEditPlaceholder.mockImplementationOnce(() => ({ slotId: 'slot-2', baselineSnapshot: undefined }))
++    maskEditGenSpies.prepareMaskEditPlaceholder.mockImplementationOnce(() => ({
++      slotId: 'slot-2',
++      slotIds: ['slot-2'],
++      baselineSnapshot: undefined,
++    }))
+     vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: true, mode: 'generate', richPrompt: 'x' } as never)
+     maskEditGenSpies.runMaskEditGeneration.mockResolvedValueOnce({ nodeIds: ['n1'], sourceDeleted: false })
+ 
+     const result = retryMaskEditMessage('scene-1', messageId)
+     expect(result).toBe(true)
+ 
+-    // prepareMaskEditPlaceholder 被调（sceneId, source, prompt）
+-    expect(maskEditGenSpies.prepareMaskEditPlaceholder).toHaveBeenCalledWith('scene-1', source, '把妹子换成帅哥')
++    // prepareMaskEditPlaceholder 被调，且重试占位计划与首次提交同源；否则多张任务重试会
++    // 退回单方块。早期测试只断三参，新增 model/plan 后 CI 仍按旧签名断言而红。
++    expect(maskEditGenSpies.prepareMaskEditPlaceholder).toHaveBeenCalledWith(
++      'scene-1',
++      source,
++      '把妹子换成帅哥',
++      record.payload.model,
++      {
++        count: record.payload.count,
++        imgRatio: record.payload.imgRatio,
++        sourceSize: record.payload.sourceSize,
++        resolution: record.payload.resolution,
++        quality: record.payload.quality,
++      },
++    )
+ 
+     // enhance 删除后,runMaskEditChatFlow 不再 await enhance,patch 'enhancing' 被后续
+     // patch 'generating' 即时覆盖,同步无法断言 status='enhancing';retry 清除
+@@ -667,7 +684,11 @@ describe('retryMaskEditMessage (Item3)', () => {
+     await runMaskEditChatFlow(record)
+ 
+     // retry with qualityOverride='medium'
+-    maskEditGenSpies.prepareMaskEditPlaceholder.mockImplementationOnce(() => ({ slotId: 'slot-2', baselineSnapshot: undefined }))
++    maskEditGenSpies.prepareMaskEditPlaceholder.mockImplementationOnce(() => ({
++      slotId: 'slot-2',
++      slotIds: ['slot-2'],
++      baselineSnapshot: undefined,
++    }))
+     vi.mocked(enhanceMivoPrompt).mockResolvedValueOnce({ enhanced: true, mode: 'generate', richPrompt: 'x' } as never)
+     maskEditGenSpies.runMaskEditGeneration.mockResolvedValueOnce({ nodeIds: ['n1'], sourceDeleted: false })
+ 
+diff --git a/src/store/chatMaskEditFlow.ts b/src/store/chatMaskEditFlow.ts
+index 9bc9a6e4..be2c2544 100644
+--- a/src/store/chatMaskEditFlow.ts
++++ b/src/store/chatMaskEditFlow.ts
+@@ -194,15 +194,23 @@ export const failMaskEditMessage = (args: {
+   error: string
+   errorKind?: ChatMessageErrorKind
+   slotId: string
++  /** 多张任务的全部占位(owner 2026-08-11 张数=占位数):失败要整批撤,不能只撤首个
++   *  留下 n-1 个永远转圈的孤儿。缺省 = [slotId]。 */
++  slotIds?: string[]
+   baselineSnapshot?: MivoCanvasSnapshot
+   sourceTitle?: string
+   sourceNodeId?: string
+ }): void => {
+-  removeMaskEditPlaceholder(args.sceneId, args.slotId, {
+-    canceled: args.canceled,
+-    error: args.error,
+-    sourceTitle: args.sourceTitle,
+-    baselineSnapshot: args.baselineSnapshot,
++  const slotIds = args.slotIds?.length ? args.slotIds : [args.slotId]
++  slotIds.forEach((slotId, index) => {
++    removeMaskEditPlaceholder(args.sceneId, slotId, {
++      canceled: args.canceled,
++      error: args.error,
++      sourceTitle: args.sourceTitle,
++      // baselineSnapshot 回滚只对首个占位用一次(它还原的是整次 prepare 前的历史基线,
++      // 逐个重放会互相覆盖);其余占位走普通节点删除分支。
++      baselineSnapshot: index === 0 ? args.baselineSnapshot : undefined,
++    })
+   })
+   // edit-timeout-batch: 区分 client-timeout/upstream-timeout（可重试）vs canceled（不可重试）vs 其他。
+   const isTimeout = !args.canceled && (args.errorKind === 'upstream-timeout' || args.errorKind === 'client-timeout')
+@@ -249,7 +257,7 @@ export const failMaskEditMessage = (args: {
+ /** 后台 flow：enhance(intent:'edit') → patch generating → runMaskEditGeneration(callbacks) → finish/fail。
+  *  由 useMaskPointArmed.submitMaskEdit 调度（void，不 await 全程）。 */
+ export const runMaskEditChatFlow = async (record: ActiveMaskEditTask): Promise<void> => {
+-  const { sceneId, messageId, slotId, source, resolvedAssetUrl, payload, abortController, imgRatio, quality } = record
++  const { sceneId, messageId, slotId, slotIds, source, resolvedAssetUrl, payload, abortController, imgRatio, quality } = record
+   const signal = abortController.signal
+   try {
+     // 1. 局部重绘【不做提示词增强】（用户 2026-07-07）：红圈指认已把「改哪」说清，
+@@ -280,6 +288,7 @@ export const runMaskEditChatFlow = async (record: ActiveMaskEditTask): Promise<v
+       sceneId,
+       source,
+       slotId,
++      slotIds,
+       resolvedAssetUrl,
+       payload: { ...payload, prompt: finalPrompt },
+       imgRatio,
+@@ -316,6 +325,7 @@ export const runMaskEditChatFlow = async (record: ActiveMaskEditTask): Promise<v
+       error: logMessage,
+       errorKind,
+       slotId,
++      slotIds,
+       baselineSnapshot: record.baselineSnapshot,
+       sourceTitle: source.title,
+       sourceNodeId: source.id,
+@@ -390,11 +400,25 @@ export const retryMaskEditMessage = (
+     return false
+   }
+   // 新 placeholder + 新 abortController；payload（含 mask blob/prompt）+ source 复用，quality 可降质覆盖。
+-  const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder(sceneId, record.source, record.payload.prompt)
++  // 占位计划与首次提交同源(张数/比例/画质档),重试的占位不许退回单方块。
++  const { slotId, slotIds, baselineSnapshot } = prepareMaskEditPlaceholder(
++    sceneId,
++    record.source,
++    record.payload.prompt,
++    record.payload.model,
++    {
++      count: record.payload.count,
++      imgRatio: record.payload.imgRatio,
++      sourceSize: record.payload.sourceSize,
++      resolution: record.payload.resolution,
++      quality: record.payload.quality,
++    },
++  )
+   const abortController = new AbortController()
+   const retryRecord: ActiveMaskEditTask = {
+     ...record,
+     slotId,
++    slotIds,
+     baselineSnapshot,
+     abortController,
+     quality: qualityOverride ?? record.quality,
+diff --git a/src/store/commitGenerationResult.multiSlotBatch.test.ts b/src/store/commitGenerationResult.multiSlotBatch.test.ts
+new file mode 100644
+index 00000000..c93511ea
+--- /dev/null
++++ b/src/store/commitGenerationResult.multiSlotBatch.test.ts
+@@ -0,0 +1,186 @@
++// src/store/commitGenerationResult.multiSlotBatch.test.ts
++// 集成契约:#628 多槽位(张数=占位数)与 main P1b #297 编辑占位批次契约**同时成立**。
++//
++// main 把 commitGenerationResult 拆到独立文件并新增 batch 契约(被替换 slot 带
++// batchId 时:heightLockedSizeForDimensions 高度锁定 + batchMetadata 批次身份继承);
++// #628 的多槽位能力(replaceSlotIds → 逐张替换 + 未消费额外槽清理)与之并存:
++//  - 多槽位 + 每槽都是 batch slot → 每张结果继承各自槽的 batch 身份(batchId/
++//    expectedCount/ordinal)且尺寸高度锁定;
++//  - 结果数 < 请求槽数 → 未消费额外槽清理(batch 槽同样被清)。
++import { describe, expect, it, vi, beforeEach } from 'vitest'
++
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++vi.mock('../lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async (_blob: Blob, name: string, type: string) => ({
++    assetUrl: 'mivo-asset://mock-asset',
++    name,
++    type,
++    sizeBytes: 1234,
++    hasTransparency: false,
++    size: '300x200',
++    sourceDimensions: { width: 300, height: 200 },
++  })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('./remoteDebugReporter', () => ({
++  reportRemoteDebugEntry: () => {},
++}))
++
++import { useCanvasStore } from './canvasStore'
++import { useChatStore } from './chatStore'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++const source = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++  id: 'n1',
++  type: 'image',
++  title: 'Image',
++  x: 10,
++  y: 20,
++  width: 300,
++  height: 200,
++  status: 'ready',
++  assetUrl: '/a.png',
++  ...overrides,
++})
++
++const baseState = useCanvasStore.getState()
++
++const emptyDoc = (title: string, nodes: MivoCanvasNode[] = []) => ({
++  title,
++  nodes,
++  edges: [],
++  tasks: [],
++  selectedNodeId: undefined,
++  selectedNodeIds: [],
++})
++
++const seedScene = () => {
++  const doc = emptyDoc('scene-a', [source()])
++  useCanvasStore.setState(
++    {
++      ...baseState,
++      canvases: { 'scene-a': doc },
++      sceneId: 'scene-a',
++      nodes: doc.nodes,
++      edges: [],
++      tasks: [],
++      selectedNodeId: undefined,
++      selectedNodeIds: [],
++      historyPast: [],
++      historyFuture: [],
++    } as never,
++    true,
++  )
++}
++
++const resultImage = (index: number) => ({
++  blob: new Blob([`mock-image-bytes-${index}`], { type: 'image/png' }),
++  title: `Generated image ${index}`,
++  width: 300,
++  height: 200,
++})
++
++/** 造一个带 batch 身份的 batch slot(仿 startDerivedImageBatch 产出的槽)。 */
++const addBatchSlot = (batchId: string, expectedCount: number, ordinal: number): string => {
++  const id = useCanvasStore.getState().addAiSlotNode({ x: 330, y: 20 + ordinal * 220 }, { width: 200, height: 200 }, 'wait', {
++    sceneId: 'scene-a',
++  })
++  const state = useCanvasStore.getState()
++  const doc = state.canvases['scene-a']
++  useCanvasStore.setState({
++    ...state,
++    canvases: {
++      ...state.canvases,
++      'scene-a': {
++        ...doc,
++        nodes: doc.nodes.map((n) =>
++          n.id === id
++            ? ({
++                ...n,
++                locked: true,
++                aiWorkflow: {
++                  ...(n.aiWorkflow ?? {}),
++                  batchId,
++                  expectedCount,
++                  ordinal,
++                  status: 'generating',
++                },
++              } as MivoCanvasNode)
++            : n,
++        ),
++      },
++    },
++  })
++  return id
++}
++
++beforeEach(() => {
++  const ls = (globalThis as { localStorage?: { clear: () => void } }).localStorage
++  if (ls) ls.clear()
++  useCanvasStore.setState({ ...baseState } as never, true)
++  useChatStore.setState({ ...useChatStore.getInitialState() } as never, true)
++})
++
++describe('commitGenerationResult — 多槽位 × P1b batch 契约并存', () => {
++  it('多槽位多结果:每张结果继承各自槽的 batch 身份 + 高度锁定尺寸,全部原位替换', async () => {
++    seedScene()
++    const b1 = addBatchSlot('batch-multi', 3, 0)
++    const b2 = addBatchSlot('batch-multi', 3, 1)
++    const b3 = addBatchSlot('batch-multi', 3, 2)
++
++    const created = await useCanvasStore.getState().commitGenerationResult({
++      sceneId: 'scene-a',
++      sourceNodeId: 'n1',
++      replaceSlotIds: [b1, b2, b3],
++      resultImages: [resultImage(1), resultImage(2), resultImage(3)],
++      prompt: '批次多张',
++      model: 'gpt-image-2',
++      kind: 'edit',
++    })
++    expect(created).toHaveLength(3)
++
++    const nodes = useCanvasStore.getState().canvases['scene-a'].nodes
++    const n1 = nodes.find((n) => n.id === b1)
++    const n2 = nodes.find((n) => n.id === b2)
++    const n3 = nodes.find((n) => n.id === b3)
++    // 三张都原位替换成 image
++    expect(n1?.type).toBe('image')
++    expect(n2?.type).toBe('image')
++    expect(n3?.type).toBe('image')
++    // P1b batch 身份继承:每张结果沿用各自槽的 batchId/expectedCount/ordinal
++    expect(n1?.aiWorkflow?.batchId).toBe('batch-multi')
++    expect(n1?.aiWorkflow?.expectedCount).toBe(3)
++    expect(n1?.aiWorkflow?.ordinal).toBe(0)
++    expect(n2?.aiWorkflow?.ordinal).toBe(1)
++    expect(n3?.aiWorkflow?.ordinal).toBe(2)
++    // P1b 高度锁定:batch slot 结果高度 = 槽高度(200,非等面积换算)
++    expect(n1?.height).toBe(200)
++    expect(n2?.height).toBe(200)
++    expect(n3?.height).toBe(200)
++  })
++
++  it('结果数 < 请求槽数:未消费的 batch 槽同样被清理', async () => {
++    seedScene()
++    const b1 = addBatchSlot('batch-short', 4, 0)
++    const b2 = addBatchSlot('batch-short', 4, 1)
++    const b3 = addBatchSlot('batch-short', 4, 2)
++    const b4 = addBatchSlot('batch-short', 4, 3)
++
++    const created = await useCanvasStore.getState().commitGenerationResult({
++      sceneId: 'scene-a',
++      sourceNodeId: 'n1',
++      replaceSlotIds: [b1, b2, b3, b4],
++      resultImages: [resultImage(1), resultImage(2), resultImage(3)],
++      prompt: '少回',
++      model: 'gpt-image-2',
++      kind: 'edit',
++    })
++    expect(created).toHaveLength(3)
++    const nodes = useCanvasStore.getState().canvases['scene-a'].nodes
++    expect(nodes.find((n) => n.id === b4)).toBeUndefined()
++    expect(nodes.find((n) => n.id === b1)?.type).toBe('image')
++  })
++})
+diff --git a/src/store/commitGenerationResult.ts b/src/store/commitGenerationResult.ts
+index 8d0cca82..85d18970 100644
+--- a/src/store/commitGenerationResult.ts
++++ b/src/store/commitGenerationResult.ts
+@@ -25,6 +25,13 @@ import {
+ import { patchCanvasDocument } from './canvasDocumentModel'
+ import { getSceneWrap } from '../lib/sceneWrapRegistry'
+ import { LocalizedKeyError } from '../lib/localizedKeyError'
++import {
++  batchDisplaySizeTracker,
++  fallbackSizeForResult,
++  findReplacementSlots,
++  pruneUnconsumedReplacementSlots,
++  resolveReplaceSlotIds,
++} from './multiSlotPlacement'
+ import type { AiWorkflowOperation, CanvasEdge, MivoCanvasNode } from '../types/mivoCanvas'
+ import type { CommitGenerationResultPayload } from '../types/generation'
+ 
+@@ -38,7 +45,9 @@ export const commitGenerationResultImpl = async (
+   if (!prompt) throw new Error('Prompt is required')
+   if (!payload.resultImages.length) throw new Error('No generated images returned')
+   const targetSceneId = payload.sceneId || get().sceneId
+-  const replaceSlotId = payload.replaceSlotId
++  // 多占位(owner 2026-08-11 张数=占位数):replaceSlotIds 优先,replaceSlotId 视作单元素。
++  const replaceSlotIdList = resolveReplaceSlotIds(payload)
++  const replaceSlotId = replaceSlotIdList[0]
+   const lineageSourceId = payload.lineageSourceId || payload.sourceNodeId
+ 
+   const initialState = get()
+@@ -90,9 +99,7 @@ export const commitGenerationResultImpl = async (
+   if (lineageSourceId && !currentLineageSource) {
+     throw new LocalizedKeyError('chat.commit.sourceDeletedSaved', { savedNames })
+   }
+-  const currentReplacementSlot = replaceSlotId
+-    ? currentDocument.nodes.find((node) => node.id === replaceSlotId && node.type === 'ai-slot' && !node.hidden)
+-    : undefined
++  const { primary: currentReplacementSlot } = findReplacementSlots(currentDocument.nodes, replaceSlotIdList)
+   if (replaceSlotId && !currentReplacementSlot) {
+     throw new LocalizedKeyError('chat.commit.slotDeletedSaved', { savedNames })
+   }
+@@ -119,27 +126,25 @@ export const commitGenerationResultImpl = async (
+       ? targetDocument.nodes.find((node) => node.id === lineageSourceId && !node.hidden)
+       : undefined
+     if (lineageSourceId && !currentLineageSource) return {}
+-    const currentReplacementSlot = replaceSlotId
+-      ? targetDocument.nodes.find((node) => node.id === replaceSlotId && node.type === 'ai-slot' && !node.hidden)
+-      : undefined
++    const { primary: currentReplacementSlot, extras: extraReplacementSlots } = findReplacementSlots(
++      targetDocument.nodes,
++      replaceSlotIdList,
++    )
+     if (replaceSlotId && !currentReplacementSlot) return {}
+ 
+     let nextNodes = targetDocument.nodes.filter((node) => !isDerivationEdgeNode(node))
+-    const nextEdges = cloneEdges(targetDocument.edges || [])
++    let nextEdges = cloneEdges(targetDocument.edges || [])
+     const newNodes: MivoCanvasNode[] = []
+     const newEdges: CanvasEdge[] = []
+ 
++    // 同批同尺寸(owner 2026-08-11 第 4 条):首张定标、余量张复用。
++    const batchSize = batchDisplaySizeTracker()
++
+     savedImages.forEach(({ image, asset }, index) => {
+-      const replacingSlot = index === 0 ? currentReplacementSlot : undefined
++      const replacingSlot = index === 0 ? currentReplacementSlot : extraReplacementSlots[index - 1]
+       const lineageNode =
+         currentLineageSource && currentLineageSource.id !== replacingSlot?.id ? currentLineageSource : undefined
+-      const fallbackNode = replacingSlot || currentSource
+-      const fallbackSize = fallbackNode
+-        ? { width: fallbackNode.width, height: fallbackNode.height }
+-        : {
+-            width: image.width || defaultSizeForNodeType('image').width,
+-            height: image.height || defaultSizeForNodeType('image').height,
+-          }
++      const fallbackSize = fallbackSizeForResult(replacingSlot, currentSource, image, defaultSizeForNodeType('image'))
+       // 规格(2026-07-05 用户二次澄清,取代 #86 W2-F5「替换保留占位尺寸」契约):
+       // 所有生图占位符一律 1:1 方形 loading(chat 与局部重绘同规,无 kind 特例),
+       // 替换时统一按结果图自然宽高比、与占位符等面积落画布——edit 结果与源图同
+@@ -148,11 +153,14 @@ export const commitGenerationResultImpl = async (
+       // #297 编辑占位批次(SC2):被替换 slot 带 batchId 时按批次契约分叉——
+       // 衍生批次 slot 用 heightLockedSizeForDimensions(高度锁定为占位高度,
+       // 与原图上下边缘一致),其余 chat/mask slot 保持 equalAreaSizeForDimensions。
+-      const displaySize = replacingSlot
+-        ? replacingSlot.aiWorkflow?.batchId
+-          ? heightLockedSizeForDimensions(replacingSlot.height, asset.sourceDimensions)
+-          : equalAreaSizeForDimensions(fallbackSize, asset.sourceDimensions)
+-        : displaySizeForGeneratedAsset(asset, fallbackSize)
++      // 展示尺寸:批次槽(P1b)高度锁定;chat/mask 槽等面积;同批统一由 batchSize 定标。
++      const displaySize = batchSize.resolve(() =>
++        replacingSlot
++          ? replacingSlot.aiWorkflow?.batchId
++            ? heightLockedSizeForDimensions(replacingSlot.height, asset.sourceDimensions)
++            : equalAreaSizeForDimensions(fallbackSize, asset.sourceDimensions)
++          : displaySizeForGeneratedAsset(asset, fallbackSize),
++      )
+       const placement = replacingSlot
+         ? { x: replacingSlot.x, y: replacingSlot.y }
+         : currentSource
+@@ -200,7 +208,8 @@ export const commitGenerationResultImpl = async (
+         operation,
+         sourceNode: lineageNode,
+         placementDirection: payload.placement || 'right',
+-        // #297 批次身份继承:结果节点沿用被替换 slot 的 batchId/expectedCount/ordinal。
++        // #297 批次身份继承:结果节点沿用被替换 slot 的 batchId/expectedCount/ordinal
++        // (多槽位路径:每张结果继承各自槽的批次身份)。
+         batchMetadata:
+           replacingSlot?.aiWorkflow?.batchId !== undefined &&
+           replacingSlot.aiWorkflow.expectedCount !== undefined &&
+@@ -237,7 +246,10 @@ export const commitGenerationResultImpl = async (
+     })
+ 
+     nextEdges.push(...newEdges)
+-
++    // 未消费 extra slot 清理(PR #628 Greptile P1,纯计算见 multiSlotPlacement)
++    const pruned = pruneUnconsumedReplacementSlots(extraReplacementSlots, savedImages.length - 1, nextNodes, nextEdges)
++    nextNodes = pruned.nodes
++    nextEdges = pruned.edges
+     return patchCanvasDocument(state, targetSceneId, {
+       selectedNodeId: createdNodeIds[0],
+       selectedNodeIds: createdNodeIds,
+diff --git a/src/store/maskEditTaskRuntime.ts b/src/store/maskEditTaskRuntime.ts
+index 35d3f553..92cb105b 100644
+--- a/src/store/maskEditTaskRuntime.ts
++++ b/src/store/maskEditTaskRuntime.ts
+@@ -15,6 +15,9 @@ export type ActiveMaskEditTask = {
+   sceneId: string
+   messageId: string
+   slotId: string
++  /** 多张任务的全部占位 id(含 slotId 自身;owner 2026-08-11 张数=占位数)。
++   *  缺省 = [slotId](单张旧形态)。 */
++  slotIds?: string[]
+   baselineSnapshot?: MivoCanvasSnapshot
+   abortController: AbortController
+   source: MivoCanvasNode
+diff --git a/src/store/multiSlotPlacement.ts b/src/store/multiSlotPlacement.ts
+new file mode 100644
+index 00000000..f0c0cf6f
+--- /dev/null
++++ b/src/store/multiSlotPlacement.ts
+@@ -0,0 +1,106 @@
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++/**
++ * 多占位替换的纯计算部分(owner 2026-08-11「张数=占位数」)。
++ *
++ * 从 documentSlice 提出来有两个理由:一是它是纯函数、可独立测;二是 documentSlice
++ * 在 main 上就已经 900 行、正好卡在结构守卫上限,任何新增都会越界。守卫要求
++ * 「拆分后入库」而不是上调 baseline,这里照办。
++ */
++
++/**
++ * 把两种占位入参收敛成统一的 id 列表:`replaceSlotIds` 优先,`replaceSlotId` 视作
++ * 单元素。下游一律按「第 i 张结果替换第 i 个 slot」处理,不再有单/多两套分支。
++ */
++export const resolveReplaceSlotIds = (input: {
++  replaceSlotId?: string
++  replaceSlotIds?: string[]
++}): string[] => input.replaceSlotIds ?? (input.replaceSlotId ? [input.replaceSlotId] : [])
++
++/**
++ * 在当前文档里查出这批 slot 节点。
++ *
++ * 语义差异是刻意的:**首个** slot 缺失 = 用户撤销了整次生成(旧语义,调用方据此
++ * 中止落图);**第 2..n 个**缺失只是那一张少个坑位,该张回落邻位摆放即可,不该
++ * 因此丢弃已经出好的图。返回值里用 undefined 占位保持下标对齐。
++ */
++export const findReplacementSlots = (
++  nodes: MivoCanvasNode[],
++  slotIds: string[],
++): { primary: MivoCanvasNode | undefined; extras: Array<MivoCanvasNode | undefined> } => {
++  const findSlot = (id: string): MivoCanvasNode | undefined =>
++    nodes.find((node) => node.id === id && node.type === 'ai-slot' && !node.hidden)
++  return {
++    primary: slotIds[0] ? findSlot(slotIds[0]) : undefined,
++    extras: slotIds.slice(1).map(findSlot),
++  }
++}
++
++/**
++ * 同批统一展示尺寸(owner 2026-08-11 实测反馈第 4 条:「同一批次的 4 个图片大小不一致」)。
++ *
++ * 旧实现首张走「等面积替换占位」、余量张走「资产自然尺寸邻位摆放」两套算法,同批出的
++ * 图在画布上大小参差,连 1K 与 2K 的档位差都被这份噪声淹没、肉眼分不出来。
++ * 现在首张定标、余量张逐字复用:同批必然同尺寸,不同画质档之间的差异才显现得出来。
++ *
++ * 首张自身怎么定标(2026-07-05 用户二次澄清,取代 #86 W2-F5「替换保留占���尺寸」契约):
++ * 所有生图占位符一律按目标比例 loading,替换时按结果图自然宽高比、与占位符**等面积**
++ * 落画布 —— edit 结果与源图同比例由生成本身保证,无需靠占位尺寸传递;结果无自然尺寸
++ * 信息时 equalAreaSizeForDimensions 内部回退占位尺寸。非占位摆放不变,仍用资产自然尺寸。
++ */
++export const batchDisplaySizeTracker = () => {
++  let size: { width: number; height: number } | undefined
++  return {
++    /** 首次调用记下 compute() 的结果,此后一律返回那一份。 */
++    resolve(compute: () => { width: number; height: number }): { width: number; height: number } {
++      if (!size) size = compute()
++      return size
++    },
++  }
++}
++
++/**
++ * 单张结果的兜底尺寸:优先跟随「它要替换的占位」或「源节点」,两者都没有才用图片
++ * 自身的像素尺寸,再没有就落节点类型的默认值。
++ *
++ * 抽出来是因为这段三级回退在 documentSlice 里读起来像噪声,而它其实是一条独立的
++ * 决策链 —— 「新节点该多大」在有占位时由占位定、无占位时由源图定。
++ */
++export const fallbackSizeForResult = (
++  replacingSlot: MivoCanvasNode | undefined,
++  currentSource: MivoCanvasNode | undefined,
++  image: { width?: number; height?: number },
++  defaultSize: { width: number; height: number },
++): { width: number; height: number } => {
++  const anchor = replacingSlot || currentSource
++  if (anchor) return { width: anchor.width, height: anchor.height }
++  return {
++    width: image.width || defaultSize.width,
++    height: image.height || defaultSize.height,
++  }
++}
++
++/**
++ * 清理未被结果消费的额外占位槽(PR #628 Greptile P1)。
++ *
++ * 请求多张但平台少回/部分下载失败时,「第 i 张结果替换第 i 个 slot」只消费前
++ * results.length 个 slot,末尾未消费的 extra slot 若不清掉会永久 loading。
++ *
++ * 删除条件:只删仍在场、type=ai-slot、index ≥ consumedExtras 的 slot;用户已删除
++ * 的 slot 不在场内自然跳过(第 2..n 个缺失只是少个坑位,不中断落图);相连 edges
++ * (from/to 指向被删 slot)同步移除,不留悬挂引用。无 stale 时原样返回入参。
++ */
++export const pruneUnconsumedReplacementSlots = <T extends { from: string; to: string }>(
++  extras: Array<MivoCanvasNode | undefined>,
++  consumedExtras: number,
++  nodes: MivoCanvasNode[],
++  edges: T[],
++): { nodes: MivoCanvasNode[]; edges: T[] } => {
++  const staleSlots = extras.slice(Math.max(0, consumedExtras)).filter((s): s is MivoCanvasNode => Boolean(s))
++  if (staleSlots.length === 0) return { nodes, edges }
++  const staleSlotIds = new Set(staleSlots.map((s) => s.id))
++  return {
++    nodes: nodes.filter((node) => !staleSlotIds.has(node.id)),
++    edges: edges.filter((edge) => !staleSlotIds.has(edge.from) && !staleSlotIds.has(edge.to)),
++  }
++}
+diff --git a/src/store/multiSlotStaleCleanup.test.ts b/src/store/multiSlotStaleCleanup.test.ts
+new file mode 100644
+index 00000000..1adfae4b
+--- /dev/null
++++ b/src/store/multiSlotStaleCleanup.test.ts
+@@ -0,0 +1,226 @@
++// src/store/multiSlotStaleCleanup.test.ts
++// PR #628 Greptile P1「请求 4 张但平台只回 3 张/部分下载失败时,未消费的
++// extraReplacementSlots 不删除 → 永久 loading」回归守卫。
++//
++// commitGenerationResult 按「第 i 张结果替换第 i 个 slot」消费;当结果数 < 请求
++// slot 数(平台少回、NANO 要 4 只回 3、部分下载失败)时,末尾未消费的 ai-slot
++// 必须从 nodes 清理并同步清理相连 edges,否则画布上留下永远不会被替换的占位。
++//
++// 删除条件(owner 2026-08-12 定):
++//   - 只删仍在场、type=ai-slot、未被本次结果消费的 slot id;
++//   - 用户已删除的 slot 不在场内,自然跳过(第 2..n 个缺失只是少个坑位,不中断);
++//   - 同步清理指向/源自被删 slot 的 edges,不留悬挂引用。
++import { describe, expect, it, vi, beforeEach } from 'vitest'
++
++vi.hoisted(() => {
++  const store = new Map<string, string>()
++  const memStorage = {
++    get length() {
++      return store.size
++    },
++    clear: () => store.clear(),
++    getItem: (k: string) => store.get(k) ?? null,
++    key: (i: number) => [...store.keys()][i] ?? null,
++    removeItem: (k: string) => {
++      store.delete(k)
++    },
++    setItem: (k: string, v: string) => {
++      store.set(k, String(v))
++    },
++  }
++  const g = globalThis as Record<string, unknown>
++  if (g.window === undefined) g.window = { localStorage: memStorage }
++  if (g.localStorage === undefined) g.localStorage = memStorage
++})
++
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++
++vi.mock('../lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async (_blob: Blob, name: string, type: string) => ({
++    assetUrl: 'mivo-asset://mock-asset',
++    name,
++    type,
++    sizeBytes: 1234,
++    hasTransparency: false,
++    size: '300x200',
++    sourceDimensions: { width: 300, height: 200 },
++  })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: vi.fn(),
++}))
++
++vi.mock('./remoteDebugReporter', () => ({
++  reportRemoteDebugEntry: () => {},
++}))
++
++import { useCanvasStore } from './canvasStore'
++import { useChatStore } from './chatStore'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++  id: 'n1',
++  type: 'image',
++  title: 'Image',
++  x: 10,
++  y: 20,
++  width: 300,
++  height: 200,
++  status: 'ready',
++  assetUrl: '/a.png',
++  ...overrides,
++})
++
++const baseState = useCanvasStore.getState()
++
++const emptyDoc = (title: string, nodes: MivoCanvasNode[] = []) => ({
++  title,
++  nodes,
++  edges: [],
++  tasks: [],
++  selectedNodeId: undefined,
++  selectedNodeIds: [],
++})
++
++const seedScene = () => {
++  const doc = emptyDoc('scene-a', [imageNode({ id: 'n1' })])
++  useCanvasStore.setState(
++    {
++      ...baseState,
++      canvases: { 'scene-a': doc },
++      sceneId: 'scene-a',
++      nodes: doc.nodes,
++      edges: [],
++      tasks: [],
++      selectedNodeId: undefined,
++      selectedNodeIds: [],
++      historyPast: [],
++      historyFuture: [],
++    } as never,
++    true,
++  )
++}
++
++const addSlot = (index: number): string =>
++  useCanvasStore.getState().addAiSlotNode({ x: 330, y: 20 + index * 220 }, { width: 200, height: 200 }, 'wait', {
++    sceneId: 'scene-a',
++  })
++
++const resultImage = (index: number) => ({
++  blob: new Blob([`mock-image-bytes-${index}`], { type: 'image/png' }),
++  title: `Generated image ${index}`,
++  width: 300,
++  height: 200,
++})
++
++const commitWith = async (replaceSlotIds: string[], resultCount: number) =>
++  useCanvasStore.getState().commitGenerationResult({
++    sceneId: 'scene-a',
++    sourceNodeId: 'n1',
++    replaceSlotIds,
++    resultImages: Array.from({ length: resultCount }, (_, i) => resultImage(i + 1)),
++    prompt: '多张生成',
++    model: 'gemini-3-pro-image',
++    kind: 'edit',
++  })
++
++const aiSlotsIn = (): MivoCanvasNode[] => useCanvasStore.getState().canvases['scene-a'].nodes.filter((n) => n.type === 'ai-slot')
++
++const resultNodesIn = (): MivoCanvasNode[] =>
++  useCanvasStore.getState().canvases['scene-a'].nodes.filter((n) => n.type === 'image' && n.title.startsWith('Generated image'))
++
++beforeEach(() => {
++  const ls = (globalThis as { localStorage?: { clear: () => void } }).localStorage
++  if (ls) ls.clear()
++  useCanvasStore.setState({ ...baseState } as never, true)
++  useChatStore.setState({ ...useChatStore.getInitialState() } as never, true)
++})
++
++describe('commitGenerationResult — 未消费 extra slot 清理 (Greptile P1)', () => {
++  it('请求 4 个 slot、平台只回 3 张 → 前 3 个 slot 替换成结果,第 4 个未消费 slot 被清理', async () => {
++    seedScene()
++    const s1 = addSlot(1)
++    const s2 = addSlot(2)
++    const s3 = addSlot(3)
++    const s4 = addSlot(4)
++
++    const created = await commitWith([s1, s2, s3, s4], 3)
++    expect(created).toHaveLength(3)
++
++    const nodes = useCanvasStore.getState().canvases['scene-a'].nodes
++    // 3 张结果都替换了前 3 个 slot(节点 id 保留 slot id)
++    expect(nodes.find((n) => n.id === s1)?.type).toBe('image')
++    expect(nodes.find((n) => n.id === s2)?.type).toBe('image')
++    expect(nodes.find((n) => n.id === s3)?.type).toBe('image')
++    // 未消费的第 4 个 slot 必须消失 —— 否则永久 loading
++    expect(nodes.find((n) => n.id === s4)).toBeUndefined()
++    expect(aiSlotsIn()).toHaveLength(0)
++    expect(resultNodesIn()).toHaveLength(3)
++  })
++
++  it('边界:用户已删除某个额外 slot → 结果照常落位,不误删其余在场 slot,不抛错', async () => {
++    seedScene()
++    const s1 = addSlot(1)
++    const s2 = addSlot(2)
++    const s3 = addSlot(3)
++    const s4 = addSlot(4)
++    // 用户删掉了第 4 个 slot(生成完成前手动清理占位)
++    useCanvasStore.setState((state) => ({
++      canvases: { ...state.canvases, 'scene-a': { ...state.canvases['scene-a'], nodes: state.canvases['scene-a'].nodes.filter((n) => n.id !== s4) } },
++    }))
++
++    const created = await commitWith([s1, s2, s3, s4], 3)
++    expect(created).toHaveLength(3)
++
++    const nodes = useCanvasStore.getState().canvases['scene-a'].nodes
++    expect(nodes.find((n) => n.id === s1)?.type).toBe('image')
++    expect(nodes.find((n) => n.id === s2)?.type).toBe('image')
++    expect(nodes.find((n) => n.id === s3)?.type).toBe('image')
++    // 已删的 s4 不在场内,清理逻辑不得报错、也不得重建
++    expect(nodes.find((n) => n.id === s4)).toBeUndefined()
++    expect(aiSlotsIn()).toHaveLength(0)
++  })
++
++  it('结果数 == slot 数 → 全部消费,无 stale 清理(既有行为不变)', async () => {
++    seedScene()
++    const s1 = addSlot(1)
++    const s2 = addSlot(2)
++    const s3 = addSlot(3)
++    const s4 = addSlot(4)
++
++    const created = await commitWith([s1, s2, s3, s4], 4)
++    expect(created).toHaveLength(4)
++    const nodes = useCanvasStore.getState().canvases['scene-a'].nodes
++    expect(nodes.find((n) => n.id === s1)?.type).toBe('image')
++    expect(nodes.find((n) => n.id === s2)?.type).toBe('image')
++    expect(nodes.find((n) => n.id === s3)?.type).toBe('image')
++    expect(nodes.find((n) => n.id === s4)?.type).toBe('image')
++    expect(aiSlotsIn()).toHaveLength(0)
++  })
++
++  it('被清理 slot 的相连 edges 同步移除,不留悬挂引用', async () => {
++    seedScene()
++    const s1 = addSlot(1)
++    const s2 = addSlot(2)
++    const s3 = addSlot(3)
++    const s4 = addSlot(4)
++    // 给将未被消费的 s4 造一条 derivation edge(指向 s4),提交后必须被清掉
++    useCanvasStore.setState((state) => ({
++      canvases: {
++        ...state.canvases,
++        'scene-a': {
++          ...state.canvases['scene-a'],
++          edges: [...(state.canvases['scene-a'].edges || []), { id: 'e-to-s4', from: 'n1', to: s4, type: 'edit', prompt: 'x', createdAt: Date.now() }],
++        },
++      },
++    }))
++
++    const created = await commitWith([s1, s2, s3, s4], 3)
++    expect(created).toHaveLength(3)
++    const edges = useCanvasStore.getState().canvases['scene-a'].edges || []
++    expect(edges.find((e) => e.id === 'e-to-s4')).toBeUndefined()
++    // 指向被消费 slot 的 derivation edge 保留
++    expect(edges.some((e) => e.to === s1 && e.from === 'n1')).toBe(true)
++  })
++})
+diff --git a/src/types/generation.ts b/src/types/generation.ts
+index 241c7eb3..3b4f1705 100644
+--- a/src/types/generation.ts
++++ b/src/types/generation.ts
+@@ -4,6 +4,13 @@ import type { CanvasId } from './mivoCanvas'
+ export type MivoImageRatio = '1:1' | '3:2' | '2:3' | '16:9' | '9:16'
+ export type MivoImageQuality = 'low' | 'medium' | 'high'
+ 
++/**
++ * Mivo 平台 NANOBANANA 通道的 `resolution` 字段(实测合法值,2026-08-11)。
++ * 与 MivoImageQuality 是**两套参数**:前者精确定尺寸(4K→4096²),后者是质量意图
++ * (GPT high→2880²)。不可互相换算——三档 quality 只能映射 1K/1K/2K。
++ */
++export type MivoPlatformResolutionValue = '1K' | '2K' | '4K'
++
+ export type GenerationRatio = MivoImageRatio | '3:4' | '4:3' | '21:9' | '5:4' | '4:5'
+ 
+ export type EnhanceRequest = {
+@@ -89,6 +96,10 @@ export type RegionRectPct =
+ 
+ export type MivoEditRequest = MivoGenerateRequest & {
+   image: Blob
++  /** region-edit「更多参数」:NANO 的平台 resolution 档(1K/2K/4K)。缺省 = 走 quality 换算。 */
++  resolution?: MivoPlatformResolutionValue
++  /** region-edit「更多参数」:出图张数(平台 n,1~4)。缺省 1。 */
++  count?: number
+   /** 嵌入式宿主端口用:image 对应的画布资产 url(源图身份)。HTTP 客户端忽略。 */
+   sourceAssetUrl?: string
+   mask?: Blob
+@@ -191,6 +202,10 @@ export type CommitGenerationResultPayload = {
+   // overrides the derivation-edge source (defaults to sourceNodeId); reflow pushes
+   // right-side obstacles after placing the result.
+   replaceSlotId?: string
++  /** 多张结果 → 多占位原位替换(owner 2026-08-11「张数=占位数」):第 i 张替换第 i 个
++   *  slot,超出 slot 数的张回落邻位摆放。与 replaceSlotId 并存时以本数组为准
++   *  (replaceSlotId 继续作为单张调用方的便捷形态)。 */
++  replaceSlotIds?: string[]
+   lineageSourceId?: string
+   reflow?: boolean
+   createDerivationEdge?: boolean

@@ -1,0 +1,31 @@
+{
+  "generated": "2026-08-13T14:36:45.775Z",
+  "source": "/Users/praise/AI-Agent/Claude/projects/Project MivoCanvas/_tmp/debug/pr-taxonomy/detail",
+  "total_entries": 250,
+  "positives": [
+    {
+      "number": 382,
+      "title": "test(e2e): mask-point 显式 SKIP(#369 废除其所测交互),重写债挂 #381",
+      "types": [
+        "skip_log_early_return"
+      ],
+      "heuristic_types": [
+        "test_skipped"
+      ],
+      "files": [
+        "scripts/e2e/scenarios/mask-point.mjs"
+      ],
+      "hasDiff": true
+    }
+  ],
+  "negatives": [
+    {
+      "number": 410,
+      "title": "test(cindyplugin): deposit 电子脑侧协议回归补全——整代退休 K=3 + 单写者架构 + 五~八轮返修",
+      "files": [
+        "cindyplugin/src/__tests__/depositBrain.test.ts"
+      ],
+      "hasDiff": true
+    }
+  ]
+}

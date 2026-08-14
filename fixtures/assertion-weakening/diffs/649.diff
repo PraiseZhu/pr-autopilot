@@ -1,0 +1,2161 @@
+diff --git a/src/canvas/actions/canvasCommand.serialize.test.ts b/src/canvas/actions/canvasCommand.serialize.test.ts
+index 6aa32c73..d70e26ad 100644
+--- a/src/canvas/actions/canvasCommand.serialize.test.ts
++++ b/src/canvas/actions/canvasCommand.serialize.test.ts
+@@ -275,6 +275,9 @@ describe('CanvasCommand serialize round-trip', () => {
+   it('derived_batch_options_are_exact: 序列化 allowlist 精确 —— 批次三元组是 runtime-only,不进序列化 command options', () => {
+     // 批次凭证(derivedBatchId/expectedCount/ordinal)与 signal/referenceFiles 同类:
+     // runtime-only,绝不进入可序列化 command options。序列化输出必须不含这三个键。
++    // (P1b F7 更正:批次三元组由 executor 的 mapGenerationOptions 以 ...shared spread
++    //  原样透传——「不进序列化」仅指 runtime-only 字段不落盘,不是「三元组不存在」;
++    //  单次生成仍以 count=1 批次语义透传,见 chat/UI 入口。)
+     const json = serializeCanvasCommand({
+       kind: 'generate-image-edit',
+       sourceNodeId: 'img-1',
+diff --git a/src/store/canvasStateTypes.ts b/src/store/canvasStateTypes.ts
+index c983d24d..2855be64 100644
+--- a/src/store/canvasStateTypes.ts
++++ b/src/store/canvasStateTypes.ts
+@@ -93,13 +93,16 @@ export type CanvasGenerationOptions = {
+    */
+   lineageSourceId?: string
+   /**
+-   * #297 编辑占位批次(runtime-only,不进序列化 command options):
+-   * 要么三者齐全(derivedBatchId/expectedCount/ordinal),要么全部缺失
+-   * (= 显式单次 count=1)。部分缺失 fail-closed——generateImageEdit /
+-   * generateBesideNode 入口按 assertBatchTriplet 拒绝,不静默降级。
+-   * ordinal 精确绑定 startDerivedImageBatch 预建的 slot,该 slotId 作为
+-   * replaceSlotId 传给 commitGenerationResult。
++   * #297 编辑占位批次(runtime-only,不进序列化 command options)。
++   * P1b 起排布意图必须显式声明,不再允许「什么都不传」的隐式旧路径:
++   *   - placement:'legacy' → 走旧路径(无对齐基准/高度锁定的场景:纯文生图)
++   *   - placement:'batch' + expectedCount → 批次发起方:action 内部
++   *     startDerivedImageBatch 预建列,按 ordinal 绑定(chat/画布 UI 单张=1)
++   *   - 完整三元组 derivedBatchId/expectedCount/ordinal → 批次成员:
++   *     按 ordinal 精确绑定既有预建 slot(agent 聚合链路)
++   * 部分缺失或全缺 → assertPlacementIntent 抛错 + debugLogger.error。
+    */
++  placement?: 'legacy' | 'batch'
+   derivedBatchId?: string
+   expectedCount?: number
+   ordinal?: number
+diff --git a/src/store/derivedBatchCoordinator.ts b/src/store/derivedBatchCoordinator.ts
+index 81141fbc..ca8d9d83 100644
+--- a/src/store/derivedBatchCoordinator.ts
++++ b/src/store/derivedBatchCoordinator.ts
+@@ -5,9 +5,10 @@
+ // 也不引入新的全局可变单例。
+ import type { StoreApi } from 'zustand'
+ import { LocalizedKeyError } from '../lib/localizedKeyError'
+-import type { AiWorkflowStatus, CanvasId, MivoCanvasNode } from '../types/mivoCanvas'
++import type { AiWorkflowStatus, CanvasId, CanvasTask, MivoCanvasNode } from '../types/mivoCanvas'
++import type { TaskFailure, TaskResultImage } from '../lib/mivoTaskClient'
+ import type { CanvasState } from './canvasStore'
+-import { assertBatchTriplet } from './canvasStateTypes'
++import { assertBatchTriplet, type CanvasGenerationOptions } from './canvasStateTypes'
+ import { AI_SLOT_GAP, centeredColumnPlacements } from './aiCanvasWorkflow'
+ import { debugLogger } from './debugLogStore'
+ import { makeNode } from './demoScenes'
+@@ -66,9 +67,409 @@ export const settleBatchSlotState = (
+   return patchCanvasDocument(current, targetSceneId, { nodes })
+ }
+ 
++/**
++ * M1:整批终态收敛(whole-request fail/cancel/unknown 共用)——把 batchSlotIds 里
++ * 仍 generating 的预建 slot 逐一生成为同一终态(failed/canceled),每步基于上一步
++ * 的 settled doc(单一 canonical-document transition;顶层镜像随活跃画布同步)。
++ * 已终态/已替换的 ordinal 不动(保留已成功结果)。返回累计 patch。
++ */
++export const settleBatchSlotsTerminal = (
++  current: CanvasState,
++  targetSceneId: CanvasId,
++  options: { batchId: string; slotIds: string[]; status: 'failed' | 'canceled' },
++): Partial<CanvasState> => {
++  let document = current.canvases[targetSceneId]
++  if (!document) return {}
++  let accumulated: Partial<CanvasState> = {}
++  for (const slotId of options.slotIds) {
++    const step = settleBatchSlotState(
++      { ...current, canvases: { ...current.canvases, [targetSceneId]: document } },
++      targetSceneId,
++      {
++        slotId,
++        batchId: options.batchId,
++        status: options.status,
++        settleWholeBatch: false,
++      },
++    )
++    const stepDoc = step.canvases?.[targetSceneId]
++    if (!stepDoc) return accumulated
++    document = stepDoc
++    accumulated = { ...accumulated, ...step }
++  }
++  return accumulated
++}
++
++export type PlacementIntent = 'legacy' | 'batch-owner' | 'batch-member'
++
++/**
++ * P1b:排布意图 fail-closed 校验(四个 generate* action 入口统一调用)。
++ * 调用方必须显式声明,不再允许「什么都不传」的隐式旧路径:
++ *   - placement:'legacy' → 旧路径,debugLogger.log 留一条 legacy 声明
++ *   - placement:'batch' + 整数 expectedCount(1-4)→ 批次发起方
++ *     (action 内部 startDerivedImageBatch 预建列后按 ordinal 绑定)
++ *   - 完整三元组 derivedBatchId/expectedCount/ordinal → 批次成员
++ *     (按 ordinal 绑定既有预建 slot)
++ * 全缺 → legacy 静默(β1 兼容态);部分缺失(1-2 个字段)→ 抛错 +
++ * debugLogger.error(与 α 基线一致,不静默退回旧路径)。
++ * 返回值是三种模式的判别结果,供调用方分流。
++ */
++export const assertPlacementIntent = (
++  options: Pick<CanvasGenerationOptions, 'placement' | 'derivedBatchId' | 'expectedCount' | 'ordinal'>,
++): PlacementIntent => {
++  const tripletPresent = [options.derivedBatchId, options.expectedCount, options.ordinal].filter(
++    (value) => value !== undefined,
++  ).length
++  if (options.placement === 'legacy') {
++    // 三态互斥:legacy 与批次凭证互斥,携带任一批次字段即 fail-closed(不静默忽略)。
++    const stray = [options.derivedBatchId, options.expectedCount, options.ordinal].filter((v) => v !== undefined)
++    if (stray.length > 0) {
++      const message = `排布意图互斥冲突:placement=legacy 不得携带批次字段(derivedBatchId=${options.derivedBatchId},expectedCount=${options.expectedCount},ordinal=${options.ordinal})`
++      debugLogger.error('Derived Batch', message)
++      throw new Error(message)
++    }
++    debugLogger.log('Derived Batch', '排布意图:placement=legacy(无批次列,走旧路径)')
++    return 'legacy'
++  }
++  if (options.placement === 'batch') {
++    if (!Number.isInteger(options.expectedCount) || (options.expectedCount as number) < 1 || (options.expectedCount as number) > 4) {
++      const message = `批次发起必须带 1-4 的整数 expectedCount,收到 ${options.expectedCount}`
++      debugLogger.error('Derived Batch', message)
++      throw new Error(message)
++    }
++    // 三态互斥:batch-owner 不得携带成员侧凭证(derivedBatchId/ordinal 属批次成员)。
++    const ownerStray = [options.derivedBatchId, options.ordinal].filter((v) => v !== undefined)
++    if (ownerStray.length > 0) {
++      const message = `排布意图互斥冲突:批次发起(placement=batch)不得携带成员侧凭证(derivedBatchId=${options.derivedBatchId},ordinal=${options.ordinal})`
++      debugLogger.error('Derived Batch', message)
++      throw new Error(message)
++    }
++    debugLogger.log('Derived Batch', `排布意图:批次发起 expectedCount=${options.expectedCount}`)
++    return 'batch-owner'
++  }
++  const tripletComplete =
++    tripletPresent === 3 &&
++    options.derivedBatchId !== undefined &&
++    options.expectedCount !== undefined &&
++    options.ordinal !== undefined
++  if (tripletComplete) {
++    debugLogger.log(
++      'Derived Batch',
++      `排布意图:批次成员 batchId=${options.derivedBatchId} ordinal=${options.ordinal}`,
++    )
++    return 'batch-member'
++  }
++  if (tripletPresent === 0) {
++    // β1(store-contract 节):全部缺失 → legacy 静默(旧行为,调用点未接线时
++    // 保持发布级兼容)。β2(entry-wiring 节)把此处改为 fail-closed 抛错。
++    debugLogger.log('Derived Batch', '排布意图:未显式声明,按 legacy 静默(旧路径)')
++    return 'legacy'
++  }
++  // 部分缺失(1-2 个字段)→ fail-closed 抛错:与 α 基线 generationSlice 语义一致
++  // (齐全/全缺二选一,部分缺失抛错),修复 β1 把部分缺失静默 legacy 的回归。
++  const message = `排布意图部分缺失:必须提供完整三元组(derivedBatchId/expectedCount/ordinal)或全缺走 legacy,收到 placement=${options.placement},derivedBatchId=${options.derivedBatchId},expectedCount=${options.expectedCount},ordinal=${options.ordinal}`
++  debugLogger.error('Derived Batch', message)
++  throw new Error(message)
++}
++
++/** 批次发起方预建列的共用入口:生成 batchId、startDerivedImageBatch 预建 expectedCount
++ *  个 slot 并返回 slot id 列表(ordinal 0..N-1 即数组下标,显式凭证不靠推断)。 */
++export const startOwnerBatch = (
++  set: StoreApi<CanvasState>['setState'],
++  get: StoreApi<CanvasState>['getState'],
++  params: DerivedBatchStartParams,
++): string[] => startDerivedImageBatchImpl(set, get, params)
++
++export type BatchBinding = { batchId?: string; slot?: MivoCanvasNode }
++
++/**
++ * P1b:按 assertPlacementIntent 的判别结果解析批次绑定(单次/单张场景共用)。
++ * legacy → 无绑定;batch-owner → 内部 startDerivedImageBatch 预建列并取 ordinal 0;
++ * batch-member → bindBatchOrdinal 按三元组绑定既有预建 slot。
++ * 返回 { batchId, slot };batch 模式下 slot 必存在,否则 fail-visible。
++ */
++export const resolveBatchBinding = (
++  intent: PlacementIntent,
++  document: { nodes: MivoCanvasNode[] },
++  options: Pick<CanvasGenerationOptions, 'placement' | 'derivedBatchId' | 'expectedCount' | 'ordinal'>,
++  set: StoreApi<CanvasState>['setState'],
++  get: StoreApi<CanvasState>['getState'],
++  ownerParams: { sceneId: CanvasId; sourceNodeId: string; batchPrefix: string },
++): BatchBinding => {
++  if (intent === 'legacy') return {}
++  if (intent === 'batch-owner') {
++    const batchId = createNodeId(ownerParams.batchPrefix)
++    const slotIds = startDerivedImageBatchImpl(set, get, {
++      sceneId: ownerParams.sceneId,
++      sourceNodeId: ownerParams.sourceNodeId,
++      batchId,
++      expectedCount: options.expectedCount as number,
++    })
++    const doc = get().canvases[ownerParams.sceneId]
++    const slot = doc.nodes.find((node) => node.id === slotIds[0] && node.type === 'ai-slot')
++    if (!slot) throw new Error(`批次 ${batchId} 预建后找不到 ordinal 0 slot`)
++    return { batchId, slot }
++  }
++  const slot = bindBatchOrdinal(document, {
++    derivedBatchId: options.derivedBatchId,
++    expectedCount: options.expectedCount,
++    ordinal: options.ordinal,
++  })
++  return { batchId: options.derivedBatchId, slot }
++}
++
++export type VariationsBatchCommitParams = {
++  sceneId: CanvasId
++  sourceNodeId: string
++  batchId: string
++  slotIds: string[]
++  count: number
++  images: TaskResultImage[]
++  failures?: TaskFailure[]
++  prompt: string
++  model: string
++  taskId: string
++}
++
++/**
++ * P1b:变体批次结果收敛(generateVariations 批次模式共用,职责在批次协调边界内)。
++ * 逐 ordinal:失败变体把对应预建 slot 原位转 failed(不删除、不压缩列、不重排);
++ * 成功变体按 variationIndex(缺省按序)取结果图原位替换其 ordinal slot。
++ * 返回成功替换的节点 id 列表。
++ *
++ * M2:收敛前先做 ordinal 分区校验——images+failures 必须构成 0..count-1 的完整、
++ * 无重复、无越界、互斥 partition。违规时 fail-visible:可靠 accounted 的 ordinal
++ * 照常收敛(已成功结果保留),未 accounted(缺失/互斥冲突)的 ordinal 原位转 failed,
++ * 最后抛错让父任务失败——绝不在槽位仍 generating 时把父任务记为 done。
++ */
++export const commitVariationsBatch = async (
++  set: StoreApi<CanvasState>['setState'],
++  get: StoreApi<CanvasState>['getState'],
++  params: VariationsBatchCommitParams,
++): Promise<string[]> => {
++  const successIds: string[] = []
++  const violations: string[] = []
++
++  // 分区校验(单一终态 transition 前置):重复保留首项,越界项只记违规。
++  const imageByIndex = new Map<number, TaskResultImage>()
++  for (const [index, image] of params.images.entries()) {
++    const key = image.variationIndex !== undefined ? image.variationIndex : index
++    if (!Number.isInteger(key) || key < 0 || key >= params.count) {
++      violations.push(`结果图 variationIndex=${key} 越界(count=${params.count})`)
++      continue
++    }
++    if (imageByIndex.has(key)) {
++      violations.push(`结果图 variationIndex=${key} 重复`)
++      continue
++    }
++    imageByIndex.set(key, image)
++  }
++  const failureByIndex = new Map<number, TaskFailure>()
++  for (const failure of params.failures ?? []) {
++    const key = failure.variationIndex
++    if (!Number.isInteger(key) || key < 0 || key >= params.count) {
++      violations.push(`失败项 variationIndex=${key} 越界(count=${params.count})`)
++      continue
++    }
++    if (failureByIndex.has(key)) {
++      violations.push(`失败项 variationIndex=${key} 重复`)
++      continue
++    }
++    failureByIndex.set(key, failure)
++  }
++  // 互斥:同一 ordinal 同时有结果与失败 → 两义,该 ordinal 按未 accounted 收敛。
++  const conflictedOrdinals = [...imageByIndex.keys()].filter((ordinal) => failureByIndex.has(ordinal))
++  for (const ordinal of conflictedOrdinals) {
++    violations.push(`ordinal ${ordinal} 同时存在结果图与失败项(互斥分区违规)`)
++  }
++  // 缺失:0..count-1 里既无结果也无失败的 ordinal。
++  const accounted = new Set<number>([...imageByIndex.keys(), ...failureByIndex.keys()])
++  const unaccountedOrdinals: number[] = []
++  for (let ordinal = 0; ordinal < params.count; ordinal += 1) {
++    if (!accounted.has(ordinal)) {
++      unaccountedOrdinals.push(ordinal)
++      violations.push(`ordinal ${ordinal} 缺失结果或失败(count=${params.count})`)
++    }
++  }
++
++  const settleOrdinalFailed = (ordinal: number, reasonText: string) => {
++    getSceneWrap()(params.sceneId, () => set((current) => {
++      // 先 settle(原位转 failed),再基于 settle 结果补 text/title——不得用未
++      // settle 的 current 重新 patch nodes(会把 failed 状态覆盖回 generating)。
++      const patch = settleBatchSlotState(current, params.sceneId, {
++        slotId: params.slotIds[ordinal],
++        batchId: params.batchId,
++        status: 'failed',
++        settleWholeBatch: false,
++      })
++      const settledDoc = patch.canvases?.[params.sceneId]
++      if (!settledDoc) return patch
++      // settle 的 patch 含顶层 nodes(活跃画布同步),必须一并返回——只给
++      // canvases 会让 store 顶层 nodes 停留 generating(测试/UI 读顶层)。
++      // 非活跃画布只写 canonical,不碰顶层镜像。
++      const annotatedNodes = (settledDoc.nodes || []).map((node) =>
++        node.id === params.slotIds[ordinal]
++          ? { ...node, text: reasonText, title: `Variation ${ordinal + 1} 失败` }
++          : node,
++      )
++      return {
++        ...patch,
++        ...(params.sceneId === current.sceneId ? { nodes: annotatedNodes } : {}),
++        canvases: {
++          ...patch.canvases,
++          [params.sceneId]: { ...settledDoc, nodes: annotatedNodes },
++        },
++      }
++    }))
++  }
++
++  for (let ordinal = 0; ordinal < params.count; ordinal += 1) {
++    if (conflictedOrdinals.includes(ordinal) || unaccountedOrdinals.includes(ordinal)) {
++      // 未 accounted(缺失/互斥冲突)→ 原位转 failed,fail-visible。
++      settleOrdinalFailed(
++        ordinal,
++        conflictedOrdinals.includes(ordinal)
++          ? `批次结果互斥冲突:ordinal ${ordinal} 同时有结果图与失败项`
++          : `批次结果缺失:ordinal ${ordinal} 无结果图或失败项`,
++      )
++      debugLogger.error(
++        'Derived Batch',
++        `变体 ordinal ${ordinal} 结果载荷违规,slot ${params.slotIds[ordinal]} 原位转 failed(batchId=${params.batchId})`,
++      )
++      continue
++    }
++    const failure = failureByIndex.get(ordinal)
++    if (failure) {
++      settleOrdinalFailed(ordinal, failure.error)
++      debugLogger.warn(
++        'Derived Batch',
++        `变体 ordinal ${ordinal} 失败,slot ${params.slotIds[ordinal]} 原位转 failed(batchId=${params.batchId})`,
++      )
++      continue
++    }
++    const imageForOrdinal = imageByIndex.get(ordinal)
++    if (!imageForOrdinal) continue
++    const committed = await get().commitGenerationResult({
++      sceneId: params.sceneId,
++      sourceNodeId: params.sourceNodeId,
++      replaceSlotId: params.slotIds[ordinal],
++      resultImages: [imageForOrdinal],
++      prompt: params.prompt,
++      model: params.model,
++      kind: 'generate',
++      taskId: params.taskId,
++    })
++    successIds.push(...committed)
++    debugLogger.log(
++      'Derived Batch',
++      `变体 ordinal ${ordinal} 原位替换 slot ${params.slotIds[ordinal]}(batchId=${params.batchId})`,
++    )
++  }
++
++  if (violations.length > 0) {
++    // 分区违规 fail-visible:已成功结果保留、未 accounted 槽位已转 failed,
++    // 但父任务必须失败(不得误 done)。
++    const message = `批次结果分区违规(count=${params.count}):${violations.join(';')}`
++    debugLogger.error('Derived Batch', message)
++    throw new Error(message)
++  }
++  return successIds
++}
++
++const upsertTask = (tasks: CanvasTask[], task: CanvasTask) =>
++  [task, ...tasks.filter((item) => item.id !== task.id)].slice(0, 5)
++
++export type SettleBatchCatchParams = {
++  sceneId: CanvasId
++  slotId: string
++  batchId: string
++  canceled: boolean
++  settleWholeBatch: boolean
++  isUserDeletedSlot: boolean
++  runningTask: CanvasTask
++  canceledLabel: string
++  failedLabel: string
++  ordinalLabel: string
++}
++
++/**
++ * P1b:批次 catch 收敛共用(generateImageEdit/generateBesideNode/generateIntoAiSlot
++ * 三个 action 的 catch 同一形态):用户已删 slot → warn 跳过;否则把对应 ordinal slot
++ * 原位转 failed/canceled 终态(不删除、不压缩列)+ 任务状态收敛 + debugLogger.warn。
++ */
++export const settleBatchCatch = (
++  set: StoreApi<CanvasState>['setState'],
++  params: SettleBatchCatchParams,
++): void => {
++  if (params.isUserDeletedSlot) {
++    // SC3:用户已删 skip——用户删掉了批次 slot,收敛跳过(不重建、不删同批)。
++    debugLogger.warn('Derived Batch', `用户已删除 slot ${params.slotId},批次收敛跳过(batchId=${params.batchId})`)
++  }
++  getSceneWrap()(params.sceneId, () => set((current) => {
++    const patch = settleBatchSlotState(current, params.sceneId, {
++      slotId: params.slotId,
++      batchId: params.batchId,
++      status: params.canceled ? 'canceled' : 'failed',
++      settleWholeBatch: params.settleWholeBatch,
++    })
++    // M3:任务 patch 必须基于 settled doc——拿 pre-settle current 重新
++    // patchCanvasDocument 会把 canonical 画布节点覆盖回 generating(顶层镜像
++    // 说 failed 而 persisted 的 canonical 说 generating,reload 复活 zombie)。
++    const settledDoc = patch.canvases?.[params.sceneId]
++    if (!settledDoc) return patch
++    const liveTask = settledDoc.tasks.find((t) => t.id === params.runningTask.id) ?? params.runningTask
++    const nextTasks = upsertTask(
++      settledDoc.tasks,
++      params.canceled ? { ...liveTask, label: params.canceledLabel, status: 'canceled' as const }
++        : { ...liveTask, label: params.failedLabel, status: 'failed' as const },
++    )
++    return {
++      ...patch,
++      // 顶层 tasks 镜像只随活跃画布更新;非活跃画布只写 canonical。
++      ...(params.sceneId === current.sceneId ? { tasks: nextTasks } : {}),
++      canvases: {
++        ...patch.canvases,
++        [params.sceneId]: { ...settledDoc, tasks: nextTasks },
++      },
++    }
++  }))
++  debugLogger.warn(
++    'Derived Batch',
++    `ordinal ${params.ordinalLabel} ${params.canceled ? '取消' : '失败'}${params.settleWholeBatch ? '(源图已删,同批收敛)' : ''},slot ${params.slotId} 原位转终态`,
++  )
++}
++
++/**
++ * 批次成员三元组语义校验(存在性之外的取值域):batchId 非空字符串、expectedCount
++ * 整数 1..4、ordinal 整数且 0 <= ordinal < expectedCount。调用方声明与持久化
++ * slot 两侧独立校验(持久化态是受信边界——malformed 持久化值不得被同值声明放行)。
++ */
++const assertValidBatchMemberTriplet = (
++  triplet: { derivedBatchId?: string; expectedCount?: number; ordinal?: number },
++  side: 'caller' | 'persisted',
++): void => {
++  const prefix = side === 'caller' ? '批次成员声明' : '批次 slot 持久化凭证'
++  if (typeof triplet.derivedBatchId !== 'string' || triplet.derivedBatchId.length === 0) {
++    throw new Error(`${prefix} batchId 必须为非空字符串,收到 ${JSON.stringify(triplet.derivedBatchId)}`)
++  }
++  if (
++    !Number.isInteger(triplet.expectedCount) ||
++    (triplet.expectedCount as number) < 1 ||
++    (triplet.expectedCount as number) > 4
++  ) {
++    throw new Error(`${prefix} expectedCount 必须为 1-4 的整数,收到 ${triplet.expectedCount}`)
++  }
++  const expectedCount = triplet.expectedCount as number
++  const ordinal = triplet.ordinal as number
++  if (!Number.isInteger(ordinal) || ordinal < 0 || ordinal >= expectedCount) {
++    throw new Error(`${prefix} ordinal 必须为 0..expectedCount-1 的整数,收到 ${ordinal}`)
++  }
++}
++
+ /**
+  * 批次三元组校验 + ordinal 绑定 slot 的共用入口(generateImageEdit 与
+- * generateBesideNode 同一套 fail-closed 契约):要么齐全、要么全缺(单次 count=1),
++ * generateBesideNode 同一套 fail-closed 契约):调用方必须先经
++ * assertPlacementIntent 判定为 batch-member,此处只接受完整三元组,
+  * 部分缺失 fail-closed 并留痕;缺员 fail-visible(缺员不静默降级成单次生成)。
+  * 返回绑定到的预建 slot(单次路径 undefined)。
+  */
+@@ -86,6 +487,16 @@ export const bindBatchOrdinal = (
+     )
+     throw error
+   }
++  // M4:调用方三元组语义校验(存在性之外的值域/类型),fail-closed。
++  try {
++    assertValidBatchMemberTriplet(triplet, 'caller')
++  } catch (error) {
++    debugLogger.error(
++      'Derived Batch',
++      `批次三元组语义校验失败(derivedBatchId=${triplet.derivedBatchId},expectedCount=${triplet.expectedCount},ordinal=${triplet.ordinal}):${error instanceof Error ? error.message : String(error)}`,
++    )
++    throw error
++  }
+   const batchSlot =
+     triplet.derivedBatchId !== undefined
+       ? findBatchSlot(document, triplet.derivedBatchId, triplet.ordinal as number)
+@@ -100,6 +511,41 @@ export const bindBatchOrdinal = (
+       `批次 ${triplet.derivedBatchId} 的 ordinal ${triplet.ordinal} 没有预建 slot(先调用 startDerivedImageBatch)`,
+     )
+   }
++  // F7:expectedCount 完整性——批次成员声明的 expectedCount 必须与 slot 持久化的
++  // 批次 expectedCount 一致(预建列是同一批次身份的真相源),不一致 fail-closed。
++  if (batchSlot) {
++    const slotExpectedCount = batchSlot.aiWorkflow?.expectedCount
++    if (slotExpectedCount === undefined) {
++      // G5:slot 缺失批次 expectedCount → 拒绝绑定(不得跳过一致性比较)。
++      const message = `批次 slot 缺失 expectedCount:slot ${batchSlot.id} 无 aiWorkflow.expectedCount(batchId=${triplet.derivedBatchId},ordinal=${triplet.ordinal}),拒绝绑定`
++      debugLogger.error('Derived Batch', message)
++      throw new Error(message)
++    }
++    if (triplet.expectedCount !== undefined && triplet.expectedCount !== slotExpectedCount) {
++      const message = `批次 expectedCount 不一致:成员声明 ${triplet.expectedCount},slot 持久化 ${slotExpectedCount}(batchId=${triplet.derivedBatchId},ordinal=${triplet.ordinal})`
++      debugLogger.error('Derived Batch', message)
++      throw new Error(message)
++    }
++    // M4:持久化 slot 凭证语义校验——malformed 持久化值(0/越界/非整数)即使与
++    // 调用方同值也不得绑定放行;batchId/ordinal 的 exact match 已由 findBatchSlot
++    // 结构性保证,expectedCount 的 exact match 由上方 F7 保证。
++    try {
++      assertValidBatchMemberTriplet(
++        {
++          derivedBatchId: batchSlot.aiWorkflow?.batchId,
++          expectedCount: batchSlot.aiWorkflow?.expectedCount,
++          ordinal: batchSlot.aiWorkflow?.ordinal,
++        },
++        'persisted',
++      )
++    } catch (error) {
++      debugLogger.error(
++        'Derived Batch',
++        `批次 slot 凭证语义校验失败(slot ${batchSlot.id},batchId=${triplet.derivedBatchId},ordinal=${triplet.ordinal}):${error instanceof Error ? error.message : String(error)}`,
++      )
++      throw error
++    }
++  }
+   if (batchSlot) {
+     debugLogger.log('Derived Batch', `ordinal ${triplet.ordinal} 绑定 slot ${batchSlot.id}(batchId=${triplet.derivedBatchId})`)
+   }
+diff --git a/src/store/generation.batchPlacement.contract.test.ts b/src/store/generation.batchPlacement.contract.test.ts
+index befee687..604084a8 100644
+--- a/src/store/generation.batchPlacement.contract.test.ts
++++ b/src/store/generation.batchPlacement.contract.test.ts
+@@ -109,6 +109,13 @@ const failedView = (error: string) => ({
+   error,
+ })
+ 
++// P2-C2: partial-view payload for variations (some success + some failure). The
++// success subset travels in result.images (with variationIndex); the failed
++// subset in failures[] (with variationIndex + desensitized error). partial does
++// NOT reject — the action resolves the success subset. Images accept blob OR b64
++// (committedImage() carries blob; runtime carries b64) — commitGenerationResult
++// handles both via blobFromCommittedGenerationImage.
++
+ const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+   id: 'n1',
+   type: 'image',
+@@ -122,6 +129,7 @@ const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => (
+   ...overrides,
+ })
+ 
++
+ const baseState = useCanvasStore.getState()
+ 
+ const seed = (overrides: Record<string, unknown> = {}) =>
+@@ -152,12 +160,10 @@ beforeEach(() => {
+ })
+ 
+ /** 读当前 pendingFocus 并断言它是 generation-result 请求,返回其成员集。 */
+-
+ /** 本批 commit 产物节点集:调用前节点之外新增的「image 结果 ∪ failed 失败槽」。
+  *  注意不能用全量 nodes diff——syncDerivationEdgeNodes 会把衍生边物化成
+  *  derivation-edge 节点进 nodes 数组,那些不是焦点成员。 */
+ 
+-// Tests -----------------------------------------------------------------------
+ describe('contract: #297 编辑占位批次(SC10/11/12/14 预建与占位几何)', () => {
+   const source = () => imageNode({ id: 'n1', width: 300, height: 200 })
+ 
+@@ -287,6 +293,7 @@ describe('contract: #297 编辑占位批次(SC10/11/12/14 预建与占位几何)
+     })
+   })
+ })
++
+ describe('contract: #297 编辑占位批次(SC4/SC5 失败收敛与单一撤销单元)', () => {
+   const source = () => imageNode({ id: 'n1', width: 300, height: 200 })
+ 
+diff --git a/src/store/generation.batchTerminal.contract.test.ts b/src/store/generation.batchTerminal.contract.test.ts
+new file mode 100644
+index 00000000..fa27c83d
+--- /dev/null
++++ b/src/store/generation.batchTerminal.contract.test.ts
+@@ -0,0 +1,631 @@
++// P1b 批次行为契约测试(新文件,不追加进逼近阈值的 generation.contract.test.ts)。
++//
++// 覆盖:
++//   - generateVariations 批次化: N=2/3/4 预建 N 占位逐 ordinal 原位替换 + partial(2 成功 1 失败)
++//   - 单张 expectedCount=1 边缘对齐:批次路径产出与 centeredColumnPlacements({count:1})
++//     返回值逐字段相等(非只数值相等——数值可能巧合,逐字段相等才证明同一套几何)
++//   - generateIntoAiSlot 批次模式:按 ordinal 绑定(与 slotId 冲突抛错)
++//   - 三态互斥:legacy 携带批次字段 / batch-owner 携带成员凭证 → 抛错(F2)
++import { describe, expect, it, vi, beforeEach } from 'vitest'
++
++// Hermetic setup(与 generation.contract.test.ts 同构)。
++vi.mock('../lib/demoImages', () => ({ createDemoImage: () => 'data:image/png;base64,mock-demo-image' }))
++vi.mock('../lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async (_blob: Blob, name: string, type: string) => ({
++    assetUrl: 'mivo-asset://mock-asset',
++    name,
++    type,
++    sizeBytes: 1234,
++    hasTransparency: false,
++    size: '300x200',
++    sourceDimensions: { width: 300, height: 200 },
++  })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('./remoteDebugReporter', () => ({ reportRemoteDebugEntry: () => {} }))
++
++const mocks = vi.hoisted(() => ({
++  submitEditTask: vi.fn(),
++  submitGenerationTask: vi.fn(),
++  submitVariationsTask: vi.fn(),
++  pollTask: vi.fn(),
++  cancelTask: vi.fn(),
++  assetBlobForNode: vi.fn(),
++}))
++
++vi.mock('../lib/mivoTaskClient', () => ({
++  submitEditTask: mocks.submitEditTask,
++  submitGenerationTask: mocks.submitGenerationTask,
++  submitVariationsTask: mocks.submitVariationsTask,
++  pollTask: mocks.pollTask,
++  cancelTask: mocks.cancelTask,
++  taskPollIntervalMs: () => 0,
++  kindForFailedTask: (error: string) => /\btimeout\b|超时/i.test(error) ? 'upstream-timeout' : 'upstream-error',
++}))
++
++vi.mock('../lib/mivoImageClient', () => ({
++  assetBlobForNode: mocks.assetBlobForNode,
++  MivoImageRequestError: class MivoImageRequestError extends Error {
++    kind: string
++    constructor(message: string, kind: string) {
++      super(message)
++      this.name = 'MivoImageRequestError'
++      this.kind = kind
++    }
++  },
++}))
++
++import { useCanvasStore } from './canvasStore'
++import { migratePersistedState } from './canvasGenerationHydration'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++function committedImage() {
++  return {
++    blob: new Blob(['mock-image-bytes'], { type: 'image/png' }),
++    title: 'img',
++    width: 300,
++    height: 200,
++    variationIndex: 0,
++  }
++}
++
++const doneView = (images = [committedImage()]) => ({
++  id: 't1',
++  kind: 'variations' as const,
++  status: 'done' as const,
++  progress: 100,
++  stage: 'done',
++  requestId: 'req-1',
++  model: 'gpt-image-2',
++  result: { images },
++})
++
++const partialView = (
++  images: Array<{ blob?: Blob; variationIndex?: number }>,
++  failures: Array<{ variationIndex: number; error: string }>,
++) => ({
++  id: 't1',
++  kind: 'variations' as const,
++  status: 'partial' as const,
++  progress: 100,
++  stage: 'done',
++  requestId: 'req-1',
++  model: 'gpt-image-2',
++  result: { images },
++  failures,
++})
++
++const failedView = (error: string) => ({
++  id: 't1',
++  kind: 'variations' as const,
++  status: 'failed' as const,
++  progress: 50,
++  stage: 'failed',
++  requestId: 'req-1',
++  model: 'gpt-image-2',
++  error,
++})
++
++const unknownView = () => ({
++  id: 't1',
++  kind: 'variations' as const,
++  status: 'unknown' as const,
++  progress: 0,
++  stage: 'x',
++  requestId: 'req-1',
++  model: 'gpt-image-2',
++})
++
++const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++  id: 'n1',
++  type: 'image',
++  title: 'Image',
++  x: 10,
++  y: 20,
++  width: 300,
++  height: 200,
++  status: 'ready',
++  assetUrl: '/a.png',
++  ...overrides,
++})
++
++const baseState = useCanvasStore.getState()
++
++const seed = (overrides: Record<string, unknown> = {}) =>
++  useCanvasStore.setState({ ...baseState, ...overrides } as never, true)
++
++const seedCanvas = (sceneId: string, nodes: MivoCanvasNode[]) => {
++  const document = { title: sceneId, nodes, edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
++  return {
++    canvases: { [sceneId]: document },
++    sceneId,
++    nodes,
++    edges: [],
++    tasks: [],
++    selectedNodeId: undefined,
++    selectedNodeIds: [],
++  }
++}
++
++// 双画布:活跃画布(顶层镜像真相)与目标非活跃画布分开,验证 canonical 与镜像互不污染。
++const seedTwoCanvases = (targetSceneId: string, targetNodes: MivoCanvasNode[]) => {
++  const activeDoc = { title: 'active', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
++  const targetDoc = {
++    title: targetSceneId,
++    nodes: targetNodes,
++    edges: [],
++    tasks: [],
++    selectedNodeId: undefined,
++    selectedNodeIds: [],
++  }
++  return {
++    canvases: { 'character-flow': activeDoc, [targetSceneId]: targetDoc },
++    sceneId: 'character-flow',
++    nodes: [],
++    edges: [],
++    tasks: [],
++    selectedNodeId: undefined,
++    selectedNodeIds: [],
++  }
++}
++
++const {
++  submitVariationsTask: mockSubmitVariationsTask,
++  pollTask: mockPollTask,
++  assetBlobForNode: mockAssetBlobForNode,
++} = mocks
++
++beforeEach(() => {
++  useCanvasStore.setState({ ...baseState } as never, true)
++  mockSubmitVariationsTask.mockReset().mockResolvedValue({ taskId: 't1', batchId: 'b1', count: 4 })
++  mockPollTask.mockReset().mockResolvedValue(doneView())
++  mockAssetBlobForNode.mockReset().mockResolvedValue(new Blob(['mock-source-bytes'], { type: 'image/png' }))
++})
++
++describe('contract: batch-member expectedCount matches persisted slot (F7)', () => {
++  it('member_with_mismatched_expectedCount_throws: 成员声明 expectedCount ≠ slot 持久化值 → 抛错', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const slotIds = await useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'b-count',
++      expectedCount: 2,
++    })
++    // 声明 expectedCount=3 与预建列(2)不一致 → fail-closed。
++    await expect(
++      useCanvasStore.getState().generateIntoAiSlot(slotIds[0], 'fill', {
++        derivedBatchId: 'b-count',
++        expectedCount: 3,
++        ordinal: 0,
++      }),
++    ).rejects.toThrow(/expectedCount 不一致/)
++  })
++
++  it('member_with_matching_expectedCount_passes: 成员声明与 slot 持久化一致 → 正常绑定替换', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const slotIds = await useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'b-ok',
++      expectedCount: 2,
++    })
++    mockPollTask.mockResolvedValueOnce(doneView([committedImage()]))
++    const nodeIds = await useCanvasStore.getState().generateIntoAiSlot(slotIds[0], 'fill', {
++      derivedBatchId: 'b-ok',
++      expectedCount: 2,
++      ordinal: 0,
++    })
++    expect(nodeIds).toContain(slotIds[0])
++    const replaced = useCanvasStore.getState().nodes.find((n) => n.id === slotIds[0])!
++    expect(replaced.type).toBe('image')
++  })
++
++  // G5(修复轮2):slot 缺失批次 expectedCount 时不得跳过一致性比较,拒绝绑定。
++  it('member_binding_slot_missing_expectedCount_throws: slot 无 aiWorkflow.expectedCount → 拒绝绑定', async () => {
++    seed(
++      seedCanvas('character-flow', [
++        imageNode({ id: 'n1' }),
++        {
++          id: 'slot-broken',
++          type: 'ai-slot',
++          title: '编辑占位 1/1',
++          x: 310,
++          y: 20,
++          width: 300,
++          height: 200,
++          status: 'generating',
++          locked: true,
++          aiWorkflow: {
++            kind: 'slot',
++            status: 'generating',
++            operation: 'area-edit',
++            prompt: 'p',
++            sourceNodeIds: ['n1'],
++            placement: 'right',
++            createdAt: 0,
++            batchId: 'b-no-count',
++            ordinal: 0,
++            // 故意缺失 expectedCount:G5 缺陷场景
++          },
++        },
++      ]),
++    )
++    await expect(
++      useCanvasStore.getState().generateIntoAiSlot('slot-broken', 'fill', {
++        derivedBatchId: 'b-no-count',
++        expectedCount: 1,
++        ordinal: 0,
++      }),
++    ).rejects.toThrow(/缺失 expectedCount|拒绝绑定/)
++  })
++})
++
++// ─── beta1 GPT P1 修复(M1):generateVariations whole-request 终态收敛 ──────────
++describe('contract: generateVariations whole-request terminal settles every prebuilt slot (M1)', () => {
++  it('whole_request_fail_settles_all_prebuilt_slots_terminal: 整批 fail → 预建 slot 全部原位转 failed,任务 failed,canonical 与顶层镜像一致', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(failedView('boom'))
++    await expect(
++      useCanvasStore.getState().generateVariations('n1', [{ prompt: 'p0' }, { prompt: 'p1' }], {
++        placement: 'batch',
++        expectedCount: 2,
++      }),
++    ).rejects.toThrow(/boom/)
++    const s = useCanvasStore.getState()
++    const slots = s.nodes.filter((n) => n.type === 'ai-slot')
++    expect(slots).toHaveLength(2)
++    slots.forEach((slot) => {
++      expect(slot.status).toBe('failed')
++      expect(slot.aiWorkflow?.status).toBe('failed')
++      // canonical document 与顶层镜像一致(不存活到 reload 的 zombie generating slot)
++      const canonical = s.canvases['character-flow'].nodes.find((n) => n.id === slot.id)
++      expect(canonical?.status).toBe('failed')
++      expect(canonical?.aiWorkflow?.status).toBe('failed')
++    })
++    expect(s.tasks[0]?.status).toBe('failed')
++    expect(s.canvases['character-flow'].tasks[0]?.status).toBe('failed')
++  })
++
++  it('whole_request_cancel_settles_all_prebuilt_slots_canceled: 整批 cancel → 预建 slot 全部原位转 canceled,任务 canceled', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const controller = new AbortController()
++    controller.abort()
++    await expect(
++      useCanvasStore.getState().generateVariations('n1', [{ prompt: 'p0' }, { prompt: 'p1' }], {
++        placement: 'batch',
++        expectedCount: 2,
++        signal: controller.signal,
++      }),
++    ).rejects.toThrow(/取消/)
++    const s = useCanvasStore.getState()
++    const slots = s.nodes.filter((n) => n.type === 'ai-slot')
++    expect(slots).toHaveLength(2)
++    slots.forEach((slot) => {
++      // 既有约定:取消槽 node.status='failed'(终态视觉)+ aiWorkflow.status='canceled'
++      expect(slot.status).toBe('failed')
++      expect(slot.aiWorkflow?.status).toBe('canceled')
++      const canonical = s.canvases['character-flow'].nodes.find((n) => n.id === slot.id)
++      expect(canonical?.aiWorkflow?.status).toBe('canceled')
++    })
++    expect(s.tasks[0]?.status).toBe('canceled')
++  })
++
++  it('whole_request_unknown_settles_all_prebuilt_slots_terminal: unknown 终态 → 预建 slot 全部原位转 failed,任务 failed', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(unknownView())
++    await expect(
++      useCanvasStore.getState().generateVariations('n1', [{ prompt: 'p0' }, { prompt: 'p1' }], {
++        placement: 'batch',
++        expectedCount: 2,
++      }),
++    ).rejects.toThrow(/任务已失效/)
++    const s = useCanvasStore.getState()
++    const slots = s.nodes.filter((n) => n.type === 'ai-slot')
++    expect(slots).toHaveLength(2)
++    slots.forEach((slot) => {
++      expect(slot.status).toBe('failed')
++      expect(slot.aiWorkflow?.status).toBe('failed')
++    })
++    expect(s.tasks[0]?.status).toBe('failed')
++  })
++
++  it('whole_request_fail_inactive_scene_settles_canonical_only: 非活跃画布整批 fail → canonical 转 failed,顶层镜像不被污染', async () => {
++    seed(seedTwoCanvases('other-scene', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(failedView('boom'))
++    await expect(
++      useCanvasStore.getState().generateVariations('n1', [{ prompt: 'p0' }, { prompt: 'p1' }], {
++        placement: 'batch',
++        expectedCount: 2,
++        sceneId: 'other-scene',
++      }),
++    ).rejects.toThrow(/boom/)
++    const s = useCanvasStore.getState()
++    const canonicalSlots = s.canvases['other-scene'].nodes.filter((n) => n.type === 'ai-slot')
++    expect(canonicalSlots).toHaveLength(2)
++    canonicalSlots.forEach((slot) => {
++      expect(slot.status).toBe('failed')
++      expect(slot.aiWorkflow?.status).toBe('failed')
++    })
++    expect(s.canvases['other-scene'].tasks[0]?.status).toBe('failed')
++    // 顶层镜像不被污染:other-scene 的 slot/task 不得出现在活跃画布镜像
++    expect(s.nodes.filter((n) => n.type === 'ai-slot')).toHaveLength(0)
++    expect(s.tasks).toHaveLength(0)
++  })
++})
++
++// ─── beta1 GPT P1 修复(M2):commitVariationsBatch ordinal 分区校验 ──────────────
++describe('contract: variations batch result partition validation (M2)', () => {
++  it('truncated_done_payload_settles_unaccounted_slot_and_fails_parent: 缺 ordinal 的 done 载荷 → 缺员 slot 原位转 failed,父任务失败不误 done,已成功结果保留', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(doneView([{ ...committedImage(), variationIndex: 0 }]))
++    await expect(
++      useCanvasStore.getState().generateVariations('n1', [{ prompt: 'p0' }, { prompt: 'p1' }], {
++        placement: 'batch',
++        expectedCount: 2,
++      }),
++    ).rejects.toThrow(/分区/)
++    const s = useCanvasStore.getState()
++    // ordinal 0 的成功结果保留(已原位提交)
++    expect(s.nodes.some((n) => n.type === 'image' && n.id !== 'n1')).toBe(true)
++    // ordinal 1 未 accounted → 原位转 failed(canonical 与镜像一致)
++    const failedSlot = s.nodes.find((n) => n.type === 'ai-slot' && n.aiWorkflow?.ordinal === 1)
++    expect(failedSlot).toBeDefined()
++    expect(failedSlot?.status).toBe('failed')
++    expect(failedSlot?.aiWorkflow?.status).toBe('failed')
++    const canonical = s.canvases['character-flow'].nodes.find((n) => n.id === failedSlot?.id)
++    expect(canonical?.status).toBe('failed')
++    // 父任务不得误 done
++    expect(s.tasks[0]?.status).toBe('failed')
++    expect(s.canvases['character-flow'].tasks[0]?.status).toBe('failed')
++  })
++
++  it('duplicate_ordinal_payload_fails_visible: 重复 variationIndex → 分区违规,首个结果保留,缺员槽位转 failed,任务失败', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(
++      doneView([{ ...committedImage(), variationIndex: 0 }, { ...committedImage(), variationIndex: 0 }]),
++    )
++    await expect(
++      useCanvasStore.getState().generateVariations('n1', [{ prompt: 'p0' }, { prompt: 'p1' }], {
++        placement: 'batch',
++        expectedCount: 2,
++      }),
++    ).rejects.toThrow(/分区/)
++    const s = useCanvasStore.getState()
++    // 重复 ordinal 的结果保留首项(已原位提交)
++    expect(s.nodes.filter((n) => n.type === 'image' && n.id !== 'n1')).toHaveLength(1)
++    // ordinal 1 缺失 → 原位转 failed
++    const failedSlot = s.nodes.find((n) => n.type === 'ai-slot' && n.aiWorkflow?.ordinal === 1)
++    expect(failedSlot?.status).toBe('failed')
++    // 父任务失败(不误 done)
++    expect(s.tasks[0]?.status).toBe('failed')
++  })
++
++  it('out_of_bounds_ordinal_payload_fails_visible: variationIndex 越界 → 分区违规,全部预建槽位转 failed,任务失败', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(doneView([{ ...committedImage(), variationIndex: 5 }]))
++    await expect(
++      useCanvasStore.getState().generateVariations('n1', [{ prompt: 'p0' }, { prompt: 'p1' }], {
++        placement: 'batch',
++        expectedCount: 2,
++      }),
++    ).rejects.toThrow(/分区/)
++    const s = useCanvasStore.getState()
++    // 越界载荷不得提交任何结果
++    expect(s.nodes.some((n) => n.type === 'image' && n.id !== 'n1')).toBe(false)
++    const slots = s.nodes.filter((n) => n.type === 'ai-slot')
++    expect(slots).toHaveLength(2)
++    slots.forEach((slot) => expect(slot.status).toBe('failed'))
++    expect(s.tasks[0]?.status).toBe('failed')
++  })
++
++  it('conflicting_image_and_failure_ordinal_fails_visible: 同 ordinal 互斥冲突 → 分区违规,冲突 ordinal 原位转 failed,任务失败', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(
++      partialView([{ ...committedImage(), variationIndex: 0 }], [{ variationIndex: 0, error: 'e' }]),
++    )
++    await expect(
++      useCanvasStore.getState().generateVariations('n1', [{ prompt: 'p0' }, { prompt: 'p1' }], {
++        placement: 'batch',
++        expectedCount: 2,
++      }),
++    ).rejects.toThrow(/分区/)
++    const s = useCanvasStore.getState()
++    // 冲突 ordinal 不提交任何结果(两义载荷不可信)
++    expect(s.nodes.some((n) => n.type === 'image' && n.id !== 'n1')).toBe(false)
++    const slots = s.nodes.filter((n) => n.type === 'ai-slot')
++    expect(slots).toHaveLength(2)
++    slots.forEach((slot) => expect(slot.status).toBe('failed'))
++    expect(s.tasks[0]?.status).toBe('failed')
++  })
++})
++
++// ─── beta1 GPT P1 修复(M3):settleBatchCatch 任务 patch 基于 settled doc ────────
++describe('contract: settleBatchCatch canonical document terminal (M3)', () => {
++  it('batch_member_catch_active_canonical_matches_top_mirror: 活跃画布批次成员失败 → canonical 与顶层镜像一致(failed),任务 failed,同批其余 slot 保留 generating', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const slotIds = useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'batch-catch',
++      expectedCount: 2,
++    })
++    mockPollTask.mockResolvedValueOnce(failedView('boom'))
++    await expect(
++      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'bad', {
++        derivedBatchId: 'batch-catch',
++        expectedCount: 2,
++        ordinal: 0,
++      }),
++    ).rejects.toThrow(/boom/)
++    const s = useCanvasStore.getState()
++    const mirror = s.nodes.find((n) => n.id === slotIds[0])
++    expect(mirror?.status).toBe('failed')
++    expect(mirror?.aiWorkflow?.status).toBe('failed')
++    // canonical document 必须与顶层镜像一致(不得停留 generating 直到 reload)
++    const canonical = s.canvases['character-flow'].nodes.find((n) => n.id === slotIds[0])
++    expect(canonical?.status).toBe('failed')
++    expect(canonical?.aiWorkflow?.status).toBe('failed')
++    expect(s.tasks[0]?.status).toBe('failed')
++    expect(s.canvases['character-flow'].tasks[0]?.status).toBe('failed')
++    // 同批 slot1 保留 generating(不因 ordinal0 失败被误 settle)
++    expect(s.canvases['character-flow'].nodes.find((n) => n.id === slotIds[1])?.status).toBe('generating')
++  })
++
++  it('batch_member_catch_inactive_canonical_terminal_mirror_untouched: 非活跃画布批次成员失败 → canonical 转 failed,顶层镜像不被污染', async () => {
++    seed(seedTwoCanvases('other-scene', [imageNode({ id: 'n1' })]))
++    const slotIds = useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'other-scene',
++      sourceNodeId: 'n1',
++      batchId: 'batch-catch-2',
++      expectedCount: 2,
++    })
++    mockPollTask.mockResolvedValueOnce(failedView('boom'))
++    await expect(
++      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'bad', {
++        sceneId: 'other-scene',
++        derivedBatchId: 'batch-catch-2',
++        expectedCount: 2,
++        ordinal: 0,
++      }),
++    ).rejects.toThrow(/boom/)
++    const s = useCanvasStore.getState()
++    const canonical = s.canvases['other-scene'].nodes.find((n) => n.id === slotIds[0])
++    expect(canonical?.status).toBe('failed')
++    expect(canonical?.aiWorkflow?.status).toBe('failed')
++    expect(s.canvases['other-scene'].tasks[0]?.status).toBe('failed')
++    // 顶层镜像不被污染:other-scene 的 slot/task 不得出现在活跃画布镜像
++    expect(s.nodes.filter((n) => n.type === 'ai-slot')).toHaveLength(0)
++    expect(s.tasks).toHaveLength(0)
++  })
++})
++
++// ─── beta1 GPT P1 修复(M4):批次成员语义校验(caller + persisted 独立校验) ──────
++describe('contract: batch member semantic validation (M4)', () => {
++  it('member_caller_expectedCount_zero_rejects: 调用方 expectedCount=0 → fail-closed 抛错', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'b-zero',
++      expectedCount: 2,
++    })
++    await expect(
++      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'x', {
++        derivedBatchId: 'b-zero',
++        expectedCount: 0,
++        ordinal: 0,
++      }),
++    ).rejects.toThrow(/expectedCount/)
++  })
++
++  it('member_caller_ordinal_out_of_range_rejects: 调用方 ordinal >= expectedCount → fail-closed 抛错', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'b-rng',
++      expectedCount: 2,
++    })
++    await expect(
++      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'x', {
++        derivedBatchId: 'b-rng',
++        expectedCount: 2,
++        ordinal: 2,
++      }),
++    ).rejects.toThrow(/ordinal/)
++  })
++
++  it('member_caller_fractional_expectedCount_rejects: 调用方非整数 expectedCount → fail-closed 抛错', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'b-frac',
++      expectedCount: 2,
++    })
++    await expect(
++      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'x', {
++        derivedBatchId: 'b-frac',
++        expectedCount: 2.5,
++        ordinal: 0,
++      }),
++    ).rejects.toThrow(/expectedCount/)
++  })
++
++  it('member_caller_empty_batchId_rejects: 调用方空 batchId → fail-closed 抛错', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    await expect(
++      useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'x', {
++        derivedBatchId: '',
++        expectedCount: 1,
++        ordinal: 0,
++      }),
++    ).rejects.toThrow(/batchId/)
++  })
++
++  it('persisted_malformed_expectedCount_0_rejected_through_migrate: 经 migratePersistedState 持久化 expectedCount=0 的 slot,同值三元组绑定必须拒绝', async () => {
++    const malformedSlot: MivoCanvasNode = {
++      id: 'slot-broken',
++      type: 'ai-slot',
++      title: '编辑占位 1/1',
++      x: 310,
++      y: 20,
++      width: 300,
++      height: 200,
++      status: 'failed',
++      generation: { prompt: 'p', model: 'gpt-image-2', taskId: 'task-x', createdAt: 0 },
++      aiWorkflow: {
++        kind: 'slot',
++        status: 'failed',
++        operation: 'area-edit',
++        prompt: 'p',
++        sourceNodeIds: ['n1'],
++        placement: 'right',
++        createdAt: 0,
++        batchId: 'bad-count',
++        expectedCount: 0, // malformed:0 必须被迁移保留且绑定拒绝
++        ordinal: 0,
++      },
++    }
++    const persistedState = {
++      canvases: {
++        'character-flow': {
++          title: 'Hydrated',
++          nodes: [imageNode({ id: 'n1' }), malformedSlot],
++          edges: [],
++          tasks: [],
++          selectedNodeId: undefined,
++          selectedNodeIds: [],
++        },
++      },
++      sceneId: 'character-flow',
++      selectedNodeId: undefined,
++      selectedNodeIds: [],
++      activeTool: 'select',
++      brushStyle: { color: '#000000', width: 8, kind: 'marker' },
++    }
++    const migrated = migratePersistedState(persistedState, 13)
++    // 迁移必须保留 malformed 0(不静默改写)
++    expect(
++      migrated.canvases['character-flow'].nodes.find((n) => n.id === 'slot-broken')?.aiWorkflow?.expectedCount,
++    ).toBe(0)
++    seed({
++      canvases: migrated.canvases,
++      sceneId: 'character-flow',
++      nodes: migrated.nodes,
++      edges: migrated.edges,
++      tasks: migrated.tasks,
++      selectedNodeId: undefined,
++      selectedNodeIds: [],
++    })
++    // 与持久化 malformed 值完全一致的三元组也必须 fail-closed(不 resolve)
++    await expect(
++      useCanvasStore.getState().generateIntoAiSlot('slot-broken', 'fill', {
++        derivedBatchId: 'bad-count',
++        expectedCount: 0,
++        ordinal: 0,
++      }),
++    ).rejects.toThrow(/expectedCount/)
++  })
++})
+diff --git a/src/store/generation.contract.test.ts b/src/store/generation.contract.test.ts
+index 9368e6ad..0ee9c58f 100644
+--- a/src/store/generation.contract.test.ts
++++ b/src/store/generation.contract.test.ts
+@@ -110,6 +110,13 @@ const failedView = (error: string) => ({
+   error,
+ })
+ 
++// P2-C2: partial-view payload for variations (some success + some failure). The
++// success subset travels in result.images (with variationIndex); the failed
++// subset in failures[] (with variationIndex + desensitized error). partial does
++// NOT reject — the action resolves the success subset. Images accept blob OR b64
++// (committedImage() carries blob; runtime carries b64) — commitGenerationResult
++// handles both via blobFromCommittedGenerationImage.
++
+ const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+   id: 'n1',
+   type: 'image',
+@@ -167,12 +174,10 @@ beforeEach(() => {
+ })
+ 
+ /** 读当前 pendingFocus 并断言它是 generation-result 请求,返回其成员集。 */
+-
+ /** 本批 commit 产物节点集:调用前节点之外新增的「image 结果 ∪ failed 失败槽」。
+  *  注意不能用全量 nodes diff——syncDerivationEdgeNodes 会把衍生边物化成
+  *  derivation-edge 节点进 nodes 数组,那些不是焦点成员。 */
+ 
+-// Tests -----------------------------------------------------------------------
+ describe('contract: generation action signatures', () => {
+   it('generateImageEdit returns a Promise<string[]> (resolves to string[] on success)', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+@@ -257,6 +262,7 @@ describe('contract: generation action signatures', () => {
+   })
+ 
+ })
++
+ describe('contract: generateImageEdit orchestration (mock network)', () => {
+   it('success: task transitions running→done, result committed, derivation edge created', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+@@ -367,6 +373,7 @@ describe('contract: generateImageEdit orchestration (mock network)', () => {
+     expect(useCanvasStore.getState().canvases['character-flow']!.tasks).toEqual([])
+   })
+ })
++
+ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () => {
+   it('generateBesideNode: success marks the task done and commits a result node', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+@@ -522,6 +529,7 @@ describe('contract: generateBesideNode / generateIntoAiSlot orchestration', () =
+     expect(finalState.historyFuture).toHaveLength(1)
+   })
+ })
++
+ describe('contract: task state machine (generation actions)', () => {
+   // The CanvasTask status union is 'running' | 'queued' | 'failed' | 'done' | 'canceled'.
+   // The 3 real generation actions create a 'running' task directly (no 'queued' is ever produced
+diff --git a/src/store/generation.focus.contract.test.ts b/src/store/generation.focus.contract.test.ts
+index 6f49626e..f1554e00 100644
+--- a/src/store/generation.focus.contract.test.ts
++++ b/src/store/generation.focus.contract.test.ts
+@@ -99,12 +99,6 @@ const doneView = (images = [committedImage()]) => ({
+   result: { images },
+ })
+ 
+-// P2-C2: partial-view payload for variations (some success + some failure). The
+-// success subset travels in result.images (with variationIndex); the failed
+-// subset in failures[] (with variationIndex + desensitized error). partial does
+-// NOT reject — the action resolves the success subset. Images accept blob OR b64
+-// (committedImage() carries blob; runtime carries b64) — commitGenerationResult
+-// handles both via blobFromCommittedGenerationImage.
+ const partialView = (
+   images: Array<{ b64?: string; blob?: Blob; variationIndex?: number }>,
+   failures: Array<{ variationIndex: number; error: string }>,
+@@ -133,6 +127,7 @@ const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => (
+   ...overrides,
+ })
+ 
++
+ const baseState = useCanvasStore.getState()
+ 
+ const seed = (overrides: Record<string, unknown> = {}) =>
+@@ -185,6 +180,7 @@ const batchNodeIds = (beforeIds: Set<string>): string[] =>
+     .map((node) => node.id)
+ 
+ // Tests -----------------------------------------------------------------------
++
+ describe('contract: variations / annotation (P2-C2 de-mocked → async tasks API)', () => {
+   it('generateVariations resolves with result nodeIds + commits derivation edges + done task', async () => {
+     seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
+diff --git a/src/store/generationBatchContract.test.ts b/src/store/generationBatchContract.test.ts
+new file mode 100644
+index 00000000..a3ff067a
+--- /dev/null
++++ b/src/store/generationBatchContract.test.ts
+@@ -0,0 +1,356 @@
++// P1b 批次行为契约测试(新文件,不追加进逼近阈值的 generation.contract.test.ts)。
++//
++// 覆盖:
++//   - generateVariations 批次化: N=2/3/4 预建 N 占位逐 ordinal 原位替换 + partial(2 成功 1 失败)
++//   - 单张 expectedCount=1 边缘对齐:批次路径产出与 centeredColumnPlacements({count:1})
++//     返回值逐字段相等(非只数值相等——数值可能巧合,逐字段相等才证明同一套几何)
++//   - generateIntoAiSlot 批次模式:按 ordinal 绑定(与 slotId 冲突抛错)
++//   - 三态互斥:legacy 携带批次字段 / batch-owner 携带成员凭证 → 抛错(F2)
++import { describe, expect, it, vi, beforeEach } from 'vitest'
++import { assertPlacementIntent } from './derivedBatchCoordinator'
++
++// Hermetic setup(与 generation.contract.test.ts 同构)。
++vi.mock('../lib/demoImages', () => ({ createDemoImage: () => 'data:image/png;base64,mock-demo-image' }))
++vi.mock('../lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async (_blob: Blob, name: string, type: string) => ({
++    assetUrl: 'mivo-asset://mock-asset',
++    name,
++    type,
++    sizeBytes: 1234,
++    hasTransparency: false,
++    size: '300x200',
++    sourceDimensions: { width: 300, height: 200 },
++  })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('./remoteDebugReporter', () => ({ reportRemoteDebugEntry: () => {} }))
++
++const mocks = vi.hoisted(() => ({
++  submitEditTask: vi.fn(),
++  submitGenerationTask: vi.fn(),
++  submitVariationsTask: vi.fn(),
++  pollTask: vi.fn(),
++  cancelTask: vi.fn(),
++  assetBlobForNode: vi.fn(),
++}))
++
++vi.mock('../lib/mivoTaskClient', () => ({
++  submitEditTask: mocks.submitEditTask,
++  submitGenerationTask: mocks.submitGenerationTask,
++  submitVariationsTask: mocks.submitVariationsTask,
++  pollTask: mocks.pollTask,
++  cancelTask: mocks.cancelTask,
++  taskPollIntervalMs: () => 0,
++  kindForFailedTask: (error: string) => /\btimeout\b|超时/i.test(error) ? 'upstream-timeout' : 'upstream-error',
++}))
++
++vi.mock('../lib/mivoImageClient', () => ({
++  assetBlobForNode: mocks.assetBlobForNode,
++  MivoImageRequestError: class MivoImageRequestError extends Error {
++    kind: string
++    constructor(message: string, kind: string) {
++      super(message)
++      this.name = 'MivoImageRequestError'
++      this.kind = kind
++    }
++  },
++}))
++
++import { useCanvasStore } from './canvasStore'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++import { AI_SLOT_GAP, centeredColumnPlacements } from './aiCanvasWorkflow'
++
++function committedImage() {
++  return {
++    blob: new Blob(['mock-image-bytes'], { type: 'image/png' }),
++    title: 'img',
++    width: 300,
++    height: 200,
++    variationIndex: 0,
++  }
++}
++
++const doneView = (images = [committedImage()]) => ({
++  id: 't1',
++  kind: 'variations' as const,
++  status: 'done' as const,
++  progress: 100,
++  stage: 'done',
++  requestId: 'req-1',
++  model: 'gpt-image-2',
++  result: { images },
++})
++
++const partialView = (
++  images: Array<{ blob?: Blob; variationIndex?: number }>,
++  failures: Array<{ variationIndex: number; error: string }>,
++) => ({
++  id: 't1',
++  kind: 'variations' as const,
++  status: 'partial' as const,
++  progress: 100,
++  stage: 'done',
++  requestId: 'req-1',
++  model: 'gpt-image-2',
++  result: { images },
++  failures,
++})
++
++
++
++const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++  id: 'n1',
++  type: 'image',
++  title: 'Image',
++  x: 10,
++  y: 20,
++  width: 300,
++  height: 200,
++  status: 'ready',
++  assetUrl: '/a.png',
++  ...overrides,
++})
++
++const baseState = useCanvasStore.getState()
++
++const seed = (overrides: Record<string, unknown> = {}) =>
++  useCanvasStore.setState({ ...baseState, ...overrides } as never, true)
++
++const seedCanvas = (sceneId: string, nodes: MivoCanvasNode[]) => {
++  const document = { title: sceneId, nodes, edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
++  return {
++    canvases: { [sceneId]: document },
++    sceneId,
++    nodes,
++    edges: [],
++    tasks: [],
++    selectedNodeId: undefined,
++    selectedNodeIds: [],
++  }
++}
++
++// 双画布:活跃画布(顶层镜像真相)与目标非活跃画布分开,验证 canonical 与镜像互不污染。
++
++const {
++  submitVariationsTask: mockSubmitVariationsTask,
++  pollTask: mockPollTask,
++  assetBlobForNode: mockAssetBlobForNode,
++} = mocks
++
++beforeEach(() => {
++  useCanvasStore.setState({ ...baseState } as never, true)
++  mockSubmitVariationsTask.mockReset().mockResolvedValue({ taskId: 't1', batchId: 'b1', count: 4 })
++  mockPollTask.mockReset().mockResolvedValue(doneView())
++  mockAssetBlobForNode.mockReset().mockResolvedValue(new Blob(['mock-source-bytes'], { type: 'image/png' }))
++})
++
++
++describe('contract: variations prebuilds column and keeps ordinals', () => {
++  it.each([2, 3, 4])(
++    'variations_prebuilds_column_and_keeps_ordinals: N=%i 预建 N 占位,成功原位替换,与 centeredColumnPlacements 逐字段相等',
++    async (count) => {
++      seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++      mockPollTask.mockResolvedValueOnce(
++        doneView(
++          Array.from({ length: count }, (_, i) => ({ ...committedImage(), variationIndex: i })),
++        ),
++      )
++      const nodeIds = await useCanvasStore.getState().generateVariations(
++        'n1',
++        Array.from({ length: count }, (_, i) => ({ prompt: `p${i}` })),
++        { placement: 'batch', expectedCount: count },
++      )
++      expect(nodeIds).toHaveLength(count)
++      const s = useCanvasStore.getState()
++      const source = s.nodes.find((n) => n.id === 'n1')!
++      // 预建 slot 全部可见(与源图同列:左缘 x = source.x + source.width + gap,
++      // N≥2 整列垂直居中 y 由几何函数决定),完成后逐 ordinal 原位替换 →
++      // 结果节点位置与 centeredColumnPlacements 返回的占位几何逐字段相等。
++      const expected = centeredColumnPlacements({
++        anchor: source,
++        count,
++        gap: AI_SLOT_GAP,
++        widths: Array.from({ length: count }, () => Math.round(source.width)),
++      })
++      const results = nodeIds.map((id) => s.nodes.find((n) => n.id === id)!)
++      results.forEach((node, index) => {
++        expect(node.x).toBe(Math.round(expected[index].x))
++        expect(node.y).toBe(Math.round(expected[index].y))
++        expect(node.width).toBe(Math.round(expected[index].width))
++        expect(node.height).toBe(Math.round(expected[index].height))
++        // 批次身份凭证随结果持久化。
++        expect(node.aiWorkflow?.batchId).toBeTruthy()
++        expect(node.aiWorkflow?.ordinal).toBe(index)
++      })
++    },
++  )
++
++  it('variations_prebuilds_column_and_keeps_ordinals: partial(2 成功 1 失败)失败槽留原 ordinal 转 failed', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(
++      partialView(
++        [{ ...committedImage(), variationIndex: 0 }, { ...committedImage(), variationIndex: 1 }],
++        [{ variationIndex: 2, error: 'Upstream error (500)' }],
++      ),
++    )
++    const nodeIds = await useCanvasStore.getState().generateVariations(
++      'n1',
++      [{ prompt: 'p0' }, { prompt: 'p1' }, { prompt: 'p2' }],
++      { placement: 'batch', expectedCount: 3 },
++    )
++    expect(nodeIds).toHaveLength(2)
++    const s = useCanvasStore.getState()
++    const failedSlot = s.nodes.find((n) => n.type === 'ai-slot' && n.status === 'failed')
++    expect(failedSlot).toBeDefined()
++    expect(failedSlot?.aiWorkflow?.ordinal).toBe(2)
++    // 不删除、不压缩列:失败槽仍在原 ordinal 列位(整列垂直居中的第 3 个槽位)。
++    const source = s.nodes.find((n) => n.id === 'n1')!
++    const expected = centeredColumnPlacements({
++      anchor: source,
++      count: 3,
++      gap: AI_SLOT_GAP,
++      widths: [Math.round(source.width), Math.round(source.width), Math.round(source.width)],
++    })
++    expect(failedSlot?.x).toBe(Math.round(expected[2].x))
++    expect(failedSlot?.y).toBe(Math.round(expected[2].y))
++  })
++})
++
++describe('contract: single count batch aligns to source edges', () => {
++  it('single_count_batch_aligns_to_source_edges: expectedCount=1 占位与 centeredColumnPlacements({count:1}) 逐字段相等(同一套几何)', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1', height: 201 })]))
++    const s0 = useCanvasStore.getState()
++    const source0 = s0.nodes.find((n) => n.id === 'n1')!
++    const expectedPlacement = centeredColumnPlacements({
++      anchor: source0,
++      count: 1,
++      gap: AI_SLOT_GAP,
++      widths: [Math.round(source0.width)],
++    })[0]
++    // 占位阶段断言:首次 poll 时(网络提交前)预建占位仍在,其 width 必须与
++    // centeredColumnPlacements({count:1}) 返回值逐字段一致——占位阶段 width
++    // 走该函数(widths 传入 Math.round(source.width)),与替换后的 heightLocked
++    // 口径语义不同,但占位阶段必须被绑定。
++    mockPollTask.mockImplementationOnce(async () => {
++      const placeholder = useCanvasStore
++        .getState()
++        .nodes.find((n) => n.type === 'ai-slot' && n.aiWorkflow?.ordinal === 0)
++      expect(placeholder).toBeDefined()
++      expect(placeholder?.width).toBe(Math.round(expectedPlacement.width))
++      expect(placeholder?.height).toBe(Math.round(expectedPlacement.height))
++      expect(placeholder?.x).toBe(Math.round(expectedPlacement.x))
++      expect(placeholder?.y).toBe(Math.round(expectedPlacement.y))
++      return doneView([{ ...committedImage(), variationIndex: 0 }])
++    })
++    const nodeIds = await useCanvasStore.getState().generateVariations(
++      'n1',
++      [{ prompt: 'p0' }],
++      { placement: 'batch', expectedCount: 1 },
++    )
++    expect(nodeIds).toHaveLength(1)
++    const s = useCanvasStore.getState()
++    const source = s.nodes.find((n) => n.id === 'n1')!
++    // 结果替换占位:位置继承占位(x/y/height 不变),width 按结果图真实比例换算
++    // (heightLockedSizeForDimensions:anchorHeight × w/h)——替换后 width 与
++    // 占位 width 本就不同,不得硬比 expectedPlacement.width。
++    const result = s.nodes.find((n) => n.id === nodeIds[0])!
++    expect(result.x).toBe(source.x + source.width + AI_SLOT_GAP)
++    expect(result.y).toBe(Math.round(source.y))
++    expect(result.height).toBe(Math.round(source.height))
++    expect(result.width).toBe(
++      Math.round((Math.round(source.height) * 300) / 200),
++    )
++  })
++})
++
++describe('contract: into slot binds by ordinal in batch mode', () => {
++  it('into_slot_binds_by_ordinal_in_batch_mode: 批次模式按 ordinal 绑定预建槽,结果原位替换该槽', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(doneView([{ ...committedImage(), variationIndex: 0 }]))
++    // 先预建一个 expectedCount=1 的批次,拿到 slotId。
++    const slotIds = await useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'b-intoslot',
++      expectedCount: 1,
++    })
++    const slotId = slotIds[0]
++    // 批次成员:传三元组 → 按 ordinal 绑定该预建槽(而非自行按 slotId 查找)。
++    mockPollTask.mockReset()
++    mockPollTask.mockResolvedValueOnce(doneView([committedImage()]))
++    const nodeIds = await useCanvasStore.getState().generateIntoAiSlot(slotId, 'fill', {
++      derivedBatchId: 'b-intoslot',
++      expectedCount: 1,
++      ordinal: 0,
++    })
++    expect(nodeIds).toContain(slotId)
++    const replaced = useCanvasStore.getState().nodes.find((n) => n.id === slotId)!
++    expect(replaced.type).toBe('image')
++    expect(replaced.aiWorkflow?.status).toBe('ready')
++  })
++
++  it('into_slot_binds_by_ordinal_in_batch_mode: slotId 与 ordinal 绑定结果冲突 → 抛错(不静默以 slotId 为准)', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    // 预建 2 个 slot:ordinal 0 与 ordinal 1。
++    const slotIds = await useCanvasStore.getState().startDerivedImageBatch({
++      sceneId: 'character-flow',
++      sourceNodeId: 'n1',
++      batchId: 'b-conflict',
++      expectedCount: 2,
++    })
++    // 传 slotId=slotIds[0] 但 ordinal=1 → 绑定到 slotIds[1],与传入 slotId 冲突 → 抛错。
++    await expect(
++      useCanvasStore.getState().generateIntoAiSlot(slotIds[0], 'fill', {
++        derivedBatchId: 'b-conflict',
++        expectedCount: 2,
++        ordinal: 1,
++      }),
++    ).rejects.toThrow(/冲突/)
++  })
++})
++
++describe('contract: placement intent is three-state mutually exclusive (F2)', () => {
++  it('legacy_carries_no_batch_fields: placement=legacy 不带任何批次字段 → 通过并返回 legacy', () => {
++    expect(assertPlacementIntent({ placement: 'legacy' })).toBe('legacy')
++  })
++
++  it('legacy_with_batch_fields_throws: placement=legacy 携带 derivedBatchId → 抛错(不静默忽略)', () => {
++    expect(() => assertPlacementIntent({ placement: 'legacy', derivedBatchId: 'b1', expectedCount: 1, ordinal: 0 })).toThrow(
++      /互斥冲突/,
++    )
++  })
++
++  it('legacy_with_expectedCount_only_throws: placement=legacy 携带 expectedCount → 抛错', () => {
++    expect(() => assertPlacementIntent({ placement: 'legacy', expectedCount: 1 })).toThrow(/互斥冲突/)
++  })
++
++  it('owner_with_member_credentials_throws: placement=batch 携带 ordinal → 抛错(成员凭证属批次成员)', () => {
++    expect(() => assertPlacementIntent({ placement: 'batch', expectedCount: 1, ordinal: 0 })).toThrow(/互斥冲突/)
++  })
++
++  it('owner_with_derivedBatchId_throws: placement=batch 携带 derivedBatchId → 抛错', () => {
++    expect(() => assertPlacementIntent({ placement: 'batch', expectedCount: 2, derivedBatchId: 'b1' })).toThrow(/互斥冲突/)
++  })
++
++  it('owner_valid: placement=batch + 仅 expectedCount → 通过并返回 batch-owner', () => {
++    expect(assertPlacementIntent({ placement: 'batch', expectedCount: 1 })).toBe('batch-owner')
++  })
++
++  it('member_valid: 完整三元组(无 placement)→ 通过并返回 batch-member', () => {
++    expect(assertPlacementIntent({ derivedBatchId: 'b1', expectedCount: 2, ordinal: 1 })).toBe('batch-member')
++  })
++
++  // G1(修复轮2):β1 语义修正——全缺→legacy 静默(β1 兼容态),部分缺(1-2 字段)
++  // → fail-closed 抛错(与 α 基线 generationSlice 一致)。此前的「部分缺也 legacy」
++  // 是锁错误行为,已在修复轮2 修正。
++  it('β1 全缺 → legacy 静默(调用点未接线时旧行为)', () => {
++    expect(assertPlacementIntent({})).toBe('legacy')
++  })
++
++  it('β1 部分缺失 → 抛错: 只带 derivedBatchId/expectedCount 任一 → fail-closed', () => {
++    expect(() => assertPlacementIntent({ derivedBatchId: 'b1', expectedCount: 2 })).toThrow(/部分缺失/)
++    expect(() => assertPlacementIntent({ expectedCount: 2 })).toThrow(/部分缺失/)
++    expect(() => assertPlacementIntent({ ordinal: 0 })).toThrow(/部分缺失/)
++  })
++})
+diff --git a/src/store/generationSlice.ts b/src/store/generationSlice.ts
+index 2e89cfe4..be93bb24 100644
+--- a/src/store/generationSlice.ts
++++ b/src/store/generationSlice.ts
+@@ -15,7 +15,15 @@ import { errorCanvas, logCanvas, warnCanvas } from './canvasStoreLog'
+ import { useCameraFocusStore } from './cameraFocusStore'
+ import { createEdgeId, createNodeId, edgeTypeForOperation } from './nodeFactory'
+ import { t } from '../i18n'
+-import { bindBatchOrdinal, settleBatchSlotState, startDerivedImageBatchImpl } from './derivedBatchCoordinator'
++import {
++  assertPlacementIntent,
++  bindBatchOrdinal,
++  commitVariationsBatch,
++  resolveBatchBinding,
++  settleBatchCatch,
++  settleBatchSlotsTerminal,
++  startDerivedImageBatchImpl,
++} from './derivedBatchCoordinator'
+ import { debugLogger } from './debugLogStore'
+ import {
+   defaultDocument,
+@@ -77,7 +85,7 @@ const createFailedVariationSlot = (
+   return { node, edge }
+ }
+ 
+-// 任务轮询/终态构造/幂等键/取消判定已抽取至 ./generationTaskHelpers.ts(纯重构)。
++// 任务轮询/记录 helper 已抽取;批次协调在 derivedBatchCoordinator.ts,本文件只留 action 编排。
+ 
+ export const createGenerationSlice: SliceCreator = (set, get) => ({
+   tasks: defaultDocument.tasks,
+@@ -114,6 +122,38 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+       nodeIds: [],
+     }
+ 
++    // P1b:变体批次化——默认批次发起方(placement:'batch',expectedCount=count),
++    // 调用方显式 legacy 时保留旧行为。批次模式下预建 N 个占位,逐变体按 ordinal
++    // 原位替换;失败变体留在原 ordinal 槽位转 failed 终态(不删除、不压缩列)。
++    const intent = assertPlacementIntent(options)
++    if (intent === 'batch-owner' && options.expectedCount !== undefined && options.expectedCount !== count) {
++      throw new Error(`变体批次 expectedCount(${options.expectedCount})与变体数(${count})不一致`)
++    }
++    let batchId: string | undefined
++    let batchSlotIds: string[] | undefined
++    if (intent === 'batch-owner') {
++      batchId = createNodeId('batch-var')
++      batchSlotIds = startDerivedImageBatchImpl(set, get, {
++        sceneId: targetSceneId,
++        sourceNodeId: source.id,
++        batchId,
++        expectedCount: count,
++      })
++    } else if (intent === 'batch-member') {
++      if (options.expectedCount !== count) {
++        throw new Error(`变体批次 expectedCount(${options.expectedCount})与变体数(${count})不一致`)
++      }
++      batchId = options.derivedBatchId
++      batchSlotIds = Array.from({ length: count }, (_, ordinal) => {
++        const slot = bindBatchOrdinal(document, {
++          derivedBatchId: batchId,
++          expectedCount: count,
++          ordinal,
++        })
++        return slot!.id
++      })
++    }
++
+     set((current) => {
+       const doc = current.canvases[targetSceneId]
+       if (!doc) return {}
+@@ -141,11 +181,34 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+         localTask: runningTask,
+         sceneId: targetSceneId,
+         onResult: async ({ images, failures }) => {
+-          // Commit the success subset via the canonical path (asset save +
+-          // derivation edges). Empty images (all-fail) → runTaskPollLoop wouldn't
+-          // reach here (status='failed' throws), but guard anyway. Pass images
+-          // as-is: runtime images are {b64}, test mocks may carry {blob} — both
+-          // are handled by blobFromCommittedGenerationImage inside commit.
++          // 批次模式:逐 ordinal 原位替换预建 slot(成功)或原位转 failed(失败),失败槽不删不压(实现体在 derivedBatchCoordinator)。
++          if (batchSlotIds && batchId) {
++            const successIds = await commitVariationsBatch(set, get, {
++              sceneId: targetSceneId,
++              sourceNodeId: source.id,
++              batchId,
++              slotIds: batchSlotIds,
++              count,
++              images,
++              failures,
++              prompt: basePrompt,
++              model,
++              taskId,
++            })
++            // p0-sc2:批次变体同样要结果焦点——成员集 = successIds ∪ 失败槽 id,与 legacy 同一语义;分区违规时 commitVariationsBatch 抛错、onResult 不达。
++            const failedSlotIds = batchSlotIds.filter((slotId) => !successIds.includes(slotId))
++            const resultFocusMembers = [...successIds, ...failedSlotIds]
++            if (resultFocusMembers.length > 0) {
++              useCameraFocusStore.getState().requestGenerationResultFocus(resultFocusMembers, {
++                triggerNodeId: resultFocusMembers[0],
++                targetSceneId,
++                activeSceneId: get().sceneId,
++                source: 'generation-result',
++              })
++            }
++            return successIds
++          }
++          // legacy 模式:原行为(整体 commit + 失败槽位网格)。
+           const successIds =
+             images.length > 0
+               ? await get().commitGenerationResult({
+@@ -214,19 +277,45 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+       const message = error instanceof LocalizedKeyError
+         ? t(error.message, error.params)
+         : error instanceof Error ? error.message : 'Variations failed'
+-      set((current) => {
+-        const doc = current.canvases[targetSceneId]
+-        if (!doc) return {}
+-        const liveTask = doc.tasks.find((t) => t.id === runningTask.id) ?? runningTask
+-        return patchCanvasDocument(current, targetSceneId, {
+-          tasks: upsertTask(
+-            doc.tasks,
+-            canceled
+-              ? canceledTask(liveTask, `变体生成已取消：${source.title}`)
+-              : failedTask(liveTask, `变体生成失败：${message}`),
+-          ),
++      const terminalLabel = canceled ? `变体生成已取消：${source.title}` : `变体生成失败：${message}`
++      if (batchSlotIds && batchId) {
++        // M1:whole-request 终态——所有预建 slot 原位转终态 + 任务收敛,单一 canonical transition(先 settle 全部 slot 再派生态任务更新)。
++        getSceneWrap()(targetSceneId, () => set((current) => {
++          const settled = settleBatchSlotsTerminal(current, targetSceneId, {
++            batchId,
++            slotIds: batchSlotIds,
++            status: canceled ? 'canceled' : 'failed',
++          })
++          const settledDoc = settled.canvases?.[targetSceneId]
++          if (!settledDoc) return settled
++          const liveTask = settledDoc.tasks.find((t) => t.id === runningTask.id) ?? runningTask
++          const nextTasks = upsertTask(
++            settledDoc.tasks,
++            canceled ? canceledTask(liveTask, terminalLabel) : failedTask(liveTask, terminalLabel),
++          )
++          return {
++            ...settled,
++            // 顶层 tasks 镜像只随活跃画布更新;非活跃画布只写 canonical。
++            ...(targetSceneId === current.sceneId ? { tasks: nextTasks } : {}),
++            canvases: {
++              ...settled.canvases,
++              [targetSceneId]: { ...settledDoc, tasks: nextTasks },
++            },
++          }
++        }))
++      } else {
++        set((current) => {
++          const doc = current.canvases[targetSceneId]
++          if (!doc) return {}
++          const liveTask = doc.tasks.find((t) => t.id === runningTask.id) ?? runningTask
++          return patchCanvasDocument(current, targetSceneId, {
++            tasks: upsertTask(
++              doc.tasks,
++              canceled ? canceledTask(liveTask, terminalLabel) : failedTask(liveTask, terminalLabel),
++            ),
++          })
+         })
+-      })
++      }
+       throw error
+     }
+   },
+@@ -254,14 +343,15 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+     if (sourceNodeId && !source) throw new LocalizedKeyError('chat.commit.sourceDeleted')
+     if (!source) return []
+ 
+-    // #297 批次三元组:要么齐全、要么全缺(单次 count=1);部分缺失 fail-closed。
+-    // 校验/绑定/缺员报错统一走 bindBatchOrdinal(与 generateBesideNode 同一契约)。
+-    const batchTriplet = {
+-      derivedBatchId: options.derivedBatchId,
+-      expectedCount: options.expectedCount,
+-      ordinal: options.ordinal,
+-    }
+-    const batchSlot = bindBatchOrdinal(document, batchTriplet)
++    // P1b 排布意图 fail-closed:完整三元组(批次成员)/ placement:'batch'/'legacy';部分缺失或全缺抛错。
++    const intent = assertPlacementIntent(options)
++    const batchBinding = resolveBatchBinding(intent, document, options, set, get, {
++      sceneId: targetSceneId,
++      sourceNodeId: source.id,
++      batchPrefix: 'batch-edit',
++    })
++    const batchSlot = batchBinding.slot
++    const batchId = batchBinding.batchId
+ 
+     const resultPrompt = prompt.trim() || operationLabel
+     const model = options.model || defaultMivoImageModel
+@@ -318,7 +408,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+           // p1-sc1:改图结果居中——commit 落地后对返回的结果节点 id 集发出显式
+           // 成员集结果焦点请求(通常 1 个;N=1 是集合的退化情形)。agentEditImage、
+           // AnchorOverlay area-edit、画布命令三类入口全部经本函数,slice 层一处
+-          // 接线即全覆盖。成员集来源是 commit 返回值,不用 beforeIds diff 撞值。
++          // 接线即全覆盖。批次模式同样生效:成员集来源是 commit 返回值,不用 beforeIds diff 撞值。
+           if (nodeIds.length > 0) {
+             useCameraFocusStore.getState().requestGenerationResultFocus(nodeIds, {
+               triggerNodeId: nodeIds[0],
+@@ -331,7 +421,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+         },
+       })
+       if (batchSlot) {
+-        debugLogger.log('Derived Batch', `ordinal ${batchTriplet.ordinal} 成功替换 slot ${batchSlot.id}`)
++        debugLogger.log('Derived Batch', `ordinal ${options.ordinal ?? 0} 成功替换 slot ${batchSlot.id}`)
+       }
+       set((current) => {
+         const targetDocument = current.canvases[targetSceneId]
+@@ -353,45 +443,25 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+         // SC4:批次模式 catch 把对应 ordinal slot 转 failed/canceled 终态
+         // (不删除、不压缩列),清 progress/stage/startedAt;任务状态照旧。
+         // SC13:源图被删(sourceDeletedSaved)时同批其它仍 generating 的 slot
+-        // 一并原位转 failed(已完成结果保留)。
++        // 一并原位转 failed(已完成结果保留)。收敛实现体在 derivedBatchCoordinator。
+         const isUserDeletedSlot =
+           error instanceof LocalizedKeyError &&
+           (error.message === 'chat.commit.slotDeleted' || error.message === 'chat.commit.slotDeletedSaved')
+-        // SC13:源图被删(await 前 sourceDeleted 或资产落盘后 sourceDeletedSaved)
+-        // 时同批其它仍 generating 的 slot 一并原位转 failed(已完成结果保留)。
+         const settleWholeBatch =
+           error instanceof LocalizedKeyError &&
+           (error.message === 'chat.commit.sourceDeleted' || error.message === 'chat.commit.sourceDeletedSaved')
+-        if (isUserDeletedSlot) {
+-          // SC3:用户已删 skip——用户删掉了批次 slot,收敛跳过(不重建、不删同批)。
+-          debugLogger.warn('Derived Batch', `用户已删除 slot ${batchSlot.id},批次收敛跳过(batchId=${batchTriplet.derivedBatchId})`)
+-        }
+-        getSceneWrap()(targetSceneId, () => set((current) => {
+-          const patch = settleBatchSlotState(current, targetSceneId, {
+-            slotId: batchSlot.id,
+-            batchId: batchTriplet.derivedBatchId as string,
+-            status: canceled ? 'canceled' : 'failed',
+-            settleWholeBatch,
+-          })
+-          const targetDocument = current.canvases[targetSceneId]
+-          if (!targetDocument) return patch
+-          const liveTask = targetDocument.tasks.find((t) => t.id === runningTask.id) ?? runningTask
+-          return {
+-            ...patch,
+-            ...patchCanvasDocument(current, targetSceneId, {
+-              tasks: upsertTask(
+-                targetDocument.tasks,
+-                canceled
+-                  ? canceledTask(liveTask, `${operationLabel} canceled`)
+-                  : failedTask(liveTask, `${operationLabel}: ${message}`),
+-              ),
+-            }),
+-          }
+-        }))
+-        debugLogger.warn(
+-          'Derived Batch',
+-          `ordinal ${batchTriplet.ordinal} ${canceled ? '取消' : '失败'}${settleWholeBatch ? '(源图已删,同批收敛)' : ''},slot ${batchSlot.id} 原位转终态`,
+-        )
++        settleBatchCatch(set, {
++          sceneId: targetSceneId,
++          slotId: batchSlot.id,
++          batchId: batchId as string,
++          canceled,
++          settleWholeBatch,
++          isUserDeletedSlot,
++          runningTask,
++          canceledLabel: `${operationLabel} canceled`,
++          failedLabel: `${operationLabel}: ${message}`,
++          ordinalLabel: String(options.ordinal ?? 0),
++        })
+       } else {
+         set((current) => {
+           const targetDocument = current.canvases[targetSceneId]
+@@ -424,14 +494,15 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+     if (sourceNodeId && !source) throw new LocalizedKeyError('chat.commit.sourceDeleted')
+     if (!source) return []
+ 
+-    // #297 批次三元组(runtime-only):与 generateImageEdit 同一套 fail-closed 契约。
+-    // 校验/绑定/缺员报错统一走 bindBatchOrdinal。
+-    const batchTriplet = {
+-      derivedBatchId: options.derivedBatchId,
+-      expectedCount: options.expectedCount,
+-      ordinal: options.ordinal,
+-    }
+-    const batchSlot = bindBatchOrdinal(document, batchTriplet)
++    // P1b 排布意图 fail-closed(与 generateImageEdit 同一契约):完整三元组/'batch'/'legacy';部分缺失或全缺抛错。
++    const intent = assertPlacementIntent(options)
++    const batchBinding = resolveBatchBinding(intent, document, options, set, get, {
++      sceneId: targetSceneId,
++      sourceNodeId: source.id,
++      batchPrefix: 'batch-beside',
++    })
++    const batchSlot = batchBinding.slot
++    const batchId = batchBinding.batchId
+ 
+     const resultPrompt = prompt?.trim() || nodePrompt(source)
+     const model = options.model || defaultMivoImageModel
+@@ -521,7 +592,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+         },
+       })
+       if (batchSlot) {
+-        debugLogger.log('Derived Batch', `ordinal ${batchTriplet.ordinal} 成功替换 slot ${batchSlot.id}`)
++        debugLogger.log('Derived Batch', `ordinal ${options.ordinal ?? 0} 成功替换 slot ${batchSlot.id}`)
+       }
+       set((current) => {
+         const targetDocument = current.canvases[targetSceneId]
+@@ -546,35 +617,18 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+         const settleWholeBatch =
+           error instanceof LocalizedKeyError &&
+           (error.message === 'chat.commit.sourceDeleted' || error.message === 'chat.commit.sourceDeletedSaved')
+-        if (isUserDeletedSlot) {
+-          debugLogger.warn('Derived Batch', `用户已删除 slot ${batchSlot.id},批次收敛跳过(batchId=${batchTriplet.derivedBatchId})`)
+-        }
+-        getSceneWrap()(targetSceneId, () => set((current) => {
+-          const patch = settleBatchSlotState(current, targetSceneId, {
+-            slotId: batchSlot.id,
+-            batchId: batchTriplet.derivedBatchId as string,
+-            status: canceled ? 'canceled' : 'failed',
+-            settleWholeBatch,
+-          })
+-          const targetDocument = current.canvases[targetSceneId]
+-          if (!targetDocument) return patch
+-          const liveTask = targetDocument.tasks.find((t) => t.id === runningTask.id) ?? runningTask
+-          return {
+-            ...patch,
+-            ...patchCanvasDocument(current, targetSceneId, {
+-              tasks: upsertTask(
+-                targetDocument.tasks,
+-                canceled
+-                  ? canceledTask(liveTask, `旁边生成已取消：${source.title}`)
+-                  : failedTask(liveTask, `旁边生成失败：${message}`),
+-              ),
+-            }),
+-          }
+-        }))
+-        debugLogger.warn(
+-          'Derived Batch',
+-          `ordinal ${batchTriplet.ordinal} ${canceled ? '取消' : '失败'}${settleWholeBatch ? '(源图已删,同批收敛)' : ''},slot ${batchSlot.id} 原位转终态`,
+-        )
++        settleBatchCatch(set, {
++          sceneId: targetSceneId,
++          slotId: batchSlot.id,
++          batchId: batchId as string,
++          canceled,
++          settleWholeBatch,
++          isUserDeletedSlot,
++          runningTask,
++          canceledLabel: `旁边生成已取消：${source.title}`,
++          failedLabel: `旁边生成失败：${message}`,
++          ordinalLabel: String(options.ordinal ?? 0),
++        })
+       } else {
+         set((current) => {
+           const targetDocument = current.canvases[targetSceneId]
+@@ -606,12 +660,41 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+     if (slotId && !slot) throw new LocalizedKeyError('chat.commit.slotDeleted')
+     if (!slot) return []
+ 
+-    const resultPrompt = prompt?.trim() || nodePrompt(slot, '根据 AI 槽位生成图片')
++    // P1b 排布意图 fail-closed(与 edit/beside 同一契约):批次模式按 ordinal 绑定预建槽位,冲突抛错;legacy 保持「按 slotId 或 selectedNodeId 查找」逐字不变。
++    // 注:into-slot 无图像源,批次发起无对齐基准——调用方应走 generateBesideNode 或显式 legacy;槽位自带 batchId 时按该批次成员绑定。
++    const intent = assertPlacementIntent(options)
++    let batchSlot: MivoCanvasNode | undefined
++    if (intent === 'batch-owner' && !slot.aiWorkflow?.batchId) {
++      // into-slot 无图像源(锚点即槽位自身)可发起批次;fail-closed 拒绝,不静默降级。
++      throw new Error('generateIntoAiSlot 不支持批次发起:槽位无批次凭证且无图像源(请走 generateBesideNode 或显式 placement:legacy)')
++    }
++    if (intent !== 'legacy') {
++      const binding = resolveBatchBinding(
++        'batch-member',
++        document,
++        {
++          derivedBatchId: options.derivedBatchId ?? slot.aiWorkflow?.batchId,
++          expectedCount: options.expectedCount ?? slot.aiWorkflow?.expectedCount,
++          ordinal: options.ordinal ?? slot.aiWorkflow?.ordinal,
++        },
++        set,
++        get,
++        { sceneId: targetSceneId, sourceNodeId: slot.id, batchPrefix: 'batch-slot' },
++      )
++      batchSlot = binding.slot
++      if (!batchSlot) throw new Error('generateIntoAiSlot 批次模式绑定失败:按批次凭证找不到预建 slot')
++      if (slot.id !== batchSlot.id) {
++        throw new Error(`slotId(${slot.id})与批次 ordinal 绑定(${batchSlot.id})冲突,批次模式按 ordinal 绑定为准`)
++      }
++    }
++    const effectiveSlot = batchSlot ?? slot
++
++    const resultPrompt = prompt?.trim() || nodePrompt(effectiveSlot, '根据 AI 槽位生成图片')
+     const model = options.model || defaultMivoImageModel
+     const taskId = createNodeId('task-slot-generation')
+     const runningTask: CanvasTask = {
+       id: taskId,
+-      label: `生成到槽位：${slot.title}`,
++      label: `生成到槽位：${effectiveSlot.title}`,
+       status: 'running',
+       progress: 0,
+       nodeIds: [],
+@@ -622,8 +705,9 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+     // S01: 捕获生成开始时的 history 基线引用。失败回滚时仅当栈顶仍是该引用才 pop
+     // （snapshot 对象身份判据，不改 snapshot schema）。异步期间用户编辑/undo 过 →
+     // 栈顶已不是该基线 → 回滚返回 undefined → caller 走 filter-removal，保留编辑。
++    // 批次模式不捕获(预建时已 captureHistory 一次;失败走 settle 不删槽)。
+     let baselineSnapshot: MivoCanvasSnapshot | undefined
+-    if (!skipSlotHistoryBaseline && targetSceneId === state.sceneId) {
++    if (!batchSlot && !skipSlotHistoryBaseline && targetSceneId === state.sceneId) {
+       get().captureHistory()
+       baselineSnapshot = get().historyPast.at(-1)
+     }
+@@ -641,13 +725,13 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+       const targetDocument = current.canvases[targetSceneId]
+       if (!targetDocument) return {}
+       const nodes = targetDocument.nodes.map((node) =>
+-        node.id === slot.id
++        node.id === effectiveSlot.id
+           ? {
+               ...node,
+               generation: {
+                 prompt: resultPrompt,
+                 model,
+-                size: node.generation?.size || `${Math.round(slot.width)}x${Math.round(slot.height)}`,
++                size: node.generation?.size || `${Math.round(effectiveSlot.width)}x${Math.round(effectiveSlot.height)}`,
+                 seed: node.generation?.seed,
+                 strength: node.generation?.strength,
+                 taskId,
+@@ -704,8 +788,8 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+         onResult: async ({ images }) => {
+           const commitPayload = {
+             sceneId: targetSceneId,
+-            sourceNodeId: slot.id,
+-            replaceSlotId: slot.id,
++            sourceNodeId: effectiveSlot.id,
++            replaceSlotId: effectiveSlot.id,
+             resultImages: images,
+             prompt: resultPrompt,
+             model,
+@@ -724,7 +808,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+         const targetDocument = current.canvases[targetSceneId]
+         if (!targetDocument) return {}
+         const nodes = targetDocument.nodes.map((node) =>
+-          node.id === slot.id && node.aiWorkflow
++          node.id === effectiveSlot.id && node.aiWorkflow
+             ? {
+                 ...node,
+                 aiWorkflow: {
+@@ -736,7 +820,7 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+         )
+         return patchCanvasDocument(current, targetSceneId, {
+           nodes,
+-          tasks: upsertTask(targetDocument.tasks, doneTask(runningTask, `生成到槽位：${slot.title}`, nodeIds)),
++          tasks: upsertTask(targetDocument.tasks, doneTask(runningTask, `生成到槽位：${effectiveSlot.title}`, nodeIds)),
+         })
+       })
+       return nodeIds
+@@ -748,6 +832,22 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+       const message = error instanceof LocalizedKeyError
+         ? t(error.message, error.params)
+         : error instanceof Error ? error.message : 'Generation failed'
++      if (batchSlot) {
++        // P1b 批次模式:失败槽原位转 failed/canceled 终态(不删不压),复用 edit/beside 收敛语义。
++        settleBatchCatch(set, {
++          sceneId: targetSceneId,
++          slotId: batchSlot.id,
++          batchId: batchSlot.aiWorkflow?.batchId as string,
++          canceled,
++          settleWholeBatch: false,
++          isUserDeletedSlot: false,
++          runningTask,
++          canceledLabel: `生成到槽位已取消：${effectiveSlot.title}`,
++          failedLabel: `生成到槽位失败：${message}`,
++          ordinalLabel: String(options.ordinal ?? 0),
++        })
++        throw error
++      }
+       // T2.2 Block 1 F1:catch 内 slot 删除经注入的 scene-scoped sync → server 模式发 delete-node
+       // (slot.id + edges/tasks);未注入/local → pass-through 仍删(行为不退)。注入点在 generationFacade
+       // (无环层),不静态 import canvasSyncRuntime —— generationSlice 由 canvasStore 组合,静态引会成
+@@ -763,22 +863,22 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+           // 不动，保留用户编辑与 redo 栈。
+           const rollback = baselineSnapshot
+             ? rollbackLatestHistoryBaseline(current, targetSceneId, {
+-                removeNodeId: slot.id,
++                removeNodeId: effectiveSlot.id,
+                 expectedBaseline: baselineSnapshot,
+               })
+             : undefined
+           if (rollback) return rollback
+ 
+           return patchCanvasDocument(current, targetSceneId, {
+-            nodes: targetDocument.nodes.filter((node) => node.id !== slot.id),
+-            edges: (targetDocument.edges || []).filter((edge) => edge.from !== slot.id && edge.to !== slot.id),
++            nodes: targetDocument.nodes.filter((node) => node.id !== effectiveSlot.id),
++            edges: (targetDocument.edges || []).filter((edge) => edge.from !== effectiveSlot.id && edge.to !== effectiveSlot.id),
+             tasks: targetDocument.tasks.filter((task) => task.id !== runningTask.id),
+           })
+         })
+       // runSceneMutation hoist 在 generating set 前(本函数顶部),catch 复用同一 resolver(Block 1 F1 注入 onSceneMutation)。
+       runSceneMutation(targetSceneId, deleteSlot)
+       if (canceled) {
+-        warnCanvas(`生成到槽位已取消，已移除占位符：${slot.title}`)
++        warnCanvas(`生成到槽位已取消，已移除占位符：${effectiveSlot.title}`)
+       } else {
+         errorCanvas(`生成到槽位失败，已移除占位符：${message}`)
+       }

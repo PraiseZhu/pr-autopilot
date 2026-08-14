@@ -1,0 +1,4482 @@
+diff --git a/.github/workflows/nightly-e2e.yml b/.github/workflows/nightly-e2e.yml
+index 69603304..aa004f38 100644
+--- a/.github/workflows/nightly-e2e.yml
++++ b/.github/workflows/nightly-e2e.yml
+@@ -1,6 +1,9 @@
+ # Nightly full prod-topology e2e.
+ #
+ # - mock-upstream full sweep runs daily and can also be started manually
++# - e2e-prod-full 按 kernel 矩阵拆分(legacy/new × --renderer=both,每 child 74 格 =
++#   37 场景 × dom/leafer;fail-fast:false 保证两腿都跑完);aggregate job 下载两份
++#   artifact 合并校验 148 格(#561)。改前:单 job 无 kernel 矩阵(默认 dom×legacy)。
+ # - real-upstream placeholder job is wired for GitHub Secrets, but skips cleanly when
+ #   secrets are absent (default on this repo today)
+ # - failure notification uses GitHub Actions defaults (repository / user email)
+@@ -21,9 +24,17 @@ permissions:
+ 
+ jobs:
+   e2e-prod-full:
+-    name: e2e prod full (mock upstream)
++    name: e2e prod full (${{ matrix.kernel }})
+     runs-on: ubuntu-latest
+-    timeout-minutes: 20
++    # W6:F2 门限改回 20 —— issue #561 验收明写「两个 child 每次均 <20min」,草案不得
++    # 静默放宽验收门。若首夜实测接近 20min,提 timeout 需 owner 单独拍板。
++    timeout-minutes: 35
++    strategy:
++      fail-fast: false
++      matrix:
++        # kernel 名必须保持 legacy/new —— 与 e2e-runner.mjs 的 --kernel= 枚举一致;
++        # artifact 名与 job 名都带 matrix.kernel 后缀,两 child 互不冲突。
++        kernel: [legacy, new]
+     steps:
+       - name: Checkout
+         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+@@ -50,32 +61,155 @@ jobs:
+       # VITE_MIVO_PERSIST=local npm run build && ...),不再需要本 job 独立的
+       # "Build production bundle" 步骤——旧版两处各 build 一次,workflow 层那次的
+       # 产物会被这里立即覆盖,纯浪费一次 build。
+-      - name: Run full prod e2e
++      # #561:kernel 矩阵。——renderer=both 与 --kernel= 经 npm 的 -- 透传到
++      # e2e-runner.mjs(--topology=prod 由 test:e2e:prod:full script 本体携带,
++      # 等效显式);每 child 74 格(37 场景 × dom/leafer,leafer 下 canvas-interactions
++      # 按 leaferSkippedScenarios 显式 skip),两 child 合计 148 格。
++      - name: Run full prod e2e (kernel=${{ matrix.kernel }})
+         run: |
+-          set -o pipefail
++          set -euo pipefail
+           mkdir -p test-artifacts
+-          npm run test:e2e:prod:full 2>&1 | tee test-artifacts/nightly-e2e-prod-full.log
++          npm run test:e2e:prod:full -- --renderer=both --kernel=${{ matrix.kernel }} 2>&1 | tee test-artifacts/nightly-e2e-prod-full-${{ matrix.kernel }}.log
+ 
+       # #560:e2e-runner.mjs 自身已在上一步跑测试期间调用过一次台账校验(结果已写进
+       # job summary);这里独立补一步是为了覆盖"e2e-runner.mjs 从未启动"的 setup 阶段
+       # 失败——那种情况下 runId 从未生成,LATEST 指针缺失,需要一条明确诊断。always()
+-      # 保证正常成功与失败两类 run 都跑这步。
++      # 保证正常成功与失败两类 run 都跑这步。matrix child 各自 job 工作区隔离,
++      # --latest 读的是本 job 自己的 e2e-runs/LATEST,无跨 child 冲突。
+       - name: E2E ledger summary
+         if: always()
+         run: node scripts/e2e/ledger-summary.mjs --latest
+ 
++      # #561:ledger 独立 artifact 的「恰好一个 run 目录」不变量用**构造**保证,而非事后
++      # 检测——runId 是 runner 运行期生成的,workflow 静态写不出路径;这里先枚举目录并
++      # 断言数量,把「恰好一个」从信任声明升级为结构保证。不用 LATEST:LATEST 是单标量
++      # 覆盖写文件,依赖它就把结构保证降级成信任声明。fail-closed:数量 ≠1 即非零退出,
++      # 打印实际数量与目录名。
++      - name: Assert exactly one ledger run dir
++        if: always()
++        run: |
++          set -euo pipefail
++          runs_root="test-artifacts/e2e-runs"
++          if [ ! -d "$runs_root" ]; then
++            echo "::error::missing run root dir '$runs_root' (e2e-runner never started?)"
++            exit 1
++          fi
++          # 目录枚举用通配展开(runId 无换行/空格,glob 安全;不用 LATEST、不用 find 管道)。
++          run_dirs=()
++          for d in "$runs_root"/*/; do
++            [ -d "$d" ] && run_dirs+=("$d")
++          done
++          if [ "${#run_dirs[@]}" -ne 1 ]; then
++            echo "::error::expected exactly 1 run dir under '$runs_root', found ${#run_dirs[@]}: ${run_dirs[*]:-<none>}"
++            exit 1
++          fi
++          echo "LEDGER_RUN_DIR=${run_dirs[0]%/}" >> "$GITHUB_ENV"
++          echo "single run dir: ${run_dirs[0]}"
++
++      # 该 run 目录作为独立 artifact 上传(整目录制品 nightly-e2e-prod-full-* 保留供人
++      # 排查,两者并存)。上传路径必须是具体目录而非 e2e-runs/* 通配——通配命中目录会
++      # 保留目录名层级,artifact 根变成 <runId>/manifest.json,破坏 canonical 布局 A。
++      # 断言步失败时 LEDGER_RUN_DIR 为空 → 本步报 no files found,同样 fail-closed。
++      - name: Upload per-kernel ledger run dir
++        if: always()
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
++        with:
++          name: nightly-e2e-ledger-${{ matrix.kernel }}
++          path: ${{ env.LEDGER_RUN_DIR }}
++          if-no-files-found: error
++          retention-days: 14
++
+       # #560:上传条件同样改 always()——正常成功与失败两类 run 都要能下载到 ledger
+       # artifact,配上一步 ledger-summary 一起服务同一诉求;步骤名去掉"failing"前缀
+       # 与新条件对齐(不再是"只在失败时上传")。
+-      - name: Upload nightly artifacts
++      # #561:artifact 名加 kernel 后缀——matrix 两 child 若同名上传,后者会覆盖前者。
++      - name: Upload nightly artifacts (kernel=${{ matrix.kernel }})
+         if: always()
+         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+-          name: nightly-e2e-prod-full-artifacts
++          name: nightly-e2e-prod-full-${{ matrix.kernel }}-artifacts
+           path: test-artifacts
+           if-no-files-found: warn
+           retention-days: 14
+ 
++  # #561:aggregate job——下载两份 per-kernel ledger artifact(nightly-e2e-ledger-*),
++  # 合并校验 148 格。
++  # if: always():child 失败也要跑,校验器把缺格如实报出来(而不是把"没跑完"静默
++  # 变成"没结果")。下载用 actions/download-artifact v7.0.0(SHA 由
++  # `gh api repos/actions/download-artifact/tags` 解析,与仓内 upload-artifact
++  # v7.0.1 同主版本、artifact 后端一致;全仓首次引入 download-artifact)。
++  aggregate:
++    name: aggregate ledger (148 cells)
++    needs: e2e-prod-full
++    if: always()
++    runs-on: ubuntu-latest
++    timeout-minutes: 10
++    # W6:F1:本 job 不再补 actions:read(推翻 W4 报告「actions:read 必需」结论,见报告
++    # W6 节)。理由:同 run 内下载 artifact 时 actions/download-artifact 走 runner
++    # runtime token,不消耗 GITHUB_TOKEN 的 actions scope,workflow 顶层 permissions:
++    # contents:read 已足。对照:ci.yml bench job 补 actions:read 是因为它要下载
++    # **上一次 main 运行**(跨 run)的 bench-result artifact,必须走 GITHUB_TOKEN 调
++    # REST API 才需要该 scope——与 #561 的「同 run 下载」是两种场景,不可照搬。
++    # 首次真跑若下载 403,说明此判据有误,错误当场可见(届时补回 actions:read)。
++    steps:
++      - name: Checkout
++        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++
++      - name: Setup Node (LTS)
++        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
++        with:
++          node-version: lts/*
++          cache: npm
++
++      - name: Install dependencies
++        # W6:F4:必须 npm ci(推翻 W4 报告「零依赖不跑 npm ci」结论,见报告 W6 节)。
++        # 依赖已确认必需(W7 定稿):ledger-aggregate.mjs 的 import 链固定为
++        # scenarios/index.mjs → scenarios/canvas-export.mjs:16
++        # `import { PNG } from 'pngjs'`(第三方依赖)——零依赖拆模块未落地,干净 runner
++        # 无 node_modules 会模块加载失败(lead 实测),本步不得去掉。
++        run: npm ci
++
++      # #561:只下载两个 per-kernel ledger 独立 artifact,各解到不同目录(dl/legacy、
++      # dl/new)。下载落地目录 = run 目录本身(canonical 布局 A:根下直接是
++      # manifest.json + ledger.jsonl,e2e-runs/<runId> 中间层已由 child 侧「恰好一个
++      # run 目录」断言 + 独立上传构造掉;校验器不做递归下探,路径必须一次给对)。
++      # 双目录隔离是硬约束:校验器禁用 --latest(LATEST 是单标量覆盖写文件,两份 ledger
++      # 解到同目录会互相覆盖)。
++      - name: Download legacy ledger
++        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
++        with:
++          name: nightly-e2e-ledger-legacy
++          path: dl/legacy
++
++      - name: Download new ledger
++        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
++        with:
++          name: nightly-e2e-ledger-new
++          path: dl/new
++
++      # #561:真实调用已定型(W7 定稿,实现契约 lead 实测):
++      #   --dir <kernel>=<路径> ×2(kernel ∈ {legacy,new} 各一次,路径 = run 目录本身,
++      #   canonical 布局 A)+ --expect-total 必填无默认值(nightly 传 148)。
++      # 退出码:0=通过;1=校验失败(缺格/重复/计数不符);2=用法/输入错误(含 manifest
++      # 结构非法);3=校验器内部错误。tee 前 mkdir:下载只落 dl/,不再隐式创建
++      # test-artifacts/,漏 mkdir 会让 tee 失败连带把校验结果误标红。
++      - name: Aggregate ledger (148 cells)
++        run: |
++          set -euo pipefail
++          mkdir -p test-artifacts
++          node scripts/e2e/ledger-aggregate.mjs --dir legacy=dl/legacy --dir new=dl/new --expect-total 148 2>&1 | tee test-artifacts/aggregate.log
++
++      - name: Surface aggregate result in job summary
++        if: always()
++        run: |
++          {
++            echo '## nightly aggregate (148 cells, kernel × renderer)'
++            echo ''
++            echo '```'
++            tail -n 40 test-artifacts/aggregate.log 2>/dev/null || echo '(无日志:校验器可能未启动,见上方 step 日志)'
++            echo '```'
++          } >> "$GITHUB_STEP_SUMMARY"
++
+   real-upstream-gate:
+     name: real upstream gate
+     runs-on: ubuntu-latest
+diff --git a/public/changelog.json b/public/changelog.json
+index f65f82a0..8713f970 100644
+--- a/public/changelog.json
++++ b/public/changelog.json
+@@ -1,16 +1,20 @@
+ {
+-  "lastGithash": "a01c72b07a3782fba1fddda34a29e909d67f9bda",
+-  "updatedAt": "2026-08-07T20:47:14+08:00",
++  "lastGithash": "f92211005fe91c831c711083a8fa8848fbf37116",
++  "updatedAt": "2026-08-08T01:29:26+08:00",
+   "entries": [
+     {
+       "date": "2026-08-07",
+       "prs": [
++        497,
+         544,
+         546,
+         563,
+         564,
+         567,
+-        568
++        568,
++        569,
++        571,
++        574
+       ],
+       "features": [],
+       "fixes": [
+@@ -37,6 +41,22 @@
+         {
+           "text": "界面文字大小的底层规范已搭好：字号按统一档位管理，为后续视觉统一打基础（当前无可见变化）。",
+           "by": "kirozeng"
++        },
++        {
++          "text": "修复复制为图片时的两个问题：旋转或翻转过的图片复制出来不再变回原样，会保留旋转和镜像效果；多张图片一起选中时也能复制合成一张图片。",
++          "by": "kirozeng"
++        },
++        {
++          "text": "内部质量保障：自动化测试模拟点击聊天面板复制按钮时更稳定，不再偶发误报异常（无用户可见变化）。",
++          "by": "PraiseZhu"
++        },
++        {
++          "text": "内部质量保障：自动化测试补齐了台账统计功能多种输入场景的覆盖（无用户可见变化）。",
++          "by": "PraiseZhu"
++        },
++        {
++          "text": "内部质量保障：自动化测试新增了跨测试实例汇总校验的能力（无用户可见变化）。",
++          "by": "PraiseZhu"
+         }
+       ]
+     },
+diff --git a/scripts/e2e/ledger-aggregate.mjs b/scripts/e2e/ledger-aggregate.mjs
+new file mode 100644
+index 00000000..3802c998
+--- /dev/null
++++ b/scripts/e2e/ledger-aggregate.mjs
+@@ -0,0 +1,687 @@
++// scripts/e2e/ledger-aggregate.mjs — #561 跨 child(matrix)ledger 汇总校验器。
++//
++// 保证等级(SC-M):本校验器只声称 T1——防疏忽/防漂移/防漏格/防 matrix 写错这类
++// 普通事故。ledger/manifest 是 runner 自产自写、由 CI 保管的中间产物,校验器与它们
++// 同源、无独立可信根,因此不构成安全边界;任何声称更高等级的措辞都是越权声明。
++//
++// 架构(SC-A):每个 child 的记录级校验 100% 复用 summarizeRun(ledger-summary.mjs,
++// #560 的 14 条规则:manifest/ledger 缺失与坏行、runId/schemaVersion/headSha 不符、
++// name↔四字段重算、未声明格、重复格、缺格、evidenceMissing、未知 status)。
++// 本文件只新增跨 child 检查(身份绑定/N_A 派生/expectedCells 重算/总数/终态/
++// 下载边界/外部输入边界)与 manifest 契约检查(topology/rendererModes/kernelModes/
++// selectedScenarios/persist 每 child 钉死——P0,2026-08-07),不出现第二份记录级校验
++// 逻辑——违反即 SC-A 失败(测试 SC-A 注入非法记录,断言错误文案来自 summarizeRun 原文)。
++//
++// 输入(SC-H):两个下载目录(--dir ×2,即两份 GitHub artifact 的解压目录)。
++// 校验器在目录内显式定位 runId(读 manifest.json 的 runId 字段,并与目录布局对账),
++// 禁止读 LATEST——LATEST 是单标量覆盖写文件,两份 artifact 解压到同一目录会互相
++// 覆盖,正是 #561 要下载两份 artifact、各自独立目录的原因;谁读 LATEST,谁就会在
++// matrix 场景下拿到错误 runId。
++//
++// 外部输入边界(SC-G):artifact 是外部输入。单文件大小上限(bounded JSON)、只
++// JSON.parse(不 eval)、不拼 shell、拒绝 symlink 与路径穿越。SAFE_NAME 白名单
++// (无分隔符、无 '..'、起始字符为字母数字)作用于 runId——它是唯一会被拼进构造
++// 路径(runDir(runId))的外部可控名字;校验器读取的两个文件是固定名字
++// (manifest.json/ledger.jsonl) join 到 dir,本身穿不出去;下载目录里其余顶层
++// 条目只是无关内容,条目数上限已防 readdir 炸弹。
++//
++// 下载布局(canonical,workflow 契约——#561 W5 D6 收敛,2026-08-07):
++//   唯一合法布局:--dir 指向「run 目录」本身,manifest.json 与 ledger.jsonl 必须
++//   直接位于该目录根(即 GitHub artifact 以 test-artifacts/e2e-runs/<runId> 的
++//   内容为根打包,解压后 manifest.json 在解压根)。禁止传含 runId 子目录的上级
++//   目录;校验器不做任何递归下探,找不到 manifest.json 直接 fail-closed(仅在
++//   错误提示里做单层"包了一层子目录"的定位帮助,不参与定位逻辑)。LATEST 永不
++//   读取。此前的布局 A/B/C 递归探查(含 MAX_DEPTH)已删除——布局由 workflow 完全
++//   控制,递归是过度设计。
++//
++// 依赖(SC-D7,2026-08-07 决策):本模块 import scenarios/index.mjs(取 scenarioOrder
++//   与 leaferSkippedScenarios——单一真相源),该模块传递依赖 canvas-export.mjs →
++//   pngjs(node_modules)。因此 aggregate job 必须先 npm ci 才能运行;node_modules
++//   就绪是运行前提,不以"纯 stdlib 脚本"自居。
++//
++// 暂存(staging)说明:校验器把下载目录里的 manifest/ledger 复制进本仓
++//   test-artifacts/e2e-runs/<runId>/ 后调 summarizeRun(记录级校验的单一 owner)。
++//   去掉 staging 需要给 ledger-summary.mjs 的 summarizeRun 增加外部 root/文件参数
++//   ——按 #561 W5 派工约束,未获 lead 授权不动该文件;此为已知残余(工作区副作用
++//   + lstat→copy 的极小 TOCTOU 窗口),workflow 接线前无害。
++import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
++import { join, resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import { cellKey, ledgerPath, manifestPath, runDir } from './result-ledger.mjs'
++import { summarizeRun } from './ledger-summary.mjs'
++import { leaferSkippedScenarios, scenarioOrder } from './scenarios/index.mjs'
++
++// 运行期常量(SC-G 的边界值;真实 manifest ~6KB、真实 ledger ~18KB,上限留足量级)。
++const MAX_MANIFEST_BYTES = 1 * 1024 * 1024
++const MAX_LEDGER_BYTES = 10 * 1024 * 1024
++const MAX_TOP_ENTRIES = 64 // 下载目录顶层条目上限(canonical 布局合法顶层 = manifest/ledger/fragments ≤ 3)
++const MAX_ERRORS_PER_CHILD = 40 // 单 child 错误数上限(bounded 诊断,SC-J)
++// runId/目录名白名单:首字符字母数字,其余仅 [A-Za-z0-9._-],总长 ≤128——无分隔符、
++// 无 '..'(路径穿越在 staging/join 之前就被拦下)。
++const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
++// headSha 回显白名单:git SHA(7-40 位 hex)。不合规 → 整段省略,不回显原始内容(D4)。
++const HEAD_SHA_TOKEN = /^[0-9a-fA-F]{7,40}$/
++
++/** 输入契约违规(SC-F:双入口同类别——CLI 缺参 exit 2 与函数 throw 都是"调用方漏传"这一件事)。 */
++export class AggregateInputError extends Error {
++  constructor(message) {
++    super(message)
++    this.name = 'AggregateInputError'
++  }
++}
++
++/**
++ * 回显白名单化(D4):任何来自外部输入/路径的回显值都必须过这道关。
++ *  - 控制字符(C0 + DEL)替换为 '?'——换行/ANSI 注入被拆平,日志行无法被伪造;
++ *  - 超长截断;
++ *  - 原始 path 一律不输出(调用方只输出 label/runId 等白名单 token)。
++ */
++const sanitizeToken = (value, max = 60) => {
++  const text = String(value).replace(/[\u0000-\u001F\u007F]/g, '?')
++  return text.length <= max ? text : `${text.slice(0, max)}…`
++}
++
++const headShaToken = (sha) => (HEAD_SHA_TOKEN.test(String(sha)) ? String(sha) : '<headSha 非 hex,已省略>')
++
++/**
++ * summarizeRun 错误摘要消毒(SC-J/SC-L/D4):
++ *  - `manifest JSON 解析失败:<path>(<err.message>)` 与 `ledger 第 N 行 JSON 解析失败:<err.message>`
++ *    的 err.message 是 JSON.parse 抛出的,会原样回显输入内容片段——外部输入可能含敏感
++ *    数据,必须剥掉整个回显段,只保留前缀(路径/行号),换固定文案;
++ *  - summarizeRun 的错误正文含本仓暂存路径(manifest 缺失:<path> 等),同样剥掉;
++ *  - 其余错误走 sanitizeToken(控制字符剔除 + 截断),不吞错。
++ */
++// [M16 变异点:隐私消毒规则(改 return 为原样透传 → t-privacy/t-ledger-badline/t-no-path/t-ctl-name 应变红)]
++const sanitizeChildErrors = (runId, errors) => {
++  const stagedManifest = manifestPath(runId)
++  const stagedLedger = ledgerPath(runId)
++  return errors.map((error) => {
++    let text = String(error)
++    if (text.startsWith('manifest JSON 解析失败:')) {
++      const cut = text.indexOf('(')
++      text = cut > 0 ? `${text.slice(0, cut)}(内容已省略)` : text
++    }
++    if (/^ledger 第 \d+ 行 JSON 解析失败:/.test(text)) {
++      const cut = text.indexOf(':')
++      text = `${text.slice(0, cut)}(内容已省略)`
++    }
++    // 暂存路径是工作区内部路径,不对外回显(D4:不输出原始 path)。
++    text = text.split(stagedManifest).join('<manifest 路径已省略>').split(stagedLedger).join('<ledger 路径已省略>')
++    return sanitizeToken(text, 200)
++  })
++}
++
++/** 单条路径的安全检查:不存在 / 是 symlink / 不是普通文件 → 返回错误文案,合法返回 null。 */
++const inspectFile = (path, kind) => {
++  if (!existsSync(path)) return `${kind} 不存在`
++  try {
++    // [M11 变异点:symlink 拒绝规则(改条件为 false → t-symlink 应变绿)]
++    if (lstatSync(path).isSymbolicLink()) return `${kind} 是 symlink(拒绝读取)`
++    if (!statSync(path).isFile()) return `${kind} 不是普通文件(拒绝读取)`
++  } catch {
++    return `${kind} 不可访问`
++  }
++  return null
++}
++
++const isPlainObject = (value) => typeof value === 'object' && value !== null && !Array.isArray(value)
++const isStringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string')
++
++/**
++ * 外部 manifest 的 shape guard(D2):业务逻辑(重算/求交/遍历)之前先验结构,
++ * 任何形状违规 → 结构化 schema 错误(kind:'schema' → CLI exit 2),禁止 TypeError
++ * 崩溃。只报"哪个字段是什么类型",不携带外部输入内容(D4)。
++ */
++// [M25 变异点:manifest shape guard(删此调用 → t-shape-* / t-cli-shape 应变红)]
++const validateManifestShape = (manifest) => {
++  if (!isPlainObject(manifest)) return 'manifest 必须是 JSON 对象'
++  if (typeof manifest.schemaVersion !== 'string' || manifest.schemaVersion.length === 0) return 'manifest.schemaVersion 必须是非空字符串'
++  if (typeof manifest.headSha !== 'string' || manifest.headSha.length === 0) return 'manifest.headSha 必须是非空字符串'
++  if (typeof manifest.topology !== 'string') return 'manifest.topology 必须是字符串'
++  if (typeof manifest.persist !== 'string') return 'manifest.persist 必须是字符串'
++  if (!isStringArray(manifest.kernelModes)) return 'manifest.kernelModes 必须是字符串数组'
++  if (!isStringArray(manifest.rendererModes)) return 'manifest.rendererModes 必须是字符串数组'
++  if (!isStringArray(manifest.selectedScenarios)) return 'manifest.selectedScenarios 必须是字符串数组'
++  if (
++    !Array.isArray(manifest.expectedCells) ||
++    !manifest.expectedCells.every(
++      (cell) => isPlainObject(cell) &&
++        typeof cell.scenario === 'string' && typeof cell.renderer === 'string' &&
++        typeof cell.kernel === 'string' && typeof cell.topology === 'string',
++    )
++  ) {
++    return 'manifest.expectedCells 必须是 {scenario,renderer,kernel,topology} 字符串字段的对象数组'
++  }
++  return null
++}
++
++/**
++ * 在下载目录内显式定位 run(SC-H/SC-I/D6 canonical 布局)。返回
++ * { runId, manifest, manifestFile, ledgerFile } 或 { error, kind? }。
++ * kind='schema' → 结构非法(exit 2);无 kind → 输入边界失败(exit 1)。
++ * 绝不读 LATEST、绝不递归下探、绝不解析 manifest 之外的任何文件内容。
++ */
++const locateRun = (dir) => {
++  if (!existsSync(dir)) return { error: '下载目录不存在' }
++  try {
++    if (lstatSync(dir).isSymbolicLink()) return { error: '下载目录是 symlink(拒绝读取)' }
++    if (!statSync(dir).isDirectory()) return { error: '下载目录不是目录' }
++  } catch {
++    return { error: '下载目录不可访问' }
++  }
++
++  let entries
++  try {
++    entries = readdirSync(dir)
++  } catch {
++    return { error: '下载目录不可读' }
++  }
++  if (entries.length > MAX_TOP_ENTRIES) return { error: `下载目录条目过多(>${MAX_TOP_ENTRIES})` }
++
++  // canonical 布局:manifest.json 必须直接在根。不做递归下探(D6)。
++  if (!entries.includes('manifest.json')) {
++    if (entries.includes('ledger.jsonl')) return { error: '有 ledger 无 manifest(打包不完整;canonical 布局要求 manifest.json 与 ledger.jsonl 都在下载目录根)' }
++    // 单层定位帮助(仅提示,不参与定位):"解压产物包了一层 runId 子目录"是常见误用形态。
++    const nested = entries.filter((name) => SAFE_NAME.test(name) && existsSync(join(dir, name, 'manifest.json')))
++    if (nested.length > 0) {
++      return {
++        error: `未找到 manifest.json(canonical 布局:manifest.json 必须直接在下载目录根;提示:在 ${nested.slice(0, 3).map((name) => sanitizeToken(name, 40)).join(', ')}${nested.length > 3 ? ` 等 ${nested.length} 个子目录` : ''} 找到 manifest.json——若 artifact 解压产物包了一层 runId 子目录,请把 --dir 指向该子目录;校验器不读 LATEST,不做递归下探)`,
++      }
++    }
++    return { error: '未找到 manifest.json(canonical 布局:manifest.json 与 ledger.jsonl 必须直接在下载目录根;校验器不读 LATEST,不做递归下探)' }
++  }
++
++  const manifestFile = join(dir, 'manifest.json')
++  const fileError = inspectFile(manifestFile, 'manifest.json')
++  if (fileError) return { error: fileError }
++  // 先按 stat 大小上限拦截,再读文件(bounded JSON:不把超大文件整体读进内存)。
++  let stat
++  try {
++    stat = statSync(manifestFile)
++  } catch {
++    return { error: 'manifest.json 不可访问' }
++  }
++  // [M13 变异点:manifest 大小上限规则(改条件为 false → t-big-manifest 应变绿)]
++  if (stat.size > MAX_MANIFEST_BYTES) {
++    return { error: `manifest.json 超过大小上限(${MAX_MANIFEST_BYTES} bytes)` }
++  }
++  let raw
++  try {
++    raw = readFileSync(manifestFile, 'utf8')
++  } catch {
++    return { error: 'manifest.json 不可读' }
++  }
++  let manifest
++  try {
++    manifest = JSON.parse(raw)
++  } catch {
++    // 不携带 err.message:JSON.parse 的错误信息会回显输入内容片段(SC-L)。
++    return { error: 'manifest JSON 解析失败(定位 runId;内容已省略)' }
++  }
++  const runId = manifest?.runId
++  // [M12 变异点:runId 白名单/路径穿越拒绝规则(改条件为 false → t-traversal/t-ctl-runid 应变绿)]
++  if (typeof runId !== 'string' || !SAFE_NAME.test(runId)) {
++    return { error: `manifest.runId 非法:${sanitizeToken(runId, 60)}(白名单外字符或疑似路径穿越)` }
++  }
++  const shapeError = validateManifestShape(manifest)
++  if (shapeError) return { error: shapeError, kind: 'schema' }
++  return { runId, manifest, manifestFile, ledgerFile: join(dir, 'ledger.jsonl') }
++}
++
++/** 把下载目录里的 manifest/ledger 暂存进本仓 test-artifacts/e2e-runs/<runId>/,让 summarizeRun 能以真实路径读到。 */
++const stageChildRun = (runId, manifestFile, ledgerFile) => {
++  const target = runDir(runId)
++  if (existsSync(target)) {
++    // runId 已过 SAFE_NAME 白名单,是可回显的安全 token;完整路径不回显(D4)。
++    return { error: `暂存目标已存在(runId=${runId},疑似 runId 冲突,拒绝覆盖)` }
++  }
++  try {
++    mkdirSync(target, { recursive: true })
++    copyFileSync(manifestFile, manifestPath(runId))
++    if (existsSync(ledgerFile)) {
++      const ledgerError = inspectFile(ledgerFile, 'ledger.jsonl')
++      if (ledgerError) throw new Error(ledgerError)
++      const stat = statSync(ledgerFile)
++      // [M13 变异点:ledger 大小上限规则(改条件为 false → t-big-ledger 应变绿)]
++      if (stat.size > MAX_LEDGER_BYTES) throw new Error(`ledger.jsonl 超过大小上限(${MAX_LEDGER_BYTES} bytes)`)
++      copyFileSync(ledgerFile, ledgerPath(runId))
++    }
++  } catch (err) {
++    // 已建目录/已复制 manifest 也要清干净:半成品暂存目录不得残留(测试变异循环
++    // 实测发现漏清,t-big-ledger 每次跑都留一个只有 manifest 的空壳目录)。
++    try {
++      rmSync(target, { recursive: true, force: true })
++    } catch {
++      // 清理失败不吞判定,继续上报。
++    }
++    return { error: err instanceof Error && err.message.startsWith('ledger') ? err.message : '暂存失败(内容已省略)' }
++  }
++  return { target }
++}
++
++/** SC-D:从权威 scenarioOrder + manifest 的 modes 重算 expectedCells 笛卡尔积(不信任 manifest.expectedCells)。 */
++const recomputeExpectedCells = (manifest) => {
++  const cells = []
++  for (const kernel of manifest.kernelModes) {
++    for (const renderer of manifest.rendererModes) {
++      for (const scenario of scenarioOrder) {
++        cells.push(cellKey({ scenario, renderer, kernel, topology: manifest.topology }))
++      }
++    }
++  }
++  return new Set(cells)
++}
++
++/** SC-C:期望 N_A 集合 = leaferSkippedScenarios × (rendererModes∩{leafer}) × kernelModes × topology,从代码与 manifest 派生,禁止写死。 */
++const deriveNaCells = (manifest) => {
++  const skips = Object.keys(leaferSkippedScenarios).filter((name) => manifest.selectedScenarios.includes(name))
++  const cells = []
++  for (const scenario of skips) {
++    for (const kernel of manifest.kernelModes) {
++      for (const renderer of manifest.rendererModes) {
++        if (renderer === 'leafer') cells.push(cellKey({ scenario, renderer, kernel, topology: manifest.topology }))
++      }
++    }
++  }
++  return new Set(cells)
++}
++
++/**
++ * manifest 契约检查(P0,每 child 钉死——不是只比两 child 相等):
++ *  - topology 必须恰为 "prod";
++ *  - rendererModes 去重后恰等于 {dom, leafer},raw 数组无重复;
++ *  - kernelModes raw 长度恰为 1,且值 === expectKernel(D3 绑定);
++ *  - selectedScenarios raw 逐位等于权威 scenarioOrder(同长度、同顺序、无重复);
++ *  - persist 必须恰为 "local"。
++ * 返回错误文案数组(空 = 通过)。此前的"跨 child 相等"版本(P0 漏洞)已删除:
++ * 两 child 各自谎报同一套非法值(如都报 topology=dev、rendererModes=[dom,bogus])
++ * 会被"相等"骗过——这正是 lead 实测的攻击形态。
++ */
++const validateChildContract = (manifest, expectKernel) => {
++  const errors = []
++  // [M18 变异点:topology 每 child 钉死 "prod"(删此 if → t-topology 应变绿)]
++  if (manifest.topology !== 'prod') {
++    errors.push(`topology 必须恰为 "prod"(收到 ${sanitizeToken(manifest.topology, 20)})`)
++  }
++  // [M19 变异点:rendererModes 钉死 {dom,leafer} 且无重复(删此 if → t-renderers-bogus/t-renderers-dup 应变绿)]
++  const renderers = manifest.rendererModes
++  const rendererSet = new Set(renderers)
++  if (renderers.length !== 2 || rendererSet.size !== renderers.length || !rendererSet.has('dom') || !rendererSet.has('leafer')) {
++    errors.push(`rendererModes 去重后必须恰为 {dom, leafer} 且无重复(收到 [${renderers.map((r) => sanitizeToken(r, 20)).join(', ')}])`)
++  }
++  // [M20 变异点:kernelModes 每 child 长度恰为 1(删此 if → t-kernel-len 应变绿)]
++  const kernels = manifest.kernelModes
++  if (kernels.length !== 1) {
++    errors.push(`kernelModes 长度必须恰为 1(收到 ${kernels.length} 个:[${kernels.map((k) => sanitizeToken(k, 20)).join(', ')}])`)
++    // [M24 变异点:kernelModes 与期望 kernel 绑定(删此 else-if → t-kernel 应变绿)]
++  } else if (kernels[0] !== expectKernel) {
++    errors.push(`kernelModes 与期望 kernel 不符(期望 ${sanitizeToken(expectKernel, 20)},收到 ${sanitizeToken(kernels[0], 20)})`)
++  }
++  // [M21 变异点:selectedScenarios 钉死 scenarioOrder(删此 if → t-scenarios-subset/t-scenarios-ghost 应变绿)]
++  // [M27 变异点:selectedScenarios 逐位顺序钉死(改回"同集合即可" → t-scenarios-order 应变绿)]
++  // 逐位相等已吸收长度/去重/集合三查:e2e-runner 的两条写入路径(scenarioOrder 直写或
++  // filter 子集)都保持原顺序,合法排列必是逐位相等;任何重排/重复/缺项都红。
++  const scenarios = manifest.selectedScenarios
++  if (scenarios.length !== scenarioOrder.length || !scenarios.every((name, index) => name === scenarioOrder[index])) {
++    errors.push('selectedScenarios 必须恰等于权威 scenarioOrder(同长度、逐位同序、无重复)')
++  }
++  // [M22 变异点:persist 钉死 "local"(删此 if → t-persist 应变绿)]
++  if (manifest.persist !== 'local') {
++    errors.push(`persist 必须恰为 "local"(收到 ${sanitizeToken(manifest.persist, 20)})`)
++  }
++  return errors
++}
++
++const childLabel = (dir, index) => dir?.label ?? dir?.expectKernel ?? `child-${index + 1}`
++
++/**
++ * 单个 child 的完整检查:定位 → shape guard → manifest 契约 → 暂存 → summarizeRun(记录级)→ 终态边界(SC-J)。
++ * 返回 { label, path, runId, manifest, ok, kind, errors, counts, records }。
++ * kind ∈ {'hard' | 'schema' | 'contract' | 'soft'}:
++ *   hard     输入边界级失败(定位/暂存/大小/symlink/路径穿越)——任何变异/降级下都必须上报;
++ *   schema   外部 manifest 结构非法(D2)——aggregate 层抛 AggregateInputError(exit 2);
++ *   contract P0 契约失败(topology/rendererModes/kernelModes/selectedScenarios/persist
++ *             谎报)——与 hard 同级始终上报,不可被 R9 pass-through 变异遮蔽
++ *             (变异隔离:契约规则由 M18-M24 各自捕获,M9 只能影响记录级 soft);
++ *   soft     记录级校验失败(走 summarizeRun 的 pass-through,即 R9 的
++ *             "禁止可用部分先合并"变异点)。
++ */
++const inspectChild = ({ label, path, expectKernel }) => {
++  const located = locateRun(path)
++  // [M10 变异点:定位失败 fail-closed 规则(删此分支 → 全部定位失败 fixture 走崩溃路径)]
++  if (located.error) {
++    return {
++      label,
++      path,
++      runId: null,
++      manifest: null,
++      ok: false,
++      kind: located.kind === 'schema' ? 'schema' : 'hard',
++      errors: [located.error],
++      counts: null,
++      records: [],
++    }
++  }
++  const { runId, manifest, manifestFile, ledgerFile } = located
++  const contractErrors = validateChildContract(manifest, expectKernel)
++  if (contractErrors.length > 0) {
++    // 契约失败:manifest 自洽但语义非法(P0 钉死规则)。不进 staging,不产生工作区副作用。
++    return { label, path, runId, manifest, ok: false, kind: 'contract', errors: contractErrors, counts: null, records: [] }
++  }
++  const staged = stageChildRun(runId, manifestFile, ledgerFile)
++  if (staged.error) {
++    return { label, path, runId, manifest, ok: false, kind: 'hard', errors: [staged.error], counts: null, records: [] }
++  }
++  let summary
++  try {
++    summary = summarizeRun(runId)
++  } catch (err) {
++    // [M28 变异点:summarizeRun 抛错转结构化 hard 错误(删此 catch → 抛错穿到 CLI 变 exit 3,
++    // t-ledger-null-row 应变红为 exit 1→exit 3)]
++    // 坏输入(合法 JSON 但非对象行,如 null)会让 summarizeRun 内部 TypeError,若一路穿到
++    // CLI 被映射成 exit 3,就把"数据不合法"伪装成"校验器内部错误",带偏排查方向。
++    // 这里转成结构化 child hard 错误,CLI 退 1;不回显任何外部输入内容(D4),只给类别诊断。
++    // 注:primitive 行(123/true/"str")不抛——属性访问返回 undefined,走记录级
++    // "runId 不符"路径(soft),本就 exit 1,只有 null 这类会抛的形态需要此 catch。
++    return {
++      label,
++      path,
++      runId,
++      manifest,
++      ok: false,
++      kind: 'hard',
++      errors: ['ledger 记录级校验抛出异常(疑似非对象行,如 null/primitive JSON)'],
++      counts: null,
++      records: [],
++    }
++  } finally {
++    try {
++      rmSync(runDir(runId), { recursive: true, force: true })
++    } catch (cleanupErr) {
++      // 清理失败不吞判定,但也不再静默(F5):CI 单次执行下残留无害(gitignore 的临时产物),
++      // 但会让后续同 runId 调用撞上 stageChildRun 的"暂存目标已存在"拒绝。只带 runId
++      // 不带完整路径(D4);不改退出码、不影响判定——只是从静默变成可见。
++      console.warn(`[ledger-aggregate] 清理暂存目录失败(runId=${sanitizeToken(runId, 24)}),后续同 runId 调用可能撞上暂存冲突`)
++    }
++  }
++  const errors = sanitizeChildErrors(runId, summary.errors)
++  // SC-J 终态边界(记录级已拦 evidenceMissing/未知 status,这里补 FAIL/RETRY_PASS):
++  // 只点名格与状态,不打印 message/pageErrors 等正文(SC-L bounded 诊断)。
++  // [M8 变异点:终态 FAIL/RETRY_PASS 规则]
++  const badTerminals = summary.records.filter((record) => record.status === 'FAIL' || record.status === 'RETRY_PASS')
++  if (badTerminals.length > 0) {
++    const names = badTerminals.slice(0, 20).map((record) => `${record.status}:${sanitizeToken(record.name, 80)}`)
++    const more = badTerminals.length > 20 ? ` +${badTerminals.length - 20} 更多` : ''
++    errors.push(`终态含 ${badTerminals.length} 个非绿格:${names.join(', ')}${more}`)
++  }
++  const boundedErrors = errors.slice(0, MAX_ERRORS_PER_CHILD)
++  if (errors.length > MAX_ERRORS_PER_CHILD) {
++    boundedErrors.push(`…另有 ${errors.length - MAX_ERRORS_PER_CHILD} 条问题(已截断)`)
++  }
++  return {
++    label,
++    path,
++    runId,
++    manifest,
++    ok: summary.ok && badTerminals.length === 0,
++    kind: 'soft',
++    errors: boundedErrors,
++    counts: summary.counts,
++    records: summary.records,
++  }
++}
++
++/**
++ * 跨 child 汇总校验(SC-B..SC-F)。dirs = 恰好 2 个 { path, expectKernel, label? };
++ * expectKernel ∈ {legacy,new} 且两值各一次(D3:每 child 绑定期望 kernel);
++ * expectTotal 必填。返回 { ok, errors, children, counts, total }。
++ * fail-closed:任一 child 不 ok 即整体不 ok,child 错误原样上报(禁"可用部分先合并")。
++ * 任一 child 的 manifest 结构非法 → throw AggregateInputError(SC-F:输入类别错误)。
++ */
++export const aggregateLedgers = ({ dirs, expectTotal }) => {
++  // [M14b 变异点:函数侧必填/入参校验(删这些 throw → t-fn-throw 应变红)]
++  if (!Array.isArray(dirs) || dirs.length !== 2) {
++    throw new AggregateInputError(`需要恰好 2 个下载目录(--dir ×2),收到 ${Array.isArray(dirs) ? dirs.length : 'none'}`)
++  }
++  if (!Number.isInteger(expectTotal) || expectTotal <= 0) {
++    // 无默认值:给默认值会把"调用方漏传"从报错降级成静默改判(SC-F)。
++    throw new AggregateInputError('expectTotal 必填且必须为正整数(无默认值,漏传必须报错)')
++  }
++  for (let index = 0; index < dirs.length; index += 1) {
++    const dir = dirs[index]
++    if (dir === null || typeof dir !== 'object' || Array.isArray(dir)) {
++      throw new AggregateInputError(`第 ${index + 1} 个 --dir 项必须是非空对象(收到非对象)`)
++    }
++    if (typeof dir.path !== 'string' || dir.path.length === 0) {
++      throw new AggregateInputError(`第 ${index + 1} 个 --dir 缺 path(必须为非空字符串)`)
++    }
++    if (dir.expectKernel !== 'legacy' && dir.expectKernel !== 'new') {
++      throw new AggregateInputError(`第 ${index + 1} 个 --dir 缺 expectKernel(必须为 legacy 或 new——D3 每 child 绑定期望 kernel)`)
++    }
++    if (dir.label !== undefined && (typeof dir.label !== 'string' || dir.label.length === 0)) {
++      throw new AggregateInputError(`第 ${index + 1} 个 --dir 的 label 必须是非空字符串`)
++    }
++  }
++  if (dirs[0].expectKernel === dirs[1].expectKernel) {
++    throw new AggregateInputError('两个 --dir 的 expectKernel 必须互不相同(legacy 与 new 各一次)')
++  }
++
++  const children = dirs.map((dir, index) => inspectChild({ label: childLabel(dir, index), path: dir.path, expectKernel: dir.expectKernel }))
++  const schemaChildren = children.filter((child) => child.kind === 'schema')
++  if (schemaChildren.length > 0) {
++    throw new AggregateInputError(`manifest 结构非法:${schemaChildren.map((child) => ` ${child.label}:${child.errors[0]}`).join(';')}`)
++  }
++
++  const errors = []
++  for (const child of children) {
++    if (child.ok) continue
++    if (child.kind === 'hard' || child.kind === 'contract') {
++      // 输入边界级错误(定位/暂存/外部输入)与 P0 契约谎报:始终上报,不可被
++      // pass-through 变异遮蔽(契约规则由 M18-M24 各自捕获,M9 只影响记录级 soft)。
++      // 只输出 label + 错误,不回显原始 path(D4)。
++      for (const error of child.errors) {
++        errors.push(`${sanitizeToken(child.label, 24)}: ${error}`)
++      }
++    } else {
++      // R9(SC-A/SC-I):child 记录级校验失败必须原样上报,禁止"可用部分先合并"。
++      // —— M9 反向变异点:删除此 else 分支,所有软失败 fixture 应变绿。
++      for (const error of child.errors) {
++        errors.push(`${sanitizeToken(child.label, 24)}: ${error}`)
++      }
++    }
++  }
++
++  // 跨 child 检查只在两个 child 都通过记录级与契约校验后执行:child 本身不完整时,其
++  // 数据不可信,继续做跨 child 比较只会叠加噪音错误。
++  const bothOk = children.every((child) => child.ok)
++  if (bothOk) {
++    const [a, b] = children
++    const ma = a.manifest
++    const mb = b.manifest
++
++    // SC-B 身份绑定:headSha/schemaVersion 相等。
++    // exact(非 subset)的理由:subset 会让"两份各少 1 格但错位互补"这种形态漏过,
++    // 而身份绑定要防的正是"matrix 两份不是同一次提交/同一 schema"的整树错配。
++    // [M1 变异点:headSha 规则] [M2 变异点:schemaVersion 规则]
++    // (旧 M4 topology 相等规则已删除:P0 已把每 child topology 钉死为 "prod",
++    // 相等被更强规则吸收,见 validateChildContract。)
++    if (ma.headSha !== mb.headSha) {
++      errors.push(`跨 child 身份绑定失败: headSha 不一致(child-1=${headShaToken(ma.headSha)}, child-2=${headShaToken(mb.headSha)})`)
++    }
++    if (ma.schemaVersion !== mb.schemaVersion) {
++      errors.push(`跨 child 身份绑定失败: schemaVersion 不一致(child-1=${sanitizeToken(ma.schemaVersion, 20)}, child-2=${sanitizeToken(mb.schemaVersion, 20)})`)
++    }
++    // 旧 M3 kernel 并集规则已删除:每 child 的 kernelModes 已与 expectKernel 绑定
++    // (validateChildContract),且 dirs 入口已要求两 expectKernel 互异且恰为 {legacy,new}
++    // ——"两份都是 legacy"的 matrix 写错形态由绑定规则拦截,t-kernel 归 M24。
++
++    // SC-D:expectedCells 必须与权威重算 exact 一致(任意方向的幽灵格/缺格都红);
++    // 且 raw 数量/重复必须与重算一致——Set 会吞重复,D1:raw.length === 重算长度
++    // 且 Set(raw).size === raw.length 双断言。
++    // [M5 变异点:expectedCells 重算规则(删除本 for 块 → t-ghost/t-expectedcells-dup 应变绿)]
++    // [M23 变异点:expectedCells raw 长度/去重规则(删 rawOk 判断 → t-expectedcells-dup 应变绿)]
++    for (const child of children) {
++      const rawCells = child.manifest.expectedCells
++      const rawKeys = rawCells.map((cell) => cellKey(cell))
++      const recomputed = recomputeExpectedCells(child.manifest)
++      const rawOk = rawKeys.length === recomputed.size && new Set(rawKeys).size === rawKeys.length
++      if (!rawOk) {
++        errors.push(`${child.label}: manifest.expectedCells 数量/重复与权威重算不符(raw ${rawKeys.length} 项,重算 ${recomputed.size} 项;重复被 Set 吞并不得通过)`)
++      } else {
++        const actual = new Set(rawKeys)
++        const ghosts = [...actual].filter((key) => !recomputed.has(key))
++        const missing = [...recomputed].filter((key) => !actual.has(key))
++        if (ghosts.length > 0 || missing.length > 0) {
++          errors.push(`${child.label}: manifest.expectedCells 含幽灵格/缺格(${ghosts.slice(0, 5).map((key) => sanitizeToken(key, 60)).join(', ')}${ghosts.length > 5 ? ` +${ghosts.length - 5}` : ''}${missing.length ? ` / 缺:${missing.slice(0, 5).map((key) => sanitizeToken(key, 60)).join(', ')}` : ''})`)
++        }
++      }
++    }
++
++    // SC-C/SC-E:N_A 格必须与派生集合 exact 相等(多余/缺失都红)。
++    // [M6 变异点:N_A 派生集合规则(删除本 for 块)]
++    for (const child of children) {
++      const derived = deriveNaCells(child.manifest)
++      const observed = new Set(child.records.filter((record) => record.status === 'N_A').map((record) => record.name))
++      const extra = [...observed].filter((key) => !derived.has(key))
++      const missing = [...derived].filter((key) => !observed.has(key))
++      if (extra.length > 0 || missing.length > 0) {
++        errors.push(`${child.label}: N_A 格与派生集合不符(派生自 leaferSkippedScenarios×rendererModes∩leafer×kernelModes×topology; 多余=${extra.map((key) => sanitizeToken(key, 60)).join(',') || '无'}, 缺失=${missing.map((key) => sanitizeToken(key, 60)).join(',') || '无'})`)
++      }
++    }
++
++    // SC-E/SC-F:总数必须恰等于调用方声明的 expectTotal(矩阵漂移或 workflow 传错都红)。
++    // [M7 变异点:总数规则]
++    const mergedTotal = a.records.length + b.records.length
++    if (mergedTotal !== expectTotal) {
++      errors.push(`总格数不符: 实际 ${mergedTotal} 格,--expect-total=${expectTotal}(矩阵漂移(场景增删)或 workflow 传错)`)
++    }
++  }
++
++  const allCounts = children.map((child) => child.counts).filter(Boolean)
++  const counts = allCounts.length === 2
++    ? allCounts.reduce(
++        (acc, c) => ({ PASS: acc.PASS + c.PASS, RETRY_PASS: acc.RETRY_PASS + c.RETRY_PASS, FAIL: acc.FAIL + c.FAIL, N_A: acc.N_A + c.N_A }),
++        { PASS: 0, RETRY_PASS: 0, FAIL: 0, N_A: 0 },
++      )
++    : null
++  const total = bothOk ? children[0].records.length + children[1].records.length : null
++
++  return { ok: errors.length === 0, errors, children, counts, total }
++}
++
++const formatCliOutput = (result) => {
++  const lines = []
++  for (const child of result.children) {
++    // runId 已过 SAFE_NAME 白名单,是安全 token;path 一律不输出(D4)。
++    lines.push(`[ledger-aggregate] ${sanitizeToken(child.label, 24)}: run=${child.runId ?? '(未定位)'} ok=${child.ok}${child.counts ? ` PASS=${child.counts.PASS} RETRY_PASS=${child.counts.RETRY_PASS} FAIL=${child.counts.FAIL} N_A=${child.counts.N_A}` : ''}`)
++  }
++  if (result.counts) {
++    const { counts, total } = result
++    lines.push(`[ledger-aggregate] 合计: total=${total} PASS=${counts.PASS} RETRY_PASS=${counts.RETRY_PASS} FAIL=${counts.FAIL} N_A=${counts.N_A}`)
++  }
++  if (!result.ok) {
++    lines.push(`[ledger-aggregate] fail-closed — ${result.errors.length} 处问题:`)
++    for (const error of result.errors) lines.push(`  - ${error}`)
++    lines.push('[ledger-aggregate] 结果: fail(exit 1)')
++  } else {
++    lines.push('[ledger-aggregate] 结果: ok(exit 0)')
++  }
++  return lines.join('\n')
++}
++
++const USAGE = [
++  '用法: node scripts/e2e/ledger-aggregate.mjs --dir <kernel>=<路径> --dir <kernel>=<路径> --expect-total <正整数>',
++  '  --dir <kernel>=<路径>  恰好 2 个;kernel ∈ {legacy, new},两值各一次;',
++  '                        <路径> 是 artifact 解压目录,根必须直接含 manifest.json + ledger.jsonl',
++  '                        (canonical 布局——不要把含 runId 子目录的上级目录传进来)',
++  '  --expect-total  期望总格数(必填,无默认值)。nightly matrix = 场景数 × 2 renderer × 2 kernel',
++  '退出码: 0=通过 1=校验失败 2=用法/输入错误(含 manifest 结构非法) 3=校验器内部错误',
++].join('\n')
++
++const parseDirArg = (raw) => {
++  const eq = raw.indexOf('=')
++  if (eq <= 0) return { error: '--dir 值必须是 <kernel>=<路径>(如 --dir legacy=<路径>);kernel ∈ {legacy, new}' }
++  const kernel = raw.slice(0, eq)
++  const path = raw.slice(eq + 1)
++  if (kernel !== 'legacy' && kernel !== 'new') {
++    return { error: `--dir 的 kernel 必须是 legacy 或 new(收到 ${sanitizeToken(kernel, 20)})` }
++  }
++  if (path.length === 0) return { error: '--dir 的路径不能为空' }
++  return { path, expectKernel: kernel }
++}
++
++const parseArgs = (argv) => {
++  const dirs = []
++  let expectTotal = null
++  for (let index = 0; index < argv.length; index += 1) {
++    const arg = argv[index]
++    if (arg === '--dir') {
++      index += 1
++      if (index >= argv.length) return { error: '--dir 缺值' }
++      const parsed = parseDirArg(argv[index])
++      if (parsed.error) return parsed
++      dirs.push(parsed)
++    } else if (arg.startsWith('--dir=')) {
++      const parsed = parseDirArg(arg.slice('--dir='.length))
++      if (parsed.error) return parsed
++      dirs.push(parsed)
++    } else if (arg === '--expect-total') {
++      index += 1
++      if (index >= argv.length) return { error: '--expect-total 缺值' }
++      expectTotal = Number(argv[index])
++    } else if (arg.startsWith('--expect-total=')) {
++      expectTotal = Number(arg.slice('--expect-total='.length))
++    } else {
++      return { error: '未知参数(已拒绝,不回显)' }
++    }
++  }
++  // [M14a 变异点:CLI 侧必填/绑定校验(删这三个 return + 入口 throw 块 → 缺参/重复 kernel
++  // 走 aggregateLedgers 崩溃或 exit 1/3,而非约定 exit 2,t-cli-no-total / t-cli-bad-dirs /
++  // t-cli-bad-kernel-binding 应变红)]
++  if (dirs.length !== 2) return { error: `--dir 必须恰好 2 个,收到 ${dirs.length}` }
++  if (dirs[0].expectKernel === dirs[1].expectKernel) {
++    return { error: '两个 --dir 的 kernel 必须互不相同(legacy 与 new 各一次)' }
++  }
++  if (!Number.isInteger(expectTotal) || expectTotal <= 0) {
++    return { error: '--expect-total 必填且必须为正整数(无默认值,漏传必须报错)' }
++  }
++  return { dirs, expectTotal }
++}
++
++const isMainModule = () => {
++  try {
++    // 注意:不能拿 `file://${process.argv[1]}` 拼串比较——仓库路径含空格时(如
++    // "Project MivoCanvas")import.meta.url 是 URL 编码形式,拼串必然不等,main 块
++    // 会静默不执行(CLI 恒 exit 0)。必须 fileURLToPath 归一化后再比。
++    return Boolean(process.argv[1]) && fileURLToPath(import.meta.url) === resolve(process.argv[1])
++  } catch {
++    return false
++  }
++}
++
++if (isMainModule()) {
++  const parsed = parseArgs(process.argv.slice(2))
++  if (parsed.error) {
++    // 用法错误 = AggregateInputError 的 CLI 等价类别(SC-F:双入口错误类别一致)。
++    console.error(`[ledger-aggregate] ${parsed.error}`)
++    console.error(USAGE)
++    process.exit(2)
++  }
++  let result
++  try {
++    result = aggregateLedgers({ dirs: parsed.dirs, expectTotal: parsed.expectTotal })
++  } catch (err) {
++    if (err instanceof AggregateInputError) {
++      // 输入/schema 异常(含 manifest 结构非法,D2)→ exit 2;消息已是白名单化文本。
++      console.error(`[ledger-aggregate] ${sanitizeToken(err.message, 400)}`)
++      console.error(USAGE)
++      process.exit(2)
++    }
++    // 未知内部异常:自身崩溃不得洗绿(SC-K),但不回显 stack(可能含路径/输入内容,D4)。
++    console.error('[ledger-aggregate] 内部错误(细节已省略)')
++    process.exit(3)
++  }
++  console.log(formatCliOutput(result))
++  // [M15 变异点:CLI 退出码映射(改成恒 exit(0) → 全部红结果 spawn fixture 变绿,t-cli-bad-input / t-privacy / t-no-path 应变红)]
++  process.exit(result.ok ? 0 : 1)
++}
+diff --git a/scripts/e2e/ledger-aggregate.test.mjs b/scripts/e2e/ledger-aggregate.test.mjs
+new file mode 100644
+index 00000000..97cc69aa
+--- /dev/null
++++ b/scripts/e2e/ledger-aggregate.test.mjs
+@@ -0,0 +1,899 @@
++// scripts/e2e/ledger-aggregate.test.mjs — #561 跨 child(matrix)ledger 汇总校验器的
++// 正向测试 + 反向变异测试。
++//
++// fixture 策略:与 ledger-summary.test.mjs 同款"真实磁盘路径"原则——不 mock fs。
++// 每个 fixture 在 os.tmpdir() 下建"下载目录"(真实 GitHub artifact 解压形态)。
++// #561 W5 D6 起使用 canonical 布局:manifest.json 与 ledger.jsonl 必须直接在下载
++// 目录根(布局 A;旧的 A/B/C 递归探查已删除)。
++// 校验器会把 manifest/ledger 暂存进本仓 test-artifacts/e2e-runs/<runId>/ 再调
++// summarizeRun,afterEach 统一清理。
++//
++// 反向变异契约(SC-N):每一条拒绝规则对应一个变异 ID,变异 = 临时回退
++// ledger-aggregate.mjs 中标注 [Mn 变异点] 的那段代码,跑本文件,断言实际红集 ==
++// 跑前写下的预测红集,再还原。预测红集写在下面每个变异 ID 的注释里(跑前快照):
++//
++//   M1  headSha 跨 child 相等          → 预测 {t-headsha, t-ctl-headsha}
++//   M2  schemaVersion 跨 child 相等    → 预测 {t-schema}
++//   M5  expectedCells 重算 exact      → 预测 {t-ghost, t-expectedcells-dup}
++//                                          (t-ghost 的 fixture 是 expectedCells 与 ledger
++//                                          同步自洽的幽灵格替换——summarizeRun 全过,只有
++//                                          M5 幽灵/缺格检查在拦;t-expectedcells-dup 由同
++//                                          一块内的 raw 长度检查拦。M23 的 raw 长度/去重
++//                                          判断也在同一 for 块内,整块删除后两个都绿;
++//                                          M23 单独删除时只有 t-expectedcells-dup 绿)
++//   M6  N_A 派生集合 exact            → 预测 {t-na-red1, t-na-red2}
++//   M7  总数 === expectTotal          → 预测 {t-total}
++//   M8  终态 FAIL/RETRY_PASS 红       → 预测 {t-fail, t-retry}
++//   M9  child 记录级失败 pass-through  → 预测 {t-sca-inject, t-ledger-badline, t-empty-ledger,
++//                                          t-no-ledger, t-evidence-missing, t-unknown-status,
++//                                          t-privacy, t-fail, t-retry, t-ctl-name, t-no-path}
++//                                          (t-ghost 已改为纯 M5 形态:fixture 自洽,
++//                                          summarizeRun 不红,不走 pass-through。P0 契约
++//                                          失败是独立 kind:'contract',始终上报,不受
++//                                          M9 影响——变异隔离实证:初版把契约失败归
++//                                          soft,导致 M9 红集混入 7 个契约测试。
++//                                          t-no-path 的 fixture 是"无 ledger"的记录级
++//                                          软失败,pass-through 被摘后 CLI exit 0 → 红,
++//                                          实证补入)
++//   M10 定位失败 fail-closed          → 预测 {t-empty-dir, t-latest-only, t-ledger-only,
++//                                          t-multi-run, t-bad-manifest-json, t-big-manifest,
++//                                          t-symlink, t-traversal, t-shape-expectedcells,
++//                                          t-shape-kernelmodes, t-shape-manifest, t-cli-shape,
++//                                          t-ctl-runid}
++//                                          (shape 错误与 runId 非法同样经 locateRun 返回
++//                                          error,依赖同一条 fail-closed 分支——实证补入)
++//   M11 symlink 拒绝                  → 预测 {t-symlink}
++//   M12 runId 白名单/路径穿越拒绝     → 预测 {t-traversal, t-ctl-runid}
++//   M13 大小上限                      → 预测 {t-big-manifest, t-big-ledger}
++//   M14a CLI 侧必填/绑定校验          → 预测 {t-cli-no-total, t-cli-bad-dirs, t-cli-bad-kernel-binding,
++//                                          t-fn-throw}
++//                                          (变异范围 = parseArgs 的三个校验 return +
++//                                          aggregateLedgers 入口校验 throw——同一条
++//                                          "参数齐备与 kernel 绑定"规则的两处实现;
++//                                          t-fn-throw 的 6 个 case 依赖入口 throw,
++//                                          变异后走崩溃/ok=false 路径——实证补入)
++//   M14b 函数侧入参校验 throw         → 预测 {t-fn-throw}
++//   M15 CLI 退出码映射                → 预测 {t-cli-bad-input, t-privacy, t-no-path}
++//   M16 隐私消毒(child 错误摘要)      → 预测 {t-privacy, t-ledger-badline, t-no-path, t-ctl-name}
++//   M18 topology 每 child 钉死 "prod" → 预测 {t-topology}
++//   M19 rendererModes 钉死 {dom,leafer} 无重复 → 预测 {t-renderers-bogus, t-renderers-dup}
++//   M20 kernelModes 每 child 长度恰 1 → 预测 {t-kernel-len}
++//   M21 selectedScenarios 钉死 scenarioOrder → 预测 {t-scenarios-subset, t-scenarios-ghost,
++//                                          t-scenarios-order}
++//                                          (同一 if 的两级变异:M27 是"改弱"——逐位改回
++//                                          集合检查,只 order 绿;M21 是"删整 if",
++//                                          subset/ghost/order 三者都绿)
++//   M22 persist 钉死 "local"          → 预测 {t-persist}
++//   M23 expectedCells raw 长度/去重   → 预测 {t-expectedcells-dup}
++//   M24 kernelModes 与期望 kernel 绑定 → 预测 {t-kernel}
++//   M25 manifest shape guard(schema)  → 预测 {t-shape-expectedcells, t-shape-kernelmodes,
++//                                          t-shape-manifest, t-cli-shape}
++//   M26 输出回显白名单化(sanitizeToken + headShaToken 原样透传) → 预测 {t-ctl-runid,
++//                                          t-ctl-headsha, t-ctl-name}
++//                                          (t-no-path 的红源是 M16 的暂存路径剥离与
++//                                          M15 的退出码映射,与 M26 无关)
++//   M27 selectedScenarios 逐位顺序钉死 → 预测 {t-scenarios-order}
++//                                          (合法排列"同集合但乱序"也红;逐位相等已
++//                                         吸收长度/去重/集合三查)
++//   M28 summarizeRun 抛错转 hard       → 预测 {t-ledger-null-row}
++//                                          (null 行使 summarizeRun 内部 TypeError,删 catch
++//                                          后穿到 CLI 变 exit 3;primitive 行不抛——属性
++//                                          访问返回 undefined,走记录级 runId 不符路径,
++//                                          本就不 exit 3,t-ledger-primitive-row 为行为锚点)
++//
++//   M3/M4 已随 P0 修复删除:旧 kernel 并集与 topology 相等规则被"每 child 钉死"
++//   规则(M18/M20/M24)吸收;M17(禁读 LATEST)已随 D6 canonical 布局收敛删除——
++//   canonical 布局不扫描目录条目,LATEST 天然不可读;t-no-latest-env 保留为
++//   行为测试(毒化 LATEST 不影响结果),无独立变异点。
++import { afterEach, describe, expect, it } from 'vitest'
++import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
++import { join } from 'node:path'
++import { spawn } from 'node:child_process'
++import { fileURLToPath } from 'node:url'
++import os from 'node:os'
++import { cellKey, runDir } from './result-ledger.mjs'
++import { AggregateInputError, aggregateLedgers } from './ledger-aggregate.mjs'
++import { leaferSkippedScenarios, scenarioOrder } from './scenarios/index.mjs'
++
++const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url))
++
++// 真实矩阵总格数由 scenarioOrder 派生,不再在 20 处硬编码。
++const MATRIX_TOTAL = scenarioOrder.length * 4
++
++// ---------------------------------------------------------------------------
++// fixture 构造(canonical 布局:manifest.json + ledger.jsonl 直接在下载目录根)
++// ---------------------------------------------------------------------------
++
++const cleanedTmpRoots = []
++const cleanedStagedRuns = []
++afterEach(() => {
++  for (const root of cleanedTmpRoots) {
++    try {
++      rmSync(root, { recursive: true, force: true })
++    } catch {}
++  }
++  cleanedTmpRoots.length = 0
++  for (const runId of cleanedStagedRuns) {
++    try {
++      rmSync(runDir(runId), { recursive: true, force: true })
++    } catch {}
++  }
++  cleanedStagedRuns.length = 0
++})
++
++let fixtureSeq = 0
++const nextRunId = (kernel) => `agg-${kernel}-${process.pid}-${fixtureSeq += 1}`
++
++const makeCells = (kernel, renderers, scenarios, topology) => {
++  const cells = []
++  for (const renderer of renderers) {
++    for (const scenario of scenarios) {
++      cells.push({ scenario, renderer, kernel, topology })
++    }
++  }
++  return cells
++}
++
++const cellStatus = (cell) => (leaferSkippedScenarios[cell.scenario] && cell.renderer === 'leafer' ? 'N_A' : 'PASS')
++
++const makeRecord = ({ runId, cell, headSha, status, overrides = {} }) => ({
++  runId,
++  schemaVersion: '1',
++  name: cellKey(cell),
++  scenario: cell.scenario,
++  renderer: cell.renderer,
++  kernel: cell.kernel,
++  topology: cell.topology,
++  status: status ?? cellStatus(cell),
++  durationMs: 100,
++  flaky: false,
++  retries: 0,
++  evidenceMissing: false,
++  retryAttempts: [],
++  message: null,
++  headSha,
++  diagnostics: { pageErrors: [] },
++  ...overrides,
++})
++
++/**
++ * 构造一个完整 child 下载目录(canonical 布局 A:manifest.json + ledger.jsonl
++ * 直接在该目录根)。fixture 数据从 scenarioOrder/leaferSkippedScenarios 动态派生
++ * (SC-C:期望 N_A 数随 skip 名单变化,测试套件不写死 2)。返回
++ * { dir, runId, manifest, records }。
++ */
++const buildChild = ({ kernel, headSha = 'abc1234', topology = 'prod', scenarios = scenarioOrder, runIdOverride = null, manifestOverrides = {}, ledgerOverrides = [] }) => {
++  const root = mkdtempSync(join(os.tmpdir(), 'agg-fixture-'))
++  cleanedTmpRoots.push(root)
++  const runId = runIdOverride ?? nextRunId(kernel)
++  const renderers = ['dom', 'leafer']
++  const expectedCells = makeCells(kernel, renderers, scenarios, topology)
++  const manifest = {
++    runId,
++    schemaVersion: '1',
++    headSha,
++    topology,
++    persist: 'local',
++    kernelModes: [kernel],
++    rendererModes: renderers,
++    selectedScenarios: scenarios,
++    expectedCells,
++    recordedAt: new Date(0).toISOString(),
++    ...manifestOverrides,
++  }
++  const records = expectedCells.map((cell) => makeRecord({ runId, cell, headSha }))
++  for (const override of ledgerOverrides) records.push(override)
++  writeFileSync(join(root, 'manifest.json'), JSON.stringify(manifest))
++  writeFileSync(join(root, 'ledger.jsonl'), `${records.map((record) => JSON.stringify(record)).join('\n')}\n`)
++  return { dir: root, runId, manifest, records }
++}
++
++const rewriteLedger = (dir, records) => {
++  writeFileSync(join(dir, 'ledger.jsonl'), `${records.map((record) => JSON.stringify(record)).join('\n')}\n`)
++}
++
++const runAggregate = ({ a, b, expectTotal = MATRIX_TOTAL }) =>
++  aggregateLedgers({
++    dirs: [
++      { path: a.dir, label: 'child-1', expectKernel: 'legacy' },
++      { path: b.dir, label: 'child-2', expectKernel: 'new' },
++    ],
++    expectTotal,
++  })
++
++const runCli = (args) =>
++  new Promise((resolvePromise) => {
++    const script = fileURLToPath(new URL('./ledger-aggregate.mjs', import.meta.url))
++    const child = spawn(process.execPath, [script, ...args], { cwd: REPO_ROOT })
++    let stdout = ''
++    let stderr = ''
++    child.stdout.on('data', (chunk) => { stdout += chunk })
++    child.stderr.on('data', (chunk) => { stderr += chunk })
++    child.on('close', (code) => resolvePromise({ code, stdout, stderr }))
++  })
++
++// ---------------------------------------------------------------------------
++// 正向路径
++// ---------------------------------------------------------------------------
++
++describe('ledger-aggregate — 正常路径', () => {
++  it('CLEAN: 双 child 各 74 格(73 PASS + 1 N_A),合计 148 → ok=true', () => {
++    // 漂移哨兵:场景增删时这一条先红,提醒同步更新
++    // .github/workflows/nightly-e2e.yml 的 --expect-total 字面量。
++    expect(scenarioOrder.length).toBe(37)
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(true)
++    expect(result.errors).toHaveLength(0)
++    expect(result.total).toBe(MATRIX_TOTAL)
++    // N_A 恰等于派生集合:每 child 恰 |skips| 个(SC-C 动态派生,不写死 2)
++    expect(result.counts.N_A).toBe(2 * Object.keys(leaferSkippedScenarios).length)
++    expect(result.counts.PASS).toBe(MATRIX_TOTAL - result.counts.N_A)
++    expect(result.counts).toMatchObject({ RETRY_PASS: 0, FAIL: 0 })
++  })
++
++  it('SC-A: 复用 summarizeRun —— 注入非法记录,错误文案来自 summarizeRun 原文', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const bad = makeRecord({ runId: b.runId, cell: { scenario: 'debug', renderer: 'dom', kernel: 'new', topology: 'prod' }, headSha: 'different-sha' })
++    rewriteLedger(b.dir, [bad])
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    // 文案是 summarizeRun 的"记录 headSha 不符",带 child 前缀点名
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('记录 headSha 不符'))).toBe(true)
++  })
++
++  it('SC-M: 源码注释与文案只声称 T1,不含更高等级措辞', async () => {
++    const { readFile } = await import('node:fs/promises')
++    const source = await readFile(fileURLToPath(new URL('./ledger-aggregate.mjs', import.meta.url)), 'utf8')
++    for (const banned of ['防伪造', '不可篡改', '防恶意', 'tamper-proof', 'forgery', '篡改']) {
++      expect(source, `源码不得出现 ${banned}`).not.toContain(banned)
++    }
++  })
++})
++
++// ---------------------------------------------------------------------------
++// P0:manifest 契约每 child 钉死(回归:每种攻击形态各一条必红 + 变异映射)
++// ---------------------------------------------------------------------------
++
++describe('ledger-aggregate — P0 manifest 契约(每 child 钉死)', () => {
++  it('t-topology: manifest topology=dev → 红,点名该 child(M18 预测红集 {t-topology})', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', topology: 'dev' })
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('topology 必须恰为 "prod"'))).toBe(true)
++  })
++
++  it('t-renderers-bogus: rendererModes 含 bogus(lead P0 攻击形态)→ 红(M19 预测红集 {t-renderers-bogus, t-renderers-dup})', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', manifestOverrides: { rendererModes: ['dom', 'bogus'] } })
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('rendererModes 去重后必须恰为 {dom, leafer}'))).toBe(true)
++  })
++
++  it('t-renderers-dup: rendererModes 有重复 → 红(M19 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', manifestOverrides: { rendererModes: ['dom', 'dom'] } })
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('rendererModes 去重后必须恰为'))).toBe(true)
++  })
++
++  it('t-kernel-len: kernelModes 长度 2(违反"恰为 1")→ 红(M20 预测红集 {t-kernel-len})', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', manifestOverrides: { kernelModes: ['legacy', 'new'] } })
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('kernelModes 长度必须恰为 1'))).toBe(true)
++  })
++
++  it('t-scenarios-subset: selectedScenarios 选 36/37 个(子集)→ 红(M21 预测红集 {t-scenarios-subset, t-scenarios-ghost})', () => {
++    // children 各自自洽(summarizeRun 全过),但 selectedScenarios 不是权威 scenarioOrder。
++    // expectTotal 必须等于实际总数(a 全量 ×2 renderer + b 子集 ×2 renderer),否则总数
++    // 规则(M7)会先红,M21 变异时红集就不纯了——本测试要锁的是 M21 这一条规则。
++    const subset = scenarioOrder.filter((name) => name !== 'debug')
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', scenarios: subset })
++    const result = runAggregate({ a, b, expectTotal: scenarioOrder.length * 2 + subset.length * 2 })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('selectedScenarios 必须恰等于权威 scenarioOrder'))).toBe(true)
++  })
++
++  it('t-scenarios-ghost: selectedScenarios 含幽灵场景名(多 1 项)→ 红(M21 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', manifestOverrides: { selectedScenarios: [...scenarioOrder, 'ghost-scenario'] } })
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('selectedScenarios 必须恰等于权威 scenarioOrder'))).toBe(true)
++  })
++
++  it('t-scenarios-order: selectedScenarios 合法排列(首尾互换,同集合)→ 红(M27 预测红集 {t-scenarios-order})', () => {
++    // 只换顺序不换集合:旧实现(只查长度+集合+去重)会绿,逐位相等才拦得住——本用例
++    // 对旧实现必须是绿的,证明它确实抓到了旧实现漏掉的东西。fixture 其余部分
++    // (expectedCells/records)保持权威顺序自洽,唯 selectedScenarios 乱序,契约级红。
++    const a = buildChild({ kernel: 'legacy' })
++    const permuted = [scenarioOrder[scenarioOrder.length - 1], ...scenarioOrder.slice(1, -1), scenarioOrder[0]]
++    const b = buildChild({ kernel: 'new', manifestOverrides: { selectedScenarios: permuted } })
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('selectedScenarios 必须恰等于权威 scenarioOrder'))).toBe(true)
++  })
++
++  it('t-persist: persist=indexeddb → 红(M22 预测红集 {t-persist})', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', manifestOverrides: { persist: 'indexeddb' } })
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('persist 必须恰为 "local"'))).toBe(true)
++  })
++
++  it('t-kernel: 两份 kernelModes 都是 ["legacy"](matrix 写错形态)→ 经 expectKernel 绑定红(M24 预测红集 {t-kernel})', () => {
++    // 每 child 契约本身合法(长度 1、值合法),但 child-2 自报 legacy 而 --dir 绑定 new。
++    // 旧 M3"并集 {legacy,new}"规则已删除,此形态由 D3 绑定拦截。
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'legacy' })
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('kernelModes 与期望 kernel 不符'))).toBe(true)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// SC-B 身份绑定
++// ---------------------------------------------------------------------------
++
++describe('ledger-aggregate — SC-B 跨 child 身份绑定', () => {
++  it('t-headsha: 两份 manifest headSha 不同 → 红(M1 预测红集 {t-headsha, t-ctl-headsha})', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', headSha: 'anothersha' })
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('headSha 不一致'))).toBe(true)
++  })
++
++  it('t-schema: schemaVersion 跨 child 不同 → 红(M2 预测红集 {t-schema})', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    // 记录的 schemaVersion 也要改成 '2',否则 summarizeRun 先红(记录↔manifest 不符),
++    // 那就不是本规则在拦了——这里要的是"两个 child 各自自洽但互不相同"。
++    const b = buildChild({ kernel: 'new', manifestOverrides: { schemaVersion: '2' } })
++    rewriteLedger(b.dir, b.records.map((record) => ({ ...record, schemaVersion: '2' })))
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('schemaVersion 不一致'))).toBe(true)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// SC-C / SC-D / SC-E exact 集合声明
++// ---------------------------------------------------------------------------
++
++describe('ledger-aggregate — SC-C/SC-D/SC-E exact 集合声明', () => {
++  it('t-ghost: expectedCells 与 ledger 同步把一格换成幽灵场景(各自自洽、raw 长度不变)→ M5 幽灵格检查红(M5 预测红集 {t-ghost, t-expectedcells-dup})', () => {
++    // 只改 manifest 会让 summarizeRun 先报"缺格"红(M9 路径),跨 child 的 M5 检查
++    // 根本跑不到——纯 M5 形态要求 manifest.expectedCells 与 ledger 记录同步自洽:
++    // raw 长度不变、无重复,唯独集合与权威重算不符。
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const manifestPath = join(b.dir, 'manifest.json')
++    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
++    manifest.expectedCells[0] = { ...manifest.expectedCells[0], scenario: 'ghost-scenario' }
++    writeFileSync(manifestPath, JSON.stringify(manifest))
++    const rewritten = b.records.map((record, index) =>
++      index === 0 ? { ...record, scenario: 'ghost-scenario', name: 'ghost-scenario::dom::new::prod' } : record,
++    )
++    rewriteLedger(b.dir, rewritten)
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('幽灵格'))).toBe(true)
++  })
++
++  it('t-expectedcells-dup: expectedCells 72 项合法 + 1 项重复(raw 73,Set 吞并)→ 红(M5/M23 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const manifestPath = join(b.dir, 'manifest.json')
++    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
++    manifest.expectedCells.push(manifest.expectedCells[0]) // raw 73,Set size 72
++    writeFileSync(manifestPath, JSON.stringify(manifest))
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('expectedCells 数量/重复'))).toBe(true)
++  })
++
++  it('t-total: expectTotal=150 而实际 148 → 红(M7 预测红集 {t-total})', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const result = runAggregate({ a, b, expectTotal: 150 })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('总格数不符'))).toBe(true)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// SC-C N_A 派生
++// ---------------------------------------------------------------------------
++
++describe('ledger-aggregate — SC-C N_A 派生集合', () => {
++  it('t-na-red1: skip 场景的 leafer 格被记成 PASS(该 N_A)→ 红,点名缺失格(M6 预测红集 {t-na-red1, t-na-red2})', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const skippedName = Object.keys(leaferSkippedScenarios)[0]
++    const rewritten = b.records.map((record) =>
++      record.scenario === skippedName && record.renderer === 'leafer' ? { ...record, status: 'PASS' } : record,
++    )
++    rewriteLedger(b.dir, rewritten)
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('N_A 格与派生集合不符'))).toBe(true)
++    expect(result.errors.some((e) => e.includes('缺失'))).toBe(true)
++  })
++
++  it('t-na-red2: 非 skip 场景出现 N_A 格 → 红,点名多余格(M6 预测红集 {t-na-red2})', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    // 动态选"当前不在 skip 名单"的场景:SC-C 临时变异(往 leaferSkippedScenarios 加项)
++    // 会把 debug 变成 skip,硬编码 'debug' 会让本测试在变异下失去红性——派生逻辑要
++    // 跟随名单,测试 fixture 也得跟随名单。
++    const nonSkippedName = scenarioOrder.find((name) => !leaferSkippedScenarios[name])
++    const rewritten = b.records.map((record) =>
++      record.scenario === nonSkippedName && record.renderer === 'leafer' ? { ...record, status: 'N_A' } : record,
++    )
++    rewriteLedger(b.dir, rewritten)
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('N_A 格与派生集合不符'))).toBe(true)
++    expect(result.errors.some((e) => e.includes('多余'))).toBe(true)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// SC-J 终态边界
++// ---------------------------------------------------------------------------
++
++describe('ledger-aggregate — SC-J 终态边界', () => {
++  it('t-fail: 出现 FAIL 格 → 红,点名格但无正文(M8 预测红集 {t-fail, t-retry})', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const rewritten = b.records.map((record) =>
++      record.scenario === 'debug' && record.renderer === 'dom' ? { ...record, status: 'FAIL', message: 'boom' } : record,
++    )
++    rewriteLedger(b.dir, rewritten)
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('终态含') && e.includes('FAIL') && e.includes('debug::dom::new::prod'))).toBe(true)
++    expect(result.errors.some((e) => e.includes('boom'))).toBe(false) // 不泄 message 正文
++  })
++
++  it('t-retry: 出现 RETRY_PASS 格 → 红(M8 预测红集 {t-retry})', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const rewritten = b.records.map((record) =>
++      record.scenario === 'debug' && record.renderer === 'dom' ? { ...record, status: 'RETRY_PASS', flaky: true, retries: 1 } : record,
++    )
++    rewriteLedger(b.dir, rewritten)
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('RETRY_PASS'))).toBe(true)
++  })
++
++  it('t-evidence-missing: 记录 evidenceMissing=true → 红(经 summarizeRun 拦,M9 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const rewritten = b.records.map((record) =>
++      record.scenario === 'debug' && record.renderer === 'dom' ? { ...record, evidenceMissing: true } : record,
++    )
++    rewriteLedger(b.dir, rewritten)
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('证据缺失'))).toBe(true)
++  })
++
++  it('t-unknown-status: 未知 status → 红(经 summarizeRun 拦,M9 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const rewritten = b.records.map((record) =>
++      record.scenario === 'debug' && record.renderer === 'dom' ? { ...record, status: 'WEIRD' } : record,
++    )
++    rewriteLedger(b.dir, rewritten)
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('未知 status'))).toBe(true)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// SC-H 禁读 LATEST(D6 后为行为测试:canonical 布局天然不读 LATEST)
++// ---------------------------------------------------------------------------
++
++describe('ledger-aggregate — SC-H 禁读 LATEST', () => {
++  it('t-no-latest-env: 无 LATEST 文件的环境仍跑通;放入含毒 LATEST 也被忽略(行为测试,无变异点)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    let result = runAggregate({ a, b })
++    expect(result.ok).toBe(true)
++    // 毒化 LATEST:即使指针指向不存在的 runId,校验器也不该读它
++    writeFileSync(join(a.dir, 'LATEST'), 'evil-runid-does-not-exist')
++    writeFileSync(join(b.dir, 'LATEST'), 'evil-runid-does-not-exist')
++    result = runAggregate({ a, b })
++    expect(result.ok).toBe(true)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// SC-I 下载边界(canonical 布局)
++// ---------------------------------------------------------------------------
++
++describe('ledger-aggregate — SC-I 下载边界 fail-closed', () => {
++  it('t-empty-dir: 两个下载目录都为空 → 红,点名两个 child(M10 预测红集包含)', () => {
++    const empty1 = mkdtempSync(join(os.tmpdir(), 'agg-empty-'))
++    const empty2 = mkdtempSync(join(os.tmpdir(), 'agg-empty-'))
++    cleanedTmpRoots.push(empty1, empty2)
++    const result = aggregateLedgers({
++      dirs: [
++        { path: empty1, label: 'child-1', expectKernel: 'legacy' },
++        { path: empty2, label: 'child-2', expectKernel: 'new' },
++      ],
++      expectTotal: MATRIX_TOTAL,
++    })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-1') && e.includes('未找到 manifest.json'))).toBe(true)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('未找到 manifest.json'))).toBe(true)
++  })
++
++  it('t-latest-only: 目录只含 LATEST 指针(缺整份 run)→ 红,点名 child(M10 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const latestOnly = mkdtempSync(join(os.tmpdir(), 'agg-latest-'))
++    cleanedTmpRoots.push(latestOnly)
++    writeFileSync(join(latestOnly, 'LATEST'), 'some-runid')
++    const result = aggregateLedgers({
++      dirs: [
++        { path: a.dir, label: 'child-1', expectKernel: 'legacy' },
++        { path: latestOnly, label: 'child-2', expectKernel: 'new' },
++      ],
++      expectTotal: MATRIX_TOTAL,
++    })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('未找到 manifest.json'))).toBe(true)
++  })
++
++  it('t-ledger-only: 有 ledger 无 manifest → 红,点名 child(M10 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const ledgerOnly = mkdtempSync(join(os.tmpdir(), 'agg-ledgeronly-'))
++    cleanedTmpRoots.push(ledgerOnly)
++    writeFileSync(join(ledgerOnly, 'ledger.jsonl'), '{"runId":"x"}\n')
++    const result = aggregateLedgers({
++      dirs: [
++        { path: a.dir, label: 'child-1', expectKernel: 'legacy' },
++        { path: ledgerOnly, label: 'child-2', expectKernel: 'new' },
++      ],
++      expectTotal: MATRIX_TOTAL,
++    })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('有 ledger 无 manifest'))).toBe(true)
++  })
++
++  it('t-multi-run: 一个 child 目录解压出两个 run(子目录形态)→ 红,点名该 child(M10 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const run2 = buildChild({ kernel: 'new' })
++    const run3 = buildChild({ kernel: 'new' })
++    const multi = mkdtempSync(join(os.tmpdir(), 'agg-multi-'))
++    cleanedTmpRoots.push(multi)
++    // canonical 布局下 manifest.json 必须在根;把两个 run 的整个目录塞进来 =
++    // 根没有 manifest.json,且提示子目录里找到了(旧布局 B 的形态)。
++    cpSync(run2.dir, join(multi, run2.runId), { recursive: true })
++    cpSync(run3.dir, join(multi, run3.runId), { recursive: true })
++    const result = aggregateLedgers({
++      dirs: [
++        { path: a.dir, label: 'child-1', expectKernel: 'legacy' },
++        { path: multi, label: 'child-2', expectKernel: 'new' },
++      ],
++      expectTotal: MATRIX_TOTAL,
++    })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('未找到 manifest.json'))).toBe(true)
++  })
++
++  it('t-no-ledger: 有 manifest 无 ledger → 红,点名 child(M9 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    rmSync(join(b.dir, 'ledger.jsonl'))
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('ledger 缺失'))).toBe(true)
++  })
++
++  it('t-empty-ledger: ledger 存在但 0 行 → 红,点名 child(M9 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    writeFileSync(join(b.dir, 'ledger.jsonl'), '')
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2'))).toBe(true)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// SC-G 外部输入安全
++// ---------------------------------------------------------------------------
++
++describe('ledger-aggregate — SC-G 外部输入安全', () => {
++  it('t-bad-manifest-json: manifest 坏 JSON → 红,且错误不携带输入正文(M10/M16 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    writeFileSync(join(b.dir, 'manifest.json'), '{not-json SECRET_ECHO_123')
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('解析失败'))).toBe(true)
++    expect(result.errors.some((e) => e.includes('SECRET_ECHO_123'))).toBe(false)
++  })
++
++  it('t-ledger-badline: ledger 某行坏 JSON → 红,点出行号,且不泄该行内容(M9/M16 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const lines = b.records.map((record) => JSON.stringify(record))
++    // 坏行必须是"非 JSON 起始"形态:V8 的 token 报错会原样回显整行输入
++    // (如 "Unexpected token 'X', "X_SECRET_LINE_789" is not valid JSON")——截断类
++    // 只报位置不回显,消毒被摘也检不出(实证见 M16 变异过程)。
++    lines.splice(2, 0, 'X_SECRET_LINE_789') // 第 3 行坏 JSON
++    writeFileSync(join(b.dir, 'ledger.jsonl'), `${lines.join('\n')}\n`)
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('ledger 第 3 行'))).toBe(true)
++    expect(result.errors.some((e) => e.includes('SECRET_LINE_789'))).toBe(false)
++  })
++
++  it('t-ledger-null-row: ledger 某行为 JSON null(合法 JSON 非对象行)→ CLI exit 恰为 1,非 3(M28 预测红集 {t-ledger-null-row})', async () => {
++    // 语法坏行(t-ledger-badline)已被 JSON.parse catch 拦;null 行 parse 成功返回 null,
++    // summarizeRun 随后访问 record.runId 抛 TypeError——若不被 M28 catch 拦截会穿到 CLI
++    // 变 exit 3,把"数据不合法"伪装成"校验器内部错误"。改后为结构化 hard 错误,exit 1。
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const lines = b.records.map((record) => JSON.stringify(record))
++    lines.splice(2, 0, 'null') // 第 3 行是合法 JSON 的非对象行
++    writeFileSync(join(b.dir, 'ledger.jsonl'), `${lines.join('\n')}\n`)
++    const { code, stderr } = await runCli(['--dir', `legacy=${a.dir}`, '--dir', `new=${b.dir}`, '--expect-total', `${MATRIX_TOTAL}`])
++    expect(code).toBe(1)
++    expect(code).not.toBe(3)
++    expect(stderr).not.toContain('内部错误')
++  })
++
++  it('t-ledger-primitive-row: ledger 某行为 primitive(123)→ CLI exit 恰为 1,非 3(M28 行为锚点)', async () => {
++    // primitive 行不抛(属性访问返回 undefined,走记录级 runId 不符路径,本就 exit 1);
++    // 本用例锚定"非对象行整体不使 CLI 崩成 3"这一行为,与 t-ledger-null-row 互补。
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const lines = b.records.map((record) => JSON.stringify(record))
++    lines.splice(2, 0, '123') // 第 3 行是合法 JSON 的 primitive 行
++    writeFileSync(join(b.dir, 'ledger.jsonl'), `${lines.join('\n')}\n`)
++    const { code, stderr } = await runCli(['--dir', `legacy=${a.dir}`, '--dir', `new=${b.dir}`, '--expect-total', `${MATRIX_TOTAL}`])
++    expect(code).toBe(1)
++    expect(code).not.toBe(3)
++    expect(stderr).not.toContain('内部错误')
++  })
++
++  it('t-big-manifest: manifest 超大(合法 JSON)→ 红(M10/M13 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const manifest = JSON.parse(readFileSync(join(b.dir, 'manifest.json'), 'utf8'))
++    manifest.pad = 'x'.repeat(1500 * 1024) // ~1.5MB 合法 JSON 字段
++    writeFileSync(join(b.dir, 'manifest.json'), JSON.stringify(manifest))
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('大小上限'))).toBe(true)
++  })
++
++  it('t-big-ledger: ledger 超大 → 红(M13 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    // 把一条真实格(debug::dom::new::prod)换成超长 message 版本:内容自洽,唯一问题就是体积
++    const rewritten = b.records.map((record) =>
++      record.scenario === 'debug' && record.renderer === 'dom' ? { ...record, message: 'x'.repeat(11 * 1024 * 1024) } : record,
++    )
++    rewriteLedger(b.dir, rewritten)
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('大小上限'))).toBe(true)
++  })
++
++  it('t-symlink: manifest.json 是 symlink → 红,拒绝读取(M10/M11 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    // manifest 换成指向"合法 manifest 文件"的 symlink:若 symlink 检查失效,读穿后
++    // 一切正常 → 只有 M11 的 symlink 规则能拦住这条。
++    rmSync(join(b.dir, 'manifest.json'))
++    const target = join(b.dir, 'honest-manifest.json')
++    writeFileSync(target, JSON.stringify(b.manifest))
++    symlinkSync(target, join(b.dir, 'manifest.json'))
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('symlink'))).toBe(true)
++  })
++
++  it('t-traversal: manifest.runId 含路径穿越字符 → 红(M10/M12 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    // manifest 在下载目录根,runId 是"穿越形态"字符串。
++    // 若 M12 的 SAFE_NAME 白名单失效,staging 会真按该 runId 建目录并全绿——这正是要拦的。
++    const evilRunId = `evil-${process.pid}/../escape-${process.pid}`
++    const b = buildChild({ kernel: 'new', runIdOverride: evilRunId })
++    cleanedStagedRuns.push(evilRunId)
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('runId 非法'))).toBe(true)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// D2:manifest shape guard(schema → AggregateInputError / CLI exit 2)
++// ---------------------------------------------------------------------------
++
++describe('ledger-aggregate — D2 manifest shape guard', () => {
++  it('t-shape-expectedcells: expectedCells={} → 结构化错误,非 TypeError 崩溃(M25 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', manifestOverrides: { expectedCells: {} } })
++    expect(() => runAggregate({ a, b })).toThrow(AggregateInputError)
++    expect(() => runAggregate({ a, b })).toThrow(/expectedCells/)
++  })
++
++  it('t-shape-kernelmodes: kernelModes 非数组(字符串)→ 结构化错误(M25 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', manifestOverrides: { kernelModes: 'legacy' } })
++    expect(() => runAggregate({ a, b })).toThrow(AggregateInputError)
++    expect(() => runAggregate({ a, b })).toThrow(/kernelModes/)
++  })
++
++  it('t-shape-manifest: manifest 只含 runId(缺其余字段)→ 结构化错误(M25 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    // 整个 manifest 替换为只含 runId 的对象:runId 过白名单,但 shape 缺字段
++    writeFileSync(join(b.dir, 'manifest.json'), JSON.stringify({ runId: b.runId }))
++    expect(() => runAggregate({ a, b })).toThrow(AggregateInputError)
++    expect(() => runAggregate({ a, b })).toThrow(/schemaVersion/)
++  })
++
++  it('t-cli-shape: CLI 喂结构非法的 manifest → exit 2(M25 预测红集包含)', async () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', manifestOverrides: { kernelModes: 'x' } })
++    const { code } = await runCli(['--dir', `legacy=${a.dir}`, '--dir', `new=${b.dir}`, '--expect-total', `${MATRIX_TOTAL}`])
++    expect(code).toBe(2)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// D4:输出回显白名单化(控制字符/换行/原始 path)
++// ---------------------------------------------------------------------------
++
++describe('ledger-aggregate — D4 输出回显白名单化', () => {
++  it('t-ctl-runid: runId 含换行控制字符 → 红,且错误输出无换行注入(M12/M26 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', runIdOverride: 'evil\nSECRET_RUNID' })
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('child-2') && e.includes('runId 非法'))).toBe(true)
++    for (const error of result.errors) {
++      expect(error, `错误不得含换行(被注入): ${error}`).not.toContain('\n')
++    }
++  })
++
++  it('t-ctl-headsha: headSha 含换行控制字符 → 红,且 headSha 回显被白名单化(M1/M26 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new', headSha: 'abc\nSECRET_SHA' })
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    expect(result.errors.some((e) => e.includes('headSha 不一致'))).toBe(true)
++    for (const error of result.errors) {
++      expect(error, `错误不得含换行(被注入): ${error}`).not.toContain('\n')
++    }
++    // 非法 headSha 整段省略,不回显原始内容
++    expect(result.errors.some((e) => e.includes('<headSha 非 hex,已省略>'))).toBe(true)
++  })
++
++  it('t-ctl-name: 记录 name 含换行控制字符(终态点名+记录级错误)→ 全部输出无换行(M9/M16/M26 预测红集包含)', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    // 把 debug::dom::new::prod 那条换成"name 含换行 + 终态 FAIL"的伪造记录:
++    // 同时触发 summarizeRun 的"记录 name 与字段不符"与聚合层的"终态点名"两处回显。
++    const evilName = 'debug::dom::new::prod\nSECRET_NAME'
++    const rewritten = b.records.map((record) =>
++      record.scenario === 'debug' && record.renderer === 'dom' ? { ...record, name: evilName, status: 'FAIL' } : record,
++    )
++    rewriteLedger(b.dir, rewritten)
++    const result = runAggregate({ a, b })
++    expect(result.ok).toBe(false)
++    for (const error of result.errors) {
++      expect(error, `错误不得含换行(被注入): ${error}`).not.toContain('\n')
++    }
++  })
++
++  it('t-no-path: CLI 输出不含本仓暂存路径与下载目录路径(M15/M16 预测红集包含)', async () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    rmSync(join(b.dir, 'ledger.jsonl')) // 触发 summarizeRun 的"ledger 缺失:<路径>"错误
++    const { code, stdout, stderr } = await runCli(['--dir', `legacy=${a.dir}`, '--dir', `new=${b.dir}`, '--expect-total', `${MATRIX_TOTAL}`])
++    expect(code).not.toBe(0)
++    const combined = stdout + stderr
++    expect(combined).not.toContain('test-artifacts')
++    expect(combined).not.toContain(a.dir)
++    expect(combined).not.toContain(b.dir)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// SC-F / SC-K CLI 与函数入口
++// ---------------------------------------------------------------------------
++
++describe('ledger-aggregate — SC-F/SC-K 双入口 fail-closed', () => {
++  it('t-fn-throw: 直调函数入参违规 → throw AggregateInputError(M14b 预测红集 {t-fn-throw})', () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const legacyDir = { path: a.dir, expectKernel: 'legacy' }
++    const newDir = { path: b.dir, expectKernel: 'new' }
++    // 缺 expectTotal
++    expect(() => aggregateLedgers({ dirs: [legacyDir, newDir] })).toThrow(AggregateInputError)
++    // 只有 1 个 dir
++    expect(() => aggregateLedgers({ dirs: [legacyDir], expectTotal: MATRIX_TOTAL })).toThrow(AggregateInputError)
++    // dirs 元素非对象(null)
++    expect(() => aggregateLedgers({ dirs: [null, {}], expectTotal: MATRIX_TOTAL })).toThrow(AggregateInputError)
++    // dir 缺 expectKernel(D3 绑定必填)
++    expect(() => aggregateLedgers({ dirs: [{ path: a.dir }, { path: b.dir }], expectTotal: MATRIX_TOTAL })).toThrow(AggregateInputError)
++    // expectKernel 非法枚举
++    expect(() => aggregateLedgers({ dirs: [{ path: a.dir, expectKernel: 'x' }, newDir], expectTotal: MATRIX_TOTAL })).toThrow(AggregateInputError)
++    // 两 dir 绑定同一 kernel
++    expect(() => aggregateLedgers({ dirs: [legacyDir, { path: b.dir, expectKernel: 'legacy' }], expectTotal: MATRIX_TOTAL })).toThrow(AggregateInputError)
++  })
++
++  it('t-cli-no-total: CLI 不带 --expect-total → 退出码 2(用法错误)(M14a 预测红集包含)', async () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const { code, stderr } = await runCli(['--dir', `legacy=${a.dir}`, '--dir', `new=${b.dir}`])
++    expect(code).toBe(2)
++    expect(stderr).toContain('--expect-total 必填')
++  })
++
++  it('t-cli-bad-dirs: CLI 只给 1 个 --dir → 退出码 2(M14a 预测红集包含)', async () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const { code } = await runCli(['--dir', `legacy=${a.dir}`, '--expect-total', `${MATRIX_TOTAL}`])
++    expect(code).toBe(2)
++  })
++
++  it('t-cli-bad-kernel-binding: 两个 --dir 绑定同一 kernel → 退出码 2(M14a 预测红集包含)', async () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    const { code, stderr } = await runCli(['--dir', `legacy=${a.dir}`, '--dir', `legacy=${b.dir}`, '--expect-total', `${MATRIX_TOTAL}`])
++    expect(code).toBe(2)
++    expect(stderr).toContain('kernel 必须互不相同')
++  })
++
++  it('t-cli-bad-input: CLI 喂不存在的下载目录 → 非零退出(exit 1,红不当绿)(M15 预测红集包含)', async () => {
++    const b = buildChild({ kernel: 'new' })
++    // 只断言退出码:错误文案的检查由直调测试(t-empty-dir 等)负责;M10 变异下 CLI
++    // 走崩溃路径(内部错误消息),多断言会让 M10 的红集混入本测试。
++    const { code } = await runCli(['--dir', 'legacy=/nonexistent/agg-no-such-dir', '--dir', `new=${b.dir}`, '--expect-total', `${MATRIX_TOTAL}`])
++    expect(code).not.toBe(0)
++  })
++
++  it('t-privacy: CLI 输出不含 secret 字段与超长 message 原文(M15/M16 预测红集包含)', async () => {
++    const a = buildChild({ kernel: 'legacy' })
++    const b = buildChild({ kernel: 'new' })
++    // secret 必须 ≤ ~18 字符:V8 的 "Unexpected token" 报错只回显输入前 ~20 字符,
++    // 超长 secret 会被截断在回显外(实证:M16 初版用 21 字符 marker 检不出泄漏)。
++    const secretMsg = `SECRET_${process.pid}`
++    const longMarker = 'ZZZ_END_MARKER_777'
++    const rewritten = b.records.map((record) =>
++      record.scenario === 'debug' && record.renderer === 'dom'
++        ? { ...record, status: 'FAIL', message: secretMsg }
++        : record,
++    )
++    // 追加:一条超长 message 记录 + 一条坏行(非 JSON 起始形态,V8 报错会回显整行)
++    rewritten.push({ ...b.records[0], status: 'FAIL', message: 'a'.repeat(10000) + longMarker })
++    const lines = rewritten.map((record) => JSON.stringify(record))
++    lines.push(`X_${secretMsg}`)
++    writeFileSync(join(b.dir, 'ledger.jsonl'), `${lines.join('\n')}\n`)
++    const { code, stdout, stderr } = await runCli(['--dir', `legacy=${a.dir}`, '--dir', `new=${b.dir}`, '--expect-total', `${MATRIX_TOTAL}`])
++    expect(code).not.toBe(0)
++    const combined = stdout + stderr
++    expect(combined).not.toContain(secretMsg)
++    expect(combined).not.toContain(longMarker)
++  })
++})
+diff --git a/scripts/e2e/ledger-summary.test.mjs b/scripts/e2e/ledger-summary.test.mjs
+index a39ed510..bda7b909 100644
+--- a/scripts/e2e/ledger-summary.test.mjs
++++ b/scripts/e2e/ledger-summary.test.mjs
+@@ -256,3 +256,86 @@ describe('ledger-summary summarizeRun — fail-closed 反向变异(#560)', () =>
+     expect(summary.ok).toBe(true)
+   })
+ })
++
++describe('ledger-summary summarizeRun — 四态计数 N_A/FAIL 覆盖(#561 W1 SC16)', () => {
++  it('CLEAN: N_A 记录正确计入 counts.N_A', () => {
++    const runId = testRunId('count-na')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug', status: 'N_A' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(true)
++    expect(summary.counts.N_A).toBe(1)
++  })
++
++  it('CLEAN: FAIL 记录正确计入 counts.FAIL', () => {
++    const runId = testRunId('count-fail')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug', status: 'FAIL' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(true)
++    expect(summary.counts.FAIL).toBe(1)
++  })
++
++  it('对照组: 不含 N_A 记录时 counts.N_A 保持 0', () => {
++    const runId = testRunId('count-na-control')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask', status: 'RETRY_PASS' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(true)
++    expect(summary.counts.N_A).toBe(0)
++  })
++
++  it('对照组: 不含 FAIL 记录时 counts.FAIL 保持 0', () => {
++    const runId = testRunId('count-fail-control')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask', status: 'RETRY_PASS' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(true)
++    expect(summary.counts.FAIL).toBe(0)
++  })
++})
++
++describe('ledger-summary summarizeRun — 输入分支覆盖(#561 W1 SC17)', () => {
++  it('RED: summarizeRun(null) → fail-closed 早退,errors 含未提供 runId 文案', () => {
++    const summary = summarizeRun(null)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('未提供 runId'))).toBe(true)
++  })
++
++  it('RED: summarizeRun(undefined) → fail-closed 早退,errors 含未提供 runId 文案', () => {
++    const summary = summarizeRun(undefined)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('未提供 runId'))).toBe(true)
++  })
++
++  it("RED: summarizeRun('') → fail-closed 早退,errors 含未提供 runId 文案", () => {
++    const summary = summarizeRun('')
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('未提供 runId'))).toBe(true)
++  })
++
++  it('RED: record 带 FOUR_STATES 之外的 status → ok=false,报未知 status 并点名 status 与格', () => {
++    const runId = testRunId('unknown-status')
++    writeManifestFile(runId)
++    writeLedgerLines(runId, [
++      JSON.stringify(record({ runId, name: 'debug::dom::legacy::dev', scenario: 'debug', status: 'PENDING' })),
++      JSON.stringify(record({ runId, name: 'mask::dom::legacy::dev', scenario: 'mask' })),
++    ])
++    const summary = summarizeRun(runId)
++    expect(summary.ok).toBe(false)
++    expect(summary.errors.some((e) => e.includes('未知 status:PENDING'))).toBe(true)
++    expect(summary.errors.some((e) => e.includes('debug::dom::legacy::dev'))).toBe(true)
++  })
++})
+diff --git a/scripts/e2e/nightly-matrix-contract.test.mjs b/scripts/e2e/nightly-matrix-contract.test.mjs
+new file mode 100644
+index 00000000..cce8aa65
+--- /dev/null
++++ b/scripts/e2e/nightly-matrix-contract.test.mjs
+@@ -0,0 +1,114 @@
++// scripts/e2e/nightly-matrix-contract.test.mjs — B2:nightly-e2e.yml 矩阵字面量 ↔ scenarioOrder
++// 一致性哨兵(PR 期拦截,替代"只在夜间响"的兜底)。
++//
++// 动机(issue #561 沿革):workflow 里 `--expect-total 148` 是字面量,而真实矩阵
++// 148 = scenarioOrder(37) × renderer(2) × kernel(2)。B1 的 ledger-aggregate 校验器
++// 兜底只在夜间运行响应(scenarioOrder 变多 → 实际格数 ≠ expect-total → aggregate job
++// 红),PR 期场景数/形状变了不响。本条把 workflow 字面量与 scenarioOrder 绑到一处,
++// CI test:unit(vitest run)PR 期即拦,不必等夜间。
++//
++// 契约范围刻意窄:只 import scenarioOrder,不 import ledger-aggregate/summary——
++// 本测试管的是「workflow 字面量与场景数一致」,与校验器实现无关(职责分离)。
++//
++// 反向变异契约(SC-N,与 B1 ledger-aggregate.test.mjs 同款纪律):每一条拒绝规则对应
++// 一个变异,变异 = 在**临时副本** workflow 上违反单个规则,跑本文件断言实际红集 ==
++// 跑前写下的预测红集。预测红集写在每个变异 ID 注释里。
++// 隔离原则 = 红集**可预测**,不是红集**单元素**:一个变异破坏前置条件时,前置检查
++// 与依赖它的断言双双变红是正确行为;为把红集压成 1 条而给断言开「返回而不断言」
++// 的早退路径,代价是断言恒真——那个交换永远不值得。
++//
++//   M1  --expect-total 改数(148→150) → 预测 {主断言}(提取 it 全过,只主断言红)
++//   M2  kernel 列表 2 项 → 1 项       → 预测 {主断言}(kernel 提取 it 只解析不设数量
++//                                         门槛,1 项合法;主断言 148≠37×2×1=74 红)
++//   M3  删掉 --renderer=both          → 预测 {renderer 存在 it, 主断言}(前置条件被
++//                                         破坏 → 前置检查与依赖它的断言双双变红)
++//
++// 路径解析:workflow 用相对本文件的 URL(CI 与本地 cwd 可能不同,禁 process.cwd())。
++// 默认路径必须是真实相对路径;NIGHTLY_E2E_WORKFLOW_PATH 仅供变异验证注入,不改默认值。
++
++import { readFileSync } from 'node:fs'
++import { fileURLToPath } from 'node:url'
++import { describe, expect, it } from 'vitest'
++import { scenarioOrder } from './scenarios/index.mjs'
++
++const DEFAULT_WORKFLOW_PATH = fileURLToPath(
++  new URL('../../.github/workflows/nightly-e2e.yml', import.meta.url),
++)
++// 变异验证注入点(默认保持真实相对路径,不为了可测性改默认值)。
++const workflowPath = process.env.NIGHTLY_E2E_WORKFLOW_PATH || DEFAULT_WORKFLOW_PATH
++
++// ── 三个提取器,全部 fail-closed:提取不到/形状异常即抛错,绝不静默返回缺省 ──────
++
++// --expect-total 字面量:必须恰好出现 1 次(0 次 = 校验器没接上;≥2 次 = 有第二条
++// 校验链路没被更新,两处一起漂)。
++function extractExpectTotal(workflow) {
++  const matches = [...workflow.matchAll(/--expect-total\s+(\d+)/g)]
++  if (matches.length !== 1) {
++    throw new Error(
++      `--expect-total 字面量必须恰好出现 1 次,实际 ${matches.length} 次` +
++        (matches.length > 0
++          ? `(命中值:${matches.map((m) => m[1]).join(', ')})`
++          : '——校验器可能没接上或参数名已改'),
++    )
++  }
++  return Number(matches[0][1])
++}
++
++// matrix.kernel 列表:必须恰好 1 个 YAML 数组定义,且条目数 ≥1(0 条目 = 空矩阵,
++// 整条链没跑,不是"合法 0 kernel")。
++function extractKernelCount(workflow) {
++  const matches = [...workflow.matchAll(/kernel:\s*\[([^\]]*)\]/g)]
++  if (matches.length !== 1) {
++    throw new Error(
++      `matrix kernel 列表定义必须恰好出现 1 次,实际 ${matches.length} 次` +
++        (matches.length > 0 ? '(多条 kernel: 定义 = 矩阵形状不确定)' : '——matrix 定义缺失或语法已改'),
++    )
++  }
++  const items = matches[0][1]
++    .split(',')
++    .map((s) => s.trim())
++    .filter(Boolean)
++  if (items.length < 1) {
++    throw new Error('matrix kernel 列表为空——空矩阵意味着整条链不会跑,不是合法状态')
++  }
++  return items.length
++}
++
++// --renderer=both:必须存在。renderer 数由它推出为 2(将来改成单 renderer 时,
++// 找不到 --renderer=both 即抛,提示更新本契约)。
++function extractRendererCount(workflow) {
++  if (!workflow.includes('--renderer=both')) {
++    throw new Error("必须包含 --renderer=both(renderer 矩阵由它驱动;缺失 = 形状变化或接线被拆)")
++  }
++  return 2
++}
++
++describe('nightly-e2e.yml 矩阵字面量 ↔ scenarioOrder 契约', () => {
++  const workflow = readFileSync(workflowPath, 'utf8')
++
++  it('--expect-total 字面量恰好出现一次', () => {
++    // 真断言:提取器 fail-closed,在真实文件上触发即红;值比较交给主断言。
++    expect(() => extractExpectTotal(workflow)).not.toThrow()
++  })
++
++  it('matrix kernel 列表定义恰好一个且条目数 ≥1', () => {
++    expect(() => extractKernelCount(workflow)).not.toThrow()
++  })
++
++  it('--renderer=both 必须存在', () => {
++    expect(() => extractRendererCount(workflow)).not.toThrow()
++  })
++
++  // 漂移哨兵主断言:workflow 字面量必须 == scenarioOrder × renderer × kernel。
++  // 形状(kernel 数 / renderer 数)变化时从 workflow 实际提取再乘,自动适配;
++  // 场景数变化时 scenarioOrder.length 变 → 与字面量不符即红。
++  // fail-closed:renderer 缺失时 extractRendererCount 直接抛 → 本断言红,
++  // 绝不"返回而不断言"地报绿。
++  it('expectTotal === scenarioOrder.length × rendererCount × kernelCount', () => {
++    const expectTotal = extractExpectTotal(workflow)
++    const kernelCount = extractKernelCount(workflow)
++    const rendererCount = extractRendererCount(workflow)
++    const expected = scenarioOrder.length * rendererCount * kernelCount
++    expect(expectTotal).toBe(expected)
++  })
++})
+diff --git a/scripts/e2e/scenarios/canvas-interactions.mjs b/scripts/e2e/scenarios/canvas-interactions.mjs
+index 18c86bbb..b445baf7 100644
+--- a/scripts/e2e/scenarios/canvas-interactions.mjs
++++ b/scripts/e2e/scenarios/canvas-interactions.mjs
+@@ -1290,8 +1290,12 @@ export const runCanvasInteractionsScenario = async (context) => {
+       { eventType: type, payloadText: text },
+     )
+   const cutSentinel = await dispatchClipboardEvent('cut')
+-  if (!cutSentinel.includes('Mivo Canvas')) {
+-    throw new Error(`Canvas cut should write the freshness sentinel into the clipboard payload: ${JSON.stringify(cutSentinel)}`)
++  // 2026-08-05:哨兵值从一句中文提示改成零宽空格(粘到画布外不再吐可见文字),
++  // 所以这里不能再按 'Mivo Canvas' 子串判。断言改为"写了非空的哨兵、且不含任何
++  // 可打印字符" —— 既证明 cut 确实同步写了系统剪贴板,也顺带钉住"不许再退回可见
++  // 文案"这条(值本身的正反识别由 src/lib/canvasClipboardSentinel.test.ts 覆盖)。
++  if (!cutSentinel || /\S/u.test(cutSentinel.replace(/\u200b/gu, ''))) {
++    throw new Error(`Canvas cut should write the invisible freshness sentinel into the clipboard payload: ${JSON.stringify(cutSentinel)}`)
+   }
+   await page.waitForFunction(
+     (count) => document.querySelectorAll('.dom-node').length === count - 1,
+diff --git a/scripts/e2e/scenarios/chat-copy.mjs b/scripts/e2e/scenarios/chat-copy.mjs
+index fa75e6aa..e92f0fd9 100644
+--- a/scripts/e2e/scenarios/chat-copy.mjs
++++ b/scripts/e2e/scenarios/chat-copy.mjs
+@@ -168,20 +168,71 @@ export const runChatCopyScenario = async (context) => {
+   // focus fixup 会把 activeElement 覆盖成 body,于是「点完再读」永远读不到被抢回的焦点 ——
+   // 断言会变成永真(实测:把外部关闭改成 onClose(true) 制造该 bug,真实点击版仍然绿)。
+   // 同一个 evaluate 内 dispatch 完立刻读,绕开 fixup,才真正测到 onClose 有没有回焦。
++  // 落点必须是 .canvas-shell 之外的节点(用 document.body):canvas shell 自身绑定了生产
++  // pointer handler(shell onPointerDown → … → useMarqueeSelection 的 setPointerCapture),
++  // 合成事件没有浏览器 active pointer 记录,必抛 "Failed to execute 'setPointerCapture' …
++  // No active pointer with the given id is found" —— 测试注入错误,不是生产缺陷。
++  // body 目标仍会 bubble 到 document,popover 的 outside-click 判定只认 target 是否落在
++  // popoverRef/anchorRef 内,关闭语义完全等价,且事件不经过 React root 委托的 canvas handler。
++  // 反向变异哨兵:React 19 dev 会把事件处理器异常延迟重抛,页面内 window 'error' 在
++  // dispatch 后的同步窗口里收不到(实测变异版照样绿),而 Playwright 的 pageerror 通道
++  // 稳定收到。窗口刻意收到最窄:只覆盖「dispatch → popover detached」这一步,detached
++  // 等待本身提供了 renderer turn,再补一次 evaluate 往返即可观察到(实测 captured=1)。
++  // 不放到场景末尾:那样步骤 4/5 的同源异常会被误归因给本步(独立审查席点名的绑定缺陷)。
++  // 窗口内断言「零 pageerror」而不是匹配 message 子串:子串匹配既会漏(DOMException 文案
++  // 跨引擎不稳,可能只给 InvalidStateError 之类)也会误报(无关异常恰好含该词)。
++  //
++  // 本步判据的保证等级(如实声明,不超卖):「dispatch 后零 pageerror」是实测捕获 ——
++  // 施加变异后于 detached 之后插探针,两次 attempt 均 captured=1 —— 不是 ACK 保证;
++  // Playwright/CDP 没有「evaluate 返回即此前 future pageerror 已排空」的公开契约。
++  // 保证边界是「同步 + 微任务级」异常;延迟更久才抛的异常(例如在 setTimeout 宏任务里
++  // 抛)不被本窗口覆盖。正式的 sentinel ACK 契约见 issue #562,本处是 P1-A 的过渡实现,
++  // P1-B3 接线时吸收或删除。
++  //
++  // 零 pageerror 判据是窄窗口强假设:__MIVO_E2E_EXPECTED_ERROR__ 约定只在 harness.mjs
++  // 过滤 console message,browser-error-guard.mjs 完全不消费它;窗口内若出现与
++  // outside-click 无关但合法/预期的 pageerror,本断言会误红。判据保留为「窗口内零
++  // pageerror」,成立前提是本窗口极短且步骤受控;未来若窗口内需要容纳合法异常,应接入
++  // #562 的统一 classifier,而不是在本处加子串白名单。
++  //
++  // 已知限制:哨兵绑定当前 page 对象。context 级 observer 有 context.on('page') 自动
++  // 覆盖新 page,局部 page.on 没有;chat-copy 当前流程不重建 page,但若未来在窗口内
++  // 重建 page 或换 context,哨兵覆盖不会自动转移。
+   await composer.focus()
+   await page.locator('.chat-model-trigger').click()
+   await page.waitForSelector('.chat-model-popover')
+-  const stoleFocusBackOnOutsideClick = await page.evaluate(() => {
+-    const textarea = document.querySelector('.chat-composer-textarea')
+-    const outside = document.querySelector('.canvas-shell')
+-    if (!(outside instanceof HTMLElement)) throw new Error('SC1d: missing canvas shell')
+-    outside.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }))
+-    return document.activeElement === textarea
+-  })
+-  if (stoleFocusBackOnOutsideClick) {
+-    throw new Error('SC1d: an outside click must not pull focus back into the composer')
++  const sc1dPageErrors = []
++  const onSc1dPageError = (error) => {
++    const name = error && error.name ? String(error.name) : 'Error'
++    const message = error && error.message ? String(error.message) : String(error)
++    sc1dPageErrors.push(`${name}: ${message}`)
++  }
++  page.on('pageerror', onSc1dPageError)
++  // 注册 → dispatch → 焦点断言 → detached 等待 → 收敛 evaluate → 零 pageerror 断言
++  // 整段包进 try,finally 只做 page.off:中途任何一步抛错(缺 textarea、焦点被抢回、
++  // detached 超时、收敛 evaluate 失败)listener 都不会泄漏;原始 error 原样向外抛。
++  try {
++    const stoleFocusBackOnOutsideClick = await page.evaluate(() => {
++      const textarea = document.querySelector('.chat-composer-textarea')
++      if (!(textarea instanceof HTMLTextAreaElement)) throw new Error('SC1d: missing composer textarea')
++      document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }))
++      return document.activeElement === textarea
++    })
++    if (stoleFocusBackOnOutsideClick) {
++      throw new Error('SC1d: an outside click must not pull focus back into the composer')
++    }
++    await page.waitForSelector('.chat-model-popover', { state: 'detached' })
++    // 收敛点:detached 等待 + 一次 evaluate 往返后,「同步 + 微任务级」的 pageerror
++    // 已实测可被 Node 侧 listener 捕获(T1,见上方保证等级说明;不承诺更迟的异常)。
++    await page.evaluate(() => undefined)
++    if (sc1dPageErrors.length > 0) {
++      throw new Error(
++        `SC1d: outside-click dispatch must not raise any pageerror (it must not reach the canvas pointer handler): ${sc1dPageErrors.join(' | ')}`,
++      )
++    }
++  } finally {
++    page.off('pageerror', onSc1dPageError)
+   }
+-  await page.waitForSelector('.chat-model-popover', { state: 'detached' })
+ 
+   // 4) ratio popover 的 Escape 同样要回焦 —— 两个 popover 共用同一个 closePopover,
+   // 契约要在两侧都钉住,否则只有 model 侧有回归保护。
+diff --git a/scripts/e2e/scenarios/copy-as-png.mjs b/scripts/e2e/scenarios/copy-as-png.mjs
+new file mode 100644
+index 00000000..64e62171
+--- /dev/null
++++ b/scripts/e2e/scenarios/copy-as-png.mjs
+@@ -0,0 +1,534 @@
++// copy-as-png — 剪贴板出图的忠实度 + 多选合成 + 哨兵仲裁。
++//
++// 为什么必须在真浏览器里证:jsdom 没有真 canvas/toBlob,也没有系统剪贴板。
++// "产物像素对不对""外部粘得到不到图""旧截图会不会赢"三件事只有这一层能证;
++// 几何算得对不对由 src/lib/imageClipboardGeometry.test.ts 单测覆盖,两层不重叠。
++//
++// 覆盖:
++//  SC-A4  零变换时产物 = 源图整幅(改动前后口径一致)
++//  SC-A1  旋转 90/180/270 → 产物方向随之(尺寸互换 + **四角映射方向**)
++//  SC-A2  镜像 → 产物像素随之改变,且**翻的是正确那根轴**
++//  SC-B1  多选两张 → 一张含两者的合成图,尺寸 = 并集包围盒,且**每张都在自己位置上**
++//  SC-B2  重叠时上层压下层
++//  D1     右键菜单「复制」也补写哨兵(真浏览器路径,不只是 mock)
++//  SC-C2  Cmd+C → Cmd+V 仍粘出节点副本
++//  SC-C3  剪贴板里先有外部图时,画布内 Cmd+C 后 Cmd+V 粘的仍是节点(哨兵仲裁生效)
++//
++// 渲染器无关:断言主体是 store 状态 + 系统剪贴板产物,节点点击走 renderer-evidence 投影。
++
++import { clickCanvasNode, waitForNodeRendered } from '../renderer-evidence.mjs'
++import { waitForAsyncPredicate } from '../wait-async-predicate.mjs'
++
++const HERO = 'ref-hero'
++const MOOD = 'mood-env'
++
++/**
++ * 读回系统剪贴板里的图:尺寸 + 四角采样 + 网格指纹 + 调用方指定的任意探针点。
++ *
++ * 四角采样不是装饰:方向类断言(旋转转对了没、镜像翻的是哪根轴)只能靠"源图哪个角
++ * 跑到了产物哪个角"来钉 —— 只断"尺寸变了"或"指纹不同"的话,把 rotate(+θ) 写成
++ * rotate(-θ)、或把 H/V 两轴对调,断言照样全绿。
++ */
++const readClipboardImage = (page, probes = []) =>
++  page.evaluate(async (probePoints) => {
++    const items = await navigator.clipboard.read()
++    for (const item of items) {
++      const type = item.types.find((entry) => entry.startsWith('image/'))
++      if (!type) continue
++
++      const blob = await item.getType(type)
++      const bitmap = await createImageBitmap(blob)
++      const canvas = document.createElement('canvas')
++      canvas.width = bitmap.width
++      canvas.height = bitmap.height
++      const context = canvas.getContext('2d')
++      context.drawImage(bitmap, 0, 0)
++
++      // 采**小区域均值**而不是单点:同一张源图以不同倍率画进产物(单张走源分辨率、
++      // 合成走 union×scale)时,单点会因重采样漂移十几到几十个色阶,区域均值稳定得多。
++      // 半径 6 → 13×13 的盒;盒被 clamp 在图内,边角处会往内收。
++      const pixel = (x, y, radius = 6) => {
++        const cx = Math.min(Math.max(radius, Math.round(x)), Math.max(radius, bitmap.width - 1 - radius))
++        const cy = Math.min(Math.max(radius, Math.round(y)), Math.max(radius, bitmap.height - 1 - radius))
++        const left = Math.max(0, cx - radius)
++        const top = Math.max(0, cy - radius)
++        const width = Math.min(bitmap.width - left, radius * 2 + 1)
++        const height = Math.min(bitmap.height - top, radius * 2 + 1)
++        const { data } = context.getImageData(left, top, width, height)
++        const sum = [0, 0, 0, 0]
++        for (let offset = 0; offset < data.length; offset += 4) {
++          sum[0] += data[offset]
++          sum[1] += data[offset + 1]
++          sum[2] += data[offset + 2]
++          sum[3] += data[offset + 3]
++        }
++        const count = data.length / 4
++        return sum.map((channel) => Math.round(channel / count))
++      }
++      // 8×8 网格指纹:整幅内容的稳定摘要,不依赖具体图案。
++      const grid = []
++      for (let gy = 0; gy < 8; gy += 1) {
++        for (let gx = 0; gx < 8; gx += 1) {
++          grid.push(pixel(((gx + 0.5) * bitmap.width) / 8, ((gy + 0.5) * bitmap.height) / 8).join(','))
++        }
++      }
++
++      return {
++        type,
++        width: bitmap.width,
++        height: bitmap.height,
++        signature: grid.join('|'),
++        pixel: {
++          tl: pixel(2, 2),
++          tr: pixel(bitmap.width - 3, 2),
++          bl: pixel(2, bitmap.height - 3),
++          br: pixel(bitmap.width - 3, bitmap.height - 3),
++          center: pixel(bitmap.width / 2, bitmap.height / 2),
++        },
++        probes: probePoints.map((point) => pixel(point.x, point.y, point.radius ?? 6)),
++      }
++    }
++    return null
++  }, probes)
++
++/** 把剪贴板清成一段无关文本 —— 保证下一步读到的图一定是本次复制产生的。 */
++const clearClipboard = (page) => page.evaluate(() => navigator.clipboard.writeText('__e2e_clipboard_reset__'))
++
++const readClipboardText = (page) => page.evaluate(() => navigator.clipboard.readText())
++
++/** 往系统剪贴板塞一张"外部截图"(2×2 纯色 PNG),用于哨兵仲裁的对照。 */
++const putForeignImageOnClipboard = (page) =>
++  page.evaluate(async () => {
++    const canvas = document.createElement('canvas')
++    canvas.width = 2
++    canvas.height = 2
++    const context = canvas.getContext('2d')
++    context.fillStyle = '#00ff00'
++    context.fillRect(0, 0, 2, 2)
++    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'))
++    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
++  })
++
++/**
++ * 清掉 DOM 文字选区再按 Cmd+C。
++ *
++ * 不是保险起见:handleCopyOrCut 在 `hasActiveTextSelection()` 为真时**直接放行系统
++ * 默认行为**(让聊天气泡等处的文本复制不被接管),于是哨兵不会被写。前面刚点过右键
++ * 菜单项,点击有可能在菜单文案上留下一段选区 —— 那样这一步会变成"偶发不写哨兵",
++ * 表现为下面的等待超时。把选区显式清掉,消掉这个干扰源。
++ */
++const clearDomTextSelection = (page) =>
++  page.evaluate(() => {
++    window.getSelection()?.removeAllRanges()
++  })
++
++/**
++ * 等"剪贴板里的文字**就是哨兵**",不是等"文字非空"。
++ * 后者会被上一步残留的任何文本满足,等待就成了摆设(本仓 e2e-wait-guard 关心的同一类)。
++ */
++const waitForSentinelOnClipboard = (page, label) =>
++  waitForAsyncPredicate(
++    page,
++    async () => {
++      const text = await navigator.clipboard.readText()
++      return !!text && !/\S/u.test(text.replace(/\u200b/gu, ''))
++    },
++    undefined,
++    { label, timeout: 10000 },
++  )
++
++const readNode = (page, moduleSpec, nodeId) =>
++  page.evaluate(
++    async ({ spec, id }) => {
++      const { useCanvasStore } = await import(spec)
++      const node = useCanvasStore.getState().nodes.find((entry) => entry.id === id)
++      if (!node) return null
++      return {
++        x: node.x,
++        y: node.y,
++        width: node.width,
++        height: node.height,
++        assetUrl: node.assetUrl,
++        crop: node.imageCrop || null,
++        rotation: node.transform?.rotation ?? 0,
++        flipH: Boolean(node.imageFlipH),
++        flipV: Boolean(node.imageFlipV),
++      }
++    },
++    { spec: moduleSpec, id: nodeId },
++  )
++
++const nodeSummary = (page, moduleSpec) =>
++  page.evaluate(async (spec) => {
++    const { useCanvasStore } = await import(spec)
++    const { nodes } = useCanvasStore.getState()
++    return {
++      total: nodes.length,
++      assetUrls: nodes.filter((node) => node.type === 'image').map((node) => node.assetUrl),
++    }
++  }, moduleSpec)
++
++const selectNodes = (page, moduleSpec, nodeIds) =>
++  page.evaluate(
++    async ({ spec, ids }) => {
++      const { useCanvasStore } = await import(spec)
++      useCanvasStore.getState().selectNodes(ids, ids[0])
++    },
++    { spec: moduleSpec, ids: nodeIds },
++  )
++
++/** 右键节点 → 点菜单里指定项。菜单项是 role="menuitem"(不是 button)。 */
++const clickContextMenuItem = async (page, rendererMode, nodeId, itemName) => {
++  await clickCanvasNode(page, rendererMode, nodeId, { button: 'right' })
++  await page.waitForSelector('.node-action-menu', { timeout: 5000 })
++  const item = page.locator('.node-action-menu').getByRole('menuitem', { name: itemName })
++  if (!(await item.count())) {
++    const labels = await page.locator('.node-action-menu button').allTextContents()
++    throw new Error(`Context menu for ${nodeId} lacks "${itemName}"; items = ${JSON.stringify(labels)}`)
++  }
++  await item.click()
++}
++
++/** 右键节点 → 点「Copy as PNG」→ 等剪贴板里真出现图。 */
++const copyAsPngViaContextMenu = async (page, rendererMode, nodeId, probes = []) => {
++  await clearClipboard(page)
++  await clickContextMenuItem(page, rendererMode, nodeId, 'Copy as PNG')
++  await waitForAsyncPredicate(
++    page,
++    async () => {
++      const items = await navigator.clipboard.read()
++      return items.some((item) => item.types.some((type) => type.startsWith('image/')))
++    },
++    undefined,
++    { label: 'Copy as PNG 把位图写进系统剪贴板', timeout: 10000 },
++  )
++  return readClipboardImage(page, probes)
++}
++
++/** 两个 RGBA 采样是否近似相同(重采样/JPEG 会带来几个数量级内的抖动)。 */
++const samePixel = (a, b, tolerance = 16) =>
++  a.length === b.length && a.every((channel, index) => Math.abs(channel - b[index]) <= tolerance)
++
++const assertPixelMaps = (label, from, to) => {
++  if (!samePixel(from, to)) {
++    throw new Error(`${label}: expected source pixel ${JSON.stringify(from)} to land at ${JSON.stringify(to)}`)
++  }
++}
++
++/** 走真实 store 动作(与快捷条按钮同一条路),不手改 transform 字段。 */
++const rotateNode = (page, moduleSpec, nodeId, times) =>
++  page.evaluate(
++    async ({ spec, id, count }) => {
++      const { useCanvasStore } = await import(spec)
++      for (let i = 0; i < count; i += 1) useCanvasStore.getState().rotateImageNode(id)
++    },
++    { spec: moduleSpec, id: nodeId, count: times },
++  )
++
++const moveNode = (page, moduleSpec, nodeId, x, y) =>
++  page.evaluate(
++    async ({ spec, id, nx, ny }) => {
++      const { useCanvasStore } = await import(spec)
++      useCanvasStore.getState().updateNodePosition(id, nx, ny)
++    },
++    { spec: moduleSpec, id: nodeId, nx: x, ny: y },
++  )
++
++const moveLayer = (page, moduleSpec, nodeId, move) =>
++  page.evaluate(
++    async ({ spec, id, direction }) => {
++      const { useCanvasStore } = await import(spec)
++      useCanvasStore.getState().moveNodeLayer(id, direction)
++    },
++    { spec: moduleSpec, id: nodeId, direction: move },
++  )
++
++const flipNode = (page, moduleSpec, nodeId, axis) =>
++  page.evaluate(
++    async ({ spec, id, which }) => {
++      const { useCanvasStore } = await import(spec)
++      useCanvasStore.getState().flipImageNode(id, which)
++    },
++    { spec: moduleSpec, id: nodeId, which: axis },
++  )
++
++/**
++ * 造一张**四象限纯色**图片节点(TL 红 / TR 绿 / BL 蓝 / BR 黄),专供方向类断言。
++ *
++ * 为什么不能用 demo 里的照片:ref-hero 是「蓝色背景」的人物插画,四个角颜色几乎一样 ——
++ * 实测拿"把 rotate(+θ) 改成 rotate(-θ)"的 mutant 跑过,基于它的四角断言**照样全绿**。
++ * 方向能不能被证,取决于基准图四角是否可区分,所以这里自带一张可区分的。
++ * 源尺寸自己定(400×300),顺带让"产物 = 源分辨率"这条也变成精确断言。
++ */
++const createQuadrantImageNode = (page, moduleSpec) =>
++  page.evaluate(async (spec) => {
++    const { useCanvasStore } = await import(spec)
++    const canvas = document.createElement('canvas')
++    canvas.width = 400
++    canvas.height = 300
++    const context = canvas.getContext('2d')
++    const quadrants = [
++      ['#ff0000', 0, 0],
++      ['#00ff00', 200, 0],
++      ['#0000ff', 0, 150],
++      ['#ffff00', 200, 150],
++    ]
++    for (const [color, x, y] of quadrants) {
++      context.fillStyle = color
++      context.fillRect(x, y, 200, 150)
++    }
++    const title = 'e2e-quadrants'
++    useCanvasStore.getState().addImportedImage(canvas.toDataURL('image/png'), title, undefined, { x: 260, y: -180 })
++    const node = useCanvasStore.getState().nodes.find((entry) => entry.title === title)
++    return node ? node.id : null
++  }, moduleSpec)
++
++/** 四象限图的角色:红=左上、绿=右上、蓝=左下、黄=右下(容差内判等)。 */
++const QUADRANT = {
++  red: [255, 0, 0, 255],
++  green: [0, 255, 0, 255],
++  blue: [0, 0, 255, 255],
++  yellow: [255, 255, 0, 255],
++}
++
++export const runCopyAsPngScenario = async (context) => {
++  const { page, rendererMode, canvasStoreSpec } = context
++  const moduleSpec = await canvasStoreSpec()
++
++  await waitForNodeRendered(page, rendererMode, HERO)
++  await waitForNodeRendered(page, rendererMode, MOOD)
++
++  // ── A 组:忠实度。全部跑在自造的四象限图上(理由见 createQuadrantImageNode)──
++  const quadId = await createQuadrantImageNode(page, moduleSpec)
++  if (!quadId) throw new Error('Failed to seed the quadrant fixture node')
++  await waitForNodeRendered(page, rendererMode, quadId)
++
++  // SC-A4 基线:零变换 → 产物 = 源图整幅(源尺寸自己定的 400×300,精确可断)
++  const baseline = await copyAsPngViaContextMenu(page, rendererMode, quadId)
++  if (!baseline) throw new Error('Copy as PNG should put an image on the clipboard')
++  if (baseline.type !== 'image/png') throw new Error(`Clipboard image should be PNG, got ${baseline.type}`)
++  if (baseline.width !== 400 || baseline.height !== 300) {
++    throw new Error(`Baseline PNG should carry SOURCE resolution 400x300, got ${baseline.width}x${baseline.height}`)
++  }
++  // 基准图本身的四角必须是四种可区分的颜色 —— 否则下面所有方向断言都是摆设。
++  assertPixelMaps('fixture top-left should be red', QUADRANT.red, baseline.pixel.tl)
++  assertPixelMaps('fixture top-right should be green', QUADRANT.green, baseline.pixel.tr)
++  assertPixelMaps('fixture bottom-left should be blue', QUADRANT.blue, baseline.pixel.bl)
++  assertPixelMaps('fixture bottom-right should be yellow', QUADRANT.yellow, baseline.pixel.br)
++
++  // SC-A1 旋转:尺寸 + **方向**。四角互不相同,所以顺时针/逆时针写反必然变红。
++  await rotateNode(page, moduleSpec, quadId, 1)
++  const rotated90 = await copyAsPngViaContextMenu(page, rendererMode, quadId)
++  if (rotated90.width !== baseline.height || rotated90.height !== baseline.width) {
++    throw new Error(
++      `90° rotation should swap the PNG dimensions: baseline ${baseline.width}x${baseline.height}, rotated ${rotated90.width}x${rotated90.height}`,
++    )
++  }
++  assertPixelMaps('90° CW maps top-left → top-right', QUADRANT.red, rotated90.pixel.tr)
++  assertPixelMaps('90° CW maps top-right → bottom-right', QUADRANT.green, rotated90.pixel.br)
++  assertPixelMaps('90° CW maps bottom-right → bottom-left', QUADRANT.yellow, rotated90.pixel.bl)
++  assertPixelMaps('90° CW maps bottom-left → top-left', QUADRANT.blue, rotated90.pixel.tl)
++
++  await rotateNode(page, moduleSpec, quadId, 1)
++  const rotated180 = await copyAsPngViaContextMenu(page, rendererMode, quadId)
++  if (rotated180.width !== baseline.width || rotated180.height !== baseline.height) {
++    throw new Error(`180° rotation should keep the PNG dimensions, got ${rotated180.width}x${rotated180.height}`)
++  }
++  // 尺寸相同,只能靠像素证"旋转真的落到了 canvas 上"(尺寸来自几何计划,变换没执行
++  // 时画布尺寸照样对 —— 实测"只应用 crop"的 mutant 让 90° 尺寸断言照绿、这里变红)。
++  assertPixelMaps('180° maps top-left → bottom-right', QUADRANT.red, rotated180.pixel.br)
++  assertPixelMaps('180° maps top-right → bottom-left', QUADRANT.green, rotated180.pixel.bl)
++
++  await rotateNode(page, moduleSpec, quadId, 2) // 回到 0°
++  const unrotated = await readNode(page, moduleSpec, quadId)
++  if (unrotated.rotation !== 0) throw new Error(`Rotation cleanup failed, got ${unrotated.rotation}`)
++
++  // SC-A2 镜像:断**哪根轴**。H 是左右对调、上下不动;V 反之。两轴写反必然变红。
++  await flipNode(page, moduleSpec, quadId, 'horizontal')
++  const flippedH = await copyAsPngViaContextMenu(page, rendererMode, quadId)
++  if (flippedH.width !== baseline.width || flippedH.height !== baseline.height) {
++    throw new Error(`Flip must not change dimensions, got ${flippedH.width}x${flippedH.height}`)
++  }
++  assertPixelMaps('H flip maps top-left → top-right', QUADRANT.red, flippedH.pixel.tr)
++  assertPixelMaps('H flip maps top-right → top-left', QUADRANT.green, flippedH.pixel.tl)
++  assertPixelMaps('H flip keeps rows (bottom-left → bottom-right)', QUADRANT.blue, flippedH.pixel.br)
++
++  await flipNode(page, moduleSpec, quadId, 'horizontal') // 关掉 H
++  await flipNode(page, moduleSpec, quadId, 'vertical')
++  const flippedV = await copyAsPngViaContextMenu(page, rendererMode, quadId)
++  assertPixelMaps('V flip maps top-left → bottom-left', QUADRANT.red, flippedV.pixel.bl)
++  assertPixelMaps('V flip maps bottom-left → top-left', QUADRANT.blue, flippedV.pixel.tl)
++  assertPixelMaps('V flip keeps columns (top-right → bottom-right)', QUADRANT.green, flippedV.pixel.br)
++
++  await flipNode(page, moduleSpec, quadId, 'vertical') // 关掉 V
++
++  // 复原后必须回到基线逐格一致(证明上面几步没有留下副作用)。
++  const restoredQuad = await copyAsPngViaContextMenu(page, rendererMode, quadId)
++  if (restoredQuad.signature !== baseline.signature) {
++    throw new Error('Clearing rotation/flip should reproduce the baseline PNG exactly')
++  }
++
++  // B 组要拿 ref-hero 自己的单张产物做参照(合成里按位置比对时用)。
++  const restored = await copyAsPngViaContextMenu(page, rendererMode, HERO)
++
++  // ── SC-B1 / SC-B2 多选合成 ────────────────────────────────────────────────
++  const heroBox = await readNode(page, moduleSpec, HERO)
++  const moodBox = await readNode(page, moduleSpec, MOOD)
++
++  // 先各自单独复制一次,拿到"这张图自己的中心像素"作为参照。
++  await selectNodes(page, moduleSpec, [MOOD])
++  const moodSolo = await copyAsPngViaContextMenu(page, rendererMode, MOOD)
++
++  const minX = Math.min(heroBox.x, moodBox.x)
++  const minY = Math.min(heroBox.y, moodBox.y)
++  const unionWidth = Math.max(heroBox.x + heroBox.width, moodBox.x + moodBox.width) - minX
++  const unionHeight = Math.max(heroBox.y + heroBox.height, moodBox.y + moodBox.height) - minY
++  // 两节点之间的空隙(hero 右缘 → mood 左缘),用来断"空处必须透明"。
++  const gapCenterX = (heroBox.x + heroBox.width + moodBox.x) / 2
++  if (gapCenterX <= heroBox.x + heroBox.width || gapCenterX >= moodBox.x) {
++    throw new Error('Fixture assumption broken: ref-hero and mood-env should not touch/overlap here')
++  }
++
++  await selectNodes(page, moduleSpec, [HERO, MOOD])
++  // 两趟:第一趟只为从产物尺寸反推 scale(合成会按"最高清那张不降采样"放大,倍数
++  // 由源图分辨率决定,场景侧算不出),第二趟带着换算好的探针点再取一次。
++  const sizeProbe = await copyAsPngViaContextMenu(page, rendererMode, HERO)
++  if (!sizeProbe) throw new Error('Multi-select Copy as PNG should put an image on the clipboard')
++  const scale = sizeProbe.width / unionWidth
++  const probeFor = (canvasX, canvasY) => ({ x: (canvasX - minX) * scale, y: (canvasY - minY) * scale })
++
++  const multi = await copyAsPngViaContextMenu(page, rendererMode, HERO, [
++    probeFor(heroBox.x + heroBox.width / 2, heroBox.y + heroBox.height / 2),
++    probeFor(moodBox.x + moodBox.width / 2, moodBox.y + moodBox.height / 2),
++    { ...probeFor(gapCenterX, minY + unionHeight / 2), radius: 0 }, // 透明判定必须单点
++  ])
++  const [heroProbe, moodProbe, gapProbe] = multi.probes
++
++  const aspect = multi.width / multi.height
++  const unionAspect = unionWidth / unionHeight
++  if (Math.abs(aspect - unionAspect) > 0.02) {
++    throw new Error(
++      `Composite PNG should match the union bbox aspect: expected ~${unionAspect.toFixed(3)}, got ${aspect.toFixed(3)} (${multi.width}x${multi.height})`,
++    )
++  }
++
++  // **每张都被画、且画在自己的位置上**。只断比例/宽度是不够的:实现若只画最上面
++  // 那一张、或把两张都摞在中心,比例与宽度断言照样绿。
++  assertPixelMaps('composite should carry ref-hero at its own centre', restored.pixel.center, heroProbe)
++  assertPixelMaps('composite should carry mood-env at its own centre', moodSolo.pixel.center, moodProbe)
++  if (samePixel(heroProbe, moodProbe)) {
++    throw new Error('Two different photos must not sample identically — probes are not discriminating')
++  }
++  // 空隙必须透明:证明画布确实是并集包围盒、两张各就各位而不是铺满。
++  if (gapProbe[3] !== 0) {
++    throw new Error(`Gap between the two images should stay transparent, got alpha ${gapProbe[3]}`)
++  }
++
++  // ── SC-B2 层序:重叠时上层压下层 ──────────────────────────────────────────
++  // 差分断言 —— 把两张叠一半,交换层序前后各取一张合成图,像素必须不同。
++  // 若合成无视图层顺序(比如永远按选中顺序画),两张会逐格相同。
++  // 右键必须点在**最上层**那个节点上:被压住的节点会被 Playwright 的可操作性
++  // 检查判成 "subtree intercepts pointer events"。选区已含两者,点谁都开多选菜单。
++  await moveNode(page, moduleSpec, MOOD, heroBox.x + heroBox.width / 2, heroBox.y)
++  await selectNodes(page, moduleSpec, [HERO, MOOD])
++  const moodOnTop = await copyAsPngViaContextMenu(page, rendererMode, MOOD)
++  await moveLayer(page, moduleSpec, HERO, 'front')
++  await selectNodes(page, moduleSpec, [HERO, MOOD])
++  const heroOnTop = await copyAsPngViaContextMenu(page, rendererMode, HERO)
++  if (moodOnTop.width !== heroOnTop.width || moodOnTop.height !== heroOnTop.height) {
++    throw new Error('Layer reorder must not change the union bbox; only the overlap pixels')
++  }
++  if (moodOnTop.signature === heroOnTop.signature) {
++    throw new Error('Bringing a node to front must change the composite overlap — layer order was ignored')
++  }
++  await moveNode(page, moduleSpec, MOOD, moodBox.x, moodBox.y)
++
++  // ── SC-C2 / SC-C3 哨兵仲裁 ────────────────────────────────────────────────
++  await selectNodes(page, moduleSpec, [HERO])
++  const before = await nodeSummary(page, moduleSpec)
++
++  // C2:普通 Cmd+C → Cmd+V 粘出节点副本。
++  await clearDomTextSelection(page)
++  await page.keyboard.press('ControlOrMeta+c')
++  await waitForSentinelOnClipboard(page, 'Cmd+C 把哨兵写进系统剪贴板')
++  const sentinelText = await readClipboardText(page)
++  if (/[^\s\u200b]/.test(sentinelText)) {
++    throw new Error(`Sentinel must not contain visible text, got ${JSON.stringify(sentinelText)}`)
++  }
++  await page.keyboard.press('ControlOrMeta+v')
++  await waitForAsyncPredicate(
++    page,
++    async ({ spec, expected }) => {
++      const { useCanvasStore } = await import(spec)
++      return useCanvasStore.getState().nodes.length >= expected
++    },
++    { spec: moduleSpec, expected: before.total + 1 },
++    { label: 'Cmd+V 粘出一个节点副本', timeout: 10000 },
++  )
++  const afterPaste = await nodeSummary(page, moduleSpec)
++  const heroAssetCount = (summary) => summary.assetUrls.filter((url) => url === heroBox.assetUrl).length
++  if (heroAssetCount(afterPaste) !== heroAssetCount(before) + 1) {
++    throw new Error('Cmd+V should duplicate the canvas node (same assetUrl), not import a bitmap')
++  }
++
++  // C3(关键回归):剪贴板里先躺一张外部图,再画布内复制节点 → 粘的仍须是节点。
++  await putForeignImageOnClipboard(page)
++  await selectNodes(page, moduleSpec, [HERO])
++  await clearDomTextSelection(page)
++  await page.keyboard.press('ControlOrMeta+c')
++  await waitForSentinelOnClipboard(page, 'Cmd+C 覆盖掉外部图、写入哨兵')
++  const beforeArbitration = await nodeSummary(page, moduleSpec)
++  await page.keyboard.press('ControlOrMeta+v')
++  await waitForAsyncPredicate(
++    page,
++    async ({ spec, expected }) => {
++      const { useCanvasStore } = await import(spec)
++      return useCanvasStore.getState().nodes.length >= expected
++    },
++    { spec: moduleSpec, expected: beforeArbitration.total + 1 },
++    { label: '仲裁后 Cmd+V 粘出节点副本', timeout: 10000 },
++  )
++  const afterArbitration = await nodeSummary(page, moduleSpec)
++  if (heroAssetCount(afterArbitration) !== heroAssetCount(beforeArbitration) + 1) {
++    throw new Error(
++      'Canvas clipboard must win over the stale foreign image: expected another node copy of the hero asset',
++    )
++  }
++
++  // ── D1:右键菜单「复制」也必须补写哨兵(真浏览器路径)────────────────────────
++  // 单测只能证"writeText 被调用";菜单点击是否真在用户手势窗口内、异步写入是否
++  // 真的赶在粘贴之前落地,只有这一层能证。修复前这条必红:菜单复制完全不碰系统
++  // 剪贴板 → 仲裁认为系统内容更新 → 粘出的是那张外部图而不是节点副本。
++  await putForeignImageOnClipboard(page)
++  await selectNodes(page, moduleSpec, [HERO])
++  await clickContextMenuItem(page, rendererMode, HERO, 'Copy image')
++  await waitForAsyncPredicate(
++    page,
++    async () => {
++      const items = await navigator.clipboard.read()
++      // 补写完成的判据:图没了、只剩文字(哨兵)。
++      return !items.some((item) => item.types.some((type) => type.startsWith('image/')))
++    },
++    undefined,
++    { label: '菜单「复制」把哨兵异步补写进系统剪贴板', timeout: 10000 },
++  )
++  const beforeMenuPaste = await nodeSummary(page, moduleSpec)
++  await page.keyboard.press('ControlOrMeta+v')
++  await waitForAsyncPredicate(
++    page,
++    async ({ spec, expected }) => {
++      const { useCanvasStore } = await import(spec)
++      return useCanvasStore.getState().nodes.length >= expected
++    },
++    { spec: moduleSpec, expected: beforeMenuPaste.total + 1 },
++    { label: '菜单复制后 Cmd+V 粘出节点副本', timeout: 10000 },
++  )
++  const afterMenuPaste = await nodeSummary(page, moduleSpec)
++  if (heroAssetCount(afterMenuPaste) !== heroAssetCount(beforeMenuPaste) + 1) {
++    throw new Error(
++      'Menu "Copy image" must write the sentinel so the canvas clipboard wins: expected a node copy, got the foreign bitmap',
++    )
++  }
++
++  console.log('[e2e-smoke] copy-as-png scenario passed')
++}
+diff --git a/scripts/e2e/scenarios/index.mjs b/scripts/e2e/scenarios/index.mjs
+index e9b5ac47..e3692673 100644
+--- a/scripts/e2e/scenarios/index.mjs
++++ b/scripts/e2e/scenarios/index.mjs
+@@ -9,6 +9,7 @@ import { runArchiveUiTrashScenario } from './archive-ui-trash.mjs'
+ import { runMaskReflowScenario } from './mask-reflow.mjs'
+ import { runCanvasInteractionsScenario } from './canvas-interactions.mjs'
+ import { runCanvasExportScenario } from './canvas-export.mjs'
++import { runCopyAsPngScenario } from './copy-as-png.mjs'
+ import { runChangelogScenario } from './changelog.mjs'
+ import { runChatGenerationScenario } from './chat-generation.mjs'
+ import { runChatCopyScenario } from './chat-copy.mjs'
+@@ -42,6 +43,7 @@ export const scenarioOrder = [
+   'archive-assets',
+   'canvas-interactions',
+   'canvas-export',
++  'copy-as-png',
+   'image-crop',
+   'input-focus',
+   'markup-text-overlay',
+@@ -102,6 +104,7 @@ export const scenarioRunners = {
+   'mask-reflow': runMaskReflowScenario,
+   'canvas-interactions': runCanvasInteractionsScenario,
+   'canvas-export': runCanvasExportScenario,
++  'copy-as-png': runCopyAsPngScenario,
+   'image-crop': runImageCropScenario,
+   'input-focus': runInputFocusScenario,
+   changelog: runChangelogScenario,
+diff --git a/src/canvas/MivoCanvas.tsx b/src/canvas/MivoCanvas.tsx
+index 0be670f5..73d01edf 100644
+--- a/src/canvas/MivoCanvas.tsx
++++ b/src/canvas/MivoCanvas.tsx
+@@ -317,7 +317,7 @@ export function MivoCanvas({
+     setCropNodeId(undefined)
+   }, [])
+ 
+-  const { replaceImageNode, copyImageAsPng, promptRenameNode, promptDialogElement } = useImageEditActions()
++  const { replaceImageNode, copyImagesAsPng, promptRenameNode, promptDialogElement } = useImageEditActions()
+   const { replaceFileNode, openFilePreview } = useFileNodeActions()
+ 
+   const downloadOriginal = useCallback((node?: typeof contextMenuNode) => {
+@@ -508,7 +508,7 @@ export function MivoCanvas({
+     onStartImageMaskEdit: openRegionEdit,
+     onDownloadOriginal: downloadOriginal,
+     onReplaceImage: replaceImageNode,
+-    onCopyImageAsPng: copyImageAsPng,
++    onCopyImagesAsPng: copyImagesAsPng,
+     onReplaceFile: replaceFileNode,
+     onOpenFilePreview: openFilePreview,
+   }
+@@ -749,7 +749,7 @@ export function MivoCanvas({
+             onStartImageMaskEdit={openRegionEdit}
+             onDownloadOriginal={downloadOriginal}
+             onReplaceImage={replaceImageNode}
+-            onCopyImageAsPng={copyImageAsPng}
++            onCopyImagesAsPng={copyImagesAsPng}
+           />
+         ) : null}
+       </div>
+diff --git a/src/canvas/NodeActionMenu.tsx b/src/canvas/NodeActionMenu.tsx
+index 5f851a01..412844d1 100644
+--- a/src/canvas/NodeActionMenu.tsx
++++ b/src/canvas/NodeActionMenu.tsx
+@@ -28,7 +28,7 @@ type NodeActionMenuProps = {
+   onStartImageMaskEdit?: (nodeId: string) => void
+   onDownloadOriginal?: (node?: MivoCanvasNode) => void
+   onReplaceImage?: (nodeId: string) => void
+-  onCopyImageAsPng?: (node?: MivoCanvasNode) => void
++  onCopyImagesAsPng?: (nodes: MivoCanvasNode[]) => void
+ }
+ 
+ export function NodeActionMenu({
+@@ -51,7 +51,7 @@ export function NodeActionMenu({
+   onStartImageMaskEdit,
+   onDownloadOriginal,
+   onReplaceImage,
+-  onCopyImageAsPng,
++  onCopyImagesAsPng,
+ }: NodeActionMenuProps) {
+   // 动作装配层的 label 在装配时已 t() 成当前语言;useTranslation 让语言切换触发重装配。
+   const { t } = useTranslation()
+@@ -74,7 +74,7 @@ export function NodeActionMenu({
+     onStartImageMaskEdit,
+     onDownloadOriginal,
+     onReplaceImage,
+-    onCopyImageAsPng,
++    onCopyImagesAsPng,
+   })
+   const actionGroups = contextMenuGroupsFor(runtime)
+   const [openSubmenu, setOpenSubmenu] = useState<{
+diff --git a/src/canvas/SelectionQuickToolbar.tsx b/src/canvas/SelectionQuickToolbar.tsx
+index 4ede2e2b..fd235ccf 100644
+--- a/src/canvas/SelectionQuickToolbar.tsx
++++ b/src/canvas/SelectionQuickToolbar.tsx
+@@ -25,7 +25,7 @@ type SelectionQuickToolbarProps = {
+   onStartImageMaskEdit?: (nodeId: string) => void
+   onDownloadOriginal?: (node?: MivoCanvasNode) => void
+   onReplaceImage?: (nodeId: string) => void
+-  onCopyImageAsPng?: (node?: MivoCanvasNode) => void
++  onCopyImagesAsPng?: (nodes: MivoCanvasNode[]) => void
+ }
+ 
+ const boundsForSingleNode = (node: MivoCanvasNode): CanvasBounds => ({
+@@ -49,7 +49,7 @@ export function SelectionQuickToolbar({
+   onStartImageMaskEdit,
+   onDownloadOriginal,
+   onReplaceImage,
+-  onCopyImageAsPng,
++  onCopyImagesAsPng,
+ }: SelectionQuickToolbarProps) {
+   // 动作装配层的 label 在装配时已 t() 成当前语言;useTranslation 让语言切换触发重装配。
+   const { t } = useTranslation()
+@@ -73,7 +73,7 @@ export function SelectionQuickToolbar({
+     onStartImageMaskEdit,
+     onDownloadOriginal,
+     onReplaceImage,
+-    onCopyImageAsPng,
++    onCopyImagesAsPng,
+   })
+   const actionGroups = quickToolbarGroupsFor(runtime)
+   // Screen-space avoid-shift: keeps the bar clear of the shell edges AND the
+diff --git a/src/canvas/actions/canvasActionEmitters.ts b/src/canvas/actions/canvasActionEmitters.ts
+index 24497fd8..e74e6f49 100644
+--- a/src/canvas/actions/canvasActionEmitters.ts
++++ b/src/canvas/actions/canvasActionEmitters.ts
+@@ -21,6 +21,7 @@ import type { CanvasActionRuntime, LayerMove } from './canvasActionTypes'
+ import type { SectionLockMode, ToolId } from '../../types/mivoCanvas'
+ import type { DistributionAxis, SelectionAlignment, SelectionArrangeMode } from '../../store/canvasStore'
+ import { applyCanvasCommand } from './canvasCommandExecutor'
++import { writeCanvasClipboardSentinel } from '../../lib/canvasClipboardSentinel'
+ 
+ const primaryNodeId = (runtime: CanvasActionRuntime) => runtime.context.primaryNode?.id
+ 
+@@ -96,7 +97,14 @@ const replacePrimaryImage = (runtime: CanvasActionRuntime) => {
+ }
+ 
+ const copyPrimaryImageAsPng = (runtime: CanvasActionRuntime) => {
+-  runtime.onCopyImageAsPng?.(runtime.context.primaryNode)
++  const node = runtime.context.primaryNode
++  runtime.onCopyImagesAsPng?.(node ? [node] : [])
++}
++
++/** 多选「复制为 PNG」:整个选区合成一张。context.nodes 已是图层顺序
++ *  (selectedNodesFromState 对 store 的 nodes 数组做 filter),直接照序传下去。 */
++const copySelectedImagesAsPng = (runtime: CanvasActionRuntime) => {
++  runtime.onCopyImagesAsPng?.(runtime.context.nodes)
+ }
+ 
+ const renamePrimaryNode = (runtime: CanvasActionRuntime) => {
+@@ -230,8 +238,13 @@ const arrange = (runtime: CanvasActionRuntime, mode: SelectionArrangeMode) => {
+ // T2.2 — zero-arg emitters for the quickbar/context-menu method-ref exits (copy/paste/
+ // group/ungroup/toggle/hide/show). The UI-intent layer wires these as onClick handlers
+ // instead of passing runtime.X directly, so command emission stays in this layer.
+-const copySelectedNodes = (runtime: CanvasActionRuntime) =>
++const copySelectedNodes = (runtime: CanvasActionRuntime) => {
+   applyCanvasCommand({ kind: 'copy-selected-nodes' }, runtime)
++  // 菜单复制没有 copy 事件可 setData,必须异步补写哨兵,否则粘贴时仲裁
++  // 认不出"内部剪贴板才是最新的",系统里残留的旧截图会赢(见该函数注释)。
++  // 副作用只碰系统剪贴板、不动文档,故不进 CanvasCommand。
++  void writeCanvasClipboardSentinel()
++}
+ const pasteClipboardNodes = (runtime: CanvasActionRuntime) =>
+   applyCanvasCommand({ kind: 'paste-clipboard-nodes' }, runtime)
+ const groupSelectedNodes = (runtime: CanvasActionRuntime) =>
+@@ -261,6 +274,7 @@ export {
+   flipPrimaryImage,
+   replacePrimaryImage,
+   copyPrimaryImageAsPng,
++  copySelectedImagesAsPng,
+   downloadPrimaryOriginal,
+   renamePrimaryNode,
+   setSectionStyle,
+diff --git a/src/canvas/actions/canvasActionModel.characterization.test.ts b/src/canvas/actions/canvasActionModel.characterization.test.ts
+index 3270e2bc..fbc5df35 100644
+--- a/src/canvas/actions/canvasActionModel.characterization.test.ts
++++ b/src/canvas/actions/canvasActionModel.characterization.test.ts
+@@ -38,8 +38,9 @@ const node = (seed: NodeSeed): MivoCanvasNode => ({
+   ...seed,
+ } as MivoCanvasNode)
+ 
++// assetUrl 是真实 image 节点的必备字段(Copy as PNG 的装配门要求它);此前 fixture 漏写。
+ const imageNode = (id: string, over: Partial<MivoCanvasNode> = {}) =>
+-  node({ id, type: 'image', ...over })
++  node({ id, type: 'image', assetUrl: `asset://${id}`, ...over })
+ const textNode = (id: string, over: Partial<MivoCanvasNode> = {}) =>
+   node({ id, type: 'text', ...over })
+ const frameNode = (id: string, over: Partial<MivoCanvasNode> = {}) =>
+@@ -305,13 +306,13 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       expect(hasAction(groups, 'duplicate')).toBe(false)
+     })
+ 
+-    it('multi image×2 真实 group 顺序: inspect → organize → arrange → align → export → danger', () => {
++    it('multi image×2 真实 group 顺序: inspect → selection-export → organize → arrange → export → danger', () => {
+       const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('a'), imageNode('b')])))
+       // multi 时 node 扩展返 []（nodeContextMenuGroupsFor 对 kind!==single 返 []）；
+-      // align 仅 multi 出现，夹在 arrange 与 export 之间。
+       // §2.5a(2026-08-01 拍板):align 组从右键退场(快捷条唯一入口)。
++      // 多选全是图片时新增 selection-export 组(仅 Copy as PNG),紧跟 inspect。
+       expect(orderedGroupIds(groups)).toEqual([
+-        'inspect', 'organize', 'arrange', 'export', 'danger',
++        'inspect', 'selection-export', 'organize', 'arrange', 'export', 'danger',
+       ])
+     })
+ 
+diff --git a/src/canvas/actions/canvasActionModel.copyAsPng.test.ts b/src/canvas/actions/canvasActionModel.copyAsPng.test.ts
+new file mode 100644
+index 00000000..7b9d0999
+--- /dev/null
++++ b/src/canvas/actions/canvasActionModel.copyAsPng.test.ts
+@@ -0,0 +1,254 @@
++// 多选「复制为 PNG」的装配契约 + 菜单复制的哨兵补写。
++//
++// 覆盖:
++//  SC-B1  多选全是图片 → 菜单出现 copy-as-png,点击把整个选区(图层顺序)交出去
++//  SC-B3  混选 / 非图片 / 缺 assetUrl → 不出现(不做"跳过非图片只拼图片")
++//  SC-B4  多选时单选专属项(AI 编辑/变体/旁生成/reset-crop 等)仍不出现 ——
++//         证明本项是单开的,没有去松 generationContextMenuGroupsFor 的
++//         `kind !== 'single'` 早退(那个早退同时护着上述各项)
++//  D1     菜单/快捷条「复制」补写哨兵,否则剪贴板里的旧截图会赢过刚复制的节点
++
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { contextMenuGroupsFor } from './canvasActionModel'
++import { createCanvasSelectionContext } from './canvasSelectionModel'
++import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
++import type { CanvasNodeType, MivoCanvasNode } from '../../types/mivoCanvas'
++import { CANVAS_CLIPBOARD_SENTINEL } from '../../lib/canvasClipboardSentinel'
++
++const node = (id: string, type: CanvasNodeType, over: Partial<MivoCanvasNode> = {}): MivoCanvasNode =>
++  ({
++    id,
++    title: id,
++    type,
++    x: 0,
++    y: 0,
++    width: 100,
++    height: 100,
++    status: 'ready',
++    ...over,
++  }) as MivoCanvasNode
++
++/** 可复制为 PNG 的图片 = 有 assetUrl 的 image。 */
++const imageNode = (id: string, over: Partial<MivoCanvasNode> = {}) =>
++  node(id, 'image', { assetUrl: `asset://${id}`, ...over })
++
++const ctx = (nodes: MivoCanvasNode[], primary?: MivoCanvasNode) =>
++  createCanvasSelectionContext(nodes, primary ?? nodes[0])
++
++const createRuntime = (
++  context: ReturnType<typeof ctx>,
++  overrides: Partial<CanvasActionRuntime> = {},
++): CanvasActionRuntime =>
++  ({
++    context,
++    clipboardCount: 0,
++    hiddenCount: 0,
++    allNodeIds: context.nodes.map((n) => n.id),
++    canvasPosition: undefined,
++    setActiveTool: vi.fn(),
++    selectNodes: vi.fn(),
++    copySelectedNodes: vi.fn(),
++    pasteClipboardNodes: vi.fn(),
++    duplicateNode: vi.fn(),
++    duplicateSelectedNodes: vi.fn(),
++    deleteNode: vi.fn(),
++    deleteSelectedNodes: vi.fn(),
++    groupSelectedNodes: vi.fn(),
++    ungroupSelectedNodes: vi.fn(),
++    moveNodeLayer: vi.fn(),
++    moveSelectedLayer: vi.fn(),
++    alignSelectedNodes: vi.fn(),
++    distributeSelectedNodes: vi.fn(),
++    arrangeSelectedNodes: vi.fn(),
++    toggleSelectedNodesLocked: vi.fn(),
++    hideSelectedNodes: vi.fn(),
++    showAllHiddenNodes: vi.fn(),
++    updateMarkupStyle: vi.fn(),
++    updateSelectedMarkupStyle: vi.fn(),
++    updateSectionStyle: vi.fn(),
++    setSectionLockMode: vi.fn(),
++    removeSectionOnly: vi.fn(),
++    rotateImageNode: vi.fn(),
++    flipImageNode: vi.fn(),
++    resetImageCrop: vi.fn(),
++    addTextNode: vi.fn(() => 'text-id'),
++    addFrameNode: vi.fn(() => 'frame-id'),
++    addAiSlotNode: vi.fn(() => 'slot-id'),
++    addAnnotationNode: vi.fn(() => 'note-id'),
++    addMarkupNode: vi.fn(() => 'markup-id'),
++    generateVariations: vi.fn(async () => []),
++    generateImageEdit: vi.fn(async () => []),
++    generateBesideNode: vi.fn(async () => []),
++    generateIntoAiSlot: vi.fn(async () => []),
++    generateFromAnnotation: vi.fn(async () => []),
++    ...overrides,
++  }) as unknown as CanvasActionRuntime
++
++const findAction = (groups: CanvasActionGroup[], id: string): CanvasActionItem | undefined => {
++  for (const group of groups) {
++    for (const action of group.actions) {
++      if (action.id === id) return action
++      const child = action.children?.find((c) => c.id === id)
++      if (child) return child
++    }
++  }
++  return undefined
++}
++
++const hasAction = (groups: CanvasActionGroup[], id: string) => Boolean(findAction(groups, id))
++
++const fire = (groups: CanvasActionGroup[], id: string) => {
++  const action = findAction(groups, id)
++  if (!action?.onClick) throw new Error(`action missing or not clickable: ${id}`)
++  action.onClick()
++}
++
++const stubClipboard = () => {
++  const writeText = vi.fn(async () => undefined)
++  const original = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
++  Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
++  return {
++    writeText,
++    restore: () => {
++      if (original) Object.defineProperty(navigator, 'clipboard', original)
++      else Reflect.deleteProperty(navigator as unknown as Record<string, unknown>, 'clipboard')
++    },
++  }
++}
++
++let clipboard: ReturnType<typeof stubClipboard> | undefined
++
++afterEach(() => {
++  clipboard?.restore()
++  clipboard = undefined
++})
++
++describe('多选「复制为 PNG」装配', () => {
++  it('SC-B1 多选全是有资产的图片 → 出现 copy-as-png', () => {
++    const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('a'), imageNode('b')])))
++    expect(hasAction(groups, 'copy-as-png')).toBe(true)
++  })
++
++  it('SC-B1 点击把整个选区按传入(图层)顺序交给 onCopyImagesAsPng', () => {
++    const onCopyImagesAsPng = vi.fn()
++    const nodes = [imageNode('bottom'), imageNode('middle'), imageNode('top')]
++    const groups = contextMenuGroupsFor(createRuntime(ctx(nodes), { onCopyImagesAsPng }))
++
++    fire(groups, 'copy-as-png')
++    expect(onCopyImagesAsPng).toHaveBeenCalledTimes(1)
++    expect(onCopyImagesAsPng.mock.calls[0][0].map((n: MivoCanvasNode) => n.id)).toEqual([
++      'bottom',
++      'middle',
++      'top',
++    ])
++  })
++
++  it('自成独立一组,紧跟 inspect 簇之后(= 落在「适应所选」下面,带分隔线)', () => {
++    const groups = contextMenuGroupsFor(
++      createRuntime(ctx([imageNode('a'), imageNode('b')]), { onFitSelection: vi.fn() }),
++    )
++    const groupIds = groups.map((g) => g.id)
++    expect(groupIds.indexOf('selection-export')).toBe(groupIds.indexOf('inspect') + 1)
++
++    // 这一组只装 copy-as-png 一项(不许顺手塞别的进来)。
++    const exportGroup = groups.find((g) => g.id === 'selection-export')
++    expect(exportGroup?.actions.map((a) => a.id)).toEqual(['copy-as-png'])
++
++    // 反向:它不在 inspect 簇里 —— 在里面就没有分隔线,与单图菜单观感不一致。
++    const inspectIds = groups.find((g) => g.id === 'inspect')?.actions.map((a) => a.id) ?? []
++    expect(inspectIds).not.toContain('copy-as-png')
++    // inspect 簇本身仍以 copy → fit-selection 收尾(证明只是搬出去,没打乱既有顺序)。
++    expect(inspectIds.slice(0, 2)).toEqual(['copy', 'fit-selection'])
++  })
++
++  it('没接 onCopyImagesAsPng 时点击不抛(可选链安全)', () => {
++    const groups = contextMenuGroupsFor(
++      createRuntime(ctx([imageNode('a'), imageNode('b')]), { onCopyImagesAsPng: undefined }),
++    )
++    expect(() => fire(groups, 'copy-as-png')).not.toThrow()
++  })
++
++  it('SC-B3 混入文本节点 → 不出现', () => {
++    const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('a'), node('t', 'text')])))
++    expect(hasAction(groups, 'copy-as-png')).toBe(false)
++  })
++
++  it('SC-B3 混入 task-placeholder → 不出现(它也持有 imageAsset 能力,但没有 assetUrl)', () => {
++    const groups = contextMenuGroupsFor(
++      createRuntime(ctx([imageNode('a'), node('task', 'task-placeholder')])),
++    )
++    expect(hasAction(groups, 'copy-as-png')).toBe(false)
++  })
++
++  it('SC-B3 image 但缺 assetUrl → 不出现', () => {
++    const groups = contextMenuGroupsFor(
++      createRuntime(ctx([imageNode('a'), node('empty', 'image')])),
++    )
++    expect(hasAction(groups, 'copy-as-png')).toBe(false)
++  })
++
++  it('SC-B3 混选 [image,text] → 整个 selection-export 组都不出现', () => {
++    const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('a'), node('t', 'text')])))
++    expect(groups.map((g) => g.id)).not.toContain('selection-export')
++  })
++
++  it('SC-B3 全是非图片(便签多选)→ 不出现', () => {
++    const groups = contextMenuGroupsFor(
++      createRuntime(ctx([node('n1', 'annotation'), node('n2', 'annotation')])),
++    )
++    expect(hasAction(groups, 'copy-as-png')).toBe(false)
++  })
++
++  it('单选图片仍只有一份 copy-as-png(来自 edit 簇,没被多选那项重复装配)', () => {
++    const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('a')])))
++    const matches = groups.flatMap((g) => g.actions.filter((a) => a.id === 'copy-as-png'))
++    expect(matches).toHaveLength(1)
++  })
++
++  it('SC-B4 多选时单选专属项仍不出现 —— 没有松动 kind!=="single" 早退', () => {
++    const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('a'), imageNode('b')])))
++    for (const id of [
++      'reset-crop',
++      'variations',
++      'generate-beside',
++      'add-edit-note',
++      'edit-with-prompt',
++      'select-area-edit',
++      'remove-background',
++      'view-details',
++    ]) {
++      expect(hasAction(groups, id)).toBe(false)
++    }
++    // 同一份菜单里 copy-as-png 确实在(证明上面的"不出现"不是整份菜单为空)。
++    expect(hasAction(groups, 'copy-as-png')).toBe(true)
++  })
++})
++
++describe('D1 菜单「复制」补写哨兵', () => {
++  it('点击 copy → 内部剪贴板 + 系统剪贴板哨兵,两件都做', async () => {
++    clipboard = stubClipboard()
++    const copySelectedNodes = vi.fn()
++    const groups = contextMenuGroupsFor(
++      createRuntime(ctx([imageNode('a'), imageNode('b')]), { copySelectedNodes }),
++    )
++
++    fire(groups, 'copy')
++    expect(copySelectedNodes).toHaveBeenCalledTimes(1)
++    // 补写是异步的(菜单点击没有 copy 事件可 setData),让微任务跑完再断言。
++    await Promise.resolve()
++    expect(clipboard.writeText).toHaveBeenCalledWith(CANVAS_CLIPBOARD_SENTINEL)
++  })
++
++  it('系统剪贴板不可用时,内部复制照做、不抛(哨兵只是增强)', () => {
++    const original = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
++    Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true })
++    try {
++      const copySelectedNodes = vi.fn()
++      const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('a')]), { copySelectedNodes }))
++      expect(() => fire(groups, 'copy')).not.toThrow()
++      expect(copySelectedNodes).toHaveBeenCalledTimes(1)
++    } finally {
++      if (original) Object.defineProperty(navigator, 'clipboard', original)
++    }
++  })
++})
+diff --git a/src/canvas/actions/canvasActionModel.ts b/src/canvas/actions/canvasActionModel.ts
+index d1095037..cac533ee 100644
+--- a/src/canvas/actions/canvasActionModel.ts
++++ b/src/canvas/actions/canvasActionModel.ts
+@@ -68,7 +68,7 @@ import {
+   hideSelectedNodes,
+   showAllHiddenNodes,
+ } from './canvasActionEmitters'
+-import { pasteHereAction } from './clipboardActionItems'
++import { copySelectionAsPngGroups, pasteHereAction } from './clipboardActionItems'
+ 
+ const hasGroupedNodes = (runtime: CanvasActionRuntime) =>
+   runtime.context.nodes.some((node) => Boolean(node.groupId))
+@@ -154,8 +154,8 @@ const generationContextMenuGroupsFor: NodeActionExtension = (runtime) => {
+     // #482 收口二批:右键第三入口,与快捷条同 builder(见 imageActionGroups),只给 image。
+     ...(imageSelected ? [aiEditActionFor(runtime, 'ai-edit')] : []),
+   ]
+-  // edit 组只给 image:copy-as-png 恒有、reset-crop 随 imageCrop 条件显示。
+-  // type 守卫不可省——本装配同时服务 ai-slot,不守卫会把 copy-as-png 漏给它。
++  // edit 组只给 image:copy-as-png 随 assetUrl(无资产栅格化必挂)、reset-crop 随 imageCrop;
++  // type 守卫防止漏给 ai-slot,按 length 判空避免空 group 渲染出孤立分隔线。
+   const editActions =
+     context.primaryNode?.type === 'image' ? imageContextEditActionsFor(runtime) : []
+ 
+@@ -313,13 +313,10 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+               },
+             ]
+           : []),
+-        ...(hasClipboard
+-          ? [
+-              pasteHereAction(runtime),
+-            ]
+-          : []),
++        ...(hasClipboard ? [pasteHereAction(runtime)] : []),
+       ],
+     },
++    ...copySelectionAsPngGroups(runtime),
+     ...nodeContextMenuGroupsFor(runtime),
+     ...(canGroupSelection || canUngroupSelection || canLock || canHide
+       ? [
+diff --git a/src/canvas/actions/canvasActionTypes.ts b/src/canvas/actions/canvasActionTypes.ts
+index f4a76005..d2c45804 100644
+--- a/src/canvas/actions/canvasActionTypes.ts
++++ b/src/canvas/actions/canvasActionTypes.ts
+@@ -90,7 +90,7 @@ export type CanvasActionRuntime = {
+   onStartImageMaskEdit?: (nodeId: string) => void
+   onDownloadOriginal?: (node?: MivoCanvasNode) => void
+   onReplaceImage?: (nodeId: string) => void
+-  onCopyImageAsPng?: (node?: MivoCanvasNode) => void
++  onCopyImagesAsPng?: (nodes: MivoCanvasNode[]) => void
+   setActiveTool: (toolId: ToolId) => void
+   rotateImageNode: (nodeId: string) => void
+   flipImageNode: (nodeId: string, axis: 'horizontal' | 'vertical') => void
+diff --git a/src/canvas/actions/clipboardActionItems.ts b/src/canvas/actions/clipboardActionItems.ts
+index 18e08dd3..2710e5be 100644
+--- a/src/canvas/actions/clipboardActionItems.ts
++++ b/src/canvas/actions/clipboardActionItems.ts
+@@ -3,12 +3,49 @@
+ //
+ // §3(2026-08-01 拍板):paste 的 label 收敛为 "Paste here"(对齐参考产品语义),
+ // 数量信息挪进粘贴完成的 toast;blank 与选区两处菜单共用本装配。
+-import { Clipboard } from 'lucide-react'
++import { Clipboard, Copy } from 'lucide-react'
+ import { t } from '../../i18n'
+ import { toastFeedback } from '../../store/toastStore'
+-import { pasteClipboardNodes } from './canvasActionEmitters'
++import { copySelectedImagesAsPng, pasteClipboardNodes } from './canvasActionEmitters'
+ import { menuShortcuts } from './menuShortcuts'
+-import type { CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
++import { isCopyablePngNode } from '../../lib/imageNodeClipboard'
++import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
++
++/**
++ * 多选「复制为 PNG」(2026-08-05)。单选那份在 imageActionGroups.imageContextEditActionsFor
++ * 的 edit 簇里,但那簇挂在 generationContextMenuGroupsFor 上、被 `kind !== 'single'`
++ * 早退挡住 —— 那个早退同时护着 AI 编辑 / 变体 / 旁生成 / Add edit note,**不能为了本项
++ * 去松它**,否则一堆单选专属项会漏进多选。故这里单开一项,由 contextMenuGroupsFor
++ * 展开进 inspect 簇。
++ *
++ * 门:**每一个**选中项都得是有资产的 image。不能用 `imageAsset` capability 代替 ——
++ * task-placeholder 也持有它(canvasNodeRegistry),但那是待生成占位、没有 assetUrl,
++ * 栅格化必挂。混选一律不给入口:不做"跳过非图片只拼图片",那是静默丢内容。
++ *
++ * 数量信息进 toast 不进 label(同下方 pasteHereAction 的 §3 约定)。
++ *
++ * 返回的是**独立 group**(不是往 inspect 簇里塞 item):单图菜单里 Copy as PNG 就自成
++ * 一组(imageContextEditActionsFor 的 edit 簇),多选要与之观感一致 —— 落在「适应所选」
++ * 之下、带分隔线的单独一组(2026-08-05 用户)。调用方把它排在 inspect 簇之后。
++ */
++export const copySelectionAsPngGroups = (runtime: CanvasActionRuntime): CanvasActionGroup[] => {
++  const { context } = runtime
++  if (context.kind !== 'multi' || !context.nodes.every(isCopyablePngNode)) return []
++
++  return [
++    {
++      id: 'selection-export',
++      actions: [
++        {
++          id: 'copy-as-png',
++          label: t('menu.image.copyAsPng'),
++          icon: Copy,
++          onClick: () => copySelectedImagesAsPng(runtime),
++        },
++      ],
++    },
++  ]
++}
+ 
+ export const pasteHereAction = (runtime: CanvasActionRuntime): CanvasActionItem => ({
+   id: 'paste',
+diff --git a/src/canvas/actions/imageActionGroups.ts b/src/canvas/actions/imageActionGroups.ts
+index b8786127..743af8ff 100644
+--- a/src/canvas/actions/imageActionGroups.ts
++++ b/src/canvas/actions/imageActionGroups.ts
+@@ -15,6 +15,7 @@ import {
+ } from 'lucide-react'
+ import { t } from '../../i18n'
+ import { hasAnyCapability } from './canvasSelectionModel'
++import { isCopyablePngNode } from '../../lib/imageNodeClipboard'
+ import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
+ import {
+   primaryNodeId,
+@@ -77,5 +78,16 @@ export const imageContextEditActionsFor = (runtime: CanvasActionRuntime): Canvas
+         },
+       ]
+     : []),
+-  { id: 'copy-as-png', label: t('menu.image.copyAsPng'), icon: Copy, onClick: () => copyPrimaryImageAsPng(runtime) },
++  // 门与多选那份一致(clipboardActionItems.copySelectionAsPngGroups):没有 assetUrl
++  // 的 image 栅格化必挂,菜单里给了入口、点了只 warn 不 toast,用户只看到"没反应"。
++  ...(isCopyablePngNode(runtime.context.primaryNode)
++    ? [
++        {
++          id: 'copy-as-png',
++          label: t('menu.image.copyAsPng'),
++          icon: Copy,
++          onClick: () => copyPrimaryImageAsPng(runtime),
++        },
++      ]
++    : []),
+ ]
+diff --git a/src/canvas/actions/useCanvasActionRuntime.ts b/src/canvas/actions/useCanvasActionRuntime.ts
+index 0340226a..fb1ecef4 100644
+--- a/src/canvas/actions/useCanvasActionRuntime.ts
++++ b/src/canvas/actions/useCanvasActionRuntime.ts
+@@ -24,7 +24,7 @@ type UseCanvasActionRuntimeOptions = {
+   onStartImageMaskEdit?: (nodeId: string) => void
+   onDownloadOriginal?: (node?: MivoCanvasNode) => void
+   onReplaceImage?: (nodeId: string) => void
+-  onCopyImageAsPng?: (node?: MivoCanvasNode) => void
++  onCopyImagesAsPng?: (nodes: MivoCanvasNode[]) => void
+ }
+ 
+ export const useCanvasActionRuntime = ({
+@@ -46,7 +46,7 @@ export const useCanvasActionRuntime = ({
+   onStartImageMaskEdit,
+   onDownloadOriginal,
+   onReplaceImage,
+-  onCopyImageAsPng,
++  onCopyImagesAsPng,
+ }: UseCanvasActionRuntimeOptions): CanvasActionRuntime => {
+   const nodes = useCanvasStore((state) => state.nodes)
+   const selectedNodeIds = useCanvasStore((state) => state.selectedNodeIds)
+@@ -121,7 +121,7 @@ export const useCanvasActionRuntime = ({
+     onStartImageMaskEdit,
+     onDownloadOriginal,
+     onReplaceImage,
+-    onCopyImageAsPng,
++    onCopyImagesAsPng,
+     setActiveTool,
+     rotateImageNode,
+     flipImageNode,
+diff --git a/src/canvas/useGlobalCanvasEvents.ts b/src/canvas/useGlobalCanvasEvents.ts
+index 10ad1d27..bbdec0f4 100644
+--- a/src/canvas/useGlobalCanvasEvents.ts
++++ b/src/canvas/useGlobalCanvasEvents.ts
+@@ -10,12 +10,8 @@ import { selectedNodesFromState } from '../store/canvasDocumentModel'
+ import { debugLogger } from '../store/debugLogStore'
+ import { wrapMutation } from './actions/canvasSyncRuntime'
+ import { createArrowNudgeThrottle, type ArrowKey } from './arrowNudgeThrottle'
+-
+-// 画布复制/剪切时写进系统剪贴板的哨兵文本(2026-07-31 用户报「剪切粘贴没生效」):
+-// 粘贴时哨兵还在 = 期间没复制过别的东西 → 画布内部剪贴板最新鲜,优先消费;
+-// 哨兵不在(之后截了图/复制了别的)→ 系统剪贴板内容优先。没有哨兵机制时,
+-// 系统里残留的旧截图会永远遮蔽画布的剪切/复制内容。
+-const CANVAS_CLIPBOARD_SENTINEL = 'Mivo Canvas 剪贴板占位 — 回到画布按 Ctrl/Cmd+V 粘贴'
++// 哨兵的语义、三条红线与历史值都在该模块的头注释里(菜单复制路径共用同一份)。
++import { CANVAS_CLIPBOARD_SENTINEL, isCanvasClipboardSentinel } from '../lib/canvasClipboardSentinel'
+ 
+ // #arrowflood P1(Greptile:键盘选区/画布切换未结算)— handleKeyDown 顶部通用前置 flush 的键集合。
+ //   ARROW_KEYS:burst 内合法 keydown(节流自身处理,不应 flush 自打断)。
+@@ -469,8 +465,7 @@ export function useGlobalCanvasEvents(api: GlobalEventsApi) {
+ 
+       // 新鲜度仲裁(2026-07-31 用户):哨兵还在系统剪贴板 = 画布复制/剪切之后用户
+       // 没再复制过别的 → 内部剪贴板优先;否则系统内容(截图等)更新,先吃系统图。
+-      const internalIsFreshest =
+-        (event.clipboardData?.getData('text/plain') || '') === CANVAS_CLIPBOARD_SENTINEL
++      const internalIsFreshest = isCanvasClipboardSentinel(event.clipboardData?.getData('text/plain'))
+       if (internalIsFreshest && pasteInternalBoards()) {
+         event.preventDefault()
+         return
+diff --git a/src/canvas/useImageEditActions.tsx b/src/canvas/useImageEditActions.tsx
+index 20593305..e649b09e 100644
+--- a/src/canvas/useImageEditActions.tsx
++++ b/src/canvas/useImageEditActions.tsx
+@@ -8,7 +8,7 @@ import { useCallback, useState } from 'react'
+ import { useCanvasStore } from '../store/canvasStore'
+ import { wrapMutation } from './actions/canvasSyncRuntime'
+ import { deleteImportedAsset, saveImportedAsset } from '../lib/assetStorage'
+-import { copyImageNodeAsPng } from '../lib/imageNodeClipboard'
++import { copyImageNodesAsPng } from '../lib/imageNodeClipboard'
+ import { toastFeedback } from '../store/toastStore'
+ import { debugLogger } from '../store/debugLogStore'
+ import { CanvasPromptDialog } from './CanvasPromptDialog'
+@@ -80,10 +80,15 @@ export function useImageEditActions() {
+     [replaceImageNodeAsset],
+   )
+ 
+-  const copyImageAsPng = useCallback((node?: MivoCanvasNode) => {
+-    if (!node) return
++  // 单选与多选共用一个出口:copyImageNodesAsPng 内部对 1 张委托回单张路径
++  // (保住"产物 = 源裁剪区分辨率"的既有口径),对多张走并集包围盒合成。
++  const copyImagesAsPng = useCallback((nodes: MivoCanvasNode[]) => {
++    if (!nodes.length) {
++      debugLogger.warn('Canvas Image', 'Copy as PNG skipped: empty selection')
++      return
++    }
+ 
+-    void copyImageNodeAsPng(node)
++    void copyImageNodesAsPng(nodes)
+   }, [])
+ 
+   const promptRenameNode = useCallback((nodeId: string) => {
+@@ -116,5 +121,5 @@ export function useImageEditActions() {
+       />
+     ) : null
+ 
+-  return { replaceImageNode, copyImageAsPng, promptRenameNode, promptDialogElement }
++  return { replaceImageNode, copyImagesAsPng, promptRenameNode, promptDialogElement }
+ }
+diff --git a/src/i18n/locales/en/toast.json b/src/i18n/locales/en/toast.json
+index 7190f15b..6b4b3caf 100644
+--- a/src/i18n/locales/en/toast.json
++++ b/src/i18n/locales/en/toast.json
+@@ -84,6 +84,8 @@
+   "clipboardImage": {
+     "unsupported": "This browser cannot copy images to the clipboard.",
+     "copiedPng": "Copied as PNG.",
++    "copiedPngMulti": "Copied {{count}} images as one PNG.",
++    "copyPngTooLarge": "Selection is too large for a single PNG — narrow the selection and retry.",
+     "copyPngFailed": "Copy as PNG failed — see Debug Log."
+   },
+   "rollback": {
+diff --git a/src/i18n/locales/ja/toast.json b/src/i18n/locales/ja/toast.json
+index 47e320bd..978c8b9c 100644
+--- a/src/i18n/locales/ja/toast.json
++++ b/src/i18n/locales/ja/toast.json
+@@ -84,6 +84,8 @@
+   "clipboardImage": {
+     "unsupported": "このブラウザは画像のクリップボードコピーに対応していません。",
+     "copiedPng": "PNGとしてコピーしました。",
++    "copiedPngMulti": "{{count}} 枚の画像を 1 枚の PNG としてコピーしました。",
++    "copyPngTooLarge": "選択範囲が大きすぎて 1 枚の PNG に収まりません。範囲を狭めてやり直してください。",
+     "copyPngFailed": "PNGのコピーに失敗しました。Debug Log を確認してください。"
+   },
+   "rollback": {
+diff --git a/src/i18n/locales/ko/toast.json b/src/i18n/locales/ko/toast.json
+index aa09a181..1e0546da 100644
+--- a/src/i18n/locales/ko/toast.json
++++ b/src/i18n/locales/ko/toast.json
+@@ -84,6 +84,8 @@
+   "clipboardImage": {
+     "unsupported": "현재 브라우저는 이미지 클립보드 복사를 지원하지 않습니다.",
+     "copiedPng": "PNG로 복사했습니다.",
++    "copiedPngMulti": "이미지 {{count}}장을 PNG 한 장으로 복사했습니다.",
++    "copyPngTooLarge": "선택 범위가 너무 커서 PNG 한 장에 담을 수 없습니다. 범위를 좁혀 다시 시도하세요.",
+     "copyPngFailed": "PNG 복사에 실패했습니다. Debug Log를 확인하세요."
+   },
+   "rollback": {
+diff --git a/src/i18n/locales/zh-CN/toast.json b/src/i18n/locales/zh-CN/toast.json
+index a276d5f1..6ed513db 100644
+--- a/src/i18n/locales/zh-CN/toast.json
++++ b/src/i18n/locales/zh-CN/toast.json
+@@ -84,6 +84,8 @@
+   "clipboardImage": {
+     "unsupported": "当前浏览器不支持复制图片到剪贴板。",
+     "copiedPng": "已复制为 PNG。",
++    "copiedPngMulti": "已把 {{count}} 张图片复制为一张 PNG。",
++    "copyPngTooLarge": "选中范围太大,超出单张 PNG 的像素上限,请缩小选区后重试。",
+     "copyPngFailed": "复制 PNG 失败,请查看 Debug Log。"
+   },
+   "rollback": {
+diff --git a/src/lib/canvasClipboardSentinel.test.ts b/src/lib/canvasClipboardSentinel.test.ts
+new file mode 100644
+index 00000000..aa6d7086
+--- /dev/null
++++ b/src/lib/canvasClipboardSentinel.test.ts
+@@ -0,0 +1,90 @@
++// SC-C4 / SC-C5 —— 哨兵识别的正反断言 + 补写路径的三条出口。
++//
++// 这里钉的是仲裁的**识别口径**:哨兵一旦漏判,粘贴就会让系统剪贴板里的旧截图
++// 赢过用户刚复制的画布节点(2026-07-31 那个 bug)。所以"什么算哨兵"必须锁死,
++// 尤其是空串 —— 它和"剪贴板本来就没文字"撞车,绝不能算。
++
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import {
++  CANVAS_CLIPBOARD_SENTINEL,
++  isCanvasClipboardSentinel,
++  writeCanvasClipboardSentinel,
++} from './canvasClipboardSentinel'
++
++const LEGACY_SENTINEL = 'Mivo Canvas 剪贴板占位 — 回到画布按 Ctrl/Cmd+V 粘贴'
++
++const stubClipboard = (clipboard: unknown) => {
++  const original = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
++  Object.defineProperty(navigator, 'clipboard', { value: clipboard, configurable: true })
++  return () => {
++    if (original) Object.defineProperty(navigator, 'clipboard', original)
++    else Reflect.deleteProperty(navigator as unknown as Record<string, unknown>, 'clipboard')
++  }
++}
++
++let restoreClipboard: (() => void) | undefined
++
++afterEach(() => {
++  restoreClipboard?.()
++  restoreClipboard = undefined
++})
++
++describe('canvasClipboardSentinel', () => {
++  it('当前哨兵是零宽空格 —— 外部粘贴不吐可见文字,且不是空串', () => {
++    expect(CANVAS_CLIPBOARD_SENTINEL).toBe('\u200b')
++    expect(CANVAS_CLIPBOARD_SENTINEL.length).toBe(1)
++    // 反向:不能退化成空串(会与"剪贴板没文字"混淆)。
++    expect(CANVAS_CLIPBOARD_SENTINEL).not.toBe('')
++    // 反向:不能含任何可打印字符(本轮改动的目的就是不让用户看见)。
++    expect(/\S/u.test(CANVAS_CLIPBOARD_SENTINEL)).toBe(true) // ZWSP 不是 \s,见下
++    expect(CANVAS_CLIPBOARD_SENTINEL.codePointAt(0)).toBe(0x200b)
++    // 顺带钉住一条有用的性质:U+200B 规范上**不是** whitespace,所以 trim() 不吃它 ——
++    // 途经会 trim 的输入框也不会把哨兵洗掉。
++    expect(CANVAS_CLIPBOARD_SENTINEL.trim()).toBe(CANVAS_CLIPBOARD_SENTINEL)
++  })
++
++  it('SC-C4 认当前值,也认历史中文值(升级前复制、升级后粘贴那一次)', () => {
++    expect(isCanvasClipboardSentinel(CANVAS_CLIPBOARD_SENTINEL)).toBe(true)
++    expect(isCanvasClipboardSentinel(LEGACY_SENTINEL)).toBe(true)
++  })
++
++  it('SC-C5 其它任何文本都不算哨兵 —— 空串/空白/前后缀/undefined/null', () => {
++    expect(isCanvasClipboardSentinel('')).toBe(false)
++    expect(isCanvasClipboardSentinel(undefined)).toBe(false)
++    expect(isCanvasClipboardSentinel(null)).toBe(false)
++    expect(isCanvasClipboardSentinel(' ')).toBe(false)
++    expect(isCanvasClipboardSentinel('\n')).toBe(false)
++    expect(isCanvasClipboardSentinel('hello')).toBe(false)
++    // 全等比较:带前后缀的不算(否则用户复制的正文里夹一个零宽字符就会误判)。
++    expect(isCanvasClipboardSentinel(`${CANVAS_CLIPBOARD_SENTINEL}x`)).toBe(false)
++    expect(isCanvasClipboardSentinel(`x${CANVAS_CLIPBOARD_SENTINEL}`)).toBe(false)
++    expect(isCanvasClipboardSentinel(CANVAS_CLIPBOARD_SENTINEL.repeat(2))).toBe(false)
++    expect(isCanvasClipboardSentinel(`${LEGACY_SENTINEL} `)).toBe(false)
++  })
++
++  describe('writeCanvasClipboardSentinel(菜单复制路径的补写)', () => {
++    it('写入成功 → true,且写的是当前哨兵值', async () => {
++      const writeText = vi.fn(async () => undefined)
++      restoreClipboard = stubClipboard({ writeText })
++
++      await expect(writeCanvasClipboardSentinel()).resolves.toBe(true)
++      expect(writeText).toHaveBeenCalledWith(CANVAS_CLIPBOARD_SENTINEL)
++      // 反向:绝不写历史值。
++      expect(writeText).not.toHaveBeenCalledWith(LEGACY_SENTINEL)
++    })
++
++    it('浏览器没有 Clipboard API → false,不抛', async () => {
++      restoreClipboard = stubClipboard(undefined)
++      await expect(writeCanvasClipboardSentinel()).resolves.toBe(false)
++    })
++
++    it('写入被拒(无权限/失焦)→ false,不抛 —— 只退回补写之前的行为', async () => {
++      const writeText = vi.fn(async () => {
++        throw new Error('NotAllowedError')
++      })
++      restoreClipboard = stubClipboard({ writeText })
++
++      await expect(writeCanvasClipboardSentinel()).resolves.toBe(false)
++    })
++  })
++})
+diff --git a/src/lib/canvasClipboardSentinel.ts b/src/lib/canvasClipboardSentinel.ts
+new file mode 100644
+index 00000000..a989726e
+--- /dev/null
++++ b/src/lib/canvasClipboardSentinel.ts
+@@ -0,0 +1,58 @@
++// canvasClipboardSentinel —— 画布复制/剪切时写进系统剪贴板的哨兵记号。
++//
++// **它是承重的仲裁记号,不是给用户看的文案。**
++// 粘贴时哨兵还在 = 期间没复制过别的东西 → 画布内部剪贴板最新鲜,优先消费;
++// 哨兵不在(之后截了图/复制了别的)→ 系统剪贴板内容优先。没有哨兵机制时,
++// 系统里残留的旧截图会永远遮蔽画布的剪切/复制内容(2026-07-31 用户报
++// 「剪切粘贴没生效」就是这个)。
++//
++// 三条红线:
++//  1. **别删** —— 删了就退回"系统剪贴板里有图就一定赢",旧截图遮蔽 bug 复活。
++//  2. **别本地化** —— 匹配是全等比较,复制与粘贴之间切了语言就漏判。
++//  3. **别换空串** —— 空串与"剪贴板本来就没文字"(如刚从别处复制了一张图)撞车,
++//     会把陈旧的内部剪贴板误判成最新鲜。零宽空格是有内容的,撞不上。
++//
++// 2026-08-05:原值是一句中文提示,粘到画布外的输入框会吐出可见文字(参考产品
++// 不留任何可见内容)。改成零宽空格 —— 外部粘贴观感为"什么都没粘上",仲裁精度不变。
++// 唯一代价:粘进终端/代码编辑器会插入一个不可见字符,取舍上优于吐一句中文。
++import { debugLogger } from '../store/debugLogStore'
++
++const SENTINEL_LOG_SOURCE = 'Canvas Clipboard'
++
++// 必须写成转义序列:字面零宽字符在编辑器里不可见,容易被格式化工具/手改静默吃掉。
++export const CANVAS_CLIPBOARD_SENTINEL = '\u200b'
++
++/** 历史哨兵值:只用于识别"升级前复制、升级后粘贴"那一次,永不写出。 */
++const LEGACY_CANVAS_CLIPBOARD_SENTINELS = ['Mivo Canvas 剪贴板占位 — 回到画布按 Ctrl/Cmd+V 粘贴']
++
++/** 这段文字是否是我们自己的哨兵(当前值或历史值)。空/undefined 一律不算。 */
++export const isCanvasClipboardSentinel = (text: string | null | undefined): boolean =>
++  !!text && (text === CANVAS_CLIPBOARD_SENTINEL || LEGACY_CANVAS_CLIPBOARD_SENTINELS.includes(text))
++
++/**
++ * 给**没有 copy 事件**的复制入口(右键菜单的「复制」)补写哨兵。
++ *
++ * Cmd/Ctrl+C 走原生 copy 事件,能同步 `setData` 保底;菜单点击没有事件对象,
++ * 只能走异步 `writeText`。不补的话菜单复制完全不碰系统剪贴板,粘贴时哨兵缺席
++ * → 仲裁判定"系统内容更新",剪贴板里残留的旧截图会赢,用户复制的节点被无视。
++ *
++ * 失败不弹 toast:哨兵是不可见机制,写不进去只是退回补写之前的行为
++ * (画布内粘贴仍有 handlePaste 末尾的内部剪贴板兜底)。三条路径各留一条日志。
++ */
++export const writeCanvasClipboardSentinel = async (): Promise<boolean> => {
++  if (!navigator.clipboard?.writeText) {
++    debugLogger.warn(SENTINEL_LOG_SOURCE, 'Sentinel write skipped: Clipboard API unavailable in this browser')
++    return false
++  }
++  try {
++    await navigator.clipboard.writeText(CANVAS_CLIPBOARD_SENTINEL)
++    debugLogger.log(SENTINEL_LOG_SOURCE, 'Canvas clipboard sentinel written (menu copy path)')
++    return true
++  } catch (error) {
++    debugLogger.warn(
++      SENTINEL_LOG_SOURCE,
++      `Sentinel write failed: ${error instanceof Error ? error.message : String(error)}`,
++    )
++    return false
++  }
++}
+diff --git a/src/lib/imageClipboardGeometry.test.ts b/src/lib/imageClipboardGeometry.test.ts
+new file mode 100644
+index 00000000..9e620bba
+--- /dev/null
++++ b/src/lib/imageClipboardGeometry.test.ts
+@@ -0,0 +1,324 @@
++// Copy as PNG 的几何契约。
++//
++// 为什么几何要单测:jsdom 没有真 canvas / toBlob(src/main.tsx:46),几何若不抽成
++// 纯函数就只能靠 e2e 证。这里钉的是"取哪块源像素、产物多大、每张画在哪";
++// "画出来的像素对不对"由 e2e 采样证,两层分工不重叠。
++//
++// 覆盖:SC-A3(crop×flip×rotate 叠加)、SC-A4(零变换时口径不变)、
++//      SC-B2(绘制顺序)、SC-B5(超预算时产物尺寸继续超标,交给调用方闸报错)。
++
++import { describe, expect, it } from 'vitest'
++import {
++  CANVAS_MAX_BITMAP_SIDE,
++  MULTI_IMAGE_MAX_SCALE,
++  nodeGeometryOf,
++  normalizeRotation,
++  planImageNodeRaster,
++  planMultiImageComposite,
++  rotatedBoundsOf,
++} from './imageClipboardGeometry'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++const imageNode = (over: Partial<MivoCanvasNode> = {}): MivoCanvasNode =>
++  ({
++    id: over.id || 'img',
++    title: over.id || 'img',
++    type: 'image',
++    assetUrl: 'asset://x',
++    x: 0,
++    y: 0,
++    width: 100,
++    height: 100,
++    status: 'ready',
++    ...over,
++  }) as MivoCanvasNode
++
++const natural = { width: 400, height: 300 }
++
++describe('normalizeRotation', () => {
++  it('归一化到 [0,360),负角与超圈都收', () => {
++    expect(normalizeRotation(0)).toBe(0)
++    expect(normalizeRotation(90)).toBe(90)
++    expect(normalizeRotation(360)).toBe(0)
++    expect(normalizeRotation(450)).toBe(90)
++    expect(normalizeRotation(-90)).toBe(270)
++    expect(normalizeRotation(-450)).toBe(270)
++  })
++
++  it('非有限值回落 0(不让 NaN 传进 canvas 变换)', () => {
++    expect(normalizeRotation(Number.NaN)).toBe(0)
++    expect(normalizeRotation(Number.POSITIVE_INFINITY)).toBe(0)
++  })
++})
++
++describe('rotatedBoundsOf', () => {
++  it('90 的倍数走整数快路径:0/180 原样,90/270 宽高互换', () => {
++    expect(rotatedBoundsOf(400, 300, 0)).toEqual({ width: 400, height: 300 })
++    expect(rotatedBoundsOf(400, 300, 180)).toEqual({ width: 400, height: 300 })
++    expect(rotatedBoundsOf(400, 300, 90)).toEqual({ width: 300, height: 400 })
++    expect(rotatedBoundsOf(400, 300, 270)).toEqual({ width: 300, height: 400 })
++  })
++
++  it('90 倍数不引入浮点误差(通用公式会算出 300.00000000000006 之类)', () => {
++    const bounds = rotatedBoundsOf(400, 300, 90)
++    expect(Number.isInteger(bounds.width)).toBe(true)
++    expect(Number.isInteger(bounds.height)).toBe(true)
++  })
++
++  it('非 90 倍数走通用包围盒(比原尺寸大,含透明边角)', () => {
++    const bounds = rotatedBoundsOf(100, 100, 45)
++    expect(bounds.width).toBeCloseTo(Math.SQRT2 * 100, 6)
++    expect(bounds.height).toBeCloseTo(Math.SQRT2 * 100, 6)
++  })
++})
++
++describe('产物尺寸用 ceil 不用 round(否则裁掉旋转后的外沿)', () => {
++  it('45° 的 100×100 产物 ≥ 理论 AABB,不是被 round 砍成 141', () => {
++    const plan = planImageNodeRaster(
++      imageNode({ transform: { x: 0, y: 0, width: 100, height: 100, rotation: 45 } }),
++      { width: 100, height: 100 },
++    )
++    const exact = Math.SQRT2 * 100 // 141.42…
++    expect(plan.output.width).toBe(Math.ceil(exact)) // 142
++    expect(plan.output.width).toBeGreaterThanOrEqual(exact)
++    expect(plan.output.height).toBeGreaterThanOrEqual(exact)
++  })
++
++  it('90 的倍数下 ceil === round,零变换路径的整数口径不受影响', () => {
++    const plan = planImageNodeRaster(imageNode(), natural)
++    expect(plan.output).toEqual({ width: 400, height: 300 })
++    const rotated = planImageNodeRaster(
++      imageNode({ transform: { x: 0, y: 0, width: 100, height: 100, rotation: 90 } }),
++      natural,
++    )
++    expect(rotated.output).toEqual({ width: 300, height: 400 })
++  })
++})
++
++describe('nodeGeometryOf', () => {
++  it('transform 优先', () => {
++    const node = imageNode({ transform: { x: 5, y: 6, width: 7, height: 8, rotation: 90 } })
++    expect(nodeGeometryOf(node)).toEqual({ x: 5, y: 6, width: 7, height: 8, rotation: 90 })
++  })
++
++  it('transform 缺失时回落扁平字段 + rotation 0(同渲染层 transformOf)', () => {
++    const node = imageNode({ x: 1, y: 2, width: 3, height: 4 })
++    expect(nodeGeometryOf(node)).toEqual({ x: 1, y: 2, width: 3, height: 4, rotation: 0 })
++  })
++})
++
++describe('planImageNodeRaster(单图)', () => {
++  it('SC-A4 无裁剪/无旋转/无镜像 → 产物 = 整张源图,口径与抽出前一致', () => {
++    const plan = planImageNodeRaster(imageNode(), natural)
++    expect(plan.source).toEqual({ x: 0, y: 0, width: 400, height: 300 })
++    expect(plan.draw).toEqual({ width: 400, height: 300 })
++    expect(plan.output).toEqual({ width: 400, height: 300 })
++    expect(plan.rotation).toBe(0)
++    expect(plan.flipH).toBe(false)
++    expect(plan.flipV).toBe(false)
++  })
++
++  it('imageCrop 在源空间取矩形,产物 = 裁剪区的源像素数(不是显示尺寸)', () => {
++    const plan = planImageNodeRaster(
++      imageNode({ width: 50, height: 50, imageCrop: { x: 0.25, y: 0.5, width: 0.5, height: 0.5 } }),
++      natural,
++    )
++    expect(plan.source).toEqual({ x: 100, y: 150, width: 200, height: 150 })
++    // 显示尺寸 50×50 不参与:产物仍是 200×150 源像素。
++    expect(plan.output).toEqual({ width: 200, height: 150 })
++  })
++
++  it('旋转 90/270 → 产物宽高互换;180 → 不变', () => {
++    const rotated = (rotation: number) =>
++      planImageNodeRaster(imageNode({ transform: { x: 0, y: 0, width: 100, height: 100, rotation } }), natural)
++    expect(rotated(90).output).toEqual({ width: 300, height: 400 })
++    expect(rotated(270).output).toEqual({ width: 300, height: 400 })
++    expect(rotated(180).output).toEqual({ width: 400, height: 300 })
++    // draw(旋转前的绘制尺寸)始终是源裁剪尺寸,旋转只改产物画布。
++    expect(rotated(90).draw).toEqual({ width: 400, height: 300 })
++  })
++
++  it('镜像标记原样透出(作用在裁剪后的窗口整体上)', () => {
++    const plan = planImageNodeRaster(imageNode({ imageFlipH: true, imageFlipV: true }), natural)
++    expect(plan.flipH).toBe(true)
++    expect(plan.flipV).toBe(true)
++    // 镜像不改产物尺寸。
++    expect(plan.output).toEqual({ width: 400, height: 300 })
++  })
++
++  it('SC-A3 crop + flip + rotate 三者叠加:各自互不污染', () => {
++    const plan = planImageNodeRaster(
++      imageNode({
++        transform: { x: 0, y: 0, width: 100, height: 100, rotation: 90 },
++        imageCrop: { x: 0, y: 0, width: 0.5, height: 1 },
++        imageFlipH: true,
++      }),
++      natural,
++    )
++    expect(plan.source).toEqual({ x: 0, y: 0, width: 200, height: 300 })
++    expect(plan.draw).toEqual({ width: 200, height: 300 })
++    expect(plan.output).toEqual({ width: 300, height: 200 })
++    expect(plan.rotation).toBe(90)
++    expect(plan.flipH).toBe(true)
++    expect(plan.flipV).toBe(false)
++  })
++
++  it('退化裁剪不产出 0 尺寸画布(canvas 宽高为 0 会让 toBlob 回 null)', () => {
++    const plan = planImageNodeRaster(imageNode({ imageCrop: { x: 0, y: 0, width: 0, height: 0 } }), natural)
++    expect(plan.output.width).toBeGreaterThanOrEqual(1)
++    expect(plan.output.height).toBeGreaterThanOrEqual(1)
++  })
++})
++
++describe('planMultiImageComposite(多图合成)', () => {
++  const entry = (node: MivoCanvasNode, size = natural) => ({ node, natural: size })
++
++  it('并集包围盒 = 选区外接矩形,相对位置按画布保持', () => {
++    const plan = planMultiImageComposite([
++      entry(imageNode({ id: 'a', x: 0, y: 0, width: 100, height: 100 }), { width: 100, height: 100 }),
++      entry(imageNode({ id: 'b', x: 200, y: 50, width: 100, height: 100 }), { width: 100, height: 100 }),
++    ])
++    // union = x 0..300, y 0..150;两张都是 1:1,scale 保持 1。
++    expect(plan.scale).toBe(1)
++    expect(plan.output).toEqual({ width: 300, height: 150 })
++    expect(plan.placements.map((p) => p.center)).toEqual([
++      { x: 50, y: 50 },
++      { x: 250, y: 100 },
++    ])
++  })
++
++  it('SC-B2 placements 顺序 = 传入顺序(调用方传图层顺序 → 上层后画压住下层)', () => {
++    const plan = planMultiImageComposite([
++      entry(imageNode({ id: 'bottom' }), { width: 100, height: 100 }),
++      entry(imageNode({ id: 'middle' }), { width: 100, height: 100 }),
++      entry(imageNode({ id: 'top' }), { width: 100, height: 100 }),
++    ])
++    expect(plan.placements.map((p) => p.nodeId)).toEqual(['bottom', 'middle', 'top'])
++  })
++
++  it('旋转节点的包围盒按旋转后算(90° 的节点会顶出未旋转矩形之外)', () => {
++    const plan = planMultiImageComposite([
++      entry(
++        imageNode({ id: 'a', transform: { x: 0, y: 0, width: 200, height: 100, rotation: 90 } }),
++        { width: 200, height: 100 },
++      ),
++    ])
++    // 200×100 绕中心转 90° → 包围盒 100×200,中心不动(100,50)。
++    expect(plan.output).toEqual({ width: 100, height: 200 })
++    expect(plan.placements[0].center).toEqual({ x: 50, y: 100 })
++    expect(plan.placements[0].rotation).toBe(90)
++  })
++
++  it('scale 朝"最高清那张不降采样"取,封顶 MULTI_IMAGE_MAX_SCALE', () => {
++    // 源 800×800 塞进 100×100 的框 → nativeRatio 8,封顶 4。
++    const plan = planMultiImageComposite([
++      entry(imageNode({ id: 'a', width: 100, height: 100 }), { width: 800, height: 800 }),
++    ])
++    expect(plan.scale).toBe(MULTI_IMAGE_MAX_SCALE)
++    expect(plan.output).toEqual({ width: 400, height: 400 })
++  })
++
++  it('全是 1:1 时 scale 保持 1,不无谓放大', () => {
++    const plan = planMultiImageComposite([
++      entry(imageNode({ id: 'a', width: 100, height: 100 }), { width: 100, height: 100 }),
++      entry(imageNode({ id: 'b', x: 100, width: 100, height: 100 }), { width: 100, height: 100 }),
++    ])
++    expect(plan.scale).toBe(1)
++  })
++
++  it('裁剪后的源像素才算 nativeRatio(裁掉一半就只剩一半分辨率)', () => {
++    const plan = planMultiImageComposite([
++      entry(
++        imageNode({ id: 'a', width: 100, height: 100, imageCrop: { x: 0, y: 0, width: 0.5, height: 0.5 } }),
++        { width: 400, height: 400 },
++      ),
++    ])
++    // 裁剪后源 200×200 进 100×100 → ratio 2。
++    expect(plan.scale).toBe(2)
++  })
++
++  it('像素预算内回退 scale,但不低于 1(基线以下不静默降级)', () => {
++    // union 1000×1000 = 100 万像素;预算 400 万 → 允许 scale 2,而非封顶 4。
++    const plan = planMultiImageComposite(
++      [entry(imageNode({ id: 'a', width: 1000, height: 1000 }), { width: 8000, height: 8000 })],
++      { maxPixels: 4_000_000 },
++    )
++    expect(plan.scale).toBeCloseTo(2, 6)
++    expect(plan.output).toEqual({ width: 2000, height: 2000 })
++  })
++
++  it('SC-B5 连 1:1 都放不下时,scale 停在 1 且产物尺寸继续超标 —— 交给调用方的预算闸报错', () => {
++    const plan = planMultiImageComposite(
++      [entry(imageNode({ id: 'a', width: 10_000, height: 10_000 }), { width: 100, height: 100 })],
++      { maxPixels: 4_000_000 },
++    )
++    expect(plan.scale).toBe(1)
++    expect(plan.output.width * plan.output.height).toBeGreaterThan(4_000_000)
++  })
++
++  it('单边闸:面积够小但放大后单边超限时按单边回退(面积闸拦不住这条)', () => {
++    // union 20000×100 = 200 万像素,面积闸怎么放大都不会碰上限;但源图高清会把
++    // scale 顶到 4 → 80000 宽,越过 Chromium 单边上限(实测 65536 起 toBlob 回 null)。
++    const plan = planMultiImageComposite(
++      [
++        entry(imageNode({ id: 'a', x: 0, y: 0, width: 100, height: 100 }), { width: 800, height: 800 }),
++        entry(imageNode({ id: 'b', x: 19_900, y: 0, width: 100, height: 100 }), { width: 800, height: 800 }),
++      ],
++      { maxPixels: 40_000_000, maxSide: CANVAS_MAX_BITMAP_SIDE },
++    )
++    expect(plan.scale).toBeLessThan(MULTI_IMAGE_MAX_SCALE) // 被单边闸压下来了
++    expect(plan.scale).toBeGreaterThan(1) // 但没白退到基线
++    expect(plan.output.width).toBeLessThanOrEqual(CANVAS_MAX_BITMAP_SIDE)
++    expect(plan.output.height).toBeLessThanOrEqual(CANVAS_MAX_BITMAP_SIDE)
++  })
++
++  it('跨度本身就超单边时停在 scale=1,交给调用方 fail-visible(不静默降到 1 以下)', () => {
++    // 两张 100×100 纵向隔开 20 万单位:union 高 20 万,scale 降到 1 也救不了 ——
++    // 再降就是相对"所见"的静默降采样,那条线不许跨,让调用方报错。
++    const plan = planMultiImageComposite(
++      [
++        entry(imageNode({ id: 'a', x: 0, y: 0, width: 100, height: 100 }), { width: 100, height: 100 }),
++        entry(imageNode({ id: 'b', x: 0, y: 200_000, width: 100, height: 100 }), { width: 100, height: 100 }),
++      ],
++      { maxPixels: 40_000_000, maxSide: CANVAS_MAX_BITMAP_SIDE },
++    )
++    expect(plan.scale).toBe(1)
++    expect(plan.output.height).toBeGreaterThan(CANVAS_MAX_BITMAP_SIDE)
++  })
++
++  it('取整后不得把面积推回上限之上 —— 存在 >1 的合法 scale 就不许误拒', () => {
++    // 反例来自审核:连续解 scale≈1.15297,round 后 116×345892 = 40,123,472 > 4000 万。
++    // 迭代收敛必须把它压到真正装得下,且仍 >1(没有退到基线)。
++    const plan = planMultiImageComposite(
++      [
++        entry(imageNode({ id: 'a', x: 0, y: 0, width: 100.3, height: 100 }), { width: 800, height: 800 }),
++        entry(imageNode({ id: 'b', x: 0, y: 299_900.3, width: 100.3, height: 100 }), { width: 800, height: 800 }),
++      ],
++      { maxPixels: 40_000_000 },
++    )
++    expect(plan.output.width * plan.output.height).toBeLessThanOrEqual(40_000_000)
++    expect(plan.scale).toBeGreaterThan(1)
++  })
++
++  it('收敛失败时落回 scale=1,不留"既没装下、scale 又 >1"的第三态', () => {
++    // 审核给出的可复现输入:极端长宽比 + 只给面积闸,连续解算 8 轮压不进预算。
++    // 契约是"要么装得下,要么 scale===1",不许返回一个既超标又自称放大过的计划。
++    const plan = planMultiImageComposite(
++      [
++        {
++          node: imageNode({ id: 'a', transform: { x: 0, y: 0, width: 1, height: 20_000_000, rotation: 0 } }),
++          natural: { width: 4, height: 80_000_000 },
++        },
++      ],
++      { maxPixels: 40_000_000 },
++    )
++    const fits = plan.output.width * plan.output.height <= 40_000_000
++    expect(fits || plan.scale === 1).toBe(true)
++  })
++
++  it('空选区返回 1×1 空计划,不产出 0 尺寸画布', () => {
++    const plan = planMultiImageComposite([])
++    expect(plan.placements).toEqual([])
++    expect(plan.output).toEqual({ width: 1, height: 1 })
++  })
++})
+diff --git a/src/lib/imageClipboardGeometry.ts b/src/lib/imageClipboardGeometry.ts
+new file mode 100644
+index 00000000..ec3fa42e
+--- /dev/null
++++ b/src/lib/imageClipboardGeometry.ts
+@@ -0,0 +1,249 @@
++// imageClipboardGeometry —— Copy as PNG 的纯几何层(不碰 DOM,可单测)。
++//
++// 为什么单独一层:jsdom 没有真 canvas / toBlob(见 src/main.tsx:46 的注释),几何
++// 若留在栅格化函数体内就只能靠 e2e 证,回归成本高。因此"取哪块源像素、产物多大、
++// 每张画在哪"全部收进本文件的纯函数,栅格化那层只剩 drawImage 的机械调用。
++//
++// 与渲染层严格同语义(canvasRenderAdapter.nodeRenderBoxFor / CanvasNodeView /
++// render/leaferImagePaint) —— 忠实度就是"和渲染层算的一样":
++//  - 几何取 node.transform,缺失时回落 x/y/width/height + rotation 0(同 transformOf);
++//  - rotation 单位 deg、顺时针、**绕中心**(渲染层 transformOrigin: '50% 50%');
++//  - imageCrop 存在**源空间**;镜像(imageFlipH/V)作用在裁剪后的窗口**整体**上
++//    (DOM 侧是 media box 的 scale(-1,1),leafer 侧是 paint 的 scaleX/scaleY)。
++//    因此变换顺序固定为 crop → flip → rotate,不可交换。
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++export type Size = { width: number; height: number }
++export type SourceRect = { x: number; y: number; width: number; height: number }
++
++const FULL_CROP = { x: 0, y: 0, width: 1, height: 1 }
++
++/** 多图合成的放大上限:朝"最高清那张不丢分辨率"努力,但不允许把画布撑到荒谬。 */
++export const MULTI_IMAGE_MAX_SCALE = 4
++
++/**
++ * 单边像素上限。**面积闸拦不住这一条**:两张 100×100 的图在无限画布上纵向隔开
++ * 十万单位,并集包围盒约 100×100000 —— 只 1000 万像素、面积闸放行,但 Chromium
++ * 在单边 ≥65536 时 `toBlob` 直接返回 null(实测 65535×10 成功、65536×10 为 null),
++ * 结果是用户只看到一句泛化失败。所以尺寸必须单独设闸并 fail-visible。
++ *
++ * 注:`canvasExport.ts` 的导出通道只有面积闸、没有这条,存在同款潜在缺口 —— 那是
++ * 另一个出口,不在本次改动范围内。
++ */
++export const CANVAS_MAX_BITMAP_SIDE = 65_535
++
++/** 几何真源:transform 优先,缺失回落扁平字段(与渲染层 transformOf 同款防御)。 */
++export const nodeGeometryOf = (node: MivoCanvasNode) =>
++  node.transform || { x: node.x, y: node.y, width: node.width, height: node.height, rotation: 0 }
++
++/** 归一化到 [0, 360)。 */
++export const normalizeRotation = (rotation: number) => {
++  if (!Number.isFinite(rotation)) return 0
++  const wrapped = rotation % 360
++  return wrapped < 0 ? wrapped + 360 : wrapped
++}
++
++/**
++ * 绕中心旋转后的轴对齐包围盒尺寸。
++ *
++ * 90 的倍数走整数快路径:图片节点的 rotation 实际只由 rotateImageNode 的 +90 步进
++ * 产生(没有自由旋转 UI),这条路径覆盖全部真实取值,且不引入浮点误差、不产生透明
++ * 边角。非 90 倍数走通用公式兜底(类型允许任意角度)。
++ */
++export const rotatedBoundsOf = (width: number, height: number, rotation: number): Size => {
++  const deg = normalizeRotation(rotation)
++  if (deg % 90 === 0) return deg % 180 === 0 ? { width, height } : { width: height, height: width }
++
++  const rad = (deg * Math.PI) / 180
++  const cos = Math.abs(Math.cos(rad))
++  const sin = Math.abs(Math.sin(rad))
++  return { width: width * cos + height * sin, height: width * sin + height * cos }
++}
++
++export type ImageNodeRasterPlan = {
++  /** 源位图上要取的矩形(源像素,未取整 —— drawImage 接受浮点)。 */
++  source: SourceRect
++  /** 旋转前的绘制尺寸(整数像素)= 单图产物的分辨率基准。 */
++  draw: Size
++  /** 产物画布尺寸(整数像素),= draw 绕中心旋转后的包围盒。 */
++  output: Size
++  rotation: number
++  flipH: boolean
++  flipV: boolean
++}
++
++/**
++ * 单张图片节点 → 栅格化计划。产物分辨率沿用**源裁剪区的像素数**(不是画布显示
++ * 尺寸),与本函数抽出前的行为一致:rotation=0 且无镜像时 output === draw ===
++ * round(源裁剪尺寸),产物逐字节不变。
++ */
++export const planImageNodeRaster = (node: MivoCanvasNode, natural: Size): ImageNodeRasterPlan => {
++  const crop = node.imageCrop || FULL_CROP
++  const source: SourceRect = {
++    x: crop.x * natural.width,
++    y: crop.y * natural.height,
++    width: Math.max(1, crop.width * natural.width),
++    height: Math.max(1, crop.height * natural.height),
++  }
++  const draw: Size = {
++    width: Math.max(1, Math.round(source.width)),
++    height: Math.max(1, Math.round(source.height)),
++  }
++  const rotation = normalizeRotation(nodeGeometryOf(node).rotation)
++  const bounds = rotatedBoundsOf(draw.width, draw.height, rotation)
++
++  return {
++    source,
++    draw,
++    // 承载内容的外接尺寸用 ceil 不用 round:round 会向下取整,把旋转后外沿裁掉
++    // (100×100 转 45° 理论 AABB 141.421,round 成 141 → 每侧切掉约 0.21px 的
++    // 不透明角点)。90 的倍数下 bounds 已是整数,ceil === round,故零变换路径的
++    // 逐字节口径不受影响。
++    output: {
++      width: Math.max(1, Math.ceil(bounds.width)),
++      height: Math.max(1, Math.ceil(bounds.height)),
++    },
++    rotation,
++    flipH: !!node.imageFlipH,
++    flipV: !!node.imageFlipV,
++  }
++}
++
++export type MultiImageEntry = { node: MivoCanvasNode; natural: Size }
++
++export type MultiImagePlacement = {
++  nodeId: string
++  /** 节点中心在产物坐标系里的位置(输出像素)。 */
++  center: { x: number; y: number }
++  /** 旋转前的绘制尺寸(输出像素)= 画布显示尺寸 × scale。 */
++  draw: Size
++  source: SourceRect
++  rotation: number
++  flipH: boolean
++  flipV: boolean
++}
++
++export type MultiImageCompositePlan = {
++  /** 1 画布单位 = scale 输出像素。 */
++  scale: number
++  /** 产物画布尺寸(整数像素)。调用方须对它跑像素预算闸。 */
++  output: Size
++  /** 绘制顺序 = 传入顺序(调用方传的是图层顺序)。 */
++  placements: MultiImagePlacement[]
++}
++
++/**
++ * 多张图片节点 → 合成计划。产物是选区的并集包围盒,保持各自相对位置与图层顺序。
++ *
++ * scale 的取法(这是唯一有裁量的地方,写清楚免得后人当成随手数):
++ *  - 基线是 1(1 画布单位 = 1 像素,即 100% 缩放下的所见);
++ *  - 朝上取到 nativeRatio —— 让"源分辨率最高那张"不被降采样,封顶 MULTI_IMAGE_MAX_SCALE;
++ *  - 若超出像素预算或单边上限则回退,但**只回退到 1**。低于 1 就是相对基线的静默
++ *    画质损失,那种情况不在这里悄悄降级,而是让产物尺寸继续超标、由调用方的闸报错
++ *    (fail-visible,与画布导出同口径)。
++ *
++ * 回退用**整数尺寸迭代收敛**,不是一次连续求解就收工:连续解算完再对宽高取整,取整
++ * 后的面积可能被推回上限之上 —— 那样"明明存在一个 >1 的合法 scale"却被调用方判超限
++ * 误拒(实测反例:两张约 100.3×100 的图纵向相隔 299900.3、源图 800×800,连续解
++ * scale=1.15297 → 取整后 116×345892 = 40,123,472 > 4000 万)。故循环压到真正装得下。
++ */
++export const planMultiImageComposite = (
++  entries: MultiImageEntry[],
++  options?: { maxScale?: number; maxPixels?: number; maxSide?: number },
++): MultiImageCompositePlan => {
++  const maxScale = options?.maxScale ?? MULTI_IMAGE_MAX_SCALE
++  if (!entries.length) return { scale: 1, output: { width: 1, height: 1 }, placements: [] }
++
++  let minX = Number.POSITIVE_INFINITY
++  let minY = Number.POSITIVE_INFINITY
++  let maxX = Number.NEGATIVE_INFINITY
++  let maxY = Number.NEGATIVE_INFINITY
++  let nativeRatio = 1
++
++  const boxes = entries.map(({ node, natural }) => {
++    const geometry = nodeGeometryOf(node)
++    const rotation = normalizeRotation(geometry.rotation)
++    const bounds = rotatedBoundsOf(geometry.width, geometry.height, rotation)
++    const center = { x: geometry.x + geometry.width / 2, y: geometry.y + geometry.height / 2 }
++
++    minX = Math.min(minX, center.x - bounds.width / 2)
++    minY = Math.min(minY, center.y - bounds.height / 2)
++    maxX = Math.max(maxX, center.x + bounds.width / 2)
++    maxY = Math.max(maxY, center.y + bounds.height / 2)
++
++    const crop = node.imageCrop || FULL_CROP
++    // 该节点若要不降采样,1 画布单位需要几个源像素。
++    nativeRatio = Math.max(
++      nativeRatio,
++      (crop.width * natural.width) / Math.max(1, geometry.width),
++      (crop.height * natural.height) / Math.max(1, geometry.height),
++    )
++
++    return { node, natural, geometry, rotation, center }
++  })
++
++  const unionWidth = Math.max(1, maxX - minX)
++  const unionHeight = Math.max(1, maxY - minY)
++  const maxPixels = options?.maxPixels ?? Number.POSITIVE_INFINITY
++  const maxSide = options?.maxSide ?? Number.POSITIVE_INFINITY
++  const areaScale = Number.isFinite(maxPixels)
++    ? Math.sqrt(maxPixels / (unionWidth * unionHeight))
++    : Number.POSITIVE_INFINITY
++  const sideScale = Number.isFinite(maxSide)
++    ? Math.min(maxSide / unionWidth, maxSide / unionHeight)
++    : Number.POSITIVE_INFINITY
++
++  const outputFor = (value: number) => ({
++    width: Math.max(1, Math.ceil(unionWidth * value)),
++    height: Math.max(1, Math.ceil(unionHeight * value)),
++  })
++  const fits = (size: Size) =>
++    size.width * size.height <= maxPixels && size.width <= maxSide && size.height <= maxSide
++
++  let scale = Math.max(1, Math.min(nativeRatio, maxScale, areaScale, sideScale))
++  let output = outputFor(scale)
++  // 取整后仍不合格就按"差多少收多少"往下压。上限 8 轮:每轮至少乘 0.999 的收缩比,
++  // 足够收敛;压到 1 还不行就停手,让调用方的闸报错(不静默降到 1 以下)。
++  for (let round = 0; round < 8 && scale > 1 && !fits(output); round += 1) {
++    const shrink = Math.min(
++      Math.sqrt(maxPixels / (output.width * output.height)),
++      maxSide / output.width,
++      maxSide / output.height,
++      0.999,
++    )
++    scale = Math.max(1, scale * shrink)
++    output = outputFor(scale)
++  }
++  // 收敛兜底:本函数只承诺两种终态 —— **装得下**,或 **scale === 1**(基线,超标由
++  // 调用方的闸 fail-visible)。极端长宽比下 8 轮可能压不进预算(可复现输入:几何
++  // 1×20,000,000、源 4×80,000,000、只给 maxPixels=4000 万 → 8 轮后 2×20,027,095
++  // 仍超标而 scale 还停在 1.0013),那会留下"既没装下、scale 又 >1"的第三种状态 ——
++  // 调用方据此以为拿到了合法放大计划。这里直接落回基线,消掉第三态。
++  // (生产调用同时给 maxSide,该输入会被单边闸先压到 1,所以这是契约缺口而非线上缺陷。)
++  if (scale > 1 && !fits(output)) {
++    scale = 1
++    output = outputFor(1)
++  }
++
++  return {
++    scale,
++    output,
++    placements: boxes.map(({ node, natural, geometry, rotation, center }) => {
++      const crop = node.imageCrop || FULL_CROP
++      return {
++        nodeId: node.id,
++        center: { x: (center.x - minX) * scale, y: (center.y - minY) * scale },
++        draw: { width: geometry.width * scale, height: geometry.height * scale },
++        source: {
++          x: crop.x * natural.width,
++          y: crop.y * natural.height,
++          width: Math.max(1, crop.width * natural.width),
++          height: Math.max(1, crop.height * natural.height),
++        },
++        rotation,
++        flipH: !!node.imageFlipH,
++        flipV: !!node.imageFlipV,
++      }
++    }),
++  }
++}
+diff --git a/src/lib/imageNodeClipboard.ts b/src/lib/imageNodeClipboard.ts
+index 624a1b96..9cbdb8d1 100644
+--- a/src/lib/imageNodeClipboard.ts
++++ b/src/lib/imageNodeClipboard.ts
+@@ -1,10 +1,31 @@
+-// Copy-as-PNG for image nodes (FigJam parity: right-click → Copy as PNG).
+-// Rasterizes the node's VISIBLE content — imageCrop applied — to a PNG blob and
+-// writes it to the system clipboard. Success/skip/failure all reported via
+-// debugLogger (+ toast for the user-visible outcome).
++// Copy-as-PNG for image nodes (参考产品同名菜单项的对位实现).
++// Rasterizes the node's VISIBLE content — imageCrop + 镜像 + 旋转 全部应用 — to a
++// PNG blob and writes it to the system clipboard. Success/skip/failure all reported
++// via debugLogger (+ toast for the user-visible outcome).
++//
++// 几何全部委托给 imageClipboardGeometry(纯函数、可单测);本文件只负责解码位图、
++// 按计划 drawImage、编码、写剪贴板。
++//
++// 2026-08-05:
++//  - 补上旋转与镜像 —— 此前只应用 imageCrop,把图转 90°/翻转后复制,粘出来是没转
++//    没翻的原图(静默给错结果)。
++//  - 新增多选合成入口 copyImageNodesAsPng。
+ 
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import { isImportedAssetUrl, readImportedAssetFile } from './assetStorage'
++import {
++  CANVAS_MAX_BITMAP_SIDE,
++  planImageNodeRaster,
++  planMultiImageComposite,
++  type MultiImageEntry,
++  type SourceRect,
++} from './imageClipboardGeometry'
++import {
++  CANVAS_EXPORT_ERROR_CODES,
++  CANVAS_EXPORT_LIMITS,
++  CanvasExportError,
++  assertCanvasExportPixelBudget,
++} from './canvasExport'
+ import { isDemoAssetUrl, renderDemoImageBlob } from './demoAssets'
+ import { debugLogger } from '../store/debugLogStore'
+ import { toastFeedback } from '../store/toastStore'
+@@ -40,51 +61,211 @@ const decodeImage = (url: string) =>
+     image.src = url
+   })
+ 
++/** 复制为 PNG 的合格节点:必须是有资产的 image。
++ *
++ *  注意不能用 `imageAsset` capability 代替 —— task-placeholder 也持有该能力
++ *  (canvasNodeRegistry),但它是待生成占位、没有 assetUrl,栅格化必挂。 */
++export const isCopyablePngNode = (node: MivoCanvasNode | undefined): boolean =>
++  !!node && node.type === 'image' && !!node.assetUrl
++
++const clipboardWriteAvailable = () => typeof ClipboardItem !== 'undefined' && !!navigator.clipboard?.write
++
++/**
++ * 绕中心画一张(已裁剪的)源位图,按 crop → flip → rotate 的顺序。
++ * 顺序与渲染层一致,理由见 imageClipboardGeometry 头注释。
++ */
++const drawPlacement = (
++  context: CanvasRenderingContext2D,
++  image: HTMLImageElement,
++  placement: {
++    center: { x: number; y: number }
++    draw: { width: number; height: number }
++    source: SourceRect
++    rotation: number
++    flipH: boolean
++    flipV: boolean
++  },
++) => {
++  const { center, draw, source, rotation, flipH, flipV } = placement
++  context.save()
++  context.translate(center.x, center.y)
++  if (rotation) context.rotate((rotation * Math.PI) / 180)
++  if (flipH || flipV) context.scale(flipH ? -1 : 1, flipV ? -1 : 1)
++  context.drawImage(
++    image,
++    source.x,
++    source.y,
++    source.width,
++    source.height,
++    -draw.width / 2,
++    -draw.height / 2,
++    draw.width,
++    draw.height,
++  )
++  context.restore()
++}
++
++const createCanvas = (width: number, height: number) => {
++  const canvas = document.createElement('canvas')
++  canvas.width = width
++  canvas.height = height
++  const context = canvas.getContext('2d')
++  if (!context) throw new Error('2d context unavailable')
++  return { canvas, context }
++}
++
++const encodePng = async (canvas: HTMLCanvasElement): Promise<Blob> => {
++  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'))
++  if (!blob) throw new Error('canvas toBlob returned null')
++  return blob
++}
++
++const writePngToClipboard = async (blob: Blob) => {
++  await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
++}
++
++/** 解码一个节点的位图,回调里用完即刻释放 object URL。
++ *  (回调参数不叫 `use` —— 那个名字会被 react-hooks/rules-of-hooks 当成 React 的
++ *  `use` hook 报错。) */
++const withDecodedBitmap = async <T,>(
++  assetUrl: string,
++  consume: (image: HTMLImageElement) => Promise<T> | T,
++): Promise<T> => {
++  const resolved = await resolveBitmapUrl(assetUrl)
++  try {
++    return await consume(await decodeImage(resolved.url))
++  } finally {
++    resolved.revoke?.()
++  }
++}
++
++const reportFailure = (label: string, error: unknown) => {
++  const tooLarge = error instanceof CanvasExportError && error.code === CANVAS_EXPORT_ERROR_CODES.tooLarge
++  debugLogger.error(
++    SOURCE,
++    `Copy as PNG failed for ${label}: ${error instanceof Error ? error.message : String(error)}`,
++  )
++  // 具体像素数只进 Debug Log(CanvasExportError.message 自带),toast 不带数字:
++  // 一个数字要在四种语言里换单位(万像素/MP)才自然,插值反而会读成"40 百万像素"。
++  toastFeedback.error(
++    tooLarge ? t('toast.clipboardImage.copyPngTooLarge') : t('toast.clipboardImage.copyPngFailed'),
++  )
++}
++
+ export const copyImageNodeAsPng = async (node: MivoCanvasNode): Promise<boolean> => {
+-  if (node.type !== 'image' || !node.assetUrl) {
++  if (!isCopyablePngNode(node)) {
+     debugLogger.warn(SOURCE, `Copy as PNG skipped: node ${node.id} is not a copyable image`)
+     return false
+   }
+-  if (typeof ClipboardItem === 'undefined' || !navigator.clipboard?.write) {
++  if (!clipboardWriteAvailable()) {
+     debugLogger.warn(SOURCE, 'Copy as PNG skipped: Clipboard API unavailable in this browser')
+     toastFeedback.warn(t('toast.clipboardImage.unsupported'))
+     return false
+   }
+ 
+-  let revoke: (() => void) | undefined
+   try {
+-    const resolved = await resolveBitmapUrl(node.assetUrl)
+-    revoke = resolved.revoke
+-    const image = await decodeImage(resolved.url)
+-
+-    const crop = node.imageCrop || { x: 0, y: 0, width: 1, height: 1 }
+-    const sx = crop.x * image.naturalWidth
+-    const sy = crop.y * image.naturalHeight
+-    const sw = Math.max(1, crop.width * image.naturalWidth)
+-    const sh = Math.max(1, crop.height * image.naturalHeight)
+-
+-    const canvas = document.createElement('canvas')
+-    canvas.width = Math.round(sw)
+-    canvas.height = Math.round(sh)
+-    const context = canvas.getContext('2d')
+-    if (!context) throw new Error('2d context unavailable')
+-    context.drawImage(image, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height)
+-
+-    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'))
+-    if (!blob) throw new Error('canvas toBlob returned null')
+-
+-    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+-    debugLogger.log(SOURCE, `Copied image "${node.title}" as PNG (${canvas.width}x${canvas.height})`)
++    const blob = await withDecodedBitmap(node.assetUrl as string, async (image) => {
++      const plan = planImageNodeRaster(node, { width: image.naturalWidth, height: image.naturalHeight })
++      // 单图**刻意不套面积闸**:改动前这条路径没有任何上限,一张 8000×6000(4800 万
++      // 像素)的图旧实现能正常出图。加闸会把它变成"直接拒绝",是我们自己引入的回归。
++      // 真放不下时 toBlob 会回 null,已由 encodePng 抛错 → 报错 toast,fail-visible。
++      const { canvas, context } = createCanvas(plan.output.width, plan.output.height)
++      drawPlacement(context, image, {
++        center: { x: canvas.width / 2, y: canvas.height / 2 },
++        draw: plan.draw,
++        source: plan.source,
++        rotation: plan.rotation,
++        flipH: plan.flipH,
++        flipV: plan.flipV,
++      })
++      debugLogger.log(
++        SOURCE,
++        `Rasterized "${node.title}" ${plan.output.width}x${plan.output.height} (rotation ${plan.rotation}°, flipH ${plan.flipH}, flipV ${plan.flipV})`,
++      )
++      return encodePng(canvas)
++    })
++
++    await writePngToClipboard(blob)
++    debugLogger.log(SOURCE, `Copied image "${node.title}" as PNG`)
+     toastFeedback.success(t('toast.clipboardImage.copiedPng'))
+     return true
+   } catch (error) {
+-    debugLogger.error(
++    reportFailure(`"${node.title}"`, error)
++    return false
++  }
++}
++
++/**
++ * 多选 → 合成一张 PNG。产物是选区并集包围盒,保持相对位置与图层顺序。
++ *
++ * `nodes` 必须按**图层顺序**传入(store 的 nodes 数组顺序即绘制顺序;
++ * selectedNodesFromState 是对该数组做 filter,顺序天然一致)。
++ *
++ * 单张时委托给 copyImageNodeAsPng —— 保住"产物 = 源裁剪区分辨率"这条既有口径,
++ * 不让单图走合成路径被显示尺寸拉低。
++ */
++export const copyImageNodesAsPng = async (nodes: MivoCanvasNode[]): Promise<boolean> => {
++  const copyable = nodes.filter(isCopyablePngNode)
++  // 混选不该走到这里(菜单装配已挡),真走到了也不静默丢内容。
++  if (!copyable.length || copyable.length !== nodes.length) {
++    debugLogger.warn(
++      SOURCE,
++      `Copy as PNG skipped: selection has ${nodes.length - copyable.length} non-image node(s) of ${nodes.length}`,
++    )
++    return false
++  }
++  if (copyable.length === 1) return copyImageNodeAsPng(copyable[0])
++  if (!clipboardWriteAvailable()) {
++    debugLogger.warn(SOURCE, 'Copy as PNG skipped: Clipboard API unavailable in this browser')
++    toastFeedback.warn(t('toast.clipboardImage.unsupported'))
++    return false
++  }
++
++  const revokers: Array<() => void> = []
++  try {
++    const entries: MultiImageEntry[] = []
++    const images = new Map<string, HTMLImageElement>()
++    for (const node of copyable) {
++      const resolved = await resolveBitmapUrl(node.assetUrl as string)
++      if (resolved.revoke) revokers.push(resolved.revoke)
++      const image = await decodeImage(resolved.url)
++      images.set(node.id, image)
++      entries.push({ node, natural: { width: image.naturalWidth, height: image.naturalHeight } })
++    }
++
++    const plan = planMultiImageComposite(entries, {
++      maxPixels: CANVAS_EXPORT_LIMITS.maxPixels,
++      maxSide: CANVAS_MAX_BITMAP_SIDE,
++    })
++    // scale 已在两条闸内尽力回退过;仍超标 = 连 1:1 都放不下,fail-visible 拒绝。
++    assertCanvasExportPixelBudget(plan.output.width, plan.output.height)
++    // 单边闸必须单独判:面积闸放行的细长画布(如 100×100000)会让 toBlob 静默回 null。
++    if (plan.output.width > CANVAS_MAX_BITMAP_SIDE || plan.output.height > CANVAS_MAX_BITMAP_SIDE) {
++      throw new CanvasExportError(
++        CANVAS_EXPORT_ERROR_CODES.tooLarge,
++        `合成位图 ${plan.output.width}×${plan.output.height} 单边超过 ${CANVAS_MAX_BITMAP_SIDE};请缩小选区跨度`,
++      )
++    }
++
++    const { canvas, context } = createCanvas(plan.output.width, plan.output.height)
++    for (const placement of plan.placements) {
++      const image = images.get(placement.nodeId)
++      if (!image) throw new Error(`decoded bitmap missing for ${placement.nodeId}`)
++      drawPlacement(context, image, placement)
++    }
++
++    const blob = await encodePng(canvas)
++    await writePngToClipboard(blob)
++    debugLogger.log(
+       SOURCE,
+-      `Copy as PNG failed for "${node.title}": ${error instanceof Error ? error.message : String(error)}`,
++      `Copied ${copyable.length} images as one PNG ${plan.output.width}x${plan.output.height} (scale ${plan.scale.toFixed(2)})`,
+     )
+-    toastFeedback.error(t('toast.clipboardImage.copyPngFailed'))
++    toastFeedback.success(t('toast.clipboardImage.copiedPngMulti', { count: copyable.length }))
++    return true
++  } catch (error) {
++    reportFailure(`${copyable.length} images`, error)
+     return false
+   } finally {
+-    revoke?.()
++    revokers.forEach((revoke) => revoke())
+   }
+ }

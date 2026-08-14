@@ -1,0 +1,42 @@
+diff --git a/src/persist/bridge.ts b/src/persist/bridge.ts
+index 30fae32e..50d061e9 100644
+--- a/src/persist/bridge.ts
++++ b/src/persist/bridge.ts
+@@ -71,9 +71,35 @@ export type PersistReply = {
+    */
+   quotaUsedBytes?: number
+   quotaLimitBytes?: number
+-  // deposit-state-load / deposit-state-save 回执(a/b 双槽 + 指针提交,状态经 state 字段传 JSON 串)
++  // deposit-state-load / deposit-state-save 回执(不可变命名协议,状态经 state 字段传 JSON 串)
+   generation?: number
+-  /** CAS 冲突:磁盘 generation 已前进,state 带回当前已提交状态供合并重试。 */
++  /**
++   * F1(四审:CAS 绑定内容指纹,不只绑 generation):当前**已合并**状态的内容摘要
++   * (`depositCanonicalSum` 对含 `generation` 字段的合并 payload 取值)。judge 四审
++   * 反例——分裂侧 B 的内存从未真正 load 过合并态,只是它自己的 `baseGeneration`
++   * 恰好与磁盘当前 `generation` 数值相等,generation-only CAS 认不出这一点,把
++   * B 的整表原样接受为下一代,冲掉磁盘已经合并好的内容(§4.10.6.1 见 depositStore.ts
++   * `retireReleasedFloor` 注释的"设计偏离说明·再续")。load 与冲突回执都带这个值,
++   * 面板下一次提交必须把它原样带回(`baseSum`);save 端在只比 generation 相等的
++   * 基础上,再比这个值——只有两者都对得上才当作"确实基于当前合并内容的线性提交",
++   * 否则一律判 conflict,强制走 `applyLocalOverlay` 重放(非 dirty 键一律用磁盘合并
++   * 结果覆盖,不可能带出陈旧主张)。旧协议回执/请求缺这个字段 → 判不匹配,保守地
++   * 一律当冲突处理,不当作"数值凑巧相等就默认放行"。
++   *
++   * **SC6.10 如实措辞**:这是一份 **128-bit 概率身份声明**,不是绝对证明——底层
++   * `depositHash128`(main.js)/`canonicalSum`(`src/lib/canonicalHash.ts`)是两轮
++   * 不同 offset basis 的 FNV-1a-64 拼接,不是密码学哈希,存在(工程上可忽略但非零)
++   * 的哈希碰撞概率:两份不同内容偶然算出同一个 128-bit 值,CAS 会误判"匹配"从而
++   * 放行一次实际基于不同内容的提交。取舍记录(六轮追加,未实现,留作已知边界):
++   * 可选加固是 CAS 比较时附带比对 canonical 序列化后的 byteLength 作为佐证,能把
++   * 残余碰撞概率再压低一档,但需要面板侧额外持久化并传递一个新字段(`baseGeneration`/
++   * `baseSum` 之外的第三个 CAS 因子),协议复杂度增加而当前 128-bit 的碰撞概率已经
++   * 工程上可忽略——本轮判断不值得为了把一个已经极小的残余风险再压低一档而扩大协议
++   * 改动面,未实现;如果未来场景对哈希碰撞的容忍度有变化(比如需要抵抗故意构造的
++   * 碰撞输入,不只是随机碰撞),应重新评估这个决定或换成密码学哈希。
++   */
++  revisionSum?: string
++  /** CAS 冲突:磁盘 generation 已前进,state 带回当前已合并的磁盘状态供重放重试。 */
+   conflict?: boolean
+ }
+ 

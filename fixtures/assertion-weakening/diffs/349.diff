@@ -1,0 +1,757 @@
+diff --git a/main.js b/main.js
+index 47f7e39c..4442ebb4 100644
+--- a/main.js
++++ b/main.js
+@@ -3090,31 +3090,47 @@ async function handleCardAction(rawMsg) {
+     return cardActionFailCard(spawnCallId, plan.fail[0], plan.fail[1], record)
+   }
+ 
+-  // 首次合法点击顺带绑定会话(绑定后 mismatch 校验才生效)。内存绑定与磁盘绑定必须
+-  // 原子:写失败就把内存也退回去,不留"内存已绑、磁盘没绑"的窗口 —— 否则重启后磁盘
+-  // 恢复未绑定状态,另一会话能重新认领这张卡驱动原画布(会话劫持,与 finding② 同病:
+-  // 落盘失败不能让内存状态继续代表一个磁盘上不存在的事实)。
+-  if (!record.sessionId && sessionId) {
+-    const priorSessionId = record.sessionId
+-    record.sessionId = sessionId
+-    const bound = await cardActionCommit(() => true)
+-    if (!bound) {
+-      record.sessionId = priorSessionId
+-      return cardActionFailCard(spawnCallId, 'contextCorrupt', 'CONTEXT_CORRUPT', record)
+-    }
+-  }
+-
++  // #320 合并列车残审(跟进项 4,Greptile 复审):inflight 登记必须紧跟在上面的
++  // rootInflight 判定之后**同步**完成,中间不许再插入任何 await —— 原实现把登记
++  // 排在会话绑定(下面 `cardActionCommit` 那次写盘)之后,两次几乎同时到达的首次
++  // 点击都会在各自都还没登记时读到"这根卡 0 个在途",双双通过判定再各自去登记,
++  // 于是同一根卡的并发首次点击能同时进入生成——single-flight 的判定与登记之间
++  // 留了一段异步绑定窗口,名额形同虚设。JS 单线程 run-to-completion:判定与登记
++  // 之间只要没有 await,这一段就是原子的,不需要另开一把锁。
++  //
+   // 在途登记连同祖先链一起进保护集:本次动作期间的写盘清理不得动这条链上的任何
+-  // 一环(直接父被淘汰 = 新记录一落地就是断链)。
++  // 一环(直接父被淘汰 = 新记录一落地就是断链)。登记之后的**全部**分支(含会话
++  // 绑定失败的提前返回)都必须走 try/finally 释放它,否则提前返回会让登记永久
++  // 悬空,把这根卡的 single-flight 名额永久占死。
+   cardActionInflight.set(spawnCallId, {
+     rootId,
+     protect: cardActionAncestry(store, record, rootId),
+   })
+-  diagOk(
+-    DIAG_SOURCE.card,
+-    'card 动作受理 action=' + actionId + ' spawn=' + spawnCallId + ' promptChars=' + diagTextLen(plan.prompt),
+-  )
+   try {
++    // 首次合法点击顺带绑定会话(绑定后 mismatch 校验才生效)。内存绑定与磁盘绑定
++    // 必须原子:写失败就把内存也退回去,不留"内存已绑、磁盘没绑"的窗口 —— 否则
++    // 重启后磁盘恢复未绑定状态,另一会话能重新认领这张卡驱动原画布(会话劫持,
++    // 与 finding② 同病:落盘失败不能让内存状态继续代表一个磁盘上不存在的事实)。
++    //
++    // 「任意持 callId 的事件可抢占首次认领」这条信任根问题超出本仓:sessionId 由
++    // 事件自带、宿主未在 tool-call/card-action 派发时注入可信的发起会话 id,插件
++    // 拿不到任何可验证 sessionId 真实性的依据(owner 已裁决宿主仓这项根治本轮
++    // 搁置)。本次只收窄"同一根卡并发首次点击可重复生成"这一条本仓能修的窗口,
++    // 不解决"伪造 sessionId 抢占认领"——两者是同一份 finding 里两个不同的问题。
++    if (!record.sessionId && sessionId) {
++      const priorSessionId = record.sessionId
++      record.sessionId = sessionId
++      const bound = await cardActionCommit(() => true)
++      if (!bound) {
++        record.sessionId = priorSessionId
++        return cardActionFailCard(spawnCallId, 'contextCorrupt', 'CONTEXT_CORRUPT', record)
++      }
++    }
++
++    diagOk(
++      DIAG_SOURCE.card,
++      'card 动作受理 action=' + actionId + ' spawn=' + spawnCallId + ' promptChars=' + diagTextLen(plan.prompt),
++    )
+     await runCardBackedGeneration({
+       cardId: spawnCallId,
+       verb: plan.verb,
+@@ -3311,6 +3327,119 @@ function exportOmissionDigest(omissions) {
+  */
+ const EXPORT_HOST_RESERVED_ARGS = ['attachments']
+ 
++/**
++ * 缺省导出文件名跨面板重载防覆盖(#328 残余风险,方案 A + B 兜底,owner 拍板)。
++ *
++ * 背景:面板侧 canvasExportFileName()(src/lib/canvasExport.ts)靠一个**面板进程内**
++ * 的 Map 挡"同一秒两次缺省同格式导出撞名";面板重载(甚至整个 brain 重启)会清空
++ * 那个 Map,但 workdir 里的旧产物文件不会消失(fs 槽 write 是创建/覆盖语义,静默
++ * 替换)。workdir 又没有 list 能力(root:'workdir' 只有带 callId 的写,见
++ * docs/plan/workspace-binding-design.md §4.10),不能靠"列目录探测"补这个缺口。
++ *
++ * 方案 A:电子脑这层在 root:'data'(完整读写)维护一份持久台账
++ * `export/used-default-names.json`,记录"已经用过的缺省文件名"——跨面板重载 /
++ * 跨 brain 重启都能读到,靠它补上面板 Map 丢失的记忆。面板侧 Map 仍然保留作为
++ * 同进程内的快路径(免得每次导出都要走一趟 fs);这里是第二层、跨进程存续的记忆。
++ *
++ * 硬要求①有界:512 条上限,超限按最旧淘汰(FIFO)。代价是"极老的缺省名理论上可能
++ * 重撞"——概率可忽略(默认名精确到秒,要撞上得先在没有任何显式命名式导出插入的
++ * 情况下连续攒够 512 个不同缺省名才会挤到淘汰边界),换来台账文件不会无界增长。
++ *
++ * 硬要求②兜底(方案 B,fail-safe 而不是 fail-closed,任何路径都不许静默覆盖):
++ *  - 台账**不存在**(fsRead 返回 null——"从未写过"与"读不出来"在宿主回执上本就
++ *    不可区分,见 fsReadResult 顶部注释)→ 当作空台账,不算异常(与 readJson 对
++ *    可选持久文件的既有处理口径一致):绝大多数用户的第一次导出会走这条路,
++ *    不该白白多一段随机串。
++ *  - 台账**存在但解析 / 结构校验失败**(JSON.parse 抛错,或形状不是
++ *    `{names:[...]}`)→ 这才是确定的"台账不可用"信号:放弃基于台账的确定性去重,
++ *    直接给候选名加一段短随机串保底避撞(概率性,不是确定性,但优于什么都不做),
++ *    diag 留痕,并尝试用只含这一条的新台账覆盖重建(best-effort,重建失败不阻断
++ *    本次导出)。
++ * 硬要求③:本函数只在 runExportTool 判定"模型没有显式传 fileName"之后才会被
++ * 调用;显式 fileName 完全不经过这条路径,用户意图(显式同名=想覆盖)不变。
++ * 硬要求④TOCTOU 留痕:read 台账 → 决定最终名 → write 台账回去,这中间不是原子
++ * 操作——两次并发导出可能读到同一份台账快照,各自算出"看起来空闲"的同一个名字,
++ * 写台账时后一次会覆盖前一次刚追加的记录。残窗性质与原「list 与写之间」一样,
++ * 只是位置挪到了"读台账与写台账之间";根治需要宿主提供 create-if-absent/CAS
++ * 原语,当前不具备。宿主侵入式修复不在本仓范围(owner 已裁决搁置),这里只留痕
++ * 不根治。
++ */
++const EXPORT_NAME_LEDGER_PATH = 'export/used-default-names.json'
++const EXPORT_NAME_LEDGER_MAX = 512
++
++/**
++ * 读台账,收敛成两档:
++ *   {names, corrupt:false} —— 台账不存在(当空台账)或读出且结构合法
++ *   {names:[], corrupt:true} —— 读出了内容但解析/结构不合法(触发方案 B 兜底)
++ */
++async function exportReadNameLedger() {
++  const text = await fsRead(EXPORT_NAME_LEDGER_PATH)
++  if (text === null) return { names: [], corrupt: false }
++  let parsed
++  try {
++    parsed = JSON.parse(text)
++  } catch {
++    return { names: [], corrupt: true }
++  }
++  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.names) || !parsed.names.every((name) => typeof name === 'string')) {
++    return { names: [], corrupt: true }
++  }
++  return { names: parsed.names, corrupt: false }
++}
++
++/** 追加一条并按①有界原则淘汰最旧;写回失败只 diag 留痕,不阻断本次导出。 */
++async function exportRecordDefaultName(existingNames, finalName) {
++  const names = existingNames.concat([finalName])
++  while (names.length > EXPORT_NAME_LEDGER_MAX) names.shift() // FIFO 淘汰最旧
++  const ok = await fsWrite(EXPORT_NAME_LEDGER_PATH, JSON.stringify({ names }))
++  if (!ok) {
++    diagSkip(
++      DIAG_SOURCE.tool,
++      'export 缺省名台账写回失败: 本次导出不受影响,但下次面板重载可能不知道 "' + finalName + '" 已被使用',
++    )
++  }
++  return ok
++}
++
++/**
++ * 从候选缺省名(面板算出的 `mivo-canvas-<timestamp>.<ext>`)决定最终落盘名。
++ *
++ * - 台账可用且候选名已在台账里 → 确定性递增后缀(`-1`/`-2`……),逐个探台账直到
++ *   找到台账里没记过的名字(与面板侧 Map 的递增惯例一致,只是探测源换成跨重载
++ *   持久的台账)。
++ * - 台账不可用(见 exportReadNameLedger 的 corrupt 档)→ 方案 B:候选名直接加短
++ *   随机串(概率性避撞,没有可信的"已用列表"可供确定性递增探测)。
++ */
++async function exportPickDefaultName(candidateName) {
++  const ledger = await exportReadNameLedger()
++  const dot = candidateName.lastIndexOf('.')
++  const base = dot > 0 ? candidateName.slice(0, dot) : candidateName
++  const ext = dot > 0 ? candidateName.slice(dot) : ''
++
++  if (ledger.corrupt) {
++    diagSkip(
++      DIAG_SOURCE.tool,
++      'export 缺省名台账不可读或结构损坏,按方案 B 兜底: "' + candidateName + '" 追加随机串避撞,并尝试重建台账',
++    )
++    const finalName = base + '-' + Math.random().toString(36).slice(2, 8) + ext
++    await exportRecordDefaultName([], finalName) // 重建:台账只含这一条,后续导出重新开始累积
++    return finalName
++  }
++
++  if (!ledger.names.includes(candidateName)) {
++    await exportRecordDefaultName(ledger.names, candidateName)
++    return candidateName
++  }
++  let n = 1
++  let finalName = base + '-' + n + ext
++  while (ledger.names.includes(finalName)) {
++    n += 1
++    finalName = base + '-' + n + ext
++  }
++  await exportRecordDefaultName(ledger.names, finalName)
++  return finalName
++}
++
+ async function runExportTool(msg, succeed, fail) {
+   const locale = cardLocaleCache
+   // 剥宿主保留字段后**原样转发其余 own 字段**,不在这里重抄一份 allowlist:
+@@ -3332,7 +3461,13 @@ async function runExportTool(msg, succeed, fail) {
+     return fail('EXPORT_RENDER_FAILED', exportText(locale, 'EXPORT_RENDER_FAILED'))
+   }
+ 
+-  const path = EXPORT_DIR + '/' + r.fileName
++  // 硬要求③:只管缺省名。模型显式传了 fileName → 用户意图不变(显式同名=想覆盖),
++  // 原样使用面板算出的名字,不经过台账;没传(缺省名)才需要台账去重,见
++  // exportPickDefaultName 顶部注释。
++  const explicitFileName = typeof params.fileName === 'string' && params.fileName.length > 0
++  const finalFileName = explicitFileName ? r.fileName : await exportPickDefaultName(r.fileName)
++
++  const path = EXPORT_DIR + '/' + finalFileName
+   // 一次性整体写入:上面已过完全部上限闸,这里失败 = 宿主拒绝,工作目录零残留。
+   const written = await fsWriteWorkdir(path, r.base64, 'base64', msg.callId)
+   if (!written.ok) {
+@@ -4123,16 +4258,47 @@ function handleDepositMedia(msg) {
+ // 这正好与设计稿「写指针失败 = 状态已提交 / 迁移不重跑」相反。manifest 想留作性能
+ // 优化必须在校验完两槽之后才短路,且不得改变结论 —— 而两槽都读完之后短路已无意义,
+ // 所以直接不读。
+-async function readDepositSlot(name) {
+-  const text = await fsRead(DEPOSIT_DIR + name)
+-  if (text === null) return { name, present: false, text: null, generation: -1 }
++//
++// ⑤(本轮补,#332 合并列车残余风险跟进项 1,Greptile 复审):「合法」不能只等价于
++// 「JSON.parse 没抛错」——`JSON.parse('"just a string"')`、`JSON.parse('42')`、
++// `JSON.parse('null')` 都不抛错,但顶层根本不是一份可恢复的状态对象;更隐蔽的一种
++// 结构损坏是顶层仍是对象、`generation` 字段完好,但最大的字段 `map` 被截断/覆盖成了
++// 别的类型(整份写入不是事务,写到一半崩在 `map` 序列化中途就是这个形态)——纯语法
++// 解析骗不出这种损坏,generation 却读得出来,一样会被当作「较新的代际真相」压过另一个
++// 结构完整、generation 较低的槎。读取(①②)、CAS 基线(`handleDepositStateSave` 的
++// `current.generation`)、写槎选择(`pickDepositWriteSlot`)三处全部复用本函数产出的
++// `generation`,三处因此会**同时**踩坑,所以只在**这一个函数**里补结构校验,三处天然
++// 同一口径,不必分别修。
++//
++// 判据比共享层 `src/agent/depositStore.ts` 的 `parseDepositState` **更严**,不是照抄:
++// 那边的职责是「拿到已被选为权威的文本,尽量读出能用的部分」,子字段容错(map 缺失/
++// 类型不对就退化成空 map,不算整份非法)对它是对的——它面对的文本已经赢过了本函数
++// 这一关。本函数的职责不同:决定「这份槎的 generation 够不够格被信」,面对的是**两个
++// 候选槎的竞争**,标准必须更保守——`map` 若存在就必须是非数组对象,类型不对直接判
++// corrupt;`map` 完全缺失(老格式從未写过 map 字段)仍视为合法,与老格式 generation
++// 缺省为 0 的既有口径(见上方"槎内 generation 缺失视作 0"注释同一处)保持一致,不额外
++// 收紧。main.js 不过打包、import 不了 src/,按 §六-9 允许适配层自带同语义实现;
++// 与共享层的差异点已在此写清楚,不是"看起来差不多"的抄近路。
++function depositParseSlotShape(text) {
++  let parsed
+   try {
+-    const parsed = JSON.parse(text)
+-    const generation = Number(parsed && parsed.generation)
+-    return { name, present: true, text, generation: Number.isFinite(generation) ? generation : 0 }
++    parsed = JSON.parse(text)
+   } catch {
+-    return { name, present: true, text: null, generation: -1, corrupt: true }
++    return null
+   }
++  if (!parsed || typeof parsed !== 'object') return null
++  const rawMap = parsed.map
++  if (rawMap !== undefined && (rawMap === null || typeof rawMap !== 'object' || Array.isArray(rawMap))) return null
++  return parsed
++}
++
++async function readDepositSlot(name) {
++  const text = await fsRead(DEPOSIT_DIR + name)
++  if (text === null) return { name, present: false, text: null, generation: -1 }
++  const parsed = depositParseSlotShape(text)
++  if (!parsed) return { name, present: true, text: null, generation: -1, corrupt: true }
++  const generation = Number(parsed.generation)
++  return { name, present: true, text, generation: Number.isFinite(generation) ? generation : 0 }
+ }
+ 
+ async function readDepositState() {
+@@ -4566,6 +4732,10 @@ if (seam && typeof seam.expose === 'function') {
+       partialNote: exportPartialNote,
+       omissionDigest: exportOmissionDigest,
+       hostReservedArgs: EXPORT_HOST_RESERVED_ARGS,
++      // #328 残余风险(方案 A):缺省名跨重载防覆盖台账,协议测试用它精确断言路径与上限。
++      nameLedgerPath: EXPORT_NAME_LEDGER_PATH,
++      nameLedgerMax: EXPORT_NAME_LEDGER_MAX,
++      pickDefaultName: exportPickDefaultName,
+     },
+     // 原型污染硬门的取件口:与 src/lib/safeArgs.ts 同语义的插件侧实现,必须能被
+     // 真实源码断言(两边同步靠测试钉住,不靠注释提醒)。
+diff --git a/src/__tests__/arrangeWiring.test.ts b/src/__tests__/arrangeWiring.test.ts
+index 412e8895..a9e675fe 100644
+--- a/src/__tests__/arrangeWiring.test.ts
++++ b/src/__tests__/arrangeWiring.test.ts
+@@ -9,11 +9,11 @@
+  * - 结构化错误码原样交卷,不被压成 FAILED;
+  * - 身份卡:新增 canvas_arrange、版本相对 merge-base 严格递增、工具数 ≤16(§六-1)。
+  */
+-import { execFileSync } from 'node:child_process'
+ import { readFileSync } from 'node:fs'
+ import { fileURLToPath } from 'node:url'
+ import { describe, expect, it } from 'vitest'
+ import { attachPanelBridge, flushMicrotasks, loadBrain } from './brainHarness'
++import { readGuardBaseFile } from './mergeBaseGuard'
+ 
+ type HostMessage = {
+   type: string
+@@ -325,15 +325,14 @@ const compare = (left: number[], right: number[]): number => {
+   return 0
+ }
+ 
++// 基线不可读时的三档行为(CI 判红 / 显式指定读不出判红 / 仅本地未指定才跳过)与
++// cardManifest.test.ts / depositBrain.test.ts 共用 mergeBaseGuard —— 三条门禁是同一
++// 机制的消费方,不许各自内联一份「catch 后 return null → console.warn + return」,
++// 那样会在浅克隆 CI 下长期静默通过(见 mergeBaseGuard.ts 顶部注释)。
+ const baseManifest = (): Manifest | null => {
+-  const git = (args: string[]) =>
+-    execFileSync('git', args, { cwd: fileURLToPath(new URL('../../..', import.meta.url)), encoding: 'utf8' }).trim()
+-  try {
+-    const base = process.env.MIVO_GUARD_BASE_SHA || git(['merge-base', 'HEAD', 'origin/main'])
+-    return JSON.parse(git(['show', `${base}:${MANIFEST_REPO_PATH}`])) as Manifest
+-  } catch {
+-    return null
+-  }
++  const baseText = readGuardBaseFile(MANIFEST_REPO_PATH, 'arrangeWiring')
++  if (baseText === null) return null
++  return JSON.parse(baseText) as Manifest
+ }
+ 
+ describe('ghost.json arrange 工具契约', () => {
+@@ -353,11 +352,10 @@ describe('ghost.json arrange 工具契约', () => {
+     expect(new Set(tools.map((tool) => tool.name)).size).toBe(tools.length) // 不许重名
+   })
+ 
+-  it('相对 merge-base:工具只增不减,本 PR 恰好 +1(canvas_arrange)', () => {
++  it('相对 merge-base:工具只增不减,本 PR 恰好 +1(canvas_arrange)', (ctx) => {
+     const base = baseManifest()
+     if (!base) {
+-      // 拿不到 base 就如实跳过,不用静态数字冒充"恰好 +1"的证明。
+-      console.warn('[arrangeWiring] merge-base 不可用,跳过工具数增量比较')
++      ctx.skip() // 只有本地取不到基线才走这里,且 mergeBaseGuard 已打印醒目横幅
+       return
+     }
+     const baseNames = base.tools.map((tool) => tool.name)
+@@ -369,10 +367,10 @@ describe('ghost.json arrange 工具契约', () => {
+     expect(added).toEqual(baseNames.includes('canvas_arrange') ? [] : ['canvas_arrange'])
+   })
+ 
+-  it('版本相对 merge-base 严格递增、槽位只增不减', () => {
++  it('版本相对 merge-base 严格递增、槽位只增不减', (ctx) => {
+     const base = baseManifest()
+     if (!base) {
+-      console.warn('[arrangeWiring] merge-base 不可用,跳过版本递增比较')
++      ctx.skip() // 只有本地取不到基线才走这里,且 mergeBaseGuard 已打印醒目横幅
+       return
+     }
+     if (JSON.stringify(base) === JSON.stringify(manifest())) return // 本分支没动 manifest
+diff --git a/src/__tests__/brainHarness.ts b/src/__tests__/brainHarness.ts
+index 789a55c8..01604388 100644
+--- a/src/__tests__/brainHarness.ts
++++ b/src/__tests__/brainHarness.ts
+@@ -340,6 +340,12 @@ export type BrainExportHandles = {
+   omissionDigest: (omissions: unknown) => string
+   /** 宿主注入、需在转发前剥掉的保留字段。 */
+   hostReservedArgs: string[]
++  /** #328 残余风险(方案 A):缺省名跨重载防覆盖台账(root:'data')。 */
++  nameLedgerPath: string
++  /** 台账有界上限(超限按最旧淘汰)。 */
++  nameLedgerMax: number
++  /** 从面板算出的候选缺省名决定最终落盘名(台账去重 / 方案 B 随机串兜底)。 */
++  pickDefaultName: (candidateName: string) => Promise<string>
+ }
+ 
+ /** 插件侧的原型污染硬门(与 src/lib/safeArgs.ts 同语义的纯 JS 实现)。 */
+diff --git a/src/__tests__/cardActionConcurrency.test.ts b/src/__tests__/cardActionConcurrency.test.ts
+index 882cde6e..19a8c2c1 100644
+--- a/src/__tests__/cardActionConcurrency.test.ts
++++ b/src/__tests__/cardActionConcurrency.test.ts
+@@ -20,10 +20,14 @@
+  *      registry 无泄漏、单例语义确已移除 —— 这是合并前对抗审的重点面。
+  */
+ import { describe, expect, it } from 'vitest'
+-import { flushMicrotasks } from './brainHarness'
+-import { ROOT_CALL_ID, boot, filesOf, seedRootRecord } from './cardActionHarness'
++import { flushMicrotasks, flushUntil } from './brainHarness'
++import { ROOT_CALL_ID, boot, filesOf, generationRequests, readyPanel, seedRootRecord } from './cardActionHarness'
+ import type { AgentRequest, Booted } from './cardActionHarness'
+ 
++const cardsFor = (booted: Booted, callId: string) => booted.cards().filter((card) => card.callId === callId)
++const lastDoneFor = (booted: Booted, callId: string) =>
++  cardsFor(booted, callId).filter((card) => card.state === 'done').pop()
++
+ /** 起一组并发动作:每个事件一个独立 spawnCallId(真实并发面)。 */
+ const fireConcurrent = async (
+   booted: Booted,
+@@ -293,3 +297,112 @@ describe('A5 与 tool 路径共存', () => {
+     expect(result?.xdt_anchor_card_id).toBeUndefined()
+   })
+ })
++
++/**
++ * #320 合并列车残审(跟进项 4,Greptile 复审):同一根卡的**首次**并发点击。
++ *
++ * 与 A9(cardActions.test.ts)的既有用例不同——那组用例事件不带 sessionId,会话绑定
++ * 那段 `await cardActionCommit` 整段被 if 跳过,根本不经过有异步窗口的那条路径,
++ * 测不出这里的问题。这里两个事件都带 sessionId,必须真的走一次绑定写盘,才能复现
++ * "判定与登记之间隔着一次 await"的窗口。
++ *
++ * 两次点击**故意用同一个 sessionId**,不是不同会话:record 是两次调用共享的同一个
++ * 对象引用,赢家在它自己的 `await cardActionCommit` 让出控制权之前,已经同步把
++ * `record.sessionId` 改成了自己的会话 id——如果两次点击用不同 sessionId,输家会先撞
++ * 在"会话不匹配"这条早于 rootInflight 判定的既有检查上,反而测不出本轮要修的那个
++ * "判定与登记之间的窗口",会被这条无关的既有保护线遮住。同会话才能让输家绕过会话
++ * 匹配检查、真正走到 rootInflight 判定这一步,让本轮的修复(而不是别的检查)来拦它。
++ */
++describe('#320 同一根卡的并发首次点击(会话认领窗口,跟进项 4)', () => {
++  it('同一会话两次几乎同时首次点击同一张未绑定的根卡 → 恰好一次进入生成,另一次收到 ACTION_BUSY', async () => {
++    const booted = boot({ locale: 'zh-CN' })
++    await seedRootRecord(booted)
++    // 基线:种根记录本身也会发一次 generate 请求(callId=根卡自己的 callId),
++    // 与下面两次点击的请求是两件事——必须扣掉基线,否则"只有一次生成"这条断言
++    // 永远因为把种子请求也算进去而假绿/假红。
++    const before = generationRequests(booted).length
++
++    // 先发起、不 await——两次调用几乎同时到达,`settle()` 之后才收口(先 await
++    // 会在假时钟推进之前就去等一个需要推进才能兑现的 promise,永远等不到)。
++    const pending = [
++      booted.brain.handles.handleCardAction({
++        type: 'card-action',
++        actionId: 'regen',
++        callId: ROOT_CALL_ID,
++        spawnCallId: 'spawn-claim-a',
++        sessionId: 'session-A',
++      }),
++      booted.brain.handles.handleCardAction({
++        type: 'card-action',
++        actionId: 'regen',
++        callId: ROOT_CALL_ID,
++        spawnCallId: 'spawn-claim-b',
++        sessionId: 'session-A',
++      }),
++    ]
++    await booted.settle()
++    await Promise.all(pending)
++
++    // 核心断言:这两次点击真正促成的生成请求只有一个,不是两个——如果判定与登记
++    // 之间的窗口没堵住,两次首次点击都会各自读到"0 个在途"通过判定,各自派一次生成。
++    expect(generationRequests(booted).length - before).toBe(1)
++
++    const doneA = lastDoneFor(booted, 'spawn-claim-a')
++    const doneB = lastDoneFor(booted, 'spawn-claim-b')
++    const outcomes = [doneA, doneB].map((card) => (card?.html?.includes('上一张还在生成') ? 'busy' : 'settled'))
++    // 恰好一个 busy、一个正常终态(成功卡的具体文案由生成结果决定,这里只关心
++    // "没有被 ACTION_BUSY 拒绝",生成结果本身已由其余用例覆盖)。
++    expect(outcomes.filter((outcome) => outcome === 'busy')).toHaveLength(1)
++    expect(outcomes.filter((outcome) => outcome === 'settled')).toHaveLength(1)
++  })
++
++  it('登记时序:输家的 ACTION_BUSY 在赢家生成仍悬挂时就已经落地(不等赢家结束),且此刻在途恰为 1', async () => {
++    // 面板脚本可切换:种根记录这一步要能正常结束(否则拿不到可用的记录),
++    // 只有下面两次点击触发的生成才需要悬挂在面板身上——用一个可重新赋值的引用
++    // 而不是固定脚本,种子阶段与测试阶段各自要的行为不是同一件事。
++    let script = readyPanel()
++    const booted = boot({ locale: 'zh-CN', panel: (request) => script(request) })
++    await seedRootRecord(booted)
++    const before = generationRequests(booted).length
++    script = () => 'never' // 从这里开始,任何 generate 请求永不应答。
++
++    const first = booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'regen',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'spawn-order-a',
++      sessionId: 'session-A',
++    })
++    const second = booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'regen',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'spawn-order-b',
++      sessionId: 'session-A',
++    })
++
++    // 按状态收口,不猜固定 flush 次数:等到"赢家已经把生成请求发出去、输家已经拿到
++    // 终态卡"这个状态同时成立——单看 inflightCount()===1 会在赢家登记完但还没真正
++    // 发出生成请求那一刻就提前成立,断言"已经发出一次生成"会撞上还没发生的状态。
++    const busyCardOf = (spawnCallId: string) => Boolean(lastDoneFor(booted, spawnCallId)?.html?.includes('上一张还在生成'))
++    await flushUntil(
++      () => generationRequests(booted).length - before === 1 && (busyCardOf('spawn-order-a') || busyCardOf('spawn-order-b')),
++      { label: '赢家已发出生成请求且输家已拿到 ACTION_BUSY 终态卡(都不需要等赢家悬挂的那一路结束)' },
++    )
++
++    // 此刻:恰好一次生成请求已经发出(赢家),输家已经拿到 ACTION_BUSY 的终态卡——
++    // 都不需要等赢家(悬挂在 'never' 上)结束;且此刻在途表恰好 1 条(赢家的登记)。
++    expect(generationRequests(booted).length - before).toBe(1)
++    expect(booted.brain.handles.cardAction.inflightCount()).toBe(1)
++    const doneA = lastDoneFor(booted, 'spawn-order-a')
++    const doneB = lastDoneFor(booted, 'spawn-order-b')
++    const busyCards = [doneA, doneB].filter((card) => card?.html?.includes('上一张还在生成'))
++    expect(busyCards).toHaveLength(1)
++
++    // 收尾:换回会正常应答的脚本,让赢家那一路也走完,避免把悬挂的 promise
++    // 泄漏给下一个用例。
++    script = readyPanel()
++    await booted.settle()
++    await Promise.all([first, second])
++  })
++})
+diff --git a/src/__tests__/depositBrain.test.ts b/src/__tests__/depositBrain.test.ts
+index 35e691bc..3388e99a 100644
+--- a/src/__tests__/depositBrain.test.ts
++++ b/src/__tests__/depositBrain.test.ts
+@@ -487,6 +487,94 @@ describe('deposit 状态槽 — 崩溃安全九组(设计稿 §4.4.2 测试口
+   })
+ })
+ 
++// #332 合并列车残余风险跟进项 1(Greptile 复审):「合法」不能只等价于「JSON.parse
++// 没抛错」——顶层非对象(字符串/数字/null)、或顶层是对象但 map 字段被截断/覆盖成
++// 别的类型,都是能骗过纯语法解析的结构损坏。这类槎若带着偏高的 generation,读取/
++// CAS 基线/写槎选择三处都会被同时带偏(见 main.js readDepositSlot 上方 ⑤ 号注释)。
++describe('deposit 状态槽 — 结构损坏的高代槎不得压过完整的低代槎(#332 跟进项 1)', () => {
++  it('顶层非对象的高代槎(字符串)+ 完整的低代槎 → 选完整低代,不当成 corrupt 之外的东西', async () => {
++    const { brain } = depositBrain({
++      files: {
++        // 顶层是字符串,不是对象——JSON.parse 不抛错,但不是可恢复的状态。
++        'deposit/state-a.json': JSON.stringify('not a state object'),
++        'deposit/state-b.json': JSON.stringify({
++          version: 1,
++          generation: 1,
++          map: { keep: { hash: HASH, ext: '.png', depositedAt: 1 } },
++        }),
++        'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-a.json', generation: 99 }),
++      },
++    })
++
++    const loaded = await brain.handles.deposit.stateLoad()
++    expect(loaded.generation).toBe(1)
++    expect(JSON.parse(String(loaded.state)).map.keep).toBeTruthy()
++  })
++
++  it('顶层是对象但 map 字段被覆盖成非对象的高代槎 + 完整的低代槎 → 选完整低代', async () => {
++    const { brain } = depositBrain({
++      files: {
++        // 顶层是对象、generation 字段完好,但 map 被写坏成了字符串——这是纯语法解析
++        // 骗不出、老版本 readDepositSlot 会照单全收的那种损坏。
++        'deposit/state-a.json': JSON.stringify({ version: 1, generation: 99, map: 'clobbered' }),
++        'deposit/state-b.json': JSON.stringify({
++          version: 1,
++          generation: 1,
++          map: { keep: { hash: HASH, ext: '.png', depositedAt: 1 } },
++        }),
++      },
++    })
++
++    const loaded = await brain.handles.deposit.stateLoad()
++    expect(loaded.generation).toBe(1)
++    expect(JSON.parse(String(loaded.state)).map.keep).toBeTruthy()
++  })
++
++  it('选中完整的低代槎之后再提交:写目标落在结构损坏的那一槎,不覆盖完整槎', async () => {
++    const { brain } = depositBrain({
++      files: {
++        'deposit/state-a.json': JSON.stringify({ version: 1, generation: 99, map: 'clobbered' }),
++        'deposit/state-b.json': JSON.stringify({
++          version: 1,
++          generation: 1,
++          map: { keep: { hash: HASH, ext: '.png', depositedAt: 1 } },
++        }),
++      },
++    })
++
++    // CAS 基线必须是「完整槎的 1」,不是「损坏槎表面上的 99」——用真实 generation=1
++    // 提交才应该成功。
++    const result = await brain.handles.deposit.stateSave({
++      baseGeneration: 1,
++      state: JSON.stringify({ version: 1, map: { next: { hash: HASH, ext: '.png', depositedAt: 2 } } }),
++    })
++    expect(result).toMatchObject({ ok: true, generation: 2 })
++
++    // 写目标是结构损坏的 state-a(不是持有最大合法 generation 的 state-b):
++    // state-b 的完整数据原样留着,新代落进原本损坏的槎。
++    expect(JSON.parse(String(brain.files.get('deposit/state-b.json')))).toMatchObject({
++      generation: 1,
++      map: { keep: { hash: HASH } },
++    })
++    expect(JSON.parse(String(brain.files.get('deposit/state-a.json')))).toMatchObject({
++      generation: 2,
++      map: { next: { hash: HASH } },
++    })
++  })
++
++  it('双槎均结构损坏(顶层非对象 / map 被覆盖)→ 诚实兜底为缓存空,不当成任何一边的高代真相', async () => {
++    const { brain } = depositBrain({
++      files: {
++        'deposit/state-a.json': JSON.stringify(42),
++        'deposit/state-b.json': JSON.stringify({ version: 1, generation: 50, map: ['not', 'a', 'map'] }),
++      },
++    })
++
++    const loaded = await brain.handles.deposit.stateLoad()
++    expect(loaded).toMatchObject({ ok: true, state: null, generation: 0 })
++  })
++})
++
+ describe('deposit 状态槽 — generation CAS', () => {
+   it('载荷基于旧 generation → 回 conflict + 当前已提交状态,不覆盖', async () => {
+     const { brain } = depositBrain({
+diff --git a/src/__tests__/exportTool.test.ts b/src/__tests__/exportTool.test.ts
+index e1a1fd84..f94f03ba 100644
+--- a/src/__tests__/exportTool.test.ts
++++ b/src/__tests__/exportTool.test.ts
+@@ -54,13 +54,18 @@ type Scenario = {
+   locale?: string
+   /** 返回 false 让该次 fs write 失败(宿主拒绝)。 */
+   writeGuard?: (request: FsRequest) => boolean
++  /** 预置假 fs 内容(root:'data' 用裸路径),用于预置 #328 缺省名台账等场景。 */
++  files?: Record<string, string>
+ }
+ 
+ type RunResult = {
+   brain: LoadedBrain
+   sent: HostMessage[]
+   toolResult: HostMessage | undefined
++  /** 落到会话工作目录(root:'workdir')的写入——即导出产物本身,恰一次是落盘协议的核心断言。 */
+   writes: FsRequest[]
++  /** 落到 root:'data' 的写入(#328 缺省名台账等电子脑私有存储的簿记写)。 */
++  dataWrites: FsRequest[]
+   verbRequests: Array<{ verb?: string; params?: Record<string, unknown>; callId?: string }>
+   logs: ReturnType<typeof attachPanelBridge>['spy']
+ }
+@@ -71,6 +76,7 @@ const runExport = async (scenario: Scenario): Promise<RunResult> => {
+     panelPresent: () => false,
+     locale: scenario.locale,
+     writeGuard: scenario.writeGuard,
++    files: scenario.files,
+     send: (payload) => {
+       sent.push(payload as HostMessage)
+       return { ok: true }
+@@ -108,7 +114,8 @@ const runExport = async (scenario: Scenario): Promise<RunResult> => {
+     brain,
+     sent,
+     toolResult: sent.find((message) => message.type === 'tool-result'),
+-    writes: brain.fsRequests.filter((request) => request.op === 'write'),
++    writes: brain.fsRequests.filter((request) => request.op === 'write' && request.root === 'workdir'),
++    dataWrites: brain.fsRequests.filter((request) => request.op === 'write' && request.root === 'data'),
+     verbRequests,
+     logs: bridge.spy,
+   }
+@@ -242,6 +249,107 @@ describe('canvas_export 失败不写半成品', () => {
+   })
+ })
+ 
++// ── #328 残余风险(方案 A + B):缺省文件名跨面板重载防覆盖 ──
++//
++// 面板侧 canvasExportFileName() 的同秒去重 Map 是面板进程内状态,面板重载(甚至
++// brain 重启)会清空它;workdir 又没有 list 能力(root:'workdir' 只有带 callId
++// 的写,docs/plan/workspace-binding-design.md §4.10),补不了这个缺口。这里断言
++// 电子脑在 root:'data' 维护的持久台账(export/used-default-names.json)。
++describe('canvas_export 缺省名跨重载防覆盖(#328 方案 A + B)', () => {
++  const LEDGER = loadBrain({ panelPresent: () => false }).handles.exportTool
++  const LEDGER_PATH = LEDGER.nameLedgerPath
++  const LEDGER_MAX = LEDGER.nameLedgerMax
++  const CANDIDATE = 'mivo-canvas-20260729-010203.png'
++
++  const ledgerOf = (run: RunResult): { names: string[] } | null => {
++    const text = run.brain.files.get(LEDGER_PATH)
++    if (text === undefined) return null
++    return JSON.parse(text) as { names: string[] }
++  }
++
++  it('首次使用(无台账):候选名原样落盘,并新建台账记下这个名字', async () => {
++    const run = await runExport({ panelReply: panelOk({ fileName: CANDIDATE }) })
++    expect(run.writes).toHaveLength(1)
++    expect(run.writes[0].path).toBe(`mivo-canvas-export/${CANDIDATE}`)
++    expect(ledgerOf(run)).toEqual({ names: [CANDIDATE] })
++  })
++
++  it('跨重载撞车(模拟新建 brain 实例,台账已记过候选名)→ 落 -1 后缀,不覆盖旧产物', async () => {
++    const run = await runExport({
++      panelReply: panelOk({ fileName: CANDIDATE }),
++      files: { [LEDGER_PATH]: JSON.stringify({ names: [CANDIDATE] }) },
++    })
++    expect(run.writes[0].path).toBe('mivo-canvas-export/mivo-canvas-20260729-010203-1.png')
++    expect(ledgerOf(run)).toEqual({ names: [CANDIDATE, 'mivo-canvas-20260729-010203-1.png'] })
++  })
++
++  it('连续撞车(台账已含候选名与 -1)→ 落 -2,不是回退成 -1 覆盖', async () => {
++    const run = await runExport({
++      panelReply: panelOk({ fileName: CANDIDATE }),
++      files: { [LEDGER_PATH]: JSON.stringify({ names: [CANDIDATE, 'mivo-canvas-20260729-010203-1.png'] }) },
++    })
++    expect(run.writes[0].path).toBe('mivo-canvas-export/mivo-canvas-20260729-010203-2.png')
++  })
++
++  it('硬要求③:显式 fileName 完全不经过台账(不读不写),用户意图不变', async () => {
++    const run = await runExport({
++      args: { format: 'png', fileName: 'board' },
++      panelReply: panelOk({ fileName: 'board.png' }),
++      files: { [LEDGER_PATH]: JSON.stringify({ names: ['board.png'] }) }, // 即使台账已有同名,也不该被拿来加后缀
++    })
++    expect(run.writes[0].path).toBe('mivo-canvas-export/board.png')
++    expect(run.brain.fsRequests.some((request) => request.path === LEDGER_PATH)).toBe(false)
++  })
++
++  it('硬要求②方案 B:台账解析失败(非 JSON)→ 候选名加随机串兜底,diag 留痕,并重建台账', async () => {
++    const run = await runExport({
++      panelReply: panelOk({ fileName: CANDIDATE }),
++      files: { [LEDGER_PATH]: 'not-json{{{' },
++    })
++    expect(run.writes).toHaveLength(1)
++    const path = run.writes[0].path
++    expect(path).not.toBe(`mivo-canvas-export/${CANDIDATE}`) // 不是"看起来没查到就原样落盘"
++    expect(path).toMatch(/^mivo-canvas-export\/mivo-canvas-20260729-010203-[0-9a-z]{6}\.png$/)
++    expect(run.logs.calls.some((entry) => entry.level === 'warn' && entry.message.includes('台账不可读或结构损坏'))).toBe(
++      true,
++    )
++    // 重建:新台账只含这一条(不是把损坏内容原样保留或追加在后面)。
++    const finalName = path.slice('mivo-canvas-export/'.length)
++    expect(ledgerOf(run)).toEqual({ names: [finalName] })
++  })
++
++  it('硬要求②方案 B:台账结构不合法({names:[...]} 之外的形状)→ 同样按损坏处理', async () => {
++    const run = await runExport({
++      panelReply: panelOk({ fileName: CANDIDATE }),
++      files: { [LEDGER_PATH]: JSON.stringify({ foo: 'bar' }) },
++    })
++    expect(run.writes[0].path).toMatch(/^mivo-canvas-export\/mivo-canvas-20260729-010203-[0-9a-z]{6}\.png$/)
++  })
++
++  it('台账写回失败不阻断导出:产物仍正常落盘,只留诊断(方案 A 的失败不许静默覆盖,也不许阻断)', async () => {
++    const run = await runExport({
++      panelReply: panelOk({ fileName: CANDIDATE }),
++      writeGuard: (request) => request.root !== 'data', // 只让台账那次 data-root 写失败
++    })
++    expect(run.writes[0].path).toBe(`mivo-canvas-export/${CANDIDATE}`) // 读台账仍成功(空台账),候选名本身不受影响
++    expect(run.toolResult?.ok).toBe(true)
++    expect(run.brain.files.has(LEDGER_PATH)).toBe(false) // 写回确实没落盘,不是误判
++    expect(run.logs.calls.some((entry) => entry.level === 'warn' && entry.message.includes('台账写回失败'))).toBe(true)
++  })
++
++  it(`硬要求①有界:台账已满 ${LEDGER_MAX} 条 → 新增一条时淘汰最旧的一条(FIFO)`, async () => {
++    const oldNames = Array.from({ length: LEDGER_MAX }, (_, i) => `old-${i}.png`)
++    const run = await runExport({
++      panelReply: panelOk({ fileName: CANDIDATE }),
++      files: { [LEDGER_PATH]: JSON.stringify({ names: oldNames }) },
++    })
++    const ledger = ledgerOf(run)
++    expect(ledger?.names).toHaveLength(LEDGER_MAX)
++    expect(ledger?.names).toEqual(oldNames.slice(1).concat([CANDIDATE]))
++    expect(ledger?.names).not.toContain('old-0.png') // 最旧的一条被淘汰
++  })
++})
++
+ describe('canvas_export 四语文案', () => {
+   const brainText = () => {
+     const brain = loadBrain({ panelPresent: () => false })
+diff --git a/src/__tests__/toolBudget.test.ts b/src/__tests__/toolBudget.test.ts
+index 1f53e13e..5ff56bb8 100644
+--- a/src/__tests__/toolBudget.test.ts
++++ b/src/__tests__/toolBudget.test.ts
+@@ -1,10 +1,10 @@
+ /**
+  * 工具预算断言(#297 §六-1 running total)。
+  *
+- * 宿主对单插件的工具数有硬上限(≤16)。#297 的规划总量:现 5 → R3 update_node=6
+- * → R5 arrange=7 → P3-10 图生视频=9 → P3-14 导出=10。每个加工具的 PR 必须把
+- * EXPECTED_TOOL_COUNT 一并改掉——这样「悄悄多挂一个工具」会立刻翻红,而不是等
+- * 上线后被宿主拒绝装载。
++ * 宿主对单插件的工具数有硬上限(≤16)。按实际合入顺序的 running total:现 5
++ * → R3 update_node=6 → P3-14 导出=7 → R5 arrange=8(图生视频未落地,不预留名额)。
++ * 每个加工具的 PR 必须把 EXPECTED_TOOL_COUNT 一并改掉——这样「悄悄多挂一个工具」
++ * 会立刻翻红,而不是等上线后被宿主拒绝装载。
+  *
+  * R7a(区域快照)是 snapshot **扩参**,不占新工具名额,预期值维持 5;
+  * R3 落第 6 个名额 → 6;P3-14(canvas_export)落第 7 个 → 7;R5(canvas_arrange,本 PR)落第 8 个 → 8。

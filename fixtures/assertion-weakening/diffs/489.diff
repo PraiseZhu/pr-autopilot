@@ -1,0 +1,379 @@
+diff --git a/main.js b/main.js
+index d4518428..c58247c1 100644
+--- a/main.js
++++ b/main.js
+@@ -2693,9 +2693,31 @@ const MIVO_API = 'https://aigc.xindong.com/api/v1'
+ // 有据可依 —— 换通道只需改 MIVO_CHANNEL,不必动流程。
+ const MIVO_CHANNELS = {
+   'nano-banana-pro': { modelType: 'NANOBANANA', version: 'gemini-3-pro-image-preview', label: 'Nano Banana Pro' },
+-  'gpt-image-2': { modelType: 'GPT', version: 'gpt-image-2', label: 'GPT Image 2' },
++  'gpt-image-2': { modelType: 'GPT', version: 'gpt-image-2', label: 'GPT Image 2.0' },
+ }
+ const MIVO_CHANNEL = 'nano-banana-pro'
++// 面板出图模型 → 本表通道 key(K2 Task 2)。面板下拉发的是网页版的 MaskEditModelId
++// (src/canvas/imageMaskGeometry.ts),这里是唯一的映射处;认不出的值回落默认通道并留痕
++// (静默改模型 = 用户以为选了 GPT 实际出的是 Nano,账单与效果都对不上)。
++const MIVO_MODEL_CHANNEL = {
++  'gemini-3-pro-image': 'nano-banana-pro',
++  'gpt-image-2': 'gpt-image-2',
++}
++function mivoChannelFor(model) {
++  const requested = typeof model === 'string' ? model.trim() : ''
++  if (!requested) return MIVO_CHANNEL
++  const channel = MIVO_MODEL_CHANNEL[requested]
++  if (channel && MIVO_CHANNELS[channel]) return channel
++  // 未知值来自面板/宿主消息,属**外部自由文本**:diagSkip 是 warn 级、会远程持久化,
++  // 按 docs/development-logging.md 只记稳定签名(长度 + 不可逆 FNV 短签名),不落原文
++  // (PR-1 R1 M4)。同一个未知值恒得同一 sig,对账照旧做得到。
++  diagSkip(
++    DIAG_SOURCE.gen,
++    'mivo 出图模型不在白名单, 回落默认通道 ' + MIVO_CHANNEL
++      + ' (len=' + requested.length + ' sig=' + diagSig(requested) + ')',
++  )
++  return MIVO_CHANNEL
++}
+ // 画幅白名单与网页版 mivoPlatformRatioSet 逐项一致;面板只会发 1:1/3:2/2:3。
+ const MIVO_RATIO_ALLOWED = new Set(['1:1', '16:9', '9:16', '4:3', '3:4', '2:3', '3:2', '4:5', '5:4'])
+ const MIVO_RESOLUTION = '1K'
+@@ -2823,8 +2845,8 @@ function mivoPayload(kind, prompt, aspectRatio, imageIds) {
+   return payload
+ }
+ 
+-async function mivoSubmit(kind, prompt, aspectRatio, imageIds, callId) {
+-  const spec = MIVO_CHANNELS[MIVO_CHANNEL]
++async function mivoSubmit(kind, prompt, aspectRatio, imageIds, callId, channel) {
++  const spec = MIVO_CHANNELS[channel || MIVO_CHANNEL]
+   const send = async () => {
+     const chatSessionId = await mivoEnsureChatSession(callId)
+     const body = JSON.stringify({
+@@ -2951,7 +2973,9 @@ async function mivoUploadSources(hashes, callId) {
+  */
+ async function mivoTryImage(msg, kind, sourceHashes) {
+   const callId = typeof msg.callId === 'string' && msg.callId ? msg.callId : ''
+-  const spec = MIVO_CHANNELS[MIVO_CHANNEL]
++  // 通道按面板选择走(K2 Task 2);msg.model 缺省/不认识都回落默认通道。
++  const channel = mivoChannelFor(msg.model)
++  const spec = MIVO_CHANNELS[channel]
+   let submitted = false
+   try {
+     // 会话先建起来:凭证/白名单这类「没接上」在这一跳暴露,此时还没上传没提交,
+@@ -2959,16 +2983,16 @@ async function mivoTryImage(msg, kind, sourceHashes) {
+     await mivoEnsureChatSession(callId)
+     let imageIds
+     if (kind === 'edit') imageIds = await mivoUploadSources(sourceHashes, callId)
+-    const jobId = await mivoSubmit(kind, String(msg.prompt || ''), msg.aspectRatio, imageIds, callId)
++    const jobId = await mivoSubmit(kind, String(msg.prompt || ''), msg.aspectRatio, imageIds, callId, channel)
+     submitted = true
+     diagOk(
+       DIAG_SOURCE.gen,
+-      kind + ' 已提交 Mivo 直连: model=' + MIVO_CHANNEL + ' promptChars=' + diagTextLen(msg.prompt),
++      kind + ' 已提交 Mivo 直连: model=' + channel + ' promptChars=' + diagTextLen(msg.prompt),
+     )
+     const images = await mivoPoll(jobId, callId)
+     if (!images.length) throw mivoError('Mivo 生成失败:结果为空', false)
+     const media = await mivoTakeImage(images[0], callId)
+-    return { status: 'ok', media: media, model: MIVO_CHANNEL, modelLabel: spec.label }
++    return { status: 'ok', media: media, model: channel, modelLabel: spec.label }
+   } catch (error) {
+     const message = String((error && error.message) || error)
+     if (!submitted && error && error.mivoUnconfigured) return { status: 'fallback', reason: message }
+@@ -3026,6 +3050,8 @@ async function genOutcome(msg, kind) {
+   let request
+   if (msg.kind === 'edit-image') {
+     // 图生图:源图是插件名下媒体指纹(1–4 张,白名单校验已在函数开头做过)
++    // 代办**不带 model**(K2 Task 2):宿主改图不收模型字段,带上会被拒。产品语义也自洽 ——
++    // 面板只在配了 Key(= 直连可用)时才显示模型下拉,看得见下拉就必定走直连。
+     request = { type: 'cindy-request', kind: 'edit_image', prompt: String(msg.prompt || ''), hashes: sourceHashes }
+   } else {
+     request = { type: 'cindy-request', kind: 'gen_image', prompt: String(msg.prompt || '') }
+@@ -6572,6 +6598,8 @@ if (seam && typeof seam.expose === 'function') {
+       api: MIVO_API,
+       channel: MIVO_CHANNEL,
+       channels: MIVO_CHANNELS,
++      channelFor: mivoChannelFor,
++      modelChannel: MIVO_MODEL_CHANNEL,
+       payload: mivoPayload,
+       signedUrl: mivoSignedUrl,
+       unconfiguredRe: MIVO_UNCONFIGURED_RE,
+diff --git a/src/__tests__/brainHarness.ts b/src/__tests__/brainHarness.ts
+index 7b8358a7..dfb6bdf2 100644
+--- a/src/__tests__/brainHarness.ts
++++ b/src/__tests__/brainHarness.ts
+@@ -497,6 +497,9 @@ export type BrainMivoHandles = {
+   api: string
+   channel: string
+   channels: Record<string, { modelType: string; version: string; label: string }>
++  /** K2 Task 2:面板 model → 通道 key 的白名单映射与解析器。 */
++  modelChannel: Record<string, string>
++  channelFor: (model: unknown) => string
+   payload: (
+     kind: string,
+     prompt: string,
+diff --git a/src/__tests__/mivoChannel.test.ts b/src/__tests__/mivoChannel.test.ts
+index 7387e326..4e484c94 100644
+--- a/src/__tests__/mivoChannel.test.ts
++++ b/src/__tests__/mivoChannel.test.ts
+@@ -152,6 +152,9 @@ const runGen = async (options: RunOptions = {}): Promise<RunResult> => {
+ 
+   return { brain, reply: replies[0], cindyRequests, fetches: brain.fetchRequests }
+ }
++// 跨包 import(网页侧模型表):vitest 单配置覆盖全仓,cindyplugin 测试可以直接读 src/。
++import { regionEditModelOptions } from '../../../src/canvas/regionEditModel'
++
+ 
+ describe('配了 key:直连 Mivo,不点宿主代办', () => {
+   it('回执带落仓三件套 + 如实回传 modelLabel,且零 cindy-request', async () => {
+@@ -245,6 +248,122 @@ describe('配了 key:直连 Mivo,不点宿主代办', () => {
+   })
+ })
+ 
++// ── K2 Task 2:面板的出图模型下拉真的选通道 ──
++// 表里两条通道本来就在(#369 时留着为了 modelLabel 如实回传),但 MIVO_CHANNEL 写死
++// 'nano-banana-pro' —— 用户在面板选了 GPT Image 2.0,出图仍是 Nano,账单与效果都对不上。
++describe('出图模型下拉选通道(K2 Task 2)', () => {
++  it("model='gpt-image-2' → 提交体 modelType GPT / version gpt-image-2,回执 label 如实", async () => {
++    const run = await runGen({
++      fetch: mivoUpstream({ uploadIds: ['up-a'] }),
++      msg: {
++        reqId: 'edit-model-1',
++        kind: 'edit-image',
++        prompt: PROMPT,
++        hashes: [SOURCE_HASH],
++        callId: 'call-1',
++        model: 'gpt-image-2',
++      },
++    })
++    const submit = run.fetches.find((request) => String(request.url).endsWith('/api/v1/message'))
++    const body = JSON.parse(String(submit?.body)) as Record<string, unknown>
++    expect(body.modelType).toBe('GPT')
++    expect(body.modelFormat).toEqual({ version: 'gpt-image-2' })
++    expect(run.reply?.modelLabel).toBe('GPT Image 2.0')
++    expect(run.reply?.ok).toBe(true)
++  })
++
++  it("model='gemini-3-pro-image'(下拉默认)→ 仍是 NANOBANANA 通道", async () => {
++    const run = await runGen({
++      fetch: mivoUpstream({ uploadIds: ['up-a'] }),
++      msg: {
++        reqId: 'edit-model-2',
++        kind: 'edit-image',
++        prompt: PROMPT,
++        hashes: [SOURCE_HASH],
++        callId: 'call-1',
++        model: 'gemini-3-pro-image',
++      },
++    })
++    const submit = run.fetches.find((request) => String(request.url).endsWith('/api/v1/message'))
++    const body = JSON.parse(String(submit?.body)) as Record<string, unknown>
++    expect(body.modelType).toBe('NANOBANANA')
++    expect(body.modelFormat).toEqual({ version: 'gemini-3-pro-image-preview' })
++    expect(run.reply?.modelLabel).toBe('Nano Banana Pro')
++  })
++
++  it('非法/未知 model → 回落默认通道并 diagSkip 留痕(不静默改模型)', async () => {
++    const run = await runGen({
++      fetch: mivoUpstream({ uploadIds: ['up-a'] }),
++      msg: {
++        reqId: 'edit-model-3',
++        kind: 'edit-image',
++        prompt: PROMPT,
++        hashes: [SOURCE_HASH],
++        callId: 'call-1',
++        model: 'dall-e-9',
++      },
++    })
++    const submit = run.fetches.find((request) => String(request.url).endsWith('/api/v1/message'))
++    const body = JSON.parse(String(submit?.body)) as Record<string, unknown>
++    expect(body.modelType).toBe('NANOBANANA')
++    const spy = attachPanelBridge(run.brain).spy
++    const skips = spy.find('不在白名单')
++    expect(skips).toHaveLength(1)
++    // PR-1 R1 M4:diagSkip 是 warn 级、会远程持久化,而 model 是外部自由文本 ——
++    // 只准留稳定签名(长度 + 不可逆短签名),**不准落原文**(docs/development-logging.md)。
++    expect(skips[0].message).not.toContain('dall-e-9')
++    expect(skips[0].message).toContain('len=' + 'dall-e-9'.length)
++    expect(skips[0].message).toMatch(/sig=[0-9a-f]{8}/)
++  })
++
++  it('缺省 model(聊天改图等无下拉入口)→ 默认通道,不记跳过(不是异常路径)', async () => {
++    const run = await runGen({ fetch: mivoUpstream({ uploadIds: ['up-a'] }), msg: {
++      reqId: 'edit-model-4', kind: 'edit-image', prompt: PROMPT, hashes: [SOURCE_HASH], callId: 'call-1',
++    } })
++    const submit = run.fetches.find((request) => String(request.url).endsWith('/api/v1/message'))
++    expect((JSON.parse(String(submit?.body)) as Record<string, unknown>).modelType).toBe('NANOBANANA')
++    expect(attachPanelBridge(run.brain).spy.find('不在白名单')).toHaveLength(0)
++  })
++
++  it('映射表只认这两个 id(白名单本体钉死,加通道必须同步改这里)', () => {
++    const handles = loadBrain({ panelPresent: () => false }).handles.mivo
++    expect(handles.modelChannel).toEqual({
++      'gemini-3-pro-image': 'nano-banana-pro',
++      'gpt-image-2': 'gpt-image-2',
++    })
++    expect(handles.channelFor('gpt-image-2')).toBe('gpt-image-2')
++    expect(handles.channelFor('')).toBe('nano-banana-pro')
++    expect(handles.channelFor(undefined)).toBe('nano-banana-pro')
++    expect(handles.channelFor('nope')).toBe('nano-banana-pro')
++  })
++
++  // PR-1 R1 S6:允许模型集合在两个包里各存一份(网页面板一份、插件通道表一份),
++  // 唯一的防漂移手段就是这条**跨端契约**。少了它,新增模型只改一侧 → 插件把新模型
++  // 静默回落到默认通道(用户以为选了 GPT,实际出的是 Nano,账单与效果都对不上)。
++  it('跨端一致:插件映射表键集 ≡ 网页面板的模型选项 id 集', () => {
++    const handles = loadBrain({ panelPresent: () => false }).handles.mivo
++    const pluginIds = Object.keys(handles.modelChannel as Record<string, string>).sort()
++    const webIds = regionEditModelOptions.map((option) => option.id).sort()
++    expect(pluginIds).toEqual(webIds)
++  })
++
++  it('代办回落路径**不带 model**(宿主改图不收,带上会被拒)', async () => {
++    const run = await runGen({
++      msg: {
++        reqId: 'edit-model-5',
++        kind: 'edit-image',
++        prompt: PROMPT,
++        hashes: [SOURCE_HASH],
++        callId: 'call-1',
++        model: 'gpt-image-2',
++      },
++    })
++    expect(run.cindyRequests).toHaveLength(1)
++    expect(run.cindyRequests[0]).not.toHaveProperty('model')
++    expect(run.cindyRequests[0].kind).toBe('edit_image')
++  })
++})
++
+ describe('没配 key:静默回落宿主代办,老路径逐字段不变', () => {
+   it('gen 回落:cindy-request 形状与切换前一致', async () => {
+     // fetch 不注入 = 假上游恒回「凭证未配置」,即真实的「这台机器没配 Mivo key」
+diff --git a/src/__tests__/portEditRatio.test.ts b/src/__tests__/portEditRatio.test.ts
+index 7d8f1f0c..1fff97ca 100644
+--- a/src/__tests__/portEditRatio.test.ts
++++ b/src/__tests__/portEditRatio.test.ts
+@@ -9,6 +9,10 @@
+  *  ③ 变体:单条 variation.imgRatio 优先,缺省回落 request.imgRatio。
+  * 回落 Cindy 代办时丢弃比例是电子脑的职责(main.js genOutcome,mivoChannel 组盯),
+  * 不在本组范围。
++ *
++ * K2 Task 2 起同一处还带 model(出图模型下拉的选择):口径与 aspectRatio 一致 ——
++ * 面板恒带该字段,值可能 undefined;电子脑 mivoChannelFor 对空值回落默认通道且不留痕
++ * (不是异常路径),对不认识的值回落默认并 diagSkip。
+  */
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+@@ -142,4 +146,76 @@ describe('端口改图比例透传', () => {
+     expect(harness.hostRequests).toHaveLength(1) // 两条变体共用同一次源图懒寄存,不是各寄存一次
+     expect(editMessages().map((message) => message.aspectRatio)).toEqual(['9:16', undefined])
+   })
++
++  // ── K2 Task 2:出图模型下拉的选择必须进 edit-image 消息 ──
++  it('request.model → edit-image 消息的 model(下拉选 GPT Image 2.0 的那一路)', async () => {
++    await cindyImageGenerationPort.submitEditTask({
++      prompt: '把区域1改成蓝色',
++      image: new Blob([new Uint8Array(8)], { type: 'image/png' }),
++      sourceAssetUrl: 'mivo-asset:ratio-src',
++      model: 'gpt-image-2',
++      idempotencyKey: 'm1',
++    })
++    await flushDetached()
++    expect(editMessages()).toHaveLength(1)
++    expect(editMessages()[0].model).toBe('gpt-image-2')
++  })
++
++  it('默认模型同样如实带上(不在端口偷偷改写)', async () => {
++    await cindyImageGenerationPort.submitEditTask({
++      prompt: '把区域1改成蓝色',
++      image: new Blob([new Uint8Array(8)], { type: 'image/png' }),
++      sourceAssetUrl: 'mivo-asset:ratio-src',
++      model: 'gemini-3-pro-image',
++      idempotencyKey: 'm2',
++    })
++    await flushDetached()
++    expect(editMessages()[0].model).toBe('gemini-3-pro-image')
++  })
++
++  it('未指定模型 → 字段为空,由电子脑回落默认通道(端口不硬塞)', async () => {
++    await cindyImageGenerationPort.submitEditTask({
++      prompt: '换个颜色',
++      image: new Blob([new Uint8Array(8)], { type: 'image/png' }),
++      sourceAssetUrl: 'mivo-asset:ratio-src',
++      idempotencyKey: 'm3',
++    })
++    await flushDetached()
++    expect(editMessages()[0].model).toBeUndefined()
++  })
++
++  // ── K6:零选区(用户只打字)→ 落普通 edit 路径,发纯指令 ──
++  // regionEdit 分流判据是 rects 非空,零选区自然走 else 支;这里钉住它**真的通**
++  // (不被 mask 类字段的 unsupported 门拦下),且 prompt 就是那句话、model 照带。
++  it('零选区纯文字 → 普通 edit 路径,prompt 为指令原文且不带 mask 类字段', async () => {
++    await cindyImageGenerationPort.submitEditTask({
++      prompt: '把背景换成夜景',
++      image: new Blob([new Uint8Array(8)], { type: 'image/png' }),
++      sourceAssetUrl: 'mivo-asset:ratio-src',
++      regionRects: [],
++      regionBody: '把背景换成夜景',
++      model: 'gpt-image-2',
++      idempotencyKey: 'k6-1',
++    })
++    await flushDetached()
++    expect(editMessages()).toHaveLength(1)
++    const message = editMessages()[0]
++    expect(message.prompt).toBe('把背景换成夜景')
++    expect(message.model).toBe('gpt-image-2')
++    expect(message).not.toHaveProperty('maskBounds')
++    expect(message).not.toHaveProperty('markedImage')
++  })
++
++  it('零选区时不因 mask 类字段缺省而报「不支持」(分流真的落到普通 edit)', async () => {
++    await cindyImageGenerationPort.submitEditTask({
++      prompt: '整体调亮一点',
++      image: new Blob([new Uint8Array(8)], { type: 'image/png' }),
++      sourceAssetUrl: 'mivo-asset:ratio-src',
++      regionRects: [],
++      regionBody: '整体调亮一点',
++      idempotencyKey: 'k6-2',
++    })
++    await flushDetached()
++    expect(editMessages().map((m) => m.prompt)).toContain('整体调亮一点')
++  })
+ })
+diff --git a/src/agent/cindyGenerationPort.ts b/src/agent/cindyGenerationPort.ts
+index f8dc5f7a..25ea4154 100644
+--- a/src/agent/cindyGenerationPort.ts
++++ b/src/agent/cindyGenerationPort.ts
+@@ -346,7 +346,10 @@ export const cindyImageGenerationPort: ImageGenerationPort = {
+             // aspectRatio = 面板算好的源图比例(closestMivoRatioForSize):Mivo 直连路
+             // 用它锁住画幅——不传平台缺省 1:1,非方图会被拉变形(2026-08-01 用户实测);
+             // Cindy 代办回落路由电子脑负责丢弃(宿主改图不收比例,带上会被拒)。
+-            { prompt, hashes: [hash], callId: editCallId, aspectRatio: request.imgRatio },
++            // model:面板出图模型下拉的选择(K2 Task 2)。Mivo 直连路按它选通道
++            // (main.js mivoChannelFor:白名单映射,不认识回落默认并留痕);Cindy 代办
++            // 回落路由电子脑负责不带它(宿主改图不收模型字段)。
++            { prompt, hashes: [hash], callId: editCallId, aspectRatio: request.imgRatio, model: request.model },
+             { retryMs: 5_000, timeoutMs: 28 * 60_000 },
+           )
+         const reply = await editOnceWithForcedRetry(request.sourceAssetUrl, request.image, doRequest, source.hash)
+diff --git a/src/cindy-theme.css b/src/cindy-theme.css
+index c8149d81..078e6313 100644
+--- a/src/cindy-theme.css
++++ b/src/cindy-theme.css
+@@ -236,6 +236,18 @@
+   border-color: color-mix(in srgb, var(--text-primary, #232323) 30%, var(--border-default, #d6d0c6));
+ }
+ 
++/* 出图模型下拉(K1 Task 2):与富文本输入区同一档抬升 —— 缺省的 --panel-surface 在
++   Dark 下是奶油实底,一个亮色下拉贴在暗面板上就是「贴纸」(2026-07-31 用户点名过
++   同一类问题)。文字**故意不覆写**:正文走 --ink(映射到 --text-primary),两套皮肤的
++   对比度由宿主的文字角色保证,同点选提示行的处理(J4 ⑧),这里不手调混色比例。
++   K3:可见 label 已去掉(文案转 aria-label);紧凑宽度与自绘 chevron 都在 App.css 里
++   用 fit-content / currentColor 写成**与皮肤无关**的形态,所以这边只需要继续管底与描边,
++   不必为这两条各加一份暗色变体。 */
++.region-edit-model-select {
++  background: color-mix(in srgb, var(--text-primary, #232323) 5%, var(--surface-elevated, #fffaf0));
++  border-color: color-mix(in srgb, var(--text-primary, #232323) 16%, var(--border-default, #d6d0c6));
++}
++
+ /* 点选常驻提示行:**故意不覆写**(J4 ⑧)。
+    原来这里按「主文字色掺 55% 抬升表面」推导,Light 下实测混出 rgb(134,132,127)
+    (相对亮度 0.2310),对面板底 #fffaf0(0.9592)只有 3.59:1 —— 12px 是 WCAG normal text,

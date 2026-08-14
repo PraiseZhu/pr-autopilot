@@ -1,0 +1,2327 @@
+diff --git a/.claude/skills/generate-changelog/SKILL.md b/.claude/skills/generate-changelog/SKILL.md
+index 1e7b389f..4c4b74e7 100644
+--- a/.claude/skills/generate-changelog/SKILL.md
++++ b/.claude/skills/generate-changelog/SKILL.md
+@@ -90,7 +90,7 @@ commit subject 前缀 `feat` → `features`，`fix` → `fixes`；其他前缀
+ - entries 保持按 `date` 降序
+ - `lastGithash` 置为 `origin/main` HEAD
+ - `updatedAt` **仅在实际有新条目写入时刷新**——无新 PR 的空跑不改 `updatedAt`（避免无意义红点）
+-- **空跑不前移 `lastGithash`**（脚本化后既定决策,2026-07-08）：空跑时 changelog.json 不写回、anchor 不动,由**下次非空补扫**（手动跑本 skill 或 `auto-changelog.mjs publish`）把 `lastGithash` 跳到当时 `origin/main` HEAD 自然追平。**anchor 何时前进取决于 open PR 何时合并**（#423 起 publish 不再自动合并,见下方"自动模式"说明）：同一待补最大结算日(即同一分支名 `chore/changelog-<日期>`)同时最多一条 open PR——publish 先查 `git ls-remote` 确认该分支 ref 是否已存在于远端(真前置条件,而非只查代理量"有没有 open PR"),ref 不存在才继续正常发布;ref 已存在则再查 `gh pr list --head --base main` 分类:命中未过 22h 的 open PR 就幂等跳过、不再开重复分支;ref 存在但查无 open PR(孤儿分支,如 push 成功但 `gh pr create` 失败,或 PR 被 close)、或该 PR 已开出超过 22h 仍未合并,均 fail-closed 翻红要求人工介入。跨日累积(前一个分支尚未合并时,新一天的真实 PR 把待补最大结算日推进,又开出另一个分支名的 PR)属已知残余风险,不在本轮陈旧门覆盖范围内——且重叠的多条 open PR 中任一被合并后,其余会永久变成 `mergeStateStatus=CONFLICTING`,脚本无自动关闭/刷新路径,详见 `scripts/changelog/RUNBOOK.md`「跨日累积」一节。
++- **空跑不前移 `lastGithash`**（脚本化后既定决策,2026-07-08）：空跑时 changelog.json 不写回、anchor 不动,由**下次非空补扫**（手动跑本 skill 或 `auto-changelog.mjs publish`）把 `lastGithash` 跳到当时 `origin/main` HEAD 自然追平。**anchor 何时前进取决于 open PR 何时合并**（#423 起 publish 不再自动合并,见下方"自动模式"说明）：publish 发布前有双层门查。**跨日可见性 + 幂等门**按归属(author + headRepositoryOwner,不按分支名)扫描所有 open changelog PR——命中任一归属本流程的,新鲜就幂等跳过、陈旧就 fail-closed,不论是否同一个待补最大结算日,消除了前一天分支未合并时又开出另一分支名 PR 的跨日累积。**同日分支域门**再查该待补最大结算日对应的具体分支名(`chore/changelog-<日期>`)是否已存在于远端(真前置条件,而非只查代理量"有没有 open PR"):ref 不存在才继续正常发布;ref 已存在则再查 `gh pr list --head` 分类(不做归属判定,存在任何 open PR 都该跳过):命中未过 22h 的 open PR 就幂等跳过;ref 存在但查无 open PR(孤儿分支,如 push 成功但 `gh pr create` 失败,或 PR 被 close)、或该 PR 已开出超过 22h 仍未合并,均 fail-closed 翻红要求人工介入。真正 `push` 时还带 `--force-with-lease=<branch>:` 断言远端该 ref 此刻仍不存在,堵住检查与 push 之间的窗口期竞态。历史遗留(本修复合入前已产生)的重叠 open PR 中任一被合并后,其余会永久变成 `mergeStateStatus=CONFLICTING`,脚本无自动关闭/刷新路径,详见 `scripts/changelog/RUNBOOK.md`「跨日累积」一节。
+ - 生成后把新增条目给用户过目,确认后随功能 PR 一起提交
+ 
+ ## 注意
+@@ -104,7 +104,7 @@ commit subject 前缀 `feat` → `features`，`fix` → `fixes`；其他前缀
+ >
+ > 1. `node scripts/changelog/auto-changelog.mjs scan` — 扫出新 PR，产物落 `/tmp/mivo-changelog-scan.json`
+ > 2. `node scripts/changelog/auto-changelog.mjs rewrite` — 脚本先确定性生成 date/by/kind 骨架（`feat`→`features`,`fix`→`fixes`,其他前缀低调归入 `fixes`），LLM 只写 PR→文案映射，产物落 `/tmp/mivo-changelog-rewrite.json`
+-> 3. `node scripts/changelog/auto-changelog.mjs publish --rewrite /tmp/mivo-changelog-rewrite.json` — 脚本回填机器字段、校验 + 开 PR + 轮询 CI + 落地后合规校验；**不合并、不删远程分支**——org ruleset `trunk-guard`（实测 6 条规则）的 `code_scanning` 因本仓未开 GHAS 永久等待判 fail、持续阻断（`code_quality` 判 pass 不阻断；`copilot_code_review`/`pull_request` 是否也阻塞 `mergeStateStatus` 本轮未验证，详见 `RUNBOOK.md`），以 `main` 为 base 的 PR 在当前配置下持续观察到 `mergeStateStatus=BLOCKED`（#423 根因）。PR 保持 open，交由 `review-pr` 自动审合或人工合并
++> 3. `node scripts/changelog/auto-changelog.mjs publish --rewrite /tmp/mivo-changelog-rewrite.json` — 脚本回填机器字段、校验 + **发布前双层门查**（跨日可见性+幂等、同日分支域）+ 开 PR + 轮询 CI + 落地后合规校验；**不合并、不删远程分支**——org ruleset `trunk-guard`（实测 6 条规则）的 `code_scanning` 因本仓未开 GHAS 永久等待判 fail、持续阻断（`code_quality` 判 pass 不阻断；`copilot_code_review`/`pull_request` 是否也阻塞 `mergeStateStatus` 本轮未验证，详见 `RUNBOOK.md`），以 `main` 为 base 的 PR 在当前配置下持续观察到 `mergeStateStatus=BLOCKED`（#423 根因）。PR 保持 open，交由 `review-pr` 自动审合或人工合并；双层门查细节见 `scripts/changelog/RUNBOOK.md`
+ >
+ > 三步编排详见 `scripts/changelog/RUNBOOK.md`。脚本行为与下方原 SOP 的扫描/归天/改写/开 PR 部分语义一致；下面第 4–6 步（轮询到全绿即 merge、merge 后同步 main）描述的是脚本承载前的历史行为，**当前脚本不执行合并**，仅供审查扫描/归天/改写/开 PR 逻辑是否忠实于本 skill 时对照。
+ 
+diff --git a/.github/workflows/daily-changelog.yml b/.github/workflows/daily-changelog.yml
+index 1827cd8f..7c542013 100644
+--- a/.github/workflows/daily-changelog.yml
++++ b/.github/workflows/daily-changelog.yml
+@@ -118,11 +118,16 @@ jobs:
+         # 配置下会被拒绝。本步骤只开 PR、轮询
+         # CI、跑落地后合规校验,不合并、不删远程分支;交由 review-pr 自动审合或人工合并(详见
+         # scripts/changelog/RUNBOOK.md)。
+-        # 分支存在性 + 幂等跳过 + 陈旧门(在建 worktree 之前):先查该分支 ref 是否已在远端
+-        # 存在(真前置条件,而非只查代理量"有没有 open PR");ref 不存在 → 正常发布。ref 存在
+-        # 时再查 open PR 分类:<22h → exit 0 跳过(stdout status=pr-already-open);≥22h、
+-        # createdAt 无法解析、或查无对应 open PR(孤儿分支)→ fail-closed 非零退出,需人工
+-        # 介入(详见 RUNBOOK.md)。
++        # 发布前双层门查(在建 worktree 之前,任何 git 写动作之前):
++        #   跨日可见性+幂等门:按归属(author+headRepositoryOwner)扫描所有 open
++        #      changelog PR,不按分支名匹配——命中新鲜(<22h)幂等跳过;命中陈旧(≥22h 或
++        #      createdAt 不可解析)fail-closed;非本流程归属的同名前缀 PR 只记录可见性
++        #      (stdout 附 unownedChangelogPrs),不认领。
++        #   同日分支域门:先查该结算日对应的具体分支 ref 是否已在远端存在(真前置
++        #      条件,而非只查代理量"有没有 open PR");ref 不存在 → 正常发布(push 带
++        #      --force-with-lease 防窗口期竞态)。ref 存在时再查 open PR(不做归属判定):
++        #      <22h → exit 0 跳过;≥22h、createdAt 无法解析、或查无对应 open PR(孤儿
++        #      分支)→ fail-closed 非零退出,需人工介入(详见 RUNBOOK.md)。
+         run: |
+           set -euo pipefail
+           node scripts/changelog/auto-changelog.mjs publish \
+diff --git a/scripts/changelog/RUNBOOK.md b/scripts/changelog/RUNBOOK.md
+index 618ca7b9..e9c3cea7 100644
+--- a/scripts/changelog/RUNBOOK.md
++++ b/scripts/changelog/RUNBOOK.md
+@@ -85,53 +85,61 @@ node scripts/changelog/auto-changelog.mjs publish --rewrite /tmp/mivo-changelog-
+ 
+ 写回流程：
+ 
+-0. **分支存在性 + 幂等跳过 + 陈旧门**（在建 worktree 之前，任何 git 写动作之前）：先算出目标分支名 `chore/changelog-<最大结算日>`。门查的是**真前置条件**——远端该分支 ref 是否存在，而不只是"有没有 open PR"（open PR 只是代理量，会漏掉两类情形：①`push` 成功但 `gh pr create` 失败，留下有 ref 无 PR 的孤儿分支；②PR 被 close 而非 merge，ref 还在但已查不到 open PR——两种情形下直接 `push` 都会 non-fast-forward 失败）。
+-   - 先 `git ls-remote --heads origin <branch>`（只读查询）：
+-     - 命令本身失败（网络/权限等，非零退出）→ **fail-closed**，不会被误当"ref 不存在"而放行；零 git 写动作。
+-     - 返回空（ref 不存在）→ 继续下面第 1 步，跳过后续 `gh pr list` 查询（无需分类）。
+-     - 返回非空（ref 存在）→ 查 `gh pr list --state open --head <branch> --base main --json number,url,createdAt`（GitHub 的唯一性约束按 (head, base) 对而非裸 head；本项目所有 changelog PR 恒以 `main` 为 base，加 `--base main` 后该 (head, base) 组合方可视为至多一条，不做归属判定——存在就该跳过，不需要知道是谁开的）分类：
+-       - 响应不是合法 JSON、或合法 JSON 但不是数组 → **fail-closed**，stderr 附实际收到的响应；零 git 写动作。
+-       - 数组为空（**孤儿分支**：ref 存在但无对应 open PR）→ **fail-closed**：stderr 说明该分支可能因 PR 被 close，或上次 push 成功后 `gh pr create` 失败而留下孤儿 ref；需人工确认后删除该远程分支或重开 PR；零 git 写动作。**绝不自动删远程分支**——那是本 PR 刻意移除的不可逆远程写，恢复它等于把 #423 的旧毛病搬回来。
+-       - 数组长度 > 1（(head, base) 唯一性假设被打破，理论不该发生，`--base main` 的论证前提失效）→ **fail-closed**：stderr 附全部候选 PR 的链接，需人工核实哪一条才是真正待处理的；零 git 写动作。
+-       - 数组非空 + `createdAt` 可解析且年龄 < 22h → **幂等跳过**：stdout `{"status":"pr-already-open","pr":N,"branch":...,"day":...}`，exit 0，零 git 写动作。
+-       - 数组非空 + `createdAt` 无法解析，或年龄 ≥ 22h → **陈旧门 fail-closed**：非零退出，stderr 说明原因，零 git 写动作，需人工介入合并该 PR。
+-   - 判定顺序：先陈旧（含不可解析、含孤儿分支这两类 fail-closed）后幂等——防止一个卡住多天的 PR 被静默当作"已有人处理"跳过。
++0. **发布前双层门查**（在建 worktree 之前，任何 git 写动作之前；`--dry-run` 也真实执行）：先算出目标分支名 `chore/changelog-<最大结算日>`（记为 `maxDay`）。两道门顺序执行，都在任何 git 写动作之前，任一 fail-closed 都是零 git 写动作：
++
++   **跨日可见性 + 幂等门**（按归属，不按分支名）：`gh pr list --state open --limit 201 --json number,headRefName,createdAt,url,author,headRepositoryOwner`（`--limit 201` = 200 条上限 + 1 条哨兵，用来分辨"恰好 200 条且完整"与"还有更多被截断"——直接把 `--limit` 设成 200 本身会把前者误判成后者）。过滤出 `headRefName` 匹配 `^chore/changelog-` 且**归属**（`author` = `MIVO_CHANGELOG_PR_AUTHOR`/默认 `PraiseZhu`，且 `headRepositoryOwner` = 仓库 owner）校验通过的 PR：
++      - 返回条数 > 200（触到哨兵）→ **fail-closed**：可能有更旧的 changelog PR 被截断在窗口外，需人工核实 `gh pr list --state open --limit 1000 | wc -l`。
++      - 命中任一归属本流程的 open changelog PR（**不论分支名/结算日**，覆盖"前一天分支还开着、今天分支名还没创建过"的跨日缺口——旧代码只按当日分支名判定，这里会在前一天分支未合并时新开第二条 PR，见下方"跨日累积（已解决）"）：
++        - `createdAt` 无法解析，或年龄 ≥ 22h → **fail-closed**：非零退出，需人工处理，可能是 `review-pr` loop 停摆。
++        - 否则（新鲜，< 22h）→ **幂等跳过**：stdout `{"status":"pr-already-open","pr":N,"branch":...,"day":...}`，exit 0，零 git 写动作。
++      - 同名前缀但非本流程归属的 PR（疑似 `MIVO_CHANGELOG_PR_AUTHOR` 与实际创建账号漂移）：只记录可见性——stderr 打印一行 + stdout JSON 附 `unownedChangelogPrs` 字段（数组，每项形如 `#601(author=..., headRepoOwner=...)`），**不认领、不计入陈旧/幂等判定**，也不删除/续接它们。
++
++   **同日分支域门**（核心 fail-closed 前置条件，原样叠加在跨日门之上；只服务 `maxDay` 这一个具体分支名，不做归属判定）：门查的是**真前置条件**——远端该分支 ref 是否存在，而不只是"有没有 open PR"（open PR 只是代理量，会漏掉两类情形：①`push` 成功但 `gh pr create` 失败，留下有 ref 无 PR 的孤儿分支；②PR 被 close 而非 merge，ref 还在但已查不到 open PR——两种情形下直接 `push` 都会 non-fast-forward 失败）。
++      - 先 `git ls-remote --heads origin <branch>`（只读查询）：
++        - 命令本身失败（网络/权限等，非零退出）→ **fail-closed**，不会被误当"ref 不存在"而放行；零 git 写动作。
++        - 返回空（ref 不存在）→ 继续下面第 1 步。
++        - 返回非空（ref 存在）→ 查 `gh pr list --state open --head <branch> --json number,url,createdAt`（同一 head 分支 GitHub 保证至多一条，**不做归属判定**——存在就该跳过，不需要知道是谁开的;这与跨日门的定位不同,跨日门服务跨日判定与可见性,这里是分支名域的最后一道闸)分类：
++          - 响应不是合法 JSON、或合法 JSON 但不是数组 → **fail-closed**，stderr 附实际收到的响应；零 git 写动作。
++          - 数组为空（**孤儿分支**：ref 存在但无对应 open PR）→ **fail-closed**：stderr 说明该分支可能因 PR 被 close，或上次 push 成功后 `gh pr create` 失败而留下孤儿 ref；需人工确认后删除该远程分支或重开 PR；零 git 写动作。**绝不自动删远程分支**——那是本 PR 刻意移除的不可逆远程写，恢复它等于把 #423 的旧毛病搬回来。
++          - 数组长度 > 1（(head, base) 唯一性假设被打破，理论不该发生）→ **fail-closed**：stderr 附全部候选 PR 的链接，需人工核实哪一条才是真正待处理的；零 git 写动作。
++          - 数组非空 + `createdAt` 可解析且年龄 < 22h → **幂等跳过**：stdout `{"status":"pr-already-open","pr":N,"branch":...,"day":...}`，exit 0，零 git 写动作。
++          - 数组非空 + `createdAt` 无法解析，或年龄 ≥ 22h → **陈旧门 fail-closed**：非零退出，stderr 说明原因，零 git 写动作，需人工介入合并该 PR。
++      - 判定顺序：先陈旧（含不可解析、含孤儿分支这两类 fail-closed）后幂等——防止一个卡住多天的 PR 被静默当作"已有人处理"跳过。
+ 1. 从最新 `origin/main` 建临时 worktree `/tmp/mivo-changelog-wt-<pid>`。
+ 2. 合并写回 `public/changelog.json`（同日 entry 合并、`prs` 去重追加、`features` / `fixes` 追加、entries 按 date 降序、`lastGithash`=scan anchor、`updatedAt`=当前本地时间）。
+ 3. 建分支 `chore/changelog-<最大结算日>`，commit `chore: 更新日志补扫 <日期>`。
+-4. `PREFLIGHT_SKIP=1 git push -u origin <branch>`；Actions 里 remote 已用 `MIVO_CHANGELOG_PAT` 配好。
++4. `PREFLIGHT_SKIP=1 git push -u origin <branch> --force-with-lease=<branch>:`；Actions 里 remote 已用 `MIVO_CHANGELOG_PAT` 配好。`--force-with-lease=<branch>:`（空 expect）断言远端该 ref 此刻仍不存在——同日门的 `ls-remote` 检查与这次真正 `push` 之间存在一个不可消除的 check-then-act 窗口，理论上可能有另一进程在窗口期内创建了同名远程分支；不加这道 CAS 且新 ref 恰好是本次 commit 的祖先时，普通 `push` 会静默 fast-forward 改写它。加上后，窗口期竞态会让 `push` 被拒绝（`stale info`）而不是静默改写，同样走 fail-closed，不产生任何删除动作。
+ 5. `gh pr create`。
+ 6. 轮询 CI（`gh pr checks <N> --json name,state`，每 30s，上限 30 分钟）；head 落后先 `gh pr update-branch`。
+ 7. 落地后合规校验（不再门控合并，只确认自动生成的 PR 本身合规）：分支名匹配 `^chore/changelog-`；PR files 仅含 `public/changelog.json`；checks 全 pass；`mergeable=MERGEABLE`。
+ 8. 若上述校验全部通过且 PR 仍有 unresolved review threads，publish 会通过 GraphQL 对每条线程先发可见回复，再 `resolveReviewThread`。回复说明该 PR 是每日更新日志自动补扫产物、只含 `public/changelog.json`、内容经脚本硬校验，并附原评论要点。此逻辑只允许在上述 changelog-only PR 上执行；任何其他分支名或文件集合都会拒绝自动处理。
+ 9. **不在此合并、不删远程分支**：org ruleset `trunk-guard` 的 `code_scanning` 因本仓未开 GHAS 永久等待判 `fail`、持续阻断（`code_quality` 判 `pass` 不阻断；`copilot_code_review`/`pull_request` 是否也阻塞 `mergeStateStatus` 本轮未验证，详见上方 #423 根因说明），以 `main` 为 base 的 PR 在当前配置下持续观察到 `mergeStateStatus=BLOCKED`（#423 根因，见上方说明）。校验全过后 PR 保持 open，交由 `review-pr` 自动审合或人工合并；本脚本只清理本地临时 worktree/分支。
+-10. 收尾：清临时 worktree + 本地分支（失败路径同样清本地 worktree/分支，PR 保留待人工处理；远程分支与 PR 本身均不由本脚本删除/合并）。
++10. 收尾：清临时 worktree + 本地分支。**分支删除只在能验证归属时才执行**（F-W1R4-B1）：早退的跨日门/同日门 fail-closed 在 `existsSync(wtPath)` 自愈判定之前就已 `exit`，不会碰任何本地分支；进入真实执行后，`cleanup()` 侧仅当本轮确实跑过 `worktree add -b`（`worktreeCreated=true`）才清（成功/失败路径共用同一份判据）；自愈路径侧（发现 `wtPath` 路径残留）改查 `git worktree list --porcelain`，只有该路径确实登记为对应目标分支的 worktree（即上一轮本脚本自己建的）才删分支——路径是否存在不能当归属凭证（`process.pid` 会复用）；查不到匹配登记则只清目录（不是 git 对象，清掉总是安全的）、**不删分支**并 fail-closed 中止，避免误删恰好同名的手工分支。远程分支与 PR 本身均不由本脚本删除/合并。
+ 
+ 退出码：
+ 
+-- 0（第 0 步：ref 不存在）→ 正常发布,PR 已开出（不代表已合并），stdout `{"status":"pr-opened","pr":N,"branch":...,"day":...}`。
+-- 0（第 0 步：ref 存在 + 幂等跳过）→ stdout `{"status":"pr-already-open","pr":N,"branch":...,"day":...}`，同名分支已有未过 22h 的 open PR，零 git 写动作。
+-- 非 0（第 0 步：ref 存在但无对应 open PR,孤儿分支）→ stderr 说明（PR 可能被 close，或上次 push 成功后 `gh pr create` 失败），零 git 写动作，需人工确认后删除该远程分支或重开 PR。
+-- 非 0（第 0 步：`gh pr list` 返回 >1 条 open PR，(head, base) 唯一性假设被打破）→ fail-closed，stderr 附全部候选 PR 链接，零 git 写动作，需人工核实。
+-- 非 0（第 0 步：`ls-remote` 查询本身失败,如网络/权限问题）→ fail-closed，不会被误当"ref 不存在"而放行；零 git 写动作。
+-- 非 0（第 0 步：ref 存在 + 陈旧门）→ 同名分支的 open PR 已 ≥22h 未合并、或其 `createdAt` 无法解析，stderr 说明，零 git 写动作，需人工先合并/核实该 PR。
+-- 非 0（第 0 步：`gh pr list` 响应非 JSON 或非数组）→ fail-closed，stderr 附实际收到的响应；零 git 写动作。
++- 0（跨日门：命中归属本流程的 open changelog PR，新鲜）→ 幂等跳过，stdout `{"status":"pr-already-open","pr":N,"branch":...,"day":...}`，零 git 写动作。
++- 0（同日门：ref 不存在）→ 正常发布,PR 已开出（不代表已合并），stdout `{"status":"pr-opened","pr":N,"branch":...,"day":...}`（若跨日门检出非归属同名前缀 PR，会附带 `unownedChangelogPrs` 字段）。
++- 0（同日门：ref 存在 + 幂等跳过）→ stdout `{"status":"pr-already-open","pr":N,"branch":...,"day":...}`，同名分支已有未过 22h 的 open PR（不做归属判定），零 git 写动作。
++- 非 0（跨日门：命中归属本流程的 open changelog PR，陈旧或 `createdAt` 不可解析）→ stderr 说明，零 git 写动作，需人工检查 `review-pr` loop 或直接处理该 PR。
++- 非 0（跨日门：`gh pr list` 用 `--limit 201` 哨兵探测到真实截断，即返回 > 200 条）→ fail-closed，需人工核实 open PR 总数；零 git 写动作。
++- 非 0（同日门：ref 存在但无对应 open PR,孤儿分支）→ stderr 说明（PR 可能被 close，或上次 push 成功后 `gh pr create` 失败），零 git 写动作，需人工确认后删除该远程分支或重开 PR。
++- 非 0（同日门：`gh pr list --head` 返回 >1 条 open PR，(head, base) 唯一性假设被打破）→ fail-closed，stderr 附全部候选 PR 链接，零 git 写动作，需人工核实。
++- 非 0（同日门：`ls-remote` 查询本身失败,如网络/权限问题）→ fail-closed，不会被误当"ref 不存在"而放行；零 git 写动作（跨日门若已放行,此前那一次 gh 调用已完成,只是零 git 写动作）。
++- 非 0（同日门：ref 存在 + 陈旧门）→ 同名分支的 open PR 已 ≥22h 未合并、或其 `createdAt` 无法解析，stderr 说明，零 git 写动作，需人工先合并/核实该 PR。
++- 非 0（同日门：`gh pr list --head` 响应非 JSON 或非数组）→ fail-closed，stderr 附实际收到的响应；零 git 写动作。
++- 非 0（自愈路径发现残留 `wtPath` 但未在 `git worktree list --porcelain` 里对应目标分支——可能是 pid 撞值或残留目录，F-W1R4-B1）→ fail-closed：**不删除**同名本地分支，stderr 说明来源核实建议；目录本身仍会被清理（不是 git 对象，清掉总是安全的），零 git 写删除动作（分支侧）。
++- 非 0（真正 push 时命中窗口期竞态：`--force-with-lease` 断言失败）→ stderr 含 git 报错原文（`stale info` 等），零删除动作，需人工核实该远程 ref 的来源。
+ - 非 0（喂入空 scan，如 `{"status":"empty"}` / `items:[]`）→ **实测 rc=1、stdout 为空**，在 `buildScanBaseline` 处直接崩溃退出（"scan 产物无 items"）；这不是 publish 自身设计的正常状态，正常运行下 workflow 的 `if: steps.scan.outputs.empty != 'true'` 会在 scan 报告 empty 时直接跳过整个 publish 步骤，不会走到这里。**不要**把 scan 子命令的 `{"status":"empty"}`（那是 scan 自己的正常退出态，见上文第 1 节）误当成 publish 的退出码——两者是不同子命令，历史版本此处曾混淆过。
+ - 非 0（其他失败，如真实 CI 失败/超时/合规校验不过）→ stderr 有原因，workflow 红灯；若 PR 已创建则保留待人工处理。
+ 
+-可选参数：`--scan <path>`（默认 `/tmp/mivo-changelog-scan.json`）、`--dry-run`（校验 + 打印计划命令，不执行 git/gh **写**操作）。注意：第 0 步的 `git ls-remote` 与（ref 存在时的）`gh pr list` 都是只读调用，`--dry-run` 也会真实执行它们——若目标分支 ref 已存在，`--dry-run` 会直接输出幂等跳过/陈旧门/孤儿分支的判定结果（同上）而不是打印计划命令；只有 ref 不存在时才继续演算合并结果与命令计划。
++可选参数：`--scan <path>`（默认 `/tmp/mivo-changelog-scan.json`）、`--dry-run`（校验 + 打印计划命令，不执行 git/gh **写**操作）。注意：跨日门的 `gh pr list` 与同日门的 `git ls-remote` 及（ref 存在时的）`gh pr list --head` 都是只读调用，`--dry-run` 也会真实执行它们——若任一门判定为跳过/fail-closed，`--dry-run` 会直接输出该判定结果（同上）而不是打印计划命令；只有两道门都放行时才继续演算合并结果与命令计划。
+ 
+-## 跨日累积（已知残余风险，本轮未消除）
++## 跨日累积（已解决；遗留一条已披露的历史残余风险）
+ 
+-第 0 步的分支存在性 + 幂等/陈旧门只按**分支名**（即待补最大结算日 `maxDay`）判定，不做跨天归并：
++`fix/changelog-publish-blocked-merge` 加入的跨日可见性 + 幂等门解决了下面这条根因：旧版判定只按**分支名**（即待补最大结算日 `maxDay`）匹配，不做跨天归并——若前一天开出的 changelog PR（分支 `chore/changelog-<D>`）尚未合并，同时又有新的真实功能 PR 在 `D+1` 天落地，`maxDay` 会推进到 `D+1`、算出不同的分支名，旧版查无该 ref 会照常再开一条新 PR，两条 PR 的条目部分重叠。现在跨日门按**归属**（不按分支名）扫描所有 open changelog PR，命中前一天仍 open 的那条即幂等跳过或翻红，不会新开第二条。
+ 
+-- 若前一天开出的 changelog PR（分支 `chore/changelog-<D>`）尚未合并，同时又有新的真实功能 PR 在 `D+1` 天落地，下一次 run 算出的 `maxDay` 会推进到 `D+1`，算出**不同的分支名** `chore/changelog-<D+1>`——第 0 步查询的是这个新分支名，查无该 ref，会照常再开一条新 PR。
+-- 这条新 PR 的条目会与前一条**部分重叠**：main 上的 `lastGithash` 只在前一条 PR 被合并后才前进，所以新 scan 会重新扫出前一条还未落地的所有旧条目，加上新落地的条目一起打包。
+-- 因此可能同时存在**多条 open 的 changelog PR**，覆盖范围互相重叠。
+-
+-**最后一步后果（本轮新增披露）**：这些重叠的 open PR 中，**任一被合并进 `main` 后，其余 PR 会永久变成 `mergeStateStatus=CONFLICTING`**——已实测验证：两条基于同一旧 `main` 的 changelog 分支各自新增不同日期的 entry 后，先合并其中一条，另一条对新 `main` 跑 `git merge-tree` 直接产出 `CONFLICT (content): Merge conflict in public/changelog.json`（`entries` 数组的文本插入位置重叠，Git 三方合并判定为冲突，不会自动解决）。脚本与 workflow 目前都**没有**检测/关闭/刷新这些永久冲突 PR 的路径——它们会一直挂在 open 列表里，占着一个已经不可能被干净合并的名额，需要人工发现并手动关闭。这也是本轮把 CA-2 由 blocker 降为已披露残余风险的依据。
+-
+-跨日幂等键（按待补范围而非单纯分支名去重/合并）不在本 PR 范围内，属姊妹分支 `fix/changelog-publish-blocked-merge` 的规划范围。
++**历史残余（本轮未处理，已知且已披露）**：若在本修复合入**之前**已经产生了重叠的 open PR，其中**任一被合并进 `main` 后，其余 PR 会永久变成 `mergeStateStatus=CONFLICTING`**——已实测验证：两条基于同一旧 `main` 的 changelog 分支各自新增不同日期的 entry 后，先合并其中一条，另一条对新 `main` 跑 `git merge-tree` 直接产出 `CONFLICT (content): Merge conflict in public/changelog.json`（`entries` 数组的文本插入位置重叠，Git 三方合并判定为冲突，不会自动解决）。脚本与 workflow 目前都**没有**检测/关闭/刷新这些永久冲突 PR 的路径——它们会一直挂在 open 列表里，占着一个已经不可能被干净合并的名额，需要人工发现并手动关闭。本轮修复防止新增此类冲突，但不回溯清理已存在的。
+ 
+ ## 关于 `PREFLIGHT_SKIP=1`
+ 
+diff --git a/scripts/changelog/auto-changelog.mjs b/scripts/changelog/auto-changelog.mjs
+index b07764d9..b42e0e9b 100644
+--- a/scripts/changelog/auto-changelog.mjs
++++ b/scripts/changelog/auto-changelog.mjs
+@@ -5,13 +5,25 @@
+ // 只留"口语化改写"一步直调 OpenAI-compatible LLM 网关。三步编排:
+ //   1. scan    — fetch + git log 差集 + 归天,产出 /tmp/mivo-changelog-scan.json
+ //   2. rewrite — 按 REWRITE_PROMPT.md 调 LLM 只产出 PR→文案映射
+-//   3. publish — 确定性组装 date/by/kind/prs + 建临时 worktree + 合并写回 changelog.json + 开 PR + 轮询 CI +
+-//      线程清理(不合并、不删远程分支:org ruleset trunk-guard(实测 6 条规则)要求的 code_scanning/
+-//      code_quality 两项必需 check 里,已确认阻断的是 code_scanning(本仓未开 GHAS 永久等待判 fail、
+-//      持续阻断),code_quality 判 pass 不阻断;copilot_code_review/pull_request 是否也阻塞
++//   3. publish — 确定性组装 date/by/kind/prs + 发布前双层门查 + 建临时 worktree + 合并写回
++//      changelog.json + 开 PR + 轮询 CI + 落地后合规校验 + 线程清理(不合并、不删远程分支:
++//      org ruleset trunk-guard(实测 6 条规则)要求的 code_scanning/code_quality 两项必需
++//      check 里,已确认阻断的是 code_scanning(本仓未开 GHAS 永久等待判 fail、持续阻断),
++//      code_quality 判 pass 不阻断;copilot_code_review/pull_request 是否也阻塞
+ //      mergeStateStatus 本轮未验证。导致以 main 为 base 的 PR 在当前配置下持续观察到
+ //      mergeStateStatus=BLOCKED,详见 #423 与 ./RUNBOOK.md;PR 保持 open,交由 review-pr
+ //      自动审合或人工合并)
++//      发布前双层门查(建 worktree 之前,任何 git 写动作之前,dry-run 也真实执行):
++//        (a) 跨日可见性+幂等:按归属(author+headRepositoryOwner)过滤的 open changelog
++//            PR 集合,不按分支名匹配——覆盖"前一天分支还开着、今天分支名还没创建过"的
++//            跨日缺口(旧代码会在此新开第二条 PR)。命中陈旧(≥22h 或 createdAt 不可
++//            解析)fail-closed;命中新鲜幂等跳过。非本流程归属的同名前缀 PR 只记录
++//            可见性(疑似 CHANGELOG_PR_EXPECTED_AUTHOR 账号漂移),不认领、不计入判定。
++//        (b) 同日分支域门:真前置条件——远端目标分支 ref 是否存在,而非仅"有没有 open
++//            PR"。ref 不存在才继续;ref 存在则精确按 head 查 open PR,孤儿分支(无对应
++//            open PR)与陈旧同样 fail-closed,不做归属判定——同名分支上存在任何 open
++//            PR 都该跳过,不需要知道是谁开的。遇到无法归属的远程 ref 一律只报告、不
++//            删除、不续接(分支名不是创建凭证,不可逆远程删除交给人工确认)。
+ //
+ // 语义规格见 .claude/skills/generate-changelog/SKILL.md(机械步骤已由本脚本承载,
+ // skill 仅保留 SOP 作为语义说明)。运行手册见 ./RUNBOOK.md。
+@@ -19,7 +31,7 @@
+ // 零 npm 依赖,只用 node 内置(fetch) + child_process 调 git/gh。Node ≥18。
+ // 退出码:0=成功(含空跑);非 0=失败(stderr 打印原因,GitHub Actions run 红灯通知)。
+ 
+-import { readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs'
++import { readFileSync, writeFileSync, existsSync, rmSync, realpathSync } from 'node:fs'
+ import { execFileSync } from 'node:child_process'
+ import { join, resolve, dirname } from 'node:path'
+ import { fileURLToPath } from 'node:url'
+@@ -76,7 +88,8 @@ const AUTO_RESOLVE_MARKER = 'changelog 自动补扫线程自清'
+ // 分立(勿混用):①名义口径 24h−22h=2h00m;②最坏抖动口径(保守值,触发阈值判定用这个)
+ // 23h53m18s−22h=1h53m18s;③复现样本口径 24h05m51s−22h=2h05m51s(24h05m51s 只是落在
+ // 抖动区间内的一个例证,不是余量计算的起点)。健康路径侧余量 ~2h20m,双侧数量级一致;
+-// 不做成可配置项。
++// 不做成可配置项。跨日可见性门(下方 listOpenChangelogPrs 的陈旧判定)与同日分支域门共用
++// 同一个阈值——两者本质是同一个"open PR 允许存活多久"的判断,不应各自定义互相冲突的阈值。
+ //
+ // cron 抖动的残余风险(两个方向都存在,未消除):
+ // - fail-open 方向(静默期侧):若首实例创建被延迟超过保守口径 ~1h53m18s 而次日 run 准点,
+@@ -179,41 +192,55 @@ const classifyKind = (subject) => {
+   return 'fixes'
+ }
+ 
+-// ---- 子进程封装 ----
++// ---- 子进程封装(可注入,供测试替换真实 git/gh 调用)----
+ // opts.allowFail:出错返回 null 而非抛异常(供降级路径)
+ // opts.cwd:默认 REPO_ROOT;worktree 内操作用 git -C <path> 切换更可靠
+ // opts.env:额外环境变量(如 PREFLIGHT_SKIP)
+-const runGit = (args, opts = {}) => {
+-  try {
+-    return execFileSync('git', args, {
+-      cwd: opts.cwd ?? REPO_ROOT,
+-      encoding: 'utf8',
+-      stdio: ['ignore', 'pipe', 'pipe'],
+-      env: opts.env ? { ...process.env, ...opts.env } : process.env,
+-    }).trimEnd()
+-  } catch (err) {
+-    if (opts.allowFail) return null
+-    const stderr = err.stderr ? err.stderr.toString().trim() : ''
+-    const msg = `git ${args.join(' ')} 失败(退出码 ${err.status ?? '?'}): ${err.message}${stderr ? ` | stderr: ${stderr}` : ''}`
+-    throw new Error(msg)
+-  }
+-}
+-
+-const runGh = (args, opts = {}) => {
+-  try {
+-    return execFileSync('gh', args, {
+-      cwd: opts.cwd ?? REPO_ROOT,
+-      encoding: 'utf8',
+-      stdio: ['ignore', 'pipe', 'pipe'],
+-      env: opts.env ? { ...process.env, ...opts.env } : process.env,
+-    }).trimEnd()
+-  } catch (err) {
+-    if (opts.allowFail) return null
+-    const stderr = err.stderr ? err.stderr.toString().trim() : ''
+-    const msg = `gh ${args.join(' ')} 失败(退出码 ${err.status ?? '?'}): ${err.message}${stderr ? ` | stderr: ${stderr}` : ''}`
+-    throw new Error(msg)
+-  }
+-}
++// createRealDeps() 是工厂函数,每次调用产出一份新的 { runGit, runGh, now, exit } 实现——
++// 不再导出可被外部直接改写的全局可变单例(W1R2 三审共识,CODEX-004/F-W1R2-06)。
++// cmdScan/cmdRewrite/cmdPublish 与其内部辅助函数都显式接收 deps 参数:main() 用一份自己
++// 持有的默认实例;scripts/changelog/auto-changelog.test.mjs 每个用例各建一份假实现,
++// 互不影响、互不泄漏,无需再在 afterEach 里回填"原始 deps"。
++export const createRealDeps = () => ({
++  runGit: (args, opts = {}) => {
++    try {
++      return execFileSync('git', args, {
++        cwd: opts.cwd ?? REPO_ROOT,
++        encoding: 'utf8',
++        stdio: ['ignore', 'pipe', 'pipe'],
++        env: opts.env ? { ...process.env, ...opts.env } : process.env,
++      }).trimEnd()
++    } catch (err) {
++      if (opts.allowFail) return null
++      const stderr = err.stderr ? err.stderr.toString().trim() : ''
++      const msg = `git ${args.join(' ')} 失败(退出码 ${err.status ?? '?'}): ${err.message}${stderr ? ` | stderr: ${stderr}` : ''}`
++      throw new Error(msg)
++    }
++  },
++  runGh: (args, opts = {}) => {
++    try {
++      return execFileSync('gh', args, {
++        cwd: opts.cwd ?? REPO_ROOT,
++        encoding: 'utf8',
++        stdio: ['ignore', 'pipe', 'pipe'],
++        env: opts.env ? { ...process.env, ...opts.env } : process.env,
++      }).trimEnd()
++    } catch (err) {
++      if (opts.allowFail) return null
++      const stderr = err.stderr ? err.stderr.toString().trim() : ''
++      const msg = `gh ${args.join(' ')} 失败(退出码 ${err.status ?? '?'}): ${err.message}${stderr ? ` | stderr: ${stderr}` : ''}`
++      throw new Error(msg)
++    }
++  },
++  now: () => Date.now(),
++  // 时区解析下沉到 deps 构造时刻(一次性求值,与 Intl 的进程级缓存语义一致),而不是在
++  // assertChangelogTimeZone 里直接调 Intl——让测试可以注入任意时区,不再被运行进程的
++  // 真实 TZ 环境变量牵着走(W1R3 blocker,W1R3-UP-01)。生产行为不变:仍是 Intl 解析结果。
++  timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
++  // fail() 路径的唯一出口;测试把它换成"抛一个带 code 的可捕获信号"而不是真的杀掉进程,
++  // 否则 vitest worker 会被 process.exit 一起带走。
++  exit: (code) => process.exit(code),
++})
+ 
+ const REVIEW_THREADS_QUERY = `
+ query($owner: String!, $name: String!, $number: Int!, $after: String) {
+@@ -266,13 +293,13 @@ mutation($threadId: ID!) {
+ }
+ `
+ 
+-const runGhGraphql = (query, variables, opts = {}) => {
++const runGhGraphql = (query, variables, opts, deps) => {
+   const args = ['api', 'graphql', '-f', `query=${query}`]
+   for (const [key, value] of Object.entries(variables || {})) {
+     if (value === undefined || value === null) continue
+     args.push('-F', `${key}=${value}`)
+   }
+-  const out = runGh(args, opts)
++  const out = deps.runGh(args, opts)
+   try {
+     return JSON.parse(out)
+   } catch (err) {
+@@ -280,7 +307,7 @@ const runGhGraphql = (query, variables, opts = {}) => {
+   }
+ }
+ 
+-const fetchReviewThreads = (prNumber, opts = {}) => {
++const fetchReviewThreads = (prNumber, opts, deps) => {
+   const threads = []
+   let after = null
+   for (;;) {
+@@ -293,6 +320,7 @@ const fetchReviewThreads = (prNumber, opts = {}) => {
+         after,
+       },
+       opts,
++      deps,
+     )
+     const pullRequest = data?.data?.repository?.pullRequest
+     if (!pullRequest) {
+@@ -356,7 +384,7 @@ const buildAutoResolveReply = (summary) => (
+   `原评论要点：${summary}`
+ )
+ 
+-const resolveChangelogReviewThreads = ({ prNumber, headRefName, files, cwd }) => {
++const resolveChangelogReviewThreads = ({ prNumber, headRefName, files, cwd }, deps) => {
+   if (!headRefName || !/^chore\/changelog-/.test(headRefName)) {
+     throw new Error(`线程清理拒绝执行:headRefName=${headRefName} 不匹配 ^chore/changelog-`)
+   }
+@@ -365,7 +393,7 @@ const resolveChangelogReviewThreads = ({ prNumber, headRefName, files, cwd }) =>
+     throw new Error(`线程清理拒绝执行:PR files 非 changelog-only,files=[${files.join(', ')}]`)
+   }
+ 
+-  const unresolved = fetchReviewThreads(prNumber, { cwd }).filter((thread) => !thread.isResolved)
++  const unresolved = fetchReviewThreads(prNumber, { cwd }, deps).filter((thread) => !thread.isResolved)
+   if (unresolved.length === 0) {
+     process.stderr.write(`[auto-changelog] PR #${prNumber} 无 unresolved review thread\n`)
+     return
+@@ -391,6 +419,7 @@ const resolveChangelogReviewThreads = ({ prNumber, headRefName, files, cwd }) =>
+           body: replyBody,
+         },
+         { cwd },
++        deps,
+       )
+     }
+     runGhGraphql(
+@@ -399,6 +428,7 @@ const resolveChangelogReviewThreads = ({ prNumber, headRefName, files, cwd }) =>
+         threadId: thread.id,
+       },
+       { cwd },
++      deps,
+     )
+     process.stderr.write(`[auto-changelog] 已回复并 resolve review thread ${thread.id}\n`)
+   }
+@@ -430,16 +460,22 @@ const parseArgs = (argv) => {
+   return out
+ }
+ 
+-const fail = (msg, code = 1) => {
++// deps 显式作第一参:每个调用方自己持有的实例,不读任何模块级可变单例。
++const fail = (deps, msg, code = 1) => {
+   process.stderr.write(`[auto-changelog] 错误: ${msg}\n`)
+-  process.exit(code)
++  deps.exit(code)
+ }
+ 
+-const assertChangelogTimeZone = () => {
+-  const resolved = Intl.DateTimeFormat().resolvedOptions().timeZone
++// 时区不变量下沉到每个命令入口(cmdScan/cmdRewrite/cmdPublish)各自调用,不再只在 CLI
++// main() 里守一次——直接 import 后调用导出函数(如测试之外的未来 in-process 调用方)同样
++// 会被这道 fail-closed 前置门拦住,不会绕过归天/updatedAt 依赖的本地时区假设(W1R2 三审共识,
++// CODEX-004/F-W1R2-06)。
++const assertChangelogTimeZone = (deps) => {
++  const resolved = deps.timeZone
+   const envTz = process.env.TZ || ''
+   if (resolved === CHANGELOG_TIME_ZONE) return
+   fail(
++    deps,
+     `更新日志归天必须在 ${CHANGELOG_TIME_ZONE} 时区运行;当前 Intl timeZone=${resolved || '(unknown)'},TZ=${envTz || '(unset)'}。` +
+       `请设置 TZ=${CHANGELOG_TIME_ZONE} 后再运行。`,
+   )
+@@ -697,19 +733,20 @@ const chatCompletions = async ({ apiBase, key, model, messages, timeoutMs }) =>
+ }
+ 
+ // ====================== scan ======================
+-const cmdScan = (args) => {
++export const cmdScan = (args, deps = createRealDeps()) => {
++  assertChangelogTimeZone(deps)
+   const anchorOverride = args.anchor
+   const output = args.output || SCAN_OUTPUT_DEFAULT
+   const doFetch = args.fetch !== false && args['no-fetch'] !== true
+ 
+   if (doFetch) {
+     process.stderr.write('[auto-changelog] git fetch origin main...\n')
+-    runGit(['fetch', 'origin', 'main'])
++    deps.runGit(['fetch', 'origin', 'main'])
+   }
+ 
+   const changelogPath = join(REPO_ROOT, CHANGELOG_REL)
+   if (!existsSync(changelogPath)) {
+-    fail(`找不到 ${changelogPath}(请在仓库内运行)`)
++    fail(deps, `找不到 ${changelogPath}(请在仓库内运行)`)
+   }
+   const changelog = JSON.parse(readFileSync(changelogPath, 'utf8'))
+ 
+@@ -717,14 +754,14 @@ const cmdScan = (args) => {
+   const historical = Boolean(anchorOverride)
+   const anchor = anchorOverride || changelog.lastGithash
+   if (!anchor) {
+-    fail('changelog.json 缺少 lastGithash,且未传 --anchor')
++    fail(deps, 'changelog.json 缺少 lastGithash,且未传 --anchor')
+   }
+ 
+-  const originMain = runGit(['rev-parse', 'origin/main'])
++  const originMain = deps.runGit(['rev-parse', 'origin/main'])
+ 
+   // 必须用 NUL 切分防 subject 含竖线/换行被截断。
+   // 格式:%H%x00%cI%x00%an%x00%s%x00%x00 (每条记录以双 NUL 结尾)
+-  const raw = runGit([
++  const raw = deps.runGit([
+     'log', '--first-parent',
+     '--format=%H%x00%cI%x00%an%x00%s%x00%x00',
+     `${anchor}..origin/main`,
+@@ -770,7 +807,7 @@ const cmdScan = (args) => {
+       pr = Number(merge[1])
+       // merge 形态:git 侧回退作者取被合并分支 tip 作者(<merge>^2),作为
+       // PR opener(gh)取不到时的降级值(squash 形态无 ^2,直接用 %an)
+-      const branchAuthor = runGit(['log', '-1', '--format=%an', `${hash}^2`], { allowFail: true })
++      const branchAuthor = deps.runGit(['log', '-1', '--format=%an', `${hash}^2`], { allowFail: true })
+       if (branchAuthor) author = branchAuthor
+     } else {
+       // 非 PR 落地(直推/其他),跳过
+@@ -789,7 +826,7 @@ const cmdScan = (args) => {
+     //   ^2 作者(merge 形态分支 tip) / %an(squash)。gh 一次取 body+author,
+     //   零额外网络开销;gh 失败则沿用上面算好的 git 作者。
+     let body = ''
+-    const prJson = runGh(['pr', 'view', String(pr), '--json', 'body,author'], { allowFail: true })
++    const prJson = deps.runGh(['pr', 'view', String(pr), '--json', 'body,author'], { allowFail: true })
+     if (prJson) {
+       try {
+         const pv = JSON.parse(prJson)
+@@ -825,7 +862,8 @@ const cmdScan = (args) => {
+ }
+ 
+ // ====================== rewrite ======================
+-const cmdRewrite = async (args) => {
++export const cmdRewrite = async (args, deps = createRealDeps()) => {
++  assertChangelogTimeZone(deps)
+   const scanPath = args.scan || SCAN_OUTPUT_DEFAULT
+   const output = args.output || REWRITE_OUTPUT_DEFAULT
+   const model = args.model || process.env.MIVO_CHANGELOG_LLM_MODEL || process.env.MIVO_LLM_MODEL || LLM_MODEL_DEFAULT
+@@ -841,25 +879,25 @@ const cmdRewrite = async (args) => {
+     : REWRITE_TIMEOUT_MS_DEFAULT
+ 
+   if (!existsSync(scanPath)) {
+-    fail(`scan 产物不存在: ${scanPath}(请先跑 scan)`)
++    fail(deps, `scan 产物不存在: ${scanPath}(请先跑 scan)`)
+   }
+   if (!key) {
+-    fail('缺少 LLM key:请设置 MIVO_CHANGELOG_LLM_KEY(或本地调试用 MIVO_LLM_API_KEY)')
++    fail(deps, '缺少 LLM key:请设置 MIVO_CHANGELOG_LLM_KEY(或本地调试用 MIVO_LLM_API_KEY)')
+   }
+   if (!/^sk-[\x21-\x7e]+$/.test(key)) {
+-    fail('LLM key 格式无效:需以 sk- 开头且不含空格/中文')
++    fail(deps, 'LLM key 格式无效:需以 sk- 开头且不含空格/中文')
+   }
+ 
+   const scan = readJsonFile(scanPath, 'scan 产物')
+   try {
+     buildScanBaseline(scan)
+   } catch (err) {
+-    fail(err.message)
++    fail(deps, err.message)
+   }
+ 
+   const promptTemplatePath = join(REPO_ROOT, REWRITE_PROMPT_REL)
+   if (!existsSync(promptTemplatePath)) {
+-    fail(`找不到改写 prompt:${promptTemplatePath}`)
++    fail(deps, `找不到改写 prompt:${promptTemplatePath}`)
+   }
+   const promptTemplate = readFileSync(promptTemplatePath, 'utf8')
+   const rewritePayload = buildRewritePromptPayload(scan)
+@@ -890,7 +928,7 @@ const cmdRewrite = async (args) => {
+       lastValidationError = err.message
+       process.stderr.write(`[auto-changelog] rewrite 第 ${attempt} 次调用/解析失败:${err.message}\n`)
+       if (attempt === totalAttempts) {
+-        fail(`rewrite 失败,已重试 ${REWRITE_MAX_RETRIES} 次:${err.message}`)
++        fail(deps, `rewrite 失败,已重试 ${REWRITE_MAX_RETRIES} 次:${err.message}`)
+       }
+       continue
+     }
+@@ -910,26 +948,118 @@ const cmdRewrite = async (args) => {
+       lastValidationError = err.message
+       process.stderr.write(`[auto-changelog] rewrite 第 ${attempt} 次校验失败:${err.message}\n`)
+       if (attempt === totalAttempts) {
+-        fail(`rewrite 产物仍未通过校验,已重试 ${REWRITE_MAX_RETRIES} 次:${err.message}`)
++        fail(deps, `rewrite 产物仍未通过校验,已重试 ${REWRITE_MAX_RETRIES} 次:${err.message}`)
+       }
+     }
+   }
+ }
+ 
++// ---- 跨日可见性 + 幂等(SC-W1-06/SC-W1-05,W1R2 三审共识修正):本脚本自己开的
++// changelog-only PR 分支名恒为 chore/changelog-<结算日>,分支名前缀只是第一层筛选;真正
++// 的归属判据是 author + headRepositoryOwner——分支名不是创建凭证,不能单靠命名就认领
++// (v2-CODEX-002)。本节只服务"跨日"判定与"归属漂移可见性",不替代下面 cmdPublish 里
++// 同日分支域门(核心保护、不做归属判定,详见该函数注释)。----
++const CHANGELOG_PR_HEAD_RE = /^chore\/changelog-/
++// 陈旧门复用 PUBLISH_PR_STALE_HOURS(见文件顶部常量及其双区间实测依据)——跨日可见性门与
++// 下方 cmdPublish 里的同日分支域门本质是同一个"open PR 允许存活多久"的判断,统一成一个
++// 常量、一份实现,不各自定义互相冲突的阈值。
++const STALE_OPEN_PR_MS = PUBLISH_PR_STALE_HOURS * HOUR_MS
++// gh pr list 默认 --limit 30 会静默截断(v2-CODEX-001/v1-F-W1R2-02/v3-UP-W1R2-01)。用
++// "上限+1"作哨兵探测真实截断,而不是直接把 --limit 设成上限值本身——否则"恰好 200 条且
++// 完整"与"还有更多被截断在窗口外"两种情况都会读到 200 条,结构上无法区分,前者会被
++// 误判为截断而 fail-closed(W1R3 三审共识,F-W1R3-05)。
++const OPEN_PR_LIST_LIMIT = 200
++const OPEN_PR_LIST_SENTINEL_LIMIT = OPEN_PR_LIST_LIMIT + 1
++// 本流程通过 fine-grained PAT 创建 PR,PR 的 GitHub author 恒为该 PAT 绑定账号;允许 env
++// 覆盖,避免账号更换时需要改代码。
++const CHANGELOG_PR_EXPECTED_AUTHOR = process.env.MIVO_CHANGELOG_PR_AUTHOR || 'PraiseZhu'
++
++const isOwnedChangelogPr = (pr) =>
++  Boolean(pr) &&
++  pr.author?.login === CHANGELOG_PR_EXPECTED_AUTHOR &&
++  pr.headRepositoryOwner?.login === REPO_OWNER
++
++const describePrForLog = (pr) =>
++  `#${pr.number}(author=${pr.author?.login ?? '?'}, headRepoOwner=${pr.headRepositoryOwner?.login ?? '?'})`
++
++// 拉全部 open PR(用哨兵 limit 探测截断),过滤出分支名匹配 chore/changelog-* 且归属校验
++// (author + headRepositoryOwner)通过的 PR。非本流程归属的同名前缀 PR 单独返回
++// (unowned)供调用方写入可见性字段——只记录、不认领、不计入陈旧/幂等判定(v2-CODEX-002;
++// F-W1R3-04:CHANGELOG_PR_EXPECTED_AUTHOR 账号漂移时,历史 PR 全部落入这一桶,必须可见
++// 而不是只在 stderr 文本里一带而过)。
++const listOpenChangelogPrs = (opts, deps) => {
++  const out = deps.runGh(
++    [
++      'pr', 'list', '--state', 'open', '--limit', String(OPEN_PR_LIST_SENTINEL_LIMIT),
++      '--json', 'number,headRefName,createdAt,url,author,headRepositoryOwner',
++    ],
++    opts,
++  )
++  let list
++  try {
++    list = JSON.parse(out)
++  } catch (err) {
++    throw new Error(`gh pr list --json 解析失败: ${err.message}`)
++  }
++  if (!Array.isArray(list)) {
++    throw new Error(`gh pr list --json 未返回数组: ${trimForError(out)}`)
++  }
++  if (list.length > OPEN_PR_LIST_LIMIT) {
++    throw new Error(
++      `gh pr list 用 --limit ${OPEN_PR_LIST_SENTINEL_LIMIT} 哨兵探测返回 ${list.length} 条(超过 ${OPEN_PR_LIST_LIMIT} 条上限),` +
++        '不能当完整 open PR 集合用——可能有更旧的 changelog PR 被截断在窗口外,导致陈旧/幂等判定漏检。请人工核实 open PR 总数' +
++        `(gh pr list --state open --limit 1000 | wc -l)后处理,不要在集合可能不完整时继续发布。`,
++    )
++  }
++  const changelogPrs = list.filter((pr) => CHANGELOG_PR_HEAD_RE.test(pr.headRefName || ''))
++  const owned = changelogPrs.filter(isOwnedChangelogPr)
++  const unowned = changelogPrs.filter((pr) => !isOwnedChangelogPr(pr))
++  if (unowned.length > 0) {
++    process.stderr.write(
++      `[auto-changelog] 发现 ${unowned.length} 条同名前缀但非本流程归属的 open PR,已排除出陈旧/幂等判定` +
++        `(疑似 CHANGELOG_PR_EXPECTED_AUTHOR=${CHANGELOG_PR_EXPECTED_AUTHOR} 与实际创建账号漂移,请核实): ` +
++        `${unowned.map(describePrForLog).join('; ')}\n`,
++    )
++  }
++  return { owned, unowned }
++}
++
++// `git worktree list --porcelain` 的最简解析:每个 worktree 一个块,以空行分隔;块内
++// 'worktree <path>' 起头,'branch refs/heads/<name>' 给出该 worktree 当前签出的分支
++// (detached 时无此行)。供 F-W1R4-B1 的自愈路径归属核验用:只有这份注册表能证明"某
++// 路径确实是本脚本此前 `worktree add -b <branch> <path>` 建立的"——路径是否存在本身
++// 不能当凭证(process.pid 会复用)。
++const parseWorktreeListPorcelain = (raw) => {
++  const entries = []
++  let current = null
++  for (const line of raw.split('\n')) {
++    if (line.startsWith('worktree ')) {
++      current = { path: line.slice('worktree '.length) }
++      entries.push(current)
++    } else if (current && line.startsWith('branch ')) {
++      current.branch = line.slice('branch '.length)
++    } else if (line === '') {
++      current = null
++    }
++  }
++  return entries
++}
++
+ // ====================== publish ======================
+-const cmdPublish = async (args) => {
++export const cmdPublish = async (args, deps = createRealDeps()) => {
++  assertChangelogTimeZone(deps)
+   const dryRun = args['dry-run'] === true
+   const rewritePath = args.rewrite
+   const scanPath = args.scan || SCAN_OUTPUT_DEFAULT
+ 
+   if (!rewritePath) {
+-    fail('publish 需要 --rewrite <path>(LLM 改写产物 JSON)')
++    fail(deps, 'publish 需要 --rewrite <path>(LLM 改写产物 JSON)')
+   }
+   if (!existsSync(rewritePath)) {
+-    fail(`改写产物不存在: ${rewritePath}`)
++    fail(deps, `改写产物不存在: ${rewritePath}`)
+   }
+   if (!existsSync(scanPath)) {
+-    fail(`scan 产物不存在: ${scanPath}(请先跑 scan)`)
++    fail(deps, `scan 产物不存在: ${scanPath}(请先跑 scan)`)
+   }
+ 
+   // ---- 1. 读 scan 产物(提供 PR 集合基准)----
+@@ -939,7 +1069,7 @@ const cmdPublish = async (args) => {
+     scan = readJsonFile(scanPath, 'scan 产物')
+     baseline = buildScanBaseline(scan)
+   } catch (err) {
+-    fail(err.message)
++    fail(deps, err.message)
+   }
+   const { scanAnchor } = baseline
+ 
+@@ -950,12 +1080,9 @@ const cmdPublish = async (args) => {
+     rewrite = readJsonFile(rewritePath, '改写产物')
+     assembled = assembleRewriteEntries(scan, rewrite)
+   } catch (err) {
+-    fail(err.message)
++    fail(deps, err.message)
+   }
+ 
+-  // ---- 3. 计算合并后的 changelog(纯逻辑,安全)----
+-  // 从最新 origin/main 建临时 worktree,在其上读 changelog.json 再合并写回。
+-  // dry-run 时只算合并结果 + 打印计划命令,不执行 git/gh 写操作。
+   const maxDay = assembled.entries
+     .map((e) => e.date)
+     .sort()
+@@ -963,23 +1090,78 @@ const cmdPublish = async (args) => {
+   const branch = `chore/changelog-${maxDay}`
+   const wtPath = `/tmp/mivo-changelog-wt-${process.pid}`
+ 
+-  // ---- 3.5 分支存在性 + 幂等跳过 + 陈旧门(在任何 git 写动作之前,含 dry-run 的 worktree add 之前)----
+-  // 门查的是真前置条件——远端分支 ref 是否存在,而非仅"有没有 open PR"(open PR 只是代理量,
+-  // 会漏掉两类情形:①push 成功但 gh pr create 失败,留下有 ref 无 PR 的孤儿分支;②PR 被
+-  // close 而非 merge,ref 还在但已查不到 open PR)。两种情形下直接 push 都会 non-fast-forward
+-  // 失败,需人工介入,不能静默放行。
+-  // git ls-remote 是只读查询:对"ref 不存在"返回空 stdout + exit 0;只有真失败(网络/权限等)
+-  // 才非零退出——两者天然可辨,故不用 allowFail,让真失败按 runGh/runGit 默认行为向上抛出,
++  // ---- 跨日可见性 + 幂等门(增量,在任何 git 写动作之前,dry-run 也真实执行)----
++  // 按归属过滤后的 open changelog PR 集合判定,不按当日分支名匹配——覆盖"前一天分支还
++  // 开着、今天分支名还没创建过"的跨日缺口(旧代码会在此新开第二条 PR,issue #423 F3/F4;
++  // RUNBOOK.md「跨日累积」一节)。判定顺序:先陈旧(含不可解析)后幂等,防止一个卡住多天
++  // 的 PR 被静默当作"已有人处理"跳过。
++  let openChangelogPrs
++  let unownedChangelogPrs
++  try {
++    ;({ owned: openChangelogPrs, unowned: unownedChangelogPrs } = listOpenChangelogPrs({}, deps))
++  } catch (err) {
++    fail(deps, err.message)
++  }
++  const unownedSummary = unownedChangelogPrs.length > 0
++    ? { unownedChangelogPrs: unownedChangelogPrs.map(describePrForLog) }
++    : {}
++  const now = deps.now()
++  const stalePrs = openChangelogPrs.filter((pr) => {
++    const createdAtMs = new Date(pr.createdAt).getTime()
++    return !Number.isFinite(createdAtMs) || now - createdAtMs >= STALE_OPEN_PR_MS
++  })
++  if (stalePrs.length > 0) {
++    const desc = stalePrs
++      .map((pr) => {
++        const createdAtMs = new Date(pr.createdAt).getTime()
++        const ageDesc = Number.isFinite(createdAtMs)
++          ? `已开 ${((now - createdAtMs) / 3_600_000).toFixed(1)}h`
++          : `createdAt 无法解析(${JSON.stringify(pr.createdAt)}),年龄不可判`
++        return `#${pr.number}(${pr.headRefName}, ${ageDesc}, ${pr.url})`
++      })
++      .join('; ')
++    fail(
++      deps,
++      `可见性铁律:存在超过 ${PUBLISH_PR_STALE_HOURS}h 仍 open 的 changelog PR 未被合并,或年龄不可判 —— ${desc}。` +
++        '绿灯不代表已投递:请检查 review-pr loop 是否停摆,或人工处理这些 PR。',
++      4,
++    )
++  }
++  if (openChangelogPrs.length > 0) {
++    const existing = openChangelogPrs[0]
++    process.stderr.write(
++      `[auto-changelog] 已存在归属本流程的 open changelog PR #${existing.number}(${existing.headRefName}),幂等跳过本次 publish\n`,
++    )
++    process.stdout.write(
++      `${JSON.stringify({
++        status: 'pr-already-open', pr: existing.number, branch: existing.headRefName, day: maxDay, ...unownedSummary,
++      })}\n`,
++    )
++    return
++  }
++
++  // ---- 同日分支域门(核心 fail-closed 前置条件,原样叠加在跨日门之上,在任何 git 写
++  // 动作之前,dry-run 也真实执行)----
++  // 门查的是真前置条件——远端目标分支 ref 是否存在,而非仅"有没有 open PR"(open PR 只是
++  // 代理量,会漏掉两类情形:①push 成功但 gh pr create 失败,留下有 ref 无 PR 的孤儿分支;
++  // ②PR 被 close 而非 merge,ref 还在但已查不到 open PR)。两种情形下直接 push 都会
++  // non-fast-forward 失败,需人工介入,不能静默放行。
++  // git ls-remote 是只读查询:对"ref 不存在"返回空 stdout + exit 0;只有真失败(网络/权限
++  // 等)才非零退出——两者天然可辨,故不用 allowFail,让真失败按 runGit 默认行为向上抛出,
+   // 走 main() 的 catch → fail-closed,不会被误当成"ref 不存在"而放行。
+-  const remoteRefRaw = runGit(['ls-remote', '--heads', 'origin', branch])
++  const remoteRefRaw = deps.runGit(['ls-remote', '--heads', 'origin', branch])
+   const remoteRefExists = remoteRefRaw.trim().length > 0
+ 
+   if (remoteRefExists) {
+     // ref 已存在 → 查 open PR 只为分类(幂等跳过 / 陈旧翻红 / 孤儿翻红),不做归属判定
+-    // (不需要知道是谁开的)。GitHub 的 (head, base) 唯一性约束按这个对判定,不是按裸 head——
+-    // 同一 head 到不同 base 理论上可并存多条 open PR。本项目所有 changelog PR 恒以 main 为
+-    // base,加 --base main 后该 (head, base) 组合方可视为至多一条,故零 --limit 截断风险。
+-    const existingPrListRaw = runGh([
++    // (不需要知道是谁开的)——同名分支上存在任何 open PR 都该跳过。这与上面跨日门的归属
++    // 判定是两套不同定位:跨日门服务跨日判定与可见性;这里是分支名域的最后一道闸,遇到无法
++    // 归属的远程 ref 一律只报告、不删除、不续接(分支名不是创建凭证,不可逆远程删除交给
++    // 人工确认)。GitHub 的 (head, base) 唯一性约束按这个对判定,不是按裸 head——同一
++    // head 到不同 base 理论上可并存多条 open PR。本项目所有 changelog PR 恒以 main 为
++    // base,加 --base main 后该 (head, base) 组合方可视为至多一条,故零 --limit 截断
++    // 风险。
++    const existingPrListRaw = deps.runGh([
+       'pr', 'list',
+       '--state', 'open',
+       '--head', branch,
+@@ -990,13 +1172,14 @@ const cmdPublish = async (args) => {
+     try {
+       existingPrList = JSON.parse(existingPrListRaw)
+     } catch (err) {
+-      fail(`gh pr list 响应不是 JSON: ${err.message}; body=${trimForError(existingPrListRaw)}`)
++      fail(deps, `gh pr list 响应不是 JSON: ${err.message}; body=${trimForError(existingPrListRaw)}`)
+     }
+     if (!Array.isArray(existingPrList)) {
+-      fail(`gh pr list 响应不是数组(实际: ${trimForError(existingPrListRaw)}),fail-closed 中止(不跳过、零 git 写动作)`)
++      fail(deps, `gh pr list 响应不是数组(实际: ${trimForError(existingPrListRaw)}),fail-closed 中止(不跳过、零 git 写动作)`)
+     }
+     if (existingPrList.length === 0) {
+       fail(
++        deps,
+         `分支 ${branch} 已存在于远端但无对应 open PR(PR 可能被 close,或上次 push 成功后 pr create 失败),` +
+           `直接 push 必然 non-fast-forward 失败;需人工确认后删除该远程分支或重开 PR。`,
+       )
+@@ -1007,6 +1190,7 @@ const cmdPublish = async (args) => {
+     // 把已论证成立的不变量编码成断言,打破时可观测而非静默走偏。
+     if (existingPrList.length > 1) {
+       fail(
++        deps,
+         `分支 ${branch} 的 gh pr list --base main 返回 ${existingPrList.length} 条 open PR` +
+           `(预期至多 1 条,(head, base) 唯一性假设被打破),fail-closed 中止(不跳过、零 git 写动作),` +
+           `需人工核实:${existingPrList.map((p) => p.url).join(', ')}`,
+@@ -1017,19 +1201,23 @@ const cmdPublish = async (args) => {
+     const createdAtMs = new Date(existingPr.createdAt).getTime()
+     if (!Number.isFinite(createdAtMs)) {
+       fail(
++        deps,
+         `分支 ${branch} 已有 open PR #${existingPr.number},但 createdAt 无法解析(${JSON.stringify(existingPr.createdAt)}),` +
+           `年龄不可判,fail-closed 中止(不跳过、零 git 写动作)。请人工核实:${existingPr.url}`,
+       )
+     }
+-    const ageMs = Date.now() - createdAtMs
++    const ageMs = now - createdAtMs
+     const ageHours = ageMs / HOUR_MS
+     if (ageHours >= PUBLISH_PR_STALE_HOURS) {
+       fail(
++        deps,
+         `分支 ${branch} 已有 open PR #${existingPr.number} 已开 ${ageHours.toFixed(1)}h` +
+           `(≥${PUBLISH_PR_STALE_HOURS}h 陈旧门),fail-closed 中止,需人工介入合并:${existingPr.url}`,
+       )
+     }
+-    process.stdout.write(`${JSON.stringify({ status: 'pr-already-open', pr: existingPr.number, branch, day: maxDay })}\n`)
++    process.stdout.write(
++      `${JSON.stringify({ status: 'pr-already-open', pr: existingPr.number, branch, day: maxDay, ...unownedSummary })}\n`,
++    )
+     process.stderr.write(
+       `[auto-changelog] 分支 ${branch} 已有 open PR #${existingPr.number}(已开 ${ageHours.toFixed(1)}h,` +
+         `<${PUBLISH_PR_STALE_HOURS}h),本次跳过,请先合并它:${existingPr.url}\n`,
+@@ -1114,21 +1302,26 @@ ${newItemsSummary}
+         2,
+       )}\n`,
+     )
+-    process.stdout.write('\n---- 将执行的命令(dry-run,不实际执行)----\n')
++    process.stdout.write('\n---- 将执行的命令(dry-run,不实际执行;上面两道门查已真实执行过,均已放行)----\n')
+     const planned = [
++      `# 已确认:跨日可见性+幂等门(gh pr list --state open --limit ${OPEN_PR_LIST_SENTINEL_LIMIT} 哨兵 + 归属过滤)未发现本流程 owned 的其他 open changelog PR`,
++      `# 已确认:同日分支域门(git ls-remote --heads origin ${branch})显示目标分支在远端不存在`,
+       `git fetch origin main`,
+       `git worktree add -b ${branch} ${wtPath} origin/main`,
+       `# 在 ${wtPath}/public/changelog.json 写入合并后的内容(lastGithash=${scanAnchor}, updatedAt=${merged.updatedAt})`,
+       `git -C ${wtPath} add public/changelog.json`,
+       `git -C ${wtPath} commit -m "${prTitle}"`,
+       `# PREFLIGHT_SKIP=1:changelog-only 非代码改动,无 deps 的临时 worktree 跑不了 pre-push 五道校验;CI 会跑真校验`,
+-      `PREFLIGHT_SKIP=1 git -C ${wtPath} push -u origin ${branch}`,
++      `# --force-with-lease=${branch}: 断言远端该 ref 仍不存在(与上面 ls-remote 检查之间的 CAS),消除"检查后被并发创建"的竞态窗口`,
++      `PREFLIGHT_SKIP=1 git -C ${wtPath} push -u origin ${branch} --force-with-lease=${branch}:`,
+       `gh pr create --title "${prTitle}" --body "<新增条目清单>"`,
+       `# 轮询 CI:gh pr checks <N> --json name,state,每 30s,上限 30 分钟;fail 中止,head 落后先 gh pr update-branch <N>`,
+-      `# 落地后合规校验(不再门控合并):分支名 ^chore/changelog-;files 仅 public/changelog.json;checks 全 pass;mergeable=MERGEABLE(UNKNOWN 重试 6×10s)`,
++      `# 发布前铁律:分支名 ^chore/changelog-;files 仅 public/changelog.json;checks 全 pass;mergeable=MERGEABLE(UNKNOWN 重试 6×10s)`,
++      `# mergeStateStatus 单独一次 allowFail 调用记入 stderr 日志,仅观测不阻断(本仓 code_scanning 因未开 GHAS 永久等待判 fail、持续阻断,code_quality 判 pass 不阻断,该字段恒为 BLOCKED,见 issue #423)`,
+       `# changelog-only PR 若有 unresolved review threads:先可见回复说明自动补扫产物,再 GraphQL resolveReviewThread`,
+-      `# 不在此合并、不删远程分支:org ruleset trunk-guard(实测 6 条规则)的 code_scanning 因本仓未开 GHAS 永久等待判 fail、持续阻断(code_quality 判 pass 不阻断;copilot_code_review/pull_request 是否也阻塞未验证),PR 在当前配置下持续观察到 mergeStateStatus=BLOCKED(#423 根因,见 RUNBOOK.md);PR 保持 open,交由 review-pr 或人工合并`,
++      `# 不在此合并、不删远程分支:org ruleset trunk-guard(实测 6 条规则)的 code_scanning 因本仓未开 GHAS 永久等待判 fail、持续阻断(code_quality 判 pass 不阻断;copilot_code_review/pull_request 是否也阻塞未验证),PR 在当前配置下持续观察到 mergeStateStatus=BLOCKED(#423 根因,见 RUNBOOK.md);PR 保持 open,交由 review-pr loop 的 admin-trust 路径或人工合并`,
+       `git worktree remove --force ${wtPath}`,
++      `git branch -D ${branch}`,
+     ]
+     for (const c of planned) process.stdout.write(`${c}\n`)
+     process.stdout.write('\n---- PR body 预览 ----\n')
+@@ -1140,7 +1333,7 @@ ${newItemsSummary}
+     return
+   }
+ 
+-  // ---- 5. 真实执行:建临时 worktree → 合并写回 → commit → push → PR → 轮询 → 落地后校验 → 清理(不合并)----
++  // ---- 5. 真实执行:建临时 worktree → 合并写回 → commit → push → PR → 轮询 CI → 发布前铁律校验 → 清理(不再 merge)----
+   process.stderr.write(`[auto-changelog] 真实 publish:branch=${branch} worktree=${wtPath}\n`)
+   let worktreeCreated = false
+   let prNumber = null
+@@ -1148,15 +1341,19 @@ ${newItemsSummary}
+   // 失败路径也要清 worktree + 本地分支(trap 语义)。allowFail 兜底"没建成/已删"。
+   // 注意:fail() 是 process.exit,在 try 里调用不会触发 catch → 漏清。故 try 内
+   // 一律用 abort()(throw),落进 catch → cleanup;catch 再 fail 退出。
++  // 分支删除现在与 worktree 删除同一个 worktreeCreated 判据(F-W1-02 修复):worktree
++  // add -b 是唯一一处由本脚本创建该本地分支的地方,两者本就是原子对——之前分支删除
++  // 无条件执行,会在上面跨日门/同日门任一 abort(worktree add -b 尚未运行)时,误删一个
++  // 恰好与目标分支同名的手工本地分支(不是本脚本创建的),不该由本脚本的失败路径清理。
+   let cleanedUp = false
+   const cleanup = () => {
+     if (cleanedUp) return
+     cleanedUp = true
+     if (worktreeCreated) {
+-      runGit(['worktree', 'remove', '--force', wtPath], { allowFail: true })
++      deps.runGit(['worktree', 'remove', '--force', wtPath], { allowFail: true })
++      // 本地分支可能因中途失败没建成(allowFail 兜底),同日重试不被残留分支卡死
++      deps.runGit(['branch', '-D', branch], { allowFail: true })
+     }
+-    // 本地分支可能没建成(allowFail 兜底),同日重试不被残留分支卡死
+-    runGit(['branch', '-D', branch], { allowFail: true })
+   }
+   const abort = (msg, code = 1) => {
+     const err = new Error(msg)
+@@ -1165,13 +1362,27 @@ ${newItemsSummary}
+   }
+ 
+   try {
+-    runGit(['fetch', 'origin', 'main'])
++    deps.runGit(['fetch', 'origin', 'main'])
+     if (existsSync(wtPath)) {
+-      // 上次失败残留:先自愈(worktree remove + branch -D + rmSync 兜底)再重建,
+-      // 不让人手动清。worktree remove 拒不掉(被占用/非注册)时 rmSync 删目录。
++      // 上次失败残留:先自愈(worktree remove + rmSync 兜底)再重建,不让人手动清。
++      // worktree remove 拒不掉(被占用/非注册)时 rmSync 删目录。
+       process.stderr.write(`[auto-changelog] worktree 路径已存在(${wtPath}),自愈清理...\n`)
+-      runGit(['worktree', 'remove', '--force', wtPath], { allowFail: true })
+-      runGit(['branch', '-D', branch], { allowFail: true })
++      // F-W1R4-B1 归属核验:START —— wtPath 路径存在不能当分支归属凭证(process.pid
++      // 会复用,是"内容相等"不是"创建凭证",与 cleanup() 已用的 worktreeCreated 判据
++      // 同属加固清单第 3 类的凭证要求)。真正的创建凭证是 git 自己的 worktree 注册表:
++      // 只有本脚本上一轮真的跑过 `worktree add -b <branch> <wtPath>` 才会让 git 把
++      // <wtPath> 登记为一个 worktree、且其签出分支恰为 <branch>——人手工建的同名分支
++      // 不会出现在这份注册表里。查不到匹配登记 → 不删除本地分支(fail-closed:宁可让
++      // 本次 publish 因分支已存在而中止,也不误删可能是人手工建的分支);仍可安全
++      // `worktree remove` 掉这个非登记目录本身(不是 git 对象,清掉不影响任何 ref)。
++      const worktreeListRaw = deps.runGit(['worktree', 'list', '--porcelain'], { allowFail: true }) || ''
++      const registeredForThisBranch = parseWorktreeListPorcelain(worktreeListRaw).some(
++        (w) => w.path === wtPath && w.branch === `refs/heads/${branch}`,
++      )
++      deps.runGit(['worktree', 'remove', '--force', wtPath], { allowFail: true })
++      // 目录清理始终安全(不是 git 对象,清掉不影响任何 ref)——不管下面分支归属能否核验,
++      // 都先把这个非登记目录清掉,再决定是否需要为分支归属问题中止;否则每次撞到下面的
++      // fail-closed 分支都会在 /tmp 里留一个空目录,累积成垃圾。
+       if (existsSync(wtPath)) {
+         try {
+           rmSync(wtPath, { recursive: true, force: true })
+@@ -1179,8 +1390,25 @@ ${newItemsSummary}
+           /* ignore */
+         }
+       }
++      if (registeredForThisBranch) {
++        deps.runGit(['branch', '-D', branch], { allowFail: true })
++      } else {
++        const staleBranchOid = deps.runGit(
++          ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`],
++          { allowFail: true },
++        )
++        if (staleBranchOid) {
++          abort(
++            `${wtPath} 未在 git worktree 注册表里对应分支 ${branch}(可能是残留目录或 pid 撞值),` +
++              `本地分支 ${branch} 归属未核验,不予删除(fail-closed)。请人工核实该分支来源` +
++              `(确认是上次运行残留可执行 git branch -D ${branch} 后重跑;若是手工创建的分支` +
++              `请改名后重跑)。`,
++          )
++        }
++      }
++      // F-W1R4-B1 归属核验:END
+     }
+-    runGit(['worktree', 'add', '-b', branch, wtPath, 'origin/main'])
++    deps.runGit(['worktree', 'add', '-b', branch, wtPath, 'origin/main'])
+     worktreeCreated = true
+ 
+     // 读 worktree 里的 changelog.json,合并写回
+@@ -1192,17 +1420,25 @@ ${newItemsSummary}
+     const finalMerged = mergeEntries(wtChangelog)
+     writeFileSync(wtChangelogPath, `${JSON.stringify(finalMerged, null, 2)}\n`)
+ 
+-    runGit(['-C', wtPath, 'add', CHANGELOG_REL])
+-    runGit(['-C', wtPath, 'commit', '-m', prTitle])
++    deps.runGit(['-C', wtPath, 'add', CHANGELOG_REL])
++    deps.runGit(['-C', wtPath, 'commit', '-m', prTitle])
+ 
+     // PREFLIGHT_SKIP=1:changelog-only 非代码改动,无 deps 的临时 worktree 跑不了 pre-push
+     // 五道校验(typecheck/lint/build/...);CI 会跑真校验。既定决策,见 RUNBOOK.md。
+-    runGit(['-C', wtPath, 'push', '-u', 'origin', branch], {
++    // --force-with-lease=<branch>:(空 expect)= 断言远端该 ref 此刻仍不存在——上面同日门
++    // 的 ls-remote 检查与这次真正 push 之间存在一个不可消除的 check-then-act 窗口:
++    // 理论上可能有另一个进程在这个窗口内创建了同名远程分支。若不加这道 CAS,且新建的
++    // 远程 ref 恰好是本次 commit 的祖先,普通(非 force)push 会静默 fast-forward 改写
++    // 它(F-W1-01 残留场景,三审确认同日门的 fail-closed 判定只覆盖"检查时已存在"的已知 ref,
++    // 覆盖不到这个窗口期竞态)。加上后:若窗口期内确实有人抢先创建了该 ref,push 会被
++    // 拒绝(non-fast-forward/stale info)而不是静默改写,同样走 catch → fail-closed,
++    // 不产生任何删除动作。
++    deps.runGit(['-C', wtPath, 'push', '-u', 'origin', branch, `--force-with-lease=${branch}:`], {
+       env: { PREFLIGHT_SKIP: '1' },
+     })
+ 
+     // 开 PR
+-    const prCreateOut = runGh([
++    const prCreateOut = deps.runGh([
+       'pr', 'create',
+       '--title', prTitle,
+       '--body', prBody,
+@@ -1223,7 +1459,7 @@ ${newItemsSummary}
+     let lastStates = ''
+     // 注:Date.now() 在本脚本(非 workflow)里可用
+     for (;;) {
+-      const checksJson = runGh(['pr', 'checks', String(prNumber), '--json', 'name,state'], { cwd: wtPath, allowFail: true })
++      const checksJson = deps.runGh(['pr', 'checks', String(prNumber), '--json', 'name,state'], { cwd: wtPath, allowFail: true })
+       if (checksJson) {
+         let checks
+         try {
+@@ -1261,13 +1497,13 @@ ${newItemsSummary}
+         }
+       }
+       // head 落后基线 → update-branch 后继续等(只取 mergeable 一个字段)
+-      const prView = runGh(['pr', 'view', String(prNumber), '--json', 'mergeable'], { cwd: wtPath, allowFail: true })
++      const prView = deps.runGh(['pr', 'view', String(prNumber), '--json', 'mergeable'], { cwd: wtPath, allowFail: true })
+       if (prView) {
+         try {
+           const pv = JSON.parse(prView)
+           if (pv.mergeable === 'BEHIND') {
+             process.stderr.write('[auto-changelog] head 落后基线,gh pr update-branch...\n')
+-            runGh(['pr', 'update-branch', String(prNumber)], { cwd: wtPath, allowFail: true })
++            deps.runGh(['pr', 'update-branch', String(prNumber)], { cwd: wtPath, allowFail: true })
+           }
+         } catch { /* ignore parse error,继续轮询 */ }
+       }
+@@ -1278,14 +1514,17 @@ ${newItemsSummary}
+       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS))
+     }
+ 
+-    // ---- 落地后合规校验(全部写死为 if;不再门控合并,只确认自动生成的 PR 本身合规)----
+-    // gh --json 只接受一个逗号连接的参数(多 arg 会报 "accepts at most 1 arg")
+-    const mergeView = runGh(['pr', 'view', String(prNumber), '--json', 'files,mergeable,headRefName'], { cwd: wtPath })
++    // ---- 发布前铁律校验(全部写死为 if)----
++    // 铁律校验是发布前的硬门槛——未过铁律的 PR 不算"已就绪",不能交给 review-pr loop 处理
++    // (合并机制见下方"发布完成"段)。gh --json 只接受一个逗号连接的参数(多 arg 会报
++    // "accepts at most 1 arg"),mergeStateStatus 是纯观测字段,故意不放进这次硬性调用,
++    // 单独一次 allowFail 取(见下方),避免它扩大这条铁律校验的硬失败面。
++    const mergeView = deps.runGh(['pr', 'view', String(prNumber), '--json', 'files,mergeable,headRefName'], { cwd: wtPath })
+     let mv
+     try {
+       mv = JSON.parse(mergeView)
+     } catch (err) {
+-      abort(`merge 前校验:gh pr view --json 解析失败: ${err.message}`)
++      abort(`发布前校验:gh pr view --json 解析失败: ${err.message}`)
+     }
+     // ① 分支名匹配 ^chore/changelog-
+     if (!mv.headRefName || !/^chore\/changelog-/.test(mv.headRefName)) {
+@@ -1306,7 +1545,7 @@ ${newItemsSummary}
+     for (let attempt = 0; attempt < 6 && mergeable === 'UNKNOWN'; attempt += 1) {
+       process.stderr.write(`[auto-changelog] mergeable=UNKNOWN,等 10s 重试(${attempt + 1}/6)...\n`)
+       await new Promise((r) => setTimeout(r, 10_000))
+-      const retryJson = runGh(['pr', 'view', String(prNumber), '--json', 'mergeable'], { cwd: wtPath, allowFail: true })
++      const retryJson = deps.runGh(['pr', 'view', String(prNumber), '--json', 'mergeable'], { cwd: wtPath, allowFail: true })
+       if (retryJson) {
+         try {
+           mergeable = JSON.parse(retryJson).mergeable
+@@ -1319,12 +1558,12 @@ ${newItemsSummary}
+       abort(`铁律违反:mergeable=${mergeable}(需 MERGEABLE;${mergeable === 'UNKNOWN' ? '已重试 6 次仍 UNKNOWN' : '非 MERGEABLE 立即拒绝'})`)
+     }
+     // ④ checks 全 pass(再确认一次)
+-    const finalChecksJson = runGh(['pr', 'checks', String(prNumber), '--json', 'name,state'], { cwd: wtPath })
++    const finalChecksJson = deps.runGh(['pr', 'checks', String(prNumber), '--json', 'name,state'], { cwd: wtPath })
+     let finalChecks
+     try {
+       finalChecks = JSON.parse(finalChecksJson)
+     } catch (err) {
+-      abort(`merge 前校验:checks 解析失败: ${err.message}`)
++      abort(`发布前校验:checks 解析失败: ${err.message}`)
+     }
+     const notPass = (finalChecks || []).filter(
+       (c) => !(c.state === 'SUCCESS' || c.state === 'NEUTRAL' || c.state === 'SKIPPED'),
+@@ -1332,6 +1571,22 @@ ${newItemsSummary}
+     if (notPass.length > 0) {
+       abort(`铁律违反:checks 未全绿: [${notPass.map((c) => `${c.name}=${c.state}`).join(', ')}]`)
+     }
++    // mergeStateStatus 只是观测字段,独立一次 allowFail 调用取(见上方铁律校验的说明)——
++    // 组织级 ruleset 给 code_scanning/code_quality 挂了必需检查,但本仓未开 Advanced
++    // Security,code_scanning 因此永久等待判 fail、持续阻断(code_quality 判 pass 不阻断),
++    // 导致该字段恒为 BLOCKED(issue #423)。物理可合并性已由上面的 mergeable/checks 判定,
++    // 这里只把 GitHub 侧分支保护态打进日志供人工/review-pr loop 观测,不作为发布门槛;
++    // 字段本身取不到(gh 版本不认)时保留 UNKNOWN,不阻断发布。
++    const mergeStateJson = deps.runGh(['pr', 'view', String(prNumber), '--json', 'mergeStateStatus'], { cwd: wtPath, allowFail: true })
++    let mergeStateStatus = 'UNKNOWN'
++    if (mergeStateJson) {
++      try {
++        mergeStateStatus = JSON.parse(mergeStateJson).mergeStateStatus ?? 'UNKNOWN'
++      } catch {
++        /* 观测字段解析失败,保留 UNKNOWN,不阻断发布 */
++      }
++    }
++    process.stderr.write(`[auto-changelog] PR #${prNumber} mergeStateStatus=${mergeStateStatus}\n`)
+ 
+     // ⑤ changelog-only PR 允许自清 review thread。严格复用上面的分支名/files 铁律;
+     // 其他 PR 绝不自动回复或 resolve。
+@@ -1340,22 +1595,23 @@ ${newItemsSummary}
+       headRefName: mv.headRefName,
+       files,
+       cwd: wtPath,
+-    })
++    }, deps)
+ 
+     // 全过 → 不在此合并。org ruleset trunk-guard(实测 6 条规则)挂的 code_scanning/code_quality
+     // 两项必需 check 里,已确认阻断的是 code_scanning(本仓未开 GHAS 永久等待判 fail、持续阻断);
+     // code_quality 判 pass,不阻断;copilot_code_review/pull_request 是否也阻塞 mergeStateStatus
+     // 本轮未验证。以 main 为 base 的 PR 因此在当前配置下持续观察到 mergeStateStatus=BLOCKED,
+     // 裸 `gh pr merge` 在当前配置下会被拒绝(#423 根因,详见 RUNBOOK.md)。铁律校验只用于确认
+-    // 自动生成的 PR 本身合规,不再门控合并。
++    // 自动生成的 PR 本身合规,不再门控合并。远程分支不能删——PR 还开着,删分支会让 PR 失去 head。
+     process.stderr.write(`[auto-changelog] 铁律校验全过,PR #${prNumber} 保持 open,不在此合并\n`)
+     cleanup()
+-    process.stdout.write(`${JSON.stringify({ status: 'pr-opened', pr: prNumber, branch, day: maxDay })}\n`)
+-    process.stderr.write(`[auto-changelog] 已开 PR #${prNumber},本流程不再合并,交由 review-pr 或人工合并\n`)
++    process.stdout.write(`${JSON.stringify({ status: 'pr-opened', pr: prNumber, branch, day: maxDay, ...unownedSummary })}\n`)
+   } catch (err) {
+-    // 任何失败(operational throw 或 abort)都走这里 → 清 worktree + 本地分支后退出
++    // 任何失败(operational throw 或 abort)都走这里 → 只清本地临时 worktree/分支后退出。
++    // 远程分支不清:失败多为 CI/铁律未过,人工排查时需要保留 PR 与其远程分支现场;
++    // 若 PR 已成功创建(prNumber 非 null),同样保留待人工/review-pr loop 处理。
+     cleanup()
+-    fail(err.message, err.exitCode ?? 1)
++    fail(deps, err.message, err.exitCode ?? 1)
+   }
+ }
+ 
+@@ -1371,30 +1627,64 @@ const main = async () => {
+   }
+   const sub = argv[0]
+   const rest = parseArgs(argv.slice(1))
+-
+-  assertChangelogTimeZone()
++  // 每次 CLI 调用各持有一份自己的真实依赖实例;时区门下沉到各 cmd 入口自己调用,main()
++  // 不再单独把关(见 assertChangelogTimeZone 调用点)。
++  const deps = createRealDeps()
+ 
+   if (sub === 'scan') {
+     try {
+-      cmdScan(rest)
++      cmdScan(rest, deps)
+     } catch (err) {
+-      fail(err.message)
++      fail(deps, err.message)
+     }
+   } else if (sub === 'rewrite') {
+     try {
+-      await cmdRewrite(rest)
++      await cmdRewrite(rest, deps)
+     } catch (err) {
+-      fail(err.message)
++      fail(deps, err.message)
+     }
+   } else if (sub === 'publish') {
+     try {
+-      await cmdPublish(rest)
++      await cmdPublish(rest, deps)
+     } catch (err) {
+-      fail(err.message)
++      fail(deps, err.message)
+     }
+   } else {
+-    fail(`未知子命令: ${sub}(可用: scan | rewrite | publish)`)
++    fail(deps, `未知子命令: ${sub}(可用: scan | rewrite | publish)`)
++  }
++}
++
++// 只在直接执行本文件时跑 CLI;被测试 import 时不触发(process.argv 解析/process.exit 都不该
++// 在 import 时发生),vitest 之类的 test runner 会把本文件当普通模块 import。
++//
++// realpath 两侧都要解析(SC-W1R2-04/v1-F-W1R2-05):node 加载主模块时 import.meta.url 内部
++// 已是 realpath;但 process.argv[1] 是原始调用路径,经符号链接调用时不是 realpath,resolve()
++// 只做路径归一化、不解析符号链接,两侧就会不等 → isMainModule 误判 false → main() 静默不跑、
++// exit 0,workflow 全绿而当日日志静默漏发。改用 realpathSync 解析 argv[1] 后再比较。
++//
++// 提取成可注入 realpath 的纯函数(导出供测试,F-W1R4-01 回归覆盖 catch 分支):默认参数
++// realpathSync 是生产行为,测试可传一个会抛错的假实现。
++export const computeIsMainModule = (argvPath, moduleUrl, realpath = realpathSync) => {
++  if (!argvPath) return false
++  try {
++    return realpath(argvPath) === fileURLToPath(moduleUrl)
++  } catch (err) {
++    // F-W1R4-01 修复:原 catch { return false } 与上面注释要消除的后果完全同构——
++    // realpathSync 抛错(TOCTOU/EACCES/ELOOP 等,argv[1] 在 node 加载本文件后失效)时
++    // 静默判 false 会让 main() 不跑、exit 0、workflow 全绿、当日日志漏发,只是触发路径
++    // 从"resolve() 未解析符号链接"换成了"argv[1] 本身读不到"。选择响亮而非致命:打一行
++    // 可 grep 的诊断到 stderr,并按主模块处理继续执行——main() 自身的时区门/双层门查
++    // 会在真实状态异常时 fail-closed 翻红,比在这里直接判 false 静默放行安全;万一是被
++    // import 场景触发该 catch(概率极低,argv[1] 此时指向宿主进程自己的入口文件,同样
++    // 必须存在才能让 node 启动),多跑一次 main() 的代价远小于当日日志静默漏发。
++    process.stderr.write(
++      `[auto-changelog] 警告: isMainModule 判定异常(realpathSync 抛错,按主模块处理继续执行): ${err.message}\n`,
++    )
++    return true
+   }
+ }
+ 
+-main()
++const isMainModule = computeIsMainModule(process.argv[1], import.meta.url)
++if (isMainModule) {
++  main()
++}
+diff --git a/scripts/changelog/auto-changelog.test.mjs b/scripts/changelog/auto-changelog.test.mjs
+new file mode 100644
+index 00000000..58efcfe0
+--- /dev/null
++++ b/scripts/changelog/auto-changelog.test.mjs
+@@ -0,0 +1,691 @@
++import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { spawnSync } from 'node:child_process'
++import { fileURLToPath } from 'node:url'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { cmdPublish, createRealDeps, computeIsMainModule } from './auto-changelog.mjs'
++
++// cmdPublish 的失败路径最终走 fail() -> deps.exit()。真实实现是 process.exit,直接在
++// vitest worker 里调用会把整个 worker 杀掉;测试把 deps.exit 换成"抛一个带 code 的可捕获
++// 信号"而不是真退出,断言时用 rejects.toMatchObject({ code }) 判定退出码。
++class ExitSignal extends Error {
++  constructor(code) {
++    super(`process.exit(${code})`)
++    this.code = code
++  }
++}
++
++const FIXED_NOW = new Date('2026-08-02T12:00:00+08:00').getTime()
++const DAY = '2026-08-02'
++const BRANCH = `chore/changelog-${DAY}`
++// cmdPublish 的 wtPath 写死为 /tmp/mivo-changelog-wt-<pid>(不可注入),pid 在整个测试
++// 进程生命周期内不变,故所有用例共用同一路径,每个用例结束都要清理。
++const WT_PATH = `/tmp/mivo-changelog-wt-${process.pid}`
++
++// 本流程归属判据(auto-changelog.mjs 的 CHANGELOG_PR_EXPECTED_AUTHOR 默认值 + REPO_OWNER
++// 默认值 'xindong/mivo-canvas' 的 owner 段)。归属校验(SC-W1R2-01/02)相关用例靠这两个
++// 字段区分"是不是本流程开的 PR"。
++const OWNED_AUTHOR = { login: 'PraiseZhu' }
++const OWNED_REPO_OWNER = { login: 'xindong' }
++const FOREIGN_AUTHOR = { login: 'someone-else' }
++
++let dir
++let deps
++let gitCalls
++let ghCalls
++let stdoutChunks
++let stderrChunks
++
++const writeFixtures = () => {
++  const scanPath = join(dir, 'scan.json')
++  const rewritePath = join(dir, 'rewrite.json')
++  writeFileSync(
++    scanPath,
++    JSON.stringify({
++      status: 'pending',
++      anchor: '0000000000000000000000000000000000000a',
++      items: [{ pr: 501, day: DAY, author: 'PraiseZhu', subject: 'fix: 修一个渲染问题 (#501)', body: '' }],
++    }),
++  )
++  writeFileSync(rewritePath, JSON.stringify({ items: [{ pr: 501, text: '画布上的一个显示问题修好了' }] }))
++  return { scanPath, rewritePath }
++}
++
++// cmdPublish 真正的 worktree 读写走 node:fs(不经 deps),所以假 git 的 worktree add
++// 必须真的把这份文件 materialize 出来,否则后续 readFileSync 会炸。
++const fakeWorktreeAdd = (wtPath) => {
++  mkdirSync(join(wtPath, 'public'), { recursive: true })
++  writeFileSync(
++    join(wtPath, 'public/changelog.json'),
++    JSON.stringify({
++      lastGithash: 'base00000000000000000000000000000000000',
++      updatedAt: '2026-08-01T00:00:00+08:00',
++      entries: [],
++    }),
++  )
++}
++
++// opts 必须被真实接收并转发(F-3 修复,见下方 makeFailingRunGit):此前签名是 (args) =>,
++// 生产 14 处 deps.runGit(args, {allowFail:true}) 传的第二参被静默丢弃,"allowFail 场景下
++// 应静默兜底"这类规则在假件层面结构上测不出来——不管 allowFail 是否为 true,假件都不会
++// 抛错,自然也不会有"抛错但被吞掉"与"抛错真的传播"两种可观测差异。
++const baseFakeRunGit = (args, _opts = {}) => {
++  gitCalls.push(args)
++  if (args[0] === 'worktree' && args[1] === 'add') {
++    fakeWorktreeAdd(args[4])
++    return ''
++  }
++  if (args[0] === 'worktree' && args[1] === 'remove') {
++    rmSync(args[3], { recursive: true, force: true })
++    return ''
++  }
++  // ls-remote 默认返回空(目标分支域门判定为"远端不存在"),其余未特别处理的调用
++  // (fetch/commit/push/branch -D 等)默认成功返回空串——足够撑起"两道门都放行,一路跑到
++  // 真实发布"这条默认路径。
++  return ''
++}
++
++// F-3 修复:构造一个真的会抛错、且尊重 opts.allowFail 的假 runGit——allowFail:true 时
++// 静默返回 null(不向上抛),否则真实 throw。用于验证:(a) cleanup() 里两处 allowFail
++// 调用即使底层真失败也不会覆盖/吞掉原始错误、也不会让 cleanup 自身抛出未捕获异常;
++// (b) 没有 allowFail 的调用(如 push)一旦真失败,错误必须原样传播,不能被静默吃掉。
++const makeFailingRunGit = (shouldFail, messageFor) => (args, opts = {}) => {
++  gitCalls.push(args)
++  if (shouldFail(args)) {
++    if (opts.allowFail) return null
++    throw new Error(messageFor(args))
++  }
++  if (args[0] === 'worktree' && args[1] === 'add') {
++    fakeWorktreeAdd(args[4])
++    return ''
++  }
++  if (args[0] === 'worktree' && args[1] === 'remove') {
++    rmSync(args[3], { recursive: true, force: true })
++    return ''
++  }
++  return ''
++}
++
++const jsonField = (args, field) => {
++  const idx = args.indexOf('--json')
++  return idx !== -1 && args[idx + 1] === field
++}
++
++// 成功路径的假 gh:无已存在 open PR(跨日 wide scan 与同日分支域门两处 gh pr list 均返回
++// 空数组)、PR #999 创建成功、CI 一次就绿、mergeable 直接 MERGEABLE、无 unresolved review
++// thread。args[0]==='pr' && args[1]==='list' 不区分 --limit/--head,统一返回空数组——两处
++// 调用都靠这一条分支覆盖。
++const successFakeRunGh = (args) => {
++  ghCalls.push(args)
++  if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([])
++  if (args[0] === 'pr' && args[1] === 'create') return 'https://github.com/xindong/mivo-canvas/pull/999'
++  if (args[0] === 'pr' && args[1] === 'checks') return JSON.stringify([{ name: 'CI', state: 'SUCCESS' }])
++  if (args[0] === 'pr' && args[1] === 'view') {
++    if (jsonField(args, 'mergeable')) return JSON.stringify({ mergeable: 'MERGEABLE' })
++    if (jsonField(args, 'files,mergeable,headRefName')) {
++      return JSON.stringify({
++        files: [{ path: 'public/changelog.json' }],
++        mergeable: 'MERGEABLE',
++        headRefName: BRANCH,
++      })
++    }
++    if (jsonField(args, 'mergeStateStatus')) return JSON.stringify({ mergeStateStatus: 'BLOCKED' })
++  }
++  if (args[0] === 'api' && args[1] === 'graphql') {
++    return JSON.stringify({
++      data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } },
++    })
++  }
++  throw new Error(`unexpected fake gh call: ${args.join(' ')}`)
++}
++
++beforeEach(() => {
++  dir = mkdtempSync(join(tmpdir(), 'auto-changelog-test-'))
++  gitCalls = []
++  ghCalls = []
++  stdoutChunks = []
++  stderrChunks = []
++  rmSync(WT_PATH, { recursive: true, force: true })
++  // deps 现在是显式工厂产物(createRealDeps()),每个用例各建一份、互不影响——不再是
++  // 可被外部改写的模块级单例,afterEach 也无需再把它复原(W1R2 SC-05)。
++  deps = createRealDeps()
++  deps.now = () => FIXED_NOW
++  // 时区改为可注入(W1R3 blocker 修复):测试固定成生产要求的 Asia/Shanghai,不再依赖
++  // 运行 vitest 进程的真实 TZ 环境变量——TZ=UTC 跑本文件同样应该全绿。
++  deps.timeZone = 'Asia/Shanghai'
++  deps.exit = (code) => {
++    throw new ExitSignal(code)
++  }
++  deps.runGit = baseFakeRunGit
++  deps.runGh = () => {
++    throw new Error('本测试未配置 deps.runGh')
++  }
++  vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
++    stdoutChunks.push(String(chunk))
++    return true
++  })
++  vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
++    stderrChunks.push(String(chunk))
++    return true
++  })
++})
++
++afterEach(() => {
++  vi.restoreAllMocks()
++  rmSync(dir, { recursive: true, force: true })
++  rmSync(WT_PATH, { recursive: true, force: true })
++})
++
++describe('cmdPublish(真实路径,注入假 git/gh runner,零网络)', () => {
++  it('①成功路径:两道门(跨日+同日分支域)均放行,push 带 --force-with-lease,不调 gh pr merge、不删远程分支,stdout status=pr-opened', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.runGh = successFakeRunGh
++
++    await cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)
++
++    expect(ghCalls.filter((a) => a[0] === 'pr' && a[1] === 'merge')).toHaveLength(0)
++    expect(gitCalls.filter((a) => a.includes('--delete'))).toHaveLength(0)
++    const pushCalls = gitCalls.filter((a) => a[0] === '-C' && a[2] === 'push')
++    expect(pushCalls).toHaveLength(1)
++    // F-1 残留修复:push 必须带 --force-with-lease=<branch>:(空 expect),对 ls-remote
++    // 检查与真正 push 之间的窗口期竞态做 CAS 断言,而不是裸 push 依赖"恰好没人抢先"。
++    expect(pushCalls[0]).toContain(`--force-with-lease=${BRANCH}:`)
++    // 目标分支域门(核心)必须真的跑过一次 ls-remote(而不是被跨日门短路跳过)。
++    expect(gitCalls.some((a) => a[0] === 'ls-remote')).toBe(true)
++
++    const out = stdoutChunks.join('')
++    const match = out.match(/\{"status":"pr-opened".*?\}/)
++    expect(match).not.toBeNull()
++    const parsed = JSON.parse(match[0])
++    expect(parsed).toMatchObject({ status: 'pr-opened', pr: 999, branch: BRANCH, day: DAY })
++  })
++
++  it('②已存在归属本流程、同日分支的 open changelog PR 时:跨日门幂等跳过,不 push、不新建分支、不触发同日分支域门,stdout status=pr-already-open', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.runGh = (args) => {
++      ghCalls.push(args)
++      if (args[0] === 'pr' && args[1] === 'list') {
++        return JSON.stringify([
++          {
++            number: 777,
++            headRefName: BRANCH,
++            createdAt: new Date(FIXED_NOW - 2 * 3_600_000).toISOString(),
++            url: 'https://github.com/xindong/mivo-canvas/pull/777',
++            author: OWNED_AUTHOR,
++            headRepositoryOwner: OWNED_REPO_OWNER,
++          },
++        ])
++      }
++      throw new Error(`unexpected fake gh call: ${args.join(' ')}`)
++    }
++
++    await cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)
++
++    expect(gitCalls).toHaveLength(0)
++    expect(ghCalls).toHaveLength(1)
++    const out = stdoutChunks.join('')
++    const match = out.match(/\{"status":"pr-already-open".*?\}/)
++    expect(match).not.toBeNull()
++    expect(JSON.parse(match[0])).toMatchObject({ status: 'pr-already-open', pr: 777, branch: BRANCH, day: DAY })
++  })
++
++  it('②b 存在归属本流程但分支名不同日(跨日)的 open changelog PR 时:幂等键不再按当日分支名匹配,同样跳过——消除跨日叠 PR(旧代码会在此新开第二条 PR)', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    const olderBranch = 'chore/changelog-2026-08-01'
++    deps.runGh = (args) => {
++      ghCalls.push(args)
++      if (args[0] === 'pr' && args[1] === 'list') {
++        return JSON.stringify([
++          {
++            number: 888,
++            headRefName: olderBranch,
++            createdAt: new Date(FIXED_NOW - 5 * 3_600_000).toISOString(),
++            url: 'https://github.com/xindong/mivo-canvas/pull/888',
++            author: OWNED_AUTHOR,
++            headRepositoryOwner: OWNED_REPO_OWNER,
++          },
++        ])
++      }
++      throw new Error(`unexpected fake gh call: ${args.join(' ')}`)
++    }
++
++    await cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)
++
++    expect(gitCalls).toHaveLength(0)
++    const out = stdoutChunks.join('')
++    const match = out.match(/\{"status":"pr-already-open".*?\}/)
++    expect(match).not.toBeNull()
++    expect(JSON.parse(match[0])).toMatchObject({ status: 'pr-already-open', pr: 888, branch: olderBranch, day: DAY })
++  })
++
++  it('③存在超过 22h 未合的 open changelog PR 时:非零退出翻红,不做任何 push/删除', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.runGh = (args) => {
++      ghCalls.push(args)
++      if (args[0] === 'pr' && args[1] === 'list') {
++        return JSON.stringify([
++          {
++            number: 555,
++            headRefName: 'chore/changelog-2026-07-30',
++            createdAt: new Date(FIXED_NOW - 30 * 3_600_000).toISOString(),
++            url: 'https://github.com/xindong/mivo-canvas/pull/555',
++            author: OWNED_AUTHOR,
++            headRepositoryOwner: OWNED_REPO_OWNER,
++          },
++        ])
++      }
++      throw new Error(`unexpected fake gh call: ${args.join(' ')}`)
++    }
++
++    await expect(cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)).rejects.toMatchObject({ code: 4 })
++
++    expect(ghCalls).toHaveLength(1)
++    expect(gitCalls.filter((a) => a[0] === '-C' && a[2] === 'push')).toHaveLength(0)
++    expect(gitCalls.filter((a) => a.includes('--delete'))).toHaveLength(0)
++    // F-2 修复的直接验证:预检门(worktree 还没建)abort 时,cleanup() 不应对 branch 做
++    // 任何 -D 操作——本轮从未创建过本地分支,不该由本脚本的失败路径"回收"它。
++    expect(gitCalls.filter((a) => a[0] === 'branch' && a[1] === '-D')).toHaveLength(0)
++  })
++
++  it('③b 存在刚越过 22h 陈旧门(22.5h)的 open changelog PR 时:跨日门与同日分支域门共用同一个 PUBLISH_PR_STALE_HOURS 常量(见 auto-changelog.mjs 顶部双区间实测依据),非零退出翻红——不是各自定义互相冲突的阈值', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.runGh = (args) => {
++      ghCalls.push(args)
++      if (args[0] === 'pr' && args[1] === 'list') {
++        return JSON.stringify([
++          {
++            number: 556,
++            headRefName: 'chore/changelog-2026-07-31',
++            createdAt: new Date(FIXED_NOW - 22.5 * 3_600_000).toISOString(),
++            url: 'https://github.com/xindong/mivo-canvas/pull/556',
++            author: OWNED_AUTHOR,
++            headRepositoryOwner: OWNED_REPO_OWNER,
++          },
++        ])
++      }
++      throw new Error(`unexpected fake gh call: ${args.join(' ')}`)
++    }
++
++    await expect(cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)).rejects.toMatchObject({ code: 4 })
++  })
++
++  it('③c 存在同名前缀但非本流程归属(foreign author)的陈旧 open PR 时:不计入陈旧/幂等判定,记录说明并照常继续发布,且 stdout JSON 携带 unownedChangelogPrs 供机器可读的可见性(F-4 修复)', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.runGh = (args) => {
++      if (args[0] === 'pr' && args[1] === 'list' && !args.includes('--head')) {
++        ghCalls.push(args)
++        return JSON.stringify([
++          {
++            number: 601,
++            headRefName: 'chore/changelog-2026-07-20',
++            createdAt: new Date(FIXED_NOW - 200 * 3_600_000).toISOString(),
++            url: 'https://github.com/xindong/mivo-canvas/pull/601',
++            author: FOREIGN_AUTHOR,
++            headRepositoryOwner: OWNED_REPO_OWNER,
++          },
++        ])
++      }
++      return successFakeRunGh(args)
++    }
++
++    await cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)
++
++    expect(stderrChunks.join('')).toContain('非本流程归属')
++    const out = stdoutChunks.join('')
++    expect(out).toContain('"status":"pr-opened"')
++    const match = out.match(/\{"status":"pr-opened".*?\}/)
++    expect(match).not.toBeNull()
++    const parsed = JSON.parse(match[0])
++    expect(parsed.unownedChangelogPrs).toEqual([
++      expect.stringContaining('#601'),
++    ])
++  })
++
++  it('③d open changelog PR 的 createdAt 字段解析失败(如字段回归/缺失)时:按陈旧处理 fail-closed,非零退出翻红,不静默幂等跳过', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.runGh = (args) => {
++      ghCalls.push(args)
++      if (args[0] === 'pr' && args[1] === 'list') {
++        return JSON.stringify([
++          {
++            number: 606,
++            headRefName: 'chore/changelog-2026-07-29',
++            // 故意不带 createdAt,模拟 gh --json 字段回归/缺失:new Date(undefined).getTime()
++            // 为 NaN,旧逻辑会把它判为"不陈旧"从而幂等跳过、永远绿灯且永不投递。
++            url: 'https://github.com/xindong/mivo-canvas/pull/606',
++            author: OWNED_AUTHOR,
++            headRepositoryOwner: OWNED_REPO_OWNER,
++          },
++        ])
++      }
++      throw new Error(`unexpected fake gh call: ${args.join(' ')}`)
++    }
++
++    await expect(cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)).rejects.toMatchObject({ code: 4 })
++
++    expect(stderrChunks.join('')).toContain('年龄不可判')
++    expect(gitCalls.filter((a) => a[0] === '-C' && a[2] === 'push')).toHaveLength(0)
++    const out = stdoutChunks.join('')
++    expect(out).not.toContain('"status":"pr-already-open"')
++  })
++
++  it('④dry-run:两道只读门查(跨日 gh pr list + 同日分支域 git ls-remote)真实执行,但计划清单不含 gh pr merge / --delete-branch / git push --delete,且不做任何真实写操作(worktree add/push/pr create 零调用)', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    // 只读调用允许;任何写动作(worktree add、push、pr create 等)一旦被调用就抛错,
++    // 用来证明 dry-run 真的零写操作。
++    deps.runGh = (args) => {
++      ghCalls.push(args)
++      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([])
++      throw new Error(`dry-run 不应调用非只读 gh 命令: ${args.join(' ')}`)
++    }
++    deps.runGit = (args) => {
++      gitCalls.push(args)
++      if (args[0] === 'ls-remote') return ''
++      throw new Error(`dry-run 不应调用非只读 git 命令: ${args.join(' ')}`)
++    }
++
++    await cmdPublish({ scan: scanPath, rewrite: rewritePath, 'dry-run': true }, deps)
++
++    // 两道门确实各执行了一次只读调用。
++    expect(ghCalls.some((a) => a[0] === 'pr' && a[1] === 'list')).toBe(true)
++    expect(gitCalls.some((a) => a[0] === 'ls-remote')).toBe(true)
++
++    const out = stdoutChunks.join('')
++    // 计划清单里允许有"我们不再做 X"这类说明性注释(# 开头),但不能有一条真的会执行
++    // merge/delete 的命令行——只挑非注释行判定,防止对着解释性文字误判。
++    const plannedBlock = out.slice(out.indexOf('将执行的命令'), out.indexOf('PR body 预览'))
++    const commandLines = plannedBlock.split('\n').filter((l) => l.trim() && !l.trim().startsWith('#'))
++    expect(commandLines.some((l) => l.includes('gh pr merge'))).toBe(false)
++    expect(commandLines.some((l) => l.includes('--delete-branch'))).toBe(false)
++    expect(commandLines.some((l) => l.includes('push') && l.includes('--delete'))).toBe(false)
++    expect(out).not.toContain('selfMergeAvailable')
++    expect(out).toContain('admin-trust')
++  })
++
++  it('⑤(F-1 修复)同日分支域门发现目标分支 ref 在远端存在但无对应 open PR(孤儿分支)时:fail-closed 非零退出,不续接、不删除、不 push——不再是旧代码"只报告仍照常 push"的错误行为', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.runGh = (args) => {
++      ghCalls.push(args)
++      if (args[0] === 'pr' && args[1] === 'list' && args.includes('--head')) return JSON.stringify([])
++      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]) // 跨日门:无其他 owned PR
++      throw new Error(`unexpected fake gh call: ${args.join(' ')}`)
++    }
++    deps.runGit = (args) => {
++      gitCalls.push(args)
++      if (args[0] === 'ls-remote') return `deadbeef\trefs/heads/${BRANCH}\n`
++      return ''
++    }
++
++    await expect(cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)).rejects.toMatchObject({ code: 1 })
++
++    // 断言绑到孤儿分支的具体报错原文,而不是只看退出码 1(时区门等其他 abort 路径同样是
++    // 1)。旧版"发现未知同名 ref"只报告不阻断的文案应已不存在。
++    expect(stderrChunks.join('')).toContain('无对应 open PR')
++    expect(stderrChunks.join('')).not.toContain('发现未知同名 ref')
++    expect(gitCalls.filter((a) => a.includes('--delete'))).toHaveLength(0)
++    expect(gitCalls.filter((a) => a[0] === 'worktree' && a[1] === 'add')).toHaveLength(0)
++    expect(gitCalls.filter((a) => a[0] === '-C' && a[2] === 'push')).toHaveLength(0)
++  })
++
++  it('⑤b(F-1 残留修复)ls-remote 检查时目标分支 ref 尚不存在,但真正 push 时该 ref 已被(窗口期内)创建:--force-with-lease 使 push 被拒绝而非静默 fast-forward 改写,非零退出翻红,不删除', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.runGh = successFakeRunGh
++    deps.runGit = (args) => {
++      gitCalls.push(args)
++      if (args[0] === 'ls-remote') return '' // 检查时刻:ref 尚不存在,两道门都放行
++      if (args[0] === 'worktree' && args[1] === 'add') {
++        fakeWorktreeAdd(args[4])
++        return ''
++      }
++      if (args[0] === 'worktree' && args[1] === 'remove') {
++        rmSync(args[3], { recursive: true, force: true })
++        return ''
++      }
++      if (args[0] === '-C' && args[2] === 'push') {
++        // 模拟窗口期竞态:push 时该 ref 已存在,--force-with-lease 断言失败,git 拒绝。
++        throw new Error('git -C ... push 失败(退出码 1): stale info; 远端 ref 已被并发创建')
++      }
++      return ''
++    }
++
++    await expect(cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)).rejects.toMatchObject({ code: 1 })
++
++    // 断言绑到具体失败原因(push 报错原文),而不是只看退出码 1——时区门等其他 abort
++    // 路径同样是退出码 1,退出码相同不代表走的是这条 push-竞态-被拒 路径。
++    expect(stderrChunks.join('')).toContain('stale info')
++    // 且要走到这条路径,push 调用必须确实发生过、且真的带上了 CAS 标志(证明不是在到达
++    // push 之前就已中止,也证明生产代码确实加上了 --force-with-lease)。
++    const pushCalls = gitCalls.filter((a) => a[0] === '-C' && a[2] === 'push')
++    expect(pushCalls).toHaveLength(1)
++    expect(pushCalls[0]).toContain(`--force-with-lease=${BRANCH}:`)
++    expect(gitCalls.filter((a) => a.includes('--delete'))).toHaveLength(0)
++  })
++
++  it('⑥(核心分支域门的既定设计,非归属判定盖过它)目标分支已被非本流程归属但仍新鲜(<22h)的 open PR 占用时:同日分支域门不做归属判定,幂等跳过而非 abort——"存在任何 open PR 都该跳过,不需要知道是谁开的"', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.runGh = (args) => {
++      ghCalls.push(args)
++      if (args[0] === 'pr' && args[1] === 'list' && args.includes('--head')) {
++        return JSON.stringify([
++          {
++            number: 909,
++            url: 'https://github.com/xindong/mivo-canvas/pull/909',
++            createdAt: new Date(FIXED_NOW - 1 * 3_600_000).toISOString(),
++          },
++        ])
++      }
++      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]) // 跨日门:无 owned PR
++      throw new Error(`unexpected fake gh call: ${args.join(' ')}`)
++    }
++    deps.runGit = (args) => {
++      gitCalls.push(args)
++      if (args[0] === 'ls-remote') return `deadbeef\trefs/heads/${BRANCH}\n`
++      return ''
++    }
++
++    await cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)
++
++    const out = stdoutChunks.join('')
++    const match = out.match(/\{"status":"pr-already-open".*?\}/)
++    expect(match).not.toBeNull()
++    expect(JSON.parse(match[0])).toMatchObject({ status: 'pr-already-open', pr: 909, branch: BRANCH, day: DAY })
++    expect(gitCalls.filter((a) => a[0] === 'worktree' && a[1] === 'add')).toHaveLength(0)
++    expect(gitCalls.filter((a) => a[0] === '-C' && a[2] === 'push')).toHaveLength(0)
++  })
++
++  it('⑦(F-5 修复)跨日门用 --limit 201(上限 200 的哨兵探测值,而非直接把 --limit 设成 200)避免静默截断', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.runGh = successFakeRunGh
++
++    await cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)
++
++    const listCall = ghCalls.find((a) => a[0] === 'pr' && a[1] === 'list' && !a.includes('--head'))
++    expect(listCall).toBeDefined()
++    const limitIdx = listCall.indexOf('--limit')
++    expect(limitIdx).toBeGreaterThan(-1)
++    expect(listCall[limitIdx + 1]).toBe('201')
++  })
++
++  it('⑧(F-5 修复)open PR 数真正超过 200 上限(201 条,触到哨兵值)时:视为截断,非零退出,不做任何 git 操作', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    const manyPrs = Array.from({ length: 201 }, (_, i) => ({
++      number: 1000 + i,
++      headRefName: `feature/unrelated-${i}`,
++      createdAt: new Date(FIXED_NOW).toISOString(),
++      url: `https://github.com/xindong/mivo-canvas/pull/${1000 + i}`,
++      author: FOREIGN_AUTHOR,
++      headRepositoryOwner: OWNED_REPO_OWNER,
++    }))
++    deps.runGh = (args) => {
++      ghCalls.push(args)
++      if (args[0] === 'pr' && args[1] === 'list' && !args.includes('--head')) {
++        return JSON.stringify(manyPrs)
++      }
++      throw new Error(`unexpected fake gh call: ${args.join(' ')}`)
++    }
++
++    await expect(cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)).rejects.toMatchObject({ code: 1 })
++
++    expect(stderrChunks.join('')).toContain('哨兵探测')
++    const listCall = ghCalls.find((a) => a[0] === 'pr' && a[1] === 'list' && !a.includes('--head'))
++    expect(listCall).toBeDefined()
++    expect(listCall[listCall.indexOf('--limit') + 1]).toBe('201')
++    expect(gitCalls.filter((a) => a.includes('--delete'))).toHaveLength(0)
++    expect(gitCalls.filter((a) => a[0] === 'worktree' && a[1] === 'add')).toHaveLength(0)
++    expect(gitCalls.filter((a) => a[0] === '-C' && a[2] === 'push')).toHaveLength(0)
++  })
++
++  it('⑧b(F-5 修复,假阳性回归)open PR 数恰好 200 条且完整(没有更多被截断)时:不误判为截断,照常继续发布——这正是旧版"直接把 --limit 设成上限值"会误伤的场景', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    const exactly200 = Array.from({ length: 200 }, (_, i) => ({
++      number: 2000 + i,
++      headRefName: `feature/unrelated-${i}`,
++      createdAt: new Date(FIXED_NOW).toISOString(),
++      url: `https://github.com/xindong/mivo-canvas/pull/${2000 + i}`,
++      author: FOREIGN_AUTHOR,
++      headRepositoryOwner: OWNED_REPO_OWNER,
++    }))
++    deps.runGh = (args) => {
++      if (args[0] === 'pr' && args[1] === 'list' && !args.includes('--head')) {
++        ghCalls.push(args)
++        return JSON.stringify(exactly200)
++      }
++      return successFakeRunGh(args)
++    }
++
++    await cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)
++
++    const out = stdoutChunks.join('')
++    expect(out).toContain('"status":"pr-opened"')
++    expect(stderrChunks.join('')).not.toContain('哨兵探测')
++  })
++
++  it('⑨open PR 数超过旧 30-limit(35 条)但未触到新上限时:仍能在第 33 位正确发现归属本流程的 open changelog PR 并幂等跳过(旧 30-limit 会漏检)', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    const noise = (count, offset) =>
++      Array.from({ length: count }, (_, i) => ({
++        number: offset + i,
++        headRefName: `feature/unrelated-${offset + i}`,
++        createdAt: new Date(FIXED_NOW).toISOString(),
++        url: `https://github.com/xindong/mivo-canvas/pull/${offset + i}`,
++        author: FOREIGN_AUTHOR,
++        headRepositoryOwner: OWNED_REPO_OWNER,
++      }))
++    const target = {
++      number: 3033,
++      headRefName: 'chore/changelog-2026-07-15',
++      createdAt: new Date(FIXED_NOW - 2 * 3_600_000).toISOString(),
++      url: 'https://github.com/xindong/mivo-canvas/pull/3033',
++      author: OWNED_AUTHOR,
++      headRepositoryOwner: OWNED_REPO_OWNER,
++    }
++    // target 排在第 33 位(index 32),超过旧 gh pr list 默认 30-limit 的窗口。
++    const list = [...noise(32, 2000), target, ...noise(2, 4000)]
++    deps.runGh = (args) => {
++      ghCalls.push(args)
++      if (args[0] === 'pr' && args[1] === 'list' && !args.includes('--head')) {
++        return JSON.stringify(list)
++      }
++      throw new Error(`unexpected fake gh call: ${args.join(' ')}`)
++    }
++
++    await cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)
++
++    const out = stdoutChunks.join('')
++    const match = out.match(/\{"status":"pr-already-open".*?\}/)
++    expect(match).not.toBeNull()
++    expect(JSON.parse(match[0])).toMatchObject({ status: 'pr-already-open', pr: 3033 })
++  })
++
++  it('⑩(F-2 修复)cleanup() 只回收本轮确实创建的本地分支:worktree 已建成后失败时,branch -D 与 worktree remove 成对触发', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.runGh = (args) => {
++      ghCalls.push(args)
++      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([])
++      if (args[0] === 'pr' && args[1] === 'create') return 'https://github.com/xindong/mivo-canvas/pull/999'
++      if (args[0] === 'pr' && args[1] === 'checks') return JSON.stringify([{ name: 'CI', state: 'FAILURE' }])
++      throw new Error(`unexpected fake gh call: ${args.join(' ')}`)
++    }
++
++    await expect(cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)).rejects.toMatchObject({ code: 2 })
++
++    // worktree 已经建成(worktree add 发生过),失败路径必须清理它,且分支删除必须
++    // 与之成对(同一个 worktreeCreated 判据),而不是无条件执行。
++    expect(gitCalls.filter((a) => a[0] === 'worktree' && a[1] === 'add')).toHaveLength(1)
++    expect(gitCalls.filter((a) => a[0] === 'worktree' && a[1] === 'remove')).toHaveLength(1)
++    expect(gitCalls.filter((a) => a[0] === 'branch' && a[1] === '-D')).toHaveLength(1)
++  })
++
++  it('⑪(F-3 修复)cleanup() 的 worktree remove / branch -D 均带 allowFail:true,即使底层命令真的失败也不会向上抛出、也不会覆盖原始的 CI 失败错误', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.runGh = (args) => {
++      ghCalls.push(args)
++      if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([])
++      if (args[0] === 'pr' && args[1] === 'create') return 'https://github.com/xindong/mivo-canvas/pull/999'
++      if (args[0] === 'pr' && args[1] === 'checks') return JSON.stringify([{ name: 'CI', state: 'FAILURE' }])
++      throw new Error(`unexpected fake gh call: ${args.join(' ')}`)
++    }
++    // cleanup() 里的两处调用(worktree remove / branch -D)在假件里真的抛错;由于生产
++    // 代码传了 allowFail:true,假件应静默吞掉、返回 null,不向上传播。
++    deps.runGit = makeFailingRunGit(
++      (args) => (args[0] === 'worktree' && args[1] === 'remove') || (args[0] === 'branch' && args[1] === '-D'),
++      () => 'cleanup 底层命令模拟失败(不应影响最终报错内容)',
++    )
++
++    await expect(cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)).rejects.toMatchObject({ code: 2 })
++
++    // 最终报错必须仍是"CI 有失败项"(原始原因),不能被 cleanup 内部的模拟失败覆盖或吞掉
++    // 导致测试本身挂起/抛出未捕获异常。
++    expect(stderrChunks.join('')).toContain('CI 有失败项')
++    expect(stderrChunks.join('')).not.toContain('cleanup 底层命令模拟失败')
++    // 且两处 allowFail 调用确实都被触发过(证明真的经过了会抛错的分支,不是没打中)。
++    expect(gitCalls.filter((a) => a[0] === 'worktree' && a[1] === 'remove')).toHaveLength(1)
++    expect(gitCalls.filter((a) => a[0] === 'branch' && a[1] === '-D')).toHaveLength(1)
++  })
++})
++
++describe('assertChangelogTimeZone(时区门,经 cmdPublish 间接验证,W1R3 blocker 修复)', () => {
++  it('当前时区不是 Asia/Shanghai 时:fail-closed 拒绝,不做任何 git/gh 调用(deps.timeZone 可注入,不依赖进程真实 TZ)', async () => {
++    const { scanPath, rewritePath } = writeFixtures()
++    deps.timeZone = 'UTC'
++
++    await expect(cmdPublish({ scan: scanPath, rewrite: rewritePath }, deps)).rejects.toMatchObject({ code: 1 })
++
++    expect(gitCalls).toHaveLength(0)
++    expect(ghCalls).toHaveLength(0)
++    expect(stderrChunks.join('')).toContain('必须在 Asia/Shanghai 时区运行')
++  })
++})
++
++describe('isMainModule(经符号链接调用,SC-W1R2-04 realpath 修复)', () => {
++  it('通过符号链接调用脚本时仍执行 main(),打印用法并 exit 2(旧 resolve() 比较会让 main() 静默不跑、exit 0)', () => {
++    const scriptPath = fileURLToPath(new URL('./auto-changelog.mjs', import.meta.url))
++    const linkDir = mkdtempSync(join(tmpdir(), 'auto-changelog-symlink-'))
++    const linkPath = join(linkDir, 'auto-changelog-link.mjs')
++    symlinkSync(scriptPath, linkPath)
++    try {
++      const result = spawnSync(process.execPath, [linkPath], { encoding: 'utf8' })
++      expect(result.status).toBe(2)
++      expect(result.stderr).toContain('用法')
++    } finally {
++      rmSync(linkDir, { recursive: true, force: true })
++    }
++  })
++
++  it('argv[1] 缺失(如 node -e)时判 false,不算主模块(未变行为,纯粹补覆盖)', () => {
++    expect(computeIsMainModule(undefined, import.meta.url)).toBe(false)
++    expect(computeIsMainModule('', import.meta.url)).toBe(false)
++  })
++
++  it('realpathSync 抛错(TOCTOU/EACCES/ELOOP 等)时不再静默判 false——按主模块处理并打印可诊断的 stderr(F-W1R4-01 修复)', () => {
++    const throwingRealpath = () => {
++      throw new Error('ENOENT: no such file or directory(模拟 TOCTOU/权限异常)')
++    }
++    const result = computeIsMainModule('/tmp/whatever-argv1-path.mjs', import.meta.url, throwingRealpath)
++    expect(result).toBe(true)
++    expect(stderrChunks.join('')).toContain('isMainModule 判定异常')
++    expect(stderrChunks.join('')).toContain('ENOENT')
++  })
++})
+diff --git a/scripts/changelog/test-publish-gate.sh b/scripts/changelog/test-publish-gate.sh
+index 04a85dfd..f02471c9 100644
+--- a/scripts/changelog/test-publish-gate.sh
++++ b/scripts/changelog/test-publish-gate.sh
+@@ -1,8 +1,18 @@
+ #!/usr/bin/env bash
+-# scripts/changelog/test-publish-gate.sh — auto-changelog.mjs publish 分支存在性 + 幂等跳过 +
+-# 陈旧门回归测试。真实 git(bare remote + sandbox worktree)+ PATH 前置假 gh,不碰网络、不碰
+-# 真实 GitHub。
+-# 覆盖:
++# scripts/changelog/test-publish-gate.sh — auto-changelog.mjs publish 同日分支域门(分支
++# 存在性 + 幂等跳过 + 陈旧门)回归测试。真实 git(bare remote + sandbox worktree)+ PATH
++# 前置假 gh,不碰网络、不碰真实 GitHub。
++#
++# 本脚本只覆盖"同日分支域门"(不做归属判定,精确按 --head 查询,详见 auto-changelog.mjs
++# cmdPublish 里的同日门注释)。发布前还有一道更早执行的"跨日可见性+幂等门"(按
++# author/headRepositoryOwner 归属过滤、不按分支名匹配),该门与其哨兵 --limit 截断检测、
++# 归属漂移可见性字段,覆盖在 scripts/changelog/auto-changelog.test.mjs(vitest)里——两套
++# 门查顺序执行,跨日门先跑,fake gh 的 "pr list" 分支按是否带 --head 区分两处调用,详见下方
++# FAKE_GH_PR_LIST_WIDE_JSON(跨日门,无 --head)与 FAKE_GH_PR_LIST_HEAD_JSON(同日门,
++# 带 --head)。本文件的全部场景都不测试跨日行为,FAKE_GH_PR_LIST_WIDE_JSON 统一置空数组
++# (代表"跨日门未发现其他归属本流程的 open changelog PR",直接放行到同日门)。
++#
++# 覆盖(同日分支域门):
+ #   (a) 远端无该分支 ref → 正常走到 pr-opened
+ #   (b) ref 存在 + open PR 且新(<22h)→ 幂等跳过、零写
+ #   (b2) 边界:open PR 21.9h(<22h)→ 幂等跳过、零写(钉住阈值恰好 22 的下侧)
+@@ -10,8 +20,14 @@
+ #   (c3) 边界:open PR 22.1h(≥22h)→ fail-closed、零写(钉住阈值恰好 22 的上侧)
+ #   (d) ref 存在但无 open PR(孤儿分支)→ fail-closed、零写
+ #   (e) ls-remote 查询本身失败(origin 不可达)→ fail-closed,不得被误当"ref 不存在"放行
++#       (跨日门的 gh pr list 先成功放行一次,随后同日门的 ls-remote 才失败)
+ #   (f) gh pr list 返回合法但非数组 JSON({})→ fail-closed、零写
+ #   (g) gh pr list 返回 >1 条 open PR((head, base) 唯一性假设被打破)→ fail-closed、零写
++#   (h)(F-1 残留竞态修复,真实 git 验证)ls-remote 检查与真正 push 之间的窗口期竞态 →
++#       --force-with-lease 拒绝、非零退出;含反向变异自证
++#   (i)(F-W1R4-B1 修复,真实 git 验证)自愈路径遇到"残留 wtPath + 同名手工本地分支,但该
++#       路径未在 git worktree 注册表里对应该分支"这一组合 → 不删除本地分支(fail-closed);
++#       含反向变异自证(退回旧的无条件 branch -D,同一场景必须变红)
+ # 与进程时区无关:被测 node 进程显式传 TZ=Asia/Shanghai,不依赖外层 shell 的 TZ。
+ # 跑法:bash scripts/changelog/test-publish-gate.sh
+ set -euo pipefail
+@@ -39,8 +55,19 @@ cmd="${1:-}"; sub="${2:-}"
+ echo "$*" >> "$FAKE_GH_LOG"
+ case "$cmd $sub" in
+   "pr list")
+-    : "${FAKE_GH_PR_LIST_JSON:?FAKE_GH_PR_LIST_JSON not set}"
+-    printf '%s' "$FAKE_GH_PR_LIST_JSON"
++    # 跨日门(无 --head)与同日分支域门(带 --head)共用 "gh pr list" 子命令,
++    # 靠 --head 是否出现在参数里区分该走哪个假响应。
++    has_head=0
++    for arg in "$@"; do
++      if [ "$arg" = "--head" ]; then has_head=1; fi
++    done
++    if [ "$has_head" -eq 1 ]; then
++      : "${FAKE_GH_PR_LIST_HEAD_JSON:?FAKE_GH_PR_LIST_HEAD_JSON not set}"
++      printf '%s' "$FAKE_GH_PR_LIST_HEAD_JSON"
++    else
++      : "${FAKE_GH_PR_LIST_WIDE_JSON:?FAKE_GH_PR_LIST_WIDE_JSON not set}"
++      printf '%s' "$FAKE_GH_PR_LIST_WIDE_JSON"
++    fi
+     ;;
+   "pr create")
+     : "${FAKE_GH_NEW_PR_NUMBER:?FAKE_GH_NEW_PR_NUMBER not set}"
+@@ -146,7 +173,7 @@ run_publish() {
+     --rewrite "$REWRITE_JSON" --scan "$SCAN_JSON" "$@") >"$outfile" 2>"$errfile"
+ }
+ 
+-echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ==="
++echo "=== auto-changelog publish: 同日分支域门(分支存在性 + 幂等跳过 + 陈旧门) ==="
+ 
+ # ---- (a) 远端无该分支 ref → 正常走到 pr-opened(真实 git worktree/commit/push 打本地 bare remote)----
+ {
+@@ -154,6 +181,7 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   out="$WORK/out-a.txt"; err="$WORK/stderr-a.log"
+   setup_sandbox "$sandbox" "$bare"
+   export FAKE_GH_LOG="$WORK/gh-a.log"; : > "$FAKE_GH_LOG"
++  export FAKE_GH_PR_LIST_WIDE_JSON='[]'
+   export FAKE_GH_NEW_PR_NUMBER=901
+   export FAKE_GH_PR_VIEW_JSON="{\"files\":[{\"path\":\"public/changelog.json\"}],\"mergeable\":\"MERGEABLE\",\"headRefName\":\"$BRANCH\"}"
+   export FAKE_GH_PR_CHECKS_JSON='[{"name":"ci","state":"SUCCESS"}]'
+@@ -176,12 +204,12 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   else
+     bad "(a) 未观察到 gh pr create 调用;log=$(cat "$FAKE_GH_LOG")"
+   fi
+-  if ! grep -q '^pr list' "$FAKE_GH_LOG"; then
+-    ok "(a) ref 不存在时未调用 gh pr list(门先查 ref,PR 查询只在 ref 存在时才做)"
++  if grep -qc '^pr list' "$FAKE_GH_LOG" && [ "$(grep -c '^pr list' "$FAKE_GH_LOG")" -eq 1 ] && ! grep '^pr list' "$FAKE_GH_LOG" | grep -q -- '--head'; then
++    ok "(a) 跨日门(无 --head)调用了恰好一次 gh pr list;同日分支域门因 ref 不存在,未调用带 --head 的 gh pr list"
+   else
+-    bad "(a) ref 不存在本不该查 gh pr list,但观察到了:log=$(cat "$FAKE_GH_LOG")"
++    bad "(a) 期望恰好一次不带 --head 的 gh pr list(跨日门)、零带 --head 调用(同日门被 ref-不存在 短路);log=$(cat "$FAKE_GH_LOG")"
+   fi
+-  unset FAKE_GH_LOG FAKE_GH_NEW_PR_NUMBER FAKE_GH_PR_VIEW_JSON FAKE_GH_PR_CHECKS_JSON FAKE_GH_GRAPHQL_JSON
++  unset FAKE_GH_LOG FAKE_GH_PR_LIST_WIDE_JSON FAKE_GH_NEW_PR_NUMBER FAKE_GH_PR_VIEW_JSON FAKE_GH_PR_CHECKS_JSON FAKE_GH_GRAPHQL_JSON
+ }
+ 
+ # ---- (b) ref 存在 + open PR 且新(<22h)→ exit 0 + pr-already-open + 零写 ----
+@@ -191,8 +219,9 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   setup_sandbox "$sandbox" "$bare"
+   push_placeholder_branch "$sandbox" "$BRANCH"
+   export FAKE_GH_LOG="$WORK/gh-b.log"; : > "$FAKE_GH_LOG"
++  export FAKE_GH_PR_LIST_WIDE_JSON='[]'
+   created_at="$(iso_hours_ago 2)"
+-  export FAKE_GH_PR_LIST_JSON="[{\"number\":902,\"url\":\"https://github.com/xindong/mivo-canvas/pull/902\",\"createdAt\":\"$created_at\"}]"
++  export FAKE_GH_PR_LIST_HEAD_JSON="[{\"number\":902,\"url\":\"https://github.com/xindong/mivo-canvas/pull/902\",\"createdAt\":\"$created_at\"}]"
+   before="$(remote_branch_refs "$bare")"
+   if run_publish "$sandbox" "$out" "$err"; then rc=0; else rc=$?; fi
+   after="$(remote_branch_refs "$bare")"
+@@ -216,7 +245,7 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   else
+     bad "(b) gh pr list 调用缺 --base main:log=$(cat "$FAKE_GH_LOG")"
+   fi
+-  unset FAKE_GH_LOG FAKE_GH_PR_LIST_JSON
++  unset FAKE_GH_LOG FAKE_GH_PR_LIST_WIDE_JSON FAKE_GH_PR_LIST_HEAD_JSON
+ }
+ 
+ # ---- (b2) 边界:ref 存在 + open PR 恰好 21.9h(<22h)→ exit 0 + pr-already-open + 零写 ----
+@@ -229,8 +258,9 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   setup_sandbox "$sandbox" "$bare"
+   push_placeholder_branch "$sandbox" "$BRANCH"
+   export FAKE_GH_LOG="$WORK/gh-b2.log"; : > "$FAKE_GH_LOG"
++  export FAKE_GH_PR_LIST_WIDE_JSON='[]'
+   created_at="$(iso_hours_ago 21.9)"
+-  export FAKE_GH_PR_LIST_JSON="[{\"number\":905,\"url\":\"https://github.com/xindong/mivo-canvas/pull/905\",\"createdAt\":\"$created_at\"}]"
++  export FAKE_GH_PR_LIST_HEAD_JSON="[{\"number\":905,\"url\":\"https://github.com/xindong/mivo-canvas/pull/905\",\"createdAt\":\"$created_at\"}]"
+   before="$(remote_branch_refs "$bare")"
+   if run_publish "$sandbox" "$out" "$err"; then rc=0; else rc=$?; fi
+   after="$(remote_branch_refs "$bare")"
+@@ -244,7 +274,7 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   else
+     bad "(b2) 期望零写,但 bare remote ref 快照变了:before=[$before] after=[$after]"
+   fi
+-  unset FAKE_GH_LOG FAKE_GH_PR_LIST_JSON
++  unset FAKE_GH_LOG FAKE_GH_PR_LIST_WIDE_JSON FAKE_GH_PR_LIST_HEAD_JSON
+ }
+ 
+ # ---- (c) 陈旧门,同一 sandbox 顺序复用两个子场景(两者都不触发任何 git 写动作,零污染风险)----
+@@ -253,10 +283,11 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   setup_sandbox "$sandbox" "$bare"
+   push_placeholder_branch "$sandbox" "$BRANCH"
+   export FAKE_GH_LOG="$WORK/gh-c.log"
++  export FAKE_GH_PR_LIST_WIDE_JSON='[]'
+ 
+   # (c1) ref 存在 + open PR 已开 23h(≥22h)→ 非零退出 + 零写
+   : > "$FAKE_GH_LOG"
+-  export FAKE_GH_PR_LIST_JSON="[{\"number\":903,\"url\":\"https://github.com/xindong/mivo-canvas/pull/903\",\"createdAt\":\"$(iso_hours_ago 23)\"}]"
++  export FAKE_GH_PR_LIST_HEAD_JSON="[{\"number\":903,\"url\":\"https://github.com/xindong/mivo-canvas/pull/903\",\"createdAt\":\"$(iso_hours_ago 23)\"}]"
+   before="$(remote_branch_refs "$bare")"
+   if run_publish "$sandbox" "$WORK/out-c1.txt" "$WORK/stderr-c1.log"; then rc=0; else rc=$?; fi
+   after="$(remote_branch_refs "$bare")"
+@@ -278,7 +309,7 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+ 
+   # (c2) ref 存在 + open PR createdAt 非法串 → 非零退出 + 零写
+   : > "$FAKE_GH_LOG"
+-  export FAKE_GH_PR_LIST_JSON='[{"number":904,"url":"https://github.com/xindong/mivo-canvas/pull/904","createdAt":"not-a-real-timestamp"}]'
++  export FAKE_GH_PR_LIST_HEAD_JSON='[{"number":904,"url":"https://github.com/xindong/mivo-canvas/pull/904","createdAt":"not-a-real-timestamp"}]'
+   before="$(remote_branch_refs "$bare")"
+   if run_publish "$sandbox" "$WORK/out-c2.txt" "$WORK/stderr-c2.log"; then rc=0; else rc=$?; fi
+   after="$(remote_branch_refs "$bare")"
+@@ -296,7 +327,7 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   # (c3) 边界:ref 存在 + open PR 恰好 22.1h(≥22h)→ 非零退出 + 零写(阈值 22 的上侧邻域,
+   # 与 (b2) 的 21.9h 成对夹逼,把常量 22 本身钉死)
+   : > "$FAKE_GH_LOG"
+-  export FAKE_GH_PR_LIST_JSON="[{\"number\":906,\"url\":\"https://github.com/xindong/mivo-canvas/pull/906\",\"createdAt\":\"$(iso_hours_ago 22.1)\"}]"
++  export FAKE_GH_PR_LIST_HEAD_JSON="[{\"number\":906,\"url\":\"https://github.com/xindong/mivo-canvas/pull/906\",\"createdAt\":\"$(iso_hours_ago 22.1)\"}]"
+   before="$(remote_branch_refs "$bare")"
+   if run_publish "$sandbox" "$WORK/out-c3.txt" "$WORK/stderr-c3.log"; then rc=0; else rc=$?; fi
+   after="$(remote_branch_refs "$bare")"
+@@ -310,7 +341,7 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   else
+     bad "(c3) 期望零写,但 bare remote ref 快照变了:before=[$before] after=[$after]"
+   fi
+-  unset FAKE_GH_LOG FAKE_GH_PR_LIST_JSON
++  unset FAKE_GH_LOG FAKE_GH_PR_LIST_WIDE_JSON FAKE_GH_PR_LIST_HEAD_JSON
+ }
+ 
+ # ---- (d) ref 存在但无 open PR(孤儿分支:push 成功但 pr create 失败,或 PR 被 close)→ 非零退出 + 零写 ----
+@@ -319,7 +350,8 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   setup_sandbox "$sandbox" "$bare"
+   push_placeholder_branch "$sandbox" "$BRANCH"
+   export FAKE_GH_LOG="$WORK/gh-d.log"; : > "$FAKE_GH_LOG"
+-  export FAKE_GH_PR_LIST_JSON='[]'
++  export FAKE_GH_PR_LIST_WIDE_JSON='[]'
++  export FAKE_GH_PR_LIST_HEAD_JSON='[]'
+   before="$(remote_branch_refs "$bare")"
+   if run_publish "$sandbox" "$WORK/out-d.txt" "$WORK/stderr-d.log"; then rc=0; else rc=$?; fi
+   after="$(remote_branch_refs "$bare")"
+@@ -338,22 +370,26 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   else
+     bad "(d) gh pr list 调用缺 --base main:log=$(cat "$FAKE_GH_LOG")"
+   fi
+-  unset FAKE_GH_LOG FAKE_GH_PR_LIST_JSON
++  unset FAKE_GH_LOG FAKE_GH_PR_LIST_WIDE_JSON FAKE_GH_PR_LIST_HEAD_JSON
+ }
+ 
+ # ---- (e) ls-remote 查询本身失败(origin 指向不存在的远端)→ fail-closed,不得被误当"ref 不存在"放行 ----
++# 跨日门比同日分支域门先执行,跨日门的 gh pr list 会先成功放行一次;随后同日门的
++# ls-remote 才失败——"零 gh 调用"已不成立,改断言"恰好一次不带 --head 的 gh pr list"。
+ {
+   sandbox="$WORK/sbx-e"
+   init_sandbox_repo "$sandbox"
+   git -C "$sandbox" remote add origin "$WORK/does-not-exist-e.git"
+   export FAKE_GH_LOG="$WORK/gh-e.log"; : > "$FAKE_GH_LOG"
++  export FAKE_GH_PR_LIST_WIDE_JSON='[]'
+   if run_publish "$sandbox" "$WORK/out-e.txt" "$WORK/stderr-e.log"; then rc=0; else rc=$?; fi
+-  if [ "$rc" -ne 0 ] && [ ! -s "$FAKE_GH_LOG" ] && grep -q 'ls-remote' "$WORK/stderr-e.log"; then
+-    ok "(e) ls-remote 查询失败(origin 不可达) → fail-closed 非零退出,零 gh 调用,stderr 含'ls-remote'(未被误当'ref 不存在'放行,也未与后续步骤失败混同)"
++  gh_calls="$(wc -l < "$FAKE_GH_LOG" | tr -d ' ')"
++  if [ "$rc" -ne 0 ] && [ "$gh_calls" -eq 1 ] && grep '^pr list' "$FAKE_GH_LOG" | grep -qv -- '--head'; then
++    ok "(e) 跨日门 gh pr list 先成功放行(恰好 1 次调用,无 --head),随后同日分支域门 ls-remote 查询失败 → fail-closed 非零退出,未被误当'ref 不存在'放行"
+   else
+-    bad "(e) 应 fail-closed 非零退出、零 gh 调用、stderr 含'ls-remote',实际 rc=$rc,gh log=$(cat "$FAKE_GH_LOG" 2>/dev/null)"; cat "$WORK/stderr-e.log" 2>/dev/null
++    bad "(e) 应恰好 1 次不带 --head 的 gh 调用后 fail-closed 非零退出,实际 rc=$rc,gh_calls=$gh_calls,log=$(cat "$FAKE_GH_LOG" 2>/dev/null)"; cat "$WORK/stderr-e.log" 2>/dev/null
+   fi
+-  unset FAKE_GH_LOG
++  unset FAKE_GH_LOG FAKE_GH_PR_LIST_WIDE_JSON
+ }
+ 
+ # ---- (f) ref 存在 + gh pr list 返回合法但非数组 JSON({})→ 非零退出 + 零写 ----
+@@ -362,7 +398,8 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   setup_sandbox "$sandbox" "$bare"
+   push_placeholder_branch "$sandbox" "$BRANCH"
+   export FAKE_GH_LOG="$WORK/gh-f.log"; : > "$FAKE_GH_LOG"
+-  export FAKE_GH_PR_LIST_JSON='{}'
++  export FAKE_GH_PR_LIST_WIDE_JSON='[]'
++  export FAKE_GH_PR_LIST_HEAD_JSON='{}'
+   before="$(remote_branch_refs "$bare")"
+   if run_publish "$sandbox" "$WORK/out-f.txt" "$WORK/stderr-f.log"; then rc=0; else rc=$?; fi
+   after="$(remote_branch_refs "$bare")"
+@@ -381,7 +418,7 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   else
+     bad "(f) gh pr list 调用缺 --base main:log=$(cat "$FAKE_GH_LOG")"
+   fi
+-  unset FAKE_GH_LOG FAKE_GH_PR_LIST_JSON
++  unset FAKE_GH_LOG FAKE_GH_PR_LIST_WIDE_JSON FAKE_GH_PR_LIST_HEAD_JSON
+ }
+ 
+ # ---- (g) ref 存在 + gh pr list 返回 >1 条 open PR((head, base) 唯一性假设被打破)→ 非零退出 + 零写 ----
+@@ -390,7 +427,8 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   setup_sandbox "$sandbox" "$bare"
+   push_placeholder_branch "$sandbox" "$BRANCH"
+   export FAKE_GH_LOG="$WORK/gh-g.log"; : > "$FAKE_GH_LOG"
+-  export FAKE_GH_PR_LIST_JSON="[{\"number\":907,\"url\":\"https://github.com/xindong/mivo-canvas/pull/907\",\"createdAt\":\"$(iso_hours_ago 2)\"},{\"number\":908,\"url\":\"https://github.com/xindong/mivo-canvas/pull/908\",\"createdAt\":\"$(iso_hours_ago 1)\"}]"
++  export FAKE_GH_PR_LIST_WIDE_JSON='[]'
++  export FAKE_GH_PR_LIST_HEAD_JSON="[{\"number\":907,\"url\":\"https://github.com/xindong/mivo-canvas/pull/907\",\"createdAt\":\"$(iso_hours_ago 2)\"},{\"number\":908,\"url\":\"https://github.com/xindong/mivo-canvas/pull/908\",\"createdAt\":\"$(iso_hours_ago 1)\"}]"
+   before="$(remote_branch_refs "$bare")"
+   if run_publish "$sandbox" "$WORK/out-g.txt" "$WORK/stderr-g.log"; then rc=0; else rc=$?; fi
+   after="$(remote_branch_refs "$bare")"
+@@ -404,9 +442,249 @@ echo "=== auto-changelog publish: 分支存在性 + 幂等跳过 + 陈旧门 ===
+   else
+     bad "(g) 期望零写,但 bare remote ref 快照变了:before=[$before] after=[$after]"
+   fi
+-  unset FAKE_GH_LOG FAKE_GH_PR_LIST_JSON
++  unset FAKE_GH_LOG FAKE_GH_PR_LIST_WIDE_JSON FAKE_GH_PR_LIST_HEAD_JSON
+ }
+ 
++# ---- (h)(F-1 残留竞态修复,真实 git 验证,非 vitest 假件)----
++# 同日门的 `git ls-remote` 检查与真正 `git push` 之间存在一个不可消除的 check-then-act 窗口。
++# 用一个只在本场景生效的 git 包装器,在 ls-remote 返回(真实、准确反映"此刻确实不存在")
++# 之后、真正 push 之前,立即用真实 git 把该分支创建为 origin/main 的别名(fast-forward
++# 祖先关系,模拟"另一进程在窗口期内抢先创建了同名分支")。断言:
++#   (a) publish 非零退出
++#   (b) 远端该分支 ref 的 OID 仍是竞争者的提交(未被改写成 publish 自己的提交)
++#   (c) stderr 有可辨识的拒绝原因(stale info / rejected)
++# 反向变异自证:把生产脚本里的 --force-with-lease=<branch>: 去掉(退回裸 push -u),同一
++# 竞态场景复跑必须变红——远端 ref 被静默 fast-forward 改写成 mutant 自己的提交(这正是
++# F-1 要消除的旧 bug:实测 ref 从 feb8c7be 前移到 e39cad83)。若变红失败,说明上面 (h) 的
++# 断言对生产代码的真实保护力度判断有误,必须重新核实。
++{
++  sandbox="$WORK/sbx-h"; bare="$WORK/bare-h.git"
++  setup_sandbox "$sandbox" "$bare"
++  export FAKE_GH_LOG="$WORK/gh-h.log"; : > "$FAKE_GH_LOG"
++  export FAKE_GH_PR_LIST_WIDE_JSON='[]'
++  export FAKE_GH_NEW_PR_NUMBER=950
++  export FAKE_GH_PR_VIEW_JSON="{\"files\":[{\"path\":\"public/changelog.json\"}],\"mergeable\":\"MERGEABLE\",\"headRefName\":\"$BRANCH\"}"
++  export FAKE_GH_PR_CHECKS_JSON='[{"name":"ci","state":"SUCCESS"}]'
++  export FAKE_GH_GRAPHQL_JSON='{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
++  export REAL_GIT_BIN="$(command -v git)"
++  export RACE_INJECT_BRANCH="$BRANCH"
++  export RACE_SANDBOX="$sandbox"
++  export RACE_INJECT_MARKER="$WORK/race-h.marker"; rm -f "$RACE_INJECT_MARKER"
++
++  competitor_oid="$(git -C "$sandbox" rev-parse main)"
++
++  # 只在本场景生效的 git 包装器:拦截目标分支的 ls-remote 调用,真实转发拿到准确结果后,
++  # 立即(用真实 git,绕过自己)把该分支推成 main 的别名——模拟窗口期内的并发创建。
++  cat > "$FAKE_BIN/git" <<'RACE_GIT_EOF'
++#!/usr/bin/env bash
++set -euo pipefail
++: "${REAL_GIT_BIN:?REAL_GIT_BIN not set}"
++if [ "${1:-}" = "ls-remote" ]; then
++  hit=0
++  for arg in "$@"; do
++    if [ "$arg" = "${RACE_INJECT_BRANCH:-}" ]; then hit=1; fi
++  done
++  if [ "$hit" -eq 1 ]; then
++    out="$("$REAL_GIT_BIN" "$@")"
++    if [ -n "${RACE_INJECT_MARKER:-}" ] && [ ! -e "$RACE_INJECT_MARKER" ]; then
++      touch "$RACE_INJECT_MARKER"
++      "$REAL_GIT_BIN" -C "$RACE_SANDBOX" push --quiet origin "refs/heads/main:refs/heads/$RACE_INJECT_BRANCH" >/dev/null 2>&1 || true
++    fi
++    printf '%s' "$out"
++    exit 0
++  fi
++fi
++exec "$REAL_GIT_BIN" "$@"
++RACE_GIT_EOF
++  chmod +x "$FAKE_BIN/git"
++
++  if run_publish "$sandbox" "$WORK/out-h.txt" "$WORK/stderr-h.log"; then rc=0; else rc=$?; fi
++  race_ref_oid="$(git -C "$bare" for-each-ref --format='%(objectname)' "refs/heads/$BRANCH" 2>/dev/null || true)"
++
++  if [ "$rc" -ne 0 ] && [ "$race_ref_oid" = "$competitor_oid" ]; then
++    ok "(h) 窗口期竞态:ls-remote 后/push 前该分支被(模拟)并发创建为 main 别名 → --force-with-lease 拒绝 push,非零退出,远端 ref 仍是竞争者的提交(未被改写)"
++  else
++    bad "(h) 期望非零退出且远端 ref 保持竞争者提交,实际 rc=$rc,race_ref_oid=$race_ref_oid,expected=$competitor_oid"; cat "$WORK/stderr-h.log"
++  fi
++  if grep -qi 'stale info\|rejected' "$WORK/stderr-h.log"; then
++    ok "(h) stderr 含可辨识的拒绝原因(stale info/rejected)"
++  else
++    bad "(h) stderr 未见可辨识的拒绝原因:$(cat "$WORK/stderr-h.log")"
++  fi
++
++  # ---- 反向变异自证 ----
++  mutated_script="$WORK/auto-changelog-no-lease.mjs"
++  node -e '
++    const fs = require("node:fs")
++    const src = fs.readFileSync(process.argv[1], "utf8")
++    const marker = ", `--force-with-lease=${branch}:`"
++    if (!src.includes(marker)) {
++      console.error("MARKER_NOT_FOUND: 生产脚本里未找到预期的 --force-with-lease 片段,反向变异自证不成立")
++      process.exit(1)
++    }
++    fs.writeFileSync(process.argv[2], src.split(marker).join(""))
++  ' "$SCRIPT_SRC" "$mutated_script"
++
++  # 只核实"真正生效的那个数组元素"被去掉,不是整份文件里任何位置都不能出现该字符串——
++  # dry-run 的"将执行的命令"展示文案里还留着两行同名字符串(纯展示,不影响真实 push 调用
++  # 的参数),用宽泛的 grep 会把那两行误判成"没删干净",fixed-string 精确匹配到目标数组
++  # 元素本身才是要核实的东西。
++  if grep -qF ', `--force-with-lease=${branch}:`' "$mutated_script"; then
++    bad "(h-mutant) mutant 脚本仍含目标 --force-with-lease 数组元素,反向变异自证不成立(未能构造对照组)"
++  else
++    ok "(h-mutant) 已构造去掉 --force-with-lease 的对照组脚本"
++    sandbox2="$WORK/sbx-h-mutant"; bare2="$WORK/bare-h-mutant.git"
++    setup_sandbox "$sandbox2" "$bare2"
++    cp "$mutated_script" "$sandbox2/scripts/changelog/auto-changelog.mjs"
++    competitor_oid2="$(git -C "$sandbox2" rev-parse main)"
++    export RACE_SANDBOX="$sandbox2"
++    export RACE_INJECT_MARKER="$WORK/race-h-mutant.marker"; rm -f "$RACE_INJECT_MARKER"
++    if run_publish "$sandbox2" "$WORK/out-h-mutant.txt" "$WORK/stderr-h-mutant.log"; then rc2=0; else rc2=$?; fi
++    race_ref_oid2="$(git -C "$bare2" for-each-ref --format='%(objectname)' "refs/heads/$BRANCH" 2>/dev/null || true)"
++    if [ "$rc2" -eq 0 ] && [ "$race_ref_oid2" != "$competitor_oid2" ]; then
++      ok "(h-mutant) 反向变异自证:去掉 --force-with-lease 后同一竞态场景变红——远端 ref 被静默改写成 mutant 自己的提交(证明修复前的旧 bug 真实存在,(h) 的断言确实在咬合,不是摆设)"
++    else
++      bad "(h-mutant) 反向变异自证失败:去掉 lease 后未复现旧 bug(rc2=$rc2,race_ref_oid2=$race_ref_oid2,competitor2=$competitor_oid2)——说明 (h) 对生产代码保护力度的判断可能有误,需要重新核实"
++    fi
++  fi
++
++  # 还原 FAKE_BIN/git 为纯透传,避免污染本场景之外的任何后续调用。
++  cat > "$FAKE_BIN/git" <<'PASSTHRU_GIT_EOF'
++#!/usr/bin/env bash
++exec "$REAL_GIT_BIN" "$@"
++PASSTHRU_GIT_EOF
++  chmod +x "$FAKE_BIN/git"
++  unset FAKE_GH_LOG FAKE_GH_PR_LIST_WIDE_JSON FAKE_GH_NEW_PR_NUMBER FAKE_GH_PR_VIEW_JSON FAKE_GH_PR_CHECKS_JSON FAKE_GH_GRAPHQL_JSON
++  unset REAL_GIT_BIN RACE_INJECT_BRANCH RACE_SANDBOX RACE_INJECT_MARKER
++}
++
++# ---- (i)(F-W1R4-B1 修复,真实 git 验证,非 vitest 假件)----
++# 自愈路径(existsSync(wtPath) 为真时)此前只把 wtPath 路径是否存在当归属凭证——process.pid
++# 会复用,"路径存在"是"内容相等"不是"创建凭证"。用一个只在本场景生效的 git 包装器,在
++# cmdPublish 里最早的一次真实 git 调用(`fetch origin main`,在 existsSync(wtPath) 判定
++# 之前)真实转发之后,立即(用真实 git,绕过自己)在该 pid 对应的 wtPath 建一个*空目录*
++# (不是注册 worktree)+ 在 sandbox 里建一个与目标分支同名的*手工*本地分支——模拟"上次
++# 残留目录 + pid 撞值 + 恰好同名的手工分支"这一组合。断言:
++#   (a) publish 非零退出
++#   (b) 手工分支在 sandbox 里仍然存在(未被自愈路径删除)
++#   (c) 全程零次 `git branch -D <该分支>` 调用(不只是"最终还在",而是"从未被删过又重建")
++#   (d) stderr 有可辨识的诊断("归属未核验")
++# 反向变异自证:把生产脚本里 F-W1R4-B1 归属核验块换回旧的无条件自愈 branch -D,同一组合
++# 复跑必须变红——手工分支被自愈路径删除(至少 1 次 branch -D 调用),证明 (i) 的断言对
++# 生产代码的保护力度判断没有错,不是摆设。
++{
++  sandbox="$WORK/sbx-i"; bare="$WORK/bare-i.git"
++  setup_sandbox "$sandbox" "$bare"
++  export FAKE_GH_LOG="$WORK/gh-i.log"; : > "$FAKE_GH_LOG"
++  export FAKE_GH_PR_LIST_WIDE_JSON='[]'
++  export REAL_GIT_BIN="$(command -v git)"
++  export HEAL_INJECT_BRANCH="$BRANCH"
++  export HEAL_SANDBOX="$sandbox"
++  export HEAL_SETUP_MARKER="$WORK/heal-i-setup.marker"; rm -f "$HEAL_SETUP_MARKER"
++  export HEAL_BRANCH_D_LOG="$WORK/heal-i-branch-d.log"; : > "$HEAL_BRANCH_D_LOG"
++
++  cat > "$FAKE_BIN/git" <<'HEAL_GIT_EOF'
++#!/usr/bin/env bash
++set -euo pipefail
++: "${REAL_GIT_BIN:?REAL_GIT_BIN not set}"
++if [ "${1:-}" = "branch" ] && [ "${2:-}" = "-D" ] && [ "${3:-}" = "${HEAL_INJECT_BRANCH:-}" ] && [ -n "${HEAL_BRANCH_D_LOG:-}" ]; then
++  echo "branch -D ${3}" >> "$HEAL_BRANCH_D_LOG"
++fi
++if [ "${1:-}" = "fetch" ] && [ -n "${HEAL_SETUP_MARKER:-}" ] && [ ! -e "$HEAL_SETUP_MARKER" ]; then
++  out="$("$REAL_GIT_BIN" "$@")"
++  touch "$HEAL_SETUP_MARKER"
++  wt="/tmp/mivo-changelog-wt-$PPID"
++  mkdir -p "$wt"
++  "$REAL_GIT_BIN" -C "${HEAL_SANDBOX:?HEAL_SANDBOX not set}" branch -q "${HEAL_INJECT_BRANCH:?}" main
++  printf '%s' "$out"
++  exit 0
++fi
++exec "$REAL_GIT_BIN" "$@"
++HEAL_GIT_EOF
++  chmod +x "$FAKE_BIN/git"
++
++  if run_publish "$sandbox" "$WORK/out-i.txt" "$WORK/stderr-i.log"; then rc=0; else rc=$?; fi
++  handcrafted_still_exists=0
++  if git -C "$sandbox" show-ref --verify --quiet "refs/heads/$BRANCH"; then handcrafted_still_exists=1; fi
++  branch_d_calls="$(wc -l < "$HEAL_BRANCH_D_LOG" | tr -d ' ')"
++
++  if [ "$rc" -ne 0 ] && [ "$handcrafted_still_exists" -eq 1 ] && [ "$branch_d_calls" -eq 0 ]; then
++    ok "(i) 自愈路径遇到未在 worktree 注册表里对应目标分支的残留 wtPath → 不删除同名手工本地分支(零 branch -D 调用),fail-closed 非零退出"
++  else
++    bad "(i) 期望非零退出 + 手工分支存活 + 零 branch -D 调用,实际 rc=$rc,存活=$handcrafted_still_exists,branch-D 调用数=$branch_d_calls"; cat "$WORK/stderr-i.log"
++  fi
++  if grep -q '归属未核验' "$WORK/stderr-i.log"; then
++    ok "(i) stderr 含可辨识的归属未核验诊断"
++  else
++    bad "(i) stderr 未见归属未核验诊断:$(cat "$WORK/stderr-i.log")"
++  fi
++
++  # ---- 反向变异自证:把归属核验块换回旧的无条件自愈 branch -D,同一组合必须变红 ----
++  mutated_script="$WORK/auto-changelog-unsafe-heal.mjs"
++  node -e '
++    const fs = require("node:fs")
++    const src = fs.readFileSync(process.argv[1], "utf8")
++    const startMarker = "// F-W1R4-B1 归属核验:START"
++    const endMarker = "// F-W1R4-B1 归属核验:END"
++    const startIdx = src.indexOf(startMarker)
++    const endIdx = src.indexOf(endMarker)
++    if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
++      console.error("MARKER_NOT_FOUND: 生产脚本里未找到预期的归属核验代码块,反向变异自证不成立")
++      process.exit(1)
++    }
++    const endOfEndMarkerLine = src.indexOf("\n", endIdx) + 1
++    const before = src.slice(0, startIdx)
++    const after = src.slice(endOfEndMarkerLine)
++    const oldUnsafeBlock =
++      "      deps.runGit([\"worktree\", \"remove\", \"--force\", wtPath], { allowFail: true })\n" +
++      "      deps.runGit([\"branch\", \"-D\", branch], { allowFail: true })\n" +
++      "      if (existsSync(wtPath)) {\n" +
++      "        try {\n" +
++      "          rmSync(wtPath, { recursive: true, force: true })\n" +
++      "        } catch {\n" +
++      "          /* ignore */\n" +
++      "        }\n" +
++      "      }\n"
++    fs.writeFileSync(process.argv[2], before + oldUnsafeBlock + after)
++  ' "$SCRIPT_SRC" "$mutated_script"
++
++  if ! grep -qF 'F-W1R4-B1 归属核验' "$mutated_script"; then
++    ok "(i-mutant) 已构造退回旧无条件自愈 branch -D 的对照组脚本(归属核验块已移除)"
++    sandbox2="$WORK/sbx-i-mutant"; bare2="$WORK/bare-i-mutant.git"
++    setup_sandbox "$sandbox2" "$bare2"
++    cp "$mutated_script" "$sandbox2/scripts/changelog/auto-changelog.mjs"
++    export HEAL_SANDBOX="$sandbox2"
++    export HEAL_SETUP_MARKER="$WORK/heal-i-mutant-setup.marker"; rm -f "$HEAL_SETUP_MARKER"
++    export HEAL_BRANCH_D_LOG="$WORK/heal-i-mutant-branch-d.log"; : > "$HEAL_BRANCH_D_LOG"
++    export FAKE_GH_NEW_PR_NUMBER=961
++    export FAKE_GH_PR_VIEW_JSON="{\"files\":[{\"path\":\"public/changelog.json\"}],\"mergeable\":\"MERGEABLE\",\"headRefName\":\"$BRANCH\"}"
++    export FAKE_GH_PR_CHECKS_JSON='[{"name":"ci","state":"SUCCESS"}]'
++    export FAKE_GH_GRAPHQL_JSON='{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
++    if run_publish "$sandbox2" "$WORK/out-i-mutant.txt" "$WORK/stderr-i-mutant.log"; then rc2=0; else rc2=$?; fi
++    branch_d_calls2="$(wc -l < "$HEAL_BRANCH_D_LOG" | tr -d ' ')"
++    if [ "$branch_d_calls2" -ge 1 ]; then
++      ok "(i-mutant) 反向变异自证:退回旧的无条件自愈 branch -D 后同一组合变红——手工分支被自愈路径删除($branch_d_calls2 次 branch -D 调用),证明修复前的旧 bug 真实存在,(i) 的断言确实在咬合,不是摆设"
++    else
++      bad "(i-mutant) 反向变异自证失败:退回旧行为后未复现旧 bug(rc2=$rc2,branch-D 调用数=$branch_d_calls2)——说明 (i) 对生产代码保护力度的判断可能有误,需要重新核实"
++    fi
++    unset FAKE_GH_NEW_PR_NUMBER FAKE_GH_PR_VIEW_JSON FAKE_GH_PR_CHECKS_JSON FAKE_GH_GRAPHQL_JSON
++  else
++    bad "(i-mutant) mutant 脚本仍含 F-W1R4-B1 归属核验标记,反向变异自证不成立(未能构造对照组)"
++  fi
++
++  # 还原 FAKE_BIN/git 为纯透传,避免污染本场景之外的任何后续调用(本文件里 (i) 是最后一个
++  # 会改写 FAKE_BIN/git 的场景,但仍按 (h) 的既有约定收尾,防止未来在此之后插入新场景时
++  # 悄悄继承一个非透传的假 git)。
++  cat > "$FAKE_BIN/git" <<'PASSTHRU_GIT_EOF'
++#!/usr/bin/env bash
++exec "$REAL_GIT_BIN" "$@"
++PASSTHRU_GIT_EOF
++  chmod +x "$FAKE_BIN/git"
++  unset FAKE_GH_LOG FAKE_GH_PR_LIST_WIDE_JSON
++  unset REAL_GIT_BIN HEAL_INJECT_BRANCH HEAL_SANDBOX HEAL_SETUP_MARKER HEAL_BRANCH_D_LOG
++}
++
++
+ echo "----------------"
+ echo "PASS=$PASS FAIL=$FAIL"
+ [ "$FAIL" -eq 0 ]

@@ -1,0 +1,434 @@
+diff --git a/scripts/loops/bug-doctor/sentry-intake.test.mjs b/scripts/loops/bug-doctor/sentry-intake.test.mjs
+index d95a4069..cd93075a 100644
+--- a/scripts/loops/bug-doctor/sentry-intake.test.mjs
++++ b/scripts/loops/bug-doctor/sentry-intake.test.mjs
+@@ -1,23 +1,29 @@
+-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
++import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
++import { execFileSync } from 'node:child_process'
+ import { createHash } from 'node:crypto'
+ import { tmpdir } from 'node:os'
+-import { join } from 'node:path'
++import { dirname, join } from 'node:path'
++import { fileURLToPath } from 'node:url'
+ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+ import {
+   SENTRY_ORIGIN,
++  applyFindingsForDate,
++  applyMarkFixed,
++  classifyRoute,
+   consumeSentryFindings,
+   findingsFilePath,
++  resolveFindingsDir,
++  screenT1Candidate,
++  sentrySummarySignal,
++  shanghaiDateString,
++  validateFinding,
+ } from './sentry-intake.mjs'
+-import { defaultState } from './state.mjs'
++import { defaultState, loadState, saveState } from './state.mjs'
+ import { FINGERPRINT_VERSION } from './fingerprint.mjs'
+ 
+-// 本文件是核心消费面用例(PR 分段 2a):复发 fail-closed / 幂等 / missing-degraded
+-// 台账。sentryIntake 节持久化往返、分拣路由 / T1 预筛 / mark-fixed / 输入安全 /
+-// CLI 端到端在紧随的分段 2b 补齐(同一测试文件原位扩展)。
+-const RULES = JSON.parse(
+-  // rules.json 与本文件同目录;不复制常量,测试永远用真实配置跑
+-  (await import('node:fs')).readFileSync(new URL('./rules.json', import.meta.url), 'utf8'),
+-)
++const __dirname = dirname(fileURLToPath(import.meta.url))
++const CLI = join(__dirname, 'sentry-intake.mjs')
++const RULES = JSON.parse(readFileSync(join(__dirname, 'rules.json'), 'utf8'))
+ 
+ let dir // findings dir
+ let stateDir
+@@ -51,6 +57,258 @@ const writeFindings = (dateStr, items) => {
+   writeFileSync(findingsFilePath(dir, dateStr), JSON.stringify(items))
+ }
+ 
++describe('resolveFindingsDir(env 优先级 + ~ 展开)', () => {
++  it('rules.json 值存在且无 env 时使用 rules.json(~ 展开)', () => {
++    const resolved = resolveFindingsDir({ sentryRules: { findingsDir: '~/mivo-ops/mivo-sentry/state' } })
++    expect(resolved).not.toContain('~')
++    expect(resolved.endsWith('/mivo-ops/mivo-sentry/state')).toBe(true)
++  })
++
++  it('env 优先于 rules.json', () => {
++    process.env.MIVO_SENTRY_FINDINGS_DIR = '/tmp/env-dir'
++    try {
++      expect(resolveFindingsDir({ sentryRules: { findingsDir: '~/other' } })).toBe('/tmp/env-dir')
++    } finally {
++      delete process.env.MIVO_SENTRY_FINDINGS_DIR
++    }
++  })
++
++  it('两者皆缺 → 抛错(fail-closed,不猜路径)', () => {
++    expect(() => resolveFindingsDir({ sentryRules: {} })).toThrow(/未配置 Sentry findings 目录/)
++  })
++})
++
++describe('shanghaiDateString(UTC+8 计算,零依赖时区库)', () => {
++  it('UTC 00:00 与 UTC 15:59:59 同为 Shanghai 当天', () => {
++    expect(shanghaiDateString('2026-08-02T00:00:00.000Z')).toBe('2026-08-02')
++    expect(shanghaiDateString('2026-08-02T15:59:59.000Z')).toBe('2026-08-02')
++  })
++
++  it('UTC 16:00 起进入 Shanghai 次日', () => {
++    expect(shanghaiDateString('2026-08-02T16:00:00.000Z')).toBe('2026-08-03')
++  })
++})
++
++describe('SC-B2-5 输入安全:枚举/指纹/路径校验(单项跳过);尺寸/条目数/字段长超限(整文件坏,记 degraded)', () => {
++  it('非法 severity 单项被跳过;dim 只做形状校验——未知但合形的 dim 放行(P2A-01:路由层负责 fail-closed)', () => {
++    expect(validateFinding(finding({ severity: 'P9' })).ok).toBe(false)
++    // 形状非法(大写/下划线/空串)拒绝
++    expect(validateFinding(finding({ dim: 'Not_A_Dim' })).ok).toBe(false)
++    expect(validateFinding(finding({ dim: '' })).ok).toBe(false)
++    // 未知但形状合法的 dim 必须放行到路由层,否则 summary-only fallback 不可达
++    expect(validateFinding(finding({ dim: 'future-dim' })).ok).toBe(true)
++    expect(validateFinding(finding()).ok).toBe(true)
++  })
++
++  it('fingerprint 非 16 位 hex 被拒', () => {
++    expect(validateFinding(finding({ fingerprint: 'short' })).ok).toBe(false)
++    expect(validateFinding(finding({ fingerprint: 'ZZZZZZZZZZZZZZZZ' })).ok).toBe(false)
++  })
++
++  it('path traversal(../../etc/passwd)与绝对路径均被拒', () => {
++    expect(validateFinding(finding({ file: '../../etc/passwd' })).ok).toBe(false)
++    expect(validateFinding(finding({ file: '/etc/passwd' })).ok).toBe(false)
++    expect(validateFinding(finding({ file: 'a\\b' })).ok).toBe(false)
++  })
++
++  it('超大条目数(>maxItems)→ readFindingsFile 判定 degraded,不当 0-findings 成功', async () => {
++    const dateStr = '2026-08-02'
++    const items = Array.from({ length: 5001 }, (_, i) => finding({ fingerprint: fp(`item${i}`) }))
++    writeFindings(dateStr, items)
++    const { readFindingsFile } = await import('./sentry-intake.mjs')
++    const r = readFindingsFile(dir, dateStr, { limits: RULES.sentryIntake.limits })
++    expect(r.kind).toBe('degraded')
++    expect(r.reason).toContain('too-many-items')
++  })
++
++  it('consumeSentryFindings 遇整文件不可解析 JSON → status=degraded,不写 consumedDates(重跑仍 degraded,不是"成功消费 0 条")', () => {
++    const dateStr = '2026-08-02'
++    writeFileSync(findingsFilePath(dir, dateStr), '{not valid json')
++    const state = defaultState(FINGERPRINT_VERSION)
++    const r1 = consumeSentryFindings(state, { findingsDir: dir, dateStr, rules: RULES })
++    expect(r1.status).toBe('degraded')
++    expect(r1.reason).toContain('malformed-json')
++    const r2 = consumeSentryFindings(state, { findingsDir: dir, dateStr, rules: RULES })
++    expect(r2.status).toBe('degraded')
++  })
++})
++
++describe('SC-B2-2 分拣路由:9 个已知 dim + 1 unknown,唯一终点', () => {
++  const cases = [
++    ['log-violation', 't1-candidate'],
++    ['dead-code', 't1-candidate'],
++    ['todo-stale', 't1-candidate'],
++    ['deps-vuln', 'manual-ticket'],
++    ['secret-pattern', 'manual-ticket'],
++    ['type-escape', 'summary-only'],
++    ['test-health', 'summary-only'],
++    ['debt-metric', 'summary-only'],
++    ['circular-dep', 'summary-only'],
++  ]
++  it.each(cases)('%s → %s', (dim, expected) => {
++    expect(classifyRoute(dim, RULES.sentryIntake).route).toBe(expected)
++  })
++
++  it('未知 dim → fail-closed 到 summary-only 并带 reason', () => {
++    const r = classifyRoute('never-heard-of-this-dim', RULES.sentryIntake)
++    expect(r.route).toBe('summary-only')
++    expect(r.reason).toContain('unknown-dim')
++  })
++
++  it('P2B-01 接线级:未知 dim 经 applyFindingsForDate 生产路径落 summary.__unknownDims(不是被 skipped 静默吞掉)', () => {
++    // 上面那条只测 classifyRoute helper;本条走真实入口,防止校验层在路由层
++    // 之前把未知 dim 判 invalid 使 fallback 不可达(审查 P2A-01 抓到的洞)。
++    const state = defaultState(FINGERPRINT_VERSION)
++    const r = applyFindingsForDate(state, { dateStr: '2026-08-02', items: [finding({ dim: 'future-dim', fingerprint: fp('fut1') })], rules: RULES, sentryRules: RULES.sentryIntake })
++    expect(r.skipped).toBe(0)
++    expect(r.newFindings).toBe(1)
++    expect(state.sentryIntake.summary['future-dim']).toBe(1)
++    expect(state.sentryIntake.summary.__unknownDims['future-dim']).toBe(1)
++    expect(Object.keys(state.clusters)).toHaveLength(0) // 不建簇
++  })
++
++  it('deps-vuln/secret-pattern 在 clusters 与 T1 队列均为零;二跑 action/summary 不重复', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    const items = [
++      finding({ dim: 'deps-vuln', fingerprint: fp('vuln1'), category: 'lodash-cve' }),
++      finding({ dim: 'secret-pattern', fingerprint: fp('secret1'), category: 'aws-key-pattern', evidence: 'AKIA_SUSPECT_SECRET_VALUE' }),
++    ]
++    const r1 = applyFindingsForDate(state, { dateStr: '2026-08-02', items, rules: RULES, sentryRules: RULES.sentryIntake })
++    expect(r1.newClusters).toBe(0)
++    expect(Object.keys(state.clusters)).toHaveLength(0)
++    expect(Object.keys(state.sentryIntake.manualTickets)).toHaveLength(2)
++    // secret-pattern 不落原文 evidence
++    const secretTicket = state.sentryIntake.manualTickets[`2026-08-02|${fp('secret1')}`]
++    expect(secretTicket.evidence).toBeUndefined()
++    expect(secretTicket.verify).toBeUndefined()
++    expect(secretTicket.category).toBe('aws-key-pattern')
++    // deps-vuln 正常落 evidence(非敏感 dim)
++    const vulnTicket = state.sentryIntake.manualTickets[`2026-08-02|${fp('vuln1')}`]
++    expect(vulnTicket.evidence).toBeTruthy()
++
++    const r2 = applyFindingsForDate(state, { dateStr: '2026-08-02', items, rules: RULES, sentryRules: RULES.sentryIntake })
++    expect(Object.keys(state.sentryIntake.manualTickets)).toHaveLength(2) // 不重复
++    expect(r2.newClusters).toBe(0)
++  })
++
++  it('summary-only dim 只累加 workpacket signals.sentry.summary,不建簇', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    const items = [
++      finding({ dim: 'type-escape', fingerprint: fp('type1') }),
++      finding({ dim: 'type-escape', fingerprint: fp('type2') }),
++      finding({ dim: 'test-health', fingerprint: fp('test1') }),
++    ]
++    applyFindingsForDate(state, { dateStr: '2026-08-02', items, rules: RULES, sentryRules: RULES.sentryIntake })
++    expect(Object.keys(state.clusters)).toHaveLength(0)
++    const sig = sentrySummarySignal(state)
++    expect(sig.summary['type-escape']).toBe(2)
++    expect(sig.summary['test-health']).toBe(1)
++  })
++})
++
++describe('SC-B2-3 T1 确定性预筛:changeType 白名单/forbiddenPaths/daily-cap/幂等决策', () => {
++  it('server/persist/x.ts:1 命中 forbiddenPaths 被拒(反向变异删掉该判定测试必须红)', () => {
++    const item = finding({ file: 'server/persist/x.ts', line: 1, fingerprint: fp('forbid1') })
++    const r = screenT1Candidate(item, { sentryRules: RULES.sentryIntake, t1Rules: RULES.t1 })
++    expect(r.ok).toBe(false)
++    expect(r.reason).toContain('forbidden-path')
++  })
++
++  it('非白名单 changeType(伪造未登记 dim 路由到 t1-candidate 但无 changeTypeByDim 映射)被拒', () => {
++    const fakeSentryRules = { ...RULES.sentryIntake, routes: { ...RULES.sentryIntake.routes, 'made-up-dim': 't1-candidate' } }
++    const item = finding({ dim: 'made-up-dim', fingerprint: fp('nowl1') })
++    const r = screenT1Candidate(item, { sentryRules: fakeSentryRules, t1Rules: RULES.t1 })
++    expect(r.ok).toBe(false)
++    expect(r.reason).toContain('changeType-not-whitelisted')
++  })
++
++  it('3 条合格 t1-candidate,daily cap=2:前 2(按 severity 排序)接纳,第 3 条 rejected reason=daily-cap;乱序输入同结果', () => {
++    const items = [
++      finding({ severity: 'P2', fingerprint: fp('c'), file: 'src/c.tsx' }),
++      finding({ severity: 'P0', fingerprint: fp('a'), file: 'src/a.tsx' }),
++      finding({ severity: 'P1', fingerprint: fp('b'), file: 'src/b.tsx' }),
++    ]
++    const runWith = (order) => {
++      const state = defaultState(FINGERPRINT_VERSION)
++      applyFindingsForDate(state, { dateStr: '2026-08-02', items: order, rules: RULES, sentryRules: RULES.sentryIntake })
++      return state
++    }
++    const s1 = runWith(items)
++    const s2 = runWith([...items].reverse())
++    const acceptedFps = (s) => Object.entries(s.sentryIntake.decisions).filter(([, d]) => d.result === 'accepted').map(([k]) => k).sort()
++    expect(acceptedFps(s1)).toEqual([`2026-08-02|${fp('a')}`, `2026-08-02|${fp('b')}`].sort())
++    expect(acceptedFps(s2)).toEqual(acceptedFps(s1)) // 乱序同结果
++    const rejectedKey = `2026-08-02|${fp('c')}`
++    expect(s1.sentryIntake.decisions[rejectedKey].result).toBe('rejected')
++    expect(s1.sentryIntake.decisions[rejectedKey].reason).toBe('daily-cap')
++    // 被拒候选仍建簇(可见但非 T1)
++    expect(s1.clusters[fp('c')].tCap).toBe('T2')
++    expect(s1.clusters[fp('a')].tCap).toBe('T1')
++  })
++
++  it('P2B-02 同日文件追加([A] 再 [A,B]):旧条目不重放,summary 恰为 2、簇 count 不翻倍、日上限跨运行累计', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    const A = finding({ dim: 'type-escape', fingerprint: fp('appA') })
++    const B = finding({ dim: 'type-escape', fingerprint: fp('appB') })
++    const r1 = applyFindingsForDate(state, { dateStr: '2026-08-02', items: [A], rules: RULES, sentryRules: RULES.sentryIntake })
++    expect(r1.newFindings).toBe(1)
++    const r2 = applyFindingsForDate(state, { dateStr: '2026-08-02', items: [A, B], rules: RULES, sentryRules: RULES.sentryIntake })
++    expect(r2.newFindings).toBe(1) // 只有 B 是新条目
++    expect(r2.deduped).toBe(1)
++    expect(state.sentryIntake.summary['type-escape']).toBe(2) // 不是 3
++
++    // t1 簇 count 不因重放翻倍
++    const T = finding({ fingerprint: fp('appT') }) // log-violation → t1-candidate
++    applyFindingsForDate(state, { dateStr: '2026-08-03', items: [T], rules: RULES, sentryRules: RULES.sentryIntake })
++    const countAfter1 = state.clusters[fp('appT')].count
++    applyFindingsForDate(state, { dateStr: '2026-08-03', items: [T, finding({ dim: 'type-escape', fingerprint: fp('appC') })], rules: RULES, sentryRules: RULES.sentryIntake })
++    expect(state.clusters[fp('appT')].count).toBe(countAfter1)
++
++    // 日上限跨运行累计:cap=2,第一次接纳 2 条后,追加的第 3 条 t1 候选必须被 daily-cap 拒绝
++    const s2 = defaultState(FINGERPRINT_VERSION)
++    applyFindingsForDate(s2, { dateStr: '2026-08-04', items: [finding({ severity: 'P0', fingerprint: fp('capA'), file: 'src/a.tsx' }), finding({ severity: 'P1', fingerprint: fp('capB'), file: 'src/b.tsx' })], rules: RULES, sentryRules: RULES.sentryIntake })
++    applyFindingsForDate(s2, { dateStr: '2026-08-04', items: [finding({ severity: 'P0', fingerprint: fp('capA'), file: 'src/a.tsx' }), finding({ severity: 'P1', fingerprint: fp('capB'), file: 'src/b.tsx' }), finding({ severity: 'P0', fingerprint: fp('capC'), file: 'src/c.tsx' })], rules: RULES, sentryRules: RULES.sentryIntake })
++    const accepted = Object.entries(s2.sentryIntake.decisions).filter(([k, d]) => k.startsWith('2026-08-04|') && d.result === 'accepted')
++    expect(accepted).toHaveLength(2) // 不因第二次运行重置配额
++    expect(s2.sentryIntake.decisions[`2026-08-04|${fp('capC')}`].reason).toBe('daily-cap')
++  })
++
++  it('DELTA-P2B-01 接纳粘滞:同 fp 内容升级(severity 变化)不释放配额、不覆写 accepted、不降 T1', () => {
++    // 审查反例原样:cap=2,[A(P1),B]→[A(P0),B]→[A(P0),B,C]。修前 A 被覆写
++    // rejected(释放配额)且 T1→T2,C 借释放的额度混进第 3 个历史接纳。
++    const state = defaultState(FINGERPRINT_VERSION)
++    const mk = (seed, sev, file) => finding({ severity: sev, fingerprint: fp(seed), file })
++    applyFindingsForDate(state, { dateStr: '2026-08-05', items: [mk('stkA', 'P1', 'src/a.tsx'), mk('stkB', 'P1', 'src/b.tsx')], rules: RULES, sentryRules: RULES.sentryIntake })
++    applyFindingsForDate(state, { dateStr: '2026-08-05', items: [mk('stkA', 'P0', 'src/a.tsx'), mk('stkB', 'P1', 'src/b.tsx')], rules: RULES, sentryRules: RULES.sentryIntake })
++    applyFindingsForDate(state, { dateStr: '2026-08-05', items: [mk('stkA', 'P0', 'src/a.tsx'), mk('stkB', 'P1', 'src/b.tsx'), mk('stkC', 'P0', 'src/c.tsx')], rules: RULES, sentryRules: RULES.sentryIntake })
++    const d = state.sentryIntake.decisions
++    expect(d[`2026-08-05|${fp('stkA')}`].result).toBe('accepted') // 不被覆写
++    expect(state.clusters[fp('stkA')].tCap).toBe('T1') // 不降级
++    expect(state.clusters[fp('stkA')].sLevel).toBe('S0') // 内容升级生效(P0→S0)
++    expect(d[`2026-08-05|${fp('stkC')}`].result).toBe('rejected') // 配额未被释放,C 挤不进
++    const acceptedCount = Object.entries(d).filter(([k, v]) => k.startsWith('2026-08-05|') && v.result === 'accepted').length
++    expect(acceptedCount).toBe(2) // 历史接纳总数恰为 maxPerDay
++  })
++
++  it('DELTA-P2B-02 原型键防护:dim=constructor(形状合法)计数必须是数字 1,不是原型函数拼接的字符串', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    applyFindingsForDate(state, { dateStr: '2026-08-06', items: [finding({ dim: 'constructor', fingerprint: fp('proto1') })], rules: RULES, sentryRules: RULES.sentryIntake })
++    expect(state.sentryIntake.summary.constructor).toBe(1)
++    expect(typeof state.sentryIntake.summary.constructor).toBe('number')
++    expect(state.sentryIntake.summary.__unknownDims.constructor).toBe(1)
++  })
++
++  it('重复消费同一天不追加 decisions(幂等)', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    const items = [finding({ fingerprint: fp('dup1') })]
++    applyFindingsForDate(state, { dateStr: '2026-08-02', items, rules: RULES, sentryRules: RULES.sentryIntake })
++    const before = JSON.stringify(state.sentryIntake.decisions)
++    applyFindingsForDate(state, { dateStr: '2026-08-02', items, rules: RULES, sentryRules: RULES.sentryIntake })
++    // decision 内容不变(同 key 覆写为等值对象)
++    expect(JSON.stringify(state.sentryIntake.decisions)).toBe(before)
++  })
++})
++
+ describe('SC-B2-1 sentry-intake 消费(幂等 + missing/degraded 台账)', () => {
+   it('同一未变文件二跑:newFindings=0/newClusters=0,cluster count 不变', () => {
+     const dateStr = '2026-08-02'
+@@ -137,3 +395,130 @@ describe('SC-B2-1 sentry-intake 消费(幂等 + missing/degraded 台账)', () =>
+   })
+ })
+ 
++describe('SC-B2-4 mark-fixed:仅已存在 trae-audit 簇 + PR 已合并且号匹配才写 fixed', () => {
++  const seedCluster = (state, overrides = {}) => {
++    state.clusters[fp('mf1')] = {
++      source: 'Trae audit', pattern: 'x', sLevel: 'S1', tCap: 'T1', count: 1,
++      clients: [], firstSeen: 't', lastSeen: 't', appVersions: [], status: 'new',
++      attempts: 0, issue: null, pr: null, levels: ['error'], serverFault: false,
++      silentFailure: false, recent: [], samples: [], origin: SENTRY_ORIGIN,
++      ...overrides,
++    }
++  }
++
++  it('未合并(mergedAt=null)→ 拒绝,state 零变化', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    seedCluster(state)
++    const before = JSON.stringify(state.clusters)
++    const r = applyMarkFixed(state, { fp: fp('mf1'), prNumber: 42, prView: { number: 42, mergedAt: null } })
++    expect(r.ok).toBe(false)
++    expect(r.reason).toBe('pr-not-merged')
++    expect(JSON.stringify(state.clusters)).toBe(before)
++  })
++
++  it('错 fp(簇不存在)→ 拒绝', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    const r = applyMarkFixed(state, { fp: fp('nope'), prNumber: 42, prView: { number: 42, mergedAt: '2026-08-02T00:00:00.000Z' } })
++    expect(r.ok).toBe(false)
++    expect(r.reason).toBe('fp-not-found')
++  })
++
++  it('非 trae 簇(origin 缺失/为其他值)→ 拒绝', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    state.clusters[fp('human1')] = {
++      source: 'HumanReport', pattern: 'x', sLevel: 'S1', tCap: 'T2', count: 1,
++      clients: [], firstSeen: 't', lastSeen: 't', appVersions: [], status: 'new',
++      attempts: 0, issue: null, pr: null, levels: ['error'], serverFault: false,
++      silentFailure: false, recent: [], samples: [], origin: 'human-report',
++    }
++    const r = applyMarkFixed(state, { fp: fp('human1'), prNumber: 42, prView: { number: 42, mergedAt: '2026-08-02T00:00:00.000Z' } })
++    expect(r.ok).toBe(false)
++    expect(r.reason).toBe('not-trae-cluster')
++  })
++
++  it('PR 号与 gh 返回不匹配 → 拒绝', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    seedCluster(state)
++    const r = applyMarkFixed(state, { fp: fp('mf1'), prNumber: 42, prView: { number: 99, mergedAt: '2026-08-02T00:00:00.000Z' } })
++    expect(r.ok).toBe(false)
++    expect(r.reason).toBe('pr-number-mismatch')
++  })
++
++  it('成功路径:mergedAt≠null 且号匹配 → 写 fixed/fixedAt/pr/mergeSha;之后同文件重跑不复发,新日期晚于 fixedAt 转 recurrent', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    seedCluster(state)
++    const r = applyMarkFixed(state, { fp: fp('mf1'), prNumber: 42, prView: { number: 42, mergedAt: '2026-08-02T00:00:00.000Z', mergeCommit: { oid: 'deadbeef' } } })
++    expect(r.ok).toBe(true)
++    expect(state.clusters[fp('mf1')].status).toBe('fixed')
++    expect(state.clusters[fp('mf1')].pr).toBe(42)
++    expect(state.clusters[fp('mf1')].mergeSha).toBe('deadbeef')
++
++    // 同文件(同 fp,同日之前的历史数据)重跑消费不复发
++    writeFindings('2026-08-01', [finding({ fingerprint: fp('mf1') })])
++    consumeSentryFindings(state, { findingsDir: dir, dateStr: '2026-08-01', rules: RULES })
++    expect(state.clusters[fp('mf1')].status).toBe('fixed') // 早于 fixedAt,不重开
++
++    // 新日期(晚于 fixedAt)同 fp → recurrent
++    writeFindings('2026-08-05', [finding({ fingerprint: fp('mf1') })])
++    consumeSentryFindings(state, { findingsDir: dir, dateStr: '2026-08-05', rules: RULES })
++    expect(state.clusters[fp('mf1')].status).toBe('recurrent')
++  })
++})
++
++describe('CLI 端到端(consume/mark-fixed 子命令,取锁 + 落盘 + appendLog)', () => {
++  const runCli = (args) => {
++    const stdout = execFileSync(process.execPath, [CLI, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
++    return JSON.parse(stdout.trim().split('\n').at(-1))
++  }
++
++  it('consume 子命令:取锁、消费、落 state、appendLog(含 sentry=<status>)', () => {
++    const dateStr = '2026-08-02'
++    writeFindings(dateStr, [finding({ fingerprint: fp('cli1') })])
++    const r = runCli(['consume', '--date', dateStr, '--state-dir', stateDir, '--findings-dir', dir])
++    expect(r.status).toBe('consumed')
++    const logs = readFileSync(join(stateDir, 'logs.md'), 'utf8')
++    expect(logs).toContain('sentry=consumed')
++    const state = JSON.parse(readFileSync(join(stateDir, 'state.json'), 'utf8'))
++    expect(state.clusters[fp('cli1')]).toBeTruthy()
++  })
++
++  it('mark-fixed 子命令:经 --pr-view-json 注入 gh 结果,跳过真实 gh 调用', () => {
++    const dateStr = '2026-08-02'
++    writeFindings(dateStr, [finding({ fingerprint: fp('cli2') })])
++    runCli(['consume', '--date', dateStr, '--state-dir', stateDir, '--findings-dir', dir])
++    const prViewPath = join(dir, 'pr-view.json')
++    writeFileSync(prViewPath, JSON.stringify({ number: 7, mergedAt: '2026-08-02T12:00:00.000Z', mergeCommit: { oid: 'abc123' } }))
++    const r = runCli(['mark-fixed', '--fp', fp('cli2'), '--pr', '7', '--state-dir', stateDir, '--pr-view-json', prViewPath])
++    expect(r.ok).toBe(true)
++    const state = JSON.parse(readFileSync(join(stateDir, 'state.json'), 'utf8'))
++    expect(state.clusters[fp('cli2')].status).toBe('fixed')
++    expect(state.clusters[fp('cli2')].pr).toBe(7)
++  })
++})
++
++describe('SC-B2V2-04 sentryIntake 节持久化往返(stableState 未知节保留 + 旧台账兼容)', () => {
++  it('consume 产生的 sentryIntake 节经 saveState/loadState 往返不丢、内容等值', () => {
++    const dateStr = '2026-08-02'
++    writeFindings(dateStr, [finding({ fingerprint: fp('rt1') })])
++    const state = defaultState(FINGERPRINT_VERSION)
++    consumeSentryFindings(state, { findingsDir: dir, dateStr, rules: RULES })
++    expect(state.sentryIntake).toBeTruthy()
++    saveState(stateDir, state)
++    const reloaded = loadState(stateDir, FINGERPRINT_VERSION)
++    expect(reloaded.sentryIntake).toEqual(state.sentryIntake)
++    expect(reloaded.clusters[fp('rt1')]).toBeTruthy()
++  })
++
++  it('SC-B2-G 无 sentryIntake 节的旧台账:读写往返不凭空长出该节、schemaVersion 不被误改', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    const schemaBefore = state.schemaVersion
++    saveState(stateDir, state)
++    const reloaded = loadState(stateDir, FINGERPRINT_VERSION)
++    expect('sentryIntake' in reloaded && reloaded.sentryIntake !== undefined).toBe(false)
++    expect(reloaded.schemaVersion).toBe(schemaBefore)
++    // 再走一轮往返,仍不长出
++    saveState(stateDir, reloaded)
++    const again = loadState(stateDir, FINGERPRINT_VERSION)
++    expect(again.sentryIntake).toBeUndefined()
++  })
++})

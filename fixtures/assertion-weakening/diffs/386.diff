@@ -1,0 +1,1093 @@
+diff --git a/src/__tests__/depositFlagOff.test.ts b/src/__tests__/depositFlagOff.test.ts
+index 18ef7b8f..16ff04df 100644
+--- a/src/__tests__/depositFlagOff.test.ts
++++ b/src/__tests__/depositFlagOff.test.ts
+@@ -38,9 +38,9 @@ import { recordMedia } from '../agent/mediaLedger'
+  * 历史版本)。i18n 完整性另有独立测试锁production 常量与 dict.ts 译文的一致性,
+  * 见 `src/i18n/translator.test.ts`。
+  */
+-const LEGACY_MESSAGE =
+-  '当前版本的 Cindy 还不能直接读取这张画布图作为改图源,目前只认得本插件生成的图,' +
+-  '或经聊天附件发给 Cindy 后放上画布的图。请把这张图作为附件发到聊天里,处理后即可再编辑。'
++// i18n Wave 3:生产常量改为 catalog key,Error.message 携带 key、展示端 t()。
++// 本锁定串跟随生产(锁的是"flag 关时文案 = cindyGenerationPort 里那一份")。
++const LEGACY_MESSAGE = 'chat.anchor.sourceNotRecognized'
+ 
+ const LEDGER_HASH = 'c'.repeat(32)
+ 
+@@ -125,6 +125,17 @@ describe('flag 关 — 现状路径逐字节不变', () => {
+     expect(fetched.filter((url) => url === '/kv')).toHaveLength(1)
+   })
+ 
++  it('前置体检 canEditAsset:不在账下 → 拒绝且 reason 是同一条 catalog key(非中文成品)', async () => {
++    // 终审确认轮 P1-1:开浮层体检与 resolveSourceEntry 共用 SOURCE_NOT_RECOGNIZED_MESSAGE,
++    // useRegionEdit 在 toast 处按 chat. 前缀 t()。这里锁 reason===key,防止有人改回成品文案。
++    const verdict = await cindyImageGenerationPort.canEditAsset?.('mivo-asset:not-in-ledger')
++    expect(verdict).toEqual({ ok: false, reason: LEGACY_MESSAGE })
++
++    recordMedia('mivo-asset:in-ledger', { hash: LEDGER_HASH, ext: 'png' })
++    const allowed = await cindyImageGenerationPort.canEditAsset?.('mivo-asset:in-ledger')
++    expect(allowed).toEqual({ ok: true })
++  })
++
+   it('变体同样走现状路径,文案与零 deposit 消息一致', async () => {
+     await expect(
+       cindyImageGenerationPort.submitVariationsTask({
+diff --git a/src/__tests__/importFolderI18n.test.ts b/src/__tests__/importFolderI18n.test.ts
+index 43391ae6..d1feb481 100644
+--- a/src/__tests__/importFolderI18n.test.ts
++++ b/src/__tests__/importFolderI18n.test.ts
+@@ -1,67 +1,49 @@
+ /**
+- * 目录导入新增文案的四语契约测试(#297 P3-15,§六-3)。
++ * 目录导入文案契约(#297 P3-15,§六-3 的 i18n Wave 3 版本)。
+  *
+- * 插件形态的多语言是 DOM 文案替换(cindyplugin/src/i18n/translator.ts 按整段文本
+- * 精确匹配),所以「四语齐备」的可验证形态就是:每条新增源文案在 zh-CN/ja/ko 三张
+- * 表里都有译文,中文源文案在 EN 表里有英文译文,且未知 locale 回落英文表。
+- *
+- * 也正因为是整段精确匹配,带数字插值的句子命中不了字典 —— 目录导入的 toast 刻意
+- * 只用固定句(明细进 Debug Log),本测试连同这个设计一起钉住:一旦有人把计数塞回
+- * toast 文案,字典里就找不到那条 key,这里会红。
++ * 旧版锁 dict.ts(DOM 替换字典)的整段映射;字典随 Wave 3 退役后,「四语齐备」
++ * 由 check:i18n(结构一致)+ i18nCompleteness(源码 key 引用)两道通用守卫承担,
++ * 这里只保留当年那条**设计决策**的钉子:目录导入的三条 toast 刻意是固定句
++ * (明细进 Debug Log),不带计数插值——一旦有人把 {{count}} 塞回文案,这里会红。
+  */
+ import { describe, expect, it } from 'vitest'
+-import { DICT_EN, DICT_JA, DICT_KO, DICT_ZH_CN, dictForLocale } from '../i18n/dict'
+-
+-/** 源码里的英文文案(菜单项),需要 zh-CN / ja / ko 三张表都有译文。 */
+-const ENGLISH_SOURCE_KEYS = ['Import asset folder']
++import en from '../../../src/i18n/locales/en'
++import ja from '../../../src/i18n/locales/ja'
++import ko from '../../../src/i18n/locales/ko'
++import zhCN from '../../../src/i18n/locales/zh-CN'
+ 
+-/** 源码里的中文文案(toast),需要 EN / ja / ko 三张表都有译文。 */
+-const CHINESE_SOURCE_KEYS = ['素材已导入。', '部分素材未导入,详见 Debug Log。', '没有素材被导入,详见 Debug Log。']
++const IMPORT_TOAST_KEYS = ['done', 'partial', 'none'] as const
+ 
+-describe('目录导入文案四语齐备', () => {
+-  it('英文源文案在 zh-CN / ja / ko 都有译文', () => {
+-    for (const key of ENGLISH_SOURCE_KEYS) {
+-      for (const [name, dict] of [
+-        ['zh-CN', DICT_ZH_CN],
+-        ['ja', DICT_JA],
+-        ['ko', DICT_KO],
+-      ] as const) {
+-        expect(dict[key], `${name} 缺少 ${key}`).toBeTruthy()
+-        expect(dict[key]).not.toBe(key) // 不许拿原文冒充译文
+-      }
+-    }
+-  })
++const importGroupOf = (catalog: unknown) =>
++  (catalog as { toast: { import: Record<string, string> } }).toast.import
+ 
+-  it('中文源文案在 en / ja / ko 都有译文', () => {
+-    for (const key of CHINESE_SOURCE_KEYS) {
+-      for (const [name, dict] of [
+-        ['en', DICT_EN],
+-        ['ja', DICT_JA],
+-        ['ko', DICT_KO],
+-      ] as const) {
+-        expect(dict[key], `${name} 缺少 ${key}`).toBeTruthy()
+-        expect(dict[key]).not.toBe(key)
++describe('目录导入 toast — 固定句设计钉(四语均不带插值)', () => {
++  for (const [label, catalog] of [['en', en], ['zh-CN', zhCN], ['ja', ja], ['ko', ko]] as const) {
++    it(`${label} 的 toast.import.done/partial/none 均为无插值固定句`, () => {
++      const importGroup = importGroupOf(catalog)
++      for (const key of IMPORT_TOAST_KEYS) {
++        const value = importGroup[key]
++        expect(value, `${label} 缺少 toast.import.${key}`).toBeTypeOf('string')
++        expect(value.includes('{{'), `${label} toast.import.${key} 不应带插值(明细进 Debug Log 的设计)`).toBe(false)
+       }
+-    }
+-  })
+-
+-  it('三条 toast 的译文彼此不同(不是复制粘贴的占位)', () => {
+-    for (const dict of [DICT_EN, DICT_JA, DICT_KO]) {
+-      const rendered = CHINESE_SOURCE_KEYS.map((key) => dict[key])
+-      expect(new Set(rendered).size).toBe(CHINESE_SOURCE_KEYS.length)
+-    }
+-  })
++    })
+ 
+-  it('未知 locale 回落英文表(手册 §2.1)', () => {
+-    expect(dictForLocale('fr-FR')).toBe(DICT_EN)
+-    expect(dictForLocale('zh-TW')).toBe(DICT_ZH_CN)
+-    expect(dictForLocale('ja-JP')).toBe(DICT_JA)
+-    expect(dictForLocale('ko-KR')).toBe(DICT_KO)
+-  })
++    it(`${label} 的三条固定句互异(done/partial/none 各说各的事)`, () => {
++      const importGroup = importGroupOf(catalog)
++      const values = IMPORT_TOAST_KEYS.map((key) => importGroup[key])
++      expect(new Set(values).size, `${label} 有两条 toast.import.* 文案相同`).toBe(IMPORT_TOAST_KEYS.length)
++    })
++  }
+ 
+-  it('toast 文案是固定句(无插值占位符),否则 DOM 文案替换命中不了', () => {
+-    for (const key of CHINESE_SOURCE_KEYS) {
+-      expect(key).not.toMatch(/[{}$]|\d/)
++  // 防"没真翻译、把 en 原样抄进非 en catalog"的假通过:check:i18n 对同文只 warning,
++  // 这里对这组关键 toast 硬断言(对抗式双审 P2-6 恢复的旧契约)。
++  it('zh/ja/ko 的每条译文都与 en 不同(真翻译)', () => {
++    const enGroup = importGroupOf(en)
++    for (const [label, catalog] of [['zh-CN', zhCN], ['ja', ja], ['ko', ko]] as const) {
++      const importGroup = importGroupOf(catalog)
++      for (const key of IMPORT_TOAST_KEYS) {
++        expect(importGroup[key], `${label} toast.import.${key} 与 en 相同,像是没真的翻译`).not.toBe(enGroup[key])
++      }
+     }
+   })
+ })
+diff --git a/src/__tests__/pendingWriteDrain.test.ts b/src/__tests__/pendingWriteDrain.test.ts
+index 4d5d56cd..80153400 100644
+--- a/src/__tests__/pendingWriteDrain.test.ts
++++ b/src/__tests__/pendingWriteDrain.test.ts
+@@ -171,7 +171,7 @@ describe('drain 闸门与 panel-ping 同源(§6.6-3)', () => {
+     const summary = await drainPendingCanvasWrites()
+     expect(summary.outcome).toBe('skipped')
+     expect(calls).toEqual([])
+-    expect(useToastStore.getState().entries.map((entry) => entry.message).join(' ')).toContain('工作区档案')
++    expect(useToastStore.getState().entries.map((entry) => entry.message).join(' ')).toContain('workspace archive')
+   })
+ 
+   it('队列列不出来 → unavailable 且记 error,不假装队列为空', async () => {
+diff --git a/src/agent/cindyGenerationPort.ts b/src/agent/cindyGenerationPort.ts
+index 99ec2605..9fc67701 100644
+--- a/src/agent/cindyGenerationPort.ts
++++ b/src/agent/cindyGenerationPort.ts
+@@ -117,23 +117,15 @@ const unsupported = (what: string): never => {
+   throw new Error(`${what}在 Cindy 插件模式下暂不支持(后续版本接入)。`)
+ }
+ 
+-/** 不在媒体账下时的人话说明(开浮层体检 canEditAsset 用)。兑换失败的文案在
+- *  resolveSourceEntry 的 flag-off 分支里单独维护 —— 那句被 deposit flag-off
+- *  「与现状逐字节一致」契约钉住(depositFlagOff.test),不做合并。 */
+-const NOT_IN_LEDGER_REASON =
+-  '这张图不在插件的媒体账下,Cindy 不允许用它做改图源。可用的图:本插件生成的图、' +
+-  '或你在聊天里作为附件发给插件后放上画布的图;画布自带的示例图与本地拖入的图请先经聊天发给 Cindy。'
+-
+ /**
+- * flag 关时"源图不在账下"的降级文案。导出为单一常量,而不是让
+- * `depositFlagOff.test.ts` 的锁定串与 `src/i18n/dict.ts` 的翻译 key 各自维护一份
+- * 字面拷贝——P1c 两轮改写都栽在"改了这里忘改那里"上,单一来源直接消掉这类漂移。
+- * `dict.ts` 仍是字面 key(它不该反向依赖业务模块),但测试可以 import 这个常量去
+- * 断言 `dict.ts` 的 key 与它逐字一致(见 `src/i18n/translator.test.ts`)。
++ * flag 关时"源图不在账下"的降级文案(i18n catalog key)。导出为单一常量:
++ * `depositFlagOff.test.ts` 锁"flag 关行为 = 本常量",`src/i18n/translator.test.ts`
++ * 锁"四语 catalog 均有该 key 的真实译文"——单一来源消掉 P1c 踩过的两份拷贝漂移。
+  */
+-export const SOURCE_NOT_RECOGNIZED_MESSAGE =
+-  '当前版本的 Cindy 还不能直接读取这张画布图作为改图源,目前只认得本插件生成的图,' +
+-  '或经聊天附件发给 Cindy 后放上画布的图。请把这张图作为附件发到聊天里,处理后即可再编辑。'
++// i18n Wave 3:常量从中文原文改为 catalog key(chat.anchor.sourceNotRecognized,
++// 四语词条在 src/i18n/locales/*/chat.json)。Error.message 携带 key,展示端
++// (AnchorOverlay 的 .anchor-degrade-hint)按 key 前缀判定后 t() 成当前语言。
++export const SOURCE_NOT_RECOGNIZED_MESSAGE = 'chat.anchor.sourceNotRecognized'
+ 
+ /**
+  * 兑换改图源指纹。
+@@ -160,9 +152,9 @@ const resolveSourceEntry = async (request: {
+     // P1c 现状降级文案核对(2026-07-31,返修版):原文案暴露"媒体账"内部概念且无
+     // i18n,首版改写又把 why 写成"只支持…"这类永久产品限制的语气(被对抗审查判回:
+     // SC1c.1 要求的是"宿主/能力不可用"这个降级归因,不是听起来永久的功能范围声明)。
+-    // 现改为"当前版本还不能…"的能力口径,保留 next action。译文见 src/i18n/dict.ts,
+-    // 渲染容器见 src/i18n/translator.ts 的 CHROME_SCOPE(`.anchor-degrade-hint`,
+-    // 不是整个 `.anchor-instruction-panel`——那样会连带误翻用户自己的节点标题)。
++    // 现改为"当前版本还不能…"的能力口径,保留 next action。四语词条在
++    // src/i18n/locales/*/chat.json(chat.anchor.sourceNotRecognized),展示端
++    // AnchorOverlay 按 key 前缀判定后 t() 渲染(.anchor-degrade-hint)。
+     throw new Error(SOURCE_NOT_RECOGNIZED_MESSAGE)
+   }
+   return entry
+@@ -176,7 +168,9 @@ const canEditAsset = async (assetUrl?: string): Promise<{ ok: boolean; reason?:
+   // deposit 切流后任何画布图都能寄存换指纹,体检恒放行(拦截只在 flag 关的现状态)。
+   if (DEPOSIT_ENABLED) return { ok: true }
+   await initMediaLedger()
+-  return lookupMedia(assetUrl) ? { ok: true } : { ok: false, reason: NOT_IN_LEDGER_REASON }
++  // 终审确认轮 P1-1:reason 用与 resolveSourceEntry 同一条 catalog key(展示端按
++  // chat. 前缀 t()),不再返回中文成品——DOM 替换器退役后没有事后翻译兜底。
++  return lookupMedia(assetUrl) ? { ok: true } : { ok: false, reason: SOURCE_NOT_RECOGNIZED_MESSAGE }
+ }
+ 
+ /** 当前画布上的全部资产 url 快照(结果落图的账本回填用)。 */
+diff --git a/src/agent/pendingWriteDrain.ts b/src/agent/pendingWriteDrain.ts
+index 4aaa6055..ccb485a9 100644
+--- a/src/agent/pendingWriteDrain.ts
++++ b/src/agent/pendingWriteDrain.ts
+@@ -38,6 +38,7 @@ import {
+   type PendingCanvasWrite,
+   type PendingCanvasWriteRejection,
+ } from '../../../src/agent/pendingCanvasWrite'
++import { t } from '../../../src/i18n'
+ import { applyPendingCanvasWrite } from '../../../src/agent/pendingWriteApply'
+ import { planPendingWriteDrain, reconcilePendingWrites } from '../../../src/agent/pendingWriteReconcile'
+ import { debugLogger } from '../../../src/store/debugLogStore'
+@@ -90,7 +91,7 @@ async function runDrain(): Promise<DrainSummary> {
+     debugLogger.warn(SOURCE, `drain skipped: canvas writes not ready (${reason ?? 'unknown'})`)
+     if (reason === 'binding-provisional') {
+       // R4 bootstrap 只读栅栏内:面板已开但改动还不能应用,必须显式说,不许静默等。
+-      toastFeedback.warn('Agent 的离线改动要等工作区档案确认后才会应用')
++      toastFeedback.warn(t('toast.pendingDrain.waitArchive'))
+     }
+     return { ...EMPTY, outcome: 'skipped' }
+   }
+@@ -187,7 +188,7 @@ async function runDrain(): Promise<DrainSummary> {
+         reason: item.reason ?? '已过保留期',
+         at: Date.now(),
+       })
+-      failedForUser.push(item.reason ?? '已过保留期')
++      failedForUser.push(item.reason ?? t('toast.pendingDrain.expiredReason'))
+       debugLogger.warn(SOURCE, `drain expired: ${intent.intentId} (${intent.verb}) — ${item.reason ?? ''}`)
+       continue
+     }
+@@ -252,7 +253,7 @@ async function runDrain(): Promise<DrainSummary> {
+       SOURCE,
+       `drain applied ${applied} change(s) but the save was not confirmed; not acking (queue entries stay, next round de-dupes via the ledger)`,
+     )
+-    if (applied) toastFeedback.error(`Agent 的 ${applied} 项离线改动已应用,但存档未确认,稍后会自动重试`)
++    if (applied) toastFeedback.error(t('toast.pendingDrain.appliedUnconfirmed', { count: applied }))
+     return {
+       outcome: 'not-durable',
+       applied,
+@@ -399,13 +400,13 @@ function presentDrainResult(
+     const failed = rejections.length
+     toastFeedback.success(
+       failed
+-        ? `已应用 Agent 在面板关闭期间的 ${applied} 项改动(${failed} 项未应用)`
+-        : `已应用 Agent 在面板关闭期间的 ${applied} 项改动`,
++        ? t('toast.pendingDrain.appliedWithFailed', { applied, failed })
++        : t('toast.pendingDrain.applied', { count: applied }),
+     )
+   } else if (rejections.length) {
+-    toastFeedback.warn(`Agent 在面板关闭期间的 ${rejections.length} 项改动未能应用`)
++    toastFeedback.warn(t('toast.pendingDrain.rejected', { count: rejections.length }))
+   }
+-  for (const reason of failedForUser.slice(0, 3)) toastFeedback.error(`离线改动未应用:${reason}`)
++  for (const reason of failedForUser.slice(0, 3)) toastFeedback.error(t('toast.pendingDrain.failedReason', { reason }))
+   if (deferredByBinding) {
+     debugLogger.warn(
+       SOURCE,
+@@ -413,7 +414,7 @@ function presentDrainResult(
+     )
+   }
+   if (queueFull) {
+-    toastFeedback.error('离线改动过多,已暂停应用;请稍后重开面板继续')
++    toastFeedback.error(t('toast.pendingDrain.overflowPaused'))
+   }
+ }
+ 
+@@ -425,5 +426,5 @@ function presentPriorRejections(rejections: readonly PendingCanvasWriteRejection
+       .map((item) => `${item.intentId}(${item.outcome})`)
+       .join(', ')}`,
+   )
+-  toastFeedback.warn(`有 ${rejections.length} 项 Agent 离线改动此前未能应用(详情见 Debug Log)`)
++  toastFeedback.warn(t('toast.pendingDrain.backlog', { count: rejections.length }))
+ }
+diff --git a/src/i18n/dict.ts b/src/i18n/dict.ts
+deleted file mode 100644
+index d27d1a5c..00000000
+--- a/src/i18n/dict.ts
++++ /dev/null
+@@ -1,346 +0,0 @@
+-/**
+- * 插件层 UI 文案字典。key = 源码里的原文(精确匹配,trim 后),value = 译文。
+- * 只覆盖界面镶边(工具坞/菜单/工具条/提示),画布上用户输入的内容永远不碰
+- * (作用域由 translator 的容器白名单保证)。宿主 locale 不在支持列表时回落英文原文。
+- */
+-
+-/** 英文原文 → 简体中文(宿主 locale = zh-CN 时启用) */
+-export const DICT_ZH_CN: Record<string, string> = {
+-  // 图片编辑(2026-07-28 FigJam 平价)
+-  'Edit image': '编辑图片',
+-  'Rotate 90°': '旋转 90°',
+-  'Replace image': '替换图片',
+-  'Flip horizontal': '水平翻转',
+-  'Flip vertical': '垂直翻转',
+-  'Reset crop': '重置裁剪',
+-  'Copy as PNG': '复制为 PNG',
+-  Done: '完成',
+-  Cancel: '取消',
+-  Reset: '重置',
+-  Free: '自由',
+-  Save: '保存',
+-  'Rename node': '重命名节点',
+-
+-  // 工具坞与工具
+-  Select: '选择',
+-  Hand: '抓手',
+-  Text: '文本',
+-  Section: '分区',
+-  Stamp: '印章',
+-  Brush: '画笔',
+-  Marker: '马克笔',
+-  Highlighter: '荧光笔',
+-  Eraser: '橡皮擦',
+-  Arrow: '箭头',
+-  Line: '直线',
+-  Rectangle: '矩形',
+-  Ellipse: '椭圆',
+-  'Markup note': '标注便签',
+-  Draw: '绘制',
+-  'Canvas tools': '画布工具',
+-  'Draw tools': '绘图工具',
+-
+-  'Fit selection': '适应所选',
+-
+-  // 画布右键菜单(新建类)
+-  'New text here': '在此新建文本',
+-  'New section here': '在此新建分区',
+-  'New AI image slot here': '在此新建 AI 图片占位',
+-  'New arrow markup': '新建箭头标注',
+-  'New rectangle markup': '新建矩形标注',
+-  'New markup note': '新建标注便签',
+-  'Fit all objects': '适应全部对象',
+-  'Select all objects': '全选对象',
+-  'Import asset': '导入素材',
+-  'Import asset folder': '导入素材文件夹',
+-  'Select area': '框选区域',
+-
+-  // 节点操作
+-  'Add edit note': '添加修改批注',
+-  'AI Edit': 'AI 编辑',
+-  Edit: '编辑',
+-  'Edit text': '编辑文字',
+-  'Edit with prompt': '按提示词修改',
+-  Delete: '删除',
+-  Duplicate: '复制副本',
+-  Crop: '裁剪',
+-  Expand: '扩展',
+-  Group: '编组',
+-  Ungroup: '取消编组',
+-  'Tidy up': '一键整理',
+-  'Tidy up options': '整理方式',
+-  'Download original': '下载原图',
+-  'Boost resolution': '提升分辨率',
+-  'Remove background': '移除背景',
+-  Generate: '生成',
+-  'Generate beside': '在旁生成',
+-  'Generate from note': '按便签生成',
+-  'Generate into slot': '生成到占位',
+-  'Make variations': '生成变体',
+-
+-  // 排布与层级
+-  Align: '对齐',
+-  'Align left': '左对齐',
+-  'Align center': '水平居中',
+-  'Align right': '右对齐',
+-  'Align top': '顶对齐',
+-  'Align middle': '垂直居中',
+-  'Align bottom': '底对齐',
+-  'Arrange row': '排成一行',
+-  'Arrange column': '排成一列',
+-  'Arrange grid': '网格排布',
+-  'Distribute horizontal': '水平等距分布',
+-  'Distribute vertical': '垂直等距分布',
+-  'Bring forward': '上移一层',
+-  'Bring to front': '置于顶层',
+-  'Send backward': '下移一层',
+-  'Send to back': '置于底层',
+-  Front: '置前',
+-
+-  // 分区
+-  'Focus section': '聚焦分区',
+-  'Rename section': '重命名分区',
+-  'Remove section only': '仅删除分区',
+-  Unlock: '解锁',
+-  'Unlock section': '解锁分区',
+-  'Lock all': '全部锁定',
+-  'Lock background only': '仅锁定背景',
+-  'Section fill': '分区填充',
+-  'Section line': '分区描边',
+-  'Hide contents': '隐藏内容',
+-  'Show contents': '显示内容',
+-  'Hide title': '隐藏标题',
+-  'Show title': '显示标题',
+-
+-  // 样式
+-  'Fill color': '填充色',
+-  'No fill': '无填充',
+-  'Corner radius': '圆角',
+-  'Line color': '线条颜色',
+-  'Line width': '线条粗细',
+-  Border: '边框',
+-  'Brush color': '画笔颜色',
+-  'Brush width': '画笔粗细',
+-  Solid: '实线',
+-  Dashed: '虚线',
+-  None: '无',
+-  Arrowheads: '箭头样式',
+-  'Both arrows': '双向箭头',
+-  'End arrow': '末端箭头',
+-  'No arrows': '无箭头',
+-  'Dashed line': '虚线',
+-  'Solid line': '实线',
+-  Bold: '加粗',
+-  Thin: '细',
+-  Medium: '中',
+-  Soft: '柔和',
+-  Sharp: '锐利',
+-  Round: '圆头',
+-  Warm: '暖色',
+-
+-  // 颜色
+-  Black: '黑色',
+-  White: '白色',
+-  Gray: '灰色',
+-  Red: '红色',
+-  Orange: '橙色',
+-  Green: '绿色',
+-  Blue: '蓝色',
+-  Pink: '粉色',
+-  Purple: '紫色',
+-  'Soft blue': '浅蓝',
+-  'Soft purple': '浅紫',
+-  'Soft yellow': '浅黄',
+-
+-  // 贴纸纸色(5 档不透明淡色)
+-  'Pale pink': '淡粉红',
+-  'Pale yellow': '淡黄',
+-  'Pale blue': '淡蓝',
+-  'Pale green': '淡绿',
+-  'Pale purple': '淡紫',
+-
+-  // 印章
+-  Check: '对勾',
+-  Heart: '爱心',
+-  Star: '星星',
+-  Question: '问号',
+-  'Thumbs down': '点踩',
+-  'Down alt': '备用向下',
+-  Face: '表情',
+-  Smile: '微笑',
+-  Eyes: '眼睛',
+-
+-  // 源码里的英文兜底(zh 模式下这些中文原文无需翻译,此处只翻英文项)
+-  Lasso: '圈选',
+-  'Point select': '点选',
+-}
+-
+-/** 源码里少量中文原文 → 英文(宿主 locale = en 时启用) */
+-export const DICT_EN: Record<string, string> = {
+-  '图片已替换。': 'Image replaced.',
+-  '替换图片失败,请查看 Debug Log。': 'Replace image failed — see Debug Log.',
+-  '已复制为 PNG。': 'Copied as PNG.',
+-  '复制 PNG 失败,请查看 Debug Log。': 'Copy as PNG failed — see Debug Log.',
+-  '当前浏览器不支持复制图片到剪贴板。': 'This browser cannot copy images to the clipboard.',
+-
+-  矩形: 'Rectangle',
+-  椭圆: 'Ellipse',
+-  圈选: 'Lasso',
+-  点选: 'Point select',
+-  Lasso: 'Lasso',
+-  'Point select': 'Point select',
+-  局部重绘: 'Inpaint',
+-  '点击图片，标出要修改的位置': 'Click an image to mark the area to edit',
+-  取消请求: 'Cancel request',
+-  退出局部重绘: 'Exit inpaint',
+-  撤销: 'Undo',
+-  重做: 'Redo',
+-  清空标记: 'Clear marks',
+-  '加载历史画布失败，已使用默认状态。': 'Failed to load saved canvas; using default state.',
+-  '素材已导入。': 'Assets imported.',
+-  '部分素材未导入,详见 Debug Log。': 'Some assets were not imported — see Debug Log.',
+-  '没有素材被导入,详见 Debug Log。': 'No asset was imported — see Debug Log.',
+-  '当前版本的 Cindy 还不能直接读取这张画布图作为改图源,目前只认得本插件生成的图,或经聊天附件发给 Cindy 后放上画布的图。请把这张图作为附件发到聊天里,处理后即可再编辑。':
+-    "The current version of Cindy can't yet read this canvas image directly as an edit source — for now it only recognizes images generated by this plugin, or images sent to Cindy as a chat attachment and placed on the canvas. Send this image to chat as an attachment, and you'll be able to edit it afterward.",
+-}
+-
+-/** 英文/中文原文 → 日本語(宿主 locale = ja) */
+-export const DICT_JA: Record<string, string> = {
+-  'Edit image': '画像を編集', 'Rotate 90°': '90°回転', 'Replace image': '画像を差し替え',
+-  'Flip horizontal': '左右反転', 'Flip vertical': '上下反転',
+-  'Reset crop': '切り抜きをリセット', 'Copy as PNG': 'PNGとしてコピー',
+-  Done: '完了', Cancel: 'キャンセル', Reset: 'リセット', Free: 'フリー', Save: '保存',
+-  'Rename node': 'ノード名を変更',
+-  '图片已替换。': '画像を差し替えました。',
+-  '替换图片失败,请查看 Debug Log。': '画像の差し替えに失敗しました。Debug Log を確認してください。',
+-  '已复制为 PNG。': 'PNGとしてコピーしました。',
+-  '复制 PNG 失败,请查看 Debug Log。': 'PNGのコピーに失敗しました。Debug Log を確認してください。',
+-  '当前浏览器不支持复制图片到剪贴板。': 'このブラウザは画像のクリップボードコピーに対応していません。',
+-
+-  Select: '選択', Hand: '手のひら', Text: 'テキスト', Section: 'セクション', Stamp: 'スタンプ',
+-  Brush: 'ブラシ', Marker: 'マーカー', Highlighter: '蛍光ペン', Eraser: '消しゴム',
+-  Arrow: '矢印', Line: '直線', Rectangle: '長方形', Ellipse: '楕円',
+-  'Markup note': '注釈メモ', Draw: '描画', 'Canvas tools': 'キャンバスツール', 'Draw tools': '描画ツール',
+-  'Fit selection': '選択範囲に合わせる',
+-  'New text here': 'ここにテキストを追加', 'New section here': 'ここにセクションを追加',
+-  'New AI image slot here': 'ここにAI画像スロットを追加', 'New arrow markup': '矢印注釈を追加',
+-  'New rectangle markup': '長方形注釈を追加', 'New markup note': '注釈メモを追加',
+-  'Fit all objects': 'すべてのオブジェクトを表示', 'Select all objects': 'すべて選択',
+-  'Import asset': '素材を読み込む', 'Import asset folder': 'フォルダーから読み込む', 'Select area': '範囲選択',
+-  'Add edit note': '編集メモを追加', 'AI Edit': 'AI編集', Edit: '編集', 'Edit text': 'テキストを編集',
+-  'Edit with prompt': 'プロンプトで編集', Delete: '削除', Duplicate: '複製', Crop: '切り抜き',
+-  Expand: '拡張', Group: 'グループ化', Ungroup: 'グループ解除', 'Tidy up': '自動整列', 'Tidy up options': '整列オプション',
+-  'Download original': '元画像をダウンロード', 'Boost resolution': '解像度を上げる',
+-  'Remove background': '背景を削除', Generate: '生成', 'Generate beside': '横に生成',
+-  'Generate from note': 'メモから生成', 'Generate into slot': 'スロットに生成', 'Make variations': 'バリエーション生成',
+-  Align: '整列', 'Align left': '左揃え', 'Align center': '左右中央揃え', 'Align right': '右揃え',
+-  'Align top': '上揃え', 'Align middle': '上下中央揃え', 'Align bottom': '下揃え',
+-  'Arrange row': '横一列に配置', 'Arrange column': '縦一列に配置', 'Arrange grid': 'グリッド配置',
+-  'Distribute horizontal': '水平方向に等間隔', 'Distribute vertical': '垂直方向に等間隔',
+-  'Bring forward': '前面へ', 'Bring to front': '最前面へ', 'Send backward': '背面へ', 'Send to back': '最背面へ',
+-  Front: '前面', 'Focus section': 'セクションにフォーカス', 'Rename section': 'セクション名を変更',
+-  'Remove section only': 'セクションのみ削除', Unlock: 'ロック解除', 'Unlock section': 'セクションのロック解除',
+-  'Lock all': 'すべてロック', 'Lock background only': '背景のみロック',
+-  'Section fill': 'セクションの塗り', 'Section line': 'セクションの線',
+-  'Hide contents': '中身を非表示', 'Show contents': '中身を表示',
+-  'Hide title': 'タイトルを非表示', 'Show title': 'タイトルを表示',
+-  'Fill color': '塗りつぶし色', 'No fill': '塗りなし', 'Corner radius': '角丸',
+-  Arrowheads: '矢印の形状', 'Both arrows': '両端矢印', 'End arrow': '終点矢印', 'No arrows': '矢印なし',
+-  'Dashed line': '破線', 'Solid line': '実線', Bold: '太字', Thin: '細', Medium: '中',
+-  'Line color': '線の色', 'Line width': '線の太さ', Border: '枠線',
+-  'Brush color': 'ブラシの色', 'Brush width': 'ブラシの太さ', Solid: '実線', Dashed: '破線', None: 'なし',
+-  Soft: 'ソフト', Sharp: 'シャープ', Round: '丸', Warm: 'ウォーム',
+-  Black: '黒', White: '白', Gray: 'グレー', Red: '赤', Orange: 'オレンジ', Green: '緑',
+-  Blue: '青', Pink: 'ピンク', Purple: '紫',
+-  'Soft blue': 'ライトブルー', 'Soft purple': 'ライトパープル', 'Soft yellow': 'ライトイエロー',
+-  'Pale pink': '淡いピンク', 'Pale yellow': '淡いイエロー', 'Pale blue': '淡いブルー',
+-  'Pale green': '淡いグリーン', 'Pale purple': '淡いパープル',
+-  Check: 'チェック', Heart: 'ハート', Star: 'スター', Question: 'はてな', 'Thumbs down': 'バッド',
+-  'Down alt': '下向き', Face: 'フェイス', Smile: 'スマイル', Eyes: '目',
+-  Lasso: 'なげなわ選択', 'Point select': 'クリック選択',
+-  矩形: '長方形', 椭圆: '楕円', 圈选: 'なげなわ選択', 点选: 'クリック選択', 局部重绘: '部分リペイント',
+-  '点击图片，标出要修改的位置': '画像をクリックして修正箇所を指定',
+-  取消请求: 'リクエストをキャンセル', 退出局部重绘: '部分リペイントを終了',
+-  撤销: '元に戻す', 重做: 'やり直す', 清空标记: 'マークをクリア',
+-  '加载历史画布失败，已使用默认状态。': 'キャンバスの読み込みに失敗しました。デフォルト状態を使用します。',
+-  '素材已导入。': '素材を読み込みました。',
+-  '部分素材未导入,详见 Debug Log。': '一部の素材を読み込めませんでした。Debug Log を確認してください。',
+-  '没有素材被导入,详见 Debug Log。': '素材を読み込めませんでした。Debug Log を確認してください。',
+-  '当前版本的 Cindy 还不能直接读取这张画布图作为改图源,目前只认得本插件生成的图,或经聊天附件发给 Cindy 后放上画布的图。请把这张图作为附件发到聊天里,处理后即可再编辑。':
+-    '現在のバージョンの Cindy は、このキャンバス画像を編集元として直接読み取ることができません。現時点では、本プラグインが生成した画像、またはチャットの添付ファイルとして Cindy に送信してキャンバスに置いた画像のみ認識します。この画像をチャットに添付として送信すると、その後編集できるようになります。',
+-}
+-
+-/** 英文/中文原文 → 한국어(宿主 locale = ko) */
+-export const DICT_KO: Record<string, string> = {
+-  'Edit image': '이미지 편집', 'Rotate 90°': '90° 회전', 'Replace image': '이미지 교체',
+-  'Flip horizontal': '좌우 반전', 'Flip vertical': '상하 반전',
+-  'Reset crop': '자르기 초기화', 'Copy as PNG': 'PNG로 복사',
+-  Done: '완료', Cancel: '취소', Reset: '초기화', Free: '자유', Save: '저장',
+-  'Rename node': '노드 이름 변경',
+-  '图片已替换。': '이미지를 교체했습니다.',
+-  '替换图片失败,请查看 Debug Log。': '이미지 교체에 실패했습니다. Debug Log를 확인하세요.',
+-  '已复制为 PNG。': 'PNG로 복사했습니다.',
+-  '复制 PNG 失败,请查看 Debug Log。': 'PNG 복사에 실패했습니다. Debug Log를 확인하세요.',
+-  '当前浏览器不支持复制图片到剪贴板。': '현재 브라우저는 이미지 클립보드 복사를 지원하지 않습니다.',
+-
+-  Select: '선택', Hand: '손', Text: '텍스트', Section: '섹션', Stamp: '스탬프',
+-  Brush: '브러시', Marker: '마커', Highlighter: '형광펜', Eraser: '지우개',
+-  Arrow: '화살표', Line: '직선', Rectangle: '사각형', Ellipse: '타원',
+-  'Markup note': '주석 메모', Draw: '그리기', 'Canvas tools': '캔버스 도구', 'Draw tools': '그리기 도구',
+-  'Fit selection': '선택 영역 맞춤',
+-  'New text here': '여기에 텍스트 추가', 'New section here': '여기에 섹션 추가',
+-  'New AI image slot here': '여기에 AI 이미지 슬롯 추가', 'New arrow markup': '화살표 주석 추가',
+-  'New rectangle markup': '사각형 주석 추가', 'New markup note': '주석 메모 추가',
+-  'Fit all objects': '모든 개체 보기', 'Select all objects': '모두 선택',
+-  'Import asset': '에셋 가져오기', 'Import asset folder': '폴더에서 에셋 가져오기', 'Select area': '영역 선택',
+-  'Add edit note': '수정 메모 추가', 'AI Edit': 'AI 편집', Edit: '편집', 'Edit text': '텍스트 편집',
+-  'Edit with prompt': '프롬프트로 편집', Delete: '삭제', Duplicate: '복제', Crop: '자르기',
+-  Expand: '확장', Group: '그룹화', Ungroup: '그룹 해제', 'Tidy up': '자동 정돈', 'Tidy up options': '정돈 옵션',
+-  'Download original': '원본 다운로드', 'Boost resolution': '해상도 높이기',
+-  'Remove background': '배경 제거', Generate: '생성', 'Generate beside': '옆에 생성',
+-  'Generate from note': '메모로 생성', 'Generate into slot': '슬롯에 생성', 'Make variations': '변형 생성',
+-  Align: '정렬', 'Align left': '왼쪽 정렬', 'Align center': '가로 가운데 정렬', 'Align right': '오른쪽 정렬',
+-  'Align top': '위쪽 정렬', 'Align middle': '세로 가운데 정렬', 'Align bottom': '아래쪽 정렬',
+-  'Arrange row': '한 행으로 배치', 'Arrange column': '한 열로 배치', 'Arrange grid': '그리드 배치',
+-  'Distribute horizontal': '가로 등간격', 'Distribute vertical': '세로 등간격',
+-  'Bring forward': '앞으로', 'Bring to front': '맨 앞으로', 'Send backward': '뒤로', 'Send to back': '맨 뒤로',
+-  Front: '앞면', 'Focus section': '섹션 포커스', 'Rename section': '섹션 이름 변경',
+-  'Remove section only': '섹션만 삭제', Unlock: '잠금 해제', 'Unlock section': '섹션 잠금 해제',
+-  'Lock all': '모두 잠금', 'Lock background only': '배경만 잠금',
+-  'Section fill': '섹션 채우기', 'Section line': '섹션 테두리',
+-  'Hide contents': '내용 숨기기', 'Show contents': '내용 표시',
+-  'Hide title': '제목 숨기기', 'Show title': '제목 표시',
+-  'Fill color': '채우기 색', 'No fill': '채우기 없음', 'Corner radius': '모서리 둥글기',
+-  Arrowheads: '화살촉', 'Both arrows': '양쪽 화살표', 'End arrow': '끝 화살표', 'No arrows': '화살표 없음',
+-  'Dashed line': '점선', 'Solid line': '실선', Bold: '굵게', Thin: '얇게', Medium: '중간',
+-  'Line color': '선 색', 'Line width': '선 굵기', Border: '테두리',
+-  'Brush color': '브러시 색', 'Brush width': '브러시 굵기', Solid: '실선', Dashed: '점선', None: '없음',
+-  Soft: '부드럽게', Sharp: '날카롭게', Round: '둥글게', Warm: '따뜻하게',
+-  Black: '검정', White: '흰색', Gray: '회색', Red: '빨강', Orange: '주황', Green: '초록',
+-  Blue: '파랑', Pink: '분홍', Purple: '보라',
+-  'Soft blue': '연한 파랑', 'Soft purple': '연한 보라', 'Soft yellow': '연한 노랑',
+-  'Pale pink': '연분홍', 'Pale yellow': '연노랑', 'Pale blue': '연파랑',
+-  'Pale green': '연초록', 'Pale purple': '연보라',
+-  Check: '체크', Heart: '하트', Star: '별', Question: '물음표', 'Thumbs down': '비추천',
+-  'Down alt': '아래쪽', Face: '표정', Smile: '미소', Eyes: '눈',
+-  Lasso: '올가미 선택', 'Point select': '클릭 선택',
+-  矩形: '사각형', 椭圆: '타원', 圈选: '올가미 선택', 点选: '클릭 선택', 局部重绘: '부분 다시 그리기',
+-  '点击图片，标出要修改的位置': '이미지를 클릭해 수정할 영역을 표시하세요',
+-  取消请求: '요청 취소', 退出局部重绘: '부분 다시 그리기 종료',
+-  撤销: '되돌리기', 重做: '다시 실행', 清空标记: '표시 지우기',
+-  '加载历史画布失败，已使用默认状态。': '캔버스 불러오기에 실패하여 기본 상태를 사용합니다.',
+-  '素材已导入。': '에셋을 가져왔습니다.',
+-  '部分素材未导入,详见 Debug Log。': '일부 에셋을 가져오지 못했습니다. Debug Log를 확인하세요.',
+-  '没有素材被导入,详见 Debug Log。': '가져온 에셋이 없습니다. Debug Log를 확인하세요.',
+-  '当前版本的 Cindy 还不能直接读取这张画布图作为改图源,目前只认得本插件生成的图,或经聊天附件发给 Cindy 后放上画布的图。请把这张图作为附件发到聊天里,处理后即可再编辑。':
+-    '현재 버전의 Cindy는 이 캔버스 이미지를 편집 소스로 직접 읽을 수 없습니다. 지금은 이 플러그인이 생성한 이미지 또는 채팅 첨부 파일로 Cindy에게 보내 캔버스에 놓은 이미지만 인식합니다. 이 이미지를 채팅에 첨부 파일로 보내면 이후에 편집할 수 있습니다.',
+-}
+-
+-export const dictForLocale = (locale: string): Record<string, string> | null => {
+-  const lower = locale.toLowerCase()
+-  if (lower.startsWith('zh')) return DICT_ZH_CN
+-  if (lower.startsWith('ja')) return DICT_JA
+-  if (lower.startsWith('ko')) return DICT_KO
+-  // 其余 locale 按手册规则回落英文资源
+-  return DICT_EN
+-}
+diff --git a/src/i18n/translator.test.ts b/src/i18n/translator.test.ts
+index a342144d..6ababae9 100644
+--- a/src/i18n/translator.test.ts
++++ b/src/i18n/translator.test.ts
+@@ -1,150 +1,146 @@
+ /**
+  * @vitest-environment happy-dom
+  *
+- * P1c 返修 finding 3(minor):补两类此前缺失的契约测试。
++ * 改图源降级文案的 i18n 契约(P1c finding 3① 的 Wave 3 版本)。
+  *
+- * ①i18n 完整性:`cindyGenerationPort.ts` 导出的降级文案常量在 en/ja/ko 三份字典
+- *  里都有翻译,且译文与中文原文不同(不是"没翻译、原样落回字典"的假通过)。
+- * ②作用域收窄回归:finding 1 判回的正是"把整个 `.anchor-instruction-panel` 加
+- *  进白名单会连带误翻用户自己的节点标题"。这里用真实 DOM(happy-dom,非手写替身
+- *  ——CSS 选择器 `closest()`/`TreeWalker` 语义只有真 DOM 才不会跑偏)复现
+- *  AnchorOverlay 的最小结构,证明:
+- *   - 面板内、但不在 `.anchor-degrade-hint` 里的文本(模拟用户把节点命名为字典
+- *     key "Cancel")在非中文 locale 下**保持原文**;
+- *   - `.anchor-degrade-hint` 本身的降级提示文本**被正确翻译**。
+- *
+- * 本仓 unit 默认跑在 node env(未装 jsdom/happy-dom 全局),本文件用
+- * `@vitest-environment happy-dom` 单文件覆盖,不影响其余测试的默认环境。
++ * 旧版锁的是"生产常量(中文原文)在 dict.ts 三语字典里都有译文";DOM 替换器与
++ * dict.ts 退役后,契约改为:生产常量是 catalog key,四语 catalog 都有非空译文,
++ * 且 en/ja/ko 译文与 zh 原文不同(防"没真翻译、原样落回"的假通过)。
++ * key↔catalog 的一般性存在性由 src/i18n 的 i18nCompleteness 单测守;这里只锁
++ * 这条跨模块常量(业务模块 cindyGenerationPort ↔ catalog)的专属契约。
+  */
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { SOURCE_NOT_RECOGNIZED_MESSAGE } from '../agent/cindyGenerationPort'
+-import { DICT_EN, DICT_JA, DICT_KO } from './dict'
+ import { installLocaleTranslator } from './translator'
++import i18n from '../../../src/i18n'
++import en from '../../../src/i18n/locales/en'
++import ja from '../../../src/i18n/locales/ja'
++import ko from '../../../src/i18n/locales/ko'
++import zhCN from '../../../src/i18n/locales/zh-CN'
++
++const lookup = (catalog: unknown, key: string): unknown => {
++  let node: unknown = catalog
++  for (const part of key.split('.')) {
++    if (!node || typeof node !== 'object') return undefined
++    node = (node as Record<string, unknown>)[part]
++  }
++  return node
++}
+ 
+-describe('i18n 完整性(finding 3①)——降级文案的三语译文', () => {
+-  it('en/ja/ko 均有该 key 的翻译,且译文与中文原文不同', () => {
+-    for (const [label, dict] of [['en', DICT_EN], ['ja', DICT_JA], ['ko', DICT_KO]] as const) {
+-      const translated = dict[SOURCE_NOT_RECOGNIZED_MESSAGE]
+-      expect(translated, `${label} 字典缺少该 key 的译文`).toBeTypeOf('string')
+-      expect(translated, `${label} 译文不能为空`).not.toHaveLength(0)
+-      expect(translated, `${label} 译文与中文原文相同,像是没真的翻译`).not.toBe(SOURCE_NOT_RECOGNIZED_MESSAGE)
+-    }
++describe('改图源降级文案 — 常量为 catalog key 且四语齐全', () => {
++  it('常量是 chat.anchor.* 形状的 key(展示端按该前缀判定并 t())', () => {
++    expect(SOURCE_NOT_RECOGNIZED_MESSAGE.startsWith('chat.anchor.')).toBe(true)
+   })
+ 
+-  it('未知 locale 回落英文兜底——DICT_EN 的这条译文即回落时用户看到的文案', () => {
+-    // dictForLocale 对非 zh/ja/ko 的 locale 固定回落 DICT_EN(手册规则);这里只
+-    // 断言 DICT_EN 确有该 key,回落路径本身由 dict.ts 的 dictForLocale 保证,
+-    // 不在本测试重复断言其分支逻辑。
+-    expect(DICT_EN[SOURCE_NOT_RECOGNIZED_MESSAGE]).toBeTypeOf('string')
++  it('四语 catalog 均有非空译文,且 en/ja/ko 与 zh 原文不同', () => {
++    const zh = lookup(zhCN, SOURCE_NOT_RECOGNIZED_MESSAGE)
++    expect(zh).toBeTypeOf('string')
++    expect((zh as string).length).toBeGreaterThan(0)
++    for (const [label, catalog] of [['en', en], ['ja', ja], ['ko', ko]] as const) {
++      const translated = lookup(catalog, SOURCE_NOT_RECOGNIZED_MESSAGE)
++      expect(translated, `${label} catalog 缺少该 key 的译文`).toBeTypeOf('string')
++      expect((translated as string).length, `${label} 译文不能为空`).toBeGreaterThan(0)
++      expect(translated, `${label} 译文与 zh 原文相同,像是没真的翻译`).not.toBe(zh)
++    }
+   })
+ })
+ 
+-describe('作用域收窄回归(finding 1)——用户节点标题永远不动,降级提示才翻译', () => {
+-  class FakeBroadcastChannel {
+-    addEventListener() {}
+-    removeEventListener() {}
+-    postMessage() {}
+-    close() {}
++// ── 纯 locale 桥的功能契约(对抗式双审 P2-6:DOM 替换器退役后桥本身零测试)──
++// fetch /app-context → normalizeLocale → i18n.changeLanguage;host-context-changed
++// 广播与 focus recheck 触发 reload;失败回退 navigator.language。删掉 changeLanguage
++// 或 reload 逻辑,这里会红。
++
++class FakeBroadcastChannel {
++  static instances: FakeBroadcastChannel[] = []
++  handlers: Array<(event: { data?: unknown }) => void> = []
++  name: string
++  constructor(name: string) {
++    this.name = name
++    FakeBroadcastChannel.instances.push(this)
+   }
+-
+-  // installLocaleTranslator 每次调用都会新装一个 MutationObserver 观察
+-  // document.body,且不对外暴露句柄。生产环境这不是问题(它只会被调一次,
+-  // 换语言靠整页 reload);但本文件要在同一个 document.body 上反复调用它验证
+-  // 不同 locale,若不追踪并在每个 it() 之后 disconnect,上一条用例装的 observer
+-  // 会在下一条用例往 body 里插新节点时被动触发、用**已经过期的模块内 dict 闭包**
+-  // 二次翻译,产出跟 locale 对不上的假结果(已实测踩过这个坑)。
+-  const RealMutationObserver = globalThis.MutationObserver
+-  let activeObservers: MutationObserver[] = []
+-  class TrackingMutationObserver extends RealMutationObserver {
+-    constructor(callback: MutationCallback) {
+-      super(callback)
+-      activeObservers.push(this)
+-    }
++  addEventListener(_type: string, handler: (event: { data?: unknown }) => void) {
++    this.handlers.push(handler)
+   }
++  postMessage() {}
++  close() {}
++}
++
++const stubHostLocale = (locale: string | (() => string)) => {
++  vi.stubGlobal('fetch', vi.fn(async () => ({
++    json: async () => ({ context: { locale: typeof locale === 'function' ? locale() : locale } }),
++  })))
++}
++
++const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 0))
++
++describe('installLocaleTranslator — 宿主 locale 桥', () => {
++  let reloadSpy: ReturnType<typeof vi.fn>
+ 
+   beforeEach(() => {
++    FakeBroadcastChannel.instances = []
+     vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+-    vi.stubGlobal('MutationObserver', TrackingMutationObserver)
+-    activeObservers = []
++    reloadSpy = vi.fn()
++    // happy-dom 的 location.reload 可覆写;桥经 window.location.reload 触发整页重载
++    Object.defineProperty(window, 'location', {
++      configurable: true,
++      value: { ...window.location, reload: reloadSpy },
++    })
+   })
+ 
+-  afterEach(() => {
+-    for (const observer of activeObservers) observer.disconnect()
+-    activeObservers = []
++  afterEach(async () => {
+     vi.unstubAllGlobals()
+-    document.body.innerHTML = ''
++    vi.restoreAllMocks()
++    await i18n.changeLanguage('en')
+   })
+ 
+-  /** 复现 AnchorOverlay.tsx 渲染出的最小 DOM 形状(不经 React,直接搭 DOM)。 */
+-  const renderAnchorPanelFixture = (): { panel: HTMLElement; titleProbe: Text; hint: HTMLElement } => {
+-    const panel = document.createElement('div')
+-    panel.className = 'anchor-instruction-panel'
+-
+-    const label = document.createElement('label')
+-    // 模拟 selected.node.title:用户自己起的节点名。故意取一个真实存在于字典里的
+-    // 英文串("Cancel",裁剪工具条按钮名)——这正是 finding 1 描述的碰撞场景:
+-    // 用户节点碰巧同名时,只有它被误翻才说明作用域收窄失败。
+-    const titleProbe = document.createTextNode('Cancel')
+-    label.appendChild(document.createTextNode('point anchor → '))
+-    label.appendChild(titleProbe)
+-    panel.appendChild(label)
+-
+-    const hint = document.createElement('span')
+-    hint.className = 'anchor-degrade-hint'
+-    hint.appendChild(document.createTextNode(SOURCE_NOT_RECOGNIZED_MESSAGE))
+-    panel.appendChild(hint)
+-
+-    document.body.appendChild(panel)
+-    return { panel, titleProbe, hint }
+-  }
+-
+-  const withHostLocale = async (locale: string, run: () => Promise<void> | void) => {
+-    vi.stubGlobal(
+-      'fetch',
+-      vi.fn(async (input: unknown) => {
+-        if (String(input) === '/app-context') {
+-          return { ok: true, json: async () => ({ context: { locale } }) } as Response
+-        }
+-        return { ok: true, json: async () => ({}) } as Response
+-      }),
+-    )
+-    await run()
+-  }
+-
+-  it('ja locale:用户节点标题 "Cancel" 不被翻译,降级提示被翻译成日语', async () => {
+-    const { titleProbe, hint } = renderAnchorPanelFixture()
+-    expect(DICT_JA.Cancel, '本测试假设的碰撞前提失效:字典里已经没有 Cancel 这个 key 了').toBe('キャンセル')
+-
+-    await withHostLocale('ja', () => installLocaleTranslator())
+-
+-    // 用户内容永远不动:即使 "Cancel" 是字典 key,它不在 .anchor-degrade-hint 里,
+-    // closest(CHROME_SCOPE) 找不到匹配容器,inScope() 为 false,原样保留。
+-    expect(titleProbe.textContent).toBe('Cancel')
+-    // 降级提示本身在作用域内,按 ja 字典替换。
+-    expect(hint.textContent).toBe(DICT_JA[SOURCE_NOT_RECOGNIZED_MESSAGE])
+-    expect(hint.textContent).not.toBe(SOURCE_NOT_RECOGNIZED_MESSAGE)
++  it('拿到宿主 locale → normalize 后 changeLanguage', async () => {
++    stubHostLocale('ja-JP')
++    await installLocaleTranslator()
++    expect(i18n.language).toBe('ja')
+   })
+ 
+-  it('en locale(未知 locale 回落场景的等价路径):同样只翻降级提示,不动用户标题', async () => {
+-    const { titleProbe, hint } = renderAnchorPanelFixture()
+-
+-    await withHostLocale('en', () => installLocaleTranslator())
++  it('fetch 失败 → 回退 navigator.language(归一化)', async () => {
++    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('down') }))
++    vi.spyOn(window.navigator, 'language', 'get').mockReturnValue('ko-KR')
++    await installLocaleTranslator()
++    expect(i18n.language).toBe('ko')
++  })
+ 
+-    expect(titleProbe.textContent).toBe('Cancel')
+-    expect(hint.textContent).toBe(DICT_EN[SOURCE_NOT_RECOGNIZED_MESSAGE])
++  it('host-context-changed 广播 → 整页 reload;无关消息不触发', async () => {
++    stubHostLocale('zh-CN')
++    await installLocaleTranslator()
++    const channel = FakeBroadcastChannel.instances.at(-1)!
++    // 频道名是宿主↔面板的跨端约定,拼错则广播永久收不到——精确钉住
++    expect(channel.name).toBe('mivo-canvas-host')
++    channel.handlers.forEach((handler) => handler({ data: { kind: 'something-else' } }))
++    expect(reloadSpy).not.toHaveBeenCalled()
++    channel.handlers.forEach((handler) => handler({ data: { kind: 'host-context-changed' } }))
++    expect(reloadSpy).toHaveBeenCalledTimes(1)
+   })
+ 
+-  it('回归护栏:若整个 .anchor-instruction-panel(而不是 .anchor-degrade-hint)在白名单里,用户标题会被误翻——证明这条判据本身是可证伪的', async () => {
+-    // 这条不是测生产代码,是自证上面两条测试"真的在测作用域收窄"而不是碰巧通过。
+-    // 直接用真实 DOM 复刻 finding 1 判回的那个错误版本:整个面板在 CHROME_SCOPE 里。
+-    const panel = document.createElement('div')
+-    panel.className = 'anchor-instruction-panel-legacy-repro'
+-    const titleProbe = document.createTextNode('Cancel')
+-    panel.appendChild(titleProbe)
+-    document.body.appendChild(panel)
+-
+-    const scoped = panel.closest('.anchor-instruction-panel-legacy-repro, .anchor-degrade-hint')
+-    expect(scoped, '把整个面板 class 塞进白名单时,面板内任意文本都会被判定为「在作用域内」——这正是 finding 1 的病因').not.toBeNull()
++  it('focus recheck:归一化后语言相同不 reload,真的变了才 reload', async () => {
++    let hostLocale = 'ja'
++    stubHostLocale(() => hostLocale)
++    // 前面用例的 install 也往 window 挂了 focus 监听(无 teardown API);拦截
++    // addEventListener 只捕获本次 install 的 handler、不真挂载,避免跨用例串扰。
++    const focusHandlers: Array<() => void> = []
++    const addSpy = vi.spyOn(window, 'addEventListener').mockImplementation((type, handler) => {
++      if (type === 'focus') focusHandlers.push(handler as () => void)
++    })
++    await installLocaleTranslator()
++    addSpy.mockRestore()
++    expect(i18n.language).toBe('ja')
++    expect(focusHandlers.length).toBe(1)
++
++    hostLocale = 'ja-JP' // 归一化后仍是 ja → 不打扰
++    focusHandlers[0]()
++    await flushAsync()
++    expect(reloadSpy).not.toHaveBeenCalled()
++
++    hostLocale = 'ko' // 真的换语言 → reload 重新走 /app-context
++    focusHandlers[0]()
++    await flushAsync()
++    expect(reloadSpy).toHaveBeenCalledTimes(1)
+   })
+ })
+diff --git a/src/i18n/translator.ts b/src/i18n/translator.ts
+index d2d717d6..ace7ece8 100644
+--- a/src/i18n/translator.ts
++++ b/src/i18n/translator.ts
+@@ -1,115 +1,19 @@
+ /**
+- * 插件层多语言桥 + 残余 UI 文案替换器。
++ * 插件层宿主 locale 桥(i18n Wave 3 起,DOM 文案替换器已整体退役)。
+  *
+- * 语言来源:Cindy 面板同源端点 /app-context 的 locale(手册:插件语言的唯一
+- * 事实来源,不读 navigator.language)。宿主切换语言时电子脑收到
+- * host-context-changed,经 BroadcastChannel 通知本面板整页重载换文案。
+- *
+- * 2026-07-31 起共享代码接入真 i18n(src/i18n,i18next 四语 catalog):本模块先把
+- * 宿主 locale 喂给 i18next(菜单/工具条等已迁移面直接以目标语言渲染),再对
+- * **尚未迁移**的容器保留 DOM 文本替换兜底。随 Wave 2/3 文案迁移推进,下面的
+- * 白名单逐步清空,最终整个 DOM 替换器退役(Wave 4)。
++ * 历史:本文件曾是"零共享代码改动"的 DOM 文本替换器(CHROME_SCOPE 白名单 +
++ * MutationObserver + dict.ts 整段映射)。随 i18n Wave 1–3 把全部 UI 镶边迁到
++ * src/i18n(i18next 四语 catalog),白名单清零,替换器与 dict.ts 一并删除;
++ * 现在只剩一件事:把宿主语言喂给共享应用的 i18next,并监听宿主切换语言。
+  *
+- * 作用域:只在下方 UI 容器白名单内替换文本节点与 title/aria-label 属性——
+- * 画布上用户自己的内容(便签文字、文本节点等)不在白名单容器里,永远不动。
+- * 命中不了字典的文案保持原文(英文兜底,符合手册要求)。
++ * 语言来源:Cindy 面板同源端点 /app-context 的 locale(手册:插件语言的唯一
++ * 事实来源,不读 localStorage 偏好——那是主站浏览器形态的设置)。宿主切换语言
++ * 时电子脑收到 host-context-changed,经 BroadcastChannel 通知本面板整页重载。
+  */
+ import i18n, { normalizeLocale } from '../../../src/i18n'
+-import { dictForLocale } from './dict'
+ 
+ const HOST_CHANNEL = 'mivo-canvas-host'
+ 
+-/**
+- * UI 镶边容器白名单:替换只发生在这些容器的子树里。
+- * 已迁移到 src/i18n 的容器(工具坞/绘制浮层/右键菜单/快捷工具条/画笔/贴纸面板)
+- * 已从名单退役——它们由 i18next 直接渲染目标语言,不再需要 DOM 替换。
+- */
+-const CHROME_SCOPE = [
+-  '.text-format-toolbar',
+-  '.image-mask-edit-toolbar',
+-  '.toast-viewport',
+-  // 2026-07-28 图片编辑平价:裁剪操作条(Done/Cancel/Reset/比例预设)与
+-  // in-app 输入弹窗(Alt text / 重命名;window.prompt 在插件 webview 不可用)。
+-  '.image-crop-actions',
+-  '.canvas-prompt-dialog',
+-  // 2026-07-31(P1c 现状降级文案核对):改图源降级提示("当前版本的 Cindy 还不能
+-  // 直接读取…")此前不在作用域内,非中文 locale 只能看中文原文。**只列这一个
+-  // class,不列它所在的 `.anchor-instruction-panel` 整个面板**——同一面板里还
+-  // 渲染 `selected.node.title`(用户自己起的节点名,任意文本);第一版把整个
+-  // 面板加进白名单后被对抗审查判回:用户若把节点命名为字典 key(如 "Cancel")
+-  // 标题会被误翻,违反"用户内容永远不动"的边界(P1c 返修 finding 1)。降级提示
+-  // 元素本身带专属 class `.anchor-degrade-hint`,只翻它,不牵连兄弟节点。
+-  '.anchor-degrade-hint',
+-].join(', ')
+-
+-// data-tooltip 是画布自绘悬停气泡的文案载体(替代了原生 title,后者延迟长、
+-// 样式弱,在插件 webview 里近乎不可见)。它必须在这张表里,否则工具条提示会
+-// 绕过翻译层直接显示英文原文。
+-const TRANSLATED_ATTRS = ['title', 'aria-label', 'placeholder', 'data-tooltip'] as const
+-
+-/** 与 TRANSLATED_ATTRS 一一对应的属性选择器 —— 两处必须同步,否则子树扫描
+- *  会漏掉新属性(仅靠 MutationObserver 的 attributeFilter 补不回首屏)。 */
+-const TRANSLATED_ATTR_SELECTOR = TRANSLATED_ATTRS.map((attr) => `[${attr}]`).join(', ')
+-
+-let dict: Record<string, string> | null = null
+-
+-/** 精确命中,或"主体 (快捷键)"/"前缀: 主体"组合式命中 */
+-const translateText = (raw: string): string | null => {
+-  if (!dict) return null
+-  const text = raw.trim()
+-  if (!text) return null
+-  const exact = dict[text]
+-  if (exact) return raw.replace(text, exact)
+-  // "Fit selection (Shift+2)" / "Zoom out (⌘-)" 这类带快捷键后缀的组合
+-  const suffixed = text.match(/^(.+?)(\s*\(.+\))$/)
+-  if (suffixed && dict[suffixed[1]]) return raw.replace(text, dict[suffixed[1]] + suffixed[2])
+-  // "Draw: Marker (P)" 这类"前缀: 主体"组合,两段分别查字典
+-  const prefixed = text.match(/^(.+?): (.+?)(\s*\(.+\))?$/)
+-  if (prefixed && dict[prefixed[1]]) {
+-    const body = dict[prefixed[2]] ?? prefixed[2]
+-    return raw.replace(text, `${dict[prefixed[1]]}: ${body}${prefixed[3] ?? ''}`)
+-  }
+-  return null
+-}
+-
+-const inScope = (node: Node): boolean => {
+-  const el = node instanceof Element ? node : node.parentElement
+-  return Boolean(el?.closest(CHROME_SCOPE))
+-}
+-
+-const translateTextNode = (node: Node): void => {
+-  if (node.nodeType !== Node.TEXT_NODE || !node.nodeValue) return
+-  if (!inScope(node)) return
+-  const next = translateText(node.nodeValue)
+-  if (next !== null && next !== node.nodeValue) node.nodeValue = next
+-}
+-
+-const translateAttrs = (el: Element): void => {
+-  if (!inScope(el)) return
+-  for (const attr of TRANSLATED_ATTRS) {
+-    const value = el.getAttribute(attr)
+-    if (!value) continue
+-    const next = translateText(value)
+-    if (next !== null && next !== value) el.setAttribute(attr, next)
+-  }
+-}
+-
+-const translateSubtree = (root: Node): void => {
+-  if (root.nodeType === Node.TEXT_NODE) {
+-    translateTextNode(root)
+-    return
+-  }
+-  if (!(root instanceof Element || root instanceof Document)) return
+-  if (root instanceof Element) translateAttrs(root)
+-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+-  for (let node = walker.nextNode(); node; node = walker.nextNode()) translateTextNode(node)
+-  if (root instanceof Element || root instanceof Document) {
+-    for (const el of (root as Element | Document).querySelectorAll(TRANSLATED_ATTR_SELECTOR)) {
+-      translateAttrs(el)
+-    }
+-  }
+-}
+-
+ export async function installLocaleTranslator(): Promise<void> {
+   // 宿主切语言 → 电子脑广播 → 整页重载(重载后重新读 /app-context)
+   new BroadcastChannel(HOST_CHANNEL).addEventListener('message', (event) => {
+@@ -120,8 +24,8 @@ export async function installLocaleTranslator(): Promise<void> {
+ 
+   const fetchHostLocale = async (): Promise<string> => {
+     try {
+-      // 3s 超时(PR #367 review):/app-context 悬挂不能拖住 installLocaleTranslator
+-      // 的 await——plugin-main 在它 resolve 前不会 createRoot,面板会一直白屏。
++      // 3s 超时(PR #367 review):/app-context 悬挂不能拖住本函数的 await——
++      // plugin-main 在它 resolve 前不会 createRoot,面板会一直白屏。
+       const r = (await (
+         await fetch('/app-context', { signal: AbortSignal.timeout(3000) })
+       ).json()) as { context?: { locale?: string } }
+@@ -132,15 +36,10 @@ export async function installLocaleTranslator(): Promise<void> {
+   }
+ 
+   // 宿主下发的 locale;空 = 旧宿主(未暴露 locale 的 Cindy 构建)、无宿主调试环境,
+-  // 或本次请求超时/失败。
++  // 或本次请求超时/失败。拿不到时回退系统语言(最优猜测)。
+   let hostLocale = await fetchHostLocale()
+-  // 拿不到宿主 locale 时回退系统语言(最优猜测;旧宿主本就无从感知 Cindy 应用内语言)。
+   const locale = hostLocale || navigator.language || 'en'
+   const appliedLocale = normalizeLocale(locale)
+-
+-  // 宿主 locale 桥:喂给共享应用的 i18next——插件里语言只听宿主的,不读
+-  // localStorage 偏好(那是主站浏览器形态的设置)。plugin-main 在 createRoot 前
+-  // await 本函数,保证首帧就是目标语言;宿主切语言仍走整页 reload。
+   await i18n.changeLanguage(appliedLocale)
+ 
+   // 电子脑按需拉起,宿主切语言那一刻它可能在沉睡、host-context-changed 会漏 →
+@@ -162,27 +61,4 @@ export async function installLocaleTranslator(): Promise<void> {
+     window.setTimeout(() => void recheck(), 5_000)
+     window.setTimeout(() => void recheck(), 15_000)
+   }
+-  dict = dictForLocale(locale)
+-  if (!dict || Object.keys(dict).length === 0) return
+-
+-  translateSubtree(document.body)
+-
+-  const observer = new MutationObserver((mutations) => {
+-    for (const mutation of mutations) {
+-      if (mutation.type === 'characterData' && mutation.target.nodeValue) {
+-        translateTextNode(mutation.target)
+-      } else if (mutation.type === 'attributes' && mutation.target instanceof Element) {
+-        translateAttrs(mutation.target)
+-      } else if (mutation.type === 'childList') {
+-        for (const added of mutation.addedNodes) translateSubtree(added)
+-      }
+-    }
+-  })
+-  observer.observe(document.body, {
+-    subtree: true,
+-    childList: true,
+-    characterData: true,
+-    attributes: true,
+-    attributeFilter: [...TRANSLATED_ATTRS],
+-  })
+ }

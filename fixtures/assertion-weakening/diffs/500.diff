@@ -1,0 +1,26 @@
+diff --git a/src/__tests__/correlateNewAssets.test.ts b/src/__tests__/correlateNewAssets.test.ts
+index 15e6a3a4..f89a3ac0 100644
+--- a/src/__tests__/correlateNewAssets.test.ts
++++ b/src/__tests__/correlateNewAssets.test.ts
+@@ -165,7 +165,7 @@ describe('mask 门禁次序不变量(R8-H 边界,与 flag 无关)', () => {
+       idempotencyKey: 'k4',
+     })
+ 
+-    await expect(promise).rejects.toThrow('局部重绘/框选修改(mask)在 Cindy 插件模式下暂不支持(后续版本接入)。')
++    await expect(promise).rejects.toThrow('AI 编辑/框选修改(mask)在 Cindy 插件模式下暂不支持(后续版本接入)。')
+ 
+     // 次序正确时连源图兑换都没进 → 任何形态的寄存/改图请求都不该发出。
+     expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
+diff --git a/src/agent/cindyGenerationPort.ts b/src/agent/cindyGenerationPort.ts
+index 25ea4154..72115d26 100644
+--- a/src/agent/cindyGenerationPort.ts
++++ b/src/agent/cindyGenerationPort.ts
+@@ -323,7 +323,7 @@ export const cindyImageGenerationPort: ImageGenerationPort = {
+     const regionBody = request.regionBody?.trim() || undefined
+     const regionEdit = Boolean(regionRects && regionBody)
+     if (!regionEdit && (request.mask || request.maskBounds || request.markedImage || request.subjects?.length)) {
+-      unsupported('局部重绘/框选修改(mask)')
++      unsupported('AI 编辑/框选修改(mask)')
+     }
+     const source = await resolveSourceEntry({ sourceAssetUrl: request.sourceAssetUrl, image: request.image })
+     // region-edit:用指令原文 + 百分比矩形重拼坐标提示词(prompt 字段是 web 双图外壳,单图宿主不可用)。

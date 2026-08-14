@@ -1,0 +1,69 @@
+diff --git a/scripts/e2e/scenarios/project-sidebar.mjs b/scripts/e2e/scenarios/project-sidebar.mjs
+index 769d6e16..2e67369b 100644
+--- a/scripts/e2e/scenarios/project-sidebar.mjs
++++ b/scripts/e2e/scenarios/project-sidebar.mjs
+@@ -309,6 +309,31 @@ export const runProjectSidebarScenario = async (context) => {
+     if (!stored || !stored.includes(projectId)) {
+       throw new Error(`Collapse should persist to localStorage: ${stored}`)
+     }
++    // #532 canvasPersistWriteScheduler debounces canvas/project writes 800ms and only
++    // flushes on pagehide/visibilitychange WITHOUT awaiting the write (fire-and-forget —
++    // by design, reload/close must never block on it). setupState()'s createProject/
++    // createCanvas calls above are still inside that debounce window (wait() with no
++    // arg is ~0ms), so reload() can race the underlying IDB write and come back to a
++    // store with no "E2E Project" — this was nightly run 31078575879's failure signature
++    // (`.project-row` visible timeout right after reload). Explicitly await the flush
++    // barrier before reloading so the scenario matches the app's real async persist
++    // contract instead of assuming synchronous writes.
++    await page.evaluate(() => {
++      // No optional chaining here on purpose: a missing bridge must fail LOUDLY, not
++      // silently skip the flush and reintroduce the exact race this guard exists for.
++      if (!window.__MIVO_E2E__ || typeof window.__MIVO_E2E__.flushCanvasPersistWrite !== 'function') {
++        throw new Error('__MIVO_E2E__.flushCanvasPersistWrite missing — e2e bridge broken, flush guard cannot run')
++      }
++      return window.__MIVO_E2E__.flushCanvasPersistWrite('e2e-reload-guard').then((outcome) => {
++        // flushAndSettle resolves 'timed-out' instead of rejecting (privacy-cleanup paths
++        // must not hang) — for this guard a timeout means the write may still be in flight,
++        // i.e. the exact race we're guarding against. Fail loudly instead of reloading.
++        if (outcome !== 'settled') {
++          throw new Error(`flushCanvasPersistWrite outcome=${outcome} — persist barrier did not settle before reload`)
++        }
++        return outcome
++      })
++    })
+     // Reload — collapse state survives. Wait for the sidebar (DOM, renderer-agnostic)
+     // + the E2E Project row to confirm hydration landed on the persisted state
+     // (waitForCanvasReady is unsuitable here: the persisted canvas is blank, no demo
+diff --git a/src/main.tsx b/src/main.tsx
+index 86e70adb..b1edfd15 100644
+--- a/src/main.tsx
++++ b/src/main.tsx
+@@ -14,6 +14,7 @@ import { ensureEffectiveKernelReady, isLegacyKernelEffective } from './app/kerne
+ import { documentKey, sessionKey } from './kernel/docKernelPersistAdapter'
+ import { installRollbackTrigger } from './kernel/rollbackTrigger'
+ import { clearRegionEditDraft } from './canvas/regionEditDraft'
++import { flushCanvasPersistWrite } from './store/canvasPersistConfig'
+ import type { agentExportCanvas } from './agent/canvasAgentVerbs'
+ 
+ declare global {
+@@ -73,6 +74,12 @@ declare global {
+        *  (不是画布文档数据),所以给 harness 一个段落隔离钩子。仅 e2e 开关打开时挂,
+        *  生产 window 上没有这个字段。 */
+       clearRegionEditDraft: typeof clearRegionEditDraft
++      /** #532 写防抖(canvasPersistWriteScheduler)的测试锚:冲刷暂存的画布持久化写
++       *  并等在途落定(有界屏障,5s)。e2e 场景在 `page.reload()` 前必须调用它——
++       *  debounce(800ms)+ pagehide/visibilitychange 兜底是 fire-and-forget(不 await),
++       *  reload 若先于底层写落定发生,持久化数据会丢(nightly project-sidebar 回归的
++       *  根因)。仅 e2e 开关打开时挂,生产 window 上没有这个字段。 */
++      flushCanvasPersistWrite: typeof flushCanvasPersistWrite
+     }
+     __MIVO_E2E_ENABLED__?: boolean
+     /** e2e opt-out: set via addInitScript to suppress first-login auto-prompt
+@@ -107,6 +114,7 @@ if (window.__MIVO_E2E_ENABLED__ === true) {
+     getCanvasPersistDocumentKey: (name: string) => (isLegacyKernelEffective() ? namespacedKey(name) : documentKey(name)),
+     getCanvasPersistSessionKey: (name: string) => (isLegacyKernelEffective() ? namespacedKey(name) : sessionKey(name)),
+     clearRegionEditDraft,
++    flushCanvasPersistWrite,
+   }
+   // 动态 import:整条动词链只在 e2e 开关打开时才加载,生产包不含它(canvasAgentVerbs
+   // 在 src/ 里没有其他 importer,静态 import 会无条件进包)。

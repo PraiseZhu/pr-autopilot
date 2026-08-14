@@ -1,0 +1,3720 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 6c0800ae..c4123f99 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -1067,6 +1067,11 @@ jobs:
+   # 阻断语义:失败即 job 红;注册为 required check 后挡合并(照 pg-suite 先例,
+   # ruleset/经典保护为 PR 外 lead 动作)。同 PR 已把本 check 名同步进
+   # deploy-green-ref REQUIRED_ON_MAIN 与 watchdog 两处名单 —— 三处必须一起改。
++  # 第四个消费者(2026-08-02,main-health.yml PR-w2 三审 F5/D-003):main-health.yml
++  # 在运行时用正则解析 deploy-green-ref.yml 里 REQUIRED_ON_MAIN 数组本身的字面量
++  # 形状(不是同步名单内容,是依赖该数组"怎么写")——把它从单引号字符串改成双引号、
++  # 拆成变量拼装,或整体挪走,main-health 的解析会静默失败并 fail-closed 退回强
++  # 措辞(不报错,只是判据失真)。改这个数组时也务必留意这条隐式契约。
+   cindyplugin-build:
+     name: cindyplugin build
+     runs-on: ubuntu-latest
+diff --git a/.github/workflows/deploy-green-ref.yml b/.github/workflows/deploy-green-ref.yml
+index 539e6241..b3297d77 100644
+--- a/.github/workflows/deploy-green-ref.yml
++++ b/.github/workflows/deploy-green-ref.yml
+@@ -18,6 +18,17 @@
+ # bench / deps audit / semgrep baseline / coverage report 是设计上的非阻断,不纳入。
+ # ⚠️ ci.yml / secret-scan.yml 若增删改名 main-push 阻断 job,必须回来同步 REQUIRED_ON_MAIN,
+ # repo-health-watchdog 会核对本文件与实际 workflow 的存在性,但核不了这个名单的语义。
++# ⚠️ 字面量形状契约(2026-08-02,main-health.yml PR-w2 三审新增的第四个消费者,与
++# ci.yml:1070-1074 互指):main-health.yml 在运行时用正则解析本文件里 REQUIRED_ON_MAIN
++# 数组本身的字面量形状(单引号字符串、逐项精确语法),不是同步名单内容 —— 把单引号
++# 改成双引号、拆成变量拼装、或整体挪走,main-health 的解析会静默失败并 fail-closed
++# 退回强措辞(不报错,只是判据失真)。**数组 `[` 与 `]` 之间也不要写行内/行尾注释**
++# (哪怕是给人看的说明)—— 解析器要求方括号内除了逐项单引号字符串与逗号/空白外
++# 不能有任何未消费的 token,一条注释就会让它判定"未消费 token"而拒绝解析(三审
++# claude-adversarial W2R3-A2 相邻 finding)。改这个数组时务必留意这条隐式契约,
++# 改完后可用 `node -e` 跑一遍 scripts/ci/main-health-logic.mjs 的
++# parseRequiredOnMain 核对(main-health-logic.test.mjs 也对本文件的当前内容跑了
++# 一条集成断言,改坏了会在 test:unit 里直接变红,不必靠人肉记住这条契约)。
+ #
+ # 防倒退:candidate 必须是当前 ref 的后代(compareCommits status=ahead)才推进,
+ # 且 updateRef 用 force:false(服务端二道闸,只许 fast-forward)。
+diff --git a/.github/workflows/main-health.yml b/.github/workflows/main-health.yml
+index b7d6d7fd..15a29cc6 100644
+--- a/.github/workflows/main-health.yml
++++ b/.github/workflows/main-health.yml
+@@ -27,14 +27,99 @@
+ #      本 PR 合入 main 前对任何 run 都不生效,PR 内无法端到端自测。合并后首测:
+ #      手动 workflow_dispatch(无 workflow_run 上下文会安全跳过),真实触发靠 main 上
+ #      下一次 workflow 完成。
+-#   2. 本 workflow 自己翻红没人监控(自监控会成环)。它只做 REST 调用、无 checkout、
+-#      无外部依赖,失败面很窄;真挂了会体现为"main 红了却没开 Issue",届时靠
+-#      Actions 页面发现。
++#   2. 本 workflow 自己翻红没人监控(自监控会成环)。它现在含一次只读 checkout
++#      (`persist-credentials: false`,仅用于把 scripts/ci/main-health-logic.mjs 读进
++#      工作目录供下方 `import()`,不做任何 git 写操作)+ REST 调用,无其它外部依赖,
++#      失败面仍窄;真挂了会体现为"main 红了却没开 Issue",届时靠 Actions 页面发现。
+ #   3. `branches: [main]` 过滤掉 PR 分支的 run,所以本 workflow **不会**在 PR head
+ #      上产出 check-run,不影响 pr-hygiene 的外部 check 计数口径。
+ #
+-# 安全:permissions 只给 issues:write(开/关/评论 Issue 所需的最小集)。
+-# 无 checkout、不读 PR 代码、不碰 contents。
++# 安全:permissions 给 issues:write(开/关/评论 Issue 所需的最小集)+
++# contents:read(读取 deploy-green-ref.yml 源码解析 REQUIRED_ON_MAIN,也覆盖下方
++# checkout)+ checks:read(查 check-run 结论判定是否命中阻断名单)+ actions:read
++# (查 job/step 明细判定"是否真的重跑过")。三个只读 scope 都是 SC2.1/SC2.2 新增的
++# 三个 API 调用(getContent/checks.listForRef/actions.listJobsForWorkflowRunAttempt)
++# 各自所需的最小权限,同仓 repo-health-watchdog.yml:34-37 对同类调用声明相同四项,
++# 是最强对照。
++#
++# 二轮返修(2026-08-02)新增一次只读 checkout(`persist-credentials: false`,不做
++# 任何 git 写操作),仅用于把 scripts/ci/main-health-logic.mjs 读进工作目录供下方
++# github-script 步骤 `import()` —— 判据逻辑单一源化(见 SC1 说明),不再手工维护
++# 第二份内联实现。checkout 的仍是 **main 分支自己的代码**:本 workflow 只在
++# `branches: [main]` 触发(见下方 on.workflow_run),不接触 PR 分支,风险面不因此
++# 扩大 —— 三个 github.rest.* 调用读的仍是 main 上的公开元数据(workflow 文件内容 /
++# check-run 结论 / job 结构),不涉及不可信输入。
++#
++# 告警口径修正(2026-08-02,issue #423 分析出的两个问题):
++#   1. 文案分档:此前"为什么这条要当回事"对**所有**受监控 workflow 无差别断言
++#      "红灯不修,后续所有合并都无法上生产" —— 但部署阻断名单
++#      (deploy-green-ref.yml 的 REQUIRED_ON_MAIN,此处不落数量防漂移)只覆盖
++#      CI/secret-scan 的部分 job,`Daily Changelog` 等 workflow 翻红并不卡
++#      deploy/green(实测 08-02:Daily Changelog 连红 4 天,deploy/green 仍随
++#      main 推进)。现在按"失败是否真的命中 REQUIRED_ON_MAIN"分两档措辞,见下方
++#      notGreenRequiredChecks。
++#   2. 关闭条件收紧:此前只要"同 workflow 下一次 success"就无条件关灯,但
++#      `Daily Changelog` 这类 workflow 存在"当天无新 PR → publish 步骤被
++#      skip → 仍以 success 收场"的空转日(07-27/07-28 有实例)—— 根因没修,
++#      Issue 也会被这种空转 success 假关闭。现在改为:success 时额外核对上次
++#      失败的 step 是否**真的被执行且通过**(conclusion=success,不是 skipped),
++#      见下方 getStepMap / FAILED_STEPS_RE。
++#   两处新逻辑的兜底方向并不相同,不能用同一个标签概括(UP2-S1 修正:此前统一
++#      写"fail-open"是错的,对名单读取失败这条实际方向相反):
++#      - 名单读不到(SC2.1):按"阻断部署"处理(强措辞)—— 这是对"是否阻断"这一
++#        判断的 fail-closed,宁可多报一次阻断,不放过任何可能真的挡部署的红灯;
++#      - job/step 明细读不到(SC2.2):退回旧行为(无条件关闭)—— 这才是 fail-open,
++#        不让一次 API 故障把红灯台账卡死。
++#      两者的共同目标一致:API 故障时都不让判据本身的不确定性引入新的静默失效,
++#      只是各自选择的兜底方向相反,视具体判据"错了会更危险"的方向而定。
++#
++# 三审修复(2026-08-02,三席盲审共识后的返修轮,详见 PR 讨论):
++#   - permissions 补齐三个只读 scope(见上,此前的 issues:write-only 会让三个新增
++#     调用全部 403,两条 SC 静默退回修复前行为,job 仍保持绿色 —— 见 W2-R1-F1)。
++#   - `deploy green ref` 自己失败时强制按阻断措辞(见 GREEN_REF_WORKFLOW_NAME),
++#     不看名单命中 —— 它只在名单全绿后才推 ref,失败时名单几乎必然全绿,原判据
++#     方向性反了(W2-R1-F2)。
++#   - job/step 查询绑定触发事件自己的 run_attempt(listJobsForWorkflowRunAttempt),
++#     不再用默认 latest attempt,避免快速空转 rerun 时读错 attempt(W2-R1-A-002)。
++#   - REQUIRED_ON_MAIN 解析正则锚定行首非注释的唯一活动声明,拒绝零个或多个候选;
++#     两条解析失败出口都补 core.warning(W2-R1-D-003 / F6,与本函数 catch 分支一致)。
++#   - job/step 聚合改为「同名 step 取并集」而非覆盖,同名 step 重跑(如 flaky
++#     upload 重试)不再因"后者覆盖前者"而互相误判(W2-R1-F4 / F-4)。
++#   - failedsteps marker 解码后校验形状(必须是二维字符串数组),畸形值 fail-open
++#     返回 null 而不是让下游 `.filter` 抛异常把本该绿的 job 打红(W2-R1-E-004)。
++#   - 空转说明评论加节流(同类空转不逐次重复追加)、可见 step 名转义+截断,防止
++#     日更 workflow 上无界评论增长与 Markdown/mention 注入(W2-R1-F3 / E-005)。
++#
++# 二轮返修(2026-08-02,PR-w2 全新盲审 W2R2-*/CODEX-*/UP2-* 共识后的第二轮返修):
++#   - 判据逻辑改为直接 `import()` scripts/ci/main-health-logic.mjs(新增一次只读
++#     checkout),不再手工维护第二份内联实现 —— 测试文件现在测的就是生产实际
++#     执行的函数,消除"镜像与生产靠注释同步、改坏一个另一个测不出来"的漂移面
++#     (W2R2-C1 / CODEX-F2 / UP2-S4)。
++#   - isStepResolved 撤回"全部 skipped 视为已解决"的判据,改回 fail-closed:仅
++#     conclusion===success 才算已重跑(W2R2-CODEX-F1)——API 不提供"这个 step 是否
++#     只在失败路径下运行"的语义,宽松判据会让本 PR 最初要拦的空转假关闭原样复现。
++#     已知局限:失败路径专属 step(如 `if: failure()`)在绿灯 run 里必然 skipped,
++#     现在会被判"未重跑",Issue 保持 open 需人工关闭一次 —— 宁可偶尔需要人工关,
++#     不可假关闭。
++#   - REQUIRED_ON_MAIN 解析改为 exact 语法校验:混合引号/裸表达式/未消费 token
++#     一律 fail-closed,不再"部分解析成功"就返回认出的那一部分名字;数组内容的
++#     括号匹配改为逐字符扫描,名字本身含 `]` 不会被误判为数组提前结束
++#     (W2R2-CODEX-F5)。
++#   - permissions 守卫补齐 checks.*/actions.* 的方法级 read/write 映射(此前对
++#     覆盖到的 resource 一律判 read,写方法如 cancelWorkflowRun/checks.create 会
++#     被静默漏报),issues.* 的 issues/pull-requests 二选一收窄到只对 comment 系
++#     端点生效,issue 本体端点(create/update/addLabels 等)只认 issues scope
++#     (W2R2-CODEX-F3 / W2R1-A1)。
++#   - permissions 守卫的 YAML 解析更健壮:带引号 job 名、非空 flow-map
++#     permissions、非 2 空格缩进均能正确识别;子行缩进不一致等无法可靠理解的
++#     形状一律 fail-closed 报"无法解析"(W2R2-CODEX-F4 / UP2-S5)。
++#   - 新增 workflow 级 concurrency(按被监控 workflow 名分组,同名 workflow 的
++#     main-health run 严格串行),写 Issue 前重新拉取最新正文复核执行序,过期即
++#     放弃本次写 —— 双重防护同一 Issue 的 read-then-write 竞态(W2R2-CODEX-F6)。
++#   - buildStepLabel 的截断改为按完整 pair 边界累加,不再在某个 pair 内部截断
++#     导致反引号数为奇数、code span 未闭合(UP2-S2)。
++#   - 空转说明评论节流改为扫最近 20 条评论(而非只看最后一条),红灯期间"空转→
++#     失败→空转"交替时不会被中间插入的失败记录评论清空节流状态(UP2-S3)。
+ 
+ name: main health
+ 
+@@ -57,6 +142,52 @@ on:
+ 
+ permissions:
+   issues: write
++  contents: read
++  checks: read
++  actions: read
++
++# SC6(W2R2-CODEX-F6):按被监控 workflow 名分组 —— 同一监控对象(同一个 Issue)的
++# main-health run 严格串行,消除"两个 run 基于同一旧 marker 并发通过 isStale"的
++# read-then-write 竞态(下方写前复核只堵住"检查后到写入前"的窄窗口,真正的强
++# 保证来自这里的串行 —— 同组同一时刻只有一个 job 在跑,两个 run 根本不会同时执行
++# 到写入那一步)。不同监控对象各自独立 Issue,不必互相排队,故不用单一静态 group
++# (那会让 CI 事件排队等 Daily Changelog 事件,无意义地变慢)。
++#
++# 三审返修(2026-08-02,claude-adversarial W2R3-D1 / codex-adversarial W2R3-CODEX-F2
++# 共识后的措辞修正,机制维持不变):GitHub 官方语义是 `cancel-in-progress: false`
++# 只保证不杀**正在运行**的那个;同组最多 1 个 pending,第三个事件到达时会把**排队
++# 中的那个取消**(GitHub 文档原文:"any existing pending job or workflow in the
++# same concurrency group will be canceled")—— 不是此前写的"排队而不是取消,任何
++# 一次事件都不能被静默丢弃"(该措辞不成立,已删)。
++#
++# 已知局限(不藏,方向:同一监控对象在一个 job 时长内(本 job timeout-minutes: 5)
++# 连续到达 N 次(N≥3)时,除了正在运行的第 1 次与最终排在 pending 位的第 N 次,
++# 中间的 N-2 次事件会被逐个取消替换,其台账留痕不会被处理 —— 三审 R2
++# claude-adversarial W2R4-D2 修正:此前写成"中间那次"这种固定单数,按上面这条
++# 机制本身推导,量级应随 N 变化,不是常数 1):
++#   - GitHub 官方 workflow-syntax 文档记载 `concurrency.queue` 字段**确实存在**
++#     (`single`/`max`,`max` 允许最多 100 个 pending 排队而不互相取消)——先不采用
++#     不是因为这个字段不存在(三审 R2 upstream-preview UP3R2-F1 修正:此前的表述
++#     把"工具不认识"和"平台没有"混为一谈,是推理错误,读者可能据此误以为这个选项
++#     永远不可用)。真实且可操作的理由是:本仓当前 actionlint(1.7.12)的 schema 还
++#     不认识这个字段(实测:`unexpected key "queue" for "concurrency" section.
++#     expected one of "cancel-in-progress", "group"`),写上去会让提交前自检用的
++#     actionlint 报错 —— 是该工具 schema 滞后,本仓目前未把 actionlint 接入自动化
++#     门禁,先不采用(本仓没有任何自动化 actionlint 步骤,此前归因于"本仓门禁工具链
++#     的能力缺口"会让人误以为存在这样一道 CI gate)。等 actionlint 补齐这个字段的
++#     schema 之后,`concurrency.queue: max` 是可以重新评估的选项。
++#   - 曾考虑把触发 run 自身的唯一标识(如 run.id)拼进 group 键,让"不同 run 各自
++#     独立分组"从而不再互相取消 —— 但这等于让同一监控对象的不同 run 完全并行
++#     执行,恰好撕开本条串行化本来要堵住的那个 read-then-write 竞态窗口(上面
++#     第一段);用"丢一次台账留痕"换"重新打开一个曾经专门修过的竞态(
++#     W2R2-CODEX-F6)"不成立,故未采用。
++#   - 终态本身自愈:被丢弃的只是**中间**那 N-2 次事件的处理机会,不是最终状态 ——
++#     Issue 的红/绿判定由**最新**一次到达的事件重新推导;只是那些被丢弃的中间
++#     事件对应的"又一次失败"/空转说明评论不会被写出,连续失败的次数记录会按
++#     被丢弃的次数少算,不影响最终是否阻断部署的判定。
++concurrency:
++  group: main-health-${{ github.event.workflow_run.name || 'dispatch' }}
++  cancel-in-progress: false
+ 
+ jobs:
+   report:
+@@ -64,6 +195,22 @@ jobs:
+     runs-on: ubuntu-latest
+     timeout-minutes: 5
+     steps:
++      - name: Checkout (read main-health-logic.mjs as the single source of judgement logic)
++        # SC1:只读 checkout,`persist-credentials: false` —— 不做任何 git 写操作,
++        # 只为了让下方 github-script 步骤能 `import()` 到 scripts/ci/main-health-logic.mjs。
++        # 三审返修(claude-adversarial W2R3-CODEX-F1):显式钉 `ref:` 为仓库默认分支
++        # (github.event.repository.default_branch,不随事件类型变化)。此前未传 ref,
++        # `workflow_run` 下确实安全(该事件的 GITHUB_REF/SHA 由 GitHub 固定为默认分支,
++        # actions/checkout 未传 ref 时取 context.ref/sha),但同一 YAML 也接了
++        # `workflow_dispatch` —— 该触发允许在 UI/CLI/API 里任选仓内 branch/tag,此时
++        # GITHUB_REF/SHA 就是所选 ref,不传 ref 的 checkout 会拿到该分支的代码。显式
++        # 钉死默认分支后,即使有人手动 dispatch 一个专题分支,checkout 与下方 import()
++        # 取到的仍是默认分支自己的代码,不接触被选中的那个分支。
++        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          ref: ${{ github.event.repository.default_branch }}
++          persist-credentials: false
++
+       - name: Open/update or close the health issue
+         # SHA pin(Greptile #348 P2 security)。本 job 持 issues:write —— 上游发布链路
+         # 被攻陷时,main 上任一受监控 workflow 完成都会执行替换后的代码,而它有权
+@@ -77,13 +224,39 @@ jobs:
+             const owner = context.repo.owner;
+             const repo = context.repo.repo;
+ 
+-            // workflow_dispatch 无 workflow_run 上下文,安全跳过(首测用途)。
++            // 三审返修(claude-adversarial W2R3-CODEX-F1):guard 必须在下方 import()
++            // 之前 —— workflow_dispatch 允许任选仓内 branch/tag,若 guard 放在 import
++            // 之后,手动 dispatch 一个专题分支时会先以本 job 持有的 issues:write +
++            // 三个 read 权限执行该分支的 scripts/ci/main-health-logic.mjs 顶层代码,
++            // 再"安全跳过"。上面的 Checkout 步骤已把 ref 钉死为默认分支(双重防护
++            // 同一个洞),但 guard 顺序本身也必须收紧,不依赖单一防线。
+             const run = context.payload.workflow_run;
+             if (!run) {
+               core.info('无 workflow_run 上下文(workflow_dispatch),跳过。真实触发靠 main 上下一次 workflow 完成。');
+               return;
+             }
+ 
++            // SC1:单一源 —— 判据逻辑的唯一实现是 scripts/ci/main-health-logic.mjs,
++            // 上面的 Checkout 步骤已把它放进工作目录,这里直接 import。不再本地
++            // 重复定义这些函数/常量,消除"手工镜像 vs 生产内联脚本"两份实现靠
++            // 注释同步、测试只测得到前者的漂移面(W2R2-C1 / CODEX-F2 / UP2-S4)。
++            const mainHealthLogic = await import(process.env.GITHUB_WORKSPACE + '/scripts/ci/main-health-logic.mjs');
++            const {
++              GREEN_REF_WORKFLOW_NAME,
++              selectBlockingMode,
++              isBlockingMode,
++              parseRequiredOnMain,
++              aggregateStepConclusions,
++              computeFailedSteps,
++              computeNotRerunPairs,
++              validateFailedStepsShape,
++              buildJobsForAttemptParams,
++              buildStepLabel,
++              IDLE_COMMENT_PREFIX,
++              hasRecentIdleNotice,
++              compareRunSeq,
++            } = mainHealthLogic;
++
+             const wfName = run.name;
+             const conclusion = run.conclusion;
+             const shortSha = String(run.head_sha || '').slice(0, 8);
+@@ -137,23 +310,144 @@ jobs:
+             };
+             let identityWarned = false;
+             // 本次事件是否比 Issue 上记录的那次**更旧**。跨 identity 一律不算旧。
++            // 陈旧性比较本身是 SC1 单一源(compareRunSeq),这里只保留网络无关的
++            // warning 副作用。
+             const isStale = (recorded) => {
+-              if (!recorded) return false;
+-              if (recorded.wfId !== seq.wfId) {
+-                if (!identityWarned) {
+-                  identityWarned = true;
+-                  core.warning('workflow identity 变更(台账 workflow_id=' + recorded.wfId
+-                    + ',当前=' + seq.wfId + ')—— 大概率是 workflow 被删除重建,run_number 已从'
+-                    + '低位重启。跨 identity 比较编号无意义,本次按 reset 处理:不判陈旧、'
+-                    + '允许正常改状态。若 main 实际仍红,下一次 failure 会重新开灯。');
++              const result = compareRunSeq(recorded, seq);
++              if (result.identityMismatch && !identityWarned) {
++                identityWarned = true;
++                core.warning('workflow identity 变更(台账 workflow_id=' + recorded.wfId
++                  + ',当前=' + seq.wfId + ')—— 大概率是 workflow 被删除重建,run_number 已从'
++                  + '低位重启。跨 identity 比较编号无意义,本次按 reset 处理:不判陈旧、'
++                  + '允许正常改状态。若 main 实际仍红,下一次 failure 会重新开灯。');
++              }
++              return result.stale;
++            };
++
++            // ── issue #423 修复 1:失败是否真的挡住 deploy/green(SC2.1)───────────
++            // 部署阻断名单 REQUIRED_ON_MAIN 的权威源是 deploy-green-ref.yml(该名单
++            // 另有 ci.yml 注释 + repo-health-watchdog.yml 两处手工同步拷贝,见
++            // ci.yml `cindyplugin-build` job 前的"三处必须一起改"注释)。本文件不再
++            // 手工维护第四份静态拷贝(容易漂移),而是运行时直接读取并解析权威源
++            // 文件里的 REQUIRED_ON_MAIN 数组 —— 名单变了这里自动跟上,零同步成本。
++            // 解析失败(文件读不到 / 格式变了,均视为"名单未知")时 fail-closed:
++            // 按阻断处理(强措辞),不放过任何可能真的挡部署的红灯;只有明确读到
++            // 名单、且明确判定"这个 sha 上全部阻断 check 仍绿"时才使用弱化措辞。
++            // 解析本身(锚定行首非注释的唯一活动声明 + exact 语法校验,拒绝零个/
++            // 多个候选与"部分解析成功")是 SC1/SC5 单一源(parseRequiredOnMain),
++            // 这里只保留网络读取 + 把解析结果的 reason 落成 core.warning。
++            async function getRequiredOnMain() {
++              try {
++                const f = await github.rest.repos.getContent({
++                  owner, repo, path: '.github/workflows/deploy-green-ref.yml',
++                });
++                const yml = Buffer.from(f.data.content, 'base64').toString('utf8');
++                const parsed = parseRequiredOnMain(yml);
++                if (!parsed.ok) {
++                  core.warning('解析 deploy-green-ref.yml 的 REQUIRED_ON_MAIN 失败(' + parsed.reason
++                    + '),名单未知,fail-closed 按阻断处理。');
++                  return null;
+                 }
+-                return false;
++                return parsed.names;
++              } catch (e) {
++                core.warning('读取 deploy-green-ref.yml 的 REQUIRED_ON_MAIN 失败(' + e.message
++                  + '),名单未知,fail-closed 按阻断处理。');
++                return null;
++              }
++            }
++
++            // 判据直接复用 deploy-green-ref.yml 自己的判法(对该 sha 查每个阻断 check
++            // 名的最新结论,全绿才算不挡)—— 而不是另外猜"本次 run 里哪个 job 失败
++            // 了",这样问的是权威问题本身("deploy-green-ref 现在会不会推进这个
++            // sha"),不会与它的真实判据走偏。返回 null = 名单未知(调用方按阻断处理);
++            // 返回数组 = 仍未转绿的阻断 check 名列表([] 即全绿 = 不阻断)。
++            async function notGreenRequiredChecks(sha, requiredOnMain) {
++              const runs = await github.paginate(github.rest.checks.listForRef, {
++                owner, repo, ref: sha, per_page: 100,
++              });
++              const best = new Map();
++              for (const r of runs) {
++                const prev = best.get(r.name);
++                if (!prev || new Date(r.started_at) > new Date(prev.started_at)) best.set(r.name, r);
++              }
++              return requiredOnMain.filter((n) => best.get(n)?.conclusion !== 'success');
++            }
++
++            // ── issue #423 修复 2:空转 success 不许关灯(SC2.2)───────────────────
++            // 判据:RED 时把这次失败的 job/step 明细记进 Issue 正文的隐藏 marker;
++            // 后续同 workflow 的 success 事件到达时,只有当**这些记录中的 step 在
++            // 本次真的执行且成功**(conclusion=success,不是被跳过)才认定"真的
++            // 修好了"并关闭 —— 否则视为空转 success(失败的路径这次根本没跑),
++            // 只留痕、不关闭。
++            // 已知局限(不藏):
++            //   - 按 (job 名, step 名) 匹配,不按 step 编号 —— 若修复 PR 同时把失败
++            //     step 改了名字,本判据会把它误判为"未重跑",Issue 需要人工关闭一次;
++            //     换成按编号匹配也有同类局限(增删 step 会移位),两难之下选可读性
++            //     更高、人工排查更直观的名字匹配。
++            //   - 只识别 step 级 conclusion ∈ {failure, timed_out} 为"失败的 step";
++            //     若整个 job 因基础设施问题(如 runner 起不来)在产生任何 step 记录前
++            //     就整体失败,记录到的失败 step 列表会是空数组 —— 此时不做 step 级
++            //     比对,直接回退到旧行为(下次 success 无条件关),避免卡死。
++            //   - job/step 明细 API 调用失败,或 Issue 正文没有本 marker(如功能上线
++            //     前已存在的旧 Issue)时,同样回退到旧行为,fail-open,不卡死红灯。
++            // 三审修复后新增说明:
++            //   - 同 run 内重名 (job, step) 现在聚合成一个 conclusion 集合而非互相覆盖
++            //     (见 getStepMap),红侧"任一失败即记"、绿侧"任一成功即算重跑",双向误判
++            //     (W2-R1-F4)已修,不再需要单列已知局限。
++            // 二轮返修:isStepResolved 撤回了此前"全部 skipped 视为已解决"的判据,
++            //   现在是 SC1/SC2 单一源(main-health-logic.mjs),fail-closed:仅
++            //   conclusion===success 才算已重跑(W2R2-CODEX-F1,见该文件对应函数的
++            //   注释与已知局限)。
++            const FAILED_STEPS_RE = /<!-- main-health-failedsteps:([A-Za-z0-9+/=]*) -->/;
++
++            async function getStepMap(run) {
++              try {
++                // attempt-specific 端点(codex-adversarial W2-R1-A-002):不传 attempt 的
++                // listJobsForWorkflowRun 默认 filter=latest,同一 run_id 被 rerun 后会读到
++                // 最新 attempt 而不是触发本次事件的那个 attempt —— "失败 attempt 刚结束、
++                // 空转 rerun 的新 attempt 已存在"这种竞态下会把假关闭又引回来。RED 记录与
++                // GREEN 核验都必须各自绑定自己 workflow_run payload 里的 run_attempt
++                // (buildJobsForAttemptParams 是 SC1/SC4 单一源)。
++                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
++                  owner, repo, ...buildJobsForAttemptParams(run), per_page: 100,
++                });
++                return aggregateStepConclusions(jobs); // 聚合同名 step(见上方说明),SC1 单一源
++              } catch (e) {
++                core.warning('读取 run #' + run.id + ' attempt #' + (run.run_attempt || 1) + ' 的 job/step 明细失败(' + e.message + ')。');
++                return null;
++              }
++            }
++
++            const encodeFailedSteps = (pairs) => Buffer.from(JSON.stringify(pairs)).toString('base64');
++            const decodeFailedSteps = (body) => {
++              const m = FAILED_STEPS_RE.exec(body || '');
++              if (!m || !m[1]) return null;
++              let parsed;
++              try {
++                parsed = JSON.parse(Buffer.from(m[1], 'base64').toString('utf8'));
++              } catch (e) {
++                return null; // 解析失败按"无记录"处理,fail-open 回退旧行为
++              }
++              // 形状校验(codex-adversarial W2-R1-E-004):只信任 Array.isArray 且每项为
++              // 长度 2 的字符串数组。合法 Base64 + 合法 JSON 但形状不对(字符串、
++              // {length:1} 等)会让下游 .filter/索引抛 TypeError,把本该 fail-open 的
++              // job 打红 —— 只有 github-actions[bot] 自己能写正文(isOurs 已挡外人),
++              // 不是安全面,但校验成本为零。校验本身是 SC1/SC8 单一源(validateFailedStepsShape)。
++              const shaped = validateFailedStepsShape(parsed);
++              if (shaped === null) {
++                core.warning('main-health-failedsteps marker 解码后形状不合法(非二维字符串数组),按"无记录"处理,fail-open 回退旧行为。');
+               }
+-              return seq.number !== recorded.number
+-                ? seq.number < recorded.number
+-                : seq.attempt < recorded.attempt;
++              return shaped;
+             };
+ 
++            // 可见 step 名转义 + 截断(codex-adversarial W2-R1-E-005 / upstream-preview
++            // UP2-S2)与空转说明评论固定前缀(SC10)均是 SC1 单一源:buildStepLabel
++            // 与 IDLE_COMMENT_PREFIX 已在文件顶部 import;escapeStepLabelPart 未在
++            // 解构清单内 —— 它只被 main-health-logic.mjs 内部的 buildStepLabel 调用,
++            // workflow 侧不直接引用,故不需要单独导入(三审 upstream-preview
++            // UP3-F4:此前注释误写成"三者均已 import",实际只有两者)。这里不再
++            // 本地重复定义。
++
+             const issues = await github.paginate(github.rest.issues.listForRepo, {
+               owner, repo, state: 'open', per_page: 100,
+             });
+@@ -197,9 +491,70 @@ jobs:
+                 return;
+               }
+ 
++              // deploy green ref 自己是把 main 绿灯 SHA 推进到 `deploy/green` ref 的推进器
++              // (claude-adversarial w2-r1-F2 / upstream-preview F-1 related / SC3):它只在
++              // 阻断名单全绿后才走到推 ref 那步(deploy-green-ref.yml 未全绿即 return,不算
++              // 失败),所以它**失败时**该 sha 的阻断 check 几乎必然全绿 —— 判据"是否命中
++              // 阻断名单"对它天生反着算,会把"推进器坏死、生产被静默冻结在旧版本"误判成
++              // "不阻断部署"。这类 ref 推进器角色不看名单命中,固定按阻断措辞处理(与
++              // repo-health-watchdog.yml 独立的 2h 心跳告警同一场景,双保险不冲突)。
++              const isGreenRefPropagator = wfName === GREEN_REF_WORKFLOW_NAME;
++
++              // SC2.1:先判定这次失败是否真的命中部署阻断名单(见文件头 issue #423
++              // 说明 + getRequiredOnMain/notGreenRequiredChecks 注释)。requiredOnMain
++              // 为 null(读取失败)时 fail-closed,按阻断处理。greenref 自身不看名单命中
++              // (见上),直接跳过这一查询,省一次 API 调用。分档判据本身是 SC1 单一源
++              // (selectBlockingMode/isBlockingMode)。
++              let requiredOnMain = null;
++              let blockingNotGreen = null;
++              if (!isGreenRefPropagator) {
++                requiredOnMain = await getRequiredOnMain();
++                if (requiredOnMain) {
++                  try {
++                    blockingNotGreen = await notGreenRequiredChecks(run.head_sha, requiredOnMain);
++                  } catch (e) {
++                    core.warning('核对部署阻断名单是否全绿失败(' + e.message + '),fail-closed 按阻断处理。');
++                  }
++                }
++              }
++              const blocking = isBlockingMode(selectBlockingMode({ wfName, requiredOnMain, blockingNotGreen }));
++
++              // SC2.2:记录本次失败的 job/step,供后续 success 事件核对"是否真的重跑过"。
++              // attempt 绑定本次事件自己的 run.run_attempt(见 getStepMap 注释,SC4)。
++              // 聚合与提取本身是 SC1 单一源(aggregateStepConclusions/computeFailedSteps)。
++              const stepMap = await getStepMap(run);
++              const failedSteps = stepMap ? computeFailedSteps(stepMap) : [];
++
++              const blockingParagraph = isGreenRefPropagator
++                ? [
++                    '`deploy green ref` 是把 main 绿灯 SHA 推进到 `deploy/green` ref 的推进器本身,',
++                    '它只在阻断名单全绿后才会走到推 ref 那一步 —— 所以它失败时,这个 sha 的阻断',
++                    'check 很可能恰好全绿,但那**不代表**部署没被卡住:推进器坏死会让生产静默',
++                    '冻结在上一个绿灯版本,直到下一次 main push 或手动 dispatch。本条固定按阻断',
++                    '措辞处理,不看名单命中(`repo-health-watchdog.yml` 另有独立 2h 心跳兜底同一场景)。',
++                  ].join('\n')
++                : (blocking
++                    ? [
++                        'maker 每日 **9:00 / 17:00** 自动部署 `deploy/green` ref 所指的最新绿灯 main'
++                          + '(2026-07-31 起带 CI 绿灯门,带病版本到不了生产)。',
++                        'main 红着时部署会停留在上一个绿灯版本 —— 红灯不修,**后续所有合并都无法上生产**,',
++                        '生产与 main 的差距会越拖越大。'
++                          + (blockingNotGreen && blockingNotGreen.length
++                            ? '(命中部署阻断名单:`' + blockingNotGreen.join('`、`') + '`)'
++                            : ''),
++                      ].join('\n')
++                    : [
++                        '本条**不阻断** `deploy/green` 推进 —— 部署阻断名单 REQUIRED_ON_MAIN'
++                          + '(' + requiredOnMain.length + ' 项,定义于 `deploy-green-ref.yml`)'
++                          + '在这个 commit 上仍全绿,`' + wfName + '` 这次的失败不在其中。',
++                        '**但本条仍需修复以恢复台账绿灯** —— 长期挂红会淹没真正的阻断信号,'
++                          + '也会训练人忽略这个 Issue。',
++                      ].join('\n'));
++
+               const body = [
+                 MARKER,
+                 runMark(seq),
++                '<!-- main-health-failedsteps:' + encodeFailedSteps(failedSteps) + ' -->',
+                 '## main 当前是红的',
+                 '',
+                 '| 项 | 值 |',
+@@ -210,13 +565,11 @@ jobs:
+                 '| commit | `' + shortSha + '` |',
+                 '| run | ' + run.html_url + ' |',
+                 '| 检测时间 | ' + new Date().toISOString() + ' |',
++                '| 阻断部署? | ' + (blocking ? '**是**' : '否') + ' |',
+                 '',
+                 '### 为什么这条要当回事',
+                 '',
+-                'maker 每日 **9:00 / 17:00** 自动部署 `deploy/green` ref 所指的最新绿灯 main'
+-                  + '(2026-07-31 起带 CI 绿灯门,带病版本到不了生产)。',
+-                'main 红着时部署会停留在上一个绿灯版本 —— 红灯不修,**后续所有合并都无法上生产**,',
+-                '生产与 main 的差距会越拖越大。',
++                blockingParagraph,
+                 '',
+                 '### 处理方式',
+                 '',
+@@ -225,12 +578,26 @@ jobs:
+                 '3. 真回归 → 立刻修或回滚;flake → **给本 Issue 加 label `flake`** 再重跑'
+                   + '(label 即台账:按 `label:ci-red label:flake` 检索历史 flake,同一签名反复出现'
+                   + ' → 该测试该修稳定性了,而不是继续重跑);',
+-                '4. main 上同一 workflow 下一次 **success** 时,本 Issue 会自动关闭,不需要手动关。',
++                '4. main 上同一 workflow 下一次 **success** 时,本 Issue 通常会自动关闭 ——'
++                  + '前提是该 success 真的重跑并通过了这次失败的 step(不是空转 success,'
++                  + '即失败路径这次被跳过);若判定为空转,会追加评论说明、不关闭,'
++                  + '不需要手动关(除非空转反复出现)。',
+                 '',
+                 '> 本 Issue 由 `.github/workflows/main-health.yml` 自动维护。',
+               ].join('\n');
+ 
+               if (existing) {
++                // SC6(W2R2-CODEX-F6)写前复核:workflow 级 concurrency 已经把同一
++                // 监控对象的 main-health run 串行化,但 job 内本身有多次 await(名单
++                // 读取、checks 查询、job/step 明细查询),真实时间在这些调用之间流逝
++                // ——防的是 concurrency group 之外的窗口(人工同时编辑 Issue 正文,
++                // 或极端排队异常)。写之前重新拉取最新正文,若发现已被更晚的事件
++                // 处理过(marker 记录的执行序比本次更新),放弃本次写,不覆盖。
++                const fresh = await github.rest.issues.get({ owner, repo, issue_number: existing.number });
++                if (isStale(parseSeq(fresh.data.body))) {
++                  core.info('写前复核发现 Issue #' + existing.number + ' 已被更晚的事件处理过,放弃本次写(避免用陈旧决策覆盖新状态)。');
++                  return;
++                }
+                 await github.rest.issues.update({
+                   owner, repo, issue_number: existing.number, body,
+                 });
+@@ -303,6 +670,71 @@ jobs:
+               await core.summary.addHeading('⏭ 陈旧 success,未关闭红灯', 2).addRaw(msg).write();
+               return;
+             }
++
++            // SC2.2:空转 success 不许关灯 —— 只有上次记录的失败 step 在本次真的被
++            // 执行且成功(conclusion=success,不是 skipped)才认定"真的修好了"
++            // (isStepResolved 现在是 fail-closed 单一源,见 main-health-logic.mjs
++            // 的 W2R2-CODEX-F1 说明:全部 skipped 不再算已解决)。读不到记录 / 记录
++            // 为空数组 / job-step 明细查询失败,都回退到旧行为(无条件关闭),
++            // fail-open,不让本判据把红灯永久卡死(见文件头注释与 getStepMap/
++            // decodeFailedSteps 处的已知局限)。attempt 绑定本次 success 事件自己的
++            // run.run_attempt(SC4,与 RED 侧记录时各自独立绑定,不会串味)。判据本身
++            // (computeNotRerunPairs)是 SC1 单一源。
++            const recordedFailedSteps = decodeFailedSteps(existing.body);
++            if (recordedFailedSteps && recordedFailedSteps.length) {
++              const currentStepMap = await getStepMap(run);
++              if (currentStepMap) {
++                const notRerun = computeNotRerunPairs(recordedFailedSteps, currentStepMap);
++                if (notRerun.length) {
++                  const label = buildStepLabel(notRerun);
++                  const msg = '`' + wfName + '` 这次 success(run #' + seq.number + '.' + seq.attempt
++                    + ')没有重跑上次失败的步骤(' + label + ')—— 视为空转 success,'
++                    + '不关闭 Issue #' + existing.number + '。';
++                  core.info(msg);
++                  // SC10/SC12(claude-adversarial w2-r1-F3 / upstream-preview UP2-S3):
++                  // 空转说明加节流 —— 扫该 Issue 最近若干条评论(不只是最后一条)
++                  // 是否已含同类空转说明,命中则只 core.info,不再重复追加。只看
++                  // 最后一条会被本 workflow 自己产生的其它评论(RED"又一次失败"、
++                  // 陈旧 RED/GREEN 留痕)清空节流状态——红灯期间"空转→失败→空转"
++                  // 交替时否则仍会持续追加。日更 workflow 上的连续空转日若不节流
++                  // 会让评论无界增长,训练人忽略告警,与本文件文件头"误报会训练人
++                  // 忽略告警"那条设计哲学自相矛盾。判据本身(hasRecentIdleNotice)
++                  // 是 SC1 单一源。
++                  let alreadyNoted = false;
++                  try {
++                    const comments = await github.paginate(github.rest.issues.listComments, {
++                      owner, repo, issue_number: existing.number, per_page: 100,
++                    });
++                    alreadyNoted = hasRecentIdleNotice(comments.map((c) => c.body));
++                  } catch (e) {
++                    core.warning('读取 Issue #' + existing.number + ' 的评论列表失败(' + e.message + '),按"未节流"处理,仍会追加一条评论。');
++                  }
++                  if (alreadyNoted) {
++                    core.info('最近评论里已有同类空转说明,不再重复追加。');
++                  } else {
++                    await github.rest.issues.createComment({
++                      owner, repo, issue_number: existing.number,
++                      body: IDLE_COMMENT_PREFIX + '(' + label + '),视为空转,'
++                        + '不关闭 —— ' + run.html_url,
++                    });
++                  }
++                  await core.summary.addHeading('⏭ 空转 success,未关闭红灯', 2).addRaw(msg).write();
++                  return;
++                }
++              } else {
++                core.info('本次 success 的 job/step 明细读取失败,SC2.2 判据回退为旧行为(无条件关闭)。');
++              }
++            }
++
++            // SC6(W2R2-CODEX-F6)写前复核:与 RED 侧同理,关闭前重新拉取最新正文,
++            // 若已被更晚的事件处理过就放弃本次关闭(避免用陈旧决策误关一个已经
++            // 被新红灯覆盖的 Issue)。
++            const freshBeforeClose = await github.rest.issues.get({ owner, repo, issue_number: existing.number });
++            if (isStale(parseSeq(freshBeforeClose.data.body))) {
++              core.info('写前复核发现 Issue #' + existing.number + ' 已被更晚的事件处理过,放弃本次关闭。');
++              return;
++            }
++
+             await github.rest.issues.createComment({
+               owner, repo, issue_number: existing.number,
+               body: '✅ 已恢复:`' + wfName + '` @ `' + shortSha
+diff --git a/agent-use/docs/pr-rules.json b/agent-use/docs/pr-rules.json
+index 333def04..d9888eea 100644
+--- a/agent-use/docs/pr-rules.json
++++ b/agent-use/docs/pr-rules.json
+@@ -112,6 +112,7 @@
+   "securityReviewPaths": [
+     "^scripts/review-pr/",
+     "^scripts/loops/bug-doctor/",
++    "^scripts/ci/main-health-logic\\.mjs$",
+     "^agent-use/",
+     "^\\.github/workflows/",
+     "^\\.github/actions/",
+diff --git a/scripts/ci/check-workflow-permissions.mjs b/scripts/ci/check-workflow-permissions.mjs
+new file mode 100644
+index 00000000..dd88f8ba
+--- /dev/null
++++ b/scripts/ci/check-workflow-permissions.mjs
+@@ -0,0 +1,1068 @@
++#!/usr/bin/env node
++// check-workflow-permissions.mjs — workflow `permissions:` ⊇ 它调用的 API 所需 scope 守卫。
++//
++// 为什么存在(2026-08-02,PR-w2 三审 codex-adversarial W2-R1-E-004 相邻 finding /
++// claude-adversarial w2-r1-F8):main-health.yml 曾经新增三个 `github.rest.*` 调用,
++// 但 `permissions:` 没跟着扩权,导致这三个调用在生产环境全部 403 —— 而 `actionlint`
++// (不做语义分析)与 `node --check`(只看语法)都测不出这类问题,合并前零信号。
++// 本守卫把"声明的 permissions 是否覆盖实际调用的 API"变成可机器执行的静态核对。
++//
++// 覆盖范围(有意"至少覆盖",不是穷举 REST API 全集):
++//   - repos.getContent → contents(读取源码文件,如 main-health 读 deploy-green-ref.yml)
++//   - checks.*         → checks(查 check-run 结论 / 建 check-run,读写方法分别映射)
++//   - actions.*        → actions(查 workflow run / job / step 明细,读写方法分别映射)
++//   - issues.*         → issues 或 pull-requests 之一,但仅限 comment 系端点(见下方
++//     ISSUES_METHOD_RULES 的 dual 字段);issue 本体端点(create/update/addLabels 等)
++//     只认 issues,不接受 pull-requests 顶替(二轮盲审 W2R2-CODEX-F3 / W2R1-A1 修正:
++//     此前对全部 issues.* 方法一律给 dual anyOf,会让"仅 pull-requests:write"的
++//     workflow 对 issues.create 这类本体端点也被判"已满足",而 GitHub 官方文档对
++//     该端点只列 Issues 权限)。
++// 其余 resource(repos 的非 getContent 方法、git.*、pulls.* 等)本仓当前用法均不依赖
++// 本守卫覆盖的这几条,故不在校验范围内 —— 新增依赖时按需扩展 SCOPE_RULES。
++//
++// covered resource(methodAllowlist===null,即"该 resource 下所有方法都受约束")上
++// 出现未被下方方法表收录的方法时,fail-closed:报告"映射缺失",不能像上一轮那样
++// 对 checks.*/actions.* 不分方法一律判"read"(W2R2-CODEX-F3:`actions.cancelWorkflowRun`
++// 这类写端点会被误判 actions:read 已满足,守卫假绿)。新增调用踩到未收录方法时,
++// 把它加进对应的 READ/WRITE 方法表,而不是放宽判定。
++//
++// 权限求解(GitHub 官方语义):workflow 级一旦显式声明 `permissions:`,未列出的 scope
++// 全部为 none;job 级若声明了自己的 `permissions:` 块,则**完全替换**(不是合并)
++// 该 job 的 workflow 级权限。level 排序 write ⊇ read,none/未声明 = 无权限。
++//
++// 实现方式:零依赖行解析(与仓内 repo-health-watchdog.yml 解析 main-health.yml 同一
++// 风格),不引入 YAML 依赖 —— 本仓 `yaml` 包只是间接依赖,未提升为可 import 的直接
++// 依赖,引入需要 npm install(本轮改动不允许)。permissions 块的子行缩进不再硬编码
++// 2/4/6 空格,改为从块首行动态检测(二轮盲审 UP2-S5)。job key 缩进与 job 属性
++// (含 permissions 头)缩进同样不再硬编码 2/4 空格,改为从 `jobs:` 与各 job 区间内
++// 首条实质行动态检测(三审 claude-adversarial W2R3-A1 相邻假绿 finding:硬编码在
++// job 用 4/6/8 空格等非常规缩进时会漏识别整个 job,内部调用落回 findJobForLine=null,
++// 借用更宽的 topPermissions,假绿而不是告警)。
++//
++// permissions 块内的独立注释行与行尾注释均透明跳过 / 剥除,不再让"块内有一行注释"
++// 被误判为"无法解析"(三审 claude-adversarial W2R3-A1:此前的回归 —— 同一输入
++// pre 正确解析、post 因为一行注释就把整份文件的全部调用判成违规,拖垮
++// `test:unit`)。多行 flow-map(`permissions: {` 单独收尾,逐行 `key: value,`,以
++// 单独一行 `}` 结束)与 YAML 锚点/别名(`permissions: &name {...}` 定义 +
++// `permissions: *name` 引用,仅限锚点定义本身也写在某个 `permissions:` 行上)现在
++// 也能正确解析,不再落回"未找到头,借用外层权限"的假绿路径(三审
++// claude-adversarial W2R3-A1 相邻 finding:此前这四类 actionlint 合法形状
++// checkWorkflowText() 全部返回 [],而实际 job permissions 是空/none)。
++//
++// 遇到无法可靠理解的形状(带引号 job 名、非空 flow-map permissions、tab 缩进、
++// 子行缩进不一致、flow-map 内出现无法识别的项、别名指向的锚点找不到或锚点自身
++// 也无法解析)时,同样 fail-closed:返回专门的 `'unparsed'` 标记而不是当作"该 job
++// 没声明任何权限"或"借用外层权限"静默处理,调用方看到的是"permissions 块无法
++// 解析,请人工核对"而不是被误导的缺 scope 提示。
++//
++// 方法级调用识别(SC3,codex-adversarial W2R3-CODEX-F4,三审 R2 起再扩一轮):
++// 除单行点号(github.rest.resource.method)外,现在也识别 bracket 方法名
++// (github.rest.resource['method']/[`method`])、bracket resource(github.rest['resource'].method
++// 及 resource/method 都 bracket 的组合)、跨行点号(含"本行以 resource. 收尾、下一行
++// 裸方法名"的尾随点号变体)、optional chaining(github.rest?.actions?.method)、
++// resource 级解构/简单赋值别名(`const { resource } = github.rest` /
++// `const api = github.rest.resource`)、整对象别名(`const gh = github.rest`
++// 之后 gh.resource.method)、以及方法级解构(`const { method } = github.rest.resource`
++// 或 `= <resource 别名>`,解构清单里的原属性名本身就是方法名)。
++//
++// 三审 R2 起的判据收紧(claude-adversarial W2R4-A1 / codex-adversarial
++// W2R3-R2-CODEX-F2):不再满足于"逐个语法打补丁、覆盖不到的等价写法归入已知局限
++// 假绿"——静态解析对抗任意等价 JS 语法本质上没有终点。改为:findRestCalls 在完成
++// 上述所有已知形态的识别后,对每一行残留的"仍引用了 github.rest 或已知别名/解构
++// 产物,但没被上述任何形态消费掉"的文本一律判定为"引用证据存在,但解析不出具体
++// 方法调用",标记该行 unparsed —— 由 findUnresolvedRestReferences 导出,
++// checkWorkflowText 据此产出 fail-closed 违规,不再是零信号的假绿。
++//
++// 域边界(三审 R3 复核盲审第 6 轮结构性收口,claude-adversarial W2R6-A1 /
++// codex-adversarial W2R3-R4-CODEX-F1 — 取代此前"位置代理"的字符邻接启发式):
++// 上面这套别名/调用识别、以及下方的残留引用扫描,只在 `script:` 键的 YAML
++// **block scalar**(`script: |`/`script: >`,可带 `+`/`-`/数字 chomping 指示符)
++// 划出的文本区间内进行 —— `github.rest` 是 `actions/github-script` 注入进它自己
++// `with.script` 沙箱的对象,只在这个域里才有意义(为什么不放宽到任意 block
++// scalar key 名,见下方 findScriptBlocks 与已知局限里的说明:`run: |` 之类的
++// shell 脚本语法上不是 JS,放宽后会把 bash 内嵌的多行字符串误判成 JS 词法歧义,
++// 产出与 permissions 无关的假 unparsed)。域外(真正的 YAML 结构:`permissions:`、
++// `uses:`、序列项键等)本就不可能出现 `github.rest` 语义,天然不在扫描面内,
++// 不需要再靠"两侧是否贴 `-`/`/`"或"是否在
++// 行首"这类跟 JS 语义无关的字符位置代理去分辨 —— 而这类代理本身在两个方向都有
++// 反例:字符邻接会把注释起始的 `/`(`acts/* 注释 */.method()`)误判成词边界信号,
++// 产出真实可执行的权限绕过假绿(codex-adversarial W2R3-R4-CODEX-F1);行首豁免则
++// 会漏掉"别名恰好独占一行、冒号紧贴"的三元/switch 变体(claude-adversarial
++// W2R6-G1)。域分离从根上消掉这两类反例,而不是再打第三轮字符位置补丁。
++// findScriptBlocks() 按缩进动态探测每个 block scalar 的内容区间(与本文件其它
++// 缩进探测同一手法),detect 到的每个区间各自独立跑一次下方的 analyzeRestCalls
++// —— 别名作用域天然按区间(即按 step)隔离,不会跨 step 泄漏(与真实 GitHub
++// Actions 里每个 script 步骤是独立 JS 执行上下文的语义一致)。
++//
++// 注释与字符串感知(同一轮结构性收口):区间内先做一次轻量词法扫描(tokenizeJsLines),
++// 剥离 `//` 行注释与 `/* */` 块注释(块注释整段删除而不是留空白占位,原本被注释
++// 隔开的 token 剥离后重新贴邻,直接调用识别的严格贴邻正则才能跨过注释继续匹配 ——
++// 这正是修正 codex-adversarial W2R3-R4-CODEX-F1 的关键一步,不是只换个位置代理);
++// 另外产出一份把字符串/模板字符串内容也抹成等长空白的版本,只供第 4 步残留引用
++// 扫描使用(直接调用识别仍在保留字符串的版本上跑,bracket 方法名等合法写法依赖
++// 字符串内容本身)—— 字符串字面量里偶然撞出的别名同形词(如 main-health.yml 里
++// `'github-actions[bot]'` 撞上别名 `actions`)不是真实 JS 引用,不该被残留扫描
++// 当成"碰了 github.rest 覆盖面"。扫描到行尾仍未闭合的单/双引号字符串(拿不准是否
++// 是合法的跨行续行写法)时不猜测,整行记入 forcedUnparsedLines,交给残留扫描
++// fail-closed 处理;跨行的块注释与模板字符串按 JS 本身的语法允许跨行,不算歧义。
++//
++// 已知局限(不藏,按方向分类,三审 R3 复核盲审第 6 轮结构性收口后重写):
++//   [假红方向 fail-open 不适用 / 保持 fail-closed]
++//   - 仍不支持 tab 缩进 —— indent 计算只识别空格前缀,tab 缩进的 job key /
++//     permissions 子行 / block scalar 头会因缩进不匹配而漏识别或直接返回
++//     'unparsed'(与本仓既有的缩进假设同一性质,应先跑 actionlint 确认 YAML
++//     本身没有跑偏)。
++//   - YAML 锚点/别名仅支持"锚点定义本身写在某个 permissions: 行上"这一种形态。
++//   - 多行 flow-map 只支持"每行一条 key: value[,]"的直白形式。
++//   - 别名解析只追一跳(`const a = github.rest.actions` 后 `a` 是已知别名,但
++//     `const b = a` 不会被继续追踪)。
++//   - 简单赋值别名只认单行、以 `;` 收尾的形态;跨行赋值不被识别为别名定义,但
++//     右侧文本仍会被残留引用扫描抓到,fail-closed 为 unparsed。
++//   - 解构里任一成员带本解析器不支持的语法(默认值、computed key 等)时,整条
++//     解构语句都不会被 consume,原文本(含其中的 github.rest 字面量/已知别名)
++//     保留在残留扫描里,fail-closed 为 unparsed。
++//   - 别名名字若与其它 JS 文本巧合撞形(如作为普通标识符出现在别的表达式里,
++//     不构成调用)不会被特别排除,会被当作残留引用报 unparsed —— 方向仍是
++//     fail-closed(多报而不是漏报),不是假绿。
++//   - block scalar 区间探测只认 `script:` 这一个 key 名(见 findScriptBlocks
++//     注释),不识别是否真的挂在 `uses: actions/github-script` 步骤下 —— 若
++//     某处 `script:` 键恰好不是 github-script 步骤(本仓未出现这种写法),仍会
++//     被当成 JS 域扫描,同样是"多扫一点,不会漏扫"的方向,不是假绿。
++//   [假绿方向,已知但暂未覆盖 —— 方法级调用识别]
++//   - 别名解析只追一跳,`b.method()` 既不报违规也不报 unparsed —— 多跳别名链
++//     需要真正的绑定追踪(变量数据流分析),不是本解析器的"至少覆盖"定位。
++//   - 简单赋值别名跨行/无分号形态不被识别为别名定义(见上,fail-closed 兜底)。
++//   - 解构成员语法不支持时整条不 consume(见上,fail-closed 兜底)。
++//   - 词法扫描不追踪模板字符串内 `${...}` 插值的嵌套结构,把整个模板字符串
++//     (含插值部分)当成不透明文本一次性跳过 —— 插值内部若恰好写了
++//     `github.rest.*` 调用,不会被识别为调用,但字面量外层(`github.rest` 若
++//     在模板外)仍会被残留扫描的 marker 检查抓到;本仓当前(2026-08-03)零处
++//     使用带插值的模板字符串,未构造对应回归。
++//   - `/` 单字符不参与注释判定(只有 `//`/`/*` 两字符组合才触发),真正的正则
++//     字面量(如 main-health.yml 里 `/<!-- ... -->/`)不会被误当注释;但若某个
++//     正则字面量内部恰好包含 `//` 或 `/*` 这两个字符组合,词法扫描仍会把它误判
++//     为注释起点 —— 区分"除号/正则字面量起始的 `/`"与真实注释起点需要完整的
++//     JS 表达式上下文(前一个 token 是否允许除法),本解析器不做这层判断;本仓
++//     当前用到的唯一正则字面量不含这两个组合,未构造对应回归。
++//
++// 退出码:0=全部调用的 scope 需求都被满足;1=有缺口(逐条 file:line + 修法);
++// 2=运行错误(目录扫描失败 / 文件读取失败 / 一个 workflow 文件都没找到),fail-closed。
++import { readFileSync, readdirSync, realpathSync } from 'node:fs'
++import { join, resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++const WORKFLOWS_DIR = '.github/workflows'
++
++// ── resource → 方法级 read/write 映射(未收录方法 = null,由调用方 fail-closed) ──
++// checks.*:官方文档 "Create a check run" / "Update a check run" 要 checks:write,
++// 其余列出/读取类端点 read 即可。
++const CHECKS_METHOD_LEVEL = {
++  listForRef: 'read',
++  listSuitesForRef: 'read',
++  get: 'read',
++  getSuite: 'read',
++  create: 'write',
++  update: 'write',
++  rerequestRun: 'write',
++  rerequestSuite: 'write',
++  setSuitesPreferences: 'write',
++}
++
++// actions.*:官方文档里明确的写端点(取消/重跑/删除/触发 dispatch/开关 workflow 等)
++// 要 actions:write,其余列出/查询/下载类端点 read 即可。
++const ACTIONS_METHOD_LEVEL = {
++  listJobsForWorkflowRunAttempt: 'read',
++  listJobsForWorkflowRun: 'read',
++  listWorkflowRunsForRepo: 'read',
++  listWorkflowRuns: 'read',
++  getWorkflowRun: 'read',
++  getWorkflowRunAttempt: 'read',
++  getWorkflowRunUsage: 'read',
++  listRepoWorkflows: 'read',
++  listWorkflowRunArtifacts: 'read',
++  listArtifactsForRepo: 'read',
++  downloadArtifact: 'read',
++  downloadJobLogsForWorkflowRun: 'read',
++  downloadWorkflowRunLogs: 'read',
++  getWorkflowRunLogs: 'read',
++  cancelWorkflowRun: 'write',
++  forceCancelWorkflowRun: 'write',
++  reRunWorkflow: 'write',
++  reRunWorkflowFailedJobs: 'write',
++  deleteWorkflowRun: 'write',
++  deleteWorkflowRunLogs: 'write',
++  createWorkflowDispatch: 'write',
++  deleteArtifact: 'write',
++  disableWorkflow: 'write',
++  enableWorkflow: 'write',
++}
++
++// issues.*:{ level, dual }。dual=true 表示该方法是 GitHub 官方文档承认的
++// "Issues 或 Pull requests 权限二选一"comment 系端点(pr-hygiene.yml 现有的纯
++// pull-requests:write 正是依赖这条规则合法工作)。dual=false 表示这是 issue 本体
++// 端点,官方文档只列 Issues 权限,pull-requests:write **不能**顶替
++// (W2R2-CODEX-F3 反例:issues.create 只配 pull-requests:write 时应判违规)。
++const ISSUES_METHOD_RULES = {
++  listComments: { level: 'read', dual: true },
++  getComment: { level: 'read', dual: true },
++  createComment: { level: 'write', dual: true },
++  updateComment: { level: 'write', dual: true },
++  deleteComment: { level: 'write', dual: true },
++  get: { level: 'read', dual: false },
++  listForRepo: { level: 'read', dual: false },
++  getLabel: { level: 'read', dual: false },
++  listLabelsForRepo: { level: 'read', dual: false },
++  listLabelsOnIssue: { level: 'read', dual: false },
++  create: { level: 'write', dual: false },
++  update: { level: 'write', dual: false },
++  lock: { level: 'write', dual: false },
++  unlock: { level: 'write', dual: false },
++  addLabels: { level: 'write', dual: false },
++  removeLabel: { level: 'write', dual: false },
++  removeAllLabels: { level: 'write', dual: false },
++  addAssignees: { level: 'write', dual: false },
++  removeAssignees: { level: 'write', dual: false },
++  delete: { level: 'write', dual: false },
++}
++
++export const SCOPE_RULES = {
++  repos: {
++    // 只覆盖 getContent(至少覆盖清单里明确点名的方法),其余 repos.* 方法本仓
++    // 现有调用(getBranch/compareCommits)不依赖新增只读 scope,不在校验范围。
++    methodAllowlist: new Set(['getContent']),
++    requiredLevel: () => 'read',
++    anyOfScopes: () => ['contents'],
++  },
++  checks: {
++    methodAllowlist: null, // null = 该 resource 下所有方法都受本规则约束
++    requiredLevel: (method) => CHECKS_METHOD_LEVEL[method] ?? null,
++    anyOfScopes: () => ['checks'],
++  },
++  actions: {
++    methodAllowlist: null,
++    requiredLevel: (method) => ACTIONS_METHOD_LEVEL[method] ?? null,
++    anyOfScopes: () => ['actions'],
++  },
++  issues: {
++    methodAllowlist: null,
++    requiredLevel: (method) => ISSUES_METHOD_RULES[method]?.level ?? null,
++    anyOfScopes: (method) => (ISSUES_METHOD_RULES[method]?.dual ? ['issues', 'pull-requests'] : ['issues']),
++  },
++}
++
++const LEVEL_RANK = { none: 0, read: 1, write: 2 }
++const levelSatisfies = (required, declared) =>
++  (LEVEL_RANK[declared] || 0) >= LEVEL_RANK[required]
++
++// 剥除行尾注释:'#' 前是空白或位于行首才算注释起点(YAML 语义;本仓 permissions
++// 块内的取值均无引号,不需要处理引号内 '#' 的转义场景),截断后再去掉尾随空白。
++function stripTrailingComment(line) {
++  return line.replace(/(^|\s)#.*$/, '').replace(/\s+$/, '')
++}
++
++// 剥除 `permissions:` 之后紧跟的 YAML 锚点标记(`&name `),不改变其后的实际
++// 取值 —— 用于 `permissions: &name {...}` 这类"定义处就带值"的锚点,与别名引用
++// (见 resolveAliasValue)是两条不同路径。锚点标记出现在 "permissions:" 之后
++// (而不是整行开头),故匹配必须锚定该前缀,不能只看行首。
++function stripLeadingAnchor(s) {
++  return s.replace(/^(\s*permissions:\s*)&[A-Za-z0-9_-]+\s*/, '$1')
++}
++
++// 单行/多行 flow-map 的公共 body 解析:逗号分隔的 `key: value` 列表。
++function parseFlowMapBody(body) {
++  const scopes = new Map()
++  const items = body.trim() ? body.split(',') : []
++  for (const pair of items) {
++    if (!pair.trim()) continue
++    const m = /^\s*([a-zA-Z-]+)\s*:\s*(read|write|none)\s*$/.exec(pair)
++    if (!m) return 'unparsed'
++    scopes.set(m[1], m[2])
++  }
++  return scopes
++}
++
++// 多行 flow-map:从 `{` 单独收尾的头行下一行开始,逐行收集 `key: value,`(允许行尾
++// 逗号与行尾注释),直到出现单独一行的 `}`(允许前导空白与行尾注释)。找不到闭合
++// `}`、或中途出现无法识别的行,fail-closed 为 'unparsed'。
++function parseMultilineFlowMap(lines, headerIdx) {
++  const scopes = new Map()
++  for (let i = headerIdx + 1; i < lines.length; i += 1) {
++    const raw = stripTrailingComment(lines[i])
++    if (raw.trim() === '') continue
++    if (/^\s*\}\s*$/.test(raw)) return scopes
++    const m = /^\s*([a-zA-Z-]+)\s*:\s*(read|write|none)\s*,?\s*$/.exec(raw)
++    if (!m) return 'unparsed'
++    scopes.set(m[1], m[2])
++  }
++  return 'unparsed' // 扫到文件末尾都没找到闭合 `}`,声明不完整
++}
++
++// 别名解析(`permissions: *name`):在全文里找同一形态的锚点定义
++// `permissions: &name ...`,取它声明的值递归解析。找不到定义、或定义自身也无法
++// 理解,一律 'unparsed'(不猜测,也不当作"未声明"借用外层权限)。
++function resolveAliasValue(lines, name) {
++  const defRe = new RegExp(`^\\s*permissions:\\s*&${name}\\b`)
++  const defIdx = lines.findIndex((l) => defRe.test(stripTrailingComment(l)))
++  if (defIdx === -1) return 'unparsed'
++  return parsePermissionsBlock(lines, defIdx)
++}
++
++// ── 纯函数:解析一个 `permissions:` 块(vitest 覆盖) ─────────────────────────
++// lines: 整个文件的行数组;headerIdx: `permissions:` 那一行的下标。
++// 返回 Map<scope, level> | 'read-all' | 'write-all' | 'unparsed' | null。
++// null = 未找到 permissions 头(headerIdx<0);'unparsed' = 找到了头,但块内容
++// 是本解析器未能可靠理解的形状 —— 二者语义不同,分别标记,不合并成同一个
++// "没权限"结果(UP2-S5)。
++export function parsePermissionsBlock(lines, headerIdx) {
++  if (headerIdx < 0 || headerIdx >= lines.length) return null
++  const headerLine = stripLeadingAnchor(stripTrailingComment(lines[headerIdx]))
++  const headerIndent = headerLine.length - headerLine.replace(/^ */, '').length
++
++  const aliasMatch = /^\s*permissions:\s*\*([A-Za-z0-9_-]+)\s*$/.exec(headerLine)
++  if (aliasMatch) return resolveAliasValue(lines, aliasMatch[1])
++
++  const inlineAll = /^\s*permissions:\s*(read-all|write-all)\s*$/.exec(headerLine)
++  if (inlineAll) return inlineAll[1]
++  if (/^\s*permissions:\s*\{\s*\}\s*$/.test(headerLine)) return new Map()
++  // 非空单行 flow-map:`permissions: { contents: read, checks: write }`
++  // (W2R2-CODEX-F4:job 级 flow-map permissions 此前完全不被识别,静默继承
++  // workflow 级更宽的权限)。
++  const flow = /^\s*permissions:\s*\{([^{}]*)\}\s*$/.exec(headerLine)
++  if (flow) return parseFlowMapBody(flow[1])
++  // 多行 flow-map:`permissions: {` 单独一行开头(三审 W2R3-A1 相邻假绿修复 —— 此前
++  // 完全不被识别为头,静默借用外层权限)。
++  if (/^\s*permissions:\s*\{\s*$/.test(headerLine)) return parseMultilineFlowMap(lines, headerIdx)
++  if (!/^\s*permissions:\s*$/.test(headerLine)) {
++    // 头行还带着本解析器不认识的其它内容,fail-closed。
++    return 'unparsed'
++  }
++
++  // block 形式:以紧随其后第一条非空、非纯注释、缩进大于 headerIndent 的行为子行
++  // 缩进基准,不再硬编码固定空格数(UP2-S5)。独立注释行与行尾注释透明跳过/剥除
++  // (三审 W2R3-A1:此前一条注释就会把整块判成 'unparsed')。
++  let scopeIndent = null
++  const scopes = new Map()
++  for (let i = headerIdx + 1; i < lines.length; i += 1) {
++    const line = lines[i]
++    if (line.trim() === '') continue
++    if (line.trim().startsWith('#')) continue
++    const indent = line.length - line.replace(/^ */, '').length
++    if (indent <= headerIndent) break // dedent 或同级,块结束(含空块,等价于 {})
++    if (scopeIndent === null) scopeIndent = indent
++    if (indent !== scopeIndent) return 'unparsed' // 子行缩进不一致,无法可靠解析
++    const stripped = stripTrailingComment(line)
++    const m = new RegExp(`^ {${scopeIndent}}([a-zA-Z-]+):\\s*(read|write|none)\\s*$`).exec(stripped)
++    if (!m) return 'unparsed' // 这一行不是合法的 "scope: level",不猜测,直接报无法解析
++    scopes.set(m[1], m[2])
++  }
++  return scopes
++}
++
++// 把 parsePermissionsBlock 的返回值统一成"查询某个 scope 的声明 level"的函数,
++// 方便下游按 anyOfScopes 求最大 level。'unparsed' 与 null/非 Map 同样落到 fail-closed
++// 的 'none'(不猜测任何 scope 已声明);missingScopesForCall 里对 'unparsed' 另有
++// 专门分支,用于产出"无法解析"而不是"缺 scope"的诊断文案。
++export function resolveDeclaredLevel(permissions, scope) {
++  if (permissions === 'read-all') return 'read'
++  if (permissions === 'write-all') return 'write'
++  if (!permissions || !(permissions instanceof Map)) return 'none'
++  return permissions.get(scope) || 'none'
++}
++
++// ── 纯函数:在整份文件文本里定位 jobs 段与每个 job 的行区间 + 生效 permissions ──
++export function parseWorkflow(text) {
++  const lines = text.split('\n')
++  // 顶层 permissions 头:不再要求精确匹配 3 种固定形状,只要求"顶层(0 缩进)的
++  // permissions: 键"本身,剥掉行尾注释后判定(三审 W2R3-A1 相邻假绿修复:此前
++  // `permissions: {} # 说明` 这类带尾注的头完全不被识别为头,直接落到
++  // headerIdx=-1 → 借用"未声明"的默认语义,而不是被正确解析成显式声明的空权限)。
++  // 具体形状(read-all / flow-map / block / 锚点 / 别名)交给 parsePermissionsBlock
++  // 逐一识别,识别不了的一律 'unparsed',不在这里预先过滤掉。
++  const topHeaderIdx = lines.findIndex((l) => /^permissions:/.test(stripTrailingComment(l)))
++  const topPermissions = parsePermissionsBlock(lines, topHeaderIdx)
++
++  // `jobs:` 头本身也剥掉行尾注释再判定(三审 R2 codex-adversarial W2R3-R2-CODEX-F1:
++  // 此前只对 permissions 头剥注释,`jobs: # 说明` 这类合法尾注会让本行匹配 /^jobs:\s*$/
++  // 失败,整个 jobs 段落漏识别 → jobs=[] → 内部全部调用借用更宽的顶层权限,静默假绿)。
++  const jobsIdx = lines.findIndex((l) => /^jobs:\s*$/.test(stripTrailingComment(l)))
++  const jobs = []
++  if (jobsIdx >= 0) {
++    // job key 缩进从 `jobs:` 后第一条非空/非注释行动态检测,不再硬编码 2 空格
++    // (三审 W2R3-A1 相邻假绿修复:job key 用 4/6/8 等非常规缩进时此前会漏识别
++    // 全部 job,内部调用落回 findJobForLine=null,借用更宽的 topPermissions)。
++    // job 名允许裸标识符或单/双引号包裹(W2R2-CODEX-F4)。
++    let jobKeyIndent = null
++    const jobKeyBodyRe = /^(?:'([^']+)'|"([^"]+)"|([A-Za-z0-9_.-]+)):\s*$/
++    for (let i = jobsIdx + 1; i < lines.length; i += 1) {
++      const line = lines[i]
++      if (line.trim() === '') continue
++      if (line.trim().startsWith('#')) continue
++      const indent = line.length - line.replace(/^ */, '').length
++      if (indent === 0) break // 回到顶层下一个 key,jobs 块结束
++      if (jobKeyIndent === null) jobKeyIndent = indent
++      if (indent !== jobKeyIndent) continue // 更深缩进的属性行,不是 job key,跳过
++      // job key 行同样剥掉行尾注释再匹配(同一条 W2R3-R2-CODEX-F1:`x: # 说明` 这类
++      // 合法尾注此前会让该 job key 本身漏识别,该 job 的边界连带丢失)。
++      const m = jobKeyBodyRe.exec(stripTrailingComment(line).slice(jobKeyIndent))
++      if (m) jobs.push({ name: m[1] || m[2] || m[3], startLine: i })
++    }
++    for (let i = 0; i < jobs.length; i += 1) {
++      jobs[i].endLine = i + 1 < jobs.length ? jobs[i + 1].startLine - 1 : lines.length - 1
++    }
++    for (const job of jobs) {
++      // job 属性(含 permissions 头)缩进同样从该 job 区间内第一条实质行动态检测,
++      // 不再硬编码 4 空格 —— 与 jobKeyIndent 同一手法,同一批修复。
++      let propIndent = null
++      let jobPermHeaderIdx = -1
++      for (let i = job.startLine + 1; i <= job.endLine; i += 1) {
++        const raw = lines[i]
++        if (raw.trim() === '') continue
++        if (raw.trim().startsWith('#')) continue
++        const indent = raw.length - raw.replace(/^ */, '').length
++        if (propIndent === null) propIndent = indent
++        if (indent !== propIndent) continue // 更深层嵌套内容(steps 详情等),跳过
++        const stripped = stripTrailingComment(raw)
++        if (/^permissions:/.test(stripped.slice(propIndent))) {
++          jobPermHeaderIdx = i
++          break
++        }
++      }
++      // job 级 permissions 若声明,完全替换(不合并)workflow 级 —— GitHub 官方语义。
++      job.permissions = jobPermHeaderIdx >= 0 ? parsePermissionsBlock(lines, jobPermHeaderIdx) : topPermissions
++    }
++  }
++  return { lines, topPermissions, jobs }
++}
++
++// ── 内部辅助:整份文本(可能跨行)的字符偏移 ↔ 行号互转,供下面的"残余引用扫描"
++// 在多行匹配(如跨多行的解构语句)里定位具体是哪一行、以及把已消费的文本区间从
++// 残余扫描副本里抹掉。 ──────────────────────────────────────────────────────
++function buildLineOffsets(lines) {
++  const offsets = []
++  let pos = 0
++  for (const l of lines) {
++    offsets.push(pos)
++    pos += l.length + 1 // +1 为 join('\n') 时的换行符
++  }
++  return offsets
++}
++
++function lineIndexAt(lineOffsets, offset) {
++  // lineOffsets 严格递增;workflow 文件通常几百到几千行,线性扫描足够,不必二分。
++  let idx = 0
++  while (idx + 1 < lineOffsets.length && lineOffsets[idx + 1] <= offset) idx += 1
++  return idx
++}
++
++function blankRange(residualLines, lineOffsets, start, end) {
++  // 把字符偏移区间 [start, end)(可能跨多行)在 residualLines 副本里替换成等长
++  // 空白,防止"残余引用扫描"对已经被某个解析成功的调用/别名定义消费掉的文本
++  // 重复告警。只动 residualLines(供残余扫描用的独立副本),不影响原始 lines/text
++  // 上任何其它已完成的正则匹配。
++  let pos = start
++  while (pos < end) {
++    const lineIdx = lineIndexAt(lineOffsets, pos)
++    const lineStart = lineOffsets[lineIdx]
++    const lineText = residualLines[lineIdx]
++    const lineEnd = lineStart + lineText.length
++    const from = pos - lineStart
++    const to = Math.min(end, lineEnd) - lineStart
++    if (to > from) {
++      residualLines[lineIdx] = lineText.slice(0, from) + ' '.repeat(to - from) + lineText.slice(to)
++    }
++    pos = lineEnd + 1 // 跳过换行符,继续下一行
++    if (lineIdx + 1 >= residualLines.length) break
++  }
++}
++
++const escapeRegExpLiteral = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
++
++// ── 纯函数:定位全文里全部 `script:` 键的 YAML block scalar(`script: |`/
++// `script: >`,可带 `+`/`-`/数字 chomping 指示符)内容行区间(三审 R3 复核盲审
++// 第 6 轮结构性收口,见文件头"域边界"说明)。只认 `script:` 这一个 key 名 ——
++// `github.rest` 是 `actions/github-script` 注入进它自己 `with.script` 沙箱的
++// 对象,只在这个域里才有意义;其它 block scalar(最典型是 `run: |` 的 shell
++// 脚本)语法上完全不是 JS,曾经把探测放宽到"任意 key 名"时,ci.yml 里
++// `run: | \n node -e "...多行 JS 字符串..."` 这类 bash 内嵌多行双引号字符串
++// 被当成 JS 逐行词法扫描,行尾"未闭合字符串"的歧义判定被大量触发,产出与
++// permissions 完全无关的假 unparsed(2026-08-03 结构性收口过程中用真实仓内
++// 文件实测发现,未采纳该放宽方案)。仓内测试 fixture 里历史上用 `run: |`
++// 简写表示"这一步的 JS 内容",现按同一收口统一改为 `script: |`,与真实文件的
++// 唯一合法域对齐,不再需要放宽 key 名去兼容旧写法。缩进探测手法与本文件其它
++// 区间探测(permissions 子行 / job 属性)一致:从头行下一条非空行的缩进动态
++// 取值,不硬编码空格数;块内容持续到出现缩进小于该基准的非空行,或到文件末尾。
++// 返回按位置排序、互不重叠的 { startLine, endLine } 数组(startLine > endLine
++// 表示空块,即头行后立即 dedent,没有任何内容行)。 ───────────────────────────
++function findScriptBlocks(lines) {
++  const blocks = []
++  // 允许可选的序列项前缀(`- `)—— `- script: |` 是"steps 列表项内嵌一个
++  // mapping key"的写法,前导 `-` 不算 key 名的一部分,但捕获组 1 仍取"这一行的
++  // 整体缩进"(dash 本身的位置,不是 key 名的位置),与本文件其它缩进探测统一按
++  // "这一行的前导空白长度"取值的惯例一致。
++  const headerRe = /^(\s*)(?:-\s+)?script:\s*[|>][+-]?\d*\s*(?:#.*)?$/
++  for (let i = 0; i < lines.length; i += 1) {
++    const m = headerRe.exec(lines[i])
++    if (!m) continue
++    const headerIndent = m[1].length
++    let bodyIndent = null
++    let firstContentLine = -1
++    for (let j = i + 1; j < lines.length; j += 1) {
++      if (lines[j].trim() === '') continue
++      const indent = lines[j].length - lines[j].replace(/^ */, '').length
++      if (indent <= headerIndent) break // 立即 dedent,空块
++      bodyIndent = indent
++      firstContentLine = j
++      break
++    }
++    if (firstContentLine === -1) {
++      blocks.push({ startLine: i + 1, endLine: i })
++      continue
++    }
++    let end = firstContentLine
++    for (let k = firstContentLine + 1; k < lines.length; k += 1) {
++      if (lines[k].trim() === '') { end = k; continue }
++      const indent = lines[k].length - lines[k].replace(/^ */, '').length
++      if (indent < bodyIndent) break
++      end = k
++    }
++    blocks.push({ startLine: firstContentLine, endLine: end })
++    i = end // 跳过已消费的块,避免把块内容自己的文本误判成新的块头
++  }
++  return blocks
++}
++
++// 判定一个 `/` 是正则字面量的起点还是除号/取余的字面字符 —— 经典的 JS 词法
++// 歧义,标准做法是看"前一个有意义的 token 是否是能作为表达式结尾的值"(值之后
++// 的 `/` 才是运算符;否则前面还没有左操作数,只能是正则起点)。lastNonSpaceChar
++// 是最近一个非空白字符本身(标识符/数字字符会一路累积进 lastWord,供关键字判定;
++// 字符串/模板字符串/正则字面量闭合后 lastNonSpaceChar 落在闭合引号/斜杠这个
++// "值"上,均不在下面的运算符集合里,天然落到"除号"分支,不需要额外的哨兵值)。
++const REGEX_PERMIT_CHARS = new Set(['(', '[', '{', ',', ';', ':', '=', '!', '&', '|', '?', '+', '-', '*', '%', '^', '~', '<', '>'])
++const REGEX_PERMIT_KEYWORDS = new Set([
++  'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void',
++  'throw', 'case', 'yield', 'await', 'else', 'do',
++])
++function isRegexStart(lastNonSpaceChar, lastWord) {
++  if (lastNonSpaceChar === '') return true // 区块开头,尚无左操作数
++  if (REGEX_PERMIT_CHARS.has(lastNonSpaceChar)) return true
++  return REGEX_PERMIT_KEYWORDS.has(lastWord)
++}
++
++// ── 纯函数:轻量 JS 词法扫描(不做完整语法解析),区分"注释 / 字符串-模板
++// 字符串-正则字面量 / 代码"几类上下文。产出:
++//   codeLines    — 注释已剥离(块注释整段删除,原本被隔开的 token 重新贴邻)、
++//                  字符串/模板字符串/正则字面量保留原样的逐行文本,供别名与
++//                  调用识别使用。
++//   stringSpans  — 每行一个 [start,end) 区间数组,标出该行(在 codeLines 里)
++//                  属于字符串/模板字符串/正则字面量的部分,供下面
++//                  maskStringSpans 只在残留引用扫描时把这些区间抹成空白 ——
++//                  正则字面量的 pattern 本身可能包含引号字符(如
++//                  `/(?:"([^"]*)"|'([^']*)')/`,repo-health-watchdog.yml 实际
++//                  用到的写法),必须先识别出"这是正则,不是字符串"才不会把
++//                  pattern 内部的引号误判成字符串边界(2026-08-03 结构性收口
++//                  过程中用真实仓内文件实测发现);pattern 内偶然撞出的别名
++//                  同形词同样不是真实 JS 引用,与字符串同一处理。
++//   forcedUnparsedLines — 行尾仍处于未闭合单/双引号字符串,或看起来像正则起点
++//                  却在本行结尾前找不到闭合 `/`(正则字面量不允许跨行,大概率
++//                  是启发式误判或真的语法有问题)的行号集合,不猜测,由调用方
++//                  fail-closed 处理。
++// 模板字符串(反引号)允许合法跨行,块注释也允许合法跨行,均按跨行状态处理;
++// 单/双引号字符串与正则字面量不允许跨行。历史遗留的整行 `#` 注释(测试 fixture
++// 里用来模拟 YAML 注释的惯例写法)在 code 状态下 trim 后整行清空,与
++// `//`/`/* */` 处理保持同一"注释即透明"的效果。 ─────────────────────────────
++function tokenizeJsLines(lines) {
++  const codeLines = []
++  const stringSpans = []
++  const forcedUnparsedLines = new Set()
++  let state = 'code' // 跨行保留:'code' | 'block-comment' | 'template'
++  let spanStart = -1
++  let quote = null
++  let lastNonSpaceChar = ''
++  let lastWord = ''
++  for (let li = 0; li < lines.length; li += 1) {
++    const src = lines[li]
++    if (state === 'code' && src.trim().startsWith('#')) {
++      codeLines.push('')
++      stringSpans.push([])
++      continue
++    }
++    let out = ''
++    const spans = []
++    if (state === 'template') { spanStart = 0 } else { quote = null }
++    let i = 0
++    while (i < src.length) {
++      const c = src[i]
++      const c2 = i + 1 < src.length ? src[i + 1] : ''
++      if (state === 'code') {
++        if (c === '/' && c2 === '/') { i = src.length; continue }
++        if (c === '/' && c2 === '*') { state = 'block-comment'; i += 2; continue }
++        if (c === '/' && isRegexStart(lastNonSpaceChar, lastWord)) {
++          const regexSpanStart = out.length
++          out += c
++          i += 1
++          let closed = false
++          let inCharClass = false
++          while (i < src.length) {
++            const rc = src[i]
++            if (rc === '\\' && i + 1 < src.length) { out += rc + src[i + 1]; i += 2; continue }
++            out += rc
++            i += 1
++            if (rc === '[') { inCharClass = true; continue }
++            if (rc === ']') { inCharClass = false; continue }
++            if (rc === '/' && !inCharClass) { closed = true; break }
++          }
++          if (closed) {
++            spans.push([regexSpanStart, out.length])
++            lastNonSpaceChar = '/'
++            lastWord = ''
++          } else {
++            // 正则字面量不允许跨行 —— 行尾都没找到闭合 `/`,大概率是启发式误判
++            // 了除号,或者真的语法有问题。不猜测,整行记为歧义。
++            forcedUnparsedLines.add(li)
++          }
++          continue
++        }
++        if (c === "'" || c === '"' || c === '`') {
++          state = c === '`' ? 'template' : 'string'
++          quote = c
++          spanStart = out.length
++          out += c
++          i += 1
++          continue
++        }
++        out += c
++        i += 1
++        if (/[A-Za-z0-9_$]/.test(c)) {
++          lastWord += c
++          lastNonSpaceChar = c
++        } else if (c.trim() !== '') {
++          lastWord = ''
++          lastNonSpaceChar = c
++        } // 空白字符:lastNonSpaceChar/lastWord 保持不变,跨空白仍能命中关键字
++        continue
++      }
++      if (state === 'block-comment') {
++        if (c === '*' && c2 === '/') { state = 'code'; i += 2; continue }
++        i += 1 // 删除,不写入 out(注释对 token 判定不可见,不更新 lastWord 等)
++        continue
++      }
++      // state 是 'string' 或 'template'
++      if (c === '\\' && i + 1 < src.length) { out += c + src[i + 1]; i += 2; continue }
++      out += c
++      i += 1
++      if (c === quote) {
++        spans.push([spanStart, out.length])
++        state = 'code'
++        lastNonSpaceChar = quote
++        lastWord = ''
++        quote = null
++        spanStart = -1
++      }
++      continue
++    }
++    if (state === 'string') {
++      // 单/双引号字符串行尾未闭合 —— 不猜测是否合法跨行,记为歧义,重置状态。
++      forcedUnparsedLines.add(li)
++      state = 'code'
++      lastNonSpaceChar = ''
++      lastWord = ''
++      quote = null
++      spanStart = -1
++    } else if (state === 'template') {
++      // 模板字符串合法跨行:先记下本行已产出这一段,下一行从行首继续累计。
++      spans.push([spanStart, out.length])
++    }
++    codeLines.push(out)
++    stringSpans.push(spans)
++  }
++  return { codeLines, stringSpans, forcedUnparsedLines }
++}
++
++// 把 tokenizeJsLines 标出的字符串/模板字符串区间抹成等长空白 —— 只供残留引用
++// 扫描使用(见 analyzeRestCalls 第 4 步),call 识别仍在保留字符串的 codeLines
++// 上跑。
++function maskStringSpans(codeLines, stringSpans) {
++  return codeLines.map((line, idx) => {
++    let masked = line
++    for (const [start, end] of stringSpans[idx]) {
++      masked = masked.slice(0, start) + ' '.repeat(end - start) + masked.slice(end)
++    }
++    return masked
++  })
++}
++
++// ── 纯函数(内部):定位全文里全部 github.rest.<resource>.<method> 等价语法引用,
++// 并把"看得出在碰 github.rest 覆盖面、但解析不出具体 resource.method"的残留引用
++// 一并报出来。三审 R2 起(D1 裁决,claude-adversarial W2R4-A1 / codex-adversarial
++// W2R3-R2-CODEX-F2):不再逐个语法打补丁,而是"消费掉全部已知形态后,残留的
++// github.rest/别名引用一律 fail-closed 标记该行 unparsed"——新等价语法不需要新一轮
++// 补丁,只要还认得出"这是在碰 github.rest",就会被抓到。
++//
++// 输入的 `lines` 假定已经是"纯 JS 文本"(不含 YAML 结构)——是否需要先按
++// findScriptBlocks() 切出 JS 域,由调用方决定:checkWorkflowText() 对真实文件按
++// block scalar 区间切片后逐块调用本函数;下方导出的 findRestCalls /
++// findUnresolvedRestReferences 保持"纯 JS 文本分析器"的既有契约不变,直接对传入
++// 的 lines 全量分析,不做域探测(供单测直接喂纯 JS 片段)。
++function analyzeRestCalls(lines) {
++  const { codeLines, stringSpans, forcedUnparsedLines } = tokenizeJsLines(lines)
++  const text = codeLines.join('\n')
++  const lineOffsets = buildLineOffsets(codeLines)
++  const residualLines = maskStringSpans(codeLines, stringSpans)
++  const calls = []
++  const consume = (start, end) => blankRange(residualLines, lineOffsets, start, end)
++
++  // ── 1) 别名基础设施(整份文本,支持跨行) ──────────────────────────────────
++  // 1a) resource 级解构别名:`const { actions, issues: iss } = github.rest;`,
++  //     允许跨多行(claude-adversarial W2R4-A1 B1「多行解构」)。负向前瞻排除
++  //     `= github.rest.X` 这种"方法解构"形态(见下方 1c)。
++  const aliasToResource = new Map()
++  const destructureRe = /(?:const|let|var)\s*\{\s*(?<names>[^}]*)\}\s*=\s*github\.rest\b(?!\s*\.)/gs
++  {
++    let dm
++    while ((dm = destructureRe.exec(text))) {
++      // consume-before-verify 顺序 bug 修复(三审 R3 复核盲审 codex-adversarial
++      // W2R3-R3-CODEX-F1 相邻根因 / claude-adversarial W2R5-A2):只有当全部
++      // 成员都成功解析时才 consume;任一成员解析失败,整段(含其中的
++      // `github.rest` 字面量)保持原样留在残留扫描里,不假装零信号等于零引用。
++      let allParsed = true
++      for (const part of dm.groups.names.split(',')) {
++        if (!part.trim()) continue
++        const m = /^\s*(?<orig>[a-zA-Z_$][\w$]*)\s*(?::\s*(?<local>[a-zA-Z_$][\w$]*))?\s*$/.exec(part)
++        if (m) {
++          aliasToResource.set(m.groups.local || m.groups.orig, m.groups.orig)
++        } else {
++          allParsed = false
++        }
++      }
++      if (allParsed) consume(dm.index, dm.index + dm[0].length)
++    }
++  }
++
++  // 1b) 简单赋值别名 —— resource 级(`const api = github.rest.actions;`)与整对象级
++  //     (`const gh = github.rest;`)。只认单行、以 `;` 收尾的形态 —— 更通用的
++  //     跨行/无分号形态不会被识别为别名定义,但右侧的 github.rest 文本仍会被
++  //     残留引用扫描抓到,fail-closed 为 unparsed(见文件头「已知局限」)。
++  const objectAliases = new Set()
++  const resourceAssignRe = /(?:const|let|var)\s+(?<alias>[a-zA-Z_$][\w$]*)\s*=\s*github\.rest\.(?<resource>[a-zA-Z]+)\s*;/g
++  const objectAssignRe = /(?:const|let|var)\s+(?<alias>[a-zA-Z_$][\w$]*)\s*=\s*github\.rest\s*;/g
++  codeLines.forEach((line, idx) => {
++    let m
++    resourceAssignRe.lastIndex = 0
++    while ((m = resourceAssignRe.exec(line))) {
++      aliasToResource.set(m.groups.alias, m.groups.resource)
++      consume(lineOffsets[idx] + m.index, lineOffsets[idx] + m.index + m[0].length)
++    }
++    objectAssignRe.lastIndex = 0
++    while ((m = objectAssignRe.exec(line))) {
++      objectAliases.add(m.groups.alias)
++      consume(lineOffsets[idx] + m.index, lineOffsets[idx] + m.index + m[0].length)
++    }
++  })
++
++  const resourceAliasNames = [...aliasToResource.keys()]
++  const resourceAliasAlt = resourceAliasNames.length ? resourceAliasNames.map(escapeRegExpLiteral).join('|') : null
++  const objectAliasNames = [...objectAliases]
++  const objectAliasAlt = objectAliasNames.length ? objectAliasNames.map(escapeRegExpLiteral).join('|') : null
++  // root:字面量 `github.rest`,或整对象别名(`const gh = github.rest` 之后的 gh)。
++  const rootAlt = objectAliasAlt ? `(?:github\\.rest|${objectAliasAlt})` : 'github\\.rest'
++  // '.' 或 optional chaining 的 '?.'(原已知局限之一,三审 R2 起补齐)。
++  const OPT_DOT = '\\??\\.'
++
++  // 1c) 方法解构:`const { cancelWorkflowRun, update: upd } = github.rest.actions`
++  //     (或 `= <resource 别名>`)—— 解构清单里的原属性名本身就是方法名。
++  {
++    const aliasBranch = resourceAliasAlt ? `|\\b(?<alias>${resourceAliasAlt})\\b` : ''
++    const methodDestructureRe = new RegExp(
++      `(?:const|let|var)\\s*\\{\\s*(?<names>[^}]*)\\}\\s*=\\s*(?:github\\.rest\\.(?<resource>[a-zA-Z]+)${aliasBranch})`,
++      'gs',
++    )
++    let mm
++    while ((mm = methodDestructureRe.exec(text))) {
++      // 同一条 consume-before-verify 顺序 bug(见上方 resource 级解构的修复注释):
++      // 方法级解构成员若带默认值等本解析器不支持的语法,此前无条件 consume 会把
++      // `github.rest.actions` 一并抹掉,产出零信号假绿。改为只有全部成员解析
++      // 成功、且 resource 本身也确实解析出来时才 consume。
++      //
++      // `resource` 恒为真:methodDestructureRe 的两个分支必有其一命中 ——
++      // resource 支捕获非空 `[a-zA-Z]+`;alias 支的 `alias` 必属
++      // `resourceAliasAlt`(= aliasToResource.keys() 同一快照,该 Map 全仓仅
++      // 上方两处写入,值均为非空标识符捕获组)。故 `else { allParsed = false }`
++      // 这一分支理论上不可达 —— 三审 R3 复核盲审 claude-adversarial W2R6-A2
++      // 用插桩实测确认(9 个真实 workflow 扫描 0 次命中)。改为显式断言:一旦
++      // 假设被违反(如未来正则改动破坏了这个前提),立刻抛错让人发现,而不是
++      // 静默保持 allParsed=true 的相反语义继续跑。
++      let allParsed = true
++      const resource = mm.groups.resource || aliasToResource.get(mm.groups.alias)
++      if (!resource) {
++        throw new Error(
++          '[workflow-permissions] 内部不变量被违反:methodDestructureRe 命中但 resource 与'
++          + ' alias 均未解析出有效 resource —— 请检查该正则或 aliasToResource 的写入逻辑'
++          + '是否发生了改动(见 W2R6-A2 的不可达性论证)。',
++        )
++      }
++      for (const part of mm.groups.names.split(',')) {
++        if (!part.trim()) continue
++        const pm = /^\s*(?<method>[a-zA-Z_$][\w$]*)\s*(?::\s*[a-zA-Z_$][\w$]*)?\s*$/.exec(part)
++        if (pm) {
++          calls.push({ line: lineIndexAt(lineOffsets, mm.index), resource, method: pm.groups.method })
++        } else {
++          allParsed = false
++        }
++      }
++      if (allParsed) consume(mm.index, mm.index + mm[0].length)
++    }
++  }
++
++  // ── 2) 直接引用形态:点号(含 optional chaining)、bracket(方法/resource 各自或
++  // 都用 bracket,引号支持单/双引号与不含 `${` 插值的静态模板字符串)、以及别名
++  // (resource 级)等价形式。 ─────────────────────────────────────────────────
++  const runCallRegex = (re) => {
++    re.lastIndex = 0
++    let m
++    while ((m = re.exec(text))) {
++      const resource = m.groups.alias ? aliasToResource.get(m.groups.alias) : m.groups.resource
++      if (resource) calls.push({ line: lineIndexAt(lineOffsets, m.index), resource, method: m.groups.method })
++      consume(m.index, m.index + m[0].length)
++    }
++  }
++
++  runCallRegex(new RegExp(`${rootAlt}${OPT_DOT}(?<resource>[a-zA-Z]+)${OPT_DOT}(?<method>[a-zA-Z]+)`, 'g'))
++  runCallRegex(new RegExp(`${rootAlt}${OPT_DOT}(?<resource>[a-zA-Z]+)\\s*\\[\\s*(?<q1>['"\`])(?<method>[a-zA-Z]+)\\k<q1>\\s*\\]`, 'g'))
++  runCallRegex(new RegExp(`${rootAlt}\\s*\\[\\s*(?<q1>['"\`])(?<resource>[a-zA-Z]+)\\k<q1>\\s*\\]${OPT_DOT}(?<method>[a-zA-Z]+)`, 'g'))
++  runCallRegex(new RegExp(
++    `${rootAlt}\\s*\\[\\s*(?<q1>['"\`])(?<resource>[a-zA-Z]+)\\k<q1>\\s*\\]\\s*\\[\\s*(?<q2>['"\`])(?<method>[a-zA-Z]+)\\k<q2>\\s*\\]`,
++    'g',
++  ))
++  if (resourceAliasAlt) {
++    runCallRegex(new RegExp(`\\b(?<alias>${resourceAliasAlt})${OPT_DOT}(?<method>[a-zA-Z]+)`, 'g'))
++    runCallRegex(new RegExp(`\\b(?<alias>${resourceAliasAlt})\\s*\\[\\s*(?<q1>['"\`])(?<method>[a-zA-Z]+)\\k<q1>\\s*\\]`, 'g'))
++  }
++
++  // ── 3) 跨行点号:本行以 `github.rest.<resource>`(或对象别名 root、resource 别名)
++  // 结尾,紧邻的下一条实质内容行(跳过空行)接方法名才算一次调用。支持两种收尾:
++  // 本行不带尾随点(下一行须以 `.method(` 开头)与本行带尾随点(下一行直接以裸
++  // `method(` 开头)。只看紧邻的下一行,不跨多行猜测。剥离注释后,原本因为块
++  // 注释隔开而"看似跨行"的写法(如 `acts/* 多行\n注释 */.method()`)在 codeLines
++  // 里注释已被整段删除,若剥离后 resource/alias 与 `.method(` 恰好落在同一行,
++  // 会先被第 2 步的单行贴邻正则命中,不会走到这里;只有块注释本身跨行时才会
++  // 走到这里,逻辑与既有的跨行场景一致,不需要特殊处理。 ────────────────────────
++  {
++    const trailingRootRe = new RegExp(`${rootAlt}${OPT_DOT}(?<resource>[a-zA-Z]+)(?<dot>\\??\\.)?\\s*$`)
++    const trailingAliasRe = resourceAliasAlt ? new RegExp(`\\b(?<alias>${resourceAliasAlt})(?<dot>\\??\\.)?\\s*$`) : null
++    const leadingDotMethodRe = /^\s*\??\.\s*(?<method>[a-zA-Z]+)\s*\(/
++    const leadingBareMethodRe = /^\s*(?<method>[a-zA-Z]+)\s*\(/
++
++    codeLines.forEach((line, idx) => {
++      const trailRoot = trailingRootRe.exec(line)
++      const trailAlias = !trailRoot && trailingAliasRe ? trailingAliasRe.exec(line) : null
++      const tailMatch = trailRoot || trailAlias
++      if (!tailMatch) return
++      const resource = trailRoot ? trailRoot.groups.resource : aliasToResource.get(trailAlias.groups.alias)
++      if (!resource) return
++      const dotConsumed = Boolean(tailMatch.groups.dot)
++      for (let j = idx + 1; j < codeLines.length; j += 1) {
++        const next = codeLines[j]
++        if (next.trim() === '') continue
++        const lm = dotConsumed ? leadingBareMethodRe.exec(next) : leadingDotMethodRe.exec(next)
++        if (lm) {
++          calls.push({ line: idx, resource, method: lm.groups.method })
++          consume(lineOffsets[idx] + tailMatch.index, lineOffsets[idx] + tailMatch.index + tailMatch[0].length)
++          consume(lineOffsets[j] + lm.index, lineOffsets[j] + lm.index + lm[0].length)
++        }
++        break
++      }
++    })
++  }
++
++  // ── 4) 残余引用扫描(D1):上面已把全部已知形态消费掉的文本从 residualLines 里
++  // 抹成空白 —— residualLines 起点是"注释已剥离、字符串/模板字符串也已抹白"的
++  // 版本(maskStringSpans 的产物),所以字符串字面量里偶然撞出的别名同形词(如
++  // 'github-actions[bot]' 撞上别名 actions)不会进入这一步的扫描面。逐行检查
++  // 还剩下 `github.rest` 字面量或任一已知别名标识符的行 —— 说明这行确实碰了
++  // covered resource 的表面,但解析不出具体是哪次调用。不猜测、不假装零信号
++  // 等于零调用,直接标记该行 unparsed,交给 checkWorkflowText 转成 fail-closed
++  // 违规。
++  //
++  // 域分离后(三审 R3 复核盲审第 6 轮结构性收口,见文件头"域边界"说明),这里
++  // 不再需要"两侧是否贴 -/"或"是否在行首"这类字符位置代理 —— 传入本函数的
++  // lines 已经被调用方限定在 JS 文本域内(findScriptBlocks 切出的 block scalar
++  // 区间,或单测直接给的纯 JS 片段),YAML 结构(permissions: 块、uses: 值、
++  // 序列项键等)天然不在扫描面里,别名名字撞上这些 YAML token 的可能性从根上
++  // 消失,不需要再靠位置代理去分辨;而三元/switch 里紧跟冒号的别名引用也不再有
++  // 被误豁免的通道 —— 单纯的 `\b(?:names)\b` word-boundary 匹配就足够,不设
++  // 任何"看起来不像调用就放过"的例外(三审 claude-adversarial W2R6-A1 /
++  // codex-adversarial W2R3-R4-CODEX-F1 / claude-adversarial W2R6-G1 三条同源
++  // finding 的结构性收口)。 ────────────────────────────────────────────────
++  const markerNames = [...new Set([...resourceAliasNames, ...objectAliasNames])]
++  const namesAlt = markerNames.length ? markerNames.map(escapeRegExpLiteral).join('|') : null
++  const markerRe = namesAlt
++    ? new RegExp(`github\\.rest\\b|\\b(?:${namesAlt})\\b`)
++    : /github\.rest\b/
++  const unresolvedSet = new Set(forcedUnparsedLines)
++  residualLines.forEach((line, idx) => {
++    if (markerRe.test(line)) unresolvedSet.add(idx)
++  })
++
++  return { calls, unresolvedLines: [...unresolvedSet].sort((a, b) => a - b) }
++}
++
++export function findRestCalls(lines) {
++  return analyzeRestCalls(lines).calls
++}
++
++// 导出供 checkWorkflowText 与测试直接使用:D1 fail-closed 兜底命中的行号(0-based),
++// 即"引用了 github.rest 覆盖面但解析不出具体调用"的那些行。
++export function findUnresolvedRestReferences(lines) {
++  return analyzeRestCalls(lines).unresolvedLines
++}
++
++function findJobForLine(jobs, lineIdx) {
++  return jobs.find((j) => lineIdx >= j.startLine && lineIdx <= j.endLine) || null
++}
++
++// ── 纯函数:对一次调用求出"缺失的 scope 选项"(空数组 = 已满足) ───────────────
++// 返回值是字符串数组:正常情况下每项是 `scope:level` 形式(供 CLI 拼"需要以下
++// 任一 scope");两种 fail-closed 分支返回单元素诊断文案数组(内容不是
++// scope:level,调用方按数组非空即判违规即可,消息本身供人读)。
++export function missingScopesForCall(call, effectivePermissions) {
++  const rule = SCOPE_RULES[call.resource]
++  if (!rule) return [] // 不在覆盖范围内的 resource,不校验
++  if (rule.methodAllowlist && !rule.methodAllowlist.has(call.method)) return []
++  if (effectivePermissions === 'unparsed') {
++    // permissions 块本身解析失败,不知道真实声明是什么 —— 不借用更宽的外层权限,
++    // 也不误报"缺 XXX scope"(那会让排查者去补一个可能已经声明只是没读出来的
++    // scope)。诊断文案不再只提"缩进或语法"(三审 W2R3-A1:那不是所有 unparsed
++    // 成因的准确描述,如今仍会走到这里的是 tab 缩进 / 缩进不一致 / 无法解析的
++    // 锚点或别名 / flow-map 内无法识别的项)。
++    return ['permissions 块无法解析(存在本解析器不支持的形状,如 tab 缩进、缩进不一致、'
++      + '或无法解析的 YAML 锚点/别名),按 fail-closed 处理,请人工核对该 job/workflow 的实际权限']
++  }
++  const requiredLevel = rule.requiredLevel(call.method)
++  if (requiredLevel === null) {
++    // covered resource(methodAllowlist===null)上出现未收录的方法 —— 不默认当作
++    // read 放行(W2R2-CODEX-F3),也不猜测所需 level,直接报映射缺失。
++    return [`github.rest.${call.resource}.${call.method}() 缺少已知的 scope 映射(未收录方法,fail-closed)—— 请在 check-workflow-permissions.mjs 里补充该方法的 read/write 归类`]
++  }
++  const anyOf = rule.anyOfScopes(call.method)
++  const satisfied = anyOf.some(
++    (scope) => levelSatisfies(requiredLevel, resolveDeclaredLevel(effectivePermissions, scope)),
++  )
++  return satisfied ? [] : anyOf.map((scope) => `${scope}:${requiredLevel}`)
++}
++
++// ── 纯函数:核对一份 workflow 文件全文,返回违规列表 ───────────────────────────
++export function checkWorkflowText(filePath, text) {
++  const { lines, topPermissions, jobs } = parseWorkflow(text)
++  // 域分离(见文件头"域边界"说明):只在 findScriptBlocks 探测到的 block scalar
++  // 区间内跑 analyzeRestCalls,YAML 结构区域完全不进扫描面。每个区间独立分析,
++  // 别名作用域天然按区间(即按 step)隔离,再把区间内的相对行号换算回文件绝对
++  // 行号。
++  const blocks = findScriptBlocks(lines)
++  const calls = []
++  const unresolvedLines = []
++  for (const block of blocks) {
++    if (block.endLine < block.startLine) continue // 空块
++    const blockLines = lines.slice(block.startLine, block.endLine + 1)
++    const result = analyzeRestCalls(blockLines)
++    for (const call of result.calls) calls.push({ ...call, line: call.line + block.startLine })
++    for (const lineIdx of result.unresolvedLines) unresolvedLines.push(lineIdx + block.startLine)
++  }
++
++  const violations = []
++  for (const call of calls) {
++    const job = findJobForLine(jobs, call.line)
++    const effective = job ? job.permissions : topPermissions
++    const missing = missingScopesForCall(call, effective)
++    if (missing.length) {
++      violations.push({
++        file: filePath,
++        line: call.line + 1,
++        resource: call.resource,
++        method: call.method,
++        job: job ? job.name : null,
++        anyOf: missing,
++      })
++    }
++  }
++  // D1 fail-closed 兜底:这些行确实碰了 github.rest 覆盖面(或其别名/解构产物),
++  // 但解析不出具体 resource.method,不知道该核对哪个 scope —— 无论该 job/workflow
++  // 声明了多宽的权限都判违规(与 permissions 块 'unparsed' 同一处理原则:不猜测,
++  // 不因为"declared 很宽"就假装已核对过)。
++  for (const lineIdx of unresolvedLines) {
++    const job = findJobForLine(jobs, lineIdx)
++    violations.push({
++      file: filePath,
++      line: lineIdx + 1,
++      resource: null,
++      method: null,
++      job: job ? job.name : null,
++      anyOf: ['该行引用了 github.rest 覆盖面(或其别名/解构产物),但本解析器解析不出具体的 '
++        + 'resource.method 调用(如 Reflect.get 间接取值、把 resource 对象整体当参数透传、'
++        + '赋给对象属性、真正插值拼接的计算 key 等)—— 按 fail-closed 处理,不假设零信号等于'
++        + '零调用,请人工核对该处实际访问的 REST 端点与所需 scope'],
++    })
++  }
++  return violations
++}
++
++// ── CLI 主流程 ────────────────────────────────────────────────────────────
++function main() {
++  let files
++  try {
++    files = readdirSync(WORKFLOWS_DIR)
++      .filter((f) => f.endsWith('.yml') || f.endsWith('.yaml'))
++      .sort()
++      .map((f) => join(WORKFLOWS_DIR, f))
++  } catch (e) {
++    console.error(`[workflow-permissions] 扫描 ${WORKFLOWS_DIR} 失败:${e.message}`)
++    process.exit(2)
++  }
++  if (files.length === 0) {
++    console.error(`[workflow-permissions] ${WORKFLOWS_DIR} 未找到任何 workflow 文件,fail-closed。`)
++    process.exit(2)
++  }
++
++  const allViolations = []
++  for (const f of files) {
++    let text
++    try {
++      text = readFileSync(f, 'utf8')
++    } catch (e) {
++      console.error(`[workflow-permissions] 读取失败即 fail-closed:${f}:${e.message}`)
++      process.exit(2)
++    }
++    allViolations.push(...checkWorkflowText(f, text))
++  }
++
++  if (allViolations.length === 0) {
++    console.log(`[workflow-permissions] OK:${files.length} 个 workflow 文件的 github.rest.* 调用均在声明的 permissions 范围内`)
++    process.exit(0)
++  }
++
++  console.error(`[workflow-permissions] 发现 ${allViolations.length} 处 permissions 缺口:\n`)
++  for (const v of allViolations) {
++    // resource===null:D1 fail-closed 兜底(引用了 github.rest 覆盖面但解析不出具体
++    // 调用),anyOf 本身就是可读诊断文案,不再拼 "github.rest.null.null()" 这种误导前缀。
++    const detail = v.resource
++      ? `github.rest.${v.resource}.${v.method}() 需要以下任一 scope:${v.anyOf.join(' 或 ')}`
++      : v.anyOf.join(' 或 ')
++    console.error(`  ${v.file}:${v.line} [${v.job ? 'job=' + v.job : 'workflow 级'}] ${detail}`)
++  }
++  console.error(`
++修法:在该调用生效的 permissions 块(job 级若已声明会完全替换 workflow 级,否则改
++workflow 级)里补上列出的 scope 之一,只补只读面即可(本守卫要求的都是 read,除非
++提示要求 write)。`)
++  process.exit(1)
++}
++
++const isCliEntry = () => {
++  if (!process.argv[1]) return false
++  try {
++    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1]))
++  } catch {
++    return false
++  }
++}
++if (isCliEntry()) {
++  main()
++}
+diff --git a/scripts/ci/check-workflow-permissions.test.mjs b/scripts/ci/check-workflow-permissions.test.mjs
+new file mode 100644
+index 00000000..d8ddfd97
+--- /dev/null
++++ b/scripts/ci/check-workflow-permissions.test.mjs
+@@ -0,0 +1,1284 @@
++// scripts/ci/check-workflow-permissions.test.mjs — 单测(vitest,随 test:unit / preflight
++// 跑)。覆盖:permissions 块解析(workflow 级 / job 级替换而非合并 / read-all 等特殊
++// 形式)、resource→scope 规则(含 issues/pull-requests 二选一等价、方法白名单、
++// write 级方法)、以及对真实仓内 workflow 文件的集成断言(SC2 验收:全仓跑通 +
++// 临时删掉 main-health 任一 scope 时非零)。
++import { describe, expect, it } from 'vitest'
++import { execFileSync } from 'node:child_process'
++import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import {
++  checkWorkflowText,
++  findRestCalls,
++  findUnresolvedRestReferences,
++  missingScopesForCall,
++  parsePermissionsBlock,
++  parseWorkflow,
++  resolveDeclaredLevel,
++} from './check-workflow-permissions.mjs'
++
++describe('parsePermissionsBlock', () => {
++  it('解析 workflow 级 permissions 块(2 空格缩进)', () => {
++    const lines = ['permissions:', '  issues: write', '  contents: read', '', 'jobs:'].join('\n').split('\n')
++    const perms = parsePermissionsBlock(lines, 0, 2)
++    expect(perms.get('issues')).toBe('write')
++    expect(perms.get('contents')).toBe('read')
++  })
++
++  it('解析 job 级 permissions 块(4 空格缩进,scope 行 6 空格)', () => {
++    const lines = ['  bench:', '    permissions:', '      contents: read', '      actions: read', '  next:'].join('\n').split('\n')
++    const perms = parsePermissionsBlock(lines, 1, 6)
++    expect(perms.get('contents')).toBe('read')
++    expect(perms.get('actions')).toBe('read')
++  })
++
++  it('遇到 dedent 停止解析,不吞下一个块的内容', () => {
++    const lines = ['permissions:', '  issues: write', 'concurrency:', '  group: x'].join('\n').split('\n')
++    const perms = parsePermissionsBlock(lines, 0, 2)
++    expect(perms.size).toBe(1)
++    expect(perms.has('group')).toBe(false)
++  })
++
++  it('支持 read-all / write-all / {} 特殊形式', () => {
++    expect(parsePermissionsBlock(['permissions: read-all'], 0, 2)).toBe('read-all')
++    expect(parsePermissionsBlock(['permissions: write-all'], 0, 2)).toBe('write-all')
++    expect(parsePermissionsBlock(['permissions: {}'], 0, 2)).toEqual(new Map())
++  })
++
++  it('headerIdx 为 -1(未找到 permissions 块)返回 null', () => {
++    expect(parsePermissionsBlock(['jobs:'], -1, 2)).toBeNull()
++  })
++})
++
++describe('parsePermissionsBlock 的健壮性(SC4:W2R2-CODEX-F4 / UP2-S5)', () => {
++  it('非 2 空格缩进(4 空格)仍能正确解析 —— 不再因硬编码 2 空格假设而漏读或误报缺 scope(UP2-S5)', () => {
++    const lines = ['permissions:', '    contents: read', '    checks: write', 'jobs:'].join('\n').split('\n')
++    const perms = parsePermissionsBlock(lines, 0)
++    expect(perms.get('contents')).toBe('read')
++    expect(perms.get('checks')).toBe('write')
++  })
++
++  it('job 级缩进为 8 空格(相对 workflow 级 4 空格更深一层)时同样正确解析', () => {
++    const lines = ['  bench:', '    permissions:', '        contents: read', '  next:'].join('\n').split('\n')
++    const perms = parsePermissionsBlock(lines, 1)
++    expect(perms.get('contents')).toBe('read')
++  })
++
++  it('非空 flow-map 形式(permissions: { contents: read, checks: write })能正确解析(W2R2-CODEX-F4)', () => {
++    const perms = parsePermissionsBlock(['permissions: { contents: read, checks: write }'], 0)
++    expect(perms.get('contents')).toBe('read')
++    expect(perms.get('checks')).toBe('write')
++  })
++
++  it('空 flow-map({})与非空 flow-map 分支不冲突,{} 仍返回空 Map', () => {
++    expect(parsePermissionsBlock(['permissions: {}'], 0)).toEqual(new Map())
++  })
++
++  it('子行缩进不一致 → 无法可靠解析,返回 "unparsed"(fail-closed,不猜测)', () => {
++    const lines = ['permissions:', '  contents: read', '    checks: write'].join('\n').split('\n')
++    expect(parsePermissionsBlock(lines, 0)).toBe('unparsed')
++  })
++
++  it('flow-map 里出现无法识别的项(如非法 level)→ "unparsed"', () => {
++    expect(parsePermissionsBlock(['permissions: { contents: maybe }'], 0)).toBe('unparsed')
++  })
++
++  it('block 形式里出现真正无法识别的子行(非注释、非 scope: level、非空行)→ "unparsed"', () => {
++    const lines = ['permissions:', '  contents: read', '  this is garbage', '  checks: read'].join('\n').split('\n')
++    expect(parsePermissionsBlock(lines, 0)).toBe('unparsed')
++  })
++})
++
++describe('parsePermissionsBlock 对注释的健壮性(SC2 假红修复,claude-adversarial W2R3-A1:此前一条注释就会把整块判成 "unparsed",拖垮 test:unit)', () => {
++  it('block 形式内一条独立注释行透明跳过,不影响其它 scope 的解析', () => {
++    const lines = ['permissions:', '  issues: write', '  # 说明这个 scope 为什么需要', '  contents: read'].join('\n').split('\n')
++    const perms = parsePermissionsBlock(lines, 0)
++    expect(perms).not.toBe('unparsed')
++    expect(perms.get('issues')).toBe('write')
++    expect(perms.get('contents')).toBe('read')
++  })
++
++  it('scope 行的行尾注释被剥除,不影响解析(如 "contents: read # 说明")', () => {
++    const lines = ['permissions:', '  contents: read # 只读源码文件', '  checks: write'].join('\n').split('\n')
++    const perms = parsePermissionsBlock(lines, 0)
++    expect(perms.get('contents')).toBe('read')
++    expect(perms.get('checks')).toBe('write')
++  })
++
++  it('permissions 头本身带行尾注释(pre/post 对比:pre 正确解析 {}、post 曾变成 "unparsed")', () => {
++    expect(parsePermissionsBlock(['permissions: {} # token intentionally empty'], 0)).toEqual(new Map())
++  })
++
++  it('顶层注释密集(独立注释 + 行尾注释混合)仍能正确解析,且不吞掉紧邻的下一个顶层块', () => {
++    const lines = [
++      'permissions:',
++      '  # 三个只读 scope',
++      '  issues: write # 开/关/评论 Issue',
++      '  contents: read',
++      '  # 查 check-run 结论',
++      '  checks: read',
++      'concurrency:',
++      '  group: x',
++    ].join('\n').split('\n')
++    const perms = parsePermissionsBlock(lines, 0)
++    expect(perms.size).toBe(3)
++    expect(perms.has('group')).toBe(false)
++  })
++})
++
++describe('parsePermissionsBlock 对多行 flow-map 与 YAML 锚点/别名的健壮性(SC2 假绿修复,claude-adversarial W2R3-A1 相邻 finding)', () => {
++  it('多行 flow-map(`permissions: {` 单独收尾,逐行 key: value,以单独一行 `}` 结束)正确解析', () => {
++    const lines = ['permissions: {', '  actions: none,', '  contents: read', '}'].join('\n').split('\n')
++    const perms = parsePermissionsBlock(lines, 0)
++    expect(perms.get('actions')).toBe('none')
++    expect(perms.get('contents')).toBe('read')
++  })
++
++  it('多行 flow-map 缺闭合 `}` → "unparsed"(不猜测声明已结束)', () => {
++    const lines = ['permissions: {', '  actions: none'].join('\n').split('\n')
++    expect(parsePermissionsBlock(lines, 0)).toBe('unparsed')
++  })
++
++  it('锚点定义(`permissions: &no-token {}`)按剥掉锚点标记后的实际值解析,不落回"未声明"', () => {
++    expect(parsePermissionsBlock(['permissions: &no-token {}'], 0)).toEqual(new Map())
++  })
++
++  it('锚点定义带非空值(`permissions: &admin { issues: write }`)同样正确解析', () => {
++    const perms = parsePermissionsBlock(['permissions: &admin { issues: write }'], 0)
++    expect(perms.get('issues')).toBe('write')
++  })
++
++  it('别名引用(`permissions: *no-token`)解析为对应锚点定义的实际值', () => {
++    const lines = [
++      'jobs:',
++      '  a:',
++      '    permissions: &no-token {}',
++      '  b:',
++      '    permissions: *no-token',
++    ].join('\n').split('\n')
++    // 找到 job b 的 permissions 头(下标 4),解析应等于 job a 锚点定义的空 Map。
++    const perms = parsePermissionsBlock(lines, 4)
++    expect(perms).toEqual(new Map())
++  })
++
++  it('别名引用找不到对应锚点定义 → "unparsed"(不当作"未声明"借用外层权限)', () => {
++    expect(parsePermissionsBlock(['permissions: *missing-anchor'], 0)).toBe('unparsed')
++  })
++})
++
++describe('parseWorkflow 对带引号 job 名的健壮性(SC4:W2R2-CODEX-F4)', () => {
++  it("单引号 job 名的 permissions:{} 被正确识别为空权限,内部调用不再借用 workflow 级权限", () => {
++    const text = [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      "  'quoted-job':",
++      '    permissions: {}',
++      '    runs-on: ubuntu-latest',
++      '    steps:',
++      '      - script: |',
++      '          await github.rest.actions.listJobsForWorkflowRunAttempt({})',
++    ].join('\n')
++    const violations = checkWorkflowText('fixture.yml', text)
++    expect(violations).toHaveLength(1)
++    expect(violations[0]).toMatchObject({ job: 'quoted-job', resource: 'actions', method: 'listJobsForWorkflowRunAttempt' })
++  })
++
++  it('双引号 job 名同样被识别为独立 job 边界', () => {
++    const { jobs } = parseWorkflow(['jobs:', '  "my-job":', '    runs-on: ubuntu-latest'].join('\n'))
++    expect(jobs.map((j) => j.name)).toEqual(['my-job'])
++  })
++
++  it('带引号 job 名的非空 flow-map permissions 同样被正确解析(W2R2-CODEX-F4:"非空 flow-map job permissions 也有同类继承误判面")', () => {
++    const text = [
++      'jobs:',
++      "  'quoted-job':",
++      '    permissions: { checks: read }',
++      '    steps:',
++      '      - script: |',
++      '          await github.rest.checks.listForRef({})',
++      '          await github.rest.actions.listJobsForWorkflowRunAttempt({})',
++    ].join('\n')
++    const violations = checkWorkflowText('fixture.yml', text)
++    expect(violations).toHaveLength(1)
++    expect(violations[0]).toMatchObject({ job: 'quoted-job', resource: 'actions' })
++  })
++})
++
++// ── 三审 R2 假绿回归(codex-adversarial W2R3-R2-CODEX-F1):`jobs:`/job key 的合法
++// 尾注释此前会让整个 jobs 段落(或单个 job)漏识别,内部调用借用更宽的顶层权限。
++// F0 fixture 与 codex 原报告一致:workflow 级 actions:write,job 级明确
++// permissions:{},job 内调 actions:write 的 cancelWorkflowRun。
++describe('parseWorkflow / checkWorkflowText 对 jobs:/job key 行尾注释的健壮性(三审 R2 codex-adversarial W2R3-R2-CODEX-F1)', () => {
++  it('`jobs:` 头带普通行尾注释仍能正确识别 jobs 段落(此前 /^jobs:\\s*$/ 不剥注释,整段漏识别)', () => {
++    const { jobs } = parseWorkflow(['jobs: # 说明', '  x:', '    runs-on: ubuntu-latest'].join('\n'))
++    expect(jobs.map((j) => j.name)).toEqual(['x'])
++  })
++
++  it('job key 行带普通行尾注释仍能正确识别该 job 边界(此前 jobKeyBodyRe 不剥注释,该 job 漏识别)', () => {
++    const { jobs } = parseWorkflow(['jobs:', '  x: # 说明', '    runs-on: ubuntu-latest'].join('\n'))
++    expect(jobs.map((j) => j.name)).toEqual(['x'])
++  })
++
++  it('端到端:`jobs:` 头带尾注释时,job 级 permissions:{} 不再被跳过,内部调用不再借用更宽的顶层权限', () => {
++    const text = [
++      'permissions:',
++      '  actions: write',
++      'jobs: # 说明',
++      '  x:',
++      '    permissions: {}',
++      '    steps:',
++      '      - script: |',
++      '          await github.rest.actions.cancelWorkflowRun({})',
++    ].join('\n')
++    const violations = checkWorkflowText('fixture.yml', text)
++    expect(violations).toHaveLength(1)
++    expect(violations[0]).toMatchObject({ job: 'x', resource: 'actions', method: 'cancelWorkflowRun' })
++  })
++
++  it('端到端:job key 行带尾注释时,job 级 permissions:{} 不再被跳过,内部调用不再借用更宽的顶层权限', () => {
++    const text = [
++      'permissions:',
++      '  actions: write',
++      'jobs:',
++      '  x: # 说明',
++      '    permissions: {}',
++      '    steps:',
++      '      - script: |',
++      '          await github.rest.actions.cancelWorkflowRun({})',
++    ].join('\n')
++    const violations = checkWorkflowText('fixture.yml', text)
++    expect(violations).toHaveLength(1)
++    expect(violations[0]).toMatchObject({ job: 'x', resource: 'actions', method: 'cancelWorkflowRun' })
++  })
++})
++
++// ── SC2 假绿修复回归(claude-adversarial W2R3-A1 相邻 finding):四类 actionlint 合法
++// YAML 此前从未进入 'unparsed',而是静默继承外层权限,checkWorkflowText() 全部返回
++// []——即使 job 实际权限是空/none。逐一复现并断言修复后能正确报违规。
++describe('checkWorkflowText 假绿修复(SC2:4 类此前从未被识别为 job 边界/权限头的合法 YAML)', () => {
++  it('job key 用 4 空格缩进、属性用 8 空格缩进(非本仓惯例的 2/4 空格)仍能正确识别 job 边界与其 permissions:{}', () => {
++    const text = [
++      'permissions:',
++      '  actions: write', // workflow 级故意给宽权限,若 job 边界漏识别就会被误用
++      'jobs:',
++      '    quoted-job:',
++      '        permissions: {}',
++      '        runs-on: ubuntu-latest',
++      '        steps:',
++      '            - script: |',
++      '                await github.rest.actions.cancelWorkflowRun({})',
++    ].join('\n')
++    const violations = checkWorkflowText('fixture.yml', text)
++    expect(violations).toHaveLength(1)
++    expect(violations[0]).toMatchObject({ job: 'quoted-job', resource: 'actions', method: 'cancelWorkflowRun' })
++  })
++
++  it('job 级 permissions 头带行尾注释(permissions: {} # token intentionally empty)不再被忽略、不再借用 workflow 级权限', () => {
++    const text = [
++      'permissions:',
++      '  actions: write',
++      'jobs:',
++      '  x:',
++      '    permissions: {} # token intentionally empty',
++      '    steps:',
++      '      - script: |',
++      '          await github.rest.actions.cancelWorkflowRun({})',
++    ].join('\n')
++    const violations = checkWorkflowText('fixture.yml', text)
++    expect(violations).toHaveLength(1)
++    expect(violations[0]).toMatchObject({ job: 'x', resource: 'actions' })
++  })
++
++  it('job 级多行 flow-map permissions(`permissions: {` 单独收尾)不再被忽略', () => {
++    const text = [
++      'permissions:',
++      '  actions: write',
++      'jobs:',
++      '  x:',
++      '    permissions: {',
++      '      actions: none',
++      '    }',
++      '    steps:',
++      '      - script: |',
++      '          await github.rest.actions.cancelWorkflowRun({})',
++    ].join('\n')
++    const violations = checkWorkflowText('fixture.yml', text)
++    expect(violations).toHaveLength(1)
++    expect(violations[0]).toMatchObject({ job: 'x', resource: 'actions' })
++  })
++
++  it('job 级 YAML 锚点/别名(permissions: &no-token {} / permissions: *no-token)不再被忽略', () => {
++    const text = [
++      'permissions:',
++      '  actions: write',
++      'jobs:',
++      '  a:',
++      '    permissions: &no-token {}',
++      '    steps:',
++      '      - script: |',
++      '          await github.rest.actions.cancelWorkflowRun({})',
++      '  b:',
++      '    permissions: *no-token',
++      '    steps:',
++      '      - script: |',
++      '          await github.rest.actions.cancelWorkflowRun({})',
++    ].join('\n')
++    const violations = checkWorkflowText('fixture.yml', text)
++    expect(violations).toHaveLength(2)
++    expect(violations.map((v) => v.job).sort()).toEqual(['a', 'b'])
++  })
++})
++
++describe('missingScopesForCall 对 unparsed permissions 块与未知方法的处理(SC3/SC4)', () => {
++  it('permissions 块 unparsed 时,任何被覆盖的调用都判违规(fail-closed,不借用更宽权限,也不误报具体缺哪个 scope)', () => {
++    const v = missingScopesForCall({ resource: 'checks', method: 'listForRef' }, 'unparsed')
++    expect(v).toHaveLength(1)
++    expect(v[0]).toMatch(/无法解析/)
++  })
++
++  it('covered resource 上的未知方法 fail-closed 报告映射缺失,不默认放行(即使声明 write-all)', () => {
++    const v1 = missingScopesForCall({ resource: 'actions', method: 'someBrandNewMethod' }, new Map([['actions', 'write']]))
++    expect(v1).toHaveLength(1)
++    expect(v1[0]).toMatch(/缺少已知的 scope 映射|unmapped/)
++    const v2 = missingScopesForCall({ resource: 'actions', method: 'someBrandNewMethod' }, 'write-all')
++    expect(v2).toHaveLength(1)
++  })
++})
++
++describe('resolveDeclaredLevel', () => {
++  it('read-all / write-all 对任意 scope 返回对应 level', () => {
++    expect(resolveDeclaredLevel('read-all', 'contents')).toBe('read')
++    expect(resolveDeclaredLevel('write-all', 'issues')).toBe('write')
++  })
++
++  it('Map 命中返回声明值,未命中返回 none', () => {
++    const m = new Map([['contents', 'read']])
++    expect(resolveDeclaredLevel(m, 'contents')).toBe('read')
++    expect(resolveDeclaredLevel(m, 'actions')).toBe('none')
++  })
++
++  it('null / 非 Map 输入返回 none(fail-closed,不假设有权限)', () => {
++    expect(resolveDeclaredLevel(null, 'contents')).toBe('none')
++  })
++})
++
++describe('findRestCalls', () => {
++  it('识别直接调用与 paginate 形式,跳过纯注释行', () => {
++    const lines = [
++      "const a = await github.rest.repos.getContent({ owner, repo });",
++      "// github.rest.issues.create 示例见文档,注释行不应被计入",
++      "# github.rest.checks.listForRef 的 YAML 注释同样跳过",
++      "const b = await github.paginate(github.rest.checks.listForRef, { owner, repo });",
++    ]
++    const calls = findRestCalls(lines)
++    expect(calls).toEqual([
++      { line: 0, resource: 'repos', method: 'getContent' },
++      { line: 3, resource: 'checks', method: 'listForRef' },
++    ])
++  })
++
++  it('一行内多个调用都被识别', () => {
++    const lines = ['x(github.rest.issues.create, github.rest.issues.update)']
++    expect(findRestCalls(lines)).toHaveLength(2)
++  })
++
++  it('SC3(codex-adversarial W2R3-CODEX-F4):bracket 方法名(github.rest.actions[\'cancelWorkflowRun\'])被识别为等价调用', () => {
++    const lines = ["await github.rest.actions['cancelWorkflowRun']({ owner, repo, run_id });"]
++    expect(findRestCalls(lines)).toEqual([{ line: 0, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('SC3:bracket 方法名支持双引号', () => {
++    const lines = ['await github.rest.actions["cancelWorkflowRun"]({});']
++    expect(findRestCalls(lines)).toEqual([{ line: 0, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('SC3:跨行点号(github.rest.actions 换行后 .cancelWorkflowRun(...))被识别', () => {
++    const lines = [
++      'await github.rest.actions',
++      '  .cancelWorkflowRun({ owner, repo, run_id });',
++    ]
++    expect(findRestCalls(lines)).toEqual([{ line: 0, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('SC3:跨行点号中间夹注释行仍能找到紧邻的下一条实质内容行', () => {
++    const lines = [
++      'await github.rest.actions',
++      '  // 取消这次 run',
++      '  .cancelWorkflowRun({ owner, repo, run_id });',
++    ]
++    expect(findRestCalls(lines)).toEqual([{ line: 0, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('SC3:解构起别名(const { actions } = github.rest)后 alias.method(...) 被识别为 actions.method', () => {
++    const lines = [
++      'const { actions } = github.rest;',
++      'await actions.cancelWorkflowRun({ owner, repo, run_id });',
++    ]
++    const calls = findRestCalls(lines)
++    expect(calls).toEqual([{ line: 1, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('SC3:解构别名 + bracket 方法名组合(alias[\'method\'])同样被识别', () => {
++    const lines = [
++      'const { actions } = github.rest;',
++      "await actions['cancelWorkflowRun']({});",
++    ]
++    expect(findRestCalls(lines)).toEqual([{ line: 1, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('SC3:解构别名 + 跨行点号组合同样被识别', () => {
++    const lines = [
++      'const { actions } = github.rest;',
++      'await actions',
++      '  .cancelWorkflowRun({});',
++    ]
++    expect(findRestCalls(lines)).toEqual([{ line: 1, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('SC3:解构重命名(resource: localName)也能正确映射回原 resource', () => {
++    const lines = [
++      'const { actions: acts } = github.rest;',
++      'await acts.cancelWorkflowRun({});',
++    ]
++    expect(findRestCalls(lines)).toEqual([{ line: 1, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('SC3:端到端 —— checkWorkflowText 对三类等价语法各自算出恰当的违规(与直写点号同结论)', () => {
++    const withDirect = checkWorkflowText('f.yml', [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      '          await github.rest.actions.cancelWorkflowRun({})',
++    ].join('\n'))
++    expect(withDirect).toHaveLength(1)
++
++    const withBracket = checkWorkflowText('f.yml', [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      "          await github.rest.actions['cancelWorkflowRun']({})",
++    ].join('\n'))
++    expect(withBracket).toHaveLength(1)
++    expect(withBracket[0]).toMatchObject({ resource: 'actions', method: 'cancelWorkflowRun' })
++
++    const withDestructure = checkWorkflowText('f.yml', [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      '          const { actions } = github.rest;',
++      '          await actions.cancelWorkflowRun({})',
++    ].join('\n'))
++    expect(withDestructure).toHaveLength(1)
++    expect(withDestructure[0]).toMatchObject({ resource: 'actions', method: 'cancelWorkflowRun' })
++  })
++})
++
++// ── 三审 R2 新增等价语法识别(D1 裁决吸收 claude-adversarial W2R4-A1 的 B1-B6 与
++// codex-adversarial W2R3-R2-CODEX-F2 的 6 个探针,去重后逐条建回归)。 ──────────
++describe('findRestCalls 对三审 R2 新增等价语法的识别(D1 吸收 W2R4-A1 / W2R3-R2-CODEX-F2)', () => {
++  it('W2R4-A1 B1:多行解构(`const {\\n  actions,\\n} = github.rest;`)被识别为别名,此前只按单行匹配零信号绕过', () => {
++    const lines = [
++      'const {',
++      '  actions,',
++      '} = github.rest;',
++      'await actions.cancelWorkflowRun({ owner, repo, run_id });',
++    ]
++    expect(findRestCalls(lines)).toEqual([{ line: 3, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('W2R4-A1 B2:尾随点号跨行(本行以 `resource.` 收尾,下一行是不带前导点的裸方法名)被识别', () => {
++    const lines = [
++      'await github.rest.actions.',
++      '  cancelWorkflowRun({ owner, repo, run_id });',
++    ]
++    expect(findRestCalls(lines)).toEqual([{ line: 0, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('W2R4-A1 B3:字面量 bracket 取 resource(`github.rest[\'actions\'].method`)被识别', () => {
++    const lines = ["await github.rest['actions'].cancelWorkflowRun({ owner, repo, run_id });"]
++    expect(findRestCalls(lines)).toEqual([{ line: 0, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('W2R4-A1 B3 变体:resource 与 method 都用 bracket(`github.rest[\'actions\'][\'method\']`)同样被识别', () => {
++    const lines = ["await github.rest['actions']['cancelWorkflowRun']({});"]
++    expect(findRestCalls(lines)).toEqual([{ line: 0, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('W2R4-A1 B5(已披露局限,本轮补齐):整对象别名(`const gh = github.rest;`)后 gh.resource.method 被识别', () => {
++    const lines = [
++      'const gh = github.rest;',
++      'await gh.actions.cancelWorkflowRun({ owner, repo, run_id });',
++    ]
++    expect(findRestCalls(lines)).toEqual([{ line: 1, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('W2R4-A1 B6(已披露局限,本轮补齐):optional chaining(`github.rest?.actions?.method`)被识别', () => {
++    const lines = ['await github.rest?.actions?.cancelWorkflowRun({ owner, repo, run_id });']
++    expect(findRestCalls(lines)).toEqual([{ line: 0, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('codex-adversarial W2R3-R2-CODEX-F2「变量间接」:`const api = github.rest.actions;` 后 api.method 被识别', () => {
++    const lines = [
++      'const api = github.rest.actions;',
++      'await api.cancelWorkflowRun({ owner, repo, run_id });',
++    ]
++    expect(findRestCalls(lines)).toEqual([{ line: 1, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('codex-adversarial W2R3-R2-CODEX-F2「模板字符串方法名」:静态模板字符串(无插值)bracket 方法名被识别', () => {
++    const lines = ['await github.rest.actions[`cancelWorkflowRun`]({ owner, repo, run_id });']
++    expect(findRestCalls(lines)).toEqual([{ line: 0, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('codex-adversarial 已知边界「方法本身被解构」:`const { cancelWorkflowRun } = github.rest.actions` 直接记一次调用', () => {
++    const lines = [
++      'const { cancelWorkflowRun } = github.rest.actions;',
++      'await cancelWorkflowRun({ owner, repo, run_id });',
++    ]
++    expect(findRestCalls(lines)).toEqual([{ line: 0, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('方法解构支持从已知 resource 别名再解构一层(`const { actions } = github.rest;` 后 `const { cancelWorkflowRun } = actions;`)', () => {
++    const lines = [
++      'const { actions } = github.rest;',
++      'const { cancelWorkflowRun } = actions;',
++    ]
++    expect(findRestCalls(lines)).toEqual([{ line: 1, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('方法解构支持重命名(`const { cancelWorkflowRun: cwr } = github.rest.actions`),记录的是原属性名而非本地别名', () => {
++    const lines = [
++      'const { cancelWorkflowRun: cwr } = github.rest.actions;',
++      'await cwr({ owner, repo, run_id });',
++    ]
++    expect(findRestCalls(lines)).toEqual([{ line: 0, resource: 'actions', method: 'cancelWorkflowRun' }])
++  })
++
++  it('端到端:checkWorkflowText 对多行解构 / 尾随点号跨行 / bracket resource 三种新增等价语法算出与直写点号相同的违规', () => {
++    const withMultilineDestructure = checkWorkflowText('f.yml', [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      '          const {',
++      '            actions,',
++      '          } = github.rest;',
++      '          await actions.cancelWorkflowRun({})',
++    ].join('\n'))
++    expect(withMultilineDestructure).toHaveLength(1)
++    expect(withMultilineDestructure[0]).toMatchObject({ resource: 'actions', method: 'cancelWorkflowRun' })
++
++    const withBracketResource = checkWorkflowText('f.yml', [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      "          await github.rest['actions'].cancelWorkflowRun({})",
++    ].join('\n'))
++    expect(withBracketResource).toHaveLength(1)
++    expect(withBracketResource[0]).toMatchObject({ resource: 'actions', method: 'cancelWorkflowRun' })
++  })
++})
++
++// ── D1 fail-closed 兜底(claude-adversarial W2R4-A1 / codex-adversarial
++// W2R3-R2-CODEX-F2「Reflect.get」与「参数透传」两个探针):不再逐个语法打补丁,
++// 而是"消费掉全部已知形态后,残留的 github.rest/别名引用一律标记该行 unparsed"。
++// findUnresolvedRestReferences 返回这些行号(0-based)。 ─────────────────────────
++describe('findUnresolvedRestReferences(D1 fail-closed 兜底:引用证据存在但解析不出具体调用)', () => {
++  it('Reflect.get 直接取 github.rest.<resource> 时被标记为 unparsed(不是零信号假绿)', () => {
++    const lines = [
++      "const fn = Reflect.get(github.rest.actions, 'cancelWorkflowRun');",
++      'await fn.call(null, { owner, repo, run_id });',
++    ]
++    expect(findRestCalls(lines)).toEqual([])
++    expect(findUnresolvedRestReferences(lines)).toEqual([0])
++  })
++
++  it('Reflect.get 取一个已知 resource 别名时同样被标记为 unparsed', () => {
++    const lines = [
++      'const { actions } = github.rest;',
++      "const fn = Reflect.get(actions, 'cancelWorkflowRun');",
++    ]
++    expect(findRestCalls(lines)).toEqual([])
++    expect(findUnresolvedRestReferences(lines)).toEqual([1])
++  })
++
++  it('参数透传(把 github.rest.<resource> 整体递给别的函数)被标记为 unparsed', () => {
++    const lines = ["await invokeMethod(github.rest.actions, 'cancelWorkflowRun');"]
++    expect(findRestCalls(lines)).toEqual([])
++    expect(findUnresolvedRestReferences(lines)).toEqual([0])
++  })
++
++  it('参数透传一个已知 resource 别名同样被标记为 unparsed', () => {
++    const lines = [
++      'const { actions } = github.rest;',
++      "await invokeMethod(actions, 'cancelWorkflowRun');",
++    ]
++    expect(findRestCalls(lines)).toEqual([])
++    expect(findUnresolvedRestReferences(lines)).toEqual([1])
++  })
++
++  it('真正插值拼接的计算 bracket key(模板字符串带 ${...})不被误判为静态方法名,标记为 unparsed', () => {
++    const lines = ['await github.rest.actions[`cancel${suffix}`]({ owner, repo, run_id });']
++    expect(findRestCalls(lines)).toEqual([])
++    expect(findUnresolvedRestReferences(lines)).toEqual([0])
++  })
++
++  it('端到端:checkWorkflowText 把 unparsed 引用转成 resource/method 均为 null 的 fail-closed 违规,且绑定到正确的 job(三审 R3 复核盲审 claude-adversarial W2R6-C1:此前误落进 consume-before-verify 顺序修复的 describe 块,挪回本 D1 语义所属的位置)', () => {
++    const text = [
++      'permissions:',
++      '  actions: write', // 故意给最宽权限,证明"不管声明多宽都判违规"(不猜测)
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      "          const fn = Reflect.get(github.rest.actions, 'cancelWorkflowRun');",
++    ].join('\n')
++    const violations = checkWorkflowText('f.yml', text)
++    expect(violations).toHaveLength(1)
++    expect(violations[0]).toMatchObject({ resource: null, method: null, job: 'x' })
++    expect(violations[0].anyOf[0]).toMatch(/解析不出具体的/)
++  })
++
++  it('回归(曾在实现中出现的假红):别名名字撞上 permissions 块里同名的 scope 键(如 actions)不会被误判为残留引用 —— 现在靠域分离(checkWorkflowText 按 script: 块切片)而不是字符位置代理达成,直接对 findUnresolvedRestReferences 喂 YAML+JS 混合文本已不是这层职责(见 findScriptBlocks 说明),该函数是纯 JS 分析器,域分离在 checkWorkflowText 完成', () => {
++    const lines = [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      '          const { actions } = github.rest;',
++      '          await actions.cancelWorkflowRun({})',
++    ]
++    const violations = checkWorkflowText('f.yml', lines.join('\n'))
++    expect(violations).toHaveLength(1)
++    expect(violations[0]).toMatchObject({ resource: 'actions', method: 'cancelWorkflowRun' })
++  })
++})
++
++// ── 域分离与词法感知回归(三审 R3 复核盲审第 6 轮结构性收口):取代此前"两侧贴
++// `-`/`/` 排除 + 行首 YAML key 精确识别"这套字符位置代理 —— 该代理在两个方向
++// 都有反例,已用真实 main-health.yml 与最小 fixture 构造实测复现:
++//   ① claude-adversarial W2R6-A1(假红):行首豁免只覆盖了行首这一种 YAML key
++//     位置,单行 flow-map(`permissions: { actions: read }`,本 PR 自己新支持
++//     的一等写法)与序列项键位(`- actions: read`)都不在行首,撞上别名名字时
++//     被误判为残留引用。
++//   ② codex-adversarial W2R3-R4-CODEX-F1(假绿,可执行的权限绕过):`两侧贴
++//     -//` 这个代理把注释起始的 `/` 也当成了词边界信号,`acts/* 注释 */.method()`
++//     两头落空 —— 直接调用识别因为注释隔断了贴邻匹配,残留扫描又被误豁免。
++//   ③ claude-adversarial W2R6-G1(假绿):行首豁免会把"别名恰好独占一行、冒号
++//     紧贴"的三元/switch 变体也误豁免(`acts` 换行写在 `?`/`case` 之后)。
++// 改法是域分离(findScriptBlocks 只在 `script:` block scalar 区间内扫描,YAML
++// 结构 —— permissions 块、uses: 值、序列项键等 —— 天然不在扫描面,①的两个
++// 反例从根上消失,不需要再猜"这是不是 YAML key")+ 词法感知(tokenizeJsLines
++// 剥离注释、隔离字符串/正则字面量,②的反例靠"注释整段删除、token 重新贴邻"
++// 解决,不再需要"两侧贴什么字符"这类代理)+ 单纯的 `\b` word-boundary 残留匹配
++// (不再有任何行位置豁免,③的反例从根上消失)。 ───────────────────────────────
++describe('域分离与词法感知回归(W2R6-A1 假红 / W2R3-R4-CODEX-F1 假绿 / W2R6-G1 假绿)', () => {
++  it('①W2R6-A1 假红复现 1:单行 flow-map permissions(本 PR 自己新支持的一等写法)撞上别名 actions,域分离后 0 违规', () => {
++    const text = [
++      'jobs:',
++      '  x:',
++      '    permissions: { actions: read }',
++      '    steps:',
++      '      - script: |',
++      '          const { actions } = github.rest;',
++      '          await actions.listJobsForWorkflowRunAttempt({})',
++    ].join('\n')
++    expect(checkWorkflowText('f.yml', text)).toEqual([])
++  })
++
++  it('①W2R6-A1 假红复现 2:域外的 YAML 序列项键位(`- actions: read`)撞上别名 actions,不产生 D1 残留引用违规', () => {
++    const text = [
++      'unrelated-list:',
++      '  - actions: read',
++      'permissions:',
++      '  actions: write',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      '          const { actions } = github.rest;',
++      '          await actions.listJobsForWorkflowRunAttempt({})',
++    ].join('\n')
++    // `unrelated-list:` 不是本文件识别的任何结构(不是 permissions:/jobs:/
++    // script:),纯粹用来复现"序列项键位"这一 YAML 形态本身;workflow 级
++    // permissions 已声明 actions:write(覆盖 job x 需要的 read),整份文本应
++    // 0 违规 —— 域外那一行的"- actions:"绝不该额外产生任何 D1 违规。
++    expect(checkWorkflowText('f.yml', text)).toEqual([])
++  })
++
++  it('①对照组 A:多行 flow-map(键在行首)撞上别名 actions,同样 0 违规(域分离前后行为不变)', () => {
++    const text = [
++      'jobs:',
++      '  x:',
++      '    permissions: {',
++      '      actions: read',
++      '    }',
++      '    steps:',
++      '      - script: |',
++      '          const { actions } = github.rest;',
++      '          await actions.listJobsForWorkflowRunAttempt({})',
++    ].join('\n')
++    expect(checkWorkflowText('f.yml', text)).toEqual([])
++  })
++
++  it('①对照组 B:block 形式 permissions 撞上别名 actions,同样 0 违规(域分离前后行为不变)', () => {
++    const text = [
++      'jobs:',
++      '  x:',
++      '    permissions:',
++      '      actions: read',
++      '    steps:',
++      '      - script: |',
++      '          const { actions } = github.rest;',
++      '          await actions.listJobsForWorkflowRunAttempt({})',
++    ].join('\n')
++    expect(checkWorkflowText('f.yml', text)).toEqual([])
++  })
++
++  it('①对照组 C:别名改名不撞名(acts)时同样 0 违规 —— 域分离不依赖别名是否撞上 YAML 常见词', () => {
++    const text = [
++      'jobs:',
++      '  x:',
++      '    permissions: { actions: read }',
++      '    steps:',
++      '      - script: |',
++      '          const { actions: acts } = github.rest;',
++      '          await acts.listJobsForWorkflowRunAttempt({})',
++    ].join('\n')
++    expect(checkWorkflowText('f.yml', text)).toEqual([])
++  })
++
++  it('②W2R3-R4-CODEX-F1 假绿复现(块注释):`acts/* 注释 */.cancelWorkflowRun()` 剥离注释后重新贴邻,精确识别为 actions:write 调用,job 仅 actions:read 时产出违规(此前是可执行的权限绕过,零信号)', () => {
++    const text = [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      '          const { actions: acts } = github.rest;',
++      '          await acts/* lexical trivia */.cancelWorkflowRun({ owner, repo, run_id });',
++    ].join('\n')
++    const violations = checkWorkflowText('f.yml', text)
++    expect(violations.length).toBeGreaterThan(0)
++    expect(violations[0]).toMatchObject({ resource: 'actions', method: 'cancelWorkflowRun' })
++  })
++
++  it('②同一失效面(跨行块注释):`acts` 与 `.cancelWorkflowRun()` 被一段跨两行的块注释隔开,仍精确识别(块注释合法跨行,靠既有的跨行点号逻辑在剥离后的文本上接上)', () => {
++    const text = [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      '          const { actions: acts } = github.rest;',
++      '          await acts/* 跨行',
++      '          注释 */.cancelWorkflowRun({ owner, repo, run_id });',
++    ].join('\n')
++    const violations = checkWorkflowText('f.yml', text)
++    expect(violations.length).toBeGreaterThan(0)
++    expect(violations[0]).toMatchObject({ resource: 'actions', method: 'cancelWorkflowRun' })
++  })
++
++  it('②同一失效面(行注释跨行调用):`acts` 与 `.cancelWorkflowRun()` 被一条行注释隔在两行,仍精确识别(既有跨行点号逻辑,W2R4-A1 B2 的行为在剥离注释后不受影响)', () => {
++    const text = [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      '          const { actions: acts } = github.rest;',
++      '          await acts // 取消这次 run',
++      '            .cancelWorkflowRun({ owner, repo, run_id });',
++    ].join('\n')
++    const violations = checkWorkflowText('f.yml', text)
++    expect(violations.length).toBeGreaterThan(0)
++    expect(violations[0]).toMatchObject({ resource: 'actions', method: 'cancelWorkflowRun' })
++  })
++
++  it('正常调用仍被精确识别,不因为去掉位置代理而退化成一律 unparsed(点号形式)', () => {
++    const text = [
++      'permissions:',
++      '  actions: write',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      '          const { actions: acts } = github.rest;',
++      '          await acts.cancelWorkflowRun({});',
++    ].join('\n')
++    expect(checkWorkflowText('f.yml', text)).toEqual([])
++  })
++
++  it('正常调用仍被精确识别,不因为去掉位置代理而退化成一律 unparsed(bracket/计算成员形式 acts[m])', () => {
++    const text = [
++      'permissions:',
++      '  actions: write',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      "          const { actions: acts } = github.rest;",
++      "          await acts['cancelWorkflowRun']({});",
++    ].join('\n')
++    expect(checkWorkflowText('f.yml', text)).toEqual([])
++  })
++
++  it('假红修复:别名名字出现在 YAML `uses:` 值位(如 actions/checkout@sha)不被误判为残留引用 —— 通过 checkWorkflowText 验证域分离(此前直接喂 findUnresolvedRestReferences 混合文本的写法已过时,见 D1 describe 块说明)', () => {
++    const text = [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - name: checkout',
++      '        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1',
++      '      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0',
++      '        with:',
++      '          script: |',
++      '            const { actions } = github.rest;',
++      '            const jobs = await github.paginate(actions.listJobsForWorkflowRunAttempt, {});',
++    ].join('\n')
++    expect(checkWorkflowText('f.yml', text)).toEqual([])
++  })
++
++  it('假红修复:别名名字出现在字符串字面量内部的复合词里(如 \'github-actions[bot]\')不被误判为残留引用(字符串掩码,不是位置代理)', () => {
++    const lines = [
++      'const { actions } = github.rest;',
++      'await actions.listJobsForWorkflowRunAttempt({});',
++      "const isOurs = i.user && i.user.login === 'github-actions[bot]';",
++    ]
++    expect(findUnresolvedRestReferences(lines)).toEqual([])
++  })
++
++  it('假绿修复:三元表达式里紧跟冒号的别名引用(cond ? acts : null)不再被豁免,产出 unparsed 而非零信号', () => {
++    const lines = [
++      'const { actions: acts } = github.rest;',
++      'const cond = true;',
++      'const api = cond ? acts : null;',
++      'await api.cancelWorkflowRun({});',
++    ]
++    expect(findRestCalls(lines)).toEqual([])
++    expect(findUnresolvedRestReferences(lines)).not.toEqual([])
++  })
++
++  it('假绿修复:switch/case 里紧跟冒号的别名引用(case acts:)不再被豁免,产出 unparsed 而非零信号', () => {
++    // 故意只留 `case acts:` 这一处引用(不额外掺 `.method()` 调用),确保断言真的
++    // 在测"紧跟冒号"这一具体位置,不会被同一 fixture 里另一处不贴冒号的引用
++    // 顺带命中而失去区分力(该另一处在旧代码下本就会被抓到,不能证明这条修复)。
++    const lines = [
++      'const { actions: acts } = github.rest;',
++      'const k = 1;',
++      'switch (k) {',
++      '  case acts:',
++      '    break;',
++      '}',
++    ]
++    expect(findRestCalls(lines)).toEqual([])
++    expect(findUnresolvedRestReferences(lines)).not.toEqual([])
++  })
++
++  it('①W2R6-G1 同源:三元表达式的别名恰好独占一行、冒号紧贴(旧"行首豁免"启发式的具体反例)仍产出 unparsed 而非零信号', () => {
++    const lines = [
++      'const { actions: acts } = github.rest;',
++      'const cond = true;',
++      'const api = cond ?',
++      '  acts:',
++      '  null;',
++      'await api.cancelWorkflowRun({});',
++    ]
++    expect(findRestCalls(lines)).toEqual([])
++    expect(findUnresolvedRestReferences(lines)).not.toEqual([])
++  })
++
++  it('端到端:真实 main-health.yml 等价重写(插入 `const { actions } = github.rest` 别名)后,仓内全部 workflow 仍 0 假红', () => {
++    const original = readFileSync(join(process.cwd(), '.github', 'workflows', 'main-health.yml'), 'utf8')
++    const mutated = original.replace(
++      "const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {",
++      "const { actions } = github.rest;\n                const jobs = await github.paginate(actions.listJobsForWorkflowRunAttempt, {",
++    )
++    expect(mutated).not.toBe(original)
++    const violations = checkWorkflowText('main-health.yml', mutated)
++    // 语义零变化的等价重写,不应因为 `actions` 撞上 `uses: actions/...` 或
++    // `'github-actions[bot]'` 而产生假红。
++    expect(violations).toEqual([])
++  })
++})
++
++describe('destructureRe / methodDestructureRe 的 consume-before-verify 顺序修复(codex-adversarial W2R3-R3-CODEX-F1 / claude-adversarial W2R5-A2)', () => {
++  it('computed resource destructuring(`const { [resource]: api } = github.rest`)不再被无条件 consume,产出 unparsed 而非零信号', () => {
++    const lines = [
++      "const resource = 'actions';",
++      'const { [resource]: api } = github.rest;',
++      'await api.cancelWorkflowRun({});',
++    ]
++    expect(findRestCalls(lines)).toEqual([])
++    expect(findUnresolvedRestReferences(lines)).not.toEqual([])
++  })
++
++  it('defaulted method destructuring(`const { cancelWorkflowRun = fallback } = github.rest.actions`)不再被无条件 consume,产出 unparsed 而非零信号', () => {
++    const lines = [
++      'const fallback = () => {};',
++      'const { cancelWorkflowRun = fallback } = github.rest.actions;',
++      'await cancelWorkflowRun({});',
++    ]
++    expect(findRestCalls(lines)).toEqual([])
++    expect(findUnresolvedRestReferences(lines)).not.toEqual([])
++  })
++
++  it('解构默认值里嵌 Reflect.get 间接取值(`const { a = Reflect.get(github.rest.actions, ...) } = github.rest`)不再被无条件 consume', () => {
++    const lines = [
++      "const { a = Reflect.get(github.rest.actions, 'cancelWorkflowRun') } = github.rest;",
++      'await a({});',
++    ]
++    expect(findRestCalls(lines)).toEqual([])
++    expect(findUnresolvedRestReferences(lines)).not.toEqual([])
++  })
++
++  it('端到端:两个 actionlint-valid 的 destructuring 反例在 job 仅 actions:read 时,仍能产出 fail-closed 违规(而不是静默放行 actions:write 级调用)', () => {
++    const computedResource = checkWorkflowText('f.yml', [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      "          const resource = 'actions';",
++      '          const { [resource]: api } = github.rest;',
++      '          await api.cancelWorkflowRun({})',
++    ].join('\n'))
++    expect(computedResource.length).toBeGreaterThan(0)
++
++    const defaultedMethod = checkWorkflowText('f.yml', [
++      'permissions:',
++      '  actions: read',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      '          const fallback = () => {}',
++      '          const { cancelWorkflowRun = fallback } = github.rest.actions',
++      '          await cancelWorkflowRun({})',
++    ].join('\n'))
++    expect(defaultedMethod.length).toBeGreaterThan(0)
++  })
++
++  it('正常解构(全部成员合法)仍照常 consume 且不产生多余的 unparsed 违规(不因本轮修复引入回归)', () => {
++    const text = [
++      'permissions:',
++      '  actions: write',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      '          const { actions } = github.rest;',
++      '          await actions.cancelWorkflowRun({})',
++    ].join('\n')
++    expect(checkWorkflowText('f.yml', text)).toEqual([])
++  })
++})
++
++describe('missingScopesForCall(SCOPE_RULES 覆盖)', () => {
++  const perms = (obj) => new Map(Object.entries(obj))
++
++  it('repos.getContent 需要 contents:read,repos.getBranch 不在覆盖范围(方法白名单)', () => {
++    expect(missingScopesForCall({ resource: 'repos', method: 'getContent' }, perms({}))).toEqual(['contents:read'])
++    expect(missingScopesForCall({ resource: 'repos', method: 'getContent' }, perms({ contents: 'read' }))).toEqual([])
++    expect(missingScopesForCall({ resource: 'repos', method: 'getBranch' }, perms({}))).toEqual([])
++  })
++
++  it('checks.* 与 actions.* 需要各自 read scope,write 亦满足(write ⊇ read)', () => {
++    expect(missingScopesForCall({ resource: 'checks', method: 'listForRef' }, perms({}))).toEqual(['checks:read'])
++    expect(missingScopesForCall({ resource: 'checks', method: 'listForRef' }, perms({ checks: 'write' }))).toEqual([])
++    expect(missingScopesForCall({ resource: 'actions', method: 'listJobsForWorkflowRunAttempt' }, perms({ actions: 'read' }))).toEqual([])
++  })
++
++  it('issues 的读方法需 read,写方法(create/update/*Comment 等)需 write', () => {
++    expect(missingScopesForCall({ resource: 'issues', method: 'listForRepo' }, perms({ issues: 'read' }))).toEqual([])
++    expect(missingScopesForCall({ resource: 'issues', method: 'createComment' }, perms({ issues: 'read' })))
++      .toEqual(['issues:write', 'pull-requests:write'])
++    expect(missingScopesForCall({ resource: 'issues', method: 'createComment' }, perms({ issues: 'write' }))).toEqual([])
++  })
++
++  it('issues.* 二选一等价:pull-requests:write 同样满足写方法需求(GitHub 官方文档等价关系)', () => {
++    expect(missingScopesForCall({ resource: 'issues', method: 'createComment' }, perms({ 'pull-requests': 'write' }))).toEqual([])
++    expect(missingScopesForCall({ resource: 'issues', method: 'listComments' }, perms({ 'pull-requests': 'write' }))).toEqual([])
++  })
++
++  it('none 显式声明与未声明同等无效', () => {
++    expect(missingScopesForCall({ resource: 'checks', method: 'listForRef' }, perms({ checks: 'none' }))).toEqual(['checks:read'])
++  })
++
++  it('不在 SCOPE_RULES 覆盖范围内的 resource(如 git、pulls)不产生违规', () => {
++    expect(missingScopesForCall({ resource: 'git', method: 'updateRef' }, perms({}))).toEqual([])
++    expect(missingScopesForCall({ resource: 'pulls', method: 'get' }, perms({}))).toEqual([])
++  })
++
++  it('SC3:actions.cancelWorkflowRun 需要 actions:write,actions:read 不满足(W2R2-CODEX-F3 反例 —— 此前对 actions.* 一律判 read,写方法被静默漏报)', () => {
++    expect(missingScopesForCall({ resource: 'actions', method: 'cancelWorkflowRun' }, perms({ actions: 'read' })))
++      .toEqual(['actions:write'])
++    expect(missingScopesForCall({ resource: 'actions', method: 'cancelWorkflowRun' }, perms({ actions: 'write' })))
++      .toEqual([])
++  })
++
++  it('SC3:checks.create / checks.update 需要 checks:write,checks:read 不满足(W2R2-CODEX-F3 反例)', () => {
++    expect(missingScopesForCall({ resource: 'checks', method: 'create' }, perms({ checks: 'read' })))
++      .toEqual(['checks:write'])
++    expect(missingScopesForCall({ resource: 'checks', method: 'update' }, perms({ checks: 'read' })))
++      .toEqual(['checks:write'])
++    expect(missingScopesForCall({ resource: 'checks', method: 'create' }, perms({ checks: 'write' })))
++      .toEqual([])
++  })
++
++  it('SC3:issues.create 仅 issues:write 满足,pull-requests:write 不满足(W2R2-CODEX-F3 / W2R1-A1 反例 —— issue 本体端点非 comment 系,官方文档只列 Issues 权限)', () => {
++    expect(missingScopesForCall({ resource: 'issues', method: 'create' }, perms({ 'pull-requests': 'write' })))
++      .toEqual(['issues:write'])
++    expect(missingScopesForCall({ resource: 'issues', method: 'create' }, perms({ issues: 'write' })))
++      .toEqual([])
++  })
++
++  it('SC3:issues.update / addLabels / lock 等本体端点同样只认 issues scope,不接受 pull-requests 顶替', () => {
++    expect(missingScopesForCall({ resource: 'issues', method: 'update' }, perms({ 'pull-requests': 'write' })))
++      .toEqual(['issues:write'])
++    expect(missingScopesForCall({ resource: 'issues', method: 'addLabels' }, perms({ 'pull-requests': 'write' })))
++      .toEqual(['issues:write'])
++    expect(missingScopesForCall({ resource: 'issues', method: 'lock' }, perms({ 'pull-requests': 'write' })))
++      .toEqual(['issues:write'])
++  })
++
++  it('SC3:issues.getLabel / listForRepo 等本体读端点同样只认 issues scope', () => {
++    expect(missingScopesForCall({ resource: 'issues', method: 'getLabel' }, perms({ 'pull-requests': 'write' })))
++      .toEqual(['issues:read'])
++    expect(missingScopesForCall({ resource: 'issues', method: 'getLabel' }, perms({ issues: 'read' })))
++      .toEqual([])
++  })
++})
++
++describe('parseWorkflow(job 边界与 job 级 permissions 完全替换 workflow 级)', () => {
++  const fixture = [
++    'name: fixture',
++    'on:',
++    '  push:',
++    'permissions:',
++    '  contents: read',
++    'jobs:',
++    '  a:',
++    '    name: A',
++    '    runs-on: ubuntu-latest',
++    '    steps:',
++    '      - run: echo a',
++    '  b:',
++    '    permissions:',
++    '      actions: read',
++    '    runs-on: ubuntu-latest',
++    '  c:',
++    '    runs-on: ubuntu-latest',
++  ].join('\n')
++
++  it('job a 无自己的 permissions → 继承 workflow 级', () => {
++    const { jobs, topPermissions } = parseWorkflow(fixture)
++    const a = jobs.find((j) => j.name === 'a')
++    expect(a.permissions).toBe(topPermissions)
++    expect(a.permissions.get('contents')).toBe('read')
++  })
++
++  it('job b 声明了自己的 permissions → 完全替换,不含 workflow 级的 contents', () => {
++    const { jobs } = parseWorkflow(fixture)
++    const b = jobs.find((j) => j.name === 'b')
++    expect(b.permissions.get('actions')).toBe('read')
++    expect(b.permissions.has('contents')).toBe(false) // 替换而非合并
++  })
++
++  it('job c 无 permissions → 继承 workflow 级', () => {
++    const { jobs, topPermissions } = parseWorkflow(fixture)
++    const c = jobs.find((j) => j.name === 'c')
++    expect(c.permissions).toBe(topPermissions)
++  })
++
++  it('job 边界正确(a 的调用不会被误记到 b)', () => {
++    const { jobs } = parseWorkflow(fixture)
++    const a = jobs.find((j) => j.name === 'a')
++    const b = jobs.find((j) => j.name === 'b')
++    expect(a.endLine).toBeLessThan(b.startLine)
++  })
++})
++
++describe('checkWorkflowText(集成:文本级违规检测)', () => {
++  it('job 级 permissions 缺 scope 时,即使 workflow 级有该 scope 也判违规(完全替换语义)', () => {
++    const text = [
++      'permissions:',
++      '  contents: read',
++      '  checks: read',
++      'jobs:',
++      '  x:',
++      '    permissions:',
++      '      contents: read',
++      '    steps:',
++      '      - script: |',
++      '          await github.rest.checks.listForRef({})',
++    ].join('\n')
++    const violations = checkWorkflowText('fixture.yml', text)
++    expect(violations).toHaveLength(1)
++    expect(violations[0]).toMatchObject({ resource: 'checks', method: 'listForRef', job: 'x' })
++  })
++
++  it('workflow 级已声明齐全时无违规', () => {
++    const text = [
++      'permissions:',
++      '  contents: read',
++      '  checks: read',
++      '  actions: read',
++      '  issues: write',
++      'jobs:',
++      '  x:',
++      '    steps:',
++      '      - script: |',
++      '          const f = await github.rest.repos.getContent({})',
++      '          const c = await github.rest.checks.listForRef({})',
++      '          const j = await github.rest.actions.listJobsForWorkflowRunAttempt({})',
++      '          await github.rest.issues.createComment({})',
++    ].join('\n')
++    expect(checkWorkflowText('fixture.yml', text)).toHaveLength(0)
++  })
++})
++
++// ── 集成断言:对真实仓内 workflow 跑通(SC2 验收) ─────────────────────────────
++describe('SC2 验收:仓内全部 workflow 文件', () => {
++  const WORKFLOWS_DIR = join(process.cwd(), '.github', 'workflows')
++  const files = readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith('.yml') || f.endsWith('.yaml'))
++
++  it('至少能发现本仓的 9 个 workflow 文件(防止 fixture 目录被搬空导致测试假绿)', () => {
++    expect(files.length).toBeGreaterThanOrEqual(9)
++  })
++
++  it('对仓内全部 workflow 跑通:github.rest.* 调用均在声明的 permissions 范围内', () => {
++    const violations = files.flatMap((f) => {
++      const p = join(WORKFLOWS_DIR, f)
++      return checkWorkflowText(p, readFileSync(p, 'utf8'))
++    })
++    expect(violations).toEqual([])
++  })
++
++  it('main-health.yml 缺任一新增 scope(contents/checks/actions/issues)时非零', () => {
++    const original = readFileSync(join(WORKFLOWS_DIR, 'main-health.yml'), 'utf8')
++    for (const scope of ['contents', 'checks', 'actions', 'issues']) {
++      const mutated = original
++        .split('\n')
++        .filter((l) => !new RegExp(`^  ${scope}: `).test(l))
++        .join('\n')
++      const violations = checkWorkflowText('main-health.yml', mutated)
++      expect(violations.length, `移除 ${scope} 后应产生违规`).toBeGreaterThan(0)
++    }
++  })
++
++  // claude-adversarial W2R4-C1:此前集成层只断言 violations 是否非空/为空,从不校验
++  // anyOf 内容 —— "正确解析后判违规"(anyOf 是 scope:level)与"fail-closed 的
++  // unparsed"(anyOf 是"无法解析"诊断文案)在这一层不可区分,只有单元层的
++  // missingScopesForCall 测试兜住了这个区分(见上方 SC3/SC4 describe 块)。对真实
++  // main-health.yml 的顶层 permissions 块注入"子行缩进不一致"这个会让
++  // parsePermissionsBlock 判 'unparsed' 的 mutation,断言产生的违规确实带"无法解析"
++  // 诊断而不是常规缺 scope 提示 —— 集成层现在也能分清这两类诊断,不再只看数量。
++  it('真实 main-health.yml 的顶层 permissions 子行缩进不一致时,产生的违规带"无法解析"诊断(集成层现在能区分两种诊断类型,W2R4-C1)', () => {
++    const original = readFileSync(join(WORKFLOWS_DIR, 'main-health.yml'), 'utf8')
++    const lines = original.split('\n')
++    const permIdx = lines.findIndex((l) => /^permissions:\s*$/.test(l))
++    expect(permIdx).toBeGreaterThanOrEqual(0)
++    const scopeLineIdx = permIdx + 1
++    expect(/^\s*[a-zA-Z-]+:\s*(read|write|none)\s*$/.test(lines[scopeLineIdx])).toBe(true)
++    lines[scopeLineIdx] = ` ${lines[scopeLineIdx]}` // 多缩进 1 空格,制造子行缩进不一致
++    const mutated = lines.join('\n')
++    const violations = checkWorkflowText('main-health.yml', mutated)
++    expect(violations.length).toBeGreaterThan(0)
++    expect(violations.some((v) => v.anyOf.some((a) => /无法解析/.test(a)))).toBe(true)
++    // 两种诊断类型互不覆盖:这条 mutation 只应产生"权限块无法解析"类违规,不应混入
++    // "该行引用了 github.rest 覆盖面"这个不同成因的诊断(D1 fail-closed 兜底)。
++    expect(violations.every((v) => !v.anyOf.some((a) => a.includes('该行引用了')))).toBe(true)
++  })
++})
++
++// ── CLI main()(claude-adversarial 附注 / lead 裁决 F8):`check-workflow-permissions.mjs`
++// 的 CLI 入口此前未接进任何 workflow / hook / npm script(git grep 全 0 命中),也从未被
++// 任何测试调用过——它长得像一层独立安全网,但从没被跑过、也没人知道它是不是还能跑。
++// 真正交付保护的是 test:unit 里上面 SC2 那条整仓集成断言(经 ci.yml 的 lint + tsc +
++// unit + logging required check 挡合并),不是这个 CLI。lead 裁决二选一:让 CLI 被
++// 测过,或删掉它;选择留着并在这里补测,理由是它对本地排查(`node
++// scripts/ci/check-workflow-permissions.mjs`)仍有用,删掉会让人手工排查时少一个
++// 现成工具——成本(subprocess 测试,~3 次 node 启动)明显低于收益。三条用例覆盖它
++// 全部三种退出码路径(0 正常 / 1 有违规 / 2 目录扫描失败),而不只是"能跑不报错"。
++describe('CLI main()(F8:此前是未接线、未被测过的死代码;补测让它至少被跑过一次,不新增独立 CI gate)', () => {
++  const scriptPath = join(process.cwd(), 'scripts', 'ci', 'check-workflow-permissions.mjs')
++
++  it('对仓内真实 workflow 跑,exit 0 且输出 OK 汇总', () => {
++    const stdout = execFileSync('node', [scriptPath], { cwd: process.cwd(), encoding: 'utf8' })
++    expect(stdout).toMatch(/\[workflow-permissions\] OK:\d+ 个 workflow 文件的 github\.rest\.\* 调用均在声明的 permissions 范围内/)
++  })
++
++  it('对声明 scope 不足的 fixture 跑,exit 1 且 stderr 逐条列出 file:line 与所需 scope', () => {
++    const tmp = mkdtempSync(join(tmpdir(), 'wf-perm-cli-'))
++    try {
++      mkdirSync(join(tmp, '.github', 'workflows'), { recursive: true })
++      writeFileSync(
++        join(tmp, '.github', 'workflows', 'bad.yml'),
++        [
++          'permissions:',
++          '  contents: read',
++          'jobs:',
++          '  x:',
++          '    steps:',
++          '      - script: |',
++          '          await github.rest.actions.cancelWorkflowRun({})',
++        ].join('\n'),
++      )
++      let error
++      try {
++        execFileSync('node', [scriptPath], { cwd: tmp, encoding: 'utf8' })
++      } catch (e) {
++        error = e
++      }
++      expect(error).toBeTruthy()
++      expect(error.status).toBe(1)
++      expect(error.stderr).toMatch(/发现 1 处 permissions 缺口/)
++      expect(error.stderr).toMatch(/actions:write/)
++    } finally {
++      rmSync(tmp, { recursive: true, force: true })
++    }
++  })
++
++  it('workflows 目录一个文件都没有时 exit 2(fail-closed,不静默判过)', () => {
++    const tmp = mkdtempSync(join(tmpdir(), 'wf-perm-cli-empty-'))
++    try {
++      mkdirSync(join(tmp, '.github', 'workflows'), { recursive: true })
++      let error
++      try {
++        execFileSync('node', [scriptPath], { cwd: tmp, encoding: 'utf8' })
++      } catch (e) {
++        error = e
++      }
++      expect(error).toBeTruthy()
++      expect(error.status).toBe(2)
++      expect(error.stderr).toMatch(/未找到任何 workflow 文件/)
++    } finally {
++      rmSync(tmp, { recursive: true, force: true })
++    }
++  })
++})
+diff --git a/scripts/ci/main-health-logic.mjs b/scripts/ci/main-health-logic.mjs
+new file mode 100644
+index 00000000..6608c14e
+--- /dev/null
++++ b/scripts/ci/main-health-logic.mjs
+@@ -0,0 +1,210 @@
++// scripts/ci/main-health-logic.mjs — .github/workflows/main-health.yml 判据逻辑的
++// 单一实现源(PR-w2 二轮盲审 W2R2-C1 / CODEX-F2 / UP2-S4 共识:此前是"手工镜像",
++// 测试只测本文件,生产执行的是 workflow 内联脚本里另一份手写实现,两者靠注释
++// 承诺同步 —— 反向变异证明"改坏内联脚本,71 条用例不会有一条变红",镜像漂移面
++// 是零信号)。
++//
++// main-health.yml 现在新增一次只读 checkout(persist-credentials:false,见该文件
++// 文件头「已知边界」②的更新说明),github-script 步骤里用
++// `await import(process.env.GITHUB_WORKSPACE + '/scripts/ci/main-health-logic.mjs')`
++// 直接消费本文件 —— 测试断言的就是生产实际执行的函数,不再是一份需要手工保持
++// 同步的复述。workflow 侧只保留必须发起网络调用的部分(github.rest.* 调用本身、
++// 以及把调用结果喂给下方纯函数),纯判据/解析/格式化逻辑一律从本文件导入,
++// 不再本地重复定义。
++//
++// 覆盖范围:分档(SC2.1 强/弱措辞 + greenref 强制阻断)、关闭判据(SC2.2 真重跑 /
++// 空转 / 重名 step 聚合,W2R2-CODEX-F1 撤回后为 fail-closed:仅 conclusion===success
++// 才算已重跑,全部 skipped 不再视为已解决)、REQUIRED_ON_MAIN 解析(锚定唯一活动
++// 声明 + exact 语法校验,不接受"部分解析成功")、marker 形状校验、attempt 绑定
++// 参数、可见 label 转义(按完整 code span pair 边界截断)、空转评论节流(扫最近
++// N 条评论)。均为纯函数,不发起任何网络调用。
++
++// ── SC3:greenref 推进器角色不看名单命中,固定阻断 ───────────────────────────
++export const GREEN_REF_WORKFLOW_NAME = 'deploy green ref'
++
++// requiredOnMain: string[] | null(null = 名单未知,读取/解析失败)
++// blockingNotGreen: string[] | null(null = 未查询或查询失败;[] = 全绿)
++export function selectBlockingMode({ wfName, requiredOnMain, blockingNotGreen }) {
++  if (wfName === GREEN_REF_WORKFLOW_NAME) return 'greenref-forced'
++  if (requiredOnMain === null || blockingNotGreen === null) return 'strong'
++  return blockingNotGreen.length > 0 ? 'strong' : 'weak'
++}
++
++export function isBlockingMode(mode) {
++  return mode !== 'weak'
++}
++
++// ── SC5:REQUIRED_ON_MAIN 解析,锚定行首(允许前导空白)非注释的唯一 const 声明 ──
++const REQUIRED_ON_MAIN_OPEN_RE = /^[ \t]*const\s+REQUIRED_ON_MAIN\s*=\s*\[/gm
++const REQUIRED_ON_MAIN_STRING_RE = /'((?:[^'\\]|\\.)*)'/g
++
++// 从 `[` 的下一个字符开始扫描,跳过合法单引号字符串内部的字符(含转义 \' 与 ]),
++// 找到与之匹配的顶层 `]`。避免"字符串里出现 ] 就把数组截断"(W2R2-CODEX-F5)。
++// 返回该 `]` 的下标;未找到(声明不完整/缺闭合括号)返回 -1。
++function findMatchingBracket(text, openIdx) {
++  let i = openIdx + 1
++  while (i < text.length) {
++    const c = text[i]
++    if (c === ']') return i
++    if (c === "'") {
++      i += 1
++      while (i < text.length && text[i] !== "'") {
++        if (text[i] === '\\') i += 1
++        i += 1
++      }
++      i += 1
++      continue
++    }
++    i += 1
++  }
++  return -1
++}
++
++// 返回 { ok: true, names: string[] } | { ok: false, reason: string }
++export function parseRequiredOnMain(ymlText) {
++  const candidates = []
++  let m
++  REQUIRED_ON_MAIN_OPEN_RE.lastIndex = 0
++  while ((m = REQUIRED_ON_MAIN_OPEN_RE.exec(ymlText))) {
++    const openIdx = m.index + m[0].length - 1 // 指向声明自己的 `[`
++    const closeIdx = findMatchingBracket(ymlText, openIdx)
++    if (closeIdx === -1) continue // 声明不完整(缺闭合 ]),不算有效候选
++    candidates.push(ymlText.slice(openIdx + 1, closeIdx))
++  }
++  if (candidates.length !== 1) {
++    return {
++      ok: false,
++      reason: candidates.length === 0 ? 'no-declaration-found' : 'multiple-candidates',
++    }
++  }
++  const body = candidates[0]
++  const names = [...body.matchAll(REQUIRED_ON_MAIN_STRING_RE)].map((x) => x[1].replace(/\\'/g, "'"))
++  // exact 消费校验(W2R2-CODEX-F5):把全部识别出的单引号字符串从正文里挖掉,残留部分
++  // 必须只剩空白与逗号 —— 任何未消费的 token(双引号字符串、裸标识符、表达式等)
++  // 都说明数组正文没被完全理解,不能只返回认出来的那一部分名字("部分解析成功"
++  // 会让真正阻断的红灯被静默漏掉)。
++  const residual = body.replace(REQUIRED_ON_MAIN_STRING_RE, '')
++  if (!/^[\s,]*$/.test(residual)) {
++    return { ok: false, reason: 'unrecognized-token' }
++  }
++  if (!names.length) return { ok: false, reason: 'empty-list' }
++  return { ok: true, names }
++}
++
++// ── SC6①②:同名 step 聚合 + 失败路径专属 step 判据 ──────────────────────────
++// jobs: actions.listJobsForWorkflowRunAttempt 返回的 data.jobs 形状(数组,每项含
++// name 与 steps[]),返回 Map<string(JSON [jobName,stepName]), Set<conclusion>>。
++export function aggregateStepConclusions(jobs) {
++  const map = new Map()
++  for (const j of jobs || []) {
++    for (const s of j.steps || []) {
++      const key = JSON.stringify([j.name, s.name])
++      if (!map.has(key)) map.set(key, new Set())
++      map.get(key).add(s.conclusion)
++    }
++  }
++  return map
++}
++
++export const FAILED_STEP_CONCLUSIONS = new Set(['failure', 'timed_out'])
++
++// 从聚合后的 stepMap 提取"本次失败的 (job, step) 对"列表(RED 侧记录用)。
++// 同名 step 任一为 failure/timed_out 即计入(不再是后者覆盖前者)。
++export function computeFailedSteps(stepMap) {
++  const failed = []
++  for (const [key, conclusions] of stepMap) {
++    if ([...conclusions].some((c) => FAILED_STEP_CONCLUSIONS.has(c))) failed.push(JSON.parse(key))
++  }
++  return failed
++}
++
++// 某个 (job, step) key 在本次 run 是否可判定为"已解决"(fail-closed,W2R2-CODEX-F1
++// 撤回了此前"全部 skipped 视为已解决"的宽松判据):
++//   - 无记录(本次没跑到)→ 未解决;
++//   - 本次仍含失败 → 未解决;
++//   - 任一记录为 success → 已解决(真的重跑并通过);
++//   - 其余情况(含"全部 skipped")→ 未解决。
++// 为什么撤回:API 只给出 step 的 conclusion,不提供"这个 step 是否只在 if:failure()
++// 失败路径下才运行"的语义。之前的版本把任意"全部 skipped"都当"失败路径这次没
++// 触发",但同一个 skipped 也可能是"这次本该重跑却被跳过"(例如 Daily Changelog
++// 当天无新 PR、publish 步骤被跳过、run 仍以 success 收场)——这正是本 PR 最初要拦的
++// 空转假关闭,若不区分会原样复现。已知局限(不藏):只在失败路径运行的 step(如
++// `if: failure()`)在绿灯 run 里必然是 skipped,现在会被判"未重跑",Issue 会保持
++// open、需要人工关闭一次 —— 宁可偶尔需要人工关,不可假关闭。
++export function isStepResolved(conclusions) {
++  if (!conclusions || conclusions.size === 0) return false
++  if ([...conclusions].some((c) => FAILED_STEP_CONCLUSIONS.has(c))) return false
++  return conclusions.has('success')
++}
++
++// 空转判据:recordedPairs 中仍未解决的那些,即"视为空转、不关闭"的依据。
++export function computeNotRerunPairs(recordedPairs, currentStepMap) {
++  return recordedPairs.filter((pair) => !isStepResolved(currentStepMap.get(JSON.stringify(pair))))
++}
++
++// ── SC8:failedsteps marker 解码后的形状校验 ────────────────────────────────
++// parsed: JSON.parse 的结果(任意值)。合法形状 = 二维字符串数组(每项长度 2)。
++export function validateFailedStepsShape(parsed) {
++  const isPair = (p) => Array.isArray(p) && p.length === 2 && typeof p[0] === 'string' && typeof p[1] === 'string'
++  if (!Array.isArray(parsed) || !parsed.every(isPair)) return null
++  return parsed
++}
++
++// ── SC4:attempt 绑定 —— 从触发事件自己的 payload 派生查询参数,不依赖全局/共享状态 ──
++// run: workflow_run payload(或其子集 { id, run_attempt })。
++export function buildJobsForAttemptParams(run) {
++  return { run_id: run.id, attempt_number: run.run_attempt || 1 }
++}
++
++// ── SC9:可见 step 名转义 + 截断 ────────────────────────────────────────────
++export function escapeStepLabelPart(s) {
++  return String(s)
++    .replace(/`/g, 'ˋ')
++    .replace(/[\r\n]+/g, ' ')
++    .replace(/@/g, '@' + String.fromCharCode(0x200b))
++    .slice(0, 80)
++}
++
++export const MAX_STEP_LABEL_TOTAL = 400
++
++// 按完整 pair 边界累加到预算,超出时在上一个完整 pair 处截断(upstream-preview
++// UP2-S2:此前按字符 slice 整串,可能停在某个 `...` code span 中间,留下奇数个
++// 反引号,CommonMark 下未配对反引号不会闭合 span,后半段渲染错乱)。
++export function buildStepLabel(pairs) {
++  const parts = pairs.map((p) => '`' + escapeStepLabelPart(p[0]) + ' / ' + escapeStepLabelPart(p[1]) + '`')
++  let out = ''
++  for (const part of parts) {
++    const next = out ? out + '、' + part : part
++    if (next.length > MAX_STEP_LABEL_TOTAL) return out + '…(其余步骤名已截断)'
++    out = next
++  }
++  return out
++}
++
++// ── SC10:空转说明评论节流 ──────────────────────────────────────────────────
++export const IDLE_COMMENT_PREFIX = '⏭ 本次 success 未重跑上次失败的步骤'
++
++export function isLastCommentIdleNotice(lastCommentBody) {
++  return typeof lastCommentBody === 'string' && lastCommentBody.startsWith(IDLE_COMMENT_PREFIX)
++}
++
++// upstream-preview UP2-S3:只看最后一条评论会被任何插入的其它评论(RED"又一次
++// 失败"、陈旧 RED/GREEN 的留痕评论)清空节流状态 —— 这些插入在本 workflow 自己
++// 的行为里就会发生(红灯期间"空转→失败→空转→失败"交替)。改为扫最近 N 条,
++// 命中任一条即视为"已节流",不再逐次重复追加。
++export const IDLE_COMMENT_LOOKBACK = 20
++
++export function hasRecentIdleNotice(commentBodies, lookback = IDLE_COMMENT_LOOKBACK) {
++  return commentBodies.slice(-lookback).some((b) => isLastCommentIdleNotice(b))
++}
++
++// ── run 执行序(number, attempt)陈旧性比较,跨 workflow identity 不比较 ────────
++// recorded/seq: { wfId, number, attempt }。返回 { stale: boolean, identityMismatch: boolean }。
++export function compareRunSeq(recorded, seq) {
++  if (!recorded) return { stale: false, identityMismatch: false }
++  if (recorded.wfId !== seq.wfId) return { stale: false, identityMismatch: true }
++  const stale = seq.number !== recorded.number
++    ? seq.number < recorded.number
++    : seq.attempt < recorded.attempt
++  return { stale, identityMismatch: false }
++}
+diff --git a/scripts/ci/main-health-logic.test.mjs b/scripts/ci/main-health-logic.test.mjs
+new file mode 100644
+index 00000000..ce771033
+--- /dev/null
++++ b/scripts/ci/main-health-logic.test.mjs
+@@ -0,0 +1,514 @@
++// scripts/ci/main-health-logic.test.mjs — main-health.yml 判据逻辑的可执行回归。
++// PR-w2 二轮盲审后(2026-08-02):本文件不再测一份"手工镜像" —— main-health.yml
++// 新增 checkout 后直接 `await import()` 本文件(见文件头),下面的断言测的就是
++// 生产实际执行的函数,不是需要另外保持同步的复述。
++// 覆盖:真重跑关闭 / 空转不关(fail-closed,全部 skipped 不视为已解决)/ greenref
++// 强措辞 / attempt 不串味 / 注释旧名单不被取 / REQUIRED_ON_MAIN exact 语法校验 /
++// 畸形 marker 不抛异常 / 重名 step 聚合,以及 label 转义(按 pair 边界截断)与
++// 空转评论节流(扫最近 N 条评论)判据。
++import { describe, expect, it } from 'vitest'
++import { existsSync, readFileSync, readdirSync } from 'node:fs'
++import { join } from 'node:path'
++import * as mainHealthLogicModule from './main-health-logic.mjs'
++import {
++  GREEN_REF_WORKFLOW_NAME,
++  FAILED_STEP_CONCLUSIONS,
++  MAX_STEP_LABEL_TOTAL,
++  IDLE_COMMENT_PREFIX,
++  aggregateStepConclusions,
++  buildJobsForAttemptParams,
++  buildStepLabel,
++  compareRunSeq,
++  computeFailedSteps,
++  computeNotRerunPairs,
++  escapeStepLabelPart,
++  hasRecentIdleNotice,
++  isBlockingMode,
++  isLastCommentIdleNotice,
++  isStepResolved,
++  parseRequiredOnMain,
++  selectBlockingMode,
++  validateFailedStepsShape,
++} from './main-health-logic.mjs'
++
++describe('selectBlockingMode / isBlockingMode(SC3:greenref 强措辞)', () => {
++  it('deploy green ref 自身失败:强制 greenref-forced,即使阻断名单全绿(blockingNotGreen 为空)也阻断', () => {
++    const mode = selectBlockingMode({
++      wfName: GREEN_REF_WORKFLOW_NAME,
++      requiredOnMain: ['a', 'b'],
++      blockingNotGreen: [], // 全绿 —— 若走通用判据会被判"不阻断",这正是要修的方向性回归
++    })
++    expect(mode).toBe('greenref-forced')
++    expect(isBlockingMode(mode)).toBe(true)
++  })
++
++  it('普通 workflow 命中阻断名单:strong', () => {
++    const mode = selectBlockingMode({ wfName: 'CI', requiredOnMain: ['a'], blockingNotGreen: ['a'] })
++    expect(mode).toBe('strong')
++    expect(isBlockingMode(mode)).toBe(true)
++  })
++
++  it('普通 workflow 名单全绿:weak(不阻断)', () => {
++    const mode = selectBlockingMode({ wfName: 'Daily Changelog', requiredOnMain: ['a'], blockingNotGreen: [] })
++    expect(mode).toBe('weak')
++    expect(isBlockingMode(mode)).toBe(false)
++  })
++
++  it('名单读取失败(requiredOnMain=null)fail-closed 按阻断处理', () => {
++    const mode = selectBlockingMode({ wfName: 'CI', requiredOnMain: null, blockingNotGreen: null })
++    expect(mode).toBe('strong')
++  })
++
++  it('SC8②:requiredOnMain 非 null 但 blockingNotGreen===null(checks 查询抛错路径,与上一条区分—只咬这一个子句)→ strong', () => {
++    const mode = selectBlockingMode({ wfName: 'CI', requiredOnMain: ['a'], blockingNotGreen: null })
++    expect(mode).toBe('strong')
++  })
++})
++
++describe('GREEN_REF_WORKFLOW_NAME 与 deploy-green-ref.yml 实际 name 绑定(SC9,W2R2-C2)', () => {
++  it('常量值与 deploy-green-ref.yml 的 name: 字段逐字相同 —— 上游改名而漏改这个常量会直接变红,不是零信号漂移', () => {
++    const yml = readFileSync(join(process.cwd(), '.github/workflows/deploy-green-ref.yml'), 'utf8')
++    const m = /^name:\s*(.+?)\s*$/m.exec(yml)
++    expect(m).not.toBeNull()
++    expect(GREEN_REF_WORKFLOW_NAME).toBe(m[1])
++  })
++})
++
++describe('parseRequiredOnMain(SC5:注释旧名单不被取)', () => {
++  it('正常声明:解析出全部名字', () => {
++    const yml = [
++      '            const REQUIRED_ON_MAIN = [',
++      "              'lint + tsc + unit + logging',",
++      "              'secret scan (gitleaks)',",
++      '            ];',
++    ].join('\n')
++    const r = parseRequiredOnMain(yml)
++    expect(r.ok).toBe(true)
++    expect(r.names).toEqual(['lint + tsc + unit + logging', 'secret scan (gitleaks)'])
++  })
++
++  it('真声明前有注释示例:只取真声明,不误取注释里的旧值', () => {
++    const yml = [
++      "            // 例:REQUIRED_ON_MAIN = ['old-stale-entry']",
++      '            const REQUIRED_ON_MAIN = [',
++      "              'real-check',",
++      '            ];',
++    ].join('\n')
++    const r = parseRequiredOnMain(yml)
++    expect(r.ok).toBe(true)
++    expect(r.names).toEqual(['real-check'])
++  })
++
++  it('YAML 风格 # 注释里的旧声明同样不被取', () => {
++    const yml = [
++      "            # 历史遗留:REQUIRED_ON_MAIN = ['dead']",
++      '            const REQUIRED_ON_MAIN = [',
++      "              'live',",
++      '            ];',
++    ].join('\n')
++    expect(parseRequiredOnMain(yml)).toEqual({ ok: true, names: ['live'] })
++  })
++
++  it('SC8①:真实威胁形状 —— 真声明前是"被注释掉的声明"本体(不是纯文字示例),锚定版只取真声明;去锚定版会把它当第二候选而 multiple-candidates(W2R2-C1 反例)', () => {
++    const yml = [
++      "// const REQUIRED_ON_MAIN = ['stale'];",
++      'const REQUIRED_ON_MAIN = [',
++      "  'live',",
++      '];',
++    ].join('\n')
++    expect(parseRequiredOnMain(yml)).toEqual({ ok: true, names: ['live'] })
++  })
++
++  it('零个候选(声明不存在或格式大改)→ ok:false,reason 可辨识', () => {
++    const r = parseRequiredOnMain('const OTHER_NAME = ["x"];')
++    expect(r).toEqual({ ok: false, reason: 'no-declaration-found' })
++  })
++
++  it('多个候选(两处行首活动声明)→ ok:false,不猜哪个是真的', () => {
++    const yml = [
++      "const REQUIRED_ON_MAIN = ['a'];",
++      "const REQUIRED_ON_MAIN = ['b'];",
++    ].join('\n')
++    expect(parseRequiredOnMain(yml)).toEqual({ ok: false, reason: 'multiple-candidates' })
++  })
++
++  it('声明匹配但数组为空 → ok:false(empty-list)', () => {
++    expect(parseRequiredOnMain('const REQUIRED_ON_MAIN = [];')).toEqual({ ok: false, reason: 'empty-list' })
++  })
++
++  it('转义单引号被正确还原', () => {
++    const r = parseRequiredOnMain("const REQUIRED_ON_MAIN = ['it\\'s ok'];")
++    expect(r).toEqual({ ok: true, names: ["it's ok"] })
++  })
++
++  it('SC5:混合引号(单引号+双引号混用)→ ok:false,不能只返回认出的那一部分名字(W2R2-CODEX-F5 反例)', () => {
++    const r = parseRequiredOnMain('const REQUIRED_ON_MAIN = [\'a\', "b"];')
++    expect(r).toEqual({ ok: false, reason: 'unrecognized-token' })
++  })
++
++  it('SC5:数组正文里混入裸标识符/表达式 → ok:false,不当作"部分解析成功"', () => {
++    const r = parseRequiredOnMain("const REQUIRED_ON_MAIN = ['a', someVar];")
++    expect(r).toEqual({ ok: false, reason: 'unrecognized-token' })
++  })
++
++  it('SC5:名字本身包含 ] 字符不会被误判为数组提前结束(此前的非贪婪正则会在字符串内第一个 ] 处截断)', () => {
++    const r = parseRequiredOnMain("const REQUIRED_ON_MAIN = ['weird]name', 'b'];")
++    expect(r).toEqual({ ok: true, names: ['weird]name', 'b'] })
++  })
++
++  it('SC5:声明缺闭合括号(不完整声明)→ ok:false,不会读到不完整的数组内容', () => {
++    const r = parseRequiredOnMain("const REQUIRED_ON_MAIN = ['a', 'b'")
++    expect(r.ok).toBe(false)
++  })
++
++  it('SC7:对真实 deploy-green-ref.yml 当前内容跑一次 parseRequiredOnMain —— 把"字面量形状契约"从人肉记忆变成机器核对(此前只有集成测试读 name: 字段,从未真正解析过这个数组;改坏契约(如数组内加一条注释)会在这里直接变红,而不必等到生产环境 fail-closed 退回强措辞才发现)', () => {
++    const yml = readFileSync(join(process.cwd(), '.github/workflows/deploy-green-ref.yml'), 'utf8')
++    const r = parseRequiredOnMain(yml)
++    expect(r.ok).toBe(true)
++    expect(r.names.length).toBeGreaterThan(0)
++  })
++})
++
++describe('aggregateStepConclusions + computeFailedSteps(SC6②:重名 step 聚合)', () => {
++  it('不重名时行为等同旧版:分别记录', () => {
++    const jobs = [{ name: 'build', steps: [{ name: 'lint', conclusion: 'success' }, { name: 'test', conclusion: 'failure' }] }]
++    const map = aggregateStepConclusions(jobs)
++    expect(computeFailedSteps(map)).toEqual([['build', 'test']])
++  })
++
++  it('同名 step 两次出现,一次 failure 一次 success → 聚合后任一失败即计入(红侧"任一失败即记")', () => {
++    const jobs = [{
++      name: 'build',
++      steps: [
++        { name: 'flaky upload', conclusion: 'failure' },
++        { name: 'flaky upload', conclusion: 'success' }, // 同名重试
++      ],
++    }]
++    const map = aggregateStepConclusions(jobs)
++    expect(computeFailedSteps(map)).toEqual([['build', 'flaky upload']])
++  })
++
++  it('同名 step 两次出现且都成功 → 不计入 failedSteps', () => {
++    const jobs = [{ name: 'build', steps: [{ name: 'x', conclusion: 'success' }, { name: 'x', conclusion: 'success' }] }]
++    expect(computeFailedSteps(aggregateStepConclusions(jobs))).toEqual([])
++  })
++
++  it('跨多个同名 job 也会聚合到同一 key(JSON [jobName, stepName] 作为 key)', () => {
++    const jobs = [
++      { name: 'build', steps: [{ name: 'x', conclusion: 'timed_out' }] },
++      { name: 'build', steps: [{ name: 'x', conclusion: 'success' }] },
++    ]
++    expect(computeFailedSteps(aggregateStepConclusions(jobs))).toEqual([['build', 'x']])
++  })
++})
++
++describe('isStepResolved + computeNotRerunPairs(真重跑关闭 / 空转不关,fail-closed)', () => {
++  it('真重跑关闭:本次记录为 success → 已解决,不再是"未重跑"', () => {
++    const currentStepMap = new Map([[JSON.stringify(['build', 'test']), new Set(['success'])]])
++    expect(computeNotRerunPairs([['build', 'test']], currentStepMap)).toEqual([])
++  })
++
++  it('空转不关:本次没有任何记录(step 未出现在 stepMap 里)→ 仍判"未重跑",不关闭', () => {
++    const currentStepMap = new Map() // 空转:这次 run 完全没有该 job/step 的记录
++    expect(computeNotRerunPairs([['build', 'test']], currentStepMap)).toEqual([['build', 'test']])
++  })
++
++  it('空转不关:本次记录为 skipped 但没有失败路径触发说明(单独出现)——若同一 run 有其它证据仍判失败则不视为解决', () => {
++    // 本例聚合集合同时含 skipped 与 failure(比如并行 rerun 里一次 skip 一次仍失败)
++    const currentStepMap = new Map([[JSON.stringify(['build', 'test']), new Set(['skipped', 'failure'])]])
++    expect(computeNotRerunPairs([['build', 'test']], currentStepMap)).toEqual([['build', 'test']])
++  })
++
++  it('W2R2-CODEX-F1:全部 skipped 且无失败 → 仍判"未重跑"(fail-closed 撤回了此前"失败路径专属 step"的宽松判据 —— API 不提供该语义,宽松判据会让空转假关闭原样复现)', () => {
++    const currentStepMap = new Map([[JSON.stringify(['ci', 'upload artifact on failure']), new Set(['skipped'])]])
++    expect(computeNotRerunPairs([['ci', 'upload artifact on failure']], currentStepMap)).toEqual([['ci', 'upload artifact on failure']])
++  })
++
++  it('W2R2-CODEX-F1:精确复现真实反例 —— Daily Changelog 当天无新 PR、"Rewrite changelog entries" 被跳过,后续 run 以 success 收场,该 pair 必须仍判"未重跑"(不关闭台账)', () => {
++    const recorded = [['daily-changelog', 'Rewrite changelog entries']]
++    const currentStepMap = new Map([[JSON.stringify(['daily-changelog', 'Rewrite changelog entries']), new Set(['skipped'])]])
++    expect(computeNotRerunPairs(recorded, currentStepMap)).toEqual([['daily-changelog', 'Rewrite changelog entries']])
++  })
++
++  it('isStepResolved 对 undefined/空 Set 均返回 false(保守,不误判已解决)', () => {
++    expect(isStepResolved(undefined)).toBe(false)
++    expect(isStepResolved(new Set())).toBe(false)
++  })
++
++  it('isStepResolved 对全部 skipped(无 success、无失败)返回 false', () => {
++    expect(isStepResolved(new Set(['skipped']))).toBe(false)
++    expect(isStepResolved(new Set(['skipped', 'skipped']))).toBe(false)
++  })
++
++  it('FAILED_STEP_CONCLUSIONS 恰好是 failure 与 timed_out 两项', () => {
++    expect([...FAILED_STEP_CONCLUSIONS].sort()).toEqual(['failure', 'timed_out'])
++  })
++})
++
++describe('validateFailedStepsShape(SC8:畸形 marker 不抛异常)', () => {
++  it('合法二维字符串数组原样返回', () => {
++    const v = [['job', 'step'], ['job2', 'step2']]
++    expect(validateFailedStepsShape(v)).toEqual(v)
++  })
++
++  it('空数组合法', () => {
++    expect(validateFailedStepsShape([])).toEqual([])
++  })
++
++  it('字符串(如 JSON.parse(\'"abc"\'))不抛异常,返回 null', () => {
++    expect(() => validateFailedStepsShape('abc')).not.toThrow()
++    expect(validateFailedStepsShape('abc')).toBeNull()
++  })
++
++  it('带 length 属性的对象({length:1})不抛异常,返回 null', () => {
++    expect(() => validateFailedStepsShape({ length: 1 })).not.toThrow()
++    expect(validateFailedStepsShape({ length: 1 })).toBeNull()
++  })
++
++  it('数组元素含 null 不抛异常,返回 null', () => {
++    expect(() => validateFailedStepsShape([null])).not.toThrow()
++    expect(validateFailedStepsShape([null])).toBeNull()
++  })
++
++  it('元素长度不为 2 或元素非字符串 → null', () => {
++    expect(validateFailedStepsShape([['only-one']])).toBeNull()
++    expect(validateFailedStepsShape([[1, 2]])).toBeNull()
++  })
++
++  it('null / undefined 输入不抛异常,返回 null', () => {
++    expect(() => validateFailedStepsShape(null)).not.toThrow()
++    expect(validateFailedStepsShape(null)).toBeNull()
++    expect(validateFailedStepsShape(undefined)).toBeNull()
++  })
++})
++
++describe('buildJobsForAttemptParams(SC4:attempt 不串味)', () => {
++  it('每次调用只绑定传入的那个 run 自己的 id/run_attempt,互不污染', () => {
++    const runA = { id: 111, run_attempt: 1 }
++    const runB = { id: 222, run_attempt: 3 }
++    const paramsA = buildJobsForAttemptParams(runA)
++    const paramsB = buildJobsForAttemptParams(runB)
++    expect(paramsA).toEqual({ run_id: 111, attempt_number: 1 })
++    expect(paramsB).toEqual({ run_id: 222, attempt_number: 3 })
++    // 交叉验证:A 的参数不含 B 的任何字段值,证明两次调用之间无共享/串味状态
++    expect(paramsA.run_id).not.toBe(paramsB.run_id)
++    expect(paramsA.attempt_number).not.toBe(paramsB.attempt_number)
++  })
++
++  it('run_attempt 缺失(未提供时)默认落到 1,而不是 undefined/NaN', () => {
++    expect(buildJobsForAttemptParams({ id: 1 })).toEqual({ run_id: 1, attempt_number: 1 })
++  })
++
++  it('同一 run_id 但不同 attempt 的两次事件,各自参数正确对应自己的 attempt(rerun 场景)', () => {
++    const failedAttempt = { id: 999, run_attempt: 1 }
++    const rerunAttempt = { id: 999, run_attempt: 2 }
++    expect(buildJobsForAttemptParams(failedAttempt).attempt_number).toBe(1)
++    expect(buildJobsForAttemptParams(rerunAttempt).attempt_number).toBe(2)
++  })
++})
++
++describe('escapeStepLabelPart + buildStepLabel(SC9:label 转义与截断)', () => {
++  it('反引号被替换为形近符号,不再闭合 code span', () => {
++    expect(escapeStepLabelPart('a`b`c')).not.toContain('`')
++  })
++
++  it('换行折叠为空格', () => {
++    expect(escapeStepLabelPart('line1\nline2\r\nline3')).toBe('line1 line2 line3')
++  })
++
++  it('@ 后插入零宽空格阻断 mention(转义后长度变化但可见文本不变)', () => {
++    const escaped = escapeStepLabelPart('@octocat/team')
++    expect(escaped.startsWith('@')).toBe(true)
++    expect(escaped.length).toBeGreaterThan('@octocat/team'.length)
++  })
++
++  it('单个名字超过 80 字符会被截断', () => {
++    const long = 'x'.repeat(200)
++    expect(escapeStepLabelPart(long)).toHaveLength(80)
++  })
++
++  it('buildStepLabel 对多个 pair 用、连接并包反引号', () => {
++    const label = buildStepLabel([['job1', 'step1'], ['job2', 'step2']])
++    expect(label).toBe('`job1 / step1`、`job2 / step2`')
++  })
++
++  it('buildStepLabel 累计长度超限时整体截断并追加说明', () => {
++    const pairs = Array.from({ length: 20 }, (_, i) => [`job${i}`, 'x'.repeat(30)])
++    const label = buildStepLabel(pairs)
++    expect(label.length).toBeLessThanOrEqual(MAX_STEP_LABEL_TOTAL + '…(其余步骤名已截断)'.length)
++    expect(label.endsWith('…(其余步骤名已截断)')).toBe(true)
++  })
++
++  it('SC7:截断按完整 pair 边界进行,反引号始终成对,不会在 pair 内部切断(upstream-preview UP2-S2)', () => {
++    const pairs = Array.from({ length: 20 }, (_, i) => [`job${i}`, 'x'.repeat(30)])
++    const label = buildStepLabel(pairs)
++    const withoutSuffix = label.replace('…(其余步骤名已截断)', '')
++    const backtickCount = (withoutSuffix.match(/`/g) || []).length
++    expect(backtickCount % 2).toBe(0)
++    expect(withoutSuffix === '' || withoutSuffix.endsWith('`')).toBe(true)
++  })
++
++  it('SC7:精确复现 upstream-preview UP2-S2 报告的形状 —— 三组接近 80+80 字符的 pair,此前会在第三个 code span 中间截断留下奇数个反引号', () => {
++    const pairs = [
++      ['a'.repeat(78), 'b'.repeat(78)],
++      ['c'.repeat(78), 'd'.repeat(78)],
++      ['e'.repeat(78), 'f'.repeat(78)],
++    ]
++    const label = buildStepLabel(pairs)
++    const backtickCount = (label.match(/`/g) || []).length
++    expect(backtickCount % 2).toBe(0)
++    expect(label.endsWith('…(其余步骤名已截断)')).toBe(true)
++  })
++})
++
++describe('IDLE_COMMENT_PREFIX / isLastCommentIdleNotice / hasRecentIdleNotice(SC10/SC12:空转评论节流)', () => {
++  it('以固定前缀开头的评论判定为同类空转说明', () => {
++    expect(isLastCommentIdleNotice(IDLE_COMMENT_PREFIX + '(`a / b`),视为空转,不关闭 —— url')).toBe(true)
++  })
++
++  it('其他类型的评论(如恢复通知、失败记录)不误判为空转说明', () => {
++    expect(isLastCommentIdleNotice('✅ 已恢复:`CI` @ `abcd1234`')).toBe(false)
++    expect(isLastCommentIdleNotice('🔴 又一次失败:`CI`')).toBe(false)
++  })
++
++  it('null/非字符串输入安全返回 false', () => {
++    expect(isLastCommentIdleNotice(null)).toBe(false)
++    expect(isLastCommentIdleNotice(undefined)).toBe(false)
++  })
++
++  it('SC12:hasRecentIdleNotice 不只看最后一条 —— 空转说明后插入一条"又一次失败"仍能在最近 N 条里命中(upstream-preview UP2-S3 反例:红灯期间"空转→失败→空转"交替时不应清空节流状态)', () => {
++    const bodies = [
++      IDLE_COMMENT_PREFIX + '(`a / b`),视为空转,不关闭 —— url1',
++      '🔴 又一次失败:`Daily Changelog` @ `abcd1234`(failure)—— url2',
++    ]
++    expect(hasRecentIdleNotice(bodies)).toBe(true)
++  })
++
++  it('SC12:超出 lookback 窗口的旧空转说明不再命中', () => {
++    const bodies = [IDLE_COMMENT_PREFIX + '(`a / b`),视为空转,不关闭 —— url0']
++    for (let i = 0; i < 5; i += 1) bodies.push('🔴 又一次失败:`CI` @ `sha' + i + '`(failure)—— url' + i)
++    expect(hasRecentIdleNotice(bodies, 3)).toBe(false)
++    expect(hasRecentIdleNotice(bodies, 10)).toBe(true)
++  })
++
++  it('SC12:完全没有空转说明时返回 false', () => {
++    expect(hasRecentIdleNotice(['✅ 已恢复:`CI`', '🔴 又一次失败:`CI`'])).toBe(false)
++  })
++})
++
++describe('compareRunSeq(执行序陈旧性比较,支撑 attempt 不串味的另一半;参数为 (recorded, seq) —— recorded 是 Issue 上已记录的执行序,seq 是本次事件的执行序,返回值描述"本次事件是否比已记录的更旧")', () => {
++  it('无记录(人工建 Issue)→ 不判陈旧', () => {
++    expect(compareRunSeq(null, { wfId: 1, number: 5, attempt: 1 })).toEqual({ stale: false, identityMismatch: false })
++  })
++
++  it('相同 identity,本次事件的 number 比已记录的更小 → 本次是陈旧的迟到事件', () => {
++    const r = compareRunSeq({ wfId: 1, number: 5, attempt: 1 }, { wfId: 1, number: 3, attempt: 1 })
++    expect(r).toEqual({ stale: true, identityMismatch: false })
++  })
++
++  it('相同 identity,本次事件的 number 更大 → 不陈旧(正常推进)', () => {
++    const r = compareRunSeq({ wfId: 1, number: 3, attempt: 1 }, { wfId: 1, number: 5, attempt: 1 })
++    expect(r).toEqual({ stale: false, identityMismatch: false })
++  })
++
++  it('相同 identity、同 number,本次事件的 attempt 比已记录的更小 → 陈旧(rerun 场景,attempt 不串味的关键判据)', () => {
++    const r = compareRunSeq({ wfId: 1, number: 5, attempt: 3 }, { wfId: 1, number: 5, attempt: 1 })
++    expect(r.stale).toBe(true)
++  })
++
++  it('相同 identity、同 number,本次事件的 attempt 更大 → 不陈旧', () => {
++    const r = compareRunSeq({ wfId: 1, number: 5, attempt: 1 }, { wfId: 1, number: 5, attempt: 3 })
++    expect(r.stale).toBe(false)
++  })
++
++  it('workflow identity 不同 → 不做数值比较,标记 identityMismatch', () => {
++    const r = compareRunSeq({ wfId: 1, number: 999, attempt: 1 }, { wfId: 2, number: 1, attempt: 1 })
++    expect(r).toEqual({ stale: false, identityMismatch: true })
++  })
++})
++
++// ── SC1 接线锁:main-health.yml 必须真的从本文件导入判据,不能悄悄退回"手工镜像"
++// (W2R2-C1 / CODEX-F2 / UP2-S4 的根因就是"两份实现靠注释同步") ─────────────────
++describe('main-health.yml 单一源接线(SC1)', () => {
++  const workflowText = readFileSync(join(process.cwd(), '.github/workflows/main-health.yml'), 'utf8')
++
++  it('github-script 步骤动态 import 本文件,而不是重新声明这些判据函数/常量', () => {
++    expect(workflowText).toMatch(/await import\(.*main-health-logic\.mjs['"]?\)/)
++  })
++
++  it('checkout 步骤在 github-script 步骤之前(import 需要工作目录里有仓库源码)', () => {
++    const checkoutIdx = workflowText.indexOf('actions/checkout@')
++    const scriptIdx = workflowText.indexOf('await import(')
++    expect(checkoutIdx).toBeGreaterThan(-1)
++    expect(scriptIdx).toBeGreaterThan(-1)
++    expect(checkoutIdx).toBeLessThan(scriptIdx)
++  })
++
++  // 三审返修(claude-adversarial W2R3-C1 / upstream-preview UP3-F3):上面三条断言
++  // 只证明"字符串长得像一句 import 语句",从未核对 import 的路径是否真实存在、也
++  // 从未核对解构出的符号是否真的在模块导出里 —— 是正则烟雾测试。反向变异实测两种
++  // 真实演进都能全绿通过:P8(模块被搬到别的目录,workflow 里路径字面量没跟着改)、
++  // P9(解构清单里某个符号打错成不存在的名字)。下面把"接线锁"改成对真实文件系统
++  // 与真实模块导出的核对,取代字符串形状匹配。
++
++  // 从 workflow 文本里解析出 import 的路径字面量与解构清单,两条断言共用。
++  const importPathMatch = /await import\(process\.env\.GITHUB_WORKSPACE \+ '([^']+)'\)/.exec(workflowText)
++  const destructureMatch = /const\s*\{([^}]+)\}\s*=\s*mainHealthLogic;/.exec(workflowText)
++  const destructuredNames = destructureMatch
++    ? destructureMatch[1].split(',').map((s) => s.trim()).filter(Boolean)
++    : []
++
++  // 三审 R2(upstream-preview UP3R2-F2):独立于被审文本维护的期望符号集 —— 此前
++  // `destructuredNames` 完全由 workflowText 自己的解构清单推导,构成自我举证:
++  // 只要把某个符号从解构清单里删掉,`for (const name of destructuredNames)` 遍历
++  // 就不再含它,"不再本地重新声明"这条锁同步停止守它;而"删掉解构 + 本地重声明"
++  // 恰恰是唯一能真正跑起来的镜像回退形态(同作用域既解构又重声明同名变量是
++  // SyntaxError,那些语法上活不下来的变异反而全被 M1-M5 抓到,制造"锁很强"的假象)。
++  // 唯一的下限断言 `toBeGreaterThan(0)` 也不够 —— 13 个符号删到 12 个仍然 >0,
++  // 不会变红。这里改成与固定期望集的集合比较,任意增删都会立即不相等。
++  const EXPECTED_DESTRUCTURED_NAMES = new Set([
++    'GREEN_REF_WORKFLOW_NAME',
++    'selectBlockingMode',
++    'isBlockingMode',
++    'parseRequiredOnMain',
++    'aggregateStepConclusions',
++    'computeFailedSteps',
++    'computeNotRerunPairs',
++    'validateFailedStepsShape',
++    'buildJobsForAttemptParams',
++    'buildStepLabel',
++    'IDLE_COMMENT_PREFIX',
++    'hasRecentIdleNotice',
++    'compareRunSeq',
++  ])
++
++  it('SC1 反向变异 P8:import 路径字面量必须指向真实存在的文件(此前"模块被搬到别的目录、字面量没跟着改"这一变异 0 红,现在必须变红)', () => {
++    expect(importPathMatch, '未能从 workflow 文本里解析出 import 的路径字面量').not.toBeNull()
++    const resolved = join(process.cwd(), importPathMatch[1])
++    expect(existsSync(resolved), `import 路径 "${importPathMatch[1]}" 解析到 ${resolved},该文件不存在`).toBe(true)
++  })
++
++  it('SC1 反向变异 P9:全部解构符号都必须在 main-health-logic.mjs 的真实导出集合里(此前"解构清单里某个符号打错"这一变异 0 红,现在必须变红)', () => {
++    expect(destructuredNames.length).toBeGreaterThan(0)
++    for (const name of destructuredNames) {
++      expect(name in mainHealthLogicModule, `解构符号 "${name}" 不在 main-health-logic.mjs 的真实导出集合里`).toBe(true)
++    }
++  })
++
++  it('SC:upstream-preview 三审 R2 UP3R2-F2 —— 解构清单与独立维护的期望符号集完全一致,任意增删都会变红(而不是只看数量 > 0 的近似空断言;13→12 这类"删一个符号"的真实退化,靠这条锁住)', () => {
++    expect(new Set(destructuredNames)).toEqual(EXPECTED_DESTRUCTURED_NAMES)
++  })
++
++  it('不再本地重新声明已导入的判据函数/常量(防止悄悄退回镜像;覆盖 function 声明与 const/let/var 赋值(含箭头函数)两类形态。三审 R2 UP3R2-F2 修正:遍历的是独立维护的期望符号集而不是从 workflowText 自己解析出的解构清单 —— 否则"把某符号从解构清单删掉再本地重声明"这一真实可执行的退化会让该符号从遍历对象里一起消失,这条锁反而不会去检查它;此前硬编码 5 条正则,只覆盖 function 声明形态,13 个解构符号里有 9 个完全不在名单内,且贴回箭头函数形态的原文能绕过检测(upstream-preview UP3-F3))', () => {
++    for (const name of EXPECTED_DESTRUCTURED_NAMES) {
++      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
++      // 解构语法(`const { NAME, ... } = mainHealthLogic`)里每个名字后面跟的是
++      // `,` 或 `}`,从不是 `=`,故 asAssignment 不会命中解构清单本身,不需要
++      // 额外排除自匹配。
++      const asFunctionDecl = new RegExp(`function\\s+${escaped}\\s*\\(`)
++      const asAssignment = new RegExp(`(?:const|let|var)\\s+${escaped}\\s*=`)
++      expect(workflowText, `"${name}" 疑似以 function 声明形态被重新声明(镜像回归)`).not.toMatch(asFunctionDecl)
++      expect(workflowText, `"${name}" 疑似以 const/let/var 赋值形态(含箭头函数)被重新声明(镜像回归)`).not.toMatch(asAssignment)
++    }
++  })
++})

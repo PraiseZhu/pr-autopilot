@@ -1,0 +1,1676 @@
+diff --git a/cindyplugin/ghost.json b/cindyplugin/ghost.json
+index 47358c77..c1534eea 100644
+--- a/cindyplugin/ghost.json
++++ b/cindyplugin/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.26",
++  "version": "0.9.27",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/cindyplugin/src/PluginApp.tsx b/cindyplugin/src/PluginApp.tsx
+index 27ad782e..039b649c 100644
+--- a/cindyplugin/src/PluginApp.tsx
++++ b/cindyplugin/src/PluginApp.tsx
+@@ -1,19 +1,24 @@
+ import { useCallback, useEffect, useState } from 'react'
++import { Settings } from 'lucide-react'
+ import { MivoCanvas } from '../../src/canvas/MivoCanvas'
+ import { ToastViewport } from '../../src/app/ToastViewport'
++import { CanvasSettingsPanel } from '../../src/app/settings/CanvasSettingsPanel'
+ import { MediaLightbox } from '../../src/app/MediaLightbox'
+ import { DetailsTargetGuard } from '../../src/app/DetailsTargetGuard'
+ import { isMediaRenderKind, renderKindForNode } from '../../src/model/canvasNodeRegistry'
+ import { debugLogger } from '../../src/store/debugLogStore'
+ import { useCanvasStore } from '../../src/store/canvasStore'
++import { useCanvasAppearanceStore } from '../../src/store/canvasAppearanceStore'
+ import { usePluginHydration } from './usePluginHydration'
+ import { migrateLedgerIntoDepositStore } from './agent/depositMigration'
++import { useTranslation } from 'react-i18next'
++import { t } from '../../src/i18n'
+ 
+ /**
+  * Cindy 面板形态的最小外壳:只渲染画布本体。
+  *
+  * 与 src/App.tsx 的差异是刻意的——不挂 ProjectSidebar / ChatPanel /
+- * LibraryWorkspace / SettingsPanel,也不安装 remoteDebugReporter /
++ * LibraryWorkspace / 主站 SettingsPanel,也不安装 remoteDebugReporter /
+  * consoleCapture,因此面板启动时没有任何网络请求(auth/me、debug-logs
+  * 上报、changelog 拉取都不会发生)。
+  *
+@@ -25,8 +30,10 @@ import { migrateLedgerIntoDepositStore } from './agent/depositMigration'
+  * InspectorPanel,双击时记 warn 跳过(主站才有完整详情弹窗)。
+  */
+ export function PluginApp() {
++  useTranslation()
+   const hydrated = usePluginHydration()
+   const sceneId = useCanvasStore((state) => state.sceneId)
++  const openCanvasAppearance = useCanvasAppearanceStore((state) => state.openCanvasAppearance)
+   // 打开时刻锁定目标(场景 + 节点),不跟随后续选区变化漂移。
+   // 越界关闭(agent 切场景等)由 DetailsTargetGuard 观察并回调清空。
+   const [lightboxTarget, setLightboxTarget] = useState<{ sceneId: string; nodeId: string }>()
+@@ -63,6 +70,16 @@ export function PluginApp() {
+     <main className="mivo-app project-collapsed ai-collapsed">
+       <div className="workspace">
+         <div className="work-surface">
++          <button
++            type="button"
++            className="plugin-settings-trigger"
++            aria-label={t('settings.canvas.open')}
++            title={t('settings.canvas.open')}
++            data-canvas-ui="true"
++            onClick={() => openCanvasAppearance()}
++          >
++            <Settings size={17} strokeWidth={1.9} />
++          </button>
+           <MivoCanvas key={sceneId} onOpenDetails={handleOpenDetails} />
+         </div>
+       </div>
+@@ -77,6 +94,7 @@ export function PluginApp() {
+       {lightboxTarget && lightboxTarget.sceneId === sceneId ? (
+         <MediaLightbox nodeId={lightboxTarget.nodeId} onClose={() => setLightboxTarget(undefined)} />
+       ) : null}
++      <CanvasSettingsPanel />
+       <ToastViewport />
+     </main>
+   )
+diff --git a/cindyplugin/src/__tests__/pluginCanvasSettings.test.tsx b/cindyplugin/src/__tests__/pluginCanvasSettings.test.tsx
+new file mode 100644
+index 00000000..9312a3b3
+--- /dev/null
++++ b/cindyplugin/src/__tests__/pluginCanvasSettings.test.tsx
+@@ -0,0 +1,99 @@
++// @vitest-environment happy-dom
++import { act } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++const pluginState = vi.hoisted(() => ({ hydrated: true }))
++
++vi.mock('../usePluginHydration', () => ({ usePluginHydration: () => pluginState.hydrated }))
++vi.mock('../../../src/canvas/MivoCanvas', () => ({
++  MivoCanvas: () => <div data-testid="mivo-canvas" />,
++}))
++vi.mock('../../../src/app/ToastViewport', () => ({ ToastViewport: () => null }))
++vi.mock('../../../src/app/MediaLightbox', () => ({ MediaLightbox: () => null }))
++vi.mock('../../../src/app/DetailsTargetGuard', () => ({ DetailsTargetGuard: () => null }))
++vi.mock('../agent/depositMigration', () => ({
++  migrateLedgerIntoDepositStore: vi.fn(async () => ({ ok: true, skipped: true })),
++}))
++
++const { PluginApp } = await import('../PluginApp')
++const { __resetCanvasAppearanceForTests, useCanvasAppearanceStore } = await import(
++  '../../../src/store/canvasAppearanceStore'
++)
++
++let container: HTMLDivElement
++let root: Root
++
++const click = (element: Element) =>
++  act(() => {
++    if (element instanceof HTMLElement) element.focus()
++    element.dispatchEvent(new MouseEvent('click', { bubbles: true }))
++  })
++const pointerDown = (element: Element) =>
++  act(() => element.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })))
++
++const keyDown = (element: Element, init: KeyboardEventInit) =>
++  act(() => element.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init })))
++
++describe('PluginApp canvas settings entry', () => {
++  beforeEach(() => {
++    globalThis.IS_REACT_ACT_ENVIRONMENT = true
++    __resetCanvasAppearanceForTests()
++    container = document.createElement('div')
++    document.body.appendChild(container)
++    root = createRoot(container)
++    act(() => root.render(<PluginApp />))
++  })
++
++  afterEach(() => {
++    act(() => root.unmount())
++    container.remove()
++    document.querySelector('.canvas-settings-backdrop')?.remove()
++  })
++
++  it('opens from the gear, switches pattern, and closes with Escape', () => {
++    const gear = container.querySelector('.plugin-settings-trigger') as HTMLElement
++    click(gear)
++    expect(document.querySelector('.canvas-settings-backdrop')).not.toBeNull()
++    expect(document.activeElement).toBe(document.querySelector('.canvas-settings-panel'))
++
++    const dots = Array.from(document.querySelectorAll('[role="radio"]')).find((item) =>
++      item.textContent?.includes('Dots'),
++    )!
++    click(dots)
++    expect(useCanvasAppearanceStore.getState().backgroundPattern).toBe('dots')
++
++    act(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })))
++    expect(document.querySelector('.canvas-settings-backdrop')).toBeNull()
++    expect(document.activeElement).toBe(gear)
++  })
++
++  it('wraps forward and backward Tab traversal inside the dialog', () => {
++    click(container.querySelector('.plugin-settings-trigger')!)
++    const panel = document.querySelector('.canvas-settings-panel') as HTMLElement
++    const focusables = Array.from(panel.querySelectorAll<HTMLElement>('button'))
++    const first = focusables[0]
++    const last = focusables.at(-1)!
++
++    last.focus()
++    keyDown(panel, { key: 'Tab' })
++    expect(document.activeElement).toBe(first)
++
++    first.focus()
++    keyDown(panel, { key: 'Tab', shiftKey: true })
++    expect(document.activeElement).toBe(last)
++  })
++
++  it('closes from the backdrop and close button and restores gear focus', () => {
++    const gear = container.querySelector('.plugin-settings-trigger') as HTMLElement
++    click(gear)
++    pointerDown(document.querySelector('.canvas-settings-backdrop')!)
++    expect(document.querySelector('.canvas-settings-backdrop')).toBeNull()
++    expect(document.activeElement).toBe(gear)
++
++    click(gear)
++    click(document.querySelector('.canvas-settings-panel .settings-panel-header button')!)
++    expect(document.querySelector('.canvas-settings-backdrop')).toBeNull()
++    expect(document.activeElement).toBe(gear)
++  })
++})
+diff --git a/cindyplugin/src/cindy-theme.css b/cindyplugin/src/cindy-theme.css
+index 80289968..a010ad41 100644
+--- a/cindyplugin/src/cindy-theme.css
++++ b/cindyplugin/src/cindy-theme.css
+@@ -26,11 +26,86 @@
+   --canvas: color-mix(in srgb, var(--surface, #ebe4d7) 93%, var(--text-primary, #232323) 7%);
+ }
+ 
+-/* 网格线原是写死的深灰 rgba,换成随主题文字色淡化——Dark 下自动变浅网格 */
++/* Cindy only supplies theme colors; pattern geometry stays owned by MivoCanvas. */
+ .canvas-shell {
+-  background-image:
+-    linear-gradient(color-mix(in srgb, var(--text-primary, #27302c) 7%, transparent) 1px, transparent 1px),
+-    linear-gradient(90deg, color-mix(in srgb, var(--text-primary, #27302c) 7%, transparent) 1px, transparent 1px);
++  --mivo-canvas-pattern-line-color: color-mix(in srgb, var(--text-primary, #27302c) 7%, transparent);
++  --mivo-canvas-pattern-dot-color: color-mix(in srgb, var(--text-primary, #27302c) 15%, transparent);
++}
++
++.plugin-settings-trigger {
++  position: absolute;
++  top: 14px;
++  right: 14px;
++  z-index: 70;
++  display: grid;
++  place-items: center;
++  width: 34px;
++  height: 34px;
++  padding: 0;
++  color: color-mix(in srgb, var(--text-primary, #232323) 78%, var(--surface, #fffaf0));
++  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 92%, var(--text-primary, #232323) 8%);
++  border: 1px solid color-mix(in srgb, var(--text-primary, #232323) 16%, var(--border-default, #d6d0c6));
++  border-radius: 999px;
++  box-shadow: 0 8px 22px color-mix(in srgb, var(--text-primary, #232323) 14%, transparent);
++  cursor: pointer;
++}
++
++.plugin-settings-trigger:hover {
++  color: var(--text-primary, #232323);
++  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 84%, var(--text-primary, #232323) 16%);
++}
++
++.plugin-settings-trigger:active {
++  transform: scale(0.96);
++}
++
++.canvas-settings-panel {
++  width: min(420px, calc(100vw - 32px));
++  max-height: min(480px, calc(100vh - 32px));
++  color: var(--text-secondary, #756f67);
++  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 96%, var(--text-primary, #232323) 4%);
++  border-color: color-mix(in srgb, var(--text-primary, #232323) 14%, var(--border-default, #d6d0c6));
++  box-shadow: 0 24px 64px color-mix(in srgb, var(--text-primary, #232323) 24%, transparent);
++}
++
++.canvas-settings-panel .settings-panel-header {
++  border-color: color-mix(in srgb, var(--text-primary, #232323) 10%, var(--border-default, #d6d0c6));
++}
++
++.canvas-settings-panel .settings-panel-header strong,
++.canvas-settings-panel .canvas-appearance-option-label {
++  color: var(--text-primary, #232323);
++}
++
++.canvas-settings-panel .settings-panel-header button {
++  color: var(--text-secondary, #756f67);
++}
++
++.canvas-settings-panel .settings-panel-header button:hover {
++  background: color-mix(in srgb, var(--text-primary, #232323) 8%, transparent);
++}
++
++.canvas-settings-panel .canvas-appearance-option {
++  color: var(--text-secondary, #756f67);
++  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 88%, var(--text-primary, #232323) 12%);
++  border-color: color-mix(in srgb, var(--text-primary, #232323) 14%, var(--border-default, #d6d0c6));
++}
++
++.canvas-settings-panel .canvas-appearance-option:hover {
++  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 80%, var(--text-primary, #232323) 20%);
++}
++
++.canvas-settings-panel .canvas-appearance-option.selected {
++  color: var(--text-primary, #232323);
++  border-color: var(--accent-cta-bg, #27302c);
++  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-cta-bg, #27302c) 18%, transparent);
++}
++
++.canvas-settings-panel .canvas-pattern-preview {
++  border-color: color-mix(in srgb, var(--text-primary, #232323) 12%, var(--border-default, #d6d0c6));
++  background-color: var(--canvas);
++  --mivo-canvas-pattern-preview-line-color: color-mix(in srgb, var(--text-primary, #27302c) 14%, transparent);
++  --mivo-canvas-pattern-preview-dot-color: color-mix(in srgb, var(--text-primary, #27302c) 25%, transparent);
+ }
+ 
+ /* 原 ::before 是米色高光晕染(写死的暖白/苔绿),主题化后改为中性表面提亮 */
+diff --git a/docs/design-previews/region-edit/assets/product.css b/docs/design-previews/region-edit/assets/product.css
+index 6a71af1c..71892471 100644
+--- a/docs/design-previews/region-edit/assets/product.css
++++ b/docs/design-previews/region-edit/assets/product.css
+@@ -57,6 +57,12 @@ button {
+      去掉半透明,一处改色全局生效 (2026-07-06 用户反馈)。 */
+   --panel-surface: #fffaf0;
+   --canvas: #ebe4d7;
++  /* MivoCanvas-owned pattern geometry; host themes may override colors only. */
++  --mivo-canvas-pattern-gap: 36px;
++  --mivo-canvas-pattern-line-width: 1px;
++  --mivo-canvas-pattern-dot-radius: 1px;
++  --mivo-canvas-pattern-line-color: rgba(39, 48, 44, 0.065);
++  --mivo-canvas-pattern-dot-color: rgba(39, 48, 44, 0.16);
+   --charcoal: #27302c;
+   --moss: #497466;
+   --rust: #b6572c;
+@@ -3310,9 +3316,13 @@ button:disabled {
+   cursor: default;
+   background-color: var(--canvas);
+   background-image:
+-    linear-gradient(rgba(39, 48, 44, 0.065) 1px, transparent 1px),
+-    linear-gradient(90deg, rgba(39, 48, 44, 0.065) 1px, transparent 1px);
+-  background-size: 36px 36px;
++    linear-gradient(var(--mivo-canvas-pattern-line-color) var(--mivo-canvas-pattern-line-width), transparent var(--mivo-canvas-pattern-line-width)),
++    linear-gradient(90deg, var(--mivo-canvas-pattern-line-color) var(--mivo-canvas-pattern-line-width), transparent var(--mivo-canvas-pattern-line-width));
++  background-size: var(--mivo-canvas-pattern-gap) var(--mivo-canvas-pattern-gap);
++}
++
++.canvas-shell.canvas-pattern-dots {
++  background-image: radial-gradient(circle, var(--mivo-canvas-pattern-dot-color) var(--mivo-canvas-pattern-dot-radius), transparent calc(var(--mivo-canvas-pattern-dot-radius) + 0.15px));
+ }
+ 
+ .canvas-shell::before {
+@@ -10777,6 +10787,66 @@ button:disabled {
+   display: grid;
+   gap: 10px;
+ }
++.canvas-appearance-heading {
++  display: flex;
++  align-items: flex-start;
++  justify-content: space-between;
++  gap: 12px;
++}
++.canvas-appearance-heading p {
++  margin: 4px 0 0;
++  font-size: var(--text-sm);
++  line-height: 1.45;
++  color: var(--muted);
++}
++.canvas-appearance-options {
++  display: grid;
++  grid-template-columns: repeat(2, minmax(0, 1fr));
++  gap: 10px;
++}
++.canvas-appearance-option {
++  display: grid;
++  gap: 8px;
++  padding: 8px;
++  text-align: left;
++  color: var(--muted);
++  background: transparent;
++  border: 1px solid rgba(35, 35, 35, 0.12);
++  border-radius: 12px;
++  cursor: pointer;
++}
++.canvas-appearance-option:hover {
++  background: rgba(35, 35, 35, 0.04);
++}
++.canvas-appearance-option.selected {
++  color: var(--fg, #242424);
++  border-color: var(--violet);
++  box-shadow: 0 0 0 2px color-mix(in srgb, var(--violet) 16%, transparent);
++}
++.canvas-pattern-preview {
++  display: block;
++  height: 68px;
++  border: 1px solid rgba(35, 35, 35, 0.1);
++  border-radius: 8px;
++  background-color: var(--canvas);
++  background-repeat: repeat;
++  --mivo-canvas-pattern-preview-line-color: rgba(39, 48, 44, 0.18);
++  --mivo-canvas-pattern-preview-dot-color: rgba(39, 48, 44, 0.34);
++}
++.canvas-pattern-preview[data-pattern='grid'] {
++  background-image:
++    linear-gradient(var(--mivo-canvas-pattern-preview-line-color) 1px, transparent 1px),
++    linear-gradient(90deg, var(--mivo-canvas-pattern-preview-line-color) 1px, transparent 1px);
++  background-size: 18px 18px;
++}
++.canvas-pattern-preview[data-pattern='dots'] {
++  background-image: radial-gradient(circle, var(--mivo-canvas-pattern-preview-dot-color) 1.2px, transparent 1.35px);
++  background-size: 18px 18px;
++}
++.canvas-appearance-option-label {
++  font-size: var(--text-md);
++  font-weight: 500;
++}
+ .settings-section h4 {
+   margin: 0;
+   font-size: 12px;
+@@ -11218,11 +11288,86 @@ button:disabled {
+   --canvas: color-mix(in srgb, var(--surface, #ebe4d7) 93%, var(--text-primary, #232323) 7%);
+ }
+ 
+-/* 网格线原是写死的深灰 rgba,换成随主题文字色淡化——Dark 下自动变浅网格 */
++/* Cindy only supplies theme colors; pattern geometry stays owned by MivoCanvas. */
+ .canvas-shell {
+-  background-image:
+-    linear-gradient(color-mix(in srgb, var(--text-primary, #27302c) 7%, transparent) 1px, transparent 1px),
+-    linear-gradient(90deg, color-mix(in srgb, var(--text-primary, #27302c) 7%, transparent) 1px, transparent 1px);
++  --mivo-canvas-pattern-line-color: color-mix(in srgb, var(--text-primary, #27302c) 7%, transparent);
++  --mivo-canvas-pattern-dot-color: color-mix(in srgb, var(--text-primary, #27302c) 15%, transparent);
++}
++
++.plugin-settings-trigger {
++  position: absolute;
++  top: 14px;
++  right: 14px;
++  z-index: 70;
++  display: grid;
++  place-items: center;
++  width: 34px;
++  height: 34px;
++  padding: 0;
++  color: color-mix(in srgb, var(--text-primary, #232323) 78%, var(--surface, #fffaf0));
++  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 92%, var(--text-primary, #232323) 8%);
++  border: 1px solid color-mix(in srgb, var(--text-primary, #232323) 16%, var(--border-default, #d6d0c6));
++  border-radius: 999px;
++  box-shadow: 0 8px 22px color-mix(in srgb, var(--text-primary, #232323) 14%, transparent);
++  cursor: pointer;
++}
++
++.plugin-settings-trigger:hover {
++  color: var(--text-primary, #232323);
++  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 84%, var(--text-primary, #232323) 16%);
++}
++
++.plugin-settings-trigger:active {
++  transform: scale(0.96);
++}
++
++.canvas-settings-panel {
++  width: min(420px, calc(100vw - 32px));
++  max-height: min(480px, calc(100vh - 32px));
++  color: var(--text-secondary, #756f67);
++  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 96%, var(--text-primary, #232323) 4%);
++  border-color: color-mix(in srgb, var(--text-primary, #232323) 14%, var(--border-default, #d6d0c6));
++  box-shadow: 0 24px 64px color-mix(in srgb, var(--text-primary, #232323) 24%, transparent);
++}
++
++.canvas-settings-panel .settings-panel-header {
++  border-color: color-mix(in srgb, var(--text-primary, #232323) 10%, var(--border-default, #d6d0c6));
++}
++
++.canvas-settings-panel .settings-panel-header strong,
++.canvas-settings-panel .canvas-appearance-option-label {
++  color: var(--text-primary, #232323);
++}
++
++.canvas-settings-panel .settings-panel-header button {
++  color: var(--text-secondary, #756f67);
++}
++
++.canvas-settings-panel .settings-panel-header button:hover {
++  background: color-mix(in srgb, var(--text-primary, #232323) 8%, transparent);
++}
++
++.canvas-settings-panel .canvas-appearance-option {
++  color: var(--text-secondary, #756f67);
++  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 88%, var(--text-primary, #232323) 12%);
++  border-color: color-mix(in srgb, var(--text-primary, #232323) 14%, var(--border-default, #d6d0c6));
++}
++
++.canvas-settings-panel .canvas-appearance-option:hover {
++  background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 80%, var(--text-primary, #232323) 20%);
++}
++
++.canvas-settings-panel .canvas-appearance-option.selected {
++  color: var(--text-primary, #232323);
++  border-color: var(--accent-cta-bg, #27302c);
++  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-cta-bg, #27302c) 18%, transparent);
++}
++
++.canvas-settings-panel .canvas-pattern-preview {
++  border-color: color-mix(in srgb, var(--text-primary, #232323) 12%, var(--border-default, #d6d0c6));
++  background-color: var(--canvas);
++  --mivo-canvas-pattern-preview-line-color: color-mix(in srgb, var(--text-primary, #27302c) 14%, transparent);
++  --mivo-canvas-pattern-preview-dot-color: color-mix(in srgb, var(--text-primary, #27302c) 25%, transparent);
+ }
+ 
+ /* 原 ::before 是米色高光晕染(写死的暖白/苔绿),主题化后改为中性表面提亮 */
+diff --git a/server/persist/permissionBackend.contract.dual.test.ts b/server/persist/permissionBackend.contract.dual.test.ts
+index 1c459978..b440cb27 100644
+--- a/server/persist/permissionBackend.contract.dual.test.ts
++++ b/server/persist/permissionBackend.contract.dual.test.ts
+@@ -382,17 +382,31 @@ const runPermissionBackendContractSuite = (
+     })
+ 
+     it('P2-1 并发 attempt:恰一个 claim,输家返 already-claimed(attemptCount 与真实 claim 一致)', async () => {
+-      // 建 pending restore 意图 + cascade marker(让 attempt 有活可干且 await 点让出并发窗口)
++      // 建 pending restore 意图 + cascade marker
+       const link = await b.createShareLink('p1', 'view', 'ownerA')
+       await b.revokeAllForProject('p1')
+       await b.recordCompensation('p1', 'restore')
+-      const [a, b2] = await Promise.all([
+-        b.attemptCompensation('p1', 'restore'),
+-        b.attemptCompensation('p1', 'restore'),
+-      ])
+-      const outcomes = [a, b2].map((o) => o.kind).sort()
+-      // 一个 completed(赢家 claim+跑通),一个 already-claimed(输家)
+-      expect(outcomes).toEqual(['already-claimed', 'completed'])
++      // review #599(pg suite CI 红,server/persist/permissionBackend.contract.dual.test.ts:395)复盘:
++      // 原实现靠 Promise.all 的真实调度速度让两个 attempt 自然错开,但赢家 claim 后到 mark done 全程
++      // 很快(尤其本地 PG、无网络延迟),输家的首次读可能落在赢家已经跑完之后 —— 这时输家看到的是
++      // "无 pending 意图"而不是"已被 claim",合法返回 nothing-pending,不是 bug,只是本用例断言
++      // 死了 already-claimed 这一种输家结果,故随机在 CI 上转 flaky。改用已有的 setClaimPause 钉死
++      // 时序(R5-F1 TOCTOU 用例的同一手法):A 先 claim 并暂停在 side effect 前,确认 claim_token
++      // 落库后才发起 B,B 此时必然落在"已 claim 未完成"这个窗口 → 确定性拿到 already-claimed。
++      let resolvePause!: () => void
++      const pausePromise = new Promise<void>((resolve) => { resolvePause = resolve })
++      setClaimPause(b, 'restore', () => pausePromise)
++      const aPromise = b.attemptCompensation('p1', 'restore')
++      for (let i = 0; i < 200; i++) {
++        const ints = await b.listCompensations('p1')
++        if (ints.find((x) => x.op === 'restore')?.claimToken) break
++        await new Promise((r) => setTimeout(r, 5))
++      }
++      const b2 = await b.attemptCompensation('p1', 'restore')
++      expect(b2.kind).toBe('already-claimed') // 输家:claim 已被 A 占且租约未过期
++      resolvePause()
++      const a = await aPromise
++      expect(a.kind).toBe('completed') // 赢家:claim+跑通
+       const ints = await b.listCompensations('p1')
+       // attemptCount 与真实 claim 一致(输家不 bump)
+       expect(ints[0].attemptCount).toBe(1)
+diff --git a/src/App.css b/src/App.css
+index 6737259d..759f124c 100644
+--- a/src/App.css
++++ b/src/App.css
+@@ -11,6 +11,12 @@
+      去掉半透明,一处改色全局生效 (2026-07-06 用户反馈)。 */
+   --panel-surface: #fffaf0;
+   --canvas: #ebe4d7;
++  /* MivoCanvas-owned pattern geometry; host themes may override colors only. */
++  --mivo-canvas-pattern-gap: 36px;
++  --mivo-canvas-pattern-line-width: 1px;
++  --mivo-canvas-pattern-dot-radius: 1px;
++  --mivo-canvas-pattern-line-color: rgba(39, 48, 44, 0.065);
++  --mivo-canvas-pattern-dot-color: rgba(39, 48, 44, 0.16);
+   --charcoal: #27302c;
+   --moss: #497466;
+   --rust: #b6572c;
+@@ -3264,9 +3270,13 @@ button:disabled {
+   cursor: default;
+   background-color: var(--canvas);
+   background-image:
+-    linear-gradient(rgba(39, 48, 44, 0.065) 1px, transparent 1px),
+-    linear-gradient(90deg, rgba(39, 48, 44, 0.065) 1px, transparent 1px);
+-  background-size: 36px 36px;
++    linear-gradient(var(--mivo-canvas-pattern-line-color) var(--mivo-canvas-pattern-line-width), transparent var(--mivo-canvas-pattern-line-width)),
++    linear-gradient(90deg, var(--mivo-canvas-pattern-line-color) var(--mivo-canvas-pattern-line-width), transparent var(--mivo-canvas-pattern-line-width));
++  background-size: var(--mivo-canvas-pattern-gap) var(--mivo-canvas-pattern-gap);
++}
++
++.canvas-shell.canvas-pattern-dots {
++  background-image: radial-gradient(circle, var(--mivo-canvas-pattern-dot-color) var(--mivo-canvas-pattern-dot-radius), transparent calc(var(--mivo-canvas-pattern-dot-radius) + 0.15px));
+ }
+ 
+ .canvas-shell::before {
+@@ -10731,6 +10741,66 @@ button:disabled {
+   display: grid;
+   gap: 10px;
+ }
++.canvas-appearance-heading {
++  display: flex;
++  align-items: flex-start;
++  justify-content: space-between;
++  gap: 12px;
++}
++.canvas-appearance-heading p {
++  margin: 4px 0 0;
++  font-size: var(--text-sm);
++  line-height: 1.45;
++  color: var(--muted);
++}
++.canvas-appearance-options {
++  display: grid;
++  grid-template-columns: repeat(2, minmax(0, 1fr));
++  gap: 10px;
++}
++.canvas-appearance-option {
++  display: grid;
++  gap: 8px;
++  padding: 8px;
++  text-align: left;
++  color: var(--muted);
++  background: transparent;
++  border: 1px solid rgba(35, 35, 35, 0.12);
++  border-radius: 12px;
++  cursor: pointer;
++}
++.canvas-appearance-option:hover {
++  background: rgba(35, 35, 35, 0.04);
++}
++.canvas-appearance-option.selected {
++  color: var(--fg, #242424);
++  border-color: var(--violet);
++  box-shadow: 0 0 0 2px color-mix(in srgb, var(--violet) 16%, transparent);
++}
++.canvas-pattern-preview {
++  display: block;
++  height: 68px;
++  border: 1px solid rgba(35, 35, 35, 0.1);
++  border-radius: 8px;
++  background-color: var(--canvas);
++  background-repeat: repeat;
++  --mivo-canvas-pattern-preview-line-color: rgba(39, 48, 44, 0.18);
++  --mivo-canvas-pattern-preview-dot-color: rgba(39, 48, 44, 0.34);
++}
++.canvas-pattern-preview[data-pattern='grid'] {
++  background-image:
++    linear-gradient(var(--mivo-canvas-pattern-preview-line-color) 1px, transparent 1px),
++    linear-gradient(90deg, var(--mivo-canvas-pattern-preview-line-color) 1px, transparent 1px);
++  background-size: 18px 18px;
++}
++.canvas-pattern-preview[data-pattern='dots'] {
++  background-image: radial-gradient(circle, var(--mivo-canvas-pattern-preview-dot-color) 1.2px, transparent 1.35px);
++  background-size: 18px 18px;
++}
++.canvas-appearance-option-label {
++  font-size: var(--text-md);
++  font-weight: 500;
++}
+ .settings-section h4 {
+   margin: 0;
+   font-size: 12px;
+diff --git a/src/app/settings/CanvasAppearanceSection.test.tsx b/src/app/settings/CanvasAppearanceSection.test.tsx
+new file mode 100644
+index 00000000..714a8b8a
+--- /dev/null
++++ b/src/app/settings/CanvasAppearanceSection.test.tsx
+@@ -0,0 +1,85 @@
++// @vitest-environment happy-dom
++//
++// review #599(4890810821)指出旧断言只验证"aria-checked=true 在 html 里存在一次",
++// 无法辨别选中态倒挂/错标。修复过程中发现问题比断言精度更深:旧测试用
++// renderToStaticMarkup(SSR 静态渲染)——zustand 的 useStore 把 React.useSyncExternalStore
++// 的 getServerSnapshot 接到 api.getInitialState()(node.js/zustand/react.js),SSR 路径下
++// 永远读"store 创建时的初始值"(此处固定为 grid),setBackgroundPattern('dots') 之后的
++// getState() 变化对 SSR 渲染完全不可见——旧测试从未真正渲染过"dots 被选中"这条分支,
++// 只是因为 grid 按钮恰好总是 aria-checked=true 才凑巧过。改用真实客户端挂载
++// (react-dom/client + act,沿用 KeyDialogEscapeBubbling.test.tsx 的先例)走
++// useSyncExternalStore 的客户端 getSnapshot=getState() 路径,才能让"dots 选中"这条分支
++// 被真实渡染和断言到。
++import { act } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import i18n from '../../i18n'
++import { __resetCanvasAppearanceForTests, useCanvasAppearanceStore } from '../../store/canvasAppearanceStore'
++import { CanvasAppearanceSection } from './CanvasAppearanceSection'
++
++let container: HTMLDivElement
++let root: Root
++
++beforeEach(() => {
++  ;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++  container = document.createElement('div')
++  document.body.appendChild(container)
++  root = createRoot(container)
++})
++
++afterEach(() => {
++  act(() => {
++    root.unmount()
++  })
++  container.remove()
++})
++
++/** 按每个 radio 按钮内部的 data-pattern 预览 span 归属到对应选项。 */
++function getOptionButtons(): Record<'grid' | 'dots', HTMLButtonElement> {
++  const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button[role="radio"]'))
++  const byPattern: Partial<Record<'grid' | 'dots', HTMLButtonElement>> = {}
++  for (const button of buttons) {
++    const pattern = button.querySelector('[data-pattern]')?.getAttribute('data-pattern')
++    if (pattern === 'grid' || pattern === 'dots') byPattern[pattern] = button
++  }
++  if (!byPattern.grid || !byPattern.dots) throw new Error('expected one radio button per pattern')
++  return byPattern as Record<'grid' | 'dots', HTMLButtonElement>
++}
++
++describe('CanvasAppearanceSection', () => {
++  it('renders the grid and dots choices with the selected state', () => {
++    __resetCanvasAppearanceForTests()
++    useCanvasAppearanceStore.getState().setBackgroundPattern('dots')
++    act(() => {
++      root.render(<CanvasAppearanceSection />)
++    })
++
++    expect(container.querySelector('[data-section="canvas-appearance"]')).not.toBeNull()
++    expect(container.textContent).toContain('Dots')
++
++    // 全局只应有一处选中标记(排除双 true / 全 false 静默通过)。
++    expect(container.querySelectorAll('[aria-checked="true"]')).toHaveLength(1)
++    expect(container.querySelectorAll('.canvas-appearance-option.selected')).toHaveLength(1)
++
++    // 逐选项按 store 当前值锚定,而不是只看"存在一个 true"。
++    const { grid, dots } = getOptionButtons()
++    expect(dots.getAttribute('aria-checked')).toBe('true')
++    expect(dots.classList.contains('selected')).toBe(true)
++    expect(grid.getAttribute('aria-checked')).toBe('false')
++    expect(grid.classList.contains('selected')).toBe(false)
++  })
++
++  it('keeps the option labels translated', async () => {
++    await i18n.changeLanguage('zh-CN')
++    try {
++      __resetCanvasAppearanceForTests()
++      act(() => {
++        root.render(<CanvasAppearanceSection />)
++      })
++      expect(container.textContent).toContain('网格')
++      expect(container.textContent).toContain('点状')
++    } finally {
++      await i18n.changeLanguage('en')
++    }
++  })
++})
+diff --git a/src/app/settings/CanvasAppearanceSection.tsx b/src/app/settings/CanvasAppearanceSection.tsx
+new file mode 100644
+index 00000000..cedd63a3
+--- /dev/null
++++ b/src/app/settings/CanvasAppearanceSection.tsx
+@@ -0,0 +1,47 @@
++import { useTranslation } from 'react-i18next'
++import {
++  CANVAS_BACKGROUND_PATTERNS,
++  useCanvasAppearanceStore,
++  type CanvasBackgroundPattern,
++} from '../../store/canvasAppearanceStore'
++import { t } from '../../i18n'
++
++const patternLabelKey: Record<CanvasBackgroundPattern, string> = {
++  grid: 'settings.canvas.grid',
++  dots: 'settings.canvas.dots',
++}
++
++export function CanvasAppearanceSection() {
++  useTranslation()
++  const selectedPattern = useCanvasAppearanceStore((state) => state.backgroundPattern)
++  const setPattern = useCanvasAppearanceStore((state) => state.setBackgroundPattern)
++
++  return (
++    <section className="settings-section canvas-appearance-section" data-section="canvas-appearance">
++      <div className="canvas-appearance-heading">
++        <div>
++          <h4>{t('settings.canvas.background')}</h4>
++          <p>{t('settings.canvas.backgroundDescription')}</p>
++        </div>
++      </div>
++      <div className="canvas-appearance-options" role="radiogroup" aria-label={t('settings.canvas.background')}>
++        {CANVAS_BACKGROUND_PATTERNS.map((pattern) => {
++          const selected = selectedPattern === pattern
++          return (
++            <button
++              key={pattern}
++              type="button"
++              className={`canvas-appearance-option${selected ? ' selected' : ''}`}
++              role="radio"
++              aria-checked={selected}
++              onClick={() => setPattern(pattern)}
++            >
++              <span className="canvas-pattern-preview" data-pattern={pattern} aria-hidden="true" />
++              <span className="canvas-appearance-option-label">{t(patternLabelKey[pattern])}</span>
++            </button>
++          )
++        })}
++      </div>
++    </section>
++  )
++}
+diff --git a/src/app/settings/CanvasSettingsPanel.tsx b/src/app/settings/CanvasSettingsPanel.tsx
+new file mode 100644
+index 00000000..fd876e4b
+--- /dev/null
++++ b/src/app/settings/CanvasSettingsPanel.tsx
+@@ -0,0 +1,93 @@
++import { useEffect, useRef, type KeyboardEvent as ReactKeyboardEvent } from 'react'
++import { createPortal } from 'react-dom'
++import { X } from 'lucide-react'
++import { useTranslation } from 'react-i18next'
++import { t } from '../../i18n'
++import { useCanvasAppearanceStore } from '../../store/canvasAppearanceStore'
++import { CanvasAppearanceSection } from './CanvasAppearanceSection'
++
++export function CanvasSettingsPanel() {
++  useTranslation()
++  const open = useCanvasAppearanceStore((state) => state.appearancePanelOpen)
++  const close = useCanvasAppearanceStore((state) => state.closeCanvasAppearance)
++  const panelRef = useRef<HTMLElement | null>(null)
++
++  useEffect(() => {
++    if (!open) return
++
++    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : undefined
++    panelRef.current?.focus()
++
++    const handleKeyDown = (event: KeyboardEvent) => {
++      if (event.key !== 'Escape') return
++      event.preventDefault()
++      event.stopPropagation()
++      close()
++    }
++    window.addEventListener('keydown', handleKeyDown)
++
++    return () => {
++      window.removeEventListener('keydown', handleKeyDown)
++      previousFocus?.focus()
++    }
++  }, [close, open])
++
++  const handlePanelKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
++    if (event.key !== 'Tab') return
++
++    const panel = panelRef.current
++    if (!panel) return
++
++    const focusables = Array.from(
++      panel.querySelectorAll<HTMLElement>('button, input, textarea, select, [href], [tabindex]:not([tabindex="-1"])'),
++    ).filter((element) => !element.hasAttribute('disabled') && !element.closest('[inert]'))
++
++    if (focusables.length === 0) {
++      event.preventDefault()
++      return
++    }
++
++    const first = focusables[0]
++    const last = focusables[focusables.length - 1]
++    if (event.shiftKey && (document.activeElement === first || document.activeElement === panel)) {
++      event.preventDefault()
++      last.focus()
++    } else if (!event.shiftKey && document.activeElement === last) {
++      event.preventDefault()
++      first.focus()
++    }
++  }
++
++  if (!open) return null
++
++  return createPortal(
++    <div
++      className="settings-backdrop canvas-settings-backdrop"
++      role="presentation"
++      onPointerDown={(event) => {
++        if (event.target === event.currentTarget) close()
++      }}
++    >
++      <section
++        ref={panelRef}
++        className="settings-panel canvas-settings-panel"
++        role="dialog"
++        aria-modal="true"
++        aria-label={t('settings.canvas.title')}
++        tabIndex={-1}
++        onKeyDown={handlePanelKeyDown}
++      >
++        <header className="settings-panel-header">
++          <strong>{t('settings.canvas.title')}</strong>
++          <button type="button" aria-label={t('settings.close')} onClick={close}>
++            <X size={16} />
++          </button>
++        </header>
++        <div className="settings-panel-body">
++          <CanvasAppearanceSection />
++        </div>
++      </section>
++    </div>,
++    document.body,
++  )
++}
+diff --git a/src/app/settings/GatewayKeyDialog.tsx b/src/app/settings/GatewayKeyDialog.tsx
+index 38f90503..d7ee4dfd 100644
+--- a/src/app/settings/GatewayKeyDialog.tsx
++++ b/src/app/settings/GatewayKeyDialog.tsx
+@@ -77,13 +77,23 @@ export function GatewayKeyDialog({ onClose }: GatewayKeyDialogProps) {
+       event.preventDefault()
+       void save()
+     }
+-    if (event.key === 'Escape') onClose()
++  }
++
++  // 挂在弹窗根上而不是只挂输入框:Tab 把焦点移到关闭/显示密钥/取消/保存/控制台
++  // 任一按钮后按 Escape,原生事件从该按钮冒泡到这里时先被拦住,不会穿透到
++  // SettingsPanel 的 window 监听器(review #599 3743141648 指出输入框级监听盖不到
++  // 按钮焦点这条路径)。
++  const handleDialogKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
++    if (event.key !== 'Escape') return
++    event.stopPropagation()
++    onClose()
+   }
+ 
+   return createPortal(
+     <div
+       className="settings-backdrop"
+       role="presentation"
++      onKeyDown={handleDialogKeyDown}
+       onPointerDown={(event) => {
+         if (event.target === event.currentTarget) onClose()
+       }}
+diff --git a/src/app/settings/KeyDialogEscapeBubbling.test.tsx b/src/app/settings/KeyDialogEscapeBubbling.test.tsx
+new file mode 100644
+index 00000000..3cc64d6b
+--- /dev/null
++++ b/src/app/settings/KeyDialogEscapeBubbling.test.tsx
+@@ -0,0 +1,95 @@
++// @vitest-environment happy-dom
++//
++// PR #599 复盘(greptile review):GatewayKeyDialog/MivoKeyDialog 的 Escape 处理器
++// 原本只挂在输入框 onKeyDown 上,不 stopPropagation —— 原生 keydown 事件继续冒泡到
++// SettingsPanel 的 window 监听器,触发 closeSettings(),导致父设置面板被一并关闭
++// 而不是只退出当前最上层弹窗。
++//
++// 第一轮修复(3742647891)只在输入框上补了 stopPropagation,但 review
++// 3743141648 指出:Tab 把焦点移到关闭/显示密钥/取消/保存/控制台任一按钮后按
++// Escape,事件根本不经过输入框,同样会穿透。改成挂在弹窗根节点上后,不论
++// Escape 是从输入框还是从任一按钮触发都应该被拦住 —— 下面分别对输入框和
++// 一个头部按钮、一个底部按钮验证。用真 DOM 事件复现(冒泡行为只在真实事件
++// 路径上成立,纯函数测不出来,沿用 useRegionEditKeyboard.test.tsx 的
++// react-dom/client + act 先例)。
++import { act } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { GatewayKeyDialog } from './GatewayKeyDialog'
++import { MivoKeyDialog } from './MivoKeyDialog'
++
++let container: HTMLDivElement
++let root: Root
++let parentEscapeHandler: (event: KeyboardEvent) => void
++let parentEscapeCalls: number
++
++beforeEach(() => {
++  ;(globalThis as unknown as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
++  container = document.createElement('div')
++  document.body.appendChild(container)
++  root = createRoot(container)
++  // 模拟 SettingsPanel 自己的 window Escape 监听器(真实实现里就是它触发 closeSettings)。
++  parentEscapeCalls = 0
++  parentEscapeHandler = () => {
++    parentEscapeCalls += 1
++  }
++  window.addEventListener('keydown', parentEscapeHandler)
++})
++
++afterEach(() => {
++  window.removeEventListener('keydown', parentEscapeHandler)
++  act(() => {
++    root.unmount()
++  })
++  container.remove()
++})
++
++const pressEscapeOn = (selector: string) => {
++  const target = document.body.querySelector<HTMLElement>(selector)
++  if (!target) throw new Error(`dialog element not found: ${selector}`)
++  const event = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
++  act(() => {
++    target.dispatchEvent(event)
++  })
++}
++
++describe.each([
++  ['GatewayKeyDialog', GatewayKeyDialog],
++  ['MivoKeyDialog', MivoKeyDialog],
++] as const)('%s Escape does not bubble to the parent settings panel', (_name, Dialog) => {
++  it('closes itself from the input without triggering the parent window listener', () => {
++    const onClose = vi.fn()
++    act(() => {
++      root.render(<Dialog onClose={onClose} />)
++    })
++
++    pressEscapeOn('input')
++
++    expect(onClose).toHaveBeenCalledTimes(1)
++    expect(parentEscapeCalls).toBe(0)
++  })
++
++  it('closes itself when focus is on the header close button (Tab away from the input)', () => {
++    const onClose = vi.fn()
++    act(() => {
++      root.render(<Dialog onClose={onClose} />)
++    })
++
++    pressEscapeOn('header button')
++
++    expect(onClose).toHaveBeenCalledTimes(1)
++    expect(parentEscapeCalls).toBe(0)
++  })
++
++  it('closes itself when focus is on a footer button (e.g. Cancel)', () => {
++    const onClose = vi.fn()
++    act(() => {
++      root.render(<Dialog onClose={onClose} />)
++    })
++
++    pressEscapeOn('footer button')
++
++    expect(onClose).toHaveBeenCalledTimes(1)
++    expect(parentEscapeCalls).toBe(0)
++  })
++})
+diff --git a/src/app/settings/MivoKeyDialog.tsx b/src/app/settings/MivoKeyDialog.tsx
+index 006350f9..14507494 100644
+--- a/src/app/settings/MivoKeyDialog.tsx
++++ b/src/app/settings/MivoKeyDialog.tsx
+@@ -61,13 +61,23 @@ export function MivoKeyDialog({ onClose }: MivoKeyDialogProps) {
+       event.preventDefault()
+       save()
+     }
+-    if (event.key === 'Escape') onClose()
++  }
++
++  // 挂在弹窗根上而不是只挂输入框:Tab 把焦点移到关闭/显示密钥/取消/保存/控制台
++  // 任一按钮后按 Escape,原生事件从该按钮冒泡到这里时先被拦住,不会穿透到
++  // SettingsPanel 的 window 监听器(review #599 3743141648 指出输入框级监听盖不到
++  // 按钮焦点这条路径)。
++  const handleDialogKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
++    if (event.key !== 'Escape') return
++    event.stopPropagation()
++    onClose()
+   }
+ 
+   return createPortal(
+     <div
+       className="settings-backdrop"
+       role="presentation"
++      onKeyDown={handleDialogKeyDown}
+       onPointerDown={(event) => {
+         if (event.target === event.currentTarget) onClose()
+       }}
+diff --git a/src/app/settings/SettingsPanel.logging.test.ts b/src/app/settings/SettingsPanel.logging.test.ts
+new file mode 100644
+index 00000000..cf10c647
+--- /dev/null
++++ b/src/app/settings/SettingsPanel.logging.test.ts
+@@ -0,0 +1,21 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++const debugLogger = vi.hoisted(() => ({ log: vi.fn(), warn: vi.fn(), error: vi.fn() }))
++vi.mock('../../store/debugLogStore', () => ({ debugLogger }))
++
++describe('SettingsPanel logging contract', () => {
++  beforeEach(() => {
++    debugLogger.log.mockClear()
++  })
++
++  it('uses the generic settings-panel wording for every close path', async () => {
++    const source = await import('node:fs/promises').then((fs) =>
++      fs.readFile(new URL('./SettingsPanel.tsx', import.meta.url), 'utf8'),
++    )
++    expect(source).toContain("debugLogger.log('Settings', 'Settings panel closed with Escape')")
++    expect(source).toContain("debugLogger.log('Settings', 'Settings panel backdrop closed')")
++    expect(source).toContain("debugLogger.log('Settings', 'Settings panel close button clicked')")
++    expect(source).not.toContain('Canvas settings backdrop closed')
++    expect(source).not.toContain('Canvas settings close button clicked')
++  })
++})
+diff --git a/src/app/settings/SettingsPanel.tsx b/src/app/settings/SettingsPanel.tsx
+index 06187cfe..e70a4584 100644
+--- a/src/app/settings/SettingsPanel.tsx
++++ b/src/app/settings/SettingsPanel.tsx
+@@ -16,6 +16,7 @@ import {
+ import { debugLogger } from '../../store/debugLogStore'
+ import { GatewayKeyDialog } from './GatewayKeyDialog'
+ import { MivoKeySection } from './MivoKeySection'
++import { CanvasAppearanceSection } from './CanvasAppearanceSection'
+ import { useTranslation } from 'react-i18next'
+ import { getLocalePreference, setAppLocale, t, type LocalePreference } from '../../i18n'
+ 
+@@ -67,7 +68,10 @@ export function SettingsPanel() {
+     debugLogger.warn('Settings', '未登录,API Keys 配置已锁定:需要先登录 SSO')
+   }, [open, isAuthenticated])
+ 
+-  if (!open) return null
++  useEffect(() => {
++    if (!open) return
++    debugLogger.log('Settings', 'Settings panel opened')
++  }, [open])
+ 
+   const handleLogout = () => {
+     debugLogger.log('Auth', 'Logout requested from settings panel')
+@@ -97,18 +101,43 @@ export function SettingsPanel() {
+     void setAppLocale(next)
+   }
+ 
++  useEffect(() => {
++    if (!open) return
++    const handleKeyDown = (event: KeyboardEvent) => {
++      if (event.key !== 'Escape') return
++      event.preventDefault()
++      event.stopPropagation()
++      debugLogger.log('Settings', 'Settings panel closed with Escape')
++      closeSettings()
++    }
++    window.addEventListener('keydown', handleKeyDown)
++    return () => window.removeEventListener('keydown', handleKeyDown)
++  }, [closeSettings, open])
++
++  if (!open) return null
++
+   return createPortal(
+     <div
+-      className="settings-backdrop"
++      className="settings-backdrop canvas-settings-backdrop"
+       role="presentation"
+       onPointerDown={(event) => {
+-        if (event.target === event.currentTarget) closeSettings()
++        if (event.target === event.currentTarget) {
++          debugLogger.log('Settings', 'Settings panel backdrop closed')
++          closeSettings()
++        }
+       }}
+     >
+       <section className="settings-panel" role="dialog" aria-modal="true" aria-label={t('settings.title')} tabIndex={-1}>
+         <header className="settings-panel-header">
+           <strong>{t('settings.title')}</strong>
+-          <button type="button" aria-label={t('settings.close')} onClick={closeSettings}>
++          <button
++            type="button"
++            aria-label={t('settings.close')}
++            onClick={() => {
++              debugLogger.log('Settings', 'Settings panel close button clicked')
++              closeSettings()
++            }}
++          >
+             <X size={16} />
+           </button>
+         </header>
+@@ -198,6 +227,8 @@ export function SettingsPanel() {
+               </div>
+             )}
+           </section>
++
++          <CanvasAppearanceSection />
+         </div>
+       </section>
+       {isAuthenticated && gatewayDialogOpen ? <GatewayKeyDialog onClose={() => setGatewayDialogOpen(false)} /> : null}
+diff --git a/src/canvas/MivoCanvas.tsx b/src/canvas/MivoCanvas.tsx
+index 86962e0c..d50fa0d9 100644
+--- a/src/canvas/MivoCanvas.tsx
++++ b/src/canvas/MivoCanvas.tsx
+@@ -14,6 +14,7 @@ import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
+ import { canReadLocalAssetDrag, parseLocalAssetDragPayload } from '../lib/canvasAssetDrag'
+ import { canImportCanvasFile, importCanvasFileBatch, importImageUrlToCanvas } from '../lib/canvasAssetImport'
+ import { useCanvasStore } from '../store/canvasStore'
++import { useCanvasAppearanceStore } from '../store/canvasAppearanceStore'
+ import { wrapMutation } from './actions/canvasSyncRuntime'
+ import { handleImportError, openFileImportDialog, openFolderImportDialog, reportCanvasBatchImport, useOpenNodeDetails } from './canvasImportHandlers'
+ import { brushCursorCssFor } from './brushCursors'
+@@ -43,6 +44,7 @@ import { useFileNodeActions } from './useFileNodeActions'
+ import { useCanvasVirtualization } from './useCanvasVirtualization'
+ import { useTranslation } from 'react-i18next'
+ import { t } from '../i18n'
++import { canvasBackgroundStyleFor } from './canvasPattern'
+ 
+ type ContextMenuState = {
+   kind: 'node' | 'blank'
+@@ -89,6 +91,7 @@ export function MivoCanvas({
+   const [cropNodeId, setCropNodeId] = useState<string>()
+   const [shellSize, setShellSize] = useState({ width: 0, height: 0 })
+   const nodes = useCanvasStore((state) => state.nodes)
++  const backgroundPattern = useCanvasAppearanceStore((state) => state.backgroundPattern)
+   const sceneId = useCanvasStore((state) => state.sceneId)
+   const storeActiveTool = useCanvasStore((state) => state.activeTool)
+   const brushStyle = useCanvasStore((state) => state.brushStyle)
+@@ -252,7 +255,7 @@ export function MivoCanvas({
+     // (commitCropFromOutside); explicit cancel is Escape / the Cancel button.
+     onCancelMaskEdit: cancelActiveImageEdit, onStartRegionEdit: startRegionEditByShortcut,
+     cropEditNodeId: cropNodeId, onCancelCropEdit: commitCropFromOutside,
+-    contextMenuOpen: Boolean(contextMenu), onCloseContextMenu: closeContextMenu,
++    contextMenuOpen: Boolean(contextMenu), onCloseContextMenu: closeContextMenu, backgroundPattern,
+   })
+ 
+   useLayoutEffect(() => {
+@@ -577,12 +580,12 @@ export function MivoCanvas({
+ 
+   return (
+     <section
+-      className={`canvas-shell tool-${interactionMode} ${isPanning ? 'is-panning' : ''} ${
++      className={`canvas-shell canvas-pattern-${backgroundPattern} tool-${interactionMode} ${isPanning ? 'is-panning' : ''} ${
+         selectionBox ? 'is-selecting' : ''
+       } ${selectedNodes.length > 1 ? 'has-multi-selection' : ''} ${brushToolActive ? 'brush-tool' : ''} ${
+         stampToolActive ? 'stamp-tool' : ''
+       }`}
+-      aria-label="Mivo Canvas" {...engineSpikeDataAttrs} data-culling-mode={cullingMode}
++      aria-label="Mivo Canvas" {...engineSpikeDataAttrs} data-background-pattern={backgroundPattern} data-culling-mode={cullingMode}
+       data-viewport-scale={viewport.scale} data-viewport-x={viewport.x} data-viewport-y={viewport.y}
+       data-rendered-node-count={renderedNodes.length}
+       data-total-node-count={visibleNodes.length}
+@@ -600,8 +603,7 @@ export function MivoCanvas({
+       onContextMenu={handleCanvasContextMenu}
+       onDoubleClick={handleCanvasDoubleClick}
+       style={{
+-        backgroundPosition: `${viewport.x}px ${viewport.y}px`,
+-        backgroundSize: `${36 * viewport.scale}px ${36 * viewport.scale}px`,
++        ...canvasBackgroundStyleFor(backgroundPattern, viewport),
+         ...(brushToolActive
+           ? ({ '--brush-cursor': brushCursorCssFor(brushStyle.kind, brushStyle.color) } as CSSProperties)
+           : {}),
+diff --git a/src/canvas/canvasInteraction.test.ts b/src/canvas/canvasInteraction.test.ts
+index 46c6808e..2e8fd60a 100644
+--- a/src/canvas/canvasInteraction.test.ts
++++ b/src/canvas/canvasInteraction.test.ts
+@@ -230,6 +230,8 @@ describe('hasOpenCanvasModal (详情弹层打开时画布快捷键停摆闸)', (
+     querySelector: (selector: string) => {
+       expect(selector).toContain('.media-lightbox-backdrop')
+       expect(selector).toContain('.details-dialog-backdrop')
++      expect(selector).toContain('.canvas-settings-backdrop')
++      expect(selector).toContain('.settings-backdrop')
+       return matched ? ({} as Element) : null
+     },
+   })
+diff --git a/src/canvas/canvasInteraction.ts b/src/canvas/canvasInteraction.ts
+index dd8a61f0..42377d94 100644
+--- a/src/canvas/canvasInteraction.ts
++++ b/src/canvas/canvasInteraction.ts
+@@ -208,12 +208,13 @@ export const frameTitleNodeIdFromTarget = (target: EventTarget | null): string |
+   return nodeIdFromDomTarget(target)
+ }
+ 
+-// 详情弹层(InspectorPanel 弹窗 / MediaLightbox)打开时,画布全局快捷键整体停摆:
++// 详情弹层(InspectorPanel 弹窗 / MediaLightbox)或画布设置弹层打开时,
++// 画布全局快捷键整体停摆:
+ // aria-modal 层背后的画布不应再响应 Esc(清选区)/Delete/Cmd+D/复制粘贴等按键。
+ // useGlobalCanvasEvents 的 keydown 与 clipboard 处理器以此为闸。
+ export const hasOpenCanvasModal = (
+   doc: Pick<Document, 'querySelector'> | null = typeof document === 'undefined' ? null : document,
+-) => Boolean(doc?.querySelector('.media-lightbox-backdrop, .details-dialog-backdrop'))
++) => Boolean(doc?.querySelector('.media-lightbox-backdrop, .details-dialog-backdrop, .canvas-settings-backdrop, .settings-backdrop'))
+ 
+ // R3 后半:「拖拽中右键」判定(纯函数)。只有本次 contextmenu 由副键(button===2)
+ // 触发且主键仍按住(buttons&1,框选/节点拖拽进行中)才吞掉。不能只看 buttons&1:
+diff --git a/src/canvas/canvasPattern.test.ts b/src/canvas/canvasPattern.test.ts
+new file mode 100644
+index 00000000..722671e0
+--- /dev/null
++++ b/src/canvas/canvasPattern.test.ts
+@@ -0,0 +1,25 @@
++import { describe, expect, it } from 'vitest'
++import { canvasBackgroundStyleFor, canvasPatternOffsetFor, canvasPatternSizeFor } from './canvasPattern'
++
++describe('canvas pattern geometry', () => {
++  it('uses the Mivo-owned 36px tile at 1x', () => {
++    expect(canvasPatternSizeFor('grid', 1)).toBe(36)
++    expect(canvasPatternSizeFor('dots', 1.5)).toBe(54)
++  })
++
++  it('keeps repeated background offsets bounded and phase-stable', () => {
++    expect(canvasPatternOffsetFor(-120, 54)).toBe(-12)
++    expect(canvasPatternOffsetFor(109, 54)).toBe(1)
++    expect(canvasPatternOffsetFor(-108, 54)).toBe(0)
++    expect(canvasPatternOffsetFor(Number.POSITIVE_INFINITY, 54)).toBe(0)
++  })
++
++  it('builds the CSS style from the selected Mivo pattern', () => {
++    expect(canvasBackgroundStyleFor('dots', { x: -120, y: 45, scale: 1.5 })).toMatchObject({
++      backgroundPosition: '-12px 45px',
++      backgroundSize: '54px 54px',
++      '--mivo-canvas-pattern-gap': '36px',
++      '--mivo-canvas-pattern-dot-radius': '1px',
++    })
++  })
++})
+diff --git a/src/canvas/canvasPattern.ts b/src/canvas/canvasPattern.ts
+new file mode 100644
+index 00000000..d42152e0
+--- /dev/null
++++ b/src/canvas/canvasPattern.ts
+@@ -0,0 +1,57 @@
++import type { CSSProperties } from 'react'
++import type { CanvasBackgroundPattern } from '../store/canvasAppearanceStore'
++
++export type { CanvasBackgroundPattern } from '../store/canvasAppearanceStore'
++
++type CanvasPatternConfig = {
++  gap: number
++  lineWidth?: number
++  dotRadius?: number
++}
++
++/**
++ * MivoCanvas-owned geometry for the visible background patterns.
++ * Cindy may override the color tokens, but it must not own these values.
++ */
++export const CANVAS_PATTERN_CONFIG = {
++  grid: {
++    gap: 36,
++    lineWidth: 1,
++  },
++  dots: {
++    gap: 36,
++    dotRadius: 1,
++  },
++} as const satisfies Record<CanvasBackgroundPattern, CanvasPatternConfig>
++
++export const canvasPatternConfigFor = (pattern: CanvasBackgroundPattern) => CANVAS_PATTERN_CONFIG[pattern]
++
++export const canvasPatternSizeFor = (pattern: CanvasBackgroundPattern, scale: number) => {
++  const config = canvasPatternConfigFor(pattern)
++  const size = config.gap * scale
++  return Number.isFinite(size) && size > 0 ? size : config.gap
++}
++
++/** Keep repeated CSS background offsets bounded while preserving their phase. */
++export const canvasPatternOffsetFor = (offset: number, patternSize: number) => {
++  if (!Number.isFinite(offset) || !Number.isFinite(patternSize) || patternSize <= 0) return 0
++  const remainder = offset % patternSize
++  return Object.is(remainder, -0) ? 0 : remainder
++}
++
++export const canvasBackgroundStyleFor = (
++  pattern: CanvasBackgroundPattern,
++  viewport: { x: number; y: number; scale: number },
++): CSSProperties => {
++  const config = canvasPatternConfigFor(pattern)
++  const patternSize = canvasPatternSizeFor(pattern, viewport.scale)
++  const lineWidth = 'lineWidth' in config ? config.lineWidth : 1
++  const dotRadius = 'dotRadius' in config ? config.dotRadius : 1
++  return {
++    backgroundPosition: `${canvasPatternOffsetFor(viewport.x, patternSize)}px ${canvasPatternOffsetFor(viewport.y, patternSize)}px`,
++    backgroundSize: `${patternSize}px ${patternSize}px`,
++    '--mivo-canvas-pattern-gap': `${config.gap}px`,
++    '--mivo-canvas-pattern-line-width': `${lineWidth}px`,
++    '--mivo-canvas-pattern-dot-radius': `${dotRadius}px`,
++  } as CSSProperties
++}
+diff --git a/src/canvas/useCanvasInteractionController.ts b/src/canvas/useCanvasInteractionController.ts
+index 77527503..81ba29df 100644
+--- a/src/canvas/useCanvasInteractionController.ts
++++ b/src/canvas/useCanvasInteractionController.ts
+@@ -16,6 +16,7 @@ import { useTextAnnotation, isEditableTextNode } from './useTextAnnotation'
+ import { useGlobalCanvasEvents } from './useGlobalCanvasEvents'
+ import { useZoomTool } from './useZoomTool'
+ import { useCanvasHitDispatch } from './interactionDispatch'
++import type { CanvasBackgroundPattern } from './canvasPattern'
+ 
+ export type { TextResizeEdge } from './useTextAnnotation'
+ 
+@@ -33,13 +34,14 @@ type UseCanvasInteractionControllerOptions = {
+   /** 右键菜单是否打开:透传给 useGlobalCanvasEvents 做 Escape 分层退出(R6)。 */
+   contextMenuOpen: boolean
+   onCloseContextMenu: () => void
++  backgroundPattern?: CanvasBackgroundPattern
+ }
+ 
+ // Thin assembly shell over the extracted interaction hooks (F7 split). Hook
+ // returns are destructured to bare stable callbacks so React.memo on
+ // CanvasNodeView skips unchanged nodes (object deps would recreate callbacks).
+ export function useCanvasInteractionController({
+-  shellRef, sceneId, nodes, selectedNodeIds, maskEditNodeId, onCancelMaskEdit, onStartRegionEdit, cropEditNodeId, onCancelCropEdit, contextMenuOpen, onCloseContextMenu,
++  shellRef, sceneId, nodes, selectedNodeIds, maskEditNodeId, onCancelMaskEdit, onStartRegionEdit, cropEditNodeId, onCancelCropEdit, contextMenuOpen, onCloseContextMenu, backgroundPattern,
+ }: UseCanvasInteractionControllerOptions) {
+   const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([])
+   const [activeSectionDropTargetId, setActiveSectionDropTargetId] = useState<string | undefined>()
+@@ -68,7 +70,7 @@ export function useCanvasInteractionController({
+     viewport: viewportState, viewportRef, isPanning, screenToCanvas, viewportCenter, zoomBy,
+     zoomTo, fitToBounds, fit, fitAll, fitSelection, resetView, handleWheel, startPan, tryMovePan,
+     tryEndPan, resetPan, resetViewportForScene,
+-  } = useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseContextMenu })
++  } = useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseContextMenu, backgroundPattern })
+ 
+   // 粘贴落点判定(2026-07-31):点在画布 shell 内 → 换算成画布坐标;出界(侧栏/
+   // 聊天面板/窗外)→ undefined,调用方退回错位偏移或视口中心。
+diff --git a/src/canvas/useViewport.pan.test.ts b/src/canvas/useViewport.pan.test.ts
+index 8283e3ee..068417c4 100644
+--- a/src/canvas/useViewport.pan.test.ts
++++ b/src/canvas/useViewport.pan.test.ts
+@@ -35,7 +35,7 @@ describe('applyViewportImperatively — freeze-pan 每帧 DOM 同步(#504 回归
+     const { shell, domLayer } = makeShell({ rendererMode: 'leafer', engineLodEnabled: 'true' })
+     applyViewportImperatively(shell, viewport)
+     expect(domLayer.style.transform).toBe('translate(-120px, 45px) scale(1.5)')
+-    expect(shell.style.backgroundPosition).toBe('-120px 45px')
++    expect(shell.style.backgroundPosition).toBe('-12px 45px')
+     expect(shell.style.backgroundSize).toBe('54px 54px') // 36 * 1.5,网格背景随缩放
+     expect(shell.dataset.viewportX).toBe('-120')
+     expect(shell.dataset.viewportY).toBe('45')
+@@ -45,14 +45,14 @@ describe('applyViewportImperatively — freeze-pan 每帧 DOM 同步(#504 回归
+     const { shell, domLayer } = makeShell({ rendererMode: 'dom', engineLodEnabled: 'false' })
+     applyViewportImperatively(shell, viewport)
+     expect(domLayer.style.transform).toBe('translate(-120px, 45px) scale(1.5)')
+-    expect(shell.style.backgroundPosition).toBe('-120px 45px')
++    expect(shell.style.backgroundPosition).toBe('-12px 45px')
+   })
+ 
+   it('pixi + LOD(工装轨)也不再跳过——engineOnlyPan 门已整体退役', () => {
+     const { shell, domLayer } = makeShell({ rendererMode: 'pixi', engineLodEnabled: 'true' })
+     applyViewportImperatively(shell, viewport)
+     expect(domLayer.style.transform).toBe('translate(-120px, 45px) scale(1.5)')
+-    expect(shell.style.backgroundPosition).toBe('-120px 45px')
++    expect(shell.style.backgroundPosition).toBe('-12px 45px')
+   })
+ 
+   it('shell 为 null 时安全 no-op', () => {
+diff --git a/src/canvas/useViewport.ts b/src/canvas/useViewport.ts
+index 67cc314c..23a13d85 100644
+--- a/src/canvas/useViewport.ts
++++ b/src/canvas/useViewport.ts
+@@ -28,6 +28,8 @@ import { useCameraFocusStore } from '../store/cameraFocusStore'
+ import { debugLogger } from '../store/debugLogStore'
+ import { viewportToCenterBounds, viewportToRevealBounds } from './autoFocusPlaceholder'
+ import { applyEngineSpikeCamera } from '../render/engineSpikeCameraBridge'
++import { canvasBackgroundStyleFor } from './canvasPattern'
++import type { CanvasBackgroundPattern } from './canvasPattern'
+ 
+ export const defaultViewportFor = (sceneId: string): Viewport => ({
+   // 画布全铺(2026-07-05):shell 原点从旧 grid 列右缘(268px)左移到 0,默认偏移
+@@ -81,13 +83,18 @@ const virtualizedPanEnabled = () => virtualizationMode === 'on' && cullingMode =
+ // annotation 等节点不成立:lod 默认 on 后,拖拽中 DOM 节点不动、松手后跳位
+ // (React 的 domLayer transform 要等 endPan 后才 commit)。用户真机抓到的回归,
+ // 门已整体退役——freeze-pan 每帧写一次单元素 transform + 背景位置,代价可忽略。
+-export const applyViewportImperatively = (shell: HTMLElement | null, viewport: Viewport) => {
++export const applyViewportImperatively = (
++  shell: HTMLElement | null,
++  viewport: Viewport,
++  backgroundPattern: CanvasBackgroundPattern = 'grid',
++) => {
+   if (!shell) return
++  const backgroundStyle = canvasBackgroundStyleFor(backgroundPattern, viewport)
+   shell.dataset.viewportScale = String(viewport.scale)
+   shell.dataset.viewportX = String(viewport.x)
+   shell.dataset.viewportY = String(viewport.y)
+-  shell.style.backgroundPosition = `${viewport.x}px ${viewport.y}px`
+-  shell.style.backgroundSize = `${36 * viewport.scale}px ${36 * viewport.scale}px`
++  shell.style.backgroundPosition = String(backgroundStyle.backgroundPosition ?? '')
++  shell.style.backgroundSize = String(backgroundStyle.backgroundSize ?? '')
+   const domLayer = shell.querySelector<HTMLElement>('.dom-canvas-layer')
+   if (domLayer) domLayer.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`
+   const leaferCanvas = shell.querySelector<HTMLCanvasElement>('.canvas-host canvas')
+@@ -105,12 +112,13 @@ type UseViewportOptions = {
+   nodes: MivoCanvasNode[]
+   selectedNodes: MivoCanvasNode[]
+   onCloseContextMenu: () => void
++  backgroundPattern?: CanvasBackgroundPattern
+ }
+ 
+ // Viewport state + pan + persistence + zoom/fit callbacks + wheel handling.
+ // Extracted from useCanvasInteractionController (F7 viewport gap). Pure
+ // extraction: behavior identical to the inline controller logic.
+-export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseContextMenu }: UseViewportOptions) {
++export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseContextMenu, backgroundPattern = 'grid' }: UseViewportOptions) {
+   const viewportRef = useRef<Viewport>(initialViewportFor(sceneId))
+   const panRef = useRef<PanState | null>(null)
+   const panCacheEnabled = useMemo(() => panCacheEnabledFromUrl(), [])
+@@ -304,13 +312,13 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
+       if (freezePanEnabled) {
+         const nextViewport = viewportFromPan(pan, event.clientX, event.clientY, viewportRef.current)
+         viewportRef.current = nextViewport
+-        applyViewportImperatively(shellRef.current, nextViewport)
++        applyViewportImperatively(shellRef.current, nextViewport, backgroundPattern)
+         return true
+       }
+       setViewport((current) => viewportFromPan(pan, event.clientX, event.clientY, current))
+       return true
+     },
+-    [freezePanEnabled, shellRef],
++    [backgroundPattern, freezePanEnabled, shellRef],
+   )
+ 
+   // Dispatcher (handleCanvasPointerEnd) pan branch. freeze-pan(panCache 或
+diff --git a/src/i18n/locales/en/settings.json b/src/i18n/locales/en/settings.json
+index 04ca3496..0c16dada 100644
+--- a/src/i18n/locales/en/settings.json
++++ b/src/i18n/locales/en/settings.json
+@@ -2,6 +2,14 @@
+   "title": "Settings",
+   "open": "Open settings",
+   "close": "Close settings",
++  "canvas": {
++    "title": "Canvas settings",
++    "open": "Open canvas settings",
++    "background": "Canvas background",
++    "backgroundDescription": "Choose how the canvas background is displayed.",
++    "grid": "Grid",
++    "dots": "Dots"
++  },
+   "account": "Account",
+   "notSignedIn": "Not signed in",
+   "signIn": "Sign in",
+diff --git a/src/i18n/locales/ja/settings.json b/src/i18n/locales/ja/settings.json
+index 6f2140c1..c62a2585 100644
+--- a/src/i18n/locales/ja/settings.json
++++ b/src/i18n/locales/ja/settings.json
+@@ -2,6 +2,14 @@
+   "title": "設定",
+   "open": "設定を開く",
+   "close": "設定を閉じる",
++  "canvas": {
++    "title": "キャンバス設定",
++    "open": "キャンバス設定を開く",
++    "background": "キャンバスの背景",
++    "backgroundDescription": "キャンバス背景の表示方法を選択します。",
++    "grid": "グリッド",
++    "dots": "ドット"
++  },
+   "account": "アカウント",
+   "notSignedIn": "未ログイン",
+   "signIn": "ログイン",
+diff --git a/src/i18n/locales/ko/settings.json b/src/i18n/locales/ko/settings.json
+index ddd7117b..a44db8ba 100644
+--- a/src/i18n/locales/ko/settings.json
++++ b/src/i18n/locales/ko/settings.json
+@@ -2,6 +2,14 @@
+   "title": "설정",
+   "open": "설정 열기",
+   "close": "설정 닫기",
++  "canvas": {
++    "title": "캔버스 설정",
++    "open": "캔버스 설정 열기",
++    "background": "캔버스 배경",
++    "backgroundDescription": "캔버스 배경 표시 방식을 선택합니다.",
++    "grid": "그리드",
++    "dots": "점"
++  },
+   "account": "계정",
+   "notSignedIn": "로그인되지 않음",
+   "signIn": "로그인",
+diff --git a/src/i18n/locales/zh-CN/settings.json b/src/i18n/locales/zh-CN/settings.json
+index 99879c0a..59736aa5 100644
+--- a/src/i18n/locales/zh-CN/settings.json
++++ b/src/i18n/locales/zh-CN/settings.json
+@@ -2,6 +2,14 @@
+   "title": "设置",
+   "open": "打开设置",
+   "close": "关闭设置",
++  "canvas": {
++    "title": "画布设置",
++    "open": "打开画布设置",
++    "background": "画布底纹",
++    "backgroundDescription": "选择画布背景的显示方式。",
++    "grid": "网格",
++    "dots": "点状"
++  },
+   "account": "账号",
+   "notSignedIn": "未登录",
+   "signIn": "登录",
+diff --git a/src/store/canvasAppearanceStore.test.ts b/src/store/canvasAppearanceStore.test.ts
+new file mode 100644
+index 00000000..787aea76
+--- /dev/null
++++ b/src/store/canvasAppearanceStore.test.ts
+@@ -0,0 +1,65 @@
++// @vitest-environment happy-dom
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++import {
++  CANVAS_BACKGROUND_PATTERN_STORAGE_KEY,
++  __resetCanvasAppearanceForTests,
++  createCanvasAppearanceStore,
++  readCanvasBackgroundPatternFromStorage,
++  useCanvasAppearanceStore,
++} from './canvasAppearanceStore'
++import { useDebugLogStore } from './debugLogStore'
++
++beforeEach(() => {
++  __resetCanvasAppearanceForTests()
++  useDebugLogStore.getState().clear()
++})
++
++describe('canvasAppearanceStore', () => {
++  it('defaults to the grid pattern', () => {
++    expect(useCanvasAppearanceStore.getState().backgroundPattern).toBe('grid')
++  })
++
++  it('switches between grid and dots and persists the preference', () => {
++    useCanvasAppearanceStore.getState().setBackgroundPattern('dots')
++    expect(useCanvasAppearanceStore.getState().backgroundPattern).toBe('dots')
++    expect(window.localStorage.getItem(CANVAS_BACKGROUND_PATTERN_STORAGE_KEY)).toBe('dots')
++    const reloadedStore = createCanvasAppearanceStore()
++    expect(reloadedStore.getState().backgroundPattern).toBe('dots')
++
++    useCanvasAppearanceStore.getState().setBackgroundPattern('grid')
++    expect(useCanvasAppearanceStore.getState().backgroundPattern).toBe('grid')
++  })
++
++  it('falls back to grid when stored value is invalid', () => {
++    window.localStorage.setItem(CANVAS_BACKGROUND_PATTERN_STORAGE_KEY, 'stripes')
++    expect(readCanvasBackgroundPatternFromStorage()).toBe('grid')
++  })
++
++  it('warns and keeps memory state when storage is unavailable', () => {
++    const getItem = vi.spyOn(window.localStorage, 'getItem').mockImplementation(() => {
++      throw new Error('blocked')
++    })
++    expect(readCanvasBackgroundPatternFromStorage()).toBe('grid')
++    expect(useDebugLogStore.getState().entries[0]?.message).toContain('using grid default')
++    getItem.mockRestore()
++
++    const setItem = vi.spyOn(window.localStorage, 'setItem').mockImplementation(() => {
++      throw new Error('blocked')
++    })
++    useCanvasAppearanceStore.getState().setBackgroundPattern('dots')
++    expect(useCanvasAppearanceStore.getState().backgroundPattern).toBe('dots')
++    expect(useDebugLogStore.getState().entries.some((entry) => entry.level === 'warning')).toBe(true)
++    setItem.mockRestore()
++  })
++
++  it('opens and closes the canvas appearance panel independently', () => {
++    useCanvasAppearanceStore.getState().openCanvasAppearance()
++    expect(useCanvasAppearanceStore.getState().appearancePanelOpen).toBe(true)
++    useCanvasAppearanceStore.getState().closeCanvasAppearance()
++    expect(useCanvasAppearanceStore.getState().appearancePanelOpen).toBe(false)
++    expect(useDebugLogStore.getState().entries.map((entry) => entry.message)).toEqual([
++      'Canvas appearance settings closed',
++      'Canvas appearance settings opened',
++    ])
++  })
++})
+diff --git a/src/store/canvasAppearanceStore.ts b/src/store/canvasAppearanceStore.ts
+new file mode 100644
+index 00000000..f150157f
+--- /dev/null
++++ b/src/store/canvasAppearanceStore.ts
+@@ -0,0 +1,76 @@
++import { create } from 'zustand'
++import { debugLogger } from './debugLogStore'
++
++export const CANVAS_BACKGROUND_PATTERNS = ['grid', 'dots'] as const
++export type CanvasBackgroundPattern = (typeof CANVAS_BACKGROUND_PATTERNS)[number]
++
++export const CANVAS_BACKGROUND_PATTERN_STORAGE_KEY = 'mivo.canvas.background-pattern'
++const DEFAULT_PATTERN: CanvasBackgroundPattern = 'grid'
++
++const isCanvasBackgroundPattern = (value: string | null): value is CanvasBackgroundPattern =>
++  value === 'grid' || value === 'dots'
++
++export const readCanvasBackgroundPatternFromStorage = (): CanvasBackgroundPattern => {
++  if (typeof window === 'undefined') return DEFAULT_PATTERN
++  try {
++    const stored = window.localStorage.getItem(CANVAS_BACKGROUND_PATTERN_STORAGE_KEY)
++    return isCanvasBackgroundPattern(stored) ? stored : DEFAULT_PATTERN
++  } catch {
++    debugLogger.warn('Canvas Appearance', 'Background pattern preference unavailable; using grid default')
++    return DEFAULT_PATTERN
++  }
++}
++
++const persistPattern = (pattern: CanvasBackgroundPattern): boolean => {
++  if (typeof window === 'undefined') return true
++  try {
++    window.localStorage.setItem(CANVAS_BACKGROUND_PATTERN_STORAGE_KEY, pattern)
++    return true
++  } catch {
++    // 画布底纹是非关键偏好：宿主存储不可用时保留本次会话的内存态即可。
++    debugLogger.warn('Canvas Appearance', 'Background pattern preference could not be persisted; using session memory')
++    return false
++  }
++}
++
++export type CanvasAppearanceState = {
++  backgroundPattern: CanvasBackgroundPattern
++  appearancePanelOpen: boolean
++  setBackgroundPattern: (pattern: CanvasBackgroundPattern) => void
++  openCanvasAppearance: () => void
++  closeCanvasAppearance: () => void
++}
++
++export const createCanvasAppearanceStore = () =>
++  create<CanvasAppearanceState>((set) => ({
++    backgroundPattern: readCanvasBackgroundPatternFromStorage(),
++    appearancePanelOpen: false,
++    setBackgroundPattern: (pattern) => {
++      const persisted = persistPattern(pattern)
++      debugLogger.log(
++        'Canvas Appearance',
++        `Background pattern changed: ${pattern}${persisted ? '' : ' (session only; storage unavailable)'}`,
++      )
++      set({ backgroundPattern: pattern })
++    },
++    openCanvasAppearance: () => {
++      debugLogger.log('Canvas Appearance', 'Canvas appearance settings opened')
++      set({ appearancePanelOpen: true })
++    },
++    closeCanvasAppearance: () => {
++      debugLogger.log('Canvas Appearance', 'Canvas appearance settings closed')
++      set({ appearancePanelOpen: false })
++    },
++  }))
++
++export const useCanvasAppearanceStore = createCanvasAppearanceStore()
++
++export const __resetCanvasAppearanceForTests = () => {
++  useCanvasAppearanceStore.setState({ backgroundPattern: DEFAULT_PATTERN, appearancePanelOpen: false })
++  if (typeof window === 'undefined') return
++  try {
++    window.localStorage.removeItem(CANVAS_BACKGROUND_PATTERN_STORAGE_KEY)
++  } catch {
++    // Ignore unavailable test/browser storage.
++  }
++}

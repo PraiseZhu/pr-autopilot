@@ -1,0 +1,1991 @@
+diff --git a/public/changelog.json b/public/changelog.json
+index c6348c92..eeeb3c3a 100644
+--- a/public/changelog.json
++++ b/public/changelog.json
+@@ -1,7 +1,25 @@
+ {
+-  "lastGithash": "5da52d15837673b9c3ca4d4121f78c435b691387",
+-  "updatedAt": "2026-08-08T08:26:14+08:00",
++  "lastGithash": "9e52ec6fe58c742b57102332b49988ade116b8f2",
++  "updatedAt": "2026-08-08T13:05:21+08:00",
+   "entries": [
++    {
++      "date": "2026-08-08",
++      "prs": [
++        579,
++        578
++      ],
++      "features": [],
++      "fixes": [
++        {
++          "text": "更新日志补录了 8 月 7 日的记录",
++          "by": "PraiseZhu"
++        },
++        {
++          "text": "内部质量保障：PR 自动合并前新增一道自动审查前置检查，管理员保留人工加急通道（无用户可见变化）。",
++          "by": "PraiseZhu"
++        }
++      ]
++    },
+     {
+       "date": "2026-08-07",
+       "prs": [
+diff --git a/src/app/assetGcBoot.test.ts b/src/app/assetGcBoot.test.ts
+new file mode 100644
+index 00000000..f1fac137
+--- /dev/null
++++ b/src/app/assetGcBoot.test.ts
+@@ -0,0 +1,194 @@
++// assetGcBoot.test — #509 wiring-layer coverage (R1 seat①-F2 / seat③-F2: this layer
++// shipped with zero dedicated tests). Every heavy dependency (canvasStore/chatStore/
++// canvasPersistConfig/chatPersistConfig/persistIdbStorage/kernelMode) is mocked — the
++// module under test is pure orchestration (which key to read, which gate to check,
++// which lock to take), and the policy it orchestrates (assetGc.ts) already has its
++// own direct-call test suite (assetGc.test.ts).
++
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++const persistState = vi.hoisted(() => ({ isLocal: true }))
++const kernelState = vi.hoisted(() => ({ isLegacy: true }))
++const canvasState = vi.hoisted(() => ({ value: { canvases: {}, nodes: [] } as unknown }))
++const chatState = vi.hoisted(() => ({ value: { messagesByScene: {} } as unknown }))
++const strictRawGetItemMock = vi.hoisted(() => vi.fn())
++const debugLoggerMock = vi.hoisted(() => ({ log: vi.fn(), warn: vi.fn(), error: vi.fn() }))
++const runAssetGcSweepMock = vi.hoisted(() => vi.fn())
++
++vi.mock('../lib/persistMode', () => ({ get isLocalPersist() { return persistState.isLocal } }))
++vi.mock('./kernelMode', () => ({ isLegacyKernelEffective: () => kernelState.isLegacy }))
++vi.mock('../lib/persistIdbStorage', () => ({ strictRawGetItem: strictRawGetItemMock }))
++vi.mock('../kernel/docKernelPersistAdapter', () => ({ documentKey: (name: string) => `${name}:document` }))
++vi.mock('../lib/persistUserId', () => ({
++  getPersistUserId: () => 'test-user',
++  namespacedKey: (name: string) => `${name}:test-user`,
++}))
++vi.mock('../store/canvasPersistConfig', () => ({ canvasPersistOptions: { name: 'mivo-canvas-demo' } }))
++vi.mock('../store/chatPersistConfig', () => ({ chatPersistOptions: { name: 'mivo-chat-demo' } }))
++vi.mock('../store/canvasStore', () => ({ useCanvasStore: { getState: () => canvasState.value } }))
++vi.mock('../store/chatStore', () => ({ useChatStore: { getState: () => chatState.value } }))
++vi.mock('../store/debugLogStore', () => ({ debugLogger: debugLoggerMock }))
++vi.mock('../lib/assetGc', () => ({
++  CLIENT_ASSET_GRACE_PERIOD_MS: 7 * 24 * 60 * 60 * 1000,
++  parsePersistedBlobRefs: vi.fn(() => new Set()),
++  runAssetGcSweep: runAssetGcSweepMock,
++}))
++
++beforeEach(() => {
++  vi.resetModules()
++  persistState.isLocal = true
++  kernelState.isLegacy = true
++  strictRawGetItemMock.mockReset().mockResolvedValue(null)
++  debugLoggerMock.log.mockClear()
++  debugLoggerMock.warn.mockClear()
++  debugLoggerMock.error.mockClear()
++  runAssetGcSweepMock.mockReset().mockResolvedValue({
++    status: 'completed', scanned: 0, foreign: 0, marked: 0, resurrected: 0,
++    deleted: 0, freedBytes: 0, deletesWithheld: 0, stale: 0,
++  })
++})
++
++afterEach(() => {
++  vi.unstubAllGlobals()
++})
++
++describe('runAssetGcSweepNow — #509 R1(seat2)-F3: the isLocalPersist gate lives on the function itself', () => {
++  it('server/shadow persist mode: skips WITHOUT calling the policy layer, returns status=skipped, warns', async () => {
++    persistState.isLocal = false
++    const { runAssetGcSweepNow } = await import('./assetGcBoot')
++
++    const result = await runAssetGcSweepNow()
++
++    expect(result.status).toBe('skipped')
++    expect(result.scanned).toBe(0)
++    expect(runAssetGcSweepMock).not.toHaveBeenCalled()
++    expect(debugLoggerMock.warn).toHaveBeenCalledWith(
++      'Asset GC',
++      expect.stringContaining('persist mode is not local'),
++    )
++  })
++
++  it('local persist mode: delegates to the policy layer with the live store getters', async () => {
++    persistState.isLocal = true
++    canvasState.value = { canvases: { c1: { nodes: [] } }, nodes: [] }
++    const { runAssetGcSweepNow } = await import('./assetGcBoot')
++
++    await runAssetGcSweepNow({ graceMs: 1234, now: 5678 })
++
++    expect(runAssetGcSweepMock).toHaveBeenCalledTimes(1)
++    const call = runAssetGcSweepMock.mock.calls[0][0]
++    expect(call.currentUserId).toBe('test-user')
++    expect(call.graceMs).toBe(1234)
++    expect(call.now).toBe(5678)
++    expect(call.getCanvasRefState()).toBe(canvasState.value)
++    expect(call.getChatRefState()).toBe(chatState.value)
++  })
++
++  it('a caller bypassing scheduleAssetGcSweeps entirely (e.g. the E2E bridge) still gets the gate', async () => {
++    // This is the exact shape R1(seat2)-F3 named: window.__MIVO_E2E__.runAssetGcSweep
++    // calls this export directly, never through scheduleAssetGcSweeps.
++    persistState.isLocal = false
++    const { runAssetGcSweepNow } = await import('./assetGcBoot')
++
++    const result = await runAssetGcSweepNow({ graceMs: 0 })
++
++    expect(result.status).toBe('skipped')
++    expect(runAssetGcSweepMock).not.toHaveBeenCalled()
++  })
++})
++
++describe('readPersistedBlobRefs (via runAssetGcSweepNow → readPersistedBlobRefs option) — #509 R1(seat2)-F2', () => {
++  const capturedReader = async () => {
++    const { runAssetGcSweepNow } = await import('./assetGcBoot')
++    await runAssetGcSweepNow()
++    return runAssetGcSweepMock.mock.calls[0][0].readPersistedBlobRefs as () => Promise<Set<string> | undefined>
++  }
++
++  it('legacy kernel: reads the namespaced single-blob key for canvas', async () => {
++    kernelState.isLegacy = true
++    const readPersistedBlobRefs = await capturedReader()
++    strictRawGetItemMock.mockResolvedValue(null)
++
++    await readPersistedBlobRefs()
++
++    expect(strictRawGetItemMock).toHaveBeenCalledWith('mivo-canvas-demo:test-user')
++    expect(strictRawGetItemMock).toHaveBeenCalledWith('mivo-chat-demo:test-user')
++  })
++
++  it('new kernel: reads the document-domain split key for canvas (not the namespaced single blob)', async () => {
++    kernelState.isLegacy = false
++    const readPersistedBlobRefs = await capturedReader()
++    strictRawGetItemMock.mockResolvedValue(null)
++
++    await readPersistedBlobRefs()
++
++    expect(strictRawGetItemMock).toHaveBeenCalledWith('mivo-canvas-demo:document')
++    expect(strictRawGetItemMock).not.toHaveBeenCalledWith('mivo-canvas-demo:test-user')
++  })
++
++  it('#509 R1(seat2)-F2: strictRawGetItem throwing (a real IDB failure) is caught and returns undefined — never null/empty', async () => {
++    const readPersistedBlobRefs = await capturedReader()
++    strictRawGetItemMock.mockRejectedValue(new Error('IDB transaction failed'))
++
++    const refs = await readPersistedBlobRefs()
++
++    expect(refs).toBeUndefined()
++    expect(debugLoggerMock.warn).toHaveBeenCalledWith(
++      'Asset GC',
++      expect.stringContaining('persisted-blob read failed'),
++    )
++  })
++
++  it('a genuinely fresh profile (both keys null, no thrown error) resolves via parsePersistedBlobRefs, not swallowed as a failure', async () => {
++    const readPersistedBlobRefs = await capturedReader()
++    strictRawGetItemMock.mockResolvedValue(null)
++
++    const refs = await readPersistedBlobRefs()
++
++    expect(refs).toEqual(new Set())
++    expect(debugLoggerMock.warn).not.toHaveBeenCalledWith(
++      'Asset GC',
++      expect.stringContaining('persisted-blob read failed'),
++    )
++  })
++})
++
++describe('scheduleAssetGcSweeps — scheduling-level optimization, not the safety gate itself', () => {
++  it('server/shadow mode: does not set up timers, warns once', async () => {
++    vi.useFakeTimers()
++    persistState.isLocal = false
++    const { scheduleAssetGcSweeps } = await import('./assetGcBoot')
++
++    scheduleAssetGcSweeps()
++    await vi.runAllTimersAsync()
++
++    expect(runAssetGcSweepMock).not.toHaveBeenCalled()
++    expect(debugLoggerMock.warn).toHaveBeenCalledWith('Asset GC', expect.stringContaining('sweep disabled'))
++    vi.useRealTimers()
++  })
++
++  it('local mode: schedules and eventually calls the sweep', async () => {
++    vi.useFakeTimers()
++    persistState.isLocal = true
++    const { scheduleAssetGcSweeps } = await import('./assetGcBoot')
++
++    scheduleAssetGcSweeps()
++    await vi.advanceTimersByTimeAsync(21_000)
++
++    expect(runAssetGcSweepMock).toHaveBeenCalled()
++    vi.useRealTimers()
++  })
++
++  it('is idempotent: a second call does not schedule a second timer chain', async () => {
++    vi.useFakeTimers()
++    persistState.isLocal = true
++    const { scheduleAssetGcSweeps } = await import('./assetGcBoot')
++
++    scheduleAssetGcSweeps()
++    scheduleAssetGcSweeps()
++    await vi.advanceTimersByTimeAsync(21_000)
++
++    expect(runAssetGcSweepMock).toHaveBeenCalledTimes(1)
++    vi.useRealTimers()
++  })
++})
+diff --git a/src/app/assetGcBoot.ts b/src/app/assetGcBoot.ts
+new file mode 100644
+index 00000000..e3e7ad3e
+--- /dev/null
++++ b/src/app/assetGcBoot.ts
+@@ -0,0 +1,183 @@
++// assetGcBoot — #509 wiring for the client asset GC sweep (policy: src/lib/assetGc.ts).
++//
++// App-shell glue: feeds the sweep live store state, the FX-6 user namespace, and the
++// persisted-blob reader (cross-tab truth for the delete phase), and schedules it off
++// the critical path (delayed boot pass + a periodic idle pass). Wired ONLY from the
++// web app's useStoreHydration success path — deliberately NOT from the Cindy plugin
++// (its sandbox owns a separate IndexedDB and never mounts chat; wiring it is a
++// follow-up once its archive-restore flow is covered) and NOT on the degraded /
++// persist-busy hydration paths (their in-memory state is the demo default, not the
++// user's truth — sweeping against it would mark everything; see the gates below).
++//
++// Mode gate: the sweep only ever runs in LOCAL persist mode. In server/shadow mode
++// canvas content hydrates lazily per scene, so state.canvases is an INCOMPLETE
++// reference surface — a scan there would misjudge assets of never-visited canvases.
++// Server-side asset GC is #313; local IDB assets referenced by server canvases wait
++// for it.
++
++import {
++  CLIENT_ASSET_GRACE_PERIOD_MS,
++  parsePersistedBlobRefs,
++  runAssetGcSweep,
++  type AssetGcSweepResult,
++} from '../lib/assetGc'
++import { strictRawGetItem } from '../lib/persistIdbStorage'
++import { documentKey } from '../kernel/docKernelPersistAdapter'
++import { isLegacyKernelEffective } from './kernelMode'
++import { isLocalPersist } from '../lib/persistMode'
++import { getPersistUserId, namespacedKey } from '../lib/persistUserId'
++import { canvasPersistOptions } from '../store/canvasPersistConfig'
++import { chatPersistOptions } from '../store/chatPersistConfig'
++import { useCanvasStore } from '../store/canvasStore'
++import { useChatStore } from '../store/chatStore'
++import { debugLogger } from '../store/debugLogStore'
++
++const SOURCE = 'Asset GC'
++
++/** First pass waits out the boot burst (hydration, first paint, demo draws). */
++const BOOT_SWEEP_DELAY_MS = 20_000
++/** Periodic re-pass — catches history-stack eviction during long sessions. */
++const SWEEP_INTERVAL_MS = 10 * 60_000
++/** Cross-tab mutual exclusion for the sweep (feature-detected; sweeps are also
++ *  individually safe without it thanks to the in-transaction re-verify). */
++const SWEEP_LOCK_NAME = 'mivo-asset-gc-sweep'
++
++/**
++ * Read the persisted canvas + chat blobs and parse their reference set. #509 R1-F2:
++ * uses `strictRawGetItem` (never falls back to localStorage / swallows an IDB
++ * failure into a silent `null`) — a genuine read failure must surface as an
++ * exception here, because a swallowed failure reading back exactly like "nothing
++ * persisted yet" would silently defeat the fail-closed guarantee below. The canvas
++ * key is resolved through the SAME kernel branch the app persists through (legacy:
++ * namespaced single blob / new: the document-domain key, which alone carries
++ * `canvases` — session only holds selection/tools, irrelevant to the reference
++ * scan), so the sweep always audits the bytes the app would actually rehydrate.
++ * Returns undefined when a blob is present but unreadable, or the read itself
++ * throws → the sweep withholds every delete this pass (fail-closed).
++ */
++const readPersistedBlobRefs = async (): Promise<Set<string> | undefined> => {
++  try {
++    const canvasKey = isLegacyKernelEffective()
++      ? namespacedKey(canvasPersistOptions.name)
++      : documentKey(canvasPersistOptions.name)
++    const [canvasRaw, chatRaw] = await Promise.all([
++      strictRawGetItem(canvasKey),
++      strictRawGetItem(namespacedKey(chatPersistOptions.name)),
++    ])
++    return parsePersistedBlobRefs(canvasRaw, chatRaw)
++  } catch (error) {
++    debugLogger.warn(
++      SOURCE,
++      `persisted-blob read failed (deletes will be withheld): ${error instanceof Error ? error.message : String(error)}`,
++    )
++    return undefined
++  }
++}
++
++export type RunAssetGcNowOptions = {
++  /** Override the grace window (bench/manual verification only). */
++  graceMs?: number
++  now?: number
++}
++
++const SKIPPED_NOT_LOCAL_RESULT: AssetGcSweepResult = {
++  status: 'skipped',
++  scanned: 0,
++  foreign: 0,
++  marked: 0,
++  resurrected: 0,
++  deleted: 0,
++  freedBytes: 0,
++  deletesWithheld: 0,
++  stale: 0,
++}
++
++/**
++ * Run one sweep against the live stores. Exported for the E2E/bench hook
++ * (window.__MIVO_E2E__.runAssetGcSweep) and used by the scheduler below.
++ *
++ * #509 R1-F3: the `isLocalPersist` gate lives HERE, not just in the scheduler —
++ * `scheduleAssetGcSweeps` below is one caller, but the E2E bridge calls this
++ * function directly, and any future caller would too. Gating only the scheduler
++ * left every other entry point free to run a sweep against an incomplete
++ * reference surface in server/shadow mode (canvas content there hydrates lazily
++ * per scene, so state.canvases never covers every canvas — see module header).
++ */
++export const runAssetGcSweepNow = (options: RunAssetGcNowOptions = {}): Promise<AssetGcSweepResult> => {
++  if (!isLocalPersist) {
++    debugLogger.warn(SOURCE, 'sweep skipped: persist mode is not local (server-side GC is #313)')
++    return Promise.resolve(SKIPPED_NOT_LOCAL_RESULT)
++  }
++  return runAssetGcSweep({
++    currentUserId: getPersistUserId(),
++    getCanvasRefState: () => useCanvasStore.getState(),
++    getChatRefState: () => useChatStore.getState(),
++    readPersistedBlobRefs,
++    graceMs: options.graceMs ?? CLIENT_ASSET_GRACE_PERIOD_MS,
++    now: options.now,
++  })
++}
++
++/** Serialize sweeps across tabs via Web Locks when available; ifAvailable means a
++ *  busy lock skips this pass instead of queueing behind another tab. */
++const runSweepExclusive = async (): Promise<void> => {
++  const locks = typeof navigator !== 'undefined' ? navigator.locks : undefined
++  if (locks?.request) {
++    await locks.request(SWEEP_LOCK_NAME, { ifAvailable: true }, async (lock) => {
++      if (!lock) {
++        debugLogger.log(SOURCE, 'sweep skipped: another tab holds the sweep lock')
++        return
++      }
++      await runAssetGcSweepNow()
++    })
++    return
++  }
++  await runAssetGcSweepNow()
++}
++
++/** Defer to browser idle time when available so the scan never competes with input. */
++const whenIdle = (run: () => void): void => {
++  if (typeof requestIdleCallback === 'function') {
++    requestIdleCallback(() => run(), { timeout: 30_000 })
++  } else {
++    setTimeout(run, 1_000)
++  }
++}
++
++let scheduled = false
++
++/**
++ * Schedule the recurring sweep. Called once from useStoreHydration's SUCCESS path —
++ * never from the degraded paths (see module header). Idempotent across calls.
++ */
++export const scheduleAssetGcSweeps = (): void => {
++  if (scheduled) return
++  scheduled = true
++
++  if (!isLocalPersist) {
++    // Server/shadow persist: incomplete local reference surface (see module header).
++    // This check is a scheduling-level optimization (skip setting up timers that
++    // would just warn every SWEEP_INTERVAL_MS) — the actual safety gate lives in
++    // runAssetGcSweepNow itself (#509 R1-F3), so any other caller is covered too.
++    debugLogger.warn(SOURCE, 'sweep disabled: persist mode is not local (server-side GC is #313)')
++    return
++  }
++
++  const pass = () => {
++    whenIdle(() => {
++      void runSweepExclusive().catch((error) => {
++        debugLogger.error(
++          SOURCE,
++          `scheduled sweep crashed: ${error instanceof Error ? error.message : String(error)}`,
++        )
++      })
++    })
++  }
++
++  setTimeout(pass, BOOT_SWEEP_DELAY_MS)
++  setInterval(pass, SWEEP_INTERVAL_MS)
++  debugLogger.log(
++    SOURCE,
++    `sweeps scheduled: first in ${BOOT_SWEEP_DELAY_MS / 1000}s, then every ${SWEEP_INTERVAL_MS / 60_000} min (grace ${CLIENT_ASSET_GRACE_PERIOD_MS / 86_400_000} d)`,
++  )
++}
+diff --git a/src/app/useStoreHydration.ts b/src/app/useStoreHydration.ts
+index 43b517b9..b5c8ab31 100644
+--- a/src/app/useStoreHydration.ts
++++ b/src/app/useStoreHydration.ts
+@@ -11,6 +11,7 @@ import { migrateV10ToV11 } from '../kernel/persistMigration'
+ import { rawIdbStorage } from '../lib/persistIdbStorage'
+ import { isLocalPersist } from '../lib/persistMode'
+ import { bootPersistWiring } from '../lib/persistBoot'
++import { scheduleAssetGcSweeps } from './assetGcBoot'
+ import { t } from '../i18n'
+ 
+ const SOURCE = 'Store Hydration'
+@@ -133,6 +134,10 @@ export function useStoreHydration(): boolean {
+               `reconcileExpiredChatTasks failed: ${error instanceof Error ? error.message : String(error)}`,
+             )
+           })
++          // #509:资产 GC 只挂在这条**完整成功**路径上——persist-busy 与降级 catch 路径
++          // 的内存态是 demo 默认而非用户真值,拿它扫引用会把一切都标成孤儿。
++          // 内部自带 local-persist 门与延迟/空闲调度,fire-and-forget。
++          scheduleAssetGcSweeps()
+         }
+       } catch (error) {
+         const message = error instanceof Error ? error.message : String(error)
+diff --git a/src/lib/assetGc.test.ts b/src/lib/assetGc.test.ts
+new file mode 100644
+index 00000000..38b34609
+--- /dev/null
++++ b/src/lib/assetGc.test.ts
+@@ -0,0 +1,423 @@
++// assetGc.test — #509 client asset GC acceptance anchors.
++//
++// The issue's two acceptance criteria are pinned here end-to-end against a real
++// (in-memory) IndexedDB, through the production import pipeline (saveImportedAsset)
++// and the production sweep (runAssetGcSweep → readAssetGcIndex/applyAssetGcDecisions):
++//   1. 导入 → 删 → (宽限/空闲) → IDB 记录回落(delete only after grace, with tests
++//      pinning both sides of the boundary);
++//   2. undo 恢复被删图片节点仍能取到资产 —— a deleted node sitting in the undo
++//      stacks keeps its asset referenced (never even marked), and a marked asset
++//      stays resolvable throughout the grace window.
++// Plus the safety gates: foreign-user records untouched, fail-closed delete
++// withholding when the persisted blobs are unreadable, cross-tab resurrect via the
++// persisted-blob reference set, and the no-mark-and-delete-in-one-pass invariant.
++
++import 'fake-indexeddb/auto'
++import { IDBFactory } from 'fake-indexeddb'
++import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
++
++vi.mock('./assetServiceMode', async (importActual) => {
++  const actual = await importActual<typeof import('./assetServiceMode')>()
++  return { ...actual, isAssetsServerMode: vi.fn(() => false) }
++})
++vi.mock('./assetService', () => ({
++  uploadAssetToServer: vi.fn(),
++  fetchServerAssetBlob: vi.fn(async () => null),
++}))
++vi.mock('../store/debugLogStore', () => ({
++  debugLogger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
++}))
++const pruneImageMetricsForAssetsMock = vi.hoisted(() => vi.fn())
++vi.mock('./imageMetricsCache', () => ({ pruneImageMetricsForAssets: pruneImageMetricsForAssetsMock }))
++
++import {
++  CLIENT_ASSET_GRACE_PERIOD_MS,
++  collectReferencedAssetUrls,
++  parsePersistedBlobRefs,
++  runAssetGcSweep,
++  type AssetGcCanvasRefState,
++  type AssetGcChatRefState,
++} from './assetGc'
++import { applyAssetGcDecisions, readAssetGcIndex, resolveAssetUrl, saveImportedAsset } from './assetStorage'
++import { setPersistUserId, __resetPersistUserId } from './persistUserId'
++
++const mdFile = (name = 'note.md', content = 'hello world') =>
++  new File([content], name, { type: 'text/markdown' })
++
++const emptyCanvasState = (): AssetGcCanvasRefState => ({
++  canvases: {},
++  nodes: [],
++  clipboardNodes: [],
++  historyPast: [],
++  historyFuture: [],
++})
++const emptyChatState = (): AssetGcChatRefState => ({ messagesByScene: {} })
++
++/** Sweep with everything injectable; defaults model the common case (anonymous
++ *  user, empty persisted blobs → cross-tab truth confirms "unreferenced"). */
++const sweep = (overrides: Partial<Parameters<typeof runAssetGcSweep>[0]> & { now?: number } = {}) =>
++  runAssetGcSweep({
++    currentUserId: 'anonymous',
++    getCanvasRefState: emptyCanvasState,
++    getChatRefState: emptyChatState,
++    readPersistedBlobRefs: async () => new Set<string>(),
++    ...overrides,
++  })
++
++const T0 = 1_700_000_000_000
++const GRACE = CLIENT_ASSET_GRACE_PERIOD_MS
++
++describe('collectReferencedAssetUrls', () => {
++  it('collects node assetUrl + image fills across canvases, mirrors, clipboard, and BOTH history stacks', () => {
++    const canvasState: AssetGcCanvasRefState = {
++      canvases: {
++        a: { nodes: [{ assetUrl: 'mivo-asset:c1' }] },
++        b: { nodes: [{ fills: [{ kind: 'solid' }, { kind: 'image', assetUrl: 'mivo-asset:c2' }] }] },
++      },
++      nodes: [{ assetUrl: 'mivo-asset:active' }],
++      clipboardNodes: [{ assetUrl: 'mivo-asset:clip' }],
++      historyPast: [{ nodes: [{ assetUrl: 'mivo-asset:past' }] }],
++      historyFuture: [{ nodes: [{ assetUrl: 'mivo-asset:future' }] }],
++    }
++    const chatState: AssetGcChatRefState = {
++      messagesByScene: {
++        scene: [
++          { generationContext: { referenceAssetUrls: ['mivo-asset:chat1', ''] } },
++          {},
++        ],
++      },
++    }
++
++    const refs = collectReferencedAssetUrls(canvasState, chatState)
++    expect(refs).toEqual(
++      new Set([
++        'mivo-asset:c1',
++        'mivo-asset:c2',
++        'mivo-asset:active',
++        'mivo-asset:clip',
++        'mivo-asset:past',
++        'mivo-asset:future',
++        'mivo-asset:chat1',
++      ]),
++    )
++  })
++})
++
++describe('parsePersistedBlobRefs', () => {
++  it('null blobs → empty set (fresh profile); valid envelopes → their refs', () => {
++    expect(parsePersistedBlobRefs(null, null)).toEqual(new Set())
++
++    const canvasBlob = JSON.stringify({
++      state: { canvases: { c: { nodes: [{ assetUrl: 'mivo-asset:x' }] } } },
++      version: 13,
++    })
++    const chatBlob = JSON.stringify({
++      state: { messagesByScene: { s: [{ generationContext: { referenceAssetUrls: ['mivo-asset:y'] } }] } },
++      version: 2,
++    })
++    expect(parsePersistedBlobRefs(canvasBlob, chatBlob)).toEqual(
++      new Set(['mivo-asset:x', 'mivo-asset:y']),
++    )
++  })
++
++  it('fail-closed: corrupt JSON or unexpected envelope shape → undefined', () => {
++    expect(parsePersistedBlobRefs('not-json{{', null)).toBeUndefined()
++    expect(parsePersistedBlobRefs(null, 'not-json{{')).toBeUndefined()
++    // Envelope present but not the expected shape (persist layout drift) — a scan
++    // over it could silently see zero refs and green-light deletes; refuse instead.
++    expect(parsePersistedBlobRefs(JSON.stringify({ state: {} }), null)).toBeUndefined()
++    expect(parsePersistedBlobRefs(JSON.stringify({ state: { canvases: [] } }), null)).toBeUndefined()
++    expect(parsePersistedBlobRefs(null, JSON.stringify({ state: {} }))).toBeUndefined()
++  })
++})
++
++describe('runAssetGcSweep — mark / grace / delete lifecycle', () => {
++  beforeEach(() => {
++    // Fresh in-memory IDB per test (the /auto shim registers one global instance;
++    // re-minting the factory isolates each test's asset store).
++    vi.stubGlobal('indexedDB', new IDBFactory())
++  })
++  afterEach(() => {
++    vi.unstubAllGlobals()
++    __resetPersistUserId()
++  })
++
++  it('referenced asset is never marked; unreferenced asset is marked but STAYS resolvable through grace', async () => {
++    const kept = await saveImportedAsset(mdFile('kept.md'))
++    const orphan = await saveImportedAsset(mdFile('orphan.md'))
++
++    const first = await sweep({
++      getCanvasRefState: () => ({
++        ...emptyCanvasState(),
++        canvases: { c: { nodes: [{ assetUrl: kept.assetUrl }] } },
++      }),
++      now: T0,
++    })
++    expect(first.status).toBe('completed')
++    expect(first.scanned).toBe(2)
++    expect(first.marked).toBe(1)
++    expect(first.deleted).toBe(0)
++
++    const index = await readAssetGcIndex()
++    const byUrl = new Map(index.map((e) => [`mivo-asset:${e.id}`, e]))
++    expect(byUrl.get(kept.assetUrl)?.lastRefZeroAt).toBeUndefined()
++    expect(byUrl.get(orphan.assetUrl)?.lastRefZeroAt).toBe(T0)
++
++    // Grace semantics: a marked record is untouched — resolve still works.
++    const resolved = await resolveAssetUrl(orphan.assetUrl)
++    expect(resolved.startsWith('blob:')).toBe(true)
++  })
++
++  it('one pass can never mark AND delete: deletion needs a previous-pass mark aged past grace', async () => {
++    const orphan = await saveImportedAsset(mdFile())
++
++    const first = await sweep({ now: T0 })
++    expect(first.marked).toBe(1)
++    expect(first.deleted).toBe(0)
++
++    // Same instant re-sweep: marked, but zero age — kept.
++    const second = await sweep({ now: T0 })
++    expect(second.marked).toBe(0)
++    expect(second.deleted).toBe(0)
++
++    // One tick before the boundary — still kept.
++    const beforeBoundary = await sweep({ now: T0 + GRACE - 1 })
++    expect(beforeBoundary.deleted).toBe(0)
++
++    // At/after the boundary — physically deleted, bytes accounted.
++    const after = await sweep({ now: T0 + GRACE })
++    expect(after.deleted).toBe(1)
++    expect(after.freedBytes).toBeGreaterThan(0)
++    expect(await readAssetGcIndex()).toEqual([])
++    expect(await resolveAssetUrl(orphan.assetUrl)).toBe('')
++  })
++
++  it('undo acceptance: a node alive only in the undo stacks keeps its asset; after real undo the asset resolves', async () => {
++    const ref = await saveImportedAsset(mdFile('deleted-but-undoable.md'))
++    // Post-delete store shape: live canvases no longer reference the asset, but the
++    // pre-delete snapshot (with the node) sits in historyPast — the 60-step window.
++    const deletedState: AssetGcCanvasRefState = {
++      ...emptyCanvasState(),
++      canvases: { c: { nodes: [] } },
++      historyPast: [{ nodes: [{ assetUrl: ref.assetUrl }] }],
++    }
++    const duringUndoWindow = await sweep({ getCanvasRefState: () => deletedState, now: T0 })
++    expect(duringUndoWindow.marked).toBe(0) // history IS a reference — not even marked
++
++    // Undo applied: the node is back on the canvas (snapshot moved to historyFuture).
++    const undoneState: AssetGcCanvasRefState = {
++      ...emptyCanvasState(),
++      canvases: { c: { nodes: [{ assetUrl: ref.assetUrl }] } },
++      historyFuture: [{ nodes: [] }],
++    }
++    const afterUndo = await sweep({ getCanvasRefState: () => undoneState, now: T0 + GRACE + 1 })
++    expect(afterUndo.marked).toBe(0)
++    expect(afterUndo.deleted).toBe(0)
++    const resolved = await resolveAssetUrl(ref.assetUrl)
++    expect(resolved.startsWith('blob:')).toBe(true)
++  })
++
++  it('resurrect clears the mark, and a later re-orphaning restarts a FULL grace window', async () => {
++    const ref = await saveImportedAsset(mdFile())
++
++    await sweep({ now: T0 }) // mark
++    const referencedState: AssetGcCanvasRefState = {
++      ...emptyCanvasState(),
++      canvases: { c: { nodes: [{ assetUrl: ref.assetUrl }] } },
++    }
++    const resurrect = await sweep({ getCanvasRefState: () => referencedState, now: T0 + 1000 })
++    expect(resurrect.resurrected).toBe(1)
++    expect((await readAssetGcIndex())[0].lastRefZeroAt).toBeUndefined()
++
++    // Orphaned again LONG after the original mark would have expired: the old stamp
++    // must not be inherited — re-mark now, delete only a full grace later.
++    const remark = await sweep({ now: T0 + GRACE * 2 })
++    expect(remark.marked).toBe(1)
++    expect(remark.deleted).toBe(0)
++    const tooEarly = await sweep({ now: T0 + GRACE * 3 - 1 })
++    expect(tooEarly.deleted).toBe(0)
++    const due = await sweep({ now: T0 + GRACE * 3 })
++    expect(due.deleted).toBe(1)
++  })
++
++  it("foreign-user and untagged records are never touched — this sweep can't see their canvases", async () => {
++    setPersistUserId('user-b')
++    const foreign = await saveImportedAsset(mdFile('theirs.md'))
++    __resetPersistUserId()
++
++    const first = await sweep({ now: T0 })
++    expect(first.foreign).toBe(1)
++    expect(first.marked).toBe(0)
++
++    const aged = await sweep({ now: T0 + GRACE * 10 })
++    expect(aged.deleted).toBe(0)
++    expect(await resolveAssetUrl(foreign.assetUrl)).not.toBe('')
++  })
++
++  it('fail-closed: unreadable persisted blobs withhold every delete (record + mark intact)', async () => {
++    await saveImportedAsset(mdFile())
++    await sweep({ now: T0 }) // mark
++
++    const withheld = await sweep({
++      now: T0 + GRACE + 1,
++      readPersistedBlobRefs: async () => undefined,
++    })
++    expect(withheld.deleted).toBe(0)
++    expect(withheld.deletesWithheld).toBe(1)
++    const [entry] = await readAssetGcIndex()
++    expect(entry.lastRefZeroAt).toBe(T0) // mark untouched — retried next pass
++
++    // Blobs readable again → the delete lands.
++    const retried = await sweep({ now: T0 + GRACE + 2 })
++    expect(retried.deleted).toBe(1)
++  })
++
++  it('cross-tab guard: a persisted-blob reference resurrects a grace-expired candidate instead of deleting it', async () => {
++    const ref = await saveImportedAsset(mdFile())
++    await sweep({ now: T0 }) // mark
++
++    const guarded = await sweep({
++      now: T0 + GRACE + 1,
++      readPersistedBlobRefs: async () => new Set([ref.assetUrl]),
++    })
++    expect(guarded.deleted).toBe(0)
++    expect(guarded.resurrected).toBe(1)
++    const [entry] = await readAssetGcIndex()
++    expect(entry.lastRefZeroAt).toBeUndefined() // full grace restarts if re-orphaned
++  })
++
++  it('blob-read cost is only paid when a delete is on the table', async () => {
++    await saveImportedAsset(mdFile())
++    const readBlobRefs = vi.fn(async () => new Set<string>())
++
++    await sweep({ now: T0, readPersistedBlobRefs: readBlobRefs }) // mark-only pass
++    expect(readBlobRefs).not.toHaveBeenCalled()
++
++    await sweep({ now: T0 + GRACE, readPersistedBlobRefs: readBlobRefs }) // delete pass
++    expect(readBlobRefs).toHaveBeenCalledTimes(1)
++  })
++})
++
++describe('runAssetGcSweep — #509 R1(seat2)-F1: same-tab TOCTOU recheck immediately before commit', () => {
++  beforeEach(() => {
++    vi.stubGlobal('indexedDB', new IDBFactory())
++  })
++  afterEach(() => {
++    vi.unstubAllGlobals()
++    __resetPersistUserId()
++  })
++
++  it('a reference appearing between the scan and the commit (paste/undo racing the sweep) resurrects, never deletes', async () => {
++    const ref = await saveImportedAsset(mdFile())
++    await sweep({ now: T0 }) // mark (unreferenced)
++
++    let calls = 0
++    const statefulCanvasState = () => {
++      calls += 1
++      // Call 1 = the main reference scan (still unreferenced at that instant).
++      // Call 2 = the pre-commit recheck — simulate a paste that landed in the gap.
++      if (calls >= 2) {
++        return { ...emptyCanvasState(), canvases: { c: { nodes: [{ assetUrl: ref.assetUrl }] } } }
++      }
++      return emptyCanvasState()
++    }
++
++    const result = await sweep({ getCanvasRefState: statefulCanvasState, now: T0 + GRACE })
++
++    expect(result.deleted).toBe(0)
++    expect(result.resurrected).toBe(1)
++    expect(calls).toBeGreaterThanOrEqual(2)
++    const [entry] = await readAssetGcIndex()
++    expect(entry.lastRefZeroAt).toBeUndefined() // resurrect clears the mark, same as any other resurrect
++    expect(await resolveAssetUrl(ref.assetUrl)).not.toBe('')
++  })
++
++  it('no such reference appears (the ordinary case): the recheck is a no-op and the delete proceeds', async () => {
++    const ref = await saveImportedAsset(mdFile())
++    await sweep({ now: T0 })
++
++    const result = await sweep({ now: T0 + GRACE })
++
++    expect(result.deleted).toBe(1)
++    expect(result.resurrected).toBe(0)
++    expect(await resolveAssetUrl(ref.assetUrl)).toBe('')
++  })
++})
++
++describe('applyAssetGcDecisions.deletedIds — #509 R1(seat1)-F1: authoritative actually-deleted set', () => {
++  beforeEach(() => {
++    vi.stubGlobal('indexedDB', new IDBFactory())
++  })
++  afterEach(() => {
++    vi.unstubAllGlobals()
++    __resetPersistUserId()
++  })
++
++  const idOf = (assetUrl: string) => assetUrl.slice('mivo-asset:'.length)
++
++  it('a stale candidate (mark already cleared by someone else) is counted stale, not deleted, and excluded from deletedIds', async () => {
++    const ref = await saveImportedAsset(mdFile())
++    const id = idOf(ref.assetUrl)
++    await sweep({ now: T0 }) // marks it
++
++    // Simulate another concurrent actor (another tab's sweep, or a live resurrect)
++    // clearing the mark between this pass's candidate collection and its apply call.
++    await applyAssetGcDecisions({ markIds: [], clearIds: [id], deleteIds: [], now: T0, deleteEligibleBefore: T0 })
++
++    const applied = await applyAssetGcDecisions({
++      markIds: [], clearIds: [], deleteIds: [id], now: T0 + GRACE, deleteEligibleBefore: T0 + GRACE,
++    })
++
++    expect(applied.deleted).toBe(0)
++    expect(applied.stale).toBe(1)
++    expect(applied.deletedIds).toEqual([])
++  })
++
++  it('a mixed batch: deletedIds contains exactly the ids that were truly deleted, never the stale one', async () => {
++    const a = await saveImportedAsset(mdFile('a.md'))
++    const b = await saveImportedAsset(mdFile('b.md'))
++    const idA = idOf(a.assetUrl)
++    const idB = idOf(b.assetUrl)
++    await sweep({ now: T0 }) // marks both (both unreferenced)
++
++    // b gets resurrected out-of-band; a does not.
++    await applyAssetGcDecisions({ markIds: [], clearIds: [idB], deleteIds: [], now: T0, deleteEligibleBefore: T0 })
++
++    const applied = await applyAssetGcDecisions({
++      markIds: [], clearIds: [], deleteIds: [idA, idB], now: T0 + GRACE, deleteEligibleBefore: T0 + GRACE,
++    })
++
++    expect(applied.deletedIds).toEqual([idA])
++    expect(applied.stale).toBe(1)
++    expect(applied.deleted).toBe(1)
++  })
++
++  it('runAssetGcSweep prunes exactly applied.deletedIds — in a mixed batch, a concurrently-resurrected candidate must NOT be pruned alongside the one that truly deleted', async () => {
++    pruneImageMetricsForAssetsMock.mockClear()
++    const keep = await saveImportedAsset(mdFile('resurrected.md'))
++    const gone = await saveImportedAsset(mdFile('deleted.md'))
++    const keepId = idOf(keep.assetUrl)
++    await sweep({ now: T0 }) // marks both (both unreferenced)
++
++    const result = await sweep({
++      now: T0 + GRACE,
++      readPersistedBlobRefs: async () => {
++        // A concurrent external actor (another tab's own sweep) resurrects `keep`
++        // strictly between this sweep's candidate collection (already done by the
++        // time this reader is invoked) and its commit below — `gone` is untouched.
++        // This sweep's own blob-check still legitimately sees BOTH as unreferenced
++        // (that actor's write hasn't reached the persisted blob this read checks).
++        await applyAssetGcDecisions({ markIds: [], clearIds: [keepId], deleteIds: [], now: T0 + GRACE, deleteEligibleBefore: T0 + GRACE })
++        return new Set()
++      },
++    })
++
++    expect(result.deleted).toBe(1) // gone
++    expect(result.stale).toBe(1) // keep, caught by the transaction-level re-verify
++    // The regression this guards: pruning off the pre-transaction candidate list
++    // (which still contains BOTH ids at this point) instead of applied.deletedIds
++    // would call this with both assetUrls — mispruning `keep`'s cached metrics
++    // even though it was never actually deleted.
++    expect(pruneImageMetricsForAssetsMock).toHaveBeenCalledExactlyOnceWith([gone.assetUrl])
++  })
++})
+diff --git a/src/lib/assetGc.ts b/src/lib/assetGc.ts
+new file mode 100644
+index 00000000..0ecf4bb4
+--- /dev/null
++++ b/src/lib/assetGc.ts
+@@ -0,0 +1,344 @@
++// assetGc — #509 client-side imported-asset GC (P2-1 of the canvas-scale perf epic #517).
++//
++// Problem: deleteNode / deleteSelectedNodes only filter the node arrays; nothing ever
++// removes the referenced blobs from the `mivo-canvas-assets` IDB store, so import →
++// delete → re-import grows IDB monotonically (P2-0 bench: after-delete IDB bytes never
++// fall). deleteImportedAsset only serves explicit replace-image rollbacks.
++//
++// Model — idle-time orphan sweep with a grace window, aligned with the server store
++// (server/lib/assetStore.ts): the refcount is DERIVED from a full reference scan (a
++// reference table, never a stored counter — nothing can drift), and a zero-ref record
++// is first STAMPED (lastRefZeroAt), only physically deleted once the stamp outlives
++// ASSET_GRACE_PERIOD (7 days, same value as the server). A reference reappearing
++// during grace (undo / redo / paste / archive restore) clears the stamp.
++//
++// The reference surface (collectReferencedAssetUrls):
++// - every canvas document in the store (state.canvases — local persist mode keeps ALL
++//   canvases, including archived ones, fully materialized), node.assetUrl + image fills;
++// - the active-canvas mirrors (state.nodes) and the in-store node clipboard;
++// - BOTH history stacks — a deleted node sitting inside the 60-step undo window keeps
++//   its asset referenced, which is exactly the "undo must still resolve the asset"
++//   acceptance: eviction from the stacks (60 more edits, or a reload — history is not
++//   persisted) is what starts the grace clock, and the grace window bridges the rest;
++// - chat messages' generationContext.referenceAssetUrls (persisted; retry replays them).
++//
++// Safety gates (why deletes are hard to reach, in order):
++// 1. Only records owned by the CURRENT persist user are ever touched (FX-6 namespace);
++//    untagged legacy records are left for migrateUntaggedAssets to claim.
++// 2. A delete needs a mark from a PREVIOUS sweep to have aged past the grace window —
++//    a single sweep can never mark-and-delete in one pass.
++// 3. Before any physical delete, the sweep re-reads the PERSISTED canvas + chat blobs
++//    (cross-tab truth: another tab's flushed state) and resurrects instead of deleting
++//    when the blob still references the asset. If the blobs cannot be read or parsed,
++//    every delete is withheld (fail-closed) — marks are self-healing, deletes are not.
++// 4. Immediately before the commit, the sweep re-collects this tab's OWN live
++//    references one more time (R1-F1) — closing the TOCTOU window opened by the
++//    async reads above, so a paste/undo racing the sweep resurrects rather than
++//    loses its asset.
++// 5. applyAssetGcDecisions re-verifies each record inside the readwrite transaction
++//    (the client analogue of the server's deleteIfStillEligible under-lock re-check).
++//
++// Out of scope: mivo-sasset: (server refcount lifecycle, #313) and mivo-demo: (drawn
++// on demand, never stored) URLs — they are not IDB records, so the sweep never sees
++// them; the reference scan keeps raw strings and only ever queries mivo-asset: ids.
++
++import {
++  applyAssetGcDecisions,
++  importedAssetUrl,
++  readAssetGcIndex,
++} from './assetStorage'
++import { pruneImageMetricsForAssets } from './imageMetricsCache'
++import { debugLogger } from '../store/debugLogStore'
++
++const SOURCE = 'Asset GC'
++
++/** Grace window before an unreferenced asset's bytes are deleted — same 7 days as
++ *  server/lib/assetStore.ts ASSET_GRACE_PERIOD_MS (single-node undo + restore cover). */
++export const CLIENT_ASSET_GRACE_PERIOD_MS = 7 * 24 * 60 * 60 * 1000
++
++/** Structural node slice the reference scan needs (satisfied by MivoCanvasNode). */
++type RefNode = {
++  assetUrl?: string
++  fills?: Array<{ kind: string; assetUrl?: string }>
++}
++
++/** Structural canvas-store slice (satisfied by CanvasState). */
++export type AssetGcCanvasRefState = {
++  canvases: Record<string, { nodes: RefNode[] }>
++  nodes: RefNode[]
++  clipboardNodes: RefNode[]
++  historyPast: Array<{ nodes: RefNode[] }>
++  historyFuture: Array<{ nodes: RefNode[] }>
++}
++
++/** Structural chat-store slice (satisfied by ChatState). */
++export type AssetGcChatRefState = {
++  messagesByScene: Record<string, Array<{ generationContext?: { referenceAssetUrls?: string[] } }>>
++}
++
++export type AssetGcSweepOptions = {
++  /** Owner namespace — only records with userId === currentUserId are touched. */
++  currentUserId: string
++  getCanvasRefState: () => AssetGcCanvasRefState
++  getChatRefState: () => AssetGcChatRefState
++  /**
++   * Cross-tab truth for the delete phase: resolves to the reference set parsed from
++   * the PERSISTED canvas + chat blobs, or undefined when they cannot be read/parsed
++   * (→ every delete is withheld this pass). Only invoked when at least one record is
++   * delete-eligible, so the blob parse cost is never paid on mark/resurrect-only passes.
++   */
++  readPersistedBlobRefs: () => Promise<Set<string> | undefined>
++  now?: number
++  graceMs?: number
++}
++
++export type AssetGcSweepResult = {
++  /** #509 R1-F3: 'skipped' is distinct from a normal empty-store 'completed' pass —
++   *  it means the sweep never ran at all (e.g. persist mode gate), so a caller
++   *  reading `scanned: 0` can tell "verified empty" apart from "didn't look". */
++  status: 'completed' | 'failed' | 'skipped'
++  /** Records in the store (all owners). */
++  scanned: number
++  /** Records skipped because they belong to another user / are untagged. */
++  foreign: number
++  marked: number
++  resurrected: number
++  deleted: number
++  freedBytes: number
++  /** Delete-eligible records withheld because the persisted blobs were unreadable. */
++  deletesWithheld: number
++  /** Decisions dropped by the in-transaction re-verify (concurrent change). */
++  stale: number
++}
++
++const addNodeRefs = (nodes: RefNode[] | undefined, into: Set<string>) => {
++  if (!nodes) return
++  for (const node of nodes) {
++    if (node.assetUrl) into.add(node.assetUrl)
++    if (node.fills) {
++      for (const fill of node.fills) {
++        if (fill.kind === 'image' && fill.assetUrl) into.add(fill.assetUrl)
++      }
++    }
++  }
++}
++
++/**
++ * Collect every asset URL the app still references. Pure over the injected slices —
++ * unit tests feed literal state, the wiring feeds live store state. Keeps raw URL
++ * strings of every scheme (http/data/mivo-demo:/mivo-sasset: included); the sweep
++ * only ever asks membership for `mivo-asset:<id>` strings.
++ */
++export const collectReferencedAssetUrls = (
++  canvasState: AssetGcCanvasRefState,
++  chatState: AssetGcChatRefState,
++): Set<string> => {
++  const refs = new Set<string>()
++
++  for (const document of Object.values(canvasState.canvases || {})) {
++    addNodeRefs(document?.nodes, refs)
++  }
++  addNodeRefs(canvasState.nodes, refs)
++  addNodeRefs(canvasState.clipboardNodes, refs)
++  for (const snapshot of canvasState.historyPast || []) addNodeRefs(snapshot?.nodes, refs)
++  for (const snapshot of canvasState.historyFuture || []) addNodeRefs(snapshot?.nodes, refs)
++
++  for (const messages of Object.values(chatState.messagesByScene || {})) {
++    if (!messages) continue
++    for (const message of messages) {
++      for (const url of message?.generationContext?.referenceAssetUrls || []) {
++        if (url) refs.add(url)
++      }
++    }
++  }
++
++  return refs
++}
++
++/**
++ * Parse the persisted zustand blobs (canvas + chat envelopes: `{"state":{...}}`) into
++ * a reference set. Fail-closed by design: a null blob contributes nothing (fresh
++ * profile — this tab's in-memory refs already cover everything that exists), but a
++ * present-yet-unparseable blob, or one whose shape is not the expected envelope,
++ * returns undefined so the caller withholds every delete. Deleting on a mis-parse
++ * would be unrecoverable; skipping a pass is free.
++ */
++export const parsePersistedBlobRefs = (
++  canvasRaw: string | null,
++  chatRaw: string | null,
++): Set<string> | undefined => {
++  const canvasState: AssetGcCanvasRefState = {
++    canvases: {},
++    nodes: [],
++    clipboardNodes: [],
++    historyPast: [],
++    historyFuture: [],
++  }
++  const chatState: AssetGcChatRefState = { messagesByScene: {} }
++
++  if (canvasRaw !== null) {
++    try {
++      const parsed = JSON.parse(canvasRaw) as { state?: { canvases?: unknown } }
++      const canvases = parsed?.state?.canvases
++      if (!canvases || typeof canvases !== 'object' || Array.isArray(canvases)) return undefined
++      canvasState.canvases = canvases as AssetGcCanvasRefState['canvases']
++    } catch {
++      return undefined
++    }
++  }
++  if (chatRaw !== null) {
++    try {
++      const parsed = JSON.parse(chatRaw) as { state?: { messagesByScene?: unknown } }
++      const messagesByScene = parsed?.state?.messagesByScene
++      if (!messagesByScene || typeof messagesByScene !== 'object' || Array.isArray(messagesByScene)) {
++        return undefined
++      }
++      chatState.messagesByScene = messagesByScene as AssetGcChatRefState['messagesByScene']
++    } catch {
++      return undefined
++    }
++  }
++
++  return collectReferencedAssetUrls(canvasState, chatState)
++}
++
++/**
++ * Run one mark-and-sweep pass. Every outcome is logged (development-logging.md):
++ * a completed pass logs its counts, a pass that had to withhold deletes warns with
++ * the reason, and an exception logs an error and reports status 'failed'.
++ */
++export const runAssetGcSweep = async (options: AssetGcSweepOptions): Promise<AssetGcSweepResult> => {
++  const now = options.now ?? Date.now()
++  const graceMs = options.graceMs ?? CLIENT_ASSET_GRACE_PERIOD_MS
++  const result: AssetGcSweepResult = {
++    status: 'completed',
++    scanned: 0,
++    foreign: 0,
++    marked: 0,
++    resurrected: 0,
++    deleted: 0,
++    freedBytes: 0,
++    deletesWithheld: 0,
++    stale: 0,
++  }
++
++  try {
++    const index = await readAssetGcIndex()
++    result.scanned = index.length
++    if (index.length === 0) {
++      debugLogger.log(SOURCE, 'sweep completed: asset store is empty')
++      return result
++    }
++
++    const memRefs = collectReferencedAssetUrls(options.getCanvasRefState(), options.getChatRefState())
++
++    const markIds: string[] = []
++    const clearIds: string[] = []
++    const deleteCandidates: string[] = []
++    for (const entry of index) {
++      if (entry.userId !== options.currentUserId) {
++        // Another user's cache namespace (or an untagged pre-FX-6 record) — this
++        // sweep's reference scan cannot see their canvases, so it must never touch
++        // their records. Their own session sweeps them.
++        result.foreign += 1
++        continue
++      }
++      const referenced = memRefs.has(importedAssetUrl(entry.id))
++      if (referenced) {
++        if (entry.lastRefZeroAt !== undefined) clearIds.push(entry.id)
++        continue
++      }
++      if (entry.lastRefZeroAt === undefined) {
++        markIds.push(entry.id)
++      } else if (now - entry.lastRefZeroAt >= graceMs) {
++        deleteCandidates.push(entry.id)
++      }
++      // else: marked but still inside grace — leave the stamp untouched.
++    }
++
++    let deleteIds: string[] = []
++    if (deleteCandidates.length > 0) {
++      const blobRefs = await options.readPersistedBlobRefs()
++      if (blobRefs === undefined) {
++        // Fail-closed: without the persisted truth we cannot rule out another tab
++        // still referencing these assets. Withhold every delete; next pass retries.
++        result.deletesWithheld = deleteCandidates.length
++        debugLogger.warn(
++          SOURCE,
++          `sweep withheld ${deleteCandidates.length} grace-expired delete(s): persisted state unreadable (fail-closed)`,
++        )
++      } else {
++        for (const id of deleteCandidates) {
++          if (blobRefs.has(importedAssetUrl(id))) {
++            // The persisted blob (possibly another tab's flushed state) still
++            // references it — resurrect so a future orphaning restarts a FULL
++            // grace window instead of inheriting this long-expired stamp.
++            clearIds.push(id)
++          } else {
++            deleteIds.push(id)
++          }
++        }
++      }
++    }
++
++    // #509 R1-F1: re-collect THIS tab's live references immediately before the
++    // commit below — closes the TOCTOU window between the scans above (each of
++    // which awaited an async IDB/blob read, yielding the event loop) and the
++    // transaction. A paste / undo / drag-in that references one of these ids
++    // during that window must resurrect it, never let it fall through to delete.
++    // This narrows but does not fully close a cross-tab window bounded by the
++    // canvas/chat persist-write debounce (~800ms) — closing that fully would need
++    // a distributed lock spanning every tab's read-decide-write pipeline, not just
++    // this tab's own recheck.
++    if (deleteIds.length > 0) {
++      const freshMemRefs = collectReferencedAssetUrls(options.getCanvasRefState(), options.getChatRefState())
++      const stillEligible: string[] = []
++      for (const id of deleteIds) {
++        if (freshMemRefs.has(importedAssetUrl(id))) {
++          clearIds.push(id)
++        } else {
++          stillEligible.push(id)
++        }
++      }
++      deleteIds = stillEligible
++    }
++
++    const applied = await applyAssetGcDecisions({
++      markIds,
++      clearIds,
++      deleteIds,
++      now,
++      deleteEligibleBefore: now - graceMs,
++    })
++    result.marked = applied.marked
++    result.resurrected = applied.cleared
++    result.deleted = applied.deleted
++    result.freedBytes = applied.freedBytes
++    result.stale = applied.stale
++
++    if (applied.deletedIds.length > 0) {
++      // #509 R1-F1: prune exactly the ids ACTUALLY deleted (applied.deletedIds),
++      // never the candidate list — applyAssetGcDecisions' own in-transaction
++      // re-verify can drop any candidate into `stale` (e.g. a concurrent
++      // clearAssetsForUser or another tab's sweep touched the record between our
++      // recheck above and the transaction), and a stale (not-actually-deleted)
++      // asset must keep its cached natural size.
++      pruneImageMetricsForAssets(applied.deletedIds.map((id) => importedAssetUrl(id)))
++    }
++
++    debugLogger.log(
++      SOURCE,
++      `sweep completed: scanned ${result.scanned}, marked ${result.marked}, resurrected ${result.resurrected}, ` +
++        `deleted ${result.deleted} (${Math.round(result.freedBytes / 1024)} KiB), ` +
++        `withheld ${result.deletesWithheld}, foreign ${result.foreign}, stale ${result.stale}`,
++    )
++    return result
++  } catch (error) {
++    result.status = 'failed'
++    debugLogger.error(
++      SOURCE,
++      `sweep failed: ${error instanceof Error ? error.message : String(error)}`,
++    )
++    return result
++  }
++}
+diff --git a/src/lib/assetStorage.ts b/src/lib/assetStorage.ts
+index 32a4d191..04c7b20e 100644
+--- a/src/lib/assetStorage.ts
++++ b/src/lib/assetStorage.ts
+@@ -40,6 +40,13 @@ type StoredAsset = {
+   // this field (undefined) and are claimed by the first authenticated user via
+   // migrateUntaggedAssets. Anonymous-mode assets stay userId === 'anonymous'.
+   userId?: string
++  // #509 client asset GC: grace-window start stamped by the sweep when no live
++  // reference (canvases / undo stacks / chat) points at this asset any more —
++  // mirrors server/lib/assetStore.ts AssetRecord.lastRefZeroAt. Cleared when a
++  // reference reappears (undo / paste / archive restore); the record is only
++  // physically deleted once the stamp is older than the grace period. Absent on
++  // every record until the first sweep marks it (no schema/version bump needed).
++  lastRefZeroAt?: number
+ }
+ 
+ export type SerializedCanvasAsset = {
+@@ -371,6 +378,156 @@ export const deleteImportedAsset = async (assetUrl: string): Promise<boolean> =>
+   }
+ }
+ 
++/** #509: one asset record's GC-relevant metadata (no blob bytes are read — the
++ *  blob property stays an untouched handle; `sizeBytes` comes from `Blob.size`,
++ *  which is metadata, not content). */
++export type AssetGcIndexEntry = {
++  id: string
++  userId?: string
++  createdAt: number
++  lastRefZeroAt?: number
++  sizeBytes: number
++}
++
++/** #509: decisions the sweep wants applied. Each id is re-verified inside the
++ *  readwrite transaction before acting (see applyAssetGcDecisions). */
++export type AssetGcDecisions = {
++  /** Stamp lastRefZeroAt = now (only if the record exists and is unmarked). */
++  markIds: string[]
++  /** Clear lastRefZeroAt (resurrect — only if the record exists and is marked). */
++  clearIds: string[]
++  /** Physically delete (only if still marked and the mark is old enough). */
++  deleteIds: string[]
++  /** Timestamp written into fresh marks. */
++  now: number
++  /** A delete only applies while lastRefZeroAt <= this bound (grace re-check). */
++  deleteEligibleBefore: number
++}
++
++export type AssetGcApplyResult = {
++  marked: number
++  cleared: number
++  deleted: number
++  /** Sum of Blob.size over actually-deleted records. */
++  freedBytes: number
++  /** Decisions dropped by the in-transaction re-verify (record gone / state changed). */
++  stale: number
++  /** #509 R1-F1: the ids ACTUALLY deleted this call — a subset of decisions.deleteIds,
++   *  since the in-transaction re-verify above can drop any of them into `stale`. Callers
++   *  that key other cleanup off "what got deleted" (e.g. pruning a sibling cache) must
++   *  use this, not the candidate list they passed in. */
++  deletedIds: string[]
++}
++
++/**
++ * #509 client asset GC — read the GC index: id / owner / createdAt / mark for every
++ * record in the store, via the same cursor pattern as clearAssetsForUser. Read-only;
++ * never touches blob bytes. Returns [] when IndexedDB is unavailable (node tests
++ * without fake-indexeddb) — the sweep treats that as "nothing to do", not an error.
++ */
++export const readAssetGcIndex = async (): Promise<AssetGcIndexEntry[]> => {
++  if (typeof indexedDB === 'undefined' || indexedDB === null) return []
++  const entries: AssetGcIndexEntry[] = []
++  const db = await openAssetDb()
++  try {
++    await new Promise<void>((resolve, reject) => {
++      const tx = db.transaction(STORE_NAME, 'readonly')
++      const req = tx.objectStore(STORE_NAME).openCursor()
++      req.onsuccess = () => {
++        const cursor = req.result as IDBCursorWithValue | null
++        if (cursor) {
++          const rec = cursor.value as StoredAsset
++          entries.push({
++            id: rec.id,
++            userId: rec.userId,
++            createdAt: rec.createdAt,
++            lastRefZeroAt: rec.lastRefZeroAt,
++            sizeBytes: rec.blob?.size ?? 0,
++          })
++          cursor.continue()
++        }
++      }
++      tx.oncomplete = () => resolve()
++      tx.onerror = () => reject(tx.error)
++      tx.onabort = () => reject(tx.error ?? new Error('asset GC index read aborted'))
++    })
++  } finally {
++    db.close()
++  }
++  return entries
++}
++
++/**
++ * #509 client asset GC — apply sweep decisions in ONE readwrite transaction, with a
++ * per-record re-verify before every write (the client analogue of the server's
++ * deleteIfStillEligible "re-check under the lock"): between the index read and this
++ * apply, another tab's sweep or clearAssetsForUser may have changed a record, so
++ * every decision re-reads the record and only acts when the expected state still
++ * holds. Anything that no longer matches is counted into `stale` and skipped —
++ * a delete can never fire on a record whose mark was cleared in the meantime.
++ */
++export const applyAssetGcDecisions = async (decisions: AssetGcDecisions): Promise<AssetGcApplyResult> => {
++  const result: AssetGcApplyResult = { marked: 0, cleared: 0, deleted: 0, freedBytes: 0, stale: 0, deletedIds: [] }
++  if (typeof indexedDB === 'undefined' || indexedDB === null) return result
++  const total = decisions.markIds.length + decisions.clearIds.length + decisions.deleteIds.length
++  if (total === 0) return result
++
++  const db = await openAssetDb()
++  try {
++    await new Promise<void>((resolve, reject) => {
++      const tx = db.transaction(STORE_NAME, 'readwrite')
++      const store = tx.objectStore(STORE_NAME)
++
++      const process = (id: string, act: (rec: StoredAsset | undefined) => void) => {
++        const getReq = store.get(id) as IDBRequest<StoredAsset | undefined>
++        getReq.onsuccess = () => act(getReq.result)
++      }
++
++      for (const id of decisions.markIds) {
++        process(id, (rec) => {
++          if (!rec || rec.lastRefZeroAt !== undefined) {
++            result.stale += 1
++            return
++          }
++          store.put({ ...rec, lastRefZeroAt: decisions.now })
++          result.marked += 1
++        })
++      }
++      for (const id of decisions.clearIds) {
++        process(id, (rec) => {
++          if (!rec || rec.lastRefZeroAt === undefined) {
++            result.stale += 1
++            return
++          }
++          const rest: StoredAsset = { ...rec }
++          delete rest.lastRefZeroAt
++          store.put(rest)
++          result.cleared += 1
++        })
++      }
++      for (const id of decisions.deleteIds) {
++        process(id, (rec) => {
++          if (!rec || rec.lastRefZeroAt === undefined || rec.lastRefZeroAt > decisions.deleteEligibleBefore) {
++            result.stale += 1
++            return
++          }
++          store.delete(id)
++          result.deleted += 1
++          result.freedBytes += rec.blob?.size ?? 0
++          result.deletedIds.push(id)
++        })
++      }
++
++      tx.oncomplete = () => resolve()
++      tx.onerror = () => reject(tx.error)
++      tx.onabort = () => reject(tx.error ?? new Error('asset GC apply aborted'))
++    })
++  } finally {
++    db.close()
++  }
++  return result
++}
++
+ export const resolveAssetUrl = async (assetUrl?: string) => {
+   if (!assetUrl) return ''
+   // T1.5: a mivo-sasset: url resolves via GET /api/assets/:id → blob URL.
+diff --git a/src/lib/imageMetricsCache.test.ts b/src/lib/imageMetricsCache.test.ts
+index adcde7f3..f0a5293e 100644
+--- a/src/lib/imageMetricsCache.test.ts
++++ b/src/lib/imageMetricsCache.test.ts
+@@ -1,5 +1,11 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+-import { __resetImageMetricsCache, getImageMetrics, reportImageMetrics } from './imageMetricsCache'
++import {
++  __resetImageMetricsCache,
++  getImageMetrics,
++  IMAGE_METRICS_CACHE_MAX_ENTRIES,
++  pruneImageMetricsForAssets,
++  reportImageMetrics,
++} from './imageMetricsCache'
+ 
+ // Mock readImportedAssetFile so tests don't touch IDB. Returns a fake blob whose
+ // createImageBitmap yields a known width/height.
+@@ -110,6 +116,53 @@ describe('getImageMetrics — non-imported URLs (cache-only)', () => {
+   })
+ })
+ 
++describe('pruneImageMetricsForAssets — #509 GC hook', () => {
++  it('drops the pruned entries; untouched entries stay cached', async () => {
++    reportImageMetrics(ASSET, { width: 640, height: 480 })
++    reportImageMetrics(HTTP, { width: 800, height: 600 })
++
++    pruneImageMetricsForAssets([ASSET])
++
++    // Pruned → falls through to a fresh IDB decode.
++    await getImageMetrics(ASSET)
++    expect(readImportedAssetFileMock).toHaveBeenCalledTimes(1)
++    // Untouched → still a cache hit.
++    expect(await getImageMetrics(HTTP)).toEqual({ width: 800, height: 600 })
++  })
++})
++
++describe('cache cap — #509 bounded growth', () => {
++  it(`evicts the least-recent entry beyond ${IMAGE_METRICS_CACHE_MAX_ENTRIES} entries`, async () => {
++    for (let i = 0; i < IMAGE_METRICS_CACHE_MAX_ENTRIES; i += 1) {
++      reportImageMetrics(`https://example.com/${i}.png`, { width: 10, height: 10 })
++    }
++    // Refresh entry 0's recency, then overflow by one — entry 1 (now oldest) evicts.
++    reportImageMetrics('https://example.com/0.png', { width: 11, height: 11 })
++    reportImageMetrics('https://example.com/overflow.png', { width: 12, height: 12 })
++
++    expect(await getImageMetrics('https://example.com/0.png')).toEqual({ width: 11, height: 11 })
++    expect(await getImageMetrics('https://example.com/overflow.png')).toEqual({ width: 12, height: 12 })
++    expect(await getImageMetrics('https://example.com/1.png')).toBeUndefined()
++  })
++
++  it('#509 R1(seat1)-F3: a cache-hit READ (not a re-report write) also refreshes recency — this is the path the fix touched', async () => {
++    for (let i = 0; i < IMAGE_METRICS_CACHE_MAX_ENTRIES; i += 1) {
++      reportImageMetrics(`https://example.com/read-${i}.png`, { width: 20, height: 20 })
++    }
++    // Refresh entry 0's recency via a cache-HIT READ (getImageMetrics), not a
++    // re-report write — this is exactly what R1(seat2)-F4's fix added, and the
++    // existing eviction test above never exercises it (it only refreshes via a
++    // write). Without the fix, this read is a no-op on ordering and entry 0 would
++    // be the next evicted, not entry 1.
++    await getImageMetrics('https://example.com/read-0.png')
++    reportImageMetrics('https://example.com/read-overflow.png', { width: 21, height: 21 })
++
++    expect(await getImageMetrics('https://example.com/read-0.png')).toEqual({ width: 20, height: 20 })
++    expect(await getImageMetrics('https://example.com/read-overflow.png')).toEqual({ width: 21, height: 21 })
++    expect(await getImageMetrics('https://example.com/read-1.png')).toBeUndefined()
++  })
++})
++
+ describe('getImageMetrics — IDB miss + decode failure', () => {
+   it('returns undefined when the asset is not in IDB (miss)', async () => {
+     const dims = await getImageMetrics(ASSET_MISS)
+diff --git a/src/lib/imageMetricsCache.ts b/src/lib/imageMetricsCache.ts
+index 68e93e26..2f45094d 100644
+--- a/src/lib/imageMetricsCache.ts
++++ b/src/lib/imageMetricsCache.ts
+@@ -20,16 +20,41 @@ const metricsCache = new Map<string, ImageDimensions>()
+ const inFlight = new Map<string, Promise<ImageDimensions | undefined>>()
+ const SOURCE = 'Image Metrics'
+ 
++/** #509: hard cap on cache entries. Entries are two numbers + a key string, so the
++ *  cap is generous; it exists so a marathon session cycling through thousands of
++ *  distinct URLs (http previews included) cannot grow the map without bound. */
++export const IMAGE_METRICS_CACHE_MAX_ENTRIES = 2048
++
+ const isValidDimensions = (dims: ImageDimensions): boolean =>
+   Number.isFinite(dims.width) && dims.width > 0 && Number.isFinite(dims.height) && dims.height > 0
+ 
++/** LRU insert: refresh recency on re-report, evict the oldest entry over the cap.
++ *  Map iteration order is insertion order, so the first key is the least recent. */
++const setWithCap = (assetUrl: string, dims: ImageDimensions): void => {
++  if (metricsCache.has(assetUrl)) metricsCache.delete(assetUrl)
++  metricsCache.set(assetUrl, dims)
++  if (metricsCache.size > IMAGE_METRICS_CACHE_MAX_ENTRIES) {
++    const oldest = metricsCache.keys().next().value
++    if (oldest !== undefined) metricsCache.delete(oldest)
++  }
++}
++
+ /**
+  * Write a decoded natural size into the cache. Called from <img onLoad> for any URL
+  * (imported blob, http, data). Idempotent; the latest measurement wins.
+  */
+ export const reportImageMetrics = (assetUrl: string, dimensions: ImageDimensions): void => {
+   if (!assetUrl || !isValidDimensions(dimensions)) return
+-  metricsCache.set(assetUrl, { width: dimensions.width, height: dimensions.height })
++  setWithCap(assetUrl, { width: dimensions.width, height: dimensions.height })
++}
++
++/** #509: drop cache entries for assets the GC sweep physically deleted — their
++ *  natural size can never be asked for again (resolve would miss anyway). */
++export const pruneImageMetricsForAssets = (assetUrls: Iterable<string>): void => {
++  for (const assetUrl of assetUrls) {
++    metricsCache.delete(assetUrl)
++    inFlight.delete(assetUrl)
++  }
+ }
+ 
+ /**
+@@ -43,7 +68,14 @@ export const getImageMetrics = async (assetUrl?: string): Promise<ImageDimension
+   if (!assetUrl) return undefined
+ 
+   const cached = metricsCache.get(assetUrl)
+-  if (cached) return cached
++  // #509 R1(seat2)-F4: a hit must refresh recency too, or this is a write-order
++  // FIFO with a refresh-on-rewrite escape hatch, not the LRU the docs above claim —
++  // a hot entry read repeatedly but never re-reported would still be the next one
++  // evicted. setWithCap's delete-then-set re-inserts it at the young end.
++  if (cached) {
++    setWithCap(assetUrl, cached)
++    return cached
++  }
+ 
+   // Non-imported URLs have no IDB blob to decode — the onLoad path reports them.
+   if (!isImportedAssetUrl(assetUrl)) return undefined
+@@ -60,7 +92,7 @@ export const getImageMetrics = async (assetUrl?: string): Promise<ImageDimension
+       const dims: ImageDimensions = { width: bitmap.width, height: bitmap.height }
+       bitmap.close()
+       if (!isValidDimensions(dims)) return undefined
+-      metricsCache.set(assetUrl, dims)
++      setWithCap(assetUrl, dims)
+       return dims
+     } catch (error) {
+       debugLogger.warn(
+diff --git a/src/lib/persistBoot.integration.test.ts b/src/lib/persistBoot.integration.test.ts
+index 3d73f9f7..5acc335d 100644
+--- a/src/lib/persistBoot.integration.test.ts
++++ b/src/lib/persistBoot.integration.test.ts
+@@ -48,6 +48,7 @@ import { toastFeedback, useToastStore } from '../store/toastStore'
+ import { useChatStore } from '../store/chatStore'
+ import { debugLogger } from '../store/debugLogStore'
+ import { enqueueChatAppend } from '../store/chatPersistSync'
++import { collectReferencedAssetUrls } from './assetGc'
+ import {
+   drainPersistQueue,
+   enqueuePersistWrite,
+@@ -754,6 +755,64 @@ describe('A2 前置 a / R-7 — chat hydrate merge 语义(保留本地未同步
+   })
+ })
+ 
++// #585 review follow-up:deleteCanvas 此前只清 persistBoot 侧 module 级 holder,没碰 chat 域——
++// 被删画布的 messagesByScene[sceneId]/unsyncedChatMsgIds[sceneId] 永久留在 chatStore,其
++// generationContext.referenceAssetUrls 也永久留在 assetGc.ts collectReferencedAssetUrls 的引用集
++// 里,对应图片资产因此永远进不了 mark/delete 路径(#509 验收对「删画布 + chat 生成图」这一类不成立)。
++describe('#585 review follow-up — deleteCanvas 清理 chat 域(messagesByScene/unsyncedChatMsgIds)', () => {
++  beforeEach(() => {
++    useChatStore.setState({ messagesByScene: {}, unsyncedChatMsgIds: {} })
++  })
++
++  const twoCanvases = () =>
++    useCanvasStore.setState({
++      sceneId: 'c1',
++      canvases: {
++        c1: { title: 'c1', projectId: 'p1', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never,
++        c2: { title: 'c2', projectId: 'p1', createdAt: 't', updatedAt: 't', nodes: [], edges: [], tasks: [] } as never,
++      },
++    })
++
++  it('deleteCanvas 后目标画布的 messagesByScene/unsyncedChatMsgIds 键都消失（未删的画布不受影响）', () => {
++    twoCanvases()
++    useChatStore.setState({
++      messagesByScene: {
++        c1: [{ id: 'm1', role: 'user', kind: 'text', text: 'hi', createdAt: 1, status: 'done' } as never],
++        c2: [{ id: 'm2', role: 'user', kind: 'text', text: 'kept', createdAt: 1, status: 'done' } as never],
++      },
++      unsyncedChatMsgIds: { c1: ['m1'] },
++    })
++
++    useCanvasStore.getState().deleteCanvas('c1')
++
++    expect('c1' in useChatStore.getState().messagesByScene).toBe(false)
++    expect('c1' in useChatStore.getState().unsyncedChatMsgIds).toBe(false)
++    expect(useChatStore.getState().messagesByScene['c2']!.map((m) => m.id)).toEqual(['m2'])
++  })
++
++  it('已删画布 chat 消息引用的资产不再计入 collectReferencedAssetUrls 的引用集（#509 GC 可回收）', () => {
++    twoCanvases()
++    useChatStore.setState({
++      messagesByScene: {
++        c1: [{
++          id: 'm1', role: 'assistant', kind: 'image', createdAt: 1, status: 'done',
++          generationContext: { referenceAssetUrls: ['mivo-asset:orphan-after-delete'] },
++        } as never],
++      },
++      unsyncedChatMsgIds: {},
++    })
++    expect(
++      collectReferencedAssetUrls(useCanvasStore.getState(), useChatStore.getState()).has('mivo-asset:orphan-after-delete'),
++    ).toBe(true) // 删前:仍被已删前的 c1 chat 引用
++
++    useCanvasStore.getState().deleteCanvas('c1')
++
++    expect(
++      collectReferencedAssetUrls(useCanvasStore.getState(), useChatStore.getState()).has('mivo-asset:orphan-after-delete'),
++    ).toBe(false) // 删后:GC 引用集里已经没有它，可以进入 mark/delete 路径
++  })
++})
++
+ // ── A2 前置 b — project delete 整树软删 + restore(server 模式对齐 soft-delete 决议)──────────
+ // 验收(计划 A2 前置 b / SC b):
+ //  - server 模式 deleteProject 从 store 移除 project + 其画板(不 standalone 回落)+ enqueue deleteProject
+diff --git a/src/lib/persistBoot.sceneHydration.test.ts b/src/lib/persistBoot.sceneHydration.test.ts
+index 3e84c4f7..093af113 100644
+--- a/src/lib/persistBoot.sceneHydration.test.ts
++++ b/src/lib/persistBoot.sceneHydration.test.ts
+@@ -57,6 +57,7 @@ vi.mock('../store/remoteDebugReporter', () => ({ reportRemoteDebugEntry: () => {
+ 
+ import {
+   bootPersistWiring,
++  clearPersistBootCanvasState,
+   stopPersistWriteQueue,
+   enqueuePersistWrite,
+   drainPersistQueue,
+@@ -203,6 +204,37 @@ describe('A2-S3 block 8 — server 模式切 scene re-hydrate(对新 scene 调 f
+     expect(fetchCanvasSpy.mock.calls.length).toBe(callsAfterFirstSwitch)
+   })
+ 
++  it('②b #509 clearPersistBootCanvasState 清 hydrate 去重标记:清理后切回该 scene → 重新 fetch(同 id 画布重建可再水合)', async () => {
++    persistState.mode = 'server'
++    useCanvasStore.setState({
++      sceneId: 'sceneA',
++      canvases: {
++        sceneA: blankCanvas('sceneA'),
++        sceneB: blankCanvas('sceneB'),
++      },
++    })
++    await bootPersistWiring(bootOpts())
++    await flush()
++    useCanvasStore.getState().loadScene('sceneB')
++    await flush()
++    const callsAfterFirstHydrate = fetchCanvasSpy.mock.calls.length
++    // 去重基线:直接切回不重复 fetch(同 ②)。
++    useCanvasStore.getState().loadScene('sceneA')
++    await flush()
++    useCanvasStore.getState().loadScene('sceneB')
++    await flush()
++    expect(fetchCanvasSpy.mock.calls.length).toBe(callsAfterFirstHydrate)
++    // #509:deleteCanvas 路径调用的清理清掉 sceneB 的去重标记后,切回 sceneB 视同
++    // 新画布 → 触发一次全新 fetchCanvas(去重 Map 不再泄漏已删画布的标记)。
++    useCanvasStore.getState().loadScene('sceneA')
++    await flush()
++    clearPersistBootCanvasState('sceneB')
++    useCanvasStore.getState().loadScene('sceneB')
++    await flush()
++    expect(fetchCanvasSpy.mock.calls.length).toBe(callsAfterFirstHydrate + 1)
++    expect(fetchCanvasSpy).toHaveBeenLastCalledWith('sceneB')
++  })
++
+   it('③ local(默认)模式:boot 后切 scene 零 fetchCanvas 请求(订阅不启动,零行为变化)', async () => {
+     persistState.mode = 'local'
+     useCanvasStore.setState({
+diff --git a/src/lib/persistBoot.ts b/src/lib/persistBoot.ts
+index 700b245e..8e6c9ec5 100644
+--- a/src/lib/persistBoot.ts
++++ b/src/lib/persistBoot.ts
+@@ -27,7 +27,7 @@ import {
+   type WriteQueue,
+ } from './writeRetryQueue'
+ import { hydrateUserStateMap } from './serverPersistHydrate'
+-import { storeCanvasCursor, __resetCanvasCursorStore } from './snapshotCursorStore'
++import { deleteCanvasCursor, storeCanvasCursor, __resetCanvasCursorStore } from './snapshotCursorStore'
+ import { getPersistUserId } from './persistUserId'
+ // Phase 1 项4(2026-07-16 复活加固):持久 tombstone 集 —— DELETE 离队(重试耗尽 terminal / 队列溢出驱逐)后
+ //   pending-delete 差集过滤失效,tombstone 接力挡复活。写入点在 store delete action(见 projectsSlice/
+@@ -420,6 +420,24 @@ export const drainPersistQueue = async (): Promise<{ processed: number; successe
+ /** 测试/observability:队列是否 active(server/shadow 已 start)。 */
+ export const isPersistWriteActive = (): boolean => writeQueue !== undefined
+ 
++/**
++ * #509:画布删除时的 per-canvas holder 清理(deleteCanvas 调)。这些 module 级 Map
++ * 只在 server/shadow 模式被写(local 恒空,清理为 no-op),且此前只增不减——删过的
++ * 画布会把 orderRevision / hydrate 去重标记 / user-state 键 / snapshot cursor 永久
++ * 留在内存里。同 id 画布重建时,去重标记已清 → 正常走 re-hydrate,语义不变。
++ */
++export const clearPersistBootCanvasState = (canvasId: string): void => {
++  if (!canvasId) return
++  orderRevisionByCanvas.delete(canvasId)
++  hydratedSceneIds.delete(canvasId)
++  inFlightSceneIds.delete(canvasId)
++  const userStatePrefix = `canvas:${canvasId}:`
++  for (const key of userStateMap.keys()) {
++    if (key.startsWith(userStatePrefix)) userStateMap.delete(key)
++  }
++  deleteCanvasCursor(canvasId)
++}
++
+ /** 测试用:重置队列单例(逐 test 隔离;不重置 persistMode)。 */
+ export const __resetPersistBoot = (): void => {
+   writeQueue?.stop()
+diff --git a/src/lib/persistIdbStorage.ts b/src/lib/persistIdbStorage.ts
+index 0f34ac10..1e317dc4 100644
+--- a/src/lib/persistIdbStorage.ts
++++ b/src/lib/persistIdbStorage.ts
+@@ -383,6 +383,26 @@ export const idbStateStorage = {
+   removeItem: (name: string): Promise<void> => removeItemByPhysicalKey(namespacedKey(name)),
+ }
+ 
++/**
++ * #509: a getItem that does NOT swallow IDB failures into a silent localStorage
++ * fallback / null. Every getter above (`idbStateStorage`, `rawIdbStorage`,
++ * `docKernelPersistStorage`) is deliberately resilient — a real IDB failure reads
++ * back as "empty" so normal rehydrate degrades gracefully instead of hanging. That
++ * default is exactly wrong for a caller whose correctness depends on telling
++ * "genuinely never written" apart from "read failed" (the client asset GC's
++ * cross-tab fail-closed check, #509 R1-F2: a swallowed failure reading back as null
++ * was indistinguishable from a fresh profile with no persisted state, silently
++ * defeating the fail-closed guarantee). Takes the PHYSICAL key directly (caller
++ * resolves namespacedKey/documentKey/sessionKey as needed) and throws — never
++ * falls back — on IDB unavailability or a transaction failure.
++ */
++export const strictRawGetItem = (physicalKey: string): Promise<string | null> => {
++  if (!isIdbAvailable()) throw new Error('IndexedDB unavailable (strictRawGetItem)')
++  return runTransaction<KvRecord | undefined>('readonly', (store) =>
++    store.get(physicalKey) as IDBRequest<KvRecord | undefined>,
++  ).then((record) => record?.value ?? null)
++}
++
+ /**
+  * rawIdbStorage:raw IDB StateStorage(无 FX-6 namespacedKey)——S6 切主给
+  * migrateV10ToV11/dryRun/rollback 用(它们内部走 namespacedKey 拼 document/session/ckpt
+diff --git a/src/lib/snapshotCursorStore.test.ts b/src/lib/snapshotCursorStore.test.ts
+new file mode 100644
+index 00000000..5c279f4b
+--- /dev/null
++++ b/src/lib/snapshotCursorStore.test.ts
+@@ -0,0 +1,47 @@
++// snapshotCursorStore.test — #509 per-canvas holder cleanup.
++//
++// The holder is a module-level only-grows Map (one bundle cursor per hydrated
++// canvas). deleteCanvasCursor is the deleteCanvas-path cleanup: the deleted
++// canvas's cursor must disappear while other canvases' cursors stay intact.
++
++import { afterEach, describe, expect, it } from 'vitest'
++import {
++  deleteCanvasCursor,
++  getCanvasCursor,
++  storeCanvasCursor,
++  __resetCanvasCursorStore,
++} from './snapshotCursorStore'
++import type { GetCanvasResponse } from '../../shared/persist-contract.ts'
++
++const fakeResponse = (id: string): GetCanvasResponse =>
++  ({
++    id,
++    contentVersion: 3,
++    sinceSeq: 7,
++    nodes: [{ id: 'n1', base: 'base-n1' }],
++    edges: [],
++    anchors: [],
++  }) as unknown as GetCanvasResponse
++
++afterEach(() => {
++  __resetCanvasCursorStore()
++})
++
++describe('deleteCanvasCursor (#509)', () => {
++  it('removes only the deleted canvas cursor; unrelated cursors survive', () => {
++    storeCanvasCursor(fakeResponse('canvas-a'))
++    storeCanvasCursor(fakeResponse('canvas-b'))
++    expect(getCanvasCursor('canvas-a')).toBeDefined()
++    expect(getCanvasCursor('canvas-b')).toBeDefined()
++
++    deleteCanvasCursor('canvas-a')
++
++    expect(getCanvasCursor('canvas-a')).toBeUndefined()
++    expect(getCanvasCursor('canvas-b')).toBeDefined()
++  })
++
++  it('is a safe no-op for a canvas that never stored a cursor', () => {
++    expect(() => deleteCanvasCursor('never-seen')).not.toThrow()
++    expect(getCanvasCursor('never-seen')).toBeUndefined()
++  })
++})
+diff --git a/src/lib/snapshotCursorStore.ts b/src/lib/snapshotCursorStore.ts
+index 042f5626..b37ad9f4 100644
+--- a/src/lib/snapshotCursorStore.ts
++++ b/src/lib/snapshotCursorStore.ts
+@@ -50,6 +50,12 @@ export const setCanvasRecordBase = (canvasId: string, recordId: string, base: st
+   cursorByCanvas.set(canvasId, setRecordBase(cur, recordId, base))
+ }
+ 
++/** #509:画布删除时清对应 cursor(holder 是只增 Map,不清会随删过的画布单调增长;
++ *  同 id 画布重建会经 hydrate 重新 storeCanvasCursor,删除无副作用)。 */
++export const deleteCanvasCursor = (canvasId: string): void => {
++  cursorByCanvas.delete(canvasId)
++}
++
+ /** 测试用:清 holder(逐 test 隔离)。 */
+ export const __resetCanvasCursorStore = (): void => {
+   cursorByCanvas.clear()
+diff --git a/src/main.tsx b/src/main.tsx
+index b1edfd15..071a8ff7 100644
+--- a/src/main.tsx
++++ b/src/main.tsx
+@@ -15,6 +15,7 @@ import { documentKey, sessionKey } from './kernel/docKernelPersistAdapter'
+ import { installRollbackTrigger } from './kernel/rollbackTrigger'
+ import { clearRegionEditDraft } from './canvas/regionEditDraft'
+ import { flushCanvasPersistWrite } from './store/canvasPersistConfig'
++import { runAssetGcSweepNow } from './app/assetGcBoot'
+ import type { agentExportCanvas } from './agent/canvasAgentVerbs'
+ 
+ declare global {
+@@ -80,6 +81,10 @@ declare global {
+        *  reload 若先于底层写落定发生,持久化数据会丢(nightly project-sidebar 回归的
+        *  根因)。仅 e2e 开关打开时挂,生产 window 上没有这个字段。 */
+       flushCanvasPersistWrite: typeof flushCanvasPersistWrite
++      /** #509 资产 GC 的测试/基准锚:立刻跑一轮 sweep(可注入 graceMs/now 模拟宽限
++       *  到期——生产语义 7 天,基准没法等)。P2-0 图片内存基准的删除后回收采样点
++       *  (D 点跟进)与手动验证共用此口。仅 e2e 开关打开时挂。 */
++      runAssetGcSweep: typeof runAssetGcSweepNow
+     }
+     __MIVO_E2E_ENABLED__?: boolean
+     /** e2e opt-out: set via addInitScript to suppress first-login auto-prompt
+@@ -115,6 +120,7 @@ if (window.__MIVO_E2E_ENABLED__ === true) {
+     getCanvasPersistSessionKey: (name: string) => (isLegacyKernelEffective() ? namespacedKey(name) : sessionKey(name)),
+     clearRegionEditDraft,
+     flushCanvasPersistWrite,
++    runAssetGcSweep: runAssetGcSweepNow,
+   }
+   // 动态 import:整条动词链只在 e2e 开关打开时才加载,生产包不含它(canvasAgentVerbs
+   // 在 src/ 里没有其他 importer,静态 import 会无条件进包)。
+diff --git a/src/store/chatHydration.characterization.test.ts b/src/store/chatHydration.characterization.test.ts
+index 2976e22c..a0e1fbae 100644
+--- a/src/store/chatHydration.characterization.test.ts
++++ b/src/store/chatHydration.characterization.test.ts
+@@ -7,7 +7,8 @@
+ // ① messagesByScene 按 sceneId 键的读写语义
+ // ② 持久化白名单（isBusy 等瞬态不入 persist）
+ // ③ hydrate 后 settleExpiredChatMessages 对 in-flight 消息的确切回落（状态/文案/task card 呈现字段）
+-// ④ 删画布后对话残留的现状语义（DP-3 迁移前：无级联清对话）
++// ④ 删画布后对话级联清理语义（#585 起：deleteCanvas 级联清 chatStore 对话，见下方 it；
++//   DP-3 迁移前的旧现状——无级联清对话——已被该修复取代，不再是当前行为）
+ // ⑤ 过期判定边界（何谓 in-flight）
+ //
+ // 现状疑点（不改行为，迁移时单独决策）见 PR 描述"现状疑点"段。
+@@ -380,7 +381,7 @@ describe('④ 删画布后对话残留现状（DP-3 迁移前：无级联清对
+     expect(after['scene-doomed']).toEqual([])
+   })
+ 
+-  it('canvasStore.deleteCanvas 不级联清 chatStore.messagesByScene（跨 store 无订阅）', () => {
++  it('canvasStore.deleteCanvas 级联清 chatStore.messagesByScene/unsyncedChatMsgIds（#585：经 chatPersistSync.clearCanvasSideState 跨 store 清理）', () => {
+     // 画布侧：两个 canvas，删掉 'doomed'（非 active）
+     const base = useCanvasStore.getInitialState()
+     useCanvasStore.setState({
+@@ -391,16 +392,18 @@ describe('④ 删画布后对话残留现状（DP-3 迁移前：无级联清对
+       },
+       sceneId: 'survivor',
+     } as never, true)
+-    // 对话侧：doomed 有历史对话
++    // 对话侧：doomed 有历史对话 + 一条未同步 sidecar 标记
+     useChatStore.setState({
+       messagesByScene: { 'doomed': [makeMessage({ id: 'c1', text: '删画布前的对话' })] },
++      unsyncedChatMsgIds: { 'doomed': ['c1'] },
+     } as never)
+ 
+     useCanvasStore.getState().deleteCanvas('doomed')
+ 
+-    // 现状（DP-3）：画布删了，对话还在 chatStore.messagesByScene['doomed']
+-    expect(useChatStore.getState().messagesByScene['doomed']).toHaveLength(1)
+-    expect(useChatStore.getState().messagesByScene['doomed'][0].text).toBe('删画布前的对话')
++    // #585：画布删了，对话跟着一起清掉——键直接消失（避免 generationContext.referenceAssetUrls
++    // 让被删画布的图片资产在 assetGc.ts 的引用集里永久留存，见 chatPersistSync.ts）
++    expect('doomed' in useChatStore.getState().messagesByScene).toBe(false)
++    expect('doomed' in useChatStore.getState().unsyncedChatMsgIds).toBe(false)
+   })
+ 
+   it('orphan sceneId key 跨 hydrate 存活（不会被 settle/merge GC）', async () => {
+diff --git a/src/store/chatPersistSync.ts b/src/store/chatPersistSync.ts
+index e1882a48..3d449fc6 100644
+--- a/src/store/chatPersistSync.ts
++++ b/src/store/chatPersistSync.ts
+@@ -6,7 +6,7 @@
+ 
+ import { isLocalPersist } from '../lib/persistMode'
+ import { useAuthStore } from './authSlice'
+-import { enqueuePersistWrite } from '../lib/persistBoot'
++import { clearPersistBootCanvasState, enqueuePersistWrite } from '../lib/persistBoot'
+ import type { ChatMessage } from './chatStore'
+ 
+ /**
+@@ -55,6 +55,29 @@ export const clearUnsyncedMarker = (canvasId: string, messageId: string): void =
+   clearUnsynced(canvasId, messageId)
+ }
+ 
++// #585 review follow-up:deleteCanvas 此前只清 persistBoot 侧 module holder(#509),没碰 chat
++// 域——被删画布的 messagesByScene[sceneId]/unsyncedChatMsgIds[sceneId] 永久留在 chatStore,其
++// generationContext.referenceAssetUrls 也永久留在 assetGc.ts collectReferencedAssetUrls 的引用
++// 集里,对应图片资产因此永远进不了 mark/delete 路径。迟到的 clearUnsynced(pending append 在
++// 删除之后才终态)因 key 已不存在直接短路(见上方 `!prev` 分支),不会重新造出这条 sidecar。
++const clearSceneChatState = (sceneId: string): void => {
++  if (!chatStoreAccessor) return
++  chatStoreAccessor.setState((s) => {
++    if (!(sceneId in s.messagesByScene) && !(sceneId in s.unsyncedChatMsgIds)) return {}
++    const messagesByScene = { ...s.messagesByScene }
++    delete messagesByScene[sceneId]
++    const unsyncedChatMsgIds = { ...s.unsyncedChatMsgIds }
++    delete unsyncedChatMsgIds[sceneId]
++    return { messagesByScene, unsyncedChatMsgIds }
++  })
++}
++
++/** deleteCanvas 的单一 per-canvas 清理入口:persistBoot 侧 module holder(#509)+ chat 域(#585)。 */
++export const clearCanvasSideState = (canvasId: string): void => {
++  clearPersistBootCanvasState(canvasId)
++  clearSceneChatState(canvasId)
++}
++
+ /**
+  * G1-a chat enqueue 出口:把 appendChatMessage op 入队(server/shadow → BFF;local no-op)。
+  * message 是 finalized committed 消息(POST 幂等 per-actor)。
+diff --git a/src/store/documentSlice.persist.test.ts b/src/store/documentSlice.persist.test.ts
+index e3a0c8f1..00c66ff4 100644
+--- a/src/store/documentSlice.persist.test.ts
++++ b/src/store/documentSlice.persist.test.ts
+@@ -703,3 +703,38 @@ describe('#353 — demo 副本 localOnly:标记落位 + document 级操作不入
+     expect(calls.filter((c) => c.path.startsWith('/api/canvas')).length).toBeGreaterThan(0)
+   })
+ })
++
++describe('#509 — deleteCanvas 清 per-canvas module 级 holder(真实链路:documentSlice → persistBoot → snapshotCursorStore)', () => {
++  it('删除画布后其 snapshot cursor 被清;其余画布的 cursor 不受影响', async () => {
++    const { storeCanvasCursor, getCanvasCursor } = await import('../lib/snapshotCursorStore')
++    const cursorSeed = (id: string) =>
++      storeCanvasCursor({
++        id,
++        contentVersion: 1,
++        sinceSeq: 0,
++        nodes: [],
++        edges: [],
++        anchors: [],
++      } as never)
++
++    useCanvasStore.setState({
++      canvases: {
++        'canvas-doomed': demoDoc('Doomed'),
++        'canvas-kept': demoDoc('Kept'),
++      },
++      sceneId: 'canvas-kept',
++      nodes: [],
++      edges: [],
++      tasks: [],
++    } as never)
++    cursorSeed('canvas-doomed')
++    cursorSeed('canvas-kept')
++    expect(getCanvasCursor('canvas-doomed')).toBeDefined()
++
++    useCanvasStore.getState().deleteCanvas('canvas-doomed')
++
++    expect(useCanvasStore.getState().canvases['canvas-doomed']).toBeUndefined()
++    expect(getCanvasCursor('canvas-doomed')).toBeUndefined()
++    expect(getCanvasCursor('canvas-kept')).toBeDefined()
++  })
++})
+diff --git a/src/store/documentSlice.ts b/src/store/documentSlice.ts
+index 2b2e0d9f..2e3df54f 100644
+--- a/src/store/documentSlice.ts
++++ b/src/store/documentSlice.ts
+@@ -40,6 +40,7 @@ import {
+ //   DEMO_PROJECT_ID_SET),document 级 mutation guard 与 canvasSyncRuntime 节点级同步 guard 共用。
+ import { DEMO_PROJECT_ID_SET, isDemoSeedCanvasId } from './demoScenes'
+ import { enqueuePersistWrite, isPersistWriteActive } from '../lib/persistBoot'
++import { clearCanvasSideState } from './chatPersistSync'
+ import { isServerPersist } from '../lib/persistMode'
+ import { getSceneWrap } from '../lib/sceneWrapRegistry'
+ // Phase 1 项4(复活加固):store delete action 发起时写持久 tombstone(详见 src/lib/deletionTombstones.ts)。
+@@ -309,6 +310,8 @@ export const createDocumentSlice: SliceCreator = (set, get) => ({
+       const deletedTitle = state.canvases[targetId].title
+       delete remainingCanvases[targetId]
+ 
++      clearCanvasSideState(targetId) // #509/#585:清 persistBoot module holder + chat 域(否则已删画布仍占资产)
++
+       if (targetId !== state.sceneId) {
+         logCanvas(`Deleted inactive canvas "${deletedTitle}"`)
+         // G1-a P1-2:server/shadow 模式 enqueue deleteCanvas(DELETE 幂等)。local no-op。

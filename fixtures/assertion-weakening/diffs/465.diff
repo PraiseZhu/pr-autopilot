@@ -1,0 +1,161 @@
+diff --git a/cindyplugin/src/__tests__/sourceEntryConvergence.test.ts b/cindyplugin/src/__tests__/sourceEntryConvergence.test.ts
+new file mode 100644
+index 00000000..0e36222a
+--- /dev/null
++++ b/cindyplugin/src/__tests__/sourceEntryConvergence.test.ts
+@@ -0,0 +1,155 @@
++/**
++ * T1f SC1b.2(三入口端到端的收敛性 + 反向断言)。
++ *
++ * 三入口(粘贴/拖入/存量)在代码层面没有分叉——它们的差异只在画布交互层"图怎么
++ * 落到 node.assetUrl 上",往后请求编辑时统一走 resolveSourceEntry。本文件不模拟
++ * 画布交互本身(那需要真机/浏览器环境),只钉住这一层没有分叉的两件事:
++ *  ① submitEditTask 与 submitVariationsTask 对同一个 sourceAssetUrl 解析出的
++ *     hash,原样进最终 edit-image 请求的 hashes 字段(不是另算一份);
++ *  ② submitVariationsTask 的多条变体共用同一次源图解析,不是每条变体各自寄存
++ *     一次(否则同一张源图会被寄存 N 次,白占配额)。
++ *  ③ 反向断言(SC1b.2 末条):submitGenerationTask(文生图,无 sourceAssetUrl)
++ *     完全不经过 resolveSourceEntry/resolveDepositEntry——结构上验证,不是猜测。
++ *
++ * canvasStore 被替身掉,理由同本目录其它 cindyGenerationPort 测试。
++ */
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.mock('../../../src/store/canvasStore', () => ({
++  useCanvasStore: { getState: () => ({ nodes: [] }) },
++}))
++
++import { cindyImageGenerationPort } from '../agent/cindyGenerationPort'
++import { createDepositHarness, teardownDepositHarness, type DepositHarness } from './depositTestHarness'
++
++let harness: DepositHarness
++
++type Posted = Record<string, unknown>
++const posted: Posted[] = []
++
++class FakeBroadcastChannel {
++  readonly name: string
++  private readonly listeners = new Set<(event: { data: unknown }) => void>()
++
++  constructor(name: string) {
++    this.name = name
++  }
++
++  addEventListener(_type: 'message', handler: (event: { data: unknown }) => void) {
++    this.listeners.add(handler)
++  }
++
++  removeEventListener(_type: 'message', handler: (event: { data: unknown }) => void) {
++    this.listeners.delete(handler)
++  }
++
++  postMessage(data: unknown) {
++    const message = data as Posted
++    posted.push(message)
++    // edit-image 首次即成功:本组只关心 hashes 字段与调用次数,不想被强制重寄
++    // 重试的语义耦合进来(那条契约见 editOnceWithForcedRetry.test.ts)。
++    const reply =
++      message.kind === 'edit-image'
++        ? { reqId: message.reqId, reply: true, ok: true, hash: 'f'.repeat(32), ext: '.png' }
++        : { reqId: message.reqId, reply: true, ok: false, message: '测试短路' }
++    for (const handler of Array.from(this.listeners)) handler({ data: reply })
++  }
++
++  close() {
++    this.listeners.clear()
++  }
++}
++
++const flushDetached = () => new Promise((resolve) => setTimeout(resolve, 0))
++const editMessages = () => posted.filter((message) => message.kind === 'edit-image')
++
++beforeEach(() => {
++  posted.length = 0
++  // deposit 侧(源图懒寄存)经 depositTestHarness 的注入传输,不走这里的
++  // FakeBroadcastChannel——两者互不干扰(同 portEditRatio.test.ts 的组合写法)。
++  harness = createDepositHarness()
++  vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
++  vi.stubGlobal('window', {
++    setInterval: (fn: () => void, ms: number) => globalThis.setInterval(fn, ms),
++    clearInterval: (id: unknown) => globalThis.clearInterval(id as never),
++    setTimeout: (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms),
++    clearTimeout: (id: unknown) => globalThis.clearTimeout(id as never),
++  })
++  vi.stubGlobal('fetch', async () => ({
++    ok: true,
++    json: async () => ({}),
++    blob: async () => new Blob([new Uint8Array(4)]),
++  }) as unknown as Response)
++  vi.stubGlobal(
++    'FileReader',
++    class {
++      result: string | null = null
++      onload: (() => void) | null = null
++      onerror: (() => void) | null = null
++      readAsDataURL() {
++        this.result = 'data:image/png;base64,ZmFrZQ=='
++        queueMicrotask(() => this.onload?.())
++      }
++    },
++  )
++})
++
++afterEach(() => {
++  teardownDepositHarness()
++  vi.unstubAllGlobals()
++})
++
++describe('SC1b.2 — 源图解析收敛:submitEditTask 与 submitVariationsTask 共用同一套解析', () => {
++  it('submitEditTask:懒寄存解析出的 hash 原样进 edit-image 的 hashes 字段', async () => {
++    await cindyImageGenerationPort.submitEditTask({
++      prompt: '改一下',
++      image: new Blob([new Uint8Array(8)], { type: 'image/png' }),
++      sourceAssetUrl: 'mivo-asset:conv-edit',
++      idempotencyKey: 'c1',
++    })
++    await flushDetached()
++
++    expect(harness.hostRequests).toHaveLength(1)
++    expect(editMessages()).toHaveLength(1)
++    // 不重复硬编码 FAKE_HASH 常量,直接从 depositStore 侧核对同一条记录,
++    // 证明 edit-image 请求携带的确实是 resolveSourceEntry 解析出的那个 hash。
++    const { peekDepositStoreForTests } = await import('../agent/depositStore')
++    const cached = peekDepositStoreForTests()?.map['mivo-asset:conv-edit']
++    expect(cached).toBeDefined()
++    expect(editMessages()[0].hashes).toEqual([cached?.hash])
++  })
++
++  it('submitVariationsTask:多条变体共用同一次源图解析(单次寄存),每条 edit-image 的 hashes 都是那同一个 hash', async () => {
++    await cindyImageGenerationPort.submitVariationsTask({
++      image: new Blob([new Uint8Array(8)], { type: 'image/png' }),
++      sourceAssetUrl: 'mivo-asset:conv-variations',
++      variations: [{ prompt: 'a' }, { prompt: 'b' }, { prompt: 'c' }],
++      idempotencyKey: 'c2',
++    })
++    await flushDetached()
++
++    // 3 条变体,若每条各自寄存会是 3 次;实际应恰好 1 次(resolveSourceEntry 在
++    // 循环之前调用一次,循环内只复用同一个 source.hash)。
++    expect(harness.hostRequests).toHaveLength(1)
++    const { peekDepositStoreForTests } = await import('../agent/depositStore')
++    const cached = peekDepositStoreForTests()?.map['mivo-asset:conv-variations']
++    expect(cached).toBeDefined()
++
++    expect(editMessages()).toHaveLength(3)
++    for (const message of editMessages()) {
++      expect(message.hashes).toEqual([cached?.hash])
++    }
++  })
++})
++
++describe('SC1b.2 — 反向断言:submitGenerationTask(文生图,无源图)零 deposit', () => {
++  it('文生图请求全程不经过 resolveSourceEntry/resolveDepositEntry,零 deposit_media 请求', async () => {
++    await cindyImageGenerationPort.submitGenerationTask({ prompt: '画一只猫', idempotencyKey: 'c3' })
++    await flushDetached()
++
++    // gen-image 走的是 FakeBroadcastChannel(kind !== 'edit-image' 分支,ok:false
++    // 短路即可,本用例不关心生成结果,只关心 deposit 侧零调用)。
++    expect(harness.hostRequests).toHaveLength(0)
++    expect(harness.hostReleaseRequests).toHaveLength(0)
++  })
++})

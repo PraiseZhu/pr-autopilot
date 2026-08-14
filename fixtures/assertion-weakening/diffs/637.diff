@@ -1,0 +1,3889 @@
+diff --git a/src/App.test.tsx b/src/App.test.tsx
+new file mode 100644
+index 00000000..5b39a813
+--- /dev/null
++++ b/src/App.test.tsx
+@@ -0,0 +1,715 @@
++// @vitest-environment happy-dom
++// App 上层协调接线(升级阶梯② / SC-3)——相机 deferred 池生命周期移交 App。
++//
++// 为什么拆两层验证:
++// 1. 纯函数层:selectLiveCanvasIds 是可测的确定性纯函数(live 判据与 UI
++//    matchesView 同源:`status !== 'archived'` 为 active,缺省/undefined 视为 active,
++//    删除的画布键不在集合里)。
++// 2. 接线层:渲染整个 <App /> 会拉起 useStoreHydration 的 IDB persist 水合
++//    (fake-indexeddb 不在测试依赖里),成本高且与接线本身无关。沿用
++//    main.e2eBridge.test.ts 的源码级门禁先例(`?raw` + 去注释后断言源码形状),
++//    锁住「App 的 effect 真的调用 reconcile(selectLiveCanvasIds(canvases)),
++//    且依赖数组含 canvases」——删掉接线(变异 1)或改依赖数组,本文件必红。
++import { describe, expect, it } from 'vitest'
++import AppSource from './App.tsx?raw'
++import { selectLiveCanvasIds } from './app/sidebar/projectSidebarModel'
++import type { CanvasDocument } from './types/mivoCanvas'
++
++// 纯函数来自 projectSidebarModel(纯 TS,无 leafer 模块图),静态 import 安全。
++// 接线层不渲染 <App />(会拉起 useStoreHydration 的 IDB persist 水合,且 App 模块图
++// 顶层 import leafer-ui——leafer 模块顶层执行 canvasPatch(CanvasRenderingContext2D/
++// Path2D.prototype),happy-dom 没有这些全局)——用 `?raw` 源码做静态断言,与
++// main.e2eBridge.test.ts 的源码级门禁同一先例。
++
++const doc = (overrides: Partial<CanvasDocument> = {}): CanvasDocument => ({
++  title: 't',
++  createdAt: '2026-01-01T00:00:00.000Z',
++  updatedAt: '2026-01-01T00:00:00.000Z',
++  nodes: [],
++  edges: [],
++  tasks: [],
++  ...overrides,
++})
++
++describe('selectLiveCanvasIds(纯函数,SC-3)', () => {
++  it('archived 排除;active 与缺省 status(undefined)保留(与 UI matchesView 同判据)', () => {
++    const canvases: Record<string, CanvasDocument> = {
++      'live-active': doc({ status: 'active' }),
++      'live-default': doc({}),
++      'archived-c': doc({ status: 'archived' }),
++      'live-again': doc({ status: 'active' }),
++    }
++    expect(selectLiveCanvasIds(canvases).sort()).toEqual(['live-active', 'live-again', 'live-default'])
++  })
++
++  it('空对象 → 空数组', () => {
++    expect(selectLiveCanvasIds({})).toEqual([])
++  })
++
++  it('返回只含 id,不含文档本体;不依赖对象键序(乱序对象输出等价的 id 集合)', () => {
++    const canvases: Record<string, CanvasDocument> = {
++      '10': doc({ status: 'active' }),
++      '2': doc({ status: 'active' }),
++      '7': doc({ status: 'archived' }),
++    }
++    const ids = selectLiveCanvasIds(canvases)
++    expect(ids).toHaveLength(2)
++    expect(ids.every((id) => typeof id === 'string' && id.length > 0)).toBe(true)
++    expect([...ids].sort()).toEqual(['10', '2'])
++  })
++})
++
++// ── 接线层(静态):effect 必须真的调用 reconcile,不能只有纯函数没人消费 ──
++//
++// 为什么不用正则:旧门禁 /useEffect\(\(\)\s*=>\s*\{[\s\S]*?reconcile...[\s\S]*?\},\s*\[([^\]]*)\]\)/
++// 的 [\s\S]*? 可以跨任意 useEffect 边界——把真实调用移进一个未调用 callback、另留
++// 空 useEffect(() => {}, [canvases]),正则仍可从更早 effect 的开头跨到调用、再跨到
++// 空 effect 的依赖数组,测试假绿:它只证明文件里同时出现了几个 token,不证明生产接线。
++// 本门禁用 TypeScript AST 解析(与 menuOverlayStack.contract.test.ts 同一先例),
++// 节点边界由语法树决定:要求「同一个 useEffect 调用」的 callback 体内含
++// reconcile(selectLiveCanvasIds(canvases)) 调用,且「同一个调用节点」的第二参数
++// 数组字面量含 canvases 标识符——跨块借 token 在 AST 上不可达。
++import ts from 'typescript'
++
++// ── 精确 AST 谓词 + 词法绑定解析(拒绝四类假绿) ──
++//
++// 门禁语义:App 组件函数体顶层可执行路径上,存在一条 useEffect 调用,其 callback
++// 顶层可执行路径上恰好有一条 useCameraFocusStore.getState().
++// reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases)) 精确语句,且同一调用
++// 节点的依赖数组含绑定到 App 顶层 canvases 的标识符。
++//
++// 三条 P1 修复(相对于上一版):
++// 1. 收集范围 App 化:collectUseEffects 不再无条件递归 sourceFile 所有后代——整个
++//    useEffect 移进「从未调用」的嵌套函数时 React 永不注册/执行,全树收集仍会收到
++//    它并放行。现改为只定位顶层 function App,对其 body 走 walkExecutable(进入
++//    if/for/try 等控制流容器,但永远不跨嵌套函数/class 边界),收集阶段即跳过
++//    嵌套作用域,App 自身是唯一 root 例外。
++// 2. 标识符词法绑定:receiver/selector/deps 不再只比 identifier.text——App body
++//    块内可声明同名局部 shadow(fake store/selector/canvases),精确文本形状仍假绿。
++//    现沿 identifier 祖先链由内向外找「最近同名声明」(Block/函数参数/循环变量/
++//    catch/模块级 import 均覆盖),要求:store 标识符绑定到顶层
++//    import { useCameraFocusStore } from './store/cameraFocusStore';selector 标识符
++//    绑定到顶层 import { selectLiveCanvasIds } from './app/sidebar/projectSidebarModel';
++//    canvases(参数与 deps)绑定到 App body 顶层的 const canvases = useCanvasStore(...)
++//    VariableDeclaration。任何作用域内的同名重声明(变量/参数/function/import
++//    alias/块内 const)都是最近声明 → 拒绝。
++// 3. 根声明本身的来源/初始化器校验(P1-3):词法绑定只保证「最近同名声明」,不保证
++//    该声明是真的。假绿 #1:App body const useEffect = () => {} shadow React,收集
++//    只看 callee 文本;假绿 #2/#3:import { fakeStore as useCameraFocusStore } 的
++//    local 名与真导入相同,resolveBindings 只看 local 名 + module path;假绿 #4:
++//    let canvases = {} as never 与真声明同名。修复:ImportSpecifier 一律按原
++//    export 名(propertyName ?? name)匹配(useEffect→react / useCameraFocusStore→
++//    ./store/cameraFocusStore / selectLiveCanvasIds→./app/sidebar/projectSidebarModel /
++//    useCanvasStore→./store/canvasStore);canvases 要求 const + 精确
++//    useCanvasStore((state) => state.canvases) 初始化器(callee 再经 bindingFor
++//    回链到 useCanvasStore 导入);effect 收集要求 callee 词法绑定到 react 导入的
++//    useEffect ImportSpecifier。任一期望绑定缺失,下游短路比较 fail-closed。
++//
++// 结构性重构(裹函数/换 receiver/套容器/删 deps/块内 shadow/fake 根声明)全部显式红,
++// 维护者同步更新测试,而不是门退化成 token 搜索。
++
++// 嵌套函数/类型边界:进入这些节点 = 进入一段不会在 effect 顶层直接执行的作用域,
++// 必须跳过(否则「定义但从不调用」的函数、class 方法里的调用会被认成接线)。
++const isFunctionBoundary = (node: ts.Node): boolean =>
++  ts.isArrowFunction(node) ||
++  ts.isFunctionExpression(node) ||
++  ts.isFunctionDeclaration(node) ||
++  ts.isMethodDeclaration(node) ||
++  ts.isConstructorDeclaration(node) ||
++  ts.isGetAccessorDeclaration(node) ||
++  ts.isSetAccessorDeclaration(node) ||
++  ts.isClassDeclaration(node) ||
++  ts.isClassExpression(node)
++
++// 遍历「顶层可执行路径」:visit 每个节点,但 forEachChild 下钻时跳过函数边界。
++// if/else/try/catch 等控制流容器照常进入(块内直接执行算接线),嵌套函数体不可达。
++const walkExecutable = (node: ts.Node, visit: (n: ts.Node) => void): void => {
++  visit(node)
++  ts.forEachChild(node, (child) => {
++    if (!isFunctionBoundary(child)) walkExecutable(child, visit)
++  })
++}
++
++// ── 词法绑定解析(P1-2):identifier → 最近同名声明的声明节点 ──
++//
++// 作用域容器与其中的声明:
++// - Block(含函数体):块内 VariableStatement/FunctionDeclaration/ClassDeclaration;
++//   若该块是函数体,函数参数(可能 shadow 外层名字)也算此作用域。
++// - SourceFile:顶层 VariableStatement/FunctionDeclaration/ClassDeclaration +
++//   命名导入 ImportSpecifier(import { a as b } 时局部名是 b)。
++// - For/ForOf:循环变量声明列表;CatchClause:catch 绑定。ForIn 不解构(TS2491),
++//   declaredInScope 不认 ForIn 为声明容器。
++// 查找从 identifier 沿 parent 向上,对每个作用域容器检查同名声明;命中即返回
++// (最近者优先),无则继续上一层。TDZ(声明在引用之后)不豁免——静态上同作用域
++// 同名声明就是 shadow,对「拒绝重声明」的判据取更严格侧。
++// P1-4(binding pattern):声明名不止 Identifier——VariableDeclaration/Parameter/
++// Catch/For 的 name 可以是解构 BindingName。旧实现只认 Identifier,`const { useEffect }
++// = ...` 类的解构 shadow 找不到最近声明,identifier 错误回落模块 import/App 外层
++// 变量,countWiredEffects 仍 1 假绿。统一走 bindingNameContains 递归查局部绑定名。
++
++// 递归 binding-name 查找:一个 ts.BindingName(标识符/对象/数组解构 pattern)是否
++// 声明了局部名 name。覆盖:
++// - 标识符:const x / (x) / catch (x) → 直接比文本
++// - 对象解构:const {x: useEffect} / {useEffect} / {...rest} → 局部绑定名是
++//   element.name——与 propertyName 无关,别名 {fake: useEffect} 的局部名仍是
++//   useEffect,而 {useEffect: fake} 局部名是 fake;rest 元素的局部名也是
++//   element.name。
++// - 数组解构:const [useEffect] / [, useEffect] / [...rest] → 对应 element.name;
++//   OmittedExpression(空位)跳过。
++// - 嵌套:{a: {b: [x]}} → element.name 本身可以是嵌套 pattern,递归进入。
++// 命中只回答「是否声明」;返回的声明容器(节点 identity)由调用方决定,保持与
++// 旧 Identifier-only 路径一致(VariableDeclaration / ParameterDeclaration /
++// CatchVariableDeclaration),resolveBindings 的 `===` 绑定比较不受影响。
++const bindingNameContains = (bindingName: ts.BindingName, name: string): boolean => {
++  if (ts.isIdentifier(bindingName)) return bindingName.text === name
++  for (const el of bindingName.elements) {
++    if (ts.isOmittedExpression(el)) continue
++    if (bindingNameContains(el.name, name)) return true
++  }
++  return false
++}
++
++// statements 中声明了局部名 name 的语句:变量声明(含解构 BindingName)、函数
++// 声明、类声明。Block 与 SourceFile 两个作用域分支共用同一扫描(/simplify 收敛
++// 出的重复);import 不在此列——SourceFile 的 import 扫描留在 declaredInScope,
++// 按语句顺序与块内声明竞争「最近声明」(见下)。
++const findStatementDeclaration = (
++  statements: readonly ts.Statement[],
++  name: string,
++): ts.Declaration | undefined => {
++  for (const stmt of statements) {
++    if (ts.isVariableStatement(stmt)) {
++      for (const d of stmt.declarationList.declarations) {
++        if (bindingNameContains(d.name, name)) return d
++      }
++    } else if (ts.isFunctionDeclaration(stmt) && stmt.name?.text === name) {
++      return stmt
++    } else if (ts.isClassDeclaration(stmt) && stmt.name?.text === name) {
++      return stmt
++    }
++  }
++  return undefined
++}
++
++const declaredInScope = (node: ts.Node, name: string): ts.Declaration | undefined => {
++  if (ts.isBlock(node)) {
++    const found = findStatementDeclaration(node.statements, name)
++    if (found) return found
++    // 函数体块:参数与块内声明同一函数作用域,参数也可 shadow 外层。
++    if (ts.isFunctionLike(node.parent)) {
++      for (const p of node.parent.parameters) {
++        if (bindingNameContains(p.name, name)) return p
++      }
++    }
++    return undefined
++  }
++  if (ts.isSourceFile(node)) {
++    // import 与块内声明同属模块作用域,按语句顺序竞争「最近声明」:逐句先查
++    // 声明再查 import,保持原单趟按序语义(先扫声明后扫 import 会把排在同名
++    // 声明之前的 import 错序)。
++    for (const stmt of node.statements) {
++      const found = findStatementDeclaration([stmt], name)
++      if (found) return found
++      if (ts.isImportDeclaration(stmt) && ts.isStringLiteral(stmt.moduleSpecifier)) {
++        const named = stmt.importClause?.namedBindings
++        if (named && ts.isNamedImports(named)) {
++          for (const el of named.elements) {
++            if (el.name.text === name) return el
++          }
++        }
++      }
++    }
++    return undefined
++  }
++  if (ts.isForStatement(node) && node.initializer && ts.isVariableDeclarationList(node.initializer)) {
++    for (const d of node.initializer.declarations) {
++      if (bindingNameContains(d.name, name)) return d
++    }
++    return undefined
++  }
++  if (ts.isForOfStatement(node) && ts.isVariableDeclarationList(node.initializer)) {
++    for (const d of node.initializer.declarations) {
++      if (bindingNameContains(d.name, name)) return d
++    }
++    return undefined
++  }
++  if (ts.isCatchClause(node) && node.variableDeclaration) {
++    return bindingNameContains(node.variableDeclaration.name, name) ? node.variableDeclaration : undefined
++  }
++  return undefined
++}
++
++const bindingFor = (id: ts.Identifier): ts.Declaration | undefined => {
++  let current: ts.Node | undefined = id.parent
++  while (current) {
++    const decl = declaredInScope(current, id.text)
++    if (decl) return decl
++    current = current.parent
++  }
++  return undefined
++}
++
++// 期望绑定的真相源(每次解析新 sourceFile 重取,变异文件与真源各自独立):
++// store/selector 必须是模块级指定路径的命名导入,且按「原 export 名」匹配——
++// import { fakeStore as useCameraFocusStore } 的 local 名再像也不是真 store
++// (propertyName 才是原 export 名);useEffect 必须是 react 模块的命名导入(支持
++// import { useEffect as e } + 调用 e(),原 export 名 useEffect 即真);useCanvasStore
++// 必须是 ./store/canvasStore 的命名导入;canvases 必须是 App body 顶层的
++// const canvases = useCanvasStore((state) => state.canvases) VariableDeclaration
++// (非 const / 非该初始化器的同名声明一律不认)。任一期望绑定缺失时,下游所有
++// 短路比较以 undefined 侧 fail-closed,不允许 undefined === undefined 碰巧通过。
++interface AppBindings {
++  useEffect: ts.ImportSpecifier | undefined
++  store: ts.ImportSpecifier | undefined
++  selector: ts.ImportSpecifier | undefined
++  useCanvasStore: ts.ImportSpecifier | undefined
++  canvases: ts.VariableDeclaration | undefined
++}
++
++// canvases 初始化器必须精确 useCanvasStore((state) => state.canvases):callee 词法
++// 绑定到 ./store/canvasStore 的 useCanvasStore 导入;恰好一个参数,参数名 state,
++// body 是 state.canvases 属性访问。useCanvasStore 绑定缺失即 fail-closed(false)。
++const isExactCanvasInit = (init: ts.Expression | undefined, useCanvasStore: ts.ImportSpecifier | undefined): boolean => {
++  if (!init || !useCanvasStore) return false
++  if (!ts.isCallExpression(init)) return false
++  if (!ts.isIdentifier(init.expression) || init.expression.text !== 'useCanvasStore') return false
++  if (bindingFor(init.expression) !== useCanvasStore) return false
++  if (init.arguments.length !== 1) return false
++  const arg = init.arguments[0]
++  if (!ts.isArrowFunction(arg) || arg.parameters.length !== 1) return false
++  const p = arg.parameters[0]
++  if (!ts.isIdentifier(p.name) || p.name.text !== 'state') return false
++  if (!ts.isPropertyAccessExpression(arg.body) || arg.body.name.text !== 'canvases') return false
++  const stateId = arg.body.expression
++  return ts.isIdentifier(stateId) && stateId.text === 'state'
++}
++
++const resolveBindings = (sf: ts.SourceFile): AppBindings => {
++  let useEffect: ts.ImportSpecifier | undefined
++  let store: ts.ImportSpecifier | undefined
++  let selector: ts.ImportSpecifier | undefined
++  let useCanvasStore: ts.ImportSpecifier | undefined
++  let canvases: ts.VariableDeclaration | undefined
++  for (const stmt of sf.statements) {
++    if (ts.isImportDeclaration(stmt) && ts.isStringLiteral(stmt.moduleSpecifier)) {
++      const mod = stmt.moduleSpecifier.text
++      const named = stmt.importClause?.namedBindings
++      if (named && ts.isNamedImports(named)) {
++        for (const el of named.elements) {
++          // 只认原 export 名(propertyName ?? name):fake export alias 成真实 local
++          // 名(假绿 #2/#3)在此被排除,绑定保持 undefined → 下游 fail-closed。
++          const exported = el.propertyName?.text ?? el.name.text
++          if (exported === 'useEffect' && mod === 'react') useEffect = el
++          if (exported === 'useCameraFocusStore' && mod === './store/cameraFocusStore') store = el
++          if (exported === 'selectLiveCanvasIds' && mod === './app/sidebar/projectSidebarModel') selector = el
++          if (exported === 'useCanvasStore' && mod === './store/canvasStore') useCanvasStore = el
++        }
++      }
++    }
++  }
++  const app = sf.statements.find(
++    (s): s is ts.FunctionDeclaration => ts.isFunctionDeclaration(s) && s.name?.text === 'App',
++  )
++  for (const stmt of app?.body?.statements ?? []) {
++    // canvases 必须 const + 精确 useCanvasStore((state) => state.canvases) 初始化
++    // (假绿 #4:let canvases = {} as never 名称相同但声明语义全错,不认)。
++    if (ts.isVariableStatement(stmt) && (stmt.declarationList.flags & ts.NodeFlags.Const) !== 0) {
++      for (const d of stmt.declarationList.declarations) {
++        if (ts.isIdentifier(d.name) && d.name.text === 'canvases' && isExactCanvasInit(d.initializer, useCanvasStore)) {
++          canvases = d
++        }
++      }
++    }
++  }
++  return { useEffect, store, selector, useCanvasStore, canvases }
++}
++
++// receiver 精确绑定:useCameraFocusStore.getState().reconcileDeferredFocusScenes。
++// TS 语法树里 `a.b().c` 是 PropertyAccess(Call(PropertyAccess(a, b)), c)——外层
++// .reconcileDeferredFocusScenes 的表达式是「调用 getState() 的 CallExpression」,
++// 不是属性访问。逐层比对:方法名 → getState() 调用 → getState 属性 → store
++// 标识符(且必须词法绑定到顶层 cameraFocusStore 导入),缺一层或形状不符(如 fake
++// 对象直接 .reconcileDeferredFocusScenes)都拒绝。
++const isExactReconcileReceiver = (expr: ts.Expression, bindings: AppBindings): boolean => {
++  if (!ts.isPropertyAccessExpression(expr) || expr.name.text !== 'reconcileDeferredFocusScenes') return false
++  const getStateCall = expr.expression
++  if (!ts.isCallExpression(getStateCall)) return false
++  const getStateAccess = getStateCall.expression
++  if (!ts.isPropertyAccessExpression(getStateAccess) || getStateAccess.name.text !== 'getState') return false
++  const storeId = getStateAccess.expression
++  return !!bindings.store && ts.isIdentifier(storeId) && bindingFor(storeId) === bindings.store
++}
++
++// firstArg 精确绑定:selectLiveCanvasIds(canvases)——调用名(词法绑定到顶层
++// projectSidebarModel 导入)+ 恰好一个 Identifier(词法绑定到 App 顶层 canvases)。
++// 不做子树搜索,后代里的同名 token(decoy 容器)一律拒绝;块内同名 shadow 拒绝。
++const isExactSelectorArg = (arg: ts.Expression, bindings: AppBindings): boolean => {
++  if (!ts.isCallExpression(arg)) return false
++  if (!ts.isIdentifier(arg.expression) || arg.expression.text !== 'selectLiveCanvasIds') return false
++  if (!bindings.selector || bindingFor(arg.expression) !== bindings.selector) return false
++  if (arg.arguments.length !== 1) return false
++  const only = arg.arguments[0]
++  return !!bindings.canvases && ts.isIdentifier(only) && only.text === 'canvases' && bindingFor(only) === bindings.canvases
++}
++
++// 精确接线语句:顶层可执行路径上的 ExpressionStatement,其表达式必须整棵精确
++// 等于 useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases)),
++// 且三个标识符都词法绑定到期望声明。
++const isExactWiringStatement = (node: ts.Node, bindings: AppBindings): boolean => {
++  if (!ts.isExpressionStatement(node)) return false
++  const call = node.expression
++  if (!ts.isCallExpression(call)) return false
++  if (!isExactReconcileReceiver(call.expression, bindings)) return false
++  if (call.arguments.length !== 1) return false
++  return isExactSelectorArg(call.arguments[0], bindings)
++}
++
++// 判定一个 useEffect 调用是否携带完整接线:callback body 顶层可执行路径上存在
++// 精确接线语句,且同一调用节点的依赖数组含绑定到 App 顶层 canvases 的标识符。
++const isWiredEffect = (call: ts.CallExpression, bindings: AppBindings): boolean => {
++  const callback = call.arguments[0]
++  if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) return false
++  if (!callback.body) return false
++  let wired = false
++  walkExecutable(callback.body, (node) => {
++    if (!wired && isExactWiringStatement(node, bindings)) wired = true
++  })
++  if (!wired) return false
++  const deps = call.arguments[1]
++  return (
++    !!deps &&
++    ts.isArrayLiteralExpression(deps) &&
++    !!bindings.canvases &&
++    deps.elements.some((el) => ts.isIdentifier(el) && el.text === 'canvases' && bindingFor(el) === bindings.canvases)
++  )
++}
++
++// 只收集「App 组件函数体顶层可执行路径」上的 useEffect(P1-1):先定位顶层
++// function App,再对其 body 走 walkExecutable——嵌套函数/class 边界在收集阶段就
++// 跳过(整个 effect 移进未调用嵌套函数时 React 永不注册,不得计入),App 自身是
++// 唯一 root 例外。找不到 App 函数 = fail-closed(返回空,不猜)。
++// P1-3(根绑定 exact):callee 标识符必须词法绑定到 SourceFile 顶层 react 导入的
++// useEffect ImportSpecifier——App body 里 const useEffect = () => {} shadow(假绿 #1)
++// 后最近同名声明是局部变量,文本相同也不收集;bindings.useEffect 缺失即
++// fail-closed(空绑定不收集任何调用)。原 export 名校验在 resolveBindings,
++// local 名不限:import { useEffect as e } + 调用 e() 的真实形态照常收集。
++const collectAppUseEffects = (sourceFile: ts.SourceFile, out: ts.CallExpression[], bindings: AppBindings): void => {
++  const app = sourceFile.statements.find(
++    (s): s is ts.FunctionDeclaration => ts.isFunctionDeclaration(s) && s.name?.text === 'App',
++  )
++  if (!app?.body) return
++  walkExecutable(app.body, (node) => {
++    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
++      if (bindings.useEffect && bindingFor(node.expression) === bindings.useEffect) out.push(node)
++    }
++  })
++}
++
++// 变异反例与真源共用入口:喂任意 App.tsx 源码字符串,返回被认作完整接线的
++// useEffect 数量。变异测试断言 = 0(新门必须拒绝),真源断言 > 0。
++const countWiredEffects = (source: string): number => {
++  const sourceFile = ts.createSourceFile('App.tsx', source, ts.ScriptTarget.Latest, /* setParentNodes */ true)
++  const bindings = resolveBindings(sourceFile)
++  const effects: ts.CallExpression[] = []
++  collectAppUseEffects(sourceFile, effects, bindings)
++  return effects.filter((call) => isWiredEffect(call, bindings)).length
++}
++
++// 生产接线片段的逐字形状(App.tsx 唯一):变异测试只替换这一块,其余源码原样,
++// 保证「同一 useEffect 的 callback + 同一依赖数组」的上下文不被换掉。
++const WIRING_EFFECT = `  useEffect(() => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++  }, [canvases])`
++
++const variantSource = (replacement: string): string => AppSource.replace(WIRING_EFFECT, replacement)
++
++describe('App 上层协调接线(SC-3,静态门禁)', () => {
++  it('imports useCameraFocusStore(接线经真实 store,不是本地 mock)', () => {
++    expect(AppSource).toMatch(
++      /import\s*\{[^}]*useCameraFocusStore[^}]*\}\s*from\s*['"].\/store\/cameraFocusStore['"]/,
++    )
++  })
++
++  it('同一 useEffect:callback 体内调用 reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases)),且同一调用依赖数组含 canvases(AST 受限,不可跨块)', () => {
++    expect(
++      countWiredEffects(AppSource),
++      'App 中不存在「同一 useEffect 的 callback 体内调用 reconcile(selectLiveCanvasIds(canvases)) 且依赖数组含 canvases」的接线(AST 节点边界,跨块借 token 不可达)',
++    ).toBeGreaterThan(0)
++  })
++})
++
++// ── 变异反例(反向变异,断言新门必须拒绝) ──
++//
++// 四处历史假绿 + 六处新 P1 反例:
++// 1. nested-callback:调用被裹进「从未调用」的嵌套箭头函数,旧 findInSubtree 会
++//    跨函数边界认成接线(生产不执行,门却绿)。
++// 2. fake-receiver:receiver 换成 fake 对象,旧谓词只看 property name 不验 receiver
++//    链(useCameraFocusStore.getState() 前缀),换壳后仍绿。
++// 3. decoy-selector:firstArg 换成 {decoy: selectLiveCanvasIds(canvases)} 容器,旧
++//    findInSubtree 在参数子树里找到 token 就绿。
++// 4. deps 回归:依赖数组删掉 canvases,新旧门都必须保持红。
++// 5. whole-effect-nested:整个 useEffect 移进「从未调用」的嵌套函数——React 永不
++//    注册/执行该 effect,但全树收集仍收到它。收集范围必须 App 化(walkExecutable
++//    收集阶段跳过嵌套边界)。
++// 6. lexical-shadow:App body 块内声明 fake useCameraFocusStore/selectLiveCanvasIds/
++//    canvases,精确文本形状不变——只比 identifier.text 仍假绿。必须按词法绑定
++//    拒绝(receiver/selector/deps 三个标识符的最近同名声明都是块内变量,不是
++//    期望的顶层 import / App 顶层 canvases)。
++// 7. fake-effect-shadow:App body 顶层 const useEffect = () => {} 声明局部函数再
++//    调用,callee 文本仍是 useEffect——收集阶段必须按词法绑定回链 react 导入的
++//    useEffect ImportSpecifier(假绿 #1)。
++// 8. fake-store-alias:import { fakeStore as useCameraFocusStore } from
++//    './store/cameraFocusStore'——local 名与真导入相同,resolveBindings 只看
++//    local 名会把它认成真 store(假绿 #2)。必须按原 export 名(propertyName)
++//    匹配,fake export alias 成真实 local 名不得通过。
++// 9. fake-selector-alias:import { fakeSelector as selectLiveCanvasIds } 同理
++//    (假绿 #3)。
++// 10. non-const canvases:App 顶层 let canvases = {} as never 与真声明同名,只看
++//    变量名会认成真 canvases(假绿 #4)。必须 const + 精确
++//    useCanvasStore((state) => state.canvases) 初始化器。
++// 11-16. binding-pattern shadow(P1-4):声明名只认 Identifier 会漏解构 BindingName
++//    ——块内 `const { useEffect } = {...}` / `const { fake: useEffect } = {...}` /
++//    `const [useEffect] = [...]` / `{ useCameraFocusStore }` / `{ selectLiveCanvasIds }`
++//    / `{ canvases }` 解构 shadow 后,identifier 错误回落模块 import/App 外层变量,
++//    countWiredEffects 仍 1 假绿。必须按局部绑定名(element.name)递归命中最近
++//    声明;别名 propertyName 不参与绑定名;rest 与嵌套 pattern 同样覆盖。
++// 17-24. binding-pattern 深分支变异绑定(终版席②):上面 11-16 只锁了「单层
++//    identifier 叶」——bindingNameContains 的递归(ObjectBinding→ArrayBinding)、
++//    rest 元素、OmittedExpression 空位、declaredInScope 的 catch/for-of/参数三个
++//    container 分支,当时没有接线级反向变异,删掉任一分支仍 21 绿。补齐:
++//    17 nested object 递归 / 18 object rest / 19 array 空位+后续绑定 / 20 函数参数
++//    pattern(callback 参数作用域)/ 21 catch 解构 / 22 for-of 对象解构 /
++//    23 for-of 数组解构 / 24 object→array 混合递归。ForIn 不解构:TS 类型检查层
++//    拒绝 for-in 左侧解构 pattern(TS2491),不存在语义合法的 ForIn 解构实例,
++//    故 declaredInScope 的 ForIn 特判结构消除(仅保留 ForOf),不保留任何无合法
++//    实例可证明的分支;for-in 简单标识符形态同样无接线用例,一并删除。
++//    每个用例的 shadow 声明都放在 walkExecutable 可达的接线路径上(不是裸测
++//    helper),bindingFor 走完整祖先链命中最近声明后 fail-closed。
++describe('App 上层协调接线(SC-3,变异反例)', () => {
++  it('未调用嵌套 callback 内放 reconcile 调用 → 不认作接线(nested-callback 反例)', () => {
++    const variant = variantSource(`  useEffect(() => {
++    const reconcileLater = () => {
++      useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++    }
++    void reconcileLater
++  }, [canvases])`)
++    expect(countWiredEffects(variant), '未调用嵌套 callback 里的调用不能算接线').toBe(0)
++  })
++
++  it('receiver 换成 fakeCameraFocusStore.reconcileDeferredFocusScenes → 不认作接线(fake-receiver 反例)', () => {
++    const variant = variantSource(`  useEffect(() => {
++    fakeCameraFocusStore.reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++    void useCameraFocusStore
++  }, [canvases])`)
++    expect(countWiredEffects(variant), 'receiver 必须精确绑定 useCameraFocusStore.getState() 链,不许换壳').toBe(0)
++  })
++
++  it('firstArg 裹成 {decoy: selectLiveCanvasIds(canvases)} as never → 不认作接线(decoy-selector 反例)', () => {
++    const variant = variantSource(`  useEffect(() => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes({ decoy: selectLiveCanvasIds(canvases) } as never)
++  }, [canvases])`)
++    expect(countWiredEffects(variant), 'firstArg 必须精确绑定 selectLiveCanvasIds(canvases),不是后代 token').toBe(0)
++  })
++
++  it('依赖数组删掉 canvases → 不认作接线(deps 回归)', () => {
++    const variant = variantSource(`  useEffect(() => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++  }, [])`)
++    expect(countWiredEffects(variant), '依赖数组必须含 canvases 标识符').toBe(0)
++  })
++
++  it('整个 useEffect 移进未调用嵌套函数 → 不认作接线(whole-effect-nested 反例)', () => {
++    const variant = variantSource(`  const later = () => {
++    useEffect(() => {
++      useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++    }, [canvases])
++  }
++  void later`)
++    expect(countWiredEffects(variant), '未调用嵌套函数里的 useEffect 永不注册,不能算接线').toBe(0)
++  })
++
++  it('App body 块内 shadow fake store/selector/canvases → 不认作接线(lexical-shadow 反例)', () => {
++    const variant = variantSource(`  useEffect(() => {
++    {
++      const useCameraFocusStore = { getState: () => ({ reconcileDeferredFocusScenes: () => {} }) }
++      const selectLiveCanvasIds = (ids: unknown) => ids
++      const canvases = {} as never
++      useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++    }
++    void useCameraFocusStore
++    void selectLiveCanvasIds
++    void canvases
++  }, [canvases])`)
++    expect(countWiredEffects(variant), '块内同名局部声明 shadow 后形状相同仍必须拒绝(词法绑定,非文本比对)').toBe(0)
++  })
++
++  it('App body 顶层 const useEffect = () => {} shadow React → 不认作接线(fake-effect-shadow 反例)', () => {
++    const variant = variantSource(`  const useEffect = () => {}
++  useEffect(() => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++  }, [canvases])`)
++    expect(countWiredEffects(variant), 'callee 必须词法绑定到 react 导入的 useEffect ImportSpecifier,局部同名函数 shadow 不算').toBe(0)
++  })
++
++  it('import { fakeStore as useCameraFocusStore } from ./store/cameraFocusStore → 不认作接线(fake-store-alias 反例)', () => {
++    const variant = AppSource.replace(
++      `import { useCameraFocusStore } from './store/cameraFocusStore'`,
++      `import { fakeStore as useCameraFocusStore } from './store/cameraFocusStore'`,
++    )
++    expect(countWiredEffects(variant), 'ImportSpecifier 必须按原 export 名(propertyName)匹配,fake export alias 成真实 local 名不许通过').toBe(0)
++  })
++
++  it('import { fakeSelector as selectLiveCanvasIds } from ./app/sidebar/projectSidebarModel → 不认作接线(fake-selector-alias 反例)', () => {
++    const variant = AppSource.replace(
++      `import { selectLiveCanvasIds } from './app/sidebar/projectSidebarModel'`,
++      `import { fakeSelector as selectLiveCanvasIds } from './app/sidebar/projectSidebarModel'`,
++    )
++    expect(countWiredEffects(variant), 'selector ImportSpecifier 必须按原 export 名匹配,不许 fake export alias').toBe(0)
++  })
++
++  it('App 顶层 let canvases = {} as never → 不认作接线(non-const canvases 反例)', () => {
++    const variant = AppSource.replace(
++      `  const canvases = useCanvasStore((state) => state.canvases)`,
++      `  let canvases = {} as never`,
++    )
++    expect(countWiredEffects(variant), 'canvases 必须 const + useCanvasStore((state)=>state.canvases) 初始化,let 无初始化器不算').toBe(0)
++  })
++
++  it('App body 顶层 const { useEffect } = {...} 解构 shadow React → 不认作接线(obj-binding-effect 反例)', () => {
++    const variant = variantSource(`  const { useEffect } = { useEffect: () => {} }
++  useEffect(() => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++  }, [canvases])
++  void useEffect`)
++    expect(countWiredEffects(variant), '解构 pattern 声明的局部名同样 shadow,callee 不得回落 react 导入').toBe(0)
++  })
++
++  it('App body 顶层 const { fake: useEffect } = { fake: () => {} } 别名解构 shadow → 不认作接线(obj-binding-alias-effect 反例)', () => {
++    const variant = variantSource(`  const { fake: useEffect } = { fake: () => {} }
++  useEffect(() => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++  }, [canvases])
++  void useEffect`)
++    expect(countWiredEffects(variant), '别名 {fake: useEffect} 的局部绑定名是 element.name(useEffect),必须命中').toBe(0)
++  })
++
++  it('App body 顶层 const [useEffect] = [() => {}] 数组解构 shadow → 不认作接线(array-binding-effect 反例)', () => {
++    const variant = variantSource(`  const [useEffect] = [() => {}]
++  useEffect(() => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++  }, [canvases])
++  void useEffect`)
++    expect(countWiredEffects(variant), '数组解构声明的局部名同样 shadow,callee 不得回落 react 导入').toBe(0)
++  })
++
++  it('块内 const { useCameraFocusStore } = {...} 解构 shadow store → 不认作接线(obj-binding-store 反例)', () => {
++    const variant = variantSource(`  useEffect(() => {
++    {
++      const { useCameraFocusStore } = { useCameraFocusStore: { getState: () => ({ reconcileDeferredFocusScenes: () => {} }) } }
++      useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++    }
++    void useCameraFocusStore
++    void selectLiveCanvasIds
++    void canvases
++  }, [canvases])`)
++    expect(countWiredEffects(variant), 'receiver 不得回落顶层 store 导入,解构局部声明必须最近优先').toBe(0)
++  })
++
++  it('块内 const { selectLiveCanvasIds } = {...} 解构 shadow selector → 不认作接线(obj-binding-selector 反例)', () => {
++    const variant = variantSource(`  useEffect(() => {
++    {
++      const { selectLiveCanvasIds } = { selectLiveCanvasIds: (ids: unknown) => ids }
++      useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++    }
++    void useCameraFocusStore
++    void selectLiveCanvasIds
++    void canvases
++  }, [canvases])`)
++    expect(countWiredEffects(variant), 'selector 不得回落顶层导入,解构局部声明必须最近优先').toBe(0)
++  })
++
++  it('块内 const { canvases } = {} as never 解构 shadow canvases → 不认作接线(obj-binding-canvases 反例)', () => {
++    const variant = variantSource(`  useEffect(() => {
++    {
++      const { canvases } = {} as never
++      useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++    }
++    void useCameraFocusStore
++    void selectLiveCanvasIds
++    void canvases
++  }, [canvases])`)
++    expect(countWiredEffects(variant), 'firstArg 不得回落 App 顶层 canvases,解构局部声明必须最近优先').toBe(0)
++  })
++
++  it('App 顶层 const { a: { b: { useEffect } } } 嵌套对象解构 shadow → 不认作接线(nested-object-binding-effect 反例)', () => {
++    const variant = variantSource(`  const { a: { b: { useEffect } } } = { a: { b: { useEffect: () => {} } } }
++  useEffect(() => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++  }, [canvases])
++  void useEffect`)
++    expect(countWiredEffects(variant), 'bindingNameContains 必须递归下钻嵌套 object pattern,只查一层会漏掉深层 useEffect shadow').toBe(0)
++  })
++
++  it('App 顶层 const { ...useEffect } = {...} 对象 rest 解构 shadow → 不认作接线(obj-rest-binding-effect 反例)', () => {
++    const variant = variantSource(`  const { ...useEffect } = { useEffect: () => {} }
++  useEffect(() => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++  }, [canvases])
++  void useEffect`)
++    expect(countWiredEffects(variant), 'object rest 元素(el.dotDotDotToken)同样声明局部绑定名,跳过 rest 会漏掉 useEffect shadow').toBe(0)
++  })
++
++  it('App 顶层 const [, useEffect] = [...] 数组空位 + 后续绑定 shadow → 不认作接线(array-omitted-binding-effect 反例)', () => {
++    const variant = variantSource(`  const [, useEffect] = [() => {}]
++  useEffect(() => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++  }, [canvases])
++  void useEffect`)
++    expect(countWiredEffects(variant), 'OmittedExpression 空位必须跳过并继续找后续元素,把空位当绑定或中断遍历都会漏掉 useEffect shadow').toBe(0)
++  })
++
++  it('useEffect callback 参数 { useCameraFocusStore } 解构 shadow store → 不认作接线(param-pattern-binding-store 反例)', () => {
++    const variant = variantSource(`  useEffect(({ useCameraFocusStore }) => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++  }, [canvases])`)
++    expect(countWiredEffects(variant), '函数参数作用域(含解构 pattern)在 Block 分支的 isFunctionLike 检查内,参数 shadow 后 receiver 不得回落顶层 store 导入').toBe(0)
++  })
++
++  it('catch ({ useCameraFocusStore }) 解构 shadow store → 不认作接线(catch-pattern-binding-store 反例)', () => {
++    const variant = variantSource(`  useEffect(() => {
++    try {
++      void 0
++    } catch ({ useCameraFocusStore }) {
++      useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++    }
++  }, [canvases])`)
++    expect(countWiredEffects(variant), 'CatchClause 分支必须按 catch 绑定名匹配(含解构 pattern),漏掉后 receiver 回落顶层 store 导入').toBe(0)
++  })
++
++  it('for-of const { selectLiveCanvasIds } 解构 shadow selector → 不认作接线(forof-pattern-binding-selector 反例)', () => {
++    const variant = variantSource(`  useEffect(() => {
++    for (const { selectLiveCanvasIds } of [{ selectLiveCanvasIds: (ids: unknown) => ids }]) {
++      useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++    }
++  }, [canvases])`)
++    expect(countWiredEffects(variant), 'ForOf 分支必须按循环变量声明名(含解构 pattern)匹配,漏掉后 selector 回落顶层导入').toBe(0)
++  })
++
++  it('for-of const [canvases] 数组解构 shadow canvases → 不认作接线(forof-array-binding-canvases 反例)', () => {
++    const variant = variantSource(`  useEffect(() => {
++    for (const [canvases] of [[]]) {
++      useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++    }
++  }, [canvases])`)
++    expect(countWiredEffects(variant), 'ForOf 分支同样覆盖数组解构 pattern,漏掉后 firstArg 回落 App 顶层 canvases').toBe(0)
++  })
++
++  it('App 顶层 const { a: [{ useEffect }] } 对象→数组混合解构 shadow → 不认作接线(nested-mixed-binding-effect 反例)', () => {
++    const variant = variantSource(`  const { a: [{ useEffect }] } = { a: [{ useEffect: () => {} }] }
++  useEffect(() => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++  }, [canvases])
++  void useEffect`)
++    expect(countWiredEffects(variant), 'ObjectBinding→ArrayBinding 混合嵌套必须跨 pattern 类型递归,任一类型只查一层都会漏掉 useEffect shadow').toBe(0)
++  })
++})
+diff --git a/src/App.tsx b/src/App.tsx
+index 68315f8b..3398368f 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -13,10 +13,12 @@ import { isMediaRenderKind, renderKindForNode } from './model/canvasNodeRegistry
+ import { canReadLocalAssetDrag } from './lib/canvasAssetDrag'
+ import { ProjectSidebar } from './app/ProjectSidebar'
+ import { ProjectSidebarControls } from './app/ProjectSidebarControls'
++import { selectLiveCanvasIds } from './app/sidebar/projectSidebarModel'
+ import { ToastViewport } from './app/ToastViewport'
+ import { AutoPromptSettings } from './app/settings/AutoPromptSettings'
+ import { SettingsPanel } from './app/settings/SettingsPanel'
+ import { useCanvasStore } from './store/canvasStore'
++import { useCameraFocusStore } from './store/cameraFocusStore'
+ import { debugLogger, installConsoleCapture } from './store/debugLogStore'
+ import { installRemoteDebugReporter } from './store/remoteDebugReporter'
+ import { useStoreHydration } from './app/useStoreHydration'
+@@ -210,6 +212,15 @@ function App() {
+     debugLogger.log('Canvas', `Node count changed: ${visibleNodeCount} visible`)
+   }, [visibleNodeCount])
+ 
++  // r2 升级(升级阶梯②):相机 deferred 池的生命周期唯一上层协调接线。canvases 变化
++  // (创建/删除/归档/恢复)时把池与 pendingFocus 对账到 live active 场景集;live 场景
++  // 请求绝不因容量被丢弃(池无容量上限,size 天然 ≤ live 画布数)。清理判据只此一份
++  // ——禁止在 documentSlice.deleteCanvas / archiveCanvas / projectsSlice 级联归档等
++  // 多个出口逐个调用(那会复制判据、再漏对称路径)。
++  useEffect(() => {
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(selectLiveCanvasIds(canvases))
++  }, [canvases])
++
+   useEffect(() => {
+     if (projectSidebarState !== 'peeking') return
+ 
+diff --git a/src/agent/canvasAgentVerbs.test.ts b/src/agent/canvasAgentVerbs.test.ts
+index a6541782..0df470a4 100644
+--- a/src/agent/canvasAgentVerbs.test.ts
++++ b/src/agent/canvasAgentVerbs.test.ts
+@@ -24,6 +24,13 @@ const storeState = {
+     storeState.nodes.push({ id: 'slot-1', type: 'ai-slot', hidden: false, x: position.x, y: position.y })
+   }),
+   agentUpdateNode: vi.fn(() => ({ ok: true, nodeId: 'node-1', changed: ['x'] })),
++  // p1-sc5 反向变异可运行性:变异把 agentEditImage 改为直调 store.generateImageEdit
++  // 时,mock 需提供同构实现(与 generationFacade mock 同行为),否则变异以
++  // undefined 调用崩溃、整文件伪红,测不到「绕过 facade」的真实断言面。
++  generateImageEdit: vi.fn(async () => {
++    storeState.nodes.push({ id: 'img-2', type: 'image', hidden: false, assetUrl: 'asset://b' })
++    return ['img-2']
++  }),
+   sceneId: 'scene-1',
+   // #300:交互卡动作要能定位到"这张图所属的板",所以动词层现在会读 canvases 并可能 loadScene。
+   canvases: { 'scene-1': {}, 'scene-2': {} } as Record<string, unknown>,
+@@ -470,6 +477,73 @@ describe('可移植记录核(§六-9:落共享层,不含宿主身份字段)', ()
+   })
+ })
+ 
++// ── p1-sc5:agentEditImage 传导链 verb 层证据 ──
++// verb 层不新增任何镜头代码——居中由 p1-sc1 的 slice 层接线自动获得。本条断言
++// agentEditImage 恒经 generationFacade.generateImageEdit 以正确参数传导,不存在
++// 绕过接线点的第二条改图通道(反向变异:绕过 facade 直调端口 → 本断言转红)。
++describe('agentEditImage 传导链(p1-sc5)', () => {
++  it('agentEditImage 调用 generationFacade.generateImageEdit(nodeId, "prompt-edit", prompt)', async () => {
++    storeState.sceneId = 'scene-1'
++    storeState.nodes = [{ id: 'img-1', type: 'image', hidden: false, assetUrl: 'asset://a' }]
++    vi.mocked(generationFacade.generateImageEdit).mockClear()
++    vi.mocked(generationFacade.generateImageEdit).mockImplementation(async () => {
++      storeState.nodes = [
++        ...storeState.nodes,
++        { id: 'img-2', type: 'image', hidden: false, assetUrl: 'asset://b' },
++      ]
++      return ['img-2']
++    })
++    try {
++      const result = await agentEditImage({ nodeId: 'img-1', prompt: '改成水彩' })
++      expect(result.status).toBe('ready')
++      expect(generationFacade.generateImageEdit).toHaveBeenCalledTimes(1)
++      expect(generationFacade.generateImageEdit).toHaveBeenCalledWith(
++        'img-1',
++        'prompt-edit',
++        '改成水彩',
++        expect.objectContaining({ agentRequestTag: undefined }),
++      )
++    } finally {
++      vi.mocked(generationFacade.generateImageEdit).mockReset()
++      storeState.nodes = []
++    }
++  })
++
++  it('agentEditImage 路径零镜头请求:placeholder/node/set 三类请求均不被调用(居中由 slice 层获得)', async () => {
++    storeState.sceneId = 'scene-1'
++    storeState.nodes = [{ id: 'img-1', type: 'image', hidden: false, assetUrl: 'asset://a' }]
++    vi.mocked(generationFacade.generateImageEdit).mockClear()
++    vi.mocked(generationFacade.generateImageEdit).mockImplementation(async () => {
++      storeState.nodes = [
++        ...storeState.nodes,
++        { id: 'img-2', type: 'image', hidden: false, assetUrl: 'asset://b' },
++      ]
++      return ['img-2']
++    })
++    const placeholderSpy = vi.spyOn(useCameraFocusStore.getState(), 'requestPlaceholderFocus')
++    const nodeSpy = vi.spyOn(useCameraFocusStore.getState(), 'requestNodeFocus')
++    const setSpy = vi.spyOn(useCameraFocusStore.getState(), 'requestGenerationSetFocus')
++    const resultSpy = vi.spyOn(useCameraFocusStore.getState(), 'requestGenerationResultFocus')
++    try {
++      const result = await agentEditImage({ nodeId: 'img-1', prompt: '改成水彩' })
++      expect(result.status).toBe('ready')
++      // verb 层不新增任何镜头调用;结果焦点由 slice 层接线在 commit 后自动获得,
++      // 不在 agentEditImage 的调用面内(调用面仍是 facade)。
++      expect(placeholderSpy).not.toHaveBeenCalled()
++      expect(nodeSpy).not.toHaveBeenCalled()
++      expect(setSpy).not.toHaveBeenCalled()
++      expect(resultSpy).not.toHaveBeenCalled()
++    } finally {
++      placeholderSpy.mockRestore()
++      nodeSpy.mockRestore()
++      setSpy.mockRestore()
++      resultSpy.mockRestore()
++      vi.mocked(generationFacade.generateImageEdit).mockReset()
++      storeState.nodes = []
++    }
++  })
++})
++
+ describe('agentUpdateNode 动词层(R3)', () => {
+   it('校验不通过时不碰 store —— 入参先过契约再落 action', () => {
+     storeState.agentUpdateNode.mockClear()
+@@ -959,7 +1033,9 @@ describe('agentGenerateImage 请求镜头焦点(p0-sc1 / p0-sc2)', () => {
+       // 门面 await 仍 pending:请求必须已经发出,注册表必须已含占位符(时序钉死)。
+       expect(spy).toHaveBeenCalledTimes(1)
+       expect(spy).toHaveBeenCalledWith('slot-stub', { targetSceneId: 'scene-1', activeSceneId: 'scene-1' })
+-      expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual(['slot-stub'])
++      expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual([
++        { nodeId: 'slot-stub', targetSceneId: 'scene-1' },
++      ])
+       // 放行 await,让流程收尾。
+       release()
+       const result = await resultPromise
+@@ -984,7 +1060,7 @@ describe('agentGenerateImage 请求镜头焦点(p0-sc1 / p0-sc2)', () => {
+         throw new Error(`expected generation-set focus request, got ${pending?.kind}`)
+       }
+       expect(pending.triggerNodeId).toBe('slot-stub')
+-      expect(useCameraFocusStore.getState().generationFocusNodeIds).toContain('slot-stub')
++      expect(useCameraFocusStore.getState().generationFocusNodeIds.map((entry) => entry.nodeId)).toContain('slot-stub')
+     } finally {
+       storeState.sceneId = 'scene-1'
+       restore()
+@@ -1093,13 +1169,13 @@ describe('并发生成集合焦点(p1-sc7 one-to-four-matrix)', () => {
+         throw new Error(`expected generation-set focus request, got ${pendingFocus?.kind}`)
+       }
+       expect(generationFocusNodeIds.length).toBe(count)
+-      expect(new Set(generationFocusNodeIds).size).toBe(count)
++      expect(new Set(generationFocusNodeIds.map((entry) => entry.nodeId)).size).toBe(count)
+ 
+       const nodes = storeState.nodes as unknown as MivoCanvasNode[]
+-      const { memberIds, bounds } = deriveGenerationFocusSet(nodes, generationFocusNodeIds, pendingFocus.triggerNodeId)
++      const { memberIds, bounds } = deriveGenerationFocusSet(nodes, generationFocusNodeIds, pendingFocus.triggerNodeId, pendingFocus.targetSceneId)
+       // 集合恰好 N 个 agent slot,且 bounds = 这些 slot 的实际 union(非假设默认横排)。
+       expect(memberIds.length).toBe(count)
+-      expect(memberIds).toEqual(expect.arrayContaining(generationFocusNodeIds))
++      expect(memberIds).toEqual(expect.arrayContaining(generationFocusNodeIds.map((entry) => entry.nodeId)))
+       expect(bounds).toBeDefined()
+       expect(bounds!.x).toBe(0)
+       expect(bounds!.y).toBe(0)
+diff --git a/src/app/sidebar/projectSidebarModel.ts b/src/app/sidebar/projectSidebarModel.ts
+index d0f45433..ffe085aa 100644
+--- a/src/app/sidebar/projectSidebarModel.ts
++++ b/src/app/sidebar/projectSidebarModel.ts
+@@ -27,6 +27,17 @@ const matchesView = (
+   filterView: SidebarFilterView,
+ ): boolean => (status === 'archived' ? 'archived' : 'active') === filterView
+ 
++/** r2 升级(升级阶梯②):live 画布 id 纯函数——归档(status==='archived')画布不可被
++ *  当前 UI 消费,排除;缺省 status 向后兼容为 active;已删除的画布键自然不在集合里。
++ *  复用本文件的 matchesView(active 过滤),与 ProjectSidebar 共用同一份 live 判据。
++ *  App effect(相机 deferred 池对账)与测试共用。 */
++export const selectLiveCanvasIds = (
++  canvases: Record<string, { status?: 'active' | 'archived' }>,
++): string[] =>
++  Object.entries(canvases)
++    .filter(([, document]) => matchesView(document.status, 'active'))
++    .map(([id]) => id)
++
+ export const buildSidebarModel = (
+   projects: CanvasProject[],
+   canvases: Record<CanvasId, CanvasDocument>,
+diff --git a/src/canvas/autoFocusPlaceholder.test.ts b/src/canvas/autoFocusPlaceholder.test.ts
+index 7b8d28c0..83e66d56 100644
+--- a/src/canvas/autoFocusPlaceholder.test.ts
++++ b/src/canvas/autoFocusPlaceholder.test.ts
+@@ -1,7 +1,9 @@
+ import { describe, expect, it } from 'vitest'
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
++import type { GenerationFocusRegistryEntry } from '../store/cameraFocusStore'
+ import {
+   deriveGenerationFocusSet,
++  deriveResultFocusSet,
+   viewportToCenterBounds,
+   viewportToRevealBounds,
+   viewportToRevealGenerationSet,
+@@ -10,6 +12,10 @@ import {
+ 
+ const shell = { width: 1200, height: 800 }
+ 
++/** p2-sc1:注册表条目 helper(单场景测试统一用 'c1')。 */
++const entries = (nodeIds: string[], sceneId = 'c1'): GenerationFocusRegistryEntry[] =>
++  nodeIds.map((nodeId) => ({ nodeId, targetSceneId: sceneId }))
++
+ describe('viewportToRevealBounds', () => {
+   it('returns undefined when bounds are fully visible (camera stays put)', () => {
+     // viewport (0,0) scale 1 → visible canvas region is (0,0)-(1200,800)。
+@@ -151,8 +157,8 @@ describe('p1-sc2 generation-set 成员派生与剪枝', () => {
+       slotNode({ id: 'e', aiWorkflowStatus: 'generating', type: 'image' }),
+       slotNode({ id: 'f', aiWorkflowStatus: 'queued' }),
+     ]
+-    const registered = ['a', 'b', 'c', 'd', 'e', 'f', 'ghost']
+-    expect(visibleGeneratingSlotIds(nodes, registered)).toEqual(['a'])
++    const registered = entries(['a', 'b', 'c', 'd', 'e', 'f', 'ghost'])
++    expect(visibleGeneratingSlotIds(nodes, registered, 'c1')).toEqual(['a'])
+   })
+ 
+   it('triggerNodeId 无条件并入(即使已 ready/failed),且不重复并入', () => {
+@@ -160,21 +166,22 @@ describe('p1-sc2 generation-set 成员派生与剪枝', () => {
+       slotNode({ id: 'a', aiWorkflowStatus: 'generating' }),
+       slotNode({ id: 'trigger', aiWorkflowStatus: 'ready' }),
+     ]
+-    const { memberIds, bounds } = deriveGenerationFocusSet(nodes, ['a', 'trigger'], 'trigger')
++    const { memberIds, bounds } = deriveGenerationFocusSet(nodes, entries(['a', 'trigger']), 'trigger', 'c1')
+     expect(memberIds).toEqual(['a', 'trigger'])
+     expect(bounds).toEqual({ x: 0, y: 0, width: 320, height: 320 })
+ 
+     // trigger 本身 generating 时不重复。
+     const { memberIds: deduped } = deriveGenerationFocusSet(
+       [slotNode({ id: 'a', aiWorkflowStatus: 'generating' })],
+-      ['a'],
++      entries(['a']),
+       'a',
++      'c1',
+     )
+     expect(deduped).toEqual(['a'])
+   })
+ 
+   it('成员为空 → bounds undefined(注册表全被剪掉且 trigger 节点不存在)', () => {
+-    const { bounds } = deriveGenerationFocusSet([], ['a'], 'ghost-trigger')
++    const { bounds } = deriveGenerationFocusSet([], entries(['a']), 'ghost-trigger', 'c1')
+     expect(bounds).toBeUndefined()
+   })
+ 
+@@ -183,14 +190,32 @@ describe('p1-sc2 generation-set 成员派生与剪枝', () => {
+       slotNode({ id: 'a', aiWorkflowStatus: 'generating' }),
+       slotNode({ id: 'b', aiWorkflowStatus: 'ready' }),
+     ]
+-    const registered = ['a', 'b']
++    const registered = entries(['a', 'b'])
+     // useViewport 消费时的回写逻辑:按过滤结果覆盖注册表。
+-    const pruned = visibleGeneratingSlotIds(nodes, registered)
++    const pruned = visibleGeneratingSlotIds(nodes, registered, 'c1')
+     expect(pruned).toEqual(['a'])
+-    const { bounds } = deriveGenerationFocusSet(nodes, pruned, 'b')
++    const { bounds } = deriveGenerationFocusSet(nodes, entries(pruned), 'b', 'c1')
+     // trigger 已被剪出注册表后,新请求的 trigger 仍无条件并入。
+     expect(bounds).toEqual({ x: 0, y: 0, width: 320, height: 320 })
+   })
++
++  // p2-sc1:剪枝只作用于请求目标场景同场景的成员——他场景成员即使在本场景节点表
++  // 里不存在也不被剪出(跨场景注册表剪枝洞的纯函数层钉子)。
++  it('p2-sc1: 剪枝按 targetSceneId 隔离,不把他场景成员移出', () => {
++    const nodes = [
++      slotNode({ id: 'a1', aiWorkflowStatus: 'generating' }),
++      slotNode({ id: 'a2', aiWorkflowStatus: 'generating' }),
++      slotNode({ id: 'b1', aiWorkflowStatus: 'generating' }),
++    ]
++    const registered = [...entries(['a1', 'a2'], 'scene-a'), ...entries(['b1'], 'scene-b')]
++    // B 场景消费:A 场景成员(a1/a2)即使不在 B 的可见生成集合里,剪枝也不动它们。
++    expect(visibleGeneratingSlotIds(nodes, registered, 'scene-b')).toEqual(['b1'])
++    const { memberIds } = deriveGenerationFocusSet(nodes, registered, 'b1', 'scene-b')
++    expect(memberIds).toEqual(['b1'])
++    // 单场景路径下派生行为与改造前逐字一致(第一批 p1-sc2 语义)。
++    const { memberIds: aMembers } = deriveGenerationFocusSet(nodes, registered, 'a1', 'scene-a')
++    expect(aMembers).toEqual(['a1', 'a2'])
++  })
+ })
+ 
+ // ── p2-sc1 集合溢出策略 ──
+@@ -304,7 +329,7 @@ describe('p2-sc3 任意布局集合', () => {
+ 
+   const expectCenteredByUnion = (nodes: MivoCanvasNode[], triggerNodeId: string) => {
+     const ids = nodes.map((node) => node.id)
+-    const { memberIds, bounds } = deriveGenerationFocusSet(nodes, ids, triggerNodeId)
++    const { memberIds, bounds } = deriveGenerationFocusSet(nodes, entries(ids), triggerNodeId, 'c1')
+     expect(new Set(memberIds)).toEqual(new Set(ids))
+     // bounds 必须等于实际 union(非假设默认横排 320×320)。
+     const minX = Math.min(...nodes.map((node) => node.x))
+@@ -364,3 +389,101 @@ describe('p2-sc3 任意布局集合', () => {
+     )
+   })
+ })
++
++// ── p0-sc3:结果集几何语义(显式成员集 → 同一份 viewportToRevealGenerationSet)──
++// 结果集消费与第一批 generation-set 共走同一纯函数(出图必居中:完全可见也平移
++// 居中;装得下保 scale 只平移,装不下缩到 padding 装下并 clampViewportScale)。
++// 三例断言把「成员并集中心精确映射视口中心」绑定到结果集派生路径上。
++describe('p0-sc3 generation-result 结果集几何语义', () => {
++  const imageNode = (over: Partial<MivoCanvasNode>): MivoCanvasNode => ({
++    id: 'r',
++    type: 'image',
++    title: 't',
++    x: 0,
++    y: 0,
++    width: 300,
++    height: 200,
++    status: 'ready',
++    ...over,
++  })
++
++  const unionBounds = (nodes: MivoCanvasNode[]) => {
++    const minX = Math.min(...nodes.map((n) => n.x))
++    const minY = Math.min(...nodes.map((n) => n.y))
++    const maxX = Math.max(...nodes.map((n) => n.x + n.width))
++    const maxY = Math.max(...nodes.map((n) => n.y + n.height))
++    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY }
++  }
++
++  it('① 装得下 → 只平移居中,scale 逐字保持用户当前值(成员并集中心精确映射视口中心)', () => {
++    const viewport = { x: 0, y: 0, scale: 1 }
++    const nodes = [
++      imageNode({ id: 'r1', x: 5000, y: 3000 }),
++      imageNode({ id: 'r2', x: 5340, y: 3000 }),
++    ]
++    const { memberIds, bounds } = deriveResultFocusSet(nodes, ['r1', 'r2'])
++    expect(memberIds).toEqual(['r1', 'r2'])
++    expect(bounds).toEqual(unionBounds(nodes))
++
++    const result = viewportToRevealGenerationSet(viewport, shell, bounds!)
++    expect(result).toBeDefined()
++    expect(result!.scale).toBe(viewport.scale)
++    expect(Math.abs((bounds!.x + bounds!.width / 2) * result!.scale + result!.x - shell.width / 2)).toBeLessThanOrEqual(1)
++    expect(Math.abs((bounds!.y + bounds!.height / 2) * result!.scale + result!.y - shell.height / 2)).toBeLessThanOrEqual(1)
++  })
++
++  it('② 装不下 → 缩小 scale 到刚好装下(含 padding),经 clampViewportScale 钳制', () => {
++    const viewport = { x: 0, y: 0, scale: 1 }
++    const nodes = [
++      imageNode({ id: 'r1', x: 0, y: 0, width: 1100, height: 100 }),
++      imageNode({ id: 'r2', x: 0, y: 100, width: 1100, height: 100 }),
++    ]
++    const { memberIds, bounds } = deriveResultFocusSet(nodes, ['r1', 'r2'])
++    expect(memberIds).toEqual(['r1', 'r2'])
++    expect(bounds).toEqual(unionBounds(nodes))
++
++    const result = viewportToRevealGenerationSet(viewport, shell, bounds!)
++    expect(result).toBeDefined()
++    const availableWidth = shell.width - 80 * 2
++    const availableHeight = shell.height - 80 * 2
++    // union 1100×200:scale 1 下宽 1100 > 1040 装不下 → 缩到 min(1040/1100, 640/200)。
++    expect(result!.scale).toBeCloseTo(Math.min(availableWidth / 1100, availableHeight / 200))
++    expect(result!.scale).toBeLessThan(viewport.scale)
++    expect(bounds!.width * result!.scale).toBeLessThanOrEqual(availableWidth + 1e-6)
++    expect(bounds!.height * result!.scale).toBeLessThanOrEqual(availableHeight + 1e-6)
++    expect(Math.abs((bounds!.x + bounds!.width / 2) * result!.scale + result!.x - shell.width / 2)).toBeLessThanOrEqual(1)
++    expect(Math.abs((bounds!.y + bounds!.height / 2) * result!.scale + result!.y - shell.height / 2)).toBeLessThanOrEqual(1)
++  })
++
++  it('③ 完全可见但偏角落 → 仍平移居中(出图必居中,不因完全可见不动),scale 不变', () => {
++    const viewport = { x: 0, y: 0, scale: 1 }
++    // 完全可见(右缘 1000 < 1200)但中心 (750,250) 偏离视口中心 (600,400)。
++    const nodes = [
++      imageNode({ id: 'r1', x: 500, y: 100, width: 500, height: 300 }),
++    ]
++    const { bounds } = deriveResultFocusSet(nodes, ['r1'])
++    const result = viewportToRevealGenerationSet(viewport, shell, bounds!)
++    expect(result).toBeDefined()
++    expect(Math.abs((bounds!.x + bounds!.width / 2) * result!.scale + result!.x - shell.width / 2)).toBeLessThanOrEqual(1)
++    expect(Math.abs((bounds!.y + bounds!.height / 2) * result!.scale + result!.y - shell.height / 2)).toBeLessThanOrEqual(1)
++    expect(result!.scale).toBe(viewport.scale)
++  })
++
++  // p0-sc5 纯函数面:成员剪枝(已删除/隐藏剪除后再取并集;全缺失 → 空)。
++  it('p0-sc5 纯函数面: 已删除/隐藏成员剪除后再取并集,成员集精确等于存活成员', () => {
++    const nodes = [
++      imageNode({ id: 'r1', x: 5000, y: 0 }),
++      imageNode({ id: 'r3', x: 5800, y: 0, hidden: true }),
++    ]
++    // r2 已删除(不在节点表)、r3 隐藏 → 只按 r1 取并集。
++    const { memberIds, bounds } = deriveResultFocusSet(nodes, ['r1', 'r2', 'r3'])
++    expect(memberIds).toEqual(['r1'])
++    expect(bounds).toEqual({ x: 5000, y: 0, width: 300, height: 200 })
++  })
++
++  it('p0-sc5 纯函数面: 成员全部缺失 → memberIds 空、bounds undefined', () => {
++    const { memberIds, bounds } = deriveResultFocusSet([imageNode({ id: 'r1' })], ['gone-1', 'gone-2'])
++    expect(memberIds).toEqual([])
++    expect(bounds).toBeUndefined()
++  })
++})
+diff --git a/src/canvas/autoFocusPlaceholder.ts b/src/canvas/autoFocusPlaceholder.ts
+index 606014fc..94d07880 100644
+--- a/src/canvas/autoFocusPlaceholder.ts
++++ b/src/canvas/autoFocusPlaceholder.ts
+@@ -1,11 +1,17 @@
+-// 生图占位符镜头跟随的纯视口计算(消费方:useViewport 的 auto-focus effect)。
+-// 缩放策略契约(单占位符路径):占位符在当前视口内完全可见 → 返回 undefined
+-// (镜头不动);不可见/部分可见 → 平移到居中,scale 保持用户当前值(不强制 zoom)。
+-// 集合路径(viewportToRevealGenerationSet,owner 2026-08-11 拍板):出图必居中——
+-// 集合完全可见也照样平移居中;scale 在装得下时保持用户当前值,装不下才缩小。
++// 生图占位符/结果镜头跟随的纯视口计算(消费方:useViewport 的 auto-focus effect)。
++// 两分支缩放策略契约:
++// - 单节点 reveal(viewportToRevealBounds):保留「完全可见 → 不动」语义——占位符在
++//   当前视口内完全可见时返回 undefined(镜头不动);不可见/部分可见 → 平移到居中,
++//   scale 保持用户当前值(不强制 zoom)。
++// - 集合与结果(viewportToRevealGenerationSet,owner 2026-08-11 拍板):出图必居中——
++//   集合/结果集完全可见也照样平移居中;scale 在装得下时保持用户当前值,装不下才
++//   缩小到 padding 装下并 clampViewportScale 钳制。generation-set 与
++//   generation-result 两类请求共走这一份几何实现,防止两份实现漂移。
+ // p1-sc2 起,agent 并发生图集合的成员派生/剪枝规则也收敛在这里(纯函数,便于
+-// 独立单测与共享层集成测试直接调用)。
++// 独立单测与共享层集成测试直接调用);p2-sc1 起注册表条目携带 targetSceneId,
++// 派生/剪枝只作用于与请求目标场景同场景的成员。
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
++import type { GenerationFocusRegistryEntry } from '../store/cameraFocusStore'
+ import { boundsForNodes, clampViewportScale, type CanvasBounds, type Viewport } from './canvasInteraction'
+ 
+ export type ShellSize = { width: number; height: number }
+@@ -51,9 +57,11 @@ export const viewportToCenterBounds = (
+ }
+ 
+ /**
+- * p1-sc2 剪枝规则(纯函数):从注册表里挑出「当前可见 ai-slot 且 aiWorkflow.status
+- * ==='generating'」的成员。ready/failed/queued 的占位符不参与集合,但不会影响
+- * triggerNodeId 的无条件并入(见 deriveGenerationFocusSet)。
++ * p1-sc2 剪枝规则(纯函数):从注册表里挑出「目标场景 === sceneId 且当前可见
++ * ai-slot 且 aiWorkflow.status==='generating'」的成员。ready/failed/queued 的
++ * 占位符不参与集合,但不会影响 triggerNodeId 的无条件并入(见
++ * deriveGenerationFocusSet)。p2-sc1:剪枝只作用于与请求目标场景同场景的成员——
++ * 跨场景消费窗口里不把他场景 generating 成员移出注册表。
+  *
+  * 判据必须读 node.aiWorkflow?.status,不是顶层 node.status:generateIntoAiSlot
+  * (generationSlice.ts)与局部重绘的 patchMaskEditSlotStatus(maskEditGeneration.ts)
+@@ -63,30 +71,53 @@ export const viewportToCenterBounds = (
+  */
+ export const visibleGeneratingSlotIds = (
+   nodes: MivoCanvasNode[],
+-  registeredIds: string[],
++  registered: GenerationFocusRegistryEntry[],
++  sceneId: string,
+ ): string[] =>
+-  registeredIds.filter((id) => {
+-    const node = nodes.find((candidate) => candidate.id === id)
+-    return node !== undefined && !node.hidden && node.type === 'ai-slot' && node.aiWorkflow?.status === 'generating'
+-  })
++  registered
++    .filter((entry) => entry.targetSceneId === sceneId)
++    .map((entry) => entry.nodeId)
++    .filter((id) => {
++      const node = nodes.find((candidate) => candidate.id === id)
++      return node !== undefined && !node.hidden && node.type === 'ai-slot' && node.aiWorkflow?.status === 'generating'
++    })
+ 
+ /**
+- * p1-sc2 派生规则(纯函数):集合成员 = 可见 generating 成员 ∪ {triggerNodeId}
+- * (triggerNodeId 无条件并入,即使它已 ready/failed——镜头必须包含触发点),
+- * bounds 交给 boundsForNodes 按实际节点几何计算(不假设默认横排 320×320,
+- * p2-sc3)。成员为空时 bounds 为 undefined。
++ * p1-sc2 派生规则(纯函数):集合成员 = 目标场景同场景的可见 generating 成员
++ * ∪ {triggerNodeId}(triggerNodeId 无条件并入,即使它已 ready/failed——镜头必须
++ * 包含触发点),bounds 交给 boundsForNodes 按实际节点几何计算(不假设默认横排
++ * 320×320,p2-sc3)。成员为空时 bounds 为 undefined。
+  */
+ export const deriveGenerationFocusSet = (
+   nodes: MivoCanvasNode[],
+-  registeredIds: string[],
++  registered: GenerationFocusRegistryEntry[],
+   triggerNodeId: string,
++  sceneId: string,
+ ): { memberIds: string[]; bounds: CanvasBounds | undefined } => {
+-  const generatingIds = visibleGeneratingSlotIds(nodes, registeredIds)
++  const generatingIds = visibleGeneratingSlotIds(nodes, registered, sceneId)
+   const memberIds = generatingIds.includes(triggerNodeId) ? generatingIds : [...generatingIds, triggerNodeId]
+   const members = nodes.filter((node) => memberIds.includes(node.id))
+   return { memberIds, bounds: boundsForNodes(members) }
+ }
+ 
++/**
++ * p0-sc1/p0-sc5 结果集成员剪枝(纯函数):显式成员集消费前,把「已删除(不在
++ * nodes 表)或 hidden」的成员剪除,再按存活成员取并集 bounds。成员全部缺失 →
++ * memberIds 为空、bounds undefined(消费侧据此作废请求、镜头不动)。结果节点
++ * commit 时已是 image/ready,不经 generating 注册表判据。
++ */
++export const deriveResultFocusSet = (
++  nodes: MivoCanvasNode[],
++  memberNodeIds: string[],
++): { memberIds: string[]; bounds: CanvasBounds | undefined } => {
++  const memberIds = memberNodeIds.filter((id) => {
++    const node = nodes.find((candidate) => candidate.id === id)
++    return node !== undefined && !node.hidden
++  })
++  const members = nodes.filter((node) => memberIds.includes(node.id))
++  return { memberIds, bounds: boundsForNodes(members) }
++}
++
+ /** p2-sc1 集合 reveal 的四周留白(与「装得下」判定共用同一口径)。 */
+ const GENERATION_SET_PADDING = 80
+ 
+diff --git a/src/canvas/maskEditGeneration.placeholder.test.ts b/src/canvas/maskEditGeneration.placeholder.test.ts
+new file mode 100644
+index 00000000..43660f05
+--- /dev/null
++++ b/src/canvas/maskEditGeneration.placeholder.test.ts
+@@ -0,0 +1,325 @@
++import { describe, expect, it, vi, beforeEach } from 'vitest'
++
++// Hermetic setup: stub the demo-image canvas renderer (canvasStore triggers scenes()
++// at module load), the IndexedDB-backed asset store, and the remote debug-log flusher
++// — same approach as generation.contract.test.ts.
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++vi.mock('../lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async (_blob: Blob, name: string, type: string) => ({
++    assetUrl: 'mivo-asset://mock-asset',
++    name,
++    type,
++    sizeBytes: 1234,
++    hasTransparency: false,
++    size: '200x200',
++    sourceDimensions: { width: 200, height: 200 },
++  })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('../store/remoteDebugReporter', () => ({
++  reportRemoteDebugEntry: () => {},
++}))
++
++// FIX-1 tests: spy on the task client + image source + black-plate inspection so
++// runMaskEditGeneration's cancel path can be exercised without a real BFF/upstream.
++const taskClientSpies = vi.hoisted(() => ({
++  submitEditTask: vi.fn(),
++  pollTask: vi.fn(),
++  cancelTask: vi.fn(),
++}))
++vi.mock('../lib/mivoTaskClient', () => ({
++  submitEditTask: taskClientSpies.submitEditTask,
++  pollTask: taskClientSpies.pollTask,
++  cancelTask: taskClientSpies.cancelTask,
++  taskPollIntervalMs: () => 10000,
++  kindForFailedTask: () => 'upstream-error',
++}))
++vi.mock('../lib/canvasImageSource', () => ({
++  readCanvasImageBlob: vi.fn(async () => new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], 'src.png', { type: 'image/png' })),
++}))
++const inspectArtifactsSpy = vi.hoisted(() => vi.fn())
++vi.mock('../lib/maskResultInspection', () => ({
++  inspectMaskResultForBlackArtifacts: inspectArtifactsSpy,
++  // 纯等比映射，与真实实现同语义（prior-bounds 断言依赖它算出的期望值）。
++  mapBoundsToResultSpace: (bounds: { x: number; y: number; width: number; height: number }, from: { width: number; height: number }, to: { width: number; height: number }) => {
++    const scaleX = to.width / Math.max(1, from.width)
++    const scaleY = to.height / Math.max(1, from.height)
++    const x = Math.max(0, Math.floor(bounds.x * scaleX))
++    const y = Math.max(0, Math.floor(bounds.y * scaleY))
++    const right = Math.min(to.width, Math.ceil((bounds.x + bounds.width) * scaleX))
++    const bottom = Math.min(to.height, Math.ceil((bounds.y + bounds.height) * scaleY))
++    return { x, y, width: Math.max(1, right - x), height: Math.max(1, bottom - y) }
++  },
++}))
++
++import { useCanvasStore } from '../store/canvasStore'
++import { prepareMaskEditPlaceholder, removeMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
++import { useCameraFocusStore } from '../store/cameraFocusStore'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++// Helpers ---------------------------------------------------------------------
++
++const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++  id: 'src-1',
++  type: 'image',
++  title: 'Source',
++  x: 0,
++  y: 0,
++  width: 200,
++  height: 200,
++  status: 'ready',
++  assetUrl: '/a.png',
++  ...overrides,
++})
++
++const baseState = useCanvasStore.getState()
++
++const seed = (overrides: Record<string, unknown> = {}) =>
++  useCanvasStore.setState({ ...baseState, ...overrides } as never, true)
++
++const seedCanvas = (sceneId: string, nodes: MivoCanvasNode[]) => {
++  const document = { title: sceneId, nodes, edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
++  return {
++    canvases: { [sceneId]: document },
++    sceneId,
++    nodes,
++    edges: [],
++    tasks: [],
++    selectedNodeId: undefined,
++    selectedNodeIds: [],
++  }
++}
++
++beforeEach(() => {
++  useCanvasStore.setState({ ...baseState } as never, true)
++})
++
++// Tests -----------------------------------------------------------------------
++
++describe('mask-edit placeholder rollback (S01)', () => {
++  it('prepare captures the baseline; remove rolls back to it when栈顶 unchanged', () => {
++    const source = imageNode({ id: 'src-1' })
++    seed(seedCanvas('character-flow', [source]))
++
++    const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder('character-flow', source, 'edit prompt')
++    expect(slotId).toBeDefined()
++    expect(baselineSnapshot).toBeDefined()
++    // prepare pushed a pre-slot baseline (active scene → addAiSlotNode history:true)
++    expect(useCanvasStore.getState().historyPast).toHaveLength(1)
++    expect(useCanvasStore.getState().nodes.some((n) => n.id === slotId)).toBe(true)
++
++    removeMaskEditPlaceholder('character-flow', slotId, { error: 'boom', baselineSnapshot })
++
++    const state = useCanvasStore.getState()
++    expect(state.nodes.some((n) => n.id === slotId)).toBe(false)
++    expect(state.historyPast).toHaveLength(0) // baseline popped (栈顶 matched)
++  })
++
++  it('remove preserves user edits when栈顶 changed during async (expectedBaseline mismatch)', () => {
++    const source = imageNode({ id: 'src-1' })
++    seed(seedCanvas('character-flow', [source]))
++
++    const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder('character-flow', source, 'edit prompt')
++    expect(baselineSnapshot).toBeDefined()
++
++    // 模拟异步生成期间用户编辑：追加节点 + captureHistory 推新快照，栈顶已不是基线
++    const userEditNode = imageNode({ id: 'user-edit', x: 500 })
++    useCanvasStore.setState((s) => {
++      const sceneDoc = s.canvases['character-flow']
++      const nextNodes = [...sceneDoc.nodes, userEditNode]
++      return {
++        nodes: nextNodes,
++        canvases: { ...s.canvases, 'character-flow': { ...sceneDoc, nodes: nextNodes } },
++      }
++    })
++    useCanvasStore.getState().captureHistory()
++    // 栈顶已是用户编辑后的快照，与生成基线不是同一引用
++    expect(useCanvasStore.getState().historyPast.at(-1)).not.toBe(baselineSnapshot)
++
++    removeMaskEditPlaceholder('character-flow', slotId, { error: 'boom', baselineSnapshot })
++
++    const state = useCanvasStore.getState()
++    expect(state.nodes.some((n) => n.id === slotId)).toBe(false) // placeholder removed
++    expect(state.nodes.some((n) => n.id === 'user-edit')).toBe(true) // 用户编辑保留
++    expect(state.historyPast).toHaveLength(2) // 基线 + 用户编辑，均未被 pop
++  })
++
++  it('remove falls back to filter when baselineSnapshot is undefined (non-active scene)', () => {
++    // 非活跃场景：addAiSlotNode 不 push history → prepare 返回 baselineSnapshot=undefined
++    // → remove 跳过 rollback 走 filter-removal，删占位符但不动 history 栈。
++    const source = imageNode({ id: 'src-1' })
++    const otherScene = { title: 'other', nodes: [source], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
++    seed({
++      ...seedCanvas('character-flow', []),
++      canvases: {
++        'character-flow': { title: 'character-flow', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
++        'other-scene': otherScene,
++      },
++    })
++    // active scene is 'character-flow'; target 'other-scene' is non-active
++    expect(useCanvasStore.getState().sceneId).toBe('character-flow')
++
++    const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder('other-scene', source, 'edit prompt')
++    expect(baselineSnapshot).toBeUndefined()
++    expect(useCanvasStore.getState().canvases['other-scene'].nodes.some((n) => n.id === slotId)).toBe(true)
++
++    removeMaskEditPlaceholder('other-scene', slotId, { error: 'boom', baselineSnapshot })
++
++    const state = useCanvasStore.getState()
++    expect(state.canvases['other-scene'].nodes.some((n) => n.id === slotId)).toBe(false)
++    expect(state.historyPast).toHaveLength(0) // 未 push 也未 pop
++  })
++
++  // SC-W2 ④: 生成中用户编辑其他节点后取消 → 用户编辑不被回滚吞（#81 三态之取消）。
++  // 与 failure 路径同语义（expectedBaseline 不匹配 → filter-removal），但显式 canceled:true
++  // 覆盖取消态，证明 removeMaskEditPlaceholder 的 baselineSnapshot 守卫在 cancel 路径也成立。
++  it('remove preserves user edits on cancel when栈顶 changed during async (canceled path)', () => {
++    const source = imageNode({ id: 'src-1' })
++    seed(seedCanvas('character-flow', [source]))
++
++    const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder('character-flow', source, 'edit prompt')
++    expect(baselineSnapshot).toBeDefined()
++
++    // 异步生成期间用户在别处追加节点 + captureHistory，栈顶已不是生成基线
++    const userEditNode = imageNode({ id: 'user-edit-cancel', x: 700 })
++    useCanvasStore.setState((s) => {
++      const sceneDoc = s.canvases['character-flow']
++      const nextNodes = [...sceneDoc.nodes, userEditNode]
++      return {
++        nodes: nextNodes,
++        canvases: { ...s.canvases, 'character-flow': { ...sceneDoc, nodes: nextNodes } },
++      }
++    })
++    useCanvasStore.getState().captureHistory()
++    expect(useCanvasStore.getState().historyPast.at(-1)).not.toBe(baselineSnapshot)
++
++    // 取消态：canceled:true，仍带同一 baselineSnapshot
++    removeMaskEditPlaceholder('character-flow', slotId, { canceled: true, baselineSnapshot })
++
++    const state = useCanvasStore.getState()
++    expect(state.nodes.some((n) => n.id === slotId)).toBe(false) // placeholder removed
++    expect(state.nodes.some((n) => n.id === 'user-edit-cancel')).toBe(true) // 用户编辑保留
++    expect(state.historyPast).toHaveLength(2) // 基线 + 用户编辑，均未被 pop
++  })
++})
++
++describe('mask-edit placeholder camera auto-focus request (镜头跟随)', () => {
++  beforeEach(() => {
++    useCameraFocusStore.setState({ pendingFocus: undefined })
++  })
++
++  it('prepare requests placeholder focus for the active scene', () => {
++    const source = imageNode({ id: 'src-1' })
++    seed(seedCanvas('character-flow', [source]))
++
++    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
++
++    expect(useCameraFocusStore.getState().pendingFocus).toEqual({
++      kind: 'node',
++      nodeId: slotId,
++      source: 'mask-edit',
++      targetSceneId: 'character-flow',
++    })
++  })
++
++  it('prepare skips the focus request for a non-active scene (#95 跨场景语义:不动镜头)', () => {
++    const source = imageNode({ id: 'src-1' })
++    const otherScene = { title: 'other-scene', nodes: [source], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
++    seed({
++      ...seedCanvas('character-flow', []),
++      canvases: {
++        'character-flow': { title: 'character-flow', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
++        'other-scene': otherScene,
++      },
++    })
++
++    prepareMaskEditPlaceholder('other-scene', source, 'p')
++
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++  })
++})
++
++// ── p1-sc4:mask-edit 结果提交的显式成员集结果焦点请求 ──
++// 双时点契约:开始时刻 = prepare 的 placeholder focus(kind:'node',#95 语义,上述
++// 用例锁定);完成时刻 = commitGenerationResult 返回后对返回的结果节点 id 集发出
++// requestGenerationResultFocus(出图必居中,成员=commit 返回 id 集)。两时点各司
++// 其职、互不替代。
++describe('mask-edit 结果焦点请求(p1-sc4)', () => {
++  beforeEach(() => {
++    useCameraFocusStore.setState({ pendingFocus: undefined })
++  })
++
++  it('commitGenerationResult 返回后发出显式成员集结果焦点请求(成员=commit 返回 id 集)', async () => {
++    const source = imageNode({ id: 'src-1' })
++    seed(seedCanvas('character-flow', [source]))
++    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
++    // 占位符焦点(开始时刻)已被 prepare 写入;结果提交后应被结果焦点覆盖。
++    expect(useCameraFocusStore.getState().pendingFocus).toEqual({
++      kind: 'node',
++      nodeId: slotId,
++      source: 'mask-edit',
++      targetSceneId: 'character-flow',
++    })
++
++    useCanvasStore.setState({ commitGenerationResult: vi.fn(async () => ['r1']) } as never)
++    taskClientSpies.submitEditTask.mockResolvedValueOnce('task-1')
++    taskClientSpies.pollTask.mockResolvedValueOnce({
++      status: 'done', progress: 100, stage: 'done',
++      result: { images: [{ b64: 'ok-b64' }] },
++    })
++
++    await runMaskEditGeneration({
++      sceneId: 'character-flow',
++      source,
++      slotId,
++      resolvedAssetUrl: undefined,
++      payload: { prompt: 'p', sourceSize: { width: 200, height: 200 } } as never,
++      imgRatio: '1:1' as never,
++      signal: new AbortController().signal,
++    })
++
++    const pending = useCameraFocusStore.getState().pendingFocus
++    if (!pending || pending.kind !== 'generation-result') {
++      throw new Error(`expected generation-result focus request, got ${pending?.kind ?? 'none'}`)
++    }
++    expect(pending.memberNodeIds).toEqual(['r1'])
++    expect(pending).toMatchObject({
++      triggerNodeId: 'r1',
++      targetSceneId: 'character-flow',
++      source: 'generation-result',
++    })
++  })
++
++  it('commit 返回空集时不发结果焦点请求(空集 no-op,不崩溃)', async () => {
++    const source = imageNode({ id: 'src-empty' })
++    seed(seedCanvas('character-flow', [source]))
++    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
++    useCanvasStore.setState({ commitGenerationResult: vi.fn(async () => []) } as never)
++    taskClientSpies.submitEditTask.mockResolvedValueOnce('task-1')
++    taskClientSpies.pollTask.mockResolvedValueOnce({
++      status: 'done', progress: 100, stage: 'done',
++      result: { images: [{ b64: 'ok-b64' }] },
++    })
++
++    await runMaskEditGeneration({
++      sceneId: 'character-flow',
++      source,
++      slotId,
++      resolvedAssetUrl: undefined,
++      payload: { prompt: 'p', sourceSize: { width: 200, height: 200 } } as never,
++      imgRatio: '1:1' as never,
++      signal: new AbortController().signal,
++    })
++
++    // 空集 → 结果焦点不写,且不覆盖/不清除占位符焦点(开始时刻 #95 语义保持)。
++    expect(useCameraFocusStore.getState().pendingFocus).toEqual({
++      kind: 'node',
++      nodeId: slotId,
++      source: 'mask-edit',
++      targetSceneId: 'character-flow',
++    })
++  })
++})
+diff --git a/src/canvas/maskEditGeneration.request.test.ts b/src/canvas/maskEditGeneration.request.test.ts
+new file mode 100644
+index 00000000..e666fb85
+--- /dev/null
++++ b/src/canvas/maskEditGeneration.request.test.ts
+@@ -0,0 +1,271 @@
++import { describe, expect, it, vi, beforeEach } from 'vitest'
++
++// Hermetic setup: stub the demo-image canvas renderer (canvasStore triggers scenes()
++// at module load), the IndexedDB-backed asset store, and the remote debug-log flusher
++// — same approach as generation.contract.test.ts.
++vi.mock('../lib/demoImages', () => ({
++  createDemoImage: () => 'data:image/png;base64,mock-demo-image',
++}))
++vi.mock('../lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async (_blob: Blob, name: string, type: string) => ({
++    assetUrl: 'mivo-asset://mock-asset',
++    name,
++    type,
++    sizeBytes: 1234,
++    hasTransparency: false,
++    size: '200x200',
++    sourceDimensions: { width: 200, height: 200 },
++  })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('../store/remoteDebugReporter', () => ({
++  reportRemoteDebugEntry: () => {},
++}))
++
++// FIX-1 tests: spy on the task client + image source + black-plate inspection so
++// runMaskEditGeneration's cancel path can be exercised without a real BFF/upstream.
++const taskClientSpies = vi.hoisted(() => ({
++  submitEditTask: vi.fn(),
++  pollTask: vi.fn(),
++  cancelTask: vi.fn(),
++}))
++vi.mock('../lib/mivoTaskClient', () => ({
++  submitEditTask: taskClientSpies.submitEditTask,
++  pollTask: taskClientSpies.pollTask,
++  cancelTask: taskClientSpies.cancelTask,
++  taskPollIntervalMs: () => 10000,
++  kindForFailedTask: () => 'upstream-error',
++}))
++vi.mock('../lib/canvasImageSource', () => ({
++  readCanvasImageBlob: vi.fn(async () => new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], 'src.png', { type: 'image/png' })),
++}))
++const inspectArtifactsSpy = vi.hoisted(() => vi.fn())
++vi.mock('../lib/maskResultInspection', () => ({
++  inspectMaskResultForBlackArtifacts: inspectArtifactsSpy,
++  // 纯等比映射，与真实实现同语义（prior-bounds 断言依赖它算出的期望值）。
++  mapBoundsToResultSpace: (bounds: { x: number; y: number; width: number; height: number }, from: { width: number; height: number }, to: { width: number; height: number }) => {
++    const scaleX = to.width / Math.max(1, from.width)
++    const scaleY = to.height / Math.max(1, from.height)
++    const x = Math.max(0, Math.floor(bounds.x * scaleX))
++    const y = Math.max(0, Math.floor(bounds.y * scaleY))
++    const right = Math.min(to.width, Math.ceil((bounds.x + bounds.width) * scaleX))
++    const bottom = Math.min(to.height, Math.ceil((bounds.y + bounds.height) * scaleY))
++    return { x, y, width: Math.max(1, right - x), height: Math.max(1, bottom - y) }
++  },
++}))
++
++// 黑块检测 mock 返回值助手。
++const artifactHit = (reason = 'out-of-mask-new-black-component') => ({
++  hasArtifact: true,
++  reason,
++  components: [{ bounds: { x: 48, y: 48, width: 110, height: 110 }, areaPx: 9500, bboxFillRatio: 0.78, sourceBlackRatio: 0 }],
++})
++
++import { useCanvasStore } from '../store/canvasStore'
++import { prepareMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++// Helpers ---------------------------------------------------------------------
++
++const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++  id: 'src-1',
++  type: 'image',
++  title: 'Source',
++  x: 0,
++  y: 0,
++  width: 200,
++  height: 200,
++  status: 'ready',
++  assetUrl: '/a.png',
++  ...overrides,
++})
++
++const baseState = useCanvasStore.getState()
++
++const seed = (overrides: Record<string, unknown> = {}) =>
++  useCanvasStore.setState({ ...baseState, ...overrides } as never, true)
++
++const seedCanvas = (sceneId: string, nodes: MivoCanvasNode[]) => {
++  const document = { title: sceneId, nodes, edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
++  return {
++    canvases: { [sceneId]: document },
++    sceneId,
++    nodes,
++    edges: [],
++    tasks: [],
++    selectedNodeId: undefined,
++    selectedNodeIds: [],
++  }
++}
++
++beforeEach(() => {
++  useCanvasStore.setState({ ...baseState } as never, true)
++})
++
++// Tests -----------------------------------------------------------------------
++
++
++// FIX-1: cancelTask must DELETE the IN-FLIGHT task. Before the fix, serverTaskId was
++// assigned only AFTER runOneAttempt returned, so an abort during the poll left it
++// undefined → cancelTask no-op'd → orphaned in-flight server task. currentTaskId is
++// now set inside runOneAttempt right after submitEditTask returns, and each retry
++// attempt overwrites it with its own fresh id.
++describe('runMaskEditGeneration cancel (FIX-1: DELETE the in-flight task)', () => {
++  beforeEach(() => {
++    taskClientSpies.submitEditTask.mockReset()
++    taskClientSpies.pollTask.mockReset()
++    taskClientSpies.cancelTask.mockReset()
++    inspectArtifactsSpy.mockReset()
++  })
++
++  const basePayload = {
++    prompt: 'p',
++    sourceSize: { width: 200, height: 200 },
++    maskBounds: { x: 10, y: 10, width: 50, height: 50 },
++    quality: 'medium' as const,
++    model: 'gpt-image-2' as const, // 黑块自愈只对 gpt-image-2 挖洞路生效（2026-07-08）
++  }
++
++  it('abort during first-attempt poll → cancelTask DELETEs task-1 (not undefined/no-op)', async () => {
++    const source = imageNode({ id: 'src-1' })
++    seed(seedCanvas('character-flow', [source]))
++    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
++    const ac = new AbortController()
++    taskClientSpies.submitEditTask.mockResolvedValueOnce('task-1')
++    // First poll returns running, then aborts so the subsequent sleep rejects canceled.
++    taskClientSpies.pollTask.mockImplementationOnce(async () => {
++      ac.abort()
++      return { status: 'running', progress: 10, stage: 'submit' }
++    })
++
++    await expect(runMaskEditGeneration({
++      sceneId: 'character-flow',
++      source,
++      slotId,
++      resolvedAssetUrl: undefined,
++      payload: basePayload as never,
++      imgRatio: '1:1' as never,
++      signal: ac.signal,
++    })).rejects.toThrow()
++
++    expect(taskClientSpies.cancelTask).toHaveBeenCalledWith('task-1')
++    expect(taskClientSpies.cancelTask).toHaveBeenCalledTimes(1)
++  })
++
++  it('self-heal retry abort → cancelTask DELETEs task-2 (the new in-flight id), not stale task-1', async () => {
++    const source = imageNode({ id: 'src-1' })
++    seed(seedCanvas('character-flow', [source]))
++    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
++    const ac = new AbortController()
++    taskClientSpies.submitEditTask
++      .mockResolvedValueOnce('task-1') // first attempt
++      .mockResolvedValueOnce('task-2') // self-heal retry
++    taskClientSpies.pollTask
++      .mockResolvedValueOnce({
++        status: 'done', progress: 100, stage: 'done',
++        result: { images: [{ b64: 'black-plate-b64' }] },
++      }) // first attempt returns a black-plate result
++      .mockImplementationOnce(async () => {
++        ac.abort() // second attempt poll → abort mid-poll
++        return { status: 'running', progress: 10, stage: 'submit' }
++      })
++    inspectArtifactsSpy.mockResolvedValueOnce(artifactHit()) // first result detected as black → retry
++
++    await expect(runMaskEditGeneration({
++      sceneId: 'character-flow',
++      source,
++      slotId,
++      resolvedAssetUrl: undefined,
++      payload: basePayload as never,
++      imgRatio: '1:1' as never,
++      signal: ac.signal,
++    })).rejects.toThrow()
++
++    // The retry's in-flight task is task-2; cancelTask must DELETE task-2, NOT the
++    // stale task-1 (which already completed and whose id was in serverTaskId).
++    expect(taskClientSpies.cancelTask).toHaveBeenCalledWith('task-2')
++    expect(taskClientSpies.cancelTask).not.toHaveBeenCalledWith('task-1')
++    expect(taskClientSpies.cancelTask).toHaveBeenCalledTimes(1)
++  })
++})
++
++// Quality parity (auto/low/medium/high): overlay 四档选择器 → payload.quality →
++// runMaskEditGeneration 透传 → submitEditTask request.quality。auto = undefined 一路
++// 穿透（不带 quality 字段，与 chat 生图路径一致）；low/medium/high 原样下发。
++// 证据：四档各自 submitEditTask 调用的 request.quality 实际值。
++//
++// 测试让 pollTask 直接返回 failed，runOneAttempt 抛错 → 外层 catch 跳过 commit
++// 直接 rethrow（canceled=false → 不走 cancelTask）。这样只验证 submitEditTask 收
++// 到的 request.quality，不耦合 commitGenerationResult 的全流程。
++describe('runMaskEditGeneration quality pass-through (auto/low/medium/high parity)', () => {
++  beforeEach(() => {
++    taskClientSpies.submitEditTask.mockReset()
++    taskClientSpies.pollTask.mockReset()
++    taskClientSpies.cancelTask.mockReset()
++    inspectArtifactsSpy.mockReset()
++  })
++
++  const baseSubmitPayload = {
++    prompt: 'p',
++    sourceSize: { width: 200, height: 200 },
++    // No maskBounds → black-plate inspection skipped (canInspect=false).
++  }
++
++  const runFor = (quality: 'auto' | 'low' | 'medium' | 'high') => {
++    const source = imageNode({ id: 'src-1' })
++    seed(seedCanvas('character-flow', [source]))
++    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
++    taskClientSpies.submitEditTask.mockResolvedValueOnce('task-q')
++    taskClientSpies.pollTask.mockResolvedValueOnce({
++      status: 'failed', progress: 0, stage: 'submit', error: 'upstream boom',
++    })
++    return runMaskEditGeneration({
++      sceneId: 'character-flow',
++      source,
++      slotId,
++      resolvedAssetUrl: undefined,
++      payload: {
++        ...baseSubmitPayload,
++        quality: quality === 'auto' ? undefined : (quality as never),
++      } as never,
++      imgRatio: '1:1' as never,
++      signal: new AbortController().signal,
++    })
++  }
++
++  const capturedRequest = (): { quality?: string } =>
++    taskClientSpies.submitEditTask.mock.calls.at(-1)?.[0] as { quality?: string }
++
++  // 局部重绘固定 Gemini（无模型选择器、无 auto）：未显式指定 quality 时回退到
++  // 模型固定质量 maskEditQualityFor(gemini) = 'high'（2K），不再是 undefined 透传。
++  it('未指定 quality → 回退到模型固定质量（gemini = high）', async () => {
++    await expect(runFor('auto')).rejects.toThrow()
++    expect(capturedRequest().quality).toBe('high')
++  })
++
++  // 回归守卫(2026-07-31 线上 bug):提交切到 imageGenerationPort 后漏传 sourceAssetUrl,
++  // 插件端口 lookupMedia(undefined) 必然失败 →「不在媒体账下」→ 浮层提交即关、后台回滚,
++  // 表现为「一点区域编辑就退出、不生图」。HTTP 客户端忽略该字段,所以 web 侧不会报错,
++  // 只有嵌入式宿主受害 —— 类型系统抓不到(可选字段),必须靠本断言钉住。
++  // 口径:画布节点 assetUrl(与 generationSlice 改图/变体一致),不是 resolved blob url。
++  it('必须把源图 assetUrl 传给端口(插件靠它兑换媒体账源图)', async () => {
++    await expect(runFor('medium')).rejects.toThrow()
++    expect((capturedRequest() as { sourceAssetUrl?: string }).sourceAssetUrl).toBe('/a.png')
++  })
++
++  it('low → submitEditTask request.quality === "low"', async () => {
++    await expect(runFor('low')).rejects.toThrow()
++    expect(capturedRequest().quality).toBe('low')
++  })
++
++  it('medium → submitEditTask request.quality === "medium"', async () => {
++    await expect(runFor('medium')).rejects.toThrow()
++    expect(capturedRequest().quality).toBe('medium')
++  })
++
++  it('high → submitEditTask request.quality === "high"', async () => {
++    await expect(runFor('high')).rejects.toThrow()
++    expect(capturedRequest().quality).toBe('high')
++  })
++})
+diff --git a/src/canvas/maskEditGeneration.test.ts b/src/canvas/maskEditGeneration.selfHeal.test.ts
+similarity index 63%
+rename from src/canvas/maskEditGeneration.test.ts
+rename to src/canvas/maskEditGeneration.selfHeal.test.ts
+index 2f274a3a..2de1ba43 100644
+--- a/src/canvas/maskEditGeneration.test.ts
++++ b/src/canvas/maskEditGeneration.selfHeal.test.ts
+@@ -64,8 +64,7 @@ const artifactHit = (reason = 'out-of-mask-new-black-component') => ({
+ const artifactClean = () => ({ hasArtifact: false, components: [] })
+ 
+ import { useCanvasStore } from '../store/canvasStore'
+-import { prepareMaskEditPlaceholder, removeMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
+-import { useCameraFocusStore } from '../store/cameraFocusStore'
++import { prepareMaskEditPlaceholder, runMaskEditGeneration } from './maskEditGeneration'
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ 
+ // Helpers ---------------------------------------------------------------------
+@@ -107,276 +106,6 @@ beforeEach(() => {
+ 
+ // Tests -----------------------------------------------------------------------
+ 
+-describe('mask-edit placeholder rollback (S01)', () => {
+-  it('prepare captures the baseline; remove rolls back to it when栈顶 unchanged', () => {
+-    const source = imageNode({ id: 'src-1' })
+-    seed(seedCanvas('character-flow', [source]))
+-
+-    const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder('character-flow', source, 'edit prompt')
+-    expect(slotId).toBeDefined()
+-    expect(baselineSnapshot).toBeDefined()
+-    // prepare pushed a pre-slot baseline (active scene → addAiSlotNode history:true)
+-    expect(useCanvasStore.getState().historyPast).toHaveLength(1)
+-    expect(useCanvasStore.getState().nodes.some((n) => n.id === slotId)).toBe(true)
+-
+-    removeMaskEditPlaceholder('character-flow', slotId, { error: 'boom', baselineSnapshot })
+-
+-    const state = useCanvasStore.getState()
+-    expect(state.nodes.some((n) => n.id === slotId)).toBe(false)
+-    expect(state.historyPast).toHaveLength(0) // baseline popped (栈顶 matched)
+-  })
+-
+-  it('remove preserves user edits when栈顶 changed during async (expectedBaseline mismatch)', () => {
+-    const source = imageNode({ id: 'src-1' })
+-    seed(seedCanvas('character-flow', [source]))
+-
+-    const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder('character-flow', source, 'edit prompt')
+-    expect(baselineSnapshot).toBeDefined()
+-
+-    // 模拟异步生成期间用户编辑：追加节点 + captureHistory 推新快照，栈顶已不是基线
+-    const userEditNode = imageNode({ id: 'user-edit', x: 500 })
+-    useCanvasStore.setState((s) => {
+-      const sceneDoc = s.canvases['character-flow']
+-      const nextNodes = [...sceneDoc.nodes, userEditNode]
+-      return {
+-        nodes: nextNodes,
+-        canvases: { ...s.canvases, 'character-flow': { ...sceneDoc, nodes: nextNodes } },
+-      }
+-    })
+-    useCanvasStore.getState().captureHistory()
+-    // 栈顶已是用户编辑后的快照，与生成基线不是同一引用
+-    expect(useCanvasStore.getState().historyPast.at(-1)).not.toBe(baselineSnapshot)
+-
+-    removeMaskEditPlaceholder('character-flow', slotId, { error: 'boom', baselineSnapshot })
+-
+-    const state = useCanvasStore.getState()
+-    expect(state.nodes.some((n) => n.id === slotId)).toBe(false) // placeholder removed
+-    expect(state.nodes.some((n) => n.id === 'user-edit')).toBe(true) // 用户编辑保留
+-    expect(state.historyPast).toHaveLength(2) // 基线 + 用户编辑，均未被 pop
+-  })
+-
+-  it('remove falls back to filter when baselineSnapshot is undefined (non-active scene)', () => {
+-    // 非活跃场景：addAiSlotNode 不 push history → prepare 返回 baselineSnapshot=undefined
+-    // → remove 跳过 rollback 走 filter-removal，删占位符但不动 history 栈。
+-    const source = imageNode({ id: 'src-1' })
+-    const otherScene = { title: 'other', nodes: [source], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
+-    seed({
+-      ...seedCanvas('character-flow', []),
+-      canvases: {
+-        'character-flow': { title: 'character-flow', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+-        'other-scene': otherScene,
+-      },
+-    })
+-    // active scene is 'character-flow'; target 'other-scene' is non-active
+-    expect(useCanvasStore.getState().sceneId).toBe('character-flow')
+-
+-    const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder('other-scene', source, 'edit prompt')
+-    expect(baselineSnapshot).toBeUndefined()
+-    expect(useCanvasStore.getState().canvases['other-scene'].nodes.some((n) => n.id === slotId)).toBe(true)
+-
+-    removeMaskEditPlaceholder('other-scene', slotId, { error: 'boom', baselineSnapshot })
+-
+-    const state = useCanvasStore.getState()
+-    expect(state.canvases['other-scene'].nodes.some((n) => n.id === slotId)).toBe(false)
+-    expect(state.historyPast).toHaveLength(0) // 未 push 也未 pop
+-  })
+-
+-  // SC-W2 ④: 生成中用户编辑其他节点后取消 → 用户编辑不被回滚吞（#81 三态之取消）。
+-  // 与 failure 路径同语义（expectedBaseline 不匹配 → filter-removal），但显式 canceled:true
+-  // 覆盖取消态，证明 removeMaskEditPlaceholder 的 baselineSnapshot 守卫在 cancel 路径也成立。
+-  it('remove preserves user edits on cancel when栈顶 changed during async (canceled path)', () => {
+-    const source = imageNode({ id: 'src-1' })
+-    seed(seedCanvas('character-flow', [source]))
+-
+-    const { slotId, baselineSnapshot } = prepareMaskEditPlaceholder('character-flow', source, 'edit prompt')
+-    expect(baselineSnapshot).toBeDefined()
+-
+-    // 异步生成期间用户在别处追加节点 + captureHistory，栈顶已不是生成基线
+-    const userEditNode = imageNode({ id: 'user-edit-cancel', x: 700 })
+-    useCanvasStore.setState((s) => {
+-      const sceneDoc = s.canvases['character-flow']
+-      const nextNodes = [...sceneDoc.nodes, userEditNode]
+-      return {
+-        nodes: nextNodes,
+-        canvases: { ...s.canvases, 'character-flow': { ...sceneDoc, nodes: nextNodes } },
+-      }
+-    })
+-    useCanvasStore.getState().captureHistory()
+-    expect(useCanvasStore.getState().historyPast.at(-1)).not.toBe(baselineSnapshot)
+-
+-    // 取消态：canceled:true，仍带同一 baselineSnapshot
+-    removeMaskEditPlaceholder('character-flow', slotId, { canceled: true, baselineSnapshot })
+-
+-    const state = useCanvasStore.getState()
+-    expect(state.nodes.some((n) => n.id === slotId)).toBe(false) // placeholder removed
+-    expect(state.nodes.some((n) => n.id === 'user-edit-cancel')).toBe(true) // 用户编辑保留
+-    expect(state.historyPast).toHaveLength(2) // 基线 + 用户编辑，均未被 pop
+-  })
+-})
+-
+-// FIX-1: cancelTask must DELETE the IN-FLIGHT task. Before the fix, serverTaskId was
+-// assigned only AFTER runOneAttempt returned, so an abort during the poll left it
+-// undefined → cancelTask no-op'd → orphaned in-flight server task. currentTaskId is
+-// now set inside runOneAttempt right after submitEditTask returns, and each retry
+-// attempt overwrites it with its own fresh id.
+-describe('runMaskEditGeneration cancel (FIX-1: DELETE the in-flight task)', () => {
+-  beforeEach(() => {
+-    taskClientSpies.submitEditTask.mockReset()
+-    taskClientSpies.pollTask.mockReset()
+-    taskClientSpies.cancelTask.mockReset()
+-    inspectArtifactsSpy.mockReset()
+-  })
+-
+-  const basePayload = {
+-    prompt: 'p',
+-    sourceSize: { width: 200, height: 200 },
+-    maskBounds: { x: 10, y: 10, width: 50, height: 50 },
+-    quality: 'medium' as const,
+-    model: 'gpt-image-2' as const, // 黑块自愈只对 gpt-image-2 挖洞路生效（2026-07-08）
+-  }
+-
+-  it('abort during first-attempt poll → cancelTask DELETEs task-1 (not undefined/no-op)', async () => {
+-    const source = imageNode({ id: 'src-1' })
+-    seed(seedCanvas('character-flow', [source]))
+-    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+-    const ac = new AbortController()
+-    taskClientSpies.submitEditTask.mockResolvedValueOnce('task-1')
+-    // First poll returns running, then aborts so the subsequent sleep rejects canceled.
+-    taskClientSpies.pollTask.mockImplementationOnce(async () => {
+-      ac.abort()
+-      return { status: 'running', progress: 10, stage: 'submit' }
+-    })
+-
+-    await expect(runMaskEditGeneration({
+-      sceneId: 'character-flow',
+-      source,
+-      slotId,
+-      resolvedAssetUrl: undefined,
+-      payload: basePayload as never,
+-      imgRatio: '1:1' as never,
+-      signal: ac.signal,
+-    })).rejects.toThrow()
+-
+-    expect(taskClientSpies.cancelTask).toHaveBeenCalledWith('task-1')
+-    expect(taskClientSpies.cancelTask).toHaveBeenCalledTimes(1)
+-  })
+-
+-  it('self-heal retry abort → cancelTask DELETEs task-2 (the new in-flight id), not stale task-1', async () => {
+-    const source = imageNode({ id: 'src-1' })
+-    seed(seedCanvas('character-flow', [source]))
+-    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+-    const ac = new AbortController()
+-    taskClientSpies.submitEditTask
+-      .mockResolvedValueOnce('task-1') // first attempt
+-      .mockResolvedValueOnce('task-2') // self-heal retry
+-    taskClientSpies.pollTask
+-      .mockResolvedValueOnce({
+-        status: 'done', progress: 100, stage: 'done',
+-        result: { images: [{ b64: 'black-plate-b64' }] },
+-      }) // first attempt returns a black-plate result
+-      .mockImplementationOnce(async () => {
+-        ac.abort() // second attempt poll → abort mid-poll
+-        return { status: 'running', progress: 10, stage: 'submit' }
+-      })
+-    inspectArtifactsSpy.mockResolvedValueOnce(artifactHit()) // first result detected as black → retry
+-
+-    await expect(runMaskEditGeneration({
+-      sceneId: 'character-flow',
+-      source,
+-      slotId,
+-      resolvedAssetUrl: undefined,
+-      payload: basePayload as never,
+-      imgRatio: '1:1' as never,
+-      signal: ac.signal,
+-    })).rejects.toThrow()
+-
+-    // The retry's in-flight task is task-2; cancelTask must DELETE task-2, NOT the
+-    // stale task-1 (which already completed and whose id was in serverTaskId).
+-    expect(taskClientSpies.cancelTask).toHaveBeenCalledWith('task-2')
+-    expect(taskClientSpies.cancelTask).not.toHaveBeenCalledWith('task-1')
+-    expect(taskClientSpies.cancelTask).toHaveBeenCalledTimes(1)
+-  })
+-})
+-
+-// Quality parity (auto/low/medium/high): overlay 四档选择器 → payload.quality →
+-// runMaskEditGeneration 透传 → submitEditTask request.quality。auto = undefined 一路
+-// 穿透（不带 quality 字段，与 chat 生图路径一致）；low/medium/high 原样下发。
+-// 证据：四档各自 submitEditTask 调用的 request.quality 实际值。
+-//
+-// 测试让 pollTask 直接返回 failed，runOneAttempt 抛错 → 外层 catch 跳过 commit
+-// 直接 rethrow（canceled=false → 不走 cancelTask）。这样只验证 submitEditTask 收
+-// 到的 request.quality，不耦合 commitGenerationResult 的全流程。
+-describe('runMaskEditGeneration quality pass-through (auto/low/medium/high parity)', () => {
+-  beforeEach(() => {
+-    taskClientSpies.submitEditTask.mockReset()
+-    taskClientSpies.pollTask.mockReset()
+-    taskClientSpies.cancelTask.mockReset()
+-    inspectArtifactsSpy.mockReset()
+-  })
+-
+-  const baseSubmitPayload = {
+-    prompt: 'p',
+-    sourceSize: { width: 200, height: 200 },
+-    // No maskBounds → black-plate inspection skipped (canInspect=false).
+-  }
+-
+-  const runFor = (quality: 'auto' | 'low' | 'medium' | 'high') => {
+-    const source = imageNode({ id: 'src-1' })
+-    seed(seedCanvas('character-flow', [source]))
+-    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+-    taskClientSpies.submitEditTask.mockResolvedValueOnce('task-q')
+-    taskClientSpies.pollTask.mockResolvedValueOnce({
+-      status: 'failed', progress: 0, stage: 'submit', error: 'upstream boom',
+-    })
+-    return runMaskEditGeneration({
+-      sceneId: 'character-flow',
+-      source,
+-      slotId,
+-      resolvedAssetUrl: undefined,
+-      payload: {
+-        ...baseSubmitPayload,
+-        quality: quality === 'auto' ? undefined : (quality as never),
+-      } as never,
+-      imgRatio: '1:1' as never,
+-      signal: new AbortController().signal,
+-    })
+-  }
+-
+-  const capturedRequest = (): { quality?: string } =>
+-    taskClientSpies.submitEditTask.mock.calls.at(-1)?.[0] as { quality?: string }
+-
+-  // 局部重绘固定 Gemini（无模型选择器、无 auto）：未显式指定 quality 时回退到
+-  // 模型固定质量 maskEditQualityFor(gemini) = 'high'（2K），不再是 undefined 透传。
+-  it('未指定 quality → 回退到模型固定质量（gemini = high）', async () => {
+-    await expect(runFor('auto')).rejects.toThrow()
+-    expect(capturedRequest().quality).toBe('high')
+-  })
+-
+-  // 回归守卫(2026-07-31 线上 bug):提交切到 imageGenerationPort 后漏传 sourceAssetUrl,
+-  // 插件端口 lookupMedia(undefined) 必然失败 →「不在媒体账下」→ 浮层提交即关、后台回滚,
+-  // 表现为「一点区域编辑就退出、不生图」。HTTP 客户端忽略该字段,所以 web 侧不会报错,
+-  // 只有嵌入式宿主受害 —— 类型系统抓不到(可选字段),必须靠本断言钉住。
+-  // 口径:画布节点 assetUrl(与 generationSlice 改图/变体一致),不是 resolved blob url。
+-  it('必须把源图 assetUrl 传给端口(插件靠它兑换媒体账源图)', async () => {
+-    await expect(runFor('medium')).rejects.toThrow()
+-    expect((capturedRequest() as { sourceAssetUrl?: string }).sourceAssetUrl).toBe('/a.png')
+-  })
+-
+-  it('low → submitEditTask request.quality === "low"', async () => {
+-    await expect(runFor('low')).rejects.toThrow()
+-    expect(capturedRequest().quality).toBe('low')
+-  })
+-
+-  it('medium → submitEditTask request.quality === "medium"', async () => {
+-    await expect(runFor('medium')).rejects.toThrow()
+-    expect(capturedRequest().quality).toBe('medium')
+-  })
+-
+-  it('high → submitEditTask request.quality === "high"', async () => {
+-    await expect(runFor('high')).rejects.toThrow()
+-    expect(capturedRequest().quality).toBe('high')
+-  })
+-})
+ 
+ // SC-13: runMaskEditGeneration 的 callbacks 契约 + 返回值 {nodeIds, sourceDeleted}。
+ // - onTaskSubmitted(taskId): submitEditTask 返回后、poll 前触发(写 message.maskEdit.serverTaskId)。
+@@ -679,37 +408,6 @@ describe('runMaskEditGeneration onSelfHealRetry 时机 (F2)', () => {
+   })
+ })
+ 
+-describe('mask-edit placeholder camera auto-focus request (镜头跟随)', () => {
+-  beforeEach(() => {
+-    useCameraFocusStore.setState({ pendingFocus: undefined })
+-  })
+-
+-  it('prepare requests placeholder focus for the active scene', () => {
+-    const source = imageNode({ id: 'src-1' })
+-    seed(seedCanvas('character-flow', [source]))
+-
+-    const { slotId } = prepareMaskEditPlaceholder('character-flow', source, 'p')
+-
+-    expect(useCameraFocusStore.getState().pendingFocus).toEqual({ kind: 'node', nodeId: slotId, source: 'mask-edit' })
+-  })
+-
+-  it('prepare skips the focus request for a non-active scene (#95 跨场景语义:不动镜头)', () => {
+-    const source = imageNode({ id: 'src-1' })
+-    const otherScene = { title: 'other-scene', nodes: [source], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] }
+-    seed({
+-      ...seedCanvas('character-flow', []),
+-      canvases: {
+-        'character-flow': { title: 'character-flow', nodes: [], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
+-        'other-scene': otherScene,
+-      },
+-    })
+-
+-    prepareMaskEditPlaceholder('other-scene', source, 'p')
+-
+-    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
+-  })
+-})
+-
+ // 黑块修复：自愈失败不 commit + 历史洞区/坐标空间元数据。
+ //  ① 第一次区域外黑 → 新 idempotency 重试；第二次干净 → commit（带 maskSourceSize）。
+ //  ② 两次全黑 → reject（upstream-error）且 commitGenerationResult 未被调 —— 宁可失败不落坏图。
+diff --git a/src/canvas/maskEditGeneration.ts b/src/canvas/maskEditGeneration.ts
+index b6213034..d773affc 100644
+--- a/src/canvas/maskEditGeneration.ts
++++ b/src/canvas/maskEditGeneration.ts
+@@ -130,8 +130,12 @@ export const prepareMaskEditPlaceholder = (
+     sceneId === useCanvasStore.getState().sceneId
+       ? useCanvasStore.getState().historyPast.at(-1)
+       : undefined
+-  // 镜头跟随契约:占位建好后请求 auto-focus;跨场景 skip 判定在 cameraFocusStore
+-  // 内(#95 语义:不切场景、不动镜头)。
++  // 镜头跟随双时点契约(开始时刻):占位建好后请求 placeholder auto-focus(#95
++  // 语义:跟随生成中的占位符;跨场景 skip 判定在 cameraFocusStore 内,不切场景、
++  // 不动镜头)。完成时刻的结果焦点请求在 runMaskEditGeneration 的 commit 之后
++  // 单独发出(requestGenerationResultFocus,出图必居中,成员=commit 返回 id 集)
++  // ——两时点各司其职、互不替代:开始时刻让用户看到占位符,完成时刻让用户看到
++  // 结果。
+   useCameraFocusStore.getState().requestPlaceholderFocus(slotId, {
+     targetSceneId: sceneId,
+     activeSceneId: useCanvasStore.getState().sceneId,
+@@ -473,6 +477,19 @@ export const runMaskEditGeneration = async (args: {
+       placement: 'right' as const,
+     }
+     const nodeIds = await useCanvasStore.getState().commitGenerationResult(commitPayload)
++    // 镜头跟随双时点契约(完成时刻):结果 commit 落地后对返回的结果节点 id 集发出
++    // 显式成员集结果焦点请求(出图必居中;memberNodeIds=commit 返回 id 集,不经
++    // 注册表/不看 aiWorkflow.status——结果节点此时已是 image/ready)。与开始时刻
++    // 的 placeholder focus(requestPlaceholderFocus)各司其职、互不替代;跨场景 skip 判定在
++    // cameraFocusStore 内(#95)。
++    if (nodeIds.length > 0) {
++      useCameraFocusStore.getState().requestGenerationResultFocus(nodeIds, {
++        triggerNodeId: nodeIds[0],
++        targetSceneId: sceneId,
++        activeSceneId: useCanvasStore.getState().sceneId,
++        source: 'generation-result',
++      })
++    }
+     // mask-chat-card: 不再在此处 appendNotice —— 同场景结果图由 chat flow 落 resultNodeIds，
+     // 跨场景 notice / chat mode replyText notice 由 chatMaskEditFlow 统一处理。
+     debugLogger.log(
+diff --git a/src/canvas/useViewport.panCommitRace.test.tsx b/src/canvas/useViewport.panCommitRace.test.tsx
+index c64a9b11..6ad03f7f 100644
+--- a/src/canvas/useViewport.panCommitRace.test.tsx
++++ b/src/canvas/useViewport.panCommitRace.test.tsx
+@@ -396,7 +396,7 @@ describe('useViewport — generation-set 集合镜头(p1-sc3 ③ / p1-sc4 / p1-s
+     })
+ 
+   beforeEach(() => {
+-    useCameraFocusStore.setState({ pendingFocus: undefined, generationFocusNodeIds: [] })
++    useCameraFocusStore.setState({ pendingFocus: undefined, generationFocusNodeIds: [], deferredFocusByScene: {} })
+   })
+ 
+   it('p1-sc3 ③: 用户正在拖拽(panRef 非空)时到达的 generation-set 请求被跳过并 clear,镜头不动', () => {
+@@ -496,3 +496,381 @@ describe('useViewport — generation-set 集合镜头(p1-sc3 ③ / p1-sc4 / p1-s
+     expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
+   })
+ })
++
++// ── p0-sc5:generation-result 结果集的真实挂载消费 ──
++// 显式成员集请求经 useViewport 的 effect 消费:按成员并集 bounds 出图必居中;
++// 已删除/隐藏成员剪除后再取并集;成员全部缺失 → 请求作废、清除且镜头不动;
++// 两批重叠完成(消费前先后 commit)按 p0-sc1 的 union 合并语义一次消费全部成员。
++describe('useViewport — generation-result 结果集挂载消费(p0-sc5)', () => {
++  const SCENE = 'result-set-test'
++
++  const resultNode = (id: string, over: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++    id,
++    type: 'image',
++    title: 'r',
++    x: 0,
++    y: 0,
++    width: 320,
++    height: 320,
++    status: 'ready',
++    assetUrl: '/a.png',
++    ...over,
++  })
++
++  function ResultHarness({ nodes }: { nodes: MivoCanvasNode[] }) {
++    const shellRef = useRef<HTMLDivElement | null>(null)
++    const hook = useViewport({
++      shellRef,
++      sceneId: SCENE,
++      nodes,
++      selectedNodes: [],
++      onCloseContextMenu: () => undefined,
++    })
++    useEffect(() => {
++      api = hook
++    })
++    return (
++      <div
++        className="canvas-shell"
++        ref={(el) => {
++          shellRef.current = el
++          if (el) {
++            shellEl = el
++            el.getBoundingClientRect = () => shellRect
++          }
++        }}
++      >
++        <div className="dom-canvas-layer" />
++      </div>
++    )
++  }
++
++  const renderResults = (nodes: MivoCanvasNode[]) =>
++    act(() => {
++      root.render(<ResultHarness nodes={nodes} />)
++    })
++
++  const requestResult = (memberNodeIds: string[]) =>
++    act(() => {
++      useCameraFocusStore.getState().requestGenerationResultFocus(memberNodeIds, {
++        triggerNodeId: memberNodeIds[0] ?? '',
++        targetSceneId: SCENE,
++        activeSceneId: SCENE,
++        source: 'generation-result',
++      })
++    })
++
++  beforeEach(() => {
++    useCameraFocusStore.setState({ pendingFocus: undefined, generationFocusNodeIds: [], deferredFocusByScene: {} })
++  })
++
++  it('结果集消费后视口按并集居中(成员并集中心映射 shell 中心,scale 保持)', () => {
++    renderResults([resultNode('r1', { x: 5000 }), resultNode('r2', { x: 5400 })])
++    const before = api.viewportRef.current
++
++    requestResult(['r1', 'r2'])
++
++    // 集合并集 {x:5000, y:0, width:720, height:320} 中心 (5360,160) 映射 shell 中心。
++    const after = api.viewportRef.current
++    expect(after).not.toEqual(before)
++    expect(after.x).toBeCloseTo(500 - 5360)
++    expect(after.y).toBeCloseTo(400 - 160)
++    expect(after.scale).toBe(before.scale)
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++  })
++
++  it('成员中已删除/隐藏节点剪除后再消费,只按存活成员并集居中', () => {
++    renderResults([resultNode('r1', { x: 5000 }), resultNode('r2', { x: 5400, hidden: true })])
++    const before = api.viewportRef.current
++
++    // r2 隐藏(删除同理:不在节点表)→ 只按 r1 取并集 {5000,0,320,320}。
++    requestResult(['r1', 'r2'])
++
++    const after = api.viewportRef.current
++    expect(after.x).toBeCloseTo(500 - 5160)
++    expect(after.y).toBeCloseTo(400 - 160)
++    expect(after.scale).toBe(before.scale)
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++  })
++
++  it('成员全部缺失 → 请求作废、清除且镜头不动', () => {
++    renderResults([resultNode('r1', { x: 5000 })])
++    const before = api.viewportRef.current
++
++    requestResult(['gone-1', 'gone-2'])
++
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++    expect(api.viewportRef.current).toEqual(before)
++  })
++
++  it('两批重叠完成(消费前 edit 与 beside 先后 commit)→ union 合并一次消费全部成员', () => {
++    renderResults([resultNode('a', { x: 5000 }), resultNode('b', { x: 5400 }), resultNode('c', { x: 5800 })])
++    const before = api.viewportRef.current
++
++    // 同一 act 内先后写两批请求(未消费):store 层 exact-union 合并 → [a,b,c]。
++    act(() => {
++      useCameraFocusStore.getState().requestGenerationResultFocus(['a'], {
++        triggerNodeId: 'a',
++        targetSceneId: SCENE,
++        activeSceneId: SCENE,
++        source: 'generation-result',
++      })
++      useCameraFocusStore.getState().requestGenerationResultFocus(['b', 'c'], {
++        triggerNodeId: 'b',
++        targetSceneId: SCENE,
++        activeSceneId: SCENE,
++        source: 'generation-result',
++      })
++    })
++
++    // 并集 {x:5000, y:0, width:1120, height:320} 中心 (5560,160) 一次消费。宽度
++    // 1120 > 840(1000-80×2 padding 区)在 scale 1 装不下 → 缩到
++    // min(840/1120, 640/320)=0.75,按缩放后中心映射 shell 中心。
++    const after = api.viewportRef.current
++    expect(after).not.toEqual(before)
++    expect(after.scale).toBeCloseTo(0.75)
++    expect(after.x).toBeCloseTo(500 - 5560 * 0.75)
++    expect(after.y).toBeCloseTo(400 - 160 * 0.75)
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++  })
++})
++
++// ── p2-sc3:跨场景消费窗口(挂载层)──
++// A 场景请求已写入但尚未消费 → 切到 B → B 的 hook 不消费该请求、不剪 A 的成员;
++// B 自己发起的请求只剪 B 场景成员;切回 A 后 A 成员完整、镜头跟随恢复。
++describe('useViewport — 跨场景消费窗口(p2-sc3)', () => {
++  // 与 generation-set describe 内的 slotNode 同构(该 helper 作用域限于其 describe)。
++  const slotNode = (
++    id: string,
++    aiWorkflowStatus: NonNullable<MivoCanvasNode['aiWorkflow']>['status'],
++    over: Partial<MivoCanvasNode> = {},
++  ): MivoCanvasNode => ({
++    id,
++    type: 'ai-slot',
++    title: 't',
++    x: 0,
++    y: 0,
++    width: 320,
++    height: 320,
++    status: 'ready',
++    aiWorkflow: { kind: 'slot', status: aiWorkflowStatus },
++    ...over,
++  })
++
++  function SceneHarness({ sceneId, nodes }: { sceneId: string; nodes: MivoCanvasNode[] }) {
++    const shellRef = useRef<HTMLDivElement | null>(null)
++    const hook = useViewport({
++      shellRef,
++      sceneId,
++      nodes,
++      selectedNodes: [],
++      onCloseContextMenu: () => undefined,
++    })
++    useEffect(() => {
++      api = hook
++    })
++    return (
++      <div
++        className="canvas-shell"
++        ref={(el) => {
++          shellRef.current = el
++          if (el) {
++            shellEl = el
++            el.getBoundingClientRect = () => shellRect
++          }
++        }}
++      >
++        <div className="dom-canvas-layer" />
++      </div>
++    )
++  }
++
++  const renderScene = (sceneId: string, nodes: MivoCanvasNode[]) =>
++    act(() => {
++      root.render(<SceneHarness sceneId={sceneId} nodes={nodes} />)
++    })
++
++  const requestSetFor = (triggerNodeId: string, targetSceneId: string) =>
++    act(() => {
++      useCameraFocusStore.getState().requestGenerationSetFocus(triggerNodeId, {
++        targetSceneId,
++        activeSceneId: targetSceneId,
++      })
++    })
++
++  // generation-result 请求的 helper(与 p0-sc5 describe 内 requestResult 同构,
++  // 只是 targetSceneId 可显式指定以模拟跨场景)。
++  const resultNode = (id: string, over: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++    id,
++    type: 'image',
++    title: 'r',
++    x: 0,
++    y: 0,
++    width: 320,
++    height: 320,
++    status: 'ready',
++    assetUrl: '/a.png',
++    ...over,
++  })
++
++  const requestResultFor = (memberNodeIds: string[], targetSceneId: string) =>
++    act(() => {
++      useCameraFocusStore.getState().requestGenerationResultFocus(memberNodeIds, {
++        triggerNodeId: memberNodeIds[0] ?? '',
++        targetSceneId,
++        activeSceneId: targetSceneId,
++        source: 'generation-result',
++      })
++    })
++
++  // r2:node 请求 helper(交错序列测试用;targetSceneId 可显式指定以模拟跨场景)。
++  const requestNodeFor = (nodeId: string, targetSceneId: string) =>
++    act(() => {
++      useCameraFocusStore.getState().requestNodeFocus(nodeId, {
++        targetSceneId,
++        activeSceneId: targetSceneId,
++        source: 'chat-result',
++        mode: 'center',
++      })
++    })
++
++  beforeEach(() => {
++    useCameraFocusStore.setState({ pendingFocus: undefined, generationFocusNodeIds: [], deferredFocusByScene: {} })
++  })
++
++  it('A 场景请求已写入尚未消费→B 的 hook 不消费该请求、不剪 A 的成员、镜头不动', () => {
++    renderScene('scene-b', [slotNode('b1', 'generating', { x: 6000 })])
++    const before = api.viewportRef.current
++
++    // A 场景发起请求(写侧 activeSceneId===targetSceneId 通过守卫)。
++    requestSetFor('a1', 'scene-a')
++
++    // B 的 hook 场景不匹配 → defer:不 clear、不剪注册表、镜头不动。
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({ kind: 'generation-set', triggerNodeId: 'a1' })
++    expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual([
++      { nodeId: 'a1', targetSceneId: 'scene-a' },
++    ])
++    expect(api.viewportRef.current).toEqual(before)
++  })
++
++  it('B 自己发起的请求只剪 B 场景成员;A 成员完整保留', () => {
++    renderScene('scene-b', [slotNode('b1', 'generating', { x: 6000 })])
++    // A 场景请求先写入(未消费,由上一用例证 defer)。
++    requestSetFor('a1', 'scene-a')
++    requestSetFor('b1', 'scene-b')
++
++    // B 请求同场景 → 消费:视口按 b1 居中;注册表只剪 B 场景成员(b1 仍 generating → 保留),
++    // A 场景成员(a1)不被触碰。
++    const after = api.viewportRef.current
++    expect(after.x).toBeCloseTo(500 - 6160)
++    expect(after.y).toBeCloseTo(400 - 160)
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++    expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual([
++      { nodeId: 'a1', targetSceneId: 'scene-a' },
++      { nodeId: 'b1', targetSceneId: 'scene-b' },
++    ])
++  })
++
++  it('切回 A 后 A 成员完整、镜头跟随恢复', () => {
++    // 先在 B 场景消费过(留下 a1 + b1 两条注册项)。
++    renderScene('scene-b', [slotNode('b1', 'generating', { x: 6000 })])
++    requestSetFor('a1', 'scene-a')
++    requestSetFor('b1', 'scene-b')
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++    expect(useCameraFocusStore.getState().generationFocusNodeIds).toHaveLength(2)
++
++    // 切回 A 场景:a1 仍是 generating 且注册项完整 → 新请求照常消费居中。
++    renderScene('scene-a', [slotNode('a1', 'generating', { x: 5000 })])
++    requestSetFor('a1', 'scene-a')
++
++    const after = api.viewportRef.current
++    expect(after.x).toBeCloseTo(500 - 5160)
++    expect(after.y).toBeCloseTo(400 - 160)
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++    expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual([
++      { nodeId: 'a1', targetSceneId: 'scene-a' },
++      { nodeId: 'b1', targetSceneId: 'scene-b' },
++    ])
++  })
++
++  it('A 场景 deferred 请求不被 B 场景请求覆盖:切回 A 后 A 的请求仍可被消费', () => {
++    // B 场景先挂载(模拟用户已切到 B)。
++    renderScene('scene-b', [resultNode('b1', { x: 6000 })])
++    const before = api.viewportRef.current
++
++    // 用户还在 A 场景时发出的结果集请求(targetSceneId='scene-a',写侧守卫通过)。
++    requestResultFor(['a1'], 'scene-a')
++    // B 的 hook 场景不匹配 → defer:不 clear、镜头不动。
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({
++      kind: 'generation-result',
++      targetSceneId: 'scene-a',
++    })
++    expect(api.viewportRef.current).toEqual(before)
++
++    // 切到 B 后 B 产生自己的结果请求:同场景 → B 消费并清空。
++    requestResultFor(['b1'], 'scene-b')
++    expect(api.viewportRef.current.x).toBeCloseTo(500 - 6160)
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++
++    // 切回 A:若 A 的 deferred 请求未被 B 的请求覆盖,应仍可被 A 的 hook 消费
++    // → 镜头按 A 成员集(单成员 a1)居中。
++    renderScene('scene-a', [resultNode('a1', { x: 5000 })])
++    const after = api.viewportRef.current
++    expect(after.x).toBeCloseTo(500 - 5160)
++    expect(after.y).toBeCloseTo(400 - 160)
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++  })
++
++  // ── r2 对称修复:kind:'node' 写侧同样压池、消费侧同样按场景判据 defer ──
++  // 上一轮只有 gen-set/gen-result 两写侧有 park 分支;node 两写侧裸 set 覆盖且
++  // 不入池,B 场景 hook 还会按「node missing」丢弃 A 的 node 请求。T7-T9 对
++  // 上一轮代码红。
++  it('T7:A 发 gen-result → 切 B → B 发 node → 切回 A:A 的 deferred 请求仍可被消费', () => {
++    renderScene('scene-b', [slotNode('b1', 'generating', { x: 6000 })])
++    // A 场景结果请求写入(未消费;B hook 场景不匹配 → defer)。
++    requestResultFor(['a1'], 'scene-a')
++    // B 发 node 请求:B 同场景 → B hook 消费(镜头按 b1 center 居中)。
++    requestNodeFor('b1', 'scene-b')
++    expect(api.viewportRef.current.x).toBeCloseTo(500 - 6160)
++    expect(api.viewportRef.current.y).toBeCloseTo(400 - 160)
++    // A 的请求已被压入池,不被 B 的 node 覆盖。
++    expect(useCameraFocusStore.getState().deferredFocusByScene['scene-a']).toBeDefined()
++    // 切回 A:deferred 请求被提升并消费,镜头按 a1 居中。
++    renderScene('scene-a', [resultNode('a1', { x: 5000 })])
++    const after = api.viewportRef.current
++    expect(after.x).toBeCloseTo(500 - 5160)
++    expect(after.y).toBeCloseTo(400 - 160)
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++  })
++
++  it('T8:A 发 node → 切 B → B 发 gen-result → 切回 A:A 的 node 请求仍可被消费', () => {
++    renderScene('scene-b', [resultNode('b1', { x: 6000 })])
++    // A 场景 node 请求写入(未消费;B hook 场景不匹配 → defer)。
++    requestNodeFor('a1', 'scene-a')
++    // B 发 gen-result:B 同场景 → B hook 消费(镜头按 b1 居中)。
++    requestResultFor(['b1'], 'scene-b')
++    expect(api.viewportRef.current.x).toBeCloseTo(500 - 6160)
++    // A 的 node 请求已入池,不被 B 的 gen-result 覆盖。
++    expect(useCameraFocusStore.getState().deferredFocusByScene['scene-a']).toMatchObject({
++      kind: 'node',
++      nodeId: 'a1',
++      targetSceneId: 'scene-a',
++    })
++    // 切回 A:deferred node 请求被提升并消费,镜头按 a1 center 居中。
++    renderScene('scene-a', [resultNode('a1', { x: 5000 })])
++    const after = api.viewportRef.current
++    expect(after.x).toBeCloseTo(500 - 5160)
++    expect(after.y).toBeCloseTo(400 - 160)
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++  })
++
++  it('T9:B hook 对 A 场景的 node 请求 defer(不消费、不 clear、镜头不动)', () => {
++    renderScene('scene-b', [slotNode('b1', 'generating', { x: 6000 })])
++    const before = api.viewportRef.current
++    // A 场景 node 请求写入(B 场景 hook 挂载中)。
++    requestNodeFor('a1', 'scene-a')
++    // B hook 场景不匹配 → defer:pendingFocus 保留、不 clear、镜头不动。
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({ kind: 'node', nodeId: 'a1' })
++    expect(api.viewportRef.current).toEqual(before)
++  })
++})
+diff --git a/src/canvas/useViewport.ts b/src/canvas/useViewport.ts
+index 8db8b40d..754c0f0c 100644
+--- a/src/canvas/useViewport.ts
++++ b/src/canvas/useViewport.ts
+@@ -28,6 +28,7 @@ import { useCameraFocusStore } from '../store/cameraFocusStore'
+ import { debugLogger } from '../store/debugLogStore'
+ import {
+   deriveGenerationFocusSet,
++  deriveResultFocusSet,
+   viewportToCenterBounds,
+   viewportToRevealBounds,
+   viewportToRevealGenerationSet,
+@@ -186,16 +187,83 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
+     }
+   }, [shellRef])
+ 
+-  // 生图占位符镜头跟随:prepareChatSlot / prepareMaskEditPlaceholder 建占位后发出
+-  // 单节点请求(kind:'node'),agentGenerateImage 建占位后发出并发生图集合请求
+-  // (kind:'generation-set'),这里消费。已完全可见不动;用户正在拖拽平移中跳过
+-  // (不打断操作,只丢当次请求);其余平移到居中,集合装不下时缩小 scale
+-  // (p2-sc1)。跨场景请求在 cameraFocusStore 写侧已拦下。
++  // 生图占位符/结果镜头跟随:prepareChatSlot / prepareMaskEditPlaceholder 建占位后
++  // 发出单节点请求(kind:'node'),agentGenerateImage 建占位后发出并发生图集合请求
++  // (kind:'generation-set'),结果 commit 落地后由四个出图路径发出显式成员集请求
++  // (kind:'generation-result'),这里统一消费。两分支几何语义:单节点 reveal 保留
++  // 「已完全可见不动」;集合与结果必居中(完全可见也平移居中;装得下保 scale 只
++  // 平移,装不下缩小 scale,p2-sc1)。用户正在拖拽平移中跳过(不打断操作,只丢
++  // 当次请求)。跨场景请求在 cameraFocusStore 写侧已拦下;写侧拦下与消费之间的
++  // 切场景窗口(请求已写入尚未消费)由本 effect 的场景判据兜底:请求目标场景
++  // !== 本 hook 场景时不消费、不 clear、不剪注册表(p2-sc3),切回目标场景后由
++  // 该场景的 hook 照常消费。
+   const pendingFocus = useCameraFocusStore((state) => state.pendingFocus)
+   useEffect(() => {
+-    if (!pendingFocus) return
++    // p2-sc3 兜底:写侧跨场景守卫把本场景被压的 deferred 请求存进
++    // deferredFocusByScene,这里在 pendingFocus 空时按本场景键提升为当前请求,由
++    // 下方分支照常消费——切回目标场景后,deferred 请求不因单槽被其他场景请求
++    // 覆盖而丢失。提升后 pendingFocus 变化会重跑本 effect,自然进入消费路径。
++    if (!pendingFocus) {
++      const parked = useCameraFocusStore.getState().deferredFocusByScene[sceneId]
++      if (parked) {
++        debugLogger.log('Camera', `Auto-focus lifted (deferred slot): ${parked.kind} for ${sceneId}`)
++        useCameraFocusStore.setState((state) => {
++          const rest = { ...state.deferredFocusByScene }
++          delete rest[sceneId]
++          return { pendingFocus: parked, deferredFocusByScene: rest }
++        })
++      }
++      return
++    }
+     const clearPlaceholderFocus = useCameraFocusStore.getState().clearPlaceholderFocus
+ 
++    // p2-sc3:消费侧场景判据唯一来源 = 请求携带的 targetSceneId(对照本 hook 的
++    // sceneId),不用 active scene 兜底。场景不匹配 → 本 hook 不消费(留给目标
++    // 场景的 hook),不 clear、不剪注册表。r2 对称修复:kind:'node' 请求同样携带
++    // targetSceneId(写侧 context 已传入),统一按场景判据 defer,不再按 kind
++    // 绕过——B 场景 hook 不得消费/丢弃 A 场景的 node 请求。
++    if (pendingFocus.targetSceneId !== sceneId) {
++      debugLogger.log(
++        'Camera',
++        `Auto-focus deferred (scene window): ${pendingFocus.kind} targets ${pendingFocus.targetSceneId}, hook on ${sceneId}`,
++      )
++      return
++    }
++
++    if (pendingFocus.kind === 'generation-result') {
++      // p0-sc5:显式成员集消费——已删除/隐藏成员剪除后再取并集 bounds,交给与
++      // generation-set 同一份纯函数(出图必居中:装得下保 scale 只平移,装不下缩
++      // 到 padding 装下并 clampViewportScale)。成员全部缺失 → 请求作废、清除且
++      // 镜头不动。
++      const rect = shellRef.current?.getBoundingClientRect()
++      if (!rect) {
++        debugLogger.warn('Camera', `Auto-focus skipped (no shell rect): ${pendingFocus.triggerNodeId}`)
++        clearPlaceholderFocus()
++        return
++      }
++      if (panRef.current) {
++        debugLogger.log('Camera', `Auto-focus skipped (user panning): ${pendingFocus.triggerNodeId}`)
++        clearPlaceholderFocus()
++        return
++      }
++      const { memberIds, bounds } = deriveResultFocusSet(nodes, pendingFocus.memberNodeIds)
++      if (!bounds) {
++        debugLogger.warn('Camera', `Auto-focus skipped (result set empty): ${pendingFocus.triggerNodeId}`)
++        clearPlaceholderFocus()
++        return
++      }
++      const shell = { width: rect.width, height: rect.height }
++      const nextViewport = viewportToRevealGenerationSet(viewportRef.current, shell, bounds)
++      if (!nextViewport) {
++        debugLogger.log('Camera', `Auto-focus skipped (no shell size): ${pendingFocus.triggerNodeId}`)
++      } else {
++        commitViewport(nextViewport)
++        debugLogger.log('Camera', `Auto-focus reveal result set (${memberIds.length}/${pendingFocus.memberNodeIds.length} members after pruning)`)
++      }
++      clearPlaceholderFocus()
++      return
++    }
++
+     if (pendingFocus.kind === 'generation-set') {
+       const rect = shellRef.current?.getBoundingClientRect()
+       if (!rect) {
+@@ -208,12 +276,17 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
+         clearPlaceholderFocus()
+         return
+       }
+-      // p1-sc2:从注册表派生集合成员(可见 generating 占位 ∪ triggerNodeId),交给
+-      // boundsForNodes 按实际几何取 union;消费后按过滤结果回写/剪枝注册表。
++      // p1-sc2:从注册表派生集合成员(目标场景同场景的可见 generating 占位 ∪
++      // triggerNodeId),交给 boundsForNodes 按实际几何取 union;消费后按过滤结果
++      // 回写/剪枝注册表——剪枝只作用于同场景成员,不把其他场景的 generating
++      // 成员移出注册表(p2-sc1/p2-sc3)。
+       const { generationFocusNodeIds } = useCameraFocusStore.getState()
+-      const { bounds } = deriveGenerationFocusSet(nodes, generationFocusNodeIds, pendingFocus.triggerNodeId)
++      const { bounds } = deriveGenerationFocusSet(nodes, generationFocusNodeIds, pendingFocus.triggerNodeId, pendingFocus.targetSceneId)
++      const prunedIds = visibleGeneratingSlotIds(nodes, generationFocusNodeIds, pendingFocus.targetSceneId)
+       useCameraFocusStore.setState({
+-        generationFocusNodeIds: visibleGeneratingSlotIds(nodes, generationFocusNodeIds),
++        generationFocusNodeIds: generationFocusNodeIds.filter(
++          (entry) => entry.targetSceneId !== pendingFocus.targetSceneId || prunedIds.includes(entry.nodeId),
++        ),
+       })
+       if (!bounds) {
+         debugLogger.warn('Camera', `Auto-focus skipped (generation set empty): ${pendingFocus.triggerNodeId}`)
+@@ -223,7 +296,7 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
+       const shell = { width: rect.width, height: rect.height }
+       const nextViewport = viewportToRevealGenerationSet(viewportRef.current, shell, bounds)
+       if (!nextViewport) {
+-        debugLogger.log('Camera', `Auto-focus skipped (already visible): ${pendingFocus.triggerNodeId}`)
++        debugLogger.log('Camera', `Auto-focus skipped (no shell size): ${pendingFocus.triggerNodeId}`)
+       } else {
+         commitViewport(nextViewport)
+         debugLogger.log('Camera', `Auto-focus reveal generation set (${pendingFocus.triggerNodeId})`)
+@@ -259,7 +332,7 @@ export function useViewport({ shellRef, sceneId, nodes, selectedNodes, onCloseCo
+       debugLogger.log('Camera', `Auto-focus ${mode} ${pendingFocus.nodeId} (${pendingFocus.source})`)
+     }
+     clearPlaceholderFocus()
+-  }, [commitViewport, nodes, pendingFocus, shellRef])
++  }, [commitViewport, nodes, pendingFocus, sceneId, shellRef])
+ 
+   const screenToCanvas = useCallback(
+     (clientX: number, clientY: number, sourceViewport: Viewport = viewportRef.current) => {
+diff --git a/src/store/cameraFocusStore.test.ts b/src/store/cameraFocusStore.test.ts
+index d5141418..710f5a18 100644
+--- a/src/store/cameraFocusStore.test.ts
++++ b/src/store/cameraFocusStore.test.ts
+@@ -1,8 +1,11 @@
+ import { beforeEach, describe, expect, it } from 'vitest'
+ import { useCameraFocusStore } from './cameraFocusStore'
++import type { CameraFocusRequest } from './cameraFocusStore'
++import { useDebugLogStore } from './debugLogStore'
+ 
+ beforeEach(() => {
+-  useCameraFocusStore.setState({ pendingFocus: undefined, generationFocusNodeIds: [] })
++  useCameraFocusStore.setState({ pendingFocus: undefined, generationFocusNodeIds: [], deferredFocusByScene: {} })
++  useDebugLogStore.getState().clear()
+ })
+ 
+ describe('cameraFocusStore', () => {
+@@ -16,6 +19,7 @@ describe('cameraFocusStore', () => {
+       kind: 'node',
+       nodeId: 'slot-1',
+       source: 'chat-slot',
++      targetSceneId: 'c1',
+     })
+   })
+ 
+@@ -31,6 +35,7 @@ describe('cameraFocusStore', () => {
+       nodeId: 'node-1',
+       source: 'chat-result',
+       mode: 'center',
++      targetSceneId: 'c1',
+     })
+   })
+ 
+@@ -86,10 +91,11 @@ describe('cameraFocusStore', () => {
+     expect(useCameraFocusStore.getState().pendingFocus).toEqual({
+       kind: 'generation-set',
+       triggerNodeId: 'slot-1',
++      targetSceneId: 'c1',
+       source: 'agent-generate',
+       mode: 'reveal',
+     })
+-    expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual(['slot-1'])
++    expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual([{ nodeId: 'slot-1', targetSceneId: 'c1' }])
+   })
+ 
+   it('requestGenerationSetFocus re-registration dedupes (registry holds unique members)', () => {
+@@ -100,7 +106,7 @@ describe('cameraFocusStore', () => {
+       })
+     request()
+     request()
+-    expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual(['slot-1'])
++    expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual([{ nodeId: 'slot-1', targetSceneId: 'c1' }])
+     // 同一 trigger 重复请求仍换新对象引用(retry 复用 slot 也能重新驱动 effect)。
+     const first = useCameraFocusStore.getState().pendingFocus
+     request()
+@@ -117,3 +123,475 @@ describe('cameraFocusStore', () => {
+     expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual([])
+   })
+ })
++
++// ── p0-sc1:显式成员集结果焦点请求(kind:'generation-result')──
++describe('requestGenerationResultFocus(p0-sc1 显式成员集)', () => {
++  it('记录全部成员 id 与 source=generation-result(不经注册表、不改注册表)', () => {
++    useCameraFocusStore.getState().requestGenerationResultFocus(['r1', 'r2', 'r3'], {
++      triggerNodeId: 'r1',
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++      source: 'generation-result',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toEqual({
++      kind: 'generation-result',
++      memberNodeIds: ['r1', 'r2', 'r3'],
++      triggerNodeId: 'r1',
++      targetSceneId: 'c1',
++      source: 'generation-result',
++      mode: 'reveal',
++    })
++    // 成员集显式携带:注册表不被触碰。
++    expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual([])
++  })
++
++  it('跨场景守卫:targetSceneId!==activeSceneId 时请求被跳过、pendingFocus 不变', () => {
++    useCameraFocusStore.getState().requestGenerationResultFocus(['r1'], {
++      triggerNodeId: 'r1',
++      targetSceneId: 'c2',
++      activeSceneId: 'c1',
++      source: 'generation-result',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++    // 已有一个 pending 请求时跨场景请求同样不覆盖。
++    useCameraFocusStore.getState().requestGenerationResultFocus(['r1'], {
++      triggerNodeId: 'r1',
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++      source: 'generation-result',
++    })
++    const before = useCameraFocusStore.getState().pendingFocus
++    useCameraFocusStore.getState().requestGenerationResultFocus(['r2'], {
++      triggerNodeId: 'r2',
++      targetSceneId: 'c2',
++      activeSceneId: 'c1',
++      source: 'generation-result',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toBe(before)
++  })
++
++  it('并发合并:消费前连续两次结果请求按 node id exact-union 去重合并,不 latest-wins', () => {
++    useCameraFocusStore.getState().requestGenerationResultFocus(['a'], {
++      triggerNodeId: 'a',
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++      source: 'generation-result',
++    })
++    // 第二批 edit=[a] beside=[b,c] 先后到达(未消费):union 去重 → [a,b,c]。
++    useCameraFocusStore.getState().requestGenerationResultFocus(['a', 'b'], {
++      triggerNodeId: 'a',
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++      source: 'generation-result',
++    })
++    useCameraFocusStore.getState().requestGenerationResultFocus(['c'], {
++      triggerNodeId: 'c',
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++      source: 'generation-result',
++    })
++    const pending = useCameraFocusStore.getState().pendingFocus
++    if (!pending || pending.kind !== 'generation-result') {
++      throw new Error(`expected generation-result focus request, got ${pending?.kind}`)
++    }
++    expect(pending.memberNodeIds).toEqual(['a', 'b', 'c'])
++  })
++
++  it('与既有 node / generation-set 请求之间维持后写覆盖语义', () => {
++    // generation-result 覆盖未消费的 node 请求。
++    useCameraFocusStore.getState().requestPlaceholderFocus('slot-1', {
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++      source: 'mask-edit',
++    })
++    useCameraFocusStore.getState().requestGenerationResultFocus(['r1'], {
++      triggerNodeId: 'r1',
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++      source: 'generation-result',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({ kind: 'generation-result' })
++    // generation-set 覆盖未消费的 generation-result。
++    useCameraFocusStore.getState().requestGenerationSetFocus('slot-2', {
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({ kind: 'generation-set', triggerNodeId: 'slot-2' })
++  })
++
++  it('空集 no-op:memberNodeIds=[] 不写 pendingFocus、不崩溃', () => {
++    useCameraFocusStore.getState().requestGenerationResultFocus([], {
++      triggerNodeId: 'r1',
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++      source: 'generation-result',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++    // 已有 pending 时空集也不覆盖。
++    useCameraFocusStore.getState().requestGenerationResultFocus(['r1'], {
++      triggerNodeId: 'r1',
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++      source: 'generation-result',
++    })
++    const before = useCameraFocusStore.getState().pendingFocus
++    useCameraFocusStore.getState().requestGenerationResultFocus([], {
++      triggerNodeId: 'r2',
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++      source: 'generation-result',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toBe(before)
++  })
++})
++
++// ── p2-sc1:注册表场景键 ──
++describe('generationFocusNodeIds 场景键(p2-sc1)', () => {
++  it('注册项携带 targetSceneId(切场景不把他场景成员移出注册表)', () => {
++    useCameraFocusStore.getState().requestGenerationSetFocus('a1', {
++      targetSceneId: 'scene-a',
++      activeSceneId: 'scene-a',
++    })
++    useCameraFocusStore.getState().requestGenerationSetFocus('a2', {
++      targetSceneId: 'scene-a',
++      activeSceneId: 'scene-a',
++    })
++    // 切到 B 后,B 的注册请求不触碰 A 的成员。
++    useCameraFocusStore.getState().requestGenerationSetFocus('b1', {
++      targetSceneId: 'scene-b',
++      activeSceneId: 'scene-b',
++    })
++    expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual([
++      { nodeId: 'a1', targetSceneId: 'scene-a' },
++      { nodeId: 'a2', targetSceneId: 'scene-a' },
++      { nodeId: 'b1', targetSceneId: 'scene-b' },
++    ])
++  })
++
++  it('同场景注册/重复注册去重与第一批语义一致', () => {
++    useCameraFocusStore.getState().requestGenerationSetFocus('s1', {
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++    })
++    useCameraFocusStore.getState().requestGenerationSetFocus('s1', {
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++    })
++    useCameraFocusStore.getState().requestGenerationSetFocus('s2', {
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++    })
++    expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual([
++      { nodeId: 's1', targetSceneId: 'c1' },
++      { nodeId: 's2', targetSceneId: 'c1' },
++    ])
++  })
++
++  it('同 nodeId 跨场景注册互不遮蔽:复合键 {nodeId,targetSceneId} 各自独立成条', () => {
++    // A 场景先注册 nodeId=X(activeSceneId===targetSceneId 通过写侧守卫)。
++    useCameraFocusStore.getState().requestGenerationSetFocus('X', {
++      targetSceneId: 'scene-a',
++      activeSceneId: 'scene-a',
++    })
++    // 切到 B 场景后,同一个 nodeId=X 由 B 场景自己的占位再次注册。
++    useCameraFocusStore.getState().requestGenerationSetFocus('X', {
++      targetSceneId: 'scene-b',
++      activeSceneId: 'scene-b',
++    })
++    // 条目是复合键:同 nodeId 不同 targetSceneId 是两条独立成员,各自不得被去重遮蔽
++    // (对齐本仓 assetStore attachRef/detachRef 的 composite-key 契约)。
++    expect(useCameraFocusStore.getState().generationFocusNodeIds).toEqual([
++      { nodeId: 'X', targetSceneId: 'scene-a' },
++      { nodeId: 'X', targetSceneId: 'scene-b' },
++    ])
++  })
++
++  it('跨场景写入不覆盖未消费请求:既有请求压入 deferred 池、清除当前请求不触碰池', () => {
++    // A 场景请求先写入(未消费;消费侧 defer 场景窗口)。
++    useCameraFocusStore.getState().requestGenerationResultFocus(['a1'], {
++      triggerNodeId: 'a1',
++      targetSceneId: 'scene-a',
++      activeSceneId: 'scene-a',
++      source: 'generation-result',
++    })
++    // B 场景请求写入:不静默覆盖 A,而是把 A 按 targetSceneId 键压入 deferred 池。
++    useCameraFocusStore.getState().requestGenerationResultFocus(['b1'], {
++      triggerNodeId: 'b1',
++      targetSceneId: 'scene-b',
++      activeSceneId: 'scene-b',
++      source: 'generation-result',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({
++      kind: 'generation-result',
++      targetSceneId: 'scene-b',
++    })
++    expect(useCameraFocusStore.getState().deferredFocusByScene).toEqual({
++      'scene-a': expect.objectContaining({ kind: 'generation-result', targetSceneId: 'scene-a' }),
++    })
++    // 消费 B 后 clear 只清当前请求,池里 A 的 deferred 请求原样保留等待其场景 hook 提升。
++    useCameraFocusStore.getState().clearPlaceholderFocus()
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++    expect(useCameraFocusStore.getState().deferredFocusByScene['scene-a']).toBeDefined()
++  })
++})
++
++// ── r2:跨场景 deferred 对称修复(六件套第 6 步可鉴别交错测试)──
++// 上一轮只给 gen-set/gen-result 两写侧加了 park 分支,node 两写侧裸 set 覆盖且不入池。
++// 以下 T1-T3 对上一轮代码红;T4 仅对判据反转(变异 B)红;T5 仅对池作废缺失(变异 C)红;
++// T6 对池上限/淘汰缺失(变异 D)红;T9 对消费侧 kind 绕过回退(变异 E)红。
++describe('跨场景 deferred 对称修复(r2)', () => {
++  it('T1:A 发 gen-result → B 发 placeholder(node) → A 的请求入池不被覆盖', () => {
++    useCameraFocusStore.getState().requestGenerationResultFocus(['a1'], {
++      triggerNodeId: 'a1',
++      targetSceneId: 'scene-a',
++      activeSceneId: 'scene-a',
++      source: 'generation-result',
++    })
++    useCameraFocusStore.getState().requestPlaceholderFocus('b1', {
++      targetSceneId: 'scene-b',
++      activeSceneId: 'scene-b',
++      source: 'chat-slot',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({ kind: 'node', nodeId: 'b1' })
++    expect(useCameraFocusStore.getState().deferredFocusByScene).toEqual({
++      'scene-a': expect.objectContaining({ kind: 'generation-result', targetSceneId: 'scene-a' }),
++    })
++  })
++
++  it('T2:A 发 node → B 发 gen-result → A 的 node 请求入池不被覆盖', () => {
++    useCameraFocusStore.getState().requestNodeFocus('a1', {
++      targetSceneId: 'scene-a',
++      activeSceneId: 'scene-a',
++      source: 'chat-result',
++      mode: 'center',
++    })
++    useCameraFocusStore.getState().requestGenerationResultFocus(['b1'], {
++      triggerNodeId: 'b1',
++      targetSceneId: 'scene-b',
++      activeSceneId: 'scene-b',
++      source: 'generation-result',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({ kind: 'generation-result', targetSceneId: 'scene-b' })
++    expect(useCameraFocusStore.getState().deferredFocusByScene).toEqual({
++      'scene-a': expect.objectContaining({ kind: 'node', nodeId: 'a1', targetSceneId: 'scene-a' }),
++    })
++  })
++
++  it('T3:A 发 node → B 发 node → A 的 node 请求入池(latest-wins per scene)', () => {
++    useCameraFocusStore.getState().requestNodeFocus('a1', {
++      targetSceneId: 'scene-a',
++      activeSceneId: 'scene-a',
++      source: 'chat-result',
++      mode: 'center',
++    })
++    useCameraFocusStore.getState().requestNodeFocus('b1', {
++      targetSceneId: 'scene-b',
++      activeSceneId: 'scene-b',
++      source: 'chat-result',
++      mode: 'center',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({ kind: 'node', nodeId: 'b1' })
++    expect(useCameraFocusStore.getState().deferredFocusByScene).toEqual({
++      'scene-a': expect.objectContaining({ kind: 'node', nodeId: 'a1', targetSceneId: 'scene-a' }),
++    })
++  })
++
++  it('T4:同场景 node 覆盖 node 不压池(维持后写覆盖语义)', () => {
++    useCameraFocusStore.getState().requestNodeFocus('a1', {
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++      source: 'chat-result',
++      mode: 'center',
++    })
++    useCameraFocusStore.getState().requestNodeFocus('a2', {
++      targetSceneId: 'c1',
++      activeSceneId: 'c1',
++      source: 'chat-result',
++      mode: 'center',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({ kind: 'node', nodeId: 'a2' })
++    expect(useCameraFocusStore.getState().deferredFocusByScene).toEqual({})
++  })
++
++  it('T5:池有本场景旧条目,pending 空时本场景写入 → 旧条目作废(同场景最新者胜)', () => {
++    // a1 写入后被 b1 写入压入池(key='scene-a');clear 模拟本场景消费完成。
++    useCameraFocusStore.getState().requestGenerationResultFocus(['a1'], {
++      triggerNodeId: 'a1',
++      targetSceneId: 'scene-a',
++      activeSceneId: 'scene-a',
++      source: 'generation-result',
++    })
++    useCameraFocusStore.getState().requestGenerationResultFocus(['b1'], {
++      triggerNodeId: 'b1',
++      targetSceneId: 'scene-b',
++      activeSceneId: 'scene-b',
++      source: 'generation-result',
++    })
++    useCameraFocusStore.getState().clearPlaceholderFocus()
++    expect(useCameraFocusStore.getState().deferredFocusByScene['scene-a']).toBeDefined()
++    // A 场景新写入:同场景不压池;池内 scene-a 旧条目作废(最新者胜,防陈旧提升回跳)。
++    useCameraFocusStore.getState().requestGenerationResultFocus(['a2'], {
++      triggerNodeId: 'a2',
++      targetSceneId: 'scene-a',
++      activeSceneId: 'scene-a',
++      source: 'generation-result',
++    })
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({
++      kind: 'generation-result',
++      memberNodeIds: ['a2'],
++      targetSceneId: 'scene-a',
++    })
++    expect(useCameraFocusStore.getState().deferredFocusByScene['scene-a']).toBeUndefined()
++  })
++
++  // T6 升级(检查点后同族复发 → 升级阶梯②):容量上限/FIFO 已删除。池生命周期移交
++  // App 上层协调者 reconcileDeferredFocusScenes(liveSceneIds)。本测试改为证明
++  // 「live 场景请求绝不因容量被丢弃」——12 个 live 场景的 parked 请求全部保留
++  // (若恢复旧 cap=8/FIFO,池在 park 阶段就被截到 8 条,本断言必红)。
++  it('T6(升级):12 个不同场景连续 park → reconcile 后全部保留,池无容量上限(SC-1)', () => {
++    const ids = ['10', '2', '7', '1', '5', '3', '8', '4', '9', '0', '6', '11']
++    for (const id of ids) {
++      useCameraFocusStore.getState().requestGenerationResultFocus([`m${id}`], {
++        triggerNodeId: `t${id}`,
++        targetSceneId: id,
++        activeSceneId: id,
++        source: 'generation-result',
++      })
++    }
++    // 12 个场景全部 live(纯数字 id 乱序插入:任何依赖 Object.keys 插入序/数值序的
++    // 淘汰逻辑都会在这里丢条目或错配)。
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(ids)
++    const state = useCameraFocusStore.getState()
++    expect(state.deferredFocusByScene).toEqual({
++      '10': expect.objectContaining({ targetSceneId: '10', memberNodeIds: ['m10'] }),
++      '2': expect.objectContaining({ targetSceneId: '2', memberNodeIds: ['m2'] }),
++      '7': expect.objectContaining({ targetSceneId: '7', memberNodeIds: ['m7'] }),
++      '1': expect.objectContaining({ targetSceneId: '1', memberNodeIds: ['m1'] }),
++      '5': expect.objectContaining({ targetSceneId: '5', memberNodeIds: ['m5'] }),
++      '3': expect.objectContaining({ targetSceneId: '3', memberNodeIds: ['m3'] }),
++      '8': expect.objectContaining({ targetSceneId: '8', memberNodeIds: ['m8'] }),
++      '4': expect.objectContaining({ targetSceneId: '4', memberNodeIds: ['m4'] }),
++      '9': expect.objectContaining({ targetSceneId: '9', memberNodeIds: ['m9'] }),
++      '0': expect.objectContaining({ targetSceneId: '0', memberNodeIds: ['m0'] }),
++      '6': expect.objectContaining({ targetSceneId: '6', memberNodeIds: ['m6'] }),
++    })
++    // pending 是最新写入的 '11'(live,保留)。
++    expect(state.pendingFocus).toMatchObject({ targetSceneId: '11', memberNodeIds: ['m11'] })
++  })
++})
++
++// ── 检查点后同族复发 → 升级阶梯②:池生命周期移交上层协调者 ──
++// 原 CA-POOL-003 处置选「容量上限 8 + FIFO 淘汰」被判为破坏核心 invariant 的规避
++// (第 9 个不同场景进入时删除最旧请求,切回被淘汰场景无 pending/deferred 可提升)。
++// 升级阶梯②:删除 MAX_DEFERRED_SCENES/FIFO,新增唯一 transition
++// reconcileDeferredFocusScenes(liveSceneIds) —— 从池剪掉非 live 场景键,
++// pendingFocus 目标非 live 时显式清除;live 场景请求绝不因容量被丢弃。
++describe('reconcileDeferredFocusScenes(升级阶梯②)', () => {
++  it('SC-1:纯数字 sceneId 不影响保留——live [10,2,7] 全保留,不排序、不淘汰', () => {
++    useCameraFocusStore.getState().requestGenerationResultFocus(['a'], {
++      triggerNodeId: 'a',
++      targetSceneId: '10',
++      activeSceneId: '10',
++      source: 'generation-result',
++    })
++    useCameraFocusStore.getState().requestGenerationResultFocus(['b'], {
++      triggerNodeId: 'b',
++      targetSceneId: '2',
++      activeSceneId: '2',
++      source: 'generation-result',
++    })
++    useCameraFocusStore.getState().requestGenerationResultFocus(['c'], {
++      triggerNodeId: 'c',
++      targetSceneId: '7',
++      activeSceneId: '7',
++      source: 'generation-result',
++    })
++    // 第四个非 live 场景把前三条挤进池(pending 是最后写入的 '8')。
++    useCameraFocusStore.getState().requestGenerationResultFocus(['d'], {
++      triggerNodeId: 'd',
++      targetSceneId: '8',
++      activeSceneId: '8',
++      source: 'generation-result',
++    })
++    expect(Object.keys(useCameraFocusStore.getState().deferredFocusByScene).sort()).toEqual(['10', '2', '7'])
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(['10', '2', '7'])
++    const pool = useCameraFocusStore.getState().deferredFocusByScene
++    // 三条都保留;键集与插入集一致,不按数值排序成 [2,7,10](任何依赖 Object.keys
++    // 数值序/插入序的遍历都会在这里丢条目或错配)。
++    expect(pool['10']).toMatchObject({ targetSceneId: '10', memberNodeIds: ['a'] })
++    expect(pool['2']).toMatchObject({ targetSceneId: '2', memberNodeIds: ['b'] })
++    expect(pool['7']).toMatchObject({ targetSceneId: '7', memberNodeIds: ['c'] })
++    expect(Object.keys(pool).sort()).toEqual(['10', '2', '7'])
++    // 非 live 的 pending '8' 被显式清除。
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++  })
++
++  it('SC-2:删除/归档场景剪枝——live-a 保留,deleted-b/archived-c 被剪', () => {
++    const seedPool: Record<string, CameraFocusRequest> = {
++      'live-a': {
++        kind: 'generation-result',
++        memberNodeIds: ['ma'],
++        triggerNodeId: 'ta',
++        targetSceneId: 'live-a',
++        source: 'generation-result',
++        mode: 'reveal',
++      },
++      'deleted-b': {
++        kind: 'node',
++        nodeId: 'nb',
++        targetSceneId: 'deleted-b',
++        source: 'chat-slot',
++      },
++      'archived-c': {
++        kind: 'node',
++        nodeId: 'nc',
++        targetSceneId: 'archived-c',
++        source: 'chat-slot',
++      },
++    }
++    useCameraFocusStore.setState({ pendingFocus: undefined, deferredFocusByScene: seedPool })
++    useDebugLogStore.getState().clear()
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(['live-a'])
++    const state = useCameraFocusStore.getState()
++    expect(state.deferredFocusByScene).toEqual({
++      'live-a': expect.objectContaining({ targetSceneId: 'live-a', memberNodeIds: ['ma'] }),
++    })
++    // 清理写可诊断日志(剪枝可观察,不含 PII)。
++    const messages = useDebugLogStore.getState().entries.map((e) => e.message)
++    expect(messages.some((m) => m.includes('pruned') && m.includes('deleted-b'))).toBe(true)
++    expect(messages.some((m) => m.includes('pruned') && m.includes('archived-c'))).toBe(true)
++  })
++
++  it('SC-2:pendingFocus 目标场景非 live → 显式清除并写日志;目标 live → 原样保留', () => {
++    // 目标 live → 保留(同一对象引用,不被重建)。
++    useCameraFocusStore.setState({
++      pendingFocus: {
++        kind: 'node',
++        nodeId: 'n1',
++        targetSceneId: 'live-a',
++        source: 'chat-slot',
++      },
++      deferredFocusByScene: {},
++    })
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(['live-a'])
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({ nodeId: 'n1', targetSceneId: 'live-a' })
++
++    // 目标 deleted-b → 显式清除。
++    useCameraFocusStore.setState({
++      pendingFocus: {
++        kind: 'generation-result',
++        memberNodeIds: ['mz'],
++        triggerNodeId: 'tz',
++        targetSceneId: 'deleted-b',
++        source: 'generation-result',
++        mode: 'reveal',
++      },
++      deferredFocusByScene: {},
++    })
++    useDebugLogStore.getState().clear()
++    useCameraFocusStore.getState().reconcileDeferredFocusScenes(['live-a'])
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++    const messages = useDebugLogStore.getState().entries.map((e) => e.message)
++    expect(messages.some((m) => m.includes('cleared') && m.includes('deleted-b'))).toBe(true)
++  })
++})
+diff --git a/src/store/cameraFocusStore.ts b/src/store/cameraFocusStore.ts
+index 59fc5299..0b4ef459 100644
+--- a/src/store/cameraFocusStore.ts
++++ b/src/store/cameraFocusStore.ts
+@@ -1,39 +1,71 @@
+-// 生图占位符镜头跟随请求(独立小 store,仿 toastStore 模式,不并入 canvasStore)。
+-// 写侧:prepareChatSlot / prepareMaskEditPlaceholder 建占位后 request;
+-// agentGenerateImage 建占位后 requestGenerationSetFocus(并发生图集合);
++// 生图占位符/结果镜头跟随请求(独立小 store,仿 toastStore 模式,不并入 canvasStore)。
++// 写侧:
++// - prepareChatSlot / prepareMaskEditPlaceholder 建占位后 request(kind:'node');
++// - agentGenerateImage 建占位后 requestGenerationSetFocus(并发生图集合);
++// - 结果 commit 落画布后 requestGenerationResultFocus(kind:'generation-result',
++//   显式成员集,不经注册表、不看 aiWorkflow.status——结果节点 commit 时已是
++//   image/ready,generating 注册表判据对它恒假);
+ // 读侧:useViewport 的 auto-focus effect 消费后 clear。瞬态状态,不持久化。
+ // 跨场景契约(#95):任务落在非活跃场景时不切场景、不动镜头,只记 log。
+ import { create } from 'zustand'
+ import { debugLogger } from './debugLogStore'
+ 
+ /**
+- * 镜头请求判别联合(p1-sc1):
++ * 镜头请求判别联合(p1-sc1 / 本批新增结果集分支):
+  * - kind:'node' — 通用单节点 focus(ChatMessageList 的 chat-result、
+- *   MediaLightbox 的 lightbox-derive,以及单张 chat-slot/mask-edit);
++ *   MediaLightbox 的 lightbox-derive,以及单张 chat-slot/mask-edit 占位符);
+  * - kind:'generation-set' — agent 并发生图集合请求,只由 agentGenerateImage 经
+  *   requestGenerationSetFocus 发出;triggerNodeId 是触发本请求的占位符,集合其余
+- *   成员在 useViewport 消费侧从 generationFocusNodeIds 注册表派生。
++ *   成员在 useViewport 消费侧从 generationFocusNodeIds 注册表派生。请求内部携带
++ *   targetSceneId(p2-sc1:消费侧剪枝只作用于同场景成员,禁止 active-scene 兜底);
++ * - kind:'generation-result' — 结果集显式成员请求,由 generateVariations /
++ *   generateImageEdit / generateBesideNode / mask-edit 结果提交经
++ *   requestGenerationResultFocus 发出;memberNodeIds 是显式成员集(commit 产物,
++ *   不依赖注册表/aiWorkflow.status),消费侧按成员并集 bounds 出图必居中。
+  */
+ export type CameraFocusRequest =
+   | {
+       kind: 'node'
+       nodeId: string
++      /** r2 对称修复:node 请求同样携带目标场景(写侧 context 已有该值,落进请求对象),
++       *  参与跨场景 park 的池键与消费侧场景判据——invariant 未豁免任何 kind。 */
++      targetSceneId: string
+       source: string
+       mode?: 'reveal' | 'center'
+     }
+   | {
+       kind: 'generation-set'
+       triggerNodeId: string
++      /** p2-sc1:请求目标场景,消费侧场景判据的唯一来源。 */
++      targetSceneId: string
+       source: 'agent-generate'
+       mode: 'reveal'
+     }
++  | {
++      kind: 'generation-result'
++      memberNodeIds: string[]
++      triggerNodeId: string
++      /** p2-sc1:请求目标场景,消费侧场景判据的唯一来源。 */
++      targetSceneId: string
++      source: 'generation-result'
++      mode: 'reveal'
++    }
++
++/** p2-sc1:注册表条目携带目标场景。成员归属按场景隔离,消费侧剪枝只作用于
++ *  与请求目标场景同场景的成员;切场景不把他场景 generating 成员移出注册表。 */
++export type GenerationFocusRegistryEntry = { nodeId: string; targetSceneId: string }
+ 
+ type CameraFocusState = {
+   pendingFocus?: CameraFocusRequest
+-  /** p1-sc2:agent 并发生图注册表,成员是已创建过的占位 slot id;只有
+-   *  requestGenerationSetFocus 追加,useViewport 消费时按「可见 ai-slot 且
+-   *  generating」过滤回写(剪枝已 ready/failed 的成员)。 */
+-  generationFocusNodeIds: string[]
++  /** p2-sc3:被压的跨场景 deferred 请求池。写侧跨场景守卫(本次请求写入时既有
++   *  pendingFocus 归属其他场景、消费侧正在 defer)把既有请求按 targetSceneId 键
++   *  压入,消费侧在 pendingFocus 空时按本场景键提升;单槽不被跨场景请求静默覆盖。 */
++  deferredFocusByScene: Record<string, CameraFocusRequest>
++  /** p1-sc2:agent 并发生图注册表;成员是已创建过的占位 slot id + 目标场景
++   *  (p2-sc1)。只有 requestGenerationSetFocus 追加,useViewport 消费时按
++   *  「目标场景同场景 + 可见 ai-slot 且 generating」过滤回写(剪枝已
++   *  ready/failed 的成员),剪枝不越场景。 */
++  generationFocusNodeIds: GenerationFocusRegistryEntry[]
+   requestPlaceholderFocus: (
+     nodeId: string,
+     context: { targetSceneId: string; activeSceneId: string; source: string },
+@@ -51,11 +83,51 @@ type CameraFocusState = {
+     triggerNodeId: string,
+     context: { targetSceneId: string; activeSceneId: string },
+   ) => void
++  requestGenerationResultFocus: (
++    memberNodeIds: string[],
++    context: { triggerNodeId: string; targetSceneId: string; activeSceneId: string; source: string },
++  ) => void
+   clearPlaceholderFocus: () => void
++  /** r2 升级(升级阶梯②):池生命周期唯一上层协调 transition。liveSceneIds = 当前
++   *  live active canvases(App 层 selectLiveCanvasIds 计算);从 deferredFocusByScene
++   *  剪掉不在其中的键(删除/归档的画布不再滞留),pendingFocus 目标场景非 live 时
++   *  显式清除。live 场景的请求**绝不因容量被丢弃**——本函数不淘汰任何 live 键。 */
++  reconcileDeferredFocusScenes: (liveSceneIds: readonly string[]) => void
++}
++
++/** p2-sc3 唯一压池判据(r2 六件套第 5 步收敛;取代散在 gen-set/gen-result 两处的
++ *  逐字拷贝):既有未消费请求是否应压入 deferred 池。跨场景(目标场景键不同)必压;
++ *  同场景不压(维持既有后写覆盖/合并语义)。共识不变量未豁免任何 kind——
++ *  kind:'node' 请求同样参与压池。 */
++const shouldParkFocus = (prev: CameraFocusRequest | undefined, nextSceneId: string): boolean =>
++  prev !== undefined && prev.targetSceneId !== nextSceneId
++
++/** 四个写侧唯一落盘入口(r2 六件套第 2 步收拢,取代四写侧各自的裸 set):
++ *  压池判据 + 压池 + 池内本场景旧条目作废(同场景最新者胜,防陈旧条目被提升后
++ *  镜头回跳)一次完成。clearPlaceholderFocus 与消费侧提升转移不经过这里。
++ *  r2 升级(检查点后同族复发 → 升级阶梯②):**无容量上限、无 FIFO 淘汰**——池的
++ *  生命周期由 App 上层协调者 reconcileDeferredFocusScenes(liveSceneIds) 接管,
++ *  池键严格是 live active canvases 的子集,size 天然 ≤ live 画布数。 */
++const commitFocusRequest = (
++  state: CameraFocusState,
++  next: CameraFocusRequest,
++): Partial<CameraFocusState> => {
++  const pool = { ...state.deferredFocusByScene }
++  delete pool[next.targetSceneId]
++  if (shouldParkFocus(state.pendingFocus, next.targetSceneId)) {
++    const prev = state.pendingFocus as CameraFocusRequest
++    pool[prev.targetSceneId] = prev
++    debugLogger.log(
++      'Camera',
++      `Auto-focus deferred (cross-scene slot guard): ${prev.kind} for ${prev.targetSceneId} parked, ${next.targetSceneId} request wins`,
++    )
++  }
++  return { pendingFocus: next, deferredFocusByScene: pool }
+ }
+ 
+ export const useCameraFocusStore = create<CameraFocusState>()((set) => ({
+   pendingFocus: undefined,
++  deferredFocusByScene: {},
+   generationFocusNodeIds: [],
+   requestPlaceholderFocus: (nodeId, { targetSceneId, activeSceneId, source }) => {
+     if (targetSceneId !== activeSceneId) {
+@@ -66,7 +138,8 @@ export const useCameraFocusStore = create<CameraFocusState>()((set) => ({
+       return
+     }
+     // 每次请求都换新对象引用,同一 nodeId 重复触发(如 retry 复用 slot)也能驱动 effect。
+-    set({ pendingFocus: { kind: 'node', nodeId, source } })
++    // r2:与 gen 两类写侧共用唯一落盘入口——跨场景既有请求先压池,node 不豁免。
++    set((state) => commitFocusRequest(state, { kind: 'node', nodeId, source, targetSceneId }))
+   },
+   requestNodeFocus: (nodeId, { targetSceneId, activeSceneId, source, mode }) => {
+     if (targetSceneId !== activeSceneId) {
+@@ -76,7 +149,7 @@ export const useCameraFocusStore = create<CameraFocusState>()((set) => ({
+       )
+       return
+     }
+-    set({ pendingFocus: { kind: 'node', nodeId, source, mode } })
++    set((state) => commitFocusRequest(state, { kind: 'node', nodeId, source, mode, targetSceneId }))
+   },
+   requestGenerationSetFocus: (triggerNodeId, { targetSceneId, activeSceneId }) => {
+     if (targetSceneId !== activeSceneId) {
+@@ -87,12 +160,85 @@ export const useCameraFocusStore = create<CameraFocusState>()((set) => ({
+       return
+     }
+     // 每次请求都换新对象引用,注册表只追加不重复(剪枝在消费侧)。
+-    set((state) => ({
+-      pendingFocus: { kind: 'generation-set', triggerNodeId, source: 'agent-generate', mode: 'reveal' },
+-      generationFocusNodeIds: state.generationFocusNodeIds.includes(triggerNodeId)
+-        ? state.generationFocusNodeIds
+-        : [...state.generationFocusNodeIds, triggerNodeId],
+-    }))
++    set((state) => {
++      const next: CameraFocusRequest = {
++        kind: 'generation-set',
++        triggerNodeId,
++        targetSceneId,
++        source: 'agent-generate',
++        mode: 'reveal',
++      }
++      // r2:压池判据/压池/作废统一进 commitFocusRequest,本写侧只保留注册表职责。
++      return {
++        ...commitFocusRequest(state, next),
++        generationFocusNodeIds: state.generationFocusNodeIds.some(
++          (entry) => entry.nodeId === triggerNodeId && entry.targetSceneId === targetSceneId,
++        )
++          ? state.generationFocusNodeIds
++          : [...state.generationFocusNodeIds, { nodeId: triggerNodeId, targetSceneId }],
++      }
++    })
++  },
++  requestGenerationResultFocus: (memberNodeIds, { triggerNodeId, targetSceneId, activeSceneId, source }) => {
++    if (targetSceneId !== activeSceneId) {
++      debugLogger.log(
++        'Camera',
++        `Auto-focus skipped (cross-scene): ${source} result set targets ${targetSceneId}, active ${activeSceneId}`,
++      )
++      return
++    }
++    // 空集 no-op:不写 pendingFocus、不崩溃(variations 允许 successIds=[] 的
++    // done 空结果;防御式双保险)。
++    if (memberNodeIds.length === 0) return
++    set((state) => {
++      // 并发合并语义:同一 targetSceneId 下,未消费的 generation-result 请求再次
++      // 到达时按 node id exact-union 去重合并(edit 与 beside 两批先后 commit、
++      // 镜头尚未消费的窗口),不做 latest-wins 覆盖;不同 kind 或不同 targetSceneId
++      // 维持既有后写覆盖语义(与 node / generation-set 请求之间的交互不变)。
++      let next: CameraFocusRequest = {
++        kind: 'generation-result',
++        memberNodeIds: [...memberNodeIds],
++        triggerNodeId,
++        targetSceneId,
++        source: 'generation-result',
++        mode: 'reveal',
++      }
++      const prev = state.pendingFocus
++      if (prev && prev.kind === 'generation-result' && prev.targetSceneId === targetSceneId) {
++        const merged = [...prev.memberNodeIds]
++        for (const id of memberNodeIds) {
++          if (!merged.includes(id)) merged.push(id)
++        }
++        next = { ...next, memberNodeIds: merged }
++      }
++      // r2:压池判据/压池/作废统一进 commitFocusRequest(合并分支同走唯一入口)。
++      return commitFocusRequest(state, next)
++    })
+   },
+   clearPlaceholderFocus: () => set({ pendingFocus: undefined }),
++  reconcileDeferredFocusScenes: (liveSceneIds) =>
++    set((state) => {
++      // 用 Set 做 membership——不依赖 Object.keys 插入序(sceneId 是任意 string,
++      // 纯数字 id 会被数值排序,任何依赖键序的遍历都是隐患)。
++      const live = new Set(liveSceneIds)
++      const prunedKeys = Object.keys(state.deferredFocusByScene).filter((id) => !live.has(id))
++      const pool = { ...state.deferredFocusByScene }
++      for (const id of prunedKeys) {
++        delete pool[id]
++        debugLogger.log(
++          'Camera',
++          `Auto-focus deferred pool pruned: parked ${state.deferredFocusByScene[id]!.kind} for non-live scene ${id}`,
++        )
++      }
++      let patch: Partial<CameraFocusState> = { deferredFocusByScene: pool }
++      const pending = state.pendingFocus
++      if (pending && !live.has(pending.targetSceneId)) {
++        patch = { ...patch, pendingFocus: undefined }
++        debugLogger.log(
++          'Camera',
++          `Auto-focus pending cleared: ${pending.kind} targets non-live scene ${pending.targetSceneId}`,
++        )
++      }
++      return patch
++    }),
+ }))
+diff --git a/src/store/generation.contract.test.ts b/src/store/generation.contract.test.ts
+index f23768ee..f06d6345 100644
+--- a/src/store/generation.contract.test.ts
++++ b/src/store/generation.contract.test.ts
+@@ -63,6 +63,8 @@ vi.mock('../lib/mivoImageClient', () => ({
+ 
+ import { useCanvasStore } from './canvasStore'
+ import { generationFacade } from './generationFacade'
++import { useCameraFocusStore } from './cameraFocusStore'
++import type { CameraFocusRequest } from './cameraFocusStore'
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ 
+ // Helpers ---------------------------------------------------------------------
+@@ -177,6 +179,7 @@ const taskFor = (id: string) => useCanvasStore.getState().tasks.find((t) => t.id
+ 
+ beforeEach(() => {
+   useCanvasStore.setState({ ...baseState } as never, true)
++  useCameraFocusStore.setState({ pendingFocus: undefined, generationFocusNodeIds: [] })
+   mockSubmitEditTask.mockReset().mockResolvedValue('t1')
+   mockSubmitGenerationTask.mockReset().mockResolvedValue('t1')
+   mockSubmitVariationsTask.mockReset().mockResolvedValue({ taskId: 't1', batchId: 'b1', count: 4 })
+@@ -185,6 +188,28 @@ beforeEach(() => {
+   mockAssetBlobForNode.mockReset().mockResolvedValue(new Blob(['mock-source-bytes'], { type: 'image/png' }))
+ })
+ 
++/** 读当前 pendingFocus 并断言它是 generation-result 请求,返回其成员集。 */
++const pendingResultMembers = (): string[] => {
++  const pending: CameraFocusRequest | undefined = useCameraFocusStore.getState().pendingFocus
++  if (!pending || pending.kind !== 'generation-result') {
++    throw new Error(`expected generation-result focus request, got ${pending?.kind ?? 'none'}`)
++  }
++  return pending.memberNodeIds
++}
++
++/** 本批 commit 产物节点集:调用前节点之外新增的「image 结果 ∪ failed 失败槽」。
++ *  注意不能用全量 nodes diff——syncDerivationEdgeNodes 会把衍生边物化成
++ *  derivation-edge 节点进 nodes 数组,那些不是焦点成员。 */
++const batchNodeIds = (beforeIds: Set<string>): string[] =>
++  useCanvasStore
++    .getState()
++    .nodes.filter(
++      (node) =>
++        !beforeIds.has(node.id) &&
++        ((node.type === 'image' && node.sourceNodeId) || (node.type === 'ai-slot' && node.status === 'failed')),
++    )
++    .map((node) => node.id)
++
+ // Tests -----------------------------------------------------------------------
+ 
+ describe('contract: generation action signatures', () => {
+@@ -648,3 +673,173 @@ describe('contract: variations / annotation (P2-C2 de-mocked → async tasks API
+     expect(useCanvasStore.getState().tasks).toHaveLength(0)
+   })
+ })
++
++// ── p0-sc2:generateVariations 结果焦点请求(commit 全部落盘后发出)──
++describe('contract: generateVariations 结果焦点请求(p0-sc2)', () => {
++  const runVariations = (view: unknown) => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    mockPollTask.mockResolvedValueOnce(view)
++    return useCanvasStore.getState().generateVariations('n1')
++  }
++
++  /** 本批 commit 产物节点集:调用前节点之外新增的「image 结果 ∪ failed 失败槽」。
++   *  注意不能用全量 nodes diff——syncDerivationEdgeNodes 会把衍生边物化成
++   *  derivation-edge 节点进 nodes 数组,那些不是焦点成员。 */
++  const batchNodeIds = (beforeIds: Set<string>): string[] =>
++    useCanvasStore
++      .getState()
++      .nodes.filter(
++        (node) =>
++          !beforeIds.has(node.id) &&
++          ((node.type === 'image' && node.sourceNodeId) || (node.type === 'ai-slot' && node.status === 'failed')),
++      )
++      .map((node) => node.id)
++
++  it('2 成功 + 2 失败混合:commit 完成前无结果焦点请求;完成后成员集恰为 successIds ∪ 失败槽 id', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
++    // C1 时序绑定:请求被调用当刻,全部成员 id 必须已存在于目标场景节点表——
++    // 失败槽必须在请求之前落盘。反向变异(请求挪到失败槽 set 之前)此断言转红。
++    const originalRequestResultFocus = useCameraFocusStore.getState().requestGenerationResultFocus
++    const focusSpy = vi
++      .spyOn(useCameraFocusStore.getState(), 'requestGenerationResultFocus')
++      .mockImplementation((members, context) => {
++        const nodeTable = useCanvasStore.getState().canvases['character-flow']?.nodes ?? []
++        for (const id of members) {
++          expect(nodeTable.some((node) => node.id === id)).toBe(true)
++        }
++        return originalRequestResultFocus(members, context)
++      })
++    try {
++      // 受控 pending gate:把 poll 挂起,在 commit 完成前断言无结果焦点请求。
++      let resolvePoll!: (view: unknown) => void
++      mockPollTask.mockReturnValueOnce(new Promise((resolve) => { resolvePoll = resolve }))
++      const promise = useCanvasStore.getState().generateVariations('n1')
++
++      // 挂在 poll 上(commit 未发生):无结果焦点请求、无 pendingFocus。
++      expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++
++      resolvePoll(
++        partialView(
++          [
++            { ...committedImage(), variationIndex: 0 },
++            { ...committedImage(), variationIndex: 1 },
++          ],
++          [
++            { variationIndex: 2, error: 'Upstream error (500)' },
++            { variationIndex: 3, error: 'Upstream error (500)' },
++          ],
++        ),
++      )
++      await promise
++    } finally {
++      focusSpy.mockRestore()
++    }
++
++    const members = pendingResultMembers()
++    // 成员集恰为本批 commit 产物:2 个成功 image + 2 个失败槽,无他。
++    const expected = batchNodeIds(beforeIds)
++    expect(new Set(members)).toEqual(new Set(expected))
++    expect(members).toHaveLength(4)
++    const s = useCanvasStore.getState()
++    expect(s.nodes.filter((node) => node.status === 'failed')).toHaveLength(2)
++    expect(s.nodes.filter((node) => node.type === 'image' && node.sourceNodeId === 'n1')).toHaveLength(2)
++    // triggerNodeId = 成员首个。
++    expect(useCameraFocusStore.getState().pendingFocus).toMatchObject({ triggerNodeId: members[0], source: 'generation-result' })
++  })
++
++  it('done(images=[]) 时无请求且不崩溃', async () => {
++    await runVariations(doneView([]))
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++  })
++})
++
++// ── p0-sc4:1/2/3/4 变体计数矩阵 + 2 成功 2 失败混合(slice 层成员 exact)──
++describe('contract: 变体计数矩阵结果焦点(p0-sc4)', () => {
++  it.each([1, 2, 3, 4])('变体 %i 张:完成后 pendingFocus 成员集恰为本批节点', async (count) => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
++    mockPollTask.mockResolvedValueOnce(doneView(Array.from({ length: count }, () => committedImage())))
++    await useCanvasStore.getState().generateVariations('n1')
++
++    const members = pendingResultMembers()
++    expect(members).toHaveLength(count)
++    const expected = batchNodeIds(beforeIds)
++    expect(new Set(members)).toEqual(new Set(expected))
++  })
++
++  it('2 成功 2 失败混合:成员集恰为本批节点(successIds ∪ 失败槽)', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
++    mockPollTask.mockResolvedValueOnce(
++      partialView(
++        [
++          { ...committedImage(), variationIndex: 0 },
++          { ...committedImage(), variationIndex: 1 },
++        ],
++        [
++          { variationIndex: 2, error: 'Upstream error (500)' },
++          { variationIndex: 3, error: 'Upstream error (500)' },
++        ],
++      ),
++    )
++    await useCanvasStore.getState().generateVariations('n1')
++
++    const members = pendingResultMembers()
++    expect(members).toHaveLength(4)
++    const expected = batchNodeIds(beforeIds)
++    expect(new Set(members)).toEqual(new Set(expected))
++  })
++})
++
++// ── p1-sc1 / p1-sc2:edit / beside 结果焦点请求(slice 层)──
++describe('contract: edit / beside 结果焦点请求(p1-sc1 / p1-sc2)', () => {
++  it('generateImageEdit commit 完成后 pendingFocus 成员 = commit 返回的结果节点 id', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const beforeIds = new Set(useCanvasStore.getState().nodes.map((node) => node.id))
++    const nodeIds = await useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'a cat')
++
++    const members = pendingResultMembers()
++    expect(nodeIds).toHaveLength(1)
++    expect(members).toEqual(nodeIds)
++    // 成员确实落在目标场景节点表(commit 产物 image 结果)。
++    const expected = batchNodeIds(beforeIds)
++    expect(new Set(members)).toEqual(new Set(expected))
++  })
++
++  it('generateBesideNode commit 完成后 pendingFocus 成员 = 结果节点', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    const nodeIds = await useCanvasStore.getState().generateBesideNode('n1', 'a cat beside')
++
++    const members = pendingResultMembers()
++    expect(members).toEqual(nodeIds)
++    expect(members).toHaveLength(1)
++  })
++
++  it('重叠完成:edit 与 beside 消费前先后 commit → pending 成员 = 两批 union(exact-union 不 latest-wins)', async () => {
++    seed(seedCanvas('character-flow', [imageNode({ id: 'n1' })]))
++    let resolveEdit!: (view: unknown) => void
++    let resolveBeside!: (view: unknown) => void
++    mockPollTask
++      .mockReturnValueOnce(new Promise((resolve) => { resolveEdit = resolve }))
++      .mockReturnValueOnce(new Promise((resolve) => { resolveBeside = resolve }))
++    const editPromise = useCanvasStore.getState().generateImageEdit('n1', 'prompt-edit', 'cat')
++    const besidePromise = useCanvasStore.getState().generateBesideNode('n1', 'beside')
++
++    // 两批都挂在 poll 上:无请求。
++    expect(useCameraFocusStore.getState().pendingFocus).toBeUndefined()
++    // edit 先 commit → 成员=[edit 结果]。
++    resolveEdit(doneView())
++    await editPromise
++    const afterEdit = pendingResultMembers()
++    expect(afterEdit).toHaveLength(1)
++    const editId = afterEdit[0]
++    // beside 后 commit → union 合并,不覆盖。
++    resolveBeside(doneView())
++    await besidePromise
++    const merged = pendingResultMembers()
++    expect(merged).toHaveLength(2)
++    expect(merged).toContain(editId)
++    expect(merged[0]).toBe(editId) // 先到达者保持在前,后到达者并入(exact-union)。
++  })
++})
+diff --git a/src/store/generationFacade.test.ts b/src/store/generationFacade.test.ts
+index e5c53291..0649097c 100644
+--- a/src/store/generationFacade.test.ts
++++ b/src/store/generationFacade.test.ts
+@@ -169,12 +169,22 @@ describe('generationFacade.prepareChatSlot — camera auto-focus request (镜头
+ 
+   it('requests focus for a freshly created slot in the active scene', () => {
+     const prep = generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, prompt: 'p' })
+-    expect(useCameraFocusStore.getState().pendingFocus).toEqual({ kind: 'node', nodeId: prep.slotId, source: 'chat-slot' })
++    expect(useCameraFocusStore.getState().pendingFocus).toEqual({
++      kind: 'node',
++      nodeId: prep.slotId,
++      source: 'chat-slot',
++      targetSceneId: 'c1',
++    })
+   })
+ 
+   it('requests focus when reusing an existing pendingSlotId (retry path)', () => {
+     generationFacade.prepareChatSlot({ sceneId: 'c1', hasSelectedImage: false, pendingSlotId: 'slot-1', prompt: 'p' })
+-    expect(useCameraFocusStore.getState().pendingFocus).toEqual({ kind: 'node', nodeId: 'slot-1', source: 'chat-slot' })
++    expect(useCameraFocusStore.getState().pendingFocus).toEqual({
++      kind: 'node',
++      nodeId: 'slot-1',
++      source: 'chat-slot',
++      targetSceneId: 'c1',
++    })
+   })
+ 
+   it('does not request focus in beside mode', () => {
+diff --git a/src/store/generationSlice.ts b/src/store/generationSlice.ts
+index cb21444f..4433fcbf 100644
+--- a/src/store/generationSlice.ts
++++ b/src/store/generationSlice.ts
+@@ -18,6 +18,7 @@ import {
+   type TaskResultImage,
+ } from '../lib/mivoTaskClient'
+ import { errorCanvas, logCanvas, warnCanvas } from './canvasStoreLog'
++import { useCameraFocusStore } from './cameraFocusStore'
+ import { createEdgeId, createNodeId, edgeTypeForOperation } from './nodeFactory'
+ import { t } from '../i18n'
+ import {
+@@ -296,6 +297,20 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+               })
+             }))
+           }
++          // p0-sc2:结果焦点请求必须在 successIds 与失败槽全部落盘之后发出——早于
++          // commit 则消费侧按 id 找不到节点、bounds 并集缺员。成员集 = successIds
++          // ∪ 失败槽 node id(全部成功→成员=successIds;部分失败→并入失败槽;全部
++          // 失败时 runTaskPollLoop 以 failed 抛出、onResult 不达,本分支不覆盖)。
++          // 空成员(理论上的 done+空 images)不发请求(空集 no-op 双保险在 store 层)。
++          const resultFocusMembers = [...successIds, ...failedSlots.map((slot) => slot.node.id)]
++          if (resultFocusMembers.length > 0) {
++            useCameraFocusStore.getState().requestGenerationResultFocus(resultFocusMembers, {
++              triggerNodeId: resultFocusMembers[0],
++              targetSceneId,
++              activeSceneId: get().sceneId,
++              source: 'generation-result',
++            })
++          }
+           return successIds
+         },
+       })
+@@ -398,16 +413,31 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+         signal: options.signal,
+         localTask: runningTask,
+         sceneId: targetSceneId,
+-        onResult: async ({ images }) => get().commitGenerationResult({
+-          sceneId: targetSceneId,
+-          sourceNodeId: source.id,
+-          resultImages: images,
+-          prompt: resultPrompt,
+-          model,
+-          kind: edgeTypeForOperation(operation),
+-          taskId,
+-          createDerivationEdge: options.createDerivationEdge,
+-        }),
++        onResult: async ({ images }) => {
++          // p1-sc1:改图结果居中——commit 落地后对返回的结果节点 id 集发出显式
++          // 成员集结果焦点请求(通常 1 个;N=1 是集合的退化情形)。agentEditImage、
++          // AnchorOverlay area-edit、画布命令三类入口全部经本函数,slice 层一处
++          // 接线即全覆盖。成员集来源是 commit 返回值,不用 beforeIds diff 撞值。
++          const nodeIds = await get().commitGenerationResult({
++            sceneId: targetSceneId,
++            sourceNodeId: source.id,
++            resultImages: images,
++            prompt: resultPrompt,
++            model,
++            kind: edgeTypeForOperation(operation),
++            taskId,
++            createDerivationEdge: options.createDerivationEdge,
++          })
++          if (nodeIds.length > 0) {
++            useCameraFocusStore.getState().requestGenerationResultFocus(nodeIds, {
++              triggerNodeId: nodeIds[0],
++              targetSceneId,
++              activeSceneId: get().sceneId,
++              source: 'generation-result',
++            })
++          }
++          return nodeIds
++        },
+       })
+       set((current) => {
+         const targetDocument = current.canvases[targetSceneId]
+@@ -511,16 +541,32 @@ export const createGenerationSlice: SliceCreator = (set, get) => ({
+         signal: options.signal,
+         localTask: runningTask,
+         sceneId: targetSceneId,
+-        onResult: async ({ images }) => get().commitGenerationResult({
+-          sceneId: targetSceneId,
+-          sourceNodeId: source.id,
+-          resultImages: images,
+-          prompt: resultPrompt,
+-          model,
+-          kind: 'generate',
+-          taskId,
+-          createDerivationEdge: options.createDerivationEdge,
+-        }),
++        onResult: async ({ images }) => {
++          // p1-sc2:旁生成结果居中——commit 落地后对返回的结果节点 id 集发出显式
++          // 成员集结果焦点请求。聊天旁生成(chatStore 经 prepareChatSlot 的
++          // mode:'beside' 分支走本函数,无开始时刻槽位焦点)同样获得居中——
++          // 共识(2026-08-12):「出图必居中」延伸成立,不加 suppressResultFocus。
++          // chat 主流程走 generateIntoAiSlot(槽位焦点已覆盖),不经本函数,行为不变。
++          const nodeIds = await get().commitGenerationResult({
++            sceneId: targetSceneId,
++            sourceNodeId: source.id,
++            resultImages: images,
++            prompt: resultPrompt,
++            model,
++            kind: 'generate',
++            taskId,
++            createDerivationEdge: options.createDerivationEdge,
++          })
++          if (nodeIds.length > 0) {
++            useCameraFocusStore.getState().requestGenerationResultFocus(nodeIds, {
++              triggerNodeId: nodeIds[0],
++              targetSceneId,
++              activeSceneId: get().sceneId,
++              source: 'generation-result',
++            })
++          }
++          return nodeIds
++        },
+       })
+       set((current) => {
+         const targetDocument = current.canvases[targetSceneId]

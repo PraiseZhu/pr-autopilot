@@ -1,0 +1,647 @@
+diff --git a/main.js b/main.js
+index 9a4cfe3d..09fef894 100644
+--- a/main.js
++++ b/main.js
+@@ -3702,6 +3702,11 @@ const SNAPSHOT_PANEL_TIMEOUT_MS = 6000
+ // 选中观测组的护栏(#297 T2a2,与共享层 `MAX_SELECTED_IMAGE_NODE_IDS`
+ // `src/agent/snapshotRegion.ts` 同值):超出即截断,不静默丢弃。
+ const SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS = 64
++// mediaNodeIds 单次上限(#297 T3a,设计稿 §2.1.1-②/§2.1.2):超出/重复一律整单
++// INVALID_PARAMS,不做部分降级或静默截断——与「选中观测组」的截断语义不同,
++// 不要混用同一常量。ghost.json 本段暂不暴露这个参数(暗态),此值只服务于
++// main.js/agentBridge.ts 两处独立校验的护栏。
++const MEDIA_NODE_IDS_MAX = 8
+ 
+ // 面板未打开/离线降级/无事可做属于「可恢复的跳过」,记 warn;其余失败记 error
+ // (口径:invalid / not-found / locked / hidden / scene-mismatch → error)。
+@@ -3753,13 +3758,39 @@ function ownArg(source, key) {
+ /** 模型可传的快照过滤/分页参数;其余字段(含宿主注入、inherited)一律不透传给面板。 */
+ function snapshotFilterArgs(args) {
+   const picked = {}
+-  for (const key of ['sceneId', 'region', 'sectionId', 'cursor', 'maxBytes']) {
++  for (const key of ['sceneId', 'region', 'sectionId', 'cursor', 'maxBytes', 'mediaNodeIds']) {
+     const value = ownArg(args, key)
+     if (value !== undefined && value !== null && value !== '') picked[key] = value
+   }
+   return picked
+ }
+ 
++/**
++ * mediaNodeIds 的类型校验——必须在决定 live/offline 之前跑完(先校型后干活,
++ * #297 T3a 设计稿 §2.1.1-②)。非法输入(非数组/超上限/含非字符串或空字符串/
++ * 重复项)一律整单 INVALID_PARAMS、fail-fast、零副作用:不调 askPanel,不读
++ * 离线快照文件。
++ *
++ * main.js 侧独立副本:与 `agentBridge.ts` 的同名函数逐字节一致但物理上是两份
++ * 独立代码(main.js 是不过打包的自包含脚本,没法 import 面板侧模块;进程间边界
++ * 的纵深防御同样要求面板侧不盲信这一层已经校验过——与 `ownArg` 的既有两份并存
++ * 模式同构,见该函数头注)。
++ */
++function validateMediaNodeIds(value) {
++  if (value === undefined) return { ok: true, value: undefined }
++  if (!Array.isArray(value)) return { ok: false, message: 'mediaNodeIds 必须是字符串数组' }
++  if (value.length > MEDIA_NODE_IDS_MAX) {
++    return { ok: false, message: 'mediaNodeIds 最多 ' + MEDIA_NODE_IDS_MAX + ' 个,请拆成多次调用' }
++  }
++  const seen = new Set()
++  for (const id of value) {
++    if (typeof id !== 'string' || !id) return { ok: false, message: 'mediaNodeIds 里的每一项必须是非空字符串' }
++    if (seen.has(id)) return { ok: false, message: 'mediaNodeIds 不允许重复项: ' + id }
++    seen.add(id)
++  }
++  return { ok: true, value }
++}
++
+ /**
+  * 离线快照不支持的字段——缺乏定位子集/续页能力,只有 region/sectionId/cursor
+  * 属于「过滤或翻页」。sceneId 是目标校验、maxBytes 是页大小旋钮,两者离线同样能
+@@ -4091,6 +4122,11 @@ function snapshotResult(source, reply, offline) {
+   if (reply.filter) result.filter = reply.filter
+   if (reply.page) result.page = reply.page
+   if (reply.omittedRefs) result.omittedRefs = reply.omittedRefs
++  // #297 T3a 设计稿 §2.1.1-④(回执出口接线):面板算出的 mediaStates/mediaSummary
++  // 原样透传,这里不解析/不校验内容——真实逐 id 语义与聚合归 T3b,本函数只负责
++  // "面板给了就带上",与 omittedRefs 现有写法同构。
++  if (reply.mediaStates) result.mediaStates = reply.mediaStates
++  if (reply.mediaSummary) result.mediaSummary = reply.mediaSummary
+   if (reply.truncated) {
+     result.truncated = true
+     if (reply.nextCursor) {
+@@ -4205,6 +4241,11 @@ async function handleToolCall(msg) {
+   try {
+     if (msg.tool === 'canvas_snapshot') {
+       const picked = snapshotFilterArgs(args)
++      // #297 T3a:先校型后干活,live/offline 两分支共享同一次前置校验(设计稿
++      // §2.1.1-②/§2.1.2)——校验不过直接整单拒绝,不进 live 分支也不进 offline
++      // 分支,不调 askPanel、不读离线快照文件。
++      const mediaValidation = validateMediaNodeIds(picked.mediaNodeIds)
++      if (!mediaValidation.ok) return fail('INVALID_PARAMS', mediaValidation.message)
+       const live = await askPanel('snapshot', picked, SNAPSHOT_PANEL_TIMEOUT_MS)
+       if (live.ok && live.snapshot) {
+         if (live.truncated) {
+@@ -4263,6 +4304,20 @@ async function handleToolCall(msg) {
+             offline.page.nodeCount + '/' + offline.page.totalNodes + '(离线无游标)',
+         )
+       }
++      // 离线分支没有面板可问,mediaStates 需要在这里合成(#297 T3a 设计稿
++      // §2.1.1-④/§2.10):每个请求的 id 一律判 panel_closed(既有 PANEL_CLOSED
++      // 语义),不新造平行的"离线不可看"概念;真实逐 id 语义只在面板在线时才有意义。
++      if (picked.mediaNodeIds && picked.mediaNodeIds.length) {
++        offline.mediaStates = {}
++        for (const id of picked.mediaNodeIds) {
++          offline.mediaStates[id] = { state: 'unavailable', reason: 'panel_closed' }
++        }
++        offline.mediaSummary = {
++          requested: picked.mediaNodeIds.length,
++          available: 0,
++          unavailable: picked.mediaNodeIds.length,
++        }
++      }
+       const snapResultOffline = {}
+       Object.assign(snapResultOffline, snapshotResult('最近一次自动保存(面板未打开,可能滞后)', offline, true))
+       return succeed(snapResultOffline)
+diff --git a/src/__tests__/agentBridgeMediaNodeIds.test.ts b/src/__tests__/agentBridgeMediaNodeIds.test.ts
+new file mode 100644
+index 00000000..17f627a2
+--- /dev/null
++++ b/src/__tests__/agentBridgeMediaNodeIds.test.ts
+@@ -0,0 +1,147 @@
++/**
++ * agentBridge.ts 侧 mediaNodeIds 独立校验(#297 T3a SC-T3a.1:进程间边界纵深复校,
++ * 与 main.js 侧逐字节一致但物理独立,设计稿 §2.1.1-③)。
++ *
++ * 段边界:真实逐 id 解析(mediaStates/mediaSummary)归 T3b,这里只验证——合法
++ * 参数能到达 `agentReadSnapshotPage` 之前的校验点(不炸、不报错)、非法形状
++ * fail-fast(INVALID_PARAMS、不读页),且校验对本文件全程未引用的 `main.js`
++ * 零依赖——面板侧纵深复校的意义正是"不盲信调用方已经校验过",单测必须能绕开
++ * main.js 直接命中这层校验,与 `agentBridgeWriteGate.test.ts` 同一套
++ * `wireBridge()` 桥接手法,断言跑在真实 `installAgentBridge()` 上。
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.hoisted(() => {
++  const store = new Map<string, string>()
++  const memStorage = {
++    get length() {
++      return store.size
++    },
++    clear: () => store.clear(),
++    getItem: (key: string) => store.get(key) ?? null,
++    key: (index: number) => [...store.keys()][index] ?? null,
++    removeItem: (key: string) => {
++      store.delete(key)
++    },
++    setItem: (key: string, value: string) => {
++      store.set(key, String(value))
++    },
++  }
++  const globals = globalThis as Record<string, unknown>
++  if (globals.window === undefined) globals.window = { localStorage: memStorage }
++  if (globals.localStorage === undefined) globals.localStorage = memStorage
++})
++
++vi.mock('../../../src/lib/demoImages', () => ({ createDemoImage: () => 'data:image/png;base64,mock' }))
++vi.mock('../../../src/store/remoteDebugReporter', () => ({ reportRemoteDebugEntry: () => {} }))
++vi.mock('../../../src/lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock', name: 'n', type: 'image/png' })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: vi.fn(),
++}))
++
++const persistRequestMock = vi.fn()
++const flushPersistNowMock = vi.fn(async () => true)
++vi.mock('../persist/bridge', () => ({ persistRequest: (...args: unknown[]) => persistRequestMock(...args) }))
++vi.mock('../persist/persistSync', () => ({
++  flushPersistNow: () => flushPersistNowMock(),
++  restoreFromDiskIfEmpty: async () => 'skipped',
++  startAutoSave: () => {},
++}))
++
++import { ChannelBus, channelConstructorFor, flushUntil } from './brainHarness'
++import { resetCanvasWriteGateForTests } from '../../../src/agent/canvasWriteGate'
++import { installAgentBridge } from '../agent/agentBridge'
++
++const CHANNEL = 'mivo-canvas-agent'
++
++/** 起一个总线 + 真实桥,返回「发动词请求并收回执」的调用器(电子脑视角,同 agentBridgeWriteGate.test.ts)。 */
++const wireBridge = () => {
++  const bus = new ChannelBus()
++  const globals = globalThis as Record<string, unknown>
++  const previous = globals.BroadcastChannel
++  globals.BroadcastChannel = channelConstructorFor(bus)
++  installAgentBridge()
++  globals.BroadcastChannel = previous
++
++  const brainSide = bus.open(CHANNEL)
++  let seq = 0
++  const ask = async (verb: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown> | null> => {
++    seq += 1
++    const reqId = `probe-${seq}`
++    let reply: Record<string, unknown> | null = null
++    brainSide.onmessage = (event) => {
++      const data = event.data as Record<string, unknown> | undefined
++      if (data && data.reply === true && data.reqId === reqId) reply = data
++    }
++    brainSide.postMessage({ reqId, verb, params })
++    await flushUntil(() => reply !== null, { label: `agent 桥对动词 '${verb}' 的回执` })
++    return reply
++  }
++  return { ask }
++}
++
++beforeEach(() => {
++  vi.clearAllMocks()
++  flushPersistNowMock.mockImplementation(async () => true)
++  resetCanvasWriteGateForTests()
++})
++
++describe('agentBridge snapshot 动词的 mediaNodeIds 独立校验(#297 T3a SC-T3a.1)', () => {
++  it('合法 mediaNodeIds 到达 snapshot 动词,不报错、正常读页(参数运输到达面板侧)', async () => {
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1', 'img-2'] })
++    expect(reply).toMatchObject({ ok: true })
++    expect(reply?.snapshot).toBeTruthy()
++    // T3a 不实现真实逐 id 解析:合法参数到达不代表这里已经产出
++    // mediaStates/mediaSummary,那是 T3b 的交付边界——本条同时钉住"没有提前偷跑"。
++    expect(reply).not.toHaveProperty('mediaStates')
++    expect(reply).not.toHaveProperty('mediaSummary')
++  })
++
++  it('未传 mediaNodeIds → 正常读页,不受影响', async () => {
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot')
++    expect(reply).toMatchObject({ ok: true })
++    expect(reply?.snapshot).toBeTruthy()
++  })
++
++  it('空数组 → 视为未请求,正常读页(不触发任何后续语义)', async () => {
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: [] })
++    expect(reply).toMatchObject({ ok: true })
++    expect(reply?.snapshot).toBeTruthy()
++  })
++
++  it('非数组 → INVALID_PARAMS,不读页', async () => {
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: 'not-an-array' })
++    expect(reply).toMatchObject({ ok: false, code: 'INVALID_PARAMS' })
++    expect(reply?.snapshot).toBeUndefined()
++  })
++
++  it('超过 8 个 → INVALID_PARAMS,不处理前 8 个', async () => {
++    const { ask } = wireBridge()
++    const ids = Array.from({ length: 9 }, (_, index) => `img-${index}`)
++    const reply = await ask('snapshot', { mediaNodeIds: ids })
++    expect(reply).toMatchObject({ ok: false, code: 'INVALID_PARAMS' })
++  })
++
++  it('含空字符串 → INVALID_PARAMS', async () => {
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1', ''] })
++    expect(reply).toMatchObject({ ok: false, code: 'INVALID_PARAMS' })
++  })
++
++  it('含非字符串项 → INVALID_PARAMS', async () => {
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1', 42] })
++    expect(reply).toMatchObject({ ok: false, code: 'INVALID_PARAMS' })
++  })
++
++  it('出现重复 id → INVALID_PARAMS(与 ghost.json 的 uniqueItems 呼应,但运行时独立生效)', async () => {
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1', 'img-1'] })
++    expect(reply).toMatchObject({ ok: false, code: 'INVALID_PARAMS' })
++  })
++})
+diff --git a/src/__tests__/brainSnapshot.test.ts b/src/__tests__/brainSnapshot.test.ts
+index 021e0d58..871ae780 100644
+--- a/src/__tests__/brainSnapshot.test.ts
++++ b/src/__tests__/brainSnapshot.test.ts
+@@ -17,57 +17,9 @@
+  */
+ import { describe, expect, it } from 'vitest'
+ import { attachPanelBridge, flushMicrotasks, loadBrain } from './brainHarness'
+-import type { LoadBrainOptions, LoadedBrain } from './brainHarness'
+ import { readSnapshotPage, SNAPSHOT_PAGE_MIN_MAX_BYTES } from '../../../src/agent/snapshotRegion'
+-import type { AiCanvasContextNode, AiCanvasContextSnapshot, CanvasEdge } from '../../../src/types/mivoCanvas'
+-
+-const closedPanelBrain = (options: LoadBrainOptions = {}) => loadBrain({ panelPresent: () => false, ...options })
+-
+-const node = (id: string, extra: Partial<AiCanvasContextNode> = {}): AiCanvasContextNode => ({
+-  id,
+-  type: 'text',
+-  title: id,
+-  bounds: { x: 0, y: 0, width: 100, height: 100 },
+-  status: 'ready',
+-  ...extra,
+-})
+-
+-const snapshotFixture = (nodes: AiCanvasContextNode[], edges: CanvasEdge[] = []): AiCanvasContextSnapshot => ({
+-  version: 1,
+-  sceneId: 'scene-offline',
+-  selectedNodeIds: ['n-0'],
+-  summary: {
+-    nodes: nodes.length,
+-    images: nodes.filter((item) => item.type === 'image').length,
+-    slots: 0,
+-    annotations: 0,
+-    results: 0,
+-  },
+-  nodes,
+-  edges,
+-  links: [],
+-})
+-
+-/** 装一个「面板在线」的假面板:按 scenario 回应 agent 动词请求,并记录收到的参数。 */
+-const withPanel = (brain: LoadedBrain, reply: Record<string, unknown>) => {
+-  const seen: Array<{ verb?: string; params?: Record<string, unknown> }> = []
+-  const agent = brain.bus.open('mivo-canvas-agent')
+-  agent.onmessage = (event) => {
+-    const request = event.data as { reqId?: string; verb?: string; params?: Record<string, unknown> }
+-    if (!request || typeof request.reqId !== 'string') return
+-    seen.push({ verb: request.verb, params: request.params })
+-    agent.postMessage({ reqId: request.reqId, reply: true, ...reply })
+-  }
+-  return seen
+-}
+-
+-const lastResult = (brain: LoadedBrain) => {
+-  const sent = brain.cindySent.filter(
+-    (item): item is { type: string; ok: boolean; result?: Record<string, unknown>; errorCode?: string; message?: string } =>
+-      Boolean(item) && (item as { type?: string }).type === 'tool-result',
+-  )
+-  return sent.at(-1)
+-}
++import type { AiCanvasContextSnapshot, CanvasEdge } from '../../../src/types/mivoCanvas'
++import { closedPanelBrain, lastResult, node, snapshotFixture, withPanel } from './brainSnapshotFixtures'
+ 
+ /**
+  * #297 T2b:离线路径的 selectionObservation 永远是 'unavailable',数值字段一律不出现
+diff --git a/src/__tests__/brainSnapshotFixtures.ts b/src/__tests__/brainSnapshotFixtures.ts
+new file mode 100644
+index 00000000..e0cde6ef
+--- /dev/null
++++ b/src/__tests__/brainSnapshotFixtures.ts
+@@ -0,0 +1,56 @@
++/**
++ * canvas_snapshot 测试夹具——从 brainSnapshot.test.ts 抽出,供该文件与
++ * brainSnapshotMedia.test.ts 共享(2026-08-02,#297 T3 拆分:brainSnapshot.test.ts
++ * 越过 800 行红线,详见 brainSnapshotMedia.test.ts 文件头)。
++ */
++import { loadBrain } from './brainHarness'
++import type { LoadBrainOptions, LoadedBrain } from './brainHarness'
++import type { AiCanvasContextNode, AiCanvasContextSnapshot, CanvasEdge } from '../../../src/types/mivoCanvas'
++
++export const closedPanelBrain = (options: LoadBrainOptions = {}) => loadBrain({ panelPresent: () => false, ...options })
++
++export const node = (id: string, extra: Partial<AiCanvasContextNode> = {}): AiCanvasContextNode => ({
++  id,
++  type: 'text',
++  title: id,
++  bounds: { x: 0, y: 0, width: 100, height: 100 },
++  status: 'ready',
++  ...extra,
++})
++
++export const snapshotFixture = (nodes: AiCanvasContextNode[], edges: CanvasEdge[] = []): AiCanvasContextSnapshot => ({
++  version: 1,
++  sceneId: 'scene-offline',
++  selectedNodeIds: ['n-0'],
++  summary: {
++    nodes: nodes.length,
++    images: nodes.filter((item) => item.type === 'image').length,
++    slots: 0,
++    annotations: 0,
++    results: 0,
++  },
++  nodes,
++  edges,
++  links: [],
++})
++
++/** 装一个「面板在线」的假面板:按 scenario 回应 agent 动词请求,并记录收到的参数。 */
++export const withPanel = (brain: LoadedBrain, reply: Record<string, unknown>) => {
++  const seen: Array<{ verb?: string; params?: Record<string, unknown> }> = []
++  const agent = brain.bus.open('mivo-canvas-agent')
++  agent.onmessage = (event) => {
++    const request = event.data as { reqId?: string; verb?: string; params?: Record<string, unknown> }
++    if (!request || typeof request.reqId !== 'string') return
++    seen.push({ verb: request.verb, params: request.params })
++    agent.postMessage({ reqId: request.reqId, reply: true, ...reply })
++  }
++  return seen
++}
++
++export const lastResult = (brain: LoadedBrain) => {
++  const sent = brain.cindySent.filter(
++    (item): item is { type: string; ok: boolean; result?: Record<string, unknown>; errorCode?: string; message?: string } =>
++      Boolean(item) && (item as { type?: string }).type === 'tool-result',
++  )
++  return sent.at(-1)
++}
+diff --git a/src/__tests__/brainSnapshotMedia.test.ts b/src/__tests__/brainSnapshotMedia.test.ts
+new file mode 100644
+index 00000000..f7b5abdc
+--- /dev/null
++++ b/src/__tests__/brainSnapshotMedia.test.ts
+@@ -0,0 +1,204 @@
++/**
++ * canvas_snapshot mediaNodeIds 测试(从 brainSnapshot.test.ts 拆出)。
++ *
++ * 拆分原因(2026-08-02,#297 T3 拆分):brainSnapshot.test.ts 加上本段内容后
++ * 越过团队 800 行硬红线,按语义边界(mediaNodeIds 暗态运输/校验/offline 合成,
++ * 与其余 canvas_snapshot 分页/离线降级测试是两个独立话题)整段搬迁到本文件,
++ * 断言与测试名逐字未改。共享夹具(loadBrain 之外的 closedPanelBrain/node/
++ * snapshotFixture/withPanel/lastResult)见 brainSnapshotFixtures.ts。
++ *
++ * #297 T3a:mediaNodeIds 暗态运输 + 两份独立校验 + offline/假 host egress。
++ *
++ * 段边界(设计稿 §2.1.1-②③④/§2.10,SC-T3a.1/T3a.2):本段只验参数运输端到端、
++ * 整单校验(非法形状 fail-fast)、offline 合成(每 id = panel_closed)、main.js
++ * 侧 egress 透传合约(用假 host 回执代表未来 T3b 的真实产出,只验证"面板给了就
++ * 原样带上",不代表这份内容有真实语义)。真实逐 id 解析(not_in_page/not_image/
++ * byte-failure)、reason 全量映射、live 路径的 mediaSummary/partial 全部归 T3b,
++ * 本文件不测这些——测了就是本段声称了不该声称的交付。ghost.json 本段不暴露该
++ * 参数,以下用例都是直接构造 args,模拟"参数已经到达"这一暗态路径。
++ */
++import { describe, expect, it } from 'vitest'
++import { loadBrain } from './brainHarness'
++import { closedPanelBrain, lastResult, node, snapshotFixture, withPanel } from './brainSnapshotFixtures'
++
++describe('canvas_snapshot mediaNodeIds 参数运输 + 校验 + offline 合成(#297 T3a,暗态)', () => {
++  it('合法 mediaNodeIds 原样透传给面板动词(参数运输端到端)', async () => {
++    const brain = loadBrain()
++    const seen = withPanel(brain, { ok: true, snapshot: { version: 1, nodes: [] }, truncated: false })
++    await brain.handles.handleToolCall({
++      tool: 'canvas_snapshot',
++      callId: 'c1',
++      args: { mediaNodeIds: ['img-1', 'img-2'] },
++    })
++    expect(seen).toHaveLength(1)
++    expect(seen[0].params).toMatchObject({ mediaNodeIds: ['img-1', 'img-2'] })
++  })
++
++  it('未传 mediaNodeIds → 面板动词参数里不出现该字段(零参不等于空数组)', async () => {
++    const brain = loadBrain()
++    const seen = withPanel(brain, { ok: true, snapshot: { version: 1, nodes: [] }, truncated: false })
++    await brain.handles.handleToolCall({ tool: 'canvas_snapshot', callId: 'c1', args: {} })
++    expect(seen).toHaveLength(1)
++    expect(seen[0].params).not.toHaveProperty('mediaNodeIds')
++  })
++
++  it('非数组 → 整单 INVALID_PARAMS,零副作用(从未调用 askPanel)', async () => {
++    const brain = loadBrain()
++    const seen = withPanel(brain, { ok: true, snapshot: { version: 1, nodes: [] }, truncated: false })
++    await brain.handles.handleToolCall({
++      tool: 'canvas_snapshot',
++      callId: 'c1',
++      args: { mediaNodeIds: 'not-an-array' },
++    })
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(false)
++    expect(sent?.errorCode).toBe('INVALID_PARAMS')
++    expect(seen).toHaveLength(0)
++  })
++
++  it('超过 8 个 → 整单 INVALID_PARAMS,不处理前 8 个,零副作用', async () => {
++    const brain = loadBrain()
++    const seen = withPanel(brain, { ok: true, snapshot: { version: 1, nodes: [] }, truncated: false })
++    const ids = Array.from({ length: 9 }, (_, index) => `img-${index}`)
++    await brain.handles.handleToolCall({ tool: 'canvas_snapshot', callId: 'c1', args: { mediaNodeIds: ids } })
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(false)
++    expect(sent?.errorCode).toBe('INVALID_PARAMS')
++    expect(seen).toHaveLength(0)
++  })
++
++  it('含空字符串 → 整单 INVALID_PARAMS,零副作用', async () => {
++    const brain = loadBrain()
++    const seen = withPanel(brain, { ok: true, snapshot: { version: 1, nodes: [] }, truncated: false })
++    await brain.handles.handleToolCall({
++      tool: 'canvas_snapshot',
++      callId: 'c1',
++      args: { mediaNodeIds: ['img-1', ''] },
++    })
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(false)
++    expect(sent?.errorCode).toBe('INVALID_PARAMS')
++    expect(seen).toHaveLength(0)
++  })
++
++  it('含非字符串项 → 整单 INVALID_PARAMS,零副作用', async () => {
++    const brain = loadBrain()
++    const seen = withPanel(brain, { ok: true, snapshot: { version: 1, nodes: [] }, truncated: false })
++    await brain.handles.handleToolCall({
++      tool: 'canvas_snapshot',
++      callId: 'c1',
++      args: { mediaNodeIds: ['img-1', 42] },
++    })
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(false)
++    expect(sent?.errorCode).toBe('INVALID_PARAMS')
++    expect(seen).toHaveLength(0)
++  })
++
++  it('出现重复 id → 整单 INVALID_PARAMS(与 ghost.json 的 uniqueItems 呼应,但运行时独立校验)', async () => {
++    const brain = loadBrain()
++    const seen = withPanel(brain, { ok: true, snapshot: { version: 1, nodes: [] }, truncated: false })
++    await brain.handles.handleToolCall({
++      tool: 'canvas_snapshot',
++      callId: 'c1',
++      args: { mediaNodeIds: ['img-1', 'img-1'] },
++    })
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(false)
++    expect(sent?.errorCode).toBe('INVALID_PARAMS')
++    expect(seen).toHaveLength(0)
++  })
++
++  it('非法形状在离线场景同样 fail-fast:不进 offline 分支,不读离线快照文件', async () => {
++    const brain = closedPanelBrain({
++      files: { 'canvases/ai-snapshot.json': JSON.stringify(snapshotFixture([node('n-0')])) },
++    })
++    const ids = Array.from({ length: 9 }, (_, index) => `img-${index}`)
++    const pending = brain.handles.handleToolCall({
++      tool: 'canvas_snapshot',
++      callId: 'c1',
++      args: { mediaNodeIds: ids },
++    })
++    brain.clock.advance(6_000)
++    await pending
++
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(false)
++    expect(sent?.errorCode).toBe('INVALID_PARAMS')
++    expect(brain.fsRequests.filter((item) => item.path === 'canvases/ai-snapshot.json')).toHaveLength(0)
++  })
++
++  it('offline 合成:清单里每个 id 一律 panel_closed,mediaSummary 恒等式成立(设计稿 §2.10 强制验收清单第 2 条)', async () => {
++    const fixture = snapshotFixture([node('n-0')])
++    const brain = closedPanelBrain({ files: { 'canvases/ai-snapshot.json': JSON.stringify(fixture) } })
++    const pending = brain.handles.handleToolCall({
++      tool: 'canvas_snapshot',
++      callId: 'c1',
++      args: { mediaNodeIds: ['img-1', 'img-2'] },
++    })
++    brain.clock.advance(6_000)
++    await pending
++
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(true)
++    expect(sent?.result?.mediaStates).toEqual({
++      'img-1': { state: 'unavailable', reason: 'panel_closed' },
++      'img-2': { state: 'unavailable', reason: 'panel_closed' },
++    })
++    expect(sent?.result?.mediaSummary).toEqual({ requested: 2, available: 0, unavailable: 2 })
++  })
++
++  it('offline + 未传 mediaNodeIds → 最终交卷对象不出现 mediaStates/mediaSummary(零请求路径不新造字段)', async () => {
++    const fixture = snapshotFixture([node('n-0')])
++    const brain = closedPanelBrain({ files: { 'canvases/ai-snapshot.json': JSON.stringify(fixture) } })
++    const pending = brain.handles.handleToolCall({ tool: 'canvas_snapshot', callId: 'c1', args: {} })
++    brain.clock.advance(6_000)
++    await pending
++
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(true)
++    expect(sent?.result).not.toHaveProperty('mediaStates')
++    expect(sent?.result).not.toHaveProperty('mediaSummary')
++  })
++
++  it('假 host egress 合约:面板回执自带 mediaStates/mediaSummary → live 路径原样透传到最终交卷对象(设计稿 §2.1.1-④)', async () => {
++    // T3a 不实现真实逐 id 解析(归 T3b);这里用假 host 直接在回执里塞入一份代表
++    // "未来 T3b 真实产出"的占位结构,只验证 main.js 的 egress 接线(snapshotResult
++    // 的透传两行)本身工作正常——不代表这份内容有真实语义,也不是本段的交付物。
++    const brain = loadBrain()
++    withPanel(brain, {
++      ok: true,
++      snapshot: { version: 1, nodes: [] },
++      truncated: false,
++      mediaStates: { 'img-1': { state: 'available', imageRef: 'cindy-media://blobs/deadbeef.png' } },
++      mediaSummary: { requested: 1, available: 1, unavailable: 0 },
++    })
++    await brain.handles.handleToolCall({
++      tool: 'canvas_snapshot',
++      callId: 'c1',
++      args: { mediaNodeIds: ['img-1'] },
++    })
++
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(true)
++    expect(sent?.result?.mediaStates).toEqual({
++      'img-1': { state: 'available', imageRef: 'cindy-media://blobs/deadbeef.png' },
++    })
++    expect(sent?.result?.mediaSummary).toEqual({ requested: 1, available: 1, unavailable: 0 })
++  })
++
++  it('面板在线但回执未带 mediaStates(真实解析尚未接线,T3b 之前的现状)→ 最终交卷对象不出现该字段', async () => {
++    const brain = loadBrain()
++    withPanel(brain, { ok: true, snapshot: { version: 1, nodes: [] }, truncated: false })
++    await brain.handles.handleToolCall({
++      tool: 'canvas_snapshot',
++      callId: 'c1',
++      args: { mediaNodeIds: ['img-1'] },
++    })
++
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(true)
++    expect(sent?.result).not.toHaveProperty('mediaStates')
++    expect(sent?.result).not.toHaveProperty('mediaSummary')
++  })
++})
+diff --git a/src/agent/agentBridge.ts b/src/agent/agentBridge.ts
+index 8ed30c75..f90d0bc1 100644
+--- a/src/agent/agentBridge.ts
++++ b/src/agent/agentBridge.ts
+@@ -45,6 +45,36 @@ const WRITE_VERBS = new Set(['add-note', 'place-images', 'generate', 'edit'])
+ // 常见后缀试探(≤5 次同源请求/图,命中即止)。
+ const EXT_CANDIDATES = ['.png', '.jpg', '.jpeg', '.webp', '.gif']
+ 
++// mediaNodeIds 单次上限(#297 T3a,设计稿 §2.1.1-②/§2.1.2):超出/重复一律
++// 整单 INVALID_PARAMS。ghost.json 本段暂不暴露这个参数(暗态)。
++const MEDIA_NODE_IDS_MAX = 8
++
++/**
++ * mediaNodeIds 的类型校验——面板侧纵深复校(#297 T3a 设计稿 §2.1.1-③):
++ * `agentBridge.ts` 经 BroadcastChannel 接收 `params`,这是一个进程间消息传递
++ * 边界,不能假设消息一定来自 `main.js` 那条已校验路径——独立重跑同一套规则,
++ * 不盲信一个已校验的标志位。
++ *
++ * 与 `cindyplugin/main.js` 的同名函数逐字节一致但物理上是两份独立代码(main.js
++ * 是不过打包的自包含脚本,没法 import 这份 TS 模块;与 `ownArg`/原型污染防护的
++ * 既有两份并存模式同构)。非法输入一律整单 INVALID_PARAMS、fail-fast、零副作用:
++ * 不调 `agentReadSnapshotPage`。
++ */
++function validateMediaNodeIds(value: unknown): { ok: true; value?: string[] } | { ok: false; message: string } {
++  if (value === undefined) return { ok: true, value: undefined }
++  if (!Array.isArray(value)) return { ok: false, message: 'mediaNodeIds 必须是字符串数组' }
++  if (value.length > MEDIA_NODE_IDS_MAX) {
++    return { ok: false, message: `mediaNodeIds 最多 ${MEDIA_NODE_IDS_MAX} 个,请拆成多次调用` }
++  }
++  const seen = new Set<string>()
++  for (const id of value) {
++    if (typeof id !== 'string' || !id) return { ok: false, message: 'mediaNodeIds 里的每一项必须是非空字符串' }
++    if (seen.has(id)) return { ok: false, message: `mediaNodeIds 不允许重复项: ${id}` }
++    seen.add(id)
++  }
++  return { ok: true, value: value as string[] }
++}
++
+ const fetchOwnedMediaFile = async (hash: string): Promise<{ file: File; ext: string } | null> => {
+   if (!/^[a-f0-9]{16,128}$/i.test(hash)) return null
+   for (const ext of EXT_CANDIDATES) {
+@@ -117,6 +147,14 @@ export function installAgentBridge(): void {
+             reason,
+           }
+         } else if (msg.verb === 'snapshot') {
++          // 纵深复校统一冻结在任何读页动作之前(#297 T3a 设计稿 §2.1.1-③):
++          // mediaNodeIds 的类型校验(数组/≤8/非空字符串/无重复)已经在 main.js 的
++          // snapshotFilterArgs 之后跑过一次,这里是独立重跑,不是重复劳动——逻辑
++          // 与 main.js 那份逐字节一致但物理上是两份独立代码。校验不过 fail-fast,
++          // 不读页。真实逐 id 解析(mediaStates/mediaSummary)归 T3b,本段只验证
++          // 参数能不能合法地传到这一层,不产出这两个字段。
++          const mediaValidation = validateMediaNodeIds(params.mediaNodeIds)
++          if (!mediaValidation.ok) throw new AgentVerbError('INVALID_PARAMS', mediaValidation.message)
+           // 过滤/分页/字节上限的语义全在共享层(src/agent/snapshotRegion.ts);这里
+           // 只把参数原样递进去、把 SnapshotPage 摊平成回执字段(#297 R7a §六-9)。
+           const page = agentReadSnapshotPage(params)

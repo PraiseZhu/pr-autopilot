@@ -1,0 +1,288 @@
+diff --git a/main.js b/main.js
+index 78e16a06..9a4cfe3d 100644
+--- a/main.js
++++ b/main.js
+@@ -4016,8 +4016,17 @@ function snapshotOfflineFirstPage(snapshot, maxBytes = SNAPSHOT_PAGE_MAX_BYTES)
+ function normalizeSelectionObservation(snapshot, offline) {
+   if (!snapshot || typeof snapshot !== 'object') return snapshot
+ 
+-  const withoutSelectionFields = (source) => {
++  // SC-T2c.4:字段名契约唯一为 `selectionObservation`——上游若已带同语义的别名字段
++  // `observation`(如坑回包投毒),必须在三态(available/invalid/offline)统一清洗,
++  // 不能只挑 offline/invalid 两路删,给 available 留一条漏网之鱼。
++  const stripObservationAlias = (source) => {
+     const next = Object.assign({}, source)
++    delete next.observation
++    return next
++  }
++
++  const withoutSelectionFields = (source) => {
++    const next = stripObservationAlias(source)
+     delete next.selectedImageNodeIds
+     delete next.selectedNodeCount
+     delete next.selectedImageNodesTruncated
+@@ -4046,7 +4055,7 @@ function normalizeSelectionObservation(snapshot, offline) {
+   ) {
+     return markInvalid('selectedImageNodeIds 不是合法的字符串数组(逐项非空/无重复/长度≤64)')
+   }
+-  if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) {
++  if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) {
+     return markInvalid('selectedNodeCount 不是非负安全整数')
+   }
+   if (truncatedFlag !== undefined && truncatedFlag !== true) {
+@@ -4062,16 +4071,18 @@ function normalizeSelectionObservation(snapshot, offline) {
+   }
+   // ③本页可验证语义:本页 nodes 里出现的选中图片 id,其节点 type 必须是 'image'
+   // (不在本页的 id 无法本地复核,不算违规——信任边界,见函数顶注)。
++  // SC-T2c.3:`Map.get` 的 undefined 同时表示"未出现"与"出现但 type 缺失"——用
++  // `has` 先区分两种情形,只有"确实出现在本页"才判定合法性,避免坑回包(type 缺失)
++  // 被误当"不在本页,无法复核"而放行。
+   const nodesInPage = Array.isArray(snapshot.nodes) ? snapshot.nodes : []
+   const typeById = new Map(nodesInPage.map((node) => [node && node.id, node && node.type]))
+   for (const id of ids) {
+-    const type = typeById.get(id)
+-    if (type !== undefined && type !== 'image') {
++    if (typeById.has(id) && typeById.get(id) !== 'image') {
+       return markInvalid('selectedImageNodeIds 命中本页里 type 不是 image 的节点: ' + id)
+     }
+   }
+ 
+-  return Object.assign({}, snapshot, { selectionObservation: 'available' })
++  return Object.assign(stripObservationAlias(snapshot), { selectionObservation: 'available' })
+ }
+ 
+ /** 统一交卷形状:面板首页与离线首页共用,字段名与共享层 SnapshotPage 一致。 */
+diff --git a/src/__tests__/agentBridgeWriteGate.test.ts b/src/__tests__/agentBridgeWriteGate.test.ts
+index 9e3a7bf3..9f5a6472 100644
+--- a/src/__tests__/agentBridgeWriteGate.test.ts
++++ b/src/__tests__/agentBridgeWriteGate.test.ts
+@@ -256,3 +256,94 @@ describe('两个码不合并(判据 4)', () => {
+     expect(reply?.code).not.toBe('PANEL_CLOSED')
+   })
+ })
++
++// ── r2-select 二轮对抗审查 Finding 1(MAJOR)返修 ─────────────────────────────
++//
++// 被修的缺口:仓内**唯一**走真实 installAgentBridge() 的 snapshot 用例(本文件上面
++// 那条「读动词不受闸门影响」)全部断言只有两行 —— ok:true + snapshot truthy。选中观测
++// 组的三个字段一个都没查。
++//
++// 三层同时假绿的场景:用户只选 target 图。若桥层重构把 selectedNodeCount 弄丢或常量
++// 覆盖(IDs 仍正确),则
++//   · T2a2 纯函数测试绿(直接测派生函数,不经桥)
++//   · T2b/T2c egress 测试绿(用伪造面板回包,自带正确 count)
++//   · 真实桥测试绿(只查 truthy)
++// 而生产 normalizeSelectionObservation 会判该组 invalid → **整组剔除 IDs** → agent 认
++// 不到用户选的那张图。owner 要的能力被打掉,CI 全绿。
++//
++// 生产代码当前没有误传(agentBridge.ts 原样传 page.snapshot),所以这是**门缺口**,
++// 不是已发生的 bug。
++describe('真实桥交接必须整组锁住选中观测组三字段(r2-select Finding 1)', () => {
++  const imageNode = (id: string) => ({
++    id,
++    type: 'image' as const,
++    title: id,
++    x: 0,
++    y: 0,
++    width: 100,
++    height: 100,
++    status: 'ready' as const,
++    assetUrl: `mivo-asset://${id}`,
++  })
++
++  it('target + decoy 两张图、只选 target → 桥回执精确含 target 一个 id、count=1、truncated 缺省;decoy 三条负向断言', async () => {
++    useCanvasStore.setState({
++      nodes: [imageNode('target'), imageNode('decoy')] as never,
++      selectedNodeIds: ['target'],
++    } as never)
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot')
++    const snapshot = reply?.snapshot as Record<string, unknown> | undefined
++    expect(snapshot).toBeTruthy()
++
++    // 正向:三个字段整组精确 —— 用 toEqual 而不是 toContain,后者抓不住「decoy 也混进来」。
++    expect(snapshot?.selectedImageNodeIds).toEqual(['target'])
++    expect(snapshot?.selectedNodeCount).toBe(1)
++    // 该字段的契约是「只允许 true 或缺省」,所以断缺省而不是断 falsy。
++    expect(snapshot?.selectedImageNodesTruncated).toBeUndefined()
++    expect(Object.prototype.hasOwnProperty.call(snapshot ?? {}, 'selectedImageNodesTruncated')).toBe(false)
++
++    // 负向三条(decoy 不得以任何形式渗进去):
++    const ids = snapshot?.selectedImageNodeIds as string[]
++    expect(ids).not.toContain('decoy')                                  // ① 不在 id 清单里
++    expect(snapshot?.selectedNodeCount).not.toBe(2)                     // ② 没被算进计数
++    expect(JSON.stringify(snapshot?.selectedImageNodesTruncated ?? null)).toBe('null') // ③ 没因它置 truncated
++
++    // F7:历史字段仍被剥离(派生字段才是真值来源),这条同时防「有人把剥离撤了当成修复」。
++    expect(snapshot?.selectedNodeIds).toEqual([])
++  })
++
++  it('选中图片数超上限(65 > MAX_SELECTED_IMAGE_NODE_IDS=64)→ truncated:true 且 id 清单长度恰好等于上限', async () => {
++    // 长度必须**恰好**等于上限:main.js 的 egress 校验有一条「truncated 为 true 但长度
++    // 不等于上限」判 invalid,只断 flag 不断长度会漏掉那条约束。
++    const ids = Array.from({ length: 65 }, (_, i) => `img-${i}`)
++    useCanvasStore.setState({
++      nodes: ids.map(imageNode) as never,
++      selectedNodeIds: ids,
++    } as never)
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot')
++    const snapshot = reply?.snapshot as Record<string, unknown> | undefined
++
++    expect(snapshot?.selectedImageNodesTruncated).toBe(true)
++    expect((snapshot?.selectedImageNodeIds as string[]).length).toBe(64)
++    expect(snapshot?.selectedNodeCount).toBe(65)
++  })
++
++  it('什么都没选中(作为输入,不是作为输出)→ 空清单 + count 0 + truncated 缺省', async () => {
++    useCanvasStore.setState({
++      nodes: [imageNode('target'), imageNode('decoy')] as never,
++      selectedNodeIds: [],
++    } as never)
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot')
++    const snapshot = reply?.snapshot as Record<string, unknown> | undefined
++
++    expect(snapshot?.selectedImageNodeIds).toEqual([])
++    expect(snapshot?.selectedNodeCount).toBe(0)
++    expect(snapshot?.selectedImageNodesTruncated).toBeUndefined()
++  })
++})
+diff --git a/src/__tests__/brainSnapshot.test.ts b/src/__tests__/brainSnapshot.test.ts
+index c573d921..021e0d58 100644
+--- a/src/__tests__/brainSnapshot.test.ts
++++ b/src/__tests__/brainSnapshot.test.ts
+@@ -80,6 +80,7 @@ const offlineEgressShapeOf = (snapshot: Record<string, unknown>): Record<string,
+   delete next.selectedImageNodeIds
+   delete next.selectedNodeCount
+   delete next.selectedImageNodesTruncated
++  delete next.observation // SC-T2c.4:别名字段三态统一清洗,离线路径同样不例外。
+   return { ...next, selectionObservation: 'unavailable' }
+ }
+ 
+@@ -210,16 +211,38 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+     })
+   })
+ 
+-  it('不存在别名字段(如 observation)——字段名契约唯一为 selectionObservation', async () => {
++  // SC-T2c.4(P1 修复):此前这条测试没往上游注入 `observation` 别名,纯透传也会绿——
++  // 测不出"三态归一化只删三个数值字段,从不清洗上游已有的 observation 别名"这条回归。
++  // 改成主动注入 observation 再断言最终交卷对象不存在,才能证伪。
++  // 反证:把 main.js 里 `stripObservationAlias` 对 available 路径的调用去掉(改回
++  // `Object.assign({}, snapshot, {...})`)重跑,本测试必须变红。
++  it('不存在别名字段(如 observation)——上游主动注入,egress 仍须清洗掉(字段名契约唯一为 selectionObservation)', async () => {
+     const sent = await callSnapshot({
+       version: 1,
+       sceneId: 'scene-1',
++      observation: 'poison', // 上游/坑回包投毒:同语义别名字段
+       nodes: [node('img-1', { type: 'image' })],
+       selectedImageNodeIds: ['img-1'],
+       selectedNodeCount: 1,
+     })
+     expect(sent?.result?.snapshot).not.toHaveProperty('observation')
+     expect(Object.keys(sent?.result?.snapshot as object)).toContain('selectionObservation')
++    expect(sent?.result?.snapshot).toMatchObject({ selectionObservation: 'available' })
++  })
++
++  // SC-T2c.4 补充:invalid/offline 两条路径此前已经会删 observation(withoutSelectionFields
++  // 覆盖),这里同样改成主动注入验证——三态统一清洗,不是只有 available 这一路补上了。
++  it('别名字段在 invalid 路径同样被清洗(不因校验失败就漏删)', async () => {
++    const sent = await callSnapshot({
++      version: 1,
++      sceneId: 'scene-1',
++      observation: 'poison',
++      nodes: [node('note-1', { type: 'markup' })],
++      selectedImageNodeIds: ['note-1'], // 本页语义违规 → invalid
++      selectedNodeCount: 1,
++    })
++    expect(sent?.result?.snapshot).toMatchObject({ selectionObservation: 'invalid' })
++    expect(sent?.result?.snapshot).not.toHaveProperty('observation')
+   })
+ 
+   it('合法截断(65 张选中裁到 64 + truncated:true,count>=64)→ 仍判 available,不误伤合法截断', async () => {
+@@ -291,7 +314,8 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+   })
+ 
+   describe('三类坏例逐条注入 → invalid,数值字段整组剔除 + diag 留痕', () => {
+-    const badCases: Array<[string, Record<string, unknown>]> = [
++    // 第三个可选元素:附加到基础 nodes 数组末尾的额外节点(默认无附加)。
++    const badCases: Array<[string, Record<string, unknown>, Record<string, unknown>[]?]> = [
+       [
+         '形状①:selectedImageNodeIds 含空字符串',
+         { selectedImageNodeIds: ['img-1', ''], selectedNodeCount: 2 },
+@@ -312,6 +336,13 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+         '形状⑤:selectedNodeCount 为负数',
+         { selectedImageNodeIds: [], selectedNodeCount: -1 },
+       ],
++      // SC-T2c.3①(P1 修复):Number.isInteger 接受超出安全范围的整数(如
++      // Number.MAX_SAFE_INTEGER+1===9007199254740992,IEEE754 double 仍能表示成整数
++      // 形状但精度已不可信);必须用 Number.isSafeInteger。
++      [
++        '形状⑥:selectedNodeCount 是不安全整数(超出 Number.MAX_SAFE_INTEGER)',
++        { selectedImageNodeIds: [], selectedNodeCount: Number.MAX_SAFE_INTEGER + 1 },
++      ],
+       [
+         '关系不变量①:selectedNodeCount 小于 selectedImageNodeIds 长度',
+         { selectedImageNodeIds: ['img-1', 'img-2'], selectedNodeCount: 1 },
+@@ -332,9 +363,18 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+         '本页语义:selectedImageNodeIds 命中本页一个 type 不是 image 的节点',
+         { selectedImageNodeIds: ['note-1'], selectedNodeCount: 1 },
+       ],
++      // SC-T2c.3②(P1 修复):`Map.get` 的 undefined 同时表示"未出现"与"出现但 type
++      // 缺失"——ghost-1 确实出现在本页 nodes 里(不是"不在本页,无法复核"的信任边界
++      // 情形),但缺 type 字段;旧逻辑 `type !== undefined && type !== 'image'` 对
++      // undefined 直接放行,坑回包会被误判成 available。
++      [
++        '本页语义②:selectedImageNodeIds 命中本页节点但该节点缺 type 字段(出现≠不在本页)',
++        { selectedImageNodeIds: ['ghost-1'], selectedNodeCount: 1 },
++        [{ id: 'ghost-1', title: 'ghost', bounds: { x: 0, y: 0, width: 1, height: 1 }, status: 'ready' }],
++      ],
+     ]
+ 
+-    for (const [label, selectionFields] of badCases) {
++    for (const [label, selectionFields, extraNodes] of badCases) {
+       it(label + ' → invalid', async () => {
+         const brain = loadBrain()
+         withPanel(brain, {
+@@ -342,7 +382,10 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+           snapshot: {
+             version: 1,
+             sceneId: 'scene-1',
+-            nodes: [node('img-1', { type: 'image' }), node('img-2', { type: 'image' }), node('note-1', { type: 'markup' })],
++            nodes: [
++              node('img-1', { type: 'image' }), node('img-2', { type: 'image' }), node('note-1', { type: 'markup' }),
++              ...(extraNodes ?? []),
++            ],
+             ...selectionFields,
+           },
+           truncated: false,
+@@ -430,6 +473,26 @@ describe('canvas_snapshot 离线降级', () => {
+     expect(brain.fsRequests.filter((item) => item.path === 'canvases/ai-snapshot.json')).toHaveLength(1)
+   })
+ 
++  // SC-T2c.4 补充:离线路径此前就会删 observation(offline 分支复用
++  // withoutSelectionFields),这里补一条主动注入的回归钉死——离线文件本身带 observation
++  // 别名(如旧版快照残留)也不例外。
++  it('面板未打开 + 离线快照带 observation 别名 → egress 同样清洗掉(三态统一清洗)', async () => {
++    const fixture = { ...snapshotFixture([node('n-0')]), observation: 'poison' } // sceneId: 'scene-offline'
++    const brain = closedPanelBrain({ files: { 'canvases/ai-snapshot.json': JSON.stringify(fixture) } })
++    const pending = brain.handles.handleToolCall({
++      tool: 'canvas_snapshot',
++      callId: 'c1',
++      args: { sceneId: 'scene-offline' },
++    })
++    brain.clock.advance(6_000)
++    await pending
++
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(true)
++    expect(sent?.result?.snapshot).not.toHaveProperty('observation')
++    expect(sent?.result?.snapshot).toMatchObject({ selectionObservation: 'unavailable' })
++  })
++
+   it('面板未打开 + sceneId 与离线快照不一致 → SCENE_MISMATCH,不把读错板的结果悄悄交卷(review2:325②)', async () => {
+     const fixture = snapshotFixture([node('n-0')]) // sceneId: 'scene-offline'
+     const brain = closedPanelBrain({ files: { 'canvases/ai-snapshot.json': JSON.stringify(fixture) } })

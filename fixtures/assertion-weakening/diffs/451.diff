@@ -1,0 +1,604 @@
+diff --git a/ghost.json b/ghost.json
+index d33ba217..37dc6124 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.11",
++  "version": "0.9.12",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/src/__tests__/agentBridgeMediaNodeIds.test.ts b/src/__tests__/agentBridgeMediaNodeIds.test.ts
+index 17f627a2..36ac800c 100644
+--- a/src/__tests__/agentBridgeMediaNodeIds.test.ts
++++ b/src/__tests__/agentBridgeMediaNodeIds.test.ts
+@@ -93,10 +93,15 @@ describe('agentBridge snapshot 动词的 mediaNodeIds 独立校验(#297 T3a SC-T
+     const reply = await ask('snapshot', { mediaNodeIds: ['img-1', 'img-2'] })
+     expect(reply).toMatchObject({ ok: true })
+     expect(reply?.snapshot).toBeTruthy()
+-    // T3a 不实现真实逐 id 解析:合法参数到达不代表这里已经产出
+-    // mediaStates/mediaSummary,那是 T3b 的交付边界——本条同时钉住"没有提前偷跑"。
+-    expect(reply).not.toHaveProperty('mediaStates')
+-    expect(reply).not.toHaveProperty('mediaSummary')
++    // #297 T3b1 翻钉(原 T3a 反向钉子「不产出 mediaStates/mediaSummary」已被 T3b1
++    // 的真实逐 id 解析交付取代,见 agentBridgeMediaResolve.test.ts):校验通过后
++    // 现在真的会产出这两个字段——本测试文件不建 store 节点,'img-1'/'img-2' 都
++    // 不在这一页里,判 not_in_page,恒等式 available+unavailable=requested 成立。
++    expect(reply?.mediaStates).toEqual({
++      'img-1': { state: 'unavailable', reason: 'not_in_page' },
++      'img-2': { state: 'unavailable', reason: 'not_in_page' },
++    })
++    expect(reply?.mediaSummary).toEqual({ requested: 2, available: 0, unavailable: 2 })
+   })
+ 
+   it('未传 mediaNodeIds → 正常读页,不受影响', async () => {
+diff --git a/src/__tests__/agentBridgeMediaResolve.test.ts b/src/__tests__/agentBridgeMediaResolve.test.ts
+new file mode 100644
+index 00000000..c543195b
+--- /dev/null
++++ b/src/__tests__/agentBridgeMediaResolve.test.ts
+@@ -0,0 +1,388 @@
++/**
++ * agentBridge.ts 的 snapshot 动词真实逐 id 媒体解析(#297 T3b1,设计稿
++ * §2.1.1「触发实现点」/§2.2/§2.3/§2.4/§2.5/§2.6/§2.7/§2.8/§4.7)。
++ *
++ * 覆盖 SC(T3b 预拆裁决:T3b1 = 不需要 deposit 通道通电的那一半):
++ *  - SC-T3b.1 唯一业务链:page.snapshot.nodes 校验 → store 回查原始
++ *    MivoCanvasNode → assetBlobForNode → resolveDepositEntry(唯一入口);
++ *    rg 接线锁(不直调无缓存原语 depositBlob、不自行写 depositMap);逐 id
++ *    catch/继续。
++ *  - SC-T3b.2 MediaNodeState 两态判别联合;reason 枚举全量;
++ *    available+unavailable=requested 恒等式;部分成功工具仍 ok:true;live 最终
++ *    对象含 mediaStates/mediaSummary;空/缺省 mediaNodeIds 字节级兼容且零 deposit。
++ *  - SC-T3b.3 要看才传(仅点名节点寄存);from:'deposit' 记账;同批重看零新增
++ *    配额;固定中性 label(敏感文件名/节点名夹具断言 payload 不含二者);diag
++ *    trigger:'edit'|'snapshot';不进 WRITE_VERBS 负断言 + 真实 undo 栈零增量。
++ *  - SC-T3b.5 mediaStates 方案 A 适配层 enrichment;回执只携带引用,永不内联
++ *    base64。
++ *
++ * 段边界:imageRef 按 T0 冻结契约解析 → 真实 Read → byteDigest 对账(SC-T3b.4)
++ * 需要 deposit 通道真正通电,归 T3b2(DoR = T1f),本文件不测、不声称交付。
++ *
++ * 端到端跑在真实 depositPort.ts/depositStore.ts + 真实 main.js(经
++ * depositTestHarness 的假宿主)之上,不是对着替身自说自话——与
++ * depositPort.test.ts 同一套基础设施,只是驱动方式换成真实 agentBridge.ts 的
++ * 'snapshot' 动词(经 brainHarness 的 ChannelBus,与 agentBridgeMediaNodeIds.test.ts
++ * 同一套桥接手法)。
++ */
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.hoisted(() => {
++  const store = new Map<string, string>()
++  const memStorage = {
++    get length() {
++      return store.size
++    },
++    clear: () => store.clear(),
++    getItem: (key: string) => store.get(key) ?? null,
++    key: (index: number) => [...store.keys()][index] ?? null,
++    removeItem: (key: string) => {
++      store.delete(key)
++    },
++    setItem: (key: string, value: string) => {
++      store.set(key, String(value))
++    },
++  }
++  const globals = globalThis as Record<string, unknown>
++  if (globals.window === undefined) globals.window = { localStorage: memStorage }
++  if (globals.localStorage === undefined) globals.localStorage = memStorage
++})
++
++vi.mock('../../../src/lib/demoImages', () => ({ createDemoImage: () => 'data:image/png;base64,mock' }))
++vi.mock('../../../src/store/remoteDebugReporter', () => ({ reportRemoteDebugEntry: () => {} }))
++
++const flushPersistNowMock = vi.fn(async () => true)
++vi.mock('../persist/persistSync', () => ({
++  flushPersistNow: () => flushPersistNowMock(),
++  restoreFromDiskIfEmpty: async () => 'skipped',
++  startAutoSave: () => {},
++}))
++
++type ImportedAssetFile = { name: string; type: string; blob: Blob; createdAt: number }
++const readImportedAssetFileMock = vi.fn<(assetUrl?: string) => Promise<ImportedAssetFile | undefined>>()
++vi.mock('../../../src/lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock', name: 'n', type: 'image/png' })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: (assetUrl?: string) => readImportedAssetFileMock(assetUrl),
++}))
++
++// 有意不 mock '../persist/bridge':本文件要走真实 depositPort/depositStore 的
++// 传输注入点(setDepositMediaTransport/setDepositTransport,depositTestHarness
++// 已经这么做),不是对着一个手搓替身断言。
++
++import { ChannelBus, channelConstructorFor, flushUntil } from './brainHarness'
++import {
++  FAKE_HASH,
++  blobOfBytes,
++  createDepositHarness,
++  teardownDepositHarness,
++  type DepositHarness,
++} from './depositTestHarness'
++import { resetCanvasWriteGateForTests } from '../../../src/agent/canvasWriteGate'
++import { installAgentBridge, mediaFailureReasonFor } from '../agent/agentBridge'
++import { DepositError, setDepositSleepForTests, type DepositFailureCode } from '../agent/depositPort'
++import { lookupDeposit } from '../agent/depositStore'
++import { useCanvasStore } from '../../../src/store/canvasStore'
++import { debugLogger, useDebugLogStore } from '../../../src/store/debugLogStore'
++import type { MivoCanvasNode } from '../../../src/types/mivoCanvas'
++
++const CHANNEL = 'mivo-canvas-agent'
++
++/** 起一个独立总线 + 真实桥(与 depositTestHarness 内部的假 main.js 总线互不相关,
++ * 两者只通过 depositPort/depositStore 的模块级传输注入点耦合)。 */
++const wireBridge = () => {
++  const bus = new ChannelBus()
++  const globals = globalThis as Record<string, unknown>
++  const previous = globals.BroadcastChannel
++  globals.BroadcastChannel = channelConstructorFor(bus)
++  installAgentBridge()
++  globals.BroadcastChannel = previous
++
++  const brainSide = bus.open(CHANNEL)
++  let seq = 0
++  const ask = async (verb: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown> | null> => {
++    seq += 1
++    const reqId = `probe-${seq}`
++    let reply: Record<string, unknown> | null = null
++    brainSide.onmessage = (event) => {
++      const data = event.data as Record<string, unknown> | undefined
++      if (data && data.reply === true && data.reqId === reqId) reply = data
++    }
++    brainSide.postMessage({ reqId, verb, params })
++    await flushUntil(() => reply !== null, { label: `agent 桥对动词 '${verb}' 的回执` })
++    return reply
++  }
++  return { ask }
++}
++
++const imageNode = (id: string, assetUrl: string, extra: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++  id,
++  type: 'image',
++  title: id,
++  x: 0,
++  y: 0,
++  width: 100,
++  height: 100,
++  status: 'ready',
++  assetUrl,
++  ...extra,
++})
++
++let harness: DepositHarness
++
++beforeEach(() => {
++  vi.clearAllMocks()
++  flushPersistNowMock.mockImplementation(async () => true)
++  readImportedAssetFileMock.mockResolvedValue(undefined)
++  resetCanvasWriteGateForTests()
++  useDebugLogStore.getState().clear()
++  harness = createDepositHarness()
++  // 频控退避走真实 setTimeout(depositPort.ts 的编译期常量 DEPOSIT_RATE_RETRY_DELAY_MS
++  // = 1.1s);测试不用假时钟(brainHarness 的 flushUntil 只推进微任务,推不动真实
++  // 定时器),直接把退避睡眠替身成立即 resolve,与 depositPort.test.ts 同一手法。
++  setDepositSleepForTests(async () => {})
++})
++
++afterEach(() => {
++  setDepositSleepForTests(undefined)
++  teardownDepositHarness()
++  vi.unstubAllGlobals()
++})
++
++describe('SC-T3b.1 唯一业务链(rg 源码接线锁)', () => {
++  it('agentBridge.ts 只经 resolveDepositEntry 消费寄存,不直调 depositBlob、不 import depositStore', async () => {
++    const source = await import('node:fs/promises').then((fs) =>
++      fs.readFile(new URL('../agent/agentBridge.ts', import.meta.url), 'utf8'),
++    )
++    expect(source).toContain('resolveDepositEntry(')
++    expect(source).not.toMatch(/\bdepositBlob\(/)
++    expect(source).not.toMatch(/from '\.\/depositStore'/)
++  })
++})
++
++describe('SC-T3b.2 真实逐 id 解析:available/unavailable 判别联合', () => {
++  it('图片节点在页内 + 寄存成功 → available,imageRef=cindy-media://blobs/<hash><ext>,永不内联 base64(SC-T3b.5)', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://a')] })
++    readImportedAssetFileMock.mockResolvedValue({
++      name: 'a.png',
++      type: 'image/png',
++      blob: blobOfBytes(64),
++      createdAt: 0,
++    })
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    expect(reply).toMatchObject({ ok: true })
++    expect(reply?.mediaStates).toEqual({
++      'img-1': { state: 'available', imageRef: `cindy-media://blobs/${FAKE_HASH}.png` },
++    })
++    expect(reply?.mediaSummary).toEqual({ requested: 1, available: 1, unavailable: 0 })
++    // §4.7 定案:只携带引用——回执 JSON 里不出现 base64/data: 字样。
++    expect(JSON.stringify(reply)).not.toMatch(/data:image|base64/i)
++    await expect(lookupDeposit('mivo-asset://a')).resolves.toMatchObject({ hash: FAKE_HASH, from: 'deposit' })
++  })
++
++  it('id 不在这一页 → not_in_page,不查 store、不发寄存请求', async () => {
++    // 故意不把 'img-ghost' 放进 store:page.snapshot.nodes 里同样没有它。
++    useCanvasStore.setState({ nodes: [] })
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-ghost'] })
++
++    expect(reply?.mediaStates).toEqual({ 'img-ghost': { state: 'unavailable', reason: 'not_in_page' } })
++    expect(harness.hostRequests).toHaveLength(0)
++  })
++
++  it('id 在页内但不是图片类型 → not_image,不发寄存请求', async () => {
++    useCanvasStore.setState({
++      nodes: [
++        { id: 'note-1', type: 'text', title: 'note', x: 0, y: 0, width: 10, height: 10, status: 'ready' } as MivoCanvasNode,
++      ],
++    })
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['note-1'] })
++
++    expect(reply?.mediaStates).toEqual({ 'note-1': { state: 'unavailable', reason: 'not_image' } })
++    expect(harness.hostRequests).toHaveLength(0)
++  })
++
++  it('部分成功(2 个里 1 个 not_in_page)→ 工具整体仍 ok:true,available+unavailable=requested 恒等式成立', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://a')] })
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1', 'img-missing'] })
++
++    expect(reply?.ok).toBe(true)
++    expect(reply?.mediaStates).toMatchObject({
++      'img-1': { state: 'available' },
++      'img-missing': { state: 'unavailable', reason: 'not_in_page' },
++    })
++    const summary = reply?.mediaSummary as { requested: number; available: number; unavailable: number }
++    expect(summary.available + summary.unavailable).toBe(summary.requested)
++    expect(summary).toEqual({ requested: 2, available: 1, unavailable: 1 })
++  })
++
++  it('宿主回执结构化配额两数命中 → quota_full', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://quota')] })
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++    harness.setHostReply(() => ({ ok: false, quotaUsedBytes: 100, quotaLimitBytes: 100 }))
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    expect(reply?.mediaStates).toEqual({ 'img-1': { state: 'unavailable', reason: 'quota_full' } })
++  })
++
++  it('宿主回执文案命中限流 → rate_limited(退避重试仍失败后如实上报,不阻断整单)', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://rl')] })
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++    harness.setHostReply(() => ({ ok: false, message: '请求过于频繁,请稍后再试' }))
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    expect(reply?.ok).toBe(true) // 单个 id 失败不阻断整次 snapshot 调用
++    expect(reply?.mediaStates).toEqual({ 'img-1': { state: 'unavailable', reason: 'rate_limited' } })
++  })
++
++  it('assetBlobForNode 取字节失败(读不到源图字节)→ unknown,不进入寄存链路', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://unreadable')] })
++    readImportedAssetFileMock.mockResolvedValue(undefined)
++    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false }) as Response))
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    expect(reply?.mediaStates).toEqual({ 'img-1': { state: 'unavailable', reason: 'unknown' } })
++    expect(harness.hostRequests).toHaveLength(0) // 从未到达 resolveDepositEntry
++  })
++
++  it('空数组 → 最终交卷对象不出现 mediaStates/mediaSummary,零寄存请求(字节级兼容)', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://a')] })
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: [] })
++
++    expect(reply).not.toHaveProperty('mediaStates')
++    expect(reply).not.toHaveProperty('mediaSummary')
++    expect(harness.hostRequests).toHaveLength(0)
++  })
++
++  it('未传 mediaNodeIds → 最终交卷对象不出现 mediaStates/mediaSummary,零寄存请求', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://a')] })
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot')
++
++    expect(reply).not.toHaveProperty('mediaStates')
++    expect(reply).not.toHaveProperty('mediaSummary')
++    expect(harness.hostRequests).toHaveLength(0)
++  })
++})
++
++describe('SC-T3b.2 reason 枚举全量(DepositFailureCode → MediaUnavailableReason 映射)', () => {
++  const cases: Array<[DepositFailureCode, string]> = [
++    ['TOO_LARGE', 'too_large'],
++    ['UNSUPPORTED_MIME', 'unsupported_type'],
++    ['QUOTA_FULL', 'quota_full'],
++    ['RATE_LIMITED', 'rate_limited'],
++    ['HOST_UNSUPPORTED', 'host_unsupported_kind'],
++    ['BRAIN_TIMEOUT', 'host_unresponsive'],
++    ['BAD_RECEIPT', 'unknown'],
++    ['DEPOSIT_FAILED', 'unknown'],
++  ]
++
++  for (const [code, reason] of cases) {
++    it(`DepositError(${code}) → reason=${reason}`, () => {
++      expect(mediaFailureReasonFor(new DepositError(code, 'x'))).toBe(reason)
++    })
++  }
++
++  it('非 DepositError 的异常 → unknown 兜底', () => {
++    expect(mediaFailureReasonFor(new Error('boom'))).toBe('unknown')
++    expect(mediaFailureReasonFor('not even an error')).toBe('unknown')
++  })
++})
++
++describe('SC-T3b.3 要看才传 + from:deposit 记账 + 同批零新增配额', () => {
++  it('画布上有两张图,只点名一张 → 仅该张发起寄存请求(要看才传)', async () => {
++    useCanvasStore.setState({
++      nodes: [imageNode('img-1', 'mivo-asset://a'), imageNode('img-2', 'mivo-asset://b')],
++    })
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++
++    const { ask } = wireBridge()
++    await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    expect(harness.hostRequests).toHaveLength(1)
++    await expect(lookupDeposit('mivo-asset://a')).resolves.toBeDefined()
++    await expect(lookupDeposit('mivo-asset://b')).resolves.toBeUndefined()
++  })
++
++  it('同一批内重复点名同一张图两次调用 → 第二次命中缓存,零新增寄存请求', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://a')] })
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++
++    const { ask } = wireBridge()
++    await ask('snapshot', { mediaNodeIds: ['img-1'] })
++    await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    expect(harness.hostRequests).toHaveLength(1)
++  })
++
++  it('固定中性 label,敏感文件名/节点标题绝不进 payload', async () => {
++    useCanvasStore.setState({
++      nodes: [
++        imageNode('img-secret', 'mivo-asset://张三-绝密合同截图.png', { title: '张三的私人聊天记录截图' }),
++      ],
++    })
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++
++    const { ask } = wireBridge()
++    await ask('snapshot', { mediaNodeIds: ['img-secret'] })
++
++    expect(harness.hostRequests).toHaveLength(1)
++    const sentLabel = String(harness.hostRequests[0]?.label ?? '')
++    expect(sentLabel).toBe('画布快照参考图')
++    expect(sentLabel).not.toContain('张三')
++    expect(sentLabel).not.toContain('绝密合同')
++    expect(sentLabel).not.toContain('私人聊天记录')
++    // 整份宿主请求(含 data 字段之外的一切元信息)都不含敏感串。
++    expect(JSON.stringify(harness.hostRequests[0])).not.toContain('张三')
++  })
++
++  it('diag 日志区分 trigger=snapshot(不新增 DIAG_SOURCE,只加字段区分触发路径)', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://a')] })
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++    const logSpy = vi.spyOn(debugLogger, 'log')
++
++    const { ask } = wireBridge()
++    await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    const hit = logSpy.mock.calls.find(([source, message]) => source === 'Cindy Deposit' && String(message).includes('trigger=snapshot'))
++    expect(hit).toBeTruthy()
++  })
++
++  it('不进 WRITE_VERBS 负断言:pre-hydrate(写闸未放行)时 snapshot 仍正常工作,不返回 PANEL_NOT_READY', async () => {
++    // resetCanvasWriteGateForTests() 已在 beforeEach 置为 pre-hydrate(未 ready)。
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://a')] })
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    expect(reply).toMatchObject({ ok: true })
++    expect(reply?.code).not.toBe('PANEL_NOT_READY')
++  })
++
++  it('真实 undo 栈零增量:snapshot 触发寄存不产生任何 historyPast 条目', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://a')], historyPast: [], historyFuture: [] })
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++    const before = useCanvasStore.getState().historyPast.length
++
++    const { ask } = wireBridge()
++    await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    expect(useCanvasStore.getState().historyPast.length).toBe(before)
++    expect(useCanvasStore.getState().historyPast).toHaveLength(0)
++  })
++})
+diff --git a/src/agent/agentBridge.ts b/src/agent/agentBridge.ts
+index f90d0bc1..185d3eaa 100644
+--- a/src/agent/agentBridge.ts
++++ b/src/agent/agentBridge.ts
+@@ -27,8 +27,11 @@ import {
+   releaseAgentGenerationContext,
+   snapshotAssetUrls,
+ } from './cindyGenerationPort'
++import { DepositError, resolveDepositEntry, type DepositFailureCode } from './depositPort'
+ import { initMediaLedger, lookupMedia } from './mediaLedger'
++import { assetBlobForNode } from '../../../src/lib/mivoImageClient'
+ import { useCanvasStore } from '../../../src/store/canvasStore'
++import type { AiCanvasContextNode } from '../../../src/types/mivoCanvas'
+ 
+ const CHANNEL_NAME = 'mivo-canvas-agent'
+ const SOURCE = 'Cindy Plugin Agent Bridge'
+@@ -75,6 +78,119 @@ function validateMediaNodeIds(value: unknown): { ok: true; value?: string[] } |
+   return { ok: true, value: value as string[] }
+ }
+ 
++/**
++ * mediaNodeIds 里每个 id 的判别联合结果(#297 T3b1,设计稿 §2.4:回应对抗审查
++ * finding 4)。类型层面写死 available⇒imageRef 必填、unavailable⇒reason 必填,
++ * 不是"两个字段都 optional、靠注释说明"。只存在于本插件组装的回执 JSON 里
++ * (§3.2 方案 A 适配层 enrichment),不进共享层 `src/types/mivoCanvas.ts`。
++ */
++export type MediaUnavailableReason =
++  | 'too_large'
++  | 'unsupported_type'
++  | 'quota_full'
++  | 'rate_limited'
++  | 'host_unresponsive'
++  | 'host_unsupported_kind'
++  | 'panel_closed'
++  | 'not_in_page'
++  | 'not_image'
++  | 'unknown'
++
++export type MediaNodeState =
++  | { state: 'available'; imageRef: string }
++  | { state: 'unavailable'; reason: MediaUnavailableReason }
++
++/**
++ * `resolveDepositEntry` 抛出的 `DepositError.code` → P3 回执 `reason` 的映射
++ * (设计稿 §2.3/§2.4:直接复用 P1b §4.7 失败矩阵,不新增失败分类)。
++ * BAD_RECEIPT/DEPOSIT_FAILED 没有对应的 P3 专属分类,落 'unknown' 兜底
++ * (消费方看 message,不是分类失配就报错)。
++ */
++const DEPOSIT_FAILURE_REASON: Record<DepositFailureCode, MediaUnavailableReason> = {
++  TOO_LARGE: 'too_large',
++  UNSUPPORTED_MIME: 'unsupported_type',
++  QUOTA_FULL: 'quota_full',
++  RATE_LIMITED: 'rate_limited',
++  HOST_UNSUPPORTED: 'host_unsupported_kind',
++  BRAIN_TIMEOUT: 'host_unresponsive',
++  BAD_RECEIPT: 'unknown',
++  DEPOSIT_FAILED: 'unknown',
++}
++
++/** 导出供单测直接核对映射表全量覆盖(#297 T3b1 SC-T3b.2「reason 枚举全量」)。 */
++export const mediaFailureReasonFor = (error: unknown): MediaUnavailableReason =>
++  error instanceof DepositError ? DEPOSIT_FAILURE_REASON[error.code] : 'unknown'
++
++/**
++ * 固定中性 label(设计稿 §2.8):与编辑触发寄存用的 `DEPOSIT_LABEL`
++ * (`depositPort.ts`,不在本段领地内,不改)是两个独立常量——本适配层只读
++ * 消费 `resolveDepositEntry` 的 `label` 参数覆盖点,绝不填用户文件名或节点
++ * 标题(节点 `title` 同样不进 label)。
++ */
++const SNAPSHOT_MEDIA_LABEL = '画布快照参考图'
++
++/** 复用既有 `Cindy Deposit` 诊断源(不新增 DIAG_SOURCE 条目),只加 trigger 字段
++ * 区分触发路径(设计稿 §2.3:trigger:'edit'|'snapshot')。 */
++const SNAPSHOT_DEPOSIT_DIAG_SOURCE = 'Cindy Deposit'
++
++/**
++ * SC-T3b.1 唯一业务链(设计稿 §2.1.1「触发实现点」/§2.2):
++ *   本页 `page.snapshot.nodes` 校验(id 在这一页 + 是图片类型)
++ *     → store 回查原始 `MivoCanvasNode` 取 `assetUrl`
++ *     → `assetBlobForNode` 取字节
++ *     → `resolveDepositEntry`(唯一业务入口——内部缓存查找/single-flight/落盘
++ *       补偿全部继承自 P1b,本函数不重新实现,也不直调无缓存原语 `depositBlob`、
++ *       不自行写 `depositMap`)。
++ * 逐 id catch/continue:某个 id 失败只影响它自己的状态,不阻断其它 id、不阻断
++ * 本次 `canvas_snapshot` 调用整体的 `ok:true`(§2.3)。
++ */
++const resolveRequestedMedia = async (
++  pageNodes: AiCanvasContextNode[],
++  mediaNodeIds: string[],
++): Promise<Record<string, MediaNodeState>> => {
++  const states: Record<string, MediaNodeState> = {}
++  for (const id of mediaNodeIds) {
++    // 范围边界(设计稿 §2.5-②):点名的 id 必须出现在这次调用实际返回的这一页,
++    // 不允许跨页点名——不在这一页就是 not_in_page,不去查 store。
++    const pageNode = pageNodes.find((item) => item.id === id)
++    if (!pageNode) {
++      states[id] = { state: 'unavailable', reason: 'not_in_page' }
++      continue
++    }
++    if (pageNode.type !== 'image') {
++      states[id] = { state: 'unavailable', reason: 'not_image' }
++      continue
++    }
++    // 快照投影不含 Blob(§2.2):取字节必须回到 store 原始节点,这是 store 现有的
++    // 正常访问模式(与 `ownedHashForNode` 同构)。
++    const storeNode = useCanvasStore.getState().nodes.find((item) => item.id === id)
++    if (!storeNode || storeNode.type !== 'image' || !storeNode.assetUrl) {
++      states[id] = { state: 'unavailable', reason: 'not_image' }
++      continue
++    }
++    try {
++      const blob = await assetBlobForNode(storeNode)
++      const entry = await resolveDepositEntry({ assetUrl: storeNode.assetUrl, blob, label: SNAPSHOT_MEDIA_LABEL })
++      debugLogger.log(
++        SNAPSHOT_DEPOSIT_DIAG_SOURCE,
++        `deposit 完成(trigger=snapshot):nodeId=${id} hash=${entry.hash.slice(0, 8)}`,
++      )
++      // §4.7 定案:回执只携带引用,永不内联 base64 图像内容。
++      states[id] = { state: 'available', imageRef: `cindy-media://blobs/${entry.hash}${entry.ext}` }
++    } catch (error) {
++      const reason = mediaFailureReasonFor(error)
++      debugLogger.warn(
++        SNAPSHOT_DEPOSIT_DIAG_SOURCE,
++        `deposit 失败(trigger=snapshot):nodeId=${id} reason=${reason} ${
++          error instanceof Error ? error.message : String(error)
++        }`,
++      )
++      states[id] = { state: 'unavailable', reason }
++    }
++  }
++  return states
++}
++
+ const fetchOwnedMediaFile = async (hash: string): Promise<{ file: File; ext: string } | null> => {
+   if (!/^[a-f0-9]{16,128}$/i.test(hash)) return null
+   for (const ext of EXT_CANDIDATES) {
+@@ -151,13 +267,26 @@ export function installAgentBridge(): void {
+           // mediaNodeIds 的类型校验(数组/≤8/非空字符串/无重复)已经在 main.js 的
+           // snapshotFilterArgs 之后跑过一次,这里是独立重跑,不是重复劳动——逻辑
+           // 与 main.js 那份逐字节一致但物理上是两份独立代码。校验不过 fail-fast,
+-          // 不读页。真实逐 id 解析(mediaStates/mediaSummary)归 T3b,本段只验证
+-          // 参数能不能合法地传到这一层,不产出这两个字段。
++          // 不读页。
+           const mediaValidation = validateMediaNodeIds(params.mediaNodeIds)
+           if (!mediaValidation.ok) throw new AgentVerbError('INVALID_PARAMS', mediaValidation.message)
++          const mediaNodeIds = mediaValidation.value ?? []
+           // 过滤/分页/字节上限的语义全在共享层(src/agent/snapshotRegion.ts);这里
+           // 只把参数原样递进去、把 SnapshotPage 摊平成回执字段(#297 R7a §六-9)。
+           const page = agentReadSnapshotPage(params)
++          // 真实逐 id 解析(#297 T3b1,设计稿 §2.1.1「触发实现点」):只在
++          // mediaNodeIds 非空时才进入这段代码,未传 = 零寄存请求(§2.1)。
++          const mediaStates = mediaNodeIds.length
++            ? await resolveRequestedMedia(page.snapshot.nodes, mediaNodeIds)
++            : undefined
++          // mediaSummary 是 mediaStates 的派生聚合(§2.6),必须与它一起算出来。
++          const mediaSummary = mediaStates
++            ? {
++                requested: mediaNodeIds.length,
++                available: Object.values(mediaStates).filter((item) => item.state === 'available').length,
++                unavailable: Object.values(mediaStates).filter((item) => item.state === 'unavailable').length,
++              }
++            : undefined
+           result = {
+             ok: true,
+             snapshot: page.snapshot,
+@@ -166,6 +295,7 @@ export function installAgentBridge(): void {
+             ...(page.filter ? { filter: page.filter } : {}),
+             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+             ...(page.omittedRefs ? { omittedRefs: page.omittedRefs } : {}),
++            ...(mediaStates ? { mediaStates, mediaSummary } : {}),
+           }
+         } else if (msg.verb === 'node-label') {
+           // 卡片要在「调用开始时」定住源图指代(#298 T4):只取一个节点标题,

@@ -1,0 +1,1365 @@
+diff --git a/ghost.json b/ghost.json
+index 6c619aec..5a3909dd 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布上有什么(canvas_snapshot)、把文字要点放上画布(canvas_add_note)、把用户随消息发来的图片放上画布(canvas_place_image)、生成图片并直接落到画布(canvas_generate_image)。用户提到画布/白板/Mivo Canvas,或要求把内容放到画布上时使用;与画布无关的普通聊天出图请交给画图类插件。",
+-  "version": "0.7.19",
++  "version": "0.7.20",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/main.js b/main.js
+index c10194fe..007ea7ae 100644
+--- a/main.js
++++ b/main.js
+@@ -1222,28 +1222,28 @@ async function notifyGenerationTerminal(mode, outcome, locale, failKind, rawReas
+ //  ③ reconciliation 三态:孤儿正文(有正文无 index 条目)= 合法 accepted,照常 drain;
+ //     有 index 条目无正文 = 从 index 剔除 + diagSkip,**不进 rejected**(没有正文就没有
+ //     可向用户描述的改动,写台账只会造一条假失败)。
+-//  ④ accepted 回执**严格晚于** commit point:write 回执 ok:false / 抛错 / 超时一律
+-//     `WRITE_DEFER_UNAVAILABLE`,**绝不能**回 `WRITE_DEFERRED`。
+-//     这条排掉唯一真正不可恢复的组合:已经告诉模型「已受理」,但磁盘上没有正文可 drain。
+-//  ⑤(本轮返修新增,#339 Greptile P1)④ 的反向组合稿子没提:write 回执**未确认**
+-//     (`indeterminate`/`rejected`)时正文**可能已经落盘**,`deferEnqueue` 会尝试补偿删除,
+-//     但那次删除本身也可能失败/不确定——失败时不能什么都不做:若正文真的在盘上,它在
+-//     结构上和一条正常 accepted 的正文**没有任何区别**(§6.2-③ 的「孤儿正文」判据认不出
+-//     它是补偿删除失败留下的),下一次 `deferScan` 会把它当合法孤儿交给面板,面板会把它
+-//     应用掉——而模型/用户已经在这之前收到了 `WRITE_DEFER_UNAVAILABLE`(「这次没有做任何
+-//     改动」)。见 `DEFER_TOMBSTONES_PATH` 与 `deferScan` 里的墓碑处理段。
++//  ④(本轮修正,#297 修正版①,取代旧的补偿删除+墓碑链)受理以 `ok:true` **或** write
++//     settle 之后定向读到完整正证据为准:正文 write 在有界 deadline 内 settle 为
++//     `ok:true` → 直接 `WRITE_DEFERRED`;settle 为 `ok:false` / 抛错 / 回包畸形 →
++//     **settle 之后**才对同一路径做有界定向读取证,读到「路径正确 + JSON 完整可解析 +
++//     内容与派发前算好的 canonical text 完全一致」的正证据 → 同样 `WRITE_DEFERRED`,
++//     有界重试耗尽仍未建立正证据 → `WRITE_DEFER_INDETERMINATE`;write 到 deadline 仍未
++//     settle(悬挂)→ 不发 read、零补偿写/删,直接 `WRITE_DEFER_INDETERMINATE`,晚到的
++//     结果只能被忽略,不得据此二次交卷。`WRITE_DEFER_UNAVAILABLE` 此后只留给正文 write
++//     **派发前**的失败(绑定未知 / 队列目录列不出来),不再是 write 结果不确定时的出口。
++//     全程**零删除、零补偿写**:正文若确实已经落盘,就放着让它按 ③ 的孤儿正文规则被
++//     正常 drain,不因为这次交卷说不清楚就去动它——这正是取代补偿删除+墓碑链的核心简化。
++//     **有界 deadline 的适用边界**(oracle seam c,别让未来读者以为它覆盖了它治不了的
++//     场景):它治的是「宿主 fs 慢 / 无回音,但电子脑这个 JS 上下文仍然活着」——超时
++//     回调需要电子脑还在跑才能触发。「电子脑随 renderer 一起死」(手册允许的宿主行为,
++//     见 `deferBrainDeath.test.ts`)时,连超时回调本身都没有机会运行——这不是本方案要
++//     堵的窟窿,是结构性边界:那种场景下正文字节若已落盘,靠的是 ③ 的孤儿正文规则在
++//     **下一次** `deferScan`/reconcile 时兜底,不靠这里的超时。
+ 
+ const DEFER_DIR = 'pending-writes'
+ const DEFER_BODY_PREFIX = 'i-'
+ const DEFER_INDEX_PATH = DEFER_DIR + '/index.json'
+ const DEFER_REJECTED_PATH = DEFER_DIR + '/rejected.json'
+-// 墓碑:补偿删除失败后「这条 intentId 的正文,不管盘上有没有,都不许再被当合法孤儿」的
+-// 记录(§6.2-⑤)。**这份文件在正确性路径上**——不同于 index.json/rejected.json(那两份
+-// 丢了不影响意图能否被 drain);墓碑丢了,补偿删除失败留下的正文就会被重新当成合法孤儿。
+-// 生命周期靠自身的 expiresAt(与原意图同值)收口:一旦过期,`deferSweepExpired` 会在
+-// 正常路径上把(若仍存在的)正文当过期删除+记台账,墓碑不再需要单独兜底,直接丢弃即可
+-// ——这是与 §3.3 台账释放同一个「结构性依据」,不是又发明一套新规则。
+-const DEFER_TOMBSTONES_PATH = DEFER_DIR + '/tombstones.json'
+ const DEFER_BINDING_PATH = 'canvases/binding.json'
+ // 容量/时限政策(设计稿 §11 D-P13-2)。台账容量在共享层 src/agent/pendingCanvasWrite.ts,
+ // 硬下界 = 队列上限 + 1;这里只管队列这一半,两边的数值由 deferPolicy.test.ts 对齐。
+@@ -1252,6 +1252,15 @@ const DEFER_BODY_MAX_BYTES = 64 * 1024
+ const DEFER_TTL_MS = 7 * 24 * 60 * 60 * 1000
+ // 达到 80% 才发一条 notify:每次入队都发会撞宿主 5s 限速并刷屏(§8-3)。
+ const DEFER_NOTIFY_HIGH_WATER = Math.ceil(DEFER_QUEUE_MAX * 0.8)
++// 有界取证常量(#297 修正版①,§6.2-④,取代旧的补偿删除+墓碑链):正文提交这一处的
++// write / list(容量判定用)/ read(取证用)各自的单次 deadline,以及取证读的有界重试
++// 上限。三者都走 `clock` seam(见 `withDeadline`),协议测试可用 fake clock 精确断言
++// 尝试次数与终态时刻。总路径确定上界 = 一次 write deadline + 至多
++// `DEFER_EVIDENCE_READ_MAX_ATTEMPTS` 次 read deadline(取证路径),或一次 list deadline
++// (派发前容量判定路径)——**只作用于 defer 正文提交这一处**,不改 `fsWrite`/`fsRead`
++// 等通用原语本身的语义,save/assets 等既有调用点不受影响。
++const DEFER_FS_DEADLINE_MS = 1500
++const DEFER_EVIDENCE_READ_MAX_ATTEMPTS = 3
+ // Phase 1 值域只放 add-note(§10「R3/R5 的关系」)。入队与重放**必须同一份值域**,
+ // 否则会出现「入队接受、重放拒绝」的谎报。
+ const DEFER_VERBS = new Set(['add-note'])
+@@ -1263,6 +1272,45 @@ const DEFER_COORD_LIMIT = 1_000_000
+ const DEFER_BODY_NAME_RE = /^i-[A-Za-z0-9][A-Za-z0-9_-]*\.json$/
+ const DEFER_INTENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
+ 
++/**
++ * 有界 deadline 包装(#297 修正版①,§6.2-④):给一个已发起的 promise 一次性截止时间。
++ * fs 手册没有取消原语,deadline 到点**不能**让底层调用消失——只是不再等它:谁先到就用
++ * 谁的结果,两个分支互相清理对方的挂件(只留一个活 timer,不泄漏)。deadline 到点后
++ * 底层 promise 晚到的结果**必须被忽略**——本函数已经把那次 resolve/reject 原地吞掉,
++ * 调用方拿到 `{settled:false}` 后不需要也不允许再对它做任何事。
++ *
++ * 返回 `{settled:true, value}`(deadline 内 settle)或 `{settled:false}`(到点仍未 settle)。
++ * 只用于 defer 正文提交这一处的 write / list / read,**不改**`fsWrite`/`fsRead` 等通用
++ * 原语本身的语义(save/assets 等既有调用点不受影响,也不经过这个包装)。
++ */
++function withDeadline(promise, ms) {
++  return new Promise((resolve) => {
++    let done = false
++    const timer = clock.setTimeout(() => {
++      if (done) return
++      done = true
++      resolve({ settled: false })
++    }, ms)
++    promise.then(
++      (value) => {
++        if (done) return
++        done = true
++        clock.clearTimeout(timer)
++        resolve({ settled: true, value })
++      },
++      () => {
++        // fsWriteResult/fsReadResult/fsList 内部已经把 cindy.fs 的异常收敛成返回值,
++        // 正常不会走到这里;万一走到,按「已 settle 但没有可用证据」处理,不让一次意外
++        // 拒绝把 deadline 包装器自己变成未处理拒绝。
++        if (done) return
++        done = true
++        clock.clearTimeout(timer)
++        resolve({ settled: true, value: null })
++      },
++    )
++  })
++}
++
+ /**
+  * 只取 own **数据**属性(`src/lib/safeArgs.ts` 的插件侧纯 JS 孪生;main.js 不过打包、
+  * import 不了 src/,§六-9 允许适配层自带同语义实现)。
+@@ -1335,66 +1383,14 @@ function deferParseBody(text) {
+ }
+ 
+ /**
+- * 立即重试到成功或次数耗尽(#339 Greptile P1-①:单次失败就放手,是「代码没有要求
+- * 墓碑成功落盘便向调用方报告未受理」这条结论的根因)。不带退避——这条路径本身就是
+- * 「刚才那次写已经不确定」之后的补救,多等一轮时间换不到结构性的确定性,只会拖长
+- * 一次已经很慢的失败路径;重试次数是**降低概率**的纵深防御,不是把问题证明掉——
+- * 见下面 deferEnqueue 调用点里为什么即便重试耗尽仍不算「解决」。
++ * FIFO 比较键全部读自正文(§6.2-①)。
+  */
+-async function deferRetry(attempts, fn) {
+-  for (let i = 0; i < attempts; i += 1) {
+-    if (await fn()) return true
+-  }
+-  return false
+-}
+-
+-/** FIFO 比较键全部读自正文(§6.2-①)。 */
+ function deferCompare(left, right) {
+   if (left.seq !== right.seq) return left.seq - right.seq
+   if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt
+   return left.intentId < right.intentId ? -1 : left.intentId > right.intentId ? 1 : 0
+ }
+ 
+-/** 读墓碑清单(§6.2-⑤)。脏数据 / 缺字段一律当空条目丢弃,不让坏数据卡住扫描。 */
+-async function deferReadTombstones() {
+-  const raw = await readJson(DEFER_TOMBSTONES_PATH)
+-  const items = raw && Array.isArray(deferOwnProp(raw, 'items')) ? deferOwnProp(raw, 'items') : []
+-  const out = []
+-  for (const item of items) {
+-    const intentId = deferOwnProp(item, 'intentId')
+-    const expiresAt = deferOwnProp(item, 'expiresAt')
+-    if (typeof intentId !== 'string' || !intentId) continue
+-    out.push({ intentId, expiresAt: typeof expiresAt === 'number' && Number.isFinite(expiresAt) ? expiresAt : 0 })
+-  }
+-  return out
+-}
+-
+-/**
+- * 写墓碑清单:best-effort,**绝不抛错**(Greptile #339 P1-②:`fsWrite` 在 `cindy.fs`
+- * 抛错时会原样上抛——那是给 `handleSave` 那种自带 chain try/catch 收口的调用点设计的
+- * 契约;`deferEnqueue` 的失败分支之后是 `return deferSubmit(...)`,**不会**被
+- * `handleToolCall` 的外层 try/catch 接住(那是 `return`,不是 `return await`,函数早已
+- * 退出 try 块),抛错会变成未处理的 rejection,把「未受理」这个本该干净返回的结果
+- * 变成异常。用 `fsWriteResult` 直接读三档回执,任何非 `ok` 结果(含 indeterminate)
+- * 都当失败处理,不重新抛出。
+- */
+-async function deferWriteTombstones(items) {
+-  let result
+-  try {
+-    result = await fsWriteResult(DEFER_TOMBSTONES_PATH, JSON.stringify({ version: 1, items }))
+-  } catch (error) {
+-    result = { status: 'indeterminate', error }
+-  }
+-  const ok = result.status === 'ok'
+-  if (!ok) {
+-    diagFail(
+-      DIAG_SOURCE.defer,
+-      'defer tombstones 写入未确认(status=' + result.status + '; 本轮排除已生效, 下次 scan 会重新读到同一份清单再试) items=' + items.length,
+-    )
+-  }
+-  return ok
+-}
+-
+ /**
+  * 枚举目录实况并读回所有正文。返回 null = **列不出来**(不是空队列):
+  * 这一档上层必须降级(入队 → WRITE_DEFER_UNAVAILABLE;drain → 本轮不做),
+@@ -1403,12 +1399,20 @@ async function deferWriteTombstones(items) {
+  * 读失败(可能只是瞬时故障)与解析失败(正文确实坏了)分开处置:前者留在盘上等下次,
+  * 后者删掉并记 error —— 一份解析不出来的正文既无法应用也无法向用户描述。
+  *
+- * **单一choke point 兼管墓碑排除(§6.2-⑤)**:这是 deferEnqueue 的容量检查与
+- * handlePendingList 的面板扫描**唯一共用**的入口,所以墓碑过滤放这里一次生效两处,
+- * 不必在每个调用点各自记一次。
++ * list 本身有界(`DEFER_FS_DEADLINE_MS`,#297 修正版①):悬挂不再让扫描本身悬挂到
++ * 天荒地老,超时同样按「列不出来」处理,由上层降级 —— 这是 deferEnqueue 的容量检查与
++ * handlePendingList 的面板扫描**唯一共用**的入口,有界性在这里生效一次两处都受益。
+  */
+ async function deferScan() {
+-  const names = await fsList(DEFER_DIR)
++  const listOutcome = await withDeadline(fsList(DEFER_DIR), DEFER_FS_DEADLINE_MS)
++  if (!listOutcome.settled) {
++    diagFail(
++      DIAG_SOURCE.defer,
++      'defer 失败: 队列目录列举超过有界 deadline(' + DEFER_FS_DEADLINE_MS + 'ms)仍未 settle, 按列不出来处理',
++    )
++    return null
++  }
++  const names = listOutcome.value
+   if (names === null) return null
+   const bodies = []
+   let unreadable = 0
+@@ -1436,44 +1440,8 @@ async function deferScan() {
+     diagFail(DIAG_SOURCE.defer, 'defer 删除 ' + corrupt + ' 条损坏正文: 解析不出来, 既无法应用也无法向用户描述')
+   }
+ 
+-  // ── 墓碑排除(§6.2-⑤):补偿删除失败留下的正文,在确认删干净之前绝不算合法孤儿 ──
+-  const tombstones = await deferReadTombstones()
+-  let liveBodies = bodies
+-  if (tombstones.length) {
+-    const now = clock.now()
+-    const kept = []
+-    const excluded = new Set()
+-    let cleanedCount = 0
+-    for (const entry of tombstones) {
+-      if (entry.expiresAt <= now) {
+-        // 过 TTL:正文若还在,下面(调用方紧跟着会做的)deferSweepExpired 会把它当过期
+-        // 处理并真删 + 记台账 —— 墓碑不再需要单独兜底,直接丢弃(§3.3 同一结构性依据)。
+-        continue
+-      }
+-      excluded.add(entry.intentId)
+-      const cleaned = await fsDelete(deferBodyPath(entry.intentId))
+-      if (cleaned) cleanedCount += 1
+-      else kept.push(entry)
+-    }
+-    if (kept.length !== tombstones.length) await deferWriteTombstones(kept)
+-    if (cleanedCount) {
+-      diagOk(DIAG_SOURCE.defer, 'defer 墓碑回收成功 ' + cleanedCount + ' 条(补偿删除这次补上了)')
+-    }
+-    if (excluded.size) {
+-      const before = liveBodies.length
+-      liveBodies = liveBodies.filter((body) => !excluded.has(body.intentId))
+-      const removed = before - liveBodies.length
+-      if (removed) {
+-        diagSkip(
+-          DIAG_SOURCE.defer,
+-          'defer 墓碑排除 ' + removed + ' 条正文: 补偿删除未确认成功前绝不当合法孤儿交出(#339 Greptile P1)',
+-        )
+-      }
+-    }
+-  }
+-
+-  liveBodies.sort(deferCompare)
+-  return liveBodies
++  bodies.sort(deferCompare)
++  return bodies
+ }
+ 
+ // 冷启动后 seq 归零会让新意图与旧条目撞号 → 首次入队前按现存最大 seq + 1 初始化(一次性)。
+@@ -1581,25 +1549,82 @@ async function deferSweepExpired(bodies, now) {
+ }
+ 
+ /**
+- * **提交一条正文,并在提交点之后才处理被它覆盖的旧条目。**
++ * 有界定向读取证(#297 修正版①,§6.2-④):write settle 为非 ok 之后,才对同一路径做
++ * 定向读。判据是**逐字节内容相等**(读到的内容 === 派发前算好的 canonical text)**且**
++ * 能被 `deferParseBody` 正常解析——两者合起来蕴含设计要求的五项 AND 条件(路径正确 /
++ * JSON 完整可解析 / intentId 一致 / 字段逐一致 / fingerprint 一致):字符串完全相等能
++ * 推出其余全部相等,反之只要有一项不同,字符串就不可能相等;`deferParseBody` 这道额外
++ * 结构校验单独存在的意义是防止「内容碰巧字节相等但根本不是一份合规正文」这种不可能
++ * 但仍显式挡住的角落(例如直接被写入的裸测试片段)。fingerprint(复用 `diagSig`)只在
++ * 日志里留痕对账,不参与判定本身——判据比任何 hash 都严格,不存在「只靠短 hash 碰撞
++ * 过关」这条红线要防的场景。
+  *
+- * 这是全部入队路径的唯一落盘出口(coalesce 与非 coalesce 共用),所以「顺序」这件事
+- * 只有一个地方说得上话,也只有一个地方会被改坏:
+- *   1. 先写新正文 → 拿到 `{ok:true}` = **commit point**(§6.2-②);
+- *   2. **只有**在这之后才删旧正文(§6.4)。
+- * 反序(先删旧再写新)会在崩溃时把用户这次改动整条丢掉 —— 所以写失败时旧正文必须
+- * **原样留在盘上**(宁可留一条旧的,也不能两条都没有)。
+- * 崩在 1 与 2 之间 = 同键两条正文都在队列里,这是**可接受的中间态**:drain 取
+- * `(seq, createdAt)` 最新的一条应用,其余标 superseded 后按 ack-after-durable 删除。
++ * 有界重试:每次读自身有 deadline(`DEFER_FS_DEADLINE_MS`),读到确定的正证据立即返回;
++ * 耗尽 `DEFER_EVIDENCE_READ_MAX_ATTEMPTS` 次仍未确认就放弹给调用方判第三态。
++ */
++async function deferVerifyByRead(path, canonicalText) {
++  for (let attempt = 0; attempt < DEFER_EVIDENCE_READ_MAX_ATTEMPTS; attempt += 1) {
++    const outcome = await withDeadline(fsReadResult(path), DEFER_FS_DEADLINE_MS)
++    const content = outcome.settled && outcome.value && outcome.value.status === 'found' ? outcome.value.content : null
++    if (content !== null && content === canonicalText && deferParseBody(content)) {
++      return true
++    }
++  }
++  return false
++}
++
++/**
++ * **提交一条正文,按有界取证的三态判定受理与否,并只在受理确定之后才处理被它覆盖的
++ * 旧条目。**(#297 修正版①,§6.2-④,取代旧的补偿删除+墓碑链)
++ *
++ * 这是全部入队路径的唯一落盘出口(coalesce 与非 coalesce 共用),三种结局:
++ *   1. write 在有界 deadline 内 settle 为 `ok:true` → committed(**commit point**,§6.2-②);
++ *   2. write 在有界 deadline 内 settle 为非 ok(`ok:false` / 抛错 / 回包畸形)→ **settle
++ *      之后**才对同一路径做有界定向读取证(`deferVerifyByRead`):读到完整正证据 →
++ *      committed;有界重试耗尽仍未确认 → not committed;
++ *   3. write 到 deadline 仍未 settle(悬挂)→ **不发 read、零补偿写/删**,直接
++ *      not committed;晚到的结果被 `withDeadline` 原地吞掉,不得据此二次交卷。
++ * 全程**零删除、零补偿写**——正文若确实已经落盘,就放着让它按 §6.2-③ 的孤儿正文规则
++ * 被正常 drain,不因为这次交卷说不清楚就去动它。
++ *
++ * **只有** committed 之后才删旧正文(§6.4):先写新正文拿到确定的 committed 结果,
++ * **才**删旧正文。反序(先删旧再写新)会在崩溃时把用户这次改动整条丢掉 —— 所以未
++ * committed 时旧正文必须**原样留在盘上**(宁可留一条旧的,也不能两条都没有)。
++ * 崩在「新正文 committed」与「删旧正文」之间 = 同键两条正文都在队列里,这是**可接受
++ * 的中间态**:drain 取 `(seq, createdAt)` 最新的一条应用,其余标 superseded 后按
++ * ack-after-durable 删除。
+  *
+  * `supersededIntentId` 为 null 时就是普通入队(Phase 1 的 add-note 恒为 null:coalesce
+  * 值域要等 R3 的 update-node 进 DEFER_VERBS 才有生产触发点)。
+  */
+ async function deferCommitBody(path, text, supersededIntentId) {
+-  const write = await fsWriteResult(path, text)
+-  if (write.status !== 'ok') {
+-    // 新正文没落稳:旧正文一个字节都不许动。
+-    return { committed: false, status: write.status, supersededDropped: false }
++  const writeOutcome = await withDeadline(fsWriteResult(path, text), DEFER_FS_DEADLINE_MS)
++  let committed
++  if (!writeOutcome.settled) {
++    diagFail(
++      DIAG_SOURCE.defer,
++      'defer 取证: write 超过有界 deadline(' + DEFER_FS_DEADLINE_MS + 'ms)仍未 settle, 不发 read/补偿写删, 直接判第三态',
++    )
++    committed = false
++  } else if (writeOutcome.value && writeOutcome.value.status === 'ok') {
++    committed = true
++  } else {
++    const status = writeOutcome.value && writeOutcome.value.status
++    committed = await deferVerifyByRead(path, text)
++    if (committed) {
++      diagOk(
++        DIAG_SOURCE.defer,
++        'defer 取证: settle 为非 ok(status=' + status + ')后定向读确认完整正证据(fingerprint=' + diagSig(text) + '), 判 deferred',
++      )
++    } else {
++      diagFail(
++        DIAG_SOURCE.defer,
++        'defer 取证: settle 为非 ok(status=' + status + ')且有界读证未能建立正证据(fingerprint=' + diagSig(text) + '), 判第三态',
++      )
++    }
++  }
++  if (!committed) {
++    return { committed: false, status: 'indeterminate', supersededDropped: false }
+   }
+   if (!supersededIntentId) return { committed: true, status: 'ok', supersededDropped: false }
+   const dropped = await fsDelete(deferBodyPath(supersededIntentId))
+@@ -1636,9 +1661,36 @@ async function notifyDeferState(kind, count) {
+   return notifySend(kind === 'expired' ? 'warning' : 'info', text)
+ }
+ 
++/**
++ * 队列关键段互斥(#297 修正版① P1-T3,§3.2):tool-call 路径(`deferEnqueue`)必须与
++ * 面板路径(`pending-list`/`pending-ack`/`pending-probe`,走 main.js:191 既有的 `chain`,
++ * 见下方 `channel.onmessage`)共用同一条串行原语——否则「scan → 容量判 → write」这个
++ * 经典 TOCTOU 序列可以被并发绕过(oracle 实证:63 条预置 + 2 个几乎同时到达的入队请求,
++ * 会各自基于同一份「读到的旧计数」通过容量检查,最终让正文数突破 §3.3 承诺的硬上限 64;
++ * 两次回执的 `queued` 字段还都自称 64——权威计数必须来自互斥段**内部**,不能是入锁前
++ * 缓存的旧值)。
++ *
++ * 复用已有的 `chain` 而不是新开一把锁(改动最小,且天然满足「共用同一串行原语」):
++ * tool-call 会排在 save/load 之后,可接受(save 不高频)。`chain` 本身绝不能被这次任务的
++ * 异常污染——否则一次入队失败会卡住所有后续 save/load/defer;所以无论 `fn` 成功还是
++ * 失败,`chain` 都推进到一个恒成功的哨兵 promise,调用方拿到的是 `fn` 真实的结果/异常
++ * (不是哨兵)。
++ */
++function deferSerialized(fn) {
++  const scheduled = chain.then(fn)
++  chain = scheduled.then(
++    () => undefined,
++    () => undefined,
++  )
++  return scheduled
++}
++
+ /**
+  * 入队一条意图。**唯一的 accepted 出口**,且严格排在 commit point 之后(§6.2-④)。
+  * 返回 `{ok:true, intentId, queued}` 或 `{ok:false, code, message}`。
++ *
++ * verb/参数校验与绑定读**不进互斥段**(它们不参与「队列条目数」这个被争用的资源,
++ * 提前拒绝也更快 fail-visible);从 scan 开始到 index 写完整段排进 `deferSerialized`。
+  */
+ async function deferEnqueue(verb, params, callId) {
+   if (!DEFER_VERBS.has(verb)) {
+@@ -1660,6 +1712,11 @@ async function deferEnqueue(verb, params, callId) {
+       message: '还不知道该把改动排给哪个画布档案(面板从未保存过)。请让用户打开 Mivo Canvas 面板后重试。',
+     }
+   }
++  return deferSerialized(() => deferEnqueueLocked(verb, valid.params, callId, binding))
++}
++
++/** `deferEnqueue` 的互斥段:scan → sweep → 容量判 → 构造正文 → commit → index 写。 */
++async function deferEnqueueLocked(verb, params, callId, binding) {
+   const scanned = await deferScan()
+   if (scanned === null) {
+     diagFail(DIAG_SOURCE.defer, 'defer 失败: 队列目录不可枚举, 无法确认容量, 拒绝入队')
+@@ -1687,7 +1744,7 @@ async function deferEnqueue(verb, params, callId) {
+     intentId,
+     seq: deferSeq,
+     verb,
+-    params: valid.params,
++    params,
+     target,
+     createdAt: now,
+     expiresAt: now + DEFER_TTL_MS,
+@@ -1710,45 +1767,17 @@ async function deferEnqueue(verb, params, callId) {
+   // ==================== commit point ====================
+   const commit = await deferCommitBody(deferBodyPath(intentId), text, superseded ? superseded.intentId : null)
+   if (!commit.committed) {
+-    // §6.2-④ 的反向组合(稿子未覆盖):indeterminate 档**可能已经落盘**,而我们即将
+-    // 告诉模型「不可用」。若不回收,那条正文会在下次 drain 被当合法孤儿应用 —— 用户
+-    // 会看到一条自己以为没发生的改动。所以尽力删掉,**重试到成功或次数耗尽**(单次
+-    // 失败就放手正是 #339 Greptile P1-① 的根因)。
+-    const cleaned = await deferRetry(3, () => fsDelete(deferBodyPath(intentId)))
+-    let tombstoned = cleaned
+-    if (!cleaned) {
+-      // §6.2-⑤(#339 Greptile P1):补偿删除没成功,不能就此放手——记进墓碑,让
+-      // deferScan 在此后每一次调用(包括面板下一次 pending-list)都重试删除,且在
+-      // 确认删干净之前绝不把这条 intentId 的正文当合法孤儿交出去。生命周期与原意图
+-      // 同一个 expiresAt:过期后交给 deferSweepExpired 的结构性通路兜底。
+-      // 同样**重试到成功或次数耗尽**,且写墓碑本身绝不允许抛错(deferWriteTombstones
+-      // 内部已收口)——否则这条 catch-up 路径自己先把工具调用炸了。
+-      tombstoned = await deferRetry(3, async () => {
+-        const tombstones = await deferReadTombstones()
+-        if (!tombstones.some((entry) => entry.intentId === intentId)) {
+-          tombstones.push({ intentId, expiresAt: body.expiresAt })
+-        }
+-        return deferWriteTombstones(tombstones)
+-      })
+-      if (!tombstoned) {
+-        // 三次重试(删除)+ 三次重试(墓碑)都没能确定性地挡住这条 intentId——这是
+-        // fs 通道本身持续不可用的信号,不是这一条意图独有的问题。结构上没有更多能做的
+-        // (手册 §4.10 没有事务/原子 rename,重试到此已经是能做到的上限):如实记 error
+-        // 留痕,不假装已经解决;§3.3/§10 的残余风险段记这条残余窗口。
+-        diagFail(
+-          DIAG_SOURCE.defer,
+-          'defer 严重: 补偿删除与墓碑写入均重试耗尽仍未确认——正文若确实落盘, 在墓碑生效前的这段窗口内可能被误当合法孤儿(fs 通道持续异常, 非单条意图问题)',
+-        )
+-      }
+-    }
++    // #297 修正版①(§6.2-④):write 派发之后的结果不确定 → 第三态,**零补偿删除**。
++    // 正文若确实已经落盘,就放着让它按 §6.2-③ 的孤儿正文规则被正常 drain;这里不再
++    // 尝试删除或记墓碑(那条老路自身还有并发洞,§6.2-④ 已改为有界取证)。
+     diagFail(
+       DIAG_SOURCE.defer,
+-      'defer 失败: 正文写入未确认(status=' + commit.status + '), 未回 accepted; 回收 cleaned=' + cleaned + ' tombstoned=' + tombstoned,
++      'defer 失败: 正文写入结果无法确认(deadline 未 settle, 或 settle 为非 ok 且有界读证未能建立正证据), 判 WRITE_DEFER_INDETERMINATE intent=' + deferShortId(intentId),
+     )
+     return {
+       ok: false,
+-      code: 'WRITE_DEFER_UNAVAILABLE',
+-      message: '离线写入队列暂时不可用(改动没能落盘)。请让用户打开 Mivo Canvas 面板后重试。',
++      code: 'WRITE_DEFER_INDETERMINATE',
++      message: '这条改动是否已经排队现在无法确认(可能已排队等待应用,也可能没有生效)。请让用户打开 Mivo Canvas 面板确认画布上是否已出现这条改动,不要凭空重试(重试可能造成重复)。',
+     }
+   }
+   // ============ 以下都在 commit point 之后:意图已被受理 ============
+@@ -1763,7 +1792,11 @@ async function deferEnqueue(verb, params, callId) {
+     'defer 入队: verb=' + verb + ' intent=' + deferShortId(intentId) + ' 队列 ' + queued.length + '/' + DEFER_QUEUE_MAX,
+   )
+   if (queued.length >= DEFER_NOTIFY_HIGH_WATER) await notifyDeferState('high-water', queued.length)
+-  return { ok: true, intentId, queued: queued.length }
++  // `code` 与共享层 src/agent/pendingCanvasWrite.ts 的 PENDING_WRITE_CODES.deferred 字符串值
++  // 手工保持一致(main.js 不过打包、import 不了 src/,与 PANEL_CLOSED 等码同一维护约定)。
++  // 只在这一层(`deferEnqueue` 的返回值)暴露;`deferSubmit` 面向模型的交卷形态刻意不带
++  // `code`(设计稿 §7 D-P13-1:ok:true + applied:false + pendingIntentId + note 已经够诚实)。
++  return { ok: true, code: 'WRITE_DEFERRED', intentId, queued: queued.length }
+ }
+ 
+ /**
+@@ -2962,10 +2995,12 @@ if (seam && typeof seam.expose === 'function') {
+       dir: DEFER_DIR,
+       indexPath: DEFER_INDEX_PATH,
+       rejectedPath: DEFER_REJECTED_PATH,
+-      tombstonesPath: DEFER_TOMBSTONES_PATH,
+       bindingPath: DEFER_BINDING_PATH,
+-      readTombstones: deferReadTombstones,
+       seq: () => deferSeq,
++      // #297 修正版①(§6.2-④):有界取证常量,协议测试用它精确断言尝试次数/终态时刻。
++      fsDeadlineMs: DEFER_FS_DEADLINE_MS,
++      evidenceReadMaxAttempts: DEFER_EVIDENCE_READ_MAX_ATTEMPTS,
++      verifyByRead: deferVerifyByRead,
+     },
+     fs: {
+       writeResult: fsWriteResult,
+diff --git a/skills/mivo-canvas-board/SKILL.md b/skills/mivo-canvas-board/SKILL.md
+index 7a9bb875..87d00c38 100644
+--- a/skills/mivo-canvas-board/SKILL.md
++++ b/skills/mivo-canvas-board/SKILL.md
+@@ -35,5 +35,6 @@ description: Use the Mivo Canvas plugin tools to read the user's infinite canvas
+ - 收到 `PANEL_NOT_READY` 时含义不同:面板**开着但还在载入**,提示用户稍等片刻再试一次即可,不必让他去开面板。
+ - `canvas_add_note` 在面板未打开时会返回 `ok:true` + `applied:false` + `pendingIntentId`:意思是**改动已排队、但还没生效**,面板打开后才会应用。此时必须如实告诉用户「还没落到画布上,打开 Mivo Canvas 面板就会应用」,**不要说已完成、不要反复重试**;`pendingIntentId` 是排队编号,**不是节点 id**,不要拿它当 `nodeId` 传给别的工具。
+ - 收到 `WRITE_QUEUE_FULL` / `WRITE_DEFER_UNAVAILABLE` 时是真失败:如实说明改动没能排上队,请用户打开面板。
++- 收到 `WRITE_DEFER_INDETERMINATE` 时改动是否生效**无法确认**(可能已经排队等待应用,也可能没有生效):请用户打开 Mivo Canvas 面板查看这条改动是否已出现,**不要凭空重试**——重试可能会造成重复。
+ - 生成结果自带画布节点 id 与图片地址;不要再额外把同一张图重复发给用户。
+ - 画布数据属于用户创作,未经明确要求不要删除或覆盖既有节点(当前工具集也不提供删除能力)。
+diff --git a/src/__tests__/brainHarness.ts b/src/__tests__/brainHarness.ts
+index 2b8af5e9..2ca04da8 100644
+--- a/src/__tests__/brainHarness.ts
++++ b/src/__tests__/brainHarness.ts
+@@ -301,10 +301,12 @@ export type BrainDeferHandles = {
+   dir: string
+   indexPath: string
+   rejectedPath: string
+-  tombstonesPath: string
+   bindingPath: string
+-  readTombstones: () => Promise<Array<{ intentId: string; expiresAt: number }>>
+   seq: () => number
++  /** #297 修正版①(§6.2-④):有界取证常量,协议测试用它精确断言尝试次数/终态时刻。 */
++  fsDeadlineMs: number
++  evidenceReadMaxAttempts: number
++  verifyByRead: (path: string, canonicalText: string) => Promise<boolean>
+ }
+ 
+ export type BrainFsHandles = {
+@@ -390,6 +392,12 @@ export type LoadBrainOptions = {
+   writeOutcome?: (request: FsRequest) => 'ok' | 'reject' | 'throw' | 'malformed' | 'hang' | undefined
+   /** throw 档时字节是否仍然落盘(模拟「宿主写成功但回执没回来」)。默认 false。 */
+   landsOnThrow?: boolean
++  /**
++   * 读回执的悬挂注入(#297 修正版① SC-1.4-③:read 侧的 'hang' 等价物,仿 writeOutcome
++   * 既有形状)。目前只有 `'hang'` 这一档:**字节位置不变,promise 永不 settle**。
++   * 返回 undefined = 走默认行为(按 files 里有没有这个 path 判 found/unresolved)。
++   */
++  readOutcome?: (request: FsRequest) => 'hang' | undefined
+   /** 返回 false 表示该次删除失败(用于验证 ackedAt 只在删除成功后才写)。 */
+   deleteGuard?: (request: FsRequest) => boolean
+   /**
+@@ -494,6 +502,13 @@ export function loadBrain(options: LoadBrainOptions = {}): LoadedBrain {
+         return { ok: true, op: 'write', path: request.path, bytes: String(request.content ?? '').length }
+       }
+       if (request.op === 'read') {
++        // 仿 writeOutcome 的 'hang' 档(#297 修正版① SC-1.4-③ 补测):**promise 永不 settle**,
++        // 忠实模拟「宿主 fs 慢/无回音,读请求悬在半空」——与 write 侧同一个结构性理由,
++        // 只是这里从来不涉及「字节落不落盘」(read 不写东西),所以只有这一档,没有
++        // reject/throw/malformed 的等价物(读的回执本就只有 found/unresolved 两态,
++        // 见 main.js `fsReadResult` 的判据注释)。
++        const outcome = options.readOutcome?.(request)
++        if (outcome === 'hang') return new Promise(() => {})
+         const content = files.get(request.path)
+         return content === undefined ? { ok: false } : { ok: true, content }
+       }
+diff --git a/src/__tests__/deferBrainDeath.test.ts b/src/__tests__/deferBrainDeath.test.ts
+index e019354a..360fd58d 100644
+--- a/src/__tests__/deferBrainDeath.test.ts
++++ b/src/__tests__/deferBrainDeath.test.ts
+@@ -70,8 +70,8 @@ describe('① 「无回执」不等于「没写成」(宿主事实 1+3)', () =>
+     expect(paths).toHaveLength(1)
+     expect(JSON.parse(brain.files.get(paths[0])!).params).toEqual({ text: 'written before death' })
+ 
+-    // 交卷一次都没发出:既没有 accepted(不许在提交点之前宣布受理),
+-    // 也没有 WRITE_DEFER_UNAVAILABLE(它是「确定没落盘」才该出的码)。
++    // 交卷一次都没发出:既没有 accepted(不许在提交点之前宣布受理),也没有
++    // WRITE_DEFER_INDETERMINATE(有界取证的 write deadline 还没到,#297 修正版①)。
+     const results = brain.cindySent.filter((item) => (item as { type?: string }).type === 'tool-result')
+     expect(results).toEqual([])
+ 
+@@ -79,12 +79,14 @@ describe('① 「无回执」不等于「没写成」(宿主事实 1+3)', () =>
+     expect(brain.files.has(`${DIR}/index.json`)).toBe(false)
+   })
+ 
+-  it('对照:回执确定为 ok:false(真的没落盘)时才交 WRITE_DEFER_UNAVAILABLE,且磁盘干净', async () => {
++  it('对照:回执确定为 ok:false(真的没落盘)且读证也找不到 → WRITE_DEFER_INDETERMINATE,磁盘干净', async () => {
+     const brain = brainWith({
+       writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'reject' : undefined),
+     })
+     const result = (await brain.handles.defer.enqueue('add-note', { text: 'never landed' })) as Record<string, unknown>
+-    expect(result.code).toBe('WRITE_DEFER_UNAVAILABLE')
++    // #297 修正版①(§6.2-④):write 一旦派发,WRITE_DEFER_UNAVAILABLE 就不再是出口——
++    // 即便回执确定是 ok:false,也要走一遍有界读证,读不到正证据才判第三态。
++    expect(result.code).toBe('WRITE_DEFER_INDETERMINATE')
+     expect(bodyPaths(brain)).toEqual([])
+   })
+ })
+diff --git a/src/__tests__/deferEnqueueConcurrency.adversarial.test.ts b/src/__tests__/deferEnqueueConcurrency.adversarial.test.ts
+new file mode 100644
+index 00000000..5ef57b1f
+--- /dev/null
++++ b/src/__tests__/deferEnqueueConcurrency.adversarial.test.ts
+@@ -0,0 +1,172 @@
++/**
++ * 对抗测试(oracle,不是实现):钉「队列关键段互斥」契约。
++ *
++ * 背景(main.js:191 `let chain = Promise.resolve() // 串行执行,避免并发写档`):
++ * `chain` 只串行化经 `mivo-canvas-persist` BroadcastChannel 进来的请求
++ * (load/save/pending-list/pending-ack/pending-probe,main.js:2823-2851)。
++ * **工具调用(`canvas_add_note` → `deferSubmit` → `deferEnqueue`)完全不在这条链上** ——
++ * `cindy.onHostMessage` 对 `tool-call` 直接 `void handleToolCall(msg)`(main.js:2867-2869),
++ * 没有经过 `chain.then(...)`。
++ *
++ * `deferEnqueue` 的容量判定是「先读(`deferScan()` = 一次 `fsList` + 逐条 `fsRead`)、
++ * 再判(`live.length >= DEFER_QUEUE_MAX`)、再写」的经典 TOCTOU 序列,读和写之间没有
++ * 任何互斥。本文件证明:两次几乎同时到达的入队请求会各自基于同一份「读到的旧计数」
++ * 通过容量检查,最终让队列正文数突破 `DEFER_QUEUE_MAX`(64)这个设计稿 §3.3 承诺的硬上限。
++ *
++ * 只读,不改动任何既有文件;只新增本文件。全部对**真实 main.js** 求值(brainHarness)。
++ */
++import { describe, expect, it } from 'vitest'
++import { flushUntil, loadBrain, type LoadBrainOptions, type LoadedBrain } from './brainHarness'
++
++const BINDING_FILE = 'canvases/binding.json'
++const BINDING = JSON.stringify({ version: 1, bindingId: 'local-single', epoch: 0, sceneId: 'character-flow' })
++const DIR = 'pending-writes'
++const PERSIST_CHANNEL = 'mivo-canvas-persist'
++const QUEUE_MAX = 64
++
++const brainWith = (options: LoadBrainOptions = {}): LoadedBrain =>
++  loadBrain({ files: { [BINDING_FILE]: BINDING }, panelPresent: () => false, ...options })
++
++const seedQueue = (count: number): Record<string, string> => {
++  const files: Record<string, string> = { [BINDING_FILE]: BINDING }
++  for (let i = 0; i < count; i += 1) {
++    const intentId = `intent-${i + 1}-seed-${i}`
++    files[`${DIR}/i-${intentId}.json`] = JSON.stringify({
++      schemaVersion: 1,
++      intentId,
++      seq: i + 1,
++      verb: 'add-note',
++      params: { text: `seed-${i}` },
++      target: { bindingId: 'local-single', epoch: 0, sceneId: 'character-flow' },
++      createdAt: 1,
++      expiresAt: 9_999_999_999_999,
++      origin: { source: 'tool-call' },
++    })
++  }
++  return files
++}
++
++const bodyKeys = (brain: LoadedBrain): string[] =>
++  [...brain.files.keys()].filter((path) => path.startsWith(`${DIR}/i-`))
++
++const bodyIntentIds = (brain: LoadedBrain): string[] =>
++  bodyKeys(brain).map((path) => (JSON.parse(brain.files.get(path)!) as { intentId: string }).intentId)
++
++/** 面板侧持久化桥替身(与 deferTransportReplay.test.ts 同形状):按 reqId 发请求、收回执。 */
++const openPersistBridge = (brain: LoadedBrain) => {
++  const channel = brain.bus.open(PERSIST_CHANNEL)
++  const replies: Array<Record<string, unknown>> = []
++  channel.onmessage = (event) => {
++    const data = event.data as Record<string, unknown> | undefined
++    if (data && data.reply === true) replies.push(data)
++  }
++  return {
++    replies,
++    send: async (reqId: string, payload: Record<string, unknown>) => {
++      const before = replies.filter((reply) => reply.reqId === reqId).length
++      channel.postMessage({ reqId, ...payload })
++      // 队列里可能有 60+ 条正文,pending-list/pending-ack 的 deferScan() 要逐条 await
++      // fsRead,默认预算(24 轮 × 8 跳)不够,调大而不是缩小种子队列掩盖真实 await 深度。
++      await flushUntil(() => replies.filter((reply) => reply.reqId === reqId).length > before, {
++        label: `persist 请求 ${reqId}(${String(payload.kind)})的回执`,
++        rounds: 400,
++        perRound: 20,
++      })
++      return replies.filter((reply) => reply.reqId === reqId).slice(-1)[0] as Record<string, unknown>
++    },
++  }
++}
++
++describe('①确定性并发: 63 条预置正文 + 2 个同时到达的入队请求,直调内部 enqueue', () => {
++  it('红: 过程与最终正文数不许突破 64,现实现两个都通过容量检查,最终落到 65 条', async () => {
++    const brain = brainWith({ files: seedQueue(63) })
++    expect(bodyKeys(brain)).toHaveLength(63) // 起始基线:确实是 63,不是别的数
++
++    // 不串行 await —— 两次调用几乎同时发起,分别走各自的「读→判→写」序列。
++    const [ra, rb] = await Promise.all([
++      brain.handles.defer.enqueue('add-note', { text: 'concurrent-A' }),
++      brain.handles.defer.enqueue('add-note', { text: 'concurrent-B' }),
++    ])
++    const resultA = ra as Record<string, unknown>
++    const resultB = rb as Record<string, unknown>
++
++    // 红:设计稿 §3.3 的硬上限是 64,现实现在这里落到 65。
++    expect(bodyKeys(brain).length).toBeLessThanOrEqual(QUEUE_MAX)
++    // 附带证据(供报告使用,不是本条的断言点):真实落地数。
++    console.info('[oracle] 并发 2 入队后正文总数 =', bodyKeys(brain).length, '结果 =', [resultA.ok, resultB.ok])
++  })
++
++  it('红: 恰好一个该收到 WRITE_QUEUE_FULL(容量检查若真的互斥,后到的那个应该被拒),现实现两个都 ok:true', async () => {
++    const brain = brainWith({ files: seedQueue(63) })
++    const [ra, rb] = await Promise.all([
++      brain.handles.defer.enqueue('add-note', { text: 'concurrent-A' }),
++      brain.handles.defer.enqueue('add-note', { text: 'concurrent-B' }),
++    ])
++    const codes = [ra, rb].map((r) => (r as Record<string, unknown>).code).filter(Boolean)
++    expect(codes.filter((code) => code === 'WRITE_QUEUE_FULL')).toHaveLength(1)
++  })
++
++  it('锁定(非红,防回归): 无论互斥修好与否,已经落盘的 intentId 都不许重复/覆盖', async () => {
++    const brain = brainWith({ files: seedQueue(63) })
++    await Promise.all([
++      brain.handles.defer.enqueue('add-note', { text: 'concurrent-A' }),
++      brain.handles.defer.enqueue('add-note', { text: 'concurrent-B' }),
++    ])
++    const ids = bodyIntentIds(brain)
++    expect(new Set(ids).size).toBe(ids.length)
++  })
++})
++
++describe('②真实接线: 2 个并发 canvas_add_note 工具调用(emitHostMessage)不受 mivo-canvas-persist 的 chain 保护', () => {
++  it('红: 面板侧权威视图(真实 pending-list 往返)最终看到的正文数突破 64,违反设计稿 §3.3 的硬上限承诺', async () => {
++    const brain = brainWith({ files: seedQueue(63) })
++    const persist = openPersistBridge(brain)
++
++    // 两次真实工具调用入口(不直调内部 enqueue):走 cindy.onHostMessage → handleToolCall
++    // → panelWriteReadiness()(1500ms panel-ping 超时)→ deferSubmit → deferEnqueue。
++    brain.emitHostMessage({ type: 'tool-call', tool: 'canvas_add_note', callId: 'call-A', args: { text: 'via tool call A' } })
++    brain.emitHostMessage({ type: 'tool-call', tool: 'canvas_add_note', callId: 'call-B', args: { text: 'via tool call B' } })
++
++    const settled = () => brain.cindySent.filter((item) => (item as { type?: string }).type === 'tool-result').length
++    const before = settled()
++    brain.clock.advance(2_000) // 两个 panel-ping 都超时,退回入队路径
++    // 63 条预置正文意味着每次 deferScan() 要串行 await 63 次 fsRead,两次并发调用合计
++    // 上百个微任务跳数,默认预算(24 轮 × 8 跳)远远不够 —— 调大预算,而不是缩小种子队列
++    // 掩盖真实的 await 深度。
++    await flushUntil(() => settled() >= before + 2, {
++      label: '两次 canvas_add_note 工具调用都交卷',
++      rounds: 400,
++      perRound: 20,
++    })
++
++    // 面板权威视图:通过真实 mivo-canvas-persist 频道(经 chain 串行化)读一次 pending-list。
++    const listReply = await persist.send('req-list-1', { kind: 'pending-list' })
++    const pendingWrites = listReply.pendingWrites as unknown[]
++
++    // 红:面板看到的权威队列长度超过 64 —— chain 串行化的 pending-list 本身没做错任何事,
++    // 但它权威呈现的目录实况已经被两条未经互斥保护的工具调用写坏了。
++    expect(pendingWrites.length).toBeLessThanOrEqual(QUEUE_MAX)
++  })
++
++  it('红: 两次工具调用都应该"恰一个被拒"(容量互斥),现实现两次都 tool-result ok:true(都被接受)', async () => {
++    const brain = brainWith({ files: seedQueue(63) })
++
++    brain.emitHostMessage({ type: 'tool-call', tool: 'canvas_add_note', callId: 'call-A', args: { text: 'via tool call A' } })
++    brain.emitHostMessage({ type: 'tool-call', tool: 'canvas_add_note', callId: 'call-B', args: { text: 'via tool call B' } })
++
++    const settled = () => brain.cindySent.filter((item) => (item as { type?: string }).type === 'tool-result').length
++    const before = settled()
++    brain.clock.advance(2_000)
++    await flushUntil(() => settled() >= before + 2, {
++      label: '两次 canvas_add_note 工具调用都交卷',
++      rounds: 400,
++      perRound: 20,
++    })
++
++    const results = brain.cindySent.filter(
++      (item) => (item as { type?: string }).type === 'tool-result',
++    ) as Array<{ callId: string; ok: boolean; errorCode?: string }>
++    const rejected = results.filter((r) => r.errorCode === 'WRITE_QUEUE_FULL')
++    expect(rejected).toHaveLength(1)
++  })
++})
+diff --git a/src/__tests__/deferQueue.test.ts b/src/__tests__/deferQueue.test.ts
+index 0958cffb..834a1dd5 100644
+--- a/src/__tests__/deferQueue.test.ts
++++ b/src/__tests__/deferQueue.test.ts
+@@ -91,28 +91,60 @@ describe('defer 提交点(§6.2-②④)', () => {
+     expect((body.expiresAt as number) - (body.createdAt as number)).toBe(brain.handles.defer.ttlMs)
+   })
+ 
++  // #297 修正版①(§6.2-④,取代旧的补偿删除+墓碑链):正文 write 一旦**派发**,就再没有
++  // WRITE_DEFER_UNAVAILABLE 这个出口了——settle 为非 ok(ok:false/抛错/畸形)之后一律
++  // 靠有界定向读取证判定,「字节实际落盘且内容全匹配」→ WRITE_DEFERRED,「不落盘/取不到
++  // 证据」→ WRITE_DEFER_INDETERMINATE。`malformed` 在假宿主里总会落盘(与 `landsOnThrow`
++  // 无关),所以它和「throw + 字节其实落了盘」同属正证据分支。
+   it.each([
+-    ['宿主明确拒绝(ok:false)', 'reject' as const, false],
+-    ['桥抛错且字节没落盘', 'throw' as const, false],
+-    ['桥抛错但字节其实落了盘', 'throw' as const, true],
+-    ['回包不是 {ok:boolean}', 'malformed' as const, false],
++    ['宿主明确拒绝(ok:false),不落盘', 'reject' as const, false, false],
++    ['桥抛错且字节没落盘', 'throw' as const, false, false],
++    ['桥抛错但字节其实落了盘', 'throw' as const, true, true],
++    ['回包不是 {ok:boolean}(假宿主总会落盘)', 'malformed' as const, false, true],
+   ])(
+-    '正文写入未确认(%s)→ WRITE_DEFER_UNAVAILABLE,**绝不回 accepted**,且不留可被 drain 捡到的正文',
+-    async (_label, outcome, lands) => {
++    '正负矩阵(%s):字节落盘且内容全匹配 → 读证后 WRITE_DEFERRED;不落盘/取不到证据 → WRITE_DEFER_INDETERMINATE',
++    async (_label, outcome, lands, expectDeferred) => {
+       const brain = withClosedPanel({
+         writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? outcome : undefined),
+         landsOnThrow: lands,
+       })
+       const result = (await brain.handles.defer.enqueue('add-note', { text: 'hi' })) as Record<string, unknown>
+-      expect(result.ok).toBe(false)
+-      expect(result.code).toBe('WRITE_DEFER_UNAVAILABLE')
+-      expect(result.intentId).toBeUndefined()
+-      // 「已告诉模型受理、但磁盘上没有正文」是唯一真正不可恢复的组合;反向组合
+-      // (回了不可用、正文却留在盘上)会让用户看到一条自己以为没发生的改动 → 也必须清掉。
+-      expect(bodyKeys(brain)).toEqual([])
++      if (expectDeferred) {
++        // 正证据成立:即便宿主这次回执不确定,内容确实完整落盘 → 照常受理。
++        expect(result.ok).toBe(true)
++        expect(typeof result.intentId).toBe('string')
++        expect(bodyKeys(brain)).toHaveLength(1)
++        expect(readBody(brain).params).toEqual({ text: 'hi' })
++      } else {
++        expect(result.ok).toBe(false)
++        expect(result.code).toBe('WRITE_DEFER_INDETERMINATE')
++        expect(result.intentId).toBeUndefined()
++        // 这两档本就没有字节落盘(reject 不写、throw+不落盘也不写),磁盘干净是「确实
++        // 没写」的自然结果,**不是**靠补偿删除清出来的(新契约下零删除、零补偿写)。
++        expect(bodyKeys(brain)).toEqual([])
++      }
+     },
+   )
+ 
++  it('端到端(handleToolCall):正文没能确认受理时,工具交卷 errorCode 是 WRITE_DEFER_INDETERMINATE(SC-1.1,不只测 helper)', async () => {
++    const brain = withClosedPanel({
++      writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'reject' : undefined),
++    })
++    void brain.handles.handleToolCall({
++      type: 'tool-call',
++      tool: 'canvas_add_note',
++      callId: 'call-indeterminate-1',
++      args: { text: 'hi' },
++    })
++    await settlePing(brain)
++    const results = brain.cindySent.filter(
++      (item) => (item as { type?: string; callId?: string }).type === 'tool-result' && (item as { callId?: string }).callId === 'call-indeterminate-1',
++    )
++    expect(results).toHaveLength(1)
++    expect(results[0]).toMatchObject({ ok: false, errorCode: 'WRITE_DEFER_INDETERMINATE' })
++    expect(bodyKeys(brain)).toEqual([])
++  })
++
+   it('accepted 交卷严格晚于提交点:tool-result 发出的那一刻,正文已在磁盘上', async () => {
+     const filesAtResult: string[][] = []
+     // send 回调在 loadBrain 返回之后才会被调用,所以这里自引用 brain 是安全的
+@@ -188,148 +220,222 @@ describe('defer 提交点(§6.2-②④)', () => {
+ })
+ 
+ /**
+- * 墓碑排除(§6.2-⑤,#339 Greptile P1):正文写入未确认(indeterminate)+ 字节其实落了盘 +
+- * 补偿删除也失败 → 那条正文在结构上和一条正常 accepted 的正文没有任何区别,若不特殊处理
+- * 会在下一次 `pendingList` 被当合法孤儿交给面板 —— 而模型/用户已经在这之前收到了
+- * `WRITE_DEFER_UNAVAILABLE`(「这次没有做任何改动」)。
++ * #297 修正版①(§6.2-④,取代旧的补偿删除+墓碑链):正文 write 一旦**派发**,结果
++ * 不确定时不再删除/记墓碑,而是靠有界定向读取证判定,四类结局(旧的六条墓碑测试按
++ * 新契约迁移到这里,不是简单删掉):
++ *   (a) 非正回执但正文完整落盘 → 读证后 WRITE_DEFERRED(照常受理,可被 drain);
++ *   (b)/(d) 未获正证(不落盘,或落盘但不是合规 canonical payload)→
++ *       WRITE_DEFER_INDETERMINATE,但**零补偿删除**——正文若幸存就原样留着,
++ *       后续 pending-list/drain 仍可能把它当孤儿正文应用;
++ *   (c) 幸存正文一直没被 ack/淘汰,跨过 TTL → 走既有 `deferSweepExpired` 的过期通路
++ *       兜底,不需要墓碑单独收口(与①③同一条结构性依据)。
+  *
+- * 变异复现口径:把 `deferEnqueue` 里「补偿删除失败时记墓碑」那几行删掉(或把 `deferScan`
+- * 里的墓碑排除段删掉),下面「pendingList 看不到它」的断言必红。
++ * 变异复现口径:把 `deferCommitBody` 的有界定向读取证分支删掉(或退化成「非 ok 就
++ * 一律 not committed」),下面「字节确实落盘时仍应判 deferred」的断言必红。
+  */
+-describe('墓碑排除:补偿删除失败的正文不许被当合法孤儿(§6.2-⑤,#339 Greptile P1)', () => {
+-  it('write indeterminate + 字节落盘 + 补偿删除失败 → 正文物理仍在但 pendingList 看不到;补偿删除后来成功了就真的清掉', async () => {
+-    let allowDelete = false
++describe('#297 修正版①:write 结果不确定时靠有界取证判定,不再补偿删除/记墓碑(§6.2-④)', () => {
++  it('(a) 非正回执但正文完整落盘 → 读证后 WRITE_DEFERRED,pendingList 照常能看到它', async () => {
+     const brain = withClosedPanel({
+       writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'throw' : undefined),
+       landsOnThrow: true,
+-      deleteGuard: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? allowDelete : true),
+     })
+ 
+-    const result = (await brain.handles.defer.enqueue('add-note', { text: 'ghost write' })) as Record<string, unknown>
+-    expect(result.ok).toBe(false)
+-    expect(result.code).toBe('WRITE_DEFER_UNAVAILABLE')
+-    // 反例前提:正文确实物理仍在盘上(补偿删除失败)——这是本轮 bug 得以复现的必要条件,
+-    // 若这里已经是空,说明测试没有造出「删不掉」这个场景,后面的断言就没有意义。
++    const result = (await brain.handles.defer.enqueue('add-note', { text: 'ghost write lands' })) as Record<string, unknown>
++    expect(result.ok).toBe(true)
++    expect(typeof result.intentId).toBe('string')
+     expect(bodyKeys(brain)).toHaveLength(1)
+     const intentId = readBody(brain).intentId as string
+ 
+-    // 墓碑记下了它,不是靠猜——直接读墓碑文件。
+-    const tombstones = (await brain.handles.defer.readTombstones()) as Array<{ intentId: string }>
+-    expect(tombstones.map((item) => item.intentId)).toContain(intentId)
+-
+-    // 核心断言:pendingList(面板下一次 drain 会调这个)看不到它,不当合法孤儿交出去,
+-    // 也不出现在 pendingWrites 或 orphanIntentIds 里。
++    // 不是靠猜:pendingList 把它当正常受理的意图,不是孤儿也不是失败。
+     const listed = (await brain.handles.defer.pendingList()) as Record<string, unknown>
+-    expect((listed.pendingWrites as Array<{ intentId: string }>).map((item) => item.intentId)).not.toContain(intentId)
+-    expect(listed.orphanIntentIds).not.toContain(intentId)
+-
+-    // 补偿删除后来成功了(比如宿主重试之后):下一次 scan 应该把它真的清掉,墓碑同步清空。
+-    allowDelete = true
+-    const listedAgain = (await brain.handles.defer.pendingList()) as Record<string, unknown>
+-    expect(listedAgain.pendingWrites).toEqual([])
+-    expect(bodyKeys(brain)).toHaveLength(0)
+-    expect(await brain.handles.defer.readTombstones()).toEqual([])
++    expect((listed.pendingWrites as Array<{ intentId: string }>).map((item) => item.intentId)).toContain(intentId)
+   })
+ 
+-  it('补偿删除一直失败(最坏情况)→ 过了原意图的 TTL 后交给 deferSweepExpired 的过期通路兜底', async () => {
++  it('(c) 读证已确认落盘的正文,一直没被 ack,跨过 TTL 后走既有过期通路(不需要墓碑单独收口)', async () => {
+     const brain = withClosedPanel({
+       writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'throw' : undefined),
+       landsOnThrow: true,
+-      deleteGuard: (request: FsRequest) => !request.path.startsWith(`${DIR}/i-`), // 永久拒绝删除这类路径
+     })
+     const result = (await brain.handles.defer.enqueue('add-note', { text: 'ghost write ttl' })) as Record<string, unknown>
+-    expect(result.code).toBe('WRITE_DEFER_UNAVAILABLE')
+-    expect(bodyKeys(brain)).toHaveLength(1)
++    expect(result.ok).toBe(true) // 读证已确认落盘,这条现在是正常受理的意图
+     const intentId = readBody(brain).intentId as string
+ 
+-    // TTL 之前:墓碑机制生效,看不到它。
+-    const beforeTtl = (await brain.handles.defer.pendingList()) as Record<string, unknown>
+-    expect((beforeTtl.pendingWrites as Array<{ intentId: string }>).map((item) => item.intentId)).not.toContain(intentId)
+-
+-    // 推进时钟越过原意图的 TTL(7 天)—— 即便补偿删除从未成功过。
+     brain.clock.advance((brain.handles.defer.ttlMs as number) + 1_000)
+     const afterTtl = (await brain.handles.defer.pendingList()) as Record<string, unknown>
+-    // 仍然看不到它(这次是靠 deferSweepExpired 的过期分类,不再靠墓碑)。
+     expect((afterTtl.pendingWrites as Array<{ intentId: string }>).map((item) => item.intentId)).not.toContain(intentId)
+-    // 且它被过期通路正式记入 rejected 台账(fail-visible,不是静默消失)。
+     const rejected = JSON.parse(brain.files.get(`${DIR}/rejected.json`)!) as { items: Array<Record<string, unknown>> }
+     expect(rejected.items.some((item) => item.intentId === intentId && item.outcome === 'expired')).toBe(true)
+   })
+ 
+-  it('补偿删除当场就成功 → 不产生墓碑条目(不给后续 scan 添无谓的重试负担)', async () => {
++  it('(d-1) write 确定没落盘(reject)→ WRITE_DEFER_INDETERMINATE,零补偿副作用(没有正文可删)', async () => {
+     const brain = withClosedPanel({
+-      writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'throw' : undefined),
+-      landsOnThrow: true, // 补偿删除本身默认放行(deleteGuard 未注入)
++      writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'reject' : undefined),
+     })
+-    const result = (await brain.handles.defer.enqueue('add-note', { text: 'ghost write cleaned' })) as Record<string, unknown>
+-    expect(result.code).toBe('WRITE_DEFER_UNAVAILABLE')
+-    expect(bodyKeys(brain)).toHaveLength(0) // 补偿删除成功,正文没留下
+-    expect(await brain.handles.defer.readTombstones()).toEqual([])
++    const before = brain.fsRequests.length
++    const result = (await brain.handles.defer.enqueue('add-note', { text: 'never landed' })) as Record<string, unknown>
++    expect(result.code).toBe('WRITE_DEFER_INDETERMINATE')
++    expect(bodyKeys(brain)).toEqual([])
++    // 零补偿写/删:这段窗口里没有任何 delete 请求,也没有 tombstones.json 这种文件。
++    const ops = brain.fsRequests.slice(before).map((request) => request.op)
++    expect(ops.filter((op) => op === 'delete')).toEqual([])
++    expect(brain.files.has(`${DIR}/tombstones.json`)).toBe(false)
+   })
+ 
+-  it('补偿删除前两次失败、第三次成功(瞬时故障)→ 重试收口,不留墓碑(#339 Greptile P1-①)', async () => {
+-    let deleteAttempts = 0
++  it('(d-2) 字节落盘但不是合规 canonical payload(结构校验不过)→ 仍判 WRITE_DEFER_INDETERMINATE,且不删它', async () => {
++    // 直接走 commitBody 低层接口:模拟「字节落盘,但内容不是一份完整合规的正文」——
++    // 这正是 deferParseBody 这道额外结构校验单独存在的意义(见 deferVerifyByRead 注释)。
++    const brain = withClosedPanel({
++      writeOutcome: (request: FsRequest) => (request.path.includes('intent-bad-payload') ? 'malformed' : undefined),
++    })
++    const path = brain.handles.defer.bodyPath('intent-bad-payload-1-1')
++    const result = await brain.handles.defer.commitBody(path, '{"schemaVersion":1}', null)
++    expect(result.committed).toBe(false)
++    // 幸存的坏正文原样留在盘上——**不删它**,与老的补偿删除设计的核心区别。
++    expect(brain.files.get(path)).toBe('{"schemaVersion":1}')
++    expect(brain.files.has(`${DIR}/tombstones.json`)).toBe(false)
++  })
++})
++
++describe('#297 修正版①:有界取证的确定性(SC-1.8,fake clock 精确断言尝试次数/时刻/timer 清理)', () => {
++  // 注意:`deferReadBinding()` 也会发一次 `op:'read'`(读 `canvases/binding.json`),
++  // 与本节要断言的「正文取证读」是两件事 —— 下面全部按**路径**(`${DIR}/i-` 前缀)过滤,
++  // 不按裸 op 过滤,否则会把绑定读也算进取证读的计数里。
++  const bodyReadOps = (brain: LoadedBrain, before: number): FsRequest[] =>
++    brain.fsRequests.slice(before).filter((request) => request.op === 'read' && request.path.startsWith(`${DIR}/i-`))
++
++  it('write 在 deadline 内 settle 为 ok → 零正文取证读、零残留 timer', async () => {
++    const brain = withClosedPanel()
++    const before = brain.fsRequests.length
++    const result = (await brain.handles.defer.enqueue('add-note', { text: 'fast ok' })) as Record<string, unknown>
++    expect(result.ok).toBe(true)
++    expect(bodyReadOps(brain, before)).toEqual([])
++    expect(brain.clock.pending()).toBe(0)
++  })
++
++  it('write 到有界 deadline 仍未 settle(悬挂)→ 直接 WRITE_DEFER_INDETERMINATE,零正文取证读、零补偿删除', async () => {
++    const brain = withClosedPanel({
++      writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'hang' : undefined),
++    })
++    const before = brain.fsRequests.length
++    const pending = brain.handles.defer.enqueue('add-note', { text: 'hangs forever' })
++    await flushUntil(() => brain.clock.pending() > 0, { label: 'write 有界 deadline 计时器已挂起' })
++    brain.clock.advance(brain.handles.defer.fsDeadlineMs as number)
++    const result = (await pending) as Record<string, unknown>
++    expect(result.code).toBe('WRITE_DEFER_INDETERMINATE')
++    expect(bodyReadOps(brain, before)).toEqual([]) // 未 settle 不发 read(§6.2-④)
++    const deleteOps = brain.fsRequests.slice(before).filter((request) => request.op === 'delete')
++    expect(deleteOps).toEqual([]) // 零补偿删除
++  })
++
++  it('write settle 为非 ok 后才发起定向读:fs 请求次序是 write(正文) → read(正文),read 严格排在 write settle 之后', async () => {
++    const brain = withClosedPanel({
++      writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'reject' : undefined),
++    })
++    const before = brain.fsRequests.length
++    await brain.handles.defer.enqueue('add-note', { text: 'reject then read' })
++    const ops = brain.fsRequests.slice(before).filter((request) => request.path.startsWith(`${DIR}/i-`))
++    const writeAt = ops.findIndex((request) => request.op === 'write')
++    const firstReadAt = ops.findIndex((request) => request.op === 'read')
++    expect(writeAt).toBeGreaterThanOrEqual(0)
++    expect(firstReadAt).toBeGreaterThan(writeAt)
++  })
++
++  it('有界读证耗尽:未获正证据时恰好尝试 DEFER_EVIDENCE_READ_MAX_ATTEMPTS(3)次,不多不少', async () => {
++    const brain = withClosedPanel({
++      writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'reject' : undefined),
++    })
++    expect(brain.handles.defer.evidenceReadMaxAttempts).toBe(3)
++    const before = brain.fsRequests.length
++    const result = (await brain.handles.defer.enqueue('add-note', { text: 'exhaust retries' })) as Record<string, unknown>
++    expect(result.code).toBe('WRITE_DEFER_INDETERMINATE')
++    expect(bodyReadOps(brain, before)).toHaveLength(brain.handles.defer.evidenceReadMaxAttempts as number)
++  })
++
++  it('读证第一次就命中正证据 → 立即返回,不把重试预算用满', async () => {
+     const brain = withClosedPanel({
+       writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'throw' : undefined),
+       landsOnThrow: true,
+-      deleteGuard: (request: FsRequest) => {
+-        if (!request.path.startsWith(`${DIR}/i-`)) return true
+-        deleteAttempts += 1
+-        return deleteAttempts >= 3 // 前两次拒绝,第三次放行
+-      },
+     })
+-    const result = (await brain.handles.defer.enqueue('add-note', { text: 'ghost write flaky' })) as Record<string, unknown>
+-    expect(result.code).toBe('WRITE_DEFER_UNAVAILABLE')
+-    expect(deleteAttempts).toBe(3) // 确实重试了,不是只试一次就放手
+-    expect(bodyKeys(brain)).toHaveLength(0) // 第三次删除成功,正文没留下
+-    expect(await brain.handles.defer.readTombstones()).toEqual([]) // 删都成功了,不需要墓碑
++    const before = brain.fsRequests.length
++    const result = (await brain.handles.defer.enqueue('add-note', { text: 'lands, one read enough' })) as Record<string, unknown>
++    expect(result.ok).toBe(true)
++    expect(bodyReadOps(brain, before)).toHaveLength(1)
+   })
+ 
+-  it('补偿删除永久失败、墓碑写入前两次失败第三次成功 → 重试收口,墓碑最终落盘', async () => {
+-    let tombstoneWriteAttempts = 0
++  // SC-1.4-③ 的欠账(harness 之前只有 write 侧 'hang',没有 read 侧等价物):补 read 悬挂
++  // 场景,证明取证读本身同样有界,不会让「宿主 fs 慢/无回音」把重试预算耗在一次悬挂上。
++  it('read 每次尝试都悬挂到 deadline → 逐次按未获证据处理,3 次耗尽后判第三态,零补偿删除', async () => {
+     const brain = withClosedPanel({
+-      writeOutcome: (request: FsRequest) => {
+-        if (request.path.startsWith(`${DIR}/i-`)) return 'throw'
+-        if (request.path === `${DIR}/tombstones.json`) {
+-          tombstoneWriteAttempts += 1
+-          return tombstoneWriteAttempts >= 3 ? undefined : 'reject' // 前两次拒绝,第三次放行(undefined = 走默认成功)
+-        }
+-        return undefined
+-      },
+-      landsOnThrow: true,
+-      deleteGuard: (request: FsRequest) => !request.path.startsWith(`${DIR}/i-`), // 补偿删除永久失败
++      writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'throw' : undefined),
++      landsOnThrow: true, // 字节确实落盘了,但每次读都悬挂,拿不到确认——只能判第三态
++      readOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'hang' : undefined),
+     })
+-    const result = (await brain.handles.defer.enqueue('add-note', { text: 'ghost write tombstone flaky' })) as Record<string, unknown>
+-    expect(result.code).toBe('WRITE_DEFER_UNAVAILABLE')
+-    expect(tombstoneWriteAttempts).toBe(3) // 墓碑写入也确实重试了
+-    const intentId = readBody(brain).intentId as string
+-    const tombstones = (await brain.handles.defer.readTombstones()) as Array<{ intentId: string }>
+-    expect(tombstones.map((item) => item.intentId)).toContain(intentId) // 第三次写成功,墓碑最终落盘
+-    const listed = (await brain.handles.defer.pendingList()) as Record<string, unknown>
+-    expect((listed.pendingWrites as Array<{ intentId: string }>).map((item) => item.intentId)).not.toContain(intentId)
++    const before = brain.fsRequests.length
++    const pending = brain.handles.defer.enqueue('add-note', { text: 'landed but unreadable' })
++    const maxAttempts = brain.handles.defer.evidenceReadMaxAttempts as number
++    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
++      await flushUntil(() => brain.clock.pending() > 0, { label: `第 ${attempt + 1} 次读证 deadline 计时器已挂起` })
++      brain.clock.advance(brain.handles.defer.fsDeadlineMs as number)
++    }
++    const result = (await pending) as Record<string, unknown>
++    expect(result.code).toBe('WRITE_DEFER_INDETERMINATE')
++    expect(bodyReadOps(brain, before)).toHaveLength(maxAttempts)
++    const deleteOps = brain.fsRequests.slice(before).filter((request) => request.op === 'delete')
++    expect(deleteOps).toEqual([]) // 零补偿删除:字节其实在盘上,原样留着交给孤儿正文规则(§6.2-③)
+   })
+ 
+-  it('补偿删除与墓碑写入均重试耗尽仍未确认 → 工具调用仍干净交卷(不抛异常),留痕 error(#339 Greptile P1-②)', async () => {
++  it('read 第一次悬挂、第二次读到证据 → 悬挂只算一次不构成证据的尝试,不终止重试', async () => {
++    let readAttempts = 0
+     const brain = withClosedPanel({
+-      writeOutcome: (request: FsRequest) => {
+-        if (request.path.startsWith(`${DIR}/i-`)) return 'throw'
+-        if (request.path === `${DIR}/tombstones.json`) return 'throw' // 墓碑写入本身也抛错(不只是 reject)
+-        return undefined
+-      },
++      writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'throw' : undefined),
+       landsOnThrow: true,
+-      deleteGuard: (request: FsRequest) => !request.path.startsWith(`${DIR}/i-`), // 补偿删除永久失败
++      readOutcome: (request: FsRequest) => {
++        if (!request.path.startsWith(`${DIR}/i-`)) return undefined
++        readAttempts += 1
++        return readAttempts === 1 ? 'hang' : undefined // 第一次悬挂,第二次起走默认(正常读到内容)
++      },
+     })
+-    // 核心断言:即便删除与墓碑写入(含抛错)全部重试耗尽,enqueue 本身**不抛异常**、
+-    // 干净地 resolve 成结构化失败——这是 Greptile P1-② 指出的洞:此前 `fsWrite` 在
+-    // `cindy.fs` 抛错时会原样上抛,而 `deferEnqueue` 的调用方是 `return deferSubmit(...)`
+-    // (不是 `return await`),外层 `handleToolCall` 的 try/catch 接不住,会变成
+-    // 未处理的 rejection。
+-    await expect(brain.handles.defer.enqueue('add-note', { text: 'ghost write worst case' })).resolves.toMatchObject({
+-      ok: false,
+-      code: 'WRITE_DEFER_UNAVAILABLE',
++    const before = brain.fsRequests.length
++    const pending = brain.handles.defer.enqueue('add-note', { text: 'first read hangs, second finds it' })
++    await flushUntil(() => brain.clock.pending() > 0, { label: '第一次读证 deadline 计时器已挂起' })
++    brain.clock.advance(brain.handles.defer.fsDeadlineMs as number)
++    const result = (await pending) as Record<string, unknown>
++    expect(result.ok).toBe(true)
++    expect(bodyReadOps(brain, before)).toHaveLength(2) // 第一次悬挂超时(不构成证据)+ 第二次命中
++  })
++
++  // P1-T3 锁粒度裁决(sol 共识 SC-3.1 原文):「scan→容量/seq/id→body write→证据终态/
++  // 容量释放」是一个不可分割的关键段——取证读也在锁内,不能在 write 一 settle 就把锁
++  // 让给下一个入队请求。用两次都需要读证的并发入队直接证明:第二次的 write 必须严格
++  // 晚于第一次的读证完成,不能插进第一次「write→read」序列中间。
++  it('并发时证据读也在锁内:第二次入队的 write 严格排在第一次读证完成之后(SC-3.1 锁粒度)', async () => {
++    const brain = withClosedPanel({
++      writeOutcome: (request: FsRequest) => (request.path.startsWith(`${DIR}/i-`) ? 'throw' : undefined),
++      landsOnThrow: true, // 两次都需要走一遍定向读取证(一次读即可命中)
+     })
+-    // 严重错误留痕,不是静默吞掉(§10「不假装已经解决」)。
+-    // (墓碑最终没能落盘是本轮如实记录的残余风险,不在这里断言墓碑内容。)
++    const before = brain.fsRequests.length
++    const [ra, rb] = await Promise.all([
++      brain.handles.defer.enqueue('add-note', { text: 'A' }),
++      brain.handles.defer.enqueue('add-note', { text: 'B' }),
++    ])
++    const intentIdA = (ra as Record<string, unknown>).intentId as string
++    const intentIdB = (rb as Record<string, unknown>).intentId as string
++    const pathA = brain.handles.defer.bodyPath(intentIdA) as string
++    const pathB = brain.handles.defer.bodyPath(intentIdB) as string
++
++    // 按**各自的路径**定位,不按裸 op 计数——B 入队时的 deferScan() 会连带读一遍此刻已经
++    // 落盘的 A(这是锁生效的证据,不是噪音),混在一起数会把这次合法的扫描读误当成
++    // 「读证多跑了一次」。
++    const ops = brain.fsRequests.slice(before)
++    const firstIndex = (path: string, op: string) => ops.findIndex((request) => request.path === path && request.op === op)
++    const writeA = firstIndex(pathA, 'write')
++    const readA = firstIndex(pathA, 'read') // A 自己的定向读证(对 A 自己的路径)
++    const writeB = firstIndex(pathB, 'write')
++    expect(writeA).toBeGreaterThanOrEqual(0)
++    expect(readA).toBeGreaterThan(writeA)
++    // 核心断言:B 的 write 必须严格晚于 A 的读证完成——若锁没有盖住读证,B 的 write 可能
++    // 插进 A 的「write → read」之间。
++    expect(writeB).toBeGreaterThan(readA)
+   })
+ })
+ 
+diff --git a/src/__tests__/deferReceiptEvidence.adversarial.test.ts b/src/__tests__/deferReceiptEvidence.adversarial.test.ts
+new file mode 100644
+index 00000000..5be14002
+--- /dev/null
++++ b/src/__tests__/deferReceiptEvidence.adversarial.test.ts
+@@ -0,0 +1,183 @@
++/**
++ * 对抗测试(oracle,不是实现):钉「有界取证 + 第三态 + 身份正证据」契约。
++ *
++ * 背景(main.js:1204-1265 §6.2 注释,主要看 ④⑤):当前实现只认两种终态 ——
++ * commit.committed===true(accepted)与 committed===false(一律 WRITE_DEFER_UNAVAILABLE,
++ * 并尝试补偿删除 `deferBodyPath(intentId)`)。这条测试文件钉的是**尚不存在**的第三条路:
++ * 写回执不可信(ok:false / 抛错)时,不能直接假定「没落盘」就去删 —— 必须先看一眼磁盘上
++ * 到底有没有东西、是不是我们刚才写的那份内容,再决定 WRITE_DEFERRED / WRITE_DEFER_INDETERMINATE
++ * / 保持现状。当前实现完全没有这一步(deferCommitBody / deferEnqueue 里没有任何 fsRead /
++ * fsReadResult / pendingProbe 调用),所以本文件的红是「缺一整段行为」,不是「一行判断写反了」。
++ *
++ * 每条断言拆成独立 `it`,这样每一行差异在测试报告里都单独可见,不会被前一条 throw 掩盖。
++ * 只读,不改动任何既有文件;只新增本文件。全部对**真实 main.js** 求值(brainHarness)。
++ */
++import { describe, expect, it } from 'vitest'
++import { flushMicrotasks, loadBrain, type LoadBrainOptions, type LoadedBrain } from './brainHarness'
++
++const BINDING_FILE = 'canvases/binding.json'
++const BINDING = JSON.stringify({ version: 1, bindingId: 'local-single', epoch: 0, sceneId: 'character-flow' })
++const DIR = 'pending-writes'
++
++const brainWith = (options: LoadBrainOptions = {}): LoadedBrain =>
++  loadBrain({ files: { [BINDING_FILE]: BINDING }, panelPresent: () => false, ...options })
++
++const bodyPaths = (brain: LoadedBrain): string[] =>
++  [...brain.files.keys()].filter((path) => path.startsWith(`${DIR}/i-`))
++
++const seedForeignBody = (over: { intentId: string; seq: number; text?: string }): string =>
++  JSON.stringify({
++    schemaVersion: 1,
++    intentId: over.intentId,
++    seq: over.seq,
++    verb: 'add-note',
++    params: { text: over.text ?? 'not ours' },
++    target: { bindingId: 'local-single', epoch: 0, sceneId: 'character-flow' },
++    createdAt: over.seq,
++    expiresAt: 9_999_999_999_999,
++    origin: { source: 'tool-call' },
++  })
++
++/** 场景①的公共 fixture:宿主谎报 ok:false,字节其实逐字节落盘。每个 it 独立跑一遍求干净状态。 */
++const landedButRejected = async (): Promise<{ brain: LoadedBrain; landedPath: string; result: Record<string, unknown> }> => {
++  let landedPath: string | undefined
++  const brain: LoadedBrain = brainWith({
++    writeOutcome: (request) => {
++      if (!request.path.startsWith(`${DIR}/i-`)) return undefined
++      landedPath = request.path
++      brain.files.set(request.path, request.content ?? '')
++      return 'reject'
++    },
++  })
++  const result = (await brain.handles.defer.enqueue('add-note', { text: 'ok bytes landed' })) as Record<
++    string,
++    unknown
++  >
++  if (!landedPath) throw new Error('fixture 没有触发到 pending-writes 的写请求,fixture 本身坏了')
++  return { brain, landedPath, result }
++}
++
++describe('①正证据: write 回执 ok:false 但字节实际落盘且内容全匹配 → 必须是 WRITE_DEFERRED,不是 UNAVAILABLE', () => {
++  it('红: 交卷应为 accepted(ok:true, code:WRITE_DEFERRED),现实现回 ok:false + WRITE_DEFER_UNAVAILABLE(main.js:1748-1752)', async () => {
++    const { result } = await landedButRejected()
++    expect(result).toMatchObject({ ok: true, code: 'WRITE_DEFERRED' })
++  })
++
++  it('红: 已落盘且内容吻合的正文不许被补偿删除,现实现的 deferRetry(3, fsDelete) 会把它删掉(main.js:1717)', async () => {
++    const { brain, landedPath } = await landedButRejected()
++    expect(brain.files.has(landedPath)).toBe(true)
++  })
++
++  it('锁定(非红,防回归): 正证据路径下不该走到"删除失败→补墓碑"这一步,当前确实没写墓碑', async () => {
++    // #297 修正版①落地后 tombstonesPath 这个 handle 已随整条墓碑链一起删除
++    // (main.js 不再有 DEFER_TOMBSTONES_PATH);改用字面路径钉住同一条回归线——
++    // tombstones.json 这个文件从今往后不该在任何场景下出现。
++    const { brain } = await landedButRejected()
++    expect(brain.files.has(`${DIR}/tombstones.json`)).toBe(false)
++  })
++})
++
++describe('②第三态: write 确定失败/无法确认落地(且字节确实没落盘)→ WRITE_DEFER_INDETERMINATE,零删除、零墓碑', () => {
++  const genuinelyLost = async (): Promise<{ brain: LoadedBrain; before: number; result: Record<string, unknown> }> => {
++    const brain = brainWith({
++      writeOutcome: (request) => (request.path.startsWith(`${DIR}/i-`) ? 'throw' : undefined),
++      landsOnThrow: false, // 字节确定没落盘:这才是「真正无法确认」的那一档,不是①的正证据
++    })
++    const before = brain.fsRequests.length
++    const result = (await brain.handles.defer.enqueue('add-note', { text: 'lost in transit' })) as Record<
++      string,
++      unknown
++    >
++    return { brain, before, result }
++  }
++
++  it('红: 交卷码必须是第三态 WRITE_DEFER_INDETERMINATE,main.js 里根本没有这个码,现实现回 WRITE_DEFER_UNAVAILABLE', async () => {
++    const { result } = await genuinelyLost()
++    expect(result.code).toBe('WRITE_DEFER_INDETERMINATE')
++    expect(result.ok).toBe(false)
++  })
++
++  it('红: 不许对着一个从未存在过的路径盲删 3 次,现实现无论如何都会 deferRetry(3, fsDelete)(main.js:1717)', async () => {
++    const { brain, before } = await genuinelyLost()
++    const ops = brain.fsRequests.slice(before)
++    expect(ops.filter((op) => op.op === 'delete')).toHaveLength(0)
++  })
++
++  it('红: 未曾证明落地时不该补写墓碑,现实现在删除失败后会补墓碑(main.js:1726-1732)', async () => {
++    // 同上:tombstonesPath handle 已随墓碑链删除,改用字面路径钉住同一条回归线。
++    const { brain } = await genuinelyLost()
++    expect(brain.files.has(`${DIR}/tombstones.json`)).toBe(false)
++  })
++})
++
++describe('③身份校验: 同路径存在异 payload(不是我们刚写的那份)→ 绝不能被当作"我方已落地",更不能被无差别删除', () => {
++  const collideWith = async (
++    foreignContentFor: (text: string) => string,
++  ): Promise<{ brain: LoadedBrain; collidedPath: string; result: Record<string, unknown> }> => {
++    let collidedPath: string | undefined
++    const brain: LoadedBrain = brainWith({
++      writeOutcome: (request) => {
++        if (!request.path.startsWith(`${DIR}/i-`)) return undefined
++        collidedPath = request.path
++        // 我们的写没有落地(回执 ok:false),但那个路径上**已经**躺着一份异 payload。
++        brain.files.set(request.path, foreignContentFor(request.content ?? ''))
++        return 'reject'
++      },
++    })
++    const result = (await brain.handles.defer.enqueue('add-note', { text: 'mine, different from foreign' })) as Record<
++      string,
++      unknown
++    >
++    if (!collidedPath) throw new Error('fixture 没有触发到 pending-writes 的写请求,fixture 本身坏了')
++    return { brain, collidedPath, result }
++  }
++
++  const mismatchedForeign = () => seedForeignBody({ intentId: 'someone-elses-intent', seq: 777, text: 'not our payload' })
++  const truncatedForeign = (ours: string) => ours.slice(0, Math.max(1, Math.floor(ours.length / 2)))
++
++  it('硬线(非红本身,但缺身份校验才会让下面两条红): intentId/内容不同的异 payload 绝不能被宣布 WRITE_DEFERRED', async () => {
++    const { result } = await collideWith(mismatchedForeign)
++    expect(result.code).not.toBe('WRITE_DEFERRED')
++  })
++
++  it('红: intentId/内容不同的异 payload → 期望第三态 WRITE_DEFER_INDETERMINATE,现实现回 WRITE_DEFER_UNAVAILABLE(没有身份校验,只看写回执)', async () => {
++    const { result } = await collideWith(mismatchedForeign)
++    expect(result.code).toBe('WRITE_DEFER_INDETERMINATE')
++  })
++
++  it('红(最危险): 异 payload 不许被无差别删除,现实现的补偿删除只按路径不核对内容/intentId,会把它删掉(main.js:1717)', async () => {
++    const { brain, collidedPath } = await collideWith(mismatchedForeign)
++    expect(brain.files.has(collidedPath)).toBe(true)
++  })
++
++  it('红: 截断 JSON(解析不出来)同样不许被判定为匹配落地 → 期望第三态,现实现回 WRITE_DEFER_UNAVAILABLE', async () => {
++    const { result } = await collideWith(truncatedForeign)
++    expect(result.code).toBe('WRITE_DEFER_INDETERMINATE')
++  })
++
++  it('红: 截断 JSON 依然不许被盲删,现实现的补偿删除照样把它清掉', async () => {
++    const { brain, collidedPath } = await collideWith(truncatedForeign)
++    expect(brain.files.has(collidedPath)).toBe(true)
++  })
++})
++
++describe('④安全窗口(fake clock,characterization —— 锁定「写未 settle 时不许抢跑」,当前已满足,防回归用)', () => {
++  it('锁定(非红): write 挂起(字节已落盘但 promise 永不 settle)期间,一次取证读/删除都不许发生', async () => {
++    // 现实现压根没有取证探测,0 次探测天然满足「有界」,所以这条不是红证据,而是给将来
++    // 加探测逻辑的实现方画一条不可越过的线:写结果本身还没 settle 之前,不许有任何
++    // 读/删动作抢跑,否则会在字节真的落盘那一刻发生竞态。
++    const brain = brainWith({
++      writeOutcome: (request) => (request.path.startsWith(`${DIR}/i-`) ? 'hang' : undefined),
++    })
++    const before = brain.fsRequests.length
++    // 不 await:这个 promise 按设计永不兑现。
++    void brain.handles.defer.enqueue('add-note', { text: 'hanging' })
++    await flushMicrotasks(40)
++
++    const ops = brain.fsRequests.slice(before)
++    // 只看队列正文自身的取证读(排除 deferReadBinding 那次与队列容量判定无关的绑定读)。
++    expect(ops.filter((op) => op.op === 'read' && op.path.startsWith(`${DIR}/i-`))).toHaveLength(0)
++    expect(ops.filter((op) => op.op === 'delete')).toHaveLength(0)
++    expect(bodyPaths(brain)).toHaveLength(1) // 字节确实落盘了(主进程已经写完)
++  })
++})
+diff --git a/src/__tests__/deferTransportReplay.test.ts b/src/__tests__/deferTransportReplay.test.ts
+index 84ab3efc..4c494bc1 100644
+--- a/src/__tests__/deferTransportReplay.test.ts
++++ b/src/__tests__/deferTransportReplay.test.ts
+@@ -469,6 +469,8 @@ describe('⚠ 静默变短的清单(回执 ok:true 且无 truncated,与完整清
+   it('容量判定在短清单下会低估,但**不产生不可逆动作**;清单恢复后按真实条数拒绝入队', async () => {
+     // 短清单会让 live.length 偏小 → 可能多放行一条。后果是队列短暂超过 64,
+     // 下一次完整清单立刻按真实条数拒绝;没有任何删除/拒绝基于「清单里没有」发生。
++    // characterization(#297 修正版①,SC-3.3):这条不反转——silent-short 下硬上限
++    // 不可证明,本用例只钉住「不可逆动作为零」这条底线,不是给硬上限本身背书。
+     const files: Record<string, string> = { [BINDING_FILE]: BINDING }
+     for (let i = 0; i < 64; i += 1) files[`${DIR}/i-intent-seed-${i + 1}-x.json`] = seedBody(`intent-seed-${i + 1}-x`, i + 1)
+ 

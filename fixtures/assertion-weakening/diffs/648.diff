@@ -1,0 +1,1043 @@
+diff --git a/cindyplugin/ghost.json b/cindyplugin/ghost.json
+index e014a047..8ddf0ee6 100644
+--- a/cindyplugin/ghost.json
++++ b/cindyplugin/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.32",
++  "version": "0.9.33",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+@@ -289,6 +289,20 @@
+           "prompt": {
+             "type": "string",
+             "description": "修改要求(用户原话透传,不要扩写)"
++          },
++          "batchId": {
++            "type": "string",
++            "description": "可选:批次聚合凭证。对同一源图的 2-4 次修改共享同一个 batchId,面板会在预建前聚合成一批(各结果并列落在源图旁);不传 = 单次修改"
++          },
++          "expectedCount": {
++            "type": "integer",
++            "minimum": 2,
++            "maximum": 4,
++            "description": "可选:批次成员总数(2-4),必须与 batchId 同时出现;聚合窗口内缺员会整批拒绝(BATCH_TIMEOUT),重试请用新 batchId"
++          },
++          "sceneId": {
++            "type": "string",
++            "description": "可选:目标画布 id(来自 canvas_snapshot 的 sceneId);不传 = 当前活跃画布。同一批次的全部调用必须指向同一画布"
+           }
+         },
+         "required": [
+@@ -375,4 +389,4 @@
+     "minWidth": 420,
+     "defaultFraction": 0.45
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/cindyplugin/main.js b/cindyplugin/main.js
+index f9e08f4d..ccdf02cd 100644
+--- a/cindyplugin/main.js
++++ b/cindyplugin/main.js
+@@ -3929,7 +3929,18 @@ async function runImageToolWithCard(msg, spec, succeed, fail) {
+     aspectRatio: spec.mode === 'generate' ? args.aspectRatio : undefined,
+     // 卡片不再展示提示词,所以 job 上不留 prompt —— 提示词只经 params 递给面板。
+     sourceLabelNodeId: spec.mode === 'edit' ? args.nodeId : undefined,
+-    params: { nodeId: args.nodeId, prompt: args.prompt, aspectRatio: args.aspectRatio, x: args.x, y: args.y },
++    // #297 批次:batchId/expectedCount/sceneId 原样透传(gpt 审查 P1-①:公共工具必须
++    // 能进批次聚合路由,否则宿主按 ghost.json 声明传的批次字段到不了 agentBridge)。
++    params: {
++      nodeId: args.nodeId,
++      prompt: args.prompt,
++      aspectRatio: args.aspectRatio,
++      x: args.x,
++      y: args.y,
++      sceneId: args.sceneId,
++      batchId: args.batchId,
++      expectedCount: args.expectedCount,
++    },
+     progressCallId: msg.callId,
+     failCode: spec.failCode,
+     failPrefix: spec.failPrefix,
+diff --git a/cindyplugin/src/__tests__/agentBridgeSelection.test.ts b/cindyplugin/src/__tests__/agentBridgeSelection.test.ts
+index a75db328..25dc217e 100644
+--- a/cindyplugin/src/__tests__/agentBridgeSelection.test.ts
++++ b/cindyplugin/src/__tests__/agentBridgeSelection.test.ts
+@@ -42,6 +42,36 @@ vi.mock('../../../src/lib/assetStorage', () => ({
+   readImportedAssetFile: vi.fn(),
+ }))
+ vi.mock('../persist/bridge', () => ({ persistRequest: vi.fn() }))
++// #297 批次测试走真实 agentEditImage → generationFacade.generateImageEdit →
++// mivoTaskClient.submitEditTask/pollTask(与 generation.contract.test.ts 同构 mock 边界)。
++const taskMocks = vi.hoisted(() => ({
++  submitEditTask: vi.fn(),
++  submitGenerationTask: vi.fn(),
++  submitVariationsTask: vi.fn(),
++  pollTask: vi.fn(),
++  cancelTask: vi.fn(),
++  assetBlobForNode: vi.fn(),
++}))
++vi.mock('../../../src/lib/mivoTaskClient', () => ({
++  submitEditTask: taskMocks.submitEditTask,
++  submitGenerationTask: taskMocks.submitGenerationTask,
++  submitVariationsTask: taskMocks.submitVariationsTask,
++  pollTask: taskMocks.pollTask,
++  cancelTask: taskMocks.cancelTask,
++  taskPollIntervalMs: () => 0,
++  kindForFailedTask: () => 'upstream-error' as const,
++}))
++vi.mock('../../../src/lib/mivoImageClient', () => ({
++  assetBlobForNode: taskMocks.assetBlobForNode,
++  MivoImageRequestError: class MivoImageRequestError extends Error {
++    kind: string
++    constructor(message: string, kind: string) {
++      super(message)
++      this.name = 'MivoImageRequestError'
++      this.kind = kind
++    }
++  },
++}))
+ vi.mock('../persist/persistSync', () => ({
+   flushPersistNow: async () => true,
+   restoreFromDiskIfEmpty: async () => 'skipped',
+@@ -58,6 +88,7 @@ vi.mock('../../../src/agent/canvasAgentVerbs', async (importOriginal) => {
+ 
+ import { ChannelBus, channelConstructorFor, flushUntil } from './brainHarness'
+ import { installAgentBridge } from '../agent/agentBridge'
++import { useCanvasStore } from '../../../src/store/canvasStore'
+ import { buildAiContextSnapshot } from '../../../src/store/aiCanvasWorkflow'
+ import {
+   beginCanvasHydration,
+@@ -85,7 +116,11 @@ const wireBridge = () => {
+ 
+   const brainSide = bus.open(CHANNEL)
+   let seq = 0
+-  const ask = async (verb: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown> | null> => {
++  const ask = async (
++    verb: string,
++    params: Record<string, unknown> = {},
++    options: { rounds?: number } = {},
++  ): Promise<Record<string, unknown> | null> => {
+     seq += 1
+     const reqId = `probe-${seq}`
+     let reply: Record<string, unknown> | null = null
+@@ -94,7 +129,10 @@ const wireBridge = () => {
+       if (data && data.reply === true && data.reqId === reqId) reply = data
+     }
+     brainSide.postMessage({ reqId, verb, params })
+-    await flushUntil(() => reply !== null, { label: `agent 桥对动词 '${verb}' 的回执` })
++    await flushUntil(() => reply !== null, {
++      label: `agent 桥对动词 '${verb}' 的回执`,
++      ...(options.rounds !== undefined ? { rounds: options.rounds } : {}),
++    })
+     return reply
+   }
+   return { ask }
+@@ -114,6 +152,21 @@ beforeEach(() => {
+     edges: [],
+     links: [],
+   }
++  taskMocks.submitEditTask.mockReset().mockResolvedValue('t1')
++  taskMocks.submitGenerationTask.mockReset().mockResolvedValue('t1')
++  taskMocks.submitVariationsTask.mockReset().mockResolvedValue({ taskId: 't1', batchId: 'b1', count: 4 })
++  taskMocks.pollTask.mockReset().mockResolvedValue({
++    id: 't1',
++    kind: 'edit',
++    status: 'done',
++    progress: 100,
++    stage: 'done',
++    requestId: 'req-1',
++    model: 'gpt-image-2',
++    result: { images: [{ blob: new Blob(['mock-bytes'], { type: 'image/png' }), title: 'G', width: 300, height: 200 }] },
++  })
++  taskMocks.cancelTask.mockReset().mockResolvedValue(undefined)
++  taskMocks.assetBlobForNode.mockReset().mockResolvedValue(new Blob(['mock-src'], { type: 'image/png' }))
+ })
+ 
+ describe('agentBridge selection 动词', () => {
+@@ -246,3 +299,280 @@ describe('agentBridge selection 动词', () => {
+     expect(reply?.selectedImageNodeIds).toEqual(['img-a'])
+   })
+ })
++
++describe('agentBridge #297 批次协调器(SC1: 同 batchId 聚合 expectedCount+ordinal;身份冻结/短缺/生命周期/归属)', () => {
++  // 批次 edit 走真实 store(不 mock agentEditImage)——需要真实画布有源图。
++  // agentEditImage 在共享层校验 nodeId 存在;用真实 store seed 一张源图。
++  const seedSource = () => {
++    const base = useCanvasStore.getState()
++    useCanvasStore.setState(
++      {
++        ...base,
++        canvases: {
++          scene: { title: 'scene', nodes: [{ id: 'img-a', type: 'image', title: 'A', x: 0, y: 0, width: 300, height: 200, status: 'ready', assetUrl: '/a.png' }], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
++        },
++        sceneId: 'scene',
++        nodes: [{ id: 'img-a', type: 'image', title: 'A', x: 0, y: 0, width: 300, height: 200, status: 'ready', assetUrl: '/a.png' }],
++        edges: [],
++        tasks: [],
++        selectedNodeId: undefined,
++        selectedNodeIds: [],
++      } as never,
++      true,
++    )
++  }
++
++  // 双源 seed:身份冻结用例需要第二个源图来制造「同 batchId 异源成员」。
++  const seedTwoSources = () => {
++    const base = useCanvasStore.getState()
++    const imgA = {
++      id: 'img-a', type: 'image' as const, title: 'A', x: 0, y: 0, width: 300, height: 200,
++      status: 'ready' as const, assetUrl: '/a.png',
++    }
++    const imgB = {
++      id: 'img-b', type: 'image' as const, title: 'B', x: 400, y: 0, width: 300, height: 200,
++      status: 'ready' as const, assetUrl: '/b.png',
++    }
++    useCanvasStore.setState(
++      {
++        ...base,
++        canvases: {
++          scene: { title: 'scene', nodes: [imgA, imgB], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
++        },
++        sceneId: 'scene',
++        nodes: [imgA, imgB],
++        edges: [],
++        tasks: [],
++        selectedNodeId: undefined,
++        selectedNodeIds: [],
++      } as never,
++      true,
++    )
++  }
++
++  // 批次 edit 链路(聚合→预建→生成→替换)跨真实 timer 调度(协调器聚合窗口/防抖落盘),
++  // 纯微任务 flushUntil 预算不足——用手写真等模式(与 flushUntil 同构但跨 macrotask)。
++  const wireRawBridge = () => {
++    const bus = new ChannelBus()
++    const globals = globalThis as Record<string, unknown>
++    const previous = globals.BroadcastChannel
++    globals.BroadcastChannel = channelConstructorFor(bus)
++    installAgentBridge()
++    globals.BroadcastChannel = previous
++    const brainSide = bus.open(CHANNEL)
++    const replies = new Map<string, Record<string, unknown>>()
++    brainSide.onmessage = (event) => {
++      const data = event.data as Record<string, unknown> | undefined
++      if (data && data.reply === true && typeof data.reqId === 'string') replies.set(data.reqId, data)
++    }
++    return {
++      post: (reqId: string, verb: string, params: Record<string, unknown>) =>
++        brainSide.postMessage({ reqId, verb, params }),
++      replies,
++    }
++  }
++
++  const waitForReply = async (
++    replies: Map<string, Record<string, unknown>>,
++    reqId: string,
++    { timeoutMs = 15000, intervalMs = 25 } = {},
++  ): Promise<Record<string, unknown>> => {
++    const deadline = Date.now() + timeoutMs
++    while (Date.now() < deadline) {
++      const reply = replies.get(reqId)
++      if (reply) return reply
++      await new Promise((r) => setTimeout(r, intervalMs))
++    }
++    throw new Error(`批次回执 ${reqId} 在 ${timeoutMs}ms 内未到达`)
++  }
++
++  it('agent_bridge_aggregates_explicit_edit_batch: 2 个同 batchId edit 聚合 → 一次预建 2 个 slot,ordinal 精确绑定,全部成功替换', async () => {
++    seedSource()
++    const { post, replies } = wireRawBridge()
++    post('agg-0', 'edit', { nodeId: 'img-a', prompt: 'p0', batchId: 'batch-agg', expectedCount: 2 })
++    // 让第一个请求先到达聚合器(建 group + 等第二个)
++    for (let i = 0; i < 50; i++) await Promise.resolve()
++    post('agg-1', 'edit', { nodeId: 'img-a', prompt: 'p1', batchId: 'batch-agg', expectedCount: 2 })
++    const [r0, r1] = await Promise.all([waitForReply(replies, 'agg-0'), waitForReply(replies, 'agg-1')])
++    expect(r0.ok).toBe(true)
++    expect(r1.ok).toBe(true)
++    const s = useCanvasStore.getState()
++    // 两个结果节点,各带批次身份(ordinal 0/1)
++    const results = s.nodes.filter((n) => n.type === 'image' && n.id !== 'img-a')
++    expect(results).toHaveLength(2)
++    expect(results.map((r) => r.aiWorkflow?.ordinal).sort()).toEqual([0, 1])
++    results.forEach((r) => {
++      expect(r.aiWorkflow?.batchId).toBe('batch-agg')
++      expect(r.aiWorkflow?.expectedCount).toBe(2)
++    })
++  })
++
++  it(
++    '批次缺员(仅 1 个请求)→ 预建前拒绝 BATCH_TIMEOUT:零 slot/任务残留,迟到成员 BATCH_CLOSED 拒绝',
++    async () => {
++      seedSource()
++      const { post, replies } = wireRawBridge()
++      const beforeCount = useCanvasStore.getState().nodes.length
++      post('solo-0', 'edit', { nodeId: 'img-a', prompt: 'solo', batchId: 'batch-solo', expectedCount: 2 })
++      // 协调器缺员超时 8s 后预建前拒绝(不预建任何占位)。等真超时,一次性成本。
++      const r0 = await waitForReply(replies, 'solo-0', { timeoutMs: 20000 })
++      expect(r0.ok).toBe(false)
++      expect(r0.code).toBe('BATCH_TIMEOUT')
++      expect(String(r0.message)).toContain('batch-solo')
++      const s = useCanvasStore.getState()
++      // 预建前拒绝:一个 slot 都没建,节点数与运行中任务数不变
++      expect(s.nodes.length).toBe(beforeCount)
++      expect(s.nodes.filter((n) => n.type === 'ai-slot')).toHaveLength(0)
++      expect(s.tasks.filter((t) => t.status === 'running')).toHaveLength(0)
++      // 零 queued/generating 残留(含 ai-slot 状态)
++      const residue = s.nodes.filter(
++        (n) =>
++          n.status === 'generating' ||
++          n.status === 'queued' ||
++          n.aiWorkflow?.status === 'generating' ||
++          n.aiWorkflow?.status === 'queued',
++      )
++      expect(residue).toHaveLength(0)
++      // 迟到成员(同 batchId)→ 确定性拒绝,不新建组、不新建 slot
++      post('solo-late', 'edit', { nodeId: 'img-a', prompt: 'solo-late', batchId: 'batch-solo', expectedCount: 2 })
++      const rLate = await waitForReply(replies, 'solo-late', { timeoutMs: 5000 })
++      expect(rLate.ok).toBe(false)
++      expect(rLate.code).toBe('BATCH_CLOSED')
++      expect(useCanvasStore.getState().nodes.length).toBe(beforeCount)
++    },
++    30000,
++  )
++
++  it('批次身份冻结:nodeId/sceneId 与首成员不一致的成员 fail-closed 拒绝,批次由一致成员照常聚合', async () => {
++    seedTwoSources()
++    const { post, replies } = wireRawBridge()
++    post('mix-0', 'edit', { nodeId: 'img-a', prompt: 'p0', batchId: 'batch-mix', expectedCount: 2 })
++    for (let i = 0; i < 50; i++) await Promise.resolve()
++    // 异源成员:与冻结的 sourceNodeId(img-a)不一致 → 该成员拒绝,组不受影响
++    post('mix-1', 'edit', { nodeId: 'img-b', prompt: 'p1', batchId: 'batch-mix', expectedCount: 2 })
++    // 异 scene 成员:与冻结的 sceneId 不一致 → 该成员拒绝
++    post('mix-2', 'edit', { nodeId: 'img-a', prompt: 'p2', sceneId: 'other-scene', batchId: 'batch-mix', expectedCount: 2 })
++    // 一致成员 → 聚合到员,整批预建+执行
++    post('mix-3', 'edit', { nodeId: 'img-a', prompt: 'p3', batchId: 'batch-mix', expectedCount: 2 })
++    const [r0, r1, r2, r3] = await Promise.all([
++      waitForReply(replies, 'mix-0'),
++      waitForReply(replies, 'mix-1'),
++      waitForReply(replies, 'mix-2'),
++      waitForReply(replies, 'mix-3'),
++    ])
++    expect(r1.ok).toBe(false)
++    expect(r1.code).toBe('INVALID_PARAMS')
++    expect(r2.ok).toBe(false)
++    expect(r2.code).toBe('INVALID_PARAMS')
++    expect(r0.ok).toBe(true)
++    expect(r3.ok).toBe(true)
++    // 预建只发生在 img-a 旁:两个结果节点都带 batch 身份,且只来自 img-a 血缘
++    const s = useCanvasStore.getState()
++    const results = s.nodes.filter((n) => n.type === 'image' && n.id !== 'img-a' && n.id !== 'img-b')
++    expect(results).toHaveLength(2)
++    expect(results.map((r) => r.aiWorkflow?.ordinal).sort()).toEqual([0, 1])
++    results.forEach((r) => {
++      expect(r.aiWorkflow?.batchId).toBe('batch-mix')
++      expect(r.aiWorkflow?.expectedCount).toBe(2)
++    })
++  })
++
++  it('批次 flush 期间与 settle 后迟到/重放成员 → BATCH_CLOSED 确定性拒绝,不产生重复 slot 与任务提交', async () => {
++    seedSource()
++    // 用 gate 把 pollTask 挂起,钉住「异步 flush 正在进行」的窗口 —— 这正是
++    // finding 4 的核心场景:原缺陷在 flush 开始时删掉 pending 条目,窗口内到达的
++    // 同 batchId 成员会新建一组、再预建一批同 batchId/ordinal 的重复 slot。
++    const releasePollRef: { current: (() => void) | null } = { current: null }
++    const pollGate = new Promise<void>((resolve) => {
++      releasePollRef.current = resolve
++    })
++    const doneView = {
++      id: 'done',
++      kind: 'edit' as const,
++      status: 'done' as const,
++      progress: 100,
++      stage: 'done',
++      requestId: 'req-x',
++      model: 'gpt-image-2',
++      result: { images: [{ blob: new Blob(['mock-bytes'], { type: 'image/png' }), title: 'G', width: 300, height: 200 }] },
++    }
++    taskMocks.pollTask.mockImplementation(async () => {
++      await pollGate
++      return doneView
++    })
++    const { post, replies } = wireRawBridge()
++    post('late-0', 'edit', { nodeId: 'img-a', prompt: 'l0', batchId: 'batch-late', expectedCount: 2 })
++    for (let i = 0; i < 50; i++) await Promise.resolve()
++    post('late-1', 'edit', { nodeId: 'img-a', prompt: 'l1', batchId: 'batch-late', expectedCount: 2 })
++    // 等 flush 开始:两个 ordinal 都已提交(预建已发生),poll 被 gate 挂住
++    const deadline = Date.now() + 15000
++    while (Date.now() < deadline && taskMocks.submitEditTask.mock.calls.length < 2) {
++      await new Promise((resolve) => setTimeout(resolve, 25))
++    }
++    expect(taskMocks.submitEditTask.mock.calls.length).toBe(2)
++    const slotCountDuring = useCanvasStore.getState().nodes.filter((n) => n.aiWorkflow?.batchId === 'batch-late').length
++    // flush 进行中:迟到成员 → 确定性拒绝,不新建组、不新增 slot
++    post('late-inflight', 'edit', { nodeId: 'img-a', prompt: 'l-inflight', batchId: 'batch-late', expectedCount: 2 })
++    const rInflight = await waitForReply(replies, 'late-inflight', { timeoutMs: 5000 })
++    expect(rInflight.ok).toBe(false)
++    expect(rInflight.code).toBe('BATCH_CLOSED')
++    expect(
++      useCanvasStore.getState().nodes.filter((n) => n.aiWorkflow?.batchId === 'batch-late').length,
++    ).toBe(slotCountDuring)
++    // 释放 gate,让两个 ordinal 完成
++    releasePollRef.current?.()
++    const [r0, r1] = await Promise.all([waitForReply(replies, 'late-0'), waitForReply(replies, 'late-1')])
++    expect(r0.ok).toBe(true)
++    expect(r1.ok).toBe(true)
++    const submitCountAfter = taskMocks.submitEditTask.mock.calls.length
++    const batchNodesAfter = useCanvasStore.getState().nodes.filter((n) => n.aiWorkflow?.batchId === 'batch-late').length
++    // 让 flush 完成终态登记(settled)后再投递重放成员
++    await new Promise((resolve) => setTimeout(resolve, 100))
++    post('late-2', 'edit', { nodeId: 'img-a', prompt: 'l2', batchId: 'batch-late', expectedCount: 2 })
++    const rLate = await waitForReply(replies, 'late-2', { timeoutMs: 5000 })
++    expect(rLate.ok).toBe(false)
++    expect(rLate.code).toBe('BATCH_CLOSED')
++    // 无重复 slot:同 batchId 的节点数不变;无重复任务提交
++    expect(
++      useCanvasStore.getState().nodes.filter((n) => n.aiWorkflow?.batchId === 'batch-late').length,
++    ).toBe(batchNodesAfter)
++    expect(taskMocks.submitEditTask.mock.calls.length).toBe(submitCountAfter)
++  })
++
++  it('乱序完成:两个 ordinal 各自回复自己的结果节点 id(不互相抢报第一个新 image)', async () => {
++    seedSource()
++    const doneView = {
++      id: 'done',
++      kind: 'edit' as const,
++      status: 'done' as const,
++      progress: 100,
++      stage: 'done',
++      requestId: 'req-x',
++      model: 'gpt-image-2',
++      result: { images: [{ blob: new Blob(['mock-bytes'], { type: 'image/png' }), title: 'G', width: 300, height: 200 }] },
++    }
++    taskMocks.submitEditTask.mockImplementation(async (opts: { prompt?: string }) => {
++      return opts?.prompt?.includes('oo0') ? 'task-oo0' : 'task-oo1'
++    })
++    taskMocks.pollTask.mockImplementation(async (taskId: string) => {
++      // ordinal 1(第二个提交)先完成,ordinal 0 后完成 → 乱序完成
++      if (taskId === 'task-oo0') await new Promise((resolve) => setTimeout(resolve, 150))
++      return doneView
++    })
++    const { post, replies } = wireRawBridge()
++    post('oo-0', 'edit', { nodeId: 'img-a', prompt: 'oo0', batchId: 'batch-oo', expectedCount: 2 })
++    for (let i = 0; i < 50; i++) await Promise.resolve()
++    post('oo-1', 'edit', { nodeId: 'img-a', prompt: 'oo1', batchId: 'batch-oo', expectedCount: 2 })
++    const [r0, r1] = await Promise.all([waitForReply(replies, 'oo-0'), waitForReply(replies, 'oo-1')])
++    expect(r0.ok).toBe(true)
++    expect(r1.ok).toBe(true)
++    // 关键不变量:各自回复各自的节点,绝不两个都报同一个
++    expect(r0.nodeId).not.toBe(r1.nodeId)
++    // ordinal 精确归属:聚合顺序 oo-0→ordinal 0,oo-1→ordinal 1
++    const s = useCanvasStore.getState()
++    const byOrdinal = (ordinal: number) =>
++      s.nodes.find((n) => n.aiWorkflow?.batchId === 'batch-oo' && n.aiWorkflow?.ordinal === ordinal)
++    expect(r0.nodeId).toBe(byOrdinal(0)?.id)
++    expect(r1.nodeId).toBe(byOrdinal(1)?.id)
++  })
++})
+diff --git a/cindyplugin/src/__tests__/editBatchPublicRoute.test.ts b/cindyplugin/src/__tests__/editBatchPublicRoute.test.ts
+new file mode 100644
+index 00000000..c0d910b2
+--- /dev/null
++++ b/cindyplugin/src/__tests__/editBatchPublicRoute.test.ts
+@@ -0,0 +1,221 @@
++/**
++ * canvas_edit_image 公共工具路径 → 批次聚合路径的端到端调用方测试(gpt 审查 P1-①):
++ * 宿主按 ghost.json schema 传 batchId/expectedCount/sceneId → main.js
++ * runImageToolWithCard 原样透传 → agentBridge 聚合器真正进入批次分支(一次预建、
++ * ordinal 绑定、按绑定 slot 归属结果)。
++ *
++ * 与 agentBridgeSelection.test.ts 的批次用例不同:那里直发 BroadcastChannel 消息
++ * 到桥(旁路了生产调用方 main.js);这里从 brain.handles.handleToolCall 走完整
++ * 公共工具链,证明公共工具真的能进批次路由。
++ *
++ * 反证:把 main.js runImageToolWithCard 的 params 里 batchId/expectedCount/sceneId
++ * 任一字段去掉,本文件所有用例必须转红(公共工具进不了批次路由)。
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.hoisted(() => {
++  const store = new Map<string, string>()
++  const memStorage = {
++    get length() {
++      return store.size
++    },
++    clear: () => store.clear(),
++    getItem: (key: string) => store.get(key) ?? null,
++    key: (index: number) => [...store.keys()][index] ?? null,
++    removeItem: (key: string) => {
++      store.delete(key)
++    },
++    setItem: (key: string, value: string) => {
++      store.set(key, String(value))
++    },
++  }
++  const globals = globalThis as Record<string, unknown>
++  if (globals.window === undefined) globals.window = { localStorage: memStorage }
++  if (globals.localStorage === undefined) globals.localStorage = memStorage
++})
++
++vi.mock('../../../src/lib/demoImages', () => ({ createDemoImage: () => 'data:image/png;base64,mock' }))
++vi.mock('../../../src/store/remoteDebugReporter', () => ({ reportRemoteDebugEntry: () => {} }))
++vi.mock('../../../src/lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock', name: 'n', type: 'image/png' })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('../persist/bridge', () => ({ persistRequest: vi.fn() }))
++// 批次链路走真实 agentEditImage → generationFacade.generateImageEdit →
++// mivoTaskClient.submitEditTask/pollTask(与 generation.contract.test.ts 同构 mock 边界)。
++const taskMocks = vi.hoisted(() => ({
++  submitEditTask: vi.fn(),
++  submitGenerationTask: vi.fn(),
++  submitVariationsTask: vi.fn(),
++  pollTask: vi.fn(),
++  cancelTask: vi.fn(),
++  assetBlobForNode: vi.fn(),
++}))
++vi.mock('../../../src/lib/mivoTaskClient', () => ({
++  submitEditTask: taskMocks.submitEditTask,
++  submitGenerationTask: taskMocks.submitGenerationTask,
++  submitVariationsTask: taskMocks.submitVariationsTask,
++  pollTask: taskMocks.pollTask,
++  cancelTask: taskMocks.cancelTask,
++  taskPollIntervalMs: () => 0,
++  kindForFailedTask: () => 'upstream-error' as const,
++}))
++vi.mock('../../../src/lib/mivoImageClient', () => ({
++  assetBlobForNode: taskMocks.assetBlobForNode,
++  MivoImageRequestError: class MivoImageRequestError extends Error {
++    kind: string
++    constructor(message: string, kind: string) {
++      super(message)
++      this.name = 'MivoImageRequestError'
++      this.kind = kind
++    }
++  },
++}))
++vi.mock('../persist/persistSync', () => ({
++  flushPersistNow: async () => true,
++  restoreFromDiskIfEmpty: async () => 'skipped',
++  startAutoSave: () => {},
++}))
++
++import { channelConstructorFor, flushMicrotasks, loadBrain } from './brainHarness'
++import { installAgentBridge } from '../agent/agentBridge'
++import { useCanvasStore } from '../../../src/store/canvasStore'
++import {
++  beginCanvasHydration,
++  markCanvasHydrationComplete,
++  resetCanvasWriteGateForTests,
++} from '../../../src/agent/canvasWriteGate'
++
++const seedSource = () => {
++  const base = useCanvasStore.getState()
++  useCanvasStore.setState(
++    {
++      ...base,
++      canvases: {
++        scene: { title: 'scene', nodes: [{ id: 'img-a', type: 'image', title: 'A', x: 0, y: 0, width: 300, height: 200, status: 'ready', assetUrl: '/a.png' }], edges: [], tasks: [], selectedNodeId: undefined, selectedNodeIds: [] },
++      },
++      sceneId: 'scene',
++      nodes: [{ id: 'img-a', type: 'image', title: 'A', x: 0, y: 0, width: 300, height: 200, status: 'ready', assetUrl: '/a.png' }],
++      edges: [],
++      tasks: [],
++      selectedNodeId: undefined,
++      selectedNodeIds: [],
++    } as never,
++    true,
++  )
++}
++
++beforeEach(() => {
++  resetCanvasWriteGateForTests()
++  taskMocks.submitEditTask.mockReset().mockResolvedValue('t1')
++  taskMocks.submitGenerationTask.mockReset().mockResolvedValue('t1')
++  taskMocks.submitVariationsTask.mockReset().mockResolvedValue({ taskId: 't1', batchId: 'b1', count: 4 })
++  taskMocks.pollTask.mockReset().mockResolvedValue({
++    id: 't1',
++    kind: 'edit',
++    status: 'done',
++    progress: 100,
++    stage: 'done',
++    requestId: 'req-1',
++    model: 'gpt-image-2',
++    result: { images: [{ blob: new Blob(['mock-bytes'], { type: 'image/png' }), title: 'G', width: 300, height: 200 }] },
++  })
++  taskMocks.cancelTask.mockReset().mockResolvedValue(undefined)
++  taskMocks.assetBlobForNode.mockReset().mockResolvedValue(new Blob(['mock-src'], { type: 'image/png' }))
++})
++
++type HostOut = { type?: string; ok?: boolean; code?: string; message?: string; result?: Record<string, unknown> }
++
++/**
++ * 跑两次公共 canvas_edit_image 工具调用(同 batchId),让 main.js 经 askPanel 把
++ * 参数投给真实 agent 桥的批次聚合器。返回:宿主出口消息(含 tool-result)、桥收到的
++ * edit 请求参数(全链透传证据)。
++ */
++const runPublicBatch = async (argsList: Array<Record<string, unknown>>, callIds: string[]) => {
++  const sent: HostOut[] = []
++  const brain = loadBrain({
++    panelPresent: () => true,
++    send: (payload) => {
++      sent.push(payload as HostOut)
++      return { ok: true }
++    },
++  })
++  await flushMicrotasks()
++  // 把真实 agent 桥挂到与 main.js 同一个 bus:公共工具经 askPanel 的请求真正到达
++  // 桥的批次聚合器(不是直发 BroadcastChannel 的旁路)。
++  const globals = globalThis as Record<string, unknown>
++  const previous = globals.BroadcastChannel
++  globals.BroadcastChannel = channelConstructorFor(brain.bus)
++  installAgentBridge()
++  globals.BroadcastChannel = previous
++  // 捕获桥收到的 edit 请求,验证 main.js 全链透传
++  const editRequests: Array<{ reqId: string; params: Record<string, unknown> }> = []
++  const probe = brain.bus.open('mivo-canvas-agent')
++  probe.onmessage = (event) => {
++    const data = event.data as
++      | { reqId?: string; verb?: string; reply?: boolean; params?: Record<string, unknown> }
++      | undefined
++    if (data && !data.reply && data.verb === 'edit' && typeof data.reqId === 'string') {
++      editRequests.push({ reqId: data.reqId, params: data.params ?? {} })
++    }
++  }
++  seedSource()
++  beginCanvasHydration()
++  markCanvasHydrationComplete()
++  const pendings = argsList.map((args, i) =>
++    brain.handles.handleToolCall({ tool: 'canvas_edit_image', callId: callIds[i], args }),
++  )
++  await Promise.all(pendings)
++  return { sent, editRequests }
++}
++
++describe('canvas_edit_image 公共工具全链透传进入批次聚合路径', () => {
++  it('两个带 batchId 的公共调用 → 聚合路径:一次预建、两个批次结果、各自回复自己的节点', async () => {
++    const { sent, editRequests } = await runPublicBatch(
++      [
++        { nodeId: 'img-a', prompt: 'pub-0', batchId: 'batch-pub', expectedCount: 2, sceneId: 'scene' },
++        { nodeId: 'img-a', prompt: 'pub-1', batchId: 'batch-pub', expectedCount: 2, sceneId: 'scene' },
++      ],
++      ['e2e-1', 'e2e-2'],
++    )
++    // 两个 tool-result 都成功
++    const results = sent.filter((m) => m.type === 'tool-result')
++    expect(results).toHaveLength(2)
++    results.forEach((r) => expect(r.ok).toBe(true))
++    const nodeIds = results.map((r) => (r.result as { nodeId?: string } | undefined)?.nodeId)
++    expect(nodeIds[0]).toBeTruthy()
++    expect(nodeIds[1]).toBeTruthy()
++    // main.js 全链透传:桥收到的 edit 请求带 batchId/expectedCount/sceneId
++    expect(editRequests).toHaveLength(2)
++    editRequests.forEach((r) => {
++      expect(r.params.batchId).toBe('batch-pub')
++      expect(r.params.expectedCount).toBe(2)
++      expect(r.params.sceneId).toBe('scene')
++    })
++    // 走的是聚合路径:两个结果节点都带批次身份,且各自回复各自的节点(ordinal 0/1)
++    const s = useCanvasStore.getState()
++    const batchResults = s.nodes.filter((n) => n.type === 'image' && n.aiWorkflow?.batchId === 'batch-pub')
++    expect(batchResults).toHaveLength(2)
++    expect(batchResults.map((r) => r.aiWorkflow?.ordinal).sort()).toEqual([0, 1])
++    const byOrdinal = (o: number) => batchResults.find((n) => n.aiWorkflow?.ordinal === o)
++    expect(nodeIds).toEqual([byOrdinal(0)?.id, byOrdinal(1)?.id])
++  })
++
++  it('公共调用不带批次字段 → 走单次路径:结果无批次身份(证明批次字段是进入批次路由的唯一开关)', async () => {
++    const { sent } = await runPublicBatch(
++      [
++        { nodeId: 'img-a', prompt: 'single-0' },
++        { nodeId: 'img-a', prompt: 'single-1' },
++      ],
++      ['e2e-3', 'e2e-4'],
++    )
++    const results = sent.filter((m) => m.type === 'tool-result')
++    expect(results).toHaveLength(2)
++    results.forEach((r) => expect(r.ok).toBe(true))
++    // 单次路径:新节点不带 batchId(各自独立生成,不是批次 slot)
++    const s = useCanvasStore.getState()
++    const withBatchId = s.nodes.filter((n) => n.aiWorkflow?.batchId !== undefined)
++    expect(withBatchId).toHaveLength(0)
++  })
++})
+diff --git a/cindyplugin/src/agent/agentBridge.ts b/cindyplugin/src/agent/agentBridge.ts
+index 1ba3b65b..848b28dc 100644
+--- a/cindyplugin/src/agent/agentBridge.ts
++++ b/cindyplugin/src/agent/agentBridge.ts
+@@ -15,6 +15,7 @@ import {
+   agentUpdateNode,
+   agentReadSnapshotPage,
+ } from '../../../src/agent/canvasAgentVerbs'
++import type { AgentGenerateResult } from '../../../src/agent/canvasAgentVerbs'
+ import { CanvasExportError } from '../../../src/lib/canvasExport'
+ import {
+   canvasWriteBlockReason,
+@@ -37,6 +38,214 @@ import type { AiCanvasContextNode } from '../../../src/types/mivoCanvas'
+ const CHANNEL_NAME = 'mivo-canvas-agent'
+ const SOURCE = 'Cindy Plugin Agent Bridge'
+ 
++// ─── #297 编辑占位批次协调器(SC1)─────────────────────────────────────────────
++// 同一明确 batchId 的 2/3/4 个 edit 请求在调用共享 store action 前聚合 expectedCount
++// 与 ordinal;聚合完成(到员)后先 startDerivedImageBatch 预建全部 slot,再按聚合
++// 顺序把 ordinal 精确绑定给每个请求(经 generateImageEdit 的 replaceSlotId 原位替换)。
++//
++// 批次身份 = 显式凭证四元组(batchId+expectedCount+sceneId+sourceNodeId):首成员
++// 到达时整体冻结,后续任一成员与冻结身份不一致 → fail-closed 拒绝(INVALID_PARAMS),
++// 发生在任何画布 mutation/预建之前;绝不从位置、标题或 reqId 相等推断。
++//
++// 生命周期 pending → flushing → settled:批次注册从建组一直保留到终态 settle,
++// 期间同 batchId 的迟到/重放请求一律确定性拒绝(BATCH_CLOSED),不会产生重复的
++// batchId/ordinal slot 或任务提交。settled 记录带有限保留窗口(TTL + 容量上限,
++// 有界清理);窗口过后同一 batchId 可开启全新批次 —— 清理后重放语义:旧身份已
++// 遗忘,新批次 = 新身份,不会撞旧批次已各自终态的 slot。
++//
++// 缺员/超时 fail-closed:**预建前拒绝**整批(BATCH_TIMEOUT,消息带期望/实际计数),
++// 不预建任何占位 —— 结构性保证零 queued/generating 残留(不再出现「预建了
++// expectedCount 个 slot 却只为到场成员派活,缺员 ordinal 永远卡在 generating」)。
++type PendingBatchEdit = {
++  params: Record<string, unknown>
++  agentRequestTag: string
++  resolve: (outcome: AgentGenerateResult) => void
++  reject: (error: unknown) => void
++}
++type FrozenBatchIdentity = {
++  batchId: string
++  expectedCount: number
++  sceneId: string
++  sourceNodeId: string
++}
++type BatchLifecycle =
++  | { phase: 'pending'; identity: FrozenBatchIdentity; edits: PendingBatchEdit[]; timer?: ReturnType<typeof setTimeout> }
++  | { phase: 'flushing' }
++  | { phase: 'settled'; settledAt: number; outcome: 'completed' | 'rejected' }
++const batchLifecycles = new Map<string, BatchLifecycle>()
++const BATCH_AGGREGATE_TIMEOUT_MS = 8000
++// settled 身份保留窗口:覆盖「聚合 flush 后数秒内到达的迟到/重放成员」;窗口过后
++// 条目被裁剪,同 batchId 可开启全新批次(清理后重放语义见头注释)。
++const BATCH_SETTLED_RETENTION_MS = 5 * 60_000
++// 容量上限(有界清理):即使 TTL 内条目堆积(理论不可能,防御性),注册表也不无界增长。
++const BATCH_LIFECYCLE_MAX = 64
++
++/** 有界清理:过期 settled 条目按 TTL 裁剪;超容量时按 settledAt 从旧到新删 settled。 */
++const pruneSettledBatchLifecycles = (): void => {
++  const now = Date.now()
++  for (const [batchId, lifecycle] of batchLifecycles) {
++    if (lifecycle.phase === 'settled' && now - lifecycle.settledAt > BATCH_SETTLED_RETENTION_MS) {
++      batchLifecycles.delete(batchId)
++    }
++  }
++  if (batchLifecycles.size > BATCH_LIFECYCLE_MAX) {
++    const settled = [...batchLifecycles.entries()]
++      .filter((entry): entry is [string, Extract<BatchLifecycle, { phase: 'settled' }>] => entry[1].phase === 'settled')
++      .sort((a, b) => a[1].settledAt - b[1].settledAt)
++    for (const [batchId] of settled) {
++      if (batchLifecycles.size <= BATCH_LIFECYCLE_MAX) break
++      batchLifecycles.delete(batchId)
++    }
++  }
++}
++
++const rejectBatchGroup = (group: { edits: PendingBatchEdit[] }, code: string, message: string): void => {
++  group.edits.forEach((edit) => edit.reject(new AgentVerbError(code, message)))
++}
++
++const flushBatchGroup = async (group: Extract<BatchLifecycle, { phase: 'pending' }>): Promise<void> => {
++  // pending → flushing:批次注册保留(不再在 flush 时删条目),迟到的同 batchId
++  // 请求在 flushing/settled 期间被确定性拒绝(BATCH_CLOSED)。
++  batchLifecycles.set(group.identity.batchId, { phase: 'flushing' })
++  if (group.timer !== undefined) clearTimeout(group.timer)
++  const { identity, edits } = group
++  const present = edits.length
++  if (present < identity.expectedCount) {
++    // 缺员超时:**预建前拒绝**整批。不预建任何占位 → 结构性零 queued/generating
++    // 残留;timeout 信号明确(BATCH_TIMEOUT + 期望/实际计数),模型改用新 batchId 重试。
++    debugLogger.warn(
++      'Derived Batch',
++      `批次 ${identity.batchId} 缺员超时(期望 ${identity.expectedCount},实际聚合 ${present}),预建前拒绝整批,未创建任何占位`,
++    )
++    rejectBatchGroup(
++      group,
++      'BATCH_TIMEOUT',
++      `批次 ${identity.batchId} 聚合超时:期望 ${identity.expectedCount} 个 edit,实际聚合 ${present} 个,未执行任何修改;请用新 batchId 重试`,
++    )
++    batchLifecycles.set(identity.batchId, { phase: 'settled', settledAt: Date.now(), outcome: 'rejected' })
++    pruneSettledBatchLifecycles()
++    return
++  }
++  try {
++    const store = useCanvasStore.getState()
++    // 用冻结的 sceneId/sourceNodeId 预建(不重读 store.sceneId —— 聚合窗口内用户
++    // 切板不能把批次挪到另一块板上);源图存在性由共享层 startDerivedImageBatch 校验。
++    store.startDerivedImageBatch({
++      sceneId: identity.sceneId,
++      sourceNodeId: identity.sourceNodeId,
++      batchId: identity.batchId,
++      expectedCount: identity.expectedCount,
++    })
++    await Promise.all(
++      edits.map(async (edit, ordinal) => {
++        try {
++          const outcome = await agentEditImage({
++            ...edit.params,
++            sceneId: identity.sceneId,
++            derivedBatchId: identity.batchId,
++            expectedCount: identity.expectedCount,
++            ordinal,
++            agentRequestTag: edit.agentRequestTag,
++          })
++          edit.resolve(outcome)
++        } catch (error) {
++          edit.reject(error)
++        }
++      }),
++    )
++    batchLifecycles.set(identity.batchId, { phase: 'settled', settledAt: Date.now(), outcome: 'completed' })
++  } catch (error) {
++    // 预建失败(源图已删/画布已删等):整批拒绝,已收集请求各自拿到明确错误。
++    debugLogger.error(
++      'Derived Batch',
++      `批次 ${identity.batchId} 预建失败:${error instanceof Error ? error.message : String(error)}`,
++    )
++    rejectBatchGroup(
++      group,
++      'BATCH_PREBUILD_FAILED',
++      `批次 ${identity.batchId} 预建失败,未执行任何修改:${error instanceof Error ? error.message : String(error)}`,
++    )
++    batchLifecycles.set(identity.batchId, { phase: 'settled', settledAt: Date.now(), outcome: 'rejected' })
++  } finally {
++    pruneSettledBatchLifecycles()
++  }
++}
++
++const aggregateBatchEdit = (
++  params: Record<string, unknown>,
++  agentRequestTag: string,
++): Promise<AgentGenerateResult> =>
++  new Promise<AgentGenerateResult>((resolve, reject) => {
++    pruneSettledBatchLifecycles()
++    const batchId = typeof params.batchId === 'string' && params.batchId ? params.batchId : ''
++    const expectedCount = Number.isInteger(params.expectedCount) ? (params.expectedCount as number) : 0
++    if (!batchId || expectedCount < 2 || expectedCount > 4) {
++      reject(new AgentVerbError('INVALID_PARAMS', '批次 edit 必须携带非空 batchId 与 2-4 的 expectedCount'))
++      return
++    }
++    const sourceNodeId = typeof params.nodeId === 'string' && params.nodeId ? params.nodeId : ''
++    if (!sourceNodeId) {
++      reject(new AgentVerbError('INVALID_PARAMS', '批次 edit 必须携带非空 nodeId(源图)'))
++      return
++    }
++    const sceneId =
++      typeof params.sceneId === 'string' && params.sceneId ? params.sceneId : useCanvasStore.getState().sceneId
++    const existing = batchLifecycles.get(batchId)
++    if (!existing) {
++      // 首成员:整体冻结批次身份四元组(batchId+expectedCount+sceneId+sourceNodeId)。
++      const group: BatchLifecycle = {
++        phase: 'pending',
++        identity: { batchId, expectedCount, sceneId, sourceNodeId },
++        edits: [],
++      }
++      batchLifecycles.set(batchId, group)
++      const pending = group as Extract<BatchLifecycle, { phase: 'pending' }>
++      pending.edits.push({ params, agentRequestTag, resolve, reject })
++      pending.timer = setTimeout(() => {
++        void flushBatchGroup(pending)
++      }, BATCH_AGGREGATE_TIMEOUT_MS)
++      return
++    }
++    if (existing.phase !== 'pending') {
++      // flushing / settled:批次已开始执行或已结束,迟到/重放成员确定性拒绝。
++      debugLogger.warn(
++        'Derived Batch',
++        `批次 ${batchId} 已${existing.phase === 'flushing' ? '开始执行' : 'settle'},拒绝迟到/重放成员`,
++      )
++      reject(
++        new AgentVerbError('BATCH_CLOSED', `批次 ${batchId} 已开始执行或已结束,不接受迟到/重放成员(重试请用新 batchId)`),
++      )
++      return
++    }
++    // 批次身份冻结:后续成员必须与首成员冻结的四元组完全一致,任一不符 fail-closed
++    // 拒绝(在任何画布 mutation/预建之前),组本身不受影响、继续聚合。
++    const identity = existing.identity
++    const mismatches: string[] = []
++    if (identity.expectedCount !== expectedCount) {
++      mismatches.push(`expectedCount=${expectedCount}(期望 ${identity.expectedCount})`)
++    }
++    if (identity.sceneId !== sceneId) mismatches.push(`sceneId=${sceneId}(期望 ${identity.sceneId})`)
++    if (identity.sourceNodeId !== sourceNodeId) mismatches.push(`nodeId=${sourceNodeId}(期望 ${identity.sourceNodeId})`)
++    if (mismatches.length) {
++      debugLogger.warn('Derived Batch', `批次 ${batchId} 成员身份不一致,拒绝该成员:${mismatches.join(';')}`)
++      reject(
++        new AgentVerbError(
++          'INVALID_PARAMS',
++          `批次 ${batchId} 成员与批次身份不一致(${mismatches.join(';')}),所有成员必须指向同一源图与同一画布`,
++        ),
++      )
++      return
++    }
++    existing.edits.push({ params, agentRequestTag, resolve, reject })
++    if (existing.edits.length >= existing.identity.expectedCount) {
++      void flushBatchGroup(existing)
++    } else if (existing.timer === undefined) {
++      existing.timer = setTimeout(() => {
++        void flushBatchGroup(existing)
++      }, BATCH_AGGREGATE_TIMEOUT_MS)
++    }
++  })
++
+ /**
+  * 写类动词(#297 P3-13 §6.6-2 硬闸)。本模块在 `plugin-main.tsx` 的模块顶层就挂上,
+  * 而 hydration 要到 `usePluginHydration` 的 effect 才跑完 —— 这段窗口里到达的写会落进
+@@ -502,19 +711,36 @@ export function installAgentBridge(): void {
+             aspectRatio: null,
+           })
+           try {
+-            // 源图的寄存指纹在派活前取:改图是分钟级任务,事后源节点可能已被删,
+-            // 那时再查账本就对不上「当时用的是哪张图」。
+-            const sourceOwned = await ownedHashForNode(
+-              typeof params.nodeId === 'string' ? params.nodeId : undefined,
+-            )
+-            const outcome = await agentEditImage({ ...params, agentRequestTag })
+-            const resultOwned = await ownedHashForNode(outcome.status === 'ready' ? outcome.nodeId : undefined)
+-            result = {
+-              ok: true,
+-              ...outcome,
+-              sourceOwnedHash: sourceOwned?.hash,
+-              resultOwnedHash: resultOwned?.hash,
+-              resultOwnedExt: resultOwned?.ext,
++            const batchId = typeof params.batchId === 'string' && params.batchId ? params.batchId : undefined
++            if (batchId) {
++              // #297 批次路径:先经协调器聚合(到员/超时 flush),再统一预建 +
++              // ordinal 绑定,最后逐请求走共享层 agentEditImage。源图归属由共享层
++              // startDerivedImageBatch 校验,不在协调器重复查账本。
++              const outcome = await aggregateBatchEdit(params, agentRequestTag)
++              const resultOwned = await ownedHashForNode(
++                outcome.status === 'ready' ? outcome.nodeId : undefined,
++              )
++              result = {
++                ok: true,
++                ...outcome,
++                resultOwnedHash: resultOwned?.hash,
++                resultOwnedExt: resultOwned?.ext,
++              }
++            } else {
++              // 单次路径:源图的寄存指纹在派活前取——改图是分钟级任务,事后源节点
++              // 可能已被删,那时再查账本就对不上「当时用的是哪张图」。
++              const sourceOwned = await ownedHashForNode(
++                typeof params.nodeId === 'string' ? params.nodeId : undefined,
++              )
++              const outcome = await agentEditImage({ ...params, agentRequestTag })
++              const resultOwned = await ownedHashForNode(outcome.status === 'ready' ? outcome.nodeId : undefined)
++              result = {
++                ok: true,
++                ...outcome,
++                sourceOwnedHash: sourceOwned?.hash,
++                resultOwnedHash: resultOwned?.hash,
++                resultOwnedExt: resultOwned?.ext,
++              }
+             }
+           } finally {
+             releaseAgentGenerationContext(agentRequestTag)
+diff --git a/src/agent/canvasAgentVerbs.ts b/src/agent/canvasAgentVerbs.ts
+index 09f14090..6bfdcc00 100644
+--- a/src/agent/canvasAgentVerbs.ts
++++ b/src/agent/canvasAgentVerbs.ts
+@@ -263,6 +263,14 @@ export const agentEditImage = async (params: {
+   sceneId?: unknown
+   /** A5:不透明请求关联令牌,原样下行到传输端口;共享层不解析。 */
+   agentRequestTag?: unknown
++  /**
++   * #297 编辑占位批次(runtime-only,不进序列化):batchId+expectedCount+ordinal
++   * 三元组。由 agentBridge 批次协调器按聚合顺序注入;共享层 generateImageEdit
++   * 对部分缺失 fail-closed,这里只做原样透传。
++   */
++  derivedBatchId?: unknown
++  expectedCount?: unknown
++  ordinal?: unknown
+ }): Promise<AgentGenerateResult> => {
+   requireScene(readOwnProp(params, 'sceneId'))
+   const nodeId = requireText(readOwnProp(params, 'nodeId'), 'nodeId', 128)
+@@ -276,10 +284,22 @@ export const agentEditImage = async (params: {
+     throw new AgentVerbErrorImpl('NOT_IMAGE', '该节点不是图片节点,只能修改图片')
+   }
+   const sceneId = store.sceneId
++  const derivedBatchId =
++    params.derivedBatchId !== undefined && params.derivedBatchId !== null ? String(params.derivedBatchId) : undefined
+   try {
+-    // 结果归属:结果节点按 generateImageEdit 返回值定位(批次模式=被替换 slot,单次=新建节点)。
++    // 结果归属:直接用 generateImageEdit 的返回值(commit 产出的节点 id)—— 批次模式
++    // 下每个 ordinal 原位替换自己的 slot(节点 id 保持为 slot id),单次模式为本次
++    // 提交创建的新节点。绝不再用「全局第一个新 image」:并发批次成员会互相抢报
++    // 先完成的那一个 ordinal,污染回复 nodeId 与动作记录归属。
+     const nodeIds = await generationFacade.generateImageEdit(nodeId, 'prompt-edit', prompt, {
+-      agentRequestTag: optionalTag(readOwnProp(params, 'agentRequestTag'))
++      agentRequestTag: optionalTag(readOwnProp(params, 'agentRequestTag')),
++      ...(derivedBatchId !== undefined
++        ? {
++            derivedBatchId,
++            expectedCount: Number(params.expectedCount),
++            ordinal: Number(params.ordinal),
++          }
++        : {}),
+     })
+     const resultNode = useCanvasStore
+       .getState()
+diff --git a/src/store/derivedBatchCoordinator.ts b/src/store/derivedBatchCoordinator.ts
+index fda70998..81141fbc 100644
+--- a/src/store/derivedBatchCoordinator.ts
++++ b/src/store/derivedBatchCoordinator.ts
+@@ -1,5 +1,8 @@
+ // #297 编辑占位批次协调器(从 generationSlice 拆出的纯重构,行为零变化)。
+-// 批次身份 = 显式凭证 batchId+expectedCount+ordinal;ordinal 按 batchId+ordinal 从文档查找,不推断。
++//
++// 批次身份 = 显式凭证 batchId+expectedCount+ordinal(随 slot 持久化)。ordinal 精确
++// 绑定预建 slot 的方式:按 batchId+ordinal 从文档查找,绝不从位置/标题/reqId 推断,
++// 也不引入新的全局可变单例。
+ import type { StoreApi } from 'zustand'
+ import { LocalizedKeyError } from '../lib/localizedKeyError'
+ import type { AiWorkflowStatus, CanvasId, MivoCanvasNode } from '../types/mivoCanvas'
+@@ -25,8 +28,9 @@ export const findBatchSlot = (doc: { nodes: MivoCanvasNode[] }, batchId: string,
+       node.aiWorkflow?.ordinal === ordinal,
+   )
+ 
+-/** 把批次 slot 收敛为终态(failed/canceled):原位保留、清进度字段;
+- *  sourceDeleted 时同批仍 generating 的 slot 一并转 failed(SC13)。 */
++/** 把批次 slot 收敛为终态(failed/canceled):原位保留(不删除、不压缩列),
++ *  清 progress/stage/startedAt。sourceDeleted 时同批其它仍 generating 的 slot
++ *  一并转 failed(SC13:批次 slot 不再被整体删除,已完成结果保留)。 */
+ export const settleBatchSlotState = (
+   current: CanvasState,
+   targetSceneId: CanvasId,
+@@ -168,7 +172,8 @@ export const startDerivedImageBatchImpl = (
+         sourceNodeIds: [source.id],
+         placement: 'right',
+         createdAt,
+-        // SC9:批次身份凭证持久化到 slot(batchId 来自创建凭证,不从位置/标题/reqId 推断)。
++        // SC9:批次身份凭证持久化到 slot —— batchId 来自发起批次的创建凭证,
++        // 绝不从位置、标题或 reqId 相等推断。
+         batchId: params.batchId,
+         expectedCount: params.expectedCount,
+         ordinal,
+@@ -176,12 +181,13 @@ export const startDerivedImageBatchImpl = (
+     })
+   })
+ 
+-  // SC5:预建前活跃场景只 captureHistory 一次(占位/状态/替换不追加 history)。
++  // SC5:活跃场景在创建前只 captureHistory 一次;占位创建、状态更新、结果原位
++  // 替换均不追加 history(undo 恢复生成前快照,redo 恢复调用 undo 时的混合状态)。
+   if (targetSceneId === state.sceneId) {
+     get().captureHistory()
+   }
+-  // SC8:预建全部 slot + 初始 generating 作为一次 scene-scoped mutation 提交,后续
+-  // ordinal 的状态/替换/收敛沿同一 canvas 队列串行提交。
++  // SC8:预建全部 slot + 初始 generating 状态作为一次 scene-scoped mutation 提交,
++  // 后续每个 ordinal 的状态/替换/失败收敛沿同一 canvas 队列串行提交。
+   getSceneWrap()(targetSceneId, () => set((current) => {
+     const targetDocument = current.canvases[targetSceneId]
+     if (!targetDocument) return {}

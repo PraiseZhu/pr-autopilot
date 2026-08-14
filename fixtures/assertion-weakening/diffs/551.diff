@@ -1,0 +1,471 @@
+diff --git a/settings.html b/settings.html
+index 5df62adb..a564f869 100644
+--- a/settings.html
++++ b/settings.html
+@@ -136,7 +136,11 @@
+       <span id="badge" class="state-badge is-pending" role="status" aria-live="polite">
+         <span id="badge-spinner" class="badge-spinner" aria-hidden="true"></span>
+         <span id="badge-icon" aria-hidden="true"></span>
+-        <span id="badge-text">读取中</span>
++        <!-- 初始文案故意 ≠ JS loading 态的「读取中」(SC-2;「读取中」定义在 settingsCard.ts
++             的 EMPTY.badgeText,由下方 script 触发渲染):停在这句说明脚本还没跑起来
++             (模块加载/CSP 问题);变成「读取中」才说明脚本已接管,此时若再卡住,病因收窄到
++             /secrets 请求本身(有界超时兜底,见 settingsCard.ts)。 -->
++        <span id="badge-text">初始化…</span>
+       </span>
+     </div>
+     <div class="action-row">
+diff --git a/src/__tests__/mivoSettingsCard.test.ts b/src/__tests__/mivoSettingsCard.test.ts
+index 64c40ae3..34436bfe 100644
+--- a/src/__tests__/mivoSettingsCard.test.ts
++++ b/src/__tests__/mivoSettingsCard.test.ts
+@@ -6,10 +6,10 @@
+  * **真实 settings.html 源文本**上 —— 见文件末尾那组测试的注释,那里说明了为什么不是
+  * computed-style。
+  */
+-import { describe, expect, it } from 'vitest'
++import { describe, expect, it, vi } from 'vitest'
+ import { readFileSync } from 'node:fs'
+ import { fileURLToPath } from 'node:url'
+-import { createSettingsCard, SECRET_KEY } from '../settings/settingsCard'
++import { createSettingsCard, READ_SECRETS_TIMEOUT_MS, SECRET_KEY } from '../settings/settingsCard'
+ import type { CardView } from '../settings/settingsCard'
+ import type { MivoKeyValidateOutcome } from '../settings/mivoKeyValidateSender'
+ 
+@@ -23,6 +23,8 @@ const makeCard = (options: {
+   putStatus?: number | (() => Promise<number>)
+   deleteStatus?: number | (() => Promise<number>)
+   outcome?: MivoKeyValidateOutcome | (() => Promise<MivoKeyValidateOutcome>)
++  /** SC-1:测试注入极小超时,不用 vi.useFakeTimers()(见 depositPort.test.ts 头部说明)。 */
++  readTimeoutMs?: number
+ }) => {
+   const calls: Calls = { put: [], del: 0, validate: 0, cancel: 0, reads: 0 }
+   const views: CardView[] = []
+@@ -52,6 +54,7 @@ const makeCard = (options: {
+       },
+     },
+     render: (view) => views.push({ ...view }),
++    readTimeoutMs: options.readTimeoutMs,
+   })
+   return { card, calls, views }
+ }
+@@ -119,6 +122,147 @@ describe('SC-C1 迁移表:开页路径', () => {
+   })
+ })
+ 
++// ── SC-1:读取阶段有界超时(不再无限停在 loading) ───────────────────────────────
++//
++// 设置卡卡在「读取中」的根因:`start()` 对 `deps.readSecrets()` 没有超时,`/secrets`
++// 挂死时卡片会永久停留 loading(showInput/showPrimary 都是 false,用户连输入框都摸不到)。
++// 修法是给读取套一个有界超时,到期必须落 failed 并给出可辨认的错误文案。
++//
++// 计时方式:注入极小的 `readTimeoutMs`,用真实计时器(不是 vi.useFakeTimers())——本仓
++// `depositPort.test.ts` 头部记录过实测教训:假时钟会污染同一 vitest worker 内其他测试
++// 文件的计时器状态,单独跑这个文件绿、跑全仓会拖垮同目录另外的文件。真实的几十毫秒
++// 超时不存在这个风险,也不需要等 8 秒。
++describe('SC-1 读取阶段有界超时', () => {
++  it('/secrets 永不 resolve → 到期后落 failed,给出超时专属文案(不是无限 loading)', async () => {
++    const { card, calls } = makeCard({
++      secrets: () => new Promise<unknown>(() => {}), // 永不 resolve/reject:模拟请求挂死
++      readTimeoutMs: 20,
++    })
++    await card.start()
++    expect(card.view.state).toBe('failed')
++    // 钉「读取超时」专属文案,不只钉子串「超时」——否则改成既有的「校验超时」文案也能
++    // 蒙混过关(反向变异实测:换成 FAILURE_TEXT.timeout 后本断言若只查「超时」仍会绿,
++    // 但那句文案说的是"期间出图会回落 Cindy 代办",对读取失败是错误建议)。
++    expect(card.view.errorText).toContain('读取配置状态超时')
++    expect(calls.validate).toBe(0) // 没读到配置,不该去校验
++  })
++
++  it('/secrets 抛出非超时错误 → 仍是既有的"读取失败"文案,不被误判成超时', async () => {
++    const { card } = makeCard({
++      secrets: async () => {
++        throw new Error('boom')
++      },
++      readTimeoutMs: 20,
++    })
++    await card.start()
++    expect(card.view.state).toBe('failed')
++    expect(card.view.errorText).toContain('读取配置状态失败')
++    expect(card.view.errorText).not.toContain('超时')
++  })
++
++  it('不传 readTimeoutMs 时,调度超时用的是生产默认值 READ_SECRETS_TIMEOUT_MS,不是只在注入路径才有界', () => {
++    // 三席对抗审查发现的真实缺口:此前 SC-1 两条用例都注入了 readTimeoutMs,
++    // `?? READ_SECRETS_TIMEOUT_MS` 这条生产默认分支从未被任何断言经过——变异成
++    // `?? Infinity` 后 45/45 照样全绿。这里直接断言调度参数,不需要真的等 8 秒。
++    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout')
++    const { card } = makeCard({ secrets: () => new Promise<unknown>(() => {}) }) // 永不 resolve;只看调度参数
++    void card.start()
++    expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), READ_SECRETS_TIMEOUT_MS)
++    // 清掉刚调度的真实 8s 定时器,不让它拖慢/污染后续测试——本用例只验证调度参数,
++    // 不需要真的等它触发。
++    const handle = setTimeoutSpy.mock.results[0]?.value
++    if (handle !== undefined) clearTimeout(handle as ReturnType<typeof setTimeout>)
++    setTimeoutSpy.mockRestore()
++  })
++
++  it('非法 readTimeoutMs(0/负数/NaN/Infinity)一律回落生产默认值,不直接喂给 setTimeout', () => {
++    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
++      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout')
++      const { card } = makeCard({ secrets: () => new Promise<unknown>(() => {}), readTimeoutMs: bad })
++      void card.start()
++      expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), READ_SECRETS_TIMEOUT_MS)
++      const handle = setTimeoutSpy.mock.results[0]?.value
++      if (handle !== undefined) clearTimeout(handle as ReturnType<typeof setTimeout>)
++      setTimeoutSpy.mockRestore()
++    }
++  })
++})
++
++// ── SC-1(延伸):校验通过后的第二次 /secrets 读取(取尾号)同样有界 ───────────────
++//
++// 三席对抗审查独立发现的同一个真实缺口(claude-adversarial CA-R1-F1 + codex-adversarial
++// F-READ-TAIL-BOUND):`withTimeout` 此前只包住 start() 的首次读取,但校验通过后
++// `runValidate()` 还会调 `tailOf()` 再读一次 /secrets 取尾号——那一处是裸调用,没有超时。
++// 与本 PR 要修的根因是同一个洞,只是换了个触发点:第二次读取挂死时卡片会永久停在
++// validating(校验中),而不是 loading(读取中)。
++describe('SC-1(延伸)校验通过后取尾号的第二次读取有界', () => {
++  it('首读成功且校验通过,但取尾号的第二次读取永不 resolve → 仍能 settle 成 connected(丢尾号不丢结论)', async () => {
++    let reads = 0
++    const { card } = makeCard({
++      secrets: async () => {
++        reads += 1
++        if (reads === 1) return savedRow(TAIL)
++        return new Promise<unknown>(() => {}) // 第二次读取(tailOf)永不 resolve
++      },
++      outcome: 'valid',
++      readTimeoutMs: 20,
++    })
++    await card.start()
++    expect(card.view.state).toBe('connected') // 不会永久停在 validating
++    expect(card.view.statusText).not.toContain('尾号') // 取不到尾号就降级,不影响"已连接"结论
++  })
++})
++
++// ── SC-4:读取失败后的重试语义(不再误报"请先粘贴 Key") ─────────────────────────
++//
++// 此前 settings.js 的主按钮恒调 `card.save(value)`,读取失败态下点「重试」但没打字,
++// 会落进 save() 的空值分支报「请先粘贴 Key」——把"读不出配置"误导成"你没填 key",
++// 而且没有真正的"重新读取"动作。修法让 save('') 在"当前 failed 是读取失败造成的"
++// 这一种情况下改为重新走 start();其余 failed 场景(校验失败/保存失败)语义不变(SC-3)。
++describe('SC-4 读取失败后的重试语义', () => {
++  it('读取失败 → save("") 重新走 start(),不误报"请先粘贴 Key";第二次读取成功则进入正确状态', async () => {
++    let reads = 0
++    const { card } = makeCard({
++      secrets: async () => {
++        reads += 1
++        if (reads === 1) throw new Error('boom')
++        return [] // 第二次读取成功:未配置(空列表)
++      },
++    })
++    await card.start()
++    expect(card.view.state).toBe('failed')
++    expect(card.view.errorText).toContain('读取配置状态失败')
++
++    await card.save('') // 模拟点「重试」但输入框是空的
++    expect(reads).toBe(2) // 必须真的重新读取,不是原地报错
++    expect(card.view.state).toBe('unconfigured')
++    expect(card.view.errorText).not.toContain('请先粘贴 Key')
++  })
++
++  it('SC-3:校验失败(非读取失败)后 save("") → 仍是"请先粘贴 Key",不误伤既有语义', async () => {
++    const { card, calls } = makeCard({ secrets: async () => savedRow(), outcome: 'auth-invalid' })
++    await card.start()
++    expect(card.view.state).toBe('failed')
++    const readsBefore = calls.reads
++
++    await card.save('')
++    expect(card.view.errorText).toContain('请先粘贴 Key')
++    expect(calls.reads).toBe(readsBefore) // 没有触发多余的重新读取
++  })
++
++  it('SC-3:保存失败(PUT 非 204)后 save("") → 仍是"请先粘贴 Key",同样不误伤', async () => {
++    const { card, calls } = makeCard({ secrets: async () => [], putStatus: 500 })
++    await card.start()
++    await card.save('mivo_abc')
++    expect(card.view.state).toBe('failed')
++    const readsBefore = calls.reads
++
++    await card.save('')
++    expect(card.view.errorText).toContain('请先粘贴 Key')
++    expect(calls.reads).toBe(readsBefore)
++  })
++})
++
+ // ── SC-C5:保存/删除失败矩阵 ───────────────────────────────────────────────────
+ describe('SC-C5 保存矩阵:只有 204 才推进到校验', () => {
+   it('空值 → 零 PUT 零校验,只提示', async () => {
+@@ -249,6 +393,22 @@ describe('SC-C5/C7 断开矩阵:二次确认 + 只有 204 才退回未配置', (
+ // 真机双主题四态截图(SC-C8)仍需 owner 过目,不作机器门 —— PR 描述里如实标 not_run。
+ const HTML = readFileSync(fileURLToPath(new URL('../../settings.html', import.meta.url)), 'utf8')
+ 
++// ── SC-2:静态初始文案 ≠ JS loading 态文案(源文本判据) ─────────────────────────
++//
++// 卡在「读取中」时,原来的静态 HTML 初始文案与 JS loading 态文案逐字相同,导致"脚本没跑"
++// 与"脚本跑了但读取卡住"这两种病因在视觉上无法区分。这里锁住两者必须不同——具体改成什么字
++// 不重要,重要的是"不相等"这个关系不能漂移回去。
++describe('SC-2 静态初始文案与 JS loading 态文案不同', () => {
++  it('settings.html 静态 badge-text 与 createSettingsCard 的 loading 态 badgeText 不同', () => {
++    const staticText = /<span id="badge-text">([^<]*)<\/span>/.exec(HTML)?.[1]
++    expect(staticText).toBeTruthy()
++    const { card } = makeCard({ secrets: async () => [] }) // 未调用 start(),view 仍是初始 loading 态
++    expect(card.view.state).toBe('loading')
++    expect(card.view.badgeText).toBe('读取中') // JS loading 态文案本身不变(SC-3)
++    expect(staticText).not.toBe(card.view.badgeText)
++  })
++})
++
+ describe('SC-C2 R3 骨架与尺寸(源文本断言)', () => {
+   it('骨架顺序固定 head-row → action-row → link-row → error-row', () => {
+     const order = ['class="head-row"', 'class="action-row"', 'class="link-row"', 'id="error-row"'].map((needle) =>
+diff --git a/src/__tests__/mivoSettingsCardDom.test.ts b/src/__tests__/mivoSettingsCardDom.test.ts
+index cebaa5a8..77b98f14 100644
+--- a/src/__tests__/mivoSettingsCardDom.test.ts
++++ b/src/__tests__/mivoSettingsCardDom.test.ts
+@@ -60,6 +60,36 @@ beforeEach(() => {
+   document.body.innerHTML = ''
+ })
+ 
++// ── SC-2:mount 后先显示静态占位,render(loading) 后才切到 JS 的「读取中」 ───────────
++describe('SC-2 静态占位文案 → 首次 render 后切到 JS loading 态文案', () => {
++  it('mount 后 badge-text 不是「读取中」;render(loading) 后才变成「读取中」', () => {
++    mount()
++    const badgeText = () => (document.getElementById('badge-text') as HTMLElement).textContent
++    expect(badgeText()).not.toBe('读取中') // 脚本还没接管时的静态占位
++    renderSettingsCard(
++      {
++        state: 'loading',
++        badgeText: '读取中',
++        badgeIcon: '',
++        badgeSpinner: true,
++        showInput: false,
++        inputDisabled: true,
++        inputError: false,
++        primaryLabel: '保存',
++        primaryDisabled: true,
++        showPrimary: false,
++        showDisconnect: false,
++        disconnectLabel: '断开',
++        statusText: '',
++        errorText: '',
++        focusInput: false,
++      },
++      document,
++    )
++    expect(badgeText()).toBe('读取中') // 脚本接管后才是这句
++  })
++})
++
+ describe('SC-C2/C13 R3 尺寸不变量:computed-style 断言(四按钮一个尺寸一个圆角)', () => {
+   it('自检:computed-style 在本环境确实可用(不是空串对空串的恒真断言)', () => {
+     mount()
+diff --git a/src/settings/settingsCard.ts b/src/settings/settingsCard.ts
+index a235ac08..46c45f5b 100644
+--- a/src/settings/settingsCard.ts
++++ b/src/settings/settingsCard.ts
+@@ -58,10 +58,43 @@ export type SettingsCardDeps = {
+   deleteSecret: () => Promise<number>
+   sender: Pick<MivoKeyValidateSender, 'validate' | 'cancel'>
+   render: (view: CardView) => void
++  /**
++   * `readSecrets()` 的超时(ms),默认 `READ_SECRETS_TIMEOUT_MS`。**测试注入极小值**——
++   * 本仓不用 `vi.useFakeTimers()` 模拟超时(depositPort.test.ts 头部有实测教训:假时钟
++   * 会污染同一 vitest worker 内其他测试文件的计时器状态,文件级隔离兜不住)。改成走 deps
++   * 注入后,测试用真实计时器 + 几十毫秒的小超时就能钉住行为,不用等 8 秒也不用碰全局时钟。
++   */
++  readTimeoutMs?: number
+ }
+ 
+ export const SECRET_KEY = 'mivo_api_key'
+ 
++/** 读取配置状态的默认超时:必须有界,否则 `/secrets` 挂死时设置卡会永久停在 loading。 */
++export const READ_SECRETS_TIMEOUT_MS = 8_000
++
++/**
++ * 超时的身份用类型判定(`instanceof`),不用错误消息字符串相等——消息只是给人看的,
++ * 不该被当成识别凭证(若 `deps.readSecrets()` 侧恰好抛出同文案的错误,字符串比对会把
++ * 非超时失败误判成超时)。
++ */
++class ReadTimeoutError extends Error {}
++
++/** 给一个 promise 套上超时;到期 reject 一个可识别的错误,不影响原 promise 后续状态。 */
++const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T> =>
++  new Promise<T>((resolve, reject) => {
++    const timer = setTimeout(() => reject(new ReadTimeoutError('settings-card-read-timeout')), ms)
++    promise.then(
++      (value) => {
++        clearTimeout(timer)
++        resolve(value)
++      },
++      (err) => {
++        clearTimeout(timer)
++        reject(err)
++      },
++    )
++  })
++
+ /** verdict/超时 → 失败文案(闭集;自由文本进不来)。 */
+ const FAILURE_TEXT: Record<Exclude<MivoKeyValidateOutcome, 'valid' | 'cancelled'>, string> = {
+   'auth-invalid': 'Key 无效或已过期,请到 Mivo 平台重新获取后再保存',
+@@ -97,9 +130,21 @@ const findRow = (list: unknown): SecretRow | null => {
+ }
+ 
+ export const createSettingsCard = (deps: SettingsCardDeps) => {
++  // 非法值(0/负数/NaN/Infinity)一律回落默认值,不直接交给 setTimeout——负数/NaN 会被
++  // 压成约 0ms(立即"假超时"),Infinity 等于失去超时保护,两者都比默认值更危险。
++  const readTimeoutMs =
++    typeof deps.readTimeoutMs === 'number' && Number.isFinite(deps.readTimeoutMs) && deps.readTimeoutMs > 0
++      ? deps.readTimeoutMs
++      : READ_SECRETS_TIMEOUT_MS
+   let view: CardView = { ...EMPTY }
+   /** 断开的二次确认闸门:false 时点「断开」只推进它,不发 DELETE。 */
+   let disconnectArmed = false
++  /**
++   * 最近一次 `failed` 是不是「读不出配置状态」造成的。只有这种失败才需要把「重试」
++   * 按钮的空输入点击路由回 `start()` 重新读取——校验失败/保存失败的「重试」仍是
++   * 「贴新 key 再保存」的旧语义,不能被本次改动误路由(SC-3)。
++   */
++  let lastFailureFromRead = false
+ 
+   const show = (patch: Partial<CardView>) => {
+     view = { ...EMPTY, ...patch }
+@@ -122,8 +167,9 @@ export const createSettingsCard = (deps: SettingsCardDeps) => {
+     })
+   }
+ 
+-  const toFailed = (errorText: string) => {
++  const toFailed = (errorText: string, fromRead = false) => {
+     disconnectArmed = false
++    lastFailureFromRead = fromRead
+     show({
+       state: 'failed',
+       badgeText: '连接失败',
+@@ -166,10 +212,15 @@ export const createSettingsCard = (deps: SettingsCardDeps) => {
+     })
+   }
+ 
+-  /** 读一次 /secrets,只为拿尾号;读不到就退化成不带尾号的文案,不影响已连接结论。 */
++  /**
++   * 读一次 /secrets,只为拿尾号;读不到就退化成不带尾号的文案,不影响已连接结论。
++   * 同样套超时(SC-1 的延伸):这是校验通过后 start()/save() 路径上唯一剩下的
++   * `/secrets` 读取,不套的话挂死会让卡片永久停在 validating——与本次要修的根因
++   * 是同一个洞,只是换了个触发点。
++   */
+   const tailOf = async (): Promise<string | undefined> => {
+     try {
+-      return findRow(await deps.readSecrets())?.tail
++      return findRow(await withTimeout(deps.readSecrets(), readTimeoutMs))?.tail
+     } catch {
+       return undefined
+     }
+@@ -186,53 +237,67 @@ export const createSettingsCard = (deps: SettingsCardDeps) => {
+     toFailed(FAILURE_TEXT[outcome])
+   }
+ 
+-  return {
+-    get view() {
+-      return view
+-    },
++  /**
++   * 开页:读 /secrets → 有 key 就真校验一次,没有就未配置。
++   * 读取有超时(SC-1):`/secrets` 挂死时,不能让卡片永久停在 loading。
++   */
++  const start = async () => {
++    deps.sender.cancel() // 代际推进:与 save() 对称——旧校验轮的迟到回执不许落到新一轮 UI 上
++    show({ ...EMPTY })
++    let row: SecretRow | null
++    try {
++      row = findRow(await withTimeout(deps.readSecrets(), readTimeoutMs))
++    } catch (err) {
++      const timedOut = err instanceof ReadTimeoutError
++      // 读不出配置状态时不敢猜「未配置」(会误导用户重新贴 key),也不敢猜「已连接」。
++      toFailed(timedOut ? '读取配置状态超时,请重试或重开设置页' : '读取配置状态失败,可关掉设置页重开一次', true)
++      return
++    }
++    if (!row || !row.saved) {
++      toUnconfigured()
++      return
++    }
++    await runValidate()
++  }
+ 
+-    /** 开页:读 /secrets → 有 key 就真校验一次,没有就未配置。 */
+-    async start() {
+-      show({ ...EMPTY })
+-      let row: SecretRow | null
+-      try {
+-        row = findRow(await deps.readSecrets())
+-      } catch {
+-        // 读不出配置状态时不敢猜「未配置」(会误导用户重新贴 key),也不敢猜「已连接」。
+-        toFailed('读取配置状态失败,可关掉设置页重开一次')
++  /** 保存:仅 HTTP 204 才推进到校验;非 204 一律留在原地并报错(SC-C5)。 */
++  const save = async (rawValue: string) => {
++    const value = rawValue.trim()
++    if (!value) {
++      // 空值不发请求。若当前 failed 是「读不出配置状态」造成的,空输入点「重试」
++      // 语义上是"再读一次",不是"你没粘 key"(SC-4)——重新走 start() 而不是原地报错。
++      if (view.state === 'failed' && lastFailureFromRead) {
++        await start()
+         return
+       }
+-      if (!row || !row.saved) {
+-        toUnconfigured()
+-        return
+-      }
+-      await runValidate()
+-    },
++      // 停在当前可输入态(unconfigured / failed 都可能),只换提示。
++      if (view.state === 'failed') toFailed('请先粘贴 Key')
++      else toUnconfigured({ errorText: '请先粘贴 Key' })
++      return
++    }
++    deps.sender.cancel() // 代际推进:旧校验轮的迟到回执不许落到这一轮的 UI 上
++    let status: number
++    try {
++      status = await deps.putSecret(value)
++    } catch {
++      toFailed('保存失败,请重试')
++      return
++    }
++    if (status !== 204) {
++      toFailed('保存失败(HTTP ' + status + '),Key 未入库')
++      return
++    }
++    await runValidate()
++  }
+ 
+-    /** 保存:仅 HTTP 204 才推进到校验;非 204 一律留在原地并报错(SC-C5)。 */
+-    async save(rawValue: string) {
+-      const value = rawValue.trim()
+-      if (!value) {
+-        // 空值不发请求。停在当前可输入态(unconfigured / failed 都可能),只换提示。
+-        if (view.state === 'failed') toFailed('请先粘贴 Key')
+-        else toUnconfigured({ errorText: '请先粘贴 Key' })
+-        return
+-      }
+-      deps.sender.cancel() // 代际推进:旧校验轮的迟到回执不许落到这一轮的 UI 上
+-      let status: number
+-      try {
+-        status = await deps.putSecret(value)
+-      } catch {
+-        toFailed('保存失败,请重试')
+-        return
+-      }
+-      if (status !== 204) {
+-        toFailed('保存失败(HTTP ' + status + '),Key 未入库')
+-        return
+-      }
+-      await runValidate()
++  return {
++    get view() {
++      return view
+     },
+ 
++    start,
++    save,
++
+     /**
+      * 断开:两段式。第一次点只把按钮换成「确认断开」(零 DELETE);第二次才真删。
+      * 只有 204 才退回未配置,其余保持已连接不动(SC-C5)。

@@ -1,0 +1,1223 @@
+diff --git a/docs/context-menu-standard.md b/docs/context-menu-standard.md
+index 9d5de199..851add2e 100644
+--- a/docs/context-menu-standard.md
++++ b/docs/context-menu-standard.md
+@@ -89,7 +89,7 @@
+ - R3. ✅ **工具模式门禁**:
+   - 绘制模式(brush / stamp)进行中 → **吞掉右键,不弹菜单**;
+   - 空格平移 / 滚轮平移中 → **允许弹菜单**(弹出即终止本次平移——阶段 2 已实现,开菜单前 resetPan);
+-  - 框选拖拽、节点拖拽、crop/mask 编辑进行中 → 吞掉(⏳ 建议值,可复议)。
++  - 框选拖拽、节点拖拽、crop/mask 编辑进行中 → 吞掉(✅ 2026-08-01 拍板,阶段 3 落地)。
+ - R4. Chrome UI(工具坞、快捷工具条、选项条、crop/mask overlay、菜单自身)上右键 → 一律不弹画布菜单也不弹浏览器菜单。实现上 `isCanvasChromeTarget` 与 `isCanvasUiTarget` 两张白名单必须收敛为同一来源,禁止各组件自行兜底。
+ 
+ ### 2.2 关闭
+@@ -117,7 +117,7 @@
+ - R14. 同一动作若在两处同时存在(如 Crop、Generate),必须同 id、同 label、同图标(单一 action model 装配,两个装配函数只做取舍不做改写)。
+ - R16. 右键菜单与快捷条允许同屏共存,不互斥。
+ 
+-### 2.5a 样式项从右键退场清单(⏳ 本版核心提案,待拍板)
++### 2.5a 样式项从右键退场清单(✅ 2026-08-01 拍板,阶段 3 落地)
+ 
+ 以下现状项**从右键菜单移除**,快捷条保留为唯一入口(均已在快捷条存在,见 quickbar-study):
+ 
+@@ -149,13 +149,13 @@
+ 
+ | 组 | id | label(EN) | 中文对照 | 显示条件 | 去留 |
+ |---|---|---|---|---|---|
+-| create | `paste` | Paste here | 粘贴到此处 | 剪贴板非空 | 保留(label 从 "Paste N item(s)" 改为 参考产品 F 的 "Paste here",数量并入 toast) ⏳ |
++| create | `paste` | Paste here | 粘贴到此处 | 剪贴板非空 | ✅ 已落地(label 收敛 Paste here,数量并入粘贴完成 toast,2026-08-01) |
+ | create | `new-text` | New text here | 在此新建文本 | 恒显 | 保留 |
+ | create | `new-section` | New section here | 在此新建 Section | 恒显 | 保留 |
+ | create | `new-ai-slot` | New AI image slot here | 在此新建 AI 图槽 | 恒显 | 保留 |
+-| create | `new-arrow-markup` | New arrow markup | 新建箭头标注 | 恒显 | ⏳ 建议退场:绘制类创建走工具坞更顺手,三个 markup 创建项是右键里最低频的 |
+-| create | `new-rect-markup` | New rectangle markup | 新建矩形标注 | 恒显 | ⏳ 同上 |
+-| create | `new-note-markup` | New markup note | 新建标注便签 | 恒显 | ⏳ 同上 |
++| create | `new-arrow-markup` | New arrow markup | 新建箭头标注 | — | ✅ 已退场(2026-08-01 拍板,绘制类创建走工具坞) |
++| create | `new-rect-markup` | New rectangle markup | 新建矩形标注 | — | ✅ 已退场(同上) |
++| create | `new-note-markup` | New markup note | 新建标注便签 | — | ✅ 已退场(同上) |
+ | canvas | `fit-all` | Fit all objects | 缩放至全部 | 画布非空 | 保留(§0.4) |
+ | canvas | `select-all` | Select all objects | 全选 | 画布非空 | 保留 |
+ | canvas | `show-hidden` | Show N hidden object(s) | 显示隐藏对象 | 有隐藏对象 | 保留(§0.4) |
+@@ -198,7 +198,7 @@
+ | edit | `reset-crop` | Reset crop | 已有裁切 | 快捷条没有,右键保留 |
+ | edit | `copy-as-png` | Copy as PNG | 单选 | 参考产品 F 对象右键同款(§0.1),保留 |
+ 
+-(`crop` / `rotate` / `flip-h` / `flip-v` / `replace-image` 退到快捷条唯一入口,见 §2.5a ⏳)
++(`crop` / `rotate` / `flip-h` / `flip-v` / `replace-image` 已退到快捷条唯一入口,§2.5a ✅)
+ 
+ ### 4.3 text / annotation / ai-slot / task-placeholder 扩展
+ 
+@@ -220,7 +220,7 @@
+ | section-lock | `section-unlock` | Unlock section | 已锁时可用 |
+ | section-lock | `remove-section-only` | Remove section only | 保留(快捷条无,且非破坏内容) |
+ 
+-(`section-fill` / `section-line` 色板子菜单退到 Section 快捷条唯一入口,见 §2.5a ⏳)
++(`section-fill` / `section-line` 色板子菜单已退到 Section 快捷条唯一入口,§2.5a ✅)
+ 
+ ### 4.5 markup(标注)扩展(裁剪后)
+ 
+@@ -231,9 +231,9 @@
+ 
+ ---
+ 
+-## 5. markdown / pdf / video 专属菜单(⏳ 新增提案,待拍板)
++## 5. markdown / pdf / video 专属菜单(✅ 2026-08-01 拍板,实现排期阶段 4)
+ 
+-现状三者只有骨架组,零专属项。标准定为以下清单(实现排期另议):
++现状三者只有骨架组,零专属项。标准定为以下清单(2026-08-01 拍板;实现排期阶段 4「功能补齐」批):
+ 
+ ### 5.1 markdown
+ 
+@@ -299,13 +299,13 @@
+ 
+ | 编号 | 事项 | 建议 | 状态 |
+ |---|---|---|---|
+-| §2.5a | 样式项从右键全面退场(本版核心提案) | 采纳 | ⏳ |
+-| §3 | 空白右键三个 markup 创建项退场;Paste 改名 "Paste here" | 采纳 | ⏳ |
+-| §4.2 | image 右键裁到 generate 3 项 + reset-crop + copy-as-png | 采纳(随 §2.5a) | ⏳ |
+-| R3 后半 | 框选/节点拖拽/crop/mask 中右键是否吞掉 | 吞掉 | ⏳ |
+-| §5 | markdown/pdf/video 菜单项清单 | 按 §5 定稿 | ⏳ |
++| §2.5a | 样式项从右键全面退场 | 2026-08-01 拍板,阶段 3 落地 | ✅ |
++| §3 | 空白右键三个 markup 创建项退场;Paste 改名 "Paste here" | 同上 | ✅ |
++| §4.2 | image 右键裁到 generate 3 项 + reset-crop + copy-as-png | 同上 | ✅ |
++| R3 后半 | 框选/节点拖拽/crop/mask 中右键吞掉 | 同上 | ✅ |
++| §5 | markdown/pdf/video 菜单项清单 | 拍板通过,实现排期阶段 4 | ✅(实现待排) |
+ | §7 | 素材库右键 | 暂缓 | ⏳(等素材库功能定型) |
+ | §1 | 插件独有项(send-to-cindy-chat 等) | 暂不立项,仅登记候选 | ⏳ |
+-| §0.1/0.2 | 参考产品 F 菜单 👁 项开产品复核截图确认 | 落地 §2.5a 前做一次 | ⏳ |
++| §0.1/0.2 | 参考产品 F 菜单 👁 项开产品复核截图确认 | §2.5a 已由用户直接拍板,复核降级为可选 | ⏳(可选) |
+ 
+ 已拍板(2026-07-31):R3 前半(绘制吞/平移放)✅、R8 视口 clamp 常量收敛为一处 ✅、R10 子菜单 hover+点击 ✅、R19 快捷键提示 ✅。
+diff --git a/scripts/e2e/scenarios/canvas-interactions.mjs b/scripts/e2e/scenarios/canvas-interactions.mjs
+index 5f58cb54..8f72f9da 100644
+--- a/scripts/e2e/scenarios/canvas-interactions.mjs
++++ b/scripts/e2e/scenarios/canvas-interactions.mjs
+@@ -262,9 +262,6 @@ export const runCanvasInteractionsScenario = async (context) => {
+     'New text here',
+     'New section here',
+     'New AI image slot here',
+-    'New arrow markup',
+-    'New rectangle markup',
+-    'New markup note',
+     'Fit all objects',
+     'Select all objects',
+     'Import asset',
+@@ -280,6 +277,12 @@ export const runCanvasInteractionsScenario = async (context) => {
+   if ((await page.getByRole('menuitem', { name: 'Delete image' }).count()) !== 0) {
+     throw new Error('Blank right-click menu should not reuse image object actions')
+   }
++  // §3(2026-08-01 拍板):三个 markup 创建项退场,创建走工具坞。
++  for (const action of ['New arrow markup', 'New rectangle markup', 'New markup note']) {
++    if ((await page.getByRole('menuitem', { name: action, exact: true }).count()) !== 0) {
++      throw new Error(`${action} should have left the blank right-click menu (§3)`)
++    }
++  }
+   await page.keyboard.press('Escape')
+   await page.waitForSelector('.node-context-menu', { state: 'detached' })
+ 
+@@ -507,13 +510,15 @@ export const runCanvasInteractionsScenario = async (context) => {
+     )
+   })
+   await page.waitForSelector('.node-action-menu')
+-  await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Line style' }).hover()
+-  await page.waitForSelector('.node-action-submenu')
+-  if (
+-    (await page.locator('.node-action-submenu').getByRole('menuitem', { name: 'Curved line' }).count()) !== 1 ||
+-    (await page.locator('.node-action-submenu').getByRole('menuitem', { name: 'Dashed line' }).count()) !== 1
+-  ) {
+-    throw new Error('Node context menu should render nested markup style actions')
++  // §2.5a(2026-08-01 拍板):markup 右键不再有任何样式项(样式唯一入口=快捷条),
++  // 只留 Edit text。
++  if ((await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Edit text' }).count()) !== 1) {
++    throw new Error('Markup right-click menu should keep Edit text (only non-style item)')
++  }
++  for (const action of ['Line style', 'Line color', 'Line width', 'Start point', 'End point']) {
++    if ((await page.locator('.node-action-menu').getByRole('menuitem', { name: action, exact: true }).count()) !== 0) {
++      throw new Error(`${action} should have left the markup right-click menu (§2.5a)`)
++    }
+   }
+   await page.locator('.sidebar-mark').click() // 标题药丸已移除;改点侧栏 Mivo logo(非交互 UI 死区):点画布会取消选中、Escape 会连选中一起清,而点侧栏死区只关右键菜单不碰画布选中,保持原语义
+   await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'Line width' }).click()
+@@ -1284,7 +1289,8 @@ export const runCanvasInteractionsScenario = async (context) => {
+     nodeCountBeforeCut,
+   )
+   await page.mouse.click(farBlankPoint.x, farBlankPoint.y, { button: 'right' })
+-  await page.getByRole('menuitem', { name: /^Paste 1 item$/ }).click()
++  // §3:Paste 文案收敛为 "Paste here",数量并入粘贴完成 toast。
++  await page.getByRole('menuitem', { name: 'Paste here', exact: true }).click()
+   await page.waitForFunction(
+     (count) => document.querySelectorAll('.dom-node').length === count,
+     nodeCountBeforeCut,
+@@ -1575,26 +1581,18 @@ export const runCanvasInteractionsScenario = async (context) => {
+     )
+   })
+   await page.waitForSelector('.node-action-menu')
+-  if (
+-    (await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Section fill' }).count()) !== 1 ||
+-    (await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Section line' }).count()) !== 1 ||
+-    (await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Orange dashed border' }).count()) !== 0
+-  ) {
+-    throw new Error('Section right-click menu should use unified Section fill / Section line naming')
++  // §2.5a(2026-08-01 拍板):Section fill/line 从右键退场,快捷条是样式唯一入口;
++  // 右键保留标题/内容开关与锁定组。
++  for (const action of ['Section fill', 'Section line', 'Orange dashed border']) {
++    if ((await page.locator('.node-action-menu').getByRole('menuitem', { name: action }).count()) !== 0) {
++      throw new Error(`${action} should have left the Section right-click menu (§2.5a)`)
++    }
+   }
+-  await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Section line' }).hover()
+-  await page.waitForSelector('.node-action-submenu')
+-  const sectionLineSubmenu = await page.locator('.node-action-submenu').evaluate((submenu) => ({
+-    className: submenu.className,
+-    chips: submenu.querySelectorAll('button.color-swatch-chip').length,
+-  }))
+   if (
+-    !sectionLineSubmenu.className.includes('color-picker-submenu') ||
+-    sectionLineSubmenu.chips < 10 ||
+-    (await page.locator('.node-action-submenu').getByRole('menuitem', { name: 'Thin', exact: true }).count()) !== 1 ||
+-    (await page.locator('.node-action-submenu').getByRole('menuitem', { name: 'Solid line' }).count()) !== 1
++    (await page.locator('.node-action-menu').getByRole('menuitem', { name: /Hide title|Show title/ }).count()) !== 1 ||
++    (await page.locator('.node-action-menu').getByRole('menuitem', { name: 'Lock all' }).count()) !== 1
+   ) {
+-    throw new Error(`Section line submenu should pair the shared color picker with style options: ${JSON.stringify(sectionLineSubmenu)}`)
++    throw new Error('Section right-click menu should keep title toggle and lock group')
+   }
+   await page.evaluate(() => {
+     document.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: 1, clientY: 1 }))
+@@ -2773,19 +2771,15 @@ export const runCanvasInteractionsScenario = async (context) => {
+     return rect.left >= 11 && rect.top >= 11 && rect.right <= window.innerWidth - 11 && rect.bottom <= window.innerHeight - 11
+   })
+   // 2026-07-31 用户:Duplicate 全面退场(工具条 + 右键),仅保留 Cmd/Ctrl+D 快捷键。
++  // §2.5a(2026-08-01 拍板):Crop/Rotate/Flip×2/Replace 退到快捷条唯一入口,
++  // image 右键只留快捷条没有的 Reset crop(条件:该图已被上方 crop 段裁过)与
++  // Copy as PNG。
+   const expectedContextActions = [
+     'View details',
+     'Generate beside',
+     'Add edit note',
+     'Make variations',
+-    'Crop',
+-    // FigJam-parity image edit group (2026-07): reset只在已裁切时出现,此处该图
+-    // 已被上方 crop 段裁过,应当在场。
+     'Reset crop',
+-    'Rotate 90°',
+-    'Flip horizontal',
+-    'Flip vertical',
+-    'Replace image',
+     'Copy as PNG',
+     // 2026-08-01 用户:四个层级动作收进「Order」子菜单(右键菜单过长),顶层只留父项。
+     'Order',
+@@ -2810,6 +2804,11 @@ export const runCanvasInteractionsScenario = async (context) => {
+       throw new Error(`Order submenu should expose ${action}`)
+     }
+   }
++  for (const action of ['Crop', 'Rotate 90°', 'Flip horizontal', 'Flip vertical', 'Replace image']) {
++    if ((await page.getByRole('menuitem', { name: action, exact: true }).count()) !== 0) {
++      throw new Error(`${action} should have left the image right-click menu (§2.5a, quick toolbar only)`)
++    }
++  }
+   for (const action of ['Upscale HD', 'Video', 'Expand', 'Mask', 'Remove background', 'Erase']) {
+     if ((await page.getByRole('menuitem', { name: action }).count()) !== 0) {
+       throw new Error(`${action} should stay hidden until its workflow exists`)
+diff --git a/scripts/e2e/scenarios/markup-text-overlay.mjs b/scripts/e2e/scenarios/markup-text-overlay.mjs
+index d6d80599..aa8cab9c 100644
+--- a/scripts/e2e/scenarios/markup-text-overlay.mjs
++++ b/scripts/e2e/scenarios/markup-text-overlay.mjs
+@@ -7,7 +7,7 @@
+  * Leafer 真画，壳内不允许出现本体元素；无文字的 markup 不产生空壳。
+  *
+  * 几何依据：右键 "New xxx markup" 在 context 点居中创建 160×96 的节点
+- * （canvasActionModel.createMarkupAtContext: x-80, y-48），arrow 默认端点
++ * （与已退役的旧菜单 emitter 同款换算: x-80, y-48),arrow 默认端点
+  * (8,88)-(152,8) 的中点恰是节点中心 —— 因此对同一屏幕点 dblclick 一定命中
+  * 本体（rect/note 面、arrow 线身），leafer 模式无 DOM 元素也能走画布 hit-test。
+  *
+@@ -17,7 +17,7 @@
+  */
+ 
+ export const runMarkupTextOverlayScenario = async (context) => {
+-  const { page, rendererMode } = context
++  const { page, rendererMode, canvasStoreSpec } = context
+   const leaferMode = rendererMode === 'leafer'
+   const shell = page.locator('.canvas-shell')
+   const shellBox = await shell.boundingBox()
+@@ -47,10 +47,26 @@ export const runMarkupTextOverlayScenario = async (context) => {
+ 
+   // hasInitialText: note 新建自带默认文字 'Note'（nodeCreationSlice addMarkupNode），
+   // 因此 leafer 模式下 note 一落地就应有文字壳；rect/arrow 无初始文字则不允许空壳。
+-  const createMarkupAt = async (spot, menuItem, markupKind, { hasInitialText = false } = {}) => {
++  const createMarkupAt = async (spot, _legacyMenuItem, markupKind, { hasInitialText = false } = {}) => {
+     const before = await readTotalNodeCount()
+-    await page.mouse.click(spot.x, spot.y, { button: 'right' })
+-    await page.getByRole('menuitem', { name: menuItem }).click()
++    // §3(2026-08-01 拍板):blank 右键的 markup 创建项已退场(创建走工具坞)。
++    // 本测试关注文字层而非创建入口,改为 store 直建;坐标换算与旧菜单 emitter
++    // 相同(spot 为屏幕坐标,节点 160×96 居中落在 spot 上)。
++    await page.evaluate(
++      async ({ moduleSpec, clientX, clientY, kind }) => {
++        const { useCanvasStore } = await import(moduleSpec)
++        const shellEl = document.querySelector('.canvas-shell')
++        const rect = shellEl.getBoundingClientRect()
++        const scale = Number(shellEl.getAttribute('data-viewport-scale')) || 1
++        const vx = Number(shellEl.getAttribute('data-viewport-x')) || 0
++        const vy = Number(shellEl.getAttribute('data-viewport-y')) || 0
++        const cx = (clientX - rect.left - vx) / scale
++        const cy = (clientY - rect.top - vy) / scale
++        const extras = kind === 'arrow' ? { points: [{ x: 8, y: 88 }, { x: 152, y: 8 }] } : undefined
++        useCanvasStore.getState().addMarkupNode(kind, { x: cx - 80, y: cy - 48 }, { width: 160, height: 96 }, extras)
++      },
++      { moduleSpec: await canvasStoreSpec(), clientX: spot.x, clientY: spot.y, kind: markupKind },
++    )
+     await page.waitForFunction(
+       (expected) => Number(document.querySelector('.canvas-shell')?.getAttribute('data-total-node-count') || 0) === expected,
+       before + 1,
+diff --git a/scripts/visual-diff.mjs b/scripts/visual-diff.mjs
+index 335af888..71ce38dc 100644
+--- a/scripts/visual-diff.mjs
++++ b/scripts/visual-diff.mjs
+@@ -626,7 +626,7 @@ const SHELL_FIXTURES = {
+   },
+   'shell-node-context-menu': {
+     kind: 'shell',
+-    description: '画布 NodeActionMenu(右键 image 节点):View details / Copy image / Duplicate image / Fit selection … — canvasActionModel.contextMenuGroupsFor(单 image),区别于侧栏画板行菜单',
++    description: '画布 NodeActionMenu(右键 image 节点):View details / Copy image / Fit selection … — canvasActionModel.contextMenuGroupsFor(单 image),区别于侧栏画板行菜单',
+     async setup(page) {
+       // Seed a single ready image node, then right-click it. The right-click lands
+       // on .dom-node (pointer-events:auto) → handleCanvasContextMenu →
+@@ -676,12 +676,13 @@ const SHELL_FIXTURES = {
+       // Hard guard (F2): prove this is the real canvas NodeActionMenu
+       // (contextMenuGroupsFor single image), not the sidebar canvas-row menu
+       // (which is Chinese 重命名/移动到项目/复制画板/归档). Single image →
+-      // "View details" + "Duplicate image" items must be present.
++      // "View details" + "Copy image" must be present(Duplicate 已于 PR #350
++      // 退场,旧守卫随右键菜单标准化阶段 3 更新)。
+       const items = await page.locator('.node-action-item').allTextContents()
+       const joined = items.join('|')
+-      if (!joined.includes('View details') || !joined.includes('Duplicate')) {
++      if (!joined.includes('View details') || !joined.includes('Copy image')) {
+         throw new Error(
+-          `shell-node-context-menu: expected canvas NodeActionMenu (View details / Duplicate …), got items: ${joined}`,
++          `shell-node-context-menu: expected canvas NodeActionMenu (View details / Copy image …), got items: ${joined}`,
+         )
+       }
+       // Wait for the seeded image to decode so the baseline is pixel-stable.
+diff --git a/src/canvas/MivoCanvas.tsx b/src/canvas/MivoCanvas.tsx
+index ad386c83..34736fdf 100644
+--- a/src/canvas/MivoCanvas.tsx
++++ b/src/canvas/MivoCanvas.tsx
+@@ -32,7 +32,7 @@ import { NodeActionMenu } from './NodeActionMenu'
+ import { SelectionQuickToolbar } from './SelectionQuickToolbar'
+ import { stampCursorCssFor, stampGrowthSizes, stampSrcFor } from './stampDefs'
+ import { useCanvasInteractionController } from './useCanvasInteractionController'
+-import { clampContextMenuPosition, isCanvasChromeTarget, isCanvasUiTarget, nativeContextMenuAllowed, nodeIdFromDomTarget } from './canvasInteraction'
++import { clampContextMenuPosition, isCanvasChromeTarget, isCanvasUiTarget, isDragInterruptedContextMenu, nativeContextMenuAllowed, nodeIdFromDomTarget } from './canvasInteraction'
+ import { useMaskPointArmed, type MaskPointArmedInteractionApi } from './useMaskPointArmed'
+ import { useRegionEdit } from './useRegionEdit'
+ import { lockedNodeIdSetFor } from './useNodeTransform'
+@@ -537,7 +537,17 @@ export function MivoCanvas({
+       debugLogger.log('Context Menu', `Skipped: drawing tool active (${storeActiveTool})`)
+       return
+     }
+-    // R3 后半:平移中允许弹菜单,但弹出即终止本次平移(多键鼠标中键仍按住时
++    // R3 后半(2026-08-01 拍板):crop/mask 是模态编辑态,进行中吞掉右键;
++    // 框选/节点拖拽等"左键仍按住"的手势中同样吞掉(拖拽到一半弹菜单无合理语义)。
++    if (cropNodeId || activeImageEditNodeId) {
++      debugLogger.log('Context Menu', `Skipped: ${cropNodeId ? 'crop' : 'mask'} edit in progress`)
++      return
++    }
++    if (isDragInterruptedContextMenu(event)) {
++      debugLogger.log('Context Menu', 'Skipped: primary-button drag in progress')
++      return
++    }
++    // R3:平移中允许弹菜单,但弹出即终止本次平移(多键鼠标中键仍按住时
+     // 右键,pan 追踪不再吃后续位移)。非平移态调用是幂等 no-op。
+     resetPan()
+     // DOM-first(见 nodeIdFromDomTarget):右键哪个 DOM 开哪个菜单,fallback 坐标兜底空白。
+@@ -553,7 +563,7 @@ export function MivoCanvas({
+     }
+     const position = clampContextMenuPosition(event.clientX, event.clientY, 300)
+     setContextMenu({ kind: 'blank', x: position.x, y: position.y, canvasPosition: screenToCanvasPoint(event.clientX, event.clientY) })
+-  }, [brushToolActive, stampToolActive, storeActiveTool, resetPan, resolveCanvasHit, openNodeContextMenu, screenToCanvasPoint, selectNode, selectedNodeIds])
++  }, [brushToolActive, stampToolActive, storeActiveTool, cropNodeId, activeImageEditNodeId, resetPan, resolveCanvasHit, openNodeContextMenu, screenToCanvasPoint, selectNode, selectedNodeIds])
+ 
+   const handleCanvasDoubleClick = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+     if (isCanvasChromeTarget(event.target)) return
+diff --git a/src/canvas/actions/canvasActionEmitters.ts b/src/canvas/actions/canvasActionEmitters.ts
+index 9c5e206e..92492d12 100644
+--- a/src/canvas/actions/canvasActionEmitters.ts
++++ b/src/canvas/actions/canvasActionEmitters.ts
+@@ -18,7 +18,7 @@
+ // direct runtime calls until their two-stage asset bridge is wired.
+ 
+ import type { CanvasActionRuntime, LayerMove } from './canvasActionTypes'
+-import type { MarkupKind, SectionLockMode, ToolId } from '../../types/mivoCanvas'
++import type { SectionLockMode, ToolId } from '../../types/mivoCanvas'
+ import type { DistributionAxis, SelectionAlignment, SelectionArrangeMode } from '../../store/canvasStore'
+ import { applyCanvasCommand } from './canvasCommandExecutor'
+ 
+@@ -253,34 +253,6 @@ const createAiSlotAtContext = (runtime: CanvasActionRuntime) => {
+   )
+ }
+ 
+-const createMarkupAtContext = (runtime: CanvasActionRuntime, kind: MarkupKind) => {
+-  const position = runtime.canvasPosition || { x: 0, y: 0 }
+-  applyCanvasCommand(
+-    {
+-      kind: 'add-markup-node',
+-      markupKind: kind,
+-      position: { x: position.x - 80, y: position.y - 48 },
+-      geometry: { width: 160, height: 96 },
+-      options: {
+-        points:
+-          kind === 'arrow' || kind === 'line'
+-            ? [
+-                { x: 8, y: 88 },
+-                { x: 152, y: 8 },
+-              ]
+-            : kind === 'brush'
+-              ? [
+-                  { x: 12, y: 62 },
+-                  { x: 44, y: 24 },
+-                  { x: 82, y: 64 },
+-                  { x: 132, y: 26 },
+-                ]
+-              : undefined,
+-      },
+-    },
+-    runtime,
+-  )
+-}
+ 
+ const importAssetAtContext = (runtime: CanvasActionRuntime) => {
+   if (runtime.canvasPosition && runtime.onImportAssetAt) {
+@@ -368,7 +340,6 @@ export {
+   createTextAtContext,
+   createFrameAtContext,
+   createAiSlotAtContext,
+-  createMarkupAtContext,
+   importAssetAtContext,
+   importAssetFolderAtContext,
+   selectAll,
+diff --git a/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts b/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
+index 5a2b6328..e8d29acb 100644
+--- a/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
++++ b/src/canvas/actions/canvasActionModel.characterization.quickbar.test.ts
+@@ -556,34 +556,12 @@ describe('canvasActionModel — characterization · part 2 (③ markup/AI-edit 
+       expect(vi.mocked(rt.addAiSlotNode)).toHaveBeenCalledWith({ x: -160, y: -160 })
+     })
+ 
+-    it('new-arrow-markup → addMarkupNode(arrow, pos-80/48, {160,96}, {points:[…]})', () => {
+-      const pos = { x: 200, y: 200 }
+-      const rt = createRuntime(ctx([]), { canvasPosition: pos })
+-      fire(contextMenuGroupsFor(rt), 'new-arrow-markup')
+-      expect(vi.mocked(rt.addMarkupNode)).toHaveBeenCalledWith(
+-        'arrow',
+-        { x: 120, y: 152 },
+-        { width: 160, height: 96 },
+-        { points: [{ x: 8, y: 88 }, { x: 152, y: 8 }] },
+-      )
+-    })
+-
+-    it('new-rect-markup → addMarkupNode(rect, …, points undefined)', () => {
+-      const pos = { x: 200, y: 200 }
+-      const rt = createRuntime(ctx([]), { canvasPosition: pos })
+-      fire(contextMenuGroupsFor(rt), 'new-rect-markup')
+-      const call = vi.mocked(rt.addMarkupNode).mock.calls[0]
+-      expect(call?.[0]).toBe('rect')
+-      expect(call?.[3]?.points).toBeUndefined()
+-    })
+-
+-    it('new-note-markup → addMarkupNode(note, …, points undefined)', () => {
+-      const pos = { x: 200, y: 200 }
+-      const rt = createRuntime(ctx([]), { canvasPosition: pos })
+-      fire(contextMenuGroupsFor(rt), 'new-note-markup')
+-      const call = vi.mocked(rt.addMarkupNode).mock.calls[0]
+-      expect(call?.[0]).toBe('note')
+-      expect(call?.[3]?.points).toBeUndefined()
++    it('new-*-markup 已从空白右键退场(§3,2026-08-01 拍板;绘制类创建走工具坞)', () => {
++      const rt = createRuntime(ctx([]), { canvasPosition: { x: 200, y: 200 } })
++      const groups = contextMenuGroupsFor(rt)
++      for (const id of ['new-arrow-markup', 'new-rect-markup', 'new-note-markup']) {
++        expect(findAction(groups, id), id).toBeUndefined()
++      }
+     })
+ 
+     it('import-asset 有 canvasPosition + onImportAssetAt → onImportAssetAt(pos)', () => {
+diff --git a/src/canvas/actions/canvasActionModel.characterization.test.ts b/src/canvas/actions/canvasActionModel.characterization.test.ts
+index f90170bd..f722c6f7 100644
+--- a/src/canvas/actions/canvasActionModel.characterization.test.ts
++++ b/src/canvas/actions/canvasActionModel.characterization.test.ts
+@@ -19,7 +19,7 @@
+  */
+ import { describe, expect, it, vi } from 'vitest'
+ import { menuShortcuts } from './menuShortcuts'
+-import { contextMenuGroupsFor } from './canvasActionModel'
++import { contextMenuGroupsFor, quickToolbarGroupsFor } from './canvasActionModel'
+ import { createCanvasSelectionContext } from './canvasSelectionModel'
+ import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
+ import type { CanvasNodeType, MarkupKind, MivoCanvasNode } from '../../types/mivoCanvas'
+@@ -173,8 +173,9 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       expect(groupIds(groups)).toEqual(['canvas', 'create'])
+       // 真实顺序：create 在前，canvas 在后（非字母序）
+       expect(orderedGroupIds(groups)).toEqual(['create', 'canvas'])
++      // §3(2026-08-01 拍板):三个 markup 创建项退场,创建走工具坞。
+       expect(deepActionIds(groups)).toEqual([
+-        'new-text', 'new-section', 'new-ai-slot', 'new-arrow-markup', 'new-rect-markup', 'new-note-markup',
++        'new-text', 'new-section', 'new-ai-slot',
+         // #297 P3-15:目录导入与单文件导入并列在 create 组末尾
+         'import-asset', 'import-asset-folder',
+       ])
+@@ -306,8 +307,9 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('a'), imageNode('b')])))
+       // multi 时 node 扩展返 []（nodeContextMenuGroupsFor 对 kind!==single 返 []）；
+       // align 仅 multi 出现，夹在 arrange 与 export 之间。
++      // §2.5a(2026-08-01 拍板):align 组从右键退场(快捷条唯一入口)。
+       expect(orderedGroupIds(groups)).toEqual([
+-        'inspect', 'organize', 'arrange', 'align', 'export', 'danger',
++        'inspect', 'organize', 'arrange', 'export', 'danger',
+       ])
+     })
+ 
+@@ -317,18 +319,11 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       expect(findAction(groups, 'delete')?.label).toBe('Delete 2 objects')
+     })
+ 
+-    it('multi 2 个 → align 组出现但无 distribute', () => {
+-      const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('a'), imageNode('b')])))
+-      expect(hasAction(groups, 'align-left')).toBe(true)
+-      expect(hasAction(groups, 'distribute-horizontal')).toBe(false)
+-    })
+-
+-    it('multi 3 个 → align 组含 distribute 横/纵', () => {
++    it('multi → align/distribute 不在右键(§2.5a 退场,快捷条唯一入口)', () => {
+       const groups = contextMenuGroupsFor(
+         createRuntime(ctx([imageNode('a'), imageNode('b'), imageNode('c')])),
+       )
+-      expect(hasAction(groups, 'distribute-horizontal')).toBe(true)
+-      expect(hasAction(groups, 'distribute-vertical')).toBe(true)
++      for (const id of ['align-left', 'align-middle', 'distribute-horizontal', 'distribute-vertical']) expect(hasAction(groups, id), id).toBe(false)
+     })
+ 
+     it('multi 3 个 → objectLabel 复数带 s', () => {
+@@ -438,12 +433,11 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       expect(findAction(groups, 'download')?.label).toBe('Download')
+     })
+ 
+-    it('single markup arrow 真实 group 顺序: inspect → markup-text → markup-style → organize → arrange → export → danger', () => {
++    it('single markup arrow 真实 group 顺序: inspect → markup-text → organize → arrange → export → danger(§2.5a 样式组退场)', () => {
+       const groups = contextMenuGroupsFor(createRuntime(ctx([markupNode('m1', 'arrow')])))
+-      // markup 走 markupContextMenuGroupsFor(markup-text, markup-style)；
+-      // unlocked markup 经 base 含 exportable → export 在，无 downloadOriginal → Download。
++      // markup 右键只剩 markup-text(Edit text);样式全在快捷条(§2.5a)。
+       expect(orderedGroupIds(groups)).toEqual([
+-        'inspect', 'markup-text', 'markup-style', 'organize', 'arrange', 'export', 'danger',
++        'inspect', 'markup-text', 'organize', 'arrange', 'export', 'danger',
+       ])
+     })
+ 
+@@ -508,12 +502,16 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+   // ─── ② 续：node-type 扩展的存在性 ────────────────────────────────────────────
+ 
+   describe('node-type context-menu extensions', () => {
+-    it('image → generate 组含 generate-beside / add-edit-note / variations；edit 组含 crop', () => {
++    it('image → generate 组含 generate-beside / add-edit-note / variations;edit 组只剩 copy-as-png(+条件 reset-crop,§2.5a)', () => {
+       const groups = contextMenuGroupsFor(createRuntime(ctx([imageNode('a')])))
+       expect(hasAction(groups, 'generate-beside')).toBe(true)
+       expect(hasAction(groups, 'add-edit-note')).toBe(true)
+       expect(hasAction(groups, 'variations')).toBe(true)
+-      expect(hasAction(groups, 'crop')).toBe(true)
++      expect(hasAction(groups, 'copy-as-png')).toBe(true)
++      for (const id of ['crop', 'rotate', 'flip-h', 'flip-v', 'replace-image']) expect(hasAction(groups, id), id).toBe(false)
++      expect(hasAction(groups, 'reset-crop')).toBe(false) // 无 imageCrop 时不出现
++      const cropped = contextMenuGroupsFor(createRuntime(ctx([imageNode('a', { imageCrop: { x: 0, y: 0, width: 10, height: 10 } })])))
++      expect(hasAction(cropped, 'reset-crop')).toBe(true)
+     })
+ 
+     it('image → 无 generate-into-slot / generate-from-annotation（非 slot/annotation）', () => {
+@@ -553,10 +551,10 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       expect(hasAction(groups, 'crop')).toBe(false)
+     })
+ 
+-    it('frame → 走 section 扩展：section-fill/section-line/section-title-toggle + section-lock 组', () => {
++    it('frame → 走 section 扩展:标题/内容开关 + section-lock 组;fill/line 退场(§2.5a)', () => {
+       const groups = contextMenuGroupsFor(createRuntime(ctx([frameNode('f1')])))
+-      expect(hasAction(groups, 'section-fill')).toBe(true)
+-      expect(hasAction(groups, 'section-line')).toBe(true)
++      expect(hasAction(groups, 'section-fill')).toBe(false)
++      expect(hasAction(groups, 'section-line')).toBe(false)
+       expect(hasAction(groups, 'section-title-toggle')).toBe(true)
+       expect(hasAction(groups, 'section-lock-all')).toBe(true)
+       expect(hasAction(groups, 'section-lock-background')).toBe(true)
+@@ -564,21 +562,21 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       expect(hasAction(groups, 'remove-section-only')).toBe(true)
+     })
+ 
+-    it('markup arrow → markup-text + markup-style 组；style 为线族五件套(色/宽/起点/线型/终点)', () => {
+-      const groups = contextMenuGroupsFor(createRuntime(ctx([markupNode('m1', 'arrow')])))
+-      expect(hasAction(groups, 'edit-markup-text')).toBe(true)
+-      expect(hasAction(groups, 'markup-line-color')).toBe(true)
+-      expect(hasAction(groups, 'markup-line-width')).toBe(true)
+-      expect(hasAction(groups, 'markup-start-arrowhead')).toBe(true)
+-      expect(hasAction(groups, 'markup-line-style')).toBe(true)
+-      expect(hasAction(groups, 'markup-end-arrowhead')).toBe(true)
+-      // 线族无填充/换形状
+-      expect(hasAction(groups, 'markup-fill-color')).toBe(false)
+-      expect(hasAction(groups, 'markup-shape-swap')).toBe(false)
+-    })
+-
+-    it('markup rect → 形状族三件套(换形状/填充/边框) + corner-radius;无线族项', () => {
+-      const groups = contextMenuGroupsFor(createRuntime(ctx([markupNode('m1', 'rect')])))
++    it('markup 右键(§2.5a):只剩 edit-markup-text,样式五件套/形状三件套全退到快捷条', () => {
++      const arrow = contextMenuGroupsFor(createRuntime(ctx([markupNode('m1', 'arrow')])))
++      expect(hasAction(arrow, 'edit-markup-text')).toBe(true)
++      for (const id of ['markup-line-color', 'markup-line-width', 'markup-start-arrowhead', 'markup-line-style', 'markup-end-arrowhead']) {
++        expect(hasAction(arrow, id), id).toBe(false)
++      }
++      // 快捷条侧仍是线族五件套(样式唯一入口)。
++      const arrowBar = quickToolbarGroupsFor(createRuntime(ctx([markupNode('m1', 'arrow')])))
++      for (const id of ['markup-line-color', 'markup-line-width', 'markup-start-arrowhead', 'markup-line-style', 'markup-end-arrowhead']) {
++        expect(hasAction(arrowBar, id), id).toBe(true)
++      }
++    })
++
++    it('markup rect → 快捷条形状族三件套 + corner-radius;右键无任何样式项', () => {
++      const groups = quickToolbarGroupsFor(createRuntime(ctx([markupNode('m1', 'rect')])))
+       expect(hasAction(groups, 'markup-shape-swap')).toBe(true)
+       expect(hasAction(groups, 'markup-fill-color')).toBe(true)
+       expect(hasAction(groups, 'markup-border')).toBe(true)
+@@ -586,10 +584,11 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+       // rect 非 connector → 无箭头端点项
+       expect(hasAction(groups, 'markup-start-arrowhead')).toBe(false)
+       expect(hasAction(groups, 'markup-end-arrowhead')).toBe(false)
++      expect(hasAction(contextMenuGroupsFor(createRuntime(ctx([markupNode('m1', 'rect')]))), 'markup-fill-color')).toBe(false)
+     })
+ 
+-    it('markup note → 仅贴纸纸色;无箭头端点也无 corner-radius', () => {
+-      const groups = contextMenuGroupsFor(createRuntime(ctx([markupNode('m1', 'note')])))
++    it('markup note → 快捷条仅贴纸纸色;无箭头端点也无 corner-radius', () => {
++      const groups = quickToolbarGroupsFor(createRuntime(ctx([markupNode('m1', 'note')])))
+       expect(hasAction(groups, 'markup-fill-color')).toBe(true)
+       expect(hasAction(groups, 'markup-start-arrowhead')).toBe(false)
+       expect(hasAction(groups, 'markup-corner-radius')).toBe(false)
+@@ -744,19 +743,19 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+ 
+     it('align-left · multi → alignSelectedNodes(left)', () => {
+       const rt = createRuntime(ctx([imageNode('a'), imageNode('b')]))
+-      fire(contextMenuGroupsFor(rt), 'align-left')
++      fire(quickToolbarGroupsFor(rt), 'align-left')
+       expect(vi.mocked(rt.alignSelectedNodes)).toHaveBeenCalledWith('left')
+     })
+ 
+     it('align-middle · multi → alignSelectedNodes(middle)', () => {
+       const rt = createRuntime(ctx([imageNode('a'), imageNode('b')]))
+-      fire(contextMenuGroupsFor(rt), 'align-middle')
++      fire(quickToolbarGroupsFor(rt), 'align-middle')
+       expect(vi.mocked(rt.alignSelectedNodes)).toHaveBeenCalledWith('middle')
+     })
+ 
+     it('distribute-vertical · multi3 → distributeSelectedNodes(vertical)', () => {
+       const rt = createRuntime(ctx([imageNode('a'), imageNode('b'), imageNode('c')]))
+-      fire(contextMenuGroupsFor(rt), 'distribute-vertical')
++      fire(quickToolbarGroupsFor(rt), 'distribute-vertical')
+       expect(vi.mocked(rt.distributeSelectedNodes)).toHaveBeenCalledWith('vertical')
+     })
+ 
+@@ -801,17 +800,17 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+     it('crop · image → onCropNode(id)', () => {
+       const onCropNode = vi.fn()
+       const rt = createRuntime(ctx([imageNode('a')]), { onCropNode })
+-      fire(contextMenuGroupsFor(rt), 'crop')
++      fire(quickToolbarGroupsFor(rt), 'crop')
+       expect(onCropNode).toHaveBeenCalledWith('a')
+     })
+   })
+ 
+   // ─── ③ section style / lock 分发 ─────────────────────────────────────────────
+ 
+-  describe('section context-menu style & lock dispatch', () => {
++  describe('section style & lock dispatch(§2.5a 后 fill/line 分发经快捷条装配;开关与锁仍在右键)', () => {
+     it('section-fill 通用取色器 onSelect → updateSectionStyle(f1, {sectionFillColor:<选色>})', () => {
+       const rt = createRuntime(ctx([frameNode('f1')]))
+-      const fill = findAction(contextMenuGroupsFor(rt), 'section-fill')
++      const fill = findAction(quickToolbarGroupsFor(rt), 'section-fill')
+       expect(fill?.colorPicker).toBeTruthy()
+       fill?.colorPicker?.onSelect('#a1e3a1')
+       expect(vi.mocked(rt.updateSectionStyle)).toHaveBeenCalledWith('f1', { sectionFillColor: '#a1e3a1' })
+@@ -819,13 +818,13 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+ 
+     it('section-fill 父 onClick → updateSectionStyle(f1, {sectionFillColor:#ffffff})（默认回写当前色）', () => {
+       const rt = createRuntime(ctx([frameNode('f1')]))
+-      fire(contextMenuGroupsFor(rt), 'section-fill')
++      fire(quickToolbarGroupsFor(rt), 'section-fill')
+       expect(vi.mocked(rt.updateSectionStyle)).toHaveBeenCalledWith('f1', { sectionFillColor: '#ffffff' })
+     })
+ 
+     it('section-line 通用取色器 onSelect → updateSectionStyle(f1, {sectionBorderColor:<选色>})', () => {
+       const rt = createRuntime(ctx([frameNode('f1')]))
+-      const line = findAction(contextMenuGroupsFor(rt), 'section-line')
++      const line = findAction(quickToolbarGroupsFor(rt), 'section-line')
+       expect(line?.colorPicker).toBeTruthy()
+       line?.colorPicker?.onSelect('#159bff')
+       expect(vi.mocked(rt.updateSectionStyle)).toHaveBeenCalledWith('f1', { sectionBorderColor: '#159bff' })
+@@ -833,13 +832,13 @@ describe('canvasActionModel — characterization · part 1 (① 结构 ② 矩
+ 
+     it('section-line-dashed → updateSectionStyle(f1, {sectionBorderStyle:dashed})', () => {
+       const rt = createRuntime(ctx([frameNode('f1')]))
+-      fire(contextMenuGroupsFor(rt), 'section-line-dashed')
++      fire(quickToolbarGroupsFor(rt), 'section-line-dashed')
+       expect(vi.mocked(rt.updateSectionStyle)).toHaveBeenCalledWith('f1', { sectionBorderStyle: 'dashed' })
+     })
+ 
+     it('section-line-bold → updateSectionStyle(f1, {sectionBorderWidth:4})', () => {
+       const rt = createRuntime(ctx([frameNode('f1')]))
+-      fire(contextMenuGroupsFor(rt), 'section-line-bold')
++      fire(quickToolbarGroupsFor(rt), 'section-line-bold')
+       expect(vi.mocked(rt.updateSectionStyle)).toHaveBeenCalledWith('f1', { sectionBorderWidth: 4 })
+     })
+ 
+diff --git a/src/canvas/actions/canvasActionModel.ts b/src/canvas/actions/canvasActionModel.ts
+index 2c9228f5..3abc75ae 100644
+--- a/src/canvas/actions/canvasActionModel.ts
++++ b/src/canvas/actions/canvasActionModel.ts
+@@ -1,5 +1,4 @@
+ import {
+-  ArrowUpRight,
+   ChevronsUp,
+   Clipboard,
+   Copy,
+@@ -15,7 +14,6 @@ import {
+   MessageSquareText,
+   PanelTop,
+   Pencil,
+-  Square,
+   SquareDashed,
+   SquareMousePointer,
+   Sparkles,
+@@ -36,6 +34,7 @@ import {
+   sectionLockToolbarAction,
+ } from './sectionStyleActions'
+ import { debugLogger } from '../../store/debugLogStore'
++import { toastFeedback } from '../../store/toastStore'
+ import type { CanvasNodeType } from '../../types/mivoCanvas'
+ import { hasAnyCapability, hasCommonCapability } from './canvasSelectionModel'
+ import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
+@@ -67,10 +66,7 @@ import {
+   createTextAtContext,
+   createFrameAtContext,
+   createAiSlotAtContext,
+-  createMarkupAtContext,
+   selectAll,
+-  align,
+-  distribute,
+   copySelectedNodes,
+   pasteClipboardNodes,
+   groupSelectedNodes,
+@@ -80,6 +76,20 @@ import {
+   showAllHiddenNodes,
+ } from './canvasActionEmitters'
+ 
++// §3(2026-08-01 拍板):paste 的 label 收敛为 "Paste here"(对齐参考产品语义),
++// 数量信息挪进粘贴完成的 toast;blank 与选区两处菜单共用本装配。
++const pasteHereAction = (runtime: CanvasActionRuntime): CanvasActionItem => ({
++  id: 'paste',
++  label: t('menu.create.pasteHere'),
++  icon: Clipboard,
++  shortcut: menuShortcuts.paste,
++  onClick: () => {
++    const count = runtime.clipboardCount
++    pasteClipboardNodes(runtime)
++    toastFeedback.success(t('toast.paste.done', { count }))
++  },
++})
++
+ const hasGroupedNodes = (runtime: CanvasActionRuntime) =>
+   runtime.context.nodes.some((node) => Boolean(node.groupId))
+ 
+@@ -94,14 +104,13 @@ type NodeActionExtension = (runtime: CanvasActionRuntime) => CanvasActionGroup[]
+ 
+ const sectionContextMenuGroupsFor: NodeActionExtension = (runtime) => {
+   const { context } = runtime
+-  const { fillColor, lineColor, lineStyle, lineWidth } = sectionStyleStateFor(runtime)
+ 
++  // §2.5a(2026-08-01 拍板):Section fill/line 色板子菜单退到 Section 快捷条
++  // 唯一入口;右键只留状态开关与锁定组(命令式)。
+   return [
+     {
+       id: 'section',
+       actions: [
+-        sectionFillAction(runtime, fillColor),
+-        sectionLineAction(runtime, lineColor, lineStyle, lineWidth),
+         {
+           id: 'section-title-toggle',
+           label:
+@@ -253,21 +262,14 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+         actions: [
+           ...(hasClipboard
+             ? [
+-                {
+-                  id: 'paste',
+-                  label: t('menu.create.paste', { count: runtime.clipboardCount }),
+-                  icon: Clipboard,
+-                  shortcut: menuShortcuts.paste,
+-                  onClick: () => pasteClipboardNodes(runtime),
+-                },
++                pasteHereAction(runtime),
+               ]
+             : []),
+           { id: 'new-text', label: t('menu.create.newText'), icon: Type, onClick: () => createTextAtContext(runtime) },
+           { id: 'new-section', label: t('menu.create.newSection'), icon: PanelTop, onClick: () => createFrameAtContext(runtime) },
+           { id: 'new-ai-slot', label: t('menu.create.newAiSlot'), icon: SquareDashed, onClick: () => createAiSlotAtContext(runtime) },
+-          { id: 'new-arrow-markup', label: t('menu.create.newArrowMarkup'), icon: ArrowUpRight, onClick: () => createMarkupAtContext(runtime, 'arrow') },
+-          { id: 'new-rect-markup', label: t('menu.create.newRectMarkup'), icon: Square, onClick: () => createMarkupAtContext(runtime, 'rect') },
+-          { id: 'new-note-markup', label: t('menu.create.newNoteMarkup'), icon: MessageSquareText, onClick: () => createMarkupAtContext(runtime, 'note') },
++              // §3(2026-08-01 拍板):三个 markup 创建项退场——绘制类创建走
++              // 工具坞;空白右键保留文本/Section/AI 槽三个高频起点。
+         ],
+       },
+       {
+@@ -375,13 +377,7 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+           : []),
+         ...(hasClipboard
+           ? [
+-              {
+-                id: 'paste',
+-                label: t('menu.create.paste', { count: runtime.clipboardCount }),
+-                icon: Clipboard,
+-                shortcut: menuShortcuts.paste,
+-                onClick: () => pasteClipboardNodes(runtime),
+-              },
++              pasteHereAction(runtime),
+             ]
+           : []),
+       ],
+@@ -442,27 +438,8 @@ export const contextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasAction
+         ]
+       : []),
+     ...(canArrange ? [arrangeContextMenuGroup(runtime)] : []),
+-    ...(context.kind === 'multi'
+-      ? [
+-          {
+-            id: 'align',
+-            actions: [
+-              { id: 'align-left', label: t('menu.align.left'), text: 'L', onClick: () => align(runtime, 'left') },
+-              { id: 'align-center', label: t('menu.align.center'), text: 'C', onClick: () => align(runtime, 'center') },
+-              { id: 'align-right', label: t('menu.align.right'), text: 'R', onClick: () => align(runtime, 'right') },
+-              { id: 'align-top', label: t('menu.align.top'), text: 'T', onClick: () => align(runtime, 'top') },
+-              { id: 'align-middle', label: t('menu.align.middle'), text: 'M', onClick: () => align(runtime, 'middle') },
+-              { id: 'align-bottom', label: t('menu.align.bottom'), text: 'B', onClick: () => align(runtime, 'bottom') },
+-              ...(selectedCount >= 3
+-                ? [
+-                    { id: 'distribute-horizontal', label: t('menu.align.distributeH'), text: 'H', onClick: () => distribute(runtime, 'horizontal') },
+-                    { id: 'distribute-vertical', label: t('menu.align.distributeV'), text: 'V', onClick: () => distribute(runtime, 'vertical') },
+-                  ]
+-                : []),
+-            ],
+-          },
+-        ]
+-      : []),
++    // §2.5a(2026-08-01 拍板):align/distribute 从右键退场,多选快捷条 Align
++    // 菜单是唯一入口。
+     ...(canExport
+       ? [
+           {
+diff --git a/src/canvas/actions/imageActionGroups.ts b/src/canvas/actions/imageActionGroups.ts
+index 5185c10a..679934f0 100644
+--- a/src/canvas/actions/imageActionGroups.ts
++++ b/src/canvas/actions/imageActionGroups.ts
+@@ -122,8 +122,9 @@ export const imageQuickToolbarGroupsFor = (runtime: CanvasActionRuntime): Canvas
+ }
+ 
+ /** Right-click "edit" cluster for a single image node. */
++// §2.5a(2026-08-01 拍板):crop/rotate/flip×2/replace 退到 image 快捷条唯一
++// 入口;右键只留快捷条没有的两项(Reset crop 条件显示、Copy as PNG)。
+ export const imageContextEditActionsFor = (runtime: CanvasActionRuntime): CanvasActionItem[] => [
+-  { id: 'crop', label: t('menu.image.crop'), icon: Crop, onClick: () => cropPrimaryNode(runtime) },
+   ...(runtime.context.primaryNode?.imageCrop
+     ? [
+         {
+@@ -134,9 +135,5 @@ export const imageContextEditActionsFor = (runtime: CanvasActionRuntime): Canvas
+         },
+       ]
+     : []),
+-  { id: 'rotate', label: t('menu.image.rotate90'), icon: RotateCw, onClick: () => rotatePrimaryImage(runtime) },
+-  { id: 'flip-h', label: t('menu.image.flipH'), icon: FlipHorizontal2, onClick: () => flipPrimaryImage(runtime, 'horizontal') },
+-  { id: 'flip-v', label: t('menu.image.flipV'), icon: FlipVertical2, onClick: () => flipPrimaryImage(runtime, 'vertical') },
+-  { id: 'replace-image', label: t('menu.image.replace'), icon: ImageUp, onClick: () => replacePrimaryImage(runtime) },
+   { id: 'copy-as-png', label: t('menu.image.copyAsPng'), icon: Copy, onClick: () => copyPrimaryImageAsPng(runtime) },
+ ]
+diff --git a/src/canvas/actions/markupStyleActions.dispatch.test.ts b/src/canvas/actions/markupStyleActions.dispatch.test.ts
+index ac54bf94..1cd2a219 100644
+--- a/src/canvas/actions/markupStyleActions.dispatch.test.ts
++++ b/src/canvas/actions/markupStyleActions.dispatch.test.ts
+@@ -3,10 +3,12 @@
+  * 拆出:结构守卫非白名单文件 900 行红线)。覆盖 2026-07-30 绘制改版后的线族/形状族
+  * 动作模型:独立起点/终点箭头、线条路由、边框 Solid/Dashed/None + 取色、换形状。
+  * fixtures 与查询辅助按 quickbar 表征同款(mock runtime,断言 store 调用意图)。
++ * §2.5a(2026-08-01 拍板)后样式动作只在快捷条:本文件全部 markup-* 样式分发经
++ * quickToolbarGroupsFor 触发;edit-markup-text 仍属右键菜单,经 contextMenuGroupsFor。
+  */
+ 
+ import { describe, expect, it, vi } from 'vitest'
+-import { contextMenuGroupsFor } from './canvasActionModel'
++import { contextMenuGroupsFor, quickToolbarGroupsFor } from './canvasActionModel'
+ import { createCanvasSelectionContext } from './canvasSelectionModel'
+ import type { CanvasActionGroup, CanvasActionItem, CanvasActionRuntime } from './canvasActionTypes'
+ import type { CanvasNodeType, MarkupKind, MivoCanvasNode } from '../../types/mivoCanvas'
+@@ -73,79 +75,79 @@ describe('markup context-menu style dispatch', () => {
+ 
+   it('markup-start-* → 起点端点六档(枚举 + 布尔同步写入)', () => {
+     const rt = createRuntime(ctx([markupNode('m1', 'arrow')]))
+-    fire(contextMenuGroupsFor(rt), 'markup-start-arrow')
++    fire(quickToolbarGroupsFor(rt), 'markup-start-arrow')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupStartHead: 'arrow', markupStartArrow: true })
+-    fire(contextMenuGroupsFor(rt), 'markup-start-triangle')
++    fire(quickToolbarGroupsFor(rt), 'markup-start-triangle')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupStartHead: 'triangle', markupStartArrow: true })
+-    fire(contextMenuGroupsFor(rt), 'markup-start-none')
++    fire(quickToolbarGroupsFor(rt), 'markup-start-none')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupStartHead: 'none', markupStartArrow: false })
+   })
+ 
+   it('markup-end-* → 终点端点六档(枚举 + 布尔同步写入)', () => {
+     const rt = createRuntime(ctx([markupNode('m1', 'line')]))
+-    fire(contextMenuGroupsFor(rt), 'markup-end-arrow')
++    fire(quickToolbarGroupsFor(rt), 'markup-end-arrow')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupEndHead: 'arrow', markupEndArrow: true })
+-    fire(contextMenuGroupsFor(rt), 'markup-end-circle')
++    fire(quickToolbarGroupsFor(rt), 'markup-end-circle')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupEndHead: 'circle', markupEndArrow: true })
+-    fire(contextMenuGroupsFor(rt), 'markup-end-none')
++    fire(quickToolbarGroupsFor(rt), 'markup-end-none')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupEndHead: 'none', markupEndArrow: false })
+   })
+ 
+   it('markup-route-curved → updateMarkupStyle lineRoute curved', () => {
+     const rt = createRuntime(ctx([markupNode('m1', 'arrow')]))
+-    fire(contextMenuGroupsFor(rt), 'markup-route-curved')
++    fire(quickToolbarGroupsFor(rt), 'markup-route-curved')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupLineRoute: 'curved' })
+   })
+ 
+   it('shape fill colorPicker onSelect → updateMarkupStyle fillColor', () => {
+     const rt = createRuntime(ctx([markupNode('m1', 'rect')]))
+-    const fill = findAction(contextMenuGroupsFor(rt), 'markup-fill-color')
++    const fill = findAction(quickToolbarGroupsFor(rt), 'markup-fill-color')
+     fill?.colorPicker?.onSelect('#4f9cf7')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupFillColor: '#4f9cf7' })
+   })
+ 
+   it('shape border colorPicker onSelect → updateMarkupStyle strokeColor(已有边框时不动线型)', () => {
+     const rt = createRuntime(ctx([markupNode('m1', 'rect')]))
+-    const border = findAction(contextMenuGroupsFor(rt), 'markup-border')
++    const border = findAction(quickToolbarGroupsFor(rt), 'markup-border')
+     border?.colorPicker?.onSelect('#232323')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupStrokeColor: '#232323' })
+   })
+ 
+   it('shape border colorPicker onSelect → 无边框(none)时顺手切回 solid', () => {
+     const rt = createRuntime(ctx([markupNode('m1', 'rect', { markupStrokeStyle: 'none' })]))
+-    const border = findAction(contextMenuGroupsFor(rt), 'markup-border')
++    const border = findAction(quickToolbarGroupsFor(rt), 'markup-border')
+     border?.colorPicker?.onSelect('#232323')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupStrokeColor: '#232323', markupStrokeStyle: 'solid' })
+   })
+ 
+   it('markup-border-dashed / markup-border-none → updateMarkupStyle strokeStyle', () => {
+     const rt = createRuntime(ctx([markupNode('m1', 'rect')]))
+-    fire(contextMenuGroupsFor(rt), 'markup-border-dashed')
++    fire(quickToolbarGroupsFor(rt), 'markup-border-dashed')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupStrokeStyle: 'dashed' })
+-    fire(contextMenuGroupsFor(rt), 'markup-border-none')
++    fire(quickToolbarGroupsFor(rt), 'markup-border-none')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupStrokeStyle: 'none' })
+   })
+ 
+   it('markup-shape-swap 子项 → updateMarkupStyle markupKind(rect → diamond)', () => {
+     const rt = createRuntime(ctx([markupNode('m1', 'rect')]))
+-    fire(contextMenuGroupsFor(rt), 'markup-shape-diamond')
++    fire(quickToolbarGroupsFor(rt), 'markup-shape-diamond')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupKind: 'diamond' })
+   })
+ 
+   it('markup-width-6 → updateMarkupStyle strokeWidth 6(线族)', () => {
+     const rt = createRuntime(ctx([markupNode('m1', 'arrow')]))
+-    fire(contextMenuGroupsFor(rt), 'markup-width-6')
++    fire(quickToolbarGroupsFor(rt), 'markup-width-6')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupStrokeWidth: 6 })
+   })
+ 
+   it('markup-radius-18(rect) → updateMarkupStyle cornerRadius 18', () => {
+     const rt = createRuntime(ctx([markupNode('m1', 'rect')]))
+-    fire(contextMenuGroupsFor(rt), 'markup-radius-18')
++    fire(quickToolbarGroupsFor(rt), 'markup-radius-18')
+     expect(vi.mocked(rt.updateMarkupStyle)).toHaveBeenCalledWith('m1', { markupCornerRadius: 18 })
+   })
+ 
+   it('markup 端点子菜单 selected 状态：默认 arrow → 终点箭头 selected、起点无', () => {
+-    const groups = contextMenuGroupsFor(createRuntime(ctx([markupNode('m1', 'arrow')])))
++    const groups = quickToolbarGroupsFor(createRuntime(ctx([markupNode('m1', 'arrow')])))
+     expect(findAction(groups, 'markup-start-none')?.selected).toBe(true)
+     expect(findAction(groups, 'markup-start-arrow')?.selected).toBe(false)
+     expect(findAction(groups, 'markup-end-none')?.selected).toBe(false)
+@@ -153,7 +155,7 @@ describe('markup context-menu style dispatch', () => {
+   })
+ 
+   it('markup line → 默认无箭头（markupEndArrow ?? kind===arrow 不命中 line → hasEndArrow=false）；默认路由 straight', () => {
+-    const groups = contextMenuGroupsFor(createRuntime(ctx([markupNode('m1', 'line')])))
++    const groups = quickToolbarGroupsFor(createRuntime(ctx([markupNode('m1', 'line')])))
+     expect(findAction(groups, 'markup-end-none')?.selected).toBe(true)
+     expect(findAction(groups, 'markup-end-arrow')?.selected).toBe(false)
+     expect(findAction(groups, 'markup-route-straight')?.selected).toBe(true)
+@@ -161,14 +163,14 @@ describe('markup context-menu style dispatch', () => {
+   })
+ 
+   it('markup stroke width 默认(undefined) → Medium selected（!==2 && !==6）', () => {
+-    const groups = contextMenuGroupsFor(createRuntime(ctx([markupNode('m1', 'arrow')])))
++    const groups = quickToolbarGroupsFor(createRuntime(ctx([markupNode('m1', 'arrow')])))
+     expect(findAction(groups, 'markup-width-3')?.selected).toBe(true)
+     expect(findAction(groups, 'markup-width-2')?.selected).toBe(false)
+     expect(findAction(groups, 'markup-width-6')?.selected).toBe(false)
+   })
+ 
+   it('markup stroke width=2 → Thin selected', () => {
+-    const groups = contextMenuGroupsFor(createRuntime(ctx([markupNode('m1', 'arrow', { markupStrokeWidth: 2 })])))
++    const groups = quickToolbarGroupsFor(createRuntime(ctx([markupNode('m1', 'arrow', { markupStrokeWidth: 2 })])))
+     expect(findAction(groups, 'markup-width-2')?.selected).toBe(true)
+     expect(findAction(groups, 'markup-width-3')?.selected).toBe(false)
+   })
+diff --git a/src/canvas/actions/markupStyleActions.test.ts b/src/canvas/actions/markupStyleActions.test.ts
+index a74c9150..8e2e927a 100644
+--- a/src/canvas/actions/markupStyleActions.test.ts
++++ b/src/canvas/actions/markupStyleActions.test.ts
+@@ -57,11 +57,13 @@ describe('brushStyleActionsFor — 画笔编辑栏只有颜色 + 粗细', () =>
+     ])
+   })
+ 
+-  it('右键菜单同样无填充/线型/箭头/圆角', () => {
++  it('右键菜单不再携带任何样式项(§2.5a:样式唯一入口是快捷条),只留 Edit text', () => {
+     const groups = contextMenuGroupsFor(runtimeFor(brushNode('b1')))
+-    expect(findAction(groups, 'markup-brush-color')).toBeDefined()
+-    expect(findAction(groups, 'markup-brush-width')).toBeDefined()
+-    for (const id of ['markup-fill-color', 'markup-line-style', 'markup-arrowheads', 'markup-corner-radius']) {
++    expect(findAction(groups, 'edit-markup-text')).toBeDefined()
++    for (const id of [
++      'markup-brush-color', 'markup-brush-width',
++      'markup-fill-color', 'markup-line-style', 'markup-arrowheads', 'markup-corner-radius',
++    ]) {
+       expect(findAction(groups, id)).toBeUndefined()
+     }
+   })
+diff --git a/src/canvas/actions/markupStyleActions.ts b/src/canvas/actions/markupStyleActions.ts
+index b8e1779f..23a5b9ea 100644
+--- a/src/canvas/actions/markupStyleActions.ts
++++ b/src/canvas/actions/markupStyleActions.ts
+@@ -372,14 +372,13 @@ const editMarkupTextActionFor = (runtime: CanvasActionRuntime): CanvasActionItem
+   onClick: () => runtime.onEditText?.(runtime.context.primaryNode?.id || ''),
+ })
+ 
+-/** markup 右键菜单装配(canvasActionModel 的 contextMenuExtensionsByNodeType 消费)。 */
++/** markup 右键菜单装配(canvasActionModel 的 contextMenuExtensionsByNodeType 消费)。
++ *  §2.5a(2026-08-01 拍板):样式项全部退场,快捷条是样式唯一入口;右键只留
++ *  Edit text(命令式)。贴纸(stamp)无扩展。 */
+ export const markupContextMenuGroupsFor = (runtime: CanvasActionRuntime): CanvasActionGroup[] => {
+   if (runtime.context.primaryNode?.markupKind === 'stamp') return []
+ 
+-  return [
+-    { id: 'markup-text', actions: [editMarkupTextActionFor(runtime)] },
+-    { id: 'markup-style', actions: markupStyleActionsFor(runtime) },
+-  ]
++  return [{ id: 'markup-text', actions: [editMarkupTextActionFor(runtime)] }]
+ }
+ 
+ /**
+diff --git a/src/canvas/canvasInteraction.test.ts b/src/canvas/canvasInteraction.test.ts
+index b71eb47c..bfa015bf 100644
+--- a/src/canvas/canvasInteraction.test.ts
++++ b/src/canvas/canvasInteraction.test.ts
+@@ -11,6 +11,7 @@ import {
+   runtimeToolFor,
+   shouldStartCanvasSurfaceInteraction,
+   isCanvasUiTarget,
++  isDragInterruptedContextMenu,
+   handleLockShortcut,
+   resolveLockShortcut,
+   nativeContextMenuAllowed,
+@@ -349,3 +350,18 @@ describe('handleLockShortcut(⇧⌘L 接线:preventDefault + dispatch 目标)',
+     expect(dispatch.setSectionLockMode).not.toHaveBeenCalled()
+   })
+ })
++
++// R3 后半「拖拽中右键」判定(阶段 3 对抗审查第 1 条回归):Ctrl+单击必须放行。
++describe('isDragInterruptedContextMenu(拖拽中右键判定)', () => {
++  it('macOS Ctrl+单击(button 0, buttons 1)→ 放行(不是拖拽)', () => {
++    expect(isDragInterruptedContextMenu({ button: 0, buttons: 1 })).toBe(false)
++  })
++
++  it('普通右键(button 2, buttons 2)→ 放行', () => {
++    expect(isDragInterruptedContextMenu({ button: 2, buttons: 2 })).toBe(false)
++  })
++
++  it('左键拖拽中按右键(button 2, buttons 3)→ 吞掉', () => {
++    expect(isDragInterruptedContextMenu({ button: 2, buttons: 3 })).toBe(true)
++  })
++})
+diff --git a/src/canvas/canvasInteraction.ts b/src/canvas/canvasInteraction.ts
+index fff90afd..b477cb87 100644
+--- a/src/canvas/canvasInteraction.ts
++++ b/src/canvas/canvasInteraction.ts
+@@ -208,6 +208,13 @@ export const frameTitleNodeIdFromTarget = (target: EventTarget | null): string |
+   return nodeIdFromDomTarget(target)
+ }
+ 
++// R3 后半:「拖拽中右键」判定(纯函数)。只有本次 contextmenu 由副键(button===2)
++// 触发且主键仍按住(buttons&1,框选/节点拖拽进行中)才吞掉。不能只看 buttons&1:
++// macOS 标准 Ctrl+单击的 contextmenu 是 {button:0, buttons:1},会被误判为拖拽中
++// 而废掉整张画布的 Ctrl-click 右键(阶段 3 对抗审查第 1 条)。
++export const isDragInterruptedContextMenu = (event: Pick<MouseEvent, 'button' | 'buttons'>) =>
++  event.button === 2 && (event.buttons & 1) === 1
++
+ // R19/⇧⌘L 锁定快捷键的分发决策(纯函数,单测覆盖)。与右键菜单语义对齐:
+ // - 无选区 → ignore,连 preventDefault 都不做(把 Cmd+Shift+L 留给浏览器/系统);
+ // - 单选 Section → 显式走 canonical 的 setSectionLockMode,钉死 Lock all ↔ 解锁
+diff --git a/src/i18n/__tests__/i18nCompleteness.test.ts b/src/i18n/__tests__/i18nCompleteness.test.ts
+index eec77414..d04f2b48 100644
+--- a/src/i18n/__tests__/i18nCompleteness.test.ts
++++ b/src/i18n/__tests__/i18nCompleteness.test.ts
+@@ -59,7 +59,7 @@ const isNonEmptyString = (value: unknown): boolean =>
+ 
+ const keyExists = (catalog: unknown, key: string): boolean => {
+   if (isNonEmptyString(lookup(catalog, key))) return true
+-  // 复数家族:t('menu.create.paste', {count}) 对应 paste_one/_other 词条
++  // 复数家族:如 t('toast.paste.done', {count}) 这类带 count 的键对应 *_one/_other 词条
+   return PLURAL_SUFFIXES.some((suffix) => isNonEmptyString(lookup(catalog, `${key}_${suffix}`)))
+ }
+ 
+diff --git a/src/i18n/locales/en/menu.json b/src/i18n/locales/en/menu.json
+index e986181d..37af03b1 100644
+--- a/src/i18n/locales/en/menu.json
++++ b/src/i18n/locales/en/menu.json
+@@ -1,13 +1,9 @@
+ {
+   "create": {
+-    "paste_one": "Paste {{count}} item",
+-    "paste_other": "Paste {{count}} items",
++    "pasteHere": "Paste here",
+     "newText": "New text here",
+     "newSection": "New section here",
+-    "newAiSlot": "New AI image slot here",
+-    "newArrowMarkup": "New arrow markup",
+-    "newRectMarkup": "New rectangle markup",
+-    "newNoteMarkup": "New markup note"
++    "newAiSlot": "New AI image slot here"
+   },
+   "canvas": {
+     "fitAll": "Fit all objects",
+diff --git a/src/i18n/locales/en/toast.json b/src/i18n/locales/en/toast.json
+index db75bf9d..577d0f90 100644
+--- a/src/i18n/locales/en/toast.json
++++ b/src/i18n/locales/en/toast.json
+@@ -146,5 +146,8 @@
+   },
+   "export": {
+     "downloadUnsupported": "This object type can't be downloaded yet."
++  },
++  "paste": {
++    "done": "Pasted {{count}} object(s)."
+   }
+ }
+diff --git a/src/i18n/locales/ja/menu.json b/src/i18n/locales/ja/menu.json
+index 1835e119..3b1f5d65 100644
+--- a/src/i18n/locales/ja/menu.json
++++ b/src/i18n/locales/ja/menu.json
+@@ -1,12 +1,9 @@
+ {
+   "create": {
+-    "paste_other": "{{count}}項目を貼り付け",
++    "pasteHere": "ここに貼り付け",
+     "newText": "ここにテキストを追加",
+     "newSection": "ここにセクションを追加",
+-    "newAiSlot": "ここにAI画像スロットを追加",
+-    "newArrowMarkup": "矢印注釈を追加",
+-    "newRectMarkup": "長方形注釈を追加",
+-    "newNoteMarkup": "注釈メモを追加"
++    "newAiSlot": "ここにAI画像スロットを追加"
+   },
+   "canvas": {
+     "fitAll": "すべてのオブジェクトを表示",
+diff --git a/src/i18n/locales/ja/toast.json b/src/i18n/locales/ja/toast.json
+index 99c512ca..acd553d4 100644
+--- a/src/i18n/locales/ja/toast.json
++++ b/src/i18n/locales/ja/toast.json
+@@ -142,5 +142,8 @@
+   },
+   "export": {
+     "downloadUnsupported": "このオブジェクトタイプはまだダウンロードできません。"
++  },
++  "paste": {
++    "done": "{{count}} 個のオブジェクトを貼り付けました。"
+   }
+ }
+diff --git a/src/i18n/locales/ko/menu.json b/src/i18n/locales/ko/menu.json
+index fd71f8ab..4a842377 100644
+--- a/src/i18n/locales/ko/menu.json
++++ b/src/i18n/locales/ko/menu.json
+@@ -1,12 +1,9 @@
+ {
+   "create": {
+-    "paste_other": "{{count}}개 항목 붙여넣기",
++    "pasteHere": "여기에 붙여넣기",
+     "newText": "여기에 텍스트 추가",
+     "newSection": "여기에 섹션 추가",
+-    "newAiSlot": "여기에 AI 이미지 슬롯 추가",
+-    "newArrowMarkup": "화살표 주석 추가",
+-    "newRectMarkup": "사각형 주석 추가",
+-    "newNoteMarkup": "주석 메모 추가"
++    "newAiSlot": "여기에 AI 이미지 슬롯 추가"
+   },
+   "canvas": {
+     "fitAll": "모든 개체 보기",
+diff --git a/src/i18n/locales/ko/toast.json b/src/i18n/locales/ko/toast.json
+index 5a2eb9a8..2113d31e 100644
+--- a/src/i18n/locales/ko/toast.json
++++ b/src/i18n/locales/ko/toast.json
+@@ -142,5 +142,8 @@
+   },
+   "export": {
+     "downloadUnsupported": "이 개체 유형은 아직 다운로드할 수 없습니다."
++  },
++  "paste": {
++    "done": "개체 {{count}}개를 붙여넣었습니다."
+   }
+ }
+diff --git a/src/i18n/locales/zh-CN/menu.json b/src/i18n/locales/zh-CN/menu.json
+index d383d27f..6d276256 100644
+--- a/src/i18n/locales/zh-CN/menu.json
++++ b/src/i18n/locales/zh-CN/menu.json
+@@ -1,12 +1,9 @@
+ {
+   "create": {
+-    "paste_other": "粘贴 {{count}} 项",
++    "pasteHere": "粘贴到此处",
+     "newText": "在此新建文本",
+     "newSection": "在此新建分区",
+-    "newAiSlot": "在此新建 AI 图片占位",
+-    "newArrowMarkup": "新建箭头标注",
+-    "newRectMarkup": "新建矩形标注",
+-    "newNoteMarkup": "新建标注便签"
++    "newAiSlot": "在此新建 AI 图片占位"
+   },
+   "canvas": {
+     "fitAll": "适应全部对象",
+diff --git a/src/i18n/locales/zh-CN/toast.json b/src/i18n/locales/zh-CN/toast.json
+index 7f784970..0c3712f2 100644
+--- a/src/i18n/locales/zh-CN/toast.json
++++ b/src/i18n/locales/zh-CN/toast.json
+@@ -142,5 +142,8 @@
+   },
+   "export": {
+     "downloadUnsupported": "该对象类型暂不支持下载。"
++  },
++  "paste": {
++    "done": "已粘贴 {{count}} 个对象。"
+   }
+ }

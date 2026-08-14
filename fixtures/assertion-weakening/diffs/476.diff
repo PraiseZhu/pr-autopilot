@@ -1,0 +1,815 @@
+diff --git a/scripts/loops/bug-doctor/rules.json b/scripts/loops/bug-doctor/rules.json
+index 3a283de4..554e5f75 100644
+--- a/scripts/loops/bug-doctor/rules.json
++++ b/scripts/loops/bug-doctor/rules.json
+@@ -106,6 +106,33 @@
+       "minAbsoluteMalformed": 5
+     }
+   },
++  "sentryIntake": {
++    "$comment": "批次2:Trae(MivoSentry 夜巡)findings 第三料源。findingsDir 支持 ~ 展开;routes 按 dim 分拣到三种互斥终点(t1-candidate/manual-ticket/summary-only),未知 dim fail-closed 到 summary-only。changeTypeByDim 的值必须命中 t1.changeTypeWhitelist。",
++    "findingsDir": "~/mivo-ops/mivo-sentry/state",
++    "missingDegradedDays": 3,
++    "maxPerDay": 2,
++    "routes": {
++      "log-violation": "t1-candidate",
++      "dead-code": "t1-candidate",
++      "todo-stale": "t1-candidate",
++      "deps-vuln": "manual-ticket",
++      "secret-pattern": "manual-ticket",
++      "type-escape": "summary-only",
++      "test-health": "summary-only",
++      "debt-metric": "summary-only",
++      "circular-dep": "summary-only"
++    },
++    "changeTypeByDim": {
++      "log-violation": "补 debugLogger 调用",
++      "dead-code": "死代码/纯清理 effect",
++      "todo-stale": "纯文案样式"
++    },
++    "limits": {
++      "maxFileBytes": 10485760,
++      "maxItems": 5000,
++      "maxStringLength": 2000
++    }
++  },
+   "loop": {
+     "lockTtlMinutes": 60,
+     "idleHeartbeatHours": 6,
+diff --git a/scripts/loops/bug-doctor/sentry-intake.mjs b/scripts/loops/bug-doctor/sentry-intake.mjs
+new file mode 100644
+index 00000000..2672080f
+--- /dev/null
++++ b/scripts/loops/bug-doctor/sentry-intake.mjs
+@@ -0,0 +1,626 @@
++#!/usr/bin/env node
++// sentry-intake.mjs — Mivo(原 bug-doctor)第三料源:消化 Trae(MivoSentry 夜巡)本地 findings JSON
++// (批次2,确定性脚本,零 LLM)。
++//
++// findings 路径解析:env MIVO_SENTRY_FINDINGS_DIR > rules.json sentryIntake.findingsDir
++// (支持 ~ 展开)。日期按 Asia/Shanghai 计算,**默认消费昨日文件**(TRAE 夜巡
++// 03:30 才产出当天文件,主轮 02:30 取当天必然扑空——见 shanghaiYesterdayString
++// 注释;测试/回填可注入 --date / now 覆盖)。
++// 文件形态:<findingsDir>/findings-<date>.json,数组,每项 {severity,dim,file,line,
++// category,evidence,verify,fingerprint}。
++//
++// 消费入口二选一:
++//   ① 主轮经 `gate --include-sentry` 在同一 gate lock 内调用本文件导出的
++//      consumeSentryFindings(纯状态变换 + 只读文件,不碰锁)。
++//   ② 独立 CLI 调用自行取锁(与 gate 共用同一把锁,state.mjs 既有实现)。
++//
++// 用法:
++//   node scripts/loops/bug-doctor/sentry-intake.mjs consume [--date YYYY-MM-DD]
++//        [--state-dir DIR] [--findings-dir DIR] [--now ISO]
++//   node scripts/loops/bug-doctor/sentry-intake.mjs mark-fixed --fp <fp> --pr <n>
++//        [--state-dir DIR] [--now ISO] [--pr-view-json <path>](测试注入 gh 结果,跳过真实 gh 调用)
++//
++// 退出码:0=业务结果(含 degraded/missing,这些是正常业务状态非脚本故障);1=脚本失败;2=用法错误。
++
++import { existsSync, readFileSync, statSync } from 'node:fs'
++import { execFileSync } from 'node:child_process'
++import { homedir } from 'node:os'
++import { join, resolve, dirname, isAbsolute } from 'node:path'
++import { createHash } from 'node:crypto'
++import { fileURLToPath } from 'node:url'
++
++import { acquireLock, appendLog, loadState, releaseLock, saveState } from './state.mjs'
++import { FINGERPRINT_VERSION } from './fingerprint.mjs'
++import { applyRecurrence } from './recurrence.mjs'
++
++const __dirname = dirname(fileURLToPath(import.meta.url))
++const REPO_ROOT = resolve(__dirname, '..', '..', '..')
++const RULES_PATH = join(__dirname, 'rules.json')
++
++export const SENTRY_ORIGIN = 'trae-audit'
++export const SEVERITY_TO_S = { P0: 'S0', P1: 'S1', P2: 'S2', P3: 'S3' }
++const SEVERITY_SET = new Set(Object.keys(SEVERITY_TO_S))
++// dim 只做形状校验,不做枚举白名单(P2A-01 审查修正):枚举校验会让未知 dim 在
++// 进入 classifyRoute 之前就被判 invalid/skipped,使「未知 dim fail-closed 到
++// summary-only(带 __unknownDims 计数)」这条声称在生产入口构造上不可达——
++// Trae 侧未来新增维度会静默消失,而不是可见地落进 summary 台账。已知维度的
++// 路由归属由 rules.json sentryIntake.routes 承载(那才是唯一枚举点)。
++const DIM_SHAPE_RE = /^[a-z][a-z0-9-]{0,63}$/
++const FP_HEX_RE = /^[0-9a-f]{16}$/
++// 相对路径合法性:拒绝绝对路径、`..` 上跳、反斜杠(Windows 分隔符/转义歧义)
++const UNSAFE_PATH_RE = /(^\/|\\|(^|\/)\.\.($|\/))/
++const REQUIRED_FIELDS = ['severity', 'dim', 'file', 'line', 'category', 'evidence', 'verify', 'fingerprint']
++// 该 dim 的 evidence/verify 属敏感规则命中,不落原文(state/log/workpacket 一律脱敏)
++const REDACT_TEXT_DIMS = new Set(['secret-pattern'])
++
++const log = (msg) => process.stderr.write(`[mivo:sentry-intake] ${msg}\n`)
++
++const parseArgs = (argv) => {
++  const out = { _: [] }
++  for (let i = 0; i < argv.length; i += 1) {
++    const a = argv[i]
++    if (a.startsWith('--')) {
++      const eq = a.indexOf('=')
++      if (eq !== -1) {
++        out[a.slice(2, eq)] = a.slice(eq + 1)
++      } else {
++        const next = argv[i + 1]
++        if (next === undefined || next.startsWith('--')) {
++          out[a.slice(2)] = true
++        } else {
++          out[a.slice(2)] = next
++          i += 1
++        }
++      }
++    } else {
++      out._.push(a)
++    }
++  }
++  return out
++}
++
++const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p)
++
++export const loadSentryRules = () => {
++  const rules = JSON.parse(readFileSync(RULES_PATH, 'utf8'))
++  return rules.sentryIntake || {}
++}
++
++/** findings 目录解析:env > rules.json,支持 ~ 展开。两者皆缺 → 抛错(fail-closed,不猜路径)。 */
++export const resolveFindingsDir = ({ sentryRules } = {}) => {
++  const fromEnv = process.env.MIVO_SENTRY_FINDINGS_DIR
++  const fromRules = (sentryRules || loadSentryRules()).findingsDir
++  const raw = (fromEnv && fromEnv.trim()) || fromRules
++  if (!raw) throw new Error('未配置 Sentry findings 目录:设 MIVO_SENTRY_FINDINGS_DIR 环境变量,或写 rules.json sentryIntake.findingsDir')
++  return expandHome(raw)
++}
++
++/** 给定 ISO 时刻,按 Asia/Shanghai(UTC+8,无夏令时)计算日期字符串 YYYY-MM-DD。纯函数,零依赖时区库。 */
++export const shanghaiDateString = (nowIso) => {
++  const ms = Date.parse(nowIso)
++  const shanghai = new Date(ms + 8 * 3600_000)
++  const y = shanghai.getUTCFullYear()
++  const m = String(shanghai.getUTCMonth() + 1).padStart(2, '0')
++  const d = String(shanghai.getUTCDate()).padStart(2, '0')
++  return `${y}-${m}-${d}`
++}
++
++/**
++ * 消费默认取"上海昨日"(P4-01 审查修正,blocker):TRAE 夜巡 03:30 才产出**当天**
++ * 的 findings 文件(见 MivoSentry docs/deploy/trae-nightly-task.md),而主轮 02:30
++ * 运行——若默认取当天,当天文件在主轮时刻必然还不存在,次日主轮又只看次日,
++ * 每天的产物会**永久漏消费**。取昨日 = 永远消费最近一份完整产物,滞后约一天,
++ * 对代码审计类 findings 可接受;需要回填/重放时用 --sentry-date / --date 显式指定。
++ */
++export const shanghaiYesterdayString = (nowIso) => shanghaiDateString(new Date(Date.parse(nowIso) - 24 * 3600_000).toISOString())
++
++export const findingsFilePath = (findingsDir, dateStr) => join(findingsDir, `findings-${dateStr}.json`)
++
++// ---- SC-B2-5:输入安全(尺寸/条目数/字段长度超限 → 视同整文件坏,记 degraded;不是单项跳过) ----
++
++const DEFAULT_LIMITS = { maxFileBytes: 10 * 1024 * 1024, maxItems: 5000, maxStringLength: 2000 }
++
++const stringFieldsOf = (item) => [item.severity, item.dim, item.file, item.category, item.evidence, item.verify, item.fingerprint]
++
++/**
++ * 读取 + 校验单个 date 的 findings 文件。返回:
++ *   { kind: 'missing' }                          — 文件不存在
++ *   { kind: 'degraded', reason }                  — 尺寸/条目数/字段长超限,或整文件 JSON 不可解析
++ *   { kind: 'ok', items, skipped }                — 可用(items 为已过基础尺寸门槛的原始数组;
++ *                                                    单项 schema 校验在 applyFindingsForDate 里做)
++ */
++export const readFindingsFile = (findingsDir, dateStr, { limits } = {}) => {
++  const path = findingsFilePath(findingsDir, dateStr)
++  if (!existsSync(path)) return { kind: 'missing' }
++  const lim = { ...DEFAULT_LIMITS, ...(limits || {}) }
++  let size
++  try {
++    size = statSync(path).size
++  } catch {
++    return { kind: 'missing' }
++  }
++  if (size > lim.maxFileBytes) return { kind: 'degraded', reason: `file-too-large:${size}>${lim.maxFileBytes}` }
++  let raw
++  try {
++    raw = readFileSync(path, 'utf8')
++  } catch (err) {
++    return { kind: 'degraded', reason: `read-failed:${err.message}` }
++  }
++  let parsed
++  try {
++    parsed = JSON.parse(raw)
++  } catch (err) {
++    return { kind: 'degraded', reason: `malformed-json:${err.message}` }
++  }
++  if (!Array.isArray(parsed)) return { kind: 'degraded', reason: 'not-an-array' }
++  if (parsed.length > lim.maxItems) return { kind: 'degraded', reason: `too-many-items:${parsed.length}>${lim.maxItems}` }
++  for (const item of parsed) {
++    for (const field of stringFieldsOf(item || {})) {
++      if (typeof field === 'string' && field.length > lim.maxStringLength) {
++        return { kind: 'degraded', reason: `field-too-long:>${lim.maxStringLength}` }
++      }
++    }
++  }
++  return { kind: 'ok', items: parsed }
++}
++
++/** 单项 schema 校验(SC-B2-5):严格校验枚举/指纹/路径合法性。不合规 → 跳过(不degrade整文件)。 */
++export const validateFinding = (item) => {
++  if (!item || typeof item !== 'object') return { ok: false, reason: 'not-an-object' }
++  for (const f of REQUIRED_FIELDS) {
++    if (item[f] === undefined || item[f] === null) return { ok: false, reason: `missing-field:${f}` }
++  }
++  if (!SEVERITY_SET.has(item.severity)) return { ok: false, reason: `bad-severity:${item.severity}` }
++  if (typeof item.dim !== 'string' || !DIM_SHAPE_RE.test(item.dim)) return { ok: false, reason: `bad-dim:${item.dim}` }
++  if (!Number.isInteger(item.line) || item.line < 0) return { ok: false, reason: `bad-line:${item.line}` }
++  if (typeof item.fingerprint !== 'string' || !FP_HEX_RE.test(item.fingerprint)) return { ok: false, reason: `bad-fingerprint:${item.fingerprint}` }
++  if (typeof item.file !== 'string' || !item.file || isAbsolute(item.file) || UNSAFE_PATH_RE.test(item.file)) {
++    return { ok: false, reason: `bad-path:${item.file}` }
++  }
++  if (typeof item.category !== 'string' || typeof item.evidence !== 'string' || typeof item.verify !== 'string') {
++    return { ok: false, reason: 'bad-text-field' }
++  }
++  return { ok: true }
++}
++
++// ---- SC-B2-2:分拣路由(三终点互斥,unknown dim fail-closed 到 summary-only) ----
++
++export const classifyRoute = (dim, sentryRules) => {
++  const route = sentryRules?.routes?.[dim]
++  if (route === 't1-candidate' || route === 'manual-ticket' || route === 'summary-only') return { route }
++  return { route: 'summary-only', reason: `unknown-dim:${dim}` }
++}
++
++// ---- SC-B2-3:T1 确定性预筛(仅 t1-candidate 路由的合格候选才可能被接纳为自动修候选) ----
++
++/** 结构性预筛:changeType 是否命中 t1.changeTypeWhitelist,file 是否落在 t1.forbiddenPaths。 */
++export const screenT1Candidate = (item, { sentryRules, t1Rules }) => {
++  const changeType = sentryRules?.changeTypeByDim?.[item.dim]
++  if (!changeType || !(t1Rules?.changeTypeWhitelist || []).includes(changeType)) {
++    return { ok: false, reason: `changeType-not-whitelisted:${changeType ?? 'none'}`, changeType: changeType ?? null }
++  }
++  const forbidden = t1Rules?.forbiddenPaths || []
++  if (forbidden.some((p) => item.file === p || item.file.startsWith(p))) {
++    return { ok: false, reason: `forbidden-path:${item.file}`, changeType }
++  }
++  return { ok: true, changeType }
++}
++
++// finding.severity 是 Sentry 侧 P 编号(P0..P3),与内部 sLevel(S0..S3)是两套并存命名——
++// 此处按 severity 原始字段排序,不要跟 S_TO_P/SEVERITY_TO_S 的映射方向搞混。
++const SEVERITY_RANK = { P0: 0, P1: 1, P2: 2, P3: 3 }
++
++// ---- 幂等 + 内容摘要 ----
++
++const contentDigestOf = (item) =>
++  createHash('sha256')
++    .update(JSON.stringify({ severity: item.severity, dim: item.dim, file: item.file, line: item.line, category: item.category }))
++    .digest('hex')
++    .slice(0, 16)
++
++const fileDigestOf = (raw) => createHash('sha256').update(raw).digest('hex')
++
++const actionIdOf = (item) => createHash('sha256').update(`${item.dim}|${item.file}|${item.fingerprint}`).digest('hex').slice(0, 12)
++
++// ---- 簇 upsert(仅 t1-candidate 路由;origin=trae-audit,severity 直接映射 sLevel) ----
++
++const upsertTraeCluster = (state, item, { dateStr, changeType, t1Accepted }) => {
++  const fp = item.fingerprint
++  let cluster = state.clusters[fp]
++  const pseudoReceivedAt = `${dateStr}T00:00:00.000Z`
++  const isNew = !cluster
++  if (!cluster) {
++    cluster = {
++      source: 'Trae audit',
++      pattern: `${item.dim}::${item.category}`,
++      sLevel: SEVERITY_TO_S[item.severity],
++      tCap: t1Accepted ? 'T1' : 'T2',
++      count: 0,
++      clients: [],
++      firstSeen: pseudoReceivedAt,
++      lastSeen: pseudoReceivedAt,
++      appVersions: [],
++      status: 'new',
++      attempts: 0,
++      issue: null,
++      pr: null,
++      levels: ['error'],
++      serverFault: false,
++      silentFailure: false,
++      recent: [],
++      samples: [],
++      origin: SENTRY_ORIGIN,
++      dim: item.dim,
++      file: item.file,
++      line: item.line,
++      changeType: changeType ?? null,
++    }
++    state.clusters[fp] = cluster
++  } else {
++    // SC1 复发判定走共享模块 recurrence.mjs(全仓唯一定义点,fail-closed,
++    // SC-BD1-R1a)。禁止在此手写判定——本文件初版正是在这里手抄了 gate.mjs
++    // 修复前的 fail-open 旧版(结算时间戳缺失时也无条件重开),同一决策两份
++    // 实现修一漏一。
++    applyRecurrence(cluster, pseudoReceivedAt)
++    cluster.sLevel = SEVERITY_TO_S[item.severity]
++    cluster.tCap = t1Accepted ? 'T1' : 'T2'
++    cluster.changeType = changeType ?? cluster.changeType ?? null
++  }
++  cluster.count += 1
++  if (pseudoReceivedAt > cluster.lastSeen) cluster.lastSeen = pseudoReceivedAt
++  cluster.recent.push({ t: pseudoReceivedAt, c: `trae:${dateStr}`, level: 'error' })
++  return isNew
++}
++
++// ---- 主处理:单个日期的完整 findings 列表 → state 变换(纯函数式,不做 IO) ----
++
++/**
++ * @returns {{newFindings:number, newClusters:number, skipped:number, deduped:number}}
++ */
++export const applyFindingsForDate = (state, { dateStr, items, rules, sentryRules }) => {
++  const si = (state.sentryIntake ||= { consumedDates: {}, missingStreak: 0, lastMissingDate: null, degraded: false, decisions: {}, summary: {}, manualTickets: {} })
++  const t1Rules = rules.t1
++  const maxPerDay = sentryRules.maxPerDay ?? 2
++
++  // P2A-02(审查修正)finding 级消费台账:同一日期的文件被追加/改写后重新消费时,
++  // 只处理**新出现**的条目——此前只有整文件 digest 完全相同才短路,digest 一变就
++  // 重放全部旧条目,summary 计数与 cluster.count 会随每次追加翻倍累计。
++  // 身份键 = fingerprint + 内容摘要:同 fp 但内容变了(如 severity 升级)算新条目,
++  // 允许重新过路由/预筛;逐字节相同的条目跨次运行只消费一次。
++  const dateEntry = (si.consumedDates[dateStr] ||= {})
++  const seenKeys = new Set(dateEntry.itemKeys || [])
++
++  let newClusters = 0
++  let skipped = 0
++  let deduped = 0
++  const valid = []
++  for (const raw of items) {
++    const v = validateFinding(raw)
++    if (!v.ok) {
++      skipped += 1
++      continue
++    }
++    const key = `${raw.fingerprint}|${contentDigestOf(raw)}`
++    if (seenKeys.has(key)) {
++      deduped += 1
++      continue
++    }
++    seenKeys.add(key)
++    valid.push(raw)
++  }
++  dateEntry.itemKeys = [...seenKeys].sort()
++
++  // 按 route 分组
++  const t1Items = []
++  for (const item of valid) {
++    const { route, reason } = classifyRoute(item.dim, sentryRules)
++    if (route === 't1-candidate') {
++      t1Items.push(item)
++    } else if (route === 'manual-ticket') {
++      applyManualTicket(si, item, dateStr)
++    } else {
++      applySummaryOnly(si, item, reason)
++    }
++  }
++
++  // T1 预筛:结构性合格 → 候选;候选按 severity→fingerprint 排序,只接纳前 maxPerDay 个
++  const screened = t1Items.map((item) => ({ item, screen: screenT1Candidate(item, { sentryRules, t1Rules }) }))
++  const structurallyOk = screened.filter((s) => s.screen.ok)
++  structurallyOk.sort((a, b) => {
++    const ra = SEVERITY_RANK[a.item.severity] ?? 9
++    const rb = SEVERITY_RANK[b.item.severity] ?? 9
++    if (ra !== rb) return ra - rb
++    return a.item.fingerprint < b.item.fingerprint ? -1 : 1
++  })
++
++  // 日上限跨运行累计(P2A-02 连带修正)+ 接纳粘滞(DELTA-P2A-01 审查修正):
++  // 同日增量消费时,本次预算 = maxPerDay − 该日已接纳的 fp 数。**已接纳的 fp
++  // 是粘滞的**:同 fp 的内容更新(如 severity 升级,itemKeys 视为新条目放行进来)
++  // 只更新簇,不重新占用配额、不参与排位、更不允许被覆写成 rejected——否则
++  // 覆写会释放已实际消费的额度(历史接纳数突破 maxPerDay),且把已接纳簇从
++  // T1 降成 T2。
++  const stickyAcceptedFps = new Set(
++    Object.entries(si.decisions)
++      .filter(([k, d]) => k.startsWith(`${dateStr}|`) && d.result === 'accepted')
++      .map(([k]) => k.slice(dateStr.length + 1)),
++  )
++  const budget = Math.max(0, maxPerDay - stickyAcceptedFps.size)
++
++  const accepted = []
++  const rejected = []
++  const stickyUpdates = []
++  const freshOk = []
++  for (const s of structurallyOk) {
++    if (stickyAcceptedFps.has(s.item.fingerprint)) stickyUpdates.push(s)
++    else freshOk.push(s)
++  }
++  freshOk.forEach((s, idx) => {
++    if (idx < budget) accepted.push(s)
++    else rejected.push({ fp: s.item.fingerprint, reason: 'daily-cap' })
++  })
++  for (const s of screened) {
++    if (s.screen.ok) continue
++    // 粘滞保护同样适用于预筛失败:已接纳 fp 的内容更新即使此刻预筛不过
++    // (如 file 字段变到 forbidden path),也不把当日决策覆写成 rejected——
++    // 配额已实际消费,降级/回收只会造出 DELTA-P2A-01 的额度释放洞;该更新
++    // 走 stickyUpdates 正常并入簇,T1 的执行期禁区检查(rules t1 段)仍在
++    // 下游生效,不依赖这里的当日决策位。
++    if (stickyAcceptedFps.has(s.item.fingerprint)) stickyUpdates.push(s)
++    else rejected.push({ fp: s.item.fingerprint, reason: s.screen.reason })
++  }
++
++  for (const { item, screen } of stickyUpdates) {
++    const decisionKey = `${dateStr}|${item.fingerprint}`
++    const prior = si.decisions[decisionKey]
++    upsertTraeCluster(state, item, { dateStr, changeType: screen.ok ? screen.changeType : (prior?.changeType ?? null), t1Accepted: true })
++    if (screen.ok && prior) prior.changeType = screen.changeType
++  }
++
++  for (const { item, screen } of accepted) {
++    const decisionKey = `${dateStr}|${item.fingerprint}`
++    const isNew = upsertTraeCluster(state, item, { dateStr, changeType: screen.changeType, t1Accepted: true })
++    if (isNew) newClusters += 1
++    si.decisions[decisionKey] = { route: 't1-candidate', changeType: screen.changeType, path: item.file, result: 'accepted', reason: null }
++  }
++  for (const { fp, reason } of rejected) {
++    const item = t1Items.find((i) => i.fingerprint === fp)
++    const decisionKey = `${dateStr}|${fp}`
++    if (item) {
++      const isNew = upsertTraeCluster(state, item, { dateStr, changeType: null, t1Accepted: false })
++      if (isNew) newClusters += 1
++    }
++    si.decisions[decisionKey] = { route: 't1-candidate', changeType: null, path: item?.file ?? null, result: 'rejected', reason }
++  }
++
++  return { newFindings: valid.length, newClusters, skipped, deduped }
++}
++
++const applyManualTicket = (si, item, dateStr) => {
++  const actionId = actionIdOf(item)
++  const key = `${dateStr}|${item.fingerprint}`
++  if (si.manualTickets[key]) return // 幂等:重复消费不追加
++  const redact = REDACT_TEXT_DIMS.has(item.dim)
++  si.manualTickets[key] = {
++    actionId,
++    dim: item.dim,
++    category: item.category,
++    file: item.file,
++    fingerprint: item.fingerprint,
++    severity: item.severity,
++    ...(redact ? {} : { evidence: item.evidence, verify: item.verify }),
++  }
++}
++
++const applySummaryOnly = (si, item, unknownReason) => {
++  const dim = item.dim
++  // 计数读取必须限定自有属性(DELTA-P2A-02 审查修正):dim 形状校验放行
++  // 'constructor'/'toString' 这类合法字符串,普通对象的裸属性读会命中
++  // Object.prototype 上的继承函数,`|| 0` 不生效 → 计数变成"函数源码字符串+1"
++  // 的字符串拼接。summary 本身来自 JSON 反序列化(带原型的普通对象),
++  // 所以在读取侧守,而不是改存储结构。
++  si.summary[dim] = (Object.hasOwn(si.summary, dim) ? si.summary[dim] : 0) + 1
++  if (unknownReason) {
++    if (!Object.hasOwn(si.summary, '__unknownDims')) si.summary.__unknownDims = {}
++    si.summary.__unknownDims[dim] = (Object.hasOwn(si.summary.__unknownDims, dim) ? si.summary.__unknownDims[dim] : 0) + 1
++  }
++}
++
++// ---- IO 包装:读文件 + 缺失/降级台账 + 落状态(不碰锁,供 gate.mjs 在同一把锁内直接调用) ----
++
++/**
++ * @returns {{status:'consumed'|'missing'|'degraded', newFindings:number, newClusters:number, skipped:number, reason?:string}}
++ */
++export const consumeSentryFindings = (state, { findingsDir, dateStr, rules }) => {
++  const sentryRules = rules.sentryIntake || {}
++  const si = (state.sentryIntake ||= { consumedDates: {}, missingStreak: 0, lastMissingDate: null, degraded: false, decisions: {}, summary: {}, manualTickets: {} })
++
++  const path = findingsFilePath(findingsDir, dateStr)
++  const missingDegradedDays = sentryRules.missingDegradedDays ?? 3
++
++  if (!existsSync(path)) {
++    if (si.lastMissingDate !== dateStr) {
++      si.missingStreak = (si.missingStreak || 0) + 1
++      si.lastMissingDate = dateStr
++    }
++    si.degraded = si.missingStreak >= missingDegradedDays
++    return { status: si.degraded ? 'degraded' : 'missing', newFindings: 0, newClusters: 0, skipped: 0, reason: si.degraded ? `missing-streak:${si.missingStreak}` : undefined }
++  }
++
++  let raw
++  try {
++    raw = readFileSync(path, 'utf8')
++  } catch (err) {
++    return { status: 'degraded', newFindings: 0, newClusters: 0, skipped: 0, reason: `read-failed:${err.message}` }
++  }
++  const digest = fileDigestOf(raw)
++
++  // 同一未变文件二跑:幂等短路,零新增(不重放已消费的一天)
++  if (si.consumedDates[dateStr]?.fileDigest === digest) {
++    si.missingStreak = 0
++    si.lastMissingDate = null
++    si.degraded = false
++    return { status: 'consumed', newFindings: 0, newClusters: 0, skipped: 0 }
++  }
++
++  const parsed = readFindingsFile(findingsDir, dateStr, { limits: sentryRules.limits })
++  if (parsed.kind === 'degraded') {
++    // 整文件坏/超限:不得当"0 findings 成功",不写 consumedDates,不清零 missingStreak
++    return { status: 'degraded', newFindings: 0, newClusters: 0, skipped: 0, reason: parsed.reason }
++  }
++  if (parsed.kind === 'missing') {
++    // 与上方 existsSync 竞态窗口内被删除(TOCTOU 边缘情况),按缺失处理
++    if (si.lastMissingDate !== dateStr) {
++      si.missingStreak = (si.missingStreak || 0) + 1
++      si.lastMissingDate = dateStr
++    }
++    si.degraded = si.missingStreak >= missingDegradedDays
++    return { status: si.degraded ? 'degraded' : 'missing', newFindings: 0, newClusters: 0, skipped: 0 }
++  }
++
++  const result = applyFindingsForDate(state, { dateStr, items: parsed.items, rules, sentryRules })
++  // 展开保留 applyFindingsForDate 写入的 itemKeys(finding 级消费台账,P2A-02)
++  si.consumedDates[dateStr] = { ...(si.consumedDates[dateStr] || {}), fileDigest: digest }
++  si.missingStreak = 0
++  si.lastMissingDate = null
++  si.degraded = false
++  return { status: 'consumed', ...result }
++}
++
++/** workpacket 用的 sentry 信号摘要(SC-B2-2/SC-B2-4);gate.mjs 消费本函数产出的对象。 */
++export const sentrySummarySignal = (state) => {
++  const si = state.sentryIntake
++  if (!si) return { summary: {}, manualTicketCount: 0 }
++  const { __unknownDims, ...summary } = si.summary || {}
++  return { summary, unknownDims: __unknownDims || {}, manualTicketCount: Object.keys(si.manualTickets || {}).length }
++}
++
++// ---- SC-B2-4:mark-fixed(只接受已存在的 trae-audit 簇 + PR 已合并且号匹配) ----
++
++const fetchPrView = (prNumber) => {
++  const out = execFileSync('gh', ['pr', 'view', String(prNumber), '--json', 'number,mergedAt,mergeCommit'], {
++    encoding: 'utf8',
++    stdio: ['ignore', 'pipe', 'pipe'],
++  })
++  return JSON.parse(out)
++}
++
++/**
++ * 纯函数式核心:cluster 存在 + origin=trae-audit + prView.mergedAt≠null + prView.number===prNumber
++ * → 写 status:fixed/fixedAt=mergedAt/pr/mergeSha;任一不满足 → 拒绝,state 零变化。
++ */
++export const applyMarkFixed = (state, { fp, prNumber, prView, now }) => {
++  const cluster = state.clusters[fp]
++  if (!cluster) return { ok: false, reason: 'fp-not-found' }
++  if (cluster.origin !== SENTRY_ORIGIN) return { ok: false, reason: 'not-trae-cluster' }
++  if (!prView || prView.mergedAt == null) return { ok: false, reason: 'pr-not-merged' }
++  if (prView.number !== prNumber) return { ok: false, reason: 'pr-number-mismatch' }
++  cluster.status = 'fixed'
++  cluster.fixedAt = prView.mergedAt
++  cluster.pr = prNumber
++  cluster.mergeSha = prView.mergeCommit?.oid ?? null
++  return { ok: true, fixedAt: cluster.fixedAt }
++}
++
++// ---- CLI ----
++
++const lockTtlMinutes = (rules) => {
++  const ttl = rules?.loop?.lockTtlMinutes
++  return Number.isFinite(ttl) && ttl > 0 ? ttl : 60
++}
++
++const stateDirFrom = (args) => resolve(args['state-dir'] || process.env.MIVO_BUG_DOCTOR_STATE_DIR || join(REPO_ROOT, 'history', 'loops', 'bug-doctor'))
++
++const runConsume = (args) => {
++  const rules = JSON.parse(readFileSync(RULES_PATH, 'utf8'))
++  const stateDir = stateDirFrom(args)
++  const now = typeof args.now === 'string' ? args.now : new Date().toISOString()
++  const dateStr = typeof args.date === 'string' ? args.date : shanghaiYesterdayString(now)
++  const findingsDir = args['findings-dir'] ? expandHome(args['findings-dir']) : resolveFindingsDir({ sentryRules: rules.sentryIntake })
++
++  const lock = acquireLock(stateDir, { ttlMinutes: lockTtlMinutes(rules), owner: 'sentry-intake:consume' })
++  if (!lock.acquired) {
++    process.stdout.write(`${JSON.stringify({ status: 'locked', holder: lock.holder })}\n`)
++    return
++  }
++  try {
++    const state = loadState(stateDir, FINGERPRINT_VERSION)
++    const result = consumeSentryFindings(state, { findingsDir, dateStr, rules })
++    saveState(stateDir, state)
++    appendLog(stateDir, `${now} · sentry-intake · date=${dateStr} · sentry=${result.status} · new=${result.newFindings} · clusters=${result.newClusters}${result.reason ? ` · ${result.reason}` : ''}`)
++    process.stdout.write(`${JSON.stringify({ dateStr, ...result })}\n`)
++  } finally {
++    // 对齐 gate.mjs 的释放纪律(SC-BD1-R7-S01):判定用 !release.ok,不比对
++    // 某个 reason 字面值;失败不静默,写 stderr + 台账日志(appendLog 自身
++    // 抛错也不吞主结果)。
++    const release = releaseLock(stateDir, { token: lock.token })
++    if (!release.ok) {
++      log(`锁释放失败(reason=${release.reason},stateDir=${stateDir})`)
++      try {
++        appendLog(stateDir, `${now} · lock-release · 锁释放失败(reason=${release.reason},stateDir=${stateDir.split('\n')[0]})`)
++      } catch {
++        // stderr 已有记录;台账写不进不再升级(与 gate 同口径)
++      }
++    }
++  }
++}
++
++const runMarkFixed = (args) => {
++  const rules = JSON.parse(readFileSync(RULES_PATH, 'utf8'))
++  const stateDir = stateDirFrom(args)
++  const now = typeof args.now === 'string' ? args.now : new Date().toISOString()
++  const fp = args.fp
++  const prNumber = Number(args.pr)
++  if (!fp || !Number.isInteger(prNumber)) {
++    process.stderr.write('用法: sentry-intake.mjs mark-fixed --fp <fp> --pr <n> [--state-dir DIR] [--pr-view-json <path>]\n')
++    process.exit(2)
++  }
++  const prView = args['pr-view-json'] ? JSON.parse(readFileSync(args['pr-view-json'], 'utf8')) : fetchPrView(prNumber)
++
++  const lock = acquireLock(stateDir, { ttlMinutes: lockTtlMinutes(rules), owner: 'sentry-intake:mark-fixed' })
++  if (!lock.acquired) {
++    process.stdout.write(`${JSON.stringify({ status: 'locked', holder: lock.holder })}\n`)
++    return
++  }
++  try {
++    const state = loadState(stateDir, FINGERPRINT_VERSION)
++    const result = applyMarkFixed(state, { fp, prNumber, prView, now })
++    if (result.ok) {
++      saveState(stateDir, state)
++      appendLog(stateDir, `${now} · sentry-intake · mark-fixed · fp=${fp.slice(0, 16)} · pr=${prNumber}`)
++    }
++    process.stdout.write(`${JSON.stringify(result)}\n`)
++  } finally {
++    // 对齐 gate.mjs 的释放纪律(SC-BD1-R7-S01):判定用 !release.ok,不比对
++    // 某个 reason 字面值;失败不静默,写 stderr + 台账日志(appendLog 自身
++    // 抛错也不吞主结果)。
++    const release = releaseLock(stateDir, { token: lock.token })
++    if (!release.ok) {
++      log(`锁释放失败(reason=${release.reason},stateDir=${stateDir})`)
++      try {
++        appendLog(stateDir, `${now} · lock-release · 锁释放失败(reason=${release.reason},stateDir=${stateDir.split('\n')[0]})`)
++      } catch {
++        // stderr 已有记录;台账写不进不再升级(与 gate 同口径)
++      }
++    }
++  }
++}
++
++const usage = () => {
++  process.stderr.write('用法: sentry-intake.mjs <consume|mark-fixed> [选项](详见文件头注释)\n')
++  process.exit(2)
++}
++
++const main = () => {
++  const args = parseArgs(process.argv.slice(2))
++  const cmd = args._[0]
++  try {
++    if (cmd === 'consume') runConsume(args)
++    else if (cmd === 'mark-fixed') runMarkFixed(args)
++    else usage()
++  } catch (err) {
++    log(`失败: ${err.message}`)
++    process.exit(1)
++  }
++}
++
++if (process.argv[1] === fileURLToPath(import.meta.url)) main()
+diff --git a/scripts/loops/bug-doctor/sentry-intake.test.mjs b/scripts/loops/bug-doctor/sentry-intake.test.mjs
+new file mode 100644
+index 00000000..d95a4069
+--- /dev/null
++++ b/scripts/loops/bug-doctor/sentry-intake.test.mjs
+@@ -0,0 +1,139 @@
++import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
++import { createHash } from 'node:crypto'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import {
++  SENTRY_ORIGIN,
++  consumeSentryFindings,
++  findingsFilePath,
++} from './sentry-intake.mjs'
++import { defaultState } from './state.mjs'
++import { FINGERPRINT_VERSION } from './fingerprint.mjs'
++
++// 本文件是核心消费面用例(PR 分段 2a):复发 fail-closed / 幂等 / missing-degraded
++// 台账。sentryIntake 节持久化往返、分拣路由 / T1 预筛 / mark-fixed / 输入安全 /
++// CLI 端到端在紧随的分段 2b 补齐(同一测试文件原位扩展)。
++const RULES = JSON.parse(
++  // rules.json 与本文件同目录;不复制常量,测试永远用真实配置跑
++  (await import('node:fs')).readFileSync(new URL('./rules.json', import.meta.url), 'utf8'),
++)
++
++let dir // findings dir
++let stateDir
++
++beforeEach(() => {
++  dir = mkdtempSync(join(tmpdir(), 'sentry-findings-'))
++  stateDir = mkdtempSync(join(tmpdir(), 'bug-doctor-state-'))
++})
++
++afterEach(() => {
++  rmSync(dir, { recursive: true, force: true })
++  rmSync(stateDir, { recursive: true, force: true })
++})
++
++// 16 位 hex 指纹(Sentry 侧已算好,测试用确定性 hash 造合法值,不是脚本自己算指纹)
++const fp = (seed) => createHash('sha256').update(seed).digest('hex').slice(0, 16)
++
++const finding = (over = {}) => ({
++  severity: 'P1',
++  dim: 'log-violation',
++  file: 'src/app/Foo.tsx',
++  line: 10,
++  category: 'missing-debug-log',
++  evidence: 'no debugLogger call on success path',
++  verify: '不可信复现提示:需人工核实',
++  fingerprint: fp('aaaa'),
++  ...over,
++})
++
++const writeFindings = (dateStr, items) => {
++  writeFileSync(findingsFilePath(dir, dateStr), JSON.stringify(items))
++}
++
++describe('SC-B2-1 sentry-intake 消费(幂等 + missing/degraded 台账)', () => {
++  it('同一未变文件二跑:newFindings=0/newClusters=0,cluster count 不变', () => {
++    const dateStr = '2026-08-02'
++    writeFindings(dateStr, [finding({ fingerprint: fp('idem1') })])
++    const state = defaultState(FINGERPRINT_VERSION)
++    const r1 = consumeSentryFindings(state, { findingsDir: dir, dateStr, rules: RULES })
++    expect(r1.status).toBe('consumed')
++    expect(r1.newClusters).toBe(1)
++    const countAfter1 = state.clusters[fp('idem1')].count
++
++    const r2 = consumeSentryFindings(state, { findingsDir: dir, dateStr, rules: RULES })
++    expect(r2.status).toBe('consumed')
++    expect(r2.newFindings).toBe(0)
++    expect(r2.newClusters).toBe(0)
++    expect(state.clusters[fp('idem1')].count).toBe(countAfter1)
++  })
++
++  it('新日期同 fp 晚于 fixedAt → recurrent(复用批次1机制)', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    state.clusters[fp('recur1')] = {
++      source: 'Trae audit', pattern: 'x', sLevel: 'S1', tCap: 'T1', count: 1,
++      clients: [], firstSeen: '2026-07-01T00:00:00.000Z', lastSeen: '2026-07-01T00:00:00.000Z',
++      appVersions: [], status: 'fixed', fixedAt: '2026-07-01T00:00:00.000Z', attempts: 1,
++      issue: null, pr: 100, levels: ['error'], serverFault: false, silentFailure: false,
++      recent: [], samples: [], origin: SENTRY_ORIGIN,
++    }
++    writeFindings('2026-08-02', [finding({ fingerprint: fp('recur1') })])
++    consumeSentryFindings(state, { findingsDir: dir, dateStr: '2026-08-02', rules: RULES })
++    expect(state.clusters[fp('recur1')].status).toBe('recurrent')
++    expect(state.clusters[fp('recur1')].recurredAt).toBe('2026-08-02T00:00:00.000Z')
++    expect(state.clusters[fp('recur1')].pr).toBe(100) // 原 pr 保留
++  })
++
++  it('SC-B2V2-02 fail-closed(SC-BD1-R1a):fixed 簇缺 fixedAt(生产异常态)→ 不重开,不误判永远复发', () => {
++    // 本文件初版在这里手抄过 gate.mjs 修复前的 fail-open 判定:结算时间戳缺失
++    // 时无条件重开。现走共享模块 recurrence.mjs,本用例是该修复的正断言——
++    // 把共享模块改回 fail-open,本用例必红(与 gate.test.mjs 的 R1a 回归双侧红)。
++    const state = defaultState(FINGERPRINT_VERSION)
++    state.clusters[fp('noStamp1')] = {
++      source: 'Trae audit', pattern: 'x', sLevel: 'S1', tCap: 'T1', count: 1,
++      clients: [], firstSeen: '2026-07-01T00:00:00.000Z', lastSeen: '2026-07-01T00:00:00.000Z',
++      appVersions: [], status: 'fixed', attempts: 1, // 注意:无 fixedAt
++      issue: null, pr: 100, levels: ['error'], serverFault: false, silentFailure: false,
++      recent: [], samples: [], origin: SENTRY_ORIGIN,
++    }
++    writeFindings('2026-08-02', [finding({ fingerprint: fp('noStamp1') })])
++    consumeSentryFindings(state, { findingsDir: dir, dateStr: '2026-08-02', rules: RULES })
++    expect(state.clusters[fp('noStamp1')].status).toBe('fixed') // 不重开
++    expect(state.clusters[fp('noStamp1')].recurredAt).toBeUndefined()
++    expect(state.clusters[fp('noStamp1')].count).toBe(2) // 正常并入计数,只是不改状态
++  })
++
++  it('单项 schema 错误跳过并计数,不影响同文件其它合法项', () => {
++    const dateStr = '2026-08-02'
++    writeFindings(dateStr, [finding({ fingerprint: fp('good1') }), { severity: 'BAD' }])
++    const state = defaultState(FINGERPRINT_VERSION)
++    const r = consumeSentryFindings(state, { findingsDir: dir, dateStr, rules: RULES })
++    expect(r.status).toBe('consumed')
++    expect(r.skipped).toBe(1)
++    expect(r.newFindings).toBe(1)
++  })
++
++  it('当日文件缺失 1/2/3 天:第 3 天(不同自然日)才转 degraded,成功读取后清零', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    const r1 = consumeSentryFindings(state, { findingsDir: dir, dateStr: '2026-08-01', rules: RULES })
++    expect(r1.status).toBe('missing')
++    const r2 = consumeSentryFindings(state, { findingsDir: dir, dateStr: '2026-08-02', rules: RULES })
++    expect(r2.status).toBe('missing')
++    const r3 = consumeSentryFindings(state, { findingsDir: dir, dateStr: '2026-08-03', rules: RULES })
++    expect(r3.status).toBe('degraded')
++
++    writeFindings('2026-08-04', [finding({ fingerprint: fp('recover1') })])
++    const r4 = consumeSentryFindings(state, { findingsDir: dir, dateStr: '2026-08-04', rules: RULES })
++    expect(r4.status).toBe('consumed')
++    expect(state.sentryIntake.missingStreak).toBe(0)
++    expect(state.sentryIntake.degraded).toBe(false)
++  })
++
++  it('同一自然日重复运行不重复计天(missingStreak 不因同日二次运行翻倍)', () => {
++    const state = defaultState(FINGERPRINT_VERSION)
++    consumeSentryFindings(state, { findingsDir: dir, dateStr: '2026-08-01', rules: RULES })
++    consumeSentryFindings(state, { findingsDir: dir, dateStr: '2026-08-01', rules: RULES })
++    expect(state.sentryIntake.missingStreak).toBe(1)
++  })
++})
++

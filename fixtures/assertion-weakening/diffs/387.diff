@@ -1,0 +1,986 @@
+diff --git a/ghost.json b/ghost.json
+index b7be424f..2662bd59 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.1",
++  "version": "0.9.2",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+@@ -17,7 +17,8 @@
+     "card",
+     "notify",
+     "subscribe",
+-    "network"
++    "network",
++    "agent"
+   ],
+   "settingsHtml": "settings.html",
+   "network": {
+diff --git a/main.js b/main.js
+index bd4e3322..979cde63 100644
+--- a/main.js
++++ b/main.js
+@@ -534,6 +534,14 @@ const CARD_I18N = {
+     errSourceGone: 'The source image was removed from the canvas',
+     errActionBusy: 'Still working on the previous one. Try again when it finishes',
+     errActionsUnavailable: 'Buttons unavailable: this result could not be saved for reuse',
++    actionContinue: 'Continue',
++    continueWorking: 'Sending to the agent…',
++    continueSent: 'Sent — check the conversation',
++    continueQueued: 'Queued — will run shortly',
++    continueFailed: 'Continue failed',
++    continueUserMessage: 'Please continue based on this image.',
++    errNoTicket: 'This button has expired. Please try again from a freshly generated image.',
++    errContinueFailed: 'Could not continue. Please try again.',
+   },
+   'zh-CN': {
+     genWorking: '正在生成图片…',
+@@ -561,6 +569,14 @@ const CARD_I18N = {
+     errSourceGone: '源图已从画布上删除',
+     errActionBusy: '上一张还在生成,完成后再试',
+     errActionsUnavailable: '按钮不可用:这次结果没能保存下来供再次使用',
++    actionContinue: '继续',
++    continueWorking: '正在发送给 Agent…',
++    continueSent: '已发送,请在对话中查看',
++    continueQueued: '已加入队列,稍后处理',
++    continueFailed: '继续失败',
++    continueUserMessage: '请基于这张图片继续。',
++    errNoTicket: '按钮已失效,请从新生成的图片重试',
++    errContinueFailed: '继续失败,请重试',
+   },
+   ja: {
+     genWorking: '画像を生成中…',
+@@ -588,6 +604,14 @@ const CARD_I18N = {
+     errSourceGone: '元画像がキャンバスから削除されています',
+     errActionBusy: '前の生成が進行中です。完了後にお試しください',
+     errActionsUnavailable: 'ボタンは利用できません:今回の結果を再利用用に保存できませんでした',
++    actionContinue: '続ける',
++    continueWorking: 'Agent に送信中…',
++    continueSent: '送信しました。会話でご確認ください',
++    continueQueued: 'キューに追加されました。少々お待ちください',
++    continueFailed: '続行に失敗しました',
++    continueUserMessage: 'この画像を基に続けてください。',
++    errNoTicket: 'このボタンは期限切れです。新しく生成した画像からもう一度お試しください',
++    errContinueFailed: '続行できませんでした。もう一度お試しください',
+   },
+   ko: {
+     genWorking: '이미지 생성 중…',
+@@ -615,6 +639,14 @@ const CARD_I18N = {
+     errSourceGone: '원본 이미지가 캔버스에서 삭제되었습니다',
+     errActionBusy: '이전 생성이 진행 중입니다. 완료 후 다시 시도하세요',
+     errActionsUnavailable: '버튼을 사용할 수 없습니다: 이번 결과를 재사용용으로 저장하지 못했습니다',
++    actionContinue: '계속',
++    continueWorking: 'Agent로 전송 중…',
++    continueSent: '전송했습니다. 대화에서 확인하세요',
++    continueQueued: '대기열에 추가되었습니다. 잠시 후 처리됩니다',
++    continueFailed: '계속하기에 실패했습니다',
++    continueUserMessage: '이 이미지를 기반으로 계속해 주세요.',
++    errNoTicket: '이 버튼은 만료되었습니다. 새로 생성한 이미지에서 다시 시도하세요',
++    errContinueFailed: '계속할 수 없습니다. 다시 시도하세요',
+   },
+ }
+ 
+@@ -714,11 +746,14 @@ function ownDataProp(source, key) {
+ //
+ // actionId 白名单是**唯一**合法动作集:allowlist 之外的一律当伪事件(只记日志,
+ // 不出卡不生成),因为宿主合法 UI 不可能产生它们。
+-const CARD_ACTION_IDS = new Set(['regen', 'restyle'])
++// #297 P2:'continue' = 「基于这张图继续」,不产生新生成,把已产出的 owned 图
++// 交回 Agent 会话续做(手册 §4.11 的一次性点击票据)。
++const CARD_ACTION_IDS = new Set(['regen', 'restyle', 'continue'])
+ // 本仓**实际消费**的 card-action 事件字段。这份 allowlist 就是入口归一化的边界:
+ // 不在其中的字段(含 `__proto__`)一概读不到,继承来的同名字段等于没带。
+ // 开始消费新字段时必须同时加进这里,否则读到的永远是 undefined。
+-const CARD_ACTION_EVENT_FIELDS = ['actionId', 'callId', 'prompt', 'sessionId', 'spawnCallId', 'type']
++// userActionToken 是 'continue' 专用的一次性点击票据(手册 §4.11);regen/restyle 不读它。
++const CARD_ACTION_EVENT_FIELDS = ['actionId', 'callId', 'prompt', 'sessionId', 'spawnCallId', 'type', 'userActionToken']
+ // 宿主对 actionId / data-ghost-action 的字符集与长度硬约束(手册 §4.5)。
+ // spawnCallId 也按这套校验:它同样是要回填进卡位 id 的宿主标识。
+ const CARD_ACTION_ID_RE = /^[A-Za-z0-9_:-]{1,128}$/
+@@ -727,12 +762,15 @@ const CARD_GHOST_PROMPT_MAX = 128
+ // 宿主对 card-action 的 msg.prompt 硬 trim 到 2000:我们再守一道,超长即伪事件。
+ const CARD_ACTION_PROMPT_MAX = 2000
+ 
++const CARD_ACTION_LABEL_KEYS = { regen: 'actionRegen', restyle: 'actionRestyle', continue: 'actionContinue' }
++
+ /**
+  * 一颗动作按钮。零脚本:只有 data-ghost-action 属性,点击由宿主接管。
+- * restyle 带 data-ghost-prompt(宿主弹输入框收新风格);regen 是同参重跑,不带。
++ * restyle 带 data-ghost-prompt(宿主弹输入框收新风格);regen / continue 是零输入的
++ * 一次性动作,不带(continue 还需要宿主随事件带上一次性点击票据,见手册 §4.11)。
+  */
+ function cardActionButton(locale, actionId) {
+-  const label = cardEscape(cardText(locale, actionId === 'regen' ? 'actionRegen' : 'actionRestyle'))
++  const label = cardEscape(cardText(locale, CARD_ACTION_LABEL_KEYS[actionId] || 'actionRegen'))
+   let attrs = ' data-ghost-action="' + actionId + '"'
+   if (actionId === 'restyle') {
+     attrs += ' data-ghost-prompt="' + cardEscape(cardClamp(cardText(locale, 'restylePromptHint'), CARD_GHOST_PROMPT_MAX)) + '"'
+@@ -813,8 +851,9 @@ const CARD_STYLE = [
+   '.mivo-card__title{margin:0;font-size:13px;font-weight:600;line-height:18px}',
+   '.mivo-card__sub{margin:6px 0 0;font-size:12px;line-height:16px;opacity:.72;overflow:hidden}',
+   '.mivo-card__sub--error{opacity:.9}',
+-  // #300 动作行:固定高度 + nowrap 按钮。四语标签都在长度预算内(CJK ≤10 / 拉丁 ≤14),
+-  // 两颗按钮合计远窄于 458,所以恒不换行 —— 44px 是真实行高不是估算。
++  // #300/#297 P2 动作行:固定高度 + nowrap 按钮。四语标签都在长度预算内(CJK ≤10 /
++  // 拉丁 ≤14),最多三颗按钮(regen/restyle/continue)合计仍远窄于 458,所以恒不
++  // 换行 —— 44px 是真实行高不是估算。
+   '.mivo-card__actions{box-sizing:border-box;height:' + CARD_ACTION_ROW_H + 'px;',
+   'display:flex;align-items:center;gap:8px;padding:6px 2px}',
+   '.mivo-card__btn{box-sizing:border-box;height:32px;padding:0 12px;border-radius:8px;',
+@@ -828,7 +867,7 @@ const CARD_STYLE = [
+ 
+ /**
+  * 渲染一版卡片。view:
+- *   mode        'generate' | 'edit'
++ *   mode        'generate' | 'edit' | 'continue'(#297 P2:继续动作的收据卡,不产生新生成)
+  *   phase       'working' | 'done' | 'failed'(failed 也是终版,宿主 state 记 done)
+  *   aspectRatio 请求里的显式画幅('1:1'|'3:2'|'2:3'),缺省按 1:1 预留
+  *   imageUrl    done 时的产物地址,必须是本意识名下 cindy-media 地址,否则不渲染 img
+@@ -837,13 +876,15 @@ const CARD_STYLE = [
+  *   reason      失败原因(调用方负责脱敏 + 本地化),转义后输出
+  *   locale      宿主 locale;缺省用缓存
+  *   actionable  这张卡属于「可能带动作按钮」的一族(#300):从首帧起预留动作行
+- *   actions     终版成功卡上真正要渲染的动作(['regen','restyle']);其余相位不给
++ *   actions     终版成功卡上真正要渲染的动作(['regen','restyle','continue']);其余相位不给
++ *   queued      mode:'continue' 且 phase:'done' 时:agent.run 的 disposition 是否为
++ *               'queued'(SC2.5:如实画「已排队」,不与其它 disposition 混同成「已完成」)
+  * 返回 { state, height, html },直接喂 cardSend。
+  */
+ function renderCard(view) {
+   const input = view || {}
+   const locale = cardLocaleKey(input.locale || cardLocaleCache)
+-  const mode = input.mode === 'edit' ? 'edit' : 'generate'
++  const mode = input.mode === 'edit' ? 'edit' : input.mode === 'continue' ? 'continue' : 'generate'
+   const phase = input.phase === 'done' ? 'done' : input.phase === 'failed' ? 'failed' : 'working'
+   const actionable = input.actionable === true
+   const height = cardHeightFor(input.aspectRatio, actionable)
+@@ -851,16 +892,22 @@ function renderCard(view) {
+     CARD_STAGE_MIN_H,
+     height - CARD_TEXT_BLOCK_H - (actionable ? CARD_ACTION_ROW_H : 0),
+   )
+-  const titleKey = mode === 'edit'
+-    ? (phase === 'working' ? 'editWorking' : phase === 'done' ? 'editDone' : 'editFailed')
+-    : (phase === 'working' ? 'genWorking' : phase === 'done' ? 'genDone' : 'genFailed')
++  const titleKey = mode === 'continue'
++    ? (phase === 'working' ? 'continueWorking' : phase === 'done' ? (input.queued ? 'continueQueued' : 'continueSent') : 'continueFailed')
++    : mode === 'edit'
++      ? (phase === 'working' ? 'editWorking' : phase === 'done' ? 'editDone' : 'editFailed')
++      : (phase === 'working' ? 'genWorking' : phase === 'done' ? 'genDone' : 'genFailed')
+ 
+   const imageUrl = typeof input.imageUrl === 'string' && CARD_MEDIA_URL_RE.test(input.imageUrl) ? input.imageUrl : null
+   // 只有 working 才挂呼吸动画:done / failed 是终版,残留动画类会让用户以为还在跑。
++  // #297 P2 返修(P2-1):continue 的呼吸占位不是在生成图片,aria-label 不能沿用
++  // 'stageAlt'(「图片生成中」)—— 复用同一条 titleKey 已经算出的文案(continue
++  // working 态就是 continueWorking),不为这一句另开一套四语字典条目。
+   const stageInner = imageUrl && phase !== 'working'
+     ? '<img class="mivo-card__img" src="' + imageUrl + '" alt="' + cardEscape(cardText(locale, 'imageAlt')) + '">'
+     : phase === 'working'
+-      ? '<div class="mivo-card__pulse" role="img" aria-label="' + cardEscape(cardText(locale, 'stageAlt')) + '"></div>'
++      ? '<div class="mivo-card__pulse" role="img" aria-label="' +
++          cardEscape(cardText(locale, mode === 'continue' ? 'continueWorking' : 'stageAlt')) + '"></div>'
+       : '<div class="mivo-card__void"></div>'
+ 
+   let sub = ''
+@@ -1167,6 +1214,12 @@ function cardFailureReason(locale, failKind, rawReason) {
+   if (failKind === 'sessionMismatch') return cardText(locale, 'errSessionMismatch')
+   if (failKind === 'sourceGone') return cardText(locale, 'errSourceGone')
+   if (failKind === 'actionBusy') return cardText(locale, 'errActionBusy')
++  // #297 P2:'continue' 专属两档。noTicket 是零调用的前置校验失败(SC2.4),
++  // continueFailed 收敛 agent.run 的**任意**失败(含 TOKEN_EXPIRED / 同步抛错 /
++  // runner reject)——不像 'failed' 档那样把上游自由文本部分透出,因为这条动作
++  // 没有"调整提示词"可言,展示更多细节没有额外可操作性,只有多余的泄露面。
++  if (failKind === 'noTicket') return cardText(locale, 'errNoTicket')
++  if (failKind === 'continueFailed') return cardText(locale, 'errContinueFailed')
+   if (failKind === 'failed') {
+     const fingerprint = internalDetailFingerprint(
+       String(rawReason === undefined || rawReason === null ? '' : rawReason),
+@@ -1366,10 +1419,64 @@ const CARD_ACTION_DIR = 'card-actions/'
+ const CARD_ACTION_RECORD_CAP = 200
+ const CARD_ACTION_RECORD_TTL_MS = 30 * 24 * 60 * 60 * 1000 // 30 天(D5 倾向值,待拍板确认)
+ const CARD_ACTION_RECORD_SCHEMA = 1
++// #297 P2 返修(R6.1):body/manifest **文件级**格式版本(与上面 CARD_ACTION_RECORD_SCHEMA
++// 是两件事——那个是单条记录 core 的 schema,这个是整份落盘文件的 wrapper 格式)。
++// v1 = R5.1 之前(及 R5.1 本身,它加了 generation 字段却仍标 version:1)的旧格式;
++// v2 = 本轮起,body/manifest 都标 version:2,且 generation 字段视为**保证存在、
++// 保证准确**的强契约。为什么必须靠版本号、不能只靠 generation 字段本身:字段缺失
++// 天然分不清"真的是升级前存量"还是"一次活得比 withDeadline 更久的旧格式 raw write
++// 迟到落地、把字段连带内容一起冲掉了"——这正是 R5.1-a 留下的洞(见 cardActionRead
++// 的 fencing 判据)。版本号是旧格式写不出来的信号:R5.1 及更早的代码只会写
++// version:1,不可能伪造出 version:2,所以"manifest 已经见过 v2"这件事本身就能
++// 无条件推翻"缺字段=旧数据"的宽松判定。
++const CARD_ACTION_STORE_SCHEMA_V2 = 2
+ // A9 背压:文案不能替代背压,所以上限是真的拒绝而不是提示。
+ // 每 ghost 实例总在途 3;每 root 卡在途 1(默认值,D5 倾向,待拍板确认)。
+ const CARD_ACTION_GHOST_INFLIGHT_MAX = 3
+ const CARD_ACTION_ROOT_INFLIGHT_MAX = 1
++// #297 P2 返修(R4.1):card-actions 记录/指针每次单独 fsWrite 的有界 deadline —— 与
++// defer 队列的 DEFER_FS_DEADLINE_MS 同数量级但独立定义(各自模块自己的调用点,不
++// 混用同一常量,改一处不牵动另一处的协议测试)。给 cardActionWrite 的两次落盘各自
++// 兜底,让 cardActionChain 永远在有限时间内前进,不被悬挂的 cindy.fs 毒死。
++const CARD_ACTION_FS_DEADLINE_MS = 1500
++
++/**
++ * 落盘路径(records-a/b.json 与 manifest.json)→ 该路径**最近一次发起**的原始
++ * fsWriteResult promise(#297 P2 返修 R5.1-b:槷位串行化)。
++ *
++ * 为什么要单独记这份、不能只靠 cardActionChain 的串行:`withDeadline` 只是**放弃
++ * 等待**,不取消底层调用(见其自身注释)——deadline 一到,cardActionWrite 就认输
++ * 返回 false,但那个真正的 `cindy.fs` 写请求仍在后台跑,迟早会落字节。a/b 两槷
++ * 按代数奇偶复用,若下一次(甚至下下次)轮到同一个槷位时那个旧写还没真正落地,
++ * 新写会跟它并发写同一个文件;谁后落盘谁赢,旧的迟到内容能整份覆盖新代,把
++ * done/attempted 都打回旧值。cardActionWaitForSlot 在每次真正发起写之前,先确认
++ * 该槷位上一次写已经 settle(有界等待,超时就 fail-closed 这次提交,不发起覆盖
++ * 写)——只是**缩窗**,不是消除窗口(手册没有取消原语,真正兜底是 R5.1-a 的代际
++ * fencing,见 cardActionRead)。
++ */
++const cardActionSlotWrites = new Map()
++
++/**
++ * 发起前的槷位守卫:有 prior 且它在 deadline 内没 settle → 不发起这次写,直接告诉
++ * 调用方"槷位忙,别写"(fail-closed)。prior 已经 settle(或从没有 prior)→ 放行。
++ */
++async function cardActionWaitForSlot(path) {
++  const prior = cardActionSlotWrites.get(path)
++  if (!prior) return true
++  const outcome = await withDeadline(prior, CARD_ACTION_FS_DEADLINE_MS)
++  return outcome.settled
++}
++
++/**
++ * 真正发起一次写,并把这个**原始**(未经 withDeadline 包装)promise 登记到槷位表
++ * ——哪怕这次调用方之后自己 withDeadline 放弃等它,槷位表上留的仍是它,下一次
++ * 复用同槷位的人才能等到它真正的结局,而不是等一个已经被截断的哨兵。
++ */
++function cardActionWriteSlot(path, content) {
++  const promise = fsWriteResult(path, content)
++  cardActionSlotWrites.set(path, promise)
++  return withDeadline(promise, CARD_ACTION_FS_DEADLINE_MS)
++}
+ 
+ /**
+  * spawnCallId → `{ rootId, protect }`:既做幂等去重、并发计数,也做淘汰保护。
+@@ -1381,6 +1488,28 @@ const CARD_ACTION_ROOT_INFLIGHT_MAX = 1
+  */
+ const cardActionInflight = new Map()
+ 
++/**
++ * rootId → 上一次 continue 的 spawnCallId:仅在 continueAgentRunBounded **超时**
++ * 时设值,标记"这个 root 有一次真实 agent.run 结果未知"。与 cardActionInflight
++ * 分开维护(#297 P2 返修 R4.3):超时那一刻 cardActionInflight 照常释放(全局并发槽
++ * 与其它卡无关,不能让一次超时占住别的卡),但同一 rootId 在结果明朗之前不得再发
++ * 第二次真实调用 —— 手册没有取消原语,迟到的真实回执唯一能做的是解除这里的守卫
++ * (见 continueAgentRunBounded 的 onLateSettle)。
++ *
++ * **这不是完全防重,是同进程内收窄**(owner 已裁决接受,2026-08-01):本 Map 纯
++ * 内存、不落盘,语义上与 cardActionInflight 一致 —— 电子脑重启就清空。残余场景:
++ * 若那次超时的调用真的永久悬挂(从不 settle)**且**电子脑在此期间重启,重启后
++ * 同一 rootId 的新 continue 点击(持新票据,是用户重启后的新意图,不是重放旧票据)
++ * 会被放行,理论上可能对宿主发出第二次真实 agent.run。后果是罕见的重复 Agent 回合
++ * (可由用户/Agent 侧感知并处理),不是静默错账 —— 与"发起悬挂再也不重试"的默认
++ * 相比,这条残余窗口需要"超时 + 重启"两个低概率条件叠加才会触发,比返修前"超时后
++ * 同进程内任意新点击都能重入"的窗口窄得多。备选方案(给守卫加 TTL 自动解除)已被
++ * 否决:没有任何依据能定出一个"绝对早于真实回执落地"的 TTL,定短了提前重开重复
++ * 调用窗口,定长了又跟"永久拒绝"没有实质区别。落盘这份守卫(需要新 schema)列为
++ * 可选跟进,不阻塞本轮交付。
++ */
++const cardActionContinueRootPending = new Map()
++
+ let cardActionStorePromise = null
+ // 落盘串行:a/b 交替 + 指针后推必须成对完成,交错写会让指针指向半新半旧的代。
+ let cardActionChain = Promise.resolve()
+@@ -1425,16 +1554,60 @@ async function cardActionRead() {
+       diagFail(DIAG_SOURCE.card, 'card 动作记录文件解析失败, 试上一代 file=' + name)
+     }
+   }
++  const manifestGeneration = Number(manifest && manifest.generation) || 0
++  const manifestVersion = Number(manifest && manifest.version) || 1
++  const bodyVersion = Number(payload && payload.version) || 1
++  const bodyGeneration = payload && typeof payload.generation === 'number' ? payload.generation : undefined
++  // #297 P2 返修(R5.1-a → R6.1 收口):代际 fencing——body 自带的 generation 字段
++  // 跟 manifest 的代数核对。R5.1 的原始判据("缺字段 = 旧数据,照旧信任")有一个
++  // 跨版本窟窿:v1 格式(R5.1 本身也标 version:1)缺字段时无条件信任,分不清"真的
++  // 是升级前存量"还是"一次活得比 withDeadline 更久的 v1 raw write 迟到落地、字段
++  // 连内容一起冲掉了"。R6.1 补上版本号这道硬信号:
++  //   manifest 已经是 v2(说明本轮修复的代码在这台机器上至少成功提交过一次)→
++  //     从此往后严格要求 body **也**是 v2 且 generation 精确相等,少一样都判
++  //     fencing——v1 格式的写(不管是不是缺字段)绝不可能是"新写的、只是字段没带
++  //     全",只可能是一次迟到覆盖。
++  //   manifest 仍是 v1(真正的升级前存量,或从未跑过本轮修复的代码)→ 保持 R5.1
++  //     的机会性核对:字段存在就核对,缺字段按保守侧信任(否则升级当天第一次读
++  //     就会把全部存量数据打成 corrupt,这本身是一次不必要的破坏性变更)。
++  // 不管走哪条分支,一旦判定 fencing:body 里的 records/done/attempted 已经是
++  // 不可信的旧快照,不能采信,但也不能悄悄清空(清空 = 记录"查不到" = 级① 静默,
++  // 契约要求这种损坏必须是级② fail-visible)。所以策略不变:整份数据仍然载入,
++  // 但强制标记每一条记录 corrupt——点击时走既有的"记录损坏"级② 出口(零调用 +
++  // 失败卡),不会静默采信、也不会静默消失。
++  // #297 P2 返修(R7.1 收口):body 版本判据从"< v2 即不信"收紧为"必须恰为 v2"
++  // ——`< CARD_ACTION_STORE_SCHEMA_V2` 会放过 v3(及任何未知/未来 wrapper 版本):
++  // manifest 已经是 v2 时,body.version=3 只可能是"迟到落地的另一种不兼容格式"或
++  // "本进程还没跟上的未来升级/降级",不是"这份数据本身可信的当前格式"——generation
++  // 数值凑巧对上也不该采信不认识的 wrapper 版本。收紧成恰好相等,把"未知版本号"
++  // 也纳入 fencing,而不是只挡"更旧"的一侧。
++  const generationFenced =
++    manifestVersion >= CARD_ACTION_STORE_SCHEMA_V2
++      ? bodyVersion !== CARD_ACTION_STORE_SCHEMA_V2 || bodyGeneration === undefined || bodyGeneration !== manifestGeneration
++      : bodyGeneration !== undefined && bodyGeneration !== manifestGeneration
++  if (generationFenced) {
++    diagFail(
++      DIAG_SOURCE.card,
++      'card 动作记录代际 fencing 不通过: manifest.version=' + manifestVersion + ' body.version=' + bodyVersion +
++        ' body.generation=' + bodyGeneration + ' manifest.generation=' + manifestGeneration +
++        '(疑似迟到写覆盖新代或跨版本旧格式落地,整份记录标记 corrupt)',
++    )
++  }
+   const store = {
+     records: new Map(),
+     done: new Set(),
+-    generation: Number(manifest && manifest.generation) || 0,
++    // #297 P2 返修(P1-2):调用 agent.run **之前**落盘的一次性调用凭据(与 done
++    // 语义不同 —— done 是"结果已交卷",attempted 是"这次点击已经打算调用,不管
++    // 调用本身成没成功"),用于收窄"写失败/重启窗口内同一票据被重复调用"的窗口。
++    attempted: new Set(),
++    generation: manifestGeneration,
+   }
+   const now = clock.now()
+   let expired = 0
+   for (const entry of Array.isArray(payload && payload.records) ? payload.records : []) {
+     const record = cardActionHydrate(entry)
+     if (!record) continue
++    if (generationFenced) record.corrupt = true // R5.1-a:整份 body 不可信,逐条强制标损坏
+     // 过期记录**载入时不删**:删了,用户点一张老卡就只剩静默(查不到记录 = 级①
+     // 只记日志),而契约要求"这张卡已过保留期"必须是一张看得见的失败卡(级②)。
+     // 真正的清理在写盘时做(cardActionTrim),容量由 cap 兜住。
+@@ -1444,6 +1617,23 @@ async function cardActionRead() {
+   for (const id of Array.isArray(payload && payload.done) ? payload.done : []) {
+     if (typeof id === 'string' && id) store.done.add(id)
+   }
++  for (const id of Array.isArray(payload && payload.attempted) ? payload.attempted : []) {
++    if (typeof id === 'string' && id) store.attempted.add(id)
++  }
++  // #297 P2 返修(R4.2 迁移):升级前的旧代码 markDone 只加 done、从不删 attempted,
++  // 磁盘上可能留着"两边都有"的旧条目 —— 这些其实早就交卷完成,不是未决,留着只会
++  // 白占 fail-closed 的容量判定。载入时一次性摘掉,之后 cardActionMarkDone 的原子
++  // done.add+attempted.delete 保证不会再产生新的这种条目。
++  let migrated = 0
++  for (const id of Array.from(store.attempted)) {
++    if (store.done.has(id)) {
++      store.attempted.delete(id)
++      migrated += 1
++    }
++  }
++  if (migrated) {
++    diagSkip(DIAG_SOURCE.card, 'card 动作记录迁移: 清理 ' + migrated + ' 条 done 与 attempted 并存的旧条目(非未决)')
++  }
+   if (expired) {
+     diagSkip(DIAG_SOURCE.card, 'card 动作记录: ' + expired + ' 条已过保留期(点击将得到过期失败卡,下次写盘时清理)')
+   }
+@@ -1510,30 +1700,87 @@ function cardActionTrim(store) {
+   while (store.done.size > CARD_ACTION_RECORD_CAP) {
+     store.done.delete(store.done.keys().next().value)
+   }
++  // #297 P2 返修(R4.2):attempted 不再参与 FIFO 淘汰 —— 它从 cardActionMarkDone
++  // 原子清理后(见下方)只剩"已调用但结果未知"的未决凭据,FIFO 按插入顺序扔最旧,
++  // 扔的恰恰可能是唯一还没解除的未决项(被后续 200 个正常 continue 挤出去,重放就
++  // 会发生第二次真实调用)。容量兜底改成 runCardActionContinue 里新增未决项前的
++  // fail-closed 判定(逼近 CARD_ACTION_RECORD_CAP 就拒新 continue 并 diag),绝不
++  // 静默丢弃已有的未决凭据。
+ }
+ 
+ /**
+  * 落盘一代。返回是否**已提交**(指针推进成功)——调用方据此决定卡上带不带按钮。
+  * 写快照成功但指针写失败 = 未提交:下次载入读到上一代,不出现半条记录。
++ *
++ * #297 P2 返修(R4.1):两次 fsWrite 各自套 `withDeadline`(CARD_ACTION_FS_DEADLINE_MS)——
++ * `cardActionChain` 是模块级串行队列,这里的 promise 若无界悬挂,`cardActionChain`
++ * 会被永久毒死(后续**所有**卡片动作的落盘都排在它后面,永远轮不到)。deadline 到点
++ * 仍未 settle 时按未提交处理:晚到的真实回执被 `withDeadline` 原地吞掉,不再二次
++ * 生效 —— 与 defer 正文提交(`deferCommitBody`)同一手法,差别只是这里不做有界读取证
++ * (未提交已经是 cardActionCommit 既有的安全出口:调用方收敛成一张失败卡,不重试)。
++ *
++ * #297 P2 返修(R5.1):R4.1 的"放弃等待"本身留了一个新窟窿——被放弃的写不会消失,
++ * 迟到落盘时可能整份覆盖一个更新的代(见 cardActionSlotWrites 注释)。两处收口:
++ *   b(缩窗)发起前先 cardActionWaitForSlot 确认该槷位上一次写已经 settle,不然
++ *     fail-closed 这次提交,不发起可能覆盖新代的写;
++ *   a(保底)body 正文自带 generation 字段(见下方 payload),读侧
++ *     (cardActionRead)拿它跟 manifest 的代数核对,不一致就是"这份 body 不是它
++ *     自称的那一代"——整份标记 corrupt,fail-visible 而不是静默采信旧内容。
++ * b 缩小窗口发生的概率,a 保证窗口即使被撞开也测得出、不会静默重放。
+  */
+ async function cardActionWrite(store) {
+   cardActionTrim(store)
+   const generation = (Number(store.generation) || 0) + 1
+   const slot = generation % 2 === 0 ? 'records-b.json' : 'records-a.json'
++  const slotPath = CARD_ACTION_DIR + slot
++  const manifestPath = CARD_ACTION_DIR + 'manifest.json'
++
++  if (!(await cardActionWaitForSlot(slotPath))) {
++    diagFail(
++      DIAG_SOURCE.card,
++      'card 动作记录写入 fail-closed: 槷位 ' + slot + ' 上一次写仍未 settle(避免覆盖新代) gen=' + generation,
++    )
++    return false
++  }
+   const payload = JSON.stringify({
+-    version: 1,
++    version: CARD_ACTION_STORE_SCHEMA_V2, // R6.1:v1 格式绝不会伪造出这个版本号
++    generation, // R5.1(a):代际 fencing —— body 自带代数,读侧据此判定是否为迟到覆盖
+     records: Array.from(store.records.values()),
+     done: Array.from(store.done),
++    attempted: Array.from(store.attempted),
+   })
+-  if (!(await fsWrite(CARD_ACTION_DIR + slot, payload))) {
++  const bodyOutcome = await cardActionWriteSlot(slotPath, payload)
++  if (!bodyOutcome.settled) {
++    diagFail(
++      DIAG_SOURCE.card,
++      'card 动作记录写入超过有界 deadline(' + CARD_ACTION_FS_DEADLINE_MS + 'ms)仍未 settle gen=' + generation,
++    )
++    return false
++  }
++  if (!(bodyOutcome.value && bodyOutcome.value.status === 'ok')) {
+     diagFail(DIAG_SOURCE.card, 'card 动作记录写入失败 gen=' + generation)
+     return false
+   }
+-  const pointerOk = await fsWrite(
+-    CARD_ACTION_DIR + 'manifest.json',
+-    JSON.stringify({ version: 1, current: slot, generation, savedAt: clock.now() }),
++
++  if (!(await cardActionWaitForSlot(manifestPath))) {
++    diagFail(
++      DIAG_SOURCE.card,
++      'card 动作记录提交指针写入 fail-closed: manifest 上一次写仍未 settle(避免覆盖新代) gen=' + generation,
++    )
++    return false
++  }
++  const pointerOutcome = await cardActionWriteSlot(
++    manifestPath,
++    JSON.stringify({ version: CARD_ACTION_STORE_SCHEMA_V2, current: slot, generation, savedAt: clock.now() }),
+   )
+-  if (!pointerOk) {
++  if (!pointerOutcome.settled) {
++    diagFail(
++      DIAG_SOURCE.card,
++      'card 动作记录提交指针写入超过有界 deadline(' + CARD_ACTION_FS_DEADLINE_MS + 'ms)仍未 settle gen=' + generation,
++    )
++    return false
++  }
++  if (!(pointerOutcome.value && pointerOutcome.value.status === 'ok')) {
+     diagFail(DIAG_SOURCE.card, 'card 动作记录提交指针写入失败 gen=' + generation)
+     return false
+   }
+@@ -1551,6 +1798,7 @@ function cardActionCommit(mutate) {
+     // 未落盘的父记录(子记录能过 lineage 校验,重启后从磁盘重建才炸成 CONTEXT_CORRUPT)。
+     const recordsSnapshot = new Map(store.records)
+     const doneSnapshot = new Set(store.done)
++    const attemptedSnapshot = new Set(store.attempted)
+     // mutate 返回 false = 本次没有实质变化(如 done 集里已经有这个 spawnCallId):
+     // 跳过写盘。少一次 a/b 翻转,也让"一次动作 = 一次提交"在测试里可断言。
+     if (mutate(store) === false) return true
+@@ -1558,6 +1806,7 @@ function cardActionCommit(mutate) {
+     if (!committed) {
+       store.records = recordsSnapshot
+       store.done = doneSnapshot
++      store.attempted = attemptedSnapshot
+     }
+     return committed
+   })
+@@ -1732,12 +1981,22 @@ function cardActionPersist(input) {
+   })
+ }
+ 
+-/** 终结一次动作:记进 done 集(重启后重放仍幂等)。 */
++/**
++ * 终结一次动作:记进 done 集(重启后重放仍幂等)。
++ *
++ * #297 P2 返修(R4.2):同一提交里原子把 spawnCallId 从 attempted 挪进 done ——
++ * attempted 只该承载"已经打算调用、结果还不确定"的未决凭据;一旦真正交卷(不管
++ * 成功还是收敛成失败卡),它就不再是"未决"了,必须从 attempted 里摘掉,否则会
++ * 一直占着 fail-closed 的容量判定,直到进程重启。`done.add` 与 `attempted.delete`
++ * 同落一次盘(同一 mutate、同一次 cardActionWrite),不会出现"删了未决却没记完成"
++ * 或反过来的半提交态。
++ */
+ function cardActionMarkDone(spawnCallId) {
+   if (!spawnCallId) return Promise.resolve(true)
+   return cardActionCommit((store) => {
+-    if (store.done.has(spawnCallId)) return false // 落记录时已顺带记过,不重复写
++    if (store.done.has(spawnCallId) && !store.attempted.has(spawnCallId)) return false // 已完全终结,不重复写
+     store.done.add(spawnCallId)
++    store.attempted.delete(spawnCallId)
+     return true
+   })
+ }
+@@ -3231,12 +3490,16 @@ async function runCardBackedGeneration(job) {
+   //    照常交付(图已经在画布上了),只是这张卡不长按钮并在卡上明说 —— 绝不产生
+   //    「刚显示就点不动」的按钮。
+   const persisted = await job.persist(r, gen)
++  // #297 P2 SC2.1:'continue' 只在合法 owned 指纹卡上追加 —— 无指纹卡(理论上不该
++  // 出现,防御性判断)零 continue 按钮,但仍可有 regen/restyle。
++  const hasOwnedHash = Boolean(gen && MEDIA_HASH_RE.test(gen.hash))
++  const doneActions = persisted ? (hasOwnedHash ? ['regen', 'restyle', 'continue'] : ['regen', 'restyle']) : []
+   const done = renderCard(
+     Object.assign(
+       {
+         phase: 'done',
+         imageUrl,
+-        actions: persisted ? ['regen', 'restyle'] : [],
++        actions: doneActions,
+         actionsUnavailable: !persisted,
+       },
+       base,
+@@ -3333,6 +3596,124 @@ async function cardActionFailCard(spawnCallId, failKind, errorCode, record) {
+   await cardActionMarkDone(spawnCallId)
+ }
+ 
++/**
++ * #297 P2 级② 出口(continue 收据卡专属):同样是一张 done 失败卡 + 记 done,
++ * 但用 mode:'continue' 措辞 —— continue 不是生成/改图,不该说「图片生成失败」。
++ */
++async function cardActionContinueFailCard(spawnCallId, failKind, errorCode) {
++  await cardFinal(
++    spawnCallId,
++    renderCard({
++      mode: 'continue',
++      phase: 'failed',
++      locale: cardLocaleCache,
++      reason: cardFailureReason(cardLocaleCache, failKind),
++    }),
++  )
++  diagFail(DIAG_SOURCE.card, 'card 继续动作不可执行 code=' + errorCode + ' spawn=' + spawnCallId)
++  await cardActionMarkDone(spawnCallId)
++}
++
++/**
++ * #297 P2 返修:级②共享前置校验(corrupt/TTL/lineage/session/背压)在 handleCardAction
++ * 里对全部 actionId 统一跑,发生在 continue 分岔(见下方 `actionId === 'continue'`)
++ * **之前**——不能无差别套 cardActionFailCard,它按 record.core.mode 强制
++ * generate/edit 措辞,continue 的输家会看到「图片生成失败」这种不成立的话。
++ * reason/code 两侧共用同一份 cardFailureReason,按 actionId 分流只换标题/mode。
++ */
++function cardActionPreFailCard(actionId, spawnCallId, failKind, errorCode, record) {
++  return actionId === 'continue'
++    ? cardActionContinueFailCard(spawnCallId, failKind, errorCode)
++    : cardActionFailCard(spawnCallId, failKind, errorCode, record)
++}
++
++// #297 P2 SC2.3:模板恰一次 {{user_message}} 且恰一次 {{event_json}}(手册 §4.11
++// 强制)。userMessage 是固定产品文案(见 CARD_I18N.continueUserMessage),不拼接
++// 任何自由文本;event 只带 SC2.7 白名单三键。
++const CONTINUE_PROMPT_TEMPLATE = '{{user_message}}\n\n[Mivo Canvas 卡片事件] {{event_json}}'
++
++// #297 P2 返修(P1-1):agent.run 是发去 Agent 会话的新回合,与 runCardBackedGeneration
++// 里 askPanel 的生成任务同一个量级(手册量级参照:26 分钟窗口,见 job.verb askPanel
++// 调用处的注释),这里复用同一个数量级常量,不另造一套超时哲学。超时只放弃等待
++// (不取消宿主那侧真实在跑的调用),不重试、不二次画卡——迟到的真实回执只留诊断。
++const CONTINUE_AGENT_RUN_TIMEOUT_MS = 26 * 60000
++
++// 超时哨兵:模块私有对象,宿主不可能返回同一个引用,身份比较不会误判(同
++// NOTIFY_TIMED_OUT 的既有手法)。
++const CONTINUE_AGENT_RUN_TIMED_OUT = { continueAgentRunTimedOut: true }
++
++/**
++ * 有界等待 cindy.agent.run。超时只放弃等待并回退成"未知"哨兵,原 promise 若之后
++ * 才 settle(成功或异常)只记诊断,不再触碰卡片/落盘状态 —— 那些状态已经在超时
++ * 分支收敛过一次,重复收敛等于给同一个 spawnCallId 发第二张终版卡。
++ *
++ * #297 P2 返修(R4.3):`onLateSettle` 只在**已经超时**之后原 promise 才真正 settle
++ * 时调用一次(成功或异常都算),让调用方能解除 cardActionContinueRootPending 的
++ * 同根守卫 —— 这是"迟到结果"唯一还有价值的地方:不再动卡/不再动落盘,但足以
++ * 证明这次调用终于有了确定结局,可以放行同根的下一次 continue。
++ */
++function continueAgentRunBounded(payload, spawnCallId, onLateSettle) {
++  return new Promise((resolve, reject) => {
++    let settled = false
++    let timer = null
++    const finish = (settle, value) => {
++      if (settled) return
++      settled = true
++      if (timer !== null) clock.clearTimeout(timer)
++      settle(value)
++    }
++    timer = clock.setTimeout(() => {
++      if (settled) return
++      settled = true
++      timer = null
++      resolve(CONTINUE_AGENT_RUN_TIMED_OUT)
++    }, CONTINUE_AGENT_RUN_TIMEOUT_MS)
++    let pending
++    try {
++      pending = cindy.agent.run(payload)
++    } catch (error) {
++      finish(reject, error)
++      return
++    }
++    Promise.resolve(pending).then(
++      (value) => {
++        if (settled) {
++          diagSkip(DIAG_SOURCE.card, 'card 继续动作宿主回执迟到(已按超时收敛,不再动卡) spawn=' + spawnCallId)
++          if (onLateSettle) onLateSettle()
++          return
++        }
++        finish(resolve, value)
++      },
++      (error) => {
++        if (settled) {
++          diagSkip(
++            DIAG_SOURCE.card,
++            'card 继续动作宿主回执迟到(异常,已按超时收敛,不再动卡) spawn=' + spawnCallId + ' ' + diagReason(error && error.message),
++          )
++          if (onLateSettle) onLateSettle()
++          return
++        }
++        finish(reject, error)
++      },
++    )
++  })
++}
++
++// #297 P2 返修(P1-3):宿主冻结的成功回执 union(apps/desktop/src/shared/ghost.ts):
++// { ok:true, sessionId, mode:'continue', disposition:'created'|'resumed'|'active'|'queued'|'forked' }。
++// 额外字段前向兼容忽略;缺字段/错 mode/未知 disposition 一律不算成功 —— 上一版
++// 只查 `result.ok===true` 就画「已发送」,伪造/残缺回执会被误当交卷成功。
++const CONTINUE_DISPOSITIONS = new Set(['created', 'resumed', 'active', 'queued', 'forked'])
++
++function continueSuccessShapeOk(result) {
++  if (!result || typeof result !== 'object' || Array.isArray(result)) return false
++  if (result.ok !== true) return false
++  if (typeof result.sessionId !== 'string' || !result.sessionId) return false
++  if (result.mode !== 'continue') return false
++  if (!CONTINUE_DISPOSITIONS.has(result.disposition)) return false
++  return true
++}
++
+ /** 按被点卡的类型与动作解出这次要派的活(A3 / A4 语义矩阵)。 */
+ function cardActionPlan(actionId, record, msg) {
+   const core = record.core
+@@ -3380,6 +3761,159 @@ function cardActionPlan(actionId, record, msg) {
+   }
+ }
+ 
++/**
++ * #297 P2:「基于这张图继续」——不产生新生成,把已产出的 owned 图连同稳定字段
++ * 交回 Agent 会话续做(手册 §4.11)。调用方(handleCardAction)已经跑完级①/级②
++ * 校验与 root-inflight 背压,这里只做 continue 专属的两件事:校验一次性点击
++ * 票据、发起 agent.run 并把结果画成收据卡。
++ */
++async function runCardActionContinue({ spawnCallId, sessionId, msg, record, rootId, store }) {
++  const artifactHash = typeof record.ownedHash === 'string' ? record.ownedHash : ''
++  // SC2.1:按钮只在合法 owned 指纹卡上渲染;真出现「无指纹却点了继续」只可能是
++  // 记录在渲染之后被裁剪/损坏 —— actionId/spawnCallId 都合法,按级②记录损坏处理
++  // (不是伪事件,仍要出一张看得见的失败卡)。
++  if (!MEDIA_HASH_RE.test(artifactHash)) {
++    return cardActionContinueFailCard(spawnCallId, 'contextCorrupt', 'CONTEXT_CORRUPT')
++  }
++  const userActionToken = typeof msg.userActionToken === 'string' ? msg.userActionToken : ''
++  if (!userActionToken) {
++    // SC2.4:无票据 = 零调用(不发 agent.run),该 spawnCallId 恰一次失败卡 + 稳定
++    // 错误码,原卡(callId)不动。
++    diagFail(DIAG_SOURCE.card, 'card 继续动作被拒: 缺少一次性点击票据(无票,零调用) spawn=' + spawnCallId)
++    return cardActionContinueFailCard(spawnCallId, 'noTicket', 'TICKET_MISSING')
++  }
++
++  // #297 P2 返修(P1-2):命中这里说明上一次点击已经把 attempted 落了盘,却从没
++  // 走到 done(调用悬挂 / 电子脑重启 / 进程崩溃都会落在这个窗口)—— 上一次调用
++  // 到底有没有真正打到宿主已经不可知,唯一安全的选择是不再调用第二次,只回收
++  // 成一张可解释的失败卡(诚实边界:这不宣称 exactly-once,只收窄"本仓能修的
++  // 重复调用窗口")。
++  if (store.attempted.has(spawnCallId)) {
++    diagFail(
++      DIAG_SOURCE.card,
++      'card 继续动作重放: 已标记 attempted 但从未交卷(上次调用结果未知,零调用) spawn=' + spawnCallId,
++    )
++    return cardActionContinueFailCard(spawnCallId, 'continueFailed', 'CONTINUE_STATE_UNKNOWN')
++  }
++
++  // #297 P2 返修(R4.3):同根若还有一次"超时后结果未知"的旧 continue 没解除守卫,
++  // 拒绝这次新点击 —— 全局并发槽在那次超时时已经释放(不占其它卡名额,见下方
++  // CONTINUE_AGENT_RUN_TIMED_OUT 分支),但"是否已经打给宿主第二次真实调用"这件事
++  // 没有取消原语可以确认,唯一安全的选择是不让第二个不确定性叠加到第一个之上。
++  if (cardActionContinueRootPending.has(rootId)) {
++    diagFail(
++      DIAG_SOURCE.card,
++      'card 继续动作被拒: 同根上一次请求结果未知,守卫未解除(零调用) spawn=' + spawnCallId + ' root=' + rootId,
++    )
++    return cardActionContinueFailCard(spawnCallId, 'continueFailed', 'CONTINUE_ROOT_PENDING')
++  }
++
++  cardActionInflight.set(spawnCallId, { rootId, protect: cardActionAncestry(store, record, rootId) })
++  try {
++    // #297 P2 返修(R4.1):会话绑定与 attempted 落盘合并成**一次**提交 —— 原先两次
++    // 独立 cardActionCommit 各自要排一轮 cardActionChain,前置链越长,一次 cindy.fs
++    // 悬挂就能拖住更多步骤;合并后只有一次 await,而 cardActionWrite 内已经给这次
++    // 提交要用到的两次 fsWrite 分别套了 CARD_ACTION_FS_DEADLINE_MS 有界 deadline
++    // (见该函数注释),所以这里的 await 本身也是有界的 —— 超时/不确定都会让
++    // cardActionCommit 归零回 false,不会无界占住这个 spawnCallId 的全局槽。
++    const priorSessionId = record.sessionId
++    const bindSession = !record.sessionId && !!sessionId
++    let capacityExceeded = false
++    const attemptCommitted = await cardActionCommit((s) => {
++      if (s.attempted.has(spawnCallId)) return false // 竞态下已被别处标过,不重复写
++      // #297 P2 返修(R4.2):容量逼近上限就 fail-closed 拒新 continue,绝不淘汰
++      // 已有的未决凭据(cardActionTrim 已经不再对 attempted 做 FIFO 淘汰)。
++      if (s.attempted.size >= CARD_ACTION_RECORD_CAP) {
++        capacityExceeded = true
++        return false
++      }
++      if (bindSession) record.sessionId = sessionId
++      s.attempted.add(spawnCallId)
++      return true
++    })
++    if (capacityExceeded) {
++      diagFail(
++        DIAG_SOURCE.card,
++        'card 继续动作被拒: 未决凭据容量已满(fail-closed,不淘汰旧未决) spawn=' + spawnCallId,
++      )
++      return cardActionContinueFailCard(spawnCallId, 'continueFailed', 'CONTINUE_CAPACITY')
++    }
++    if (!attemptCommitted) {
++      if (bindSession) record.sessionId = priorSessionId
++      diagFail(DIAG_SOURCE.card, 'card 继续动作未受理: 一次性调用凭据落盘失败(零调用) spawn=' + spawnCallId)
++      return cardActionContinueFailCard(spawnCallId, 'contextCorrupt', 'CONTEXT_CORRUPT')
++    }
++
++    diagOk(DIAG_SOURCE.card, 'card 继续动作受理 spawn=' + spawnCallId + ' hash=' + diagHash8(artifactHash))
++    cardSend(spawnCallId, renderCard({ mode: 'continue', phase: 'working', locale: cardLocaleCache }))
++
++    // SC2.7:event 白名单恰为三键,artifactHash 取自卡片记录(不信事件自报)。
++    // SC2.3/2.8:userMessage 固定产品文案、禁止 spread msg、调用不带 trigger/sessionId。
++    const payload = {
++      mode: 'continue',
++      promptTemplate: CONTINUE_PROMPT_TEMPLATE,
++      userMessage: cardText(cardLocaleCache, 'continueUserMessage'),
++      event: { artifactHash: artifactHash, spawnCallId: spawnCallId, actionId: 'continue' },
++      userActionToken: userActionToken,
++    }
++    let result
++    try {
++      // #297 P2 返修(P1-1):有界等待,不再无界挂住 finally 释放 —— 详见
++      // continueAgentRunBounded 顶部注释。onLateSettle 在超时之后真正解除
++      // cardActionContinueRootPending 的守卫(R4.3)。
++      result = await continueAgentRunBounded(payload, spawnCallId, () => {
++        cardActionContinueRootPending.delete(rootId)
++        diagOk(
++          DIAG_SOURCE.card,
++          'card 继续动作宿主回执迟到, 已解除同根未知状态守卫 root=' + rootId + ' spawn=' + spawnCallId,
++        )
++      })
++    } catch (error) {
++      // 同步抛错 / runner reject 都落在这里:SC2.5 任何失败零自动重试,只发一次
++      // 失败卡;票据已经用掉,不重试(手册:runner 失败也不退票)。
++      diagFail(
++        DIAG_SOURCE.card,
++        'card 继续动作异常 spawn=' + spawnCallId + ' ' + diagReason(error && error.message),
++      )
++      return cardActionContinueFailCard(spawnCallId, 'continueFailed', 'PLUGIN_ERROR')
++    }
++    if (result === CONTINUE_AGENT_RUN_TIMED_OUT) {
++      // #297 P2 返修(R4.3):超时只放弃等待,不代表调用没有真的打到宿主 —— 这个
++      // root 在结果明朗前一律拒绝新 continue(见函数顶部的 cardActionContinueRootPending
++      // 判定),直到 onLateSettle 回调解除,或电子脑重启(见该 Map 声明处注释)。
++      cardActionContinueRootPending.set(rootId, spawnCallId)
++      diagFail(
++        DIAG_SOURCE.card,
++        'card 继续动作宿主回执超时, 已放弃等待(不重试) spawn=' + spawnCallId + ' waitMs=' + CONTINUE_AGENT_RUN_TIMEOUT_MS,
++      )
++      return cardActionContinueFailCard(spawnCallId, 'continueFailed', 'CONTINUE_TIMEOUT')
++    }
++    // #297 P2 返修(P1-3):success 分支必须按宿主冻结的 union 严格校型(见
++    // continueSuccessShapeOk),不能只看 ok===true —— 缺字段/错 mode/未知
++    // disposition 都不算成功,一律收敛到同一条失败卡(与 ok:false 同一出口)。
++    if (!continueSuccessShapeOk(result)) {
++      diagFail(
++        DIAG_SOURCE.card,
++        'card 继续动作被宿主拒绝或回包不合规 spawn=' + spawnCallId +
++          ' code=' + (result && result.errorCode) + ' ' + diagReason(result && result.message),
++      )
++      return cardActionContinueFailCard(spawnCallId, 'continueFailed', (result && result.errorCode) || 'CONTINUE_FAILED')
++    }
++    // SC2.5:只有 disposition==='queued' 才画「已排队」,其余(new/resumed/forked)
++    // 一律画「已发送」——两者都不等于「已完成」,agent 的续做工作在这次调用**之后**
++    // 才真正开始,卡片只对「有没有成功送达」负责。
++    const queued = result.disposition === 'queued'
++    await cardFinal(spawnCallId, renderCard({ mode: 'continue', phase: 'done', queued: queued, locale: cardLocaleCache }))
++    diagOk(
++      DIAG_SOURCE.card,
++      'card 继续动作完成 spawn=' + spawnCallId + ' disposition=' + diagReason(result.disposition),
++    )
++    await cardActionMarkDone(spawnCallId)
++  } finally {
++    cardActionInflight.delete(spawnCallId)
++  }
++}
++
+ async function handleCardAction(rawMsg) {
+   // 级① 的第一道门(两步,见 safeOwnArgs):
+   //   ① safeOwnArgs 归一化 —— 只留 own 数据属性,继承字段拷不进来,own `__proto__`
+@@ -3416,33 +3950,45 @@ async function handleCardAction(rawMsg) {
+   }
+ 
+   // ── 级②:合法事件但业务不可执行 ──
++  // #297 P2 返修:以下 6 处判定发生在下方 continue 分岔**之前**,对 regen/restyle/
++  // continue 一视同仁地跑,所以出口一律走 cardActionPreFailCard 按 actionId 分流
++  // (continue → continue 专属措辞,其余 → 原 generate/edit 措辞),不能直接调
++  // cardActionFailCard——它不知道 continue 存在,会把输家卡的标题说成「图片生成
++  // 失败/图片修改失败」。
+   if (record.corrupt || !cardActionCoreValid(record.core)) {
+-    return cardActionFailCard(spawnCallId, 'contextCorrupt', 'CONTEXT_CORRUPT', record)
++    return cardActionPreFailCard(actionId, spawnCallId, 'contextCorrupt', 'CONTEXT_CORRUPT', record)
+   }
+   if (clock.now() - record.core.createdAt > CARD_ACTION_RECORD_TTL_MS) {
+-    return cardActionFailCard(spawnCallId, 'contextExpired', 'CONTEXT_EXPIRED', record)
++    return cardActionPreFailCard(actionId, spawnCallId, 'contextExpired', 'CONTEXT_EXPIRED', record)
+   }
+   if (!cardActionLineageOk(store, record)) {
+-    return cardActionFailCard(spawnCallId, 'contextCorrupt', 'CONTEXT_CORRUPT', record)
++    return cardActionPreFailCard(actionId, spawnCallId, 'contextCorrupt', 'CONTEXT_CORRUPT', record)
+   }
+   // 会话校验只在**已绑定后**启用:根生成走 tool-call、宿主不注入 session 上下文,
+   // 未绑定就校验会把所有按钮变成死键。已绑定后必须 fail-closed:事件省略
+   // sessionId 也算 mismatch,不能让"缺字段"退化成"通过校验"(否则另一会话
+   // 省略 sessionId 就能驱动已绑定会话 A 的原画布)。
+   if (record.sessionId && record.sessionId !== sessionId) {
+-    return cardActionFailCard(spawnCallId, 'sessionMismatch', 'SESSION_MISMATCH', record)
++    return cardActionPreFailCard(actionId, spawnCallId, 'sessionMismatch', 'SESSION_MISMATCH', record)
+   }
+ 
+   const rootId = record.rootCallId || record.recordId
+   if (cardActionInflight.size >= CARD_ACTION_GHOST_INFLIGHT_MAX) {
+-    return cardActionFailCard(spawnCallId, 'actionBusy', 'ACTION_BUSY', record)
++    return cardActionPreFailCard(actionId, spawnCallId, 'actionBusy', 'ACTION_BUSY', record)
+   }
+   let rootInflight = 0
+   for (const inflight of cardActionInflight.values()) {
+     if (inflight.rootId === rootId) rootInflight += 1
+   }
+   if (rootInflight >= CARD_ACTION_ROOT_INFLIGHT_MAX) {
+-    return cardActionFailCard(spawnCallId, 'actionBusy', 'ACTION_BUSY', record)
++    return cardActionPreFailCard(actionId, spawnCallId, 'actionBusy', 'ACTION_BUSY', record)
++  }
++
++  // #297 P2:'continue' 分岔到独立内核 —— 没有 verb/params 可派给面板重跑生成,
++  // 而是直发一次 agent.run(手册 §4.11)。共享的级①/级②校验与背压判定已在上面
++  // 走完,分岔之后不再经过 cardActionPlan(那是 regen/restyle 专属的生成参数装配)。
++  if (actionId === 'continue') {
++    return runCardActionContinue({ spawnCallId, sessionId, msg, record, rootId, store })
+   }
+ 
+   const plan = cardActionPlan(actionId, record, msg)
+@@ -5069,7 +5615,11 @@ if (seam && typeof seam.expose === 'function') {
+       /** 已载入的记录快照(测试断言用;返回浅拷贝,不给测试改内部状态的机会)。 */
+       records: async () => Array.from((await cardActionStore()).records.values()).map((r) => Object.assign({}, r)),
+       doneIds: async () => Array.from((await cardActionStore()).done),
++      attemptedIds: async () => Array.from((await cardActionStore()).attempted),
+       inflightCount: () => cardActionInflight.size,
++      // #297 P2 返修(R4.3):同根"上一次 continue 结果未知"的守卫数量,协议测试用它
++      // 断言超时后守卫确实立起、迟到回执/重启后确实解除。
++      continueRootPendingCount: () => cardActionContinueRootPending.size,
+       plan: cardActionPlan,
+       lineageOk: cardActionLineageOk,
+       coreValid: cardActionCoreValid,
+diff --git a/src/__tests__/cardActionHarness.ts b/src/__tests__/cardActionHarness.ts
+index 58527fa7..625d1e1b 100644
+--- a/src/__tests__/cardActionHarness.ts
++++ b/src/__tests__/cardActionHarness.ts
+@@ -210,10 +210,19 @@ export const boot = (options: BootOptions = {}): Booted => {
+   }
+ 
+   const settle = async () => {
+-    await flushMicrotasks(16)
++    // #297 P2 返修(R4.1):cardActionWrite 现在给两次 fsWrite 各自套了
++    // CARD_ACTION_FS_DEADLINE_MS(1.5s)的有界 deadline(withDeadline)。这里每轮
++    // `advance(5*60_000)` 是**同步**一次性推过 5 分钟(为了钉住 26 分钟的
++    // continueAgentRunBounded 窗口),如果推进发生在那次短 deadline 的真实回执
++    // 还没来得及跑完它自己的微任务链的那个瞬间,`clock.advance` 会在超时分支赢下
++    // 竞态,把一次本该成功的写盘误判成"悬挂"。所以每次大跳之前先给足预算把当前
++    // 已经在跑的短链(不依赖时钟,只靠微任务)排空 —— 预算只增不减是安全的:
++    // 微任务计数是确定性的,给多了不影响正确性,给少了才会像这次一样把假时钟的
++    // 粗粒度跳跃提前撞上一个原本会自然 settle 的短 deadline。
++    await flushMicrotasks(64)
+     for (let i = 0; i < 8; i += 1) {
+       brain.clock.advance(5 * 60_000)
+-      await flushMicrotasks(16)
++      await flushMicrotasks(64)
+     }
+   }
+ 
+diff --git a/src/__tests__/cardActions.test.ts b/src/__tests__/cardActions.test.ts
+index 1b944a38..b182024d 100644
+--- a/src/__tests__/cardActions.test.ts
++++ b/src/__tests__/cardActions.test.ts
+@@ -486,7 +486,8 @@ describe('A1 卡 v2 结构(结构/snapshot 证据;高度证据走真实浏览器
+   it('actionId 只出现 allowlist 值,且匹配 ^[A-Za-z0-9_:-]{1,128}$', () => {
+     const handles = loadBrain().handles
+     const allow = handles.card.actionIds()
+-    expect(allow.sort()).toEqual(['regen', 'restyle'])
++    // #297 P2:allowlist 新增 'continue'(基于这张图继续,不产生新生成)。
++    expect(allow.sort()).toEqual(['continue', 'regen', 'restyle'])
+     for (const id of allow) expect(id).toMatch(/^[A-Za-z0-9_:-]{1,128}$/)
+     // allowlist 之外的一律不渲染(伪造的 action 进不了 HTML)。
+     const html = handles.card.render({ phase: 'done', actionable: true, actions: ['regen', 'evil onclick'] }).html
+@@ -1088,17 +1089,29 @@ describe('A2 consumer contract 锁(只锁本仓消费面)', () => {
+   // 本仓**实际消费**的事件字段集。宿主加字段不该让这里红;本仓开始消费新字段必须
+   // 主动改这份清单 —— 这就是"消费面变更即红"。不承诺"宿主仓升级即红"(那要跨仓
+   // 集成检查,列 R8-H / 宿主协作项)。
+-  const CONSUMED_FIELDS = ['actionId', 'callId', 'prompt', 'sessionId', 'spawnCallId', 'type'].sort()
+-
+-  /** 事件字段在两处被读:handleCardAction(校验/路由)与 cardActionPlan(取 prompt)。 */
++  // #297 P2:userActionToken 是 'continue' 专属的一次性点击票据(手册 §4.11),
++  // 消费点在 runCardActionContinue(位于 cardActionPlan 与 handleCardAction 之间,
++  // 落在下面第一段切片的范围内)。
++  const CONSUMED_FIELDS = ['actionId', 'callId', 'prompt', 'sessionId', 'spawnCallId', 'type', 'userActionToken'].sort()
++
++  /**
++   * 事件字段在三处被读:handleCardAction(校验/路由)、cardActionPlan(取 prompt)、
++   * runCardActionContinue(取 userActionToken)。第一段切片按源码顺序天然覆盖后两者
++   * (cardActionPlan → runCardActionContinue → handleCardAction 依次声明)。
++   *
++   * 端标记必须精确匹配 `async function handleCardAction(`(带开括号)而不是裸前缀
++   * `async function handleCardAction` —— 后者是 `async function
++   * handleCardActionXxx` 的前缀子串,任何以 handleCardAction 开头命名的新函数都会
++   * 被误当作切片终点,静默漏扫一段消费面(#297 P2 复审踩过这个坑)。
++   */
+   const sliceSource = (marker: string, endMarker: string): string => {
+     const start = MAIN_JS.indexOf(marker)
+     expect(start).toBeGreaterThan(0)
+     return MAIN_JS.slice(start, MAIN_JS.indexOf(endMarker, start))
+   }
+   const consumerBody = (): string =>
+-    sliceSource('function cardActionPlan(', 'async function handleCardAction') +
+-    sliceSource('async function handleCardAction', 'cardActionInflight.delete(spawnCallId)')
++    sliceSource('function cardActionPlan(', 'async function handleCardAction(') +
++    sliceSource('async function handleCardAction(', 'cardActionInflight.delete(spawnCallId)')
+ 
+   it('钉住消费字段集', () => {
+     const consumed = Array.from(
+diff --git a/src/__tests__/depositBrain.test.ts b/src/__tests__/depositBrain.test.ts
+index 1880ac71..853fbd40 100644
+--- a/src/__tests__/depositBrain.test.ts
++++ b/src/__tests__/depositBrain.test.ts
+@@ -667,11 +667,17 @@ describe('ghost.json — 前段口径(能力项与工具预算)', () => {
+     // 基线读到了但 slots 不是数组 = 基线本身坏了,这是判红而不是跳过的理由。
+     expect(Array.isArray(parsed.slots)).toBe(true)
+     const base = parsed.slots as string[]
+-    // 本分支**唯一**新增的槽:network —— Mivo 平台直连(宿主图像模型目录整体挂掉时
+-    // 插件出图 100% 废,这条槽是唯一自救通道;详单与回落语义见 main.js「Mivo 平台直连」
+-    // 段与 mivoChannel.test.ts)。列成白名单而不是删掉断言:除它之外任何新槽照旧判红,
+-    // 门禁的牙齿一颗没少。
+-    const allowed = new Set([...base, 'network'])
+-    for (const slot of manifest.slots) expect(Array.from(allowed)).toContain(slot)
++    // #297 P2(卡片续做)与本段(deposit 前段,network 槽)是计划里明写的并行
++    // 任务(round2-plan-v3.md P2 节:「T0b 通过后与 P1 并行(后合并者按 merge-base
++    // 重新递增 ghost 版本)」)。network 槽已随 main 合入,此刻的 merge-base 已经
++    // 含它,不再需要单独豁免;P2 按 SC2.8 新增的 'agent' 槽是本分支自己在合并
++    // main 之后仍未落进 merge-base 的那一个,是计划要求不是回归。等本分支合入
++    // main 之后,'agent' 也会进 merge-base,这条豁免到那时自然失效(不会有人
++    // 忘记删——下面的 for 循环本身仍会拦住除 'agent' 以外的任何意外新增槽位)。
++    const concurrentPrSlots = ['agent']
++    for (const slot of manifest.slots) {
++      if (concurrentPrSlots.includes(slot)) continue
++      expect(base).toContain(slot)
++    }
+   })
+ })

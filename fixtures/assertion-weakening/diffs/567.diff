@@ -1,0 +1,54 @@
+diff --git a/scripts/e2e/scenarios/mask-point.mjs b/scripts/e2e/scenarios/mask-point.mjs
+index e20e2b6d..71b1323d 100644
+--- a/scripts/e2e/scenarios/mask-point.mjs
++++ b/scripts/e2e/scenarios/mask-point.mjs
+@@ -486,6 +486,32 @@ export const runMaskPointScenario = async (context) => {
+   }
+   // 等两帧:一帧给 ResizeObserver → rAF 重量,一帧给重量后的重排
+   await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))))
++  // 逐帧采样:窄壳收窄后菜单不许出现"飘出壳外一帧、下一帧自愈"的瞬态。
++  // 这是 SC-2 的逐帧回归断言 —— useRegionEditFlip 的 measure() 必须强制同步布局,
++  // 使 anchor 与 shell 落在同一布局世代(否则 offsetX 按旧 anchorLeft 求值 → -624)。
++  // 反向变异(去掉 offsetHeight flush)会在这里红,而不是靠整条场景偶发。
++  {
++    const sampled = await page.evaluate(async () => {
++      const samples = []
++      for (let i = 0; i < 5; i += 1) {
++        const menu = document.querySelector('.region-edit-model-menu')
++        const shell = menu?.closest('.canvas-shell')
++        if (!menu || !shell) return { samples, broken: false, missing: true }
++        const m = menu.getBoundingClientRect()
++        const s = shell.getBoundingClientRect()
++        samples.push({ left: +m.left.toFixed(2), right: +m.right.toFixed(2), shellLeft: +s.left.toFixed(2), shellRight: +s.right.toFixed(2) })
++        await new Promise((r) => requestAnimationFrame(r))
++      }
++      const broken = samples.some((x) => x.left < x.shellLeft || x.right > x.shellRight)
++      return { samples, broken, missing: false }
++    })
++    if (sampled.missing) {
++      throw new Error('P4-model: 逐帧采样找不到菜单/shell,无法验证无瞬态')
++    }
++    if (sampled.broken) {
++      throw new Error(`P4-model: 窄壳下菜单出现飘出壳外的瞬态帧(锚/壳跨布局世代), samples=${JSON.stringify(sampled.samples)}`)
++    }
++  }
+   const narrowContainment = await page.evaluate(() => {
+     const menu = document.querySelector('.region-edit-model-menu')
+     const shell = menu?.closest('.canvas-shell')
+diff --git a/src/canvas/useRegionEditFlip.ts b/src/canvas/useRegionEditFlip.ts
+index bb2fa3de..44aa1e70 100644
+--- a/src/canvas/useRegionEditFlip.ts
++++ b/src/canvas/useRegionEditFlip.ts
+@@ -100,6 +100,12 @@ export function useRegionEditFlip(
+     let frame = 0
+     const measure = () => {
+       frame = 0
++      // 先强制同步布局,再读 rect:React 的内联 style 写入与浏览器的几何重排异步,
++      // 壳收窄时 shell 可能已按新世代重排、而 anchor 还停在旧世代(见 mask-point 窄壳
++      // 竞态:offsetX 按旧 anchorLeft 求值 → 菜单飘出壳一帧)。读 offsetHeight 会 flush
++      // 所有待处理的 style 变更与布局,使 anchor 与 shell 落在同一布局世代。
++      // 显式 void:读取 offsetHeight 只为强制同步布局,返回值不用。
++      void block.offsetHeight
+       const anchorRect = anchor.getBoundingClientRect()
+       const shellRect = shell.getBoundingClientRect()
+       const next = solveFlipPlacement({

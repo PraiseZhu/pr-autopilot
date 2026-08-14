@@ -1,0 +1,461 @@
+diff --git a/ghost.json b/ghost.json
+index 2d4b0195..d33ba217 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.10",
++  "version": "0.9.11",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+@@ -64,7 +64,7 @@
+   "tools": [
+     {
+       "name": "canvas_snapshot",
+-      "description": "读取画布当前内容的结构化快照:节点(文字/图片/分区/标注)、位置尺寸、连线与衍生关系。默认读整块活跃画布;画布很大时用 region(画布世界坐标矩形)或 sectionId(只读某个分区及其全部子节点)缩小范围,二者互斥。单次返回上限 256KB,超出会只返回第一页并带 nextCursor——把它原样传回 cursor 继续读(翻页期间画布被改动会返回 STALE_CURSOR,那时重新从第一页开始)。返回 JSON;面板未打开时返回最近一次自动保存的快照并注明来源(离线快照不支持过滤与翻页)。",
++      "description": "读取画布当前内容的结构化快照:节点(文字/图片/分区/标注)、位置尺寸、连线与衍生关系。默认读整块活跃画布;画布很大时用 region(画布世界坐标矩形)或 sectionId(只读某个分区及其全部子节点)缩小范围,二者互斥。单次返回上限 256KB,超出会只返回第一页并带 nextCursor——把它原样传回 cursor 继续读(翻页期间画布被改动会返回 STALE_CURSOR,那时重新从第一页开始)。返回内容含 selectedImageNodeIds(用户当前选中且在本次结果集内的图片节点 id 列表)与 selectedNodeCount(选中节点总数,不限类型)。用户说「这张」/「选中的图」时,从 selectedImageNodeIds 取 id,显式传给 canvas_edit_image 的 nodeId——canvas_edit_image 不会自动读取当前选中,必须显式传 id。返回 JSON;面板未打开时返回最近一次自动保存的快照并注明来源(离线快照不支持过滤与翻页)。",
+       "parameters": {
+         "type": "object",
+         "properties": {
+diff --git a/main.js b/main.js
+index 7d564170..78e16a06 100644
+--- a/main.js
++++ b/main.js
+@@ -3845,6 +3845,11 @@ function snapshotOfflineFirstPage(snapshot, maxBytes = SNAPSHOT_PAGE_MAX_BYTES)
+     {
+       version: snapshot && snapshot.version,
+       sceneId: snapshot && snapshot.sceneId,
++      // 离线快照本就不含选中态——选中是 UI 瞬态,从未进过自动保存文件,这里的 []
++      // 是诚实表达,不是遗漏,不要"修"它。真值(若能算)在下方 selectedImageObservation
++      // 展开进来的 selectedImageNodeIds/selectedNodeCount,但离线路径最终会被 main.js
++      // 的 normalizeSelectionObservation 统一改判 selectionObservation:'unavailable'
++      // 并整组剔除数值字段——所以这里的候选值本就是中间态,不是交卷形态。
+       selectedNodeIds: [],
+       summary,
+       nodes: [],
+@@ -3993,9 +3998,85 @@ function snapshotOfflineFirstPage(snapshot, maxBytes = SNAPSHOT_PAGE_MAX_BYTES)
+   return result
+ }
+ 
++/**
++ * 选中观测组的三态归一化(SC-T2b.1,设计稿 §2.11-②):main.js egress 是唯一权威,
++ * 面板在线/离线两条路径的最终交卷对象都经过这一处,不得在别处自行拼
++ * `selectionObservation`。
++ *
++ * - offline:数值字段一律不出现(即使共享层等价性测试用的离线首页函数算出了候选值
++ *   ——那是给「两形态输出逐字段一致」用的中间态,不是最终交卷形态),`selectionObservation:'unavailable'`。
++ * - live 且三类校验(形状/关系不变量/本页语义)全部通过 → `'available'`,数值字段保留。
++ * - live 但任一校验失败(含字段整组缺失——真实面板经共享层派生后必存在,缺失本身
++ *   就是形状违规)→ `'invalid'`,数值字段整组剔除 + diag 留痕(fail-visible,不静默
++ *   放过协议混淆)。
++ *
++ * 只挡协议混淆与形状污染、保证交卷对象内部自洽——不复核「id 是否真的来自用户选中」
++ * (信任边界见设计稿:能伪造选中字段的对手同样能伪造整份快照)。
++ */
++function normalizeSelectionObservation(snapshot, offline) {
++  if (!snapshot || typeof snapshot !== 'object') return snapshot
++
++  const withoutSelectionFields = (source) => {
++    const next = Object.assign({}, source)
++    delete next.selectedImageNodeIds
++    delete next.selectedNodeCount
++    delete next.selectedImageNodesTruncated
++    return next
++  }
++
++  if (offline) {
++    return Object.assign(withoutSelectionFields(snapshot), { selectionObservation: 'unavailable' })
++  }
++
++  const markInvalid = (reason) => {
++    diagSkip(DIAG_SOURCE.tool, 'snapshot 选中观测组校验失败,已按 invalid 归一化并剔除数值字段: ' + reason)
++    return Object.assign(withoutSelectionFields(snapshot), { selectionObservation: 'invalid' })
++  }
++
++  const ids = snapshot.selectedImageNodeIds
++  const count = snapshot.selectedNodeCount
++  const truncatedFlag = snapshot.selectedImageNodesTruncated
++
++  // ①形状
++  if (
++    !Array.isArray(ids) ||
++    ids.some((id) => typeof id !== 'string' || !id) ||
++    new Set(ids).size !== ids.length ||
++    ids.length > SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS
++  ) {
++    return markInvalid('selectedImageNodeIds 不是合法的字符串数组(逐项非空/无重复/长度≤64)')
++  }
++  if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) {
++    return markInvalid('selectedNodeCount 不是非负安全整数')
++  }
++  if (truncatedFlag !== undefined && truncatedFlag !== true) {
++    return markInvalid('selectedImageNodesTruncated 只允许 true 或缺省')
++  }
++  // ②关系不变量
++  if (count < ids.length) return markInvalid('selectedNodeCount 小于 selectedImageNodeIds 长度')
++  if (truncatedFlag === true && ids.length !== SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS) {
++    return markInvalid('selectedImageNodesTruncated 为 true 但长度不等于上限')
++  }
++  if (truncatedFlag === true && count < SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS) {
++    return markInvalid('selectedImageNodesTruncated 为 true 但 selectedNodeCount 小于上限')
++  }
++  // ③本页可验证语义:本页 nodes 里出现的选中图片 id,其节点 type 必须是 'image'
++  // (不在本页的 id 无法本地复核,不算违规——信任边界,见函数顶注)。
++  const nodesInPage = Array.isArray(snapshot.nodes) ? snapshot.nodes : []
++  const typeById = new Map(nodesInPage.map((node) => [node && node.id, node && node.type]))
++  for (const id of ids) {
++    const type = typeById.get(id)
++    if (type !== undefined && type !== 'image') {
++      return markInvalid('selectedImageNodeIds 命中本页里 type 不是 image 的节点: ' + id)
++    }
++  }
++
++  return Object.assign({}, snapshot, { selectionObservation: 'available' })
++}
++
+ /** 统一交卷形状:面板首页与离线首页共用,字段名与共享层 SnapshotPage 一致。 */
+ function snapshotResult(source, reply, offline) {
+-  const result = { source, snapshot: reply.snapshot }
++  const result = { source, snapshot: normalizeSelectionObservation(reply.snapshot, offline) }
+   if (reply.filter) result.filter = reply.filter
+   if (reply.page) result.page = reply.page
+   if (reply.omittedRefs) result.omittedRefs = reply.omittedRefs
+diff --git a/src/__tests__/brainSnapshot.test.ts b/src/__tests__/brainSnapshot.test.ts
+index 52967df4..c573d921 100644
+--- a/src/__tests__/brainSnapshot.test.ts
++++ b/src/__tests__/brainSnapshot.test.ts
+@@ -69,6 +69,20 @@ const lastResult = (brain: LoadedBrain) => {
+   return sent.at(-1)
+ }
+ 
++/**
++ * #297 T2b:离线路径的 selectionObservation 永远是 'unavailable',数值字段一律不出现
++ * ——即使共享层 readSnapshotPage(供「两形态逐字段一致」等价性测试用)对同一份
++ * snapshot 会算出候选值,那是中间态,不是离线最终交卷形态。这个 helper 把共享层
++ * 输出改写成离线egress 之后**应该**长成的样子,供既有等价性测试改用。
++ */
++const offlineEgressShapeOf = (snapshot: Record<string, unknown>): Record<string, unknown> => {
++  const next = { ...snapshot }
++  delete next.selectedImageNodeIds
++  delete next.selectedNodeCount
++  delete next.selectedImageNodesTruncated
++  return { ...next, selectionObservation: 'unavailable' }
++}
++
+ describe('canvas_snapshot 扩参透传', () => {
+   it('只透传模型可见的过滤/分页参数,宿主注入与未知字段不进面板动词', async () => {
+     const brain = loadBrain()
+@@ -121,7 +135,15 @@ describe('canvas_snapshot 扩参透传', () => {
+ 
+   it('面板首页的 truncated/nextCursor/page/filter/omittedRefs 原样交卷,电子脑不再截断', async () => {
+     const brain = loadBrain()
+-    const bigSnapshot = { version: 1, sceneId: 'scene-1', nodes: [node('n-0', { text: 'x'.repeat(80_000) })] }
++    // 选中观测组字段合法(#297 T2b egress 会校验它们;这条测试关心的是其余字段
++    // 原样交卷,所以给一份能通过校验的合法值,不让 egress 干扰本测试的断言意图)。
++    const bigSnapshot = {
++      version: 1,
++      sceneId: 'scene-1',
++      nodes: [node('n-0', { text: 'x'.repeat(80_000) })],
++      selectedImageNodeIds: [],
++      selectedNodeCount: 0,
++    }
+     withPanel(brain, {
+       ok: true,
+       snapshot: bigSnapshot,
+@@ -136,7 +158,8 @@ describe('canvas_snapshot 扩参透传', () => {
+     const sent = lastResult(brain)
+     expect(sent?.ok).toBe(true)
+     // 旧行为会在 60000 字符处把 nodes 截成 slice(0,120) —— 现在必须逐字节原样交卷
+-    expect(sent?.result?.snapshot).toEqual(bigSnapshot)
++    // (egress 只加 selectionObservation,不动 nodes/其余字段)。
++    expect(sent?.result?.snapshot).toEqual(Object.assign({}, bigSnapshot, { selectionObservation: 'available' }))
+     expect(sent?.result?.truncated).toBe(true)
+     expect(sent?.result?.nextCursor).toBe('s1|rev|1|%7B%7D')
+     expect(sent?.result?.page).toEqual({ nodeOffset: 0, nodeCount: 1, totalNodes: 9, bytes: 80_123, maxBytes: 262_144 })
+@@ -160,6 +183,185 @@ describe('canvas_snapshot 扩参透传', () => {
+   })
+ })
+ 
++// #297 T2b(SC-T2b.1,设计稿 §2.11-②):选中观测组三态归一化——main.js egress 是唯一
++// 权威。live 且三类校验(形状/关系不变量/本页语义)全部通过 → 'available';任一校验
++// 失败 → 'invalid' + 数值字段整组剔除 + diag 留痕;offline → 'unavailable'(见「离线
++// 降级」describe 块)。断言全部落在**最终交卷对象**(sent.result.snapshot)上。
++describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () => {
++  const callSnapshot = async (liveSnapshot: Record<string, unknown>) => {
++    const brain = loadBrain()
++    withPanel(brain, { ok: true, snapshot: liveSnapshot, truncated: false })
++    await brain.handles.handleToolCall({ tool: 'canvas_snapshot', callId: 'c1', args: {} })
++    return lastResult(brain)
++  }
++
++  it("合法选中(图片 + 关系不变量成立)→ selectionObservation:'available',数值字段保留", async () => {
++    const sent = await callSnapshot({
++      version: 1,
++      sceneId: 'scene-1',
++      nodes: [node('img-1', { type: 'image' }), node('note-1', { type: 'markup' })],
++      selectedImageNodeIds: ['img-1'],
++      selectedNodeCount: 2,
++    })
++    expect(sent?.result?.snapshot).toMatchObject({
++      selectionObservation: 'available',
++      selectedImageNodeIds: ['img-1'],
++      selectedNodeCount: 2,
++    })
++  })
++
++  it('不存在别名字段(如 observation)——字段名契约唯一为 selectionObservation', async () => {
++    const sent = await callSnapshot({
++      version: 1,
++      sceneId: 'scene-1',
++      nodes: [node('img-1', { type: 'image' })],
++      selectedImageNodeIds: ['img-1'],
++      selectedNodeCount: 1,
++    })
++    expect(sent?.result?.snapshot).not.toHaveProperty('observation')
++    expect(Object.keys(sent?.result?.snapshot as object)).toContain('selectionObservation')
++  })
++
++  it('合法截断(65 张选中裁到 64 + truncated:true,count>=64)→ 仍判 available,不误伤合法截断', async () => {
++    const imageIds = Array.from({ length: 64 }, (_, index) => `img-${index}`)
++    const sent = await callSnapshot({
++      version: 1,
++      sceneId: 'scene-1',
++      nodes: imageIds.map((id) => node(id, { type: 'image' })),
++      selectedImageNodeIds: imageIds,
++      selectedNodeCount: 70,
++      selectedImageNodesTruncated: true,
++    })
++    expect(sent?.result?.snapshot).toMatchObject({
++      selectionObservation: 'available',
++      selectedImageNodesTruncated: true,
++    })
++    expect((sent?.result?.snapshot as { selectedImageNodeIds: string[] }).selectedImageNodeIds).toHaveLength(64)
++  })
++
++  it('选而无图(选 3 个全非图片)→ count===3 且 ids===[],仍判 available', async () => {
++    const sent = await callSnapshot({
++      version: 1,
++      sceneId: 'scene-1',
++      nodes: [node('note-1', { type: 'markup' }), node('note-2', { type: 'markup' }), node('note-3', { type: 'markup' })],
++      selectedImageNodeIds: [],
++      selectedNodeCount: 3,
++    })
++    expect(sent?.result?.snapshot).toMatchObject({
++      selectionObservation: 'available',
++      selectedImageNodeIds: [],
++      selectedNodeCount: 3,
++    })
++  })
++
++  // G1(#297 T2b):"选而无图"(上面那条)是"选了但没选到图",跟"什么都没选"是两件
++  // 不同的事——零值必须原样交卷(不是 undefined、不是被裁剪成缺省态),否则模型看到
++  // 字段缺失会误判成 unavailable/invalid,而不是"确认了,用户就是没选任何东西"。
++  it('选 0 张(什么都没选中)→ 仍判 available,ids===[]/count===0,truncated 不出现', async () => {
++    const sent = await callSnapshot({
++      version: 1,
++      sceneId: 'scene-1',
++      nodes: [node('img-1', { type: 'image' }), node('note-1', { type: 'markup' })],
++      selectedImageNodeIds: [],
++      selectedNodeCount: 0,
++    })
++    expect(sent?.result?.snapshot).toMatchObject({
++      selectionObservation: 'available',
++      selectedImageNodeIds: [],
++      selectedNodeCount: 0,
++    })
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodesTruncated')
++  })
++
++  it('跨页选中:第一页即携带全结果集清单,egress 不重新裁剪面板已给出的合法清单', async () => {
++    // main.js 不做第二遍分页/裁剪(与「电子脑不再截断」同精神);面板首页已经是
++    // 全结果集口径,egress 只校验+归一化,不改数值。
++    const sent = await callSnapshot({
++      version: 1,
++      sceneId: 'scene-1',
++      nodes: [node('img-1', { type: 'image' })], // 本页只有一个节点,其余在后续页
++      selectedImageNodeIds: ['img-1', 'img-2', 'img-3'], // 全结果集清单,跨页
++      selectedNodeCount: 3,
++      truncated: true,
++    })
++    expect(sent?.result?.snapshot).toMatchObject({
++      selectionObservation: 'available',
++      selectedImageNodeIds: ['img-1', 'img-2', 'img-3'],
++    })
++  })
++
++  describe('三类坏例逐条注入 → invalid,数值字段整组剔除 + diag 留痕', () => {
++    const badCases: Array<[string, Record<string, unknown>]> = [
++      [
++        '形状①:selectedImageNodeIds 含空字符串',
++        { selectedImageNodeIds: ['img-1', ''], selectedNodeCount: 2 },
++      ],
++      [
++        '形状②:selectedImageNodeIds 含重复 id',
++        { selectedImageNodeIds: ['img-1', 'img-1'], selectedNodeCount: 2 },
++      ],
++      [
++        '形状③:selectedImageNodeIds 超过 64 且未标 truncated',
++        { selectedImageNodeIds: Array.from({ length: 65 }, (_, i) => `img-${i}`), selectedNodeCount: 65 },
++      ],
++      [
++        '形状④:selectedNodeCount 非整数',
++        { selectedImageNodeIds: ['img-1'], selectedNodeCount: 1.5 },
++      ],
++      [
++        '形状⑤:selectedNodeCount 为负数',
++        { selectedImageNodeIds: [], selectedNodeCount: -1 },
++      ],
++      [
++        '关系不变量①:selectedNodeCount 小于 selectedImageNodeIds 长度',
++        { selectedImageNodeIds: ['img-1', 'img-2'], selectedNodeCount: 1 },
++      ],
++      [
++        '关系不变量②:truncated 为 true 但长度不等于 64',
++        { selectedImageNodeIds: ['img-1'], selectedNodeCount: 1, selectedImageNodesTruncated: true },
++      ],
++      [
++        '关系不变量③:truncated 为 true 但 count < 64',
++        {
++          selectedImageNodeIds: Array.from({ length: 64 }, (_, i) => `img-${i}`),
++          selectedNodeCount: 10,
++          selectedImageNodesTruncated: true,
++        },
++      ],
++      [
++        '本页语义:selectedImageNodeIds 命中本页一个 type 不是 image 的节点',
++        { selectedImageNodeIds: ['note-1'], selectedNodeCount: 1 },
++      ],
++    ]
++
++    for (const [label, selectionFields] of badCases) {
++      it(label + ' → invalid', async () => {
++        const brain = loadBrain()
++        withPanel(brain, {
++          ok: true,
++          snapshot: {
++            version: 1,
++            sceneId: 'scene-1',
++            nodes: [node('img-1', { type: 'image' }), node('img-2', { type: 'image' }), node('note-1', { type: 'markup' })],
++            ...selectionFields,
++          },
++          truncated: false,
++        })
++        await brain.handles.handleToolCall({ tool: 'canvas_snapshot', callId: 'c1', args: {} })
++
++        const sent = lastResult(brain)
++        expect(sent?.result?.snapshot).toMatchObject({ selectionObservation: 'invalid' })
++        expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodeIds')
++        expect(sent?.result?.snapshot).not.toHaveProperty('selectedNodeCount')
++        expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodesTruncated')
++
++        const { spy } = attachPanelBridge(brain)
++        expect(spy.find('选中观测组校验失败')[0]?.level).toBe('warn')
++      })
++    }
++  })
++})
++
+ describe('canvas_snapshot 错误不被离线快照掩盖', () => {
+   for (const code of ['INVALID_PARAMS', 'STALE_CURSOR', 'SECTION_NOT_FOUND', 'SCENE_MISMATCH']) {
+     it(`面板明确拒绝 ${code} → 直接失败,不降级读离线快照`, async () => {
+@@ -179,6 +381,13 @@ describe('canvas_snapshot 错误不被离线快照掩盖', () => {
+   }
+ })
+ 
++// G1(#297 T2b):以下"离线路径必得 selectionObservation:'unavailable'"类断言,前置
++// 条件是**面板关闭 + 已有合法离线快照文件 + 本次调用不带 region/sectionId/cursor**
++// 三者同时成立——少任一条,egress 会在到达选中观测组归一化之前就已经因
++// PANEL_CLOSED(无离线文件)/SNAPSHOT_FILTER_OFFLINE(带了不兼容过滤参数)短路失败,
++// `sent.result` 压根不存在,断言 `selectionObservation`/数值字段会是对着 undefined
++// 断言,测试会假绿或假红。本文件下方每条 closedPanelBrain({ files: {...} }) 配无
++// 不兼容过滤参数的调用,就是在满足这三条前置,不是随手写的。
+ describe('canvas_snapshot 离线降级', () => {
+   it('面板未打开 + 带过滤 → SNAPSHOT_FILTER_OFFLINE,且不读离线文件', async () => {
+     const brain = closedPanelBrain({
+@@ -257,7 +466,12 @@ describe('canvas_snapshot 离线降级', () => {
+     expect(expected.truncated).toBe(true) // 小上限必须真的触发截断,否则这条测试是空跑
+     const sent = lastResult(brain)
+     expect(sent?.ok).toBe(true)
+-    expect(sent?.result?.snapshot).toEqual(expected.snapshot)
++    // #297 T2b:egress 对离线路径强制 selectionObservation:'unavailable' 并剔除
++    // 选中观测组数值字段——它们在共享层是候选值,不是离线路径的最终交卷形态。
++    expect(sent?.result?.snapshot).toEqual(offlineEgressShapeOf(expected.snapshot))
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodeIds')
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedNodeCount')
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodesTruncated')
+     expect(sent?.result?.page).toEqual(expected.page)
+     expect((sent?.result?.page as { maxBytes: number }).maxBytes).toBe(16_384)
+   })
+@@ -305,7 +519,12 @@ describe('canvas_snapshot 离线降级', () => {
+     expect(sent?.ok).toBe(true)
+     const expected = readSnapshotPage(fixture, {})
+     expect(expected.truncated).toBe(true) // fixture 真的超限,否则这条测试是空跑
+-    expect(sent?.result?.snapshot).toEqual(expected.snapshot)
++    // #297 T2b:egress 对离线路径强制 selectionObservation:'unavailable' 并剔除
++    // 选中观测组数值字段——它们在共享层是候选值,不是离线路径的最终交卷形态。
++    expect(sent?.result?.snapshot).toEqual(offlineEgressShapeOf(expected.snapshot))
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodeIds')
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedNodeCount')
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodesTruncated')
+     expect(sent?.result?.truncated).toBe(true)
+     expect(sent?.result?.page).toEqual(expected.page)
+     expect(sent?.result?.nextCursor).toBeUndefined() // 离线没有游标(游标绑活画布修订号)
+@@ -327,7 +546,12 @@ describe('canvas_snapshot 离线降级', () => {
+ 
+     const expected = readSnapshotPage(fixture, {})
+     const sent = lastResult(brain)
+-    expect(sent?.result?.snapshot).toEqual(expected.snapshot)
++    // #297 T2b:egress 对离线路径强制 selectionObservation:'unavailable' 并剔除
++    // 选中观测组数值字段——它们在共享层是候选值,不是离线路径的最终交卷形态。
++    expect(sent?.result?.snapshot).toEqual(offlineEgressShapeOf(expected.snapshot))
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodeIds')
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedNodeCount')
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodesTruncated')
+     expect(sent?.result?.snapshot).toMatchObject({ nodes: fixture.nodes, edges: [], links: [], selectedNodeIds: [] })
+     expect(sent?.result?.truncated).toBeUndefined()
+   })
+@@ -347,7 +571,12 @@ describe('canvas_snapshot 离线降级', () => {
+ 
+     const expected = readSnapshotPage(fixture, {})
+     const sent = lastResult(brain)
+-    expect(sent?.result?.snapshot).toEqual(expected.snapshot)
++    // #297 T2b:egress 对离线路径强制 selectionObservation:'unavailable' 并剔除
++    // 选中观测组数值字段——它们在共享层是候选值,不是离线路径的最终交卷形态。
++    expect(sent?.result?.snapshot).toEqual(offlineEgressShapeOf(expected.snapshot))
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodeIds')
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedNodeCount')
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodesTruncated')
+     expect(sent?.result?.snapshot).toMatchObject({ nodes: [], links: [] })
+     expect(sent?.result?.omittedRefs).toEqual({ links: 2 })
+     expect(expected.omittedRefs).toEqual({ links: 2 })
+@@ -370,7 +599,12 @@ describe('canvas_snapshot 离线降级', () => {
+     const sent = lastResult(brain)
+     expect(expected.omittedRefs).toEqual({ sectionId: 1, targetNodeId: 1, links: 1 })
+     expect(sent?.result?.omittedRefs).toEqual(expected.omittedRefs)
+-    expect(sent?.result?.snapshot).toEqual(expected.snapshot)
++    // #297 T2b:egress 对离线路径强制 selectionObservation:'unavailable' 并剔除
++    // 选中观测组数值字段——它们在共享层是候选值,不是离线路径的最终交卷形态。
++    expect(sent?.result?.snapshot).toEqual(offlineEgressShapeOf(expected.snapshot))
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodeIds')
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedNodeCount')
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodesTruncated')
+     // 剥离结果本身也钉一遍(否则「两形态一致」可能是一致地都没剥)
+     expect(expected.snapshot.nodes[0].sectionId).toBeUndefined()
+     expect(expected.snapshot.nodes[1].targetNodeId).toBeUndefined()
+@@ -429,7 +663,12 @@ describe('离线首页与共享层在「巨量关系」场景仍等价', () => {
+     const expected = readSnapshotPage(fixture, {})
+     expect(expected.truncated).toBe(true) // 关系体积必须真的超 256KB,否则空跑
+     const sent = lastResult(brain)
+-    expect(sent?.result?.snapshot).toEqual(expected.snapshot)
++    // #297 T2b:egress 对离线路径强制 selectionObservation:'unavailable' 并剔除
++    // 选中观测组数值字段——它们在共享层是候选值,不是离线路径的最终交卷形态。
++    expect(sent?.result?.snapshot).toEqual(offlineEgressShapeOf(expected.snapshot))
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodeIds')
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedNodeCount')
++    expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodesTruncated')
+     expect(sent?.result?.page).toEqual(expected.page)
+     expect((sent?.result?.page as { bytes: number }).bytes).toBeLessThanOrEqual(262_144)
+   })

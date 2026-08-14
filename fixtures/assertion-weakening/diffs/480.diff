@@ -1,0 +1,1374 @@
+diff --git a/cindyplugin/ghost.json b/cindyplugin/ghost.json
+index a483845d..489d7b94 100644
+--- a/cindyplugin/ghost.json
++++ b/cindyplugin/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.16",
++  "version": "0.9.21",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+@@ -64,7 +64,7 @@
+   "tools": [
+     {
+       "name": "canvas_snapshot",
+-      "description": "读取画布内容的结构化快照:节点(文字/图片/分区/标注)、位置尺寸、连线与衍生关系。默认读整块活跃画布;画布大时用 region(世界坐标矩形)或 sectionId(某分区及其子节点)缩小范围,二者互斥。单次上限 256KB,超出只返回第一页并带 nextCursor——原样传回 cursor 续读(期间画布被改返回 STALE_CURSOR,须从第一页重来)。面板未打开时返回最近一次自动保存的快照并注明来源(离线快照不支持过滤与翻页)。返回含 selectedImageNodeIds(当前选中且在本次结果集内的图片节点 id)与 selectedNodeCount(选中总数,不限类型)。用户说「这张」/「选中的图」时从 selectedImageNodeIds 取 id 显式传给 canvas_edit_image 的 nodeId——它不会自动读选中。默认只读结构、零寄存请求;要看图的像素用 mediaNodeIds 点名(最多 8 个,须是本次返回这一页里的图片节点 id),返回带 mediaStates(逐 id 的 available/imageRef 或 unavailable/reason)与 mediaSummary(requested/available/unavailable)。imageRef(形如 cindy-media://blobs/<hash><ext>)只是引用、不含像素;看像素用 Read 读落盘路径 <userData>/cindy-media/blobs/<hash 原样前 2 个字符>/<hash><ext>(分片键取 hash 自身前 2 个字符,原样使用,不做大小写转换,否则大小写敏感文件系统上读不到;macOS 的 <userData> = ~/Library/Application Support/Cindy)。超过 8 张时:先分页遍历固化目标 id 清单,再按页在含目标 id 的那次调用里点名该页目标(每页 ≤8);维护「已读取」与「已知不可读」两个集合,并集覆盖固化清单即完成——不要累加 requested 计数(STALE_CURSOR 重遍历会虚高),也不要只看第一批就下结论。遇 STALE_CURSOR 从第一页重来,固化清单不变。",
++      "description": "读取画布内容的结构化快照:节点(文字/图片/分区/标注)、位置尺寸、连线与衍生关系。默认读整块活跃画布;画布大时用 region(世界坐标矩形)或 sectionId(某分区及其子节点)缩小范围,二者互斥。单次上限 256KB,超出只返回第一页并带 nextCursor——原样传回 cursor 续读(期间画布被改返回 STALE_CURSOR,须从第一页重来)。面板未打开时返回最近一次自动保存的快照并注明来源(离线快照不支持过滤与翻页)。返回含 selectedImageNodeIds(当前选中且在本次结果集内的图片节点 id)与 selectedNodeCount(选中总数,不限类型)。用户说「这张/选中的」时优先用 canvas_selection 拿 id 传给 canvas_edit_image(本工具选中字段按结果集过滤,范围外时 selectionOutOfScope>0)。默认只读结构、零寄存请求;要看图的像素用 mediaNodeIds 点名(最多 8 个,须是本次返回这一页里的图片节点 id),返回带 mediaStates(逐 id 的 available/imageRef 或 unavailable/reason)与 mediaSummary(requested/available/unavailable)。imageRef(形如 cindy-media://blobs/<hash><ext>)只是引用、不含像素;看像素用 Read 读落盘路径 <userData>/cindy-media/blobs/<hash 原样前 2 个字符>/<hash><ext>(分片键取 hash 自身前 2 个字符,原样使用,不做大小写转换,否则大小写敏感文件系统上读不到;macOS 的 <userData> = ~/Library/Application Support/Cindy)。超过 8 张时:先分页遍历固化目标 id 清单,再按页在含目标 id 的那次调用里点名该页目标(每页 ≤8);维护「已读取」与「已知不可读」两个集合,并集覆盖固化清单即完成——不要累加 requested 计数(STALE_CURSOR 重遍历会虚高),也不要只看第一批就下结论。遇 STALE_CURSOR 从第一页重来,固化清单不变。",
+       "parameters": {
+         "type": "object",
+         "properties": {
+@@ -122,6 +122,22 @@
+         }
+       }
+     },
++    {
++      "name": "canvas_selection",
++      "description": "读取用户当前在画布上选中的节点清单(实时选中态,不受 region/分页影响,一次返回全部,上限 64,超出置 selectedNodesTruncated):每项含 id/type/title/bounds,另给 selectedImageNodeIds(选中里的图片)与 selectedNodeCount。用户说「这张/这几张/选中的」时用本工具拿 id,再传给 canvas_edit_image(改图)或 canvas_snapshot(查详情)。要看选中图片的像素:用 mediaNodeIds 点名(≤8 个,必须是当前选中的图片 id,不在选中集判 not_in_selection),返回 mediaStates/mediaSummary;imageRef 语义与 canvas_snapshot 相同(用 Read 读落盘路径)。选中超过 8 张图时分多次调用点名。需要画布面板处于打开状态且已载入完成:面板未打开返回 PANEL_CLOSED、仍在载入返回 PANEL_NOT_READY(两种都不降级——离线选中记录会滞后、载入期读到的是演示种子数据,都不作为「当前选中」依据),提示用户处理后重试。",
++      "parameters": {
++        "type": "object",
++        "properties": {
++          "mediaNodeIds": {
++            "type": "array",
++            "items": {
++              "type": "string"
++            },
++            "description": "可选:点名要看像素的图片节点 id,最多 8 个、逐项非空且不重复,必须是当前选中集内的图片节点。不传 = 只读选中清单,零寄存请求。"
++          }
++        }
++      }
++    },
+     {
+       "name": "canvas_add_note",
+       "description": "把一段文字作为文本节点放到画布上。返回新节点 id。需要 Mivo Canvas 面板处于打开状态。",
+@@ -352,4 +368,4 @@
+     "minWidth": 420,
+     "defaultFraction": 0.45
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/cindyplugin/main.js b/cindyplugin/main.js
+index af866e62..fed62511 100644
+--- a/cindyplugin/main.js
++++ b/cindyplugin/main.js
+@@ -3846,20 +3846,23 @@ function parseOfflineMaxBytes(value) {
+  * `src/agent/snapshotRegion.ts` 同规则):对原始 snapshot 的 selectedNodeIds、
+  * 裁剪到「结果集」(离线路径无过滤 → 整份快照的节点)。
+  */
+-function deriveSelectedImageObservation(rawSelectedNodeIds, includedIds, nodesById) {
+-  const selectedIncluded = (Array.isArray(rawSelectedNodeIds) ? rawSelectedNodeIds : []).filter((id) =>
+-    includedIds.has(id),
+-  )
++function deriveSelectedImageObservation(rawSelectedNodeIds, includedIds, nodesById, allNodeIds) {
++  const rawIds = Array.isArray(rawSelectedNodeIds) ? rawSelectedNodeIds : []
++  const selectedIncluded = rawIds.filter((id) => includedIds.has(id))
+   const selectedImageIds = selectedIncluded.filter((id) => {
+     const found = nodesById.get(id)
+     return Boolean(found) && found.type === 'image'
+   })
+   const truncated = selectedImageIds.length > SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS
++  // selectionOutOfScope 与共享层同规则:只统计画布上真实存在、但被过滤排除在结果集
++  // 外的选中节点(幽灵 id 不计)。离线路径无过滤 → includedIds === allNodeIds → 恒 0。
++  const scopeAll = allNodeIds || includedIds
+   const result = {
+     selectedImageNodeIds: truncated
+       ? selectedImageIds.slice(0, SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS)
+       : selectedImageIds,
+     selectedNodeCount: selectedIncluded.length,
++    selectionOutOfScope: rawIds.filter((id) => !includedIds.has(id) && scopeAll.has(id)).length,
+   }
+   if (truncated) result.selectedImageNodesTruncated = true
+   return result
+@@ -4079,6 +4082,7 @@ function normalizeSelectionObservation(snapshot, offline) {
+     const next = stripObservationAlias(source)
+     delete next.selectedImageNodeIds
+     delete next.selectedNodeCount
++    delete next.selectionOutOfScope
+     delete next.selectedImageNodesTruncated
+     return next
+   }
+@@ -4108,6 +4112,13 @@ function normalizeSelectionObservation(snapshot, offline) {
+   if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) {
+     return markInvalid('selectedNodeCount 不是非负安全整数')
+   }
++  // selectionOutOfScope(#297 选中直读):区分「没选」与「选了但在读取范围外」的
++  // 兜底信号,与其余数值字段同一套形状纪律——真实面板经共享层派生后必存在,
++  // 缺失/非法即形状违规,整组剔除,不单独放行。
++  const outOfScope = snapshot.selectionOutOfScope
++  if (typeof outOfScope !== 'number' || !Number.isSafeInteger(outOfScope) || outOfScope < 0) {
++    return markInvalid('selectionOutOfScope 不是非负安全整数')
++  }
+   if (truncatedFlag !== undefined && truncatedFlag !== true) {
+     return markInvalid('selectedImageNodesTruncated 只允许 true 或缺省')
+   }
+@@ -4136,6 +4147,152 @@ function normalizeSelectionObservation(snapshot, offline) {
+ }
+ 
+ /** 统一交卷形状:面板首页与离线首页共用,字段名与共享层 SnapshotPage 一致。 */
++/**
++ * canvas_selection 回执的出口形状门(#297 选中直读):与 normalizeSelectionObservation
++ * 同一套纪律——只挡协议混淆与形状污染,不复核「id 是否真的来自用户选中」(信任边界
++ * 同快照侧:能伪造选中回执的对手同样能伪造整份快照)。校验不过整单拒绝
++ * (SELECTION_INVALID)+ diag 留痕,不把畸形回执剔字段后放行——选中清单就是本工具的
++ * 全部交付物,剔掉字段等于交白卷还标 ok。mediaStates/mediaSummary 原样透传,信任
++ * 模型与 snapshotResult 一致。
++ */
++function normalizeSelectionReply(live) {
++  const invalid = (reason) => {
++    diagSkip(DIAG_SOURCE.tool, 'selection 回执形状校验失败,整单拒绝: ' + reason)
++    return { ok: false, message: '选中态回执形状异常(' + reason + ');请重试或打开面板后再试。' }
++  }
++  if (typeof live.sceneId !== 'string' || !live.sceneId) return invalid('sceneId 缺失')
++  const nodes = live.selectedNodes
++  if (!Array.isArray(nodes) || nodes.length > SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS) {
++    return invalid('selectedNodes 不是数组或超上限')
++  }
++  const seen = new Set()
++  for (const node of nodes) {
++    if (!node || typeof node !== 'object') return invalid('selectedNodes 含非对象项')
++    if (typeof node.id !== 'string' || !node.id) return invalid('selectedNodes 含空 id')
++    if (seen.has(node.id)) return invalid('selectedNodes 含重复 id: ' + node.id)
++    seen.add(node.id)
++    if (typeof node.type !== 'string' || !node.type) return invalid('节点 ' + node.id + ' 缺 type')
++    // title 是契约必填(共享层 AiCanvasContextNode.title: string)。egress 存在的理由
++    // 就是面板回执跨了进程边界不可信,所以类型说必填这里就得真的验——初版漏了它,
++    // 缺 title 的坑回包会被判合法并交卷一个缺字段的清单(gpt 审查 P2)。
++    if (typeof node.title !== 'string') return invalid('节点 ' + node.id + ' 的 title 不是字符串')
++    const b = node.bounds
++    if (
++      !b || typeof b !== 'object' ||
++      [b.x, b.y, b.width, b.height].some((v) => typeof v !== 'number' || !Number.isFinite(v))
++    ) {
++      return invalid('节点 ' + node.id + ' 的 bounds 不是四元有限数')
++    }
++  }
++  const count = live.selectedNodeCount
++  if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) {
++    return invalid('selectedNodeCount 不是非负安全整数')
++  }
++  const truncatedFlag = live.selectedNodesTruncated
++  if (truncatedFlag !== undefined && truncatedFlag !== true) {
++    return invalid('selectedNodesTruncated 只允许 true 或缺省')
++  }
++  // 关系不变量:未截断 ⇒ 清单就是全量(长度必等于计数);截断 ⇒ 清单必满且计数更大。
++  if (truncatedFlag === true) {
++    if (nodes.length !== SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS) return invalid('截断为 true 但清单未满')
++    if (count <= SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS) return invalid('截断为 true 但计数未超上限')
++  } else if (nodes.length !== count) {
++    return invalid('未截断但 selectedNodes 长度不等于 selectedNodeCount')
++  }
++  const imageIds = live.selectedImageNodeIds
++  if (
++    !Array.isArray(imageIds) ||
++    imageIds.some((id) => typeof id !== 'string' || !id) ||
++    new Set(imageIds).size !== imageIds.length ||
++    imageIds.length > SNAPSHOT_MAX_SELECTED_IMAGE_NODE_IDS
++  ) {
++    return invalid('selectedImageNodeIds 不是合法的字符串数组(逐项非空/无重复/长度≤上限)')
++  }
++  // 本清单可验证语义。初版只做单向检查(`typeById.has(id) && type !== 'image'`),
++  // gpt 审查 P2 指出:**未截断**时 `selectedNodes` 已是全量,一个不在清单里的外来 id
++  // 恰好因为 `has(id)` 为 false 而被放行 —— agent 于是拿到一个根本没选中的"选中图片
++  // id"。截断与未截断的可复核程度不同,分开判:
++  const typeById = new Map(nodes.map((node) => [node.id, node.type]))
++  const imageIdsInList = nodes.filter((node) => node.type === 'image').map((node) => node.id)
++  if (truncatedFlag === true) {
++    // 截断:第 65+ 个图片 id 允许出现在 imageIds 而不在 listed 里(清单不完整已由
++    // selectedNodesTruncated 声明)。仍可复核两点:出现在 listed 里的 id 类型必须对,
++    // 且 listed 里的每个 image 都必须被 imageIds 收录(漏收就是清单不自洽)。
++    for (const id of imageIds) {
++      if (typeById.has(id) && typeById.get(id) !== 'image') {
++        return invalid('selectedImageNodeIds 命中清单里 type 不是 image 的节点: ' + id)
++      }
++    }
++    const imageIdSet = new Set(imageIds)
++    for (const id of imageIdsInList) {
++      if (!imageIdSet.has(id)) return invalid('清单里的图片节点未被 selectedImageNodeIds 收录: ' + id)
++    }
++  } else {
++    // 未截断:清单即全量,两个集合必须**逐元素相等**(顺序不作要求)。
++    if (imageIds.length !== imageIdsInList.length || imageIds.some((id) => typeById.get(id) !== 'image')) {
++      return invalid('未截断时 selectedImageNodeIds 必须恰好等于清单内的图片节点集合')
++    }
++    const imageIdSet = new Set(imageIds)
++    for (const id of imageIdsInList) {
++      if (!imageIdSet.has(id)) return invalid('未截断但清单里的图片节点未被收录: ' + id)
++    }
++  }
++  return { ok: true }
++}
++
++/**
++ * 单个选中节点的交卷投影:只留契约声明的四元组,面板回执上多挂的任何字段在此物理丢弃。
++ *
++ * 两处刻意的写法,改动前先读完:
++ * ① **必须在 main.js 侧做**,不能挪到面板侧 —— egress 存在的全部理由就是面板回执跨了
++ *    进程边界不可信;在被审查的一侧做投影等于没做。
++ * ② `type` **后置赋值**,不要"顺手"合回上面的对象字面量:verify-debug-logging.mjs 的
++ *    宿主载荷门按「对象字面量带 type 键」识别待发载荷,并要求该值是静态字符串字面量
++ *    (fail-closed,它是新增发送点的唯一防线)。这里的 `type` 是**画布节点类型**、不是
++ *    宿主消息类型,写成 `{ type: node.type }` 会被判 `non-literal type value` 让
++ *    preflight 整体转红。宁可这里别扭,也不去放宽那道门。
++ * 另外本函数**独立于 selectionResult**:后者是 TOKEN_PROVIDERS 成员,静态分析要求它
++ * 恰好只有一条 `return <本地标识符>`,把投影内联进去会多出一条 return 而判红。
++ */
++function selectionNodeProjection(node) {
++  const projected = {
++    id: node.id,
++    title: node.title,
++    bounds: { x: node.bounds.x, y: node.bounds.y, width: node.bounds.width, height: node.bounds.height },
++  }
++  projected.type = node.type
++  return projected
++}
++
++/**
++ * canvas_selection 的交卷对象构建器——verify-debug-logging.mjs 的 TOKEN_PROVIDERS
++ * 成员(与 snapshotResult 同一套静态可审计约定):只能返回**一个**本地构建的标识符,
++ * 字段集合由该守卫静态解析并对 allowlist 判定。只在 normalizeSelectionReply 校验
++ * 通过后调用,不做二次校验。
++ */
++function selectionResult(live) {
++  const result = {
++    source: '实时画布',
++    sceneId: live.sceneId,
++    // **逐项重建,不引用面板对象**(gpt 审查 P2):result 字段 allowlist(门禁那份与
++    // toolResultSweep 那份)只静态校验**顶层**键,`selectedNodes` 数组元素**内部**的
++    // 键完全不受约束。原样引用 `live.selectedNodes` 时,面板回执上多挂的任何字段
++    // (坑回包里塞一个 `rawPanelReply:'/Users/...'` 就够)会随交卷载荷一起出去,而两道
++    // 门都照常绿。这里显式投影成契约声明的四元组,多余字段在此处物理丢弃。
++    // bounds 同样重建 —— 否则 `bounds` 内部一样是个不受约束的口子。
++    selectedNodes: live.selectedNodes.map(selectionNodeProjection),
++    selectedNodeCount: live.selectedNodeCount,
++    selectedImageNodeIds: live.selectedImageNodeIds,
++  }
++  if (live.selectedNodesTruncated === true) result.selectedNodesTruncated = true
++  if (live.mediaStates) result.mediaStates = live.mediaStates
++  if (live.mediaSummary) result.mediaSummary = live.mediaSummary
++  if (live.selectedNodeCount === 0) {
++    result.note = '当前没有选中任何节点(这是实时选中态,不是读取范围问题)。'
++  }
++  return result
++}
++
+ function snapshotResult(source, reply, offline) {
+   const result = { source, snapshot: normalizeSelectionObservation(reply.snapshot, offline) }
+   if (reply.filter) result.filter = reply.filter
+@@ -4347,6 +4504,35 @@ async function handleToolCall(msg) {
+       return succeed(snapResultOffline)
+     }
+ 
++    if (msg.tool === 'canvas_selection') {
++      // #297 选中直读:选中态是全局、极小、易变的事实,不该经 region/分页裁剪投递
++      // (canvas_snapshot 的选中字段按结果集过滤,「没选」与「选了但在范围外」同形)。
++      // 本工具一次返回全部选中节点;选中的图片可用 mediaNodeIds 就地点名读像素。
++      const picked = {}
++      const pickedMedia = ownArg(args, 'mediaNodeIds')
++      if (pickedMedia !== undefined && pickedMedia !== null) picked.mediaNodeIds = pickedMedia
++      const mediaValidation = validateMediaNodeIds(picked.mediaNodeIds)
++      if (!mediaValidation.ok) return fail('INVALID_PARAMS', mediaValidation.message)
++      const live = await askPanel('selection', picked, SNAPSHOT_PANEL_TIMEOUT_MS)
++      if (live.ok) {
++        const norm = normalizeSelectionReply(live)
++        if (!norm.ok) return fail('SELECTION_INVALID', norm.message)
++        const selResult = {}
++        Object.assign(selResult, selectionResult(live))
++        return succeed(selResult)
++      }
++      // 离线不降级(与 canvas_snapshot 的离线降级刻意不同):离线快照里的
++      // selectedNodeIds 是"上次保存那一刻"的选中,把它当"当前选中"交卷会驱动
++      // 消费方改错图——选中态的价值就在"现在",宁缺毋滥。
++      if (live.code && live.code !== 'PANEL_CLOSED') {
++        return fail(live.code, live.message || 'selection 读取被面板拒绝')
++      }
++      return fail(
++        'PANEL_CLOSED',
++        '画布面板未打开:选中态只在面板在线时可读(离线快照的选中记录可能滞后,不作为"当前选中"依据)。请让用户打开 Mivo Canvas 面板后重试。',
++      )
++    }
++
+     if (msg.tool === 'canvas_add_note') {
+       // 纯文档写 = 可降级(§4 矩阵):面板就绪就直连,否则入队。
+       const readiness = await panelWriteReadiness()
+diff --git a/cindyplugin/skills/mivo-canvas-board/SKILL.md b/cindyplugin/skills/mivo-canvas-board/SKILL.md
+index 006f7095..d5ca79f4 100644
+--- a/cindyplugin/skills/mivo-canvas-board/SKILL.md
++++ b/cindyplugin/skills/mivo-canvas-board/SKILL.md
+@@ -23,18 +23,20 @@ description: Use the Mivo Canvas plugin tools to read the user's infinite canvas
+    - **翻页**:单次上限 256KB。结果带 `truncated: true` 与 `nextCursor` 时,把 `nextCursor` 原样传回 `cursor` 读下一页(不必重复传 region/sectionId)。翻页期间画布被改动会返回 `STALE_CURSOR` —— 这不是错误而是提醒:去掉 cursor 重新从第一页读,不要拼接两个版本的结果。
+    - **返回里的过滤痕迹**:`page`(本页/总数)、`filter`(生效的过滤条件)、`omittedRefs`(被摘掉的引用条数,按字段/关系分类)。零-dangling 是按**同一条 cursor 链的各页合并之后**成立的,不是按单页闭合——某一页里的 id 引用可能解析到前面已经翻过的页,不代表本页自身独立完整;`omittedRefs` 也按**整个过滤结果集**(而非单页)统计,只有指向结果集外的引用(跨界边、区域外的分区、已不存在的节点)才会被摘除并计进去。看到 `omittedRefs` 说明范围外还有关联内容,别据此断言"画布上没有别的东西"。
+    - 面板未打开时只能读**未过滤**的离线快照;带 region/sectionId/cursor 会返回 `SNAPSHOT_FILTER_OFFLINE`,请提示用户打开面板。
+-2. **canvas_add_note** — 放文字。`text` 用用户原话或明确要求的内容,不要自行扩写;坐标缺省会自动落在现有内容右侧,通常不用传。
+-3. **canvas_place_image** — 用户随消息发来的图片附件上墙。仅在本条消息确有图片附件时调用。
+-4. **canvas_generate_image** — 生成图片并直接落画布(先占位后替换,保留生成关系)。`prompt` 透传用户描述;`aspectRatio`(1:1/3:2/2:3)仅在用户明确要求横图/竖图/方图时传,不传由模型自定;分钟级任务,耐心等待返回。
+-5. **canvas_update_node** — 改画布上已有的节点:挪位置(`x`/`y`,绝对坐标)、改尺寸(`width`+`height` 必须成对)或按倍率缩放(`scale`,左上角不动),以及改文字(`text`,仅文字/标注类节点)。`sceneId` 与 `nodeId` 都从 canvas_snapshot 取;**一次调用只改一个节点,且只算一次撤销**,所以要把同一个节点的挪位+缩放+改字放进同一次调用。不支持改样式、删节点、批量多节点。
+-6. **canvas_edit_image** — 图生图:按提示词修改画布上的一张图,结果作为新图落在源图旁(保留衍生关系,原图不动)。`nodeId` 先用 canvas_snapshot 查;**只支持本插件生成的图或用户经聊天附件放上画布的图**——用户本地拖入的图不行,收到相应错误时引导用户把图作为附件发到聊天里再上画布。
++   - **选中态按结果集过滤**:`selectedImageNodeIds`/`selectedNodeCount` 只统计本次读到的范围;`selectionOutOfScope > 0` 表示有选中节点在你读取范围之外——此时不要猜坐标,改调 canvas_selection。
++2. **canvas_selection** — 读用户当前选中的节点(实时选中态,不受 region/分页影响,一次返回全部,上限 64):每项含 id/type/title/bounds,另给 `selectedImageNodeIds` 与 `selectedNodeCount`。用户说「这张 / 这几张 / 选中的图」时**优先用它**拿 id,再传给 canvas_edit_image(改图)或 canvas_snapshot(查详情/读像素均可;本工具也支持 `mediaNodeIds` 直接点名选中图片读像素,≤8 个,不在选中集判 `not_in_selection`)。选中超过 8 张图时分多次点名。**面板未打开返回 `PANEL_CLOSED`,不降级读离线快照**——离线的选中记录可能滞后,不作为「当前选中」依据;面板开着但仍在载入返回 `PANEL_NOT_READY`(此时读到的会是演示种子数据,所以宁可拒答),提示用户稍等再试。
++3. **canvas_add_note** — 放文字。`text` 用用户原话或明确要求的内容,不要自行扩写;坐标缺省会自动落在现有内容右侧,通常不用传。
++4. **canvas_place_image** — 用户随消息发来的图片附件上墙。仅在本条消息确有图片附件时调用。
++5. **canvas_generate_image** — 生成图片并直接落画布(先占位后替换,保留生成关系)。`prompt` 透传用户描述;`aspectRatio`(1:1/3:2/2:3)仅在用户明确要求横图/竖图/方图时传,不传由模型自定;分钟级任务,耐心等待返回。
++6. **canvas_update_node** — 改画布上已有的节点:挪位置(`x`/`y`,绝对坐标)、改尺寸(`width`+`height` 必须成对)或按倍率缩放(`scale`,左上角不动),以及改文字(`text`,仅文字/标注类节点)。`sceneId` 与 `nodeId` 都从 canvas_snapshot 取;**一次调用只改一个节点,且只算一次撤销**,所以要把同一个节点的挪位+缩放+改字放进同一次调用。不支持改样式、删节点、批量多节点。
++7. **canvas_edit_image** — 图生图:按提示词修改画布上的一张图,结果作为新图落在源图旁(保留衍生关系,原图不动)。`nodeId` 从 canvas_selection(用户点名"这张"时)或 canvas_snapshot 查。本插件生成、聊天附件过户、**用户本地拖入/粘贴**及画布存量的图均支持。
+ 
+-7. **canvas_arrange** — 整理画布:把指定的一组节点按 `row`/`column`/`grid`/`tidy` 重排,可选顺手把它们圈进一个新分区(`section.title` 用用户原话)。`sceneId` 与 `nodeIds` 都先用 canvas_snapshot 查;一次最多 100 个节点,一次调用只算一次撤销。**整单原子**:任一 nodeId 找不到 / 是连线,整次整理都不执行 —— 按返回的错误码修正输入后重试,不要期待"排好了一部分"。已锁定/已隐藏的节点**照常参与整理**(锁定只拦手动误触,不拦用户明确下的整理指令)。收到 `SECTION_NESTING_UNSUPPORTED` 说明这些节点里有分区、或它们已属别的分区:去掉 `section` 只做排布。不改尺寸、不改文字、不删节点。
+-8. **canvas_export** — 把画布导出成 PNG 或 PDF,存到当前会话的工作目录 `mivo-canvas-export/` 下。`format` 必填(png/pdf),`scale` 可传 1 或 2(2 更清晰、体积约 4 倍),`fileName` 可选(缺省带时间戳,不会覆盖上一次导出)。**导出范围是画布当前视图所见的内容**:回执里的 `nodesInView / nodesTotal / partial` 会如实告知覆盖了多少元素——`partial: true` 时要转告用户"视图外的内容没导进去,可以先缩放/平移画布到想导出的范围再导一次",不要声称导出了整块画布。产物过大(`EXPORT_TOO_LARGE`)时建议降 scale 或改导 PNG;工作目录为只读/计划模式或远程 SSH 会话时会明确失败,**这种情况不会产生任何文件**,如实告知用户即可。
++8. **canvas_arrange** — 整理画布:把指定的一组节点按 `row`/`column`/`grid`/`tidy` 重排,可选顺手把它们圈进一个新分区(`section.title` 用用户原话)。`sceneId` 与 `nodeIds` 都先用 canvas_snapshot 查;一次最多 100 个节点,一次调用只算一次撤销。**整单原子**:任一 nodeId 找不到 / 是连线,整次整理都不执行 —— 按返回的错误码修正输入后重试,不要期待"排好了一部分"。已锁定/已隐藏的节点**照常参与整理**(锁定只拦手动误触,不拦用户明确下的整理指令)。收到 `SECTION_NESTING_UNSUPPORTED` 说明这些节点里有分区、或它们已属别的分区:去掉 `section` 只做排布。不改尺寸、不改文字、不删节点。
++9. **canvas_export** — 把画布导出成 PNG 或 PDF,存到当前会话的工作目录 `mivo-canvas-export/` 下。`format` 必填(png/pdf),`scale` 可传 1 或 2(2 更清晰、体积约 4 倍),`fileName` 可选(缺省带时间戳,不会覆盖上一次导出)。**导出范围是画布当前视图所见的内容**:回执里的 `nodesInView / nodesTotal / partial` 会如实告知覆盖了多少元素——`partial: true` 时要转告用户"视图外的内容没导进去,可以先缩放/平移画布到想导出的范围再导一次",不要声称导出了整块画布。产物过大(`EXPORT_TOO_LARGE`)时建议降 scale 或改导 PNG;工作目录为只读/计划模式或远程 SSH 会话时会明确失败,**这种情况不会产生任何文件**,如实告知用户即可。
+ 
+ ## 注意事项
+ 
+-- 写入类工具(2-8)需要用户打开着 Mivo Canvas 面板;收到 `PANEL_CLOSED` 错误时,提示用户打开面板后重试,不要反复自动重试。
++- 写入类工具(3-9)需要用户打开着 Mivo Canvas 面板;canvas_selection(2)是读工具但**同样需要面板在线**(选中态只有实时才可信);收到 `PANEL_CLOSED` 错误时,提示用户打开面板后重试,不要反复自动重试。
+ - `canvas_snapshot` 的错误码:`INVALID_PARAMS`(参数不合法,如 region 与 sectionId 同时传、宽高 ≤ 0)、`SECTION_NOT_FOUND`(分区 id 不存在或不是分区节点)、`STALE_CURSOR`(游标失效,重新读第一页)、`SCENE_MISMATCH`(指定的画布不是当前活跃画布)、`SNAPSHOT_FILTER_OFFLINE`(面板未打开时用了过滤/翻页)。这些都是明确原因,按提示改参数或引导用户,不要盲目重试同一调用。
+ - 收到 `PANEL_NOT_READY` 时含义不同:面板**开着但还在载入**,提示用户稍等片刻再试一次即可,不必让他去开面板。
+ - `canvas_add_note` 在面板未打开时会返回 `ok:true` + `applied:false` + `pendingIntentId`:意思是**改动已排队、但还没生效**,面板打开后才会应用。此时必须如实告诉用户「还没落到画布上,打开 Mivo Canvas 面板就会应用」,**不要说已完成、不要反复重试**;`pendingIntentId` 是排队编号,**不是节点 id**,不要拿它当 `nodeId` 传给别的工具。
+diff --git a/cindyplugin/src/__tests__/agentBridgeSelection.test.ts b/cindyplugin/src/__tests__/agentBridgeSelection.test.ts
+new file mode 100644
+index 00000000..a75db328
+--- /dev/null
++++ b/cindyplugin/src/__tests__/agentBridgeSelection.test.ts
+@@ -0,0 +1,248 @@
++/**
++ * agentBridge `selection` 动词(#297 选中直读)——面板侧行为测试。
++ *
++ * 电子脑侧(main.js canvas_selection 的入参校验/出口形状门/离线不降级)在
++ * canvasSelectionTool.test.ts;这里对**真实 installAgentBridge** 断言面板侧派生:
++ *   1 清单来自 store 快照的 selectedNodeIds,不吃任何过滤;
++ *   2 选中清单不含快照里不存在的 id —— 该收敿由共享层 buildAiContextSnapshot 完成
++ *     (真数据源断言,不 mock);
++ *   3 >64 截断置 truncated,计数不受截断影响;
++ *   4 mediaNodeIds 不在选中集 → not_in_selection(不是 not_in_page——选中集没有页);
++ *   5 selection 虽是读动词但进 READY_REQUIRED_VERBS:pre-hydrate 必须拒答
++ *     (此时 store 是 demo 种子,读出来是"看似合法的假选区")。
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.hoisted(() => {
++  const store = new Map<string, string>()
++  const memStorage = {
++    get length() {
++      return store.size
++    },
++    clear: () => store.clear(),
++    getItem: (key: string) => store.get(key) ?? null,
++    key: (index: number) => [...store.keys()][index] ?? null,
++    removeItem: (key: string) => {
++      store.delete(key)
++    },
++    setItem: (key: string, value: string) => {
++      store.set(key, String(value))
++    },
++  }
++  const globals = globalThis as Record<string, unknown>
++  if (globals.window === undefined) globals.window = { localStorage: memStorage }
++  if (globals.localStorage === undefined) globals.localStorage = memStorage
++})
++
++vi.mock('../../../src/lib/demoImages', () => ({ createDemoImage: () => 'data:image/png;base64,mock' }))
++vi.mock('../../../src/store/remoteDebugReporter', () => ({ reportRemoteDebugEntry: () => {} }))
++vi.mock('../../../src/lib/assetStorage', () => ({
++  saveGeneratedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock', name: 'n', type: 'image/png' })),
++  saveImportedAsset: vi.fn(async () => ({ assetUrl: 'mivo-asset://mock-imported' })),
++  readImportedAssetFile: vi.fn(),
++}))
++vi.mock('../persist/bridge', () => ({ persistRequest: vi.fn() }))
++vi.mock('../persist/persistSync', () => ({
++  flushPersistNow: async () => true,
++  restoreFromDiskIfEmpty: async () => 'skipped',
++  startAutoSave: () => {},
++}))
++
++// 只覆写 agentReadSnapshot(selection 动词的唯一数据源);其余动词原样保留——
++// 部分 mock 而非整仓替身,免得把桥的其它分支一起测成假的。
++const snapshotFixtureRef: { current: Record<string, unknown> } = { current: {} }
++vi.mock('../../../src/agent/canvasAgentVerbs', async (importOriginal) => {
++  const original = await importOriginal<Record<string, unknown>>()
++  return { ...original, agentReadSnapshot: () => snapshotFixtureRef.current }
++})
++
++import { ChannelBus, channelConstructorFor, flushUntil } from './brainHarness'
++import { installAgentBridge } from '../agent/agentBridge'
++import { buildAiContextSnapshot } from '../../../src/store/aiCanvasWorkflow'
++import {
++  beginCanvasHydration,
++  markCanvasHydrationComplete,
++  resetCanvasWriteGateForTests,
++} from '../../../src/agent/canvasWriteGate'
++
++const CHANNEL = 'mivo-canvas-agent'
++
++const node = (id: string, type = 'image') => ({
++  id,
++  type,
++  title: id,
++  bounds: { x: 0, y: 0, width: 100, height: 100 },
++  status: 'ready',
++})
++
++const wireBridge = () => {
++  const bus = new ChannelBus()
++  const globals = globalThis as Record<string, unknown>
++  const previous = globals.BroadcastChannel
++  globals.BroadcastChannel = channelConstructorFor(bus)
++  installAgentBridge()
++  globals.BroadcastChannel = previous
++
++  const brainSide = bus.open(CHANNEL)
++  let seq = 0
++  const ask = async (verb: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown> | null> => {
++    seq += 1
++    const reqId = `probe-${seq}`
++    let reply: Record<string, unknown> | null = null
++    brainSide.onmessage = (event) => {
++      const data = event.data as Record<string, unknown> | undefined
++      if (data && data.reply === true && data.reqId === reqId) reply = data
++    }
++    brainSide.postMessage({ reqId, verb, params })
++    await flushUntil(() => reply !== null, { label: `agent 桥对动词 '${verb}' 的回执` })
++    return reply
++  }
++  return { ask }
++}
++
++beforeEach(() => {
++  // 默认置为「已 hydrate」:除时序门那条用例外,其余用例测的都是派生逻辑,不该被
++  // READY_REQUIRED_VERBS 的闸门挡在门外。时序门用例自己 reset 回未就绪。
++  resetCanvasWriteGateForTests()
++  beginCanvasHydration()
++  markCanvasHydrationComplete()
++  snapshotFixtureRef.current = {
++    version: 1,
++    sceneId: 'scene-sel',
++    selectedNodeIds: [],
++    nodes: [],
++    edges: [],
++    links: [],
++  }
++})
++
++describe('agentBridge selection 动词', () => {
++  it('清单来自 selectedNodeIds,含全类型;imageIds 只含图片;不吃过滤', async () => {
++    snapshotFixtureRef.current = {
++      version: 1,
++      sceneId: 'scene-sel',
++      selectedNodeIds: ['img-a', 'note-b'],
++      nodes: [node('img-a'), node('note-b', 'markup'), node('img-unselected')],
++      edges: [],
++      links: [],
++    }
++    const { ask } = wireBridge()
++    const reply = await ask('selection')
++    expect(reply?.ok).toBe(true)
++    expect(reply?.sceneId).toBe('scene-sel')
++    expect(reply?.selectedNodeCount).toBe(2)
++    expect((reply?.selectedNodes as Array<{ id: string }>).map((n) => n.id)).toEqual(['img-a', 'note-b'])
++    expect(reply?.selectedImageNodeIds).toEqual(['img-a'])
++    // 回执只带定位四元组,不带 generation 等大字段
++    expect(Object.keys((reply?.selectedNodes as object[])[0]).sort()).toEqual(['bounds', 'id', 'title', 'type'])
++  })
++
++  // gpt 审查 P2:本处初版断言 `unresolvedSelectedCount === 1`,而它之所以绿**只因为
++  // 本文件 mock 了 agentReadSnapshot、伪造出一份带幽灵 id 的快照** —— 生产永不产生该
++  // 形状,所以那个字段恒为 0、是死代码(已整字段删除)。改成对**真数据源**断言:证明
++  // 幽灵 id 在进入本 verb 之前就已被共享层收敿掉,这才是"字段不可达"的依据本身。
++  // 反证:把 aiCanvasWorkflow.ts 的 `selectedIdsForSnapshot` 改成原样返回
++  // selectedNodeIds(去掉 visibleIds 过滤),本用例必须转红。
++  it('幽灵 id 由共享层 buildAiContextSnapshot 收敿,不会流到本 verb(真数据源,不 mock)', async () => {
++    const live = {
++      id: 'img-a',
++      type: 'image' as const,
++      title: 'a',
++      x: 0, y: 0, width: 10, height: 10,
++      status: 'ready' as const,
++      createdAt: 0,
++    }
++    const snapshot = buildAiContextSnapshot({
++      nodes: [live] as never,
++      edges: [],
++      selectedNodeIds: ['img-a', 'ghost-deleted'],
++      selectedNodeId: 'img-a',
++      sceneId: 'scene-sel',
++    } as never)
++    // 入参含幽灵 id,产出不含 —— 所以 verb 侧的 map+filter 结构上永不丢项。
++    expect(snapshot.selectedNodeIds).toEqual(['img-a'])
++    expect(snapshot.nodes.map((item) => item.id)).toEqual(['img-a'])
++  })
++
++  it('选中超 64 → 截断置 truncated,计数不受截断影响,imageIds 同一上限', async () => {
++    const ids = Array.from({ length: 70 }, (_, i) => `img-${i}`)
++    snapshotFixtureRef.current = {
++      version: 1,
++      sceneId: 'scene-sel',
++      selectedNodeIds: ids,
++      nodes: ids.map((id) => node(id)),
++      edges: [],
++      links: [],
++    }
++    const { ask } = wireBridge()
++    const reply = await ask('selection')
++    expect(reply?.selectedNodeCount).toBe(70)
++    expect(reply?.selectedNodesTruncated).toBe(true)
++    expect((reply?.selectedNodes as unknown[]).length).toBe(64)
++    expect((reply?.selectedImageNodeIds as unknown[]).length).toBe(64)
++  })
++
++  it('mediaNodeIds 不在选中集 → not_in_selection(不是 not_in_page),summary 如实聚合', async () => {
++    snapshotFixtureRef.current = {
++      version: 1,
++      sceneId: 'scene-sel',
++      selectedNodeIds: ['img-a'],
++      nodes: [node('img-a'), node('img-elsewhere')],
++      edges: [],
++      links: [],
++    }
++    const { ask } = wireBridge()
++    const reply = await ask('selection', { mediaNodeIds: ['img-elsewhere'] })
++    expect(reply?.ok).toBe(true)
++    expect(reply?.mediaStates).toEqual({ 'img-elsewhere': { state: 'unavailable', reason: 'not_in_selection' } })
++    expect(reply?.mediaSummary).toEqual({ requested: 1, available: 0, unavailable: 1 })
++  })
++
++  it('mediaNodeIds 形状违规(9 个)→ INVALID_PARAMS(纵深复校,不依赖 main.js 那份)', async () => {
++    const { ask } = wireBridge()
++    const reply = await ask('selection', { mediaNodeIds: Array.from({ length: 9 }, (_, i) => `x-${i}`) })
++    expect(reply?.ok).toBe(false)
++    expect(reply?.code).toBe('INVALID_PARAMS')
++  })
++
++  // gpt 审查 P1:本处初版断言"pre-hydrate 也照常应答",把一个真实的错误窗口钉成了
++  // 预期。`installAgentBridge()` 在 plugin-main.tsx 模块顶层求值,而
++  // `createRoot().render()` 排在 localeReady.then() 里 —— 桥在 React 挂载前就应答,
++  // 此时 store 是 demo 种子(character-flow 自带 selectedNodeId),会交卷一份
++  // 「看似合法的种子选区」并标 source:'实时画布'。已反转:必须拒答。
++  it('pre-hydrate 必须拒答 PANEL_NOT_READY(此时 store 是 demo 种子,不是用户画布)', async () => {
++    // 撤回 beforeEach 的就绪状态,重现 pre-hydrate 窗口。
++    // 反证:把 selection 从 READY_REQUIRED_VERBS 里移除,本用例必须转红。
++    resetCanvasWriteGateForTests()
++    snapshotFixtureRef.current = {
++      version: 1,
++      sceneId: 'scene-sel',
++      selectedNodeIds: ['seed-node'],
++      nodes: [node('seed-node')],
++      edges: [],
++      links: [],
++    }
++    const { ask } = wireBridge()
++    const reply = await ask('selection')
++    expect(reply?.ok).toBe(false)
++    expect(reply?.code).toBe('PANEL_NOT_READY')
++    // 关键:绝不能把种子选区当结果交出去
++    expect(reply?.selectedNodes).toBeUndefined()
++    expect(reply?.selectedImageNodeIds).toBeUndefined()
++  })
++
++  it('hydration 完成后正常应答(证明上面那条拒答是时序门,不是把功能关死)', async () => {
++    snapshotFixtureRef.current = {
++      version: 1,
++      sceneId: 'scene-sel',
++      selectedNodeIds: ['img-a'],
++      nodes: [node('img-a')],
++      edges: [],
++      links: [],
++    }
++    const { ask } = wireBridge()
++    const reply = await ask('selection')
++    expect(reply?.ok).toBe(true)
++    expect(reply?.selectedImageNodeIds).toEqual(['img-a'])
++  })
++})
+diff --git a/cindyplugin/src/__tests__/agentManifest.test.ts b/cindyplugin/src/__tests__/agentManifest.test.ts
+index dfb20abe..8e00fc8a 100644
+--- a/cindyplugin/src/__tests__/agentManifest.test.ts
++++ b/cindyplugin/src/__tests__/agentManifest.test.ts
+@@ -25,7 +25,7 @@ const PRIOR_SLOTS = ['panel', 'fs', 'tool', 'cindy', 'skill', 'card', 'notify',
+ /** §六-1 的工具预算上限(宿主硬约束)。 */
+ const TOOL_BUDGET = 16
+ // running total:R3/P3-14/R5 三段落地后固定为 8;P2 不加工具。
+-const EXPECTED_TOOL_COUNT = 8
++const EXPECTED_TOOL_COUNT = 9 // +1: canvas_selection(#297 选中直读)
+ 
+ type Manifest = {
+   version: string
+diff --git a/cindyplugin/src/__tests__/arrangeWiring.test.ts b/cindyplugin/src/__tests__/arrangeWiring.test.ts
+index a9e675fe..a3694112 100644
+--- a/cindyplugin/src/__tests__/arrangeWiring.test.ts
++++ b/cindyplugin/src/__tests__/arrangeWiring.test.ts
+@@ -364,7 +364,13 @@ describe('ghost.json arrange 工具契约', () => {
+     // arrange 合入 main 前:本分支恰好 +1;合入后(merge-base 已含 arrange):不再有增量。
+     // 写成条件式而非静态 +1,否则该断言在 arrange 进 main 的那一刻起对所有后续分支都是假红。
+     const added = names.filter((name) => !baseNames.includes(name))
+-    expect(added).toEqual(baseNames.includes('canvas_arrange') ? [] : ['canvas_arrange'])
++    // 同 arrange 的条件式写法:每个"会加工具的分支"在此登记自己的增量,合入 main
++    // (merge-base 已含该工具)后增量自动归零,不产生假红。
++    const expectedAdded = [
++      ...(baseNames.includes('canvas_arrange') ? [] : ['canvas_arrange']),
++      ...(baseNames.includes('canvas_selection') ? [] : ['canvas_selection']),
++    ]
++    expect(added.sort()).toEqual(expectedAdded.sort())
+   })
+ 
+   it('版本相对 merge-base 严格递增、槽位只增不减', (ctx) => {
+diff --git a/cindyplugin/src/__tests__/brainSnapshot.test.ts b/cindyplugin/src/__tests__/brainSnapshot.test.ts
+index 871ae780..cd0450ce 100644
+--- a/cindyplugin/src/__tests__/brainSnapshot.test.ts
++++ b/cindyplugin/src/__tests__/brainSnapshot.test.ts
+@@ -31,6 +31,7 @@ const offlineEgressShapeOf = (snapshot: Record<string, unknown>): Record<string,
+   const next = { ...snapshot }
+   delete next.selectedImageNodeIds
+   delete next.selectedNodeCount
++  delete next.selectionOutOfScope
+   delete next.selectedImageNodesTruncated
+   delete next.observation // SC-T2c.4:别名字段三态统一清洗,离线路径同样不例外。
+   return { ...next, selectionObservation: 'unavailable' }
+@@ -96,6 +97,7 @@ describe('canvas_snapshot 扩参透传', () => {
+       nodes: [node('n-0', { text: 'x'.repeat(80_000) })],
+       selectedImageNodeIds: [],
+       selectedNodeCount: 0,
++      selectionOutOfScope: 0,
+     }
+     withPanel(brain, {
+       ok: true,
+@@ -155,11 +157,13 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+       nodes: [node('img-1', { type: 'image' }), node('note-1', { type: 'markup' })],
+       selectedImageNodeIds: ['img-1'],
+       selectedNodeCount: 2,
++      selectionOutOfScope: 0,
+     })
+     expect(sent?.result?.snapshot).toMatchObject({
+       selectionObservation: 'available',
+       selectedImageNodeIds: ['img-1'],
+       selectedNodeCount: 2,
++      selectionOutOfScope: 0,
+     })
+   })
+ 
+@@ -176,6 +180,7 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+       nodes: [node('img-1', { type: 'image' })],
+       selectedImageNodeIds: ['img-1'],
+       selectedNodeCount: 1,
++      selectionOutOfScope: 0,
+     })
+     expect(sent?.result?.snapshot).not.toHaveProperty('observation')
+     expect(Object.keys(sent?.result?.snapshot as object)).toContain('selectionObservation')
+@@ -205,6 +210,7 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+       nodes: imageIds.map((id) => node(id, { type: 'image' })),
+       selectedImageNodeIds: imageIds,
+       selectedNodeCount: 70,
++      selectionOutOfScope: 0,
+       selectedImageNodesTruncated: true,
+     })
+     expect(sent?.result?.snapshot).toMatchObject({
+@@ -221,6 +227,7 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+       nodes: [node('note-1', { type: 'markup' }), node('note-2', { type: 'markup' }), node('note-3', { type: 'markup' })],
+       selectedImageNodeIds: [],
+       selectedNodeCount: 3,
++      selectionOutOfScope: 0,
+     })
+     expect(sent?.result?.snapshot).toMatchObject({
+       selectionObservation: 'available',
+@@ -239,11 +246,13 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+       nodes: [node('img-1', { type: 'image' }), node('note-1', { type: 'markup' })],
+       selectedImageNodeIds: [],
+       selectedNodeCount: 0,
++      selectionOutOfScope: 0,
+     })
+     expect(sent?.result?.snapshot).toMatchObject({
+       selectionObservation: 'available',
+       selectedImageNodeIds: [],
+       selectedNodeCount: 0,
++      selectionOutOfScope: 0,
+     })
+     expect(sent?.result?.snapshot).not.toHaveProperty('selectedImageNodesTruncated')
+   })
+@@ -257,6 +266,7 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+       nodes: [node('img-1', { type: 'image' })], // 本页只有一个节点,其余在后续页
+       selectedImageNodeIds: ['img-1', 'img-2', 'img-3'], // 全结果集清单,跨页
+       selectedNodeCount: 3,
++      selectionOutOfScope: 0,
+       truncated: true,
+     })
+     expect(sent?.result?.snapshot).toMatchObject({
+@@ -315,6 +325,20 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+         '本页语义:selectedImageNodeIds 命中本页一个 type 不是 image 的节点',
+         { selectedImageNodeIds: ['note-1'], selectedNodeCount: 1 },
+       ],
++      // #297 选中直读:selectionOutOfScope 与其余数值字段同一套形状纪律——缺失/
++      // 负数/非安全整数都判 invalid,不单独放行(真实面板经共享层派生后必存在)。
++      [
++        '形状⑦:selectionOutOfScope 缺失(整组字段必须同时存在)',
++        { selectedImageNodeIds: ['img-1'], selectedNodeCount: 1, selectionOutOfScope: undefined },
++      ],
++      [
++        '形状⑧:selectionOutOfScope 为负数',
++        { selectedImageNodeIds: ['img-1'], selectedNodeCount: 1, selectionOutOfScope: -1 },
++      ],
++      [
++        '形状⑨:selectionOutOfScope 非整数',
++        { selectedImageNodeIds: ['img-1'], selectedNodeCount: 1, selectionOutOfScope: 0.5 },
++      ],
+       // SC-T2c.3②(P1 修复):`Map.get` 的 undefined 同时表示"未出现"与"出现但 type
+       // 缺失"——ghost-1 确实出现在本页 nodes 里(不是"不在本页,无法复核"的信任边界
+       // 情形),但缺 type 字段;旧逻辑 `type !== undefined && type !== 'image'` 对
+@@ -338,6 +362,7 @@ describe('canvas_snapshot 选中观测组三态归一化(#297 T2b egress)', () =
+               node('img-1', { type: 'image' }), node('img-2', { type: 'image' }), node('note-1', { type: 'markup' }),
+               ...(extraNodes ?? []),
+             ],
++            selectionOutOfScope: 0,
+             ...selectionFields,
+           },
+           truncated: false,
+diff --git a/cindyplugin/src/__tests__/canvasSelectionTool.test.ts b/cindyplugin/src/__tests__/canvasSelectionTool.test.ts
+new file mode 100644
+index 00000000..011be1ce
+--- /dev/null
++++ b/cindyplugin/src/__tests__/canvasSelectionTool.test.ts
+@@ -0,0 +1,216 @@
++/**
++ * canvas_selection(#297 选中直读)main.js 侧流程测试。
++ *
++ * 背景:选中态是全局、极小、易变的事实,canvas_snapshot 的选中字段按 region/sectionId
++ * 结果集过滤,「没选」与「选了但在读取范围外」返回字节级同形(空数组+0)——2026-08-04
++ * 真机事故:把选中的 16:9 图读成隔壁 1:1。本工具一次返回全部选中节点,不吃过滤。
++ *
++ * 覆盖面:入参透传与校验 / 合法回执交卷 / 出口形状门(normalizeSelectionReply)逐条
++ * 坏例 / 离线不降级(与 canvas_snapshot 的离线降级刻意不同)。
++ */
++import { describe, expect, it } from 'vitest'
++import { loadBrain } from './brainHarness'
++import { closedPanelBrain, lastResult, withPanel } from './brainSnapshotFixtures'
++
++const selNode = (id: string, type = 'image') => ({
++  id,
++  type,
++  title: id,
++  bounds: { x: 0, y: 0, width: 100, height: 100 },
++})
++
++const validReply = {
++  ok: true,
++  sceneId: 'scene-1',
++  selectedNodes: [selNode('img-1'), selNode('note-1', 'markup')],
++  selectedNodeCount: 2,
++  selectedImageNodeIds: ['img-1'],
++}
++
++const callSelection = async (reply: Record<string, unknown>, args: Record<string, unknown> = {}) => {
++  const brain = loadBrain()
++  const seen = withPanel(brain, reply)
++  await brain.handles.handleToolCall({ tool: 'canvas_selection', callId: 'c1', args })
++  return { sent: lastResult(brain), seen }
++}
++
++describe('canvas_selection 入参', () => {
++  it('无参调用 → verb selection,params 为空(零寄存请求)', async () => {
++    const { sent, seen } = await callSelection(validReply)
++    expect(seen).toHaveLength(1)
++    expect(seen[0].verb).toBe('selection')
++    expect(seen[0].params).toEqual({})
++    expect(sent?.ok).toBe(true)
++  })
++
++  it('mediaNodeIds 透传;宿主注入与未知字段不进面板动词', async () => {
++    const { seen } = await callSelection(validReply, {
++      mediaNodeIds: ['img-1'],
++      session_context: { session_id: 's' },
++      attachments: ['deadbeef'],
++      nonsense: 1,
++    })
++    expect(seen[0].params).toEqual({ mediaNodeIds: ['img-1'] })
++  })
++
++  it('mediaNodeIds 超 8 个 → INVALID_PARAMS,不进面板', async () => {
++    const { sent, seen } = await callSelection(validReply, {
++      mediaNodeIds: Array.from({ length: 9 }, (_, i) => `img-${i}`),
++    })
++    expect(seen).toHaveLength(0)
++    expect(sent?.ok).toBe(false)
++    expect(sent?.errorCode).toBe('INVALID_PARAMS')
++  })
++
++  it('mediaNodeIds 含重复 → INVALID_PARAMS', async () => {
++    const { sent } = await callSelection(validReply, { mediaNodeIds: ['img-1', 'img-1'] })
++    expect(sent?.ok).toBe(false)
++    expect(sent?.errorCode).toBe('INVALID_PARAMS')
++  })
++})
++
++describe('canvas_selection 合法回执交卷', () => {
++  it('选中清单/计数/图片 id 原样交卷,source 标实时画布', async () => {
++    const { sent } = await callSelection(validReply)
++    expect(sent?.ok).toBe(true)
++    expect(sent?.result).toMatchObject({
++      source: '实时画布',
++      sceneId: 'scene-1',
++      selectedNodeCount: 2,
++      selectedImageNodeIds: ['img-1'],
++    })
++    expect((sent?.result?.selectedNodes as unknown[]).length).toBe(2)
++  })
++
++  it('选 0 张 → ok:true + note 点明「实时选中态,不是读取范围问题」', async () => {
++    const { sent } = await callSelection({ ok: true, sceneId: 's', selectedNodes: [], selectedNodeCount: 0, selectedImageNodeIds: [] })
++    expect(sent?.ok).toBe(true)
++    expect(sent?.result?.selectedNodeCount).toBe(0)
++    expect(String(sent?.result?.note)).toContain('实时选中态')
++  })
++
++  it('mediaStates/mediaSummary 原样透传(信任模型与 canvas_snapshot 一致)', async () => {
++    const { sent } = await callSelection({
++      ...validReply,
++      mediaStates: { 'img-1': { state: 'available', imageRef: 'cindy-media://blobs/ab.png' } },
++      mediaSummary: { requested: 1, available: 1, unavailable: 0 },
++    })
++    expect(sent?.result?.mediaStates).toEqual({ 'img-1': { state: 'available', imageRef: 'cindy-media://blobs/ab.png' } })
++    expect(sent?.result?.mediaSummary).toEqual({ requested: 1, available: 1, unavailable: 0 })
++  })
++
++  it('合法截断:64 条清单 + count>64 + truncated → 原样交卷', async () => {
++    const nodes = Array.from({ length: 64 }, (_, i) => selNode(`img-${i}`))
++    const { sent } = await callSelection({
++      ok: true,
++      sceneId: 's',
++      selectedNodes: nodes,
++      selectedNodeCount: 70,
++      selectedImageNodeIds: nodes.map((n) => n.id),
++      selectedNodesTruncated: true,
++    })
++    expect(sent?.ok).toBe(true)
++    expect(sent?.result?.selectedNodesTruncated).toBe(true)
++  })
++})
++
++describe('canvas_selection 出口形状门(整单拒绝,不剔字段放行)', () => {
++  const badCases: Array<[string, Record<string, unknown>]> = [
++    ['sceneId 缺失', { ...validReply, sceneId: undefined }],
++    ['selectedNodes 非数组', { ...validReply, selectedNodes: 'x' }],
++    ['selectedNodes 含空 id', { ...validReply, selectedNodes: [selNode('img-1'), selNode('')] , selectedNodeCount: 2 }],
++    ['selectedNodes 含重复 id', { ...validReply, selectedNodes: [selNode('img-1'), selNode('img-1')], selectedNodeCount: 2 }],
++    ['节点缺 bounds', { ...validReply, selectedNodes: [{ id: 'img-1', type: 'image', title: 't' }], selectedNodeCount: 1, selectedImageNodeIds: ['img-1'] }],
++    ['bounds 含非有限数', { ...validReply, selectedNodes: [{ ...selNode('img-1'), bounds: { x: NaN, y: 0, width: 1, height: 1 } }], selectedNodeCount: 1, selectedImageNodeIds: ['img-1'] }],
++    ['未截断但长度不等于计数', { ...validReply, selectedNodeCount: 5 }],
++    ['截断为 true 但清单未满', { ...validReply, selectedNodesTruncated: true, selectedNodeCount: 70 }],
++    ['selectedImageNodeIds 含重复', { ...validReply, selectedImageNodeIds: ['img-1', 'img-1'] }],
++    ['selectedImageNodeIds 命中清单里非 image 节点', { ...validReply, selectedImageNodeIds: ['note-1'] }],
++    ['selectedNodeCount 负数', { ...validReply, selectedNodeCount: -1 }],
++    // gpt 审查 P2:title 是契约必填(AiCanvasContextNode.title: string),egress 存在
++    // 的理由就是面板回执跨进程不可信 —— 初版漏验,缺 title 的坑回包会被判合法。
++    [
++      '节点缺 title(契约必填,egress 必须真的验)',
++      { ...validReply, selectedNodes: [{ id: 'img-1', type: 'image', bounds: { x: 0, y: 0, width: 1, height: 1 } }], selectedNodeCount: 1, selectedImageNodeIds: ['img-1'] },
++    ],
++    [
++      'title 不是字符串',
++      { ...validReply, selectedNodes: [{ ...selNode('img-1'), title: 42 }], selectedNodeCount: 1, selectedImageNodeIds: ['img-1'] },
++    ],
++    // gpt 审查 P2:未截断时清单即全量,外来 image id 此前因 `typeById.has(id)` 为 false
++    // 被放行 —— agent 会拿到一个根本没被选中的"选中图片 id"。
++    [
++      '未截断但 selectedImageNodeIds 含清单外的外来 id',
++      { ...validReply, selectedNodes: [selNode('note-1', 'markup')], selectedNodeCount: 1, selectedImageNodeIds: ['img-not-selected'] },
++    ],
++    [
++      '未截断但清单里的图片未被 selectedImageNodeIds 收录(漏收)',
++      { ...validReply, selectedNodes: [selNode('img-1'), selNode('img-2')], selectedNodeCount: 2, selectedImageNodeIds: ['img-1'] },
++    ],
++  ]
++  for (const [label, reply] of badCases) {
++    it(label + ' → SELECTION_INVALID', async () => {
++      const { sent } = await callSelection(reply)
++      expect(sent?.ok).toBe(false)
++      expect(sent?.errorCode).toBe('SELECTION_INVALID')
++    })
++  }
++})
++
++describe('canvas_selection 交卷投影(嵌套字段不得直通)', () => {
++  // gpt 审查 P2:result 字段 allowlist(门禁那份与 toolResultSweep 那份)只静态校验
++  // **顶层**键;`selectedNodes` 元素内部的键完全不受约束。原样引用面板对象时,坑回包
++  // 里多挂的任何字段都会随交卷载荷出去,而两道门照常绿。selectionResult 现在逐项
++  // 重建四元组,多余字段物理丢弃。
++  // 反证:把 selectionResult 里的 .map 投影改回 `live.selectedNodes`,本用例必须转红。
++  it('面板多挂的嵌套字段被丢弃,不随交卷载荷外泄', async () => {
++    const { sent } = await callSelection({
++      ...validReply,
++      selectedNodes: [
++        { ...selNode('img-1'), rawPanelReply: '/Users/praise/secret', assetOriginalName: '客户机密.png' },
++        selNode('note-1', 'markup'),
++      ],
++    })
++    expect(sent?.ok).toBe(true)
++    const nodes = sent?.result?.selectedNodes as Array<Record<string, unknown>>
++    expect(Object.keys(nodes[0]).sort()).toEqual(['bounds', 'id', 'title', 'type'])
++    expect(JSON.stringify(sent?.result)).not.toContain('/Users/praise/secret')
++    expect(JSON.stringify(sent?.result)).not.toContain('客户机密')
++  })
++
++  it('bounds 内部多挂的字段同样被丢弃(bounds 也是个不受约束的口子)', async () => {
++    const { sent } = await callSelection({
++      ...validReply,
++      selectedNodes: [
++        { ...selNode('img-1'), bounds: { x: 1, y: 2, width: 3, height: 4, leaked: '/Users/praise/x' } },
++        selNode('note-1', 'markup'),
++      ],
++    })
++    expect(sent?.ok).toBe(true)
++    const nodes = sent?.result?.selectedNodes as Array<{ bounds: Record<string, unknown> }>
++    expect(Object.keys(nodes[0].bounds).sort()).toEqual(['height', 'width', 'x', 'y'])
++    expect(JSON.stringify(sent?.result)).not.toContain('/Users/praise/x')
++  })
++})
++
++describe('canvas_selection 离线不降级', () => {
++  it('面板未打开 → PANEL_CLOSED,不读离线快照(选中态宁缺毋滥)', async () => {
++    const brain = closedPanelBrain()
++    const pending = brain.handles.handleToolCall({ tool: 'canvas_selection', callId: 'c1', args: {} })
++    brain.clock.advance(6_000)
++    await pending
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(false)
++    expect(sent?.errorCode).toBe('PANEL_CLOSED')
++    expect(String(sent?.message)).toContain('滞后')
++    // 反向断言:离线降级读的是 canvases/ai-snapshot.json——选中直读绝不碰它。
++    const readPaths = brain.fsRequests.filter((r) => r.op === 'read').map((r) => r.path)
++    expect(readPaths).not.toContain('canvases/ai-snapshot.json')
++  })
++
++  it('面板明确拒绝(非 PANEL_CLOSED)→ 错误码原样透传', async () => {
++    const { sent } = await callSelection({ ok: false, code: 'SOME_ERR', message: 'x' })
++    expect(sent?.ok).toBe(false)
++    expect(sent?.errorCode).toBe('SOME_ERR')
++  })
++})
+diff --git a/cindyplugin/src/__tests__/depositBrain.test.ts b/cindyplugin/src/__tests__/depositBrain.test.ts
+index d7210f3a..e366a92b 100644
+--- a/cindyplugin/src/__tests__/depositBrain.test.ts
++++ b/cindyplugin/src/__tests__/depositBrain.test.ts
+@@ -1756,8 +1756,8 @@ describe('ghost.json — 前段口径(能力项与工具预算)', () => {
+   it('工具数不变(不因本段增长,≤16 预算)', () => {
+     // 基线 8 = main 已合入 R3 canvas_update_node(#323)+ P3-14 canvas_export(#328)
+     // + R5 canvas_arrange(#326);本段(前段口径)不加工具。
+-    // 本段(前段口径)不加工具。
+-    expect(manifest.tools).toHaveLength(8)
++    // 本段(前段口径)不加工具。#297 选中直读合入后基线 9(canvas_selection)。
++    expect(manifest.tools).toHaveLength(9)
+     expect(manifest.tools.length).toBeLessThanOrEqual(16)
+   })
+ 
+diff --git a/cindyplugin/src/__tests__/exportManifest.test.ts b/cindyplugin/src/__tests__/exportManifest.test.ts
+index 3bfdbaad..bf53545e 100644
+--- a/cindyplugin/src/__tests__/exportManifest.test.ts
++++ b/cindyplugin/src/__tests__/exportManifest.test.ts
+@@ -18,7 +18,7 @@ const MANIFEST_PATH = fileURLToPath(new URL('../../ghost.json', import.meta.url)
+ /** 宿主硬上限(手册与 issue 一致):逼近 14 就要改两段式目录,越过 16 直接拒。 */
+ const TOOL_HARD_CAP = 16
+ /** 本分支落地后的工具总数(P3-14 前 5 个 + canvas_export)。 */
+-const EXPECTED_TOOL_COUNT = 8
++const EXPECTED_TOOL_COUNT = 9 // +1: canvas_selection(#297 选中直读)
+ 
+ type ToolSpec = {
+   name: string
+diff --git a/cindyplugin/src/__tests__/notifyManifest.test.ts b/cindyplugin/src/__tests__/notifyManifest.test.ts
+index bcdf8006..809259a4 100644
+--- a/cindyplugin/src/__tests__/notifyManifest.test.ts
++++ b/cindyplugin/src/__tests__/notifyManifest.test.ts
+@@ -18,9 +18,10 @@ const PRE_NOTIFY_SLOTS = ['panel', 'fs', 'tool', 'cindy', 'skill', 'card']
+ const CARD_VERSION = [0, 7, 7]
+ // 宿主硬上限(手册 §3.5:tools 超 16 项直接拒装)。
+ const HOST_TOOL_LIMIT = 16
+-// running total(SSOT §三 P3-10 表):R3=6 → P3-14(canvas_export)=7 → R5(canvas_arrange,本 PR)=8。
++// running total(SSOT §三 P3-10 表):R3=6 → P3-14(canvas_export)=7 → R5(canvas_arrange)=8
++// → #297 选中直读(canvas_selection)=9。
+ // 谁再加工具就同步改这行并复核 ≤16(在途 PR 之间不预留,以合并顺序为准)。
+-const EXPECTED_TOOL_COUNT = 8
++const EXPECTED_TOOL_COUNT = 9
+ 
+ type Manifest = { version: string; slots: string[]; tools: Array<{ name: string }> }
+ 
+diff --git a/cindyplugin/src/__tests__/sessionManifest.test.ts b/cindyplugin/src/__tests__/sessionManifest.test.ts
+index 96d5367b..ee098269 100644
+--- a/cindyplugin/src/__tests__/sessionManifest.test.ts
++++ b/cindyplugin/src/__tests__/sessionManifest.test.ts
+@@ -85,7 +85,7 @@ describe('ghost.json subscribe 槽契约', () => {
+     // 基线随 main 推进:R3(canvas_update_node)已合入 main → 现为 6 个工具。
+     // subscribe 是会话事件接线、不加工具,所以这里钉「不因本 PR 增长」而非固定值。
+     const tools = manifest().tools
+-    expect(tools).toHaveLength(8)
++    expect(tools).toHaveLength(9) // +1: canvas_selection(#297 选中直读)
+     expect(tools.length).toBeLessThanOrEqual(TOOL_BUDGET)
+   })
+ 
+diff --git a/cindyplugin/src/__tests__/toolBudget.test.ts b/cindyplugin/src/__tests__/toolBudget.test.ts
+index 26f0d50d..f9f1bf8f 100644
+--- a/cindyplugin/src/__tests__/toolBudget.test.ts
++++ b/cindyplugin/src/__tests__/toolBudget.test.ts
+@@ -7,14 +7,15 @@
+  * 会立刻翻红,而不是等上线后被宿主拒绝装载。
+  *
+  * R7a(区域快照)是 snapshot **扩参**,不占新工具名额,预期值维持 5;
+- * R3 落第 6 个名额 → 6;P3-14(canvas_export)落第 7 个 → 7;R5(canvas_arrange,本 PR)落第 8 个 → 8。
++ * R3 落第 6 个名额 → 6;P3-14(canvas_export)落第 7 个 → 7;R5(canvas_arrange)落第 8 个 → 8;
++ * #297 选中直读(canvas_selection)落第 9 个 → 9。
+  */
+ import { readFileSync } from 'node:fs'
+ import { fileURLToPath } from 'node:url'
+ import { describe, expect, it } from 'vitest'
+ 
+ const HOST_TOOL_HARD_CAP = 16
+-const EXPECTED_TOOL_COUNT = 8
++const EXPECTED_TOOL_COUNT = 9
+ 
+ type Manifest = { tools: Array<{ name: string; parameters?: { type?: string; properties?: Record<string, unknown> } }> }
+ 
+diff --git a/cindyplugin/src/__tests__/toolResultSweep.test.ts b/cindyplugin/src/__tests__/toolResultSweep.test.ts
+index 1f3d4b5d..a328d3a9 100644
+--- a/cindyplugin/src/__tests__/toolResultSweep.test.ts
++++ b/cindyplugin/src/__tests__/toolResultSweep.test.ts
+@@ -73,6 +73,16 @@ const ALLOWED_RESULT_FIELDS = [
+   'omittedRefs',
+   'truncated',
+   'nextCursor',
++  // canvas_snapshot mediaNodeIds 回执(#297 T3a):门禁那份(verify-debug-logging.mjs)
++  // 在 T3a 合并时已加,这里此前漏了对账——两份声称"同一份"的清单已经漂移过一次;
++  // #297 选中直读顺带补齐,消除既有漂移。
++  'mediaStates',
++  'mediaSummary',
++  // canvas_selection(#297 选中直读):selectionResult 构建的回执字段,与门禁同步添加。
++  'selectedNodes',
++  'selectedNodeCount',
++  'selectedImageNodeIds',
++  'selectedNodesTruncated',
+ ]
+ 
+ /** 失败载荷的字段集合(固定五项,不许多出携带内部信息的字段)。 */
+@@ -157,6 +167,20 @@ const TOOL_CASES: ToolCase[] = [
+       },
+     },
+   },
++  {
++    name: 'canvas_selection',
++    tool: 'canvas_selection',
++    args: {},
++    verbReply: {
++      selection: {
++        ok: true,
++        sceneId: 'scene-1',
++        selectedNodes: [{ id: 'n-img', type: 'image', title: '选中图', bounds: { x: 0, y: 0, width: 10, height: 10 } }],
++        selectedNodeCount: 1,
++        selectedImageNodeIds: ['n-img'],
++      },
++    },
++  },
+   {
+     name: 'canvas_export',
+     tool: 'canvas_export',
+diff --git a/cindyplugin/src/__tests__/updateNodeTool.test.ts b/cindyplugin/src/__tests__/updateNodeTool.test.ts
+index 0cb1dacd..dbf14ecf 100644
+--- a/cindyplugin/src/__tests__/updateNodeTool.test.ts
++++ b/cindyplugin/src/__tests__/updateNodeTool.test.ts
+@@ -238,9 +238,9 @@ describe('工具预算 running total', () => {
+   const manifest = () =>
+     JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')) as { tools: Array<{ name: string; parameters?: unknown }> }
+ 
+-  it('R3+P3-14+R5 后工具数 = 8,且不超过宿主上限 16', () => {
++  it('R3+P3-14+R5+选中直读后工具数 = 9,且不超过宿主上限 16', () => {
+     const tools = manifest().tools
+-    expect(tools).toHaveLength(8)
++    expect(tools).toHaveLength(9)
+     expect(tools.length).toBeLessThanOrEqual(16)
+   })
+ 
+diff --git a/cindyplugin/src/agent/agentBridge.ts b/cindyplugin/src/agent/agentBridge.ts
+index 370b1770..0271d652 100644
+--- a/cindyplugin/src/agent/agentBridge.ts
++++ b/cindyplugin/src/agent/agentBridge.ts
+@@ -45,6 +45,21 @@ const SOURCE = 'Cindy Plugin Agent Bridge'
+  * 由电子脑侧转入队,不可降级的给明确失败。
+  */
+ const WRITE_VERBS = new Set(['add-note', 'place-images', 'generate', 'edit'])
++
++/**
++ * 需要 hydration 就绪才能应答的动词 = 写动词 ∪ {selection}(#297 选中直读,gpt 审查
++ * P1)。`selection` 是读动词却必须进这个集合:`installAgentBridge()` 在
++ * `plugin-main.tsx` 的**模块顶层**求值,而 `createRoot().render(<PluginApp/>)` 排在
++ * `localeReady.then(...)` 里——桥在 React 挂载前就开始应答,`usePluginHydration` 的
++ * restore 还没跑。此时 store 里是 demo 种子场景(`demoScenes.ts` 的 character-flow
++ * 自带 `selectedNodeId`),读出来会得到一份**看似合法的种子选区**并标
++ * `source:'实时画布'` 交卷 —— 比"读不到"恶劣得多:agent 会拿着别的节点 id 去改图。
++ * 选中态的全部价值在于"就是用户现在点的那个",拿不准就必须拒答。
++ *
++ * 只覆盖本段新增的 `selection`。`snapshot` 同样存在 pre-hydrate 读种子的窗口,但那是
++ * 既有行为、不在本段 diff 内,如实登记不顺手改(见 PR 正文残余风险)。
++ */
++const READY_REQUIRED_VERBS = new Set([...WRITE_VERBS, 'selection'])
+ // 附件过户只给指纹不给后缀;名下媒体经同源 /media/<指纹><后缀> 取回,逐个
+ // 常见后缀试探(≤5 次同源请求/图,命中即止)。
+ const EXT_CANDIDATES = ['.png', '.jpg', '.jpeg', '.webp', '.gif']
+@@ -97,6 +112,10 @@ export type MediaUnavailableReason =
+   | 'panel_closed'
+   | 'not_in_page'
+   | 'not_image'
++  // selection verb 专用(#297 选中直读):点名的 id 不在当前选中集内。语义与
++  // not_in_page 同族(「不在本次结果集」),但 selection 的结果集是"选中集"而非
++  // "这一页",复用 not_in_page 会误导消费方去翻页——选中集没有页可翻。
++  | 'not_in_selection'
+   | 'unknown'
+ 
+ export type MediaNodeState =
+@@ -307,15 +326,25 @@ export function installAgentBridge(): void {
+           // **与 drain 闸门同一判据**;绝不用诊断桥的 presence(它在 pre-hydrate 就为真)。
+           const ready = isCanvasWriteReady()
+           result = ready ? { ok: true, ready: true } : { ok: true, ready: false, reason: canvasWriteBlockReason() ?? 'hydrating' }
+-        } else if (WRITE_VERBS.has(msg.verb) && !isCanvasWriteReady()) {
++        } else if (READY_REQUIRED_VERBS.has(msg.verb) && !isCanvasWriteReady()) {
+           const reason = canvasWriteBlockReason() ?? 'hydrating'
+-          // 拒绝是可恢复的跳过(载入完就能写),但必须留痕:否则「Agent 说排队了、
++          // 拒绝是可恢复的跳过(载入完就能写/能读),但必须留痕:否则「Agent 说排队了、
+           // 面板里什么都没发生」在 Debug Log 里查不到根因。
+-          debugLogger.warn(SOURCE, `write verb '${msg.verb}' refused: canvas writes not ready (${reason})`)
++          // 读/写分开留痕:两者后果不同(写是"改动没落地",读是"差点把种子数据当真实
++          // 选区交出去"),日志里能一眼分辨才有排查价值。写侧文案逐字保持不变——
++          // agentBridgeWriteGate.test.ts 按字面量钉住了它。
++          debugLogger.warn(
++            SOURCE,
++            WRITE_VERBS.has(msg.verb)
++              ? `write verb '${msg.verb}' refused: canvas writes not ready (${reason})`
++              : `read verb '${msg.verb}' refused: canvas not hydrated, would read demo seed (${reason})`,
++          )
+           result = {
+             ok: false,
+             code: 'PANEL_NOT_READY',
+-            message: '画布面板正在载入,请稍候重试(这次没有做任何改动)。',
++            // 读动词(selection)也走这条:此时读到的会是 demo 种子数据而非用户画布,
++            // 所以措辞不能只说"没有做任何改动",要说清"也没有读到真实内容"。
++            message: '画布面板正在载入,请稍候重试(这次既没有做任何改动,也没有读到画布真实内容)。',
+             reason,
+           }
+         } else if (msg.verb === 'snapshot') {
+@@ -353,6 +382,78 @@ export function installAgentBridge(): void {
+             ...(page.omittedRefs ? { omittedRefs: page.omittedRefs } : {}),
+             ...(mediaStates ? { mediaStates, mediaSummary } : {}),
+           }
++        } else if (msg.verb === 'selection') {
++          // #297 选中直读:选中态是全局、极小、易变的事实,不该被 region/分页裁剪
++          // ——canvas_snapshot 的选中字段按结果集过滤,「没选」与「选了但在读取范围
++          // 外」返回同形(空数组+0),按范围读取的消费方只能猜坐标(2026-08-04 真机
++          // 事故:把选中的 16:9 读成隔壁 1:1)。本 verb 一次返回**全部**选中节点,
++          // 不吃过滤、没有空数组歧义。
++          const mediaValidation = validateMediaNodeIds(params.mediaNodeIds)
++          if (!mediaValidation.ok) throw new AgentVerbError('INVALID_PARAMS', mediaValidation.message)
++          const mediaNodeIds = mediaValidation.value ?? []
++          const snap = agentReadSnapshot()
++          const byId = new Map(snap.nodes.map((item) => [item.id, item]))
++          // `snap.selectedNodeIds` 已由共享层收敿过:`buildAiContextSnapshot`
++          // (src/store/aiCanvasWorkflow.ts)经 `selectedIdsForSnapshot` 只保留**存在
++          // 且可见**的 id,所以这里的 map+filter 结构上永不丢项。
++          //
++          // 本段初版据此加过一个 `unresolvedSelectedCount`(记"选中集里有几个已不存在"),
++          // gpt 审查 P2 指出它**恒为 0、是死字段**,而配套测试之所以绿是因为它 mock 了
++          // `agentReadSnapshot` 并伪造出带幽灵 id 的快照——一个生产永不产生的形状。
++          // 已整字段删除:不留永不出现的字段,也不留靠伪造形状取绿的断言。
++          // 「用户选了但 AI 看不见(节点被隐藏)」这个信号确实有价值,但要正确实现得改读
++          // raw store 并重新定义语义,属独立改动,本轮不扩范围(见 PR 正文)。
++          const selectedNodes = snap.selectedNodeIds
++            .map((id) => byId.get(id))
++            .filter((item): item is NonNullable<typeof item> => item !== undefined)
++          // 护栏与 snapshotRegion.MAX_SELECTED_IMAGE_NODE_IDS 同精神:超 64 截断并
++          // 置 truncated,不静默丢弃。回执只带定位所需四元组,不带 generation 等
++          // 大字段——要全量信息拿 id 去 canvas_snapshot 查。
++          const SELECTION_MAX_NODES = 64
++          const truncated = selectedNodes.length > SELECTION_MAX_NODES
++          const listed = truncated ? selectedNodes.slice(0, SELECTION_MAX_NODES) : selectedNodes
++          // 图片 id 清单按**全量选中集**派生(不是截断后的 listed),≤64 时即完整;
++          // 超 64 只可能发生在 truncated 已置位的情形,同一个截断护栏,不另加标志。
++          const selectedImageNodeIds = selectedNodes
++            .filter((item) => item.type === 'image')
++            .map((item) => item.id)
++            .slice(0, SELECTION_MAX_NODES)
++          // 点名读像素:结果集 = 选中集。不在选中集的 id 判 not_in_selection(不复用
++          // not_in_page——选中集没有页可翻,那个词会误导消费方去翻页);在选中集内的
++          // 走与 snapshot 完全相同的唯一业务链 resolveRequestedMedia。
++          let mediaStates: Record<string, MediaNodeState> | undefined
++          if (mediaNodeIds.length) {
++            const selectedIdSet = new Set(selectedNodes.map((item) => item.id))
++            const inSelection = mediaNodeIds.filter((id) => selectedIdSet.has(id))
++            mediaStates = await resolveRequestedMedia(
++              selectedNodes.filter((item) => selectedIdSet.has(item.id)),
++              inSelection,
++            )
++            for (const id of mediaNodeIds) {
++              if (!selectedIdSet.has(id)) mediaStates[id] = { state: 'unavailable', reason: 'not_in_selection' }
++            }
++          }
++          const mediaSummary = mediaStates
++            ? {
++                requested: mediaNodeIds.length,
++                available: Object.values(mediaStates).filter((item) => item.state === 'available').length,
++                unavailable: Object.values(mediaStates).filter((item) => item.state === 'unavailable').length,
++              }
++            : undefined
++          result = {
++            ok: true,
++            sceneId: snap.sceneId,
++            selectedNodes: listed.map((item) => ({
++              id: item.id,
++              type: item.type,
++              title: item.title,
++              bounds: item.bounds,
++            })),
++            selectedNodeCount: selectedNodes.length,
++            selectedImageNodeIds,
++            ...(truncated ? { selectedNodesTruncated: true } : {}),
++            ...(mediaStates ? { mediaStates, mediaSummary } : {}),
++          }
+         } else if (msg.verb === 'node-label') {
+           // 卡片要在「调用开始时」定住源图指代(#298 T4):只取一个节点标题,
+           // 不把整份快照回传给电子脑(那是分钟级任务里最没必要的一次大搬运)。
+diff --git a/scripts/verify-debug-logging.mjs b/scripts/verify-debug-logging.mjs
+index c7f734a4..737d8591 100644
+--- a/scripts/verify-debug-logging.mjs
++++ b/scripts/verify-debug-logging.mjs
+@@ -1287,10 +1287,17 @@ checks.push(async () => {
+     // 原文/路径/错误堆栈,与 omittedRefs/page 同类,不是这道门禁要防的泄漏形状。
+     'mediaStates',
+     'mediaSummary',
++    // canvas_selection(#297 选中直读):selectionResult 构建的回执字段。selectedNodes
++    // 只带定位四元组(id/type/title/bounds),selectedImageNodeIds 是 id 清单,其余是
++    // 数字/布尔护栏(计数、截断、幽灵选中数)——不携带宿主回执原文/路径/堆栈。
++    'selectedNodes',
++    'selectedNodeCount',
++    'selectedImageNodeIds',
++    'selectedNodesTruncated',
+   ])
+   // `Object.assign(result, <call>)` 只许摊这些**本地纯函数**的返回字面量;其余一律
+   // fail-closed(摊一个宿主回执进来正是要拦的那一手)。
+-  const TOKEN_PROVIDERS = new Set(['cardResultTokens', 'snapshotResult'])
++  const TOKEN_PROVIDERS = new Set(['cardResultTokens', 'snapshotResult', 'selectionResult'])
+ 
+   /** 从一个函数作用域里解析某标识符对象的字段集合;拿不到形状就抛(fail-closed)。 */
+   const resolveObjectFields = (scope, name, trail) => {
+diff --git a/src/agent/snapshotRegion.selectionObservation.test.ts b/src/agent/snapshotRegion.selectionObservation.test.ts
+index 6bca092c..051b4882 100644
+--- a/src/agent/snapshotRegion.selectionObservation.test.ts
++++ b/src/agent/snapshotRegion.selectionObservation.test.ts
+@@ -227,3 +227,52 @@ describe('SC-T2a.3 R7a 可证伪回归', () => {
+     expect(restarted.snapshot.selectedNodeCount).toBe(1)
+   })
+ })
++
++// #297 选中直读:selectionOutOfScope——「没选」与「选了但在读取范围外」此前返回
++// 字节级同形(空数组+0),按范围读取的消费方只能猜坐标(2026-08-04 真机事故:把选中
++// 的 16:9 图读成隔壁 1:1)。本字段 = 画布上真实存在、但被过滤排除在结果集外的选中
++// 节点数;幽灵 id(选中集里已删除的节点)不计入。
++describe('selectionOutOfScope(范围外选中计数)', () => {
++  it('无过滤:恒 0(结果集=全集,不存在范围外)', () => {
++    const page = readSnapshotPage(spread)
++    expect(page.snapshot.selectionOutOfScope).toBe(0)
++    expect(page.snapshot.selectedNodeCount).toBe(1)
++  })
++
++  it('region 框住选中节点:0;框不住:1——两种现实不再同形', () => {
++    const inRegion = readSnapshotPage(spread, { region: { x: 150, y: -50, width: 200, height: 200 } })
++    expect(inRegion.snapshot.selectedNodeCount).toBe(1)
++    expect(inRegion.snapshot.selectionOutOfScope).toBe(0)
++
++    const outsideRegion = readSnapshotPage(spread, { region: { x: -500, y: -500, width: 50, height: 50 } })
++    // 事故形状:count===0 && ids===[] —— 但现在 outOfScope===1 把「选了在别处」显式说出来。
++    expect(outsideRegion.snapshot.selectedNodeCount).toBe(0)
++    expect(outsideRegion.snapshot.selectedImageNodeIds).toEqual([])
++    expect(outsideRegion.snapshot.selectionOutOfScope).toBe(1)
++  })
++
++  it('幽灵 id(选中但节点已删)不计入范围外——避免消费方为不存在的节点扩大 region', () => {
++    const withGhost = snapshotOf({
++      nodes: [node({ id: 'mid', type: 'image', bounds: { x: 200, y: 0, width: 100, height: 100 } })],
++      selectedNodeIds: ['mid', 'ghost-deleted'],
++    })
++    const page = readSnapshotPage(withGhost, { region: { x: 150, y: -50, width: 200, height: 200 } })
++    expect(page.snapshot.selectedNodeCount).toBe(1)
++    expect(page.snapshot.selectionOutOfScope).toBe(0)
++  })
++
++  it('多选散落:框住 1 张时 count=1 且 outOfScope=2(其余两张在范围外,真实存在)', () => {
++    const multi = snapshotOf({
++      nodes: [
++        node({ id: 'a', type: 'image', bounds: { x: 0, y: 0, width: 100, height: 100 } }),
++        node({ id: 'b', type: 'image', bounds: { x: 1000, y: 0, width: 100, height: 100 } }),
++        node({ id: 'c', type: 'image', bounds: { x: 2000, y: 0, width: 100, height: 100 } }),
++      ],
++      selectedNodeIds: ['a', 'b', 'c'],
++    })
++    const page = readSnapshotPage(multi, { region: { x: -50, y: -50, width: 200, height: 200 } })
++    expect(page.snapshot.selectedImageNodeIds).toEqual(['a'])
++    expect(page.snapshot.selectedNodeCount).toBe(1)
++    expect(page.snapshot.selectionOutOfScope).toBe(2)
++  })
++})
+diff --git a/src/agent/snapshotRegion.ts b/src/agent/snapshotRegion.ts
+index 75ae80f0..70f737dd 100644
+--- a/src/agent/snapshotRegion.ts
++++ b/src/agent/snapshotRegion.ts
+@@ -535,6 +535,15 @@ export type SelectedImageObservation = {
+   selectedImageNodeIds: string[]
+   /** 过滤结果集内被选中的节点总数(不限类型),用于区分"选而无图"与"没选"。 */
+   selectedNodeCount: number
++  /**
++   * 真实存在于画布、但被本次 region/sectionId 过滤排除在结果集外的选中节点数。
++   * 没有它,「用户什么都没选」与「选了但在你读取范围之外」两种现实的返回字节级
++   * 同形(都是空数组 + 0),按范围读取的消费方只能靠猜坐标——这正是 2026-08-04
++   * 真机上把"选中的 16:9"读成"隔壁 1:1"的事故根因。>0 时应改调 canvas_selection
++   * (不受过滤影响)拿完整选中清单,而不是继续猜 region。只统计画布上真实存在的
++   * 节点:selection 里的幽灵 id(节点已删)不计入,避免消费方追空。
++   */
++  selectionOutOfScope: number
+   /** true = selectedImageNodeIds 发生截断(原始选中图片数 > MAX_SELECTED_IMAGE_NODE_IDS)。 */
+   selectedImageNodesTruncated?: true
+ }
+@@ -550,14 +559,22 @@ const deriveSelectedImageObservation = (
+   rawSelectedNodeIds: string[],
+   includedIds: Set<string>,
+   nodesById: Map<string, AiCanvasContextNode>,
++  allNodeIds: Set<string>,
+ ): SelectedImageObservation => {
+   const selectedIncluded = rawSelectedNodeIds.filter((id) => includedIds.has(id))
+   const selectedImageIds = selectedIncluded.filter((id) => nodesById.get(id)?.type === 'image')
+   const truncated = selectedImageIds.length > MAX_SELECTED_IMAGE_NODE_IDS
++  // 范围外计数只认「画布上真实存在」的选中节点(allNodeIds 是**全快照**节点集,
++  // 不是过滤结果集):幽灵 id 既不在结果集也不在画布,归 0 而不是归"范围外",
++  // 否则消费方会为一个已删除的节点反复扩大 region。
++  const selectionOutOfScope = rawSelectedNodeIds.filter(
++    (id) => !includedIds.has(id) && allNodeIds.has(id),
++  ).length
+ 
+   return {
+     selectedImageNodeIds: truncated ? selectedImageIds.slice(0, MAX_SELECTED_IMAGE_NODE_IDS) : selectedImageIds,
+     selectedNodeCount: selectedIncluded.length,
++    selectionOutOfScope,
+     ...(truncated ? { selectedImageNodesTruncated: true as const } : {}),
+   }
+ }
+@@ -621,7 +638,12 @@ export const filterSnapshotSet = (
+     omittedRefs: Object.fromEntries(omitted),
+     edgeAnchors,
+     linkAnchors,
+-    ...deriveSelectedImageObservation(snapshot.selectedNodeIds, scope.included, nodesById),
++    ...deriveSelectedImageObservation(
++      snapshot.selectedNodeIds,
++      scope.included,
++      nodesById,
++      new Set(snapshot.nodes.map((node) => node.id)),
++    ),
+   }
+ }
+ 
+@@ -776,6 +798,7 @@ export const readSnapshotPage = (
+     // 变化——全部页重复携带同一份值(与 summary.images 同精神,第一页即完整清单)。
+     selectedImageNodeIds: set.selectedImageNodeIds,
+     selectedNodeCount: set.selectedNodeCount,
++    selectionOutOfScope: set.selectionOutOfScope,
+     ...(set.selectedImageNodesTruncated ? { selectedImageNodesTruncated: true as const } : {}),
+   }
+   if (parsed.filter) base.filter = parsed.filter

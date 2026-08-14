@@ -1,0 +1,176 @@
+diff --git a/server/routes/assets.test.ts b/server/routes/assets.test.ts
+index 70494969..747286e6 100644
+--- a/server/routes/assets.test.ts
++++ b/server/routes/assets.test.ts
+@@ -25,6 +25,14 @@ const buildApp = (backend: AssetStoreBackend): Hono<AppEnv> => {
+ // P1-A: the route canonicalizes via sharp (full decode + re-encode), so test fixtures
+ // must be REAL decodable images. sharp generates them at test time — no binary blobs in
+ // the repo, and the fixtures are guaranteed decodable.
++//
++// 这些 helper 返回 Node Buffer。凡是把它喂进 `new File([...])` 的地方都要先包一层
++//   new Uint8Array(bytes):@types/node 26 起 Buffer 泛型外露为 Buffer<ArrayBufferLike>,
++//   其 .buffer 可能是 SharedArrayBuffer,不满足 DOM 侧 BlobPart 要求的
++//   ArrayBufferView<ArrayBuffer>(TS2322,#361 bump 24→26 暴露)。注意本文件里只有**显式**
++//   标注了 `: Promise<Buffer>` / `: Buffer` 的路径会踩雷(如 realAnimatedGif、post(bytes: Buffer));
++//   无注解的 helper 靠推断保住了 Buffer<ArrayBuffer> 故而幸免 —— 但别依赖这个巧合,
++//   新增 new File([...]) 调用一律包 Uint8Array。
+ const realPng = (color: { r: number; g: number; b: number } = { r: 255, g: 0, b: 0 }) =>
+   sharp({ create: { width: 2, height: 2, channels: 3, background: color } }).png().toBuffer()
+ const realJpeg = (color: { r: number; g: number; b: number } = { r: 0, g: 255, b: 0 }) =>
+@@ -465,7 +473,7 @@ describe('POST /api/assets — P1-A sharp canonicalization', () => {
+     const app = buildApp(be)
+     const bytes = await realAnimatedGif()
+     const form = new FormData()
+-    form.append('image', new File([bytes], 'a.gif', { type: 'image/gif' }), 'a.gif')
++    form.append('image', new File([new Uint8Array(bytes)], 'a.gif', { type: 'image/gif' }), 'a.gif')
+     const res = await app.request('/api/assets', { method: 'POST', headers: { 'X-Mivo-Api-Key': MIVO_KEY }, body: form })
+     expect(res.status).toBe(200)
+     const { assetId } = (await res.json()) as { assetId: string }
+@@ -492,7 +500,7 @@ describe('POST /api/assets — P1-A sharp canonicalization', () => {
+     expect(pngA.equals(pngB)).toBe(false) // sanity: inputs differ
+     const post = (bytes: Buffer) => {
+       const form = new FormData()
+-      form.append('image', new File([bytes], 'x.png', { type: 'image/png' }), 'x.png')
++      form.append('image', new File([new Uint8Array(bytes)], 'x.png', { type: 'image/png' }), 'x.png')
+       return app.request('/api/assets', { method: 'POST', body: form })
+     }
+     const r1 = await (await post(pngA)).json() as { assetId: string; deduped: boolean }
+@@ -540,7 +548,7 @@ describe('POST /api/assets — quota atomicity (P1.3 route-level)', () => {
+     try {
+       const post = (bytes: Buffer) => {
+         const form = new FormData()
+-        form.append('image', new File([bytes], 'x.png', { type: 'image/png' }), 'x.png')
++        form.append('image', new File([new Uint8Array(bytes)], 'x.png', { type: 'image/png' }), 'x.png')
+         return app.request('/api/assets', { method: 'POST', headers: { 'X-Mivo-Api-Key': MIVO_KEY }, body: form })
+       }
+       const [r1, r2] = await Promise.all([post(a), post(b)])
+diff --git a/server/routes/assetsAttachDetach.test.ts b/server/routes/assetsAttachDetach.test.ts
+index 36dbb2c4..48e1c569 100644
+--- a/server/routes/assetsAttachDetach.test.ts
++++ b/server/routes/assetsAttachDetach.test.ts
+@@ -35,6 +35,9 @@ const buildApp = (backend: AssetStoreBackend, persist: PersistBackend, permissio
+   return app
+ }
+ 
++// 返回 Node Buffer。喂给 `new File([...])` 时必须先包 new Uint8Array(bytes):@types/node 26
++//   起 Buffer 泛型外露为 Buffer<ArrayBufferLike>,其 .buffer 可能是 SharedArrayBuffer,不满足
++//   DOM 侧 BlobPart 要求的 ArrayBufferView<ArrayBuffer>(TS2322,#361 bump 24→26 暴露)。
+ const realPng = async (): Promise<Buffer> =>
+   sharp({ create: { width: 2, height: 2, channels: 3, background: { r: 255, g: 0, b: 0 } } }).png().toBuffer()
+ 
+@@ -60,7 +63,7 @@ const seedCanvas = async (
+ const uploadAsset = async (app: Hono<AppEnv>, key = MIVO_KEY_A): Promise<string> => {
+   const bytes = await realPng()
+   const form = new FormData()
+-  form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
++  form.append('image', new File([new Uint8Array(bytes)], 'a.png', { type: 'image/png' }), 'a.png')
+   const res = await app.request('/api/assets', { method: 'POST', headers: hdr(key), body: form })
+   expect(res.status).toBe(200)
+   return ((await res.json()) as { assetId: string }).assetId
+@@ -220,7 +223,7 @@ describe('G2.2 — refcount 经 attach/detach 变化(内容寻址 refcount = ref
+     const assetId = sha256Hex(canonical)
+     const form = () => {
+       const f = new FormData()
+-      f.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
++      f.append('image', new File([new Uint8Array(bytes)], 'a.png', { type: 'image/png' }), 'a.png')
+       return f
+     }
+     const r1 = await app.request('/api/assets', { method: 'POST', headers: hdr(MIVO_KEY_A), body: form() })
+diff --git a/server/routes/assetsAuthzMatrix.test.ts b/server/routes/assetsAuthzMatrix.test.ts
+index b481db40..dd1baac2 100644
+--- a/server/routes/assetsAuthzMatrix.test.ts
++++ b/server/routes/assetsAuthzMatrix.test.ts
+@@ -53,6 +53,11 @@ const hdr = (key: string, shareToken?: string): Record<string, string> => {
+   return h
+ }
+ 
++// 返回 Node Buffer(sharp 的 toBuffer())。喂给 `new File([...])` 时必须先包一层
++//   new Uint8Array(bytes):@types/node 26 起 Buffer 泛型外露为 Buffer<ArrayBufferLike>,
++//   其 .buffer 可能是 SharedArrayBuffer,不满足 DOM 侧 BlobPart 要求的
++//   ArrayBufferView<ArrayBuffer>(TS2322,#361 bump 24→26 暴露)。本文件下方所有
++//   form.append('image', new File([new Uint8Array(bytes)], ...)) 都出于此,不是冗余包装。
+ const realPng = async (color: { r: number; g: number; b: number } = { r: 255, g: 0, b: 0 }): Promise<Buffer> =>
+   sharp({ create: { width: 2, height: 2, channels: 3, background: color } }).png().toBuffer()
+ 
+@@ -91,7 +96,7 @@ const seedFixture = async (
+   const editLink = await permissions.createShareLink(ids.project, 'edit', FP_OWNER)
+   const bytes = await realPng()
+   const form = new FormData()
+-  form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
++  form.append('image', new File([new Uint8Array(bytes)], 'a.png', { type: 'image/png' }), 'a.png')
+   const upRes = await app.request('/api/assets', { method: 'POST', headers: hdr(MIVO_KEY_OWNER), body: form })
+   expect(upRes.status).toBe(200)
+   const assetId = ((await upRes.json()) as { assetId: string }).assetId
+@@ -123,7 +128,7 @@ const uploadReq = async (app: Hono<AppEnv>, key: string) => {
+   uploadCounter += 1
+   const bytes = await realPng({ r: (uploadCounter % 64) * 4, g: ((uploadCounter * 7) % 64) * 4, b: ((uploadCounter * 13) % 64) * 4 })
+   const form = new FormData()
+-  form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
++  form.append('image', new File([new Uint8Array(bytes)], 'a.png', { type: 'image/png' }), 'a.png')
+   return app.request('/api/assets', { method: 'POST', headers: hdr(key), body: form })
+ }
+ 
+@@ -283,7 +288,7 @@ describe('G2.2 P1-4 残留2 — route detach 复合键选择(InMemory route 级)
+     // service 级 attach 一个 legacy ref(无 canvasId)——模拟 G2.2 前写入的 ref。
+     const bytes = await realPng()
+     const form = new FormData()
+-    form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
++    form.append('image', new File([new Uint8Array(bytes)], 'a.png', { type: 'image/png' }), 'a.png')
+     const upRes = await app.request('/api/assets', { method: 'POST', headers: hdr(MIVO_KEY_OWNER), body: form })
+     const assetId = ((await upRes.json()) as { assetId: string }).assetId
+     const fpOwner = fingerprintOfPlatformKey(MIVO_KEY_OWNER)
+@@ -312,7 +317,7 @@ describe('G2.2 P1-4 残留2 — route detach 复合键选择(InMemory route 级)
+     // upload asset(owner)。
+     const bytes = await realPng()
+     const form = new FormData()
+-    form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
++    form.append('image', new File([new Uint8Array(bytes)], 'a.png', { type: 'image/png' }), 'a.png')
+     const upRes = await app.request('/api/assets', { method: 'POST', headers: hdr(MIVO_KEY_OWNER), body: form })
+     expect(upRes.status).toBe(200)
+     const assetId = ((await upRes.json()) as { assetId: string }).assetId
+@@ -343,7 +348,7 @@ describe('G2.2 P1-4 残留2 — route detach 复合键选择(InMemory route 级)
+     await persist.ensureCreateChild(FP_OWNER, ids.canvas, 'node', ids.node, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+     const bytes = await realPng()
+     const form = new FormData()
+-    form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
++    form.append('image', new File([new Uint8Array(bytes)], 'a.png', { type: 'image/png' }), 'a.png')
+     const upRes = await app.request('/api/assets', { method: 'POST', headers: hdr(MIVO_KEY_OWNER), body: form })
+     expect(upRes.status).toBe(200)
+     const assetId = ((await upRes.json()) as { assetId: string }).assetId
+@@ -373,7 +378,7 @@ describe('G2.2 P1-4 残留2 — route detach 复合键选择(InMemory route 级)
+     await persist.ensureCreateChild(FP_OWNER, aIds.canvas, 'node', aIds.node, { type: 'image' }, { method: 'POST', resourceKind: 'node' })
+     const bytes = await realPng()
+     const form = new FormData()
+-    form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
++    form.append('image', new File([new Uint8Array(bytes)], 'a.png', { type: 'image/png' }), 'a.png')
+     const upRes = await app.request('/api/assets', { method: 'POST', headers: hdr(MIVO_KEY_OWNER), body: form })
+     expect(upRes.status).toBe(200)
+     const assetId = ((await upRes.json()) as { assetId: string }).assetId
+@@ -512,7 +517,7 @@ describe('G2.2 P1-4 残留2 — route detach 复合键选择(InMemory route 级)
+     // A 上传 + attach 到 (n-shared, cA)。
+     const bytes = await realPng()
+     const form = new FormData()
+-    form.append('image', new File([bytes], 'a.png', { type: 'image/png' }), 'a.png')
++    form.append('image', new File([new Uint8Array(bytes)], 'a.png', { type: 'image/png' }), 'a.png')
+     const upRes = await app.request('/api/assets', { method: 'POST', headers: hdr(MIVO_KEY_OWNER), body: form })
+     const assetId = ((await upRes.json()) as { assetId: string }).assetId
+     const attA = await app.request(`/api/assets/${assetId}/attach`, {
+diff --git a/server/routes/tasks.ts b/server/routes/tasks.ts
+index bceabc89..efbb1288 100644
+--- a/server/routes/tasks.ts
++++ b/server/routes/tasks.ts
+@@ -160,7 +160,13 @@ tasksRoute.post('/edit', async (c) => {
+         logRequest({ method: c.req.method, path: c.req.path, requestId, status: 400, latencyMs: Date.now() - t0, note: 'mask-gen-failed' })
+         return c.json({ error: message }, 400)
+       }
+-      mask = new File([maskBuffer], 'mask.png', { type: 'image/png' })
++      // Node Buffer → Web File 边界:@types/node 26 起 Buffer 的泛型参数外露为
++      //   Buffer<ArrayBufferLike>,其 .buffer 可能是 SharedArrayBuffer,不满足 DOM 侧 BlobPart
++      //   要求的 ArrayBufferView<ArrayBuffer>(TS2322,#361 dependabot bump 24→26 暴露)。
++      //   new Uint8Array(buf) 拷一份 ArrayBuffer-backed 视图,类型与运行时都正确。零拷贝写法
++      //   new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) 的类型仍是
++      //   Uint8Array<ArrayBufferLike>,过不了检查;mask 是小遮罩 png,一次拷贝可忽略。
++      mask = new File([new Uint8Array(maskBuffer)], 'mask.png', { type: 'image/png' })
+     }
+   }
+ 

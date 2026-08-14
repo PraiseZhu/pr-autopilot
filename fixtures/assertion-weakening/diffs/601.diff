@@ -1,0 +1,1440 @@
+diff --git a/src/store/remoteDebugClientInfo.ts b/src/store/remoteDebugClientInfo.ts
+index 107b9a47..3f849f62 100644
+--- a/src/store/remoteDebugClientInfo.ts
++++ b/src/store/remoteDebugClientInfo.ts
+@@ -10,6 +10,11 @@
+ // reporter 里 re-export,既有 import 点与测试零改动。
+ 
+ import type { DebugLogLevel } from './debugLogStore'
++// B 支接线:出网脱敏收口。规则层在 cindyplugin/src/diagnostics/debugLogRedact.ts
++// (已冻结,本文件只消费 `redactForRemoteReport` / `redactPagePath` 两个导出,不改其实现)。
++// A1 把组包函数从 reporter 搬到本模块,脱敏随组包点一并移入——仍是所有出网 payload 的
++// 唯一组包点,flush + outbox 两条路径全覆盖,不存在绕过脱敏的旁路。
++import { redactForRemoteReport, redactPagePath } from '../../cindyplugin/src/diagnostics/debugLogRedact'
+ 
+ export type RemoteDebugQueuedEntry = {
+   level: DebugLogLevel
+@@ -131,21 +136,37 @@ const clampRemoteDebugStack = (stack: string | undefined): string | undefined =>
+ export const buildRemoteDebugPayload = (
+   entries: RemoteDebugQueuedEntry[],
+   clientInfo: RemoteDebugClientInfo,
+-): RemoteDebugPayload => ({
+-  ...clientInfo,
+-  entries: entries
+-    .filter((entry): entry is RemoteDebugQueuedEntry & { level: ReportableDebugLogLevel } =>
+-      shouldReportRemoteDebugLevel(entry.level),
+-    )
+-    .map((entry) => {
+-      // T2-4:stack 只随 error 级上报(warning 剥除控体积),且截断 ≤2KB。
+-      const stack = entry.level === 'error' ? clampRemoteDebugStack(entry.stack) : undefined
+-      const base = {
+-        level: entry.level,
+-        source: entry.source,
+-        message: entry.message,
+-        timestamp: entry.timestamp,
+-      }
+-      return stack === undefined ? base : { ...base, stack }
+-    }),
+-})
++): RemoteDebugPayload => {
++  // B 支出网脱敏收口(B-1):本函数是所有 debug-logs 出网 payload 的**唯一组包点**——
++  // 直接 flush 与失败持久化都经它组包;outbox 里存的就是本函数的产物,重放只读已组包的
++  // payload,因此在这里脱敏一次,flush + outbox 两条出网路径全覆盖,不存在绕过脱敏的旁路。
++  //
++  // fail-closed:所有自由文本字段一律过脱敏,没有"脱敏失败就原样发"的分支——两个 redact
++  // 均为纯函数(不抛错)。source 虽多为模块常量也过闸:15+ 调用点各写各的,未来新增点可能
++  // 把自由文本拼进 source,在组包点统一收口防逐点漂移。
++  //
++  // 豁免字段(结构化设备元数据,非自由文本入口):clientId / sessionId 由 CSPRNG 生成、
++  // appVersion 为构建常量、userAgent / language / timezone 为浏览器枚举、screen / timestamp 为数值。
++  const redact = (value: string): string => redactForRemoteReport(value)
++  return {
++    ...clientInfo,
++    // E-542:pagePath 带 query string,任何未来接入的参数都可能是 token/邮箱/内部 id,
++    // 即使 pathname 本身是设备元数据,query 侧也要按自由文本入口收口。
++    pagePath: redactPagePath(clientInfo.pagePath),
++    entries: entries
++      .filter((entry): entry is RemoteDebugQueuedEntry & { level: ReportableDebugLogLevel } =>
++        shouldReportRemoteDebugLevel(entry.level),
++      )
++      .map((entry) => {
++        // T2-4:stack 只随 error 级上报(warning 剥除控体积),且截断 ≤2KB。
++        const stack = entry.level === 'error' ? clampRemoteDebugStack(entry.stack) : undefined
++        const base = {
++          level: entry.level,
++          source: redact(entry.source),
++          message: redact(entry.message),
++          timestamp: entry.timestamp,
++        }
++        return stack === undefined ? base : { ...base, stack: redact(stack) }
++      }),
++  }
++}
+diff --git a/src/store/remoteDebugReporter.outbox.test.ts b/src/store/remoteDebugReporter.outbox.test.ts
+new file mode 100644
+index 00000000..8beaee95
+--- /dev/null
++++ b/src/store/remoteDebugReporter.outbox.test.ts
+@@ -0,0 +1,600 @@
++// remoteDebugReporter FX-7 durable outbox + retry + drop count 用例(v4 段,从 remoteDebugReporter.test.ts 拆出,① structure-guard 拆分)。
++//
++// 拆分理由:remoteDebugReporter.test.ts 1036 行越 structure-guard 的 900 绝对线(#591 CI structure guard 红灯)。
++// 本文件承载 FX-7 durable outbox + exponential-backoff retry + drop count 用例;基础行为、createId/stack/
++// 出网脱敏、模块级初始值锁用例留在主文件(remoteDebugReporter.test.ts)。
++//
++// 内容为原样搬移(拆分等价),断言零改动;主文件与本文各自独立跑,共享的 IndexedDB 底层
++// (按 DB_NAME 持久化)由各 describe 的 afterEach 清理,跨文件互不污染。
++
++import 'fake-indexeddb/auto'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { useDebugLogStore } from './debugLogStore'
++import {
++  __resetRemoteDebugStateForTest,
++  __setRemoteDebugTestHooks,
++  drainRemoteDebugOutbox,
++  flushRemoteDebugEntries,
++  getRemoteDebugDropCount,
++  getRemoteDebugOutboxCount,
++  reportRemoteDebugEntry,
++  type RemoteDebugClientInfo,
++} from './remoteDebugReporter'
++
++// ── FX-7: durable outbox + exponential-backoff retry + drop count (A6 · D-4 hard prereq) ──
++
++const fixedClientInfo = (): RemoteDebugClientInfo => ({
++  clientId: 'client-fixed',
++  sessionId: 'session-fixed',
++  appVersion: '0.0.0-test',
++  pagePath: '/canvas',
++  userAgent: 'TestBrowser',
++  language: 'en',
++  timezone: 'UTC',
++  screen: { width: 1440, height: 900, pixelRatio: 2 },
++})
++
++describe('FX-7 remoteDebugReporter durable outbox + retry + drop count', () => {
++  beforeEach(async () => {
++    vi.clearAllMocks()
++    await __resetRemoteDebugStateForTest()
++  })
++  afterEach(async () => {
++    vi.unstubAllGlobals()
++    await __resetRemoteDebugStateForTest()
++  })
++
++  it('SC1: a failed batch persists to the durable outbox, recovers on resend, and is not lost', async () => {
++    const sentPayloads: { entries: Array<{ message: string }> }[] = []
++    let shouldFail = true
++    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
++      if (shouldFail) throw new Error('network down (BFF jitter)')
++      sentPayloads.push(JSON.parse(init.body ?? '{}'))
++      return new Response('{}', { status: 200 })
++    })
++    let clock = 1000
++    __setRemoteDebugTestHooks({
++      fetchImpl: fetchMock as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5, // deterministic jitter → 0.75 of capped delay
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++
++    // Report an error entry; flush immediately (batch is the single entry).
++    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
++    await flushRemoteDebugEntries()
++
++    // The batch failed to send but was NOT lost — it landed in the durable IDB outbox,
++    // and the drop count is still 0 (retry is not yet exhausted).
++    expect(fetchMock).toHaveBeenCalledTimes(1)
++    expect(await getRemoteDebugOutboxCount()).toBe(1)
++    expect(await getRemoteDebugDropCount()).toBe(0)
++
++    // Simulate BFF recovery: fetch now succeeds. Advance the clock past the record's
++    // backoff window so it is due, then drain the durable outbox.
++    shouldFail = false
++    clock += 10_000
++    const result = await drainRemoteDebugOutbox()
++
++    expect(result.sent).toBe(1)
++    expect(result.dropped).toBe(0)
++    expect(await getRemoteDebugOutboxCount()).toBe(0)
++    expect(await getRemoteDebugDropCount()).toBe(0)
++    // The original batch was actually delivered (not lost): its entry survived the
++    // failed flush + durable round-trip.
++    expect(sentPayloads).toHaveLength(1)
++    expect(sentPayloads[0].entries[0].message).toBe('boom')
++  })
++
++  it('SC2: after the retry limit the drop count increments and is queryable', async () => {
++    const fetchMock = vi.fn(async () => {
++      throw new Error('network down (BFF permanently unreachable)')
++    })
++    let clock = 1000
++    __setRemoteDebugTestHooks({
++      fetchImpl: fetchMock as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++
++    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
++    await flushRemoteDebugEntries() // batch fails → durable outbox (attempts=0)
++    expect(await getRemoteDebugOutboxCount()).toBe(1)
++    expect(await getRemoteDebugDropCount()).toBe(0)
++
++    // DEFAULT_MAX_RETRIES = 5. Each drain (clock advanced past the record's backoff
++    // window) fails and bumps attempts; on the 5th retry attempt (attempts reaches
++    // 5 >= maxRetries) the batch is dropped + counted. The clock is advanced before the
++    // FIRST drain too, because persistFailedBatch set nextAttemptAt = now + backoff(1)
++    // (so the record is not due at clock=1000 immediately after the failed flush).
++    let last: { dropped: number } = { dropped: 0 }
++    for (let attempt = 1; attempt <= 5; attempt++) {
++      clock += 100_000 // well past any backoff window so the record is due
++      last = await drainRemoteDebugOutbox()
++    }
++    // The 5th retry attempt drops the batch (attempts=5 >= maxRetries).
++    expect(last.dropped).toBe(1)
++    // Drop count is persisted + queryable.
++    expect(await getRemoteDebugDropCount()).toBe(1)
++    expect(await getRemoteDebugOutboxCount()).toBe(0)
++    // 1 initial flush send + 5 retry sends, all failed.
++    expect(fetchMock).toHaveBeenCalledTimes(6)
++  })
++
++  it('F-A1-03(R2 fix): 2xx 送达后 outbox 记录删不掉时,attempts 仍递增并最终计入 drop(不会永远 due)', async () => {
++    // 第一次 flush 网络失败,把这一批放进 outbox(attempts=0)。
++    const initialFailFetch = vi.fn(async () => {
++      throw new Error('network down (BFF jitter)')
++    })
++    let clock = 1000
++    __setRemoteDebugTestHooks({
++      fetchImpl: initialFailFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
++    await flushRemoteDebugEntries()
++    expect(await getRemoteDebugOutboxCount()).toBe(1)
++
++    // 之后每次 drain 都"送达成功"(2xx),但 outbox 记录删不掉 —— 用 fake-indexeddb 原型打断
++    // 前 5 次 delete 调用,第 6 次(第 5 轮 drop 分支里的 best-effort 补删)放行,验证记录最终
++    // 被真正清理而不是永远残留。
++    const deliveredFetch = vi.fn(async () => new Response('{}', { status: 200 }))
++    __setRemoteDebugTestHooks({
++      fetchImpl: deliveredFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    const originalDelete = IDBObjectStore.prototype.delete
++    let deleteCallCount = 0
++    const deleteSpy = vi
++      .spyOn(IDBObjectStore.prototype, 'delete')
++      .mockImplementation(function (this: IDBObjectStore, query?: IDBValidKey | IDBKeyRange) {
++        deleteCallCount += 1
++        if (deleteCallCount <= 5) throw new Error('delete blocked (quota lockdown)')
++        return originalDelete.call(this, query as IDBValidKey)
++      })
++
++    let last: { sent: number; retained: number; dropped: number } = { sent: 0, retained: 0, dropped: 0 }
++    for (let attempt = 1; attempt <= 5; attempt++) {
++      clock += 100_000
++      last = await drainRemoteDebugOutbox()
++      if (attempt < 5) {
++        // 反向变异对照:退掉本轮修复(删不掉时不抛错,直接当成功)会让这里变成
++        // {sent:1,retained:0,dropped:0}(误判已投递并清空 outbox),而不是 retained:1
++        // (仍受重试上限约束)。
++        expect(last).toMatchObject({ sent: 0, retained: 1, dropped: 0 })
++      }
++    }
++    deleteSpy.mockRestore()
++
++    // 送达从未失败过(deliveredFetch 一直 2xx)—— 5 次全部是"送达成功但删不掉"而非网络
++    // 失败,证明重试上限确实施加于"删除失败"这一失败模式,不只是"发送失败"。
++    expect(deliveredFetch).toHaveBeenCalledTimes(5)
++    expect(last.dropped).toBe(1)
++    expect(await getRemoteDebugDropCount()).toBe(1)
++    // 第 6 次 delete 调用(drop 分支的 best-effort 补删)放行后记录被真正清理。
++    expect(await getRemoteDebugOutboxCount()).toBe(0)
++  })
++
++  it('F-A1-03(R3 fix):delete 恒抛(不限次)时,重投与 drop 计数最终都停止增长,记录不再被重发', async () => {
++    // 硬要求(R3 任务书):stub 不得构造成让残余缺陷不可见——上一轮的测试只让 delete
++    // 失败 5 次、第 6 次放行,刚好卡在重试上限边界,"持续删除失败"这个真实场景从未出现。
++    // 本轮把边界推远:delete 恒抛,不限次。
++    const initialFailFetch = vi.fn(async () => {
++      throw new Error('network down (BFF jitter)')
++    })
++    let clock = 1000
++    __setRemoteDebugTestHooks({
++      fetchImpl: initialFailFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
++    await flushRemoteDebugEntries()
++    expect(await getRemoteDebugOutboxCount()).toBe(1)
++
++    const deliveredFetch = vi.fn(async () => new Response('{}', { status: 200 }))
++    __setRemoteDebugTestHooks({
++      fetchImpl: deliveredFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    const deleteSpy = vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(() => {
++      throw new Error('delete blocked (quota lockdown, permanent)')
++    })
++
++    const sendsAfterRound: number[] = []
++    const dropAfterRound: number[] = []
++    for (let round = 1; round <= 10; round++) {
++      clock += 100_000
++      await drainRemoteDebugOutbox()
++      sendsAfterRound.push(deliveredFetch.mock.calls.length)
++      dropAfterRound.push(await getRemoteDebugDropCount())
++    }
++    deleteSpy.mockRestore()
++
++    // 修复前的形状(①席 10 轮实测):dropCount 持续增长([0,0,0,0,1,2,2,2,3,4] 一类),
++    // outboxCount 全程 =1,记录从未清理。修复后的形状——本测试断言的就是这个对照:
++    // 到达重试上限(第 5 轮)后,发送次数与 drop 计数都不再增长(记录被标记终态,
++    // 不再被 due 过滤选中,不会再重发、也不会再虚增 drop)。
++    expect(sendsAfterRound.slice(4)).toEqual(new Array(6).fill(sendsAfterRound[4])) // 第5轮起发送次数不再增长
++    expect(dropAfterRound.slice(4)).toEqual(new Array(6).fill(1)) // drop 恰好计 1 次,此后不再增长
++    expect(deliveredFetch).toHaveBeenCalledTimes(5) // 只有前 5 次(到达上限之前)真正发送过
++
++    // 留痕存在:本地 Debug Log 有一条"标记终态,停止重发"的 error 级痕迹。
++    const messages = useDebugLogStore.getState().entries.filter((e) => e.source === 'Remote Debug')
++    expect(messages.some((e) => e.level === 'error' && e.message.includes('marked terminal to stop further resends'))).toBe(
++      true,
++    )
++  })
++
++  it('F-A1-03(R3 fix)对照组:delete 只失败一次随后成功 → 正常投递完成,不会被误标终态', async () => {
++    const initialFailFetch = vi.fn(async () => {
++      throw new Error('network down (BFF jitter)')
++    })
++    let clock = 1000
++    __setRemoteDebugTestHooks({
++      fetchImpl: initialFailFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
++    await flushRemoteDebugEntries()
++    expect(await getRemoteDebugOutboxCount()).toBe(1)
++
++    const deliveredFetch = vi.fn(async () => new Response('{}', { status: 200 }))
++    __setRemoteDebugTestHooks({
++      fetchImpl: deliveredFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    const originalDelete = IDBObjectStore.prototype.delete
++    let deleteCallCount = 0
++    const deleteSpy = vi
++      .spyOn(IDBObjectStore.prototype, 'delete')
++      .mockImplementation(function (this: IDBObjectStore, query?: IDBValidKey | IDBKeyRange) {
++        deleteCallCount += 1
++        if (deleteCallCount === 1) throw new Error('delete blocked (transient)')
++        return originalDelete.call(this, query as IDBValidKey)
++      })
++
++    clock += 100_000
++    const firstDrain = await drainRemoteDebugOutbox() // 送达成功但删不掉一次 → retained
++    expect(firstDrain).toMatchObject({ sent: 0, retained: 1, dropped: 0 })
++    clock += 100_000
++    const secondDrain = await drainRemoteDebugOutbox() // 再次送达且删除成功 → 正常完成
++    deleteSpy.mockRestore()
++
++    expect(secondDrain).toMatchObject({ sent: 1, retained: 0, dropped: 0 })
++    expect(await getRemoteDebugOutboxCount()).toBe(0)
++    expect(await getRemoteDebugDropCount()).toBe(0)
++  })
++
++  it('R3b fix:enforceOutboxCapacity 驱逐失败时不虚增 drop 计数,日志如实说"驱逐失败"而非声称已驱逐', async () => {
++    // enforceOutboxCapacity 此前把 deleteOutbox 的返回值丢掉——驱逐失败时仍无条件
++    // incrementDropCount 并在日志里声称 "evicted"，是与 drop 分支同一个"丢弃返回值"形状的
++    // 缺陷，且日志本身在失败路径上宣称成功（运行时版本的失准声明）。
++    const alwaysFailFetch = vi.fn(async () => {
++      throw new Error('network down')
++    })
++    const clock = 1000
++    __setRemoteDebugTestHooks({
++      fetchImpl: alwaysFailFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++
++    // 填满到 DEFAULT_MAX_OUTBOX(64)条记录——第 65 条写入前 enforceOutboxCapacity 才会
++    // 真正触发驱逐尝试（`existing.length >= 64`）。clock 恒定不前进：所有记录的
++    // nextAttemptAt 都在未来，不会被任何后台 drain 定时器意外处理，测试的确定性不受
++    // scheduleOutboxDrain 真实定时器影响。
++    for (let i = 0; i < 64; i++) {
++      reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: `seed-${i}`, timestamp: 1000 + i })
++      await flushRemoteDebugEntries()
++    }
++    expect(await getRemoteDebugOutboxCount()).toBe(64)
++    expect(await getRemoteDebugDropCount()).toBe(0)
++
++    // 打断 delete(恒抛，不限次),再写入第 65 条 → enforceOutboxCapacity 尝试驱逐最旧的
++    // 一条,但删不掉。
++    const deleteSpy = vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(() => {
++      throw new Error('delete blocked (quota lockdown, permanent)')
++    })
++    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'overflow', timestamp: 2000 })
++    await flushRemoteDebugEntries()
++    deleteSpy.mockRestore()
++
++    // 反向变异对照:退掉修复(丢弃返回值)会让这里变成 1(驱逐失败也被计入一次 drop)。
++    expect(await getRemoteDebugDropCount()).toBe(0)
++    // 容量确实没释放:64 条旧记录 + 1 条新写入的记录都还在(驱逐没有真正发生)。
++    expect(await getRemoteDebugOutboxCount()).toBe(65)
++    // 日志如实反映驱逐失败,不写"evicted"这种声称已成功的措辞。
++    const messages = useDebugLogStore.getState().entries.filter((e) => e.source === 'Remote Debug')
++    expect(
++      messages.some(
++        (e) =>
++          e.level === 'error' &&
++          e.message.includes('eviction of oldest batch') &&
++          e.message.includes('failed') &&
++          e.message.includes('capacity NOT released'),
++      ),
++    ).toBe(true)
++    expect(messages.some((e) => e.message.includes('evicted oldest batch'))).toBe(false)
++  })
++
++  it('R1 fix ③:终态记录不再触发空 drain 0ms 自激(全终态时不 re-arm 定时器)', async () => {
++    // 机制(R1 三席共识,②席报):drain 的 due 过滤排除 terminal,但 scheduleOutboxDrain 的
++    // earliest 计算不排除 —— 全终态时 earliest 取到终态记录的过期 nextAttemptAt,delay 恒为
++    // 0,而 drain 又是空跑,尾部还无条件 re-arm → 无限 0ms 自激。修法:两处判据统一。
++    // 反向变异对照:退回"earliest 不排除 terminal / 尾部无条件 re-arm"会让下面的
++    // `getTimerCount() === 0` 恰好变红(终态后每轮 drain 尾部都会再排一个 0ms timer)。
++    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
++    try {
++      const initialFailFetch = vi.fn(async () => {
++        throw new Error('network down (BFF jitter)')
++      })
++      let clock = 1000
++      __setRemoteDebugTestHooks({
++        fetchImpl: initialFailFetch as unknown as typeof fetch,
++        now: () => clock,
++        random: () => 0.5,
++        buildClientInfo: fixedClientInfo,
++        enabled: true,
++      })
++      reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
++      await flushRemoteDebugEntries()
++      expect(await getRemoteDebugOutboxCount()).toBe(1)
++
++      const deliveredFetch = vi.fn(async () => new Response('{}', { status: 200 }))
++      __setRemoteDebugTestHooks({
++        fetchImpl: deliveredFetch as unknown as typeof fetch,
++        now: () => clock,
++        random: () => 0.5,
++        buildClientInfo: fixedClientInfo,
++        enabled: true,
++      })
++      const deleteSpy = vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(() => {
++        throw new Error('delete blocked (quota lockdown, permanent)')
++      })
++      // 5 轮 drain 到达重试上限 → 记录被标记终态。
++      for (let round = 1; round <= 5; round++) {
++        clock += 100_000
++        await drainRemoteDebugOutbox()
++      }
++      expect(await getRemoteDebugDropCount()).toBe(1)
++      expect(await getRemoteDebugOutboxCount()).toBe(1)
++
++      // 清掉终态化之前遗留的合法 timer(那是有真实退避延迟的),再推进时间并 drain:
++      // 修复后尾部不再 re-arm,注册表恒空;修复前每轮都会排一个新的 0ms timer。
++      vi.clearAllTimers()
++      const processedAfterTerminal: number[] = []
++      for (let round = 1; round <= 5; round++) {
++        clock += 100_000
++        const result = await drainRemoteDebugOutbox()
++        processedAfterTerminal.push(result.processed)
++      }
++      deleteSpy.mockRestore()
++
++      expect(processedAfterTerminal).toEqual(new Array(5).fill(0)) // 空 drain,不再处理
++      expect(vi.getTimerCount()).toBe(0) // 不再 re-arm —— 反向变异时此处恰好红
++      expect(deliveredFetch).toHaveBeenCalledTimes(5) // 发送次数不再增长
++    } finally {
++      vi.useRealTimers()
++    }
++  })
++
++  it('R1 fix ⑤:驱逐 terminal 记录时不重复计 drop(终态化那次已计),terminalSkipIds 同步清理', async () => {
++    // 双重计数机制(②席):记录终态化时已 incrementDropCount 计过一次;此后若
++    // enforceOutboxCapacity 成功驱逐这条 terminal 记录,会再计一次 → 同一批两次 drop。
++    // 修法:驱逐 terminal 记录时不重复计数;驱逐成功后把 id 从 terminalSkipIds 清掉。
++    // 反向变异对照:退回"驱逐成功一律计数"会让下面的 `dropCount === 1` 恰好变红(变 2)。
++    const initialFailFetch = vi.fn(async () => {
++      throw new Error('network down (BFF jitter)')
++    })
++    let clock = 1000
++    __setRemoteDebugTestHooks({
++      fetchImpl: initialFailFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
++    await flushRemoteDebugEntries()
++    expect(await getRemoteDebugOutboxCount()).toBe(1)
++
++    // 阶段 1:delete 恒抛,5 轮 drain 让这一批到达重试上限 → 终态化(drop 计 1)。
++    const deliveredFetch = vi.fn(async () => new Response('{}', { status: 200 }))
++    __setRemoteDebugTestHooks({
++      fetchImpl: deliveredFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    const deleteSpy = vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(() => {
++      throw new Error('delete blocked (quota lockdown, permanent)')
++    })
++    for (let round = 1; round <= 5; round++) {
++      clock += 100_000
++      await drainRemoteDebugOutbox()
++    }
++    deleteSpy.mockRestore()
++    expect(await getRemoteDebugDropCount()).toBe(1)
++    expect(await getRemoteDebugOutboxCount()).toBe(1)
++
++    // 阶段 2:恢复可写的 IDB(fetch 改回恒败以便种子入 outbox),填 63 条普通记录
++    // (共 64 条;终态记录 createdAt 最早,是驱逐候选)。clock 停走,种子 nextAttemptAt
++    // 全在未来,不会被任何后台 drain 定时器处理。
++    __setRemoteDebugTestHooks({
++      fetchImpl: initialFailFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    for (let i = 0; i < 63; i++) {
++      reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: `seed-${i}`, timestamp: 2000 + i })
++      await flushRemoteDebugEntries()
++    }
++    expect(await getRemoteDebugOutboxCount()).toBe(64)
++    expect(await getRemoteDebugDropCount()).toBe(1)
++
++    // 阶段 3:第 65 次写入触发驱逐 —— 最旧一条(终态记录)被真正删除。
++    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'overflow', timestamp: 3000 })
++    await flushRemoteDebugEntries()
++
++    expect(await getRemoteDebugDropCount()).toBe(1) // 不重复计数 —— 反向变异时此处恰好红
++    expect(await getRemoteDebugOutboxCount()).toBe(64) // 驱逐 1 条 + 写入 1 条
++  })
++
++  it('R1A2 fix(F-A1-R1-CODEX-004):终态标记仅存在于内存(IDB 留 stale 行)时,驱逐成功不再二次计 drop', async () => {
++    // 与 R1 fix ⑤ 那条对照:⑤ 覆盖「terminal=true 已持久化进 IDB」的路径(oldest.terminal
++    // 可见);本条的缺陷路径是「终态化时的 putOutbox 写失败 → terminal=true 只存在于
++    // outboxMem,IDB 里还是 terminal=false 的 stale 行」。此时 getAllOutbox 的 union 逻辑
++    // 按 idbIds 命中把内存那份过滤掉(:353-354),驱逐候选拿到的是 stale 行 —— 只看
++    // `oldest.terminal` 会把「已计过 drop 的批次」误判为未计过而二次计数。
++    // 反向变异对照:退回只看 terminal 字段,会让下面 `dropCount === 1` 恰好变红(变 2)。
++    const initialFailFetch = vi.fn(async () => {
++      throw new Error('network down (BFF jitter)')
++    })
++    let clock = 1000
++    __setRemoteDebugTestHooks({
++      fetchImpl: initialFailFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
++    await flushRemoteDebugEntries()
++    expect(await getRemoteDebugOutboxCount()).toBe(1)
++
++    // 阶段 1:delete 恒抛 → 5 轮 drain 到达重试上限。第 5 轮 drop 分支里,终态化的
++    // putOutbox 恰好也失败(只拦 terminal=true 的写入;前 4 轮的 retained put 放行,让
++    // IDB 里留下 terminal=false 的 stale 行)。
++    const deliveredFetch = vi.fn(async () => new Response('{}', { status: 200 }))
++    __setRemoteDebugTestHooks({
++      fetchImpl: deliveredFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    const originalPut = IDBObjectStore.prototype.put
++    const putSpy = vi
++      .spyOn(IDBObjectStore.prototype, 'put')
++      .mockImplementation(function (this: IDBObjectStore, value: unknown, key?: IDBValidKey | IDBKeyRange) {
++        if (
++          typeof value === 'object' &&
++          value !== null &&
++          (value as { terminal?: boolean }).terminal === true
++        ) {
++          throw new Error('put blocked (terminal marker write)')
++        }
++        return originalPut.call(this, value as never, key as never)
++      })
++    const deleteSpy = vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(() => {
++      throw new Error('delete blocked (quota lockdown, permanent)')
++    })
++    for (let round = 1; round <= 5; round++) {
++      clock += 100_000
++      await drainRemoteDebugOutbox()
++    }
++    expect(await getRemoteDebugDropCount()).toBe(1)
++    // 记录没被删,仍在 outbox(内存那份 terminal=true 被 union 过滤,IDB stale 行可见)。
++    expect(await getRemoteDebugOutboxCount()).toBe(1)
++    deleteSpy.mockRestore()
++    putSpy.mockRestore()
++
++    // 阶段 2:恢复可写的 IDB(fetch 改回恒败以便种子入 outbox),填 63 条普通记录
++    // (共 64 条;stale 行 createdAt 最早,是驱逐候选)。clock 停走,种子 nextAttemptAt
++    // 全在未来,不会被任何后台 drain 定时器处理。
++    __setRemoteDebugTestHooks({
++      fetchImpl: initialFailFetch as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    for (let i = 0; i < 63; i++) {
++      reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: `seed-${i}`, timestamp: 2000 + i })
++      await flushRemoteDebugEntries()
++    }
++    expect(await getRemoteDebugOutboxCount()).toBe(64)
++    expect(await getRemoteDebugDropCount()).toBe(1)
++
++    // 阶段 3:第 65 次写入触发驱逐 —— 最旧一条(stale 行)被真正删除。驱逐成功,
++    // 但该批次的 drop 早已在终态化时计过:修复后不再重复计数。
++    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'overflow', timestamp: 3000 })
++    await flushRemoteDebugEntries()
++
++    expect(await getRemoteDebugDropCount()).toBe(1) // 不重复计数 —— 反向变异时此处恰好红
++    expect(await getRemoteDebugOutboxCount()).toBe(64) // 驱逐 1 条 + 写入 1 条
++    // 日志走「已计过」分支,而不是「计入一次 drop」分支。
++    const messages = useDebugLogStore.getState().entries.filter((e) => e.source === 'Remote Debug')
++    expect(
++      messages.some((e) => e.level === 'error' && e.message.includes('evicted terminal batch') && e.message.includes('drop already counted')),
++    ).toBe(true)
++    expect(messages.some((e) => e.message.includes('evicted oldest batch') && e.message.includes('total dropped'))).toBe(false)
++  })
++
++  it('logging completeness (docs/development-logging.md): success/skip/failure paths all surface locally', async () => {
++    // Success path → logLocal('log'); transient retry → logLocal('warning'); drop →
++    // logLocal('error'). These bypass debugLogger to avoid the remote-report feedback
++    // loop, but still write to the Debug Log store so the panel shows every outcome.
++    useDebugLogStore.getState().clear()
++    const fetchMock = vi.fn(async () => {
++      throw new Error('network down')
++    })
++    let clock = 1000
++    __setRemoteDebugTestHooks({
++      fetchImpl: fetchMock as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++
++    reportRemoteDebugEntry({ level: 'error', source: 'S', message: 'm', timestamp: 1000 })
++    await flushRemoteDebugEntries()
++    // skip/failure path: batch persisted to outbox → a warning-level local log entry.
++    const afterFlush = useDebugLogStore.getState().entries
++    expect(
++      afterFlush.some(
++        (e) => e.level === 'warning' && typeof e.message === 'string' && e.message.includes('persisted to durable outbox'),
++      ),
++    ).toBe(true)
++
++    // Drain through to drop (5 retry attempts, clock advanced past backoff each time)
++    // → an error-level local log entry.
++    for (let attempt = 1; attempt <= 5; attempt++) {
++      clock += 100_000
++      await drainRemoteDebugOutbox()
++    }
++    const afterDrop = useDebugLogStore.getState().entries
++    expect(
++      afterDrop.some(
++        (e) => e.level === 'error' && typeof e.message === 'string' && e.message.includes('dropped after'),
++      ),
++    ).toBe(true)
++  })
++})
+\ No newline at end of file
+diff --git a/src/store/remoteDebugReporter.test.ts b/src/store/remoteDebugReporter.test.ts
+index 53a8c0e8..6feff8df 100644
+--- a/src/store/remoteDebugReporter.test.ts
++++ b/src/store/remoteDebugReporter.test.ts
+@@ -9,9 +9,7 @@ import {
+   createRemoteDebugClientInfo,
+   drainRemoteDebugOutbox,
+   flushRemoteDebugEntries,
+-  getRemoteDebugDropCount,
+   getRemoteDebugOutboxCount,
+-  reportRemoteDebugEntry,
+   resolveRemoteDebugEndpoint,
+   shouldReportRemoteDebugLevel,
+   type RemoteDebugClientInfo,
+@@ -106,8 +104,7 @@ describe('remoteDebugReporter', () => {
+   })
+ })
+ 
+-// ── FX-7: durable outbox + exponential-backoff retry + drop count (A6 · D-4 hard prereq) ──
+-
++// 共享 helper:FX-7 用例拆出后,createId/stack/脱敏/模块级初始值锁用例仍使用。
+ const fixedClientInfo = (): RemoteDebugClientInfo => ({
+   clientId: 'client-fixed',
+   sessionId: 'session-fixed',
+@@ -119,571 +116,6 @@ const fixedClientInfo = (): RemoteDebugClientInfo => ({
+   screen: { width: 1440, height: 900, pixelRatio: 2 },
+ })
+ 
+-describe('FX-7 remoteDebugReporter durable outbox + retry + drop count', () => {
+-  beforeEach(async () => {
+-    vi.clearAllMocks()
+-    await __resetRemoteDebugStateForTest()
+-  })
+-  afterEach(async () => {
+-    vi.unstubAllGlobals()
+-    await __resetRemoteDebugStateForTest()
+-  })
+-
+-  it('SC1: a failed batch persists to the durable outbox, recovers on resend, and is not lost', async () => {
+-    const sentPayloads: { entries: Array<{ message: string }> }[] = []
+-    let shouldFail = true
+-    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
+-      if (shouldFail) throw new Error('network down (BFF jitter)')
+-      sentPayloads.push(JSON.parse(init.body ?? '{}'))
+-      return new Response('{}', { status: 200 })
+-    })
+-    let clock = 1000
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: fetchMock as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5, // deterministic jitter → 0.75 of capped delay
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-
+-    // Report an error entry; flush immediately (batch is the single entry).
+-    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
+-    await flushRemoteDebugEntries()
+-
+-    // The batch failed to send but was NOT lost — it landed in the durable IDB outbox,
+-    // and the drop count is still 0 (retry is not yet exhausted).
+-    expect(fetchMock).toHaveBeenCalledTimes(1)
+-    expect(await getRemoteDebugOutboxCount()).toBe(1)
+-    expect(await getRemoteDebugDropCount()).toBe(0)
+-
+-    // Simulate BFF recovery: fetch now succeeds. Advance the clock past the record's
+-    // backoff window so it is due, then drain the durable outbox.
+-    shouldFail = false
+-    clock += 10_000
+-    const result = await drainRemoteDebugOutbox()
+-
+-    expect(result.sent).toBe(1)
+-    expect(result.dropped).toBe(0)
+-    expect(await getRemoteDebugOutboxCount()).toBe(0)
+-    expect(await getRemoteDebugDropCount()).toBe(0)
+-    // The original batch was actually delivered (not lost): its entry survived the
+-    // failed flush + durable round-trip.
+-    expect(sentPayloads).toHaveLength(1)
+-    expect(sentPayloads[0].entries[0].message).toBe('boom')
+-  })
+-
+-  it('SC2: after the retry limit the drop count increments and is queryable', async () => {
+-    const fetchMock = vi.fn(async () => {
+-      throw new Error('network down (BFF permanently unreachable)')
+-    })
+-    let clock = 1000
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: fetchMock as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-
+-    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
+-    await flushRemoteDebugEntries() // batch fails → durable outbox (attempts=0)
+-    expect(await getRemoteDebugOutboxCount()).toBe(1)
+-    expect(await getRemoteDebugDropCount()).toBe(0)
+-
+-    // DEFAULT_MAX_RETRIES = 5. Each drain (clock advanced past the record's backoff
+-    // window) fails and bumps attempts; on the 5th retry attempt (attempts reaches
+-    // 5 >= maxRetries) the batch is dropped + counted. The clock is advanced before the
+-    // FIRST drain too, because persistFailedBatch set nextAttemptAt = now + backoff(1)
+-    // (so the record is not due at clock=1000 immediately after the failed flush).
+-    let last: { dropped: number } = { dropped: 0 }
+-    for (let attempt = 1; attempt <= 5; attempt++) {
+-      clock += 100_000 // well past any backoff window so the record is due
+-      last = await drainRemoteDebugOutbox()
+-    }
+-    // The 5th retry attempt drops the batch (attempts=5 >= maxRetries).
+-    expect(last.dropped).toBe(1)
+-    // Drop count is persisted + queryable.
+-    expect(await getRemoteDebugDropCount()).toBe(1)
+-    expect(await getRemoteDebugOutboxCount()).toBe(0)
+-    // 1 initial flush send + 5 retry sends, all failed.
+-    expect(fetchMock).toHaveBeenCalledTimes(6)
+-  })
+-
+-  it('F-A1-03(R2 fix): 2xx 送达后 outbox 记录删不掉时,attempts 仍递增并最终计入 drop(不会永远 due)', async () => {
+-    // 第一次 flush 网络失败,把这一批放进 outbox(attempts=0)。
+-    const initialFailFetch = vi.fn(async () => {
+-      throw new Error('network down (BFF jitter)')
+-    })
+-    let clock = 1000
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: initialFailFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
+-    await flushRemoteDebugEntries()
+-    expect(await getRemoteDebugOutboxCount()).toBe(1)
+-
+-    // 之后每次 drain 都"送达成功"(2xx),但 outbox 记录删不掉 —— 用 fake-indexeddb 原型打断
+-    // 前 5 次 delete 调用,第 6 次(第 5 轮 drop 分支里的 best-effort 补删)放行,验证记录最终
+-    // 被真正清理而不是永远残留。
+-    const deliveredFetch = vi.fn(async () => new Response('{}', { status: 200 }))
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: deliveredFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-    const originalDelete = IDBObjectStore.prototype.delete
+-    let deleteCallCount = 0
+-    const deleteSpy = vi
+-      .spyOn(IDBObjectStore.prototype, 'delete')
+-      .mockImplementation(function (this: IDBObjectStore, query?: IDBValidKey | IDBKeyRange) {
+-        deleteCallCount += 1
+-        if (deleteCallCount <= 5) throw new Error('delete blocked (quota lockdown)')
+-        return originalDelete.call(this, query as IDBValidKey)
+-      })
+-
+-    let last: { sent: number; retained: number; dropped: number } = { sent: 0, retained: 0, dropped: 0 }
+-    for (let attempt = 1; attempt <= 5; attempt++) {
+-      clock += 100_000
+-      last = await drainRemoteDebugOutbox()
+-      if (attempt < 5) {
+-        // 反向变异对照:退掉本轮修复(删不掉时不抛错,直接当成功)会让这里变成
+-        // {sent:1,retained:0,dropped:0}(误判已投递并清空 outbox),而不是 retained:1
+-        // (仍受重试上限约束)。
+-        expect(last).toMatchObject({ sent: 0, retained: 1, dropped: 0 })
+-      }
+-    }
+-    deleteSpy.mockRestore()
+-
+-    // 送达从未失败过(deliveredFetch 一直 2xx)—— 5 次全部是"送达成功但删不掉"而非网络
+-    // 失败,证明重试上限确实施加于"删除失败"这一失败模式,不只是"发送失败"。
+-    expect(deliveredFetch).toHaveBeenCalledTimes(5)
+-    expect(last.dropped).toBe(1)
+-    expect(await getRemoteDebugDropCount()).toBe(1)
+-    // 第 6 次 delete 调用(drop 分支的 best-effort 补删)放行后记录被真正清理。
+-    expect(await getRemoteDebugOutboxCount()).toBe(0)
+-  })
+-
+-  it('F-A1-03(R3 fix):delete 恒抛(不限次)时,重投与 drop 计数最终都停止增长,记录不再被重发', async () => {
+-    // 硬要求(R3 任务书):stub 不得构造成让残余缺陷不可见——上一轮的测试只让 delete
+-    // 失败 5 次、第 6 次放行,刚好卡在重试上限边界,"持续删除失败"这个真实场景从未出现。
+-    // 本轮把边界推远:delete 恒抛,不限次。
+-    const initialFailFetch = vi.fn(async () => {
+-      throw new Error('network down (BFF jitter)')
+-    })
+-    let clock = 1000
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: initialFailFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
+-    await flushRemoteDebugEntries()
+-    expect(await getRemoteDebugOutboxCount()).toBe(1)
+-
+-    const deliveredFetch = vi.fn(async () => new Response('{}', { status: 200 }))
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: deliveredFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-    const deleteSpy = vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(() => {
+-      throw new Error('delete blocked (quota lockdown, permanent)')
+-    })
+-
+-    const sendsAfterRound: number[] = []
+-    const dropAfterRound: number[] = []
+-    for (let round = 1; round <= 10; round++) {
+-      clock += 100_000
+-      await drainRemoteDebugOutbox()
+-      sendsAfterRound.push(deliveredFetch.mock.calls.length)
+-      dropAfterRound.push(await getRemoteDebugDropCount())
+-    }
+-    deleteSpy.mockRestore()
+-
+-    // 修复前的形状(①席 10 轮实测):dropCount 持续增长([0,0,0,0,1,2,2,2,3,4] 一类),
+-    // outboxCount 全程 =1,记录从未清理。修复后的形状——本测试断言的就是这个对照:
+-    // 到达重试上限(第 5 轮)后,发送次数与 drop 计数都不再增长(记录被标记终态,
+-    // 不再被 due 过滤选中,不会再重发、也不会再虚增 drop)。
+-    expect(sendsAfterRound.slice(4)).toEqual(new Array(6).fill(sendsAfterRound[4])) // 第5轮起发送次数不再增长
+-    expect(dropAfterRound.slice(4)).toEqual(new Array(6).fill(1)) // drop 恰好计 1 次,此后不再增长
+-    expect(deliveredFetch).toHaveBeenCalledTimes(5) // 只有前 5 次(到达上限之前)真正发送过
+-
+-    // 留痕存在:本地 Debug Log 有一条"标记终态,停止重发"的 error 级痕迹。
+-    const messages = useDebugLogStore.getState().entries.filter((e) => e.source === 'Remote Debug')
+-    expect(messages.some((e) => e.level === 'error' && e.message.includes('marked terminal to stop further resends'))).toBe(
+-      true,
+-    )
+-  })
+-
+-  it('F-A1-03(R3 fix)对照组:delete 只失败一次随后成功 → 正常投递完成,不会被误标终态', async () => {
+-    const initialFailFetch = vi.fn(async () => {
+-      throw new Error('network down (BFF jitter)')
+-    })
+-    let clock = 1000
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: initialFailFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
+-    await flushRemoteDebugEntries()
+-    expect(await getRemoteDebugOutboxCount()).toBe(1)
+-
+-    const deliveredFetch = vi.fn(async () => new Response('{}', { status: 200 }))
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: deliveredFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-    const originalDelete = IDBObjectStore.prototype.delete
+-    let deleteCallCount = 0
+-    const deleteSpy = vi
+-      .spyOn(IDBObjectStore.prototype, 'delete')
+-      .mockImplementation(function (this: IDBObjectStore, query?: IDBValidKey | IDBKeyRange) {
+-        deleteCallCount += 1
+-        if (deleteCallCount === 1) throw new Error('delete blocked (transient)')
+-        return originalDelete.call(this, query as IDBValidKey)
+-      })
+-
+-    clock += 100_000
+-    const firstDrain = await drainRemoteDebugOutbox() // 送达成功但删不掉一次 → retained
+-    expect(firstDrain).toMatchObject({ sent: 0, retained: 1, dropped: 0 })
+-    clock += 100_000
+-    const secondDrain = await drainRemoteDebugOutbox() // 再次送达且删除成功 → 正常完成
+-    deleteSpy.mockRestore()
+-
+-    expect(secondDrain).toMatchObject({ sent: 1, retained: 0, dropped: 0 })
+-    expect(await getRemoteDebugOutboxCount()).toBe(0)
+-    expect(await getRemoteDebugDropCount()).toBe(0)
+-  })
+-
+-  it('R3b fix:enforceOutboxCapacity 驱逐失败时不虚增 drop 计数,日志如实说"驱逐失败"而非声称已驱逐', async () => {
+-    // enforceOutboxCapacity 此前把 deleteOutbox 的返回值丢掉——驱逐失败时仍无条件
+-    // incrementDropCount 并在日志里声称 "evicted"，是与 drop 分支同一个"丢弃返回值"形状的
+-    // 缺陷，且日志本身在失败路径上宣称成功（运行时版本的失准声明）。
+-    const alwaysFailFetch = vi.fn(async () => {
+-      throw new Error('network down')
+-    })
+-    const clock = 1000
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: alwaysFailFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-
+-    // 填满到 DEFAULT_MAX_OUTBOX(64)条记录——第 65 条写入前 enforceOutboxCapacity 才会
+-    // 真正触发驱逐尝试（`existing.length >= 64`）。clock 恒定不前进：所有记录的
+-    // nextAttemptAt 都在未来，不会被任何后台 drain 定时器意外处理，测试的确定性不受
+-    // scheduleOutboxDrain 真实定时器影响。
+-    for (let i = 0; i < 64; i++) {
+-      reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: `seed-${i}`, timestamp: 1000 + i })
+-      await flushRemoteDebugEntries()
+-    }
+-    expect(await getRemoteDebugOutboxCount()).toBe(64)
+-    expect(await getRemoteDebugDropCount()).toBe(0)
+-
+-    // 打断 delete(恒抛，不限次),再写入第 65 条 → enforceOutboxCapacity 尝试驱逐最旧的
+-    // 一条,但删不掉。
+-    const deleteSpy = vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(() => {
+-      throw new Error('delete blocked (quota lockdown, permanent)')
+-    })
+-    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'overflow', timestamp: 2000 })
+-    await flushRemoteDebugEntries()
+-    deleteSpy.mockRestore()
+-
+-    // 反向变异对照:退掉修复(丢弃返回值)会让这里变成 1(驱逐失败也被计入一次 drop)。
+-    expect(await getRemoteDebugDropCount()).toBe(0)
+-    // 容量确实没释放:64 条旧记录 + 1 条新写入的记录都还在(驱逐没有真正发生)。
+-    expect(await getRemoteDebugOutboxCount()).toBe(65)
+-    // 日志如实反映驱逐失败,不写"evicted"这种声称已成功的措辞。
+-    const messages = useDebugLogStore.getState().entries.filter((e) => e.source === 'Remote Debug')
+-    expect(
+-      messages.some(
+-        (e) =>
+-          e.level === 'error' &&
+-          e.message.includes('eviction of oldest batch') &&
+-          e.message.includes('failed') &&
+-          e.message.includes('capacity NOT released'),
+-      ),
+-    ).toBe(true)
+-    expect(messages.some((e) => e.message.includes('evicted oldest batch'))).toBe(false)
+-  })
+-
+-  it('R1 fix ③:终态记录不再触发空 drain 0ms 自激(全终态时不 re-arm 定时器)', async () => {
+-    // 机制(R1 三席共识,②席报):drain 的 due 过滤排除 terminal,但 scheduleOutboxDrain 的
+-    // earliest 计算不排除 —— 全终态时 earliest 取到终态记录的过期 nextAttemptAt,delay 恒为
+-    // 0,而 drain 又是空跑,尾部还无条件 re-arm → 无限 0ms 自激。修法:两处判据统一。
+-    // 反向变异对照:退回"earliest 不排除 terminal / 尾部无条件 re-arm"会让下面的
+-    // `getTimerCount() === 0` 恰好变红(终态后每轮 drain 尾部都会再排一个 0ms timer)。
+-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+-    try {
+-      const initialFailFetch = vi.fn(async () => {
+-        throw new Error('network down (BFF jitter)')
+-      })
+-      let clock = 1000
+-      __setRemoteDebugTestHooks({
+-        fetchImpl: initialFailFetch as unknown as typeof fetch,
+-        now: () => clock,
+-        random: () => 0.5,
+-        buildClientInfo: fixedClientInfo,
+-        enabled: true,
+-      })
+-      reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
+-      await flushRemoteDebugEntries()
+-      expect(await getRemoteDebugOutboxCount()).toBe(1)
+-
+-      const deliveredFetch = vi.fn(async () => new Response('{}', { status: 200 }))
+-      __setRemoteDebugTestHooks({
+-        fetchImpl: deliveredFetch as unknown as typeof fetch,
+-        now: () => clock,
+-        random: () => 0.5,
+-        buildClientInfo: fixedClientInfo,
+-        enabled: true,
+-      })
+-      const deleteSpy = vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(() => {
+-        throw new Error('delete blocked (quota lockdown, permanent)')
+-      })
+-      // 5 轮 drain 到达重试上限 → 记录被标记终态。
+-      for (let round = 1; round <= 5; round++) {
+-        clock += 100_000
+-        await drainRemoteDebugOutbox()
+-      }
+-      expect(await getRemoteDebugDropCount()).toBe(1)
+-      expect(await getRemoteDebugOutboxCount()).toBe(1)
+-
+-      // 清掉终态化之前遗留的合法 timer(那是有真实退避延迟的),再推进时间并 drain:
+-      // 修复后尾部不再 re-arm,注册表恒空;修复前每轮都会排一个新的 0ms timer。
+-      vi.clearAllTimers()
+-      const processedAfterTerminal: number[] = []
+-      for (let round = 1; round <= 5; round++) {
+-        clock += 100_000
+-        const result = await drainRemoteDebugOutbox()
+-        processedAfterTerminal.push(result.processed)
+-      }
+-      deleteSpy.mockRestore()
+-
+-      expect(processedAfterTerminal).toEqual(new Array(5).fill(0)) // 空 drain,不再处理
+-      expect(vi.getTimerCount()).toBe(0) // 不再 re-arm —— 反向变异时此处恰好红
+-      expect(deliveredFetch).toHaveBeenCalledTimes(5) // 发送次数不再增长
+-    } finally {
+-      vi.useRealTimers()
+-    }
+-  })
+-
+-  it('R1 fix ⑤:驱逐 terminal 记录时不重复计 drop(终态化那次已计),terminalSkipIds 同步清理', async () => {
+-    // 双重计数机制(②席):记录终态化时已 incrementDropCount 计过一次;此后若
+-    // enforceOutboxCapacity 成功驱逐这条 terminal 记录,会再计一次 → 同一批两次 drop。
+-    // 修法:驱逐 terminal 记录时不重复计数;驱逐成功后把 id 从 terminalSkipIds 清掉。
+-    // 反向变异对照:退回"驱逐成功一律计数"会让下面的 `dropCount === 1` 恰好变红(变 2)。
+-    const initialFailFetch = vi.fn(async () => {
+-      throw new Error('network down (BFF jitter)')
+-    })
+-    let clock = 1000
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: initialFailFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
+-    await flushRemoteDebugEntries()
+-    expect(await getRemoteDebugOutboxCount()).toBe(1)
+-
+-    // 阶段 1:delete 恒抛,5 轮 drain 让这一批到达重试上限 → 终态化(drop 计 1)。
+-    const deliveredFetch = vi.fn(async () => new Response('{}', { status: 200 }))
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: deliveredFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-    const deleteSpy = vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(() => {
+-      throw new Error('delete blocked (quota lockdown, permanent)')
+-    })
+-    for (let round = 1; round <= 5; round++) {
+-      clock += 100_000
+-      await drainRemoteDebugOutbox()
+-    }
+-    deleteSpy.mockRestore()
+-    expect(await getRemoteDebugDropCount()).toBe(1)
+-    expect(await getRemoteDebugOutboxCount()).toBe(1)
+-
+-    // 阶段 2:恢复可写的 IDB(fetch 改回恒败以便种子入 outbox),填 63 条普通记录
+-    // (共 64 条;终态记录 createdAt 最早,是驱逐候选)。clock 停走,种子 nextAttemptAt
+-    // 全在未来,不会被任何后台 drain 定时器处理。
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: initialFailFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-    for (let i = 0; i < 63; i++) {
+-      reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: `seed-${i}`, timestamp: 2000 + i })
+-      await flushRemoteDebugEntries()
+-    }
+-    expect(await getRemoteDebugOutboxCount()).toBe(64)
+-    expect(await getRemoteDebugDropCount()).toBe(1)
+-
+-    // 阶段 3:第 65 次写入触发驱逐 —— 最旧一条(终态记录)被真正删除。
+-    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'overflow', timestamp: 3000 })
+-    await flushRemoteDebugEntries()
+-
+-    expect(await getRemoteDebugDropCount()).toBe(1) // 不重复计数 —— 反向变异时此处恰好红
+-    expect(await getRemoteDebugOutboxCount()).toBe(64) // 驱逐 1 条 + 写入 1 条
+-  })
+-
+-  it('R1A2 fix(F-A1-R1-CODEX-004):终态标记仅存在于内存(IDB 留 stale 行)时,驱逐成功不再二次计 drop', async () => {
+-    // 与 R1 fix ⑤ 那条对照:⑤ 覆盖「terminal=true 已持久化进 IDB」的路径(oldest.terminal
+-    // 可见);本条的缺陷路径是「终态化时的 putOutbox 写失败 → terminal=true 只存在于
+-    // outboxMem,IDB 里还是 terminal=false 的 stale 行」。此时 getAllOutbox 的 union 逻辑
+-    // 按 idbIds 命中把内存那份过滤掉(:353-354),驱逐候选拿到的是 stale 行 —— 只看
+-    // `oldest.terminal` 会把「已计过 drop 的批次」误判为未计过而二次计数。
+-    // 反向变异对照:退回只看 terminal 字段,会让下面 `dropCount === 1` 恰好变红(变 2)。
+-    const initialFailFetch = vi.fn(async () => {
+-      throw new Error('network down (BFF jitter)')
+-    })
+-    let clock = 1000
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: initialFailFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'boom', timestamp: 1000 })
+-    await flushRemoteDebugEntries()
+-    expect(await getRemoteDebugOutboxCount()).toBe(1)
+-
+-    // 阶段 1:delete 恒抛 → 5 轮 drain 到达重试上限。第 5 轮 drop 分支里,终态化的
+-    // putOutbox 恰好也失败(只拦 terminal=true 的写入;前 4 轮的 retained put 放行,让
+-    // IDB 里留下 terminal=false 的 stale 行)。
+-    const deliveredFetch = vi.fn(async () => new Response('{}', { status: 200 }))
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: deliveredFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-    const originalPut = IDBObjectStore.prototype.put
+-    const putSpy = vi
+-      .spyOn(IDBObjectStore.prototype, 'put')
+-      .mockImplementation(function (this: IDBObjectStore, value: unknown, key?: IDBValidKey | IDBKeyRange) {
+-        if (
+-          typeof value === 'object' &&
+-          value !== null &&
+-          (value as { terminal?: boolean }).terminal === true
+-        ) {
+-          throw new Error('put blocked (terminal marker write)')
+-        }
+-        return originalPut.call(this, value as never, key as never)
+-      })
+-    const deleteSpy = vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(() => {
+-      throw new Error('delete blocked (quota lockdown, permanent)')
+-    })
+-    for (let round = 1; round <= 5; round++) {
+-      clock += 100_000
+-      await drainRemoteDebugOutbox()
+-    }
+-    expect(await getRemoteDebugDropCount()).toBe(1)
+-    // 记录没被删,仍在 outbox(内存那份 terminal=true 被 union 过滤,IDB stale 行可见)。
+-    expect(await getRemoteDebugOutboxCount()).toBe(1)
+-    deleteSpy.mockRestore()
+-    putSpy.mockRestore()
+-
+-    // 阶段 2:恢复可写的 IDB(fetch 改回恒败以便种子入 outbox),填 63 条普通记录
+-    // (共 64 条;stale 行 createdAt 最早,是驱逐候选)。clock 停走,种子 nextAttemptAt
+-    // 全在未来,不会被任何后台 drain 定时器处理。
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: initialFailFetch as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-    for (let i = 0; i < 63; i++) {
+-      reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: `seed-${i}`, timestamp: 2000 + i })
+-      await flushRemoteDebugEntries()
+-    }
+-    expect(await getRemoteDebugOutboxCount()).toBe(64)
+-    expect(await getRemoteDebugDropCount()).toBe(1)
+-
+-    // 阶段 3:第 65 次写入触发驱逐 —— 最旧一条(stale 行)被真正删除。驱逐成功,
+-    // 但该批次的 drop 早已在终态化时计过:修复后不再重复计数。
+-    reportRemoteDebugEntry({ level: 'error', source: 'Canvas', message: 'overflow', timestamp: 3000 })
+-    await flushRemoteDebugEntries()
+-
+-    expect(await getRemoteDebugDropCount()).toBe(1) // 不重复计数 —— 反向变异时此处恰好红
+-    expect(await getRemoteDebugOutboxCount()).toBe(64) // 驱逐 1 条 + 写入 1 条
+-    // 日志走「已计过」分支,而不是「计入一次 drop」分支。
+-    const messages = useDebugLogStore.getState().entries.filter((e) => e.source === 'Remote Debug')
+-    expect(
+-      messages.some((e) => e.level === 'error' && e.message.includes('evicted terminal batch') && e.message.includes('drop already counted')),
+-    ).toBe(true)
+-    expect(messages.some((e) => e.message.includes('evicted oldest batch') && e.message.includes('total dropped'))).toBe(false)
+-  })
+-
+-  it('logging completeness (docs/development-logging.md): success/skip/failure paths all surface locally', async () => {
+-    // Success path → logLocal('log'); transient retry → logLocal('warning'); drop →
+-    // logLocal('error'). These bypass debugLogger to avoid the remote-report feedback
+-    // loop, but still write to the Debug Log store so the panel shows every outcome.
+-    useDebugLogStore.getState().clear()
+-    const fetchMock = vi.fn(async () => {
+-      throw new Error('network down')
+-    })
+-    let clock = 1000
+-    __setRemoteDebugTestHooks({
+-      fetchImpl: fetchMock as unknown as typeof fetch,
+-      now: () => clock,
+-      random: () => 0.5,
+-      buildClientInfo: fixedClientInfo,
+-      enabled: true,
+-    })
+-
+-    reportRemoteDebugEntry({ level: 'error', source: 'S', message: 'm', timestamp: 1000 })
+-    await flushRemoteDebugEntries()
+-    // skip/failure path: batch persisted to outbox → a warning-level local log entry.
+-    const afterFlush = useDebugLogStore.getState().entries
+-    expect(
+-      afterFlush.some(
+-        (e) => e.level === 'warning' && typeof e.message === 'string' && e.message.includes('persisted to durable outbox'),
+-      ),
+-    ).toBe(true)
+-
+-    // Drain through to drop (5 retry attempts, clock advanced past backoff each time)
+-    // → an error-level local log entry.
+-    for (let attempt = 1; attempt <= 5; attempt++) {
+-      clock += 100_000
+-      await drainRemoteDebugOutbox()
+-    }
+-    const afterDrop = useDebugLogStore.getState().entries
+-    expect(
+-      afterDrop.some(
+-        (e) => e.level === 'error' && typeof e.message === 'string' && e.message.includes('dropped after'),
+-      ),
+-    ).toBe(true)
+-  })
+-})
+-
+ // ── P1-1 / P1-2 (double-review fixes) ──
+ 
+ describe('FX-7 P1-1: createId never uses Math.random (CWE-338)', () => {
+@@ -797,6 +229,144 @@ describe('T2-4 stack capture on error-level entries', () => {
+   })
+ })
+ 
++// ── B 支:出网脱敏收口(接线 debugLogRedact 规则层)──
++//
++// 行为层验证:脱敏在唯一组包点 buildRemoteDebugPayload 生效,覆盖直接 flush 与
++// outbox 持久化/重放两条出网路径;本地面板保留原文。断言基于实测输出形态
++// (凭证→`Bearer [secret]`、URL→`[url]`、未知 query 键值→`[text len=N sig=…]`)。
++
++describe('B 支出网脱敏:凭证/URL/pagePath 不出网', () => {
++  beforeEach(async () => {
++    vi.clearAllMocks()
++    await __resetRemoteDebugStateForTest()
++  })
++
++  afterEach(async () => {
++    vi.unstubAllGlobals()
++    await __resetRemoteDebugStateForTest()
++  })
++
++  it('直接 flush 路径:message 内凭证被替换,出网 payload 不含明文', async () => {
++    const bodies: string[] = []
++    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
++      bodies.push(String(init?.body ?? ''))
++      return { ok: true, status: 200 } as Response
++    })
++    __setRemoteDebugTestHooks({
++      fetchImpl: fetchMock as unknown as typeof fetch,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++
++    // Error 的 stack 内也携带同一凭证(真实场景:message 插值被 Error 构造函数带进 stack),
++    // 证明 stack 侧与 message 侧走同一脱敏收口。
++    debugLogger.error('Canvas', 'upload failed: Bearer sk-abc12345xyz', new Error('Bearer sk-abc12345xyz'))
++    await flushRemoteDebugEntries()
++
++    expect(fetchMock).toHaveBeenCalledTimes(1)
++    const payload = JSON.parse(bodies[0]!) as { entries: Array<{ message: string; stack?: string }> }
++    expect(payload.entries).toHaveLength(1)
++    // 凭证明文绝不出网:原文片段与整串都不能出现(message 与 stack 两侧)。
++    expect(bodies[0]!).not.toContain('sk-abc12345xyz')
++    expect(payload.entries[0]!.message).toBe('upload failed: Bearer [secret]')
++    // stack 是同一脱敏收口的第二现场(Error 文本里携带同一凭证)。
++    expect(payload.entries[0]!.stack).toContain('Bearer [secret]')
++  })
++
++  it('pagePath:query 内 token 被指纹化,安全开关键名保留诊断值', async () => {
++    const bodies: string[] = []
++    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
++      bodies.push(String(init?.body ?? ''))
++      return { ok: true, status: 200 } as Response
++    })
++    const info = fixedClientInfo()
++    __setRemoteDebugTestHooks({
++      fetchImpl: fetchMock as unknown as typeof fetch,
++      buildClientInfo: () => ({ ...info, pagePath: '/canvas?token=SECRET123&renderer=dom' }),
++      enabled: true,
++    })
++
++    debugLogger.warn('Canvas', 'renderer fallback')
++    await flushRemoteDebugEntries()
++
++    const payload = JSON.parse(bodies[0]!) as { pagePath: string }
++    expect(payload.pagePath).not.toContain('SECRET123')
++    expect(payload.pagePath).toContain('[text len=9 sig=')
++    // 安全键(renderer 在 SAFE_QUERY_KEYS 闭集)原样保留,供 bug-doctor 定位「renderer=dom 才复现」。
++    expect(payload.pagePath).toContain('renderer=dom')
++  })
++
++  it('outbox 持久化 + 重放路径:失败批次重放后出网 payload 仍无明文(无旁路)', async () => {
++    const sentBodies: string[] = []
++    let shouldFail = true
++    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
++      if (shouldFail) throw new Error('network down (BFF jitter)')
++      sentBodies.push(String(init?.body ?? ''))
++      return { ok: true, status: 200 } as Response
++    })
++    let clock = 1000
++    __setRemoteDebugTestHooks({
++      fetchImpl: fetchMock as unknown as typeof fetch,
++      now: () => clock,
++      random: () => 0.5,
++      buildClientInfo: () => ({ ...fixedClientInfo(), pagePath: '/canvas?token=SECRET123' }),
++      enabled: true,
++    })
++
++    debugLogger.error('Canvas', 'config: api_key=SECRET123', new Error('config'))
++    await flushRemoteDebugEntries() // 失败 → 脱敏后的 payload 进入 durable outbox
++    expect(await getRemoteDebugOutboxCount()).toBe(1)
++
++    shouldFail = false
++    clock += 10_000
++    const result = await drainRemoteDebugOutbox() // outbox 重放 → 直接发已组包 payload
++
++    expect(result.sent).toBe(1)
++    expect(sentBodies).toHaveLength(1)
++    // 值被替换;键名保留是脱敏设计(键名是 bug-doctor 判据,见规则层 KEY_TRIGGER_RE)。
++    expect(sentBodies[0]!).not.toContain('SECRET123')
++    expect(sentBodies[0]!).toContain('api_key=[secret]')
++    // 脱敏发生在持久化时(组包点),重放不再重组——出网形态保持已脱敏。
++    expect(sentBodies[0]!).toContain('[secret]')
++  })
++
++  it('本地面板保留原文:脱敏只在出网边界,不破坏本地诊断', async () => {
++    const fetchMock = vi.fn(async () => ({ ok: true, status: 200 }) as Response)
++    __setRemoteDebugTestHooks({
++      fetchImpl: fetchMock as unknown as typeof fetch,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++    useDebugLogStore.getState().clear()
++
++    debugLogger.warn('Canvas', 'upload failed: Bearer sk-abc12345xyz')
++    await flushRemoteDebugEntries()
++
++    const local = useDebugLogStore.getState().entries
++    expect(local.some((e) => e.message.includes('sk-abc12345xyz'))).toBe(true)
++  })
++
++  it('非敏感文本保诊断价值:短英文/普通运行时错误原样出网(脱敏不误伤)', async () => {
++    const bodies: string[] = []
++    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
++      bodies.push(String(init?.body ?? ''))
++      return { ok: true, status: 200 } as Response
++    })
++    __setRemoteDebugTestHooks({
++      fetchImpl: fetchMock as unknown as typeof fetch,
++      buildClientInfo: fixedClientInfo,
++      enabled: true,
++    })
++
++    debugLogger.error('Canvas Sync', "TypeError: Cannot read properties of undefined (reading 'id')")
++    await flushRemoteDebugEntries()
++
++    const payload = JSON.parse(bodies[0]!) as { entries: Array<{ source: string; message: string }> }
++    expect(payload.entries[0]!.source).toBe('Canvas Sync')
++    expect(payload.entries[0]!.message).toBe("TypeError: Cannot read properties of undefined (reading 'id')")
++  })
++})
++
+ // ── R2 fix · F1(①席):模块级初始值锁 ──
+ //
+ // 上面所有"回归锁"用例的 beforeEach 都先调用了 __resetRemoteDebugStateForTest(),它无条件
+@@ -895,4 +465,4 @@ describe('R2 fix · F1:模块级初始值锁(不经 reset,验证真实 import 
+     // transportImpl 相关红条时先看本条,再回头核对 durableFirst 测试。
+     expect(fetchMock).toHaveBeenCalledTimes(1)
+   })
+-})
++})
+\ No newline at end of file
+diff --git a/src/store/remoteDebugReporter.ts b/src/store/remoteDebugReporter.ts
+index 48482e97..920da439 100644
+--- a/src/store/remoteDebugReporter.ts
++++ b/src/store/remoteDebugReporter.ts
+@@ -26,6 +26,8 @@
+ import { useDebugLogStore, type DebugLogLevel } from './debugLogStore'
+ import { toastFeedback } from './toastStore'
+ import { t } from '../i18n'
++// 出网脱敏收口已随组包函数一并移入 ./remoteDebugClientInfo（A1 拆分后 buildRemoteDebugPayload
++// 在那边，B 支脱敏也落在那边的唯一组包点）——本文件不再直接 import redact。
+ import {
+   buildRemoteDebugPayload,
+   createRemoteDebugClientInfo,

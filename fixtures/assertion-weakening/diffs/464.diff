@@ -1,0 +1,1080 @@
+diff --git a/cindyplugin/ghost.json b/cindyplugin/ghost.json
+index 489d7b94..3bf25875 100644
+--- a/cindyplugin/ghost.json
++++ b/cindyplugin/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.21",
++  "version": "0.9.22",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+@@ -54,6 +54,9 @@
+     "image": [
+       "generate",
+       "edit"
++    ],
++    "media": [
++      "deposit"
+     ]
+   },
+   "subscribe": {
+@@ -271,7 +274,7 @@
+     },
+     {
+       "name": "canvas_edit_image",
+-      "description": "按提示词修改画布上的一张图片(图生图):结果作为新图落在源图旁并保留衍生关系。nodeId 从 canvas_snapshot 获取;仅支持本插件生成或聊天附件过户的图。分钟级任务;需要面板处于打开状态。",
++      "description": "按提示词修改画布上的一张图片(图生图):结果作为新图落在源图旁并保留衍生关系。nodeId 从 canvas_snapshot 获取;本插件生成、聊天附件过户、用户本地拖入/粘贴或画布存量的图均支持。分钟级任务;需要面板处于打开状态。",
+       "parameters": {
+         "type": "object",
+         "properties": {
+diff --git a/cindyplugin/main.js b/cindyplugin/main.js
+index fed62511..d4518428 100644
+--- a/cindyplugin/main.js
++++ b/cindyplugin/main.js
+@@ -4719,13 +4719,13 @@ async function handleSave(msg) {
+   return { ok: true, savedAssetIds: saved, skippedAssetIds: skipped }
+ }
+ 
+-// ── 媒体寄存(R-M 前段;设计稿 docs/plan/cindy-deposit-media-design.md)──
++// ── 媒体寄存(设计稿 docs/plan/cindy-deposit-media-design.md)──
+ //
+ // 宿主改图代办只认本意识媒体总仓里的指纹,而用户粘贴/拖入/存量图的字节只在面板侧。
+ // 这里把面板递来的字节交给宿主 deposit_media 换回指纹。
+ //
+-// 面板侧 flag(DEPOSIT_ENABLED)在前段是关的,所以生产上这几个 kind 收不到消息;
+-// 本段只落电子脑适配层与协议测试(经 seam 直接驱动),不改任何既有路径。
++// T1f 切流段起,面板侧无条件走这条路径(`DEPOSIT_ENABLED` 已删除,设计稿 §8.1);
++// 这几个 kind 在生产上正常收到真实消息。
+ const DEPOSIT_DIR = 'deposit/'
+ // 宿主终版寄存上限(设计稿 §4.6):50MB 解码字节,不设余量、不设灰区。**与上面的
+ // MAX_ASSET_BYTES(cindy.fs 槽单次写入上限)无关**——那是另一条通道的另一个数字,
+@@ -5303,20 +5303,21 @@ async function depositReadAllCandidates() {
+   if (names === null) return null
+   const matching = names.filter((name) => DEPOSIT_FILE_RE.test(name))
+   // A4(四审追加——judge-b CASE9,SC1a.6):不符合当前协议命名的文件(典型如移植来源
+-  // `workspace-binding-design.md` §4.7.2 的旧 a/b 双槎命名 `state-a.json`/
++  // `workspace-binding-design.md` §4.7.2 的旧 a/b 双槽命名 `state-a.json`/
+   // `state-b.json`)此前被这个 filter 静默丢弃——不进候选、不计 corrupt、连
+   // `diagFail` 都没有,SC1a.6 要求的"兼容读取/迁移,或论证可安全忽略并留痕"两条
+-  // 都没做到。**证据(设计稿 §4.4.2 已固化)**:`deposit/` 是本 PR(P1a)才新增的
+-  // 目录,面板侧写这个目录的唯一入口是 `depositStore.ts` 的不可变命名协议
+-  // (`state-<gen>-<writer>.json`),而 `DEPOSIT_ENABLED` flag 在本 PR 落地的前段
+-  // 一直是关的(生产从未真正调用过 `deposit_media`/`deposit-state-save`)——也就是
+-  // 说 `deposit/` 目录**从未被写入过任何候选状态文件**(不可能存在真实的旧 a/b
+-  // 格式历史数据)。P05-CODEX-001(#297 P0.5 Wave B-1)起,本 PR 额外在这个目录下
+-  // 写一个固定名的 `highwater.json`(声明处见 `DEPOSIT_HIGHWATER_PATH`)——它是
++  // 都没做到。**证据(设计稿 §4.4.2 已固化,T1f 切流后重述)**:`deposit/` 从新增
++  // 至今只有一种协议——面板侧写这个目录的唯一入口一直是 `depositStore.ts` 的不可变
++  // 命名协议(`state-<gen>-<writer>.json`),这个目录从来没有经历过 a/b 双槽命名的
++  // 历史阶段(那是 `workspace-binding-design.md` 里另一个更老目录的旧协议,不是这个
++  // 目录曾用过的格式)。
++  // P05-CODEX-001(#297 P0.5 Wave B-1)起,本目录下另有一个固定名的
++  // `highwater.json` 冷启动 marker(声明处见 `DEPOSIT_HIGHWATER_PATH`)——它是
+   // 已知合法的非候选文件,按精确文件名单独排除,不落进下面这条 unrecognized 留痕
+-  // (不是放宽 `DEPOSIT_FILE_RE`,是专门认出这一个文件)。这里出现的其它不符合命名
+-  // 的文件只可能来自开发 / 测试环境手工放置,或未来协议版本的产物。安全忽略,但
+-  // 绝不静默——留痕让它可查,而不是自动兼容读取一份"不该存在"的旧格式(反而会把
++  // (不是放宽 `DEPOSIT_FILE_RE`,是专门认出这一个文件)。
++  // 所以这里出现的其它不符合命名的文件不可能是"这个目录自己的历史数据换代",
++  // 只可能来自开发/测试环境手工放置,或未来协议版本的产物。安全忽略,但绝不
++  // 静默——留痕让它可查,而不是自动兼容读取一份"不该存在"的旧格式(反而会把
+   // 开发环境的手工测试脚手架误当成生产数据读入)。
+   const unrecognized = names.filter((name) => name !== DEPOSIT_HIGHWATER_NAME && !DEPOSIT_FILE_RE.test(name))
+   if (unrecognized.length) {
+@@ -5324,9 +5325,9 @@ async function depositReadAllCandidates() {
+       DIAG_SOURCE.deposit,
+       'deposit 候选枚举: 发现 ' +
+         unrecognized.length +
+-        ' 个不符合当前协议命名的文件(如旧版 a/b 双槎命名),已忽略不计入候选——' +
+-        'deposit/ 目录从未被写入过任何候选状态文件(DEPOSIT_ENABLED 全程未开,设计稿 §4.4.2),' +
+-        '不存在需要兼容迁移的历史数据: ' +
++        ' 个不符合当前协议命名的文件(如旧版 a/b 双槽命名),已忽略不计入候选——' +
++        'deposit/ 目录自新增至今只用过 state-<gen>-<writer>.json 这一种候选协议(另有固定名 highwater.json 冷启动 marker,P05-CODEX-001,已按精确名排除;设计稿 §4.4.2),' +
++        '不存在这个目录自己的旧 a/b 格式历史数据: ' +
+         unrecognized.slice(0, 5).join(','),
+     )
+   }
+diff --git a/cindyplugin/src/PluginApp.tsx b/cindyplugin/src/PluginApp.tsx
+index a1ec0b6e..27ad782e 100644
+--- a/cindyplugin/src/PluginApp.tsx
++++ b/cindyplugin/src/PluginApp.tsx
+@@ -7,7 +7,6 @@ import { isMediaRenderKind, renderKindForNode } from '../../src/model/canvasNode
+ import { debugLogger } from '../../src/store/debugLogStore'
+ import { useCanvasStore } from '../../src/store/canvasStore'
+ import { usePluginHydration } from './usePluginHydration'
+-import { DEPOSIT_ENABLED } from './agent/depositPort'
+ import { migrateLedgerIntoDepositStore } from './agent/depositMigration'
+ 
+ /**
+@@ -46,14 +45,13 @@ export function PluginApp() {
+     debugLogger.warn('Lightbox', `Details skipped in plugin for node type: ${node?.type ?? 'unknown'}`)
+   }, [])
+ 
+-  // T1e:迁移触发,置于 DEPOSIT_ENABLED 守卫内(不解禁预热,§3.3)。**放在这里
+-  // 而不是 plugin-main.tsx 模块顶层**是刻意的——迁移读取画布态相关数据前需要
+-  // hydration 已完成这个前置信号;`hydrated` 从 false→true 只会发生一次
+-  // (usePluginHydration 语义),用它做依赖数组正是这个信号本身,不是猜时机。
+-  // (owner 2026-08-02 决策:demo 阶段砍掉自动回收——sweep 触发点与
+-  // pending consumer 启动恢复随之摘除,迁移不是回收,保留。)
++  // T1e:迁移触发。**放在这里而不是 plugin-main.tsx 模块顶层**是刻意的——迁移
++  // 读取画布态相关数据前需要 hydration 已完成这个前置信号;`hydrated` 从
++  // false→true 只会发生一次(usePluginHydration 语义),用它做依赖数组正是这个
++  // 信号本身,不是猜时机。(owner 2026-08-02 决策:demo 阶段砍掉自动回收——sweep
++  // 触发点与 pending consumer 启动恢复随之摘除,迁移不是回收,保留。)
+   useEffect(() => {
+-    if (!hydrated || !DEPOSIT_ENABLED) return
++    if (!hydrated) return
+     void migrateLedgerIntoDepositStore()
+   }, [hydrated])
+ 
+diff --git a/cindyplugin/src/__tests__/correlateNewAssets.test.ts b/cindyplugin/src/__tests__/correlateNewAssets.test.ts
+new file mode 100644
+index 00000000..15e6a3a4
+--- /dev/null
++++ b/cindyplugin/src/__tests__/correlateNewAssets.test.ts
+@@ -0,0 +1,174 @@
++/**
++ * T1f cutover:`depositFlagOff.test.ts` 随 `DEPOSIT_ENABLED` 一并删除(那个文件的
++ * 前提——"flag 关时行为与现状逐字节一致"——随 flag 删除而消失),本文件迁移其中
++ * 两条与 flag 无关、仍需覆盖的行为:
++ *
++ *  ① `correlateNewAssets` 的接线本身(任务完成 → 画布出现新节点 → 真的调用
++ *     `recordArtifactDeposit` 双写)。`recordArtifactDeposit` 自身的双写行为已由
++ *     `depositOwned.test.ts` 覆盖,但"谁在什么时机调用它"只有这条测试锁着。
++ *  ② mask 门禁次序不变量(R8-H 边界):mask 请求必须在源图兑换**之前**被拒,否则
++ *     一个注定被拒的 mask 请求会先把字节寄存进宿主总仓、白烧配额。
++ *
++ * canvasStore 被替身掉:它在 node 环境求值需要 document(demoScenes 画 canvas),
++ * 而这两条测试都不关心画布内容本身。
++ */
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++/**
++ * T1e 补测(P1-a/§3.3):`correlateNewAssets`/`correlatePlacedAttachments` 的
++ * 完成路径需要"画布出现新节点"这个可观测变化才能触发,原 mock 是固定空数组,
++ * 测不到这条路径。改成可变数组,测试可以在提交任务之后手动推入"新节点",模拟
++ * `correlateNewAssets` 的 500ms 轮询检测到它的那一刻。
++ */
++let mockCanvasNodes: Array<{ type: string; assetUrl?: string }> = []
++vi.mock('../../../src/store/canvasStore', () => ({
++  useCanvasStore: { getState: () => ({ nodes: mockCanvasNodes }) },
++}))
++
++import { cindyImageGenerationPort } from '../agent/cindyGenerationPort'
++import { peekDepositStoreForTests, resetDepositStoreForTests } from '../agent/depositStore'
++
++type Posted = Record<string, unknown>
++
++/**
++ * 双 spy 判据:只挡"发到宿主媒体总仓"的两个 kind(`deposit-media`/`release-media`)。
++ * **不能**用 `startsWith('deposit')` 前缀匹配——`recordArtifactDeposit` 写
++ * depositMap 会真的触发 `deposit-state-load`/`deposit-state-save`(depositStore
++ * 自己的状态持久化,走 electron-brain 的 `/kv` 槎,与"寄存进媒体总仓换指纹"是
++ * 两件完全不同的事),前缀匹配会把这两条正常的状态持久化误判成寄存请求。
++ */
++const isDepositOrReleaseKind = (message: Posted): boolean => {
++  const kind = String(message.kind)
++  return kind === 'deposit-media' || kind === 'release-media'
++}
++
++const posted: Posted[] = []
++const fetched: string[] = []
++const replyForNextRequest: Record<string, unknown> = { ok: false, message: '测试短路' }
++
++class FakeBroadcastChannel {
++  readonly name: string
++  private readonly listeners = new Set<(event: { data: unknown }) => void>()
++
++  constructor(name: string) {
++    this.name = name
++  }
++
++  addEventListener(_type: 'message', handler: (event: { data: unknown }) => void) {
++    this.listeners.add(handler)
++  }
++
++  removeEventListener(_type: 'message', handler: (event: { data: unknown }) => void) {
++    this.listeners.delete(handler)
++  }
++
++  postMessage(data: unknown) {
++    const message = data as Posted
++    posted.push(message)
++    // 回执延到下一个 microtask,不是同一 tick 内同步回:真实 BroadcastChannel 的
++    // postMessage 本就是异步派发(persist/bridge.ts 的 `send()`/`intervalId` 顺序
++    // 依赖这一点,同步假实现会撞 TDZ——已在 bridge.ts 修掉,这里保持拟真写法)。
++    const reply = { reqId: message.reqId, reply: true, ...replyForNextRequest }
++    queueMicrotask(() => {
++      for (const handler of Array.from(this.listeners)) handler({ data: reply })
++    })
++  }
++
++  close() {
++    this.listeners.clear()
++  }
++}
++
++beforeEach(() => {
++  posted.length = 0
++  fetched.length = 0
++  mockCanvasNodes = []
++  replyForNextRequest.ok = false
++  replyForNextRequest.message = '测试短路'
++  delete replyForNextRequest.hash
++  delete replyForNextRequest.ext
++  resetDepositStoreForTests()
++  vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
++  vi.stubGlobal('window', {
++    setInterval: (fn: () => void, ms: number) => globalThis.setInterval(fn, ms),
++    clearInterval: (id: unknown) => globalThis.clearInterval(id as never),
++    setTimeout: (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms),
++    clearTimeout: (id: unknown) => globalThis.clearTimeout(id as never),
++  })
++  vi.stubGlobal('fetch', async (input: unknown) => {
++    const url = String(input)
++    fetched.push(url)
++    if (url === '/kv') return { ok: true, json: async () => ({}) } as unknown as Response
++    return { ok: true, json: async () => ({}) } as unknown as Response
++  })
++  // node 环境本没有 FileReader,`blobToBase64`(cindyGenerationPort.ts 内部)用它把
++  // 产物 blob 转 base64,任务成功落图这条路径需要它。
++  vi.stubGlobal(
++    'FileReader',
++    class {
++      result: string | null = null
++      onload: (() => void) | null = null
++      onerror: (() => void) | null = null
++      readAsDataURL() {
++        this.result = 'data:image/png;base64,ZmFrZQ=='
++        queueMicrotask(() => this.onload?.())
++      }
++    },
++  )
++})
++
++afterEach(() => {
++  vi.unstubAllGlobals()
++})
++
++describe('correlateNewAssets — 任务完成后画布出现新节点即触发 artifact 双写', () => {
++  it('任务成功落图后,recordArtifactDeposit 真的被调用:ledger 与 depositMap 都写入(from=artifact)', async () => {
++    const newAssetUrl = 'mivo-asset:generated-1'
++    const generatedHash = 'd'.repeat(32)
++    replyForNextRequest.ok = true
++    replyForNextRequest.hash = generatedHash
++    replyForNextRequest.ext = '.png'
++    vi.stubGlobal('fetch', async (input: unknown) => {
++      const url = String(input)
++      fetched.push(url)
++      if (url === '/kv') return { ok: true, json: async () => ({}) } as unknown as Response
++      return { ok: true, blob: async () => new Blob([new Uint8Array(4)]) } as unknown as Response
++    })
++
++    await cindyImageGenerationPort.submitGenerationTask({ prompt: '画一只猫', idempotencyKey: 'k5' })
++    await new Promise((resolve) => setTimeout(resolve, 20))
++    // correlateNewAssets 起轮询之前,画布上还是老样子(空)——现在推入"新落图的
++    // 节点",模拟任务完成后画布真的多出这一张图。
++    mockCanvasNodes = [{ type: 'image', assetUrl: newAssetUrl }]
++    // 轮询间隔 500ms,给足一次轮询周期的余量。
++    await new Promise((resolve) => setTimeout(resolve, 700))
++
++    expect(await import('../agent/mediaLedger').then((m) => m.lookupMedia(newAssetUrl))).toMatchObject({
++      hash: generatedHash,
++      ext: '.png',
++    })
++    expect(peekDepositStoreForTests()?.map[newAssetUrl]).toMatchObject({ hash: generatedHash, from: 'artifact' })
++    // 这是本地记账(AI 自己生成的产物),不是走寄存换来的——全程零 deposit/release 请求。
++    expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
++  })
++})
++
++describe('mask 门禁次序不变量(R8-H 边界,与 flag 无关)', () => {
++  it('mask 请求在源图兑换之前就被拒:抛 mask 文案而不是源图解析错误', async () => {
++    // 关键点:源图**故意不给 image/sourceAssetUrl 对应的真实字节**——次序正确时
++    // mask 检查在 resolveSourceEntry 之前就抛,根本不会走到源图兑换这一步。
++    const promise = cindyImageGenerationPort.submitEditTask({
++      prompt: '局部改',
++      image: new Blob([new Uint8Array(16)], { type: 'image/png' }),
++      sourceAssetUrl: 'mivo-asset:mask-source',
++      mask: new Blob([new Uint8Array(4)], { type: 'image/png' }),
++      idempotencyKey: 'k4',
++    })
++
++    await expect(promise).rejects.toThrow('局部重绘/框选修改(mask)在 Cindy 插件模式下暂不支持(后续版本接入)。')
++
++    // 次序正确时连源图兑换都没进 → 任何形态的寄存/改图请求都不该发出。
++    expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
++    expect(posted.filter((message) => message.kind === 'edit-image')).toHaveLength(0)
++  })
++})
+diff --git a/cindyplugin/src/__tests__/depositBrain.test.ts b/cindyplugin/src/__tests__/depositBrain.test.ts
+index e366a92b..ac477218 100644
+--- a/cindyplugin/src/__tests__/depositBrain.test.ts
++++ b/cindyplugin/src/__tests__/depositBrain.test.ts
+@@ -595,12 +595,12 @@ describe('deposit 状态 — generation CAS', () => {
+   })
+ })
+ 
+-// P1(动机来自代码审查,不是真机实测——CA-P05-4 复核:main.js 的 diagSkip 文案与
+-// depositFlagOff.test.ts 均确认 DEPOSIT_ENABLED 全程为 false,`canvas_edit_image`
+-// 走的是 cindyGenerationPort,该常量为 false 时它不会调用本模块任何一步(见
+-// depositPort.ts 头注释),故这个场景不可能来自生产真机复现;此前的"真机
+-// 2026-08-02 owner 连续两次 canvas_edit_image 实测"表述缺乏依据,已删除,不再
+-// 用它给本夹具背书):main.js 自己在 `fsList` 定义处(:309-334)承认宿主 list
++// P1(动机来自代码审查,不是真机实测——CA-P05-4 复核时的依据:当时 flag-off 世界里
++// main.js 的 diagSkip 文案与彼时尚存的 depositFlagOff.test.ts 均确认 DEPOSIT_ENABLED
++// 全程为 false、cindyGenerationPort 一步不进本模块,故该场景不可能来自生产真机复现;
++// 此前的"真机 2026-08-02 owner 连续两次 canvas_edit_image 实测"表述缺乏依据,已删除,
++// 不再用它给本夹具背书。T1f 切流后 flag 与该测试文件均已删除、路径无条件生效——这段
++// 只是历史动机记录,"当时不可能来自真机"的结论不受切流影响,不据此推断切流后的行为):main.js 自己在 `fsList` 定义处(:309-334)承认宿主 list
+ // 可能"静默变短"(子目录 readdir 失败 catch{continue},回执仍 ok:true 且不带
+ // truncated)。修复前
+ // `readDepositState`/`handleDepositStateSave` 对 deposit 账本没有落实那条既有纪律
+@@ -1745,11 +1745,13 @@ describe('ghost.json — 前段口径(能力项与工具预算)', () => {
+     readFileSync(fileURLToPath(new URL('../../ghost.json', import.meta.url)), 'utf8'),
+   ) as { version: string; slots: string[]; tools: unknown[]; cindy: Record<string, string[]> }
+ 
+-  it('本段不加 cindy.media 能力项(§11-② ⛔ 未答:旧宿主遇未知能力项可能拒装)', () => {
+-    // 这条不是"忘了加",是刻意的:能力项进 ghost.json 的时机由宿主回答
+-    // 「旧宿主遇未知能力项是拒装还是忽略」之后决定(设计稿 §4.1 / §11-②)。
+-    // 提前加 = 插件在旧宿主上直接装不上,而前段的全部价值就是"零行为回归"。
+-    expect(manifest.cindy.media).toBeUndefined()
++  it('T1f 切流段:cindy.media 能力项已加(SC1b.1),deposit/release 共用一个键', () => {
++    // §11-② 已由设计稿 §5.0/§5.3 重写作答:旧宿主遇未知能力项 = 装包期硬失败
++    // (MANIFEST_INVALID,已实证),不是运行期降级——加键本身就是发布决策(何时
++    // 铺开由发版闸把关,不是插件代码层面的事)。这条前段(R-M 前段)版本锁的是
++    // "合并不切流",T1f 是切流段,前提反过来:media 键必须存在,且不编造独立的
++    // release 键(deposit 与 release 共用同一个键,设计稿 §4.1.1-2)。
++    expect(manifest.cindy.media).toEqual(['deposit'])
+     expect(manifest.cindy.image).toEqual(['generate', 'edit'])
+   })
+ 
+@@ -1878,8 +1880,9 @@ describe('deposit 状态 — 五轮返修:F1 分裂反例 + judge-b 对抗回归
+     })
+ 
+     const loaded = await brain.handles.deposit.stateLoad()
+-    // 安全忽略(设计稿证据:deposit/ 生产从未被写入过)——不是兼容读取旧格式,
+-    // 结果仍是诚实的缓存空,不是把旧格式硬凑成一份"看起来合法"的状态。
++    // 安全忽略(设计稿证据:deposit/ 自新增至今只用过 state-<gen>-<writer>.json 这一种
++    // 协议,没有 a/b 双槎命名的历史阶段)——不是兼容读取旧格式,结果仍是诚实的缓存空,
++    // 不是把旧格式硬凑成一份"看起来合法"的状态。
+     expect(loaded.state).toBeNull()
+     expect(loaded.generation).toBe(0)
+     // 但必须留痕:通过附带的诊断回调断言至少发生过一次 diagSkip(如实标注忽略了
+@@ -2007,7 +2010,9 @@ describe('deposit 状态 — 六轮返修:双审合并 SC 清单回归', () => {
+     const chinesePad = '中'.repeat(6_000_000)
+     const oversizedUtf8 = JSON.stringify({ version: 1, map: {}, migration: { version: 1, at: 1, migrated: 1, pad: chinesePad } })
+     // 前提断言:UTF-16 `.length` 本身小于上限——如果判据用的是 `.length` 而不是
+-    // 真实 UTF-8 字节数,这份 payload 会被误判"没超限"而放行落盘。
++    // 真实 UTF-8 字节数,这份 payload 会被误判"没超限"而放行落盘。这次编码本身
++    // 就是本条要证明的东西的一部分,不是生产退化——理由同 depositPort.test.ts:
++    // 155-170 那条 precedent,不重复另写(下方 20_000 超时同一根因)。
+     expect(oversizedUtf8.length).toBeLessThan(deposit.stateMaxBytes)
+     expect(new TextEncoder().encode(oversizedUtf8).length).toBeGreaterThan(deposit.stateMaxBytes)
+ 
+@@ -2019,7 +2024,7 @@ describe('deposit 状态 — 六轮返修:双审合并 SC 清单回归', () => {
+     })
+     expect(result.ok).toBe(false)
+     expect(brain.files.get('deposit/state-00000002-bbbbbbbb.json')).toBeUndefined()
+-  })
++  }, 20_000)
+ 
+   it('SC6.6 续:候选携带未知(超过 DEPOSIT_KNOWN_VERSION)的 version 时整份候选无效,不压过同代合法候选', async () => {
+     const { brain } = depositBrain({
+diff --git a/cindyplugin/src/__tests__/depositFlagOff.test.ts b/cindyplugin/src/__tests__/depositFlagOff.test.ts
+deleted file mode 100644
+index 435621b1..00000000
+--- a/cindyplugin/src/__tests__/depositFlagOff.test.ts
++++ /dev/null
+@@ -1,290 +0,0 @@
+-/**
+- * flag 关闭时行为与现状逐字节一致(R-M 前段的硬 SC)。
+- *
+- * 证明手段(不靠「看着没变」):
+- *  ① 不在账下的源图 → 抛**与本 PR 之前逐字一致**的现状文案(字符串锁);
+- *  ② 全程零 `deposit-media` / `deposit-state-*` / `release-media` 消息(桥
+- *    postMessage 全量记账,双 spy 统一判据见 `isDepositOrReleaseKind`);
+- *  ③ 全程 depositStore 从未被 load(模块内存态仍为 null)——连一次多余的读盘都没有;
+- *  ④ ledger 读写调用序列与现状一致:只有一次 `GET /kv`;
+- *  ⑤ 正向对照:在账下的源图照旧发出 `edit-image` 且 hashes 取自 ledger,
+- *    请求形状逐字段不变。
+- *
+- * 这一组的自检口径:把 `DEPOSIT_ENABLED` 临时翻成 `true` 时,组内**每一条都必须
+- * 变红**。翻转后还能过的用例说明它钉的不是 flag-off 行为,应当移出本组(mask 次序
+- * 那条就是这么被移出去的),否则会虚增本组覆盖数、让反向验证从「全红」退化成「多数红」。
+- *
+- * canvasStore 被替身掉:它在 node 环境求值需要 document(demoScenes 画 canvas),
+- * 而本测试只关心 resolveSourceEntry 的分流,不关心画布内容。
+- */
+-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+-
+-/**
+- * T1e 补测(P1-a/§3.3):`correlateNewAssets`/`correlatePlacedAttachments` 的
+- * 完成路径需要"画布出现新节点"这个可观测变化才能触发,原 mock 是固定空数组,
+- * 测不到这条路径。改成可变数组,测试可以在提交任务之后手动推入"新节点",模拟
+- * `correlateNewAssets` 的 500ms 轮询检测到它的那一刻。
+- */
+-let mockCanvasNodes: Array<{ type: string; assetUrl?: string }> = []
+-vi.mock('../../../src/store/canvasStore', () => ({
+-  useCanvasStore: { getState: () => ({ nodes: mockCanvasNodes }) },
+-}))
+-
+-import { cindyImageGenerationPort } from '../agent/cindyGenerationPort'
+-import { DEPOSIT_ENABLED } from '../agent/depositPort'
+-import { peekDepositStoreForTests, resetDepositStoreForTests } from '../agent/depositStore'
+-import { recordMedia } from '../agent/mediaLedger'
+-
+-/**
+- * resolveSourceEntry 的现状文案,逐字锁住(改动即红)。**故意保持独立字面量,不 import
+- * 生产常量**——这条测试的价值就是"生产文案变了但这里忘改就必须红",一旦改成 import
+- * 同一个常量,文本内容的回归检测就变成了自证同义反复,锁不住任何东西了。
+- * 2026-07-31(P1c 现状降级文案核对,返修版):原文暴露"媒体账"内部概念且无 i18n,
+- * 首版改写又把 why 写成"只支持…"的永久限制语气(被对抗审查判回,改为"当前版本
+- * 还不能…"的能力口径)。按 _tmp/297-dispatch/p1c-copy-audit.md 改写,此处随生产
+- * 文案同步更新(锁的是"flag 关时文案 = cindyGenerationPort 里那一份",不是某个
+- * 历史版本)。i18n 完整性另有独立测试锁production 常量与 dict.ts 译文的一致性,
+- * 见 `src/i18n/translator.test.ts`。
+- */
+-// i18n Wave 3:生产常量改为 catalog key,Error.message 携带 key、展示端 t()。
+-// 本锁定串跟随生产(锁的是"flag 关时文案 = cindyGenerationPort 里那一份")。
+-const LEGACY_MESSAGE = 'chat.anchor.sourceNotRecognized'
+-
+-const LEDGER_HASH = 'c'.repeat(32)
+-
+-type Posted = Record<string, unknown>
+-
+-/**
+- * T1a 基建之后本组升级为**双 spy**:release-media 与 deposit-media 是两个独立的
+- * kind 前缀,`startsWith('deposit')` 单独一条挡不住一次误发的 release 请求。
+- * flag 关期间(T1a~T1e 暗段执行纪律 4)两者必须同时为零,这里统一成一个判据,
+- * 避免两份筛选条件各自维护后来漂移。
+- */
+-const isDepositOrReleaseKind = (message: Posted): boolean => {
+-  const kind = String(message.kind)
+-  return kind.startsWith('deposit') || kind.startsWith('release')
+-}
+-
+-const posted: Posted[] = []
+-const fetched: string[] = []
+-const replyForNextRequest: Record<string, unknown> = { ok: false, message: '测试短路' }
+-
+-class FakeBroadcastChannel {
+-  readonly name: string
+-  private readonly listeners = new Set<(event: { data: unknown }) => void>()
+-
+-  constructor(name: string) {
+-    this.name = name
+-  }
+-
+-  addEventListener(_type: 'message', handler: (event: { data: unknown }) => void) {
+-    this.listeners.add(handler)
+-  }
+-
+-  removeEventListener(_type: 'message', handler: (event: { data: unknown }) => void) {
+-    this.listeners.delete(handler)
+-  }
+-
+-  postMessage(data: unknown) {
+-    const message = data as Posted
+-    posted.push(message)
+-    // 回执延到下一个 microtask,不是同一 tick 内同步回:真实 BroadcastChannel 的
+-    // postMessage 本就是异步派发。persistRequest(bridge.ts)里 `send()` 与
+-    // `const intervalId = window.setInterval(send, retryMs)` 中间那一行如果被
+-    // 同步触发的回执打断,`finish()` 会在 `intervalId` 完成赋值前就去读它(暂时性
+-    // 死区,ReferenceError)——生产环境不会撞到(真实 BroadcastChannel 天然异步),
+-    // 完全同步的假实现反而会暴露这个此前从未走到的路径(此前用例全部在此之前就
+-    // 失败/短路,没有一条真的跑到"任务成功"这一步)。
+-    const reply = { reqId: message.reqId, reply: true, ...replyForNextRequest }
+-    queueMicrotask(() => {
+-      for (const handler of Array.from(this.listeners)) handler({ data: reply })
+-    })
+-  }
+-
+-  close() {
+-    this.listeners.clear()
+-  }
+-}
+-
+-beforeEach(() => {
+-  posted.length = 0
+-  fetched.length = 0
+-  mockCanvasNodes = []
+-  replyForNextRequest.ok = false
+-  replyForNextRequest.message = '测试短路'
+-  delete replyForNextRequest.hash
+-  delete replyForNextRequest.ext
+-  resetDepositStoreForTests()
+-  vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+-  vi.stubGlobal('window', {
+-    setInterval: (fn: () => void, ms: number) => globalThis.setInterval(fn, ms),
+-    clearInterval: (id: unknown) => globalThis.clearInterval(id as never),
+-    setTimeout: (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms),
+-    clearTimeout: (id: unknown) => globalThis.clearTimeout(id as never),
+-  })
+-  vi.stubGlobal('fetch', async (input: unknown) => {
+-    const url = String(input)
+-    fetched.push(url)
+-    if (url === '/kv') return { ok: true, json: async () => ({}) } as unknown as Response
+-    return { ok: true, json: async () => ({}) } as unknown as Response
+-  })
+-  // T1e:node 环境本没有 FileReader,`blobToBase64`(cindyGenerationPort.ts 内部)
+-  // 用它把产物 blob 转 base64——现有测试从未走到这一步(全部在此之前就失败/短路),
+-  // 新增的"任务成功落图"测试第一次真的需要它,补个最小可用替身。
+-  vi.stubGlobal(
+-    'FileReader',
+-    class {
+-      result: string | null = null
+-      onload: (() => void) | null = null
+-      onerror: (() => void) | null = null
+-      readAsDataURL() {
+-        this.result = 'data:image/png;base64,ZmFrZQ=='
+-        queueMicrotask(() => this.onload?.())
+-      }
+-    },
+-  )
+-})
+-
+-afterEach(() => {
+-  vi.unstubAllGlobals()
+-})
+-
+-describe('flag 关 — 现状路径逐字节不变', () => {
+-  it('flag 是编译期常量且为 false', () => {
+-    expect(DEPOSIT_ENABLED).toBe(false)
+-  })
+-
+-  it('不在账下的源图:抛现状原文,零 deposit 消息,depositStore 从未被 load', async () => {
+-    await expect(
+-      cindyImageGenerationPort.submitEditTask({
+-        prompt: '改一下',
+-        image: new Blob([new Uint8Array(16)], { type: 'image/png' }),
+-        sourceAssetUrl: 'mivo-asset:not-in-ledger',
+-        idempotencyKey: 'k1',
+-      }),
+-    ).rejects.toThrow(LEGACY_MESSAGE)
+-
+-    // 零 deposit 传输
+-    expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
+-    // depositStore 一次都没读盘(连 load 都没发生)
+-    expect(peekDepositStoreForTests()).toBeNull()
+-    // ledger 读序列:只有一次 GET /kv
+-    expect(fetched.filter((url) => url === '/kv')).toHaveLength(1)
+-  })
+-
+-  it('前置体检 canEditAsset:不在账下 → 拒绝且 reason 是同一条 catalog key(非中文成品)', async () => {
+-    // 终审确认轮 P1-1:开浮层体检与 resolveSourceEntry 共用 SOURCE_NOT_RECOGNIZED_MESSAGE,
+-    // useRegionEdit 在 toast 处按 chat. 前缀 t()。这里锁 reason===key,防止有人改回成品文案。
+-    const verdict = await cindyImageGenerationPort.canEditAsset?.('mivo-asset:not-in-ledger')
+-    expect(verdict).toEqual({ ok: false, reason: LEGACY_MESSAGE })
+-
+-    recordMedia('mivo-asset:in-ledger', { hash: LEDGER_HASH, ext: 'png' })
+-    const allowed = await cindyImageGenerationPort.canEditAsset?.('mivo-asset:in-ledger')
+-    expect(allowed).toEqual({ ok: true })
+-  })
+-
+-  it('变体同样走现状路径,文案与零 deposit 消息一致', async () => {
+-    await expect(
+-      cindyImageGenerationPort.submitVariationsTask({
+-        image: new Blob([new Uint8Array(16)], { type: 'image/png' }),
+-        variations: [{ prompt: 'a' }],
+-        idempotencyKey: 'k2',
+-        sourceAssetUrl: 'mivo-asset:also-missing',
+-      }),
+-    ).rejects.toThrow(LEGACY_MESSAGE)
+-
+-    expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
+-    expect(peekDepositStoreForTests()).toBeNull()
+-  })
+-
+-  it('正向对照:在账下的源图照旧发 edit-image,hashes 取自 ledger', async () => {
+-    recordMedia('mivo-asset:in-ledger', { hash: LEDGER_HASH, ext: '.png' })
+-
+-    await cindyImageGenerationPort.submitEditTask({
+-      prompt: '换个颜色',
+-      image: new Blob([new Uint8Array(16)], { type: 'image/png' }),
+-      sourceAssetUrl: 'mivo-asset:in-ledger',
+-      idempotencyKey: 'k3',
+-    })
+-
+-    const editRequests = posted.filter((message) => message.kind === 'edit-image')
+-    expect(editRequests).toHaveLength(1)
+-    expect(editRequests[0]).toMatchObject({ kind: 'edit-image', prompt: '换个颜色', hashes: [LEDGER_HASH] })
+-    expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
+-    expect(peekDepositStoreForTests()).toBeNull()
+-  })
+-
+-  it('T1e(§3.3,if/else 分流不是包裹):任务成功落图后 ledger 写入序列与基线逐次相同——不是"零写",是"照旧写"', async () => {
+-    // 这条测的是 correlateNewAssets 内的分流本身:flag=false 时必须走 recordMedia
+-    // 这一支,不能因为套了 `if (DEPOSIT_ENABLED)` 而让整条 ledger 写入路径消失
+-    // (那是 lead review 抓出的暗段生产回归,§3.3)。
+-    const newAssetUrl = 'mivo-asset:generated-1'
+-    const generatedHash = 'd'.repeat(32)
+-    replyForNextRequest.ok = true
+-    replyForNextRequest.hash = generatedHash
+-    replyForNextRequest.ext = '.png'
+-    vi.stubGlobal('fetch', async (input: unknown) => {
+-      const url = String(input)
+-      fetched.push(url)
+-      if (url === '/kv') return { ok: true, json: async () => ({}) } as unknown as Response
+-      return { ok: true, blob: async () => new Blob([new Uint8Array(4)]) } as unknown as Response
+-    })
+-
+-    await cindyImageGenerationPort.submitGenerationTask({ prompt: '画一只猫', idempotencyKey: 'k5' })
+-    await new Promise((resolve) => setTimeout(resolve, 20))
+-    // correlateNewAssets 起轮询之前,画布上还是老样子(空)——现在推入"新落图的
+-    // 节点",模拟任务完成后画布真的多出这一张图。
+-    mockCanvasNodes = [{ type: 'image', assetUrl: newAssetUrl }]
+-    // 轮询间隔 500ms,给足一次轮询周期的余量。
+-    await new Promise((resolve) => setTimeout(resolve, 700))
+-
+-    expect(await import('../agent/mediaLedger').then((m) => m.lookupMedia(newAssetUrl))).toMatchObject({
+-      hash: generatedHash,
+-      ext: '.png',
+-    })
+-    // depositStore 侧仍然是"零写"(这条口径不变,只有 ledger 那半是"照旧写")。
+-    expect(peekDepositStoreForTests()).toBeNull()
+-    expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
+-  })
+-
+-})
+-
+-/**
+- * mask 门禁的**次序**不变量(R8-H 边界)。
+- *
+- * 单独成组、不挂在上面那个 flag-off 组里,理由:这条断言的行为**与
+- * `DEPOSIT_ENABLED` 无关**(mask 门禁在 `submitEditTask` 第一行,`resolveSourceEntry`
+- * 之前就抛)。挂在「flag 关 — 现状路径逐字节不变」组里会虚增那组的覆盖数 ——
+- * 于是「flag 翻 true → 该组全红」这个反向验证就变成 4/5,4/5 是警报不是成绩。
+- * 拆出来后 flag-off 组翻转必然 4/4 全红。
+- *
+- * 为什么这条仍然值得留:它钉的是次序。若有人把 mask 门禁挪到源图兑换**之后**,
+- * 切流段(flag 开)一个注定被拒的 mask 请求会先把字节寄存进宿主总仓 —— 白烧
+- * 单次 50MB / 每插件 1GB 的寄存配额,而且 R8-H 的边界也糊掉了。
+- */
+-describe('mask 门禁次序不变量(R8-H 边界,与 flag 无关)', () => {
+-  it('mask 请求在源图兑换之前就被拒:抛 mask 文案而不是「不在账下」', async () => {
+-    // 关键点:源图**故意用不在账本里的 url**。
+-    //
+-    // 原用例用的是 `mivo-asset:in-ledger`(前一条用例 recordMedia 进去的),那样
+-    // 次序正反两种实现都抛同一句 mask 文案 —— 断言证明不了自己的名字。换成不在
+-    // 账下的 url 后两种次序的可观测结果就分开了:
+-    //   门禁在前(现状) → 抛 mask 文案
+-    //   门禁在后(回归) → resolveSourceEntry 先抛 LEGACY_MESSAGE
+-    const promise = cindyImageGenerationPort.submitEditTask({
+-      prompt: '局部改',
+-      image: new Blob([new Uint8Array(16)], { type: 'image/png' }),
+-      sourceAssetUrl: 'mivo-asset:mask-source-not-in-ledger',
+-      mask: new Blob([new Uint8Array(4)], { type: 'image/png' }),
+-      idempotencyKey: 'k4',
+-    })
+-
+-    await expect(promise).rejects.toThrow('局部重绘/框选修改(mask)在 Cindy 插件模式下暂不支持(后续版本接入)。')
+-    // 显式排除「其实是源图兑换先抛的」这种假通过
+-    await expect(promise).rejects.not.toThrow(LEGACY_MESSAGE)
+-
+-    // 次序正确时连源图兑换都没进 → 任何形态的寄存/改图请求都不该发出
+-    expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
+-    expect(posted.filter((message) => message.kind === 'edit-image')).toHaveLength(0)
+-  })
+-})
+diff --git a/cindyplugin/src/__tests__/depositPort.test.ts b/cindyplugin/src/__tests__/depositPort.test.ts
+index 32d27af9..18b69668 100644
+--- a/cindyplugin/src/__tests__/depositPort.test.ts
++++ b/cindyplugin/src/__tests__/depositPort.test.ts
+@@ -8,7 +8,6 @@
+  */
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import {
+-  DEPOSIT_ENABLED,
+   DEPOSIT_LABEL,
+   DEPOSIT_MAX_BYTES,
+   DEPOSIT_RATE_RETRY_DELAY_MS,
+@@ -48,11 +47,7 @@ afterEach(() => {
+   teardownDepositHarness()
+ })
+ 
+-describe('depositPort — flag 与常量', () => {
+-  it('前段 flag 关(合并不切流)', () => {
+-    expect(DEPOSIT_ENABLED).toBe(false)
+-  })
+-
++describe('depositPort — 常量', () => {
+   it('前置阈值 = 宿主终版 50MB,与 main.js 的 MAX_ASSET_BYTES 无关、不设余量', () => {
+     expect(DEPOSIT_MAX_BYTES).toBe(50 * 1024 * 1024)
+   })
+diff --git a/cindyplugin/src/__tests__/editOnceWithForcedRetry.test.ts b/cindyplugin/src/__tests__/editOnceWithForcedRetry.test.ts
+index 2c3bfc5c..84e34811 100644
+--- a/cindyplugin/src/__tests__/editOnceWithForcedRetry.test.ts
++++ b/cindyplugin/src/__tests__/editOnceWithForcedRetry.test.ts
+@@ -2,8 +2,7 @@
+  * T1e §1.3/§3.3:"edit 失败强制重寄重试"的原语契约测试(设计稿 §11-B:"任一改图
+  * 失败后允许一次强制重寄存重试",不精确分类失败原因,1 次上限、不循环)。
+  *
+- * flag-independent:`editOnceWithForcedRetry` 本身不读 `DEPOSIT_ENABLED`,直接
+- * 单测,不需要"手动翻转编译期常量再跑一遍"这种人工复核。
++ * 直接单测这个原语本身的重试语义,不经 submitEditTask 整条链路。
+  *
+  * 端到端跑在真实 main.js 上(depositTestHarness),换指纹那一步走真实
+  * `refingerprintDepositEntry`,不是对着替身自说自话。
+diff --git a/cindyplugin/src/__tests__/portEditRatio.test.ts b/cindyplugin/src/__tests__/portEditRatio.test.ts
+index cffefa80..7d8f1f0c 100644
+--- a/cindyplugin/src/__tests__/portEditRatio.test.ts
++++ b/cindyplugin/src/__tests__/portEditRatio.test.ts
+@@ -17,9 +17,9 @@ vi.mock('../../../src/store/canvasStore', () => ({
+ }))
+ 
+ import { cindyImageGenerationPort } from '../agent/cindyGenerationPort'
+-import { recordMedia } from '../agent/mediaLedger'
++import { createDepositHarness, teardownDepositHarness, type DepositHarness } from './depositTestHarness'
+ 
+-const LEDGER_HASH = 'd'.repeat(32)
++let harness: DepositHarness
+ 
+ type Posted = Record<string, unknown>
+ const posted: Posted[] = []
+@@ -43,8 +43,14 @@ class FakeBroadcastChannel {
+   postMessage(data: unknown) {
+     const message = data as Posted
+     posted.push(message)
+-    // 立刻失败回执:本组只看请求形状,不走取回产物分支。
+-    const reply = { reqId: message.reqId, reply: true, ok: false, message: '测试短路' }
++    // edit-image 立刻成功回执(T1f:editOnceWithForcedRetry 现在无条件生效,首次失败
++    // 会触发强制换指纹重寄再重试一次——本组只关心 aspectRatio 透传这一件事,不想
++    // 被"要不要重试"的语义耦合进来,让 doRequest 首次即成功避开那条分支,那条分支
++    // 自己的契约测试见 editOnceWithForcedRetry.test.ts)。
++    const reply =
++      message.kind === 'edit-image'
++        ? { reqId: message.reqId, reply: true, ok: true, hash: 'e'.repeat(32), ext: '.png' }
++        : { reqId: message.reqId, reply: true, ok: false, message: '测试短路' }
+     for (const handler of Array.from(this.listeners)) handler({ data: reply })
+   }
+ 
+@@ -59,6 +65,11 @@ const editMessages = () => posted.filter((message) => message.kind === 'edit-ima
+ 
+ beforeEach(() => {
+   posted.length = 0
++  // deposit 侧(源图兑换的懒寄存)全部经 depositTestHarness 的注入传输,不走这里
++  // 的 FakeBroadcastChannel——两者互不干扰,详见 correlateNewAssets.test.ts 的
++  // 同款组合写法。这个 harness 让 resolveSourceEntry 对任意 sourceAssetUrl 的
++  // 首次寄存都返回成功,不需要预先在账本/depositStore 里垫一条记录。
++  harness = createDepositHarness()
+   vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+   vi.stubGlobal('window', {
+     setInterval: (fn: () => void, ms: number) => globalThis.setInterval(fn, ms),
+@@ -66,11 +77,29 @@ beforeEach(() => {
+     setTimeout: (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms),
+     clearTimeout: (id: unknown) => globalThis.clearTimeout(id as never),
+   })
+-  vi.stubGlobal('fetch', async () => ({ ok: true, json: async () => ({}) }) as unknown as Response)
+-  recordMedia('mivo-asset:ratio-src', { hash: LEDGER_HASH, ext: '.png' })
++  vi.stubGlobal('fetch', async () => ({
++    ok: true,
++    json: async () => ({}),
++    blob: async () => new Blob([new Uint8Array(4)]),
++  }) as unknown as Response)
++  // node 环境本没有 FileReader,`blobToBase64`(cindyGenerationPort.ts 内部)用它把
++  // 产物 blob 转 base64——edit-image 现在直接成功,会真的走到这一步。
++  vi.stubGlobal(
++    'FileReader',
++    class {
++      result: string | null = null
++      onload: (() => void) | null = null
++      onerror: (() => void) | null = null
++      readAsDataURL() {
++        this.result = 'data:image/png;base64,ZmFrZQ=='
++        queueMicrotask(() => this.onload?.())
++      }
++    },
++  )
+ })
+ 
+ afterEach(() => {
++  teardownDepositHarness()
+   vi.unstubAllGlobals()
+ })
+ 
+@@ -84,6 +113,7 @@ describe('端口改图比例透传', () => {
+       idempotencyKey: 'r1',
+     })
+     await flushDetached()
++    expect(harness.hostRequests).toHaveLength(1) // 源图确实经过一次真实(假宿主)懒寄存
+     expect(editMessages()).toHaveLength(1)
+     expect(editMessages()[0].aspectRatio).toBe('3:2')
+   })
+@@ -96,6 +126,7 @@ describe('端口改图比例透传', () => {
+       idempotencyKey: 'r2',
+     })
+     await flushDetached()
++    expect(harness.hostRequests).toHaveLength(1)
+     expect(editMessages()).toHaveLength(1)
+     expect(editMessages()[0].aspectRatio).toBeUndefined()
+   })
+@@ -108,6 +139,7 @@ describe('端口改图比例透传', () => {
+       idempotencyKey: 'r3',
+     })
+     await flushDetached()
++    expect(harness.hostRequests).toHaveLength(1) // 两条变体共用同一次源图懒寄存,不是各寄存一次
+     expect(editMessages().map((message) => message.aspectRatio)).toEqual(['9:16', undefined])
+   })
+ })
+diff --git a/cindyplugin/src/agent/agentBridge.ts b/cindyplugin/src/agent/agentBridge.ts
+index 0271d652..1ba3b65b 100644
+--- a/cindyplugin/src/agent/agentBridge.ts
++++ b/cindyplugin/src/agent/agentBridge.ts
+@@ -159,8 +159,10 @@ const SNAPSHOT_DEPOSIT_DIAG_SOURCE = 'Cindy Deposit'
+  * 寄存诊断留痕的唯一入口(#297 T3b1-fix SC-T3b1-fix.4):typed `trigger` 区分触发
+  * 路径,两侧落同形日志,不新增 DIAG_SOURCE 条目。本段(T3b1)只接线 `trigger:'snapshot'`
+  * 那一侧(唯一业务链见 `resolveRequestedMedia`);`trigger:'edit'` 那一侧的调用口
+- * (`cindyGenerationPort.ts` 的 `resolveSourceEntry`,在 `DEPOSIT_ENABLED` 守卫内)
+- * 不在本段领地——T1e 接线 edit 侧时应复用本函数,不要另起一套字符串拼接。
++ * (`cindyGenerationPort.ts` 的 `resolveSourceEntry`)不在本段领地——T1e 接线 edit
++ * 侧时应复用本函数,不要另起一套字符串拼接。
++ * (原文此处写"在 `DEPOSIT_ENABLED` 守卫内"——T1f 切流已删除该 flag、寄存路径无条件
++ * 生效,那句话在本次 rebase 后成了假话,已改。)
+  */
+ export type DepositDiagTrigger = 'edit' | 'snapshot'
+ 
+diff --git a/cindyplugin/src/agent/cindyGenerationPort.ts b/cindyplugin/src/agent/cindyGenerationPort.ts
+index 0a97dbd2..f8dc5f7a 100644
+--- a/cindyplugin/src/agent/cindyGenerationPort.ts
++++ b/cindyplugin/src/agent/cindyGenerationPort.ts
+@@ -16,9 +16,8 @@ import { buildRegionCoordinatePrompt } from '../../../src/lib/regionEditPrompt'
+ import { useCanvasStore } from '../../../src/store/canvasStore'
+ import { debugLogger } from '../../../src/store/debugLogStore'
+ import { persistRequest, type PersistReply } from '../persist/bridge'
+-import { DEPOSIT_ENABLED, refingerprintDepositEntry, resolveDepositEntry } from './depositPort'
++import { refingerprintDepositEntry, resolveDepositEntry } from './depositPort'
+ import { recordArtifactDeposit } from './depositOwned'
+-import { initMediaLedger, lookupMedia, recordMedia } from './mediaLedger'
+ 
+ const SOURCE = 'Cindy Plugin Generation'
+ 
+@@ -119,60 +118,30 @@ const unsupported = (what: string): never => {
+ }
+ 
+ /**
+- * flag 关时"源图不在账下"的降级文案(i18n catalog key)。导出为单一常量:
+- * `depositFlagOff.test.ts` 锁"flag 关行为 = 本常量",`src/i18n/translator.test.ts`
+- * 锁"四语 catalog 均有该 key 的真实译文"——单一来源消掉 P1c 踩过的两份拷贝漂移。
++ * 旧版插件(加 `media` 能力键之前)的"源图不在账下"降级文案 key,仍由
++ * `src/i18n/translator.test.ts` 锁四语 catalog 完整性——那个 catalog 词条要继续
++ * 服务仍装着旧插件包的用户(设计稿 §5.7:切流段发布后旧包仍可安装),与本文件
++ * 是否还有生产 throw 点无关,不要因为本文件不再引用就当作死代码删掉。
+  */
+-// i18n Wave 3:常量从中文原文改为 catalog key(chat.anchor.sourceNotRecognized,
+-// 四语词条在 src/i18n/locales/*/chat.json)。Error.message 携带 key,展示端
+-// (AnchorOverlay 的 .anchor-degrade-hint)按 key 前缀判定后 t() 成当前语言。
+ export const SOURCE_NOT_RECOGNIZED_MESSAGE = 'chat.anchor.sourceNotRecognized'
+ 
+ /**
+- * 兑换改图源指纹。
+- *
+- * 两条路径,由编译期常量 `DEPOSIT_ENABLED` 分流(R-M 前段 = 关):
+- *  - flag 关(本段):**逐字节等于本 PR 之前的现状** —— 只读 mediaLedger,不在账下就
+- *    抛现状错误。不发任何 deposit 请求、不读写 depositStore(SC:flag 关时行为与现状
+- *    逐字节一致)。
+- *  - flag 开(切流段):走 depositPort —— 缓存命中直接用,未命中就拿手里的字节寄存
+- *    换指纹,粘贴 / 拖入 / 存量三条路一视同仁(设计稿 §4.3)。
++ * 兑换改图源指纹:缓存命中直接用,未命中就拿手里的字节寄存换指纹,粘贴 / 拖入 /
++ * 存量三条路一视同仁(设计稿 §4.3)。
+  */
+ const resolveSourceEntry = async (request: {
+   sourceAssetUrl?: string
+   image?: Blob
+ }): Promise<{ hash: string; ext: string }> => {
+-  if (DEPOSIT_ENABLED) {
+-    const entry = await resolveDepositEntry({ assetUrl: request.sourceAssetUrl, blob: request.image })
+-    return { hash: entry.hash, ext: entry.ext }
+-  }
+-  // 先等账本加载完(memoized,常态零开销)——避免启动瞬间的误报"不在账下"。
+-  await initMediaLedger()
+-  const entry = lookupMedia(request.sourceAssetUrl)
+-  if (!entry) {
+-    // P1c 现状降级文案核对(2026-07-31,返修版):原文案暴露"媒体账"内部概念且无
+-    // i18n,首版改写又把 why 写成"只支持…"这类永久产品限制的语气(被对抗审查判回:
+-    // SC1c.1 要求的是"宿主/能力不可用"这个降级归因,不是听起来永久的功能范围声明)。
+-    // 现改为"当前版本还不能…"的能力口径,保留 next action。四语词条在
+-    // src/i18n/locales/*/chat.json(chat.anchor.sourceNotRecognized),展示端
+-    // AnchorOverlay 按 key 前缀判定后 t() 渲染(.anchor-degrade-hint)。
+-    throw new Error(SOURCE_NOT_RECOGNIZED_MESSAGE)
+-  }
+-  return entry
++  const entry = await resolveDepositEntry({ assetUrl: request.sourceAssetUrl, blob: request.image })
++  return { hash: entry.hash, ext: entry.ext }
+ }
+ 
+ /**
+- * 改图源体检(区域编辑/局部重绘开浮层前调):账本里查得到才放行。让用户在动手圈
+- * 区域之前就知道这张图不行,而不是圈完写完提交后静默失败。
++ * 改图源体检(区域编辑/局部重绘开浮层前调)。deposit 切流后任何画布图都能寄存
++ * 换指纹,体检恒放行。
+  */
+-const canEditAsset = async (assetUrl?: string): Promise<{ ok: boolean; reason?: string }> => {
+-  // deposit 切流后任何画布图都能寄存换指纹,体检恒放行(拦截只在 flag 关的现状态)。
+-  if (DEPOSIT_ENABLED) return { ok: true }
+-  await initMediaLedger()
+-  // 终审确认轮 P1-1:reason 用与 resolveSourceEntry 同一条 catalog key(展示端按
+-  // chat. 前缀 t()),不再返回中文成品——DOM 替换器退役后没有事后翻译兜底。
+-  return lookupMedia(assetUrl) ? { ok: true } : { ok: false, reason: SOURCE_NOT_RECOGNIZED_MESSAGE }
+-}
++const canEditAsset = async (): Promise<{ ok: boolean; reason?: string }> => ({ ok: true })
+ 
+ /** 当前画布上的全部资产 url 快照(结果落图的账本回填用)。 */
+ const currentAssetUrls = (): Set<string> => {
+@@ -201,39 +170,27 @@ const correlateNewAssets = (before: Set<string>, entries: Array<{ hash: string;
+     }
+     if (fresh.length >= entries.length || attempts >= 12) {
+       window.clearInterval(timer)
+-      // T1e §3.3:if/else 分流,不是包裹——recordArtifactDeposit 内部自己调
+-      // recordMedia,若只在 flag=true 时才调用整个块,flag=false 时 ledger 写入
+-      // 会彻底消失(暗段本该逐字节维持现状,却改变了现状)。
+-      //
+-      // lead review(T1b4 BLOCKED 返修期间提醒):w-t1c-fix 正在改
+-      // `recordArtifactDeposit` 的失败语义(ledger 持久化真正成功才提交
+-      // depositMap,不再是"内存写+防抖+吞失败"),调用形状不变但它此后**会**
+-      // 因 ledger 失败而 reject——`void` fire-and-forget 若不接 `.catch`,
+-      // 未来这条改动落地后就是未捕获 rejection。这里的 `.catch` 是防御性的,
+-      // 不依赖对方具体改法,只保证"记账失败"永远走 debugLogger,不静默吞。
++      // lead review(P2):`{ ledgerWritten }` 此前被整个丢弃——调用点也要检一次
++      // (不只依赖 recordArtifactDeposit 内部的 warn),"双写到底成没成"在生产上
++      // 才有可观测性。`.catch` 是防御性的:recordArtifactDeposit 内部
++      // `recordMediaDurable` 可能 reject,`void` fire-and-forget 若不接
++      // `.catch` 就是未捕获 rejection。
+       fresh.slice(0, entries.length).forEach((assetUrl, index) => {
+-        if (DEPOSIT_ENABLED) {
+-          // lead review(P2):`{ ledgerWritten }` 此前被整个丢弃——调用点也要
+-          // 检一次(不只依赖 recordArtifactDeposit 内部的 warn),"双写到底成
+-          // 没成"在生产上才有可观测性。
+-          void recordArtifactDeposit(assetUrl, entries[index])
+-            .then((result) => {
+-              if (!result.ledgerWritten) {
+-                debugLogger.warn(
+-                  SOURCE,
+-                  `artifact 双写:ledger 未写入(assetUrl/hash/ext 前置条件不满足),depositMap 同样未写:assetUrl=${assetUrl.slice(0, 60)}`,
+-                )
+-              }
+-            })
+-            .catch((error) => {
+-              debugLogger.error(
++        void recordArtifactDeposit(assetUrl, entries[index])
++          .then((result) => {
++            if (!result.ledgerWritten) {
++              debugLogger.warn(
+                 SOURCE,
+-                `artifact 双写失败:assetUrl=${assetUrl.slice(0, 60)} ${error instanceof Error ? error.message : String(error)}`,
++                `artifact 双写:ledger 未写入(assetUrl/hash/ext 前置条件不满足),depositMap 同样未写:assetUrl=${assetUrl.slice(0, 60)}`,
+               )
+-            })
+-        } else {
+-          recordMedia(assetUrl, entries[index])
+-        }
++            }
++          })
++          .catch((error) => {
++            debugLogger.error(
++              SOURCE,
++              `artifact 双写失败:assetUrl=${assetUrl.slice(0, 60)} ${error instanceof Error ? error.message : String(error)}`,
++            )
++          })
+       })
+     }
+   }, 500)
+@@ -243,8 +200,7 @@ const correlateNewAssets = (before: Set<string>, entries: Array<{ hash: string;
+  * T1e §1.3/§3.3(edit 失败强制重寄重试,设计稿 §11-B):"任一改图失败后允许一次
+  * 强制重寄存重试"——宿主只给自由文本 message、无稳定 code,不精确分类失败原因,
+  * 失败就换新指纹重试一次,再失败照常报错、不第二次重试(SC1b.7 自愈至多 1
+- * 轮)。flag-independent(不读 DEPOSIT_ENABLED):可以直接单测,生产 callsite
+- * 只在 flag=true 时调用它,flag=false 时走 `doRequest(firstHash)` 现状路径。
++ * 轮)。
+  *
+  * 换指纹本身失败(`refingerprintDepositEntry` 抛错,如寄存超限/宿主拒收)—— 原样
+  * 返回首次失败,不把"换指纹失败"包装成第二次改图失败,两种失败原因不同不该
+@@ -393,9 +349,7 @@ export const cindyImageGenerationPort: ImageGenerationPort = {
+             { prompt, hashes: [hash], callId: editCallId, aspectRatio: request.imgRatio },
+             { retryMs: 5_000, timeoutMs: 28 * 60_000 },
+           )
+-        const reply = DEPOSIT_ENABLED
+-          ? await editOnceWithForcedRetry(request.sourceAssetUrl, request.image, doRequest, source.hash)
+-          : await doRequest(source.hash)
++        const reply = await editOnceWithForcedRetry(request.sourceAssetUrl, request.image, doRequest, source.hash)
+         if (!reply.ok || !reply.hash || !reply.ext) {
+           pending.view = { ...pending.view, status: 'failed', progress: 100, stage: 'failed', error: reply.message || '修改失败' }
+           return
+@@ -457,9 +411,7 @@ export const cindyImageGenerationPort: ImageGenerationPort = {
+               { prompt: variation.prompt || 'variation', hashes: [hash], callId, aspectRatio: variation.imgRatio },
+               { retryMs: 5_000, timeoutMs: 28 * 60_000 },
+             )
+-          const reply = DEPOSIT_ENABLED
+-            ? await editOnceWithForcedRetry(request.sourceAssetUrl, request.image, doRequest, source.hash)
+-            : await doRequest(source.hash)
++          const reply = await editOnceWithForcedRetry(request.sourceAssetUrl, request.image, doRequest, source.hash)
+           if (!reply.ok || !reply.hash || !reply.ext) throw new Error(reply.message || '生成失败')
+           const res = await fetch(`/media/${reply.hash}${reply.ext}`)
+           if (!res.ok) throw new Error(`产物取回失败(${res.status})`)
+diff --git a/cindyplugin/src/agent/depositPort.ts b/cindyplugin/src/agent/depositPort.ts
+index 4fe053b0..30e25f95 100644
+--- a/cindyplugin/src/agent/depositPort.ts
++++ b/cindyplugin/src/agent/depositPort.ts
+@@ -4,11 +4,6 @@
+  * 宿主的改图代办只认「本意识媒体总仓里的指纹」,而用户粘贴 / 拖入 / 早先躺在板上
+  * 的图,字节只在面板侧 → 这些图 AI 改不了。本模块把面板手里的字节寄存进总仓换回
+  * 指纹(lazy:只在源图被真正消费的那一刻寄存,设计稿 D-A)。
+- *
+- * **本段功能 flag 关**:`DEPOSIT_ENABLED = false`,合并不切流。切流段改 true 并在
+- * 同 PR 删掉 flag 分支,不留长期双分支(设计稿 §8.1「flag 定义」)。flag 关时
+- * `cindyGenerationPort` 一步都不进这里,所以本模块的契约测试**直接 import 本模块与
+- * fake-host harness**,不依赖「跑一遍主流程顺带覆盖」。
+  */
+ import { debugLogger } from '../../../src/store/debugLogStore'
+ import { persistRequest, type PersistReply } from '../persist/bridge'
+@@ -47,14 +42,6 @@ const PLUGIN_VERSION: string = ghostManifest.version
+ /** 当前唯一支持的寄存媒体 kind(video/audio 等待 P3-10)。调用方未来按实际媒体类型传参。 */
+ const DEPOSIT_DEFAULT_KIND = 'image'
+ 
+-/**
+- * 编译期常量,不是运行时开关:运行时开关会产生「一半用户走新路一半走旧路」的
+- * 诊断噩梦,而这条链路的回滚粒度本就是插件版本(设计稿 §6.3)。
+- * 标注 `: boolean` 是刻意的——不让 TS 把下游 `if (DEPOSIT_ENABLED)` 收窄成死代码,
+- * 否则切流段翻开关时编译期才发现分支从未被类型检查过。
+- */
+-export const DEPOSIT_ENABLED: boolean = false
+-
+ /**
+  * 面板侧前置上限:宿主终版寄存上限 = 50MB 解码字节(设计稿 §4.6),不设余量、不设
+  * 灰区。**与 `main.js:193` 的 `MAX_ASSET_BYTES` 无关**——那是宿主 fs 槽单次写入
+@@ -369,8 +356,8 @@ export const resetDepositPortForTests = (): void => {
+ //
+ // 除补偿释放外一律不发 release_media:本函数原本(T1b2/T1b3)在换掉旧指纹后会
+ // 尝试释放旧 hash,降范围后**只覆盖映射,不释放旧 hash**——旧 hash 继续占用宿主
+-// 配额,这是范围裁决已接受的代价,不是遗漏。本段只交付"逻辑完成":接线仍在
+-// T1e,且须置于 DEPOSIT_ENABLED 守卫内。
++// 配额,这是范围裁决已接受的代价,不是遗漏。接线已在 T1e 完成(cindyGenerationPort
++// 的 editOnceWithForcedRetry),T1f 删 flag 后无条件生效。
+ 
+ /**
+  * 强制重新寄存一个 assetUrl(绕过缓存)——调用方(T1e 的"edit 失败强制重寄重试"
+diff --git a/cindyplugin/src/persist/bridge.ts b/cindyplugin/src/persist/bridge.ts
+index 6fccffab..cfbb8d5f 100644
+--- a/cindyplugin/src/persist/bridge.ts
++++ b/cindyplugin/src/persist/bridge.ts
+@@ -163,12 +163,16 @@ export function persistRequest(
+     }
+ 
+     ch.addEventListener('message', onMessage)
+-    send()
+     const intervalId = window.setInterval(send, retryMs)
+     const timeoutId = window.setTimeout(
+       () => finish({ reqId, reply: true, ok: false, timeout: true, message: '电子脑无响应(超时)' }),
+       timeoutMs,
+     )
++    // 首次发送放在 intervalId/timeoutId 都已赋值之后:若 postMessage 触发同步回执,
++    // finish() 里的 clearInterval/clearTimeout 才不会在这两个 const 的暂时性死区
++    // (TDZ)内执行。真实 BroadcastChannel 不会同步派发,首次发送晚这几纳秒不影响
++    // interval 到期时间。
++    send()
+ 
+     // 函数声明提升;实际调用只发生在异步回调里,intervalId/timeoutId 必已初始化。
+     function finish(reply: PersistReply) {

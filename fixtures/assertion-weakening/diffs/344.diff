@@ -1,0 +1,87 @@
+diff --git a/src/cindy-theme.css b/src/cindy-theme.css
+index edf43483..b4d980be 100644
+--- a/src/cindy-theme.css
++++ b/src/cindy-theme.css
+@@ -40,11 +40,9 @@
+ }
+ 
+ /* ── 底部工具坞与工具弹出层:奶油底/暖灰图标原是写死值 ──
+-   坞体比画布抬升一档(混入少量文字色),描边加重让轮廓在 Dark 下清晰。
+-   缩放条(.canvas-controls)并入同一底色,消除 Light 下两条浮层色差。 */
++   坞体比画布抬升一档(混入少量文字色),描边加重让轮廓在 Dark 下清晰。 */
+ .canvas-tool-dock,
+-.canvas-tool-flyout,
+-.canvas-controls {
++.canvas-tool-flyout {
+   background: color-mix(in srgb, var(--surface-elevated, #fffaf0) 94%, var(--text-primary, #232323) 6%);
+   border-color: color-mix(in srgb, var(--text-primary, #232323) 16%, var(--border-default, #d6d0c6));
+ }
+@@ -54,16 +52,14 @@
+    面板嵌套在 flyout 内,内部控件由下方专属规则接管,不能被这里覆盖。 */
+ .canvas-tool-dock > button,
+ .canvas-tool-dock .canvas-tool-group > button,
+-.canvas-tool-dock .canvas-tool-flyout > button,
+-.canvas-controls button {
++.canvas-tool-dock .canvas-tool-flyout > button {
+   color: color-mix(in srgb, var(--text-primary, #554f48) 78%, var(--surface, #fffaf0));
+ }
+ 
+ /* 悬停 = 轻水洗(不再整块反色,消除 Dark 下的白色大亮斑) */
+ .canvas-tool-dock > button:hover:not(.active):not(:disabled),
+ .canvas-tool-dock .canvas-tool-group > button:hover:not(.active):not(:disabled),
+-.canvas-tool-dock .canvas-tool-flyout > button:hover:not(.active):not(:disabled),
+-.canvas-controls button:hover:not(:disabled) {
++.canvas-tool-dock .canvas-tool-flyout > button:hover:not(.active):not(:disabled) {
+   color: var(--text-primary, #232323);
+   background: color-mix(in srgb, var(--text-primary, #232323) 10%, transparent);
+ }
+diff --git a/src/i18n/dict.ts b/src/i18n/dict.ts
+index 227a668b..04d0287d 100644
+--- a/src/i18n/dict.ts
++++ b/src/i18n/dict.ts
+@@ -40,13 +40,7 @@ export const DICT_ZH_CN: Record<string, string> = {
+   'Canvas tools': '画布工具',
+   'Draw tools': '绘图工具',
+ 
+-  // 缩放条
+-  'Zoom out': '缩小',
+-  'Zoom in': '放大',
+-  'Reset view': '重置视图',
+-  'Fit all': '适应全部',
+   'Fit selection': '适应所选',
+-  'Canvas zoom controls': '画布缩放控制',
+ 
+   // 画布右键菜单(新建类)
+   'New text here': '在此新建文本',
+@@ -208,8 +202,7 @@ export const DICT_JA: Record<string, string> = {
+   Brush: 'ブラシ', Marker: 'マーカー', Highlighter: '蛍光ペン', Eraser: '消しゴム',
+   Arrow: '矢印', Line: '直線', Rectangle: '長方形', Ellipse: '楕円',
+   'Markup note': '注釈メモ', Draw: '描画', 'Canvas tools': 'キャンバスツール', 'Draw tools': '描画ツール',
+-  'Zoom out': '縮小', 'Zoom in': '拡大', 'Reset view': '表示をリセット',
+-  'Fit all': '全体表示', 'Fit selection': '選択範囲に合わせる', 'Canvas zoom controls': 'ズーム操作',
++  'Fit selection': '選択範囲に合わせる',
+   'New text here': 'ここにテキストを追加', 'New section here': 'ここにセクションを追加',
+   'New AI image slot here': 'ここにAI画像スロットを追加', 'New arrow markup': '矢印注釈を追加',
+   'New rectangle markup': '長方形注釈を追加', 'New markup note': '注釈メモを追加',
+@@ -266,8 +259,7 @@ export const DICT_KO: Record<string, string> = {
+   Brush: '브러시', Marker: '마커', Highlighter: '형광펜', Eraser: '지우개',
+   Arrow: '화살표', Line: '직선', Rectangle: '사각형', Ellipse: '타원',
+   'Markup note': '주석 메모', Draw: '그리기', 'Canvas tools': '캔버스 도구', 'Draw tools': '그리기 도구',
+-  'Zoom out': '축소', 'Zoom in': '확대', 'Reset view': '보기 초기화',
+-  'Fit all': '전체 보기', 'Fit selection': '선택 영역 맞춤', 'Canvas zoom controls': '확대/축소 컨트롤',
++  'Fit selection': '선택 영역 맞춤',
+   'New text here': '여기에 텍스트 추가', 'New section here': '여기에 섹션 추가',
+   'New AI image slot here': '여기에 AI 이미지 슬롯 추가', 'New arrow markup': '화살표 주석 추가',
+   'New rectangle markup': '사각형 주석 추가', 'New markup note': '주석 메모 추가',
+diff --git a/src/i18n/translator.ts b/src/i18n/translator.ts
+index bf74194f..c4714a2a 100644
+--- a/src/i18n/translator.ts
++++ b/src/i18n/translator.ts
+@@ -17,7 +17,6 @@ const HOST_CHANNEL = 'mivo-canvas-host'
+ const CHROME_SCOPE = [
+   '.canvas-tool-dock',
+   '.canvas-tool-flyout',
+-  '.canvas-controls',
+   '.node-context-menu',
+   '.node-action-menu',
+   '.brush-options-bar',

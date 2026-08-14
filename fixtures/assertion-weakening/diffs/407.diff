@@ -1,0 +1,970 @@
+diff --git a/main.js b/main.js
+index 4d7bfc90..2b18a618 100644
+--- a/main.js
++++ b/main.js
+@@ -5898,46 +5898,96 @@ async function readDepositSlot(name) {
+  * `diagFail` 响亮诊断——fail-visible,不装作"正常"。
+  */
+ async function readDepositState() {
+-  const slots = []
+-  for (const name of DEPOSIT_SLOTS) slots.push(await readDepositSlot(name))
+-  const corrupt = slots.filter((slot) => slot.corrupt).length
+-  const missing = slots.filter((slot) => !slot.present).length
+-  let best = null
+-  for (const slot of slots) {
+-    if (slot.text === null) continue
+-    if (!best || slot.generation > best.generation) best = slot
++  const candidates = await depositReadAllCandidates()
++  if (candidates === null) {
++    diagFail(DIAG_SOURCE.deposit, 'deposit 候选枚举失败(list 未知/截断),按未知处理,降级为缓存空')
++    return { payload: null, generation: 0, corrupt: 0, missing: true, usedNames: [] }
++  }
++  const corrupt = candidates.filter((candidate) => !candidate.valid).length
++  let maxGen = -1
++  for (const candidate of candidates) if (candidate.valid && candidate.gen > maxGen) maxGen = candidate.gen
++  if (maxGen < 0) {
++    if (corrupt) diagFail(DIAG_SOURCE.deposit, 'deposit 候选文件全部无效(' + corrupt + ' 个),降级为缓存空')
++    return { payload: null, generation: 0, corrupt, missing: candidates.length === 0, usedNames: [] }
++  }
++  if (corrupt) diagFail(DIAG_SOURCE.deposit, 'deposit 候选文件解析失败 ' + corrupt + ' 个: 按 generation 更大的合法候选回退')
++  const validAtMax = candidates
++    .filter((candidate) => candidate.valid && candidate.gen === maxGen)
++    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
++  if (validAtMax.length === 1) {
++    // payload.generation 与顶层 generation 保持一致落盘(不修改候选对象本身,构造新对象),
++    // 面板侧 parseDepositState 才不会在"读到的是不是权威内容"上表现出差异行为。
++    const singlePayload = { ...validAtMax[0].payload, generation: maxGen }
++    // 仍过一遍 map/pendingReleases 互斥检查——这份候选本身可能是一个跨面板 CAS
++    // 重放留下的、有缺陷的内容,不能假设"只有一份候选"就等于"它内部自洽"
++    // (与写者数无关,见 `depositEnforceMapPendingMutex` 头注释)。
++    depositEnforceMapPendingMutex(singlePayload)
++    return { payload: singlePayload, generation: maxGen, corrupt, missing: false, usedNames: [validAtMax[0].name] }
++  }
++  diagFail(
++    DIAG_SOURCE.deposit,
++    'deposit 同代多候选(gen=' +
++      maxGen +
++      ',' +
++      validAtMax.length +
++      ' 份有效候选)——单写者架构下应为不可达态,可能来自人工篡改或双 App 实例;已合并吸收全部候选内容,不丢弃任一候选',
++  )
++  const merged = depositMergeCandidates(validAtMax, maxGen)
++  if (merged.impossibleTie) {
++    diagFail(DIAG_SOURCE.deposit, 'deposit 合并遇到同 gen 同 writer 的极端分支(canonical 名门理论上应挡住),保守保留 map 条目')
++  }
++  // 合并 payload 原本只有 {version,map,releasedTombstones,pendingReleases[,migration,capability,releasedFloor]},
++  // 顶层 generation 单独回填,面板侧才能读到"这次合并的权威 generation"。
++  return {
++    payload: { ...merged.payload, generation: maxGen },
++    generation: maxGen,
++    corrupt,
++    missing: false,
++    // 这次"当前已合并内容"实际吸收了哪些候选文件(按文件名)——`handleDepositStateSave`
++    // 的 SC9.3c 容量诊断靠它区分"合并态超限"与"单一写者自己持续增长超限"两种情形。
++    usedNames: validAtMax.map((candidate) => candidate.name),
+   }
+-  if (best) return { text: best.text, generation: best.generation, corrupt, missing, bestSlot: best.name }
+-  return { text: null, generation: 0, corrupt, missing, bestSlot: null }
+ }
+ 
+-// 写目标槽 = 两槽中**不持有最大合法 generation** 的那一槽(设计稿 §4.4.2)。
+-// 设计稿明禁按 generation 奇偶推算:奇偶假设「代际与槽位一一对应」,而这个假设在
+-// 一槽损坏时不成立。实撞形态:state-a 损坏、state-b 持 gen=5 → 奇偶算出 gen=6 落
+-// DEPOSIT_SLOTS[1] = state-b,正好覆盖**唯一合法槽**;写到一半崩(cindy.fs 的 write
+-// 是直接覆盖,无 rename/事务)就双槽全灭 → 整表退化为「缓存空 + 未迁移」。
+-// 无合法槽时任选一槽(此时没有需要保护的最高代)。
+-function pickDepositWriteSlot(bestSlot) {
+-  if (!bestSlot) return DEPOSIT_SLOTS[0]
+-  for (const name of DEPOSIT_SLOTS) {
+-    if (name !== bestSlot) return name
++/**
++ * 整代退休(设计稿 §4.4.3.1):每次提交成功后,删除 `gen ≤ 新gen − K` 的旧代全部
++ * 文件(不分 writer——按 gen 整代退休,落败候选在被合并吸收之前可能仍是唯一持有
++ * 某条未合并信息的地方,提前挑着删会造成信息丢失)。失败非阻塞:提交本身已成功,
++ * 退休只是磁盘整理,下次提交再试。
++ */
++async function depositRetireOldGenerations(newGeneration) {
++  const cutoff = newGeneration - DEPOSIT_RETAIN_GENERATIONS
++  if (cutoff < 0) return
++  const names = await fsList(DEPOSIT_DIR)
++  if (names === null) {
++    diagSkip(DIAG_SOURCE.deposit, 'deposit 退休扫描跳过: list 未知/截断,下次提交再试')
++    return
++  }
++  for (const name of names) {
++    const match = DEPOSIT_FILE_RE.exec(name)
++    if (!match) continue
++    if (Number(match[1]) > cutoff) continue
++    const removed = await fsDelete(DEPOSIT_DIR + name)
++    if (!removed) diagSkip(DIAG_SOURCE.deposit, 'deposit 退休删除失败(非阻塞,下次提交再试): ' + name)
+   }
+-  return DEPOSIT_SLOTS[0]
+ }
+ 
+ async function handleDepositStateLoad() {
+   const state = await readDepositState()
+-  if (state.corrupt) {
+-    diagFail(DIAG_SOURCE.deposit, 'deposit 状态槽解析失败 ' + state.corrupt + ' 个: 按 generation 更大的合法槽回退')
+-  }
+-  if (state.text === null) {
+-    // 两槽皆不可读 / 从未写过:缓存空 + 迁移标记缺失。代价有界(迁移重跑一次、
+-    // 图首次改图重寄存一次),不产生错数据 —— 这正是「本地表是缓存不是账本」买到的性质。
+-    diagSkip(DIAG_SOURCE.deposit, 'deposit 状态为空: 缺槽 ' + state.missing + ' 个, 降级为缓存空 + 未迁移')
+-    return { ok: true, state: null, generation: 0 }
+-  }
+-  diagOk(DIAG_SOURCE.deposit, 'deposit 状态读取: gen=' + state.generation + ' 字节 ' + state.text.length)
+-  return { ok: true, state: state.text, generation: state.generation }
++  if (state.payload === null) {
++    // N3 三审如实修订:全部候选无效/不存在,只保证"不编造错误数据"——面板拿到的
++    // 是诚实的空,不是错的答案。但这不等于"不产生错数据/缓存不是账本"的无成本
++    // 降级:迁移标记缺失确实只需重跑一次、纯缓存条目(migration/capability/
++    // artifact/ledger)确实下次改图重算即可,这部分代价有界;若磁盘上原本混有
++    // `from:'deposit'` 条目或未消费的 `pendingReleases`(意味着已经真实占了宿主
++    // 配额、或欠着一笔释放),它们跟着这份状态一起消失,后果是配额孤儿风险
++    // (§4.10.4),不是"反正只丢缓存"——与 depositStore.ts commitNow 侧
++    // describeCommitLossRisk 同一定性,读路径不能单独享有一句轻描淡写。
++    diagSkip(DIAG_SOURCE.deposit, 'deposit 状态为空: 降级为缓存空 + 未迁移(若磁盘原本有 from:deposit/pendingReleases,这部分有配额孤儿风险,不是纯缓存代价)')
++    return { ok: true, state: null, generation: 0, revisionSum: DEPOSIT_EMPTY_REVISION_SUM }
++  }
++  diagOk(DIAG_SOURCE.deposit, 'deposit 状态读取: gen=' + state.generation)
++  return { ok: true, state: JSON.stringify(state.payload), generation: state.generation, revisionSum: depositRevisionSum(state.payload) }
+ }
+ 
+ /**
+@@ -5965,64 +6015,115 @@ async function handleDepositStateSave(msg) {
+     diagFail(DIAG_SOURCE.deposit, 'deposit 状态提交被拒: 载荷不是合法 JSON')
+     return { ok: false, message: 'deposit 状态载荷非法' }
+   }
+-  if (!parsed || typeof parsed !== 'object') {
++  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+     diagFail(DIAG_SOURCE.deposit, 'deposit 状态提交被拒: 载荷不是对象')
+     return { ok: false, message: 'deposit 状态载荷非法' }
+   }
+-  if (raw.length > MAX_ASSET_BYTES) {
+-    diagFail(DIAG_SOURCE.deposit, 'deposit 状态提交被拒: 载荷 ' + raw.length + ' 字节超过单次写入上限')
+-    return { ok: false, message: 'deposit 状态超过单次写入上限' }
+-  }
+ 
+-  // generation CAS:磁盘已前进 → 回冲突 + 当前已提交状态,面板合并重试。
++  // generation + 内容指纹双重 CAS(F1,四审——只比 generation 数值挡不住"面板拿旧
++  // 基线覆盖新数据"这个反例,见 `depositRevisionSum` 与 bridge.ts revisionSum
++  // 字段注释的完整证明):这条判据与写者数无关,单写者架构下原样保留——磁盘已
++  // 前进,或数值相等但内容指纹对不上 → 回冲突 + 当前已合并的磁盘状态,面板重放
++  // 本实例未提交的逐键变更后重试(§4.10.6.1 仲裁轴第一级,面板侧实现)。`baseSum`
++  // 缺失(旧格式请求 / 测试直调未传)按不匹配处理,不当作"数值凑巧相等就默认
++  // 放行"——fail 到 conflict 保守侧。
+   const current = await readDepositState()
+-  const base = Number(msg.baseGeneration)
+-  if (Number.isFinite(base) && base !== current.generation) {
++  // A5(四审追加——judge-b CASE5/CASE6):generation 参与 `+1` 递增运算,必须是安全
++  // 整数——`depositValidateCandidate` 已经在候选校验这一步挡住了不安全的 gen,
++  // 这里是防御性复核,理论上不该再触发(除非"缓存空"这个特殊分支的 0 出了岔子,
++  // 而 0 恒安全,复核只是把这条不变量写成断言,不依赖"理论上不该"这句自然语言)。
++  if (!Number.isSafeInteger(current.generation) || current.generation < 0) {
++    diagFail(DIAG_SOURCE.deposit, 'deposit 状态提交中止: 磁盘当前 generation 不是安全整数,拒绝在其上递增')
++    return { ok: false, message: 'deposit 状态 generation 不合法' }
++  }
++  const currentSum = depositRevisionSum(current.payload)
++  // SC6.4(六轮追加):`Number(msg.baseGeneration)` 会先做隐式类型转换再判——
++  // `Number(null)`/`Number('')`/`Number(false)`/`Number([])`/`Number('0')`
++  // 全部等于 `0`,若磁盘当前正好在 gen=0,这些本该判"缺失/非法基线"的取值会被
++  // 误判成"数值凑巧等于 0",绕过 CAS(judge 反例:五种非法值全部实跑盲写成功)。
++  // 判"是不是一个合法基线"必须在类型层先把关,不能让 `Number()` 先吃掉类型信息——
++  // 只有 `typeof === 'number'` 且本身是非负安全整数,才有资格被认作"可能匹配"。
++  const baseValid = typeof msg.baseGeneration === 'number' && Number.isSafeInteger(msg.baseGeneration) && msg.baseGeneration >= 0
++  const base = baseValid ? msg.baseGeneration : NaN
++  const baseSum = typeof msg.baseSum === 'string' ? msg.baseSum : null
++  const generationMismatch = !baseValid || base !== current.generation
++  const sumMismatch = baseSum !== currentSum
++  if (generationMismatch || sumMismatch) {
+     diagSkip(
+       DIAG_SOURCE.deposit,
+-      'deposit 状态提交冲突: 载荷基于 gen=' + base + ', 磁盘已到 gen=' + current.generation + ', 回冲突让面板合并',
++      'deposit 状态提交冲突: 载荷基于 gen=' +
++        base +
++        '(内容指纹' +
++        (sumMismatch ? '不匹配' : '匹配') +
++        '), 磁盘已到 gen=' +
++        current.generation +
++        ', 回冲突让面板重放重试',
+     )
+-    return { ok: false, conflict: true, state: current.text, generation: current.generation }
++    return {
++      ok: false,
++      conflict: true,
++      state: current.payload === null ? null : JSON.stringify(current.payload),
++      generation: current.generation,
++      revisionSum: currentSum,
++    }
+   }
+ 
+   const generation = current.generation + 1
+-  parsed.generation = generation // 槽内 generation 由电子脑写死,面板不自报
+-  const slot = pickDepositWriteSlot(current.bestSlot)
+-  const slotOk = await fsWrite(DEPOSIT_DIR + slot, JSON.stringify(parsed))
+-  if (!slotOk) {
+-    // 写槽失败 = 指针不动,上一代完好(本次提交视为未发生)。
+-    diagFail(DIAG_SOURCE.deposit, 'deposit 状态提交失败: 槽写入失败 gen=' + generation + ' slot=' + slot)
+-    return { ok: false, message: 'deposit 状态槽写入失败' }
++  parsed.generation = generation // 顶层 generation 由电子脑写死,面板自报的值不作数
++  const fileName = 'state-' + String(generation).padStart(8, '0') + '-' + DEPOSIT_WRITER + '.json'
++
++  const sum = depositCanonicalSum(parsed)
++  const envelope = { schema: 1, gen: generation, writer: DEPOSIT_WRITER, sum, payload: parsed }
++  // SC9.1(九轮修正 SC8.3④ 的判据对象错误,十轮确认在单写者路径上原样保真):真正
++  // 落盘的字符串是**这个信封**(`{schema,gen,writer,sum,payload}`),不是裸
++  // `parsed`——信封比 payload 多出 `schema`/`gen`/`writer`/`sum` 这些固定字段的
++  // 开销(judge 反例:payload 恰好卡在硬上限之下、信封已经超出,旧判据只测
++  // payload,放行了一份写下去就超限的文件)。必须在信封字符串已经完整构造出来
++  // 之后才判定,且判的字符串要跟接下来 `fsWrite` 真正写的字符串是同一个变量,
++  // 不是各自重新 stringify 出来的两份。
++  const envelopeText = JSON.stringify(envelope)
++  if (depositByteLength(envelopeText) > DEPOSIT_STATE_HARD_BYTES) {
++    // SC9.3c(九轮追加,十一轮恢复——单写者场景下单实例的容量闸挡不住"同代并集"这种
++    // 复合体积:两个写者各自在自己的软闸以内独立积累,谁都没做错事,合并结果却可能
++    // 超硬上限。`current.usedNames.length > 1` 就是这次 `current` 来自"真的合并了
++    // 多份候选"(见 `readDepositState` 的合并分支),不是单一写者自己持续增长撞到的
++    // 上限——这种情况不猜删、不裁剪任何一份候选的内容,只如实报「需人工介入」,与
++    // 常规超限走不同的诊断措辞(现实上限:SOFT=7MiB × 残影份数 2 = 14MiB < 15MiB
++    // HARD,三份以上残影属病理性重复重启循环,不静默处理,交人工介入)。
++    if (current.usedNames.length > 1) {
++      diagFail(
++        DIAG_SOURCE.deposit,
++        'deposit 状态提交被拒: 同代并集(gen=' +
++          current.generation +
++          ',' +
++          current.usedNames.length +
++          ' 份候选合并)已超单次写入上限 ' +
++          depositByteLength(envelopeText) +
++          ' 字节,需人工介入(SC9.3c,理论边界见设计稿 §4.10.6.1)',
++      )
++      return { ok: false, message: 'deposit 状态同代并集超上限,需人工介入' }
++    }
++    diagFail(DIAG_SOURCE.deposit, 'deposit 状态提交被拒: 信封 ' + depositByteLength(envelopeText) + ' 字节超过单次写入上限')
++    return { ok: false, message: 'deposit 状态超过单次写入上限' }
+   }
+-  const manifestOk = await fsWrite(
+-    DEPOSIT_DIR + 'manifest.json',
+-    JSON.stringify({ version: 1, current: slot, generation, savedAt: clock.now() }),
+-  )
+-  if (!manifestOk) {
+-    // 写指针失败 = **状态已提交**(设计稿 §4.4.2),所以回 ok:true:槽已整份写成,读路径
+-    // 按槽内 generation 取更大者就会拿到这一代,迁移标记生效、不重跑。回 ok:false 会是
+-    // 一次**假阴性** —— 对一个已提交成功的状态报失败,训练调用方在成功时重试。
+-    //
+-    // 「指针与真相不一致所以不宣称成功」不成立:manifest 已彻底退出正确性路径(本函数
+-    // 之外无人读它),陈旧的不是真相而是**诊断面包屑**(与本文件 readDepositState 上方
+-    // 注释同一口径)。**它不是加速器**:读侧那条「信 manifest.current 指的槽」的快路径
+-    // 已作为 bug 删除(理由见 readDepositState 上方),现在没有任何消费者 —— 没有消费者
+-    // 的加速器不成立,别照着这段注释把快路径补回来。陈旧是有界的:本文件是
+-    // manifest.json 的**唯一写者**(全文仅此一处 fsWrite),且每次成功提交都无条件重写
+-    // 它,所以陈旧最多持续到下一次成功提交即自愈;而在陈旧期间唯一后果是「人肉/调试
+-    // 去读 manifest.json 会看到比槽内更小的 generation」——没有代码消费它。
+-    //
+-    // 留痕不静默:走 diagSkip(warn 级,可恢复分支)而不是 diagFail —— 提交本身成功了,
+-    // 失败的是次级的诊断面包屑。消息里保留「已提交」字样,便于按同一关键词检索提交记录。
+-    diagSkip(
+-      DIAG_SOURCE.deposit,
+-      'deposit 状态已提交但指针写入失败: gen=' + generation + ' slot=' + slot +
+-        ', 诊断面包屑陈旧(读路径不看指针), 下次成功提交时自愈',
+-    )
+-    return { ok: true, generation }
++  const fileOk = await fsWrite(DEPOSIT_DIR + fileName, envelopeText)
++  if (!fileOk) {
++    // 写文件失败 = 本次提交未发生,上一代(仍是磁盘上 generation 最大的有效候选)完好。
++    // N3 如实表述:这不是笼统的"只丢缓存"——本次载荷若含新增/换指纹产生的
++    // from:'deposit' 条目,它背后是一份已经真实占了宿主配额的指纹,提交未发生 =
++    // 本地不再知道这份配额该由谁认领 = 配额孤儿风险(设计稿 §4.10.4;P1a 尚未接线
++    // 自动补偿,消费在 P1b)。只有 migration/capability/artifact/ledger 条目丢了才
++    // 是纯缓存损失,下次重算即可。
++    diagFail(DIAG_SOURCE.deposit, 'deposit 状态提交失败: 文件写入失败 gen=' + generation)
++    return { ok: false, message: 'deposit 状态文件写入失败' }
+   }
+-  diagOk(DIAG_SOURCE.deposit, 'deposit 状态已提交: gen=' + generation + ' slot=' + slot)
+-  return { ok: true, generation }
++
++  diagOk(DIAG_SOURCE.deposit, 'deposit 状态已提交: gen=' + generation + ' writer=' + DEPOSIT_WRITER)
++  await depositRetireOldGenerations(generation) // 非阻塞:退休失败不影响本次提交结果
++  // F1:此刻磁盘上 gen=`generation` 只有这一份候选(单写者+进程内串行下不可能有
++  // 别的候选与它同代),"当前已合并内容"就是它自己——对应的 sum 已经是完整性哈希,
++  // 直接复用即为这一代的 revisionSum,不必重算。
++  return { ok: true, generation, revisionSum: sum }
+ }
+ 
+ channel.onmessage = (event) => {
+@@ -6425,12 +6526,13 @@ if (seam && typeof seam.expose === 'function') {
+       // 每次都绕一圈完整的 fs 落盘往返。
+       mergeCandidates: depositMergeCandidates,
+       dir: DEPOSIT_DIR,
+-      slots: DEPOSIT_SLOTS,
++      fileRe: DEPOSIT_FILE_RE,
++      retainGenerations: DEPOSIT_RETAIN_GENERATIONS,
+       maxBytes: DEPOSIT_MAX_BYTES,
+-      // deposit 状态自身落盘走 cindy.fs,单次写入上限是 MAX_ASSET_BYTES(与上面的媒体
+-      // 寄存上限是两件事,设计稿 §4.6 明文禁止互推)。测试需要状态写入上限时用这个,
+-      // 不要复用 maxBytes。
+-      stateMaxBytes: MAX_ASSET_BYTES,
++      // deposit 状态自身落盘走 cindy.fs,单次写入上限是 DEPOSIT_STATE_HARD_BYTES
++      // (SC8.2,与上面的媒体寄存上限 maxBytes 是两件独立维护的事,设计稿 §4.6 明文
++      // 禁止互推)。测试需要状态写入上限时用这个,不要复用 maxBytes。
++      stateMaxBytes: DEPOSIT_STATE_HARD_BYTES,
+       labelMax: DEPOSIT_LABEL_MAX,
+       inflightCount: () => depositInflight.size,
+       // F1:协议测试用它算某份候选 payload 的 revisionSum,拼出正确的 baseSum 去撞 CAS。
+diff --git a/src/__tests__/depositBrain.test.ts b/src/__tests__/depositBrain.test.ts
+index 853fbd40..e6574d3e 100644
+--- a/src/__tests__/depositBrain.test.ts
++++ b/src/__tests__/depositBrain.test.ts
+@@ -6,8 +6,10 @@
+  *  - reqId 重放去重与在途忽略(重发绝不变成重复寄存);
+  *  - 前置超限拦截 → 零 cindy.send;
+  *  - 回执不带合法指纹 → 按失败处理,绝不让面板写半条映射;
+- *  - 状态槽:a/b 双槽 + 指针提交、槽内 generation 恢复语义(九组崩溃安全)、
+- *    generation CAS 冲突回执。
++ *  - 状态:不可变命名协议(`state-<gen>-<writer>.json`)提交、候选校验、整代退休 K=3、
++ *    generation CAS(设计稿 §4.4.2/§4.4.3/§4.10.6.1);十轮定案单写者架构下,写侧
++ *    四层写者碰撞检测已删除;十一轮(SC11.1)恢复读侧同代多候选合并 + canonical
++ *    文件名门(SC11.2)。
+  *
+  * 断言跑在真实 cindyplugin/main.js 源码上(fake clock + cindy.send spy + fake fs),
+  * 复用 #298 X0 的 brainHarness,不自建脚手架。
+@@ -15,9 +17,10 @@
+ import { readFileSync } from 'node:fs'
+ import { fileURLToPath } from 'node:url'
+ import { describe, expect, it } from 'vitest'
++import { canonicalSum } from '../../../src/lib/canonicalHash'
+ import { flushMicrotasks, loadBrain } from './brainHarness'
+ import { readGuardBaseFile } from './mergeBaseGuard'
+-import type { FsRequest, LoadBrainOptions, LoadedBrain } from './brainHarness'
++import type { LoadBrainOptions, LoadedBrain } from './brainHarness'
+ 
+ type HostReply = {
+   ok: boolean
+@@ -226,32 +229,59 @@ describe('deposit_media — 失败矩阵(绝不写半条映射)', () => {
+   })
+ })
+ 
+-describe('deposit 状态槽 — a/b 双槽 + 指针提交', () => {
+-  const stateJson = (extra: Record<string, unknown> = {}) =>
+-    JSON.stringify({ version: 1, generation: 0, map: {}, ...extra })
++describe('deposit 状态 — 不可变命名协议提交(设计稿 §4.4.2)', () => {
++  const stateJson = (extra: Record<string, unknown> = {}) => JSON.stringify({ version: 1, map: {}, ...extra })
+ 
+-  it('首次提交写 state-a 并推进指针;第二次交替到 state-b', async () => {
++  it('首次提交写 state-<gen>-<writer>.json,文件名与信封字段一致(writer = 电子脑进程生命周期常量,不再由面板携带)', async () => {
+     const { brain } = depositBrain()
+-    const deposit = brain.handles.deposit
++    // F1(四审):baseGeneration=0 数值相等不再够用,必须同时带上与"当前已合并内容"
++    // (此刻磁盘真空,main.js 用固定哨兵值代表)匹配的 baseSum 才被接为线性提交。
++    // SC10.1:请求不再携带 writer 字段——main.js 用自己的 DEPOSIT_WRITER,不读 msg.writer。
++    const result = await brain.handles.deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: brain.handles.deposit.emptyRevisionSum,
++      state: stateJson(),
++    })
+ 
+-    const first = await deposit.stateSave({ baseGeneration: 0, state: stateJson() })
+-    expect(first).toMatchObject({ ok: true, generation: 1 })
+-    expect(brain.files.get('deposit/state-a.json')).toBeTruthy()
+-    expect(JSON.parse(String(brain.files.get('deposit/manifest.json')))).toMatchObject({
+-      current: 'state-a.json',
+-      generation: 1,
++    expect(result).toMatchObject({ ok: true, generation: 1 })
++    const fileName = `deposit/state-00000001-${brain.handles.deposit.writer}.json`
++    const envelope = JSON.parse(String(brain.files.get(fileName)))
++    expect(envelope).toMatchObject({ schema: 1, gen: 1, writer: brain.handles.deposit.writer })
++    expect(envelope.payload.generation).toBe(1)
++  })
++
++  it('第二次提交写一个全新文件,不覆盖第一个(不可变命名,不是覆盖写)', async () => {
++    const { brain } = depositBrain()
++    const first = await brain.handles.deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: brain.handles.deposit.emptyRevisionSum,
++      state: stateJson(),
++    })
++    // F1:第二次提交的 baseSum 原样接第一次回执给的 revisionSum(面板永远这样做,
++    // opaque echo,不自己重算)。
++    await brain.handles.deposit.stateSave({
++      baseGeneration: 1,
++      baseSum: first.revisionSum,
++      state: stateJson(),
+     })
+ 
+-    const second = await deposit.stateSave({ baseGeneration: 1, state: stateJson({ generation: 1 }) })
+-    expect(second).toMatchObject({ ok: true, generation: 2 })
+-    expect(brain.files.get('deposit/state-b.json')).toBeTruthy()
+-    expect(JSON.parse(String(brain.files.get('deposit/manifest.json'))).current).toBe('state-b.json')
++    // SC10.1:单写者架构下两次提交用同一个 writer,只有 gen 前进——文件名不再靠
++    // 不同 writer 区分,靠不同 gen 区分。
++    const writer = brain.handles.deposit.writer
++    expect(brain.files.get(`deposit/state-00000001-${writer}.json`)).toBeTruthy()
++    expect(brain.files.get(`deposit/state-00000002-${writer}.json`)).toBeTruthy()
+   })
+ 
+-  it('槽内 generation 由电子脑写死,面板自报的值不作数', async () => {
++  it('顶层 generation 由电子脑写死,面板自报的值不作数', async () => {
+     const { brain } = depositBrain()
+-    await brain.handles.deposit.stateSave({ baseGeneration: 0, state: stateJson({ generation: 999 }) })
+-    expect(JSON.parse(String(brain.files.get('deposit/state-a.json'))).generation).toBe(1)
++    await brain.handles.deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: brain.handles.deposit.emptyRevisionSum,
++      state: stateJson({ generation: 999 }),
++    })
++
++    const envelope = JSON.parse(String(brain.files.get(`deposit/state-00000001-${brain.handles.deposit.writer}.json`)))
++    expect(envelope.payload.generation).toBe(1)
+   })
+ 
+   it('从未写过 → 读取返回缓存空 + gen 0(不是错误)', async () => {
+@@ -263,8 +293,11 @@ describe('deposit 状态槽 — a/b 双槽 + 指针提交', () => {
+     const { brain } = depositBrain()
+     await brain.handles.deposit.stateSave({
+       baseGeneration: 0,
+-      state: stateJson({ map: { 'mivo-asset:1': { hash: HASH, ext: '.png', depositedAt: 7 } } }),
++      baseSum: brain.handles.deposit.emptyRevisionSum,
++      writer: 'aaaaaaaa',
++      state: stateJson({ map: { 'mivo-asset:1': { hash: HASH, ext: '.png', depositedAt: 7, from: 'deposit' } } }),
+     })
++
+     const loaded = await brain.handles.deposit.stateLoad()
+     expect(loaded.generation).toBe(1)
+     expect(JSON.parse(String(loaded.state)).map['mivo-asset:1']).toMatchObject({ hash: HASH, ext: '.png' })
+@@ -274,235 +307,57 @@ describe('deposit 状态槽 — a/b 双槽 + 指针提交', () => {
+     const { brain } = depositBrain()
+     const deposit = brain.handles.deposit
+ 
+-    await expect(deposit.stateSave({ baseGeneration: 0, state: '{oops' })).resolves.toMatchObject({ ok: false })
+-    await expect(deposit.stateSave({ baseGeneration: 0, state: '"text"' })).resolves.toMatchObject({ ok: false })
++    await expect(deposit.stateSave({ baseGeneration: 0, writer: 'aaaaaaaa', state: '{oops' })).resolves.toMatchObject({ ok: false })
++    await expect(deposit.stateSave({ baseGeneration: 0, writer: 'aaaaaaaa', state: '"text"' })).resolves.toMatchObject({ ok: false })
+     await expect(
+       // 状态自身落盘的上限是 stateMaxBytes(= MAX_ASSET_BYTES,cindy.fs 单次写入上限),
+       // 不是 maxBytes(= 媒体寄存上限,两者不得互推,设计稿 §4.6)。
+-      deposit.stateSave({ baseGeneration: 0, state: JSON.stringify({ pad: 'x'.repeat(deposit.stateMaxBytes + 16) }) }),
++      deposit.stateSave({
++        baseGeneration: 0,
++        writer: 'aaaaaaaa',
++        state: JSON.stringify({ pad: 'x'.repeat(deposit.stateMaxBytes + 16) }),
++      }),
+     ).resolves.toMatchObject({ ok: false })
+ 
+-    expect(brain.files.get('deposit/state-a.json')).toBeUndefined()
+-    expect(brain.files.get('deposit/manifest.json')).toBeUndefined()
++    expect(brain.files.size).toBe(0)
+   })
+ })
+ 
+-describe('deposit 状态槽 — 崩溃安全九组(设计稿 §4.4.2 测试口径 + 指针陈旧有界)', () => {
+-  const commitOnce = async (files?: Record<string, string>, writeGuard?: (request: FsRequest) => boolean) => {
+-    const { brain } = depositBrain({ files, writeGuard })
+-    return brain
+-  }
+-
+-  it('① 写槽失败 → 指针不动,上一代完好', async () => {
+-    const brain = await commitOnce(
+-      {
+-        'deposit/state-a.json': JSON.stringify({ version: 1, generation: 1, map: { keep: { hash: HASH, ext: '.png', depositedAt: 1 } } }),
+-        'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-a.json', generation: 1 }),
+-      },
+-      (request) => !request.path.endsWith('state-b.json'),
+-    )
+-
+-    const result = await brain.handles.deposit.stateSave({ baseGeneration: 1, state: JSON.stringify({ version: 1, map: {} }) })
+-    expect(result.ok).toBe(false)
+-    // 指针仍指向上一代,读取仍拿到上一代内容
+-    const loaded = await brain.handles.deposit.stateLoad()
+-    expect(loaded.generation).toBe(1)
+-    expect(JSON.parse(String(loaded.state)).map.keep).toBeTruthy()
+-  })
+-
+-  // 这条曾把违约断言成正确行为:原断言 `loaded.generation === 1`(= 快路径读回上一代)
+-  // 与设计稿 §4.4.2「写指针失败 = 状态已提交」「读侧总是读两个槽取 generation 更大的
+-  // 合法槽」正相反 —— 它把 manifest 重新拉回正确性路径,把 P1 bug 钉成了预期。
+-  it('② 写指针失败 → 状态已提交,重启读到较新槽(manifest 不进正确性路径)', async () => {
+-    const brain = await commitOnce(
+-      {
+-        'deposit/state-a.json': JSON.stringify({ version: 1, generation: 1, map: {} }),
+-        'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-a.json', generation: 1 }),
+-      },
+-      (request) => !request.path.endsWith('manifest.json'),
+-    )
+-
+-    const committed = {
+-      version: 1,
+-      map: { fresh: { hash: HASH, ext: '.png', depositedAt: 2 } },
+-      // 迁移标记:设计稿 §7.3 两条相反断言里的「已提交 → 应**不**重跑」那一条,
+-      // 靠它落地 —— 标记必须随这一代被读回来,否则下次启动会重跑迁移。
+-      migration: { version: 2, at: 7, migrated: 3 },
+-    }
+-    const result = await brain.handles.deposit.stateSave({ baseGeneration: 1, state: JSON.stringify(committed) })
+-    // 回执 ok:true + gen=2:这一代**已经提交**,回 ok:false 会是对成功状态的假阴性
+-    // (陈旧的是诊断面包屑,不是真相 —— manifest 已无任何读者,不存在被它加速的读路径)。面板据此把本地
+-    // generation 推进到 2,与磁盘一致,下次提交不必先撞一次 CAS 冲突。
+-    expect(result).toMatchObject({ ok: true, generation: 2 })
+-
+-    const loaded = await brain.handles.deposit.stateLoad()
+-    expect(loaded.generation).toBe(2)
+-    const state = JSON.parse(String(loaded.state))
+-    expect(state.map.fresh).toBeTruthy()
+-    // 迁移标记生效 = 不重跑迁移。
+-    expect(state.migration).toMatchObject({ version: 2, migrated: 3 })
+-    // manifest 仍指着上一代(写失败),但它不影响结论 —— 这就是「退出正确性路径」。
+-    expect(JSON.parse(String(brain.files.get('deposit/manifest.json'))).generation).toBe(1)
+-  })
++// #349 语义延续(原「合并列车残余风险跟进项 1」,main.js 历史修复的等价场景):「有效」
++// 不能只等价于「JSON.parse 没抛错」——顶层非对象、payload.map 被截断/覆盖成别的类型,
++// 都是能骗过纯语法解析的结构损坏,新协议下用 sum 完整性信封 + 结构门双保险堵住。
++describe('deposit 状态 — 候选校验:结构损坏/信封篡改的高代候选不得压过完整的低代候选(#349 语义延续)', () => {
++  const validEnvelope = (gen: number, writer: string, payload: Record<string, unknown>) =>
++    JSON.stringify({ schema: 1, gen, writer, sum: canonicalSum(payload), payload })
+ 
+-  // 把「指针陈旧是有界的」从文字承诺变成门禁:main.js 是 manifest.json 的唯一写者,
+-  // 且每次成功提交都无条件重写它,所以陈旧最多持续到下一次成功提交。
+-  it('⑨ 指针陈旧有界:下一次成功提交把指针写回真相(自愈)', async () => {
+-    let blockManifest = true
++  it('顶层非对象的候选(字符串)+ 完整候选 → 选完整候选,不当成任何高代真相', async () => {
+     const { brain } = depositBrain({
+       files: {
+-        'deposit/state-a.json': JSON.stringify({ version: 1, generation: 1, map: {} }),
+-        'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-a.json', generation: 1 }),
+-      },
+-      writeGuard: (request) => !(blockManifest && request.path.endsWith('manifest.json')),
+-    })
+-
+-    // 第一次:槽写成 gen=2,指针写失败 → 已提交但指针停在 gen=1。
+-    await expect(
+-      brain.handles.deposit.stateSave({ baseGeneration: 1, state: JSON.stringify({ version: 1, map: {} }) }),
+-    ).resolves.toMatchObject({ ok: true, generation: 2 })
+-    expect(JSON.parse(String(brain.files.get('deposit/manifest.json'))).generation).toBe(1)
+-
+-    // 第二次(指针写恢复):gen=3 落另一槽,指针一并写对 → 陈旧终止。
+-    blockManifest = false
+-    await expect(
+-      brain.handles.deposit.stateSave({ baseGeneration: 2, state: JSON.stringify({ version: 1, map: {} }) }),
+-    ).resolves.toMatchObject({ ok: true, generation: 3 })
+-    expect(JSON.parse(String(brain.files.get('deposit/manifest.json')))).toMatchObject({
+-      current: 'state-a.json',
+-      generation: 3,
+-    })
+-  })
+-
+-  it('⑦ manifest 落后时 CAS 基线仍取槽内最大 generation → 回冲突,绝不覆盖最高代槽', async () => {
+-    // 磁盘现状 = 上一次「槽写成功但指针写失败」留下的:state-b 持 gen=2(已提交),
+-    // manifest 还指着 state-a 的 gen=1。面板拿着过时的内存基线 1 再提交:
+-    // 修复前 —— 读侧快路径信 manifest 返回 gen=1 → CAS 认为磁盘没前进 → 直接写,
+-    // 且奇偶算出 gen=2 落 state-b,**覆盖掉较新的已提交状态**。
+-    const { brain } = depositBrain({
+-      files: {
+-        'deposit/state-a.json': JSON.stringify({ version: 1, generation: 1, map: {} }),
+-        'deposit/state-b.json': JSON.stringify({
++        // 顶层是字符串,不是对象——JSON.parse 不抛错,但不是可恢复的状态。
++        'deposit/state-00000099-aaaaaaaa.json': JSON.stringify('not an envelope'),
++        'deposit/state-00000001-bbbbbbbb.json': validEnvelope(1, 'bbbbbbbb', {
+           version: 1,
+-          generation: 2,
+-          map: { newer: { hash: HASH, ext: '.png', depositedAt: 5 } },
+-          migration: { version: 2, at: 7, migrated: 3 },
++          map: { keep: { hash: HASH, ext: '.png', depositedAt: 1, from: 'deposit' } },
+         }),
+-        'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-a.json', generation: 1 }),
+       },
+     })
+ 
+-    const result = await brain.handles.deposit.stateSave({ baseGeneration: 1, state: JSON.stringify({ version: 1, map: {} }) })
+-
+-    expect(result).toMatchObject({ ok: false, conflict: true, generation: 2 })
+-    // 冲突回执带的是「已提交的那一代」,面板据此合并重试。
+-    expect(JSON.parse(String(result.state)).map.newer).toBeTruthy()
+-    // 两槽都原样:较新代没被覆盖。
+-    expect(JSON.parse(String(brain.files.get('deposit/state-b.json'))).generation).toBe(2)
+-    expect(JSON.parse(String(brain.files.get('deposit/state-b.json'))).map.newer).toBeTruthy()
+-    expect(JSON.parse(String(brain.files.get('deposit/state-a.json'))).generation).toBe(1)
+-  })
+-
+-  it('⑧ 写目标槽 = 不持有最大 generation 的那一槽(一槽损坏时不覆盖唯一合法槽)', async () => {
+-    // state-a 损坏、state-b 持 gen=5。按 generation 奇偶推算(gen=6 → 偶 → state-b)
+-    // 会覆盖唯一合法槽,写一半崩就双槽全灭;设计稿 §4.4.2 因此明禁奇偶。
+-    const { brain } = depositBrain({
+-      files: {
+-        'deposit/state-a.json': '{truncated',
+-        'deposit/state-b.json': JSON.stringify({ version: 1, generation: 5, map: { keep: { hash: HASH, ext: '.png', depositedAt: 1 } } }),
+-        'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-b.json', generation: 5 }),
+-      },
+-    })
+-
+-    const result = await brain.handles.deposit.stateSave({ baseGeneration: 5, state: JSON.stringify({ version: 1, map: { next: { hash: HASH, ext: '.png', depositedAt: 6 } } }) })
+-
+-    expect(result).toMatchObject({ ok: true, generation: 6 })
+-    // 先断被保护的那一槽:持有最大合法代的 state-b 一字未动(仍是可回退的 gen=5)。
+-    // 奇偶推算会把 gen=6 写进 state-b,这条即翻红。
+-    expect(JSON.parse(String(brain.files.get('deposit/state-b.json')))).toMatchObject({
+-      generation: 5,
+-      map: { keep: { hash: HASH } },
+-    })
+-    // 新代落在原本损坏的那一槽。
+-    expect(String(brain.files.get('deposit/state-a.json'))).not.toBe('{truncated')
+-    expect(JSON.parse(String(brain.files.get('deposit/state-a.json')))).toMatchObject({ generation: 6 })
+-  })
+-
+-  it('③ 槽被截断成非法 JSON → 回退另一个合法槽', async () => {
+-    const brain = await commitOnce({
+-      'deposit/state-a.json': '{"version":1,"generation":2,"map":{"a"',
+-      'deposit/state-b.json': JSON.stringify({ version: 1, generation: 1, map: { b: { hash: HASH, ext: '.png', depositedAt: 1 } } }),
+-      'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-a.json', generation: 2 }),
+-    })
+-
+     const loaded = await brain.handles.deposit.stateLoad()
+     expect(loaded.generation).toBe(1)
+-    expect(JSON.parse(String(loaded.state)).map.b).toBeTruthy()
+-  })
+-
+-  it('④ 两槽皆坏 → 诚实兜底为缓存空(不产生错数据)', async () => {
+-    const brain = await commitOnce({
+-      'deposit/state-a.json': '{broken',
+-      'deposit/state-b.json': 'also broken',
+-      'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-a.json', generation: 5 }),
+-    })
+-
+-    const loaded = await brain.handles.deposit.stateLoad()
+-    expect(loaded).toMatchObject({ ok: true, state: null, generation: 0 })
+-  })
+-
+-  it('⑤ 指针指向不存在的槽 → 回退到实际存在的槽', async () => {
+-    const brain = await commitOnce({
+-      'deposit/state-b.json': JSON.stringify({ version: 1, generation: 3, map: { b: { hash: HASH, ext: '.png', depositedAt: 1 } } }),
+-      'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-a.json', generation: 3 }),
+-    })
+-
+-    const loaded = await brain.handles.deposit.stateLoad()
+-    expect(loaded.generation).toBe(3)
+-    expect(JSON.parse(String(loaded.state)).map.b).toBeTruthy()
+-  })
+-
+-  it('⑥ manifest 损坏且两槽均合法 → 选中 generation 更大的那个(不是文件名靠前的)', async () => {
+-    const brain = await commitOnce({
+-      // 文件名靠前的 state-a 是**旧**代:按文件名顺序回退会选错。
+-      'deposit/state-a.json': JSON.stringify({ version: 1, generation: 4, map: { old: { hash: HASH, ext: '.png', depositedAt: 1 } } }),
+-      'deposit/state-b.json': JSON.stringify({ version: 1, generation: 5, map: { newer: { hash: HASH, ext: '.png', depositedAt: 2 } } }),
+-      'deposit/manifest.json': '{corrupt',
+-    })
+-
+-    const loaded = await brain.handles.deposit.stateLoad()
+-    expect(loaded.generation).toBe(5)
+-    const map = JSON.parse(String(loaded.state)).map
+-    expect(map.newer).toBeTruthy()
+-    expect(map.old).toBeUndefined()
+-  })
+-
+-  it('槽内 generation 缺失(老格式)视作 0', async () => {
+-    const brain = await commitOnce({
+-      'deposit/state-a.json': JSON.stringify({ version: 1, map: { legacy: { hash: HASH, ext: '.png', depositedAt: 1 } } }),
+-      'deposit/manifest.json': '{corrupt',
+-    })
+-    const loaded = await brain.handles.deposit.stateLoad()
+-    expect(loaded.generation).toBe(0)
++    expect(JSON.parse(String(loaded.state)).map.keep).toBeTruthy()
+   })
+-})
+ 
+-// #332 合并列车残余风险跟进项 1(Greptile 复审):「合法」不能只等价于「JSON.parse
+-// 没抛错」——顶层非对象(字符串/数字/null)、或顶层是对象但 map 字段被截断/覆盖成
+-// 别的类型,都是能骗过纯语法解析的结构损坏。这类槎若带着偏高的 generation,读取/
+-// CAS 基线/写槎选择三处都会被同时带偏(见 main.js readDepositSlot 上方 ⑤ 号注释)。
+-describe('deposit 状态槽 — 结构损坏的高代槎不得压过完整的低代槎(#332 跟进项 1)', () => {
+-  it('顶层非对象的高代槎(字符串)+ 完整的低代槎 → 选完整低代,不当成 corrupt 之外的东西', async () => {
++  it('payload.map 被覆盖成非对象类型的候选(sum 对得上自己,但结构门先拦)+ 完整候选 → 选完整候选', async () => {
++    const clobberedPayload = { version: 1, map: 'clobbered' as unknown }
+     const { brain } = depositBrain({
+       files: {
+-        // 顶层是字符串,不是对象——JSON.parse 不抛错,但不是可恢复的状态。
+-        'deposit/state-a.json': JSON.stringify('not a state object'),
+-        'deposit/state-b.json': JSON.stringify({
++        // sum 是"忠实"于这份被破坏 payload 算出来的——它没有被半路篡改,是从一开始
++        // 就构造成 map 字段类型错误。结构门(payload-shape)必须独立于 sum 校验拦住它。
++        'deposit/state-00000099-aaaaaaaa.json': validEnvelope(99, 'aaaaaaaa', clobberedPayload),
++        'deposit/state-00000001-bbbbbbbb.json': validEnvelope(1, 'bbbbbbbb', {
+           version: 1,
+-          generation: 1,
+-          map: { keep: { hash: HASH, ext: '.png', depositedAt: 1 } },
++          map: { keep: { hash: HASH, ext: '.png', depositedAt: 1, from: 'deposit' } },
+         }),
+-        'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-a.json', generation: 99 }),
+       },
+     })
+ 
+@@ -511,98 +366,165 @@ describe('deposit 状态槽 — 结构损坏的高代槎不得压过完整的低
+     expect(JSON.parse(String(loaded.state)).map.keep).toBeTruthy()
+   })
+ 
+-  it('顶层是对象但 map 字段被覆盖成非对象的高代槎 + 完整的低代槎 → 选完整低代', async () => {
++  it('sum 与 payload 不一致(截断/篡改)的高代候选 + 完整低代候选 → 选完整低代', async () => {
++    const realPayload = { version: 1, map: { keep: { hash: HASH, ext: '.png', depositedAt: 1, from: 'deposit' } } }
++    const tamperedEnvelope = JSON.parse(validEnvelope(99, 'aaaaaaaa', { version: 1, map: {} }))
++    tamperedEnvelope.payload.map.injected = { hash: 'evil', ext: '.png', depositedAt: 1, from: 'deposit' } // sum 不再匹配
+     const { brain } = depositBrain({
+       files: {
+-        // 顶层是对象、generation 字段完好,但 map 被写坏成了字符串——这是纯语法解析
+-        // 骗不出、老版本 readDepositSlot 会照单全收的那种损坏。
+-        'deposit/state-a.json': JSON.stringify({ version: 1, generation: 99, map: 'clobbered' }),
+-        'deposit/state-b.json': JSON.stringify({
+-          version: 1,
+-          generation: 1,
+-          map: { keep: { hash: HASH, ext: '.png', depositedAt: 1 } },
+-        }),
++        'deposit/state-00000099-aaaaaaaa.json': JSON.stringify(tamperedEnvelope),
++        'deposit/state-00000001-bbbbbbbb.json': validEnvelope(1, 'bbbbbbbb', realPayload),
+       },
+     })
+ 
+     const loaded = await brain.handles.deposit.stateLoad()
+     expect(loaded.generation).toBe(1)
+-    expect(JSON.parse(String(loaded.state)).map.keep).toBeTruthy()
++    expect(JSON.parse(String(loaded.state)).map.injected).toBeUndefined()
+   })
+ 
+-  it('选中完整的低代槎之后再提交:写目标落在结构损坏的那一槎,不覆盖完整槎', async () => {
++  it('选中完整的低代候选之后再提交:写一个全新文件,不覆盖任何既有候选', async () => {
+     const { brain } = depositBrain({
+       files: {
+-        'deposit/state-a.json': JSON.stringify({ version: 1, generation: 99, map: 'clobbered' }),
+-        'deposit/state-b.json': JSON.stringify({
++        'deposit/state-00000099-aaaaaaaa.json': validEnvelope(99, 'aaaaaaaa', { version: 1, map: 'clobbered' as unknown }),
++        'deposit/state-00000001-bbbbbbbb.json': validEnvelope(1, 'bbbbbbbb', {
+           version: 1,
+-          generation: 1,
+-          map: { keep: { hash: HASH, ext: '.png', depositedAt: 1 } },
++          map: { keep: { hash: HASH, ext: '.png', depositedAt: 1, from: 'deposit' } },
+         }),
+       },
+     })
+ 
+-    // CAS 基线必须是「完整槎的 1」,不是「损坏槎表面上的 99」——用真实 generation=1
+-    // 提交才应该成功。
++    // CAS 基线必须是「完整候选的 1」,不是「损坏候选表面上的 99」——baseSum 同理,
++    // 必须是"完整候选"这份内容的指纹,不是损坏候选的。
+     const result = await brain.handles.deposit.stateSave({
+       baseGeneration: 1,
+-      state: JSON.stringify({ version: 1, map: { next: { hash: HASH, ext: '.png', depositedAt: 2 } } }),
++      baseSum: brain.handles.deposit.revisionSum({
++        version: 1,
++        map: { keep: { hash: HASH, ext: '.png', depositedAt: 1, from: 'deposit' } },
++        generation: 1,
++      }),
++      state: JSON.stringify({ version: 1, map: { next: { hash: HASH, ext: '.png', depositedAt: 2, from: 'deposit' } } }),
+     })
+     expect(result).toMatchObject({ ok: true, generation: 2 })
+ 
+-    // 写目标是结构损坏的 state-a(不是持有最大合法 generation 的 state-b):
+-    // state-b 的完整数据原样留着,新代落进原本损坏的槎。
+-    expect(JSON.parse(String(brain.files.get('deposit/state-b.json')))).toMatchObject({
+-      generation: 1,
+-      map: { keep: { hash: HASH } },
+-    })
+-    expect(JSON.parse(String(brain.files.get('deposit/state-a.json')))).toMatchObject({
+-      generation: 2,
+-      map: { next: { hash: HASH } },
+-    })
++    // 两份既有候选原样未动;新代是一份全新文件。
++    expect(brain.files.get('deposit/state-00000099-aaaaaaaa.json')).toBeTruthy()
++    expect(brain.files.get('deposit/state-00000001-bbbbbbbb.json')).toBeTruthy()
++    expect(
++      JSON.parse(String(brain.files.get(`deposit/state-00000002-${brain.handles.deposit.writer}.json`))).payload.map.next,
++    ).toBeTruthy()
+   })
+ 
+-  it('双槎均结构损坏(顶层非对象 / map 被覆盖)→ 诚实兜底为缓存空,不当成任何一边的高代真相', async () => {
++  it('全部候选结构损坏 → 诚实兜底为缓存空,不当成任何一边的高代真相', async () => {
+     const { brain } = depositBrain({
+       files: {
+-        'deposit/state-a.json': JSON.stringify(42),
+-        'deposit/state-b.json': JSON.stringify({ version: 1, generation: 50, map: ['not', 'a', 'map'] }),
++        'deposit/state-00000042-aaaaaaaa.json': JSON.stringify(42),
++        'deposit/state-00000050-bbbbbbbb.json': validEnvelope(50, 'bbbbbbbb', { version: 1, map: ['not', 'a', 'map'] as unknown }),
+       },
+     })
+ 
+     const loaded = await brain.handles.deposit.stateLoad()
+     expect(loaded).toMatchObject({ ok: true, state: null, generation: 0 })
+   })
++
++  it('generation 缺失(老格式 payload)视作 0', async () => {
++    const { brain } = depositBrain({
++      files: {
++        'deposit/state-00000001-aaaaaaaa.json': validEnvelope(1, 'aaaaaaaa', {
++          version: 1,
++          map: { legacy: { hash: HASH, ext: '.png', depositedAt: 1, from: 'deposit' } },
++        }),
++      },
++    })
++    const loaded = await brain.handles.deposit.stateLoad()
++    // payload 本身没有 generation 字段(main.js 只在写入时回填,读取只看候选 gen),
++    // 断言的是"能正常读出这份候选",不是顶层 generation 字段——它由候选文件名决定。
++    expect(loaded.generation).toBe(1)
++    expect(JSON.parse(String(loaded.state)).map.legacy).toBeTruthy()
++  })
++
++  it('SC11.2(judge-j P2):候选文件名必须逐字节等于 gen/writer 重新编码出的 canonical 名——9 位补零 gen 的候选被拒,正序/逆序枚举读到同一份内容', async () => {
++    const goodPayload = { version: 1, map: { fromGood: { hash: HASH, ext: '.png', depositedAt: 1, from: 'deposit' } } }
++    const badPayload = { version: 1, map: { fromBadPad: { hash: HASH, ext: '.png', depositedAt: 2, from: 'deposit' } } }
++    // 两份候选数值上都声明 gen=4、writer 相同——`Number('000000004') === Number('00000004') === 4`,
++    // 若只按数值比对文件名与信封字段是否一致(既有 gen-mismatch/writer-mismatch 门),
++    // 两者都会通过校验,谁被选中取决于 `fsList` 枚举顺序这种协议未保证的东西。
++    const canonicalEnvelope = validEnvelope(4, 'aaaaaaaaaaaaaaaa', goodPayload)
++    const nonCanonicalEnvelope = JSON.stringify({
++      schema: 1,
++      gen: 4,
++      writer: 'aaaaaaaaaaaaaaaa',
++      sum: canonicalSum(badPayload),
++      payload: badPayload,
++    })
++
++    const filesAscending = {
++      'deposit/state-00000004-aaaaaaaaaaaaaaaa.json': canonicalEnvelope,
++      'deposit/state-000000004-aaaaaaaaaaaaaaaa.json': nonCanonicalEnvelope,
++    }
++    const filesDescending = {
++      'deposit/state-000000004-aaaaaaaaaaaaaaaa.json': nonCanonicalEnvelope,
++      'deposit/state-00000004-aaaaaaaaaaaaaaaa.json': canonicalEnvelope,
++    }
++
++    const { brain: ascBrain } = depositBrain({ files: filesAscending })
++    const { brain: descBrain } = depositBrain({ files: filesDescending })
++
++    const ascLoaded = await ascBrain.handles.deposit.stateLoad()
++    const descLoaded = await descBrain.handles.deposit.stateLoad()
++    const ascState = JSON.parse(String(ascLoaded.state))
++    const descState = JSON.parse(String(descLoaded.state))
++
++    // 唯一合法候选是 8 位补零的那份;9 位补零的那份被 canonical 名门拒绝——正序/
++    // 逆序枚举必须读到同一份内容,不依赖 `fsList` 目录枚举顺序(judge-j 反例)。
++    expect(ascState.map.fromGood).toBeTruthy()
++    expect(ascState.map.fromBadPad).toBeUndefined()
++    expect(descState.map.fromGood).toBeTruthy()
++    expect(descState.map.fromBadPad).toBeUndefined()
++    expect(ascLoaded.generation).toBe(4)
++    expect(descLoaded.generation).toBe(4)
++  })
+ })
+ 
+-describe('deposit 状态槽 — generation CAS', () => {
+-  it('载荷基于旧 generation → 回 conflict + 当前已提交状态,不覆盖', async () => {
++describe('deposit 状态 — generation CAS', () => {
++  const validEnvelope = (gen: number, writer: string, payload: Record<string, unknown>) =>
++    JSON.stringify({ schema: 1, gen, writer, sum: canonicalSum(payload), payload })
++
++  it('载荷基于旧 generation → 回 conflict + 当前已合并的磁盘状态,不覆盖', async () => {
+     const { brain } = depositBrain({
+       files: {
+-        'deposit/state-a.json': JSON.stringify({ version: 1, generation: 3, map: { remote: { hash: HASH, ext: '.png', depositedAt: 9 } } }),
+-        'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-a.json', generation: 3 }),
++        'deposit/state-00000003-aaaaaaaa.json': validEnvelope(3, 'aaaaaaaa', {
++          version: 1,
++          map: { remote: { hash: HASH, ext: '.png', depositedAt: 9, from: 'deposit', gen: 3, writer: 'aaaaaaaa' } },
++        }),
+       },
+     })
+ 
+-    const result = await brain.handles.deposit.stateSave({ baseGeneration: 1, state: JSON.stringify({ version: 1, map: {} }) })
++    const result = await brain.handles.deposit.stateSave({
++      baseGeneration: 1,
++      writer: 'bbbbbbbb',
++      state: JSON.stringify({ version: 1, map: {} }),
++    })
+ 
+     expect(result).toMatchObject({ ok: false, conflict: true, generation: 3 })
+     expect(JSON.parse(String(result.state)).map.remote).toBeTruthy()
+-    // 冲突不落盘:上一代原样
+-    expect(JSON.parse(String(brain.files.get('deposit/state-a.json'))).generation).toBe(3)
+-    expect(brain.files.get('deposit/state-b.json')).toBeUndefined()
++    // 冲突不落盘:既有候选原样,没有新文件出现。
++    expect(brain.files.size).toBe(1)
+   })
+ 
+-  it('baseGeneration 与磁盘一致 → 正常提交', async () => {
++  it('baseGeneration 与磁盘一致 → 正常提交,写一个全新文件', async () => {
+     const { brain } = depositBrain({
+       files: {
+-        'deposit/state-a.json': JSON.stringify({ version: 1, generation: 3, map: {} }),
+-        'deposit/manifest.json': JSON.stringify({ version: 1, current: 'state-a.json', generation: 3 }),
++        'deposit/state-00000003-aaaaaaaa.json': validEnvelope(3, 'aaaaaaaa', { version: 1, map: {} }),
+       },
+     })
+     await expect(
+-      brain.handles.deposit.stateSave({ baseGeneration: 3, state: JSON.stringify({ version: 1, map: {} }) }),
++      brain.handles.deposit.stateSave({
++        baseGeneration: 3,
++        baseSum: brain.handles.deposit.revisionSum({ version: 1, map: {}, generation: 3 }),
++        state: JSON.stringify({ version: 1, map: {} }),
++      }),
+     ).resolves.toMatchObject({ ok: true, generation: 4 })
++    expect(brain.files.get(`deposit/state-00000004-${brain.handles.deposit.writer}.json`)).toBeTruthy()
+   })
+ })
+ 
+diff --git a/src/__tests__/depositStore.test.ts b/src/__tests__/depositStore.test.ts
+index f061a17c..93110493 100644
+--- a/src/__tests__/depositStore.test.ts
++++ b/src/__tests__/depositStore.test.ts
+@@ -17,6 +17,7 @@ import {
+   lookupDeposit,
+   mergeDepositStates,
+   parseDepositState,
++  peekDepositRevisionSumForTests,
+   peekDepositStoreForTests,
+   recordDeposit,
+   recordMigration,
+@@ -287,31 +288,44 @@ describe('depositStore — 端到端提交(真实 main.js 槽 + 指针)', () =>
+   })
+ })
+ 
+-describe('depositStore — generation CAS 合并重试', () => {
++describe('depositStore — generation CAS:本实例未提交变更重放(设计稿 §4.10.6.1,last-write-wins 已作废)', () => {
+   afterEach(() => {
+     teardownDepositHarness()
+   })
+ 
+-  it('磁盘 generation 被外部推进 → 重读合并重试,两边条目都不丢', async () => {
++  it('磁盘 generation 被外部推进 → 重放本实例未提交变更,两边条目都不丢', async () => {
+     const harness = createDepositHarness()
+-    await recordDeposit('mivo-asset:mine', entry('mine', 1, 'deposit'))
+-
+-    // 模拟「另一个面板窗口」直接推进磁盘 generation 并写入自己的条目
+-    await harness.brain.handles.deposit.stateSave({
++    await recordDeposit('mivo-asset:mine', draft('mine', 1, 'deposit'))
++
++    // 模拟「另一个面板窗口」:它会先读到 gen=1(含 mine),再把自己的新条目叠加上去,
++    // 提交一份**携带 mine**的完整快照(行为良好的写者永远这样做——一次提交 = 一份完整
++    // 快照,不是差量)。这里手工构造这份快照来模拟"另一个实例的完整视图"。
++    // F1:这次直调必须带上与磁盘当前(gen=1)真实内容匹配的 baseSum,否则它自己就会
++    // 被判 conflict、悬空不落盘,后面"磁盘被外部推进"这个测试前提就不成立——
++    // `peekDepositRevisionSumForTests()` 此刻正是上面 `recordDeposit` 成功后记的
++    // 那个值,与磁盘 gen=1 的真实内容一致。
++    const savedResult = await harness.brain.handles.deposit.stateSave({
+       baseGeneration: 1,
++      baseSum: peekDepositRevisionSumForTests(),
++      writer: 'ffffffff',
+       state: JSON.stringify({
+         version: 1,
+-        map: { 'mivo-asset:other': { hash: 'other', ext: '.png', depositedAt: 50 } },
++        map: {
++          'mivo-asset:mine': { hash: 'mine', ext: '.png', depositedAt: 1, from: 'deposit', gen: 1, writer: 'aaaaaaaa' },
++          'mivo-asset:other': { hash: 'other', ext: '.png', depositedAt: 50, from: 'deposit', gen: 2, writer: 'ffffffff' },
++        },
+       }),
+     })
++    expect(savedResult.ok).toBe(true) // 前提断言:外部写者确实落盘到了 gen=2
+ 
+-    const result = await recordDeposit('mivo-asset:second', entry('second', 60, 'deposit'))
++    const result = await recordDeposit('mivo-asset:second', draft('second', 60, 'deposit'))
+ 
+     expect(result.ok).toBe(true)
+     expect(result.attempts).toBeGreaterThan(1) // 走过一次冲突重试
+     const map = peekDepositStoreForTests()?.map ?? {}
+     expect(map['mivo-asset:other']).toBeTruthy() // 对方的没被抹掉
+     expect(map['mivo-asset:second']).toBeTruthy() // 自己的也在
++    expect(map['mivo-asset:mine']).toBeTruthy() // 本实例更早的提交也在(已在磁盘上)
+   })
+ 
+   it('CAS 一直冲突 → 重试用尽后只丢缓存,不写错映射', async () => {

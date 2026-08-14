@@ -1,0 +1,986 @@
+diff --git a/README.md b/README.md
+index 1ade3087..4913daa3 100644
+--- a/README.md
++++ b/README.md
+@@ -32,3 +32,54 @@ bash cindyplugin/build.sh     # vite 构建 + 拷贝 ghost.json/main.js/icon/ski
+ - `dataUrlToBlob` 手工解码修复(PR #286):插件沙箱 CSP 拦 `fetch(data:)`,
+   没有它启动恢复会丢图;
+ - 工具坞点击式 popover(PR #285):非硬依赖,但面板交互体验一致性需要。
++
++## 已知限制(残余风险)
++
++- **`depositStore.ts` 的 `reason:'rejected'` 提交出口不回填 dirty 批次**:
++  `main.js` 的 `handleDepositStateSave` 拒绝提交(含本段新增的棘轮 `distrusted`
++  fail-closed 出口)时,面板侧 `enqueueCommit` 已经原子摘取过的脏键批次不会被
++  放回脏集,永久从脏集消失(只留 memory 内的值)。这是**既有行为**——`rejected`
++  出口在本段修复之前就已可达(超限/冲突已能触发它),不是本段新造;但本段新增
++  的 `distrusted` 拒绝出口与其它拒绝出口**同一形状**、下游走的是
++  `depositStore.ts` **同一条** `reason:'rejected'` 路径,使这条既有缺陷变得更
++  易触达,故由本段登记。本段**未修**这一处(修复需要改 `depositStore.ts`,超出
++  本段文件域),后果是配额孤儿累积:已经真实占用宿主配额的媒体,账本却永久不
++  知道该由谁认领。**段 A round 2 新增的 `rescued` 拒绝出口(C-1,救援读到内容但
++  无法证明是磁盘最高代)同样走这条 `reason:'rejected'` 路径**,因此每一次经救援
++  读判定后被拒的提交尝试都会照样丢一批脏键。取舍已明确权衡过三个选项:①(旧
++  行为)线性放行——提交"成功"、面板据此清空脏集,但文件永不进权威态,是**静默
++  丢失 + 假成功**;②(本段实际选择)直接拒绝——dirty 批次仍被下游丢弃,但**失败
++  是 fail-visible 的**,调用方知道没成功;③ 返回 `conflict:true` 让面板重放——
++  重放后再读取到的仍是同一个 `rescued` 态(清单还没恢复),**可能陷入活锁**,直到
++  清单恢复健康枚举才能跳出。②优于①(失败可见胜过假成功)、也优于③(无活锁
++  风险),故选②;dirty 批次丢失的后果与本条登记的既有缺陷同源,不重复展开。
++- **棘轮文件确已丢失(外部删除/双实例抢占)→ 本进程 deposit 拒读拒写,直到进程
++  重启(CA-P05-2)**:进程内棘轮(`depositRatchetGeneration` / `depositRatchetFileName`)
++  一旦推进就只增不减,若它记住的那个物理文件后续变为永久不可读或被外部删除,
++  `readDepositState` 的救援会恒失败,本进程此后对 deposit 账本的每一次读、写都
++  会 fail-closed 拒绝,唯一解锁手段是重启插件进程。前置条件是设计稿 §4.4.2 已
++  声明的边界(双 App 实例共享同一数据目录 / 人工篡改)。**本 PR 不在运行期自动
++  恢复,取舍理由**:自动恢复需要在 `readDepositState` 判定 distrusted 之后,派发
++  一个更高的 generation 号继续写——但 `fsReadResult` 没有 `absent` 档,这一刻
++  永远无法区分"文件真的没了(写更高代安全)"与"文件还在,只是这次读不到(双
++  实例场景下,另一实例的同名/更早文件其实仍然存活)";一旦真是后一种情形,
++  写更高代会让本实例的内容永久胜出、把另一实例仍存活的数据覆盖掉。owner
++  2026-08-03 拍板:宁可卡死(fail-closed,数据完好、重启即可恢复)也不盖数据
++  (fail-open 式自动恢复、静默覆盖)。
++- **`fsList` 静默变短且恰好只藏掉一个同代兄弟候选(`maxGen === 棘轮`)→ 该候选永久
++  不参与合并**:进程内棘轮只能堵住"清单变短到低于棘轮"(`maxGen < 棘轮`→ 直读棘轮
++  文件名救援),堵不住"清单只漏掉一个同代候选、棘轮本身仍等于最大代"这一半——此时
++  走单候选采用路径,被藏起来的那份 sibling 从未进入候选集合,SC11.1 的逐字段合并
++  吸收不到它,它随后代数变低,永不再被合并。**既有行为,非本 PR 引入**(base 版
++  同样只认单候选,已实测核对);**本仓无法修**(sibling 文件名含随机 writer 短码,
++  不知道名字就无法精确直读)。归因:`fsList` 不提供枚举完整性保证,与设计稿
++  §4.4.2 已登记的 lifecycle fencing 缺口同族,详见设计稿 §4.4.2「残余边界·其二」
++  与 §11 仍开项 G。
++- **进程内棘轮只是磁盘最大代的下界,不是上界**:一次写入若回执为 `indeterminate`
++  (宿主回包丢失/非法,但没有抛错——`fsWriteResult` 的第三档),`fsWrite` 会把它折
++  叠进 `false`,当前代码据此判定"本次提交未发生"而不推进棘轮。若那次写其实已经
++  落盘,棘轮不会跟着前进;若随后一次 `fsList` 恰好静默变短、仍显示旧 gen,棘轮的
++  探测条件(`maxGen < 棘轮`)不成立,fail-closed 不会触发,下一次提交会以同名文件
++  覆盖那份本可被下一次健康 list 读回的内容。**本 PR 不实现写路径三态 reconcile**
++  (机制本体已登记为后续段),这里只如实登记这一探测盲区,详见设计稿 §4.4.2「残余
++  边界·其三」。
+diff --git a/ghost.json b/ghost.json
+index cfc886b0..7cef516a 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.7",
++  "version": "0.9.8",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/main.js b/main.js
+index 70f83455..72a8a5ac 100644
+--- a/main.js
++++ b/main.js
+@@ -4398,6 +4398,95 @@ function mintDepositWriter() {
+ }
+ const DEPOSIT_WRITER = mintDepositWriter()
+ 
++/**
++ * 进程内棘轮(fail-closed 补丁,承接 `fsList` 头注释 :323-329 已经给队列子系统立过的
++ * 纪律——「绝不基于清单里没有做任何不可逆动作」,deposit 账本补上同一条,不另写
++ * 一套说法):只记「本进程自己上一次成功提交落在哪个 (generation, 文件名)」,纯
++ * 内存变量,不写盘、不进 `DepositState`——进程重启即丢,不是持久字段。
++ *
++ * 为什么这道棘轮能堵住 :323-325 说的「静默变短的清单」:目标文件名是
++ * `(generation, DEPOSIT_WRITER)` 的纯函数,而单写者+进程内串行下 `DEPOSIT_WRITER`
++ * 是进程生命周期常量——磁盘上**本进程已确认写成功过**的 generation 只可能前进,
++ * 不可能在同一个进程眼皮底下后退。`readDepositState` 若发现这一次的清单报告的
++ * maxGen 低于棘轮,**已知至少包括**两种可能:这次清单确实静默变短(:324-325 承认
++ * 的宿主子目录 readdir 抖动),或磁盘被人工/另一进程改动(§4.4.2 已知边界)——两种
++ * 情况都不该被当成「磁盘真的空了」直接采信为下一次提交的 CAS 基线,否则就是这次
++ * 修复要堵的那个洞:清单说谎 → CAS 判无冲突 → `fsWrite` 整份覆盖同名文件。
++ *
++ * C-3(段 A round 2,①席 CA-P05A-5)如实补充:上面「只可能前进」只对**本进程已经
++ * 确认成功**的那些代成立——`fsWriteResult`(声明处见 :250-262)明确建模了第三档
++ * `indeterminate`(不知道有没有落盘),`fsWrite` 把它折叠进 `false`,
++ * `handleDepositStateSave` 的 `if (!fileOk)` 据此判定「本次提交未发生」而不推进
++ * 棘轮(见该分支注释)。若那次 indeterminate 写其实已经落盘,棘轮就不会跟着前进
++ * ——**棘轮只是磁盘最大代的下界,不是上界**,「不可能后退」这句不能扩大到"棘轮
++ * 之上不存在别的已落盘代"。本段不实现该缺口的写路径三态 reconcile(登记为后续
++ * 段,见 PR body 延后表),这里只如实收窄措辞,不再暗示已穷尽全部可能。
++ */
++let depositRatchetGeneration = 0
++let depositRatchetFileName = ''
++
++/**
++ * 棘轮救援:直读棘轮记住的文件名,**必须**再过一遍 `depositValidateCandidate` 同一套
++ * 结构/完整性/语义校验才采信——棘轮只提供「该读哪个文件名」的线索,不代替对内容的
++ * 信任(万一那份内容本身也已损坏,读回来但校验不过,同样不采信)。
++ *
++ * 返回 tagged result,不折叠成单个 `null`(r2-deposit 二轮审 SUGGESTION 3):
++ *   { kind: 'none' }        棘轮还没记住任何文件名
++ *   { kind: 'unreadable' }  文件读不回来(IO / 不存在)
++ *   { kind: 'invalid', reason } 读到了,但校验不过(内容损坏)
++ *   { kind: 'valid', candidate } 读到且校验通过
++ * 折叠成 `null` 会让外层诊断把「内容损坏」误报成「读不回」,把排查引向 IO 方向。
++ */
++async function depositRescueRatchetCandidate() {
++  if (!depositRatchetFileName) return { kind: 'none' }
++  const text = await fsRead(DEPOSIT_DIR + depositRatchetFileName)
++  if (text === null) return { kind: 'unreadable' }
++  const candidate = depositValidateCandidate(depositRatchetFileName, text)
++  if (!candidate.valid) return { kind: 'invalid', reason: candidate.reason || '校验不通过' }
++  return { kind: 'valid', candidate }
++}
++
++/** 把 tagged 救援结果翻成一句诊断措辞——区分「读不回」与「读到了但内容损坏」。 */
++function depositRescueDiagPhrase(rescue) {
++  if (rescue.kind === 'none') return '棘轮尚未记住文件名'
++  if (rescue.kind === 'unreadable') return '棘轮文件 ' + depositRatchetFileName + ' 读不回来(IO/不存在)'
++  if (rescue.kind === 'invalid') return '棘轮文件 ' + depositRatchetFileName + ' 读到了但校验不过: ' + rescue.reason
++  return '未知救援结果'
++}
++
++/**
++ * 「采用单份候选为权威状态」的唯一入口(r2-deposit 二轮审 BLOCKER 2)。
++ *
++ * 被修的缺陷:棘轮救援路径此前直接 `{ ...rescued.payload }` 返回,而正常单候选路径
++ * (`readDepositState` 里 `validAtMax.length === 1` 那支)会再过一遍
++ * `depositEnforceMapPendingMutex`。两条路径语义不同构 → 救援回来的那份若同时含
++ * `map.live.hash=H` 与 `pendingReleases[H]`(字段/sum/gen/writer 全合法,是既有 A1
++ * 测试覆盖的可达跨面板 CAS 重放残态),面板就会同时看到「仍被 map 引用的 H」和
++ * 「待释放 H」,P1b 消费该 pending 条目时会 release 仍在使用的媒体 → 可见数据破坏。
++ *
++ * 根因一句话:**`depositValidateCandidate` 是候选**准入门**,不是完整的 read-state
++ * 归一化。** 准入通过 ≠ 内容内部自洽;跨字段互斥必须单独做,且两条路径必须共用同一
++ * 个入口,不能各写一遍。
++ *
++ * `rescued`(C-1,段 A round 2,②席 blocker P05A-CODEX-001):棘轮救援路径传 `true`。
++ * `depositValidateCandidate` 只证明「这份文件内容仍合法」,清单本身已不可信时没有
++ * 任何办法证明「它是磁盘当前最高代」——若据此放行下一次提交的 CAS 前进,提交会
++ * 派出一个可能低于磁盘真实最高代的 generation,永不被下一次健康枚举的读者采用,
++ * CAS 本身也抓不住(比对的是这份同样陈旧的 current)。`rescued: true` 只影响写侧
++ * (见 `handleDepositStateSave`),读侧仍返回真实内容——救援的价值本就是"避免把
++ * 空态当基线",不是"证明磁盘没有更新的代"。正常单候选采用路径(`validAtMax.length
++ * === 1`)不传该参数,清单本身是可信的,不受影响。
++ */
++function depositAdoptSingleCandidate(candidate, gen, corrupt, rescued = false) {
++  // 不修改候选对象本身,构造新对象(与原正常路径同一约定:payload.generation 与顶层
++  // generation 保持一致落盘,面板侧 parseDepositState 才不会表现出差异行为)。
++  const singlePayload = { ...candidate.payload, generation: gen }
++  depositEnforceMapPendingMutex(singlePayload)
++  const state = { payload: singlePayload, generation: gen, corrupt, missing: false, usedNames: [candidate.name] }
++  if (rescued) state.rescued = true
++  return state
++}
++
+ // ── 完整性信封:sum = hash128(canonical(payload))(设计稿 §4.4.2)──
+ //
+ // 与 `src/lib/canonicalHash.ts` 同语义纯 JS 实现(main.js 不过打包,import 不了它,
+@@ -5076,8 +5165,12 @@ function depositEnforceMapPendingMutex(payload) {
+   }
+   if (dropped > 0) {
+     diagFail(
++      // C-4(段 A round 2,①席 CA-P05A-7):此前写「合并后互斥检查」,但本函数的
++      // 调用面已从「同代合并 + 单候选采用」扩到「两条棘轮救援路径」——三条路径都
++      // 没有发生合并。「合并后」在本模块语义里是同代合并这一不可达态的强信号,继续
++      // 这样写会让日志读者误判故障等级。改成中性的「采用前」,覆盖全部调用场景。
+       DIAG_SOURCE.deposit,
+-      'deposit 合并后互斥检查: ' + dropped + ' 个 hash 同时出现在 map(仍被引用)与 pendingReleases 里,已按 live 优先剔除 pending 条目(A1)',
++      'deposit 采用前互斥检查: ' + dropped + ' 个 hash 同时出现在 map(仍被引用)与 pendingReleases 里,已按 live 优先剔除 pending 条目(A1)',
+     )
+   }
+   return dropped
+@@ -5096,12 +5189,102 @@ function depositEnforceMapPendingMutex(payload) {
+ async function readDepositState() {
+   const candidates = await depositReadAllCandidates()
+   if (candidates === null) {
+-    diagFail(DIAG_SOURCE.deposit, 'deposit 候选枚举失败(list 未知/截断),按未知处理,降级为缓存空')
+-    return { payload: null, generation: 0, corrupt: 0, missing: true, usedNames: [] }
++    // 🔴 r2-deposit 二轮审 BLOCKER 1:这里此前直接返回「可信空态」(generation:0、
++    // 不带 distrusted),而且**早于**下面的棘轮分支 —— 于是本次修复只覆盖了 list
++    // **静默变短**(ok:true 但条目少 → maxGen < 棘轮 → 走棘轮救援),漏掉了 list
++    // **明确报错**的四种形状(`fsList` 抛错 / 宿主回 ok:false / 缺 entries /
++    // truncated:true,全部折叠成 null)。难检测的那半修了,好检测的那半漏了。
++    //
++    // 漏掉的后果就是本修复要堵的洞本身:同进程内面板 A 已提交 gen1(棘轮=1),面板 B
++    // 仍持空盘基线;B 提交时 list 明确失败 → 拿到「可信空态」→ 空盘基线与伪造的
++    // gen0/empty sum 完全匹配 → CAS 判无冲突 → 同名 fsWrite 物理覆盖 A 的 gen1。
++    //
++    // 修法:与下方棘轮分支走**同一套** fail-closed 决策,而不是自己一条早退。
++    const rescue = depositRatchetGeneration > 0 ? await depositRescueRatchetCandidate() : { kind: 'none' }
++    if (rescue.kind === 'valid') {
++      // C-1(段 A round 2,②席 blocker P05A-CODEX-001)如实收窄措辞:直读校验通过
++      // 只证明"这份文件仍完好",不证明"它是磁盘当前最高代"(清单本身已不可信,
++      // 无法确认磁盘上是否存在更高代)。读操作仍可返回这份内容(见
++      // `handleDepositStateLoad`),但 `depositAdoptSingleCandidate` 会打上
++      // `rescued` 标记,`handleDepositStateSave` 据此拒绝在其上线性前进。
++      diagFail(
++        DIAG_SOURCE.deposit,
++        'deposit 候选枚举失败(list 抛错/被拒/缺 entries/被截断),但进程内棘轮记着 gen=' +
++          depositRatchetGeneration +
++          ' 的文件名 ' +
++          depositRatchetFileName +
++          '——已直读该文件,内容可读且校验通过,但这只证明文件本身完好,不证明它是磁盘' +
++          '当前最高代;读操作可返回这份内容,但基于它的提交将被拒绝,直到清单恢复健康' +
++          '枚举为止',
++      )
++      return depositAdoptSingleCandidate(rescue.candidate, rescue.candidate.gen, 0, true)
++    }
++    // C-2(段 A round 2,①席 CA-P05A-1)如实拆开两种情形,各自只说自己成立的事:
++    // 棘轮=0 时上面的三元短路使 depositRescueRatchetCandidate 从未被调用,没有
++    // 「本进程记录」可言、也不存在棘轮文件,真实解除条件只是"清单恢复",不需要
++    // 重启;棘轮>0 且救援失败时才谈得上"棘轮文件"与"文件确已丢失则需重启"。
++    if (depositRatchetGeneration > 0) {
++      diagFail(
++        DIAG_SOURCE.deposit,
++        'deposit 候选枚举失败(list 抛错/被拒/缺 entries/被截断),且棘轮救援未成功(' +
++          depositRescueDiagPhrase(rescue) +
++          ')——fail-closed,按不可信处理拒绝在这份清单上线性前进(这不是仅此一次,' +
++          '持续到清单恢复或棘轮文件重新可读为止;若棘轮文件确已丢失,则直到进程重启)',
++      )
++      return { payload: null, generation: 0, corrupt: 0, missing: true, usedNames: [], distrusted: true }
++    }
++    diagFail(
++      DIAG_SOURCE.deposit,
++      'deposit 候选枚举失败(list 抛错/被拒/缺 entries/被截断),本进程尚无棘轮基线,' +
++        '无法核实清单完整性——fail-closed,按不可信处理拒绝在这份清单上线性前进' +
++        '(这不是仅此一次,持续到清单恢复为止)',
++    )
++    return {
++      payload: null,
++      generation: 0,
++      corrupt: 0,
++      missing: true,
++      usedNames: [],
++      distrusted: true,
++      distrustReason: 'no-baseline',
++    }
+   }
+   const corrupt = candidates.filter((candidate) => !candidate.valid).length
+   let maxGen = -1
+   for (const candidate of candidates) if (candidate.valid && candidate.gen > maxGen) maxGen = candidate.gen
++
++  // fail-closed 棘轮(声明处 `depositRatchetGeneration` 有完整说明):本进程自己
++  // 成功提交过的 generation 只可能前进,这次清单却报出一个更低的 maxGen —— 只可能
++  // 是清单静默变短,或磁盘被外部改动(§4.4.2 已知边界),两者都不能当成"磁盘真的
++  // 退步了"直接采信为下一次提交的 CAS 基线。
++  if (depositRatchetGeneration > 0 && maxGen < depositRatchetGeneration) {
++    const rescue = await depositRescueRatchetCandidate()
++    if (rescue.kind === 'valid') {
++      // C-1(同上,②席 blocker P05A-CODEX-001):同样只证明"文件仍完好",不证明
++      // "它是磁盘最高代"——`rescued: true` 交给 `handleDepositStateSave` 拒绝提交。
++      diagFail(
++        DIAG_SOURCE.deposit,
++        'deposit 候选清单与进程内棘轮不符(清单报 maxGen=' + maxGen + ', 棘轮=' + depositRatchetGeneration +
++          ')——已直读棘轮文件名 ' + depositRatchetFileName + ' 确认清单静默变短,内容可读且校验通过,但同样' +
++          '不能证明它是磁盘当前最高代;读操作可返回这份内容,但基于它的提交将被拒绝,直到清单恢复健康枚举为止',
++      )
++      // 走与正常单候选路径**同一个**采用入口(BLOCKER 2):必须补 map/pendingReleases
++      // 互斥修复,不能直接 spread 候选 payload。
++      return depositAdoptSingleCandidate(rescue.candidate, rescue.candidate.gen, corrupt, true)
++    }
++    diagFail(
++      DIAG_SOURCE.deposit,
++      'deposit 候选清单与进程内棘轮不符(清单报 maxGen=' + maxGen + ', 棘轮=' + depositRatchetGeneration +
++        ')且棘轮救援未成功(' + depositRescueDiagPhrase(rescue) +
++        // CA-P05-2(同上,lead round 2 措辞裁决):这不是"本次"读取独有的拒绝,会在
++        // 每一次读取上重复出现,直到清单恢复或棘轮文件重新可读为止;文件确已丢失
++        // 则要等进程重启。
++        ')——fail-closed,按不可信处理拒绝在这份清单上线性前进(这不是仅此一次,' +
++        '持续到清单恢复或棘轮文件重新可读为止;若棘轮文件确已丢失,则直到进程重启)',
++    )
++    return { payload: null, generation: 0, corrupt, missing: true, usedNames: [], distrusted: true }
++  }
++
+   if (maxGen < 0) {
+     if (corrupt) diagFail(DIAG_SOURCE.deposit, 'deposit 候选文件全部无效(' + corrupt + ' 个),降级为缓存空')
+     return { payload: null, generation: 0, corrupt, missing: candidates.length === 0, usedNames: [] }
+@@ -5111,14 +5294,12 @@ async function readDepositState() {
+     .filter((candidate) => candidate.valid && candidate.gen === maxGen)
+     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+   if (validAtMax.length === 1) {
+-    // payload.generation 与顶层 generation 保持一致落盘(不修改候选对象本身,构造新对象),
+-    // 面板侧 parseDepositState 才不会在"读到的是不是权威内容"上表现出差异行为。
+-    const singlePayload = { ...validAtMax[0].payload, generation: maxGen }
+-    // 仍过一遍 map/pendingReleases 互斥检查——这份候选本身可能是一个跨面板 CAS
+-    // 重放留下的、有缺陷的内容,不能假设"只有一份候选"就等于"它内部自洽"
+-    // (与写者数无关,见 `depositEnforceMapPendingMutex` 头注释)。
+-    depositEnforceMapPendingMutex(singlePayload)
+-    return { payload: singlePayload, generation: maxGen, corrupt, missing: false, usedNames: [validAtMax[0].name] }
++    // 采用单候选为权威状态 —— 与棘轮救援路径共用 `depositAdoptSingleCandidate`(它内部
++    // 负责补 generation 并过一遍 map/pendingReleases 互斥检查)。两条路径**必须**共用
++    // 同一个入口:这份候选本身可能是跨面板 CAS 重放留下的、有缺陷的内容,不能假设
++    // "只有一份候选"就等于"它内部自洽"(与写者数无关,见 `depositEnforceMapPendingMutex`
++    // 头注释)。此前救援路径自己 spread 了一遍、漏掉互斥修复,即 r2-deposit BLOCKER 2。
++    return depositAdoptSingleCandidate(validAtMax[0], maxGen, corrupt)
+   }
+   diagFail(
+     DIAG_SOURCE.deposit,
+@@ -5170,6 +5351,33 @@ async function depositRetireOldGenerations(newGeneration) {
+ 
+ async function handleDepositStateLoad() {
+   const state = await readDepositState()
++  if (state.distrusted) {
++    // fail-closed 棘轮命中且救援失败(`readDepositState` 已经 diagFail 留痕):
++    // 绝不能把这次「读不出真相」包装成 `ok:true, state:null`——那会被面板当成
++    // "确认过、磁盘真的是空的",据此发起的下一次提交又会撞回同一个洞。如实拒绝,
++    // 面板侧 `load()` 的既有失败分支(`memory=emptyState(); baseRevisionSum=null`)
++    // 会强制下一次提交走 conflict,不会把这次的不确定性误当成确定的空。
++    // CA-P05-2(lead round 2 措辞裁决):如实标注持续性——不是这一次读取独有的
++    // 偶发拒绝,会在每一次读取上重复出现,直到清单恢复或棘轮文件重新可读为止;
++    // 若棘轮文件确已丢失,则要等到进程重启才会清空棘轮记忆。
++    // C-2(段 A round 2,①席 CA-P05A-1):`distrustReason==='no-baseline'` 是
++    // `readDepositState` 标注的「棘轮=0」情形——没有「本进程记录」可言,也不存在
++    // 棘轮文件,不套用上面那句需要重启的措辞。
++    if (state.distrustReason === 'no-baseline') {
++      return {
++        ok: false,
++        message:
++          'deposit 状态读取被拒: 本进程尚无棘轮基线,候选清单枚举失败,无法核实内容完整性,按不可信处理' +
++          '(这不是单次状态,持续到清单恢复为止)',
++      }
++    }
++    return {
++      ok: false,
++      message:
++        'deposit 状态读取被拒: 候选清单与本进程记录不符且直读确认失败,按不可信处理' +
++        '(这不是单次状态,持续到清单恢复或棘轮文件重新可读为止;若棘轮文件确已丢失,则直到进程重启)',
++    }
++  }
+   if (state.payload === null) {
+     // N3 三审如实修订:全部候选无效/不存在,只保证"不编造错误数据"——面板拿到的
+     // 是诚实的空,不是错的答案。但这不等于"不产生错数据/缓存不是账本"的无成本
+@@ -5224,6 +5432,52 @@ async function handleDepositStateSave(msg) {
+   // 缺失(旧格式请求 / 测试直调未传)按不匹配处理,不当作"数值凑巧相等就默认
+   // 放行"——fail 到 conflict 保守侧。
+   const current = await readDepositState()
++  if (current.distrusted) {
++    // CA-P05-2 复审裁决(lead,round 2,否决写盘式恢复):`fsReadResult` 头注释
++    // (声明处见 :290 上方)刻意没有 `absent` 档——「谁都不许拿这次读去证明『正文
++    // 已经没了』」,而"棘轮自锁可以恢复"的前提恰恰是"确认棘轮文件真的丢了所以可以
++    // 弃用它",正是该文档禁止的推论。更根本的是:`current` 此刻是
++    // `{payload:null, generation:0}` 破产态,任何基于它构造的信封写到磁盘最高
++    // generation 上,都等于用一份可能不完整的载荷把磁盘上真实存在但暂时读不到的
++    // 内容永久盖住——这正是本 PR 全部机制要防的事故本体。「卡住但数据完好、重启
++    // 即可恢复」优于「能继续写但静默毁数据」,fail-closed 原语义保留,不加恢复。
++    // C-2(段 A round 2,①席 CA-P05A-1):`distrustReason==='no-baseline'` 时不
++    // 套用需要重启的措辞,理由与 `handleDepositStateLoad` 同一分支同步。
++    if (current.distrustReason === 'no-baseline') {
++      return {
++        ok: false,
++        message:
++          'deposit 状态提交中止: 本进程尚无棘轮基线,候选清单枚举失败,无法核实内容完整性,拒绝覆盖' +
++          '(这不是单次状态,持续到清单恢复为止)',
++      }
++    }
++    return {
++      ok: false,
++      message:
++        'deposit 状态提交中止: 候选清单与本进程记录不符且直读确认失败,按不可信处理,拒绝覆盖' +
++        '(这不是单次状态,会持续到清单恢复或棘轮文件重新可读为止;若棘轮文件确已丢失,则直到进程重启)',
++    }
++  }
++  if (current.rescued) {
++    // C-1(段 A round 2,②席 blocker P05A-CODEX-001):`current` 来自棘轮直读救援
++    // (见 `readDepositState`/`depositAdoptSingleCandidate`)——救援证明的是"这份
++    // 文件仍可读、内容仍合法",不是"它是磁盘当前最高代"。清单本身已不可信,没有
++    // 办法证明磁盘上不存在更高代(例如已死亡电子脑的悬挂写落盘,SC11.6 明确这是
++    // 受支持的非篡改场景)。若仍放行 CAS 前进,提交会派出一个可能低于磁盘真实最高
++    // 代的 generation,永不被下一次健康枚举的读者采用,而 CAS 本身抓不住(比对的
++    // 是这份同样陈旧的 current)。读操作(`handleDepositStateLoad`)仍返回这份真实
++    // 内容,但这里必须拒绝在其上线性前进——不需要重启进程,下一次调用若清单恢复
++    // 健康枚举,`current.rescued` 不会再被设置,自动解除。
++    diagFail(
++      DIAG_SOURCE.deposit,
++      'deposit 状态提交中止: 当前基线来自棘轮直读救援,内容可读但清单本身不可信,无法证明这是磁盘' +
++        '最高代,拒绝在其上线性前进(不需要重启,下一次清单恢复健康枚举后自动解除)',
++    )
++    return {
++      ok: false,
++      message: 'deposit 状态提交中止: 救援读到的内容无法证明是磁盘最高代,拒绝提交(清单恢复健康枚举后自动解除)',
++    }
++  }
+   // A5(四审追加——judge-b CASE5/CASE6):generation 参与 `+1` 递增运算,必须是安全
+   // 整数——`depositValidateCandidate` 已经在候选校验这一步挡住了不安全的 gen,
+   // 这里是防御性复核,理论上不该再触发(除非"缓存空"这个特殊分支的 0 出了岔子,
+@@ -5304,17 +5558,29 @@ async function handleDepositStateSave(msg) {
+   }
+   const fileOk = await fsWrite(DEPOSIT_DIR + fileName, envelopeText)
+   if (!fileOk) {
+-    // 写文件失败 = 本次提交未发生,上一代(仍是磁盘上 generation 最大的有效候选)完好。
++    // `fileOk===false` 覆盖两种不同的底层回执(见 `fsWriteResult`/`fsWrite` 声明处
++    // :250-273):宿主明确拒绝(`rejected`,确定没落盘)与不抛错的 `indeterminate`
++    // (回包非法但没抛错,**不知道有没有落盘**)——`fsWrite` 把后者也折叠进 `false`。
++    // C-3(段 A round 2,①席 CA-P05A-5)如实收窄:本分支只能确定"面板视角里这次
++    // 提交没有被确认成功",**不能**确定"磁盘上一代真的还完好、这次写真的什么都
++    // 没发生"——若底层其实是 indeterminate 且恰好已经落盘,棘轮不会推进(见声明处
++    // 补充),那份内容会变成一个此后 `maxGen === 棘轮` 时探测不到的同代幽灵。本段
++    // 不实现该缺口的三态 reconcile(登记为后续段),这里只如实标注不确定性,不再
++    // 断言"上一代完好"这个在 indeterminate 分支下无法保证的结论。
+     // N3 如实表述:这不是笼统的"只丢缓存"——本次载荷若含新增/换指纹产生的
+-    // from:'deposit' 条目,它背后是一份已经真实占了宿主配额的指纹,提交未发生 =
++    // from:'deposit' 条目,它背后是一份已经真实占了宿主配额的指纹,提交未确认成功 =
+     // 本地不再知道这份配额该由谁认领 = 配额孤儿风险(设计稿 §4.10.4;P1a 尚未接线
+     // 自动补偿,消费在 P1b)。只有 migration/capability/artifact/ledger 条目丢了才
+     // 是纯缓存损失,下次重算即可。
+-    diagFail(DIAG_SOURCE.deposit, 'deposit 状态提交失败: 文件写入失败 gen=' + generation)
++    diagFail(DIAG_SOURCE.deposit, 'deposit 状态提交失败: 文件写入未被确认成功 gen=' + generation)
+     return { ok: false, message: 'deposit 状态文件写入失败' }
+   }
+ 
+   diagOk(DIAG_SOURCE.deposit, 'deposit 状态已提交: gen=' + generation + ' writer=' + DEPOSIT_WRITER)
++  // 棘轮前进(声明处 `depositRatchetGeneration` 有完整说明):只在这一刻更新——
++  // 这是本进程唯一"确认刚刚真的写成功了什么"的时刻,不能提前或延后到别处推断。
++  depositRatchetGeneration = generation
++  depositRatchetFileName = fileName
+   await depositRetireOldGenerations(generation) // 非阻塞:退休失败不影响本次提交结果
+   // F1:此刻磁盘上 gen=`generation` 只有这一份候选(单写者+进程内串行下不可能有
+   // 别的候选与它同代),"当前已合并内容"就是它自己——对应的 sum 已经是完整性哈希,
+diff --git a/src/__tests__/depositBrain.test.ts b/src/__tests__/depositBrain.test.ts
+index f8a2d810..a230ff49 100644
+--- a/src/__tests__/depositBrain.test.ts
++++ b/src/__tests__/depositBrain.test.ts
+@@ -595,6 +595,549 @@ describe('deposit 状态 — generation CAS', () => {
+   })
+ })
+ 
++// P1(动机来自代码审查,不是真机实测——CA-P05-4 复核:main.js 的 diagSkip 文案与
++// depositFlagOff.test.ts 均确认 DEPOSIT_ENABLED 全程为 false,`canvas_edit_image`
++// 走的是 cindyGenerationPort,该常量为 false 时它不会调用本模块任何一步(见
++// depositPort.ts 头注释),故这个场景不可能来自生产真机复现;此前的"真机
++// 2026-08-02 owner 连续两次 canvas_edit_image 实测"表述缺乏依据,已删除,不再
++// 用它给本夹具背书):main.js 自己在 `fsList` 定义处(:309-334)承认宿主 list
++// 可能"静默变短"(子目录 readdir 失败 catch{continue},回执仍 ok:true 且不带
++// truncated)。修复前
++// `readDepositState`/`handleDepositStateSave` 对 deposit 账本没有落实那条既有纪律
++// ("绝不基于清单里没有做任何不可逆动作",:327-329),一次静默变短的清单会让 CAS
++// 基线误判"磁盘仍空",两次提交都报 ok:true、从无 conflict,后一次 fsWrite 整份覆盖
++// 前一次的文件(目标文件名是 (generation, DEPOSIT_WRITER) 的纯函数,writer 是进程
++// 生命周期常量)。修复:进程内棘轮(depositRatchetGeneration/depositRatchetFileName,
++// main.js DEPOSIT_WRITER 声明处之后)——清单报告的 maxGen 低于棘轮时,先直读棘轮
++// 记住的文件名核实;读得回来就是清单说谎、以读回内容为准并 diagFail;读不回来就
++// fail-closed,拒绝本次读取/提交,不覆盖任何东西。
++describe('deposit 状态 — fsList 静默变短的 fail-closed 棘轮补丁(P1 修复)', () => {
++  /** 第 2 次 list 调用起,回一份静默变短的清单(ok:true、空 entries、无 truncated)。 */
++  const listReplyGoesEmptyFromSecondCall = (
++    _request: Parameters<NonNullable<LoadBrainOptions['listReply']>>[0],
++    names: string[],
++    listCalls: { count: number },
++  ) => {
++    listCalls.count += 1
++    if (listCalls.count >= 2) return { ok: true, op: 'list', entries: [] }
++    return { ok: true, op: 'list', entries: names.map((path) => ({ path, bytes: 1, mtime: 1 })) }
++  }
++
++  it('第二次提交时 list 静默漏掉刚落盘的候选 → 棘轮直读救回真实内容但无法证明是磁盘最高代,提交被拒(不覆盖、不返回 conflict 供线性重试),第一次提交的文件原样保留(主判据,修复前是红的)', async () => {
++    const listCalls = { count: 0 }
++    const { brain } = depositBrain({
++      listReply: (request, names) => listReplyGoesEmptyFromSecondCall(request, names, listCalls),
++    })
++    const deposit = brain.handles.deposit
++
++    const first = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:first': { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'artifact' } },
++      }),
++    })
++    expect(first).toMatchObject({ ok: true, generation: 1 })
++
++    // 第二次提交(模拟同一 fixture 下连续两次寄存提交,不对应任何真机复现):这次
++    // 的 CAS 基线同样声称"磁盘是空的"——r2-deposit 一轮修复后棘轮会拦下来判成
++    // conflict,供面板重放重试;但 C-1(段 A round 2,②席 blocker P05A-CODEX-001)
++    // 指出即使重放重试成功,写出的 generation 依然无法证明是磁盘最高代——救援只能
++    // 证明"这份文件仍完好",不能证明"磁盘没有更高代"(例如死亡电子脑的悬挂写)。
++    // 本轮起,只要 `current` 来自棘轮救援,提交就必须被直接拒绝(不再返回 conflict
++    // 供线性重试),直到清单恢复健康枚举为止(见下一个用例的"对称测试")。
++    const second = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:second': { hash: 'b'.repeat(32), ext: '.png', depositedAt: 2, from: 'artifact' } },
++      }),
++    })
++
++    expect(second.ok).toBe(false)
++    expect(second.conflict).toBeUndefined()
++
++    const writer = deposit.writer
++    // 提交被拒不落盘:磁盘上仍然只有第一次提交的那份候选状态文件,没有被覆盖,也
++    // 没有新的候选状态文件出现。
++    expect(brain.files.size).toBe(1)
++    expect(brain.files.has(`deposit/state-00000001-${writer}.json`)).toBe(true)
++
++    // ①(C-1 验收):读侧仍必须拿得到真实内容,不是伪造的空态。
++    const loaded = await deposit.stateLoad()
++    expect(loaded.ok).toBe(true)
++    const finalMap = JSON.parse(String(loaded.state)).map
++    // 主判据:第一次提交的条目必须还在——这条断言在修复前是红的(条目会被覆盖丢失)。
++    expect(finalMap['mivo-asset:first']).toBeTruthy()
++  })
++
++  it('对称测试:清单静默变短但棘轮直读能读回真实内容(清单说谎、文件本身还在)→ 提交先被拒(C-1,不返回 conflict 供线性重试),清单恢复健康枚举后同一进程免重启即可正常提交,两条记账都在,且 diagFail 留痕说清"清单与棘轮不符/静默变短"', async () => {
++    const listCalls = { count: 0 }
++    const { brain } = depositBrain({
++      listReply: (_request, names) => {
++        listCalls.count += 1
++        // 第 2、3 次静默变短(依次对应下面的 blocked save 与 loaded load);第 4 次
++        // 起清单恢复健康——模拟"清单短暂抖动、随后自愈",验证 C-1 的③号验收:不
++        // 需要重启进程,下一次健康枚举就能自动解除。
++        if (listCalls.count === 2 || listCalls.count === 3) return { ok: true, op: 'list', entries: [] }
++        return { ok: true, op: 'list', entries: names.map((path) => ({ path, bytes: 1, mtime: 1 })) }
++      },
++    })
++    const deposit = brain.handles.deposit
++
++    const first = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:first': { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'artifact' } },
++      }),
++    })
++    expect(first).toMatchObject({ ok: true, generation: 1 })
++
++    // C-1:即使棘轮救援读回的内容字面上与磁盘一致,清单本身不可信时也不能证明它
++    // 是磁盘最高代——提交必须被拒绝,不返回 conflict 供线性重试。
++    const blocked = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:second': { hash: 'b'.repeat(32), ext: '.png', depositedAt: 2, from: 'artifact' } },
++      }),
++    })
++    expect(blocked.ok).toBe(false)
++    expect(blocked.conflict).toBeUndefined()
++    expect(brain.files.size).toBe(1)
++
++    // ①读侧仍返回真实内容(这次 list 同样静默变短,救援再次成功)。
++    const loaded = await deposit.stateLoad()
++    expect(loaded.ok).toBe(true)
++    expect(loaded.generation).toBe(1)
++    const rescuedMap = JSON.parse(String(loaded.state)).map
++    expect(rescuedMap['mivo-asset:first']).toBeTruthy()
++
++    // ③清单恢复健康枚举后(第 4 次 list 调用起),同一进程不需要重启即可正常提交——
++    // 用刚才读到的真实基线重放本实例未提交的变更后重试(§4.10.6.1 仲裁轴第一级,
++    // depositStore.ts applyLocalOverlay 同一条既有链路)。
++    const retried = await deposit.stateSave({
++      baseGeneration: loaded.generation,
++      baseSum: loaded.revisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: {
++          ...rescuedMap,
++          'mivo-asset:second': { hash: 'b'.repeat(32), ext: '.png', depositedAt: 2, from: 'artifact' },
++        },
++      }),
++    })
++    expect(retried).toMatchObject({ ok: true, generation: 2 })
++
++    const finalLoaded = await deposit.stateLoad()
++    const finalMap = JSON.parse(String(finalLoaded.state)).map
++    expect(finalMap['mivo-asset:first']).toBeTruthy()
++    expect(finalMap['mivo-asset:second']).toBeTruthy()
++
++    const { spy, stop } = attachPanelBridge(brain)
++    await flushMicrotasks()
++    stop()
++    expect(spy.find('候选清单与进程内棘轮不符').length).toBeGreaterThan(0)
++    expect(spy.find('静默变短').length).toBeGreaterThan(0)
++  })
++
++  // lead 复审追加(C-1 ③号验收单独测):上面"对称测试"把自动解除跟对账/重放揉在
++  // 一起断言,容易让人误以为断言绑定的是重放逻辑而不是"rescued 不粘滞"这件事本身。
++  // 本例只隔离这一件事:救援触发拒绝之后,不重启进程,清单一旦恢复健康枚举,
++  // 下一次提交必须能正常成功——`rescued` 是 `readDepositState` 每次现算的返回值
++  // 字段,不是模块级持久状态;若未来有人把它误改成粘滞标记(拒绝一次后不再清零),
++  // 这条断言必须转红。用 entry A(candidates===null)覆盖,与"对称测试"的 entry B
++  // 分开,凑齐两个入口各自的自动解除验证。
++  it('救援触发的拒绝不是粘滞状态:清单恢复健康枚举后,同一进程内下一次提交无需重启即可正常成功(C-1 ③号验收)', async () => {
++    const listCalls = { count: 0 }
++    const { brain } = depositBrain({
++      listReply: (_request, names) => {
++        listCalls.count += 1
++        // 只让第 2 次(entry A)报错一次;第 3 次起清单恢复健康。
++        if (listCalls.count === 2) throw new Error('host list exploded once')
++        return { ok: true, op: 'list', entries: names.map((path) => ({ path, bytes: 1, mtime: 1 })) }
++      },
++    })
++    const deposit = brain.handles.deposit
++    const payload = {
++      version: 1,
++      map: {
++        'mivo-asset:first': { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'artifact' },
++        'mivo-asset:second': { hash: 'b'.repeat(32), ext: '.png', depositedAt: 2, from: 'artifact' },
++      },
++    }
++
++    const first = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:first': { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'artifact' } },
++      }),
++    })
++    expect(first).toMatchObject({ ok: true, generation: 1 })
++
++    // 第 2 次 list 报错(entry A,棘轮记住的文件仍可读,救援成功但清单不可信)→
++    // 提交必须被拒绝,不管请求携带的 baseGeneration/baseSum 是什么(C-1 的拒绝先
++    // 于 CAS 比对发生)。
++    const blocked = await deposit.stateSave({
++      baseGeneration: 1,
++      baseSum: first.revisionSum,
++      state: JSON.stringify(payload),
++    })
++    expect(blocked.ok).toBe(false)
++    expect(blocked.conflict).toBeUndefined()
++
++    // 关键断言:不重启进程,第 3 次调用(清单已恢复健康)必须能正常成功——如果
++    // `rescued` 被误做成粘滞状态,这次提交会继续被拒绝,本断言会转红。
++    const recovered = await deposit.stateSave({
++      baseGeneration: 1,
++      baseSum: first.revisionSum,
++      state: JSON.stringify(payload),
++    })
++    expect(recovered).toMatchObject({ ok: true, generation: 2 })
++  })
++
++  it('清单静默变短且棘轮记住的文件本身也已经不在(fsRead 落空)→ fail-closed:save 与 load 都拒绝,不产生任何新文件', async () => {
++    const listCalls = { count: 0 }
++    const { brain } = depositBrain({
++      listReply: (request, names) => listReplyGoesEmptyFromSecondCall(request, names, listCalls),
++    })
++    const deposit = brain.handles.deposit
++
++    const first = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:first': { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'artifact' } },
++      }),
++    })
++    expect(first).toMatchObject({ ok: true, generation: 1 })
++
++    // 棘轮记住的文件本身也已经不在了(比如被误删、或宿主字节真的丢了)——不能靠
++    // "读得到"来豁免 fail-closed,这条正是"读不回来"那一半分支。
++    brain.files.delete(`deposit/state-00000001-${deposit.writer}.json`)
++
++    const second = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:second': { hash: 'b'.repeat(32), ext: '.png', depositedAt: 2, from: 'artifact' } },
++      }),
++    })
++    expect(second.ok).toBe(false)
++    expect(second.conflict).toBeUndefined()
++    // fail-closed,不是"退回一份空态照常写"——没有任何新的候选状态文件被写出。
++    // CA-P05-2 复审裁决(lead,round 2):写盘式恢复被否决——distrusted 时 `current`
++    // 是 `{payload:null, generation:0}` 破产态,在其上构造信封写到磁盘最高代等于
++    // 把真实内容永久埋掉,正是本 PR 要防的事故;`fsReadResult` 没有 `absent` 档,
++    // 也不允许拿"棘轮文件读不回来"去证明"内容真的没了"。fail-closed 原语义保留。
++    expect(brain.files.size).toBe(0)
++
++    const loadResult = await deposit.stateLoad()
++    expect(loadResult.ok).toBe(false)
++
++    const { spy, stop } = attachPanelBridge(brain)
++    await flushMicrotasks()
++    stop()
++    // 诊断措辞按 r2-deposit 二轮审 SUGGESTION 3 收紧:救援结果改成 tagged result,
++    // 「读不回(IO/不存在)」与「读到了但校验不过(内容损坏)」不再折叠成同一句
++    // 「也读不回」——后者会把排查引向 IO 方向。本用例的场景是 fsRead 落空,所以
++    // 必须命中前者,**且不得**出现后者的措辞(否则区分只是写在注释里,没真生效)。
++    expect(spy.find('读不回来(IO/不存在)').length).toBeGreaterThan(0)
++    expect(spy.find('校验不过').length).toBe(0)
++    // CA-P05-2 措辞纪律(round 2 收窄后的三件之一):不得再用"本次"这种一次性框架
++    // 描述这个会在每一次读取上重复出现的持续状态;且要如实区分两种持续性——
++    // 「清单恢复/棘轮文件重新可读」可以不重启就解除,「文件确已丢失」则只有
++    // 重启能解除,不能把两者混说成同一件事。
++    expect(spy.find('本次读取/提交').length).toBe(0)
++    expect(spy.find('持续到清单恢复或棘轮文件重新可读为止').length).toBeGreaterThan(0)
++    expect(spy.find('若棘轮文件确已丢失,则直到进程重启').length).toBeGreaterThan(0)
++  })
++})
++
++// ── r2-deposit 二轮对抗审查 BLOCKER 1 / BLOCKER 2 返修 ─────────────────────────
++//
++// BLOCKER 1:上一版修复只覆盖 list **静默变短**(ok:true 但条目少 → maxGen < 棘轮 →
++// 走棘轮救援),漏掉了 list **明确报错**的四种形状 —— 它们在 `fsList` 里全部折叠成
++// `null`,而 `readDepositState` 对 `candidates === null` 有一条**早于棘轮分支**的旧
++// 出口,返回「可信空态」且不带 `distrusted`。于是难检测的那半修了、好检测的那半漏了,
++// 原缺陷(同名 fsWrite 物理覆盖)原样可发生。
++//
++// 覆盖矩阵(`fsList` 能返回 null 的全部形状,逐格覆盖,不留空白):
++//   ① cindy.fs 抛错                → catch → null
++//   ② 回包 ok !== true(宿主拒绝)   → null
++//   ③ 回包缺 entries 数组           → null
++//   ④ 回包 truncated === true       → null
++// 「静默变短(ok:true + 空 entries + 无 truncated)」不在此表 —— 它不返回 null,由上面
++// 那个 describe 覆盖。
++describe('deposit 状态 — list 明确报错的四种形状同样 fail-closed(r2-deposit BLOCKER 1)', () => {
++  const SHAPES: Array<[string, (names: string[]) => unknown]> = [
++    ['① cindy.fs 抛错', () => { throw new Error('host list exploded') }],
++    ['② 宿主拒绝(ok:false)', () => ({ ok: false, op: 'list' })],
++    ['③ 回包缺 entries 数组', () => ({ ok: true, op: 'list' })],
++    ['④ 回包 truncated:true', (names) => ({ ok: true, op: 'list', truncated: true, entries: names.map((path) => ({ path, bytes: 1, mtime: 1 })) })],
++  ]
++
++  it.each(SHAPES)(
++    '%s:第一次提交成功后,第二次 stale save 必须失败且 gen1 文件原样保留;load 不得回可信空态',
++    async (_label, badReply) => {
++      const listCalls = { count: 0 }
++      const { brain } = depositBrain({
++        listReply: (_request, names) => {
++          listCalls.count += 1
++          // 第一次 list 正常(让首次提交能成功、把棘轮推到 gen1);第二次起按形状报错。
++          if (listCalls.count >= 2) return badReply(names) as never
++          return { ok: true, op: 'list', entries: names.map((path) => ({ path, bytes: 1, mtime: 1 })) }
++        },
++      })
++      const deposit = brain.handles.deposit
++
++      const first = await deposit.stateSave({
++        baseGeneration: 0,
++        baseSum: deposit.emptyRevisionSum,
++        state: JSON.stringify({
++          version: 1,
++          map: { 'mivo-asset:first': { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'artifact' } },
++        }),
++      })
++      expect(first).toMatchObject({ ok: true, generation: 1 })
++      const writer = deposit.writer
++      const gen1Name = `deposit/state-00000001-${writer}.json`
++      const gen1Bytes = brain.files.get(gen1Name)
++      expect(gen1Bytes).toBeTruthy()
++
++      // 第二次提交仍持空盘基线 —— 修复前这里会被判「无冲突」并同名覆盖 gen1。
++      const second = await deposit.stateSave({
++        baseGeneration: 0,
++        baseSum: deposit.emptyRevisionSum,
++        state: JSON.stringify({
++          version: 1,
++          map: { 'mivo-asset:second': { hash: 'b'.repeat(32), ext: '.png', depositedAt: 2, from: 'artifact' } },
++        }),
++      })
++
++      expect(second.ok).toBe(false)
++      // 关键:gen1 的文件必须**逐字节**原样保留(不只是"文件还在"——被覆盖后文件也还在)。
++      expect(brain.files.get(gen1Name)).toBe(gen1Bytes)
++      expect(brain.files.size).toBe(1)
++
++      // load 侧的判据是「绝不能把不完整清单包装成**可信的空**」。本 fixture 只改
++      // listReply,从不让 fsRead 落空,棘轮文件在上面的首次提交里刚写成功,一直在
++      // brain.files 里——所以救援恒成功,`loaded.ok` 恒为 true,不存在救援失败的
++      // 分支(C-8,段 A round 2,U3-P05A-2/CA-P05A-4 修订变异证据:①席原注释把变异
++      // 对象误写成"下面这条断言换成 throw"——那条断言换成 throw 必然全红,不可能
++      // 0 红。真正能支撑"本夹具从不进救援失败出口"这句结论的变异对象是 main.js 该
++      // 出口自己(去掉 :~5230 返回值里的 `distrusted: true`,即 M2):在本树复跑,
++      // 全文件 72 例中仅 CA-P05-1 describe 内「rescue 失败」那一例转红(隔离变异恰
++      // 好 1 红,与 lead 复审后新增的自动解除测试无关——该测试从不触发这条 else
++      // 出口),本 SHAPES 夹具 4 例与其余全部用例保持绿——证明该出口确实从不被
++      // 本夹具触达,而是由 CA-P05-1 的独立测试单独覆盖)。load **必须**返回真实的
++      // gen1 内容,不能是伪造的空态(那正是覆盖事故的前一步:面板据此把空盘当权威
++      // 基线再提交)。
++      const loaded = await deposit.stateLoad()
++      expect(loaded.ok).toBe(true)
++      const payload = JSON.parse(String(loaded.state))
++      expect(payload.map['mivo-asset:first']).toMatchObject({ hash: 'a'.repeat(32) })
++      expect(loaded.generation).toBe(1)
++    },
++  )
++})
++
++// CA-P05-1(①席):上面的 SHAPES 用例 `it.each` 只构造了「棘轮文件仍可读」一种
++// 世界(fixture 只改 listReply,从不让 fsRead 落空),所以 `candidates===null`
++// 分支里「救援失败」这个子决策与「救援成功后走共用入口做互斥修复」这个子决策各自
++// 隔离变异都是 0 红——测试判据本身没构造对,不是变异构造失败。补两条能咬住的:
++describe('deposit 状态 — list 明确报错分支的两个子决策各自需要断言把守(CA-P05-1)', () => {
++  it('list 明确报错且棘轮记住的文件也读不回来(rescue 失败)→ 必须走 distrusted:true 出口,save 被拒且零新文件、load 同样被拒', async () => {
++    const listCalls = { count: 0 }
++    const { brain } = depositBrain({
++      listReply: (_request, names) => {
++        listCalls.count += 1
++        if (listCalls.count >= 2) throw new Error('host list exploded')
++        return { ok: true, op: 'list', entries: names.map((path) => ({ path, bytes: 1, mtime: 1 })) }
++      },
++    })
++    const deposit = brain.handles.deposit
++    const writer = deposit.writer
++
++    const first = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:first': { hash: 'a'.repeat(32), ext: '.png', depositedAt: 1, from: 'artifact' } },
++      }),
++    })
++    expect(first).toMatchObject({ ok: true, generation: 1 })
++
++    // 与 SHAPES 用例的关键差异:这里额外让棘轮记住的文件本身也不在了,逼救援
++    // 真正失败(kind:'unreadable'),走到 `candidates===null` 分支里此前零断言
++    // 覆盖的「救援失败」出口。
++    brain.files.delete(`deposit/state-00000001-${writer}.json`)
++
++    const second = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:second': { hash: 'b'.repeat(32), ext: '.png', depositedAt: 2, from: 'artifact' } },
++      }),
++    })
++    expect(second.ok).toBe(false)
++    expect(second.conflict).toBeUndefined()
++    expect(brain.files.size).toBe(0)
++
++    const loaded = await deposit.stateLoad()
++    expect(loaded.ok).toBe(false)
++
++    const { spy, stop } = attachPanelBridge(brain)
++    await flushMicrotasks()
++    stop()
++    // C-6(段 A round 2,①席 CA-P05A-3):上面四条断言只咬住「distrusted 出口
++    // 存在」,咬不住本例声称要覆盖的子决策「救援真的跑了并失败(kind:'unreadable')」
++    // ——M8 隔离变异(令 depositRescueRatchetCandidate 恒返 { kind: 'none' })下,
++    // 若没有这两条断言,本例在同族 9 例转红时仍然全绿。判据抄自姊妹例(:776,entry B
++    // 同构场景):必须命中「读不回来(IO/不存在)」,且不得出现「校验不过」(那是
++    // kind:'invalid' 的措辞,本例场景是文件被删、fsRead 落空,只能是 kind:'unreadable')。
++    expect(spy.find('读不回来(IO/不存在)').length).toBeGreaterThan(0)
++    expect(spy.find('校验不过').length).toBe(0)
++  })
++
++  it('list 明确报错但棘轮记住的文件仍可读(rescue 成功)→ 必须经共用入口 depositAdoptSingleCandidate 做互斥修复,不能裸 spread 候选 payload', async () => {
++    const H = 'd'.repeat(32)
++    const listCalls = { count: 0 }
++    const { brain } = depositBrain({
++      listReply: (_request, names) => {
++        listCalls.count += 1
++        if (listCalls.count >= 2) return { ok: false, op: 'list' }
++        return { ok: true, op: 'list', entries: names.map((path) => ({ path, bytes: 1, mtime: 1 })) }
++      },
++    })
++    const deposit = brain.handles.deposit
++
++    // 落一份「合法但内部互斥冲突」的信封:map.live 仍引用 H,pendingReleases 也挂着
++    // H。写侧不做互斥修复(那是读侧职责),这份内容原样落盘并被棘轮记住——棘轮
++    // 文件本身**没有**被删,所以接下来 list 报错时 rescue 必然成功(kind:'valid')。
++    const first = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:live': { hash: H, ext: '.png', depositedAt: 1, from: 'deposit' } },
++        pendingReleases: { [H]: { hash: H, from: 'deposit', at: 1, gen: 1, writer: deposit.writer } },
++      }),
++    })
++    expect(first).toMatchObject({ ok: true, generation: 1 })
++
++    // 这次 load 撞上 list 明确报错(`ok:false`)→ candidates===null → rescue 成功
++    // → 必须经 `depositAdoptSingleCandidate` 这个共用入口,不能直接 spread 候选。
++    const loaded = await deposit.stateLoad()
++    expect(loaded.ok).toBe(true)
++    const payload = JSON.parse(String(loaded.state))
++    // map 里仍被引用的条目必须在(不能因为 pending 挂了同一个 hash 就把 map 删掉)。
++    expect(payload.map['mivo-asset:live']).toMatchObject({ hash: H })
++    // 而 pendingReleases 里那条必须被剔除——裸 spread 会让它原样留着,P1b 消费该
++    // pending 条目时会 release 仍在使用的媒体(BLOCKER 2 同一后果,换了一个触发
++    // 分支)。
++    expect(payload.pendingReleases?.[H]).toBeUndefined()
++
++    const { spy, stop } = attachPanelBridge(brain)
++    await flushMicrotasks()
++    stop()
++    expect(spy.find('互斥检查').length).toBeGreaterThan(0)
++  })
++
++  // C-5(段 A round 2,①席 CA-P05A-2):上面两例都先让首次 list 成功,把棘轮推到
++  // gen1 之后才制造报错——「棘轮=0(本进程从未提交过)+ 首次 list 就直接失败」这条
++  // 本段新造的可达终态此前零覆盖。行为相对 base 从「可信空态 + 写出 gen1」变成
++  // 「读写全拒 + 零文件」,是本段刻意收紧的 fail-closed 方向变更,必须有断言钉住,
++  // 否则未来任何一次"看起来合理"的局部修改都能悄悄把它改回去而全绿。
++  it('棘轮=0(本进程从未提交过)且首次 list 就直接失败 → save 与 load 都必须拒绝,零新文件,诊断命中"本进程尚无棘轮基线"', async () => {
++    const { brain } = depositBrain({
++      listReply: () => {
++        throw new Error('host list exploded from the very first call')
++      },
++    })
++    const deposit = brain.handles.deposit
++
++    const saveResult = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({ version: 1, map: {} }),
++    })
++    expect(saveResult.ok).toBe(false)
++    expect(saveResult.conflict).toBeUndefined()
++    expect(brain.files.size).toBe(0)
++
++    const loadResult = await deposit.stateLoad()
++    expect(loadResult.ok).toBe(false)
++
++    const { spy, stop } = attachPanelBridge(brain)
++    await flushMicrotasks()
++    stop()
++    // 棘轮=0 时不存在「本进程记录」也不存在棘轮文件——不得出现 C-2 收紧后专属于
++    // 「棘轮>0 且救援失败」分支的措辞(重启条件对本场景无所指)。
++    expect(spy.find('本进程尚无棘轮基线').length).toBeGreaterThan(0)
++    expect(spy.find('若棘轮文件确已丢失,则直到进程重启').length).toBe(0)
++  })
++})
++
++// BLOCKER 2:棘轮救援此前直接 spread 候选 payload,漏掉了正常单候选路径会做的
++// `depositEnforceMapPendingMutex`。一份**字段全合法**、但 `map` 与 `pendingReleases`
++// 同时引用同一个 hash 的信封(既有 A1 测试覆盖的可达跨面板 CAS 重放残态)因此能带着
++// 互斥冲突回到面板;P1b 消费该 pending 条目时会 release 仍在使用的媒体 → 可见数据破坏。
++describe('deposit 状态 — 棘轮救援必须与正常路径同构地做互斥修复(r2-deposit BLOCKER 2)', () => {
++  it('救援回来的合法候选若 map 与 pendingReleases 同时引用同一 hash → 保留 map、删除 pending 条目,并留互斥诊断', async () => {
++    const H = 'c'.repeat(32)
++    const listCalls = { count: 0 }
++    const { brain } = depositBrain({
++      listReply: (_request, names) => {
++        listCalls.count += 1
++        // 第二次起静默变短(ok:true、空 entries、无 truncated)→ maxGen < 棘轮 → 走救援。
++        if (listCalls.count >= 2) return { ok: true, op: 'list', entries: [] }
++        return { ok: true, op: 'list', entries: names.map((path) => ({ path, bytes: 1, mtime: 1 })) }
++      },
++    })
++    const deposit = brain.handles.deposit
++
++    // 落一份「合法但内部互斥冲突」的信封:map.live 仍引用 H,pendingReleases 也挂着 H。
++    // 写侧不做互斥修复(那是读侧的职责),所以这份内容会原样落盘并被棘轮记住。
++    const first = await deposit.stateSave({
++      baseGeneration: 0,
++      baseSum: deposit.emptyRevisionSum,
++      state: JSON.stringify({
++        version: 1,
++        map: { 'mivo-asset:live': { hash: H, ext: '.png', depositedAt: 1, from: 'deposit' } },
++        pendingReleases: { [H]: { hash: H, from: 'deposit', at: 1, gen: 1, writer: deposit.writer } },
++      }),
++    })
++    expect(first).toMatchObject({ ok: true, generation: 1 })
++
++    // 这次 load 会撞上静默变短 → 棘轮救援 → 必须走 depositAdoptSingleCandidate。
++    const loaded = await deposit.stateLoad()
++    expect(loaded.ok).toBe(true)
++    const payload = JSON.parse(String(loaded.state))
++    // map 里仍被引用的条目必须在(不能因为 pending 挂了同一个 hash 就把 map 删掉)。
++    expect(payload.map['mivo-asset:live']).toMatchObject({ hash: H })
++    // 而 pendingReleases 里那条必须被剔除 —— 否则 P1b 会 release 仍在使用的媒体。
++    expect(payload.pendingReleases?.[H]).toBeUndefined()
++
++    const { spy, stop } = attachPanelBridge(brain)
++    await flushMicrotasks()
++    stop()
++    // 互斥修复必须留痕(A1 诊断),不能静默改内容。
++    expect(spy.find('互斥检查').length).toBeGreaterThan(0)
++  })
++})
++
+ describe('deposit 状态 — 十轮定案:单写者架构(SC10.0-SC10.3)', () => {
+   const validEnvelope = (gen: number, writer: string, payload: Record<string, unknown>) =>
+     JSON.stringify({ schema: 1, gen, writer, sum: canonicalSum(payload), payload })

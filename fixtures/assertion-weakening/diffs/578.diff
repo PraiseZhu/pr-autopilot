@@ -1,0 +1,30 @@
+diff --git a/public/changelog.json b/public/changelog.json
+index 3672f388..eeeb3c3a 100644
+--- a/public/changelog.json
++++ b/public/changelog.json
+@@ -1,17 +1,22 @@
+ {
+-  "lastGithash": "2f278e0bac6657873ab19562ba4495524fe3665e",
+-  "updatedAt": "2026-08-08T12:40:09+08:00",
++  "lastGithash": "9e52ec6fe58c742b57102332b49988ade116b8f2",
++  "updatedAt": "2026-08-08T13:05:21+08:00",
+   "entries": [
+     {
+       "date": "2026-08-08",
+       "prs": [
+-        579
++        579,
++        578
+       ],
+       "features": [],
+       "fixes": [
+         {
+           "text": "更新日志补录了 8 月 7 日的记录",
+           "by": "PraiseZhu"
++        },
++        {
++          "text": "内部质量保障：PR 自动合并前新增一道自动审查前置检查，管理员保留人工加急通道（无用户可见变化）。",
++          "by": "PraiseZhu"
+         }
+       ]
+     },

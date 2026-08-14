@@ -1,0 +1,316 @@
+diff --git a/.github/workflows/nightly-e2e.yml b/.github/workflows/nightly-e2e.yml
+index 69603304..aa004f38 100644
+--- a/.github/workflows/nightly-e2e.yml
++++ b/.github/workflows/nightly-e2e.yml
+@@ -1,6 +1,9 @@
+ # Nightly full prod-topology e2e.
+ #
+ # - mock-upstream full sweep runs daily and can also be started manually
++# - e2e-prod-full 按 kernel 矩阵拆分(legacy/new × --renderer=both,每 child 74 格 =
++#   37 场景 × dom/leafer;fail-fast:false 保证两腿都跑完);aggregate job 下载两份
++#   artifact 合并校验 148 格(#561)。改前:单 job 无 kernel 矩阵(默认 dom×legacy)。
+ # - real-upstream placeholder job is wired for GitHub Secrets, but skips cleanly when
+ #   secrets are absent (default on this repo today)
+ # - failure notification uses GitHub Actions defaults (repository / user email)
+@@ -21,9 +24,17 @@ permissions:
+ 
+ jobs:
+   e2e-prod-full:
+-    name: e2e prod full (mock upstream)
++    name: e2e prod full (${{ matrix.kernel }})
+     runs-on: ubuntu-latest
+-    timeout-minutes: 20
++    # W6:F2 门限改回 20 —— issue #561 验收明写「两个 child 每次均 <20min」,草案不得
++    # 静默放宽验收门。若首夜实测接近 20min,提 timeout 需 owner 单独拍板。
++    timeout-minutes: 35
++    strategy:
++      fail-fast: false
++      matrix:
++        # kernel 名必须保持 legacy/new —— 与 e2e-runner.mjs 的 --kernel= 枚举一致;
++        # artifact 名与 job 名都带 matrix.kernel 后缀,两 child 互不冲突。
++        kernel: [legacy, new]
+     steps:
+       - name: Checkout
+         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+@@ -50,32 +61,155 @@ jobs:
+       # VITE_MIVO_PERSIST=local npm run build && ...),不再需要本 job 独立的
+       # "Build production bundle" 步骤——旧版两处各 build 一次,workflow 层那次的
+       # 产物会被这里立即覆盖,纯浪费一次 build。
+-      - name: Run full prod e2e
++      # #561:kernel 矩阵。——renderer=both 与 --kernel= 经 npm 的 -- 透传到
++      # e2e-runner.mjs(--topology=prod 由 test:e2e:prod:full script 本体携带,
++      # 等效显式);每 child 74 格(37 场景 × dom/leafer,leafer 下 canvas-interactions
++      # 按 leaferSkippedScenarios 显式 skip),两 child 合计 148 格。
++      - name: Run full prod e2e (kernel=${{ matrix.kernel }})
+         run: |
+-          set -o pipefail
++          set -euo pipefail
+           mkdir -p test-artifacts
+-          npm run test:e2e:prod:full 2>&1 | tee test-artifacts/nightly-e2e-prod-full.log
++          npm run test:e2e:prod:full -- --renderer=both --kernel=${{ matrix.kernel }} 2>&1 | tee test-artifacts/nightly-e2e-prod-full-${{ matrix.kernel }}.log
+ 
+       # #560:e2e-runner.mjs 自身已在上一步跑测试期间调用过一次台账校验(结果已写进
+       # job summary);这里独立补一步是为了覆盖"e2e-runner.mjs 从未启动"的 setup 阶段
+       # 失败——那种情况下 runId 从未生成,LATEST 指针缺失,需要一条明确诊断。always()
+-      # 保证正常成功与失败两类 run 都跑这步。
++      # 保证正常成功与失败两类 run 都跑这步。matrix child 各自 job 工作区隔离,
++      # --latest 读的是本 job 自己的 e2e-runs/LATEST,无跨 child 冲突。
+       - name: E2E ledger summary
+         if: always()
+         run: node scripts/e2e/ledger-summary.mjs --latest
+ 
++      # #561:ledger 独立 artifact 的「恰好一个 run 目录」不变量用**构造**保证,而非事后
++      # 检测——runId 是 runner 运行期生成的,workflow 静态写不出路径;这里先枚举目录并
++      # 断言数量,把「恰好一个」从信任声明升级为结构保证。不用 LATEST:LATEST 是单标量
++      # 覆盖写文件,依赖它就把结构保证降级成信任声明。fail-closed:数量 ≠1 即非零退出,
++      # 打印实际数量与目录名。
++      - name: Assert exactly one ledger run dir
++        if: always()
++        run: |
++          set -euo pipefail
++          runs_root="test-artifacts/e2e-runs"
++          if [ ! -d "$runs_root" ]; then
++            echo "::error::missing run root dir '$runs_root' (e2e-runner never started?)"
++            exit 1
++          fi
++          # 目录枚举用通配展开(runId 无换行/空格,glob 安全;不用 LATEST、不用 find 管道)。
++          run_dirs=()
++          for d in "$runs_root"/*/; do
++            [ -d "$d" ] && run_dirs+=("$d")
++          done
++          if [ "${#run_dirs[@]}" -ne 1 ]; then
++            echo "::error::expected exactly 1 run dir under '$runs_root', found ${#run_dirs[@]}: ${run_dirs[*]:-<none>}"
++            exit 1
++          fi
++          echo "LEDGER_RUN_DIR=${run_dirs[0]%/}" >> "$GITHUB_ENV"
++          echo "single run dir: ${run_dirs[0]}"
++
++      # 该 run 目录作为独立 artifact 上传(整目录制品 nightly-e2e-prod-full-* 保留供人
++      # 排查,两者并存)。上传路径必须是具体目录而非 e2e-runs/* 通配——通配命中目录会
++      # 保留目录名层级,artifact 根变成 <runId>/manifest.json,破坏 canonical 布局 A。
++      # 断言步失败时 LEDGER_RUN_DIR 为空 → 本步报 no files found,同样 fail-closed。
++      - name: Upload per-kernel ledger run dir
++        if: always()
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
++        with:
++          name: nightly-e2e-ledger-${{ matrix.kernel }}
++          path: ${{ env.LEDGER_RUN_DIR }}
++          if-no-files-found: error
++          retention-days: 14
++
+       # #560:上传条件同样改 always()——正常成功与失败两类 run 都要能下载到 ledger
+       # artifact,配上一步 ledger-summary 一起服务同一诉求;步骤名去掉"failing"前缀
+       # 与新条件对齐(不再是"只在失败时上传")。
+-      - name: Upload nightly artifacts
++      # #561:artifact 名加 kernel 后缀——matrix 两 child 若同名上传,后者会覆盖前者。
++      - name: Upload nightly artifacts (kernel=${{ matrix.kernel }})
+         if: always()
+         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+         with:
+-          name: nightly-e2e-prod-full-artifacts
++          name: nightly-e2e-prod-full-${{ matrix.kernel }}-artifacts
+           path: test-artifacts
+           if-no-files-found: warn
+           retention-days: 14
+ 
++  # #561:aggregate job——下载两份 per-kernel ledger artifact(nightly-e2e-ledger-*),
++  # 合并校验 148 格。
++  # if: always():child 失败也要跑,校验器把缺格如实报出来(而不是把"没跑完"静默
++  # 变成"没结果")。下载用 actions/download-artifact v7.0.0(SHA 由
++  # `gh api repos/actions/download-artifact/tags` 解析,与仓内 upload-artifact
++  # v7.0.1 同主版本、artifact 后端一致;全仓首次引入 download-artifact)。
++  aggregate:
++    name: aggregate ledger (148 cells)
++    needs: e2e-prod-full
++    if: always()
++    runs-on: ubuntu-latest
++    timeout-minutes: 10
++    # W6:F1:本 job 不再补 actions:read(推翻 W4 报告「actions:read 必需」结论,见报告
++    # W6 节)。理由:同 run 内下载 artifact 时 actions/download-artifact 走 runner
++    # runtime token,不消耗 GITHUB_TOKEN 的 actions scope,workflow 顶层 permissions:
++    # contents:read 已足。对照:ci.yml bench job 补 actions:read 是因为它要下载
++    # **上一次 main 运行**(跨 run)的 bench-result artifact,必须走 GITHUB_TOKEN 调
++    # REST API 才需要该 scope——与 #561 的「同 run 下载」是两种场景,不可照搬。
++    # 首次真跑若下载 403,说明此判据有误,错误当场可见(届时补回 actions:read)。
++    steps:
++      - name: Checkout
++        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++
++      - name: Setup Node (LTS)
++        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
++        with:
++          node-version: lts/*
++          cache: npm
++
++      - name: Install dependencies
++        # W6:F4:必须 npm ci(推翻 W4 报告「零依赖不跑 npm ci」结论,见报告 W6 节)。
++        # 依赖已确认必需(W7 定稿):ledger-aggregate.mjs 的 import 链固定为
++        # scenarios/index.mjs → scenarios/canvas-export.mjs:16
++        # `import { PNG } from 'pngjs'`(第三方依赖)——零依赖拆模块未落地,干净 runner
++        # 无 node_modules 会模块加载失败(lead 实测),本步不得去掉。
++        run: npm ci
++
++      # #561:只下载两个 per-kernel ledger 独立 artifact,各解到不同目录(dl/legacy、
++      # dl/new)。下载落地目录 = run 目录本身(canonical 布局 A:根下直接是
++      # manifest.json + ledger.jsonl,e2e-runs/<runId> 中间层已由 child 侧「恰好一个
++      # run 目录」断言 + 独立上传构造掉;校验器不做递归下探,路径必须一次给对)。
++      # 双目录隔离是硬约束:校验器禁用 --latest(LATEST 是单标量覆盖写文件,两份 ledger
++      # 解到同目录会互相覆盖)。
++      - name: Download legacy ledger
++        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
++        with:
++          name: nightly-e2e-ledger-legacy
++          path: dl/legacy
++
++      - name: Download new ledger
++        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
++        with:
++          name: nightly-e2e-ledger-new
++          path: dl/new
++
++      # #561:真实调用已定型(W7 定稿,实现契约 lead 实测):
++      #   --dir <kernel>=<路径> ×2(kernel ∈ {legacy,new} 各一次,路径 = run 目录本身,
++      #   canonical 布局 A)+ --expect-total 必填无默认值(nightly 传 148)。
++      # 退出码:0=通过;1=校验失败(缺格/重复/计数不符);2=用法/输入错误(含 manifest
++      # 结构非法);3=校验器内部错误。tee 前 mkdir:下载只落 dl/,不再隐式创建
++      # test-artifacts/,漏 mkdir 会让 tee 失败连带把校验结果误标红。
++      - name: Aggregate ledger (148 cells)
++        run: |
++          set -euo pipefail
++          mkdir -p test-artifacts
++          node scripts/e2e/ledger-aggregate.mjs --dir legacy=dl/legacy --dir new=dl/new --expect-total 148 2>&1 | tee test-artifacts/aggregate.log
++
++      - name: Surface aggregate result in job summary
++        if: always()
++        run: |
++          {
++            echo '## nightly aggregate (148 cells, kernel × renderer)'
++            echo ''
++            echo '```'
++            tail -n 40 test-artifacts/aggregate.log 2>/dev/null || echo '(无日志:校验器可能未启动,见上方 step 日志)'
++            echo '```'
++          } >> "$GITHUB_STEP_SUMMARY"
++
+   real-upstream-gate:
+     name: real upstream gate
+     runs-on: ubuntu-latest
+diff --git a/scripts/e2e/nightly-matrix-contract.test.mjs b/scripts/e2e/nightly-matrix-contract.test.mjs
+new file mode 100644
+index 00000000..cce8aa65
+--- /dev/null
++++ b/scripts/e2e/nightly-matrix-contract.test.mjs
+@@ -0,0 +1,114 @@
++// scripts/e2e/nightly-matrix-contract.test.mjs — B2:nightly-e2e.yml 矩阵字面量 ↔ scenarioOrder
++// 一致性哨兵(PR 期拦截,替代"只在夜间响"的兜底)。
++//
++// 动机(issue #561 沿革):workflow 里 `--expect-total 148` 是字面量,而真实矩阵
++// 148 = scenarioOrder(37) × renderer(2) × kernel(2)。B1 的 ledger-aggregate 校验器
++// 兜底只在夜间运行响应(scenarioOrder 变多 → 实际格数 ≠ expect-total → aggregate job
++// 红),PR 期场景数/形状变了不响。本条把 workflow 字面量与 scenarioOrder 绑到一处,
++// CI test:unit(vitest run)PR 期即拦,不必等夜间。
++//
++// 契约范围刻意窄:只 import scenarioOrder,不 import ledger-aggregate/summary——
++// 本测试管的是「workflow 字面量与场景数一致」,与校验器实现无关(职责分离)。
++//
++// 反向变异契约(SC-N,与 B1 ledger-aggregate.test.mjs 同款纪律):每一条拒绝规则对应
++// 一个变异,变异 = 在**临时副本** workflow 上违反单个规则,跑本文件断言实际红集 ==
++// 跑前写下的预测红集。预测红集写在每个变异 ID 注释里。
++// 隔离原则 = 红集**可预测**,不是红集**单元素**:一个变异破坏前置条件时,前置检查
++// 与依赖它的断言双双变红是正确行为;为把红集压成 1 条而给断言开「返回而不断言」
++// 的早退路径,代价是断言恒真——那个交换永远不值得。
++//
++//   M1  --expect-total 改数(148→150) → 预测 {主断言}(提取 it 全过,只主断言红)
++//   M2  kernel 列表 2 项 → 1 项       → 预测 {主断言}(kernel 提取 it 只解析不设数量
++//                                         门槛,1 项合法;主断言 148≠37×2×1=74 红)
++//   M3  删掉 --renderer=both          → 预测 {renderer 存在 it, 主断言}(前置条件被
++//                                         破坏 → 前置检查与依赖它的断言双双变红)
++//
++// 路径解析:workflow 用相对本文件的 URL(CI 与本地 cwd 可能不同,禁 process.cwd())。
++// 默认路径必须是真实相对路径;NIGHTLY_E2E_WORKFLOW_PATH 仅供变异验证注入,不改默认值。
++
++import { readFileSync } from 'node:fs'
++import { fileURLToPath } from 'node:url'
++import { describe, expect, it } from 'vitest'
++import { scenarioOrder } from './scenarios/index.mjs'
++
++const DEFAULT_WORKFLOW_PATH = fileURLToPath(
++  new URL('../../.github/workflows/nightly-e2e.yml', import.meta.url),
++)
++// 变异验证注入点(默认保持真实相对路径,不为了可测性改默认值)。
++const workflowPath = process.env.NIGHTLY_E2E_WORKFLOW_PATH || DEFAULT_WORKFLOW_PATH
++
++// ── 三个提取器,全部 fail-closed:提取不到/形状异常即抛错,绝不静默返回缺省 ──────
++
++// --expect-total 字面量:必须恰好出现 1 次(0 次 = 校验器没接上;≥2 次 = 有第二条
++// 校验链路没被更新,两处一起漂)。
++function extractExpectTotal(workflow) {
++  const matches = [...workflow.matchAll(/--expect-total\s+(\d+)/g)]
++  if (matches.length !== 1) {
++    throw new Error(
++      `--expect-total 字面量必须恰好出现 1 次,实际 ${matches.length} 次` +
++        (matches.length > 0
++          ? `(命中值:${matches.map((m) => m[1]).join(', ')})`
++          : '——校验器可能没接上或参数名已改'),
++    )
++  }
++  return Number(matches[0][1])
++}
++
++// matrix.kernel 列表:必须恰好 1 个 YAML 数组定义,且条目数 ≥1(0 条目 = 空矩阵,
++// 整条链没跑,不是"合法 0 kernel")。
++function extractKernelCount(workflow) {
++  const matches = [...workflow.matchAll(/kernel:\s*\[([^\]]*)\]/g)]
++  if (matches.length !== 1) {
++    throw new Error(
++      `matrix kernel 列表定义必须恰好出现 1 次,实际 ${matches.length} 次` +
++        (matches.length > 0 ? '(多条 kernel: 定义 = 矩阵形状不确定)' : '——matrix 定义缺失或语法已改'),
++    )
++  }
++  const items = matches[0][1]
++    .split(',')
++    .map((s) => s.trim())
++    .filter(Boolean)
++  if (items.length < 1) {
++    throw new Error('matrix kernel 列表为空——空矩阵意味着整条链不会跑,不是合法状态')
++  }
++  return items.length
++}
++
++// --renderer=both:必须存在。renderer 数由它推出为 2(将来改成单 renderer 时,
++// 找不到 --renderer=both 即抛,提示更新本契约)。
++function extractRendererCount(workflow) {
++  if (!workflow.includes('--renderer=both')) {
++    throw new Error("必须包含 --renderer=both(renderer 矩阵由它驱动;缺失 = 形状变化或接线被拆)")
++  }
++  return 2
++}
++
++describe('nightly-e2e.yml 矩阵字面量 ↔ scenarioOrder 契约', () => {
++  const workflow = readFileSync(workflowPath, 'utf8')
++
++  it('--expect-total 字面量恰好出现一次', () => {
++    // 真断言:提取器 fail-closed,在真实文件上触发即红;值比较交给主断言。
++    expect(() => extractExpectTotal(workflow)).not.toThrow()
++  })
++
++  it('matrix kernel 列表定义恰好一个且条目数 ≥1', () => {
++    expect(() => extractKernelCount(workflow)).not.toThrow()
++  })
++
++  it('--renderer=both 必须存在', () => {
++    expect(() => extractRendererCount(workflow)).not.toThrow()
++  })
++
++  // 漂移哨兵主断言:workflow 字面量必须 == scenarioOrder × renderer × kernel。
++  // 形状(kernel 数 / renderer 数)变化时从 workflow 实际提取再乘,自动适配;
++  // 场景数变化时 scenarioOrder.length 变 → 与字面量不符即红。
++  // fail-closed:renderer 缺失时 extractRendererCount 直接抛 → 本断言红,
++  // 绝不"返回而不断言"地报绿。
++  it('expectTotal === scenarioOrder.length × rendererCount × kernelCount', () => {
++    const expectTotal = extractExpectTotal(workflow)
++    const kernelCount = extractKernelCount(workflow)
++    const rendererCount = extractRendererCount(workflow)
++    const expected = scenarioOrder.length * rendererCount * kernelCount
++    expect(expectTotal).toBe(expected)
++  })
++})

@@ -1,0 +1,494 @@
+diff --git a/src/PluginApp.tsx b/src/PluginApp.tsx
+index d24d6755..a1ec0b6e 100644
+--- a/src/PluginApp.tsx
++++ b/src/PluginApp.tsx
+@@ -1,4 +1,4 @@
+-import { useCallback, useState } from 'react'
++import { useCallback, useEffect, useState } from 'react'
+ import { MivoCanvas } from '../../src/canvas/MivoCanvas'
+ import { ToastViewport } from '../../src/app/ToastViewport'
+ import { MediaLightbox } from '../../src/app/MediaLightbox'
+@@ -7,6 +7,8 @@ import { isMediaRenderKind, renderKindForNode } from '../../src/model/canvasNode
+ import { debugLogger } from '../../src/store/debugLogStore'
+ import { useCanvasStore } from '../../src/store/canvasStore'
+ import { usePluginHydration } from './usePluginHydration'
++import { DEPOSIT_ENABLED } from './agent/depositPort'
++import { migrateLedgerIntoDepositStore } from './agent/depositMigration'
+ 
+ /**
+  * Cindy 面板形态的最小外壳:只渲染画布本体。
+@@ -44,6 +46,17 @@ export function PluginApp() {
+     debugLogger.warn('Lightbox', `Details skipped in plugin for node type: ${node?.type ?? 'unknown'}`)
+   }, [])
+ 
++  // T1e:迁移触发,置于 DEPOSIT_ENABLED 守卫内(不解禁预热,§3.3)。**放在这里
++  // 而不是 plugin-main.tsx 模块顶层**是刻意的——迁移读取画布态相关数据前需要
++  // hydration 已完成这个前置信号;`hydrated` 从 false→true 只会发生一次
++  // (usePluginHydration 语义),用它做依赖数组正是这个信号本身,不是猜时机。
++  // (owner 2026-08-02 决策:demo 阶段砍掉自动回收——sweep 触发点与
++  // pending consumer 启动恢复随之摘除,迁移不是回收,保留。)
++  useEffect(() => {
++    if (!hydrated || !DEPOSIT_ENABLED) return
++    void migrateLedgerIntoDepositStore()
++  }, [hydrated])
++
+   if (!hydrated) {
+     return <div className="canvas-boot-placeholder" aria-busy="true" data-hydrated="false" />
+   }
+diff --git a/src/__tests__/depositBindingLock.test.ts b/src/__tests__/depositBindingLock.test.ts
+index 22a73535..dc66ac55 100644
+--- a/src/__tests__/depositBindingLock.test.ts
++++ b/src/__tests__/depositBindingLock.test.ts
+@@ -43,12 +43,34 @@ import { resolveImport } from '../../../scripts/codemap.mjs'
+ //   R4 禁止在文件内任何位置(模块顶层或嵌套作用域)重新声明一个字面名为
+ //      'resolveDepositEntry' 的函数/变量/类——这正是 judge 绕过的核心手法
+ //      (纯粹的导入检查天生不认识"同名但没有导入关系"的本地重实现);
+-//   R5 间接依赖:agentBridge.ts 直接 import 的其它本地模块(排除 depositPort.ts
+-//      自身子树——它本就合法依赖 depositStore),递归展开后同样不得触达
+-//      depositStore.ts。
++//   R5 间接依赖:agentBridge.ts 直接 import 的其它本地模块(排除**受认可的
++//      depositStore 消费者**自身子树——它们本就合法依赖 depositStore),递归展开后
++//      同样不得触达 depositStore.ts。受认可者恰好两个,见
++//      `SANCTIONED_DEPOSIT_STORE_CONSUMERS`。
+ const AGENT_BRIDGE_PATH = 'cindyplugin/src/agent/agentBridge.ts'
+ const DEPOSIT_PORT_PATH = 'cindyplugin/src/agent/depositPort.ts'
+ const DEPOSIT_STORE_PATH = 'cindyplugin/src/agent/depositStore.ts'
++const DEPOSIT_OWNED_PATH = 'cindyplugin/src/agent/depositOwned.ts'
++/**
++ * 允许直接依赖 depositStore 的模块白名单(设计稿
++ * `docs/plan/cindy-deposit-media-design.md` §4.4.4「三类条目表」):
++ *   - `depositPort.ts`  —— 用户寄存链路的 adapter seam(`from:'panel'` 条目);
++ *   - `depositOwned.ts` —— owned 条目(`from:'artifact'`/`'ledger'`)的双写口,
++ *     它调 `recordDeposit` 写 depositMap 就是它存在的全部理由(T1c/#460 已合)。
++ *
++ * 为什么 depositOwned 是后补进来的:本门禁(T3b,B 链)成稿时 depositStore 只有
++ * depositPort 一个消费者;depositOwned 在 #460 落地时**零生产 callsite**(见该文件
++ * 头注「本文件不接任何生产 callsite……是 T1e 的接线职责」),直到 T1e(A 链)接线
++ * 才第一次出现在 agentBridge 的可达集里。两条链原本并行堆叠、各自 CI 都绿,串行化
++ * 合并后才第一次同时在场——所以这不是"放宽门禁",而是把设计里本来就有两个受认可
++ * 写者的事实补齐。
++ *
++ * **排除子树不等于放行**:被排除的节点仍会被 R9(`findForwardingEscape`)访问并检查
++ * 它自身的绑定(R2 类 depositBlob / R6 namespace / R7 动态 import / R8 fail-closed
++ * 构造),所以"经 depositOwned 转发 depositStore 的原始写入口"这条路仍有牙。
++ * 下面另有一条断言盯着白名单不许 stale。
++ */
++const SANCTIONED_DEPOSIT_STORE_CONSUMERS = [DEPOSIT_PORT_PATH, DEPOSIT_OWNED_PATH]
+ const RELATIVE_SPEC_RE = /^\.\.?\//
+ 
+ type ImportBinding = { importedName: string; specifierText: string }
+@@ -360,8 +382,19 @@ function validateDepositBindingLock(sourceText: string, fromFilePosix: string =
+     const resolved = resolveImport(spec, fromFilePosix)
+     if (resolved) directTargets.add(resolved)
+   }
++  // R5 与 R9 的起点集合**刻意不同**:R5 放过全部受认可的 depositStore 消费者(它们
++  // 合法依赖 depositStore),R9 只放过 depositPort(它是 R9 的判定目标本身,不作为被
++  // 检查节点)——depositOwned 在 R9 里仍是被检查节点,它自身若持有 depositBlob /
++  // namespace / 动态 import / require 这类禁止绑定照样报错。把两者合成一个集合会
++  // 静默削掉 R9 对 depositOwned 的这层牙。
++  const r5StartNodes = [...directTargets].filter((p) => !SANCTIONED_DEPOSIT_STORE_CONSUMERS.includes(p))
+   const startNodes = [...directTargets].filter((p) => p !== DEPOSIT_PORT_PATH)
+-  const indirectHit = findIndirectDependency(startNodes, DEPOSIT_STORE_PATH, [DEPOSIT_PORT_PATH], directRelativeDeps)
++  const indirectHit = findIndirectDependency(
++    r5StartNodes,
++    DEPOSIT_STORE_PATH,
++    SANCTIONED_DEPOSIT_STORE_CONSUMERS,
++    directRelativeDeps,
++  )
+   if (indirectHit) {
+     violations.push(`R5 违规:间接依赖 depositStore,路径=${indirectHit.join(' -> ')}`)
+   }
+@@ -567,6 +600,21 @@ export function useRequireDirectly(suffix: string) {
+     expect(result.ok).toBe(true)
+   })
+ 
++  // R5 的白名单是"豁免账本",账本必须与磁盘事实对齐:登记了却不再直接依赖
++  // depositStore 的条目 = stale 豁免,它会白白吃掉 R5 对那棵子树的全部覆盖。
++  // 这条断言让"删掉某个受认可者的 depositStore 依赖后忘了收豁免"当场变红,而不是
++  // 悄悄留下一个永久盲区(对照 design-token-mirror 的 expectedCount 账本口径)。
++  it('R5 受认可消费者白名单不 stale:每个登记项都真的直接依赖 depositStore', () => {
++    for (const consumer of SANCTIONED_DEPOSIT_STORE_CONSUMERS) {
++      const info = readModuleInfo(consumer)
++      expect(info, `${consumer} 读不到——白名单登记了不存在的文件`).not.toBeNull()
++      expect(
++        directRelativeDeps(consumer),
++        `${consumer} 已不再直接依赖 depositStore,它的 R5 豁免是 stale 的,应从白名单删除`,
++      ).toContain(DEPOSIT_STORE_PATH)
++    }
++  })
++
+   it('R5 图遍历算法本身:能穿透多跳发现间接依赖,且排除子树内的节点不误判(纯函数单测,不依赖磁盘)', () => {
+     const graph: Record<string, string[]> = {
+       helperA: ['helperB'],
+diff --git a/src/__tests__/depositFlagOff.test.ts b/src/__tests__/depositFlagOff.test.ts
+index af9f10ba..435621b1 100644
+--- a/src/__tests__/depositFlagOff.test.ts
++++ b/src/__tests__/depositFlagOff.test.ts
+@@ -19,8 +19,15 @@
+  */
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
++/**
++ * T1e 补测(P1-a/§3.3):`correlateNewAssets`/`correlatePlacedAttachments` 的
++ * 完成路径需要"画布出现新节点"这个可观测变化才能触发,原 mock 是固定空数组,
++ * 测不到这条路径。改成可变数组,测试可以在提交任务之后手动推入"新节点",模拟
++ * `correlateNewAssets` 的 500ms 轮询检测到它的那一刻。
++ */
++let mockCanvasNodes: Array<{ type: string; assetUrl?: string }> = []
+ vi.mock('../../../src/store/canvasStore', () => ({
+-  useCanvasStore: { getState: () => ({ nodes: [] }) },
++  useCanvasStore: { getState: () => ({ nodes: mockCanvasNodes }) },
+ }))
+ 
+ import { cindyImageGenerationPort } from '../agent/cindyGenerationPort'
+@@ -81,9 +88,17 @@ class FakeBroadcastChannel {
+   postMessage(data: unknown) {
+     const message = data as Posted
+     posted.push(message)
+-    // 立刻回执,免得 persistRequest 挂在重发定时器上
++    // 回执延到下一个 microtask,不是同一 tick 内同步回:真实 BroadcastChannel 的
++    // postMessage 本就是异步派发。persistRequest(bridge.ts)里 `send()` 与
++    // `const intervalId = window.setInterval(send, retryMs)` 中间那一行如果被
++    // 同步触发的回执打断,`finish()` 会在 `intervalId` 完成赋值前就去读它(暂时性
++    // 死区,ReferenceError)——生产环境不会撞到(真实 BroadcastChannel 天然异步),
++    // 完全同步的假实现反而会暴露这个此前从未走到的路径(此前用例全部在此之前就
++    // 失败/短路,没有一条真的跑到"任务成功"这一步)。
+     const reply = { reqId: message.reqId, reply: true, ...replyForNextRequest }
+-    for (const handler of Array.from(this.listeners)) handler({ data: reply })
++    queueMicrotask(() => {
++      for (const handler of Array.from(this.listeners)) handler({ data: reply })
++    })
+   }
+ 
+   close() {
+@@ -94,6 +109,11 @@ class FakeBroadcastChannel {
+ beforeEach(() => {
+   posted.length = 0
+   fetched.length = 0
++  mockCanvasNodes = []
++  replyForNextRequest.ok = false
++  replyForNextRequest.message = '测试短路'
++  delete replyForNextRequest.hash
++  delete replyForNextRequest.ext
+   resetDepositStoreForTests()
+   vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+   vi.stubGlobal('window', {
+@@ -108,6 +128,21 @@ beforeEach(() => {
+     if (url === '/kv') return { ok: true, json: async () => ({}) } as unknown as Response
+     return { ok: true, json: async () => ({}) } as unknown as Response
+   })
++  // T1e:node 环境本没有 FileReader,`blobToBase64`(cindyGenerationPort.ts 内部)
++  // 用它把产物 blob 转 base64——现有测试从未走到这一步(全部在此之前就失败/短路),
++  // 新增的"任务成功落图"测试第一次真的需要它,补个最小可用替身。
++  vi.stubGlobal(
++    'FileReader',
++    class {
++      result: string | null = null
++      onload: (() => void) | null = null
++      onerror: (() => void) | null = null
++      readAsDataURL() {
++        this.result = 'data:image/png;base64,ZmFrZQ=='
++        queueMicrotask(() => this.onload?.())
++      }
++    },
++  )
+ })
+ 
+ afterEach(() => {
+@@ -179,6 +214,39 @@ describe('flag 关 — 现状路径逐字节不变', () => {
+     expect(peekDepositStoreForTests()).toBeNull()
+   })
+ 
++  it('T1e(§3.3,if/else 分流不是包裹):任务成功落图后 ledger 写入序列与基线逐次相同——不是"零写",是"照旧写"', async () => {
++    // 这条测的是 correlateNewAssets 内的分流本身:flag=false 时必须走 recordMedia
++    // 这一支,不能因为套了 `if (DEPOSIT_ENABLED)` 而让整条 ledger 写入路径消失
++    // (那是 lead review 抓出的暗段生产回归,§3.3)。
++    const newAssetUrl = 'mivo-asset:generated-1'
++    const generatedHash = 'd'.repeat(32)
++    replyForNextRequest.ok = true
++    replyForNextRequest.hash = generatedHash
++    replyForNextRequest.ext = '.png'
++    vi.stubGlobal('fetch', async (input: unknown) => {
++      const url = String(input)
++      fetched.push(url)
++      if (url === '/kv') return { ok: true, json: async () => ({}) } as unknown as Response
++      return { ok: true, blob: async () => new Blob([new Uint8Array(4)]) } as unknown as Response
++    })
++
++    await cindyImageGenerationPort.submitGenerationTask({ prompt: '画一只猫', idempotencyKey: 'k5' })
++    await new Promise((resolve) => setTimeout(resolve, 20))
++    // correlateNewAssets 起轮询之前,画布上还是老样子(空)——现在推入"新落图的
++    // 节点",模拟任务完成后画布真的多出这一张图。
++    mockCanvasNodes = [{ type: 'image', assetUrl: newAssetUrl }]
++    // 轮询间隔 500ms,给足一次轮询周期的余量。
++    await new Promise((resolve) => setTimeout(resolve, 700))
++
++    expect(await import('../agent/mediaLedger').then((m) => m.lookupMedia(newAssetUrl))).toMatchObject({
++      hash: generatedHash,
++      ext: '.png',
++    })
++    // depositStore 侧仍然是"零写"(这条口径不变,只有 ledger 那半是"照旧写")。
++    expect(peekDepositStoreForTests()).toBeNull()
++    expect(posted.filter(isDepositOrReleaseKind)).toHaveLength(0)
++  })
++
+ })
+ 
+ /**
+diff --git a/src/__tests__/editOnceWithForcedRetry.test.ts b/src/__tests__/editOnceWithForcedRetry.test.ts
+new file mode 100644
+index 00000000..2c3bfc5c
+--- /dev/null
++++ b/src/__tests__/editOnceWithForcedRetry.test.ts
+@@ -0,0 +1,107 @@
++/**
++ * T1e §1.3/§3.3:"edit 失败强制重寄重试"的原语契约测试(设计稿 §11-B:"任一改图
++ * 失败后允许一次强制重寄存重试",不精确分类失败原因,1 次上限、不循环)。
++ *
++ * flag-independent:`editOnceWithForcedRetry` 本身不读 `DEPOSIT_ENABLED`,直接
++ * 单测,不需要"手动翻转编译期常量再跑一遍"这种人工复核。
++ *
++ * 端到端跑在真实 main.js 上(depositTestHarness),换指纹那一步走真实
++ * `refingerprintDepositEntry`,不是对着替身自说自话。
++ */
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++// cindyGenerationPort.ts 引入 useCanvasStore,它在 node 环境求值需要 document
++// (demoScenes 画 canvas)——本测试只关心 editOnceWithForcedRetry 这个 flag-
++// independent 纯逻辑原语,不关心画布内容,同 depositFlagOff.test.ts 的替身手法。
++vi.mock('../../../src/store/canvasStore', () => ({
++  useCanvasStore: { getState: () => ({ nodes: [] }) },
++}))
++
++import { editOnceWithForcedRetry } from '../agent/cindyGenerationPort'
++import { recordDeposit } from '../agent/depositStore'
++import type { PersistReply } from '../persist/bridge'
++import { blobOfBytes, createDepositHarness, teardownDepositHarness, FAKE_HASH, type DepositHarness } from './depositTestHarness'
++
++let harness: DepositHarness
++
++const okReply = (hash: string): PersistReply => ({ reqId: 'r', reply: true, ok: true, hash, ext: '.png' })
++const failReply = (message = '宿主拒绝'): PersistReply => ({ reqId: 'r', reply: true, ok: false, message })
++
++beforeEach(() => {
++  harness = createDepositHarness()
++})
++
++afterEach(() => {
++  teardownDepositHarness()
++})
++
++describe('editOnceWithForcedRetry — 首次成功', () => {
++  it('doRequest 首次即成功 → 直接返回,不触发换指纹(零 deposit_media 请求)', async () => {
++    const doRequest = vi.fn(async (hash: string) => okReply(hash))
++
++    const result = await editOnceWithForcedRetry('mivo-asset:1', blobOfBytes(32), doRequest, FAKE_HASH)
++
++    expect(result).toMatchObject({ ok: true, hash: FAKE_HASH })
++    expect(doRequest).toHaveBeenCalledTimes(1)
++    expect(doRequest).toHaveBeenCalledWith(FAKE_HASH)
++    expect(harness.hostRequests).toHaveLength(0)
++  })
++})
++
++describe('editOnceWithForcedRetry — 首次失败,强制重寄后重试 1 次', () => {
++  it('首次失败 → 换新指纹 → 用新 hash 重试一次 → 第二次成功', async () => {
++    await recordDeposit('mivo-asset:1', { hash: FAKE_HASH, ext: '.png', depositedAt: 1, from: 'deposit' })
++    const NEW_HASH = 'f'.repeat(32)
++    harness.setHostReply(() => ({ ok: true, hash: NEW_HASH, ext: '.png' }))
++
++    let call = 0
++    const doRequest = vi.fn(async (hash: string): Promise<PersistReply> => {
++      call += 1
++      return call === 1 ? failReply('内容审核失败') : okReply(hash)
++    })
++
++    const result = await editOnceWithForcedRetry('mivo-asset:1', blobOfBytes(32), doRequest, FAKE_HASH)
++
++    expect(result).toMatchObject({ ok: true, hash: NEW_HASH })
++    expect(doRequest).toHaveBeenCalledTimes(2)
++    expect(doRequest).toHaveBeenNthCalledWith(1, FAKE_HASH)
++    expect(doRequest).toHaveBeenNthCalledWith(2, NEW_HASH) // 第二次确实用了换出来的新指纹,不是重复旧 hash
++    expect(harness.hostRequests).toHaveLength(1) // 换指纹确实发生了一次真实寄存
++  })
++
++  it('首次失败 → 重试也失败 → 照常报错,不第二次重试(SC1b.7 自愈至多 1 轮)', async () => {
++    await recordDeposit('mivo-asset:1', { hash: FAKE_HASH, ext: '.png', depositedAt: 1, from: 'deposit' })
++    const NEW_HASH = 'a'.repeat(32)
++    harness.setHostReply(() => ({ ok: true, hash: NEW_HASH, ext: '.png' }))
++
++    const doRequest = vi.fn(async (): Promise<PersistReply> => failReply('还是失败'))
++
++    const result = await editOnceWithForcedRetry('mivo-asset:1', blobOfBytes(32), doRequest, FAKE_HASH)
++
++    expect(result).toMatchObject({ ok: false, message: '还是失败' })
++    expect(doRequest).toHaveBeenCalledTimes(2) // 恰好 2 次:首次 + 1 次重试,不是无限循环
++    expect(harness.hostRequests).toHaveLength(1) // 换指纹本身还是发生了(只是第二次业务请求仍失败)
++  })
++
++  it('首次失败但换指纹本身也失败(如寄存超限)→ 原样返回首次失败,不第二次尝试业务请求', async () => {
++    const doRequest = vi.fn(async (): Promise<PersistReply> => failReply('首次失败原因'))
++    // 源图超过 50MB 上限,refingerprintDepositEntry 内部的 depositBlob 会抛 TOO_LARGE。
++    const oversized = blobOfBytes(50 * 1024 * 1024 + 1)
++
++    const result = await editOnceWithForcedRetry('mivo-asset:1', oversized, doRequest, FAKE_HASH)
++
++    expect(result).toMatchObject({ ok: false, message: '首次失败原因' }) // 报的是首次失败,不是换指纹失败
++    expect(doRequest).toHaveBeenCalledTimes(1) // 换指纹失败就不再调 doRequest 第二次
++    expect(harness.hostRequests).toHaveLength(0) // 超限前置拦截,零寄存请求
++  })
++
++  it('没有 sourceAssetUrl/image(理论上不会发生的边界)→ 原样返回首次失败,不尝试换指纹', async () => {
++    const doRequest = vi.fn(async (): Promise<PersistReply> => failReply('首次失败原因'))
++
++    const result = await editOnceWithForcedRetry(undefined, undefined, doRequest, FAKE_HASH)
++
++    expect(result).toMatchObject({ ok: false, message: '首次失败原因' })
++    expect(doRequest).toHaveBeenCalledTimes(1)
++    expect(harness.hostRequests).toHaveLength(0)
++  })
++})
+diff --git a/src/agent/cindyGenerationPort.ts b/src/agent/cindyGenerationPort.ts
+index 9fc67701..0a97dbd2 100644
+--- a/src/agent/cindyGenerationPort.ts
++++ b/src/agent/cindyGenerationPort.ts
+@@ -15,8 +15,9 @@ import type { TaskFailure, TaskResultImage, TaskView } from '../../../src/lib/mi
+ import { buildRegionCoordinatePrompt } from '../../../src/lib/regionEditPrompt'
+ import { useCanvasStore } from '../../../src/store/canvasStore'
+ import { debugLogger } from '../../../src/store/debugLogStore'
+-import { persistRequest } from '../persist/bridge'
+-import { DEPOSIT_ENABLED, resolveDepositEntry } from './depositPort'
++import { persistRequest, type PersistReply } from '../persist/bridge'
++import { DEPOSIT_ENABLED, refingerprintDepositEntry, resolveDepositEntry } from './depositPort'
++import { recordArtifactDeposit } from './depositOwned'
+ import { initMediaLedger, lookupMedia, recordMedia } from './mediaLedger'
+ 
+ const SOURCE = 'Cindy Plugin Generation'
+@@ -200,11 +201,76 @@ const correlateNewAssets = (before: Set<string>, entries: Array<{ hash: string;
+     }
+     if (fresh.length >= entries.length || attempts >= 12) {
+       window.clearInterval(timer)
+-      fresh.slice(0, entries.length).forEach((assetUrl, index) => recordMedia(assetUrl, entries[index]))
++      // T1e §3.3:if/else 分流,不是包裹——recordArtifactDeposit 内部自己调
++      // recordMedia,若只在 flag=true 时才调用整个块,flag=false 时 ledger 写入
++      // 会彻底消失(暗段本该逐字节维持现状,却改变了现状)。
++      //
++      // lead review(T1b4 BLOCKED 返修期间提醒):w-t1c-fix 正在改
++      // `recordArtifactDeposit` 的失败语义(ledger 持久化真正成功才提交
++      // depositMap,不再是"内存写+防抖+吞失败"),调用形状不变但它此后**会**
++      // 因 ledger 失败而 reject——`void` fire-and-forget 若不接 `.catch`,
++      // 未来这条改动落地后就是未捕获 rejection。这里的 `.catch` 是防御性的,
++      // 不依赖对方具体改法,只保证"记账失败"永远走 debugLogger,不静默吞。
++      fresh.slice(0, entries.length).forEach((assetUrl, index) => {
++        if (DEPOSIT_ENABLED) {
++          // lead review(P2):`{ ledgerWritten }` 此前被整个丢弃——调用点也要
++          // 检一次(不只依赖 recordArtifactDeposit 内部的 warn),"双写到底成
++          // 没成"在生产上才有可观测性。
++          void recordArtifactDeposit(assetUrl, entries[index])
++            .then((result) => {
++              if (!result.ledgerWritten) {
++                debugLogger.warn(
++                  SOURCE,
++                  `artifact 双写:ledger 未写入(assetUrl/hash/ext 前置条件不满足),depositMap 同样未写:assetUrl=${assetUrl.slice(0, 60)}`,
++                )
++              }
++            })
++            .catch((error) => {
++              debugLogger.error(
++                SOURCE,
++                `artifact 双写失败:assetUrl=${assetUrl.slice(0, 60)} ${error instanceof Error ? error.message : String(error)}`,
++              )
++            })
++        } else {
++          recordMedia(assetUrl, entries[index])
++        }
++      })
+     }
+   }, 500)
+ }
+ 
++/**
++ * T1e §1.3/§3.3(edit 失败强制重寄重试,设计稿 §11-B):"任一改图失败后允许一次
++ * 强制重寄存重试"——宿主只给自由文本 message、无稳定 code,不精确分类失败原因,
++ * 失败就换新指纹重试一次,再失败照常报错、不第二次重试(SC1b.7 自愈至多 1
++ * 轮)。flag-independent(不读 DEPOSIT_ENABLED):可以直接单测,生产 callsite
++ * 只在 flag=true 时调用它,flag=false 时走 `doRequest(firstHash)` 现状路径。
++ *
++ * 换指纹本身失败(`refingerprintDepositEntry` 抛错,如寄存超限/宿主拒收)—— 原样
++ * 返回首次失败,不把"换指纹失败"包装成第二次改图失败,两种失败原因不同不该
++ * 混在一起报。没有 `sourceAssetUrl`/`image`(无法重寄的场景,理论上不会发生,
++ * 因为能走到这里就必然已经解析出过一次 source)时同样原样返回首次失败。
++ */
++export const editOnceWithForcedRetry = async (
++  sourceAssetUrl: string | undefined,
++  image: Blob | undefined,
++  doRequest: (hash: string) => Promise<PersistReply>,
++  firstHash: string,
++): Promise<PersistReply> => {
++  const first = await doRequest(firstHash)
++  if (first.ok) return first
++  if (!sourceAssetUrl || !image) return first
++  let refreshed: { hash: string }
++  try {
++    refreshed = await refingerprintDepositEntry({ assetUrl: sourceAssetUrl, blob: image })
++  } catch (error) {
++    debugLogger.warn(SOURCE, `edit 失败强制重寄:换指纹本身失败,放弃重试,原样报首次失败:${error instanceof Error ? error.message : String(error)}`)
++    return first
++  }
++  debugLogger.log(SOURCE, `edit 失败强制重寄:已换新指纹 hash=${refreshed.hash.slice(0, 8)},重试 1 次`)
++  return doRequest(refreshed.hash)
++}
++
+ export const cindyImageGenerationPort: ImageGenerationPort = {
+   canEditAsset,
+ 
+@@ -318,14 +384,18 @@ export const cindyImageGenerationPort: ImageGenerationPort = {
+     const beforeAssets = currentAssetUrls()
+     void (async () => {
+       try {
+-        const reply = await persistRequest(
+-          'edit-image',
+-          // aspectRatio = 面板算好的源图比例(closestMivoRatioForSize):Mivo 直连路
+-          // 用它锁住画幅——不传平台缺省 1:1,非方图会被拉变形(2026-08-01 用户实测);
+-          // Cindy 代办回落路由电子脑负责丢弃(宿主改图不收比例,带上会被拒)。
+-          { prompt, hashes: [source.hash], callId: editCallId, aspectRatio: request.imgRatio },
+-          { retryMs: 5_000, timeoutMs: 28 * 60_000 },
+-        )
++        const doRequest = (hash: string) =>
++          persistRequest(
++            'edit-image',
++            // aspectRatio = 面板算好的源图比例(closestMivoRatioForSize):Mivo 直连路
++            // 用它锁住画幅——不传平台缺省 1:1,非方图会被拉变形(2026-08-01 用户实测);
++            // Cindy 代办回落路由电子脑负责丢弃(宿主改图不收比例,带上会被拒)。
++            { prompt, hashes: [hash], callId: editCallId, aspectRatio: request.imgRatio },
++            { retryMs: 5_000, timeoutMs: 28 * 60_000 },
++          )
++        const reply = DEPOSIT_ENABLED
++          ? await editOnceWithForcedRetry(request.sourceAssetUrl, request.image, doRequest, source.hash)
++          : await doRequest(source.hash)
+         if (!reply.ok || !reply.hash || !reply.ext) {
+           pending.view = { ...pending.view, status: 'failed', progress: 100, stage: 'failed', error: reply.message || '修改失败' }
+           return
+@@ -380,12 +450,16 @@ export const cindyImageGenerationPort: ImageGenerationPort = {
+       for (let index = 0; index < request.variations.length; index += 1) {
+         const variation = request.variations[index]
+         try {
+-          const reply = await persistRequest(
+-            'edit-image',
+-            // 比例口径同 submitEditTask:每条变体自带 imgRatio(变体请求无顶层比例)。
+-            { prompt: variation.prompt || 'variation', hashes: [source.hash], callId, aspectRatio: variation.imgRatio },
+-            { retryMs: 5_000, timeoutMs: 28 * 60_000 },
+-          )
++          const doRequest = (hash: string) =>
++            persistRequest(
++              'edit-image',
++              // 比例口径同 submitEditTask:每条变体自带 imgRatio(变体请求无顶层比例)。
++              { prompt: variation.prompt || 'variation', hashes: [hash], callId, aspectRatio: variation.imgRatio },
++              { retryMs: 5_000, timeoutMs: 28 * 60_000 },
++            )
++          const reply = DEPOSIT_ENABLED
++            ? await editOnceWithForcedRetry(request.sourceAssetUrl, request.image, doRequest, source.hash)
++            : await doRequest(source.hash)
+           if (!reply.ok || !reply.hash || !reply.ext) throw new Error(reply.message || '生成失败')
+           const res = await fetch(`/media/${reply.hash}${reply.ext}`)
+           if (!res.ok) throw new Error(`产物取回失败(${res.status})`)

@@ -1,0 +1,625 @@
+diff --git a/src/__tests__/agentBridgeMediaResolve.test.ts b/src/__tests__/agentBridgeMediaResolve.test.ts
+index 8f5448d9..3de447b3 100644
+--- a/src/__tests__/agentBridgeMediaResolve.test.ts
++++ b/src/__tests__/agentBridgeMediaResolve.test.ts
+@@ -37,10 +37,6 @@
+  * 同一套桥接手法)。
+  */
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+-import { readFileSync } from 'node:fs'
+-import { join } from 'node:path'
+-import ts from 'typescript'
+-import { resolveImport } from '../../../scripts/codemap.mjs'
+ 
+ vi.hoisted(() => {
+   const store = new Map<string, string>()
+@@ -102,199 +98,6 @@ import { useCanvasStore } from '../../../src/store/canvasStore'
+ import { debugLogger, useDebugLogStore } from '../../../src/store/debugLogStore'
+ import type { MivoCanvasNode } from '../../../src/types/mivoCanvas'
+ 
+-// ── SC-T3b1-fix.1(judge finding P1-B1)AST 接线锁 ──────────────────────────
+-//
+-// judge 实跑证明:把 agentBridge.ts 改成 `depositBlob as rawDeposit` 别名导入 +
+-// `from "./depositStore"` 双引号导入 + 本地重实现一个同名 `resolveDepositEntry`
+-// 函数(手搓 happy path,省略 SC1b.11 的 failed-commit 补偿),旧的字符串扫描
+-// 门禁(本文件曾用的 `toContain('resolveDepositEntry(')` /
+-// `not.toMatch(/\bdepositBlob\(/)` / `not.toMatch(/from '\.\/depositStore'/)`)
+-// 25/25 全绿——别名 import / 双引号 import / 本地同名函数三种手法都能绕开纯
+-// 文本匹配。改用 TS AST 解析(`ts.createSourceFile`,与 scripts/ci/cycle-guard.mjs
+-// 同一套思路),按「绑定来源」而非字面文本判定:
+-//   R1 必须存在从 './depositPort' 导入的、**导入名**(而非本地别名)为
+-//      'resolveDepositEntry' 的具名导入;
+-//   R2 禁止任何导入的**导入名**为 'depositBlob'(无论来自哪个模块、起什么别名);
+-//   R3 禁止任何 import / export-from / 动态 import 的模块说明符解析(复用
+-//      scripts/codemap.mjs 的 resolveImport,不重复实现路径解析)到
+-//      depositStore.ts,不论引号风格;
+-//   R4 禁止在文件内任何位置(模块顶层或嵌套作用域)重新声明一个字面名为
+-//      'resolveDepositEntry' 的函数/变量/类——这正是 judge 绕过的核心手法
+-//      (纯粹的导入检查天生不认识"同名但没有导入关系"的本地重实现);
+-//   R5 间接依赖:agentBridge.ts 直接 import 的其它本地模块(排除 depositPort.ts
+-//      自身子树——它本就合法依赖 depositStore),递归展开后同样不得触达
+-//      depositStore.ts。
+-const AGENT_BRIDGE_PATH = 'cindyplugin/src/agent/agentBridge.ts'
+-const DEPOSIT_PORT_PATH = 'cindyplugin/src/agent/depositPort.ts'
+-const DEPOSIT_STORE_PATH = 'cindyplugin/src/agent/depositStore.ts'
+-const RELATIVE_SPEC_RE = /^\.\.?\//
+-
+-type ImportBinding = { importedName: string; specifierText: string }
+-
+-/** 收集一份源码里全部非 type-only 的 import 具名绑定 + export-from 具名重导出 +
+- * 动态 import 的模块说明符(AST 层面,天然不受引号风格/别名影响)。 */
+-function collectImportBindings(
+-  sourceText: string,
+-  fromFilePosix: string,
+-): { bindings: ImportBinding[]; dynamicSpecs: string[] } {
+-  const sf = ts.createSourceFile(fromFilePosix, sourceText, ts.ScriptTarget.Latest, true)
+-  const bindings: ImportBinding[] = []
+-  const dynamicSpecs: string[] = []
+-
+-  const pushNamed = (elements: ts.NodeArray<ts.ImportSpecifier | ts.ExportSpecifier>, specifierText: string) => {
+-    for (const el of elements) {
+-      if (el.isTypeOnly) continue
+-      bindings.push({ importedName: (el.propertyName ?? el.name).text, specifierText })
+-    }
+-  }
+-
+-  function visit(node: ts.Node) {
+-    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
+-      const specifierText = node.moduleSpecifier.text
+-      const clause = node.importClause
+-      if (clause && !clause.isTypeOnly) {
+-        if (clause.name) bindings.push({ importedName: 'default', specifierText })
+-        const named = clause.namedBindings
+-        if (named) {
+-          if (ts.isNamespaceImport(named)) bindings.push({ importedName: '*', specifierText })
+-          else if (ts.isNamedImports(named)) pushNamed(named.elements, specifierText)
+-        }
+-      }
+-    } else if (
+-      ts.isExportDeclaration(node) &&
+-      node.moduleSpecifier &&
+-      ts.isStringLiteral(node.moduleSpecifier) &&
+-      !node.isTypeOnly
+-    ) {
+-      const specifierText = node.moduleSpecifier.text
+-      const clause = node.exportClause
+-      if (!clause) bindings.push({ importedName: '*', specifierText })
+-      else if (ts.isNamedExports(clause)) pushNamed(clause.elements, specifierText)
+-      else bindings.push({ importedName: '*', specifierText })
+-    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+-      const arg = node.arguments[0]
+-      if (arg && ts.isStringLiteral(arg)) dynamicSpecs.push(arg.text)
+-    }
+-    ts.forEachChild(node, visit)
+-  }
+-  visit(sf)
+-  return { bindings, dynamicSpecs }
+-}
+-
+-/** R4:文件内任何位置重新声明一个字面名为 `targetName` 的函数/变量/类(import 语句本身不算)。 */
+-function countLocalNameDeclarations(sourceText: string, fromFilePosix: string, targetName: string): number {
+-  const sf = ts.createSourceFile(fromFilePosix, sourceText, ts.ScriptTarget.Latest, true)
+-  let count = 0
+-  function visit(node: ts.Node) {
+-    if (ts.isImportDeclaration(node) || ts.isImportEqualsDeclaration(node)) return
+-    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name?.text === targetName) {
+-      count += 1
+-    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === targetName) {
+-      count += 1
+-    }
+-    ts.forEachChild(node, visit)
+-  }
+-  visit(sf)
+-  return count
+-}
+-
+-/** R5:纯图遍历(与磁盘 I/O 解耦,便于单测算法本身,见下方"图遍历本身"用例)。
+- * `excludeSubtreeRoots` 里的节点既不作为命中目标、也不展开其子节点(合法子树)。 */
+-function findIndirectDependency(
+-  startNodes: string[],
+-  bannedTarget: string,
+-  excludeSubtreeRoots: string[],
+-  getDirectDeps: (node: string) => string[],
+-): string[] | null {
+-  const excluded = new Set(excludeSubtreeRoots)
+-  const visited = new Set<string>()
+-  const queue: Array<{ node: string; path: string[] }> = startNodes
+-    .filter((n) => !excluded.has(n))
+-    .map((n) => ({ node: n, path: [n] }))
+-  while (queue.length) {
+-    const current = queue.shift() as { node: string; path: string[] }
+-    if (current.node === bannedTarget) return current.path
+-    if (visited.has(current.node)) continue
+-    visited.add(current.node)
+-    for (const dep of getDirectDeps(current.node)) {
+-      if (excluded.has(dep)) continue
+-      queue.push({ node: dep, path: [...current.path, dep] })
+-    }
+-  }
+-  return null
+-}
+-
+-/** 生产用:某个仓相对路径文件的直接相对依赖(已用 resolveImport 解析为仓相对路径)。 */
+-function directRelativeDeps(posix: string): string[] {
+-  let text: string
+-  try {
+-    text = readFileSync(join(process.cwd(), posix), 'utf8')
+-  } catch {
+-    return []
+-  }
+-  const { bindings, dynamicSpecs } = collectImportBindings(text, posix)
+-  const specs = new Set<string>()
+-  for (const b of bindings) specs.add(b.specifierText)
+-  for (const s of dynamicSpecs) specs.add(s)
+-  const out: string[] = []
+-  for (const spec of specs) {
+-    if (!RELATIVE_SPEC_RE.test(spec)) continue
+-    const resolved = resolveImport(spec, posix)
+-    if (resolved) out.push(resolved)
+-  }
+-  return out
+-}
+-
+-type BindingLockResult = { ok: boolean; violations: string[] }
+-
+-/** R1~R5 汇总判定。`fromFilePosix` 默认为 agentBridge.ts 自身,可传别的仓相对
+- * 路径以便对 fixture 字符串复用同一套 specifier 解析基准目录。 */
+-function validateDepositBindingLock(sourceText: string, fromFilePosix: string = AGENT_BRIDGE_PATH): BindingLockResult {
+-  const violations: string[] = []
+-  const { bindings, dynamicSpecs } = collectImportBindings(sourceText, fromFilePosix)
+-
+-  let resolvesDepositEntryFromPort = false
+-  for (const b of bindings) {
+-    if (b.importedName === 'depositBlob') {
+-      violations.push(`R2 违规:导入名为 depositBlob(specifier=${b.specifierText})`)
+-    }
+-    if (!RELATIVE_SPEC_RE.test(b.specifierText)) continue
+-    const resolved = resolveImport(b.specifierText, fromFilePosix)
+-    if (resolved === DEPOSIT_STORE_PATH) {
+-      violations.push(`R3 违规:导入名「${b.importedName}」解析自 depositStore(specifier=${b.specifierText})`)
+-    }
+-    if (resolved === DEPOSIT_PORT_PATH && b.importedName === 'resolveDepositEntry') {
+-      resolvesDepositEntryFromPort = true
+-    }
+-  }
+-  for (const spec of dynamicSpecs) {
+-    if (!RELATIVE_SPEC_RE.test(spec)) continue
+-    if (resolveImport(spec, fromFilePosix) === DEPOSIT_STORE_PATH) {
+-      violations.push(`R3 违规:动态 import 解析自 depositStore(specifier=${spec})`)
+-    }
+-  }
+-  if (!resolvesDepositEntryFromPort) {
+-    violations.push('R1 违规:未找到从 ./depositPort 导入的、导入名为 resolveDepositEntry 的具名导入')
+-  }
+-  const localRedeclarations = countLocalNameDeclarations(sourceText, fromFilePosix, 'resolveDepositEntry')
+-  if (localRedeclarations > 0) {
+-    violations.push(`R4 违规:文件内存在 ${localRedeclarations} 处对 resolveDepositEntry 的本地重新声明(应只有导入绑定)`)
+-  }
+-
+-  const directTargets = new Set<string>()
+-  for (const b of bindings) {
+-    if (!RELATIVE_SPEC_RE.test(b.specifierText)) continue
+-    const resolved = resolveImport(b.specifierText, fromFilePosix)
+-    if (resolved) directTargets.add(resolved)
+-  }
+-  const startNodes = [...directTargets].filter((p) => p !== DEPOSIT_PORT_PATH)
+-  const indirectHit = findIndirectDependency(startNodes, DEPOSIT_STORE_PATH, [DEPOSIT_PORT_PATH], directRelativeDeps)
+-  if (indirectHit) {
+-    violations.push(`R5 违规:间接依赖 depositStore,路径=${indirectHit.join(' -> ')}`)
+-  }
+-
+-  return { ok: violations.length === 0, violations }
+-}
+ 
+ const CHANNEL = 'mivo-canvas-agent'
+ 
+@@ -359,67 +162,6 @@ afterEach(() => {
+   vi.unstubAllGlobals()
+ })
+ 
+-describe('SC-T3b.1 / SC-T3b1-fix.1 唯一业务链:AST 接线锁(替换可绕过的字符串扫描)', () => {
+-  it('复现 judge 绕过:别名 depositBlob + 双引号 depositStore + 本地重实现同名 resolveDepositEntry —— 旧字符串扫描全绿,新 AST 门禁必须报错', () => {
+-    const bypassSource = `
+-import { depositBlob as rawDeposit } from './depositPort'
+-import { lookupDeposit, recordDeposit } from "./depositStore"
+-
+-// 手搓 happy path,故意省掉 SC1b.11 的 failed-commit 补偿
+-async function resolveDepositEntry(input) {
+-  const cached = await lookupDeposit(input.assetUrl)
+-  if (cached) return cached
+-  const receipt = await rawDeposit(input.blob, input.label)
+-  const entry = { hash: receipt.hash, ext: receipt.ext, bytes: receipt.bytes, depositedAt: Date.now(), from: 'deposit' }
+-  await recordDeposit(input.assetUrl, entry)
+-  return entry
+-}
+-
+-export async function useIt(input) {
+-  return resolveDepositEntry(input)
+-}
+-`
+-    // 旧字符串扫描门禁(本文件曾用的判据)对这份绕过全绿——证明「字符串扫描」
+-    // 本身是假绿,不是给新门禁立的稻草人。
+-    expect(bypassSource).toContain('resolveDepositEntry(')
+-    expect(bypassSource).not.toMatch(/\bdepositBlob\(/)
+-    expect(bypassSource).not.toMatch(/from '\.\/depositStore'/)
+-
+-    // 新 AST 门禁必须拓住它:R1(未从 depositPort 导入 resolveDepositEntry)、
+-    // R2(depositBlob 按导入名而非本地别名判定,别名 rawDeposit 逃不掉)、
+-    // R3(直接依赖 depositStore,不论引号风格)、R4(本地重新声明同名函数)
+-    // 四条应同时命中。
+-    const result = validateDepositBindingLock(bypassSource, AGENT_BRIDGE_PATH)
+-    expect(result.ok).toBe(false)
+-    const joined = result.violations.join('\n')
+-    expect(joined).toMatch(/R1 违规/)
+-    expect(joined).toMatch(/R2 违规/)
+-    expect(joined).toMatch(/R3 违规/)
+-    expect(joined).toMatch(/R4 违规/)
+-  })
+-
+-  it('真实 agentBridge.ts 源码通过 AST 门禁(R1~R5 全部满足,零 violation)', () => {
+-    const source = readFileSync(join(process.cwd(), AGENT_BRIDGE_PATH), 'utf8')
+-    const result = validateDepositBindingLock(source, AGENT_BRIDGE_PATH)
+-    expect(result.violations).toEqual([])
+-    expect(result.ok).toBe(true)
+-  })
+-
+-  it('R5 图遍历算法本身:能穿透多跳发现间接依赖,且排除子树内的节点不误判(纯函数单测,不依赖磁盘)', () => {
+-    const graph: Record<string, string[]> = {
+-      helperA: ['helperB'],
+-      helperB: ['depositStore'], // 间接:agentBridge → helperA → helperB → depositStore
+-      depositPort: ['depositStore'], // 合法:depositPort 自己依赖 depositStore,应被排除子树
+-    }
+-    const getDeps = (n: string) => graph[n] ?? []
+-
+-    const hit = findIndirectDependency(['helperA', 'depositPort'], 'depositStore', ['depositPort'], getDeps)
+-    expect(hit).toEqual(['helperA', 'helperB', 'depositStore'])
+-
+-    const clean = findIndirectDependency(['depositPort'], 'depositStore', ['depositPort'], getDeps)
+-    expect(clean).toBeNull()
+-  })
+-})
+ 
+ describe('SC-T3b.2 真实逐 id 解析:available/unavailable 判别联合', () => {
+   it('图片节点在页内 + 寄存成功 → available,imageRef=cindy-media://blobs/<hash><ext>,永不内联 base64(SC-T3b.5)', async () => {
+diff --git a/src/__tests__/depositBindingLock.test.ts b/src/__tests__/depositBindingLock.test.ts
+new file mode 100644
+index 00000000..70f7f4bf
+--- /dev/null
++++ b/src/__tests__/depositBindingLock.test.ts
+@@ -0,0 +1,336 @@
++/**
++ * SC-T3b.1 / SC-T3b1-fix.1 唯一业务链的 **AST 接线锁**(从
++ * `agentBridgeMediaResolve.test.ts` 拆出)。
++ *
++ * 拆分理由(不是为了好看):原文件加入 R6 后达到 810 行,越过本仓 800 行硬上限。按
++ * 「先拆再加」纪律把这一整块自包含的静态分析门(常量 + 5 个 helper + R1~R6 判定 +
++ * 反向夹具)搬出来——它与原文件其余部分零共享标识符(实测:9 个标识符在原 describe
++ * 之后零使用),搬迁是纯移动,无行为改动。
++ *
++ * R6 是 r2-vision 二轮对抗审查的 MAJOR 4:R2 按**导入名**禁 depositBlob,锁不住
++ * `import * as rawPort from './depositPort'` 这种「导入一个能取到所有名字的容器」。
++ */
++import { describe, expect, it } from 'vitest'
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++import ts from 'typescript'
++import { resolveImport } from '../../../scripts/codemap.mjs'
++
++// ── SC-T3b1-fix.1(judge finding P1-B1)AST 接线锁 ──────────────────────────
++//
++// judge 实跑证明:把 agentBridge.ts 改成 `depositBlob as rawDeposit` 别名导入 +
++// `from "./depositStore"` 双引号导入 + 本地重实现一个同名 `resolveDepositEntry`
++// 函数(手搓 happy path,省略 SC1b.11 的 failed-commit 补偿),旧的字符串扫描
++// 门禁(本文件曾用的 `toContain('resolveDepositEntry(')` /
++// `not.toMatch(/\bdepositBlob\(/)` / `not.toMatch(/from '\.\/depositStore'/)`)
++// 25/25 全绿——别名 import / 双引号 import / 本地同名函数三种手法都能绕开纯
++// 文本匹配。改用 TS AST 解析(`ts.createSourceFile`,与 scripts/ci/cycle-guard.mjs
++// 同一套思路),按「绑定来源」而非字面文本判定:
++//   R1 必须存在从 './depositPort' 导入的、**导入名**(而非本地别名)为
++//      'resolveDepositEntry' 的具名导入;
++//   R2 禁止任何导入的**导入名**为 'depositBlob'(无论来自哪个模块、起什么别名);
++//   R3 禁止任何 import / export-from / 动态 import 的模块说明符解析(复用
++//      scripts/codemap.mjs 的 resolveImport,不重复实现路径解析)到
++//      depositStore.ts,不论引号风格;
++//   R4 禁止在文件内任何位置(模块顶层或嵌套作用域)重新声明一个字面名为
++//      'resolveDepositEntry' 的函数/变量/类——这正是 judge 绕过的核心手法
++//      (纯粹的导入检查天生不认识"同名但没有导入关系"的本地重实现);
++//   R5 间接依赖:agentBridge.ts 直接 import 的其它本地模块(排除 depositPort.ts
++//      自身子树——它本就合法依赖 depositStore),递归展开后同样不得触达
++//      depositStore.ts。
++const AGENT_BRIDGE_PATH = 'cindyplugin/src/agent/agentBridge.ts'
++const DEPOSIT_PORT_PATH = 'cindyplugin/src/agent/depositPort.ts'
++const DEPOSIT_STORE_PATH = 'cindyplugin/src/agent/depositStore.ts'
++const RELATIVE_SPEC_RE = /^\.\.?\//
++
++type ImportBinding = { importedName: string; specifierText: string }
++
++/** 收集一份源码里全部非 type-only 的 import 具名绑定 + export-from 具名重导出 +
++ * 动态 import 的模块说明符(AST 层面,天然不受引号风格/别名影响)。 */
++function collectImportBindings(
++  sourceText: string,
++  fromFilePosix: string,
++): { bindings: ImportBinding[]; dynamicSpecs: string[] } {
++  const sf = ts.createSourceFile(fromFilePosix, sourceText, ts.ScriptTarget.Latest, true)
++  const bindings: ImportBinding[] = []
++  const dynamicSpecs: string[] = []
++
++  const pushNamed = (elements: ts.NodeArray<ts.ImportSpecifier | ts.ExportSpecifier>, specifierText: string) => {
++    for (const el of elements) {
++      if (el.isTypeOnly) continue
++      bindings.push({ importedName: (el.propertyName ?? el.name).text, specifierText })
++    }
++  }
++
++  function visit(node: ts.Node) {
++    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
++      const specifierText = node.moduleSpecifier.text
++      const clause = node.importClause
++      if (clause && !clause.isTypeOnly) {
++        if (clause.name) bindings.push({ importedName: 'default', specifierText })
++        const named = clause.namedBindings
++        if (named) {
++          if (ts.isNamespaceImport(named)) bindings.push({ importedName: '*', specifierText })
++          else if (ts.isNamedImports(named)) pushNamed(named.elements, specifierText)
++        }
++      }
++    } else if (
++      ts.isExportDeclaration(node) &&
++      node.moduleSpecifier &&
++      ts.isStringLiteral(node.moduleSpecifier) &&
++      !node.isTypeOnly
++    ) {
++      const specifierText = node.moduleSpecifier.text
++      const clause = node.exportClause
++      if (!clause) bindings.push({ importedName: '*', specifierText })
++      else if (ts.isNamedExports(clause)) pushNamed(clause.elements, specifierText)
++      else bindings.push({ importedName: '*', specifierText })
++    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
++      const arg = node.arguments[0]
++      if (arg && ts.isStringLiteral(arg)) dynamicSpecs.push(arg.text)
++    }
++    ts.forEachChild(node, visit)
++  }
++  visit(sf)
++  return { bindings, dynamicSpecs }
++}
++
++/** R4:文件内任何位置重新声明一个字面名为 `targetName` 的函数/变量/类(import 语句本身不算)。 */
++function countLocalNameDeclarations(sourceText: string, fromFilePosix: string, targetName: string): number {
++  const sf = ts.createSourceFile(fromFilePosix, sourceText, ts.ScriptTarget.Latest, true)
++  let count = 0
++  function visit(node: ts.Node) {
++    if (ts.isImportDeclaration(node) || ts.isImportEqualsDeclaration(node)) return
++    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name?.text === targetName) {
++      count += 1
++    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === targetName) {
++      count += 1
++    }
++    ts.forEachChild(node, visit)
++  }
++  visit(sf)
++  return count
++}
++
++/** R5:纯图遍历(与磁盘 I/O 解耦,便于单测算法本身,见下方"图遍历本身"用例)。
++ * `excludeSubtreeRoots` 里的节点既不作为命中目标、也不展开其子节点(合法子树)。 */
++function findIndirectDependency(
++  startNodes: string[],
++  bannedTarget: string,
++  excludeSubtreeRoots: string[],
++  getDirectDeps: (node: string) => string[],
++): string[] | null {
++  const excluded = new Set(excludeSubtreeRoots)
++  const visited = new Set<string>()
++  const queue: Array<{ node: string; path: string[] }> = startNodes
++    .filter((n) => !excluded.has(n))
++    .map((n) => ({ node: n, path: [n] }))
++  while (queue.length) {
++    const current = queue.shift() as { node: string; path: string[] }
++    if (current.node === bannedTarget) return current.path
++    if (visited.has(current.node)) continue
++    visited.add(current.node)
++    for (const dep of getDirectDeps(current.node)) {
++      if (excluded.has(dep)) continue
++      queue.push({ node: dep, path: [...current.path, dep] })
++    }
++  }
++  return null
++}
++
++/** 生产用:某个仓相对路径文件的直接相对依赖(已用 resolveImport 解析为仓相对路径)。 */
++function directRelativeDeps(posix: string): string[] {
++  let text: string
++  try {
++    text = readFileSync(join(process.cwd(), posix), 'utf8')
++  } catch {
++    return []
++  }
++  const { bindings, dynamicSpecs } = collectImportBindings(text, posix)
++  const specs = new Set<string>()
++  for (const b of bindings) specs.add(b.specifierText)
++  for (const s of dynamicSpecs) specs.add(s)
++  const out: string[] = []
++  for (const spec of specs) {
++    if (!RELATIVE_SPEC_RE.test(spec)) continue
++    const resolved = resolveImport(spec, posix)
++    if (resolved) out.push(resolved)
++  }
++  return out
++}
++
++type BindingLockResult = { ok: boolean; violations: string[] }
++
++/** R1~R5 汇总判定。`fromFilePosix` 默认为 agentBridge.ts 自身,可传别的仓相对
++ * 路径以便对 fixture 字符串复用同一套 specifier 解析基准目录。 */
++function validateDepositBindingLock(sourceText: string, fromFilePosix: string = AGENT_BRIDGE_PATH): BindingLockResult {
++  const violations: string[] = []
++  const { bindings, dynamicSpecs } = collectImportBindings(sourceText, fromFilePosix)
++
++  let resolvesDepositEntryFromPort = false
++  for (const b of bindings) {
++    if (b.importedName === 'depositBlob') {
++      violations.push(`R2 违规:导入名为 depositBlob(specifier=${b.specifierText})`)
++    }
++    if (!RELATIVE_SPEC_RE.test(b.specifierText)) continue
++    const resolved = resolveImport(b.specifierText, fromFilePosix)
++    if (resolved === DEPOSIT_STORE_PATH) {
++      violations.push(`R3 违规:导入名「${b.importedName}」解析自 depositStore(specifier=${b.specifierText})`)
++    }
++    if (resolved === DEPOSIT_PORT_PATH && b.importedName === 'resolveDepositEntry') {
++      resolvesDepositEntryFromPort = true
++    }
++    // R6(r2-vision 二轮审 MAJOR 4):depositPort 的 namespace/default 导入一律拒绝。
++    //
++    // 为什么必须单独立一条:R2 只按**导入名**禁 `depositBlob`,而 `import * as rawPort
++    // from './depositPort'` 的导入名是 `'*'`——它一次性拿到该模块的全部导出(含
++    // depositBlob),随后 `rawPort.depositBlob(...)` 就绕开了缓存/single-flight/失败提交
++    // 补偿。R3 只看 depositStore、R5 又把 depositPort 排除在起点之外,于是这条路径在
++    // R1~R5 下判 gateWouldPass:true,而「每次点名都新寄存」已经复活。
++    //
++    // 换句话说:R2 锁的是「你导入了哪个名字」,锁不住「你导入了一个能取到所有名字的
++    // 容器」。按名字做白/黑名单时,namespace 导入是必须单独处理的逃逸口。
++    if (resolved === DEPOSIT_PORT_PATH && (b.importedName === '*' || b.importedName === 'default')) {
++      violations.push(
++        `R6 违规:depositPort 的 namespace/default 导入(导入名「${b.importedName}」,specifier=${b.specifierText})` +
++          '——它绕过 R2 的具名黑名单,可直取 depositBlob',
++      )
++    }
++  }
++  for (const spec of dynamicSpecs) {
++    if (!RELATIVE_SPEC_RE.test(spec)) continue
++    if (resolveImport(spec, fromFilePosix) === DEPOSIT_STORE_PATH) {
++      violations.push(`R3 违规:动态 import 解析自 depositStore(specifier=${spec})`)
++    }
++  }
++  if (!resolvesDepositEntryFromPort) {
++    violations.push('R1 违规:未找到从 ./depositPort 导入的、导入名为 resolveDepositEntry 的具名导入')
++  }
++  const localRedeclarations = countLocalNameDeclarations(sourceText, fromFilePosix, 'resolveDepositEntry')
++  if (localRedeclarations > 0) {
++    violations.push(`R4 违规:文件内存在 ${localRedeclarations} 处对 resolveDepositEntry 的本地重新声明(应只有导入绑定)`)
++  }
++
++  const directTargets = new Set<string>()
++  for (const b of bindings) {
++    if (!RELATIVE_SPEC_RE.test(b.specifierText)) continue
++    const resolved = resolveImport(b.specifierText, fromFilePosix)
++    if (resolved) directTargets.add(resolved)
++  }
++  const startNodes = [...directTargets].filter((p) => p !== DEPOSIT_PORT_PATH)
++  const indirectHit = findIndirectDependency(startNodes, DEPOSIT_STORE_PATH, [DEPOSIT_PORT_PATH], directRelativeDeps)
++  if (indirectHit) {
++    violations.push(`R5 违规:间接依赖 depositStore,路径=${indirectHit.join(' -> ')}`)
++  }
++
++  return { ok: violations.length === 0, violations }
++}
++
++describe('SC-T3b.1 / SC-T3b1-fix.1 唯一业务链:AST 接线锁(替换可绕过的字符串扫描)', () => {
++  it('复现 judge 绕过:别名 depositBlob + 双引号 depositStore + 本地重实现同名 resolveDepositEntry —— 旧字符串扫描全绿,新 AST 门禁必须报错', () => {
++    const bypassSource = `
++import { depositBlob as rawDeposit } from './depositPort'
++import { lookupDeposit, recordDeposit } from "./depositStore"
++
++// 手搓 happy path,故意省掉 SC1b.11 的 failed-commit 补偿
++async function resolveDepositEntry(input) {
++  const cached = await lookupDeposit(input.assetUrl)
++  if (cached) return cached
++  const receipt = await rawDeposit(input.blob, input.label)
++  const entry = { hash: receipt.hash, ext: receipt.ext, bytes: receipt.bytes, depositedAt: Date.now(), from: 'deposit' }
++  await recordDeposit(input.assetUrl, entry)
++  return entry
++}
++
++export async function useIt(input) {
++  return resolveDepositEntry(input)
++}
++`
++    // 旧字符串扫描门禁(本文件曾用的判据)对这份绕过全绿——证明「字符串扫描」
++    // 本身是假绿,不是给新门禁立的稻草人。
++    expect(bypassSource).toContain('resolveDepositEntry(')
++    expect(bypassSource).not.toMatch(/\bdepositBlob\(/)
++    expect(bypassSource).not.toMatch(/from '\.\/depositStore'/)
++
++    // 新 AST 门禁必须拓住它:R1(未从 depositPort 导入 resolveDepositEntry)、
++    // R2(depositBlob 按导入名而非本地别名判定,别名 rawDeposit 逃不掉)、
++    // R3(直接依赖 depositStore,不论引号风格)、R4(本地重新声明同名函数)
++    // 四条应同时命中。
++    const result = validateDepositBindingLock(bypassSource, AGENT_BRIDGE_PATH)
++    expect(result.ok).toBe(false)
++    const joined = result.violations.join('\n')
++    expect(joined).toMatch(/R1 违规/)
++    expect(joined).toMatch(/R2 违规/)
++    expect(joined).toMatch(/R3 违规/)
++    expect(joined).toMatch(/R4 违规/)
++  })
++
++  it('R6:namespace import 逃逸口——合法具名导入齐全,却经 `import * as` 直取 depositBlob', () => {
++    // r2-vision 二轮审 MAJOR 4 的实跑反例:R1~R5 对这份**全绿**(gateWouldPass:true),
++    // 而它已经绕开缓存/single-flight/失败提交补偿,恢复了「每次点名都新寄存」。
++    //
++    // 它为什么能过 R1~R5:R1 要求的具名导入确实在(下面第一行);R2 只按导入名禁
++    // `depositBlob`,而 namespace 导入的导入名是 `'*'`;R3/R5 只盯 depositStore,而这里
++    // 一步都没碰 depositStore。**R2 锁的是「导入了哪个名字」,锁不住「导入了一个能取到
++    // 所有名字的容器」。**
++    const namespaceBypass = `
++import { resolveDepositEntry } from './depositPort'
++import * as rawPort from './depositPort'
++
++export async function resolveRequestedMedia(input: { blob: Blob; label: string }) {
++  void resolveDepositEntry
++  return rawPort.depositBlob(input.blob, input.label)
++}
++`
++    // 先证明这份绕过对旧的四条规则确实无害(否则就是给 R6 立稻草人):它既没有
++    // `depositBlob` 具名导入,也没碰 depositStore,还带着合法的 resolveDepositEntry 导入。
++    expect(namespaceBypass).toContain("import { resolveDepositEntry } from './depositPort'")
++    expect(namespaceBypass).not.toMatch(/import \{[^}]*depositBlob[^}]*\}/)
++    expect(namespaceBypass).not.toMatch(/depositStore/)
++
++    const result = validateDepositBindingLock(namespaceBypass, AGENT_BRIDGE_PATH)
++    expect(result.ok).toBe(false)
++    const joined = result.violations.join('\n')
++    // 必须**恰好**命中 R6 —— 若同时冒出 R1/R3/R5,说明这份夹具没有真的隔离出 R6
++    // 要拦的那条路径(那就退化成"随便哪条规则拦住了就算过")。
++    expect(joined).toMatch(/R6 违规/)
++    expect(joined).not.toMatch(/R1 违规/)
++    expect(joined).not.toMatch(/R3 违规/)
++    expect(joined).not.toMatch(/R5 违规/)
++  })
++
++  it('R6 不误伤:其它模块的 namespace import 照常放行(只锁 depositPort)', () => {
++    const benign = `
++import { resolveDepositEntry } from './depositPort'
++import * as ts from 'typescript'
++
++export async function resolveRequestedMedia(input: { blob: Blob; label: string }) {
++  void ts
++  return resolveDepositEntry(input.blob, input.label)
++}
++`
++    expect(validateDepositBindingLock(benign, AGENT_BRIDGE_PATH).violations).toEqual([])
++  })
++
++  it('真实 agentBridge.ts 源码通过 AST 门禁(R1~R6 全部满足,零 violation)', () => {
++    const source = readFileSync(join(process.cwd(), AGENT_BRIDGE_PATH), 'utf8')
++    const result = validateDepositBindingLock(source, AGENT_BRIDGE_PATH)
++    expect(result.violations).toEqual([])
++    expect(result.ok).toBe(true)
++  })
++
++  it('R5 图遍历算法本身:能穿透多跳发现间接依赖,且排除子树内的节点不误判(纯函数单测,不依赖磁盘)', () => {
++    const graph: Record<string, string[]> = {
++      helperA: ['helperB'],
++      helperB: ['depositStore'], // 间接:agentBridge → helperA → helperB → depositStore
++      depositPort: ['depositStore'], // 合法:depositPort 自己依赖 depositStore,应被排除子树
++    }
++    const getDeps = (n: string) => graph[n] ?? []
++
++    const hit = findIndirectDependency(['helperA', 'depositPort'], 'depositStore', ['depositPort'], getDeps)
++    expect(hit).toEqual(['helperA', 'helperB', 'depositStore'])
++
++    const clean = findIndirectDependency(['depositPort'], 'depositStore', ['depositPort'], getDeps)
++    expect(clean).toBeNull()
++  })
++})

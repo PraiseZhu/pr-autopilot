@@ -1,0 +1,109 @@
+diff --git a/ghost.json b/ghost.json
+index bfe519d1..fa9e3e61 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.23",
++  "version": "0.9.24",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/main.js b/main.js
+index c58247c1..f6b9984d 100644
+--- a/main.js
++++ b/main.js
+@@ -139,7 +139,9 @@ const DIAG_REASON_PATTERNS = [
+   [/parse|json|invalid|malformed|非法|格式/i, 'malformed'],
+ ]
+ 
+-/** FNV-1a 32 位:同一故障文本得到同一短签名,不可逆、无内容。 */
++/** FNV-1a 32 位:同一故障文本得到同一短签名。**稳定短签名(非密码学,用于对账不用于
++ *  保密)** —— 32 位空间可枚举,别把它当「读不出原文」的保证;它的用途是「同一个值
++ *  在不同日志条目之间对得上」,而「不落原文」是靠这里只输出签名+长度实现的。 */
+ function diagSig(text) {
+   let hash = 0x811c9dc5
+   for (let i = 0; i < text.length; i += 1) {
+@@ -2709,7 +2711,8 @@ function mivoChannelFor(model) {
+   const channel = MIVO_MODEL_CHANNEL[requested]
+   if (channel && MIVO_CHANNELS[channel]) return channel
+   // 未知值来自面板/宿主消息,属**外部自由文本**:diagSkip 是 warn 级、会远程持久化,
+-  // 按 docs/development-logging.md 只记稳定签名(长度 + 不可逆 FNV 短签名),不落原文
++  // 按 docs/development-logging.md 只记稳定短签名(长度 + FNV 短签名,非密码学:用于对账
++  // 不用于保密),不落原文
+   // (PR-1 R1 M4)。同一个未知值恒得同一 sig,对账照旧做得到。
+   diagSkip(
+     DIAG_SOURCE.gen,
+diff --git a/src/cindy-theme.css b/src/cindy-theme.css
+index 078e6313..672a9bf2 100644
+--- a/src/cindy-theme.css
++++ b/src/cindy-theme.css
+@@ -226,16 +226,33 @@
+ }
+ 
+ /* 富文本输入区:比面板抬升一档 + 描边加重,Dark 下才看得出这是个"可输入的框"
+-   (原来 --panel-2 = 面板同色,框消失了)。 */
+-.region-edit-input {
++   (原来 --panel-2 = 面板同色,框消失了)。
++   K7 ① → K8 ①:描边/底色上提到**输入面板本体**(.region-edit-input-panel —— 它现在就是
++   那张卡,里面还装着模型下拉与提交按钮那一行),内层输入框在 App.css 里已退掉自己那一份,
++   所以这里也跟着搬 —— 否则 Dark 下会出现「卡片一个框、输入框又一个框」。
++   focus 态挂面板的 focus-within。
++   K9:选择器补上共享骨架类变成**复合选择器**。App.css 那侧为了压过共享骨架的写死浅底,
++   已经把壳视觉提到 `.region-edit-panel.image-mask-edit-prompt`(0-2-0);本文件虽然加载在后,
++   但特异度低就是压不过,单类写法会让暗色映射失效。 */
++.region-edit-input-panel.image-mask-edit-prompt {
+   background: color-mix(in srgb, var(--text-primary, #232323) 5%, var(--surface-elevated, #fffaf0));
+   border-color: color-mix(in srgb, var(--text-primary, #232323) 16%, var(--border-default, #d6d0c6));
+ }
+ 
+-.region-edit-input:focus {
++.region-edit-input-panel.image-mask-edit-prompt:focus-within {
+   border-color: color-mix(in srgb, var(--text-primary, #232323) 30%, var(--border-default, #d6d0c6));
+ }
+ 
++/* 工具面板(K9 ②:用户真机「暗色下工具面板还是白底」)。K8 拆双浮层时只给输入面板留了
++   这份抬升映射,工具面板从此自己是一张卡、却没人给它接肤 —— 缺省落回 App.css 的
++   --panel-surface(暗色下宿主给的是 --surface-elevated,本该是暗的),但共享骨架的写死
++   rgba(255,253,248,.96) 又把它压掉,于是两套皮肤下都是奶油白。App.css 侧已用复合选择器
++   把底色接回 token,这里给它与输入面板同一档的抬升(两块卡同色,不出现色差)。 */
++.region-edit-tool-panel.image-mask-edit-toolbar {
++  background: color-mix(in srgb, var(--text-primary, #232323) 5%, var(--surface-elevated, #fffaf0));
++  border-color: color-mix(in srgb, var(--text-primary, #232323) 16%, var(--border-default, #d6d0c6));
++}
++
+ /* 出图模型下拉(K1 Task 2):与富文本输入区同一档抬升 —— 缺省的 --panel-surface 在
+    Dark 下是奶油实底,一个亮色下拉贴在暗面板上就是「贴纸」(2026-07-31 用户点名过
+    同一类问题)。文字**故意不覆写**:正文走 --ink(映射到 --text-primary),两套皮肤的
+@@ -261,15 +278,26 @@
+   border-color: color-mix(in srgb, var(--text-primary, #232323) 14%, var(--border-default, #d6d0c6));
+ }
+ 
+-/* 面板按钮:底 = 轻抬升(不是奶油实底),描边随主题;hover/active 走上面的 token。 */
++/* 面板按钮:底 = 轻抬升(不是奶油实底),描边随主题;hover/active 走上面的 token。
++   K7 ③:✕ 已删,选择器里的 .image-mask-edit-close 随之去掉(老局部重绘浮层的 ✕ 不在
++   .region-edit-panel 作用域内,不受影响)。 */
+ .region-edit-panel .image-mask-edit-tools button,
+-.region-edit-panel .image-mask-edit-history button,
+-.region-edit-panel .image-mask-edit-close {
++.region-edit-panel .image-mask-edit-history button {
+   color: color-mix(in srgb, var(--text-primary, #554f48) 84%, var(--surface, #fffaf0));
+   background: color-mix(in srgb, var(--text-primary, #232323) 5%, var(--surface-elevated, #fffaf0));
+   border-color: color-mix(in srgb, var(--text-primary, #232323) 14%, var(--border-default, #d6d0c6));
+ }
+ 
++/* 工具按钮去框(K8 ②)在暗皮肤下的同款:上面那条「面板按钮 = 轻抬升底 + 描边」对
++   **工具面板**里的按钮一律退掉 —— 参考图的形态是裸图标+文字,底与描边只在 hover
++   (--region-btn-hover,已随文字色推导)与 active(强调块)时出现。文字色**不覆写**:
++   走 --text-primary 映射,两肤对比度由宿主的文字角色保证(同 J4 ⑧ 的处理)。 */
++.region-edit-tool-panel.image-mask-edit-toolbar .image-mask-edit-tools button:not(.active),
++.region-edit-tool-panel.image-mask-edit-toolbar .image-mask-edit-history button {
++  background: none;
++  border-color: transparent;
++}
++
+ /* ── 选区快捷工具条(单选/多选浮条 + 文字排版条):刻意不做主题跟随 ──
+    用户决定(2026-07-31):浮条永远保持 App.css 的深色块(rgba(28,28,27) 底 +
+    米白字),Light/Dark 换肤都不影响——不要给它加主题化规则。 */

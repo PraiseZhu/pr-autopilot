@@ -1,0 +1,664 @@
+diff --git a/ghost.json b/ghost.json
+index 37dc6124..f4738581 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.12",
++  "version": "0.9.13",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/main.js b/main.js
+index 09fef894..97311a88 100644
+--- a/main.js
++++ b/main.js
+@@ -4308,7 +4308,12 @@ async function handleToolCall(msg) {
+       // §2.1.1-④/§2.10):每个请求的 id 一律判 panel_closed(既有 PANEL_CLOSED
+       // 语义),不新造平行的"离线不可看"概念;真实逐 id 语义只在面板在线时才有意义。
+       if (picked.mediaNodeIds && picked.mediaNodeIds.length) {
+-        offline.mediaStates = {}
++        // 原型污染硬门(#297 T3b1-fix SC-T3b1-fix.2,judge finding P1-B2,与
++        // agentBridge.ts 的 live 侧同一套语义):picked.mediaNodeIds 校验只保证
++        // 非空字符串/不重复/≤8 个,合法 id `__proto__` 能通过。普通 `{}` 上
++        // `mediaStates['__proto__'] = ...` 会替换掉 mediaStates 的原型而不是
++        // 产生 own state——条目静默消失,下面的 mediaSummary 计数也会悄悄少算。
++        offline.mediaStates = Object.create(null)
+         for (const id of picked.mediaNodeIds) {
+           offline.mediaStates[id] = { state: 'unavailable', reason: 'panel_closed' }
+         }
+diff --git a/src/__tests__/agentBridgeMediaResolve.test.ts b/src/__tests__/agentBridgeMediaResolve.test.ts
+index c543195b..8f5448d9 100644
+--- a/src/__tests__/agentBridgeMediaResolve.test.ts
++++ b/src/__tests__/agentBridgeMediaResolve.test.ts
+@@ -19,6 +19,17 @@
+  * 段边界:imageRef 按 T0 冻结契约解析 → 真实 Read → byteDigest 对账(SC-T3b.4)
+  * 需要 deposit 通道真正通电,归 T3b2(DoR = T1f),本文件不测、不声称交付。
+  *
++ * #297 T3b1-fix(judge 判 T3b1 BLOCKED,4 条 P1,本次返修):
++ *  - SC-T3b1-fix.1(P1-B1):唯一业务链接线锁改用 AST/import-graph 校验(见下方
++ *    「AST 接线锁」小节),替换可被别名/双引号 import 绕过的字符串扫描。
++ *  - SC-T3b1-fix.2(P1-B2):live 侧 mediaStates 原型污染硬门(main.js 的 offline
++ *    侧同一修法,回归测试在 brainSnapshot.test.ts)。
++ *  - SC-T3b1-fix.3(P1-B3):imageRef 的 ext 校验/规范化收口到 mediaRefFormat.ts
++ *    单一入口,legacy 无点 ext 显式补点,非法 ext fail closed。
++ *  - SC-T3b1-fix.4(P1-B4):diag trigger 改走可复用的 `logDepositDiagOutcome`
++ *    入口(typed 'edit'|'snapshot');edit 侧调用口在 cindyGenerationPort.ts
++ *    (T1e 领地),本文件只证明共享入口本身对两种 trigger 值都正确成形。
++ *
+  * 端到端跑在真实 depositPort.ts/depositStore.ts + 真实 main.js(经
+  * depositTestHarness 的假宿主)之上,不是对着替身自说自话——与
+  * depositPort.test.ts 同一套基础设施,只是驱动方式换成真实 agentBridge.ts 的
+@@ -26,6 +37,10 @@
+  * 同一套桥接手法)。
+  */
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++import ts from 'typescript'
++import { resolveImport } from '../../../scripts/codemap.mjs'
+ 
+ vi.hoisted(() => {
+   const store = new Map<string, string>()
+@@ -79,13 +94,208 @@ import {
+   type DepositHarness,
+ } from './depositTestHarness'
+ import { resetCanvasWriteGateForTests } from '../../../src/agent/canvasWriteGate'
+-import { installAgentBridge, mediaFailureReasonFor } from '../agent/agentBridge'
++import { installAgentBridge, logDepositDiagOutcome, mediaFailureReasonFor } from '../agent/agentBridge'
+ import { DepositError, setDepositSleepForTests, type DepositFailureCode } from '../agent/depositPort'
+-import { lookupDeposit } from '../agent/depositStore'
++import { lookupDeposit, recordMigration } from '../agent/depositStore'
++import { buildImageRef, normalizeImageRefExt } from '../agent/mediaRefFormat'
+ import { useCanvasStore } from '../../../src/store/canvasStore'
+ import { debugLogger, useDebugLogStore } from '../../../src/store/debugLogStore'
+ import type { MivoCanvasNode } from '../../../src/types/mivoCanvas'
+ 
++// ── SC-T3b1-fix.1(judge finding P1-B1)AST 接线锁 ──────────────────────────
++//
++// judge 实跑证明:把 agentBridge.ts 改成 `depositBlob as rawDeposit` 别名导入 +
++// `from "./depositStore"` 双引号导入 + 本地重实现一个同名 `resolveDepositEntry`
++// 函数(手搓 happy path,省略 SC1b.11 的 failed-commit 补偿),旧的字符串扫描
++// 门禁(本文件曾用的 `toContain('resolveDepositEntry(')` /
++// `not.toMatch(/\bdepositBlob\(/)` / `not.toMatch(/from '\.\/depositStore'/)`)
++// 25/25 全绿——别名 import / 双引号 import / 本地同名函数三种手法都能绕开纯
++// 文本匹配。改用 TS AST 解析(`ts.createSourceFile`,与 scripts/ci/cycle-guard.mjs
++// 同一套思路),按「绑定来源」而非字面文本判定:
++//   R1 必须存在从 './depositPort' 导入的、**导入名**(而非本地别名)为
++//      'resolveDepositEntry' 的具名导入;
++//   R2 禁止任何导入的**导入名**为 'depositBlob'(无论来自哪个模块、起什么别名);
++//   R3 禁止任何 import / export-from / 动态 import 的模块说明符解析(复用
++//      scripts/codemap.mjs 的 resolveImport,不重复实现路径解析)到
++//      depositStore.ts,不论引号风格;
++//   R4 禁止在文件内任何位置(模块顶层或嵌套作用域)重新声明一个字面名为
++//      'resolveDepositEntry' 的函数/变量/类——这正是 judge 绕过的核心手法
++//      (纯粹的导入检查天生不认识"同名但没有导入关系"的本地重实现);
++//   R5 间接依赖:agentBridge.ts 直接 import 的其它本地模块(排除 depositPort.ts
++//      自身子树——它本就合法依赖 depositStore),递归展开后同样不得触达
++//      depositStore.ts。
++const AGENT_BRIDGE_PATH = 'cindyplugin/src/agent/agentBridge.ts'
++const DEPOSIT_PORT_PATH = 'cindyplugin/src/agent/depositPort.ts'
++const DEPOSIT_STORE_PATH = 'cindyplugin/src/agent/depositStore.ts'
++const RELATIVE_SPEC_RE = /^\.\.?\//
++
++type ImportBinding = { importedName: string; specifierText: string }
++
++/** 收集一份源码里全部非 type-only 的 import 具名绑定 + export-from 具名重导出 +
++ * 动态 import 的模块说明符(AST 层面,天然不受引号风格/别名影响)。 */
++function collectImportBindings(
++  sourceText: string,
++  fromFilePosix: string,
++): { bindings: ImportBinding[]; dynamicSpecs: string[] } {
++  const sf = ts.createSourceFile(fromFilePosix, sourceText, ts.ScriptTarget.Latest, true)
++  const bindings: ImportBinding[] = []
++  const dynamicSpecs: string[] = []
++
++  const pushNamed = (elements: ts.NodeArray<ts.ImportSpecifier | ts.ExportSpecifier>, specifierText: string) => {
++    for (const el of elements) {
++      if (el.isTypeOnly) continue
++      bindings.push({ importedName: (el.propertyName ?? el.name).text, specifierText })
++    }
++  }
++
++  function visit(node: ts.Node) {
++    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
++      const specifierText = node.moduleSpecifier.text
++      const clause = node.importClause
++      if (clause && !clause.isTypeOnly) {
++        if (clause.name) bindings.push({ importedName: 'default', specifierText })
++        const named = clause.namedBindings
++        if (named) {
++          if (ts.isNamespaceImport(named)) bindings.push({ importedName: '*', specifierText })
++          else if (ts.isNamedImports(named)) pushNamed(named.elements, specifierText)
++        }
++      }
++    } else if (
++      ts.isExportDeclaration(node) &&
++      node.moduleSpecifier &&
++      ts.isStringLiteral(node.moduleSpecifier) &&
++      !node.isTypeOnly
++    ) {
++      const specifierText = node.moduleSpecifier.text
++      const clause = node.exportClause
++      if (!clause) bindings.push({ importedName: '*', specifierText })
++      else if (ts.isNamedExports(clause)) pushNamed(clause.elements, specifierText)
++      else bindings.push({ importedName: '*', specifierText })
++    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
++      const arg = node.arguments[0]
++      if (arg && ts.isStringLiteral(arg)) dynamicSpecs.push(arg.text)
++    }
++    ts.forEachChild(node, visit)
++  }
++  visit(sf)
++  return { bindings, dynamicSpecs }
++}
++
++/** R4:文件内任何位置重新声明一个字面名为 `targetName` 的函数/变量/类(import 语句本身不算)。 */
++function countLocalNameDeclarations(sourceText: string, fromFilePosix: string, targetName: string): number {
++  const sf = ts.createSourceFile(fromFilePosix, sourceText, ts.ScriptTarget.Latest, true)
++  let count = 0
++  function visit(node: ts.Node) {
++    if (ts.isImportDeclaration(node) || ts.isImportEqualsDeclaration(node)) return
++    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name?.text === targetName) {
++      count += 1
++    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === targetName) {
++      count += 1
++    }
++    ts.forEachChild(node, visit)
++  }
++  visit(sf)
++  return count
++}
++
++/** R5:纯图遍历(与磁盘 I/O 解耦,便于单测算法本身,见下方"图遍历本身"用例)。
++ * `excludeSubtreeRoots` 里的节点既不作为命中目标、也不展开其子节点(合法子树)。 */
++function findIndirectDependency(
++  startNodes: string[],
++  bannedTarget: string,
++  excludeSubtreeRoots: string[],
++  getDirectDeps: (node: string) => string[],
++): string[] | null {
++  const excluded = new Set(excludeSubtreeRoots)
++  const visited = new Set<string>()
++  const queue: Array<{ node: string; path: string[] }> = startNodes
++    .filter((n) => !excluded.has(n))
++    .map((n) => ({ node: n, path: [n] }))
++  while (queue.length) {
++    const current = queue.shift() as { node: string; path: string[] }
++    if (current.node === bannedTarget) return current.path
++    if (visited.has(current.node)) continue
++    visited.add(current.node)
++    for (const dep of getDirectDeps(current.node)) {
++      if (excluded.has(dep)) continue
++      queue.push({ node: dep, path: [...current.path, dep] })
++    }
++  }
++  return null
++}
++
++/** 生产用:某个仓相对路径文件的直接相对依赖(已用 resolveImport 解析为仓相对路径)。 */
++function directRelativeDeps(posix: string): string[] {
++  let text: string
++  try {
++    text = readFileSync(join(process.cwd(), posix), 'utf8')
++  } catch {
++    return []
++  }
++  const { bindings, dynamicSpecs } = collectImportBindings(text, posix)
++  const specs = new Set<string>()
++  for (const b of bindings) specs.add(b.specifierText)
++  for (const s of dynamicSpecs) specs.add(s)
++  const out: string[] = []
++  for (const spec of specs) {
++    if (!RELATIVE_SPEC_RE.test(spec)) continue
++    const resolved = resolveImport(spec, posix)
++    if (resolved) out.push(resolved)
++  }
++  return out
++}
++
++type BindingLockResult = { ok: boolean; violations: string[] }
++
++/** R1~R5 汇总判定。`fromFilePosix` 默认为 agentBridge.ts 自身,可传别的仓相对
++ * 路径以便对 fixture 字符串复用同一套 specifier 解析基准目录。 */
++function validateDepositBindingLock(sourceText: string, fromFilePosix: string = AGENT_BRIDGE_PATH): BindingLockResult {
++  const violations: string[] = []
++  const { bindings, dynamicSpecs } = collectImportBindings(sourceText, fromFilePosix)
++
++  let resolvesDepositEntryFromPort = false
++  for (const b of bindings) {
++    if (b.importedName === 'depositBlob') {
++      violations.push(`R2 违规:导入名为 depositBlob(specifier=${b.specifierText})`)
++    }
++    if (!RELATIVE_SPEC_RE.test(b.specifierText)) continue
++    const resolved = resolveImport(b.specifierText, fromFilePosix)
++    if (resolved === DEPOSIT_STORE_PATH) {
++      violations.push(`R3 违规:导入名「${b.importedName}」解析自 depositStore(specifier=${b.specifierText})`)
++    }
++    if (resolved === DEPOSIT_PORT_PATH && b.importedName === 'resolveDepositEntry') {
++      resolvesDepositEntryFromPort = true
++    }
++  }
++  for (const spec of dynamicSpecs) {
++    if (!RELATIVE_SPEC_RE.test(spec)) continue
++    if (resolveImport(spec, fromFilePosix) === DEPOSIT_STORE_PATH) {
++      violations.push(`R3 违规:动态 import 解析自 depositStore(specifier=${spec})`)
++    }
++  }
++  if (!resolvesDepositEntryFromPort) {
++    violations.push('R1 违规:未找到从 ./depositPort 导入的、导入名为 resolveDepositEntry 的具名导入')
++  }
++  const localRedeclarations = countLocalNameDeclarations(sourceText, fromFilePosix, 'resolveDepositEntry')
++  if (localRedeclarations > 0) {
++    violations.push(`R4 违规:文件内存在 ${localRedeclarations} 处对 resolveDepositEntry 的本地重新声明(应只有导入绑定)`)
++  }
++
++  const directTargets = new Set<string>()
++  for (const b of bindings) {
++    if (!RELATIVE_SPEC_RE.test(b.specifierText)) continue
++    const resolved = resolveImport(b.specifierText, fromFilePosix)
++    if (resolved) directTargets.add(resolved)
++  }
++  const startNodes = [...directTargets].filter((p) => p !== DEPOSIT_PORT_PATH)
++  const indirectHit = findIndirectDependency(startNodes, DEPOSIT_STORE_PATH, [DEPOSIT_PORT_PATH], directRelativeDeps)
++  if (indirectHit) {
++    violations.push(`R5 违规:间接依赖 depositStore,路径=${indirectHit.join(' -> ')}`)
++  }
++
++  return { ok: violations.length === 0, violations }
++}
++
+ const CHANNEL = 'mivo-canvas-agent'
+ 
+ /** 起一个独立总线 + 真实桥(与 depositTestHarness 内部的假 main.js 总线互不相关,
+@@ -149,14 +359,65 @@ afterEach(() => {
+   vi.unstubAllGlobals()
+ })
+ 
+-describe('SC-T3b.1 唯一业务链(rg 源码接线锁)', () => {
+-  it('agentBridge.ts 只经 resolveDepositEntry 消费寄存,不直调 depositBlob、不 import depositStore', async () => {
+-    const source = await import('node:fs/promises').then((fs) =>
+-      fs.readFile(new URL('../agent/agentBridge.ts', import.meta.url), 'utf8'),
+-    )
+-    expect(source).toContain('resolveDepositEntry(')
+-    expect(source).not.toMatch(/\bdepositBlob\(/)
+-    expect(source).not.toMatch(/from '\.\/depositStore'/)
++describe('SC-T3b.1 / SC-T3b1-fix.1 唯一业务链:AST 接线锁(替换可绕过的字符串扫描)', () => {
++  it('复现 judge 绕过:别名 depositBlob + 双引号 depositStore + 本地重实现同名 resolveDepositEntry —— 旧字符串扫描全绿,新 AST 门禁必须报错', () => {
++    const bypassSource = `
++import { depositBlob as rawDeposit } from './depositPort'
++import { lookupDeposit, recordDeposit } from "./depositStore"
++
++// 手搓 happy path,故意省掉 SC1b.11 的 failed-commit 补偿
++async function resolveDepositEntry(input) {
++  const cached = await lookupDeposit(input.assetUrl)
++  if (cached) return cached
++  const receipt = await rawDeposit(input.blob, input.label)
++  const entry = { hash: receipt.hash, ext: receipt.ext, bytes: receipt.bytes, depositedAt: Date.now(), from: 'deposit' }
++  await recordDeposit(input.assetUrl, entry)
++  return entry
++}
++
++export async function useIt(input) {
++  return resolveDepositEntry(input)
++}
++`
++    // 旧字符串扫描门禁(本文件曾用的判据)对这份绕过全绿——证明「字符串扫描」
++    // 本身是假绿,不是给新门禁立的稻草人。
++    expect(bypassSource).toContain('resolveDepositEntry(')
++    expect(bypassSource).not.toMatch(/\bdepositBlob\(/)
++    expect(bypassSource).not.toMatch(/from '\.\/depositStore'/)
++
++    // 新 AST 门禁必须拓住它:R1(未从 depositPort 导入 resolveDepositEntry)、
++    // R2(depositBlob 按导入名而非本地别名判定,别名 rawDeposit 逃不掉)、
++    // R3(直接依赖 depositStore,不论引号风格)、R4(本地重新声明同名函数)
++    // 四条应同时命中。
++    const result = validateDepositBindingLock(bypassSource, AGENT_BRIDGE_PATH)
++    expect(result.ok).toBe(false)
++    const joined = result.violations.join('\n')
++    expect(joined).toMatch(/R1 违规/)
++    expect(joined).toMatch(/R2 违规/)
++    expect(joined).toMatch(/R3 违规/)
++    expect(joined).toMatch(/R4 违规/)
++  })
++
++  it('真实 agentBridge.ts 源码通过 AST 门禁(R1~R5 全部满足,零 violation)', () => {
++    const source = readFileSync(join(process.cwd(), AGENT_BRIDGE_PATH), 'utf8')
++    const result = validateDepositBindingLock(source, AGENT_BRIDGE_PATH)
++    expect(result.violations).toEqual([])
++    expect(result.ok).toBe(true)
++  })
++
++  it('R5 图遍历算法本身:能穿透多跳发现间接依赖,且排除子树内的节点不误判(纯函数单测,不依赖磁盘)', () => {
++    const graph: Record<string, string[]> = {
++      helperA: ['helperB'],
++      helperB: ['depositStore'], // 间接:agentBridge → helperA → helperB → depositStore
++      depositPort: ['depositStore'], // 合法:depositPort 自己依赖 depositStore,应被排除子树
++    }
++    const getDeps = (n: string) => graph[n] ?? []
++
++    const hit = findIndirectDependency(['helperA', 'depositPort'], 'depositStore', ['depositPort'], getDeps)
++    expect(hit).toEqual(['helperA', 'helperB', 'depositStore'])
++
++    const clean = findIndirectDependency(['depositPort'], 'depositStore', ['depositPort'], getDeps)
++    expect(clean).toBeNull()
+   })
+ })
+ 
+@@ -303,6 +564,70 @@ describe('SC-T3b.2 reason 枚举全量(DepositFailureCode → MediaUnavailableRe
+   })
+ })
+ 
++describe('SC-T3b1-fix.3 imageRef 的 ext 格式化/校验(judge finding P1-B3,mediaRefFormat.ts 单一入口,fail closed)', () => {
++  it('带点 ext 原样接受', () => {
++    expect(normalizeImageRefExt('.png')).toEqual({ ok: true, ext: '.png' })
++    expect(buildImageRef(FAKE_HASH, '.png')).toBe(`cindy-media://blobs/${FAKE_HASH}.png`)
++  })
++
++  it('legacy 不带点 ext(saveMessage/附件通道与部分存量 ledger 的约定)显式规范化为带点', () => {
++    expect(normalizeImageRefExt('png')).toEqual({ ok: true, ext: '.png' })
++    expect(buildImageRef(FAKE_HASH, 'png')).toBe(`cindy-media://blobs/${FAKE_HASH}.png`)
++  })
++
++  it('空 / 缺省 ext → fail closed', () => {
++    expect(normalizeImageRefExt('').ok).toBe(false)
++    expect(normalizeImageRefExt(undefined).ok).toBe(false)
++    expect(normalizeImageRefExt(null).ok).toBe(false)
++    expect(buildImageRef(FAKE_HASH, '')).toBeNull()
++  })
++
++  it('路径型 ext(疑似路径注入,如 ../x.png / a/b.png)→ fail closed', () => {
++    expect(normalizeImageRefExt('../x.png').ok).toBe(false)
++    expect(normalizeImageRefExt('a/b.png').ok).toBe(false)
++    expect(normalizeImageRefExt('a\\b.png').ok).toBe(false)
++    expect(buildImageRef(FAKE_HASH, '../x.png')).toBeNull()
++    expect(buildImageRef(FAKE_HASH, 'a/b.png')).toBeNull()
++  })
++
++  it('端到端:from=ledger 的存量条目 ext 不带点(judge finding P1-B3 的真实触发路径——迁移遗留,不是新鲜寄存回执)→ agentBridge 规范化为合法 imageRef,不判 available 却拼出非法 URI', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://legacy')] })
++    // agentBridge.ts 的 resolveRequestedMedia 不管 resolveDepositEntry 会不会命中
++    // 缓存,都先无条件取一次源图字节(§2.2)——即使本用例走的是缓存命中路径,
++    // 这个 mock 仍必须配好,否则会在 assetBlobForNode 这一步就先失败,测不到
++    // 真正要验证的 ext 规范化逻辑。
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++    await recordMigration(
++      [['mivo-asset://legacy', { hash: FAKE_HASH, ext: 'png', depositedAt: 0, from: 'ledger' }]],
++      { version: 1, at: 0, migrated: 1 },
++    )
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    expect(reply?.mediaStates).toEqual({
++      'img-1': { state: 'available', imageRef: `cindy-media://blobs/${FAKE_HASH}.png` },
++    })
++    // 命中缓存(resolveDepositEntry 的 lookupDeposit 命中),零新增寄存请求。
++    expect(harness.hostRequests).toHaveLength(0)
++  })
++
++  it('端到端:from=ledger 条目 ext 是路径型垃圾值(存量数据损坏/协议违规)→ 判 unavailable/unknown,绝不拼出非法 URI 却标 available', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://corrupt')] })
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++    await recordMigration(
++      [['mivo-asset://corrupt', { hash: FAKE_HASH, ext: '../evil', depositedAt: 0, from: 'ledger' }]],
++      { version: 1, at: 0, migrated: 1 },
++    )
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    expect(reply?.mediaStates).toEqual({ 'img-1': { state: 'unavailable', reason: 'unknown' } })
++    expect(harness.hostRequests).toHaveLength(0)
++  })
++})
++
+ describe('SC-T3b.3 要看才传 + from:deposit 记账 + 同批零新增配额', () => {
+   it('画布上有两张图,只点名一张 → 仅该张发起寄存请求(要看才传)', async () => {
+     useCanvasStore.setState({
+@@ -386,3 +711,37 @@ describe('SC-T3b.3 要看才传 + from:deposit 记账 + 同批零新增配额',
+     expect(useCanvasStore.getState().historyPast).toHaveLength(0)
+   })
+ })
++
++describe('SC-T3b1-fix.4 diag trigger 唯一入口(judge finding P1-B4,typed \'edit\'|\'snapshot\')', () => {
++  it("trigger='snapshot' 侧已在唯一业务链里接线(端到端,见上方「diag 日志区分 trigger=snapshot」用例)——本描述块只补 'edit' 侧的可复用入口验证", () => {
++    // 领地边界(#297 T3b1-fix 派工合同):trigger='edit' 的真实调用口在
++    // cindyGenerationPort.ts 的 resolveSourceEntry(DEPOSIT_ENABLED 守卫内,目前
++    // 该守卫恒为 false、也完全没有任何 diag 留痕),那个文件在 T1e 领地,不在本段。
++    // 这里只证明共享入口 logDepositDiagOutcome 本身对 trigger='edit' 也能正确
++    // 成形两种日志形态——T1e 接线 edit 侧时应直接复用它,不要另起一套字符串拼接。
++    const logSpy = vi.spyOn(debugLogger, 'log')
++    logDepositDiagOutcome('edit', { nodeId: 'node-e', hash: FAKE_HASH })
++    const successHit = logSpy.mock.calls.find(
++      ([source, message]) => source === 'Cindy Deposit' && String(message).includes('trigger=edit') && String(message).includes('node-e'),
++    )
++    expect(successHit).toBeTruthy()
++
++    const warnSpy = vi.spyOn(debugLogger, 'warn')
++    logDepositDiagOutcome('edit', { nodeId: 'node-e2', reason: 'quota_full', detail: 'x' })
++    const failureHit = warnSpy.mock.calls.find(
++      ([source, message]) => source === 'Cindy Deposit' && String(message).includes('trigger=edit') && String(message).includes('quota_full'),
++    )
++    expect(failureHit).toBeTruthy()
++  })
++
++  it("trigger 值必须原样出现,'edit'/'snapshot' 不会互相串", () => {
++    const logSpy = vi.spyOn(debugLogger, 'log')
++    logDepositDiagOutcome('snapshot', { nodeId: 'n1', hash: FAKE_HASH })
++    logDepositDiagOutcome('edit', { nodeId: 'n2', hash: FAKE_HASH })
++    const messages = logSpy.mock.calls.map(([, message]) => String(message))
++    expect(messages.some((m) => m.includes('trigger=snapshot') && m.includes('n1'))).toBe(true)
++    expect(messages.some((m) => m.includes('trigger=edit') && m.includes('n2'))).toBe(true)
++    expect(messages.some((m) => m.includes('trigger=snapshot') && m.includes('n2'))).toBe(false)
++    expect(messages.some((m) => m.includes('trigger=edit') && m.includes('n1'))).toBe(false)
++  })
++})
+diff --git a/src/__tests__/brainSnapshotMedia.test.ts b/src/__tests__/brainSnapshotMedia.test.ts
+index f7b5abdc..19970927 100644
+--- a/src/__tests__/brainSnapshotMedia.test.ts
++++ b/src/__tests__/brainSnapshotMedia.test.ts
+@@ -148,6 +148,32 @@ describe('canvas_snapshot mediaNodeIds 参数运输 + 校验 + offline 合成(#2
+     expect(sent?.result?.mediaSummary).toEqual({ requested: 2, available: 0, unavailable: 2 })
+   })
+ 
++  it('offline 合成:mediaNodeIds 含 __proto__ 不产生原型污染,恒等式仍成立(#297 T3b1-fix SC-T3b1-fix.2/P1-B2)', async () => {
++    const fixture = snapshotFixture([node('n-0')])
++    const brain = closedPanelBrain({ files: { 'canvases/ai-snapshot.json': JSON.stringify(fixture) } })
++    const pending = brain.handles.handleToolCall({
++      tool: 'canvas_snapshot',
++      callId: 'c1',
++      args: { mediaNodeIds: ['__proto__', 'img-2'] },
++    })
++    brain.clock.advance(6_000)
++    await pending
++
++    const sent = lastResult(brain)
++    expect(sent?.ok).toBe(true)
++    const mediaStates = sent?.result?.mediaStates as Record<string, unknown>
++    // 反证:普通 `{}` 会让 `__proto__` 赋值改写原型而非产生 own state——
++    // hasOwnProperty 读不到、Object.keys 看不到,summary 计数悄悄少 1(见下方
++    // toEqual 用 Object.create(null) 构造期望值,避免比较对象自身也踩同一个坑)。
++    expect(Object.prototype.hasOwnProperty.call(mediaStates, '__proto__')).toBe(true)
++    expect(Object.keys(mediaStates).sort()).toEqual(['__proto__', 'img-2'])
++    const expectedStates: Record<string, unknown> = Object.create(null)
++    expectedStates['__proto__'] = { state: 'unavailable', reason: 'panel_closed' }
++    expectedStates['img-2'] = { state: 'unavailable', reason: 'panel_closed' }
++    expect(mediaStates).toEqual(expectedStates)
++    expect(sent?.result?.mediaSummary).toEqual({ requested: 2, available: 0, unavailable: 2 })
++  })
++
+   it('offline + 未传 mediaNodeIds → 最终交卷对象不出现 mediaStates/mediaSummary(零请求路径不新造字段)', async () => {
+     const fixture = snapshotFixture([node('n-0')])
+     const brain = closedPanelBrain({ files: { 'canvases/ai-snapshot.json': JSON.stringify(fixture) } })
+diff --git a/src/__tests__/codemap.d.ts b/src/__tests__/codemap.d.ts
+new file mode 100644
+index 00000000..259ddc27
+--- /dev/null
++++ b/src/__tests__/codemap.d.ts
+@@ -0,0 +1,9 @@
++/**
++ * `scripts/codemap.mjs` 是纯 JS 工具脚本(仓库路径解析的唯一真相源,与
++ * scripts/ci/cycle-guard.mjs 共用),没有自己的类型声明。这里只声明
++ * agentBridgeMediaResolve.test.ts 的 AST 接线锁实际用到的那一个函数签名,
++ * 不代表该模块的完整公开面。
++ */
++declare module '*/scripts/codemap.mjs' {
++  export function resolveImport(specifier: string, fromFilePosix: string): string | null
++}
+diff --git a/src/agent/agentBridge.ts b/src/agent/agentBridge.ts
+index 185d3eaa..19881a67 100644
+--- a/src/agent/agentBridge.ts
++++ b/src/agent/agentBridge.ts
+@@ -29,6 +29,7 @@ import {
+ } from './cindyGenerationPort'
+ import { DepositError, resolveDepositEntry, type DepositFailureCode } from './depositPort'
+ import { initMediaLedger, lookupMedia } from './mediaLedger'
++import { buildImageRef } from './mediaRefFormat'
+ import { assetBlobForNode } from '../../../src/lib/mivoImageClient'
+ import { useCanvasStore } from '../../../src/store/canvasStore'
+ import type { AiCanvasContextNode } from '../../../src/types/mivoCanvas'
+@@ -133,6 +134,32 @@ const SNAPSHOT_MEDIA_LABEL = '画布快照参考图'
+  * 区分触发路径(设计稿 §2.3:trigger:'edit'|'snapshot')。 */
+ const SNAPSHOT_DEPOSIT_DIAG_SOURCE = 'Cindy Deposit'
+ 
++/**
++ * 寄存诊断留痕的唯一入口(#297 T3b1-fix SC-T3b1-fix.4):typed `trigger` 区分触发
++ * 路径,两侧落同形日志,不新增 DIAG_SOURCE 条目。本段(T3b1)只接线 `trigger:'snapshot'`
++ * 那一侧(唯一业务链见 `resolveRequestedMedia`);`trigger:'edit'` 那一侧的调用口
++ * (`cindyGenerationPort.ts` 的 `resolveSourceEntry`,在 `DEPOSIT_ENABLED` 守卫内)
++ * 不在本段领地——T1e 接线 edit 侧时应复用本函数,不要另起一套字符串拼接。
++ */
++export type DepositDiagTrigger = 'edit' | 'snapshot'
++
++export const logDepositDiagOutcome = (
++  trigger: DepositDiagTrigger,
++  outcome: { nodeId: string; hash: string } | { nodeId: string; reason: MediaUnavailableReason; detail: string },
++): void => {
++  if ('hash' in outcome) {
++    debugLogger.log(
++      SNAPSHOT_DEPOSIT_DIAG_SOURCE,
++      `deposit 完成(trigger=${trigger}):nodeId=${outcome.nodeId} hash=${outcome.hash.slice(0, 8)}`,
++    )
++  } else {
++    debugLogger.warn(
++      SNAPSHOT_DEPOSIT_DIAG_SOURCE,
++      `deposit 失败(trigger=${trigger}):nodeId=${outcome.nodeId} reason=${outcome.reason} ${outcome.detail}`,
++    )
++  }
++}
++
+ /**
+  * SC-T3b.1 唯一业务链(设计稿 §2.1.1「触发实现点」/§2.2):
+  *   本页 `page.snapshot.nodes` 校验(id 在这一页 + 是图片类型)
+@@ -148,7 +175,13 @@ const resolveRequestedMedia = async (
+   pageNodes: AiCanvasContextNode[],
+   mediaNodeIds: string[],
+ ): Promise<Record<string, MediaNodeState>> => {
+-  const states: Record<string, MediaNodeState> = {}
++  // 原型污染硬门(#297 T3b1-fix SC-T3b1-fix.2,judge finding P1-B2,与 depositStore.ts
++  // 的 `emptyRecord` 同一套语义):`id` 来自进程边界(main.js 经 BroadcastChannel
++  // 转发的 mediaNodeIds),合法非空字符串即可通过既有校验,包括 `__proto__`。普通
++  // `{}` 上 `states['__proto__'] = entry` 会替换掉 `states` 的原型而不是产生 own
++  // state——条目静默消失(hasOwnProperty 读不到,mediaSummary 计数悄悄少算),
++  // `Object.create(null)` 让 `__proto__` 退化成普通数据键。
++  const states: Record<string, MediaNodeState> = Object.create(null)
+   for (const id of mediaNodeIds) {
+     // 范围边界(设计稿 §2.5-②):点名的 id 必须出现在这次调用实际返回的这一页,
+     // 不允许跨页点名——不在这一页就是 not_in_page,不去查 store。
+@@ -171,20 +204,29 @@ const resolveRequestedMedia = async (
+     try {
+       const blob = await assetBlobForNode(storeNode)
+       const entry = await resolveDepositEntry({ assetUrl: storeNode.assetUrl, blob, label: SNAPSHOT_MEDIA_LABEL })
+-      debugLogger.log(
+-        SNAPSHOT_DEPOSIT_DIAG_SOURCE,
+-        `deposit 完成(trigger=snapshot):nodeId=${id} hash=${entry.hash.slice(0, 8)}`,
+-      )
+-      // §4.7 定案:回执只携带引用,永不内联 base64 图像内容。
+-      states[id] = { state: 'available', imageRef: `cindy-media://blobs/${entry.hash}${entry.ext}` }
++      logDepositDiagOutcome('snapshot', { nodeId: id, hash: entry.hash })
++      // §4.7 定案:回执只携带引用,永不内联 base64 图像内容。ext 校验/规范化的唯一
++      // 入口见 mediaRefFormat.ts(#297 T3b1-fix SC-T3b1-fix.3,judge finding P1-B3):
++      // legacy 无点 ext(from:'ledger' 存量条目常见)在这里显式补点,非法 ext(空/
++      // 路径型)fail closed 判 unavailable,不得原样拼出非法 URI 却标 available。
++      const imageRef = buildImageRef(entry.hash, entry.ext)
++      if (imageRef) {
++        states[id] = { state: 'available', imageRef }
++      } else {
++        logDepositDiagOutcome('snapshot', {
++          nodeId: id,
++          reason: 'unknown',
++          detail: `ext 非法,拒绝拼出非法 imageRef(fail closed):hash=${entry.hash.slice(0, 8)} ext=${JSON.stringify(entry.ext)}`,
++        })
++        states[id] = { state: 'unavailable', reason: 'unknown' }
++      }
+     } catch (error) {
+       const reason = mediaFailureReasonFor(error)
+-      debugLogger.warn(
+-        SNAPSHOT_DEPOSIT_DIAG_SOURCE,
+-        `deposit 失败(trigger=snapshot):nodeId=${id} reason=${reason} ${
+-          error instanceof Error ? error.message : String(error)
+-        }`,
+-      )
++      logDepositDiagOutcome('snapshot', {
++        nodeId: id,
++        reason,
++        detail: error instanceof Error ? error.message : String(error),
++      })
+       states[id] = { state: 'unavailable', reason }
+     }
+   }
+diff --git a/src/agent/mediaRefFormat.ts b/src/agent/mediaRefFormat.ts
+new file mode 100644
+index 00000000..ed8bb23b
+--- /dev/null
++++ b/src/agent/mediaRefFormat.ts
+@@ -0,0 +1,46 @@
++/**
++ * imageRef 的 ext 格式化/校验(#297 T3b1-fix SC-T3b1-fix.3,judge finding P1-B3)。
++ *
++ * 背景(dispatch 记录的已知陷阱):本仓 `ext` 有两套并存约定——`deposit_media` 回执
++ * 用 `.png`(带点,T0 冻结契约的形状),`saveMessage`/附件通道与部分存量账本用
++ * `png`(不带点,见 `depositFlagOff.test.ts` 同文件内两种夹具并存)。`depositMigration.ts`
++ * 的迁移器只校验 `typeof ext === 'string' && ext`,不要求带点——不带点的 ledger ext
++ * 会原样进 `depositMap`(`from:'ledger'`)。`agentBridge.ts` 的 imageRef 构造若原样
++ * 拼接该 ext,会产出 `cindy-media://blobs/<hash>png` 这种缺分隔点、宿主不识别的
++ * 非法 URI,却仍把该 id 标 `available`。
++ *
++ * 本模块是 imageRef 构造前 ext 校验/规范化的唯一入口:
++ *   - 带点且扩展名主体安全(字母数字)→ 原样接受;
++ *   - 不带点但主体本身安全(legacy 无点约定)→ 显式补点规范化;
++ *   - 空 / 含路径分隔符(`/`、`\`)/ 含 `..` / 主体不安全 → 拒绝(fail closed:调用方
++ *     必须把该 id 标 `unavailable`,不得原样拼出非法 URI 却标 `available`)。
++ */
++
++/** 扩展名主体(去掉可能存在的前导点后)必须是安全的字母数字串,长度封顶避免异常输入。 */
++const SAFE_EXT_BODY_RE = /^[a-zA-Z0-9]{1,16}$/
++
++export type ImageRefExtResult = { ok: true; ext: string } | { ok: false; reason: string }
++
++export const normalizeImageRefExt = (rawExt: unknown): ImageRefExtResult => {
++  if (typeof rawExt !== 'string' || !rawExt) {
++    return { ok: false, reason: 'ext 缺失或非字符串' }
++  }
++  if (rawExt.includes('/') || rawExt.includes('\\') || rawExt.includes('..')) {
++    return { ok: false, reason: `ext 含路径分隔符或上级引用,疑似路径注入:${rawExt}` }
++  }
++  const body = rawExt.startsWith('.') ? rawExt.slice(1) : rawExt
++  if (!SAFE_EXT_BODY_RE.test(body)) {
++    return { ok: false, reason: `ext 不是安全的字母数字扩展名:${rawExt}` }
++  }
++  return { ok: true, ext: `.${body}` }
++}
++
++/**
++ * imageRef(`cindy-media://blobs/<hash><ext>`)的唯一构造入口。ext 校验失败时返回
++ * `null`——调用方据此把该 id 判 `unavailable`(fail closed),不得退回到原样拼接。
++ */
++export const buildImageRef = (hash: string, rawExt: unknown): string | null => {
++  const extResult = normalizeImageRefExt(rawExt)
++  if (!extResult.ok) return null
++  return `cindy-media://blobs/${hash}${extResult.ext}`
++}

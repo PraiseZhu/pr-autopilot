@@ -1,0 +1,130 @@
+diff --git a/ghost.json b/ghost.json
+index 3c329a2f..085914ba 100644
+--- a/ghost.json
++++ b/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.8.1",
++  "version": "0.8.9",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+diff --git a/src/cindy-theme.css b/src/cindy-theme.css
+index b4d980be..794f423b 100644
+--- a/src/cindy-theme.css
++++ b/src/cindy-theme.css
+@@ -146,3 +146,7 @@
+   color: color-mix(in srgb, var(--text-secondary, #554f48) 42%, transparent);
+   background: transparent;
+ }
++
++/* ── 选区快捷工具条(单选/多选浮条 + 文字排版条):刻意不做主题跟随 ──
++   用户决定(2026-07-31):浮条永远保持 App.css 的深色块(rgba(28,28,27) 底 +
++   米白字),Light/Dark 换肤都不影响——不要给它加主题化规则。 */
+diff --git a/src/i18n/dict.ts b/src/i18n/dict.ts
+index 06a9cb29..011ec1aa 100644
+--- a/src/i18n/dict.ts
++++ b/src/i18n/dict.ts
+@@ -67,7 +67,8 @@ export const DICT_ZH_CN: Record<string, string> = {
+   Expand: '扩展',
+   Group: '编组',
+   Ungroup: '取消编组',
+-  'Tidy selection': '整理所选',
++  'Tidy up': '一键整理',
++  'Tidy up options': '整理方式',
+   'Download original': '下载原图',
+   'Boost resolution': '提升分辨率',
+   'Remove background': '移除背景',
+@@ -85,7 +86,6 @@ export const DICT_ZH_CN: Record<string, string> = {
+   'Align top': '顶对齐',
+   'Align middle': '垂直居中',
+   'Align bottom': '底对齐',
+-  Arrange: '排布',
+   'Arrange row': '排成一行',
+   'Arrange column': '排成一列',
+   'Arrange grid': '网格排布',
+@@ -101,6 +101,7 @@ export const DICT_ZH_CN: Record<string, string> = {
+   'Focus section': '聚焦分区',
+   'Rename section': '重命名分区',
+   'Remove section only': '仅删除分区',
++  Unlock: '解锁',
+   'Unlock section': '解锁分区',
+   'Lock all': '全部锁定',
+   'Lock background only': '仅锁定背景',
+@@ -115,6 +116,14 @@ export const DICT_ZH_CN: Record<string, string> = {
+   'Fill color': '填充色',
+   'No fill': '无填充',
+   'Corner radius': '圆角',
++  'Line color': '线条颜色',
++  'Line width': '线条粗细',
++  Border: '边框',
++  'Brush color': '画笔颜色',
++  'Brush width': '画笔粗细',
++  Solid: '实线',
++  Dashed: '虚线',
++  None: '无',
+   Arrowheads: '箭头样式',
+   'Both arrows': '双向箭头',
+   'End arrow': '末端箭头',
+@@ -218,17 +227,17 @@ export const DICT_JA: Record<string, string> = {
+   'Import asset': '素材を読み込む', 'Import asset folder': 'フォルダーから読み込む', 'Select area': '範囲選択',
+   'Add edit note': '編集メモを追加', 'AI Edit': 'AI編集', Edit: '編集', 'Edit text': 'テキストを編集',
+   'Edit with prompt': 'プロンプトで編集', Delete: '削除', Duplicate: '複製', Crop: '切り抜き',
+-  Expand: '拡張', Group: 'グループ化', Ungroup: 'グループ解除', 'Tidy selection': '選択を整列',
++  Expand: '拡張', Group: 'グループ化', Ungroup: 'グループ解除', 'Tidy up': '自動整列', 'Tidy up options': '整列オプション',
+   'Download original': '元画像をダウンロード', 'Boost resolution': '解像度を上げる',
+   'Remove background': '背景を削除', Generate: '生成', 'Generate beside': '横に生成',
+   'Generate from note': 'メモから生成', 'Generate into slot': 'スロットに生成', 'Make variations': 'バリエーション生成',
+   Align: '整列', 'Align left': '左揃え', 'Align center': '左右中央揃え', 'Align right': '右揃え',
+   'Align top': '上揃え', 'Align middle': '上下中央揃え', 'Align bottom': '下揃え',
+-  Arrange: '配置', 'Arrange row': '横一列に配置', 'Arrange column': '縦一列に配置', 'Arrange grid': 'グリッド配置',
++  'Arrange row': '横一列に配置', 'Arrange column': '縦一列に配置', 'Arrange grid': 'グリッド配置',
+   'Distribute horizontal': '水平方向に等間隔', 'Distribute vertical': '垂直方向に等間隔',
+   'Bring forward': '前面へ', 'Bring to front': '最前面へ', 'Send backward': '背面へ', 'Send to back': '最背面へ',
+   Front: '前面', 'Focus section': 'セクションにフォーカス', 'Rename section': 'セクション名を変更',
+-  'Remove section only': 'セクションのみ削除', 'Unlock section': 'ロック解除',
++  'Remove section only': 'セクションのみ削除', Unlock: 'ロック解除', 'Unlock section': 'セクションのロック解除',
+   'Lock all': 'すべてロック', 'Lock background only': '背景のみロック',
+   'Section fill': 'セクションの塗り', 'Section line': 'セクションの線',
+   'Hide contents': '中身を非表示', 'Show contents': '中身を表示',
+@@ -236,6 +245,8 @@ export const DICT_JA: Record<string, string> = {
+   'Fill color': '塗りつぶし色', 'No fill': '塗りなし', 'Corner radius': '角丸',
+   Arrowheads: '矢印の形状', 'Both arrows': '両端矢印', 'End arrow': '終点矢印', 'No arrows': '矢印なし',
+   'Dashed line': '破線', 'Solid line': '実線', Bold: '太字', Thin: '細', Medium: '中',
++  'Line color': '線の色', 'Line width': '線の太さ', Border: '枠線',
++  'Brush color': 'ブラシの色', 'Brush width': 'ブラシの太さ', Solid: '実線', Dashed: '破線', None: 'なし',
+   Soft: 'ソフト', Sharp: 'シャープ', Round: '丸', Warm: 'ウォーム',
+   Black: '黒', White: '白', Gray: 'グレー', Red: '赤', Orange: 'オレンジ', Green: '緑',
+   Blue: '青', Pink: 'ピンク', Purple: '紫',
+@@ -280,17 +291,17 @@ export const DICT_KO: Record<string, string> = {
+   'Import asset': '에셋 가져오기', 'Import asset folder': '폴더에서 에셋 가져오기', 'Select area': '영역 선택',
+   'Add edit note': '수정 메모 추가', 'AI Edit': 'AI 편집', Edit: '편집', 'Edit text': '텍스트 편집',
+   'Edit with prompt': '프롬프트로 편집', Delete: '삭제', Duplicate: '복제', Crop: '자르기',
+-  Expand: '확장', Group: '그룹화', Ungroup: '그룹 해제', 'Tidy selection': '선택 정돈',
++  Expand: '확장', Group: '그룹화', Ungroup: '그룹 해제', 'Tidy up': '자동 정돈', 'Tidy up options': '정돈 옵션',
+   'Download original': '원본 다운로드', 'Boost resolution': '해상도 높이기',
+   'Remove background': '배경 제거', Generate: '생성', 'Generate beside': '옆에 생성',
+   'Generate from note': '메모로 생성', 'Generate into slot': '슬롯에 생성', 'Make variations': '변형 생성',
+   Align: '정렬', 'Align left': '왼쪽 정렬', 'Align center': '가로 가운데 정렬', 'Align right': '오른쪽 정렬',
+   'Align top': '위쪽 정렬', 'Align middle': '세로 가운데 정렬', 'Align bottom': '아래쪽 정렬',
+-  Arrange: '배치', 'Arrange row': '한 행으로 배치', 'Arrange column': '한 열로 배치', 'Arrange grid': '그리드 배치',
++  'Arrange row': '한 행으로 배치', 'Arrange column': '한 열로 배치', 'Arrange grid': '그리드 배치',
+   'Distribute horizontal': '가로 등간격', 'Distribute vertical': '세로 등간격',
+   'Bring forward': '앞으로', 'Bring to front': '맨 앞으로', 'Send backward': '뒤로', 'Send to back': '맨 뒤로',
+   Front: '앞면', 'Focus section': '섹션 포커스', 'Rename section': '섹션 이름 변경',
+-  'Remove section only': '섹션만 삭제', 'Unlock section': '섹션 잠금 해제',
++  'Remove section only': '섹션만 삭제', Unlock: '잠금 해제', 'Unlock section': '섹션 잠금 해제',
+   'Lock all': '모두 잠금', 'Lock background only': '배경만 잠금',
+   'Section fill': '섹션 채우기', 'Section line': '섹션 테두리',
+   'Hide contents': '내용 숨기기', 'Show contents': '내용 표시',
+@@ -298,6 +309,8 @@ export const DICT_KO: Record<string, string> = {
+   'Fill color': '채우기 색', 'No fill': '채우기 없음', 'Corner radius': '모서리 둥글기',
+   Arrowheads: '화살촉', 'Both arrows': '양쪽 화살표', 'End arrow': '끝 화살표', 'No arrows': '화살표 없음',
+   'Dashed line': '점선', 'Solid line': '실선', Bold: '굵게', Thin: '얇게', Medium: '중간',
++  'Line color': '선 색', 'Line width': '선 굵기', Border: '테두리',
++  'Brush color': '브러시 색', 'Brush width': '브러시 굵기', Solid: '실선', Dashed: '점선', None: '없음',
+   Soft: '부드럽게', Sharp: '날카롭게', Round: '둥글게', Warm: '따뜻하게',
+   Black: '검정', White: '흰색', Gray: '회색', Red: '빨강', Orange: '주황', Green: '초록',
+   Blue: '파랑', Pink: '분홍', Purple: '보라',

@@ -1,0 +1,469 @@
+diff --git a/main.js b/main.js
+index f942d49e..4ab4c5b1 100644
+--- a/main.js
++++ b/main.js
+@@ -4797,6 +4797,22 @@ function depositRevisionSum(payload) {
+   return payload === null ? DEPOSIT_EMPTY_REVISION_SUM : depositCanonicalSum(payload)
+ }
+ 
++/**
++ * T1d(SC1b.3"冻结值整 → 发出"边界修复):精确算出一段 base64 字符串解码后的
++ * 字节数——扣掉末尾补位('='),不是 `Math.floor(length * 3 / 4)` 那种没扣补位
++ * 就会高估的粗估(输入总字节数不是 3 的倍数时,粗估会多算 1~2 字节,足以把一张
++ * 恰好等于上限的图误判成超限)。合法 base64 的补位只可能是 0/1/2 个,不做更宽的
++ * 容错(非法输入不是这个函数要处理的问题)。
++ */
++function depositExactByteLength(base64) {
++  const length = base64.length
++  if (!length) return 0
++  let padding = 0
++  if (base64.endsWith('==')) padding = 2
++  else if (base64.endsWith('=')) padding = 1
++  return (length / 4) * 3 - padding
++}
++
+ function handleDepositMedia(msg) {
+   if (completed.has(msg.reqId)) {
+     // 重发必须进这套去重,否则会变成重复寄存(撞频控、脏配额)。
+@@ -4814,7 +4830,13 @@ function handleDepositMedia(msg) {
+     try {
+       const data = typeof msg.data === 'string' ? msg.data : ''
+       if (!data) throw new Error('缺少寄存字节')
+-      const approxBytes = Math.floor((data.length * 3) / 4)
++      // T1d(DoR 边界补测发现):`Math.floor(length * 3 / 4)` 没扣掉 base64 末尾的
++      // '=' 补位——刚好落在"总字节数不是 3 的倍数"这一类输入上会把解码后的真实字节数
++      // 高估 1~2 字节,导致一张恰好等于 DEPOSIT_MAX_BYTES 的图被这道"第二道防线"
++      // 误判超限(SC1b.3"冻结值整 → 发出"要求的正是这个边界)。改用扣补位的精确公式,
++      // 不再是"约"数——面板侧(depositBlob 的 `blob.size`)本就是精确值,两道防线的
++      // 阈值判据统一,不会再出现"面板放行、电子脑误拦"的分歧。
++      const approxBytes = depositExactByteLength(data)
+       if (approxBytes > DEPOSIT_MAX_BYTES) {
+         // 前置拦截:不发请求(面板侧也拦一道,这里是第二道防线)。不带 code——宿主
+         // 从不为 deposit_media 提供稳定错误码(设计稿 §4.1/§11-③ 已解),这条是电子脑
+diff --git a/src/__tests__/depositCrashCompensation.test.ts b/src/__tests__/depositCrashCompensation.test.ts
+new file mode 100644
+index 00000000..7a65daa2
+--- /dev/null
++++ b/src/__tests__/depositCrashCompensation.test.ts
+@@ -0,0 +1,117 @@
++/**
++ * 寄存成功记账失败的崩溃点补偿契约测试(T1b3;设计稿 SC1b.11/SC1b.7)。
++ *
++ * 覆盖:
++ *  - `resolveDepositEntry`(基础新寄存路径,T1a):`recordDeposit` 提交失败后
++ *    立即幂等 release 新 hash(避免配额孤儿),release 也失败则按 C 风险记账,
++ *    不循环重试;
++ *  - `refingerprintDepositEntry`(换指纹路径,T1b2/T1b3):提交失败按同一条路径
++ *    补偿(对象是这次新寄存出的 hash);
++ *  - SC1b.7"至多强制重寄 1 轮,再败终止不循环":寄存本身失败时不自动重试第二轮。
++ *
++ * 端到端跑在真实 main.js 上(depositTestHarness 双 spy),不是对着替身自说自话。
++ */
++import { afterEach, describe, expect, it } from 'vitest'
++import { DepositError, refingerprintDepositEntry, resolveDepositEntry } from '../agent/depositPort'
++import { recordDeposit, type DepositEntryDraft } from '../agent/depositStore'
++import { blobOfBytes, createDepositHarness, teardownDepositHarness, FAKE_HASH, type DepositHarness } from './depositTestHarness'
++
++let harness: DepositHarness
++
++const draft = (hash: string, depositedAt: number, from: 'deposit' | 'artifact' | 'ledger' = 'deposit'): DepositEntryDraft => ({
++  hash,
++  ext: '.png',
++  depositedAt,
++  from,
++})
++
++/** 所有 deposit/state-*.json 写盘一律失败——迫使 recordDeposit 的提交必然失败,
++ * 但读(load)不受影响(同 depositMigration.test.ts「中断恢复」的手法)。 */
++const withBrokenStateWrites = (): DepositHarness => createDepositHarness({ writeGuard: (request) => !request.path.startsWith('deposit/state-') })
++
++afterEach(() => {
++  teardownDepositHarness()
++})
++
++describe('resolveDepositEntry — SC1b.11 寄存成功但本地记账失败的补偿', () => {
++  it('提交失败 + hash 无其它引用 → 立即幂等 release 新 hash,避免配额孤儿', async () => {
++    harness = withBrokenStateWrites()
++    harness.setHostReleaseReply(() => ({ ok: true, released: true }))
++
++    await expect(resolveDepositEntry({ assetUrl: 'mivo-asset:1', blob: blobOfBytes(32) })).rejects.toBeInstanceOf(DepositError)
++
++    expect(harness.hostRequests).toHaveLength(1) // 寄存本身确实发生过(宿主已经真实占了配额)
++    expect(harness.hostReleaseRequests).toHaveLength(1) // 补偿性 release
++    expect(harness.hostReleaseRequests[0]).toMatchObject({ hash: FAKE_HASH })
++  })
++
++  it('release 也失败 → 按 owner 已接受的 C 风险记账,不循环重试第二次', async () => {
++    harness = withBrokenStateWrites()
++    harness.setHostReleaseReply(() => ({ ok: false, message: '宿主也拒绝' }))
++
++    await expect(resolveDepositEntry({ assetUrl: 'mivo-asset:1', blob: blobOfBytes(32) })).rejects.toBeInstanceOf(DepositError)
++
++    expect(harness.hostReleaseRequests).toHaveLength(1) // 尝试过恰好一次,没有自动重试
++  })
++
++  it('提交失败但 hash 恰好已被别的 assetUrl 合法持有(同字节 dedup)→ 零 release 请求', async () => {
++    harness = withBrokenStateWrites()
++    // 先用一条能正常落盘的会话预置一条已存在的映射,再切到写盘故障场景验证
++    // resolveDepositEntry 面对"同 hash 已有其它合法持有者"时不会误 release。
++    // 直接操纵内存态(不经提交)即可——这里只关心 resolveDepositEntry 读到的
++    // refcount 判断,不关心这条预置记录本身是否落盘。
++    await recordDeposit('mivo-asset:existing', draft(FAKE_HASH, 0, 'deposit'))
++    harness.setHostReply(() => ({ ok: true, hash: FAKE_HASH, ext: '.png' }))
++
++    await expect(resolveDepositEntry({ assetUrl: 'mivo-asset:1', blob: blobOfBytes(32) })).rejects.toBeInstanceOf(DepositError)
++
++    expect(harness.hostReleaseRequests).toHaveLength(0) // mivo-asset:existing 仍持有这个 hash,不能释放
++  })
++})
++
++describe('refingerprintDepositEntry — SC1b.11 换指纹时提交失败的补偿(对象是新 hash)', () => {
++  it('提交失败 → 补偿新寄存出的 hash,旧条目原样保留(提交从未真正替换它)', async () => {
++    // 先用一条正常会话把旧条目落盘,再切到写盘故障场景验证补偿路径。
++    const setup = createDepositHarness()
++    await recordDeposit('mivo-asset:1', draft(FAKE_HASH, 1, 'deposit'))
++    const disk = { ...Object.fromEntries(setup.brain.files) }
++    teardownDepositHarness()
++
++    harness = createDepositHarness({ files: disk, writeGuard: (request) => !request.path.startsWith('deposit/state-') })
++    const newHash = 'c'.repeat(32)
++    harness.setHostReply(() => ({ ok: true, hash: newHash, ext: '.png' }))
++    harness.setHostReleaseReply(() => ({ ok: true, released: true }))
++
++    await expect(refingerprintDepositEntry({ assetUrl: 'mivo-asset:1', blob: blobOfBytes(32) })).rejects.toBeInstanceOf(DepositError)
++
++    // 补偿对象是这次新寄存出的 hash,不是旧 hash——提交本身失败,旧条目从未被
++    // 换掉(mutateAndCommit 的 mutator 仍然会把新条目写进内存,但这里验证的是
++    // 对外可观察的补偿行为:release 的是新 hash)。
++    expect(harness.hostReleaseRequests).toHaveLength(1)
++    expect(harness.hostReleaseRequests[0]).toMatchObject({ hash: newHash })
++  })
++
++  it('T1x(owner 决策,demo 阶段砍掉自动回收):提交成功 → 新映射覆盖旧条目,旧 hash 绝不发起 release', async () => {
++    harness = createDepositHarness()
++    await recordDeposit('mivo-asset:1', draft(FAKE_HASH, 1, 'deposit'))
++    const newHash = 'd'.repeat(32)
++    harness.setHostReply(() => ({ ok: true, hash: newHash, ext: '.png' }))
++    harness.setHostReleaseReply(() => ({ ok: true, released: true })) // 即使宿主愿意释放,也不该被调用
++
++    const entry = await refingerprintDepositEntry({ assetUrl: 'mivo-asset:1', blob: blobOfBytes(32) })
++
++    expect(entry.hash).toBe(newHash)
++    expect(harness.hostReleaseRequests).toHaveLength(0) // 降范围核心断言:旧 hash 占宿主配额是已知代价,不发 release
++  })
++})
++
++describe('SC1b.7 — 自愈至多强制重寄 1 轮,再败终止不循环', () => {
++  it('寄存本身失败(宿主拒绝)→ 只发一次寄存请求,不自动重试第二轮', async () => {
++    harness = createDepositHarness()
++    harness.setHostReply(() => ({ ok: false, message: '宿主拒绝' }))
++
++    await expect(refingerprintDepositEntry({ assetUrl: 'mivo-asset:1', blob: blobOfBytes(32) })).rejects.toThrow()
++
++    expect(harness.hostRequests).toHaveLength(1) // 恰好一次,没有内部重试循环
++  })
++})
+diff --git a/src/__tests__/depositPort.test.ts b/src/__tests__/depositPort.test.ts
+index 86bf08c0..bfc20dc6 100644
+--- a/src/__tests__/depositPort.test.ts
++++ b/src/__tests__/depositPort.test.ts
+@@ -150,6 +150,23 @@ describe('depositPort — 失败矩阵(绝不写半条映射)', () => {
+     expect(peekDepositStoreForTests()?.map['mivo-asset:big']).toBeUndefined()
+   })
+ 
++  it(
++    'T1d(DoR 边界补测):刚好等于上限 → 放行发出请求,不被前置拦截误伤(冻结值整,SC1b.3)',
++    async () => {
++      // 真实把 50MB blob 走一遍 blobToBase64(与生产路径一致,不是造一个小夹具
++      // 假装测过边界)。全仓并跑高并发下这条真实 I/O-等价开销偶尔压过默认
++      // 5000ms——放宽本条超时不是掩盖式修法(不改变任何判据、不改字节公式的
++      // 容差),只是承认这条测试比同文件其它测试多做一份真实的大字节转换。
++      const exact = blobOfBytes(DEPOSIT_MAX_BYTES)
++
++      await expect(resolveDepositEntry({ assetUrl: 'mivo-asset:exact', blob: exact })).resolves.toMatchObject({
++        hash: FAKE_HASH,
++      })
++      expect(harness.hostRequests).toHaveLength(1)
++    },
++    20_000,
++  )
++
+   it('结构化配额判据(quotaUsedBytes ≥ quotaLimitBytes)→ QUOTA_FULL,不依赖文案,不写映射', async () => {
+     harness.setHostReply(() => ({
+       ok: false,
+diff --git a/src/__tests__/depositStore.test.ts b/src/__tests__/depositStore.test.ts
+index 9327d50e..26caff64 100644
+--- a/src/__tests__/depositStore.test.ts
++++ b/src/__tests__/depositStore.test.ts
+@@ -397,11 +397,17 @@ describe('depositStore — 端到端提交(真实 main.js 不可变命名协议)
+     expect(peekDepositStoreForTests()?.map['mivo-asset:3']).toMatchObject({ hash: 'h2' })
+   })
+ 
+-  it('LRU:超上限按 depositedAt 从旧到新淘汰', async () => {
++  /**
++   * T1b2(D-C/§4.10.2-①返修,demo 降范围后仍保留):trimMap 不再无条件按
++   * depositedAt 淘汰——`from:'deposit'` 且淘汰后会失去唯一引用的条目**跳过**,
++   * 宁可 map 超出上限也不在没有 release 的情况下丢弃配额认领权。降范围后没有
++   * `releaseLruOverflow` 异步兜底(该函数已随 owner 决策丢弃),这些风险条目会
++   * 持续超出上限,这是范围裁决已接受的代价(见 `_tmp/297-dispatch/
++   * drag-image-goal-sc-v5-final.md` 的「owner 决策」节),不是回归。
++   */
++  it('D-C(§4.10.2-①):全部 from:deposit 且各自唯一 hash → 一个都不淘汰,map 允许超出上限', async () => {
+     await loadDepositStore()
+-    // 一次性灌入(复用 recordMigration 的批量提交路径,单次提交而非 5005 次往返)——
+-    // trimMap 在同一次 mutateAndCommit 内的 mutator 执行完毕后立刻生效,不需要真的
+-    // 走满 5005 次网络往返才能验证淘汰逻辑。
++    // 一次性灌入(复用 recordMigration 的批量提交路径,单次提交而非 5005 次往返)。
+     const bulk: Array<[string, DepositEntryDraft]> = Array.from({ length: DEPOSIT_MAP_MAX_ENTRIES + 5 }, (_, index) => [
+       `mivo-asset:${index}`,
+       draft(`h${index}`, index, 'deposit'),
+@@ -409,9 +415,28 @@ describe('depositStore — 端到端提交(真实 main.js 不可变命名协议)
+     await recordMigration(bulk, { version: 1, at: 0, migrated: bulk.length })
+ 
+     const map = peekDepositStoreForTests()?.map ?? {}
+-    expect(Object.keys(map)).toHaveLength(DEPOSIT_MAP_MAX_ENTRIES)
+-    expect(map['mivo-asset:0']).toBeUndefined() // 最旧的被淘汰
+-    expect(map[`mivo-asset:${DEPOSIT_MAP_MAX_ENTRIES + 4}`]).toBeTruthy()
++    expect(Object.keys(map)).toHaveLength(DEPOSIT_MAP_MAX_ENTRIES + 5) // 超出上限,零无 release 淘汰
++    expect(map['mivo-asset:0']).toBeTruthy() // 最旧的也保留(风险条目)
++  })
++
++  it('淘汰只挑安全条目(from!==deposit,或 hash 仍被引用),风险条目原样保留', async () => {
++    await loadDepositStore()
++    // 5 条最旧的是 ledger 来源(安全,可无条件淘汰);其余全是各自唯一 hash 的
++    // deposit 来源(风险,须先 release,trimMap 不敢碰)。
++    const safe: Array<[string, DepositEntryDraft]> = Array.from({ length: 5 }, (_, index) => [
++      `mivo-asset:safe-${index}`,
++      draft(`ledger-h${index}`, index, 'ledger'),
++    ])
++    const risky: Array<[string, DepositEntryDraft]> = Array.from({ length: DEPOSIT_MAP_MAX_ENTRIES }, (_, index) => [
++      `mivo-asset:risky-${index}`,
++      draft(`deposit-h${index}`, index + 5, 'deposit'),
++    ])
++    await recordMigration([...safe, ...risky], { version: 1, at: 0, migrated: safe.length + risky.length })
++
++    const map = peekDepositStoreForTests()?.map ?? {}
++    for (let index = 0; index < 5; index += 1) expect(map[`mivo-asset:safe-${index}`]).toBeUndefined()
++    expect(Object.keys(map)).toHaveLength(DEPOSIT_MAP_MAX_ENTRIES) // 5 条安全的被淘汰,风险的一条不少
++    expect(map['mivo-asset:risky-0']).toBeTruthy() // 最旧的风险条目也保留
+   })
+ })
+ 
+diff --git a/src/__tests__/releaseBrain.test.ts b/src/__tests__/releaseBrain.test.ts
+index fb7504e2..756f8fe7 100644
+--- a/src/__tests__/releaseBrain.test.ts
++++ b/src/__tests__/releaseBrain.test.ts
+@@ -147,7 +147,7 @@ describe('release_media — 重发去重(重发绝不变成重复释放)', () =>
+ 
+ describe('release_media — 失败矩阵', () => {
+   it('宿主 ok:false → 透传 message,不带 code,不带 released', async () => {
+-    const { brain, replies } = releaseBrain({ reply: () => ({ ok: false, message: '宿主拒绝' }) })
++    const { brain, hostRequests, replies } = releaseBrain({ reply: () => ({ ok: false, message: '宿主拒绝' }) })
+ 
+     brain.handles.release.media({ reqId: 'r1', kind: 'release-media', hash: HASH })
+     await flushMicrotasks()
+@@ -155,10 +155,15 @@ describe('release_media — 失败矩阵', () => {
+     expect(replies[0]).toMatchObject({ reqId: 'r1', ok: false, message: '宿主拒绝' })
+     expect(replies[0].code).toBeUndefined()
+     expect(replies[0].released).toBeUndefined()
++    // T1b5(SC-T1b5.4):失败回执不能只验证"回给面板的东西长什么样"——必须证明
++    // 电子脑真的调用过宿主恰一次,否则一个从不打宿主、直接编造失败回执的假
++    // 实现也能通过这条测试。
++    expect(hostRequests).toHaveLength(1)
++    expect(hostRequests[0]).toEqual({ type: 'cindy-request', kind: 'release_media', hash: HASH })
+   })
+ 
+   it('宿主异常(cindy.send 抛错)→ 按失败处理,message 携带异常原因', async () => {
+-    const { brain, replies } = releaseBrain({
++    const { brain, hostRequests, replies } = releaseBrain({
+       reply: () => {
+         throw new Error('宿主离线')
+       },
+@@ -169,6 +174,9 @@ describe('release_media — 失败矩阵', () => {
+ 
+     expect(replies[0]).toMatchObject({ reqId: 'r1', ok: false })
+     expect(String(replies[0].message)).toContain('宿主离线')
++    // 同上:异常路径同样必须证明真的调用过宿主(而不是在调用前就短路抛错)。
++    expect(hostRequests).toHaveLength(1)
++    expect(hostRequests[0]).toEqual({ type: 'cindy-request', kind: 'release_media', hash: HASH })
+   })
+ })
+ 
+diff --git a/src/__tests__/releasePort.test.ts b/src/__tests__/releasePort.test.ts
+index 5e5993d2..f7dff213 100644
+--- a/src/__tests__/releasePort.test.ts
++++ b/src/__tests__/releasePort.test.ts
+@@ -40,6 +40,11 @@ describe('releaseHash — 成功路径', () => {
+     harness.setHostReleaseReply(() => ({ ok: true, released: false }))
+ 
+     await expect(releaseHash(FAKE_HASH)).resolves.toMatchObject({ ok: true, released: false })
++    // T1b5(SC-T1b5.4):"视为成功"不能只验证返回形状——必须证明真的发出了恰一次
++    // 请求、目标就是这枚 hash,否则一个直接 resolve 常量、从未真正调用宿主的假
++    // 实现也能通过这条测试。
++    expect(harness.hostReleaseRequests).toHaveLength(1)
++    expect(harness.hostReleaseRequests[0]).toMatchObject({ hash: FAKE_HASH })
+   })
+ })
+ 
+diff --git a/src/agent/depositPort.ts b/src/agent/depositPort.ts
+index 777d816c..1ec63f03 100644
+--- a/src/agent/depositPort.ts
++++ b/src/agent/depositPort.ts
+@@ -13,6 +13,8 @@
+ import { debugLogger } from '../../../src/store/debugLogStore'
+ import { persistRequest, type PersistReply } from '../persist/bridge'
+ import {
++  depositHashRefCount,
++  invalidateDeposit,
+   loadDepositStore,
+   lookupDeposit,
+   recordCapabilityMark,
+@@ -265,7 +267,12 @@ export const resolveDepositEntry = async (input: {
+     }
+     // 写映射的唯一时机 = 收到 ok:true 且 hash/ext 均合法之后(设计稿 §4.7)。
+     // gen/writer 由提交层盖戳(depositStore.ts,设计稿 §4.10.6.1),这里不手填。
+-    await recordDeposit(assetUrl, entry)
++    const commit = await recordDeposit(assetUrl, entry)
++    if (!commit.ok) {
++      // SC1b.11:宿主已经真实占了配额,但本地映射没能落盘——不补救就是配额孤儿。
++      await compensateFailedDepositCommit(assetUrl, receipt.hash)
++      throw new DepositError('DEPOSIT_FAILED', '寄存记账失败,请重试。')
++    }
+     return entry
+   })()
+   inflight.set(assetUrl, pending)
+@@ -332,3 +339,84 @@ export const resetDepositPortForTests = (): void => {
+   inflight.clear()
+   releaseInflight.clear()
+ }
++
++// ── T1x:换指纹重寄(设计稿 §4.10.2 接线点②;owner 2026-08-02 决策 demo 阶段
++// 砍掉自动回收后的降范围版,见 `_tmp/297-dispatch/drag-image-goal-sc-v5-final.md`
++// 「owner 决策」节)──
++//
++// 除补偿释放外一律不发 release_media:本函数原本(T1b2/T1b3)在换掉旧指纹后会
++// 尝试释放旧 hash,降范围后**只覆盖映射,不释放旧 hash**——旧 hash 继续占用宿主
++// 配额,这是范围裁决已接受的代价,不是遗漏。本段只交付"逻辑完成":接线仍在
++// T1e,且须置于 DEPOSIT_ENABLED 守卫内。
++
++/**
++ * 强制重新寄存一个 assetUrl(绕过缓存)——调用方(T1e 的"edit 失败强制重寄重试"
++ * 接线)已确认旧指纹在宿主侧失效。写入新映射即返回,**不释放旧 hash**(降范围,
++ * 见上)。提交失败按 SC1b.11 补偿这次新寄存出的 hash(与 `resolveDepositEntry`
++ * 同一条路径)。不做单独的 single-flight:调用方(T1e)负责"自愈至多 1 轮"的
++ * 重试次数控制(SC1b.7),这里只是被触发时执行的那个原语本身。
++ */
++export const refingerprintDepositEntry = async (input: {
++  assetUrl: string
++  blob: Blob
++  label?: string
++}): Promise<DepositEntryDraft> => {
++  const { assetUrl, blob, label } = input
++  const oldEntry = await lookupDeposit(assetUrl)
++  const receipt = await depositBlob(blob, label ?? DEPOSIT_LABEL)
++  const entry: DepositEntryDraft = {
++    hash: receipt.hash,
++    ext: receipt.ext,
++    bytes: receipt.bytes,
++    depositedAt: now(),
++    from: 'deposit',
++  }
++  const commit = await recordDeposit(assetUrl, entry)
++  if (!commit.ok) {
++    await compensateFailedDepositCommit(assetUrl, entry.hash)
++    throw new DepositError('DEPOSIT_FAILED', '换指纹记账失败,请重试。')
++  }
++  if (oldEntry && oldEntry.from === 'deposit' && oldEntry.hash !== entry.hash) {
++    debugLogger.log(
++      SOURCE,
++      `换指纹:旧 hash 不释放(自动回收已砍,占宿主配额是范围裁决已接受的代价):hash=${oldEntry.hash.slice(0, 8)}`,
++    )
++  }
++  return entry
++}
++
++// ── T1b3(降范围后保留):寄存成功记账失败的补偿(设计稿 SC1b.11)──
++
++/**
++ * SC1b.11:`recordDeposit` 的提交失败之后调用——宿主已经确实寄存成功(真实占了
++ * 配额),但本地映射没能落盘,不补救就是一份**配额孤儿**(§4.10.4)。若这个刚寄存
++ * 出来的 hash 此刻已无其它 assetUrl 引用,立即幂等 release 它;release 也失败 →
++ * `diagFail`(经 debugLogger.error)并按 owner 已接受的 C 风险记账——不重试、
++ * 不循环,如实记录残余风险。
++ *
++ * 无论 release 成功与否,这条失败的本地映射本身都不可信(`mutateAndCommit` 的
++ * mutator 已经把它写进内存,只是没能落盘)——用 `invalidateDeposit` 清掉,避免
++ * 下次 `lookupDeposit` 假命中一个已经被释放、或从未真正落盘过的指纹。这一步的
++ * 提交同样可能失败(持久化本身已经出问题),失败就留痕、不二次重试——诚实边界,
++ * 不假装能在持久化损坏的情况下还保证内存与磁盘完全一致。
++ *
++ * 安全性构造上成立(demo 降范围后唯一保留的 release 出口):这个 hash 从未写入
++ * 过 map(commit 失败),refcount 必为 0——零依赖 pendingReleases、零依赖租约。
++ */
++const compensateFailedDepositCommit = async (assetUrl: string, hash: string): Promise<void> => {
++  const state = await loadDepositStore()
++  if (depositHashRefCount(state, hash, assetUrl) > 0) {
++    debugLogger.log(SOURCE, `记账失败补偿:hash=${hash.slice(0, 8)} 仍被别的 assetUrl 引用,零 release`)
++  } else {
++    const result = await releaseHash(hash)
++    if (result.ok) {
++      debugLogger.warn(SOURCE, `记账失败补偿:已幂等 release 新 hash,避免配额孤儿 hash=${hash.slice(0, 8)}`)
++    } else {
++      debugLogger.error(
++        SOURCE,
++        `记账失败补偿:release 也失败,按 owner 已接受的 C 风险记账(配额孤儿)hash=${hash.slice(0, 8)} ${result.message || '无原因'}`,
++      )
++    }
++  }
++  await invalidateDeposit(assetUrl)
++}
+diff --git a/src/agent/depositStore.ts b/src/agent/depositStore.ts
+index 35222192..37b3efb8 100644
+--- a/src/agent/depositStore.ts
++++ b/src/agent/depositStore.ts
+@@ -636,14 +636,38 @@ const applyLocalOverlay = (
+   }
+ }
+ 
+-/** LRU:超上限按 depositedAt 从旧到新淘汰(淘汰只损失一次重寄存)。 */
+-const trimMap = (state: DepositState): number => {
++/**
++ * T1b2 纯选择器(§4.10.2-①):map 超过 `limit` 时,按 `depositedAt` 从旧到新排出
++ * 全部溢出候选。纯函数,不读盘、不产生副作用。
++ */
++export const peekMapOverflowCandidates = (state: DepositState, limit: number = DEPOSIT_MAP_MAX_ENTRIES): string[] => {
+   const keys = Object.keys(state.map)
+-  if (keys.length <= DEPOSIT_MAP_MAX_ENTRIES) return 0
+-  keys.sort((a, b) => state.map[a].depositedAt - state.map[b].depositedAt)
+-  const drop = keys.length - DEPOSIT_MAP_MAX_ENTRIES
+-  for (let index = 0; index < drop; index += 1) delete state.map[keys[index]]
+-  return drop
++  if (keys.length <= limit) return []
++  return [...keys].sort((a, b) => state.map[a].depositedAt - state.map[b].depositedAt).slice(0, keys.length - limit)
++}
++
++/**
++ * LRU 淘汰(D-C/§4.10.2-①返修,取代无条件淘汰):**只淘汰不需要 release 就
++ * 安全的条目**——`from !== 'deposit'`,或该 hash 仍被别的 assetUrl 引用(淘汰这
++ * 一条不影响那份配额的持有权)。`from==='deposit'` 且即将失去唯一引用的条目
++ * **跳过**,即使这意味着 map 超出上限——D-C 明文"淘汰前须先 release 成功,失败
++ * 则放弃淘汰",而 release 是 I/O,不能在这个同步的纯函数里做(store 不得反向
++ * import port)。demo 阶段砍掉自动回收后,这些被跳过的条目**没有**异步 release-
++ * gated 淘汰兜底(该兜底原属 T1b2 的 `releaseLruOverflow`,已随范围裁决丢弃)——
++ * 这里只保证"不在没有释放的情况下丢失配额认领权",不保证 map 严格不超上限。
++ */
++const trimMap = (state: DepositState): number => {
++  const candidates = peekMapOverflowCandidates(state)
++  if (!candidates.length) return 0
++  let dropped = 0
++  for (const key of candidates) {
++    const entry = state.map[key]
++    if (!entry) continue
++    if (entry.from === 'deposit' && depositHashRefCount(state, entry.hash, key) === 0) continue
++    delete state.map[key]
++    dropped += 1
++  }
++  return dropped
+ }
+ 
+ /**

@@ -1,0 +1,80 @@
+diff --git a/cindyplugin/ghost.json b/cindyplugin/ghost.json
+index 58399849..a483845d 100644
+--- a/cindyplugin/ghost.json
++++ b/cindyplugin/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.15",
++  "version": "0.9.16",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+@@ -64,7 +64,7 @@
+   "tools": [
+     {
+       "name": "canvas_snapshot",
+-      "description": "读取画布当前内容的结构化快照:节点(文字/图片/分区/标注)、位置尺寸、连线与衍生关系。默认读整块活跃画布;画布很大时用 region(画布世界坐标矩形)或 sectionId(只读某个分区及其全部子节点)缩小范围,二者互斥。单次返回上限 256KB,超出会只返回第一页并带 nextCursor——把它原样传回 cursor 继续读(翻页期间画布被改动会返回 STALE_CURSOR,那时重新从第一页开始)。返回内容含 selectedImageNodeIds(用户当前选中且在本次结果集内的图片节点 id 列表)与 selectedNodeCount(选中节点总数,不限类型)。用户说「这张」/「选中的图」时,从 selectedImageNodeIds 取 id,显式传给 canvas_edit_image 的 nodeId——canvas_edit_image 不会自动读取当前选中,必须显式传 id。返回 JSON;面板未打开时返回最近一次自动保存的快照并注明来源(离线快照不支持过滤与翻页)。默认只读结构,零寄存请求;要看某几张图的像素时用 mediaNodeIds 显式点名(最多 8 个,必须是本次调用返回的这一页里的图片节点 id),返回里会带 mediaStates(逐 id 的 available/imageRef 或 unavailable/reason)与 mediaSummary(requested/available/unavailable 计数)。available 的 imageRef 只是引用(形如 cindy-media://blobs/<hash><ext>),不含像素;要看像素直接用 Read 工具读取推导出的落盘路径:<Cindy 应用 userData 目录>/cindy-media/blobs/<hash 原样前 2 个字符>/<hash><ext>——分片键取 hash 自身前 2 个字符,原样使用,不做大小写转换(hash 是 BBcd… 时分片目录就是 BB,不是 bb;大小写敏感文件系统上转换了就读不到)(macOS 上 userData 目录即 ~/Library/Application Support/Cindy)。一次要看的图超过 8 张时:先分页遍历拿到完整候选清单并固化目标 id,再按页遍历、在包含目标 id 的那一页调用里点名该页目标(每页最多 8 个);维护「已成功读取」与「已知不可读」两个 id 集合,完成条件是两者的并集覆盖固化目标清单全部 id——不要按调用次数累加 requested 计数(会随 STALE_CURSOR 重新遍历而虚高),也不要只看第一批结果就下结论。遇到 STALE_CURSOR 时从第一页重新遍历,固化的目标清单不因此改变。",
++      "description": "读取画布内容的结构化快照:节点(文字/图片/分区/标注)、位置尺寸、连线与衍生关系。默认读整块活跃画布;画布大时用 region(世界坐标矩形)或 sectionId(某分区及其子节点)缩小范围,二者互斥。单次上限 256KB,超出只返回第一页并带 nextCursor——原样传回 cursor 续读(期间画布被改返回 STALE_CURSOR,须从第一页重来)。面板未打开时返回最近一次自动保存的快照并注明来源(离线快照不支持过滤与翻页)。返回含 selectedImageNodeIds(当前选中且在本次结果集内的图片节点 id)与 selectedNodeCount(选中总数,不限类型)。用户说「这张」/「选中的图」时从 selectedImageNodeIds 取 id 显式传给 canvas_edit_image 的 nodeId——它不会自动读选中。默认只读结构、零寄存请求;要看图的像素用 mediaNodeIds 点名(最多 8 个,须是本次返回这一页里的图片节点 id),返回带 mediaStates(逐 id 的 available/imageRef 或 unavailable/reason)与 mediaSummary(requested/available/unavailable)。imageRef(形如 cindy-media://blobs/<hash><ext>)只是引用、不含像素;看像素用 Read 读落盘路径 <userData>/cindy-media/blobs/<hash 原样前 2 个字符>/<hash><ext>(分片键取 hash 自身前 2 个字符,原样使用,不做大小写转换,否则大小写敏感文件系统上读不到;macOS 的 <userData> = ~/Library/Application Support/Cindy)。超过 8 张时:先分页遍历固化目标 id 清单,再按页在含目标 id 的那次调用里点名该页目标(每页 ≤8);维护「已读取」与「已知不可读」两个集合,并集覆盖固化清单即完成——不要累加 requested 计数(STALE_CURSOR 重遍历会虚高),也不要只看第一批就下结论。遇 STALE_CURSOR 从第一页重来,固化清单不变。",
+       "parameters": {
+         "type": "object",
+         "properties": {
+diff --git a/cindyplugin/src/__tests__/manifestHostLimits.test.ts b/cindyplugin/src/__tests__/manifestHostLimits.test.ts
+new file mode 100644
+index 00000000..dd6e677d
+--- /dev/null
++++ b/cindyplugin/src/__tests__/manifestHostLimits.test.ts
+@@ -0,0 +1,52 @@
++/**
++ * 宿主 manifest 硬限守卫(#297,2026-08-04 事故驱动新增)。
++ *
++ * **为什么必须有这道门**:宿主装入时会校验 `tools[].description` 必须是 1–1024
++ * 字符的非空字符串,不过就整包拒装(`MANIFEST_INVALID`)。本仓此前**没有任何断言
++ * 检查这个长度**——于是出现过最恶劣的失败形状:**22 道 CI 全绿、插件却装不进去**。
++ *
++ * 实际事故:#297 两条列车(T2「选中可见」/ T3「看图」)原本是两条独立栈,各自的
++ * `canvas_snapshot.description` 分别 454 / 890 字符都在限内;线性化成一条链后两套
++ * 说明必须**并集**,合成后 1176 字符 —— 越限。合成时没人量长度,直到真机打包被宿主
++ * 拒了才暴露。这条测试就是把「宿主会拒」提前到 CI。
++ *
++ * 判据取宿主口径,不取"我们觉得够用"的宽松值:非空、≤1024。
++ */
++import { readFileSync } from 'node:fs'
++import { join } from 'node:path'
++import { describe, expect, it } from 'vitest'
++
++/** 宿主装入校验的硬上限(见 ghost_forge_pack 的 MANIFEST_INVALID 文案)。 */
++const DESCRIPTION_MAX = 1024
++
++type Manifest = {
++  tools?: Array<{ name?: unknown; description?: unknown }>
++}
++
++const manifest = (): Manifest =>
++  JSON.parse(readFileSync(join(__dirname, '../../ghost.json'), 'utf8')) as Manifest
++
++describe('ghost.json 宿主 manifest 硬限', () => {
++  it('每个 tools[].description 都是 1–1024 字符的非空字符串(超限则宿主整包拒装)', () => {
++    const tools = manifest().tools
++    expect(Array.isArray(tools)).toBe(true)
++    expect(tools!.length).toBeGreaterThan(0)
++
++    // 逐个报名字与实测长度:越限时错误信息要能直接指出改哪一个,不能只说"有一个超了"。
++    const measured = tools!.map((tool) => ({
++      name: typeof tool.name === 'string' ? tool.name : '(name 非字符串)',
++      length: typeof tool.description === 'string' ? tool.description.length : -1,
++    }))
++    const bad = measured.filter((m) => m.length < 1 || m.length > DESCRIPTION_MAX)
++    expect(
++      bad,
++      `越限项(上限 ${DESCRIPTION_MAX}):${bad.map((m) => `${m.name}=${m.length}`).join(', ')}`,
++    ).toEqual([])
++  })
++
++  it('tools[].name 全部非空且互不重复', () => {
++    const names = (manifest().tools ?? []).map((tool) => tool.name)
++    expect(names.every((n) => typeof n === 'string' && n.length > 0)).toBe(true)
++    expect(new Set(names as string[]).size).toBe(names.length)
++  })
++})

@@ -1,0 +1,87 @@
+diff --git a/scripts/loops/bug-doctor/notify.test.mjs b/scripts/loops/bug-doctor/notify.test.mjs
+index d1990dd5..098650d4 100644
+--- a/scripts/loops/bug-doctor/notify.test.mjs
++++ b/scripts/loops/bug-doctor/notify.test.mjs
+@@ -1,6 +1,8 @@
+-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
++import { spawnSync } from 'node:child_process'
++import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+ import { tmpdir } from 'node:os'
+-import { join } from 'node:path'
++import { dirname, join, resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
+ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+ 
+ import { PENDING_ALERTS_FILE, appendPendingAlert, loadNotifyConfig, sendAlert, sendThreadReply } from './notify.mjs'
+@@ -115,3 +117,71 @@ describe('sendThreadReply', () => {
+     }
+   })
+ })
++
++// 守卫:降级路径不得把桌面横幅泄漏到真实世界。
++// 事故背景(2026-08-05):本套件与 patrol.test.mjs 都会故意清空 Slack 配置逼 sendAlert 走
++// degrade(),而 degrade() 当时无条件 execFileSync('osascript') —— 于是每跑一次单测,owner
++// 就收到一条内容是假 OID/假失败次数的真桌面告警,#487 三审期间累计弹了十余条。
++//
++// 为什么必须由子进程 + PATH 假 osascript 来断言,而不是断言返回的 desktopNotified:
++// 该字段是自报的,把 execFileSync 换成别的实现(或直接返回 false 却仍然弹)都骗得过它。
++// 这里数的是真实进程调用次数——osascript 一旦被调,marker 文件必然出现,无法自证清白。
++const NOTIFY_MJS = resolve(dirname(fileURLToPath(import.meta.url)), 'notify.mjs')
++
++/** 在子进程里跑一次 degrade 路径,返回假 osascript 的真实被调次数。 */
++const countOsascriptCalls = (env) => {
++  const probe = mkdtempSync(join(tmpdir(), 'mivo-osascript-probe-'))
++  const stateDir = mkdtempSync(join(tmpdir(), 'mivo-degrade-'))
++  try {
++    mkdirSync(join(probe, 'bin'))
++    const marker = join(probe, 'called.txt')
++    const shim = join(probe, 'bin', 'osascript')
++    writeFileSync(shim, `#!/bin/sh\necho CALLED >> ${JSON.stringify(marker)}\n`)
++    chmodSync(shim, 0o755)
++    const run = spawnSync(
++      process.execPath,
++      [
++        '-e',
++        `import(${JSON.stringify(NOTIFY_MJS)}).then((m) => m.sendAlert({ stateDir: ${JSON.stringify(stateDir)}, config: {}, title: 't', text: 'x' }))`,
++      ],
++      // 关键:PATH 前置假 osascript;Slack 三键清空(空串在 loadNotifyConfig 里为 falsy)确保走 degrade
++      {
++        encoding: 'utf8',
++        env: {
++          ...process.env,
++          PATH: `${join(probe, 'bin')}:${process.env.PATH}`,
++          SLACK_WEBHOOK_URL: '',
++          SLACK_BOT_TOKEN: '',
++          SLACK_CHANNEL_ID: '',
++          ...env,
++        },
++      },
++    )
++    expect(run.status, `子进程应正常退出,stderr: ${run.stderr}`).toBe(0)
++    const calls = existsSync(marker) ? readFileSync(marker, 'utf8').trim().split('\n').filter(Boolean).length : 0
++    return { calls, pendingWritten: existsSync(join(stateDir, PENDING_ALERTS_FILE)) }
++  } finally {
++    rmSync(probe, { recursive: true, force: true })
++    rmSync(stateDir, { recursive: true, force: true })
++  }
++}
++
++describe('降级路径的桌面横幅默认关闭(防测试副作用泄漏到 owner 屏幕)', () => {
++  it('默认:osascript 零次被调,但 pending-alerts.md 仍必落', () => {
++    const { calls, pendingWritten } = countOsascriptCalls({})
++    expect(calls).toBe(0)
++    expect(pendingWritten).toBe(true) // 关掉横幅不等于允许静默丢告警
++  })
++
++  it('MIVO_NOTIFY_DESKTOP=1:osascript 恰被调 1 次(证明这是开关,不是把功能删了)', () => {
++    const { calls, pendingWritten } = countOsascriptCalls({ MIVO_NOTIFY_DESKTOP: '1' })
++    expect(calls).toBe(1)
++    expect(pendingWritten).toBe(true)
++  })
++
++  it('非 "1" 的取值一律不开启(避免 =0/=false/=true 这类值被误当真)', () => {
++    for (const v of ['0', 'false', 'true', 'yes', '']) {
++      expect(countOsascriptCalls({ MIVO_NOTIFY_DESKTOP: v }).calls, `MIVO_NOTIFY_DESKTOP=${v}`).toBe(0)
++    }
++  })
++})

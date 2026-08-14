@@ -1,0 +1,111 @@
+diff --git a/main.js b/main.js
+index 979cde63..9b42c139 100644
+--- a/main.js
++++ b/main.js
+@@ -1033,7 +1033,10 @@ async function cardDeliver(cardId, version) {
+     html: version.html,
+     height: version.height,
+   }
+-  const bytes = version.html.length
++  // 可选(七轮追加):`.length` 是 UTF-16 code units,中文/emoji 等多字节字符的
++  // 真实 UTF-8 字节数比 `.length` 大——用 `.length` 判定会让真实超限的 HTML 漏判
++  // 放行。改用 TextEncoder 编码后的真实字节数。
++  const bytes = new TextEncoder().encode(version.html).length
+   if (bytes > CARD_HTML_MAX_BYTES) {
+     // 超体积宿主会拒整版:如实记失败,不假装发出去了。
+     diagFail(DIAG_SOURCE.card, 'card 版本超体积未发送 cardId=' + cardId + ' bytes=' + bytes)
+@@ -2565,8 +2568,10 @@ async function deferEnqueueLocked(verb, params, callId, binding) {
+     origin: { callId: typeof callId === 'string' && callId ? callId : undefined, source: 'tool-call' },
+   }
+   const text = JSON.stringify(body)
+-  if (text.length > DEFER_BODY_MAX_BYTES) {
+-    diagFail(DIAG_SOURCE.defer, 'defer 失败: 单条正文超上限 bytes=' + text.length + '/' + DEFER_BODY_MAX_BYTES)
++  // 可选(七轮追加):同上——按真实 UTF-8 字节数判定,不用 UTF-16 code units。
++  const textBytes = new TextEncoder().encode(text).length
++  if (textBytes > DEFER_BODY_MAX_BYTES) {
++    diagFail(DIAG_SOURCE.defer, 'defer 失败: 单条正文超上限 bytes=' + textBytes + '/' + DEFER_BODY_MAX_BYTES)
+     return { ok: false, code: 'WRITE_QUEUE_FULL', message: '这条改动太大,无法离线排队(单条上限 64KB)。' }
+   }
+ 
+diff --git a/src/__tests__/brainHarness.ts b/src/__tests__/brainHarness.ts
+index 6c9d92bf..ea3043af 100644
+--- a/src/__tests__/brainHarness.ts
++++ b/src/__tests__/brainHarness.ts
+@@ -364,6 +364,8 @@ export type BrainDepositReply = {
+   ok: boolean
+   state?: string | null
+   generation?: number
++  /** F1(四审):当前已合并内容的指纹,CAS 双因子之一——见 bridge.ts revisionSum 字段注释。 */
++  revisionSum?: string
+   conflict?: boolean
+   message?: string
+ }
+@@ -372,16 +374,37 @@ export type BrainDepositHandles = {
+   media: (msg: unknown) => void
+   stateLoad: () => Promise<BrainDepositReply>
+   stateSave: (msg: unknown) => Promise<BrainDepositReply>
+-  readState: () => Promise<{ text: string | null; generation: number; corrupt: number; missing: number }>
++  readState: () => Promise<{ payload: unknown; generation: number; corrupt: number; missing: boolean }>
++  /** SC11.1:同代多候选合并纯函数,协议测试用它直接断言逐字段仲裁而不必绕完整 fs 往返。 */
++  mergeCandidates: (
++    candidates: Array<{ gen: number; writer: string; payload: Record<string, unknown> }>,
++    maxGen: number,
++  ) => { payload: Record<string, unknown>; impossibleTie: boolean }
+   dir: string
+-  slots: string[]
++  /** 不可变命名协议的候选文件名正则(设计稿 §4.4.2:`state-<gen>-<writer>.json`)。 */
++  fileRe: RegExp
++  /** 保留代数 K(设计稿 §4.4.3.1)。 */
++  retainGenerations: number
+   /** 媒体寄存上限(设计稿 §4.6:50MB)。 */
+   maxBytes: number
+-  /** 状态自身落盘的单次写入上限(= MAX_ASSET_BYTES,cindy.fs 槽单次写入上限,
+-   * 与上面 maxBytes 是两个不相关的数字,不得互推,设计稿 §4.6)。 */
++  /** 状态自身落盘的单次写入上限(SC8.2 `DEPOSIT_STATE_HARD_BYTES`,与上面
++   * maxBytes 是两个不相关的数字,不得互推,设计稿 §4.6)。 */
+   stateMaxBytes: number
+   labelMax: number
+   inflightCount: () => number
++  /** F1:协议测试用它给某份构造出的 payload 现算 revisionSum,拼出正确的 baseSum。 */
++  revisionSum: (payload: unknown) => string
++  emptyRevisionSum: string
++  /** F2:releasedFloor 条目上限(与 depositStore.ts 同值)。 */
++  releasedFloorMaxEntries: number
++  /** SC6.6:这条 main.js 副本理解的最高协议 version。 */
++  knownVersion: number
++  /**
++   * SC10.1(十轮定案——单写者架构):main.js 进程生命周期内唯一的写者短码,协议
++   * 测试拼预期文件名(`state-<gen>-<writer>.json`)/信封字段要用它,不能再假设或
++   * 硬编码某个值(面板不再随请求携带 `writer`,`stateSave` 的 `msg` 里也不用带)。
++   */
++  writer: string
+ }
+ 
+ /** subscribe 槽会话事件(#297 R11a)。信号形状与共享层 BindingSignal 一致。 */
+diff --git a/src/__tests__/cardTransport.test.ts b/src/__tests__/cardTransport.test.ts
+index 79c18de7..92ecec1d 100644
+--- a/src/__tests__/cardTransport.test.ts
++++ b/src/__tests__/cardTransport.test.ts
+@@ -350,6 +350,22 @@ describe('card transport — fail-visible 且不悬挂', () => {
+     const { spy } = attachPanelBridge(brain)
+     expect(spy.find('card 版本超体积未发送')[0]?.level).toBe('error')
+   })
++
++  it('七轮可选修复:超限判据按真实 UTF-8 字节数,不是 UTF-16 code units——中文重复串在 .length 视角"没超限"但真实字节超限', async () => {
++    const { brain, cards } = cardBrain()
++    // 中文字符 UTF-16 占 1 个 code unit,UTF-8 占 3 字节——构造一份 `.length` 明显
++    // 小于上限、真实 UTF-8 字节数明显大于上限的 HTML。
++    const chinesePad = '中'.repeat(Math.ceil(brain.handles.card.maxBytes / 2))
++    const html = `<div>${chinesePad}</div>`
++    expect(html.length).toBeLessThan(brain.handles.card.maxBytes)
++    expect(new TextEncoder().encode(html).length).toBeGreaterThan(brain.handles.card.maxBytes)
++
++    await brain.handles.card.final('call-1', { state: 'done', height: 522, html })
++
++    expect(cards).toHaveLength(0)
++    const { spy } = attachPanelBridge(brain)
++    expect(spy.find('card 版本超体积未发送')[0]?.level).toBe('error')
++  })
+ })
+ 
+ describe('card transport — 交卷媒体令牌', () => {

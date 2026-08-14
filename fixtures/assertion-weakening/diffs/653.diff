@@ -1,0 +1,510 @@
+diff --git a/docs/design-previews/region-edit/assets/product.css b/docs/design-previews/region-edit/assets/product.css
+index 1f45e612..74dedbce 100644
+--- a/docs/design-previews/region-edit/assets/product.css
++++ b/docs/design-previews/region-edit/assets/product.css
+@@ -6935,7 +6935,9 @@ button:disabled {
+ 
+ /* 摘要文案随所选档变长(「原比例 · 标准画质 · 1张」最长约 14 字),极窄壳下省略而不是
+    把发送键挤出行外 —— 完整值仍在 aria-label 里,读屏器不受影响。
+-   浮层最小宽已从 400 抬到 460(见 maskEditFloatingControls),常态不会触发省略。 */
++   常态(可用宽 ≥ 460)不会触发省略;窄壳 containment(可用宽 < 460,layout.width 被压到
++   availableWidth,见 maskEditFloatingControls)下省略会真正触发 —— 属优雅降级,
++   发送键(32px flex:none)始终可点。 */
+ .region-edit-params-summary {
+   overflow: hidden;
+   max-width: 16ch;
+@@ -7145,6 +7147,17 @@ button:disabled {
+   gap: 2px;
+ }
+ 
++/* 极窄壳组内折行(Greptile P1):外层 wrap 只能整体搬组,组自身 nowrap 的单行最小
++   内容宽(~250px)在 availableWidth 跌破它时会横出面板,被 .canvas-shell
++   overflow:clip 裁切(实测 available≈204 时组右缘越壳)。is-narrow 只在
++   computeFloatingControls 给出 toolbarMaxWidth 钳制时存在(可用宽 < 460),宽壳下
++   永不触发,「不撕组」的观感契约在常态不受影响;极窄壳是优雅降级 —— 按钮不缩放、
++   不隐藏,只把组内按钮折成多行,组宽收敛到 ≤ availableWidth。 */
++.region-edit-tool-panel.image-mask-edit-toolbar.is-narrow .image-mask-edit-tools,
++.region-edit-tool-panel.image-mask-edit-toolbar.is-narrow .region-edit-toolbar-group {
++  flex-wrap: wrap;
++}
++
+ /* 工具按钮去框(K8 ②,参考图样式):平时**裸图标 + 文字**,无边框无底色;hover 才给
+    轻微底色反馈;只有 active 是强调块(沿用既有 charcoal pill);禁用降透明度。
+    对比度重验(去框后文字直接坐在面板底上,配色对没变但换了承载面):
+diff --git a/scripts/e2e/scenarios/mask-blackblock.mjs b/scripts/e2e/scenarios/mask-blackblock.mjs
+index 052d7b18..0392ac59 100644
+--- a/scripts/e2e/scenarios/mask-blackblock.mjs
++++ b/scripts/e2e/scenarios/mask-blackblock.mjs
+@@ -41,6 +41,34 @@ const waitForCondition = async (fn, { timeout = 10000, interval = 50, label = 'c
+   throw new Error(`Timed out waiting for ${label}`)
+ }
+ 
++// 回归断言(侧栏遮挡修复):项目侧栏在抽屉/peek 态与画布模式常态打开态都会
++// position:fixed 浮在画布之上(App.css),maskEditFloatingControls 的浮层左界必须避开
++// 它——否则工具条会被侧栏(更高 z-index)盖住,Point select 点不到,现象是 30s click
++// 超时且不指名根因。这里显式测两者 bounding rect 是否重叠,命中时直接报坐标,比等
++// click 超时更早、更可诊断地暴露回归。
++const assertMaskToolbarClearsFloatingSidebar = async (page) => {
++  const overlap = await page.evaluate(() => {
++    const toolbar = document.querySelector('.image-mask-edit-toolbar')
++    const sidebar = document.querySelector('.project-sidebar:not(.closed)')
++    const shell = toolbar?.closest('.canvas-shell') || null
++    if (!toolbar || !sidebar || getComputedStyle(sidebar).position !== 'fixed') return null
++    const t = toolbar.getBoundingClientRect()
++    const s = sidebar.getBoundingClientRect()
++    const shellRect = shell ? shell.getBoundingClientRect() : null
++    const overlapsHorizontally = t.left < s.right && t.right > s.left
++    const overlapsVertically = t.top < s.bottom && t.bottom > s.top
++    if (!overlapsHorizontally || !overlapsVertically) return null
++    return {
++      toolbar: { left: t.left, right: t.right, top: t.top, bottom: t.bottom },
++      sidebar: { left: s.left, right: s.right, top: s.top, bottom: s.bottom },
++      shellRect: shellRect ? { left: shellRect.left, right: shellRect.right, width: shellRect.width } : null,
++    }
++  })
++  if (overlap) {
++    throw new Error(`mask edit toolbar overlaps floating project sidebar: ${JSON.stringify(overlap)}`)
++  }
++}
++
+ const ensureChatPanelOpen = async (page) => {
+   if (await page.locator('.ai-panel.collapsed').isVisible()) {
+     await page.getByRole('button', { name: 'Open AI panel' }).click()
+@@ -236,6 +264,8 @@ export const runMaskBlackblockScenario = async (context) => {
+     await page.waitForSelector('.selection-quick-toolbar')
+     await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
+     await page.waitForSelector('.image-mask-edit-stage')
++    await page.waitForSelector('.image-mask-edit-toolbar')
++    await assertMaskToolbarClearsFloatingSidebar(page)
+     await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
+   }
+ 
+@@ -425,6 +455,220 @@ export const runMaskBlackblockScenario = async (context) => {
+ 
+   } // end else (SKIP_BB_SELF_HEAL=false 时跑 BB-1/BB-2 自愈断言)
+ 
++  // ═══ BB-4 窄壳 containment(M-1):窄视口下可用宽跌破 min-width,浮层宽必须服从壳,
++  // 工具条/输入面板真实盒整体留在 canvas-shell 内,Point select 仍可点 ═════════════
++  {
++    await resetScene()
++    const sourceNodeId = await addKnownSource()
++    if (!sourceNodeId) throw new Error('BB-4: failed to add known source image')
++    await clearRegionEditDraftFor(page, sourceNodeId)
++    await ensureChatPanelCollapsed(page)
++    await clickCanvasNode(page, rendererMode, sourceNodeId)
++    await page.waitForSelector('.selection-quick-toolbar')
++    await page.locator('.selection-quick-toolbar').getByRole('button', { name: 'AI Edit' }).click()
++    await page.waitForSelector('.image-mask-edit-stage')
++    await page.waitForSelector('.image-mask-edit-toolbar')
++    await assertMaskToolbarClearsFloatingSidebar(page)
++
++    // 收窄视口 → canvas-shell 随视口变窄(画布列恒全铺,侧栏 fixed 不占列宽)。
++    // 前置条件:侧栏以 fixed 悬浮、可用宽 < min-width(460) —— 不满足说明本块没有真正
++    // 压到窄壳路径,直接报错而不是静默放行(防断言退化成恒真)。谓词不满足时必须返回
++    // falsy 让 waitForFunction 继续轮询(返回 {ok:false} 对象是 truthy,会立刻解析)。
++    await page.setViewportSize({ width: 620, height: 800 })
++    const narrowHandle = await page.waitForFunction(() => {
++      const toolbar = document.querySelector('.image-mask-edit-toolbar')
++      const shell = toolbar?.closest('.canvas-shell')
++      const sidebar = document.querySelector('.project-sidebar:not(.closed)')
++      if (!toolbar || !shell || !sidebar) return false
++      if (getComputedStyle(sidebar).position !== 'fixed') return false
++      const s = shell.getBoundingClientRect()
++      const sb = sidebar.getBoundingClientRect()
++      if (!(sb.right > s.left)) return false
++      // 与 maskEditFloatingControls 同源:leftBound = max(12, sidebarRight - shellLeft + 10),
++      // availableWidth = shellW - leftBound - 12
++      const leftBound = Math.max(12, sb.right - s.left + 10)
++      const available = s.width - leftBound - 12
++      const t = toolbar.getBoundingClientRect()
++      // 布局重算完成信号:壳已收窄(available < 460)、工具条已按 toolbarMaxWidth 钳制
++      // wrap 重排、自身宽收敛到 ≤ available(席②:窄壳下工具条必须真重排进壳,不能靠
++      // 溢出放行),且左缘越过侧栏右缘。
++      const ok = available >= 0 && available < 460 && t.width > 0 && t.width <= available + 1 && t.left >= 240
++      if (!ok) return false
++      return { available, shellW: s.width, sidebarRight: sb.right, toolbarW: t.width }
++    }, { timeout: 8000 })
++    const narrowPrecondition = await narrowHandle.jsonValue()
++    if (!narrowPrecondition) {
++      throw new Error('BB-4: narrow-shell precondition failed (sidebar must float fixed over shell, available < 460, toolbar wrapped to fit within available)')
++    }
++    // 等一帧让 computeFloatingControls 的 setState 渲染落定,再读最终盒
++    await page.waitForTimeout(150)
++
++    // 真实盒 containment —— 席② major 起**无条件**断言:窄壳下工具条经
++    // toolbarMaxWidth 钳制 + flex-wrap 重排后自身宽 ≤ 可用宽,**二维**(水平 + 垂直)
++    // 全部落在 canvas-shell 内(wrap 使工具条变高,第二行撤销组若被壳下缘 clip 同样
++    // 点不到;右缘被 overflow:clip 裁切也点不到,不允许日志放行);输入面板
++    // (宽 = layout.width)与其最右控制 Generate 同样必须在壳内。
++    const containment = await page.evaluate(() => {
++      const toolbar = document.querySelector('.image-mask-edit-toolbar')
++      const prompt = document.querySelector('.image-mask-edit-prompt')
++      const shell = toolbar?.closest('.canvas-shell')
++      if (!toolbar || !prompt || !shell) return { error: 'toolbar/prompt/shell missing' }
++      const t = toolbar.getBoundingClientRect()
++      const p = prompt.getBoundingClientRect()
++      const s = shell.getBoundingClientRect()
++      const generate = prompt.querySelector('.image-mask-edit-submit')
++      const g = generate ? generate.getBoundingClientRect() : null
++      const sidebar = document.querySelector('.project-sidebar:not(.closed)')
++      const sb = sidebar && getComputedStyle(sidebar).position === 'fixed' ? sidebar.getBoundingClientRect() : null
++      const inside2d = (r) =>
++        r.left >= s.left - 0.5 && r.right <= s.right + 0.5 && r.top >= s.top - 0.5 && r.bottom <= s.bottom + 0.5
++      // 与 maskEditFloatingControls 同源:leftBound = max(12, sidebarRight - shellLeft + 10)
++      const leftBound = sb && sb.right > s.left ? Math.max(12, sb.right - s.left + 10) : 12
++      return {
++        toolbar: { left: t.left, right: t.right, top: t.top, bottom: t.bottom, width: t.width, height: t.height },
++        prompt: { left: p.left, right: p.right, top: p.top, bottom: p.bottom, width: p.width },
++        generateInsideShell: g ? g.left >= s.left - 0.5 && g.right <= s.right + 0.5 : null,
++        shell: { left: s.left, right: s.right, top: s.top, bottom: s.bottom, width: s.width },
++        available: s.width - leftBound - 12,
++        sidebarRight: sb && sb.right > s.left ? sb.right : null,
++        // 右缘 containment 单独成字段并**无条件**断言 —— 席② major 的核心:右缘越出
++        // 壳即被 .canvas-shell overflow:clip 裁切,右侧按钮点不到,不因任何条件放行。
++        toolbarRightInsideShell: t.right <= s.right + 0.5,
++        toolbarLeftInsideShell: t.left >= s.left - 0.5,
++        toolbarInsideShell: inside2d(t),
++        promptInsideShell: inside2d(p),
++        toolbarClearsSidebar: sb && sb.right > s.left ? t.left >= sb.right - 0.5 : true,
++      }
++    })
++    if (containment.error) throw new Error(`BB-4: ${containment.error}`)
++    if (!containment.toolbarRightInsideShell) {
++      throw new Error(`BB-4: mask toolbar right edge must be inside canvas-shell at narrow viewport (wrapped, no clip), got ${JSON.stringify(containment)}`)
++    }
++    if (!containment.toolbarInsideShell) {
++      throw new Error(`BB-4: mask toolbar must be fully inside canvas-shell (2D) at narrow viewport (wrapped), got ${JSON.stringify(containment)}`)
++    }
++    if (!containment.promptInsideShell) {
++      throw new Error(`BB-4: mask input panel must stay fully inside canvas-shell (2D) at narrow viewport, got ${JSON.stringify(containment)}`)
++    }
++    if (containment.generateInsideShell === false) {
++      throw new Error(`BB-4: input panel Generate button must stay inside canvas-shell at narrow viewport, got ${JSON.stringify(containment)}`)
++    }
++    if (!containment.toolbarClearsSidebar) {
++      throw new Error(`BB-4: mask toolbar must clear floating sidebar at narrow viewport, got ${JSON.stringify(containment)}`)
++    }
++
++    // 窄壳下最右按钮(Clear regions,撤销组右端)必须真实可操作 —— 不只可见,要能画出
++    // 选区再一键清空。先切 Box select 在 stage 上拖出矩形选区。
++    await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Box select', exact: true }).click()
++    const stage = await page.locator('.image-mask-edit-stage').boundingBox()
++    if (!stage) throw new Error('BB-4: mask edit stage should be visible')
++    if (stage.width < 300 || stage.height < 200) {
++      throw new Error(`BB-4: stage too small for proportional drag, got ${stage.width.toFixed(0)}x${stage.height.toFixed(0)}`)
++    }
++    // 比例位移画选区(对齐 mask-multi-edit drawBoxRegion 惯例):绝对像素差量在窄视口
++    // 小 stage 下可能越出 stage 边界,比例位移天然不越界。
++    const bx = 0.5
++    const by = 0.5
++    const brx = 0.15
++    const bry = 0.12
++    await page.mouse.move(stage.x + (bx - brx) * stage.width, stage.y + (by - bry) * stage.height)
++    await page.mouse.down()
++    await page.mouse.move(stage.x + (bx + brx) * stage.width, stage.y + (by + bry) * stage.height, { steps: 8 })
++    await page.mouse.up()
++    await page.waitForFunction(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '0') > 0)
++    // 点击最右的 Clear regions,选区应清空(证明 wrap 后右端按钮真实命中可操作)。
++    // aria-label 来自 regionEditOverlayRender 的 clearRegions key(= "Clear regions")。
++    await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Clear regions', exact: true }).click()
++    const cleared = await page.evaluate(() => Number(document.querySelector('.image-mask-edit-overlay')?.getAttribute('data-region-count') || '-1'))
++    if (cleared !== 0) {
++      throw new Error(`BB-4: Clear regions should reset regions at narrow viewport, got data-region-count=${cleared}`)
++    }
++
++    // Point select(工具条最左按钮)必须仍可点:点击后 active 状态须切换成功
++    await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Point select', exact: true }).click()
++    const activeTool = await page.evaluate(() => document.querySelector('.image-mask-edit-toolbar button.active')?.getAttribute('aria-label') ?? null)
++    if (activeTool !== 'Point select') {
++      throw new Error(`BB-4: Point select should become active after click at narrow viewport, got ${JSON.stringify(activeTool)}`)
++    }
++
++    // ══ 超窄壳(Greptile P1):availableWidth 跌破工具组 nowrap 单行最小内容宽 ══
++    // 外层 wrap 只能整体搬组;`.image-mask-edit-tools { flex-wrap: nowrap }` 的单行最小
++    // 宽(≈317px,工具条单行 436 − 撤销组/分隔线/间距)在 620 视口(available=344)还放得下,
++    // 但更窄的壳(480 视口 → available≈204,跌破组 min-content)会让组横出面板被 shell clip 裁切(Lasso
++    // 按钮是组内最右、最先被裁的点)。修复(is-narrow 组内折行)后组宽收敛到 ≤ available。
++    const toolsNatural = await page.evaluate(() => {
++      const g = document.querySelector('.image-mask-edit-toolbar .image-mask-edit-tools')
++      return g ? g.getBoundingClientRect().width : 0
++    })
++    if (toolsNatural < 200) {
++      throw new Error(`BB-4: tools group natural width too small to prove ultra-narrow wrap, got ${toolsNatural}`)
++    }
++    await page.setViewportSize({ width: 480, height: 800 })
++    const ultraHandle = await page.waitForFunction((natural) => {
++      const toolbar = document.querySelector('.image-mask-edit-toolbar')
++      const tools = toolbar?.querySelector('.image-mask-edit-tools')
++      const shell = toolbar?.closest('.canvas-shell')
++      const sidebar = document.querySelector('.project-sidebar:not(.closed)')
++      if (!toolbar || !tools || !shell || !sidebar) return false
++      if (getComputedStyle(sidebar).position !== 'fixed') return false
++      const s = shell.getBoundingClientRect()
++      const sb = sidebar.getBoundingClientRect()
++      const leftBound = Math.max(12, sb.right - s.left + 10)
++      const available = s.width - leftBound - 12
++      const t = toolbar.getBoundingClientRect()
++      const g = tools.getBoundingClientRect()
++      const inside2d = (r) =>
++        r.left >= s.left - 0.5 && r.right <= s.right + 0.5 && r.top >= s.top - 0.5 && r.bottom <= s.bottom + 0.5
++      // 收敛信号:可用宽跌破工具组自然单行宽(真正压到组内折行路径),组宽与工具条宽
++      // 都收敛到壳内
++      const ok = available > 0 && available < natural && g.width <= available + 1 && t.width <= available + 1 && inside2d(t)
++      if (!ok) return false
++      return { available, toolsWidth: g.width, toolbarWidth: t.width, natural }
++    }, toolsNatural, { timeout: 8000 })
++    const ultraPrecondition = await ultraHandle.jsonValue()
++    if (!ultraPrecondition) {
++      throw new Error('BB-4: ultra-narrow precondition failed (tools group must wrap within available < natural single-line width)')
++    }
++    // 超窄壳 containment 无条件断言:工具条 2D 在壳内、右缘不越壳、组右缘不越壳
++    const ultraContainment = await page.evaluate(() => {
++      const toolbar = document.querySelector('.image-mask-edit-toolbar')
++      const tools = toolbar?.querySelector('.image-mask-edit-tools')
++      const shell = toolbar?.closest('.canvas-shell')
++      if (!toolbar || !tools || !shell) return { error: 'toolbar/tools/shell missing' }
++      const t = toolbar.getBoundingClientRect()
++      const g = tools.getBoundingClientRect()
++      const s = shell.getBoundingClientRect()
++      return {
++        toolbarRightInsideShell: t.right <= s.right + 0.5,
++        toolsRightInsideShell: g.right <= s.right + 0.5,
++        toolsLeftInsideShell: g.left >= s.left - 0.5,
++        toolbar2dInsideShell: t.left >= s.left - 0.5 && t.right <= s.right + 0.5 && t.top >= s.top - 0.5 && t.bottom <= s.bottom + 0.5,
++        toolbar: { left: t.left, right: t.right, width: t.width },
++        tools: { left: g.left, right: g.right, width: g.width },
++        shell: { left: s.left, right: s.right },
++      }
++    })
++    if (ultraContainment.error) throw new Error(`BB-4: ${ultraContainment.error}`)
++    if (!ultraContainment.toolbarRightInsideShell || !ultraContainment.toolbar2dInsideShell) {
++      throw new Error(`BB-4: ultra-narrow toolbar must stay fully inside canvas-shell, got ${JSON.stringify(ultraContainment)}`)
++    }
++    if (!ultraContainment.toolsRightInsideShell || !ultraContainment.toolsLeftInsideShell) {
++      throw new Error(`BB-4: ultra-narrow tools group must stay inside canvas-shell (group-level wrap), got ${JSON.stringify(ultraContainment)}`)
++    }
++    // 超窄壳下组内最右按钮(Lasso,修复前被 clip 的那颗)必须可点
++    await page.locator('.image-mask-edit-toolbar').getByRole('button', { name: 'Lasso', exact: true }).click()
++    const ultraActiveTool = await page.evaluate(() => document.querySelector('.image-mask-edit-toolbar button.active')?.getAttribute('aria-label') ?? null)
++    if (ultraActiveTool !== 'Lasso') {
++      throw new Error(`BB-4: Lasso should become active after click at ultra-narrow viewport, got ${JSON.stringify(ultraActiveTool)}`)
++    }
++
++    // 还原视口并关编辑器(空指令下 Escape → cancel;body 非空时 Escape 只 blur 不关闭)
++    await page.setViewportSize({ width: 1512, height: 900 })
++    await page.keyboard.press('Escape')
++    await page.waitForSelector('.image-mask-edit-overlay', { state: 'detached' })
++    console.log(`[mask-blackblock] BB-4 passed (narrow-shell unconditional containment, toolbar wrapped to ${containment.toolbar.width}px ≤ available ${containment.available}px, Clear regions + Point select operable; ultra-narrow group wrap ${ultraPrecondition.toolsWidth}px ≤ ${ultraPrecondition.available}px, Lasso operable)`)
++  }
++
+   // ═══ BB-3 迭代重绘（N=5）：连续编辑 result 节点，submit 源恒不透明 + 结果恒无黑块 ═══
+   {
+     await resetScene()
+diff --git a/src/App.css b/src/App.css
+index c7ef3727..39a47ddf 100644
+--- a/src/App.css
++++ b/src/App.css
+@@ -6889,7 +6889,9 @@ button:disabled {
+ 
+ /* 摘要文案随所选档变长(「原比例 · 标准画质 · 1张」最长约 14 字),极窄壳下省略而不是
+    把发送键挤出行外 —— 完整值仍在 aria-label 里,读屏器不受影响。
+-   浮层最小宽已从 400 抬到 460(见 maskEditFloatingControls),常态不会触发省略。 */
++   常态(可用宽 ≥ 460)不会触发省略;窄壳 containment(可用宽 < 460,layout.width 被压到
++   availableWidth,见 maskEditFloatingControls)下省略会真正触发 —— 属优雅降级,
++   发送键(32px flex:none)始终可点。 */
+ .region-edit-params-summary {
+   overflow: hidden;
+   max-width: 16ch;
+@@ -7099,6 +7101,17 @@ button:disabled {
+   gap: 2px;
+ }
+ 
++/* 极窄壳组内折行(Greptile P1):外层 wrap 只能整体搬组,组自身 nowrap 的单行最小
++   内容宽(~250px)在 availableWidth 跌破它时会横出面板,被 .canvas-shell
++   overflow:clip 裁切(实测 available≈204 时组右缘越壳)。is-narrow 只在
++   computeFloatingControls 给出 toolbarMaxWidth 钳制时存在(可用宽 < 460),宽壳下
++   永不触发,「不撕组」的观感契约在常态不受影响;极窄壳是优雅降级 —— 按钮不缩放、
++   不隐藏,只把组内按钮折成多行,组宽收敛到 ≤ availableWidth。 */
++.region-edit-tool-panel.image-mask-edit-toolbar.is-narrow .image-mask-edit-tools,
++.region-edit-tool-panel.image-mask-edit-toolbar.is-narrow .region-edit-toolbar-group {
++  flex-wrap: wrap;
++}
++
+ /* 工具按钮去框(K8 ②,参考图样式):平时**裸图标 + 文字**,无边框无底色;hover 才给
+    轻微底色反馈;只有 active 是强调块(沿用既有 charcoal pill);禁用降透明度。
+    对比度重验(去框后文字直接坐在面板底上,配色对没变但换了承载面):
+diff --git a/src/canvas/maskEditFloatingControls.ts b/src/canvas/maskEditFloatingControls.ts
+index 7192a705..a1add4bb 100644
+--- a/src/canvas/maskEditFloatingControls.ts
++++ b/src/canvas/maskEditFloatingControls.ts
+@@ -1,8 +1,24 @@
+ // 从 ImageMaskEditOverlay 机械抽离(structure guard >900),行为不变。
+ // 浮层定位:测量 stage/shell/toolbar/prompt 真实尺寸,算浮层左/宽/工具条顶/
+-// prompt 顶,避开抽屉侧栏,夹在画布内。refs 以参数传入(不改创建位置与身份);
+-// 调用点时序不动(overlay 保留 useCallback 薄包装,effect deps 与 raf/observer
+-// 回调不变)。
++// prompt 顶,避开悬浮侧栏(抽屉态 + 画布模式常态打开态,两者都 position:fixed
++// 浮在画布上,按 computed position 判断,不绑定某个具体 class),夹在画布内。
++// refs 以参数传入(不改创建位置与身份);调用点时序不动(overlay 保留 useCallback
++// 薄包装,effect deps 与 raf/observer 回调不变)。
++//
++// 工具条居中偏移(避让计算的第二层坐标系):.region-edit-tool-panel.image-mask-edit-toolbar
++// 是 width:max-content + transform:translateX(-50%)(App.css),渲染层用
++// `left: layout.left + layout.width / 2` 把它摆在以 layout.left 为左边、layout.width
++// 为宽的那个假想盒子的**中线**上,再用负 50% 位移把自己居中。宽壳下它按
++// max-content 渲染(~436px),小于 min-width(460)时无偏移;窄壳下 availableWidth
++// 把 layout.width 压到 own 以下 —— 这时布局不给 overhang 让位,而是给工具条钳制
++// toolbarMaxWidth = availableWidth,触发面板自身的 flex-wrap 重排成多行,自身宽
++// 收敛到壳内,左右 containment 无条件成立(席② major:溢出会被 .canvas-shell
++// overflow:clip 裁切,右侧按钮点不到,不能靠日志放行)。overhang 只在首帧测量到
++// 未钳制单行宽时暂算,wrap 落地后由 ResizeObserver 重算收敛到 0。注意
++// regionEditOverlayRender.tsx 的 toolbarRef/promptRef 与视觉角色是**反的**(该文件
++// 586 行注释:"toolbarRef 量输入面板、promptRef 量工具面板",复用既有两槽栈的 slot
++// 命名,不是按视觉角色命名):居中悬浮、真正当 Point select 点击目标的
++// `.image-mask-edit-toolbar` 元素挂在 `promptRef` 上,不是 `toolbarRef`。
+ import type { Dispatch, RefObject, SetStateAction } from 'react'
+ 
+ export type FloatingControlsLayout = {
+@@ -10,6 +26,8 @@ export type FloatingControlsLayout = {
+   width: number
+   toolbarTop: number
+   promptTop: number
++  /** 窄壳时对居中工具条(max-content)的 max-width 钳制,触发 CSS flex-wrap 重排。 */
++  toolbarMaxWidth?: number
+ }
+ 
+ const floatingControlsMargin = 12
+@@ -17,9 +35,10 @@ const floatingControlsGap = 10
+ const floatingToolbarHeight = 114
+ // 加宽（用户 2026-07-07）：4 个工具按钮 + 关闭要能在一排放下，不换行；顺带让
+ // prompt 描述少折行。竖图时浮层宽度以前只有 ~320，「点选」会被挤到第二行。
+-// 再加宽（用户 2026-08-11 实测）：底部提交行从「模型下拉 + 发送键」变成
+-// 「模型下拉 + 参数入口 + 发送键」，400 下三者相互挤压（参数摘要「原比例 · 2K · 1张」
+-// 本身就有 ~15 字符）。+60 让最窄态也能一排放下，最大值同步抬以免宽图时反而更紧。
++// 再加宽（用户 2026-08-11 实测，#629 region-edit-plugin-params）：底部提交行从
++// 「模型下拉 + 发送键」变成「模型下拉 + 参数入口 + 发送键」，400 下三者相互挤压
++// （参数摘要「原比例 · 2K · 1张」本身就有 ~15 字符）。+60 让最窄态也能一排放下，
++// 最大值同步抬以免宽图时反而更紧。
+ const floatingControlsMinWidth = 460
+ const floatingControlsMaxWidth = 540
+ 
+@@ -44,27 +63,70 @@ export function computeFloatingControls({
+ 
+   const stageRect = stage.getBoundingClientRect()
+   const shellRect = shell.getBoundingClientRect()
+-  // 侧栏(position:fixed, z-index 80)浮在画布之上,会盖住浮层左半。测出它的
+-  // 右边界,把浮层左界推到侧栏右侧,避免工具条钻到栏后无法操作。
+-  // 2026-08-13 修复:原实现只避让抽屉形态(.drawer),固定浮层形态的侧栏同样
+-  // z-index 80 盖住画布左缘,镜头把节点摆到左侧时工具条会钻到栏后被拦截。
++  // 侧栏在抽屉/peek 态(.drawer)和画布模式常态打开态都是 position:fixed,z-index 80
++  // 浮在画布之上(App.css 2026-07-05 起把"默认打开态"也收敛进 fixed 浮层定位,不再
++  // 只有 .drawer 才浮——只认 .drawer 类会漏掉常态打开态,工具条算出的位置可能钻到
++  // 侧栏(如底部 Change Log 行)后面点不到)。改成按运行时 computed position 判断是否
++  // 真的悬浮在画布上,不绑定具体触发它悬浮的 class 组合;测出它的右边界,把浮层左界
++  // 推到侧栏右侧,避免工具条钻到栏后无法操作。
+   let leftBound = floatingControlsMargin
+   const sidebar = shell.ownerDocument.querySelector('.project-sidebar:not(.closed)') as HTMLElement | null
+-  if (sidebar) {
++  const sidebarIsFloating =
++    sidebar && shell.ownerDocument.defaultView?.getComputedStyle(sidebar).position === 'fixed'
++  if (sidebarIsFloating) {
+     const sidebarRect = sidebar.getBoundingClientRect()
+     if (sidebarRect.width > 0 && sidebarRect.right > shellRect.left) {
+       leftBound = Math.max(leftBound, sidebarRect.right - shellRect.left + floatingControlsGap)
+     }
+   }
+-  const maxWidth = Math.max(floatingControlsMinWidth, shellRect.width - leftBound - floatingControlsMargin)
+-  const width = Math.min(floatingControlsMaxWidth, maxWidth, Math.max(floatingControlsMinWidth, stageRect.width))
++  // 可用宽 = 壳宽 − 侧栏右缘 − 右呼吸位。min-width(460)只是"想一排放下"的偏好,
++  // 不许拿它突破 shell:可用宽 < 460 时宽度必须服从壳 —— 否则输入面板(宽 = layout.width)
++  // 会伸出壳右缘被 clip 削掉,而且下方工具条夹紧的上下界交叉,clamp 取到右界把工具条
++  // 整块推回侧栏后面(M-1 窄壳 containment 缺口;与 .region-edit-model-menu 的
++  // --flip-cap 同款"min-width 顶掉上限"坑)。
++  const availableWidth = Math.max(0, shellRect.width - leftBound - floatingControlsMargin)
++  // 工具条自身渲染宽度(max-content)可能比 width 更宽,居中(translateX(-50%))后左右各多
++  // 探出这个差值的一半。真正居中悬浮的工具条元素挂在 promptRef 上(见上方文件头注释,
++  // slot 命名与视觉角色相反);首帧未挂载时 offsetWidth 为 0,overhang 按 0 算,面板
++  // 挂载后由 ResizeObserver 触发重算补齐。
++  const width = Math.min(
++    floatingControlsMaxWidth,
++    Math.max(floatingControlsMinWidth, stageRect.width),
++    availableWidth,
++  )
++  // 窄壳重排(席② major):工具条 max-content 宽 > 可用宽时,布局无法把单行工具条塞进
++  // 壳内(右缘溢出会被 .canvas-shell overflow:clip 裁切,右侧按钮点不到)。工具面板
++  // 的 CSS 本就是 width:max-content + flex-wrap:wrap,但 max-content 容器永远按单行
++  // 撑宽,wrap 永不触发 —— 必须由 JS 把容器钳到可用宽(max-width 胜过 max-content),
++  // wrap 才真正生效:工具组(nowrap)独占一行、撤销组折到第二行,面板自身宽收敛到
++  // ≤ availableWidth,左右 containment 无条件成立,全部按钮保持原尺寸可点。
++  // 判定必须用纯几何量,不能依赖测量宽:max-width 钳制改变视觉宽,而视觉宽又是判定
++  // 输入 —— 无论用 offsetWidth 还是 scrollWidth(flex-wrap 后内容不横向溢出,
++  // scrollWidth 也收敛),wrap 后条件翻转、maxWidth 被移除弹回单行,ResizeObserver
++  // 再钳回来,形成无限振荡(实测:前置条件捕获到 wrap 帧后 containment 读到 436
++  // 单行,位置随测量抖动)。min-width(460) 正是"一排放得下"的最小需求:可用宽跌破它
++  // 即需钳制(available ≥ own 时钳到 available 不触发 wrap,居中恰好夹在
++  // [leftBound, shell−margin] 内;available < own 时 wrap 重排)。overhang 用
++  // offsetWidth(wrap 收敛后视觉宽 ≤ available = width,恒 0)。
++  const toolbarEl = promptRef.current
++  const toolbarMaxWidth =
++    availableWidth < floatingControlsMinWidth ? Math.max(0, Math.floor(availableWidth)) : undefined
++  const toolbarOverhang = Math.max(0, ((toolbarEl?.offsetWidth || 0) - width) / 2)
+   const stageLeft = stageRect.left - shellRect.left
+   const stageTop = stageRect.top - shellRect.top
+   const stageBottom = stageTop + stageRect.height
+-  const left = clamp(
+-    stageLeft + stageRect.width / 2 - width / 2,
+-    leftBound,
+-    Math.max(leftBound, shellRect.width - width - floatingControlsMargin),
++  const left = Math.max(
++    clamp(
++      stageLeft + stageRect.width / 2 - width / 2,
++      leftBound + toolbarOverhang,
++      // 内层 hi 已带 max(lo, ...):任意输入下 clamp 结果必然 ≥ lo —— 左缘约束由这一
++      // 层独立保证,工具条(Point select 在最左)不会钻回侧栏后。
++      Math.max(leftBound + toolbarOverhang, shellRect.width - width - floatingControlsMargin - toolbarOverhang),
++    ),
++    // 外层的 Math.max 在数学上是冗余(内层已兜住),保留作 belt-and-suspenders:两层
++    // 各自独立充分,任一被未来重构去掉,另一层仍守住左缘。不要因"证明冗余"删其中
++    // 一层而不动另一层 —— 删除必须两层一起删。
++    leftBound + toolbarOverhang,
+   )
+   // 真实测量高度优先（挂载后可得），首帧回退到常量估算。prompt 面板仅在有锚点时
+   // 渲染（promptRef 为 null），此时不预留它的高度，工具条独立定位。
+@@ -93,12 +155,14 @@ export function computeFloatingControls({
+       width: Math.round(width),
+       toolbarTop: Math.round(toolbarTop),
+       promptTop: Math.round(promptTop),
++      ...(toolbarMaxWidth !== undefined ? { toolbarMaxWidth } : {}),
+     }
+     return current &&
+       current.left === nextLayout.left &&
+       current.width === nextLayout.width &&
+       current.toolbarTop === nextLayout.toolbarTop &&
+-      current.promptTop === nextLayout.promptTop
++      current.promptTop === nextLayout.promptTop &&
++      current.toolbarMaxWidth === nextLayout.toolbarMaxWidth
+       ? current
+       : nextLayout
+   })
+diff --git a/src/canvas/regionEditOverlayRender.tsx b/src/canvas/regionEditOverlayRender.tsx
+index d3ca36d7..e547b651 100644
+--- a/src/canvas/regionEditOverlayRender.tsx
++++ b/src/canvas/regionEditOverlayRender.tsx
+@@ -735,9 +735,15 @@ export function RegionEditFloatingControls({
+           生成进行中的「取消请求」由提交按钮自己承担。 */}
+       <div
+         ref={promptRef}
+-        className="image-mask-edit-toolbar region-edit-panel region-edit-tool-panel"
++        className={`image-mask-edit-toolbar region-edit-panel region-edit-tool-panel${layout.toolbarMaxWidth !== undefined ? ' is-narrow' : ''}`}
+         data-canvas-ui="true"
+-        style={{ left: layout.left + layout.width / 2, top: layout.promptTop }}
++        style={{
++          left: layout.left + layout.width / 2,
++          top: layout.promptTop,
++          // 窄壳时钳制 max-content 宽 → CSS flex-wrap 重排(见 computeFloatingControls
++          // 的 toolbarMaxWidth;max-content 容器 wrap 永不触发,必须由 JS 钳制)。
++          ...(layout.toolbarMaxWidth !== undefined ? { maxWidth: layout.toolbarMaxWidth } : null),
++        }}
+         onPointerDown={(event) => event.stopPropagation()}
+       >
+           <div className="image-mask-edit-tools">

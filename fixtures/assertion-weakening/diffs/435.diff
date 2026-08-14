@@ -1,0 +1,86 @@
+diff --git a/main.js b/main.js
+index 7776974f..70f83455 100644
+--- a/main.js
++++ b/main.js
+@@ -493,8 +493,12 @@ const CARD_FAIL_PAD_TOP = 10
+ const CARD_FAIL_PAD_BOTTOM = 8
+ const CARD_FAIL_TITLE_H = 18
+ const CARD_FAIL_SUB_GAP = 6
+-const CARD_FAIL_SOURCE_H = 16 // 单行
+-const CARD_FAIL_REASON_H = 32 // 2 行 × 16
++// 副文本行高 —— 下面 .mivo-card__sub 的 line-height 必须用它,不许写死字面量:
++// 源图/原因两个高度都是它的整数倍,行高改了而高度没跟着改,第二行就会被
++// overflow:hidden 静默切掉(正是本文件要修的那个 bug)。测试同时钉住行高与倍数。
++const CARD_FAIL_LINE_H = 16
++const CARD_FAIL_SOURCE_H = CARD_FAIL_LINE_H // 单行
++const CARD_FAIL_REASON_H = 2 * CARD_FAIL_LINE_H // 2 行
+ const CARD_FAIL_META_H =
+   CARD_FAIL_PAD_TOP + CARD_FAIL_TITLE_H + CARD_FAIL_SUB_GAP + CARD_FAIL_REASON_H + CARD_FAIL_PAD_BOTTOM
+ const CARD_FAIL_META_WITH_SOURCE_H = CARD_FAIL_META_H + CARD_FAIL_SUB_GAP + CARD_FAIL_SOURCE_H
+@@ -725,7 +729,7 @@ const CARD_STYLE = [
+   '.mivo-card__meta{box-sizing:border-box;padding:' + CARD_FAIL_PAD_TOP + 'px 2px ' + CARD_FAIL_PAD_BOTTOM + 'px;',
+   'overflow:hidden;color:var(--text-primary, #1a1a1a)}',
+   '.mivo-card__title{margin:0;font-size:13px;font-weight:700;line-height:' + CARD_FAIL_TITLE_H + 'px}',
+-  '.mivo-card__sub{margin:' + CARD_FAIL_SUB_GAP + 'px 0 0;font-size:12px;line-height:16px;opacity:.72;overflow:hidden}',
++  '.mivo-card__sub{margin:' + CARD_FAIL_SUB_GAP + 'px 0 0;font-size:12px;line-height:' + CARD_FAIL_LINE_H + 'px;opacity:.72;overflow:hidden}',
+   // 源图行锁死单行:再长也只占 16px,不会把下面的失败原因顶出可见区。
+   '.mivo-card__sub--source{height:' + CARD_FAIL_SOURCE_H + 'px;white-space:nowrap;text-overflow:ellipsis}',
+   // 原因区固定 2 行:超长文案被裁的是原因的尾巴,而不是整行消失。
+@@ -5587,6 +5591,7 @@ if (seam && typeof seam.expose === 'function') {
+         padBottom: CARD_FAIL_PAD_BOTTOM,
+         titleH: CARD_FAIL_TITLE_H,
+         subGap: CARD_FAIL_SUB_GAP,
++        lineH: CARD_FAIL_LINE_H,
+         sourceH: CARD_FAIL_SOURCE_H,
+         reasonH: CARD_FAIL_REASON_H,
+       },
+diff --git a/src/__tests__/brainHarness.ts b/src/__tests__/brainHarness.ts
+index 60dad18a..5a923ffe 100644
+--- a/src/__tests__/brainHarness.ts
++++ b/src/__tests__/brainHarness.ts
+@@ -265,7 +265,15 @@ export type BrainCardHandles = {
+   failMetaHeight: number
+   failMetaWithSourceHeight: number
+   failReasonChars: number
+-  failParts: { padTop: number; padBottom: number; titleH: number; subGap: number; sourceH: number; reasonH: number }
++  failParts: {
++    padTop: number
++    padBottom: number
++    titleH: number
++    subGap: number
++    lineH: number
++    sourceH: number
++    reasonH: number
++  }
+   minIntervalMs: number
+   maxBytes: number
+   minHeight: number
+diff --git a/src/__tests__/cardRender.test.ts b/src/__tests__/cardRender.test.ts
+index a2f192a5..e50b4166 100644
+--- a/src/__tests__/cardRender.test.ts
++++ b/src/__tests__/cardRender.test.ts
+@@ -166,6 +166,9 @@ describe('card 失败卡保留文字', () => {
+     // 常量本身必须等于各部分之和(改了某一项忘了改总高,这条就红)
+     expect(api.failMetaHeight).toBe(parts.padTop + parts.titleH + parts.subGap + parts.reasonH + parts.padBottom)
+     expect(api.failMetaWithSourceHeight).toBe(api.failMetaHeight + parts.subGap + parts.sourceH)
++    // 两个高度都是行高的整数倍 —— 行高改了而高度没跟着改,第二行会被 overflow 切掉
++    expect(parts.sourceH).toBe(parts.lineH)
++    expect(parts.reasonH).toBe(2 * parts.lineH)
+ 
+     // CSS 侧的数值必须与常量一致(两边脱节只会表现为文字被裁,没有任何报错)
+     const css = styleBlock(api.render({ phase: 'failed', reason: 'r' }).html)
+@@ -174,9 +177,14 @@ describe('card 失败卡保留文字', () => {
+     const sub = css.match(/\.mivo-card__sub\{([^}]*)\}/)?.[1] ?? ''
+     const source = css.match(/\.mivo-card__sub--source\{([^}]*)\}/)?.[1] ?? ''
+     const error = css.match(/\.mivo-card__sub--error\{([^}]*)\}/)?.[1] ?? ''
++    // border-box 是 74/96 那套内容盒算术的前提:换成 content-box,meta 实渲会比
++    // 申报的 chrome 高出 padding 那么多,整卡被宿主裁掉
++    expect(meta).toContain('box-sizing:border-box')
+     expect(meta).toContain(`padding:${parts.padTop}px 2px ${parts.padBottom}px`)
+     expect(title).toContain(`line-height:${parts.titleH}px`)
+     expect(sub).toContain(`margin:${parts.subGap}px 0 0`)
++    // 副文本行高必须来自常量:sourceH/reasonH 都按它算,写死字面量会静默脱节
++    expect(sub).toContain(`line-height:${parts.lineH}px`)
+     expect(source).toContain(`height:${parts.sourceH}px`)
+     expect(error).toContain(`height:${parts.reasonH}px`)
+   })

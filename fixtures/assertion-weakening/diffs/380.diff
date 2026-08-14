@@ -1,0 +1,16 @@
+diff --git a/scripts/e2e/scenarios/mask-point.mjs b/scripts/e2e/scenarios/mask-point.mjs
+index 7716e8ea..2a14cf3d 100644
+--- a/scripts/e2e/scenarios/mask-point.mjs
++++ b/scripts/e2e/scenarios/mask-point.mjs
+@@ -104,7 +104,10 @@ export const runMaskPointScenario = async (context) => {
+   const leaferMode = rendererMode === 'leafer'
+   const spec = await canvasStoreSpec()
+ 
+-  const dockMaskButton = page.locator('.canvas-tool-dock').getByRole('button', { name: '局部重绘' })
++  // i18n Wave 1(#367)后工具坞按钮默认英文(t('tools.dock.inpaint') → en 'Inpaint');
++  // 与兄弟场景的 dock 定位口径一致(canvas-interactions 用 'Draw'/'Brush' 等英文名)。
++  // 面板内按钮(.image-mask-edit-prompt 的「局部重绘」)尚未迁移 i18n,保持中文查询。
++  const dockMaskButton = page.locator('.canvas-tool-dock').getByRole('button', { name: 'Inpaint' })
+ 
+   // P2 — no selected image and no image on canvas: dock entry stays enabled, warns, and does not arm.
+   // createCanvas/selectNode 经 canvasStore bridge(两拓扑都可);clearToasts 走 /src/store/toastStore.ts

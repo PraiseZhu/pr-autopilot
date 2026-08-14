@@ -1,0 +1,300 @@
+diff --git a/scripts/loops/bug-doctor/gate.mjs b/scripts/loops/bug-doctor/gate.mjs
+index 45291b57..2dbaa36e 100644
+--- a/scripts/loops/bug-doctor/gate.mjs
++++ b/scripts/loops/bug-doctor/gate.mjs
+@@ -15,7 +15,10 @@
+ //
+ // 用法:
+ //   node scripts/loops/bug-doctor/gate.mjs [--s0-only] [--input <jsonl>] [--no-gh]
+-//        [--state-dir <dir>] [--json-out <path>]
++//        [--state-dir <dir>] [--json-out <path>] [--include-sentry] [--sentry-date <date>]
++//
++// --include-sentry(批次2):在本轮已持有的 gate 锁内消费 Trae/Sentry findings 第三料源
++// (sentry-intake.mjs)。仅显式带该 flag 才消费,任何模式(full/s0-only)不带则 skipped。
+ //
+ // 生产安全:对生产服务器仅执行 `ssh <host> 'cat <glob>'`(只读);本脚本不含任何
+ // 远端写命令。所有台账写操作幂等(同输入重跑 → clusters/workpacket 零 diff)。
+@@ -31,6 +34,7 @@ import { fileURLToPath } from 'node:url'
+ 
+ import { FINGERPRINT_VERSION, fingerprintOf, normalizeMessage } from './fingerprint.mjs'
+ import { applyRecurrence } from './recurrence.mjs'
++import { SENTRY_ORIGIN, consumeSentryFindings, resolveFindingsDir, sentrySummarySignal, shanghaiYesterdayString } from './sentry-intake.mjs'
+ import {
+   STATE_FILE,
+   WORKPACKET_FILE,
+@@ -83,6 +87,8 @@ const SETTLED_STATUSES = new Set(['fixed', 'issue-filed', 'known-noise'])
+ // recurrence.mjs —— 全仓唯一定义点,gate 与 sentry-intake 共用,禁止在任何
+ // 消费方重新手写(bd2 批次教训:第二份手抄实现抄回了 R1a 修掉的 fail-open)。
+ const HOUR_MS = 3_600_000
++// Trae 簇殿后分组内的排序键(sLevel 内部字段,S0 最急)
++const S_LEVEL_RANK = { S0: 0, S1: 1, S2: 2, S3: 3 }
+ 
+ // ---- 基础工具 ----
+ 
+@@ -489,6 +495,16 @@ const scoreClusters = (state, rules, refNowMs) => {
+       continue
+     }
+ 
++    // Trae/Sentry 簇(批次2,origin=trae-audit):severity 已在 sentry-intake.mjs 消费时
++    // 直接映射 sLevel(P0..P3→S0..S3),gate 不跑日志 score/window 公式重算覆盖——
++    // 这类簇没有 clientId/appVersion 等日志形态字段,硬套打分公式只会算出无意义的值。
++    // score 置 0:workpacket 排序另按 severity+fingerprint 分组(见 buildWorkpacket),
++    // 0 分也让它在按 score 排序的看板 Top 表里天然殿后,两处口径一致。
++    if (cluster.origin === SENTRY_ORIGIN) {
++      scored[fp] = { score: 0, count24h: 0, prev24h: 0, distinctClients24h: 0, errorCount24h: 0, distinctErrorClients24h: 0, process: null }
++      continue
++    }
++
+     // S 级判定(S0→S3 顺序短路;判据全部来自 rules.json)。
+     // silentFailure 是独立短路(SC2):静默丢数据信号本身就是 S0 事实,不要求
+     // isError——若只要求 error 级,单条 warning 形态的"retry queue exhausted"
+@@ -564,9 +580,31 @@ const buildWorkpacket = ({ state, scored, rules, mode, signals, recurrenceEmitEn
+       serverFault: c.serverFault,
+       silentFailure: c.silentFailure,
+       samples: c.samples,
++      origin: c.origin ?? null,
++      // 批次2(P3-01 审查修正):Trae 簇没有日志样本,定位/动作全靠这四个字段——
++      // 不投影的话主轮拿到的 workpacket 只有 opaque 的 fp+pattern,无法仅凭工作包
++      // 定位代码。非 trae 簇这四项为 null(它们靠 samples 定位),字段并存不混用。
++      dim: c.dim ?? null,
++      file: c.file ?? null,
++      line: c.line ?? null,
++      changeType: c.changeType ?? null,
+       }
+     })
+-    .sort((a, b) => b.score - a.score || (a.fp < b.fp ? -1 : 1))
++    // 批次2:非 Trae 簇保持既有序(score 降序)在前;Trae(origin=trae-audit)簇殿后,
++    // 组内按 severity(=sLevel S0→S3)+ fingerprint 排。两组排序规则不同——trae 簇
++    // score 恒 0 靠它天然排最后也行,但组内顺序需要 severity 而非 score,故显式两段。
++    .sort((a, b) => {
++      const aTrae = a.origin === SENTRY_ORIGIN
++      const bTrae = b.origin === SENTRY_ORIGIN
++      if (aTrae !== bTrae) return aTrae ? 1 : -1
++      if (aTrae && bTrae) {
++        const ra = S_LEVEL_RANK[a.sLevel] ?? 9
++        const rb = S_LEVEL_RANK[b.sLevel] ?? 9
++        if (ra !== rb) return ra - rb
++        return a.fp < b.fp ? -1 : 1
++      }
++      return b.score - a.score || (a.fp < b.fp ? -1 : 1)
++    })
+ 
+   const s0Clusters = clusters.filter((c) => c.sLevel === 'S0')
+   const selected = mode === 's0-only' ? s0Clusters : clusters
+@@ -601,6 +639,11 @@ const workpacketDigest = (workpacket) => {
+   // 不同,idleSkip 永久失效(簇集合明明没变也照常产出工作包)。status 是离散的
+   // 'ok'/'fail-closed',能且应该继续参与空转判定。
+   essence.push(['__debugLogHealth__', workpacket.signals?.debugLog?.status])
++  // 批次2:sentry 消费状态(missing→degraded 转变/新 manualTicket/summary 计数变化)
++  // 同样是"信号自身健康度"变化,不能只看 clusters——否则连续多天 missing 累计到
++  // degraded 的转变会被空转跳过悄悄吞掉。口径遵守 R1d 纪律:status 离散枚举、
++  // manualTicketCount 与 summary 计数只在真实消费事件时变化,均非逐轮漂移的连续值。
++  essence.push(['__sentry__', workpacket.signals?.sentry?.status, workpacket.signals?.sentry?.manualTicketCount, JSON.stringify(workpacket.signals?.sentry?.summary ?? {})])
+   return createHash('sha256').update(JSON.stringify(essence)).digest('hex')
+ }
+ 
+@@ -608,7 +651,7 @@ const workpacketDigest = (workpacket) => {
+ 
+ const usage = () => {
+   process.stderr.write(
+-    '用法: node scripts/loops/bug-doctor/gate.mjs [--s0-only] [--input <jsonl>] [--no-gh] [--state-dir <dir>] [--json-out <path>]\n',
++    '用法: node scripts/loops/bug-doctor/gate.mjs [--s0-only] [--input <jsonl>] [--no-gh] [--state-dir <dir>] [--json-out <path>] [--include-sentry] [--sentry-date <date>]\n',
+   )
+   process.exit(2)
+ }
+@@ -715,6 +758,29 @@ const main = () => {
+     // -- 信号源③ nightly-e2e;②/④ 留接口 --
+     const nightly = args['no-gh'] ? { status: 'skipped' } : fetchNightlySignal()
+ 
++    // -- 信号源(批次2)Trae/Sentry findings:仅显式 --include-sentry 才消费,复用本轮
++    // 已持有的 gate 锁(不重复取锁——acquireLock 非重入,二次取锁会误判占用)。
++    // 不带该 flag 的任何模式(full/s0-only)一律 skipped,不碰 state.sentryIntake。
++    // debug-log 专属的新簇数在 sentry 消费**之前**快照——signals.debugLog.newClusters
++    // 必须保持单一来源口径,顶层 newClusters 才是跨来源总数(P3-02)。
++    const debugLogNewClusters = newClusters
++    let sentrySignal = { status: 'skipped' }
++    if (args['include-sentry']) {
++      const sentryNow = typeof args.now === 'string' ? args.now : new Date().toISOString()
++      // 默认消费**上海昨日**文件(P4-01 审查修正,blocker):TRAE 夜巡 03:30 才产出
++      // 当天文件,主轮 02:30 取当天必然扑空且次日不回看 → 每天产物永久漏消费。
++      // 语义与滞后代价见 sentry-intake.mjs 的 shanghaiYesterdayString 注释。
++      const sentryDateStr = typeof args['sentry-date'] === 'string' ? args['sentry-date'] : shanghaiYesterdayString(sentryNow)
++      const findingsDir = resolveFindingsDir({ sentryRules: rules.sentryIntake })
++      const consumed = consumeSentryFindings(state, { findingsDir, dateStr: sentryDateStr, rules })
++      const summarySignal = sentrySummarySignal(state)
++      sentrySignal = { ...consumed, dateStr: sentryDateStr, summary: summarySignal.summary, manualTicketCount: summarySignal.manualTicketCount }
++      // P3-02 审查修正:sentry 新簇计入顶层 newClusters(ledger/日志/stdout 摘要的
++      // 权威口径 = 本轮真实新建簇总数,不分来源);signals.debugLog.newClusters
++      // 保持 debug-log 专属口径不动,两层各自如实。
++      newClusters += consumed.newClusters ?? 0
++    }
++
+     // SC-BD1-R1c 联网增补段:与 nightly 同处(已持锁 + 本就要用网络)
+     upgradeSettledTimestampsViaIssue(state, { noGh: Boolean(args['no-gh']) })
+ 
+@@ -738,11 +804,12 @@ const main = () => {
+     const signals = {
+       // total/malformed/ratio/status(SC3)与既有 totalRecords/newRecords/newClusters
+       // 并存,不偷换口径——展示/下游若仍读旧字段不受影响。
+-      debugLog: { ...debugLogHealth, totalRecords: allRecords.length, newRecords, newClusters },
++      debugLog: { ...debugLogHealth, totalRecords: allRecords.length, newRecords, newClusters: debugLogNewClusters },
+       nightly,
+       // T3 产物接入点:基线存在时由后续任务实现 diff,此处只报告可用性
+       reactBaseline: { status: existsSync(reactBaselinePath) ? 'present-not-diffed' : 'skipped' },
+       verifyLogging: { status: 'skipped' },
++      sentry: sentrySignal,
+     }
+ 
+     // -- 打分 + S 级(参考时刻 = 游标,确定性)--
+@@ -786,7 +853,8 @@ const main = () => {
+     appendLog(
+       stateDir,
+       `${runAt} · mode=${mode} · 新记录 ${newRecords} · 新簇 ${newClusters} · 活跃簇 ${activeClusters} · S0 ${s0Count}` +
+-        (idleSkip ? ' · 空转跳过(工作包指纹一致)' : ` · 工作包 ${workpacket.clusters.length} 簇`),
++        (idleSkip ? ' · 空转跳过(工作包指纹一致)' : ` · 工作包 ${workpacket.clusters.length} 簇`) +
++        ` · sentry=${sentrySignal.status}`,
+     )
+ 
+     const summary = {
+diff --git a/scripts/loops/bug-doctor/gate.test.mjs b/scripts/loops/bug-doctor/gate.test.mjs
+index 8cacb6c6..34a402a4 100644
+--- a/scripts/loops/bug-doctor/gate.test.mjs
++++ b/scripts/loops/bug-doctor/gate.test.mjs
+@@ -1872,3 +1872,137 @@ describe('SC-G2 workpacket digest 身份:nightly alert 身份变化必须打破
+     expect(JSON.parse(wpB).s0Alerts[0].url).toBe('https://example.test/runs/2')
+   })
+ })
++
++describe('SC-B2-1 gate --include-sentry:主轮显式消费,不带 flag 的任何模式不消费', () => {
++  const seedFindings = (findingsDir, dateStr, items) => {
++    mkdirSync(findingsDir, { recursive: true })
++    writeFileSync(join(findingsDir, `findings-${dateStr}.json`), JSON.stringify(items))
++  }
++  const sentryFinding = (over = {}) => ({
++    severity: 'P1', dim: 'log-violation', file: 'src/app/Foo.tsx', line: 10,
++    category: 'missing-debug-log', evidence: 'no debugLogger call', verify: '不可信复现提示',
++    fingerprint: '1111111111111111', ...over,
++  })
++
++  it('不带 --include-sentry:任何模式(full/s0-only)都不消费,signals.sentry.status=skipped,state.sentryIntake 不被创建', () => {
++    const findingsDir = join(dir, 'sentry-findings')
++    seedFindings(findingsDir, '2026-08-02', [sentryFinding()])
++    const input = writeFixture([])
++    runGate(['--input', input], { env: { MIVO_SENTRY_FINDINGS_DIR: findingsDir } })
++    const wp = JSON.parse(readFileSync(join(dir, 'workpacket.json'), 'utf8'))
++    expect(wp.signals.sentry.status).toBe('skipped')
++    const state = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
++    expect(state.sentryIntake).toBeUndefined()
++
++    runGate(['--input', input, '--s0-only'], { env: { MIVO_SENTRY_FINDINGS_DIR: findingsDir } })
++    const wp2 = JSON.parse(readFileSync(join(dir, 'workpacket.json'), 'utf8'))
++    expect(wp2.signals.sentry.status).toBe('skipped')
++  })
++
++  it('带 --include-sentry:同一把锁内消费,workpacket.signals.sentry.status=consumed,日志行含 sentry=consumed;簇建到 state', () => {
++    const findingsDir = join(dir, 'sentry-findings')
++    seedFindings(findingsDir, '2026-08-02', [sentryFinding({ fingerprint: '2222222222222222' })])
++    const input = writeFixture([])
++    const { summary } = runGate(['--input', input, '--include-sentry', '--sentry-date', '2026-08-02'], { env: { MIVO_SENTRY_FINDINGS_DIR: findingsDir } })
++    expect(summary.status).toBe('workpacket')
++    const wp = JSON.parse(readFileSync(join(dir, 'workpacket.json'), 'utf8'))
++    expect(wp.signals.sentry.status).toBe('consumed')
++    const state = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
++    expect(state.clusters['2222222222222222'].origin).toBe('trae-audit')
++    const logs = readFileSync(join(dir, 'logs.md'), 'utf8')
++    expect(logs).toContain('sentry=consumed')
++  })
++
++  it('缺当日 findings 文件:signals.sentry.status=missing,日志含 sentry=missing', () => {
++    const findingsDir = join(dir, 'sentry-findings')
++    mkdirSync(findingsDir, { recursive: true })
++    const input = writeFixture([])
++    runGate(['--input', input, '--include-sentry', '--sentry-date', '2026-08-02'], { env: { MIVO_SENTRY_FINDINGS_DIR: findingsDir } })
++    const wp = JSON.parse(readFileSync(join(dir, 'workpacket.json'), 'utf8'))
++    expect(wp.signals.sentry.status).toBe('missing')
++    const logs = readFileSync(join(dir, 'logs.md'), 'utf8')
++    expect(logs).toContain('sentry=missing')
++  })
++
++  it('SC-B2-4 workpacket 排序:非 Trae 簇(score 降序)在前,Trae 簇殿后且组内按 severity+fingerprint 排', () => {
++    const findingsDir = join(dir, 'sentry-findings')
++    seedFindings(findingsDir, '2026-08-02', [
++      sentryFinding({ severity: 'P2', fingerprint: '3333333333333333' }),
++      sentryFinding({ severity: 'P0', fingerprint: '4444444444444444' }),
++    ])
++    // 一个普通 S0 debug-log 簇(非 trae),score 应远高于 trae 簇的恒 0
++    const input = writeFixture(fixtureLines)
++    runGate(['--input', input, '--include-sentry', '--sentry-date', '2026-08-02'], { env: { MIVO_SENTRY_FINDINGS_DIR: findingsDir } })
++    const wp = JSON.parse(readFileSync(join(dir, 'workpacket.json'), 'utf8'))
++    const traeIdx = wp.clusters.map((c) => c.origin === 'trae-audit').indexOf(true)
++    const nonTraeCount = wp.clusters.filter((c) => c.origin !== 'trae-audit').length
++    expect(traeIdx).toBe(nonTraeCount) // 非 trae 簇全部排在 trae 簇之前
++    const traeClusters = wp.clusters.filter((c) => c.origin === 'trae-audit')
++    expect(traeClusters).toHaveLength(2)
++    expect(traeClusters[0].fp).toBe('4444444444444444') // P0(S0)排前
++    expect(traeClusters[0].sLevel).toBe('S0')
++    expect(traeClusters[1].sLevel).toBe('S2') // P2→S2
++    expect(traeClusters.every((c) => c.score === 0)).toBe(true)
++  })
++
++  it('sentry 信号转变打破空转跳过:missing → consumed(即使簇集合不变)第二轮不得 idle-skip', () => {
++    const findingsDir = join(dir, 'sentry-findings')
++    mkdirSync(findingsDir, { recursive: true })
++    const input = writeFixture([])
++    // 第一轮:无 findings 文件 → missing,产出 workpacket
++    const r1 = runGate(['--input', input, '--include-sentry', '--sentry-date', '2026-08-02'], { env: { MIVO_SENTRY_FINDINGS_DIR: findingsDir } })
++    expect(r1.summary.status).not.toBe('idle-skip')
++    // 第二轮:同样零日志记录(簇集合不变),但 findings 文件出现且只含 summary-only
++    // dim(type-escape 不建簇)→ 变化只发生在 signals.sentry 层。若 digest 不含
++    // __sentry__ 行,这一轮会被误判 idle-skip,missing→consumed 的转变被吞掉。
++    seedFindings(findingsDir, '2026-08-02', [sentryFinding({ dim: 'type-escape', fingerprint: '5555555555555555' })])
++    const r2 = runGate(['--input', input, '--include-sentry', '--sentry-date', '2026-08-02'], { env: { MIVO_SENTRY_FINDINGS_DIR: findingsDir } })
++    expect(r2.summary.status).not.toBe('idle-skip')
++    const wp = JSON.parse(readFileSync(join(dir, 'workpacket.json'), 'utf8'))
++    expect(wp.signals.sentry.status).toBe('consumed')
++    expect(wp.signals.sentry.summary['type-escape']).toBe(1)
++    const state = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
++    expect(state.clusters['5555555555555555']).toBeUndefined() // summary-only 不建簇
++  })
++
++  it('P3-01:workpacket 里的 Trae 簇必须带 dim/file/line/changeType(主轮仅凭工作包即可定位),非 trae 簇四项为 null', () => {
++    const findingsDir = join(dir, 'sentry-findings')
++    seedFindings(findingsDir, '2026-08-02', [sentryFinding({ fingerprint: '6666666666666666', file: 'src/app/Bar.tsx', line: 42 })])
++    const input = writeFixture(fixtureLines)
++    runGate(['--input', input, '--include-sentry', '--sentry-date', '2026-08-02'], { env: { MIVO_SENTRY_FINDINGS_DIR: findingsDir } })
++    const wp = JSON.parse(readFileSync(join(dir, 'workpacket.json'), 'utf8'))
++    const trae = wp.clusters.find((c) => c.origin === 'trae-audit')
++    expect(trae.dim).toBe('log-violation')
++    expect(trae.file).toBe('src/app/Bar.tsx')
++    expect(trae.line).toBe(42)
++    expect(trae.changeType).toBe('补 debugLogger 调用')
++    const nonTrae = wp.clusters.find((c) => c.origin !== 'trae-audit')
++    expect(nonTrae.dim).toBeNull()
++    expect(nonTrae.file).toBeNull()
++  })
++
++  it('P3-02:sentry 新簇计入顶层 newClusters(ledger/日志/stdout 权威口径),signals.debugLog.newClusters 保持 debug 专属为 0', () => {
++    const findingsDir = join(dir, 'sentry-findings')
++    seedFindings(findingsDir, '2026-08-02', [sentryFinding({ fingerprint: '7777777777777777' })])
++    const input = writeFixture([]) // 零 debug 记录
++    const { summary } = runGate(['--input', input, '--include-sentry', '--sentry-date', '2026-08-02'], { env: { MIVO_SENTRY_FINDINGS_DIR: findingsDir } })
++    expect(summary.newClusters).toBe(1)
++    const wp = JSON.parse(readFileSync(join(dir, 'workpacket.json'), 'utf8'))
++    expect(wp.signals.debugLog.newClusters).toBe(0)
++    const logs = readFileSync(join(dir, 'logs.md'), 'utf8')
++    expect(logs).toContain('新簇 1')
++  })
++
++  it('P4-01:不带 --sentry-date 时默认消费上海昨日文件(TRAE 03:30 才产出当天文件,02:30 主轮取当天必然扑空)', () => {
++    const findingsDir = join(dir, 'sentry-findings')
++    // now = 2026-08-03T18:30:00Z → 上海 08-04 02:30(主轮时刻),昨日 = 08-03
++    seedFindings(findingsDir, '2026-08-03', [sentryFinding({ fingerprint: '8888888888888888' })])
++    const input = writeFixture([])
++    runGate(['--input', input, '--include-sentry', '--now', '2026-08-03T18:30:00.000Z'], { env: { MIVO_SENTRY_FINDINGS_DIR: findingsDir } })
++    const wp = JSON.parse(readFileSync(join(dir, 'workpacket.json'), 'utf8'))
++    expect(wp.signals.sentry.status).toBe('consumed')
++    expect(wp.signals.sentry.dateStr).toBe('2026-08-03')
++    const state = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
++    expect(state.clusters['8888888888888888']).toBeTruthy()
++  })
++})

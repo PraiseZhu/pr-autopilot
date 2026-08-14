@@ -1,0 +1,426 @@
+diff --git a/src/canvas/actions/canvasSyncRuntime.block3.test.ts b/src/canvas/actions/canvasSyncRuntime.block3.test.ts
+index 9f063c6c..57581bf2 100644
+--- a/src/canvas/actions/canvasSyncRuntime.block3.test.ts
++++ b/src/canvas/actions/canvasSyncRuntime.block3.test.ts
+@@ -151,7 +151,11 @@ const seedCanvas = (sceneId: string, nodes: MivoCanvasNode[]) => ({
+   selectedNodeIds: [],
+ })
+ 
+-const SCENE = 'character-flow'
++// #284 同族:SCENE 用非 demo canvas id('c1')——这些 server-wire 用例验的是真实画布的
++// import/generate/commit → submitChange 链路。canvasSyncRuntime 的 demo seed guard 会拦 demo
++// scene id('character-flow' 等不上服务端),若用 demo id 会全部被 guard 跳过(不 submit),
++// 与本矩阵"验 submit 命中"的本意相悖;用 demo id 在生产里本就 404/missing-bundle-base。
++const SCENE = 'c1'
+ // server 资产 assetUrl(mivo-sasset: 前缀 → serverAssetId 剥得 'asset-gen' → enqueueAssetAttach)
+ const SERVER_ASSET_URL = 'mivo-sasset:asset-gen'
+ 
+diff --git a/src/canvas/actions/canvasSyncRuntime.test.ts b/src/canvas/actions/canvasSyncRuntime.test.ts
+index b83e643b..31e58da0 100644
+--- a/src/canvas/actions/canvasSyncRuntime.test.ts
++++ b/src/canvas/actions/canvasSyncRuntime.test.ts
+@@ -4,6 +4,7 @@ import type { MivoCanvasNode } from '../../types/mivoCanvas'
+ import type { ChangeOutcome, CanvasSyncPort } from '../../lib/canvasSyncPort'
+ import { imageNode, nodeRecord, loadRuntimeModule } from './canvasSyncRuntimeTestFactories'
+ import { __resetArchivedWriteNotice } from '../../lib/archivedWriteNotice'
++import { DEMO_PROJECT_IDS } from '../../store/demoScenes'
+ 
+ vi.hoisted(() => {
+   const store = new Map<string, string>()
+@@ -627,3 +628,196 @@ describe('canvasSyncRuntime — Block 3 asset attach/detach side-effects', () =>
+     __resetCanvasSyncRuntimeQueue()
+   })
+ })
++
++// ── #284 同族:demo seed canvas 节点级同步 guard ──────────────────────────────────
++// 生产证据:Canvas Sync Runtime 抓到 6 个簇(variants/asset-handoff 的 edit/delete/reorder/create),
++//   全部 warning 级、同一根因——demo seed 画布不上服务端,节点改动经 wrapMutation → enqueueCanvasSyncChanges
++//   → submitChange 必然终态拒绝(missing bundle base / 404 not-found),100% 无效请求 + 日志噪音。
++//   修法:在 enqueueCanvasSyncChanges 唯一收口点拦 demo seed canvas —— 不 submit、不 enqueue attach/detach
++//   (今天 rejected 分支也不发 side-effect,行为不变),每批恰好 1 条 warn 说明跳过。
++//   fork-on-write(#297)不在本修范围;demo 画布改动仍只存本地。
++describe('canvasSyncRuntime — #284 demo seed canvas sync guard', () => {
++  beforeEach(() => {
++    vi.clearAllMocks()
++    __resetArchivedWriteNotice()
++  })
++
++  // 通用:server 模式 + demo scene id 'variants' + 各 change kind → 不 submit,恰好 1 条 warn。
++  const assertDemoSceneIdSkipped = async (
++    change: import('../../lib/canvasSyncPort').CanvasChange,
++  ) => {
++    const { __resetCanvasSyncRuntimeQueue, enqueueCanvasSyncChanges, submitChange, useDebugLogStore } =
++      await loadRuntimeModule()
++    useDebugLogStore.setState({ entries: [] })
++    const fakePort = { submitChange } as unknown as CanvasSyncPort
++    await enqueueCanvasSyncChanges('variants', [change], fakePort)
++
++    expect(submitChange).not.toHaveBeenCalled()
++    const warns = useDebugLogStore
++      .getState()
++      .entries.filter((e) => e.level === 'warning' && e.message.includes('demo seed canvas'))
++    expect(warns).toHaveLength(1)
++    // 文案契约:canvasId + changes 数量 + #284 同族 + "本地已生效/demo 不上服务端" 语义
++    expect(warns[0].message).toContain('variants')
++    expect(warns[0].message).toContain('#284')
++    expect(warns[0].message).toContain('1')
++    __resetCanvasSyncRuntimeQueue()
++  }
++
++  it('server + demo scene id(variants)edit-node → 不 submitChange,恰好 1 条 warn', async () => {
++    await assertDemoSceneIdSkipped({
++      kind: 'edit-node',
++      nodeId: 'n1',
++      intents: [{ op: 'set', fieldPath: ['title'], value: 'renamed' }],
++    })
++  })
++
++  it('server + demo scene id(variants)delete-node → 不 submitChange,恰好 1 条 warn', async () => {
++    await assertDemoSceneIdSkipped({ kind: 'delete-node', nodeId: 'n1' })
++  })
++
++  it('server + demo scene id(variants)create-node → 不 submitChange(原生产 404 not-found),恰好 1 条 warn', async () => {
++    await assertDemoSceneIdSkipped({ kind: 'create-node', node: nodeRecord({ id: 'n1' }) })
++  })
++
++  it('server + demo scene id(variants)reorder-children → 不 submitChange(原生产 missing order base),恰好 1 条 warn', async () => {
++    await assertDemoSceneIdSkipped({
++      kind: 'reorder-children',
++      childType: 'node',
++      orderedIds: ['n1', 'n2'],
++    })
++  })
++
++  it('SC3 回归:server + 非 demo canvas(c1,真实 projectId)→ submitChange 照常调用(guard 不误伤真实画布)', async () => {
++    const { __resetCanvasSyncRuntimeQueue, enqueueCanvasSyncChanges, submitChange, useDebugLogStore, useCanvasStore } =
++      await loadRuntimeModule()
++    useDebugLogStore.setState({ entries: [] })
++    const baseState = useCanvasStore.getInitialState()
++    useCanvasStore.setState(
++      {
++        ...baseState,
++        sceneId: 'c1',
++        canvases: {
++          c1: {
++            title: 'Canvas',
++            projectId: 'real-project-1',
++            createdAt: '2026-07-13T00:00:00.000Z',
++            updatedAt: '2026-07-13T00:00:00.000Z',
++            nodes: [imageNode()],
++            edges: [],
++            tasks: [],
++            selectedNodeId: 'n1',
++            selectedNodeIds: ['n1'],
++          },
++        },
++        nodes: [imageNode()],
++        edges: [],
++        tasks: [],
++        selectedNodeId: 'n1',
++        selectedNodeIds: ['n1'],
++      } as never,
++      true,
++    )
++    const fakePort = { submitChange } as unknown as CanvasSyncPort
++    await enqueueCanvasSyncChanges(
++      'c1',
++      [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['title'], value: 'renamed' }] }],
++      fakePort,
++    )
++    expect(submitChange).toHaveBeenCalledWith('c1', expect.objectContaining({ kind: 'edit-node', nodeId: 'n1' }))
++    // 非 demo 画布不应触发 demo-skip warn
++    const demoSkips = useDebugLogStore
++      .getState()
++      .entries.filter((e) => e.level === 'warning' && e.message.includes('demo seed canvas'))
++    expect(demoSkips).toHaveLength(0)
++    __resetCanvasSyncRuntimeQueue()
++  })
++
++  it('server + demo project 下画布(canvas id 非 demo scene,projectId 命中 DEMO_PROJECT_ID_SET)→ 不 submit,恰好 1 条 warn', async () => {
++    const { __resetCanvasSyncRuntimeQueue, enqueueCanvasSyncChanges, submitChange, useDebugLogStore, useCanvasStore } =
++      await loadRuntimeModule()
++    useDebugLogStore.setState({ entries: [] })
++    const baseState = useCanvasStore.getInitialState()
++    useCanvasStore.setState(
++      {
++        ...baseState,
++        sceneId: 'c1',
++        canvases: {
++          c1: {
++            title: 'Canvas under demo project',
++            projectId: DEMO_PROJECT_IDS.conceptBattlepass,
++            createdAt: '2026-07-13T00:00:00.000Z',
++            updatedAt: '2026-07-13T00:00:00.000Z',
++            nodes: [imageNode()],
++            edges: [],
++            tasks: [],
++            selectedNodeId: 'n1',
++            selectedNodeIds: ['n1'],
++          },
++        },
++        nodes: [imageNode()],
++        edges: [],
++        tasks: [],
++        selectedNodeId: 'n1',
++        selectedNodeIds: ['n1'],
++      } as never,
++      true,
++    )
++    const fakePort = { submitChange } as unknown as CanvasSyncPort
++    await enqueueCanvasSyncChanges(
++      'c1',
++      [{ kind: 'edit-node', nodeId: 'n1', intents: [{ op: 'set', fieldPath: ['title'], value: 'renamed' }] }],
++      fakePort,
++    )
++    expect(submitChange).not.toHaveBeenCalled()
++    const warns = useDebugLogStore
++      .getState()
++      .entries.filter((e) => e.level === 'warning' && e.message.includes('demo seed canvas'))
++    expect(warns).toHaveLength(1)
++    expect(warns[0].message).toContain('c1')
++    __resetCanvasSyncRuntimeQueue()
++  })
++
++  it('local 模式 + demo 画布(variants)wrapMutation → 改动生效 + 零 submitChange + 无 demo-skip warn(local gate 短路在 guard 之前,行为不变)', async () => {
++    const { __resetCanvasSyncRuntimeQueue, wrapMutation, submitChange, useDebugLogStore, useCanvasStore } =
++      await loadRuntimeModule({ local: true })
++    useDebugLogStore.setState({ entries: [] })
++    const baseState = useCanvasStore.getInitialState()
++    const img = imageNode({ id: 'n1' })
++    useCanvasStore.setState(
++      {
++        ...baseState,
++        sceneId: 'variants',
++        canvases: {
++          variants: {
++            title: 'Variants',
++            createdAt: '2026-07-13T00:00:00.000Z',
++            updatedAt: '2026-07-13T00:00:00.000Z',
++            nodes: [img],
++            edges: [],
++            tasks: [],
++            selectedNodeId: 'n1',
++            selectedNodeIds: ['n1'],
++          },
++        },
++        nodes: [img],
++        edges: [],
++        tasks: [],
++        selectedNodeId: 'n1',
++        selectedNodeIds: ['n1'],
++      } as never,
++      true,
++    )
++    wrapMutation(useCanvasStore.getState().deleteNode)('n1')
++    await Promise.resolve()
++    await Promise.resolve()
++    await Promise.resolve()
++    // local 模式:改动本地生效(节点删除)但不 submitChange,且 guard 不跑(isLocalPersist 短路在前)
++    expect(useCanvasStore.getState().nodes).toHaveLength(0)
++    expect(submitChange).not.toHaveBeenCalled()
++    expect(
++      useDebugLogStore.getState().entries.filter((e) => e.message.includes('demo seed canvas')),
++    ).toHaveLength(0)
++    __resetCanvasSyncRuntimeQueue()
++  })
++})
+diff --git a/src/canvas/actions/canvasSyncRuntime.ts b/src/canvas/actions/canvasSyncRuntime.ts
+index 0827ff1e..607ff690 100644
+--- a/src/canvas/actions/canvasSyncRuntime.ts
++++ b/src/canvas/actions/canvasSyncRuntime.ts
+@@ -17,6 +17,7 @@ import { debugLogger } from '../../store/debugLogStore'
+ import { notifyArchivedWriteBlocked } from '../../lib/archivedWriteNotice'
+ import { useCanvasStore } from '../../store/canvasStore'
+ import { documentFor } from '../../store/canvasDocumentModel'
++import { isDemoSeedCanvasId } from '../../store/demoScenes'
+ import { anchorsToRecords, edgeToRecord, toRecord } from '../../kernel/mapping'
+ 
+ const SOURCE = 'Canvas Sync Runtime'
+@@ -435,6 +436,22 @@ export const enqueueCanvasSyncChanges = (
+   assetEffects?: AssetSideEffects,
+ ): Promise<void> => {
+   if (changes.length === 0) return Promise.resolve()
++  // #284 同族(demo-canvas-server-leak):demo seed canvas 不上服务端——boot 迁移已 skip,
++  //   documentSlice 的 mutation guard 已拦 document 级 enqueue(rename/move/archive),但漏了
++  //   节点级同步路径(wrapMutation/wrapMutationForScene → 此处 → submitChange)。服务端从来没有
++  //   这个 canvas,submitChange 必然终态拒绝(edit/delete/reorder missing bundle base;create 404
++  //   not-found)——100% 无效请求 + warning 日志噪音,且噪音会掩盖真实持久化故障(生产证据:Canvas Sync
++  //   Runtime 6 个簇,2026-07-29~30 首现)。在此唯一收口点拦:不 submit、不 enqueue attach/detach
++  //   (今天 rejected 分支也不发 side-effect,行为不变),每批一条 warn 说明跳过。fork-on-write(#297)不在本修范围。
++  //   projectId 从 store 的 canvases 文档取(documentFor);拿不到时 undefined,仅靠 scene id 命中即可拦。
++  const projectId = documentFor(useCanvasStore.getState().canvases, canvasId).projectId
++  if (isDemoSeedCanvasId(canvasId, projectId)) {
++    debugLogger.warn(
++      SOURCE,
++      `demo seed canvas ${canvasId} sync skipped: ${changes.length} change(s) not submitted (#284 同族 — demo 画布不上服务端,本地已生效)`,
++    )
++    return Promise.resolve()
++  }
+   const previous = queueByCanvas.get(canvasId) ?? Promise.resolve()
+   const next = previous
+     .catch(() => {})
+diff --git a/src/canvas/actions/canvasSyncRuntime.updatenode.test.ts b/src/canvas/actions/canvasSyncRuntime.updatenode.test.ts
+index 44eee275..d77f7194 100644
+--- a/src/canvas/actions/canvasSyncRuntime.updatenode.test.ts
++++ b/src/canvas/actions/canvasSyncRuntime.updatenode.test.ts
+@@ -243,20 +243,26 @@ describe('U5 / D9 demo 语义:local 形态零 submit', () => {
+     expect(submitChange).not.toHaveBeenCalled()
+   })
+ 
+-  it('server 模式改 demo 画布:内容 edit-node 照常 submit(与既有任何节点写一致),元数据 guard 家族不受影响', async () => {
+-    // 诚实口径:#301/#304/#312 的 demo guard 只覆盖 server 模式的**元数据**写
+-    // (rename/move/archive 的 enqueue),节点内容写本就不在其内。R3 不改这一现状;
+-    // 要不要把内容写也纳入 demo guard 是独立产品决策(见契约文档 §6)。
+-    const { wrapMutation, useCanvasStore, submitChange } = await loadRuntimeModule()
++  it('server 模式改 demo 画布:节点内容写也被 #284 guard 拦(不 submit,恰好 1 条 warn)', async () => {
++    // #284 同族(2026-07-31 落地):原 R3 留作"独立产品决策"的节点内容写 demo guard,
++    //   由生产证据(Canvas Sync Runtime 6 簇 warning,2026-07-29~30 首现)驱动落地。demo 画布
++    //   不上服务端,节点 edit 经 wrapMutation → enqueueCanvasSyncChanges → guard 拦:不 submit、
++    //   不 enqueue attach/detach,每批 1 条 warn。元数据 guard(documentSlice #302)与节点 guard
++    //   同族同拦。fork-on-write(#297)不在本修范围;demo 画布改动仍只存本地。
++    const { wrapMutation, useCanvasStore, submitChange, useDebugLogStore } = await loadRuntimeModule()
++    useDebugLogStore.setState({ entries: [] })
+     seed(useCanvasStore, [textNode()], 'character-flow')
+ 
+     wrapMutation(useCanvasStore.getState().agentUpdateNode)({ sceneId: 'character-flow', nodeId: 'text-1', x: 42 })
+     await flush()
+ 
+-    const changes = submittedChanges(submitChange)
+-    expect(changes).toHaveLength(1)
+-    expect(changes[0].kind).toBe('edit-node')
+-    // 没有任何画布元数据 change 混进来(rename/move/archive 走另一条 enqueue 路径)
+-    expect(changes.every((change) => change.kind === 'edit-node')).toBe(true)
++    // 改动本地生效(demo 画布照常可改),但不 submit(服务端没有这个画布)
++    expect(useCanvasStore.getState().nodes[0]).toMatchObject({ x: 42 })
++    expect(submitChange).not.toHaveBeenCalled()
++    const warns = useDebugLogStore
++      .getState()
++      .entries.filter((e) => e.level === 'warning' && e.message.includes('demo seed canvas'))
++    expect(warns).toHaveLength(1)
++    expect(warns[0].message).toContain('character-flow')
+   })
+ })
+diff --git a/src/store/demoScenes.test.ts b/src/store/demoScenes.test.ts
+new file mode 100644
+index 00000000..fd225c3d
+--- /dev/null
++++ b/src/store/demoScenes.test.ts
+@@ -0,0 +1,54 @@
++// src/store/demoScenes.test.ts
++// #284 同族(demo-canvas-server-leak):isDemoSeedCanvasId 是 demo seed 判定的单一真相源,
++//   下沉在纯数据模块 demoScenes(同 DEMO_SCENE_ID_SET / DEMO_PROJECT_ID_SET 先例),供
++//   documentSlice(document 级 mutation guard)与 canvasSyncRuntime(节点级同步 guard)复用,
++//   不得各自重新派生。本文件钉死其语义与既有 documentSlice.isDemoSeedCanvas 完全一致。
++import { describe, expect, it, vi } from 'vitest'
++import { isDemoSeedCanvasId, DEMO_SCENE_ID_SET, DEMO_PROJECT_ID_SET } from './demoScenes'
++
++vi.mock('../lib/demoImages', () => ({ createDemoImage: () => 'data:image/png;base64,mock-demo' }))
++
++describe('demoScenes — isDemoSeedCanvasId (#284 单一真相源)', () => {
++  it('canvas id 命中 DEMO_SCENE_ID_SET → true(projectId 缺省或任意均拦,scene id 是全局稳定 demo id)', () => {
++    expect(isDemoSeedCanvasId('variants')).toBe(true)
++    expect(isDemoSeedCanvasId('character-flow')).toBe(true)
++    expect(isDemoSeedCanvasId('asset-handoff')).toBe(true)
++    expect(isDemoSeedCanvasId('task-states')).toBe(true)
++    expect(isDemoSeedCanvasId('stress-test')).toBe(true)
++    expect(isDemoSeedCanvasId('empty')).toBe(true)
++    // projectId 缺省仍拦:demo scene id 不归任何真实项目,仅靠 scene id 命中即可
++    expect(isDemoSeedCanvasId('variants', undefined)).toBe(true)
++    // 即便 projectId 是非 demo 的真实项目,scene id 命中仍拦(demo scene id 全局稳定)
++    expect(isDemoSeedCanvasId('variants', 'real-project-xyz')).toBe(true)
++  })
++
++  it('canvas id 非 demo 且 projectId 缺省 → false(普通画布不拦,回归护栏)', () => {
++    expect(isDemoSeedCanvasId('c1')).toBe(false)
++    expect(isDemoSeedCanvasId('c1', undefined)).toBe(false)
++    expect(isDemoSeedCanvasId('uuid-not-a-demo', undefined)).toBe(false)
++  })
++
++  it('canvas id 非 demo 但 projectId 命中 DEMO_PROJECT_ID_SET → true(demo project 下画布同拦)', () => {
++    // 两集合各命中一次:concept-battlepass 与 product-direction
++    const [firstProjectId] = DEMO_PROJECT_ID_SET
++    const projectIds = [...DEMO_PROJECT_ID_SET]
++    expect(projectIds.length).toBeGreaterThanOrEqual(2)
++    expect(isDemoSeedCanvasId('c1', projectIds[0])).toBe(true)
++    expect(isDemoSeedCanvasId('c1', projectIds[1])).toBe(true)
++    expect(isDemoSeedCanvasId('uuid-123', firstProjectId)).toBe(true)
++  })
++
++  it('canvas id 非 demo 且 projectId 非 demo → false', () => {
++    expect(isDemoSeedCanvasId('c1', 'real-project')).toBe(false)
++  })
++
++  it('穷举:DEMO_SCENE_ID_SET 全员命中、DEMO_PROJECT_ID_SET 全员命中(防漏成员)', () => {
++    for (const sceneId of DEMO_SCENE_ID_SET) {
++      expect(isDemoSeedCanvasId(sceneId)).toBe(true)
++    }
++    for (const projectId of DEMO_PROJECT_ID_SET) {
++      // 非 demo canvas id + demo projectId → 拦
++      expect(isDemoSeedCanvasId('non-demo-canvas', projectId)).toBe(true)
++    }
++  })
++})
+diff --git a/src/store/demoScenes.ts b/src/store/demoScenes.ts
+index 6ad355f6..796116f1 100644
+--- a/src/store/demoScenes.ts
++++ b/src/store/demoScenes.ts
+@@ -67,6 +67,16 @@ export const DEMO_SCENE_IDS_EXHAUSTIVE: Exclude<DemoSceneId, (typeof DEMO_SCENE_
+   ? true
+   : never = true
+ 
++// #284 同族(demo-canvas-server-leak):demo seed canvas 判定的单一真相源。canvas id 命中
++//   DEMO_SCENE_ID_SET(demo scene id 全局稳定),或归属 DEMO_PROJECT_ID_SET 下的 demo project。
++//   语义与 documentSlice 既有 isDemoSeedCanvas 完全一致——本导出下沉后,documentSlice 的节点级
++//   mutation guard 与 canvasSyncRuntime 的同步 guard 一律复用此函数,不得各自重新派生。
++//   projectId 缺省(拿不到归属)时仅靠 scene id 命中即可拦,与 boot 迁移 skip / document guard 对称:
++//   demo seed 不上服务端,本地照常可见可改。fork-on-write(把 demo 改动落成用户自己的画布)是
++//   产品功能,挂 #297 讨论,不在本修范围。
++export const isDemoSeedCanvasId = (canvasId: string, projectId?: string): boolean =>
++  DEMO_SCENE_ID_SET.has(canvasId) || (projectId !== undefined && DEMO_PROJECT_ID_SET.has(projectId))
++
+ const image = (
+   label: string,
+   mood: 'character' | 'environment' | 'variant' | 'asset',
+diff --git a/src/store/documentSlice.ts b/src/store/documentSlice.ts
+index 422ade42..b2f08107 100644
+--- a/src/store/documentSlice.ts
++++ b/src/store/documentSlice.ts
+@@ -36,7 +36,9 @@ import {
+   snapshotFromState,
+ } from './canvasDocumentModel'
+ // #284(2026-07-28 demo-canvas-server-leak):demo seed 真相源(纯数据模块,store 层同层 import 无环)。
+-import { DEMO_PROJECT_ID_SET, DEMO_SCENE_ID_SET } from './demoScenes'
++//   isDemoSeedCanvasId 是判定函数的单一真相源(canvas id 命中 DEMO_SCENE_ID_SET 或归属
++//   DEMO_PROJECT_ID_SET),document 级 mutation guard 与 canvasSyncRuntime 节点级同步 guard 共用。
++import { DEMO_PROJECT_ID_SET, isDemoSeedCanvasId } from './demoScenes'
+ import { enqueuePersistWrite, isPersistWriteActive } from '../lib/persistBoot'
+ import { isServerPersist } from '../lib/persistMode'
+ import { getSceneWrap } from '../lib/sceneWrapRegistry'
+@@ -56,25 +58,16 @@ const recordCanvasTombstone = (canvasId: string): void => {
+   )
+ }
+ 
+-// #284:canvas 是否 demo seed —— canvas id 本身是 demo scene id,或它归属某个 demo project。
+-//   demo id 全局稳定('character-flow' / 'project-demo-concept-battlepass' 等),而服务端 canvas id 是
+-//   F4 全局唯一:首个打开 demo 的账号占住这些 id,其余账号一 rename/move 就撞 409 canvas-exists →
+-//   error toast「这条改动无法保存」。2026-07-16 的 demo-seed-migration-skip 已把 demo 排除出 boot 迁移
+-//   (persistBoot.ts 的 createProject/createCanvas op 收集两处),但漏了用户主动 mutation 路径;本判定
+-//   给 rename/move 补上同一层保护,与 boot 侧 skip 对称(demo 不上服务端,本地照常可见可改)。
+-//   注:fork-on-write(把 demo 改动落成用户自己的画布)是产品功能,挂 #297 讨论,不在本修范围。
+-const isDemoSeedCanvas = (canvasId: string, projectId: string | undefined): boolean =>
+-  DEMO_SCENE_ID_SET.has(canvasId) || (projectId !== undefined && DEMO_PROJECT_ID_SET.has(projectId))
+-
+ // #302:mutation 调用点级 guard。刻意不下沉 enqueuePersistWrite——后者保持无 store 依赖，且
+ // archive/unarchive op 本身不携带 projectId，只有调用点拿得到 canvas document 的归属信息。
++// #284:判定函数复用 demoScenes.isDemoSeedCanvasId(单一真相源),不在此重新派生。
+ const guardDemoSeedEnqueue = (
+   action: string,
+   canvasId: string,
+   projectId: string | undefined,
+   localOutcome: string,
+ ): boolean => {
+-  if (!isDemoSeedCanvas(canvasId, projectId)) return false
++  if (!isDemoSeedCanvasId(canvasId, projectId)) return false
+   warnCanvas(`${action} ${canvasId} not enqueued: demo seed canvas (#302 — ${localOutcome})`)
+   return true
+ }

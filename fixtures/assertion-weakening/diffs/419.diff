@@ -1,0 +1,1364 @@
+diff --git a/.github/workflows/merge-thanks.yml b/.github/workflows/merge-thanks.yml
+index 5cd4fe5e..f3c8ca8b 100644
+--- a/.github/workflows/merge-thanks.yml
++++ b/.github/workflows/merge-thanks.yml
+@@ -70,13 +70,21 @@ jobs:
+           # 取证:构造失败时下一步会报 event-has-no-pull-request,这里先把结果打出来便于排查。
+           echo "--- dispatch-event.json ---"
+           node -e 'const e=require("/tmp/dispatch-event.json");console.log(JSON.stringify({keys:Object.keys(e),pr:e.pull_request?.number}))'
++          # 只有本步骤真的跑过(= 非 pull_request 触发)才把路径交给下一步。见下方注释:
++          # 用 GITHUB_ENV 而不是在下一步写三元表达式,是因为后者在这里必然写错。
++          echo "MERGE_THANKS_EVENT_PATH=/tmp/dispatch-event.json" >> "${GITHUB_ENV}"
+ 
+       - name: Post merge thanks
+         env:
+-          # 用自有变量名而不是覆盖 GITHUB_EVENT_PATH:后者是 Actions 保留前缀,runner 会用
+-          # 真实事件路径覆盖 step env 的同名值(见脚本内注释)。真实 pull_request 触发时
+-          # 这里为空,脚本自动回落到 runner 提供的 GITHUB_EVENT_PATH。
+-          MERGE_THANKS_EVENT_PATH: ${{ github.event_name == 'pull_request' && '' || '/tmp/dispatch-event.json' }}
++          # MERGE_THANKS_EVENT_PATH 不在这里设:它由上一步(仅 workflow_dispatch 才跑)写进
++          # GITHUB_ENV。真实 pull_request 触发时上一步被 skip,该变量根本不存在,脚本自动
++          # 回落到 runner 提供的 GITHUB_EVENT_PATH——这正是我们要的。
++          #
++          # 为什么不能用「event_name == 'pull_request' && '' || '/tmp/…'」这种三元式:
++          # Actions 的 &&/|| 是「取值」运算符(同 JS),空字符串是 falsy。pull_request 触发时
++          # `true && ''` 得到 '',falsy 又触发 `|| '/tmp/…'`,结果恰好是我们想避开的那个值。
++          # 2026-08-01 实测:#390 自己合并那次因此报 ENOENT、致谢没发出去(run 30715524176)。
++          # 另注:变量名不用 GITHUB_EVENT_PATH,因为 GITHUB_ 是保留前缀,runner 会覆盖同名值。
+           # 读 xindong/org 成员名录(GitHub login → 中文真名 + 公司邮箱)。名录是 internal 仓,
+           # 本仓的 GITHUB_TOKEN 读不到,复用已有的 PAT;若该 PAT 对名录仓无 read 权限,
+           # resolve-slack-identity 会记 roster-unread 并降级为 @login,不影响致谢发出。
+@@ -87,6 +95,10 @@ jobs:
+         run: |
+           set -uo pipefail
+           # 脚本退出码恒 0(播报失败不让本 workflow 变红:合并已经发生,通报是附加动作)。
++          # 「没发出去」的良性/故障判定与 `::error::` 注解已收进脚本自身(formatAnnotation,
++          # scripts/loops/merge-thanks/from-github-event.mjs)——此前这份 benign 名单在这里
++          # 和脚本各存一份,两处字符串一旦漂移就会互相失配(2026-08-02 lead 自查发现属于
++          # 自己在 #419 引进的缺陷)。这里只需要原样打印脚本的 stdout。
+           if [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ github.event.inputs.dry_run }}" != "false" ]; then
+             node scripts/loops/merge-thanks/from-github-event.mjs --dry-run
+           else
+diff --git a/scripts/loops/merge-thanks/from-github-event.mjs b/scripts/loops/merge-thanks/from-github-event.mjs
+index 3b5c3f29..16c5eadb 100644
+--- a/scripts/loops/merge-thanks/from-github-event.mjs
++++ b/scripts/loops/merge-thanks/from-github-event.mjs
+@@ -42,6 +42,142 @@ const REPO_ROOT = join(HERE, '..', '..', '..')
+ 
+ const out = (obj) => process.stdout.write(`${JSON.stringify(obj, null, 2)}\n`)
+ 
++// 「没发出去」分两种:预期跳过(机器人作者/未合并/dry-run/fork PR 无 secrets)和真故障。
++// 后者仍不让 job 变红(合并已经发生),但必须在 Actions 首页留一条 error 注解——否则
++// 故障躲在绿灯里没人看见:#390 那次 ENOENT 就是这么漏掉的。
++//
++// 这份判定原来在 workflow YAML 里另存一份(靠 node -e 读 /tmp/thanks-out.json 重算),
++// 与本脚本产出的 reason 字符串各存一份、天然会漂移——2026-08-02 lead 自查发现属于自己
++// 在 #419 引进的缺陷。收进脚本本身,YAML 只需要把本脚本的 stdout 原样打印。
++//
++// **必须精确匹配,不能用 startsWith**:前缀匹配对未来新增的 reason 是 fail-open 的——
++// 例如某天新增 `dry-run-failed` 这个 reason,若判定用 `startsWith('dry-run')` 会被误判
++// 成良性、吞掉真故障的注解。精确匹配下,任何不在这份名单里的字面量默认走「报错」。
++export const FORK_SLACK_NOT_CONFIGURED_REASON = 'slack-not-configured(fork PR 无仓库 secrets,预期行为)'
++
++const BENIGN_REASONS = new Set([
++  'dry-run',
++  'bot-author-no-thanks',
++  'pr-closed-without-merge',
++  FORK_SLACK_NOT_CONFIGURED_REASON,
++])
++
++/**
++ * 按 GitHub Actions workflow command 的转义规则转义 data 部分:先转义 `%`(必须最先,
++ * 否则会把这一步产生的 `%0D`/`%0A` 里的 `%` 二次转义,变成 `%250D`/`%250A`),再转义
++ * CR、LF。避免 reason/error 里的换行被解析成新的 workflow command 边界——未转义时
++ * 含换行的 error 会在同一次 stdout 写入里额外生成一条可解析的 `::warning` 命令,且
++ * 多行错误(聚合错误、带片段的 JSON parse 错误)会让注解看起来被截断。
++ */
++function escapeActionsData(value) {
++  return String(value).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A')
++}
++
++/**
++ * 判断并格式化「合并致谢没发出去」的 Actions 错误注解。
++ * 返回 null 表示不需要注解(已发出 / 良性跳过);否则返回可直接打印的 `::error::` 行。
++ */
++export function formatAnnotation(result) {
++  if (result?.posted) return null
++  const reason = String(result?.reason ?? 'unknown')
++  if (BENIGN_REASONS.has(reason)) return null
++  const errorPart = result?.error ? ` error=${escapeActionsData(result.error)}` : ''
++  return `::error title=合并致谢没发出去::reason=${escapeActionsData(reason)}${errorPart}`
++}
++
++/** 打印结果 JSON,并在需要时紧跟一行 `::error::` 注解。 */
++const finish = (obj) => {
++  out(obj)
++  const annotation = formatAnnotation(obj)
++  if (annotation) process.stdout.write(`${annotation}\n`)
++}
++
++/**
++ * 事件文件路径解析:MERGE_THANKS_EVENT_PATH 优先,否则回落 GITHUB_EVENT_PATH。
++ * 抽成纯函数只为可单测——main() 同样调用它,不重复维护同一份优先级判断(#419 那次
++ * YAML 三元式写错的教训:同一条分支逻辑存在两份就会漂移)。
++ */
++export function resolveEventPath(env = process.env) {
++  return env.MERGE_THANKS_EVENT_PATH || env.GITHUB_EVENT_PATH || null
++}
++
++/**
++ * 判断本次 PR 是否跨仓(fork PR)。`pull_request: closed` 事件对 fork 来源的 PR 不下发
++ * 仓库 secrets(GitHub 安全限制,详见 docs/loops/bug-doctor.md 的 fork 例外一节),缺
++ * Slack 配置属预期、不该产生 `::error::`;同仓触发时缺配置代表 secrets 真的坏了,必须报。
++ *
++ * 判定口径对齐 `gh pr list --json isCrossRepository` 的语义(head 仓库与 base 仓库不同名
++ * 即跨仓),但**只信 head/base 本身,不读取或采信任何外部直传的布尔值**(CX-5):「fork 拿
++ * 不到 secrets」这条限制只针对 fork 的 `pull_request` 触发;维护者在本仓手动
++ * `workflow_dispatch` 补发时权限不随被补发 PR 的 fork 身份变化——若信一个外部直传的
++ * `isCrossRepository:true`,手动补发路径上真实的 secrets 配置故障会被当成"fork 预期
++ * 行为"静默吞掉。真实 `pull_request` 事件(无论同仓或 fork)一定携带 head/base,不需要
++ * 也不该有旁路。
++ *
++ * **未知来源 fail-closed(CA-6 教训)**:head/base 缺失时不授予 benign 资格,一律按同仓
++ * 处理(= 需要告警)。之前这里对缺失 head 返回 true(当成跨仓、放过),导致本仓
++ * make-dispatch-event.mjs 生成的合成事件(从不携带 head/base)不管源 PR 是否同仓,
++ * 缺 Slack 配置永远被判定为良性——手动补发时 secrets 真坏了也不会报,是本 PR 自己在
++ * 修复过程中重新引入的一类静默失败。良性豁免是特权,不确定就不给。
++ */
++export function isCrossRepositoryPR(pr) {
++  const headRepo = pr?.head?.repo
++  const baseFullName = pr?.base?.repo?.full_name
++  if (!headRepo || !baseFullName) return false
++  return headRepo.full_name !== baseFullName
++}
++
++/**
++ * 判断当前进程读到的事件是不是 runner 直接注入的真实 `pull_request` payload,而不是
++ * `workflow_dispatch` 手动补发时自己构造的等价事件(CX-5)。返回 `'pull_request'` 需要
++ * 两个合取同时成立:
++ *   1. `env.GITHUB_EVENT_NAME === 'pull_request'`——`GITHUB_EVENT_NAME` 由 runner 注入,
++ *      `GITHUB_` 是保留前缀、workflow 层 `env:` 覆盖不了,是这里唯一可信的来源信号
++ *      (与 #419 原缺陷注释里"变量名不用 GITHUB_EVENT_PATH,因为 GITHUB_ 是保留前缀"是
++ *      同一条事实,这里正面用一次);
++ *   2. `!env.MERGE_THANKS_EVENT_PATH`——这个变量存在就意味着读的是手工构造的 payload,
++ *      不是 runner 给的。即使 `GITHUB_EVENT_NAME` 说是 `pull_request`,payload 本身也不
++ *      可信,不能给豁免资格。
++ * 其余一切情况(包括两者都缺、`workflow_dispatch` 触发)都归 `'synthetic'`。
++ */
++export function resolveEventProvenance(env = process.env) {
++  return env.GITHUB_EVENT_NAME === 'pull_request' && !env.MERGE_THANKS_EVENT_PATH ? 'pull_request' : 'synthetic'
++}
++
++/**
++ * 缺 Slack 配置时按跨仓 / 同仓给出对应的 reason 字面量,供 main() 直接 finish()。
++ *
++ * `provenance` 必填,不设默认值(CX-5):默认值虽然方向 fail-closed,但会把"调用点漏传"
++ * 变成静默改变行为——真实 fork PR 会从"良性不注解"变成每次合并都注解(CA-3 回退),而
++ * 所有单元用例照样全绿,没人会发现。改成 throw 后,后果链是顶层 catch → `reason:
++ * 'merge-thanks-error'` → 不在 BENIGN_REASONS → 产 `::error::` 注解、退出码仍 0——响亮但
++ * 不致命,不依赖任何人记得为未来的新调用点补测试。
++ *
++ * 良性豁免 = `provenance === 'pull_request' && isCrossRepositoryPR(pr)`:「fork 拿不到
++ * secrets」只对 fork 的 `pull_request` 触发成立,合成的 `workflow_dispatch` 事件即使
++ * 携带看起来像 fork 的 head/base(例如未来 make-dispatch-event.mjs 保真化、补上这两个
++ * 字段),也不授予豁免——维护者在本仓手动补发时权限不随被补发 PR 的 fork 身份变化。
++ */
++export function describeSlackNotConfigured(pr, provenance) {
++  if (provenance !== 'pull_request' && provenance !== 'synthetic') {
++    throw new Error(`describeSlackNotConfigured: provenance 必须显式传入 'pull_request' 或 'synthetic',收到 ${String(provenance)}`)
++  }
++  return provenance === 'pull_request' && isCrossRepositoryPR(pr)
++    ? FORK_SLACK_NOT_CONFIGURED_REASON
++    : 'slack-not-configured(需 SLACK_BOT_TOKEN + SLACK_CHANNEL_ID)'
++}
++
++/**
++ * 投递未成功时(channel 不是 'api')给注解一个可定位的失败原因。此前主成功路径的
++ * payload 完全没有 reason 字段——真正的故障(Slack 投递失败,notify.mjs 降级为
++ * channel:'degraded')落进 formatAnnotation 后只能取到 `reason ?? 'unknown'`,注解看不出
++ * 哪个通道挂了。degrade() 本身不回传底层 apiError(理由细节只落本机 pending-alerts.md,
++ * 不把可能带敏感信息的原始错误带进 Actions 公开日志),这里只暴露「哪个通道」这一层。
++ */
++export function describeChannelFailure(channel) {
++  return `post-failed(${channel})`
++}
++
+ const LLM_BASE = process.env.MIVO_THANKS_LLM_BASE || 'https://llm-proxy.tapsvc.com/v1'
+ const MODEL = process.env.MIVO_THANKS_LLM_MODEL || 'deepseek/deepseek-v4-flash'
+ // 回退模型用 claude-haiku-4-5:2026-08-01 在本网关逐个实调验证过可用。**不要用
+@@ -151,26 +287,26 @@ async function main() {
+   // **不能靠覆盖 GITHUB_EVENT_PATH 实现**——`GITHUB_*` 是 Actions 的保留前缀,runner 会用
+   // 真实事件的路径覆盖掉 step env 里的同名值(日志里打印的是声明值,进程里拿到的是 runner
+   // 的值,所以现象是"文件明明写对了却读不到 pull_request",极难查。2026-08-01 实测踩过)。
+-  const eventPath = process.env.MERGE_THANKS_EVENT_PATH || process.env.GITHUB_EVENT_PATH
++  const eventPath = resolveEventPath()
+   if (!eventPath) {
+-    out({ ok: true, posted: false, reason: 'no-github-event(本脚本只在 Actions 事件里跑)' })
++    finish({ ok: true, posted: false, reason: 'no-github-event(本脚本只在 Actions 事件里跑)' })
+     process.exit(0)
+   }
+   const event = JSON.parse(readFileSync(eventPath, 'utf8'))
+   const pr = event?.pull_request
+   if (!pr) {
+-    out({ ok: true, posted: false, reason: 'event-has-no-pull-request' })
++    finish({ ok: true, posted: false, reason: 'event-has-no-pull-request' })
+     process.exit(0)
+   }
+   if (!pr.merged) {
+-    out({ ok: true, posted: false, reason: 'pr-closed-without-merge' })
++    finish({ ok: true, posted: false, reason: 'pr-closed-without-merge' })
+     process.exit(0)
+   }
+   const author = pr.user?.login ?? ''
+   // 机器人不致谢:「感谢 @app/dependabot」是纯噪音。workflow 侧也有同样判定(提前跳过
+   // 整个 job,顺带避开 dependabot 上下文拿不到 secrets 的问题),这里是第二道防线。
+   if (pr.user?.type === 'Bot' || /\[bot\]$/.test(author) || /^app\//.test(author)) {
+-    out({ ok: true, posted: false, reason: 'bot-author-no-thanks', author })
++    finish({ ok: true, posted: false, reason: 'bot-author-no-thanks', author })
+     process.exit(0)
+   }
+ 
+@@ -193,7 +329,7 @@ async function main() {
+   const threadText = built.rest ? `${built.rest}\n原始标题：${pr.title ?? ''}` : null
+ 
+   if (dryRun) {
+-    out({
++    finish({
+       ok: true, posted: false, reason: 'dry-run', pr: pr.number, title, text, threadText,
+       identity: { tier: ident.tier, ...(ident.reason ? { reason: ident.reason } : {}), name: ident.name ?? null, slackId: ident.slackId ?? null },
+       headlineFrom: built.headline ? 'llm' : 'pr-title',
+@@ -209,7 +345,12 @@ async function main() {
+   // 且这里**不配 webhook**——CI 只走 api 通道,拿不到 ts 就没有 thread,降级也不该往别处漏。
+   const config = { ...loadNotifyConfig('/tmp'), SLACK_WEBHOOK_URL: '' }
+   if (!config.SLACK_BOT_TOKEN || !config.SLACK_CHANNEL_ID) {
+-    out({ ok: true, posted: false, reason: 'slack-not-configured(需 SLACK_BOT_TOKEN + SLACK_CHANNEL_ID)' })
++    // fork PR:GitHub 不下发仓库 secrets,缺配置是预期结果,不产生 ::error::——由
++    // notify-merge-backfill.mjs 按跨仓判定兜底补发(见 docs/loops/bug-doctor.md)。
++    // 同仓 PR 缺配置代表 secrets 真的坏了,必须报,复用配置前的判定原文不变。
++    // provenance 必须显式算出来再传(CX-5):豁免只对真实 pull_request 事件成立,
++    // workflow_dispatch 手动补发即使 payload 里带了看起来像 fork 的 head/base 也不给。
++    finish({ ok: true, posted: false, reason: describeSlackNotConfigured(pr, resolveEventProvenance()) })
+     process.exit(0)
+   }
+ 
+@@ -222,8 +363,9 @@ async function main() {
+     threadPosted = !!tr?.ok
+     if (!threadPosted) threadReason = tr?.reason ?? 'unknown'
+   }
+-  out({
++  finish({
+     ok: true, pr: pr.number, posted, channel: result.channel,
++    ...(posted ? {} : { reason: describeChannelFailure(result.channel) }),
+     threadPosted, ...(threadReason ? { threadReason } : {}),
+     identity: { tier: ident.tier, ...(ident.reason ? { reason: ident.reason } : {}) },
+     headlineFrom: built.headline ? 'llm' : 'pr-title',
+@@ -239,6 +381,6 @@ if (invokedDirectly) {
+     await main()
+   } catch (e) {
+     // 播报失败不让 workflow 变红:合并已经发生,通报只是附加动作。
+-    out({ ok: true, posted: false, reason: 'merge-thanks-error', error: String(e?.message ?? e) })
++    finish({ ok: true, posted: false, reason: 'merge-thanks-error', error: String(e?.message ?? e) })
+   }
+ }
+diff --git a/scripts/loops/merge-thanks/from-github-event.test.mjs b/scripts/loops/merge-thanks/from-github-event.test.mjs
+new file mode 100644
+index 00000000..94501c2b
+--- /dev/null
++++ b/scripts/loops/merge-thanks/from-github-event.test.mjs
+@@ -0,0 +1,421 @@
++// from-github-event.test.mjs — 事件路径解析契约 + 要点校验 + Actions 注解判定
++//
++// 背景(#419):真实合并事件下 MERGE_THANKS_EVENT_PATH 优先判定用了
++// `event_name == 'pull_request' && '' || '/tmp/…'` 这种三元式,Actions 的 &&/|| 是取值
++// 运算符,空字符串 falsy,两条分支求出同一个值——致谢链路静默失败了两小时,job 全程绿灯。
++// 本文件把「MERGE_THANKS_EVENT_PATH 优先、否则回落 GITHUB_EVENT_PATH」这条分支逻辑钉死,
++// 不让同一类 bug 下次再悄悄溜过去。
++//
++// 全离线:不联网、不需要任何 token/secret——事件路径缺失或指向合成 fixture 时脚本在网络
++// 调用之前就已经退出。
++import { execFileSync } from 'node:child_process'
++import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { dirname, join } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++
++import {
++  describeChannelFailure,
++  describeSlackNotConfigured,
++  FORK_SLACK_NOT_CONFIGURED_REASON,
++  formatAnnotation,
++  isCrossRepositoryPR,
++  resolveEventPath,
++  resolveEventProvenance,
++  validateDetails,
++} from './from-github-event.mjs'
++
++const HERE = dirname(fileURLToPath(import.meta.url))
++const SCRIPT_PATH = join(HERE, 'from-github-event.mjs')
++
++describe('resolveEventPath — MERGE_THANKS_EVENT_PATH 优先,否则回落 GITHUB_EVENT_PATH', () => {
++  it('两者都设置时,MERGE_THANKS_EVENT_PATH 优先', () => {
++    expect(resolveEventPath({ MERGE_THANKS_EVENT_PATH: '/tmp/a.json', GITHUB_EVENT_PATH: '/tmp/b.json' })).toBe(
++      '/tmp/a.json',
++    )
++  })
++
++  it('MERGE_THANKS_EVENT_PATH 未设置(键不存在)时回落 GITHUB_EVENT_PATH', () => {
++    expect(resolveEventPath({ GITHUB_EVENT_PATH: '/tmp/b.json' })).toBe('/tmp/b.json')
++  })
++
++  it('MERGE_THANKS_EVENT_PATH 为空字符串时仍回落 GITHUB_EVENT_PATH(#419 的 bug 类:空串是 falsy)', () => {
++    expect(resolveEventPath({ MERGE_THANKS_EVENT_PATH: '', GITHUB_EVENT_PATH: '/tmp/b.json' })).toBe('/tmp/b.json')
++  })
++
++  it('两者都没有时返回 null,不抛异常', () => {
++    expect(() => resolveEventPath({})).not.toThrow()
++    expect(resolveEventPath({})).toBeNull()
++  })
++})
++
++describe('resolveEventPath 接入 main() 的真实行为(子进程实跑,不 mock)', () => {
++  let dir
++
++  beforeEach(() => {
++    dir = mkdtempSync(join(tmpdir(), 'merge-thanks-eventpath-'))
++  })
++
++  afterEach(() => {
++    rmSync(dir, { recursive: true, force: true })
++  })
++
++  const runScript = (env) =>
++    execFileSync(process.execPath, [SCRIPT_PATH], {
++      encoding: 'utf8',
++      env: { PATH: process.env.PATH, ...env },
++    })
++
++  // 脚本的 out() 打印结果 JSON 后,formatAnnotation 命中时还会紧跟一行 `::error::` 注解
++  // (SC5)——两者共享同一条 stdout,这里只取前半段的 JSON 块来断言结果字段。
++  const parseResult = (stdout) => {
++    const idx = stdout.indexOf('\n::error')
++    return JSON.parse(idx === -1 ? stdout : stdout.slice(0, idx))
++  }
++
++  it('两者都没有 → posted:false, reason 以 no-github-event 开头,退出码 0(不抛异常)', () => {
++    const stdout = runScript({})
++    const result = parseResult(stdout)
++    expect(result.posted).toBe(false)
++    expect(result.reason).toMatch(/^no-github-event/)
++  })
++
++  it('只有 GITHUB_EVENT_PATH → 读取该文件', () => {
++    const eventPath = join(dir, 'github-event.json')
++    writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 1, merged: false } }))
++    const stdout = runScript({ GITHUB_EVENT_PATH: eventPath })
++    const result = parseResult(stdout)
++    expect(result.reason).toBe('pr-closed-without-merge')
++  })
++
++  it('MERGE_THANKS_EVENT_PATH 优先于 GITHUB_EVENT_PATH(即使后者指向一个读不到的路径)', () => {
++    const eventPath = join(dir, 'dispatch-event.json')
++    writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 2, merged: false } }))
++    // GITHUB_EVENT_PATH 指向不存在的文件:若脚本读错了变量(#419 的回归类),这里会因
++    // ENOENT 落进顶层 catch,产出 reason:'merge-thanks-error',而不是 'pr-closed-without-merge'。
++    const stdout = runScript({
++      MERGE_THANKS_EVENT_PATH: eventPath,
++      GITHUB_EVENT_PATH: join(dir, 'does-not-exist.json'),
++    })
++    const result = parseResult(stdout)
++    expect(result.reason).toBe('pr-closed-without-merge')
++  })
++
++  it('MERGE_THANKS_EVENT_PATH 为空字符串时,回落 GITHUB_EVENT_PATH 而不是把空串当路径去读', () => {
++    const eventPath = join(dir, 'github-event.json')
++    writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 3, merged: false } }))
++    const stdout = runScript({ MERGE_THANKS_EVENT_PATH: '', GITHUB_EVENT_PATH: eventPath })
++    const result = parseResult(stdout)
++    expect(result.reason).toBe('pr-closed-without-merge')
++  })
++})
++
++describe('validateDetails — LLM 输出的三行骨架硬校验', () => {
++  const VALID = [
++    '• 改了什么：给合并致谢补上契约测试',
++    '• 为什么：YAML 三元式写错导致致谢链路两小时静默失败',
++    '• 影响谁：仅内部实现，使用者无感',
++  ].join('\n')
++
++  it('合格样本 → ok:true,headline 剥掉标签,rest 是另外两行', () => {
++    const v = validateDetails(VALID)
++    expect(v.ok).toBe(true)
++    expect(v.headline).toBe('给合并致谢补上契约测试')
++    expect(v.rest).toBe(
++      ['• 为什么：YAML 三元式写错导致致谢链路两小时静默失败', '• 影响谁：仅内部实现，使用者无感'].join('\n'),
++    )
++    expect(v.details).toBe(VALID)
++  })
++
++  it('空文本 → reason:empty', () => {
++    expect(validateDetails('')).toEqual({ ok: false, reason: 'empty' })
++    expect(validateDetails(null)).toEqual({ ok: false, reason: 'empty' })
++  })
++
++  it('行数 ≠ 3(只有两行) → 行数不符', () => {
++    const v = validateDetails(['• 改了什么：x', '• 为什么：y'].join('\n'))
++    expect(v.ok).toBe(false)
++    expect(v.reason).toBe('行数 2 ≠ 3')
++  })
++
++  it('行数 ≠ 3(四行) → 行数不符', () => {
++    const v = validateDetails([VALID, '• 多余的第四行'].join('\n'))
++    expect(v.ok).toBe(false)
++    expect(v.reason).toBe('行数 4 ≠ 3')
++  })
++
++  it('未按「• 」骨架输出(某行用 - 开头) → 骨架不符', () => {
++    const bad = ['- 改了什么：x', '• 为什么：y', '• 影响谁：z'].join('\n')
++    expect(validateDetails(bad)).toEqual({ ok: false, reason: '未按「• 」骨架输出' })
++  })
++
++  it('三行标签顺序不符(缺"为什么"标签) → 顺序不符', () => {
++    const bad = ['• 改了什么：x', '• 因为：y', '• 影响谁：z'].join('\n')
++    expect(validateDetails(bad)).toEqual({ ok: false, reason: '三行标签顺序不符' })
++  })
++
++  it('含反引号 → 拒绝(要求人话、不贴代码)', () => {
++    const bad = [
++      '• 改了什么：改了 `validateDetails` 函数',
++      '• 为什么：y',
++      '• 影响谁：z',
++    ].join('\n')
++    expect(validateDetails(bad)).toEqual({ ok: false, reason: '含反引号(要求人话、不贴代码)' })
++  })
++
++  it('有行超长(>90 字) → 拒绝', () => {
++    const longLine = `• 改了什么：${'很长的一句话啊'.repeat(15)}`
++    expect(longLine.length).toBeGreaterThan(90)
++    const bad = [longLine, '• 为什么：y', '• 影响谁：z'].join('\n')
++    const v = validateDetails(bad)
++    expect(v.ok).toBe(false)
++    expect(v.reason).toMatch(/^有行超长\(\d+ 字\)$/)
++  })
++
++  it('首行剥掉标签后为空 → 拒绝', () => {
++    const bad = ['• 改了什么：', '• 为什么：y', '• 影响谁：z'].join('\n')
++    expect(validateDetails(bad)).toEqual({ ok: false, reason: '首行剥掉标签后为空' })
++  })
++
++  it('标签用英文冒号也能正确剥离出 headline', () => {
++    const v = validateDetails(['• 改了什么:x', '• 为什么:y', '• 影响谁:z'].join('\n'))
++    expect(v.ok).toBe(true)
++    expect(v.headline).toBe('x')
++  })
++})
++
++describe('formatAnnotation — Actions ::error:: 注解判定(消掉与 YAML 重复的 benign 名单)', () => {
++  it('posted:true → 不注解,无论 reason 是什么', () => {
++    expect(formatAnnotation({ posted: true, reason: 'merge-thanks-error' })).toBeNull()
++  })
++
++  // 现存 7 个 reason 字面量(逐字来自 from-github-event.mjs 各 finish() 调用点)的分类
++  // 一个都不变:精确匹配只是把判定方式从 startsWith 换成 exact,不改变现有行为(SC7)。
++  it.each([
++    'dry-run',
++    'bot-author-no-thanks',
++    'pr-closed-without-merge',
++    FORK_SLACK_NOT_CONFIGURED_REASON,
++  ])('良性 reason "%s" → 不注解', (reason) => {
++    expect(formatAnnotation({ posted: false, reason })).toBeNull()
++  })
++
++  it.each([
++    'merge-thanks-error',
++    'event-has-no-pull-request',
++    'no-github-event(本脚本只在 Actions 事件里跑)',
++    'slack-not-configured(需 SLACK_BOT_TOKEN + SLACK_CHANNEL_ID)',
++    'some-unknown-reason',
++  ])('故障/未知 reason "%s" → 产生 ::error:: 注解', (reason) => {
++    const line = formatAnnotation({ posted: false, reason })
++    expect(line).toMatch(/^::error title=合并致谢没发出去::reason=/)
++    expect(line).toContain(`reason=${reason}`)
++  })
++
++  it('缺 reason 字段 → 视为 unknown 并注解', () => {
++    const line = formatAnnotation({ posted: false })
++    expect(line).toBe('::error title=合并致谢没发出去::reason=unknown')
++  })
++
++  it('带 error 字段时,注解行附带 error=', () => {
++    const line = formatAnnotation({ posted: false, reason: 'merge-thanks-error', error: 'ENOENT: no such file' })
++    expect(line).toBe('::error title=合并致谢没发出去::reason=merge-thanks-error error=ENOENT: no such file')
++  })
++
++  // SC7:精确匹配下,近前缀但不是现存 reason 的字面量必须走「报错」(fail-closed)。
++  // startsWith('dry-run') 会误判这条为良性——那正是 SC7 要修的漂移风险。
++  it('近前缀但不是精确匹配的 reason(如 "dry-run-failed")→ 仍产生注解,不被 startsWith 误判为良性', () => {
++    const line = formatAnnotation({ posted: false, reason: 'dry-run-failed' })
++    expect(line).toContain('reason=dry-run-failed')
++  })
++})
++
++describe('describeChannelFailure — 投递未成功时,给注解一个可定位的通道原因(SC4)', () => {
++  it('degraded 通道 → post-failed(degraded)', () => {
++    expect(describeChannelFailure('degraded')).toBe('post-failed(degraded)')
++  })
++
++  it('搭配 formatAnnotation → 注解带上具体通道,不是空心的 reason=unknown', () => {
++    const line = formatAnnotation({ posted: false, channel: 'degraded', reason: describeChannelFailure('degraded') })
++    expect(line).toContain('reason=post-failed(degraded)')
++    expect(line).not.toContain('reason=unknown')
++  })
++})
++
++describe('isCrossRepositoryPR — 判定口径对齐 gh pr list --json isCrossRepository(SC5)', () => {
++  const pr = (head, base) => ({ head: { repo: head }, base: { repo: base } })
++
++  it('head/base 仓库同名 → 同仓,非跨仓', () => {
++    expect(isCrossRepositoryPR(pr({ full_name: 'xindong/mivo-canvas' }, { full_name: 'xindong/mivo-canvas' }))).toBe(
++      false,
++    )
++  })
++
++  it('head/base 仓库不同名 → 跨仓(fork)', () => {
++    expect(isCrossRepositoryPR(pr({ full_name: 'someone/mivo-canvas' }, { full_name: 'xindong/mivo-canvas' }))).toBe(
++      true,
++    )
++  })
++
++  // CA-6/SC8:未知来源 fail-closed——head/base 缺失时不授予 benign 资格,一律按同仓
++  // (需要告警)处理,不再像修复前那样把"不确定"当成"跨仓"直接放过。
++  it.each([
++    ['head.repo 为 null', pr(null, { full_name: 'xindong/mivo-canvas' })],
++    ['base.repo.full_name 缺失', pr({ full_name: 'xindong/mivo-canvas' }, null)],
++    ['head/base 全部缺失(make-dispatch-event.mjs 当前实际产出的合成事件形状)', {}],
++  ])('%s(未知来源)→ 按同仓/需要告警处理,不授予 benign', (_label, badPR) => {
++    expect(isCrossRepositoryPR(badPR)).toBe(false)
++  })
++})
++
++describe('resolveEventProvenance — 判定事件来源是否可信(SC14)', () => {
++  it.each([
++    [{ GITHUB_EVENT_NAME: 'pull_request' }, 'pull_request'],
++    [{ GITHUB_EVENT_NAME: 'pull_request', MERGE_THANKS_EVENT_PATH: '/tmp/x' }, 'synthetic'],
++    [{ GITHUB_EVENT_NAME: 'workflow_dispatch' }, 'synthetic'],
++    [{}, 'synthetic'],
++  ])('env=%j → %s', (env, expected) => {
++    expect(resolveEventProvenance(env)).toBe(expected)
++  })
++})
++
++// SC14(CX-5):良性豁免不能只看 PR 是不是 fork,还必须同时是真实 pull_request 事件——
++// 「fork 拿不到仓库 secrets」只对 fork 的 pull_request 触发成立,workflow_dispatch 手动
++// 补发时权限不随被补发 PR 的 fork 身份变化。provenance 必填 + 入口 throw(不设默认值):
++// 默认值会把"调用点漏传"变成静默改变行为,而所有单元用例照样全绿,没人会发现。
++describe('describeSlackNotConfigured(pr, provenance) — 豁免必须同时是真实 pull_request 事件(SC14)', () => {
++  const samRepoPR = { head: { repo: { full_name: 'xindong/mivo-canvas' } }, base: { repo: { full_name: 'xindong/mivo-canvas' } } }
++  const forkPR = { head: { repo: { full_name: 'someone/mivo-canvas' } }, base: { repo: { full_name: 'xindong/mivo-canvas' } } }
++  const ALERT_REASON = 'slack-not-configured(需 SLACK_BOT_TOKEN + SLACK_CHANNEL_ID)'
++
++  it.each([
++    ['pull_request + fork → 豁免', 'pull_request', forkPR, FORK_SLACK_NOT_CONFIGURED_REASON],
++    ['pull_request + 同仓 → 告警', 'pull_request', samRepoPR, ALERT_REASON],
++    // 命门:即使 payload 长得像 fork(head≠base),synthetic 一律不豁免——这是唯一能在
++    // "把 head/base 保真化进 make-dispatch-event.mjs"那天拦住 fail-open 复活的断言。
++    ['synthetic + fork(SC14 命门,不得豁免)', 'synthetic', forkPR, ALERT_REASON],
++    ['任意 provenance + 缺 head/base → 告警(CA-6 fail-closed)', 'synthetic', {}, ALERT_REASON],
++  ])('%s', (_label, provenance, pr, expected) => {
++    expect(describeSlackNotConfigured(pr, provenance)).toBe(expected)
++  })
++
++  it.each([undefined, '', 'nope'])('provenance 非法值(%s)→ throw,不静默改变行为', (bad) => {
++    expect(() => describeSlackNotConfigured(forkPR, bad)).toThrow()
++  })
++
++  it('pull_request + fork 的 reason 搭配 formatAnnotation → 不产生注解', () => {
++    expect(formatAnnotation({ posted: false, reason: describeSlackNotConfigured(forkPR, 'pull_request') })).toBeNull()
++  })
++
++  it('synthetic + fork 的 reason 搭配 formatAnnotation → 产生注解(SC14 命门,端到端)', () => {
++    expect(formatAnnotation({ posted: false, reason: describeSlackNotConfigured(forkPR, 'synthetic') })).not.toBeNull()
++  })
++})
++
++// SC15:SC14 的四格矩阵锁的是 describeSlackNotConfigured 自身的逻辑,锁不住 main() 里
++// :351 那个调用点有没有真的把 resolveEventProvenance() 传进去——四格用例直接调函数、自己
++// 传参,根本不经过那一行。这里子进程实跑 main(),同一份 fork 形态事件分别经
++// GITHUB_EVENT_PATH(真实 pull_request)和 MERGE_THANKS_EVENT_PATH(synthetic)送入,
++// 断言 stdout 里 ::error:: 注解的有无——接线必须在它自己的层级上被断言。
++describe('describeSlackNotConfigured 在 main() 里的接线(SC15:子进程实跑,不 mock)', () => {
++  let dir
++
++  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'merge-thanks-provenance-')) })
++  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
++
++  const runScript = (env) =>
++    execFileSync(process.execPath, [SCRIPT_PATH], {
++      encoding: 'utf8',
++      env: { PATH: process.env.PATH, ...env },
++    })
++
++  // fork 形态(head≠base)+ merged:true + 作者非 bot;两条都不设 SLACK_BOT_TOKEN /
++  // SLACK_CHANNEL_ID,让 main() 走到"缺 Slack 配置"那个分支。
++  const forkEvent = {
++    pull_request: {
++      number: 500,
++      merged: true,
++      title: 't',
++      body: 'b',
++      html_url: 'https://x',
++      user: { login: 'someone', type: 'User' },
++      head: { repo: { full_name: 'someone/mivo-canvas' } },
++      base: { repo: { full_name: 'xindong/mivo-canvas' } },
++    },
++  }
++
++  it('GITHUB_EVENT_NAME=pull_request + 事件经 GITHUB_EVENT_PATH 送入 → fork 良性豁免在生产接线上成立,stdout 不含 ::error(CA-3 未回退)', () => {
++    const eventPath = join(dir, 'github-event.json')
++    writeFileSync(eventPath, JSON.stringify(forkEvent))
++    const stdout = runScript({ GITHUB_EVENT_NAME: 'pull_request', GITHUB_EVENT_PATH: eventPath })
++    expect(stdout).not.toContain('::error')
++  })
++
++  it('同一份事件经 MERGE_THANKS_EVENT_PATH 送入(= synthetic,无论 GITHUB_EVENT_NAME 设成什么)→ 不豁免,stdout 含 ::error(SC14 命门的接线版)', () => {
++    const eventPath = join(dir, 'dispatch-event.json')
++    writeFileSync(eventPath, JSON.stringify(forkEvent))
++    const stdout = runScript({ GITHUB_EVENT_NAME: 'pull_request', MERGE_THANKS_EVENT_PATH: eventPath })
++    expect(stdout).toContain('::error')
++  })
++})
++
++// CA-6/SC8 最硬的一条 hold:此前的分类器测试全是手写 { head:{repo:…}, base:{repo:…} } 形状,
++// 没有一条覆盖生产 dispatch 真正产生的「连 head/base 键都不存在」的形状——断言的是生产从不
++// 产生的输入,门形同虚设。这里直接跑真实 make-dispatch-event.mjs 拿真实输出喂给分类器,
++// 不再手写猜测的 fixture。
++describe('make-dispatch-event.mjs 真实产出 → 分类器判定,不用手写猜的形状(SC8)', () => {
++  const MAKE_DISPATCH_EVENT_PATH = join(HERE, 'make-dispatch-event.mjs')
++  let dir
++
++  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'make-dispatch-event-')) })
++  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
++
++  // CX-5:isCrossRepository 直传链路已删——即使输入的 pr-meta 里带着这个字段(比如未来
++  // 有人给 gh pr view --json 补上它),make-dispatch-event.mjs 也绝不会把它带进合成事件,
++  // 分类器永远走 head/base(此处始终缺失)→ fail-closed → 需要告警,不会被"看起来像 fork"
++  // 的输入悄悄放过。
++  it.each([
++    ['同仓 PR(当前生产真实形状)', {}, 'slack-not-configured(需 SLACK_BOT_TOKEN + SLACK_CHANNEL_ID)'],
++    ['即使 pr-meta 里混入 isCrossRepository:true,也不会被带进合成事件、不会被当成 fork', { isCrossRepository: true }, 'slack-not-configured(需 SLACK_BOT_TOKEN + SLACK_CHANNEL_ID)'],
++  ])('%s → describeSlackNotConfigured 给出需要告警的 reason,不说反话', (_label, extra, expected) => {
++    const prMetaPath = join(dir, 'pr-meta.json')
++    writeFileSync(prMetaPath, JSON.stringify({
++      number: 409, title: 't', body: 'b', url: 'https://x',
++      author: { login: 'PraiseZhu', is_bot: false }, mergedAt: '2026-08-01T00:00:00Z', ...extra,
++    }))
++    const outPath = join(dir, 'dispatch-event.json')
++    execFileSync(process.execPath, [MAKE_DISPATCH_EVENT_PATH, outPath, '--from', prMetaPath])
++    const event = JSON.parse(readFileSync(outPath, 'utf8'))
++    expect(event.pull_request).not.toHaveProperty('isCrossRepository')
++    // provenance 传 'synthetic':任何经 make-dispatch-event.mjs 产出的事件都不是 runner
++    // 直接注入的真实 payload,不管 GITHUB_EVENT_NAME 当时设成什么。
++    expect(describeSlackNotConfigured(event.pull_request, 'synthetic')).toBe(expected)
++  })
++})
++
++describe('formatAnnotation — 按 Actions workflow command 规则转义 reason/error(SC6)', () => {
++  it('error 含换行 → 转义为 %0A,整条注解仍是单行,不产生第二条可解析的 workflow command', () => {
++    const line = formatAnnotation({ posted: false, reason: 'merge-thanks-error', error: 'boom\nline2' })
++    expect(line.split('\n')).toHaveLength(1)
++    expect(line).toContain('error=boom%0Aline2')
++  })
++
++  it('error 含 CR → 转义为 %0D', () => {
++    const line = formatAnnotation({ posted: false, reason: 'merge-thanks-error', error: 'a\rb' })
++    expect(line).toContain('error=a%0Db')
++  })
++
++  it('reason 含 % → 转义为 %25', () => {
++    const line = formatAnnotation({ posted: false, reason: '50% failed' })
++    expect(line).toContain('reason=50%25 failed')
++  })
++
++  it('%与换行同时出现时,先转义 % 再转义换行,不产生双重转义', () => {
++    // 若顺序反了(先转 \n 再转 %),\n 生成的 %0A 会被第二步的 % 转义规则再转一次,
++    // 变成错误的 %250A——必须先转 % 才能避免这种"转义自己生成的转义序列"。
++    const line = formatAnnotation({ posted: false, reason: 'merge-thanks-error', error: '50% done\nnext' })
++    expect(line).toContain('error=50%25 done%0Anext')
++    expect(line).not.toContain('%250A')
++  })
++})
+diff --git a/scripts/loops/merge-thanks/resolve-slack-identity.test.mjs b/scripts/loops/merge-thanks/resolve-slack-identity.test.mjs
+new file mode 100644
+index 00000000..317fa51d
+--- /dev/null
++++ b/scripts/loops/merge-thanks/resolve-slack-identity.test.mjs
+@@ -0,0 +1,137 @@
++// resolve-slack-identity.test.mjs — 身份解析三档 + 四类失败原因,全程不抛错
++//
++// 身份解析只是锦上添花(把 @login 升级成能真通知到人的 Slack @):它挂了绝不能阻断
++// 致谢本身发出去,所以这里逐类锁定四种失败原因都走降级分支返回,而不是抛异常。
++//
++// 全离线:spawnSync(读 xindong/org 名录用)与 fetch(查 Slack)全部打桩,不联网、不需要
++// 真实 token。
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.mock('node:child_process', () => ({ spawnSync: vi.fn() }))
++
++import { spawnSync } from 'node:child_process'
++
++import { findInRoster, resolveAuthorMention } from './resolve-slack-identity.mjs'
++
++const ENV_KEYS = ['ORG_ROSTER_TOKEN', 'SLACK_BOT_TOKEN']
++
++const ROSTER_MD = [
++  '| GitHub | Name | Email | Role |',
++  '|---|---|---|---|',
++  '| [@testlogin](https://github.com/testlogin) | 测试同学 | test@xd.com | member |',
++].join('\n')
++
++const rosterStdout = (md) => Buffer.from(md, 'utf8').toString('base64')
++
++let prevEnv
++let origFetch
++
++beforeEach(() => {
++  prevEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]))
++  for (const k of ENV_KEYS) delete process.env[k]
++  spawnSync.mockReset()
++  origFetch = globalThis.fetch
++})
++
++afterEach(() => {
++  for (const k of ENV_KEYS) {
++    if (prevEnv[k] === undefined) delete process.env[k]
++    else process.env[k] = prevEnv[k]
++  }
++  globalThis.fetch = origFetch
++})
++
++describe('findInRoster — 名录表格解析(纯函数)', () => {
++  it('login 大小写不敏感命中,返回中文真名 + 邮箱', () => {
++    expect(findInRoster(ROSTER_MD, 'TestLogin')).toEqual({ name: '测试同学', email: 'test@xd.com' })
++  })
++
++  it('名录里没这个 login → null', () => {
++    expect(findInRoster(ROSTER_MD, 'someone-else')).toBeNull()
++  })
++
++  it('markdown 为空 / login 为空 → null,不抛错', () => {
++    expect(findInRoster('', 'testlogin')).toBeNull()
++    expect(findInRoster(ROSTER_MD, '')).toBeNull()
++  })
++})
++
++describe('resolveAuthorMention — 三档 + 四类失败原因(全程不抛错,不阻断致谢发出)', () => {
++  it('login 为空 → tier none', async () => {
++    await expect(resolveAuthorMention('')).resolves.toEqual({ mention: '', tier: 'none', reason: 'no-login' })
++  })
++
++  it('ORG_ROSTER_TOKEN 未配置 → roster-unread,且不调用 spawnSync(无 token 直接短路)', async () => {
++    const r = await resolveAuthorMention('testlogin')
++    expect(r).toEqual({ mention: '@testlogin', tier: 'login-only', reason: 'roster-unread' })
++    expect(spawnSync).not.toHaveBeenCalled()
++  })
++
++  it('spawnSync 非零退出(名录读不到)→ roster-unread', async () => {
++    process.env.ORG_ROSTER_TOKEN = 'ghp_test'
++    spawnSync.mockReturnValue({ status: 1, stdout: '' })
++    const r = await resolveAuthorMention('testlogin')
++    expect(r).toEqual({ mention: '@testlogin', tier: 'login-only', reason: 'roster-unread' })
++  })
++
++  it('名录读到,但没有这个 login → roster-miss', async () => {
++    process.env.ORG_ROSTER_TOKEN = 'ghp_test'
++    spawnSync.mockReturnValue({ status: 0, stdout: rosterStdout(ROSTER_MD) })
++    const r = await resolveAuthorMention('unknown-login')
++    expect(r).toEqual({ mention: '@unknown-login', tier: 'login-only', reason: 'roster-miss' })
++  })
++
++  it('名录命中 + Slack 查到邮箱 → tier slack-mention,带真名与 Slack ID', async () => {
++    process.env.ORG_ROSTER_TOKEN = 'ghp_test'
++    process.env.SLACK_BOT_TOKEN = 'xoxb-test'
++    spawnSync.mockReturnValue({ status: 0, stdout: rosterStdout(ROSTER_MD) })
++    globalThis.fetch = async () => ({ json: async () => ({ ok: true, user: { id: 'U123' } }) })
++    const r = await resolveAuthorMention('testlogin')
++    expect(r).toEqual({
++      mention: '<@U123>',
++      tier: 'slack-mention',
++      name: '测试同学',
++      email: 'test@xd.com',
++      slackId: 'U123',
++    })
++  })
++
++  it('名录命中 + Slack 缺 users:read.email scope → tier real-name,reason slack-noscope', async () => {
++    process.env.ORG_ROSTER_TOKEN = 'ghp_test'
++    process.env.SLACK_BOT_TOKEN = 'xoxb-test'
++    spawnSync.mockReturnValue({ status: 0, stdout: rosterStdout(ROSTER_MD) })
++    globalThis.fetch = async () => ({ json: async () => ({ ok: false, error: 'missing_scope' }) })
++    const r = await resolveAuthorMention('testlogin')
++    expect(r.tier).toBe('real-name')
++    expect(r.reason).toBe('slack-noscope(bot 缺 users:read.email)')
++    expect(r.mention).toBe('测试同学（@testlogin）')
++  })
++
++  it('名录命中 + SLACK_BOT_TOKEN 未配置 → tier real-name,reason slack-miss(no-slack-token),不抛错', async () => {
++    process.env.ORG_ROSTER_TOKEN = 'ghp_test'
++    spawnSync.mockReturnValue({ status: 0, stdout: rosterStdout(ROSTER_MD) })
++    const r = await resolveAuthorMention('testlogin')
++    expect(r.tier).toBe('real-name')
++    expect(r.reason).toBe('slack-miss(no-slack-token)')
++  })
++
++  it('名录命中 + Slack 查无该邮箱(users_not_found)→ tier real-name,reason slack-miss(...)', async () => {
++    process.env.ORG_ROSTER_TOKEN = 'ghp_test'
++    process.env.SLACK_BOT_TOKEN = 'xoxb-test'
++    spawnSync.mockReturnValue({ status: 0, stdout: rosterStdout(ROSTER_MD) })
++    globalThis.fetch = async () => ({ json: async () => ({ ok: false, error: 'users_not_found' }) })
++    const r = await resolveAuthorMention('testlogin')
++    expect(r.tier).toBe('real-name')
++    expect(r.reason).toBe('slack-miss(users_not_found)')
++  })
++
++  it('名录命中 + fetch 本身抛网络异常 → 仍不抛错,降级为 real-name/slack-miss', async () => {
++    process.env.ORG_ROSTER_TOKEN = 'ghp_test'
++    process.env.SLACK_BOT_TOKEN = 'xoxb-test'
++    spawnSync.mockReturnValue({ status: 0, stdout: rosterStdout(ROSTER_MD) })
++    globalThis.fetch = async () => {
++      throw new Error('network down')
++    }
++    await expect(resolveAuthorMention('testlogin')).resolves.toMatchObject({ tier: 'real-name' })
++  })
++})
+diff --git a/scripts/loops/merge-thanks/workflow-contract.mjs b/scripts/loops/merge-thanks/workflow-contract.mjs
+new file mode 100644
+index 00000000..4a390f3a
+--- /dev/null
++++ b/scripts/loops/merge-thanks/workflow-contract.mjs
+@@ -0,0 +1,252 @@
++// workflow-contract.mjs — 校验 merge-thanks.yml 的关键契约,不用手工红绿演示当回归
++//
++// #419 的教训:`resolveEventPath` 只是把 base.yml 里原样的 `A || B` 抽成函数,行为
++// 零变化,被现有 40 条脚本侧测试钉死的是"本就没坏的那半"——把导致致谢两小时静默失败的
++// 三元式贴回 workflow YAML 的 `Post merge thanks` 步骤,那 40 条测试依旧全绿。缺陷真正
++// 所在的 YAML 一行完全没被任何测试覆盖过。本文件把 YAML 本身的关键约束抽成纯函数,
++// 用真实文件当正例、用编码进测试的原缺陷片段当负例,让"红"永久固化成一条测试而不是
++// 做完就消失的手工验证。
++//
++// 只做字符串级结构校验,不引入 YAML 解析依赖——本仓没有 js-yaml/yaml 包,这几条契约用
++// 行级扫描足够表达清楚,不值得为此新增依赖。
++//
++// ============================================================================
++// 威胁模型(交付物的一部分,不是可选说明——决定这道门能挡什么、不能挡什么)
++// ============================================================================
++//
++// 本检查器防的是**无意回归**:改回取值三元式、把 MERGE_THANKS_EVENT_PATH 的声明挪到
++// 别的层级、动了构造步骤的 guard——这些都是"改的时候没意识到会复活 #419"的日常编辑
++// 事故。它**不是**、也不打算是防刻意混淆的安全边界。关键事实:`workflow-contract.mjs`
++// 与 `.github/workflows/` 在同一个仓、同一批人可改。能想办法往 workflow 里塞出刻意
++// 混淆过的绕过的人,同样能直接删掉 `workflow-contract.test.mjs` 或本文件——对抗性加固
++// 在这里的边际价值为零,投入应该放在"挡住无意回归"上,不是"挡住蓄意破坏"。
++//
++// **风险分层(决定这道门残余盲区的真实代价)**:
++//   - 一阶不变量——`value-ternary-empty-string`(#419 原缺陷本身的形态)、以及"该 env
++//     键全文恰好一条且是 $GITHUB_ENV 写入行"这条计数(`event-path-not-single-github-
++//     env-write`)——都是纯正则的全文扫描,**不经过 `extractStep`/`STEP_ITEM_RE`**。
++//     已实测:把 `STEP_ITEM_RE` 强制改成永不匹配(模拟步骤边界判定全盲)后单独注入
++//     三元式违规、单独注入重复声明违规,这两条规则依旧各自照常触发,不受影响。
++//   - 但"不经过步骤边界判定"不等于"不可绕过":第 9 类(MERGE_THANKS_EVENT_PATH 键用
++//     YAML 双引号转义 `\xHH`/`\uHHHH` 拆散)绕的正是"全文恰好一条"这条计数规则本身——
++//     原始文本 `includes()` 看不到被转义拆散的键名,但 YAML 会解出同一个键,导致漏计;
++//     这个绕过与步骤边界判定无关,已由 `unescapeYamlDoubleQuoted` 覆盖(见
++//     `eventPathLines` 那行)。
++//   - 二阶不变量——guard 必须落在构造步骤自己的 mapping 列(`dispatch-step-guard-
++//     changed`)、写入行必须落在受 guard 的步骤范围内(`event-path-moved-out-of-
++//     dispatch-step`)——**依赖步骤边界判定**(`extractStep`/`STEP_ITEM_RE`)。
++//   - 结论:步骤边界判定的残余盲区不影响一阶规则的检出能力。具体哪种变异形态命中哪条
++//     违规 id,以 workflow-contract.test.mjs 的 MUTATIONS 变异表逐条为准,本节不对
++//     绕过形态按机制归类。
++//
++// **步骤边界判定是行级 best-effort,不是 YAML 语义判定**——不引入 YAML parser 就不可能
++// 穷尽 YAML 里所有合法的列表项写法。目前 `STEP_ITEM_RE` 明确支持识别为步骤边界的形态:
++//   - `- name: ...`(带 name 的标准形态,本文件真实四个步骤当前用的都是这种);
++//   - `- uses: ...` / `- run: ...`(dash 后跟内容、同一行,无 name 的常规形态,GitHub
++//     Actions 里很常见,只是本文件目前没用);
++//   - bare-dash(dash 单独占一行,内容写在下一行、缩进更深的 mapping 里——同样合法
++//     YAML,`actionlint`/真实 YAML 解析器都会接受)。
++// 未设专门负例 fixture 的形态:flow-style 序列项(`- {uses: ..., if: ...}`)、多步骤
++// 压缩在一行等更罕见的写法。如实注明,不假装是设计保证:flow-style 序列项经实测——
++// `STEP_ITEM_RE` 的 `-(?:\s|$)` 对 "dash 后跟空格"这种写法本就能匹配,`- {...}` 已被
++// 正确识别为步骤边界(删掉受 guard 步骤自身的 if: 后仍正常报 dispatch-step-guard-
++// changed,是按边界正常工作,不是"认不出但恰好 fail-closed");多步骤压缩在一行未测,
++// 行为未知,不作任何声称。
++//
++// 已覆盖的形态(15 类,均有对应负例 fixture,见 workflow-contract.test.mjs):
++//   1. 取值三元式 + 空字符串(`&& '' ||` / `&& "" ||`)贴回任意 `${{ }}` 表达式;
++//   2/5/6. MERGE_THANKS_EVENT_PATH 被声明在 step/job/workflow 任意层级的 env 里;
++//   7. 构造步骤缺 GITHUB_ENV 写入;
++//   3/4. 构造步骤的 if: guard 被删除或反转;
++//   8. guard 被移出步骤 mapping 层、塞进 run: | 块内的同名文本("实现没兑现声明"级缺陷,
++//      按列精确匹配后已结构性排除);
++//   9. MERGE_THANKS_EVENT_PATH 键用 YAML 双引号转义(`\xHH`/`\uHHHH`)拆散,原始文本
++//      `includes()` 看不到但 YAML 会解出同一个键名(廉价反解后已覆盖);
++//   10. GITHUB_ENV 写入行被原样搬到 Build 步骤之外、一个自身没有 if: guard 的新步骤
++//       (全文仍只有一行、仍是写入形态,但"位置"错了——见下方 CA-9 教训);
++//   11. Build 步骤 mapping 层同列出现两条 if:(重复键)——guard 判定按"唯一命中"而非
++//       first-match,命中数 ≠ 1 一律报违规,不因第一条恰好没变就放过;
++//   12. guard 落在 Build 之后一个无 name 的 `- uses:`/`- run:` 后继步骤(dash 后跟
++//       内容这种形态)里,而不是 Build 自己的 mapping 层(见下方 CX-1 第四层教训);
++//   13. GITHUB_ENV 写入行落在 Build 之后一个无 name 的 `- uses:`/`- run:` 后继步骤里
++//       (同一根因,咬中位置约束那条规则而不是 guard 那条);
++//   14. guard 落在 Build 之后一个 bare-dash(dash 单独占一行)形态的后继步骤里——同一
++//       根因的第三种表现(见下方 CX-1 第四层教训);
++//   15. GITHUB_ENV 写入行落在 Build 之后一个 bare-dash 形态的后继步骤里。
++//
++// 已知不覆盖、且刻意不覆盖的形态(逐条给理由,理由统一见上一段"对抗性加固边际价值为零"):
++//   - YAML 锚点/别名(`&anchor` / `*ref`):要正确展开引用才能看到最终键名/值,等价于
++//     实现一个 YAML 解析器;
++//   - 块标量(`|`/`>`)内部通过多行拼接、缩进技巧间接构造出目标字符串;
++//   - 任何需要完整 YAML 语义(多文档、标签、flow-style 序列/映射嵌套等)才能正确
++//     还原真实结构的形式。
++// 以上均只能由刻意混淆达成,没人会无意中写出这类构造——本文件的检测预算优先给无意回归,
++// 不为这些形式新增规则。
++//
++// CA-9 教训(2026-08-02):本检查器的每一项规则都携带**位置/层级约束**,不只是文本存在
++// 性。曾有一次「合并同类规则、净减 6 行」的收敛把「GITHUB_ENV 写入行必须落在受 guard 的
++// 构造步骤内」这层约束丢了——收敛前的版本天然带着这层约束(检查逻辑本就在该步骤的行
++// 范围内做),收敛成"全文恰好一行且是写入"之后就只剩文本存在性,不再检查位置。结果是
++// 「把写入行原样搬到 Build 之前一个没有 if: 的新步骤」这条旁路能让新规则判定通过,而
++// 当时用来验证这次收敛的变异表里没有"搬移"这种形态,没能暴露。**今后合并或简化本文件
++// 的规则时,必须先确认被合并的规则各自携带的约束(位置、层级、时序……)是否都在新规则
++// 里保留,并为新打开的形态补负例——不能只用旧变异表验证一次会引入新风险的改动。**
++//
++// CX-1 第四层教训(2026-08-02,三轮构造才收口):`STEP_HEADER_RE` 曾被同时用于两个不同
++// 目的——①按名字精确定位步骤起点,②扫描下一个同级步骤判定边界。目的①只需要匹配"带
++// name 的那一种形态"就够,但目的②要求这个谓词能识别边界的合法形态;无名的 `- uses:`/
++// `- run:` 步骤(GitHub Actions 常规写法)与 bare-dash(dash 单独占一行,同样合法
++// YAML,`actionlint`/真实 YAML 解析器都接受)先后两次被目的①的正则/其替代正则漏判成
++// "不是边界",导致后继步骤的内容被错误并入前一个步骤的范围——guard 判定和位置约束
++// 判定都因此可被完全正常的日常编辑无意绕过,不需要任何刻意混淆。**一个谓词若同时服务
++// 多个目的,其中任一目的的完备性要求都必须单独检查——不能假设"够用于其中一个目的"就
++// 默认"够用于另一个目的"。** 已改为起点用 STEP_HEADER_RE、边界扫描用 STEP_ITEM_RE
++// (接受本节"步骤边界判定"列出的三种已支持形态——不等于穷尽 YAML 的一切合法列表项
++// 写法,残余盲区按上面"风险分层"的结论,不影响一阶不变量的检出能力——该结论仅指步骤
++// 边界扫描的残余盲区,不代表一阶不变量不可被绕过,见上方风险分层第 9 类)。
++// ============================================================================
++
++const STEP_HEADER_RE = /^(\s*)-\s+name:\s*(.+)\s*$/
++// YAML 列表项边界,覆盖三种形态(逐条理由见文件头"步骤边界判定"一节;不是"任意"——
++// 不引入 YAML parser 就不可能穷尽 YAML 的一切合法列表项写法):
++//   ① `- name: ...`(带 name);② `- uses: ...`/`- run: ...`(dash 后跟内容、同一行,
++//   无 name 的常规形态,GitHub Actions 里常见——只是本文件当前四个步骤都用①);
++//   ③ bare-dash(dash 单独占一行,内容写在下一行更深缩进处,同样合法 YAML)。
++// CX-1 第四层的根因:STEP_HEADER_RE 被同时用于两个不同目的——①按名字精确定位起点,
++// ②扫描下一个同级步骤判定边界。目的①只需要匹配"带 name 的那一种形态"就够,但目的②
++// 要求这个谓词能识别边界的合法形态,无名步骤与 bare-dash 都不带 name、被目的①的正则
++// 漏判成"不是边界",导致后继步骤的内容被错误并入前一个步骤的范围。同一个正则服务两个
++// 目的,其中任一目的的完备性要求都必须单独检查——不能假设"够用于定位"就"够用于判边界"。
++const STEP_ITEM_RE = /^(\s*)-(?:\s|$)/
++
++/**
++ * 按步骤名切出该步骤在 YAML 文本里的行范围(不含下一个同级或更外层步骤),并算出该步骤
++ * mapping 层键(`name:`/`if:`/`run:`/`env:` 等,与 `- name:` 的 `name` 同列)的缩进列数——
++ * `- ` 占 2 列,键就在 dash 缩进 +2 列起。调用方靠这个列数精确定位"步骤自己的 if:"而不是
++ * 被 `run: |` 块内容里恰好同名的文本行(CX-1 第三层)骗过:block scalar 的内容按 YAML
++ * 语法规则必须比 `run:` 键更深缩进,不可能落在这一列,所以按列精确匹配天然排除它。
++ *
++ * 起点用 STEP_HEADER_RE(按名字精确定位,不变);边界扫描用 STEP_ITEM_RE(接受本文件头
++ * "步骤边界判定"一节列出的三种已支持列表项形态,不要求带 name;不是穷尽 YAML 语义
++ * 判定,行级 best-effort)——两者服务不同目的,不能共用同一个"只认 name"的正则。
++ */
++function extractStep(lines, stepName) {
++  const startIdx = lines.findIndex((l) => {
++    const m = l.match(STEP_HEADER_RE)
++    return m && m[2].trim().replace(/^['"]|['"]$/g, '') === stepName
++  })
++  if (startIdx === -1) return null
++  const dashIndent = lines[startIdx].match(STEP_HEADER_RE)[1].length
++  let endIdx = lines.length
++  for (let i = startIdx + 1; i < lines.length; i++) {
++    const m = lines[i].match(STEP_ITEM_RE)
++    if (m && m[1].length <= dashIndent) {
++      endIdx = i
++      break
++    }
++  }
++  return { lines: lines.slice(startIdx, endIdx), keyIndent: dashIndent + 2 }
++}
++
++/** 过滤掉注释行(trim 后以 # 开头)——避免把"解释为什么不这么写"的说明段误判成真实配置。 */
++const stripComments = (lines) => lines.filter((l) => !l.trim().startsWith('#'))
++
++/**
++ * 检测「取值三元式 + 空字符串」形态:`${{ ... && '' || ... }}` / `&& "" || `。
++ * Actions 的 &&/|| 是取值运算符(同 JS),空串 falsy——`true && ''` 求出 `''` 又落到
++ * `|| B`,两条分支求出同一个值(#419 真实缺陷)。只在 `${{ }}` 表达式内部扫描,天然
++ * 跳过纯文字注释里提及该写法的说明段(注释不是 `${{ }}` 表达式,不会被本正则捕获)。
++ */
++export function findValueTernaryEmptyStringViolations(yamlText) {
++  const violations = []
++  const exprRe = /\$\{\{([\s\S]*?)\}\}/g
++  let m
++  while ((m = exprRe.exec(yamlText))) {
++    const expr = m[1]
++    if (/&&\s*(['"])\1\s*\|\|/.test(expr)) {
++      violations.push(`value-ternary-empty-string: \${{${expr}}}`)
++    }
++  }
++  return violations
++}
++
++const DISPATCH_GUARD = "github.event_name != 'pull_request'"
++const EVENT_PATH_WRITE_RE = /MERGE_THANKS_EVENT_PATH=\/tmp\/dispatch-event\.json"\s*>>\s*"\$\{?GITHUB_ENV\}?"/
++
++/**
++ * 廉价还原 YAML 双引号标量里的 `\xHH` / `\uHHHH` 转义(单引号标量不支持转义,不需处理)。
++ * 只处理这两种最常被用来拆散字面子串的转义形式——不是完整 YAML 解析器,只为让
++ * `MERGE_THANKS_EVENT_PATH` 键被编码成转义序列时,原始文本 `includes()` 依然看得见。
++ */
++const unescapeYamlDoubleQuoted = (line) =>
++  line
++    .replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
++    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
++
++/**
++ * merge-thanks.yml 专属契约:
++ *   1. 全文(去注释、去 YAML 双引号转义)含 MERGE_THANKS_EVENT_PATH 的行必须有且仅有一条,
++ *      且必须是写入 GITHUB_ENV 的那一行(`event-path-not-single-github-env-write`)——
++ *      不分 step/job/workflow 层级,任何位置多声明一处都算违规,一条规则覆盖三个注入位
++ *      (CA-8);
++ *   2. 那唯一一行还必须落在受 guard 的构造步骤本身内部,否则报
++ *      `event-path-moved-out-of-dispatch-step`——哪怕全文仍只有它一行、仍是写入形态,
++ *      搬到构造步骤之外就等于绕开了 guard(CA-9/SC13);
++ *   3. 构造步骤的 if: 必须是唯一一条且精确等于 DISPATCH_GUARD——它是让 Post 步骤回落到
++ *      真实 GITHUB_EVENT_PATH 的机制本身,删掉、反转或变成结构含糊(同列出现多条)都会
++ *      让原 bug 原地复活或判定不可信(CX-1);
++ *   4. 全文不得出现取值三元式+空串形态。
++ */
++export function checkMergeThanksWorkflowContract(yamlText) {
++  const violations = []
++  const lines = yamlText.split('\n')
++  const nonComment = stripComments(lines)
++
++  const dispatchStep = extractStep(lines, 'Build event payload for dry-run')
++  if (!dispatchStep) {
++    violations.push('missing-step: 找不到 "Build event payload for dry-run" 步骤')
++  } else {
++    // 断言"唯一",不用 first-match:同列出现两个 if:(重复键)时,find() 只看第一条,
++    // 值恰好没变就会放过——但那已经是结构含糊,不该被判定"guard 完好"。命中数 ≠ 1
++    // 或值 ≠ DISPATCH_GUARD,都归同一个 dispatch-step-guard-changed。
++    const ifPrefix = `${' '.repeat(dispatchStep.keyIndent)}if:`
++    const ifLines = stripComments(dispatchStep.lines).filter((l) => l.startsWith(ifPrefix))
++    const guard = ifLines.length === 1 ? ifLines[0].slice(ifPrefix.length).trim() : null
++    if (ifLines.length !== 1 || guard !== DISPATCH_GUARD) {
++      violations.push(
++        `dispatch-step-guard-changed: "Build event payload for dry-run" 步骤的 if: 必须是唯一一条且精确等于 ` +
++          `${DISPATCH_GUARD},实际命中 ${ifLines.length} 条,值为 ${JSON.stringify(guard)}`,
++      )
++    }
++  }
++
++  if (!extractStep(lines, 'Post merge thanks')) {
++    violations.push('missing-step: 找不到 "Post merge thanks" 步骤')
++  }
++
++  // CA-9/SC13:「全文恰好一行且该行是写入」曾经够用,是因为上一版检查天然带着「必须在
++  // 受 guard 的构造步骤范围内」这层位置约束(旧版在 dispatchStep 的行范围内单独找写入)。
++  // 收敛成单条全文规则时这层约束被丢了——把写入行原样搬到 Build 之前一个没有 if: 的新
++  // 步骤,全文仍只有一行、仍是写入形态,旧规则判定通过,但真实 pull_request 触发时这个
++  // 新步骤会无条件执行、把 GITHUB_ENV 设成一个从未被创建的文件路径,#390 原样复活。
++  // 因此拆成两段判断、给两个不同的违规 id——「不止一条/不是写入」与「搬出了构造步骤」
++  // 是两类不同的缺陷,共用一个 id 会让将来触发时读不出到底是哪一种。
++  const eventPathLines = nonComment.filter((l) => unescapeYamlDoubleQuoted(l).includes('MERGE_THANKS_EVENT_PATH'))
++  const isSingleLegitWrite = eventPathLines.length === 1 && EVENT_PATH_WRITE_RE.test(eventPathLines[0])
++  if (!isSingleLegitWrite) {
++    violations.push(
++      `event-path-not-single-github-env-write: 含 MERGE_THANKS_EVENT_PATH 的行必须有且仅有一条 GITHUB_ENV ` +
++        `写入行,实际命中 ${eventPathLines.length} 行`,
++    )
++  } else if (!dispatchStep || !stripComments(dispatchStep.lines).includes(eventPathLines[0])) {
++    violations.push(
++      `event-path-moved-out-of-dispatch-step: 唯一的 GITHUB_ENV 写入行没有落在受 guard 的 ` +
++        `"Build event payload for dry-run" 步骤内部——像是被搬到了别的步骤;真实 pull_request ` +
++        `触发时该步骤会无条件执行、把变量设成一个从未被创建的文件路径(#390 复活)`,
++    )
++  }
++
++  violations.push(...findValueTernaryEmptyStringViolations(yamlText))
++
++  return violations
++}
+diff --git a/scripts/loops/merge-thanks/workflow-contract.test.mjs b/scripts/loops/merge-thanks/workflow-contract.test.mjs
+new file mode 100644
+index 00000000..4d515846
+--- /dev/null
++++ b/scripts/loops/merge-thanks/workflow-contract.test.mjs
+@@ -0,0 +1,268 @@
++// workflow-contract.test.mjs — 把 #419 的真实缺陷形态钉死成负例 fixture
++//
++// 背景:①席审查证明 `resolveEventPath` 的 40 条脚本侧测试对本次真正的缺陷(YAML 里的
++// 取值三元式)零覆盖——把三元式贴回 `Post merge thanks` 步骤的 env,那 40 条测试依旧
++// 全绿。本文件补上 YAML 层的契约测试:正例用真实文件、负例用编码进测试的原缺陷片段,
++// 让"红"不再是做完就消失的手工验证。
++import { readdirSync, readFileSync } from 'node:fs'
++import { dirname, join } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import { describe, expect, it } from 'vitest'
++
++import { checkMergeThanksWorkflowContract, findValueTernaryEmptyStringViolations } from './workflow-contract.mjs'
++
++const HERE = dirname(fileURLToPath(import.meta.url))
++const REPO_ROOT = join(HERE, '..', '..', '..')
++const WORKFLOWS_DIR = join(REPO_ROOT, '.github', 'workflows')
++const MERGE_THANKS_YML = join(WORKFLOWS_DIR, 'merge-thanks.yml')
++
++// 原缺陷逐字复现(2026-08-01,#390 自己合并那次因此报 ENOENT、致谢没发出去,
++// run 30715524176)。缩进与引号与 pre-fix 版本一致,贴回真实 workflow 的
++// `Post merge thanks` 步骤 env 块内即可复现「40 条脚本侧测试全绿但 YAML 仍是坏的」。
++const PRE_FIX_TERNARY_LINE =
++  "          MERGE_THANKS_EVENT_PATH: ${{ github.event_name == 'pull_request' && '' || '/tmp/dispatch-event.json' }}"
++
++// 干净基线:Build 步骤 guard 精确、写了 GITHUB_ENV,Post 步骤不声明该 env 键,任何层级都无
++// MERGE_THANKS_EVENT_PATH 声明,无三元式。下面每条 MUTATION 都从这份基线单点破坏一处。
++const GOOD_YAML = `
++name: Merge Thanks Fixture
++
++on:
++  pull_request:
++    types: [closed]
++
++jobs:
++  thanks:
++    runs-on: ubuntu-latest
++    steps:
++      - name: Build event payload for dry-run
++        if: github.event_name != 'pull_request'
++        run: |
++          echo "MERGE_THANKS_EVENT_PATH=/tmp/dispatch-event.json" >> "\${GITHUB_ENV}"
++
++      - name: Post merge thanks
++        run: |
++          node scripts/loops/merge-thanks/from-github-event.mjs
++`
++
++// R2 三席复核点名的 7 种机制层绕过(CX-1/SC9、CA-8/SC10),每种都必须被抓出来——检查器
++// 之前只守住了症状(Post 步骤的 env 键、三元式形态),没守住机制(guard 本身、其他层级)。
++const MUTATIONS = [
++  [
++    '贴回取值三元式(job 级 env)',
++    (y) => y.replace('runs-on: ubuntu-latest', `runs-on: ubuntu-latest\n    env:\n${PRE_FIX_TERNARY_LINE}`),
++    'value-ternary-empty-string',
++  ],
++  [
++    'Post 步骤声明该 env 键',
++    (y) =>
++      y.replace(
++        '- name: Post merge thanks\n        run: |',
++        '- name: Post merge thanks\n        env:\n          MERGE_THANKS_EVENT_PATH: /tmp/dispatch-event.json\n        run: |',
++      ),
++    'event-path-not-single-github-env-write',
++  ],
++  ['删掉 Build 步骤的 if: guard', (y) => y.replace(/\n\s*if: github\.event_name != 'pull_request'/, ''), 'dispatch-step-guard-changed'],
++  ['反转 if: guard(!= → ==)', (y) => y.replace('!=', '=='), 'dispatch-step-guard-changed'],
++  [
++    'job 级 env 声明该键',
++    (y) => y.replace('runs-on: ubuntu-latest', 'runs-on: ubuntu-latest\n    env:\n      MERGE_THANKS_EVENT_PATH: /tmp/dispatch-event.json'),
++    'event-path-not-single-github-env-write',
++  ],
++  [
++    'workflow 顶层 env 声明该键',
++    (y) => y.replace('jobs:', 'env:\n  MERGE_THANKS_EVENT_PATH: /tmp/dispatch-event.json\njobs:'),
++    'event-path-not-single-github-env-write',
++  ],
++  [
++    'Build 步骤缺 GITHUB_ENV 写入',
++    (y) => y.replace('echo "MERGE_THANKS_EVENT_PATH=/tmp/dispatch-event.json" >> "${GITHUB_ENV}"', 'echo "no-op"'),
++    'event-path-not-single-github-env-write',
++  ],
++  [
++    // SC11/CX-1 第三层:删掉步骤级 if:,把同一串文本以更深缩进塞进 run: | 块内(不带注释)
++    // ——它只是 shell 文本,不是真正的 guard,必须仍被判定为"guard 缺失"。
++    '删掉步骤级 if:,同串文本塞进 run: | 块内(伪 guard)',
++    (y) =>
++      y
++        .replace(/\n\s*if: github\.event_name != 'pull_request'/, '')
++        .replace('run: |\n          echo', "run: |\n          if: github.event_name != 'pull_request'\n          echo"),
++    'dispatch-step-guard-changed',
++  ],
++  [
++    // SC11 补充(a):YAML 双引号标量会处理转义,单引号不会——`\x4D` 解出来就是 'M'。
++    // 把键名的一个字符编码成转义序列,原始文本 includes() 字面匹配看不见,但 YAML 解出
++    // 的键名就是 MERGE_THANKS_EVENT_PATH 本身。job 级 env 里塞一条这种键必须仍被抓到。
++    '双引号转义键(\\x4D 还原成 M)绕过字面匹配',
++    (y) =>
++      y.replace(
++        'runs-on: ubuntu-latest',
++        'runs-on: ubuntu-latest\n    env:\n      "\\x4DERGE_THANKS_EVENT_PATH": /tmp/dispatch-event.json',
++      ),
++    'event-path-not-single-github-env-write',
++  ],
++  [
++    // CA-9/SC13:全文仍只有一行、仍是写入形态,但把它搬出受 guard 的 Build 步骤、放进一个
++    // 自身没有 if: 的新步骤——真实 pull_request 触发时这个新步骤照样跑,把 GITHUB_ENV
++    // 设成一个从未被创建的文件路径,#390 原样复活。必须仍被判定为违规("位置"不对)。
++    '把 GITHUB_ENV 写入行搬到 Build 步骤之前的新步骤(该新步骤自身无 if: guard)',
++    (y) =>
++      y
++        .replace(
++          'run: |\n          echo "MERGE_THANKS_EVENT_PATH=/tmp/dispatch-event.json" >> "${GITHUB_ENV}"\n',
++          'run: |\n          echo "no-op"\n',
++        )
++        .replace(
++          '- name: Build event payload for dry-run',
++          '- name: Leak event path (no guard)\n        run: |\n          echo "MERGE_THANKS_EVENT_PATH=/tmp/dispatch-event.json" >> "${GITHUB_ENV}"\n\n      - name: Build event payload for dry-run',
++        ),
++    'event-path-moved-out-of-dispatch-step',
++  ],
++  [
++    // ②席收口条件:guard 判定必须断言"唯一",不能 first-match。同列出现两个 if:(重复键,
++    // 真实 GitHub Actions 会拒收这份 YAML,但检查器仍要按结构含糊处理,不能因为第一条
++    // 命中值没变就放过)→ 必须仍报 dispatch-step-guard-changed。
++    'Build 步骤 mapping 层出现两条 if:(重复键,guard 判定要求唯一而非 first-match)',
++    (y) =>
++      y.replace(
++        "if: github.event_name != 'pull_request'",
++        "if: github.event_name != 'pull_request'\n        if: github.event_name != 'pull_request'",
++      ),
++    'dispatch-step-guard-changed',
++  ],
++  [
++    // SC16(CX-1 第四层)(a):无名 `- uses:`/`- run:` 步骤是 GitHub Actions 常规写法
++    // (本文件当前四个步骤都带 name,但这不代表以后加的步骤也会带),旧边界扫描只认
++    // `- name:`,会把这类步骤的内容错误并入前一个步骤的范围。删掉 Build 自身 if:,把它
++    // 放进 Build 之后一个无 name 的 - uses: 步骤——若边界扫描漏判,这个"别人家的 if:"
++    // 会被当成 Build 自己的 guard。
++    '删掉 Build 自身 if:,放进 Build 之后一个无 name 的 - uses: 步骤(边界扫描漏判)',
++    (y) =>
++      y
++        .replace(/\n\s*if: github\.event_name != 'pull_request'/, '')
++        .replace(
++          '\n\n      - name: Post merge thanks',
++          "\n\n      - uses: actions/checkout@v4\n        if: github.event_name != 'pull_request'\n\n      - name: Post merge thanks",
++        ),
++    'dispatch-step-guard-changed',
++  ],
++  [
++    // SC16(CX-1 第四层)(b):同一根因,咬中位置约束那条规则而不是 guard 那条。Build 自身
++    // if: 保留不动,只把写入行换成 no-op(真删除),放进 Build 之后一个无 name 的
++    // - run: 步骤——全文含该键的行仍恰好一条(测的是"搬移"不是"多声明"),若边界扫描
++    // 漏判,这行会被误算作"在 Build 范围内"。
++    '把 GITHUB_ENV 写入行放进 Build 之后一个无 name 的 - run: 步骤(边界扫描漏判)',
++    (y) =>
++      y
++        .replace(
++          'run: |\n          echo "MERGE_THANKS_EVENT_PATH=/tmp/dispatch-event.json" >> "${GITHUB_ENV}"\n',
++          'run: |\n          echo "no-op"\n',
++        )
++        .replace(
++          '\n      - name: Post merge thanks',
++          '\n      - run: |\n          echo "MERGE_THANKS_EVENT_PATH=/tmp/dispatch-event.json" >> "${GITHUB_ENV}"\n\n      - name: Post merge thanks',
++        ),
++    'event-path-moved-out-of-dispatch-step',
++  ],
++  [
++    // SC17(CX-1 第四层,第三种表现):YAML 允许序列指示符 `-` 单独占一行,内容写在下一行
++    // 更深缩进处——同样合法 YAML(actionlint、真实 YAML 解析器都接受),但 dash 后没有
++    // 空白字符,`/^(\s*)-\s/` 匹配不上行尾的 dash。删掉 Build 自身 if:,把它放进 Build
++    // 之后一个 bare-dash 形态的后继步骤——若边界扫描漏判,这个"别人家的 if:"会被当成
++    // Build 自己的 guard。
++    '删掉 Build 自身 if:,放进 Build 之后一个 bare-dash 形态的后继步骤(边界扫描漏判)',
++    (y) =>
++      y
++        .replace(/\n\s*if: github\.event_name != 'pull_request'/, '')
++        .replace(
++          '\n\n      - name: Post merge thanks',
++          "\n\n      -\n        uses: actions/checkout@v4\n        if: github.event_name != 'pull_request'\n\n      - name: Post merge thanks",
++        ),
++    'dispatch-step-guard-changed',
++  ],
++  [
++    // SC17(CX-1 第四层,第三种表现,位置约束一侧):同一根因,咬中位置约束那条规则。
++    // Build 自身 if: 保留不动,只把写入行换成 no-op(真删除),放进 Build 之后一个
++    // bare-dash 形态的后继步骤——全文含该键的行仍恰好一条(测的是"搬移"不是"多声明")。
++    '把 GITHUB_ENV 写入行放进 Build 之后一个 bare-dash 形态的后继步骤(边界扫描漏判)',
++    (y) =>
++      y
++        .replace(
++          'run: |\n          echo "MERGE_THANKS_EVENT_PATH=/tmp/dispatch-event.json" >> "${GITHUB_ENV}"\n',
++          'run: |\n          echo "no-op"\n',
++        )
++        .replace(
++          '\n      - name: Post merge thanks',
++          '\n      -\n        run: |\n          echo "MERGE_THANKS_EVENT_PATH=/tmp/dispatch-event.json" >> "${GITHUB_ENV}"\n\n      - name: Post merge thanks',
++        ),
++    'event-path-moved-out-of-dispatch-step',
++  ],
++]
++
++describe('checkMergeThanksWorkflowContract — 正例:真实 merge-thanks.yml 零违规', () => {
++  it('真实文件不触发任何契约违规(包括注释里逐字引用三元式的那段说明,不应被误判)', () => {
++    const yamlText = readFileSync(MERGE_THANKS_YML, 'utf8')
++    expect(checkMergeThanksWorkflowContract(yamlText)).toEqual([])
++  })
++
++  it('真实文件的注释确实逐字包含原缺陷三元式文本(否则上面的"零违规"毫无意义)', () => {
++    const yamlText = readFileSync(MERGE_THANKS_YML, 'utf8')
++    expect(yamlText).toContain("&& '' ||")
++  })
++})
++
++describe('checkMergeThanksWorkflowContract — 负例:15 种机制层绕过必须逐一被抓出(SC9/CX-1、SC10/CA-8、SC11/CX-1、SC13/CA-9、SC16/CX-1、SC17/CX-1)', () => {
++  it('GOOD_YAML 基线本身零违规(否则下面的红没有意义)', () => {
++    expect(checkMergeThanksWorkflowContract(GOOD_YAML)).toEqual([])
++  })
++
++  it.each(MUTATIONS)('%s → 命中对应违规', (_label, mutate, expectedPrefix) => {
++    const violations = checkMergeThanksWorkflowContract(mutate(GOOD_YAML))
++    expect(violations.some((v) => v.startsWith(expectedPrefix))).toBe(true)
++  })
++
++  it('缺 "Post merge thanks" / "Build event payload for dry-run" 步骤 → 各自报 missing-step', () => {
++    const violations = checkMergeThanksWorkflowContract('jobs:\n  thanks:\n    steps: []\n')
++    expect(violations).toContain('missing-step: 找不到 "Build event payload for dry-run" 步骤')
++    expect(violations).toContain('missing-step: 找不到 "Post merge thanks" 步骤')
++  })
++})
++
++describe('findValueTernaryEmptyStringViolations — 只扫 ${{ }} 表达式内部,不误伤纯文字注释', () => {
++  it('注释里逐字提及三元式写法,但不在 ${{ }} 内 → 不算违规', () => {
++    const yamlText = [
++      '# 为什么不能用「&& \'\' ||」这种三元式:Actions 的 &&/|| 是取值运算符,空串 falsy。',
++      'env:',
++      '  X: ${{ github.event_name }}',
++    ].join('\n')
++    expect(findValueTernaryEmptyStringViolations(yamlText)).toEqual([])
++  })
++
++  it('真的写在 ${{ }} 表达式里 → 命中', () => {
++    const yamlText = "X: ${{ a == 'b' && '' || 'c' }}"
++    expect(findValueTernaryEmptyStringViolations(yamlText)).toHaveLength(1)
++  })
++
++  it('双引号变体 `&& "" ||` 同样命中', () => {
++    const yamlText = 'X: ${{ a == "b" && "" || "c" }}'
++    expect(findValueTernaryEmptyStringViolations(yamlText)).toHaveLength(1)
++  })
++
++  it('非空串的取值三元式(正常用法)不命中', () => {
++    const yamlText = "X: ${{ a == 'b' && 'yes' || 'no' }}"
++    expect(findValueTernaryEmptyStringViolations(yamlText)).toEqual([])
++  })
++})
++
++describe('findValueTernaryEmptyStringViolations — 扫全 .github/workflows/ 目录', () => {
++  const files = readdirSync(WORKFLOWS_DIR).filter((f) => /\.ya?ml$/.test(f))
++
++  it('目录里确实有多个 workflow 文件可扫(防止目录路径写错导致测试空转通过)', () => {
++    expect(files.length).toBeGreaterThan(1)
++  })
++
++  it.each(files)('%s 不含取值三元式+空串形态', (file) => {
++    const yamlText = readFileSync(join(WORKFLOWS_DIR, file), 'utf8')
++    expect(findValueTernaryEmptyStringViolations(yamlText)).toEqual([])
++  })
++})

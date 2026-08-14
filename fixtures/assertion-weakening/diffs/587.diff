@@ -1,0 +1,338 @@
+diff --git a/src/store/canvasPersistWriteScheduler.test.ts b/src/store/canvasPersistWriteScheduler.test.ts
+index 3689a79f..a9ccc86e 100644
+--- a/src/store/canvasPersistWriteScheduler.test.ts
++++ b/src/store/canvasPersistWriteScheduler.test.ts
+@@ -17,6 +17,7 @@ const { setPersistUserId, __resetPersistUserId, namespacedKey } = await import('
+ const {
+   createDebouncedCompactPersistStorage,
+   CANVAS_PERSIST_DEBOUNCE_MS,
++  CANVAS_PERSIST_MAX_WAIT_MS,
+   discardPersistWritesForLogout,
+   flushPersistBarrierForUserSwitch,
+   __clearDebouncedPersistInstancesForTests,
+@@ -69,7 +70,10 @@ const makeBackend = () => {
+   return backend
+ }
+ 
+-const makeStorage = (backend: ReturnType<typeof makeBackend>, extra?: { skipLifecycleListeners?: boolean; barrierTimeoutMs?: number }) =>
++const makeStorage = (
++  backend: ReturnType<typeof makeBackend>,
++  extra?: { skipLifecycleListeners?: boolean; barrierTimeoutMs?: number; maxWaitMs?: number },
++) =>
+   createDebouncedCompactPersistStorage<Slice>({
+     resolveTarget: backend.resolveTarget,
+     readCurrent: backend.readCurrent,
+@@ -124,6 +128,151 @@ describe('createDebouncedCompactPersistStorage — #505 写防抖(冻结物理
+     expect((JSON.parse(written) as { state: Slice }).state.activeTool).toBe('tool-59') // 落的是最后一帧
+   })
+ 
++  it('maxWait 独立 deadline(SC-15 双审 finding 1 控制组):高频流停更后,maxWait 到期即写最新值,不等下一次 set 也不等 trailing', async () => {
++    // 原实现 maxWait 只在「下一次 setItem 到达时」检查 now - enqueuedAt,没有独立
++    // deadline timer——高频流在阈值前停更时,最新值要等到 trailing(最后 set +800ms)
++    // 才落盘,超过 maxWait 承诺的时间上界。本测试构造该反例:t=0..250 高频后停更,
++    // 推进到 t=300(maxWait)必须已经写;trailing(t=250+800=1050)此时尚未到。
++    const backend = makeBackend()
++    const storage = createDebouncedCompactPersistStorage<Slice>({
++      resolveTarget: backend.resolveTarget,
++      readCurrent: backend.readCurrent,
++      compactAtFlush: (s) => s,
++      skipLifecycleListeners: true,
++      maxWaitMs: 300,
++    })
++
++    // 持续高频 set(模拟任务 progress poll 每 50ms 一次)后**停更**
++    for (let tick = 0; tick < 6; tick += 1) {
++      storage.setItem(NAME, storageValue(`tick-${tick}`))
++      vi.advanceTimersByTime(50)
++    }
++    // t=300:独立 maxWait timer(首次入队 t=0 + 300ms)已触发——写最新值 tick-5;
++    // trailing timer(最后 set t=250 + 800ms = t=1050)尚未到
++    expect(backend.writeCalls).toHaveLength(1)
++    const [, written] = backend.writeCalls[0]
++    expect((JSON.parse(written) as { state: Slice }).state.activeTool).toBe('tick-5')
++    expect(debugLogger.log).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('maxwait'))
++
++    // 继续无事件推进到 trailing 之后:无第二次写(pending 已被 maxWait 删除)
++    vi.advanceTimersByTime(CANVAS_PERSIST_DEBOUNCE_MS)
++    expect(backend.writeCalls).toHaveLength(1)
++  })
++
++  it('maxWait 起点不随高频 set 刷新:deadline 自首次入队起算,高频续期 trailing 不续期 maxWait', async () => {
++    // 隔离「每次 set 重建 maxWait timer/刷新起点」变异:若刷新,最后 set(t=500)
++    // 重建的 max timer 要到 t=1500 才触发;本测试在 t=1000(首次入队 deadline,
++    // trailing t=1300 未到)断言已写——刷新变异在此处 0 写,恰好红目标断言。
++    const backend = makeBackend()
++    const storage = createDebouncedCompactPersistStorage<Slice>({
++      resolveTarget: backend.resolveTarget,
++      readCurrent: backend.readCurrent,
++      compactAtFlush: (s) => s,
++      skipLifecycleListeners: true,
++      maxWaitMs: 1000,
++    })
++
++    // 高频 6 次 × 100ms(t=0..500 各 set 一次),t=600 停手
++    for (let tick = 0; tick < 6; tick += 1) {
++      storage.setItem(NAME, storageValue(`tick-${tick}`))
++      vi.advanceTimersByTime(100)
++    }
++    expect(backend.writeCalls).toHaveLength(0) // maxWait(1000)与 trailing(1300)均未到
++
++    // 推进到首次入队的 maxWait deadline:t=1000 必须已写,trailing 尚未到(1300)
++    vi.advanceTimersByTime(400)
++    expect(backend.writeCalls).toHaveLength(1)
++    const [, written] = backend.writeCalls[0]
++    expect((JSON.parse(written) as { state: Slice }).state.activeTool).toBe('tick-5') // 最新值
++
++    // 推进到 trailing 之后:无第二次写(deadline 已消费 pending,trailing 被清)
++    vi.advanceTimersByTime(CANVAS_PERSIST_DEBOUNCE_MS)
++    expect(backend.writeCalls).toHaveLength(1)
++  })
++
++  it('maxWait 多周期(永远 running 任务):每周期独立 deadline,连续周期写值递进非重复', async () => {
++    // maxWait timer 触发后 delete pending + startWrite;下一次 setItem 创建新 job、
++    // 排新 max timer → 天然多周期。回归锁:若触发后错误地保留旧 pending(第二周期
++    // 永不触发 maxWait,写停 1 次)或每次 set 刷新起点(第一周期 deadline 推迟、
++    // t=300 不写),本测试都红。
++    const backend = makeBackend()
++    const storage = createDebouncedCompactPersistStorage<Slice>({
++      resolveTarget: backend.resolveTarget,
++      readCurrent: backend.readCurrent,
++      compactAtFlush: (s) => s,
++      skipLifecycleListeners: true,
++      maxWaitMs: 300,
++    })
++
++    // 第一周期:t=0..250 高频,t=300 独立 deadline 落一次 cycle1-5
++    for (let tick = 0; tick < 6; tick += 1) {
++      storage.setItem(NAME, storageValue(`cycle1-${tick}`))
++      vi.advanceTimersByTime(50)
++    }
++    expect(backend.writeCalls).toHaveLength(1)
++    expect((JSON.parse(backend.writeCalls[0][1]) as { state: Slice }).state.activeTool).toBe('cycle1-5')
++
++    // 第二周期:继续高频(t=300..550),新 max timer 自 t=300 起算 → t=600 再落一次
++    for (let tick = 0; tick < 6; tick += 1) {
++      storage.setItem(NAME, storageValue(`cycle2-${tick}`))
++      vi.advanceTimersByTime(50)
++    }
++    expect(backend.writeCalls).toHaveLength(2) // 必须再落一次,不能停在第一周期
++    const [, written2] = backend.writeCalls[1]
++    expect((JSON.parse(written2) as { state: Slice }).state.activeTool).toBe('cycle2-5') // 更晚的最新值
++    expect(backend.writeCalls[0][1]).not.toBe(backend.writeCalls[1][1]) // 两次写非同一快照
++    expect(debugLogger.log).toHaveBeenCalledTimes(2) // 两次 maxwait 均留痕
++    expect(debugLogger.log).toHaveBeenCalledWith('Persist Debounce', expect.stringContaining('maxwait'))
++  })
++
++  it('terminal paths 清 maxWait timer:flush/remove/reset 各清双 timer(spy 锁 id),advance 超期零幽灵写', async () => {
++    // 双审 finding 1 要求 max timer 在所有 terminal path 一并取消,防旧周期 callback
++    // 在错误时间冲刷新周期。spy 锁「清掉了 maxWaitTimer 的 id」;行为断言锁
++    // 「flush/remove/reset 后 advance 超 maxWait 无幽灵写」(对「取消 CAS 后泄漏
++    // timer 乱写」变异红)。
++    const clearSpy = vi.spyOn(global, 'clearTimeout')
++    const setSpy = vi.spyOn(global, 'setTimeout')
++
++    // — flush —
++    const backend1 = makeBackend()
++    const storage1 = makeStorage(backend1, { skipLifecycleListeners: true, maxWaitMs: 300 })
++    storage1.setItem(NAME, storageValue('flush'))
++    const flushTimers = setSpy.mock.results.map((r) => r.value)
++    setSpy.mockClear()
++    clearSpy.mockClear()
++    await storage1.flushAndSettle('drain')
++    expect(clearSpy.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining([flushTimers[0], flushTimers[1]]))
++
++    // — remove —
++    clearSpy.mockClear()
++    const backend2 = makeBackend()
++    const storage2 = makeStorage(backend2, { skipLifecycleListeners: true, maxWaitMs: 300 })
++    storage2.setItem(NAME, storageValue('remove'))
++    const removeTimers = setSpy.mock.results.slice(-2).map((r) => r.value)
++    clearSpy.mockClear()
++    await storage2.removeItem(NAME)
++    expect(clearSpy.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining([removeTimers[0], removeTimers[1]]))
++
++    // — reset —
++    clearSpy.mockClear()
++    const backend3 = makeBackend()
++    const storage3 = makeStorage(backend3, { skipLifecycleListeners: true, maxWaitMs: 300 })
++    storage3.setItem(NAME, storageValue('reset'))
++    const resetTimers = setSpy.mock.results.slice(-2).map((r) => r.value)
++    clearSpy.mockClear()
++    storage3.__resetForTests()
++    expect(clearSpy.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining([resetTimers[0], resetTimers[1]]))
++
++    clearSpy.mockRestore()
++    setSpy.mockRestore()
++
++    // 三路径后 advance 超 maxWait:零幽灵写(只剩 flush 的 1 次正常写)
++    vi.advanceTimersByTime(4000)
++    expect(backend1.writeCalls).toHaveLength(1)
++    expect(backend2.writeCalls).toHaveLength(0)
++    expect(backend3.writeCalls).toHaveLength(0)
++  })
++
+   it('envelope 与被替换的 createJSONStorage 逐字节等价({ state, version } 键序/无空白)', async () => {
+     const backend = makeBackend()
+     const storage = makeStorage(backend, { skipLifecycleListeners: true })
+@@ -378,6 +527,9 @@ describe('createDebouncedCompactPersistStorage — #505 写防抖(冻结物理
+     window.dispatchEvent(new Event('pagehide'))
+     await storage.flushAndSettle('drain')
+     expect(backend.writeCalls).toHaveLength(1) // 只有那次在途慢写,pending 未复活
++    // logout 也清 maxWait timer:推进超默认 maxWait(4s)+ debounce,无幽灵写
++    vi.advanceTimersByTime(CANVAS_PERSIST_MAX_WAIT_MS + CANVAS_PERSIST_DEBOUNCE_MS)
++    expect(backend.writeCalls).toHaveLength(1)
+   })
+ 
+   it('logout 吸收态:返回后任何 setItem/removeItem(后台任务迟到)都被丢弃 + error', async () => {
+diff --git a/src/store/canvasPersistWriteScheduler.ts b/src/store/canvasPersistWriteScheduler.ts
+index 45c2f747..5d536375 100644
+--- a/src/store/canvasPersistWriteScheduler.ts
++++ b/src/store/canvasPersistWriteScheduler.ts
+@@ -37,6 +37,7 @@ import { debugLogger } from './debugLogStore'
+ const SOURCE = 'Persist Debounce'
+ 
+ export const CANVAS_PERSIST_DEBOUNCE_MS = 800
++export const CANVAS_PERSIST_MAX_WAIT_MS = 4000
+ export const PERSIST_BARRIER_TIMEOUT_MS = 5000
+ 
+ /** remove 的 tombstone:快照层记「最新真相是删除」,getItem 返回 null。 */
+@@ -121,6 +122,8 @@ export const createDebouncedCompactPersistStorage = <S>(options: {
+   /** flush 时对暂存 state 做的压缩(compactCanvasesForPersist 等);输出进 JSON.stringify。 */
+   compactAtFlush: (state: S) => S
+   debounceMs?: number
++  /** maxWait 有界等待(默认 4s;见 setItem 内说明)。测试注入短值以真实计时器验证。 */
++  maxWaitMs?: number
+   /** 屏障超时(默认 5s);测试注入短超时以真实计时器验证超时路径。 */
+   barrierTimeoutMs?: number
+   /** 测试注入:跳过 window/document 生命周期监听注册。 */
+@@ -131,11 +134,21 @@ export const createDebouncedCompactPersistStorage = <S>(options: {
+     readCurrent,
+     compactAtFlush,
+     debounceMs = CANVAS_PERSIST_DEBOUNCE_MS,
++    maxWaitMs = CANVAS_PERSIST_MAX_WAIT_MS,
+     barrierTimeoutMs = PERSIST_BARRIER_TIMEOUT_MS,
+   } = options
+ 
+   // pending / 快照 / epoch 全部按冻结物理键索引(代际顺序是物理键的属性)。
+-  type PendingJob = { target: FrozenPersistTarget; value: StorageValue<S>; timer: ReturnType<typeof setTimeout> }
++  type PendingJob = {
++    target: FrozenPersistTarget
++    value: StorageValue<S>
++    /** trailing debounce timer:每次 setItem 重置。首次入队先建 job 再赋 timer,
++     *  因此声明为 optional。 */
++    timer: ReturnType<typeof setTimeout> | undefined
++    /** 独立 maxWait deadline timer:首次入队创建,后续 set **不**重置——maxWait
++     *  是自首次入队起的真实时间上界,不是事件驱动的「下一次 set 时检查」。 */
++    maxWaitTimer: ReturnType<typeof setTimeout> | undefined
++  }
+   const pendingByKey = new Map<string, PendingJob>()
+   // read-your-writes:per-键「最新已接受快照」——setItem 接受即更新,写启动后仍
+   // 保留(含 in-flight 那份),getItem 直读它,永不等在途写。remove 落 tombstone。
+@@ -208,11 +221,40 @@ export const createDebouncedCompactPersistStorage = <S>(options: {
+     return track(target, write, true)
+   }
+ 
++  /** 清掉 job 的全部 timer(trailing + maxWait)。所有 terminal path(防抖到期、
++   *  maxWait 到期、flush、remove、logout discard、reset)都必须走它,否则旧周期
++   *  timer 泄漏——即便 CAS 能挡住幽灵写,泄漏的 timer 也会在错误的时间点空跑。 */
++  const clearJobTimers = (job: PendingJob): void => {
++    if (job.timer !== undefined) clearTimeout(job.timer)
++    if (job.maxWaitTimer !== undefined) clearTimeout(job.maxWaitTimer)
++  }
++
++  /** trailing debounce 到期:先 CAS 确认自己仍是当前 pending(防旧 job 对象在
++   *  已被 remove/flush 换代后冲掉新周期),再清 max timer、删除、写**最新**值。
++   *  job 是原地更新的稳定引用,触发时读到的 target/value 必然是最新 set 的。 */
++  const fireTrailing = (job: PendingJob, key: string): void => {
++    if (pendingByKey.get(key) !== job) return
++    clearJobTimers(job)
++    pendingByKey.delete(key)
++    void startWrite(job.target, job.value, 'debounce')
++  }
++
++  /** maxWait 独立 deadline 到期:与 fireTrailing 同构的 CAS + 清双 timer + 删除
++   *  + 写最新值。这个 callback 的存在本身 = maxWait 是**真实时间上界**:持续高频
++   *  流下 trailing 被无限重置,但本 timer 自首次入队起计时,到点必然触发。 */
++  const fireMaxWait = (job: PendingJob, key: string): void => {
++    if (pendingByKey.get(key) !== job) return
++    clearJobTimers(job)
++    pendingByKey.delete(key)
++    debugLogger.log(SOURCE, `flush on maxwait(高频写流有界兜底,自首次入队 ${maxWaitMs}ms):${key}`)
++    void startWrite(job.target, job.value, 'maxwait')
++  }
++
+   /** 冲刷全部暂存写(立即启动,返回这批写的落定 Promise)。 */
+   const flushAllPending = (reason: string): Promise<void> => {
+     const started: Promise<void>[] = []
+     for (const [key, job] of pendingByKey) {
+-      clearTimeout(job.timer)
++      clearJobTimers(job)
+       pendingByKey.delete(key)
+       started.push(startWrite(job.target, job.value, reason))
+     }
+@@ -274,13 +316,31 @@ export const createDebouncedCompactPersistStorage = <S>(options: {
+       const target = resolveTarget(name)
+       latestByKey.set(target.key, value)
+       const existing = pendingByKey.get(target.key)
+-      if (existing) clearTimeout(existing.timer)
+-      const timer = setTimeout(() => {
+-        const job = pendingByKey.get(target.key)
+-        pendingByKey.delete(target.key)
+-        if (job) void startWrite(job.target, job.value, 'debounce')
+-      }, debounceMs)
+-      pendingByKey.set(target.key, { target, value, timer })
++      if (existing) {
++        // 后续 set:**原地更新**同一 job 对象(保持稳定引用——fireTrailing/
++        // fireMaxWait 的 CAS 用对象身份判断「我仍是当前 pending」,重建对象会让
++        // 旧 callback 永远 CAS 失败、新对象又失去绑定)+ 只重置 trailing timer;
++        // maxWait deadline timer **不重置**——有界等待自首次入队起算,这正是
++        // SC-15 双审 finding 1/2 锁住的契约(高频续期 trailing 不能续期 maxWait)。
++        if (existing.timer !== undefined) clearTimeout(existing.timer)
++        existing.target = target
++        existing.value = value
++        existing.timer = setTimeout(() => fireTrailing(existing, target.key), debounceMs)
++        return
++      }
++      // 首次入队:排双 timer——trailing(每次 set 重置)+ maxWait(独立 deadline,
++      // 到点必然触发写,不受高频续期影响)。静止流(用户停手)照旧 trailing 到期写;
++      // 持续高频流(maxWait 先到)由独立 timer 保证最坏每 maxWaitMs 落盘一次
++      // 最新快照——mask-hydration SC-15 根因的契约修复。
++      const job: PendingJob = {
++        target,
++        value,
++        timer: undefined,
++        maxWaitTimer: undefined,
++      }
++      job.timer = setTimeout(() => fireTrailing(job, target.key), debounceMs)
++      job.maxWaitTimer = setTimeout(() => fireMaxWait(job, target.key), maxWaitMs)
++      pendingByKey.set(target.key, job)
+     },
+     removeItem: async (name) => {
+       if (loggedOut) {
+@@ -292,7 +352,7 @@ export const createDebouncedCompactPersistStorage = <S>(options: {
+       const target = resolveTarget(name)
+       const existing = pendingByKey.get(target.key)
+       if (existing) {
+-        clearTimeout(existing.timer)
++        clearJobTimers(existing)
+         pendingByKey.delete(target.key)
+       }
+       latestByKey.set(target.key, REMOVED)
+@@ -315,7 +375,7 @@ export const createDebouncedCompactPersistStorage = <S>(options: {
+       // 同步丢弃全部暂存 + 快照,置吸收态——先于一切 await,discard 之后不存在
+       // 还能进入正常写通道的 job。
+       loggedOut = true
+-      for (const job of pendingByKey.values()) clearTimeout(job.timer)
++      for (const job of pendingByKey.values()) clearJobTimers(job)
+       pendingByKey.clear()
+       latestByKey.clear()
+       // 有界等在途;屏障(含超时)完成后 arm 迟到写补删——无论当下有没有在途写
+@@ -329,7 +389,7 @@ export const createDebouncedCompactPersistStorage = <S>(options: {
+       return outcome
+     },
+     __resetForTests: () => {
+-      for (const job of pendingByKey.values()) clearTimeout(job.timer)
++      for (const job of pendingByKey.values()) clearJobTimers(job)
+       pendingByKey.clear()
+       latestByKey.clear()
+     },

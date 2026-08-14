@@ -1,0 +1,162 @@
+diff --git a/src/store/aiCanvasWorkflow.test.ts b/src/store/aiCanvasWorkflow.test.ts
+index 8c8b2dd1..bd812082 100644
+--- a/src/store/aiCanvasWorkflow.test.ts
++++ b/src/store/aiCanvasWorkflow.test.ts
+@@ -5,8 +5,15 @@ vi.mock('./remoteDebugReporter', () => ({
+ }))
+ 
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
++import { importedImageDisplaySize } from '../lib/imageSizing'
+ import { useDebugLogStore } from './debugLogStore'
+-import { buildAiContextSnapshot, equalAreaSizeForDimensions, reflowRightObstacles } from './aiCanvasWorkflow'
++import {
++  buildAiContextSnapshot,
++  centeredColumnPlacements,
++  equalAreaSizeForDimensions,
++  heightLockedSizeForDimensions,
++  reflowRightObstacles,
++} from './aiCanvasWorkflow'
+ 
+ const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
+   id: 'img-1',
+@@ -118,3 +125,80 @@ describe('buildAiContextSnapshot — importBatchId 投影带出', () => {
+     expect(snapshot.nodes[0].importBatchId).toBeUndefined()
+   })
+ })
++
++describe('centeredColumnPlacements (编辑占位列几何)', () => {
++  const anchor = { x: 100, y: 50, width: 200, height: 100 }
++
++  it('centeredColumnPlacements_exact_count — 返回恰好 count 个矩形,widths 缺省 anchor.width', () => {
++    const placements = centeredColumnPlacements({ anchor, count: 3, gap: 20 })
++    expect(placements).toHaveLength(3)
++    placements.forEach((placement) => {
++      expect(placement.x).toBe(320) // anchor.x + anchor.width + gap
++      expect(placement.width).toBe(200) // widths 缺省 = anchor.width
++      expect(placement.height).toBe(100)
++    })
++    expect(centeredColumnPlacements({ anchor, count: 0, gap: 20 })).toEqual([])
++
++    // 完成/部分完成阶段按 ordinal 传各自宽度,宽度不影响列左缘
++    const sized = centeredColumnPlacements({ anchor, count: 3, gap: 20, widths: [180, 200, 220] })
++    expect(sized.map((placement) => placement.width)).toEqual([180, 200, 220])
++    expect(sized.map((placement) => placement.x)).toEqual([320, 320, 320])
++  })
++
++  it('centeredColumnPlacements_single_edge_alignment — count=1 与原图上下边缘对齐', () => {
++    const [placement] = centeredColumnPlacements({ anchor, count: 1, gap: 20 })
++    expect(placement.y).toBe(anchor.y) // 顶边对齐
++    expect(placement.height).toBe(anchor.height) // 高度一致 → 底边也对齐
++
++    // 非整数 anchor.height 也不破坏边缘对齐:height 取整到 Math.round(anchor.height)
++    // (99.6 → 100),底边按取整后高度对齐 —— 不断言浮点底边相等(30+99.6≠30+100)
++    const oddAnchor = { x: 0, y: 30, width: 100, height: 99.6 }
++    const [oddPlacement] = centeredColumnPlacements({ anchor: oddAnchor, count: 1, gap: 20 })
++    expect(oddPlacement.y).toBe(oddAnchor.y)
++    expect(oddPlacement.height).toBe(Math.round(oddAnchor.height))
++    expect(oddPlacement.y + oddPlacement.height).toBe(oddAnchor.y + Math.round(oddAnchor.height))
++  })
++
++  it('centeredColumnPlacements_vertical_center — 整列垂直居中于 anchor', () => {
++    const count = 2
++    const gap = 20
++    const h = Math.round(anchor.height) // 100
++    const totalH = count * h + (count - 1) * gap // 220
++    const top = anchor.y + anchor.height / 2 - totalH / 2 // 50 + 50 - 110 = -10
++    const placements = centeredColumnPlacements({ anchor, count, gap })
++
++    expect(placements[0].y).toBe(top)
++    expect(placements[1].y).toBe(top + h + gap)
++    // 列包围盒中心 === anchor 中心
++    const boxCenter = placements[0].y + totalH / 2
++    expect(boxCenter).toBe(anchor.y + anchor.height / 2)
++  })
++})
++
++describe('heightLockedSizeForDimensions (编辑占位高度锁定)', () => {
++  it('heightLockedSizeForDimensions_locked_height — 高度锁定为 anchorHeight,宽度按原比例换算', () => {
++    const size = heightLockedSizeForDimensions(400, { width: 1920, height: 1080 })
++    expect(size.height).toBe(400)
++    expect(size.width).toBe(711) // Math.round(400 * 1920 / 1080)
++    expect(size.width / size.height).toBeCloseTo(16 / 9, 2)
++
++    // 宽度公式吃未取整的 anchorHeight,不是先取整再算比例(400.4 取整后是 400,
++    // 但宽度须按 400.4 换算 —— 712 vs 用取整后 400 算出的 711 之差即锁定这一点)
++    const oddSize = heightLockedSizeForDimensions(400.4, { width: 1920, height: 1080 })
++    expect(oddSize.height).toBe(400)
++    expect(oddSize.width).toBe(712) // Math.round(400.4 * 1920 / 1080)
++  })
++
++  it('heightLockedSizeForDimensions_no_import_clamp — 不复用 [96,360] 钳制', () => {
++    // 若复用 importedImageDisplaySize,4000 长边会被钳到 360、高度只有 180
++    const size = heightLockedSizeForDimensions(1000, { width: 8000, height: 4000 })
++    expect(size.height).toBe(1000)
++    expect(size.width).toBe(2000)
++    expect(importedImageDisplaySize({ width: 8000, height: 4000 })).not.toEqual(size)
++
++    // 小图同样不被钳到 96
++    const small = heightLockedSizeForDimensions(1000, { width: 200, height: 100 })
++    expect(small.height).toBe(1000)
++    expect(small.width).toBe(2000)
++  })
++})
+diff --git a/src/store/aiCanvasWorkflow.ts b/src/store/aiCanvasWorkflow.ts
+index 097668b3..d1302017 100644
+--- a/src/store/aiCanvasWorkflow.ts
++++ b/src/store/aiCanvasWorkflow.ts
+@@ -33,6 +33,55 @@ export const equalAreaSizeForDimensions = (
+   return { width, height: Math.round((width * dimensions.height) / dimensions.width) }
+ }
+ 
++/** #297 编辑占位列布局:anchor 右侧生成一列 count 张衍生图,整列垂直居中于 anchor。
++ *  占位阶段 widths 缺省为 anchor.width;完成/部分完成阶段按 ordinal 传入各自宽度,
++ *  width 只影响矩形自身,列左缘 x = anchor.x + anchor.width + gap 固定。 */
++export const centeredColumnPlacements = ({
++  anchor,
++  count,
++  gap,
++  widths,
++}: {
++  anchor: Pick<MivoCanvasNode, 'x' | 'y' | 'width' | 'height'>
++  count: number
++  gap: number
++  widths?: number[]
++}): { x: number; y: number; width: number; height: number }[] => {
++  if (count <= 0) return []
++
++  const h = Math.round(anchor.height)
++  const x = anchor.x + anchor.width + gap
++
++  // count=1 退化情形(用户规格图 1):单张衍生图与原图上下边缘对齐。
++  // 垂直居中公式在整数高度下自然退化为此值;此处显式保证非整数高度的边缘对齐。
++  if (count === 1) {
++    return [{ x, y: anchor.y, width: Math.round(widths?.[0] ?? anchor.width), height: h }]
++  }
++
++  const totalH = count * h + (count - 1) * gap
++  const top = anchor.y + anchor.height / 2 - totalH / 2
++  return Array.from({ length: count }, (_, index) => ({
++    x,
++    y: top + index * (h + gap),
++    width: Math.round(widths?.[index] ?? anchor.width),
++    height: h,
++  }))
++}
++
++/** 编辑占位:衍生图高度锁定为原图高度(与原图上下边缘一致),宽度按结果图自身宽高比
++ *  换算。不复用 importedImageDisplaySize——它把最长边钳到 [96,360],与
++ *  「高度=原图高度」直接冲突。 */
++export const heightLockedSizeForDimensions = (
++  anchorHeight: number,
++  dimensions?: { width: number; height: number },
++): { width: number; height: number } => {
++  const height = Math.round(anchorHeight)
++  if (!dimensions || dimensions.width <= 0 || dimensions.height <= 0) {
++    return { width: height, height }
++  }
++  return { width: Math.round((anchorHeight * dimensions.width) / dimensions.height), height }
++}
++
+ const rectsOverlap = (
+   a: Pick<MivoCanvasNode, 'x' | 'y' | 'width' | 'height'>,
+   b: Pick<MivoCanvasNode, 'x' | 'y' | 'width' | 'height'>,

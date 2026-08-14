@@ -1,0 +1,2516 @@
+diff --git a/docs/design-previews/region-edit/assets/product.css b/docs/design-previews/region-edit/assets/product.css
+index 71892471..846713f5 100644
+--- a/docs/design-previews/region-edit/assets/product.css
++++ b/docs/design-previews/region-edit/assets/product.css
+@@ -65,6 +65,14 @@ button {
+   --mivo-canvas-pattern-dot-color: rgba(39, 48, 44, 0.16);
+   --charcoal: #27302c;
+   --moss: #497466;
++  /* derivation edge 连线色:渲染层按主题读取(不写节点数据),主题切换自动跟随。
++     --edge-derivation 只给自动生成的派生连线;用户手画 markup 颜色不走此变量。
++     light 档 = cool slate #5f6976 对画布底 #ebe4d7 的 60% 强度混合
++     (0.6·#5f6976 + 0.4·#ebe4d7 = #979a9d;用户 2026-08-08:白天太深,减弱到 60%。
++     不用 color-mix():Leafer 侧 getComputedStyle 读到的是未解析原文,喂不进 canvas)。 */
++  --edge-derivation: #979a9d;
++  --edge-derivation-width: 2;
++  --edge-derivation-opacity: 0.88;
+   --rust: #b6572c;
+   --ochre: #b77928;
+   --blue: #566d89;
+@@ -7731,6 +7739,7 @@ button:disabled {
+ }
+ 
+ :root[data-mivo-theme='dark'] {
++  --edge-derivation: #9da8b5;
+   --dialog-backdrop: rgba(0, 0, 0, 0.52);
+   --dialog-surface: #232322;
+   --dialog-ink: #f4f2ee;
+diff --git a/src/App.css b/src/App.css
+index 759f124c..29ff02e0 100644
+--- a/src/App.css
++++ b/src/App.css
+@@ -19,6 +19,14 @@
+   --mivo-canvas-pattern-dot-color: rgba(39, 48, 44, 0.16);
+   --charcoal: #27302c;
+   --moss: #497466;
++  /* derivation edge 连线色:渲染层按主题读取(不写节点数据),主题切换自动跟随。
++     --edge-derivation 只给自动生成的派生连线;用户手画 markup 颜色不走此变量。
++     light 档 = cool slate #5f6976 对画布底 #ebe4d7 的 60% 强度混合
++     (0.6·#5f6976 + 0.4·#ebe4d7 = #979a9d;用户 2026-08-08:白天太深,减弱到 60%。
++     不用 color-mix():Leafer 侧 getComputedStyle 读到的是未解析原文,喂不进 canvas)。 */
++  --edge-derivation: #979a9d;
++  --edge-derivation-width: 2;
++  --edge-derivation-opacity: 0.88;
+   --rust: #b6572c;
+   --ochre: #b77928;
+   --blue: #566d89;
+@@ -7685,6 +7693,7 @@ button:disabled {
+ }
+ 
+ :root[data-mivo-theme='dark'] {
++  --edge-derivation: #9da8b5;
+   --dialog-backdrop: rgba(0, 0, 0, 0.52);
+   --dialog-surface: #232322;
+   --dialog-ink: #f4f2ee;
+diff --git a/src/canvas/CanvasNodeView.tsx b/src/canvas/CanvasNodeView.tsx
+index d43a75d8..31a965cb 100644
+--- a/src/canvas/CanvasNodeView.tsx
++++ b/src/canvas/CanvasNodeView.tsx
+@@ -160,7 +160,7 @@ export const CanvasNodeView = memo(function CanvasNodeView({
+   // (pointIndex 2 走同一条 onMarkupPointPointerDown 通路)。
+   const markupBendHandle =
+     lineMarkupNode && lineRouteOf(node.markupLineRoute) === 'curved' && markupPointHandles.length >= 2
+-      ? lineRouteMidpointFor('curved', markupPointHandles[0], markupPointHandles[1], node.markupCurveBow)
++      ? lineRouteMidpointFor('curved', markupPointHandles[0], markupPointHandles[1], { curvature: node.markupCurveBow })
+       : undefined
+   const emptyText = textNode && !node.text?.trim()
+   const imageNode = node.type === 'image'
+diff --git a/src/canvas/MarkupNodeView.tsx b/src/canvas/MarkupNodeView.tsx
+index 7318fbdb..4446f662 100644
+--- a/src/canvas/MarkupNodeView.tsx
++++ b/src/canvas/MarkupNodeView.tsx
+@@ -5,6 +5,9 @@ import { defaultNoteFillColor } from '../model/markupStyleDefaults'
+ import { brushOutlinePathFor } from '../model/brushGeometry'
+ import { arrowHeadRenderFor, effectiveEndHeadFor, effectiveStartHeadFor } from '../model/arrowHeadGeometry'
+ import {
++  type CubicBezierOptions,
++  cubicSegmentsFor,
++  cubicPathFor,
+   curvedSegmentsFor,
+   elbowSegmentsFor,
+   lineRouteOf,
+@@ -12,8 +15,10 @@ import {
+   polylinePathFor,
+   quadraticPathFor,
+ } from '../model/lineRouteGeometry'
++import { cubicOptionsForConnectors } from '../model/connectorGeometry'
+ import { isPolygonMarkupKind, polygonShapePointsFor } from '../model/markupShapeGeometry'
+ import { markupRenderStyleFor } from './canvasRenderAdapter'
++import { useDocumentThemeAttribute } from '../render/useDocumentThemeAttribute'
+ import { CanvasTextEditor } from './CanvasTextEditor'
+ import {
+   defaultMarkupPointsFor,
+@@ -121,6 +126,12 @@ export function MarkupNodeView({
+ }) {
+   const kind = node.markupKind || 'rect'
+   const lastPlacedStampId = useCanvasStore((state) => state.lastPlacedStampId)
++  // data-mivo-theme 由插件宿主外部灌入,markupRenderStyleFor 对 derivation edge 现读
++  // --edge-derivation* CSS 变量——但"现读"只在这个组件重渲染的那一刻发生一次。没有
++  // 这一行,外部主题切换不会让本组件重渲染,派生连线颜色就会停留在挂载时的主题上
++  // (见 useDocumentThemeAttribute.ts 头部注释;返回值本身不需要参与渲染,订阅状态
++  // 变化本身就是触发源)。
++  useDocumentThemeAttribute()
+   const renderStyle = markupRenderStyleFor(node)
+   // strokeStyle 'none'(无边框档):描边整组归零,与 Leafer 侧 strokeHidden 同语义。
+   const strokeHidden = renderStyle.strokeStyle === 'none'
+@@ -218,15 +229,25 @@ export function MarkupNodeView({
+   const isRouteLine = (kind === 'line' || kind === 'arrow') && lineRoute !== 'straight'
+   const routeStart = { x: points[0]?.x ?? 0, y: points[0]?.y ?? node.height }
+   const routeEnd = { x: points[1]?.x ?? node.width, y: points[1]?.y ?? 0 }
+-  const routePathD = isRouteLine ? lineRoutePathFor(lineRoute, routeStart, routeEnd, node.markupCurveBow) : undefined
++  // 与 hitTest/leaferLinePaint 同源(cubicOptionsForConnectors),三处曲线形状一致。
++  const bezierOpts: CubicBezierOptions = cubicOptionsForConnectors(
++    node.connectorStart,
++    node.connectorEnd,
++    node.markupCurveBow,
++  )
++  const routePathD = isRouteLine ? lineRoutePathFor(lineRoute, routeStart, routeEnd, bezierOpts) : undefined
+   const routeGap = isRouteLine ? lineLabelGapRangeFor(node, points, lineLabelActive) : null
+   const routeSegmentPaths = !isRouteLine
+     ? []
+-    : lineRoute === 'curved'
+-      ? curvedSegmentsFor(routeStart, routeEnd, routeGap || undefined, node.markupCurveBow).map((seg) =>
+-          quadraticPathFor(seg.p0, seg.ctrl, seg.p1),
++    : lineRoute === 'smooth'
++      ? cubicSegmentsFor(routeStart, routeEnd, routeGap || undefined, bezierOpts).map((seg) =>
++          cubicPathFor(seg.p0, seg.cp1, seg.cp2, seg.p1),
+         )
+-      : elbowSegmentsFor(routeStart, routeEnd, routeGap || undefined).map((polyline) => polylinePathFor(polyline))
++      : lineRoute === 'curved'
++        ? curvedSegmentsFor(routeStart, routeEnd, routeGap || undefined, node.markupCurveBow).map((seg) =>
++            quadraticPathFor(seg.p0, seg.ctrl, seg.p1),
++          )
++        : elbowSegmentsFor(routeStart, routeEnd, routeGap || undefined).map((polyline) => polylinePathFor(polyline))
+ 
+   return (
+     <>
+diff --git a/src/canvas/SelectionQuickToolbar.tsx b/src/canvas/SelectionQuickToolbar.tsx
+index fd235ccf..ca74d7e0 100644
+--- a/src/canvas/SelectionQuickToolbar.tsx
++++ b/src/canvas/SelectionQuickToolbar.tsx
+@@ -4,6 +4,7 @@ import { ChevronDown } from 'lucide-react'
+ import type { CanvasBounds } from './canvasInteraction'
+ import { preventToolButtonFocus } from './toolButtonFocus'
+ import { quickToolbarGroupsFor, type CanvasActionItem } from './actions/canvasActionModel'
++import { isDerivationEdgeNode } from '../store/nodeFactory'
+ import { useCanvasActionRuntime } from './actions/useCanvasActionRuntime'
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import { TextFormatToolbar } from './TextFormatToolbar'
+@@ -125,6 +126,11 @@ export function SelectionQuickToolbar({
+ 
+   if (!primaryNode || selectedNodes.some((node) => node.id === editingTextNodeId)) return null
+ 
++  // derivation edge 不可编辑(不可拖、样式随主题、无端点/箭头可调)——纯连线
++  // 选区不弹编辑工具条,选中反馈由渲染层的选中态承担(2026-08-08 用户)。混选时
++  // 保持原行为(工具条服务其余可编辑节点)。
++  if (selectedNodes.every((node) => isDerivationEdgeNode(node))) return null
++
+   if (selectedNodes.length === 1 && primaryNode.type === 'text' && !primaryNode.locked) {
+     return <TextFormatToolbar node={primaryNode} scale={scale} />
+   }
+diff --git a/src/canvas/canvasRenderAdapter.test.ts b/src/canvas/canvasRenderAdapter.test.ts
+index 2ce9f70a..e18bffe6 100644
+--- a/src/canvas/canvasRenderAdapter.test.ts
++++ b/src/canvas/canvasRenderAdapter.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, it } from 'vitest'
++import { afterEach, describe, expect, it, vi } from 'vitest'
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import {
+   frameRenderStyleFor,
+@@ -120,6 +120,50 @@ describe('canvasRenderAdapter', () => {
+     expect(rectStyle.fill).toBe('rgba(105, 87, 232, 0.08)')
+   })
+ 
++  it('markup stroke 兜底色 #6957e8（非 derivation edge 无 v2 stroke、无 markupStrokeColor 时的最后兜底=历史手画默认紫）', () => {
++    const bare = markupRenderStyleFor(baseNode({ type: 'markup', markupKind: 'rect' }))
++    // Bare markup node without any stroke info: ultimate fallback is now
++    // 历史手画默认紫 —— 通用 markup 兜底不许与 derivation edge 主题色混用(2026-08-08 复原)。
++    expect(bare.stroke).toBe('#6957e8')
++  })
++
++  describe('derivation edge — CSS token 数值解析(与 leaferLinePaint.derivationEdgeVisualFor 同一份规则,DOM/Leafer 口径一致)', () => {
++    const derivationNode = () =>
++      baseNode({ type: 'markup', markupKind: 'arrow', generation: { prompt: '', model: 'Mivo Derivation Edge' } as never })
++
++    const stubDerivationCssVars = (vars: { width?: string; opacity?: string; color?: string }) => {
++      vi.stubGlobal('document', {
++        documentElement: { getAttribute: () => null },
++      })
++      vi.stubGlobal('getComputedStyle', () => ({
++        getPropertyValue: (name: string) => {
++          if (name === '--edge-derivation-width') return vars.width ?? ''
++          if (name === '--edge-derivation-opacity') return vars.opacity ?? ''
++          if (name === '--edge-derivation') return vars.color ?? ''
++          return ''
++        },
++      }))
++    }
++
++    afterEach(() => {
++      vi.unstubAllGlobals()
++    })
++
++    it('CSS token 为 0 时不被吞成默认值（strokeWidth/strokeOpacity 合法 0 必须原样通过）', () => {
++      stubDerivationCssVars({ width: '0', opacity: '0' })
++      const style = markupRenderStyleFor(derivationNode())
++      expect(style.strokeWidth).toBe(0)
++      expect(style.strokeOpacity).toBe(0)
++    })
++
++    it('CSS token 空串/NaN 仍兜默认（未声明变量 / 写坏值）', () => {
++      stubDerivationCssVars({ width: '', opacity: 'not-a-number' })
++      const style = markupRenderStyleFor(derivationNode())
++      expect(style.strokeWidth).toBe(2)
++      expect(style.strokeOpacity).toBe(0.88)
++    })
++  })
++
+   it('extracts text render style from legacy text fields', () => {
+     const style = textRenderStyleFor(
+       baseNode({
+diff --git a/src/canvas/canvasRenderAdapter.ts b/src/canvas/canvasRenderAdapter.ts
+index 222673e0..03bb0490 100644
+--- a/src/canvas/canvasRenderAdapter.ts
++++ b/src/canvas/canvasRenderAdapter.ts
+@@ -7,6 +7,7 @@ import type {
+ } from '../types/mivoCanvas'
+ import { defaultNoteFillColor } from '../model/markupStyleDefaults'
+ import { normalizeCanvasNodeV2 } from '../model/documentModelV2'
++import { isDerivationEdgeNode } from '../store/nodeFactory'
+ import { defaultTextAlign, defaultTextColor, defaultTextFontSize, defaultTextWeight } from './textGeometry'
+ 
+ export type NodeRenderBox = Pick<CSSProperties, 'width' | 'height' | 'transform' | 'transformOrigin'>
+@@ -42,6 +43,15 @@ const firstSolidFillOf = (n: MivoCanvasNode) => n.fills?.find(isVisibleSolidFill
+ 
+ const firstStrokeOf = (n: MivoCanvasNode) => n.strokes?.find(visibleStroke)
+ 
++/** CSS 变量数值解析:`Number(raw) || fallback` 会把合法的 0 也吞成 fallback
++ *  (0 是 falsy)。显式校验 Number.isFinite,只有空串/NaN 才兜默认
++ *  (与 leaferLinePaint.derivationEdgeVisualFor 同一份数值解析规则,DOM/Leafer 两侧口径一致)。 */
++const finiteCssNumber = (raw: string, fallback: number): number => {
++  if (raw === '') return fallback
++  const parsed = Number(raw)
++  return Number.isFinite(parsed) ? parsed : fallback
++}
++
+ const transformOf = (n: MivoCanvasNode) =>
+   n.transform || {
+     x: n.x,
+@@ -84,6 +94,22 @@ export const markupRenderStyleFor = (node: MivoCanvasNode): MarkupRenderStyle =>
+   const fill = firstSolidFillOf(n)
+   const stroke = firstStrokeOf(n)
+ 
++  // derivation edge: 颜色/线宽/不透明度从 CSS 变量读取(主题驱动),不取节点属性
++  const isDerivation = isDerivationEdgeNode(node)
++  const isDark = typeof document !== 'undefined' && document.documentElement.getAttribute('data-mivo-theme') === 'dark'
++  // 与 App.css 的 --edge-derivation 两档同值(light = 60% 强度混合 #979a9d)。
++  const edgeColorFallback = isDark ? '#9da8b5' : '#979a9d'
++  const edgeVis = isDerivation && typeof document !== 'undefined'
++    ? (() => {
++        const s = getComputedStyle(document.documentElement)
++        return {
++          color: s.getPropertyValue('--edge-derivation').trim() || edgeColorFallback,
++          width: finiteCssNumber(s.getPropertyValue('--edge-derivation-width').trim(), 2),
++          opacity: finiteCssNumber(s.getPropertyValue('--edge-derivation-opacity').trim(), 0.88),
++        }
++      })()
++    : null
++
+   return {
+     // 贴纸缺失填充兜底到默认纸色(与 projection/菜单同口径,Greptile P1);
+     // 其余 markup 保持通用淡紫水洗。
+@@ -91,10 +117,14 @@ export const markupRenderStyleFor = (node: MivoCanvasNode): MarkupRenderStyle =>
+       fill?.color ||
+       node.markupFillColor ||
+       (node.markupKind === 'note' ? defaultNoteFillColor : 'rgba(105, 87, 232, 0.08)'),
+-    stroke: stroke?.color || node.markupStrokeColor || '#6957e8',
+-    strokeWidth: stroke?.width ?? node.markupStrokeWidth ?? 3,
++    // derivation edge 无 document(SSR)时也不许掉进手画紫兜底 —— 自动连线与
++    // 用户标注混色是禁忌;通用 markup 兜底保持历史紫 #6957e8。
++    stroke: isDerivation
++      ? (edgeVis?.color ?? '#979a9d')
++      : (stroke?.color || node.markupStrokeColor || '#6957e8'),
++    strokeWidth: isDerivation ? (edgeVis?.width ?? 2) : (stroke?.width ?? node.markupStrokeWidth ?? 3),
+     strokeStyle: stroke?.style || node.markupStrokeStyle || 'solid',
+-    strokeOpacity: stroke?.opacity ?? node.markupOpacity ?? 1,
++    strokeOpacity: isDerivation ? (edgeVis?.opacity ?? 0.88) : (stroke?.opacity ?? node.markupOpacity ?? 1),
+   }
+ }
+ 
+diff --git a/src/canvas/markupTextGeometry.ts b/src/canvas/markupTextGeometry.ts
+index 0b88d91c..01b35d81 100644
+--- a/src/canvas/markupTextGeometry.ts
++++ b/src/canvas/markupTextGeometry.ts
+@@ -70,7 +70,7 @@ export const lineLabelPositionFor = (
+ 
+   // elbow/curved:label 悬挂在路由的弧长中点(截图2 的"文字压线"修复的一半;
+   // 另一半是渲染层按 lineLabelGapRangeFor 把线体断开)。
+-  return lineRouteMidpointFor(lineRouteOf(node.markupLineRoute), start, end, node.markupCurveBow)
++  return lineRouteMidpointFor(lineRouteOf(node.markupLineRoute), start, end, { curvature: node.markupCurveBow })
+ }
+ 
+ export const estimatedMarkupLabelWidth = (text: string, fontSize: number): number => {
+@@ -99,7 +99,7 @@ export const lineLabelGapRangeFor = (
+   if (!labelActive) return null
+   const start = points[0] || { x: 0, y: node.height }
+   const end = points[1] || { x: node.width, y: 0 }
+-  const length = lineRouteLengthFor(lineRouteOf(node.markupLineRoute), start, end, node.markupCurveBow)
++  const length = lineRouteLengthFor(lineRouteOf(node.markupLineRoute), start, end, { curvature: node.markupCurveBow })
+   if (length < 1) return null
+ 
+   const labelWidth = estimatedMarkupLabelWidth(node.text || 'Label', node.fontSize || defaultTextFontSize)
+diff --git a/src/lib/snapshotValidation.test.ts b/src/lib/snapshotValidation.test.ts
+index 45b375d2..7a360be2 100644
+--- a/src/lib/snapshotValidation.test.ts
++++ b/src/lib/snapshotValidation.test.ts
+@@ -1,6 +1,6 @@
+ import { describe, expect, it } from 'vitest'
+ import { parseCanvasSnapshot } from './snapshotValidation'
+-import type { MivoCanvasSnapshot, MivoCanvasNode, CanvasTask, CanvasEdge } from '../types/mivoCanvas'
++import { type MivoCanvasSnapshot, type MivoCanvasNode, type CanvasTask, type CanvasEdge, MARKUP_LINE_ROUTE_VALUES } from '../types/mivoCanvas'
+ import type { SerializedCanvasAsset } from './assetStorage'
+ 
+ // Helpers ---------------------------------------------------------------------
+@@ -471,3 +471,42 @@ describe('importBatchId (SC-T2c.1 light validation)', () => {
+     expect(result.ok).toBe(false)
+   })
+ })
++
++// --- PR #602 review P1: markupLineRoute 消费 MARKUP_LINE_ROUTE_VALUES(单一事实源) ---
++
++describe('markupLineRoute (单一事实源 MARKUP_LINE_ROUTE_VALUES)', () => {
++  const markupNode = (route: unknown): MivoCanvasNode => ({
++    id: 'm1',
++    type: 'markup',
++    title: 'edge',
++    x: 0,
++    y: 0,
++    width: 100,
++    height: 100,
++    status: 'ready',
++    markupKind: 'arrow',
++    markupLineRoute: route as MivoCanvasNode['markupLineRoute'],
++    markupPoints: [{ x: 0, y: 0 }, { x: 80, y: 0 }],
++  })
++
++  it('接受 smooth 路由的 markup 节点(含派生连线的快照不再被整单拒绝)', () => {
++    const result = parse(validSnapshot({ nodes: [markupNode('smooth')] }))
++    expect(result.ok).toBe(true)
++  })
++
++  it('接受 MARKUP_LINE_ROUTE_VALUES 里每个路由(单一事实源,新增路由自动放行)', () => {
++    for (const route of MARKUP_LINE_ROUTE_VALUES) {
++      expect(parse(validSnapshot({ nodes: [markupNode(route)] })).ok).toBe(true)
++    }
++  })
++
++  it('拒绝 MARKUP_LINE_ROUTE_VALUES 之外的未知路由(如 "wavy",不放行任意字符串)', () => {
++    const result = parse(validSnapshot({ nodes: [markupNode('wavy')] }))
++    expect(result.ok).toBe(false)
++  })
++
++  it('接受缺省 markupLineRoute(legacy 快照,undefined 仍放行)', () => {
++    const result = parse(validSnapshot({ nodes: [markupNode(undefined)] }))
++    expect(result.ok).toBe(true)
++  })
++})
+diff --git a/src/lib/snapshotValidation.ts b/src/lib/snapshotValidation.ts
+index 1d73a656..97105b8d 100644
+--- a/src/lib/snapshotValidation.ts
++++ b/src/lib/snapshotValidation.ts
+@@ -1,14 +1,15 @@
+-import type {
+-  AiWorkflowKind,
+-  AiWorkflowOperation,
+-  AiWorkflowPlacement,
+-  AiWorkflowStatus,
+-  CanvasEdge,
+-  CanvasEdgeType,
+-  CanvasTask,
+-  MivoCanvasNode,
+-  MivoCanvasSnapshot,
+-  NodeStatus,
++import {
++  type AiWorkflowKind,
++  type AiWorkflowOperation,
++  type AiWorkflowPlacement,
++  type AiWorkflowStatus,
++  type CanvasEdge,
++  type CanvasEdgeType,
++  type CanvasTask,
++  type MivoCanvasNode,
++  type MivoCanvasSnapshot,
++  type NodeStatus,
++  MARKUP_LINE_ROUTE_VALUES,
+ } from '../types/mivoCanvas'
+ import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
+ import { isNodeNoteApp, isNodeTagsApp } from '../../shared/persist-contract'
+@@ -31,6 +32,10 @@ const aiWorkflowOperations = new Set<AiWorkflowOperation>([
+   'upscale',
+ ])
+ const aiWorkflowPlacements = new Set<AiWorkflowPlacement>(['slot', 'right', 'left', 'below'])
++// markupLineRoute 合法值单一事实源 = MARKUP_LINE_ROUTE_VALUES(mivoCanvas.ts)。
++// validator 消费它而非手写第二份清单,新增路由(如 'smooth')自动放行,不再漂移
++// (PR #602 review P1:旧手写 ['straight','elbow','curved'] 漏 smooth → 含派生连线快照被整单拒)。
++const markupLineRouteValues = new Set<string>(MARKUP_LINE_ROUTE_VALUES)
+ 
+ const isRecord = (value: unknown): value is Record<string, unknown> =>
+   typeof value === 'object' && value !== null
+@@ -57,7 +62,7 @@ const isMarkupKind = (value: unknown) =>
+ const isMarkupStrokeStyle = (value: unknown) =>
+   value === undefined || value === 'solid' || value === 'dashed' || value === 'none'
+ const isMarkupLineRoute = (value: unknown) =>
+-  value === undefined || value === 'straight' || value === 'elbow' || value === 'curved'
++  value === undefined || (typeof value === 'string' && markupLineRouteValues.has(value))
+ const isMarkupArrowHead = (value: unknown) =>
+   value === undefined ||
+   value === 'none' ||
+diff --git a/src/model/connectorGeometry.ts b/src/model/connectorGeometry.ts
+index 6829513f..fa11df16 100644
+--- a/src/model/connectorGeometry.ts
++++ b/src/model/connectorGeometry.ts
+@@ -2,6 +2,35 @@ import type { ConnectorAnchor, ConnectorBinding, MarkupPoint, MivoCanvasNode } f
+ 
+ export const connectorAnchors: ConnectorAnchor[] = ['center', 'top', 'right', 'bottom', 'left']
+ export const connectorSnapThreshold = 24
++
++/** 锚点边的出射方向：控制点沿此方向离开/进入节点。
++ *  曲线两端统一使用 outDir——CP1 = P0 + outDir(startAnchor) * c，
++ *  CP2 = P1 + outDir(endAnchor) * c，控制点都从各自节点"往外伸"。
++ *  端点切线由贝塞尔参数化自然翻转（B'(1) = 3(P1-CP2)）。 */
++export const connectorAnchorOutDir = (anchor: ConnectorAnchor): { x: number; y: number } => {
++  switch (anchor) {
++    case 'right': return { x: 1, y: 0 }
++    case 'left': return { x: -1, y: 0 }
++    case 'bottom': return { x: 0, y: 1 }
++    case 'top': return { x: 0, y: -1 }
++    default: return { x: 0, y: 0 }
++  }
++}
++/** 渲染与命中共用的三次贝塞尔方向参数（单一来源）。
++ *  教训（2026-08-08）：渲染侧传了锚点方向而命中侧没传，两条曲线形状不同，
++ *  hover/点击落在"看得见的线"上却命不中（偏垂直的连线兜底方向≠渲染方向）。
++ *  凡需要 CubicBezierOptions 的消费点（leaferLinePaint / MarkupNodeView /
++ *  hitTest / 未来新增）一律走这里，不要各自手拼。 */
++export const cubicOptionsForConnectors = (
++  start: ConnectorBinding | undefined,
++  end: ConnectorBinding | undefined,
++  curvature?: number,
++): { curvature?: number; outDir?: { x: number; y: number }; endOutDir?: { x: number; y: number } } => ({
++  curvature,
++  outDir: start ? connectorAnchorOutDir(start.anchor) : undefined,
++  endOutDir: end ? connectorAnchorOutDir(end.anchor) : undefined,
++})
++
+ const centerSnapRatio = 0.1
+ const insideEdgeSnapThreshold = 16
+ 
+diff --git a/src/model/lineRouteGeometry.test.ts b/src/model/lineRouteGeometry.test.ts
+new file mode 100644
+index 00000000..7ca1d646
+--- /dev/null
++++ b/src/model/lineRouteGeometry.test.ts
+@@ -0,0 +1,376 @@
++import { describe, expect, test } from 'vitest'
++import {
++  cubicControlPointsFor,
++  cubicPathFor,
++  cubicSegmentsFor,
++  cubicSubcurveFor,
++  lineRouteHeadAnglesFor,
++  lineRouteMidpointFor,
++  lineRoutePathFor,
++  lineRoutePolylineFor,
++  type CubicBezierOptions,
++  type LineRoutePoint,
++} from './lineRouteGeometry'
++import { lineLabelGapRangeFor, type MarkupLabelBox } from '../canvas/markupTextGeometry'
++
++// ── independent reference bezier evaluator (NOT the code under test) ─────
++// de Casteljau 分割断言必须有一个不依赖被测实现的真值参照——直接展开三次
++// 贝塞尔 Bernstein 多项式,不调用 lineRouteGeometry.ts 内部任何求值函数,
++// 避免测试与实现共享同一处潜在错误。
++const referenceCubicPointAt = (
++  p0: LineRoutePoint,
++  cp1: LineRoutePoint,
++  cp2: LineRoutePoint,
++  p1: LineRoutePoint,
++  t: number,
++): LineRoutePoint => {
++  const mt = 1 - t
++  const b0 = mt * mt * mt
++  const b1 = 3 * mt * mt * t
++  const b2 = 3 * mt * t * t
++  const b3 = t * t * t
++  return {
++    x: b0 * p0.x + b1 * cp1.x + b2 * cp2.x + b3 * p1.x,
++    y: b0 * p0.y + b1 * cp1.y + b2 * cp2.y + b3 * p1.y,
++  }
++}
++
++const expectPointClose = (actual: LineRoutePoint, expected: LineRoutePoint) => {
++  expect(Math.abs(actual.x - expected.x)).toBeLessThan(1e-9)
++  expect(Math.abs(actual.y - expected.y)).toBeLessThan(1e-9)
++}
++
++// ── cubic bezier discriminative tests (2026-08-07 bezier spike) ──────────
++// These tests are designed to CATCH the "collinear control point" regression:
++// if outDir/inDir are accidentally set to chord direction, CP1/CP2/ P0/P1
++// all lie on the same line → cubic bezier degenerates to a straight line →
++// midpoint sits on the chord and is visually identical to a straight connector.
++//
++// IMPORTANT: symmetric direction pairs (outDir=(1,0), inDir=(-1,0)) produce
++// a curve whose cubic midpoint IS the chord midpoint due to symmetry. The
++// discriminative tests below use ASYMMETRIC pairs (e.g. outDir=(1,0),
++// inDir=(0,-1) = source right edge → target top edge) so the midpoint
++// measurably deviates from the chord.
++
++describe('cubicControlPointsFor', () => {
++  test('right→left: cp2 is to the LEFT of p1 (no overshoot)', () => {
++    // Bug 2 regression: inDir was -outDir → cp2 = p1 + (-(-1,0))*c = p1+(1,0)*c
++    // → cp2 to the RIGHT of p1 → overshoot + hook-back. With both ends using
++    // outDir, cp2 should be to the LEFT of p1 for a left-anchored target.
++    const p0 = { x: 0, y: 0 }
++    const p1 = { x: 400, y: 120 }
++    const opts: CubicBezierOptions = {
++      outDir: { x: 1, y: 0 },     // source right anchor
++      endOutDir: { x: -1, y: 0 },  // target left anchor
++    }
++    const { cp1, cp2 } = cubicControlPointsFor(p0, p1, opts)
++
++    // cp1 extends right from source
++    expect(cp1.x).toBeGreaterThan(p0.x)
++    expect(cp1.y).toBeCloseTo(p0.y, 5)
++
++    // cp2 extends left from target (NOT right — that's the bug)
++    expect(cp2.x).toBeLessThan(p1.x)
++    expect(cp2.y).toBeCloseTo(p1.y, 5)
++  })
++
++  test('control points follow explicit directions, NOT chord direction', () => {
++    const p0 = { x: 100, y: 50 }
++    const p1 = { x: 400, y: 150 }
++    const opts: CubicBezierOptions = {
++      outDir: { x: 1, y: 0 },
++      endOutDir: { x: 0, y: -1 },
++    }
++    const { cp1, cp2 } = cubicControlPointsFor(p0, p1, opts)
++
++    expect(cp1.x).toBeGreaterThan(p0.x)
++    expect(cp1.y).toBeCloseTo(p0.y, 5)
++
++    expect(cp2.y).toBeLessThan(p1.y)
++    expect(cp2.x).toBeCloseTo(p1.x, 5)
++
++    const samples = lineRoutePolylineFor('smooth', p0, p1, opts)
++    const mid = samples[8]
++    const chordMidX = (p0.x + p1.x) / 2
++    const chordMidY = (p0.y + p1.y) / 2
++    const dist = Math.hypot(mid.x - chordMidX, mid.y - chordMidY)
++    expect(dist).toBeGreaterThan(5)
++  })
++
++  test('fallback dominant direction also produces a curve (not collinear)', () => {
++    // Diagonal chord: dx > dy, fallback → horizontal outDir
++    // With outDir=-inDir (the fallback), the curve midpoint at t=0.5 IS the
++    // chord midpoint by symmetry — BUT the curve still bows off the chord
++    // elsewhere. Sample at t=0.25 to catch collinear regression.
++    const p0 = { x: 0, y: 50 }
++    const p1 = { x: 300, y: 100 }
++    const samples = lineRoutePolylineFor('smooth', p0, p1)
++    // Sample at t≈0.25 (index 4 of 16), not t=0.5
++    const q = samples[4]
++    // Chord point at same t: linear interpolation
++    const t = 4 / 16
++    const chordX = p0.x + (p1.x - p0.x) * t
++    const chordY = p0.y + (p1.y - p0.y) * t
++    const dist = Math.hypot(q.x - chordX, q.y - chordY)
++    expect(dist).toBeGreaterThan(3)  // collinear → 0
++  })
++})
++
++describe('lineRoutePathFor curved → cubic bezier', () => {
++  test('midpoint deviates from chord with asymmetric directions', () => {
++    const p0 = { x: 100, y: 50 }
++    const p1 = { x: 400, y: 120 }
++    const pathD = lineRoutePathFor('smooth', p0, p1, {
++      outDir: { x: 1, y: 0 },
++      endOutDir: { x: 0, y: 1 },  // asymmetric
++    })
++    expect(pathD).toMatch(/^M .+ C .+, .+, .+$/)
++  })
++
++  test('without directions, still produces a valid cubic bezier path', () => {
++    const p0 = { x: 0, y: 50 }
++    const p1 = { x: 300, y: 100 }
++    const pathD = lineRoutePathFor('smooth', p0, p1)
++    expect(pathD).toMatch(
++      /^M [\d.]+ [\d.]+ C [\d.-]+ [\d.-]+, [\d.-]+ [\d.-]+, [\d.-]+ [\d.-]+$/,
++    )
++  })
++})
++
++describe('lineRouteMidpointFor curved', () => {
++  test('midpoint deviates from chord with asymmetric anchor directions', () => {
++    // Source right edge → target bottom edge
++    const p0 = { x: 100, y: 50 }
++    const p1 = { x: 400, y: 150 }
++    const mid = lineRouteMidpointFor('smooth', p0, p1, {
++      outDir: { x: 1, y: 0 },
++      endOutDir: { x: 0, y: -1 },
++    })
++    const chordMidX = (p0.x + p1.x) / 2
++    const chordMidY = (p0.y + p1.y) / 2
++    // Both x and y should deviate (asymmetric pair)
++    expect(Math.abs(mid.x - chordMidX)).toBeGreaterThan(5)
++    expect(Math.abs(mid.y - chordMidY)).toBeGreaterThan(5)
++  })
++})
++
++describe('lineRoutePolylineFor curved', () => {
++  test('sampled points form a curve, not a straight line', () => {
++    // Source right edge → target bottom edge (asymmetric)
++    const p0 = { x: 100, y: 50 }
++    const p1 = { x: 400, y: 150 }
++    const samples = lineRoutePolylineFor('smooth', p0, p1, {
++      outDir: { x: 1, y: 0 },
++      endOutDir: { x: 0, y: -1 },
++    })
++    expect(samples.length).toBe(17) // CURVE_SAMPLES=16 → 17 points
++
++    // The middle sample should deviate from the chord
++    const mid = samples[8] // t≈0.5
++    const chordMidX = (p0.x + p1.x) / 2
++    const chordMidY = (p0.y + p1.y) / 2
++    const dist = Math.hypot(mid.x - chordMidX, mid.y - chordMidY)
++    expect(dist).toBeGreaterThan(5)
++  })
++})
++
++describe('cubicSegmentsFor + lineRouteHeadAnglesFor', () => {
++  test('head angles follow cubic tangent directions', () => {
++    const p0 = { x: 100, y: 50 }
++    const p1 = { x: 400, y: 150 }
++    const opts: CubicBezierOptions = {
++      outDir: { x: 1, y: 0 },
++      endOutDir: { x: -1, y: 0 },
++    }
++    const angles = lineRouteHeadAnglesFor('smooth', p0, p1, opts)
++
++    // start = outDir tangent + π: cp1 to the right of p0 → tangent=0 → start=π (180°)
++    const startDeg = (angles.start * 180) / Math.PI
++    expect(Math.abs(startDeg - 180) % 360).toBeLessThan(10)
++
++    // end = tangent from cp2 to p1: cp2 left of p1 → tangent=0
++    expect((angles.end * 180) / Math.PI).toBeCloseTo(0, 0)
++  })
++
++  test('segments handle gap correctly', () => {
++    const p0 = { x: 100, y: 50 }
++    const p1 = { x: 400, y: 150 }
++    const segments = cubicSegmentsFor(p0, p1, { beforeT: 0.3, afterT: 0.7 })
++    expect(segments.length).toBe(2)
++  })
++})
++
++// ── de Casteljau 二次分割数值正确性(SC-1/2/3,2026-08-09 修复) ─────────────
++// cubicSubcurveFor 对 [t0,1] 做完第一次切割后,再对右半段 [f,e,c,p1] 做第二次
++// 切割取 [t0,t1] 区间;第二次切割的第一层 lerp 必须是 lerp(f,e,s)/lerp(e,c,s)/
++// lerp(c,p1,s) 三组配对,此前第三组误写成了 lerp(d,e,s),导致返回子段的终点
++// (p1)偏离原曲线在 t1 处的真实值。下面用独立展开的 Bernstein 多项式做参照,
++// 不复用 cubicPointAt/cubicSubcurveFor 本身。
++describe('cubicSubcurveFor de Casteljau 数值正确性', () => {
++  test('子段终点等于原曲线 t1 处真实点', () => {
++    const p0 = { x: 0, y: 0 }
++    const cp1 = { x: 40, y: 120 }
++    const cp2 = { x: 260, y: -80 }
++    const p1 = { x: 300, y: 100 }
++    const t0 = 0.15
++    const t1 = 0.62
++    const segment = cubicSubcurveFor(p0, cp1, cp2, p1, t0, t1)
++    expectPointClose(segment.p1, referenceCubicPointAt(p0, cp1, cp2, p1, t1))
++  })
++
++  test('有缺口时两段的四个端点都落在原曲线上', () => {
++    const p0 = { x: 20, y: 10 }
++    const p1 = { x: 380, y: 220 }
++    const opts: CubicBezierOptions = { outDir: { x: 1, y: 0 }, endOutDir: { x: 0, y: -1 } }
++    const { cp1, cp2 } = cubicControlPointsFor(p0, p1, opts)
++    const gap = { beforeT: 0.35, afterT: 0.68 }
++    const [before, after] = cubicSegmentsFor(p0, p1, gap, opts)
++
++    expectPointClose(before.p0, referenceCubicPointAt(p0, cp1, cp2, p1, 0))
++    expectPointClose(before.p1, referenceCubicPointAt(p0, cp1, cp2, p1, gap.beforeT))
++    expectPointClose(after.p0, referenceCubicPointAt(p0, cp1, cp2, p1, gap.afterT))
++    expectPointClose(after.p1, referenceCubicPointAt(p0, cp1, cp2, p1, 1))
++  })
++
++  test('任意区间子段端点精确落在原曲线', () => {
++    const curves = [
++      { p0: { x: 0, y: 0 }, cp1: { x: 40, y: 120 }, cp2: { x: 260, y: -80 }, p1: { x: 300, y: 100 } },
++      { p0: { x: -50, y: 200 }, cp1: { x: 100, y: -40 }, cp2: { x: 150, y: 400 }, p1: { x: 500, y: 50 } },
++      { p0: { x: 0, y: 0 }, cp1: { x: 0, y: 0 }, cp2: { x: 100, y: 0 }, p1: { x: 100, y: 0 } },
++    ]
++    const intervals: Array<[number, number]> = [
++      [0, 1],
++      [0, 0.5],
++      [0.5, 1],
++      [0.2, 0.8],
++      [0.05, 0.37],
++      [0.63, 0.999],
++      [0.4, 0.4001],
++    ]
++
++    for (const curve of curves) {
++      for (const [t0, t1] of intervals) {
++        const segment = cubicSubcurveFor(curve.p0, curve.cp1, curve.cp2, curve.p1, t0, t1)
++        expectPointClose(segment.p0, referenceCubicPointAt(curve.p0, curve.cp1, curve.cp2, curve.p1, t0))
++        expectPointClose(segment.p1, referenceCubicPointAt(curve.p0, curve.cp1, curve.cp2, curve.p1, t1))
++      }
++    }
++  })
++})
++
++// ── 第二波补钉(2026-08-09):上一波只钉了几何 helper 的返回值,补两处更外层
++// 的判别钉——① 真实调用链(lineLabelGapRangeFor 算出的 gap,不是自己合成的
++// {beforeT, afterT});② 渲染层实际吐出的 path 字符串(cubicPathFor 的输出),
++// 不是 helper 返回的对象属性。 ────────────────────────────────────────────
++describe('cubicSubcurveFor 公开路径与渲染层补钉(第二波)', () => {
++  test('公开路径真实 gap 下四端点仍在原曲线', () => {
++    // 与 leaferLinePaint.ts/MarkupNodeView.tsx 同源:真实 label 节点走
++    // lineLabelGapRangeFor 算出 gap,而不是像上一波那样自己合成 {beforeT, afterT}。
++    const p0 = { x: 0, y: 0 }
++    const p1 = { x: 400, y: 120 }
++    const node: MarkupLabelBox = {
++      width: 400,
++      height: 120,
++      text: 'Hello World Label',
++      fontSize: 14,
++      markupLineRoute: 'smooth',
++    }
++    const gap = lineLabelGapRangeFor(node, [p0, p1], true)
++    expect(gap).not.toBeNull()
++
++    const opts: CubicBezierOptions = { curvature: node.markupCurveBow }
++    const { cp1, cp2 } = cubicControlPointsFor(p0, p1, opts)
++    const [before, after] = cubicSegmentsFor(p0, p1, gap!, opts)
++
++    expectPointClose(before.p0, referenceCubicPointAt(p0, cp1, cp2, p1, 0))
++    expectPointClose(before.p1, referenceCubicPointAt(p0, cp1, cp2, p1, gap!.beforeT))
++    expectPointClose(after.p0, referenceCubicPointAt(p0, cp1, cp2, p1, gap!.afterT))
++    expectPointClose(after.p1, referenceCubicPointAt(p0, cp1, cp2, p1, 1))
++  })
++
++  test('渲染 path 字符串端点与原曲线一致', () => {
++    // 与 leaferLinePaint.ts 同源:子段 → cubicPathFor 吐出的 SVG path 字符串是
++    // 真正被画到屏幕上、被 hitTest 消费的东西;上一波只断言了 segment.p1 这个
++    // 对象属性,没断言"渲染出的字符串"里编码的坐标是否就是那个正确的端点——
++    // 万一 cubicPathFor 参数顺序错了(如把 cp2/p1 传反),helper 层测试也看不出来。
++    const p0 = { x: 30, y: 40 }
++    const p1 = { x: 420, y: 260 }
++    const opts: CubicBezierOptions = { outDir: { x: 1, y: 0 }, endOutDir: { x: 0, y: 1 } }
++    const { cp1, cp2 } = cubicControlPointsFor(p0, p1, opts)
++
++    const t0 = 0.22
++    const t1 = 0.81
++    const segment = cubicSubcurveFor(p0, cp1, cp2, p1, t0, t1)
++    const pathD = cubicPathFor(segment.p0, segment.cp1, segment.cp2, segment.p1)
++
++    const match = pathD.match(
++      /^M ([-\d.]+) ([-\d.]+) C ([-\d.]+) ([-\d.]+), ([-\d.]+) ([-\d.]+), ([-\d.]+) ([-\d.]+)$/,
++    )
++    expect(match).not.toBeNull()
++    const [, mx, my, , , , , ex, ey] = match!
++
++    const round2 = (value: number) => Math.round(value * 100) / 100
++    const expectedStart = referenceCubicPointAt(p0, cp1, cp2, p1, t0)
++    const expectedEnd = referenceCubicPointAt(p0, cp1, cp2, p1, t1)
++
++    expect(Number(mx)).toBeCloseTo(round2(expectedStart.x), 6)
++    expect(Number(my)).toBeCloseTo(round2(expectedStart.y), 6)
++    expect(Number(ex)).toBeCloseTo(round2(expectedEnd.x), 6)
++    expect(Number(ey)).toBeCloseTo(round2(expectedEnd.y), 6)
++  })
++})
++
++describe('cubicPathFor', () => {
++  test('produces valid SVG cubic bezier path', () => {
++    const p0 = { x: 0, y: 0 }
++    const cp1 = { x: 40, y: 0 }
++    const cp2 = { x: 260, y: 100 }
++    const p1 = { x: 300, y: 100 }
++    const d = cubicPathFor(p0, cp1, cp2, p1)
++    expect(d).toBe('M 0 0 C 40 0, 260 100, 300 100')
++  })
++})
++
++// ── endpoint consistency ─────────────────────────────────────────────────
++
++describe('cubic bezier endpoint consistency', () => {
++  test('sampled polyline starts and ends at correct points', () => {
++    const p0 = { x: 100, y: 50 }
++    const p1 = { x: 400, y: 150 }
++    const samples = lineRoutePolylineFor('smooth', p0, p1, {
++      outDir: { x: 1, y: 0 },
++      endOutDir: { x: 0, y: -1 },
++    })
++    expect(samples[0].x).toBeCloseTo(p0.x, 5)
++    expect(samples[0].y).toBeCloseTo(p0.y, 5)
++    expect(samples[16].x).toBeCloseTo(p1.x, 5)
++    expect(samples[16].y).toBeCloseTo(p1.y, 5)
++  })
++
++  test('no overshoot: all sampled points project onto chord within [-0.05, 1.05]', () => {
++    // Bug 2 regression: wrong control-point direction causes the curve to shoot
++    // past the endpoint and hook back, visible as projection t > 1.05 or < -0.05.
++    // This is the "right→left inDir overshoot" catch.
++    const p0 = { x: 0, y: 0 }
++    const p1 = { x: 400, y: 120 }
++    // right→left: a realistic edge from source right to target left
++    const opts: CubicBezierOptions = {
++      outDir: { x: 1, y: 0 },    // source right anchor
++      endOutDir: { x: -1, y: 0 }, // target left anchor
++    }
++    const samples = lineRoutePolylineFor('smooth', p0, p1, opts)
++    const dx = p1.x - p0.x
++    const dy = p1.y - p0.y
++    const len2 = dx * dx + dy * dy
++    let minT = Infinity
++    let maxT = -Infinity
++    for (const s of samples) {
++      // Project sample onto chord via dot product, get parameter t
++      const t = len2 > 0 ? ((s.x - p0.x) * dx + (s.y - p0.y) * dy) / len2 : 0.5
++      minT = Math.min(minT, t)
++      maxT = Math.max(maxT, t)
++    }
++    expect(minT).toBeGreaterThan(-0.05)
++    expect(maxT).toBeLessThan(1.05)
++  })
++})
+diff --git a/src/model/lineRouteGeometry.ts b/src/model/lineRouteGeometry.ts
+index 068d74a6..d85aeb73 100644
+--- a/src/model/lineRouteGeometry.ts
++++ b/src/model/lineRouteGeometry.ts
+@@ -14,6 +14,7 @@ import type { MarkupLineRoute } from '../types/mivoCanvas'
+  */
+ 
+ export type LineRoutePoint = { x: number; y: number }
++export type CubicBezierSegment = { p0: LineRoutePoint; cp1: LineRoutePoint; cp2: LineRoutePoint; p1: LineRoutePoint }
+ 
+ /** 旧档案无 markupLineRoute 字段 = 直线(行为零变化)。 */
+ export const lineRouteOf = (route?: MarkupLineRoute): MarkupLineRoute => route || 'straight'
+@@ -35,6 +36,8 @@ export const chordNormalFor = (
+  * (markupCurveBow,拖拽中点手柄写入;二次贝塞尔 B(0.5)=M+n·bow ⇔ ctrl=M+n·2bow)。
+  * 未给 bow 时用默认弓高:朝弦左侧、途经距 = clamp(弦长×18%, [12,96])/2
+  * (与历史控制点偏移 clamp(len×18%) 完全等价,旧档案渲染零变化)。
++ *
++ * 注:2026-08-07 — curved 保持二次贝塞尔不变（向后兼容）；smooth 路由使用三次贝塞尔。
+  */
+ export const curvedControlPointFor = (
+   p0: LineRoutePoint,
+@@ -51,6 +54,136 @@ export const curvedControlPointFor = (
+   }
+ }
+ 
++// ── 三次贝塞尔(smooth 路由) ───────────────────────────────────────────
++// 控制点方向由锚点边的出射方向决定，两端统一使用 outDir：
++//   CP1 = P0 + outDir(startAnchor) * c
++//   CP2 = P1 + outDir(endAnchor)   * c
++// 控制点都从各自节点"往外伸"，端点切线由贝塞尔参数化自然翻转。
++// 无锚点信息时兜底用弦占优方向：outDir=轴向，endOutDir=-outDir（镜像 S 形）。
++
++/** 三次贝塞尔控制点方向选项。
++ *  - outDir: P0 出发方向（connectorStart 锚点边的出射方向；未提供 → 弦占优轴向）
++ *  - endOutDir: CP2 方向（connectorEnd 锚点边的出射方向；未提供 → -outDir 镜像兜底）
++ *  - curvature: 曲率偏移距，clamp(len×0.45, [40, 200])（未提供时自动计算） */
++export type CubicBezierOptions = {
++  outDir?: LineRoutePoint
++  endOutDir?: LineRoutePoint
++  curvature?: number
++}
++
++/** 三次贝塞尔控制点对。
++ *  两端统一 outDir 语义：控制点都从各自节点"往外伸"。 */
++export const cubicControlPointsFor = (
++  p0: LineRoutePoint,
++  p1: LineRoutePoint,
++  opts?: CubicBezierOptions,
++): { cp1: LineRoutePoint; cp2: LineRoutePoint } => {
++  const dx = p1.x - p0.x
++  const dy = p1.y - p0.y
++  const len = Math.hypot(dx, dy)
++  if (len <= 0) return { cp1: { x: p0.x, y: p0.y }, cp2: { x: p1.x, y: p1.y } }
++  // 兜底曲率：clamp(len×0.45, [40,200])，比参考项目 dx×0.5 略保守以适配任意方向
++  const c = opts?.curvature ?? Math.min(200, Math.max(40, len * 0.45))
++
++  // 兜底:弦占优轴向(水平优先),与参考项目行为一致
++  const fallbackOutDir = (): LineRoutePoint =>
++    Math.abs(dx) >= Math.abs(dy)
++      ? { x: dx >= 0 ? 1 : -1, y: 0 }
++      : { x: 0, y: dy >= 0 ? 1 : -1 }
++
++  const outDir = opts?.outDir ?? fallbackOutDir()
++  const endOutDir = opts?.endOutDir ?? { x: -outDir.x, y: -outDir.y }
++
++  return {
++    cp1: { x: p0.x + outDir.x * c, y: p0.y + outDir.y * c },
++    cp2: { x: p1.x + endOutDir.x * c, y: p1.y + endOutDir.y * c },
++  }
++}
++
++const cubicPointAt = (
++  p0: LineRoutePoint,
++  cp1: LineRoutePoint,
++  cp2: LineRoutePoint,
++  p1: LineRoutePoint,
++  t: number,
++): LineRoutePoint => {
++  const mt = 1 - t
++  const mt2 = mt * mt
++  const t2 = t * t
++  return {
++    x: mt2 * mt * p0.x + 3 * mt2 * t * cp1.x + 3 * mt * t2 * cp2.x + t2 * t * p1.x,
++    y: mt2 * mt * p0.y + 3 * mt2 * t * cp1.y + 3 * mt * t2 * cp2.y + t2 * t * p1.y,
++  }
++}
++
++/** 三次贝塞尔 SVG path。 */
++export const cubicPathFor = (
++  p0: LineRoutePoint,
++  cp1: LineRoutePoint,
++  cp2: LineRoutePoint,
++  p1: LineRoutePoint,
++): string =>
++  `M ${fmt(p0.x)} ${fmt(p0.y)} C ${fmt(cp1.x)} ${fmt(cp1.y)}, ${fmt(cp2.x)} ${fmt(cp2.y)}, ${fmt(p1.x)} ${fmt(p1.y)}`
++
++/** 三次贝塞尔切线角(弧度)：B'(0) = 3(CP1-P0), B'(1) = 3(P1-CP2)。 */
++const cubicHeadAnglesFor = (
++  p0: LineRoutePoint,
++  cp1: LineRoutePoint,
++  cp2: LineRoutePoint,
++  p1: LineRoutePoint,
++): { start: number; end: number } => ({
++  start: Math.atan2(cp1.y - p0.y, cp1.x - p0.x) + Math.PI,
++  end: Math.atan2(p1.y - cp2.y, p1.x - cp2.x),
++})
++
++/** 三次贝塞尔 de Casteljau [t0,t1] 子段(子段仍是三次贝塞尔)。 */
++export const cubicSubcurveFor = (
++  p0: LineRoutePoint,
++  cp1: LineRoutePoint,
++  cp2: LineRoutePoint,
++  p1: LineRoutePoint,
++  t0: number,
++  t1: number,
++): CubicBezierSegment => {
++  // De Casteljau 分割：先切出 [t0,1]，再从中切出 [0,(t1-t0)/(1-t0)]
++  if (t0 <= 0 && t1 >= 1) return { p0, cp1, cp2, p1 }
++  const lerp = (a: LineRoutePoint, b: LineRoutePoint, t: number): LineRoutePoint => ({
++    x: a.x + (b.x - a.x) * t,
++    y: a.y + (b.y - a.y) * t,
++  })
++  // de Casteljau cutoff at t0
++  const a = lerp(p0, cp1, t0)
++  const b = lerp(cp1, cp2, t0)
++  const c = lerp(cp2, p1, t0)
++  const d = lerp(a, b, t0)
++  const e = lerp(b, c, t0)
++  const f = lerp(d, e, t0)
++  // Remaining subcurve from t0 to 1
++  const s = t1 <= 1 ? (t1 - t0) / (1 - t0) : 1
++  const g = lerp(f, e, s)
++  const h = lerp(e, c, s)
++  const i = lerp(c, p1, s)
++  const j = lerp(g, h, s)
++  const k = lerp(h, i, s)
++  const l = lerp(j, k, s)
++  return { p0: f, cp1: g, cp2: j, p1: l }
++}
++
++/** smooth 路由的线体子段:无缺口 = 1 段完整三次贝塞尔，有缺口 = 2 段。 */
++export const cubicSegmentsFor = (
++  p0: LineRoutePoint,
++  p1: LineRoutePoint,
++  gap?: LineRouteGapRange,
++  opts?: CubicBezierOptions,
++): CubicBezierSegment[] => {
++  const { cp1, cp2 } = cubicControlPointsFor(p0, p1, opts)
++  if (!gap) return [{ p0, cp1, cp2, p1 }]
++  return [
++    cubicSubcurveFor(p0, cp1, cp2, p1, 0, gap.beforeT),
++    cubicSubcurveFor(p0, cp1, cp2, p1, gap.afterT, 1),
++  ]
++}
++
+ /**
+  * 直角拐弯的途经点(含两端点)。横向占优 → 横-竖-横(中线 Z 形);
+  * 纵向占优 → 竖-横-竖,避免几乎垂直的线出现一长两短的贴边拐弯。
+@@ -81,16 +214,24 @@ const quadraticPointAt = (
+   }
+ }
+ 
+-/** 路由折线近似(直线原样两点、elbow 途经点、curved 采样 16 段)——命中检测消费。 */
++/** 路由折线近似(直线原样两点、elbow 途经点、curved 二次/smooth 三次贝塞尔采样 16 段)——命中检测消费。 */
+ export const lineRoutePolylineFor = (
+   route: MarkupLineRoute,
+   p0: LineRoutePoint,
+   p1: LineRoutePoint,
+-  bow?: number,
++  opts?: CubicBezierOptions,
+ ): LineRoutePoint[] => {
+   if (route === 'elbow') return elbowWaypointsFor(p0, p1)
++  if (route === 'smooth') {
++    const { cp1, cp2 } = cubicControlPointsFor(p0, p1, opts)
++    const points: LineRoutePoint[] = []
++    for (let i = 0; i <= CURVE_SAMPLES; i += 1) {
++      points.push(cubicPointAt(p0, cp1, cp2, p1, i / CURVE_SAMPLES))
++    }
++    return points
++  }
+   if (route === 'curved') {
+-    const ctrl = curvedControlPointFor(p0, p1, bow)
++    const ctrl = curvedControlPointFor(p0, p1, opts?.curvature)
+     const points: LineRoutePoint[] = []
+     for (let i = 0; i <= CURVE_SAMPLES; i += 1) {
+       points.push(quadraticPointAt(p0, ctrl, p1, i / CURVE_SAMPLES))
+@@ -114,14 +255,19 @@ export const quadraticPathFor = (
+   p1: LineRoutePoint,
+ ): string => `M ${fmt(p0.x)} ${fmt(p0.y)} Q ${fmt(ctrl.x)} ${fmt(ctrl.y)} ${fmt(p1.x)} ${fmt(p1.y)}`
+ 
+-/** SVG path 字符串(节点本地坐标)——DOM <path d> 与 Leafer Path.path 共用。 */
++/** SVG path 字符串(节点本地坐标)——DOM <path d> 与 Leafer Path.path 共用。
++ *  curved=二次贝塞尔(Q), smooth=三次贝塞尔(C)。 */
+ export const lineRoutePathFor = (
+   route: MarkupLineRoute,
+   p0: LineRoutePoint,
+   p1: LineRoutePoint,
+-  bow?: number,
++  opts?: CubicBezierOptions,
+ ): string => {
+-  if (route === 'curved') return quadraticPathFor(p0, curvedControlPointFor(p0, p1, bow), p1)
++  if (route === 'smooth') {
++    const { cp1, cp2 } = cubicControlPointsFor(p0, p1, opts)
++    return cubicPathFor(p0, cp1, cp2, p1)
++  }
++  if (route === 'curved') return quadraticPathFor(p0, curvedControlPointFor(p0, p1, opts?.curvature), p1)
+   if (route === 'elbow') return polylinePathFor(elbowWaypointsFor(p0, p1))
+   return polylinePathFor([p0, p1])
+ }
+@@ -219,17 +365,21 @@ export const lineRouteLengthFor = (
+   route: MarkupLineRoute,
+   p0: LineRoutePoint,
+   p1: LineRoutePoint,
+-  bow?: number,
+-): number => polylineLengthOf(lineRoutePolylineFor(route, p0, p1, bow))
++  opts?: CubicBezierOptions,
++): number => polylineLengthOf(lineRoutePolylineFor(route, p0, p1, opts))
+ 
+-/** 路由线体中点(label 悬挂位;straight/curved 取参数 0.5,elbow 取弧长 0.5)。 */
++/** 路由线体中点(label 悬挂位;straight/curved/smooth 取参数 0.5,elbow 取弧长 0.5)。 */
+ export const lineRouteMidpointFor = (
+   route: MarkupLineRoute,
+   p0: LineRoutePoint,
+   p1: LineRoutePoint,
+-  bow?: number,
++  opts?: CubicBezierOptions,
+ ): LineRoutePoint => {
+-  if (route === 'curved') return quadraticPointAt(p0, curvedControlPointFor(p0, p1, bow), p1, 0.5)
++  if (route === 'smooth') {
++    const { cp1, cp2 } = cubicControlPointsFor(p0, p1, opts)
++    return cubicPointAt(p0, cp1, cp2, p1, 0.5)
++  }
++  if (route === 'curved') return quadraticPointAt(p0, curvedControlPointFor(p0, p1, opts?.curvature), p1, 0.5)
+   if (route === 'elbow') return polylineArcPointAt(elbowWaypointsFor(p0, p1), 0.5).point
+   return { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2 }
+ }
+@@ -246,10 +396,14 @@ export const lineRouteHeadAnglesFor = (
+   route: MarkupLineRoute,
+   p0: LineRoutePoint,
+   p1: LineRoutePoint,
+-  bow?: number,
++  opts?: CubicBezierOptions,
+ ): { start: number; end: number } => {
++  if (route === 'smooth') {
++    const { cp1, cp2 } = cubicControlPointsFor(p0, p1, opts)
++    return cubicHeadAnglesFor(p0, cp1, cp2, p1)
++  }
+   if (route === 'curved') {
+-    const ctrl = curvedControlPointFor(p0, p1, bow)
++    const ctrl = curvedControlPointFor(p0, p1, opts?.curvature)
+     return { start: angleBetween(p0, ctrl) + Math.PI, end: angleBetween(ctrl, p1) }
+   }
+   if (route === 'elbow') {
+diff --git a/src/render/engineSpikeLod.test.ts b/src/render/engineSpikeLod.test.ts
+index f0005a93..342ee7d2 100644
+--- a/src/render/engineSpikeLod.test.ts
++++ b/src/render/engineSpikeLod.test.ts
+@@ -31,6 +31,22 @@ describe('engineSpikeLod — 0g 全景 LOD 候选集', () => {
+     expect(shouldUseEngineLod(node({ id: 's', type: 'markup', markupKind: 'stamp' }), viewport)).toBe(false)
+   })
+ 
++  // 判别钉(2026-08-08 真机"生成时连线塌成色块,拖一下才恢复"):derivation edge
++  // 永不 LOD——包围盒判据对线不成立(近水平长线的盒高才 24px,生成结果又默认
++  // 放在源图旁边,稍一缩放整条可见的线就被换成色块)。删掉豁免本测试当场红。
++  it('derivation edge 永不 LOD:同尺寸同缩放下普通 arrow 会 LOD、派生连线不会', () => {
++    const viewport = { x: 0, y: 0, scale: 0.1 }
++    const plain = node({ id: 'a2', type: 'markup', markupKind: 'arrow' })
++    const derivation = node({
++      id: 'derivation-e1',
++      type: 'markup',
++      markupKind: 'arrow',
++      generation: { model: 'Mivo Derivation Edge', prompt: '' },
++    } as Partial<MivoCanvasNode>)
++    expect(shouldUseEngineLod(plain, viewport)).toBe(true) // 对照组:判据仍在
++    expect(shouldUseEngineLod(derivation, viewport)).toBe(false) // 豁免生效
++  })
++
+   it('summary reports image/text/shape/line buckets and high-fidelity remainder', () => {
+     const viewport = { x: 0, y: 0, scale: 0.1 }
+     const stats = summarizeEngineLod(
+diff --git a/src/render/engineSpikeLod.ts b/src/render/engineSpikeLod.ts
+index 7e743c98..93ba3106 100644
+--- a/src/render/engineSpikeLod.ts
++++ b/src/render/engineSpikeLod.ts
+@@ -1,5 +1,6 @@
+ import type { MivoCanvasNode } from '../types/mivoCanvas'
+ import { debugLogger } from '../store/debugLogStore'
++import { isDerivationEdgeNode } from '../store/nodeFactory'
+ import type { RendererMode } from './rendererMode'
+ import type { ViewportState } from './useLeaferSpikeRenderer'
+ import { engineLodMode, engineLodThresholdPx } from './engineLodMode'
+@@ -52,6 +53,11 @@ export const isEngineLodLineCandidate = (node: MivoCanvasNode): boolean =>
+ 
+ export const shouldUseEngineLod = (node: MivoCanvasNode, viewport: ViewportState): boolean =>
+   engineLodMode === 'on' &&
++  // derivation edge 永不 LOD:判据是"包围盒最大边×scale<32",对图片合理,对线荒谬——
++  // 生成结果默认放在源图旁边(dx 天然小),近水平连线的包围盒高才 24px,稍一缩放
++  // 整条明明可见的长线就塌缩成色块(2026-08-08 真机:"生成时连线状态奇怪,拖一下
++  // 就好了"——拖开后包围盒变大退出 LOD)。连线数量少(≈edges 数),绘制便宜,豁免。
++  !isDerivationEdgeNode(node) &&
+   (node.type === 'image' ||
+     node.type === 'text' ||
+     isEngineLodShapeCandidate(node) ||
+diff --git a/src/render/hitTest.test.ts b/src/render/hitTest.test.ts
+index 4e1a86b5..313bbbb1 100644
+--- a/src/render/hitTest.test.ts
++++ b/src/render/hitTest.test.ts
+@@ -135,6 +135,33 @@ describe('pointInMarkupStroke', () => {
+     expect(pointInMarkupStroke(node, { x: 200, y: 0 }, tol)).toBe(false) // past the end segment
+   })
+ 
++  // 判别钉(2026-08-08"hover 时灵时不灵/点选不中"根因):smooth 路由的命中曲线
++  // 必须与渲染曲线同源 —— 带锚点方向。偏垂直的弦下,兜底方向(弦占优=垂直)与
++  // 渲染方向(锚点=水平出入)的曲线在 t=0.25 处差 ~54px,漏传方向参数本测试当场红。
++  it('smooth 路由:带 connector 锚点时按渲染同源曲线命中(方向参数不许丢)', () => {
++    const base = {
++      id: 'sm1',
++      type: 'markup' as const,
++      markupKind: 'arrow' as const,
++      markupLineRoute: 'smooth' as const,
++      geometry: { x: 0, y: 0, width: 40, height: 300, rotation: 0 },
++      markupPoints: [{ x: 0, y: 0 }, { x: 40, y: 300 }],
++    }
++    const withAnchors = makeNode({
++      ...base,
++      connectorStart: { nodeId: 'src', anchor: 'right' as const },
++      connectorEnd: { nodeId: 'tgt', anchor: 'left' as const },
++    })
++    const withoutAnchors = makeNode({ ...base, id: 'sm2' })
++    // 渲染曲线(right/left 锚点,c=clamp(302.65×0.45,[40,200])≈136.2)在 t=0.25
++    // 的点 ≈ (44.6, 46.9);兜底曲线(弦占优=垂直)同参数点 ≈ (6.2, 85.2)。
++    const onRenderedCurve = { x: 44.6, y: 46.9 }
++    expect(pointInMarkupStroke(withAnchors, onRenderedCurve, tol)).toBe(true)
++    // 同一点在"无锚点信息"的兜底曲线上必须命不中 —— 两条曲线确实不同,
++    // 这保证了上面的 true 是"方向参数生效"而非容差撞大运。
++    expect(pointInMarkupStroke(withoutAnchors, onRenderedCurve, tol)).toBe(false)
++  })
++
+   it('line: local points + geometry offset hit in canvas space', () => {
+     // Node at (200,100); local points (0,0)→(100,0) → canvas (200,100)→(300,100).
+     const node = makeNode({
+diff --git a/src/render/hitTest.ts b/src/render/hitTest.ts
+index 5ea6c2f7..8dd1b62e 100644
+--- a/src/render/hitTest.ts
++++ b/src/render/hitTest.ts
+@@ -23,6 +23,7 @@
+ // CanvasNodeView SVG stay untouched; the hit layer converts internally.
+ 
+ import { lineRouteOf, lineRoutePolylineFor } from '../model/lineRouteGeometry'
++import { cubicOptionsForConnectors } from '../model/connectorGeometry'
+ import type { RenderAnchor, RenderNode } from './projection'
+ 
+ export type CanvasPoint = { x: number; y: number }
+@@ -168,7 +169,18 @@ export const pointInMarkupStroke = (
+       // 直线路由保持原两点线段判定。
+       const route = lineRouteOf(node.markupLineRoute)
+       if (route !== 'straight') {
+-        return distToPolyline(point, lineRoutePolylineFor(route, pts[0], pts[1], node.markupCurveBow)) <= tol
++        // 方向参数必须与渲染同源(cubicOptionsForConnectors):smooth 路由的曲线形状
++        // 由锚点出射方向决定,漏传会退回弦占优兜底 → 命中曲线 ≠ 渲染曲线,
++        // 偏垂直的连线在线体上 hover/点击命不中(2026-08-08 真机)。
++        return distToPolyline(
++          point,
++          lineRoutePolylineFor(
++            route,
++            pts[0],
++            pts[1],
++            cubicOptionsForConnectors(node.connectorStart, node.connectorEnd, node.markupCurveBow),
++          ),
++        ) <= tol
+       }
+       return distToSegment(point, pts[0], pts[1]) <= tol
+     }
+diff --git a/src/render/leaferLinePaint.test.ts b/src/render/leaferLinePaint.test.ts
+index 3637bf6c..173254c3 100644
+--- a/src/render/leaferLinePaint.test.ts
++++ b/src/render/leaferLinePaint.test.ts
+@@ -1,4 +1,4 @@
+-import { beforeEach, describe, expect, it, vi } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ // Mock 'leafer-ui' with lightweight fake display objects so the paint module can
+ // be exercised without a real canvas. The fakes record props (for DOM-parity
+@@ -283,6 +283,52 @@ describe('linePaintPropsFor — DOM 视觉等价（消费 projection 下沉缺
+   })
+ })
+ 
++describe('derivationEdgeVisualFor（linePaintPropsFor 内部）— CSS token 数值解析(legit 0 不被 || 吞成默认值)', () => {
++  const derivationLineNode = (opts: Partial<MivoCanvasNode> = {}): MivoCanvasNode =>
++    lineNode({ generation: { prompt: '', model: 'Mivo Derivation Edge' } as never, ...opts })
++
++  /** 只 stub derivation edge 路径读的两个全局(document.documentElement.getAttribute
++   *  与 getComputedStyle),不进 happy-dom——与文件其余测试共享 Node 测试环境。 */
++  const stubDerivationCssVars = (vars: { width?: string; opacity?: string; color?: string }) => {
++    vi.stubGlobal('document', {
++      documentElement: { getAttribute: () => null },
++    })
++    vi.stubGlobal('getComputedStyle', () => ({
++      getPropertyValue: (name: string) => {
++        if (name === '--edge-derivation-width') return vars.width ?? ''
++        if (name === '--edge-derivation-opacity') return vars.opacity ?? ''
++        if (name === '--edge-derivation') return vars.color ?? ''
++        return ''
++      },
++    }))
++  }
++
++  afterEach(() => {
++    vi.unstubAllGlobals()
++  })
++
++  it('CSS token 为 0 时不被吞成默认值（strokeWidth/opacity 合法 0 必须原样通过）', () => {
++    stubDerivationCssVars({ width: '0', opacity: '0' })
++    const props = linePaintPropsFor(projectNode(derivationLineNode()), undefined)
++    expect(props.main.strokeWidth).toBe(0)
++    expect(props.main.opacity).toBe(0)
++  })
++
++  it('CSS token 空串/NaN 仍兜默认（未声明变量 / 写坏值）', () => {
++    stubDerivationCssVars({ width: '', opacity: 'not-a-number' })
++    const props = linePaintPropsFor(projectNode(derivationLineNode()), undefined)
++    expect(props.main.strokeWidth).toBe(2)
++    expect(props.main.opacity).toBe(0.88)
++  })
++
++  it('非 0 的正常合法值原样通过（非退化场景不受影响）', () => {
++    stubDerivationCssVars({ width: '4', opacity: '0.5' })
++    const props = linePaintPropsFor(projectNode(derivationLineNode()), undefined)
++    expect(props.main.strokeWidth).toBe(4)
++    expect(props.main.opacity).toBe(0.5)
++  })
++})
++
+ describe('createLeaferLinePaint — diffReconcilePlan 收支 (no leak, no resurrect)', () => {
+   let leafer: ReturnType<typeof makeFakeLeafer>
+   let paint: LeaferLinePaint
+diff --git a/src/render/leaferLinePaint.ts b/src/render/leaferLinePaint.ts
+index cadac890..1d6c8e9d 100644
+--- a/src/render/leaferLinePaint.ts
++++ b/src/render/leaferLinePaint.ts
+@@ -79,6 +79,9 @@ import {
+   transformArrowHeadPoints,
+ } from '../model/arrowHeadGeometry'
+ import {
++  type CubicBezierOptions,
++  cubicPathFor,
++  cubicSegmentsFor,
+   curvedSegmentsFor,
+   elbowSegmentsFor,
+   lineRouteHeadAnglesFor,
+@@ -86,6 +89,8 @@ import {
+   polylinePathFor,
+   quadraticPathFor,
+ } from '../model/lineRouteGeometry'
++import { cubicOptionsForConnectors } from '../model/connectorGeometry'
++import { isDerivationEdgeNode } from '../store/nodeFactory'
+ import type { MarkupArrowHead, MarkupLineRoute, MivoCanvasNode } from '../types/mivoCanvas'
+ import { debugLogger } from '../store/debugLogStore'
+ import { engineLodFillFor, shouldUseEngineLod } from './engineSpikeLod'
+@@ -230,6 +235,29 @@ export const lineLodPaintPropsFor = (
+   ...(zIndex !== undefined ? { zIndex } : {}),
+ })
+ 
++/** CSS 变量数值解析:`Number(raw) || fallback` 会把合法的 0 也吞成 fallback
++ *  (0 是 falsy)。显式校验 Number.isFinite,只有空串/NaN 才兜默认。 */
++const finiteCssNumber = (raw: string, fallback: number): number => {
++  if (raw === '') return fallback
++  const parsed = Number(raw)
++  return Number.isFinite(parsed) ? parsed : fallback
++}
++
++/** 从 CSS 变量读取 derivation edge 的视觉属性。
++ *  不读节点数据——derivation edge 的颜色/线宽/不透明度由主题驱动,渲染时解析。 */
++const derivationEdgeVisualFor = () => {
++  if (typeof document === 'undefined') return null
++  const isDark = document.documentElement.getAttribute('data-mivo-theme') === 'dark'
++  // 与 App.css 的 --edge-derivation 两档同值(light = 60% 强度混合 #979a9d)。
++  const fallbackColor = isDark ? '#9da8b5' : '#979a9d'
++  const style = getComputedStyle(document.documentElement)
++  return {
++    color: style.getPropertyValue('--edge-derivation').trim() || fallbackColor,
++    width: finiteCssNumber(style.getPropertyValue('--edge-derivation-width').trim(), 2),
++    opacity: finiteCssNumber(style.getPropertyValue('--edge-derivation-opacity').trim(), 0.88),
++  }
++}
++
+ /**
+  * Map a projected RenderNode → Leafer paint props for one line/arrow node.
+  * Every visual key on `main` is ALWAYS present (undefined = clear) so the
+@@ -254,17 +282,22 @@ export const linePaintPropsFor = (
+     labelActive,
+   )
+ 
++  // derivation edge: 颜色/线宽/不透明度从 CSS 变量读取(主题驱动),不取节点属性。
++  // 存量节点的 markupStrokeColor/markupStrokeWidth/markupOpacity 被忽略。
++  const isDerivation = isDerivationEdgeNode(r as unknown as MivoCanvasNode)
++  const edgeVis = isDerivation ? derivationEdgeVisualFor() : null
++
+   const stroke = firstVisibleStroke(r)
+-  const strokeWidth = stroke?.width ?? 0
++  const strokeColor = isDerivation && edgeVis ? edgeVis.color : stroke?.color
++  const strokeWidth = isDerivation && edgeVis ? edgeVis.width : (stroke?.width ?? 0)
+   // strokeOpacity goes on the main Line OBJECT, not a solid-paint object:
+   // Leafer 2.1.10 does not apply `{type:'solid', color, opacity}` opacity on a
+   // stroke at render time (pixel-probed: DOM #000@0.82 over beige = (40,39,37),
+   // Leafer painted (0,0,0) full-opacity). A Line has no fill, so object-level
+   // opacity is exactly the DOM strokeOpacity semantics; the chevron heads are
+   // separate full-opacity objects (DOM marker has no strokeOpacity), unaffected.
+-  const strokeOpacity = stroke?.opacity ?? r.markupOpacity ?? 1
++  const strokeOpacity = isDerivation && edgeVis ? edgeVis.opacity : (stroke?.opacity ?? r.markupOpacity ?? 1)
+   const dashed = stroke?.style === 'dashed'
+-
+   // 端点样式:枚举优先,旧档案回退布尔(arrowHeadGeometry 单一来源)。
+   const startHeadKind = effectiveStartHeadFor(r)
+   const endHeadKind = effectiveEndHeadFor(r)
+@@ -330,18 +363,28 @@ export const linePaintPropsFor = (
+       [start, end],
+       labelActive,
+     )
++    // 与 hitTest 同源(cubicOptionsForConnectors),渲染曲线 ≡ 命中曲线。
++    const bezierOpts: CubicBezierOptions = cubicOptionsForConnectors(
++      r.connectorStart,
++      r.connectorEnd,
++      r.markupCurveBow,
++    )
+     const segmentPaths =
+-      route === 'curved'
+-        ? curvedSegmentsFor(start, end, gap || undefined, r.markupCurveBow).map((seg) =>
+-            quadraticPathFor(rotatePoint(seg.p0), rotatePoint(seg.ctrl), rotatePoint(seg.p1)),
++      route === 'smooth'
++        ? cubicSegmentsFor(start, end, gap || undefined, bezierOpts).map((seg) =>
++            cubicPathFor(rotatePoint(seg.p0), rotatePoint(seg.cp1), rotatePoint(seg.cp2), rotatePoint(seg.p1)),
+           )
+-        : elbowSegmentsFor(start, end, gap || undefined).map((polyline) => polylinePathFor(polyline.map(rotatePoint)))
+-    const headAngles = lineRouteHeadAnglesFor(route, start, end, r.markupCurveBow)
++        : route === 'curved'
++          ? curvedSegmentsFor(start, end, gap || undefined, r.markupCurveBow).map((seg) =>
++              quadraticPathFor(rotatePoint(seg.p0), rotatePoint(seg.ctrl), rotatePoint(seg.p1)),
++            )
++          : elbowSegmentsFor(start, end, gap || undefined).map((polyline) => polylinePathFor(polyline.map(rotatePoint)))
++    const headAngles = lineRouteHeadAnglesFor(route, start, end, bezierOpts)
+     const hasHead = showStartArrow || showEndArrow
+     const routePathProps = (pathD: string): Record<string, unknown> => ({
+       path: pathD,
+       fill: undefined,
+-      stroke: stroke?.color,
++      stroke: strokeColor,
+       strokeWidth,
+       strokeCap: hasHead ? 'butt' : 'round',
+       strokeJoin: 'round',
+@@ -372,7 +415,7 @@ export const linePaintPropsFor = (
+     hasEndMarker: boolean,
+   ): Record<string, unknown> => ({
+     points: [segment.start.x, segment.start.y, segment.end.x, segment.end.y],
+-    stroke: stroke?.color,
++    stroke: strokeColor,
+     strokeWidth,
+     strokeCap: hasStartMarker || hasEndMarker ? 'butt' : 'round',
+     dashPattern: dashed ? dashPatternFor(strokeWidth) : undefined,
+diff --git a/src/render/leaferPaintSignature.test.ts b/src/render/leaferPaintSignature.test.ts
+index ba0a65e4..0d621623 100644
+--- a/src/render/leaferPaintSignature.test.ts
++++ b/src/render/leaferPaintSignature.test.ts
+@@ -113,6 +113,13 @@ describe('paintSignatureFor — 字段覆盖契约（漏字段 = 视觉漂移）
+     expect(s2).not.toBe(s1)
+   })
+ 
++  it('theme 变化 → 签名翻转（同一节点在两个 theme 下 paint signature 不同，主题切换重绘触发链的后一半：签名变了才会重 set）', () => {
++    const node = baseNode()
++    const s1 = paintSignatureFor(node, ctx({ theme: 'light' }))
++    const s2 = paintSignatureFor(node, ctx({ theme: 'dark' }))
++    expect(s2).not.toBe(s1)
++  })
++
+   it('selectedNodeIds 变化 → 签名不变（paint 模块不读 selection，selection 是 DOM overlay 关注点）', () => {
+     const node = baseNode()
+     const s1 = paintSignatureFor(node, ctx({ selectedNodeIds: new Set() }))
+diff --git a/src/render/leaferPaintSignature.ts b/src/render/leaferPaintSignature.ts
+index b8fd3f5d..115649d1 100644
+--- a/src/render/leaferPaintSignature.ts
++++ b/src/render/leaferPaintSignature.ts
+@@ -88,5 +88,18 @@ export const paintSignatureFor = (
+     // ctx 输入
+     zIndex: ctx.layerOf?.(node.id),
+     isEditing: ctx.editingNodeId === node.id,
++    // derivation edge 颜色由主题驱动 → 主题切换必须触发重绘。
++    //
++    // 有意取舍:theme 进的是全节点类型的签名,不是只给 derivation edge 单独开一个
++    // 窄字段。收窄成"只有 markupKind 命中派生连线才带 theme"看起来更精确,但
++    // 主题切换是低频操作(用户手动切换或插件宿主外部灌入,一次会话可能只发生
++    // 0~几次),换来的省的是「非派生连线节点在主题切换那一刻多一次 set」,代价
++    // 却是:未来任何新增的主题化节点(如 frame/section 主题色扩展)一旦忘了同步
++    // 收窄这份白名单,就会在主题切换后悄悄留旧色——直到该节点因其他字段变更被
++    // 迫触发下一次 set 才补上,期间的视觉漂移无日志、无报错,只能靠肉眼在切换
++    // 主题时发现。代价上界很小:多一个短字符串字段进 JSON.stringify,35 字段/
++    // 节点、1000 节点 ≈ 1-2ms 的既有开销里可忽略(见文件头 profiling 备注)。
++    // 低频操作换低频重画,精确早退换潜在的静默失配——这里选后者更安全。
++    theme: ctx.theme,
+   })
+ }
+diff --git a/src/render/projection.ts b/src/render/projection.ts
+index b60c6ece..fbb29fff 100644
+--- a/src/render/projection.ts
++++ b/src/render/projection.ts
+@@ -254,6 +254,9 @@ const FRAME_STROKE_COLOR_DEFAULT = '#ff8a00'
+ const FRAME_STROKE_WIDTH_DEFAULT = 2
+ const FRAME_STROKE_STYLE_DEFAULT: MarkupStrokeStyle = 'dashed'
+ const MARKUP_FILL_DEFAULT = 'rgba(105, 87, 232, 0.08)'
++// 通用 markup(用户手画标注)的兜底色 —— 历史默认紫,不是 derivation edge 的
++// 主题色(那个走 --edge-derivation)。2026-08-08 曾被误扫成连线灰蓝,已复原:
++// 改这里会让无色的手画标注跟自动连线混色。
+ const MARKUP_STROKE_COLOR_DEFAULT = '#6957e8'
+ const MARKUP_STROKE_WIDTH_DEFAULT = 3
+ const MARKUP_STROKE_STYLE_DEFAULT: MarkupStrokeStyle = 'solid'
+diff --git a/src/render/rendererAdapter.ts b/src/render/rendererAdapter.ts
+index 48534aaf..b35fc141 100644
+--- a/src/render/rendererAdapter.ts
++++ b/src/render/rendererAdapter.ts
+@@ -51,6 +51,9 @@ export type RendererSyncContext = {
+   /** FU-11: 正在文字编辑的节点 id。line paint 用它在编辑空 label 时也断开线体
+    *  （DOM 侧此刻已渲染编辑器）——与 DOM 的 lineLabelActive(editing||text) 同口径。 */
+   editingNodeId?: string
++  /** data-mivo-theme 属性值(空串=light)。derivation edge 颜色由此驱动，
++   *  主题切换→签名变化→自动重绘。 */
++  theme?: string
+ }
+ 
+ /** A record of create/update/delete operations a sync performed. Contract tests
+diff --git a/src/render/useDocumentThemeAttribute.test.ts b/src/render/useDocumentThemeAttribute.test.ts
+new file mode 100644
+index 00000000..f20a6303
+--- /dev/null
++++ b/src/render/useDocumentThemeAttribute.test.ts
+@@ -0,0 +1,265 @@
++// @vitest-environment happy-dom
++//
++// data-mivo-theme 由 Cindy 插件宿主从外部灌入,本应用自身从不写这个属性(见
++// useDocumentThemeAttribute.ts 头部注释)。没有观察器就没有触发源——这三个测试
++// 钉住"外部改写属性 → hook 返回新值"这条唯一存在意义的行为,而不是纯函数层面的
++// 字符串解析(那没有争议,真正的坑在"谁通知了 React")。
++//
++// harness 沿用 useRegionEditFlip.test.tsx 的先例:react-dom/client + React 19 act,
++// 不引入 @testing-library。用 createElement 而非 JSX——文件是 .ts 不是 .tsx。
++import { act, createElement, useEffect } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++const THEME_ATTR = 'data-mivo-theme'
++
++let container: HTMLDivElement
++let root: Root
++let captured: string
++
++/** MutationObserver 回调是微任务派发,React 的 useSyncExternalStore 重渲染跟在
++ *  后面;等一个宏任务边界,保证两者都已落定(纯 Promise.resolve() 微任务链在不同
++ *  React 调度路径下深度不完全确定,宏任务边界更稳)。 */
++const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
++
++beforeEach(async () => {
++  document.documentElement.removeAttribute(THEME_ATTR)
++  container = document.createElement('div')
++  document.body.appendChild(container)
++  root = createRoot(container)
++  captured = ''
++  // 每个测试拿一份全新的模块级单例(cachedTheme/listeners/observer),不跨测试残留
++  // 上一次的订阅者集合或缓存值。
++  vi.resetModules()
++})
++
++afterEach(() => {
++  act(() => {
++    root.unmount()
++  })
++  container.remove()
++  document.documentElement.removeAttribute(THEME_ATTR)
++})
++
++const mountHarness = async () => {
++  const { useDocumentThemeAttribute } = await import('./useDocumentThemeAttribute')
++  function Harness() {
++    const theme = useDocumentThemeAttribute()
++    useEffect(() => {
++      captured = theme
++    })
++    return null
++  }
++  act(() => {
++    root.render(createElement(Harness))
++  })
++}
++
++describe('useDocumentThemeAttribute — 外部 DOM mutation 转成可订阅 state（派生连线重绘的触发源）', () => {
++  it('外部改写 data-mivo-theme 后 hook 返回新值', async () => {
++    await mountHarness()
++    expect(captured).toBe('')
++
++    act(() => {
++      document.documentElement.setAttribute(THEME_ATTR, 'dark')
++    })
++    await flushAsync()
++    expect(captured).toBe('dark')
++
++    act(() => {
++      document.documentElement.setAttribute(THEME_ATTR, 'light')
++    })
++    await flushAsync()
++    expect(captured).toBe('light')
++  })
++
++  it('属性被移除时兜底回空串（light 的既有约定）', async () => {
++    document.documentElement.setAttribute(THEME_ATTR, 'dark')
++    await mountHarness()
++    expect(captured).toBe('dark')
++
++    act(() => {
++      document.documentElement.removeAttribute(THEME_ATTR)
++    })
++    await flushAsync()
++    expect(captured).toBe('')
++  })
++
++  it('卸载后 disconnect：不再收到通知，也不会因残留监听器抛错', async () => {
++    await mountHarness()
++    act(() => {
++      document.documentElement.setAttribute(THEME_ATTR, 'dark')
++    })
++    await flushAsync()
++    expect(captured).toBe('dark')
++
++    act(() => {
++      root.unmount()
++    })
++    expect(() => {
++      document.documentElement.setAttribute(THEME_ATTR, 'light')
++    }).not.toThrow()
++    await flushAsync()
++    // 卸载前最后一次捕获的值原样保留——unmount 之后 harness 不再运行 effect。
++    expect(captured).toBe('dark')
++  })
++
++  // F-A5(第二波修复):退订 → 无观察器期间属性变化 → 重订阅。旧实现把"快照"和
++  // "notify 去重基准"合成同一个模块级缓存,这个窗口期会让两者都陷入陈旧:
++  // (a) 重订阅拿到的第一份快照是退订前的旧值,不是 DOM 真值;
++  // (b) 更坏的是,后续真的切回那份旧值时,去重判断 `next === 缓存` 会误判成
++  //     "没变"而吞掉这次通知,组件从此卡在错误的中间值上不再更新。
++  it('退订后属性变化再重订阅:快照为 DOM 真值且反向切换不被吞', async () => {
++    const { useDocumentThemeAttribute } = await import('./useDocumentThemeAttribute')
++    let capturedA = ''
++    let capturedB = ''
++
++    function HarnessA() {
++      const theme = useDocumentThemeAttribute()
++      useEffect(() => {
++        capturedA = theme
++      })
++      return null
++    }
++    function HarnessB() {
++      const theme = useDocumentThemeAttribute()
++      useEffect(() => {
++        capturedB = theme
++      })
++      return null
++    }
++
++    const containerA = document.createElement('div')
++    document.body.appendChild(containerA)
++    const rootA = createRoot(containerA)
++    act(() => {
++      rootA.render(createElement(HarnessA))
++    })
++    expect(capturedA).toBe('')
++
++    // 用一次**有观察器在场**的真实切换建立"去重基准"= light —— 不能靠模块 import
++    // 时刻的初值凑巧撞对,否则测不出"重同步"这一步到底有没有发生。
++    act(() => {
++      document.documentElement.setAttribute(THEME_ATTR, 'light')
++    })
++    await flushAsync()
++    expect(capturedA).toBe('light')
++
++    // 最后一个订阅者退订 → 观察器应该 disconnect。
++    act(() => {
++      rootA.unmount()
++    })
++    containerA.remove()
++
++    // Gap:此刻没有任何订阅者,属性变化没有观察器接住。
++    document.documentElement.setAttribute(THEME_ATTR, 'dark')
++
++    // 重订阅(全新挂载的消费者):快照必须是 DOM 真值 dark,不是退订前缓存的 light。
++    const containerB = document.createElement('div')
++    document.body.appendChild(containerB)
++    const rootB = createRoot(containerB)
++    act(() => {
++      rootB.render(createElement(HarnessB))
++    })
++    expect(capturedB).toBe('dark')
++
++    // 真实的反向切换:切回退订前的旧值 light —— 不能被"看起来没变"的陈旧去重基准吞掉。
++    act(() => {
++      document.documentElement.setAttribute(THEME_ATTR, 'light')
++    })
++    await flushAsync()
++    expect(capturedB).toBe('light')
++
++    act(() => {
++      rootB.unmount()
++    })
++    containerB.remove()
++  })
++
++  // SC-R2-2:上一波只钉了"两个 theme 下 paint signature 不同"(纯函数层面的字符串
++  // 差异),没有钉住"theme 变化真的会让一个把它放进依赖数组的 effect 重跑"——这正是
++  // useLeaferSpikeRenderer 的 paint effect 依赖 theme 之后应该发生的事。
++  it('主题变化触发 Leafer sync 重跑', async () => {
++    const { useDocumentThemeAttribute } = await import('./useDocumentThemeAttribute')
++    const syncSpy = vi.fn()
++
++    function SyncHarness() {
++      const theme = useDocumentThemeAttribute()
++      // 镜像 useLeaferSpikeRenderer 的 paint effect:theme 在依赖数组里,
++      // theme 变化必须让它重跑(这里用 spy 站替真实的 linePaintRef.sync 调用)。
++      useEffect(() => {
++        syncSpy()
++      }, [theme])
++      return null
++    }
++
++    act(() => {
++      root.render(createElement(SyncHarness))
++    })
++    expect(syncSpy).toHaveBeenCalledTimes(1)
++
++    act(() => {
++      document.documentElement.setAttribute(THEME_ATTR, 'dark')
++    })
++    await flushAsync()
++    expect(syncSpy).toHaveBeenCalledTimes(2)
++
++    act(() => {
++      document.documentElement.setAttribute(THEME_ATTR, 'light')
++    })
++    await flushAsync()
++    expect(syncSpy).toHaveBeenCalledTimes(3)
++
++    // 属性不变的重复写入不构成新变化,不应该多算一次重跑。
++    act(() => {
++      document.documentElement.setAttribute(THEME_ATTR, 'light')
++    })
++    await flushAsync()
++    expect(syncSpy).toHaveBeenCalledTimes(3)
++  })
++
++  // SC-R2-3:上一波只在 Leafer 侧钉了触发,DOM 渲染路径(MarkupNodeView)从未有断言
++  // 证明它会重渲染并现读到新的 --edge-derivation 值。用真实组件(不是替身 harness),
++  // 直接从渲染出的 SVG 描边属性读值,证明 DOM 侧的重绘触发链真的闭合。
++  it('DOM 侧主题切换后重渲染并读到新描边色', async () => {
++    const { MarkupNodeView } = await import('../canvas/MarkupNodeView')
++    const derivationLineNode = {
++      id: 'dom-derivation-1',
++      type: 'markup',
++      title: 'Derivation',
++      status: 'ready',
++      markupKind: 'line',
++      x: 0,
++      y: 0,
++      width: 200,
++      height: 100,
++      markupStartArrow: false,
++      markupEndArrow: false,
++      generation: { prompt: '', model: 'Mivo Derivation Edge' },
++    } as unknown as Parameters<typeof MarkupNodeView>[0]['node']
++
++    document.documentElement.style.setProperty('--edge-derivation', '#979a9d')
++    act(() => {
++      root.render(
++        createElement(MarkupNodeView, {
++          node: derivationLineNode,
++          editing: false,
++          onUpdateText: () => {},
++          onFinishTextEdit: () => {},
++        }),
++      )
++    })
++    const readStroke = () => container.querySelector('.markup-visible-line')?.getAttribute('stroke')
++    expect(readStroke()).toBe('#979a9d')
++
++    // 主题切换的可观测后果就是 --edge-derivation 的计算值变了(真实 App.css 里
++    // 靠 [data-mivo-theme='dark'] 选择器级联出这个新值;这里直接改级联后的最终值,
++    // 断言的是"重渲染后现读到新值"这条链路,不是 CSS 级联本身)。
++    act(() => {
++      document.documentElement.setAttribute(THEME_ATTR, 'dark')
++      document.documentElement.style.setProperty('--edge-derivation', '#9da8b5')
++    })
++    await flushAsync()
++    expect(readStroke()).toBe('#9da8b5')
++  })
++})
+diff --git a/src/render/useDocumentThemeAttribute.ts b/src/render/useDocumentThemeAttribute.ts
+new file mode 100644
+index 00000000..067c4263
+--- /dev/null
++++ b/src/render/useDocumentThemeAttribute.ts
+@@ -0,0 +1,76 @@
++import { useSyncExternalStore } from 'react'
++
++// `data-mivo-theme` 由 Cindy 插件宿主从外部灌入(见 src/app/dialog/ModalDialog.tsx
++// 顶部注释)——本应用自身从不写这个属性。派生连线(derivation edge)的描边色/线宽/
++// 不透明度是从 `--edge-derivation*` CSS 变量现读的(leaferLinePaint.derivationEdgeVisualFor
++// / canvasRenderAdapter.markupRenderStyleFor),但"现读"只在渲染/effect 运行的那一刻发生
++// 一次——外部改写 DOM 属性不会自动变成一次 React 重渲染或 Leafer sync,没有观察器就没有
++// 触发源。这个 hook 就是那个触发源:把"属性变化"转成"可订阅的 state"。
++//
++// 单例 MutationObserver + 订阅者集合(而不是每个调用点各开一个 observer):调用方可能是
++// MarkupNodeView(每个 markup 节点一份实例,数量可达上千)与 useLeaferSpikeRenderer(单份),
++// 共享同一个观察器实例避免随调用点数量线性增长。最后一个订阅者退订时 disconnect,
++// 下一个订阅者到来时重新 observe——不会有"没人用了但观察器还在跑"的泄漏。
++//
++// R2 重写(F-A5):快照(getSnapshot/getServerSnapshot)永远现读 DOM 真值,不再经过任何
++// 模块级缓存——字符串按值比较,useSyncExternalStore 对基本类型现读是安全的(不会像
++// 每次返回新对象/数组引用那样触发无限重渲染)。模块级 `lastNotifiedTheme` 只保留给
++// notify() 用于「避免同一属性变化通知两次」的去重,不再是任何组件读到的真相源。
++//
++// 这条线的第一版曾经把 cachedTheme 当成快照源:最后一个订阅者退订 → observer
++// disconnect → 退订期间发生的属性变化没有任何代码路径去更新这份缓存 → 下一个订阅者
++// 重挂载时,(a) 从 getSnapshot() 读到的是退订前的陈旧值,且 (b) 更糟的是,后续那次真的
++// 切回该陈旧值的变化,会被 notify() 里 `next === cachedTheme` 的去重判断当成"没变"而
++// 吞掉,状态从此卡死。根因是把"用于去重的缓存"和"组件读到的快照"合成了同一个变量——
++// 两者必须分离:快照永远现读,去重缓存只影响是否调用监听器,且在每次重新订阅时都要
++// 与 DOM 重同步一次,才能不遗留跨越"无订阅者窗口"的陈旧比较基准。
++
++const THEME_ATTRIBUTE = 'data-mivo-theme'
++
++const readThemeAttribute = (): string => {
++  if (typeof document === 'undefined') return ''
++  return document.documentElement.getAttribute(THEME_ATTRIBUTE) || ''
++}
++
++// 仅用于 notify() 的「这次 mutation 有没有真的改变值」去重判断——不是快照源。
++let lastNotifiedTheme = readThemeAttribute()
++const listeners = new Set<() => void>()
++let observer: MutationObserver | null = null
++
++const notify = () => {
++  const next = readThemeAttribute()
++  if (next === lastNotifiedTheme) return
++  lastNotifiedTheme = next
++  for (const listener of listeners) listener()
++}
++
++const subscribe = (onStoreChange: () => void): (() => void) => {
++  listeners.add(onStoreChange)
++  if (!observer && typeof document !== 'undefined' && typeof MutationObserver !== 'undefined') {
++    // 重新订阅:与 DOM 重同步去重基准。上一个订阅者退订到现在这段时间没有观察器,
++    // `lastNotifiedTheme` 可能已经落后于 DOM 真值——不重同步的话,下一次真实变化如果
++    // 恰好变回这份陈旧基准值,会被上面的 `next === lastNotifiedTheme` 误判成"没变"
++    // 而吞掉,永久卡住。快照本身(getSnapshot)已经不依赖这份缓存,这里重同步只是为了
++    // 让 notify() 的去重判断在恢复观察的那一刻起就是准的。
++    lastNotifiedTheme = readThemeAttribute()
++    observer = new MutationObserver(notify)
++    observer.observe(document.documentElement, {
++      attributes: true,
++      attributeFilter: [THEME_ATTRIBUTE],
++    })
++  }
++  return () => {
++    listeners.delete(onStoreChange)
++    if (listeners.size === 0 && observer) {
++      observer.disconnect()
++      observer = null
++    }
++  }
++}
++
++/**
++ * 当前 `data-mivo-theme` 属性值(空串 = light)。外部(插件宿主)改写该属性会让
++ * 所有订阅了这个 hook 的组件重渲染——派生连线颜色随主题即时更新的触发源。
++ */
++export const useDocumentThemeAttribute = (): string =>
++  useSyncExternalStore(subscribe, readThemeAttribute, readThemeAttribute)
+diff --git a/src/render/useLeaferSpikeRenderer.ts b/src/render/useLeaferSpikeRenderer.ts
+index fd190171..9ac29e15 100644
+--- a/src/render/useLeaferSpikeRenderer.ts
++++ b/src/render/useLeaferSpikeRenderer.ts
+@@ -36,6 +36,7 @@ import { createLeaferImagePaint } from './leaferImagePaint'
+ import { createLeaferLinePaint } from './leaferLinePaint'
+ import { createLeaferShapePaint, leaferZOrderMapFor } from './leaferShapePaint'
+ import { createLeaferStampFx } from './leaferStampFx'
++import { useDocumentThemeAttribute } from './useDocumentThemeAttribute'
+ import { t } from '../i18n'
+ 
+ /**
+@@ -349,6 +350,10 @@ export const useLeaferSpikeRenderer = ({
+   /** FU-11: 正在文字编辑的节点 id —— line paint 用它复现 DOM 的编辑态 label 缺口。 */
+   editingNodeId?: string
+ }): LeaferSpikeStats => {
++  // data-mivo-theme 由插件宿主外部灌入(见 useDocumentThemeAttribute.ts 头部注释),
++  // 没有这个 state 就没有重绘触发源 —— derivation edge 的 Leafer paint 只在这个
++  // effect 重跑时才会现读 CSS 变量,把 theme 接进依赖数组才能让外部主题切换触发重跑。
++  const theme = useDocumentThemeAttribute()
+   const leaferRef = useRef<Leafer | null>(null)
+   const paintedRef = useRef<Map<string, PaintedEntry>>(new Map())
+   const signatureRef = useRef<Map<string, string>>(new Map())
+@@ -750,6 +755,7 @@ export const useLeaferSpikeRenderer = ({
+       // isPanning informational only (modules ignore); passing false (not the
+       // prop) keeps this effect off the isPanning dep → 0g invariant 1 holds.
+       isPanning: false,
++      theme,
+     }
+     // Phase 3c/4a: image nodes → leaferImagePaint, frame/markup shapes →
+     // leaferShapePaint (both after this call). The inline sync only handles
+@@ -820,7 +826,7 @@ export const useLeaferSpikeRenderer = ({
+     return () => {
+       cancelled = true
+     }
+-  }, [brushStampPaintedNodes, editingNodeId, hostRef, imagePaintedNodes, inlinePaintedNodes, leaferReady, linePaintedNodes, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode, shapePaintedNodes])
++  }, [brushStampPaintedNodes, editingNodeId, hostRef, imagePaintedNodes, inlinePaintedNodes, leaferReady, linePaintedNodes, lodViewport, panCacheEnabled, paintedNodes, paintedNodeSignature, publishStats, rendererMode, shapePaintedNodes, theme])
+ 
+   // R-06: 调试探针 window.__MIVO_LEAFER_SPIKE__ 仅在 DEV 暴露。正向 DEV 分支让生产
+   // 构建里 `if (false) {...}` 整块被 tree-shake——effect body 为空，无 window 写、
+diff --git a/src/store/canvasDocumentModel.derivationGuard.test.ts b/src/store/canvasDocumentModel.derivationGuard.test.ts
+new file mode 100644
+index 00000000..d8e300ff
+--- /dev/null
++++ b/src/store/canvasDocumentModel.derivationGuard.test.ts
+@@ -0,0 +1,64 @@
++// 独立成文的原因(不是随手拆的):canvasDocumentModel.test.ts 已逼近
++// scripts/ci/structure-guard.mjs 对非 allowlist 文件的 900 行硬门(891 行)。
++// 2026-08-09 wave2 曾把本文件的两个 it 直接加进那个文件,加到 933 行,push-guard 的
++// preflight 当场把 structure-guard FAIL 挡在 push 之前——处置结论是拆文件入库,不是
++// 为这 33 行去调治理层 baseline。SC-R2-8 因此单独落地在这里。
++//
++// 本文件钉的论证前提:审第一波时论证过"面板(SelectionQuickToolbar.tsx)/LOD
++// (engineSpikeLod.ts)两处读裸 isDerivationEdgeNode 也安全",依据是
++// normalizeCanvasGraph 经 syncDerivationEdgeNodes 会把任何 isDerivationEdgeNode 命中
++// 的节点先整体剔除,再严格按当前 edges 从零重建——没有匹配 edge 的一律不重建,即
++// "伪造/失去支撑的派生节点必被丢弃"。这条前提此前只在 review 对话里论证过,没有测试
++// 钉住;本文件把它变成断言,以后有人改 syncDerivationEdgeNodes 时不会静默失效。
++import { describe, expect, it } from 'vitest'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++import { normalizeCanvasGraph } from './canvasDocumentModel'
++
++const imageNode = (overrides: Partial<MivoCanvasNode> = {}): MivoCanvasNode => ({
++  id: 'img-1',
++  type: 'image',
++  title: 'Image',
++  x: 0,
++  y: 0,
++  width: 100,
++  height: 100,
++  status: 'ready',
++  assetUrl: '/a.png',
++  ...overrides,
++})
++
++describe('normalizeCanvasGraph — 派生连线节点是"已验证投影",不是可持久化的一等公民(SC-R2-8)', () => {
++  it('丢弃无 edge 支撑的伪造派生节点(type=markup + generation.model 命中,但没有对应 edge 记录)', () => {
++    const src = imageNode({ id: 'src', x: 0 })
++    const tgt = imageNode({ id: 'tgt', x: 300 })
++    const forged: MivoCanvasNode = {
++      id: 'derivation-forged',
++      type: 'markup',
++      title: 'forged',
++      x: 10,
++      y: 10,
++      width: 24,
++      height: 24,
++      status: 'ready',
++      locked: true,
++      // 伪造:type+generation.model 与真派生连线一致,但 edges 里没有任何一条 edge
++      // 能与它对应——不是"已验证投影"。
++      generation: { prompt: '', model: 'Mivo Derivation Edge', createdAt: 0 },
++    } as MivoCanvasNode
++
++    const nodes = normalizeCanvasGraph([src, tgt, forged], [])
++
++    expect(nodes.find((n) => n.id === 'derivation-forged')).toBeUndefined()
++    expect(nodes.map((n) => n.id).sort()).toEqual(['src', 'tgt'])
++  })
++
++  it('对照:真实 edge 支撑的派生节点会被保留/重建(证明上一条不是把该类型整体清空)', () => {
++    const src = imageNode({ id: 'src', x: 0 })
++    const tgt = imageNode({ id: 'tgt', x: 300 })
++    const edge = { id: 'e1', from: 'src', to: 'tgt', type: 'edit' as const, prompt: '', createdAt: 0 }
++
++    const nodes = normalizeCanvasGraph([src, tgt], [edge])
++
++    expect(nodes.find((n) => n.id === 'derivation-e1')).toBeDefined()
++  })
++})
+diff --git a/src/store/nodeFactory.test.ts b/src/store/nodeFactory.test.ts
+index 0ff8797b..9865434d 100644
+--- a/src/store/nodeFactory.test.ts
++++ b/src/store/nodeFactory.test.ts
+@@ -369,7 +369,7 @@ describe('createDerivationEdgeNode (衍生边节点构造)', () => {
+     expect(node.generation?.model).toBe('Mivo Derivation Edge')
+     expect(node.generation?.prompt).toBe('p')
+     expect(node.generation?.createdAt).toBe(1)
+-    expect(node.markupEndArrow).toBe(true)
++    expect(node.markupEndArrow).toBe(false) // 2026-08-07: derivation edges no longer carry arrows
+     expect(node.markupStartArrow).toBe(false)
+   })
+ 
+diff --git a/src/store/nodeFactory.ts b/src/store/nodeFactory.ts
+index 49cfa452..7b9e66e9 100644
+--- a/src/store/nodeFactory.ts
++++ b/src/store/nodeFactory.ts
+@@ -113,11 +113,45 @@ export const createNodeCopy = (
+ })
+ 
+ const derivationEdgeModel = 'Mivo Derivation Edge'
+-const derivationEdgeNodeId = (edgeId: string) => `derivation-${edgeId}`
++export const derivationEdgeNodeId = (edgeId: string) => `derivation-${edgeId}`
+ 
+ export const isDerivationEdgeNode = (node: MivoCanvasNode) =>
+   node.type === 'markup' && node.generation?.model === derivationEdgeModel
+ 
++/**
++ * 派生特权(锁定豁免、删 edge 记录)的唯一判据——不是"内容相等"(generation.model
++ * 字符串、id 前缀),是"创建凭证"(hardening-checklist 第 3 类):节点必须同时满足
++ * isDerivationEdgeNode(类型+model)、id 恰好等于 derivation-{edge.id}(而不是
++ * 任意共享 "derivation-" 前缀的字符串)、且该 edge 记录在当前 edges 里真实存在。
++ * 三者缺一律不授予——伪造 model 字符串的节点、或 id 前缀碰撞但并非派生连线的节点,
++ * 都不应蹭到锁豁免或让删除路径误删无关 edge 记录。
++ *
++ * 返回该节点对应的真实 edge id(供调用方决定是否连带移除 edge 记录),无匹配时
++ * 返回 undefined。
++ */
++export const verifiedDerivationEdgeIdFor = (
++  node: MivoCanvasNode,
++  edges: CanvasEdge[],
++): string | undefined => {
++  if (!isDerivationEdgeNode(node)) return undefined
++  return edges.find((edge) => derivationEdgeNodeId(edge.id) === node.id)?.id
++}
++
++export const isVerifiedDerivationEdgeNode = (node: MivoCanvasNode, edges: CanvasEdge[]): boolean =>
++  verifiedDerivationEdgeIdFor(node, edges) !== undefined
++
++/** 批量版本:给一组候选节点(如即将被删除/剪切的节点),收集它们各自已验证的 edge
++ *  id——三条移除路径(deleteNode/deleteSelectedNodes/cutSelectedNodes)共用同一份
++ *  判据,不再各自剥字符串前缀。 */
++export const verifiedDerivationEdgeIds = (nodes: MivoCanvasNode[], edges: CanvasEdge[]): Set<string> => {
++  const ids = new Set<string>()
++  for (const node of nodes) {
++    const edgeId = verifiedDerivationEdgeIdFor(node, edges)
++    if (edgeId) ids.add(edgeId)
++  }
++  return ids
++}
++
+ /**
+  * Build the markup arrow node that visually represents a derivation edge between two
+  * content nodes. Returns `undefined` when either endpoint is missing or hidden.
+@@ -145,12 +179,13 @@ export const createDerivationEdgeNode = (
+     width: Math.max(24, Math.abs(endPt.x - startPt.x)),
+     height: Math.max(24, Math.abs(endPt.y - startPt.y)),
+     markupKind: 'arrow',
+-    markupStrokeColor: '#497466',
+-    markupStrokeWidth: 3,
++    markupLineRoute: 'smooth',
++    // derivation edge 的描边色/线宽/不透明度由渲染层从 CSS 变量读取
++    // (--edge-derivation / --edge-derivation-width / --edge-derivation-opacity),
++    // 不写进节点数据——避免主题切换颜色不跟随、存量数据带旧色。
+     markupStrokeStyle: 'solid',
+-    markupOpacity: 0.82,
+     markupStartArrow: false,
+-    markupEndArrow: true,
++    markupEndArrow: false,
+     markupPoints: [
+       { x: 0, y: 0 },
+       { x: Math.max(24, Math.abs(endPt.x - startPt.x)), y: Math.round(endPt.y - startPt.y) },
+diff --git a/src/store/nodeMutationSlice.derivationEdgeDelete.test.ts b/src/store/nodeMutationSlice.derivationEdgeDelete.test.ts
+new file mode 100644
+index 00000000..8e61d054
+--- /dev/null
++++ b/src/store/nodeMutationSlice.derivationEdgeDelete.test.ts
+@@ -0,0 +1,308 @@
++// @vitest-environment happy-dom
++// derivation edge 的"不可拖、可删"语义(2026-08-08 真机:选中连线按 Delete 无反应)。
++// 根因:createDerivationEdgeNode 出厂 locked:true(防拖动),而 deleteNode /
++// deleteSelectedNodes 的锁定守卫把它挡在删除集之外 → Delete 永远空转;
++// 修复 = 删除路径对 derivation edge 豁免锁定守卫,普通锁定节点语义不变。
++// 真 store 测试,不 mock slice;fixture 走真工厂(锁定态是判别前提,见前提断言)。
++import { beforeEach, describe, expect, it } from 'vitest'
++import { useCanvasStore } from './canvasStore'
++import { createDerivationEdgeNode } from './nodeFactory'
++import type { CanvasEdge, MivoCanvasNode } from '../types/mivoCanvas'
++
++const image = (id: string, x: number): MivoCanvasNode =>
++  ({
++    id,
++    type: 'image',
++    title: id,
++    x,
++    y: 0,
++    width: 100,
++    height: 100,
++    status: 'ready',
++  }) as MivoCanvasNode
++
++const edge: CanvasEdge = { id: 'e1', from: 'src', to: 'tgt', type: 'edit', prompt: '', createdAt: 0 }
++
++const seedStore = () => {
++  const src = image('src', 0)
++  const tgt = image('tgt', 300)
++  const edgeNode = createDerivationEdgeNode(edge, [src, tgt])
++  if (!edgeNode) throw new Error('fixture: derivation edge node not created')
++  useCanvasStore.setState({
++    nodes: [src, tgt, edgeNode],
++    edges: [edge],
++    selectedNodeId: undefined,
++    selectedNodeIds: [],
++  })
++  return edgeNode
++}
++
++describe('derivation edge 删除 — 锁定豁免(不可拖、可删)', () => {
++  beforeEach(() => { seedStore() })
++
++  it('前提断言:真工厂产出的连线节点确实是 locked(豁免才有判别力)', () => {
++    const edgeNode = useCanvasStore.getState().nodes.find((n) => n.id === 'derivation-e1')
++    expect(edgeNode?.locked).toBe(true)
++  })
++
++  it('键盘 Delete(deleteSelectedNodes):锁定的连线节点可删,edge 记录同步移除不复活', () => {
++    useCanvasStore.setState({ selectedNodeIds: ['derivation-e1'] })
++    useCanvasStore.getState().deleteSelectedNodes()
++    const state = useCanvasStore.getState()
++    expect(state.nodes.find((n) => n.id === 'derivation-e1')).toBeUndefined()
++    expect(state.edges).toHaveLength(0) // 记录不删会被 syncDerivationEdgeNodes 复活
++    expect(state.nodes.map((n) => n.id).sort()).toEqual(['src', 'tgt']) // 两端图片不动
++  })
++
++  it('右键单删(deleteNode):同样豁免锁定守卫', () => {
++    useCanvasStore.getState().deleteNode('derivation-e1')
++    const state = useCanvasStore.getState()
++    expect(state.nodes.find((n) => n.id === 'derivation-e1')).toBeUndefined()
++    expect(state.edges).toHaveLength(0)
++  })
++
++  it('豁免不外溢:普通锁定节点仍然拒绝删除', () => {
++    useCanvasStore.setState({
++      nodes: [...useCanvasStore.getState().nodes, { ...image('pinned', 600), locked: true }],
++      selectedNodeIds: ['pinned'],
++    })
++    useCanvasStore.getState().deleteSelectedNodes()
++    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'pinned')).toBeDefined()
++    useCanvasStore.getState().deleteNode('pinned')
++    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'pinned')).toBeDefined()
++  })
++})
++
++describe('剪切(cutSelectedNodes)纯派生连线选区', () => {
++  beforeEach(() => { seedStore() })
++
++  it('Ctrl+X 剪切纯派生连线选区:节点与 edge 记录同时移除、clipboardNodes 非空', () => {
++    useCanvasStore.setState({ selectedNodeIds: ['derivation-e1'] })
++    useCanvasStore.getState().cutSelectedNodes()
++    const state = useCanvasStore.getState()
++    expect(state.nodes.find((n) => n.id === 'derivation-e1')).toBeUndefined()
++    expect(state.edges).toHaveLength(0)
++    expect(state.clipboardNodes.length).toBeGreaterThan(0)
++    expect(state.clipboardNodes.some((n) => n.id === 'derivation-e1')).toBe(true)
++  })
++
++  it('cut 分支的 edge 记录过滤可达(选中连线后 edges 真的减少;豁免缺失时这行过滤永远碰不到派生连线,是不可达死代码)', () => {
++    expect(useCanvasStore.getState().edges).toHaveLength(1) // 前提:确有 1 条 edge 记录可供过滤
++    useCanvasStore.setState({ selectedNodeIds: ['derivation-e1'] })
++    useCanvasStore.getState().cutSelectedNodes()
++    expect(useCanvasStore.getState().edges).toHaveLength(0)
++  })
++})
++
++describe('三条移除路径(deleteNode/deleteSelectedNodes/cutSelectedNodes)各自原子移除节点与 edge 记录', () => {
++  beforeEach(() => { seedStore() })
++
++  it('deleteNode:移除派生连线节点与其 edge 记录', () => {
++    useCanvasStore.getState().deleteNode('derivation-e1')
++    const state = useCanvasStore.getState()
++    expect(state.nodes.find((n) => n.id === 'derivation-e1')).toBeUndefined()
++    expect(state.edges).toHaveLength(0)
++  })
++
++  it('deleteSelectedNodes:移除派生连线节点与其 edge 记录', () => {
++    useCanvasStore.setState({ selectedNodeIds: ['derivation-e1'] })
++    useCanvasStore.getState().deleteSelectedNodes()
++    const state = useCanvasStore.getState()
++    expect(state.nodes.find((n) => n.id === 'derivation-e1')).toBeUndefined()
++    expect(state.edges).toHaveLength(0)
++  })
++
++  it('cutSelectedNodes:移除派生连线节点与其 edge 记录(clipboardNodes 保留副本)', () => {
++    useCanvasStore.setState({ selectedNodeIds: ['derivation-e1'] })
++    useCanvasStore.getState().cutSelectedNodes()
++    const state = useCanvasStore.getState()
++    expect(state.nodes.find((n) => n.id === 'derivation-e1')).toBeUndefined()
++    expect(state.edges).toHaveLength(0)
++    expect(state.clipboardNodes.some((n) => n.id === 'derivation-e1')).toBe(true)
++  })
++})
++
++describe('已验证投影(isDerivationEdgeNode + id 恰好对应真实 edge + edge 记录存在,三者缺一不授予特权)', () => {
++  beforeEach(() => { seedStore() })
++
++  it('伪造 model 字符串但无匹配 edge 的节点不获特权(锁豁免拒绝,三条移除路径均挡住,edge 记录不受影响)', () => {
++    const forged = {
++      id: 'derivation-forged-no-edge',
++      type: 'markup',
++      title: 'forged',
++      x: 0,
++      y: 0,
++      width: 10,
++      height: 10,
++      status: 'ready',
++      locked: true,
++      // 伪造:type+model 与真派生连线一致,但 id 不对应任何真实 edge——不是「已验证投影」。
++      generation: { prompt: '', model: 'Mivo Derivation Edge', createdAt: 0 },
++    } as MivoCanvasNode
++    useCanvasStore.setState((state) => ({ nodes: [...state.nodes, forged] }))
++
++    useCanvasStore.getState().deleteNode('derivation-forged-no-edge')
++    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'derivation-forged-no-edge')).toBeDefined()
++    expect(useCanvasStore.getState().edges).toHaveLength(1) // 真派生连线的 edge 未被误删
++
++    useCanvasStore.setState({ selectedNodeIds: ['derivation-forged-no-edge'] })
++    useCanvasStore.getState().deleteSelectedNodes()
++    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'derivation-forged-no-edge')).toBeDefined()
++
++    useCanvasStore.getState().cutSelectedNodes()
++    const state = useCanvasStore.getState()
++    expect(state.nodes.find((n) => n.id === 'derivation-forged-no-edge')).toBeDefined()
++    expect(state.clipboardNodes.some((n) => n.id === 'derivation-forged-no-edge')).toBe(false)
++  })
++
++  it('前缀碰撞不误删无关 edge(id 恰好带 "derivation-" 前缀,但不是派生连线节点)', () => {
++    const decoyEdge: CanvasEdge = { id: 'decoy', from: 'a', to: 'b', type: 'edit', prompt: '', createdAt: 0 }
++    const decoyNode = {
++      id: 'derivation-decoy',
++      // 关键:type 是 image 不是 markup,isDerivationEdgeNode 判假,但 id 前缀恰好撞上
++      // decoyEdge.id(旧实现纯剥字符串前缀,会把它误当成 edge id 来源)。
++      type: 'image',
++      title: 'decoy',
++      x: 900,
++      y: 0,
++      width: 50,
++      height: 50,
++      status: 'ready',
++    } as MivoCanvasNode
++    useCanvasStore.setState((state) => ({
++      nodes: [...state.nodes, decoyNode],
++      edges: [...state.edges, decoyEdge],
++    }))
++
++    useCanvasStore.getState().deleteNode('derivation-decoy')
++    const state = useCanvasStore.getState()
++    expect(state.nodes.find((n) => n.id === 'derivation-decoy')).toBeUndefined() // 普通未锁定节点正常删除
++    expect(state.edges.some((e) => e.id === 'decoy')).toBe(true) // 无关 edge 未被误删
++    expect(state.edges.some((e) => e.id === 'e1')).toBe(true) // 真派生连线的 edge 也未受影响
++  })
++})
++
++// SC-R2-6:上一波只钉了"删除"方向的原子性(节点+edge 同帧移除)。撤销是另一半——
++// pushHistory/snapshotFromState 在删除前把 nodes+edges 一起快照,undo 再把两者一起
++// 还原,靠的正是这条既有机制,本用例把它钉成断言(而不只是论证):如果谁改坏成"只
++// 还原节点、edges 仍用当前值",下一次 normalizeCanvasGraph 的 syncDerivationEdgeNodes
++// 会因为没有匹配的 edge 记录,把刚刚"撤销回来"的派生连线节点重新判定为无支撑并抹掉——
++// 用户会看到"撤销了一下又消失"。
++describe('撤销(undo)——派生连线的删除是可逆的,节点与 edge 记录必须同帧还原', () => {
++  beforeEach(() => { seedStore() })
++
++  it('撤销同时还原派生连线节点与 edge 记录(只还原节点、edges 不同步还原,下一次 normalize 会把它再删掉)', () => {
++    useCanvasStore.setState({ selectedNodeIds: ['derivation-e1'] })
++    useCanvasStore.getState().deleteSelectedNodes()
++
++    let state = useCanvasStore.getState()
++    expect(state.nodes.find((n) => n.id === 'derivation-e1')).toBeUndefined()
++    expect(state.edges).toHaveLength(0)
++
++    useCanvasStore.getState().undo()
++
++    state = useCanvasStore.getState()
++    expect(state.nodes.find((n) => n.id === 'derivation-e1')).toBeDefined()
++    expect(state.edges.some((e) => e.id === 'e1')).toBe(true)
++    expect(state.nodes.map((n) => n.id).sort()).toEqual(['derivation-e1', 'src', 'tgt'])
++  })
++})
++
++// SC-R2-7:上一波三个入口各自只有一条独立 it,没有强制它们对同一输入产出"等价的最终
++// 状态"这件事本身。表驱动遍历三入口,任何一条入口未来被单独改坏(例如只改
++// deleteSelectedNodes 的豁免判据、漏了 cutSelectedNodes),对应那一行会独立变红,
++// 不影响其余两行——这正是本轮 blocker(cutSelectedNodes 漏判)的形状。
++describe('三入口对派生连线产出等价最终状态(deleteNode/deleteSelectedNodes/cutSelectedNodes)', () => {
++  beforeEach(() => { seedStore() })
++
++  const entries: Array<{ name: string; run: () => void }> = [
++    { name: 'deleteNode', run: () => { useCanvasStore.getState().deleteNode('derivation-e1') } },
++    {
++      name: 'deleteSelectedNodes',
++      run: () => {
++        useCanvasStore.setState({ selectedNodeIds: ['derivation-e1'] })
++        useCanvasStore.getState().deleteSelectedNodes()
++      },
++    },
++    {
++      name: 'cutSelectedNodes',
++      run: () => {
++        useCanvasStore.setState({ selectedNodeIds: ['derivation-e1'] })
++        useCanvasStore.getState().cutSelectedNodes()
++      },
++    },
++  ]
++
++  it.each(entries)('三入口对派生连线产出等价最终状态:$name 同等移除节点与 edge、清空选中态', ({ run }) => {
++    run()
++    const state = useCanvasStore.getState()
++    expect(state.nodes.map((n) => n.id).sort()).toEqual(['src', 'tgt'])
++    expect(state.edges).toHaveLength(0)
++    expect(state.selectedNodeIds).toEqual([])
++    expect(state.selectedNodeId).toBeUndefined()
++  })
++})
++
++// SC-section:三审已钉"直接选中派生连线可删",但 section 子节点展开路径漏抄了同款
++// 锁定豁免——选中一个 section(其子节点含 locked:true 派生连线,但不含连线端点)按
++// Delete 时,section 展开用 !isEffectivelyLocked 把派生连线排除出删除集,backing
++// edge 不被移除,patchActiveCanvas → normalizeCanvasGraph → syncDerivationEdgeNodes
++// 见 edge 仍在 + 端点仍在 → 连线留画布(Greptile P1,PR #602 comment 5234898363)。
++// 形态与 SC-R2-7 的 cutSelectedNodes 漏判同构:section 展开这行漏抄了顶层(L676/L287)
++// 已有的 || isVerifiedDerivationEdgeNode(child, state.edges) 豁免。
++describe('section 子节点展开须对派生连线豁免锁定(deleteSelectedNodes/cutSelectedNodes)', () => {
++  const seedStoreWithSection = () => {
++    const src = image('src', 0)
++    const tgt = image('tgt', 300)
++    const section = {
++      id: 'sec',
++      type: 'frame',
++      title: 'sec',
++      x: 0,
++      y: 0,
++      width: 400,
++      height: 400,
++      status: 'ready',
++    } as MivoCanvasNode
++    const edgeNode = createDerivationEdgeNode(edge, [src, tgt])
++    if (!edgeNode) throw new Error('fixture: derivation edge node not created')
++    useCanvasStore.setState({
++      // section 只含派生连线节点(中点),不含端点 src/tgt——正是 Greptile 指出的形态
++      nodes: [src, tgt, section, { ...edgeNode, sectionId: 'sec' }],
++      edges: [edge],
++      selectedNodeId: undefined,
++      selectedNodeIds: [],
++    })
++  }
++
++  beforeEach(() => {
++    seedStoreWithSection()
++  })
++
++  it('前提断言:派生连线是 section 子节点且 locked(section 展开才会碰到它)', () => {
++    const edgeNode = useCanvasStore.getState().nodes.find((n) => n.id === 'derivation-e1')
++    expect(edgeNode?.sectionId).toBe('sec')
++    expect(edgeNode?.locked).toBe(true)
++    expect(useCanvasStore.getState().nodes.find((n) => n.id === 'sec')?.type).toBe('frame')
++  })
++
++  it('deleteSelectedNodes:删含派生连线子节点的 section,连线节点与 backing edge 同帧移除不复活', () => {
++    useCanvasStore.setState({ selectedNodeIds: ['sec'] })
++    useCanvasStore.getState().deleteSelectedNodes()
++    const state = useCanvasStore.getState()
++    expect(state.nodes.find((n) => n.id === 'sec')).toBeUndefined() // section 已删
++    expect(state.nodes.find((n) => n.id === 'derivation-e1')).toBeUndefined() // 连线节点不在了
++    expect(state.edges).toHaveLength(0) // backing edge 不留(否则 syncDerivationEdgeNodes 复活)
++    expect(state.nodes.map((n) => n.id).sort()).toEqual(['src', 'tgt']) // 端点不动
++  })
++
++  it('cutSelectedNodes:剪切含派生连线子节点的 section,连线节点与 backing edge 同帧移除', () => {
++    useCanvasStore.setState({ selectedNodeIds: ['sec'] })
++    useCanvasStore.getState().cutSelectedNodes()
++    const state = useCanvasStore.getState()
++    expect(state.nodes.find((n) => n.id === 'sec')).toBeUndefined()
++    expect(state.nodes.find((n) => n.id === 'derivation-e1')).toBeUndefined()
++    expect(state.edges).toHaveLength(0)
++    expect(state.nodes.map((n) => n.id).sort()).toEqual(['src', 'tgt'])
++  })
++})
+diff --git a/src/store/nodeMutationSlice.ts b/src/store/nodeMutationSlice.ts
+index 75596424..c9a124e9 100644
+--- a/src/store/nodeMutationSlice.ts
++++ b/src/store/nodeMutationSlice.ts
+@@ -7,7 +7,13 @@ import type { AgentArrangeOutcome } from '../model/arrangeIntent'
+ import { UpdateNodePlanError, resolveUpdateNodePlan } from '../model/updateNodeIntent'
+ import type { AgentUpdateNodeOutcome } from '../model/updateNodeIntent'
+ import { logCanvas, warnCanvas } from './canvasStoreLog'
+-import { createGroupId, createNodeCopy, createNodeId } from './nodeFactory'
++import {
++  createGroupId,
++  createNodeCopy,
++  createNodeId,
++  isVerifiedDerivationEdgeNode,
++  verifiedDerivationEdgeIds,
++} from './nodeFactory'
+ import {
+   childIdsForSections,
+   isEditableTextNode,
+@@ -622,19 +628,39 @@ export const createNodeMutationSlice: SliceCreator = (set, get) => ({
+   deleteNode: (nodeId) =>
+     set((state) => {
+       const target = state.nodes.find((node) => node.id === nodeId)
+-      if (!target || isEffectivelyLocked(state.nodes, target)) return {}
++      // derivation edge 出厂 locked:true(防拖动),但语义是"不可拖、可删"——
++      // 删除即断开派生关系。锁定守卫对它豁免,否则 Delete 永远空转
++      // (2026-08-08 真机:选中连线按 Delete 无反应的根因)。豁免判据是已验证投影
++      // (isVerifiedDerivationEdgeNode:类型+model+id 恰好对应一条真实 edge),不是裸
++      // isDerivationEdgeNode——避免伪造 generation.model 的节点蹭到锁豁免。
++      if (!target || (isEffectivelyLocked(state.nodes, target) && !isVerifiedDerivationEdgeNode(target, state.edges))) return {}
+ 
+       const deletedIds = new Set([
+         nodeId,
+         ...(isSectionNode(target) ? state.nodes.filter((node) => node.sectionId === nodeId).map((node) => node.id) : []),
+       ])
++      // 已验证投影派生 edge id,不再剥 "derivation-" 字符串前缀——纯前缀匹配会把任何
++      // id 恰好带这个前缀、但并非派生连线节点的普通节点也误当成 edge id 来源,连带
++      // 删掉一条无关的 edge 记录(id 前缀碰撞)。
++      const derivedEdgeIds = verifiedDerivationEdgeIds(
++        state.nodes.filter((node) => deletedIds.has(node.id)),
++        state.edges,
++      )
++      if (derivedEdgeIds.size > 0) {
++        logCanvas(`deleteNode: removing ${derivedEdgeIds.size} derivation edge(s): ${[...derivedEdgeIds].join(', ')}`)
++      }
+       const selectedNodeIds = state.selectedNodeIds.filter((id) => !deletedIds.has(id))
+ 
+       return patchWithHistory(state, {
+         selectedNodeId: deletedIds.has(state.selectedNodeId || '') ? selectedNodeIds[0] : state.selectedNodeId,
+         selectedNodeIds,
+         nodes: normalizeCanvasNodes(state.nodes.filter((node) => !deletedIds.has(node.id))),
+-        edges: state.edges.filter((edge) => !deletedIds.has(edge.from) && !deletedIds.has(edge.to)),
++        edges: state.edges.filter(
++          (edge) =>
++            !deletedIds.has(edge.from) &&
++            !deletedIds.has(edge.to) &&
++            !derivedEdgeIds.has(edge.id),
++        ),
+       })
+     }),
+   deleteSelectedNodes: () =>
+@@ -645,23 +671,38 @@ export const createNodeMutationSlice: SliceCreator = (set, get) => ({
+       const selectedSet = new Set(
+         selectedNodeIds.filter((nodeId) => {
+           const node = state.nodes.find((item) => item.id === nodeId)
+-          return node && !isEffectivelyLocked(state.nodes, node)
++          // derivation edge 锁定豁免:不可拖、可删(见 deleteNode 同注释;判据同样是
++          // 已验证投影,不是裸 isDerivationEdgeNode)。
++          return node && (!isEffectivelyLocked(state.nodes, node) || isVerifiedDerivationEdgeNode(node, state.edges))
+         }),
+       )
+       state.nodes.forEach((node) => {
+         if (selectedSet.has(node.id) && isSectionNode(node)) {
+           state.nodes
+-            .filter((child) => child.sectionId === node.id && !isEffectivelyLocked(state.nodes, child))
++            .filter((child) => child.sectionId === node.id && (!isEffectivelyLocked(state.nodes, child) || isVerifiedDerivationEdgeNode(child, state.edges)))
+             .forEach((child) => selectedSet.add(child.id))
+         }
+       })
+       if (!selectedSet.size) return {}
+ 
++      // 已验证投影派生 edge id(见 deleteNode 同注释),不再剥字符串前缀。
++      const derivedEdgeIds = verifiedDerivationEdgeIds(
++        state.nodes.filter((node) => selectedSet.has(node.id)),
++        state.edges,
++      )
++      if (derivedEdgeIds.size > 0) {
++        logCanvas(`deleteSelectedNodes: removing ${derivedEdgeIds.size} derivation edge(s): ${[...derivedEdgeIds].join(', ')}`)
++      }
+       return patchWithHistory(state, {
+         selectedNodeId: undefined,
+         selectedNodeIds: [],
+         nodes: normalizeCanvasNodes(state.nodes.filter((node) => !selectedSet.has(node.id))),
+-        edges: state.edges.filter((edge) => !selectedSet.has(edge.from) && !selectedSet.has(edge.to)),
++        edges: state.edges.filter(
++          (edge) =>
++            !selectedSet.has(edge.from) &&
++            !selectedSet.has(edge.to) &&
++            !derivedEdgeIds.has(edge.id),
++        ),
+       })
+     }),
+   toggleSelectedNodesLocked: () =>
+diff --git a/src/store/selectionSlice.ts b/src/store/selectionSlice.ts
+index a2720caa..66f51502 100644
+--- a/src/store/selectionSlice.ts
++++ b/src/store/selectionSlice.ts
+@@ -16,6 +16,8 @@ import {
+   createGroupId,
+   createNodeCopy,
+   createNodeId,
++  isVerifiedDerivationEdgeNode,
++  verifiedDerivationEdgeIds,
+ } from './nodeFactory'
+ import {
+   arrangedPositionsFor,
+@@ -277,20 +279,33 @@ export const createSelectionSlice: SliceCreator = (set) => ({
+       const removedSet = new Set(
+         selectedNodeIds.filter((nodeId) => {
+           const node = state.nodes.find((item) => item.id === nodeId)
+-          return node && !isEffectivelyLocked(state.nodes, node)
++          // derivation edge 锁定豁免:不可拖、可删(与 deleteNode/deleteSelectedNodes
++          // 同一判据——已验证投影,见 nodeFactory.isVerifiedDerivationEdgeNode)。此前
++          // 这里裸判 !isEffectivelyLocked,派生连线永远进不了 removedSet,导致下面的
++          // derivedEdgeIds/edges 过滤是不可达死代码,Ctrl+X 剪切纯派生连线选区空转
++          // (2026-08-09 三审复核)。
++          return node && (!isEffectivelyLocked(state.nodes, node) || isVerifiedDerivationEdgeNode(node, state.edges))
+         }),
+       )
+       state.nodes.forEach((node) => {
+         if (removedSet.has(node.id) && isSectionNode(node)) {
+           state.nodes
+-            .filter((child) => child.sectionId === node.id && !isEffectivelyLocked(state.nodes, child))
++            .filter((child) => child.sectionId === node.id && (!isEffectivelyLocked(state.nodes, child) || isVerifiedDerivationEdgeNode(child, state.edges)))
+             .forEach((child) => removedSet.add(child.id))
+         }
+       })
+       if (!removedSet.size) return {}
+ 
+-      logCanvas(`Cut ${removedSet.size} node${removedSet.size === 1 ? '' : 's'} to clipboard`)
+-
++      // 已验证投影派生 edge id(见 deleteNode 同注释),不再剥字符串前缀。
++      const derivedEdgeIds = verifiedDerivationEdgeIds(
++        state.nodes.filter((node) => removedSet.has(node.id)),
++        state.edges,
++      )
++      logCanvas(
++        derivedEdgeIds.size > 0
++          ? `Cut ${removedSet.size} node(s) to clipboard (incl. ${derivedEdgeIds.size} derivation edge(s): ${[...derivedEdgeIds].join(', ')})`
++          : `Cut ${removedSet.size} node${removedSet.size === 1 ? '' : 's'} to clipboard`,
++      )
+       return {
+         clipboardNodes: cloneNodes(state.nodes.filter((node) => removedSet.has(node.id))),
+         // 与 copySelectedNodes 对齐:清掉残留的资产剪贴板——paste 分支优先消费
+@@ -301,6 +316,12 @@ export const createSelectionSlice: SliceCreator = (set) => ({
+           selectedNodeId: undefined,
+           selectedNodeIds: [],
+           nodes: normalizeCanvasNodes(state.nodes.filter((node) => !removedSet.has(node.id))),
++          edges: state.edges.filter(
++            (edge) =>
++              !removedSet.has(edge.from) &&
++              !removedSet.has(edge.to) &&
++              !derivedEdgeIds.has(edge.id),
++          ),
+         }),
+       }
+     }),
+diff --git a/src/types/mivoCanvas.ts b/src/types/mivoCanvas.ts
+index c45b8be4..ee8292bc 100644
+--- a/src/types/mivoCanvas.ts
++++ b/src/types/mivoCanvas.ts
+@@ -69,7 +69,7 @@ export type MarkupKind =
+   | 'note'
+   | 'stamp'
+ /** 线/箭头的路由形态:直线(默认,旧档案无字段=straight)、直角拐弯、二次贝塞尔曲线。 */
+-export type MarkupLineRoute = 'straight' | 'elbow' | 'curved'
++export type MarkupLineRoute = 'straight' | 'elbow' | 'curved' | 'smooth'
+ /**
+  * 线/箭头端点样式(FigJam 同款六档)。旧档案无字段时回退布尔
+  * markupStartArrow/markupEndArrow(true=arrow / false=none),见
+@@ -590,7 +590,7 @@ export type SceneDefinition = {
+ export const MARKUP_KIND_VALUES = [
+   'arrow', 'line', 'rect', 'ellipse', 'diamond', 'triangle', 'triangle-down', 'brush', 'note', 'stamp',
+ ] as const satisfies readonly MarkupKind[]
+-export const MARKUP_LINE_ROUTE_VALUES = ['straight', 'elbow', 'curved'] as const satisfies readonly MarkupLineRoute[]
++export const MARKUP_LINE_ROUTE_VALUES = ['straight', 'elbow', 'curved', 'smooth'] as const satisfies readonly MarkupLineRoute[]
+ export const MARKUP_ARROW_HEAD_VALUES = [
+   'none', 'arrow', 'triangle', 'triangle-inverted', 'circle', 'diamond',
+ ] as const satisfies readonly MarkupArrowHead[]

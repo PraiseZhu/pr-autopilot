@@ -1,0 +1,1772 @@
+diff --git a/cindyplugin/ghost.json b/cindyplugin/ghost.json
+index 5cf9ee61..07a86c41 100644
+--- a/cindyplugin/ghost.json
++++ b/cindyplugin/ghost.json
+@@ -4,7 +4,7 @@
+   "name": "Mivo Canvas",
+   "description": "无限画布白板 + Agent 画布:平移缩放、画笔压感标注、形状/便签/印章、图片/PDF/视频上板、归档备份;AI 可读取画布内容、往画布放文字和图片、生成图片直接落到画布(配了 Mivo API Key 走公司 Mivo 平台出图,没配则经 Cindy 代办)。数据自动保存在本地。",
+   "whenToUse": "涉及画布/白板上的创作与整理时找我:读取画布内容(canvas_snapshot)、放文字要点(canvas_add_note)、放用户图片(canvas_place_image)、生成图片落画布(canvas_generate_image)、改写已有节点(canvas_update_node)、整理排布/归入分区(canvas_arrange)、导出 PNG/PDF(canvas_export)。用户提到画布/白板/Mivo Canvas 或要把内容放上画布时使用;与画布无关的普通出图交给画图类插件。",
+-  "version": "0.9.4",
++  "version": "0.9.5",
+   "entry": "main.js",
+   "icon": "icon.jpg",
+   "command": "画布",
+@@ -345,4 +345,4 @@
+     "minWidth": 420,
+     "defaultFraction": 0.45
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/public/changelog.json b/public/changelog.json
+index 0eb7ace8..3ca55b1d 100644
+--- a/public/changelog.json
++++ b/public/changelog.json
+@@ -1,17 +1,22 @@
+ {
+-  "lastGithash": "ac7f36cbe94f811f23c8509064252ccd949b445e",
+-  "updatedAt": "2026-08-02T22:25:47+08:00",
++  "lastGithash": "a876af3202e45eb5c0d315d3835e2913f22c2f39",
++  "updatedAt": "2026-08-02T22:33:27+08:00",
+   "entries": [
+     {
+       "date": "2026-08-02",
+       "prs": [
+         401,
+-        419
++        419,
++        429
+       ],
+       "features": [
+         {
+           "text": "双击画布上的图片或视频,现在会打开全屏大图预览:深色沉浸背景、按原始比例放大,点空白处或按 Esc 即可关闭;Cindy 插件面板里同样可用",
+           "by": "kirozeng"
++        },
++        {
++          "text": "所有文本输入框聚焦时不再出现外圈绿环,焦点改为更安静的框内边框表达;按钮和勾选框的键盘焦点环保留",
++          "by": "kirozeng"
+         }
+       ],
+       "fixes": [
+diff --git a/shared/persist-contract.ts b/shared/persist-contract.ts
+index 40e29fcf..7d256aca 100644
+--- a/shared/persist-contract.ts
++++ b/shared/persist-contract.ts
+@@ -828,10 +828,64 @@ export const NODE_PAYLOAD_KEYS = [
+   'markupEndArrow', 'markupCornerRadius', 'markupLineRoute', 'markupCurveBow', 'markupStartHead', 'markupEndHead',
+   'sectionTitleVisible', 'sectionContentHidden', 'sectionLockMode', 'sectionTemplateId',
+   'markdownDisplayMode', 'imageHasTransparency', 'assetSourceDimensions', 'imageCrop', 'imageFlipH', 'imageFlipV', 'sourceNodeId',
+-  'groupId', 'locked', 'hidden', 'favorited', 'generation', 'aiWorkflow', 'experimentalAnchors',
++  'groupId', 'locked', 'hidden', 'favorited', 'tags', 'note', 'generation', 'aiWorkflow', 'experimentalAnchors',
+   'annotationBounds',
+ ] as const satisfies ReadonlyArray<keyof NodePayload>
+ 
++// ── 节点标签/注释:wire codec 与上限的单一入口(client mapping 与 server decoder 共用)──
++// wire 形态 = JSON string array(单标量叶子,FieldIntent 可 set;并发语义 = 整组 LWW 替换)。
++// JSON 编码任意标签文本无损往返,无分隔符碰撞;上限在 encode 入口(store 归一化)与
++// decode 校验(isNodeTagsWire)两端同源生效,超限 payload 服务端拒收,不产生本地/服务端分叉。
++export const NODE_TAG_MAX_LENGTH = 64
++export const NODE_TAGS_MAX_COUNT = 32
++export const NODE_NOTE_MAX_LENGTH = 2000
++
++export const encodeNodeTags = (tags: readonly string[] | undefined): string | undefined =>
++  tags && tags.length ? JSON.stringify(tags) : undefined
++
++/** 宽容解码(hydrate/snapshot 用):非法 wire → undefined(字段整体缺失),空串成员剔除。 */
++export const decodeNodeTags = (wire: string | undefined): string[] | undefined => {
++  if (!wire) return undefined
++  try {
++    const parsed: unknown = JSON.parse(wire)
++    if (!Array.isArray(parsed)) return undefined
++    const tags = parsed.filter((item): item is string => typeof item === 'string' && item.length > 0)
++    return tags.length ? tags : undefined
++  } catch {
++    return undefined
++  }
++}
++
++/** 严格校验(payload decoder 用):JSON string array + 非空 + 条数/单条长度上限。 */
++export const isNodeTagsWire = (value: unknown): boolean => {
++  if (typeof value !== 'string') return false
++  try {
++    const parsed: unknown = JSON.parse(value)
++    return (
++      Array.isArray(parsed) &&
++      parsed.length > 0 &&
++      parsed.length <= NODE_TAGS_MAX_COUNT &&
++      parsed.every((item) => typeof item === 'string' && item.length > 0 && item.length <= NODE_TAG_MAX_LENGTH)
++    )
++  } catch {
++    return false
++  }
++}
++
++export const isNodeNoteWire = (value: unknown): boolean =>
++  typeof value === 'string' && value.length > 0 && value.length <= NODE_NOTE_MAX_LENGTH
++
++/** app 层(string[])标签校验:snapshot import 与 wire 校验同源上限——上限"三端同源"
++ *  的第四个入口(store 归一化 / UI maxLength / wire decoder / snapshot import)。 */
++export const isNodeTagsApp = (value: unknown): value is string[] =>
++  Array.isArray(value) &&
++  value.length > 0 &&
++  value.length <= NODE_TAGS_MAX_COUNT &&
++  value.every((item) => typeof item === 'string' && item.length > 0 && item.length <= NODE_TAG_MAX_LENGTH)
++
++export const isNodeNoteApp = (value: unknown): value is string =>
++  typeof value === 'string' && value.length > 0 && value.length <= NODE_NOTE_MAX_LENGTH
++
+ /** EdgePayload 合法 key 集。createdAt 是 canonical 域字段(保留)。 */
+ export const EDGE_PAYLOAD_KEYS = ['from', 'to', 'type', 'prompt', 'createdAt'] as const satisfies ReadonlyArray<keyof EdgePayload>
+ 
+@@ -1054,7 +1108,10 @@ const PAYLOAD_SPECS: Record<'node' | 'edge' | 'anchor', Check> = {
+     imageHasTransparency: scalar(isBool), assetSourceDimensions: DIMENSIONS, imageCrop: RECT,
+     imageFlipH: scalar(isBool), imageFlipV: scalar(isBool),
+     sourceNodeId: scalar(isStr), groupId: scalar(isStr), locked: scalar(isBool), hidden: scalar(isBool),
+-    favorited: scalar(isBool), generation: GENERATION, aiWorkflow: AI_WORKFLOW,
++    // tags/note 是单标量叶子(数组进不了 FieldIntent 语法);wire 校验走 codec 单一入口
++    // (isNodeTagsWire:JSON string array + 上限;isNodeNoteWire:非空 + 长度上限)。
++    favorited: scalar(isBool), tags: scalar(isNodeTagsWire), note: scalar(isNodeNoteWire),
++    generation: GENERATION, aiWorkflow: AI_WORKFLOW,
+     experimentalAnchors: arr(ANCHOR_ELEMENT), annotationBounds: RECT,
+   }, ['type', 'title', 'transform', 'fills', 'strokes', 'effects', 'relations']),
+   edge: obj(
+diff --git a/src/App.css b/src/App.css
+index 9d36f8f5..a6a827b5 100644
+--- a/src/App.css
++++ b/src/App.css
+@@ -8020,45 +8020,387 @@ button:disabled {
+ /* 媒体详情 lightbox(双击图片/视频入口,App.tsx 按 renderKind 与 .details-dialog 分流)。
+    与 .details-dialog-backdrop 同层 z-index:100;toast-viewport(220)必须保持在弹层之上。
+    刻意深色沉浸,不随主站浅色主题。 */
++/* ── 媒体详情 Lightbox(二期:信息浮层)──────────────────────────
++   形态不变式(2026-08-02 定稿):信息直接浮在压暗遮罩上(无容器底色)、
++   任何状态不遮挡媒体本体、窄容器降级底部抽屉(带底色)、固定深色不随主题
++   (与选区快捷条同族,插件皮肤层不得覆写)。字重走 400/500/700/800 梯(#425)。 */
+ .media-lightbox-backdrop {
++  /* 浮层宽度单一变量:让位 padding 由 calc 派生,改宽度不会静默破
++     「信息不遮挡媒体」硬不变式(对抗审 R4-B2)。 */
++  --lightbox-info-w: 300px;
+   position: fixed;
+   inset: 0;
+   z-index: 100;
+-  display: grid;
+-  place-items: center;
+-  padding: 32px;
+-  background: rgba(18, 16, 14, 0.72);
++  background: rgba(18, 16, 14, 0.86);
+   backdrop-filter: blur(4px);
+ }
+ 
++/* 媒体区吃满全层;信息浮层打开时右侧让位(padding 过渡)。 */
++.media-lightbox-stage {
++  position: absolute;
++  inset: 0;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  padding: 32px;
++  transition: padding 0.28s ease;
++}
++
++.media-lightbox-backdrop.info-open:not(.narrow) .media-lightbox-stage {
++  padding-right: calc(16px + var(--lightbox-info-w) + 32px); /* 边距 + 浮层 + 留白 */
++}
++
+ .media-lightbox-media {
+   display: block;
+-  max-width: calc(100vw - 64px);
++  max-width: 100%;
+   max-height: calc(100svh - 64px);
+   object-fit: contain;
+   box-shadow: 0 28px 88px rgba(0, 0, 0, 0.5);
+ }
+ 
+-/* 视觉隐藏、键盘聚焦时浮现的关闭按钮:屏幕阅读器/键盘用户的显式退出口,
+-   不打破"无遮挡看图"的默认形态。 */
+-.media-lightbox-close {
++/* ── 右上按钮簇(信息浮层正上方,右对齐同列) ── */
++.media-lightbox-actions {
+   position: absolute;
+   top: 16px;
+   right: 16px;
+-  padding: 8px 14px;
+-  color: rgba(255, 250, 240, 0.95);
+-  background: rgba(24, 21, 18, 0.85);
+-  border: 1px solid rgba(255, 250, 240, 0.35);
+-  border-radius: 8px;
++  z-index: 30;
++  display: flex;
++  gap: 8px;
++}
++
++.media-lightbox-chip {
++  min-height: 34px;
++  padding: 7px 13px;
++  display: inline-flex;
++  align-items: center;
++  gap: 6px;
++  color: rgba(255, 250, 240, 0.92);
++  background: rgba(28, 28, 27, 0.88);
++  border: 1px solid rgba(255, 250, 240, 0.25);
++  border-radius: var(--radius-md);
+   font-size: var(--text-sm);
++  font-weight: 700;
++  line-height: 1;
+   cursor: pointer;
++  transition: background 0.15s ease, border-color 0.15s ease;
++}
++
++.media-lightbox-chip:hover {
++  background: rgba(40, 38, 35, 0.94);
++  border-color: rgba(255, 250, 240, 0.45);
++}
++
++.media-lightbox-chip.active {
++  border-color: rgba(255, 250, 240, 0.65);
++  background: rgba(48, 45, 40, 0.95);
++}
++
++.media-lightbox-chip-ico {
++  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
++  font-style: italic;
++  font-weight: 700;
++}
++
++/* ── 信息浮层:无容器,文字直接浮在遮罩上(桌面) ── */
++.media-lightbox-info {
++  position: absolute;
++  top: 62px;
++  right: 16px;
++  bottom: 16px;
++  width: var(--lightbox-info-w);
++  z-index: 25;
++  display: flex;
++  flex-direction: column;
++  color: #fffaf0;
++  overflow: hidden;
++  transition: opacity 0.22s ease, transform 0.22s ease;
++}
++
++.media-lightbox-backdrop:not(.info-open):not(.narrow) .media-lightbox-info {
+   opacity: 0;
+   pointer-events: none;
++  transform: translateX(12px);
+ }
+ 
+-.media-lightbox-close:focus-visible {
+-  opacity: 1;
+-  pointer-events: auto;
++/* 信息主体包一层:收起时整块 inert(把手留在外面保持可交互)。 */
++.media-lightbox-info-body {
++  flex: 1;
++  min-height: 0;
++  display: flex;
++  flex-direction: column;
++}
++
++.media-lightbox-info-head {
++  flex: none;
++  padding: 16px 16px 12px;
++  border-bottom: 1px solid rgba(255, 250, 240, 0.08);
++}
++
++.media-lightbox-file-name {
++  font-size: var(--text-lg);
++  font-weight: 800;
++  line-height: 1.4;
++  word-break: break-all;
++}
++
++.media-lightbox-file-sub {
++  margin-top: 4px;
++  font-size: var(--text-xs);
++  color: rgba(255, 250, 240, 0.45);
++  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
++}
++
++.media-lightbox-info-scroll {
++  flex: 1;
++  overflow-y: auto;
++  padding: 2px 16px 12px;
++  scrollbar-width: thin;
++  scrollbar-color: rgba(255, 250, 240, 0.2) transparent;
++}
++
++.media-lightbox-info-foot {
++  flex: none;
++  padding: 12px 16px;
++  border-top: 1px solid rgba(255, 250, 240, 0.08);
++}
++
++/* 下载 = 强按钮:全站唯一交互驱动紫(与快捷条开启态同源),固定深色形态专用 hover 深一档。 */
++.media-lightbox-download {
++  width: 100%;
++  font-size: var(--text-lg);
++  font-weight: 700;
++  color: #fffaf0;
++  background: var(--violet);
++  border: none;
++  border-radius: var(--radius-md);
++  padding: 9px 0;
++  cursor: pointer;
++  transition: background 0.15s ease;
++}
++
++.media-lightbox-download:hover {
++  background: #5b49d6;
++}
++
++.media-lightbox-sec {
++  padding: 13px 0;
++  border-bottom: 1px solid rgba(255, 250, 240, 0.08);
++}
++
++.media-lightbox-sec:last-child {
++  border-bottom: none;
++}
++
++.media-lightbox-sec h3 {
++  margin: 0 0 9px;
++  font-size: var(--text-xs);
++  font-weight: 800;
++  letter-spacing: 0.08em;
++  color: rgba(255, 250, 240, 0.45);
++}
++
++.media-lightbox-kv {
++  display: flex;
++  justify-content: space-between;
++  gap: 12px;
++  padding: 4px 0;
++  font-size: var(--text-md);
++}
++
++.media-lightbox-kv-key {
++  color: rgba(255, 250, 240, 0.45);
++  flex: none;
++  font-weight: 500;
++}
++
++.media-lightbox-kv-value {
++  color: #fffaf0;
++  text-align: right;
++  word-break: break-all;
++  font-weight: 700;
++}
++
++.media-lightbox-kv-value.mono {
++  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
++  font-size: var(--text-sm);
++  font-weight: 400;
++}
++
++.media-lightbox-prompt {
++  font-size: var(--text-sm);
++  line-height: 1.65;
++  color: rgba(255, 250, 240, 0.88);
++  background: rgba(255, 250, 240, 0.08);
++  border: 1px solid rgba(255, 250, 240, 0.08);
++  border-radius: var(--radius-md);
++  padding: 9px 11px;
++  margin-bottom: 9px;
++}
++
++.media-lightbox-derive {
++  display: block;
++  width: 100%;
++  margin-top: 8px;
++  padding: 8px;
++  font-size: var(--text-xs);
++  text-align: left;
++  line-height: 1.5;
++  color: rgba(255, 250, 240, 0.7);
++  background: transparent;
++  border: 1px solid rgba(255, 250, 240, 0.08);
++  border-radius: var(--radius-md);
++  cursor: pointer;
++  transition: border-color 0.15s ease;
++}
++
++.media-lightbox-derive:hover {
++  border-color: rgba(255, 250, 240, 0.45);
++}
++
++.media-lightbox-tags {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 6px;
++}
++
++.media-lightbox-tag {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  font-size: var(--text-xs);
++  font-weight: 700;
++  color: rgba(255, 250, 240, 0.88);
++  background: rgba(255, 250, 240, 0.08);
++  border: 1px solid rgba(255, 250, 240, 0.08);
++  border-radius: var(--radius-pill);
++  padding: 4px 10px;
++}
++
++.media-lightbox-tag-remove {
++  padding: 0;
++  border: none;
++  background: none;
++  cursor: pointer;
++  color: rgba(255, 250, 240, 0.45);
++  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
++  font-size: 10px;
++}
++
++.media-lightbox-tag-remove:hover {
++  color: #fffaf0;
++}
++
++.media-lightbox-tag-add {
++  font-size: var(--text-xs);
++  font-weight: 700;
++  color: rgba(255, 250, 240, 0.45);
++  background: transparent;
++  border: 1px dashed rgba(255, 250, 240, 0.25);
++  border-radius: var(--radius-pill);
++  padding: 4px 10px;
++  cursor: pointer;
++}
++
++.media-lightbox-tag-add:hover {
++  color: #fffaf0;
++  border-color: rgba(255, 250, 240, 0.45);
++}
++
++.media-lightbox-tag-input {
++  width: 92px;
++  font-size: var(--text-xs);
++  color: #fffaf0;
++  background: rgba(255, 250, 240, 0.08);
++  border: 1px solid rgba(255, 250, 240, 0.25);
++  border-radius: var(--radius-pill);
++  padding: 4px 10px;
++  outline: none;
++}
++
++.media-lightbox-note {
++  width: 100%;
++  min-height: 60px;
++  resize: vertical;
++  font-family: inherit;
++  font-size: var(--text-sm);
++  line-height: 1.6;
++  color: #fffaf0;
++  background: rgba(255, 250, 240, 0.08);
++  border: 1px solid rgba(255, 250, 240, 0.08);
++  border-radius: var(--radius-md);
++  padding: 8px 10px;
++}
++
++.media-lightbox-note::placeholder,
++.media-lightbox-tag-input::placeholder {
++  color: rgba(255, 250, 240, 0.45);
++}
++
++.media-lightbox-note:focus,
++.media-lightbox-tag-input:focus {
++  outline: none;
++  border-color: rgba(255, 250, 240, 0.45);
++}
++
++/* 桌面形态不渲染抽屉把手视觉。 */
++.media-lightbox-sheet-grip {
++  display: none;
++}
++
++/* ── 窄容器(< 720px,插件面板/窄窗口):信息浮层 → 底部抽屉 ── */
++.media-lightbox-backdrop.narrow .media-lightbox-stage {
++  padding: 20px 20px 64px;
++}
++
++/* 抽屉展开时媒体区上让位:信息永不遮挡媒体本体(硬约束)。 */
++.media-lightbox-backdrop.narrow.info-open .media-lightbox-stage {
++  bottom: auto;
++  height: 54%;
++  padding-bottom: 16px;
++}
++
++.media-lightbox-backdrop.narrow.info-open .media-lightbox-media {
++  max-height: 100%;
++}
++
++.media-lightbox-backdrop.narrow .media-lightbox-info {
++  top: auto;
++  left: 0;
++  right: 0;
++  bottom: 0;
++  width: auto;
++  height: 46%;
++  border-radius: 14px 14px 0 0;
++  /* 抽屉盖在媒体上方,保留一层底色保可读(与桌面无容器形态刻意不同)。 */
++  background: rgba(28, 28, 27, 0.88);
++  backdrop-filter: blur(14px);
++  -webkit-backdrop-filter: blur(14px);
++  border-top: 1px solid rgba(255, 250, 240, 0.08);
++  transition: transform 0.3s ease;
++}
++
++.media-lightbox-backdrop.narrow:not(.info-open) .media-lightbox-info {
++  transform: translateY(calc(100% - 44px));
++}
++
++.media-lightbox-backdrop.narrow .media-lightbox-sheet-grip {
++  display: block;
++  flex: none;
++  width: 100%;
++  padding: 8px 0 2px;
++  background: none;
++  border: none;
++  cursor: pointer;
++  text-align: center;
++}
++
++.media-lightbox-backdrop.narrow .media-lightbox-sheet-grip::before {
++  content: "";
++  display: inline-block;
++  width: 40px;
++  height: 4px;
++  border-radius: 2px;
++  background: rgba(255, 250, 240, 0.25);
+ }
+ 
+ /* 资产解析 pending 期间的最小加载指示(IndexedDB/服务端资产是异步取回的)。 */
+diff --git a/src/app/MediaLightbox.tsx b/src/app/MediaLightbox.tsx
+index 1ad492db..2188756b 100644
+--- a/src/app/MediaLightbox.tsx
++++ b/src/app/MediaLightbox.tsx
+@@ -1,12 +1,20 @@
+-import { useCallback, useEffect, useRef } from 'react'
++import { useCallback, useEffect, useRef, useState } from 'react'
+ import { useTranslation } from 'react-i18next'
+ import { t } from '../i18n'
++import { isEditingTarget } from '../canvas/canvasInteraction'
++import { wrapMutation } from '../canvas/actions/canvasSyncRuntime'
++import { downloadCanvasNodeOriginal } from '../lib/assetDownload'
++import { isImeComposing } from '../lib/imeSafeEnter'
+ import { handleOverlayEscape } from '../lib/menuOverlayStack'
+ import { useResolvedAssetState } from '../lib/useResolvedAssetUrl'
+ import { debugLogger } from '../store/debugLogStore'
+ import { toastFeedback } from '../store/toastStore'
++import { useCameraFocusStore } from '../store/cameraFocusStore'
+ import { useCanvasStore } from '../store/canvasStore'
+ import { isMediaRenderKind, renderKindForNode } from '../model/canvasNodeRegistry'
++import { formatBytes } from './assetLibraryModel'
++import { NODE_NOTE_MAX_LENGTH, NODE_TAG_MAX_LENGTH, NODE_TAGS_MAX_COUNT } from '../../shared/persist-contract'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
+ 
+ type MediaLightboxProps = {
+   /** 打开时刻锁定的目标节点;不跟随后续选区变化漂移。 */
+@@ -14,9 +22,56 @@ type MediaLightboxProps = {
+   onClose: () => void
+ }
+ 
++/** 窄容器阈值:低于此宽度信息浮层降级为底部抽屉(插件面板/窄窗口同一套判定)。 */
++const NARROW_CONTAINER_WIDTH = 720
++
++/** 信息浮层开合偏好(跨会话记忆;窄容器抽屉不写入,避免面板一次收起污染桌面偏好)。 */
++const INFO_OPEN_STORAGE_KEY = 'mivo.lightbox.info-open'
++
++const readInfoOpenPreference = () => {
++  try {
++    return window.localStorage.getItem(INFO_OPEN_STORAGE_KEY) !== '0'
++  } catch {
++    return true
++  }
++}
++
++/** 'image/png' → 'PNG';未知/缺失时回退原串或节点类型。 */
++const formatLabelFor = (node: MivoCanvasNode) => {
++  const mime = node.assetMimeType
++  if (!mime) return node.type
++  const subtype = mime.split('/')[1] || mime
++  if (subtype.includes('jpeg')) return 'JPEG'
++  if (subtype.includes('quicktime')) return 'MOV'
++  return subtype.split('+')[0].toUpperCase()
++}
++
++const formatTimestamp = (ms?: number) => {
++  if (!ms) return undefined
++  const d = new Date(ms)
++  const pad = (n: number) => String(n).padStart(2, '0')
++  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
++}
++
++const formatDuration = (seconds?: number) => {
++  if (seconds === undefined || !Number.isFinite(seconds)) return undefined
++  const total = Math.round(seconds)
++  const pad = (n: number) => String(n).padStart(2, '0')
++  const h = Math.floor(total / 3600)
++  const m = Math.floor((total % 3600) / 60)
++  const s = total % 60
++  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`
++}
++
+ /**
+- * 图片/视频详情的最简 lightbox:深色遮罩 + 按原始比例放大的媒体本体,
+- * 无信息栏;点媒体以外区域、Esc 或屏幕阅读器关闭按钮关闭。
++ * 图片/视频详情 lightbox(二期):深色遮罩 + 按原始比例放大的媒体本体 +
++ * 可开合的信息浮层(基本信息 / AI 上下文 / 视频专属 / 标签 / 注释 / 下载)。
++ *
++ * 形态不变式(2026-08-02 定稿,模拟页冻结):
++ * - 信息不与媒体分栏——文字直接浮在压暗的遮罩上,无容器底色(桌面);
++ * - 任何状态下信息不遮挡媒体本体(桌面右让位 / 窄容器上让位);
++ * - 窄容器(< 720px,插件面板)降级为底部抽屉(peek 条 + 上拉展开,带底色保可读);
++ * - 详情页固定深色,不随主题(与选区快捷条同族规则)。
+  *
+  * 模态语义:打开时把焦点移入对话框,Tab 圈定在内部,关闭时还原焦点;
+  * 画布全局快捷键在弹层打开期间由 useGlobalCanvasEvents 的 modal 闸统一停摆。
+@@ -24,6 +79,10 @@ type MediaLightboxProps = {
+ export function MediaLightbox({ nodeId, onClose }: MediaLightboxProps) {
+   useTranslation()
+   const nodes = useCanvasStore((state) => state.nodes)
++  const setNodeTags = useCanvasStore((state) => state.setNodeTags)
++  const setNodeNote = useCanvasStore((state) => state.setNodeNote)
++  const selectNode = useCanvasStore((state) => state.selectNode)
++  const requestNodeFocus = useCameraFocusStore((state) => state.requestNodeFocus)
+   const backdropRef = useRef<HTMLDivElement>(null)
+ 
+   const node = nodes.find((item) => item.id === nodeId)
+@@ -32,9 +91,48 @@ export function MediaLightbox({ nodeId, onClose }: MediaLightboxProps) {
+   const nodeHasAsset = Boolean(node?.assetUrl)
+   const nodeIsMedia = isMediaRenderKind(renderKind)
+ 
++  const [infoOpen, setInfoOpen] = useState(readInfoOpenPreference)
++  const [narrow, setNarrow] = useState(false)
++  // 像素尺寸兜底:assetSourceDimensions 缺失时(旧数据)从媒体元素自然尺寸补。
++  const [mediaProbe, setMediaProbe] = useState<{ width: number; height: number; duration?: number }>()
++  const [tagDraft, setTagDraft] = useState<string>()
++  const [noteDraft, setNoteDraft] = useState<string>()
++
++  // 换目标时在渲染期清掉上一张的探测尺寸与编辑草稿(React "adjust state on prop
++  // change" 范式,不进 effect),避免串台。
++  const [probedNodeId, setProbedNodeId] = useState(nodeId)
++  if (probedNodeId !== nodeId) {
++    setProbedNodeId(nodeId)
++    setMediaProbe(undefined)
++    setTagDraft(undefined)
++    setNoteDraft(undefined)
++  }
++
++  // 关闭前冲刷未提交的标签/注释草稿:遮罩 pointerdown 卸载早于浏览器 blur,
++  // 不冲刷的话 blur 提交路径永远赶不上,草稿静默丢失(对抗审 R1-A2)。
++  // ref 装最新 render 的闭包,closeWith 的 useCallback 依赖不用追草稿状态。
++  const flushDraftsRef = useRef<() => void>(() => {})
++  // Escape 取消草稿时的一次性护栏:取消触发的同步 blur 会带着旧闭包进 commit,
++  // 不拦就会把刚放弃的草稿提交回去;microtask 清零防"blur 未发生→护栏残留"。
++  const tagCancelRef = useRef(false)
++  const noteCancelRef = useRef(false)
++
+   // 所有关闭路径都带 reason 落 Debug Log("为什么关了"在诊断时必须可答)。
+   const closeWith = useCallback(
+-    (reason: 'escape' | 'backdrop' | 'close-button' | 'target-missing' | 'asset-missing' | 'load-error') => {
++    (
++      reason:
++        | 'escape'
++        | 'backdrop'
++        | 'close-button'
++        | 'target-missing'
++        | 'asset-missing'
++        | 'load-error'
++        | 'locate-source',
++    ) => {
++      if (reason === 'escape' || reason === 'backdrop' || reason === 'close-button' || reason === 'locate-source') {
++        // 用户主动关闭:先落草稿再关(自愈类关闭不冲刷——目标已缺失,提交无意义)。
++        flushDraftsRef.current()
++      }
+       if (reason === 'target-missing' || reason === 'asset-missing') {
+         debugLogger.warn('Lightbox', `Media lightbox closed (${reason}): ${nodeId}`)
+       } else if (reason === 'load-error') {
+@@ -47,8 +145,54 @@ export function MediaLightbox({ nodeId, onClose }: MediaLightboxProps) {
+     [nodeId, onClose],
+   )
+ 
++  // 窄容器抽屉的开合不写偏好:插件面板里收一次抽屉不该改掉下次桌面默认(R1-A6)。
++  const narrowRef = useRef(false)
++  // infoOpen 镜像 ref:开合只经 toggleInfo,一处写保证同步。next 在 updater 外算——
++  // updater 必须纯:在里面写日志会经 debugLogger 更新 store,撞
++  // "Cannot update ProjectSidebar while rendering MediaLightbox";并发重放还会重复
++  // 写偏好(对抗审 R3-B1)。
++  const infoOpenRef = useRef(infoOpen)
++
++  const toggleInfo = useCallback(
++    (source: 'button' | 'shortcut' | 'sheet-grip') => {
++      const next = !infoOpenRef.current
++      // 收起瞬间若焦点在信息主体内(纯键盘 i 收起的路径),inert 生效会把焦点
++      // 踢到 body,Tab 从此走进 aria-modal 背后的界面——先把焦点接回对话框
++      // (对抗审 R4-A2;鼠标点 chip/grip 时焦点在触发件上,不受影响)。
++      if (!next) {
++        const body = backdropRef.current?.querySelector('.media-lightbox-info-body')
++        if (body?.contains(document.activeElement)) backdropRef.current?.focus()
++      }
++      infoOpenRef.current = next
++      setInfoOpen(next)
++      debugLogger.log('Lightbox', `Info panel ${next ? 'opened' : 'closed'} (${source}): ${nodeId}`)
++      if (!narrowRef.current) {
++        try {
++          window.localStorage.setItem(INFO_OPEN_STORAGE_KEY, next ? '1' : '0')
++        } catch {
++          // 偏好写入失败不影响本次开合(隐私模式等);下次打开回默认。
++        }
++      }
++    },
++    [nodeId],
++  )
++
+   useEffect(() => {
+     const handleKeyDown = (event: KeyboardEvent) => {
++      // 浮层内输入态(标签输入框/注释)让行:Esc 交给输入控件自己收(取消编辑),
++      // 不越级关闭整个 lightbox;字母键更不能被快捷键劫持。
++      if (
++        event.target instanceof HTMLElement &&
++        backdropRef.current?.contains(event.target) &&
++        isEditingTarget(event.target)
++      ) {
++        return
++      }
++      if (event.key.toLowerCase() === 'i' && !event.metaKey && !event.ctrlKey && !event.altKey) {
++        event.preventDefault()
++        toggleInfo('shortcut')
++        return
++      }
+       handleOverlayEscape(event, () => closeWith('escape'))
+     }
+ 
+@@ -56,7 +200,22 @@ export function MediaLightbox({ nodeId, onClose }: MediaLightboxProps) {
+     // 右键菜单开着时按 R6 让行(menuOverlayStack 单一来源,先关菜单再轮到本层)。
+     window.addEventListener('keydown', handleKeyDown, { capture: true })
+     return () => window.removeEventListener('keydown', handleKeyDown, { capture: true })
+-  }, [closeWith])
++  }, [closeWith, toggleInfo])
++
++  // 窄容器判定:观察遮罩自身宽度(插件面板与窄窗口同一套),不是 media query。
++  useEffect(() => {
++    const el = backdropRef.current
++    if (!el) return
++    const observer = new ResizeObserver((entries) => {
++      const width = entries[0]?.contentRect.width
++      if (width !== undefined) {
++        narrowRef.current = width < NARROW_CONTAINER_WIDTH
++        setNarrow(narrowRef.current)
++      }
++    })
++    observer.observe(el)
++    return () => observer.disconnect()
++  }, [])
+ 
+   // 模态焦点:打开时移入对话框,关闭/卸载时还原到触发前的元素。
+   useEffect(() => {
+@@ -95,6 +254,102 @@ export function MediaLightbox({ nodeId, onClose }: MediaLightboxProps) {
+     closeWith('load-error')
+   }, [node, nodeIsMedia, nodeHasAsset, assetState.status, closeWith])
+ 
++  // 标签/注释写入统一过 wrapMutation:server 持久化模式下由它 diff 出
++  // submitChange(裸调 store 只改本地,服务端重载即丢——对抗审 R1-A1/B1)。
++  // 定义在 early-return 之前:冲刷 effect(hooks 顺序)依赖它们。
++  const commitTagDraft = () => {
++    if (tagCancelRef.current) {
++      tagCancelRef.current = false
++      setTagDraft(undefined)
++      return
++    }
++    if (!node) return
++    const value = tagDraft?.trim()
++    setTagDraft(undefined)
++    // 空白草稿 = 用户取消(点开输入框又没写就离开),不是被跳过的操作——刻意
++    // 不落 skipped 日志:空 blur 高频发生,落了反而把 Debug Log 刷成噪音(R4-B1)。
++    if (!value) return
++    const existing = node.tags ?? []
++    if (existing.includes(value)) {
++      debugLogger.log('Lightbox', `Tag add skipped (duplicate): "${value}" on ${nodeId}`)
++      return
++    }
++    if (existing.length >= NODE_TAGS_MAX_COUNT) {
++      // UI 已在达限时隐藏入口;这里是并发/程序路径的兜底,skipped 如实落日志
++      // (不再出现"store 静默截断 + 界面宣告 added"的假成功——对抗审 R3-A2)。
++      debugLogger.warn('Lightbox', `Tag add skipped (limit ${NODE_TAGS_MAX_COUNT}): "${value}" on ${nodeId}`)
++      return
++    }
++    wrapMutation(setNodeTags)(nodeId, [...existing, value])
++    debugLogger.log('Lightbox', `Tag added: "${value}" on ${nodeId}`)
++  }
++
++  // 标签提交/删除会卸载当前焦点元素(input/✕),焦点掉到 body——下一帧还给
++  // 「添加标签」入口,达限隐藏时退回对话框(R4-A3)。只在键盘/点击主动路径调用,
++  // blur 提交(用户已把焦点移走)不抢焦点。
++  const restoreTagFocus = () => {
++    requestAnimationFrame(() => {
++      const container = backdropRef.current
++      if (!container) return
++      const add = container.querySelector<HTMLElement>('.media-lightbox-tag-add')
++      ;(add ?? container).focus()
++    })
++  }
++
++  const cancelTagDraft = () => {
++    tagCancelRef.current = true
++    queueMicrotask(() => {
++      tagCancelRef.current = false
++    })
++    setTagDraft(undefined)
++    backdropRef.current?.focus()
++  }
++
++  const removeTag = (tag: string) => {
++    if (!node) return
++    wrapMutation(setNodeTags)(nodeId, (node.tags ?? []).filter((item) => item !== tag))
++    debugLogger.log('Lightbox', `Tag removed: "${tag}" on ${nodeId}`)
++    restoreTagFocus()
++  }
++
++  const commitNote = () => {
++    if (noteCancelRef.current) {
++      noteCancelRef.current = false
++      setNoteDraft(undefined)
++      return
++    }
++    if (!node || noteDraft === undefined) return
++    const previous = node.note ?? ''
++    setNoteDraft(undefined)
++    // no-op 判定按原串比较(trim 只用于判空):store 契约是非空注释原样保存,
++    // 用 trim 相等当 no-op 会吞掉纯空白/换行调整(对抗审 R3-A3)。
++    if (noteDraft === previous) return
++    if (!noteDraft.trim() && !previous.trim()) return
++    wrapMutation(setNodeNote)(nodeId, noteDraft)
++    debugLogger.log('Lightbox', `Note ${noteDraft.trim() ? 'saved' : 'cleared'}: ${nodeId}`)
++  }
++
++  const cancelNoteDraft = (el: HTMLTextAreaElement) => {
++    noteCancelRef.current = true
++    queueMicrotask(() => {
++      noteCancelRef.current = false
++    })
++    setNoteDraft(undefined)
++    el.blur()
++    // 焦点还给对话框:下一次 Esc 走 modal 关闭路径,键盘不卡死(对抗审 R3-A1)。
++    backdropRef.current?.focus()
++  }
++
++  // 冲刷闭包在 commit 后(effect 期)同步到 ref——render 期写 ref 违反
++  // react-hooks/refs(对抗审 R2-B1);事件(pointerdown/keydown)总在 effect
++  // 之后触发,closeWith 经 ref 拿到的必然是最新草稿闭包。
++  useEffect(() => {
++    flushDraftsRef.current = () => {
++      commitTagDraft()
++      commitNote()
++    }
++  })
++
+   if (!node || !nodeIsMedia || !nodeHasAsset || assetState.status === 'error') return null
+ 
+   const handleMediaError = () => {
+@@ -102,15 +357,25 @@ export function MediaLightbox({ nodeId, onClose }: MediaLightboxProps) {
+     closeWith('load-error')
+   }
+ 
+-  // 最小 focus trap:内部可聚焦元素只有关闭按钮和视频控件,Tab 到边界时回绕。
++  // 最小 focus trap:Tab 圈定在弹层内部(按钮/视频控件/标签输入/注释),边界回绕。
+   const handleTabTrap = (event: React.KeyboardEvent<HTMLDivElement>) => {
+     if (event.key !== 'Tab') return
+ 
+     const container = backdropRef.current
+     if (!container) return
+ 
++    // 真正 tabbable 的过滤:inert 子树之外,还要排除 display:none(桌面态的
++    // sheet grip,getClientRects 为空)与 disabled——否则 Tab 到"最后一个可聚焦
++    // 元素"是个不可见按钮,回绕判定失效,焦点逃出 modal(对抗审 R1-A3 / R2-A1)。
+     const focusables = Array.from(
+-      container.querySelectorAll<HTMLElement>('button, video, [tabindex]:not([tabindex="-1"])'),
++      container.querySelectorAll<HTMLElement>(
++        'button, video, input, textarea, [tabindex]:not([tabindex="-1"])',
++      ),
++    ).filter(
++      (el) =>
++        !el.closest('[inert]') &&
++        !el.hasAttribute('disabled') &&
++        el.getClientRects().length > 0,
+     )
+     if (focusables.length === 0) {
+       event.preventDefault()
+@@ -128,37 +393,276 @@ export function MediaLightbox({ nodeId, onClose }: MediaLightboxProps) {
+     }
+   }
+ 
++  const sourceNode = node.sourceNodeId ? nodes.find((item) => item.id === node.sourceNodeId) : undefined
++
++  const handleDownload = () => {
++    // 成功/跳过/失败三路分别落日志(development-logging 规则);失败路径再 toast。
++    void downloadCanvasNodeOriginal(node)
++      .then((outcome) => {
++        if (outcome === 'completed') {
++          debugLogger.log('Lightbox', `Download completed: ${nodeId}`)
++          return
++        }
++        debugLogger.error('Lightbox', `Download failed (${outcome}): ${nodeId}`)
++        toastFeedback.error(t('toast.lightbox.downloadFailed'))
++      })
++      .catch((error) => {
++        debugLogger.error('Lightbox', `Download failed (throw): ${nodeId} — ${String(error)}`)
++        toastFeedback.error(t('toast.lightbox.downloadFailed'))
++      })
++  }
++
++  const handleLocateSource = () => {
++    if (!sourceNode) {
++      // 来源节点已不在当前画布(被删/跨场景):如实提示,不做静默跳转。
++      debugLogger.warn('Lightbox', `Locate source skipped (missing): ${node.sourceNodeId} ← ${nodeId}`)
++      toastFeedback.error(t('toast.lightbox.sourceMissing'))
++      return
++    }
++    const sceneId = useCanvasStore.getState().sceneId
++    selectNode(sourceNode.id)
++    requestNodeFocus(sourceNode.id, {
++      targetSceneId: sceneId,
++      activeSceneId: sceneId,
++      source: 'lightbox-derive',
++      mode: 'center',
++    })
++    debugLogger.log('Lightbox', `Locate source: ${sourceNode.id} ← ${nodeId}`)
++    closeWith('locate-source')
++  }
++
++  const pixelSize = node.assetSourceDimensions ?? mediaProbe
++  const basicRows: Array<{ label: string; value: string; mono?: boolean }> = [
++    ...(pixelSize
++      ? [{ label: t('inspector.lightboxInfo.pixelSize'), value: `${Math.round(pixelSize.width)} × ${Math.round(pixelSize.height)}`, mono: true }]
++      : []),
++    ...(node.assetSizeBytes !== undefined
++      ? [{ label: t('inspector.meta.fileSize'), value: formatBytes(node.assetSizeBytes), mono: true }]
++      : []),
++    { label: t('inspector.meta.mimeType'), value: formatLabelFor(node), mono: true },
++    ...(node.generation?.createdAt
++      ? [{ label: t('inspector.meta.created'), value: formatTimestamp(node.generation.createdAt) ?? '', mono: true }]
++      : []),
++  ]
++  // duration=Infinity(流式源)时 formatDuration 返 undefined,整行不渲染而不是渲空值行。
++  const durationLabel = renderKind === 'video' ? formatDuration(mediaProbe?.duration) : undefined
++  const videoRows: Array<{ label: string; value: string }> = durationLabel
++    ? [{ label: t('inspector.lightboxInfo.duration'), value: durationLabel }]
++    : []
++
++  const infoPanelId = 'media-lightbox-info-panel'
++
+   return (
+     <div
+       ref={backdropRef}
+-      className="media-lightbox-backdrop"
++      className={`media-lightbox-backdrop${infoOpen ? ' info-open' : ''}${narrow ? ' narrow' : ''}`}
+       role="dialog"
+       aria-modal="true"
+       aria-label={t('library.aria.details')}
+       tabIndex={-1}
+       onKeyDown={handleTabTrap}
+-      onPointerDown={(event) => {
+-        if (event.target === event.currentTarget) closeWith('backdrop')
+-      }}
+     >
+-      {/* 视觉上隐藏、聚焦时浮现的关闭按钮:给屏幕阅读器/键盘用户一个显式退出口。 */}
+-      <button type="button" className="media-lightbox-close" onClick={() => closeWith('close-button')}>
+-        {t('inspector.closeDetails')}
+-      </button>
+-      {assetState.status === 'pending' ? (
+-        // IndexedDB/服务端资产解析是异步的,pending 期间给一个最小加载指示而不是全空遮罩。
+-        <div className="media-lightbox-loading" aria-hidden="true" />
+-      ) : renderKind === 'video' ? (
+-        <video
+-          className="media-lightbox-media"
+-          src={assetState.url}
+-          controls
+-          preload="metadata"
+-          onError={handleMediaError}
++      <div
++        className="media-lightbox-stage"
++        onPointerDown={(event) => {
++          if (event.target === event.currentTarget) closeWith('backdrop')
++        }}
++      >
++        {assetState.status === 'pending' ? (
++          // IndexedDB/服务端资产解析是异步的,pending 期间给一个最小加载指示而不是全空遮罩。
++          <div className="media-lightbox-loading" aria-hidden="true" />
++        ) : renderKind === 'video' ? (
++          <video
++            className="media-lightbox-media"
++            src={assetState.url}
++            controls
++            preload="metadata"
++            onLoadedMetadata={(event) => {
++              const el = event.currentTarget
++              setMediaProbe({ width: el.videoWidth, height: el.videoHeight, duration: el.duration })
++            }}
++            onError={handleMediaError}
++          />
++        ) : (
++          <img
++            className="media-lightbox-media"
++            src={assetState.url}
++            alt={node.title}
++            onLoad={(event) => {
++              const el = event.currentTarget
++              setMediaProbe((probe) => probe ?? { width: el.naturalWidth, height: el.naturalHeight })
++            }}
++            onError={handleMediaError}
++          />
++        )}
++      </div>
++
++      <div className="media-lightbox-actions">
++        <button
++          type="button"
++          className={`media-lightbox-chip${infoOpen ? ' active' : ''}`}
++          aria-expanded={infoOpen}
++          aria-controls={infoPanelId}
++          onClick={() => toggleInfo('button')}
++        >
++          <span className="media-lightbox-chip-ico" aria-hidden="true">i</span>
++          {t('inspector.lightboxInfo.toggle')}
++        </button>
++        <button
++          type="button"
++          className="media-lightbox-chip"
++          aria-label={t('inspector.closeDetails')}
++          onClick={() => closeWith('close-button')}
++        >
++          ✕
++        </button>
++      </div>
++
++      <aside id={infoPanelId} className="media-lightbox-info" aria-hidden={!infoOpen && !narrow}>
++        {/* 窄容器抽屉的拖拽把手;桌面形态不渲染视觉(CSS 隐藏)。 */}
++        <button
++          type="button"
++          className="media-lightbox-sheet-grip"
++          aria-label={t('inspector.lightboxInfo.toggle')}
++          aria-expanded={infoOpen}
++          onClick={() => toggleInfo('sheet-grip')}
+         />
+-      ) : (
+-        <img className="media-lightbox-media" src={assetState.url} alt={node.title} onError={handleMediaError} />
+-      )}
++        {/* 收起时主体 inert:移出 Tab 序与辅助树(仅把手保持可交互,窄态 peek 用)。 */}
++        <div className="media-lightbox-info-body" inert={!infoOpen} aria-hidden={narrow ? !infoOpen : undefined}>
++        <header className="media-lightbox-info-head">
++          <div className="media-lightbox-file-name">{node.assetOriginalName || node.title}</div>
++          <div className="media-lightbox-file-sub">
++            {node.type} · {node.generation ? t('inspector.lightboxInfo.sourceGenerated') : t('inspector.lightboxInfo.sourceImported')}
++          </div>
++        </header>
++        <div className="media-lightbox-info-scroll">
++          <section className="media-lightbox-sec">
++            <h3>{t('inspector.lightboxInfo.basic')}</h3>
++            {basicRows.map((row) => (
++              <div key={row.label} className="media-lightbox-kv">
++                <span className="media-lightbox-kv-key">{row.label}</span>
++                <span className={`media-lightbox-kv-value${row.mono ? ' mono' : ''}`}>{row.value}</span>
++              </div>
++            ))}
++          </section>
++
++          {node.generation ? (
++            <section className="media-lightbox-sec">
++              <h3>{t('inspector.lightboxInfo.aiContext')}</h3>
++              {node.generation.prompt ? (
++                <div className="media-lightbox-prompt">{node.generation.prompt}</div>
++              ) : null}
++              <div className="media-lightbox-kv">
++                <span className="media-lightbox-kv-key">{t('inspector.meta.model')}</span>
++                <span className="media-lightbox-kv-value">{node.generation.model || 'Mivo'}</span>
++              </div>
++              {node.generation.seed !== undefined ? (
++                <div className="media-lightbox-kv">
++                  <span className="media-lightbox-kv-key">{t('inspector.meta.seed')}</span>
++                  <span className="media-lightbox-kv-value mono">{String(node.generation.seed)}</span>
++                </div>
++              ) : null}
++              {node.sourceNodeId ? (
++                <button type="button" className="media-lightbox-derive" onClick={handleLocateSource}>
++                  {t('inspector.lightboxInfo.derivedFrom', {
++                    name: sourceNode?.assetOriginalName || sourceNode?.title || t('inspector.lightboxInfo.sourceGone'),
++                  })}
++                </button>
++              ) : null}
++            </section>
++          ) : null}
++
++          {videoRows.length ? (
++            <section className="media-lightbox-sec">
++              <h3>{t('inspector.lightboxInfo.videoSection')}</h3>
++              {videoRows.map((row) => (
++                <div key={row.label} className="media-lightbox-kv">
++                  <span className="media-lightbox-kv-key">{row.label}</span>
++                  <span className="media-lightbox-kv-value mono">{row.value}</span>
++                </div>
++              ))}
++            </section>
++          ) : null}
++
++          <section className="media-lightbox-sec">
++            <h3>{t('inspector.lightboxInfo.tags')}</h3>
++            <div className="media-lightbox-tags">
++              {(node.tags ?? []).map((tag) => (
++                <span key={tag} className="media-lightbox-tag">
++                  {tag}
++                  <button
++                    type="button"
++                    className="media-lightbox-tag-remove"
++                    aria-label={t('inspector.lightboxInfo.removeTag', { name: tag })}
++                    onClick={() => removeTag(tag)}
++                  >
++                    ✕
++                  </button>
++                </span>
++              ))}
++              {tagDraft !== undefined ? (
++                <input
++                  className="media-lightbox-tag-input"
++                  value={tagDraft}
++                  placeholder={t('inspector.lightboxInfo.tagInputPlaceholder')}
++                  maxLength={NODE_TAG_MAX_LENGTH}
++                  autoFocus
++                  onChange={(event) => setTagDraft(event.target.value)}
++                  onBlur={commitTagDraft}
++                  onKeyDown={(event) => {
++                    // IME 合成态的 Enter/Esc 是输入法在选字/关候选窗,归编辑器
++                    // (ime-safe-input 约定;Esc 不守卫会连带丢整段草稿——R4-A1)。
++                    if (isImeComposing(event)) return
++                    if (event.key === 'Enter') {
++                      event.preventDefault()
++                      commitTagDraft()
++                      // 提交后 input 卸载,焦点会掉到 body(位置感丢失,R4-A3):
++                      // 下一帧还给「添加标签」入口(达限隐藏时退回对话框)。
++                      restoreTagFocus()
++                    }
++                    if (event.key === 'Escape') {
++                      event.stopPropagation()
++                      cancelTagDraft()
++                    }
++                  }}
++                />
++              ) : (node.tags?.length ?? 0) >= NODE_TAGS_MAX_COUNT ? null : (
++                <button type="button" className="media-lightbox-tag-add" onClick={() => setTagDraft('')}>
++                  + {t('inspector.lightboxInfo.addTag')}
++                </button>
++              )}
++            </div>
++          </section>
++
++          <section className="media-lightbox-sec">
++            <h3>{t('inspector.lightboxInfo.note')}</h3>
++            <textarea
++              className="media-lightbox-note"
++              value={noteDraft ?? node.note ?? ''}
++              placeholder={t('inspector.lightboxInfo.notePlaceholder')}
++              maxLength={NODE_NOTE_MAX_LENGTH}
++              onChange={(event) => setNoteDraft(event.target.value)}
++              onBlur={commitNote}
++              onKeyDown={(event) => {
++                // IME 合成态的 Esc 是关候选窗,归编辑器(R4-A1,与标签输入同形)。
++                if (isImeComposing(event)) return
++                // Esc = 放弃草稿并退出编辑;capture 层对输入态让行,这里必须自己收,
++                // 否则焦点在注释框时键盘永远关不掉 lightbox(对抗审 R3-A1)。
++                if (event.key === 'Escape') {
++                  event.stopPropagation()
++                  cancelNoteDraft(event.currentTarget)
++                }
++              }}
++            />
++          </section>
++        </div>
++        <footer className="media-lightbox-info-foot">
++          <button type="button" className="media-lightbox-download" onClick={handleDownload}>
++            {t('inspector.downloadOriginal')}
++          </button>
++        </footer>
++        </div>
++      </aside>
+     </div>
+   )
+ }
+diff --git a/src/i18n/locales/en/inspector.json b/src/i18n/locales/en/inspector.json
+index 8e35430f..89436c09 100644
+--- a/src/i18n/locales/en/inspector.json
++++ b/src/i18n/locales/en/inspector.json
+@@ -75,5 +75,23 @@
+   "lineCount_other": "{{count}} lines",
+   "charCount_one": "{{count}} character",
+   "charCount_other": "{{count}} characters",
+-  "noteSuffix": "original Markdown kept unchanged"
++  "noteSuffix": "original Markdown kept unchanged",
++  "lightboxInfo": {
++    "toggle": "Info",
++    "basic": "Basic info",
++    "aiContext": "AI context",
++    "videoSection": "Video",
++    "pixelSize": "Dimensions",
++    "duration": "Duration",
++    "derivedFrom": "Derived from \"{{name}}\" — click to locate on canvas",
++    "sourceGone": "(source no longer on canvas)",
++    "sourceGenerated": "AI generated",
++    "sourceImported": "Imported",
++    "tags": "Tags",
++    "addTag": "Add tag",
++    "tagInputPlaceholder": "Press Enter",
++    "removeTag": "Remove tag {{name}}",
++    "note": "Notes",
++    "notePlaceholder": "Add a note…"
++  }
+ }
+diff --git a/src/i18n/locales/en/toast.json b/src/i18n/locales/en/toast.json
+index 85bd3b4e..29b1d506 100644
+--- a/src/i18n/locales/en/toast.json
++++ b/src/i18n/locales/en/toast.json
+@@ -150,7 +150,9 @@
+     "expiredReason": "retention period expired"
+   },
+   "lightbox": {
+-    "loadFailed": "Failed to load the media, details closed"
++    "loadFailed": "Failed to load the media, details closed",
++    "downloadFailed": "Download failed, see Debug Log.",
++    "sourceMissing": "The source image is no longer on this canvas."
+   },
+   "export": {
+     "downloadUnsupported": "This object type can't be downloaded yet."
+diff --git a/src/i18n/locales/ja/inspector.json b/src/i18n/locales/ja/inspector.json
+index cd6d1c4f..bb95caea 100644
+--- a/src/i18n/locales/ja/inspector.json
++++ b/src/i18n/locales/ja/inspector.json
+@@ -73,5 +73,23 @@
+   },
+   "lineCount_other": "{{count}}行",
+   "charCount_other": "{{count}}文字",
+-  "noteSuffix": "元のMarkdownは変更されません"
++  "noteSuffix": "元のMarkdownは変更されません",
++  "lightboxInfo": {
++    "toggle": "情報",
++    "basic": "基本情報",
++    "aiContext": "AI コンテキスト",
++    "videoSection": "動画",
++    "pixelSize": "サイズ",
++    "duration": "長さ",
++    "derivedFrom": "「{{name}}」から派生 — クリックでキャンバス上を表示",
++    "sourceGone": "(元画像はキャンバスにありません)",
++    "sourceGenerated": "AI 生成",
++    "sourceImported": "インポート",
++    "tags": "タグ",
++    "addTag": "タグを追加",
++    "tagInputPlaceholder": "Enter で確定",
++    "removeTag": "タグ {{name}} を削除",
++    "note": "メモ",
++    "notePlaceholder": "メモを追加…"
++  }
+ }
+diff --git a/src/i18n/locales/ja/toast.json b/src/i18n/locales/ja/toast.json
+index 7a5758c4..d7f8e965 100644
+--- a/src/i18n/locales/ja/toast.json
++++ b/src/i18n/locales/ja/toast.json
+@@ -146,7 +146,9 @@
+     "expiredReason": "保持期間を過ぎました"
+   },
+   "lightbox": {
+-    "loadFailed": "メディアの読み込みに失敗したため、詳細を閉じました"
++    "loadFailed": "メディアの読み込みに失敗したため、詳細を閉じました",
++    "downloadFailed": "ダウンロードに失敗しました。Debug Log を確認してください。",
++    "sourceMissing": "元画像はこのキャンバスにありません。"
+   },
+   "export": {
+     "downloadUnsupported": "このオブジェクトタイプはまだダウンロードできません。"
+diff --git a/src/i18n/locales/ko/inspector.json b/src/i18n/locales/ko/inspector.json
+index b26fab99..ca6cbafc 100644
+--- a/src/i18n/locales/ko/inspector.json
++++ b/src/i18n/locales/ko/inspector.json
+@@ -73,5 +73,23 @@
+   },
+   "lineCount_other": "{{count}}줄",
+   "charCount_other": "{{count}}자",
+-  "noteSuffix": "원본 Markdown은 그대로 유지됩니다"
++  "noteSuffix": "원본 Markdown은 그대로 유지됩니다",
++  "lightboxInfo": {
++    "toggle": "정보",
++    "basic": "기본 정보",
++    "aiContext": "AI 컨텍스트",
++    "videoSection": "동영상",
++    "pixelSize": "크기",
++    "duration": "길이",
++    "derivedFrom": "\"{{name}}\"에서 파생 — 클릭하면 캔버스에서 찾습니다",
++    "sourceGone": "(원본이 캔버스에 없습니다)",
++    "sourceGenerated": "AI 생성",
++    "sourceImported": "가져옴",
++    "tags": "태그",
++    "addTag": "태그 추가",
++    "tagInputPlaceholder": "Enter로 확정",
++    "removeTag": "태그 {{name}} 제거",
++    "note": "메모",
++    "notePlaceholder": "메모 추가…"
++  }
+ }
+diff --git a/src/i18n/locales/ko/toast.json b/src/i18n/locales/ko/toast.json
+index f78de67a..78c9cc26 100644
+--- a/src/i18n/locales/ko/toast.json
++++ b/src/i18n/locales/ko/toast.json
+@@ -146,7 +146,9 @@
+     "expiredReason": "보존 기간이 지났습니다"
+   },
+   "lightbox": {
+-    "loadFailed": "미디어를 불러오지 못해 상세 보기를 닫았습니다"
++    "loadFailed": "미디어를 불러오지 못해 상세 보기를 닫았습니다",
++    "downloadFailed": "다운로드에 실패했습니다. Debug Log를 확인하세요.",
++    "sourceMissing": "원본 이미지가 이 캔버스에 없습니다."
+   },
+   "export": {
+     "downloadUnsupported": "이 개체 유형은 아직 다운로드할 수 없습니다."
+diff --git a/src/i18n/locales/zh-CN/inspector.json b/src/i18n/locales/zh-CN/inspector.json
+index 3c690631..960b0864 100644
+--- a/src/i18n/locales/zh-CN/inspector.json
++++ b/src/i18n/locales/zh-CN/inspector.json
+@@ -73,5 +73,23 @@
+   },
+   "lineCount_other": "{{count}} 行",
+   "charCount_other": "{{count}} 字符",
+-  "noteSuffix": "原始 Markdown 保持不变"
++  "noteSuffix": "原始 Markdown 保持不变",
++  "lightboxInfo": {
++    "toggle": "信息",
++    "basic": "基本信息",
++    "aiContext": "AI 上下文",
++    "videoSection": "视频",
++    "pixelSize": "尺寸",
++    "duration": "时长",
++    "derivedFrom": "衍生自「{{name}}」,点击在画布中定位",
++    "sourceGone": "(来源已不在画布)",
++    "sourceGenerated": "AI 生成",
++    "sourceImported": "导入",
++    "tags": "标签",
++    "addTag": "添加标签",
++    "tagInputPlaceholder": "回车确认",
++    "removeTag": "移除标签 {{name}}",
++    "note": "注释",
++    "notePlaceholder": "添加注释…"
++  }
+ }
+diff --git a/src/i18n/locales/zh-CN/toast.json b/src/i18n/locales/zh-CN/toast.json
+index 227e91f0..a49cee61 100644
+--- a/src/i18n/locales/zh-CN/toast.json
++++ b/src/i18n/locales/zh-CN/toast.json
+@@ -146,7 +146,9 @@
+     "expiredReason": "已过保留期"
+   },
+   "lightbox": {
+-    "loadFailed": "媒体加载失败,已关闭详情"
++    "loadFailed": "媒体加载失败,已关闭详情",
++    "downloadFailed": "下载失败,详见 Debug Log。",
++    "sourceMissing": "来源图已不在当前画布。"
+   },
+   "export": {
+     "downloadUnsupported": "该对象类型暂不支持下载。"
+diff --git a/src/kernel/mapping.ts b/src/kernel/mapping.ts
+index 9466dbf9..0916636b 100644
+--- a/src/kernel/mapping.ts
++++ b/src/kernel/mapping.ts
+@@ -8,6 +8,7 @@
+ 
+ import type { MivoCanvasNode, CanvasNodeFill, CanvasNodeSolidFill, CanvasNodeStroke, NodeStatus } from '../types/mivoCanvas'
+ import type { AnchorRecord, EdgeRecord, NodeRecord, NodeRelations, Revision } from './records'
++import { decodeNodeTags, encodeNodeTags } from '../../shared/persist-contract'
+ 
+ // ─── helpers(镜像 documentModelV2 的判别 + 合成,reverse 方向)──────────────────
+ const isSolidFill = (fill: CanvasNodeFill): fill is CanvasNodeSolidFill => fill.kind === 'solid'
+@@ -87,6 +88,9 @@ export const toRecord = (node: MivoCanvasNode, revision: Revision = 0): NodeReco
+     locked: node.locked,
+     hidden: node.hidden,
+     favorited: node.favorited,
++    // tags:app 层 string[] → wire 层 JSON 单标量(codec 单一入口,见 NodeRecord.tags 注释)。
++    tags: encodeNodeTags(node.tags),
++    note: node.note,
+     generation: node.generation ? { ...node.generation, ...(node.generation.maskBounds ? { maskBounds: { ...node.generation.maskBounds } } : {}), ...(node.generation.maskSourceSize ? { maskSourceSize: { ...node.generation.maskSourceSize } } : {}) } : undefined,
+     // aiWorkflow canonical 顶层(裁决 6);relations.aiWorkflow 不取(移除)。
+     aiWorkflow: node.aiWorkflow
+@@ -200,6 +204,8 @@ export const fromRecord = (r: NodeRecord): MivoCanvasNode => {
+     locked: r.locked,
+     hidden: r.hidden,
+     favorited: r.favorited,
++    tags: decodeNodeTags(r.tags),
++    note: r.note,
+     sourceNodeId: r.sourceNodeId,
+     generation: r.generation ? { ...r.generation, ...(r.generation.maskBounds ? { maskBounds: { ...r.generation.maskBounds } } : {}), ...(r.generation.maskSourceSize ? { maskSourceSize: { ...r.generation.maskSourceSize } } : {}) } : undefined,
+     aiWorkflow: r.aiWorkflow ? { ...r.aiWorkflow, ...(r.aiWorkflow.sourceNodeIds ? { sourceNodeIds: [...r.aiWorkflow.sourceNodeIds] } : {}) } : undefined,
+diff --git a/src/kernel/records.ts b/src/kernel/records.ts
+index ec59ad53..a0c1f3e4 100644
+--- a/src/kernel/records.ts
++++ b/src/kernel/records.ts
+@@ -109,6 +109,12 @@ export type NodeRecord = {
+   locked?: boolean
+   hidden?: boolean
+   favorited?: boolean
++  /** wire/record 层标签编码:JSON string array 的单标量字符串(codec 单一入口 =
++   *  shared/persist-contract 的 encodeNodeTags/decodeNodeTags/isNodeTagsWire)。
++   *  数组进不了 FieldIntent 语法(array set = clobber 拒),标量 set 是合法叶子;
++   *  并发语义 = 整组 last-writer-wins。应用层是 MivoCanvasNode.tags: string[]。 */
++  tags?: string
++  note?: string
+   generation?: NodeGeneration
+   aiWorkflow?: CanvasAiWorkflow
+   /** node-embedded 过渡形态;收编目标 = 顶层 AnchorRecord(见 mapping 提取)。 */
+diff --git a/src/lib/assetDownload.ts b/src/lib/assetDownload.ts
+index 110385d9..47c07339 100644
+--- a/src/lib/assetDownload.ts
++++ b/src/lib/assetDownload.ts
+@@ -53,20 +53,24 @@ const downloadBlob = (blob: Blob, filename: string) => {
+   window.setTimeout(() => URL.revokeObjectURL(url), 0)
+ }
+ 
+-export const downloadCanvasNodeOriginal = async (node: MivoCanvasNode) => {
+-  if (!node.assetUrl) return
++/** 下载结果判别:调用方按此分派成功/跳过/失败三路日志与反馈(旧调用方可忽略返回值,行为不变)。 */
++export type AssetDownloadOutcome = 'completed' | 'no-asset' | 'asset-missing' | 'fetch-failed'
++
++export const downloadCanvasNodeOriginal = async (node: MivoCanvasNode): Promise<AssetDownloadOutcome> => {
++  if (!node.assetUrl) return 'no-asset'
+ 
+   if (isImportedAssetUrl(node.assetUrl)) {
+     const asset = await readImportedAssetFile(node.assetUrl)
+-    if (!asset) return
++    if (!asset) return 'asset-missing'
+ 
+     downloadBlob(asset.blob, cleanFilename(asset.name) || filenameFor(node, asset.type))
+-    return
++    return 'completed'
+   }
+ 
+-  const response = await fetch(node.assetUrl)
+-  if (!response.ok) return
++  const response = await fetch(node.assetUrl).catch(() => undefined)
++  if (!response?.ok) return 'fetch-failed'
+ 
+   const blob = await response.blob()
+   downloadBlob(blob, filenameFor(node, blob.type))
++  return 'completed'
+ }
+diff --git a/src/lib/snapshotValidation.test.ts b/src/lib/snapshotValidation.test.ts
+index ff35f3f8..1794da99 100644
+--- a/src/lib/snapshotValidation.test.ts
++++ b/src/lib/snapshotValidation.test.ts
+@@ -67,6 +67,29 @@ const parse = (value: unknown) => parseCanvasSnapshot(JSON.stringify(value))
+ // Tests -----------------------------------------------------------------------
+ 
+ describe('parseCanvasSnapshot', () => {
++  describe('tags/note 上限(与 wire 校验同源,2026-08-02 对抗审 R3-B2)', () => {
++    it('接受合法 tags/note(上限内)', () => {
++      const result = parse(validSnapshot({ nodes: [validImageNode({ tags: ['a', 'b'], note: 'n' })] }))
++      expect(result.ok).toBe(true)
++    })
++
++    it('拒绝超条数 tags(33 条)', () => {
++      const tags = Array.from({ length: 33 }, (_, i) => `t${i}`)
++      expect(parse(validSnapshot({ nodes: [validImageNode({ tags })] })).ok).toBe(false)
++    })
++
++    it('拒绝超长单条标签(65 字符)与空成员与空数组', () => {
++      expect(parse(validSnapshot({ nodes: [validImageNode({ tags: ['x'.repeat(65)] })] })).ok).toBe(false)
++      expect(parse(validSnapshot({ nodes: [validImageNode({ tags: ['a', ''] })] })).ok).toBe(false)
++      expect(parse(validSnapshot({ nodes: [validImageNode({ tags: [] })] })).ok).toBe(false)
++    })
++
++    it('拒绝超长 note(2001 字符)与空串 note', () => {
++      expect(parse(validSnapshot({ nodes: [validImageNode({ note: 'n'.repeat(2001) })] })).ok).toBe(false)
++      expect(parse(validSnapshot({ nodes: [validImageNode({ note: '' })] })).ok).toBe(false)
++    })
++  })
++
+   describe('valid snapshots', () => {
+     it('accepts a plain v2 snapshot and returns it with no assets', () => {
+       const result = parse(validSnapshot())
+diff --git a/src/lib/snapshotValidation.ts b/src/lib/snapshotValidation.ts
+index 5f52be95..95d88471 100644
+--- a/src/lib/snapshotValidation.ts
++++ b/src/lib/snapshotValidation.ts
+@@ -11,6 +11,7 @@ import type {
+   NodeStatus,
+ } from '../types/mivoCanvas'
+ import { normalizeCanvasSnapshotV2 } from '../model/canvasSnapshotModel'
++import { isNodeNoteApp, isNodeTagsApp } from '../../shared/persist-contract'
+ import type { SerializedCanvasAsset } from './assetStorage'
+ 
+ const nodeStatuses = new Set<NodeStatus>(['ready', 'generating', 'failed', 'queued'])
+@@ -273,6 +274,10 @@ const isCanvasNode = (value: unknown): value is MivoCanvasNode => {
+     (value.locked === undefined || typeof value.locked === 'boolean') &&
+     (value.hidden === undefined || typeof value.hidden === 'boolean') &&
+     (value.favorited === undefined || typeof value.favorited === 'boolean') &&
++    // tags/note 上限与 wire 校验同源(shared codec 单一入口):snapshot import 不得
++    // 放行超限/空成员值,否则复制/上服务端时 decoder 拒收,重新制造本地/服务端分叉。
++    (value.tags === undefined || isNodeTagsApp(value.tags)) &&
++    (value.note === undefined || isNodeNoteApp(value.note)) &&
+     isGeneration(value.generation) &&
+     isAiWorkflow(value.aiWorkflow) &&
+     (value.experimentalAnchors === undefined || isExperimentalAnchorArray(value.experimentalAnchors))
+diff --git a/src/store/canvasStateTypes.ts b/src/store/canvasStateTypes.ts
+index 7eedd041..de0091bc 100644
+--- a/src/store/canvasStateTypes.ts
++++ b/src/store/canvasStateTypes.ts
+@@ -370,6 +370,10 @@ export type CanvasState = {
+   generateFromAnnotation: (annotationNodeId?: string, options?: CanvasGenerationOptions) => Promise<string[]>
+   commitGenerationResult: (payload: CommitGenerationResultPayload) => Promise<string[]>
+   toggleFavorite: (nodeId: string) => void
++  /** 媒体详情页标签编辑:trim + 去重 + 去空,结果为空数组时收敛为 undefined(不落盘)。 */
++  setNodeTags: (nodeId: string, tags: string[]) => void
++  /** 媒体详情页注释编辑:trim 后空串收敛为 undefined(不落盘)。 */
++  setNodeNote: (nodeId: string, note: string) => void
+   updatePrompt: (nodeId: string, prompt: string) => void
+   // P2-D1 EXPERIMENTAL — Anchor MVP actions (roadmap §7 组 D). Migration rule
+   // (§9 P4-a):收编为 formal CanvasAnchor, or remove the field + these actions.
+diff --git a/src/store/nodeFactory.ts b/src/store/nodeFactory.ts
+index b3ff05cd..a7cdf26a 100644
+--- a/src/store/nodeFactory.ts
++++ b/src/store/nodeFactory.ts
+@@ -38,6 +38,8 @@ export const cloneNode = (node: MivoCanvasNode): MivoCanvasNode => ({
+   connectorStart: node.connectorStart ? { ...node.connectorStart } : undefined,
+   connectorEnd: node.connectorEnd ? { ...node.connectorEnd } : undefined,
+   parentIds: node.parentIds ? [...node.parentIds] : undefined,
++  // tags 是数组:spread 只拷引用,history/clipboard/persist 三处都要求与源隔离。
++  tags: node.tags ? [...node.tags] : undefined,
+   generation: node.generation
+     ? {
+         ...node.generation,
+diff --git a/src/store/nodeMutationSlice.meta.test.ts b/src/store/nodeMutationSlice.meta.test.ts
+new file mode 100644
+index 00000000..00c935b7
+--- /dev/null
++++ b/src/store/nodeMutationSlice.meta.test.ts
+@@ -0,0 +1,149 @@
++// @vitest-environment happy-dom
++// setNodeTags / setNodeNote(媒体详情页信息浮层,2026-08-02):归一化语义钉死——
++// tags 走 trim + 去重 + 去空、空数组收敛为 undefined(不落盘);note 走 trim 判空、
++// 空串收敛为 undefined。真 store 测试,不 mock slice;undo 走 patchWithHistory,
++// 与其它节点字段编辑同一撤销通道。
++import { beforeEach, describe, expect, it } from 'vitest'
++import { useCanvasStore } from './canvasStore'
++import { cloneNode } from './nodeFactory'
++import { fromRecord, toRecord } from '../kernel/mapping'
++import { validateFieldIntent } from '../lib/canvasSyncPort'
++import {
++  NODE_NOTE_MAX_LENGTH,
++  NODE_TAG_MAX_LENGTH,
++  NODE_TAGS_MAX_COUNT,
++  classifyFieldPathBySchema,
++  decodeNodeTags,
++  isNodeTagsWire,
++} from '../../shared/persist-contract'
++import type { MivoCanvasNode } from '../types/mivoCanvas'
++
++const node = (seed: Partial<MivoCanvasNode> & { id: string }): MivoCanvasNode =>
++  ({
++    type: 'image',
++    title: seed.id,
++    x: 0,
++    y: 0,
++    width: 100,
++    height: 100,
++    status: 'ready',
++    ...seed,
++  }) as MivoCanvasNode
++
++const nodeById = (id: string) => useCanvasStore.getState().nodes.find((item) => item.id === id)
++
++describe('setNodeTags — trim/去重/去空 + 空数组收敛 undefined', () => {
++  beforeEach(() => {
++    useCanvasStore.setState({ nodes: [node({ id: 'img' }), node({ id: 'other', tags: ['keep'] })] })
++  })
++
++  it('trim + 去重 + 去空:["  参考图 ", "参考图", "", "角色"] → ["参考图", "角色"]', () => {
++    useCanvasStore.getState().setNodeTags('img', ['  参考图 ', '参考图', '', '角色'])
++    expect(nodeById('img')?.tags).toEqual(['参考图', '角色'])
++  })
++
++  it('清空到空数组 → 字段收敛为 undefined(不落盘空数组)', () => {
++    useCanvasStore.getState().setNodeTags('img', ['a'])
++    useCanvasStore.getState().setNodeTags('img', [])
++    expect(nodeById('img')?.tags).toBeUndefined()
++  })
++
++  it('全空白输入同样收敛为 undefined', () => {
++    useCanvasStore.getState().setNodeTags('img', ['   ', ''])
++    expect(nodeById('img')?.tags).toBeUndefined()
++  })
++
++  it('只改目标节点,不碰其它节点的标签', () => {
++    useCanvasStore.getState().setNodeTags('img', ['x'])
++    expect(nodeById('other')?.tags).toEqual(['keep'])
++  })
++})
++
++describe('setNodeTags — undo 走标准历史通道', () => {
++  it('设标签后 undo 恢复原值(patchWithHistory 单撤销单元)', () => {
++    useCanvasStore.setState({ nodes: [node({ id: 'img', tags: ['旧'] })] })
++    useCanvasStore.getState().setNodeTags('img', ['新'])
++    expect(nodeById('img')?.tags).toEqual(['新'])
++    useCanvasStore.getState().undo()
++    expect(nodeById('img')?.tags).toEqual(['旧'])
++  })
++})
++
++describe('tags 跨层契约 — wire 单标量编码 + 克隆隔离 + intent 合法性', () => {
++  it('cloneNode 隔离:改源节点 tags 数组不影响克隆(history/clipboard/persist 共用前提)', () => {
++    const source = node({ id: 'img', tags: ['a'] })
++    const clone = cloneNode(source)
++    source.tags!.push('b')
++    expect(clone.tags).toEqual(['a'])
++  })
++
++  it('mapping 往返:string[] ↔ JSON 单标量无损;note 原样', () => {
++    const source = node({ id: 'img', tags: ['参考图', '角色'], note: '备注' })
++    const record = toRecord(source)
++    expect(record.tags).toBe(JSON.stringify(['参考图', '角色']))
++    const back = fromRecord(record)
++    expect(back.tags).toEqual(['参考图', '角色'])
++    expect(back.note).toBe('备注')
++  })
++
++  it('codec 对抗往返:含分隔符/引号/反斜杠的标签文本无损(JSON 编码不存在碰撞)', () => {
++    const hostile = ['a\u001fb', '引"号', 'back\\slash']
++    const back = fromRecord(toRecord(node({ id: 'img', tags: hostile })))
++    expect(back.tags).toEqual(hostile)
++  })
++
++  it('decode 防御:非法 wire → undefined;空串成员剔除', () => {
++    expect(decodeNodeTags('not-json')).toBeUndefined()
++    expect(decodeNodeTags('{"a":1}')).toBeUndefined()
++    expect(decodeNodeTags(JSON.stringify(['', 'x', 3]))).toEqual(['x'])
++    expect(decodeNodeTags(JSON.stringify(['']))).toBeUndefined()
++  })
++
++  it('wire 严格校验:超上限拒收(条数/单条长度),合法值放行', () => {
++    expect(isNodeTagsWire(JSON.stringify(['x']))).toBe(true)
++    expect(isNodeTagsWire(JSON.stringify(Array.from({ length: NODE_TAGS_MAX_COUNT + 1 }, (_, i) => `t${i}`)))).toBe(false)
++    expect(isNodeTagsWire(JSON.stringify(['x'.repeat(NODE_TAG_MAX_LENGTH + 1)]))).toBe(false)
++    expect(isNodeTagsWire(JSON.stringify([]))).toBe(false)
++  })
++
++  it('store 上限:单条截断到 NODE_TAG_MAX_LENGTH,条数截断到 NODE_TAGS_MAX_COUNT,note 截断到 NODE_NOTE_MAX_LENGTH', () => {
++    useCanvasStore.setState({ nodes: [node({ id: 'img' })] })
++    useCanvasStore.getState().setNodeTags('img', ['x'.repeat(NODE_TAG_MAX_LENGTH + 40)])
++    expect(nodeById('img')?.tags?.[0]?.length).toBe(NODE_TAG_MAX_LENGTH)
++    useCanvasStore.getState().setNodeTags('img', Array.from({ length: NODE_TAGS_MAX_COUNT + 8 }, (_, i) => `t${i}`))
++    expect(nodeById('img')?.tags?.length).toBe(NODE_TAGS_MAX_COUNT)
++    useCanvasStore.getState().setNodeNote('img', 'n'.repeat(NODE_NOTE_MAX_LENGTH + 50))
++    expect(nodeById('img')?.note?.length).toBe(NODE_NOTE_MAX_LENGTH)
++  })
++
++  it('归一化剔除 U+001F 等控制字符:分隔符不可能进标签文本', () => {
++    useCanvasStore.setState({ nodes: [node({ id: 'img' })] })
++    useCanvasStore.getState().setNodeTags('img', ['a\u001fb', 'c'])
++    expect(nodeById('img')?.tags).toEqual(['ab', 'c'])
++  })
++
++  it('FieldIntent:set tags(单标量)与 set note 都是合法叶子操作,不会被同步层丢弃', () => {
++    const classify = (fieldPath: readonly (string | number)[]) => classifyFieldPathBySchema('node', fieldPath)
++    expect(() =>
++      validateFieldIntent({ op: 'set', fieldPath: ['tags'], value: JSON.stringify(['a', 'b']) }, classify),
++    ).not.toThrow()
++    expect(() => validateFieldIntent({ op: 'set', fieldPath: ['note'], value: 'n' }, classify)).not.toThrow()
++    expect(() => validateFieldIntent({ op: 'delete-field', fieldPath: ['tags'] }, classify)).not.toThrow()
++  })
++})
++
++describe('setNodeNote — trim 判空 + 空串收敛 undefined', () => {
++  beforeEach(() => {
++    useCanvasStore.setState({ nodes: [node({ id: 'img', note: '旧注释' })] })
++  })
++
++  it('非空注释原样保存(不 trim 内容本身,只用 trim 判空)', () => {
++    useCanvasStore.getState().setNodeNote('img', '  新注释  ')
++    expect(nodeById('img')?.note).toBe('  新注释  ')
++  })
++
++  it('清空(纯空白)→ 字段收敛为 undefined', () => {
++    useCanvasStore.getState().setNodeNote('img', '   ')
++    expect(nodeById('img')?.note).toBeUndefined()
++  })
++})
+diff --git a/src/store/nodeMutationSlice.ts b/src/store/nodeMutationSlice.ts
+index 16f79571..75596424 100644
+--- a/src/store/nodeMutationSlice.ts
++++ b/src/store/nodeMutationSlice.ts
+@@ -26,6 +26,22 @@ import {
+   removeAnchorFromNode,
+   updateAnchorInstruction,
+ } from '../model/anchorModel'
++import {
++  NODE_NOTE_MAX_LENGTH,
++  NODE_TAG_MAX_LENGTH,
++  NODE_TAGS_MAX_COUNT,
++} from '../../shared/persist-contract'
++
++// 标签文本剔除控制字符(codePoint 过滤,不用控制字符正则——no-control-regex):
++// 控制字符对标签无语义,且保证 wire codec(JSON)与日志输出干净。
++const stripControlChars = (value: string): string => {
++  let out = ''
++  for (const ch of value) {
++    const code = ch.codePointAt(0) ?? 0
++    if (code > 0x1f && code !== 0x7f) out += ch
++  }
++  return out
++}
+ 
+ export const createNodeMutationSlice: SliceCreator = (set, get) => ({
+   updateNodePosition: (nodeId, x, y) =>
+@@ -708,6 +724,36 @@ export const createNodeMutationSlice: SliceCreator = (set, get) => ({
+         node.id === nodeId ? { ...node, favorited: !node.favorited } : node,
+       )
+ 
++      return patchWithHistory(state, { nodes })
++    }),
++  setNodeTags: (nodeId, tags) =>
++    set((state) => {
++      // 归一化:剔控制字符 + trim + 单条截断(NODE_TAG_MAX_LENGTH)+ 去空去重 +
++      // 条数上限(NODE_TAGS_MAX_COUNT)。上限与 shared/persist-contract 的 wire
++      // 校验同源:本地永不超限,不会出现"本地已存、服务端拒收"的分叉。
++      const normalized = [
++        ...new Set(
++          tags
++            .map((tag) => stripControlChars(tag).trim().slice(0, NODE_TAG_MAX_LENGTH).trim())
++            .filter(Boolean),
++        ),
++      ].slice(0, NODE_TAGS_MAX_COUNT)
++      const next = normalized.length ? normalized : undefined
++      const nodes = state.nodes.map((node) =>
++        node.id === nodeId ? { ...node, tags: next } : node,
++      )
++
++      return patchWithHistory(state, { nodes })
++    }),
++  setNodeNote: (nodeId, note) =>
++    set((state) => {
++      // 长度上限与 wire 校验(isNodeNoteWire)同源;截断而非拒绝(UI 侧 maxLength 已挡)。
++      const clamped = note.slice(0, NODE_NOTE_MAX_LENGTH)
++      const next = clamped.trim() ? clamped : undefined
++      const nodes = state.nodes.map((node) =>
++        node.id === nodeId ? { ...node, note: next } : node,
++      )
++
+       return patchWithHistory(state, { nodes })
+     }),
+   updatePrompt: (nodeId, prompt) =>
+diff --git a/src/types/mivoCanvas.ts b/src/types/mivoCanvas.ts
+index 90e5a51d..ed32983a 100644
+--- a/src/types/mivoCanvas.ts
++++ b/src/types/mivoCanvas.ts
+@@ -350,6 +350,10 @@ export type MivoCanvasNode = {
+   locked?: boolean
+   hidden?: boolean
+   favorited?: boolean
++  /** 用户标签(媒体详情页编辑;空数组不落盘,mutation 层收敛为 undefined)。 */
++  tags?: string[]
++  /** 用户注释(媒体详情页编辑;空串不落盘,mutation 层收敛为 undefined)。 */
++  note?: string
+   sourceNodeId?: string
+   generation?: {
+     prompt: string

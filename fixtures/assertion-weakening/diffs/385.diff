@@ -1,0 +1,757 @@
+diff --git a/src/__tests__/cardActionContinue.test.ts b/src/__tests__/cardActionContinue.test.ts
+index c194665b..e5c66caf 100644
+--- a/src/__tests__/cardActionContinue.test.ts
++++ b/src/__tests__/cardActionContinue.test.ts
+@@ -10,12 +10,13 @@
+  * 按钮可见性、agent.run 调用契约、失败矩阵、并发、event 白名单与脱敏。
+  */
+ import { describe, expect, it } from 'vitest'
+-import { flushUntil } from './brainHarness'
++import { attachPanelBridge, flushMicrotasks, flushUntil } from './brainHarness'
+ import {
+   boot,
+   clickAction,
+   coreFor,
+   filesOf,
++  flushDiag,
+   generationRequests,
+   HASH,
+   markup,
+@@ -27,6 +28,13 @@ import type { Booted } from './cardActionHarness'
+ const cardsFor = (booted: Booted, callId: string) => booted.cards().filter((card) => card.callId === callId)
+ const doneCardsFor = (booted: Booted, callId: string) => cardsFor(booted, callId).filter((card) => card.state === 'done')
+ 
++/** #297 P2 返修(R6.2):直接读裸文件核对代际 fencing 自洽性,不经过任何高层 API。 */
++const rawJson = (booted: Booted, path: string): Record<string, unknown> => {
++  const text = booted.brain.files.get(path)
++  if (text === undefined) throw new Error(`raw file not found in fake fs: ${path}`)
++  return JSON.parse(text)
++}
++
+ // #297 P2 返修:级②共享前置校验(corrupt/TTL/lineage/session/背压)的现场构造,
+ // 与 cardActions.test.ts 的 envelope/seededFiles 同一份手搓落盘形状(wire shape),
+ // 这里独立一份是因为那个文件的版本是局部常量,未对外导出。
+@@ -520,3 +528,723 @@ describe('P2 continue 跨动作单飞互斥(与 regen/restyle 互斥,完成后
+     expect(generationRequests(booted).length).toBe(before + 1) // 名额已释放,新点击能真正进入生成
+   })
+ })
++
++describe('P2 continue 有界超时(#297 P2 返修 P1-1)', () => {
++  it('agent.run 悬挂超过 26 分钟窗口 → 按超时收敛成一张失败卡,释放在途,不再无界悬挂 finally', async () => {
++    const seeded = boot()
++    await seedRootRecord(seeded)
++    const booted = boot({ files: filesOf(seeded), agentRun: () => new Promise(() => {}) })
++    const pending = booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'continue',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'never-settles',
++      userActionToken: 'never-token',
++    })
++    await booted.settle() // 假时钟推进 40 分钟(> 26 分钟超时窗口),真实回执永不到达
++    await pending
++    const cards = cardsFor(booted, 'never-settles')
++    expect(cards.filter((card) => card.state === 'working')).toHaveLength(1)
++    expect(cards.filter((card) => card.state === 'done')).toHaveLength(1) // 收敛成终版,不再悬挂
++    expect(booted.brain.handles.cardAction.inflightCount()).toBe(0) // 在途名额已释放
++    const failed = doneCardsFor(booted, 'never-settles').pop()
++    expect(failed?.html).toContain(booted.brain.handles.card.text('en', 'continueFailed'))
++  })
++
++  it('超时后宿主真实回执迟到(才 settle)→ 不二次画卡,不重复 markDone', async () => {
++    let resolveLate!: (value: unknown) => void
++    const seeded = boot()
++    await seedRootRecord(seeded)
++    const booted = boot({
++      files: filesOf(seeded),
++      agentRun: () => new Promise((resolve) => { resolveLate = resolve }),
++    })
++    const pending = booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'continue',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'late-arrival',
++      userActionToken: 'late-token',
++    })
++    await booted.settle() // 越过 26 分钟超时窗口,先按超时收敛一次
++    await pending
++    expect(doneCardsFor(booted, 'late-arrival')).toHaveLength(1)
++
++    // 真实回执这才姗姗来迟(晚于超时收敛):不应该再产生第二张终版卡。
++    resolveLate({ ok: true, sessionId: 's', mode: 'continue', disposition: 'resumed' })
++    await booted.settle()
++    expect(doneCardsFor(booted, 'late-arrival')).toHaveLength(1)
++  })
++})
++
++describe('P2 continue 同根未知状态守卫(#297 P2 返修 R4.3:超时释放全局槽,但同根拒绝新 continue 直到迟到回执/重启解除)', () => {
++  it('超时后同一 rootId 的新 spawn 点击 → 真实调用数仍为 1(零重复),新点击收敛成"结果未知"失败卡且不占互斥', async () => {
++    const seeded = boot()
++    await seedRootRecord(seeded)
++    const booted = boot({ files: filesOf(seeded), agentRun: () => new Promise(() => {}) })
++    const pending = booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'continue',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'timeout-mother',
++      userActionToken: 'tok-timeout-mother',
++    })
++    await booted.settle() // 越过 26 分钟超时窗口,真实回执永不到达
++    await pending
++    expect(booted.brain.agentRunCalls).toHaveLength(1)
++    expect(booted.brain.handles.cardAction.inflightCount()).toBe(0) // 全局并发槽已释放
++    expect(booted.brain.handles.cardAction.continueRootPendingCount()).toBe(1) // 同根守卫立起
++
++    // 同一 rootId 的新点击:不同 spawnCallId、不同票据,也不能再发第二次真实调用 ——
++    // 手册没有取消原语,上一次调用到底有没有真的打到宿主仍然不可知。
++    await clickAction(booted, {
++      actionId: 'continue',
++      spawnCallId: 'timeout-mother-retry',
++      userActionToken: 'tok-timeout-mother-retry',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(1) // 仍是 1,不是 2
++    const retryCard = doneCardsFor(booted, 'timeout-mother-retry').pop()
++    expect(retryCard?.html).toContain(booted.brain.handles.card.text('en', 'continueFailed'))
++    expect(booted.brain.handles.cardAction.inflightCount()).toBe(0) // 新点击也没有占住互斥
++  })
++
++  it('跨母卡不受影响:一张卡超时后,另一张(不同 root)照常能发起 continue', async () => {
++    const seeded = boot()
++    await seedRootRecord(seeded)
++    await seedRootRecord(seeded, { callId: 'call-root-2' })
++    const booted = boot({
++      files: filesOf(seeded),
++      agentRun: (payload) =>
++        (payload.event as Record<string, unknown> | undefined)?.spawnCallId === 'other-root-hang'
++          ? new Promise(() => {})
++          : { ok: true, sessionId: 's', mode: 'continue', disposition: 'resumed' },
++    })
++    const pending = booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'continue',
++      callId: 'call-root-2',
++      spawnCallId: 'other-root-hang',
++      userActionToken: 'tok-other-root',
++    })
++    await booted.settle()
++    await pending
++    expect(booted.brain.handles.cardAction.continueRootPendingCount()).toBe(1)
++
++    // 另一个 root(ROOT_CALL_ID)照常能发,不被那个还没解除守卫的 root 拖累。
++    await clickAction(booted, {
++      actionId: 'continue',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'other-root-fine',
++      userActionToken: 'tok-fine',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(2) // 悬挂那次 + 这次都是真实调用
++    const fineCard = doneCardsFor(booted, 'other-root-fine').pop()
++    expect(fineCard?.html).not.toContain(booted.brain.handles.card.text('en', 'continueFailed'))
++  })
++
++  it('迟到的真实回执解除同根守卫:解除后再点一次能正常发起新调用', async () => {
++    let resolveLate!: (value: unknown) => void
++    const seeded = boot()
++    await seedRootRecord(seeded)
++    const booted = boot({
++      files: filesOf(seeded),
++      agentRun: () => new Promise((resolve) => { resolveLate = resolve }),
++    })
++    const pending = booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'continue',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'late-unlocks',
++      userActionToken: 'tok-late-unlocks',
++    })
++    await booted.settle()
++    await pending
++    expect(booted.brain.handles.cardAction.continueRootPendingCount()).toBe(1)
++
++    resolveLate({ ok: true, sessionId: 's', mode: 'continue', disposition: 'resumed' })
++    await booted.settle()
++    expect(booted.brain.handles.cardAction.continueRootPendingCount()).toBe(0) // 迟到回执解除守卫
++
++    await clickAction(booted, {
++      actionId: 'continue',
++      spawnCallId: 'late-unlocks-retry',
++      userActionToken: 'tok-late-unlocks-retry',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(2) // 守卫已解除,新点击能真正再发一次调用
++  })
++})
++
++describe('P2 continue 一次性调用凭据(#297 P2 返修 P1-2:调用前落盘,写失败零调用,重启重放不再调用)', () => {
++  it('调用前的 attempted 凭据落盘失败 → 零调用(不冒险重复调用);写盘持续故障,重放同样零调用', async () => {
++    let allowWrites = true
++    const booted = boot({ writeGuard: () => allowWrites })
++    await seedRootRecord(booted)
++    allowWrites = false
++
++    await clickAction(booted, {
++      actionId: 'continue', spawnCallId: 'persist-fail-replay', userActionToken: 'one-shot-token',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(0) // 旧实现在这里会调用一次(先调用再补记账)
++    expect((await booted.brain.handles.cardAction.doneIds()).includes('persist-fail-replay')).toBe(false)
++    expect((await booted.brain.handles.cardAction.attemptedIds()).includes('persist-fail-replay')).toBe(false)
++    const firstFail = doneCardsFor(booted, 'persist-fail-replay').pop()
++    expect(firstFail?.html).toContain(booted.brain.handles.card.text('en', 'continueFailed'))
++
++    await clickAction(booted, {
++      actionId: 'continue', spawnCallId: 'persist-fail-replay', userActionToken: 'one-shot-token',
++    })
++    // 写盘一直没恢复:第二次点击依旧是零调用,不是"第一次调用、第二次才补上第二次调用"
++    // (旧实现在写失败+重放场景下会累计到 2 次调用 —— 这正是 P1-2 finding 的重复调用窗口)。
++    expect(booted.brain.agentRunCalls).toHaveLength(0)
++  })
++
++  it('电子脑重启后重放同一票据 → 不再调用 agent.run,收敛成可解释的失败卡(结果未知)', async () => {
++    const seeded = boot()
++    await seedRootRecord(seeded)
++    const first = boot({ files: filesOf(seeded), agentRun: () => new Promise(() => {}) })
++    void first.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'continue',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'restart-replay',
++      userActionToken: 'one-shot-restart',
++    })
++    await flushUntil(() => first.brain.agentRunCalls.length === 1, { label: 'first brain entered agent.run' })
++    // attempted 凭据在调用**之前**已经落盘(P1-2 的核心不变量),重启前先确认这一点,
++    // 否则下面"重启后不再调用"就可能只是巧合(比如凑巧从没进过 continue 分岔)。
++    expect((await first.brain.handles.cardAction.attemptedIds()).includes('restart-replay')).toBe(true)
++    expect((await first.brain.handles.cardAction.doneIds()).includes('restart-replay')).toBe(false)
++
++    // 模拟电子脑重启:全新一份 brain 吃上一份的落盘快照,第一份的悬挂调用永远不会
++    // 结束,但那是"另一个进程"的事,与重启后的这份 brain 无关。
++    const restarted = boot({
++      files: filesOf(first),
++      agentRun: () => ({ ok: false, errorCode: 'TOKEN_EXPIRED', message: 'ticket expired' }),
++    })
++    await clickAction(restarted, {
++      actionId: 'continue',
++      spawnCallId: 'restart-replay',
++      userActionToken: 'one-shot-restart',
++    })
++    expect(restarted.brain.agentRunCalls).toHaveLength(0) // 重启后重放:不再调用(旧实现会调用一次)
++    const done = doneCardsFor(restarted, 'restart-replay').pop()
++    expect(done?.html).toContain(restarted.brain.handles.card.text('en', 'continueFailed'))
++  })
++})
++
++describe('P2 continue 调用前落盘有界(#297 P2 返修 R4.1:会话绑定+attempted 合并成一次提交,两次 fsWrite 各自有界,不悬空占住全局槷)', () => {
++  it('records 落盘悬挂 → 越过有界 deadline 后收敛成一张失败卡, 零调用且互斥已释放', async () => {
++    let hangRecords = false
++    const booted = boot({
++      writeOutcome: (request) =>
++        hangRecords && /card-actions\/records-[ab]\.json$/.test(request.path) ? 'hang' : undefined,
++    })
++    await seedRootRecord(booted)
++    hangRecords = true
++
++    const pending = booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'continue',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'records-write-hang',
++      userActionToken: 'tok-records-hang',
++    })
++    await booted.settle() // 越过 CARD_ACTION_FS_DEADLINE_MS(1.5s),真实回执永不到达
++    await pending
++
++    expect(booted.brain.agentRunCalls).toHaveLength(0) // 零调用:悬挂发生在 agent.run 之前
++    expect(doneCardsFor(booted, 'records-write-hang')).toHaveLength(1) // 恰一张失败卡
++    const failed = doneCardsFor(booted, 'records-write-hang').pop()
++    expect(failed?.html).toContain(booted.brain.handles.card.text('en', 'continueFailed'))
++    expect(booted.brain.handles.cardAction.inflightCount()).toBe(0) // 互斥已释放,没有永久占槷
++  })
++
++  it('manifest 指针落盘悬挂 → 同样越过有界 deadline 后收敛, 零调用且互斥已释放', async () => {
++    let hangManifest = false
++    const booted = boot({
++      writeOutcome: (request) => (hangManifest && request.path === 'card-actions/manifest.json' ? 'hang' : undefined),
++    })
++    await seedRootRecord(booted)
++    hangManifest = true
++
++    const pending = booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'continue',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'manifest-write-hang',
++      userActionToken: 'tok-manifest-hang',
++    })
++    await booted.settle()
++    await pending
++
++    expect(booted.brain.agentRunCalls).toHaveLength(0)
++    expect(doneCardsFor(booted, 'manifest-write-hang')).toHaveLength(1)
++    const failed = doneCardsFor(booted, 'manifest-write-hang').pop()
++    expect(failed?.html).toContain(booted.brain.handles.card.text('en', 'continueFailed'))
++    expect(booted.brain.handles.cardAction.inflightCount()).toBe(0)
++  })
++})
++
++describe('P2 continue 未决凭据生命周期(#297 P2 返修 R4.2:markDone 原子 done.add+attempted.delete,容量逼近上限 fail-closed 不淘汰未决)', () => {
++  it('done 写失败留未决 + 200 个后续正常提交都不挤占它 + 重启重放仍是零二次调用', async () => {
++    let writeCount = 0
++    let failFromWrite = Number.POSITIVE_INFINITY
++    const booted = boot({
++      writeGuard: () => {
++        if (failFromWrite === Number.POSITIVE_INFINITY) return true
++        writeCount += 1
++        return writeCount < failFromWrite
++      },
++    })
++    await seedRootRecord(booted)
++
++    // 让"标记完成"这次提交(attempted 已经落盘成功之后的下一次提交)的两次 fsWrite
++    // 全部失败:命中的正是 cardActionMarkDone 里 done.add+attempted.delete 那次提交,
++    // 不是前面 attempted 落盘那次(那次必须成功,才谈得上"已调用但结果未知")。
++    writeCount = 0
++    failFromWrite = 3
++    await clickAction(booted, {
++      actionId: 'continue',
++      spawnCallId: 'done-write-fails',
++      userActionToken: 'tok-done-write-fails',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(1) // 真实调用已经发生(agent.run 成功)
++    expect((await booted.brain.handles.cardAction.attemptedIds())).toContain('done-write-fails') // 未决凭据没被抹掉
++    expect((await booted.brain.handles.cardAction.doneIds())).not.toContain('done-write-fails') // done 提交确实没落盘
++
++    // 写盘恢复正常,后续 200 个正常 continue 各自完整走完(attempted 落盘又被
++    // markDone 原子摘掉),验证它们不会把上面这条未决凭据从 attempted 里挤出去。
++    failFromWrite = Number.POSITIVE_INFINITY
++    for (let index = 0; index < 200; index += 1) {
++      await clickAction(booted, {
++        actionId: 'continue',
++        spawnCallId: `normal-continue-${index}`,
++        userActionToken: `tok-normal-${index}`,
++      })
++    }
++    expect(booted.brain.agentRunCalls).toHaveLength(201) // 1 条未决 + 200 条全部走完
++    expect((await booted.brain.handles.cardAction.attemptedIds())).toContain('done-write-fails')
++
++    // 重启:全新 brain 吃上一份的落盘快照,重放同一张票据。
++    const restarted = boot({ files: filesOf(booted) })
++    expect((await restarted.brain.handles.cardAction.attemptedIds())).toContain('done-write-fails')
++    await clickAction(restarted, {
++      actionId: 'continue',
++      spawnCallId: 'done-write-fails',
++      userActionToken: 'tok-done-write-fails',
++    })
++    expect(restarted.brain.agentRunCalls).toHaveLength(0) // 零二次调用
++    const replayed = doneCardsFor(restarted, 'done-write-fails').pop()
++    expect(replayed?.html).toContain(restarted.brain.handles.card.text('en', 'continueFailed'))
++  })
++
++  it('未决凭据逼近容量上限 → 新 continue fail-closed 拒绝,不淘汰已有未决;重启后未决仍在,重放零调用', async () => {
++    const cap = boot().brain.handles.cardAction.recordCap
++    const root = { recordId: ROOT_CALL_ID, callId: ROOT_CALL_ID, core: coreFor(), ownedHash: HASH, ext: '.png' }
++    const filler = Array.from({ length: cap - 1 }, (_, index) => `old-pending-${index}`)
++    const attempted = ['unknown-old', ...filler] // 恰好 cap 条,一条不多不少地占满
++    expect(attempted).toHaveLength(cap)
++
++    const booted = boot({ files: seededFiles([root], [], attempted) })
++    await clickAction(booted, {
++      actionId: 'continue',
++      spawnCallId: 'capacity-new-click',
++      userActionToken: 'tok-capacity-new',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(0) // fail-closed:容量已满,零调用
++    const rejected = doneCardsFor(booted, 'capacity-new-click').pop()
++    expect(rejected?.html).toContain(booted.brain.handles.card.text('en', 'continueFailed'))
++
++    // 容量满时拒绝新 continue,不等于淘汰旧的未决凭据 —— 200 条原样还在。
++    const attemptedAfter = await booted.brain.handles.cardAction.attemptedIds()
++    expect(attemptedAfter).toHaveLength(cap)
++    expect(attemptedAfter).toContain('unknown-old')
++
++    // 重启后 unknown-old 仍在(没有被 FIFO 悄悄扔掉),重放它本身也是零调用。
++    const restarted = boot({ files: filesOf(booted) })
++    expect((await restarted.brain.handles.cardAction.attemptedIds())).toContain('unknown-old')
++    await clickAction(restarted, {
++      actionId: 'continue',
++      spawnCallId: 'unknown-old',
++      userActionToken: 'tok-unknown-old-replay',
++    })
++    expect(restarted.brain.agentRunCalls).toHaveLength(0)
++  })
++})
++
++describe('P2 continue 四语完整性(#297 P2 返修 P1-4:防"删翻译测试仍绿"假绿)', () => {
++  it('8 个 continue 专属 key 在 zh-CN/ja/ko 下均有专属译文,不悬空回退英文;未知 locale 仍兜底英文', () => {
++    const card = boot().brain.handles.card
++    const keys = [
++      'actionContinue',
++      'continueWorking',
++      'continueSent',
++      'continueQueued',
++      'continueFailed',
++      'continueUserMessage',
++      'errNoTicket',
++      'errContinueFailed',
++    ] as const
++    for (const key of keys) {
++      const english = card.text('en', key)
++      expect(english).toBeTruthy()
++      for (const locale of ['zh-CN', 'ja', 'ko']) {
++        const localized = card.text(locale, key)
++        expect(localized).toBeTruthy()
++        // 悬空回退英文 = 该 locale 这个 key 已经不存在(如被误删)。字典条目缺失时
++        // cardText 会静默兜底英文(既有产品设计,面向未知 locale),这条断言专门
++        // 收窄"支持的四语里有一门被误删还查得到英文"这个假绿窗口。
++        expect(localized).not.toBe(english)
++      }
++      // 未知 locale 仍走既有英文兜底,不受本条新增断言影响既有契约。
++      expect(card.text('de', key)).toBe(english)
++    }
++  })
++})
++
++describe('P2 continue event 白名单与脱敏(SC2.7)', () => {
++  it('宿主事件自报的伪造字段(hash/自由文本)读不到、不进 event/userMessage', async () => {
++    const booted = boot()
++    await seedRootRecord(booted)
++    // 不能直接 await handleCardAction:working→done 落在同一 cardId 通道上,
++    // 中间隔着卡片限速窗口(CARD_MIN_INTERVAL_MS)的一次 clock.setTimeout,必须先
++    // 让假时钟推进(booted.settle())才会真正 resolve —— 与 clickAction 内部同一顺序
++    // (先发起、settle、再 await),否则会在这个 setTimeout 上真实挂起到用例超时。
++    const pending = booted.brain.handles.handleCardAction({
++      type: 'card-action',
++      actionId: 'continue',
++      callId: ROOT_CALL_ID,
++      spawnCallId: 'spawn-hostile',
++      userActionToken: 'tok',
++      // 以下两个字段都不在 CARD_ACTION_EVENT_FIELDS allowlist 内,验证读不到、不进消费面。
++      artifactHash: 'evil-hash-should-not-leak',
++      prompt: '<script>alert(1)</script>',
++    })
++    await booted.settle()
++    await pending
++
++    expect(booted.brain.agentRunCalls).toHaveLength(1)
++    const payload = booted.brain.agentRunCalls[0]
++    const event = payload.event as Record<string, unknown>
++    expect(event.artifactHash).toBe(HASH) // 只取卡片记录,不信事件自报
++    expect(Object.keys(event).sort()).toEqual(['actionId', 'artifactHash', 'spawnCallId'])
++    expect(payload.userMessage).toBe(booted.brain.handles.card.text('en', 'continueUserMessage'))
++    expect(JSON.stringify(payload)).not.toContain('<script')
++
++    const sentCard = doneCardsFor(booted, 'spawn-hostile').pop()
++    expect(sentCard?.html).not.toContain('<script')
++  })
++
++  it('一次性点击票据不落诊断日志(成功/ok:false/runner reject 三档,诊断事件流全文都不含票据原文)', async () => {
++    const SECRET_TOKEN = 'super-secret-ticket-value'
++    const scenarios: Array<{ label: string; agentRun?: (payload: Record<string, unknown>) => unknown }> = [
++      { label: 'success' },
++      { label: 'ok-false', agentRun: () => ({ ok: false, errorCode: 'TOKEN_EXPIRED', message: 'ticket expired' }) },
++      { label: 'reject', agentRun: () => Promise.reject(new Error('boom reject')) },
++    ]
++    for (const scenario of scenarios) {
++      const booted = boot({ agentRun: scenario.agentRun })
++      // attach 必须能接住 seedRootRecord + clickAction 两段全部诊断事件 —— 见
++      // cardActionHarness.flushDiag 的注释:事件先压进有界队列,靠面板心跳才回放,
++      // attach 的时点不影响回放,但漏 attach 就等于测了一个没人听的诊断桥。
++      const bridge = attachPanelBridge(booted.brain)
++      await seedRootRecord(booted)
++      await clickAction(booted, {
++        actionId: 'continue',
++        spawnCallId: `spawn-token-secrecy-${scenario.label}`,
++        userActionToken: SECRET_TOKEN,
++      })
++      await flushDiag(booted)
++
++      // 空锁位陷阱(#297 P2 返修):必须真的读到诊断事件文本再断言不含票据,否则
++      // 「桥没接住任何事件」与「事件里确实没有票据」两种情况都会让下面这行绿,
++      // 断言就退化成空转。
++      const diagMessages = bridge.spy.messages()
++      expect(diagMessages.length).toBeGreaterThan(0)
++      expect(diagMessages.join('\n')).not.toContain(SECRET_TOKEN)
++
++      // 卡片 HTML(用户可见面)与事件白名单(SC2.7 已在上面钉死三键)都不含票据原文;
++      // 这里额外确认它不会顺着卡片这条用户可见通道泄出。
++      const done = doneCardsFor(booted, `spawn-token-secrecy-${scenario.label}`).pop()
++      expect(done?.html).not.toContain(SECRET_TOKEN)
++    }
++  })
++})
++
++describe('P2 continue 迟到写覆盖新代(#297 P2 返修 R5.1:代际 fencing + 槷位串行化)', () => {
++  it('评审员 witness 场景:records 槷位迟到落字节不再覆盖后续代,重启重放零二次调用(#297 交叉审 P1)', async () => {
++    // witness 复现(见 /tmp/297-p2-r4-mutations.R2H0Ud/…/cardActionLateWriteProbe.test.ts):
++    // withDeadline 放弃等待不等于底层写消失——'slow-body' 的 attempted 落盘被注入
++    // 4s 延迟,越过 1.5s deadline 后 cardActionWrite 认输,但那个真实写仍在后台跑,
++    // 迟早会真的落字节。返修前它会在之后某个新代复用同一 a/b 槷位时把新代整份覆盖掉。
++    let delayed = false
++    const booted = boot({
++      writeDelayMs: (request) =>
++        !delayed &&
++        /^card-actions\/records-[ab]\.json$/.test(request.path) &&
++        String(request.content).includes('"attempted":["slow-body"]')
++          ? ((delayed = true), 4_000)
++          : undefined,
++    })
++    await seedRootRecord(booted)
++
++    // 用「promise 是否已经 settle」而不是「卡片状态出现没出现」当收敛判据——
++    // cardActionContinueFailCard 先发失败卡再跑 markDone(R5.1-b 的槷位串行化
++    // 守卫就长在 markDone 触发的第二次提交里),只看卡片状态会在第二道 deadline
++    // 还没轮到之前就误判"已经收敛",随后 await 那个还没真正 settle 的 promise
++    // 会一直悬着,直到用例超时。
++    let slowSettled = false
++    const slow = booted.brain.handles
++      .handleCardAction({
++        type: 'card-action', actionId: 'continue', callId: ROOT_CALL_ID,
++        spawnCallId: 'slow-body', userActionToken: 'slow-token',
++      })
++      .finally(() => { slowSettled = true })
++    await flushUntil(() => delayed, { label: 'slow body write issued' })
++    // 每轮只推小步(250ms),让「越过一道 deadline → 微任务把下一道 deadline 真正
++    // 排上号 → 再推小步」这条链每一步都对齐,不会因为一次性推过头而在同一个
++    // advance() 同步批次里把还没轮到的后续 deadline 也一并错误触发。
++    await flushUntil(
++      () => slowSettled,
++      { label: 'slow-body 落定(含失败卡触发的第二次 markDone 提交)', rounds: 60, perRound: 8, advanceEachRound: () => booted.brain.clock.advance(250) },
++    )
++    await slow
++    expect(booted.brain.agentRunCalls).toHaveLength(0)
++
++    // 在旧写真正落地之前,新的一次 continue 想用同一个槷位——它必须先等旧写
++    // settle(R5.1-b),等到之后(此刻旧写终于真落地)才轮到它自己落盘,不会被
++    // 旧写事后覆盖。
++    let fastSettled = false
++    const fast = booted.brain.handles
++      .handleCardAction({
++        type: 'card-action', actionId: 'continue', callId: ROOT_CALL_ID,
++        spawnCallId: 'fast-after-timeout', userActionToken: 'fast-token',
++      })
++      .finally(() => { fastSettled = true })
++    await flushUntil(
++      () => fastSettled,
++      { label: 'fast-after-timeout 落定', rounds: 60, perRound: 8, advanceEachRound: () => booted.brain.clock.advance(250) },
++    )
++    await fast
++    expect(booted.brain.agentRunCalls).toHaveLength(1)
++    expect(await booted.brain.handles.cardAction.doneIds()).toContain('fast-after-timeout')
++
++    // #297 P2 返修(R6.2):「fast 的 action promise 已经 settle」不等于「那个被
++    // cardActionWaitForSlot 判定 fail-closed 的旧 raw write 已经真的物理落盘」——
++    // 二者是两件独立的事(judge 用 mutation 实证过:把 cardActionWaitForSlot 整层
++    // 删掉恒 true,只断言最终 agentRunCalls===0 的旧版本这 4 例仍然全绿,因为那个
++    // 断言会被 R5.1-a 的 fencing 兜底掩盖,测不出串行化本身是否真的生效)。必须
++    // 显式再推进超过 seam 配置的 4s 延迟,让那次旧写真正 settle,然后直接读裸
++    // 文件核对——如果串行化真的生效,body 与 manifest 的代数应该完全自洽,done
++    // 不会被冲掉;如果串行化被删掉(mutation),旧写会在此刻覆盖掉 fast 刚写下的
++    // 新代,这里就会读到不自洽的代数或丢失的 done。
++    booted.brain.clock.advance(4_500)
++    await flushMicrotasks(64)
++    const manifestRaw = rawJson(booted, 'card-actions/manifest.json')
++    const bodyRaw = rawJson(booted, 'card-actions/' + manifestRaw.current)
++    expect(bodyRaw.generation).toBe(manifestRaw.generation)
++    expect(bodyRaw.done).toContain('fast-after-timeout')
++
++    const restarted = boot({ files: filesOf(booted) })
++    // 在重放之前先确认 root 记录本身没有被(错误地)判 corrupt——如果这条断言
++    // 失败但下面的重放断言仍然是零调用,说明是靠 fencing 兜底而不是串行化本身
++    // 生效,两者要分开看才不会被 fencing 掩盖。
++    const restartedRoot = (await restarted.brain.handles.cardAction.records()).find(
++      (record) => record.recordId === ROOT_CALL_ID,
++    )
++    expect(restartedRoot?.corrupt).not.toBe(true)
++    await clickAction(restarted, {
++      actionId: 'continue', callId: ROOT_CALL_ID,
++      spawnCallId: 'fast-after-timeout', userActionToken: 'fast-token',
++    })
++    // 修复前:旧写覆盖了 done,重放会再发一次真实调用。修复后:done 完好,不会
++    // 静默重放。
++    expect(restarted.brain.agentRunCalls).toHaveLength(0)
++  })
++
++  it('迟到落字节 seam 同样覆盖 manifest.json:指针槷位迟到落地不覆盖后续代的指针', async () => {
++    // 只武装 seedRootRecord 完成之后的写——manifest.json 的正文不带 spawnCallId,
++    // 若不用 armed 隔开,seedRootRecord 自己那次生成 1 代的提交也会命中同一个
++    // "generation":1 特征,注错目标。
++    let armed = false
++    let delayed = false
++    const booted = boot({
++      writeDelayMs: (request) =>
++        armed && !delayed && request.path === 'card-actions/manifest.json'
++          ? ((delayed = true), 4_000)
++          : undefined,
++    })
++    await seedRootRecord(booted)
++    armed = true
++
++    let slowSettled = false
++    const slow = booted.brain.handles
++      .handleCardAction({
++        type: 'card-action', actionId: 'continue', callId: ROOT_CALL_ID,
++        spawnCallId: 'slow-pointer', userActionToken: 'slow-pointer-token',
++      })
++      .finally(() => { slowSettled = true })
++    await flushUntil(() => delayed, { label: 'slow manifest write issued' })
++    await flushUntil(
++      () => slowSettled,
++      { label: 'slow-pointer 落定(含失败卡触发的第二次 markDone 提交)', rounds: 60, perRound: 8, advanceEachRound: () => booted.brain.clock.advance(250) },
++    )
++    await slow
++    expect(booted.brain.agentRunCalls).toHaveLength(0)
++
++    let fastSettled = false
++    const fast = booted.brain.handles
++      .handleCardAction({
++        type: 'card-action', actionId: 'continue', callId: ROOT_CALL_ID,
++        spawnCallId: 'fast-pointer', userActionToken: 'fast-pointer-token',
++      })
++      .finally(() => { fastSettled = true })
++    await flushUntil(
++      () => fastSettled,
++      { label: 'fast-pointer 落定', rounds: 60, perRound: 8, advanceEachRound: () => booted.brain.clock.advance(250) },
++    )
++    await fast
++    expect(booted.brain.agentRunCalls).toHaveLength(1)
++    expect(await booted.brain.handles.cardAction.doneIds()).toContain('fast-pointer')
++
++    // #297 P2 返修(R6.2):同上一条用例——显式等旧 manifest 写真正物理落盘,再
++    // 直接读裸文件核对代数自洽 + done 完好,不能只靠最终 agentRunCalls===0(那会
++    // 被 fencing 兜底掩盖串行化本身是否生效)。
++    booted.brain.clock.advance(4_500)
++    await flushMicrotasks(64)
++    const manifestRaw = rawJson(booted, 'card-actions/manifest.json')
++    const bodyRaw = rawJson(booted, 'card-actions/' + manifestRaw.current)
++    expect(bodyRaw.generation).toBe(manifestRaw.generation)
++    expect(bodyRaw.done).toContain('fast-pointer')
++
++    const restarted = boot({ files: filesOf(booted) })
++    const restartedRoot = (await restarted.brain.handles.cardAction.records()).find(
++      (record) => record.recordId === ROOT_CALL_ID,
++    )
++    expect(restartedRoot?.corrupt).not.toBe(true)
++    await clickAction(restarted, {
++      actionId: 'continue', callId: ROOT_CALL_ID,
++      spawnCallId: 'fast-pointer', userActionToken: 'fast-pointer-token',
++    })
++    expect(restarted.brain.agentRunCalls).toHaveLength(0)
++  })
++
++  it('直接构造 body.generation 与 manifest.generation 不一致 → 记录整份标记 corrupt,continue 收敛为零调用失败卡', async () => {
++    const staleBody = JSON.stringify({
++      version: 1,
++      generation: 1, // 故意落后于 manifest 的 3——模拟一次迟到覆盖后的现场
++      records: [{ recordId: ROOT_CALL_ID, callId: ROOT_CALL_ID, core: coreFor(), ownedHash: HASH, ext: '.png' }],
++      done: [],
++      attempted: [],
++    })
++    const booted = boot({
++      files: {
++        'card-actions/manifest.json': JSON.stringify({ version: 1, current: 'records-a.json', generation: 3, savedAt: 1 }),
++        'card-actions/records-a.json': staleBody,
++      },
++    })
++    await clickAction(booted, {
++      actionId: 'continue', callId: ROOT_CALL_ID, spawnCallId: 'fencing-direct', userActionToken: 'tok-fencing-direct',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(0)
++    const failed = doneCardsFor(booted, 'fencing-direct').pop()
++    expect(failed?.html).toContain(booted.brain.handles.card.text('en', 'continueFailed'))
++  })
++
++  it('body 缺 generation 字段(修复前的旧数据)→ 不判 fencing,照旧信任,continue 正常可用', async () => {
++    const legacyBody = JSON.stringify({
++      version: 1, // 无 generation 字段:修复上线前写下的存量数据
++      records: [{ recordId: ROOT_CALL_ID, callId: ROOT_CALL_ID, core: coreFor(), ownedHash: HASH, ext: '.png' }],
++      done: [],
++      attempted: [],
++    })
++    const booted = boot({
++      files: {
++        'card-actions/manifest.json': JSON.stringify({ version: 1, current: 'records-a.json', generation: 7, savedAt: 1 }),
++        'card-actions/records-a.json': legacyBody,
++      },
++    })
++    await clickAction(booted, {
++      actionId: 'continue', callId: ROOT_CALL_ID, spawnCallId: 'legacy-body-ok', userActionToken: 'tok-legacy',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(1) // 缺字段按旧数据处理,不判 fencing,正常放行
++  })
++
++  it('跨版本 witness(#297 P2 返修 R6.1):manifest 已经是 v2 + body 仍是旧 v1 格式且缺 generation → 版本号本身就是 fencing 信号,不会被"缺字段=信任"的旧判据放过', async () => {
++    // 复现交叉审给的真实窗口:一次活得比 withDeadline 更久的**旧格式**(v1、无
++    // generation)raw write 迟到落地,覆盖了一个后来已经进到 v2 的新代。R5.1 的
++    // 原始判据只看 generation 字段有没有、对不对——字段缺失时无条件信任,分不清
++    // "真的是升级前存量"还是"这次迟到覆盖恰好把字段也冲掉了"。R6.1 要求:manifest
++    // 一旦见过 v2,就不再接受任何 v1 形态的 body,不管它是不是缺字段。
++    const staleV1Body = JSON.stringify({
++      version: 1, // R5.1 及更早的代码只会写这个版本号,新写不可能是这个数字
++      // 无 generation 字段——旧格式写从不带这个字段
++      records: [{ recordId: ROOT_CALL_ID, callId: ROOT_CALL_ID, core: coreFor(), ownedHash: HASH, ext: '.png' }],
++      done: [],
++      attempted: [],
++    })
++    const booted = boot({
++      files: {
++        'card-actions/manifest.json': JSON.stringify({ version: 2, current: 'records-a.json', generation: 5, savedAt: 1 }),
++        'card-actions/records-a.json': staleV1Body,
++      },
++    })
++    await clickAction(booted, {
++      actionId: 'continue', callId: ROOT_CALL_ID, spawnCallId: 'cross-version-fencing', userActionToken: 'tok-cross-version',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(0) // 已完成的一次性调用不会被这次重放二次发起
++    const failed = doneCardsFor(booted, 'cross-version-fencing').pop()
++    expect(failed?.html).toContain(booted.brain.handles.card.text('en', 'continueFailed'))
++  })
++
++  it('跨版本 witness(#297 P2 返修 R6.1):manifest v2 + body v1 但 generation 数值恰好与 manifest 相等 → 版本号是独立于 generation 数值的判据,仍判 fencing', async () => {
++    // 只核对 generation 数值(不看版本号)会在这个用例上误放行——两边数字"恰好"
++    // 一样,但 body 仍然是旧格式写下的,不可信。version 号必须独立参与判定,
++    // 不能被"生成数值凑巧对上"绕过。
++    const staleV1BodySameGeneration = JSON.stringify({
++      version: 1,
++      generation: 5, // 与下面 manifest 的代数故意凑成一样的数字
++      records: [{ recordId: ROOT_CALL_ID, callId: ROOT_CALL_ID, core: coreFor(), ownedHash: HASH, ext: '.png' }],
++      done: [],
++      attempted: [],
++    })
++    const booted = boot({
++      files: {
++        'card-actions/manifest.json': JSON.stringify({ version: 2, current: 'records-a.json', generation: 5, savedAt: 1 }),
++        'card-actions/records-a.json': staleV1BodySameGeneration,
++      },
++    })
++    await clickAction(booted, {
++      actionId: 'continue', callId: ROOT_CALL_ID, spawnCallId: 'cross-version-number-coincidence', userActionToken: 'tok-coincidence',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(0)
++    const failed = doneCardsFor(booted, 'cross-version-number-coincidence').pop()
++    expect(failed?.html).toContain(booted.brain.handles.card.text('en', 'continueFailed'))
++  })
++
++  it('跨版本 witness(#297 P2 返修 R7.1):manifest v2 + body v3(未知/未来 wrapper 版本,generation 相同)→ 版本号判据必须"恰为 v2",不能只挡更旧的一侧', async () => {
++    // R6.1 的原判据是 `bodyVersion < CARD_ACTION_STORE_SCHEMA_V2`——只挡"更旧"的
++    // body,放过了 v3 这种未知/未来 wrapper 版本(即使 generation 数值对得上,
++    // 也不代表这个进程认得 v3 的 records/done/attempted 形状)。收紧成恰好相等
++    // 之后,任何不是 v2 的 body(不管更旧还是更新)都判 fencing。
++    const unknownV3Body = JSON.stringify({
++      version: 3, // 未知/未来 wrapper 版本——不是"更旧",反而"看起来更新"
++      generation: 5, // 与 manifest 的代数一致,单靠 generation 数值分不出问题
++      records: [{ recordId: ROOT_CALL_ID, callId: ROOT_CALL_ID, core: coreFor(), ownedHash: HASH, ext: '.png' }],
++      done: [],
++      attempted: [],
++    })
++    const booted = boot({
++      files: {
++        'card-actions/manifest.json': JSON.stringify({ version: 2, current: 'records-a.json', generation: 5, savedAt: 1 }),
++        'card-actions/records-a.json': unknownV3Body,
++      },
++    })
++    await clickAction(booted, {
++      actionId: 'continue', callId: ROOT_CALL_ID, spawnCallId: 'cross-version-unknown-v3', userActionToken: 'tok-unknown-v3',
++    })
++    expect(booted.brain.agentRunCalls).toHaveLength(0) // fencing 拦下,零调用
++    const failed = doneCardsFor(booted, 'cross-version-unknown-v3').pop()
++    expect(failed?.html).toContain(booted.brain.handles.card.text('en', 'continueFailed')) // 可见失败卡,不静默采信
++  })
++})

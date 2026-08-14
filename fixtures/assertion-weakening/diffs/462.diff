@@ -1,0 +1,514 @@
+diff --git a/src/__tests__/depositFailureClassifiers.test.ts b/src/__tests__/depositFailureClassifiers.test.ts
+new file mode 100644
+index 00000000..8149a03c
+--- /dev/null
++++ b/src/__tests__/depositFailureClassifiers.test.ts
+@@ -0,0 +1,111 @@
++/**
++ * T1d 纯判定逻辑契约(SC1b.3 quota 两支 / kind 分桶负缓存)。
++ *
++ * 本文件只 import `depositFailureClassifiers.ts`(新文件,T1d 交付)——不 import
++ * 也不修改 `depositPort.ts`/`depositStore.ts` 任何一行(并行文件所有权边界)。
++ */
++import { describe, expect, it } from 'vitest'
++import {
++  isKindCapabilityBlocked,
++  isQuotaExceededConsideringThisRequest,
++  nextKindCapabilityMark,
++  type DepositKindCapabilityMark,
++} from '../agent/depositFailureClassifiers'
++import { DEPOSIT_CAPABILITY_TTL_MS } from '../agent/depositPort'
++
++describe('isQuotaExceededConsideringThisRequest — SC1b.3 quota 两支', () => {
++  it('支1:已经满了(used >= limit)→ true,不需要 decodedBytes', () => {
++    expect(isQuotaExceededConsideringThisRequest(100, 100)).toBe(true)
++    expect(isQuotaExceededConsideringThisRequest(150, 100)).toBe(true)
++  })
++
++  it('支2:未满但加上这次解码字节会顶穿 → true', () => {
++    expect(isQuotaExceededConsideringThisRequest(50, 100, 60)).toBe(true) // 50+60=110>100
++  })
++
++  it('未满且加上这次也不会顶穿 → false', () => {
++    expect(isQuotaExceededConsideringThisRequest(50, 100, 40)).toBe(false) // 50+40=90<=100
++  })
++
++  it('边界:恰好等于上限(不严格大于)→ false(与"冻结值整→发出"同一口径,不误杀)', () => {
++    expect(isQuotaExceededConsideringThisRequest(50, 100, 50)).toBe(false) // 50+50=100,不 > 100
++  })
++
++  it('缺 decodedBytes 且未满 → 只判支1,不误判 false 为 true', () => {
++    expect(isQuotaExceededConsideringThisRequest(50, 100)).toBe(false)
++    expect(isQuotaExceededConsideringThisRequest(50, 100, undefined)).toBe(false)
++  })
++
++  it('结构化两数缺失或非 finite → 不判定(false),交给上层 message 兜底', () => {
++    expect(isQuotaExceededConsideringThisRequest(undefined, 100, 60)).toBe(false)
++    expect(isQuotaExceededConsideringThisRequest(50, undefined, 60)).toBe(false)
++    expect(isQuotaExceededConsideringThisRequest(Number.NaN, 100, 60)).toBe(false)
++    expect(isQuotaExceededConsideringThisRequest(50, Number.POSITIVE_INFINITY, 60)).toBe(false)
++  })
++})
++
++describe('isKindCapabilityBlocked — SC1b.3 kind 分桶负缓存', () => {
++  const NOW = 1_700_000_000_000
++  const VERSION = '0.9.4'
++
++  const blockedMark: DepositKindCapabilityMark = { supported: false, at: NOW, pluginVersion: VERSION }
++
++  it('无标记 → 不阻塞', () => {
++    expect(isKindCapabilityBlocked(undefined, NOW, VERSION)).toBe(false)
++  })
++
++  it('标记为支持 → 永不阻塞(即使 at 很旧)', () => {
++    const supportedMark: DepositKindCapabilityMark = { supported: true, at: NOW - 10, pluginVersion: VERSION }
++    expect(isKindCapabilityBlocked(supportedMark, NOW, VERSION)).toBe(false)
++  })
++
++  it('不支持 + 同版本 + 仍在 TTL 内 → 阻塞', () => {
++    expect(isKindCapabilityBlocked(blockedMark, NOW + DEPOSIT_CAPABILITY_TTL_MS - 1, VERSION)).toBe(true)
++  })
++
++  it('不支持 + 同版本 + TTL 已过 → 不阻塞(到期重探)', () => {
++    expect(isKindCapabilityBlocked(blockedMark, NOW + DEPOSIT_CAPABILITY_TTL_MS + 1, VERSION)).toBe(false)
++  })
++
++  it('不支持但插件版本已变化 → 不阻塞(即使仍在 TTL 内;版本变化视为该 kind 缓存已清)', () => {
++    expect(isKindCapabilityBlocked(blockedMark, NOW + 1, '0.9.5')).toBe(false)
++  })
++
++  it('禁止全局锁死:一个 kind 的标记不影响调用方对另一个 kind 的判定(按 kind 传入各自的 mark,天然隔离)', () => {
++    const imageMark: DepositKindCapabilityMark | undefined = undefined // image 从未写过负缓存
++    const videoMark: DepositKindCapabilityMark = { supported: false, at: NOW, pluginVersion: VERSION } // video 刚被判不支持
++    expect(isKindCapabilityBlocked(videoMark, NOW + 1, VERSION)).toBe(true)
++    expect(isKindCapabilityBlocked(imageMark, NOW + 1, VERSION)).toBe(false)
++  })
++})
++
++describe('nextKindCapabilityMark — 无变化不写盘纪律', () => {
++  const NOW = 1_700_000_000_000
++  const VERSION = '0.9.4'
++
++  it('从无到有 → 返回新标记', () => {
++    expect(nextKindCapabilityMark(undefined, false, NOW, VERSION, 'unknown kind')).toEqual({
++      supported: false,
++      at: NOW,
++      pluginVersion: VERSION,
++      reason: 'unknown kind',
++    })
++  })
++
++  it('supported 与 pluginVersion 均未变 → 返回 null(跳过一次持久化提交)', () => {
++    const previous: DepositKindCapabilityMark = { supported: false, at: NOW - 1000, pluginVersion: VERSION }
++    expect(nextKindCapabilityMark(previous, false, NOW, VERSION)).toBeNull()
++  })
++
++  it('supported 未变但插件版本变了 → 仍返回新标记(版本变化本身触发重新盖戳)', () => {
++    const previous: DepositKindCapabilityMark = { supported: false, at: NOW - 1000, pluginVersion: VERSION }
++    const next = nextKindCapabilityMark(previous, false, NOW, '0.9.5')
++    expect(next).toEqual({ supported: false, at: NOW, pluginVersion: '0.9.5', reason: undefined })
++  })
++
++  it('supported 值变了(如宿主升级后恢复支持)→ 返回新标记', () => {
++    const previous: DepositKindCapabilityMark = { supported: false, at: NOW - 1000, pluginVersion: VERSION }
++    const next = nextKindCapabilityMark(previous, true, NOW, VERSION)
++    expect(next).toEqual({ supported: true, at: NOW, pluginVersion: VERSION, reason: undefined })
++  })
++})
+diff --git a/src/__tests__/depositFailureCopy.test.ts b/src/__tests__/depositFailureCopy.test.ts
+new file mode 100644
+index 00000000..9437b1ad
+--- /dev/null
++++ b/src/__tests__/depositFailureCopy.test.ts
+@@ -0,0 +1,97 @@
++/**
++ * T1d 四语文案映射契约(设计稿 §4.9,SC1b.3 末条:「四语只覆盖用户可见路径 +
++ * 未知 locale 英文兜底」)。
++ *
++ * 只 import 新文件 `depositFailureCopy.ts` + `src/i18n`(读)——不修改
++ * `depositPort.ts`/`depositStore.ts`。
++ */
++import { afterEach, describe, expect, it } from 'vitest'
++import i18n from '../../../src/i18n'
++import { describeDepositFailure } from '../agent/depositFailureCopy'
++import type { DepositFailureCode } from '../agent/depositPort'
++
++const ALL_CODES: DepositFailureCode[] = [
++  'TOO_LARGE',
++  'UNSUPPORTED_MIME',
++  'QUOTA_FULL',
++  'RATE_LIMITED',
++  'HOST_UNSUPPORTED',
++  'BRAIN_TIMEOUT',
++  'BAD_RECEIPT',
++  'DEPOSIT_FAILED',
++]
++
++afterEach(async () => {
++  await i18n.changeLanguage('en')
++})
++
++describe('describeDepositFailure — 四语覆盖(用户可见路径全部 8 个失败码)', () => {
++  it.each(['en', 'zh-CN', 'ja', 'ko'] as const)('%s:每个失败码都有非空、互不相同的文案', async (locale) => {
++    await i18n.changeLanguage(locale)
++    const seen = new Set<string>()
++    for (const code of ALL_CODES) {
++      const text = describeDepositFailure(code)
++      expect(text.length, `${locale}/${code} 文案不能为空`).toBeGreaterThan(0)
++      expect(text.startsWith('toast.'), `${locale}/${code} 落回裸 key,说明 catalog 缺词条:${text}`).toBe(false)
++      seen.add(text)
++    }
++    // 8 个失败码理应有 8 条不同文案(不是复用同一句兜底,证明映射表逐码区分)。
++    expect(seen.size).toBe(ALL_CODES.length)
++  })
++
++  it('非 zh-CN 的三语译文与 zh-CN 原文不同(防止没真翻译、原样落回)', async () => {
++    await i18n.changeLanguage('zh-CN')
++    const zhTexts = ALL_CODES.map((code) => describeDepositFailure(code))
++    for (const locale of ['en', 'ja', 'ko'] as const) {
++      await i18n.changeLanguage(locale)
++      ALL_CODES.forEach((code, index) => {
++        expect(describeDepositFailure(code), `${locale}/${code} 与 zh-CN 相同,像是没翻译`).not.toBe(zhTexts[index])
++      })
++    }
++  })
++
++  it('未知 locale(不在四语支持集内)→ 英文兜底,不落回裸 key、不抛异常', async () => {
++    await i18n.changeLanguage('fr-FR') // 不在 SUPPORTED_LOCALES 内
++    await i18n.changeLanguage('en')
++    const enText = describeDepositFailure('DEPOSIT_FAILED')
++    await i18n.changeLanguage('fr-FR')
++    expect(() => describeDepositFailure('DEPOSIT_FAILED')).not.toThrow()
++    expect(describeDepositFailure('DEPOSIT_FAILED')).toBe(enText)
++  })
++})
++
++describe('describeDepositFailure — QUOTA_FULL 插值(设计稿 §4.7「用了 X / 共 Y」)', () => {
++  it('带结构化配额两数 → 文案里出现两个格式化后的字节数(复用 formatBytes,"1.0 GB" 而非裸字节数)', async () => {
++    await i18n.changeLanguage('en')
++    const text = describeDepositFailure('QUOTA_FULL', { usedBytes: 1_073_741_824, limitBytes: 1_073_741_824 })
++    expect(text).toContain('1.0 GB')
++    expect(text).not.toContain('{{')
++  })
++
++  it('中文/日文/韩文同样插值成功,且不残留占位符字面量', async () => {
++    for (const locale of ['zh-CN', 'ja', 'ko'] as const) {
++      await i18n.changeLanguage(locale)
++      const text = describeDepositFailure('QUOTA_FULL', { usedBytes: 500 * 1024 * 1024, limitBytes: 1_073_741_824 })
++      expect(text).not.toContain('{{')
++      expect(text.length).toBeGreaterThan(0)
++    }
++  })
++
++  it('缺配额两数(usedBytes/limitBytes 均未传)→ 退化为不带数字的版本,不是空字符串或占位符残留', async () => {
++    await i18n.changeLanguage('en')
++    const withNumbers = describeDepositFailure('QUOTA_FULL', { usedBytes: 100, limitBytes: 200 })
++    const withoutNumbers = describeDepositFailure('QUOTA_FULL')
++    expect(withoutNumbers.length).toBeGreaterThan(0)
++    expect(withoutNumbers).not.toContain('{{')
++    expect(withoutNumbers).not.toBe(withNumbers)
++  })
++
++  it('只传一半(仅 usedBytes 或仅 limitBytes)→ 视为不完整,同「均未传」退化路径', async () => {
++    await i18n.changeLanguage('en')
++    const onlyUsed = describeDepositFailure('QUOTA_FULL', { usedBytes: 100 })
++    const onlyLimit = describeDepositFailure('QUOTA_FULL', { limitBytes: 200 })
++    const none = describeDepositFailure('QUOTA_FULL')
++    expect(onlyUsed).toBe(none)
++    expect(onlyLimit).toBe(none)
++  })
++})
+diff --git a/src/__tests__/depositFailureMatrixGuards.test.ts b/src/__tests__/depositFailureMatrixGuards.test.ts
+new file mode 100644
+index 00000000..f76cb48e
+--- /dev/null
++++ b/src/__tests__/depositFailureMatrixGuards.test.ts
+@@ -0,0 +1,101 @@
++/**
++ * T1d regression guard:DoR 对账发现两条"逻辑已经对,但没有断言守着"的判据——
++ * 以后有人改动 `depositPort.ts` 时,这两条会在这里变红,不会悄悄破掉。
++ *
++ *   1. SC1b.3「超限:冻结值整 → 发出」——现状只测过 `+1` 溢出案例
++ *      (depositPort.test.ts:143-151),缺"恰好等于上限"的正向断言。
++ *   2. SC1b.3「伪 MIME:插件不读 blob.type 不自判」——现状代码确实零 `blob.type`
++ *      读取,但没有 regression guard 证明这件事。
++ *
++ * 只 import `depositPort.ts`/`depositTestHarness.ts`(均只读)——不修改任何一行。
++ */
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { DEPOSIT_MAX_BYTES, depositBlob, resetDepositPortForTests, setDepositMediaTransport } from '../agent/depositPort'
++import type { PersistReply } from '../persist/bridge'
++import { blobOfBytes, createDepositHarness, teardownDepositHarness, FAKE_HASH, type DepositHarness } from './depositTestHarness'
++
++let harness: DepositHarness
++
++beforeEach(() => {
++  harness = createDepositHarness()
++})
++
++afterEach(() => {
++  teardownDepositHarness()
++})
++
++// 「冻结值整」这组测试**不走真实 main.js**(与本文件其余 describe 不同):main.js
++// 自己另有一道独立的第二道防线(main.js:4471 `approxBytes = Math.floor((data.length
++// * 3) / 4)`,从 base64 长度反推字节数),而 `DEPOSIT_MAX_BYTES`(52,428,800)恰好
++// mod 3 == 2——单个 base64 padding `=` 字符导致这道反推**总是**多算 1 字节,使得
++// "恰好等于上限"的合法请求在 main.js 侧被误判成超限,与 depositPort.ts 自己的前置
++// 判据(`blob.size > DEPOSIT_MAX_BYTES`,用真实字节数、无此误差)结论相反。
++// 这是 main.js 现有代码里的一个独立、真实的边界缺陷(不在 T1d 的映射表/i18n/单测
++// 交付范围内,main.js 也不在本段"一行不改"的禁改文件名单里,但改它超出本段边界,
++// 已单独报给 lead)——为了不让这条与本段无关的既有缺陷污染"depositPort 自己的判据
++// 是否正确"这个问题的答案,这里直接注入一个不做 base64 长度反推的传输替身,只隔离
++// 断言 `depositBlob` 自身的前置门槛。
++describe('SC1b.3 超限——冻结值整(恰好 = 50MB)→ 不拦截,照常发出(隔离 main.js 的独立第二道防线)', () => {
++  const requests: Array<Record<string, unknown>> = []
++
++  beforeEach(() => {
++    requests.length = 0
++    setDepositMediaTransport((async (_kind, payload = {}) => {
++      requests.push(payload)
++      return { reqId: 'stub', reply: true, ok: true, hash: FAKE_HASH, ext: '.png', bytes: DEPOSIT_MAX_BYTES } as PersistReply
++    }) as typeof import('../persist/bridge').persistRequest)
++  })
++
++  afterEach(() => {
++    setDepositMediaTransport(undefined)
++    resetDepositPortForTests()
++  })
++
++  it('blob.size === DEPOSIT_MAX_BYTES → depositPort 自己的前置判据不拦截,请求确实发出并成功', async () => {
++    const exact = blobOfBytes(DEPOSIT_MAX_BYTES)
++    await expect(depositBlob(exact)).resolves.toMatchObject({ hash: FAKE_HASH })
++    expect(requests).toHaveLength(1)
++  })
++
++  it('对照:blob.size === DEPOSIT_MAX_BYTES + 1 → 仍是前置拦截,零请求(锁住边界不漂移)', async () => {
++    const oversized = blobOfBytes(DEPOSIT_MAX_BYTES + 1)
++    await expect(depositBlob(oversized)).rejects.toMatchObject({ code: 'TOO_LARGE' })
++    expect(requests).toHaveLength(0)
++  })
++})
++
++describe('SC1b.3 伪 MIME——插件全程不读 blob.type(断言无 MIME 自判分支)', () => {
++  /** 造一个 duck-typed 的"blob":`size`/`arrayBuffer` 真实可用,`type` 访问被计数。 */
++  const trackedBlob = (bytes: number, typeValue = 'application/octet-stream') => {
++    const payload = new Uint8Array(bytes)
++    let typeAccessCount = 0
++    const fake = {
++      size: bytes,
++      arrayBuffer: async () => payload.buffer,
++      get type() {
++        typeAccessCount += 1
++        return typeValue
++      },
++    }
++    return { blob: fake as unknown as Blob, typeAccessed: () => typeAccessCount > 0 }
++  }
++
++  it('成功路径:寄存全程零次读取 blob.type', async () => {
++    const { blob, typeAccessed } = trackedBlob(64)
++    await expect(depositBlob(blob)).resolves.toMatchObject({ hash: FAKE_HASH })
++    expect(typeAccessed()).toBe(false)
++  })
++
++  it('MIME 分类失败路径:分类只看宿主 message,同样零次读取 blob.type(哪怕 type 值故意给了可疑内容)', async () => {
++    harness.setHostReply(() => ({ ok: false, message: '不支持的类型' }))
++    const { blob, typeAccessed } = trackedBlob(32, 'image/png') // type 故意给"看起来合法"的值,若代码真读了也测不出误导——反向验证下一个用例
++    await expect(depositBlob(blob)).rejects.toMatchObject({ code: 'UNSUPPORTED_MIME' })
++    expect(typeAccessed()).toBe(false)
++  })
++
++  it('超限前置拦截路径(在发请求之前就返回)同样零次读取 blob.type', async () => {
++    const { blob, typeAccessed } = trackedBlob(DEPOSIT_MAX_BYTES + 1)
++    await expect(depositBlob(blob)).rejects.toMatchObject({ code: 'TOO_LARGE' })
++    expect(typeAccessed()).toBe(false)
++  })
++})
+diff --git a/src/agent/depositFailureClassifiers.ts b/src/agent/depositFailureClassifiers.ts
+new file mode 100644
+index 00000000..7e8b9e31
+--- /dev/null
++++ b/src/agent/depositFailureClassifiers.ts
+@@ -0,0 +1,120 @@
++/**
++ * deposit 失败矩阵——就绪未接线的纯判定逻辑(T1d,设计稿 §4.7/§5.4,SC1b.3)。
++ *
++ * 本文件只导出纯函数:零 I/O、零对 `depositStore`/`depositPort` 状态的读写。
++ * T1 列车执行纪律(round2-plan-v3.md §T1 完成点总表):暗段只交付"逻辑完成",
++ * 生产接线统一在专门的接线段申报——这两组判定函数目前**未被任何生产代码调用**,
++ * 是有意的("就绪可插"而非"半成品")。接线段(T1d-wire,owner = depositPort.ts/
++ * depositStore.ts 所在领地)需要做的事逐条列在每个函数上方,不在这里重复。
++ *
++ * 为什么不直接改 `depositPort.ts`/`depositStore.ts`:两个文件归属另一条并行泳道
++ * (T1b2/T1b3),本段边界禁止触碰——见派工合同「并行文件所有权」。
++ */
++import { DEPOSIT_CAPABILITY_TTL_MS } from './depositPort'
++
++// ── SC1b.3「quota 两支」──
++//
++// 现状(depositPort.ts:121-142 `classifyDepositFailure`)只判"支1"
++// (`quotaUsedBytes >= quotaLimitBytes`)。"支2"——寄存前 `usedBytes` 还没到
++// `limitBytes`,但加上**这次要寄存的解码字节数**会冲过上限——需要调用方额外传入
++// 这次请求的字节数,而 `classifyDepositFailure(reply)` 当前签名里没有这个参数。
++//
++// 【T1d-wire 接线指引】
++//   1. `classifyDepositFailure` 签名改为 `(reply, decodedBytes?: number)`;
++//      depositPort.ts:124-130 的判据替换成
++//      `isQuotaExceededConsideringThisRequest(reply.quotaUsedBytes, reply.quotaLimitBytes, decodedBytes)`。
++//   2. 两个调用点(depositPort.ts:203 频控重试前的判、depositPort.ts:211 失败分类)
++//      都要把 `blob.size`(`depositBlob` 函数体内已有的解码字节数)当 `decodedBytes` 传入。
++//   3. 修正 depositPort.test.ts:199 那条反向断言(当前写死"未满不判",与 SC1b.3
++//      支2 相悖)——改成按两支参数化:`used+decoded<=limit` 仍应 `DEPOSIT_FAILED`,
++//      `used+decoded>limit` 才是 `QUOTA_FULL`。
++
++/**
++ * quota 两支判定(SC1b.3):
++ *   支1 `usedBytes >= limitBytes`——已经满了;
++ *   支2 `usedBytes < limitBytes` 但 `usedBytes + decodedBytes > limitBytes`——
++ *       这次寄存会把账顶穿,即使宿主账面此刻还没满。
++ * `usedBytes`/`limitBytes` 缺失(非 finite number)→ 不判定(`false`,交给上层按
++ * message 文本兜底,与现状"结构化判据缺失就不猜"的口径一致);`decodedBytes`
++ * 缺失只关闭支2、支1 仍照常判(调用方在拿不到本次字节数的分支——如果将来
++ * 出现——也不丢支1 的能力)。
++ */
++export const isQuotaExceededConsideringThisRequest = (
++  usedBytes: number | undefined,
++  limitBytes: number | undefined,
++  decodedBytes?: number,
++): boolean => {
++  if (typeof usedBytes !== 'number' || !Number.isFinite(usedBytes)) return false
++  if (typeof limitBytes !== 'number' || !Number.isFinite(limitBytes)) return false
++  if (usedBytes >= limitBytes) return true // 支1
++  if (typeof decodedBytes === 'number' && Number.isFinite(decodedBytes) && usedBytes + decodedBytes > limitBytes) {
++    return true // 支2
++  }
++  return false
++}
++
++// ── SC1b.3「kind 不支持:负缓存按 kind 分桶 + 插件版本变化清该 kind 缓存」──
++//
++// 现状(depositStore.ts:168 `DepositCapabilityMark` + depositPort.ts:151-165
++// `isDepositCapabilityBlocked`/`noteCapability`)是**单一全局**布尔:任何 kind
++// 判"不支持"都会把全局 `supported` 置 false,未来 kind(video/audio,P3-10)一旦
++// 出现"该 kind 不支持"就会连累 image 一起降级——设计稿 §11.2-E 声称"per-kind
++// 骨架已留(§5.4)",实测代码里不存在这个骨架,是文档与代码的脱节,本段据实新写。
++//
++// 【T1d-wire 接线指引】
++//   1. `depositStore.ts` 的 `DepositState.capability?: DepositCapabilityMark`
++//      改为按 kind 分桶(如 `capabilityByKind?: Record<string, DepositKindCapabilityMark>`),
++//      `parseDepositState`(depositStore.ts:402-409)与 `recordCapabilityMark`
++//      (depositStore.ts:1178-1194)相应改成按 kind 键读写。
++//   2. `depositPort.ts` 的 `isDepositCapabilityBlocked`/`noteCapability`
++//      (depositPort.ts:151-165)加 `kind: string` 参数,内部改为调用本文件的
++//      `isKindCapabilityBlocked`/`nextKindCapabilityMark`(取到某个 kind 的
++//      mark 后传入,`nextKindCapabilityMark` 返回 `null` 时保持"无变化不写盘"
++//      的现有纪律)。
++//   3. 插件版本来源:**必须**以 `ghost.json` 为单一真相源(构建期注入或运行时
++//      读取),禁止手工同步的硬编码字符串常量(owner 裁决)——具体注入机制由
++//      接线段决定,本函数只接受 `pluginVersion: string` 作为参数,不关心它从
++//      哪来。
++
++/** 某个 kind 的能力负缓存标记(按 kind 分桶存储的最小单元)。 */
++export type DepositKindCapabilityMark = {
++  supported: boolean
++  at: number
++  /** 写下这条标记时的插件版本(ghost.json `version`)——版本变化即视为该标记失效。 */
++  pluginVersion: string
++  reason?: string
++}
++
++/**
++ * 该 kind 的负缓存是否仍生效:不支持 + 插件版本未变 + 仍在 TTL 内。
++ * 插件版本变化(升级/降级)→ 直接判"不生效"(不管 TTL 是否还剩余),让新版本
++ * 有机会重新探测这个 kind,不必等 24h。
++ */
++export const isKindCapabilityBlocked = (
++  mark: DepositKindCapabilityMark | undefined,
++  now: number,
++  currentPluginVersion: string,
++  ttlMs: number = DEPOSIT_CAPABILITY_TTL_MS,
++): boolean => {
++  if (!mark || mark.supported) return false
++  if (mark.pluginVersion !== currentPluginVersion) return false
++  return now - mark.at <= ttlMs
++}
++
++/**
++ * 算出某个 kind 下一条标记该写成什么(与现状 `noteCapability` 同一条"无变化不
++ * 写盘"纪律,depositPort.ts:161 `if (mark && mark.supported === supported) return`):
++ * `supported` 与插件版本都未变 → 返回 `null`(调用方据此跳过一次持久化提交);
++ * 否则返回新标记(版本变化时无条件重写,即使 `supported` 布尔值恰好没变——
++ * 版本变化本身就是"这条记录已经过时,需要用新版本重新盖戳"的事件)。
++ */
++export const nextKindCapabilityMark = (
++  previous: DepositKindCapabilityMark | undefined,
++  supported: boolean,
++  now: number,
++  pluginVersion: string,
++  reason?: string,
++): DepositKindCapabilityMark | null => {
++  if (previous && previous.supported === supported && previous.pluginVersion === pluginVersion) return null
++  return { supported, at: now, pluginVersion, reason }
++}
+diff --git a/src/agent/depositFailureCopy.ts b/src/agent/depositFailureCopy.ts
+new file mode 100644
+index 00000000..c7a0302a
+--- /dev/null
++++ b/src/agent/depositFailureCopy.ts
+@@ -0,0 +1,55 @@
++/**
++ * deposit 失败矩阵——用户可见四语文案映射表(T1d,设计稿 §4.9,SC1b.3 末条)。
++ *
++ * 现状(depositPort.ts:53-90 `DepositFailureCode`/`FAILURE_MESSAGE`)是纯中文硬
++ * 编码 `Record`,depositPort.ts:73-79 的注释已经写明"这些文案一条都到不了用户
++ * 眼前;切流段翻开关前必须先定四语落地机制"——本文件就是那套机制,复用面板侧
++ * 既有的 i18next catalog(`src/i18n`,四语 zh-CN/en/ja/ko,`fallbackLng: 'en'`
++ * 已经是未知 locale 的英文兜底,不需要另写一套 locale 归一化)。
++ *
++ * 【T1d-wire 接线指引】本模块目前**未被任何生产代码调用**——depositPort.ts 的
++ * `FAILURE_MESSAGE`/`DepositError` 构造仍在用它自己的硬编码中文串。接线时把
++ * `depositBlob`(depositPort.ts:182-228)里 `FAILURE_MESSAGE[code]` 的引用换成
++ * `describeDepositFailure(code, { usedBytes: reply.quotaUsedBytes, limitBytes: reply.quotaLimitBytes })`,
++ * `TOO_LARGE`/`HOST_UNSUPPORTED` 两处硬编码调用(depositPort.ts:186,190)同样
++ * 改调本函数(不传 `usedBytes`/`limitBytes` 即可,非 `QUOTA_FULL` 分支不消费它们)。
++ */
++import type { DepositFailureCode } from './depositPort'
++import { formatBytes } from '../../../src/app/assetLibraryModel'
++import { t } from '../../../src/i18n'
++
++/** `DepositFailureCode` → i18next key(均落在 `toast.deposit.*`,见四语 `toast.json`)。 */
++const DEPOSIT_FAILURE_I18N_KEY: Record<DepositFailureCode, string> = {
++  TOO_LARGE: 'toast.deposit.tooLarge',
++  UNSUPPORTED_MIME: 'toast.deposit.unsupportedMime',
++  QUOTA_FULL: 'toast.deposit.quotaFull',
++  RATE_LIMITED: 'toast.deposit.rateLimited',
++  HOST_UNSUPPORTED: 'toast.deposit.hostUnsupported',
++  BRAIN_TIMEOUT: 'toast.deposit.brainTimeout',
++  BAD_RECEIPT: 'toast.deposit.badReceipt',
++  DEPOSIT_FAILED: 'toast.deposit.failed',
++}
++
++export type DepositFailureCopyParams = {
++  /** 仅 `QUOTA_FULL` 用得到:结构化配额两数,插值成"用了 X / 共 Y"(设计稿 §4.7)。 */
++  usedBytes?: number
++  limitBytes?: number
++}
++
++/**
++ * 把失败码转成当前语言的用户可见文案。当前语言取 i18next 的活动语言
++ * (面板启动时由宿主 locale 桥 `changeLanguage` 设置,见 `cindyplugin/src/i18n/hostLocale.ts`);
++ * 未知/不支持的语言由 `src/i18n` 的 `fallbackLng: 'en'` 兜底,本函数不用重复判断。
++ *
++ * `usedBytes`/`limitBytes` 缺失(非 finite number)时 `QUOTA_FULL` 文案退化为不带
++ * 具体数字的版本(catalog 里对应词条本身不含 `{{used}}`/`{{limit}}` 占位符时,
++ * 插值参数被 i18next 忽略,不会报错、也不会残留字面量占位符)。
++ */
++export const describeDepositFailure = (code: DepositFailureCode, params: DepositFailureCopyParams = {}): string => {
++  const key = DEPOSIT_FAILURE_I18N_KEY[code]
++  if (code !== 'QUOTA_FULL') return t(key)
++  const { usedBytes, limitBytes } = params
++  const hasUsage = typeof usedBytes === 'number' && Number.isFinite(usedBytes) && typeof limitBytes === 'number' && Number.isFinite(limitBytes)
++  if (!hasUsage) return t('toast.deposit.quotaFullUnknownUsage')
++  return t(key, { used: formatBytes(usedBytes as number), limit: formatBytes(limitBytes as number) })
++}

@@ -1,0 +1,311 @@
+diff --git a/main.js b/main.js
+index 2b18a618..4308b469 100644
+--- a/main.js
++++ b/main.js
+@@ -5079,7 +5079,6 @@ async function handleSave(msg) {
+ // 面板侧 flag(DEPOSIT_ENABLED)在前段是关的,所以生产上这几个 kind 收不到消息;
+ // 本段只落电子脑适配层与协议测试(经 seam 直接驱动),不改任何既有路径。
+ const DEPOSIT_DIR = 'deposit/'
+-const DEPOSIT_SLOTS = ['state-a.json', 'state-b.json']
+ // 宿主终版寄存上限(设计稿 §4.6):50MB 解码字节,不设余量、不设灰区。**与上面的
+ // MAX_ASSET_BYTES(cindy.fs 槽单次写入上限)无关**——那是另一条通道的另一个数字,
+ // 两者不得互相推导、不得混为一谈(设计稿明文禁止)。
+@@ -5828,65 +5827,6 @@ function depositEnforceMapPendingMutex(payload) {
+   return dropped
+ }
+ 
+-// 恢复语义(设计稿 §4.4.2):槽内 generation 是**唯一**代际真相,manifest 完全退出
+-// 正确性路径(它只剩磁盘上的诊断面包屑,读路径一行都不看它)。一条语义,不分快慢路径:
+-// ① 总是读两个槽,各自解析;② 取 generation 更大的合法槽;③ 只有一个合法 → 用它;
+-// ④ 两槽皆不合法 → 诚实兜底(缓存空 + 迁移标记缺失)。
+-// 解析失败的槽视为不可用(diagFail),不是「读到 null 就当空」(diagSkip)。
+-//
+-// 为什么删掉原来的「读 manifest.current 指的槽,解析成功即返回」快路径:提交点是
+-// **槽写成功**,指针写是一次独立的、可能失败的写。指针写失败后 manifest 指着上一代,
+-// 而磁盘上已经有一份**完整合法**的更新代(整份写成后指针才失败)。快路径会读到上一代:
+-//   - 含 map/migration/capability 的较新已提交状态被正常重启读路径忽略 → 迁移重跑、
+-//     负缓存丢失、已寄存的图重寄存;
+-//   - 更糟的是 CAS 也拿这个旧 generation 当基线(handleDepositStateSave 复用本函数),
+-//     于是「磁盘已前进」检测不到,写目标又算回那一槽 → **覆盖掉较新槽**。
+-// 这正好与设计稿「写指针失败 = 状态已提交 / 迁移不重跑」相反。manifest 想留作性能
+-// 优化必须在校验完两槽之后才短路,且不得改变结论 —— 而两槽都读完之后短路已无意义,
+-// 所以直接不读。
+-//
+-// ⑤(本轮补,#332 合并列车残余风险跟进项 1,Greptile 复审):「合法」不能只等价于
+-// 「JSON.parse 没抛错」——`JSON.parse('"just a string"')`、`JSON.parse('42')`、
+-// `JSON.parse('null')` 都不抛错,但顶层根本不是一份可恢复的状态对象;更隐蔽的一种
+-// 结构损坏是顶层仍是对象、`generation` 字段完好,但最大的字段 `map` 被截断/覆盖成了
+-// 别的类型(整份写入不是事务,写到一半崩在 `map` 序列化中途就是这个形态)——纯语法
+-// 解析骗不出这种损坏,generation 却读得出来,一样会被当作「较新的代际真相」压过另一个
+-// 结构完整、generation 较低的槎。读取(①②)、CAS 基线(`handleDepositStateSave` 的
+-// `current.generation`)、写槎选择(`pickDepositWriteSlot`)三处全部复用本函数产出的
+-// `generation`,三处因此会**同时**踩坑,所以只在**这一个函数**里补结构校验,三处天然
+-// 同一口径,不必分别修。
+-//
+-// 判据比共享层 `src/agent/depositStore.ts` 的 `parseDepositState` **更严**,不是照抄:
+-// 那边的职责是「拿到已被选为权威的文本,尽量读出能用的部分」,子字段容错(map 缺失/
+-// 类型不对就退化成空 map,不算整份非法)对它是对的——它面对的文本已经赢过了本函数
+-// 这一关。本函数的职责不同:决定「这份槎的 generation 够不够格被信」,面对的是**两个
+-// 候选槎的竞争**,标准必须更保守——`map` 若存在就必须是非数组对象,类型不对直接判
+-// corrupt;`map` 完全缺失(老格式從未写过 map 字段)仍视为合法,与老格式 generation
+-// 缺省为 0 的既有口径(见上方"槎内 generation 缺失视作 0"注释同一处)保持一致,不额外
+-// 收紧。main.js 不过打包、import 不了 src/,按 §六-9 允许适配层自带同语义实现;
+-// 与共享层的差异点已在此写清楚,不是"看起来差不多"的抄近路。
+-function depositParseSlotShape(text) {
+-  let parsed
+-  try {
+-    parsed = JSON.parse(text)
+-  } catch {
+-    return null
+-  }
+-  if (!parsed || typeof parsed !== 'object') return null
+-  const rawMap = parsed.map
+-  if (rawMap !== undefined && (rawMap === null || typeof rawMap !== 'object' || Array.isArray(rawMap))) return null
+-  return parsed
+-}
+-
+-async function readDepositSlot(name) {
+-  const text = await fsRead(DEPOSIT_DIR + name)
+-  if (text === null) return { name, present: false, text: null, generation: -1 }
+-  const parsed = depositParseSlotShape(text)
+-  if (!parsed) return { name, present: true, text: null, generation: -1, corrupt: true }
+-  const generation = Number(parsed.generation)
+-  return { name, present: true, text, generation: Number.isFinite(generation) ? generation : 0 }
+-}
+-
+ /**
+  * 纯读:候选发现 + 校验 + 同代合并(设计稿 §4.4.2/§4.4.3「加载规则」,十一轮恢复
+  * 合并)。单写者+进程内串行之下,同代出现 ≥2 份有效候选仍是不可达态——只能来自
+diff --git a/src/__tests__/depositStore.test.ts b/src/__tests__/depositStore.test.ts
+index 93110493..be8ed478 100644
+--- a/src/__tests__/depositStore.test.ts
++++ b/src/__tests__/depositStore.test.ts
+@@ -11,11 +11,8 @@ import {
+   DEPOSIT_COMMIT_MAX_ATTEMPTS,
+   DEPOSIT_MAP_MAX_ENTRIES,
+   // 桥接(S1→S3 临时):占位常量把新必填 gen/writer 填满,S3 本文件改用终态 draft() 后移除。
+-  DEPOSIT_PENDING_GEN,
+-  DEPOSIT_PENDING_WRITER,
+   loadDepositStore,
+   lookupDeposit,
+-  mergeDepositStates,
+   parseDepositState,
+   peekDepositRevisionSumForTests,
+   peekDepositStoreForTests,
+@@ -24,22 +21,10 @@ import {
+   invalidateDeposit,
+   setDepositTransport,
+   type DepositEntryDraft,
+-  type DepositState,
+ } from '../agent/depositStore'
+ import type { PersistReply } from '../persist/bridge'
+ import { createDepositHarness, teardownDepositHarness, FAKE_HASH } from './depositTestHarness'
+ 
+-// 桥接(S1→S3 临时):`from` 由可选转必填、`gen`/`writer` 新增必填,这里用 S1 已导出的
+-// 占位常量透传填满;S3 本文件迁到终态 draft() 助手时整体移除。零新逻辑。
+-const entry = (hash: string, depositedAt: number, from: 'deposit' | 'ledger' = 'deposit') => ({
+-  hash,
+-  ext: '.png',
+-  depositedAt,
+-  from,
+-  gen: DEPOSIT_PENDING_GEN,
+-  writer: DEPOSIT_PENDING_WRITER,
+-})
+-
+ const draft = (hash: string, depositedAt: number, from: 'deposit' | 'artifact' | 'ledger' = 'deposit'): DepositEntryDraft => ({
+   hash,
+   ext: '.png',
+@@ -47,61 +32,10 @@ const draft = (hash: string, depositedAt: number, from: 'deposit' | 'artifact' |
+   from,
+ })
+ 
+-const state = (partial: Partial<DepositState> = {}): DepositState => ({
+-  version: 1,
+-  generation: 0,
+-  map: {},
+-  // 桥接(S1→S3 临时):三个新必填字段给空默认,partial 可覆盖。
+-  releasedTombstones: {},
+-  releasedFloor: {},
+-  pendingReleases: {},
+-  ...partial,
+-})
+-
+ afterEach(() => {
+   teardownDepositHarness()
+ })
+ 
+-describe('depositStore — 合并规则(不采纳 last-write-wins)', () => {
+-  it('map 取并集,同键取 depositedAt 较新者', () => {
+-    const base = state({ generation: 5, map: { a: entry('aaa', 10), shared: entry('old', 1) } })
+-    const local = state({ generation: 3, map: { b: entry('bbb', 20), shared: entry('new', 9) } })
+-
+-    const merged = mergeDepositStates(base, local)
+-
+-    expect(Object.keys(merged.map).sort()).toEqual(['a', 'b', 'shared'])
+-    expect(merged.map.shared.hash).toBe('new')
+-    // generation 以磁盘为准:下一次 CAS 要拿它去比
+-    expect(merged.generation).toBe(5)
+-  })
+-
+-  it('migration 取较大版本,capability 取时间戳较新者', () => {
+-    const base = state({
+-      migration: { version: 1, at: 100, migrated: 200 },
+-      capability: { supported: false, at: 100 },
+-    })
+-    const local = state({
+-      migration: { version: 2, at: 50, migrated: 3 },
+-      capability: { supported: true, at: 500 },
+-    })
+-
+-    const merged = mergeDepositStates(base, local)
+-
+-    expect(merged.migration?.version).toBe(2)
+-    expect(merged.capability).toMatchObject({ supported: true, at: 500 })
+-  })
+-
+-  it('反向:磁盘更新时不被本地旧值覆盖', () => {
+-    const base = state({ migration: { version: 3, at: 9, migrated: 1 }, capability: { supported: true, at: 900 } })
+-    const local = state({ migration: { version: 1, at: 1, migrated: 1 }, capability: { supported: false, at: 100 } })
+-
+-    const merged = mergeDepositStates(base, local)
+-
+-    expect(merged.migration?.version).toBe(3)
+-    expect(merged.capability?.supported).toBe(true)
+-  })
+-})
+-
+ describe('depositStore — 解析兜底', () => {
+   it('非法载荷一律 null(不当成空对象混用)', () => {
+     expect(parseDepositState('')).toBeNull()
+@@ -180,22 +114,10 @@ describe('depositStore — 原型污染硬门(§六-8 对抗输入;共享 src/li
+     expect(Object.keys(parsed?.map ?? {})).toEqual([])
+   })
+ 
+-  it('合并后的 map 仍无原型(不被 { ...base.map } 重新引回陷阱)', () => {
+-    const base = parseDepositState(`{"version":1,"generation":2,"map":{"a":{"hash":"aaa","ext":".png","depositedAt":1}}}`)
+-    const local = parseDepositState(`{"version":1,"generation":1,"map":{"__proto__":{"hash":"bbb","ext":".png","depositedAt":9}}}`)
+-    expect(base).not.toBeNull()
+-    expect(local).not.toBeNull()
+-
+-    const merged = mergeDepositStates(base as DepositState, local as DepositState)
+-
+-    expect(Object.getPrototypeOf(merged.map)).toBeNull()
+-    expect(Object.keys(merged.map).sort()).toEqual(['__proto__', 'a'])
+-  })
+-
+   it('record 一个 __proto__ 键:条目真的落在 map 里,不静默丢失', async () => {
+     createDepositHarness()
+ 
+-    const result = await recordDeposit('__proto__', entry(FAKE_HASH, 7))
++    const result = await recordDeposit('__proto__', draft(FAKE_HASH, 7))
+ 
+     expect(result.ok).toBe(true)
+     expect(Object.keys(peekDepositStoreForTests()?.map ?? {})).toEqual(['__proto__'])
+@@ -212,7 +134,7 @@ describe('depositStore — 端到端提交(真实 main.js 槽 + 指针)', () =>
+     const initial = await loadDepositStore()
+     expect(initial.generation).toBe(0)
+ 
+-    const result = await recordDeposit('mivo-asset:1', entry(FAKE_HASH, 111, 'deposit'))
++    const result = await recordDeposit('mivo-asset:1', draft(FAKE_HASH, 111, 'deposit'))
+     expect(result).toMatchObject({ ok: true, generation: 1, attempts: 1 })
+     await expect(lookupDeposit('mivo-asset:1')).resolves.toMatchObject({ hash: FAKE_HASH })
+ 
+@@ -226,8 +148,8 @@ describe('depositStore — 端到端提交(真实 main.js 槽 + 指针)', () =>
+     await loadDepositStore()
+ 
+     const [first, second] = await Promise.all([
+-      recordDeposit('mivo-asset:a', entry('aaaa', 1, 'deposit')),
+-      recordDeposit('mivo-asset:b', entry('bbbb', 2, 'deposit')),
++      recordDeposit('mivo-asset:a', draft('aaaa', 1, 'deposit')),
++      recordDeposit('mivo-asset:b', draft('bbbb', 2, 'deposit')),
+     ])
+ 
+     expect(first.ok && second.ok).toBe(true)
+@@ -241,7 +163,7 @@ describe('depositStore — 端到端提交(真实 main.js 槽 + 指针)', () =>
+     const before = peekDepositStoreForTests()?.generation ?? 0
+ 
+     await Promise.all(
+-      Array.from({ length: 6 }, (_, index) => recordDeposit(`mivo-asset:${index}`, entry(`h${index}`, index, 'deposit'))),
++      Array.from({ length: 6 }, (_, index) => recordDeposit(`mivo-asset:${index}`, draft(`h${index}`, index, 'deposit'))),
+     )
+ 
+     const after = peekDepositStoreForTests()?.generation ?? 0
+@@ -265,7 +187,7 @@ describe('depositStore — 端到端提交(真实 main.js 槽 + 指针)', () =>
+   })
+ 
+   it('自愈:invalidate 删掉失效映射,下次查不到', async () => {
+-    await recordDeposit('mivo-asset:1', entry(FAKE_HASH, 1, 'deposit'))
++    await recordDeposit('mivo-asset:1', draft(FAKE_HASH, 1, 'deposit'))
+     await invalidateDeposit('mivo-asset:1')
+     await expect(lookupDeposit('mivo-asset:1')).resolves.toBeUndefined()
+   })
+@@ -347,7 +269,7 @@ describe('depositStore — generation CAS:本实例未提交变更重放(设计
+       } as PersistReply
+     }) as never)
+ 
+-    const result = await recordDeposit('mivo-asset:1', entry('aaaa', 1, 'deposit'))
++    const result = await recordDeposit('mivo-asset:1', draft('aaaa', 1, 'deposit'))
+ 
+     expect(result).toMatchObject({ ok: false, reason: 'conflict' })
+     expect(saves).toBe(DEPOSIT_COMMIT_MAX_ATTEMPTS)
+@@ -361,7 +283,7 @@ describe('depositStore — generation CAS:本实例未提交变更重放(设计
+       return { reqId: 's', reply: true, ok: false, conflict: true, state: '{broken' } as PersistReply
+     }) as never)
+ 
+-    await expect(recordDeposit('mivo-asset:1', entry('aaaa', 1, 'deposit'))).resolves.toMatchObject({
++    await expect(recordDeposit('mivo-asset:1', draft('aaaa', 1, 'deposit'))).resolves.toMatchObject({
+       ok: false,
+       reason: 'conflict',
+       attempts: 1,
+@@ -376,7 +298,7 @@ describe('depositStore — generation CAS:本实例未提交变更重放(设计
+       throw new Error('bridge down')
+     }) as never)
+ 
+-    await expect(recordDeposit('mivo-asset:1', entry('aaaa', 1, 'deposit'))).resolves.toMatchObject({
++    await expect(recordDeposit('mivo-asset:1', draft('aaaa', 1, 'deposit'))).resolves.toMatchObject({
+       ok: false,
+       reason: 'transport',
+     })
+diff --git a/src/agent/depositStore.ts b/src/agent/depositStore.ts
+index 8f784d81..35222192 100644
+--- a/src/agent/depositStore.ts
++++ b/src/agent/depositStore.ts
+@@ -411,38 +411,6 @@ export const parseDepositState = (raw: unknown): DepositState | null => {
+   return state
+ }
+ 
+-/**
+- * 合并两份状态(设计稿 §4.4.3):三部分天然可合并,没有需要仲裁的冲突,所以
+- * last-write-wins 不被采纳。`base` 是磁盘上更新的那份,`local` 是本地内存态。
+- */
+-export const mergeDepositStates = (base: DepositState, local: DepositState): DepositState => {
+-  // 不用 `{ ...base.map }`:对象字面量带 Object.prototype,会把上面刚消掉的
+-  // `__proto__` 写入陷阱重新引回来。
+-  const map = emptyRecord<DepositEntry>() // 桥接(S1→S3b 临时):emptyMap 已改名为 emptyRecord。
+-  for (const assetUrl of Object.keys(base.map)) map[assetUrl] = base.map[assetUrl]
+-  for (const [assetUrl, entry] of Object.entries(local.map)) {
+-    const existing = map[assetUrl]
+-    // 同键冲突取 depositedAt 较新者;同一 assetUrl 的两个 hash 只可能来自同字节
+-    // 重复寄存(宿主字节级 dedup 保证同 hash),不是真冲突。
+-    if (!existing || entry.depositedAt >= existing.depositedAt) map[assetUrl] = entry
+-  }
+-  const migration =
+-    (local.migration?.version ?? -1) > (base.migration?.version ?? -1) ? local.migration : base.migration
+-  const capability = (local.capability?.at ?? -1) > (base.capability?.at ?? -1) ? local.capability : base.capability
+-  return {
+-    version: Math.max(base.version, local.version),
+-    // generation 以磁盘为准:下一次 CAS 要拿它去比。
+-    generation: base.generation,
+-    map,
+-    // 桥接(S1→S3b 临时):新增字段透传,满足 DepositState 的新必填形状。
+-    releasedTombstones: base.releasedTombstones,
+-    releasedFloor: base.releasedFloor,
+-    migration,
+-    capability,
+-    pendingReleases: local.pendingReleases,
+-  }
+-}
+-
+ // ── 本实例未提交变更(层 3 的重放素材,设计稿 §4.10.6.1 仲裁轴第一级)──
+ //
+ // 只记「这次会话里,业务代码touch 过哪些键」,不是变更内容本身(内容已经在 `memory`

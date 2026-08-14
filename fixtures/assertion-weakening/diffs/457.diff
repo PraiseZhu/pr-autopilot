@@ -1,0 +1,790 @@
+diff --git a/src/__tests__/agentBridgeMediaResolve.test.ts b/src/__tests__/agentBridgeMediaResolve.test.ts
+index 3de447b3..1cad31f7 100644
+--- a/src/__tests__/agentBridgeMediaResolve.test.ts
++++ b/src/__tests__/agentBridgeMediaResolve.test.ts
+@@ -454,6 +454,41 @@ describe('SC-T3b.3 要看才传 + from:deposit 记账 + 同批零新增配额',
+   })
+ })
+ 
++describe('r3-leadfix BLOCKER 1 · 真实端到端:非法 hash 的存量条目一律 unavailable,回执 JSON 绝无 cindy-media:// 字样', () => {
++  // 这是 mediaRefHashGate.test.ts 的"结构充分性断言"被证明可被字符串分段绕过之后
++  // (审查实跑:`entry.hash.includes('..') ? 'cindy-media:${\'//\'blobs/...' : buildImageRef(...)`
++  // 在该断言下仍全绿),真正承担充分性的行为断言——直接绑 resolveRequestedMedia 的产出,
++  // 绕不过去。反向变异验证见派工报告,不在本文件内(变异生产代码不进正式提交)。
++  const ILLEGAL_LEDGER_HASHES: Array<[string, string]> = [
++    ['路径上级引用', '../../sensitive'],
++    ['含正斜杠', 'abcdef0123456789/etc/passwd'],
++    ['非 hex 字符', 'z'.repeat(16)],
++    ['15 位(短于下界 16)', 'a'.repeat(15)],
++    ['129 位(长于上界 128)', 'a'.repeat(129)],
++  ]
++
++  it.each(ILLEGAL_LEDGER_HASHES)(
++    '存量条目 hash 非法(%s)→ img-1 落 unavailable/unknown,整份回执 JSON 不含 cindy-media://',
++    async (_label, badHash) => {
++      useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://bad')] })
++      readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++      await recordMigration(
++        [['mivo-asset://bad', { hash: badHash, ext: '.png', depositedAt: 0, from: 'ledger' }]],
++        { version: 1, at: 0, migrated: 1 },
++      )
++
++      const { ask } = wireBridge()
++      const reply = await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++      expect(reply?.mediaStates).toEqual({ 'img-1': { state: 'unavailable', reason: 'unknown' } })
++      expect(JSON.stringify(reply)).not.toContain('cindy-media://')
++      // 命中缓存(lookupDeposit 直接命中迁移写入的条目),零新增寄存请求——非法条目
++      // 的拒绝发生在 buildImageRef 这一步,不会往下游发起任何宿主请求。
++      expect(harness.hostRequests).toHaveLength(0)
++    },
++  )
++})
++
+ describe('SC-T3b1-fix.4 diag trigger 唯一入口(judge finding P1-B4,typed \'edit\'|\'snapshot\')', () => {
+   it("trigger='snapshot' 侧已在唯一业务链里接线(端到端,见上方「diag 日志区分 trigger=snapshot」用例)——本描述块只补 'edit' 侧的可复用入口验证", () => {
+     // 领地边界(#297 T3b1-fix 派工合同):trigger='edit' 的真实调用口在
+@@ -487,3 +522,50 @@ describe('SC-T3b1-fix.4 diag trigger 唯一入口(judge finding P1-B4,typed \'ed
+     expect(messages.some((m) => m.includes('trigger=edit') && m.includes('n1'))).toBe(false)
+   })
+ })
++
++describe('r3-leadfix SUGGESTION 3 · 拒绝拼出 imageRef 时的诊断归因(hash 非法不得错记成 ext 非法)', () => {
++  it('hash 非法 + ext 合法 → 日志归因到 hash,不含"ext 非法"这类误导措辞', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://badhash')] })
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++    await recordMigration(
++      [['mivo-asset://badhash', { hash: '../../sensitive', ext: '.png', depositedAt: 0, from: 'ledger' }]],
++      { version: 1, at: 0, migrated: 1 },
++    )
++    const warnSpy = vi.spyOn(debugLogger, 'warn')
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    expect(reply?.mediaStates).toEqual({ 'img-1': { state: 'unavailable', reason: 'unknown' } })
++    const hit = warnSpy.mock.calls.find(
++      ([source, message]) => source === 'Cindy Deposit' && String(message).includes('trigger=snapshot'),
++    )
++    expect(hit).toBeTruthy()
++    const message = String(hit?.[1])
++    expect(message).toMatch(/hash/i)
++    // .png 是完全合法的 ext——不得把归因错记到它头上(修复前的固定文案就是这样)。
++    expect(message).not.toMatch(/ext 不是安全|ext 缺失|ext 含路径分隔符/)
++  })
++
++  it('ext 非法 + hash 合法 → 日志归因到 ext,不含"hash 非法"这类误导措辞', async () => {
++    useCanvasStore.setState({ nodes: [imageNode('img-1', 'mivo-asset://badext')] })
++    readImportedAssetFileMock.mockResolvedValue({ name: 'a.png', type: 'image/png', blob: blobOfBytes(64), createdAt: 0 })
++    await recordMigration(
++      [['mivo-asset://badext', { hash: FAKE_HASH, ext: '../evil', depositedAt: 0, from: 'ledger' }]],
++      { version: 1, at: 0, migrated: 1 },
++    )
++    const warnSpy = vi.spyOn(debugLogger, 'warn')
++
++    const { ask } = wireBridge()
++    const reply = await ask('snapshot', { mediaNodeIds: ['img-1'] })
++
++    expect(reply?.mediaStates).toEqual({ 'img-1': { state: 'unavailable', reason: 'unknown' } })
++    const hit = warnSpy.mock.calls.find(
++      ([source, message]) => source === 'Cindy Deposit' && String(message).includes('trigger=snapshot'),
++    )
++    expect(hit).toBeTruthy()
++    const message = String(hit?.[1])
++    expect(message).toMatch(/ext/i)
++    expect(message).not.toMatch(/hash 不是合法|hash 缺失/)
++  })
++})
+diff --git a/src/__tests__/depositBindingLock.test.ts b/src/__tests__/depositBindingLock.test.ts
+index 70f7f4bf..22a73535 100644
+--- a/src/__tests__/depositBindingLock.test.ts
++++ b/src/__tests__/depositBindingLock.test.ts
+@@ -9,6 +9,14 @@
+  *
+  * R6 是 r2-vision 二轮对抗审查的 MAJOR 4:R2 按**导入名**禁 depositBlob,锁不住
+  * `import * as rawPort from './depositPort'` 这种「导入一个能取到所有名字的容器」。
++ *
++ * r3-leadfix MAJOR2(本文件三轮返修新增 R7~R9):R6 之后仍有三个逃逸口 R1~R6 摸不到——
++ * R7 字面量动态 import(`await import('./depositPort')`,与 R6 同类只是换了语法);
++ * R8 require()/ImportEquals-require()/非字面量动态 import(静态分析看不清目标,
++ * fail-closed 一律拒绝);R9 转发模块(第三模块 `export {depositBlob} from
++ * './depositPort'`,agentBridge.ts 只 import 这第三模块——R1~R8 都只检查 agentBridge.ts
++ * 自身的绑定,摸不到藏在转发模块里的禁止绑定,R5 排除 depositPort 子树时又连带漏查了
++ * 排除点*之前*的中间模块)。
+  */
+ import { describe, expect, it } from 'vitest'
+ import { readFileSync } from 'node:fs'
+@@ -45,15 +53,24 @@ const RELATIVE_SPEC_RE = /^\.\.?\//
+ 
+ type ImportBinding = { importedName: string; specifierText: string }
+ 
++/** r3-leadfix MAJOR 2 item 3:静态分析看不清目标、必须 fail-closed 拒绝的构造——
++ * `require(...)`、`import x = require(...)`(ImportEquals)、非字面量动态 import
++ * specifier(拼接/变量,如 `import('./depositPort' + suffix)`)。这三种手法都能
++ * 拿到一个模块的全部导出而不留下可靠的静态绑定痕迹,判不清目标就该拒,不是
++ * 悬而不决地放行。 */
++type SuspiciousConstruct = { kind: 'require' | 'import-equals-require' | 'dynamic-import-non-literal'; detail: string }
++
+ /** 收集一份源码里全部非 type-only 的 import 具名绑定 + export-from 具名重导出 +
+- * 动态 import 的模块说明符(AST 层面,天然不受引号风格/别名影响)。 */
++ * 动态 import 的模块说明符(AST 层面,天然不受引号风格/别名影响),外加上面这类
++ * 静态分析无法确认目标的可疑构造。 */
+ function collectImportBindings(
+   sourceText: string,
+   fromFilePosix: string,
+-): { bindings: ImportBinding[]; dynamicSpecs: string[] } {
++): { bindings: ImportBinding[]; dynamicSpecs: string[]; suspicious: SuspiciousConstruct[] } {
+   const sf = ts.createSourceFile(fromFilePosix, sourceText, ts.ScriptTarget.Latest, true)
+   const bindings: ImportBinding[] = []
+   const dynamicSpecs: string[] = []
++  const suspicious: SuspiciousConstruct[] = []
+ 
+   const pushNamed = (elements: ts.NodeArray<ts.ImportSpecifier | ts.ExportSpecifier>, specifierText: string) => {
+     for (const el of elements) {
+@@ -85,14 +102,36 @@ function collectImportBindings(
+       if (!clause) bindings.push({ importedName: '*', specifierText })
+       else if (ts.isNamedExports(clause)) pushNamed(clause.elements, specifierText)
+       else bindings.push({ importedName: '*', specifierText })
++    } else if (ts.isImportEqualsDeclaration(node)) {
++      // `import x = require('./depositPort')`——CommonJS interop,不产生本文件其它
++      // 分支能识别的具名绑定,一律 fail-closed 判可疑,不猜测目标。
++      if (ts.isExternalModuleReference(node.moduleReference)) {
++        const arg = node.moduleReference.expression
++        suspicious.push({
++          kind: 'import-equals-require',
++          detail: ts.isStringLiteral(arg) ? arg.text : arg.getText(sf),
++        })
++      }
+     } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+       const arg = node.arguments[0]
+-      if (arg && ts.isStringLiteral(arg)) dynamicSpecs.push(arg.text)
++      if (arg && ts.isStringLiteral(arg)) {
++        dynamicSpecs.push(arg.text)
++      } else {
++        // 拼接/变量等非字面量动态 specifier——静态分析看不清目标,fail-closed 直接拒,
++        // 不去猜它有没有指向 depositPort。
++        suspicious.push({ kind: 'dynamic-import-non-literal', detail: arg ? arg.getText(sf) : '<empty>' })
++      }
++    } else if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require') {
++      const arg = node.arguments[0]
++      suspicious.push({
++        kind: 'require',
++        detail: arg && ts.isStringLiteral(arg) ? arg.text : arg ? arg.getText(sf) : '<empty>',
++      })
+     }
+     ts.forEachChild(node, visit)
+   }
+   visit(sf)
+-  return { bindings, dynamicSpecs }
++  return { bindings, dynamicSpecs, suspicious }
+ }
+ 
+ /** R4:文件内任何位置重新声明一个字面名为 `targetName` 的函数/变量/类(import 语句本身不算)。 */
+@@ -138,18 +177,28 @@ function findIndirectDependency(
+   return null
+ }
+ 
+-/** 生产用:某个仓相对路径文件的直接相对依赖(已用 resolveImport 解析为仓相对路径)。 */
+-function directRelativeDeps(posix: string): string[] {
++/** 生产用:读一个仓相对路径文件自身的绑定信息(读不到/不存在则返回 null)。
++ * `directRelativeDeps`(R5)与 `findForwardingEscape`(r3-leadfix MAJOR2 新增 R9)
++ * 共享这一份磁盘读取,不重复实现。 */
++function readModuleInfo(
++  posix: string,
++): { bindings: ImportBinding[]; dynamicSpecs: string[]; suspicious: SuspiciousConstruct[] } | null {
+   let text: string
+   try {
+     text = readFileSync(join(process.cwd(), posix), 'utf8')
+   } catch {
+-    return []
++    return null
+   }
+-  const { bindings, dynamicSpecs } = collectImportBindings(text, posix)
++  return collectImportBindings(text, posix)
++}
++
++/** 生产用:某个仓相对路径文件的直接相对依赖(已用 resolveImport 解析为仓相对路径)。 */
++function directRelativeDeps(posix: string): string[] {
++  const info = readModuleInfo(posix)
++  if (!info) return []
+   const specs = new Set<string>()
+-  for (const b of bindings) specs.add(b.specifierText)
+-  for (const s of dynamicSpecs) specs.add(s)
++  for (const b of info.bindings) specs.add(b.specifierText)
++  for (const s of info.dynamicSpecs) specs.add(s)
+   const out: string[] = []
+   for (const spec of specs) {
+     if (!RELATIVE_SPEC_RE.test(spec)) continue
+@@ -159,13 +208,83 @@ function directRelativeDeps(posix: string): string[] {
+   return out
+ }
+ 
++/** r3-leadfix MAJOR2 item 2 · R9 转发逃逸口:R5 只检查"是否间接依赖到 depositStore"、
++ * 且把 depositPort 整棵子树排除在遍历之外——这个排除是必要的(agentBridge.ts →
++ * depositPort.ts 是唯一合法直接边,不该被当成违规),但审查证明它被做得太宽:任何
++ * "经中间模块转发 depositPort 禁止绑定"的路径都被一并放行,因为遍历从不检查被排除
++ * 子树*之前*那些中间模块自己的绑定。
++ *
++ * 本函数与 R5 共享同一套遍历骨架(`findIndirectDependency`),但判据换成"当前节点
++ * 自身是否持有解析到 targetModule 的禁止绑定"而不是"当前节点是不是 targetModule
++ * 本身"——含 R2 类(具名 depositBlob,任意来源)、R6 类(namespace/default 导入
++ * 解析自 targetModule)、R7 类(字面量动态 import 解析自 targetModule)、R8 类
++ * (require/ImportEquals/非字面量动态 import,target-agnostic fail-closed)四种子
++ * 判据,逐一复用而非另起一套字符串扫描。targetModule 自身(如 depositPort.ts)不会
++ * 被检查自己的绑定——它是排除子树的根,只作为"是否被转发"的判定目标,不作为被
++ * 检查节点出现。 */
++function findForwardingEscape(
++  startNodes: string[],
++  targetModule: string,
++  excludeSubtreeRoots: string[],
++  getModuleInfo: (
++    node: string,
++  ) => { bindings: ImportBinding[]; dynamicSpecs: string[]; suspicious: SuspiciousConstruct[] } | null,
++  getDirectDeps: (node: string) => string[],
++): { path: string[]; rule: 'R2' | 'R6' | 'R7' | 'R8'; detail: string } | null {
++  const excluded = new Set(excludeSubtreeRoots)
++  const visited = new Set<string>()
++  const queue: Array<{ node: string; path: string[] }> = startNodes
++    .filter((n) => !excluded.has(n))
++    .map((n) => ({ node: n, path: [n] }))
++  while (queue.length) {
++    const current = queue.shift() as { node: string; path: string[] }
++    if (visited.has(current.node)) continue
++    visited.add(current.node)
++    const info = getModuleInfo(current.node)
++    if (info) {
++      for (const b of info.bindings) {
++        if (b.importedName === 'depositBlob') {
++          return { path: current.path, rule: 'R2', detail: `导入名为 depositBlob(specifier=${b.specifierText})` }
++        }
++        if (!RELATIVE_SPEC_RE.test(b.specifierText)) continue
++        if (
++          resolveImport(b.specifierText, current.node) === targetModule &&
++          (b.importedName === '*' || b.importedName === 'default')
++        ) {
++          return {
++            path: current.path,
++            rule: 'R6',
++            detail: `namespace/default 导入(导入名「${b.importedName}」,specifier=${b.specifierText})解析自 ${targetModule}`,
++          }
++        }
++      }
++      for (const spec of info.dynamicSpecs) {
++        if (!RELATIVE_SPEC_RE.test(spec)) continue
++        if (resolveImport(spec, current.node) === targetModule) {
++          return { path: current.path, rule: 'R7', detail: `字面量动态 import 解析自 ${targetModule}(specifier=${spec})` }
++        }
++      }
++      if (info.suspicious.length) {
++        const s = info.suspicious[0]
++        return { path: current.path, rule: 'R8', detail: `出现 ${s.kind} 构造(${s.detail})` }
++      }
++      for (const dep of getDirectDeps(current.node)) {
++        if (excluded.has(dep)) continue
++        queue.push({ node: dep, path: [...current.path, dep] })
++      }
++    }
++  }
++  return null
++}
++
+ type BindingLockResult = { ok: boolean; violations: string[] }
+ 
+-/** R1~R5 汇总判定。`fromFilePosix` 默认为 agentBridge.ts 自身,可传别的仓相对
+- * 路径以便对 fixture 字符串复用同一套 specifier 解析基准目录。 */
++/** R1~R9 汇总判定(r3-leadfix MAJOR2 新增 R7/R8/R9)。`fromFilePosix` 默认为
++ * agentBridge.ts 自身,可传别的仓相对路径以便对 fixture 字符串复用同一套
++ * specifier 解析基准目录。 */
+ function validateDepositBindingLock(sourceText: string, fromFilePosix: string = AGENT_BRIDGE_PATH): BindingLockResult {
+   const violations: string[] = []
+-  const { bindings, dynamicSpecs } = collectImportBindings(sourceText, fromFilePosix)
++  const { bindings, dynamicSpecs, suspicious } = collectImportBindings(sourceText, fromFilePosix)
+ 
+   let resolvesDepositEntryFromPort = false
+   for (const b of bindings) {
+@@ -199,9 +318,28 @@ function validateDepositBindingLock(sourceText: string, fromFilePosix: string =
+   }
+   for (const spec of dynamicSpecs) {
+     if (!RELATIVE_SPEC_RE.test(spec)) continue
+-    if (resolveImport(spec, fromFilePosix) === DEPOSIT_STORE_PATH) {
++    const resolved = resolveImport(spec, fromFilePosix)
++    if (resolved === DEPOSIT_STORE_PATH) {
+       violations.push(`R3 违规:动态 import 解析自 depositStore(specifier=${spec})`)
+     }
++    // R7(r3-leadfix MAJOR2 item 1):字面量动态 import 直取 depositPort 一律拒绝,
++    // 不止 depositStore。审查实跑:`const rawPort = await import('./depositPort')`
++    // 在 R1~R6 下判 gateWouldPass:true(R1 要求的具名导入确实在场,R2 按导入名不认
++    // 动态 import,R6 只看静态 namespace/default),而它同样能直取 depositBlob,
++    // 绕开缓存/single-flight/失败提交补偿——与 R6 的静态 namespace 逃逸是同一类
++    // 逻辑漏洞,只是换了语法形态。
++    if (resolved === DEPOSIT_PORT_PATH) {
++      violations.push(
++        `R7 违规:字面量动态 import 解析自 depositPort(specifier=${spec})` +
++          '——与静态 namespace/default 导入(R6)同一类逃逸,只是换了语法形态',
++      )
++    }
++  }
++  // R8(r3-leadfix MAJOR2 item 3):require()/ImportEquals-require()/非字面量动态
++  // import 静态分析看不清目标,fail-closed 一律拒绝(不去猜它有没有指向
++  // depositPort)。这三种手法在本仓当前是零使用的异常构造,出现即可疑。
++  for (const s of suspicious) {
++    violations.push(`R8 违规:出现 ${s.kind} 构造(${s.detail})——静态分析无法确认目标,fail-closed 一律拒绝`)
+   }
+   if (!resolvesDepositEntryFromPort) {
+     violations.push('R1 违规:未找到从 ./depositPort 导入的、导入名为 resolveDepositEntry 的具名导入')
+@@ -217,12 +355,32 @@ function validateDepositBindingLock(sourceText: string, fromFilePosix: string =
+     const resolved = resolveImport(b.specifierText, fromFilePosix)
+     if (resolved) directTargets.add(resolved)
+   }
++  for (const spec of dynamicSpecs) {
++    if (!RELATIVE_SPEC_RE.test(spec)) continue
++    const resolved = resolveImport(spec, fromFilePosix)
++    if (resolved) directTargets.add(resolved)
++  }
+   const startNodes = [...directTargets].filter((p) => p !== DEPOSIT_PORT_PATH)
+   const indirectHit = findIndirectDependency(startNodes, DEPOSIT_STORE_PATH, [DEPOSIT_PORT_PATH], directRelativeDeps)
+   if (indirectHit) {
+     violations.push(`R5 违规:间接依赖 depositStore,路径=${indirectHit.join(' -> ')}`)
+   }
+ 
++  // R9(r3-leadfix MAJOR2 item 2):R5 把 depositPort 整棵子树排除在遍历之外是对的
++  // (agentBridge.ts → depositPort.ts 是唯一合法直接边),但排除得太宽——从未检查过
++  // "被排除子树之前的中间模块自己持不持有 depositPort 的禁止绑定"。审查实跑:第三
++  // 模块 `export { depositBlob as rawDeposit } from './depositPort'`,agentBridge.ts
++  // 只 import 这第三模块 → R1~R6/R7/R8 在 agentBridge.ts 自身的绑定里一个都摸不到
++  // (它没有直接绑定 depositBlob/*/default,禁止绑定藏在转发模块里),R5 的排除子树
++  // 又不检查中间模块的绑定,于是整条链路 gateWouldPass:true。
++  const forwardingHit = findForwardingEscape(startNodes, DEPOSIT_PORT_PATH, [DEPOSIT_PORT_PATH], readModuleInfo, directRelativeDeps)
++  if (forwardingHit) {
++    violations.push(
++      `R9 违规:转发模块经 ${forwardingHit.path.join(' -> ')} 触达 depositPort 的禁止绑定` +
++        `(${forwardingHit.rule} 类,${forwardingHit.detail})`,
++    )
++  }
++
+   return { ok: violations.length === 0, violations }
+ }
+ 
+@@ -312,7 +470,97 @@ export async function resolveRequestedMedia(input: { blob: Blob; label: string }
+     expect(validateDepositBindingLock(benign, AGENT_BRIDGE_PATH).violations).toEqual([])
+   })
+ 
+-  it('真实 agentBridge.ts 源码通过 AST 门禁(R1~R6 全部满足,零 violation)', () => {
++  it('r3-leadfix R7:字面量动态 import 直取 depositPort——绕开 R1~R6 的静态具名绑定检查', () => {
++    // 审查实跑反例:R1~R6 对这份**全绿**——R1 要求的具名导入确实在;R2/R6 只看
++    // 静态 import 语句的绑定,压根不检查 `await import(...)` 这条运行时表达式。
++    const dynamicImportBypass = `
++import { resolveDepositEntry } from './depositPort'
++
++export async function resolveRequestedMedia(input: { blob: Blob; label: string }) {
++  void resolveDepositEntry
++  const rawPort = await import('./depositPort')
++  return rawPort.depositBlob(input.blob, input.label)
++}
++`
++    // 先证明这份绕过对旧规则确实无害(否则就是给 R7 立稻草人)。
++    expect(dynamicImportBypass).toContain("import { resolveDepositEntry } from './depositPort'")
++    expect(dynamicImportBypass).not.toMatch(/import \{[^}]*depositBlob[^}]*\}/)
++    expect(dynamicImportBypass).not.toMatch(/import \* as/)
++
++    const result = validateDepositBindingLock(dynamicImportBypass, AGENT_BRIDGE_PATH)
++    expect(result.ok).toBe(false)
++    const joined = result.violations.join('\n')
++    // 必须**恰好**命中 R7——同 R6 夹具的纪律,不能靠别的规则顺手拦住就算过。
++    expect(joined).toMatch(/R7 违规/)
++    expect(joined).not.toMatch(/R1 违规/)
++    expect(joined).not.toMatch(/R2 违规/)
++    expect(joined).not.toMatch(/R3 违规/)
++    expect(joined).not.toMatch(/R5 违规/)
++    expect(joined).not.toMatch(/R6 违规/)
++  })
++
++  it('r3-leadfix R8:require()/ImportEquals-require()/非字面量动态 import 三种 CommonJS/拼接逃逸,fail-closed 一律拒绝', () => {
++    const requireBypass = `
++import { resolveDepositEntry } from './depositPort'
++import legacyPort = require('./depositPort')
++
++export function useRequireDirectly(suffix: string) {
++  void resolveDepositEntry
++  const rawPort = require('./depositPort')
++  const dynamicPort = import('./depositPort' + suffix)
++  return { rawPort, dynamicPort }
++}
++`
++    const result = validateDepositBindingLock(requireBypass, AGENT_BRIDGE_PATH)
++    expect(result.ok).toBe(false)
++    const joined = result.violations.join('\n')
++    // 三种构造(import-equals-require、require()、非字面量动态 import)各记一条 R8。
++    const r8Count = (joined.match(/R8 违规/g) ?? []).length
++    expect(r8Count).toBe(3)
++    // 不该只因为"含 depositPort 字样"就被误判成别的规则——R1 仍应满足(具名导入在场),
++    // R2/R6/R7 不应命中(没有具名 depositBlob、没有 namespace/default、没有字面量动态 import)。
++    expect(joined).not.toMatch(/R1 违规/)
++    expect(joined).not.toMatch(/R2 违规/)
++    expect(joined).not.toMatch(/R6 违规/)
++    expect(joined).not.toMatch(/R7 违规/)
++  })
++
++  it('r3-leadfix R9:转发模块逃逸口(纯算法单测,注入假图,不依赖磁盘)——第三模块转发 depositBlob,agentBridge 只 import 这第三模块', () => {
++    // 复现审查实跑的形状:agentBridge.ts 只静态 import helperForward(完全合法、
++    // R1~R8 都摸不到任何禁止绑定),而 helperForward 自己 `export {depositBlob as
++    // rawDeposit} from './depositPort'`——R5 排除 depositPort 子树时，从未检查过
++    // helperForward 自身的绑定，于是这条链路在旧版判定下 gateWouldPass:true。
++    const moduleInfos: Record<
++      string,
++      { bindings: ImportBinding[]; dynamicSpecs: string[]; suspicious: SuspiciousConstruct[] }
++    > = {
++      helperForward: {
++        bindings: [{ importedName: 'depositBlob', specifierText: './depositPort' }],
++        dynamicSpecs: [],
++        suspicious: [],
++      },
++      helperBenign: { bindings: [], dynamicSpecs: [], suspicious: [] },
++    }
++    const graph: Record<string, string[]> = {
++      helperForward: [],
++      helperBenign: ['helperForward'], // 多跳:agentBridge → helperBenign → helperForward → depositPort(转发)
++      depositPort: [], // 排除子树根,不应被当作待检查节点访问
++    }
++    const getModuleInfo = (n: string) => moduleInfos[n] ?? null
++    const getDeps = (n: string) => graph[n] ?? []
++    // R2 类判据(`importedName === 'depositBlob'`)按设计就是来源无关的——不需要
++    // resolveImport 解出 specifier 指向哪个真实文件,这正是它能在假图上被单测的原因
++    // (R6/R7 类判据才需要 resolveImport,本用例不覆盖那两条,留给上面的字符串夹具
++    // 与"真实源码通过门禁"测试兜底)。
++
++    const hit = findForwardingEscape(['helperBenign', 'depositPort'], DEPOSIT_PORT_PATH, ['depositPort'], getModuleInfo, getDeps)
++    expect(hit).toMatchObject({ path: ['helperBenign', 'helperForward'], rule: 'R2' })
++
++    const clean = findForwardingEscape(['helperBenign'], DEPOSIT_PORT_PATH, ['depositPort', 'helperForward'], getModuleInfo, getDeps)
++    expect(clean).toBeNull() // helperForward 也被排除时,转发路径不可达,不误报
++  })
++
++  it('真实 agentBridge.ts 源码通过 AST 门禁(R1~R9 全部满足,零 violation)', () => {
+     const source = readFileSync(join(process.cwd(), AGENT_BRIDGE_PATH), 'utf8')
+     const result = validateDepositBindingLock(source, AGENT_BRIDGE_PATH)
+     expect(result.violations).toEqual([])
+@@ -333,4 +581,171 @@ export async function resolveRequestedMedia(input: { blob: Blob; label: string }
+     const clean = findIndirectDependency(['depositPort'], 'depositStore', ['depositPort'], getDeps)
+     expect(clean).toBeNull()
+   })
++
++  // ── #297-b12 gatefix:resolveImport 扩展名归一(R6/R7 摸得到 .js 后缀 specifier)──
++  //
++  // lead 实跑证明:`resolveImport` 对 `.js` 后缀只做字面匹配——本仓源码全是 .ts,磁盘上
++  // 没有字面 `depositPort.js`,于是判 null,而不是回退去找真实的 `depositPort.ts`
++  // (本仓 tsconfig 为 "moduleResolution": "bundler",`./foo.js` 引用 `foo.ts` 是受支持的
++  // 惯用法)。R6/R7 都靠 `resolveImport(...) === DEPOSIT_PORT_PATH` 判定,解析失败等于
++  // "跟 depositPort 无关",于是 `.js` 后缀的 namespace / 字面量动态 import 能不可追踪地
++  // 绕开这两条已有规则。修法在 scripts/codemap.mjs 的 resolveImport 本身:.js/.jsx/.mjs/
++  // .cjs 字面匹配不到时回退到对应 TS 源码扩展名(.ts/.tsx/.mts/.cts)。因为修的是解析器
++  // 本身,`.js` 绕过在打了补丁后精确落回 R6/R7 各自原有的判据——不是新开一条规则。
++
++  it('R6:.js 后缀绕过——resolveImport 修复前对 .js 只做字面匹配,磁盘上没有字面 depositPort.js 故判 null,摸不到 R6', () => {
++    const jsExtNamespaceBypass = `
++import { resolveDepositEntry } from './depositPort'
++import * as rawPort from './depositPort.js'
++
++export async function resolveRequestedMedia(input: { blob: Blob; label: string }) {
++  void resolveDepositEntry
++  return rawPort.depositBlob(input.blob, input.label)
++}
++`
++    const result = validateDepositBindingLock(jsExtNamespaceBypass, AGENT_BRIDGE_PATH)
++    expect(result.ok).toBe(false)
++    const joined = result.violations.join('\n')
++    // 必须**恰好**命中 R6(与既有的无后缀 namespace 夹具同一条规则,只是 specifier 多了
++    // .js 尾巴)——不应退化成任何其它规则顺手拦住。
++    expect(joined).toMatch(/R6 违规/)
++    expect(joined).not.toMatch(/R1 违规/)
++    expect(joined).not.toMatch(/R3 违规/)
++    expect(joined).not.toMatch(/R5 违规/)
++    expect(joined).not.toMatch(/R7 违规/)
++  })
++
++  it('R7:.js 后缀字面量动态 import 绕过——同一处 resolveImport 缺陷,换成动态 import 语法', () => {
++    const jsExtDynamicBypass = `
++import { resolveDepositEntry } from './depositPort'
++
++export async function resolveRequestedMedia(input: { blob: Blob; label: string }) {
++  void resolveDepositEntry
++  const rawPort = await import('./depositPort.js')
++  return rawPort.depositBlob(input.blob, input.label)
++}
++`
++    const result = validateDepositBindingLock(jsExtDynamicBypass, AGENT_BRIDGE_PATH)
++    expect(result.ok).toBe(false)
++    const joined = result.violations.join('\n')
++    expect(joined).toMatch(/R7 违规/)
++    expect(joined).not.toMatch(/R1 违规/)
++    expect(joined).not.toMatch(/R2 违规/)
++    expect(joined).not.toMatch(/R3 违规/)
++    expect(joined).not.toMatch(/R5 违规/)
++    expect(joined).not.toMatch(/R6 违规/)
++  })
++
++  // ── 回归锁:下面四种形态在修复前已被现有规则接住,补成夹具防止将来重构把它们放开 ──
++
++  it('R6 回归:`./././` 多重当前目录前缀 + namespace 导入,resolveImport 能折叠冗余路径段,仍命中 R6', () => {
++    const dotDotDotBypass = `
++import { resolveDepositEntry } from './depositPort'
++import * as rawPort from './././depositPort'
++
++export async function resolveRequestedMedia(input: { blob: Blob; label: string }) {
++  void resolveDepositEntry
++  return rawPort.depositBlob(input.blob, input.label)
++}
++`
++    const result = validateDepositBindingLock(dotDotDotBypass, AGENT_BRIDGE_PATH)
++    expect(result.ok).toBe(false)
++    const joined = result.violations.join('\n')
++    expect(joined).toMatch(/R6 违规/)
++    expect(joined).not.toMatch(/R1 违规/)
++    expect(joined).not.toMatch(/R3 违规/)
++    expect(joined).not.toMatch(/R5 违规/)
++  })
++
++  it('R6 回归:`../agent/depositPort` 显式父目录往返相对路径 + namespace 导入,仍命中 R6', () => {
++    const parentAgentBypass = `
++import { resolveDepositEntry } from './depositPort'
++import * as rawPort from '../agent/depositPort'
++
++export async function resolveRequestedMedia(input: { blob: Blob; label: string }) {
++  void resolveDepositEntry
++  return rawPort.depositBlob(input.blob, input.label)
++}
++`
++    const result = validateDepositBindingLock(parentAgentBypass, AGENT_BRIDGE_PATH)
++    expect(result.ok).toBe(false)
++    const joined = result.violations.join('\n')
++    expect(joined).toMatch(/R6 违规/)
++    expect(joined).not.toMatch(/R1 违规/)
++    expect(joined).not.toMatch(/R3 违规/)
++    expect(joined).not.toMatch(/R5 违规/)
++  })
++
++  it('如实记录已知局限:大小写变体 `./DepositPort` + namespace 导入不由 R6 拦下(R6 无大小写归一),且 specifier 解析失败时本门整体 fail-open', () => {
++    // 本用例记录的是**本门的局限**,不是"这条路已堵死"。两句都经实测,且两句都与
++    // 文件系统大小写敏感性无关(此前版本断言 `ok === false` + 命中 R5,那是 macOS
++    // 大小写不敏感文件系统上的偶然产物,在大小写敏感的 Linux CI 上必红)。
++    //
++    // ① R6 摸不到大小写变体:R6 判据是 `resolved === DEPOSIT_PORT_PATH` 逐字符比较,
++    //    没有做大小写归一。`./DepositPort` 的 resolved 值在大小写不敏感的文件系统上
++    //    是 'cindyplugin/src/agent/DepositPort.ts'(首字母大写,不等),在大小写敏感的
++    //    文件系统上 `existsSync` 落空、resolveImport 直接返回 null(也不等)。两种
++    //    文件系统下 R6 都不命中,所以这条断言稳定。
++    // ② specifier 解析不出仓内文件时,本门给出零违规(fail-open):R2 按导入名过、
++    //    R3/R6/R7/R9 的判据都要求 resolved 等于某个具体路径,resolved 为 null 时
++    //    逐条落空;R5 的起点集合也只收 resolved 为真值的目标,于是整条链无人拦。
++    //    这正是大小写敏感文件系统上 `./DepositPort` 的处境——用一个在任何大小写下
++    //    都不存在的 specifier 把它编码成与平台无关的断言。
++    //
++    // 真正拦住大小写变体的不是本门,而是 TypeScript 自身的模块解析:实测把
++    // `import * as x from './DepositPort'` 加进 agentBridge.ts 后 `tsc -b` 报
++    // TS1149(File name '…/DepositPort.ts' differs from already included file name
++    // '…/depositPort.ts' only in casing);大小写敏感文件系统上则是解析不到模块。
++    // 若哪天要让本门自己也认得大小写变体,该改的是 R6 的比较方式(归一后再比),
++    // 不是回头去依赖 R5 的偶然命中。
++    const caseVariantBypass = `
++import { resolveDepositEntry } from './depositPort'
++import * as rawPort from './DepositPort'
++
++export async function resolveRequestedMedia(input: { blob: Blob; label: string }) {
++  void resolveDepositEntry
++  return rawPort.depositBlob(input.blob, input.label)
++}
++`
++    // ① 与文件系统大小写敏感性无关:R6 两种情况下都不命中。
++    expect(validateDepositBindingLock(caseVariantBypass, AGENT_BRIDGE_PATH).violations.join('\n')).not.toMatch(
++      /R6 违规/,
++    )
++
++    // ② fail-open:specifier 解析不到仓内文件(此处用一个在任何大小写下都不存在的
++    //    名字,保证两种文件系统上 resolveImport 都返回 null)→ 本门零违规。
++    const unresolvableNamespaceBypass = `
++import { resolveDepositEntry } from './depositPort'
++import * as rawPort from './depositPortThatDoesNotExistOnDisk'
++
++export async function resolveRequestedMedia(input: { blob: Blob; label: string }) {
++  void resolveDepositEntry
++  return rawPort.depositBlob(input.blob, input.label)
++}
++`
++    const unresolvable = validateDepositBindingLock(unresolvableNamespaceBypass, AGENT_BRIDGE_PATH)
++    expect(unresolvable.violations).toEqual([])
++    expect(unresolvable.ok).toBe(true)
++  })
++
++  it('R7 回归:字面量动态 import 解构取值(非 namespace 整体赋值),仍命中 R7', () => {
++    const destructuredDynamicBypass = `
++import { resolveDepositEntry } from './depositPort'
++
++export async function resolveRequestedMedia(input: { blob: Blob; label: string }) {
++  void resolveDepositEntry
++  const { depositBlob } = await import('./depositPort')
++  return depositBlob(input.blob, input.label)
++}
++`
++    const result = validateDepositBindingLock(destructuredDynamicBypass, AGENT_BRIDGE_PATH)
++    expect(result.ok).toBe(false)
++    const joined = result.violations.join('\n')
++    expect(joined).toMatch(/R7 违规/)
++    expect(joined).not.toMatch(/R1 违规/)
++    expect(joined).not.toMatch(/R2 违规/)
++    expect(joined).not.toMatch(/R3 违规/)
++    expect(joined).not.toMatch(/R5 违规/)
++    expect(joined).not.toMatch(/R6 违规/)
++  })
+ })
+diff --git a/src/__tests__/depositMigration.test.ts b/src/__tests__/depositMigration.test.ts
+index 24f4b266..17167240 100644
+--- a/src/__tests__/depositMigration.test.ts
++++ b/src/__tests__/depositMigration.test.ts
+@@ -168,6 +168,30 @@ describe('迁移 — 脏数据', () => {
+   })
+ })
+ 
++describe('迁移 — 纵深防御:hash 形状非法的存量条目一律跳过(r3-leadfix BLOCKER 1)', () => {
++  // 这条断言是行为断言,不是靠头部注释宣称"纵深防御"——审查实跑证明:把
++  // depositMigration.ts:128 的 `normalizeImageRefHash(hash).ok` 判断禁掉之后,
++  // mediaRefHashGate.test.ts + 本文件的其它用例仍 41/41 全绿,因为原先没有任何
++  // 用例往 ledger 里塞过形状非法的 hash。本用例专门堵这个洞:跳过计数与
++  // lookupDeposit 查不到,两者都要成立。
++  it('路径逃逸 / 含斜杠 / 非 hex 的 hash 一律跳过,不进 depositMap,且不阻断合法条目', async () => {
++    useLedger({
++      'mivo-asset:ok': { hash: 'a'.repeat(32), ext: '.png' },
++      'mivo-asset:pathEscape': { hash: '../../sensitive', ext: '.png' },
++      'mivo-asset:slash': { hash: 'abcdef0123456789/etc/passwd', ext: '.png' },
++      'mivo-asset:nonHex': { hash: 'z'.repeat(32), ext: '.png' },
++    })
++
++    const outcome = await migrateLedgerIntoDepositStore()
++
++    expect(outcome).toMatchObject({ migrated: 1, skipped: 3, committed: true })
++    await expect(lookupDeposit('mivo-asset:ok')).resolves.toBeTruthy()
++    await expect(lookupDeposit('mivo-asset:pathEscape')).resolves.toBeUndefined()
++    await expect(lookupDeposit('mivo-asset:slash')).resolves.toBeUndefined()
++    await expect(lookupDeposit('mivo-asset:nonHex')).resolves.toBeUndefined()
++  })
++})
++
+ describe('迁移 — backward(回滚)', () => {
+   it('迁移全程不回写 /kv:ledger 的读源一次都没被写过', async () => {
+     // 读源经注入的 reader(生产实现是 GET /kv,只读);断言落盘请求里没有任何
+diff --git a/src/__tests__/mediaRefHashGate.test.ts b/src/__tests__/mediaRefHashGate.test.ts
+index fff8680b..6f1d90ef 100644
+--- a/src/__tests__/mediaRefHashGate.test.ts
++++ b/src/__tests__/mediaRefHashGate.test.ts
+@@ -8,21 +8,37 @@
+  * 并被 `agentBridge.ts:214` 的 else 分支之外标成 `available`;ghost 又教外部 agent 把 hash
+  * 原样代入落盘路径,于是 agent 的 Read 目标可能逃出 blobs 分片目录。
+  *
+- * ── 本文件证明什么、不证明什么(诚实边界)──
++ * ── 本文件证明什么、不证明什么(诚实边界,r3-leadfix BLOCKER 1 返修更新)──
+  *
+- * r2-vision 要求的是 `recordMigration`→snapshot 端到端用例。本文件**没有**重建那套端到端
+- * 台子(真实 depositPort + 真实 main.js + 假宿主,见 agentBridgeMediaResolve.test.ts 的
+- * harness),而是用「单元断言 + 结构充分性断言」组合替代:
++ * r2-vision 要求的是 `recordMigration`→snapshot 端到端用例。本文件最初想用「单元断言 +
++ * 结构充分性断言」组合替代那套端到端台子,但 r3-leadfix 审查实跑证明这个替代是假的:
+  *
+- *   1. 单元层:非法 hash 一律拿不到 imageRef(`buildImageRef` 返 null);
+- *   2. 结构层:断言 `buildImageRef` 是 `cindy-media://blobs/` 在生产代码里的**唯一**构造
+- *      点 —— 这一条是让第 1 条从「必要」升级为「充分」的关键。少了它,第 1 条只能证明
+- *      「这个函数不产出非法引用」,证明不了「生产不会从别处产出非法引用」。
+- *   3. 迁移层:非法 hash 的存量条目不进 depositMap(纵深防御,不是主防线)。
++ *   - 分段字符串拼接能绕开下面的"唯一构造点"正则(`cindy-media:${'//'}blobs/${hash}...`
++ *     不含连续字面量 `cindy-media://blobs/`,断言看不见),而在这个生产变异下,本文件 +
++ *     agentBridgeMediaResolve.test.ts 曾经 60/60 全绿——真实回执却已经把 `../../sensitive`
++ *     原样拼进 `imageRef` 并标成 `available`。
++ *   - `depositMigration.ts:128` 的 hash guard 被禁掉之后,本文件 + depositMigration.test.ts
++ *     曾经仍 41/41 全绿——因为**从没有一条用例往 ledger 里塞过形状非法的 hash**,"纵深
++ *     防御"只是注释里的一句话,没有行为断言撑着。
+  *
+- * 这个替代是有代价的:它不覆盖「桥层拿到 null 之后是否真的落 unavailable/unknown」这一
+- * 跳 —— 那一跳由 agentBridgeMediaResolve.test.ts 已有的非法 ext 用例覆盖(同一 else
+- * 分支,与 hash 合法性无关)。如果将来那个 else 分支被改动,本文件抓不到。
++ * 所以现在的分工是:
++ *
++ *   1. 单元层(下方 describe 块 1,仍然有效):非法 hash 一律拿不到 imageRef
++ *      (`buildImageRef` 返 null)—— 这条是必要条件,没有争议。
++ *   2. **结构层(下方 describe 块 2,已降级)**:「buildImageRef 是唯一构造点」这条正则
++ *      断言**不再被当作充分性的来源**——它只能抓住"完整重复了这段连续字面量"的低成本
++ *      漂移(比如有人在别处手写了同款拼接却没走校验),抓不住任何有意的绕过(字符串
++ *      分段/模板嵌套/编码变形都能让它熟视无睹)。保留它仅仅是因为便宜且对"完全没想
++ *      绕过、纯手滑"的情形仍有提示价值——**当它是绿的,不能得出"生产只有一处能拼出
++ *      这个前缀"的结论**。
++ *   3. 迁移层单元断言(下方 describe 块 3):非法 hash 的存量条目不进 depositMap——同样
++ *      降格为辅助断言,真正的纵深防御证据在 `depositMigration.test.ts` 新增的行为用例
++ *      (直接断言 `skipped` 计数与 `lookupDeposit` 查不到)。
++ *
++ * **真正承担充分性的是 `agentBridgeMediaResolve.test.ts` 里 r3-leadfix BLOCKER 1 新增的
++ * 端到端用例**:直接驱动真实 `installAgentBridge()` → `resolveRequestedMedia`,断言非法
++ * hash 的存量条目在真实回执里落 `unavailable`/`unknown` 且整份 JSON 不含 `cindy-media://`
++ * ——这条绑的是行为,不是文本形状,分段拼接绕不过它。
+  */
+ import { readFileSync } from 'node:fs'
+ import { fileURLToPath } from 'node:url'
+@@ -90,8 +106,14 @@ describe('BLOCKER 2 · hash 形状门:非法 hash 一律拿不到 imageRef', ()
+   })
+ })
+ 
+-describe('BLOCKER 2 · 结构充分性:buildImageRef 是唯一生产构造点', () => {
+-  it('生产代码里 `cindy-media://blobs/` 的字符串拼接只出现在 buildImageRef 内', () => {
++describe('BLOCKER 2 · 漂移提示(已降级,r3-leadfix BLOCKER 1):文本扫描不具充分性,仅作低成本漂移信号', () => {
++  // ⚠️ 降级说明(不是稻草人,是真实踩过的坑):这两条曾被当作「让单元断言从必要升级为
++  // 充分」的关键证据。r3-leadfix 审查用分段字符串拼接(`cindy-media:${'//'}blobs/${hash}...`)
++  // 证明它们能被绕过而全绿——不含连续字面量 `cindy-media://blobs/`,正则看不见,而那份
++  // 生产变异下真实回执已经把非法 hash 原样拼进 imageRef 并标成 available。这两条现在只
++  // 证明「没有人手滑重复写了这段前缀」,证明不了「生产不会从别处产出非法引用」——后者
++  // 由 agentBridgeMediaResolve.test.ts 的端到端行为断言承担(见文件头部说明)。
++  it('[漂移提示] 生产代码里 `cindy-media://blobs/` 的字符串拼接只出现在 buildImageRef 内', () => {
+     const source = readFileSync(MEDIA_REF_FORMAT_PATH, 'utf8')
+     // 去掉块注释与行注释,只看可执行代码 —— 注释里为了讲清缺陷会引用该前缀(本文件头部
+     // 与 mediaRefFormat.ts 头部都有),不能把注释当构造点。
+@@ -103,7 +125,7 @@ describe('BLOCKER 2 · 结构充分性:buildImageRef 是唯一生产构造点',
+     expect(code).toContain('`cindy-media://blobs/${hashResult.hash}${extResult.ext}`')
+   })
+ 
+-  it('agentBridge.ts 构造 available 引用时只经 buildImageRef,不自行拼前缀', () => {
++  it('[漂移提示] agentBridge.ts 构造 available 引用时只经 buildImageRef,不自行拼前缀', () => {
+     const source = readFileSync(AGENT_BRIDGE_PATH, 'utf8')
+     const code = stripComments(source)
+     expect(code).toContain('buildImageRef(entry.hash, entry.ext)')
+diff --git a/src/agent/agentBridge.ts b/src/agent/agentBridge.ts
+index 96369bdc..370b1770 100644
+--- a/src/agent/agentBridge.ts
++++ b/src/agent/agentBridge.ts
+@@ -29,7 +29,7 @@ import {
+ } from './cindyGenerationPort'
+ import { DepositError, resolveDepositEntry, type DepositFailureCode } from './depositPort'
+ import { initMediaLedger, lookupMedia } from './mediaLedger'
+-import { buildImageRef } from './mediaRefFormat'
++import { buildImageRef, normalizeImageRefExt, normalizeImageRefHash } from './mediaRefFormat'
+ import { assetBlobForNode } from '../../../src/lib/mivoImageClient'
+ import { useCanvasStore } from '../../../src/store/canvasStore'
+ import type { AiCanvasContextNode } from '../../../src/types/mivoCanvas'
+@@ -215,10 +215,22 @@ const resolveRequestedMedia = async (
+       if (imageRef) {
+         states[id] = { state: 'available', imageRef }
+       } else {
++        // r3-leadfix SUGGESTION 3:诊断归因不得写死"ext 非法"——buildImageRef 同时
++        // 校验 hash 与 ext(#297 r2-vision BLOCKER 2),固定文案会把 hash 非法的情形
++        // (如存量条目 hash='../../sensitive')误导成"去查一个实际合法的 ext"。改用
++        // normalizeImageRefHash/normalizeImageRefExt 各自的结构化 reason 原样进日志,
++        // 而不是重新猜测拒绝原因。
++        const hashCheck = normalizeImageRefHash(entry.hash)
++        const extCheck = normalizeImageRefExt(entry.ext)
++        const reasonDetail = !hashCheck.ok
++          ? hashCheck.reason
++          : !extCheck.ok
++            ? extCheck.reason
++            : 'hash/ext 均通过独立校验但 buildImageRef 仍拒绝(与本处逻辑不同步,请检查 mediaRefFormat.ts)'
+         logDepositDiagOutcome('snapshot', {
+           nodeId: id,
+           reason: 'unknown',
+-          detail: `ext 非法,拒绝拼出非法 imageRef(fail closed):hash=${entry.hash.slice(0, 8)} ext=${JSON.stringify(entry.ext)}`,
++          detail: `拒绝拼出非法 imageRef(fail closed):hash=${entry.hash.slice(0, 8)} ext=${JSON.stringify(entry.ext)} reason=${reasonDetail}`,
+         })
+         states[id] = { state: 'unavailable', reason: 'unknown' }
+       }
