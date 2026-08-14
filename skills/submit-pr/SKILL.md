@@ -346,9 +346,9 @@ node scripts/dispatch-contract.mjs --check pkg-<seat>.md --seat <reviewer> --rou
 
 | 席 | 模型/档位 | lens | 边界 |
 |---|---|---|---|
-| ① claude-adversarial | anthropic-claude/claude-sonnet-5 / xhigh（Cindy AI 网关供应商，owner 2026-08-08 拍板替换裸 claude-sonnet-5） | 正确性 / 回归 / 影响面 | 盲审：不见其他席 finding |
+| ① claude-adversarial | z-ai/glm-5.3 / max（owner 2026-08-14 替换 anthropic-claude/claude-sonnet-5/xhigh） | 正确性 / 回归 / 影响面 | 盲审：不见其他席 finding |
 | ② codex-adversarial | codex/gpt-5.6-terra（骨折）/ xhigh；**条件升档**：本次 diff 路径命中目标仓 pr-rules.json `archGate.corePaths` → 该席 effort=ultra，派发说明标注原因 | 安全 / 边界 / 规范 | 盲审：同上 |
-| ③ upstream-preview | deepseek/deepseek-v4-flash / max（owner 2026-08-08 替换 claude-sonnet-5/xhigh） | **直接运行 review-pr 受限构建版**（preview-dist，见下方「席③执行契约」）：阶段一四门 + 阶段二独立审查真实执行，产内部 verdict | 对外写**白名单仅产品/架构 hold 三类**（开讨论 issue / PR hold 说明评论 / 转 draft 及 release/close 收尾）；其余 GitHub review/评论/合并/标签一律禁止（合并/批准/修代码/普通通知能力已在构建层物理剥离） |
+| ③ upstream-preview | z-ai/glm-5.3 / max（owner 2026-08-14 替换 deepseek/deepseek-v4-flash/max） | **直接运行 review-pr 受限构建版**（preview-dist，见下方「席③执行契约」）：阶段一四门 + 阶段二独立审查真实执行，产内部 verdict | 对外写**白名单仅产品/架构 hold 三类**（开讨论 issue / PR hold 说明评论 / 转 draft 及 release/close 收尾）；其余 GitHub review/评论/合并/标签一律禁止（合并/批准/修代码/普通通知能力已在构建层物理剥离） |
 
 - **GPT 通路纪律（owner 2026-08-06 定案，三条通路择一）**：本机对 GPT 有**三条**互不相同的通路，
   从 model ID 前缀区分——`codex/gpt-*` = **骨折**（立省 85%）；裸 `gpt-*` = **Cindy AI 通路**
