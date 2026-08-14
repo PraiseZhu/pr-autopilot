@@ -152,15 +152,20 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    自动修复是对文件（PR 正文文件、可能还包括 changelog 等关联文件）的写操作，可能覆盖掉本来正确的写法。
    修复前**必须**生成可回退快照。
 
-   **快照必须绑定当前自动修复会话**。快照存放于会话级目录，目录名携带会话身份：
+   **快照必须绑定当前自动修复会话**。快照目录由 `mktemp -d` 原子创建于工作区外（`/tmp/`），
+   目录名由系统保证唯一，创建与归属一步到位——不存在「先命名再建目录」的 TOCTOU 窗口：
    ```bash
-   SNAP_DIR=".pre-format-fix-snap-$(date +%s)-$$"
+   SNAP_DIR="$(mktemp -d /tmp/.pre-format-fix-snap-XXXXXXXX)"
    ```
-   会话 id（`$$` + 时间戳）写入快照目录名，不同会话的目录名不同，互不覆盖、可追溯归属。
+   `mktemp -d` 保证目录名唯一且原子创建。若创建失败（已存在/权限不足/冲突）→ **blocked**，
+   状态机转移至 `failed→blocked`（`mktemp` 非零退出即 fail-closed，不得降级为 `mkdir -p` 或
+   自造目录名）。`SNAP_DIR` 为绝对路径，在所有后续步骤（回退、清单核验、清理）中均使用该
+   绝对路径，进入 Phase 2 无需 `mv`——快照目录自始至终在工作区外，不会出现在 `git status` 中。
 
    **进入 `fixing` 前的残留检测**（加固类 1：不可逆/快照）：
    进入 `fixing` 状态前，必须检测是否存在**残留快照**——上次会话遗留的 `.pre-format-fix.bak` 文件
-   或 `.pre-format-fix-snap-*` 目录，无法证明属于当前会话。检测到残留 → **fail-closed**，不得进入
+   或工作区内 `.pre-format-fix-snap-*` 目录、或 `/tmp/` 下 `.pre-format-fix-snap-*` 目录（非当前
+   `$SNAP_DIR` 的），无法证明属于当前会话。检测到残留 → **fail-closed**，不得进入
    `fixing` 状态，状态机转移至 `blocked`（§6b 的 `failed→blocked` 转移：「快照生成失败」扩展为同时
    覆盖残留快照场景）。归属不明（快照目录名不含可识别的会话身份）→ 同口径 fail-closed，转人工确认/清理。
    当前会话自有目录（与 `$SNAP_DIR` 整串相等）不视为残留，**排除检测**——避免自动修复会话
@@ -169,7 +174,7 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
 
    **快照生成**（残留检测通过后、进入 `fixing` 状态前执行，同一自动修复会话内**仅首次生成**）：
    ```bash
-   mkdir -p "$SNAP_DIR"
+   # SNAP_DIR 已由 mktemp -d 原子创建，目录已存在，无需再 mkdir
    ```
    快照以**仓库相对路径为键**，在 `$SNAP_DIR` 内落一份映射清单（`$SNAP_DIR/.snap-manifest`），
    记录每条「仓库相对路径 → 快照文件名」的映射。清单以 tab 分隔两列（相对路径 \t 快照文件名）。
@@ -216,11 +221,11 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    该判据对任意快照目录（含上一会话残留）均仅凭目录自身内容即可判定完整性，不依赖当前轮次
    尚未确定的文件集。
 
-   **快照目录与 Phase 2 clean 工作区门**：快照目录为未跟踪目录，会出现在 `git status --porcelain`
-   中并打红 Phase 2 的 clean 工作区门。进入 Phase 2 前，将快照目录**移出工作区**（`mv "$SNAP_DIR"
-   /tmp/` 或等价的、不进 porcelain 的会话绑定位置），保留到 Phase 2 回退判断结束后再清理。不得在
-   回退判断点到达前 `rm -rf` 唯一回退源——快照是修复可逆性的唯一解，提前删除将使承诺的回退能力
-   无法兑现。
+   **快照目录与 Phase 2 clean 工作区门**：快照目录由 `mktemp -d` 创建在 `/tmp/` 下，自始至终在
+   工作区外，不会出现在 `git status --porcelain` 中，不会打红 Phase 2 的 clean 工作区门。
+   因此进入 Phase 2 无需 `mv`——`SNAP_DIR` 的绝对路径始终有效，回退循环、清单核验、清理
+   均消费同一绝对路径。不得在回退判断点到达前 `rm -rf` 唯一回退源——快照是修复可逆性的
+   唯一解，提前删除将使承诺的回退能力无法兑现。
 
    > **「先自动修」与原 evidence 声称的「无破坏性操作」自相矛盾**（加固类 1）：自动修复一旦
    > 写入文件就不再是纯只读检查。快照机制是这条矛盾的唯一解——它让自动修复变成**可逆**操作，
