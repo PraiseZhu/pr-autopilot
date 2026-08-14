@@ -163,8 +163,9 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    或 `.pre-format-fix-snap-*` 目录，无法证明属于当前会话。检测到残留 → **fail-closed**，不得进入
    `fixing` 状态，状态机转移至 `blocked`（§6b 的 `failed→blocked` 转移：「快照生成失败」扩展为同时
    覆盖残留快照场景）。归属不明（快照目录名不含可识别的会话身份）→ 同口径 fail-closed，转人工确认/清理。
-   当前会话自有目录（目录名含当前 shell PID `$$`）不视为残留，**排除检测**——避免自动修复会话
-   因自己刚创建的空目录被残留检测拦下而永远进不了 `fixing`。
+   当前会话自有目录（与 `$SNAP_DIR` 整串相等）不视为残留，**排除检测**——避免自动修复会话
+   因自己刚创建的空目录被残留检测拦下而永远进不了 `fixing`。非精确匹配的 `.pre-format-fix-snap-*`
+   目录一律 fail-closed，不得仅凭 PID 子串匹配或时间戳推断豁免。
 
    **快照生成**（残留检测通过后、进入 `fixing` 状态前执行，同一自动修复会话内**仅首次生成**）：
    ```bash
@@ -199,7 +200,8 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
      cp "$SNAP_DIR/$snap_name" "$rel_path"
    done < "$SNAP_DIR/.snap-manifest"
    ```
-   还原后工作区状态与修复前逐字节一致。快照目录在台账确认本轮修复无误且会话结束后删除。
+   还原后工作区状态与修复前逐字节一致。快照目录保留到 Phase 2 回退判断结束后（台账确认本轮修复
+   已通过全部审查、不再需要回退），届时由台账步骤统一清理。在回退判断点到达前，不得删除快照目录。
 
    **部分快照判据**（以映射清单为唯一可求值判据）：快照目录存在时，检查 `$SNAP_DIR/.snap-manifest`：
    - 清单缺失 → fail-closed（快照不完整，无法可靠回退）
@@ -214,11 +216,11 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    该判据对任意快照目录（含上一会话残留）均仅凭目录自身内容即可判定完整性，不依赖当前轮次
    尚未确定的文件集。
 
-   **快照目录与 Phase 2 clean 工作区门**：`.pre-format-fix-snap-*` 目录为未跟踪目录，会出现在
-   `git status --porcelain` 中并打红 Phase 2 `:279` 定格 candidate / `push-guard` 的 clean
-   工作区门。进入 Phase 2 前**必须清理**快照目录（`rm -rf "$SNAP_DIR"`），清理纳入状态机：
-   `fixing` 完成后、台账确认本轮修复无误后执行清理。目录不可落于 git 跟踪路径下，且不得以
-   「会话结束后再删」作为与 clean 工作区门的共存方案。
+   **快照目录与 Phase 2 clean 工作区门**：快照目录为未跟踪目录，会出现在 `git status --porcelain`
+   中并打红 Phase 2 的 clean 工作区门。进入 Phase 2 前，将快照目录**移出工作区**（`mv "$SNAP_DIR"
+   /tmp/` 或等价的、不进 porcelain 的会话绑定位置），保留到 Phase 2 回退判断结束后再清理。不得在
+   回退判断点到达前 `rm -rf` 唯一回退源——快照是修复可逆性的唯一解，提前删除将使承诺的回退能力
+   无法兑现。
 
    > **「先自动修」与原 evidence 声称的「无破坏性操作」自相矛盾**（加固类 1）：自动修复一旦
    > 写入文件就不再是纯只读检查。快照机制是这条矛盾的唯一解——它让自动修复变成**可逆**操作，
