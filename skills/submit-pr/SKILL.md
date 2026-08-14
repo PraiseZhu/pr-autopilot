@@ -155,7 +155,6 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    **快照必须绑定当前自动修复会话**。快照存放于会话级目录，目录名携带会话身份：
    ```bash
    SNAP_DIR=".pre-format-fix-snap-$(date +%s)-$$"
-   mkdir -p "$SNAP_DIR"
    ```
    会话 id（`$$` + 时间戳）写入快照目录名，不同会话的目录名不同，互不覆盖、可追溯归属。
 
@@ -164,8 +163,13 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    或 `.pre-format-fix-snap-*` 目录，无法证明属于当前会话。检测到残留 → **fail-closed**，不得进入
    `fixing` 状态，状态机转移至 `blocked`（§6b 的 `failed→blocked` 转移：「快照生成失败」扩展为同时
    覆盖残留快照场景）。归属不明（快照目录名不含可识别的会话身份）→ 同口径 fail-closed，转人工确认/清理。
+   当前会话自有目录（目录名含当前 shell PID `$$`）不视为残留，**排除检测**——避免自动修复会话
+   因自己刚创建的空目录被残留检测拦下而永远进不了 `fixing`。
 
    **快照生成**（残留检测通过后、进入 `fixing` 状态前执行，同一自动修复会话内**仅首次生成**）：
+   ```bash
+   mkdir -p "$SNAP_DIR"
+   ```
    快照以**仓库相对路径为键**，在 `$SNAP_DIR` 内落一份映射清单（`$SNAP_DIR/.snap-manifest`），
    记录每条「仓库相对路径 → 快照文件名」的映射。清单以 tab 分隔两列（相对路径 \t 快照文件名）。
    ```bash
@@ -201,9 +205,20 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    - 清单缺失 → fail-closed（快照不完整，无法可靠回退）
    - 清单条目数与目录内除 `.snap-manifest` 外的实际文件数不符 → fail-closed（存在未登记或缺失的快照文件）
    - 清单内存在重复的相对路径或快照文件名 → fail-closed（映射非单射）
+   - 清单每一行声明的 `snap_name` 文件不存在于 `$SNAP_DIR` → fail-closed（快照文件缺失，无法可靠回退；
+     反例：清单声明 A→a、B→b，目录实际只有 a 和一个无关残留 x → 条目数（2）vs 文件数（2）一致但 b
+     缺失，该条单独兜住。**不得只比基数**）
+   - 清单中的任何相对路径或快照文件名含 tab 字符 → fail-closed（tab 是清单列分隔符，路径含 tab
+     会把一行拆成多列，回退还原时取错文件）
    以上任一条件触发，均不得进入 `fixing` 状态，状态机转移至 `blocked`，转人工确认/清理。
    该判据对任意快照目录（含上一会话残留）均仅凭目录自身内容即可判定完整性，不依赖当前轮次
    尚未确定的文件集。
+
+   **快照目录与 Phase 2 clean 工作区门**：`.pre-format-fix-snap-*` 目录为未跟踪目录，会出现在
+   `git status --porcelain` 中并打红 Phase 2 `:279` 定格 candidate / `push-guard` 的 clean
+   工作区门。进入 Phase 2 前**必须清理**快照目录（`rm -rf "$SNAP_DIR"`），清理纳入状态机：
+   `fixing` 完成后、台账确认本轮修复无误后执行清理。目录不可落于 git 跟踪路径下，且不得以
+   「会话结束后再删」作为与 clean 工作区门的共存方案。
 
    > **「先自动修」与原 evidence 声称的「无破坏性操作」自相矛盾**（加固类 1）：自动修复一旦
    > 写入文件就不再是纯只读检查。快照机制是这条矛盾的唯一解——它让自动修复变成**可逆**操作，
