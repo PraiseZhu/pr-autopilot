@@ -7,6 +7,9 @@
       "number": 382,
       "title": "test(e2e): mask-point 显式 SKIP(#369 废除其所测交互),重写债挂 #381",
       "types": [
+        "skip_log_early_return"
+      ],
+      "heuristic_types": [
         "test_skipped"
       ],
       "files": [

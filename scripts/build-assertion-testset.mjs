@@ -38,6 +38,13 @@ function resolveTaxonomyDir(cliArg, mivoDir) {
   return null;
 }
 
+// curated 类型覆盖：PR 号 → detector 权威词汇表（不依赖 builder 关键词启发式）
+// 当 builder 的启发式标签与 detector 实际产出不一致时，在此处手动纠正。
+// 启发式标签保留在 heuristic_types 字段，不参与断言。
+const CURATED_TYPES = {
+  382: ['skip_log_early_return'],
+};
+
 const ASSERTION_WEAKENING_KEYWORDS = [
   'skip', '跳过', '弱化', '删断言', '删除断言', 'xdescribe', 'xtest', 'xit',
   'early return', '注释掉', '删测试', '删除测试', 'test_skip', 'relaxed',
@@ -199,7 +206,8 @@ function main() {
     total_entries: entries.length,
     positives: keptPositives.map(p => ({
       number: p.number, title: p.title,
-      types: measurePR(p)?.types || [],
+      heuristic_types: measurePR(p)?.types || [],
+      types: CURATED_TYPES[p.number] || measurePR(p)?.types || [],
       files: (p.files||[]).map(f => f.path),
       hasDiff: true,
     })),

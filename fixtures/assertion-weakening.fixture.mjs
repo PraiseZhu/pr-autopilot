@@ -4,12 +4,13 @@
 //
 // 注: 这个 fixture 的 cwd 固定在 fixtures/ 下（run-all.sh 的 cd 或绝对路径）
 
-import { readFileSync, existsSync, mkdirSync, writeFileSync, symlinkSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, writeFileSync, symlinkSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync, spawnSync } from 'node:child_process';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const FIXTURE_FILE = fileURLToPath(import.meta.url);
 const ROOT = join(HERE, '..');
 const MAIN = join(ROOT, 'scripts', 'detect-assertion-weakening.mjs');
 const TESTSET = join(HERE, 'assertion-weakening', 'testset.json');
@@ -191,7 +192,9 @@ async function main() {
 
   // 末行: failed 标签集合或 pass
   const failedTags = [...new Set([...posFail, ...negFail].flatMap(r => r.tags || []))];
-  const allPass = posFail.length === 0 && negFail.length === 0 && symlinkResults.every(r => r.pass);
+  const allPass = posFail.length === 0 && negFail.length === 0
+    && posSkipped.length === 0 && negSkipped.length === 0
+    && symlinkResults.every(r => r.pass);
   if (allPass) {
     console.log('pass');
     process.exit(0);
@@ -201,4 +204,69 @@ async function main() {
   }
 }
 
-await main();
+// ── FAM-4 回归测试：语料缺失必须让 fixture 失败 ──
+// 用法: node fixtures/assertion-weakening.fixture.mjs --check-fam4
+// 用 410.diff（仅负样本引用，不污染软链测试）做语料缺失反例
+async function checkFam4() {
+  const diff410 = join(DIFFS, '410.diff');
+  const bak410 = join(DIFFS, '410.diff.fam4-bak');
+
+  if (!existsSync(diff410)) {
+    console.log('FAM-4 SKIP: 410.diff 不存在，无法执行回归');
+    process.exit(2);
+  }
+
+  // 1. 先确认当前状态（零 skipped）是绿的
+  console.log('--- FAM-4 对照组: 语料完整 ---');
+  const ctrl = spawnSync(process.execPath, [FIXTURE_FILE], { encoding: 'utf8', timeout: 30000, cwd: HERE });
+  const ctrlPass = ctrl.status === 0 && /^pass$/m.test(ctrl.stdout.trim());
+  console.log(`对照组 exit=${ctrl.status} ${ctrlPass ? '✓ pass' : '✗ 非预期失败'}`);
+  if (!ctrlPass) {
+    console.log(ctrl.stdout.trim());
+    console.log('FAM-4 FAIL: 对照组应 pass，但 exit ≠ 0');
+    process.exit(1);
+  }
+
+  // 2. 单一变更：移走 410.diff → 语料缺失
+  let expFail = false;
+  let expOutput = '';
+  try {
+    renameSync(diff410, bak410);
+
+    console.log('\n--- FAM-4 实验组: 410.diff 缺失（语料不可用）---');
+    const exp = spawnSync(process.execPath, [FIXTURE_FILE], { encoding: 'utf8', timeout: 30000, cwd: HERE });
+    expFail = exp.status !== 0 && /^failed/m.test(exp.stdout.trim());
+    expOutput = exp.stdout.trim();
+    console.log(`实验组 exit=${exp.status} ${expFail ? '✓ 预期失败（exit 1）' : '✗ 应 exit 1 但未失败'}`);
+    console.log(expOutput);
+  } finally {
+    // 恢复（必须在 process.exit 前执行，因为 exit 不触发 finally）
+    if (existsSync(bak410)) renameSync(bak410, diff410);
+  }
+  if (!expFail) {
+    console.log('FAM-4 FAIL: 语料缺失时 fixture 应 exit 1，实际未失败');
+    process.exit(1);
+  }
+
+  // 3. 恢复后再次确认绿
+  console.log('\n--- FAM-4 恢复验证: 语料恢复后应重新绿 ---');
+  const restore = spawnSync(process.execPath, [FIXTURE_FILE], { encoding: 'utf8', timeout: 30000, cwd: HERE });
+  const restorePass = restore.status === 0 && /^pass$/m.test(restore.stdout.trim());
+  console.log(`恢复后 exit=${restore.status} ${restorePass ? '✓ pass' : '✗ 非预期失败'}`);
+  if (!restorePass) {
+    console.log(restore.stdout.trim());
+    console.log('FAM-4 FAIL: 恢复后应 pass');
+    process.exit(1);
+  }
+
+  console.log('\nFAM-4 PASS: 语料缺失 → exit 1 ✓  语料恢复 → exit 0 ✓');
+  process.exit(0);
+}
+
+// ── 入口 ──
+const isFam4 = process.argv.includes('--check-fam4');
+if (isFam4) {
+  await checkFam4();
+} else {
+  await main();
+}
