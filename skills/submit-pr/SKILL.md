@@ -129,40 +129,44 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
    | `pending` | `checking` | 执行 `pr-format-gate.mjs` |
    | `checking` | `passed` | exit 0 且 result ∈ {PASS, SKIP} |
    | `checking` | `failed` | exit 1（result = FAIL） |
+   | `checking` | `blocked` | exit 3（malformed / 配置错误 / fail-closed），台账记录原因 |
    | `failed` | `fixing` | 重试计数 < `maxRetries`（默认 3），触发自动修复 |
    | `failed` | `blocked` | 重试计数 ≥ `maxRetries`，转人工 |
+   | `failed` | `blocked` | 快照生成失败（进入 fixing 前的 `cp -p` 失败），转人工 |
    | `fixing` | `checking` | 自动修复完成，**必须重新执行完整格式闸**（不得因「修过一次」直接放行） |
    | `fixing` | `blocked` | 自动修复自身失败（无法生成修复补丁/快照还原失败），转人工 |
    | `blocked` | `pending` | lead 人工修复完成，手动重置（重试计数器归零，见下方「阻断出口」第 2 条） |
 
-   **重试上限**：`maxRetries` 默认 3，由目标仓 `agent-use/docs/pr-rules.json` 的
-   `formatGate.maxRetries` 字段配置（缺省 = 3；malformed → fail-closed，拒绝执行）。
+   **重试上限**：`maxRetries` 默认 3，为 lead 侧规范性计数（格式闸自动修复的重试次数上限）。
+   `pr-format-gate.mjs` 当前不读取该字段；重试计数由 lead 在台账中维护。
    每次重检前必须重新执行完整 `pr-format-gate.mjs`，**不得**因「已修过一次」跳过检测直接进入
    `passed`。
 
    **阻断出口**（到达 `blocked` 状态时）：
    1. lead 在台账记录阻断原因、已尝试的修复次数、最后一轮 `missing_sections` 输出
    2. lead 人工修复后从 `pending` 重新开始（重试计数器归零，因为输入已实质性变更）
-   3. **不得绕过格式闸直接进入 Phase 2**——`blocked` 状态下无任何路径通往 `passed`
+   3. **不得绕过格式闸直接进入 Phase 2**——`blocked` 状态下无自动或直接转移；人工修复后经 `pending` 重新完整检测才可 `passed`
 
    ### 6c. 自动修复前快照（t3 加固，2026-08-13）
 
    自动修复是对文件（PR 正文文件、可能还包括 changelog 等关联文件）的写操作，可能覆盖掉本来正确的写法。
    修复前**必须**生成可回退快照。
 
-   **快照生成**（进入 `fixing` 状态前执行）：
+   **快照生成**（进入 `fixing` 状态前执行，同一自动修复会话内**仅首次生成**）：
    ```bash
-   # 对 PR 正文文件（已跟踪或未跟踪均覆盖）
+   # 对 PR 正文文件（已跟踪或未跟踪均覆盖），仅当快照不存在时生成
    cp -p "<PR正文文件>" "<PR正文文件>.pre-format-fix.bak"
    ```
    若自动修复还涉及其他文件（如 changelog），每个被修改文件同口径生成 `.pre-format-fix.bak` 副本。
+   **同一自动修复会话内，首次生成后后续 `failed→fixing` 重试不得对同一文件再次 `cp -p` 覆盖快照**——
+   快照必须始终保留本轮格式闸检测开始前的原文，不得被半修复结果覆盖。回退始终还原到该原文。
 
    **回退命令**（修复后若被打回或发现修复引入新问题）：
    ```bash
-   # 逐文件还原
+   # 逐文件还原到本轮格式闸检测开始前的原文
    cp "<文件>.pre-format-fix.bak" "<文件>"
    ```
-   还原后工作区状态与修复前逐字节一致。快照文件在台账确认修复无误后删除。
+   还原后工作区状态与修复前逐字节一致。快照文件在台账确认本轮修复无误且会话结束后删除。
 
    > **「先自动修」与原 evidence 声称的「无破坏性操作」自相矛盾**（加固类 1）：自动修复一旦
    > 写入文件就不再是纯只读检查。快照机制是这条矛盾的唯一解——它让自动修复变成**可逆**操作，
@@ -205,6 +209,14 @@ Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini �
         改动 PR body 正文但不应改动 marker 区块（marker 内容由 `intent-check.mjs` 管理，格式闸
         自动修复不触碰 marker）。若格式闸自动修复意外改动了 marker 区块，G2 必须重跑。
       - 若未来格式闸扩展为可修改源码文件，本条规则须同步更新。
+
+   4. **格式闸自动修复改动文件后，规模闸结论作废（stale）**：
+      - 格式闸（G4）自动修复若改动计入规模闸（G3）输入的文件（如 changelog），已取得的 G3
+        结论（PASS/WARN/STOP）必须标记为 stale——因为 G4 修复改变了 G3 判定所依赖的 diff 范围。
+      - 未重跑 G3 不得带着旧 G3 结论进入 Phase 2。
+      - 台账记录：`size-gate: stale(下游 format-gate 自动修复改动规模输入，重跑)`。
+      - 此条与规则 2（G3 STOP → G4 stale）互为反向——自动修复对任一闸门输入文件的改动，都
+        必须使另一闸门的既有结论失效，不得只写单一方向的传导。
 
    > **四闸合取顺序的设计理由**：G3（规模）必须在 G4（格式）之前——规模闸判 STOP 时格式闸的
    > PASS 结论在拆分后立即作废，所以把格式闸放在规模闸之后、作为派审前最后一道闸，避免「格式
