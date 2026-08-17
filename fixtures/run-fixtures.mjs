@@ -6993,6 +6993,14 @@ t('[D1-DC] sc-29b CLI fail-closed: round>=2 未传 --parent → 非零退出且�
   ok(r3.stdout.includes('DISPATCH-CONTRACT-OK'), 'check 正向必须 OK: ' + r3.stdout);
 });
 
+t('[D1-DC] round 非整数 fail-closed: --round 2.5 缺 --parent → 报 round 非法而非误导性 --parent 文案', () => {
+  const runDcCli = (args) => spawnSync(process.execPath, [join(S, 'dispatch-contract.mjs'), ...args], { encoding: 'utf8', timeout: 60_000 });
+  const r = runDcCli(['--emit', 'claude-adversarial', '--round', '2.5']);
+  ok(r.status !== 0, `非整数 round 必须非零退出（status=${r.status}）: ${r.stderr}`);
+  ok(r.stderr.includes('round 非法'), `错误文案必须点名 round 非法（来自 contractSpec）: ${r.stderr}`);
+  ok(!r.stderr.includes('必须传 --parent'), `非整数 round 不该先被 --parent 门拦下（会误导用户补 --parent 后仍撞 round 校验）: ${r.stderr}`);
+});
+
 // ── D2: PR 格式确定性预检 ──
 const FG_CFG = { featureSections: ['变更说明', '提交前自检', '备注'], bugfixSections: ['变更说明', '怎么修的', '备注'], titleTypes: ['feat', 'fix', 'chore', 'docs'], lightTypes: ['chore', 'docs'] };
 const FG_BODY_FULL = '## 变更说明\n做了 X\n\n## 提交前自检\n- [x] ok\n\n## 备注\n无\n';
