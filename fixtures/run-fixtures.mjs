@@ -2,7 +2,7 @@
 // pr-autopilot 回归 fixtures v3 — 审③后更新（对账用例全部固化）
 // 每条用例前缀 [计划条款/审次编号]；末尾 SKIPPED 清单如实列出仓内验不了的项。
 // 模拟密钥一律运行时拼接（静态文件不含完整 token/赋值形态）。
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, utimesSync, rmSync, lstatSync, appendFileSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, utimesSync, rmSync, lstatSync, appendFileSync, symlinkSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
@@ -20,7 +20,7 @@ import { validateVerdict, SCHEMA_VERSION } from '../scripts/verdict-validate.mjs
 import { runConsensusGate, recomputeArtifactHash, familyKeyOf } from '../scripts/consensus-gate.mjs';
 import { checkPushGuard, matchAny, directionCheck, jsonSubset, fastSignaturePayload } from '../scripts/push-guard.mjs';
 import { ciReadiness } from '../scripts/ci-readiness.mjs';
-import { matchUiPaths } from '../scripts/ui-paths/match.mjs';
+import { matchUiPaths, registryReceipt } from '../scripts/ui-paths/match.mjs';
 import { registerPr, unregisterPr, checkReceipt, stateFileName, legacyStateFileName, parseStateFileName, migrateAllLegacyStateFiles, STATE_FILE_NAME_RE } from '../scripts/pr-watch/register.mjs';
 import { evaluate, emptyCursors } from '../scripts/pr-watch/gate.mjs';
 import { runEngine } from '../scripts/pr-watch/engine.mjs';
@@ -107,7 +107,14 @@ function mkBundle(baseSha, candidateSha, over = {}) {
   return {
     base_sha: baseSha, candidate_sha: candidateSha, pr_title: 't', pr_body: 'b',
     touches_ui: false, matched_paths: [],
-    ui_registry_config_hash: 'c'.repeat(64), pr_context_digest: 'd'.repeat(64), ...over
+    ui_registry_config_hash: 'c'.repeat(64),
+    // #22 provenance receipt（wave2 g2）: path/64hex/40sha/repo 全量入锅；config_hash 与
+    // ui_registry_config_hash 双轨一致（不一致时 computeReviewInputHash fail-closed）。
+    ui_registry_receipt: {
+      path: 'scripts/ui-paths/registry.pr-autopilot.json',
+      config_hash: 'c'.repeat(64), source_sha: SHA_A, repo: 'PraiseZhu/pr-autopilot'
+    },
+    pr_context_digest: 'd'.repeat(64), ...over
   };
 }
 // v2: 每条 finding 需 anchor_paths（机器分组字段）。测试 finding 未显式给时，
@@ -276,6 +283,189 @@ t('[SC-B4/D5] checklist_version 9→10 迁移: 旧 9 项 verdict 必须报「清
   const newErrs = validateVerdict(newStyle);
   eq(newErrs.length, 0, '新 10 项 + 当前 checklist_version 的 verdict 必须零错误: ' + JSON.stringify(newErrs));
 });
+// ========== SC-27/28/29（wave1 g3-r2 派工包）==========
+// CLI 用例需要真实 git 仓（--repo-dir 必填，tracked/changed 校验要能算出实改集）
+const vvRepo = mkdtempSync(join(tmpdir(), 'vv-'));
+const vvTmp = mkdtempSync(join(tmpdir(), 'vvt-'));
+const vvGit = (...a) => execFileSync('git', ['-C', vvRepo, ...a], { encoding: 'utf8' }).trim();
+vvGit('init', '-q', '-b', 'main');
+vvGit('config', 'user.email', 'fx@test'); vvGit('config', 'user.name', 'fx');
+writeFileSync(join(vvRepo, 'a.txt'), '1\n'); vvGit('add', '.'); vvGit('commit', '-qm', 'base');
+const VV_BASE = vvGit('rev-parse', 'HEAD');
+vvGit('checkout', '-qb', 'feat');
+writeFileSync(join(vvRepo, 'b.txt'), '2\n'); vvGit('add', '.'); vvGit('commit', '-qm', 'feat');
+const VV_HEAD = vvGit('rev-parse', 'HEAD');
+const runVvCli = (args) => spawnSync(process.execPath, [join(S, 'verdict-validate.mjs'), ...args], { encoding: 'utf8', timeout: 60_000 });
+
+t('[sc-28] faces=not-an-array → validateVerdict 返回「faces 必须是数组」errs 且不抛 TypeError（进程不崩）', () => {
+  const v = mkVerdictFor('claude-adversarial', bundle, { faces: 'not-an-array' });
+  const errs = validateVerdict(v); // 若实现又落到 (v.faces ?? []).some，这里直接抛 TypeError，t() 捕获 → FAIL
+  ok(Array.isArray(errs), '必须返回 errs 数组而非抛错');
+  ok(errs.some((e) => /faces 必须是数组/.test(e)), '必须点名 faces 必须是数组: ' + JSON.stringify(errs));
+});
+t('[sc-28-cli] faces=not-an-array 走 CLI → [SCHEMA-FAIL]+[VERDICT] degraded / exit 1，无 TypeError 堆栈', () => {
+  const b = mkBundle(VV_BASE, VV_HEAD);
+  const v = mkVerdictFor('claude-adversarial', b, { faces: 'not-an-array' });
+  const vf = join(vvTmp, 'sc28.json');
+  writeFileSync(vf, JSON.stringify(v));
+  const r = runVvCli(['--verdict', vf, '--repo-dir', vvRepo]);
+  eq(r.status, 1, 'exit 必须为 1（degraded）');
+  ok(r.stderr.includes('[SCHEMA-FAIL] faces 必须是数组'), 'stderr 必须含 [SCHEMA-FAIL] faces 必须是数组: ' + r.stderr);
+  ok(r.stderr.includes('[VERDICT] degraded'), 'stderr 必须含 [VERDICT] degraded: ' + r.stderr);
+  ok(!r.stderr.includes('TypeError'), '不得抛 TypeError（进程崩溃）: ' + r.stderr);
+});
+
+t('[sc-27-bundle] 全 0 hash + bundle → 拒，错误信息含完整 64 hex 两串（禁止截断 12 位）', () => {
+  const b = mkBundle(VV_BASE, VV_HEAD);
+  const recomputed = computeReviewInputHash(b);
+  const v = mkVerdictFor('claude-adversarial', b, { review_input_hash: '0'.repeat(64) });
+  const errs = validateVerdict(v, { bundle: b });
+  ok(errs.some((e) => /SC-27/.test(e)), '必须点名 SC-27: ' + JSON.stringify(errs));
+  const hit = errs.find((e) => e.includes('携带='));
+  ok(hit && hit.includes('0'.repeat(64)), '错误信息必须含完整 64 位携带值（截断 12 位会让前缀相同的「不一致」显示成「同一串」）: ' + JSON.stringify(errs));
+  ok(hit && hit.includes(recomputed), '错误信息必须含完整 64 位重算值: ' + JSON.stringify(errs));
+});
+t('[sc-27-bundle-ok] 匹配 hash + bundle → ok；不传 bundle 只验 hex 形状（保持旧调用）', () => {
+  const b = mkBundle(VV_BASE, VV_HEAD);
+  eq(validateVerdict(mkVerdictFor('claude-adversarial', b), { bundle: b }).length, 0, '匹配 hash+bundle 应零错误');
+  const v = mkVerdictFor('claude-adversarial', b, { review_input_hash: 'f'.repeat(64) }); // 形状合法但无 bundle 可比
+  eq(validateVerdict(v).length, 0, '不传 bundle 时只验 64 位 hex 形状，应零错误');
+});
+t('[sc-27-bundle-cli] --bundle 不匹配 → CLI exit 1 + SCHEMA-FAIL + 完整 64 hex（不截断）', () => {
+  const b = mkBundle(VV_BASE, VV_HEAD);
+  const v = mkVerdictFor('claude-adversarial', b, { review_input_hash: '0'.repeat(64) });
+  const vf = join(vvTmp, 'sc27.json'), bf = join(vvTmp, 'sc27bundle.json');
+  writeFileSync(vf, JSON.stringify(v)); writeFileSync(bf, JSON.stringify(b));
+  const r = runVvCli(['--verdict', vf, '--repo-dir', vvRepo, '--bundle', bf]);
+  eq(r.status, 1, 'exit 必须为 1');
+  ok(r.stderr.includes('[SCHEMA-FAIL]') && r.stderr.includes('SC-27'), 'stderr 必须含 SCHEMA-FAIL SC-27: ' + r.stderr);
+  ok(r.stderr.includes('0'.repeat(64)), 'stderr 必须含完整 64 位携带 hash: ' + r.stderr);
+  ok(r.stderr.includes(computeReviewInputHash(b)), 'stderr 必须含完整 64 位重算 hash: ' + r.stderr);
+});
+
+t('[sc-27-sha-width] 7 位短 sha → 拒（base_sha/candidate_sha 非法）；40 位合法 sha → 过', () => {
+  const shortBase = mkVerdictFor('claude-adversarial', bundle, { base_sha: 'abc1234' }); // 合法 hex 但非 40 位
+  ok(validateVerdict(shortBase).some((e) => /base_sha 非法/.test(e)), '7 位短 base_sha 必须拒: ' + JSON.stringify(validateVerdict(shortBase)));
+  const shortCand = mkVerdictFor('claude-adversarial', bundle, { candidate_sha: 'abcd123' });
+  ok(validateVerdict(shortCand).some((e) => /candidate_sha 非法/.test(e)), '7 位短 candidate_sha 必须拒: ' + JSON.stringify(validateVerdict(shortCand)));
+  eq(validateVerdict(mkVerdictFor('claude-adversarial', bundle)).length, 0, '40 位合法 sha 应零错误');
+});
+
+t('[sc-29-missing-parent-cli] round=4 reuse + 无 --parent → CLI 用法错（含 CLI/--parent，不含「round=1 谱系根」）', () => {
+  const b = mkBundle(VV_BASE, VV_HEAD);
+  const K1 = familyKeyOf('SC-29 夹具不变量');
+  const v = mkVerdictFor('claude-adversarial', b, {
+    round: 4,
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['b.txt'], evidence: 'e', status: 'closed', invariant: 'SC-29 夹具不变量', family_id: 'fam1', family_claim: { kind: 'reuse', target_family_key: K1 } }],
+    closed_finding_ids: ['F1']
+  });
+  const vf = join(vvTmp, 'sc29.json');
+  writeFileSync(vf, JSON.stringify(v));
+  const r = runVvCli(['--verdict', vf, '--repo-dir', vvRepo]);
+  eq(r.status, 1, '无 --parent 必须 exit 1（fail-closed，在进入 reuse 语义前）');
+  ok(r.stderr.includes('CLI 用法错') && r.stderr.includes('--parent'), '错误文案必须是 CLI 用法错且点名 --parent: ' + r.stderr);
+  ok(!r.stderr.includes('round=1 谱系根'), '不得落入「round=1 谱系根」内容级文案（那是冤枉合法 reuse 意图的错误形态）: ' + r.stderr);
+});
+t('[sc-29-missing-parent-cli-ok] 带 --parent（真实 known family）→ 不因本改动误伤合法 reuse（exit 0 ok）', () => {
+  const b = mkBundle(VV_BASE, VV_HEAD);
+  const K1 = familyKeyOf('SC-29 夹具不变量');
+  const v = mkVerdictFor('claude-adversarial', b, {
+    round: 4,
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['b.txt'], evidence: 'e', status: 'closed', invariant: 'SC-29 夹具不变量', family_id: 'fam1', family_claim: { kind: 'reuse', target_family_key: K1 } }],
+    closed_finding_ids: ['F1']
+  });
+  const vf = join(vvTmp, 'sc29ok.json'), pf = join(vvTmp, 'sc29parent.json');
+  writeFileSync(vf, JSON.stringify(v));
+  writeFileSync(pf, JSON.stringify({ canonical_findings: [{ family_key: K1, invariant: 'SC-29 夹具不变量' }] }));
+  const r = runVvCli(['--verdict', vf, '--repo-dir', vvRepo, '--parent', pf]);
+  eq(r.status, 0, '带 --parent 应 exit 0，stderr=' + r.stderr);
+  ok(r.stdout.trim() === 'ok', 'stdout 应为 ok: ' + r.stdout);
+});
+
+// ========== sc-22（wave2 g2 派工包: #22 registry 来源绑定 + provenance 进 review_input_hash）==========
+const PA_REG = readJson(join(S, 'ui-paths/registry.pr-autopilot.json'));
+const CINDY_REG = readJson(join(S, 'ui-paths/registry.cindy.json'));
+const PA_REG_HASH = '7c47f21be0249c215772ee916dd163bfea710356358283ac8afd3722a96c78e0';
+
+t('[sc-22-registry-bound] 本仓权威 registry 派生: config_hash 固定 64 hex + expectedRepo 绑定（错仓红）', () => {
+  eq(matchUiPaths(PA_REG, ['src/x.ts']).config_hash, PA_REG_HASH, '本仓 registry config_hash 必须固定为 7c47f21b...（正例 64 hex）');
+  eq(matchUiPaths(PA_REG, ['src/x.ts'], { expectedRepo: 'PraiseZhu/pr-autopilot' }).touches_ui, false, '本仓 + expectedRepo 匹配应正常派生');
+  ok(CINDY_REG.repo !== PA_REG.repo, '前置: cindy registry 归属仓必须与本仓不同（错仓红的前提）');
+  let threw = false;
+  try { matchUiPaths(CINDY_REG, [], { expectedRepo: 'PraiseZhu/pr-autopilot' }); } catch { threw = true; }
+  ok(threw, '错仓 registry（repo 归属 != 目标仓）必须红（来源绑定）');
+  let threw2 = false;
+  try { matchUiPaths({ ...PA_REG, repo: undefined }, [], { expectedRepo: 'PraiseZhu/pr-autopilot' }); } catch { threw2 = true; }
+  ok(threw2, 'registry 缺 repo 声明时必须红（无法绑定来源）');
+});
+
+t('[sc-22-registry-bound-cli] CLI: --repo 必填；本仓绿（exit 0 + 完整 64 hex + receipt）；错仓红（exit 1）', () => {
+  const r22 = mkdtempSync(join(tmpdir(), 'r22-'));
+  const g22 = (...a) => execFileSync('git', ['-C', r22, ...a], { encoding: 'utf8' }).trim();
+  g22('init', '-q', '-b', 'main'); g22('config', 'user.email', 'fx@test'); g22('config', 'user.name', 'fx');
+  writeFileSync(join(r22, 'registry.json'), JSON.stringify(PA_REG, null, 2) + '\n');
+  g22('add', '.'); g22('commit', '-qm', 'registry');
+  const R22_SHA = g22('rev-parse', 'HEAD');
+  const files22 = join(r22, 'files.txt'); writeFileSync(files22, 'src/x.ts\n');
+  const runMatch = (args, input) => spawnSync(process.execPath, [join(S, 'ui-paths/match.mjs'), ...args], { input, encoding: 'utf8', timeout: 60_000 });
+  // 缺 --repo → exit 1（来源绑定强制化，lead 无「不传 repo 兜底」路径）
+  const noRepo = runMatch(['--registry', join(r22, 'registry.json'), '--files', files22], '');
+  eq(noRepo.status, 1, '缺 --repo 必须 exit 1: ' + noRepo.stderr);
+  // 本仓 + 真实来源 ref SHA → 绿
+  const okCli = runMatch(['--registry', join(r22, 'registry.json'), '--files', files22, '--repo', 'PraiseZhu/pr-autopilot', '--source-sha', R22_SHA], '');
+  eq(okCli.status, 0, '本仓 registry CLI 应 exit 0: ' + okCli.stderr);
+  const r22out = JSON.parse(okCli.stdout);
+  eq(r22out.config_hash, PA_REG_HASH, 'CLI config_hash 必须为完整 64 hex 固定值');
+  eq(r22out.receipt.config_hash, PA_REG_HASH, 'receipt.config_hash 必须一致');
+  eq(r22out.receipt.source_sha, R22_SHA, 'receipt.source_sha 必须等于来源 ref SHA（40 位）');
+  eq(r22out.receipt.repo, 'PraiseZhu/pr-autopilot', 'receipt.repo 必须为 registry 归属仓');
+  ok(r22out.receipt.path.includes('registry.json'), 'receipt.path 必须记录 registry 路径');
+  // 错仓 registry → 红（exit 1 + 点名来源绑定）
+  const badCli = runMatch(['--registry', join(S, 'ui-paths/registry.cindy.json'), '--files', files22, '--repo', 'PraiseZhu/pr-autopilot', '--source-sha', R22_SHA], '');
+  eq(badCli.status, 1, '错仓 registry CLI 必须 exit 1');
+  ok(badCli.stderr.includes('来源绑定'), 'stderr 必须点名来源绑定: ' + badCli.stderr);
+  rmSync(r22, { recursive: true, force: true });
+});
+
+t('[sc-22-provenance-receipt-binding] path/64hex/40sha/repo 全量入锅: 篡改任一字段 → hash 变或 fail-closed → bundle 通道拒', () => {
+  const b = mkBundle(SHA_A, SHA_B);
+  const v = mkVerdictFor('claude-adversarial', b);
+  const rcpt = b.ui_registry_receipt;
+  const cases = [
+    ['path', 'scripts/ui-paths/registry.cindy.json'],
+    ['config_hash', 'f'.repeat(64)],
+    ['source_sha', 'f'.repeat(40)],
+    ['repo', 'PraiseZhu/cindy']
+  ];
+  for (const [k, val] of cases) {
+    const tampered = { ...b, ui_registry_receipt: { ...rcpt, [k]: val } };
+    let threw = false, diff = false;
+    try { diff = computeReviewInputHash(tampered) !== v.review_input_hash; } catch { threw = true; }
+    ok(threw || diff, '篡改 receipt.' + k + ' 必须改变 hash 或 fail-closed 抛错');
+    const errs = validateVerdict(v, { bundle: tampered });
+    ok(errs.some((e) => /SC-27/.test(e)), '篡改 receipt.' + k + ' 必须被 bundle 通道拒（SC-27 点名）: ' + JSON.stringify(errs));
+  }
+  eq(validateVerdict(v, { bundle: b }).length, 0, '未篡改 bundle 必须零错误（对照组）');
+  // 形状校验: 非 64 hex / 非 40 hex / 空 repo / 空 path → fail-closed 抛错
+  for (const bad of [{ config_hash: 'abc' }, { source_sha: 'abc1234' }, { repo: '' }, { path: '' }]) {
+    let threw = false;
+    try { computeReviewInputHash({ ...b, ui_registry_receipt: { ...rcpt, ...bad } }); } catch { threw = true; }
+    ok(threw, '非法 receipt 形状必须抛错: ' + JSON.stringify(bad));
+  }
+  // 双轨脱钩: 手填 ui_registry_config_hash 与 receipt.config_hash 不一致 → fail-closed（#22 建议 3: 禁止 lead 手填 hash）
+  let threwTrack = false;
+  try { computeReviewInputHash({ ...b, ui_registry_config_hash: '0'.repeat(64) }); } catch { threwTrack = true; }
+  ok(threwTrack, 'ui_registry_config_hash 与 receipt.config_hash 双轨脱钩必须抛错（禁止手填 hash）');
+  // registryReceipt 纯函数: 组装 + 形状校验
+  const built = registryReceipt({ path: 'scripts/ui-paths/registry.pr-autopilot.json', registry: PA_REG, sourceSha: SHA_A });
+  eq(built.config_hash, PA_REG_HASH, 'registryReceipt 必须产出本仓固定 64 hex');
+  eq(built.repo, 'PraiseZhu/pr-autopilot');
+  eq(built.source_sha, SHA_A);
+  let threwSha = false;
+  try { registryReceipt({ path: 'p', registry: PA_REG, sourceSha: 'abc' }); } catch { threwSha = true; }
+  ok(threwSha, 'source_sha 非 40 位 hex 必须抛错');
+});
+
 t('[⑥/审③F4-R] 全绿 → pass；artifact hash 含 base/candidate（只改 SHA 即失效）', () => {
   const { artifact } = consensusFor(bundle);
   eq(artifact.gate_result, 'pass', JSON.stringify(artifact.fail_reasons));
@@ -4224,10 +4414,12 @@ console.log('\n[19c] D8-node: 已登记 fixture 入口的 stdout summary 行级�
 //   5. [D8-node-R4IDENT-4] 正向对照: 普通正规文件（白名单路径本体）→ applies=true 且
 //      selected_tests 为真实数（零回归）
 //   6. [D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且凭证零落库（sc-1g）
-// 注: R4IDENT-6（运行期洗白 TOCTOU）在 f1 下**不红**——它断言 fail-open 语义
-// （gate=unmeasured / selected_tests=null），整体禁用恰好也落 unmeasured，断言通过；
-// 它绑定的是 f3 的时序变异方向。红集以实测为准，勿凭「新增即必红」推理补数
-// （该推理曾由 lead 提出，被实测推翻）。
+// 注: issue #21（2026-08-17）把 R4IDENT-1/2/3/5/6 的断言从 fail-open（unmeasured+PASS）
+// 收紧为 fail-closed（UNRUNNABLE+blocked+ok=false）——它们断言「身份失败不得 finalize
+// PASS」，f1（测量分支整体禁用 → 全落 unmeasured）下断言 UNRUNNABLE/ok=false 全红，
+// 故 f1 红集在收紧后扩为 11 条（含 R4IDENT-1/2/3/5/6）。红集以实测为准，勿凭
+// 「新增即必红」推理补数（该推理曾由 lead 提出，被实测推翻）；收紧后的完整数字
+// 以下次变异态复测为准。
 // 更新义务 f1: 新增会绑定 node 测量分支的用例时必须就地更新本清单——「断言 pass /
 // VACUOUS / gate=pass」方向的用例会扩红集，「断言 unmeasured / fail-open」方向的一般不会；
 // 方向性不可推理，只能实测。
@@ -4244,8 +4436,11 @@ console.log('\n[19c] D8-node: 已登记 fixture 入口的 stdout summary 行级�
 //      → gate=unmeasured 且 selected_tests=null（SC-R5-TIMING-1）
 // 注: f2 红集含 R4IDENT-6 是 R4 新增用例后的演变——旧声称 {R4IDENT-1,2,3} 已随 R4IDENT-6
 // 加入而过期（身份缺失时运行期洗白 decoy 的伪造 summary 同样被采信）。本条正是「红集随
-// 用例新增静默过期」的实锤现场（不变量 fk1-b9dea67e 第 4 次复发）。R4IDENT-4/5
-// （正向对照 / 文件缺失 fail-open）两态一致不红。
+// 用例新增静默过期」的实锤现场（不变量 fk1-b9dea67e 第 4 次复发）。R4IDENT-4
+// （正向对照）两态一致不红。issue #21（2026-08-17）收紧断言后:
+//   · R4IDENT-1/2/3/6 挖掉身份 → 采信伪造 summary（gate=pass）→ 断言 blocked/null 全红（红集不变，红因更强）;
+//   · R4IDENT-5（文件缺失）挖掉身份 → runnerOut 无 summary → unmeasured+PASS → 断言
+//     UNRUNNABLE 变红（新增红，红集扩为 5 条，含 R4IDENT-5）。
 // 更新义务 f2: 新增断言 symlink/身份失败语义的用例时，先实测再更新本清单（f2 红集
 // 会随「身份负例 + fail-open 断言」类用例新增而变化）。
 //
@@ -4255,7 +4450,10 @@ console.log('\n[19c] D8-node: 已登记 fixture 入口的 stdout summary 行级�
 //   1. [D8-node-R4IDENT-6] 运行期洗白 TOCTOU: symlink decoy 真实子进程退出前把自己洗成正规文件
 //      → gate=unmeasured 且 selected_tests=null（SC-R5-TIMING-1）
 // 注: 只有 R4IDENT-6 红——它断言 exec 前判定语义（事后 realpath 看到的是被洗白的文件系统）；
-// R4IDENT-1/2/3 的静态 symlink 不洗白，事后 realpath 仍见 symlink → 不红。
+// R4IDENT-1/2/3 的静态 symlink 不洗白，事后 realpath 仍见 symlink → 不红。issue #21
+// （2026-08-17）收紧断言后: R4IDENT-6 变异态采信伪造 summary（gate=pass+selected=999）→
+// 断言 blocked/null 仍红（红集不变，红因更强）；R4IDENT-1/2/3/5 事后仍见 symlink/缺失 →
+// identity 失败 → blocked+UNRUNNABLE，断言通过，不红（与收紧前一致）。
 // 更新义务 f3: 新增「运行期换体 / 洗白」类用例会扩本形态红集，新增后必须实测更新。
 //
 // 形态 f4: **移除主跑 execFileSync 的 maxBuffer**（回默认 1MiB，sc-1a 承重失效）。
@@ -4690,10 +4888,13 @@ t('[D8-node-R4IDENT-1] symlink 指向 worktree 外 decoy（打印合法 summary�
   });
   const r = v.results.find((x) => x.sc_id === 'R4ID1');
   eq(FR.nodeEntryEligible({ cmd: 'node', args: ['fixtures/run-fixtures.mjs'] }, wtPath).applies, false, '直接断言 applies=false（词法命中但文件身份不成立）');
-  eq(r.status, 'PASS', 'fail-open: 维持 PASS 不阻断');
-  eq(r.selection_gate, 'unmeasured', 'gate=unmeasured（symlink 冒充白名单入口的伪造 summary 不得被采信）');
+  // issue #21（sc-21-cli-realpath-isolation）: 身份失败从 fail-open（unmeasured 放行）收紧为
+  // fail-closed（UNRUNNABLE + blocked，整波阻断）——symlink 冒充不得 finalize PASS。变异态
+  // （挖掉身份判据）下词法命中 → 测量 → gate=pass + status=PASS，本用例仍红（红集语义不变）。
+  eq(r.status, 'UNRUNNABLE', 'fail-closed（issue #21）: symlink 冒充白名单入口不得维持 PASS');
+  eq(r.selection_gate, 'blocked', 'gate=blocked（身份不可信 = 测量不可信，整波阻断）');
   eq(r.selected_tests, null, '不取伪造计数');
-  eq(v.ok, true, '整波放行');
+  eq(v.ok, false, '整波阻断（sc-21-cli-realpath-isolation: 身份三例不得 finalize PASS）');
 });
 
 t('[D8-node-R4IDENT-2] symlink 指向 worktree 内另一个文件 → applies=false 且 selection_gate=unmeasured（仓内换体同样不得冒充白名单入口）', () => {
@@ -4707,10 +4908,11 @@ t('[D8-node-R4IDENT-2] symlink 指向 worktree 内另一个文件 → applies=fa
   });
   const r = v.results.find((x) => x.sc_id === 'R4ID2');
   eq(FR.nodeEntryEligible({ cmd: 'node', args: ['fixtures/run-fixtures.mjs'] }, wtPath).applies, false, '直接断言 applies=false');
-  eq(r.status, 'PASS', 'fail-open: 维持 PASS 不阻断');
-  eq(r.selection_gate, 'unmeasured', 'gate=unmeasured（仓内换体 symlink 同样不得被采信）');
+  // issue #21（sc-21-cli-realpath-isolation）: 仓内换体 symlink 同样 fail-closed 阻断
+  eq(r.status, 'UNRUNNABLE', 'fail-closed（issue #21）: 仓内换体冒充不得维持 PASS');
+  eq(r.selection_gate, 'blocked', 'gate=blocked（仓内换体 symlink 同样不得被采信）');
   eq(r.selected_tests, null, '不取伪造计数');
-  eq(v.ok, true, '整波放行');
+  eq(v.ok, false, '整波阻断（sc-21-cli-realpath-isolation）');
 });
 
 t('[D8-node-R4IDENT-3] 父目录本身是 symlink（fixtures → 别处）→ applies=false 且 selection_gate=unmeasured', () => {
@@ -4724,10 +4926,11 @@ t('[D8-node-R4IDENT-3] 父目录本身是 symlink（fixtures → 别处）→ ap
   });
   const r = v.results.find((x) => x.sc_id === 'R4ID3');
   eq(FR.nodeEntryEligible({ cmd: 'node', args: ['fixtures/run-fixtures.mjs'] }, wtPath).applies, false, '直接断言 applies=false');
-  eq(r.status, 'PASS', 'fail-open: 维持 PASS 不阻断');
-  eq(r.selection_gate, 'unmeasured', 'gate=unmeasured（父目录 symlink 解析整条路径后同样 ≠ 期望）');
+  // issue #21（sc-21-cli-realpath-isolation）: 父目录 symlink 同样 fail-closed 阻断
+  eq(r.status, 'UNRUNNABLE', 'fail-closed（issue #21）: 父目录 symlink 不得维持 PASS');
+  eq(r.selection_gate, 'blocked', 'gate=blocked（父目录 symlink 解析整条路径后同样 ≠ 期望）');
   eq(r.selected_tests, null, '不取伪造计数');
-  eq(v.ok, true, '整波放行');
+  eq(v.ok, false, '整波阻断（sc-21-cli-realpath-isolation）');
 });
 
 t('[D8-node-R4IDENT-4] 正向对照: 普通正规文件（白名单路径本体）→ applies=true 且 selected_tests 为真实数（零回归）', () => {
@@ -4746,19 +4949,23 @@ t('[D8-node-R4IDENT-4] 正向对照: 普通正规文件（白名单路径本体�
   eq(v.ok, true, '整波放行');
 });
 
-t('[D8-node-R4IDENT-5] 文件缺失 → 不抛异常，落 unmeasured（fail-open，与多参数/未登记方向一致）', () => {
-  // R4-IDENT fail-open 分支: realpath 失败（文件缺失）必须不抛异常、落 unmeasured，不得
-  // 让 validateIntegration 崩掉，也不得把缺失态当成 pass。变异态（挖掉身份判据）下
-  // 本用例同样绿（runnerOut 无 summary 行 → 0 匹配 → unmeasured，两态一致，不红）。
+t('[D8-node-R4IDENT-5] 文件缺失（realpath 解析失败）→ 不抛异常，fail-closed 阻断（issue #21: 解析失败例不得 finalize PASS）', () => {
+  // R4-IDENT + issue #21（sc-21-cli-realpath-isolation）: realpath 失败（文件缺失）必须
+  // 不抛异常（fail-closed 是记 UNRUNNABLE，不是让 validateIntegration 崩掉），且从 fail-open
+  // （unmeasured 放行）收紧为阻断——「解析失败」是身份三例之一。变异态（挖掉身份判据）下
+  // 词法命中 → runnerOut 无 summary → unmeasured + PASS，本用例断言 UNRUNNABLE 即红。
   const { env, wtPath, v } = mkNodeGateEnvFs('R4ID5', ['fixtures/run-fixtures.mjs'], 'all pass\n', (wt) => {
     /* 刻意不创建文件: 操作数路径缺失（真实运行中 node 会 ENOENT → FAIL，不会进本分支；
        注入式 runner 下显式构造缺失态验证 fail-open 不抛异常） */
   });
   const r = v.results.find((x) => x.sc_id === 'R4ID5');
-  eq(r.status, 'PASS', '不抛异常且维持 PASS 不阻断');
-  eq(r.selection_gate, 'unmeasured', 'gate=unmeasured');
+  // issue #21（sc-21-cli-realpath-isolation）: realpath 解析失败（文件缺失）同样 fail-closed
+  // 阻断——「解析失败」是三例之一，不得 finalize PASS。不抛异常的不变式保留（fail-closed
+  // 是记 UNRUNNABLE，不是让 validateIntegration 崩掉）。
+  eq(r.status, 'UNRUNNABLE', 'fail-closed（issue #21）: realpath 解析失败不得维持 PASS');
+  eq(r.selection_gate, 'blocked', 'gate=blocked');
   eq(r.selected_tests, null, '不取计数');
-  eq(v.ok, true, '整波放行');
+  eq(v.ok, false, '整波阻断（sc-21-cli-realpath-isolation: 解析失败例）');
 });
 
 t('[D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且凭证零落库（sc-1g）', () => {
@@ -4803,7 +5010,7 @@ t('[D8-node-REAL] 真实子进程 + >1MiB stdout + fake marker → 未截断且�
   eq(v.ok, true, '整波放行');
 });
 
-t('[D8-node-R4IDENT-6] 运行期洗白 TOCTOU: symlink decoy 真实子进程退出前把自己洗成正规文件 → gate=unmeasured 且 selected_tests=null（SC-R5-TIMING-1）', () => {
+t('[D8-node-R4IDENT-6] 运行期洗白 TOCTOU: symlink decoy 真实子进程退出前把自己洗成正规文件 → fail-closed 阻断且 selected_tests=null（SC-R5-TIMING-1 + issue #21）', () => {
   // SC-R5-TIMING-1（issue #19 round 5，三席各自独立复现的同一 PoC）: 白名单路径起初是
   // 指向 decoy 的 symlink；decoy 打印伪造 summary 后，在退出前**同步**完成 unlinkSync +
   // writeFileSync，把自己换成干净的正规文件——全在同一个同步子进程内、先于 execFileSync
@@ -4849,14 +5056,335 @@ t('[D8-node-R4IDENT-6] 运行期洗白 TOCTOU: symlink decoy 真实子进程退�
   // 真实跑（不注入 runner/selectionProbe）: validate 真实执行 node fixtures/run-fixtures.mjs
   const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'd8n-r4id6', scManifest: scm, waveIndex: 0 });
   const r = v.results.find((x) => x.sc_id === 'R4ID6');
-  eq(r.status, 'PASS', 'fail-open: 维持 PASS 不阻断（漏测而非假 PASS）');
-  eq(r.selection_gate, 'unmeasured', 'gate=unmeasured——授权决定来自 exec 前那次判定，symlink 冒充入口的伪造 summary 不得被采信（判据移回 exec 后的变异态下此处为 pass，本用例即红）: got=' + r.selection_gate);
+  // issue #21（sc-21-cli-realpath-isolation）: 身份失败（exec 前判定时入口是 symlink）从
+  // fail-open 收紧为 fail-closed——UNRUNNABLE + 整波阻断，不得 finalize PASS。TIMING-1 的
+  // 绑定语义不变: 变异态（判据移回 exec 后）下 exec 后看到被洗白的正规文件 → 词法命中 →
+  // 采信伪造 summary（gate=pass + selected=999），本用例断言 UNRUNNABLE/null 即红。
+  eq(r.status, 'UNRUNNABLE', 'fail-closed（issue #21）: 运行期洗白 decoy 同样不得维持 PASS');
+  eq(r.selection_gate, 'blocked', 'gate=blocked——授权决定来自 exec 前那次判定，symlink 冒充入口的伪造 summary 不得被采信（判据移回 exec 后的变异态下此处为 pass，本用例即红）: got=' + r.selection_gate);
   eq(r.selected_tests, null, 'selected_tests=null，不取伪造值 999（精确断言，禁笼统判据）: got=' + r.selected_tests);
   // PoC 前提自证: 洗白后的入口确为正规文件——「事后看文件系统是干净的」正是旧判据被骗的
   // 机制，而本闸门（exec 前判定）不受其影响。
   const st = lstatSync(join(wt, 'fixtures', 'run-fixtures.mjs'));
   ok(st.isFile() && !st.isSymbolicLink(), '运行后入口已是正规文件（洗白 PoC 前提成立: 事后 realpath 看到的是被洗白的文件系统）');
+  eq(v.ok, false, '整波阻断（sc-21-cli-realpath-isolation）');
+});
+
+// ========== 19b. issue #21: verify 消重 + 身份 fail-closed + escape 出路 + base 锁 ==========
+console.log('\n[19b] issue #21: 消重（同 wave 同 digest 一次）/ 身份三例 fail-closed / escape 出路 / base 锁');
+// 本组用例绑定 fix-run.mjs 的 issue #21 改动（2026-08-17）:
+//   · sc-21-verify-dedupe-or-filter: 同 wave 相同 digest 只跑一次；异树同 cmd 不得消重
+//   · sc-21-cli-realpath-isolation: symlink/realpath 不一致、解析失败、父目录 symlink 三例
+//     不得 finalize PASS（R4IDENT-1/2/3/5/6 断言已随本组同步收紧，红集注释见上方 f1/f2/f3）
+//   · sc-21-escape-hatch / sc-21-bootstrap-disposition: 真祖先 merge / 已登记 flake+构造性
+//     归因可放行；任意前进 / BOOTSTRAP / 未知类型拒（escapeEligible 唯一裁决点）
+//   · sc-base-lock-and-verify-context: digest 绑 cmd+args+integrated_tip+source/base
+
+t('[SC-21-DEDUPE-1] 同 wave 相同 digest（同 cmd+args+同树）→ verify 只执行一次，组内 SC 共享结果', () => {
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-D1', 'SC-D2'], paths: ['a.ts'] }],
+    [['g1']],
+    [
+      { id: 'SC-D1', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) },
+      { id: 'SC-D2', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }
+    ]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'sc21d1', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'sc21d1', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'sc21d1', plan, waveIndex: 0 }).ok, 'wave 应集成');
+  let calls = 0;
+  const v = FR.validateIntegration({ stateDir: env.stateDir, runId: 'sc21d1', scManifest: scm, waveIndex: 0, runner: () => { calls++; return 'ok\n'; } });
+  eq(calls, 1, 'sc-21-verify-dedupe-or-filter 核心: 同 wave 相同 digest 的 verify 只执行一次（PR #19 round 3 的十条同命令从十次收敛为一次）: calls=' + calls);
+  const r1 = v.results.find((x) => x.sc_id === 'SC-D1');
+  const r2 = v.results.find((x) => x.sc_id === 'SC-D2');
+  eq(r1.status, 'PASS', '组内 SC-1 共享执行结果');
+  eq(r2.status, 'PASS', '组内 SC-2 共享执行结果');
+  eq(r1.verify_digest, r2.verify_digest, '组内两 SC 的 verify_digest 相同（消重键一致）');
+  eq(v.results.length, 2, '每 SC 仍有独立 entry 记录（消重的是执行，不是记录）');
   eq(v.ok, true, '整波放行');
+});
+
+t('[SC-21-DEDUPE-2] 异树（不同 integrated_tip）同 cmd+args → 不得消重，各执行一次', () => {
+  const env = mkRunEnv({ files: ['a.ts', 'b.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-D3'], paths: ['a.ts'] }, { id: 'g2', sc_ids: ['SC-D4'], paths: ['b.ts'] }],
+    [['g1'], ['g2']],
+    [
+      { id: 'SC-D3', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) },
+      { id: 'SC-D4', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }
+    ]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'sc21d2', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  // wave 0
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'sc21d2', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'sc21d2', plan, waveIndex: 0 }).ok, 'wave1 应集成');
+  // wave 1（base = wave0 integrated_tip，树不同）
+  const a2 = FR.allocate({ stateDir: env.stateDir, runId: 'sc21d2', plan, waveIndex: 1, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a2.allocations[0], 'b.ts', 'fixed b\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'sc21d2', plan, waveIndex: 1 }).ok, 'wave2 应集成');
+  let calls = 0;
+  const r0 = FR.validateIntegration({ stateDir: env.stateDir, runId: 'sc21d2', scManifest: scm, waveIndex: 0, runner: () => { calls++; return 'ok\n'; } });
+  const r1 = FR.validateIntegration({ stateDir: env.stateDir, runId: 'sc21d2', scManifest: scm, waveIndex: 1, runner: () => { calls++; return 'ok\n'; } });
+  eq(calls, 2, '异树同 cmd 必须各执行一次（digest 含树上下文，跨树不得消重）: calls=' + calls);
+  eq(r0.ok, true); eq(r1.ok, true);
+  const m = readJson(FR.runManifestPath(env.stateDir, 'sc21d2'));
+  const ctx0 = FR.verifyContext(m, m.waves[0]);
+  const ctx1 = FR.verifyContext(m, m.waves[1]);
+  const d0 = FR.verifyDigest({ cmd: 'test', args: ['-f', 'a.ts'] }, ctx0);
+  const d1 = FR.verifyDigest({ cmd: 'test', args: ['-f', 'a.ts'] }, ctx1);
+  ok(d0 !== d1, 'sc-base-lock-and-verify-context: 同 cmd+args 异树（不同 integrated_tip）digest 必须不同: ' + d0.slice(0, 12) + ' vs ' + d1.slice(0, 12));
+});
+
+t('[SC-21-IDENT-FINAL] symlink 冒充白名单入口 → validate ok=false → finalizeRun 抛错（身份三例不得 finalize PASS 的最终级断言）', () => {
+  // 复用 mkNodeGateEnvFs 的 symlink→仓外 decoy 形态（R4IDENT-1 同款）: validate 已阻断
+  // （UNRUNNABLE/blocked），本用例补 finalize 级断言——阻断必须一路传到 finalize。
+  const { env } = mkNodeGateEnvFs('FINID', ['fixtures/run-fixtures.mjs'], '========== fixtures: 5 passed, 0 failed ==========\n', (wt, env2) => {
+    mkdirSync(join(wt, 'fixtures'), { recursive: true });
+    const decoyPath = join(env2.d, 'decoy.mjs');
+    writeFileSync(decoyPath, '#!/usr/bin/env node\nconsole.log("========== fixtures: 5 passed, 0 failed ==========")\n');
+    symlinkSync(decoyPath, join(wt, 'fixtures', 'run-fixtures.mjs'));
+  });
+  let finThrew = null;
+  try { FR.finalizeRun({ stateDir: env.stateDir, runId: 'd8n-FINID' }); } catch (e) { finThrew = e.message; }
+  ok(finThrew && /未通过 orchestrator 复跑验证|不可 flake 放行/.test(finThrew), 'sc-21-cli-realpath-isolation: 身份失败不得 finalize PASS（finalize 必须抛错）: ' + finThrew);
+});
+
+t('[SC-21-ESCAPE] 出路判定（escapeEligible 唯一裁决点）: 真祖先 merge / 已登记 flake+构造性归因放行；任意前进 / BOOTSTRAP / 未知类型拒', () => {
+  const src = 'a'.repeat(40);
+  // 真祖先 merge: parent 含源 candidate → 放行
+  ok(FR.escapeEligible({ kind: 'true-ancestor-merge', parents: [src, 'b'.repeat(40)], sourceCandidate: src }).ok, '真祖先 merge（某 parent == 源 candidate）放行（修法 2）');
+  // 任意前进: parent 均非源 candidate → 拒
+  ok(!FR.escapeEligible({ kind: 'true-ancestor-merge', parents: ['c'.repeat(40), 'b'.repeat(40)], sourceCandidate: src }).ok, 'parent 不含源 candidate = 任意前进，拒');
+  ok(!FR.escapeEligible({ kind: 'true-ancestor-merge', parents: [src], sourceCandidate: null }).ok, '无源 candidate 参照 = 拒（fail-closed）');
+  ok(!FR.escapeEligible({ kind: 'true-ancestor-merge', parents: [src], sourceCandidate: src }).ok, '单 parent 的普通直接子不是 merge，即使 parent==源 candidate 也拒');
+  // 已登记 flake + 构造性归因 → 放行（修法 3）
+  const constructive = 'engine.mjs:348-349 两次独立 nowIso() 调用旧形态 + 受控时钟每次取值强制 +1ms，证明该树必产生 1ms 差（确定性机制描述）';
+  ok(FR.escapeEligible({ kind: 'flake-registered', attribution: constructive }).ok, '已登记 flake + 构造性归因放行（修法 3）');
+  ok(FR.attributionConstructive(constructive), 'attributionConstructive 对机制描述归因返回 true');
+  // 空洞归因（重试次数）→ 拒
+  ok(!FR.escapeEligible({ kind: 'flake-registered', attribution: '重试三次就过' }).ok, '「重试三次就过」空洞归因拒');
+  ok(!FR.attributionConstructive('retry three times then pass'), '英文 retry 空洞归因拒');
+  ok(!FR.attributionConstructive('太短'), '过短归因拒');
+  // 任意前进 / BOOTSTRAP / 未知类型 → 拒
+  ok(!FR.escapeEligible({ kind: 'arbitrary-advance' }).ok, '任意前进拒（sc-21-escape-hatch）');
+  ok(!FR.escapeEligible({ kind: 'bootstrap' }).ok, 'BOOTSTRAP 拒（sc-21-bootstrap-disposition）');
+  ok(!FR.escapeEligible({ kind: 'magic' }).ok, '未知出路类型 fail-closed 拒');
+});
+
+t('[SC-21-FLAKE-1] validate 层 flake 登记: 命中（sc_id+tree+digest 全匹配+构造性归因）→ FLAKE 放行并标注；未命中 → FAIL 阻断', () => {
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-F1'], paths: ['a.ts'] }],
+    [['g1']],
+    [{ id: 'SC-F1', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'sc21fa', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'sc21fa', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'sc21fa', plan, waveIndex: 0 }).ok, 'wave 应集成');
+  const failRunner = () => { const e = new Error('verify failed'); e.status = 1; e.stdout = ''; throw e; };
+  // 未登记 → FAIL 阻断
+  const v0 = FR.validateIntegration({ stateDir: env.stateDir, runId: 'sc21fa', scManifest: scm, waveIndex: 0, runner: failRunner });
+  eq(v0.results[0].status, 'FAIL', '未登记 flake 的失败照旧 FAIL');
+  eq(v0.ok, false, 'FAIL 阻断整波');
+  // 登记命中 → FLAKE + ok=true + 显式标注
+  const m = readJson(FR.runManifestPath(env.stateDir, 'sc21fa'));
+  const tip = m.waves[0].integrated_tip;
+  const ctx = FR.verifyContext(m, m.waves[0]);
+  const d = FR.verifyDigest({ cmd: 'test', args: ['-f', 'a.ts'] }, ctx);
+  const registry = { entries: [{ sc_id: 'SC-F1', tree_sha: tip, digest: d, attribution: 'a.ts 的校验逻辑在偶发时钟偏移下 1ms 抖动（受控时钟 +1ms 可稳定复现，确定性机制）' }] };
+  const v1 = FR.validateIntegration({ stateDir: env.stateDir, runId: 'sc21fa', scManifest: scm, waveIndex: 0, runner: failRunner, flakeRegistry: registry });
+  const r1 = v1.results.find((x) => x.sc_id === 'SC-F1');
+  eq(r1.status, 'FLAKE', '命中登记 → FLAKE（修法 3 放行）');
+  eq(r1.selection_gate, 'flake-registered', 'gate 标注 flake-registered');
+  ok(/已登记 flake/.test(r1.note ?? ''), 'validate 输出显式标注哪条 SC 走了登记（修法 3 要求）: ' + (r1.note ?? ''));
+  eq(v1.ok, true, 'FLAKE 计入通过 → 整波放行');
+  // 反例: digest 不匹配（换了树的登记）→ 未命中 → 仍 FAIL
+  const wrongTree = { entries: [{ sc_id: 'SC-F1', tree_sha: '0'.repeat(40), digest: d, attribution: '树不匹配的登记（构造性归因但树错）——仍不得放行，确定性机制描述但树错也拒' }] };
+  const v2 = FR.validateIntegration({ stateDir: env.stateDir, runId: 'sc21fa', scManifest: scm, waveIndex: 0, runner: failRunner, flakeRegistry: wrongTree });
+  eq(v2.results[0].status, 'FAIL', '登记绑定的树 ≠ 本波集成树 → 未命中，照旧 FAIL');
+  eq(v2.ok, false, '整波阻断');
+});
+
+t('[SC-21-FLAKE-2] finalize 层 flake 兜底: validate 未收登记而 finalize 收到 → 失败 SC 全部命中则放行；空洞归因/未登记仍拒', () => {
+  // run A: validate 无 registry（FAIL/ok=false）→ finalize 带 registry（命中）→ 放行
+  const mkRun = (runId) => {
+    const env = mkRunEnv({ files: ['a.ts'] });
+    mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+    const { art, plan, scm } = mkRunSetup(env,
+      [{ id: 'g1', sc_ids: ['SC-FA'], paths: ['a.ts'] }],
+      [['g1']],
+      [{ id: 'SC-FA', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }]
+    );
+    FR.initRun({ stateDir: env.stateDir, runId, repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+    const a1 = FR.allocate({ stateDir: env.stateDir, runId, plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+    workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+    ok(FR.integrate({ stateDir: env.stateDir, runId, plan, waveIndex: 0 }).ok, `${runId} wave 应集成`);
+    const failRunner = () => { const e = new Error('verify failed'); e.status = 1; e.stdout = ''; throw e; };
+    const v = FR.validateIntegration({ stateDir: env.stateDir, runId, scManifest: scm, waveIndex: 0, runner: failRunner });
+    eq(v.ok, false, `${runId}: validate 无登记 → FAIL 阻断（前提）`);
+    const m = readJson(FR.runManifestPath(env.stateDir, runId));
+    const ctx = FR.verifyContext(m, m.waves[0]);
+    const d = FR.verifyDigest({ cmd: 'test', args: ['-f', 'a.ts'] }, ctx);
+    return { env, m, d };
+  };
+  // run A: finalize 带命中登记 → flake 出路放行
+  const A = mkRun('sc21fb');
+  const regHit = { entries: [{ sc_id: 'SC-FA', tree_sha: A.m.waves[0].integrated_tip, digest: A.d, attribution: 'a.ts 校验在偶发时钟偏移下 1ms 抖动（受控时钟 +1ms 可稳定复现，确定性机制）' }] };
+  const finA = FR.finalizeRun({ stateDir: A.env.stateDir, runId: 'sc21fb', flakeRegistry: regHit });
+  eq(finA.final_candidate, A.m.waves[0].integrated_tip, 'finalize 层 flake 出路放行（修法 3 兜底接线）');
+  const evA = finA.manifest.events.find((e) => e.kind === 'wave-escape-flake');
+  ok(evA && evA.sc_ids.includes('SC-FA'), '放行必须留事件痕迹（wave-escape-flake）');
+  // run B: finalize 带空洞归因登记 → 仍拒
+  const B = mkRun('sc21fc');
+  const regVoid = { entries: [{ sc_id: 'SC-FA', tree_sha: B.m.waves[0].integrated_tip, digest: B.d, attribution: '重试三次就过' }] };
+  let finBThrew = null;
+  try { FR.finalizeRun({ stateDir: B.env.stateDir, runId: 'sc21fc', flakeRegistry: regVoid }); } catch (e) { finBThrew = e.message; }
+  ok(finBThrew && /未通过 orchestrator 复跑验证/.test(finBThrew), '空洞归因（重试次数）不得放行 finalize: ' + finBThrew);
+  // run C: finalize 不带 registry → 照旧拒
+  let finCThrew = null;
+  try { FR.finalizeRun({ stateDir: B.env.stateDir, runId: 'sc21fc' }); } catch (e) { finCThrew = e.message; }
+  ok(finCThrew && /未通过 orchestrator 复跑验证/.test(finCThrew), '无登记凭据时 finalize 照旧拒（fail-closed）');
+  // run D: validate 记 UNRUNNABLE 后，即使 flake 登记命中也不得 finalize
+  const D = mkRun('sc21fd');
+  const dPath = FR.runManifestPath(D.env.stateDir, 'sc21fd');
+  const dMan = readJson(dPath);
+  dMan.waves[0].validation = {
+    ok: false,
+    results: [{ sc_id: 'SC-FA', status: 'UNRUNNABLE', verify_digest: D.d, selection_gate: 'blocked' }]
+  };
+  writeFileSync(dPath, JSON.stringify(dMan, null, 2));
+  const regUnrun = { entries: [{ sc_id: 'SC-FA', tree_sha: D.m.waves[0].integrated_tip, digest: D.d, attribution: 'a.ts 校验在偶发时钟偏移下 1ms 抖动（受控时钟 +1ms 可稳定复现，确定性机制）' }] };
+  let finDThrew = null;
+  try { FR.finalizeRun({ stateDir: D.env.stateDir, runId: 'sc21fd', flakeRegistry: regUnrun }); } catch (e) { finDThrew = e.message; }
+  ok(finDThrew && /不可 flake 放行/.test(finDThrew), 'UNRUNNABLE 不得经 flake 登记 finalize: ' + finDThrew);
+});
+
+t('[SC-21-BASE-LOCK] digest 绑定 source/base/integrated_tip；source_candidate 是当前集成点派生（不硬重置回计划期锁 0aa0410）', () => {
+  const env = mkRunEnv({ files: ['a.ts', 'b.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const { art, plan, scm } = mkRunSetup(env,
+    [{ id: 'g1', sc_ids: ['SC-B1'], paths: ['a.ts'] }, { id: 'g2', sc_ids: ['SC-B2'], paths: ['b.ts'] }],
+    [['g1'], ['g2']],
+    [
+      { id: 'SC-B1', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) },
+      { id: 'SC-B2', kind: 'fix', finding_ids: ['f0'], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }
+    ]
+  );
+  FR.initRun({ stateDir: env.stateDir, runId: 'sc21bl', repoDir: env.r, plan, scManifest: scm, sourceArtifact: art, featureBranch: 'feat' });
+  const a1 = FR.allocate({ stateDir: env.stateDir, runId: 'sc21bl', plan, waveIndex: 0, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a1.allocations[0], 'a.ts', 'fixed a\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'sc21bl', plan, waveIndex: 0 }).ok, 'wave1 应集成');
+  const a2 = FR.allocate({ stateDir: env.stateDir, runId: 'sc21bl', plan, waveIndex: 1, worktreeRoot: env.wtRoot, artifact: art, scManifest: scm });
+  workGroup(env, a2.allocations[0], 'b.ts', 'fixed b\n');
+  ok(FR.integrate({ stateDir: env.stateDir, runId: 'sc21bl', plan, waveIndex: 1 }).ok, 'wave2 应集成');
+  const m = readJson(FR.runManifestPath(env.stateDir, 'sc21bl'));
+  const ctx0 = FR.verifyContext(m, m.waves[0]);
+  const ctx1 = FR.verifyContext(m, m.waves[1]);
+  // base 锁（sc-base-lock）: 本组实际 base 是 wave1 集成点派生——source_candidate 必须 ==
+  // run 起点（env.cand，真仓里即 e833052 集成点的后代/自身），digest 不把 origin/main
+  // 硬重置回计划期锁 0aa0410。若实现把 source_candidate 写死成计划期值，此处必红。
+  eq(ctx0.source_candidate, env.cand, 'source_candidate == run 起点（源 artifact 派生，非计划期锁值）');
+  eq(ctx0.base, env.cand, 'wave0 base == source_candidate');
+  eq(ctx0.integrated_tip, m.waves[0].integrated_tip, 'wave0 integrated_tip == 本波集成树');
+  eq(ctx1.base, m.waves[0].integrated_tip, 'wave1 base == 前波集成树（CAS 派生链）');
+  eq(ctx1.integrated_tip, m.waves[1].integrated_tip, 'wave1 integrated_tip == 本波集成树');
+  // digest 对 ctx 敏感: 换任意字段即换 digest
+  const v0 = { cmd: 'test', args: ['-f', 'a.ts'] };
+  ok(FR.verifyDigest(v0, ctx0) !== FR.verifyDigest(v0, { ...ctx0, integrated_tip: '0'.repeat(40) }), '换 integrated_tip → digest 变');
+  ok(FR.verifyDigest(v0, ctx0) !== FR.verifyDigest(v0, { ...ctx0, source_candidate: '0'.repeat(40) }), '换 source_candidate → digest 变');
+  ok(FR.verifyDigest(v0, ctx0) !== FR.verifyDigest(v0, { ...ctx0, base: '0'.repeat(40) }), '换 base → digest 变');
+  ok(FR.verifyDigest(v0, ctx0) !== FR.verifyDigest({ cmd: 'test', args: ['-f', 'b.ts'] }, ctx0), '换 args → digest 变');
+  // 消重键语义: 同树同 cmd 的 entry digest == 组内共享的 digest（sc-21-verify-dedupe-or-filter）
+  const v1 = FR.validateIntegration({ stateDir: env.stateDir, runId: 'sc21bl', scManifest: scm, waveIndex: 0, runner: () => 'ok\n' });
+  const e0 = v1.results.find((x) => x.sc_id === 'SC-B1');
+  eq(e0.verify_digest, FR.verifyDigest(v0, ctx0), 'entry.verify_digest 就是绑定上下文的 digest');
+});
+
+t('[SC-21-PG-MERGE] push-guard 起点「仅前进到含源 candidate 的 merge」不算漂移（issue #21 修法 2）；任意前进起点仍拒', () => {
+  const env = mkRunEnv({ files: ['a.ts'] });
+  mkdirSync(env.stateDir, { recursive: true }); mkdirSync(env.wtRoot, { recursive: true });
+  const g = env.g;
+  const S = env.cand; // 源 candidate = feat HEAD（env.r 唯一 commit，base 与 candidate 同源）
+  g('remote', 'add', 'origin', 'https://github.com/o/r.git'); // F3-R: remote URL 必须指向 manifest.repo
+  // git 历史: S(feat) → fix 分支 commit F → merge fix 进 feat 得 M（parents=[S,F]，真祖先 merge）→ finalTip
+  g('checkout', '-qb', 'fix');
+  writeFileSync(join(env.r, 'a.ts'), 'fixed\n');
+  g('add', '.'); g('commit', '-qm', 'fix commit');
+  const F = g('rev-parse', 'HEAD');
+  g('checkout', '-q', 'feat');
+  g('merge', '--no-ff', '-m', 'merge fix into feat', 'fix');
+  const M = g('rev-parse', 'HEAD');
+  writeFileSync(join(env.r, 'a.ts'), 'final\n');
+  g('add', '.'); g('commit', '-qm', 'final squash');
+  const finalTip = g('rev-parse', 'HEAD');
+  // 手搓三件套（不用 mkRunSetup）: 源 artifact 的 base/candidate 都必须是 env.r 内真实 commit
+  // （带 repoDir 的终版共识做 git 血缘检查；且源/终版 base_sha 必须一致，防「跨评审拼接」）。
+  // 必须带一条真实 finding（SC 覆盖门: SC 引用悬空 finding 即拒）; plan 由 buildFixPlan 生成
+  // （派发门: capacity 不得 lead 自报，走可信配置）。
+  const art = artifactWithFindings([{ sev: 'major', paths: ['a.ts'] }], mkBundle(S, S));
+  const fid0 = art.canonical_findings[0].id;
+  const scm = { schema_version: 'v2', consensus_artifact_hash: art.consensus_artifact_hash,
+    scs: withScAttribution([{ id: 'SC-0', kind: 'fix', finding_ids: [fid0], change: 'c', holds: 'h', verify: VF('test', ['-f', 'a.ts']) }], art) };
+  const planB = buildFixPlan({ artifact: art, manifest: scm });
+  ok(!planB.degraded, 'plan 不应 degraded: ' + JSON.stringify(planB.reasons ?? []));
+  const plan = planB.plan;
+  const mkRunM = (sourceCandidate) => ({
+    schema_version: FR.RUN_MANIFEST_SCHEMA_VERSION, run_id: 'sc21pm', repo_dir: env.r,
+    fix_plan_hash: plan.fix_plan_hash, sc_manifest_hash: hashObject(scm),
+    source_artifact_hash: art.consensus_artifact_hash,
+    source_candidate: sourceCandidate, feature_branch: 'feat', integration_branch: 'fix/sc21pm/integration',
+    waves: [{
+      wave_index: 0, base: sourceCandidate, worktree_root: env.wtRoot,
+      allocations: [{ group_id: 'g1', sc_ids: ['SC-0'], write_paths: { mode: 'isolated' } }],
+      tips: [{ group_id: 'g1', tip: F }],
+      integrated_tip: finalTip, squash_commits: [finalTip], replan: null,
+      validation: { ok: true, results: [{ sc_id: 'SC-0', status: 'PASS', exit_code: 0, verify_digest: 'd'.repeat(64) }] }
+    }],
+    final_candidate: finalTip, events: [],
+    // SC-T8: 源 artifact 含 actionable findings → 批次协议必须启用。frozen_at_sha 由 run 起点
+    // 派生（= M，不是源 candidate S）；successor_sha = 最终集成 tip。
+    batch: {
+      batch_id: 'sc21pm', frozen_at_sha: sourceCandidate,
+      frozen_families: [...new Set((art.canonical_findings ?? []).map((c) => c.family_key).filter(Boolean))].sort(),
+      successor_sha: finalTip, status: 'closed'
+    }
+  });
+  const runM = mkRunM(M); // 起点前进到真祖先 merge（parent 含 S）
+  // 终版共识: base=S（与源一致）、candidate=finalTip，git 血缘检查在 env.r 内可过
+  const finalBundle = mkBundle(S, finalTip);
+  const finalArt = consensusFor(finalBundle, [{ round: 2 }, { round: 2 }, { round: 2 }], { parentArtifact: art, repoDir: env.r }).artifact;
+  const dispatchRecord = { fix_plan_hash: plan.fix_plan_hash, waves: [{ dispatches: [{ group_id: 'g1', worker_session_id: 'w0', tip: F, report: 'ok', result: mkResult(plan, 'g1') }] }] };
+  const fo = {
+    source_artifact_hash: art.consensus_artifact_hash,
+    sc_manifest_hash: hashObject(scm),
+    fix_plan_hash: plan.fix_plan_hash,
+    dispatch_record_hash: hashObject(dispatchRecord),
+    run_manifest_hash: FR.runManifestHash(runM)
+  };
+  const baseManifest = { repo: 'o/r', remote: 'origin', branch: 'feat', expected_sha: finalTip, purpose: 'feature', consensus_artifact_hash: finalArt.consensus_artifact_hash };
+  const call = (runM2) => checkPushGuard({
+    repoDir: env.r,
+    manifest: { ...baseManifest, fix_orchestration: { ...fo, run_manifest_hash: FR.runManifestHash(runM2) } },
+    artifact: finalArt, bundle: finalBundle, constitution,
+    sourceArtifact: art, scManifest: scm, fixPlan: plan, dispatchRecord,
+    runManifest: runM2
+  });
+  // 真祖先 merge 起点（M 的 parent 含 S）→ 放行
+  const rTrue = call(runM);
+  ok(rTrue.ok, 'sc-21-escape-hatch 修法 2: 起点前进到含源 candidate 的 merge 不算漂移，应放行: ' + rTrue.errors.join(';'));
+  // 任意前进起点（不存在/血缘外的 SHA）→ 仍拒（SC-R3-10）
+  const rArb = call(mkRunM('1'.repeat(40)));
+  ok(!rArb.ok && rArb.errors.some((e) => /起点漂移/.test(e)), '任意前进起点（无源 candidate 血缘）仍拒（SC-R3-10）');
+  // 普通直接子（单 parent == 源 candidate）不是 merge，仍算起点漂移
+  const rChild = call(mkRunM(F));
+  ok(!rChild.ok && rChild.errors.some((e) => /起点漂移/.test(e)), '普通直接子（单 parent==源）不得当作出路: ' + rChild.errors.join(';'));
 });
 
 // ========== 20. SC-11/SC-12/SC-13 ==========
@@ -5243,7 +5771,7 @@ t('[R2-F2] 跨波: wave1 建的软链不得让 wave2「改了依赖清单」被�
   // 阻断必须一路传到 finalize，不能只停在 validate（finalizeRun 的契约是**抛错**，不是返回 ok:false）
   let finThrew = null;
   try { FR.finalizeRun({ stateDir: env.stateDir, runId: 'r2f2' }); } catch (e) { finThrew = e.message; }
-  ok(finThrew && /未通过 orchestrator 复跑验证/.test(finThrew), 'finalizeRun 必须拒绝（validation.ok !== true → 抛错）: ' + finThrew);
+  ok(finThrew && /未通过 orchestrator 复跑验证|不可 flake 放行/.test(finThrew), 'finalizeRun 必须拒绝（validation.ok !== true → 抛错）: ' + finThrew);
 });
 
 t('[R2-F2] changedFiles 抛错时归 UNRUNNABLE，不归 runnable（算不出实改集就不敢判「依赖没变」）', () => {
@@ -6628,6 +7156,85 @@ console.log('\n[B2] size-gate 双闸（真实 git 仓）');
     rmSync(d2, { recursive: true, force: true });
   });
 
+  t('[B2-T8-1] git show 失败分「真缺文件」与「坏 ref/非 git」；后者 fail-closed 不回退 default', () => {
+    const { d, base } = mkRepo();
+    // 不存在的 merge-base → computeSizeReport 抛错（fail-closed，不得回退 default）
+    let threw = null;
+    try { computeSizeReport({ repoDir: d, baseRef: 'no-such-merge-base' }); } catch (e) { threw = e; }
+    ok(threw, '不存在的 merge-base 必须抛错');
+    ok(/fail-closed/.test(threw.message), `错误须标注 fail-closed: ${threw.message}`);
+    // 坏 ref 直入 loadSizeGateConfig（绕过 merge-base）→ 抛错
+    threw = null;
+    try { loadSizeGateConfig(d, 'd'.repeat(40)); } catch (e) { threw = e; }
+    ok(threw, '坏 ref 直入 loadSizeGateConfig 必须抛错');
+    // 非 git 仓 → 两个入口都抛错
+    const plain = mkdtempSync(join(tmpdir(), 'sg-notgit-'));
+    writeFileSync(join(plain, 'x.txt'), '1\n');
+    threw = null;
+    try { loadSizeGateConfig(plain, base); } catch (e) { threw = e; }
+    ok(threw, '非 git 仓 loadSizeGateConfig 必须抛错');
+    threw = null;
+    try { computeSizeReport({ repoDir: plain, baseRef: base }); } catch (e) { threw = e; }
+    ok(threw, '非 git 仓 computeSizeReport 必须抛错');
+    rmSync(plain, { recursive: true, force: true });
+    // 真缺文件仍是唯一 default 正例（合法仓 + 有效 ref + 树里确实没有 pr-rules.json）
+    eq(loadSizeGateConfig(d, base).source, 'default', '真缺文件仍回 default');
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  t('[B2-T8-2] 失败不伪装零测量：坏 ref/非 git/对象损坏只给非零错误，不产 config_source=default 或 counted_lines=0', () => {
+    // 坏 ref：抛错即无报告对象可消费，错误消息不得含报告字段伪装
+    const { d } = mkRepo();
+    for (const badRef of ['no-such-merge-base', 'd'.repeat(40)]) {
+      let threw = null;
+      try { computeSizeReport({ repoDir: d, baseRef: badRef }); } catch (e) { threw = e; }
+      ok(threw, `坏 ref=${badRef} 必须抛错`);
+      ok(!/config_source|counted_lines/.test(threw.message), `错误消息不得包含报告字段伪装: ${threw.message}`);
+    }
+    rmSync(d, { recursive: true, force: true });
+    // 对象读取失败（ref 有效、blob 权限拒绝）：verify 通过但 git show 失败 → fail-closed 抛错
+    if (typeof process.getuid !== 'function' || process.getuid() !== 0) {
+      const D2 = mkdtempSync(join(tmpdir(), 'sg-corrupt-'));
+      const g2 = (...a) => execFileSync('git', ['-C', D2, ...a], { encoding: 'utf8' }).trim();
+      g2('init', '-q', '-b', 'main'); g2('config', 'user.email', 'fx@t'); g2('config', 'user.name', 'fx');
+      mkdirSync(join(D2, 'agent-use/docs'), { recursive: true });
+      writeFileSync(join(D2, 'agent-use/docs/pr-rules.json'), JSON.stringify({ sizeGate: { budgetLines: 100 } }));
+      g2('add', '.'); g2('commit', '-qm', 'rules');
+      const ref2 = g2('rev-parse', 'HEAD');
+      const blob = g2('rev-parse', `${ref2}:agent-use/docs/pr-rules.json`);
+      const obj = join(D2, '.git/objects', blob.slice(0, 2), blob.slice(2));
+      chmodSync(obj, 0o000);
+      let threw = null;
+      try { loadSizeGateConfig(D2, ref2); } catch (e) { threw = e; }
+      chmodSync(obj, 0o644);
+      ok(threw, '对象读取失败（权限拒绝）必须 fail-closed 抛错');
+      ok(!/config_source|counted_lines/.test(threw.message), '对象失败错误不得伪装 default 或零计数');
+      rmSync(D2, { recursive: true, force: true });
+    }
+    // CLI 级：坏 ref → exit 3，stdout 无 config_source / counted_lines（只给非零错误）
+    const D3 = mkdtempSync(join(tmpdir(), 'sg-cli-badref-'));
+    const g3 = (...a) => execFileSync('git', ['-C', D3, ...a], { encoding: 'utf8' }).trim();
+    g3('init', '-q', '-b', 'main'); g3('config', 'user.email', 'fx@t'); g3('config', 'user.name', 'fx');
+    writeFileSync(join(D3, 'a.txt'), '1\n'); g3('add', '.'); g3('commit', '-qm', 'base');
+    let code = 0, out = '';
+    try { out = execFileSync(process.execPath, [join(S, 'size-gate.mjs'), '--repo-dir', D3, '--base', 'no-such-merge-base'], { encoding: 'utf8' }); }
+    catch (e) { code = e.status; out = e.stdout ?? ''; }
+    eq(code, 3, '坏 ref CLI 必须 exit 3');
+    ok(!out.includes('config_source') && !out.includes('counted_lines'), `CLI 失败 stdout 不得含报告字段: ${out.slice(0, 120)}`);
+    rmSync(D3, { recursive: true, force: true });
+    // 真缺文件 CLI 仍正常出报告（唯一 default 正例，exit 0 且计数真实）
+    const D4 = mkdtempSync(join(tmpdir(), 'sg-cli-ok-'));
+    const g4 = (...a) => execFileSync('git', ['-C', D4, ...a], { encoding: 'utf8' }).trim();
+    g4('init', '-q', '-b', 'main'); g4('config', 'user.email', 'fx@t'); g4('config', 'user.name', 'fx');
+    writeFileSync(join(D4, 'a.txt'), '1\n'); g4('add', '.'); g4('commit', '-qm', 'base');
+    const ref4 = g4('rev-parse', 'HEAD');
+    const okOut = execFileSync(process.execPath, [join(S, 'size-gate.mjs'), '--repo-dir', D4, '--base', ref4], { encoding: 'utf8' });
+    const parsed = JSON.parse(okOut);
+    eq(parsed.config_source, 'default', '真缺文件 CLI 仍走 default');
+    ok(Number.isInteger(parsed.counted_lines), '真缺文件有真实计数（非伪装零）');
+    rmSync(D4, { recursive: true, force: true });
+  });
+
   t('[B2-SC20+SC21] push-guard 终闸: 入口 PASS→修复轮膨胀→终版 STOP 拒 push;豁免绑 head 变更即失效', () => {
     const d = mkdtempSync(join(tmpdir(), 'sgpg-'));
     const g = (...a) => execFileSync('git', ['-C', d, ...a], { encoding: 'utf8' }).trim();
@@ -6767,6 +7374,48 @@ t('[D1-DC] 非法输入 fail-closed: seat/round 非法一律 throw，不产出�
     try { emitContract(bad); } catch { threw = true; }
     ok(threw, `非法输入必须 throw: ${JSON.stringify(bad)}`);
   }
+});
+
+t('[D1-DC] sc-29b CLI fail-closed: round>=2 未传 --parent → 非零退出且文案点名 --parent（emit 与 check 两入口）', () => {
+  const runDcCli = (args) => spawnSync(process.execPath, [join(S, 'dispatch-contract.mjs'), ...args], { encoding: 'utf8', timeout: 60_000 });
+  // 两条入口分别测（SC: 覆盖 emit 与 check）
+  const cases = [
+    ['--emit', ['--emit', 'claude-adversarial', '--round', '2']],
+    ['--check', ['--check', 'unused-file.json', '--seat', 'claude-adversarial', '--round', '2']]
+  ];
+  for (const [name, argv] of cases) {
+    const r = runDcCli(argv);
+    ok(r.status !== 0, `${name} round=2 无 --parent 必须非零退出（status=${r.status}）: ${r.stderr}`);
+    ok(r.stderr.includes('--parent'), `${name} 错误文案必须点名 --parent: ${r.stderr}`);
+    ok(r.stderr.includes('round=1') && r.stderr.includes('谱系根'), `${name} 必须提示只有 round=1（谱系根）才可不传: ${r.stderr}`);
+    ok(!r.stdout.includes('DISPATCH-CONTRACT-OK') && !r.stdout.includes('机器契约段'), `${name} fail-closed 不得产出半成品契约: ${r.stdout}`);
+  }
+  // 正向对照: round=1 不带 --parent 照常可用（谱系根合法路径不被误伤）
+  const r1 = runDcCli(['--emit', 'claude-adversarial', '--round', '1']);
+  eq(r1.status, 0, 'round=1 无 --parent 必须照常 exit 0');
+  ok(r1.stdout.includes('本轮是 round=1（谱系根'), 'round=1 契约段保留谱系根说明');
+  // 正向对照: round>=2 带 --parent 照常可用（合法路径不被误伤）
+  const K1 = familyKeyOf('SC-29b 夹具不变量');
+  const pf = join(vvTmp, 'dc-sc29b-parent.json');
+  writeFileSync(pf, JSON.stringify({ canonical_findings: [{ family_key: K1, invariant: 'SC-29b 夹具不变量' }] }));
+  const r2 = runDcCli(['--emit', 'claude-adversarial', '--round', '2', '--parent', pf]);
+  eq(r2.status, 0, 'emit round=2 带 --parent 必须照常 exit 0，stderr=' + r2.stderr);
+  ok(r2.stdout.includes('known_families_digest='), 'round=2 契约段必须含 known families digest');
+  ok(r2.stdout.includes('SC-29b 夹具不变量'), 'round=2 契约段必须含 parent 派生的 family invariant');
+  // check 入口正向: round>=2 带 --parent 照常可用
+  const cf = join(vvTmp, 'dc-sc29b-pkg.md');
+  writeFileSync(cf, emitContract({ seat: 'claude-adversarial', round: 2, parentArtifact: { canonical_findings: [{ family_key: K1, invariant: 'SC-29b 夹具不变量' }] } }));
+  const r3 = runDcCli(['--check', cf, '--seat', 'claude-adversarial', '--round', '2', '--parent', pf]);
+  eq(r3.status, 0, 'check round=2 带 --parent 必须照常 exit 0，stderr=' + r3.stderr);
+  ok(r3.stdout.includes('DISPATCH-CONTRACT-OK'), 'check 正向必须 OK: ' + r3.stdout);
+});
+
+t('[D1-DC] round 非整数 fail-closed: --round 2.5 缺 --parent → 报 round 非法而非误导性 --parent 文案', () => {
+  const runDcCli = (args) => spawnSync(process.execPath, [join(S, 'dispatch-contract.mjs'), ...args], { encoding: 'utf8', timeout: 60_000 });
+  const r = runDcCli(['--emit', 'claude-adversarial', '--round', '2.5']);
+  ok(r.status !== 0, `非整数 round 必须非零退出（status=${r.status}）: ${r.stderr}`);
+  ok(r.stderr.includes('round 非法'), `错误文案必须点名 round 非法（来自 contractSpec）: ${r.stderr}`);
+  ok(!r.stderr.includes('必须传 --parent'), `非整数 round 不该先被 --parent 门拦下（会误导用户补 --parent 后仍撞 round 校验）: ${r.stderr}`);
 });
 
 // ── D2: PR 格式确定性预检 ──
@@ -7480,7 +8129,7 @@ try {
   const L1 = gD('rev-parse', 'HEAD');
   writeFileSync(join(rD, 'app.ts'), 'v3\\n'); gD('add', '.'); gD('commit', '-qm', 'fix');
   const L2 = gD('rev-parse', 'HEAD');
-  const bundle = (b, c) => ({ base_sha: b, candidate_sha: c, pr_title: 't', pr_body: 'b', touches_ui: false, matched_paths: [], ui_registry_config_hash: 'c'.repeat(64), pr_context_digest: 'd'.repeat(64) });
+  const bundle = (b, c) => ({ base_sha: b, candidate_sha: c, pr_title: 't', pr_body: 'b', touches_ui: false, matched_paths: [], ui_registry_config_hash: 'c'.repeat(64), ui_registry_receipt: { path: 'scripts/ui-paths/registry.pr-autopilot.json', config_hash: 'c'.repeat(64), source_sha: L0, repo: 'PraiseZhu/pr-autopilot' }, pr_context_digest: 'd'.repeat(64) });
   const FULL_FACES = ['A','B','C','D','E','F','G'].map((f) => ({ face: f, result: f === 'B' ? 'n_a' : 'pass', evidence: f + ' 面走查完成' }));
   const THIRD_FACES = ['D','E','F','G'].map((f) => ({ face: f, result: 'pass', evidence: f + ' 面走查完成' }));
   const THIRD_GATES = ['format-gate','rule-compliance','security-privacy-gate','product-arch-gate'].map((g) => ({ gate_id: g, result: 'pass', evidence: g + ' 走查完成' }));

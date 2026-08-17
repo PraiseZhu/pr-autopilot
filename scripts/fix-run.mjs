@@ -416,7 +416,68 @@ export function validateVerifyRecipe(v) {
   if (!Array.isArray(v.args) || v.args.some((a) => typeof a !== 'string')) return 'verify.args 必须是字符串数组';
   return null;
 }
-export function verifyDigest(v) { return sha256(canonicalJson({ cmd: v.cmd, args: v.args })); }
+// issue #21（sc-base-lock-and-verify-context，2026-08-17）: verify digest 必须绑定运行上下文。
+// 旧形态只绑 cmd+args——同一命令在不同树（不同 integrated_tip / 不同 run 起点）上是两个不同
+// 的验证事件，却算出同一个 digest，为「跨树消重」提供了错误前提。本批把上下文（run 起点
+// source_candidate、波 base、集成树 integrated_tip）并入 digest：
+//   · 同 wave 同树同命令 → 相同 digest → 允许消重（sc-21-verify-dedupe-or-filter）
+//   · 异树（内容不同但 cmd+args 相同）→ digest 不同 → 必须各跑一次，不得消重
+// base 锁说明: sc-base-lock 的「开工锁 0aa0410」是计划期对 origin/main 的锁，本组实际 base 是
+// wave 1 集成点 e833052——ctx 里写入的是 **本 run 当前** 的 source_candidate / base /
+// integrated_tip，绝不把 origin/main 硬重置回计划期锁值。
+export function verifyContext(m, ws) {
+  return {
+    source_candidate: m.source_candidate,
+    base: ws?.base ?? null,
+    integrated_tip: ws?.integrated_tip ?? null
+  };
+}
+export function verifyDigest(v, ctx) {
+  return sha256(canonicalJson({ cmd: v.cmd, args: v.args, ...(ctx ?? {}) }));
+}
+
+// ---- issue #21（sc-21-escape-hatch / sc-21-bootstrap-disposition）: finalize 出路判定 ----
+// 背景: 批次协议把 run 起点钉死在源共识 candidate 上（SC-R3-10），被验证树若含偶发红缺陷，
+// validate 永远无法确定性通过（PR #19 round 3 实据: 十条 SC 同一 verify 命令、同命令同树、
+// 失败点漂移）。出路 = 在确定性验证之外、允许 finalize 放行的有限豁免。本批（lead 拍板）:
+//   · 保留真祖先 merge（issue 修法 2）——被验证树是 merge 且某 parent == 源 candidate，
+//     树仍挂在源 candidate 血缘上，不算「任意前进」；
+//   · 保留已登记 flake + 构造性归因（issue 修法 3）——失败 SC 在 flake 台账登记且归因是
+//     确定性机制描述（不是「重试三次就过」）；
+//   · 拒 BOOTSTRAP 作为出路（本批新增的第四种候选形态，lead 明令拒绝）;
+//   · 拒任意前进——merge 的 parent 不含源 candidate；
+//   · 未知出路类型一律拒（fail-closed）。
+// 本函数是出路判定的**唯一裁决点**（消重/按名过滤二取一之外的判据收敛点），fixture 直接
+// 断言其输出；validateIntegration（修法 3 接线）与 push-guard（修法 2 接线）分别消费。
+// 构造性归因判据（T1 级，可机器判定）: 非空、长度 ≥ 40 字符、且不含重试/运气类空洞措辞。
+export function attributionConstructive(a) {
+  if (typeof a !== 'string' || a.trim().length < 40) return false;
+  if (/重试|retry|再试|多跑|多试|重跑|rerun|碰运气|运气好|再碰/i.test(a)) return false;
+  return true;
+}
+export function escapeEligible({ kind, parents = [], sourceCandidate = null, attribution = '' }) {
+  if (kind === 'true-ancestor-merge') {
+    // merge commit 必须 ≥2 parent。单 parent 的普通直接子也会「parent 含源 candidate」，
+    // 若放行就把起点漂移当成出路，后续 DAG 窗从错误 tip 算起（GPT 单审 P1）。
+    if (!sourceCandidate || parents.length < 2 || !parents.includes(sourceCandidate)) {
+      return { ok: false, reason: `真祖先 merge 必须是 merge commit（≥2 parent）且 parent 含源 candidate（parents=[${parents.join(', ')}]，源=${sourceCandidate?.slice?.(0, 8) ?? '无'}）——单 parent 或未含源即任意前进，拒（sc-21-escape-hatch）` };
+    }
+    return { ok: true, reason: '真祖先 merge: ≥2 parent 且某 parent == 源 candidate，树仍挂在源 candidate 血缘上（issue #21 修法 2）' };
+  }
+  if (kind === 'flake-registered') {
+    if (!attributionConstructive(attribution)) {
+      return { ok: false, reason: 'flake 登记缺构造性归因（空洞/重试次数类不算）——拒（sc-21-escape-hatch）' };
+    }
+    return { ok: true, reason: '已登记 flake + 构造性归因（issue #21 修法 3）' };
+  }
+  if (kind === 'arbitrary-advance') {
+    return { ok: false, reason: '任意前进不是出路——merge 的 parent 不含源 candidate，树未挂在源 candidate 血缘上（sc-21-escape-hatch）' };
+  }
+  if (kind === 'bootstrap') {
+    return { ok: false, reason: 'BOOTSTRAP 不作为 finalize 出路（本批拒，sc-21-bootstrap-disposition）' };
+  }
+  return { ok: false, reason: `未知出路类型 ${JSON.stringify(kind)}（fail-closed，sc-21-escape-hatch）` };
+}
 
 // ---- D8（owner 2026-08-03 授权）: 选中数闸门——「PASS」必须建立在真的跑了用例之上 ----
 // 根因: vitest 对 `-t <无匹配>` 的处理是 **skip 全部用例并 exit 0**（`--passWithNoTests` 只
@@ -698,7 +759,7 @@ export function probeVitestSelection({ verify, wt }) {
   }
 }
 
-export function validateIntegration({ stateDir, runId, scManifest, waveIndex, runner = null, selectionProbe = null }) {
+export function validateIntegration({ stateDir, runId, scManifest, waveIndex, runner = null, selectionProbe = null, flakeRegistry = null }) {
   const { path, m } = loadRun(stateDir, runId);
   if (hashObject(scManifest) !== m.sc_manifest_hash) {
     throw new Error('sc manifest 与 run 绑定的 sc_manifest_hash 不符（SC-R3-3: 换/改 manifest 造 vacuous PASS 被拦）');
@@ -718,23 +779,47 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
   const depPrep = prepareDependencies({ repoDir: m.repo_dir, wt, sourceCandidate: m.source_candidate, integratedTip: ws.integrated_tip });
   const wtHasModules = existsSync(join(wt, 'node_modules'));
 
+  // issue #21（sc-21-escape-hatch 修法 3）: flake 登记是可选参数，显式传才生效（与 i9-batch
+  // 的 --batch opt-in 同模式）；形状非法 fail-closed，不留静默旁路。
+  if (flakeRegistry !== null && flakeRegistry !== undefined) {
+    if (!flakeRegistry || typeof flakeRegistry !== 'object' || Array.isArray(flakeRegistry) || !Array.isArray(flakeRegistry.entries)) {
+      throw new Error('flakeRegistry 必须形如 { entries: [{ sc_id, tree_sha, digest, attribution }] }（fail-closed，issue #21）');
+    }
+  }
+
   const results = [];
+  const ctx = verifyContext(m, ws);
+  // issue #21（sc-21-verify-dedupe-or-filter）: 同 wave 内相同 digest 的 SC 共享**一次**执行
+  // 与测量——PR #19 round 3 的「十条 SC 同一 verify 命令」从十次独立掷骰收敛为一次判定。
+  // digest 已含 integrated_tip / base / source_candidate（sc-base-lock-and-verify-context），
+  // 异树（内容不同但 cmd+args 相同）digest 不同 → 组间仍各执行一次，绝不跨树消重。
+  const groups = new Map();
   for (const id of scIds) {
     const sc = byId.get(id);
     const recipeErr = validateVerifyRecipe(sc.verify);
     if (recipeErr) throw new Error(`SC ${id}: ${recipeErr}`);
+    const d = verifyDigest(sc.verify, ctx);
+    if (!groups.has(d)) groups.set(d, { ids: [], verify: sc.verify });
+    groups.get(d).ids.push(id);
+  }
+  for (const [digest, group] of groups) {
+    const v0 = group.verify; // 同 digest ⇒ 组内 verify 的 cmd+args 全同（上下文已入 digest）
     if (depPrep.unrunnable) {
       // D7 确定性分类①: 已知我们主动跳过了依赖准备（候选改了依赖清单），不是猜的。
       // UNRUNNABLE 与 FAIL 分开报但同等阻断（下方 ok 判定对两者一视同仁，不得把
       // UNRUNNABLE 排除在 every(PASS) 之外）。
-      results.push({ sc_id: id, status: 'UNRUNNABLE', exit_code: null, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(''), stdout_bytes: 0, note: depPrep.reason });
+      for (const id of group.ids) {
+        results.push({ sc_id: id, status: 'UNRUNNABLE', exit_code: null, verify_digest: digest, stdout_sha256: sha256(''), stdout_bytes: 0, note: depPrep.reason });
+      }
       continue;
     }
-    if (DEP_TOOLCHAIN_CMDS.has(sc.verify.cmd) && !wtHasModules) {
+    if (DEP_TOOLCHAIN_CMDS.has(v0.cmd) && !wtHasModules) {
       // D7 确定性分类②: recipe 明确要用 npx/npm/yarn/pnpm，但 worktree 里确实没有
       // node_modules（无论是主仓也没有、还是软链已尝试但仍不存在）——这是对命令语义的
       // 确定性判断，不是「exit!=0 且 stdout 空」那种启发式猜测。
-      results.push({ sc_id: id, status: 'UNRUNNABLE', exit_code: null, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(''), stdout_bytes: 0, note: `verify.cmd="${sc.verify.cmd}" 依赖 node 工具链，但 worktree 无 node_modules（主仓亦无可链入的依赖）——未尝试执行，避免落一个无意义的原生报错` });
+      for (const id of group.ids) {
+        results.push({ sc_id: id, status: 'UNRUNNABLE', exit_code: null, verify_digest: digest, stdout_sha256: sha256(''), stdout_bytes: 0, note: `verify.cmd="${v0.cmd}" 依赖 node 工具链，但 worktree 无 node_modules（主仓亦无可链入的依赖）——未尝试执行，避免落一个无意义的原生报错` });
+      }
       continue;
     }
     // SC-R5-TIMING-1（issue #19 round 5，三席共识 PoC）: 文件身份判据必须在主跑
@@ -748,12 +833,12 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
     // 实际执行 verify 的同一个 cwd 变量（空间同源上一轮已做到，本轮加时间同源）。词法未
     // 命中的 recipe 本函数纯字符串早退、零文件系统开销；非 PASS 的 SC 该结论不消费，
     // 「FAIL/UNRUNNABLE 不测量」的既有行为逐字不变。
-    const preIdent = nodeEntryEligible(sc.verify, wt);
+    const preIdent = nodeEntryEligible(v0, wt);
     let exitCode = 0, stdout = '';
     try {
       stdout = runner
-        ? runner(sc.verify, wt)
-        : execFileSync(sc.verify.cmd, sc.verify.args, {
+        ? runner(v0, wt)
+        : execFileSync(v0.cmd, v0.args, {
             // 主跑执行点 maxBuffer 承重（sc-1a）: 本分支直接消费主跑 stdout 做 summary 行级测量，
             // 默认 1MB 上限若截断会把尾部 summary 弄丢 → 测量从 pass 静默退化成 unmeasured，
             // 或 ENOBUFS 被归一成 exitCode=1 误判 FAIL。16MiB 比本仓五个入口实测 stdout 量级
@@ -769,15 +854,16 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
     }
     // 凭证不落库红线: 只存 exit + 摘要 hash，不存原始输出
     const status = exitCode === 0 ? 'PASS' : 'FAIL';
-    const entry = { sc_id: id, status, exit_code: exitCode, verify_digest: verifyDigest(sc.verify), stdout_sha256: sha256(String(stdout)), stdout_bytes: Buffer.byteLength(String(stdout)) };
+    // 组级执行结果（消重共享）: 同 digest 组只执行/测量一次，组内每 SC 复制同一结果
+    const groupEntry = { status, exit_code: exitCode, verify_digest: digest, stdout_sha256: sha256(String(stdout)), stdout_bytes: Buffer.byteLength(String(stdout)) };
     // D7: exit≠0 且 stdout 为空只是**提示**，不是判据——真实测试失败也可能 stdout 为空
     // （有些 runner 只写 stderr），不得据此改判 UNRUNNABLE，只在 note 里给排查方向。
-    if (status === 'FAIL' && entry.stdout_bytes === 0) {
-      entry.note = '退出非零且 stdout 为空——疑似环境问题（如 worktree 缺 node_modules、命令找不到），也可能是真实测试失败但输出全落在 stderr；请先查 worktree 运行环境再确认是否为真实失败';
+    if (status === 'FAIL' && groupEntry.stdout_bytes === 0) {
+      groupEntry.note = '退出非零且 stdout 为空——疑似环境问题（如 worktree 缺 node_modules、命令找不到），也可能是真实测试失败但输出全落在 stderr；请先查 worktree 运行环境再确认是否为真实失败';
     }
     // D8 选中数闸门: 只在「主记录判 PASS」时才有意义——FAIL/UNRUNNABLE 已经阻断了，
-    // 再测选中数不改变结论、白花一次运行。
-    if (entry.status === 'PASS') {
+    // 再测选中数不改变结论、白花一次运行。测量是组级（同 digest 共享同一执行，结果一致）。
+    if (groupEntry.status === 'PASS') {
       // R4-IDENT（SC-R4-IDENT-1）+ SC-R5-TIMING-1: 唯一写入者不变——是否进入 D8-node
       // summary 测量的授权只经 nodeEntryEligible 一处（词法白名单 + 文件身份两个子判据
       // 在其内部串联）。**授权决定来自 exec 前那次判定**（上方 preIdent，与主跑消费同一
@@ -813,70 +899,98 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
         if (matches.length === 1) {
           const passed = Number(matches[0][1]), failed = Number(matches[0][2]);
           const selected = passed + failed;
-          entry.selected_tests = selected;
+          groupEntry.selected_tests = selected;
           if (selected === 0) {
-            entry.status = 'VACUOUS';
-            entry.selection_gate = 'fail';
-            entry.note = [entry.note, 'D8-node 选中数闸门: 已登记 fixture 入口本轮选中 0 个用例却 exit 0（summary 为 0 passed, 0 failed 形态）——它对该 SC 的交付物零约束，不得记 PASS'].filter(Boolean).join(' | ');
+            groupEntry.status = 'VACUOUS';
+            groupEntry.selection_gate = 'fail';
+            groupEntry.note = [groupEntry.note, 'D8-node 选中数闸门: 已登记 fixture 入口本轮选中 0 个用例却 exit 0（summary 为 0 passed, 0 failed 形态）——它对该 SC 的交付物零约束，不得记 PASS'].filter(Boolean).join(' | ');
           } else {
-            entry.selection_gate = 'pass';
-            entry.selection_reason = `已登记 fixture 入口 stdout summary 恰好一行，selected=${selected}（passed=${passed}, failed=${failed}）`;
+            groupEntry.selection_gate = 'pass';
+            groupEntry.selection_reason = `已登记 fixture 入口 stdout summary 恰好一行，selected=${selected}（passed=${passed}, failed=${failed}）`;
           }
         } else if (matches.length === 0) {
-          entry.selected_tests = null;
-          entry.selection_gate = 'unmeasured';
-          entry.selection_reason = '已登记 fixture 入口但主跑 stdout 无 summary 行（0 行匹配），维持 unmeasured 不阻断';
+          groupEntry.selected_tests = null;
+          groupEntry.selection_gate = 'unmeasured';
+          groupEntry.selection_reason = '已登记 fixture 入口但主跑 stdout 无 summary 行（0 行匹配），维持 unmeasured 不阻断';
         } else {
-          entry.selected_tests = null;
-          entry.selection_gate = 'unmeasured';
-          entry.selection_reason = `已登记 fixture 入口但主跑 stdout 出现 ${matches.length} 行 summary 匹配，解析歧义，维持 unmeasured 不阻断`;
+          groupEntry.selected_tests = null;
+          groupEntry.selection_gate = 'unmeasured';
+          groupEntry.selection_reason = `已登记 fixture 入口但主跑 stdout 出现 ${matches.length} 行 summary 匹配，解析歧义，维持 unmeasured 不阻断`;
         }
       } else if (nsel.stage === 'identity') {
-        // 词法命中已登记入口、但操作数路径上的文件不是白名单入口本体（symlink 冒充 /
-        // 缺失 / realpath 失败）→ 不采信该路径上的 summary，fail-open 到 unmeasured
-        // （漏测而非假 PASS，与「多参数 / 未登记入口」方向一致）。reason 只写结构化事实
-        // （R4-IDENT 天花板: 对稳定、无意的 symlink 配置提供过滤价值，不构成对抗性候选
-        // 完整性证明——内容维由测试自身 + 宿主级签名闭合，见 nodeEntryIdentity 注释）。
-        entry.selected_tests = null;
-        entry.selection_gate = 'unmeasured';
-        entry.selection_reason = nsel.reason;
+        // issue #21（sc-21-cli-realpath-isolation）: 身份失败从 fail-open 收紧为 fail-closed。
+        // 三例（symlink/realpath 不一致、realpath 解析失败、父目录 symlink）**不得 finalize
+        // PASS**。旧语义是 unmeasured 放行（「漏测而非假 PASS」）；本批收紧的实据: 消重机制
+        // 让一次冒充执行被多条 SC 共享，fail-open 的放行危害成倍放大——decoy 树以
+        // PASS+unmeasured 形态走完 finalize，闸门形同虚设。收窄为: 词法命中白名单但文件身份
+        // 不可信 → UNRUNNABLE + gate=blocked，整波阻断（漏测不再是可接受终态）。词法未命中
+        // （未登记入口）仍维持 unmeasured 不阻断（那是合法形态，不是冒充）。reason 只写
+        // 结构化事实（R4-IDENT 天花板: 内容维仍由测试自身 + 宿主级签名闭合）。
+        groupEntry.status = 'UNRUNNABLE';
+        groupEntry.selected_tests = null;
+        groupEntry.selection_gate = 'blocked';
+        groupEntry.note = [groupEntry.note, `D8-node 身份闸 fail-closed（issue #21）: ${nsel.reason}`].filter(Boolean).join(' | ');
       } else {
-        const sel = vitestSelectionApplies(sc.verify);
+        const sel = vitestSelectionApplies(v0);
         if (!sel.applies) {
-          entry.selected_tests = null;
-          entry.selection_gate = 'unmeasured';
+          groupEntry.selected_tests = null;
+          groupEntry.selection_gate = 'unmeasured';
           // 刻意**不**写进 note: D7-③ 的既有契约是「正常 PASS 不带诊断 note」，note 专供
           // 需要人去排查的异常。本条是闸门自身的覆盖边界声明，属常态，走独立字段。
           // sc-1e: 收窄后边界如实声明——node 侧只有已登记 fixture 入口的单行 summary 可解析，
           // 未登记 node 入口 / 多行 summary / own-prs.fixture.mjs / 其他 runner 仍为 T1 洞。
-          entry.selection_reason = `${sel.reason}。如实声明: 本闸门只覆盖已识别 vitest recipe 与已登记 fixture 入口（fixtures/run-fixtures.mjs, fixtures/i9-core.mjs, fixtures/i9-verdict.mjs, fixtures/i9-docs.mjs, fixtures/i9-batch.mjs）的单行 summary；未登记 node 入口、多行 summary、own-prs.fixture.mjs（只打印 all pass 无数字 summary）、以及其他 runner 仍为 T1 洞（换 runner / 换入口 / 抑制 summary 即绕过）`;
+          groupEntry.selection_reason = `${sel.reason}。如实声明: 本闸门只覆盖已识别 vitest recipe 与已登记 fixture 入口（fixtures/run-fixtures.mjs, fixtures/i9-core.mjs, fixtures/i9-verdict.mjs, fixtures/i9-docs.mjs, fixtures/i9-batch.mjs）的单行 summary；未登记 node 入口、多行 summary、own-prs.fixture.mjs（只打印 all pass 无数字 summary）、以及其他 runner 仍为 T1 洞（换 runner / 换入口 / 抑制 summary 即绕过）`;
         } else if (sel.blocked) {
-          entry.status = 'UNRUNNABLE';
-          entry.selected_tests = null;
-          entry.selection_gate = 'blocked';
-          entry.note = [entry.note, `D8 选中数闸门 fail-closed: ${sel.reason}`].filter(Boolean).join(' | ');
+          groupEntry.status = 'UNRUNNABLE';
+          groupEntry.selected_tests = null;
+          groupEntry.selection_gate = 'blocked';
+          groupEntry.note = [groupEntry.note, `D8 选中数闸门 fail-closed: ${sel.reason}`].filter(Boolean).join(' | ');
         } else {
-          const selected = selectionProbe ? selectionProbe(sc.verify, wt) : probeVitestSelection({ verify: sc.verify, wt });
-          entry.selected_tests = selected;
+          const selected = selectionProbe ? selectionProbe(v0, wt) : probeVitestSelection({ verify: v0, wt });
+          groupEntry.selected_tests = selected;
           if (selected === null) {
-            entry.status = 'UNRUNNABLE';
-            entry.selection_gate = 'unmeasurable';
-            entry.note = [entry.note, 'D8 选中数闸门 fail-closed: 探针未能产出/解析 vitest json 报告，无法确认本条 verify 真的跑了用例——不允许在测不出选中数时记 PASS'].filter(Boolean).join(' | ');
+            groupEntry.status = 'UNRUNNABLE';
+            groupEntry.selection_gate = 'unmeasurable';
+            groupEntry.note = [groupEntry.note, 'D8 选中数闸门 fail-closed: 探针未能产出/解析 vitest json 报告，无法确认本条 verify 真的跑了用例——不允许在测不出选中数时记 PASS'].filter(Boolean).join(' | ');
           } else if (selected === 0) {
-            entry.status = 'VACUOUS';
-            entry.selection_gate = 'fail';
-            entry.note = [entry.note, 'D8 选中数闸门: 本条 verify 选中 0 个用例却 exit 0（vitest 对 -t 无匹配即 skip 全部并 exit 0）——它对该 SC 的交付物零约束，不得记 PASS。请把过滤词改成能选中本 SC 自己用例的值（约定: 过滤词 = 该 SC 的 id，且测试 describe 标题带该 id）'].filter(Boolean).join(' | ');
+            groupEntry.status = 'VACUOUS';
+            groupEntry.selection_gate = 'fail';
+            groupEntry.note = [groupEntry.note, 'D8 选中数闸门: 本条 verify 选中 0 个用例却 exit 0（vitest 对 -t 无匹配即 skip 全部并 exit 0）——它对该 SC 的交付物零约束，不得记 PASS。请把过滤词改成能选中本 SC 自己用例的值（约定: 过滤词 = 该 SC 的 id，且测试 describe 标题带该 id）'].filter(Boolean).join(' | ');
           } else {
-            entry.selection_gate = 'pass';
+            groupEntry.selection_gate = 'pass';
           }
         }
       }
     }
-    results.push(entry);
+    // 消重核心: 组内每 SC 共享同一执行结果（sc_id 不同），undefined 键不落（保持既有形状）
+    for (const id of group.ids) {
+      const entry = {
+        sc_id: id, status: groupEntry.status, exit_code: groupEntry.exit_code,
+        verify_digest: digest, stdout_sha256: groupEntry.stdout_sha256, stdout_bytes: groupEntry.stdout_bytes,
+        ...(groupEntry.note !== undefined ? { note: groupEntry.note } : {}),
+        ...(groupEntry.selected_tests !== undefined ? { selected_tests: groupEntry.selected_tests } : {}),
+        ...(groupEntry.selection_gate !== undefined ? { selection_gate: groupEntry.selection_gate } : {}),
+        ...(groupEntry.selection_reason !== undefined ? { selection_reason: groupEntry.selection_reason } : {})
+      };
+      // issue #21（sc-21-escape-hatch 修法 3）: 已登记 flake + 构造性归因 → 该 SC 放行并在
+      // validate 输出显式标注（哪条 SC 走了登记一眼可见）。命中条件: sc_id + tree_sha
+      // （必须 == 本波集成树）+ digest（含上下文的完整 digest）全匹配，且 attribution 通过
+      // attributionConstructive（不是「重试三次就过」的空洞声明）。
+      if (entry.status === 'FAIL' && flakeRegistry) {
+        const hit = flakeRegistry.entries.find((e) => e.sc_id === id && e.tree_sha === ws.integrated_tip && e.digest === digest && attributionConstructive(e.attribution));
+        if (hit) {
+          entry.status = 'FLAKE';
+          entry.selection_gate = 'flake-registered';
+          entry.note = [entry.note, `已登记 flake + 构造性归因（issue #21 修法 3，本 SC 验证失败按登记放行）: ${hit.attribution.slice(0, 140)}`].filter(Boolean).join(' | ');
+        }
+      }
+      results.push(entry);
+    }
   }
-  const ok = results.every((r) => r.status === 'PASS');
+  // issue #21: FLAKE = 已登记 flake 的失败（修法 3），与 PASS 同等计入通过；其余非 PASS 阻断
+  const ok = results.every((r) => r.status === 'PASS' || r.status === 'FLAKE');
   ws.validation = { at: nowIso(), ok, results };
-  appendEvent(m, { kind: 'wave-validated', wave: waveIndex, ok, failed: results.filter((r) => r.status !== 'PASS').map((r) => r.sc_id) });
+  appendEvent(m, { kind: 'wave-validated', wave: waveIndex, ok, failed: results.filter((r) => r.status !== 'PASS' && r.status !== 'FLAKE').map((r) => r.sc_id) });
   saveManifest(path, m);
   return { ok, results, manifest: m };
 }
@@ -886,12 +1000,40 @@ export function validateIntegration({ stateDir, runId, scManifest, waveIndex, ru
 // （R3-P2 实证）。现在主 checkout 零接触，前推分两种：feature branch 正被检出 →
 // merge --ff-only（squash 链的 parent 就是旧 tip，天然 fast-forward，工作区同步且 clean）；
 // 未检出 → branch -f。工作区不 clean 一律 fail-closed。
-export function finalizeRun({ stateDir, runId }) {
+export function finalizeRun({ stateDir, runId, flakeRegistry = null }) {
   const { path, m } = loadRun(stateDir, runId);
   const last = m.waves[m.waves.length - 1];
   if (!last?.integrated_tip) throw new Error('最后一波尚未集成，不能 finalize');
+  // issue #21（sc-21-escape-hatch 修法 3 的 finalize 侧兜底）: validate 未收到 flakeRegistry
+  // 而 finalize 收到时，validation.ok=false 的波可经「失败 SC 全部命中 flake 登记 + 构造性
+  // 归因」放行（escapeEligible 统一裁决）；任一失败 SC 未命中 → 照旧拒（fail-closed）。
+  // 与 validate 层 FLAKE 是同一套判据（sc_id + tree_sha + digest 全匹配）的两个消费点。
+  if (flakeRegistry !== null && flakeRegistry !== undefined) {
+    if (!flakeRegistry || typeof flakeRegistry !== 'object' || Array.isArray(flakeRegistry) || !Array.isArray(flakeRegistry.entries)) {
+      throw new Error('flakeRegistry 必须形如 { entries: [{ sc_id, tree_sha, digest, attribution }] }（fail-closed，issue #21）');
+    }
+  }
   for (const [i, w] of m.waves.entries()) {
-    if (!w.validation?.ok) throw new Error(`wave${i + 1} 未通过 orchestrator 复跑验证（fail-closed）`);
+    if (!w.validation?.ok) {
+      // 出路判定（issue #21）: 失败 SC 全部命中登记 → 该波经 flake 出路放行，事件留痕；
+      // 否则维持「未通过 orchestrator 复跑验证」拒（fail-closed）。
+      // flake 出路只吃 FAIL（与 validate 层只把 FAIL 标成 FLAKE 对齐）。
+      // UNRUNNABLE / VACUOUS / blocked 是身份闸或空验证，不是偶发红，登记不得放行（GPT 单审 P1）。
+      const results = w.validation?.results ?? [];
+      const failed = results.filter((r) => r.status === 'FAIL');
+      const nonFlakeable = results.filter((r) => r.status !== 'PASS' && r.status !== 'FLAKE' && r.status !== 'FAIL');
+      if (nonFlakeable.length > 0) {
+        throw new Error(`wave${i + 1} 含不可 flake 放行的状态 ${nonFlakeable.map((r) => `${r.sc_id}=${r.status}`).join(', ')}（UNRUNNABLE/VACUOUS/身份闸不得经 flake 登记 finalize，fail-closed）`);
+      }
+      if (flakeRegistry && failed.length > 0 && failed.every((r) => {
+        const hit = flakeRegistry.entries.find((e) => e.sc_id === r.sc_id && e.tree_sha === w.integrated_tip && e.digest === r.verify_digest);
+        return !!hit && attributionConstructive(hit.attribution) && escapeEligible({ kind: 'flake-registered', attribution: hit.attribution }).ok;
+      })) {
+        appendEvent(m, { kind: 'wave-escape-flake', wave: i, sc_ids: failed.map((r) => r.sc_id), via: 'flake-registered' });
+        continue;
+      }
+      throw new Error(`wave${i + 1} 未通过 orchestrator 复跑验证（fail-closed）`);
+    }
     // SC-T2（2026-08-08，GPT 席执行注记）：reader 侧硬化——finalizeRun 读到持久化 manifest 中
     // {ok:true, results:[]} 该形状时拒绝（空 results 上 results.every 恒 true，ok:true 是自报
     // 摘要，不是逐项证据；文案限定「finalizeRun 读到该形状时拒绝」，不泛化为防所有手改 manifest）。
@@ -1027,12 +1169,12 @@ if (isMain(import.meta.url)) {
       process.exit(r.ok ? 0 : 1);
     } else if (mode === 'validate') {
       need(['state-dir', 'run-id', 'sc-manifest', 'wave']);
-      const r = validateIntegration({ stateDir: args['state-dir'], runId: args['run-id'], scManifest: readJson(args['sc-manifest']), waveIndex: Number(args.wave) });
+      const r = validateIntegration({ stateDir: args['state-dir'], runId: args['run-id'], scManifest: readJson(args['sc-manifest']), waveIndex: Number(args.wave), flakeRegistry: args['flake-registry'] ? readJson(args['flake-registry']) : null });
       process.stdout.write(JSON.stringify({ ok: r.ok, results: r.results }, null, 2) + '\n');
       process.exit(r.ok ? 0 : 1);
     } else if (mode === 'finalize') {
       need(['state-dir', 'run-id']);
-      const r = finalizeRun({ stateDir: args['state-dir'], runId: args['run-id'] });
+      const r = finalizeRun({ stateDir: args['state-dir'], runId: args['run-id'], flakeRegistry: args['flake-registry'] ? readJson(args['flake-registry']) : null });
       process.stdout.write(JSON.stringify({ ok: true, final_candidate: r.final_candidate, run_manifest_hash: runManifestHash(r.manifest) }) + '\n');
     } else if (mode === 'cleanup') {
       // SC-R3-1: 回收对象只从 run manifest 枚举，caller 不再传 worktree-root/plan

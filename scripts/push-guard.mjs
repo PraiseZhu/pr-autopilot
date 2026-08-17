@@ -26,7 +26,7 @@ import { checkScCoverage } from './sc-coverage-gate.mjs';
 import { buildFixPlan } from './fix-plan.mjs';
 import { checkDispatch } from './fix-dispatch-gate.mjs';
 import { checkBatchClosure } from './batch-closure-gate.mjs';
-import { verifyEventChain, runManifestHash, recordedSquashes, RUN_MANIFEST_SCHEMA_VERSION } from './fix-run.mjs';
+import { verifyEventChain, runManifestHash, recordedSquashes, RUN_MANIFEST_SCHEMA_VERSION, escapeEligible } from './fix-run.mjs';
 import { computeSizeReport, evaluateSize, exemptionInvalidReason } from './size-gate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -328,7 +328,23 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
           if (runManifest.sc_manifest_hash !== fo.sc_manifest_hash) errors.push('run manifest 绑定的 sc_manifest_hash ≠ 五件套声明值（SC-R3-3: 换 sc manifest 造 vacuous PASS 被拦）');
           if (runManifest.source_artifact_hash !== srcReal) errors.push('run manifest 绑定的 source_artifact_hash ≠ 源 artifact 重算值（SC-R3-10）');
           if (runManifest.source_candidate !== sourceArtifact.candidate_sha) {
-            errors.push(`run 起点 ${String(runManifest.source_candidate).slice(0, 12)} ≠ 源 artifact candidate ${String(sourceArtifact.candidate_sha).slice(0, 12)}（起点漂移被拦，SC-R3-10）`);
+            // issue #21（sc-21-escape-hatch 修法 2 接线）: 起点「仅前进到含源 candidate 的
+            // merge」不算漂移——worker 把修复 merge 到源 candidate 上后以其为新 run 起点
+            // （被验证树仍挂在源 candidate 血缘上）。判据走 escapeEligible 唯一裁决点：
+            // run 起点必须是 merge（≥2 parent）且某一个 parent **是**源 artifact 的
+            // candidate_sha。普通直接子（单 parent == 源）不是 merge，仍算起点漂移。
+            let isTrueAncestorMerge = false;
+            try {
+              const parents = gitT(repoDir, 'rev-list', '--parents', '-n', '1', runManifest.source_candidate).split(' ').slice(1);
+              isTrueAncestorMerge = escapeEligible({
+                kind: 'true-ancestor-merge',
+                parents,
+                sourceCandidate: sourceArtifact.candidate_sha,
+              }).ok;
+            } catch { /* 起点解析失败 = 非合法 merge，不算出路 */ }
+            if (!isTrueAncestorMerge) {
+              errors.push(`run 起点 ${String(runManifest.source_candidate).slice(0, 12)} ≠ 源 artifact candidate ${String(sourceArtifact.candidate_sha).slice(0, 12)}（起点漂移被拦，SC-R3-10；仅「parent 含源 candidate 的真祖先 merge」可不计漂移，issue #21 修法 2）`);
+            }
           }
           if (runManifestHash(runManifest) !== fo.run_manifest_hash) errors.push('fix_orchestration.run_manifest_hash ≠ run manifest 重算值');
           // issue #9 R4（lead 2026-08-07）: run manifest 版本比较——旧 v2/缺字段只要按当前
@@ -372,6 +388,9 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
             errors.push(`expected_sha ≠ run manifest 的最终 integrated_tip（expected=${String(manifest.expected_sha).slice(0, 12)} run=${finalTip.slice(0, 12)}）——集成后私改/换 commit 被拦（SC-9）`);
           } else {
             try {
+              // 注: issue #21 修法 2 的「真祖先 merge」接线在起点检查（source_candidate ≠
+              // candidate_sha 分支）——run 起点可前进到「parent 含源 candidate 的 merge」；
+              // 此处（起点之后的集成链）仍要求 squash 线性链，任何 merge 都拒（SC-R3-8）。
               const merges = gitT(repoDir, 'rev-list', '--merges', `${runManifest.source_candidate}..${finalTip}`).split('\n').filter(Boolean);
               if (merges.length) errors.push(`最终 DAG 含 merge commit ${merges[0].slice(0, 12)}（squash 集成下最终历史只应有 squash 线性链，SC-R3-8）`);
               const revs = gitT(repoDir, 'rev-list', `${runManifest.source_candidate}..${finalTip}`).split('\n').filter(Boolean);

@@ -19,6 +19,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, readJson, fail, isMain, normalizeRepoPath, sha256 } from './lib/common.mjs';
 import { HARDENING_CLASS_COUNT, HARDENING_CHECKLIST_VERSION } from './lib/hardening-registry.mjs';
+// SC-27: bundle 在场时 review_input_hash 与 bundle 重算值逐字比对（与 consensus-gate conjunct①
+// 同口径，但本文件是自检 CLI，错误信息打印完整 64 hex——截断 12 位会让前缀相同的「不一致」
+// 显示成「同一串」，见 consensus-gate.mjs :295 的 slice(0,12) 病灶，此处不再复制）。
+import { computeReviewInputHash } from './review-input-hash.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // SC-11: anchor_paths 数量上限来自可信配置（与 capacity 同源，owner 亲手改）
@@ -156,7 +160,11 @@ export const OUT_OF_SCOPE_NOTES_FIELD = 'out_of_scope_notes';
 const RESULTS = ['pass', 'fail', 'n_a'];
 const SEVERITIES = ['blocker', 'major', 'suggestion'];
 const ACTIONABLE_SEVERITIES = ['blocker', 'major'];
-const SHA_RE = /^[0-9a-f]{7,40}$/;
+// SC-27（sha-width）: 收成 40 位完整 SHA——与 consensus-gate 的 git 语义逐字对齐
+// （consensus-gate / push-guard 把 verdict 的 base_sha/candidate_sha 直接喂 git rev-parse /
+// ls-tree / diff，git 解析出的完整 SHA 恒为 40 位 hex；自检口径 7-40 会放行 7 位短 sha 而
+// 收卷口径（git）不接受，产生「自检绿、共识拒」的假信号，与 T1 的 --repo-dir 收紧同一病灶）。
+const SHA_RE = /^[0-9a-f]{40}$/;
 const HASH_RE = /^[0-9a-f]{64}$/;
 // I9-SC-5: hardening_coverage[].evidence 格式校验，按 result 分支（SC-5b 修复）——
 //   - result==='covered'：声称"已覆盖"，必须给出「路径:行号」形态的引用（如
@@ -209,12 +217,31 @@ export function validateVerdict(v, opts = {}) {
   need(SHA_RE.test(v.base_sha ?? ''), `base_sha 非法: ${v.base_sha}`);
   need(SHA_RE.test(v.candidate_sha ?? ''), `candidate_sha 非法: ${v.candidate_sha}`);
   need(HASH_RE.test(v.review_input_hash ?? ''), 'review_input_hash 必须是 64 位 hex');
+  // SC-27（bundle-hash-compare）: opts.bundle 在场时，review_input_hash 必须与 bundle 重算值
+  // 逐字相等（与 consensus-gate conjunct① 同口径，但错误信息打印**完整 64 hex**，不截断——
+  // 截断 12 位会让前缀相同的两个不同 hash 显示成「同一串」，无法排查）。不传 bundle 时只验
+  // hex 形状（保持旧调用）。bundle 字段不全导致无法重算 → fail-closed（同 consensus-gate）。
+  if (bundle) {
+    try {
+      const recomputed = computeReviewInputHash(bundle);
+      need(v.review_input_hash === recomputed,
+        `review_input_hash 与 bundle 重算值不符（SC-27，完整 64 hex 比对）: 携带=${v.review_input_hash} 重算=${recomputed}`);
+    } catch (e) {
+      need(false, `bundle 无法重算 input hash（fail-closed，SC-27）: ${e.message}`);
+    }
+  }
   need(['APPROVED', 'REQUIRES_CHANGES'].includes(v.verdict), `verdict 非法: ${v.verdict}`);
   need(Array.isArray(v.closed_finding_ids), 'closed_finding_ids 必须是数组');
   if (errs.length) return errs;
 
-  // faces 逐项
-  need(Array.isArray(v.faces), 'faces 必须是数组');
+  // faces 逐项（sc-28: faces 非数组时**立即 return**，禁止继续往下走到 :295 的
+  // (v.faces ?? []).some——字符串/数字等非数组会让 .some 抛 TypeError，把 SCHEMA-FAIL 变成
+  // 进程崩溃（e2e 实测: faces='not-an-array' 时 CLI 直接崩，审席收不到 degraded 信号）。
+  // 短路后其余检查不跑，属 fail-fast 语义；错误信息与旧 need 保持逐字一致。
+  if (!Array.isArray(v.faces)) {
+    errs.push('faces 必须是数组');
+    return errs;
+  }
   const seenFaces = new Set();
   for (const f of v.faces ?? []) {
     need(FACES.includes(f.face), `faces.face 非法: ${f.face}`);
@@ -532,6 +559,14 @@ if (isMain(import.meta.url)) {
     fail('用法: verdict-validate.mjs --verdict <verdict.json> --repo-dir <dir> [--bundle <bundle.json>] [--parent <parent-artifact.json>]\n（--repo-dir 必填——T1: 不带实改集校验的自检是不完整口径，会产出「自检绿、共识拒」的假信号；--parent 可选——SC-T7b: round>=2 校验 family_claim.kind=\'reuse\' 的 target_family_key 存在性时必须传，与 consensus-gate 的 --parent 同源）');
   }
   const v0 = readJson(args.verdict);
+  // SC-29（missing-parent-cli）: round>=2 且未传 --parent → 进入 reuse 语义前 fail-closed 报
+  // CLI 用法错。reuse 的 target_family_key 存在性对照同一谱系 parent（SC-T7b 的 known families
+  // 派生）；缺 parent 时该对照无法进行，若让校验继续走，reuse finding 只会拿到「无 parent
+  // （round=1 谱系根）」的**内容级**拒绝文案——那是在冤枉一份 round>=2 的合法 reuse 意图，
+  // 真正的问题在调用方漏传参数。故在 validateVerdict 之前拦下，错误形态是 CLI 用法错。
+  if (Number.isInteger(v0.round) && v0.round >= 2 && !args.parent) {
+    fail(`CLI 用法错（SC-29）: round=${v0.round} >= 2 的 verdict 必须传 --parent <parent-artifact.json>——reuse 的 target_family_key 存在性对照同一谱系 parent（与 consensus-gate 的 --parent 同源）；缺省时无法进入 reuse 校验，fail-closed`);
+  }
   let trackedPaths = null, changedPaths = null;
   try {
     trackedPaths = trackedPathSet({ repoDir: args['repo-dir'], baseSha: v0.base_sha, candidateSha: v0.candidate_sha });
