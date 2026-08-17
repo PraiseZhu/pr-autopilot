@@ -215,6 +215,14 @@ if (isMain(import.meta.url)) {
     + '  --parent 可选（SC-T7b）: round>=2 时传上一轮 consensus artifact，known families 现场派生进契约段（含 digest）；round=1 不传（谱系根，reuse 必拒）。';
   const round = args.round === undefined ? NaN : Number(args.round);
   try {
+    // sc-29b（#21 附带 emit 漏 --parent）: round>=2 且未传 --parent → CLI fail-closed。
+    // 此前 parentArtifact 落到 null → knownFamilies=null，契约段被静默降级成 round=1 谱系根
+    // 语义——known families 与 digest 缺失，lead 照抄进派工包后第三席交卷 reuse 必被拒，
+    // 整轮作废（同 D1 头部注释 gate_id 事故的同一形状：契约与语义各念各的经）。
+    // 只有 round=1（谱系根）才允许不传 --parent。
+    if (round >= 2 && !args.parent) {
+      fail(`--round ${round} 必须传 --parent <parent-artifact.json>（known families 从 parent 现场派生）；只有 round=1（谱系根）才允许不传 --parent。\n${USAGE}`);
+    }
     if (args.emit) {
       process.stdout.write(emitContract({ seat: args.emit, round, parentArtifact: args.parent ? readJson(args.parent) : null }));
     } else if (args.check) {

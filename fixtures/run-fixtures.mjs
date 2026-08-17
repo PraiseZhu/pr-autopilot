@@ -6959,6 +6959,40 @@ t('[D1-DC] 非法输入 fail-closed: seat/round 非法一律 throw，不产出�
   }
 });
 
+t('[D1-DC] sc-29b CLI fail-closed: round>=2 未传 --parent → 非零退出且文案点名 --parent（emit 与 check 两入口）', () => {
+  const runDcCli = (args) => spawnSync(process.execPath, [join(S, 'dispatch-contract.mjs'), ...args], { encoding: 'utf8', timeout: 60_000 });
+  // 两条入口分别测（SC: 覆盖 emit 与 check）
+  const cases = [
+    ['--emit', ['--emit', 'claude-adversarial', '--round', '2']],
+    ['--check', ['--check', 'unused-file.json', '--seat', 'claude-adversarial', '--round', '2']]
+  ];
+  for (const [name, argv] of cases) {
+    const r = runDcCli(argv);
+    ok(r.status !== 0, `${name} round=2 无 --parent 必须非零退出（status=${r.status}）: ${r.stderr}`);
+    ok(r.stderr.includes('--parent'), `${name} 错误文案必须点名 --parent: ${r.stderr}`);
+    ok(r.stderr.includes('round=1') && r.stderr.includes('谱系根'), `${name} 必须提示只有 round=1（谱系根）才可不传: ${r.stderr}`);
+    ok(!r.stdout.includes('DISPATCH-CONTRACT-OK') && !r.stdout.includes('机器契约段'), `${name} fail-closed 不得产出半成品契约: ${r.stdout}`);
+  }
+  // 正向对照: round=1 不带 --parent 照常可用（谱系根合法路径不被误伤）
+  const r1 = runDcCli(['--emit', 'claude-adversarial', '--round', '1']);
+  eq(r1.status, 0, 'round=1 无 --parent 必须照常 exit 0');
+  ok(r1.stdout.includes('本轮是 round=1（谱系根'), 'round=1 契约段保留谱系根说明');
+  // 正向对照: round>=2 带 --parent 照常可用（合法路径不被误伤）
+  const K1 = familyKeyOf('SC-29b 夹具不变量');
+  const pf = join(vvTmp, 'dc-sc29b-parent.json');
+  writeFileSync(pf, JSON.stringify({ canonical_findings: [{ family_key: K1, invariant: 'SC-29b 夹具不变量' }] }));
+  const r2 = runDcCli(['--emit', 'claude-adversarial', '--round', '2', '--parent', pf]);
+  eq(r2.status, 0, 'emit round=2 带 --parent 必须照常 exit 0，stderr=' + r2.stderr);
+  ok(r2.stdout.includes('known_families_digest='), 'round=2 契约段必须含 known families digest');
+  ok(r2.stdout.includes('SC-29b 夹具不变量'), 'round=2 契约段必须含 parent 派生的 family invariant');
+  // check 入口正向: round>=2 带 --parent 照常可用
+  const cf = join(vvTmp, 'dc-sc29b-pkg.md');
+  writeFileSync(cf, emitContract({ seat: 'claude-adversarial', round: 2, parentArtifact: { canonical_findings: [{ family_key: K1, invariant: 'SC-29b 夹具不变量' }] } }));
+  const r3 = runDcCli(['--check', cf, '--seat', 'claude-adversarial', '--round', '2', '--parent', pf]);
+  eq(r3.status, 0, 'check round=2 带 --parent 必须照常 exit 0，stderr=' + r3.stderr);
+  ok(r3.stdout.includes('DISPATCH-CONTRACT-OK'), 'check 正向必须 OK: ' + r3.stdout);
+});
+
 // ── D2: PR 格式确定性预检 ──
 const FG_CFG = { featureSections: ['变更说明', '提交前自检', '备注'], bugfixSections: ['变更说明', '怎么修的', '备注'], titleTypes: ['feat', 'fix', 'chore', 'docs'], lightTypes: ['chore', 'docs'] };
 const FG_BODY_FULL = '## 变更说明\n做了 X\n\n## 提交前自检\n- [x] ok\n\n## 备注\n无\n';
