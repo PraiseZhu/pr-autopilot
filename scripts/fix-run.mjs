@@ -457,10 +457,12 @@ export function attributionConstructive(a) {
 }
 export function escapeEligible({ kind, parents = [], sourceCandidate = null, attribution = '' }) {
   if (kind === 'true-ancestor-merge') {
-    if (!sourceCandidate || !parents.includes(sourceCandidate)) {
-      return { ok: false, reason: `真祖先 merge 的 parent 必须含源 candidate（parents=[${parents.join(', ')}]，源=${sourceCandidate?.slice?.(0, 8) ?? '无'}）——不含即任意前进，拒（sc-21-escape-hatch）` };
+    // merge commit 必须 ≥2 parent。单 parent 的普通直接子也会「parent 含源 candidate」，
+    // 若放行就把起点漂移当成出路，后续 DAG 窗从错误 tip 算起（GPT 单审 P1）。
+    if (!sourceCandidate || parents.length < 2 || !parents.includes(sourceCandidate)) {
+      return { ok: false, reason: `真祖先 merge 必须是 merge commit（≥2 parent）且 parent 含源 candidate（parents=[${parents.join(', ')}]，源=${sourceCandidate?.slice?.(0, 8) ?? '无'}）——单 parent 或未含源即任意前进，拒（sc-21-escape-hatch）` };
     }
-    return { ok: true, reason: '真祖先 merge: 某 parent == 源 candidate，树仍挂在源 candidate 血缘上（issue #21 修法 2）' };
+    return { ok: true, reason: '真祖先 merge: ≥2 parent 且某 parent == 源 candidate，树仍挂在源 candidate 血缘上（issue #21 修法 2）' };
   }
   if (kind === 'flake-registered') {
     if (!attributionConstructive(attribution)) {
@@ -1015,7 +1017,14 @@ export function finalizeRun({ stateDir, runId, flakeRegistry = null }) {
     if (!w.validation?.ok) {
       // 出路判定（issue #21）: 失败 SC 全部命中登记 → 该波经 flake 出路放行，事件留痕；
       // 否则维持「未通过 orchestrator 复跑验证」拒（fail-closed）。
-      const failed = (w.validation?.results ?? []).filter((r) => r.status !== 'PASS' && r.status !== 'FLAKE');
+      // flake 出路只吃 FAIL（与 validate 层只把 FAIL 标成 FLAKE 对齐）。
+      // UNRUNNABLE / VACUOUS / blocked 是身份闸或空验证，不是偶发红，登记不得放行（GPT 单审 P1）。
+      const results = w.validation?.results ?? [];
+      const failed = results.filter((r) => r.status === 'FAIL');
+      const nonFlakeable = results.filter((r) => r.status !== 'PASS' && r.status !== 'FLAKE' && r.status !== 'FAIL');
+      if (nonFlakeable.length > 0) {
+        throw new Error(`wave${i + 1} 含不可 flake 放行的状态 ${nonFlakeable.map((r) => `${r.sc_id}=${r.status}`).join(', ')}（UNRUNNABLE/VACUOUS/身份闸不得经 flake 登记 finalize，fail-closed）`);
+      }
       if (flakeRegistry && failed.length > 0 && failed.every((r) => {
         const hit = flakeRegistry.entries.find((e) => e.sc_id === r.sc_id && e.tree_sha === w.integrated_tip && e.digest === r.verify_digest);
         return !!hit && attributionConstructive(hit.attribution) && escapeEligible({ kind: 'flake-registered', attribution: hit.attribution }).ok;

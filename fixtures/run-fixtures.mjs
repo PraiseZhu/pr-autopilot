@@ -5151,7 +5151,7 @@ t('[SC-21-IDENT-FINAL] symlink 冒充白名单入口 → validate ok=false → f
   });
   let finThrew = null;
   try { FR.finalizeRun({ stateDir: env.stateDir, runId: 'd8n-FINID' }); } catch (e) { finThrew = e.message; }
-  ok(finThrew && /未通过 orchestrator 复跑验证/.test(finThrew), 'sc-21-cli-realpath-isolation: 身份失败不得 finalize PASS（finalize 必须抛错）: ' + finThrew);
+  ok(finThrew && /未通过 orchestrator 复跑验证|不可 flake 放行/.test(finThrew), 'sc-21-cli-realpath-isolation: 身份失败不得 finalize PASS（finalize 必须抛错）: ' + finThrew);
 });
 
 t('[SC-21-ESCAPE] 出路判定（escapeEligible 唯一裁决点）: 真祖先 merge / 已登记 flake+构造性归因放行；任意前进 / BOOTSTRAP / 未知类型拒', () => {
@@ -5161,6 +5161,7 @@ t('[SC-21-ESCAPE] 出路判定（escapeEligible 唯一裁决点）: 真祖先 me
   // 任意前进: parent 均非源 candidate → 拒
   ok(!FR.escapeEligible({ kind: 'true-ancestor-merge', parents: ['c'.repeat(40), 'b'.repeat(40)], sourceCandidate: src }).ok, 'parent 不含源 candidate = 任意前进，拒');
   ok(!FR.escapeEligible({ kind: 'true-ancestor-merge', parents: [src], sourceCandidate: null }).ok, '无源 candidate 参照 = 拒（fail-closed）');
+  ok(!FR.escapeEligible({ kind: 'true-ancestor-merge', parents: [src], sourceCandidate: src }).ok, '单 parent 的普通直接子不是 merge，即使 parent==源 candidate 也拒');
   // 已登记 flake + 构造性归因 → 放行（修法 3）
   const constructive = 'engine.mjs:348-349 两次独立 nowIso() 调用旧形态 + 受控时钟每次取值强制 +1ms，证明该树必产生 1ms 差（确定性机制描述）';
   ok(FR.escapeEligible({ kind: 'flake-registered', attribution: constructive }).ok, '已登记 flake + 构造性归因放行（修法 3）');
@@ -5250,6 +5251,19 @@ t('[SC-21-FLAKE-2] finalize 层 flake 兜底: validate 未收登记而 finalize 
   let finCThrew = null;
   try { FR.finalizeRun({ stateDir: B.env.stateDir, runId: 'sc21fc' }); } catch (e) { finCThrew = e.message; }
   ok(finCThrew && /未通过 orchestrator 复跑验证/.test(finCThrew), '无登记凭据时 finalize 照旧拒（fail-closed）');
+  // run D: validate 记 UNRUNNABLE 后，即使 flake 登记命中也不得 finalize
+  const D = mkRun('sc21fd');
+  const dPath = FR.runManifestPath(D.env.stateDir, 'sc21fd');
+  const dMan = readJson(dPath);
+  dMan.waves[0].validation = {
+    ok: false,
+    results: [{ sc_id: 'SC-FA', status: 'UNRUNNABLE', verify_digest: D.d, selection_gate: 'blocked' }]
+  };
+  writeFileSync(dPath, JSON.stringify(dMan, null, 2));
+  const regUnrun = { entries: [{ sc_id: 'SC-FA', tree_sha: D.m.waves[0].integrated_tip, digest: D.d, attribution: 'a.ts 校验在偶发时钟偏移下 1ms 抖动（受控时钟 +1ms 可稳定复现，确定性机制）' }] };
+  let finDThrew = null;
+  try { FR.finalizeRun({ stateDir: D.env.stateDir, runId: 'sc21fd', flakeRegistry: regUnrun }); } catch (e) { finDThrew = e.message; }
+  ok(finDThrew && /不可 flake 放行/.test(finDThrew), 'UNRUNNABLE 不得经 flake 登记 finalize: ' + finDThrew);
 });
 
 t('[SC-21-BASE-LOCK] digest 绑定 source/base/integrated_tip；source_candidate 是当前集成点派生（不硬重置回计划期锁 0aa0410）', () => {
@@ -5368,6 +5382,9 @@ t('[SC-21-PG-MERGE] push-guard 起点「仅前进到含源 candidate 的 merge�
   // 任意前进起点（不存在/血缘外的 SHA）→ 仍拒（SC-R3-10）
   const rArb = call(mkRunM('1'.repeat(40)));
   ok(!rArb.ok && rArb.errors.some((e) => /起点漂移/.test(e)), '任意前进起点（无源 candidate 血缘）仍拒（SC-R3-10）');
+  // 普通直接子（单 parent == 源 candidate）不是 merge，仍算起点漂移
+  const rChild = call(mkRunM(F));
+  ok(!rChild.ok && rChild.errors.some((e) => /起点漂移/.test(e)), '普通直接子（单 parent==源）不得当作出路: ' + rChild.errors.join(';'));
 });
 
 // ========== 20. SC-11/SC-12/SC-13 ==========
@@ -5754,7 +5771,7 @@ t('[R2-F2] 跨波: wave1 建的软链不得让 wave2「改了依赖清单」被�
   // 阻断必须一路传到 finalize，不能只停在 validate（finalizeRun 的契约是**抛错**，不是返回 ok:false）
   let finThrew = null;
   try { FR.finalizeRun({ stateDir: env.stateDir, runId: 'r2f2' }); } catch (e) { finThrew = e.message; }
-  ok(finThrew && /未通过 orchestrator 复跑验证/.test(finThrew), 'finalizeRun 必须拒绝（validation.ok !== true → 抛错）: ' + finThrew);
+  ok(finThrew && /未通过 orchestrator 复跑验证|不可 flake 放行/.test(finThrew), 'finalizeRun 必须拒绝（validation.ok !== true → 抛错）: ' + finThrew);
 });
 
 t('[R2-F2] changedFiles 抛错时归 UNRUNNABLE，不归 runnable（算不出实改集就不敢判「依赖没变」）', () => {

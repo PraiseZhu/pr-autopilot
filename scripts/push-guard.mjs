@@ -26,7 +26,7 @@ import { checkScCoverage } from './sc-coverage-gate.mjs';
 import { buildFixPlan } from './fix-plan.mjs';
 import { checkDispatch } from './fix-dispatch-gate.mjs';
 import { checkBatchClosure } from './batch-closure-gate.mjs';
-import { verifyEventChain, runManifestHash, recordedSquashes, RUN_MANIFEST_SCHEMA_VERSION } from './fix-run.mjs';
+import { verifyEventChain, runManifestHash, recordedSquashes, RUN_MANIFEST_SCHEMA_VERSION, escapeEligible } from './fix-run.mjs';
 import { computeSizeReport, evaluateSize, exemptionInvalidReason } from './size-gate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -330,14 +330,17 @@ export function checkPushGuard({ repoDir, manifest, artifact, bundle, constituti
           if (runManifest.source_candidate !== sourceArtifact.candidate_sha) {
             // issue #21（sc-21-escape-hatch 修法 2 接线）: 起点「仅前进到含源 candidate 的
             // merge」不算漂移——worker 把修复 merge 到源 candidate 上后以其为新 run 起点
-            // （被验证树仍挂在源 candidate 血缘上）。判据: run 起点是 merge commit 且其
-            // 某一个 parent **是**源 artifact 的 candidate_sha（防任意前进）。判定与
-            // fix-run.mjs 的 escapeEligible({kind:'true-ancestor-merge'}) 同一语义（本处直接
-            // 读 git 血缘）。其余起点漂移一律拒（fail-closed）。
+            // （被验证树仍挂在源 candidate 血缘上）。判据走 escapeEligible 唯一裁决点：
+            // run 起点必须是 merge（≥2 parent）且某一个 parent **是**源 artifact 的
+            // candidate_sha。普通直接子（单 parent == 源）不是 merge，仍算起点漂移。
             let isTrueAncestorMerge = false;
             try {
               const parents = gitT(repoDir, 'rev-list', '--parents', '-n', '1', runManifest.source_candidate).split(' ').slice(1);
-              isTrueAncestorMerge = parents.includes(sourceArtifact.candidate_sha);
+              isTrueAncestorMerge = escapeEligible({
+                kind: 'true-ancestor-merge',
+                parents,
+                sourceCandidate: sourceArtifact.candidate_sha,
+              }).ok;
             } catch { /* 起点解析失败 = 非合法 merge，不算出路 */ }
             if (!isTrueAncestorMerge) {
               errors.push(`run 起点 ${String(runManifest.source_candidate).slice(0, 12)} ≠ 源 artifact candidate ${String(sourceArtifact.candidate_sha).slice(0, 12)}（起点漂移被拦，SC-R3-10；仅「parent 含源 candidate 的真祖先 merge」可不计漂移，issue #21 修法 2）`);
