@@ -45,10 +45,12 @@ export function loadSizeGateConfig(repoDir, ref) {
   }
   let text;
   try {
-    text = execFileSync('git', ['-C', repoDir, 'show', `${ref}:agent-use/docs/pr-rules.json`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    text = execFileSync('git', ['-C', repoDir, 'show', `${ref}:agent-use/docs/pr-rules.json`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, LC_ALL: 'C', LANG: 'C' } });
   } catch (e) {
     // 第二道：ref 已有效，失败只有「树里真没有该路径」是 default 正例；
     // 权限 / 对象损坏等其他失败仍 fail-closed（失败≠零测量）。
+    // 判据靠 stderr 文本匹配 /does not exist in/，git 该消息可被 gettext 翻译——
+    // 强制 C locale 防止宿主非英文环境下真缺文件被误判为 fail-closed。
     const why = (e.stderr ?? '').toString().trim() || e.message;
     if (/does not exist in/.test(why)) return { config: { ...DEFAULT_SIZE_CONFIG }, source: 'default' };
     throw new Error(`size-gate: 读取 base 树 pr-rules.json 失败（fail-closed，不回退默认）: ${why}`);
