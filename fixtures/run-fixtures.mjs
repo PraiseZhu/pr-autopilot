@@ -20,7 +20,7 @@ import { validateVerdict, SCHEMA_VERSION } from '../scripts/verdict-validate.mjs
 import { runConsensusGate, recomputeArtifactHash, familyKeyOf } from '../scripts/consensus-gate.mjs';
 import { checkPushGuard, matchAny, directionCheck, jsonSubset, fastSignaturePayload } from '../scripts/push-guard.mjs';
 import { ciReadiness } from '../scripts/ci-readiness.mjs';
-import { matchUiPaths } from '../scripts/ui-paths/match.mjs';
+import { matchUiPaths, registryReceipt } from '../scripts/ui-paths/match.mjs';
 import { registerPr, unregisterPr, checkReceipt, stateFileName, legacyStateFileName, parseStateFileName, migrateAllLegacyStateFiles, STATE_FILE_NAME_RE } from '../scripts/pr-watch/register.mjs';
 import { evaluate, emptyCursors } from '../scripts/pr-watch/gate.mjs';
 import { runEngine } from '../scripts/pr-watch/engine.mjs';
@@ -107,7 +107,14 @@ function mkBundle(baseSha, candidateSha, over = {}) {
   return {
     base_sha: baseSha, candidate_sha: candidateSha, pr_title: 't', pr_body: 'b',
     touches_ui: false, matched_paths: [],
-    ui_registry_config_hash: 'c'.repeat(64), pr_context_digest: 'd'.repeat(64), ...over
+    ui_registry_config_hash: 'c'.repeat(64),
+    // #22 provenance receipt（wave2 g2）: path/64hex/40sha/repo 全量入锅；config_hash 与
+    // ui_registry_config_hash 双轨一致（不一致时 computeReviewInputHash fail-closed）。
+    ui_registry_receipt: {
+      path: 'scripts/ui-paths/registry.pr-autopilot.json',
+      config_hash: 'c'.repeat(64), source_sha: SHA_A, repo: 'PraiseZhu/pr-autopilot'
+    },
+    pr_context_digest: 'd'.repeat(64), ...over
   };
 }
 // v2: 每条 finding 需 anchor_paths（机器分组字段）。测试 finding 未显式给时，
@@ -373,6 +380,90 @@ t('[sc-29-missing-parent-cli-ok] 带 --parent（真实 known family）→ 不因
   const r = runVvCli(['--verdict', vf, '--repo-dir', vvRepo, '--parent', pf]);
   eq(r.status, 0, '带 --parent 应 exit 0，stderr=' + r.stderr);
   ok(r.stdout.trim() === 'ok', 'stdout 应为 ok: ' + r.stdout);
+});
+
+// ========== sc-22（wave2 g2 派工包: #22 registry 来源绑定 + provenance 进 review_input_hash）==========
+const PA_REG = readJson(join(S, 'ui-paths/registry.pr-autopilot.json'));
+const CINDY_REG = readJson(join(S, 'ui-paths/registry.cindy.json'));
+const PA_REG_HASH = '7c47f21be0249c215772ee916dd163bfea710356358283ac8afd3722a96c78e0';
+
+t('[sc-22-registry-bound] 本仓权威 registry 派生: config_hash 固定 64 hex + expectedRepo 绑定（错仓红）', () => {
+  eq(matchUiPaths(PA_REG, ['src/x.ts']).config_hash, PA_REG_HASH, '本仓 registry config_hash 必须固定为 7c47f21b...（正例 64 hex）');
+  eq(matchUiPaths(PA_REG, ['src/x.ts'], { expectedRepo: 'PraiseZhu/pr-autopilot' }).touches_ui, false, '本仓 + expectedRepo 匹配应正常派生');
+  ok(CINDY_REG.repo !== PA_REG.repo, '前置: cindy registry 归属仓必须与本仓不同（错仓红的前提）');
+  let threw = false;
+  try { matchUiPaths(CINDY_REG, [], { expectedRepo: 'PraiseZhu/pr-autopilot' }); } catch { threw = true; }
+  ok(threw, '错仓 registry（repo 归属 != 目标仓）必须红（来源绑定）');
+  let threw2 = false;
+  try { matchUiPaths({ ...PA_REG, repo: undefined }, [], { expectedRepo: 'PraiseZhu/pr-autopilot' }); } catch { threw2 = true; }
+  ok(threw2, 'registry 缺 repo 声明时必须红（无法绑定来源）');
+});
+
+t('[sc-22-registry-bound-cli] CLI: --repo 必填；本仓绿（exit 0 + 完整 64 hex + receipt）；错仓红（exit 1）', () => {
+  const r22 = mkdtempSync(join(tmpdir(), 'r22-'));
+  const g22 = (...a) => execFileSync('git', ['-C', r22, ...a], { encoding: 'utf8' }).trim();
+  g22('init', '-q', '-b', 'main'); g22('config', 'user.email', 'fx@test'); g22('config', 'user.name', 'fx');
+  writeFileSync(join(r22, 'registry.json'), JSON.stringify(PA_REG, null, 2) + '\n');
+  g22('add', '.'); g22('commit', '-qm', 'registry');
+  const R22_SHA = g22('rev-parse', 'HEAD');
+  const files22 = join(r22, 'files.txt'); writeFileSync(files22, 'src/x.ts\n');
+  const runMatch = (args, input) => spawnSync(process.execPath, [join(S, 'ui-paths/match.mjs'), ...args], { input, encoding: 'utf8', timeout: 60_000 });
+  // 缺 --repo → exit 1（来源绑定强制化，lead 无「不传 repo 兜底」路径）
+  const noRepo = runMatch(['--registry', join(r22, 'registry.json'), '--files', files22], '');
+  eq(noRepo.status, 1, '缺 --repo 必须 exit 1: ' + noRepo.stderr);
+  // 本仓 + 真实来源 ref SHA → 绿
+  const okCli = runMatch(['--registry', join(r22, 'registry.json'), '--files', files22, '--repo', 'PraiseZhu/pr-autopilot', '--source-sha', R22_SHA], '');
+  eq(okCli.status, 0, '本仓 registry CLI 应 exit 0: ' + okCli.stderr);
+  const r22out = JSON.parse(okCli.stdout);
+  eq(r22out.config_hash, PA_REG_HASH, 'CLI config_hash 必须为完整 64 hex 固定值');
+  eq(r22out.receipt.config_hash, PA_REG_HASH, 'receipt.config_hash 必须一致');
+  eq(r22out.receipt.source_sha, R22_SHA, 'receipt.source_sha 必须等于来源 ref SHA（40 位）');
+  eq(r22out.receipt.repo, 'PraiseZhu/pr-autopilot', 'receipt.repo 必须为 registry 归属仓');
+  ok(r22out.receipt.path.includes('registry.json'), 'receipt.path 必须记录 registry 路径');
+  // 错仓 registry → 红（exit 1 + 点名来源绑定）
+  const badCli = runMatch(['--registry', join(S, 'ui-paths/registry.cindy.json'), '--files', files22, '--repo', 'PraiseZhu/pr-autopilot', '--source-sha', R22_SHA], '');
+  eq(badCli.status, 1, '错仓 registry CLI 必须 exit 1');
+  ok(badCli.stderr.includes('来源绑定'), 'stderr 必须点名来源绑定: ' + badCli.stderr);
+  rmSync(r22, { recursive: true, force: true });
+});
+
+t('[sc-22-provenance-receipt-binding] path/64hex/40sha/repo 全量入锅: 篡改任一字段 → hash 变或 fail-closed → bundle 通道拒', () => {
+  const b = mkBundle(SHA_A, SHA_B);
+  const v = mkVerdictFor('claude-adversarial', b);
+  const rcpt = b.ui_registry_receipt;
+  const cases = [
+    ['path', 'scripts/ui-paths/registry.cindy.json'],
+    ['config_hash', 'f'.repeat(64)],
+    ['source_sha', 'f'.repeat(40)],
+    ['repo', 'PraiseZhu/cindy']
+  ];
+  for (const [k, val] of cases) {
+    const tampered = { ...b, ui_registry_receipt: { ...rcpt, [k]: val } };
+    let threw = false, diff = false;
+    try { diff = computeReviewInputHash(tampered) !== v.review_input_hash; } catch { threw = true; }
+    ok(threw || diff, '篡改 receipt.' + k + ' 必须改变 hash 或 fail-closed 抛错');
+    const errs = validateVerdict(v, { bundle: tampered });
+    ok(errs.some((e) => /SC-27/.test(e)), '篡改 receipt.' + k + ' 必须被 bundle 通道拒（SC-27 点名）: ' + JSON.stringify(errs));
+  }
+  eq(validateVerdict(v, { bundle: b }).length, 0, '未篡改 bundle 必须零错误（对照组）');
+  // 形状校验: 非 64 hex / 非 40 hex / 空 repo / 空 path → fail-closed 抛错
+  for (const bad of [{ config_hash: 'abc' }, { source_sha: 'abc1234' }, { repo: '' }, { path: '' }]) {
+    let threw = false;
+    try { computeReviewInputHash({ ...b, ui_registry_receipt: { ...rcpt, ...bad } }); } catch { threw = true; }
+    ok(threw, '非法 receipt 形状必须抛错: ' + JSON.stringify(bad));
+  }
+  // 双轨脱钩: 手填 ui_registry_config_hash 与 receipt.config_hash 不一致 → fail-closed（#22 建议 3: 禁止 lead 手填 hash）
+  let threwTrack = false;
+  try { computeReviewInputHash({ ...b, ui_registry_config_hash: '0'.repeat(64) }); } catch { threwTrack = true; }
+  ok(threwTrack, 'ui_registry_config_hash 与 receipt.config_hash 双轨脱钩必须抛错（禁止手填 hash）');
+  // registryReceipt 纯函数: 组装 + 形状校验
+  const built = registryReceipt({ path: 'scripts/ui-paths/registry.pr-autopilot.json', registry: PA_REG, sourceSha: SHA_A });
+  eq(built.config_hash, PA_REG_HASH, 'registryReceipt 必须产出本仓固定 64 hex');
+  eq(built.repo, 'PraiseZhu/pr-autopilot');
+  eq(built.source_sha, SHA_A);
+  let threwSha = false;
+  try { registryReceipt({ path: 'p', registry: PA_REG, sourceSha: 'abc' }); } catch { threwSha = true; }
+  ok(threwSha, 'source_sha 非 40 位 hex 必须抛错');
 });
 
 t('[⑥/审③F4-R] 全绿 → pass；artifact hash 含 base/candidate（只改 SHA 即失效）', () => {
@@ -7579,7 +7670,7 @@ try {
   const L1 = gD('rev-parse', 'HEAD');
   writeFileSync(join(rD, 'app.ts'), 'v3\\n'); gD('add', '.'); gD('commit', '-qm', 'fix');
   const L2 = gD('rev-parse', 'HEAD');
-  const bundle = (b, c) => ({ base_sha: b, candidate_sha: c, pr_title: 't', pr_body: 'b', touches_ui: false, matched_paths: [], ui_registry_config_hash: 'c'.repeat(64), pr_context_digest: 'd'.repeat(64) });
+  const bundle = (b, c) => ({ base_sha: b, candidate_sha: c, pr_title: 't', pr_body: 'b', touches_ui: false, matched_paths: [], ui_registry_config_hash: 'c'.repeat(64), ui_registry_receipt: { path: 'scripts/ui-paths/registry.pr-autopilot.json', config_hash: 'c'.repeat(64), source_sha: L0, repo: 'PraiseZhu/pr-autopilot' }, pr_context_digest: 'd'.repeat(64) });
   const FULL_FACES = ['A','B','C','D','E','F','G'].map((f) => ({ face: f, result: f === 'B' ? 'n_a' : 'pass', evidence: f + ' 面走查完成' }));
   const THIRD_FACES = ['D','E','F','G'].map((f) => ({ face: f, result: 'pass', evidence: f + ' 面走查完成' }));
   const THIRD_GATES = ['format-gate','rule-compliance','security-privacy-gate','product-arch-gate'].map((g) => ({ gate_id: g, result: 'pass', evidence: g + ' 走查完成' }));
