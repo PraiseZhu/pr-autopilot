@@ -276,6 +276,105 @@ t('[SC-B4/D5] checklist_version 9→10 迁移: 旧 9 项 verdict 必须报「清
   const newErrs = validateVerdict(newStyle);
   eq(newErrs.length, 0, '新 10 项 + 当前 checklist_version 的 verdict 必须零错误: ' + JSON.stringify(newErrs));
 });
+// ========== SC-27/28/29（wave1 g3-r2 派工包）==========
+// CLI 用例需要真实 git 仓（--repo-dir 必填，tracked/changed 校验要能算出实改集）
+const vvRepo = mkdtempSync(join(tmpdir(), 'vv-'));
+const vvTmp = mkdtempSync(join(tmpdir(), 'vvt-'));
+const vvGit = (...a) => execFileSync('git', ['-C', vvRepo, ...a], { encoding: 'utf8' }).trim();
+vvGit('init', '-q', '-b', 'main');
+vvGit('config', 'user.email', 'fx@test'); vvGit('config', 'user.name', 'fx');
+writeFileSync(join(vvRepo, 'a.txt'), '1\n'); vvGit('add', '.'); vvGit('commit', '-qm', 'base');
+const VV_BASE = vvGit('rev-parse', 'HEAD');
+vvGit('checkout', '-qb', 'feat');
+writeFileSync(join(vvRepo, 'b.txt'), '2\n'); vvGit('add', '.'); vvGit('commit', '-qm', 'feat');
+const VV_HEAD = vvGit('rev-parse', 'HEAD');
+const runVvCli = (args) => spawnSync(process.execPath, [join(S, 'verdict-validate.mjs'), ...args], { encoding: 'utf8', timeout: 60_000 });
+
+t('[sc-28] faces=not-an-array → validateVerdict 返回「faces 必须是数组」errs 且不抛 TypeError（进程不崩）', () => {
+  const v = mkVerdictFor('claude-adversarial', bundle, { faces: 'not-an-array' });
+  const errs = validateVerdict(v); // 若实现又落到 (v.faces ?? []).some，这里直接抛 TypeError，t() 捕获 → FAIL
+  ok(Array.isArray(errs), '必须返回 errs 数组而非抛错');
+  ok(errs.some((e) => /faces 必须是数组/.test(e)), '必须点名 faces 必须是数组: ' + JSON.stringify(errs));
+});
+t('[sc-28-cli] faces=not-an-array 走 CLI → [SCHEMA-FAIL]+[VERDICT] degraded / exit 1，无 TypeError 堆栈', () => {
+  const b = mkBundle(VV_BASE, VV_HEAD);
+  const v = mkVerdictFor('claude-adversarial', b, { faces: 'not-an-array' });
+  const vf = join(vvTmp, 'sc28.json');
+  writeFileSync(vf, JSON.stringify(v));
+  const r = runVvCli(['--verdict', vf, '--repo-dir', vvRepo]);
+  eq(r.status, 1, 'exit 必须为 1（degraded）');
+  ok(r.stderr.includes('[SCHEMA-FAIL] faces 必须是数组'), 'stderr 必须含 [SCHEMA-FAIL] faces 必须是数组: ' + r.stderr);
+  ok(r.stderr.includes('[VERDICT] degraded'), 'stderr 必须含 [VERDICT] degraded: ' + r.stderr);
+  ok(!r.stderr.includes('TypeError'), '不得抛 TypeError（进程崩溃）: ' + r.stderr);
+});
+
+t('[sc-27-bundle] 全 0 hash + bundle → 拒，错误信息含完整 64 hex 两串（禁止截断 12 位）', () => {
+  const b = mkBundle(VV_BASE, VV_HEAD);
+  const recomputed = computeReviewInputHash(b);
+  const v = mkVerdictFor('claude-adversarial', b, { review_input_hash: '0'.repeat(64) });
+  const errs = validateVerdict(v, { bundle: b });
+  ok(errs.some((e) => /SC-27/.test(e)), '必须点名 SC-27: ' + JSON.stringify(errs));
+  const hit = errs.find((e) => e.includes('携带='));
+  ok(hit && hit.includes('0'.repeat(64)), '错误信息必须含完整 64 位携带值（截断 12 位会让前缀相同的「不一致」显示成「同一串」）: ' + JSON.stringify(errs));
+  ok(hit && hit.includes(recomputed), '错误信息必须含完整 64 位重算值: ' + JSON.stringify(errs));
+});
+t('[sc-27-bundle-ok] 匹配 hash + bundle → ok；不传 bundle 只验 hex 形状（保持旧调用）', () => {
+  const b = mkBundle(VV_BASE, VV_HEAD);
+  eq(validateVerdict(mkVerdictFor('claude-adversarial', b), { bundle: b }).length, 0, '匹配 hash+bundle 应零错误');
+  const v = mkVerdictFor('claude-adversarial', b, { review_input_hash: 'f'.repeat(64) }); // 形状合法但无 bundle 可比
+  eq(validateVerdict(v).length, 0, '不传 bundle 时只验 64 位 hex 形状，应零错误');
+});
+t('[sc-27-bundle-cli] --bundle 不匹配 → CLI exit 1 + SCHEMA-FAIL + 完整 64 hex（不截断）', () => {
+  const b = mkBundle(VV_BASE, VV_HEAD);
+  const v = mkVerdictFor('claude-adversarial', b, { review_input_hash: '0'.repeat(64) });
+  const vf = join(vvTmp, 'sc27.json'), bf = join(vvTmp, 'sc27bundle.json');
+  writeFileSync(vf, JSON.stringify(v)); writeFileSync(bf, JSON.stringify(b));
+  const r = runVvCli(['--verdict', vf, '--repo-dir', vvRepo, '--bundle', bf]);
+  eq(r.status, 1, 'exit 必须为 1');
+  ok(r.stderr.includes('[SCHEMA-FAIL]') && r.stderr.includes('SC-27'), 'stderr 必须含 SCHEMA-FAIL SC-27: ' + r.stderr);
+  ok(r.stderr.includes('0'.repeat(64)), 'stderr 必须含完整 64 位携带 hash: ' + r.stderr);
+  ok(r.stderr.includes(computeReviewInputHash(b)), 'stderr 必须含完整 64 位重算 hash: ' + r.stderr);
+});
+
+t('[sc-27-sha-width] 7 位短 sha → 拒（base_sha/candidate_sha 非法）；40 位合法 sha → 过', () => {
+  const shortBase = mkVerdictFor('claude-adversarial', bundle, { base_sha: 'abc1234' }); // 合法 hex 但非 40 位
+  ok(validateVerdict(shortBase).some((e) => /base_sha 非法/.test(e)), '7 位短 base_sha 必须拒: ' + JSON.stringify(validateVerdict(shortBase)));
+  const shortCand = mkVerdictFor('claude-adversarial', bundle, { candidate_sha: 'abcd123' });
+  ok(validateVerdict(shortCand).some((e) => /candidate_sha 非法/.test(e)), '7 位短 candidate_sha 必须拒: ' + JSON.stringify(validateVerdict(shortCand)));
+  eq(validateVerdict(mkVerdictFor('claude-adversarial', bundle)).length, 0, '40 位合法 sha 应零错误');
+});
+
+t('[sc-29-missing-parent-cli] round=4 reuse + 无 --parent → CLI 用法错（含 CLI/--parent，不含「round=1 谱系根」）', () => {
+  const b = mkBundle(VV_BASE, VV_HEAD);
+  const K1 = familyKeyOf('SC-29 夹具不变量');
+  const v = mkVerdictFor('claude-adversarial', b, {
+    round: 4,
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['b.txt'], evidence: 'e', status: 'closed', invariant: 'SC-29 夹具不变量', family_id: 'fam1', family_claim: { kind: 'reuse', target_family_key: K1 } }],
+    closed_finding_ids: ['F1']
+  });
+  const vf = join(vvTmp, 'sc29.json');
+  writeFileSync(vf, JSON.stringify(v));
+  const r = runVvCli(['--verdict', vf, '--repo-dir', vvRepo]);
+  eq(r.status, 1, '无 --parent 必须 exit 1（fail-closed，在进入 reuse 语义前）');
+  ok(r.stderr.includes('CLI 用法错') && r.stderr.includes('--parent'), '错误文案必须是 CLI 用法错且点名 --parent: ' + r.stderr);
+  ok(!r.stderr.includes('round=1 谱系根'), '不得落入「round=1 谱系根」内容级文案（那是冤枉合法 reuse 意图的错误形态）: ' + r.stderr);
+});
+t('[sc-29-missing-parent-cli-ok] 带 --parent（真实 known family）→ 不因本改动误伤合法 reuse（exit 0 ok）', () => {
+  const b = mkBundle(VV_BASE, VV_HEAD);
+  const K1 = familyKeyOf('SC-29 夹具不变量');
+  const v = mkVerdictFor('claude-adversarial', b, {
+    round: 4,
+    findings: [{ id: 'F1', primary_face: 'A', severity: 'major', anchor: 'a', anchor_paths: ['b.txt'], evidence: 'e', status: 'closed', invariant: 'SC-29 夹具不变量', family_id: 'fam1', family_claim: { kind: 'reuse', target_family_key: K1 } }],
+    closed_finding_ids: ['F1']
+  });
+  const vf = join(vvTmp, 'sc29ok.json'), pf = join(vvTmp, 'sc29parent.json');
+  writeFileSync(vf, JSON.stringify(v));
+  writeFileSync(pf, JSON.stringify({ canonical_findings: [{ family_key: K1, invariant: 'SC-29 夹具不变量' }] }));
+  const r = runVvCli(['--verdict', vf, '--repo-dir', vvRepo, '--parent', pf]);
+  eq(r.status, 0, '带 --parent 应 exit 0，stderr=' + r.stderr);
+  ok(r.stdout.trim() === 'ok', 'stdout 应为 ok: ' + r.stdout);
+});
+
 t('[⑥/审③F4-R] 全绿 → pass；artifact hash 含 base/candidate（只改 SHA 即失效）', () => {
   const { artifact } = consensusFor(bundle);
   eq(artifact.gate_result, 'pass', JSON.stringify(artifact.fail_reasons));

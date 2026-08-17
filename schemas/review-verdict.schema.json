@@ -16,8 +16,8 @@
     "run_status": { "enum": ["ok", "degraded"] },
     "round": { "type": "integer", "minimum": 1, "description": "I9: round 语义 = PASS 共识 artifact 的序号（不是审查尝试次数）——见 attempt。" },
     "attempt": { "type": "integer", "minimum": 1, "description": "I9（SC-6）: 当前 round 的第几次审查尝试。round 语义变更为「PASS 共识序号」后，尝试次数信息从 round 里丢失，改由本字段承载。单份 verdict 的形状校验只锁「是合法正整数」；三席 attempt 是否一致属 consensus-gate 层跨席校验，不在此实现。" },
-    "base_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
-    "candidate_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+    "base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$", "description": "SC-27（sha-width）: 40 位完整 SHA——与 consensus-gate 的 git 语义逐字对齐（consensus-gate/push-guard 把该值直接喂 git rev-parse/ls-tree/diff，解析出的完整 SHA 恒为 40 位 hex；7-40 会放行 7 位短 sha 而收卷口径不接受，产生「自检绿、共识拒」假信号）。verdict-validate.mjs 的 SHA_RE 与这里逐字一致，改必须同步。" },
+    "candidate_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$", "description": "SC-27（sha-width）: 40 位完整 SHA，同 base_sha。" },
     "review_input_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "faces": {
       "type": "array",
