@@ -646,6 +646,23 @@ node scripts/fix-run.mjs validate --state-dir <st> --run-id <run> --sc-manifest 
 # 5) 全波跑完收口: 校验每波都通过复跑 → feature branch 前推到最终 integration tip
 node scripts/fix-run.mjs finalize --state-dir <st> --run-id <run>   # 输出 run_manifest_hash
 ```
+- **issue #21（批次协议出路，2026-08-17）**：
+  - **verify 消重（二取一，已选消重，不做按名过滤）**：同 wave 内相同 verify digest 的
+    SC 共享**一次**执行与测量（PR #19 round 3 的「十条 SC 同一 verify 命令」从十次收敛为
+    一次）。digest 绑定运行上下文 `cmd+args+source_candidate+base+integrated_tip`
+    （`fix-run.mjs verifyContext`）——异树（内容不同但 cmd+args 相同）digest 不同，各执行
+    一次，绝不跨树消重。禁止两套判据并存（消重与按名过滤只能留一个）。
+  - **身份三例 fail-closed**：已登记 fixture 入口的文件身份不可信（symlink/realpath 不一致、
+    realpath 解析失败、父目录 symlink）→ `UNRUNNABLE + selection_gate=blocked`，整波阻断，
+    不得 finalize PASS（词法未命中的未登记入口仍 unmeasured 不阻断）。
+  - **flake 登记出路（可选参数）**：`validate` / `finalize` 可带
+    `--flake-registry <file>`（`{ entries: [{ sc_id, tree_sha, digest, attribution }] }`）。
+    SC 验证失败但命中登记（sc_id + tree_sha==本波集成树 + digest 全匹配）且归因**构造性**
+    （机制描述，非「重试三次就过」）→ validate 记 `FLAKE` 放行并在输出显式标注；finalize
+    侧同样凭登记放行（`wave-escape-flake` 事件留痕）。
+  - **finalize 出路只两类**（`fix-run.mjs escapeEligible` 唯一裁决点）：真祖先 merge（被验证
+    树/起点是 merge 且某 parent == 源 candidate，`push-guard` 起点漂移检查同步放行）与已登记
+    flake+构造性归因。任意前进、**BOOTSTRAP**、未知类型一律拒。
 - **组数门**（lead 派少了直接拦）：
   ```
   node scripts/fix-dispatch-gate.mjs --plan fix-plan.json --record dispatch-record.json
