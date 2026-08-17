@@ -1,0 +1,19 @@
+{
+  "_comment": "mivo-canvas-plugin UI 路径 registry — 镜像 registry.mivo.json（插件仓为主仓引擎全副本，src 树同构）。2026-08 拆仓后 submit-pr Phase 1 默认读这份。",
+  "schema_version": "v1",
+  "repo": "xindong/mivo-canvas-plugin",
+  "ui_globs": [
+    "src/app/**",
+    "src/canvas/**",
+    "src/render/**",
+    "src/agent/**/*.tsx",
+    "src/**/*.css",
+    "index.html",
+    "public/**",
+    "DESIGN.md"
+  ],
+  "non_ui_exceptions": [
+    "**/*.test.ts",
+    "**/*.test.tsx"
+  ]
+}

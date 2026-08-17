@@ -927,7 +927,7 @@ fix-plan（纯函数重算等价）+ 组数门 + **最终 DAG lineage**（SC-9/S
 守卫过 → **守卫自己以固定 argv 执行普通 refspec push**（漂移即停，绝不产出待 shell 解释的命令串）→ `gh pr create/edit` → ssh mini：
 ```
 node scripts/pr-watch/register.mjs --state-dir <mini-state> --owner <o> --repo <r> --pr <N> --branch <feature-branch> --push-remote <origin|fork> [--push-repo PraiseZhu/cindy-fork] --verify --lease <lease> --schedule-check "<cmd>"
-# 审⑤-F4: --branch 与 --push-remote 必填（mivo: --push-remote origin；cindy: --push-remote fork + --push-repo）——
+# 审⑤-F4: --branch 与 --push-remote 必填（mivo-canvas-plugin: --push-remote origin；cindy: --push-remote fork + --push-repo）——
 # 缺任一 register 直接拒绝，杜绝 state.branch=null 的注定失败注册；引擎不猜 remote 名
 
 ```

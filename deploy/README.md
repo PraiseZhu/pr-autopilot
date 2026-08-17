@@ -7,7 +7,7 @@
 ## 0. 前置（P0，不做完不许开调度）
 
 1. mini `gh auth status` 有效（token 失效是当前第一阻塞）。
-2. mini clone cindy（base = `makecindy/cindy`；fork 流程 push 目标 = `PraiseZhu/cindy-fork`）与 mivo 各一份 checkout。
+2. mini clone cindy（base = `makecindy/cindy`；fork 流程 push 目标 = `PraiseZhu/cindy-fork`）与 mivo（canonical = `xindong/mivo-canvas-plugin`，checkout = `~/mivo-ops/mivo-canvas-plugin`）各一份。旧主仓 `xindong/mivo-canvas` 不再是盯梢默认目标。
 3. 飞书: owner 先私聊一次 Mivo bot；W-7 三前提实测（launchd 环境凭证可读 / bot API 可达 / 真实试发成功，凭证不落库不打日志）。
 4. `sessions.dispatch` 端到端: 从 script 调度起 GLM 会话，session meta 落盘核对四元组
    `agentKind=claude-code + provider + claude-sonnet-5 + xhigh`（不是只看 dispatch 成功）。
@@ -20,29 +20,29 @@
 ```bash
 # mini 上
 git clone git@github.com:PraiseZhu/pr-autopilot.git ~/pr-autopilot
-mkdir -p ~/pr-autopilot-runtime/{state-mivo,state-cindy,ledger,journal}
+mkdir -p ~/pr-autopilot-runtime/{state,ledger,journal}
 ```
 
 runtime 目录（state/lease/ledger/journal）一律在仓外 `~/pr-autopilot-runtime/`。
+**本机 mini 实况（2026-08 起）= 单条盯梢班车 + 共享 `state/` + 单份 `engine.json` / `lease.json`**，不要再按旧的 `state-mivo` / `state-cindy` 双目录落盘。`engine-mivo.json` / `engine-cindy.json` 是无人消费的死配置，mini 上已改名为 `*.stale`。
 
-## 2. 盯梢引擎（每仓一条 script 模式 Cindy 调度，W-2）
+## 2. 盯梢引擎（本机 = 一条 Cindy 班车扫共享 state，W-2）
 
-- cron: `*/15 * * * *`；execution_mode=script；零 LLM。
-- schedule A（mivo）: workingDir=mivo checkout；schedule B（cindy）: workingDir=cindy checkout。
-- 两条 schedule 自身设 `agentKind=claude-code + claude-sonnet-5 + xhigh`（修复会话经继承获得）。
+- cron: `*/15 * * * *`；本机班车 `execution_mode=agent`（prompt 里后台拉起零 LLM 的 `engine.mjs`）。
+- 本机 workingDir = `~/pr-autopilot`；业务仓路径只写在 `engine.json` 的 `repoDirs`，不靠第二条 schedule 分仓。
 - 入口命令（`--config` **必填**——缺 budget 配置引擎直接拒绝启动，审③-F13-R fail-closed）:
 
 ```bash
 node ~/pr-autopilot/scripts/pr-watch/engine.mjs \
-  --state-dir ~/pr-autopilot-runtime/state-mivo \
-  --lease ~/pr-autopilot-runtime/lease-mivo.json \
+  --state-dir ~/pr-autopilot-runtime/state \
+  --lease ~/pr-autopilot-runtime/lease.json \
   --snapshot-cmd "node ~/pr-autopilot/deploy/wrappers/gh-snapshot.mjs {owner} {repo} {pr}" \
   --dispatch-cmd "node ~/pr-autopilot/deploy/wrappers/cindy-dispatch.mjs" \
   --journal ~/pr-autopilot-runtime/journal/watch.jsonl \
-  --config ~/pr-autopilot-runtime/engine-mivo.json
+  --config ~/pr-autopilot-runtime/engine.json
 ```
 
-engine-mivo.json（完整必填示例；两仓 schedule **共享同一 budget.ledger**——预留在锁内原子完成，防竞态双派）:
+engine.json（完整必填示例；本机双仓 **共享同一 state + 同一 budget.ledger**——预留在锁内原子完成，防竞态双派）:
 ```json
 {
   "budget": {
@@ -51,14 +51,17 @@ engine-mivo.json（完整必填示例；两仓 schedule **共享同一 budget.le
     "estimate": 3
   },
   "repoDirs": {
+    "xindong/mivo-canvas-plugin": "/Users/<mini-user>/mivo-ops/mivo-canvas-plugin",
+    "makecindy/cindy": "/Users/<mini-user>/cindy-ops/cindy",
     "xindong/mivo-canvas": "/Users/<mini-user>/mivo-ops/mivo-canvas"
   },
   "triReviewLedgerDir": "/Users/<mini-user>/pr-autopilot-runtime/tri-review",
   "escapeLedger": "/Users/<mini-user>/pr-autopilot-runtime/ledger/escape.jsonl",
   "feishuCmd": "node /Users/<mini-user>/pr-autopilot/scripts/health/feishu-alert.mjs",
-  "slackCmd": "node /Users/<mini-user>/mivo-ops/mivo-canvas/agent-use/loops/bug-doctor/notify.mjs"
+  "slackCmd": "node /Users/<mini-user>/mivo-ops/mivo-canvas-plugin/scripts/loops/bug-doctor/notify.mjs"
 }
 ```
+旧主仓 `xindong/mivo-canvas` 不再是盯梢默认目标，但共享 state 里还有它的历史 PR 状态文件——`repoDirs` 缺该 key 时终态清理 fail-closed（cleanup-pending 不销单），所以必须留着直到旧仓状态清空。
 - `estimate` 是**行为参数**（`reserveBudget()`（`scripts/pr-watch/budget.mjs` 导出，engine 的
   dispatch 路径调用它预留，当前约 `engine.mjs:295`——以符号为准，行号会漂移），不是注释）——
   mivo 示例取 `3`：外部部署实测单样本 $1.41，保守取整为 3。
@@ -98,11 +101,10 @@ engine-mivo.json（完整必填示例；两仓 schedule **共享同一 budget.le
   字符串 / `NaN` / `Infinity` / 负数 / `0` 一律**启动即拒（fail-closed）**，在扫描与通知之前抛错，
   零副作用——本任务明确**不支持用 0 禁用**告警。年龄基准 = `first_dispatched_at`（重派不更新），
   去重标记持久化在 `pending_dispatch.pending_stuck_notified`（通知失败也置位，宁丢一次不刷屏）。
-- **cindy 引擎各有 config**（engine-cindy.json 等），estimate 取值由部署者按同口径自行判断调整，
-  本示例只校准 mivo 侧，不代改其他引擎的 config。
-- `repoDirs` 缺某仓时该仓终态清理 fail-closed（cleanup-pending 不销单，审③-I2-R）——两仓都必须配。
+- 本机不再拆 `engine-cindy.json`：cindy 与 mivo 共用上面这份 `engine.json`。另外部署若仍坚持双引擎，estimate 由部署者按同口径自行判断，本示例只校准本机共享引擎。
+- `repoDirs` 缺某仓时该仓终态清理 fail-closed（cleanup-pending 不销单，审③-I2-R）——共享 state 里出现过的仓都必须配。
 - 注册命令（审⑤-F4: `--branch` 与 `--push-remote` **必填**，引擎不猜 remote 名）:
-  - mivo: `node scripts/pr-watch/register.mjs --state-dir … --owner xindong --repo mivo-canvas --pr <N> --branch <feature> --push-remote origin`
+  - mivo: `node scripts/pr-watch/register.mjs --state-dir … --owner xindong --repo mivo-canvas-plugin --pr <N> --branch <feature> --push-remote origin`
   - cindy: 同上，另加 `--push-remote fork --push-repo PraiseZhu/cindy-fork`
     （finalize 会把该 remote 的 push URL 与 push-repo 仓名绑定，upstream 冒充被拦）。
     **前置**: cindy checkout 的 origin/base = `makecindy/cindy`（canonical），checkout 里必须存在
@@ -220,7 +222,7 @@ export REQUIRED_CONTEXTS_FILE=/path/to/required-contexts.json
 - **取值权威来源 = 分支保护 API 的实际值，不是人手抄 workflow 名**：`gh api repos/{owner}/{repo}/branches/main/protection --jq '.required_status_checks.contexts'`（或仓库 Settings → Branches → 保护规则 → Require status checks 里看到的清单）。手抄名字会漂移——分支保护里改名/增删后，清单不跟着变，CI 判绿就失真。
 - **两类 check 绝对不能进这份清单（同一类陷阱的两个变种）**：
   - **`SKIPPED` 不算绿**：gh-snapshot 归一化 check-run 时只有 `conclusion == success` 才映射为绿，`skipped`/`neutral`/`cancelled` 一律非绿（`gh-snapshot.mjs:135`；`scripts/ci-readiness.mjs:33` `entry.state !== 'success'` → fail-closed 非绿）。按路径过滤的 job（改动不命中就 SKIPPED）一旦进清单，该 PR 永远判不绿。
-  - **只在 `pull_request` 事件上跑的 job 同样不能列**：它在 main push 上根本不产生 check，列进去 = 永远等一个不会来的绿。真实案例：mivo 仓（`xindong/mivo-canvas`）`.github/workflows/deploy-green-ref.yml` 的 `REQUIRED_ON_MAIN` 数组上方注释（本机踩过并写死在注释里的教训，措辞以该文件当前内容为准）——e2e 系列 job 是 pull_request-only，main push 上不存在，不能列（列了 ref 永远不动）；bench / deps audit / semgrep baseline / coverage report 是设计上的非阻断，不纳入。**设计上非阻断的 job（bench / audit / baseline / coverage 类）也不进清单**。
+  - **只在 `pull_request` 事件上跑的 job 同样不能列**：它在 main push 上根本不产生 check，列进去 = 永远等一个不会来的绿。真实案例：旧主仓 `xindong/mivo-canvas` 的 `.github/workflows/deploy-green-ref.yml`，以及插件仓 `xindong/mivo-canvas-plugin` 的 `.github/workflows/plugin-green-ref.yml`（本机踩过并写死在注释里的教训，措辞以该文件当前内容为准）——e2e / `pr-size-gate` 这类 pull_request-only job 在 main push 上不存在，不能列进 **main 绿灯推进** 名单（列了 ref 永远不动）。盯梢 `REQUIRED_CONTEXTS_FILE` 评的是 **PR** 是否绿，插件仓 branch protection 的 `pr-size-gate` **要**列入。bench / deps audit / semgrep baseline / coverage report 是设计上的非阻断，不纳入。**设计上非阻断的 job（bench / audit / baseline / coverage 类）也不进清单**。
 - **没配/文件缺失 = fail-closed 非绿，同一 head 的 ci-red 在本轮之内判一次并去重**：gh-snapshot 对未配置的 required 返回 `green: false` + `['required contexts 未配置（fail-closed）']`（`gh-snapshot.mjs:147`）→ gate 对**同一 head** 的 ci-red 用 `cursors.ci_red_sha !== head` 去重（`gate.mjs:61-62`）——**前提是状态真的落盘了（投递成功、pending/ack 已持久化）**；若投递失败，`engine.mjs:356-363` 释放预留（`:358`）且**游标不推进**（「下轮重试 = at-least-once」，失败记 `dispatch-failed` journal 事件 `:361`），`engine.mjs:364` 落盘的状态里没有 pending/cursor 推进，下一轮 gate 仍见 `ci_red_sha != head` → 仍 actionable → **可能每轮重新启动 agent**（`fixtures/run-fixtures.mjs:1351-1403` 已覆盖首派/重派连续失败重试；重派失败同样持久化 `redispatch_count`（`engine.mjs:258`）并计入 stuck 判据（`engine.mjs:240`））。**不保证低唤醒/低 token**——别据此估预算。（早期版本写「CI 永远红 → 每轮都唤醒」不成立，已更正；本段也不构成跨轮静默保证。）
 
 **②b `SNAPSHOT_CACHE_DIR` —— 不配 = 每轮探针都是普通 API 请求，配额被静默低估**
@@ -252,33 +254,37 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
 **④ 多实例部署（2026-08-07 从外部部署者真实踩坑回填）**
 
 - **双机同时巡审：目前没有内建的按作者分片手段**。实测核实：review-pr 的 `--auto` 批量扫**所有**可审查的 open、非 draft PR，无作者过滤参数；pr-autopilot 引擎按 state 目录扫全部在册 PR，注册（`register.mjs`）也不含 author 维度。两台机器各自跑巡审会**抢同一批 PR**：同一 PR 被两家重复审查、重复评论（selfFixAuthors 触发还会交叉改同一 PR）。**这是 T1 之外的真实空缺**，不是设计限制——分片能力尚未建，别以为有什么参数能解决。现状下的缓解只有人工约定：错开时间窗、或让每台机器只管自己注册进盯梢的 PR（pr-autopilot 的盯梢按注册隔离，谁注册谁盯；但注册与巡审是两条独立链路，巡审侧的抢单不受注册隔离保护）。
-- **`engine-mivo.json` 不能直接拷** —— ⚠️ 里面的 `feishuCmd` / `slackCmd` 是指向**本机 owner** 的告警脚本路径（bug-doctor notify.mjs 的 Slack 通道、feishu-alert.mjs 的飞书通道）：原样拷过去 = 对方机器上的巡审结果、预算告警、健康告警**发进我们的群里**，等于把我们机器的通知目标装到了别人机器上。部署者必须**本地化通知配置**（把这两个字段改成自己的告警通道）。这条没有机器门在拦——字段只是路径字符串，机器无法验证它指向谁的通知——纯靠部署时自觉，写在这里就是要让这份拷贝刺眼。
+- **`engine.json` 不能直接拷** —— ⚠️ 里面的 `feishuCmd` / `slackCmd` 是指向**本机 owner** 的告警脚本路径（bug-doctor notify.mjs 的 Slack 通道、feishu-alert.mjs 的飞书通道）：原样拷过去 = 对方机器上的巡审结果、预算告警、健康告警**发进我们的群里**，等于把我们机器的通知目标装到了别人机器上。部署者必须**本地化通知配置**（把这两个字段改成自己的告警通道）。这条没有机器门在拦——字段只是路径字符串，机器无法验证它指向谁的通知——纯靠部署时自觉，写在这里就是要让这份拷贝刺眼。
 
 ### 2.2 补注册接线（reconcile 班车，T1）
 
 自己名下没走注册流程的旁路 PR，由 `deploy/wrappers/reconcile-own-prs.mjs` 补注册进盯梢。
-**生产入口 = 每仓一条 15 分钟 schedule**（`*/15 * * * *`，execution_mode=script，零 LLM）——
-mivo → state-mivo、cindy → state-cindy，与盯梢引擎、每日卡片（§3）解耦独立调度：
+**本机生产入口 = `~/pr-autopilot-runtime/reconcile-cron.sh`**（`*/15 * * * *`，零 LLM）——
+循环 `xindong/mivo-canvas-plugin` 与 `makecindy/cindy`，**都写进共享 `state/`**，与盯梢引擎、每日卡片（§3）解耦独立调度：
 
 ```bash
-# mivo 仓
+# 与 reconcile-cron.sh 同口径：两仓共用 --state-dir
 node ~/pr-autopilot/deploy/wrappers/reconcile-own-prs.mjs \
-  --repo xindong/mivo-canvas \
-  --state-dir ~/pr-autopilot-runtime/state-mivo \
+  --repo xindong/mivo-canvas-plugin \
+  --state-dir ~/pr-autopilot-runtime/state \
   --remote-map-file ~/pr-autopilot-runtime/remote-map.json
-# cindy 仓（canonical base = makecindy/cindy；fork 身份 = PraiseZhu/cindy-fork）
 node ~/pr-autopilot/deploy/wrappers/reconcile-own-prs.mjs \
   --repo makecindy/cindy \
-  --state-dir ~/pr-autopilot-runtime/state-cindy \
+  --state-dir ~/pr-autopilot-runtime/state \
   --remote-map-file ~/pr-autopilot-runtime/remote-map.json
 ```
 
 remote-map.json（base 仓全名 → 该仓 checkout 里修复 push 用的 remote 名；注册时必须显式声明，
 引擎不猜，同 §2 注册命令的 `--push-remote` 语义。key 一律要求严格 owner/repo 形状——
-`/foo`、`foo/`、多斜杠、非法字符的 key 会在启动前被拒）:
+`/foo`、`foo/`、多斜杠、非法字符的 key 会在启动前被拒。缺当前 `--repo` key = 该轮 fail-closed。
+旧主仓 key 仍要留着：共享 state 里的历史 PR 终态清理还认它）:
 
 ```json
-{ "xindong/mivo-canvas": "origin", "makecindy/cindy": "fork" }
+{
+  "xindong/mivo-canvas-plugin": "origin",
+  "makecindy/cindy": "fork",
+  "xindong/mivo-canvas": "origin"
+}
 ```
 
 - **fail-closed 分层**：启动前校验 remote-map（不可读 / JSON 非对象 / 缺当前 `--repo` key /
@@ -325,10 +331,9 @@ health.json（`slack_cmd` **必填**——不配则飞书凭证不可得时双�
 ```json
 { "ttl_minutes": 45,
   "leases": [
-    { "name": "engine-mivo", "file": "/Users/<mini-user>/pr-autopilot-runtime/lease-mivo.json" },
-    { "name": "engine-cindy", "file": "/Users/<mini-user>/pr-autopilot-runtime/lease-cindy.json" } ],
+    { "name": "engine", "file": "/Users/<mini-user>/pr-autopilot-runtime/lease.json" } ],
   "feishu_cmd": "node /Users/<mini-user>/pr-autopilot/scripts/health/feishu-alert.mjs",
-  "slack_cmd": "node /Users/<mini-user>/mivo-ops/mivo-canvas/agent-use/loops/bug-doctor/notify.mjs" }
+  "slack_cmd": "node /Users/<mini-user>/mivo-ops/mivo-canvas-plugin/scripts/loops/bug-doctor/notify.mjs" }
 ```
 
 > **lease 语义（T4 澄清，勿把 lease 当进展信号）**：lease 文件只表示「引擎轮次仍活」——引擎每轮启动时刷新 `{last_success, pid}`（`engine.mjs:92`），健康检查据此判引擎是否在跑（ttl_minutes 过期 → 告警）。**lease 新鲜 ≠ PR 有进展**：引擎活着但某个 PR 的修复会话卡死/重派失败时，lease 照常刷新，健康检查不会因此告警。判断单个 PR 是否有进展要看 journal 事件：`waiting`（每轮对在途 pending 记一条，`engine.mjs:217-221`）、`pending-stuck`（超 `pendingStuckHours` 未 ack）、`dispatch-failed` / `redispatch-failed`（派发失败）；健康告警只管引擎进程本身，管不了 PR 级卡死——后者靠盯梢告警链（`stuck`/`pending-stuck` 通知）。

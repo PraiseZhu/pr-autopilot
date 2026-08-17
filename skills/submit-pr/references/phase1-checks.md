@@ -16,7 +16,10 @@
    ```
    merge 冲突 = 失败（先 rebase 再来）；typecheck 非零 = 失败。
 
-## mivo-canvas（xindong/mivo-canvas）
+## mivo（xindong/mivo-canvas-plugin）
+
+> 2026-08 插件拆仓后，submit-pr / 盯梢的 mivo 跟踪仓是 `xindong/mivo-canvas-plugin`（origin 直推）。
+> 旧主仓 `xindong/mivo-canvas` 不再是这两条链路的默认目标；历史 PR / 旧 registry 仍可按旧仓处理，但新提交走插件仓。
 
 | 步骤 | 命令 | 失败语义 |
 |---|---|---|
@@ -24,8 +27,8 @@
 | typecheck | `npx tsc -b --noEmit` | 非零 = 失败 |
 | lint | `npm run lint` | 非零 = 失败 |
 | 日志规则守卫 | `npm run verify:logging` | 非零 = 失败（仓规则: debugLogger 全路径覆盖） |
-| 版本 bump | 按仓内 VERSIONING.md；changelog 补扫（generate-changelog skill 约定） | 漏 bump = 失败 |
-| UI 判定 | `git diff -z --name-only origin/main...HEAD \| node scripts/ui-paths/match.mjs --registry registry.mivo.json --files -` | touches_ui=true 且无 demo 证据 = 失败（除非 --skip-demo-gate 带理由留痕） |
+| 版本 bump | 插件仓无 VERSIONING.md → 本步 `n_a`；changelog 按仓内 daily-changelog / 既有约定 | 不得按旧主仓 VERSIONING.md 误判漏 bump |
+| UI 判定 | `git diff -z --name-only origin/main...HEAD \| node scripts/ui-paths/match.mjs --registry registry.mivo-plugin.json --files -` | touches_ui=true 且无 demo 证据 = 失败（除非 --skip-demo-gate 带理由留痕） |
 
 ## cindy（makecindy/cindy fork 流）
 
