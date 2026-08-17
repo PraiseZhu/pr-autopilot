@@ -32,12 +32,26 @@ export const BUILTIN_EXCLUDES = [
 
 // 返回 {config, source: 'default'|'base'}；malformed 一律 throw（fail-closed，SC-19）。
 // ref = merge-base SHA：配置从 base 树读（审 B2-F1：读候选树 = 被测 PR 可自改闸门）。
+// T8（SC-8）：git show 失败必须分「真缺文件」与「坏 ref / 非 git 仓 / 对象损坏」——
+// 只有前者回退 default（唯一正例），后者 fail-closed 抛错，不得伪装成缺文件。
 export function loadSizeGateConfig(repoDir, ref) {
+  // 第一道：ref 必须能解析成 commit；坏 ref / 非 git 仓在此拦截（fail-closed，不回退 default）
+  // stderr 必须 pipe：区分「真缺文件」要靠 git show 的 stderr 判据，丢弃了就无从判断
+  try {
+    execFileSync('git', ['-C', repoDir, 'rev-parse', '--verify', `${ref}^{commit}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    const why = (e.stderr ?? '').toString().trim() || e.message;
+    throw new Error(`size-gate: merge-base ref 无法解析 ${ref}（坏 ref / 非 git 仓，fail-closed，不回退默认）: ${why}`);
+  }
   let text;
   try {
-    text = execFileSync('git', ['-C', repoDir, 'show', `${ref}:agent-use/docs/pr-rules.json`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-  } catch {
-    return { config: { ...DEFAULT_SIZE_CONFIG }, source: 'default' }; // base 树无此文件 → 默认
+    text = execFileSync('git', ['-C', repoDir, 'show', `${ref}:agent-use/docs/pr-rules.json`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    // 第二道：ref 已有效，失败只有「树里真没有该路径」是 default 正例；
+    // 权限 / 对象损坏等其他失败仍 fail-closed（失败≠零测量）。
+    const why = (e.stderr ?? '').toString().trim() || e.message;
+    if (/does not exist in/.test(why)) return { config: { ...DEFAULT_SIZE_CONFIG }, source: 'default' };
+    throw new Error(`size-gate: 读取 base 树 pr-rules.json 失败（fail-closed，不回退默认）: ${why}`);
   }
   let rules;
   try { rules = JSON.parse(text); } catch (e) {
@@ -96,7 +110,14 @@ export function parseNumstatZ(raw) {
 
 export function computeSizeReport({ repoDir, baseRef, headRef = 'HEAD' }) {
   const git = (...a) => execFileSync('git', ['-C', repoDir, ...a], { encoding: 'utf8' });
-  const mergeBase = git('merge-base', baseRef, headRef).trim();
+  let mergeBase;
+  try {
+    mergeBase = git('merge-base', baseRef, headRef).trim();
+  } catch (e) {
+    // T8（SC-8）：不存在的 merge-base / 非 git 仓 → fail-closed 抛错，不得继续产出零测量报告
+    const why = (e.stderr ?? '').toString().trim() || e.message;
+    throw new Error(`size-gate: merge-base(${baseRef}, ${headRef}) 失败（坏 ref / 非 git 仓，fail-closed，不回退默认）: ${why}`);
+  }
   const headSha = git('rev-parse', headRef).trim();
   const raw = git('diff', '--numstat', '-z', mergeBase, headRef);
   const { config, source } = loadSizeGateConfig(repoDir, mergeBase);

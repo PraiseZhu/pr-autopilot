@@ -2,7 +2,7 @@
 // pr-autopilot 回归 fixtures v3 — 审③后更新（对账用例全部固化）
 // 每条用例前缀 [计划条款/审次编号]；末尾 SKIPPED 清单如实列出仓内验不了的项。
 // 模拟密钥一律运行时拼接（静态文件不含完整 token/赋值形态）。
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, utimesSync, rmSync, lstatSync, appendFileSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, utimesSync, rmSync, lstatSync, appendFileSync, symlinkSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
@@ -6816,6 +6816,85 @@ console.log('\n[B2] size-gate 双闸（真实 git 仓）');
     g2('add', '.'); g2('commit', '-qm', 'no-sizegate');
     eq(loadSizeGateConfig(d2, g2('rev-parse', 'HEAD')).source, 'default');
     rmSync(d2, { recursive: true, force: true });
+  });
+
+  t('[B2-T8-1] git show 失败分「真缺文件」与「坏 ref/非 git」；后者 fail-closed 不回退 default', () => {
+    const { d, base } = mkRepo();
+    // 不存在的 merge-base → computeSizeReport 抛错（fail-closed，不得回退 default）
+    let threw = null;
+    try { computeSizeReport({ repoDir: d, baseRef: 'no-such-merge-base' }); } catch (e) { threw = e; }
+    ok(threw, '不存在的 merge-base 必须抛错');
+    ok(/fail-closed/.test(threw.message), `错误须标注 fail-closed: ${threw.message}`);
+    // 坏 ref 直入 loadSizeGateConfig（绕过 merge-base）→ 抛错
+    threw = null;
+    try { loadSizeGateConfig(d, 'd'.repeat(40)); } catch (e) { threw = e; }
+    ok(threw, '坏 ref 直入 loadSizeGateConfig 必须抛错');
+    // 非 git 仓 → 两个入口都抛错
+    const plain = mkdtempSync(join(tmpdir(), 'sg-notgit-'));
+    writeFileSync(join(plain, 'x.txt'), '1\n');
+    threw = null;
+    try { loadSizeGateConfig(plain, base); } catch (e) { threw = e; }
+    ok(threw, '非 git 仓 loadSizeGateConfig 必须抛错');
+    threw = null;
+    try { computeSizeReport({ repoDir: plain, baseRef: base }); } catch (e) { threw = e; }
+    ok(threw, '非 git 仓 computeSizeReport 必须抛错');
+    rmSync(plain, { recursive: true, force: true });
+    // 真缺文件仍是唯一 default 正例（合法仓 + 有效 ref + 树里确实没有 pr-rules.json）
+    eq(loadSizeGateConfig(d, base).source, 'default', '真缺文件仍回 default');
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  t('[B2-T8-2] 失败不伪装零测量：坏 ref/非 git/对象损坏只给非零错误，不产 config_source=default 或 counted_lines=0', () => {
+    // 坏 ref：抛错即无报告对象可消费，错误消息不得含报告字段伪装
+    const { d } = mkRepo();
+    for (const badRef of ['no-such-merge-base', 'd'.repeat(40)]) {
+      let threw = null;
+      try { computeSizeReport({ repoDir: d, baseRef: badRef }); } catch (e) { threw = e; }
+      ok(threw, `坏 ref=${badRef} 必须抛错`);
+      ok(!/config_source|counted_lines/.test(threw.message), `错误消息不得包含报告字段伪装: ${threw.message}`);
+    }
+    rmSync(d, { recursive: true, force: true });
+    // 对象读取失败（ref 有效、blob 权限拒绝）：verify 通过但 git show 失败 → fail-closed 抛错
+    if (typeof process.getuid !== 'function' || process.getuid() !== 0) {
+      const D2 = mkdtempSync(join(tmpdir(), 'sg-corrupt-'));
+      const g2 = (...a) => execFileSync('git', ['-C', D2, ...a], { encoding: 'utf8' }).trim();
+      g2('init', '-q', '-b', 'main'); g2('config', 'user.email', 'fx@t'); g2('config', 'user.name', 'fx');
+      mkdirSync(join(D2, 'agent-use/docs'), { recursive: true });
+      writeFileSync(join(D2, 'agent-use/docs/pr-rules.json'), JSON.stringify({ sizeGate: { budgetLines: 100 } }));
+      g2('add', '.'); g2('commit', '-qm', 'rules');
+      const ref2 = g2('rev-parse', 'HEAD');
+      const blob = g2('rev-parse', `${ref2}:agent-use/docs/pr-rules.json`);
+      const obj = join(D2, '.git/objects', blob.slice(0, 2), blob.slice(2));
+      chmodSync(obj, 0o000);
+      let threw = null;
+      try { loadSizeGateConfig(D2, ref2); } catch (e) { threw = e; }
+      chmodSync(obj, 0o644);
+      ok(threw, '对象读取失败（权限拒绝）必须 fail-closed 抛错');
+      ok(!/config_source|counted_lines/.test(threw.message), '对象失败错误不得伪装 default 或零计数');
+      rmSync(D2, { recursive: true, force: true });
+    }
+    // CLI 级：坏 ref → exit 3，stdout 无 config_source / counted_lines（只给非零错误）
+    const D3 = mkdtempSync(join(tmpdir(), 'sg-cli-badref-'));
+    const g3 = (...a) => execFileSync('git', ['-C', D3, ...a], { encoding: 'utf8' }).trim();
+    g3('init', '-q', '-b', 'main'); g3('config', 'user.email', 'fx@t'); g3('config', 'user.name', 'fx');
+    writeFileSync(join(D3, 'a.txt'), '1\n'); g3('add', '.'); g3('commit', '-qm', 'base');
+    let code = 0, out = '';
+    try { out = execFileSync(process.execPath, [join(S, 'size-gate.mjs'), '--repo-dir', D3, '--base', 'no-such-merge-base'], { encoding: 'utf8' }); }
+    catch (e) { code = e.status; out = e.stdout ?? ''; }
+    eq(code, 3, '坏 ref CLI 必须 exit 3');
+    ok(!out.includes('config_source') && !out.includes('counted_lines'), `CLI 失败 stdout 不得含报告字段: ${out.slice(0, 120)}`);
+    rmSync(D3, { recursive: true, force: true });
+    // 真缺文件 CLI 仍正常出报告（唯一 default 正例，exit 0 且计数真实）
+    const D4 = mkdtempSync(join(tmpdir(), 'sg-cli-ok-'));
+    const g4 = (...a) => execFileSync('git', ['-C', D4, ...a], { encoding: 'utf8' }).trim();
+    g4('init', '-q', '-b', 'main'); g4('config', 'user.email', 'fx@t'); g4('config', 'user.name', 'fx');
+    writeFileSync(join(D4, 'a.txt'), '1\n'); g4('add', '.'); g4('commit', '-qm', 'base');
+    const ref4 = g4('rev-parse', 'HEAD');
+    const okOut = execFileSync(process.execPath, [join(S, 'size-gate.mjs'), '--repo-dir', D4, '--base', ref4], { encoding: 'utf8' });
+    const parsed = JSON.parse(okOut);
+    eq(parsed.config_source, 'default', '真缺文件 CLI 仍走 default');
+    ok(Number.isInteger(parsed.counted_lines), '真缺文件有真实计数（非伪装零）');
+    rmSync(D4, { recursive: true, force: true });
   });
 
   t('[B2-SC20+SC21] push-guard 终闸: 入口 PASS→修复轮膨胀→终版 STOP 拒 push;豁免绑 head 变更即失效', () => {
