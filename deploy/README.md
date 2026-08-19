@@ -28,7 +28,7 @@ runtime 目录（state/lease/ledger/journal）一律在仓外 `~/pr-autopilot-ru
 
 ## 2. 盯梢引擎（本机 = 一条 Cindy 班车扫共享 state，W-2）
 
-- cron: `*/15 * * * *`；本机班车 `execution_mode=agent`（prompt 里后台拉起零 LLM 的 `engine.mjs`）。
+- cron: `30 * * * *`（每小时 :30，与补注册班车同一时钟）；本机班车 `execution_mode=agent`（prompt 里后台拉起零 LLM 的 `engine.mjs`）。无在册 PR 时 preRunHook（`probe.mjs`）exit 2 跳过，不起会话。
 - 本机 workingDir = `~/pr-autopilot`；业务仓路径只写在 `engine.json` 的 `repoDirs`，不靠第二条 schedule 分仓。
 - 入口命令（`--config` **必填**——缺 budget 配置引擎直接拒绝启动，审③-F13-R fail-closed）:
 
@@ -52,8 +52,7 @@ engine.json（完整必填示例；本机双仓 **共享同一 state + 同一 bu
   },
   "repoDirs": {
     "xindong/mivo-canvas-plugin": "/Users/<mini-user>/mivo-ops/mivo-canvas-plugin",
-    "makecindy/cindy": "/Users/<mini-user>/cindy-ops/cindy",
-    "xindong/mivo-canvas": "/Users/<mini-user>/mivo-ops/mivo-canvas"
+    "makecindy/cindy": "/Users/<mini-user>/cindy-ops/cindy"
   },
   "triReviewLedgerDir": "/Users/<mini-user>/pr-autopilot-runtime/tri-review",
   "escapeLedger": "/Users/<mini-user>/pr-autopilot-runtime/ledger/escape.jsonl",
@@ -61,7 +60,7 @@ engine.json（完整必填示例；本机双仓 **共享同一 state + 同一 bu
   "slackCmd": "node /Users/<mini-user>/mivo-ops/mivo-canvas-plugin/scripts/loops/bug-doctor/notify.mjs"
 }
 ```
-旧主仓 `xindong/mivo-canvas` 不再是盯梢默认目标，但共享 state 里还有它的历史 PR 状态文件——`repoDirs` 缺该 key 时终态清理 fail-closed（cleanup-pending 不销单），所以必须留着直到旧仓状态清空。
+旧主仓 `xindong/mivo-canvas` 已从扫仓范围和 `repoDirs` 摘除（2026-08-19）。历史 PR 状态文件销单后即可不再保留该 key。
 - `estimate` 是**行为参数**（`reserveBudget()`（`scripts/pr-watch/budget.mjs` 导出，engine 的
   dispatch 路径调用它预留，当前约 `engine.mjs:295`——以符号为准，行号会漂移），不是注释）——
   mivo 示例取 `3`：外部部署实测单样本 $1.41，保守取整为 3。
@@ -259,8 +258,8 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
 ### 2.2 补注册接线（reconcile 班车，T1）
 
 自己名下没走注册流程的旁路 PR，由 `deploy/wrappers/reconcile-own-prs.mjs` 补注册进盯梢。
-**本机生产入口 = `~/pr-autopilot-runtime/reconcile-cron.sh`**（`*/15 * * * *`，零 LLM）——
-循环 `xindong/mivo-canvas-plugin` 与 `makecindy/cindy`，**都写进共享 `state/`**，与盯梢引擎、每日卡片（§3）解耦独立调度：
+**本机生产入口 = `~/pr-autopilot-runtime/reconcile-cron.sh`**（LaunchAgent `StartCalendarInterval Minute=30`，与盯梢班车同一时钟，零 LLM）——
+循环 `xindong/mivo-canvas-plugin` 与 `makecindy/cindy`，**都写进共享 `state/`**，与盯梢引擎、每日卡片（§3）解耦独立调度。旧主仓 `xindong/mivo-canvas` 已从循环摘除（2026-08-19）。
 
 ```bash
 # 与 reconcile-cron.sh 同口径：两仓共用 --state-dir
@@ -277,13 +276,12 @@ node ~/pr-autopilot/deploy/wrappers/reconcile-own-prs.mjs \
 remote-map.json（base 仓全名 → 该仓 checkout 里修复 push 用的 remote 名；注册时必须显式声明，
 引擎不猜，同 §2 注册命令的 `--push-remote` 语义。key 一律要求严格 owner/repo 形状——
 `/foo`、`foo/`、多斜杠、非法字符的 key 会在启动前被拒。缺当前 `--repo` key = 该轮 fail-closed。
-旧主仓 key 仍要留着：共享 state 里的历史 PR 终态清理还认它）:
+旧主仓 key 已摘除（2026-08-19），补注册只认下面两仓）:
 
 ```json
 {
   "xindong/mivo-canvas-plugin": "origin",
-  "makecindy/cindy": "fork",
-  "xindong/mivo-canvas": "origin"
+  "makecindy/cindy": "fork"
 }
 ```
 
@@ -300,8 +298,8 @@ remote-map.json（base 仓全名 → 该仓 checkout 里修复 push 用的 remot
   互不混淆**——巡审侧（审查）至今没有按作者分片，补注册侧（盯梢注册）用 `--author @me`
   收窄，两者不互相取消。
 - **每日卡片的 ownPrsCmd 在 strict 默认（生产）下必填**（`scripts/inbox-digest/runner.mjs` 的补注册段）：runDigest 默认 `strict:true`（`:35`）把 ownPrsCmd 列入 requiredCfg（`:39`），省略它调 runDigest 会在采集前抛「digest 配置缺失: ownPrsCmd」（`:41`，fail-closed）——每日卡片启动即失败，不是「不配则跳过辅路」。跳过补注册的唯一方式是显式 `strict:false`（仅单元 fixture 用，非生产）。**本期只交付 reconcile 班车这条生产入口，不声称双仓补注册
-  已由每日卡片完成**——每日卡片 10:00 一次，旁路 PR 的 24h SLO 由 15 分钟班车兜底。
-- **registerPr 幂等**（同 wiring 重跑返回 already、不重置游标/在途 dispatch），15 分钟高频重跑
+  已由每日卡片完成**——每日卡片 10:00 一次，旁路 PR 的 24h SLO 由每小时 :30 的补注册班车兜底。
+- **registerPr 幂等**（同 wiring 重跑返回 already、不重置游标/在途 dispatch），每小时 :30 重跑
   安全，不会重复派发或污染在途任务。
 - 契约 fixture: `fixtures/own-prs.fixture.mjs`（真实三层接线 wrapper→reconcile→registerPr，
   只 stub gh 二进制）。
