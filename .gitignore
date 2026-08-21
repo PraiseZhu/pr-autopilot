@@ -9,6 +9,8 @@ scripts/schedule-checks/
 
 # syncthing 同步临时文件
 .syncthing.*.tmp
+# 过期意图草稿（权威副本在 PR body marker）
+scripts/.pr-intent.md
 
 # 本机运行时（原 ~/pr-autopilot-runtime；不入库）
 _runtime/
