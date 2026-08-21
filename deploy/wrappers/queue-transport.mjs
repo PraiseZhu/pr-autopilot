@@ -12,11 +12,13 @@
 //   5. 超时无 receipt = 非零退出（引擎 at-least-once: 预留释放 + 下轮重试）
 // 本脚本零猜测: 不碰 Cindy 内部 API，唯一环境耦合是「班车会话会写 receipt」这个契约。
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
-const QUEUE_DIR = process.env.PR_AUTOPILOT_QUEUE_DIR ?? join(homedir(), 'pr-autopilot-runtime', 'dispatch-queue');
+const HERE = dirname(fileURLToPath(import.meta.url));
+const DEFAULT_QUEUE_DIR = join(HERE, '..', '..', '_runtime', 'dispatch-queue');
+const QUEUE_DIR = process.env.PR_AUTOPILOT_QUEUE_DIR ?? DEFAULT_QUEUE_DIR;
 // 超时硬边界 [5s, 300s]——审⑩-P2-2 同款纪律: 0/NaN/超大 env 不得关闭有界性
 let timeoutMs = 240_000;
 if (process.env.PR_AUTOPILOT_QUEUE_TIMEOUT_MS !== undefined) {

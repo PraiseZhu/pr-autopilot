@@ -1,7 +1,7 @@
 node_modules/
 .DS_Store
 *.log
-# runtime 台账/状态数据绝不入库（部署机上位于 ~/pr-autopilot-runtime）
+# runtime 台账/状态数据绝不入库（默认在仓内 _runtime/；可用环境变量改）
 runtime/
 *.jsonl.head
 # mini 宿主 preRunHook 落盘目录（schedule_set_pre_run_hook 生成，随机器不随仓）
