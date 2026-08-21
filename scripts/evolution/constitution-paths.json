@@ -29,9 +29,9 @@
     "fixtures/**"
   ],
   "_whitelist_note": "fixtures/** 在白名单是 R10 的必然推论（自动落地必附误报回归 fixture）；fixture 只能新增断言，方向 diff 检查同样适用于它",
-  "proposal_ledger_path": "/Users/praise/pr-autopilot-runtime/ledger/proposal-ledger.jsonl",
-  "escape_ledger_path": "/Users/praise/pr-autopilot-runtime/ledger/escape.jsonl",
-  "fast_ledger_path": "/Users/praise/pr-autopilot-runtime/ledger/fast-bypass.jsonl",
+  "proposal_ledger_path": "/Users/praise/AI-Agent/Claude/projects/Project Skills/pr-autopilot/_runtime/ledger/proposal-ledger.jsonl",
+  "escape_ledger_path": "/Users/praise/AI-Agent/Claude/projects/Project Skills/pr-autopilot/_runtime/ledger/escape.jsonl",
+  "fast_ledger_path": "/Users/praise/AI-Agent/Claude/projects/Project Skills/pr-autopilot/_runtime/ledger/fast-bypass.jsonl",
   "_fast_ledger_note": "审⑤-I2: fast attestation 的 ledger_file 必须等于此路径；push-guard 对缺失该字段 fail-closed（不再静默跳过固定校验）",
   "confirm_rule_allowlist": [],
   "_confirm_rule_note": "审⑤-F6: E1 pending → confirm 的确定性规则 allowlist（rule_id）。初始为空 = 只有 owner HMAC（PR_AUTOPILOT_CONFIRM_KEY 签名）能转正；新增规则由 owner 亲手提交（本文件在宪法黑名单内）",
