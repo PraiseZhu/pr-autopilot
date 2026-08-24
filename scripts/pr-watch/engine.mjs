@@ -324,14 +324,18 @@ export function runEngine(cfg) {
         manifest_path: manifestPath,
         finalize_cmd: `node ${scriptsDir}finalize.mjs --repo-dir <修复worktree路径> --manifest ${manifestPath} --snapshot-cmd "${snapshotCmd}" --state-dir ${stateDir}`,
         complete_cmd: `node ${scriptsDir}complete.mjs --manifest ${manifestPath} --snapshot-cmd "${snapshotCmd}" --state-dir ${stateDir}`,
-        signals: res.signals, new_items: res.newItems,
+        signals: res.signals,
+        new_items: {
+          ...res.newItems,
+          ...(res.signals.includes('ci-red') ? { failing: snapshot.ci?.failing ?? [] } : {}),
+        },
         // 审(2026-08-08): 预算结算字段随 manifest 自包含投递——complete 在 ack 前凭
         // manifest.budget.{ledger,estimate} 机械结算 reserve（缺省 estimate 结算，--actual 可给实值）
         budget: { ledger: budget.ledger, estimate: budget.estimate },
         worktree_name: `fix-${state.pr_number}`,
         rules: [
           '第一步必须 git worktree add ../fix-<pr> 并切入（宿主无 per-dispatch worktree，S2）',
-          '从反馈提炼 SC 清单，goal skill --until-sc 修到每条 SC 有证据',
+          '从反馈提炼 SC 清单，用 goal skill 执行；投递文本含独立行 --until-sc，修到每条 SC 有证据',
           'push 必须经 finalize.mjs（remote CAS + PR open 复查 + CI 路径守卫 + remote↔仓绑定），绝不裸 push',
           '回帖必须带 provenance 签名且正文含 dispatch:<dispatch_id>（complete 探测依据）',
           '绝不合并、禁 force-push、禁改 CI 路径',

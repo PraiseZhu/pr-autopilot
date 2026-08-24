@@ -43,7 +43,7 @@ export function evaluate(cursors, snapshot, opts = {}) {
     if (r.outdated === true || r.dismissed === true) continue;
     if (r.commitOid && r.commitOid !== head) continue; // 旧 head 的 review 不唤醒
     if (!['CHANGES_REQUESTED', 'COMMENTED'].includes(r.state)) continue;
-    newItems.reviews.push(String(r.id));
+    newItems.reviews.push({ id: String(r.id), body: typeof r.body === 'string' ? r.body : '' });
   }
   if (newItems.reviews.length) signals.push('review');
 
@@ -53,7 +53,7 @@ export function evaluate(cursors, snapshot, opts = {}) {
     if (seenComments.has(String(c.id))) continue;
     if (c.author_is_self === true) continue;
     if (c.body && verifyMarker(c.body, hmacKey)) continue; // 自家签名评论不算反馈
-    newItems.comments.push(String(c.id));
+    newItems.comments.push({ id: String(c.id), body: typeof c.body === 'string' ? c.body : '' });
   }
   if (newItems.comments.length) signals.push('comment');
 
@@ -68,8 +68,8 @@ export function evaluate(cursors, snapshot, opts = {}) {
 
   // 推进后的游标（引擎在 ack 后才持久化，F6）
   const nextCursors = {
-    review_ids: [...seenReviews, ...newItems.reviews],
-    comment_ids: [...seenComments, ...newItems.comments],
+    review_ids: [...seenReviews, ...newItems.reviews.map((r) => (typeof r === 'object' ? r.id : r))],
+    comment_ids: [...seenComments, ...newItems.comments.map((c) => (typeof c === 'object' ? c.id : c))],
     ci_red_sha: signals.includes('ci-red') ? head : cursors.ci_red_sha,
     conflict_sha: signals.includes('conflict') ? head : cursors.conflict_sha
   };
