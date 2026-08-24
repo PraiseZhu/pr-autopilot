@@ -1523,6 +1523,7 @@ t('[审③F8-R] dispatch wrapper 四元组: 只回 session_id 拒 / 缺任一字
   const manifest = JSON.stringify({
     dispatch_id: 'd1', owner: 'o', repo: 'r', pr_number: 1, worktree_name: 'fix-1',
     signals: ['review'], original_head: SHA_A, rules: [],
+    new_items: { reviews: [{ id: 'r1', body: 'please fix the race' }], comments: [] },
     state_dir: '/tmp/state', snapshot_cmd: 'snap {owner} {repo} {pr}', manifest_path: '/tmp/m.json',
     finalize_cmd: 'node finalize.mjs ...', complete_cmd: 'node complete.mjs ...', branch: 'fix-1', remote: 'origin'
   });
@@ -1568,6 +1569,44 @@ t('[审③F8-R] dispatch wrapper 四元组: 只回 session_id 拒 / 缺任一字
   ok(runW(mkTransport(JSON.stringify({ ...full, model: 'z-ai/glm-5.2', effort: 'max' })),
     { over: { EXPECT_MODEL: 'z-ai/glm-5.2', EXPECT_EFFORT: 'max' } }),
   '换一套期望值且回执相符应过');
+});
+t('[盯梢 until-sc] 投递文本含独立行 --until-sc 与内联正文；空正文/裸 id fail-closed', () => {
+  const wDir = mkdtempSync(join(tmpdir(), 'du-'));
+  const captured = join(wDir, 'stdin.txt');
+  const mkTransport = (payload) => {
+    const f = join(wDir, `t-${Math.random().toString(36).slice(2)}.sh`);
+    writeFileSync(f, `#!/bin/sh\ncat > '${captured}'\necho '${payload}'\n`);
+    execFileSync('chmod', ['+x', f]);
+    return f;
+  };
+  const EXPECT_ENV = { EXPECT_AGENT_KIND: 'claude-code', EXPECT_PROVIDER: 'Cindy AI', EXPECT_MODEL: 'claude-sonnet-5', EXPECT_EFFORT: 'xhigh' };
+  const full = { session_id: 's1', agentKind: 'claude-code', provider: 'Cindy AI', model: 'claude-sonnet-5', effort: 'xhigh' };
+  const base = {
+    dispatch_id: 'd1', owner: 'o', repo: 'r', pr_number: 1, worktree_name: 'fix-1',
+    original_head: SHA_A, rules: [],
+    state_dir: '/tmp/state', snapshot_cmd: 'snap {owner} {repo} {pr}', manifest_path: '/tmp/m.json',
+    finalize_cmd: 'node finalize.mjs ...', complete_cmd: 'node complete.mjs ...', branch: 'fix-1', remote: 'origin'
+  };
+  const run = (manifest) => {
+    const env = { ...process.env, CINDY_DISPATCH_CMD: mkTransport(JSON.stringify(full)), ...EXPECT_ENV };
+    try {
+      execFileSync(process.execPath, [join(W, 'cindy-dispatch.mjs')], { encoding: 'utf8', input: JSON.stringify(manifest), env });
+      return { ok: true, text: existsSync(captured) ? readFileSync(captured, 'utf8') : '' };
+    } catch (e) {
+      return { ok: false, err: String(e.stderr || e.message) };
+    }
+  };
+  const good = run({ ...base, signals: ['comment'], new_items: { comments: [{ id: 'c1', body: 'fix the race' }], reviews: [] } });
+  ok(good.ok, '有正文应过: ' + (good.err || ''));
+  ok(good.text.split('\n').includes('--until-sc'), '投递数组必须含独立行 --until-sc');
+  ok(good.text.includes('fix the race'), '正文必须内联渲染');
+  ok(good.text.includes('OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY'), '授权行仍在');
+  ok(!run({ ...base, signals: ['comment'], new_items: { comments: [{ id: 'c1', body: '   ' }], reviews: [] } }).ok, '正文为空 → exit 1 fail-closed');
+  ok(!run({ ...base, signals: ['comment'], new_items: { comments: ['c1'], reviews: [] } }).ok, '裸 id → exit 1 fail-closed');
+  ok(!run({ ...base, signals: ['review'], new_items: { reviews: [], comments: [] } }).ok, '信号要正文但 new_items 空 → fail-closed');
+  ok(!run({ ...base, signals: ['comment'], new_items: { comments: [{ body: 'x' }], reviews: [] } }).ok, '对象缺 id → fail-closed');
+  const withUndefinedWord = run({ ...base, signals: ['comment'], new_items: { comments: [{ id: 'c1', body: 'repro is undefined in logs' }], reviews: [] } });
+  ok(withUndefinedWord.ok, '正文含字面量 undefined 不得当接线缺口拒: ' + (withUndefinedWord.err || ''));
 });
 
 // ---- T2/T3: 引擎失败可观测 + pending 超时告警（SC-2a/b · SC-3a/b/c）----

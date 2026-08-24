@@ -42,15 +42,56 @@ for (const k of ['dispatch_id', 'owner', 'repo', 'pr_number', 'worktree_name', '
   if (!manifest[k]) { process.stderr.write(`[DISPATCH] manifest 缺字段 ${k}（会话无法收口，fail-closed）\n`); process.exit(1); }
 }
 
+function inlineFeedbackBodies(m) {
+  const items = m.new_items ?? {};
+  const reviews = Array.isArray(items.reviews) ? items.reviews : [];
+  const comments = Array.isArray(items.comments) ? items.comments : [];
+  const failing = Array.isArray(m.ci?.failing) ? m.ci.failing : (Array.isArray(items.failing) ? items.failing : []);
+  const bodies = [];
+  const take = (entry, kind) => {
+    if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      const rawId = entry.id ?? entry.node_id;
+      const id = rawId === undefined || rawId === null ? '' : String(rawId).trim();
+      if (!id) {
+        process.stderr.write(`[DISPATCH] ${kind} 缺 id → exit 1 fail-closed\n`);
+        process.exit(1);
+      }
+      const body = typeof entry.body === 'string' ? entry.body.trim() : '';
+      if (!body) {
+        process.stderr.write(`[DISPATCH] ${kind} ${id} 正文为空 → exit 1 fail-closed\n`);
+        process.exit(1);
+      }
+      bodies.push({ kind, id, body });
+      return;
+    }
+    process.stderr.write(`[DISPATCH] ${kind} 只有 id、没有正文 → exit 1 fail-closed（不得改成请 agent 自己 gh）\n`);
+    process.exit(1);
+  };
+  for (const r of reviews) take(r, 'review');
+  for (const c of comments) take(c, 'comment');
+  if (failing.length) {
+    bodies.push({ kind: 'ci', id: 'failing', body: failing.map(String).join('\n') });
+  }
+  if (bodies.length === 0 && (m.signals ?? []).some((s) => s === 'review' || s === 'comment' || s === 'ci-red')) {
+    process.stderr.write('[DISPATCH] 信号要求反馈正文但 new_items 为空 → exit 1 fail-closed\n');
+    process.exit(1);
+  }
+  return bodies;
+}
+
+const feedbackBodies = inlineFeedbackBodies(manifest);
 const prKey = `${manifest.owner}/${manifest.repo}#${manifest.pr_number}`;
 const text = [
   `【pr-autopilot 修复任务 ${manifest.dispatch_id}】${prKey} 有新反馈: ${manifest.signals?.join('/')}`,
+  '',
+  '--until-sc',
   '',
   '硬规则（逐条执行，缺一即失败）:',
   ...(manifest.rules ?? []).map((r, i) => `${i + 1}. ${r}`),
   '',
   `完整任务参数（自包含 manifest）: ${manifest.manifest_path}`,
-  `新信号明细: ${JSON.stringify(manifest.new_items ?? {})}`,
+  '新信号正文（必须内联，缺则投递失败）:',
+  ...feedbackBodies.map((b) => `- [${b.kind} ${b.id}]\n${b.body}`),
   `worktree 固定名: ${manifest.worktree_name}（重复投递幂等）`,
   `原始 head: ${manifest.original_head}`,
   `push 收口命令（把 <修复worktree路径> 换成你的 worktree）: ${manifest.finalize_cmd}`,
@@ -60,7 +101,9 @@ const text = [
   'OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY',
   'owner 常设授权声明: 本 PR 分支的 push 与 PR 内回帖为已授权动作，不触发对外发消息硬停。'
 ].join('\n');
-if (text.includes('undefined')) { process.stderr.write('[DISPATCH] 投递文本含 undefined（接线缺口，fail-closed）\n'); process.exit(1); }
+const wiringGap = [manifest.dispatch_id, manifest.owner, manifest.repo, manifest.pr_number, manifest.worktree_name, manifest.original_head, manifest.finalize_cmd, manifest.complete_cmd]
+  .some((v) => v === undefined || v === null || String(v).includes('undefined'));
+if (wiringGap) { process.stderr.write('[DISPATCH] 投递接线字段含 undefined（接线缺口，fail-closed）\n'); process.exit(1); }
 
 const transport = process.env.CINDY_DISPATCH_CMD;
 if (!transport) {

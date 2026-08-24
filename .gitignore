@@ -14,3 +14,5 @@ scripts/.pr-intent.md
 
 # 本机运行时（原 ~/pr-autopilot-runtime；不入库）
 _runtime/
+.worktrees/
+.cindy-worktrees/
