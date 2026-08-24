@@ -50,13 +50,18 @@ function inlineFeedbackBodies(m) {
   const bodies = [];
   const take = (entry, kind) => {
     if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
-      const id = entry.id ?? entry.node_id ?? '';
-      const body = typeof entry.body === 'string' ? entry.body.trim() : '';
-      if (!body) {
-        process.stderr.write(`[DISPATCH] ${kind} ${id || '(missing id)'} 正文为空 → exit 1 fail-closed\n`);
+      const rawId = entry.id ?? entry.node_id;
+      const id = rawId === undefined || rawId === null ? '' : String(rawId).trim();
+      if (!id) {
+        process.stderr.write(`[DISPATCH] ${kind} 缺 id → exit 1 fail-closed\n`);
         process.exit(1);
       }
-      bodies.push({ kind, id: String(id), body });
+      const body = typeof entry.body === 'string' ? entry.body.trim() : '';
+      if (!body) {
+        process.stderr.write(`[DISPATCH] ${kind} ${id} 正文为空 → exit 1 fail-closed\n`);
+        process.exit(1);
+      }
+      bodies.push({ kind, id, body });
       return;
     }
     process.stderr.write(`[DISPATCH] ${kind} 只有 id、没有正文 → exit 1 fail-closed（不得改成请 agent 自己 gh）\n`);
@@ -96,7 +101,9 @@ const text = [
   'OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY',
   'owner 常设授权声明: 本 PR 分支的 push 与 PR 内回帖为已授权动作，不触发对外发消息硬停。'
 ].join('\n');
-if (text.includes('undefined')) { process.stderr.write('[DISPATCH] 投递文本含 undefined（接线缺口，fail-closed）\n'); process.exit(1); }
+const wiringGap = [manifest.dispatch_id, manifest.owner, manifest.repo, manifest.pr_number, manifest.worktree_name, manifest.original_head, manifest.finalize_cmd, manifest.complete_cmd]
+  .some((v) => v === undefined || v === null || String(v).includes('undefined'));
+if (wiringGap) { process.stderr.write('[DISPATCH] 投递接线字段含 undefined（接线缺口，fail-closed）\n'); process.exit(1); }
 
 const transport = process.env.CINDY_DISPATCH_CMD;
 if (!transport) {

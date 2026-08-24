@@ -1604,6 +1604,9 @@ t('[盯梢 until-sc] 投递文本含独立行 --until-sc 与内联正文；空�
   ok(!run({ ...base, signals: ['comment'], new_items: { comments: [{ id: 'c1', body: '   ' }], reviews: [] } }).ok, '正文为空 → exit 1 fail-closed');
   ok(!run({ ...base, signals: ['comment'], new_items: { comments: ['c1'], reviews: [] } }).ok, '裸 id → exit 1 fail-closed');
   ok(!run({ ...base, signals: ['review'], new_items: { reviews: [], comments: [] } }).ok, '信号要正文但 new_items 空 → fail-closed');
+  ok(!run({ ...base, signals: ['comment'], new_items: { comments: [{ body: 'x' }], reviews: [] } }).ok, '对象缺 id → fail-closed');
+  const withUndefinedWord = run({ ...base, signals: ['comment'], new_items: { comments: [{ id: 'c1', body: 'repro is undefined in logs' }], reviews: [] } });
+  ok(withUndefinedWord.ok, '正文含字面量 undefined 不得当接线缺口拒: ' + (withUndefinedWord.err || ''));
 });
 
 // ---- T2/T3: 引擎失败可观测 + pending 超时告警（SC-2a/b · SC-3a/b/c）----
