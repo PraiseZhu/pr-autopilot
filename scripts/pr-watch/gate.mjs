@@ -37,22 +37,36 @@ export function evaluate(cursors, snapshot, opts = {}) {
   const newItems = { reviews: [], comments: [] };
 
   // reviews: exact-head + 非 stale + 新 id
+  // Greptile / 空壳 COMMENTED review 的真正意见在 comment 上。空正文不唤醒，
+  // 但 id 必须进游标，否则每轮都当新信号、dispatch 再被空正文卡死。
   const seenReviews = new Set(cursors.review_ids);
+  const absorbedReviewIds = [];
   for (const r of snapshot.reviews ?? []) {
     if (seenReviews.has(String(r.id))) continue;
     if (r.outdated === true || r.dismissed === true) continue;
     if (r.commitOid && r.commitOid !== head) continue; // 旧 head 的 review 不唤醒
     if (!['CHANGES_REQUESTED', 'COMMENTED'].includes(r.state)) continue;
+    const body = typeof r.body === 'string' ? r.body.trim() : '';
+    if (!body && r.state === 'COMMENTED') {
+      absorbedReviewIds.push(String(r.id));
+      continue;
+    }
     newItems.reviews.push({ id: String(r.id), body: typeof r.body === 'string' ? r.body : '' });
   }
   if (newItems.reviews.length) signals.push('review');
 
   // comments: 新 id + 非自家 provenance
   const seenComments = new Set(cursors.comment_ids);
+  const absorbedCommentIds = [];
   for (const c of snapshot.comments ?? []) {
     if (seenComments.has(String(c.id))) continue;
     if (c.author_is_self === true) continue;
     if (c.body && verifyMarker(c.body, hmacKey)) continue; // 自家签名评论不算反馈
+    const body = typeof c.body === 'string' ? c.body.trim() : '';
+    if (!body) {
+      absorbedCommentIds.push(String(c.id));
+      continue;
+    }
     newItems.comments.push({ id: String(c.id), body: typeof c.body === 'string' ? c.body : '' });
   }
   if (newItems.comments.length) signals.push('comment');
@@ -66,10 +80,10 @@ export function evaluate(cursors, snapshot, opts = {}) {
     signals.push('conflict');
   }
 
-  // 推进后的游标（引擎在 ack 后才持久化，F6）
+  // 推进后的游标（引擎在 ack 后才持久化，F6；空壳 id 在 decision=none 时由引擎直接落盘）
   const nextCursors = {
-    review_ids: [...seenReviews, ...newItems.reviews.map((r) => (typeof r === 'object' ? r.id : r))],
-    comment_ids: [...seenComments, ...newItems.comments.map((c) => (typeof c === 'object' ? c.id : c))],
+    review_ids: [...seenReviews, ...newItems.reviews.map((r) => (typeof r === 'object' ? r.id : r)), ...absorbedReviewIds],
+    comment_ids: [...seenComments, ...newItems.comments.map((c) => (typeof c === 'object' ? c.id : c)), ...absorbedCommentIds],
     ci_red_sha: signals.includes('ci-red') ? head : cursors.ci_red_sha,
     conflict_sha: signals.includes('conflict') ? head : cursors.conflict_sha
   };
@@ -82,7 +96,7 @@ export function evaluate(cursors, snapshot, opts = {}) {
     return { decision: 'blocked-external', cursors, signals: ['hold-label', ...signals], newItems };
   }
   if (signals.length === 0) {
-    return { decision: 'none', cursors, signals: [], newItems };
+    return { decision: 'none', cursors: nextCursors, signals: [], newItems };
   }
   return { decision: 'actionable', cursors: nextCursors, signals, newItems };
 }

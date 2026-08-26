@@ -909,6 +909,20 @@ t('[F7] 旧评论+新 head 不唤醒 / 同 head 新 node 唤醒一次 / stale re
   eq(evaluate(c0, { ...snapBase, reviews: [{ id: 'r2', state: 'CHANGES_REQUESTED', commitOid: SHA_A, dismissed: true }] }).decision, 'none');
   eq(evaluate(c0, { ...snapBase, reviews: [{ id: 'r3', state: 'CHANGES_REQUESTED', commitOid: SHA_B }] }).decision, 'none');
   eq(evaluate(c0, { ...snapBase, reviews: [{ id: 'r4', state: 'CHANGES_REQUESTED', commitOid: SHA_A }] }).decision, 'actionable');
+  const emptyShell = evaluate(c0, { ...snapBase, reviews: [{ id: 'r-empty', state: 'COMMENTED', commitOid: SHA_A, body: '' }] });
+  eq(emptyShell.decision, 'none', '空壳 COMMENTED review 不得唤醒');
+  ok(emptyShell.cursors.review_ids.includes('r-empty'), '空壳 review id 必须进游标，避免每轮空转');
+  eq(evaluate(emptyShell.cursors, { ...snapBase, reviews: [{ id: 'r-empty', state: 'COMMENTED', commitOid: SHA_A, body: '' }] }).decision, 'none');
+  const mixed = evaluate(c0, {
+    ...snapBase,
+    reviews: [{ id: 'r-empty2', state: 'COMMENTED', commitOid: SHA_A, body: '   ' }],
+    comments: [{ id: 'c-real', body: '真正意见在这里' }]
+  });
+  eq(mixed.decision, 'actionable');
+  eq(mixed.signals.join('/'), 'comment');
+  eq(mixed.newItems.reviews.length, 0, '空壳 review 不得进投递正文');
+  ok(mixed.cursors.review_ids.includes('r-empty2'));
+  ok(mixed.cursors.comment_ids.includes('c-real'));
 });
 t('[F7] provenance HMAC: 自家评论不唤醒/篡改验不过/他人评论唤醒', () => {
   const signed = signMarker('机器人回帖: dispatch:abc 已修复', HMAC_KEY);
