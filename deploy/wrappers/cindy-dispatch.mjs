@@ -58,8 +58,10 @@ function inlineFeedbackBodies(m) {
       }
       const body = typeof entry.body === 'string' ? entry.body.trim() : '';
       if (!body) {
-        process.stderr.write(`[DISPATCH] ${kind} ${id} 正文为空 → exit 1 fail-closed\n`);
-        process.exit(1);
+        // Greptile 等会提交 COMMENTED 空壳 review，真正意见在 comment 上。
+        // 空正文不再 fail-closed，留给后面的 comment/ci；若全部为空仍会在下方拦下。
+        process.stderr.write(`[DISPATCH] ${kind} ${id} 正文为空 → skip\n`);
+        return;
       }
       bodies.push({ kind, id, body });
       return;

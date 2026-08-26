@@ -1601,6 +1601,14 @@ t('[盯梢 until-sc] 投递文本含独立行 --until-sc 与内联正文；空�
   ok(good.text.split('\n').includes('--until-sc'), '投递数组必须含独立行 --until-sc');
   ok(good.text.includes('fix the race'), '正文必须内联渲染');
   ok(good.text.includes('OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY'), '授权行仍在');
+  const emptyReviewWithComment = run({
+    ...base,
+    signals: ['review', 'comment'],
+    new_items: { reviews: [{ id: 'r1', body: '' }], comments: [{ id: 'c1', body: 'fix the race' }] }
+  });
+  ok(emptyReviewWithComment.ok, '空壳 review + 有正文 comment 应过: ' + (emptyReviewWithComment.err || ''));
+  ok(emptyReviewWithComment.text.includes('fix the race'), '空壳 review 不得吞掉 comment 正文');
+  ok(!emptyReviewWithComment.text.includes('[review r1]'), '空壳 review 不得内联空段');
   ok(!run({ ...base, signals: ['comment'], new_items: { comments: [{ id: 'c1', body: '   ' }], reviews: [] } }).ok, '正文为空 → exit 1 fail-closed');
   ok(!run({ ...base, signals: ['comment'], new_items: { comments: ['c1'], reviews: [] } }).ok, '裸 id → exit 1 fail-closed');
   ok(!run({ ...base, signals: ['review'], new_items: { reviews: [], comments: [] } }).ok, '信号要正文但 new_items 空 → fail-closed');
@@ -3207,7 +3215,9 @@ t('[P0-⑦] probe 探针: 无活 SKIP / 新信号·租约过期·canceling·终�
   writeFileSync(snapJson, JSON.stringify(snapBase));
   writeFileSync(join(qDir, 'x.task.txt'), 'x');
   ok(P9().work, '队列滞留 → RUN');
-  execFileSync('rm', [join(qDir, 'x.task.txt')]);
+  writeFileSync(join(qDir, 'x.receipt.json'), '{}');
+  eq(P9().work, false, '已有回执的滞留 task 不得放行班车');
+  execFileSync('rm', [join(qDir, 'x.task.txt'), join(qDir, 'x.receipt.json')]);
   // 杂质文件不触发
   writeFileSync(join(stDir, 'garbage__5.json'), '{}');
   eq(P9().work, false, '杂质文件不得放行班车');
