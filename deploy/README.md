@@ -112,6 +112,33 @@ engine.json（完整必填示例；本机双仓 **共享同一 state + 同一 bu
     「origin=fork / upstream=上游」布局，则注册时传 `--push-remote origin` 即可——remote
     名以**注册时显式声明**为准，不是约定死的。
 
+### 控制面开关（`control.json`，2026-09-03）
+
+班车 schedule 的 `paused` **不是**「关盯梢」。关跟进会话必须走本仓唯一开关文件
+`$PR_AUTOPILOT_RUNTIME/control.json`：
+
+```json
+{ "enabled": true, "changed_at": "2026-09-03T00:00:00.000Z", "changed_by": "owner" }
+```
+
+- **缺文件 / 读失败 / JSON 坏 / `enabled` 非布尔 = off**（fail-closed）。
+- 读者是薄模块 `scripts/pr-watch/control-gate.mjs`。`probe.mjs` CLI、`engine.mjs` CLI、
+  `cindy-dispatch.mjs`、`reconcile-own-prs.mjs` CLI 都过这一闸。
+- **review-pr 的 fix-handoff 不走 `cindy-dispatch`**（那是 pr-fix manifest + 班车队列协议）。
+  巡审出门前应调同一 `readControl`；包装器在 Review-PR 仓落地（本仓只提供闸）。
+- 库调用（`runEngine()` / `probe()` 函数）不传 `controlPath`、也不读 env 时 = `unconfigured` 放行，
+  避免回归 fixture 被缺文件误伤。生产 CLI / 班车必须设 `PR_AUTOPILOT_CONTROL` 或 `--control`。
+- 开关动作：
+
+```bash
+# off：写 enabled=false，把 dispatch-queue/*.task.txt 挪到 suppressed/，pending_dispatch 标 canceling
+bash deploy/wrappers/switch.sh off --runtime "$PR_AUTOPILOT_RUNTIME"
+# on
+bash deploy/wrappers/switch.sh on --runtime "$PR_AUTOPILOT_RUNTIME"
+```
+
+Cindy schedule 的 pause 只保留为「省 token 的第二道闸」，不再当开关语义。
+
 ### P0-⑦ 定案：CINDY_DISPATCH_CMD = 队列握手（班车形态）
 
 ```
@@ -240,8 +267,8 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
 班车 schedule 的 preRunHook 直接用本仓现成的 `deploy/wrappers/probe.mjs`，不要另写：
 
 - **三条退出路径（都要接对）**：
-  - `exit 0` = 有活 → 放行班车 agent 会话（引擎 + 队列投递）；**或运行期异常放行**（`probe.mjs:62-64` catch → exit 0，可用性优先：让完整引擎 + 通知链去暴露问题，而不是让探针静默扼杀所有轮次）；
-  - `exit 2` = 无活 → 跳过本轮，**零 token**，只花几次带 ETag 的 gh API 读（`probe.mjs:67`）；
+  - `exit 0` = 有活 → 放行班车 agent 会话（引擎 + 队列投递）；**或运行期异常放行**（`probe.mjs` 的 probe() catch → exit 0，可用性优先：让完整引擎 + 通知链去暴露问题，而不是让探针静默扼杀所有轮次）。**开关检查不在这个 catch 里**：`control.json` 缺/坏/off 在 try 外 `exit 2`，读开关失败不得放行班车。
+  - `exit 2` = 无活 **或控制面 off** → 跳过本轮，**零 token**；
   - `exit 1` = **参数/初始化错误**（`probe.mjs:52` 在 try 外 `fail(...,1)`，模块导入/初始化异常也不在 catch 内），**不受 fail-open 保护，且本仓未定义调度侧如何处理 exit 1**——这是调用姿势错了，不是「探针异常」。（本仓只有 exit 0/2 协议。）
 - **宿主 preRunHook 失败语义 2026-08-08 已确认：fail-open**——preRunHook 失败/异常不会拦停班车会话，宿主照常启动；所以「不接 probe 会怎样」从「可能每周期启动会话（需实测）」升级为**确定的**「每周期必起会话、空转轮也烧 token」。fail-closed 的唯一来源是把 probe.mjs 的 `exit 2` 接进宿主 preRunHook（无活 → 真正跳过）；本仓源码自身没有「preRunHook 失败 → 拦停」的 fail-closed 路径（曾写「源码 fail-closed / 待实测」的旧说法已随 T4 更正，P0 项 ⑦ 见 `deploy/README.md:16`）。
 - **通知链是 best-effort，别依赖「收到」当验收**，重试语义按事件分述：`pending-stuck`（`engine.mjs:225-235`）**去重**——`pending_stuck_notified` 标记在**尝试发送后即置位（含发送失败）**（`engine.mjs:234`），同一 PR 的 pending-stuck 告警至多发一次，取舍是宁丢一次不刷屏（`engine.mjs:224-226` 注释原文）；`stuck`（`engine.mjs:243-248`）**无去重标记**——每次租约到期且 `redispatch_count` ≥ `stuckThreshold`（`engine.mjs:240`）都再次调 routeNotify，连续租约过期 + 通知命令失败 = 每条都记 `notify-error`（多条），不是「不重试、不补发」；`budget-pause`（`engine.mjs:302`）**按日去重**——`budget_notified_on` 当日已通知则不再发（`engine.mjs:299`）。判断「告警是否被发出」以 journal 的 `notify-error` 有无为准，不能假设必达。
@@ -258,8 +285,11 @@ export SNAPSHOT_CACHE_DIR=/path/to/snapshot-cache   # 与 REQUIRED_CONTEXTS_FILE
 ### 2.2 补注册接线（reconcile 班车，T1）
 
 自己名下没走注册流程的旁路 PR，由 `deploy/wrappers/reconcile-own-prs.mjs` 补注册进盯梢。
-**本机生产入口 = `~/pr-autopilot-runtime/reconcile-cron.sh`**（LaunchAgent `StartCalendarInterval Minute=30`，与盯梢班车同一时钟，零 LLM）——
-循环 `xindong/mivo-canvas-plugin` 与 `makecindy/cindy`，**都写进共享 `state/`**，与盯梢引擎、每日卡片（§3）解耦独立调度。旧主仓 `xindong/mivo-canvas` 已从循环摘除（2026-08-19）。
+**独立 LaunchAgent `com.praise.pr-autopilot-reconcile` 已删除（2026-09-03）**：它不读控制面开关，
+load 即绕过「关盯梢」。补注册改为盯梢班车轮内的一步（与班车同生同灭），CLI 过 `control-gate`——
+`enabled=false` 时非零退出、不写 state。旧的 `_runtime/reconcile-cron.sh` / plist 不再是生产入口，
+机器上若仍 loaded 必须 `launchctl unload` 后删掉。
+循环 `xindong/mivo-canvas-plugin` 与 `makecindy/cindy`，**都写进共享 `state/`**。旧主仓 `xindong/mivo-canvas` 已从循环摘除（2026-08-19）。
 
 ```bash
 # 与 reconcile-cron.sh 同口径：两仓共用 --state-dir

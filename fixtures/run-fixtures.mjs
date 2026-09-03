@@ -24,6 +24,7 @@ import { matchUiPaths, registryReceipt } from '../scripts/ui-paths/match.mjs';
 import { registerPr, unregisterPr, checkReceipt, stateFileName, legacyStateFileName, parseStateFileName, migrateAllLegacyStateFiles, STATE_FILE_NAME_RE } from '../scripts/pr-watch/register.mjs';
 import { evaluate, emptyCursors } from '../scripts/pr-watch/gate.mjs';
 import { runEngine } from '../scripts/pr-watch/engine.mjs';
+import { readControl, writeControl, sweepQueueToSuppressed, markPendingCanceling, SUPPRESSED_BY_SWITCH } from '../scripts/pr-watch/control-gate.mjs';
 import { ackDispatch, cancelDispatch, settleAndAckDispatch } from '../scripts/pr-watch/ack.mjs';
 import { checkFinalize, receiptPath, receiptPathLocked } from '../scripts/pr-watch/finalize.mjs';
 import { checkCompletion } from '../scripts/pr-watch/complete.mjs';
@@ -3211,6 +3212,16 @@ t('[P0-⑦] probe 探针: 无活 SKIP / 新信号·租约过期·canceling·终�
   // 杂质文件不触发
   writeFileSync(join(stDir, 'garbage__5.json'), '{}');
   eq(P9().work, false, '杂质文件不得放行班车');
+  // 开关：库调用不传 controlPath = unconfigured 放行（本段既有断言不被误伤）
+  const ctl = join(dP, 'control.json');
+  writeControl({ controlPath: ctl, enabled: false, changedBy: 'fixture' });
+  eq(P9({ controlPath: ctl }).work, false, 'enabled=false → SKIP 即使有滞留队列');
+  writeFileSync(join(qDir, 'y.task.txt'), 'y');
+  eq(P9({ controlPath: ctl }).work, false, 'off 时滞留队列也不得放行班车');
+  execFileSync('rm', [join(qDir, 'y.task.txt')]);
+  writeControl({ controlPath: ctl, enabled: true, changedBy: 'fixture' });
+  writeFileSync(join(qDir, 'z.task.txt'), 'z');
+  ok(P9({ controlPath: ctl }).work, 'enabled=true 滞留队列 → RUN');
 });
 
 // ========== 16. merged 远端分支清理（owner 2026-08-01 点单） ==========
@@ -8872,6 +8883,106 @@ t('[R4-SC-RC3] cancel 锁内只读核对 legacy receipt 无死锁: 意图 receip
   ok(rcOk.ok, `错 dispatch receipt 不拦取消（正常取消）: ${rcOk.reason}`);
   ok(!readJson(st701).pending_dispatch, '取消完成清 pending');
   for (const f of [leg701, st701]) execFileSync('rm', ['-f', f]);
+});
+
+console.log('\n[control-gate] 唯一开关: 缺路径放行 / 缺文件 off / 坏 JSON off / sweep+canceling');
+t('[control-gate] 库语义: 未配置放行；缺文件/坏 JSON/非布尔 = off；enabled 布尔生效', () => {
+  eq(readControl({}).reason, 'unconfigured');
+  ok(readControl({}).allowed, '不传路径必须放行（保住 runEngine/probe fixture）');
+  const d = mkdtempSync(join(tmpdir(), 'cg-'));
+  const p = join(d, 'control.json');
+  eq(readControl({ controlPath: p }).reason, 'missing');
+  ok(!readControl({ controlPath: p }).allowed && readControl({ controlPath: p }).status === SUPPRESSED_BY_SWITCH, '缺文件 fail-closed');
+  writeFileSync(p, '{');
+  eq(readControl({ controlPath: p }).reason, 'malformed-json');
+  writeFileSync(p, JSON.stringify({ enabled: 'yes' }));
+  eq(readControl({ controlPath: p }).reason, 'enabled-not-boolean');
+  writeControl({ controlPath: p, enabled: false, changedBy: 't' });
+  eq(readControl({ controlPath: p }).reason, 'disabled');
+  writeControl({ controlPath: p, enabled: true, changedBy: 't' });
+  eq(readControl({ controlPath: p }).reason, 'enabled');
+  ok(readControl({ env: { PR_AUTOPILOT_CONTROL: p } }).allowed, 'env 路径 enabled=true 放行');
+});
+t('[control-gate] sweep-off: 队列进 suppressed，pending 标 canceling；已 canceling 不重复', () => {
+  const d = mkdtempSync(join(tmpdir(), 'cg2-'));
+  const q = join(d, 'queue'); mkdirSync(q);
+  const sup = join(d, 'suppressed');
+  const st = join(d, 'state'); mkdirSync(st);
+  writeFileSync(join(q, 'abcdabcdabcdabcd.task.txt'), 'task');
+  writeFileSync(join(q, 'note.txt'), 'not-a-task');
+  registerPr({ stateDir: st, owner: 'o', repo: 'r', prNumber: 1, branch: 'f', pushRemote: 'origin' });
+  const sf = join(st, stateFileName('o', 'r', 1));
+  const base = readJson(sf);
+  writeFileSync(sf, JSON.stringify({ ...base, pending_dispatch: { dispatch_id: 'd1', dispatched_at: new Date().toISOString(), manifest: {} } }));
+  const swept = sweepQueueToSuppressed({ queueDir: q, suppressedDir: sup });
+  eq(swept.moved.length, 1, '只搬 *.task.txt');
+  ok(!existsSync(join(q, 'abcdabcdabcdabcd.task.txt')), '源任务已挪走');
+  ok(existsSync(join(q, 'note.txt')), '非 task 文件不动');
+  ok(readdirSync(sup).some((f) => f.endsWith('.task.txt')), 'suppressed 留痕');
+  const marked = markPendingCanceling({ stateDir: st });
+  eq(marked.marked, [stateFileName('o', 'r', 1)], `marked=${JSON.stringify(marked)}`);
+  ok(readJson(sf).pending_dispatch.canceling, 'pending 标 canceling');
+  eq(markPendingCanceling({ stateDir: st }).marked.length, 0, '已 canceling 不重复');
+});
+t('[control-gate] cindy-dispatch CLI: PR_AUTOPILOT_CONTROL=off 在 EXPECT 之前 exit 2 并留痕', () => {
+  const d = mkdtempSync(join(tmpdir(), 'cg3-'));
+  const ctl = join(d, 'control.json');
+  const sup = join(d, 'suppressed');
+  writeControl({ controlPath: ctl, enabled: false, changedBy: 't' });
+  const manifest = JSON.stringify({
+    dispatch_id: 'd1', owner: 'o', repo: 'r', pr_number: 1, worktree_name: 'fix-1',
+    signals: ['review'], original_head: SHA_A, rules: [],
+    new_items: { reviews: [{ id: 'r1', body: 'please fix the race' }], comments: [] },
+    state_dir: '/tmp/state', snapshot_cmd: 'snap {owner} {repo} {pr}', manifest_path: '/tmp/m.json',
+    finalize_cmd: 'node finalize.mjs ...', complete_cmd: 'node complete.mjs ...', branch: 'fix-1', remote: 'origin'
+  });
+  let code = 0, err = '';
+  try {
+    execFileSync(process.execPath, [join(W, 'cindy-dispatch.mjs')], {
+      encoding: 'utf8', input: manifest,
+      env: { ...process.env, PR_AUTOPILOT_CONTROL: ctl, PR_AUTOPILOT_SUPPRESSED_DIR: sup },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+  } catch (e) { code = e.status; err = String(e.stderr || ''); }
+  eq(code, 2, `off 必须 exit 2，got ${code} ${err}`);
+  ok(err.includes(SUPPRESSED_BY_SWITCH), err);
+  ok(readdirSync(sup).some((f) => f.endsWith('.json')), 'suppressed 必须留痕');
+});
+t('[control-gate] engine 库路径: 显式 controlPath=off 拒启动；不传路径不拒', () => {
+  const d = mkdtempSync(join(tmpdir(), 'cg4-'));
+  const ctl = join(d, 'control.json');
+  writeControl({ controlPath: ctl, enabled: false, changedBy: 't' });
+  let threw = false;
+  try { runEngine({ ...ENG(), controlPath: ctl }); } catch (e) { threw = /control-gate/.test(e.message); }
+  ok(threw, '显式 off 必须拒启动');
+  ok(runEngine(ENG()).scanned >= 0, '不传 controlPath 必须放行既有引擎 fixture');
+});
+t('[control-gate] probe CLI: 缺 control.json 在 catch 外 exit 2，不得被可用性优先吃成 0', () => {
+  const d = mkdtempSync(join(tmpdir(), 'cg6-'));
+  mkdirSync(join(d, 'state'));
+  let code = 0, err = '';
+  try {
+    execFileSync(process.execPath, [join(W, 'probe.mjs'), '--state-dir', join(d, 'state'), '--snapshot-cmd', 'echo {}'], {
+      encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe']
+    });
+  } catch (e) { code = e.status; err = String(e.stderr || ''); }
+  eq(code, 2, `缺文件必须 exit 2 不是 0，got ${code} ${err}`);
+  ok(/SUPPRESSED_BY_SWITCH/.test(err) && /missing/.test(err), err);
+});
+t('[control-gate] switch.sh off/on: 写 control.json + 清队列', () => {
+  const d = mkdtempSync(join(tmpdir(), 'cg5-'));
+  mkdirSync(join(d, 'state'));
+  mkdirSync(join(d, 'dispatch-queue'));
+  writeFileSync(join(d, 'dispatch-queue', 'deadbeefdeadbeef.task.txt'), 'x');
+  const sh = join(W, 'switch.sh');
+  execFileSync('chmod', ['+x', sh]);
+  const offOut = execFileSync(sh, ['off', '--runtime', d, '--changed-by', 'fixture'], { encoding: 'utf8' });
+  const off = JSON.parse(offOut.trim().split('\n').filter(Boolean).pop());
+  ok(off.gate && off.gate.allowed === false, offOut);
+  ok(off.swept.moved.length === 1, 'off 必须搬队列: ' + offOut);
+  const onOut = execFileSync(sh, ['on', '--runtime', d, '--changed-by', 'fixture'], { encoding: 'utf8' });
+  const on = JSON.parse(onOut.trim().split('\n').filter(Boolean).pop());
+  ok(on.allowed === true && on.enabled === true, onOut);
 });
 
 // ========== 汇总 + SKIPPED ==========

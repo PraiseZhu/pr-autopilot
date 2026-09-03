@@ -8,8 +8,9 @@
 //   F6-R : ack 由 complete.mjs 在 push+回帖两项副作用确认后触发（引擎只认 ack）
 //   F7-R : blocked-external 不消费游标（gate 已改），解除 hold 后信号仍在
 //   I2-R : repoDirs 缺失 = 清理 fail-closed → cleanup-pending，不销单
-import { readdirSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
+import { readdirSync, existsSync, mkdirSync, appendFileSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { readJson, writeJsonAtomic, parseArgs, fail, nowIso, sha256, canonicalJson, isMain} from '../lib/common.mjs';
 import { withLock } from '../lib/state-lock.mjs';
@@ -19,6 +20,7 @@ import { reserveBudget, releaseReserve } from './budget.mjs';
 import { cleanupRemoteBranch } from './branch-cleanup.mjs';
 import { send as routeNotify } from './notify-router.mjs';
 import { classifyEscapes } from '../evolution/escape-classify.mjs';
+import { readControl, resolveProductionControlPath } from './control-gate.mjs';
 
 function runCmd(template, vars, stdinData) {
   const parts = template.split(' ').map((p) =>
@@ -71,9 +73,14 @@ export function runEngine(cfg) {
     pendingStuckHours = 6, // T3/SC-3a: pending 等待 ack 超时告警阈值（默认 6 小时，可经 config 覆盖）
     deleteRemoteBranchOnMerge = false, // 审⑬/owner 点单: 显式 opt-in 才启用远端分支清理
     hmacKey = process.env.PR_AUTOPILOT_HMAC_KEY ?? null,
-    nowMs = Date.now()
+    nowMs = Date.now(),
+    controlPath = null
   } = cfg;
 
+  const gate = readControl({ controlPath });
+  if (!gate.allowed) {
+    throw new Error(`引擎启动拒绝: control-gate ${gate.status} (${gate.reason})`);
+  }
   if (!budget || !budget.ledger || !(budget.cap > 0) || !(budget.estimate > 0)) {
     throw new Error('引擎启动拒绝: budget{ledger,cap,estimate} 必填（F13-R fail-closed——没有预算闸不许开盯梢）');
   }
@@ -379,18 +386,29 @@ export function runEngine(cfg) {
   return out;
 }
 
-if (isMain(import.meta.url)) {
+const invokedAsCli = (() => {
+  if (isMain(import.meta.url)) return true;
+  if (!process.argv[1]) return false;
+  try { return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); }
+  catch { return /(?:^|\/)engine\.mjs$/.test(process.argv[1]); }
+})();
+if (invokedAsCli) {
   const args = parseArgs(process.argv.slice(2));
   const need = ['state-dir', 'lease', 'snapshot-cmd', 'dispatch-cmd', 'config'];
   if (need.some((k) => !args[k])) {
     fail('用法: engine.mjs --state-dir <dir> --lease <file> --snapshot-cmd "<cmd>" --dispatch-cmd "<cmd>" --config <engine.json>（config 必填: budget/repoDirs 等，F13-R/I2-R fail-closed）');
   }
   const extra = readJson(args.config);
+  const controlPath = resolveProductionControlPath({
+    controlPath: args.control ?? extra.controlPath ?? null,
+    stateDir: args['state-dir']
+  });
   const res = runEngine({
+    ...extra,
     stateDir: args['state-dir'], leaseFile: args.lease,
     snapshotCmd: args['snapshot-cmd'], dispatchCmd: args['dispatch-cmd'],
     journalFile: args.journal,
-    ...extra
+    controlPath
   });
   process.stdout.write(JSON.stringify(res) + '\n');
 }

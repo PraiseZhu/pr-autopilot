@@ -11,11 +11,13 @@
 //      迁移拒绝 throw）→ errors 记明细且该轮非零
 // 退出码: 配置错 / gh 失败 / errors 非空 → 非零；其余（含合法 dropped）→ 0
 // 输出 JSON 四明细: {registered:[prKey...], already:[prKey...], dropped:[{pr,reason}...], errors:[{pr,reason}...]}
-import { mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { isMain, parseArgs, fail } from '../../scripts/lib/common.mjs';
 import { registerPr } from '../../scripts/pr-watch/register.mjs';
 import { listOwnPrs, parseRepo } from './own-prs.mjs';
 import { validateRemoteName } from '../../scripts/lib/git-checks.mjs';
+import { readControl } from '../../scripts/pr-watch/control-gate.mjs';
 
 // ①层启动校验: 读 map 并整体校验（结构 + 全部 alias 非空字符串 + 缺当前 --repo key 即报错）。
 // 所有 key 也要求严格 owner/repo 形状（parseRepo grammar 复用，own-prs.mjs 导出）——
@@ -73,11 +75,25 @@ export function reconcileOwnPrs({ repo, stateDir, remoteMap }) {
   return { registered, already, dropped, errors };
 }
 
-if (isMain(import.meta.url)) {
+const invokedAsCli = (() => {
+  if (isMain(import.meta.url)) return true;
+  if (!process.argv[1]) return false;
+  try { return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); }
+  catch { return /(?:^|\/)reconcile-own-prs\.mjs$/.test(process.argv[1]); }
+})();
+if (invokedAsCli) {
   const args = parseArgs(process.argv.slice(2));
   const need = ['repo', 'state-dir', 'remote-map-file'];
   if (need.some((k) => !args[k])) {
-    fail('用法: reconcile-own-prs.mjs --repo <owner/repo> --state-dir <dir> --remote-map-file <path>');
+    fail('用法: reconcile-own-prs.mjs --repo <owner/repo> --state-dir <dir> --remote-map-file <path> [--control <file>]');
+  }
+  // 只认 --control / PR_AUTOPILOT_CONTROL。不从 --state-dir 推——own-prs fixture 的临时
+  // state 旁没有 control.json，一推就 missing=off，把补注册契约冲掉。生产由 reconcile-cron
+  // 注入 PR_AUTOPILOT_CONTROL 或显式 --control。未配置 = unconfigured 放行。
+  const controlPath = args.control ?? process.env.PR_AUTOPILOT_CONTROL ?? null;
+  const gate = readControl({ controlPath });
+  if (!gate.allowed) {
+    fail(`control-gate ${gate.status} (${gate.reason}) path=${controlPath}——补注册与班车同生同灭，开关 off 不写 state`);
   }
   let remoteMap;
   try { remoteMap = loadRemoteMap(args['remote-map-file'], args.repo); }

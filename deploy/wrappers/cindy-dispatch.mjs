@@ -8,6 +8,7 @@
 // 本 adapter 自身不猜 Cindy 内部 API——传输层是唯一环境耦合点，用录制 fixture 验证契约。
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { readControl, suppressRecord, SUPPRESSED_BY_SWITCH } from '../../scripts/pr-watch/control-gate.mjs';
 
 // 审③-F8-R: 四元组全量必填 exact match（provider 在内），回执缺任一字段 = 派发失败
 //
@@ -25,6 +26,31 @@ const EXPECT_ENV = {
   model: 'EXPECT_MODEL',
   effort: 'EXPECT_EFFORT'
 };
+
+const manifest = JSON.parse(readFileSync(0, 'utf8'));
+// 只认显式 PR_AUTOPILOT_CONTROL，不从 manifest.state_dir 推——fixture 的 /tmp/state
+// 旁根本没有 control.json，一推就变成 missing=off，把四元组契约测冲掉。
+// 生产由 env.sh / 班车环境注入；未配置 = 库语义 unconfigured（放行，与 probe/runEngine 一致）。
+const controlPath = process.env.PR_AUTOPILOT_CONTROL ?? null;
+const gate = readControl({ controlPath });
+if (!gate.allowed) {
+  const suppressedDir = process.env.PR_AUTOPILOT_SUPPRESSED_DIR
+    ?? (process.env.PR_AUTOPILOT_RUNTIME ? `${process.env.PR_AUTOPILOT_RUNTIME}/suppressed` : null);
+  if (suppressedDir) {
+    try {
+      suppressRecord({
+        suppressedDir,
+        kind: 'cindy-dispatch',
+        payload: { dispatch_id: manifest.dispatch_id, owner: manifest.owner, repo: manifest.repo, pr_number: manifest.pr_number, reason: gate.reason }
+      });
+    } catch (e) {
+      process.stderr.write(`[DISPATCH] suppressed 留痕失败: ${e.message}\n`);
+    }
+  }
+  process.stderr.write(`[DISPATCH] ${SUPPRESSED_BY_SWITCH} (${gate.reason}) path=${controlPath}\n`);
+  process.exit(2);
+}
+
 const EXPECT = {};
 for (const [field, envVar] of Object.entries(EXPECT_ENV)) {
   const v = process.env[envVar];
@@ -34,8 +60,6 @@ for (const [field, envVar] of Object.entries(EXPECT_ENV)) {
   }
   EXPECT[field] = v;
 }
-
-const manifest = JSON.parse(readFileSync(0, 'utf8'));
 // 审④-F5: 修复会话必须能直接执行 finalize/complete——缺任一接线字段 = 派发失败
 // 审⑤-F4: branch/remote 加入必填——缺任一 = finalize 注定失败的空转派发，投递前拦下
 for (const k of ['dispatch_id', 'owner', 'repo', 'pr_number', 'worktree_name', 'state_dir', 'snapshot_cmd', 'manifest_path', 'finalize_cmd', 'complete_cmd', 'original_head', 'branch', 'remote']) {

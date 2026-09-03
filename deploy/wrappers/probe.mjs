@@ -6,14 +6,19 @@
 // 判定完全复用引擎同源模块（gate.evaluate / stateFileName 文法），不另造第二套信号逻辑。
 // 探针自身异常 → exit 0 放行（可用性优先: 让完整引擎 + 通知链去暴露问题，
 // 而不是让探针静默扼杀所有轮次）。
-import { readdirSync, readFileSync, existsSync } from 'node:fs';
+// 控制面开关检查在该 catch 之外：control.json 缺/坏/off → exit 2，不得被可用性优先吃掉。
+import { readdirSync, readFileSync, existsSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { parseArgs, fail, isMain } from '../../scripts/lib/common.mjs';
 import { evaluate, emptyCursors } from '../../scripts/pr-watch/gate.mjs';
 import { stateFileName, migrateAllLegacyStateFiles, STATE_FILE_NAME_RE } from '../../scripts/pr-watch/register.mjs';
+import { readControl, resolveProductionControlPath } from '../../scripts/pr-watch/control-gate.mjs';
 
-export function probe({ stateDir, queueDir, snapshotCmd, leaseTtlMinutes = 40, hmacKey = null, nowMs = Date.now() }) {
+export function probe({ stateDir, queueDir, snapshotCmd, leaseTtlMinutes = 40, hmacKey = null, nowMs = Date.now(), controlPath = null }) {
+  const gate = readControl({ controlPath });
+  if (!gate.allowed) return { work: false, why: `control-gate ${gate.status} (${gate.reason})`, gate };
   // 队列有未消费任务（上一班车没送完/晚到回执）→ 有活
   if (queueDir && existsSync(queueDir) && readdirSync(queueDir).some((f) => f.endsWith('.task.txt'))) {
     return { work: true, why: 'dispatch-queue 有滞留任务' };
@@ -46,10 +51,27 @@ export function probe({ stateDir, queueDir, snapshotCmd, leaseTtlMinutes = 40, h
   return { work: false, why: '全部在册 PR 无新信号' };
 }
 
-if (isMain(import.meta.url)) {
+const invokedAsCli = (() => {
+  if (isMain(import.meta.url)) return true;
+  if (!process.argv[1]) return false;
+  try { return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); }
+  catch { return /(?:^|\/)probe\.mjs$/.test(process.argv[1]); }
+})();
+if (invokedAsCli) {
   const args = parseArgs(process.argv.slice(2));
   if (!args['state-dir'] || !args['snapshot-cmd']) {
-    fail('用法: probe.mjs --state-dir <dir> --snapshot-cmd "<cmd>" [--queue-dir <dir>] [--lease-ttl-minutes 40]', 1);
+    fail('用法: probe.mjs --state-dir <dir> --snapshot-cmd "<cmd>" [--queue-dir <dir>] [--lease-ttl-minutes 40] [--control <file>]', 1);
+  }
+  // 开关检查在探针异常 catch 之外：control.json 缺/坏 = off → exit 2。
+  // 不得进下面那个「可用性优先 exit 0」——读开关失败放行班车，等于开关失效。
+  const controlPath = resolveProductionControlPath({
+    controlPath: args.control ?? null,
+    stateDir: args['state-dir']
+  });
+  const gate = readControl({ controlPath });
+  if (!gate.allowed) {
+    process.stderr.write(`[PROBE] SKIP: control-gate ${gate.status} (${gate.reason}) path=${controlPath}\n`);
+    process.exit(2);
   }
   let r;
   try {
@@ -57,7 +79,8 @@ if (isMain(import.meta.url)) {
       stateDir: args['state-dir'], queueDir: args['queue-dir'] ?? null,
       snapshotCmd: args['snapshot-cmd'],
       leaseTtlMinutes: Number(args['lease-ttl-minutes'] ?? 40),
-      hmacKey: process.env.PR_AUTOPILOT_HMAC_KEY ?? null
+      hmacKey: process.env.PR_AUTOPILOT_HMAC_KEY ?? null,
+      controlPath
     });
   } catch (e) {
     process.stderr.write(`[PROBE] 探针异常（放行班车，让引擎/通知链暴露问题）: ${e.message}\n`);
