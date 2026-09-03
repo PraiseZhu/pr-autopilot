@@ -1,6 +1,6 @@
 ---
 name: submit-pr
-description: 提交 PR v2 — push 前三审收口（对抗双审 + 上游预演）+ 共识后自动修复 + push + 注册盯梢。触发词「提交 PR」。
+description: 提交 PR v2 — push 前三审收口（对抗双审 + 上游预演）+ 共识后自动修复 + push。触发词「提交 PR」。不注册盯梢、不开跟进会话。
 ---
 
 # 提交 PR v2（三审收口版）
@@ -17,7 +17,7 @@ Phase 1.5 预扫自清洗（haiku diff-scanner 只报可疑点 → lead 核实�
 Phase 2  三审（push 之前，SHA 绑定 + 盲审；R1 走加固清单穷举）
 Phase 2b 共识 → SC 提炼（自动，无需 owner 授权）
 Phase 2c 修复 worker（模型见 Phase 2c 修复席表；按类套形状，goal --until-sc）→ delta 复核 → 收敛即收口
-Phase 3  同一 worker: push-guard → push → gh pr create/edit → ssh mini 注册盯梢（回执四要素）
+Phase 3  同一 worker: push-guard → push → gh pr create/edit。**禁止** ssh Mini 注册盯梢、禁止开跟进修复会话。
 ```
 
 > **`face=pass` 与 `APPROVED` 的权威定义（issue #9 F4 修复；全文仅此一处定义，其余提及处与本段
@@ -584,7 +584,7 @@ node scripts/fix-plan.mjs --artifact consensus.json --manifest sc-manifest.json 
 - **本表刻意不写具体模型值**——`routing.json` 是唯一真相源，`node -e` 或 Read 现读即得。复述模型值已出过事故：commit `c57ea43` 专门清掉 `plan.md` 的具体模型值，就是因为「文档复述 + 席位表改了不同步 → 照旧值填错模型」（2026-08-05 两个会话都派了已被移除的模型）。
 - **与 Orca 路由表的优先关系（显式写明，防下一个会话判错）**：`~/.claude/rules/agent-dispatch.md` 的权威顺序是「skill 内明确编排 > 任务类型首选规则」。本表**不覆盖** `execute` 档的值，而是**指向**它——所以两者天然不冲突，无需裁决。若将来 owner 要让修复席脱离 `execute` 档，必须在本表写明并说明理由，不得靠某处复述的旧值默认生效。
 - 换值的唯一合法路径是 `model-route set 执行 <模型> [effort]`（脚本校验模型存在性/可路由性/枚举，写入前自动备份）；**禁止手改 `routing.json`**。
-- 与 mini 盯梢链的修复会话**是两回事**：那条走引擎 schedule 的四元组继承（见 `deploy/README.md`），本表不管它，改本表不改它。
+- Mini 盯梢链已停用（2026-09-03）：本 skill 不再 ssh 注册，也不开盯梢修复会话。本表只约束 Phase 2c 修复 worker。
 
 **修复方设计约束（写代码之前，按类套形状——反补丁螺旋的主闸）**：
 派工包必须带上 `references/hardening-checklist.md`，并要求 worker：**动手前先判本 SC 触碰的
@@ -913,7 +913,8 @@ candidate 不改变它们的判据（与本节「反猫捉老鼠」立场一致�
   — **不冒充已堵跨 PR**。
 - **语义复发边界（T1 上限，如实声明）**：批次协议拦的是**逐字复发**，拦不住**语义复发**——`family_key` 由 `invariant` 的字面文本派生（`familyKeyOf`，仅 trim/小写/去空白），同一根因换个说法会算出不同 key、机器视为新族。语义级同族复发的判断权在 lead，机器无能力。**反捉老鼠的痛点本体就是语义复发，本机制只拦逐字复发，不冒充已解决**——语义级归族的机器化（要求每条 finding 显式声明「复用现有 family_key X」或「新族，与已列出的都不同因为…」，机器验动作存在性）**已由 SC-T7b 落地**（2026-08-08）：`family_claim` 字段 + `verdict-validate.mjs` 校验（reuse 引用本谱系 known families 才合法 / new 必须给非空 reason / 缺 claim 拒）+ `dispatch-contract --parent` 契约正文列 known families 与 digest + consensus-gate live 接线。机器验的是「**声明动作存在且引用合法**」（reuse 的 target 在本谱系 known families 内、new 的 reason 非空），**仍不判语义**（「这个 reuse 判断对不对」是审查席的判断，见 Phase 1 的 family_claim 段）。
 
-## Phase 3 — push + 注册（lead 指定一个修复 worker 执行；并行场景选其一即可）
+## Phase 3 — push + 开 PR（lead 指定一个修复 worker 执行；并行场景选其一即可）
+盯梢注册已从本阶段删除。
 
 worker 收**自包含 push manifest**（repo/remote/branch/**expected_sha**/`purpose=feature`/标题正文/已有 PR 号/注册 key/consensus_artifact_hash/`sc_manifest`+`sc_manifest_hash`/`fix_orchestration` 五件套）。base 不在 manifest 里——由共识 artifact 派生，manifest 无权自定（审②-F4）：
 
@@ -941,14 +942,11 @@ fix-plan（纯函数重算等价）+ 组数门 + **最终 DAG lineage**（SC-9/S
 `--source-artifact` 是修复**前**的源共识（编排从它算）；两者必须是 **exact parent 关系**
 （SC-3：终版 artifact 的 `parent_artifact_hash` == 源 artifact hash，同 base 的另一份冒充被拦）。
 （审③-F4-R：bundle 必到场——守卫重算 review_input_hash 并绑定 bundle↔artifact↔manifest 三方 SHA。）
-守卫过 → **守卫自己以固定 argv 执行普通 refspec push**（漂移即停，绝不产出待 shell 解释的命令串）→ `gh pr create/edit` → ssh mini：
-```
-node scripts/pr-watch/register.mjs --state-dir <mini-state> --owner <o> --repo <r> --pr <N> --branch <feature-branch> --push-remote <origin|fork> [--push-repo PraiseZhu/cindy-fork] --verify --lease <lease> --schedule-check "<cmd>"
-# 审⑤-F4: --branch 与 --push-remote 必填（mivo-canvas-plugin: --push-remote origin；cindy: --push-remote fork + --push-repo）——
-# 缺任一 register 直接拒绝，杜绝 state.branch=null 的注定失败注册；引擎不猜 remote 名
+守卫过 → **守卫自己以固定 argv 执行普通 refspec push**（漂移即停，绝不产出待 shell 解释的命令串）→ `gh pr create/edit`。
 
-```
-**回执四要素**任一缺失 = 注册失败**显式报 owner**（兜底靠每日卡片补扫，但不静默）。
+**盯梢已停用（2026-09-03）**：Phase 3 **不得** ssh Mini 跑 `scripts/pr-watch/register.mjs`，
+不得写 Mini state dir，不得等回执四要素。PR 开出来即本 skill 收口。引擎/班车/补注册已从
+Mini 调度卸掉；再注册只会留下无人消费的 state。失败也不许改成「跳过 verify 仍写入」。
 
 ## 参数
 
