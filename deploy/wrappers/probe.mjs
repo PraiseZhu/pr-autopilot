@@ -14,9 +14,15 @@ import { evaluate, emptyCursors } from '../../scripts/pr-watch/gate.mjs';
 import { stateFileName, migrateAllLegacyStateFiles, STATE_FILE_NAME_RE } from '../../scripts/pr-watch/register.mjs';
 
 export function probe({ stateDir, queueDir, snapshotCmd, leaseTtlMinutes = 40, hmacKey = null, nowMs = Date.now() }) {
-  // 队列有未消费任务（上一班车没送完/晚到回执）→ 有活
-  if (queueDir && existsSync(queueDir) && readdirSync(queueDir).some((f) => f.endsWith('.task.txt'))) {
-    return { work: true, why: 'dispatch-queue 有滞留任务' };
+  // 队列有未消费任务（上一班车没送完/晚到回执）→ 有活。
+  // 已有同名 receipt 的 task 是握手完成残留，不得当成新活——否则班车每轮空转烧 token。
+  if (queueDir && existsSync(queueDir)) {
+    const pendingTasks = readdirSync(queueDir).filter((f) => {
+      if (!f.endsWith('.task.txt')) return false;
+      const id = f.slice(0, -'.task.txt'.length);
+      return !existsSync(join(queueDir, `${id}.receipt.json`));
+    });
+    if (pendingTasks.length) return { work: true, why: 'dispatch-queue 有滞留任务' };
   }
   if (!existsSync(stateDir)) return { work: false, why: 'state 目录不存在' };
   // R3 修复: 与引擎同源——扫描前先迁移旧命名状态文件（mame/_ 等折叠碰撞旧名），

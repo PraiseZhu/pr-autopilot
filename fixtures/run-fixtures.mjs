@@ -909,6 +909,20 @@ t('[F7] 旧评论+新 head 不唤醒 / 同 head 新 node 唤醒一次 / stale re
   eq(evaluate(c0, { ...snapBase, reviews: [{ id: 'r2', state: 'CHANGES_REQUESTED', commitOid: SHA_A, dismissed: true }] }).decision, 'none');
   eq(evaluate(c0, { ...snapBase, reviews: [{ id: 'r3', state: 'CHANGES_REQUESTED', commitOid: SHA_B }] }).decision, 'none');
   eq(evaluate(c0, { ...snapBase, reviews: [{ id: 'r4', state: 'CHANGES_REQUESTED', commitOid: SHA_A }] }).decision, 'actionable');
+  const emptyShell = evaluate(c0, { ...snapBase, reviews: [{ id: 'r-empty', state: 'COMMENTED', commitOid: SHA_A, body: '' }] });
+  eq(emptyShell.decision, 'none', '空壳 COMMENTED review 不得唤醒');
+  ok(emptyShell.cursors.review_ids.includes('r-empty'), '空壳 review id 必须进游标，避免每轮空转');
+  eq(evaluate(emptyShell.cursors, { ...snapBase, reviews: [{ id: 'r-empty', state: 'COMMENTED', commitOid: SHA_A, body: '' }] }).decision, 'none');
+  const mixed = evaluate(c0, {
+    ...snapBase,
+    reviews: [{ id: 'r-empty2', state: 'COMMENTED', commitOid: SHA_A, body: '   ' }],
+    comments: [{ id: 'c-real', body: '真正意见在这里' }]
+  });
+  eq(mixed.decision, 'actionable');
+  eq(mixed.signals.join('/'), 'comment');
+  eq(mixed.newItems.reviews.length, 0, '空壳 review 不得进投递正文');
+  ok(mixed.cursors.review_ids.includes('r-empty2'));
+  ok(mixed.cursors.comment_ids.includes('c-real'));
 });
 t('[F7] provenance HMAC: 自家评论不唤醒/篡改验不过/他人评论唤醒', () => {
   const signed = signMarker('机器人回帖: dispatch:abc 已修复', HMAC_KEY);
@@ -1601,6 +1615,14 @@ t('[盯梢 until-sc] 投递文本含独立行 --until-sc 与内联正文；空�
   ok(good.text.split('\n').includes('--until-sc'), '投递数组必须含独立行 --until-sc');
   ok(good.text.includes('fix the race'), '正文必须内联渲染');
   ok(good.text.includes('OWNER_STANDING_AUTH: PR_PUSH_AND_REPLY'), '授权行仍在');
+  const emptyReviewWithComment = run({
+    ...base,
+    signals: ['review', 'comment'],
+    new_items: { reviews: [{ id: 'r1', body: '' }], comments: [{ id: 'c1', body: 'fix the race' }] }
+  });
+  ok(emptyReviewWithComment.ok, '空壳 review + 有正文 comment 应过: ' + (emptyReviewWithComment.err || ''));
+  ok(emptyReviewWithComment.text.includes('fix the race'), '空壳 review 不得吞掉 comment 正文');
+  ok(!emptyReviewWithComment.text.includes('[review r1]'), '空壳 review 不得内联空段');
   ok(!run({ ...base, signals: ['comment'], new_items: { comments: [{ id: 'c1', body: '   ' }], reviews: [] } }).ok, '正文为空 → exit 1 fail-closed');
   ok(!run({ ...base, signals: ['comment'], new_items: { comments: ['c1'], reviews: [] } }).ok, '裸 id → exit 1 fail-closed');
   ok(!run({ ...base, signals: ['review'], new_items: { reviews: [], comments: [] } }).ok, '信号要正文但 new_items 空 → fail-closed');
@@ -3207,7 +3229,9 @@ t('[P0-⑦] probe 探针: 无活 SKIP / 新信号·租约过期·canceling·终�
   writeFileSync(snapJson, JSON.stringify(snapBase));
   writeFileSync(join(qDir, 'x.task.txt'), 'x');
   ok(P9().work, '队列滞留 → RUN');
-  execFileSync('rm', [join(qDir, 'x.task.txt')]);
+  writeFileSync(join(qDir, 'x.receipt.json'), '{}');
+  eq(P9().work, false, '已有回执的滞留 task 不得放行班车');
+  execFileSync('rm', [join(qDir, 'x.task.txt'), join(qDir, 'x.receipt.json')]);
   // 杂质文件不触发
   writeFileSync(join(stDir, 'garbage__5.json'), '{}');
   eq(P9().work, false, '杂质文件不得放行班车');

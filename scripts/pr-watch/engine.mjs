@@ -274,6 +274,9 @@ export function runEngine(cfg) {
       }
       if (res.decision !== 'actionable') {
         if (state.status === 'blocked-external' || state.status === 'fixing') next.status = 'watching';
+        // 空壳 review/comment 的 id 在 gate 里已经吸进 cursors，这里必须落盘，
+        // 否则下一轮还当新信号，dispatch 再被空正文卡死。
+        next.cursors = res.cursors;
         writeJsonAtomic(path, next);
         return;
       }
