@@ -16,3 +16,6 @@ scripts/.pr-intent.md
 _runtime/
 .worktrees/
 .cindy-worktrees/
+
+# 本机一次性产物（不入库）
+_tmp/
